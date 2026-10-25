@@ -1,0 +1,45 @@
+{
+  "account": "${CDK_DEFAULT_ACCOUNT}",
+  "region": "us-east-1",
+  "stage": "prod",
+  "globalNameSuffix": "",
+  "layout": "split",
+  "split": {
+    "zone": "coderhelm.com",
+    "appUrl": "https://app.coderhelm.com",
+    "apiUrl": "https://api.coderhelm.com",
+    "apiDomain": "api.coderhelm.com",
+    "streamDomain": "stream.coderhelm.com",
+    "authDomain": "auth.coderhelm.com",
+    "corsOrigins": ["https://app.coderhelm.com", "https://coderhelm.com", "https://www.coderhelm.com"],
+    "streamCorsOrigins": ["https://app.coderhelm.com", "https://coderhelm.com"]
+  },
+  "retainData": true,
+  "models": {
+    "provider": "anthropic",
+    "primary": "claude-opus-5-5",
+    "light": "claude-sonnet-5-5"
+  },
+  "email": {
+    "from": "noreply@coderhelm.com",
+    "fromName": "Coderhelm",
+    "supportInbox": "support@coderhelm.com",
+    "identity": "coderhelm.com",
+    "sesRegion": "us-east-1",
+    "cognitoUsesSes": true,
+    "logoUrl": "https://coderhelm.com/favicon.svg",
+    "privacyUrl": "https://coderhelm.com/privacy"
+  },
+  "integrations": {
+    "googleSignIn": true,
+    "sandbox": true,
+    "logAnalyzer": true,
+    "weeklySummary": true,
+    "weeklySummaryListedTeamsOnly": false
+  },
+  "publicBucketName": "coderhelm-public",
+  "siteUrl": "https://coderhelm.com",
+  "ci": {
+    "reviewerEvalsRepo": "CoderHelm/coderhelm-platform"
+  }
+}

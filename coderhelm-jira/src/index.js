@@ -2,6 +2,7 @@ const api = require("@forge/api");
 const { fetch } = api;
 const { storage } = api;
 const { route } = api;
+const { GATEWAY_URL } = require("./gateway");
 
 /** The parts of a Jira user CoderHelm keeps: account id, name, email. */
 function jiraUser(u) {
@@ -143,7 +144,7 @@ exports.handler = async (event, context) => {
       },
     };
 
-    const response = await fetch("https://api.coderhelm.com/webhooks/jira", {
+    const response = await fetch(`${GATEWAY_URL}/webhooks/jira`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(payload),
@@ -212,7 +213,7 @@ exports.handler = async (event, context) => {
     },
   };
 
-  const response = await fetch("https://api.coderhelm.com/webhooks/jira", {
+  const response = await fetch(`${GATEWAY_URL}/webhooks/jira`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(payload),

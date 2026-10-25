@@ -392,6 +392,100 @@ def call_messages(api_key, body, model_id, client, table, team_id, feature,
     raise StreamBroke("unreachable")
 
 
+# ── Amazon Bedrock (MODEL_PROVIDER=bedrock) ──────────────────────────────
+
+def is_bedrock(env=None):
+    """True when the deployment calls Claude through Amazon Bedrock."""
+    env = os.environ if env is None else env
+    return (env.get("MODEL_PROVIDER") or "").strip().lower() == "bedrock"
+
+
+def bedrock_model_id(model, env=None):
+    """The Bedrock id for a model name (same rule as
+    services/common/src/model_provider.rs): an explicit BEDROCK_MODEL_IDS
+    entry, an id that already is a Bedrock id, else
+    <BEDROCK_INFERENCE_PREFIX>anthropic.<model>."""
+    env = os.environ if env is None else env
+    try:
+        mapping = json.loads(env.get("BEDROCK_MODEL_IDS") or "{}")
+    except ValueError:
+        mapping = {}
+    if model in mapping:
+        return mapping[model]
+    if "anthropic." in model or model.startswith("arn:"):
+        return model
+    name = BEDROCK_NAMES.get(model, model)
+    return f"{env.get('BEDROCK_INFERENCE_PREFIX', 'us.')}anthropic.{name}"
+
+
+# Models whose Bedrock id isn't just their name (same table as the Rust side).
+BEDROCK_NAMES = {
+    "claude-haiku-4-5": "claude-haiku-4-5-20251001-v1:0",
+    "claude-haiku-4-5-20251001": "claude-haiku-4-5-20251001-v1:0",
+}
+
+
+def bedrock_body(body):
+    """A Messages body as Bedrock takes it: no model or stream field, its
+    version marker added."""
+    b = {k: v for k, v in body.items() if k not in ("model", "stream")}
+    b["anthropic_version"] = "bedrock-2023-05-31"
+    return b
+
+
+def call_messages_bedrock(body, model_id, client, table, team_id, feature, bedrock=None,
+                          backoff=(2, 4, 8, 16, 32), sleep=time.sleep):
+    """The same call as call_messages, through Bedrock's streaming API with
+    the Lambda's own role (no key). Every attempt is recorded the same way."""
+    import random
+
+    if bedrock is None:
+        import boto3
+        bedrock = boto3.client("bedrock-runtime")
+    data = json.dumps(bedrock_body(body)).encode("utf-8")
+    for attempt in range(len(backoff) + 1):
+        last = attempt == len(backoff)
+        try:
+            resp = bedrock.invoke_model_with_response_stream(
+                modelId=bedrock_model_id(model_id), body=data,
+                contentType="application/json", accept="application/json",
+            )
+        except Exception as e:
+            status = getattr(e, "response", {}).get("ResponseMetadata", {}).get("HTTPStatusCode", 0) \
+                if hasattr(e, "response") else 0
+            if last or (status and not is_transient_status(status)):
+                raise
+            logger.warning(f"Bedrock call failed ({e}), retrying (attempt {attempt + 1})")
+            sleep(backoff[attempt] * random.uniform(0.75, 1.25))
+            continue
+        acc = Accumulator()
+        call_id = (resp.get("ResponseMetadata") or {}).get("RequestId")
+        broke = None
+        try:
+            for event in resp["body"]:
+                chunk = (event or {}).get("chunk")
+                if not chunk:
+                    continue
+                try:
+                    acc.feed(json.loads(chunk["bytes"]))
+                except ValueError:
+                    continue
+                if acc.error is not None:
+                    break
+        except Exception as e:  # the stream broke mid-reply
+            broke = e
+        u, estimated = acc.call(len(data))
+        _record_attempt(client, table, team_id, feature, model_id, u, call_id, estimated)
+        if not estimated and acc.error is None:
+            return acc.message()
+        err = StreamBroke(f"reply broke off: {broke or acc.error or 'no final usage'}")
+        if last:
+            raise err
+        logger.warning(f"{err}, retrying (attempt {attempt + 1})")
+        sleep(backoff[attempt] * random.uniform(0.75, 1.25))
+    raise StreamBroke("unreachable")
+
+
 def _record_attempt(client, table, team_id, feature, model_id, u, call_id, estimated):
     if estimated:
         logger.warning(f"Anthropic reply broke off; recording {u} with the output estimated")

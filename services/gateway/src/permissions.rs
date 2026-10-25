@@ -459,6 +459,20 @@ pub const CAPABILITIES: &[Capability] = &[
         // stays with built-in admins and owners (`NEVER_IN_CUSTOM_ROLES`).
         handlers: &[],
     },
+    Capability {
+        key: "system",
+        label: "See this install's version, update it or roll it back, and send a test email (self-hosted installs; install admins only)",
+        min_role: "admin",
+        // Also checked inside each handler: the person must be an install
+        // admin (PLATFORM_ADMIN_EMAILS).
+        handlers: &[
+            "system::version",
+            "system::set_auto_update",
+            "system::update_now",
+            "system::rollback",
+            "system::test_email",
+        ],
+    },
     // ── Owners ──────────────────────────────────────────────────────
     Capability {
         key: "manage_admins",
@@ -526,7 +540,7 @@ pub const CUSTOM_PREFIX: &str = "custom:";
 /// Capabilities a custom role can never hold, whatever the table says about
 /// them: managing roles, and support (checked by built-in role inside the
 /// support handlers), stay with built-in admins and owners.
-pub const NEVER_IN_CUSTOM_ROLES: &[&str] = &["roles", "support"];
+pub const NEVER_IN_CUSTOM_ROLES: &[&str] = &["roles", "support", "system"];
 
 /// The id in a `custom:<id>` role, or `None` for a built-in role.
 pub fn custom_role_id(role: &str) -> Option<&str> {

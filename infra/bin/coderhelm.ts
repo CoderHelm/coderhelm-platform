@@ -1,129 +1,42 @@
 #!/usr/bin/env node
 import "source-map-support/register";
+import * as path from "path";
 import * as cdk from "aws-cdk-lib";
-import { DatabaseStack } from "../lib/database-stack";
-import { StorageStack } from "../lib/storage-stack";
-import { ApiStack } from "../lib/api-stack";
-import { WorkerStack } from "../lib/worker-stack";
-import { MonitoringStack } from "../lib/monitoring-stack";
-import { EmailStack } from "../lib/email-stack";
-import { LogAnalyzerStack } from "../lib/log-analyzer-stack";
-import { StreamingStack } from "../lib/streaming-stack";
+import { buildApp } from "../lib/app";
+import { chooseConfigFile, ConfigError, loadConfigFile, resolveConfig } from "../lib/config";
 
+// Which deployment to build comes from one config file:
+//   cdk deploy -c config=../coderhelm.config.json   (or CODERHELM_CONFIG=...)
+// With neither, the hosted deployment's own config is used
+// (config/hosted.prod.json; `-c stage=<name>` picks config/local.json).
 const app = new cdk.App();
 
-const env = {
-  account: process.env.CDK_DEFAULT_ACCOUNT,
-  region: process.env.CDK_DEFAULT_REGION ?? "us-east-1",
-};
-
-const stage = app.node.tryGetContext("stage") ?? "prod";
-const prefix = `coderhelm-${stage}`;
-
-// --- Core Infrastructure ---
-
-const database = new DatabaseStack(app, `${prefix}-database`, {
-  env,
-  stage,
+const choice = chooseConfigFile({
+  contextConfig: app.node.tryGetContext("config"),
+  envConfig: process.env.CODERHELM_CONFIG,
+  stage: app.node.tryGetContext("stage"),
+  infraDir: path.join(__dirname, ".."),
 });
 
-const storage = new StorageStack(app, `${prefix}-storage`, {
-  env,
-  stage,
-});
+let cfg;
+try {
+  cfg = loadConfigFile(choice.file);
+  if (choice.stage && choice.stage !== cfg.stage) {
+    cfg = resolveConfig({ ...cfg.raw, stage: choice.stage });
+  }
+  // The installer passes the dashboard build it downloaded for the release.
+  if (process.env.CODERHELM_DASHBOARD_DIR) {
+    cfg = resolveConfig({
+      ...cfg.raw,
+      dashboard: { ...cfg.raw.dashboard, assetDir: process.env.CODERHELM_DASHBOARD_DIR },
+    });
+  }
+} catch (err) {
+  if (err instanceof ConfigError) {
+    console.error(`${choice.file}\n${err.message}`);
+    process.exit(1);
+  }
+  throw err;
+}
 
-// --- Compute ---
-
-const api = new ApiStack(app, `${prefix}-api`, {
-  env,
-  stage,
-  table: database.table,
-  eventsTable: database.eventsTable,
-  usersTable: database.usersTable,
-  jiraTokensTable: database.jiraTokensTable,
-  plansTable: database.plansTable,
-  jiraConfigTable: database.jiraConfigTable,
-  reposTable: database.reposTable,
-  settingsTable: database.settingsTable,
-  secretsKey: database.secretsKey,
-  infraTable: database.infraTable,
-  billingTable: database.billingTable,
-  bannersTable: database.bannersTable,
-  mcpConfigsTable: database.mcpConfigsTable,
-  awsInsightsTable: database.awsInsightsTable,
-  testsTable: database.testsTable,
-  waitlistTable: database.waitlistTable,
-  bucket: storage.bucket,
-});
-
-const worker = new WorkerStack(app, `${prefix}-worker`, {
-  env,
-  stage,
-  table: database.table,
-  usersTable: database.usersTable,
-  plansTable: database.plansTable,
-  jiraConfigTable: database.jiraConfigTable,
-  reposTable: database.reposTable,
-  settingsTable: database.settingsTable,
-  infraTable: database.infraTable,
-  billingTable: database.billingTable,
-  mcpConfigsTable: database.mcpConfigsTable,
-  tracesTable: database.tracesTable,
-  checkpointsTable: database.checkpointsTable,
-  eventsTable: database.eventsTable,
-  testsTable: database.testsTable,
-  bucket: storage.bucket,
-  ticketQueue: api.ticketQueue,
-  ciFixQueue: api.ciFixQueue,
-  feedbackQueue: api.feedbackQueue,
-  dlq: api.dlq,
-  mcpProxyFunction: api.mcpProxyFunction,
-  encryptionKey: database.encryptionKey,
-  secretsKey: database.secretsKey,
-});
-
-// --- Email ---
-
-new EmailStack(app, `${prefix}-email`, {
-  env,
-  stage,
-  gatewayFunction: api.gatewayFunction,
-  workerFunction: worker.workerFunction,
-});
-
-// --- Monitoring ---
-
-new MonitoringStack(app, `${prefix}-monitoring`, {
-  env,
-  stage,
-  gatewayFunction: api.gatewayFunction,
-  workerFunction: worker.workerFunction,
-  table: database.table,
-  ticketQueue: api.ticketQueue,
-});
-
-// --- Log Analyzer ---
-
-new LogAnalyzerStack(app, `${prefix}-log-analyzer`, {
-  env,
-  stage,
-  awsInsightsTable: database.awsInsightsTable,
-  settingsTable: database.settingsTable,
-  secretsKey: database.secretsKey,
-});
-
-// --- Streaming (SSE via Lambda Function URL + Web Adapter) ---
-
-new StreamingStack(app, `${prefix}-streaming`, {
-  env,
-  stage,
-  table: database.table,
-  plansTable: database.plansTable,
-  reposTable: database.reposTable,
-  settingsTable: database.settingsTable,
-  mcpConfigsTable: database.mcpConfigsTable,
-  bucket: storage.bucket,
-  mcpProxyFunction: api.mcpProxyFunction,
-  secretsKey: database.secretsKey,
-  ticketQueue: api.ticketQueue,
-});
+buildApp(app, cfg);

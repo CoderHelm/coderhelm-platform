@@ -594,11 +594,10 @@ fn validate_oauth_state(req_cookies: &str, cookie_name: &str, query_state: Optio
 
 /// GET /auth/google — Redirect to Cognito hosted UI for Google login.
 pub async fn google_login(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    let redirect_uri = if state.config.stage == "prod" {
-        "https://api.coderhelm.com/auth/google/callback"
-    } else {
-        "http://localhost:3001/auth/google/callback"
-    };
+    let redirect_uri = format!(
+        "{}/auth/google/callback",
+        common::public_urls::api_url(&state.config.stage)
+    );
 
     let domain = &state.config.cognito_domain;
     let client_id = &state.config.cognito_client_id;
@@ -644,11 +643,10 @@ pub async fn google_callback(
         warn!("Google OAuth callback with missing/mismatched CSRF state");
         return Err(StatusCode::FORBIDDEN);
     }
-    let redirect_uri = if state.config.stage == "prod" {
-        "https://api.coderhelm.com/auth/google/callback"
-    } else {
-        "http://localhost:3001/auth/google/callback"
-    };
+    let redirect_uri = format!(
+        "{}/auth/google/callback",
+        common::public_urls::api_url(&state.config.stage)
+    );
 
     let domain = &state.config.cognito_domain;
     let client_id = &state.config.cognito_client_id;
@@ -671,7 +669,7 @@ pub async fn google_callback(
             ("code", &params.code),
             ("client_id", client_id),
             ("client_secret", client_secret),
-            ("redirect_uri", redirect_uri),
+            ("redirect_uri", &redirect_uri),
         ])
         .send()
         .await
@@ -738,11 +736,7 @@ pub async fn google_callback(
 
     // Closed beta: only allow new users on the allowlist (existing users can always log in)
     if existing.is_empty() && !is_email_allowed(&state, &email).await {
-        let dash = if state.config.stage == "prod" {
-            "https://app.coderhelm.com"
-        } else {
-            "http://localhost:3000"
-        };
+        let dash = common::public_urls::app_url(&state.config.stage);
         let redirect = format!("{dash}?error=closed_beta");
         return Ok(Redirect::temporary(&redirect).into_response());
     }
@@ -827,11 +821,7 @@ pub async fn google_callback(
     )
     .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
-    let dashboard_url = if state.config.stage == "prod" {
-        "https://app.coderhelm.com"
-    } else {
-        "http://localhost:3000"
-    };
+    let dashboard_url = common::public_urls::app_url(&state.config.stage);
 
     let cookie = format!(
         "__Host-coderhelm_session={token}; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age={SESSION_TTL_SECS}"
@@ -852,11 +842,10 @@ pub async fn google_callback(
 /// GET /auth/github — Redirect to GitHub OAuth (for connecting GitHub account).
 pub async fn github_login(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let client_id = &state.secrets.github_client_id;
-    let redirect_uri = if state.config.stage == "prod" {
-        "https://api.coderhelm.com/auth/github/callback"
-    } else {
-        "http://localhost:3000/auth/github/callback"
-    };
+    let redirect_uri = format!(
+        "{}/auth/github/callback",
+        common::public_urls::api_url(&state.config.stage)
+    );
     let csrf = ulid::Ulid::new().to_string();
     let url = format!(
         "https://github.com/login/oauth/authorize?client_id={client_id}&redirect_uri={redirect_uri}&scope=read:user,read:org&state={csrf}"
@@ -1093,11 +1082,7 @@ pub async fn github_callback(
 
         info!(github_login, "GitHub connected to existing account");
 
-        let dashboard_url = if state.config.stage == "prod" {
-            "https://app.coderhelm.com"
-        } else {
-            "http://localhost:3000"
-        };
+        let dashboard_url = common::public_urls::app_url(&state.config.stage);
 
         let cookie = format!(
             "__Host-coderhelm_session={token}; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age={SESSION_TTL_SECS}"
@@ -1160,11 +1145,7 @@ pub async fn github_callback(
 
     // Closed beta: check allowlist for new GitHub users
     if !has_existing_record && !email.is_empty() && !is_email_allowed(&state, email).await {
-        let dash = if state.config.stage == "prod" {
-            "https://app.coderhelm.com"
-        } else {
-            "http://localhost:3000"
-        };
+        let dash = common::public_urls::app_url(&state.config.stage);
         let redirect = format!("{dash}?error=closed_beta");
         return Ok(Redirect::temporary(&redirect).into_response());
     }
@@ -1186,11 +1167,7 @@ pub async fn github_callback(
                     owner_team = %owner,
                     "First GitHub sign-in for an installation another team owns — asking for an invite"
                 );
-                let dash = if state.config.stage == "prod" {
-                    "https://app.coderhelm.com"
-                } else {
-                    "http://localhost:3000"
-                };
+                let dash = common::public_urls::app_url(&state.config.stage);
                 return Ok(Redirect::temporary(&ask_for_invite_url(dash, org)).into_response());
             }
         }
@@ -1400,11 +1377,7 @@ pub async fn github_callback(
     )
     .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
-    let dashboard_url = if state.config.stage == "prod" {
-        "https://app.coderhelm.com"
-    } else {
-        "http://localhost:3000"
-    };
+    let dashboard_url = common::public_urls::app_url(&state.config.stage);
 
     let cookie = format!(
         "__Host-coderhelm_session={token}; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age={SESSION_TTL_SECS}"

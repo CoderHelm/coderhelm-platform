@@ -52,7 +52,11 @@ async fn main() -> Result<(), Error> {
     let kms = aws_sdk_kms::Client::new(&aws_config);
     let sts = aws_sdk_sts::Client::new(&aws_config);
     let bedrock = aws_sdk_bedrockruntime::Client::new(&aws_config);
+    // Claude through Bedrock when the deployment says so (MODEL_PROVIDER).
+    common::model_provider::set_bedrock_client(bedrock.clone());
     let sm = aws_sdk_secretsmanager::Client::new(&aws_config);
+    // Where this deployment's dashboard and API are (config, or SSM).
+    common::public_urls::init(common::public_urls::ssm::Client::new(&aws_config)).await;
 
     // Load secrets from Secrets Manager
     let secrets_name =
@@ -122,6 +126,12 @@ async fn main() -> Result<(), Error> {
                 .delete(routes::api::remove_from_allowlist),
         )
         .route("/admin/teams", get(routes::admin::admin_teams))
+        // The install's version and updates (self-hosted installs).
+        .route("/system/version", get(routes::system::version))
+        .route("/system/auto-update", put(routes::system::set_auto_update))
+        .route("/system/update", post(routes::system::update_now))
+        .route("/system/rollback", post(routes::system::rollback))
+        .route("/system/test-email", post(routes::system::test_email))
         // The shared DLQ: every team's failed messages and the global jobs'
         .route("/admin/dlq", get(routes::admin::admin_dlq))
         // The daily check of recorded usage against Anthropic's report
@@ -821,6 +831,9 @@ async fn main() -> Result<(), Error> {
             "/api/plans/chat/stream",
             post(routes::plans::plan_chat_stream),
         )
+        // Opt-in pings from self-host installers: public, no session, a
+        // fixed set of non-identifying fields (routes::telemetry).
+        .route("/api/telemetry/ping", post(routes::telemetry::ping))
         .nest("/webhooks", webhook_routes)
         .route(
             "/integrations/jira/forge-register",
@@ -833,6 +846,13 @@ async fn main() -> Result<(), Error> {
         .layer(SetResponseHeaderLayer::overriding(
             header::CACHE_CONTROL,
             header::HeaderValue::from_static("no-store"),
+        ))
+        // The public URL, if it couldn't be read at start (first deploy).
+        .layer(axum::middleware::from_fn(
+            |req: axum::extract::Request, next: axum::middleware::Next| async move {
+                common::public_urls::ensure().await;
+                next.run(req).await
+            },
         ))
         .with_state(state);
 

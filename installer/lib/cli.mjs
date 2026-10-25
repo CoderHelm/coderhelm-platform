@@ -1,0 +1,125 @@
+// coderhelm-selfhost: install and run CoderHelm in your own AWS account.
+import * as cmd from "./commands.mjs";
+import { wizard } from "./wizard.mjs";
+import fs from "node:fs";
+import { Runner } from "./runner.mjs";
+import { parseArgs, prompter } from "./util.mjs";
+
+export const HELP = `coderhelm-selfhost: run CoderHelm in your own AWS account
+
+Usage: coderhelm-selfhost <command> [options]
+
+Commands
+  init          The guided install: checks, a few questions with explanations,
+                a cost estimate, then deploy, GitHub App and first sign-up.
+                Resumable; "back" returns to the previous step; flags or
+                --answers <file> answer it without a terminal
+  deploy        Deploy (or redeploy) the release your config names, then
+                create your GitHub App if there isn't one yet
+  github-app    Create the GitHub App (one click on github.com) and store its keys
+  update        Move to the latest release (or --to vX.Y.Z): health check,
+                signature check, migration check, deploy, health check
+                (--auto-rollback goes back if the new release is unhealthy)
+  rollback      Go back to the previous release (or --to vX.Y.Z)
+  auto-update   on | off | status [--window "Sun 03:00"] [--timezone UTC]
+                [--channel stable|preview] [--majors ask|auto]
+  health        Check the stacks, functions, queues, keys, email and URLs
+  backup        Take on-demand backups of every table
+  uninstall     Delete the stacks (tables, bucket and secret are kept)
+  telemetry     on | off | status: anonymous install and upgrade pings (off by default)
+  pull          Write the config and state from the account (--stage, --region),
+                to manage an install from another machine
+  version       The installer's, the installed and the latest version
+
+Options
+  --config <file>     Config file (default ./coderhelm.config.json)
+  --version <tag>     Release to deploy (default: the one installed, else the latest)
+  --source <dir>      Deploy from a CoderHelm checkout instead of a release
+  --dry-run           Print every command and change, run nothing
+  --yes               Don't ask (upgrade across action-needed releases, uninstall)
+  --org <name>        github-app: create the app in this GitHub organization
+  --app-id, --client-id, --private-key-file
+                      github-app: store an app you made by hand (GitHub
+                      Enterprise Server); secrets come from GITHUB_WEBHOOK_SECRET
+                      and GITHUB_CLIENT_SECRET
+  --skip-github-app   deploy: don't create the GitHub App now
+  --require-signature update/deploy: refuse a release whose signature can't be checked
+  --auto-rollback     update: deploy the previous release again if health fails
+  --result-file <f>   update: write {status, from, to, reason} to this file
+
+Docs: https://github.com/CoderHelm/coderhelm-platform/tree/main/docs/self-host
+`;
+
+export async function main(argv, deps = {}) {
+  const flags = parseArgs(argv);
+  // Bare `npx github:CoderHelm/coderhelm-platform`: the guided install, unless
+  // this folder already has an install.
+  const command = flags._[0] ?? (flags.version === true ? "version" : fs.existsSync(cmd.configPath(flags)) || flags.help ? "help" : "init");
+  if (typeof flags.version !== "string") delete flags.version;
+  const log = deps.log ?? console.log;
+  const interactive = deps.interactive ?? (process.stdin.isTTY && !flags.yes && !flags.dryRun);
+  const runner = deps.runner ?? new Runner({ dryRun: !!flags.dryRun, log });
+  const ask = deps.ask ?? prompter({ interactive });
+  const ctx = {
+    flags, runner, ask, log, interactive,
+    fetchImpl: deps.fetchImpl ?? fetch,
+    manifestFlow: deps.manifestFlow,
+    resolveSource: deps.resolveSource,
+    open: deps.open,
+  };
+  try {
+    switch (command) {
+      case "init":
+      case "setup":
+        await wizard(ctx);
+        return 0;
+      case "deploy":
+      case "install":
+        await cmd.deploy(ctx);
+        return 0;
+      case "github-app":
+        await cmd.githubApp(ctx);
+        return 0;
+      case "pull":
+        await cmd.pull(ctx);
+        return 0;
+      case "update":
+      case "upgrade": {
+        const r = await cmd.update(ctx);
+        return r && r.status !== "succeeded" ? 1 : 0;
+      }
+      case "auto-update":
+        await cmd.autoUpdate(ctx);
+        return 0;
+      case "rollback":
+        await cmd.rollback(ctx);
+        return 0;
+      case "health":
+        return await cmd.health(ctx);
+      case "backup":
+        await cmd.backup(ctx);
+        return 0;
+      case "uninstall":
+        await cmd.uninstall(ctx);
+        return 0;
+      case "telemetry":
+        await cmd.telemetry(ctx);
+        return 0;
+      case "version":
+      case "--version":
+        await cmd.version(ctx);
+        return 0;
+      case "help":
+      case "--help":
+      case "-h":
+        log(HELP);
+        return 0;
+      default:
+        log(`Unknown command "${command}".\n`);
+        log(HELP);
+        return 2;
+    }
+  } finally {
+    ask.close?.();
+  }
+}

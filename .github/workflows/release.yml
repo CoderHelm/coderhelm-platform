@@ -1,0 +1,142 @@
+name: Release
+
+# A tag vX.Y.Z publishes a self-host release: prebuilt Lambda code (no Rust
+# toolchain needed to install), the dashboard build, the CDK app's source,
+# the installer, the install script and the Launch Stack template, with
+# SHA256SUMS and build provenance (GitHub artifact attestations: Sigstore,
+# no keys to manage). The hosted deployment is not touched by this workflow.
+on:
+  push:
+    tags: ["v*.*.*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing tag to (re)build the release for
+        required: true
+
+permissions:
+  contents: write
+  id-token: write
+  attestations: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  release:
+    name: Build and publish
+    runs-on: ubuntu-latest
+    steps:
+      - id: tag
+        run: echo "tag=${{ github.event.inputs.tag || github.ref_name }}" >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.tag.outputs.tag }}
+          fetch-depth: 0
+
+      # ── Rust Lambdas ───────────────────────────────────────────────
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-unknown-linux-musl
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: services
+      - uses: mlugg/setup-zig@v2
+      - run: pip3 install --retries 3 --timeout 60 cargo-zigbuild
+      - name: Build gateway and worker
+        working-directory: services
+        run: cargo zigbuild --workspace --release --target aarch64-unknown-linux-musl
+      - name: Package Lambdas
+        run: |
+          mkdir -p dist
+          for b in gateway worker; do
+            cp services/target/aarch64-unknown-linux-musl/release/$b bootstrap
+            zip -q -X dist/$b.zip bootstrap
+            rm bootstrap
+          done
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: lts/*
+
+      # ── MCP proxy ──────────────────────────────────────────────────
+      - name: Build the MCP proxy
+        working-directory: lambda/mcp-proxy
+        run: npm ci && npm run build && (cd dist && zip -q -r -X ../../../dist/mcp-proxy.zip .)
+
+      # ── Dashboard (the commit selfhost/versions.json names) ────────
+      - name: Pick the dashboard commit
+        id: dash
+        run: echo "ref=$(node -p 'require("./selfhost/versions.json").dashboardRef')" >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@v4
+        with:
+          repository: CoderHelm/coderhelm
+          ref: ${{ steps.dash.outputs.ref }}
+          path: dashboard-src
+      - name: Build the dashboard
+        working-directory: dashboard-src/dashboard
+        # No API URL baked in: a self-hosted deployment serves
+        # runtime-config.js next to the pages (infra/lib/web-stack.ts).
+        env:
+          NEXT_PUBLIC_SELF_HOSTED: "1"
+        run: |
+          npm ci
+          npm run build
+          test -f out/index.html
+          tar -czf "$GITHUB_WORKSPACE/dist/dashboard.tar.gz" -C out .
+
+      # ── Source, installer, script, template ────────────────────────
+      - name: Source and installer
+        run: |
+          TAG="${{ steps.tag.outputs.tag }}"
+          # The source, plus the release stamp each install shows (Settings → System).
+          SRC="$RUNNER_TEMP/src/coderhelm-platform-${TAG#v}"
+          mkdir -p "$SRC" && git archive --format=tar "$TAG" | tar -x -C "$SRC"
+          printf '{"version":"%s","commit":"%s","releasedAt":"%s"}\n' "$TAG" "$(git rev-parse "$TAG^{commit}")" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$SRC/selfhost/release.json"
+          tar -czf dist/source.tar.gz -C "$RUNNER_TEMP/src" "coderhelm-platform-${TAG#v}"
+          (cd installer && npm version --no-git-tag-version --allow-same-version "${TAG#v}" >/dev/null && npm pack --silent --pack-destination ../dist >/dev/null)
+          mv dist/coderhelm-selfhost-*.tgz dist/coderhelm-selfhost.tgz
+          cp selfhost/install.sh dist/install.sh
+          cp infra/cfn/coderhelm-selfhost-launch.yaml dist/launch-stack.yaml
+          (cd dist && sha256sum gateway.zip worker.zip mcp-proxy.zip dashboard.tar.gz source.tar.gz coderhelm-selfhost.tgz install.sh launch-stack.yaml > SHA256SUMS)
+          cat dist/SHA256SUMS
+
+      # The release's own CDK app synthesizes for a fresh self-host config.
+      - name: Synth check
+        working-directory: infra
+        env:
+          GATEWAY_ZIP: ${{ github.workspace }}/dist/gateway.zip
+          WORKER_ZIP: ${{ github.workspace }}/dist/worker.zip
+          MCP_PROXY_DIR: ${{ github.workspace }}/dist/mcp-proxy.zip
+        run: |
+          npm ci
+          mkdir -p "$RUNNER_TEMP/dash" && tar -xzf ../dist/dashboard.tar.gz -C "$RUNNER_TEMP/dash"
+          CODERHELM_DASHBOARD_DIR="$RUNNER_TEMP/dash" npx cdk synth --all --quiet -c config=config/selfhost.example.json -o "$RUNNER_TEMP/synth"
+
+      # Keyless signature of the checksums: the update build and the
+      # installer check it was made by this workflow, on a tag.
+      - uses: sigstore/cosign-installer@v3
+      - name: Sign the checksums
+        run: cosign sign-blob --yes --bundle dist/SHA256SUMS.sigstore.json dist/SHA256SUMS
+
+      - uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: |
+            dist/gateway.zip
+            dist/worker.zip
+            dist/mcp-proxy.zip
+            dist/dashboard.tar.gz
+            dist/source.tar.gz
+            dist/coderhelm-selfhost.tgz
+
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="${{ steps.tag.outputs.tag }}"
+          NOTES="Self-host release ${TAG}. Install: npx -y github:${GITHUB_REPOSITORY}#${TAG} init, then deploy. Upgrade: coderhelm-selfhost upgrade --to ${TAG}. See docs/self-host."
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" dist/* --clobber
+          else
+            gh release create "$TAG" dist/* --title "$TAG" --notes "$NOTES" --verify-tag
+          fi

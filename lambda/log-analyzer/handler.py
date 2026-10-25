@@ -266,8 +266,9 @@ def analyze_connection(conn):
     logger.info(f"Analyzing {team_id} / account {account_id}")
 
     # Load team's Anthropic API key
-    api_key = get_team_api_key(team_id)
-    if not api_key:
+    # On Bedrock the Lambda's own role calls the model: no team key needed.
+    api_key = "" if usage.is_bedrock() else get_team_api_key(team_id)
+    if not api_key and not usage.is_bedrock():
         logger.warning(f"No Anthropic API key configured for {team_id}, skipping analysis")
         return 0
 
@@ -598,10 +599,16 @@ Return ONLY the JSON array, no surrounding text."""
     try:
         # Streamed; every attempt (a broken or retried one too) is counted in
         # the team's usage counters as it happens (usage.call_messages).
-        response_data = usage.call_messages(
-            api_key, build_request_body(prompt), MODEL_ID,
-            dynamodb_client, ANALYTICS_TABLE, team_id, usage.FEATURE_LOG_ANALYSIS,
-        )
+        if usage.is_bedrock():
+            response_data = usage.call_messages_bedrock(
+                build_request_body(prompt), MODEL_ID,
+                dynamodb_client, ANALYTICS_TABLE, team_id, usage.FEATURE_LOG_ANALYSIS,
+            )
+        else:
+            response_data = usage.call_messages(
+                api_key, build_request_body(prompt), MODEL_ID,
+                dynamodb_client, ANALYTICS_TABLE, team_id, usage.FEATURE_LOG_ANALYSIS,
+            )
 
         recommendations = parse_recommendations(response_text(response_data))
         if recommendations is None:

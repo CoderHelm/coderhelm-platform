@@ -5363,8 +5363,9 @@ async fn fail_run(
                  {}\n\n\
                  If you can, add more detail to the issue description — for example which files to change, \
                  expected behavior, or relevant code snippets — and I'll try again.\n\n\
-                 [View run →](https://app.coderhelm.com/runs/detail?id={})",
+                 [View run →]({}/runs/detail?id={})",
                 common::truncate_str(error_msg, 300),
+                common::public_urls::app_url(&state.config.stage),
                 run_id,
             );
             if let Err(e) = gh
@@ -5378,8 +5379,9 @@ async fn fail_run(
         let comment = format!(
             "{}\n\n\
              Add more detail — which files to change, expected behavior, or relevant code snippets — and comment to retry.\n\n\
-             View run → https://app.coderhelm.com/runs/detail?id={}",
+             View run → {}/runs/detail?id={}",
             common::truncate_str(error_msg, 300),
+            common::public_urls::app_url(&state.config.stage),
             run_id,
         );
         if let Err(e) = post_jira_comment(
@@ -7639,8 +7641,9 @@ fn format_progress(current_phase: &str, run_id: &str) -> String {
         rows.push_str(&format!("| {label} | {status} |\n"));
     }
 
+    let app = common::public_urls::app_url_from_env();
     format!(
-        "🔄 **Coderhelm is working on this**\n\n| Phase | Status |\n|-------|--------|\n{rows}\n[View run →](https://app.coderhelm.com/runs/detail?id={run_id})"
+        "🔄 **Coderhelm is working on this**\n\n| Phase | Status |\n|-------|--------|\n{rows}\n[View run →]({app}/runs/detail?id={run_id})"
     )
 }
 

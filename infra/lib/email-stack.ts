@@ -2,10 +2,15 @@ import * as cdk from "aws-cdk-lib";
 import * as ses from "aws-cdk-lib/aws-ses";
 import * as iam from "aws-cdk-lib/aws-iam";
 import * as lambda from "aws-cdk-lib/aws-lambda";
+import * as route53 from "aws-cdk-lib/aws-route53";
 import { Construct } from "constructs";
+import { ResolvedConfig } from "./config";
 
 interface EmailStackProps extends cdk.StackProps {
   stage: string;
+  cfg: ResolvedConfig;
+  /** The dashboard's URL, for links in emails. */
+  appUrl: string;
   gatewayFunction: lambda.Function;
   workerFunction: lambda.Function;
 }
@@ -16,7 +21,17 @@ export class EmailStack extends cdk.Stack {
   constructor(scope: Construct, id: string, props: EmailStackProps) {
     super(scope, id, props);
 
-    const prefix = `coderhelm-${props.stage}`;
+    const cfg = props.cfg;
+    const prefix = cfg.prefix;
+    // Fills the deployment's links into a template (see the bottom of this file).
+    const fill = (t: string) =>
+      t
+        .split("__APP_URL__").join(props.appUrl)
+        .split("__LOGO_URL__").join(cfg.email.logoUrl ?? `${props.appUrl}/favicon.svg`)
+        .split("__PRIVACY_LINK__").join(
+          cfg.email.privacyUrl ? ` · <a href="${cfg.email.privacyUrl}" style="color:#888">Privacy</a>` : ""
+        )
+        .split("__SUPPORT_INBOX__").join(cfg.email.supportInbox);
 
     // SES configuration set for tracking
     this.configSet = new ses.ConfigurationSet(this, "ConfigSet", {
@@ -25,19 +40,40 @@ export class EmailStack extends cdk.Stack {
       sendingEnabled: true,
     });
 
-    // SES email identity (domain-level verification)
-    new ses.EmailIdentity(this, "DomainIdentity", {
-      identity: ses.Identity.domain("coderhelm.com"),
-      configurationSet: this.configSet,
-    });
+    // SES email identity: a domain (its DKIM records are created for you
+    // when it is the single-origin domain's Route 53 zone; otherwise add the
+    // three CNAMEs SES shows) or one address (SES emails it a confirmation
+    // link). null: the identity is managed elsewhere.
+    const identity = cfg.email.identity;
+    if (identity) {
+      const zoneName = cfg.singleOrigin?.hostedZone;
+      let sesIdentity: ses.Identity;
+      if (identity.includes("@")) {
+        sesIdentity = ses.Identity.email(identity);
+      } else if (zoneName && identity === zoneName) {
+        const zone = cfg.singleOrigin?.hostedZoneId
+          ? route53.PublicHostedZone.fromPublicHostedZoneAttributes(this, "EmailZone", {
+              zoneName,
+              hostedZoneId: cfg.singleOrigin.hostedZoneId,
+            })
+          : route53.PublicHostedZone.fromLookup(this, "EmailZone", { domainName: zoneName });
+        sesIdentity = ses.Identity.publicHostedZone(zone as route53.IPublicHostedZone);
+      } else {
+        sesIdentity = ses.Identity.domain(identity);
+      }
+      new ses.EmailIdentity(this, "DomainIdentity", {
+        identity: sesIdentity,
+        configurationSet: this.configSet,
+      });
+    }
 
     // Templated emails
     new ses.CfnTemplate(this, "WelcomeTemplate", {
       template: {
         templateName: `${prefix}-welcome`,
         subjectPart: "Welcome to Coderhelm — your AI coding agent is ready",
-        htmlPart: WELCOME_HTML,
-        textPart: WELCOME_TEXT,
+        htmlPart: fill(WELCOME_HTML),
+        textPart: fill(WELCOME_TEXT),
       },
     });
 
@@ -45,8 +81,8 @@ export class EmailStack extends cdk.Stack {
       template: {
         templateName: `${prefix}-run-complete`,
         subjectPart: "Coderhelm completed: {{title}}",
-        htmlPart: RUN_COMPLETE_HTML,
-        textPart: RUN_COMPLETE_TEXT,
+        htmlPart: fill(RUN_COMPLETE_HTML),
+        textPart: fill(RUN_COMPLETE_TEXT),
       },
     });
 
@@ -54,8 +90,8 @@ export class EmailStack extends cdk.Stack {
       template: {
         templateName: `${prefix}-run-failed`,
         subjectPart: "Coderhelm failed: {{title}}",
-        htmlPart: RUN_FAILED_HTML,
-        textPart: RUN_FAILED_TEXT,
+        htmlPart: fill(RUN_FAILED_HTML),
+        textPart: fill(RUN_FAILED_TEXT),
       },
     });
 
@@ -63,8 +99,8 @@ export class EmailStack extends cdk.Stack {
       template: {
         templateName: `${prefix}-weekly-summary`,
         subjectPart: "Your Coderhelm weekly summary",
-        htmlPart: WEEKLY_SUMMARY_HTML,
-        textPart: WEEKLY_SUMMARY_TEXT,
+        htmlPart: fill(WEEKLY_SUMMARY_HTML),
+        textPart: fill(WEEKLY_SUMMARY_TEXT),
       },
     });
 
@@ -74,8 +110,8 @@ export class EmailStack extends cdk.Stack {
       template: {
         templateName: `${prefix}-reset-password`,
         subjectPart: "Reset your Coderhelm password",
-        htmlPart: RESET_PASSWORD_HTML,
-        textPart: RESET_PASSWORD_TEXT,
+        htmlPart: fill(RESET_PASSWORD_HTML),
+        textPart: fill(RESET_PASSWORD_TEXT),
       },
     });
 
@@ -83,8 +119,8 @@ export class EmailStack extends cdk.Stack {
       template: {
         templateName: `${prefix}-team-invite`,
         subjectPart: "You've been invited to {{org}} on Coderhelm",
-        htmlPart: TEAM_INVITE_HTML,
-        textPart: TEAM_INVITE_TEXT,
+        htmlPart: fill(TEAM_INVITE_HTML),
+        textPart: fill(TEAM_INVITE_TEXT),
       },
     });
 
@@ -92,8 +128,8 @@ export class EmailStack extends cdk.Stack {
       template: {
         templateName: `${prefix}-verify-email`,
         subjectPart: "Verify your Coderhelm email",
-        htmlPart: VERIFY_EMAIL_HTML,
-        textPart: VERIFY_EMAIL_TEXT,
+        htmlPart: fill(VERIFY_EMAIL_HTML),
+        textPart: fill(VERIFY_EMAIL_TEXT),
       },
     });
 
@@ -101,8 +137,8 @@ export class EmailStack extends cdk.Stack {
       template: {
         templateName: `${prefix}-password-changed`,
         subjectPart: "Your Coderhelm password was changed",
-        htmlPart: PASSWORD_CHANGED_HTML,
-        textPart: PASSWORD_CHANGED_TEXT,
+        htmlPart: fill(PASSWORD_CHANGED_HTML),
+        textPart: fill(PASSWORD_CHANGED_TEXT),
       },
     });
 
@@ -110,8 +146,8 @@ export class EmailStack extends cdk.Stack {
       template: {
         templateName: `${prefix}-passkey-added`,
         subjectPart: "A passkey was added to your Coderhelm account",
-        htmlPart: PASSKEY_ADDED_HTML,
-        textPart: PASSKEY_ADDED_TEXT,
+        htmlPart: fill(PASSKEY_ADDED_HTML),
+        textPart: fill(PASSKEY_ADDED_TEXT),
       },
     });
 
@@ -119,8 +155,8 @@ export class EmailStack extends cdk.Stack {
       template: {
         templateName: `${prefix}-passkey-removed`,
         subjectPart: "A passkey was removed from your Coderhelm account",
-        htmlPart: PASSKEY_REMOVED_HTML,
-        textPart: PASSKEY_REMOVED_TEXT,
+        htmlPart: fill(PASSKEY_REMOVED_HTML),
+        textPart: fill(PASSKEY_REMOVED_TEXT),
       },
     });
 
@@ -130,8 +166,8 @@ export class EmailStack extends cdk.Stack {
       template: {
         templateName: `${prefix}-token-warning`,
         subjectPart: "Coderhelm: {{usage_pct}}% of your monthly {{limit_name}} limit used",
-        htmlPart: TOKEN_WARNING_HTML,
-        textPart: TOKEN_WARNING_TEXT,
+        htmlPart: fill(TOKEN_WARNING_HTML),
+        textPart: fill(TOKEN_WARNING_TEXT),
       },
     });
 
@@ -139,8 +175,8 @@ export class EmailStack extends cdk.Stack {
       template: {
         templateName: `${prefix}-token-limit-reached`,
         subjectPart: "Coderhelm: monthly {{limit_name}} limit reached",
-        htmlPart: TOKEN_LIMIT_REACHED_HTML,
-        textPart: TOKEN_LIMIT_REACHED_TEXT,
+        htmlPart: fill(TOKEN_LIMIT_REACHED_HTML),
+        textPart: fill(TOKEN_LIMIT_REACHED_TEXT),
       },
     });
 
@@ -150,7 +186,7 @@ export class EmailStack extends cdk.Stack {
       resources: ["*"],
       conditions: {
         StringEquals: {
-          "ses:FromAddress": `noreply@coderhelm.com`,
+          "ses:FromAddress": cfg.email.from,
         },
       },
     });
@@ -174,11 +210,11 @@ const EMAIL_WRAPPER = (body: string) => `<!DOCTYPE html>
 <tr><td align="center">
 <table width="600" cellpadding="0" cellspacing="0" style="background:#111;border-radius:8px;border:1px solid #222">
 <tr><td style="padding:32px 40px 24px">
-  <img src="https://coderhelm.com/favicon.svg" width="32" height="32" alt="Coderhelm" style="display:block;margin-bottom:24px">
+  <img src="__LOGO_URL__" width="32" height="32" alt="Coderhelm" style="display:block;margin-bottom:24px">
   ${body}
   <p style="color:#666;font-size:12px;margin-top:32px;padding-top:16px;border-top:1px solid #222">
     You're receiving this because you have notifications enabled for your Coderhelm account.<br>
-    <a href="https://app.coderhelm.com/settings" style="color:#888">Manage notification preferences</a> · <a href="https://coderhelm.com/privacy" style="color:#888">Privacy</a>
+    <a href="__APP_URL__/settings" style="color:#888">Manage notification preferences</a>__PRIVACY_LINK__
   </p>
 </td></tr>
 </table>
@@ -196,7 +232,7 @@ const WELCOME_HTML = EMAIL_WRAPPER(`
     Once installed, assign an issue to <code style="background:#1a1a1a;padding:2px 6px;border-radius:4px;color:#4ade80">coderhelm[bot]</code>
     or add the <code style="background:#1a1a1a;padding:2px 6px;border-radius:4px;color:#4ade80">coderhelm</code> label.
   </p>
-  <a href="https://app.coderhelm.com/settings/github" style="display:inline-block;background:#fff;color:#000;padding:12px 24px;border-radius:6px;text-decoration:none;font-weight:600;margin-top:16px">Connect GitHub</a>
+  <a href="__APP_URL__/settings/github" style="display:inline-block;background:#fff;color:#000;padding:12px 24px;border-radius:6px;text-decoration:none;font-weight:600;margin-top:16px">Connect GitHub</a>
 `);
 
 const WELCOME_TEXT = `Welcome to Coderhelm!
@@ -205,9 +241,9 @@ Your AI coding agent is ready. Connect your GitHub organization and install the 
 
 Once installed, assign an issue to coderhelm[bot] or add the "coderhelm" label.
 
-Connect GitHub: https://app.coderhelm.com/settings/github
+Connect GitHub: __APP_URL__/settings/github
 
-Manage notifications: https://app.coderhelm.com/settings`;
+Manage notifications: __APP_URL__/settings`;
 
 const RUN_COMPLETE_HTML = EMAIL_WRAPPER(`
   <h1 style="color:#4ade80;font-size:20px;margin:0 0 16px">✓ Run completed</h1>
@@ -220,7 +256,7 @@ const RUN_COMPLETE_HTML = EMAIL_WRAPPER(`
     <tr><td style="color:#888;padding:4px 0;font-size:14px">Duration</td><td style="color:#fff;padding:4px 0;font-size:14px">{{duration}}</td></tr>
     <tr><td style="color:#888;padding:4px 0;font-size:14px">Tokens</td><td style="color:#fff;padding:4px 0;font-size:14px">{{tokens}}</td></tr>
   </table>
-  <a href="https://app.coderhelm.com" style="display:inline-block;background:#fff;color:#000;padding:10px 20px;border-radius:6px;text-decoration:none;font-weight:600;margin-top:8px">View Run</a>
+  <a href="__APP_URL__" style="display:inline-block;background:#fff;color:#000;padding:10px 20px;border-radius:6px;text-decoration:none;font-weight:600;margin-top:8px">View Run</a>
 `);
 
 const RUN_COMPLETE_TEXT = `Run completed: {{title}}
@@ -230,7 +266,7 @@ Files: {{files_modified}} modified
 Duration: {{duration}}
 Tokens: {{tokens}}
 
-View run: https://app.coderhelm.com`;
+View run: __APP_URL__`;
 
 const RUN_FAILED_HTML = EMAIL_WRAPPER(`
   <h1 style="color:#ef4444;font-size:20px;margin:0 0 16px">✗ Run failed</h1>
@@ -240,14 +276,14 @@ const RUN_FAILED_HTML = EMAIL_WRAPPER(`
   <div style="background:#1a0000;border:1px solid #3f0000;border-radius:6px;padding:16px;margin:16px 0">
     <p style="color:#fca5a5;font-size:14px;margin:0;font-family:monospace">{{error}}</p>
   </div>
-  <a href="https://app.coderhelm.com" style="display:inline-block;background:#fff;color:#000;padding:10px 20px;border-radius:6px;text-decoration:none;font-weight:600;margin-top:8px">View Run</a>
+  <a href="__APP_URL__" style="display:inline-block;background:#fff;color:#000;padding:10px 20px;border-radius:6px;text-decoration:none;font-weight:600;margin-top:8px">View Run</a>
 `);
 
 const RUN_FAILED_TEXT = `Run failed: {{title}}
 Repo: {{repo}}
 Error: {{error}}
 
-View run: https://app.coderhelm.com`;
+View run: __APP_URL__`;
 
 const WEEKLY_SUMMARY_HTML = EMAIL_WRAPPER(`
   <h1 style="color:#fff;font-size:20px;margin:0 0 16px">Weekly Summary — {{org}}</h1>
@@ -259,7 +295,7 @@ const WEEKLY_SUMMARY_HTML = EMAIL_WRAPPER(`
     <tr><td style="color:#888;padding:8px 0;font-size:14px;border-bottom:1px solid #222">PRs created</td><td style="color:#fff;padding:8px 0;font-size:14px;border-bottom:1px solid #222;text-align:right">{{prs_created}}</td></tr>
     <tr><td style="color:#888;padding:8px 0;font-size:14px">Total cost</td><td style="color:#fff;padding:8px 0;font-size:14px;text-align:right">\${{total_cost}}</td></tr>
   </table>
-  <a href="https://app.coderhelm.com" style="display:inline-block;background:#fff;color:#000;padding:10px 20px;border-radius:6px;text-decoration:none;font-weight:600;margin-top:24px">Open Dashboard</a>
+  <a href="__APP_URL__" style="display:inline-block;background:#fff;color:#000;padding:10px 20px;border-radius:6px;text-decoration:none;font-weight:600;margin-top:24px">Open Dashboard</a>
 `);
 
 const WEEKLY_SUMMARY_TEXT = `Weekly Summary — {{org}} ({{period}})
@@ -270,7 +306,7 @@ Failed: {{failed}}
 PRs created: {{prs_created}}
 Total cost: \${{total_cost}}
 
-Dashboard: https://app.coderhelm.com`;
+Dashboard: __APP_URL__`;
 
 // ─── Token limit templates ──────────────────────────────────────────
 
@@ -280,7 +316,7 @@ const TOKEN_WARNING_HTML = EMAIL_WRAPPER(`
     Your team has used <strong style="color:#fff">{{used_tokens}}</strong> of its <strong style="color:#fff">{{limit_tokens}}</strong> monthly {{limit_name}} limit for {{month}}.
     When it reaches the limit, Coderhelm stops starting new work until the month ends or the limit is raised.
   </p>
-  <a href="https://app.coderhelm.com/settings/budget" style="display:inline-block;background:#fff;color:#000;padding:10px 20px;border-radius:6px;text-decoration:none;font-weight:600;margin-top:8px">Review token limits</a>
+  <a href="__APP_URL__/settings/budget" style="display:inline-block;background:#fff;color:#000;padding:10px 20px;border-radius:6px;text-decoration:none;font-weight:600;margin-top:8px">Review token limits</a>
 `);
 
 const TOKEN_WARNING_TEXT = `{{usage_pct}}% of your {{limit_name}} limit used
@@ -288,7 +324,7 @@ const TOKEN_WARNING_TEXT = `{{usage_pct}}% of your {{limit_name}} limit used
 Your team has used {{used_tokens}} of its {{limit_tokens}} monthly {{limit_name}} limit for {{month}}.
 When it reaches the limit, Coderhelm stops starting new work until the month ends or the limit is raised.
 
-Token limits: https://app.coderhelm.com/settings/budget`;
+Token limits: __APP_URL__/settings/budget`;
 
 const TOKEN_LIMIT_REACHED_HTML = EMAIL_WRAPPER(`
   <h1 style="color:#ef4444;font-size:20px;margin:0 0 16px">Monthly {{limit_name}} limit reached</h1>
@@ -296,7 +332,7 @@ const TOKEN_LIMIT_REACHED_HTML = EMAIL_WRAPPER(`
     Your team has used <strong style="color:#fff">{{used_tokens}}</strong> of its <strong style="color:#fff">{{limit_tokens}}</strong> monthly {{limit_name}} limit for {{month}}.
     Coderhelm won't start new work until the month ends or an admin raises or clears this limit.
   </p>
-  <a href="https://app.coderhelm.com/settings/budget" style="display:inline-block;background:#fff;color:#000;padding:10px 20px;border-radius:6px;text-decoration:none;font-weight:600;margin-top:8px">Review token limits</a>
+  <a href="__APP_URL__/settings/budget" style="display:inline-block;background:#fff;color:#000;padding:10px 20px;border-radius:6px;text-decoration:none;font-weight:600;margin-top:8px">Review token limits</a>
 `);
 
 const TOKEN_LIMIT_REACHED_TEXT = `Monthly {{limit_name}} limit reached
@@ -304,7 +340,7 @@ const TOKEN_LIMIT_REACHED_TEXT = `Monthly {{limit_name}} limit reached
 Your team has used {{used_tokens}} of its {{limit_tokens}} monthly {{limit_name}} limit for {{month}}.
 Coderhelm won't start new work until the month ends or an admin raises or clears this limit.
 
-Token limits: https://app.coderhelm.com/settings/budget`;
+Token limits: __APP_URL__/settings/budget`;
 
 // ─── Account email templates ────────────────────────────────────────
 
@@ -335,14 +371,14 @@ const TEAM_INVITE_HTML = EMAIL_WRAPPER(`
   <p style="color:#ccc;font-size:15px;line-height:1.6">
     Coderhelm is an AI coding agent that turns GitHub issues and Jira tickets into production-ready pull requests.
   </p>
-  <a href="https://app.coderhelm.com" style="display:inline-block;background:#fff;color:#000;padding:12px 24px;border-radius:6px;text-decoration:none;font-weight:600;margin-top:16px">Accept Invite</a>
+  <a href="__APP_URL__" style="display:inline-block;background:#fff;color:#000;padding:12px 24px;border-radius:6px;text-decoration:none;font-weight:600;margin-top:16px">Accept Invite</a>
 `);
 
 const TEAM_INVITE_TEXT = `You've been invited to {{org}} on Coderhelm
 
 {{inviter}} invited you as a {{role}}.
 
-Accept your invite: https://app.coderhelm.com`;
+Accept your invite: __APP_URL__`;
 
 const VERIFY_EMAIL_HTML = EMAIL_WRAPPER(`
   <h1 style="color:#fff;font-size:20px;margin:0 0 16px">Verify your email</h1>
@@ -372,7 +408,7 @@ const PASSWORD_CHANGED_HTML = EMAIL_WRAPPER(`
     If you made this change, no further action is needed.
   </p>
   <p style="color:#fca5a5;font-size:15px;line-height:1.6">
-    If you didn't change your password, please <a href="https://app.coderhelm.com" style="color:#60a5fa">reset it immediately</a> and contact us at support@coderhelm.com.
+    If you didn't change your password, please <a href="__APP_URL__" style="color:#60a5fa">reset it immediately</a> and contact us at __SUPPORT_INBOX__.
   </p>
 `);
 
@@ -381,9 +417,9 @@ const PASSWORD_CHANGED_TEXT = `Your Coderhelm password was changed
 The password for your account ({{email}}) was just changed.
 
 If you made this change, no action is needed.
-If you didn't, reset your password immediately: https://app.coderhelm.com
+If you didn't, reset your password immediately: __APP_URL__
 
-Contact: support@coderhelm.com`;
+Contact: __SUPPORT_INBOX__`;
 
 const PASSKEY_ADDED_HTML = EMAIL_WRAPPER(`
   <h1 style="color:#fff;font-size:20px;margin:0 0 16px">Passkey added to your account</h1>
@@ -398,7 +434,7 @@ const PASSKEY_ADDED_HTML = EMAIL_WRAPPER(`
     If you made this change, no further action is needed.
   </p>
   <p style="color:#fca5a5;font-size:15px;line-height:1.6">
-    If you didn't add this passkey, please <a href="https://app.coderhelm.com/settings" style="color:#60a5fa">review your security settings</a> immediately.
+    If you didn't add this passkey, please <a href="__APP_URL__/settings" style="color:#60a5fa">review your security settings</a> immediately.
   </p>
 `);
 
@@ -410,7 +446,7 @@ Device: {{device_name}}
 Date: {{date}}
 
 If you made this change, no action is needed.
-If you didn't, review your security settings: https://app.coderhelm.com/settings`;
+If you didn't, review your security settings: __APP_URL__/settings`;
 
 const PASSKEY_REMOVED_HTML = EMAIL_WRAPPER(`
   <h1 style="color:#fff;font-size:20px;margin:0 0 16px">Passkey removed from your account</h1>
@@ -425,7 +461,7 @@ const PASSKEY_REMOVED_HTML = EMAIL_WRAPPER(`
     If you made this change, no further action is needed.
   </p>
   <p style="color:#fca5a5;font-size:15px;line-height:1.6">
-    If you didn't remove this passkey, please <a href="https://app.coderhelm.com/settings" style="color:#60a5fa">review your security settings</a> immediately and change your password.
+    If you didn't remove this passkey, please <a href="__APP_URL__/settings" style="color:#60a5fa">review your security settings</a> immediately and change your password.
   </p>
 `);
 
@@ -437,5 +473,5 @@ Device: {{device_name}}
 Date: {{date}}
 
 If you made this change, no action is needed.
-If you didn't, review your security settings immediately and change your password: https://app.coderhelm.com/settings`;
+If you didn't, review your security settings immediately and change your password: __APP_URL__/settings`;
 

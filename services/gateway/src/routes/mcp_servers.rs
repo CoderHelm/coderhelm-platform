@@ -71,17 +71,16 @@ pub fn redirect_uri(stage: &str) -> String {
 }
 
 fn dashboard_origin(stage: &str) -> &'static str {
-    if stage == "prod" {
-        "https://app.coderhelm.com"
-    } else {
-        "http://localhost:3000"
-    }
+    common::public_urls::app_url(stage)
 }
 
 /// Coderhelm's Client ID Metadata Document (served by the dashboard). Only
-/// in production: the document names the production callback.
+/// on the hosted dashboard: the document's static copy names the hosted
+/// callback, so other installs register dynamically instead.
 pub fn metadata_document_url(stage: &str) -> Option<String> {
-    (stage == "prod").then(|| format!("{}/oauth/mcp-client.json", dashboard_origin(stage)))
+    let origin = dashboard_origin(stage);
+    (origin == common::public_urls::stage_app_url("prod"))
+        .then(|| format!("{origin}/oauth/mcp-client.json"))
 }
 
 pub(crate) fn runtime(state: &AppState, team: &str) -> Runtime {

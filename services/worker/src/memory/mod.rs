@@ -402,7 +402,9 @@ impl AgentMemory {
     ) {
         let api_key = provider.api_key();
         let model_id = provider.primary_model_id();
-        if conversation_json.is_empty() || api_key.is_empty() {
+        if conversation_json.is_empty()
+            || (api_key.is_empty() && !common::model_provider::is_bedrock())
+        {
             return;
         }
 

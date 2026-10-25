@@ -17,10 +17,13 @@ import * as ses from "aws-cdk-lib/aws-ses";
 import * as events from "aws-cdk-lib/aws-events";
 import * as targets from "aws-cdk-lib/aws-events-targets";
 import { Construct } from "constructs";
-import { WEEKLY_SUMMARY_ENABLED } from "./flags";
+import { ResolvedConfig } from "./config";
+import { repoPath } from "./paths";
+import { serviceEnvironment, modelPolicyStatements, publicUrlReadStatement, recordNameIn, updaterInvokeStatement } from "./service-env";
 
 interface ApiStackProps extends cdk.StackProps {
   stage: string;
+  cfg: ResolvedConfig;
   table: dynamodb.TableV2;
   eventsTable: dynamodb.TableV2;
   usersTable: dynamodb.TableV2;
@@ -48,13 +51,16 @@ export class ApiStack extends cdk.Stack {
   public readonly feedbackQueue: sqs.Queue;
   /** The shared dead-letter queue (the worker's DLQ cleanup reads it). */
   public readonly dlq: sqs.Queue;
+  /** The HTTP API (the single-origin web stack forwards to it). */
+  public readonly httpApi: apigatewayv2.HttpApi;
 
   constructor(scope: Construct, id: string, props: ApiStackProps) {
     super(scope, id, props);
 
-    const prefix = `coderhelm-${props.stage}`;
+    const cfg = props.cfg;
+    const prefix = cfg.prefix;
     const gatewayAssetPath =
-      process.env.GATEWAY_ZIP ?? "../services/gateway/target/lambda/gateway";
+      process.env.GATEWAY_ZIP ?? repoPath("services/gateway/target/lambda/gateway");
 
     // --- Cognito User Pool ---
 
@@ -77,16 +83,21 @@ export class ApiStack extends cdk.Stack {
       mfa: cognito.Mfa.OPTIONAL,
       mfaSecondFactor: { sms: false, otp: true },
       accountRecovery: cognito.AccountRecovery.EMAIL_ONLY,
-      email: cognito.UserPoolEmail.withSES({
-        fromEmail: "noreply@coderhelm.com",
-        fromName: "Coderhelm",
-        sesRegion: "us-east-1",
-        sesVerifiedDomain: "coderhelm.com",
-      }),
-      removalPolicy:
-        props.stage === "prod"
-          ? cdk.RemovalPolicy.RETAIN
-          : cdk.RemovalPolicy.DESTROY,
+      // Through SES once the sender's identity is verified (cognitoUsesSes);
+      // until then Cognito sends from its own address (50 emails a day).
+      email: cfg.email.cognitoUsesSes
+        ? cognito.UserPoolEmail.withSES({
+            fromEmail: cfg.email.from,
+            fromName: cfg.email.fromName,
+            sesRegion: cfg.email.sesRegion,
+            ...(cfg.email.identity && !cfg.email.identity.includes("@")
+              ? { sesVerifiedDomain: cfg.email.identity }
+              : {}),
+          })
+        : cognito.UserPoolEmail.withCognito(),
+      removalPolicy: cfg.retainData
+        ? cdk.RemovalPolicy.RETAIN
+        : cdk.RemovalPolicy.DESTROY,
     });
 
     // Custom message Lambda — sends branded SES emails for verification and password reset
@@ -94,12 +105,12 @@ export class ApiStack extends cdk.Stack {
       functionName: `${prefix}-custom-message`,
       runtime: lambda.Runtime.NODEJS_22_X,
       handler: "handler.handler",
-      code: lambda.Code.fromAsset("../lambda/custom-message"),
+      code: lambda.Code.fromAsset(repoPath("lambda/custom-message")),
       timeout: cdk.Duration.seconds(10),
       memorySize: 128,
       environment: {
         SES_TEMPLATE_PREFIX: prefix,
-        SES_FROM_ADDRESS: "noreply@coderhelm.com",
+        SES_FROM_ADDRESS: cfg.email.from,
       },
       logRetention: logs.RetentionDays.ONE_MONTH,
     });
@@ -116,46 +127,38 @@ export class ApiStack extends cdk.Stack {
       customMessageFn
     );
 
-    // Google identity provider
-    // TODO: Set these values in Secrets Manager at coderhelm/{stage}/secrets:
-    //   google_client_id     — from https://console.cloud.google.com/apis/credentials
-    //   google_client_secret — same page
-    //   Callback URL: https://<cognito-domain>.auth.us-east-1.amazoncognito.com/oauth2/idpresponse
-    const googleSecrets = secretsmanager.Secret.fromSecretNameV2(
-      this,
-      "GoogleSecrets",
-      `coderhelm/${props.stage}/secrets`
-    );
+    // Google identity provider (optional: integrations.googleSignIn).
+    // google_client_id and google_client_secret live in the deployment's
+    // secret (cfg.secretName). Callback URL:
+    //   https://<sign-in domain>/oauth2/idpresponse
+    let googleProvider: cognito.UserPoolIdentityProviderGoogle | undefined;
+    if (cfg.integrations.googleSignIn) {
+      const googleSecrets = secretsmanager.Secret.fromSecretNameV2(
+        this,
+        "GoogleSecrets",
+        `${cfg.secretName}`
+      );
 
-    const googleProvider = new cognito.UserPoolIdentityProviderGoogle(
-      this,
-      "GoogleProvider",
-      {
-        userPool,
-        clientId: googleSecrets
-          .secretValueFromJson("google_client_id")
-          .unsafeUnwrap(),
-        clientSecretValue: googleSecrets.secretValueFromJson(
-          "google_client_secret"
-        ),
-        scopes: ["openid", "email", "profile"],
-        attributeMapping: {
-          email: cognito.ProviderAttribute.GOOGLE_EMAIL,
-          fullname: cognito.ProviderAttribute.GOOGLE_NAME,
-          profilePicture: cognito.ProviderAttribute.GOOGLE_PICTURE,
-        },
-      }
-    );
-
-    const dashboardUrl =
-      props.stage === "prod"
-        ? "https://app.coderhelm.com"
-        : "http://localhost:3000";
-
-    const apiUrl =
-      props.stage === "prod"
-        ? "https://api.coderhelm.com"
-        : "http://localhost:3001";
+      googleProvider = new cognito.UserPoolIdentityProviderGoogle(
+        this,
+        "GoogleProvider",
+        {
+          userPool,
+          clientId: googleSecrets
+            .secretValueFromJson("google_client_id")
+            .unsafeUnwrap(),
+          clientSecretValue: googleSecrets.secretValueFromJson(
+            "google_client_secret"
+          ),
+          scopes: ["openid", "email", "profile"],
+          attributeMapping: {
+            email: cognito.ProviderAttribute.GOOGLE_EMAIL,
+            fullname: cognito.ProviderAttribute.GOOGLE_NAME,
+            profilePicture: cognito.ProviderAttribute.GOOGLE_PICTURE,
+          },
+        }
+      );
+    }
 
     const userPoolClient = new cognito.UserPoolClient(this, "UserPoolClient", {
       userPool,
@@ -164,48 +167,61 @@ export class ApiStack extends cdk.Stack {
         userPassword: true,
         userSrp: true,
       },
-      oAuth: {
-        flows: { authorizationCodeGrant: true },
-        scopes: [
-          cognito.OAuthScope.OPENID,
-          cognito.OAuthScope.EMAIL,
-          cognito.OAuthScope.PROFILE,
-          cognito.OAuthScope.COGNITO_ADMIN,
-        ],
-        callbackUrls: [`${apiUrl}/auth/google/callback`],
-        logoutUrls: [dashboardUrl],
-      },
-      supportedIdentityProviders: [
-        cognito.UserPoolClientIdentityProvider.COGNITO,
-        cognito.UserPoolClientIdentityProvider.GOOGLE,
-      ],
+      // The hosted sign-in pages are only used for Google; without it
+      // (validation requires a known URL when it is on) OAuth stays off.
+      ...(googleProvider && cfg.apiUrl && cfg.appUrl
+        ? {
+            oAuth: {
+              flows: { authorizationCodeGrant: true },
+              scopes: [
+                cognito.OAuthScope.OPENID,
+                cognito.OAuthScope.EMAIL,
+                cognito.OAuthScope.PROFILE,
+                cognito.OAuthScope.COGNITO_ADMIN,
+              ],
+              callbackUrls: [`${cfg.apiUrl}/auth/google/callback`],
+              logoutUrls: [cfg.appUrl],
+            },
+            supportedIdentityProviders: [
+              cognito.UserPoolClientIdentityProvider.COGNITO,
+              cognito.UserPoolClientIdentityProvider.GOOGLE,
+            ],
+          }
+        : {
+            disableOAuth: true,
+            supportedIdentityProviders: [
+              cognito.UserPoolClientIdentityProvider.COGNITO,
+            ],
+          }),
       generateSecret: true,
     });
 
-    userPoolClient.node.addDependency(googleProvider);
+    if (googleProvider) userPoolClient.node.addDependency(googleProvider);
 
-    // Cognito custom domain (prod: auth.coderhelm.com, dev: hosted UI prefix)
+    // Sign-in domain: a custom one when the split layout names it, else
+    // Cognito's own prefix domain.
     let userPoolDomain: cognito.UserPoolDomain;
-    if (props.stage === "prod") {
+    const authDomain = cfg.split?.authDomain;
+    if (authDomain && cfg.split?.zone) {
       const hostedZone = route53.HostedZone.fromLookup(this, "AuthZone", {
-        domainName: "coderhelm.com",
+        domainName: cfg.split.zone,
       });
 
       const authCert = new acm.Certificate(this, "AuthCertificate", {
-        domainName: "auth.coderhelm.com",
+        domainName: authDomain,
         validation: acm.CertificateValidation.fromDns(hostedZone),
       });
 
       userPoolDomain = userPool.addDomain("UserPoolDomain", {
         customDomain: {
-          domainName: "auth.coderhelm.com",
+          domainName: authDomain,
           certificate: authCert,
         },
       });
 
       new route53.ARecord(this, "AuthAliasRecord", {
         zone: hostedZone,
-        recordName: "auth",
+        recordName: recordNameIn(authDomain, cfg.split.zone),
         target: route53.RecordTarget.fromAlias(
           new route53Targets.UserPoolDomainTarget(userPoolDomain)
         ),
@@ -213,7 +229,7 @@ export class ApiStack extends cdk.Stack {
     } else {
       userPoolDomain = userPool.addDomain("UserPoolDomain", {
         cognitoDomain: {
-          domainPrefix: `coderhelm-${props.stage}`,
+          domainPrefix: cfg.cognitoDomainPrefix,
         },
       });
     }
@@ -288,7 +304,7 @@ export class ApiStack extends cdk.Stack {
     new events.Rule(this, "WeeklySummarySchedule", {
       ruleName: `${prefix}-weekly-summary`,
       description: "Weekly summary email (Mondays 13:00 UTC)",
-      enabled: WEEKLY_SUMMARY_ENABLED,
+      enabled: cfg.integrations.weeklySummary,
       schedule: events.Schedule.cron({ minute: "0", hour: "13", weekDay: "MON" }),
       targets: [
         new targets.SqsQueue(this.ticketQueue, {
@@ -355,7 +371,7 @@ export class ApiStack extends cdk.Stack {
     const secrets = secretsmanager.Secret.fromSecretNameV2(
       this,
       "Secrets",
-      `coderhelm/${props.stage}/secrets`
+      `${props.cfg.secretName}`
     );
 
     // --- Gateway Lambda (Rust) ---
@@ -378,13 +394,13 @@ export class ApiStack extends cdk.Stack {
       environment: {
         STAGE: props.stage,
         TABLE_NAME: props.table.tableName,
-        TEAMS_TABLE_NAME: `coderhelm-${props.stage}-teams`,
-        RUNS_TABLE_NAME: `coderhelm-${props.stage}-runs`,
-        ANALYTICS_TABLE_NAME: `coderhelm-${props.stage}-analytics`,
+        TEAMS_TABLE_NAME: `${props.cfg.prefix}-teams`,
+        RUNS_TABLE_NAME: `${props.cfg.prefix}-runs`,
+        ANALYTICS_TABLE_NAME: `${props.cfg.prefix}-analytics`,
         EVENTS_TABLE_NAME: props.eventsTable.tableName,
         USERS_TABLE_NAME: props.usersTable.tableName,
         JIRA_TOKENS_TABLE_NAME: props.jiraTokensTable.tableName,
-        JIRA_EVENTS_TABLE_NAME: `coderhelm-${props.stage}-jira-events`,
+        JIRA_EVENTS_TABLE_NAME: `${props.cfg.prefix}-jira-events`,
         PLANS_TABLE_NAME: props.plansTable.tableName,
         JIRA_CONFIG_TABLE_NAME: props.jiraConfigTable.tableName,
         REPOS_TABLE_NAME: props.reposTable.tableName,
@@ -402,42 +418,46 @@ export class ApiStack extends cdk.Stack {
         CI_FIX_QUEUE_URL: this.ciFixQueue.queueUrl,
         FEEDBACK_QUEUE_URL: this.feedbackQueue.queueUrl,
         DLQ_URL: dlq.queueUrl,
-        SECRETS_NAME: `coderhelm/${props.stage}/secrets`,
-        SES_FROM_ADDRESS: "noreply@coderhelm.com",
+        SECRETS_NAME: `${props.cfg.secretName}`,
+        SES_FROM_ADDRESS: cfg.email.from,
         // Where new support tickets and customer replies are emailed.
-        SUPPORT_INBOX: "support@coderhelm.com",
-        SES_TEMPLATE_PREFIX: `coderhelm-${props.stage}`,
-        MODEL_ID: "claude-sonnet-5-5",
+        SUPPORT_INBOX: cfg.email.supportInbox,
+        SES_TEMPLATE_PREFIX: `${props.cfg.prefix}`,
+        MODEL_ID: cfg.models.light,
         COGNITO_USER_POOL_ID: userPool.userPoolId,
         COGNITO_CLIENT_ID: userPoolClient.userPoolClientId,
         COGNITO_DOMAIN: userPoolDomain.domainName,
         RUST_LOG: "info",
-        TRACES_TABLE_NAME: `coderhelm-${props.stage}-traces`,
+        TRACES_TABLE_NAME: `${props.cfg.prefix}-traces`,
+        ...serviceEnvironment(cfg, this.account),
       },
     });
+    for (const st of [...modelPolicyStatements(cfg, this), publicUrlReadStatement(cfg, this), updaterInvokeStatement(cfg, this)]) {
+      if (st) this.gatewayFunction.addToRolePolicy(st);
+    }
 
     // Permissions
     props.table.grantReadWriteData(this.gatewayFunction);
 
     // Decoupled tables — use fromTableName to avoid cross-stack exports
-    const teamsTable = dynamodb.TableV2.fromTableName(this, "TeamsTableRef", `coderhelm-${props.stage}-teams`);
-    const runsTable = dynamodb.TableV2.fromTableName(this, "RunsTableRef", `coderhelm-${props.stage}-runs`);
-    const analyticsTable = dynamodb.TableV2.fromTableName(this, "AnalyticsTableRef", `coderhelm-${props.stage}-analytics`);
-    const jiraEventsTable = dynamodb.TableV2.fromTableName(this, "JiraEventsTableRef", `coderhelm-${props.stage}-jira-events`);
-    const tracesTable = dynamodb.TableV2.fromTableName(this, "TracesTableRef", `coderhelm-${props.stage}-traces`);
+    const teamsTable = dynamodb.TableV2.fromTableName(this, "TeamsTableRef", `${props.cfg.prefix}-teams`);
+    const runsTable = dynamodb.TableV2.fromTableName(this, "RunsTableRef", `${props.cfg.prefix}-runs`);
+    const analyticsTable = dynamodb.TableV2.fromTableName(this, "AnalyticsTableRef", `${props.cfg.prefix}-analytics`);
+    const jiraEventsTable = dynamodb.TableV2.fromTableName(this, "JiraEventsTableRef", `${props.cfg.prefix}-jira-events`);
+    const tracesTable = dynamodb.TableV2.fromTableName(this, "TracesTableRef", `${props.cfg.prefix}-traces`);
     teamsTable.grantReadWriteData(this.gatewayFunction);
     // fromTableName doesn't know about GSIs, so grant index access explicitly
     this.gatewayFunction.addToRolePolicy(
       new iam.PolicyStatement({
         actions: ["dynamodb:Query"],
-        resources: [`arn:aws:dynamodb:${this.region}:${this.account}:table/coderhelm-${props.stage}-teams/index/*`],
+        resources: [`arn:aws:dynamodb:${this.region}:${this.account}:table/${props.cfg.prefix}-teams/index/*`],
       })
     );
     runsTable.grantReadWriteData(this.gatewayFunction);
     this.gatewayFunction.addToRolePolicy(
       new iam.PolicyStatement({
         actions: ["dynamodb:Query"],
-        resources: [`arn:aws:dynamodb:${this.region}:${this.account}:table/coderhelm-${props.stage}-runs/index/*`],
+        resources: [`arn:aws:dynamodb:${this.region}:${this.account}:table/${props.cfg.prefix}-runs/index/*`],
       })
     );
     // Write: plan chat counts its model calls in the team's usage counters
@@ -534,7 +554,8 @@ export class ApiStack extends cdk.Stack {
       runtime: lambda.Runtime.NODEJS_20_X,
       architecture: lambda.Architecture.ARM_64,
       handler: "handler.handler",
-      code: lambda.Code.fromAsset("../lambda/mcp-proxy/dist"),
+      // MCP_PROXY_DIR: a prebuilt proxy (release artifact) instead of a local build.
+      code: lambda.Code.fromAsset(process.env.MCP_PROXY_DIR ?? repoPath("lambda/mcp-proxy/dist")),
       memorySize: 512,
       timeout: cdk.Duration.minutes(2),
       logGroup: mcpProxyLogGroup,
@@ -565,15 +586,10 @@ export class ApiStack extends cdk.Stack {
 
     const httpApi = new apigatewayv2.HttpApi(this, "HttpApi", {
       apiName: `${prefix}-api`,
-      corsPreflight: {
-        allowOrigins: [
-          props.stage === "prod"
-            ? "https://app.coderhelm.com"
-            : "http://localhost:3000",
-          ...(props.stage === "prod"
-            ? ["https://coderhelm.com", "https://www.coderhelm.com"]
-            : []),
-        ],
+      // Cross-origin only in the split layout; single-origin serves the
+      // dashboard and the API from one hostname.
+      corsPreflight: cfg.split ? {
+        allowOrigins: cfg.split.corsOrigins,
         allowMethods: [
           apigatewayv2.CorsHttpMethod.GET,
           apigatewayv2.CorsHttpMethod.POST,
@@ -583,8 +599,9 @@ export class ApiStack extends cdk.Stack {
         ],
         allowHeaders: ["Content-Type", "Authorization", "Cookie"],
         allowCredentials: true,
-      },
+      } : undefined,
     });
+    this.httpApi = httpApi;
 
     // Stage-level throttling: 1000 req/sec burst, 500 req/sec sustained
     const defaultStage = httpApi.defaultStage?.node.defaultChild as cdk.aws_apigatewayv2.CfnStage;
@@ -673,12 +690,18 @@ export class ApiStack extends cdk.Stack {
       value: userPoolClient.userPoolClientId,
     });
 
-    // --- Custom domain: api.coderhelm.com ---
-    if (props.stage === "prod") {
-      const apiDomain = "api.coderhelm.com";
+    // Self-hosted installs: the sign-in domain Google's OAuth client needs.
+    if (cfg.layout === "single-origin") {
+      new cdk.CfnOutput(this, "SignInDomain", { value: userPoolDomain.baseUrl() });
+    }
+
+    // --- Custom domain for the API (split layout) ---
+    const apiDomainName = cfg.split?.apiDomain;
+    if (apiDomainName && cfg.split?.zone) {
+      const apiDomain = apiDomainName;
 
       const hostedZone = route53.HostedZone.fromLookup(this, "Zone", {
-        domainName: "coderhelm.com",
+        domainName: cfg.split.zone,
       });
 
       const certificate = new acm.Certificate(this, "ApiCertificate", {
@@ -698,7 +721,7 @@ export class ApiStack extends cdk.Stack {
 
       new route53.ARecord(this, "ApiAliasRecord", {
         zone: hostedZone,
-        recordName: "api",
+        recordName: recordNameIn(apiDomain, cfg.split.zone),
         target: route53.RecordTarget.fromAlias(
           new route53Targets.ApiGatewayv2DomainProperties(
             customDomain.regionalDomainName,

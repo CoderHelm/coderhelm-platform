@@ -1,0 +1,25 @@
+{
+  "account": "123456789012",
+  "region": "us-east-1",
+  "stage": "prod",
+  "domain": null,
+  "models": {
+    "provider": "anthropic"
+  },
+  "email": {
+    "from": "coderhelm@example.com"
+  },
+  "admins": ["you@example.com"],
+  "signup": {
+    "domains": ["example.com"]
+  },
+  "integrations": {
+    "googleSignIn": false,
+    "sandbox": true,
+    "logAnalyzer": true,
+    "weeklySummary": true
+  },
+  "telemetry": {
+    "enabled": false
+  }
+}

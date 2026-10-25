@@ -118,6 +118,9 @@ pub async fn me(
             .collect::<Vec<_>>(),
         "status": team_status,
         "auth_provider": auth_provider,
+        // Admin of the whole install (PLATFORM_ADMIN_EMAILS): the dashboard shows
+        // the admin pages; every admin route checks again.
+        "platform_admin": is_platform_admin(&claims),
         "mfa_enabled": mfa_enabled,
     })))
 }
@@ -1879,9 +1882,12 @@ pub async fn get_jira_integration_check(
         .and_then(|n| n.parse::<u64>().ok())
         .unwrap_or(0);
 
-    let webhook_url = team_secret
-        .as_ref()
-        .map(|(token, _)| format!("https://api.coderhelm.com/webhooks/jira/{token}"));
+    let webhook_url = team_secret.as_ref().map(|(token, _)| {
+        format!(
+            "{}/webhooks/jira/{token}",
+            common::public_urls::api_url(&state.config.stage)
+        )
+    });
 
     // Load or generate forge_secret for the Forge app integration
     let jira_config = state
@@ -4084,6 +4090,7 @@ pub async fn get_model_provider(
             "api_key_masked": null,
             "primary_model": null,
             "heavy_model": null,
+            "deployment_provider": deployment_provider(),
         })));
     };
 
@@ -4121,7 +4128,18 @@ pub async fn get_model_provider(
         "primary_model": current(&primary_saved),
         "heavy_model": current(&heavy_saved),
         "retired_models": retired,
+        "deployment_provider": deployment_provider(),
     })))
+}
+
+/// How this deployment calls Claude: "bedrock" (its own AWS account, no team
+/// key needed) or "anthropic" (each team's key).
+fn deployment_provider() -> &'static str {
+    if common::model_provider::is_bedrock() {
+        "bedrock"
+    } else {
+        "anthropic"
+    }
 }
 
 /// PUT /api/settings/model-provider — configure Anthropic API key and models.
@@ -4143,6 +4161,29 @@ pub async fn update_model_provider(
 
     if !ALLOWED_MODELS.contains(&primary_model) || !ALLOWED_MODELS.contains(&heavy_model) {
         return Err(StatusCode::BAD_REQUEST);
+    }
+
+    // On Bedrock the install's own role calls the model: only the model
+    // choices are saved, with no key to check.
+    if common::model_provider::is_bedrock() {
+        let now = chrono::Utc::now().to_rfc3339();
+        state
+            .dynamo
+            .put_item()
+            .table_name(&state.config.settings_table_name)
+            .item("pk", attr_s(&claims.team_id))
+            .item("sk", attr_s("SETTINGS#MODEL_PROVIDER"))
+            .item("provider", attr_s(provider))
+            .item("primary_model", attr_s(primary_model))
+            .item("heavy_model", attr_s(heavy_model))
+            .item("updated_at", attr_s(&now))
+            .send()
+            .await
+            .map_err(|e| {
+                error!("Failed to save model provider settings: {e}");
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
+        return Ok(Json(json!({ "status": "ok", "provider": "bedrock" })));
     }
 
     // If no new key provided, try to reuse existing one

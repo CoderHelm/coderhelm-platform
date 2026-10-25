@@ -20,7 +20,24 @@ use tracing::{error, info};
 
 use crate::AppState;
 
-const NOTIFICATIONS_URL: &str = "https://app.coderhelm.com/settings/notifications/";
+/// The notification settings page.
+fn notifications_url() -> String {
+    format!(
+        "{}/settings/notifications/",
+        common::public_urls::app_url_from_env()
+    )
+}
+
+/// The page footer: the product name, and the site when there is one.
+fn footer() -> String {
+    match common::public_urls::site_url() {
+        Some(site) => format!(
+            "Coderhelm · <a href=\"{site}\" style=\"color:inherit\">{}</a>",
+            common::public_urls::host_of(site)
+        ),
+        None => "Coderhelm".to_string(),
+    }
+}
 
 #[derive(Deserialize)]
 pub struct UnsubscribeQuery {
@@ -167,7 +184,12 @@ cursor:pointer;white-space:nowrap}\
 footer{margin:24px 4px 0;font-size:13px;line-height:20px;color:var(--t3);text-align:center}";
 
 fn page(outcome: &Outcome) -> Response {
-    let settings = format!(r#"<a class="button" href="{NOTIFICATIONS_URL}">Email settings</a>"#);
+    let notifications = notifications_url();
+    let footer = footer();
+    let settings = format!(
+        r#"<a class="button" href="{}">Email settings</a>"#,
+        notifications_url()
+    );
     let (status, title, body) = match outcome {
         Outcome::Confirm { team } => {
             let team = if team.trim().is_empty() {
@@ -183,7 +205,7 @@ fn page(outcome: &Outcome) -> Response {
                      emails stay as they are.</p>\
                      <form method=\"post\"><button class=\"button\" type=\"submit\">Unsubscribe</button></form>\
                      <p class=\"more\">Changed your mind? Just close this page. \
-                     <a href=\"{NOTIFICATIONS_URL}\">Email settings&nbsp;&rarr;</a></p>"
+                     <a href=\"{notifications}\">Email settings&nbsp;&rarr;</a></p>"
                 ),
             )
         }
@@ -193,7 +215,7 @@ fn page(outcome: &Outcome) -> Response {
             format!(
                 "<p>You won't get the weekly summary email from Coderhelm any more. Other \
                  emails you have on are not affected.</p>\
-                 <a class=\"button\" href=\"{NOTIFICATIONS_URL}\">Turn it back on</a>"
+                 <a class=\"button\" href=\"{notifications}\">Turn it back on</a>"
             ),
         ),
         Outcome::Test => (
@@ -230,7 +252,7 @@ fn page(outcome: &Outcome) -> Response {
          <title>{title} · Coderhelm</title><style>{STYLE}</style></head><body>\
          <div class=\"wrap\"><div class=\"mark\" aria-label=\"Coderhelm\"><i>/</i><b>/</b><i>/</i>&nbsp;Coderhelm</div>\
          <main><h1>{title}</h1>{body}</main>\
-         <footer>Coderhelm · <a href=\"https://coderhelm.com\" style=\"color:inherit\">coderhelm.com</a></footer>\
+         <footer>{footer}</footer>\
          </div></body></html>"
     );
     let mut resp = (status, html).into_response();
@@ -357,7 +379,7 @@ mod tests {
         let html = body(resp).await;
         assert!(html.contains("You're unsubscribed"));
         assert!(html.contains("Turn it back on"));
-        assert!(html.contains(NOTIFICATIONS_URL));
+        assert!(html.contains(&notifications_url()));
     }
 
     #[tokio::test]

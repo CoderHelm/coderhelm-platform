@@ -2530,11 +2530,13 @@ pub async fn plan_chat(
         .ok()
         .and_then(|r| r.item().cloned());
 
+    // On Bedrock the deployment's own role calls the model: no team key.
     let api_key = provider_result
         .as_ref()
         .and_then(|item| item.get("api_key"))
         .and_then(|v| v.as_s().ok())
         .cloned()
+        .or_else(|| common::model_provider::is_bedrock().then(String::new))
         .ok_or_else(|| {
             error!("No Anthropic API key configured for team");
             StatusCode::BAD_REQUEST
@@ -2827,7 +2829,7 @@ async fn run_anthropic_stream(
         };
 
         // Process SSE stream from Anthropic
-        let mut stream = resp.bytes_stream();
+        let mut stream = resp;
         let mut buffer = String::new();
         let mut assistant_text = String::new();
         let mut tool_uses: Vec<(String, String, String)> = Vec::new(); // (id, name, input_json)
@@ -3145,11 +3147,13 @@ pub async fn plan_chat_stream(
         .ok()
         .and_then(|r| r.item().cloned());
 
+    // On Bedrock the deployment's own role calls the model: no team key.
     let anthropic_api_key = provider_result
         .as_ref()
         .and_then(|item| item.get("api_key"))
         .and_then(|v| v.as_s().ok())
-        .cloned();
+        .cloned()
+        .or_else(|| common::model_provider::is_bedrock().then(String::new));
 
     let model_id = provider_result
         .as_ref()

@@ -1,10 +1,14 @@
 import * as cdk from "aws-cdk-lib";
 import * as dynamodb from "aws-cdk-lib/aws-dynamodb";
 import * as kms from "aws-cdk-lib/aws-kms";
+import * as cr from "aws-cdk-lib/custom-resources";
+import * as iam from "aws-cdk-lib/aws-iam";
 import { Construct } from "constructs";
+import { ResolvedConfig } from "./config";
 
 interface DatabaseStackProps extends cdk.StackProps {
   stage: string;
+  cfg: ResolvedConfig;
 }
 
 export class DatabaseStack extends cdk.Stack {
@@ -35,11 +39,11 @@ export class DatabaseStack extends cdk.Stack {
   constructor(scope: Construct, id: string, props: DatabaseStackProps) {
     super(scope, id, props);
 
-    const isProd = props.stage === "prod";
+    const isProd = props.cfg.retainData;
 
     // KMS key for DynamoDB encryption
     this.encryptionKey = new kms.Key(this, "TableKey", {
-      alias: `coderhelm-${props.stage}-dynamo`,
+      alias: `${props.cfg.prefix}-dynamo`,
       description: "Coderhelm DynamoDB encryption key",
       enableKeyRotation: true,
       removalPolicy: cdk.RemovalPolicy.RETAIN,
@@ -49,7 +53,7 @@ export class DatabaseStack extends cdk.Stack {
     // (data sources). Separate from the table key so each service gets only the
     // direction it needs: the gateway seals and opens, the worker only opens.
     this.secretsKey = new kms.Key(this, "SecretsKey", {
-      alias: `coderhelm-${props.stage}-secrets`,
+      alias: `${props.cfg.prefix}-secrets`,
       description: "Coderhelm: seals team-provided keys for data sources",
       enableKeyRotation: true,
       removalPolicy: cdk.RemovalPolicy.RETAIN,
@@ -59,7 +63,7 @@ export class DatabaseStack extends cdk.Stack {
     // Main table: team identity (META, TEAM, WELCOME_SENT)
     // ──────────────────────────────────────────────
     this.table = new dynamodb.TableV2(this, "Table", {
-      tableName: `coderhelm-${props.stage}`,
+      tableName: `${props.cfg.prefix}`,
       partitionKey: { name: "pk", type: dynamodb.AttributeType.STRING },
       sortKey: { name: "sk", type: dynamodb.AttributeType.STRING },
       billing: dynamodb.Billing.onDemand(),
@@ -89,7 +93,7 @@ export class DatabaseStack extends cdk.Stack {
     // GSI: github_installation_id → team_id (for webhook lookup)
     // ──────────────────────────────────────────────
     this.teamsTable = new dynamodb.TableV2(this, "TeamsTable", {
-      tableName: `coderhelm-${props.stage}-teams`,
+      tableName: `${props.cfg.prefix}-teams`,
       partitionKey: { name: "team_id", type: dynamodb.AttributeType.STRING },
       sortKey: { name: "sk", type: dynamodb.AttributeType.STRING },
       billing: dynamodb.Billing.onDemand(),
@@ -120,7 +124,7 @@ export class DatabaseStack extends cdk.Stack {
     // GSI: status-index (team_id + status_run_id), repo-index (team_repo + run_id)
     // ──────────────────────────────────────────────
     this.runsTable = new dynamodb.TableV2(this, "RunsTableV2", {
-      tableName: `coderhelm-${props.stage}-runs`,
+      tableName: `${props.cfg.prefix}-runs`,
       partitionKey: { name: "team_id", type: dynamodb.AttributeType.STRING },
       sortKey: { name: "run_id", type: dynamodb.AttributeType.STRING },
       billing: dynamodb.Billing.onDemand(),
@@ -169,7 +173,7 @@ export class DatabaseStack extends cdk.Stack {
     // PK = team_id, SK = period
     // ──────────────────────────────────────────────
     this.analyticsTable = new dynamodb.TableV2(this, "AnalyticsTableV2", {
-      tableName: `coderhelm-${props.stage}-analytics`,
+      tableName: `${props.cfg.prefix}-analytics`,
       partitionKey: { name: "team_id", type: dynamodb.AttributeType.STRING },
       sortKey: { name: "period", type: dynamodb.AttributeType.STRING },
       billing: dynamodb.Billing.onDemand(),
@@ -193,7 +197,7 @@ export class DatabaseStack extends cdk.Stack {
     // TTL auto-cleanup for transient records
     // ──────────────────────────────────────────────
     this.eventsTable = new dynamodb.TableV2(this, "EventsTable", {
-      tableName: `coderhelm-${props.stage}-events`,
+      tableName: `${props.cfg.prefix}-events`,
       partitionKey: { name: "pk", type: dynamodb.AttributeType.STRING },
       sortKey: { name: "sk", type: dynamodb.AttributeType.STRING },
       billing: dynamodb.Billing.onDemand(),
@@ -216,7 +220,7 @@ export class DatabaseStack extends cdk.Stack {
     // GSI1: reverse lookup by github_id → team
     // ──────────────────────────────────────────────
     this.usersTable = new dynamodb.TableV2(this, "UsersTable", {
-      tableName: `coderhelm-${props.stage}-users`,
+      tableName: `${props.cfg.prefix}-users`,
       partitionKey: { name: "pk", type: dynamodb.AttributeType.STRING },
       sortKey: { name: "sk", type: dynamodb.AttributeType.STRING },
       billing: dynamodb.Billing.onDemand(),
@@ -251,7 +255,7 @@ export class DatabaseStack extends cdk.Stack {
     // PK = token (the random 40-char string)
     // ──────────────────────────────────────────────
     this.jiraTokensTable = new dynamodb.TableV2(this, "JiraTokensTable", {
-      tableName: `coderhelm-${props.stage}-jira-tokens`,
+      tableName: `${props.cfg.prefix}-jira-tokens`,
       partitionKey: { name: "token", type: dynamodb.AttributeType.STRING },
       billing: dynamodb.Billing.onDemand(),
       encryption: dynamodb.TableEncryptionV2.customerManagedKey(
@@ -271,7 +275,7 @@ export class DatabaseStack extends cdk.Stack {
     // PK = team_id, SK = event_id
     // ──────────────────────────────────────────────
     this.jiraEventsTable = new dynamodb.TableV2(this, "JiraEventsTableV2", {
-      tableName: `coderhelm-${props.stage}-jira-events`,
+      tableName: `${props.cfg.prefix}-jira-events`,
       partitionKey: { name: "team_id", type: dynamodb.AttributeType.STRING },
       sortKey: { name: "event_id", type: dynamodb.AttributeType.STRING },
       billing: dynamodb.Billing.onDemand(),
@@ -293,7 +297,7 @@ export class DatabaseStack extends cdk.Stack {
     // PK = team_id, SK = PLAN#<plan_id> or PLAN#<plan_id>#TASK#<task_id>
     // ──────────────────────────────────────────────
     this.plansTable = new dynamodb.TableV2(this, "PlansTable", {
-      tableName: `coderhelm-${props.stage}-plans`,
+      tableName: `${props.cfg.prefix}-plans`,
       partitionKey: { name: "pk", type: dynamodb.AttributeType.STRING },
       sortKey: { name: "sk", type: dynamodb.AttributeType.STRING },
       billing: dynamodb.Billing.onDemand(),
@@ -314,7 +318,7 @@ export class DatabaseStack extends cdk.Stack {
     // PK = team_id, SK = config key
     // ──────────────────────────────────────────────
     this.jiraConfigTable = new dynamodb.TableV2(this, "JiraConfigTable", {
-      tableName: `coderhelm-${props.stage}-jira-config`,
+      tableName: `${props.cfg.prefix}-jira-config`,
       partitionKey: { name: "pk", type: dynamodb.AttributeType.STRING },
       sortKey: { name: "sk", type: dynamodb.AttributeType.STRING },
       billing: dynamodb.Billing.onDemand(),
@@ -335,7 +339,7 @@ export class DatabaseStack extends cdk.Stack {
     // PK = team_id, SK = REPO#<owner>/<repo>
     // ──────────────────────────────────────────────
     this.reposTable = new dynamodb.TableV2(this, "ReposTable", {
-      tableName: `coderhelm-${props.stage}-repos`,
+      tableName: `${props.cfg.prefix}-repos`,
       partitionKey: { name: "pk", type: dynamodb.AttributeType.STRING },
       sortKey: { name: "sk", type: dynamodb.AttributeType.STRING },
       billing: dynamodb.Billing.onDemand(),
@@ -356,7 +360,7 @@ export class DatabaseStack extends cdk.Stack {
     // PK = team_id, SK = setting key
     // ──────────────────────────────────────────────
     this.settingsTable = new dynamodb.TableV2(this, "SettingsTable", {
-      tableName: `coderhelm-${props.stage}-settings`,
+      tableName: `${props.cfg.prefix}-settings`,
       partitionKey: { name: "pk", type: dynamodb.AttributeType.STRING },
       sortKey: { name: "sk", type: dynamodb.AttributeType.STRING },
       billing: dynamodb.Billing.onDemand(),
@@ -379,7 +383,7 @@ export class DatabaseStack extends cdk.Stack {
     // Runs and PR triage expire through `ttl`.
     // ──────────────────────────────────────────────
     this.testsTable = new dynamodb.TableV2(this, "TestsTable", {
-      tableName: `coderhelm-${props.stage}-tests`,
+      tableName: `${props.cfg.prefix}-tests`,
       partitionKey: { name: "pk", type: dynamodb.AttributeType.STRING },
       sortKey: { name: "sk", type: dynamodb.AttributeType.STRING },
       billing: dynamodb.Billing.onDemand(),
@@ -402,7 +406,7 @@ export class DatabaseStack extends cdk.Stack {
     // Separated from settings to isolate cross-account IAM data
     // ──────────────────────────────────────────────
     this.awsInsightsTable = new dynamodb.TableV2(this, "AwsInsightsTable", {
-      tableName: `coderhelm-${props.stage}-aws-insights`,
+      tableName: `${props.cfg.prefix}-aws-insights`,
       partitionKey: { name: "pk", type: dynamodb.AttributeType.STRING },
       sortKey: { name: "sk", type: dynamodb.AttributeType.STRING },
       billing: dynamodb.Billing.onDemand(),
@@ -425,7 +429,7 @@ export class DatabaseStack extends cdk.Stack {
     // Separated from settings to isolate secret material
     // ──────────────────────────────────────────────
     this.mcpConfigsTable = new dynamodb.TableV2(this, "McpConfigsTable", {
-      tableName: `coderhelm-${props.stage}-mcp-configs`,
+      tableName: `${props.cfg.prefix}-mcp-configs`,
       partitionKey: { name: "pk", type: dynamodb.AttributeType.STRING },
       sortKey: { name: "sk", type: dynamodb.AttributeType.STRING },
       billing: dynamodb.Billing.onDemand(),
@@ -449,7 +453,7 @@ export class DatabaseStack extends cdk.Stack {
     // PK = EMAIL#{normalized_email}
     // ──────────────────────────────────────────────
     this.waitlistTable = new dynamodb.TableV2(this, "WaitlistTable", {
-      tableName: `coderhelm-${props.stage}-waitlist`,
+      tableName: `${props.cfg.prefix}-waitlist`,
       partitionKey: { name: "email", type: dynamodb.AttributeType.STRING },
       billing: dynamodb.Billing.onDemand(),
       encryption: dynamodb.TableEncryptionV2.customerManagedKey(
@@ -466,7 +470,7 @@ export class DatabaseStack extends cdk.Stack {
     // PK = team_id, SK = INFRA#analysis or INFRA#REPO#<owner>/<repo>
     // ──────────────────────────────────────────────
     this.infraTable = new dynamodb.TableV2(this, "InfraTable", {
-      tableName: `coderhelm-${props.stage}-infra`,
+      tableName: `${props.cfg.prefix}-infra`,
       partitionKey: { name: "pk", type: dynamodb.AttributeType.STRING },
       sortKey: { name: "sk", type: dynamodb.AttributeType.STRING },
       billing: dynamodb.Billing.onDemand(),
@@ -487,7 +491,7 @@ export class DatabaseStack extends cdk.Stack {
     // PK = scope (BANNER#GLOBAL or BANNER#<team_id>), SK = banner_id
     // ──────────────────────────────────────────────
     this.bannersTable = new dynamodb.TableV2(this, "BannersTable", {
-      tableName: `coderhelm-${props.stage}-banners`,
+      tableName: `${props.cfg.prefix}-banners`,
       partitionKey: { name: "pk", type: dynamodb.AttributeType.STRING },
       sortKey: { name: "sk", type: dynamodb.AttributeType.STRING },
       billing: dynamodb.Billing.onDemand(),
@@ -510,7 +514,7 @@ export class DatabaseStack extends cdk.Stack {
     // TTL: 30 days
     // ──────────────────────────────────────────────
     this.tracesTable = new dynamodb.TableV2(this, "TracesTable", {
-      tableName: `coderhelm-${props.stage}-traces`,
+      tableName: `${props.cfg.prefix}-traces`,
       partitionKey: { name: "team_id", type: dynamodb.AttributeType.STRING },
       sortKey: { name: "sk", type: dynamodb.AttributeType.STRING },
       billing: dynamodb.Billing.onDemand(),
@@ -527,7 +531,7 @@ export class DatabaseStack extends cdk.Stack {
     // TTL: 7 days
     // ──────────────────────────────────────────────
     this.checkpointsTable = new dynamodb.TableV2(this, "CheckpointsTable", {
-      tableName: `coderhelm-${props.stage}-checkpoints`,
+      tableName: `${props.cfg.prefix}-checkpoints`,
       partitionKey: { name: "team_id", type: dynamodb.AttributeType.STRING },
       sortKey: { name: "sk", type: dynamodb.AttributeType.STRING },
       billing: dynamodb.Billing.onDemand(),
@@ -580,7 +584,7 @@ export class DatabaseStack extends cdk.Stack {
     // Retained temporarily — CF export still referenced by previously deployed stacks.
     // Safe to remove after one successful deploy cycle.
     this.billingTable = new dynamodb.TableV2(this, "BillingTable", {
-      tableName: `coderhelm-${props.stage}-billing-data`,
+      tableName: `${props.cfg.prefix}-billing-data`,
       partitionKey: { name: "pk", type: dynamodb.AttributeType.STRING },
       sortKey: { name: "sk", type: dynamodb.AttributeType.STRING },
       billing: dynamodb.Billing.onDemand(),
@@ -607,5 +611,49 @@ export class DatabaseStack extends cdk.Stack {
     new cdk.CfnOutput(this, "CheckpointsTableName", {
       value: this.checkpointsTable.tableName,
     });
+
+    // Who may sign up: the config's admins, addresses and domains go on the
+    // allowlist the sign-up check reads (settings table, pk ALLOWLIST).
+    // Entries are only ever added here; remove one from the dashboard.
+    const allow = [
+      ...props.cfg.signup.emails.map((e) => `EMAIL#${e}`),
+      ...props.cfg.signup.domains.map((d) => `EMAIL#*@${d}`),
+    ];
+    for (let i = 0; i < allow.length; i += 25) {
+      const chunk = allow.slice(i, i + 25);
+      const call: cr.AwsSdkCall = {
+        service: "DynamoDB",
+        action: "batchWriteItem",
+        parameters: {
+          RequestItems: {
+            [this.settingsTable.tableName]: chunk.map((sk) => ({
+              PutRequest: {
+                Item: {
+                  pk: { S: "ALLOWLIST" },
+                  sk: { S: sk },
+                  added_by: { S: "config" },
+                },
+              },
+            })),
+          },
+        },
+        physicalResourceId: cr.PhysicalResourceId.of(`allowlist-${chunk.join(",")}`.slice(0, 1000)),
+      };
+      const seed = new cr.AwsCustomResource(this, `SignupAllowlist${i / 25}`, {
+        onCreate: call,
+        onUpdate: call,
+        policy: cr.AwsCustomResourcePolicy.fromStatements([
+          new iam.PolicyStatement({
+            actions: ["dynamodb:BatchWriteItem"],
+            resources: [this.settingsTable.tableArn],
+          }),
+          new iam.PolicyStatement({
+            actions: ["kms:Encrypt", "kms:Decrypt", "kms:GenerateDataKey*", "kms:DescribeKey"],
+            resources: [this.encryptionKey.keyArn],
+          }),
+        ]),
+        installLatestAwsSdk: false,
+      });
+    }
   }
 }

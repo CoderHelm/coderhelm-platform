@@ -1,5 +1,6 @@
-//! Model provider — Anthropic direct API is the only supported LLM provider.
-//! Teams must configure their own Anthropic API key.
+//! Model provider: the Anthropic API with the team's own key, or, when the
+//! deployment uses Amazon Bedrock (`common::model_provider`), Bedrock with
+//! the deployment's own AWS role and no key.
 
 use serde::{Deserialize, Serialize};
 use tracing::info;
@@ -43,9 +44,14 @@ impl ModelProvider {
             .await
             .map_err(|e| format!("Failed to load model provider settings: {e}"))?;
 
-        let item = result
-            .item()
-            .ok_or("No model provider configured. Please set up your Anthropic API key in Settings → Model Provider.")?;
+        let bedrock = common::model_provider::is_bedrock();
+        let empty = std::collections::HashMap::new();
+        let item = match result.item() {
+            Some(item) => item,
+            // On Bedrock a team needs no settings: the defaults apply.
+            None if bedrock => &empty,
+            None => return Err("No model provider configured. Please set up your Anthropic API key in Settings → Model Provider.".into()),
+        };
 
         let api_key = item
             .get("api_key")
@@ -53,7 +59,7 @@ impl ModelProvider {
             .cloned()
             .unwrap_or_default();
 
-        if api_key.is_empty() {
+        if api_key.is_empty() && !bedrock {
             return Err("Anthropic API key is not configured. Please add your API key in Settings → Model Provider.".into());
         }
 
@@ -110,7 +116,10 @@ impl ModelProvider {
             tracing::warn!("Model provider without a usage meter; usage stays uncounted");
             common::usage::UsageMeter::memory("").0
         });
-        AnthropicClient::new(self.api_key.clone(), meter)
+        match common::model_provider::bedrock_client() {
+            Some(bedrock) => AnthropicClient::bedrock(bedrock.clone(), meter),
+            None => AnthropicClient::new(self.api_key.clone(), meter),
+        }
     }
 }
 
