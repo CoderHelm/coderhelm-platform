@@ -107,6 +107,7 @@ pub const CAPABILITIES: &[Capability] = &[
             "plans::get_plan",
             "reviewer::list_reviews",
             "reviewer::get_review",
+            "reviewer::open_prs",
             "review_lessons::list_lessons",
             "learning::get_learning",
             "tests::summary",

@@ -289,6 +289,7 @@ async fn main() -> Result<(), Error> {
         .route("/reviewer/reviews", get(routes::reviewer::list_reviews))
         .route("/reviewer/review", get(routes::reviewer::get_review))
         .route("/reviewer/live", get(routes::reviewer::live_prs))
+        .route("/reviewer/open-prs", get(routes::reviewer::open_prs))
         .route(
             "/reviewer/gate",
             get(routes::reviewer::get_gate).post(routes::reviewer::control_gate),
