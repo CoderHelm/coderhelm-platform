@@ -80,33 +80,33 @@ pub struct SourceKind {
 pub const SOURCE_KINDS: &[SourceKind] = &[
     SourceKind {
         key: "knowledge",
-        label: "Knowledge bases",
-        about: "Documents your team uploaded",
+        label: "Files and pages",
+        about: "Documents and pages your team added to Knowledge",
     },
     SourceKind {
         key: "connections",
-        label: "Connections",
-        about: "Connected tools such as Notion, Linear or Sentry, read live",
+        label: "Connected apps",
+        about: "Apps such as Notion, Linear or Sentry, read as you ask",
     },
     SourceKind {
         key: "code",
-        label: "Repositories",
-        about: "Code search, files and the code graph",
+        label: "Code",
+        about: "Your team's code and how it fits together",
     },
     SourceKind {
         key: "memories",
-        label: "Memories",
-        about: "What Coderhelm learned from past work",
+        label: "Past work",
+        about: "What Coderhelm learned from earlier work",
     },
     SourceKind {
         key: "data_sources",
-        label: "Data sources",
-        about: "Logs, databases, metrics and docs you connected, read-only",
+        label: "Logs and data",
+        about: "Logs, databases and metrics you connected, only read",
     },
     SourceKind {
         key: "skills",
-        label: "Team skills",
-        about: "Your written skills and team agents",
+        label: "Team know-how",
+        about: "Your team's written skills and helpers",
     },
 ];
 
@@ -201,6 +201,9 @@ pub struct Message {
     #[serde(default)]
     pub used: Vec<Value>,
     pub at: String,
+    /// The asker's rating of an answer: `up` or `down`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub feedback: Option<String>,
 }
 
 fn yes() -> bool {
@@ -321,7 +324,7 @@ pub async fn list_threads(
 ) -> Reply {
     let mut threads: Vec<Thread> = query(&state, &claims.team_id, "BRAIN#T#")
         .await
-        .map_err(|e| internal("brain threads", e))?;
+        .map_err(|e| internal("chat threads", e))?;
     threads.retain(|t| can_read(t, &claims.sub));
     threads.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
     threads.truncate(200);
@@ -339,12 +342,12 @@ pub async fn get_thread(
 ) -> Reply {
     let t = get_thread_record(&state, &claims.team_id, &id)
         .await
-        .map_err(|e| internal("brain thread", e))?
+        .map_err(|e| internal("chat thread", e))?
         .filter(|t| can_read(t, &claims.sub))
         .ok_or_else(|| fail(StatusCode::NOT_FOUND, "No such thread."))?;
     let mut messages: Vec<Message> = query(&state, &claims.team_id, &message_prefix(&t.id))
         .await
-        .map_err(|e| internal("brain messages", e))?;
+        .map_err(|e| internal("chat messages", e))?;
     messages.sort_by_key(|m| m.seq);
     Ok(Json(json!({
         "thread": thread_json(&t, &claims.sub),
@@ -373,7 +376,7 @@ pub async fn update_thread(
     }
     let mut t = get_thread_record(&state, &claims.team_id, &id)
         .await
-        .map_err(|e| internal("brain thread", e))?
+        .map_err(|e| internal("chat thread", e))?
         .filter(|t| can_read(t, &claims.sub))
         .ok_or_else(|| fail(StatusCode::NOT_FOUND, "No such thread."))?;
     if !can_write(&t, &claims.sub) {
@@ -397,7 +400,7 @@ pub async fn update_thread(
     }
     put(&state, &claims.team_id, &thread_sk(&t.id), &t)
         .await
-        .map_err(|e| internal("brain thread save", e))?;
+        .map_err(|e| internal("chat thread save", e))?;
     Ok(Json(json!({ "thread": thread_json(&t, &claims.sub) })))
 }
 
@@ -412,7 +415,7 @@ pub async fn delete_thread(
     }
     let t = get_thread_record(&state, &claims.team_id, &id)
         .await
-        .map_err(|e| internal("brain thread", e))?
+        .map_err(|e| internal("chat thread", e))?
         .filter(|t| can_read(t, &claims.sub))
         .ok_or_else(|| fail(StatusCode::NOT_FOUND, "No such thread."))?;
     if !can_write(&t, &claims.sub) {
@@ -423,7 +426,7 @@ pub async fn delete_thread(
     }
     let messages: Vec<Message> = query(&state, &claims.team_id, &message_prefix(&t.id))
         .await
-        .map_err(|e| internal("brain messages", e))?;
+        .map_err(|e| internal("chat messages", e))?;
     for sk in messages
         .iter()
         .map(|m| message_sk(&t.id, m.seq))
@@ -437,7 +440,7 @@ pub async fn delete_thread(
             .key("sk", AttributeValue::S(sk))
             .send()
             .await
-            .map_err(|e| internal("brain delete", e.to_string()))?;
+            .map_err(|e| internal("chat delete", e.to_string()))?;
     }
     Ok(Json(json!({ "ok": true })))
 }
@@ -528,6 +531,270 @@ pub async fn sources(
     })))
 }
 
+// ── Starter questions ───────────────────────────────────────────────────────
+
+/// A recent run, as starter questions use it.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct RecentRun {
+    pub title: String,
+    pub repo: String,
+}
+
+/// A question the empty chat offers: the words, where they come from, and
+/// the sources it turns on when picked.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct Starter {
+    pub question: String,
+    pub why: String,
+    pub sources: Picks,
+}
+
+/// How many starter questions the empty chat shows.
+pub const STARTERS: usize = 4;
+
+fn short_repo(repo: &str) -> &str {
+    repo.rsplit('/').next().unwrap_or(repo)
+}
+
+/// At most `max` characters, cut at a word with an ellipsis.
+fn clip(text: &str, max: usize) -> String {
+    let text = text.trim();
+    if text.chars().count() <= max {
+        return text.to_string();
+    }
+    let cut: String = text.chars().take(max).collect();
+    let cut = cut.rsplit_once(' ').map_or(cut.as_str(), |(head, _)| head);
+    format!("{}…", cut.trim_end_matches([',', '.', ':', ';', '-']))
+}
+
+/// Starter questions from the team's own data: a knowledge base the person
+/// may read (`(id, name)`, ready ones first), a recent run's work in its
+/// repository, how a repository is laid out, and what was learned from past
+/// work. Each one turns on exactly the sources that can answer it. Nothing
+/// is invented: with no knowledge, repositories or runs the list is empty.
+pub fn starter_questions(
+    bases: &[(String, String)],
+    repos: &[String],
+    runs: &[RecentRun],
+) -> Vec<Starter> {
+    let mut out: Vec<Starter> = Vec::new();
+    let push = |s: Starter, out: &mut Vec<Starter>| {
+        if out.len() < STARTERS && !out.iter().any(|o| o.question == s.question) {
+            out.push(s);
+        }
+    };
+    let base_q = |(id, name): &(String, String)| Starter {
+        question: format!("What should I know from {}?", clip(name, 60)),
+        why: format!("From {}", clip(name, 60)),
+        sources: Picks {
+            knowledge: vec![id.clone()],
+            ..Default::default()
+        },
+    };
+    let code = |repo: &str| Picks {
+        code: true,
+        repo: Some(repo.to_string()),
+        ..Default::default()
+    };
+    let run_qs: Vec<Starter> = runs
+        .iter()
+        .filter(|r| !r.title.trim().is_empty() && repos.contains(&r.repo))
+        .map(|r| Starter {
+            question: format!("What's the latest on “{}”?", clip(&r.title, 70)),
+            why: format!("From recent work in {}", short_repo(&r.repo)),
+            sources: code(&r.repo),
+        })
+        .collect();
+    // The repository people work in most lately leads.
+    let main_repo = runs
+        .iter()
+        .map(|r| &r.repo)
+        .find(|r| repos.contains(r))
+        .or(repos.first());
+
+    if let Some(b) = bases.first() {
+        push(base_q(b), &mut out);
+    }
+    if let Some(q) = run_qs.first() {
+        push(q.clone(), &mut out);
+    }
+    if let Some(repo) = main_repo {
+        push(
+            Starter {
+                question: format!("How is {} put together?", short_repo(repo)),
+                why: format!("From the {} code", short_repo(repo)),
+                sources: code(repo),
+            },
+            &mut out,
+        );
+        push(
+            Starter {
+                question: format!(
+                    "What should a new teammate know about {}?",
+                    short_repo(repo)
+                ),
+                why: format!("From past work in {}", short_repo(repo)),
+                sources: Picks {
+                    memories: true,
+                    repo: Some(repo.clone()),
+                    ..Default::default()
+                },
+            },
+            &mut out,
+        );
+    }
+    // Fill what is left with more of the same kinds.
+    for b in bases.iter().skip(1) {
+        push(base_q(b), &mut out);
+    }
+    for q in run_qs.into_iter().skip(1) {
+        push(q, &mut out);
+    }
+    out
+}
+
+/// The team's latest run titles and repositories, newest first.
+async fn recent_runs(state: &AppState, team_id: &str) -> Vec<RecentRun> {
+    let r = state
+        .dynamo
+        .query()
+        .table_name(&state.config.runs_table_name)
+        .key_condition_expression("team_id = :tid")
+        .expression_attribute_values(":tid", AttributeValue::S(team_id.to_string()))
+        .projection_expression("#t, #r")
+        .expression_attribute_names("#t", "title")
+        .expression_attribute_names("#r", "repo")
+        .scan_index_forward(false)
+        .limit(25)
+        .send()
+        .await;
+    match r {
+        Ok(r) => r
+            .items()
+            .iter()
+            .map(|item| {
+                let s = |k: &str| {
+                    item.get(k)
+                        .and_then(|v| v.as_s().ok())
+                        .cloned()
+                        .unwrap_or_default()
+                };
+                RecentRun {
+                    title: s("title"),
+                    repo: s("repo"),
+                }
+            })
+            .collect(),
+        Err(e) => {
+            warn!(error = %e, "Chat starters: couldn't read recent runs");
+            Vec::new()
+        }
+    }
+}
+
+/// GET /api/brain/starters — questions for the empty chat, built from the
+/// knowledge this person may read, the team's repositories and recent runs.
+pub async fn starters(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<Claims>,
+) -> Reply {
+    let st = super::knowledge::store(&state);
+    let (bases, repos, runs) = tokio::join!(
+        st.bases(&claims.team_id),
+        load_repos(&state, &claims.team_id),
+        recent_runs(&state, &claims.team_id),
+    );
+    let role = super::knowledge::reader_role(&claims.holder());
+    let mut readable: Vec<_> = bases
+        .map_err(|e| internal("knowledge bases", e))?
+        .into_iter()
+        .filter(|b| b.readable_by(role))
+        .collect();
+    readable.sort_by(|a, b| a.name.cmp(&b.name));
+    // Bases with something to read come first; at most a few are checked.
+    let mut ready = Vec::new();
+    for b in readable.into_iter().take(6) {
+        let files = st.files(&claims.team_id, &b.id).await.unwrap_or_default();
+        if files.iter().any(|f| f.ready_version > 0) {
+            ready.push((b.id, b.name));
+        }
+    }
+    let mut repo_names: Vec<String> = repos.into_keys().collect();
+    repo_names.sort();
+    Ok(Json(json!({
+        "starters": starter_questions(&ready, &repo_names, &runs),
+    })))
+}
+
+// ── Feedback on answers ─────────────────────────────────────────────────────
+
+#[derive(Debug, Deserialize)]
+pub struct FeedbackBody {
+    /// `up`, `down`, or null to clear.
+    #[serde(default)]
+    pub rating: Option<String>,
+}
+
+/// Is `rating` one an answer may carry (`None` clears it)?
+pub fn valid_rating(rating: Option<&str>) -> bool {
+    matches!(rating, None | Some("up") | Some("down"))
+}
+
+/// PUT /api/brain/threads/:id/messages/:seq/feedback — the asker rates an
+/// answer up or down (or clears the rating).
+pub async fn rate_message(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<Claims>,
+    Path((id, seq)): Path<(String, u32)>,
+    Json(body): Json<FeedbackBody>,
+) -> Reply {
+    if claims.require_role(1).is_err() {
+        return Err(fail(StatusCode::FORBIDDEN, "Viewers can't rate answers."));
+    }
+    if !valid_rating(body.rating.as_deref()) {
+        return Err(fail(StatusCode::BAD_REQUEST, "Rate an answer up or down."));
+    }
+    let t = get_thread_record(&state, &claims.team_id, &id)
+        .await
+        .map_err(|e| internal("chat thread", e))?
+        .filter(|t| can_read(t, &claims.sub))
+        .ok_or_else(|| fail(StatusCode::NOT_FOUND, "No such thread."))?;
+    if !can_write(&t, &claims.sub) {
+        return Err(fail(
+            StatusCode::FORBIDDEN,
+            "Only the person who asked can rate its answers.",
+        ));
+    }
+    let r = state
+        .dynamo
+        .get_item()
+        .table_name(&state.config.settings_table_name)
+        .key("pk", AttributeValue::S(claims.team_id.clone()))
+        .key("sk", AttributeValue::S(message_sk(&t.id, seq)))
+        .consistent_read(true)
+        .send()
+        .await
+        .map_err(|e| internal("chat message", e.to_string()))?;
+    let mut m = r
+        .item()
+        .and_then(read_data::<Message>)
+        .filter(|m| m.role == "assistant")
+        .ok_or_else(|| fail(StatusCode::NOT_FOUND, "No such answer."))?;
+    m.feedback = body.rating;
+    put(&state, &claims.team_id, &message_sk(&t.id, seq), &m)
+        .await
+        .map_err(|e| internal("chat message save", e))?;
+    info!(
+        team_id = %claims.team_id,
+        thread = %t.id,
+        seq,
+        rating = m.feedback.as_deref().unwrap_or("none"),
+        grounded = m.grounded,
+        "Chat: answer rated"
+    );
+    Ok(Json(json!({ "ok": true, "feedback": m.feedback })))
+}
+
 /// POST /api/brain/token — a five-minute token for `/api/brain/stream`,
 /// minted only for someone holding `brain_ask` (the auth middleware decides
 /// this route from its capability). Its audience is the brain's own, so it
@@ -539,7 +806,7 @@ pub async fn stream_token(
     if claims.require_role(1).is_err() {
         return Err(fail(
             StatusCode::FORBIDDEN,
-            "Your role can't ask the brain.",
+            "Your role can't ask questions.",
         ));
     }
     let token = crate::auth::jwt::create_scoped_token(
@@ -548,7 +815,7 @@ pub async fn stream_token(
         &state.secrets.jwt_secret,
         300,
     )
-    .map_err(|e| internal("brain token", e.to_string()))?;
+    .map_err(|e| internal("chat token", e.to_string()))?;
     Ok(Json(json!({ "token": token })))
 }
 
@@ -566,7 +833,7 @@ pub async fn create_attachment(
     Json(body): Json<AttachmentBody>,
 ) -> Reply {
     if claims.require_role(1).is_err() {
-        return Err(fail(StatusCode::FORBIDDEN, "Viewers can't ask the brain."));
+        return Err(fail(StatusCode::FORBIDDEN, "Viewers can't ask questions."));
     }
     let name = kb::clean_file_name(&body.name);
     let kind = super::knowledge::check_upload(&name, body.size, MAX_ATTACHMENT_BYTES)
@@ -595,7 +862,7 @@ fn user_folder(user_id: &str) -> String {
 
 // ── Asking ──────────────────────────────────────────────────────────────────
 
-const BRAIN_SYSTEM: &str = r#"You are the company brain for a software team that uses Coderhelm. You answer questions using only the team's own sources: passages from their knowledge bases, files attached to the question, and the results of tools you call (connections, repositories and the code graph, memories, data sources, team skills).
+const BRAIN_SYSTEM: &str = r#"You are Chat, the assistant for a software team that uses Coderhelm. You answer questions using only the team's own sources: passages from their knowledge bases, files attached to the question, and the results of tools you call (connections, repositories and the code graph, memories, data sources, team skills).
 
 Rules:
 - Ground every claim. After each sentence that uses a source, cite it with its id in square brackets, like [S2] or [S1, S4]. Cite only ids you were given in <source> blocks. Never invent an id.
@@ -808,7 +1075,7 @@ async fn run_tool(
                     )
                 }
                 Err(e) => {
-                    warn!(error = %e, "Brain knowledge search failed");
+                    warn!(error = %e, "Chat knowledge search failed");
                     (
                         "Error: the knowledge bases couldn't be searched.".into(),
                         "Search failed".into(),
@@ -855,7 +1122,7 @@ async fn run_tool(
                     false,
                 ),
                 Err(e) => {
-                    warn!(error = %e, "Brain memory search failed");
+                    warn!(error = %e, "Chat memory search failed");
                     (
                         "Error: memories couldn't be read.".into(),
                         "Memory read failed".into(),
@@ -1147,7 +1414,7 @@ pub async fn brain_stream(
     if !holder.holds("brain_ask") {
         return Err(fail(
             StatusCode::FORBIDDEN,
-            "Your role can read shared threads but can't ask the brain.",
+            "Your role can read shared chats but can't ask questions.",
         ));
     }
     let reader = super::knowledge::reader_role(&holder);
@@ -1165,12 +1432,12 @@ pub async fn brain_stream(
         Some(id) => {
             let t = get_thread_record(&state, &claims.team_id, id)
                 .await
-                .map_err(|e| internal("brain thread", e))?
+                .map_err(|e| internal("chat thread", e))?
                 .filter(|t| can_write(t, &claims.sub))
                 .ok_or_else(|| fail(StatusCode::NOT_FOUND, "No such thread."))?;
             let mut h: Vec<Message> = query(&state, &claims.team_id, &message_prefix(&t.id))
                 .await
-                .map_err(|e| internal("brain messages", e))?;
+                .map_err(|e| internal("chat messages", e))?;
             h.sort_by_key(|m| m.seq);
             (t, h)
         }
@@ -1187,7 +1454,7 @@ pub async fn brain_stream(
             };
             put(&state, &claims.team_id, &thread_sk(&t.id), &t)
                 .await
-                .map_err(|e| internal("brain thread save", e))?;
+                .map_err(|e| internal("chat thread save", e))?;
             (t, Vec::new())
         }
     };
@@ -1267,7 +1534,7 @@ pub async fn brain_stream(
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<Event, std::convert::Infallible>>(64);
     let user_id = claims.sub.clone();
     let attachments = body.attachments.clone();
-    info!(team_id = %claims.team_id, thread = %thread.id, kbs = run.kb_ids.len(), "Brain question");
+    info!(team_id = %claims.team_id, thread = %thread.id, kbs = run.kb_ids.len(), "Chat question");
     tokio::spawn(async move {
         let _ = tx
             .send(sse_event(
@@ -1277,7 +1544,7 @@ pub async fn brain_stream(
             .await;
         let (fin, used) = if run.api_key.is_empty() && !common::model_provider::is_bedrock() {
             let _ = tx
-                .send(sse_event("error", json!({ "message": "Add a model provider key in Settings → AI models to use the brain." })))
+                .send(sse_event("error", json!({ "message": "Add a model provider key in your AI model settings to use Chat." })))
                 .await;
             let _ = tx.send(sse_event("done", json!({}))).await;
             return;
@@ -1344,7 +1611,7 @@ pub async fn brain_stream(
         }
         .await;
         if let Err(e) = saved {
-            error!(error = %e, "Brain answer not saved");
+            error!(error = %e, "Chat answer not saved");
         }
         let _ = tx.send(sse_event("done", json!({}))).await;
     });
@@ -1439,7 +1706,7 @@ async fn answer(
                 super::knowledge::reembed(state, &run.team_id, &found.stale).await;
                 first_ids.extend(reg.add_hits(&found.hits));
             }
-            Err(e) => warn!(error = %e, "Brain retrieval failed"),
+            Err(e) => warn!(error = %e, "Chat retrieval failed"),
         }
     }
     let (att_ids, problems) = read_attachments(
@@ -1525,7 +1792,7 @@ async fn answer(
         {
             Ok(r) => r,
             Err(e) => {
-                error!(transient = e.is_transient(), "Brain model call failed: {e}");
+                error!(transient = e.is_transient(), "Chat model call failed: {e}");
                 let _ = tx
                         .send(sse_event("error", json!({ "message": "The model couldn't be reached. Try again in a moment." })))
                         .await;
@@ -1681,6 +1948,74 @@ mod tests {
         ] {
             assert!(SOURCE_KINDS.iter().any(|k| k.key == kind_of_tool(t)), "{t}");
         }
+    }
+
+    fn run(title: &str, repo: &str) -> RecentRun {
+        RecentRun {
+            title: title.into(),
+            repo: repo.into(),
+        }
+    }
+
+    #[test]
+    fn starters_come_from_the_teams_own_data() {
+        let bases = vec![
+            ("kb1".to_string(), "HR handbook".to_string()),
+            ("kb2".to_string(), "Runbooks".to_string()),
+        ];
+        let repos = vec!["acme/api".to_string(), "acme/web".to_string()];
+        let runs = vec![
+            run("", "acme/web"),
+            run("Add rate limiting to login", "acme/web"),
+            run("Old work", "gone/repo"),
+        ];
+        let s = starter_questions(&bases, &repos, &runs);
+        assert_eq!(s.len(), STARTERS);
+        assert_eq!(s[0].question, "What should I know from HR handbook?");
+        assert_eq!(s[0].sources.knowledge, vec!["kb1".to_string()]);
+        assert!(!s[0].sources.code);
+        assert_eq!(
+            s[1].question,
+            "What's the latest on “Add rate limiting to login”?"
+        );
+        assert_eq!(s[1].why, "From recent work in web");
+        assert!(s[1].sources.code);
+        assert_eq!(s[1].sources.repo.as_deref(), Some("acme/web"));
+        // The repository with the latest run leads, not the first by name.
+        assert_eq!(s[2].question, "How is web put together?");
+        assert!(s[3].sources.memories && !s[3].sources.code);
+        // A run in a repository that is no longer connected is never offered.
+        assert!(s.iter().all(|q| !q.question.contains("Old work")));
+        // Every starter turns on at least one source.
+        assert!(s
+            .iter()
+            .all(|q| SOURCE_KINDS.iter().any(|k| q.sources.allows(k.key))));
+    }
+
+    #[test]
+    fn starters_are_empty_without_data_and_fill_from_what_there_is() {
+        assert!(starter_questions(&[], &[], &[]).is_empty());
+        let only_bases: Vec<(String, String)> = (1..=5)
+            .map(|i| (format!("kb{i}"), format!("Base {i}")))
+            .collect();
+        let s = starter_questions(&only_bases, &[], &[]);
+        assert_eq!(s.len(), STARTERS);
+        assert!(s.iter().all(|q| q.sources.knowledge.len() == 1));
+        let long = "word ".repeat(40);
+        let s = starter_questions(&[], &["a/b".into()], &[run(&long, "a/b")]);
+        assert!(s[0].question.contains('…'));
+        assert!(s[0].question.chars().count() < 110);
+    }
+
+    #[test]
+    fn ratings_are_up_down_or_cleared() {
+        assert!(valid_rating(Some("up")) && valid_rating(Some("down")) && valid_rating(None));
+        assert!(!valid_rating(Some("meh")) && !valid_rating(Some("")));
+        // Old messages without a rating still read, and an unrated one writes none.
+        let m: Message =
+            serde_json::from_str(r#"{"seq":1,"role":"assistant","content":"x","at":"t"}"#).unwrap();
+        assert_eq!(m.feedback, None);
+        assert!(!serde_json::to_string(&m).unwrap().contains("feedback"));
     }
 
     #[test]

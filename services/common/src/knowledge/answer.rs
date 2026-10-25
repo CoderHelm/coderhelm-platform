@@ -13,8 +13,9 @@ use serde::{Deserialize, Serialize};
 use super::search::Hit;
 
 /// The answer given when nothing in the chosen sources supports one.
-pub const NO_SOURCE_ANSWER: &str = "I couldn't find anything in the selected sources that answers this, so I won't guess. \
-Try turning on more sources, adding the document to a knowledge base, or attaching it to your question.";
+pub const NO_SOURCE_ANSWER: &str =
+    "Nothing in what you chose to search answers this, so I won't guess. \
+Try searching more places, adding the document to Knowledge, or attaching it to your question.";
 
 /// Longest passage kept on a citation.
 const PASSAGE_CHARS: usize = 1_600;

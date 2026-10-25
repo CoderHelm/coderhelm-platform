@@ -122,7 +122,7 @@ impl Agent {
             Agent::Coder => "Coder",
             Agent::Reviewer => "Reviewer",
             Agent::PlanChat => "Plan chat",
-            Agent::BrainChat => "Brain chat",
+            Agent::BrainChat => "Chat",
             Agent::AlertFixer => "Alert fixer",
             Agent::LogAutofix => "Log auto-fix",
             Agent::Plugin => "Plugin runs",

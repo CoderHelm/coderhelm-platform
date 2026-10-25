@@ -58,7 +58,7 @@ pub fn gate_for(
             .thread(&thread)
             .person(email)
             .task(if agent == Agent::BrainChat {
-                "Answering a question in the brain chat"
+                "Answering a question in Chat"
             } else {
                 "Planning in the plan chat"
             }),
