@@ -123,6 +123,12 @@ pub const PUBLIC_ROUTES: &[PublicRoute] = &[
         handler: "alerts::handle_sns",
         auth: RouteAuth::Webhook,
     },
+    PublicRoute {
+        method: "POST",
+        path: "/webhooks/knowledge/:token",
+        handler: "knowledge_sources::webhook",
+        auth: RouteAuth::Webhook,
+    },
 ];
 
 /// May an API key call this routed handler with this method?
@@ -222,6 +228,7 @@ are verified by their signatures.";
         crate::routes::github_webhook::handle,
         crate::routes::jira_webhook::handle,
         crate::routes::alerts::handle_sns,
+        crate::routes::knowledge_sources::webhook,
     ),
     components(schemas(ErrorBody)),
     modifiers(&Common),
@@ -233,7 +240,7 @@ are verified by their signatures.";
         (name = "Reviews", description = "Pull request reviews written by CoderHelm's reviewer."),
         (name = "Usage", description = "Tokens used this month and the team's limits."),
         (name = "CI", description = "Endpoints a CI job calls with its GitHub Actions OIDC token, so no CoderHelm secret is stored in CI."),
-        (name = "Webhooks", description = "Events CoderHelm receives from GitHub, Jira and AWS SNS. Each is verified before anything happens."),
+        (name = "Webhooks", description = "Events CoderHelm receives from GitHub, Jira, AWS SNS, Sanity and Notion. Each is verified before anything happens."),
     ),
 )]
 pub struct ApiDoc;
@@ -304,6 +311,21 @@ impl Modify for Common {
             SecurityScheme::ApiKey(ApiKey::Header(ApiKeyValue::with_description(
                 "X-Hub-Signature",
                 "Only when the team generated a webhook secret: `sha256=` and the hex HMAC-SHA256 of the raw body, keyed with that secret.",
+            ))),
+        );
+
+        components.add_security_scheme(
+            "sanity_signature",
+            SecurityScheme::ApiKey(ApiKey::Header(ApiKeyValue::with_description(
+                "sanity-webhook-signature",
+                "`t=<ms>,v1=` and the base64url HMAC-SHA256 of `<t>.<body>`, keyed with the token in the address.",
+            ))),
+        );
+        components.add_security_scheme(
+            "notion_signature",
+            SecurityScheme::ApiKey(ApiKey::Header(ApiKeyValue::with_description(
+                "X-Notion-Signature",
+                "`sha256=` and the hex HMAC-SHA256 of the raw body, keyed with the subscription's verification token.",
             ))),
         );
 

@@ -69,3 +69,8 @@ These run in every install, as EventBridge rules that drop a message on the tick
 | Weekly summary | Mondays 13:00 UTC |
 | Usage reconciliation (only with an Anthropic admin key) | daily 06:00 UTC |
 | Dead-letter queue cleanup | daily 07:00 UTC |
+| Knowledge source syncs that are due | every 15 minutes |
+
+## Knowledge sources
+
+Notion, Confluence, Sanity, Google Drive, GitHub and website sources work without settings. One-click sign-in for Notion, Confluence and Google Drive, and instant updates from Notion, need OAuth apps of your own: see [Knowledge sources](./knowledge-sources.md).

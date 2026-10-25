@@ -113,6 +113,12 @@ async fn handle_event(
         // asynchronously by the gateway).
         let req: passes::knowledge::IngestRequest = serde_json::from_value(req.clone())?;
         Ok(passes::knowledge::ingest(&state, req).await)
+    } else if let Some(req) = payload.get("knowledge_sync") {
+        // One knowledge source to sync now ("Sync now", a new source, a
+        // provider's webhook; called asynchronously by the gateway).
+        let req: common::knowledge::sources::SyncMessage = serde_json::from_value(req.clone())?;
+        let call = passes::knowledge_sync::sync(&state, &req);
+        Ok(common::usage::with_feature(common::usage::feature::EMBEDDING, call).await)
     } else {
         let sqs: SqsEvent = serde_json::from_value(payload)?;
         handle_sqs(state, LambdaEvent::new(sqs, context))
@@ -458,6 +464,14 @@ async fn handle_message(state: Arc<WorkerState>, message: models::WorkerMessage)
             if let Err(e) = passes::code_graph::run(&state, msg).await {
                 error!("Code-graph index failed: {e:?}");
             }
+        }
+        models::WorkerMessage::KnowledgeSyncSweep => {
+            let queued = passes::knowledge_sync::sweep(&state).await;
+            info!(queued, "Knowledge sync sweep");
+        }
+        models::WorkerMessage::KnowledgeSync(msg) => {
+            let out = passes::knowledge_sync::sync(&state, &msg).await;
+            info!(team_id = %msg.team_id, source = %msg.source_id, result = %out, "Knowledge source synced");
         }
         models::WorkerMessage::DlqCleanup => {
             info!("DLQ cleanup");

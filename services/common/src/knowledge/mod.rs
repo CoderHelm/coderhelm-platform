@@ -21,6 +21,7 @@ pub mod answer;
 pub mod chunk;
 pub mod extract;
 pub mod search;
+pub mod sources;
 
 use serde::{Deserialize, Serialize};
 
@@ -155,6 +156,34 @@ pub struct FileMeta {
     /// Passages dropped past [`MAX_CHUNKS_PER_FILE`].
     #[serde(default)]
     pub truncated: bool,
+    /// The connected source this item was synced from ([`sources`]); empty
+    /// for an uploaded file.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub source_id: String,
+    /// The item's id in the source (a Notion page id, a Drive file id).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub external_id: String,
+    /// The original page, which citations link to.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub url: String,
+    /// Where it sits in the source ("Engineering / Runbooks").
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub path: String,
+    /// The source's own version marker (an edit time, a revision, a blob
+    /// sha): an item whose marker is unchanged is not fetched again.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub remote_version: String,
+    /// SHA-256 of the text that was indexed: a fetched item whose text is
+    /// unchanged is not embedded again.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub content_hash: String,
+}
+
+impl FileMeta {
+    /// Synced from a connected source (not uploaded).
+    pub fn is_synced(&self) -> bool {
+        !self.source_id.is_empty()
+    }
 }
 
 fn one() -> u32 {

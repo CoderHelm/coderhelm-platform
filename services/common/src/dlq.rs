@@ -59,6 +59,9 @@ pub const WORKER_MESSAGE_TYPES: &[&str] = &[
     "agent_resume_sweep",
     // A model call's usage, held because its counters couldn't be written.
     "usage_record",
+    // Knowledge sources: the scheduled sweep, and one source's sync.
+    "knowledge_sync_sweep",
+    "knowledge_sync",
 ];
 
 /// Scheduled jobs that act on every team (EventBridge puts them on the ticket
@@ -71,6 +74,7 @@ pub const GLOBAL_MESSAGE_TYPES: &[&str] = &[
     "dlq_cleanup",
     "log_autofix",
     "agent_resume_sweep",
+    "knowledge_sync_sweep",
 ];
 
 /// The DLQ keeps a message this long, counted from when it was first sent

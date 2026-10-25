@@ -502,8 +502,13 @@ pub async fn sources(
     {
         let files = st.files(&claims.team_id, &b.id).await.unwrap_or_default();
         let ready = files.iter().filter(|f| f.ready_version > 0).count();
+        let sources = super::knowledge_sources::sources_of(&state, &claims.team_id, &b.id).await;
+        let kinds = super::knowledge_sources::kinds(&files, &sources);
         knowledge.push(json!({
             "id": b.id, "name": b.name, "ready": ready, "authoritative": b.authoritative,
+            // What the base holds: `upload` and each connected app (`notion`).
+            "kind": kinds.iter().find(|k| *k != "upload").cloned().unwrap_or_else(|| "upload".into()),
+            "kinds": kinds,
         }));
     }
     knowledge.sort_by(|a, b| a["name"].as_str().cmp(&b["name"].as_str()));

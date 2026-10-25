@@ -365,6 +365,22 @@ export class ApiStack extends cdk.Stack {
       ],
     });
 
+    // Knowledge sources: every 15 min, queue a sync for each connected
+    // source whose next scheduled sync is due (hourly without webhooks,
+    // every 6 hours as a backstop with them). Does nothing without sources.
+    new events.Rule(this, "KnowledgeSyncSchedule", {
+      ruleName: `${prefix}-knowledge-sync`,
+      description: "Queue scheduled syncs of knowledge sources that are due",
+      schedule: events.Schedule.rate(cdk.Duration.minutes(15)),
+      targets: [
+        new targets.SqsQueue(this.ticketQueue, {
+          message: events.RuleTargetInput.fromObject({
+            type: "knowledge_sync_sweep",
+          }),
+        }),
+      ],
+    });
+
     // DLQ cleanup: daily 07:00 UTC. The worker archives to S3, then deletes,
     // DLQ messages it can't parse (an unknown type, not JSON) once they are
     // 7 days old (common::dlq::CLEANUP_AFTER_DAYS), before the DLQ's 14-day
@@ -657,6 +673,14 @@ export class ApiStack extends cdk.Stack {
     // Alert intake: an SNS HTTPS subscription (messages verified by signature)
     httpApi.addRoutes({
       path: "/webhooks/alerts/sns",
+      methods: [apigatewayv2.HttpMethod.POST],
+      integration: lambdaIntegration,
+    });
+
+    // Knowledge sources: providers (Sanity, Notion) say pages changed. Each
+    // request is verified by its signature before a sync starts.
+    httpApi.addRoutes({
+      path: "/webhooks/knowledge/{proxy+}",
       methods: [apigatewayv2.HttpMethod.POST],
       integration: lambdaIntegration,
     });

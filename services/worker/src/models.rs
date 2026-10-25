@@ -201,6 +201,13 @@ pub enum WorkerMessage {
     /// worker can't read once they are `common::dlq::CLEANUP_AFTER_DAYS` old.
     #[serde(rename = "dlq_cleanup")]
     DlqCleanup,
+    /// Every 15 minutes (EventBridge → SQS): queue a sync for each knowledge
+    /// source whose next scheduled sync is due.
+    #[serde(rename = "knowledge_sync_sweep")]
+    KnowledgeSyncSweep,
+    /// Sync one knowledge source (queued by the sweep).
+    #[serde(rename = "knowledge_sync")]
+    KnowledgeSync(common::knowledge::sources::SyncMessage),
     /// The Monday weekly summary emails (EventBridge → SQS). Sends nothing
     /// unless WEEKLY_SUMMARY_ENABLED is true.
     #[serde(rename = "weekly_summary")]
@@ -341,6 +348,7 @@ impl WorkerMessage {
             WorkerMessage::ReleaseNotes(_) | WorkerMessage::TagSweep(_) => f::RELEASE_NOTES,
             WorkerMessage::TestIngest(_) | WorkerMessage::TestAction(_) => f::TESTS,
             WorkerMessage::ToolProposals(_) => f::LIVE_SOURCES,
+            WorkerMessage::KnowledgeSync(_) => f::EMBEDDING,
             WorkerMessage::HiddenSuggest(_) => f::DATA_SOURCE,
             WorkerMessage::HealthCheck(_)
             | WorkerMessage::AwaitMerge(_)
@@ -350,6 +358,7 @@ impl WorkerMessage {
             | WorkerMessage::UsageReconcile(_)
             | WorkerMessage::UsageRecord(_)
             | WorkerMessage::DlqCleanup
+            | WorkerMessage::KnowledgeSyncSweep
             | WorkerMessage::AgentResumeSweep
             | WorkerMessage::LogAutofix => f::OTHER,
         }

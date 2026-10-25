@@ -344,7 +344,7 @@ pub async fn neighborhood(
 }
 
 /// The team's GitHub App installation (either table spelling).
-async fn installation_id(state: &AppState, team_id: &str) -> Option<u64> {
+pub(crate) async fn installation_id(state: &AppState, team_id: &str) -> Option<u64> {
     let from = |it: HashMap<String, AttributeValue>| {
         it.get("github_installation_id")
             .or_else(|| it.get("github_install_id"))

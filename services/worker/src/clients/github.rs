@@ -226,6 +226,14 @@ impl GitHubClient {
         Ok(token)
     }
 
+    /// An installation token (cached until shortly before it expires), for
+    /// callers that make their own GitHub requests (knowledge sync).
+    pub async fn installation_token(
+        &self,
+    ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+        self.get_installation_token().await
+    }
+
     async fn get_installation_token(
         &self,
     ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {

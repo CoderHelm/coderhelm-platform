@@ -575,6 +575,14 @@ pub async fn oauth_callback(
         .map_err(|e| fail(StatusCode::BAD_REQUEST, &e))?;
     // List the tools now so the picker has them. A failure here leaves the
     // connection saved; the status says why.
+    // A knowledge source's sign-in has no tools to list.
+    if common::knowledge::sources::oauth::is_source_connection(&s.catalog_id) {
+        info!(team = %rt.team, server = %s.id, "Knowledge source connected");
+        return Ok(Json(json!({
+            "server": { "id": s.id, "name": s.name, "catalog_id": s.catalog_id },
+            "tools_error": Value::Null,
+        })));
+    }
     let listed = rt.refresh_tool_list(&mut s, &owner).await;
     if let Err(e) = &listed {
         info!(team = %rt.team, server = %s.id, error = %e, "Tools not listed after sign-in");
