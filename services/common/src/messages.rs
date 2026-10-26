@@ -60,6 +60,10 @@ pub enum WorkerMessage {
     /// for pending checks (e.g. a staging deploy); never merges on failing CI.
     #[serde(rename = "await_merge")]
     AwaitMerge(AwaitMergeMessage),
+    /// Hosted side of hybrid: forward a held event to a self-hosted install
+    /// again (self-scheduled with SQS delay, about 24 hours of backoff).
+    #[serde(rename = "relay_retry")]
+    RelayRetry(RelayRetryMessage),
     /// Coalesced release-tag sweep (self-scheduled with SQS delay). One is armed
     /// per repo by the first merge in a batch window; later merges in the window
     /// fold into it. When it fires it cuts ONE release tag at the default
@@ -328,6 +332,7 @@ impl WorkerMessage {
             WorkerMessage::HiddenSuggest(_) => f::DATA_SOURCE,
             WorkerMessage::HealthCheck(_)
             | WorkerMessage::AwaitMerge(_)
+            | WorkerMessage::RelayRetry(_)
             | WorkerMessage::GraphIndex(_)
             | WorkerMessage::WeeklySummary
             | WorkerMessage::WeeklySummaryTest(_)
@@ -496,6 +501,23 @@ pub struct AwaitMergeMessage {
     /// They are retried on their own schedule and never end the gate.
     #[serde(default)]
     pub error_retries: u32,
+}
+
+/// A relay forward to try again (hosted side of hybrid).
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+pub struct RelayRetryMessage {
+    pub install_id: String,
+    /// The relay's delivery record (`HYBRID#<install>`, `DELIVERY#<id>`).
+    pub delivery_id: String,
+    /// The id the install refuses replays by (GitHub's delivery id).
+    pub relay_delivery_id: String,
+    pub event: String,
+    #[serde(default = "github_source")]
+    pub source: String,
+}
+
+fn github_source() -> String {
+    "github".into()
 }
 
 /// Post-merge health check job. Baseline = checks already failing at merge time,

@@ -325,6 +325,30 @@ pub async fn deliver(poster: &dyn Poster, to: &Channels, msg: &Message, what: &s
     Delivery { teams, slack }
 }
 
+/// [`deliver`], then a row per channel on the team's Deliveries page.
+pub async fn deliver_recorded(
+    poster: &dyn Poster,
+    to: &Channels,
+    msg: &Message,
+    what: &str,
+    dynamo: &aws_sdk_dynamodb::Client,
+    table: &str,
+    team: &str,
+) -> Delivery {
+    let started = std::time::Instant::now();
+    let sent = deliver(poster, to, msg, what).await;
+    crate::deliveries::record_chat(
+        dynamo,
+        table,
+        team,
+        what,
+        &sent,
+        started.elapsed().as_millis() as u64,
+    )
+    .await;
+    sent
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -34,6 +34,8 @@ aws-sdk-sts = "1"
 aws-sdk-cloudwatchlogs = "1"
 aws-sdk-cloudwatch = "1"
 aws-sdk-lambda = "1"
+# hybrid (hosted side): CNAME records for {name}.coderhelm.com
+aws-sdk-route53 = "1"
 aws-sdk-kms = "1"
 # memory: embeds a memory a person adds or edits
 aws-sdk-bedrockruntime = "1"
@@ -68,6 +70,7 @@ ulid = "1"
 thiserror = "2"
 rand = "0.9"
 urlencoding = "2"
+url = "2"
 uuid = { version = "1", features = ["v4"] }
 regex = "1"
 md5 = "0.7"

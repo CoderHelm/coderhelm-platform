@@ -63,6 +63,16 @@ export interface SplitLayout {
   streamCorsOrigins: string[];
 }
 
+export interface HybridConfig {
+  /**
+   * The parent zone, e.g. `coderhelm.com`. Moving customer addresses to a
+   * separate domain later is this setting (and its zone), not a code change.
+   */
+  zone: string;
+  /** The zone's id, to skip the lookup at synth. */
+  zoneId?: string;
+}
+
 export interface CoderhelmConfig {
   $schema?: string;
   /** The 12-digit AWS account to deploy to. */
@@ -84,6 +94,18 @@ export interface CoderhelmConfig {
   domain?: SingleOriginDomain | null;
   /** split only. */
   split?: SplitLayout;
+  /**
+   * The hosted side of hybrid self-hosting (CoderHelm's own deployment only):
+   * the zone `{name}.<zone>` addresses live in, the provisioning API's Route
+   * 53 rights there, and the fallback page every unclaimed name shows.
+   */
+  hybrid?: HybridConfig | null;
+  /**
+   * Self-hosted installs: CoderHelm's hosted API, used only when an admin
+   * turns on a hybrid part (a CoderHelm address, CoderHelm's apps).
+   * Default `https://api.coderhelm.com`; null turns hybrid off entirely.
+   */
+  hybridUrl?: string | null;
   /**
    * Keep tables, buckets and keys when a stack is deleted, and turn on
    * deletion protection. Default true.
@@ -221,6 +243,10 @@ export interface ResolvedConfig {
   distributionDomainParameter: string;
   singleOrigin: SingleOriginDomain | null;
   split: SplitLayout | null;
+  /** The hosted side of hybrid, or null (every self-hosted install). */
+  hybrid: HybridConfig | null;
+  /** Self-hosted: the hosted API hybrid parts talk to; null when turned off. */
+  hybridUrl: string | null;
   models: {
     provider: ModelProvider;
     primary: string;
@@ -278,7 +304,7 @@ const REGION_RE = /^[a-z]{2}(-gov)?-[a-z]+-\d$/;
 const URL_RE = /^https?:\/\/[^\s/]+(\/[^\s]*)?$/;
 const KNOWN_TOP_KEYS = new Set([
   "$schema", "account", "region", "stage", "resourcePrefix", "globalNameSuffix", "layout",
-  "domain", "split", "retainData", "models", "email", "admins", "signup", "integrations",
+  "domain", "split", "hybrid", "hybridUrl", "retainData", "models", "email", "admins", "signup", "integrations",
   "dashboard", "telemetry", "logReaderTemplateUrl", "publicBucketName", "siteUrl", "ci", "updates",
 ]);
 
@@ -371,6 +397,17 @@ export function validateConfig(c: unknown): string[] {
     if (cfg.dashboard?.assetDir) {
       p.push('dashboard.assetDir: the split layout does not serve the dashboard (it is deployed separately)');
     }
+  }
+  if (cfg.hybrid !== undefined && cfg.hybrid !== null) {
+    const h = cfg.hybrid;
+    if (layout !== "split") p.push("hybrid: only the hosted deployment (layout split) serves hybrid installs");
+    if (typeof h !== "object" || typeof h.zone !== "string" || !HOST_RE.test(h.zone)) p.push("hybrid.zone: a zone name such as coderhelm.com");
+    if (h.zoneId !== undefined && !/^Z[A-Z0-9]{5,32}$/.test(String(h.zoneId))) p.push("hybrid.zoneId: a Route 53 zone id such as Z0123456789ABC");
+    // The fallback site's wildcard certificate must be in us-east-1 for CloudFront.
+    if (cfg.region !== "us-east-1") p.push("hybrid: deploy the hosted side in us-east-1 (CloudFront certificates live there)");
+  }
+  if (cfg.hybridUrl !== undefined && cfg.hybridUrl !== null && (typeof cfg.hybridUrl !== "string" || !/^https:\/\/[^\s/]+$/.test(cfg.hybridUrl))) {
+    p.push("hybridUrl: an https origin such as https://api.coderhelm.com, or null to turn hybrid off");
   }
 
   const m = cfg.models ?? {};
@@ -545,6 +582,8 @@ export function resolveConfig(cfg: CoderhelmConfig, opts: { skipValidation?: boo
     distributionDomainParameter: `/${prefix}/distribution-domain`,
     singleOrigin,
     split,
+    hybrid: cfg.hybrid ? { zone: cfg.hybrid.zone.toLowerCase(), ...(cfg.hybrid.zoneId ? { zoneId: cfg.hybrid.zoneId } : {}) } : null,
+    hybridUrl: layout === "split" ? null : cfg.hybridUrl === undefined ? "https://api.coderhelm.com" : cfg.hybridUrl,
     models: {
       provider: m.provider ?? "anthropic",
       primary: m.primary ?? "claude-opus-5-5",

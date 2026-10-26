@@ -3,24 +3,26 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Page Not Found — Coderhelm</title>
+  <meta name="robots" content="noindex">
+  <title>Page not found · CoderHelm</title>
   <style>
+    :root{--bg:#fafafa;--fg:#111;--muted:#5c5c66;--line:#e4e4e7;--brand:#2563eb;--on-brand:#fff;--card:#fff}
+    @media (prefers-color-scheme:dark){:root{--bg:#0a0a0b;--fg:#f4f4f5;--muted:#a1a1aa;--line:#27272a;--brand:#60a5fa;--on-brand:#0b1220;--card:#111113}}
     *{margin:0;padding:0;box-sizing:border-box}
-    body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:#0a0a0f;color:#e0e0e8;display:flex;align-items:center;justify-content:center;min-height:100vh;padding:2rem}
-    .container{text-align:center;max-width:480px}
-    .code{font-size:8rem;font-weight:800;line-height:1;background:linear-gradient(135deg,#6366f1,#a78bfa);-webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text}
-    h1{font-size:1.5rem;margin:1rem 0 .5rem;color:#f0f0f5}
-    p{color:#9090a0;line-height:1.6;margin-bottom:2rem}
-    a{display:inline-block;padding:.75rem 2rem;background:#6366f1;color:#fff;text-decoration:none;border-radius:.5rem;font-weight:600;transition:background .2s}
-    a:hover{background:#4f46e5}
+    body{font:16px/1.55 ui-sans-serif,system-ui,-apple-system,"Segoe UI",sans-serif;background:var(--bg);color:var(--fg);display:grid;place-items:center;min-height:100vh;padding:24px 16px}
+    main{max-width:480px;width:100%;background:var(--card);border:1px solid var(--line);border-radius:16px;padding:32px}
+    .code{font-size:13px;font-weight:600;color:var(--muted);letter-spacing:.04em;margin-bottom:8px}
+    h1{font-size:24px;line-height:1.25;letter-spacing:-.02em;margin-bottom:10px}
+    p{color:var(--muted);margin-bottom:24px}
+    a{display:inline-flex;align-items:center;min-height:44px;padding:0 18px;background:var(--brand);color:var(--on-brand);text-decoration:none;border-radius:10px;font-weight:600}
   </style>
 </head>
 <body>
-  <div class="container">
+  <main>
     <div class="code">404</div>
-    <h1>Page not found</h1>
-    <p>The page you're looking for doesn't exist or has been moved.</p>
-    <a href="/dashboard">Back to Dashboard</a>
-  </div>
+    <h1>This page doesn&rsquo;t exist</h1>
+    <p>The link may be old or mistyped. Everything in CoderHelm starts from its home page.</p>
+    <a href="/">Open CoderHelm</a>
+  </main>
 </body>
 </html>

@@ -214,10 +214,28 @@ pub async fn test_email(
         .send()
         .await
     {
-        Ok(_) => Ok(Json(json!({ "sent": true, "to": claims.email }))),
+        Ok(_) => {
+            super::deliveries::record_email(
+                &state,
+                &claims.team_id,
+                "test_email",
+                &claims.email,
+                Ok(()),
+            )
+            .await;
+            Ok(Json(json!({ "sent": true, "to": claims.email })))
+        }
         Err(e) => {
             let reason = aws_sdk_sesv2::error::DisplayErrorContext(&e).to_string();
             warn!(reason = %reason, "test email not sent");
+            super::deliveries::record_email(
+                &state,
+                &claims.team_id,
+                "test_email",
+                &claims.email,
+                Err(reason.clone()),
+            )
+            .await;
             // The usual reasons: an unverified sender, or the SES sandbox.
             Ok(Json(
                 json!({ "sent": false, "reason": short_reason(&reason) }),

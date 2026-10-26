@@ -251,7 +251,13 @@ pub async fn connectors(
     let env = env(&state, &claims.team_id, None).await;
     let mut out = Vec::new();
     for kind in Kind::ALL {
-        let st = connect::status(&env, kind, app(&state, kind).is_set(), &claims.email).await;
+        let st = connect::status(
+            &env,
+            kind,
+            app(&state, kind).is_set() || super::hybrid_install::brokered(kind).is_some(),
+            &claims.email,
+        )
+        .await;
         // "Connected as": the provider account of this person's sign-in.
         let account = if st.signed_in {
             match connect::find_signin(&env.runtime(), kind, &claims.email).await {
@@ -304,7 +310,16 @@ pub async fn connect(
             "This kind of source doesn't sign in.",
         )
     })?;
-    let a = app(&state, kind);
+    // A hybrid install that chose CoderHelm's app for this provider signs in
+    // through CoderHelm's broker (its client id is the install id).
+    let brokered = super::hybrid_install::brokered(kind);
+    let a = match &brokered {
+        Some(c) => oauth::App {
+            client_id: c.install_id.clone(),
+            client_secret: c.secret.clone(),
+        },
+        None => app(&state, kind),
+    };
     if !a.is_set() {
         return Err(fail(
             StatusCode::BAD_REQUEST,
@@ -321,7 +336,16 @@ pub async fn connect(
         .seal_client_secret(&id, a.client_secret.trim())
         .await
         .map_err(|e| internal("seal knowledge client", e))?;
-    let mut rec = oauth::connection_record(kind, &provider, a.client_id.trim(), &sealed);
+    let mut rec = if brokered.is_some() {
+        oauth::brokered_connection_record(
+            kind,
+            &common::hybrid::hosted_url(),
+            a.client_id.trim(),
+            &sealed,
+        )
+    } else {
+        oauth::connection_record(kind, &provider, a.client_id.trim(), &sealed)
+    };
     rec.added_by = claims.email.clone();
     rec.added_at = now();
     if let Ok(Some(old)) = rt.store.get_server(&claims.team_id, &id).await {

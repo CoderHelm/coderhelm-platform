@@ -1,0 +1,16 @@
+{
+  "_comment": "Names under the hybrid parent zone (coderhelm.com) that no install may claim. zone_records: every host CoderHelm itself serves there (the CDK stacks' records, plus the dashboard, docs and marketing site deployed elsewhere); infra/test/hybrid.test.ts fails when a hosted stack adds a record that isn't listed. blocklist: names that would mislead or that infrastructure commonly uses.",
+  "zone_records": ["api", "app", "auth", "docs", "stream", "www", "fallback"],
+  "blocklist": [
+    "about", "account", "accounts", "admin", "administrator", "alerts", "apps", "assets", "autodiscover",
+    "beta", "billing", "blog", "careers", "cdn", "chat", "coderhelm", "community", "console", "dashboard",
+    "demo", "dev", "developer", "developers", "dns", "download", "downloads", "edge", "email", "events",
+    "forum", "ftp", "git", "github", "help", "hooks", "hosted", "hybrid", "imap", "internal", "jira",
+    "jobs", "legal", "login", "logout", "mail", "marketplace", "mcp", "media", "mx", "news", "ns", "ns1",
+    "ns2", "ns3", "ns4", "oauth", "official", "ops", "pay", "payments", "plugins", "pop", "portal",
+    "preview", "privacy", "prod", "production", "proxy", "relay", "root", "sales", "secure", "security",
+    "selfhost", "self-host", "signin", "signup", "slack", "smtp", "sso", "staging", "static", "status",
+    "store", "support", "teams", "terms", "test", "testing", "trust", "update", "updates", "vpn",
+    "webhook", "webhooks", "webmail"
+  ]
+}

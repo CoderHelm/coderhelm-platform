@@ -20,6 +20,7 @@ import * as scheduler from "aws-cdk-lib/aws-scheduler";
 import { Construct } from "constructs";
 import { ResolvedConfig } from "./config";
 import { repoPath } from "./paths";
+import { Hybrid } from "./hybrid";
 import { serviceEnvironment, modelPolicyStatements, publicUrlReadStatement, recordNameIn, setupEnvironment, setupStatements, updaterInvokeStatement } from "./service-env";
 
 interface ApiStackProps extends cdk.StackProps {
@@ -753,6 +754,33 @@ export class ApiStack extends cdk.Stack {
       integration: lambdaIntegration,
     });
 
+    // Hybrid installs: events CoderHelm's relay forwards (signed with the
+    // install's relay key) and the ownership proof the hosted side asks for.
+    httpApi.addRoutes({
+      path: "/webhooks/relay",
+      methods: [apigatewayv2.HttpMethod.POST],
+      integration: lambdaIntegration,
+    });
+    httpApi.addRoutes({
+      path: "/webhooks/relay/proof",
+      methods: [apigatewayv2.HttpMethod.GET],
+      integration: lambdaIntegration,
+    });
+    // The hosted side of hybrid: what self-hosted installs call (signed with
+    // their registration secret), the OAuth broker and the fallback page.
+    if (cfg.hybrid) {
+      httpApi.addRoutes({
+        path: "/hybrid/{proxy+}",
+        methods: [
+          apigatewayv2.HttpMethod.GET,
+          apigatewayv2.HttpMethod.POST,
+          apigatewayv2.HttpMethod.PUT,
+          apigatewayv2.HttpMethod.DELETE,
+        ],
+        integration: lambdaIntegration,
+      });
+    }
+
     // CI uploads and the quarantine list, signed with a GitHub Actions OIDC token
     httpApi.addRoutes({
       path: "/webhooks/ci/{proxy+}",
@@ -799,6 +827,12 @@ export class ApiStack extends cdk.Stack {
       ],
       integration: lambdaIntegration,
     });
+
+    // The hosted side of hybrid: Route 53 rights for {name}.<zone> and the
+    // fallback page for every unclaimed name (lib/hybrid.ts).
+    if (cfg.hybrid) {
+      new Hybrid(this, "Hybrid", { cfg, httpApi, gatewayFunction: this.gatewayFunction });
+    }
 
     // Outputs
     new cdk.CfnOutput(this, "ApiUrl", {

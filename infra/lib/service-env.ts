@@ -36,6 +36,14 @@ export function serviceEnvironment(cfg: ResolvedConfig, account: string): Record
     env.GOOGLE_SIGN_IN = cfg.integrations.googleSignIn ? "true" : "false";
     if (cfg.updates.enabled) env.UPDATER_FUNCTION_NAME = `${cfg.prefix}-updater`;
   }
+  // Hybrid: a self-hosted install's hosted API (used only once an admin turns
+  // a hybrid part on), and the zone `{name}.<zone>` addresses live in.
+  // The default (https://api.coderhelm.com) is built into the services, so a
+  // plain install carries nothing of the hosted deployment; "off" when the
+  // config turns hybrid off.
+  if (cfg.layout === "single-origin" && cfg.hybridUrl === null) env.HYBRID_URL = "off";
+  else if (cfg.hybridUrl && cfg.hybridUrl !== "https://api.coderhelm.com") env.HYBRID_URL = cfg.hybridUrl;
+  if (cfg.hybrid) env.HYBRID_ZONE_NAME = cfg.hybrid.zone;
   // The services read the secret once at start. The installer sets this to
   // the secret's version after it stores new keys (the GitHub App), so the
   // functions restart and read them. Unset in normal deploys.

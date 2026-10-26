@@ -32,7 +32,7 @@ use crate::AppState;
 /// Where the browser goes after the manifest flow, unless the install says otherwise.
 pub const DEFAULT_RETURN_URL: &str = "https://docs.coderhelm.com/self-host/install/";
 
-fn enabled() -> bool {
+pub(crate) fn enabled() -> bool {
     std::env::var("SETUP_ENDPOINTS").is_ok_and(|v| v == "1")
 }
 
@@ -131,7 +131,7 @@ fn secret_name() -> String {
 }
 
 /// The secret as it is now (not as it was when this function started).
-async fn read_secret() -> Result<Value, String> {
+pub(crate) async fn read_secret() -> Result<Value, String> {
     let r = secrets_client()
         .await
         .get_secret_value()
@@ -142,7 +142,7 @@ async fn read_secret() -> Result<Value, String> {
     serde_json::from_str(r.secret_string().unwrap_or("{}")).map_err(|e| e.to_string())
 }
 
-async fn write_secret(value: &Value) -> Result<String, String> {
+pub(crate) async fn write_secret(value: &Value) -> Result<String, String> {
     let r = secrets_client()
         .await
         .put_secret_value()
@@ -155,7 +155,7 @@ async fn write_secret(value: &Value) -> Result<String, String> {
 }
 
 /// Restarts the services so they read the new keys (the updater does it).
-async fn refresh_services(state: &AppState, revision: &str) -> bool {
+pub(crate) async fn refresh_services(state: &AppState, revision: &str) -> bool {
     let Some(name) = env("UPDATER_FUNCTION_NAME") else {
         return false;
     };
