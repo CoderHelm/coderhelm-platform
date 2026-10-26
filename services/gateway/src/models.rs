@@ -32,6 +32,8 @@ pub struct Config {
     pub ticket_queue_arn: String,
     pub ci_fix_queue_url: String,
     pub feedback_queue_url: String,
+    /// Outbound webhook events and retries. Empty: nothing is emitted.
+    pub webhook_queue_url: String,
     pub dlq_url: String,
     pub ses_from_address: String,
     pub ses_template_prefix: String,
@@ -89,6 +91,7 @@ impl Config {
             ci_fix_queue_url: std::env::var("CI_FIX_QUEUE_URL").expect("CI_FIX_QUEUE_URL required"),
             feedback_queue_url: std::env::var("FEEDBACK_QUEUE_URL")
                 .expect("FEEDBACK_QUEUE_URL required"),
+            webhook_queue_url: std::env::var("WEBHOOK_QUEUE_URL").unwrap_or_default(),
             dlq_url: std::env::var("DLQ_URL").unwrap_or_default(),
             ses_from_address: std::env::var("SES_FROM_ADDRESS")
                 .unwrap_or_else(|_| "notifications@coderhelm.com".to_string()),

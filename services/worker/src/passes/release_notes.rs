@@ -917,6 +917,36 @@ async fn run_locked(
         save_record(state, &msg.team_id, &record_sk, tag, &rec).await;
     }
     info!(%tag, repo = %format!("{owner}/{repo}"), "Release notes published");
+    if msg.resend.is_empty() {
+        let channels: Vec<&str> = [
+            ("github", !release_url.is_empty()),
+            (
+                "confluence",
+                rec.get("confluence_url").is_some_and(|u| !u.is_empty()),
+            ),
+            (
+                "email",
+                rec.get("email_sent_at").is_some_and(|u| !u.is_empty()),
+            ),
+        ]
+        .iter()
+        .filter(|(_, on)| *on)
+        .map(|(c, _)| *c)
+        .collect();
+        super::webhooks::emit(
+            state,
+            &msg.team_id,
+            "release_notes.published",
+            json!({
+                "repo": format!("{owner}/{repo}"),
+                "tag": tag,
+                "sha": msg.sha,
+                "release_url": Some(release_url.as_str()).filter(|u| !u.is_empty()),
+                "channels": channels,
+            }),
+        )
+        .await;
+    }
     // Plugins with a release trigger (a marketing plugin's launch posts)
     // start from these notes. Only the first publish, never a re-send.
     if msg.resend.is_empty() {

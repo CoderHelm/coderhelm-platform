@@ -1315,6 +1315,44 @@ async fn record_event(
     if let Err(e) = written {
         warn!(topic = %msg.topic_arn, ticket = %tid, error = %e, "Could not record alert event");
     }
+    // The alert's id seeds the event's, so an SNS redelivery is sent once.
+    common::webhooks::emit_event_keyed(
+        &state.sqs,
+        &state.config.webhook_queue_url,
+        &route.team_id,
+        "alert.received",
+        alert_event_data(&id, alert, outcome, repo, tid, &received_at),
+        Some(&id),
+    )
+    .await;
+}
+
+/// `alert.received`'s `data` (pure).
+pub fn alert_event_data(
+    id: &str,
+    alert: &Alert,
+    outcome: Outcome,
+    repo: &str,
+    tid: &str,
+    received_at: &str,
+) -> Value {
+    use common::alert_notify::Severity;
+    let severity = match common::alert_notify::severity(alert.kind, &alert.title) {
+        Severity::Alarm => "alarm",
+        Severity::Warning => "warning",
+        Severity::Resolved => "resolved",
+        Severity::Info => "info",
+    };
+    serde_json::json!({
+        "alert_id": id,
+        "kind": alert.kind,
+        "title": common::truncate_str(&alert.title, 300),
+        "severity": severity,
+        "outcome": outcome.as_str(),
+        "repo": Some(repo).filter(|r| !r.is_empty()),
+        "ticket_id": tid,
+        "received_at": received_at,
+    })
 }
 
 /// Pure: may another alert run start? Tokens used plus a reserve for each run
@@ -2338,6 +2376,34 @@ pub async fn get_event(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_alert_event_carries_the_documented_fields() {
+        let alert = normalize(
+            Some("ALARM: api-5xx"),
+            r#"{"AlarmName":"api-5xx","NewStateValue":"ALARM","NewStateReason":"x"}"#,
+        );
+        let d = alert_event_data(
+            "01JBALERT3K8P2N6Q9R1S4T7V0",
+            &alert,
+            Outcome::RunStarted,
+            "example-org/api",
+            "ALERT-1",
+            "2026-10-26T09:14:03+00:00",
+        );
+        let schema = common::webhooks::catalog::data_schema(
+            common::webhooks::catalog::find("alert.received").unwrap(),
+        );
+        let props = schema["properties"].as_object().unwrap();
+        let keys: std::collections::BTreeSet<&String> = d.as_object().unwrap().keys().collect();
+        assert_eq!(keys, props.keys().collect());
+        assert_eq!(d["severity"], "alarm");
+        assert_eq!(d["outcome"], "run_started");
+        let none = alert_event_data("x", &alert, Outcome::NoMatch, "", "T", "t");
+        assert_eq!(none["repo"], Value::Null);
+        let sev = props["severity"]["enum"].as_array().unwrap();
+        assert!(sev.contains(&d["severity"]));
+    }
 
     #[test]
     fn a_route_keeps_only_its_webhooks_and_shows_them_as_hints() {

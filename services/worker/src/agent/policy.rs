@@ -430,8 +430,11 @@ pub async fn end_run_for_stop(state: &WorkerState, team_id: &str, run_id: &str, 
         .ended_values()
         .send()
         .await;
-    if let Err(e) = r {
-        tracing::warn!(run_id, error = %e, "Couldn't record why the run stopped");
+    match r {
+        Ok(_) => {
+            crate::passes::webhooks::emit_run(state, team_id, run_id, status).await;
+        }
+        Err(e) => tracing::warn!(run_id, error = %e, "Couldn't record why the run stopped"),
     }
 }
 

@@ -21,6 +21,22 @@ pub enum EmailEvent {
         used_tokens: String,
         limit_tokens: String,
     },
+    /// A webhook endpoint failed for days and was turned off. Goes to the
+    /// team's admins and owners only.
+    WebhookDisabled {
+        url: String,
+        host: String,
+        description: String,
+        failing_since: String,
+        days: i64,
+    },
+}
+
+impl EmailEvent {
+    /// Only admins and owners get it.
+    fn admins_only(&self) -> bool {
+        matches!(self, EmailEvent::WebhookDisabled { .. })
+    }
 }
 
 /// Send a templated email to all users of a team who have the notification enabled.
@@ -68,6 +84,24 @@ pub async fn send_notification(
             })
             .to_string(),
         ),
+        EmailEvent::WebhookDisabled {
+            url,
+            host,
+            description,
+            failing_since,
+            days,
+        } => (
+            "webhook-disabled",
+            "",
+            json!({
+                "url": url,
+                "host": host,
+                "description": description,
+                "failing_since": failing_since,
+                "days": days,
+            })
+            .to_string(),
+        ),
     };
 
     let template_name = format!("{}-{}", state.config.ses_template_prefix, template_suffix);
@@ -99,6 +133,16 @@ pub async fn send_notification(
             Some(id) => id.clone(),
             None => continue,
         };
+        if event.admins_only() {
+            let role = user_item
+                .get("role")
+                .and_then(|v| v.as_s().ok())
+                .map(String::as_str)
+                .unwrap_or("");
+            if !matches!(role, "admin" | "owner") {
+                continue;
+            }
+        }
 
         // Check notification preferences (skip for welcome emails — always send)
         if !pref_field.is_empty() {

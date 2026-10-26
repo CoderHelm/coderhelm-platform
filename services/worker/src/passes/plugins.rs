@@ -581,6 +581,13 @@ pub async fn run_plugin(state: &WorkerState, msg: PluginRunMessage) -> Res {
     for id in &rec.artifacts {
         notify_review(state, &msg.team_id, id).await;
     }
+    // Only teams with plugins on run plugins; the check keeps the event
+    // behind the same flag even for a run queued before it was turned off.
+    if let Some(data) = super::webhooks::plugin_run_data(&rec) {
+        if flag::enabled(&kv, &msg.team_id).await {
+            super::webhooks::emit(state, &msg.team_id, "plugin.run.completed", data).await;
+        }
+    }
     Ok(())
 }
 

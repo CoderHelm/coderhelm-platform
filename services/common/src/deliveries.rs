@@ -95,6 +95,8 @@ pub enum Redeliver {
     Relay,
     /// Send a test message to the same channel (the original isn't kept).
     NotifyTest,
+    /// Send the kept event to the team's webhook endpoint again, signed now.
+    Webhook,
 }
 
 /// One delivery.
@@ -102,7 +104,7 @@ pub enum Redeliver {
 pub struct Delivery {
     pub id: String,
     pub direction: Direction,
-    /// `github`, `relay`, `jira`, `alerts`, `slack`, `teams`, `email`, `broker`, `knowledge`.
+    /// `github`, `relay`, `jira`, `alerts`, `slack`, `teams`, `email`, `broker`, `knowledge`, `webhook`.
     pub source: String,
     /// The event or message type, e.g. `pull_request.opened`.
     pub event: String,
@@ -122,6 +124,9 @@ pub struct Delivery {
     pub repo: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pr: Option<u64>,
+    /// The team's webhook endpoint an outbound webhook went to.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub endpoint_id: String,
     pub created_at: String,
     pub duration_ms: u64,
     #[serde(default)]
@@ -152,6 +157,7 @@ impl Delivery {
             external_id: String::new(),
             repo: String::new(),
             pr: None,
+            endpoint_id: String::new(),
             created_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
             duration_ms: 0,
             attempts: vec![],
@@ -340,6 +346,16 @@ const REASONS: &[Reason] = &[
     Reason { code: "broker_refused", message: "CoderHelm's token broker refused the request.", fix: "Open Settings, System, Hybrid: it shows the link's state and how to fix it." },
     Reason { code: "broker_unreachable", message: "CoderHelm's token broker didn't answer.", fix: "Usually temporary; the next request retries. status.coderhelm.com shows any outage." },
     Reason { code: "jira_signature", message: "The Jira webhook's signature didn't match.", fix: "Copy the webhook secret from Settings, Jira into Jira's webhook again." },
+    Reason { code: "webhook_unreachable", message: "Your webhook endpoint couldn't be reached (the connection failed or its name didn't resolve).", fix: "Check the endpoint's address and that it is up. CoderHelm keeps retrying for about a day." },
+    Reason { code: "webhook_timeout", message: "Your webhook endpoint didn't answer within 10 seconds.", fix: "Answer with a 2xx at once and do the work afterwards (queue it). CoderHelm retries meanwhile." },
+    Reason { code: "webhook_server_error", message: "Your webhook endpoint answered with a server error (5xx).", fix: "Check your endpoint's logs for this event id. CoderHelm retries for about a day." },
+    Reason { code: "webhook_rate_limited", message: "Your webhook endpoint answered 429 Too Many Requests.", fix: "Raise the endpoint's limit for CoderHelm. CoderHelm retries later." },
+    Reason { code: "webhook_refused", message: "Your webhook endpoint refused the event (a 4xx answer), so it isn't retried.", fix: "Check that the endpoint verifies signatures with the right secret and accepts JSON, then press Resend." },
+    Reason { code: "webhook_endpoint_gone", message: "Your webhook endpoint answered 410 Gone.", fix: "Update the address in Settings, Webhooks, or delete the endpoint." },
+    Reason { code: "webhook_redirect", message: "Your webhook endpoint answered with a redirect. Redirects aren't followed.", fix: "Use the final address (where the redirect points) in Settings, Webhooks." },
+    Reason { code: "webhook_blocked", message: "The endpoint's address points inside a private network, or to a local or cloud metadata address, so nothing was sent.", fix: "Use an address on the public internet. Its name must resolve only to public addresses." },
+    Reason { code: "webhook_gave_up", message: "Delivery stopped after about a day of failed attempts.", fix: "Fix what the attempts show, then press Resend, or replay a time range from the endpoint's page." },
+    Reason { code: "webhook_disabled", message: "The endpoint is turned off, so the event wasn't sent.", fix: "Turn the endpoint on in Settings, Webhooks, then replay the events you missed." },
     Reason { code: "jira_limit", message: "The team's monthly token limit was reached, so the ticket wasn't started.", fix: "Raise the limit in Settings, Usage, or wait for next month." },
 ];
 
@@ -367,6 +383,7 @@ pub fn reason_for_http(source: &str, code: Option<u16>) -> &'static str {
         ("slack" | "teams", Some(404 | 410)) => "chat_webhook_gone",
         ("slack" | "teams", None) => "chat_unreachable",
         ("slack" | "teams", Some(_)) => "chat_rejected",
+        ("webhook", c) => crate::webhooks::deliver::reason_code(c, false, false),
         _ => "unknown",
     }
 }
@@ -536,6 +553,9 @@ pub struct Filter {
     /// A delivery id, GitHub delivery id, repository or PR number.
     #[serde(default)]
     pub q: Option<String>,
+    /// Only deliveries to this webhook endpoint.
+    #[serde(default)]
+    pub endpoint: Option<String>,
 }
 
 impl Filter {
@@ -560,6 +580,11 @@ impl Filter {
                 other => d.status.as_str() == other,
             };
             if !ok {
+                return false;
+            }
+        }
+        if let Some(ep) = self.endpoint.as_deref().filter(|e| !e.is_empty()) {
+            if d.endpoint_id != ep {
                 return false;
             }
         }
@@ -911,6 +936,7 @@ mod tests {
             status: status.map(Into::into),
             since: None,
             q: q.map(Into::into),
+            endpoint: None,
         };
         assert!(f(Some("github"), Some("failed"), None).matches(&d));
         assert!(!f(Some("relay"), None, None).matches(&d));
@@ -928,5 +954,19 @@ mod tests {
             ..Default::default()
         };
         assert!(!since.matches(&d));
+        let mut w = at("2026-10-25T10:00:00Z", Status::Failed, "webhook");
+        w.endpoint_id = "ep_1".into();
+        let ep = |e: &str| Filter {
+            endpoint: Some(e.into()),
+            ..Default::default()
+        };
+        assert!(ep("ep_1").matches(&w));
+        assert!(!ep("ep_2").matches(&w));
+        assert!(!ep("ep_1").matches(&d));
+        assert_eq!(
+            reason_for_http("webhook", Some(503)),
+            "webhook_server_error"
+        );
+        assert_eq!(reason_for_http("webhook", None), "webhook_unreachable");
     }
 }

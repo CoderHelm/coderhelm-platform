@@ -30,6 +30,8 @@ interface StreamingStackProps extends cdk.StackProps {
   secretsKey: kms.Key;
   /** Where a plan chat call whose usage couldn't be written is queued. */
   ticketQueue: sqs.IQueue;
+  /** Outbound webhook events (a route this function serves may emit one). */
+  webhookQueue: sqs.IQueue;
 }
 
 export class StreamingStack extends cdk.Stack {
@@ -112,6 +114,7 @@ export class StreamingStack extends cdk.Stack {
         // A model call whose usage couldn't be written waits here
         // (`usage_record`), for the worker to add once.
         TICKET_QUEUE_URL: props.ticketQueue.queueUrl,
+        WEBHOOK_QUEUE_URL: props.webhookQueue.queueUrl,
         // Unused by streaming but required by shared binary
         CI_FIX_QUEUE_URL: "unused",
         FEEDBACK_QUEUE_URL: "unused",
@@ -157,6 +160,7 @@ export class StreamingStack extends cdk.Stack {
     );
 
     props.ticketQueue.grantSendMessages(this.streamingFunction);
+    props.webhookQueue.grantSendMessages(this.streamingFunction);
 
     // Bedrock: Titan embeddings only (the shared gateway binary's memory
     // routes, metered in common::embed). Plan chat calls Anthropic directly

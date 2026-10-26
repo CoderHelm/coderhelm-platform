@@ -241,6 +241,7 @@ pub async fn list(
         status: q.status,
         since: q.since,
         q: q.q,
+        endpoint: None,
     };
     let limit = q.limit.unwrap_or(100).clamp(1, 500);
     let all = everything(&state, &claims, &f).await;
@@ -306,7 +307,9 @@ pub async fn get(
 
 /// Which redelivery this record allows, if any.
 fn redeliver_kind(d: &Delivery) -> Option<deliveries::Redeliver> {
-    if d.status.is_ok() && d.source != "github" {
+    // GitHub's and a webhook's deliveries can be sent again even when they
+    // went fine (the receiver asks for it); the others only when they failed.
+    if d.status.is_ok() && d.source != "github" && d.source != "webhook" {
         return None;
     }
     match (d.source.as_str(), d.redeliver) {
@@ -315,6 +318,11 @@ fn redeliver_kind(d: &Delivery) -> Option<deliveries::Redeliver> {
         }
         ("relay", Some(deliveries::Redeliver::Relay)) if d.id.starts_with("relay:") => {
             Some(deliveries::Redeliver::Relay)
+        }
+        ("webhook", Some(deliveries::Redeliver::Webhook))
+            if !d.endpoint_id.is_empty() && !d.external_id.is_empty() =>
+        {
+            Some(deliveries::Redeliver::Webhook)
         }
         _ => None,
     }
@@ -344,6 +352,14 @@ pub async fn redeliver(
     let d: Delivery = serde_json::from_value(v["delivery"].clone())
         .map_err(|_| fail(StatusCode::INTERNAL_SERVER_ERROR, "Unreadable record."))?;
     match redeliver_kind(&d) {
+        Some(deliveries::Redeliver::Webhook) => {
+            let d = super::webhooks::resend_record(&state, &claims.team_id, d).await?;
+            let ok = d.status.is_ok();
+            Ok(Json(json!({
+                "ok": ok,
+                "message": if ok { "Sent again and delivered." } else { "Sent again; the endpoint didn't take it. The attempt is on the record." },
+            })))
+        }
         Some(deliveries::Redeliver::Relay) => {
             let creds = common::hybrid::client::credentials().ok_or_else(|| {
                 fail(
@@ -492,6 +508,22 @@ mod tests {
         );
         let e = Delivery::new(Direction::Outbound, "email", "invite", "example.com");
         assert_eq!(redeliver_kind(&e), None);
+        let mut w = Delivery::new(
+            Direction::Outbound,
+            "webhook",
+            "run.failed",
+            "hooks.example.com",
+        );
+        w.redeliver = Some(deliveries::Redeliver::Webhook);
+        w.status = Status::Handled;
+        assert_eq!(redeliver_kind(&w), None, "needs the endpoint and the event");
+        w.endpoint_id = "ep_1".into();
+        w.external_id = "evt_1".into();
+        assert_eq!(
+            redeliver_kind(&w),
+            Some(deliveries::Redeliver::Webhook),
+            "a delivered webhook can be sent again"
+        );
     }
 
     #[test]

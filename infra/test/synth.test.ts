@@ -621,3 +621,49 @@ test("sign-in: hosted keeps its open pool (no pre-sign-up trigger) and optional 
   assert.equal(pool.Properties.LambdaConfig.PreSignUp, undefined);
   assert.ok(pool.Properties.LambdaConfig.CustomMessage);
 });
+
+test("outbound webhooks: one queue, wired to the worker, sendable by every emitter", () => {
+  const t = synth(selfHost());
+  const api = t["coderhelm-prod-api"];
+  const queues = api.findResources("AWS::SQS::Queue", {
+    Properties: { QueueName: "coderhelm-prod-webhooks" },
+  });
+  const ids = Object.keys(queues);
+  assert.equal(ids.length, 1, "one webhooks queue");
+  const q = (queues[ids[0]] as any).Properties;
+  // Visible longer than the worker can run, retried into the shared DLQ.
+  assert.equal(q.VisibilityTimeout, 960);
+  assert.equal(q.RedrivePolicy.maxReceiveCount, 3);
+  // Every function that emits or sends knows the queue.
+  const gw = envOf(api, "coderhelm-prod-gateway");
+  assert.ok(gw.WEBHOOK_QUEUE_URL, "gateway");
+  const worker = t["coderhelm-prod-worker"];
+  assert.ok(envOf(worker, "coderhelm-prod-worker").WEBHOOK_QUEUE_URL, "worker");
+  // The worker reads it one message at a time, with a concurrency cap.
+  const sources = Object.values(worker.findResources("AWS::Lambda::EventSourceMapping")) as any[];
+  const fromWebhooks = sources.filter((s) =>
+    JSON.stringify(s.Properties.EventSourceArn).includes("WebhookQueue")
+  );
+  assert.equal(fromWebhooks.length, 1, "the worker consumes the webhooks queue");
+  assert.equal(fromWebhooks[0].Properties.BatchSize, 1);
+  assert.equal(fromWebhooks[0].Properties.ScalingConfig.MaximumConcurrency, 5);
+  // Gateway, worker, streaming and the log analyzer may send to it.
+  for (const [stack, fn] of [
+    ["coderhelm-prod-api", "Gateway"],
+    ["coderhelm-prod-worker", "Worker"],
+    ["coderhelm-prod-streaming", "Streaming"],
+    ["coderhelm-prod-log-analyzer", "Analyzer"],
+  ]) {
+    // A large role's statements spill into a managed "overflow" policy.
+    const policies = JSON.stringify([
+      t[stack].findResources("AWS::IAM::Policy"),
+      t[stack].findResources("AWS::IAM::ManagedPolicy"),
+    ]);
+    assert.ok(
+      policies.includes("WebhookQueue") && policies.includes("sqs:SendMessage"),
+      `${fn} can send webhook events`
+    );
+  }
+  // The template for the admins' email when an endpoint is turned off.
+  assert.ok(json(t["coderhelm-prod-email"]).includes("coderhelm-prod-webhook-disabled"));
+});

@@ -11,6 +11,8 @@
     "infra_analyze": {"type":"infra_analyze","team_id":"TEAM#team-a","triggered_by":"someone","repo":"acme/widgets"},
     "resume": {"type":"resume","team_id":"TEAM#team-a","run_id":"r1","installation_id":1},
     "review": {"type":"review","team_id":"TEAM#team-a","installation_id":1,"repo_owner":"acme","repo_name":"widgets","pr_number":2,"head_sha":"abc","label":"coderhelm-review","question":"why?","trigger":"labeled","dedup_key":"d","reply_to_comment_id":6,"requested_by":"someone"},
+    "webhook_emit": {"type":"webhook_emit","team_id":"TEAM#team-a","event":{"id":"evt_01JBEVNT8M1N4P7Q0R3S6T9V2W","type":"run.failed","created_at":"2026-10-26T14:31:47.512Z","team_id":"TEAM#team-a","api_version":"2026-10-26","data":{"run_id":"r1"}}},
+    "webhook_send": {"type":"webhook_send","team_id":"TEAM#team-a","endpoint_id":"ep_01jbendpt4a7b0c3d6e9f2g5h8","event_id":"evt_01JBEVNT8M1N4P7Q0R3S6T9V2W","delivery_id":"01hzzdelivery","due_at":1792416387},
     "relay_retry": {"type":"relay_retry","install_id":"ins_abcdefghijklmnopqrstuvwx","delivery_id":"01hzzdelivery","relay_delivery_id":"72d3162e-cc78-11e3-81ab-4c9367dc0958","event":"pull_request","source":"github"},
     "await_merge": {"type":"await_merge","team_id":"TEAM#team-a","installation_id":1,"repo_owner":"acme","repo_name":"widgets","pr_number":2,"head_sha":"abc","base_branch":"main","self_authored":true,"attempts":1,"chain_id":"c","error_retries":0},
     "graph_index": {"type":"graph_index","team_id":"TEAM#team-a","installation_id":1,"repo_owner":"acme","repo_name":"widgets","branch":"main","changed_files":["a.rs"]},

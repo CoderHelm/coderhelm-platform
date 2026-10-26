@@ -44,6 +44,11 @@ LOOKBACK_HOURS = int(os.environ.get("LOOKBACK_HOURS", "24"))
 DASHBOARD_URL = os.environ["DASHBOARD_URL"].rstrip("/")
 # Team usage counters (empty: usage isn't counted).
 ANALYTICS_TABLE = os.environ.get("ANALYTICS_TABLE_NAME", "")
+# Outbound webhook events go on this queue (empty: none are sent). The
+# worker sends them to the team's endpoints (common::webhooks).
+WEBHOOK_QUEUE_URL = os.environ.get("WEBHOOK_QUEUE_URL", "")
+# Must equal common::webhooks::catalog::API_VERSION (a Rust test checks).
+WEBHOOK_API_VERSION = "2026-10-26"
 
 dynamodb = boto3.resource("dynamodb")
 dynamodb_client = boto3.client("dynamodb")
@@ -60,6 +65,7 @@ def _stored_model_provider():
 usage.RUNTIME_LOADER = _stored_model_provider
 sts_client = boto3.client("sts")
 kms_client = boto3.client("kms")
+sqs_client = boto3.client("sqs")
 
 # ── Pre-built Insights Queries ──────────────────────────────────
 
@@ -709,11 +715,69 @@ def resolve_stale_recommendations(team_id, existing, seen_ids):
                 ExpressionAttributeValues={":s": "resolved", ":t": now, ":pending": "pending"},
             )
             resolved_count += 1
+            emit_event(
+                team_id,
+                "log_finding.resolved",
+                finding_event_data(
+                    item["rec_id"],
+                    item.get("source_account_id", ""),
+                    item,
+                    resolved_at=now.replace("+00:00", "Z"),
+                ),
+            )
         except ClientError as e:
             if e.response.get("Error", {}).get("Code") != "ConditionalCheckFailedException":
                 logger.warning(f"Failed to resolve {item['sk']}: {e}")
     if resolved_count:
         logger.info(f"{team_id}: {resolved_count} recommendations resolved")
+
+
+def finding_url(rec_id):
+    return f"{DASHBOARD_URL.rstrip('/')}/logs/?finding={rec_id}"
+
+
+def webhook_event(team_id, event_type, data):
+    """The envelope common::webhooks::Event has, as the worker reads it."""
+    now = datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+    return {
+        "id": "evt_" + ulid_now().upper(),
+        "type": event_type,
+        "created_at": now,
+        "team_id": team_id,
+        "api_version": WEBHOOK_API_VERSION,
+        "data": data,
+    }
+
+
+def emit_event(team_id, event_type, data, send=None):
+    """Queue one event for the team's webhook endpoints. Never raises: the
+    analysis matters more than the event."""
+    if not WEBHOOK_QUEUE_URL or not team_id:
+        return None
+    event = webhook_event(team_id, event_type, data)
+    body = json.dumps({"type": "webhook_emit", "team_id": team_id, "event": event})
+    try:
+        (send or sqs_client.send_message)(QueueUrl=WEBHOOK_QUEUE_URL, MessageBody=body)
+        return event["id"]
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"Could not queue webhook event {event_type}: {type(e).__name__}")
+        return None
+
+
+def finding_event_data(rec_id, account_id, item, resolved_at=None):
+    """`log_finding.created` / `log_finding.resolved` data (the catalog's fields)."""
+    data = {
+        "finding_id": rec_id,
+        "account_id": account_id,
+        "title": scrub_secrets(str(item.get("title", ""))),
+        "severity": item.get("severity") if item.get("severity") in ("critical", "warning", "info") else "info",
+    }
+    if resolved_at is None:
+        data["log_group"] = item.get("source_log_group") or None
+    else:
+        data["resolved_at"] = resolved_at
+    data["url"] = finding_url(rec_id)
+    return data
 
 
 def error_hash_for(account_id, rec):
@@ -854,6 +918,7 @@ def store_finding(team_id, account_id, cand, existing, cw_logs=None, window=None
         item["suspected_location"] = location
     try:
         aws_insights_table.put_item(Item=item)
+        emit_event(team_id, "log_finding.created", finding_event_data(rec_id, account_id, item))
         existing.append({
             "rec_id": rec_id, "sk": f"REC#{rec_id}", "error_hash": error_hash,
             "source_log_group": group, "count_basis": "events", "seen_count": stats["count"],

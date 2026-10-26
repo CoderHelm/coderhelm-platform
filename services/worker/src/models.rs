@@ -38,6 +38,8 @@ pub struct Config {
     pub ci_fix_queue_url: String,
     pub ticket_queue_url: String,
     pub feedback_queue_url: String,
+    /// Outbound webhook events and their retries. Empty: nothing is emitted.
+    pub webhook_queue_url: String,
     /// The shared dead-letter queue (the DLQ cleanup reads it). Empty: the
     /// cleanup does nothing.
     pub dlq_url: String,
@@ -95,6 +97,7 @@ impl Config {
             ci_fix_queue_url: std::env::var("CI_FIX_QUEUE_URL").unwrap_or_default(),
             ticket_queue_url: std::env::var("TICKET_QUEUE_URL").unwrap_or_default(),
             feedback_queue_url: std::env::var("FEEDBACK_QUEUE_URL").unwrap_or_default(),
+            webhook_queue_url: std::env::var("WEBHOOK_QUEUE_URL").unwrap_or_default(),
             dlq_url: std::env::var("DLQ_URL").unwrap_or_default(),
             sandbox_bucket_name: std::env::var("SANDBOX_BUCKET_NAME").unwrap_or_default(),
             sandbox_project_name: std::env::var("SANDBOX_PROJECT_NAME").unwrap_or_default(),

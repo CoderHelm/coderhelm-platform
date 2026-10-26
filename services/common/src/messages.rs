@@ -64,6 +64,14 @@ pub enum WorkerMessage {
     /// again (self-scheduled with SQS delay, about 24 hours of backoff).
     #[serde(rename = "relay_retry")]
     RelayRetry(RelayRetryMessage),
+    /// An event for the team's webhook endpoints (`crate::webhooks`), put on
+    /// the webhooks queue by `emit_event` wherever the work happened.
+    #[serde(rename = "webhook_emit")]
+    WebhookEmit(WebhookEmitMessage),
+    /// One more try at a webhook delivery (self-scheduled with SQS delay;
+    /// a wait longer than SQS allows is carried by `due_at`).
+    #[serde(rename = "webhook_send")]
+    WebhookSend(WebhookSendMessage),
     /// Coalesced release-tag sweep (self-scheduled with SQS delay). One is armed
     /// per repo by the first merge in a batch window; later merges in the window
     /// fold into it. When it fires it cuts ONE release tag at the default
@@ -333,6 +341,8 @@ impl WorkerMessage {
             WorkerMessage::HealthCheck(_)
             | WorkerMessage::AwaitMerge(_)
             | WorkerMessage::RelayRetry(_)
+            | WorkerMessage::WebhookEmit(_)
+            | WorkerMessage::WebhookSend(_)
             | WorkerMessage::GraphIndex(_)
             | WorkerMessage::WeeklySummary
             | WorkerMessage::WeeklySummaryTest(_)
@@ -501,6 +511,28 @@ pub struct AwaitMergeMessage {
     /// They are retried on their own schedule and never end the gate.
     #[serde(default)]
     pub error_retries: u32,
+}
+
+/// An event for the team's webhook endpoints.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct WebhookEmitMessage {
+    /// The event's team, at the top so a dead-lettered message is the team's.
+    #[serde(default)]
+    pub team_id: String,
+    pub event: crate::webhooks::Event,
+}
+
+/// One webhook delivery to try (again).
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
+pub struct WebhookSendMessage {
+    pub team_id: String,
+    pub endpoint_id: String,
+    pub event_id: String,
+    /// The delivery record the attempt goes on.
+    pub delivery_id: String,
+    /// Unix seconds: not before this.
+    #[serde(default)]
+    pub due_at: i64,
 }
 
 /// A relay forward to try again (hosted side of hybrid).

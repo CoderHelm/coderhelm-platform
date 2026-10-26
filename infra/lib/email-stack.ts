@@ -95,6 +95,16 @@ export class EmailStack extends cdk.Stack {
       },
     });
 
+    // A webhook endpoint failed for days and was turned off (team admins).
+    new ses.CfnTemplate(this, "WebhookDisabledTemplate", {
+      template: {
+        templateName: `${prefix}-webhook-disabled`,
+        subjectPart: "CoderHelm turned off a webhook endpoint: {{host}}",
+        htmlPart: fill(WEBHOOK_DISABLED_HTML),
+        textPart: fill(WEBHOOK_DISABLED_TEXT),
+      },
+    });
+
     new ses.CfnTemplate(this, "WeeklySummaryTemplate", {
       template: {
         templateName: `${prefix}-weekly-summary`,
@@ -284,6 +294,27 @@ Repo: {{repo}}
 Error: {{error}}
 
 View run: __APP_URL__`;
+
+const WEBHOOK_DISABLED_HTML = EMAIL_WRAPPER(`
+  <h1 style="color:#f59e0b;font-size:20px;margin:0 0 16px">A webhook endpoint was turned off</h1>
+  <p style="color:#ccc;font-size:15px;line-height:1.6;margin:0 0 16px">
+    Every delivery to <code style="background:#1a1a1a;padding:2px 6px;border-radius:4px;color:#ccc;word-break:break-word">{{url}}</code> has failed since {{failing_since}} ({{days}} days), so CoderHelm stopped sending to it.
+  </p>
+  <p style="color:#ccc;font-size:15px;line-height:1.6;margin:0 0 16px">{{description}}</p>
+  <p style="color:#ccc;font-size:15px;line-height:1.6;margin:0 0 16px">
+    Fix the endpoint, turn it back on in Settings, Webhooks, and replay the events it missed (they are kept 14 days).
+  </p>
+  <a href="__APP_URL__/settings/webhooks" style="display:inline-block;background:#fff;color:#000;padding:10px 20px;border-radius:6px;text-decoration:none;font-weight:600;margin-top:8px">Open Webhooks</a>
+`);
+
+const WEBHOOK_DISABLED_TEXT = `A webhook endpoint was turned off
+
+Every delivery to {{url}} has failed since {{failing_since}} ({{days}} days), so CoderHelm stopped sending to it.
+{{description}}
+
+Fix the endpoint, turn it back on in Settings, Webhooks, and replay the events it missed (they are kept 14 days).
+
+Open Webhooks: __APP_URL__/settings/webhooks`;
 
 const WEEKLY_SUMMARY_HTML = EMAIL_WRAPPER(`
   <h1 style="color:#fff;font-size:20px;margin:0 0 16px">Weekly Summary — {{org}}</h1>

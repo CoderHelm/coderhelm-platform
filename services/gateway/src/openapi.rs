@@ -93,6 +93,58 @@ pub const PUBLIC_ROUTES: &[PublicRoute] = &[
     key("GET", "/api/reviewer/reviews", "reviewer::list_reviews"),
     key("GET", "/api/reviewer/review", "reviewer::get_review"),
     key("GET", "/api/usage", "api::get_usage"),
+    key("GET", "/api/webhooks/event-types", "webhooks::event_types"),
+    key("GET", "/api/webhooks/endpoints", "webhooks::list_endpoints"),
+    key(
+        "POST",
+        "/api/webhooks/endpoints",
+        "webhooks::create_endpoint",
+    ),
+    key(
+        "GET",
+        "/api/webhooks/endpoints/:endpoint_id",
+        "webhooks::get_endpoint",
+    ),
+    key(
+        "PUT",
+        "/api/webhooks/endpoints/:endpoint_id",
+        "webhooks::update_endpoint",
+    ),
+    key(
+        "DELETE",
+        "/api/webhooks/endpoints/:endpoint_id",
+        "webhooks::delete_endpoint",
+    ),
+    key(
+        "GET",
+        "/api/webhooks/endpoints/:endpoint_id/secret",
+        "webhooks::reveal_secret",
+    ),
+    key(
+        "POST",
+        "/api/webhooks/endpoints/:endpoint_id/secret/rotate",
+        "webhooks::rotate_secret",
+    ),
+    key(
+        "POST",
+        "/api/webhooks/endpoints/:endpoint_id/test",
+        "webhooks::send_test",
+    ),
+    key(
+        "GET",
+        "/api/webhooks/endpoints/:endpoint_id/deliveries",
+        "webhooks::list_endpoint_deliveries",
+    ),
+    key(
+        "POST",
+        "/api/webhooks/endpoints/:endpoint_id/deliveries/:delivery_id/resend",
+        "webhooks::resend_delivery",
+    ),
+    key(
+        "POST",
+        "/api/webhooks/endpoints/:endpoint_id/replay",
+        "webhooks::replay",
+    ),
     PublicRoute {
         method: "POST",
         path: "/webhooks/ci/tests/results",
@@ -198,7 +250,7 @@ pub fn default_code(status: axum::http::StatusCode) -> &'static str {
 const DESCRIPTION: &str =
     "The CoderHelm API lets your own programs start and follow CoderHelm's work: \
 list and inspect runs, retry or cancel them, create and run plans, read the reviewer's reviews, \
-and check token usage.\n\n\
+check token usage, and manage the webhook endpoints CoderHelm sends your team's events to.\n\n\
 Every request is authenticated with a team API key sent as a bearer token. Admins create keys in \
 the dashboard under Settings, API keys. A key holds scopes, never more than the admin who made it, \
 and has its own rate limit.\n\n\
@@ -229,6 +281,18 @@ are verified by their signatures.";
         crate::routes::reviewer::list_reviews,
         crate::routes::reviewer::get_review,
         crate::routes::api::get_usage,
+        crate::routes::webhooks::event_types,
+        crate::routes::webhooks::list_endpoints,
+        crate::routes::webhooks::create_endpoint,
+        crate::routes::webhooks::get_endpoint,
+        crate::routes::webhooks::update_endpoint,
+        crate::routes::webhooks::delete_endpoint,
+        crate::routes::webhooks::reveal_secret,
+        crate::routes::webhooks::rotate_secret,
+        crate::routes::webhooks::send_test,
+        crate::routes::webhooks::list_endpoint_deliveries,
+        crate::routes::webhooks::resend_delivery,
+        crate::routes::webhooks::replay,
         crate::routes::tests::ci_upload,
         crate::routes::tests::ci_quarantine,
         crate::routes::github_webhook::handle,
@@ -247,7 +311,8 @@ are verified by their signatures.";
         (name = "Reviews", description = "Pull request reviews written by CoderHelm's reviewer."),
         (name = "Usage", description = "Tokens used this month and the team's limits."),
         (name = "CI", description = "Endpoints a CI job calls with its GitHub Actions OIDC token, so no CoderHelm secret is stored in CI."),
-        (name = "Webhooks", description = "Events CoderHelm receives from GitHub, Jira, AWS SNS, Sanity and Notion. Each is verified before anything happens."),
+        (name = "Webhook endpoints", description = "Where CoderHelm sends your team's events (runs, pull requests, reviews, CI fixes, alerts, log findings, releases, plans). Each request is signed the Standard Webhooks way. The `webhooks` section of this document has every event's schema."),
+        (name = "Webhooks", description = "Webhooks CoderHelm receives from GitHub, Jira, AWS SNS, Sanity and Notion. CoderHelm verifies each one before anything happens."),
     ),
 )]
 pub struct ApiDoc;
@@ -461,6 +526,9 @@ pub fn document_json() -> String {
     if let Some(paths) = doc.get_mut("paths") {
         inline_schemas(paths);
     }
+    if let Some(obj) = doc.as_object_mut() {
+        obj.insert("webhooks".into(), outbound_webhooks());
+    }
     // Readers show a tag's `x-displayName` as written ("CI"), where they
     // would otherwise make a title out of its name ("C I").
     if let Some(tags) = doc.get_mut("tags").and_then(|v| v.as_array_mut()) {
@@ -473,6 +541,61 @@ pub fn document_json() -> String {
     let mut s = serde_json::to_string_pretty(&doc).expect("the OpenAPI document serializes");
     s.push('\n');
     s
+}
+
+/// The events CoderHelm sends to a team's endpoints, as OpenAPI 3.1
+/// `webhooks`: one operation per event type, made from the event catalog
+/// (`common::webhooks::catalog`).
+fn outbound_webhooks() -> serde_json::Value {
+    use common::webhooks::catalog;
+    use serde_json::json;
+    let header = |name: &str, description: &str, example: &str| {
+        json!({
+            "name": name,
+            "in": "header",
+            "required": true,
+            "description": description,
+            "schema": { "type": "string" },
+            "example": example,
+        })
+    };
+    let params = json!([
+        header("webhook-id", "The event id (`evt_…`). The same on every retry: use it to skip an event you already handled.", "evt_01JBEVNT8M1N4P7Q0R3S6T9V2W"),
+        header("webhook-timestamp", "Unix seconds when this attempt was sent. Refuse a request more than 5 minutes off.", "1792420307"),
+        header("webhook-signature", "Space-separated `v1,<base64>` signatures: HMAC-SHA256 of `<webhook-id>.<webhook-timestamp>.<raw body>` keyed with the endpoint's secret (the bytes after `whsec_`, base64-decoded). Two while a rotated secret still signs; accept the request when any matches.", "v1,K5oZfzN95Z9UVu1EsfQmfVNQhnkZ2pj9o9NDN/H/pI4="),
+    ]);
+    let mut out = serde_json::Map::new();
+    for e in catalog::EVENTS {
+        let example = catalog::example_event(e.name);
+        out.insert(
+            e.name.to_string(),
+            json!({
+                "post": {
+                    "operationId": format!("event.{}", e.name),
+                    "summary": e.summary,
+                    "description": format!("{} Sent as `POST` to each endpoint subscribed to `{}` (or to every event).", e.description, e.name),
+                    "tags": [format!("Events: {}", e.group)],
+                    "parameters": params,
+                    "requestBody": {
+                        "required": true,
+                        "content": {
+                            "application/json": {
+                                "schema": catalog::event_schema(e),
+                                "examples": { "event": { "value": example } },
+                            }
+                        }
+                    },
+                    "responses": {
+                        "2XX": { "description": "Received. Answer within 10 seconds; do the work afterwards." },
+                        "410": { "description": "Gone: the delivery is final (not retried). Any 4xx other than 408 and 429 is final." },
+                        "5XX": { "description": "Retried with backoff for about a day, as are timeouts, 408 and 429." },
+                    },
+                    "security": [],
+                }
+            }),
+        );
+    }
+    serde_json::Value::Object(out)
 }
 
 /// OpenAPI 3.1 schemas are JSON Schema 2020-12, where an example is
@@ -559,6 +682,34 @@ mod tests {
             }
         }
         out
+    }
+
+    /// Outbound webhooks only go out: no unauthenticated or signature-only
+    /// route takes anything on that path, so whoever controls an endpoint
+    /// can't send events, answers or "deliveries" into CoderHelm.
+    #[test]
+    fn outbound_webhooks_have_no_inbound_path() {
+        for r in PUBLIC_ROUTES
+            .iter()
+            .filter(|r| r.handler.starts_with("webhooks::"))
+        {
+            assert_eq!(r.auth, RouteAuth::ApiKey, "{} must need an API key", r.path);
+            assert!(r.path.starts_with("/api/webhooks/"), "{}", r.path);
+        }
+        let main = include_str!("main.rs");
+        let inbound = main
+            .split(".nest(\"/webhooks\", webhook_routes)")
+            .next()
+            .unwrap();
+        let webhook_router = inbound.rsplit("let webhook_routes").next().unwrap_or("");
+        assert!(
+            !webhook_router.contains("routes::webhooks::"),
+            "an outbound webhook handler is on the unauthenticated /webhooks router"
+        );
+        // What an endpoint answers is only kept as a short note; nothing parses it.
+        let deliver = include_str!("../../common/src/webhooks/deliver.rs");
+        let code = deliver.split("#[cfg(test)]").next().unwrap();
+        assert!(!code.contains(".json::<") && !code.contains("resp.json("));
     }
 
     #[test]
