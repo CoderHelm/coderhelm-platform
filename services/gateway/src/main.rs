@@ -349,6 +349,10 @@ async fn main() -> Result<(), Error> {
             get(routes::alerts::list_topic_alarms),
         )
         .route(
+            "/alert-routes/resolve-repo",
+            post(routes::alerts::resolve_repo),
+        )
+        .route(
             "/alert-budget",
             get(routes::alerts::get_budget).put(routes::alerts::put_budget),
         )
@@ -718,6 +722,10 @@ async fn main() -> Result<(), Error> {
         .route(
             "/log-findings/:id/fix",
             post(routes::log_findings::create_fix),
+        )
+        .route(
+            "/log-findings/:id/repo",
+            get(routes::log_findings::get_repo),
         )
         .route(
             "/log-findings/:id/ignore",

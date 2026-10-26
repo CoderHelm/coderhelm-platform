@@ -1638,7 +1638,10 @@ async fn read_attachments(
 
 /// The team's model key, the model answers are written with (the heavy
 /// model, like the plan chat) and the lighter one for the answer check.
-async fn load_provider(state: &AppState, team_id: &str) -> (Option<String>, String, String) {
+pub(crate) async fn load_provider(
+    state: &AppState,
+    team_id: &str,
+) -> (Option<String>, String, String) {
     let item = state
         .dynamo
         .get_item()
@@ -1671,7 +1674,7 @@ async fn load_provider(state: &AppState, team_id: &str) -> (Option<String>, Stri
 
 /// The team's GitHub App token (either table's spelling of the
 /// installation, as every other reader of it does).
-async fn github_token(state: &AppState, team_id: &str) -> Option<String> {
+pub(crate) async fn github_token(state: &AppState, team_id: &str) -> Option<String> {
     let id = super::graph::installation_id(state, team_id).await?;
     crate::auth::github_app::get_installation_token(state, id)
         .await

@@ -1727,6 +1727,58 @@ pub async fn put_route(
 }
 
 #[derive(Deserialize)]
+pub struct ResolveRepoRequest {
+    topic_arn: String,
+    #[serde(default)]
+    alarms: Vec<String>,
+}
+
+/// POST /api/alert-routes/resolve-repo — the repo a rule for these alarms
+/// should fix in, worked out from the resources the alarms watch (their
+/// metric dimensions), the team's code and records. Read only (admin+, as
+/// route setup is).
+pub async fn resolve_repo(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<Claims>,
+    Json(req): Json<ResolveRepoRequest>,
+) -> Result<Json<Value>, StatusCode> {
+    claims.require_role(3)?;
+    let account = topic_account(req.topic_arn.trim()).ok_or(StatusCode::BAD_REQUEST)?;
+    let alarms: Vec<String> = req
+        .alarms
+        .iter()
+        .map(|a| a.trim().to_string())
+        .filter(|a| !a.is_empty() && a.len() <= 255)
+        .take(MAX_RULE_ALARMS)
+        .collect();
+    if alarms.is_empty() {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    let team = claims.team_id.as_str();
+    let cfg =
+        common::log_findings::load_autofix(&state.dynamo, &state.config.settings_table_name, team)
+            .await
+            .unwrap_or_default();
+    let judge = super::log_findings::GatewayJudge::for_team(&state, team).await;
+    let token = super::brain::github_token(&state, team).await;
+    let http = common::mcp_remote::http::GuardedHttps;
+    let host = token.map(|t| common::repo_read::GitHubHost {
+        http: &http,
+        auth: format!("Bearer {t}"),
+    });
+    let r = common::log_repo::live::for_alarms(
+        &super::log_findings::team_ref(&state, team),
+        host.as_ref().map(|h| h as &dyn common::repo_read::RepoHost),
+        &judge,
+        account,
+        &alarms,
+        &cfg,
+    )
+    .await;
+    Ok(Json(common::log_repo::to_json(&r)))
+}
+
+#[derive(Deserialize)]
 pub struct DeleteRouteQuery {
     topic_arn: String,
 }

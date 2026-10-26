@@ -1,0 +1,395 @@
+[
+  {
+    "name": "ecs image label beats a look-alike repo name",
+    "log_group": "/ecs/prod-ledger-worker",
+    "repos": [
+      "acme/ledger-worker",
+      "acme/ledger-service",
+      "acme/web"
+    ],
+    "facts": {
+      "connected": true,
+      "ecs": [
+        {
+          "cluster": "prod",
+          "service": "prod-ledger-worker",
+          "task_definition": "arn:aws:ecs:us-east-1:111122223333:task-definition/ledger-worker:12",
+          "family": "ledger-worker",
+          "images": [
+            "111122223333.dkr.ecr.us-east-1.amazonaws.com/ledger:9f1c"
+          ],
+          "labels": {
+            "org.opencontainers.image.source": "https://github.com/acme/ledger-service"
+          }
+        }
+      ]
+    },
+    "expect": "acme/ledger-service",
+    "min": "high",
+    "max": "high",
+    "decoy": "acme/ledger-worker"
+  },
+  {
+    "name": "ecr manifest annotation",
+    "log_group": "/ecs/quill-worker",
+    "repos": [
+      "acme/quill",
+      "acme/quill-worker-old",
+      "acme/infra"
+    ],
+    "facts": {
+      "connected": true,
+      "ecs": [
+        {
+          "cluster": "prod",
+          "service": "quill-worker",
+          "task_definition": "td/quill:3",
+          "family": "quill",
+          "images": [
+            "111122223333.dkr.ecr.us-east-1.amazonaws.com/quill:latest"
+          ]
+        }
+      ],
+      "images": [
+        {
+          "image": "111122223333.dkr.ecr.us-east-1.amazonaws.com/quill:latest",
+          "ecr_repo": "quill",
+          "annotations": {
+            "org.opencontainers.image.source": "https://github.com/acme/quill"
+          }
+        }
+      ]
+    },
+    "expect": "acme/quill",
+    "min": "high",
+    "max": "high",
+    "decoy": "acme/quill-worker-old"
+  },
+  {
+    "name": "lambda tag names the repo",
+    "log_group": "/aws/lambda/orbit-thumbnailer",
+    "repos": [
+      "acme/orbit-media",
+      "acme/orbit-thumbnailer-v1",
+      "acme/orbit-web"
+    ],
+    "facts": {
+      "connected": true,
+      "lambdas": [
+        {
+          "name": "orbit-thumbnailer",
+          "code_sha": "s1",
+          "tags": {
+            "repository": "acme/orbit-media",
+            "owner": "media"
+          }
+        }
+      ]
+    },
+    "expect": "acme/orbit-media",
+    "min": "high",
+    "max": "high",
+    "decoy": "acme/orbit-thumbnailer-v1"
+  },
+  {
+    "name": "stack description names the repo",
+    "log_group": "/ecs/kettle-api",
+    "repos": [
+      "acme/kettle-api",
+      "acme/kettle",
+      "acme/platform-infra"
+    ],
+    "facts": {
+      "connected": true,
+      "ecs": [
+        {
+          "cluster": "prod",
+          "service": "kettle-api",
+          "task_definition": "td/kettle:7",
+          "family": "kettle",
+          "tags": {
+            "aws:cloudformation:stack-name": "kettle-prod"
+          }
+        }
+      ],
+      "stacks": [
+        {
+          "name": "kettle-prod",
+          "description": "Runs the API built from acme/kettle on ECS"
+        }
+      ]
+    },
+    "expect": "acme/kettle",
+    "min": "high",
+    "max": "high",
+    "decoy": "acme/kettle-api"
+  },
+  {
+    "name": "log group tag in ssh form",
+    "log_group": "/app/marble/errors",
+    "repos": [
+      "acme/marble-errors",
+      "acme/stonework"
+    ],
+    "facts": {
+      "connected": true,
+      "log_group_tags": {
+        "git": "git@github.com:acme/stonework.git"
+      }
+    },
+    "expect": "acme/stonework",
+    "min": "high",
+    "max": "high",
+    "decoy": "acme/marble-errors"
+  },
+  {
+    "name": "terraform in the app repo defines the log group",
+    "log_group": "/ecs/prod-pantry-api",
+    "repos": [
+      "acme/pantry-api-docs",
+      "acme/larder",
+      "acme/web"
+    ],
+    "facts": {
+      "connected": true
+    },
+    "hits": [
+      {
+        "query": "/ecs/prod-pantry-api",
+        "repo": "acme/larder",
+        "path": "deploy/ecs.tf",
+        "fragment": "resource \"aws_cloudwatch_log_group\" \"api\" { name = \"/ecs/prod-pantry-api\" }"
+      }
+    ],
+    "expect": "acme/larder",
+    "min": "medium",
+    "max": "high",
+    "decoy": "acme/pantry-api-docs"
+  },
+  {
+    "name": "past merged fixes for the log group",
+    "log_group": "/ecs/gizmo-sync",
+    "repos": [
+      "acme/gadget-core",
+      "acme/gizmo-sync-tools",
+      "acme/web"
+    ],
+    "facts": {},
+    "past": [
+      {
+        "repo": "acme/gadget-core",
+        "merged": true
+      },
+      {
+        "repo": "acme/gadget-core",
+        "merged": true
+      }
+    ],
+    "expect": "acme/gadget-core",
+    "min": "medium",
+    "max": "high",
+    "decoy": "acme/gizmo-sync-tools"
+  },
+  {
+    "name": "image source and tag disagree",
+    "log_group": "/ecs/prod-sprocket",
+    "repos": [
+      "acme/sprocket",
+      "acme/sprocket-v2"
+    ],
+    "facts": {
+      "connected": true,
+      "ecs": [
+        {
+          "cluster": "prod",
+          "service": "sprocket",
+          "task_definition": "td/sprocket:2",
+          "family": "sprocket",
+          "labels": {
+            "org.opencontainers.image.source": "https://github.com/acme/sprocket-v2"
+          }
+        }
+      ],
+      "images": [
+        {
+          "image": "i",
+          "ecr_repo": "sprocket",
+          "annotations": {
+            "org.opencontainers.image.source": "https://github.com/acme/sprocket"
+          }
+        }
+      ]
+    },
+    "expect": null,
+    "min": "low",
+    "max": "low",
+    "decoy": "acme/sprocket-v2"
+  },
+  {
+    "name": "no evidence at all: a name is only a guess",
+    "log_group": "/ecs/fernhouse-jobs",
+    "repos": [
+      "acme/fernhouse-jobs",
+      "acme/web",
+      "acme/api"
+    ],
+    "facts": {
+      "connected": true
+    },
+    "expect": null,
+    "min": "none",
+    "max": "medium",
+    "decoy": "acme/fernhouse-jobs"
+  },
+  {
+    "name": "image source outside the team's repos is not evidence",
+    "log_group": "/ecs/prod-tally",
+    "repos": [
+      "acme/tally",
+      "acme/web"
+    ],
+    "facts": {
+      "connected": true,
+      "ecs": [
+        {
+          "cluster": "prod",
+          "service": "tally",
+          "task_definition": "td/tally:1",
+          "family": "tally",
+          "labels": {
+            "org.opencontainers.image.source": "https://github.com/someone-else/tally"
+          }
+        }
+      ]
+    },
+    "expect": null,
+    "min": "none",
+    "max": "medium",
+    "decoy": "acme/tally"
+  },
+  {
+    "name": "role refused: no aws evidence, permission named",
+    "log_group": "/ecs/prod-otter",
+    "repos": [
+      "acme/otter",
+      "acme/river"
+    ],
+    "facts": {
+      "connected": true,
+      "denied": [
+        "ecs:ListClusters",
+        "lambda:GetFunction"
+      ]
+    },
+    "expect": null,
+    "min": "none",
+    "max": "medium",
+    "decoy": "acme/otter",
+    "permissions": [
+      "ecs:ListClusters",
+      "lambda:GetFunction"
+    ]
+  },
+  {
+    "name": "infra repo terraform plus app repo image label",
+    "log_group": "/ecs/prod-beacon-worker",
+    "repos": [
+      "acme/infra-live",
+      "acme/beacon",
+      "acme/beacon-worker-cli"
+    ],
+    "facts": {
+      "connected": true,
+      "ecs": [
+        {
+          "cluster": "prod",
+          "service": "beacon-worker",
+          "task_definition": "td/beacon:30",
+          "family": "beacon",
+          "labels": {
+            "org.opencontainers.image.source": "https://github.com/acme/beacon"
+          }
+        }
+      ]
+    },
+    "hits": [
+      {
+        "query": "/ecs/prod-beacon-worker",
+        "repo": "acme/infra-live",
+        "path": "envs/prod/beacon.tf",
+        "fragment": "name = \"/ecs/prod-beacon-worker\""
+      }
+    ],
+    "expect": "acme/beacon",
+    "min": "high",
+    "max": "high",
+    "decoy": "acme/beacon-worker-cli"
+  },
+  {
+    "name": "saved api repo, lines really from the web site, run worked in web",
+    "log_group": "/ecs/prod-harbor-api-worker",
+    "repos": [
+      "acme/harbor-api-worker",
+      "acme/harbor-site",
+      "acme/infra"
+    ],
+    "saved": "acme/harbor-api-worker",
+    "samples": [
+      {
+        "log_group": "/ecs/prod-harbor-site",
+        "message": "Failed to update prerender cache for /menu Error: ENOSPC: no space left on device, write at .next/server/app/menu.html"
+      },
+      {
+        "log_group": "/ecs/prod-harbor-site",
+        "message": "Failed to update prerender cache for /menu Error: ENOSPC: no space left on device, write at .next/server/app/menu.html"
+      }
+    ],
+    "facts": {
+      "connected": true
+    },
+    "past": [
+      {
+        "repo": "acme/harbor-api-worker",
+        "merged": false,
+        "ran_in": "acme/harbor-site"
+      }
+    ],
+    "expect": "acme/harbor-site",
+    "min": "low",
+    "max": "medium",
+    "decoy": "acme/harbor-api-worker"
+  },
+  {
+    "name": "saved api repo, lines from the web site's log group (its image source)",
+    "log_group": "/ecs/prod-harbor-api-worker",
+    "repos": [
+      "acme/harbor-api-worker",
+      "acme/harbor-site"
+    ],
+    "saved": "acme/harbor-api-worker",
+    "samples": [
+      {
+        "log_group": "/ecs/prod-harbor-site",
+        "message": "Failed to update prerender cache for /menu Error: ENOSPC: no space left on device, write at .next/server/app/menu.html"
+      }
+    ],
+    "facts": {
+      "connected": true,
+      "ecs": [
+        {
+          "cluster": "prod",
+          "service": "harbor-site",
+          "task_definition": "td/harbor-site:88",
+          "family": "harbor-site",
+          "labels": {
+            "org.opencontainers.image.source": "https://github.com/acme/harbor-site"
+          }
+        }
+      ]
+    },
+    "expect": "acme/harbor-site",
+    "min": "medium",
+    "max": "medium",
+    "decoy": "acme/harbor-api-worker"
+  }
+]

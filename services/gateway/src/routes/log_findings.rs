@@ -10,6 +10,9 @@
 //! - `POST /api/log-findings/:id/{ignore,acknowledge,reopen}`.
 //! - `GET|PUT /api/log-findings/autofix` — the team's automatic-fix setting.
 //!   The worker's hourly sweep applies it.
+//! - `GET  /api/log-findings/:id/repo` — which repo the finding's code lives
+//!   in: its saved mapping, or worked out from the evidence
+//!   ([`common::log_repo`]); `?refresh=1` works it out again.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -423,6 +426,123 @@ pub fn skip_reply(skip: &Skip) -> Reply {
         }
     };
     fail(code, error, &message)
+}
+
+// ─── Which repo ─────────────────────────────────────────────────────────────
+
+/// The resolver's model call: the team's own model, metered as log analysis.
+pub(crate) struct GatewayJudge {
+    http: reqwest::Client,
+    api_key: String,
+    model: String,
+    meter: common::usage::UsageMeter,
+}
+
+impl GatewayJudge {
+    pub(crate) async fn for_team(state: &AppState, team_id: &str) -> GatewayJudge {
+        let (key, _heavy, primary) = super::brain::load_provider(state, team_id).await;
+        GatewayJudge {
+            http: reqwest::Client::new(),
+            api_key: key.unwrap_or_default(),
+            model: primary,
+            meter: crate::model_call::chat_meter(state, team_id),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl common::log_repo::live::Judge for GatewayJudge {
+    async fn judge(&self, system: &str, user: &str) -> Result<String, String> {
+        if self.api_key.is_empty() && !common::model_provider::is_bedrock() {
+            return Err("no model provider key".into());
+        }
+        let body = json!({
+            "model": self.model,
+            "max_tokens": 1024,
+            "system": system,
+            "messages": [{ "role": "user", "content": user }],
+        });
+        let m = crate::model_call::log_repo_turn(
+            &self.http,
+            &self.api_key,
+            &body,
+            &self.meter,
+            &self.model,
+        )
+        .await
+        .map_err(|e| e.message)?;
+        Ok(m["content"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|b| b["text"].as_str())
+            .collect::<Vec<_>>()
+            .join(""))
+    }
+}
+
+/// Where the team's records are, for the resolver.
+pub(crate) fn team_ref<'a>(
+    state: &'a AppState,
+    team_id: &'a str,
+) -> common::log_repo::live::Team<'a> {
+    common::log_repo::live::Team {
+        dynamo: &state.dynamo,
+        sts: &state.sts,
+        settings_table: &state.config.settings_table_name,
+        repos_table: &state.config.repos_table_name,
+        runs_table: &state.config.runs_table_name,
+        insights_table: &state.config.aws_insights_table_name,
+        team_id,
+    }
+}
+
+#[derive(Deserialize, Default)]
+pub struct RepoQuery {
+    #[serde(default)]
+    refresh: Option<String>,
+}
+
+/// GET /api/log-findings/:id/repo — the repo a fix for this finding goes
+/// to, how sure, and why (member+).
+pub async fn get_repo(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<Claims>,
+    Path(id): Path<String>,
+    Query(q): Query<RepoQuery>,
+) -> Result<Json<Value>, Reply> {
+    claims.require_role(1).map_err(forbidden)?;
+    let team = claims.team_id.as_str();
+    let f = finding_or_404(&state, team, &id).await?;
+    let cfg = lf::load_autofix(&state.dynamo, &state.config.settings_table_name, team)
+        .await
+        .map_err(|e| internal("Could not read the automatic-fix setting", e))?;
+    let findings = lf::list_findings(
+        &state.dynamo,
+        &state.config.aws_insights_table_name,
+        team,
+        MAX_FINDINGS,
+    )
+    .await
+    .unwrap_or_default();
+    let judge = GatewayJudge::for_team(&state, team).await;
+    let token = super::brain::github_token(&state, team).await;
+    let http = common::mcp_remote::http::GuardedHttps;
+    let host = token.map(|t| common::repo_read::GitHubHost {
+        http: &http,
+        auth: format!("Bearer {t}"),
+    });
+    let r = common::log_repo::live::for_finding(
+        &team_ref(&state, team),
+        host.as_ref().map(|h| h as &dyn common::repo_read::RepoHost),
+        &judge,
+        &f,
+        &cfg,
+        &findings,
+        matches!(q.refresh.as_deref(), Some("1" | "true")),
+    )
+    .await;
+    Ok(Json(common::log_repo::to_json(&r)))
 }
 
 /// POST /api/log-findings/:id/fix — start a fix run from a finding (member+).

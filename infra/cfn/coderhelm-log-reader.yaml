@@ -87,6 +87,29 @@ Resources:
                 Action:
                   - "airflow:InvokeRestApi"
                 Resource: "arn:aws:airflow:*:*:role/*/Viewer"
+        - PolicyName: FindTheCodeBehindALogGroupReadOnly
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              # Which service writes a log group, so a fix goes to the repo its
+              # code lives in: describes and tags only. No image layers, no
+              # function code, nothing is changed.
+              - Sid: DescribeServicesBehindLogGroups
+                Effect: Allow
+                Action:
+                  - "ecs:ListClusters"
+                  - "ecs:ListServices"
+                  - "ecs:DescribeServices"
+                  - "ecs:DescribeTaskDefinition"
+                  - "lambda:GetFunction"
+                  - "lambda:GetFunctionConfiguration"
+                  - "lambda:ListFunctions"
+                  - "lambda:ListTags"
+                  - "logs:ListTagsForResource"
+                  - "cloudformation:DescribeStacks"
+                  - "ecr:BatchGetImage"
+                  - "ecr:ListTagsForResource"
+                Resource: "*"
 
 Outputs:
   RoleArn:

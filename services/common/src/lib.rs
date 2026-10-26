@@ -40,6 +40,8 @@ pub mod git_conventions;
 pub mod live;
 /// Log findings and the fix runs started from them.
 pub mod log_findings;
+// Which repo a log group's or alarm's code lives in, from evidence.
+pub mod log_repo;
 /// The MCP servers a team can switch on: one catalog for gateway and worker.
 pub mod mcp_catalog;
 /// Sealed credentials for a team's MCP servers (KMS, bound to team and server).

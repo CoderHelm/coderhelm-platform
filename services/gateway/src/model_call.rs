@@ -47,6 +47,18 @@ pub async fn brain_turn(
     whole_turn(http, api_key, body, meter, model_id, feature::BRAIN).await
 }
 
+/// The repo resolver's one call (which repo a log group's code lives in):
+/// recorded under feature `log_analysis`.
+pub async fn log_repo_turn(
+    http: &reqwest::Client,
+    api_key: &str,
+    body: &Value,
+    meter: &UsageMeter,
+    model_id: &str,
+) -> Result<Value, ModelCallError> {
+    whole_turn(http, api_key, body, meter, model_id, feature::LOG_ANALYSIS).await
+}
+
 async fn whole_turn(
     http: &reqwest::Client,
     api_key: &str,

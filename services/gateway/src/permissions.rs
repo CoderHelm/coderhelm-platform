@@ -247,6 +247,7 @@ pub const CAPABILITIES: &[Capability] = &[
             "log_analyzer::create_plan_from_recommendation",
             "log_analyzer::dismiss_recommendation",
             "log_findings::get_samples",
+            "log_findings::get_repo",
             "log_findings::create_fix",
             "log_findings::ignore_finding",
             "log_findings::acknowledge_finding",
@@ -540,6 +541,7 @@ pub const CAPABILITIES: &[Capability] = &[
         handlers: &[
             "log_findings::put_autofix",
             "alerts::put_route",
+            "alerts::resolve_repo",
             "alerts::delete_route",
             "alerts::get_notify",
             "alerts::put_notify",

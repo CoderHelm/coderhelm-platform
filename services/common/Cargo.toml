@@ -42,6 +42,11 @@ aws-sdk-redshiftdata = "1"
 aws-sdk-cloudwatchlogs = "1"
 # live: CloudWatch metrics and Airflow (MWAA) through the team's log reader role
 aws-sdk-cloudwatch = "1"
+# log_repo: which repo a log group's code lives in (read-only lookups)
+aws-sdk-ecs = "1"
+aws-sdk-lambda = "1"
+aws-sdk-cloudformation = "1"
+aws-sdk-ecr = "1"
 aws-sdk-mwaa = "1"
 # public_urls: the deployment's URL when CloudFront picked it (single origin)
 aws-sdk-ssm = "1"
