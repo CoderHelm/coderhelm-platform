@@ -4,7 +4,7 @@ description: How a self-hosted install reports its own setup, and how the browse
 order: 13
 ---
 
-The [install guide](https://docs.coderhelm.com/self-host/install/) installs CoderHelm from your browser. It reads three things, all in your own account: the installer's progress file, your install's public `GET /api/setup/status`, and your install's GitHub App manifest landing. Nothing about your install passes through CoderHelm's servers. The hosted CoderHelm has neither route.
+The [install guide](https://docs.coderhelm.com/self-host/install/) installs CoderHelm from your browser. It reads three things, all in your own account: the installer's progress file, your install's public `GET /api/setup/status`, and your install's GitHub App manifest landing. Nothing about your install passes through CoderHelm's servers. The hosted CoderHelm has neither route. The page counts anonymous page views with Google Analytics (origin and path only); nothing you type and nothing about your install is sent.
 
 ## How the install guide works
 
