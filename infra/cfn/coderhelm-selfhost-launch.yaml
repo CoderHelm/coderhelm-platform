@@ -60,7 +60,7 @@ Parameters:
     Type: String
     Default: bedrock
     AllowedValues: [bedrock, anthropic]
-    Description: bedrock (Claude on Amazon Bedrock in this account, no API key) or anthropic (each team adds its own Anthropic API key).
+    Description: bedrock (Claude on Amazon Bedrock in this account, no API key) or anthropic (each team adds its own Anthropic API key). You can change this later in Settings, System.
   Version:
     Type: String
     # Stamped with the release's own tag when the release is published

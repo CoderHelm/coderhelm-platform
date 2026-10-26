@@ -4752,20 +4752,6 @@ pub async fn update_git_conventions(
     Ok(Json(git_conventions_json(&c)))
 }
 
-/// Allowed model IDs for the Anthropic provider.
-const ALLOWED_MODELS: &[&str] = &[
-    "claude-fable-5-1",
-    "claude-opus-5-5",
-    "claude-sonnet-5-5",
-    "claude-opus-4-8",
-    "claude-opus-4-7",
-    "claude-opus-4-6",
-    "claude-sonnet-4-6",
-    "claude-sonnet-4-5",
-    "claude-haiku-4-5",
-    "claude-haiku-4-5-20251001",
-];
-
 /// GET /api/settings/model-provider — get model provider configuration.
 pub async fn get_model_provider(
     State(state): State<Arc<AppState>>,
@@ -4860,7 +4846,10 @@ pub async fn update_model_provider(
         .as_str()
         .ok_or(StatusCode::BAD_REQUEST)?;
 
-    if !ALLOWED_MODELS.contains(&primary_model) || !ALLOWED_MODELS.contains(&heavy_model) {
+    // What a team may pick is the release's manifest (common::model_ids).
+    if !common::model_ids::is_selectable(primary_model)
+        || !common::model_ids::is_selectable(heavy_model)
+    {
         return Err(StatusCode::BAD_REQUEST);
     }
 

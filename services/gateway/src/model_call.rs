@@ -59,6 +59,24 @@ pub async fn log_repo_turn(
     whole_turn(http, api_key, body, meter, model_id, feature::LOG_ANALYSIS).await
 }
 
+/// Where one call goes: Bedrock (with the id to call) or the Anthropic API.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Via {
+    Bedrock(String),
+    Anthropic,
+}
+
+impl Via {
+    /// The install's provider as it is now (Settings, System, Models).
+    pub fn now(model_id: &str) -> Self {
+        if common::model_provider::is_bedrock() {
+            Via::Bedrock(common::model_provider::bedrock_model_id(model_id))
+        } else {
+            Via::Anthropic
+        }
+    }
+}
+
 async fn whole_turn(
     http: &reqwest::Client,
     api_key: &str,
@@ -67,9 +85,30 @@ async fn whole_turn(
     model_id: &str,
     feature_tag: &'static str,
 ) -> Result<Value, ModelCallError> {
-    if common::model_provider::is_bedrock() {
+    whole_turn_via(
+        Via::now(model_id),
+        http,
+        api_key,
+        body,
+        meter,
+        model_id,
+        feature_tag,
+    )
+    .await
+}
+
+async fn whole_turn_via(
+    via: Via,
+    http: &reqwest::Client,
+    api_key: &str,
+    body: &Value,
+    meter: &UsageMeter,
+    model_id: &str,
+    feature_tag: &'static str,
+) -> Result<Value, ModelCallError> {
+    if let Via::Bedrock(bedrock_id) = via {
         let (mut stream, mut flight) =
-            open_bedrock_stream(body, meter, model_id, feature_tag).await?;
+            open_bedrock_stream(&bedrock_id, body, meter, model_id, feature_tag).await?;
         let mut parser = SseParser::default();
         while let Some(chunk) = stream.next().await {
             match chunk {
@@ -127,13 +166,25 @@ pub async fn probe(
     meter: &UsageMeter,
     model: &str,
 ) -> crate::routes::setup_checks::ModelProbe {
+    probe_via(Via::now(model), http, api_key, meter, model).await
+}
+
+/// [`probe`] on a given provider, whatever the install uses now: a
+/// provider switch checks the provider it would switch to.
+pub async fn probe_via(
+    via: Via,
+    http: &reqwest::Client,
+    api_key: &str,
+    meter: &UsageMeter,
+    model: &str,
+) -> crate::routes::setup_checks::ModelProbe {
     use crate::routes::setup_checks::ModelProbe;
     let body = json!({
         "model": model,
         "max_tokens": 1,
         "messages": [{ "role": "user", "content": "Reply with OK." }],
     });
-    match chat_turn(http, api_key, &body, meter, model).await {
+    match whole_turn_via(via, http, api_key, &body, meter, model, feature::CHAT).await {
         Ok(_) => ModelProbe::Ok,
         // The token limit is the point of a one-token call.
         Err(e) if e.kind == ModelErrorKind::Truncated => ModelProbe::Ok,
@@ -178,8 +229,8 @@ async fn open_stream(
     model_id: &str,
     feature_tag: &'static str,
 ) -> Result<(ChatBytes, InFlight), ModelCallError> {
-    if common::model_provider::is_bedrock() {
-        return open_bedrock_stream(body, meter, model_id, feature_tag).await;
+    if let Via::Bedrock(bedrock_id) = Via::now(model_id) {
+        return open_bedrock_stream(&bedrock_id, body, meter, model_id, feature_tag).await;
     }
     let bytes = serde_json::to_vec(body).unwrap_or_default();
     let resp = common::model_retry::send_streaming(
@@ -217,6 +268,7 @@ pub type ChatBytes = std::pin::Pin<Box<dyn futures::Stream<Item = Result<Vec<u8>
 /// until a stream starts. Bedrock's events are framed as SSE, so callers
 /// read them exactly like the Anthropic API's.
 async fn open_bedrock_stream(
+    bedrock_id: &str,
     body: &Value,
     meter: &UsageMeter,
     model_id: &str,
@@ -224,19 +276,18 @@ async fn open_bedrock_stream(
 ) -> Result<(ChatBytes, InFlight), ModelCallError> {
     use aws_sdk_bedrockruntime::types::ResponseStream;
     use common::model_retry::{backoff, is_transient_status, INTERACTIVE_BACKOFF_SECS};
-    let Some(client) = common::model_provider::bedrock_client() else {
+    let Some(client) = common::model_provider::any_bedrock_client() else {
         return Err(ModelCallError::new(
             ModelErrorKind::Network,
             "Bedrock is the model provider but no client was set up",
         ));
     };
     let bytes = serde_json::to_vec(&common::model_provider::bedrock_body(body)).unwrap_or_default();
-    let bedrock_id = common::model_provider::bedrock_model_id(model_id);
     let mut attempt = 0;
     let out = loop {
         let result = client
             .invoke_model_with_response_stream()
-            .model_id(&bedrock_id)
+            .model_id(bedrock_id)
             .content_type("application/json")
             .accept("application/json")
             .body(aws_smithy_types::Blob::new(bytes.clone()))

@@ -56,7 +56,12 @@ export function serviceEnvironment(cfg: ResolvedConfig, account: string): Record
   return env;
 }
 
-/** MODEL_PROVIDER and the Bedrock model mapping (nothing for the default Anthropic API). */
+/**
+ * MODEL_PROVIDER and the Bedrock model mapping (nothing for the default
+ * Anthropic API). On a self-hosted install this is only the first-boot
+ * default: an admin can switch in Settings, System, Models at any time
+ * (services/common/src/model_provider.rs).
+ */
 export function modelProviderEnvironment(cfg: ResolvedConfig): Record<string, string> {
   if (cfg.models.provider !== "bedrock") return {};
   return {
@@ -66,11 +71,27 @@ export function modelProviderEnvironment(cfg: ResolvedConfig): Record<string, st
   };
 }
 
-/** Bedrock access for Claude models when the provider is Bedrock. */
+/**
+ * Whether the services may call Claude on Bedrock: when the config picks
+ * Bedrock, and on every self-hosted install (an admin can switch to Bedrock
+ * in Settings at any time, with no redeploy).
+ */
+export function mayCallBedrock(cfg: ResolvedConfig): boolean {
+  return cfg.models.provider === "bedrock" || cfg.layout === "single-origin";
+}
+
+/**
+ * Calling Claude on Bedrock: InvokeModel (which also covers the Converse
+ * API) and InvokeModelWithResponseStream (ConverseStream), on Anthropic
+ * models and this account's inference profiles, nothing else. Never
+ * aws-marketplace:Subscribe or the model agreement and use case calls:
+ * accepting Anthropic's terms stays a person's action in the console.
+ */
 export function modelPolicyStatements(cfg: ResolvedConfig, scope: cdk.Stack): iam.PolicyStatement[] {
-  if (cfg.models.provider !== "bedrock") return [];
+  if (!mayCallBedrock(cfg)) return [];
   return [
     new iam.PolicyStatement({
+      sid: "CallClaudeOnBedrock",
       actions: ["bedrock:InvokeModel", "bedrock:InvokeModelWithResponseStream"],
       resources: [
         // Anthropic models in any region an inference profile routes to,

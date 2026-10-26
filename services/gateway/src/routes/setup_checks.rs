@@ -572,7 +572,7 @@ pub enum ModelProbe {
 
 /// Bedrock's console page where model access is turned on.
 pub fn bedrock_access_url(region: &str) -> String {
-    format!("https://console.aws.amazon.com/bedrock/home?region={region}#/modelaccess")
+    common::model_access::bedrock_access_url(region)
 }
 
 pub fn model(bedrock: bool, region: &str, model_id: &str, probe: &ModelProbe) -> Check {
@@ -1307,6 +1307,67 @@ pub fn public_updates(status: Option<&Value>) -> PublicCheck {
     }
 }
 
+/// The updater's model check for the next release: every model it calls,
+/// tried through the install's provider. `None` until it has run.
+pub fn update_models(status: Option<&Value>) -> Option<Check> {
+    let mc = status?.get("model_check").filter(|m| m.is_object())?;
+    let version = mc["version"].as_str().unwrap_or("the next release");
+    let failing: Vec<&Value> = mc["results"]
+        .as_array()
+        .map(|r| r.iter().filter(|x| x["status"] == "fail").collect())
+        .unwrap_or_default();
+    let label = "The next release's models answer";
+    if mc["pending"].as_bool() == Some(true) {
+        return Some(Check::not_ok(
+            Status::Warn,
+            "update_models",
+            M,
+            label,
+            format!("Checking {version}'s signature before reading the models it calls."),
+            "The update waits until every model it calls answers.",
+            Fix::text("Wait a few minutes, then check again.").href("/settings/system#readiness"),
+        ));
+    }
+    if mc["ok"].as_bool() == Some(true) || failing.is_empty() {
+        return Some(Check::pass(
+            "update_models",
+            M,
+            label,
+            format!("Every model {version} calls answered a test call."),
+        ));
+    }
+    let first = failing[0];
+    let models: Vec<&str> = failing.iter().filter_map(|f| f["model"].as_str()).collect();
+    let mut fix = Fix::text(
+        first["fix"]
+            .as_str()
+            .unwrap_or("Fix the model access, then check again."),
+    );
+    if let Some(u) = first["url"].as_str() {
+        fix = fix.url(u);
+    }
+    if let Some(h) = first["href"].as_str() {
+        fix = fix.href(h);
+    }
+    Some(Check::not_ok(
+        Status::Fail,
+        "update_models",
+        M,
+        label,
+        format!(
+            "Update to {version} needs your action: {}",
+            first["detail"].as_str().unwrap_or("a model was refused.")
+        ),
+        format!(
+            "{version} calls {}; it won't be applied until {} answer{}. The check runs again daily.",
+            models.join(" and "),
+            if models.len() == 1 { "it" } else { "they" },
+            if models.len() == 1 { "s" } else { "" },
+        ),
+        fix,
+    ))
+}
+
 // ── Update preflight ──────────────────────────────────────────────────────
 
 /// One thing that would stop (or should pause) an update.
@@ -1323,7 +1384,11 @@ pub struct Blocker {
 pub fn preflight(checks: &[Check], status: Option<&Value>) -> Vec<Blocker> {
     let mut out: Vec<Blocker> = checks
         .iter()
-        .filter(|c| c.status == Status::Fail && !matches!(c.group, "Integrations"))
+        .filter(|c| {
+            c.status == Status::Fail
+                && !matches!(c.group, "Integrations")
+                && c.key != "update_models"
+        })
         .map(|c| Blocker {
             key: c.key.to_string(),
             severity: "block",
@@ -1343,6 +1408,54 @@ pub fn preflight(checks: &[Check], status: Option<&Value>) -> Vec<Blocker> {
         });
         return out;
     };
+    // The next release calls a model this install can't call yet: one
+    // blocker per model, each with its own fix.
+    if let Some(mc) = v.get("model_check").filter(|m| m["pending"] == true) {
+        let ver = mc["version"].as_str().unwrap_or("the next release");
+        out.push(Blocker {
+            key: "model_check_pending".into(),
+            severity: "block",
+            detail: format!("Checking {ver}'s signature before reading the models it calls."),
+            fix: Fix::text("Wait a few minutes, then check again.")
+                .href("/settings/system#readiness"),
+        });
+    }
+    if let Some(mc) = v
+        .get("model_check")
+        .filter(|m| m["ok"] == false && m["pending"] != true)
+    {
+        let ver = mc["version"].as_str().unwrap_or("the next release");
+        for f in mc["results"].as_array().into_iter().flatten() {
+            if f["status"] != "fail" {
+                continue;
+            }
+            let mut fix = Fix::text(
+                f["fix"]
+                    .as_str()
+                    .unwrap_or("Fix the model access, then check again."),
+            );
+            if let Some(u) = f["url"].as_str() {
+                fix = fix.url(u);
+            }
+            if let Some(h) = f["href"].as_str() {
+                fix = fix.href(h);
+            }
+            out.push(Blocker {
+                key: format!("model:{}", f["model"].as_str().unwrap_or("?")),
+                // Only a model the release calls blocks; another can be skipped.
+                severity: if f["required"] == false {
+                    "warn"
+                } else {
+                    "block"
+                },
+                detail: format!(
+                    "Update to {ver} needs your action: {}",
+                    f["detail"].as_str().unwrap_or("a model was refused.")
+                ),
+                fix,
+            });
+        }
+    }
     if v["running"].as_bool() == Some(true) {
         out.push(Blocker {
             key: "running".into(),
@@ -1860,6 +1973,7 @@ pub async fn run_all(state: &AppState, team_id: &str) -> (Vec<Check>, Option<Val
     checks.push(dlq(dlq_n));
     if super::system::has_updater() {
         checks.push(updates(updater.as_ref()));
+        checks.extend(update_models(updater.as_ref()));
     }
     checks.extend(integrations);
     checks.push(google_sign_in(
@@ -2060,31 +2174,12 @@ pub fn public_github(
 }
 
 /// Bedrock's refusal, as the guide's codes (one for each fix it shows).
+/// The same reading as Settings, System, Models and the updater's check
+/// (common::model_access); the guide has no code for a busy Bedrock.
 pub fn bedrock_code(status: u16, message: &str) -> &'static str {
-    let m = message.to_ascii_lowercase();
-    if m.contains("use case") || m.contains("use-case") {
-        "use_case_required"
-    } else if m.contains("being processed") || m.contains("subscription") && m.contains("pending") {
-        "subscription_pending"
-    } else if m.contains("marketplace") || m.contains("payment") {
-        "marketplace_failed"
-    } else if m.contains("not authorized to perform") || m.contains("explicit deny") {
-        "iam_denied"
-    } else if m.contains("don't have access")
-        || m.contains("do not have access")
-        || m.contains("access to the model")
-    {
-        "access_denied"
-    } else if m.contains("not available")
-        || m.contains("not supported")
-        || m.contains("model identifier is invalid")
-        || status == 404
-    {
-        "not_available"
-    } else if status == 403 {
-        "access_denied"
-    } else {
-        "unknown"
+    match common::model_access::refusal_code(status, message) {
+        "transient" => "unknown",
+        c => c,
     }
 }
 
@@ -2715,6 +2810,51 @@ mod tests {
         let s = summary(&[jira(false), chat("slack", "Slack", true, true)]);
         assert_eq!(s["ready"], true);
         assert_eq!(s["skip"], 1);
+    }
+
+    #[test]
+    fn a_refused_model_in_the_next_release_blocks_the_update() {
+        let status = json!({
+            "running": false,
+            "latest": {"version": "v1.3.0"},
+            "model_check": {
+                "version": "v1.3.0", "ok": false,
+                "results": [
+                    {"model": "claude-opus-5-5", "status": "pass", "code": "ok"},
+                    {"model": "claude-sonnet-5-5", "status": "fail", "code": "marketplace_failed", "required": true,
+                     "detail": "Bedrock refused us.anthropic.claude-sonnet-5-5: Anthropic's terms for this model haven't been accepted in AWS Marketplace.",
+                     "fix": "Have someone allowed to subscribe in AWS Marketplace accept the terms for claude-sonnet-5-5 on the Bedrock console's Model access page, then check again.",
+                     "url": "https://console.aws.amazon.com/bedrock/home?region=us-east-1#/modelaccess"},
+                ],
+            },
+        });
+        let b = preflight(&[], Some(&status));
+        assert_eq!(b.len(), 1);
+        assert_eq!(b[0].key, "model:claude-sonnet-5-5");
+        assert_eq!(b[0].severity, "block");
+        assert!(b[0]
+            .detail
+            .starts_with("Update to v1.3.0 needs your action"));
+        assert!(b[0].fix.url.as_deref().unwrap().contains("#/modelaccess"));
+        // Setup shows it as a failing check, which the preflight doesn't count twice.
+        let c = update_models(Some(&status)).unwrap();
+        assert_eq!(c.status, Status::Fail);
+        assert!(c.detail.contains("Update to v1.3.0 needs your action"));
+        assert!(c.why.contains("claude-sonnet-5-5"));
+        assert_eq!(preflight(&[c], Some(&status)).len(), 1);
+        // Passed, or never run.
+        let ok = json!({"model_check": {"version": "v1.3.0", "ok": true, "results": []}});
+        assert_eq!(update_models(Some(&ok)).unwrap().status, Status::Pass);
+        assert!(update_models(Some(&json!({}))).is_none());
+        // Before the release's signature is checked: held, not refused.
+        let pending = json!({"model_check": {"version": "v1.3.0", "ok": false, "pending": true, "results": []}});
+        assert_eq!(update_models(Some(&pending)).unwrap().status, Status::Warn);
+        let b = preflight(&[], Some(&pending));
+        assert_eq!(
+            (b[0].key.as_str(), b[0].severity),
+            ("model_check_pending", "block")
+        );
+        assert!(preflight(&[], Some(&ok)).is_empty());
     }
 
     #[test]

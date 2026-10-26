@@ -195,7 +195,7 @@ export function bedrockPrefixFor(region) {
 
 async function stepModel(ctx, answers) {
   const { flags, runner, log } = ctx;
-  log("CoderHelm uses Claude. Either each team adds its own Anthropic API key, or the install calls Claude on Amazon Bedrock in this AWS account (no keys, billed by AWS).");
+  log("CoderHelm uses Claude. Either each team adds its own Anthropic API key, or the install calls Claude on Amazon Bedrock in this AWS account (no keys, billed by AWS). You can change this later in Settings, System.");
   const provider = await answer(ctx, pick(flags, answers, "provider"), "Claude through anthropic or bedrock", "anthropic", (v) => (["anthropic", "bedrock"].includes(v) ? null : "anthropic or bedrock"));
   if (provider === BACK) return BACK;
   if (provider === "anthropic") {

@@ -1,0 +1,21 @@
+{
+  "schema": 1,
+  "about": "The models this release calls. Read by the services (common::model_ids), the release workflow (selfhost/release-models.mjs writes models.json into each release) and the updater's model check. A test in common::model_ids fails when code names a model id that isn't listed here.",
+  "calls": ["claude-opus-5-5", "claude-sonnet-5-5"],
+  "selectable": [
+    "claude-fable-5-1",
+    "claude-opus-5-5",
+    "claude-sonnet-5-5",
+    "claude-opus-4-8",
+    "claude-opus-4-7",
+    "claude-opus-4-6",
+    "claude-sonnet-4-6",
+    "claude-sonnet-4-5",
+    "claude-haiku-4-5",
+    "claude-haiku-4-5-20251001"
+  ],
+  "bedrock_names": {
+    "claude-haiku-4-5": "claude-haiku-4-5-20251001-v1:0",
+    "claude-haiku-4-5-20251001": "claude-haiku-4-5-20251001-v1:0"
+  }
+}

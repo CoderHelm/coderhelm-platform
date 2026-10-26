@@ -77,11 +77,16 @@ pub(crate) async fn call(state: &AppState, payload: Value) -> Result<Value, Stat
     Ok(body)
 }
 
-/// The updater's `{ok, error}` as an HTTP answer: a refused request is a 400.
+/// The updater's `{ok, error}` as an HTTP answer: a refused request is a
+/// 400, with the model check when that is what refused it.
 fn answer(body: Value) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     if body.get("ok").and_then(Value::as_bool) == Some(false) {
         let msg = body.get("error").cloned().unwrap_or(json!("refused"));
-        return Err((StatusCode::BAD_REQUEST, Json(json!({ "error": msg }))));
+        let mut out = json!({ "error": msg });
+        if let Some(m) = body.get("model_check").filter(|m| !m.is_null()) {
+            out["model_check"] = m.clone();
+        }
+        return Err((StatusCode::BAD_REQUEST, Json(out)));
     }
     Ok(Json(body))
 }
@@ -148,6 +153,9 @@ pub async fn set_auto_update(
 }
 
 /// POST /api/system/update: update to `version` (default: the latest).
+/// The updater checks every model the release calls first and refuses
+/// while one is refused; `skip_check` passes only a failure on a model the
+/// release doesn't call.
 pub async fn update_now(
     State(state): State<Arc<AppState>>,
     Extension(claims): Extension<Claims>,
@@ -159,9 +167,27 @@ pub async fn update_now(
         .get("version")
         .and_then(Value::as_str)
         .map(str::to_string);
+    let skip = body.get("skip_check").and_then(Value::as_bool) == Some(true);
     let body = call(
         &state,
-        json!({ "action": "update_now", "version": version, "actor": claims.email }),
+        json!({ "action": "update_now", "version": version, "actor": claims.email, "skip_check": skip }),
+    )
+    .await
+    .map_err(status_only)?;
+    answer(body)
+}
+
+/// POST /api/system/update-check: check the next release's models again
+/// now (the update banner's "Check again").
+pub async fn check_update(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<Claims>,
+) -> Reply {
+    claims.require_role(3).map_err(status_only)?;
+    allowed(&claims).map_err(status_only)?;
+    let body = call(
+        &state,
+        json!({ "action": "model_check", "actor": claims.email }),
     )
     .await
     .map_err(status_only)?;
@@ -363,6 +389,13 @@ mod tests {
         let (code, body) = r.unwrap_err();
         assert_eq!(code, StatusCode::BAD_REQUEST);
         assert_eq!(body.0["error"], "an update is already running");
+        assert!(body.0.get("model_check").is_none());
+        // A model the release calls was refused: the check comes along.
+        let r = answer(
+            json!({"ok": false, "error": "Update to v1.3.0 needs your action", "model_check": {"version": "v1.3.0", "ok": false}}),
+        );
+        let (_, body) = r.unwrap_err();
+        assert_eq!(body.0["model_check"]["version"], "v1.3.0");
         assert!(answer(json!({"ok": true, "version": "v1.2.0"})).is_ok());
     }
 

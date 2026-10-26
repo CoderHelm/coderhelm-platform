@@ -16,7 +16,7 @@ import { Template } from "aws-cdk-lib/assertions";
 import { buildApp } from "../lib/app";
 import { CoderhelmConfig, loadConfigFile, resolveConfig, ResolvedConfig } from "../lib/config";
 import { API_PATHS, STREAM_PATH, runtimeConfigScript } from "../lib/web-stack";
-import { updateBuildSpec } from "../lib/updates-stack";
+import { releaseCheckBuildSpec, updateBuildSpec } from "../lib/updates-stack";
 import { CHECK_VERSION, COSIGN_LINUX_AMD64_SHA256, VERIFY_SUMS } from "../lib/release-verify";
 
 const INFRA = path.join(__dirname, "..", "..");
@@ -493,4 +493,87 @@ test("CORS: the gateway answers browsers, not API Gateway; the docs origin never
     assert.equal(b.ResponseHeadersPolicyId, undefined, `${b.PathPattern} rewrites the API's headers`);
   }
   assert.ok(API_PATHS.includes("/api/*"), "the setup routes go through the API behavior");
+});
+
+// ── Switching the model provider (Settings, System, Models) ──────────────
+
+/** Every action any IAM policy or role in these templates allows. */
+function allowedActions(t: Record<string, Template>): string[] {
+  const out: string[] = [];
+  const walk = (v: unknown) => {
+    if (Array.isArray(v)) v.forEach(walk);
+    else if (v && typeof v === "object") {
+      for (const [k, x] of Object.entries(v)) {
+        if (k === "Action") out.push(...(Array.isArray(x) ? x : [x]).map(String));
+        else walk(x);
+      }
+    }
+  };
+  for (const tpl of Object.values(t)) walk(tpl.toJSON().Resources);
+  return out;
+}
+
+test("a self-host that starts on Anthropic keys may still call Bedrock, and nothing may accept terms", () => {
+  const t = synth(selfHost({ models: { provider: "anthropic" } }));
+  // No MODEL_PROVIDER: the first-boot default is the Anthropic API.
+  assert.equal(envOf(t["coderhelm-prod-api"], "coderhelm-prod-gateway").MODEL_PROVIDER, undefined);
+  // Every function that calls Claude may call it on Bedrock, on Anthropic models and inference profiles only.
+  for (const stack of ["coderhelm-prod-api", "coderhelm-prod-worker", "coderhelm-prod-streaming", "coderhelm-prod-log-analyzer"]) {
+    const policies = Object.values(t[stack].findResources("AWS::IAM::Policy"));
+    const st = policies
+      .flatMap((p: any) => p.Properties.PolicyDocument.Statement)
+      .find((s: any) => s.Sid === "CallClaudeOnBedrock");
+    assert.ok(st, `${stack} may call Claude on Bedrock`);
+    assert.deepEqual(st.Action, ["bedrock:InvokeModel", "bedrock:InvokeModelWithResponseStream"]);
+    const res = JSON.stringify(st.Resource);
+    assert.ok(res.includes("foundation-model/anthropic.*"), stack);
+    assert.ok(res.includes("inference-profile/*"), stack);
+    assert.ok(!res.includes('"*"'), `${stack}: never every resource`);
+  }
+  // The install never subscribes in AWS Marketplace or accepts a model agreement or use case form.
+  const actions = allowedActions(t);
+  for (const a of actions) {
+    assert.ok(!/^aws-marketplace:/i.test(a), a);
+    assert.ok(!/bedrock:(CreateFoundationModelAgreement|PutUseCaseForModelAccess|\*)/i.test(a), a);
+  }
+  // The updater asks the worker for the model check, and knows the config's models.
+  const u = t["coderhelm-prod-updates"];
+  const env = envOf(u, "coderhelm-prod-updater");
+  assert.equal(env.WORKER_FUNCTION_NAME, "coderhelm-prod-worker");
+  assert.equal(env.CONFIGURED_MODELS, "claude-opus-5-5,claude-sonnet-5-5");
+  const up = JSON.stringify(u.findResources("AWS::IAM::Policy"));
+  assert.ok(up.includes("ModelCheckThroughWorker"));
+  assert.ok(!up.includes("bedrock:"), "the updater itself never calls a model");
+});
+
+test("the hosted deployment on Anthropic keys gets no Bedrock model access", () => {
+  const hostedCfg = loadConfigFile(path.join(INFRA, "config", "hosted.prod.json"), { CDK_DEFAULT_ACCOUNT: "654654210434" });
+  if (hostedCfg.models.provider === "bedrock") return;
+  const hosted = synth(hostedCfg, zoneContext("654654210434", "us-east-1", "coderhelm.com"));
+  const api = JSON.stringify(hosted["coderhelm-prod-api"].findResources("AWS::IAM::Policy"));
+  assert.ok(!api.includes("CallClaudeOnBedrock"));
+});
+
+test("the release check reads models.json only after the signature check, and can only report back", () => {
+  const cfg = selfHost();
+  const commands: string[] = [...Object.values((releaseCheckBuildSpec(cfg) as any).spec.phases)].flatMap((p: any) => p.commands);
+  const verifyAt = commands.indexOf(VERIFY_SUMS);
+  assert.ok(verifyAt > 0, "the same exact signature check as the update build");
+  assert.ok(commands.indexOf(CHECK_VERSION) < verifyAt);
+  const readAt = commands.findIndex((c) => c.includes("models.json"));
+  assert.ok(readAt > verifyAt, "models.json only after the signature check");
+  assert.ok(commands[readAt].includes("grep ' models.json$' SHA256SUMS | sha256sum -c -"), "and only when its checksum matches");
+  assert.ok(!commands.some((c) => /npm install|coderhelm-selfhost|cdk /.test(c)), "nothing installed or deployed");
+  assert.ok(commands.some((c) => c.includes('action:"models_verified"')));
+  const t = synth(cfg);
+  const u = t["coderhelm-prod-updates"];
+  const roles = u.findResources("AWS::IAM::Role");
+  const check = Object.entries(roles).find(([, r]: any) => r.Properties.RoleName === "coderhelm-prod-release-check");
+  assert.ok(check, "its own role");
+  const policies = Object.values(u.findResources("AWS::IAM::Policy")).filter((p: any) => JSON.stringify(p.Properties.Roles).includes(check![0]));
+  const actions = policies.flatMap((p: any) => p.Properties.PolicyDocument.Statement.flatMap((s: any) => [].concat(s.Action)));
+  // Only reporting back (plus CodeBuild's own logs and reports): no deploy, no secret, no assumed role.
+  assert.ok(actions.every((a) => a === "lambda:InvokeFunction" || a.startsWith("logs:") || /^codebuild:(Create|Update|BatchPut)/.test(a)), JSON.stringify(actions));
+  assert.ok(!actions.some((a) => /sts:|secretsmanager:|ssm:|cloudformation:|bedrock:/.test(a)));
+  assert.equal(envOf(u, "coderhelm-prod-updater").RELEASE_CHECK_PROJECT_NAME, "coderhelm-prod-release-check");
 });

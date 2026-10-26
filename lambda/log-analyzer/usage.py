@@ -392,33 +392,86 @@ def call_messages(api_key, body, model_id, client, table, team_id, feature,
     raise StreamBroke("unreachable")
 
 
-# ── Amazon Bedrock (MODEL_PROVIDER=bedrock) ──────────────────────────────
+# ── Amazon Bedrock or Anthropic API keys ─────────────────────────────────
+#
+# The deploy config sets the first-boot default (MODEL_PROVIDER,
+# BEDROCK_INFERENCE_PREFIX, BEDROCK_MODEL_IDS); an install admin can change
+# it in Settings, System, Models, stored on the settings table (pk SYSTEM,
+# sk MODELS). The handler sets RUNTIME_LOADER to read that record; it is read
+# again at most every RUNTIME_SECONDS, like the Rust services
+# (services/common/src/model_provider.rs).
+
+RUNTIME_SECONDS = 30
+RUNTIME_LOADER = None
+_runtime = {"at": None, "value": None}
+_PREFIX_RE = __import__("re").compile(r"^([a-z]{2,6}\.)?$")
+
+
+def deploy_settings(env=None):
+    env = os.environ if env is None else env
+    try:
+        ids = json.loads(env.get("BEDROCK_MODEL_IDS") or "{}")
+    except ValueError:
+        ids = {}
+    return {
+        "provider": "bedrock" if (env.get("MODEL_PROVIDER") or "").strip().lower() == "bedrock" else "anthropic",
+        "inference_prefix": env.get("BEDROCK_INFERENCE_PREFIX", "us."),
+        "model_ids": ids if isinstance(ids, dict) else {},
+    }
+
+
+def resolve_settings(stored, default):
+    """A stored choice when it reads and is valid, else the deploy config's."""
+    if not isinstance(stored, dict):
+        return default
+    provider = str(stored.get("provider") or "").strip().lower()
+    if provider not in ("anthropic", "bedrock"):
+        return default
+    prefix = str(stored.get("inference_prefix", default["inference_prefix"])).strip()
+    ids = stored.get("model_ids") or {}
+    if not _PREFIX_RE.match(prefix) or not isinstance(ids, dict):
+        return default
+    if any(not isinstance(v, str) or not ("anthropic." in v or v.startswith("arn:aws")) for v in ids.values()):
+        return default
+    return {"provider": provider, "inference_prefix": prefix, "model_ids": ids}
+
+
+def provider_settings(env=None, clock=time.monotonic):
+    """The setting in force: the stored choice (read at most every 30 s), else the deploy config."""
+    default = deploy_settings(env)
+    if RUNTIME_LOADER is None:
+        return default
+    now = clock()
+    if _runtime["at"] is None or now - _runtime["at"] >= RUNTIME_SECONDS:
+        try:
+            _runtime["value"] = RUNTIME_LOADER()
+        except Exception as e:  # keep the last one; try again later
+            logger.warning(f"Model provider setting not read: {e}")
+        _runtime["at"] = now
+    return resolve_settings(_runtime["value"], default)
+
 
 def is_bedrock(env=None):
-    """True when the deployment calls Claude through Amazon Bedrock."""
-    env = os.environ if env is None else env
-    return (env.get("MODEL_PROVIDER") or "").strip().lower() == "bedrock"
+    """True when the install calls Claude through Amazon Bedrock now."""
+    return provider_settings(env)["provider"] == "bedrock"
 
 
 def bedrock_model_id(model, env=None):
     """The Bedrock id for a model name (same rule as
-    services/common/src/model_provider.rs): an explicit BEDROCK_MODEL_IDS
-    entry, an id that already is a Bedrock id, else
-    <BEDROCK_INFERENCE_PREFIX>anthropic.<model>."""
-    env = os.environ if env is None else env
-    try:
-        mapping = json.loads(env.get("BEDROCK_MODEL_IDS") or "{}")
-    except ValueError:
-        mapping = {}
+    services/common/src/model_provider.rs): an explicit model id override, an
+    id that already is a Bedrock id, else <prefix>anthropic.<model>."""
+    s = provider_settings(env)
+    mapping = s["model_ids"]
     if model in mapping:
         return mapping[model]
     if "anthropic." in model or model.startswith("arn:"):
         return model
     name = BEDROCK_NAMES.get(model, model)
-    return f"{env.get('BEDROCK_INFERENCE_PREFIX', 'us.')}anthropic.{name}"
+    return f"{s['inference_prefix']}anthropic.{name}"
 
 
-# Models whose Bedrock id isn't just their name (same table as the Rust side).
+# Models whose Bedrock id isn't just their name (the release manifest's
+# bedrock_names, services/common/release_models.json; a test holds them equal).
 BEDROCK_NAMES = {
     "claude-haiku-4-5": "claude-haiku-4-5-20251001-v1:0",
     "claude-haiku-4-5-20251001": "claude-haiku-4-5-20251001-v1:0",
