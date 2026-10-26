@@ -772,7 +772,7 @@ pub async fn notify_review(state: &WorkerState, team: &str, artifact: &str) {
         }
     }
     // A signed link for each named approver (never the requester).
-    if state.secrets.jwt_secret.is_empty() || state.config.ses_from_address.is_empty() {
+    if state.secrets.jwt_secret.is_empty() {
         return;
     }
     let Some(ap) = &a.approval else { return };
@@ -802,50 +802,39 @@ pub async fn notify_review(state: &WorkerState, team: &str, artifact: &str) {
             a.version,
             a.id
         );
-        let sent = state
-            .ses
-            .send_email()
-            .from_email_address(&state.config.ses_from_address)
-            .destination(
-                aws_sdk_sesv2::types::Destination::builder()
-                    .to_addresses(to)
-                    .build(),
-            )
-            .content(
-                aws_sdk_sesv2::types::EmailContent::builder()
-                    .simple(
-                        aws_sdk_sesv2::types::Message::builder()
-                            .subject(
-                                aws_sdk_sesv2::types::Content::builder()
-                                    .data(format!("Approve: {}", a.title))
-                                    .build()
-                                    .unwrap_or_else(|_| unreachable_content()),
-                            )
-                            .body(
-                                aws_sdk_sesv2::types::Body::builder()
-                                    .text(
-                                        aws_sdk_sesv2::types::Content::builder()
-                                            .data(body)
-                                            .build()
-                                            .unwrap_or_else(|_| unreachable_content()),
-                                    )
-                                    .build(),
-                            )
-                            .build(),
-                    )
-                    .build(),
-            )
-            .send()
-            .await;
+        use common::mail::templates::fit;
+        let mail = common::mail::Mail {
+            kind: "plugin_approval".into(),
+            to: to.clone(),
+            template: "plugin_approval",
+            params: serde_json::json!({
+                "plugin": fit(&a.plugin_name, 80),
+                "title": fit(&a.title, 200),
+                "excerpt": fit(&excerpt, 1200),
+                "version": a.version,
+                "approve_link": link,
+                "review_link": format!("{base}/plugins/draft/?id={}", a.id),
+            })
+            .as_object()
+            .cloned()
+            .unwrap_or_default(),
+            ses: common::mail::SesBody::Simple {
+                subject: format!("Approve: {}", a.title),
+                text: body,
+                html: None,
+                headers: vec![],
+            },
+        };
+        let sent = common::mail::send(&crate::clients::email::sender(state), &mail).await;
+        common::deliveries::record(
+            &state.dynamo,
+            &state.config.settings_table_name,
+            team,
+            &common::mail::delivery("plugin_approval", to, &sent),
+        )
+        .await;
         if let Err(e) = sent {
-            warn!(team, to = %to, error = %e, "Couldn't send a plugin approval email");
+            warn!(team, code = %e.code, error = %e.message, "Couldn't send a plugin approval email");
         }
     }
-}
-
-fn unreachable_content() -> aws_sdk_sesv2::types::Content {
-    aws_sdk_sesv2::types::Content::builder()
-        .data(" ")
-        .build()
-        .expect("content with data")
 }

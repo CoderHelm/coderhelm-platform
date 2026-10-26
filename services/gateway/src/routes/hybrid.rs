@@ -43,11 +43,11 @@ use crate::AppState;
 
 type Reply = Result<Json<Value>, (StatusCode, Json<Value>)>;
 
-fn fail(code: StatusCode, reason: &str, message: &str) -> (StatusCode, Json<Value>) {
+pub(crate) fn fail(code: StatusCode, reason: &str, message: &str) -> (StatusCode, Json<Value>) {
     (code, Json(json!({ "code": reason, "error": message })))
 }
 
-fn not_here() -> (StatusCode, Json<Value>) {
+pub(crate) fn not_here() -> (StatusCode, Json<Value>) {
     fail(StatusCode::NOT_FOUND, "not_found", "Not found.")
 }
 
@@ -202,7 +202,7 @@ pub fn name_change_allowed(changes: &[i64], now: i64) -> bool {
     changes.iter().filter(|t| now - **t < 86_400).count() < names::CHANGES_PER_DAY as usize
 }
 
-async fn load_install(
+pub(crate) async fn load_install(
     state: &AppState,
     id: &str,
 ) -> Result<Option<Install>, (StatusCode, Json<Value>)> {
@@ -258,7 +258,7 @@ async fn save_install(state: &AppState, i: &Install) -> Result<(), (StatusCode, 
 }
 
 /// One line in the audit log (kept 400 days).
-async fn audit(state: &AppState, install: &str, action: &str, detail: Value) {
+pub(crate) async fn audit(state: &AppState, install: &str, action: &str, detail: Value) {
     let id = ulid::Ulid::new().to_string();
     let _ = state
         .dynamo
@@ -281,7 +281,7 @@ async fn audit(state: &AppState, install: &str, action: &str, detail: Value) {
 }
 
 /// The install a signed request comes from, after checking the signature.
-async fn signed(
+pub(crate) async fn signed(
     state: &AppState,
     headers: &HeaderMap,
     method: &Method,
@@ -2660,7 +2660,7 @@ pub async fn oauth_revoke(State(state): State<Arc<AppState>>, body: Bytes) -> Re
 
 // ── Admin (CoderHelm's own operators) ────────────────────────────────────
 
-fn operator(claims: &Claims) -> Result<(), (StatusCode, Json<Value>)> {
+pub(crate) fn operator(claims: &Claims) -> Result<(), (StatusCode, Json<Value>)> {
     if !super::api::is_platform_admin(claims) {
         return Err(fail(
             StatusCode::FORBIDDEN,

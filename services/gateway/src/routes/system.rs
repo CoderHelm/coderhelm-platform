@@ -218,53 +218,45 @@ pub async fn test_email(
 ) -> Reply {
     claims.require_role(3).map_err(status_only)?;
     allowed(&claims).map_err(status_only)?;
-    use aws_sdk_sesv2::types::{Body, Content, Destination, EmailContent, Message};
-    let text = Content::builder()
-        .data("Email from your CoderHelm install works. Run results, invites and update notices will arrive like this one.")
-        .build()
-        .map_err(|_| status_only(StatusCode::INTERNAL_SERVER_ERROR))?;
-    let subject = Content::builder()
-        .data("CoderHelm test email")
-        .build()
-        .map_err(|_| status_only(StatusCode::INTERNAL_SERVER_ERROR))?;
-    let message = Message::builder()
-        .subject(subject)
-        .body(Body::builder().text(text).build())
-        .build();
-    match state
-        .ses
-        .send_email()
-        .from_email_address(&state.config.ses_from_address)
-        .destination(Destination::builder().to_addresses(&claims.email).build())
-        .content(EmailContent::builder().simple(message).build())
-        .send()
-        .await
-    {
-        Ok(_) => {
-            super::deliveries::record_email(
-                &state,
-                &claims.team_id,
-                "test_email",
-                &claims.email,
-                Ok(()),
-            )
-            .await;
-            Ok(Json(json!({ "sent": true, "to": claims.email })))
-        }
+    use common::mail;
+    let m = mail::Mail {
+        kind: "test_email".into(),
+        to: claims.email.clone(),
+        template: "test_email",
+        params: serde_json::Map::new(),
+        ses: mail::SesBody::Simple {
+            subject: "CoderHelm test email".into(),
+            text: "Email from your CoderHelm install works. Run results, invites and update notices will arrive like this one.".into(),
+            html: None,
+            headers: vec![],
+        },
+    };
+    let result = mail::send(&super::email_settings::sender(&state), &m).await;
+    super::deliveries::record_mail(
+        &state,
+        &claims.team_id,
+        "test_email",
+        &claims.email,
+        &result,
+    )
+    .await;
+    match result {
+        Ok(route) => Ok(Json(json!({
+            "sent": true,
+            "to": claims.email,
+            "via": if route == mail::Route::Relay { "coderhelm" } else { "ses" },
+        }))),
         Err(e) => {
-            let reason = aws_sdk_sesv2::error::DisplayErrorContext(&e).to_string();
-            warn!(reason = %reason, "test email not sent");
-            super::deliveries::record_email(
-                &state,
-                &claims.team_id,
-                "test_email",
-                &claims.email,
-                Err(reason.clone()),
-            )
-            .await;
-            // The usual reasons: an unverified sender, or the SES sandbox.
+            warn!(code = %e.code, reason = %e.message, "test email not sent");
+            // The usual reasons: an unverified sender, the SES sandbox, or
+            // CoderHelm's relay refusing (its code says why).
+            let reason = if e.code.starts_with("email_") {
+                short_reason(&e.message).to_string()
+            } else {
+                e.message.clone()
+            };
             Ok(Json(
-                json!({ "sent": false, "reason": short_reason(&reason) }),
+                json!({ "sent": false, "code": e.code, "reason": reason }),
             ))
         }
     }

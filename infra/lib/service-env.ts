@@ -30,6 +30,7 @@ export function serviceEnvironment(cfg: ResolvedConfig, account: string): Record
   env.LOG_READER_TEMPLATE_URL = logReaderTemplateUrlFor(cfg);
   env.RESOURCE_PREFIX = cfg.prefix;
   if (cfg.admins.length) env.PLATFORM_ADMIN_EMAILS = cfg.admins.join(",");
+  Object.assign(env, emailEnvironment(cfg));
   Object.assign(env, modelProviderEnvironment(cfg));
   // Self-hosted installs: which release this is (Settings → System), and
   // the updater the system routes ask. The hosted deployment has neither.
@@ -47,8 +48,7 @@ export function serviceEnvironment(cfg: ResolvedConfig, account: string): Record
   // The default (https://api.coderhelm.com) is built into the services, so a
   // plain install carries nothing of the hosted deployment; "off" when the
   // config turns hybrid off.
-  if (cfg.layout === "single-origin" && cfg.hybridUrl === null) env.HYBRID_URL = "off";
-  else if (cfg.hybridUrl && cfg.hybridUrl !== "https://api.coderhelm.com") env.HYBRID_URL = cfg.hybridUrl;
+  Object.assign(env, hybridUrlEnvironment(cfg));
   if (cfg.hybrid) env.HYBRID_ZONE_NAME = cfg.hybrid.zone;
   // The services read the secret once at start. The installer sets this to
   // the secret's version after it stores new keys (the GitHub App), so the
@@ -70,6 +70,49 @@ export function logReaderTemplateUrlFor(cfg: ResolvedConfig, version: string | n
     return releaseLogReaderTemplateUrl(version);
   }
   return DEFAULT_LOG_READER_TEMPLATE_URL;
+}
+
+/**
+ * HYBRID_URL for a function that may call the hosted side: "off" when the
+ * config turned hybrid off, a non-default hosted URL, or nothing (the
+ * default is built into each caller).
+ */
+export function hybridUrlEnvironment(cfg: ResolvedConfig): Record<string, string> {
+  if (cfg.layout === "single-origin" && cfg.hybridUrl === null) return { HYBRID_URL: "off" };
+  if (cfg.hybridUrl && cfg.hybridUrl !== "https://api.coderhelm.com") return { HYBRID_URL: cfg.hybridUrl };
+  return {};
+}
+
+/**
+ * Which emails a deployment sends and how (services/common/src/mail). The
+ * hosted deployment (split layout) sends every email as before. A
+ * self-hosted install sends optional emails only once an install admin turns
+ * them on; OPTIONAL_EMAIL_DEFAULTS is the config's starting value and
+ * EMAIL_TRANSPORT_DEFAULT how it sends until an admin chooses. The hosted
+ * side of hybrid also gets its mail relay's sender.
+ */
+export function emailEnvironment(cfg: ResolvedConfig): Record<string, string> {
+  const env: Record<string, string> = {
+    DEPLOYMENT_KIND: cfg.layout === "split" ? "hosted" : "self-hosted",
+    SUPPORT_INBOX: cfg.email.supportInbox,
+  };
+  if (cfg.layout !== "split") {
+    env.OPTIONAL_EMAIL_DEFAULTS = cfg.integrations.weeklySummary ? "weekly_summary" : "";
+    env.EMAIL_TRANSPORT_DEFAULT = cfg.email.transport;
+  }
+  if (cfg.mailRelay) {
+    env.HYBRID_EMAIL_FROM = cfg.mailRelay.from;
+    env.HYBRID_EMAIL_CONFIG_SET = `${cfg.prefix}-relay`;
+  }
+  return env;
+}
+
+/**
+ * Whether the Monday summary's schedule exists: always on a self-hosted
+ * install (the install's own setting decides), else the config's switch.
+ */
+export function weeklySummaryScheduled(cfg: ResolvedConfig): boolean {
+  return cfg.layout !== "split" || cfg.integrations.weeklySummary;
 }
 
 /**

@@ -1359,6 +1359,7 @@ async fn send_invite_email(
     org: &str,
     role: &str,
 ) -> Result<(), StatusCode> {
+    use common::mail::{self, templates::fit};
     let template_name = format!("{}-team-invite", state.config.ses_template_prefix);
     let template_data = serde_json::to_string(&json!({
         "inviter": inviter,
@@ -1366,33 +1367,37 @@ async fn send_invite_email(
         "role": role,
     }))
     .unwrap_or_default();
-
-    let sent = state
-        .ses
-        .send_email()
-        .from_email_address(&state.config.ses_from_address)
-        .destination(
-            aws_sdk_sesv2::types::Destination::builder()
-                .to_addresses(to)
-                .build(),
-        )
-        .content(
-            aws_sdk_sesv2::types::EmailContent::builder()
-                .template(
-                    aws_sdk_sesv2::types::Template::builder()
-                        .template_name(&template_name)
-                        .template_data(&template_data)
-                        .build(),
-                )
-                .build(),
-        )
-        .send()
-        .await;
-    let result = sent
-        .map(|_| ())
-        .map_err(|e| aws_sdk_sesv2::error::DisplayErrorContext(&e).to_string());
-    super::deliveries::record_email(state, team, "invite", to, result.clone()).await;
-    result.map_err(|e| {
+    let sender = super::email_settings::sender(state);
+    // Through CoderHelm, the invite is listed first, vouched for by the
+    // admin sending it (the gateway only lets admins invite).
+    let listed = mail::list_invite(&sender, inviter, to).await;
+    let result = match listed {
+        Err(e) => Err(e),
+        Ok(()) => {
+            let inviter_name = inviter.split('@').next().unwrap_or("A teammate");
+            let m = mail::Mail {
+                kind: "invite".into(),
+                to: to.to_string(),
+                template: "team_invite",
+                params: json!({
+                    "team": fit(org, 80),
+                    "inviter": fit(inviter_name, 80),
+                    "role": role,
+                    "link": common::public_urls::app_url_from_env(),
+                })
+                .as_object()
+                .cloned()
+                .unwrap_or_default(),
+                ses: mail::SesBody::Template {
+                    name: template_name,
+                    data: template_data,
+                },
+            };
+            mail::send(&sender, &m).await
+        }
+    };
+    super::deliveries::record_mail(state, team, "invite", to, &result).await;
+    result.map(|_| ()).map_err(|e| {
         error!("Failed to send invite email: {e}");
         StatusCode::INTERNAL_SERVER_ERROR
     })

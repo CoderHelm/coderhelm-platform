@@ -2321,35 +2321,38 @@ fn attr_n(val: impl std::fmt::Display) -> aws_sdk_dynamodb::types::AttributeValu
 }
 
 /// Send the welcome email to a single address (best-effort, non-blocking).
+/// Optional: on a self-hosted install it goes out only once an install
+/// admin turned it on (Settings, Emails).
 async fn send_welcome_email(state: &AppState, email: &str) {
+    use common::mail;
+    if !mail::optional_allowed(
+        &state.dynamo,
+        &state.config.settings_table_name,
+        mail::WELCOME,
+    )
+    .await
+    {
+        info!("Welcome email is off for this install; not sent");
+        return;
+    }
     let template_name = format!("{}-welcome", state.config.ses_template_prefix);
     let template_data = serde_json::json!({ "org": "", "repo_count": 0 }).to_string();
-
-    if let Err(e) = state
-        .ses
-        .send_email()
-        .from_email_address(&state.config.ses_from_address)
-        .destination(
-            aws_sdk_sesv2::types::Destination::builder()
-                .to_addresses(email)
-                .build(),
-        )
-        .content(
-            aws_sdk_sesv2::types::EmailContent::builder()
-                .template(
-                    aws_sdk_sesv2::types::Template::builder()
-                        .template_name(&template_name)
-                        .template_data(&template_data)
-                        .build(),
-                )
-                .build(),
-        )
-        .send()
-        .await
-    {
-        error!("Failed to send welcome email to {email}: {e}");
-    } else {
-        info!(email, "Welcome email sent");
+    let m = mail::Mail {
+        kind: "welcome".into(),
+        to: email.to_string(),
+        template: "welcome",
+        params: serde_json::json!({ "link": common::public_urls::app_url_from_env() })
+            .as_object()
+            .cloned()
+            .unwrap_or_default(),
+        ses: mail::SesBody::Template {
+            name: template_name,
+            data: template_data,
+        },
+    };
+    match mail::send(&super::email_settings::sender(state), &m).await {
+        Ok(_) => info!("Welcome email sent"),
+        Err(e) => error!(code = %e.code, "Failed to send welcome email: {}", e.message),
     }
 }
 

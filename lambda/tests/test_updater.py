@@ -114,7 +114,7 @@ class Handler(unittest.TestCase):
         self.store = u.Store(self.db, "t")
         self.builds, self.notices = [], []
         u.start_build = lambda env, version, actor, mode, hid, extra=None: self.builds.append((version, actor, mode, hid)) or f"b-{len(self.builds)}"
-        u.notify = lambda subject, text, env=None: self.notices.append(subject) or 1
+        u.notify = lambda subject, text, env=None, **kw: self.notices.append(subject) or 1
         # Releases checked by the build and listing no models: nothing to check.
         real = u.verified_manifest
         u.verified_manifest = lambda store, version: (True, None)
@@ -191,7 +191,7 @@ class NoDowngrade(unittest.TestCase):
         self.store = u.Store(self.db, "t")
         self.builds = []
         u.start_build = lambda env, version, actor, mode, hid, extra=None: self.builds.append((version, mode)) or "b"
-        u.notify = lambda subject, text, env=None: 1
+        u.notify = lambda subject, text, env=None, **kw: 1
         self.env = {"CODERHELM_VERSION": "v1.2.0", "APP_URL": "https://helm.example.org", "UPDATE_PROJECT_NAME": "p"}
         self.fetch = lambda _r: [rel("v1.3.0")]
         # Signed releases that list no models: the model check has nothing to hold.
@@ -298,7 +298,7 @@ class ModelCheck(unittest.TestCase):
         self.builds, self.notices, self.texts = [], [], []
         real_build, real_notify = u.start_build, u.notify
         u.start_build = lambda env, version, actor, mode, hid, extra=None: self.builds.append((version, actor, mode)) or "b-1"
-        u.notify = lambda subject, text, env=None: self.notices.append(subject) or self.texts.append(text) or 1
+        u.notify = lambda subject, text, env=None, **kw: self.notices.append(subject) or self.texts.append(text) or 1
         self.addCleanup(setattr, u, "start_build", real_build)
         self.addCleanup(setattr, u, "notify", real_notify)
         real_check = u.start_check
@@ -593,7 +593,7 @@ class Domain(unittest.TestCase):
         self.builds, self.notices = [], []
         self._start, self._notify = u.start_build, u.notify
         u.start_build = lambda env, version, actor, mode, hid, extra=None: self.builds.append((version, actor, mode, extra)) or "b-1"
-        u.notify = lambda subject, text, env=None: self.notices.append(subject) or 1
+        u.notify = lambda subject, text, env=None, **kw: self.notices.append(subject) or 1
         self.acm = FakeAcm()
         self.r53 = FakeRoute53([])
         u._clients.update({"acm@us-east-1": self.acm, "route53": self.r53, "ssm": FakeSsm()})
@@ -725,3 +725,91 @@ class Domain(unittest.TestCase):
         self.h({"action": "finished", "status": "succeeded", "history_id": hid}, env=live)
         self.assertEqual(self.store.get("DOMAIN"), {})
         self.assertEqual(self.notices[-1], "CoderHelm is back on its AWS address")
+
+
+class EmailRouteTest(unittest.TestCase):
+    """Update notices go out the install's chosen way, never both, never to CoderHelm."""
+
+    def setUp(self):
+        self.sent = []
+        self.posts = []
+        test = self
+
+        class Ses:
+            def send_email(self, **kw):
+                test.sent.append(kw)
+
+        class Dyn:
+            def __init__(self, item=None):
+                self.item = item
+
+            def get_item(self, **kw):
+                return {"Item": self.item} if self.item else {}
+
+        class Secrets:
+            def get_secret_value(self, **kw):
+                return {"SecretString": json.dumps({"hybrid_install_id": "ins_abcdefghijklmnopqrstuvwx", "hybrid_install_secret": "s3cret"})}
+
+        self.Dyn = Dyn
+        u._clients.clear()
+        u._clients["sesv2"] = Ses()
+        u._clients["secretsmanager"] = Secrets()
+        self.env = {"ADMIN_EMAILS": "admin@example.org,ops@coderhelm.com", "SES_FROM_ADDRESS": "ch@example.org",
+                    "SETTINGS_TABLE_NAME": "t", "SECRETS_NAME": "x", "APP_URL": "https://d1.cloudfront.net",
+                    "HYBRID_URL": "https://hosted.example.test"}
+
+        class Resp:
+            def close(self):
+                pass
+
+        def opener(req, timeout=None):
+            test.posts.append((req.full_url, json.loads(req.data), dict(req.header_items())))
+            return Resp()
+
+        self.opener = opener
+
+    def tearDown(self):
+        u._clients.clear()
+
+    def test_own_ses_by_default_and_never_a_coderhelm_address(self):
+        u._clients["dynamodb"] = self.Dyn()
+        u.notify("s", "t", self.env, what="available", version="v1.2.0", opener=self.opener)
+        self.assertEqual(len(self.sent), 1)
+        self.assertEqual(self.sent[0]["Destination"]["ToAddresses"], ["admin@example.org"])
+        self.assertEqual(self.posts, [], "nothing goes to CoderHelm unless an admin chose it")
+
+    def test_through_coderhelm_only_when_chosen_templates_only_and_signed(self):
+        u._clients["dynamodb"] = self.Dyn({"data": {"S": json.dumps({"transport": "coderhelm"})}})
+        u.notify("s", "t", self.env, what="succeeded", version="v1.2.0", opener=self.opener)
+        self.assertEqual(self.sent, [], "never both routes")
+        urls = [p[0] for p in self.posts]
+        self.assertEqual(urls, ["https://hosted.example.test/hybrid/email/recipients", "https://hosted.example.test/hybrid/email"])
+        body = self.posts[1][1]
+        self.assertEqual(body["template"], "update_notice")
+        self.assertEqual(set(body), {"request_id", "to", "template", "params", "contact"})
+        self.assertNotIn("subject", body["params"])
+        self.assertEqual(body["params"]["link"], "https://d1.cloudfront.net/settings/system/")
+        self.assertEqual(body["to"], "admin@example.org")
+        headers = {k.lower(): v for k, v in self.posts[1][2].items()}
+        self.assertTrue(headers["x-coderhelm-signature"].startswith("v1="))
+
+    def test_the_signature_matches_the_services(self):
+        # services/common/src/hybrid/sign.rs, the_signature_matches_the_installer_and_a_fixed_vector
+        self.assertEqual(
+            u.sign_request("s3cret", 1_800_000_000, "delete", "/hybrid/installs", b""),
+            "v1=ae93880dea04941037494d54f0116ec78c7f934c8a4fceed86d64fa41d24a769",
+        )
+
+    def test_hybrid_turned_off_sends_nothing_through_coderhelm(self):
+        u._clients["dynamodb"] = self.Dyn({"data": {"S": json.dumps({"transport": "coderhelm"})}})
+        u.notify("s", "t", dict(self.env, HYBRID_URL="off"), opener=self.opener)
+        self.assertEqual((self.sent, self.posts), ([], []), "never SES instead, never the relay")
+
+    def test_unreadable_settings_send_nothing(self):
+        class Broken:
+            def get_item(self, **kw):
+                raise RuntimeError("down")
+
+        u._clients["dynamodb"] = Broken()
+        u.notify("s", "t", self.env, opener=self.opener)
+        self.assertEqual((self.sent, self.posts), ([], []))

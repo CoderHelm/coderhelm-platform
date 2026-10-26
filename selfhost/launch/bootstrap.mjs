@@ -29,6 +29,7 @@
 //   STAGE            install name (resources start with coderhelm-<stage>)
 //   ADMIN_EMAIL      the first admin
 //   EMAIL_FROM       sender address; empty means ADMIN_EMAIL
+//   EMAIL_TRANSPORT  ses (default) | coderhelm: CoderHelm's mail service
 //   HOSTNAME_ARG     optional: your own domain, e.g. coderhelm.example.com
 //   HOSTED_ZONE      optional: its Route 53 zone (empty: found in the account,
 //                    or another DNS provider)
@@ -155,7 +156,10 @@ export function configFromEnv(env, { account, found = null }) {
     // certificate is issued (the updater moves it along).
     domain: plan.mode === "route53" ? { hostname, hostedZone, ...(plan.zoneId ? { hostedZoneId: plan.zoneId } : {}) } : null,
     models,
-    email: { from, identity: emailIdentity({ from, hostedZone }) },
+    email: env.EMAIL_TRANSPORT === "coderhelm"
+      // Through CoderHelm: no SES identity to verify; Cognito keeps its own sender.
+      ? { from, identity: null, transport: "coderhelm" }
+      : { from, identity: emailIdentity({ from, hostedZone }) },
     admins: [admin],
     telemetry: { enabled: env.TELEMETRY === "on" },
   };

@@ -21,7 +21,6 @@ use std::collections::HashMap;
 use std::fmt::Write as _;
 
 use aws_sdk_dynamodb::types::AttributeValue;
-use aws_sdk_sesv2::types::{Body, Content, Destination, EmailContent, Message, MessageHeader};
 use chrono::{DateTime, Datelike, Duration, SecondsFormat, TimeZone, Utc};
 use common::unsubscribe;
 use tracing::{info, warn};
@@ -2003,26 +2002,67 @@ pub fn unsubscribe_headers(link: &str) -> [(&'static str, String); 2] {
     ]
 }
 
-async fn send(state: &WorkerState, to: &str, email: &Rendered, link: &str) -> Result<(), BoxErr> {
-    let content = |v: &str| Content::builder().data(v).charset("UTF-8").build();
-    let mut message = Message::builder().subject(content(&email.subject)?).body(
-        Body::builder()
-            .html(content(&email.html)?)
-            .text(content(&email.text)?)
-            .build(),
-    );
-    for (name, value) in unsubscribe_headers(link) {
-        message = message.headers(MessageHeader::builder().name(name).value(value).build()?);
+/// The relay form of a summary: the headline numbers and the merged PR
+/// titles as plain text (CoderHelm's mail relay writes the email from its
+/// own template; see `common::mail::templates`).
+pub fn relay_params(sm: &Summary, unsubscribe: &str) -> serde_json::Map<String, serde_json::Value> {
+    use common::mail::templates::fit;
+    let highlights = sm
+        .runs
+        .top_merged
+        .iter()
+        .map(|p| format!("Merged: {}", title_or(&p.title, &p.repo)))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let mut m = serde_json::json!({
+        "team": fit(if sm.team_name.is_empty() { "Your team" } else { &sm.team_name }, 80),
+        "period": fit(&period(sm.start, sm.end), 40),
+        "merged": sm.runs.merged,
+        "runs": sm.runs.completed,
+        "reviews": sm.reviews.posted,
+        "waiting": sm.runs.attention_total,
+        "link": app(),
+        "unsubscribe": unsubscribe,
+    });
+    if !highlights.is_empty() {
+        m["highlights"] = serde_json::json!(fit(&highlights, 1500));
     }
-    state
-        .ses
-        .send_email()
-        .from_email_address(&state.config.ses_from_address)
-        .destination(Destination::builder().to_addresses(to).build())
-        .content(EmailContent::builder().simple(message.build()).build())
-        .send()
-        .await?;
-    Ok(())
+    m.as_object().cloned().unwrap_or_default()
+}
+
+async fn send(
+    state: &WorkerState,
+    team_id: &str,
+    to: &str,
+    email: &Rendered,
+    link: &str,
+    sm: &Summary,
+) -> Result<(), BoxErr> {
+    let headers = unsubscribe_headers(link)
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v))
+        .collect();
+    let mail = common::mail::Mail {
+        kind: "weekly_summary".into(),
+        to: to.to_string(),
+        template: "weekly_summary",
+        params: relay_params(sm, link),
+        ses: common::mail::SesBody::Simple {
+            subject: email.subject.clone(),
+            text: email.text.clone(),
+            html: Some(email.html.clone()),
+            headers,
+        },
+    };
+    let sent = common::mail::send(&crate::clients::email::sender(state), &mail).await;
+    common::deliveries::record(
+        &state.dynamo,
+        &state.config.settings_table_name,
+        team_id,
+        &common::mail::delivery("weekly_summary", to, &sent),
+    )
+    .await;
+    sent.map(|_| ()).map_err(|e| e.into())
 }
 
 /// "2026-W43": the once-per-week marker's key.
@@ -2083,7 +2123,7 @@ async fn send_team(
             // Already sent this week, or we can't tell: never send twice.
             continue;
         }
-        match send(state, &p.email, &email, &link).await {
+        match send(state, team_id, &p.email, &email, &link, &summary).await {
             Ok(()) => sent += 1,
             Err(e) => warn!(team_id, error = %e, "Weekly summary not sent to one member"),
         }
@@ -2180,6 +2220,18 @@ pub async fn run(state: &WorkerState) -> Result<(), BoxErr> {
         info!("Weekly summary is switched off (WEEKLY_SUMMARY_ENABLED); sending nothing");
         return Ok(());
     }
+    // Optional email: on a self-hosted install, off until an install admin
+    // turns it on (Settings, Emails). The hosted deployment sends as before.
+    if !common::mail::optional_allowed(
+        &state.dynamo,
+        &state.config.settings_table_name,
+        common::mail::WEEKLY_SUMMARY,
+    )
+    .await
+    {
+        info!("Weekly summary is off for this install (Settings, Emails); sending nothing");
+        return Ok(());
+    }
     let now = Utc::now();
     let mut start: Option<Item> = None;
     let (mut teams, mut emails) = (0usize, 0usize);
@@ -2236,7 +2288,7 @@ pub async fn run_test(state: &WorkerState, msg: WeeklySummaryTestMessage) -> Res
         .unwrap_or_else(|| unsubscribe::url(unsubscribe::TEST_TOKEN));
     let mut email = render(&summary, Access::Admin, &link);
     email.subject = format!("[Test] {}", email.subject);
-    send(state, to, &email, &link).await?;
+    send(state, &msg.team_id, to, &email, &link, &summary).await?;
     info!(
         team_id = %msg.team_id,
         member = member.is_some(),
@@ -2278,6 +2330,27 @@ mod tests {
             url: format!("https://github.com/{repo}/pull/{n}"),
             repo: repo.into(),
         }
+    }
+
+    /// The relay form of the summary on a self-hosted install: every link is
+    /// the install's own, it passes the relay's template check for that
+    /// host, and nothing names a CoderHelm address.
+    #[test]
+    fn the_relayed_summary_links_only_to_the_install() {
+        use common::mail::templates;
+        use common::public_urls::{hosted_mentions, pretend_self_hosted, EXAMPLE_SELF_HOST};
+        pretend_self_hosted();
+        let unsub = format!("{}?t=abc.def", common::unsubscribe::base_url());
+        let params = relay_params(&sample(), &unsub);
+        let host = common::public_urls::host_of(EXAMPLE_SELF_HOST).to_string();
+        let (t, v) =
+            templates::check("weekly_summary", &params, std::slice::from_ref(&host), true).unwrap();
+        let r = templates::render(t, &v, &host, None);
+        common::public_urls::override_for_this_thread(None);
+        for part in [&r.subject, &r.text, &r.html] {
+            assert_eq!(hosted_mentions(part), Vec::<String>::new());
+        }
+        assert!(r.html.contains(&format!("href=\"{EXAMPLE_SELF_HOST}")));
     }
 
     /// A self-hosted install's weekly summary links to the install (runs,

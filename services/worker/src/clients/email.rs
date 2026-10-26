@@ -1,4 +1,3 @@
-use aws_sdk_sesv2::types::{Destination, EmailContent, Template};
 use serde_json::json;
 use tracing::{info, warn};
 
@@ -105,6 +104,46 @@ pub async fn send_notification(
     };
 
     let template_name = format!("{}-{}", state.config.ses_template_prefix, template_suffix);
+    // The relay form: the same numbers, a fixed template (common::mail).
+    let usage_link = format!(
+        "{}/settings/usage/",
+        common::public_urls::app_url_from_env()
+    );
+    let relay_params = |v: serde_json::Value| v.as_object().cloned().unwrap_or_default();
+    let (relay_template, params) = match &event {
+        EmailEvent::TokenWarning80 {
+            month,
+            limit_name,
+            used_tokens,
+            limit_tokens,
+            usage_pct,
+        } => (
+            "token_warning",
+            relay_params(json!({
+                "month": month, "limit_name": limit_name, "used": used_tokens,
+                "limit": limit_tokens, "pct": usage_pct, "link": usage_link,
+            })),
+        ),
+        EmailEvent::TokenLimitReached {
+            month,
+            limit_name,
+            used_tokens,
+            limit_tokens,
+        } => (
+            "token_limit_reached",
+            relay_params(json!({
+                "month": month, "limit_name": limit_name, "used": used_tokens,
+                "limit": limit_tokens, "link": usage_link,
+            })),
+        ),
+        EmailEvent::WebhookDisabled { days, .. } => (
+            "webhook_disabled",
+            relay_params(json!({
+                "days": days,
+                "link": format!("{}/settings/webhooks/", common::public_urls::app_url_from_env()),
+            })),
+        ),
+    };
 
     // Get all users under this team
     let users = state
@@ -171,41 +210,41 @@ pub async fn send_notification(
             }
         }
 
-        // Send templated email
-        let result = state
-            .ses
-            .send_email()
-            .from_email_address(&state.config.ses_from_address)
-            .destination(Destination::builder().to_addresses(&email).build())
-            .content(
-                EmailContent::builder()
-                    .template(
-                        Template::builder()
-                            .template_name(&template_name)
-                            .template_data(&template_data)
-                            .build(),
-                    )
-                    .build(),
-            )
-            .send()
-            .await;
-
-        let outcome = result
-            .as_ref()
-            .map(|_| ())
-            .map_err(|e| aws_sdk_sesv2::error::DisplayErrorContext(e).to_string());
+        let mail = common::mail::Mail {
+            kind: template_suffix.to_string(),
+            to: email.clone(),
+            template: relay_template,
+            params: params.clone(),
+            ses: common::mail::SesBody::Template {
+                name: template_name.clone(),
+                data: template_data.clone(),
+            },
+        };
+        let result = common::mail::send(&sender(state), &mail).await;
         common::deliveries::record(
             &state.dynamo,
             &state.config.settings_table_name,
             team_id,
-            &common::deliveries::email(template_suffix, &email, &outcome),
+            &common::mail::delivery(template_suffix, &email, &result),
         )
         .await;
         match result {
-            Ok(_) => info!(email = %email, template = %template_name, "Email sent"),
-            Err(e) => warn!(email = %email, error = %e, "Failed to send email — continuing"),
+            Ok(_) => info!(template = %template_name, "Email sent"),
+            Err(e) => warn!(code = %e.code, error = %e.message, "Failed to send email, continuing"),
         }
     }
 
     Ok(())
+}
+
+/// The worker's sender for `common::mail::send` (SES, or CoderHelm's relay
+/// on a self-hosted install that chose it).
+pub fn sender(state: &WorkerState) -> common::mail::Sender<'_> {
+    common::mail::Sender {
+        ses: &state.ses,
+        http: &state.http,
+        dynamo: &state.dynamo,
+        settings_table: &state.config.settings_table_name,
+        from: &state.config.ses_from_address,
+    }
 }

@@ -17,7 +17,7 @@
     "googleSignIn": false,
     "sandbox": true,
     "logAnalyzer": true,
-    "weeklySummary": true
+    "weeklySummary": false
   },
   "telemetry": {
     "enabled": false

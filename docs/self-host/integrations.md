@@ -151,7 +151,7 @@ Needs a domain (Google requires a fixed callback URL). Create an OAuth client in
 
 ## Weekly summary email
 
-`integrations.weeklySummary` sends each team's members a Monday summary (13:00 UTC). People can turn it off in their notification settings or with the email's unsubscribe link.
+The Monday summary (13:00 UTC) is an optional email: on a self-hosted install it is off until an install admin turns it on in **Settings, Emails**, no redeploy needed. `integrations.weeklySummary: true` in the config starts it on instead. Each person can still turn it off in their notification settings or with the email's unsubscribe link. See [Email](./email.md).
 
 ## Scheduled jobs
 

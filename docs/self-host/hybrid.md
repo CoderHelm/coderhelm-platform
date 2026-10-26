@@ -25,6 +25,7 @@ Your code, runs, plans, reviews, memory, knowledge and secrets stay in your AWS 
 | Token broker | the short-lived installation token it mints for your install (scoped to the repositories you chose, never more than the app's permissions) | no tokens; a record of each mint for 14 days |
 | Jira app relay | each issue event, in transit, unchanged | as for GitHub. The Forge app's secret is checked by your install, so CoderHelm can't make an event up |
 | Notion, Confluence, Google Drive | the sign-in, once | the provider sign-in, encrypted with a key only CoderHelm's services can use, so it can hand your install access tokens. Disconnecting revokes it. Notion's tokens don't expire by themselves: a copy your install holds stays valid until Notion's own integration page removes it |
+| Email through CoderHelm (opt-in, [Email](./email.md#send-through-coderhelm)) | each email's recipient address, template id and parameters (names, PR titles and run links in the weekly summary), in transit; CoderHelm writes the email from its own templates | delivery metadata only: template id, a shortened address and the status, for 3 days. Salted hashes of the addresses your install listed, and your install admins' addresses sealed with a key only CoderHelm's services can use, to tell them if email pauses |
 | Sharing with support (opt-in) | metadata of failed deliveries, and payload previews only if you also choose that | for 14 days, so support can see what failed |
 
 CoderHelm never stores your code, never sees your model calls or your AWS credentials, and can't sign in to your install.
@@ -40,6 +41,7 @@ How the pieces are protected:
 - **Scoped tokens.** The broker mints tokens only for installations linked to your install, narrowed to the repositories you chose and, within those, to the repositories the person who linked it can push to on GitHub. GitHub itself enforces both: they are part of the token request.
 - **Sign-ins are yours only once your install takes them.** A Notion, Confluence or Google Drive sign-in is held apart until your install redeems it with its secret and its PKCE verifier, so nobody else can put their account in place of yours.
 - **Revocable.** CoderHelm can turn an install's access off (its name and records go, its GitHub links are removed, the relay and broker refuse it, and the same CloudFront can't register again), and every action is in an audit log.
+- **Email only as itself.** See [Email threat model](#email-threat-model) below.
 - **Same-site safety.** Addresses under coderhelm.com are the same site as app.coderhelm.com and api.coderhelm.com to a browser, so CoderHelm doesn't rely on that: its cookies are host-only (`__Host-`, no Domain attribute), its CORS lists exact origins, and the API refuses any change sent with cookies from another page on the same site. An install's pages can't read or change coderhelm.com sessions.
 
 The full threat model, with each attack and what stops it, is in [Security model](./security.md#hybrid-threat-model).
@@ -87,3 +89,18 @@ A forward that fails is retried with growing waits for about 24 hours. Both side
 ## For CoderHelm's operators
 
 The hosted side runs in the hosted deployment's API stack when `hybrid.zone` is set in its config (the parent zone is configurable, so moving customer addresses to a separate domain later is a config change). It needs `hybrid_master_key` (32 or more random characters) in the hosted secret, the callback URL `https://api.coderhelm.com/auth/github/callback/hybrid` on CoderHelm's GitHub App, and the GitHub App's setup page (the dashboard's Settings, GitHub) to forward `state=hyb_…` returns. Platform admins see every install and the audit log at `GET /api/admin/hybrid`, and revoke one with `POST /api/admin/hybrid/:install_id/revoke`.
+
+
+## Email threat model
+
+What CoderHelm's mail service refuses, and how. Each line has a test (`services/common/src/mail`).
+
+| Threat | What stops it |
+|---|---|
+| Another install, or someone without the install's secret, sends as your install | Every request is signed with the install's own secret (derived per install on CoderHelm's side), checked within 5 minutes, with a request id that is refused the second time. Only a registered, verified, not revoked install can send; revoking stops it at the next request. |
+| An email made to look like it comes from CoderHelm support or security | No subject, HTML, sender or Reply-To can be sent: only a template id and parameters. Subjects are fixed. Parameters are plain text, escaped, length-limited, and refused when they read as CoderHelm itself ("CoderHelm support", "CoderHelm security"). The sender name is built only from the install's verified address, and a name that reads as CoderHelm staff (`support`, `billing`, `c0derhe1m` and other look-alikes) falls back to the CloudFront address. Every email's footer names the install. |
+| A phishing link | Link parameters must be `https://` links to the install's own verified address. Links, addresses and look-alike domains in text parameters are removed before the email is written. |
+| Mail to people outside the install | Only listed addresses: the install's admins, people and pending invites. Only an install admin can list an invite, at most 50 new addresses a day. CoderHelm's own addresses are never a recipient. |
+| Spam or a burst | 30 emails a minute and 500 a day per install. Bounced and complaining addresses get nothing more; too many bounces or complaints pause the install's email and its admins are told. |
+| Spoofing CoderHelm's sending domain | Mail comes from its own subdomain, `notify.coderhelm.com`, with Easy DKIM, SPF for a custom MAIL FROM and DMARC `p=reject`, so it can't harm the main domain's reputation and can't be forged from it. |
+| Secrets in mail | Sign-up codes never leave the install. Parameters marked secret (signed approval and unsubscribe links) are never logged or stored; nothing is kept but delivery metadata. |

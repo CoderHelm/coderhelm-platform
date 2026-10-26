@@ -30,6 +30,8 @@ test("parses, with the parameters the install guide fills in", () => {
   assert.equal(t.Parameters.ModelProvider.Default, "bedrock", "no API key needed to start");
   assert.equal(t.Parameters.Hostname.Default, "", "no DNS work by default");
   assert.equal(t.Parameters.EmailFrom.Default, "", "the admin's own address by default: no DNS work");
+  assert.equal(t.Parameters.EmailTransport.Default, "ses", "email through CoderHelm only when chosen");
+  assert.deepEqual(t.Parameters.EmailTransport.AllowedValues, ["ses", "coderhelm"]);
   assert.equal(t.Parameters.HostedZone.Default, "", "the zone is found in the account");
   assert.match(t.Parameters.Hostname.Description, /any other DNS provider/);
   assert.equal(t.Parameters.AutoUpdate.Default, "off", "updates wait for an admin by default");

@@ -1455,6 +1455,7 @@ dependencies = [
  "aws-sdk-redshiftdata",
  "aws-sdk-s3",
  "aws-sdk-scheduler",
+ "aws-sdk-sesv2",
  "aws-sdk-sqs",
  "aws-sdk-ssm",
  "aws-sdk-sts",
