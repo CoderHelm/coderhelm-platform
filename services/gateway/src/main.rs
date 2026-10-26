@@ -1183,6 +1183,8 @@ async fn main() -> Result<(), Error> {
         .route("/google/callback", get(routes::auth::google_callback))
         .route("/github", get(routes::auth::github_login))
         .route("/github/callback", get(routes::auth::github_callback))
+        // This deployment's GitHub App on GitHub (install, or configure).
+        .route("/github/app", get(routes::github::app_install))
         // Hybrid linking: GitHub sign-in that proves an installation is yours.
         .route(
             "/github/callback/hybrid",

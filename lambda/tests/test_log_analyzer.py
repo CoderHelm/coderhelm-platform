@@ -17,6 +17,7 @@ sys.path.insert(0, str(HANDLER.parent))
 def load_handler(model_id):
     os.environ.update(
         CODERHELM_ACCOUNT_ID="000000000000",
+        DASHBOARD_URL="https://coderhelm.example.com",
         MODEL_ID=model_id,
         AWS_DEFAULT_REGION="us-east-1",
     )

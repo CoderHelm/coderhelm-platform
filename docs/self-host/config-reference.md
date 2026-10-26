@@ -160,6 +160,7 @@ The CDK app turns the config into environment variables on the gateway, streamin
 |---|---|
 | `APP_URL`, `API_URL` | Your hostname, when you have one |
 | `PUBLIC_URL_PARAMETER` | The SSM parameter that holds the CloudFront URL, when you have no domain |
+| `SELF_HOSTED` | `1` on every self-hosted install: links never fall back to CoderHelm's hosted addresses, and support goes to `SUPPORT_INBOX` |
 | `SITE_URL` | `siteUrl` |
 | `CODERHELM_ACCOUNT_ID` | `account` (the account teams' read-only roles trust) |
 | `LOG_READER_TEMPLATE_URL` | `logReaderTemplateUrl` |

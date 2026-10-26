@@ -39,7 +39,9 @@ SETTINGS_TABLE = os.environ.get("SETTINGS_TABLE_NAME", "coderhelm-prod-settings"
 MODEL_ID = os.environ.get("MODEL_ID", "claude-sonnet-4-6")
 CODERHELM_ACCOUNT_ID = os.environ["CODERHELM_ACCOUNT_ID"]
 LOOKBACK_HOURS = int(os.environ.get("LOOKBACK_HOURS", "24"))
-DASHBOARD_URL = os.environ.get("DASHBOARD_URL", "https://app.coderhelm.com")
+# This deployment's dashboard (the deploy always sets it); never the hosted
+# dashboard, which a self-hosted install's teams can't sign in to.
+DASHBOARD_URL = os.environ["DASHBOARD_URL"].rstrip("/")
 # Team usage counters (empty: usage isn't counted).
 ANALYTICS_TABLE = os.environ.get("ANALYTICS_TABLE_NAME", "")
 

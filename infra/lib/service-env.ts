@@ -31,6 +31,9 @@ export function serviceEnvironment(cfg: ResolvedConfig, account: string): Record
   // Self-hosted installs: which release this is (Settings → System), and
   // the updater the system routes ask. The hosted deployment has neither.
   if (cfg.layout === "single-origin") {
+    // A self-hosted install: its links never fall back to the hosted
+    // addresses, and support goes to its own inbox (public_urls.rs).
+    env.SELF_HOSTED = "1";
     Object.assign(env, stampEnvironment(releaseStamp(cfg)));
     // Whether "Sign in with Google" is on (Settings, then Setup checks it).
     env.GOOGLE_SIGN_IN = cfg.integrations.googleSignIn ? "true" : "false";

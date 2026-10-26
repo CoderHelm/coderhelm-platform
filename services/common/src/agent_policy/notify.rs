@@ -11,7 +11,7 @@ use crate::notify::{Block, Button, Message, Size, Text, Tone};
 use super::approvals::Approval;
 use super::links::{self, Channel, LinkClaims};
 use super::signin::Prompt;
-use super::{API_URL, DASHBOARD_URL};
+use super::{api_url, dashboard_url};
 
 /// A signed link to an approval for a channel (or a person, for email).
 pub fn approval_link(
@@ -36,7 +36,8 @@ pub fn approval_link(
         },
     );
     format!(
-        "{API_URL}/agent-approvals/link?t={}&do={}",
+        "{}/agent-approvals/link?t={}&do={}",
+        api_url(),
         urlencoding::encode(&token),
         urlencoding::encode(action)
     )
@@ -45,7 +46,8 @@ pub fn approval_link(
 /// The dashboard page for an approval (signed in).
 pub fn approval_page(a: &Approval) -> String {
     format!(
-        "{DASHBOARD_URL}/settings/agents?approval={}",
+        "{}/settings/agents?approval={}",
+        dashboard_url(),
         urlencoding::encode(&a.id)
     )
 }
@@ -134,7 +136,7 @@ pub fn sign_in_message(p: &Prompt, run_id: &str) -> Message {
             } else {
                 "Connect"
             },
-            format!("{DASHBOARD_URL}{}", p.link_path),
+            format!("{}{}", dashboard_url(), p.link_path),
         )],
         full_width: false,
     }
@@ -194,6 +196,52 @@ mod tests {
             assert!(json.contains("Use create_issue on linear"));
             assert!(!json.contains("→"));
         }
+    }
+
+    /// A self-hosted install's approval cards and sign-in prompts link to
+    /// the install, in every channel, never to the hosted service.
+    #[test]
+    fn a_self_hosted_install_links_to_itself() {
+        use crate::public_urls::{hosted_mentions, pretend_self_hosted, EXAMPLE_SELF_HOST};
+        pretend_self_hosted();
+        let a = card();
+        let p = super::super::signin::prompt(
+            "figma",
+            "Figma",
+            super::super::signin::Need::Personal,
+            true,
+            "read this file",
+        );
+        let messages = [
+            approval_message("s3cret", "TEAM#1", &a, Channel::Slack),
+            approval_message("s3cret", "TEAM#1", &a, Channel::Teams),
+            sign_in_message(&p, "run-1"),
+        ];
+        let mut out = vec![
+            approval_page(&a),
+            approval_link(
+                "s3cret",
+                "TEAM#1",
+                &a,
+                Channel::Email,
+                "ada@example.org",
+                "approve",
+            ),
+        ];
+        for m in &messages {
+            for b in &m.buttons {
+                assert!(b.url.starts_with(EXAMPLE_SELF_HOST), "{}", b.url);
+            }
+            for kind in crate::notify::ChannelKind::ALL {
+                out.push(kind.render(m).to_string());
+            }
+        }
+        crate::public_urls::override_for_this_thread(None);
+        for o in &out {
+            assert_eq!(hosted_mentions(o), Vec::<String>::new(), "{o}");
+        }
+        assert!(out[0].starts_with(EXAMPLE_SELF_HOST));
+        assert!(out[1].starts_with(EXAMPLE_SELF_HOST));
     }
 
     #[test]

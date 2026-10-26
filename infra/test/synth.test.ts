@@ -334,6 +334,10 @@ test("the manifest landing: self-host only, may write only this install's secret
   const api = t["coderhelm-prod-api"];
   const gw = envOf(api, "coderhelm-prod-gateway");
   assert.equal(gw.SETUP_ENDPOINTS, "1");
+  // Every service knows it is self-hosted, so no link falls back to the hosted addresses.
+  for (const [stack, fn] of [["coderhelm-prod-api", "coderhelm-prod-gateway"], ["coderhelm-prod-worker", "coderhelm-prod-worker"]] as const) {
+    assert.equal(envOf(t[stack], fn).SELF_HOSTED, "1", fn);
+  }
   const policies = JSON.stringify(api.findResources("AWS::IAM::Policy"));
   assert.ok(policies.includes("SetupStoresGithubAppKeys"));
   assert.ok(policies.includes("secret:coderhelm/prod/secrets-??????"), "only this install's secret");
@@ -348,6 +352,7 @@ test("the manifest landing: self-host only, may write only this install's secret
   const hostedCfg = loadConfigFile(path.join(INFRA, "config", "hosted.prod.json"), { CDK_DEFAULT_ACCOUNT: "654654210434" });
   const hosted = synth(hostedCfg, zoneContext("654654210434", "us-east-1", "coderhelm.com"));
   assert.equal(envOf(hosted["coderhelm-prod-api"], "coderhelm-prod-gateway").SETUP_ENDPOINTS, undefined);
+  assert.equal(envOf(hosted["coderhelm-prod-api"], "coderhelm-prod-gateway").SELF_HOSTED, undefined);
   assert.ok(!JSON.stringify(hosted["coderhelm-prod-api"].findResources("AWS::IAM::Policy")).includes("SetupStoresGithubAppKeys"));
   // The install guide reads launch/latest.json from the public bucket in the browser.
   hosted["coderhelm-prod-log-analyzer"].hasResourceProperties("AWS::S3::Bucket", {

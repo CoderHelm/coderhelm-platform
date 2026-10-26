@@ -57,8 +57,6 @@ const META_PREFIX: &str = "SUPPORT#";
 const MSG_PREFIX: &str = "SUPPORT_MSG#";
 const RATE_PREFIX: &str = "SUPPORT_RATE#";
 
-const DEFAULT_INBOX: &str = "support@coderhelm.com";
-
 pub const MAX_SUBJECT: usize = 150;
 pub const MAX_BODY: usize = 8000;
 const MAX_PAGE: usize = 300;
@@ -2018,11 +2016,7 @@ pub fn mail_team_resolved(inbox: &str, t: &Ticket, by: &str) -> Mail {
 }
 
 fn inbox() -> String {
-    std::env::var("SUPPORT_INBOX")
-        .ok()
-        .map(|v| v.trim().to_string())
-        .filter(|v| !v.is_empty())
-        .unwrap_or_else(|| DEFAULT_INBOX.to_string())
+    common::public_urls::support_inbox()
 }
 
 /// Send through SES from the same address as the weekly summary. A failed
@@ -3117,6 +3111,46 @@ mod tests {
         let v = customer_view(thread);
         assert_eq!(v[0].author_email, "");
         assert_eq!(v[0].author_name, "Coderhelm support");
+    }
+
+    /// A self-hosted install's support emails link to the install and go to
+    /// its own inbox, never to CoderHelm's site or support.
+    #[tokio::test]
+    async fn a_self_hosted_install_emails_link_to_itself() {
+        use common::public_urls::{hosted_mentions, pretend_self_hosted, EXAMPLE_SELF_HOST};
+        pretend_self_hosted();
+        let store = Mem::default();
+        let alice = person("alpha", "alice");
+        let items = Items::default();
+        let (t, first) = create(
+            &store,
+            &items,
+            &roster(),
+            &alice,
+            &ask("Broken"),
+            "acme",
+            "",
+        )
+        .await
+        .unwrap();
+        let mut mails = vec![mail_new_ticket(&inbox(), &t, &first.body)];
+        let (t, m) = admin_reply(&store, &admin(), &t.id, "Fixed it", None)
+            .await
+            .unwrap();
+        mails.extend(mail_support_reply(&t, &m));
+        let (t, m) = reply_as_customer(&store, &none(), &alice, &t.id, "Thanks", &[])
+            .await
+            .unwrap();
+        mails.push(mail_customer_reply(&inbox(), &t, &m));
+        mails.extend(mail_status(&t, "resolved", "Coderhelm support"));
+        mails.push(mail_team_resolved(&inbox(), &t, "alice"));
+        common::public_urls::override_for_this_thread(None);
+        assert!(mails.len() >= 5);
+        for m in &mails {
+            let all = format!("{}\n{}\n{}\n{}", m.to, m.subject, m.text, m.html);
+            assert_eq!(hosted_mentions(&all), Vec::<String>::new(), "{all}");
+        }
+        assert!(mails[0].text.contains(EXAMPLE_SELF_HOST));
     }
 
     #[tokio::test]

@@ -427,8 +427,26 @@ pub async fn serve() -> impl axum::response::IntoResponse {
             (axum::http::header::CONTENT_TYPE, "application/json"),
             (axum::http::header::ACCESS_CONTROL_ALLOW_ORIGIN, "*"),
         ],
-        DOC.get_or_init(document_json).clone(),
+        served_document(DOC.get_or_init(document_json).clone()),
     )
+}
+
+/// The document as this deployment serves it: a self-hosted install names
+/// its own API as the server, not the hosted one.
+fn served_document(doc: String) -> String {
+    if !common::public_urls::self_hosted() {
+        return doc;
+    }
+    let Ok(mut v) = serde_json::from_str::<serde_json::Value>(&doc) else {
+        return doc;
+    };
+    v["servers"] = serde_json::json!([{
+        "url": common::public_urls::api_url_from_env(),
+        "description": "This install"
+    }]);
+    serde_json::to_string_pretty(&v)
+        .map(|s| s + "\n")
+        .unwrap_or(doc)
 }
 
 /// The document as committed: pretty JSON with a final newline.
@@ -505,6 +523,26 @@ fn inline_schemas(node: &mut serde_json::Value) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_self_hosted_install_serves_its_own_api_as_the_server() {
+        use common::public_urls::{from_single, override_for_this_thread, Override};
+        override_for_this_thread(Some(Override {
+            urls: from_single("https://coderhelm.example.com"),
+            site: None,
+            self_hosted: true,
+        }));
+        let doc = super::served_document(super::document_json());
+        override_for_this_thread(None);
+        let v: serde_json::Value = serde_json::from_str(&doc).unwrap();
+        assert_eq!(v["servers"][0]["url"], "https://coderhelm.example.com");
+        assert!(!doc.contains("api.coderhelm.com"));
+        // The hosted deployment serves the committed document unchanged.
+        assert_eq!(
+            super::served_document(super::document_json()),
+            super::document_json()
+        );
+    }
+
     use super::*;
     use std::collections::BTreeSet;
 

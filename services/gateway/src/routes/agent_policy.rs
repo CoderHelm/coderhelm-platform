@@ -960,12 +960,9 @@ pub struct LinkForm {
     note: String,
 }
 
+/// This deployment's dashboard (a self-hosted install's own address).
 fn dashboard_origin(stage: &str) -> &'static str {
-    if stage == "prod" {
-        "https://app.coderhelm.com"
-    } else {
-        "http://localhost:3000"
-    }
+    common::public_urls::app_url(stage)
 }
 
 fn esc(s: &str) -> String {
@@ -1315,6 +1312,29 @@ mod tests {
                 expires_at: exp,
             },
         )
+    }
+
+    #[test]
+    fn a_self_hosted_install_opens_its_own_approval_page() {
+        common::public_urls::pretend_self_hosted();
+        let (v, _) = link_view(
+            "s3cret",
+            "prod",
+            &signed(Channel::Slack, "", 2_000),
+            "approve",
+            1_000,
+        );
+        common::public_urls::override_for_this_thread(None);
+        match v {
+            LinkView::Open(to) => assert_eq!(
+                to,
+                format!(
+                    "{}/settings/agents/?approval=ap_1&do=approve&via=slack",
+                    common::public_urls::EXAMPLE_SELF_HOST
+                )
+            ),
+            _ => panic!("expected a redirect"),
+        }
     }
 
     #[test]

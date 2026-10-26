@@ -68,7 +68,11 @@ pub fn next_id() -> String {
         .to_string()
 }
 
-/// Where the dashboard lives (links in Slack, Teams and email).
-pub const DASHBOARD_URL: &str = "https://app.coderhelm.com";
-/// Where the gateway answers signed approval links.
-pub const API_URL: &str = "https://api.coderhelm.com";
+/// Where this install's dashboard lives (links in Slack, Teams and email).
+pub fn dashboard_url() -> &'static str {
+    crate::public_urls::app_url_from_env()
+}
+/// Where this install's gateway answers signed approval links.
+pub fn api_url() -> &'static str {
+    crate::public_urls::api_url_from_env()
+}

@@ -329,6 +329,35 @@ mod tests {
         unsubscribe::sign(SECRET, "team-1", "USER#a", unsubscribe::WEEKLY_SUMMARY, exp)
     }
 
+    /// The unsubscribe pages of a self-hosted install link to the install
+    /// and name no CoderHelm site.
+    #[tokio::test]
+    async fn a_self_hosted_install_pages_link_to_itself() {
+        common::public_urls::pretend_self_hosted();
+        let outcomes = [
+            Outcome::Confirm {
+                team: "Acme".into(),
+            },
+            Outcome::Unsubscribed,
+            Outcome::Test,
+            Outcome::Invalid,
+            Outcome::Failed,
+        ];
+        let mut pages = Vec::new();
+        for o in &outcomes {
+            pages.push(body(page(o)).await);
+        }
+        common::public_urls::override_for_this_thread(None);
+        for p in &pages {
+            assert_eq!(
+                common::public_urls::hosted_mentions(p),
+                Vec::<String>::new(),
+                "{p}"
+            );
+        }
+        assert!(pages[1].contains(common::public_urls::EXAMPLE_SELF_HOST));
+    }
+
     async fn body(resp: Response) -> String {
         let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20)
             .await
