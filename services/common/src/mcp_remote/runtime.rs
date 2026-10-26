@@ -937,6 +937,55 @@ impl Runtime {
         out
     }
 
+    /// Takes a finished sign-in from another partition into this one: the
+    /// tokens are opened under the other's keys, sealed again under this
+    /// one's, and the other partition's records are deleted. The hosted
+    /// broker finishes a hybrid install's provider sign-in in a holding
+    /// partition and calls this only when the install redeems the code (with
+    /// its secret and the PKCE verifier), so a sign-in someone else started
+    /// never replaces the install's own.
+    pub async fn adopt_sign_in(
+        &self,
+        from: &Runtime,
+        server_id: &str,
+        owner: &Owner,
+    ) -> Result<(), String> {
+        let t = from
+            .store
+            .get_token(&from.team, server_id, owner)
+            .await?
+            .ok_or("There is no finished sign-in to take.")?;
+        let set = from.open_tokens(server_id, owner, &t.sealed).await?;
+        let sealed = self.seal_tokens(server_id, owner, &set).await?;
+        let version = self
+            .store
+            .get_token(&self.team, server_id, owner)
+            .await?
+            .map(|x| x.version + 1)
+            .unwrap_or(1);
+        self.store
+            .put_token(
+                &self.team,
+                server_id,
+                &TokenRecord {
+                    sealed,
+                    version,
+                    ..t
+                },
+                None,
+            )
+            .await?;
+        if *owner == Owner::Team {
+            self.store
+                .set_status(&self.team, server_id, Status::Connected, "")
+                .await?;
+        }
+        from.store
+            .delete_token(&from.team, server_id, owner)
+            .await?;
+        from.store.delete_server(&from.team, server_id).await
+    }
+
     /// Removes a server: every connection is disconnected (and revoked)
     /// first, then the server goes.
     pub async fn remove(&self, s: &ServerRecord) -> Result<(), String> {
@@ -1059,6 +1108,70 @@ mod tests {
             http,
             now,
         }
+    }
+
+    /// A hybrid install's provider sign-in is finished in a holding
+    /// partition and only taken into the install's own once the install
+    /// redeems the code: the tokens move resealed under the install's keys,
+    /// and nothing is left behind.
+    #[tokio::test]
+    async fn a_sign_in_is_adopted_from_a_holding_partition() {
+        let store = Arc::new(MemStore::default());
+        let http = Arc::new(Fake::default());
+        let mk = |team: &str| Runtime {
+            store: store.clone(),
+            cipher: Arc::new(FakeKms),
+            http: http.clone(),
+            team: team.into(),
+            clock: Arc::new(|| 1_000_000),
+        };
+        let main = mk("HYBRID#ins_a");
+        let hold = mk("HYBRID#ins_a#SIGNIN#fl_1");
+        let s = server();
+        store.put_server(&main.team, &s).await.unwrap();
+        store.put_server(&hold.team, &s).await.unwrap();
+        super::testing::sign_in(&main, &s.id, &Owner::Team, "old", None, None, "a").await;
+        super::testing::sign_in(&hold, &s.id, &Owner::Team, "new", Some("r"), None, "b").await;
+
+        main.adopt_sign_in(&hold, &s.id, &Owner::Team)
+            .await
+            .unwrap();
+
+        let t = store
+            .get_token(&main.team, &s.id, &Owner::Team)
+            .await
+            .unwrap()
+            .unwrap();
+        let set = main
+            .open_tokens(&s.id, &Owner::Team, &t.sealed)
+            .await
+            .unwrap();
+        assert_eq!(set.access_token, "new");
+        assert_eq!(set.refresh_token.as_deref(), Some("r"));
+        assert_eq!(t.version, 2);
+        assert!(store
+            .get_token(&hold.team, &s.id, &Owner::Team)
+            .await
+            .unwrap()
+            .is_none());
+        assert!(store.get_server(&hold.team, &s.id).await.unwrap().is_none());
+        // Nothing held: refused, and the install's sign-in stays.
+        assert!(main
+            .adopt_sign_in(&hold, &s.id, &Owner::Team)
+            .await
+            .is_err());
+        let t = store
+            .get_token(&main.team, &s.id, &Owner::Team)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            main.open_tokens(&s.id, &Owner::Team, &t.sealed)
+                .await
+                .unwrap()
+                .access_token,
+            "new"
+        );
     }
 
     fn server() -> ServerRecord {

@@ -1075,8 +1075,10 @@ fn note_intake_problem(p: &'static str) {
     description = "On a hybrid self-hosted install, where CoderHelm's hosted relay forwards the events \
         of CoderHelm's GitHub App (and Jira app) after checking the provider's own signature. Each \
         request is signed with the install's relay key: `X-CoderHelm-Relay-Signature: t=<unix \
-        seconds>,d=<delivery id>,v1=<hex>`, the HMAC-SHA256 of `<t>.<d>.<raw body>`. Requests older \
-        than 5 minutes are refused, and so is a delivery id the install has already taken (`409`). \
+        seconds>,d=<delivery id>,v1=<hex>,v2=<hex>`, where `v1` is the HMAC-SHA256 of \
+        `<t>.<d>.<raw body>` and `v2` of `v2.<t>.<d>.<source>.<event>.<raw body>` (so the two \
+        headers below are signed too). Requests older than 5 minutes are refused, and so is a \
+        delivery id the install has already taken (`409`). \
         `X-CoderHelm-Relay-Source` is `github` or `jira`; for GitHub, `X-CoderHelm-Relay-Event` is \
         GitHub's event type and the body is GitHub's payload, unchanged.",
     params(
@@ -1119,6 +1121,8 @@ pub async fn intake(
         headers
             .get(sign::RELAY_HEADER)
             .and_then(|v| v.to_str().ok()),
+        &source,
+        &event,
         &body,
         chrono::Utc::now().timestamp(),
     ) {
@@ -1150,12 +1154,9 @@ pub async fn intake(
         sign::REPLAY_TTL_SECS as u64,
     )
     .await;
-    if matches!(claim, common::claim::Claim::Held) {
-        return Err(fail(
-            StatusCode::CONFLICT,
-            sign::SignatureProblem::Replayed.code(),
-            sign::SignatureProblem::Replayed.message(),
-        ));
+    match intake_claim_answer(&claim) {
+        None => {}
+        Some((code, p)) => return Err(fail(code, p, intake_claim_message(p))),
     }
     match source.as_str() {
         "github" => {
@@ -1252,6 +1253,31 @@ pub async fn intake(
             "unknown_source",
             "This release doesn't take that kind of event yet. Update CoderHelm.",
         )),
+    }
+}
+
+/// What the intake answers for its replay claim: nothing (go on) when this
+/// is the first copy; 409 for a copy already taken; 503 when the claim
+/// couldn't be written, so a replay is never let through for want of a
+/// record (the relay retries a 503).
+pub fn intake_claim_answer(c: &common::claim::Claim) -> Option<(StatusCode, &'static str)> {
+    match c {
+        common::claim::Claim::Won => None,
+        common::claim::Claim::Held => Some((
+            StatusCode::CONFLICT,
+            sign::SignatureProblem::Replayed.code(),
+        )),
+        common::claim::Claim::Failed(_) => {
+            Some((StatusCode::SERVICE_UNAVAILABLE, "store_unavailable"))
+        }
+    }
+}
+
+fn intake_claim_message(code: &str) -> &'static str {
+    if code == sign::SignatureProblem::Replayed.code() {
+        sign::SignatureProblem::Replayed.message()
+    } else {
+        "This install couldn't record the delivery just now; the relay tries again."
     }
 }
 
@@ -1407,6 +1433,23 @@ pub async fn github_hosted(state: &AppState) -> bool {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn the_intake_never_takes_a_copy_it_couldnt_record() {
+        use common::claim::Claim;
+        assert_eq!(intake_claim_answer(&Claim::Won), None);
+        assert_eq!(
+            intake_claim_answer(&Claim::Held).map(|a| a.0),
+            Some(StatusCode::CONFLICT)
+        );
+        // A failed write used to let the event through: a replay could land
+        // while the store was throttled.
+        assert_eq!(
+            intake_claim_answer(&Claim::Failed("throttled".into())).map(|a| a.0),
+            Some(StatusCode::SERVICE_UNAVAILABLE)
+        );
+    }
+
     use super::*;
 
     fn registered() -> Local {

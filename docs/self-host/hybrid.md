@@ -33,15 +33,18 @@ How the pieces are protected:
 
 - **Registration.** Your install registers once and gets an id, a secret and a relay key. Both keys are derived from a key on CoderHelm's side, so CoderHelm stores no copy of them; your install keeps them in its own Secrets Manager secret.
 - **Proof of ownership.** Before a name or an app is linked, CoderHelm asks your install's CloudFront address to answer a challenge with its secret. Names only ever point at a verified install's own CloudFront distribution.
-- **Signed both ways.** Every call from your install is signed (`X-CoderHelm-Signature`), and every relayed event is signed with your relay key (`X-CoderHelm-Relay-Signature: t=,d=,v1=`). Your install refuses anything older than 5 minutes and any delivery id it has already taken.
-- **Linking proves both sides.** Linking CoderHelm's GitHub App needs your install (its setup key in the guide, or an install admin in Settings) and a GitHub sign-in that shows the installation is yours. A GitHub redirect alone can't link anything.
-- **Scoped tokens.** The broker mints tokens only for installations linked to your install, narrowed to the repositories you chose.
-- **Revocable.** CoderHelm can turn an install's access off (its name and records go, the relay and broker refuse it), and every action is in an audit log.
-- **Same-site safety.** Every address under coderhelm.com is a different site to the browser: CoderHelm's own cookies are host-only (`__Host-`, no Domain attribute) and its CORS lists exact origins, so an install's pages can't read or change coderhelm.com sessions.
+- **Signed both ways.** Every call from your install is signed (`X-CoderHelm-Signature`), and every relayed event is signed with your relay key (`X-CoderHelm-Relay-Signature: t=,d=,v1=,v2=`; `v2` also covers the source and event headers). Your install refuses anything older than 5 minutes and any delivery id it has already taken, and refuses an event it couldn't record as taken.
+- **Linking proves both sides.** Linking CoderHelm's GitHub App needs your install (its setup key in the guide, or an install admin in Settings), a GitHub sign-in that shows the installation is yours, and a press of **Link** on a CoderHelm page that names your install's address. A GitHub redirect or a link someone sends you can't link anything by itself.
+- **Scoped tokens.** The broker mints tokens only for installations linked to your install, narrowed to the repositories you chose and, within those, to the repositories the person who linked it can push to on GitHub. GitHub itself enforces both: they are part of the token request.
+- **Sign-ins are yours only once your install takes them.** A Notion, Confluence or Google Drive sign-in is held apart until your install redeems it with its secret and its PKCE verifier, so nobody else can put their account in place of yours.
+- **Revocable.** CoderHelm can turn an install's access off (its name and records go, its GitHub links are removed, the relay and broker refuse it, and the same CloudFront can't register again), and every action is in an audit log.
+- **Same-site safety.** Addresses under coderhelm.com are the same site as app.coderhelm.com and api.coderhelm.com to a browser, so CoderHelm doesn't rely on that: its cookies are host-only (`__Host-`, no Domain attribute), its CORS lists exact origins, and the API refuses any change sent with cookies from another page on the same site. An install's pages can't read or change coderhelm.com sessions.
+
+The full threat model, with each attack and what stops it, is in [Security model](./security.md#hybrid-threat-model).
 
 ## A CoderHelm address
 
-Pick a name in the guide or in **Settings, System, Domain**. The page checks it as you type: lowercase letters, digits and hyphens, 3 to 40 characters, not reserved (CoderHelm's own hosts such as `app`, `api`, `docs` and `auth`, and names such as `admin`, `support` or `status`), and not taken.
+Pick a name in the guide or in **Settings, System, Domain**. The page checks it as you type: lowercase letters, digits and hyphens, 3 to 40 characters, not reserved (CoderHelm's own hosts such as `app`, `api`, `docs` and `auth`, and names such as `admin`, `support` or `status`), not reading as CoderHelm's own (no `coderhelm` in it, even spelled with digits, and no part such as `app`, `login`, `billing` or `support`, as in `app2` or `acme-login`), and not taken.
 
 Then everything happens by itself:
 
@@ -58,7 +61,8 @@ A name can change five times a day. Uninstalling with `npx github:CoderHelm/code
 
 1. In the guide (or **Settings, System, Hybrid**), choose **Use CoderHelm's GitHub App**.
 2. Press **Install on GitHub**, pick the organization and repositories, and sign in to GitHub when it asks. That sign-in proves the installation is yours.
-3. You come back linked. From then on GitHub sends events to CoderHelm, which forwards each one to `https://<your CloudFront>/webhooks/relay`, and your install asks the broker for tokens when it works on a repository.
+3. CoderHelm shows which install the organization is about to be linked to. Check the address and press **Link**.
+4. You come back linked. Tokens reach only the repositories you can push to on GitHub; someone with more access can link it again to widen that. From then on GitHub sends events to CoderHelm, which forwards each one to `https://<your CloudFront>/webhooks/relay`, and your install asks the broker for tokens when it works on a repository.
 
 A forward that fails is retried with growing waits for about 24 hours. Both sides show it on their **Deliveries** page with each attempt, the answer and the next retry. Choose your own GitHub App again any time; signing in with GitHub on your install needs your own app.
 

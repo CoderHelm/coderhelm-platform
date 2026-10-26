@@ -115,10 +115,86 @@ pub fn validate_name(raw: &str) -> Result<String, NameProblem> {
     if name.contains("--") {
         return Err(NameProblem::DoubleHyphen);
     }
-    if reserved().iter().any(|r| r == &name) {
+    if reserved().iter().any(|r| r == &name) || looks_like_coderhelm(&name) {
         return Err(NameProblem::Reserved);
     }
     Ok(name)
+}
+
+/// Words no part of a name may be: CoderHelm's own hosts and the pages
+/// people sign in, pay or ask for help on. A name is a real coderhelm.com
+/// address with a valid certificate, so "app-login" or "support-team" would
+/// read as CoderHelm's own.
+pub const LOOKALIKE_WORDS: &[&str] = &[
+    "api",
+    "app",
+    "apps",
+    "auth",
+    "docs",
+    "stream",
+    "www",
+    "fallback",
+    "login",
+    "logon",
+    "signin",
+    "signup",
+    "sso",
+    "oauth",
+    "admin",
+    "support",
+    "helpdesk",
+    "help",
+    "billing",
+    "invoice",
+    "pay",
+    "payment",
+    "payments",
+    "account",
+    "accounts",
+    "secure",
+    "security",
+    "verify",
+    "verification",
+    "password",
+    "passwords",
+    "reset",
+    "official",
+    "staff",
+    "status",
+    "mail",
+    "email",
+    "webmail",
+    "dashboard",
+    "console",
+    "portal",
+    "trust",
+];
+
+/// Whether a (well-formed) name could pass for CoderHelm's own address:
+/// "coderhelm" anywhere, digits standing in for letters included ("c0derhe1m"),
+/// or a [`LOOKALIKE_WORDS`] word as one of its hyphen-separated parts, with
+/// trailing digits ignored ("app2", "api-v2", "auth1").
+pub fn looks_like_coderhelm(name: &str) -> bool {
+    let letters: String = name
+        .chars()
+        .filter(|c| *c != '-')
+        .map(|c| match c {
+            '0' => 'o',
+            '1' => 'l',
+            '3' => 'e',
+            '4' => 'a',
+            '5' => 's',
+            '7' => 't',
+            c => c,
+        })
+        .collect();
+    if letters.contains("coderhelm") || letters.contains("coderheim") {
+        return true;
+    }
+    name.split('-').any(|part| {
+        let word = part.trim_end_matches(|c: char| c.is_ascii_digit());
+        LOOKALIKE_WORDS.contains(&word)
+    })
 }
 
 /// The full hostname for a valid name.
@@ -401,6 +477,50 @@ mod tests {
             assert!(reserved().iter().any(|r| r == n), "{n}");
         }
         assert_eq!(zone(), DEFAULT_ZONE);
+    }
+
+    /// A name is a real coderhelm.com address with a valid certificate, so
+    /// it must never read as CoderHelm's own: no "coderhelm" (with digit
+    /// look-alikes), and no word of a CoderHelm host or a sign-in, billing
+    /// or support page as one of its parts.
+    #[test]
+    fn look_alike_names_are_refused() {
+        for n in [
+            "coderhelm-support",
+            "my-coderhelm",
+            "c0derhelm",
+            "coderhe1m",
+            "c0derhe1m-app",
+            "coder-helm",
+            "app2",
+            "api-v2",
+            "app-login",
+            "login-app",
+            "secure-signin",
+            "acme-sso",
+            "support-team",
+            "billing-portal",
+            "auth1",
+            "www2",
+            "docs-site",
+            "verify-account",
+            "password-reset",
+        ] {
+            assert_eq!(validate_name(n), Err(NameProblem::Reserved), "{n}");
+        }
+        for n in [
+            "example",
+            "example-co",
+            "acme",
+            "my-team",
+            "apple",
+            "application-lab",
+            "mapbox",
+            "rapid7",
+            "team42",
+        ] {
+            assert!(validate_name(n).is_ok(), "{n}");
+        }
     }
 
     #[test]
