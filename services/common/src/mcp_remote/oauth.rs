@@ -189,7 +189,9 @@ pub fn registration_request(a: &AuthServer, redirect_uri: &str, scopes: &[String
     };
     let mut body = serde_json::json!({
         "client_name": CLIENT_NAME,
-        "client_uri": "https://coderhelm.com",
+        // The install that asks: the callback's origin (a self-hosted
+        // install's own address, never the hosted site).
+        "client_uri": origin_of(redirect_uri),
         "redirect_uris": [redirect_uri],
         "grant_types": ["authorization_code", "refresh_token"],
         "response_types": ["code"],
@@ -205,6 +207,14 @@ pub fn registration_request(a: &AuthServer, redirect_uri: &str, scopes: &[String
         super::http::Limit::Metadata,
     )
     .header("Accept", "application/json")
+}
+
+/// `https://host[:port]` of a URL, or the URL itself when it has no host.
+fn origin_of(u: &str) -> String {
+    match url::Url::parse(u) {
+        Ok(p) if p.host_str().is_some() => p.origin().ascii_serialization(),
+        _ => u.to_string(),
+    }
 }
 
 /// Reads a registration reply.
@@ -615,6 +625,7 @@ mod tests {
         let body: serde_json::Value = serde_json::from_slice(r.body.as_ref().unwrap()).unwrap();
         assert_eq!(body["token_endpoint_auth_method"], "none");
         assert_eq!(body["redirect_uris"], j!(["https://x.example.com/cb"]));
+        assert_eq!(body["client_uri"], "https://x.example.com");
         assert_eq!(
             body["grant_types"],
             j!(["authorization_code", "refresh_token"])

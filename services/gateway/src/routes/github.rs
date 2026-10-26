@@ -238,6 +238,50 @@ fn attr_s(val: &str) -> aws_sdk_dynamodb::types::AttributeValue {
     aws_sdk_dynamodb::types::AttributeValue::S(val.to_string())
 }
 
+/// Query for [`app_install`].
+#[derive(Deserialize, Default)]
+pub struct AppInstallQuery {
+    /// Passed on to GitHub, which hands it back on the setup redirect.
+    #[serde(default)]
+    pub state: Option<String>,
+    /// Open this installation's settings instead of a new installation.
+    #[serde(default)]
+    pub installation_id: Option<u64>,
+}
+
+/// Where this deployment's GitHub App is installed (or an installation of it
+/// configured). The slug is this install's own app, never the hosted one.
+pub fn app_install_url(slug: &str, q: &AppInstallQuery) -> String {
+    let slug = urlencoding::encode(slug);
+    match q.installation_id {
+        Some(id) => format!("https://github.com/apps/{slug}/installations/{id}"),
+        None => match q.state.as_deref().filter(|s| !s.is_empty()) {
+            Some(st) => format!(
+                "https://github.com/apps/{slug}/installations/new?state={}",
+                urlencoding::encode(st)
+            ),
+            None => format!("https://github.com/apps/{slug}/installations/new"),
+        },
+    }
+}
+
+/// GET /auth/github/app: sends the browser to this deployment's GitHub App
+/// on GitHub (the dashboard links here, so a self-hosted install's buttons
+/// open its own app). Before the app exists, back to the dashboard's GitHub
+/// settings.
+pub async fn app_install(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Query(q): axum::extract::Query<AppInstallQuery>,
+) -> axum::response::Redirect {
+    match crate::auth::github_app::app_slug(&state).await {
+        Some(slug) => axum::response::Redirect::to(&app_install_url(&slug, &q)),
+        None => axum::response::Redirect::to(&format!(
+            "{}/settings/integrations/github/",
+            common::public_urls::app_url(&state.config.stage)
+        )),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -256,6 +300,26 @@ mod tests {
         assert_eq!(
             link_decision(None, "TEAM#a"),
             LinkDecision::NeedsGithubSignIn
+        );
+    }
+
+    #[test]
+    fn the_app_link_is_this_installs_own_app() {
+        let q = |state: Option<&str>, id: Option<u64>| AppInstallQuery {
+            state: state.map(str::to_string),
+            installation_id: id,
+        };
+        assert_eq!(
+            app_install_url("acme-coderhelm", &q(None, None)),
+            "https://github.com/apps/acme-coderhelm/installations/new"
+        );
+        assert_eq!(
+            app_install_url("acme-coderhelm", &q(Some("a b&c"), None)),
+            "https://github.com/apps/acme-coderhelm/installations/new?state=a%20b%26c"
+        );
+        assert_eq!(
+            app_install_url("acme-coderhelm", &q(Some("x"), Some(42))),
+            "https://github.com/apps/acme-coderhelm/installations/42"
         );
     }
 

@@ -34,3 +34,9 @@ and deploy again. Turning it on before the identity is verified makes the deploy
 ## Templates
 
 The email templates are created by the email stack with your URLs filled in. `email.logoUrl` and `email.privacyUrl` change the header logo and the footer link.
+
+## Links in emails and messages
+
+Every link CoderHelm sends from your install points at your install: emails (run results, invites, approvals, the weekly summary and its unsubscribe link), Slack and Teams cards, Jira comments and GitHub comments all use your own address. The header logo loads from your install (`<your address>/favicon.svg`) unless you set `email.logoUrl`, so opening an email never calls CoderHelm's servers. Support and "reply to unsubscribe" go to `email.supportInbox` (by default `email.from`), never to CoderHelm support. The only coderhelm.com links left are the public docs on docs.coderhelm.com.
+
+If the install doesn't know its own address (no `APP_URL` and `API_URL`, and the CloudFront address not yet readable from SSM), links stay relative rather than pointing anywhere else, the services log an error at start, and **Settings, then Setup** fails **Web address answers** until a deploy sets it.

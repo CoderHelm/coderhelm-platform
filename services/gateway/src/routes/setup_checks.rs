@@ -740,8 +740,23 @@ pub fn updates(status: Option<&Value>) -> Check {
     }
 }
 
-/// The public address answers over HTTPS.
-pub fn public_url(url: &str, status: Option<u16>) -> Check {
+/// The public address answers over HTTPS. `problem` is set when a
+/// self-hosted install doesn't know its own address
+/// ([`common::public_urls::problem`]): its links would be relative, so this
+/// fails rather than linking anywhere else.
+pub fn public_url(url: &str, status: Option<u16>, problem: Option<&str>) -> Check {
+    if let Some(p) = problem {
+        return Check::not_ok(
+            Status::Fail,
+            "url",
+            I,
+            "Web address answers",
+            p.to_string(),
+            "Links in emails, Slack, Teams and GitHub point at this address.",
+            Fix::text("Deploy again from your machine: the installer sets the address.")
+                .command(format!("{CLI} deploy")),
+        );
+    }
     match status {
         Some(200..=399) => Check::pass(
             "url",
@@ -1598,6 +1613,9 @@ async fn url_status(state: &AppState) -> (String, Option<u16>) {
     let url = common::public_urls::app_url_from_env()
         .trim_end_matches('/')
         .to_string();
+    if url.is_empty() {
+        return (url, None);
+    }
     let code = state
         .http
         .get(format!("{url}/"))
@@ -1828,7 +1846,11 @@ pub async fn run_all(state: &AppState, team_id: &str) -> (Vec<Check>, Option<Val
         },
     );
     let mut checks = Vec::new();
-    checks.push(public_url(&url.0, url.1));
+    checks.push(public_url(
+        &url.0,
+        url.1,
+        common::public_urls::problem().as_deref(),
+    ));
     if let Some(f) = domain_now {
         checks.push(domain(&f));
     }
@@ -2665,9 +2687,18 @@ mod tests {
         assert!(dlq(Some(3)).detail.starts_with("3 events"));
         assert_eq!(updates(None).status, Status::Warn);
         assert!(updates(Some(&json!({"settings": {"auto": true, "day": "sat", "hour": 22, "timezone": "Europe/Berlin"}}))).detail.contains("sat 22:00 Europe/Berlin"));
-        assert_eq!(public_url("https://h", Some(200)).status, Status::Pass);
-        assert_eq!(public_url("https://h", Some(403)).status, Status::Fail);
-        assert!(public_url("https://h", None)
+        assert_eq!(
+            public_url("https://h", Some(200), None).status,
+            Status::Pass
+        );
+        assert_eq!(
+            public_url("https://h", Some(403), None).status,
+            Status::Fail
+        );
+        let unknown = public_url("", None, Some("APP_URL and API_URL aren't set"));
+        assert_eq!(unknown.status, Status::Fail);
+        assert!(unknown.detail.contains("APP_URL"));
+        assert!(public_url("https://h", None, None)
             .fix
             .unwrap()
             .command

@@ -528,7 +528,7 @@ pub async fn rename_team(
 /// so it never counts.
 pub(crate) fn is_platform_admin(claims: &Claims) -> bool {
     let admins = std::env::var("PLATFORM_ADMIN_EMAILS")
-        .unwrap_or_else(|_| "admin@coderhelm.com".to_string());
+        .unwrap_or_else(|_| common::public_urls::default_platform_admins().to_string());
     // A support-view session is the team's read-only view, never the admin's
     // own powers: the admin routes refuse it.
     claims.support_view.is_none()

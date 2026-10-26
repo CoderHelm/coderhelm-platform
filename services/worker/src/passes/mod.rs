@@ -748,6 +748,8 @@ pub mod review_sweep;
 pub mod review_verdict;
 pub mod rewards;
 mod security;
+#[cfg(test)]
+mod selfhost_links;
 pub mod skill_compat;
 pub mod skill_suggest;
 pub mod skills;
@@ -5562,7 +5564,10 @@ async fn lookup_team_installation_id(
         .and_then(|n| n.parse::<u64>().ok())
         .filter(|&id| id > 0)
         .ok_or_else(|| {
-            "GitHub App is not installed for this team. Please install it at https://github.com/apps/coderhelm/installations/new".to_string()
+            format!(
+                "GitHub App is not installed for this team. Install it from {}/settings/integrations/github/",
+                common::public_urls::app_url_from_env()
+            )
             .into()
         })
 }

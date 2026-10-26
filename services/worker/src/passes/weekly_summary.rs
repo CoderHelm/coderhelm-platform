@@ -47,10 +47,7 @@ const SENT_MARKER_SECS: u64 = 14 * 86_400;
 /// Mail apps read this address for the `mailto:` unsubscribe; requests that
 /// land there are handled by hand.
 fn unsubscribe_mailto() -> String {
-    let inbox = std::env::var("SUPPORT_INBOX")
-        .ok()
-        .filter(|s| !s.trim().is_empty())
-        .unwrap_or_else(|| "support@coderhelm.com".to_string());
+    let inbox = common::public_urls::support_inbox();
     format!("mailto:{inbox}?subject=Unsubscribe%20from%20weekly%20summaries")
 }
 
@@ -2281,6 +2278,45 @@ mod tests {
             url: format!("https://github.com/{repo}/pull/{n}"),
             repo: repo.into(),
         }
+    }
+
+    /// A self-hosted install's weekly summary links to the install (runs,
+    /// settings, unsubscribe) and names no CoderHelm site or support inbox,
+    /// for every role.
+    #[test]
+    fn a_self_hosted_install_summary_links_to_itself() {
+        use common::public_urls::{hosted_mentions, pretend_self_hosted, EXAMPLE_SELF_HOST};
+        pretend_self_hosted();
+        let link = format!(
+            "{}?t={}",
+            common::unsubscribe::base_url(),
+            common::unsubscribe::sign(
+                "s",
+                "TEAM#1",
+                "u1",
+                common::unsubscribe::WEEKLY_SUMMARY,
+                2_000_000_000
+            )
+        );
+        let headers = unsubscribe_headers(&link);
+        let mut out: Vec<String> = headers.iter().map(|(_, v)| v.clone()).collect();
+        for access in [Access::Admin, Access::Member, Access::Viewer] {
+            let e = render(&sample(), access, &link);
+            out.push(e.subject);
+            out.push(e.html);
+            out.push(e.text);
+        }
+        common::public_urls::override_for_this_thread(None);
+        for o in &out {
+            assert_eq!(hosted_mentions(o), Vec::<String>::new(), "{o}");
+        }
+        // The HTML (after the two headers and the subject) links to the install.
+        assert!(
+            out[3].contains(&format!("href=\"{EXAMPLE_SELF_HOST}/")),
+            "{}",
+            out[3]
+        );
+        assert!(link.starts_with(EXAMPLE_SELF_HOST));
     }
 
     fn sample() -> Summary {

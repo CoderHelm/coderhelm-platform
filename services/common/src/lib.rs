@@ -95,6 +95,8 @@ pub mod rewards;
 pub mod run_fail;
 /// Run statuses; which ones a person set; closing and reopening a run.
 pub mod run_status;
+#[cfg(test)]
+mod selfhost_links;
 pub mod skill_apply;
 pub mod skill_compat;
 pub mod skills;
