@@ -37,48 +37,133 @@ Each check prints `PASS`, `WARN`, `FAIL` or `SKIP`. Anything that isn't a pass s
 
 Fix it and run the doctor again. It exits with 0 when nothing fails, so scripts and CI can use it. Options:
 
-| Option | What it does |
-|---|---|
-| `--json` | Prints the results as JSON (groups, each check's `status`, `what`, `why`, `fix`) |
-| `ANTHROPIC_API_KEY=...` | Also tests this Anthropic key with a real one-token call |
-| `--verbose` | Prints full error details. They are always saved in `.coderhelm/logs/` |
+- **`--json`**\
+  Prints the results as JSON (groups, each check's `status`, `what`, `why`, `fix`).
+- **`ANTHROPIC_API_KEY=...`**\
+  Also tests this Anthropic key with a real one-token call.
+- **`--verbose`**\
+  Prints full error details. They are always saved in `.coderhelm/logs/`.
 
 The last result is kept in `.coderhelm/doctor.json`.
 
 ## Every check
 
-| Group | Check | A failure means | The fix it shows |
-|---|---|---|---|
-| This machine | Node.js 20 or newer | The installer and the CDK can't run | The Node.js download page |
-| This machine | AWS CLI v2 | No `aws`, or version 1 | The AWS CLI install guide |
-| This machine | Signed in to AWS | No credentials, or the sign-in expired | `aws sso login --profile <name>`, or `aws configure sso` |
-| This machine | The right AWS account | Your credentials are for another account than the config's | `aws configure list-profiles`, then `AWS_PROFILE=<name>` |
-| This machine | AWS permissions | Your identity isn't allowed some actions the deploy needs (checked with `iam:SimulatePrincipalPolicy`); each one is listed | Ask your AWS admin, or use a role with AdministratorAccess. When the simulation itself isn't allowed, this is a warning |
-| Region and CDK | Region has every service | The region lacks a service the install uses (Bedrock too, with the `bedrock` provider) | Pick another region, such as us-east-1, us-west-2 or eu-west-1 |
-| Region and CDK | CDK set up | No `CDKToolkit` stack in the region (or in us-east-1, which CloudFront's certificate needs) | `npx -y cdk bootstrap aws://<account>/<region>`. The guided install offers to run it |
-| Web address | Route 53 zone | No public zone with that name in the account | `aws route53 create-hosted-zone ...` |
-| Web address | Name servers point at Route 53 | Public DNS answers other name servers than the zone's | The exact NS records to set at your registrar, and what is there now |
-| Web address | TLS certificate issued | Wrong region, wrong name, or still validating | The validation records to add, or the ACM request page |
-| Web address | Web address answers | DNS doesn't resolve, the certificate is refused, or CloudFront answers an error | The DNS record to add, or the ACM or CloudFront console |
-| Web address | API answers | `/api` doesn't answer | `aws logs tail` for the gateway, then deploy again |
-| Web address | Your own domain (Settings, then Setup) | The certificate waits for its record, a record has the wrong value, CAA blocks Amazon, the hostname is a zone apex, or HTTPS or the API doesn't answer on it | The records to add with their exact values; every code is in [Domains](./domains.md#checks) |
-| Install health | CloudFormation stacks | A stack is missing or stuck in a rollback | The stack's Events tab, then `deploy` |
-| Install health | Functions | gateway, worker or streaming isn't active | `deploy` (it replaces the function) |
-| Install health | No failed events waiting | Messages wait in the dead-letter queue (a warning) | The failed events page in the dashboard |
-| GitHub | Install secret | The secret is missing | `deploy`, then `github-app` |
-| GitHub | GitHub App created | No app is stored | `github-app` |
-| GitHub | GitHub accepts the app's keys | GitHub refuses the stored app id and private key | `github-app --force` |
-| GitHub | Permissions and events | A permission is missing or too weak (for example Workflows: write), or an event isn't subscribed | The app's Permissions page, with each value to set |
-| GitHub | Webhook reaches this install | The webhook URL is wrong, GitHub couldn't connect, or the install refused the last delivery (401: the webhook secret doesn't match) | The URL to set, or `github-app --force` and a redelivery |
-| GitHub | App installed | The app isn't installed anywhere | The app's install page |
-| GitHub | Sign-in client | GitHub refuses the stored OAuth client id and secret | `github-app --force` |
-| Email | Sender verified | The sender's domain isn't in SES, isn't verified, or DKIM isn't set up | The three DKIM records to add, or `aws sesv2 create-email-identity ...` |
-| Email | Email can reach anyone | The account is in the SES sandbox (a warning) | The SES page to request production access |
-| Claude | Models enabled in Bedrock | Model access isn't on for Claude Opus 5.5 or Claude Sonnet 5.5 in the region; each is named | The Bedrock Model access page for the region |
-| Claude | Claude answers | A real one-token call fails | The model access page, or the inference prefix to check |
-| Claude | Anthropic API key works | The key is refused, can't use the model, or has no credit | The Anthropic console's keys or billing page |
-| Notices | Slack or Teams webhook | The webhook was removed or the URL is wrong | How to create a new one |
-| Integrations | Sign in with Google (Settings, then Setup) | It is on, but its keys aren't in the secret | The keys to add; see [Sign-in and people](./sign-in.md) |
+### This machine
+
+- **Node.js 20 or newer**\
+  *If it fails:* The installer and the CDK can't run.\
+  *Fix:* The Node.js download page.
+- **AWS CLI v2**\
+  *If it fails:* No `aws`, or version 1.\
+  *Fix:* The AWS CLI install guide.
+- **Signed in to AWS**\
+  *If it fails:* No credentials, or the sign-in expired.\
+  *Fix:* `aws sso login --profile <name>`, or `aws configure sso`.
+- **The right AWS account**\
+  *If it fails:* Your credentials are for another account than the config's.\
+  *Fix:* `aws configure list-profiles`, then `AWS_PROFILE=<name>`.
+- **AWS permissions**\
+  *If it fails:* Your identity isn't allowed some actions the deploy needs (checked with `iam:SimulatePrincipalPolicy`); each one is listed.\
+  *Fix:* Ask your AWS admin, or use a role with AdministratorAccess. When the simulation itself isn't allowed, this is a warning.
+
+### Region and CDK
+
+- **Region has every service**\
+  *If it fails:* The region lacks a service the install uses (Bedrock too, with the `bedrock` provider).\
+  *Fix:* Pick another region, such as us-east-1, us-west-2 or eu-west-1.
+- **CDK set up**\
+  *If it fails:* No `CDKToolkit` stack in the region (or in us-east-1, which CloudFront's certificate needs).\
+  *Fix:* `npx -y cdk bootstrap aws://<account>/<region>`. The guided install offers to run it.
+
+### Web address
+
+- **Route 53 zone**\
+  *If it fails:* No public zone with that name in the account.\
+  *Fix:* `aws route53 create-hosted-zone ...`.
+- **Name servers point at Route 53**\
+  *If it fails:* Public DNS answers other name servers than the zone's.\
+  *Fix:* The exact NS records to set at your registrar, and what is there now.
+- **TLS certificate issued**\
+  *If it fails:* Wrong region, wrong name, or still validating.\
+  *Fix:* The validation records to add, or the ACM request page.
+- **Web address answers**\
+  *If it fails:* DNS doesn't resolve, the certificate is refused, or CloudFront answers an error.\
+  *Fix:* The DNS record to add, or the ACM or CloudFront console.
+- **API answers**\
+  *If it fails:* `/api` doesn't answer.\
+  *Fix:* `aws logs tail` for the gateway, then deploy again.
+- **Your own domain (Settings, then Setup)**\
+  *If it fails:* The certificate waits for its record, a record has the wrong value, CAA blocks Amazon, the hostname is a zone apex, or HTTPS or the API doesn't answer on it.\
+  *Fix:* The records to add with their exact values; every code is in [Domains](./domains.md#checks).
+
+### Install health
+
+- **CloudFormation stacks**\
+  *If it fails:* A stack is missing or stuck in a rollback.\
+  *Fix:* The stack's Events tab, then `deploy`.
+- **Functions**\
+  *If it fails:* gateway, worker or streaming isn't active.\
+  *Fix:* `deploy` (it replaces the function).
+- **No failed events waiting**\
+  *If it fails:* Messages wait in the dead-letter queue (a warning).\
+  *Fix:* The failed events page in the dashboard.
+
+### GitHub
+
+- **Install secret**\
+  *If it fails:* The secret is missing.\
+  *Fix:* `deploy`, then `github-app`.
+- **GitHub App created**\
+  *If it fails:* No app is stored.\
+  *Fix:* `github-app`.
+- **GitHub accepts the app's keys**\
+  *If it fails:* GitHub refuses the stored app id and private key.\
+  *Fix:* `github-app --force`.
+- **Permissions and events**\
+  *If it fails:* A permission is missing or too weak (for example Workflows: write), or an event isn't subscribed.\
+  *Fix:* The app's Permissions page, with each value to set.
+- **Webhook reaches this install**\
+  *If it fails:* The webhook URL is wrong, GitHub couldn't connect, or the install refused the last delivery (401: the webhook secret doesn't match).\
+  *Fix:* The URL to set, or `github-app --force` and a redelivery.
+- **App installed**\
+  *If it fails:* The app isn't installed anywhere.\
+  *Fix:* The app's install page.
+- **Sign-in client**\
+  *If it fails:* GitHub refuses the stored OAuth client id and secret.\
+  *Fix:* `github-app --force`.
+
+### Email
+
+- **Sender verified**\
+  *If it fails:* The sender's domain isn't in SES, isn't verified, or DKIM isn't set up.\
+  *Fix:* The three DKIM records to add, or `aws sesv2 create-email-identity ...`.
+- **Email can reach anyone**\
+  *If it fails:* The account is in the SES sandbox (a warning).\
+  *Fix:* The SES page to request production access.
+
+### Claude
+
+- **Models enabled in Bedrock**\
+  *If it fails:* Model access isn't on for Claude Opus 5.5 or Claude Sonnet 5.5 in the region; each is named.\
+  *Fix:* The Bedrock Model access page for the region.
+- **Claude answers**\
+  *If it fails:* A real one-token call fails.\
+  *Fix:* The model access page, or the inference prefix to check.
+- **Anthropic API key works**\
+  *If it fails:* The key is refused, can't use the model, or has no credit.\
+  *Fix:* The Anthropic console's keys or billing page.
+
+### Notices
+
+- **Slack or Teams webhook**\
+  *If it fails:* The webhook was removed or the URL is wrong.\
+  *Fix:* How to create a new one.
+
+### Integrations
+
+- **Sign in with Google (Settings, then Setup)**\
+  *If it fails:* It is on, but its keys aren't in the secret.\
+  *Fix:* The keys to add; see [Sign-in and people](./sign-in.md).
 
 ## The guided install
 
@@ -194,17 +279,33 @@ For the [install guide](https://docs.coderhelm.com/self-host/install/) to poll f
 - `required: false` marks a check that never blocks `ready`. `ready` is true when every required check passes or is skipped.
 - `github_manifest_ready` is true when the install holds the Launch Stack's one-time setup key and no GitHub App yet, so the manifest landing (`/api/setup/github/callback`) will accept a new app.
 
-| Check | Codes | What fixes it |
-|---|---|---|
-| `api` | `ok` | The install answers. |
-| `github_app` | `ok`, `missing`, `missing_no_setup_key`, `secret_unreadable` | Create the app (the install guide, or `github-app` from the CLI when the browser no longer has the setup key). |
-| `github_installed` | `ok`, `needs_app` (wait), `not_installed` (wait), `app_rejected`, `bad_key`, `github_unreachable` (warn) | Install the app on your repositories. `app_rejected` and `bad_key`: create a new app with `github-app --force`. |
-| `models` | `ok`, `use_case_required`, `access_denied`, `subscription_pending` (warn), `marketplace_failed`, `iam_denied`, `not_available`, `unknown`; `anthropic_keys_per_team` (skip) | Bedrock: one real one-token call (a pass is kept 10 minutes, a failure 20 seconds). Submit Anthropic's use case form or request access in the Bedrock console for your region, wait for the subscription, fix the payment method, or allow Bedrock model calls. With Anthropic API keys, each team adds its key after signing in. |
-| `email` | `ok`, `identity_unverified`, `sandbox`, `unknown` (all warn, never blocking) | Verify the sender (DKIM records, or the link AWS emailed); request SES production access. |
-| `domain` | `none` (skip), `validating` (wait), `attaching` (wait), `removing` (wait), `dns_missing` (wait), `zone_not_delegated`, `validation_wrong_value`, `caa_blocked`, `certificate_failed`, `attach_failed`, `dns_wrong_value`, `cname_at_apex`, `https_failed`, `api_unreachable`, `unknown` (warn), `ok`; never blocking | See [Domains](./domains.md#checks). The hostname and the records are never in this answer: the guide has them from the progress file. |
-| `google_sign_in` | `off` (skip), `missing_keys`, `ok`; never blocking | See [Sign-in and people](./sign-in.md). |
-| `updates` | `auto_off` (skip), `ok`, `unknown` (warn); never blocking | Turn automatic updates on in Settings, then System. |
-| `admin` | `ok`, `not_signed_up` (wait) | Sign up at your CoderHelm address with the admin email. |
+- **`api`**\
+  *Codes:* `ok`\
+  *Fix:* The install answers.
+- **`github_app`**\
+  *Codes:* `ok`, `missing`, `missing_no_setup_key`, `secret_unreadable`\
+  *Fix:* Create the app (the install guide, or `github-app` from the CLI when the browser no longer has the setup key).
+- **`github_installed`**\
+  *Codes:* `ok`, `needs_app` (wait), `not_installed` (wait), `app_rejected`, `bad_key`, `github_unreachable` (warn)\
+  *Fix:* Install the app on your repositories. `app_rejected` and `bad_key`: create a new app with `github-app --force`.
+- **`models`**\
+  *Codes:* `ok`, `use_case_required`, `access_denied`, `subscription_pending` (warn), `marketplace_failed`, `iam_denied`, `not_available`, `unknown`; `anthropic_keys_per_team` (skip)\
+  *Fix:* Bedrock: one real one-token call (a pass is kept 10 minutes, a failure 20 seconds). Submit Anthropic's use case form or request access in the Bedrock console for your region, wait for the subscription, fix the payment method, or allow Bedrock model calls. With Anthropic API keys, each team adds its key after signing in.
+- **`email`**\
+  *Codes:* `ok`, `identity_unverified`, `sandbox`, `unknown` (all warn, never blocking)\
+  *Fix:* Verify the sender (DKIM records, or the link AWS emailed); request SES production access.
+- **`domain`**\
+  *Codes:* `none` (skip), `validating` (wait), `attaching` (wait), `removing` (wait), `dns_missing` (wait), `zone_not_delegated`, `validation_wrong_value`, `caa_blocked`, `certificate_failed`, `attach_failed`, `dns_wrong_value`, `cname_at_apex`, `https_failed`, `api_unreachable`, `unknown` (warn), `ok`; never blocking\
+  *Fix:* See [Domains](./domains.md#checks). The hostname and the records are never in this answer: the guide has them from the progress file.
+- **`google_sign_in`**\
+  *Codes:* `off` (skip), `missing_keys`, `ok`; never blocking\
+  *Fix:* See [Sign-in and people](./sign-in.md).
+- **`updates`**\
+  *Codes:* `auto_off` (skip), `ok`, `unknown` (warn); never blocking\
+  *Fix:* Turn automatic updates on in Settings, then System.
+- **`admin`**\
+  *Codes:* `ok`, `not_signed_up` (wait)\
+  *Fix:* Sign up at your CoderHelm address with the admin email.
 
 The guide builds its own links (the Bedrock console for the region it launched in, `https://github.com/apps/<slug>/installations/new` from the slug the manifest landing hands back), so the install never has to publish them.
 

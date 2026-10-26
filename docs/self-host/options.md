@@ -8,45 +8,129 @@ One list of everything you can set up, and where. Required items are steps in th
 
 ## At install
 
-| Setting | Required | Install guide | Launch Stack parameter | Config | Checked by |
-|---|---|---|---|---|---|
-| Your email (the first admin) | Yes | Your email | `AdminEmail` | `admins` | `admin` |
-| AWS region | Yes | AWS region | the console's region | `region` | |
-| Install name | | More options | `Stage` | `stage` | |
-| Models: Bedrock or Anthropic keys | | More options | `ModelProvider` | `models.provider` | `models`, `model` |
-| Bedrock inference profile | | | `BedrockInferencePrefix` | `models.bedrockInferencePrefix` | `model` |
-| Your own domain | | More options, then the Domain step | `Hostname` (`HostedZone` to pick a zone) | `domain` | `domain` |
-| Send email from | | More options | `EmailFrom` | `email.from`, `email.identity` | `email`, `email_identity` |
-| Who else may sign up | | More options | `SignupDomain` | `signup.domains`, `signup.emails` | |
-| Automatic updates and the window | | More options | `AutoUpdate`, `UpdateWindow`, `UpdateTimezone` | `updates.*` | `updates` |
-| Anonymous install pings | | | `Telemetry` | `telemetry.enabled` | |
-| The release | | (the newest) | `Version` | `--version` | |
-| GitHub App | Yes | The GitHub step | | `github-app` | `github_app`, `github_installed`, `github_*` |
-| Claude access in Bedrock | Yes, with Bedrock | The Models step | | | `models`, `model` |
+- **Your email (the first admin)** *required*\
+  *Install guide:* Your email\
+  *Launch Stack:* `AdminEmail`\
+  *Config:* `admins`\
+  *Checked by:* `admin`
+- **AWS region** *required*\
+  *Install guide:* AWS region\
+  *Launch Stack:* the console's region\
+  *Config:* `region`
+- **Install name**\
+  *Install guide:* More options\
+  *Launch Stack:* `Stage`\
+  *Config:* `stage`
+- **Models: Bedrock or Anthropic keys**\
+  *Install guide:* More options\
+  *Launch Stack:* `ModelProvider`\
+  *Config:* `models.provider`\
+  *Checked by:* `models`, `model`
+- **Bedrock inference profile**\
+  *Launch Stack:* `BedrockInferencePrefix`\
+  *Config:* `models.bedrockInferencePrefix`\
+  *Checked by:* `model`
+- **Your own domain**\
+  *Install guide:* More options, then the Domain step\
+  *Launch Stack:* `Hostname` (`HostedZone` to pick a zone)\
+  *Config:* `domain`\
+  *Checked by:* `domain`
+- **Send email from**\
+  *Install guide:* More options\
+  *Launch Stack:* `EmailFrom`\
+  *Config:* `email.from`, `email.identity`\
+  *Checked by:* `email`, `email_identity`
+- **Who else may sign up**\
+  *Install guide:* More options\
+  *Launch Stack:* `SignupDomain`\
+  *Config:* `signup.domains`, `signup.emails`
+- **Automatic updates and the window**\
+  *Install guide:* More options\
+  *Launch Stack:* `AutoUpdate`, `UpdateWindow`, `UpdateTimezone`\
+  *Config:* `updates.*`\
+  *Checked by:* `updates`
+- **Anonymous install pings**\
+  *Launch Stack:* `Telemetry`\
+  *Config:* `telemetry.enabled`
+- **The release**\
+  *Install guide:* (the newest)\
+  *Launch Stack:* `Version`\
+  *Config:* `--version`
+- **GitHub App** *required*\
+  *Install guide:* The GitHub step\
+  *Config:* `github-app`\
+  *Checked by:* `github_app`, `github_installed`, `github_*`
+- **Claude access in Bedrock** *yes, with Bedrock*\
+  *Install guide:* The Models step\
+  *Checked by:* `models`, `model`
 
 ## After install
 
-| Setting | Where | Checked by | Guide |
-|---|---|---|---|
-| Your own domain, or change it | Settings, then System, Domain | `domain` | [Domains](./domains.md) |
-| Email reaches anyone (leave the SES sandbox) | The SES console | `email_sandbox` | [Email](./email.md) |
-| Email from your domain, with DKIM | The SES console, and DNS | `email_identity` | [Email](./email.md) |
-| Sign-up and password emails through SES | `email.cognitoUsesSes` | | [Email](./email.md) |
-| Sign in with Google | Google Cloud, the secret, `integrations.googleSignIn` | `google_sign_in` | [Sign-in and people](./sign-in.md) |
-| Invite your team | Settings, People | | [Sign-in and people](./sign-in.md) |
-| Anthropic API key (Anthropic provider) | Settings, AI models (per team) | `model` | [Model providers](./model-providers.md) |
-| Models a team uses | Settings, AI models | `model` | [Model providers](./model-providers.md) |
-| Repositories CoderHelm works on | Settings, Repositories | | |
-| Slack or Teams notices and alert routes | Settings, Alerts | `slack`, `teams` | [Integrations](./integrations.md) |
-| Jira | Settings, Integrations, Jira | `jira` | [Integrations](./integrations.md) |
-| Connected AWS accounts (logs, metrics) | Settings, Integrations, AWS | | [Integrations](./integrations.md) |
-| Knowledge sources (Notion, Confluence, Google Drive and more) | Settings, Knowledge; OAuth apps in the secret | | [Knowledge sources](./knowledge-sources.md) |
-| Automatic updates, channel, window, majors | Settings, System | `updates` | [Updates](./updates.md) |
-| Update notices in Slack or Teams | `updates.webhookUrl` | | [Updates](./updates.md) |
-| Backups | On by the install (point-in-time recovery on every table, versioned bucket); on-demand with `backup`; AWS Backup plans | | [Backups](./backups.md) |
-| Keep data when stacks are deleted | `retainData` (on) | | [Config reference](./config-reference.md) |
-| The build sandbox, log analysis, weekly summary | `integrations.*` | | [Integrations](./integrations.md) |
-| Support access for install admins | Settings, Support access (per team) | | [Sign-in and people](./sign-in.md) |
+- **Your own domain, or change it**\
+  *Where:* Settings, then System, Domain\
+  *Checked by:* `domain`\
+  *Guide:* [Domains](./domains.md)
+- **Email reaches anyone (leave the SES sandbox)**\
+  *Where:* The SES console\
+  *Checked by:* `email_sandbox`\
+  *Guide:* [Email](./email.md)
+- **Email from your domain, with DKIM**\
+  *Where:* The SES console, and DNS\
+  *Checked by:* `email_identity`\
+  *Guide:* [Email](./email.md)
+- **Sign-up and password emails through SES**\
+  *Where:* `email.cognitoUsesSes`\
+  *Guide:* [Email](./email.md)
+- **Sign in with Google**\
+  *Where:* Google Cloud, the secret, `integrations.googleSignIn`\
+  *Checked by:* `google_sign_in`\
+  *Guide:* [Sign-in and people](./sign-in.md)
+- **Invite your team**\
+  *Where:* Settings, People\
+  *Guide:* [Sign-in and people](./sign-in.md)
+- **Anthropic API key (Anthropic provider)**\
+  *Where:* Settings, AI models (per team)\
+  *Checked by:* `model`\
+  *Guide:* [Model providers](./model-providers.md)
+- **Models a team uses**\
+  *Where:* Settings, AI models\
+  *Checked by:* `model`\
+  *Guide:* [Model providers](./model-providers.md)
+- **Repositories CoderHelm works on**\
+  *Where:* Settings, Repositories
+- **Slack or Teams notices and alert routes**\
+  *Where:* Settings, Alerts\
+  *Checked by:* `slack`, `teams`\
+  *Guide:* [Integrations](./integrations.md)
+- **Jira**\
+  *Where:* Settings, Integrations, Jira\
+  *Checked by:* `jira`\
+  *Guide:* [Integrations](./integrations.md)
+- **Connected AWS accounts (logs, metrics)**\
+  *Where:* Settings, Integrations, AWS\
+  *Guide:* [Integrations](./integrations.md)
+- **Knowledge sources (Notion, Confluence, Google Drive and more)**\
+  *Where:* Settings, Knowledge; OAuth apps in the secret\
+  *Guide:* [Knowledge sources](./knowledge-sources.md)
+- **Automatic updates, channel, window, majors**\
+  *Where:* Settings, System\
+  *Checked by:* `updates`\
+  *Guide:* [Updates](./updates.md)
+- **Update notices in Slack or Teams**\
+  *Where:* `updates.webhookUrl`\
+  *Guide:* [Updates](./updates.md)
+- **Backups**\
+  *Where:* On by the install (point-in-time recovery on every table, versioned bucket); on-demand with `backup`; AWS Backup plans\
+  *Guide:* [Backups](./backups.md)
+- **Keep data when stacks are deleted**\
+  *Where:* `retainData` (on)\
+  *Guide:* [Config reference](./config-reference.md)
+- **The build sandbox, log analysis, weekly summary**\
+  *Where:* `integrations.*`\
+  *Guide:* [Integrations](./integrations.md)
+- **Support access for install admins**\
+  *Where:* Settings, Support access (per team)\
+  *Guide:* [Sign-in and people](./sign-in.md)
 
 ## Not available yet
 
