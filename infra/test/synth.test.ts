@@ -447,3 +447,32 @@ test("domain: the updater may request the certificate, add only the validation C
   const spec = JSON.stringify(u.findResources("AWS::CodeBuild::Project"));
   assert.ok(spec.includes("coderhelm-selfhost domain apply --yes --require-signature"));
 });
+
+test("CORS: the gateway answers browsers, not API Gateway; the docs origin never gets credentials", () => {
+  // Hosted (split): no API Gateway CORS setting (it would drop the gateway's
+  // own headers), the dashboard's origins reach the gateway, and every
+  // preflight is routed to it.
+  const hostedCfg = loadConfigFile(path.join(INFRA, "config", "hosted.prod.json"), { CDK_DEFAULT_ACCOUNT: "654654210434" });
+  const hosted = synth(hostedCfg, zoneContext("654654210434", "us-east-1", "coderhelm.com"))["coderhelm-prod-api"];
+  const api = Object.values(hosted.findResources("AWS::ApiGatewayV2::Api"))[0] as any;
+  assert.equal(api.Properties.CorsConfiguration, undefined);
+  const keys = Object.values(hosted.findResources("AWS::ApiGatewayV2::Route")).map((r: any) => String(r.Properties.RouteKey));
+  assert.ok(keys.includes("OPTIONS /{proxy+}"), "preflights reach the gateway");
+  assert.ok(keys.some((k) => routeTakes(k, "GET", "/hybrid/names/acme")), "the name check has a route");
+  const env = envOf(hosted, "coderhelm-prod-gateway");
+  assert.equal(env.CORS_ORIGINS, hostedCfg.split!.corsOrigins.join(","));
+  assert.ok(!String(env.CORS_ORIGINS).includes("docs.coderhelm.com"), "the docs origin is never a credentialed origin");
+
+  // Self-host (single-origin): nothing at API Gateway or CloudFront touches
+  // CORS, so the setup routes' own `*` reaches the docs install guide.
+  const t = synth(selfHost());
+  const selfApi = Object.values(t["coderhelm-prod-api"].findResources("AWS::ApiGatewayV2::Api"))[0] as any;
+  assert.equal(selfApi.Properties.CorsConfiguration, undefined);
+  assert.equal(envOf(t["coderhelm-prod-api"], "coderhelm-prod-gateway").CORS_ORIGINS, undefined);
+  const dist = Object.values(t["coderhelm-prod-web"].findResources("AWS::CloudFront::Distribution"))[0] as any;
+  for (const b of dist.Properties.DistributionConfig.CacheBehaviors) {
+    if (b.PathPattern === STREAM_PATH) continue;
+    assert.equal(b.ResponseHeadersPolicyId, undefined, `${b.PathPattern} rewrites the API's headers`);
+  }
+  assert.ok(API_PATHS.includes("/api/*"), "the setup routes go through the API behavior");
+});

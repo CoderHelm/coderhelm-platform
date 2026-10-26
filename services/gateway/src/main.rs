@@ -1293,6 +1293,9 @@ async fn main() -> Result<(), Error> {
                 next.run(req).await
             },
         ))
+        // Cross-origin answers for browsers (middleware::cors): outermost,
+        // so preflights are answered before routing.
+        .layer(axum_middleware::from_fn(middleware::cors::cors))
         .with_state(state);
 
     // In streaming mode the Lambda Web Adapter proxies requests to port 8080,

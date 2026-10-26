@@ -516,8 +516,14 @@ pub async fn name_available(
     headers: HeaderMap,
     Path(raw): Path<String>,
 ) -> Response {
+    public_reply(name_check(&state, &headers, &raw).await)
+}
+
+/// A public answer any origin may read, never with credentials
+/// (middleware::cors keeps it that way for every origin but the dashboard's).
+pub fn public_reply(r: Reply) -> Response {
     let cors = [(axum::http::header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")];
-    match name_check(&state, &headers, &raw).await {
+    match r {
         Ok(v) => (cors, v).into_response(),
         Err((code, v)) => (code, cors, v).into_response(),
     }
