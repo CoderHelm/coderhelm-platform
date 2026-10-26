@@ -807,63 +807,192 @@ async fn results_come_back_as_lessons_for_the_next_run() {
     assert!(sys.contains("How earlier published drafts did"));
 }
 
-/// The public example in `plugins/marketing` reads, checks and grants what
-/// its README says.
+/// The full marketing plugin (the one published in CoderHelm/coderhelm-plugins,
+/// as of its 1.1.0) reads, checks and grants what its README says, and its
+/// HTTP bodies fill in the approved text and the team's settings. The
+/// examples themselves live in that repository, whose CI validates them.
+const FULL_MARKETING: &str = r#"
+name: marketing
+version: 1.1.0
+description: Drafts launch posts, a blog post and a launch email from each release or brief, for an editor to approve before anything goes out.
+
+skills: [skills/*/SKILL.md]
+agents: [agents/*.md]
+
+settings:
+  - key: brand_voice_doc
+    type: string
+    description: A link to your brand voice document, or a few sentences about how you sound.
+  - key: product_name
+    type: string
+    description: The product's name as it should appear in posts.
+  - key: linkedin_author
+    type: string
+    description: The LinkedIn organization or person URN posts are made as (urn:li:organization:123).
+  - key: email_from
+    type: string
+    description: The address launch emails come from, verified with your email service (news@example.com).
+  - key: email_to
+    type: string
+    description: The one address launch emails go to, such as a mailing list address (announce@example.com).
+  - key: linkedin
+    type: connection
+    provider: oauth2
+    scopes: [w_member_social, w_organization_social]
+    sensitive: true
+    description: The LinkedIn connection posts are published with.
+  - key: email
+    type: connection
+    provider: key
+    sensitive: true
+    description: The email service's API key, for sending the approved launch email.
+  - key: images
+    type: connection
+    provider: key
+    sensitive: true
+    description: The image service's API key, for header images. Leave it empty to skip images.
+
+tools:
+  # The CMS (Sanity on the Connections page): read content, write drafts.
+  - ref: "mcp:sanity"
+    allow: [get_*, list_*, query_*, create_draft]
+    description: Read published content and save a blog draft in the CMS.
+  # Analytics (PostHog on the Connections page): read only.
+  - ref: "mcp:posthog"
+    allow: [query_*, get_*]
+    description: Read how earlier posts did.
+  # Publishing a LinkedIn post: only after a person approves the version.
+  - name: publish_post
+    kind: http
+    connection: linkedin
+    method: POST
+    url: "https://api.linkedin.com/rest/posts"
+    risk: consequential
+    description: Publish an approved post on LinkedIn.
+    headers:
+      LinkedIn-Version: "202406"
+      X-Restli-Protocol-Version: "2.0.0"
+    body:
+      author: "{{setting:linkedin_author}}"
+      commentary: "{{content}}"
+      visibility: PUBLIC
+      distribution:
+        feedDistribution: MAIN_FEED
+      lifecycleState: PUBLISHED
+  # Sending the launch email. Calling it only queues a request: the email
+  # goes out after a person approves that exact subject and text.
+  - name: send_email
+    kind: http
+    connection: email
+    method: POST
+    url: "https://api.sendgrid.com/v3/mail/send"
+    risk: consequential
+    description: Ask to send the launch email. Pass the subject as `title` and the plain text as `content`. Nothing is sent until a person approves it.
+    body:
+      personalizations:
+        - to:
+            - email: "{{setting:email_to}}"
+      from:
+        email: "{{setting:email_from}}"
+      subject: "{{title}}"
+      content:
+        - type: text/plain
+          value: "{{content}}"
+  # A header image for a draft. It makes an image; it publishes nothing.
+  - name: generate_image
+    kind: http
+    connection: images
+    method: POST
+    url: "https://api.openai.com/v1/images/generations"
+    risk: write
+    description: Make a header image from a prompt, for a draft. Save the link it returns in an image draft.
+
+triggers:
+  - on: github.release
+    agent: launch-writer
+  - on: schedule
+    cron: "0 14 * * MON"
+    agent: weekly-roundup
+  - on: manual
+    agent: launch-writer
+    form:
+      brief: text
+      channels: [linkedin, blog, email]
+
+outputs:
+  - type: draft
+    kinds: [blog, social, email, image]
+  - type: publish
+    via: publish_post
+    approval: {role: marketing_editor, min: 1}
+
+# A week after a post goes out, its numbers come back as a lesson the next
+# runs read.
+results:
+  via: "mcp:posthog"
+  tool: query_insight
+  after_days: 7
+
+budget:
+  monthly_tokens: 2000000
+"#;
+
 #[tokio::test]
-async fn the_example_marketing_plugin_is_valid() {
-    struct Disk(std::path::PathBuf);
-    #[async_trait::async_trait]
-    impl super::package::RepoRead for Disk {
-        async fn resolve(&self, _r: &str) -> Result<String, String> {
-            Ok("0000000".into())
-        }
-        async fn tree(&self, _sha: &str) -> Result<Vec<(String, u64)>, String> {
-            fn walk(base: &std::path::Path, dir: &std::path::Path, out: &mut Vec<(String, u64)>) {
-                for e in std::fs::read_dir(dir).unwrap().flatten() {
-                    let p = e.path();
-                    if p.is_dir() {
-                        walk(base, &p, out);
-                    } else {
-                        let rel = p
-                            .strip_prefix(base)
-                            .unwrap()
-                            .to_string_lossy()
-                            .replace('\\', "/");
-                        out.push((rel, e.metadata().unwrap().len()));
-                    }
-                }
-            }
-            let mut out = Vec::new();
-            walk(&self.0, &self.0.join("plugins"), &mut out);
-            Ok(out)
-        }
-        async fn read(&self, _sha: &str, path: &str) -> Result<String, String> {
-            std::fs::read_to_string(self.0.join(path)).map_err(|e| e.to_string())
-        }
-    }
-    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-    let disk = Disk(root);
-    let tree = super::package::RepoRead::tree(&disk, "x").await.unwrap();
-    assert!(super::package::plugin_roots(&tree).contains(&"plugins/marketing".to_string()));
-    let pkg = super::package::read(&disk, "x", "plugins/marketing")
+async fn the_full_marketing_plugin_reads_checks_and_grants() {
+    let repo = super::package::tests::FakeRepo::default();
+    let agent =
+        |n: &str| format!("---\nname: {n}\ndescription: Writes posts\n---\nWrite the posts.");
+    let skill =
+        |n: &str| format!("---\nname: {n}\ndescription: How to write\n---\nShort sentences.");
+    let files = [
+        (
+            "plugins/marketing/plugin.yaml".to_string(),
+            FULL_MARKETING.to_string(),
+        ),
+        (
+            "plugins/marketing/agents/launch-writer.md".into(),
+            agent("launch-writer"),
+        ),
+        (
+            "plugins/marketing/agents/weekly-roundup.md".into(),
+            agent("weekly-roundup"),
+        ),
+        (
+            "plugins/marketing/skills/brand-voice/SKILL.md".into(),
+            skill("brand-voice"),
+        ),
+        (
+            "plugins/marketing/skills/brand-voice/examples.md".into(),
+            "Example post.".into(),
+        ),
+        (
+            "plugins/marketing/skills/claims-and-facts/SKILL.md".into(),
+            skill("claims-and-facts"),
+        ),
+        (
+            "plugins/marketing/connectors/README.md".into(),
+            "For people.".into(),
+        ),
+    ];
+    let refs: Vec<(&str, &str)> = files
+        .iter()
+        .map(|(a, b)| (a.as_str(), b.as_str()))
+        .collect();
+    repo.commit("c3c3c3c3", "main", &refs);
+    use super::package::RepoRead;
+    let tree = repo.tree("c3c3c3c3").await.unwrap();
+    assert_eq!(
+        super::package::plugin_roots(&tree),
+        vec!["plugins/marketing".to_string()]
+    );
+    let pkg = super::package::read(&repo, "c3c3c3c3", "plugins/marketing")
         .await
         .unwrap();
     let m = &pkg.manifest;
     assert_eq!(m.id(), "marketing");
-    assert_eq!(
-        pkg.items
-            .iter()
-            .filter(|i| i.kind == crate::skills::Kind::Agent)
-            .count(),
-        2
-    );
-    assert_eq!(
-        pkg.items
-            .iter()
-            .filter(|i| i.kind == crate::skills::Kind::Skill)
-            .count(),
-        2
-    );
+    let count = |k: crate::skills::Kind| pkg.items.iter().filter(|i| i.kind == k).count();
+    assert_eq!(count(crate::skills::Kind::Agent), 2);
+    assert_eq!(count(crate::skills::Kind::Skill), 2);
     let g = m.grant();
     use crate::tool_registry::Risk;
     assert_eq!(g.risk("publish_post"), Some(Risk::Consequential));
@@ -873,37 +1002,33 @@ async fn the_example_marketing_plugin_is_valid() {
     assert_eq!(g.risk("posthog__query_insight"), Some(Risk::Read));
     assert!(!g.allows("sanity__delete_document"));
     assert!(m.results.is_some());
-    // The LinkedIn body fills in the approved text and the author setting.
-    let spec = m.named_tool("publish_post").unwrap();
     let fields = BTreeMap::from([
-        ("title", "T".to_string()),
+        ("title", "Subject".to_string()),
         ("content", "Body".to_string()),
         ("kind", "social".into()),
         ("channel", "linkedin".into()),
     ]);
-    let settings = BTreeMap::from([(
-        "linkedin_author".to_string(),
-        "urn:li:organization:1".to_string(),
-    )]);
+    let settings = BTreeMap::from([
+        (
+            "linkedin_author".to_string(),
+            "urn:li:organization:1".to_string(),
+        ),
+        ("email_from".to_string(), "news@example.com".to_string()),
+        ("email_to".to_string(), "announce@example.com".to_string()),
+    ]);
+    // The LinkedIn body fills in the approved text and the author setting.
+    let spec = m.named_tool("publish_post").unwrap();
     let body = super::manifest::render_body(spec.body.as_ref().unwrap(), &fields, &settings);
     assert_eq!(body["commentary"], "Body");
     assert_eq!(body["author"], "urn:li:organization:1");
-    // No customer names or brand content in the public example.
-    for (path, text) in pkg
-        .items
-        .iter()
-        .map(|i| (i.path.clone(), i.body.clone()))
-        .chain(std::iter::once((
-            "plugin.yaml".into(),
-            pkg.manifest_text.clone(),
-        )))
-    {
-        let lower = text.to_lowercase();
-        for word in ["acme", "@"] {
-            assert!(
-                !lower.contains(word) || word == "@" && !lower.contains(".com>"),
-                "{path} mentions {word}"
-            );
-        }
-    }
+    // The email body is the email service's own shape.
+    let spec = m.named_tool("send_email").unwrap();
+    let body = super::manifest::render_body(spec.body.as_ref().unwrap(), &fields, &settings);
+    assert_eq!(body["subject"], "Subject");
+    assert_eq!(body["content"][0]["value"], "Body");
+    assert_eq!(body["from"]["email"], "news@example.com");
+    assert_eq!(
+        body["personalizations"][0]["to"][0]["email"],
+        "announce@example.com"
+    );
 }
