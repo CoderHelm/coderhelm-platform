@@ -642,6 +642,44 @@ impl Runtime {
         Err(format!("{}: the server didn't answer.", s.name))
     }
 
+    /// Calls a tool for Coderhelm itself (a knowledge source reading through
+    /// a person's sign-in), not for an agent: the tool doesn't need to be on
+    /// the agents' allow list, so the caller must only ever name read-only
+    /// tools it knows. Signs with the owner's connection (renewed when about
+    /// to expire, and once more on a `401`), sends the token to this server's
+    /// own address only, and returns the whole result.
+    pub async fn read_tool(
+        &self,
+        s: &ServerRecord,
+        owner: &Owner,
+        tool: &RemoteTool,
+        args: &Value,
+    ) -> Result<Value, ConnError> {
+        let mut auth = self.auth_header(s, owner, false).await?;
+        for attempt in 0..2 {
+            let conn = Conn {
+                http: self.http.as_ref(),
+                url: &s.url,
+                auth: auth.clone(),
+                era: Self::era_of(s),
+            };
+            match conn.call_tool_result(tool, args).await {
+                Ok((out, era)) => {
+                    self.remember_era(s, era).await;
+                    return Ok(out);
+                }
+                Err(CallError::Unauthorized(_)) if attempt == 0 && s.auth == AuthKind::OAuth => {
+                    auth = self.auth_header(s, owner, true).await?;
+                }
+                Err(e @ (CallError::Unauthorized(_) | CallError::Forbidden(Some(_)))) => {
+                    return Err(self.refused(s, owner, &e).await)
+                }
+                Err(e) => return Err(ConnError::Temporary(e.to_string())),
+            }
+        }
+        Err(ConnError::Temporary("The server didn't answer.".into()))
+    }
+
     /// Starts a sign-in: makes sure Coderhelm has a client on the server's
     /// authorization server (metadata document, else dynamic registration),
     /// records the PKCE verifier and the expected issuer against a fresh
@@ -910,21 +948,14 @@ impl Runtime {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::super::http::fake::{json as fjson, resp, Fake};
-    use super::super::http::Method;
-    use super::super::store::fake::MemStore;
-    use super::super::store::{OAuthSettings, Sharing};
-    use super::*;
-    use serde_json::json;
-    use std::sync::atomic::{AtomicI64, Ordering};
+pub(crate) mod testing {
+    //! Test helpers for code that runs on a [`Runtime`] (here and in
+    //! `knowledge::sources`).
 
-    const MCP: &str = "https://mcp.example.com/mcp";
-    const TOKEN: &str = "https://auth.example.com/token";
-    const REVOKE: &str = "https://auth.example.com/revoke";
+    use super::*;
 
     /// Stands in for KMS: opening under any other context fails.
-    struct FakeKms;
+    pub struct FakeKms;
     fn key(c: &HashMap<String, String>) -> String {
         let mut v: Vec<_> = c.iter().map(|(k, v)| format!("{k}={v}")).collect();
         v.sort();
@@ -946,6 +977,63 @@ mod tests {
             Ok(b[at + 1..].iter().map(|x| x ^ 0x33).collect())
         }
     }
+
+    /// Saves a sign-in for `owner` on `server_id`, as a finished sign-in
+    /// would.
+    pub async fn sign_in(
+        rt: &Runtime,
+        server_id: &str,
+        owner: &Owner,
+        access: &str,
+        refresh: Option<&str>,
+        expires_at: Option<i64>,
+        by: &str,
+    ) {
+        let set = TokenSet {
+            access_token: access.into(),
+            refresh_token: refresh.map(str::to_string),
+            expires_at,
+            scope: String::new(),
+        };
+        let sealed = rt.seal_tokens(server_id, owner, &set).await.unwrap();
+        rt.store
+            .put_token(
+                &rt.team,
+                server_id,
+                &TokenRecord {
+                    owner: owner.clone(),
+                    sealed,
+                    expires_at,
+                    scope: String::new(),
+                    version: 1,
+                    status: Status::Connected,
+                    status_reason: String::new(),
+                    step_up: vec![],
+                    connected_by: by.into(),
+                    connected_at: String::new(),
+                },
+                None,
+            )
+            .await
+            .unwrap();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::http::fake::{json as fjson, resp, Fake};
+    use super::super::http::Method;
+    use super::super::store::fake::MemStore;
+    use super::super::store::{OAuthSettings, Sharing};
+    use super::*;
+    use serde_json::json;
+    use std::sync::atomic::{AtomicI64, Ordering};
+
+    const MCP: &str = "https://mcp.example.com/mcp";
+    const TOKEN: &str = "https://auth.example.com/token";
+    const REVOKE: &str = "https://auth.example.com/revoke";
+
+    use super::testing::FakeKms;
 
     struct Rig {
         rt: Runtime,
@@ -1717,5 +1805,68 @@ mod tests {
         assert!(detect(&p, "https://10.0.0.5/mcp").await.is_err());
         assert!(detect(&p, "http://mcp.example.com/mcp").await.is_err());
         assert!(p.sent().is_empty());
+    }
+
+    #[tokio::test]
+    async fn coderhelm_reads_a_tool_agents_arent_allowed_and_renews_first() {
+        let r = rig("TEAM#a");
+        let mut s = server();
+        s.allowed.clear();
+        s.approved.clear();
+        r.store.put_server("TEAM#a", &s).await.unwrap();
+        let me = Owner::user("ada@example.com");
+        connect(&r, &s, &me, tokens("at-1", Some(1_000_000 + 30))).await;
+        r.http.on(Method::Post, TOKEN, fjson(200, json!({"access_token": "at-2", "token_type": "Bearer", "expires_in": 3600, "refresh_token": "rt-2"})));
+        answer_tools(&r.http, "Bearer at-2");
+        let tool = s.tools[0].clone();
+        let out = r.rt.read_tool(&s, &me, &tool, &json!({})).await.unwrap();
+        assert_eq!(out["content"][0]["text"], "found");
+        // The token went to the server and the token endpoint only.
+        for sent in r.http.sent() {
+            if sent
+                .header_value("Authorization")
+                .is_some_and(|h| h.starts_with("Bearer"))
+            {
+                assert_eq!(sent.url, MCP);
+            }
+        }
+        // Not written to the agents' audit trail: nothing an agent did.
+        assert!(r
+            .store
+            .list_logs("TEAM#a", "docs", 10)
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_refused_renewal_means_signing_in_again() {
+        let r = rig("TEAM#a");
+        let s = server();
+        r.store.put_server("TEAM#a", &s).await.unwrap();
+        let me = Owner::user("ada@example.com");
+        connect(&r, &s, &me, tokens("at-1", Some(1_000_000 - 10))).await;
+        r.http.on(
+            Method::Post,
+            TOKEN,
+            fjson(
+                400,
+                json!({"error": "invalid_grant", "error_description": "Refresh token expired"}),
+            ),
+        );
+        let tool = s.tools[0].clone();
+        let e =
+            r.rt.read_tool(&s, &me, &tool, &json!({}))
+                .await
+                .unwrap_err();
+        assert!(matches!(e, ConnError::NeedsReconnect(_)), "{e:?}");
+        let rec = r
+            .store
+            .get_token("TEAM#a", "docs", &me)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(rec.status, Status::NeedsReconnect);
+        let _ = &r.now;
     }
 }

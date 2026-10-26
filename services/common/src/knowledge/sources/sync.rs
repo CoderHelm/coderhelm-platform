@@ -168,7 +168,7 @@ async fn finish(ctx: &Ctx<'_>, kb_id: &str, id: &str, ran: &Source, r: &Outcome)
         }
         Some(e) => {
             s.status = Status::Error;
-            s.error = Some(e.for_source(s.kind.unwrap_or(super::Kind::Web)));
+            s.error = Some(super::source_error(&s, e));
             s.next_sync_at = next_sync(&s, now, true);
         }
     }
@@ -190,11 +190,27 @@ pub async fn fail(
     err: &ConnectorError,
     now: i64,
 ) {
+    let Ok(Some(s)) = store.source(team, kb_id, id).await else {
+        return;
+    };
+    let error = super::source_error(&s, err);
+    fail_with(store, team, kb_id, id, error, now).await;
+}
+
+/// [`fail`] with the error already worded.
+pub async fn fail_with(
+    store: &dyn SyncStore,
+    team: &str,
+    kb_id: &str,
+    id: &str,
+    error: super::SourceError,
+    now: i64,
+) {
     let Ok(Some(mut s)) = store.source(team, kb_id, id).await else {
         return;
     };
     s.status = Status::Error;
-    s.error = Some(err.for_source(s.kind.unwrap_or(super::Kind::Web)));
+    s.error = Some(error);
     s.progress = None;
     s.last_sync_at = rfc3339(now);
     s.next_sync_at = next_sync(&s, now, true);

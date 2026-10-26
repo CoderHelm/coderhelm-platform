@@ -552,6 +552,18 @@ impl Conn<'_> {
         tool: &RemoteTool,
         args: &Value,
     ) -> Result<(ToolOutput, Era), CallError> {
+        let (result, era) = self.call_tool_result(tool, args).await?;
+        Ok((output_of(&result), era))
+    }
+
+    /// Calls one tool and returns its whole result (content, any
+    /// `structuredContent`, `isError`), for callers that read data rather
+    /// than hand text to a model.
+    pub async fn call_tool_result(
+        &self,
+        tool: &RemoteTool,
+        args: &Value,
+    ) -> Result<(Value, Era), CallError> {
         let mut extra = vec![("Mcp-Name".to_string(), header_value(&tool.name))];
         extra.extend(param_headers(&tool.input_schema, args));
         let args = if args.is_object() {
@@ -579,7 +591,7 @@ impl Conn<'_> {
                 )))
             }
         }
-        Ok((output_of(&result), era))
+        Ok((result, era))
     }
 }
 

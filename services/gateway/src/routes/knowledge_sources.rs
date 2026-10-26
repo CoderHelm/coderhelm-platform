@@ -9,7 +9,11 @@
 //! source app. The page says so when a source is added.
 //!
 //! Sign-ins reuse the remote MCP OAuth flow and its callback page; tokens
-//! are sealed per team by KMS and never reach the browser. Syncs run in the
+//! are sealed per team by KMS and never reach the browser. Sanity also
+//! syncs through a member's own Sanity sign-in on its remote MCP server
+//! (the one Connected apps uses): the source records whose sign-in it reads
+//! with, the page says so, and when that sign-in stops working any admin
+//! can sign in again from the source. Syncs run in the
 //! worker; this module only starts them (asynchronously) and shows their
 //! state. Providers' change events arrive at `/webhooks/knowledge/<token>`.
 
@@ -23,10 +27,11 @@ use axum::{
     Extension, Json,
 };
 use common::knowledge::sources::{
-    self as ks, clean_selection, connect, hook_pk, oauth, sanity, shown_status, store, webhook,
-    Kind, Selected, Source, Status, MAX_SOURCES_PER_BASE,
+    self as ks, clean_selection, connect, hook_pk, oauth, sanity, sanity_mcp, shown_status, store,
+    webhook, Connector, Kind, Selected, Source, Status, MAX_SOURCES_PER_BASE,
 };
 use common::knowledge::{self as kb, FileMeta};
+use common::mcp_remote::store::Owner;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use tracing::{error, info, warn};
@@ -172,6 +177,12 @@ pub fn source_json(s: &Source, now: i64) -> Value {
         "live_updates": s.webhook,
         "created_at": s.created_at,
         "created_by": s.created_by,
+        "connection": if s.signin.is_some() { "sign_in" } else { "" },
+        "signin": s.signin.as_ref().map(|si| json!({
+            "name": si.who(),
+            "email": si.email,
+            "account": si.account,
+        })),
     })
 }
 
@@ -240,7 +251,20 @@ pub async fn connectors(
     let env = env(&state, &claims.team_id, None).await;
     let mut out = Vec::new();
     for kind in Kind::ALL {
-        let st = connect::status(&env, kind, app(&state, kind).is_set()).await;
+        let st = connect::status(&env, kind, app(&state, kind).is_set(), &claims.email).await;
+        // "Connected as": the provider account of this person's sign-in.
+        let account = if st.signed_in {
+            match connect::find_signin(&env.runtime(), kind, &claims.email).await {
+                Ok(Some(si)) if kind == Kind::Sanity => {
+                    connect::sanity_signin(env.runtime(), si.server, si.owner)
+                        .account()
+                        .await
+                }
+                _ => String::new(),
+            }
+        } else {
+            String::new()
+        };
         out.push(json!({
             "kind": kind.key(),
             "label": kind.label(),
@@ -251,6 +275,10 @@ pub async fn connectors(
             "reconnect_reason": st.reconnect_reason,
             "connected_by": st.connected_by,
             "hint": st.hint,
+            "member_sign_in": st.member_sign_in,
+            "signed_in": st.signed_in,
+            "signed_in_as": if account.is_empty() { claims.email.clone() } else { account },
+            "has_saved_key": st.has_saved_key,
             "live_updates": kind.has_webhooks(),
             "picker": if kind == Kind::Web { "address" } else { "tree" },
         }));
@@ -321,6 +349,122 @@ pub async fn connect(
     Ok(Json(json!({ "authorize_url": url })))
 }
 
+/// Starts `claims`' own sign-in to `kind` through its remote MCP server, on
+/// the team's Connected apps entry for it when that signs each person in,
+/// else on Knowledge's own record. Returns where to send the browser (a
+/// popup; the shared callback page tells the page that opened it).
+async fn start_member_signin(
+    state: &AppState,
+    claims: &Claims,
+    kind: Kind,
+) -> Result<String, (StatusCode, Json<Value>)> {
+    let rt = super::mcp_servers::runtime(state, &claims.team_id);
+    let mut rec = connect::signin_target(&rt, kind)
+        .await
+        .map_err(|e| fail(StatusCode::BAD_GATEWAY, &e))?;
+    let url = rt
+        .start_sign_in(
+            &mut rec,
+            &Owner::user(&claims.email),
+            &claims.sub,
+            &claims.email,
+            &super::mcp_servers::redirect_uri(&state.config.stage),
+            super::mcp_servers::metadata_document_url(&state.config.stage).as_deref(),
+        )
+        .await
+        .map_err(|e| fail(StatusCode::BAD_REQUEST, &e))?;
+    info!(team = %claims.team_id, kind = kind.key(), server = %rec.id, "Knowledge member sign-in started");
+    Ok(url)
+}
+
+/// POST /api/knowledge/connectors/:kind/signin — sign in with your own
+/// account for the provider (Sanity), with nothing for an admin to set up.
+/// Answers `signed_in` when you already are, else where to send a popup.
+pub async fn signin(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<Claims>,
+    Path(kind): Path<String>,
+) -> Reply {
+    claims.require_role(3).map_err(forbidden)?;
+    let kind = kind_of(&kind)?;
+    if connect::signin_url(kind).is_none() {
+        return Err(fail(
+            StatusCode::BAD_REQUEST,
+            "This kind of source doesn't sign in this way.",
+        ));
+    }
+    let rt = super::mcp_servers::runtime(&state, &claims.team_id);
+    if connect::find_signin(&rt, kind, &claims.email)
+        .await
+        .map_err(|e| connector_fail(kind, &e))?
+        .is_some()
+    {
+        return Ok(Json(json!({ "signed_in": true })));
+    }
+    let url = start_member_signin(&state, &claims, kind).await?;
+    Ok(Json(json!({ "signed_in": false, "authorize_url": url })))
+}
+
+/// This person's working sign-in for `kind`, or the error that asks them
+/// to sign in.
+async fn member_signin(
+    state: &AppState,
+    claims: &Claims,
+    kind: Kind,
+) -> Result<connect::SignedIn, (StatusCode, Json<Value>)> {
+    let rt = super::mcp_servers::runtime(state, &claims.team_id);
+    connect::find_signin(&rt, kind, &claims.email)
+        .await
+        .map_err(|e| connector_fail(kind, &e))?
+        .ok_or_else(|| {
+            (
+                StatusCode::CONFLICT,
+                Json(json!({
+                    "error": format!("You aren't signed in to {} yet.", kind.label()),
+                    "fix": format!("Sign in with {} to continue.", kind.label()),
+                    "action": "sign_in",
+                })),
+            )
+        })
+}
+
+/// The member's name from the team's records (empty when there is none).
+async fn member_name(state: &AppState, team: &str, sub: &str) -> String {
+    state
+        .dynamo
+        .get_item()
+        .table_name(&state.config.users_table_name)
+        .key("pk", AttributeValue::S(team.to_string()))
+        .key("sk", AttributeValue::S(sub.to_string()))
+        .send()
+        .await
+        .ok()
+        .and_then(|r| {
+            r.item()
+                .and_then(|i| i.get("name"))
+                .and_then(|v| v.as_s().ok())
+                .cloned()
+        })
+        .unwrap_or_default()
+}
+
+/// What a new or re-pointed source records about the sign-in it uses.
+async fn signin_for_source(
+    state: &AppState,
+    claims: &Claims,
+    si: &connect::SignedIn,
+) -> ks::SignIn {
+    let account = connect::sanity_signin(
+        super::mcp_servers::runtime(state, &claims.team_id),
+        si.server.clone(),
+        si.owner.clone(),
+    )
+    .account()
+    .await;
+    let name = member_name(state, &claims.team_id, &claims.sub).await;
+    si.signin(&claims.email, &name, &account)
+}
+
 /// DELETE /api/knowledge/connectors/:kind — sign out (and revoke where the
 /// provider allows). Sources that used it show "Reconnect".
 pub async fn disconnect(
@@ -353,6 +497,9 @@ pub struct BrowseQuery {
     pub parent: Option<String>,
     #[serde(default)]
     pub q: String,
+    /// `sign_in`: browse with your own sign-in (Sanity), not the team's key.
+    #[serde(default)]
+    pub via: String,
 }
 
 /// GET /api/knowledge/connectors/:kind/browse?parent=&q= — one level of the
@@ -365,15 +512,31 @@ pub async fn browse(
 ) -> Reply {
     claims.require_role(3).map_err(forbidden)?;
     let kind = kind_of(&kind)?;
-    let env = env(&state, &claims.team_id, Some(kind)).await;
-    let opened = connect::open(&env, kind, &json!({}))
-        .await
-        .map_err(|e| connector_fail(kind, &e))?;
     let query = common::truncate_str(q.q.trim(), 200);
     let parent = q
         .parent
         .as_deref()
         .filter(|p| !p.is_empty() && p.len() <= 2_000);
+    if q.via == "sign_in" && kind == Kind::Sanity {
+        let si = member_signin(&state, &claims, kind).await?;
+        let c = connect::sanity_signin(
+            super::mcp_servers::runtime(&state, &claims.team_id),
+            si.server,
+            si.owner,
+        );
+        let nodes = c
+            .browse(parent, query)
+            .await
+            .map_err(|e| connector_fail(kind, &e))?;
+        return Ok(Json(json!({
+            "nodes": nodes.into_iter().take(500).collect::<Vec<_>>(),
+            "options": {},
+        })));
+    }
+    let env = env(&state, &claims.team_id, Some(kind)).await;
+    let opened = connect::open(&env, kind, &json!({}))
+        .await
+        .map_err(|e| connector_fail(kind, &e))?;
     let nodes = opened
         .connector
         .browse(parent, query)
@@ -414,6 +577,10 @@ pub struct SourceInput {
     pub options: Option<Value>,
     #[serde(default)]
     pub paused: Option<bool>,
+    /// `sign_in`: read through the adding member's own sign-in (Sanity)
+    /// instead of the team's saved key.
+    #[serde(default)]
+    pub via: Option<String>,
 }
 
 /// The name a source gets when none is given: what was picked.
@@ -497,6 +664,9 @@ pub(crate) async fn add_source(
     }
     let mut options = clean_options(kind, input.options.as_ref().unwrap_or(&Value::Null))
         .map_err(|m| fail(StatusCode::BAD_REQUEST, &m))?;
+    if input.via.as_deref() == Some("sign_in") {
+        return add_signin_source(state, claims, kb_id, kind, selection, options, input).await;
+    }
     // Opening it checks the connection works before anything is saved, and
     // settles which site or project it reads.
     let env = env(state, &claims.team_id, Some(kind)).await;
@@ -614,6 +784,80 @@ pub(crate) async fn add_source(
     }))
 }
 
+/// Creates a source read through the adding member's own sign-in (Sanity's
+/// remote MCP server). There is no webhook through a sign-in: it syncs on a
+/// schedule, each time asking only for what changed.
+async fn add_signin_source(
+    state: &AppState,
+    claims: &Claims,
+    kb_id: &str,
+    kind: Kind,
+    selection: Vec<Selected>,
+    mut options: Value,
+    input: &SourceInput,
+) -> Result<Value, (StatusCode, Json<Value>)> {
+    if kind != Kind::Sanity {
+        return Err(fail(
+            StatusCode::BAD_REQUEST,
+            &format!("{} doesn't sync through a sign-in like this.", kind.label()),
+        ));
+    }
+    let probe = Source {
+        selection: selection.clone(),
+        ..Default::default()
+    };
+    let project =
+        sanity_mcp::selection_project(&probe).map_err(|m| fail(StatusCode::BAD_REQUEST, &m))?;
+    let si = member_signin(state, claims, kind).await?;
+    // Checks the sign-in can read the project before anything is saved.
+    connect::sanity_signin(
+        super::mcp_servers::runtime(state, &claims.team_id),
+        si.server.clone(),
+        si.owner.clone(),
+    )
+    .datasets(&project)
+    .await
+    .map_err(|e| connector_fail(kind, &e))?;
+    options["project_id"] = json!(project);
+    let name = input
+        .name
+        .as_deref()
+        .map(str::trim)
+        .filter(|n| !n.is_empty())
+        .map(|n| common::truncate_str(n, 80).to_string())
+        .unwrap_or_else(|| suggested_name(kind, &selection));
+    let src = Source {
+        id: kb::new_id(),
+        kb_id: kb_id.to_string(),
+        kind: Some(kind),
+        name,
+        selection,
+        options,
+        created_at: now(),
+        created_by: claims.email.clone(),
+        next_sync_at: now_secs(),
+        signin: Some(signin_for_source(state, claims, &si).await),
+        ..Default::default()
+    };
+    use common::knowledge::sources::store::SyncStore;
+    let st = sync_store(state);
+    st.put_source(&claims.team_id, &src)
+        .await
+        .map_err(|e| internal("create knowledge source", e))?;
+    st.put_registry(&claims.team_id, &src)
+        .await
+        .map_err(|e| internal("register knowledge source", e))?;
+    if let Err(e) = start_sync(state, &claims.team_id, kb_id, &src.id).await {
+        warn!(error = %e, "First knowledge sync not started; the sweep starts it");
+    }
+    info!(team = %claims.team_id, kb = %kb_id, source = %src.id, kind = kind.key(), "Knowledge source added through a sign-in");
+    Ok(json!({
+        "source": source_json(&src, now_secs()),
+        "setup": Value::Null,
+        "visibility_note": VISIBILITY_NOTE,
+    }))
+}
+
 /// The dataset and picked types of a Sanity selection.
 fn sanity_scope(sel: &[Selected]) -> (String, Vec<String>) {
     let mut dataset = String::new();
@@ -686,6 +930,11 @@ pub async fn update_source(
     }
     if let Some(sel) = &input.selection {
         src.selection = clean_selection(sel).map_err(|m| fail(StatusCode::BAD_REQUEST, &m))?;
+        if src.signin.is_some() {
+            let project = sanity_mcp::selection_project(&src)
+                .map_err(|m| fail(StatusCode::BAD_REQUEST, &m))?;
+            src.options["project_id"] = json!(project);
+        }
         resync = true;
     }
     if let Some(o) = &input.options {
@@ -732,6 +981,62 @@ pub async fn update_source(
             warn!(error = %e, "Knowledge sync not started");
         }
     }
+    Ok(Json(json!({ "source": source_json(&src, now_secs()) })))
+}
+
+/// POST /api/knowledge/:kb_id/sources/:source_id/signin — "Sign in again":
+/// any admin points a sign-in source at their own sign-in (when the one it
+/// used stopped working, or its member left). Already signed in: the source
+/// switches to their sign-in and syncs now. Not yet: answers where to send a
+/// popup; the page calls this again once it closes.
+pub async fn source_signin(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<Claims>,
+    Path((kb_id, source_id)): Path<(String, String)>,
+) -> Reply {
+    claims.require_role(3).map_err(forbidden)?;
+    let mut src = load_source(&state, &claims.team_id, &kb_id, &source_id).await?;
+    let kind = src
+        .kind
+        .filter(|k| connect::signin_url(*k).is_some())
+        .ok_or_else(|| {
+            fail(
+                StatusCode::BAD_REQUEST,
+                "This source doesn't sync through a sign-in.",
+            )
+        })?;
+    if src.signin.is_none() {
+        return Err(fail(
+            StatusCode::BAD_REQUEST,
+            "This source uses the team's API token, not a sign-in.",
+        ));
+    }
+    let rt = super::mcp_servers::runtime(&state, &claims.team_id);
+    let Some(si) = connect::find_signin(&rt, kind, &claims.email)
+        .await
+        .map_err(|e| connector_fail(kind, &e))?
+    else {
+        let url = start_member_signin(&state, &claims, kind).await?;
+        return Ok(Json(json!({ "authorize_url": url })));
+    };
+    src.signin = Some(signin_for_source(&state, &claims, &si).await);
+    if src.status == Status::Error {
+        src.status = Status::Queued;
+        src.error = None;
+    }
+    src.next_sync_at = now_secs();
+    use common::knowledge::sources::store::SyncStore;
+    let st = sync_store(&state);
+    st.put_source(&claims.team_id, &src)
+        .await
+        .map_err(|e| internal("update knowledge source", e))?;
+    st.put_registry(&claims.team_id, &src)
+        .await
+        .map_err(|e| internal("register knowledge source", e))?;
+    if let Err(e) = start_sync(&state, &claims.team_id, &kb_id, &source_id).await {
+        warn!(error = %e, "Knowledge sync not started after signing in again");
+    }
+    info!(team = %claims.team_id, kb = %kb_id, source = %source_id, "Knowledge source signed in again");
     Ok(Json(json!({ "source": source_json(&src, now_secs()) })))
 }
 
@@ -1093,6 +1398,38 @@ mod tests {
         assert!(v["options"].get("sanity_hook_id").is_none());
         assert_eq!(v["next_sync_at"], "");
         assert_eq!(v["kind"], "sanity");
+    }
+
+    #[test]
+    fn a_sign_in_source_says_whose_sign_in_it_uses_and_nothing_secret() {
+        let s = Source {
+            id: "s".into(),
+            kind: Some(Kind::Sanity),
+            signin: Some(ks::SignIn {
+                server_id: "ks-sanity".into(),
+                owner: "user#ada@example.com".into(),
+                email: "ada@example.com".into(),
+                name: "Ada".into(),
+                account: "Ada L".into(),
+                alerted_at: String::new(),
+            }),
+            ..Default::default()
+        };
+        let v = source_json(&s, 0);
+        assert_eq!(v["connection"], "sign_in");
+        assert_eq!(v["signin"]["name"], "Ada");
+        assert_eq!(v["signin"]["account"], "Ada L");
+        assert!(v["signin"].get("owner").is_none() && v["signin"].get("server_id").is_none());
+        // Options can never name a sign-in.
+        let o = clean_options(
+            Kind::Sanity,
+            &json!({"signin": {"owner": "user#bo@example.com"}}),
+        )
+        .unwrap();
+        assert_eq!(o, json!({}));
+        let plain = source_json(&Source::default(), 0);
+        assert_eq!(plain["connection"], "");
+        assert!(plain["signin"].is_null());
     }
 
     #[test]
