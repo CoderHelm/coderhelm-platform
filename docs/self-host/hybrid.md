@@ -29,6 +29,8 @@ Your code, runs, plans, reviews, memory, knowledge and secrets stay in your AWS 
 
 CoderHelm never stores your code, never sees your model calls or your AWS credentials, and can't sign in to your install.
 
+The install guide page itself (docs.coderhelm.com) counts anonymous page views with Google Analytics: the page's address without anything after `?` or `#`, the step reached by name, and the host of a link you open. Nothing you type, including the name you check, and nothing about your install is sent to Google. Your install sends nothing to Google Analytics.
+
 How the pieces are protected:
 
 - **Registration.** Your install registers once and gets an id, a secret and a relay key. Both keys are derived from a key on CoderHelm's side, so CoderHelm stores no copy of them; your install keeps them in its own Secrets Manager secret.
