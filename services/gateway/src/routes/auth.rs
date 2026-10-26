@@ -958,33 +958,11 @@ async fn github_callback_inner(
         )
     })?;
 
-    // Fetch user's app installations to find team
-    let installs_resp = client
-        .get("https://api.github.com/user/installations")
-        .header("Authorization", format!("Bearer {access_token}"))
-        .header("User-Agent", "Coderhelm")
-        .send()
+    // The installations of our app this GitHub user can access, as GitHub
+    // reports them for the user's own token.
+    let all_installations = user_app_installations(state, access_token)
         .await
         .map_err(|e| SignInFailure::new(P, Reason::Provider, "installations", e))?;
-
-    let installs: serde_json::Value = installs_resp
-        .json()
-        .await
-        .map_err(|e| SignInFailure::new(P, Reason::Provider, "installations", e))?;
-
-    let our_app_id: u64 = state.secrets.github_app_id.parse().unwrap_or(0);
-
-    let all_installations: Vec<(u64, String)> = installs["installations"]
-        .as_array()
-        .unwrap_or(&vec![])
-        .iter()
-        .filter(|i| i["app_id"].as_u64() == Some(our_app_id))
-        .filter_map(|i| {
-            let id = i["id"].as_u64()?;
-            let org = i["account"]["login"].as_str().unwrap_or("unknown");
-            Some((id, org.to_string()))
-        })
-        .collect();
 
     // Check if user already has a session (connecting GitHub to existing account)
     let existing_claims = extract_cookie(cookie_header(headers), "__Host-coderhelm_session")
@@ -1013,8 +991,25 @@ async fn github_callback_inner(
             .send()
             .await;
 
-        // Link GitHub installations to the user's team in both tables
-        for (inst_id, org) in &all_installations {
+        // Link GitHub installations to the user's team in both tables. This
+        // is the one verified way an installation joins a team: GitHub just
+        // confirmed, with this user's own token, that they can access it.
+        // Linking changes the whole team, so it takes an admin, as it does
+        // in the dashboard.
+        let may_link_for_team = may_link_for_role(&claims.role);
+        if !may_link_for_team && !all_installations.is_empty() {
+            info!(
+                team_id = %claims.team_id,
+                role = %claims.role,
+                "GitHub connected by a non-admin — installations are not linked to the team"
+            );
+        }
+        let linkable: &[(u64, String)] = if may_link_for_team {
+            &all_installations
+        } else {
+            &[]
+        };
+        for (inst_id, org) in linkable {
             let owner = super::github_webhook::resolve_team_by_installation(state, *inst_id).await;
             if !may_link_installation(owner.as_deref(), &claims.team_id) {
                 warn!(
@@ -1498,6 +1493,49 @@ fn github_signin_update(
         names: (!names.is_empty()).then_some(names),
         values,
     }
+}
+
+/// Only a team's owner or admin may link a GitHub installation to it.
+pub(crate) fn may_link_for_role(role: &str) -> bool {
+    matches!(role, "owner" | "admin")
+}
+
+/// The installations of our GitHub App that the holder of `access_token` (a
+/// user's own OAuth token) can access: GitHub's `GET /user/installations`,
+/// kept to our app. This is the proof that a person may link an installation.
+pub(crate) async fn user_app_installations(
+    state: &AppState,
+    access_token: &str,
+) -> Result<Vec<(u64, String)>, reqwest::Error> {
+    let installs: serde_json::Value = state
+        .http
+        .get("https://api.github.com/user/installations")
+        .header("Authorization", format!("Bearer {access_token}"))
+        .header("User-Agent", "Coderhelm")
+        .send()
+        .await?
+        .json()
+        .await?;
+
+    let our_app_id: u64 = state.secrets.github_app_id.parse().unwrap_or(0);
+    Ok(our_installations(&installs, our_app_id))
+}
+
+/// Our app's installations in a `GET /user/installations` response, as
+/// (installation id, account login).
+fn our_installations(installs: &serde_json::Value, our_app_id: u64) -> Vec<(u64, String)> {
+    installs["installations"]
+        .as_array()
+        .map(|a| a.as_slice())
+        .unwrap_or_default()
+        .iter()
+        .filter(|i| our_app_id != 0 && i["app_id"].as_u64() == Some(our_app_id))
+        .filter_map(|i| {
+            let id = i["id"].as_u64()?;
+            let org = i["account"]["login"].as_str().unwrap_or("unknown");
+            Some((id, org.to_string()))
+        })
+        .collect()
 }
 
 /// A team may link an installation only when no other team owns it.
@@ -2076,6 +2114,32 @@ mod installation_link_tests {
         assert!(may_link_installation(None, "TEAM#a"));
         assert!(may_link_installation(Some("TEAM#a"), "TEAM#a"));
         assert!(!may_link_installation(Some("TEAM#b"), "TEAM#a"));
+    }
+
+    #[test]
+    fn only_owners_and_admins_link_installations() {
+        assert!(may_link_for_role("owner"));
+        assert!(may_link_for_role("admin"));
+        for role in ["member", "billing", "", "Owner"] {
+            assert!(!may_link_for_role(role), "{role}");
+        }
+    }
+
+    #[test]
+    fn user_installations_are_kept_to_our_app() {
+        let installs = serde_json::json!({"installations": [
+            {"id": 11, "app_id": 5, "account": {"login": "acme"}},
+            {"id": 12, "app_id": 6, "account": {"login": "acme"}},
+            {"id": 13, "app_id": 5, "account": {}},
+            {"app_id": 5, "account": {"login": "no-id"}},
+        ]});
+        assert_eq!(
+            our_installations(&installs, 5),
+            vec![(11, "acme".to_string()), (13, "unknown".to_string())]
+        );
+        // An app id that failed to parse (0) matches nothing.
+        assert!(our_installations(&installs, 0).is_empty());
+        assert!(our_installations(&serde_json::json!({}), 5).is_empty());
     }
 
     #[test]

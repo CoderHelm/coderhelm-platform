@@ -83,6 +83,7 @@ pub const GLOBAL_MESSAGE_TYPES: &[&str] = &[
     "log_autofix",
     "agent_resume_sweep",
     "knowledge_sync_sweep",
+    "plugin_sweep",
 ];
 
 /// The DLQ keeps a message this long, counted from when it was first sent

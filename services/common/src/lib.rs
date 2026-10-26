@@ -90,6 +90,8 @@ pub mod run_status;
 pub mod skill_apply;
 pub mod skill_compat;
 pub mod skills;
+/// Who may ask CoderHelm for work from a GitHub comment or review.
+pub mod standing;
 /// A ticket's comments as CoderHelm read them, and whether its work is done.
 pub mod ticket_state;
 /// A team's monthly token limits: new tokens, cache read, cache write.

@@ -201,6 +201,24 @@ test("optional parts can be turned off", () => {
   t["coderhelm-prod-api"].hasResourceProperties("AWS::Events::Rule", { Name: "coderhelm-prod-weekly-summary", State: "DISABLED" });
 });
 
+test("the sandbox build role has no S3 access: builds use the URLs the worker signs", () => {
+  const t = synth(selfHost())["coderhelm-prod-worker"];
+  const projects = t.findResources("AWS::CodeBuild::Project");
+  assert.equal(Object.keys(projects).length, 1);
+  const role = JSON.stringify(Object.values(projects)[0].Properties.ServiceRole);
+  const roleId = role.match(/"Fn::GetAtt":\["([^"]+)"/)?.[1];
+  assert.ok(roleId, role);
+  for (const [id, pol] of Object.entries(t.findResources("AWS::IAM::Policy"))) {
+    if (!JSON.stringify(pol.Properties.Roles ?? []).includes(roleId!)) continue;
+    const actions = JSON.stringify(pol.Properties.PolicyDocument.Statement.map((st: { Action: unknown }) => st.Action));
+    assert.ok(!/s3:/i.test(actions), `${id} gives the sandbox build role S3 actions: ${actions}`);
+  }
+  // The buildspec fetches and uploads through presigned URLs, never the CLI.
+  const spec = JSON.stringify(Object.values(projects)[0].Properties.Source);
+  assert.ok(spec.includes("SANDBOX_GET_URL") && spec.includes("SANDBOX_PUT_URL"), spec);
+  assert.ok(!spec.includes("aws s3 cp"), spec);
+});
+
 test("a dashboard build is uploaded with the runtime config", () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "chdash-"));
   fs.writeFileSync(path.join(dir, "index.html"), "<html></html>");
