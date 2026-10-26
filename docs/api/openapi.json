@@ -7971,7 +7971,7 @@
                       "log_group": "/aws/lambda/invoice-worker",
                       "severity": "critical",
                       "title": "Unhandled TimeoutError in the invoice worker",
-                      "url": "https://app.coderhelm.com/logs/?finding=01JBFIND6W3X8Y1Z4A7B0C2D5E"
+                      "url": "https://coderhelm.example.com/logs/?finding=01JBFIND6W3X8Y1Z4A7B0C2D5E"
                     },
                     "id": "evt_01JBEVNT8M1N4P7Q0R3S6T9V2W",
                     "team_id": "TEAM#7c1f0e2a",
@@ -8133,7 +8133,7 @@
                       "resolved_at": "2026-10-27T06:00:12.000Z",
                       "severity": "critical",
                       "title": "Unhandled TimeoutError in the invoice worker",
-                      "url": "https://app.coderhelm.com/logs/?finding=01JBFIND6W3X8Y1Z4A7B0C2D5E"
+                      "url": "https://coderhelm.example.com/logs/?finding=01JBFIND6W3X8Y1Z4A7B0C2D5E"
                     },
                     "id": "evt_01JBEVNT8M1N4P7Q0R3S6T9V2W",
                     "team_id": "TEAM#7c1f0e2a",
@@ -8292,7 +8292,7 @@
                       "plan_id": "01JBPLAN2F5G8H1J4K7L0M3N6P",
                       "task_count": 4,
                       "title": "Move exports to the background queue",
-                      "url": "https://app.coderhelm.com/plans/detail/?id=01JBPLAN2F5G8H1J4K7L0M3N6P"
+                      "url": "https://coderhelm.example.com/plans/detail/?id=01JBPLAN2F5G8H1J4K7L0M3N6P"
                     },
                     "id": "evt_01JBEVNT8M1N4P7Q0R3S6T9V2W",
                     "team_id": "TEAM#7c1f0e2a",
@@ -8923,7 +8923,7 @@
                       "repo": "example-org/web",
                       "risk": "medium",
                       "trigger": "opened",
-                      "url": "https://app.coderhelm.com/reviewer/?repo=example-org%2Fweb&pr=902",
+                      "url": "https://coderhelm.example.com/reviewer/?repo=example-org%2Fweb&pr=902",
                       "verdict": "request_changes"
                     },
                     "id": "evt_01JBEVNT8M1N4P7Q0R3S6T9V2W",
@@ -9111,7 +9111,7 @@
                       "ticket_id": "ENG-142",
                       "title": "Add rate limiting to the export endpoint",
                       "updated_at": "2026-10-26T14:31:47.000Z",
-                      "url": "https://app.coderhelm.com/runs/detail/?id=01JBRUN7Q2X9M3V6T8W1K4HZ5C"
+                      "url": "https://coderhelm.example.com/runs/detail/?id=01JBRUN7Q2X9M3V6T8W1K4HZ5C"
                     },
                     "id": "evt_01JBEVNT8M1N4P7Q0R3S6T9V2W",
                     "team_id": "TEAM#7c1f0e2a",
@@ -9333,7 +9333,7 @@
                       "ticket_id": "ENG-142",
                       "title": "Add rate limiting to the export endpoint",
                       "updated_at": "2026-10-26T14:31:47.000Z",
-                      "url": "https://app.coderhelm.com/runs/detail/?id=01JBRUN7Q2X9M3V6T8W1K4HZ5C"
+                      "url": "https://coderhelm.example.com/runs/detail/?id=01JBRUN7Q2X9M3V6T8W1K4HZ5C"
                     },
                     "id": "evt_01JBEVNT8M1N4P7Q0R3S6T9V2W",
                     "team_id": "TEAM#7c1f0e2a",
@@ -9555,7 +9555,7 @@
                       "ticket_id": "ENG-142",
                       "title": "Add rate limiting to the export endpoint",
                       "updated_at": "2026-10-26T14:31:47.000Z",
-                      "url": "https://app.coderhelm.com/runs/detail/?id=01JBRUN7Q2X9M3V6T8W1K4HZ5C"
+                      "url": "https://coderhelm.example.com/runs/detail/?id=01JBRUN7Q2X9M3V6T8W1K4HZ5C"
                     },
                     "id": "evt_01JBEVNT8M1N4P7Q0R3S6T9V2W",
                     "team_id": "TEAM#7c1f0e2a",
@@ -9777,7 +9777,7 @@
                       "ticket_id": "ENG-142",
                       "title": "Add rate limiting to the export endpoint",
                       "updated_at": "2026-10-26T14:31:47.000Z",
-                      "url": "https://app.coderhelm.com/runs/detail/?id=01JBRUN7Q2X9M3V6T8W1K4HZ5C"
+                      "url": "https://coderhelm.example.com/runs/detail/?id=01JBRUN7Q2X9M3V6T8W1K4HZ5C"
                     },
                     "id": "evt_01JBEVNT8M1N4P7Q0R3S6T9V2W",
                     "team_id": "TEAM#7c1f0e2a",

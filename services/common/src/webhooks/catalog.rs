@@ -478,7 +478,7 @@ fn run_example(status: &str, pr: bool, error: Option<&str>) -> Value {
         "pr_url": if pr { json!("https://github.com/example-org/api/pull/318") } else { Value::Null },
         "branch": if pr { json!("coderhelm/eng-142-rate-limit-export") } else { Value::Null },
         "error": error,
-        "url": format!("https://app.coderhelm.com/runs/detail/?id={EXAMPLE_RUN_ID}"),
+        "url": format!("https://coderhelm.example.com/runs/detail/?id={EXAMPLE_RUN_ID}"),
         "created_at": "2026-10-26T14:02:11.000Z",
         "updated_at": "2026-10-26T14:31:47.000Z",
     })
@@ -518,7 +518,7 @@ pub fn example_data(name: &str) -> Value {
             "posted_as": "request_changes",
             "risk": "medium",
             "trigger": "opened",
-            "url": "https://app.coderhelm.com/reviewer/?repo=example-org%2Fweb&pr=902",
+            "url": "https://coderhelm.example.com/reviewer/?repo=example-org%2Fweb&pr=902",
         }),
         "ci_fix.started" => json!({
             "run_id": EXAMPLE_RUN_ID,
@@ -553,7 +553,7 @@ pub fn example_data(name: &str) -> Value {
             "title": "Unhandled TimeoutError in the invoice worker",
             "severity": "critical",
             "log_group": "/aws/lambda/invoice-worker",
-            "url": "https://app.coderhelm.com/logs/?finding=01JBFIND6W3X8Y1Z4A7B0C2D5E",
+            "url": "https://coderhelm.example.com/logs/?finding=01JBFIND6W3X8Y1Z4A7B0C2D5E",
         }),
         "log_finding.resolved" => json!({
             "finding_id": "01JBFIND6W3X8Y1Z4A7B0C2D5E",
@@ -561,7 +561,7 @@ pub fn example_data(name: &str) -> Value {
             "title": "Unhandled TimeoutError in the invoice worker",
             "severity": "critical",
             "resolved_at": "2026-10-27T06:00:12.000Z",
-            "url": "https://app.coderhelm.com/logs/?finding=01JBFIND6W3X8Y1Z4A7B0C2D5E",
+            "url": "https://coderhelm.example.com/logs/?finding=01JBFIND6W3X8Y1Z4A7B0C2D5E",
         }),
         "release_notes.published" => json!({
             "repo": "example-org/api",
@@ -575,7 +575,7 @@ pub fn example_data(name: &str) -> Value {
             "title": "Move exports to the background queue",
             "task_count": 4,
             "approved_by": "lead@example.com",
-            "url": "https://app.coderhelm.com/plans/detail/?id=01JBPLAN2F5G8H1J4K7L0M3N6P",
+            "url": "https://coderhelm.example.com/plans/detail/?id=01JBPLAN2F5G8H1J4K7L0M3N6P",
         }),
         "plugin.run.completed" => json!({
             "run_id": "01JBPRUN9Q2R5S8T1U4V7W0X3Y",
