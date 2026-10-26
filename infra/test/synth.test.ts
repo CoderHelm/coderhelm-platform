@@ -577,3 +577,47 @@ test("the release check reads models.json only after the signature check, and ca
   assert.ok(!actions.some((a) => /sts:|secretsmanager:|ssm:|cloudformation:|bedrock:/.test(a)));
   assert.equal(envOf(u, "coderhelm-prod-updater").RELEASE_CHECK_PROJECT_NAME, "coderhelm-prod-release-check");
 });
+
+test("sign-in: self-host checks every new account in Cognito (pre-sign-up trigger); MFA stays optional with authenticator apps", () => {
+  const t = synth(selfHost({ signup: { domains: ["Example.org"], emails: ["b@example.org"], requireTwoFactor: true } }));
+  const api = t["coderhelm-prod-api"];
+  // Optional in Cognito: the "required" switch is CoderHelm's (an admin turns
+  // it on at runtime), and Google sign-ins never pass Cognito MFA anyway.
+  api.hasResourceProperties("AWS::Cognito::UserPool", {
+    MfaConfiguration: "OPTIONAL",
+    EnabledMfas: ["SOFTWARE_TOKEN_MFA"],
+  });
+  const pool = Object.values(api.findResources("AWS::Cognito::UserPool"))[0] as any;
+  const pre = pool.Properties.LambdaConfig.PreSignUp;
+  assert.ok(pre, "a pre-sign-up trigger");
+  const fns = api.findResources("AWS::Lambda::Function");
+  const [fnId, fn] = Object.entries(fns).find(([, r]) => (r as any).Properties.FunctionName === "coderhelm-prod-pre-signup") as [string, any];
+  assert.deepEqual(pre, { "Fn::GetAtt": [fnId, "Arn"] });
+  const env = fn.Properties.Environment.Variables;
+  assert.ok(env.SETTINGS_TABLE_NAME && env.USERS_TABLE_NAME);
+  // Cognito may call it; it only reads.
+  api.hasResourceProperties("AWS::Lambda::Permission", { Principal: "cognito-idp.amazonaws.com", FunctionName: { "Fn::GetAtt": [fnId, "Arn"] } });
+  const policies = JSON.stringify(api.findResources("AWS::IAM::Policy"));
+  const preRolePolicy = Object.values(api.findResources("AWS::IAM::Policy")).find((p: any) =>
+    JSON.stringify(p.Properties.Roles).includes(fn.Properties.Role["Fn::GetAtt"][0]),
+  ) as any;
+  const actions = JSON.stringify(preRolePolicy.Properties.PolicyDocument.Statement.map((s: any) => s.Action));
+  assert.ok(actions.includes("dynamodb:GetItem") && actions.includes("dynamodb:Query"), actions);
+  assert.ok(!/PutItem|UpdateItem|DeleteItem|BatchWrite/.test(actions), `pre-sign-up may only read: ${actions}`);
+  assert.ok(policies.length > 0);
+
+  // The first boot's list: the admin, an invite, a domain and the rule.
+  const db = json(t["coderhelm-prod-database"]);
+  for (const want of ['"EMAIL#owner@example.org"},"kind":{"S":"admin"}', '"EMAIL#b@example.org"},"kind":{"S":"invite"}', '"EMAIL#*@example.org"},"kind":{"S":"domain"}', '"TWO_FACTOR"},"kind":{"S":"rule"}', '"require":{"BOOL":true}']) {
+    assert.ok(db.replace(/\\/g, "").includes(want), want);
+  }
+});
+
+test("sign-in: hosted keeps its open pool (no pre-sign-up trigger) and optional MFA", () => {
+  const cfg = loadConfigFile(path.join(INFRA, "config", "hosted.prod.json"), { CDK_DEFAULT_ACCOUNT: "654654210434" });
+  const api = synth(cfg, zoneContext("654654210434", "us-east-1", "coderhelm.com"))["coderhelm-prod-api"];
+  const pool = Object.values(api.findResources("AWS::Cognito::UserPool"))[0] as any;
+  assert.equal(pool.Properties.MfaConfiguration, "OPTIONAL");
+  assert.equal(pool.Properties.LambdaConfig.PreSignUp, undefined);
+  assert.ok(pool.Properties.LambdaConfig.CustomMessage);
+});

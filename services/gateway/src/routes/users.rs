@@ -2,6 +2,7 @@ use aws_sdk_dynamodb::types::{AttributeValue, Delete, TransactWriteItem, Update}
 use axum::{
     extract::{Extension, Path, State},
     http::StatusCode,
+    response::IntoResponse,
     Json,
 };
 use serde::Deserialize;
@@ -880,8 +881,14 @@ pub async fn update_role(
         .table_name(&state.config.users_table_name)
         .key("pk", attr_s(&claims.team_id))
         .key("sk", attr_s(&sk))
-        .update_expression("SET #r = :role, updated_at = :now")
+        // Their sessions end with the change: they sign in again with the new role.
+        .update_expression("SET #r = :role, updated_at = :now, #va = :va")
         .expression_attribute_names("#r", "role")
+        .expression_attribute_names("#va", crate::routes::sign_in::VALID_AFTER)
+        .expression_attribute_values(
+            ":va",
+            AttributeValue::N((chrono::Utc::now().timestamp() + 1).to_string()),
+        )
         .expression_attribute_values(":role", attr_s(&body.role))
         .expression_attribute_values(":now", attr_s(&chrono::Utc::now().to_rfc3339()))
         .condition_expression(condition);
@@ -1169,7 +1176,7 @@ pub async fn mfa_verify_setup(
     State(state): State<Arc<AppState>>,
     Extension(claims): Extension<Claims>,
     Json(body): Json<VerifyMfaRequest>,
-) -> Result<Json<Value>, StatusCode> {
+) -> Result<axum::response::Response, StatusCode> {
     // Authenticate to get a Cognito access token
     let hash = cognito_secret_hash(
         &state.cognito_client_secret,
@@ -1246,16 +1253,42 @@ pub async fn mfa_verify_setup(
 
     info!(email = %claims.email, "MFA enabled");
 
-    Ok(Json(json!({ "status": "enabled" })))
+    // A self-hosted install: the factor is recorded for admins, and this
+    // session, which just proved the password and a code, counts as signed
+    // in with two factors.
+    if crate::routes::sign_in::applies() {
+        crate::routes::sign_in::note_factor(&state, &claims.team_id, &claims.sub, Some("cognito"))
+            .await;
+        let cookie =
+            crate::routes::sign_in::session_with_second_factor(&state, &claims, "password")
+                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        let mut resp = Json(json!({ "status": "enabled" })).into_response();
+        if let Ok(v) = axum::http::HeaderValue::from_str(&cookie) {
+            resp.headers_mut().append(axum::http::header::SET_COOKIE, v);
+        }
+        return Ok(resp);
+    }
+
+    Ok(Json(json!({ "status": "enabled" })).into_response())
 }
 
 /// DELETE /api/users/mfa — Disable TOTP MFA.
 pub async fn mfa_disable(
     State(state): State<Arc<AppState>>,
     Extension(claims): Extension<Claims>,
-) -> Result<Json<Value>, StatusCode> {
+    proof: Option<Extension<crate::auth::jwt::SignInProof>>,
+) -> Result<axum::response::Response, StatusCode> {
     if role_level(&claims.role) < 3 && claims.email.is_empty() {
         return Err(StatusCode::FORBIDDEN);
+    }
+    // A self-hosted install that requires two-factor sign-in keeps it on.
+    if crate::routes::sign_in::applies()
+        && crate::routes::sign_in::load_org(&state)
+            .await
+            .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?
+            .is_some_and(|o| o.require_2fa)
+    {
+        return Err(StatusCode::CONFLICT);
     }
 
     state
@@ -1277,8 +1310,19 @@ pub async fn mfa_disable(
         })?;
 
     info!(email = %claims.email, "MFA disabled");
-
-    Ok(Json(json!({ "status": "disabled" })))
+    if crate::routes::sign_in::applies() {
+        crate::routes::sign_in::note_factor(&state, &claims.team_id, &claims.sub, None).await;
+    }
+    // Every other session of theirs ends; this one carries on.
+    let proof = proof.map(|p| p.0).unwrap_or_default();
+    let cookie = crate::routes::sign_in::end_other_sessions(&state, &claims, &proof)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let mut resp = Json(json!({ "status": "disabled" })).into_response();
+    if let Ok(v) = axum::http::HeaderValue::from_str(&cookie) {
+        resp.headers_mut().append(axum::http::header::SET_COOKIE, v);
+    }
+    Ok(resp)
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────

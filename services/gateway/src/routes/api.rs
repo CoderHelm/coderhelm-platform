@@ -440,6 +440,7 @@ pub async fn list_teams(
 pub async fn switch_team(
     State(state): State<Arc<AppState>>,
     Extension(claims): Extension<Claims>,
+    proof: Option<Extension<jwt::SignInProof>>,
     Json(body): Json<Value>,
 ) -> Result<axum::response::Response, StatusCode> {
     let target_team = body["team_id"].as_str().ok_or(StatusCode::BAD_REQUEST)?;
@@ -462,13 +463,15 @@ pub async fn switch_team(
         .and_then(|v| v.as_s().ok())
         .map_or("member", |v| v);
 
-    // Re-issue JWT with new team_id and correct role
-    let token = jwt::create_token(
+    // Re-issue JWT with new team_id and correct role, keeping how the
+    // session signed in.
+    let token = jwt::create_session_token(
         &claims.sub,
         target_team,
         &claims.email,
         target_role,
         claims.github_login.as_deref(),
+        &proof.map(|p| p.0).unwrap_or_default(),
         &state.secrets.jwt_secret,
         SESSION_TTL_SECS,
     )

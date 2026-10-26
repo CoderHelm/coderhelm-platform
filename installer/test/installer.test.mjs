@@ -108,7 +108,8 @@ test("init writes a config from flags (non-interactive)", async () => {
   assert.equal(cfg.models.provider, "bedrock");
   assert.equal(cfg.email.from, "coderhelm@example.org");
   assert.deepEqual(cfg.admins, ["me@example.org"]);
-  assert.deepEqual(cfg.signup, { domains: ["example.org"] });
+  // One organization, closed by default: only people the admins invite.
+  assert.deepEqual(cfg.signup, {});
   assert.equal(cfg.telemetry.enabled, false, "telemetry is off unless asked for");
   // Running it again does not overwrite.
   await assert.rejects(() => main(["init", "--config", file], { runner, log: () => {}, interactive: false, ask: quietAsk() }), /already exists/);

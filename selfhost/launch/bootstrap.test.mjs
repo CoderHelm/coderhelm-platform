@@ -35,6 +35,10 @@ test("config: a domain in a hosted zone gets a domain identity", () => {
   assert.deepEqual(cfg.domain, { hostname: "ch.example.com", hostedZone: "example.com" });
   assert.equal(cfg.email.identity, "example.com");
   assert.deepEqual(cfg.signup, { domains: ["example.com"] });
+  // Two-factor sign-in required from the start.
+  const tf = configFromEnv({ ...ENV, REQUIRE_TWO_FACTOR: "on" }, { account: "123456789012" });
+  assert.deepEqual(tf.signup, { requireTwoFactor: true });
+  assert.equal(configFromEnv({ ...ENV, REQUIRE_TWO_FACTOR: "off" }, { account: "123456789012" }).signup, undefined);
 });
 
 test("config: anthropic has no Bedrock prefix; explicit prefixes are kept", () => {

@@ -150,12 +150,20 @@ export interface CoderhelmConfig {
   };
   /** People with admin rights over the whole deployment (the first one is you). */
   admins?: string[];
-  /** Who may create an account (admins always may). */
+  /**
+   * Who may create an account (admins always may). On a self-hosted install
+   * this is the first boot's list: the addresses become invites and the
+   * domains the allowed domains of the one organization, which admins change
+   * after that in Settings, Sign-in. Empty means only people the admins
+   * invite.
+   */
   signup?: {
     /** Exact addresses. */
     emails?: string[];
     /** Whole email domains, e.g. `example.com`. */
     domains?: string[];
+    /** Start with two-factor sign-in required for everyone. Default false. */
+    requireTwoFactor?: boolean;
   };
   integrations?: {
     /** "Sign in with Google" (needs google_client_id/secret in the secret and a domain). Default false. */
@@ -265,7 +273,7 @@ export interface ResolvedConfig {
     privacyUrl: string | null;
   };
   admins: string[];
-  signup: { emails: string[]; domains: string[] };
+  signup: { emails: string[]; domains: string[]; requireTwoFactor: boolean };
   integrations: Required<NonNullable<CoderhelmConfig["integrations"]>>;
   dashboardAssetDir: string | null;
   updates: {
@@ -478,6 +486,9 @@ export function validateConfig(c: unknown): string[] {
     if (s.domains !== undefined && (!Array.isArray(s.domains) || s.domains.some((x) => !HOST_RE.test(String(x).toLowerCase())))) {
       p.push("signup.domains: a list of email domains such as example.com");
     }
+    if (s.requireTwoFactor !== undefined && typeof s.requireTwoFactor !== "boolean") {
+      p.push("signup.requireTwoFactor: true or false");
+    }
   }
   const i = cfg.integrations ?? {};
   for (const [k, v] of Object.entries(i)) {
@@ -605,6 +616,7 @@ export function resolveConfig(cfg: CoderhelmConfig, opts: { skipValidation?: boo
     signup: {
       emails: [...new Set([...admins, ...(cfg.signup?.emails ?? [])].map((x) => x.toLowerCase()))],
       domains: [...new Set((cfg.signup?.domains ?? []).map((x) => x.toLowerCase()))],
+      requireTwoFactor: cfg.signup?.requireTwoFactor === true,
     },
     integrations: {
       googleSignIn: i.googleSignIn ?? false,

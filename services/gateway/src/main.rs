@@ -526,6 +526,18 @@ async fn main() -> Result<(), Error> {
         .route("/users/mfa/setup", post(routes::users::mfa_setup))
         .route("/users/mfa/verify", post(routes::users::mfa_verify_setup))
         .route("/users/mfa", delete(routes::users::mfa_disable))
+        .route("/users/2fa", get(routes::sign_in::my_status))
+        .route("/users/2fa/app/setup", post(routes::sign_in::app_setup))
+        .route("/users/2fa/app/verify", post(routes::sign_in::app_verify))
+        .route("/users/2fa/app", delete(routes::sign_in::app_disable))
+        .route(
+            "/users/:user_id/2fa/reset",
+            post(routes::sign_in::reset_two_factor),
+        )
+        .route(
+            "/sign-in",
+            get(routes::sign_in::get_settings).put(routes::sign_in::update_settings),
+        )
         // Plan endpoints
         .route(
             "/plans",
@@ -1193,6 +1205,7 @@ async fn main() -> Result<(), Error> {
         .route("/forgot-password", post(routes::auth::forgot_password))
         .route("/confirm-reset", post(routes::auth::confirm_reset))
         .route("/mfa/verify", post(routes::auth::mfa_verify))
+        .route("/2fa/verify", post(routes::sign_in::verify_second_step))
         .route("/google", get(routes::auth::google_login))
         .route("/google/callback", get(routes::auth::google_callback))
         .route("/github", get(routes::auth::github_login))

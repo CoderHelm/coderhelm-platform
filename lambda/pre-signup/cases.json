@@ -1,0 +1,19 @@
+[
+  { "name": "first admin, nobody signed up yet", "email": "admin@example.com", "org": null, "admin_listed": true, "listed": true, "anyone": false, "now": "2026-10-26T12:00:00Z", "want": "first_admin" },
+  { "name": "not listed, nobody signed up yet", "email": "stranger@example.com", "org": null, "anyone": false, "now": "2026-10-26T12:00:00Z", "want": "refused" },
+  { "name": "on the config list as an invite, before the first admin", "email": "b@example.com", "org": null, "admin_listed": false, "listed": true, "anyone": false, "now": "2026-10-26T12:00:00Z", "want": "refused" },
+  { "name": "a listed admin once the organization exists (no second organization)", "email": "admin2@example.com", "org": { "team_id": "TEAM#org", "domains": [] }, "admin_listed": true, "listed": true, "anyone": true, "now": "2026-10-26T12:00:00Z", "want": "refused" },
+  { "name": "a stranger once the organization exists", "email": "x@elsewhere.io", "org": { "team_id": "TEAM#org", "domains": ["example.com"] }, "anyone": true, "now": "2026-10-26T12:00:00Z", "want": "refused" },
+  { "name": "an allowed domain", "email": "Ann@Example.com", "org": { "team_id": "TEAM#org", "domains": ["example.com"] }, "anyone": true, "now": "2026-10-26T12:00:00Z", "want": "domain" },
+  { "name": "a subdomain of an allowed domain is not that domain", "email": "ann@eu.example.com", "org": { "team_id": "TEAM#org", "domains": ["example.com"] }, "anyone": true, "now": "2026-10-26T12:00:00Z", "want": "refused" },
+  { "name": "a lookalike domain", "email": "ann@example.com.evil.io", "org": { "team_id": "TEAM#org", "domains": ["example.com"] }, "anyone": true, "now": "2026-10-26T12:00:00Z", "want": "refused" },
+  { "name": "a live invite", "email": "bo@other.io", "org": { "team_id": "TEAM#org", "domains": [] }, "records": [{ "pk": "TEAM#org", "sk": "USER#invite_01", "status": "invited", "invited_at": "2026-10-20T00:00:00Z" }], "anyone": true, "now": "2026-10-26T12:00:00Z", "want": "invite" },
+  { "name": "an expired invite", "email": "bo@other.io", "org": { "team_id": "TEAM#org", "domains": [] }, "records": [{ "pk": "TEAM#org", "sk": "USER#invite_01", "status": "invited", "invited_at": "2026-09-01T00:00:00Z" }], "anyone": true, "now": "2026-10-26T12:00:00Z", "want": "refused" },
+  { "name": "an invite to some other team", "email": "bo@other.io", "org": { "team_id": "TEAM#org", "domains": [] }, "records": [{ "pk": "TEAM#old", "sk": "USER#invite_01", "status": "invited", "invited_at": "2026-10-20T00:00:00Z" }], "anyone": true, "now": "2026-10-26T12:00:00Z", "want": "refused" },
+  { "name": "already a member (signing up again after their account was removed from Cognito)", "email": "m@other.io", "org": { "team_id": "TEAM#org", "domains": [] }, "records": [{ "pk": "TEAM#org", "sk": "USER#abc" }], "anyone": true, "now": "2026-10-26T12:00:00Z", "want": "existing" },
+  { "name": "a member of some other team only", "email": "m@other.io", "org": { "team_id": "TEAM#org", "domains": [] }, "records": [{ "pk": "TEAM#old", "sk": "USER#abc" }], "anyone": true, "now": "2026-10-26T12:00:00Z", "want": "refused" },
+  { "name": "an older install without the organization yet: a member", "email": "m@other.io", "org": null, "records": [{ "pk": "TEAM#old", "sk": "USER#abc" }], "anyone": true, "now": "2026-10-26T12:00:00Z", "want": "existing" },
+  { "name": "an older install without the organization yet: on the config list", "email": "n@example.com", "org": null, "listed": true, "anyone": true, "now": "2026-10-26T12:00:00Z", "want": "listed" },
+  { "name": "an older install without the organization yet: a stranger", "email": "n@elsewhere.io", "org": null, "anyone": true, "now": "2026-10-26T12:00:00Z", "want": "refused" },
+  { "name": "no email at all", "email": "", "org": { "team_id": "TEAM#org", "domains": ["example.com"] }, "anyone": true, "now": "2026-10-26T12:00:00Z", "want": "refused" }
+]

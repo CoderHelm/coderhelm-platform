@@ -256,7 +256,7 @@ async function stepEmail(ctx, answers) {
   }, { heading: "Checking Amazon SES" });
   if (checked === BACK) return BACK;
   const acct = runner.dryRun ? null : { ProductionAccessEnabled: !sandbox };
-  const signupDomain = await answer(ctx, pick(flags, answers, "signupDomain"), "Let anyone with this email domain sign up (empty: only you)", admin.split("@")[1], (v) => (!v || HOST_RE.test(v) ? null : "A domain such as example.com, or empty."));
+  const signupDomain = await answer(ctx, pick(flags, answers, "signupDomain"), "This install is for one organization. Let people from your company join: an email domain such as example.com (empty: only people you invite)", "", (v) => (!v || HOST_RE.test(v) ? null : "A domain such as example.com, or empty."));
   if (signupDomain === BACK) return BACK;
   return { ...answers, admin, emailFrom, signupDomain, sesSandbox: acct ? !acct.ProductionAccessEnabled : undefined };
 }
@@ -342,7 +342,7 @@ async function stepSummary(ctx, answers) {
   log(`  Address            ${cfg.domain ? `https://${cfg.domain.hostname}` : "CloudFront's own address"}`);
   log(`  Claude             ${cfg.models.provider === "bedrock" ? `Amazon Bedrock (${cfg.models.bedrockInferencePrefix || "in-region"})` : "Anthropic API, each team's key"}`);
   log(`  Admin / sender     ${cfg.admins[0]} / ${cfg.email.from}`);
-  log(`  Sign-up            ${cfg.signup.domains?.length ? `anyone at ${cfg.signup.domains[0]}` : "only you (invite others later)"}`);
+  log(`  Who may join       ${cfg.signup.domains?.length ? `people you invite, and anyone at ${cfg.signup.domains[0]}` : "only people you invite"} (change it later in Settings, Sign-in)`);
   log(`  Google sign-in     ${cfg.integrations.googleSignIn ? "on" : "off"}`);
   log(`  Auto-update        ${cfg.updates.auto ? `on, ${cfg.updates.window} ${cfg.updates.timezone}, majors: ${cfg.updates.majors}` : "off (you're emailed about new releases)"}`);
   const c = estimateMonthlyCost(answers);

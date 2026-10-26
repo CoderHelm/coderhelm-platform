@@ -129,6 +129,32 @@ export class ApiStack extends cdk.Stack {
       customMessageFn
     );
 
+    // A self-hosted install is one organization: every account the user pool
+    // makes (sign-up with the app client, Google, AdminCreateUser) is checked
+    // against its rules first, so even a direct Cognito SignUp call is
+    // refused unless the person is invited, at an allowed domain, or the
+    // first admin. The gateway checks the same rules (routes/sign_in.rs).
+    if (cfg.layout === "single-origin") {
+      const preSignUpFn = new lambda.Function(this, "PreSignUpFn", {
+        functionName: `${prefix}-pre-signup`,
+        runtime: lambda.Runtime.NODEJS_22_X,
+        handler: "handler.handler",
+        code: lambda.Code.fromAsset(repoPath("lambda/pre-signup"), {
+          exclude: ["*.test.js", "cases.json"],
+        }),
+        timeout: cdk.Duration.seconds(5),
+        memorySize: 128,
+        environment: {
+          SETTINGS_TABLE_NAME: props.settingsTable.tableName,
+          USERS_TABLE_NAME: props.usersTable.tableName,
+        },
+        logRetention: logs.RetentionDays.ONE_MONTH,
+      });
+      props.settingsTable.grantReadData(preSignUpFn);
+      props.usersTable.grantReadData(preSignUpFn);
+      userPool.addTrigger(cognito.UserPoolOperation.PRE_SIGN_UP, preSignUpFn);
+    }
+
     // Google identity provider (optional: integrations.googleSignIn).
     // google_client_id and google_client_secret live in the deployment's
     // secret (cfg.secretName). Callback URL:
