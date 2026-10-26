@@ -121,12 +121,20 @@ pub struct Finding {
     pub source_account_id: String,
     pub error_pattern: String,
     pub error_hash: String,
-    /// Matching log lines in the analysis that found it.
+    /// Matching log lines in its log group in the latest analysis window.
     pub error_count: Option<u64>,
-    /// Analyses it appeared in.
+    /// Matching log lines over every analysis when `count_basis` is
+    /// `events`; on older items, the number of analyses (see [`Self::events_seen`]).
     pub seen_count: Option<u64>,
+    /// `events` once the analyzer counts lines, not analyses.
+    pub count_basis: String,
     pub suspected_location: String,
+    /// When the finding was stored (not when its error happened).
     pub created_at: String,
+    /// The first matching line's own time; never moves forward. Older items
+    /// without one fall back to `created_at`.
+    pub first_seen_at: String,
+    /// The last matching line's own time.
     pub last_seen_at: String,
     pub plan_id: String,
     pub acknowledged_at: String,
@@ -166,7 +174,11 @@ impl Finding {
             error_hash: s(item, "error_hash"),
             error_count: n(item, "error_count"),
             seen_count: n(item, "seen_count"),
+            count_basis: s(item, "count_basis"),
             suspected_location: s(item, "suspected_location"),
+            first_seen_at: Some(s(item, "first_seen_at"))
+                .filter(|v| !v.is_empty())
+                .unwrap_or_else(|| created_at.clone()),
             last_seen_at: Some(s(item, "last_seen_at"))
                 .filter(|v| !v.is_empty())
                 .unwrap_or_else(|| created_at.clone()),
@@ -206,6 +218,15 @@ impl Finding {
     /// The ticket every fix run for this finding's error shares.
     pub fn ticket_id(&self) -> String {
         ticket_id(&self.fingerprint())
+    }
+
+    /// Matching log lines seen over every analysis, only when the item
+    /// counts lines: an older item's `seen_count` counts analyses and is
+    /// never shown as lines.
+    pub fn events_seen(&self) -> Option<u64> {
+        (self.count_basis == "events")
+            .then_some(self.seen_count)
+            .flatten()
     }
 }
 
@@ -757,6 +778,12 @@ pub fn ticket_body(f: &Finding, starter: &Starter, samples: &[String]) -> String
     ];
     if let Some(c) = f.error_count {
         data.push(format!("Matching lines in the last analysis: {c}"));
+    }
+    if let Some(c) = f.events_seen() {
+        data.push(format!("Matching lines since first seen: {c}"));
+    }
+    if !f.first_seen_at.is_empty() {
+        data.push(format!("First seen: {}", f.first_seen_at));
     }
     if !f.last_seen_at.is_empty() {
         data.push(format!("Last seen: {}", f.last_seen_at));
@@ -1529,6 +1556,45 @@ mod tests {
         assert_eq!(Finding::from_item("", &i), None);
         let conn = item(&[("pk", TEAM), ("sk", "AWS_CONN#1")]);
         assert_eq!(Finding::from_item(TEAM, &conn), None);
+    }
+
+    #[test]
+    fn times_and_counts_are_the_lines_own() {
+        let mut i = item(&[
+            ("pk", TEAM),
+            ("sk", "REC#01abc"),
+            ("created_at", "2026-10-25T06:00:00+00:00"),
+            ("first_seen_at", "2026-10-24T09:12:00.000+00:00"),
+            ("last_seen_at", "2026-10-25T05:59:00.000+00:00"),
+            ("count_basis", "events"),
+        ]);
+        i.insert("seen_count".into(), AttributeValue::N("44534".into()));
+        let f = Finding::from_item(TEAM, &i).unwrap();
+        assert_eq!(f.first_seen_at, "2026-10-24T09:12:00.000+00:00");
+        assert_eq!(f.created_at, "2026-10-25T06:00:00+00:00");
+        assert_eq!(f.events_seen(), Some(44534));
+        let body = ticket_body(&f, &Starter::Auto, &[]);
+        assert!(
+            body.contains("Matching lines since first seen: 44534"),
+            "{body}"
+        );
+        assert!(
+            body.contains("First seen: 2026-10-24T09:12:00.000+00:00"),
+            "{body}"
+        );
+
+        // Stored before lines were counted: seen_count is analyses, never shown
+        // as lines, and first seen falls back to when it was stored.
+        let mut old = item(&[
+            ("pk", TEAM),
+            ("sk", "REC#01old"),
+            ("created_at", "2026-10-25T06:00:00+00:00"),
+        ]);
+        old.insert("seen_count".into(), AttributeValue::N("1".into()));
+        let f = Finding::from_item(TEAM, &old).unwrap();
+        assert_eq!(f.seen_count, Some(1));
+        assert_eq!(f.events_seen(), None);
+        assert_eq!(f.first_seen_at, f.created_at);
     }
 
     #[test]

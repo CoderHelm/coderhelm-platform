@@ -3,12 +3,16 @@ Coderhelm Log Analyzer Lambda
 
 Triggered by EventBridge every 6 hours. For each team with an AWS connection:
 1. AssumeRole into the customer's account
-2. Run pre-built CloudWatch Logs Insights queries
-3. Send error summaries to Anthropic Claude for analysis
-4. Deduplicate and store recommendations in DynamoDB
+2. Run pre-built CloudWatch Logs Insights queries, counted per log group
+   and stream (@log, @logStream)
+3. Send that evidence to Anthropic Claude, which writes the findings' words
+4. Credit each finding to the log groups whose lines match it, check each
+   group alone, guard the title against services the evidence doesn't show
+   (attribution.py), then deduplicate and store in DynamoDB
 5. Post new findings to the team's Teams channel, when turned on
 
-No raw logs are stored — only error summaries and recommendations.
+Raw logs are not stored: only counts, times and up to three scrubbed sample
+lines per finding, each with its log group and stream.
 """
 
 import base64
@@ -24,6 +28,7 @@ from urllib.error import HTTPError
 import boto3
 from botocore.exceptions import ClientError
 
+import attribution
 import usage
 
 logger = logging.getLogger()
@@ -47,72 +52,56 @@ kms_client = boto3.client("kms")
 
 # ── Pre-built Insights Queries ──────────────────────────────────
 
+# Every query runs over many log groups at once, so each returns @log
+# (account:log group) and @logStream and is grouped by them: a count always
+# belongs to one log group (attribution.discovery_query). The filters only
+# choose which lines are worth reading.
 INSIGHTS_QUERIES = [
     {
         "name": "lambda_errors",
         "description": "Lambda function errors and timeouts",
         "log_group_pattern": "/aws/lambda/",
-        "query": (
-            "fields @timestamp, @message, @logStream, @logGroup "
-            "| filter @message like /(?i)(error|exception|timeout|task timed out|out of memory|runtime exited)/ "
-            "| filter @message not like /(?i)(info|debug|warn.*deprecat)/ "
-            "| stats count() as error_count by @logGroup, @logStream "
-            "| sort error_count desc "
-            "| limit 20"
-        ),
+        "query": attribution.discovery_query([
+            "filter @message like /(?i)(error|exception|timeout|task timed out|out of memory|runtime exited)/",
+            "filter @message not like /(?i)(info|debug|warn.*deprecat)/",
+        ]),
     },
     {
         "name": "api_gateway_5xx",
         "description": "API Gateway 5xx errors",
         "log_group_pattern": "api-gateway",
-        "query": (
-            "fields @timestamp, @message, @logGroup "
-            "| filter @message like /\" 5\\d{2} \"/ "
-            "| stats count() as error_count by @logGroup, @message "
-            "| sort error_count desc "
-            "| limit 20"
-        ),
+        "query": attribution.discovery_query([
+            "filter @message like /\" 5\\d{2} \"/",
+        ]),
     },
     {
         "name": "ecs_crashes",
         "description": "ECS task crashes and OOM kills",
         "log_group_pattern": "/ecs/",
-        "query": (
-            "fields @timestamp, @message, @logStream, @logGroup "
-            "| filter @message like /(?i)(oom|killed|signal|exit code [^0]|panic|fatal|segfault)/ "
-            "| stats count() as crash_count by @logGroup, @logStream "
-            "| sort crash_count desc "
-            "| limit 20"
-        ),
+        "query": attribution.discovery_query([
+            "filter @message like /(?i)(oom|killed|signal|exit code [^0]|panic|fatal|segfault)/",
+        ]),
     },
     {
         "name": "general_errors",
         "description": "General application errors across all log groups",
         "log_group_pattern": None,  # matches any
-        "query": (
-            "fields @timestamp, @message, @logGroup "
-            "| filter @message like /(?i)(ERROR|FATAL|CRITICAL|UnhandledPromiseRejection|Traceback)/ "
-            "| filter @message not like /(?i)(healthcheck|ping|OPTIONS)/ "
+        "query": attribution.discovery_query([
+            "filter @message like /(?i)(ERROR|FATAL|CRITICAL|UnhandledPromiseRejection|Traceback)/",
+            "filter @message not like /(?i)(healthcheck|ping|OPTIONS)/",
             # Filter out common bot/scanner noise before it reaches the LLM
-            "| filter @message not like /(?i)(Not found: \\/\\.env|Not found: \\/\\.git|Not found: \\/wp-|Not found: \\/admin|Not found: \\/phpMyAdmin|Not found: \\/\\.aws|Not found: \\/\\.DS_Store|Not found: \\/robots\\.txt|Not found: \\/favicon\\.ico|Not found: \\/sitemap)/ "
-            "| stats count() as error_count by @logGroup, @message "
-            "| sort error_count desc "
-            "| limit 20"
-        ),
+            "filter @message not like /(?i)(Not found: \\/\\.env|Not found: \\/\\.git|Not found: \\/wp-|Not found: \\/admin|Not found: \\/phpMyAdmin|Not found: \\/\\.aws|Not found: \\/\\.DS_Store|Not found: \\/robots\\.txt|Not found: \\/favicon\\.ico|Not found: \\/sitemap)/",
+        ]),
     },
     {
         "name": "http_4xx_5xx",
         "description": "HTTP error responses from web services",
         "log_group_pattern": "/ecs/",
-        "query": (
-            "fields @timestamp, @message, @logGroup "
-            "| filter @message like /(?i)(\\\"(GET|POST|PUT|DELETE|PATCH).*\\\" [45]\\d{2}|HTTP [45]\\d{2}|status[=: ]+[45]\\d{2})/ "
+        "query": attribution.discovery_query([
+            "filter @message like /(?i)(\\\"(GET|POST|PUT|DELETE|PATCH).*\\\" [45]\\d{2}|HTTP [45]\\d{2}|status[=: ]+[45]\\d{2})/",
             # Exclude known scanner paths
-            "| filter @message not like /(?i)(\\.env|\\.git|wp-admin|wp-login|phpMyAdmin|\\.aws|xmlrpc|wp-content|wp-includes)/ "
-            "| stats count() as error_count by @logGroup, @message "
-            "| sort error_count desc "
-            "| limit 20"
-        ),
+            "filter @message not like /(?i)(\\.env|\\.git|wp-admin|wp-login|phpMyAdmin|\\.aws|xmlrpc|wp-content|wp-includes)/",
+        ]),
     },
 ]
 
@@ -160,17 +149,6 @@ def scrub_secrets(text):
             # AWS secret key heuristic — only replace near AWS-related context
             text = pattern.sub("[POSSIBLE_SECRET_KEY]", text)
     return text
-
-
-def scrub_query_results(results):
-    """Recursively scrub secrets from query result data."""
-    if isinstance(results, str):
-        return scrub_secrets(results)
-    if isinstance(results, list):
-        return [scrub_query_results(item) for item in results]
-    if isinstance(results, dict):
-        return {k: scrub_query_results(v) for k, v in results.items()}
-    return results
 
 
 # ── Main Handler ────────────────────────────────────────────────
@@ -255,13 +233,44 @@ def get_team_api_key(team_id):
         return None
 
 
+def logs_client_for(conn):
+    """A CloudWatch Logs client in the team's account, through its log reader
+    role (15-minute session, the minimum). Shared with repair_attribution."""
+    assumed = sts_client.assume_role(
+        RoleArn=conn["role_arn"],
+        RoleSessionName="coderhelm-analyzer",
+        ExternalId=conn["external_id"],
+        DurationSeconds=900,
+    )
+    creds = assumed["Credentials"]
+    return boto3.client(
+        "logs",
+        region_name=conn["region"],
+        aws_access_key_id=creds["AccessKeyId"],
+        aws_secret_access_key=creds["SecretAccessKey"],
+        aws_session_token=creds["SessionToken"],
+    )
+
+
+def log_groups_for(conn, cw_logs):
+    """The log groups the team configured, or every one in the account."""
+    log_groups = conn.get("log_groups", [])
+    if not log_groups:
+        log_groups = discover_log_groups(cw_logs)
+        logger.info(f"Auto-discovered {len(log_groups)} log groups")
+    return list(log_groups)
+
+
+def lookback_window(hours=None):
+    """(start, end) in epoch seconds; every query in a run uses the same one."""
+    end = int(time.time())
+    return end - int(hours or LOOKBACK_HOURS) * 3600, end
+
+
 def analyze_connection(conn):
     """Analyze a single AWS connection — AssumeRole, query logs, generate recommendations."""
     team_id = conn["team_id"]
     account_id = conn["account_id"]
-    role_arn = conn["role_arn"]
-    external_id = conn["external_id"]
-    region = conn["region"]
 
     logger.info(f"Analyzing {team_id} / account {account_id}")
 
@@ -272,32 +281,13 @@ def analyze_connection(conn):
         logger.warning(f"No Anthropic API key configured for {team_id}, skipping analysis")
         return 0
 
-    # AssumeRole with 15-minute session (minimum)
-    assumed = sts_client.assume_role(
-        RoleArn=role_arn,
-        RoleSessionName="coderhelm-analyzer",
-        ExternalId=external_id,
-        DurationSeconds=900,
-    )
-
-    creds = assumed["Credentials"]
-    cw_logs = boto3.client(
-        "logs",
-        region_name=region,
-        aws_access_key_id=creds["AccessKeyId"],
-        aws_secret_access_key=creds["SecretAccessKey"],
-        aws_session_token=creds["SessionToken"],
-    )
-
-    # Get the log groups this team has configured (or discover them)
-    log_groups = conn.get("log_groups", [])
-    if not log_groups:
-        log_groups = discover_log_groups(cw_logs)
-        logger.info(f"Auto-discovered {len(log_groups)} log groups")
+    cw_logs = logs_client_for(conn)
+    log_groups = log_groups_for(conn, cw_logs)
+    start, end = lookback_window()
 
     # Run queries and collect results. A query that fails is not "no errors":
     # when any fails, nothing is auto-resolved this run.
-    all_results = []
+    batches = []
     any_query_failed = False
     for query_def in INSIGHTS_QUERIES:
         matching_groups = filter_log_groups(log_groups, query_def.get("log_group_pattern"))
@@ -306,16 +296,12 @@ def analyze_connection(conn):
 
         # Run query against matching log groups (batch of 50 max)
         for batch in chunk_list(matching_groups, 50):
-            try:
-                results = run_insights_query(cw_logs, batch, query_def["query"])
-            except Exception as e:
-                logger.warning(f"Query {query_def['name']} failed: {e}")
-                results = None
+            results = run_insights_query(cw_logs, batch, query_def["query"], start, end)
             if results is None:
                 any_query_failed = True
                 continue
             if results:
-                all_results.append(
+                batches.append(
                     {
                         "query_name": query_def["name"],
                         "description": query_def["description"],
@@ -326,7 +312,7 @@ def analyze_connection(conn):
 
     existing = list_pending_recommendations(team_id, account_id)
 
-    if not all_results:
+    if not batches:
         record_connection_success(team_id, account_id)
         if any_query_failed:
             logger.warning(f"{team_id}/{account_id}: queries failed and none returned rows, skipping resolution")
@@ -336,51 +322,22 @@ def analyze_connection(conn):
         resolve_stale_recommendations(team_id, existing, set())
         return 0
 
-    # Reorganize results grouped by log group
-    all_results = group_results_by_log_group(all_results)
-    counts = error_counts_by_log_group(all_results)
+    # One entry per log group and message, each with its own counts and times.
+    evidence = attribution.build_evidence(batches, scrub_secrets)
 
     seen_ids = set()
     new_recs = []
 
-    # Check for secrets/tokens in raw results and create advisory if found
-    raw_text = json.dumps(all_results, default=str)
-    secrets_found = 0
-    secret_types = set()
-    for pattern, replacement in SECRET_PATTERNS:
-        matches = pattern.findall(raw_text)
-        if matches and replacement:
-            secrets_found += len(matches)
-            secret_types.add(replacement.strip("[]"))
-
-    if secrets_found > 0:
-        types_str = ", ".join(sorted(secret_types))
-        advisory_rec = {
-            "title": f"Secrets detected in CloudWatch Logs ({secrets_found} instances)",
-            "severity": "critical",
-            "summary": (
-                f"We detected {secrets_found} potential secrets or tokens in your CloudWatch Logs "
-                f"(types: {types_str}). These were automatically scrubbed before AI analysis, "
-                f"but they still exist in your logs and could be exposed."
-            ),
-            "suggested_action": (
-                "1. Rotate any exposed credentials immediately. "
-                "2. Add a CloudWatch Logs subscription filter or Lambda to strip secrets at ingestion. "
-                "3. Update your application to avoid logging sensitive values — use environment variables "
-                "and never pass secrets as command-line arguments or log them at any level. "
-                "4. Consider using AWS Secrets Manager or Parameter Store for credential management."
-            ),
-            "source_log_group": "multiple",
-            "error_pattern": f"secrets_in_logs_{account_id}",
-        }
-        rec_id, is_new = store_recommendation(team_id, account_id, advisory_rec, existing, counts)
+    advisory = secrets_advisory(batches, evidence, account_id)
+    if advisory:
+        rec_id, is_new = store_finding(team_id, account_id, advisory, existing, None, (start, end))
         if rec_id:
             seen_ids.add(rec_id)
         if is_new:
-            new_recs.append(advisory_rec)
+            new_recs.append(advisory)
 
-    # Send to Anthropic for analysis
-    recommendations = analyze_with_anthropic(all_results, account_id, api_key, existing, team_id=team_id)
+    # The model reads the attributed evidence and writes the words.
+    recommendations = analyze_with_anthropic(evidence, account_id, api_key, existing, team_id=team_id)
 
     # None = the analysis failed: we can't tell "no issues" from "API error",
     # so nothing is resolved.
@@ -391,12 +348,21 @@ def analyze_connection(conn):
 
     record_connection_success(team_id, account_id)
 
-    for rec in recommendations:
-        rec_id, is_new = store_recommendation(team_id, account_id, rec, existing, counts)
+    # Credit each finding to the log groups whose lines match it, checked one
+    # group at a time; then make its words match that evidence.
+    candidates, check_failed = attribute_recommendations(cw_logs, recommendations, evidence, start, end)
+    if check_failed:
+        any_query_failed = True
+    attribution.guard_texts(
+        candidates, log_groups, lambda prompt: ask_model(prompt, api_key, team_id)
+    )
+
+    for cand in candidates:
+        rec_id, is_new = store_finding(team_id, account_id, cand, existing, cw_logs, (start, end))
         if rec_id:
             seen_ids.add(rec_id)
         if is_new:
-            new_recs.append(rec)
+            new_recs.append(cand)
 
     # Resolve findings that no longer appear — only after a complete run.
     if not any_query_failed:
@@ -405,6 +371,104 @@ def analyze_connection(conn):
     notify_new_recommendations(team_id, account_id, new_recs)
     logger.info(f"{team_id}/{account_id}: {len(new_recs)} new recommendations")
     return len(new_recs)
+
+
+def secrets_advisory(batches, evidence, account_id):
+    """A finding when secrets appear in the raw query rows (before scrubbing),
+    counted from those rows; None when there are none."""
+    raw_text = json.dumps([b["results"] for b in batches], default=str)
+    secrets_found = 0
+    secret_types = set()
+    groups = set()
+    for pattern, replacement in SECRET_PATTERNS:
+        matches = pattern.findall(raw_text)
+        if matches and replacement:
+            secrets_found += len(matches)
+            secret_types.add(replacement.strip("[]"))
+    if not secrets_found:
+        return None
+    for e in evidence:
+        if any(tag in e["message"] for tag in secret_types):
+            groups.add(e["log_group"])
+    firsts = [e["first"] for e in evidence if e["first"]]
+    lasts = [e["last"] for e in evidence if e["last"]]
+    types_str = ", ".join(sorted(secret_types))
+    group = next(iter(groups)) if len(groups) == 1 else "multiple"
+    return {
+        "id": "secrets",
+        "title": f"Secrets detected in CloudWatch Logs ({secrets_found} instances)",
+        "severity": "critical",
+        "summary": (
+            f"We detected {secrets_found} potential secrets or tokens in your CloudWatch Logs "
+            f"(types: {types_str}). These were automatically scrubbed before AI analysis, "
+            f"but they still exist in your logs and could be exposed."
+        ),
+        "suggested_action": (
+            "1. Rotate any exposed credentials immediately. "
+            "2. Add a CloudWatch Logs subscription filter or Lambda to strip secrets at ingestion. "
+            "3. Update your application to avoid logging sensitive values — use environment variables "
+            "and never pass secrets as command-line arguments or log them at any level. "
+            "4. Consider using AWS Secrets Manager or Parameter Store for credential management."
+        ),
+        "log_group": group,
+        "account": account_id,
+        "literal": f"secrets_in_logs_{account_id}",
+        "stats": {
+            "count": secrets_found,
+            "first": min(firsts) if firsts else None,
+            "last": max(lasts) if lasts else None,
+            "samples": [],
+        },
+    }
+
+
+def attribute_recommendations(cw_logs, recommendations, evidence, start, end, run=None):
+    """One candidate per (model finding, log group with matching lines).
+
+    The log group, account, count and times of each come from Insights
+    (attribution.attribute over every group the cited evidence was searched
+    in, then attribution.check_group on each group alone). A finding whose
+    text matches nowhere is dropped. Returns (candidates, a query failed)."""
+    run = run or attribution.run_query
+    candidates, failed = [], False
+    for i, rec in enumerate(recommendations):
+        literal, cited = attribution.choose_literal(rec, evidence)
+        if not literal:
+            logger.info(f"Dropped '{str(rec.get('title', ''))[:60]}': no evidence line backs it")
+            continue
+        stats = attribution.attribute(
+            cw_logs, attribution.scope_of(cited), literal, start, end, scrub_secrets, run
+        )
+        if stats is None:
+            failed = True
+            continue
+        credited, check_failed = attribution.credited_groups(
+            stats, cw_logs, literal, start, end, scrub_secrets, run
+        )
+        failed = failed or check_failed
+        if not credited:
+            logger.info(f"Dropped '{str(rec.get('title', ''))[:60]}': no log group has '{literal[:40]}' lines")
+            continue
+        for g in credited:
+            candidates.append({
+                "id": f"f{i}-{g['log_group']}",
+                "title": str(rec.get("title", "Untitled")),
+                "summary": str(rec.get("summary", "")),
+                "suggested_action": str(rec.get("suggested_action", "")),
+                "severity": rec.get("severity", "info"),
+                "suspected_location": rec.get("suspected_location"),
+                "existing_id": rec.get("existing_id"),
+                "log_group": g["log_group"],
+                "account": g["account"],
+                "literal": literal,
+                "stats": g,
+                "others": [
+                    {"log_group": o["log_group"], "lines": o["count"]}
+                    for o in credited
+                    if o is not g
+                ],
+            })
+    return candidates, failed
 
 
 def discover_log_groups(cw_logs):
@@ -428,53 +492,11 @@ def filter_log_groups(log_groups, pattern):
     return [g for g in log_groups if pattern in g.lower()]
 
 
-def run_insights_query(cw_logs, log_groups, query_string):
-    """Run a CloudWatch Logs Insights query and wait for results."""
-    end_time = int(time.time())
-    start_time = end_time - (LOOKBACK_HOURS * 3600)
-
-    try:
-        response = cw_logs.start_query(
-            logGroupNames=log_groups,
-            startTime=start_time,
-            endTime=end_time,
-            queryString=query_string,
-        )
-    except ClientError as e:
-        logger.warning(f"StartQuery failed: {e}")
-        return None
-
-    query_id = response["queryId"]
-
-    # Poll for results (max 30 seconds)
-    for _ in range(30):
-        time.sleep(1)
-        result = cw_logs.get_query_results(queryId=query_id)
-        status = result["status"]
-
-        if status == "Complete":
-            return format_query_results(result.get("results", []))
-        elif status in ("Failed", "Cancelled", "Timeout"):
-            logger.warning(f"Query {query_id} ended with status: {status}")
-            return None
-
-    # Timed out waiting — stop the query
-    try:
-        cw_logs.stop_query(queryId=query_id)
-    except Exception:
-        pass
-
-    logger.warning(f"Query {query_id} did not finish in time")
-    return None
-
-
-def format_query_results(results):
-    """Format Insights query results into readable lines."""
-    lines = []
-    for row in results[:20]:  # Cap at 20 rows
-        fields = {f["field"]: f["value"] for f in row}
-        lines.append(fields)
-    return lines
+def run_insights_query(cw_logs, log_groups, query_string, start=None, end=None):
+    """Run a CloudWatch Logs Insights query; rows as dicts, None when it failed."""
+    if start is None or end is None:
+        start, end = lookback_window()
+    return attribution.run_query(cw_logs, log_groups, query_string, start, end)
 
 
 def is_always_thinking_model(model_id):
@@ -526,13 +548,34 @@ def parse_recommendations(output_text):
 
 
 
-def analyze_with_anthropic(query_results, account_id, api_key, existing=None, team_id=None):
-    """Send log error summaries to Anthropic Claude for analysis."""
-    # Scrub any secrets/tokens from the data before sending to AI
-    scrubbed_results = scrub_query_results(query_results)
+def ask_model(prompt, api_key, team_id=None):
+    """One model call; its text, or None when it failed. Every attempt is
+    counted in the team's usage (usage.call_messages)."""
+    try:
+        if usage.is_bedrock():
+            response_data = usage.call_messages_bedrock(
+                build_request_body(prompt), MODEL_ID,
+                dynamodb_client, ANALYTICS_TABLE, team_id, usage.FEATURE_LOG_ANALYSIS,
+            )
+        else:
+            response_data = usage.call_messages(
+                api_key, build_request_body(prompt), MODEL_ID,
+                dynamodb_client, ANALYTICS_TABLE, team_id, usage.FEATURE_LOG_ANALYSIS,
+            )
+        return response_text(response_data)
+    except HTTPError as e:
+        error_body = e.read().decode("utf-8") if e.fp else ""
+        logger.error(f"Anthropic API error ({e.code}): {error_body}")
+        return None
+    except Exception as e:
+        logger.error(f"Anthropic analysis failed: {e}", exc_info=True)
+        return None
 
-    # Build context — NO raw log data, only aggregated summaries
-    context = json.dumps(scrubbed_results, indent=2, default=str)
+
+def analysis_prompt(evidence, account_id, existing=None):
+    """The analysis prompt: attributed evidence in, words out. The model cites
+    evidence ids; it never names the log group a finding is saved under."""
+    context = json.dumps(attribution.evidence_for_prompt(evidence), indent=2, default=str)
 
     # Truncate if too large (keep under 100K tokens)
     if len(context) > 50000:
@@ -549,13 +592,13 @@ def analyze_with_anthropic(query_results, account_id, api_key, existing=None, te
     ]
     known_json = json.dumps(known, indent=2)
 
-    prompt = f"""You are a senior SRE analyzing CloudWatch Logs error summaries for AWS account {account_id}.
+    return f"""You are a senior SRE analyzing CloudWatch Logs error summaries for AWS account {account_id}.
 
-Below are aggregated error patterns from CloudWatch Logs Insights queries, grouped by log group. Each entry shows the error message and how many times it occurred.
+Below is the evidence from CloudWatch Logs Insights. Each entry is one error message in ONE log group, with its id, the number of matching lines, the first and last time it was seen and the log streams it came from. These numbers are exact; do not change or reassign them.
 
-<error_summaries>
+<evidence>
 {context}
-</error_summaries>
+</evidence>
 
 Your job: identify REAL operational issues that need engineering attention. Think step-by-step:
 
@@ -572,11 +615,13 @@ Return a JSON array of recommendations. Each must have:
 - "title": Short descriptive title (max 80 chars)
 - "severity": "critical" | "warning" | "info"
 - "summary": 2-3 sentence explanation. Be specific about what's broken and why.
-- "suggested_action": Concrete steps — not generic advice. Reference actual service names, error codes, log groups.
-- "source_log_group": The primary log group where this was detected
-- "error_pattern": A representative error string for deduplication
+- "suggested_action": Concrete steps — not generic advice. Reference actual error codes and the log groups of the evidence you cite.
+- "evidence_ids": The ids of every evidence entry this finding is about. If the same error appears in several log groups, cite all of them; each log group becomes its own finding.
+- "error_pattern": Text copied exactly from the cited evidence messages that every occurrence of this error shares, at most 80 characters. Leave out ids, hashes, timestamps and numbers that change between lines.
 - "suspected_location": The file, function or module the error text points to (from a stack trace, logger name or path in the messages), or null when the logs don't show one. Never guess.
 - "existing_id": If this is the same underlying issue as one of the already-open findings below, that finding's "id"; otherwise null. Reuse an id only for the same issue, even if the wording differs.
+
+Name a service or log group in the title, summary or suggested action only when it is the log_group of evidence you cite. Never infer a service from another log group.
 
 Already-open findings for this account:
 <open_findings>
@@ -596,32 +641,17 @@ Rules:
 
 Return ONLY the JSON array, no surrounding text."""
 
-    try:
-        # Streamed; every attempt (a broken or retried one too) is counted in
-        # the team's usage counters as it happens (usage.call_messages).
-        if usage.is_bedrock():
-            response_data = usage.call_messages_bedrock(
-                build_request_body(prompt), MODEL_ID,
-                dynamodb_client, ANALYTICS_TABLE, team_id, usage.FEATURE_LOG_ANALYSIS,
-            )
-        else:
-            response_data = usage.call_messages(
-                api_key, build_request_body(prompt), MODEL_ID,
-                dynamodb_client, ANALYTICS_TABLE, team_id, usage.FEATURE_LOG_ANALYSIS,
-            )
 
-        recommendations = parse_recommendations(response_text(response_data))
-        if recommendations is None:
-            logger.error("Anthropic response was not a JSON array")
-        return recommendations
-
-    except HTTPError as e:
-        error_body = e.read().decode("utf-8") if e.fp else ""
-        logger.error(f"Anthropic API error ({e.code}): {error_body}")
+def analyze_with_anthropic(evidence, account_id, api_key, existing=None, team_id=None):
+    """The model's findings for this run's evidence (scrubbed when it was
+    built), or None when the call or its JSON failed."""
+    text = ask_model(analysis_prompt(evidence, account_id, existing), api_key, team_id)
+    if text is None:
         return None
-    except Exception as e:
-        logger.error(f"Anthropic analysis failed: {e}", exc_info=True)
-        return None
+    recommendations = parse_recommendations(text)
+    if recommendations is None:
+        logger.error("Anthropic response was not a JSON array")
+    return recommendations
 
 
 def list_pending_recommendations(team_id, account_id):
@@ -680,30 +710,6 @@ def error_hash_for(account_id, rec):
     return hashlib.sha256(raw.encode()).hexdigest()[:16]
 
 
-def error_counts_by_log_group(grouped):
-    """{log group: matching lines in this run}, from the queries' count
-    columns (a row without one counts once)."""
-    counts = {}
-    for entry in grouped:
-        total = 0
-        for q in entry.get("queries", []):
-            for row in q.get("results", []):
-                raw = row.get("error_count") or row.get("crash_count") or 1
-                try:
-                    total += max(int(float(raw)), 0)
-                except (TypeError, ValueError):
-                    total += 1
-        counts[entry.get("log_group", "")] = total
-    return counts
-
-
-def count_for(rec, counts):
-    """Matching lines for a finding's log group, or None when unknown."""
-    if not counts:
-        return None
-    return counts.get(str(rec.get("source_log_group", "")))
-
-
 def suspected_location(rec):
     """The model's code location, when it named one."""
     loc = rec.get("suspected_location")
@@ -726,84 +732,135 @@ def match_existing(rec, existing, error_hash):
     return None
 
 
-def store_recommendation(team_id, account_id, rec, existing, counts=None):
-    """Store a finding, or refresh the open one it repeats.
-    Returns (rec_id, is_new); rec_id is None when the write failed."""
-    error_hash = error_hash_for(account_id, rec)
+def lines_since(cw_logs, group, literal, prev, window):
+    """Matching lines after a stored finding's last_seen_at, for seen_count.
+    None when that time is before this run's window (every line in it is
+    new). 0 when the check can't run: an unanswered question never adds."""
+    start, end = window
+    prev_last = attribution.parse_ts(prev.get("last_seen_at"))
+    if prev_last is None or prev_last.timestamp() < start:
+        return None
+    if cw_logs is None:
+        return 0
+    # Insights takes whole seconds; lines in the same second as the stored
+    # last one are not counted again (a rare undercount, never a double count).
+    checked = attribution.check_group(
+        cw_logs, group, literal, int(prev_last.timestamp()) + 1, end, scrub_secrets
+    )
+    return checked["count"] if checked else 0
+
+
+def store_finding(team_id, account_id, cand, existing, cw_logs=None, window=None):
+    """Store a finding credited to one log group, or refresh the open one it
+    repeats there. `cand` carries the evidence: log_group, account, literal
+    and checked stats (count, first, last, samples). Returns (rec_id, is_new);
+    rec_id is None when the write failed.
+
+    Every number written comes from the stats: error_count = lines in this
+    run's window, seen_count = matching lines over every run, first_seen_at
+    and last_seen_at = the first and last line's own time."""
+    window = window or lookback_window()
+    group = str(cand["log_group"])
+    literal = str(cand["literal"])
+    stats = cand["stats"]
+    error_hash = error_hash_for(account_id, {"source_log_group": group, "error_pattern": literal})
     now = datetime.now(timezone.utc).isoformat()
     # Open findings stay as long as they keep appearing.
     ttl_epoch = int((datetime.now(timezone.utc) + timedelta(days=7)).timestamp())
-    count = count_for(rec, counts)
+    samples = [dict(s) for s in stats.get("samples", [])][: attribution.MAX_SAMPLES]
 
-    match = match_existing(rec, existing, error_hash)
+    # Only a finding in the same log group can be the same finding: a match
+    # by id in another group would move its credit without evidence.
+    same_group = [e for e in existing if e.get("source_log_group", group) == group]
+    match = match_existing(cand, same_group, error_hash)
     if match:
-        update = "SET last_seen_at = :t, updated_at = :t, #ttl = :ttl"
-        values = {":t": now, ":ttl": ttl_epoch, ":one": 1}
-        if count is not None:
-            update += ", error_count = :c"
-            values[":c"] = count
+        new_lines = lines_since(cw_logs, group, literal, match, window)
+        seen, first, last = attribution.merge_seen(match, stats, new_lines)
+        values = {
+            ":t": now,
+            ":ttl": ttl_epoch,
+            ":c": stats["count"],
+            ":seen": seen,
+            ":f": attribution.iso(first) or now,
+            ":l": attribution.iso(last) or now,
+            ":basis": "events",
+            ":samples": samples,
+            ":acct": cand.get("account") or account_id,
+        }
+        sets = (
+            "last_seen_at = :l, first_seen_at = :f, updated_at = :t, error_count = :c, "
+            "seen_count = :seen, count_basis = :basis, samples = :samples, log_account_id = :acct"
+        )
         try:
             aws_insights_table.update_item(
                 Key={"pk": team_id, "sk": match["sk"]},
                 # A finding being fixed has no TTL; seeing it again keeps it so.
-                UpdateExpression=update + " ADD seen_count :one",
+                UpdateExpression=f"SET {sets}, #ttl = :ttl",
                 ConditionExpression="attribute_not_exists(fix_ticket_id)",
                 ExpressionAttributeNames={"#ttl": "ttl"},
                 ExpressionAttributeValues=values,
             )
         except ClientError as e:
             if e.response.get("Error", {}).get("Code") == "ConditionalCheckFailedException":
-                refresh_fixing(team_id, match["sk"], now, count)
+                refresh_fixing(team_id, match["sk"], sets, values)
             else:
                 logger.warning(f"Failed to refresh {match['sk']}: {e}")
         except Exception as e:
             logger.warning(f"Failed to refresh {match['sk']}: {e}")
+        match.update({
+            "last_seen_at": values[":l"], "first_seen_at": values[":f"],
+            "seen_count": seen, "count_basis": "events",
+        })
         return match["rec_id"], False
 
+    first, last = stats.get("first"), stats.get("last")
     rec_id = ulid_now()
     item = {
         "pk": team_id,
         "sk": f"REC#{rec_id}",
         "status": "pending",
-        "severity": rec.get("severity", "info"),
-        "title": str(rec.get("title", "Untitled"))[:200],
-        "summary": str(rec.get("summary", ""))[:2000],
-        "suggested_action": str(rec.get("suggested_action", ""))[:2000],
-        "source_log_group": str(rec.get("source_log_group", ""))[:500],
+        "severity": cand.get("severity", "info"),
+        "title": str(cand.get("title", "Untitled"))[:200],
+        "summary": str(cand.get("summary", ""))[:2000],
+        "suggested_action": str(cand.get("suggested_action", ""))[:2000],
+        "source_log_group": group[:500],
         "source_account_id": account_id,
-        "error_pattern": str(rec.get("error_pattern", ""))[:500],
+        "log_account_id": cand.get("account") or account_id,
+        "error_pattern": literal[:500],
         "error_hash": error_hash,
         "created_at": now,
         "updated_at": now,
-        "last_seen_at": now,
-        "seen_count": 1,
+        "first_seen_at": attribution.iso(first) or now,
+        "last_seen_at": attribution.iso(last) or now,
+        "error_count": stats["count"],
+        "seen_count": stats["count"],
+        "count_basis": "events",
+        "samples": samples,
         "ttl": ttl_epoch,
     }
-    if count is not None:
-        item["error_count"] = count
-    location = suspected_location(rec)
+    location = suspected_location(cand)
     if location:
         item["suspected_location"] = location
     try:
         aws_insights_table.put_item(Item=item)
-        existing.append({"rec_id": rec_id, "sk": f"REC#{rec_id}", "error_hash": error_hash})
+        existing.append({
+            "rec_id": rec_id, "sk": f"REC#{rec_id}", "error_hash": error_hash,
+            "source_log_group": group, "count_basis": "events", "seen_count": stats["count"],
+            "first_seen_at": item["first_seen_at"], "last_seen_at": item["last_seen_at"],
+        })
         return rec_id, True
     except Exception as e:
         logger.error(f"Failed to store recommendation: {e}")
         return None, False
 
 
-def refresh_fixing(team_id, sk, now, count):
+def refresh_fixing(team_id, sk, sets, values):
     """Refresh a finding that has a fix run, keeping it without a TTL."""
-    update = "SET last_seen_at = :t, updated_at = :t"
-    values = {":t": now, ":one": 1}
-    if count is not None:
-        update += ", error_count = :c"
-        values[":c"] = count
+    values = {k: v for k, v in values.items() if k != ":ttl"}
     try:
         aws_insights_table.update_item(
             Key={"pk": team_id, "sk": sk},
-            UpdateExpression=update + " ADD seen_count :one",
+            UpdateExpression=f"SET {sets}",
             ExpressionAttributeValues=values,
         )
     except Exception as e:
@@ -1107,47 +1164,6 @@ def ulid_now():
     rand_part = "".join(random.choices(alphabet, k=16))
 
     return ts_part + rand_part
-
-
-def group_results_by_log_group(all_results):
-    """Reorganize query results so they are grouped by log group."""
-    grouped = {}  # log_group_name -> list of {query_name, description, results}
-
-    for entry in all_results:
-        query_name = entry["query_name"]
-        description = entry["description"]
-        log_groups_in_batch = entry.get("log_groups", [])
-
-        # Split results by @logGroup field if present
-        per_group = {}  # log_group -> [rows]
-        ungrouped = []
-        for row in entry.get("results", []):
-            lg = row.get("@logGroup")
-            if lg:
-                per_group.setdefault(lg, []).append(row)
-            else:
-                ungrouped.append(row)
-
-        # Add grouped rows
-        for lg, rows in per_group.items():
-            grouped.setdefault(lg, []).append(
-                {"query_name": query_name, "description": description, "results": rows}
-            )
-
-        # If no @logGroup field was returned, fall back to batch log groups
-        if ungrouped:
-            key = ", ".join(log_groups_in_batch[:3])
-            if len(log_groups_in_batch) > 3:
-                key += f" (+{len(log_groups_in_batch) - 3} more)"
-            grouped.setdefault(key or "unknown", []).append(
-                {"query_name": query_name, "description": description, "results": ungrouped}
-            )
-
-    # Convert to a list format for the prompt
-    return [
-        {"log_group": lg, "queries": queries}
-        for lg, queries in sorted(grouped.items())
-    ]
 
 
 def chunk_list(lst, chunk_size):

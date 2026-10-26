@@ -124,8 +124,9 @@ pub fn finding_json(
         "account_id": f.source_account_id,
         "error_pattern": f.error_pattern,
         "error_count": f.error_count,
-        "seen_count": f.seen_count,
-        "first_seen": f.created_at,
+        // Lines, only once the analyzer counts lines (see Finding::events_seen).
+        "seen_count": f.events_seen(),
+        "first_seen": f.first_seen_at,
         "last_seen": f.last_seen_at,
         "suspected_location": (!f.suspected_location.is_empty()).then_some(&f.suspected_location),
         "plan_id": (!f.plan_id.is_empty()).then_some(&f.plan_id),
@@ -739,6 +740,23 @@ mod tests {
         assert!(
             plain["fix"].is_null() && plain["console_url"].is_null() && plain["repo"].is_null()
         );
+    }
+
+    #[test]
+    fn a_row_shows_the_lines_own_times_and_count() {
+        let mut f = finding();
+        f.first_seen_at = "2026-10-24T09:12:00.000+00:00".into();
+        f.last_seen_at = "2026-10-25T05:59:00.000+00:00".into();
+        f.seen_count = Some(44534);
+        f.count_basis = "events".into();
+        let row = finding_json(&f, lf::FixState::None, None, &AutoFix::default(), None);
+        assert_eq!(row["first_seen"], "2026-10-24T09:12:00.000+00:00");
+        assert_eq!(row["last_seen"], "2026-10-25T05:59:00.000+00:00");
+        assert_eq!(row["seen_count"], 44534);
+        // An older item counted analyses: no line count is claimed.
+        f.count_basis.clear();
+        let row = finding_json(&f, lf::FixState::None, None, &AutoFix::default(), None);
+        assert!(row["seen_count"].is_null());
     }
 
     #[test]
