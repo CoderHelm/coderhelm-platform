@@ -364,21 +364,6 @@ if __name__ == "__main__":
 
 
 class FindingCounts(unittest.TestCase):
-    GROUPED = [
-        {"log_group": "/aws/lambda/shop", "queries": [
-            {"results": [{"error_count": "12"}, {"error_count": "3"}]},
-            {"results": [{"@message": "no count column"}]},
-        ]},
-        {"log_group": "/ecs/web", "queries": [{"results": [{"crash_count": "2"}, {"crash_count": "x"}]}]},
-    ]
-
-    def test_counts_sum_per_log_group(self):
-        counts = h.error_counts_by_log_group(self.GROUPED)
-        self.assertEqual(counts, {"/aws/lambda/shop": 16, "/ecs/web": 3})
-        self.assertEqual(h.count_for({"source_log_group": "/ecs/web"}, counts), 3)
-        self.assertIsNone(h.count_for({"source_log_group": "/missing"}, counts))
-        self.assertIsNone(h.count_for({"source_log_group": "/ecs/web"}, None))
-
     def test_suspected_location_is_kept_only_when_named(self):
         self.assertEqual(h.suspected_location({"suspected_location": " src/checkout.py:42 "}), "src/checkout.py:42")
         for empty in (None, "", "null", "Unknown", 5):
@@ -408,19 +393,26 @@ class StoreFindings(unittest.TestCase):
     def tearDown(self):
         h.aws_insights_table = self.saved
 
+    @staticmethod
+    def cand(group="/aws/lambda/shop", literal="Task timed out", count=16, **kw):
+        t = h.attribution.parse_ts
+        stats = {"count": count, "first": t("2026-10-25 01:00:00.000"), "last": t("2026-10-25 05:00:00.000"),
+                 "samples": [{"log_group": group, "log_stream": "s1", "timestamp": "x", "message": literal}]}
+        return {"title": "Timeouts", "log_group": group, "account": "111122223333", "literal": literal,
+                "stats": stats, **kw}
+
     def test_a_new_finding_stores_its_count_and_location(self):
         h.aws_insights_table = t = self.Table()
-        rec = {"title": "Timeouts", "source_log_group": "/aws/lambda/shop", "error_pattern": "Task timed out",
-               "suspected_location": "handler.py"}
-        rec_id, new = h.store_recommendation("TEAM#a", "111122223333", rec, [], {"/aws/lambda/shop": 16})
+        rec_id, new = h.store_finding("TEAM#a", "111122223333", self.cand(suspected_location="handler.py"), [])
         self.assertTrue(new and rec_id)
         item = t.calls[0][1]
         self.assertEqual((item["error_count"], item["suspected_location"]), (16, "handler.py"))
 
     def test_a_finding_being_fixed_is_refreshed_without_a_ttl(self):
         h.aws_insights_table = t = self.Table(fail_condition=True)
-        existing = [{"rec_id": "r1", "sk": "REC#r1", "error_hash": h.error_hash_for("111122223333", {"source_log_group": "/g", "error_pattern": "p"})}]
-        rec_id, new = h.store_recommendation("TEAM#a", "111122223333", {"source_log_group": "/g", "error_pattern": "p"}, existing, {"/g": 4})
+        existing = [{"rec_id": "r1", "sk": "REC#r1", "source_log_group": "/g",
+                     "error_hash": h.error_hash_for("111122223333", {"source_log_group": "/g", "error_pattern": "Task timed out"})}]
+        rec_id, new = h.store_finding("TEAM#a", "111122223333", self.cand(group="/g", count=4), existing)
         self.assertEqual((rec_id, new), ("r1", False))
         first, second = t.calls
         self.assertIn("attribute_not_exists(fix_ticket_id)", first[1]["ConditionExpression"])
