@@ -26,7 +26,7 @@ The updater (a Lambda in your account) checks GitHub for releases every hour, ke
 
 ## Automatic updates
 
-Turn them on in **Settings, then System**, or:
+Turn them on in **Settings, then System**, at install (the install guide's **More options**, or the Launch Stack's `AutoUpdate`, `UpdateWindow` and `UpdateTimezone`), or:
 
 ```sh
 npx -y github:CoderHelm/coderhelm-platform auto-update on --window "Sun 03:00" --timezone Europe/Berlin --channel stable --majors ask

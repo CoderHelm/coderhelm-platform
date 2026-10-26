@@ -32,6 +32,8 @@ export function serviceEnvironment(cfg: ResolvedConfig, account: string): Record
   // the updater the system routes ask. The hosted deployment has neither.
   if (cfg.layout === "single-origin") {
     Object.assign(env, stampEnvironment(releaseStamp(cfg)));
+    // Whether "Sign in with Google" is on (Settings, then Setup checks it).
+    env.GOOGLE_SIGN_IN = cfg.integrations.googleSignIn ? "true" : "false";
     if (cfg.updates.enabled) env.UPDATER_FUNCTION_NAME = `${cfg.prefix}-updater`;
   }
   // The services read the secret once at start. The installer sets this to

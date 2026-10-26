@@ -15,6 +15,8 @@ The deploy creates an SES identity for `email.identity` (by default the domain o
 - **One address** (`"identity": "coderhelm@example.com"`): SES emails it a confirmation link. Good for trying CoderHelm out.
 - **null:** you manage the identity yourself.
 
+The install guide's **Optional setup** list and **Settings, then Setup** check both: the identity (`email_identity`) and the sandbox (`email_sandbox`), each with the console link pre-filled for your region.
+
 ## Leaving the SES sandbox
 
 New AWS accounts are in the SES sandbox: email only reaches verified addresses, at most 200 a day. Request production access in the SES console (**Account dashboard, Request production access**), saying CoderHelm sends transactional email to your own team. The doctor (`coderhelm-selfhost doctor`) and **Settings, then Setup** tell you which mode you are in and print the DKIM records to add.

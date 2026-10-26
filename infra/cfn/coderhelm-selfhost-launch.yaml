@@ -23,6 +23,8 @@ Metadata:
         Parameters: [Hostname, HostedZone]
       - Label: { default: "Optional" }
         Parameters: [EmailFrom, SignupDomain, BedrockInferencePrefix, Telemetry]
+      - Label: { default: "Optional: updates (you can change these later in Settings, System)" }
+        Parameters: [AutoUpdate, UpdateWindow, UpdateTimezone]
       - Label: { default: "Filled in by the install guide (leave as they are)" }
         Parameters: [StatusId, SetupToken]
     ParameterLabels:
@@ -36,6 +38,9 @@ Metadata:
       SignupDomain: { default: "Who else may sign up" }
       BedrockInferencePrefix: { default: "Bedrock inference profile" }
       Telemetry: { default: "Anonymous install pings" }
+      AutoUpdate: { default: "Install new releases by themselves" }
+      UpdateWindow: { default: "Maintenance window" }
+      UpdateTimezone: { default: "Time zone of the window" }
       StatusId: { default: "Progress ID" }
       SetupToken: { default: "Setup key" }
 
@@ -66,12 +71,15 @@ Parameters:
   Hostname:
     Type: String
     Default: ""
-    Description: e.g. coderhelm.example.com. Empty for a free CloudFront address (you can add a domain later).
+    Description: >
+      e.g. coderhelm.example.com. Empty for a free CloudFront address (you can add a domain later in Settings, System).
+      A Route 53 zone in this account is found and set up for you; with any other DNS provider the install guide
+      shows the two records to add, and CoderHelm moves to the domain once they are in place.
     AllowedPattern: "^$|^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\\.)+[a-z]{2,63}$"
   HostedZone:
     Type: String
     Default: ""
-    Description: The Route 53 public hosted zone the hostname is in, e.g. example.com.
+    Description: Leave empty (the zone is found in this account). Only to pick one, e.g. example.com.
     AllowedPattern: "^$|^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\\.)+[a-z]{2,63}$"
   EmailFrom:
     Type: String
@@ -93,6 +101,23 @@ Parameters:
     Default: "off"
     AllowedValues: ["off", "on"]
     Description: Send anonymous install pings (release and region only) to CoderHelm.
+  AutoUpdate:
+    Type: String
+    Default: "off"
+    AllowedValues: ["off", "on"]
+    Description: on installs each new release in the maintenance window (health checked, rolled back if unhealthy). off emails the admins about each release.
+  UpdateWindow:
+    Type: String
+    Default: "Sun 03:00"
+    AllowedPattern: "^((Mon|Tue|Wed|Thu|Fri|Sat|Sun|daily) ([01]\\d|2[0-3]):00)$"
+    ConstraintDescription: a day (or daily) and an hour, e.g. Sun 03:00 or daily 02:00
+    Description: When updates may run, e.g. Sun 03:00 or daily 02:00.
+  UpdateTimezone:
+    Type: String
+    Default: UTC
+    AllowedPattern: "^(UTC|[A-Za-z_]+(/[A-Za-z0-9_+-]+)+)$"
+    ConstraintDescription: an IANA time zone such as Europe/Berlin
+    Description: The window's time zone, e.g. Europe/Berlin.
   StatusId:
     Type: String
     Default: ""
@@ -181,6 +206,9 @@ Resources:
           - { Name: BEDROCK_PREFIX, Value: !Ref BedrockInferencePrefix }
           - { Name: SIGNUP_DOMAIN, Value: !Ref SignupDomain }
           - { Name: TELEMETRY, Value: !Ref Telemetry }
+          - { Name: AUTO_UPDATE, Value: !Ref AutoUpdate }
+          - { Name: UPDATE_WINDOW, Value: !Ref UpdateWindow }
+          - { Name: UPDATE_TIMEZONE, Value: !Ref UpdateTimezone }
           - { Name: STATUS_BUCKET, Value: !If [HasStatus, !Ref StatusBucket, ""] }
           - { Name: SETUP_TOKEN, Value: !Ref SetupToken }
           - { Name: WAIT_URL, Value: "" }

@@ -243,6 +243,14 @@ export class WebStack extends cdk.Stack {
       description: "CoderHelm's public URL (dashboard and API)",
     });
 
+    // CloudFront's own hostname, the target of the DNS record for a domain
+    // added later (the updater shows it; docs/self-host/domains.md).
+    new ssm.StringParameter(this, "DistributionDomainParameter", {
+      parameterName: cfg.distributionDomainParameter,
+      stringValue: this.distribution.distributionDomainName,
+      description: "CloudFront's own hostname for CoderHelm (the CNAME target for your own domain)",
+    });
+
     // --- Dashboard upload ---
     const runtimeConfig = s3deploy.Source.data("runtime-config.js", runtimeConfigScript(cfg));
     const assetDir = cfg.dashboardAssetDir ? path.resolve(cfg.dashboardAssetDir) : null;

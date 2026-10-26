@@ -3,8 +3,8 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
-  bedrockPrefixFor, configFromEnv, createProgress, explainFailure, logGroup, logUrl, redact, run, secretName,
-  statusDoc, withSetupToken,
+  bedrockPrefixFor, configFromEnv, createProgress, domainPlan, explainFailure, findZone, isDelegated, logGroup, logUrl,
+  publicDomain, redact, run, secretName, statusDoc, updatesFromEnv, withSetupToken,
 } from "./bootstrap.mjs";
 
 const ENV = {
@@ -45,7 +45,7 @@ test("config: anthropic has no Bedrock prefix; explicit prefixes are kept", () =
 test("config: plain sentences for settings that can't work", () => {
   assert.throws(() => configFromEnv({ ...ENV, ADMIN_EMAIL: "nope" }, { account: "123456789012" }), /admin email/);
   assert.throws(() => configFromEnv({ ...ENV, HOSTNAME_ARG: "ch.other.com", HOSTED_ZONE: "example.com" }, { account: "123456789012" }), /not inside the hosted zone/);
-  assert.throws(() => configFromEnv({ ...ENV, HOSTNAME_ARG: "ch.example.com" }, { account: "123456789012" }), /hosted zone/);
+  assert.throws(() => configFromEnv({ ...ENV, HOSTNAME_ARG: "not a host" }, { account: "123456789012" }), /not a hostname/);
   assert.throws(() => configFromEnv(ENV, { account: "x" }), /account number/);
 });
 
@@ -176,4 +176,87 @@ test("run: no setup key, no secret write", async () => {
   const { deps, calls } = fakes();
   await run({ env: { ...ENV, SETUP_TOKEN: "" }, deps, log: () => {} });
   assert.equal(calls.secret, null);
+});
+
+// ── Your own domain ───────────────────────────────────────────────────────
+
+const ZONES = [
+  { Id: "/hostedzone/ZROOT", Name: "example.com.", Config: { PrivateZone: false } },
+  { Id: "/hostedzone/ZPRIV", Name: "ch.example.com.", Config: { PrivateZone: true } },
+];
+
+test("domain: the zone is found in the account; private zones and other domains never match", () => {
+  assert.deepEqual(findZone(ZONES, "ch.example.com"), { name: "example.com", id: "ZROOT" });
+  assert.equal(findZone(ZONES, "ch.example.net"), null);
+  assert.equal(findZone(ZONES, "badexample.com"), null);
+  assert.ok(isDelegated(["ns-1.awsdns-01.org.", "NS-2.awsdns-02.com"], ["ns-2.awsdns-02.com", "ns-1.awsdns-01.org"]));
+  assert.ok(!isDelegated(["ns-1.awsdns-01.org"], ["dns1.registrar.example"]));
+  assert.ok(!isDelegated([], []));
+});
+
+test("domain: a delegated Route 53 zone is set up by the deploy; anything else waits for its certificate", () => {
+  const host = { ...ENV, HOSTNAME_ARG: "ch.example.com" };
+  assert.deepEqual(domainPlan(ENV), { mode: "none" });
+  assert.deepEqual(domainPlan(host, { name: "example.com", id: "ZROOT", delegated: true }), { mode: "route53", hostname: "ch.example.com", zone: "example.com", zoneId: "ZROOT" });
+  assert.deepEqual(domainPlan(host, { name: "example.com", id: "ZROOT", delegated: false }), { mode: "external", hostname: "ch.example.com" });
+  assert.deepEqual(domainPlan(host, null), { mode: "external", hostname: "ch.example.com" });
+  // Route 53: the domain is in the config with the zone id (no lookup at synth).
+  const r53 = configFromEnv(host, { account: "123456789012", found: { name: "example.com", id: "ZROOT", delegated: true } });
+  assert.deepEqual(r53.domain, { hostname: "ch.example.com", hostedZone: "example.com", hostedZoneId: "ZROOT" });
+  // Elsewhere: the AWS address first.
+  assert.equal(configFromEnv(host, { account: "123456789012" }).domain, null);
+});
+
+test("domain: the progress file holds the records to add and nothing else about the account", () => {
+  const d = publicDomain({ hostname: "CH.example.com.", mode: "external", state: "validating", certificateArn: "arn:aws:acm:us-east-1:123456789012:certificate/x",
+    records: [{ purpose: "certificate", name: "_a1.ch.example.com.", type: "CNAME", value: "_b2.acm-validations.aws." }, { purpose: "address", name: "ch.example.com", type: "CNAME", value: "d111.cloudfront.net" }] });
+  assert.deepEqual(d, { hostname: "ch.example.com", mode: "external", state: "validating", records: [
+    { purpose: "certificate", name: "_a1.ch.example.com", type: "CNAME", value: "_b2.acm-validations.aws" },
+    { purpose: "address", name: "ch.example.com", type: "CNAME", value: "d111.cloudfront.net" },
+  ] });
+  assert.equal(publicDomain(null), null);
+  assert.equal(statusDoc({ phase: "done" }).domain, null);
+});
+
+test("run: another DNS provider: the AWS address now, the certificate requested, its records in the progress file", async () => {
+  const asked = [];
+  const { deps, calls } = fakes({
+    findZone: async () => null,
+    setDomain: async (stage, host) => (asked.push([stage, host]), { ok: true, state: "validating", records: [{ purpose: "certificate", name: "_a1.ch.example.com", type: "CNAME", value: "_b2.acm-validations.aws" }] }),
+  });
+  const doc = await run({ env: { ...ENV, HOSTNAME_ARG: "ch.example.com" }, deps, log: () => {} });
+  assert.equal(doc.phase, "done");
+  assert.equal(doc.url, "https://d111.cloudfront.net");
+  assert.equal(calls.config.domain, null);
+  assert.deepEqual(asked, [["prod", "ch.example.com"]]);
+  assert.equal(doc.domain.mode, "external");
+  assert.equal(doc.domain.records[0].value, "_b2.acm-validations.aws");
+});
+
+test("run: a Route 53 zone in the account: the deploy does it all, nothing to add", async () => {
+  const { deps, calls } = fakes({
+    findZone: async () => ({ name: "example.com", id: "ZROOT", delegated: true }),
+    setDomain: async () => assert.fail("no certificate request"),
+    readState: () => ({ publicUrl: "https://ch.example.com" }),
+  });
+  const doc = await run({ env: { ...ENV, HOSTNAME_ARG: "ch.example.com" }, deps, log: () => {} });
+  assert.equal(calls.config.domain.hostedZone, "example.com");
+  assert.deepEqual(doc.domain, { hostname: "ch.example.com", mode: "route53", state: "live", records: [] });
+  assert.equal(doc.url, "https://ch.example.com");
+});
+
+test("run: a certificate request that fails still finishes the install, marked for Settings", async () => {
+  const { deps } = fakes({ findZone: async () => null, setDomain: async () => ({ ok: false, error: "enter a domain you own" }) });
+  const doc = await run({ env: { ...ENV, HOSTNAME_ARG: "ch.example.com" }, deps, log: () => {} });
+  assert.equal(doc.phase, "done");
+  assert.equal(doc.domain.state, "failed");
+});
+
+test("updates: off by default; on with a window and time zone from the stack", () => {
+  assert.equal(configFromEnv(ENV, { account: "123456789012" }).updates, undefined);
+  assert.equal(updatesFromEnv({ AUTO_UPDATE: "off", UPDATE_WINDOW: "Sun 03:00", UPDATE_TIMEZONE: "UTC" }), null);
+  assert.deepEqual(configFromEnv({ ...ENV, AUTO_UPDATE: "on", UPDATE_WINDOW: "daily 02:00", UPDATE_TIMEZONE: "Europe/Berlin" }, { account: "123456789012" }).updates,
+    { auto: true, window: "daily 02:00", timezone: "Europe/Berlin" });
+  assert.throws(() => updatesFromEnv({ UPDATE_WINDOW: "whenever" }), /maintenance window/);
+  assert.throws(() => updatesFromEnv({ UPDATE_TIMEZONE: "Mars" }), /time zone/);
 });

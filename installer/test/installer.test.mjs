@@ -578,3 +578,53 @@ test("an app made by hand: flags and environment, never argv secrets", () => {
   assert.match(keys.github_private_key, /PRIVATE KEY/);
   assert.throws(() => cmd.manualAppKeys({ appId: "x" }, {}), /--app-id[\s\S]*GITHUB_CLIENT_SECRET/);
 });
+
+// ── domain apply (docs/self-host/domains.md) ─────────────────────────────
+
+import { withDomain, describeChange } from "../lib/domain.mjs";
+
+const CERT = `arn:aws:acm:us-east-1:${ACCOUNT}:certificate/0f0e0d0c-1111-2222-3333-444455556666`;
+
+test("withDomain: another DNS provider, a Route 53 zone, removal, and plain refusals", () => {
+  const cfg = { account: ACCOUNT, domain: null, integrations: {} };
+  assert.deepEqual(withDomain(cfg, { hostname: "Helm.Example.org.", certificateArn: CERT }).domain, { hostname: "helm.example.org", certificateArn: CERT });
+  assert.deepEqual(withDomain(cfg, { hostname: "helm.example.org", certificateArn: CERT, zone: "example.org", zoneId: "ZTEST000001" }).domain,
+    { hostname: "helm.example.org", certificateArn: CERT, hostedZone: "example.org", hostedZoneId: "ZTEST000001" });
+  assert.equal(withDomain({ ...cfg, domain: { hostname: "a.example.org", hostedZone: "example.org" } }, { action: "remove" }).domain, null);
+  assert.throws(() => withDomain(cfg, { hostname: "helm", certificateArn: CERT }), /--hostname must be a hostname/);
+  assert.throws(() => withDomain(cfg, { hostname: "helm.example.org", certificateArn: CERT.replace("us-east-1", "eu-west-1") }), /us-east-1/);
+  assert.throws(() => withDomain(cfg, { hostname: "helm.example.org", certificateArn: CERT, zone: "example.net" }), /not inside the zone/);
+  assert.throws(() => withDomain({ ...cfg, integrations: { googleSignIn: true } }, { action: "remove" }), /Google sign-in needs a domain/);
+  assert.equal(describeChange(null, { hostname: "helm.example.org" }), "the AWS address to https://helm.example.org");
+});
+
+test("domain apply: writes the domain into the config and redeploys the release that runs, no bootstrap", async () => {
+  const { dir, file } = stateDir("v1.2.0");
+  const sources = [];
+  const runner = healthyThen(99);
+  const result = path.join(dir, "r.json");
+  const { code, out } = await run(["domain", "apply", "--config", file, "--hostname", "helm.example.org", "--certificate-arn", CERT, "--zone", "", "--zone-id", "", "--yes", "--result-file", result],
+    { runner, resolveSource: fakeSource(sources) });
+  assert.equal(code, 0, out);
+  assert.deepEqual(sources, ["v1.2.0"]);
+  assert.deepEqual(JSON.parse(fs.readFileSync(file, "utf8")).domain, { hostname: "helm.example.org", certificateArn: CERT });
+  const lines = runner.lines();
+  assert.ok(lines.some((l) => l.includes("cdk deploy --all")), lines.join("\n"));
+  assert.ok(!lines.some((l) => l.includes("cdk bootstrap")), "no bootstrap");
+  assert.match(out, /CNAME record/);
+  assert.equal(JSON.parse(fs.readFileSync(result, "utf8")).status, "succeeded");
+});
+
+test("domain apply: bad values fail before deploying, and the result file says why", async () => {
+  const { dir, file } = stateDir("v1.2.0");
+  const runner = healthyThen(99);
+  const result = path.join(dir, "r.json");
+  await assert.rejects(
+    () => main(["domain", "apply", "--config", file, "--hostname", "helm", "--certificate-arn", CERT, "--result-file", result],
+      { runner, resolveSource: fakeSource([]), log: () => {}, interactive: false, ask: quietAsk() }),
+    /--hostname must be a hostname/,
+  );
+  assert.ok(!runner.commands.some((c) => c.args.includes("deploy")));
+  assert.equal(JSON.parse(fs.readFileSync(file, "utf8")).domain, null, "config unchanged");
+  assert.equal(JSON.parse(fs.readFileSync(result, "utf8")).status, "failed");
+});

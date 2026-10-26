@@ -2,6 +2,7 @@
 import * as cmd from "./commands.mjs";
 import { wizard } from "./wizard.mjs";
 import { doctor } from "./doctor.mjs";
+import { domain } from "./domain.mjs";
 import fs from "node:fs";
 import path from "node:path";
 import { Runner } from "./runner.mjs";
@@ -35,6 +36,10 @@ Commands
   backup        Take on-demand backups of every table
   uninstall     Delete the stacks (tables, bucket and secret are kept)
   telemetry     on | off | status: anonymous install and upgrade pings (off by default)
+  domain apply  Put your own domain on the install (--hostname, --certificate-arn
+                in us-east-1, and --zone/--zone-id for a Route 53 zone), or
+                --action remove for the AWS address. Settings, then System
+                does all of it with checks and the DNS records to add
   pull          Write the config and state from the account (--stage, --region),
                 to manage an install from another machine
   version       The installer's, the installed and the latest version
@@ -103,6 +108,8 @@ export async function main(argv, deps = {}) {
       case "pull":
         await cmd.pull(ctx);
         return 0;
+      case "domain":
+        return (await domain(ctx)).status === "succeeded" ? 0 : 1;
       case "update":
       case "upgrade": {
         const r = await cmd.update(ctx);

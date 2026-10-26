@@ -213,6 +213,12 @@ export interface ResolvedConfig {
   apiUrl: string | null;
   /** SSM parameter holding the public URL (single-origin). */
   publicUrlParameter: string;
+  /**
+   * SSM parameter holding CloudFront's own hostname (`dxxxx.cloudfront.net`,
+   * single-origin): the value of the DNS record people add for their own
+   * domain. The updater reads it (docs/self-host/domains.md).
+   */
+  distributionDomainParameter: string;
   singleOrigin: SingleOriginDomain | null;
   split: SplitLayout | null;
   models: {
@@ -536,6 +542,7 @@ export function resolveConfig(cfg: CoderhelmConfig, opts: { skipValidation?: boo
     appUrl,
     apiUrl,
     publicUrlParameter: `/${prefix}/public-url`,
+    distributionDomainParameter: `/${prefix}/distribution-domain`,
     singleOrigin,
     split,
     models: {

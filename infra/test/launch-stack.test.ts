@@ -29,6 +29,11 @@ test("parses, with the parameters the install guide fills in", () => {
   assert.equal(t.Parameters.ModelProvider.Default, "bedrock", "no API key needed to start");
   assert.equal(t.Parameters.Hostname.Default, "", "no DNS work by default");
   assert.equal(t.Parameters.EmailFrom.Default, "", "the admin's own address by default: no DNS work");
+  assert.equal(t.Parameters.HostedZone.Default, "", "the zone is found in the account");
+  assert.match(t.Parameters.Hostname.Description, /any other DNS provider/);
+  assert.equal(t.Parameters.AutoUpdate.Default, "off", "updates wait for an admin by default");
+  assert.equal(t.Parameters.UpdateWindow.Default, "Sun 03:00");
+  assert.equal(t.Parameters.UpdateTimezone.Default, "UTC");
   // Quick-create links ignore NoEcho parameters, so the guide's values can't be NoEcho.
   assert.equal(t.Parameters.SetupToken.NoEcho, undefined);
   assert.equal(t.Parameters.StatusId.NoEcho, undefined);
@@ -91,4 +96,10 @@ test("the installer's log outlives a rollback (no log group resource; names foll
   const t = load();
   t.resourceCountIs("AWS::Logs::LogGroup", 0);
   t.hasResourceProperties("AWS::CodeBuild::Project", { Name: { "Fn::Sub": "${AWS::StackName}-installer" } });
+});
+
+test("the domain and update settings reach the installer", () => {
+  const t = load();
+  const env = JSON.stringify(t.findResources("AWS::CodeBuild::Project"));
+  for (const v of ["HOSTNAME_ARG", "HOSTED_ZONE", "AUTO_UPDATE", "UPDATE_WINDOW", "UPDATE_TIMEZONE"]) assert.ok(env.includes(v), v);
 });

@@ -113,7 +113,7 @@ class Handler(unittest.TestCase):
         self.db = FakeDynamo()
         self.store = u.Store(self.db, "t")
         self.builds, self.notices = [], []
-        u.start_build = lambda env, version, actor, mode, hid: self.builds.append((version, actor, mode, hid)) or f"b-{len(self.builds)}"
+        u.start_build = lambda env, version, actor, mode, hid, extra=None: self.builds.append((version, actor, mode, hid)) or f"b-{len(self.builds)}"
         u.notify = lambda subject, text, env=None: self.notices.append(subject) or 1
         self.env = {"CODERHELM_VERSION": "v1.0.0", "APP_URL": "https://helm.example.org", "UPDATE_PROJECT_NAME": "p"}
 
@@ -218,3 +218,192 @@ class RefreshSecrets(unittest.TestCase):
             u._clients.pop("lambda", None)
         self.assertEqual(out, {"refreshed": ["f-gateway", "f-worker"]})
         self.assertEqual(lam.env["f-worker"]["SECRETS_REVISION"], "abc-123rm-rf")
+
+
+# ── Your own domain ───────────────────────────────────────────────────────
+
+ARN = "arn:aws:acm:us-east-1:111122223333:certificate/0f0e0d0c-1111-2222-3333-444455556666"
+VALIDATION = {"Name": "_a1b2.helm.example.org.", "Type": "CNAME", "Value": "_c3d4.xyz.acm-validations.aws."}
+
+
+class FakeAcm:
+    def __init__(self, status="PENDING_VALIDATION", ready_after=0):
+        self.status = status
+        self.reason = None
+        self.ready_after = ready_after
+        self.requests = []
+
+    def request_certificate(self, **kw):
+        self.requests.append(kw)
+        return {"CertificateArn": ARN}
+
+    def describe_certificate(self, CertificateArn):
+        opts = [{"DomainName": "helm.example.org"}]
+        if self.ready_after <= 0:
+            opts[0]["ResourceRecord"] = VALIDATION
+        self.ready_after -= 1
+        c = {"Status": self.status, "DomainValidationOptions": opts}
+        if self.reason:
+            c["FailureReason"] = self.reason
+        return {"Certificate": c}
+
+
+class FakeRoute53:
+    def __init__(self, zones):
+        self.zones = zones
+        self.changes = []
+
+    def list_hosted_zones(self, **kw):
+        return {"HostedZones": self.zones, "IsTruncated": False}
+
+    def change_resource_record_sets(self, HostedZoneId, ChangeBatch):
+        self.changes.append((HostedZoneId, ChangeBatch))
+
+    def get_hosted_zone(self, Id):
+        return {"DelegationSet": {"NameServers": ["ns-1.awsdns-01.org.", "ns-2.awsdns-02.com."]}}
+
+
+class FakeSsm:
+    def get_parameter(self, Name):
+        return {"Parameter": {"Value": "d111test.cloudfront.net"}}
+
+
+class Domain(unittest.TestCase):
+    def setUp(self):
+        self.db = FakeDynamo()
+        self.store = u.Store(self.db, "t")
+        self.builds, self.notices = [], []
+        self._start, self._notify = u.start_build, u.notify
+        u.start_build = lambda env, version, actor, mode, hid, extra=None: self.builds.append((version, actor, mode, extra)) or "b-1"
+        u.notify = lambda subject, text, env=None: self.notices.append(subject) or 1
+        self.acm = FakeAcm()
+        self.r53 = FakeRoute53([])
+        u._clients.update({"acm@us-east-1": self.acm, "route53": self.r53, "ssm": FakeSsm()})
+        self.env = {"CODERHELM_VERSION": "v1.2.0", "APP_URL": "https://d111test.cloudfront.net", "UPDATE_PROJECT_NAME": "p",
+                    "DISTRIBUTION_DOMAIN_PARAMETER": "/coderhelm-prod/distribution-domain", "RESOURCE_PREFIX": "coderhelm-prod"}
+
+    def tearDown(self):
+        u.start_build, u.notify = self._start, self._notify
+        for k in ("acm@us-east-1", "route53", "ssm"):
+            u._clients.pop(k, None)
+
+    def h(self, event, now=SUNDAY_3AM, env=None):
+        return u.handle(event, env or self.env, self.store, now)
+
+    def test_hostnames_are_cleaned_and_bad_ones_refused_in_plain_words(self):
+        self.assertEqual(u.clean_hostname(" https://Helm.Example.org/ "), "helm.example.org")
+        for bad in ("", "localhost", "helm", "-x.example.org", "d111.cloudfront.net", "a b.example.org"):
+            with self.assertRaises(ValueError, msg=bad):
+                u.clean_hostname(bad)
+
+    def test_the_longest_public_zone_wins_and_private_zones_never_do(self):
+        zones = [
+            {"Id": "/hostedzone/ZROOT", "Name": "example.org.", "Config": {"PrivateZone": False}},
+            {"Id": "/hostedzone/ZSUB", "Name": "dev.example.org.", "Config": {"PrivateZone": False}},
+            {"Id": "/hostedzone/ZPRIV", "Name": "helm.dev.example.org.", "Config": {"PrivateZone": True}},
+        ]
+        self.assertEqual(u.find_zone(zones, "helm.dev.example.org"), {"name": "dev.example.org", "id": "ZSUB"})
+        self.assertEqual(u.find_zone(zones, "example.org")["id"], "ZROOT")
+        self.assertIsNone(u.find_zone(zones, "helm.example.net"))
+        self.assertIsNone(u.find_zone(zones, "badexample.org"))
+
+    def test_no_domain_reports_the_aws_address(self):
+        v = self.h({"action": "domain_status"})
+        self.assertEqual((v["state"], v["hostname"], v["target"]), ("none", None, "d111test.cloudfront.net"))
+        v = self.h({"action": "domain_status"}, env=dict(self.env, APP_URL="https://helm.example.org"))
+        self.assertEqual((v["state"], v["mode"], v["hostname"]), ("live", "config", "helm.example.org"))
+
+    def test_external_dns_shows_both_records_then_attaches_once_issued(self):
+        v = self.h({"action": "domain_set", "hostname": "helm.example.org", "actor": "owner@example.org"})
+        self.assertEqual((v["state"], v["mode"]), ("validating", "external"))
+        self.assertEqual(self.acm.requests[0]["DomainName"], "helm.example.org")
+        self.assertEqual(self.acm.requests[0]["ValidationMethod"], "DNS")
+        self.assertEqual(v["records"], [
+            {"purpose": "certificate", "name": "_a1b2.helm.example.org", "type": "CNAME", "value": "_c3d4.xyz.acm-validations.aws"},
+            {"purpose": "address", "name": "helm.example.org", "type": "CNAME", "value": "d111test.cloudfront.net"},
+        ])
+        self.assertNotIn("111122223333", json.dumps(v))
+        self.assertEqual(self.builds, [])
+        self.assertEqual(self.h({"action": "domain_status"})["state"], "validating")
+        self.acm.status = "ISSUED"
+        v = self.h({"action": "domain_status"})
+        self.assertEqual(v["state"], "attaching")
+        version, actor, mode, extra = self.builds[0]
+        self.assertEqual((version, actor, mode), ("v1.2.0", "owner@example.org", "domain"))
+        self.assertEqual(extra["DOMAIN_ACTION"], "attach")
+        self.assertEqual(extra["DOMAIN_CERT"], ARN)
+        self.assertEqual(extra["DOMAIN_ZONE"], "")
+        self.h({"action": "domain_status"})
+        self.assertEqual(len(self.builds), 1)
+        hid = self.store.get("DOMAIN")["history_id"]
+        r = self.h({"action": "finished", "status": "succeeded", "history_id": hid})
+        self.assertEqual(r["domain"], "live")
+        self.assertEqual(self.notices[-1], "CoderHelm now answers on helm.example.org")
+        self.assertNotIn("failed_versions", self.store.get("UPDATE_STATE"))
+
+    def test_a_route53_zone_gets_the_validation_record_automatically(self):
+        self.r53.zones = [{"Id": "/hostedzone/ZTEST1", "Name": "example.org.", "Config": {"PrivateZone": False}}]
+        self.acm.ready_after = 2
+        v = u.domain_set(self.store, self.env, SUNDAY_3AM, "helm.example.org", "a", sleep=lambda s: None)
+        self.assertEqual((v["mode"], v["zone"], v["records"]), ("route53", "example.org", []))
+        self.assertEqual(v["name_servers"], ["ns-1.awsdns-01.org", "ns-2.awsdns-02.com"])
+        zone_id, batch = self.r53.changes[0]
+        self.assertEqual(zone_id, "ZTEST1")
+        rr = batch["Changes"][0]["ResourceRecordSet"]
+        self.assertEqual((batch["Changes"][0]["Action"], rr["Name"], rr["ResourceRecords"][0]["Value"]),
+                         ("UPSERT", "_a1b2.helm.example.org.", "_c3d4.xyz.acm-validations.aws."))
+        self.acm.status = "ISSUED"
+        self.h({"action": "domain_status"})
+        self.assertEqual(self.builds[0][3]["DOMAIN_ZONE"], "example.org")
+        self.assertEqual(self.builds[0][3]["DOMAIN_ZONE_ID"], "ZTEST1")
+
+    def test_a_failed_certificate_stops_with_its_reason_and_try_again_asks_for_a_new_one(self):
+        self.h({"action": "domain_set", "hostname": "helm.example.org"})
+        self.acm.status, self.acm.reason = "FAILED", "CAA_ERROR"
+        v = self.h({"action": "domain_status"})
+        self.assertEqual((v["state"], v["reason"], v["certificate"]["failure_reason"]), ("failed", "CAA_ERROR", "CAA_ERROR"))
+        self.assertEqual(self.builds, [])
+        self.acm.status, self.acm.reason = "PENDING_VALIDATION", None
+        self.h({"action": "domain_set", "hostname": "helm.example.org"}, now=SUNDAY_3AM + timedelta(minutes=5))
+        first, second = (r["IdempotencyToken"] for r in self.acm.requests)
+        self.assertNotEqual(first, second)
+        self.assertEqual(self.store.get("DOMAIN")["state"], "validating")
+
+    def test_a_failed_attach_is_kept_with_the_reason_and_can_be_retried(self):
+        self.h({"action": "domain_set", "hostname": "helm.example.org"})
+        self.acm.status = "ISSUED"
+        self.h({"action": "domain_status"})
+        hid = self.store.get("DOMAIN")["history_id"]
+        self.h({"action": "finished", "status": "failed", "reason": "deploy failed: CNAMEAlreadyExists", "history_id": hid})
+        d = self.store.get("DOMAIN")
+        self.assertEqual((d["state"], d["reason"]), ("failed", "deploy failed: CNAMEAlreadyExists"))
+        self.assertEqual(self.notices[-1], "CoderHelm could not change its address")
+        later = SUNDAY_3AM + timedelta(minutes=30)
+        self.assertEqual(self.h({"action": "domain_set", "hostname": "helm.example.org"}, now=later)["state"], "attaching")
+
+    def test_busy_and_same_address_are_refused(self):
+        self.h({"action": "domain_set", "hostname": "helm.example.org"})
+        self.acm.status = "ISSUED"
+        self.h({"action": "domain_status"})
+        with self.assertRaises(ValueError):
+            self.h({"action": "domain_set", "hostname": "other.example.org"})
+        with self.assertRaises(ValueError):
+            self.h({"action": "domain_remove"})
+        with self.assertRaises(ValueError):
+            self.h({"action": "domain_set", "hostname": "helm.example.org"}, env=dict(self.env, APP_URL="https://helm.example.org"))
+
+    def test_removing_a_live_domain_redeploys_and_one_never_attached_is_just_forgotten(self):
+        with self.assertRaises(ValueError):
+            self.h({"action": "domain_remove"})
+        self.h({"action": "domain_set", "hostname": "helm.example.org"})
+        v = self.h({"action": "domain_remove"})
+        self.assertEqual(v["state"], "none")
+        self.assertEqual(self.builds, [])
+        live = dict(self.env, APP_URL="https://helm.example.org")
+        v = self.h({"action": "domain_remove", "actor": "a"}, env=live)
+        self.assertEqual(v["state"], "removing")
+        self.assertEqual(self.builds[0][3]["DOMAIN_ACTION"], "remove")
+        hid = self.store.get("DOMAIN")["history_id"]
+        self.h({"action": "finished", "status": "succeeded", "history_id": hid}, env=live)
+        self.assertEqual(self.store.get("DOMAIN"), {})
+        self.assertEqual(self.notices[-1], "CoderHelm is back on its AWS address")
