@@ -686,22 +686,13 @@ export class ApiStack extends cdk.Stack {
 
     // --- HTTP API Gateway ---
 
+    // No CORS setting here: with one on, API Gateway drops the gateway's own
+    // CORS headers and answers every route with one origin list and one
+    // credentials flag. The gateway owns CORS (middleware/cors.rs): the
+    // dashboard's origins (CORS_ORIGINS) get credentials, and the public
+    // routes the docs install guide calls get `*` without credentials.
     const httpApi = new apigatewayv2.HttpApi(this, "HttpApi", {
       apiName: `${prefix}-api`,
-      // Cross-origin only in the split layout; single-origin serves the
-      // dashboard and the API from one hostname.
-      corsPreflight: cfg.split ? {
-        allowOrigins: cfg.split.corsOrigins,
-        allowMethods: [
-          apigatewayv2.CorsHttpMethod.GET,
-          apigatewayv2.CorsHttpMethod.POST,
-          apigatewayv2.CorsHttpMethod.PUT,
-          apigatewayv2.CorsHttpMethod.DELETE,
-          apigatewayv2.CorsHttpMethod.OPTIONS,
-        ],
-        allowHeaders: ["Content-Type", "Authorization", "Cookie"],
-        allowCredentials: true,
-      } : undefined,
     });
     this.httpApi = httpApi;
 
@@ -719,6 +710,18 @@ export class ApiStack extends cdk.Stack {
         "GatewayIntegration",
         this.gatewayFunction
       );
+
+    // Cross-origin only in the split layout (single-origin serves the
+    // dashboard and the API from one hostname): the dashboard's origins, and
+    // every preflight goes to the gateway, which answers it.
+    if (cfg.split) {
+      this.gatewayFunction.addEnvironment("CORS_ORIGINS", cfg.split.corsOrigins.join(","));
+      httpApi.addRoutes({
+        path: "/{proxy+}",
+        methods: [apigatewayv2.HttpMethod.OPTIONS],
+        integration: lambdaIntegration,
+      });
+    }
 
     // Webhook routes
     httpApi.addRoutes({
