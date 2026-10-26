@@ -318,6 +318,19 @@ pub fn logs_policy() -> serde_json::Value {
                 ],
                 "Resource": "*"
             },
+            {
+                "Sid": "DescribeTasksBehindLogErrors",
+                "Effect": "Allow",
+                "Action": [
+                    "ecs:ListClusters",
+                    "ecs:ListServices",
+                    "ecs:DescribeServices",
+                    "ecs:DescribeTaskDefinition",
+                    "ecs:ListTasks",
+                    "ecs:DescribeTasks"
+                ],
+                "Resource": "*"
+            },
             { "Sid": "NeverUnmask", "Effect": "Deny", "Action": "logs:Unmask", "Resource": "*" }
         ]
     })
