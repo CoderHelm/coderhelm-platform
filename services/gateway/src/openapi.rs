@@ -311,8 +311,8 @@ are verified by their signatures.";
         (name = "Reviews", description = "Pull request reviews written by CoderHelm's reviewer."),
         (name = "Usage", description = "Tokens used this month and the team's limits."),
         (name = "CI", description = "Endpoints a CI job calls with its GitHub Actions OIDC token, so no CoderHelm secret is stored in CI."),
-        (name = "Webhooks", description = "Webhook endpoints: where CoderHelm sends your team's events (runs, pull requests, reviews, CI fixes, alerts, log findings, releases, plans). Each request is signed the Standard Webhooks way. The `webhooks` section of this document has every event's schema."),
-        (name = "Incoming webhooks", description = "Events CoderHelm receives from GitHub, Jira, AWS SNS, Sanity and Notion. Each is verified before anything happens."),
+        (name = "Webhook endpoints", description = "Where CoderHelm sends your team's events (runs, pull requests, reviews, CI fixes, alerts, log findings, releases, plans). Each request is signed the Standard Webhooks way. The `webhooks` section of this document has every event's schema."),
+        (name = "Webhooks", description = "Webhooks CoderHelm receives from GitHub, Jira, AWS SNS, Sanity and Notion. CoderHelm verifies each one before anything happens."),
     ),
 )]
 pub struct ApiDoc;

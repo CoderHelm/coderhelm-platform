@@ -428,7 +428,7 @@ pub struct DeliveryQuery {
 #[utoipa::path(
     get,
     path = "/api/webhooks/event-types",
-    tag = "Webhooks",
+    tag = "Webhook endpoints",
     operation_id = "listWebhookEventTypes",
     summary = "List event types",
     description = "Every event type CoderHelm sends, with an example event. The `webhooks` section of this document has each one's schema.",
@@ -462,7 +462,7 @@ pub async fn event_types(Extension(claims): Extension<Claims>) -> Reply {
 #[utoipa::path(
     get,
     path = "/api/webhooks/endpoints",
-    tag = "Webhooks",
+    tag = "Webhook endpoints",
     operation_id = "listWebhookEndpoints",
     summary = "List webhook endpoints",
     description = "The team's webhook endpoints, oldest first. Secrets are never listed.",
@@ -496,7 +496,7 @@ pub async fn list_endpoints(
 #[utoipa::path(
     post,
     path = "/api/webhooks/endpoints",
-    tag = "Webhooks",
+    tag = "Webhook endpoints",
     operation_id = "createWebhookEndpoint",
     summary = "Create a webhook endpoint",
     description = "Adds an endpoint and makes its signing secret, which this answer shows once. \
@@ -573,7 +573,7 @@ pub async fn create_endpoint(
 #[utoipa::path(
     get,
     path = "/api/webhooks/endpoints/{endpoint_id}",
-    tag = "Webhooks",
+    tag = "Webhook endpoints",
     operation_id = "getWebhookEndpoint",
     summary = "Get a webhook endpoint",
     description = "One endpoint, with its health: when it last delivered, and since when it has been failing, if it is.",
@@ -598,7 +598,7 @@ pub async fn get_endpoint(
 #[utoipa::path(
     put,
     path = "/api/webhooks/endpoints/{endpoint_id}",
-    tag = "Webhooks",
+    tag = "Webhook endpoints",
     operation_id = "updateWebhookEndpoint",
     summary = "Update a webhook endpoint",
     description = "Changes the address, description, events, or turns the endpoint on or off. Fields left out keep their value. Turning an endpoint back on starts its failure count again; events missed while it was off are not sent by themselves (replay them).",
@@ -646,7 +646,7 @@ pub async fn update_endpoint(
 #[utoipa::path(
     delete,
     path = "/api/webhooks/endpoints/{endpoint_id}",
-    tag = "Webhooks",
+    tag = "Webhook endpoints",
     operation_id = "deleteWebhookEndpoint",
     summary = "Delete a webhook endpoint",
     description = "Stops all deliveries to it, including retries already queued.",
@@ -690,7 +690,7 @@ pub async fn delete_endpoint(
 #[utoipa::path(
     get,
     path = "/api/webhooks/endpoints/{endpoint_id}/secret",
-    tag = "Webhooks",
+    tag = "Webhook endpoints",
     operation_id = "getWebhookSecret",
     summary = "Reveal the signing secret",
     description = "The endpoint's current signing secret. Each reveal is written to the team's audit log.",
@@ -738,7 +738,7 @@ pub async fn reveal_secret(
 #[utoipa::path(
     post,
     path = "/api/webhooks/endpoints/{endpoint_id}/secret/rotate",
-    tag = "Webhooks",
+    tag = "Webhook endpoints",
     operation_id = "rotateWebhookSecret",
     summary = "Rotate the signing secret",
     description = "Makes a new secret. For `overlap_hours` (24 unless set) every request carries two \
@@ -814,7 +814,7 @@ fn ctx<'a>(state: &'a AppState, cipher: &'a common::mcp_credentials::Kms<'a>) ->
 #[utoipa::path(
     post,
     path = "/api/webhooks/endpoints/{endpoint_id}/test",
-    tag = "Webhooks",
+    tag = "Webhook endpoints",
     operation_id = "sendWebhookTest",
     summary = "Send a test event",
     description = "Sends one `webhook.test` event to the endpoint now, signed like every other event, \
@@ -858,7 +858,7 @@ pub async fn send_test(
 #[utoipa::path(
     get,
     path = "/api/webhooks/endpoints/{endpoint_id}/deliveries",
-    tag = "Webhooks",
+    tag = "Webhook endpoints",
     operation_id = "listWebhookDeliveries",
     summary = "List an endpoint's deliveries",
     description = "The endpoint's deliveries, newest first, each with every attempt. Kept 14 days.",
@@ -949,7 +949,7 @@ pub async fn resend_record(
 #[utoipa::path(
     post,
     path = "/api/webhooks/endpoints/{endpoint_id}/deliveries/{delivery_id}/resend",
-    tag = "Webhooks",
+    tag = "Webhook endpoints",
     operation_id = "resendWebhookDelivery",
     summary = "Resend a delivery",
     description = "Sends the same event (the same body and `webhook-id`, signed now) to the endpoint \
@@ -1002,7 +1002,7 @@ fn delivered_ids(records: &[Delivery]) -> std::collections::HashSet<String> {
 #[utoipa::path(
     post,
     path = "/api/webhooks/endpoints/{endpoint_id}/replay",
-    tag = "Webhooks",
+    tag = "Webhook endpoints",
     operation_id = "replayWebhookEvents",
     summary = "Replay events",
     description = "Sends the kept events made in a time range to this endpoint again, each as a new \

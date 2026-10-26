@@ -598,7 +598,7 @@ pub struct SnsEnvelope {
 #[utoipa::path(
     post,
     path = "/webhooks/alerts/sns",
-    tag = "Incoming webhooks",
+    tag = "Webhooks",
     operation_id = "receiveSnsAlert",
     summary = "AWS SNS alerts",
     description = "Subscribe CoderHelm to an SNS topic with an HTTPS subscription to this address \

@@ -188,7 +188,7 @@ pub async fn resolve_all_teams_by_installation(
 #[utoipa::path(
     post,
     path = "/webhooks/github",
-    tag = "Incoming webhooks",
+    tag = "Webhooks",
     operation_id = "receiveGithubEvent",
     summary = "GitHub App events",
     description = "Where GitHub sends every event of the CoderHelm GitHub App. Installing the app \

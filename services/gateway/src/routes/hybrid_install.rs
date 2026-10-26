@@ -1069,7 +1069,7 @@ fn note_intake_problem(p: &'static str) {
 #[utoipa::path(
     post,
     path = "/webhooks/relay",
-    tag = "Incoming webhooks",
+    tag = "Webhooks",
     operation_id = "receiveRelayedEvent",
     summary = "Events from CoderHelm's relay",
     description = "On a hybrid self-hosted install, where CoderHelm's hosted relay forwards the events \

@@ -168,7 +168,7 @@ pub struct JiraRepoPin {
 #[utoipa::path(
     post,
     path = "/webhooks/jira/{token}",
-    tag = "Incoming webhooks",
+    tag = "Webhooks",
     operation_id = "receiveJiraWebhook",
     summary = "Jira webhook",
     description = "For a plain Jira webhook, when the CoderHelm Jira app can't be installed. The \

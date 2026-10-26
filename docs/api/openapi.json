@@ -5331,7 +5331,7 @@
         ],
         "summary": "List webhook endpoints",
         "tags": [
-          "Webhooks"
+          "Webhook endpoints"
         ]
       },
       "post": {
@@ -5474,7 +5474,7 @@
         ],
         "summary": "Create a webhook endpoint",
         "tags": [
-          "Webhooks"
+          "Webhook endpoints"
         ]
       }
     },
@@ -5614,7 +5614,7 @@
         ],
         "summary": "Delete a webhook endpoint",
         "tags": [
-          "Webhooks"
+          "Webhook endpoints"
         ]
       },
       "get": {
@@ -5749,7 +5749,7 @@
         ],
         "summary": "Get a webhook endpoint",
         "tags": [
-          "Webhooks"
+          "Webhook endpoints"
         ]
       },
       "put": {
@@ -5904,7 +5904,7 @@
         ],
         "summary": "Update a webhook endpoint",
         "tags": [
-          "Webhooks"
+          "Webhook endpoints"
         ]
       }
     },
@@ -6084,7 +6084,7 @@
         ],
         "summary": "List an endpoint's deliveries",
         "tags": [
-          "Webhooks"
+          "Webhook endpoints"
         ]
       }
     },
@@ -6241,7 +6241,7 @@
         ],
         "summary": "Resend a delivery",
         "tags": [
-          "Webhooks"
+          "Webhook endpoints"
         ]
       }
     },
@@ -6398,7 +6398,7 @@
         ],
         "summary": "Replay events",
         "tags": [
-          "Webhooks"
+          "Webhook endpoints"
         ]
       }
     },
@@ -6535,7 +6535,7 @@
         ],
         "summary": "Reveal the signing secret",
         "tags": [
-          "Webhooks"
+          "Webhook endpoints"
         ]
       }
     },
@@ -6692,7 +6692,7 @@
         ],
         "summary": "Rotate the signing secret",
         "tags": [
-          "Webhooks"
+          "Webhook endpoints"
         ]
       }
     },
@@ -6829,7 +6829,7 @@
         ],
         "summary": "Send a test event",
         "tags": [
-          "Webhooks"
+          "Webhook endpoints"
         ]
       }
     },
@@ -6956,7 +6956,7 @@
         ],
         "summary": "List event types",
         "tags": [
-          "Webhooks"
+          "Webhook endpoints"
         ]
       }
     },
@@ -6991,7 +6991,7 @@
         ],
         "summary": "AWS SNS alerts",
         "tags": [
-          "Incoming webhooks"
+          "Webhooks"
         ]
       }
     },
@@ -7189,7 +7189,7 @@
         ],
         "summary": "GitHub App events",
         "tags": [
-          "Incoming webhooks"
+          "Webhooks"
         ]
       }
     },
@@ -7238,7 +7238,7 @@
         ],
         "summary": "Jira webhook",
         "tags": [
-          "Incoming webhooks"
+          "Webhooks"
         ]
       }
     },
@@ -7289,7 +7289,7 @@
         ],
         "summary": "Knowledge source change",
         "tags": [
-          "Incoming webhooks"
+          "Webhooks"
         ]
       }
     },
@@ -7364,7 +7364,7 @@
         ],
         "summary": "Events from CoderHelm's relay",
         "tags": [
-          "Incoming webhooks"
+          "Webhooks"
         ]
       }
     }
@@ -7412,14 +7412,14 @@
       "x-displayName": "CI"
     },
     {
-      "description": "Webhook endpoints: where CoderHelm sends your team's events (runs, pull requests, reviews, CI fixes, alerts, log findings, releases, plans). Each request is signed the Standard Webhooks way. The `webhooks` section of this document has every event's schema.",
-      "name": "Webhooks",
-      "x-displayName": "Webhooks"
+      "description": "Where CoderHelm sends your team's events (runs, pull requests, reviews, CI fixes, alerts, log findings, releases, plans). Each request is signed the Standard Webhooks way. The `webhooks` section of this document has every event's schema.",
+      "name": "Webhook endpoints",
+      "x-displayName": "Webhook endpoints"
     },
     {
-      "description": "Events CoderHelm receives from GitHub, Jira, AWS SNS, Sanity and Notion. Each is verified before anything happens.",
-      "name": "Incoming webhooks",
-      "x-displayName": "Incoming webhooks"
+      "description": "Webhooks CoderHelm receives from GitHub, Jira, AWS SNS, Sanity and Notion. CoderHelm verifies each one before anything happens.",
+      "name": "Webhooks",
+      "x-displayName": "Webhooks"
     }
   ],
   "webhooks": {
