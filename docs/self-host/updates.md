@@ -51,6 +51,8 @@ An update starts only when all of these hold: auto-update is on, the hour is the
 
 Each release lists the models it calls (`models.json`, made from the code and covered by the signed `SHA256SUMS`). The updater reads it only after a read-only build has checked the release's signature and the file's checksum; until then the update waits. Before an update, automatic or **Update now**, the updater asks the worker to make one test call to each, through your current provider (Bedrock or Anthropic keys). If one is refused, the update waits: **Settings, System** and **Setup** say **Update to vX needs your action** with the model, the fix and the AWS console link, and admins get one email. The check runs again daily and the update applies by itself once it passes (with auto-update on). **Check again** reruns it now. CoderHelm never accepts model terms or submits forms for you; see [Model providers](./model-providers.md#bedrock-model-access).
 
+`update` from your machine runs the same check after the release's signature passes, through your install's worker, before anything is deployed. A refused model stops it with the fix and the console link. `--skip-model-check` goes on only when the refused model is one the release doesn't call; a model it calls can't be skipped. A rollback skips the check (you go back to models you already used).
+
 ## Update readiness
 
 Before you update, **Settings, then System** shows **Update readiness**: the same checks an update makes, run now, each with its fix.

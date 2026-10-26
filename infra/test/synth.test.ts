@@ -667,3 +667,13 @@ test("outbound webhooks: one queue, wired to the worker, sendable by every emitt
   // The template for the admins' email when an endpoint is turned off.
   assert.ok(json(t["coderhelm-prod-email"]).includes("coderhelm-prod-webhook-disabled"));
 });
+
+test("the update build may run the installer's model check: ask the worker, read the SYSTEM setting only", () => {
+  const u = synth(selfHost())["coderhelm-prod-updates"];
+  const statements = Object.values(u.findResources("AWS::IAM::Policy")).flatMap((p: any) => p.Properties.PolicyDocument.Statement);
+  const invoke = statements.find((s: any) => s.Sid === "InstallerModelCheck" && JSON.stringify(s.Resource).includes("coderhelm-prod-worker"));
+  assert.ok(invoke);
+  const read = statements.find((s: any) => s.Sid === "ModelCheckSetting");
+  assert.deepEqual(read.Action, "dynamodb:GetItem");
+  assert.deepEqual(read.Condition, { "ForAllValues:StringEquals": { "dynamodb:LeadingKeys": ["SYSTEM"] } });
+});

@@ -191,6 +191,20 @@ export class UpdatesStack extends cdk.Stack {
         `arn:aws:secretsmanager:${this.region}:${this.account}:secret:${cfg.secretName}-??????`,
       ],
     }));
+    // The installer's model check before it deploys (installer/lib/commands.mjs,
+    // updateModelCheck): the worker makes the test calls; the build only asks,
+    // and reads which team's key passed the last switch to Anthropic keys.
+    buildRole.addToPolicy(new iam.PolicyStatement({
+      sid: "InstallerModelCheck",
+      actions: ["lambda:InvokeFunction"],
+      resources: [`arn:aws:lambda:${this.region}:${this.account}:function:${prefix}-worker`],
+    }));
+    buildRole.addToPolicy(new iam.PolicyStatement({
+      sid: "ModelCheckSetting",
+      actions: ["dynamodb:GetItem"],
+      resources: [props.settingsTable.tableArn],
+      conditions: { "ForAllValues:StringEquals": { "dynamodb:LeadingKeys": ["SYSTEM"] } },
+    }));
     buildRole.addToPolicy(new iam.PolicyStatement({
       sid: "ReportResult",
       actions: ["lambda:InvokeFunction"],

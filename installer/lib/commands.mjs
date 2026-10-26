@@ -3,6 +3,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import crypto from "node:crypto";
+import os from "node:os";
 import { checkPrereqs } from "./prereqs.mjs";
 import { checkTag, fetchRelease, latestVersion, releasePaths, releasesDir, TAG_RE } from "./release.mjs";
 import { openBrowser } from "./github-app.mjs";
@@ -88,6 +89,8 @@ export async function resolveSource(ctx, version) {
   const paths = await fetchRelease(tag, { runner, fetchImpl: ctx.fetchImpl, log });
   return {
     version: tag,
+    // The release's model list, read after its signature check (or null).
+    models: paths.models ?? null,
     infra: paths.infra,
     dashboard: paths.dashboard,
     env: { GATEWAY_ZIP: paths.gatewayZip, WORKER_ZIP: paths.workerZip, MCP_PROXY_DIR: paths.mcpProxyZip },
@@ -373,6 +376,12 @@ export async function update(ctx) {
     }
 
     const src = await resolveSource(ctx, target);
+    // Every model the release calls must answer through the install's
+    // provider before anything is deployed (the same check as the updater's).
+    if (!flags.rollback) {
+      const note = await updateModelCheck(ctx, loadConfig(flags), src, target);
+      if (note) result.note = note;
+    }
     const migrationsFile = path.join(path.dirname(src.infra), "selfhost", "MIGRATIONS.json");
     const notes = migrationNotes(runner.dryRun ? [] : readJson(migrationsFile, { releases: [] }).releases, state.version, target);
     if (notes.length) log("Release notes this update crosses:");
@@ -416,6 +425,99 @@ export async function update(ctx) {
 }
 
 const CHECK_CMD = "npx -y github:CoderHelm/coderhelm-platform doctor";
+
+/**
+ * What a release's model check found: blocking failures are models the
+ * release calls (or the config names), which nothing can skip; the rest
+ * may be skipped with --skip-model-check, as on the dashboard.
+ */
+export function modelCheckVerdict(results, required, skip = false) {
+  const failing = (results ?? []).filter((r) => r.status === "fail");
+  const blocking = failing.filter((r) => required.has(r.model));
+  const other = failing.filter((r) => !required.has(r.model));
+  if (blocking.length) return { ok: false, blocking, other, skippable: false };
+  if (other.length && !skip) return { ok: false, blocking, other, skippable: true };
+  return { ok: true, blocking, other, skipped: skip ? other.map((r) => r.model) : [] };
+}
+
+/** The models to test: the release's, plus the config's own (each with its Bedrock ids). */
+export function modelTargets(manifest, cfg) {
+  const names = [...(manifest.calls ?? [])];
+  for (const m of [cfg.models?.primary ?? "claude-opus-5-5", cfg.models?.light ?? "claude-sonnet-5-5"]) {
+    if (!names.includes(m)) names.push(m);
+  }
+  return names.map((model) => ({ model, bedrock_ids: manifest.bedrock?.[model] ?? {} }));
+}
+
+/**
+ * The model check before an update from this machine: the worker of the
+ * running install makes one test call per model through the install's
+ * provider (Settings, System, Models), with its own role or a team's key.
+ * A refused model stops the update with its fix and the console link.
+ * Nothing here accepts terms or subscribes: a person does that in the
+ * AWS console. Returns a note when a check was skipped.
+ */
+export async function updateModelCheck(ctx, cfg, src, target) {
+  const { flags, runner, log } = ctx;
+  log("\nThe models this release calls");
+  if (src.models === undefined || src.version === "source") {
+    log("  skipped: deploying from a checkout, not a signed release");
+    return null;
+  }
+  if (runner.dryRun) {
+    log("  [dry run] test each model the release calls through the install's provider");
+    return null;
+  }
+  if (!src.models) {
+    log(`  ${target} lists no models to check`);
+    return null;
+  }
+  const d = derived(cfg);
+  const stored = await runner.json("aws", [
+    "dynamodb", "get-item", "--table-name", `${d.prefix}-settings`, "--region", cfg.region,
+    "--key", JSON.stringify({ pk: { S: "SYSTEM" }, sk: { S: "MODELS" } }), "--output", "json",
+  ], { capture: true, allowFail: true });
+  let probeTeam = null;
+  try {
+    probeTeam = JSON.parse(stored?.Item?.data?.S ?? "{}").probe_team ?? null;
+  } catch {
+    probeTeam = null;
+  }
+  const targets = modelTargets(src.models, cfg);
+  const required = new Set(targets.map((t) => t.model));
+  const out = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "ch-models-")), "out.json");
+  const r = await runner.run("aws", [
+    "lambda", "invoke", "--function-name", `${d.prefix}-worker`, "--region", cfg.region,
+    "--cli-binary-format", "raw-in-base64-out",
+    "--payload", JSON.stringify({ model_check: { targets, probe_team: probeTeam } }), out,
+  ], { capture: true, allowFail: true });
+  let answer = null;
+  try {
+    answer = r.code === 0 ? JSON.parse(fs.readFileSync(out, "utf8")) : null;
+  } catch {
+    answer = null;
+  }
+  if (!answer || !Array.isArray(answer.results)) {
+    throw plainError(`The model check couldn't run (the install's worker, ${d.prefix}-worker, didn't answer), so nothing was changed. Check your AWS credentials for ${cfg.region} and that the install is running, then run the update again.`);
+  }
+  for (const a of answer.results) {
+    if (a.status === "pass") log(`  PASS  ${a.model}`);
+    else if (a.status === "skip") log(`  SKIP  ${a.model}: ${a.detail}`);
+    else log(`  FAIL  ${a.model}: ${a.detail}\n        How to fix: ${a.fix ?? "see Settings, System, Models"}${a.url ? `\n        ${a.url}` : ""}`);
+  }
+  const v = modelCheckVerdict(answer.results, required, !!flags.skipModelCheck);
+  if (v.blocking.length) {
+    throw plainError(`Update to ${target} needs your action: ${v.blocking.map((b) => b.model).join(" and ")} ${v.blocking.length === 1 ? "was" : "were"} refused (fix above). The release calls ${v.blocking.length === 1 ? "it" : "them"}, so this can't be skipped; nothing was changed. Agreeing to model terms and the Bedrock use case form are done by a person in the AWS console. Then run the update again.`);
+  }
+  if (v.skippable) {
+    throw plainError(`Update to ${target} needs your action: ${v.other.map((b) => b.model).join(" and ")} ${v.other.length === 1 ? "was" : "were"} refused (fix above). This release doesn't call ${v.other.length === 1 ? "it" : "them"}, so --skip-model-check lets the update go ahead; nothing was changed.`);
+  }
+  if (v.skipped?.length) {
+    log(`  skipped for ${v.skipped.join(", ")} (--skip-model-check; the release doesn't call ${v.skipped.length === 1 ? "it" : "them"})`);
+    return `model check skipped for ${v.skipped.join(", ")}`;
+  }
+  return null;
+}
 
 function plainError(message) {
   return Object.assign(new Error(message), { plain: true });
