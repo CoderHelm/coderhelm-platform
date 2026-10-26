@@ -433,8 +433,9 @@ export class DatabaseStack extends cdk.Stack {
       partitionKey: { name: "pk", type: dynamodb.AttributeType.STRING },
       sortKey: { name: "sk", type: dynamodb.AttributeType.STRING },
       billing: dynamodb.Billing.onDemand(),
-      // Remote MCP sign-ins in progress (ten minutes) and the tool-call audit
-      // trail (90 days) carry `ttl`; server and token records never do.
+      // Remote MCP sign-ins in progress (ten minutes), the tool-call audit
+      // trail (90 days) and the hosted hybrid broker's holding partitions
+      // (a day) carry `ttl`; a team's own server and token records never do.
       timeToLiveAttribute: "ttl",
       encryption: dynamodb.TableEncryptionV2.customerManagedKey(
         this.encryptionKey
