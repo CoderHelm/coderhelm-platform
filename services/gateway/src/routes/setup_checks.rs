@@ -831,6 +831,467 @@ pub fn jira(connected: bool) -> Check {
     }
 }
 
+// ── Your own domain ───────────────────────────────────────────────────────
+//
+// The updater requests the certificate and moves the domain along
+// (lambda/updater, `domain_status`); these checks look at what the rest of
+// the world sees: the DNS records (asked over DNS-over-HTTPS, from the
+// install), the certificate, and whether CoderHelm answers on the hostname
+// over HTTPS. docs/self-host/domains.md lists every code and its fix.
+
+const D: &str = "Domain";
+
+/// The certificate authorities whose CAA names let Amazon issue certificates.
+pub const AMAZON_CAA: &[&str] = &[
+    "amazon.com",
+    "amazontrust.com",
+    "awstrust.com",
+    "amazonaws.com",
+];
+
+/// One DNS record to add (name, type, value), as the updater lists it.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct DnsRecord {
+    pub purpose: String,
+    pub name: String,
+    #[serde(rename = "type")]
+    pub rtype: String,
+    pub value: String,
+}
+
+/// What public DNS answered (None: it couldn't be asked).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DnsAnswers {
+    /// The CNAME at the certificate's validation name.
+    pub validation_cname: Option<Vec<String>>,
+    /// The CNAME at the hostname.
+    pub host_cname: Option<Vec<String>>,
+    /// The hostname's A records (after any CNAME).
+    pub host_a: Option<Vec<String>>,
+    /// The hostname is a zone apex (it has its own SOA).
+    pub apex: bool,
+    /// The closest CAA record set above the hostname (None: none found).
+    pub caa: Option<Vec<String>>,
+    /// The zone's name servers, as public DNS answers (Route 53 zones).
+    pub zone_ns: Option<Vec<String>>,
+}
+
+/// Everything the domain checks decide from.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DomainFacts {
+    /// None: the updater didn't answer.
+    pub known: bool,
+    pub hostname: Option<String>,
+    /// none, validating, attaching, live, failed, removing.
+    pub state: String,
+    /// route53, external or config.
+    pub mode: String,
+    pub reason: String,
+    /// CloudFront's own hostname, the value of the address record.
+    pub target: Option<String>,
+    /// The hostname the install answers on now.
+    pub current: Option<String>,
+    pub cert_status: Option<String>,
+    pub cert_failure: Option<String>,
+    pub validation: Option<DnsRecord>,
+    /// The Route 53 zone's own name servers.
+    pub name_servers: Vec<String>,
+    pub zone: Option<String>,
+    pub records: Vec<DnsRecord>,
+    pub dns: DnsAnswers,
+    /// GET https://<hostname>/ answered this.
+    pub https: Option<u16>,
+    /// GET https://<hostname>/api/setup/status?probe=1 answered as CoderHelm.
+    pub api: Option<bool>,
+}
+
+fn norm(s: &str) -> String {
+    s.trim().trim_end_matches('.').to_ascii_lowercase()
+}
+
+/// The facts from the updater's `domain_status` answer.
+pub fn domain_facts_from(v: Option<&Value>) -> DomainFacts {
+    let Some(v) = v.filter(|v| v.get("ok").and_then(Value::as_bool) != Some(false)) else {
+        return DomainFacts::default();
+    };
+    let s = |k: &str| v[k].as_str().map(norm).filter(|x| !x.is_empty());
+    let rec = |r: &Value| DnsRecord {
+        purpose: r["purpose"].as_str().unwrap_or("").to_string(),
+        name: norm(r["name"].as_str().unwrap_or("")),
+        rtype: r["type"].as_str().unwrap_or("CNAME").to_string(),
+        value: norm(r["value"].as_str().unwrap_or("")),
+    };
+    let cert = &v["certificate"];
+    DomainFacts {
+        known: true,
+        hostname: s("hostname"),
+        state: v["state"].as_str().unwrap_or("none").to_string(),
+        mode: v["mode"].as_str().unwrap_or("").to_string(),
+        reason: v["reason"].as_str().unwrap_or("").to_string(),
+        target: s("target"),
+        current: s("current"),
+        cert_status: cert["status"].as_str().map(str::to_string),
+        cert_failure: cert["failure_reason"].as_str().map(str::to_string),
+        validation: cert["validation"]
+            .is_object()
+            .then(|| rec(&cert["validation"])),
+        name_servers: v["name_servers"]
+            .as_array()
+            .map(|a| a.iter().filter_map(Value::as_str).map(norm).collect())
+            .unwrap_or_default(),
+        zone: s("zone"),
+        records: v["records"]
+            .as_array()
+            .map(|a| a.iter().map(rec).collect())
+            .unwrap_or_default(),
+        ..Default::default()
+    }
+}
+
+/// Whether a CAA record set lets Amazon issue a certificate. No `issue`
+/// tag at all means any authority may.
+pub fn caa_allows_amazon(records: &[String]) -> bool {
+    let issuers: Vec<String> = records
+        .iter()
+        .filter_map(|r| {
+            let mut parts = r.split_whitespace();
+            let _flags = parts.next()?;
+            let tag = parts.next()?.to_ascii_lowercase();
+            let value: String = parts.collect::<Vec<_>>().join(" ");
+            (tag == "issue").then(|| {
+                value
+                    .trim_matches('"')
+                    .split(';')
+                    .next()
+                    .unwrap_or("")
+                    .trim()
+                    .to_ascii_lowercase()
+            })
+        })
+        .collect();
+    issuers.is_empty() || issuers.iter().any(|i| AMAZON_CAA.contains(&i.as_str()))
+}
+
+fn same_set(a: &[String], b: &[String]) -> bool {
+    let mut x: Vec<String> = a.iter().map(|s| norm(s)).collect();
+    let mut y: Vec<String> = b.iter().map(|s| norm(s)).collect();
+    x.sort();
+    x.dedup();
+    y.sort();
+    y.dedup();
+    !x.is_empty() && x == y
+}
+
+/// The decision: (status, code). The guide, the dashboard and the doctor
+/// show one sentence and one fix for each code.
+pub fn domain_code(f: &DomainFacts) -> (&'static str, &'static str) {
+    if !f.known {
+        return ("warn", "unknown");
+    }
+    let Some(host) = f.hostname.as_deref() else {
+        return ("skip", "none");
+    };
+    let dns = &f.dns;
+    let caa_blocks = dns.caa.as_deref().is_some_and(|c| !caa_allows_amazon(c));
+    match f.state.as_str() {
+        "removing" => return ("wait", "removing"),
+        "attaching" => return ("wait", "attaching"),
+        "failed" => {
+            let reason = format!("{} {}", f.reason, f.cert_failure.as_deref().unwrap_or(""));
+            if reason.contains("CAA") || caa_blocks {
+                return ("fail", "caa_blocked");
+            }
+            let cert_failed = matches!(
+                f.cert_status.as_deref(),
+                Some("FAILED" | "VALIDATION_TIMED_OUT" | "REVOKED" | "EXPIRED")
+            );
+            return if cert_failed {
+                ("fail", "certificate_failed")
+            } else {
+                ("fail", "attach_failed")
+            };
+        }
+        "validating" => {
+            if caa_blocks {
+                return ("fail", "caa_blocked");
+            }
+            if f.mode == "route53" {
+                if let Some(public) = dns.zone_ns.as_deref() {
+                    if !f.name_servers.is_empty() && !same_set(public, &f.name_servers) {
+                        return ("fail", "zone_not_delegated");
+                    }
+                }
+                return ("wait", "validating");
+            }
+            if let (Some(found), Some(want)) =
+                (dns.validation_cname.as_deref(), f.validation.as_ref())
+            {
+                if let Some(first) = found.first() {
+                    if norm(first) != want.value {
+                        return ("fail", "validation_wrong_value");
+                    }
+                }
+            }
+            return ("wait", "validating");
+        }
+        _ => {}
+    }
+    // Live (or set in the config): what visitors see.
+    let cname = dns
+        .host_cname
+        .as_deref()
+        .and_then(|c| c.first())
+        .map(|c| norm(c));
+    if let (Some(c), Some(t)) = (cname.as_deref(), f.target.as_deref()) {
+        if c != t && f.mode != "route53" {
+            return ("fail", "dns_wrong_value");
+        }
+    }
+    let resolves = cname.is_some() || dns.host_a.as_deref().is_some_and(|a| !a.is_empty());
+    let asked = dns.host_cname.is_some() || dns.host_a.is_some();
+    match f.https {
+        Some(200..=399) => {}
+        _ if asked && !resolves => {
+            return if dns.apex && f.mode != "route53" {
+                ("fail", "cname_at_apex")
+            } else {
+                ("wait", "dns_missing")
+            };
+        }
+        _ => return ("fail", "https_failed"),
+    }
+    let _ = host;
+    if f.api == Some(true) {
+        ("pass", "ok")
+    } else {
+        ("fail", "api_unreachable")
+    }
+}
+
+/// The records as lines to paste into a DNS provider's form.
+pub fn records_text(records: &[DnsRecord]) -> String {
+    records
+        .iter()
+        .map(|r| format!("{}  {}  {}", r.name, r.rtype, r.value))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// The domain, for Settings, then Setup and the doctor: one sentence, why,
+/// and the fix (the records to add, in `command`).
+pub fn domain(f: &DomainFacts) -> Check {
+    let label = "Your own domain";
+    let (_, code) = domain_code(f);
+    let host = f.hostname.clone().unwrap_or_default();
+    let target = f
+        .target
+        .clone()
+        .unwrap_or_else(|| "your CloudFront address".into());
+    let page = "/settings/system#domain";
+    let status = |s: &str| match s {
+        "pass" => Status::Pass,
+        "skip" => Status::Skip,
+        "fail" => Status::Fail,
+        _ => Status::Warn,
+    };
+    let (st, _) = domain_code(f);
+    let check = |detail: String, why: &str, fix: Fix| {
+        Check::not_ok(status(st), "domain", D, label, detail, why, fix)
+    };
+    let address = DnsRecord {
+        purpose: "address".into(),
+        name: host.clone(),
+        rtype: "CNAME".into(),
+        value: target.clone(),
+    };
+    match code {
+        "ok" => Check::pass(
+            "domain",
+            D,
+            label,
+            format!("https://{host} answers with its certificate, and so does the API."),
+        ),
+        "none" => check(
+            format!(
+                "CoderHelm uses its AWS address{} (optional: use your own domain).",
+                f.current.as_deref().map(|c| format!(" {c}")).unwrap_or_default()
+            ),
+            "A domain of your own is easier to remember and share, and Google sign-in needs one.",
+            Fix::text("Add it in Settings, then System. With Route 53 in this account it is set up for you; otherwise you add two DNS records.")
+                .href(page),
+        ),
+        "validating" if f.mode == "route53" => check(
+            format!("The certificate for {host} is waiting for its DNS check; the record is in your Route 53 zone."),
+            "CloudFront needs the certificate before it can answer on your domain.",
+            Fix::text("Nothing to do: AWS usually issues it within 30 minutes, then CoderHelm moves to the domain by itself.").href(page),
+        ),
+        "validating" => {
+            let mut fix = Fix::text("Add these DNS records where your domain's DNS is hosted. AWS checks every few minutes; new records can take up to an hour to show up.")
+                .href(page);
+            fix.command = (!f.records.is_empty()).then(|| records_text(&f.records));
+            check(
+                format!("The certificate for {host} is waiting for its DNS record."),
+                "CloudFront needs the certificate before it can answer on your domain.",
+                fix,
+            )
+        }
+        "zone_not_delegated" => {
+            let mut fix = Fix::text(format!(
+                "At the registrar where you bought {}, set the name servers to the ones below. The change can take up to a day.",
+                f.zone.as_deref().unwrap_or(&host)
+            ))
+            .href(page);
+            fix.command = Some(f.name_servers.join("\n"));
+            check(
+                format!("Public DNS doesn't use the Route 53 zone {} yet.", f.zone.as_deref().unwrap_or("")),
+                "Nothing in the zone is seen until the registrar points at it, so the certificate can't be checked.",
+                fix,
+            )
+        }
+        "validation_wrong_value" => {
+            let want = f.validation.clone().unwrap_or_default();
+            let found = f.dns.validation_cname.as_ref().and_then(|v| v.first()).cloned().unwrap_or_default();
+            let mut fix = Fix::text(format!("Change the record's value to {} and save.", want.value)).href(page);
+            fix.command = Some(records_text(std::slice::from_ref(&want)));
+            check(
+                format!("{} points to {}, not to the value AWS gave.", want.name, norm(&found)),
+                "AWS only issues the certificate when the value matches exactly.",
+                fix,
+            )
+        }
+        "caa_blocked" => check(
+            format!("Your domain's CAA records don't allow Amazon to issue a certificate for {host}."),
+            "Without a certificate CloudFront can't answer on your domain.",
+            {
+                let mut fix = Fix::text("Add this CAA record next to the ones you have, then press Try again in Settings, then System.").href(page);
+                fix.command = Some(format!("{}  CAA  0 issue \"amazon.com\"", f.zone.as_deref().unwrap_or(&host)));
+                fix
+            },
+        ),
+        "certificate_failed" => check(
+            format!(
+                "AWS couldn't issue the certificate for {host}{}.",
+                f.cert_failure.as_deref().map(|r| format!(" ({})", r.to_lowercase().replace('_', " "))).unwrap_or_default()
+            ),
+            "CloudFront needs the certificate before it can answer on your domain.",
+            Fix::text("Check the records, then press Try again in Settings, then System for a new certificate.").href(page),
+        ),
+        "attach_failed" => check(
+            format!(
+                "Moving CoderHelm to {host} failed{}.",
+                if f.reason.is_empty() { String::new() } else { format!(": {}", f.reason) }
+            ),
+            "CoderHelm still answers on its AWS address.",
+            Fix::text(format!("If {host} is on another CloudFront distribution, remove it there first. Then press Try again in Settings, then System; the update history has the log.")).href(page),
+        ),
+        "attaching" => check(
+            format!("The certificate for {host} is issued; CoderHelm is moving to the domain."),
+            "It takes about 10 minutes, and CoderHelm keeps working on its AWS address meanwhile.",
+            Fix::text("Nothing to do: this page checks again by itself.").href("/settings/system#history"),
+        ),
+        "removing" => check(
+            "CoderHelm is moving back to its AWS address.".to_string(),
+            "It takes about 10 minutes.",
+            Fix::text("Nothing to do: this page checks again by itself.").href("/settings/system#history"),
+        ),
+        "dns_missing" => {
+            let mut fix = Fix::text("Add this record where your domain's DNS is hosted. New records can take up to an hour to show up.").href(page);
+            fix.command = Some(records_text(&[address]));
+            check(
+                format!("{host} doesn't point anywhere yet."),
+                "People and GitHub can't reach CoderHelm on the domain until it does.",
+                fix,
+            )
+        }
+        "dns_wrong_value" => {
+            let found = f.dns.host_cname.as_ref().and_then(|v| v.first()).map(|s| norm(s)).unwrap_or_default();
+            let mut fix = Fix::text(format!("Change the record's value to {target} and save.")).href(page);
+            fix.command = Some(records_text(&[address]));
+            check(
+                format!("{host} points to {found}, not to CoderHelm."),
+                "Visitors reach the other address instead of CoderHelm.",
+                fix,
+            )
+        }
+        "cname_at_apex" => check(
+            format!("{host} is the root of your domain, where most DNS providers don't allow a CNAME record."),
+            "Without a record, nobody reaches CoderHelm on the domain.",
+            Fix::text(format!("Use a subdomain such as coderhelm.{host} instead, or an ALIAS, ANAME or flattened CNAME record to {target} if your DNS provider has one.")).href(page),
+        ),
+        "https_failed" => check(
+            format!("{host} answers, but not as CoderHelm over HTTPS."),
+            "Browsers refuse the page, or reach another server.",
+            Fix::text(format!("Point the record at {target} only, with no proxy in front (with Cloudflare, set the record to DNS only), then check again.")).href(page),
+        ),
+        "api_unreachable" => check(
+            format!("The page loads on {host}, but CoderHelm's API doesn't answer there."),
+            "Sign-in, GitHub events and the dashboard all go through the API.",
+            Fix::text("Run the doctor from your machine: it checks CloudFront and the API.")
+                .command(format!("{CLI} doctor")),
+        ),
+        _ => check(
+            "The domain couldn't be checked (the updater didn't answer).".to_string(),
+            "The check runs again each time this page opens.",
+            Fix::text("Check again in a minute.").href(page),
+        ),
+    }
+}
+
+/// The domain for the install guide: codes only, never the hostname.
+pub fn public_domain(f: &DomainFacts) -> PublicCheck {
+    let (status, code) = domain_code(f);
+    PublicCheck::new("domain", "Your domain", status, code).optional()
+}
+
+// ── Sign-in and updates (optional) ────────────────────────────────────────
+
+/// "Sign in with Google": on in the config, and its keys in the secret.
+pub fn google_sign_in(enabled: bool, has_keys: bool) -> Check {
+    let label = "Sign in with Google";
+    match (enabled, has_keys) {
+        (true, true) => Check::pass("google_sign_in", X, label, "People can sign in with their Google account."),
+        (true, false) => Check::not_ok(
+            Status::Fail,
+            "google_sign_in",
+            X,
+            label,
+            "Google sign-in is on, but its client id and secret aren't in the install's secret.",
+            "The Google button fails until they are there.",
+            Fix::text("Add google_client_id and google_client_secret to the secret, then deploy again.")
+                .url("https://console.cloud.google.com/apis/credentials"),
+        ),
+        (false, _) => Check::not_ok(
+            Status::Skip,
+            "google_sign_in",
+            X,
+            label,
+            "Off: people sign in with email and password, with optional passkeys and two-factor codes (optional).",
+            "Google sign-in saves your team a password; it needs your own domain.",
+            Fix::text("Create an OAuth client in Google Cloud, add its keys to the secret, set integrations.googleSignIn, and deploy.")
+                .url("https://console.cloud.google.com/apis/credentials"),
+        ),
+    }
+}
+
+pub fn public_google_sign_in(enabled: bool, has_keys: bool) -> PublicCheck {
+    let c = |s, code| PublicCheck::new("google_sign_in", "Sign in with Google", s, code).optional();
+    match (enabled, has_keys) {
+        (true, true) => c("pass", "ok"),
+        (true, false) => c("fail", "missing_keys"),
+        (false, _) => c("skip", "off"),
+    }
+}
+
+/// Auto-update, from the updater's status (None: it didn't answer).
+pub fn public_updates(status: Option<&Value>) -> PublicCheck {
+    let c = |s, code| PublicCheck::new("updates", "Automatic updates", s, code).optional();
+    match status {
+        None => c("warn", "unknown"),
+        Some(v) if v["settings"]["auto"].as_bool() == Some(true) => c("pass", "ok"),
+        Some(_) => c("skip", "auto_off"),
+    }
+}
+
 // ── Update preflight ──────────────────────────────────────────────────────
 
 /// One thing that would stop (or should pause) an update.
@@ -1193,9 +1654,159 @@ async fn get_item(
     req.send().await.ok().and_then(|o| o.item().cloned())
 }
 
+// ── Asking DNS and the domain ─────────────────────────────────────────────
+
+/// One DNS question over DNS-over-HTTPS (Cloudflare, then Google): the
+/// answers of `rtype` for `name`, and whether `name` has its own SOA.
+/// None when neither resolver answered.
+async fn doh(state: &AppState, name: &str, rtype: u16) -> Option<(Vec<String>, bool)> {
+    let urls = [
+        format!("https://cloudflare-dns.com/dns-query?name={name}&type={rtype}"),
+        format!("https://dns.google/resolve?name={name}&type={rtype}"),
+    ];
+    for url in urls {
+        let Ok(r) = state
+            .http
+            .get(&url)
+            .header("Accept", "application/dns-json")
+            .timeout(Duration::from_secs(4))
+            .send()
+            .await
+        else {
+            continue;
+        };
+        let Ok(v) = r.json::<Value>().await else {
+            continue;
+        };
+        // NOERROR or NXDOMAIN: an answer either way.
+        if !matches!(v["Status"].as_u64(), Some(0) | Some(3)) {
+            continue;
+        }
+        let want = norm(name);
+        let answers = v["Answer"].as_array().cloned().unwrap_or_default();
+        let data: Vec<String> = answers
+            .iter()
+            .filter(|a| a["type"].as_u64() == Some(rtype as u64))
+            .filter(|a| rtype == 1 || norm(a["name"].as_str().unwrap_or("")) == want)
+            .filter_map(|a| a["data"].as_str().map(str::to_string))
+            .collect();
+        let soa = answers.iter().any(|a| {
+            a["type"].as_u64() == Some(6) && norm(a["name"].as_str().unwrap_or("")) == want
+        });
+        return Some((data, soa));
+    }
+    None
+}
+
+/// The closest CAA record set at or above `host` (CAA is inherited).
+async fn closest_caa(state: &AppState, host: &str) -> Option<Vec<String>> {
+    let labels: Vec<&str> = host.split('.').collect();
+    for i in 0..labels.len().saturating_sub(1) {
+        let name = labels[i..].join(".");
+        match doh(state, &name, 257).await {
+            Some((caa, _)) if !caa.is_empty() => return Some(caa),
+            Some(_) => continue,
+            None => return None,
+        }
+    }
+    None
+}
+
+async fn https_status(state: &AppState, url: &str) -> Option<u16> {
+    state
+        .http
+        .get(url)
+        .timeout(Duration::from_secs(8))
+        .send()
+        .await
+        .ok()
+        .map(|r| r.status().as_u16())
+}
+
+/// CoderHelm's own probe answer on the hostname (`/api/setup/status?probe=1`).
+async fn api_answers(state: &AppState, host: &str) -> Option<bool> {
+    let r = state
+        .http
+        .get(format!("https://{host}/api/setup/status?probe=1"))
+        .timeout(Duration::from_secs(8))
+        .send()
+        .await
+        .ok()?;
+    let v = r.json::<Value>().await.ok()?;
+    Some(v["service"] == "coderhelm")
+}
+
+/// The updater's view of the domain plus what DNS and HTTPS answer now.
+pub async fn domain_facts_now(state: &AppState) -> (DomainFacts, Option<Value>) {
+    let view = super::system::call(state, json!({ "action": "domain_status" }))
+        .await
+        .ok();
+    let mut f = domain_facts_from(view.as_ref());
+    let Some(host) = f.hostname.clone() else {
+        return (f, view);
+    };
+    match f.state.as_str() {
+        "validating" => {
+            let v_name = f.validation.as_ref().map(|v| v.name.clone());
+            let zone = f.zone.clone();
+            let (vc, caa, ns) = tokio::join!(
+                async {
+                    match v_name {
+                        Some(n) => doh(state, &n, 5).await.map(|(d, _)| d),
+                        None => None,
+                    }
+                },
+                closest_caa(state, &host),
+                async {
+                    match zone {
+                        Some(z) => doh(state, &z, 2).await.map(|(d, _)| d),
+                        None => None,
+                    }
+                },
+            );
+            f.dns.validation_cname = vc;
+            f.dns.caa = caa;
+            f.dns.zone_ns = ns;
+        }
+        "failed" => {
+            f.dns.caa = closest_caa(state, &host).await;
+        }
+        "live" => {
+            let root = format!("https://{host}/");
+            let (cname, a, soa, https, api) = tokio::join!(
+                doh(state, &host, 5),
+                doh(state, &host, 1),
+                doh(state, &host, 6),
+                https_status(state, &root),
+                api_answers(state, &host),
+            );
+            f.dns.host_cname = cname.map(|(d, _)| d);
+            f.dns.host_a = a.map(|(d, _)| d);
+            f.dns.apex = soa.is_some_and(|(_, apex)| apex);
+            f.https = https;
+            f.api = api;
+        }
+        _ => {}
+    }
+    (f, view)
+}
+
+fn google_enabled() -> bool {
+    std::env::var("GOOGLE_SIGN_IN").is_ok_and(|v| v == "true")
+}
+
+fn google_keys(s: &crate::models::Secrets) -> bool {
+    s.google_client_id
+        .as_deref()
+        .is_some_and(|v| !v.trim().is_empty())
+        && s.google_client_secret
+            .as_deref()
+            .is_some_and(|v| !v.trim().is_empty())
+}
+
 /// Every check, in the order the page shows them.
 pub async fn run_all(state: &AppState, team_id: &str) -> (Vec<Check>, Option<Value>) {
-    let (gh, email, model, dlq_n, url, integrations, updater) = tokio::join!(
+    let (gh, email, model, dlq_n, url, integrations, updater, domain_now) = tokio::join!(
         github_checks(state, true),
         email_checks(state, true),
         model_check(state, team_id),
@@ -1208,9 +1819,19 @@ pub async fn run_all(state: &AppState, team_id: &str) -> (Vec<Check>, Option<Val
                 .ok()
                 .filter(|b| b.get("ok").and_then(Value::as_bool) != Some(false))
         },
+        async {
+            if super::system::has_updater() {
+                Some(domain_facts_now(state).await.0)
+            } else {
+                None
+            }
+        },
     );
     let mut checks = Vec::new();
     checks.push(public_url(&url.0, url.1));
+    if let Some(f) = domain_now {
+        checks.push(domain(&f));
+    }
     checks.extend(gh);
     checks.extend(email);
     checks.push(model);
@@ -1219,6 +1840,10 @@ pub async fn run_all(state: &AppState, team_id: &str) -> (Vec<Check>, Option<Val
         checks.push(updates(updater.as_ref()));
     }
     checks.extend(integrations);
+    checks.push(google_sign_in(
+        google_enabled(),
+        google_keys(&state.secrets),
+    ));
     (checks, updater)
 }
 
@@ -1477,6 +2102,7 @@ pub fn public_status(
     github: [PublicCheck; 2],
     models: PublicCheck,
     email: PublicCheck,
+    optional: Vec<PublicCheck>,
     manifest_ready: bool,
 ) -> Value {
     let admin = if open {
@@ -1488,6 +2114,7 @@ pub fn public_status(
     checks.extend(github);
     checks.push(models);
     checks.push(email);
+    checks.extend(optional);
     checks.push(admin);
     json!({
         "schema": 1,
@@ -1645,9 +2272,47 @@ async fn public_email_now(state: &AppState) -> PublicCheck {
     )
 }
 
+/// The optional checks the guide lists after Ready: the domain, Google
+/// sign-in and automatic updates (codes only).
+async fn public_optional_now(state: &AppState) -> Vec<PublicCheck> {
+    let mut out = Vec::new();
+    if super::system::has_updater() {
+        let (domain_now, updater) = tokio::join!(
+            domain_facts_now(state),
+            super::system::call(state, json!({ "action": "status" })),
+        );
+        out.push(public_domain(&domain_now.0));
+        out.push(public_updates(
+            updater
+                .ok()
+                .filter(|b| b.get("ok").and_then(Value::as_bool) != Some(false))
+                .as_ref(),
+        ));
+    }
+    let secret = stored_secret().await;
+    let keys = secret.as_ref().is_some_and(|s| {
+        s["google_client_id"]
+            .as_str()
+            .is_some_and(|v| !v.trim().is_empty())
+            && s["google_client_secret"]
+                .as_str()
+                .is_some_and(|v| !v.trim().is_empty())
+    });
+    out.push(public_google_sign_in(google_enabled(), keys));
+    out
+}
+
 #[derive(serde::Deserialize, Default)]
 pub struct StatusQuery {
     fresh: Option<String>,
+    /// `probe=1`: only "this is CoderHelm" (the domain check calls it on the
+    /// hostname; no checks run, so it can't call itself again).
+    probe: Option<String>,
+}
+
+/// The answer to `?probe=1`.
+pub fn probe_answer() -> Value {
+    json!({ "schema": 1, "service": "coderhelm", "probe": true })
 }
 
 /// GET /api/setup/status: public, polled by the install guide. Any origin
@@ -1664,6 +2329,9 @@ pub async fn status(
     ];
     if !self_hosted() {
         return StatusCode::NOT_FOUND.into_response();
+    }
+    if q.probe.as_deref() == Some("1") {
+        return (cors, Json(probe_answer())).into_response();
     }
     if let Err(code) = crate::middleware::rate_limit::allow_setup_poll(&headers) {
         return (code, cors).into_response();
@@ -1682,12 +2350,21 @@ pub async fn status(
             return (cors, Json(v)).into_response();
         }
     }
-    let ((github, manifest_ready), models, email) = tokio::join!(
+    let ((github, manifest_ready), models, email, optional) = tokio::join!(
         public_github_now(&state),
         public_models_now(&state),
         public_email_now(&state),
+        public_optional_now(&state),
     );
-    let v = public_status(version, true, github, models, email, manifest_ready);
+    let v = public_status(
+        version,
+        true,
+        github,
+        models,
+        email,
+        optional,
+        manifest_ready,
+    );
     *CACHE.lock().unwrap_or_else(|e| e.into_inner()) = Some((Instant::now(), v.clone()));
     (cors, Json(v)).into_response()
 }
@@ -2016,6 +2693,12 @@ mod tests {
             public_github(keys, Some(200), Some(0)),
             public_models(true, Some(&ModelProbe::Refused(403, "AccessDeniedException: arn:aws:iam::111122223333:role/x is not authorized to perform bedrock:Converse on us.anthropic.claude".into()))),
             public_email(Some(&Identity { verified: true, ..Default::default() }), Some(false)),
+            vec![
+                public_domain(&DomainFacts { known: true, hostname: Some("helm.example.org".into()), state: "validating".into(), mode: "external".into(),
+                    target: Some("d111test.cloudfront.net".into()), ..Default::default() }),
+                public_google_sign_in(false, false),
+                public_updates(Some(&json!({"settings": {"auto": false}}))),
+            ],
             false,
         );
         let text = serde_json::to_string(&v).unwrap();
@@ -2029,6 +2712,8 @@ mod tests {
             "us-east",
             "anthropic.claude",
             "coderhelm-prod",
+            "example.org",
+            "cloudfront",
         ] {
             assert!(!text.contains(leak), "public status leaks {leak}: {text}");
         }
@@ -2047,13 +2732,20 @@ mod tests {
                 "github_installed",
                 "models",
                 "email",
+                "domain",
+                "google_sign_in",
+                "updates",
                 "admin"
             ]
         );
         assert_eq!(v["checks"][2]["code"], "not_installed");
         assert_eq!(v["checks"][3]["code"], "iam_denied");
         assert_eq!(v["checks"][4]["required"], false);
-        assert_eq!(v["checks"][5]["status"], "wait");
+        assert_eq!(v["checks"][5]["code"], "validating");
+        assert_eq!(v["checks"][5]["required"], false);
+        assert_eq!(v["checks"][6]["code"], "off");
+        assert_eq!(v["checks"][7]["code"], "auto_off");
+        assert_eq!(v["checks"][8]["status"], "wait");
         assert_eq!(v["ready"], false);
         // Every check has only these fields.
         for c in v["checks"].as_array().unwrap() {
@@ -2174,6 +2866,12 @@ mod tests {
             public_github(AppKeys::Present, Some(200), Some(1)),
             public_models(false, None),
             public_email(None, None),
+            vec![public_domain(&DomainFacts {
+                known: true,
+                hostname: Some("h.example.org".into()),
+                state: "validating".into(),
+                ..Default::default()
+            })],
             false,
         );
         assert_eq!(all_pass["ready"], true);
@@ -2186,6 +2884,228 @@ mod tests {
         assert_eq!(v["ready"], true);
         assert_eq!(v["checks"].as_array().unwrap().len(), 1);
         assert_eq!(v["checks"][0]["id"], "admin");
+    }
+
+    // ── Your own domain ──
+
+    fn ext(state: &str) -> DomainFacts {
+        domain_facts_from(Some(&json!({
+            "ok": true,
+            "hostname": "helm.example.org",
+            "state": state,
+            "mode": "external",
+            "target": "d111test.cloudfront.net",
+            "current": "d111test.cloudfront.net",
+            "certificate": {"status": "PENDING_VALIDATION", "validation": {"name": "_a1.helm.example.org.", "type": "CNAME", "value": "_b2.acm-validations.aws."}},
+            "records": [
+                {"purpose": "certificate", "name": "_a1.helm.example.org", "type": "CNAME", "value": "_b2.acm-validations.aws"},
+                {"purpose": "address", "name": "helm.example.org", "type": "CNAME", "value": "d111test.cloudfront.net"}
+            ]
+        })))
+    }
+
+    #[test]
+    fn domain_facts_read_the_updater() {
+        let f = ext("validating");
+        assert!(f.known);
+        assert_eq!(
+            f.validation.as_ref().unwrap().value,
+            "_b2.acm-validations.aws"
+        );
+        assert_eq!(f.records.len(), 2);
+        assert!(!domain_facts_from(None).known);
+        assert!(!domain_facts_from(Some(&json!({"ok": false, "error": "x"}))).known);
+        assert_eq!(domain_code(&domain_facts_from(None)), ("warn", "unknown"));
+        let none = domain_facts_from(Some(
+            &json!({"ok": true, "state": "none", "current": "d111test.cloudfront.net"}),
+        ));
+        assert_eq!(domain_code(&none), ("skip", "none"));
+        let c = domain(&none);
+        assert_eq!(c.status, Status::Skip);
+        assert!(c.detail.contains("d111test.cloudfront.net"));
+        assert_eq!(c.fix.unwrap().href.unwrap(), "/settings/system#domain");
+    }
+
+    #[test]
+    fn caa_lets_amazon_issue_or_not() {
+        let v = |x: &[&str]| x.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert!(caa_allows_amazon(&v(&[])));
+        assert!(caa_allows_amazon(&v(&[
+            "0 iodef \"mailto:sec@example.org\""
+        ])));
+        assert!(caa_allows_amazon(&v(&[
+            "0 issue \"letsencrypt.org\"",
+            "0 issue \"amazon.com\""
+        ])));
+        assert!(caa_allows_amazon(&v(&[
+            "0 issue \"amazontrust.com; account=1\""
+        ])));
+        assert!(!caa_allows_amazon(&v(&["0 issue \"letsencrypt.org\""])));
+        assert!(!caa_allows_amazon(&v(&["0 issue \";\""])));
+    }
+
+    #[test]
+    fn waiting_for_the_certificate_shows_the_records_and_spots_a_wrong_value() {
+        let mut f = ext("validating");
+        assert_eq!(domain_code(&f), ("wait", "validating"));
+        let c = domain(&f);
+        assert_eq!(c.status, Status::Warn);
+        let cmd = c.fix.unwrap().command.unwrap();
+        assert!(
+            cmd.contains("_a1.helm.example.org  CNAME  _b2.acm-validations.aws"),
+            "{cmd}"
+        );
+        assert!(
+            cmd.contains("helm.example.org  CNAME  d111test.cloudfront.net"),
+            "{cmd}"
+        );
+        // Not there yet: still waiting (propagation).
+        f.dns.validation_cname = Some(vec![]);
+        assert_eq!(domain_code(&f).1, "validating");
+        f.dns.validation_cname = Some(vec!["_b2.acm-validations.aws.".into()]);
+        assert_eq!(domain_code(&f).1, "validating");
+        f.dns.validation_cname = Some(vec!["_typo.acm-validations.aws.".into()]);
+        assert_eq!(domain_code(&f), ("fail", "validation_wrong_value"));
+        let c = domain(&f);
+        assert!(
+            c.detail.contains("_typo.acm-validations.aws"),
+            "{}",
+            c.detail
+        );
+        assert!(c.fix.unwrap().text.contains("_b2.acm-validations.aws"));
+        // CAA that leaves Amazon out.
+        f.dns.validation_cname = None;
+        f.dns.caa = Some(vec!["0 issue \"letsencrypt.org\"".into()]);
+        assert_eq!(domain_code(&f), ("fail", "caa_blocked"));
+        assert!(domain(&f)
+            .fix
+            .unwrap()
+            .command
+            .unwrap()
+            .contains("CAA  0 issue \"amazon.com\""));
+    }
+
+    #[test]
+    fn a_route53_zone_public_dns_does_not_use_says_so() {
+        let mut f = ext("validating");
+        f.mode = "route53".into();
+        f.zone = Some("example.org".into());
+        f.name_servers = vec!["ns-1.awsdns-01.org".into(), "ns-2.awsdns-02.com".into()];
+        f.dns.zone_ns = Some(vec![
+            "ns-2.awsdns-02.com.".into(),
+            "NS-1.awsdns-01.org.".into(),
+        ]);
+        assert_eq!(domain_code(&f), ("wait", "validating"));
+        f.dns.zone_ns = Some(vec!["dns1.registrar.example".into()]);
+        assert_eq!(domain_code(&f), ("fail", "zone_not_delegated"));
+        assert!(domain(&f)
+            .fix
+            .unwrap()
+            .command
+            .unwrap()
+            .contains("ns-1.awsdns-01.org"));
+    }
+
+    #[test]
+    fn failures_name_their_cause() {
+        let mut f = ext("failed");
+        f.cert_status = Some("FAILED".into());
+        f.cert_failure = Some("CAA_ERROR".into());
+        assert_eq!(domain_code(&f).1, "caa_blocked");
+        f.cert_failure = Some("DOMAIN_NOT_ALLOWED".into());
+        assert_eq!(domain_code(&f).1, "certificate_failed");
+        assert!(domain(&f).detail.contains("domain not allowed"));
+        f.cert_status = Some("ISSUED".into());
+        f.reason = "deploy failed: CNAMEAlreadyExists".into();
+        assert_eq!(domain_code(&f), ("fail", "attach_failed"));
+        assert!(domain(&f).detail.contains("CNAMEAlreadyExists"));
+        assert_eq!(domain_code(&ext("attaching")), ("wait", "attaching"));
+        assert_eq!(domain_code(&ext("removing")), ("wait", "removing"));
+    }
+
+    #[test]
+    fn a_live_domain_resolves_serves_https_and_the_api() {
+        let mut f = ext("live");
+        f.dns.host_cname = Some(vec!["d111test.cloudfront.net.".into()]);
+        f.dns.host_a = Some(vec!["192.0.2.1".into()]);
+        f.https = Some(200);
+        f.api = Some(true);
+        assert_eq!(domain_code(&f), ("pass", "ok"));
+        assert_eq!(domain(&f).status, Status::Pass);
+        f.api = Some(false);
+        assert_eq!(domain_code(&f).1, "api_unreachable");
+        f.api = Some(true);
+        f.dns.host_cname = Some(vec!["old-host.example.net.".into()]);
+        assert_eq!(domain_code(&f), ("fail", "dns_wrong_value"));
+        assert!(domain(&f).detail.contains("old-host.example.net"));
+        // Nothing there yet: wait, unless it's the apex (no CNAME allowed).
+        f.dns.host_cname = Some(vec![]);
+        f.dns.host_a = Some(vec![]);
+        f.https = None;
+        assert_eq!(domain_code(&f), ("wait", "dns_missing"));
+        assert!(domain(&f)
+            .fix
+            .unwrap()
+            .command
+            .unwrap()
+            .contains("helm.example.org  CNAME  d111test.cloudfront.net"));
+        f.dns.apex = true;
+        assert_eq!(domain_code(&f), ("fail", "cname_at_apex"));
+        // Resolves somewhere, but no HTTPS (a proxy or another server).
+        f.dns.apex = false;
+        f.dns.host_a = Some(vec!["198.51.100.7".into()]);
+        assert_eq!(domain_code(&f), ("fail", "https_failed"));
+        assert!(domain(&f).fix.unwrap().text.contains("DNS only"));
+        // A domain from the config (Route 53 aliases, no CNAME) only needs HTTPS and the API.
+        let mut cfg = ext("live");
+        cfg.mode = "config".into();
+        cfg.dns.host_a = Some(vec!["192.0.2.1".into()]);
+        cfg.dns.host_cname = Some(vec![]);
+        cfg.https = Some(200);
+        cfg.api = Some(true);
+        assert_eq!(domain_code(&cfg).1, "ok");
+    }
+
+    #[test]
+    fn every_domain_code_has_a_sentence_and_a_fix() {
+        let mut all = vec![];
+        let mut f = ext("validating");
+        all.push(domain(&f));
+        f.dns.validation_cname = Some(vec!["_x.acm-validations.aws".into()]);
+        all.push(domain(&f));
+        f.dns.caa = Some(vec!["0 issue \"letsencrypt.org\"".into()]);
+        all.push(domain(&f));
+        for st in ["attaching", "removing", "failed"] {
+            all.push(domain(&ext(st)));
+        }
+        for c in &all {
+            assert!(!c.detail.is_empty());
+            assert!(c.status == Status::Pass || c.fix.as_ref().is_some_and(|x| !x.text.is_empty()));
+        }
+        let text = serde_json::to_string(&all).unwrap();
+        for g in ['\u{2192}', '\u{21D2}', '\u{279C}'] {
+            assert!(!text.contains(g));
+        }
+        assert!(!text.contains("brain"));
+    }
+
+    #[test]
+    fn google_sign_in_and_updates_for_the_guide() {
+        assert_eq!(google_sign_in(false, false).status, Status::Skip);
+        assert_eq!(google_sign_in(true, false).status, Status::Fail);
+        assert_eq!(google_sign_in(true, true).status, Status::Pass);
+        assert_eq!(public_google_sign_in(true, false).code, "missing_keys");
+        assert!(public_google_sign_in(false, false).optional);
+        assert_eq!(public_updates(None).code, "unknown");
+        assert_eq!(
+            public_updates(Some(&json!({"settings": {"auto": true}}))).code,
+            "ok"
+        );
+        assert_eq!(
+            public_updates(Some(&json!({"settings": {"auto": false}}))).code,
+            "auto_off"
+        );
+        assert_eq!(probe_answer()["service"], "coderhelm");
     }
 
     #[test]

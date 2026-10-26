@@ -13,7 +13,7 @@ The [install guide](https://docs.coderhelm.com/self-host/install/) installs Code
    - a **setup key** (40 characters), kept in your browser's storage and in the stack's parameters.
 
    Quick-create links ignore hidden (NoEcho) parameters, so both values appear in the stack's Parameters tab. The setup key works only once, only on your install, and only until a GitHub App exists.
-2. **Progress.** The installer (CodeBuild, `selfhost/launch/bootstrap.mjs`) writes `status.json` to that bucket: the phase, a plain message, the step count and, at the end, your CoderHelm URL. Account numbers, ARNs and email addresses are removed before writing. The guide reads `https://coderhelm-setup-<id>.s3.<region>.amazonaws.com/status.json`. If your account blocks public bucket policies (S3 Block Public Access at account level), the file stays private and the guide asks you to paste the URL from the stack's Outputs instead. The install itself is unaffected.
+2. **Progress.** The installer (CodeBuild, `selfhost/launch/bootstrap.mjs`) writes `status.json` to that bucket: the phase, a plain message, the step count and, at the end, your CoderHelm URL. With your own domain it also writes `domain`: the hostname, `mode` (`route53` when the deploy set it all up, `external` otherwise), `state`, and the DNS `records` to add (names and values, which are public in DNS anyway). Account numbers, ARNs and email addresses are removed before writing. The guide reads `https://coderhelm-setup-<id>.s3.<region>.amazonaws.com/status.json`. If your account blocks public bucket policies (S3 Block Public Access at account level), the file stays private and the guide asks you to paste the URL from the stack's Outputs instead. The install itself is unaffected.
 3. **Checks.** Once the URL is known, the guide polls `GET <url>/api/setup/status` (below) and shows each check as waiting, passing or failing, with a fix.
 4. **GitHub App.** The guide posts a GitHub App manifest to github.com with `redirect_url` set to `<url>/api/setup/github/callback` and `state` set to the setup key. GitHub sends the browser to your install with a one-time code. Your install exchanges the code for the app's keys, stores them in its own secret, restarts its services to read them and sends you back to the guide. The keys never leave your account.
 
@@ -21,7 +21,8 @@ The [install guide](https://docs.coderhelm.com/self-host/install/) installs Code
 
 The guide's checks come from the install's public `GET /api/setup/status`, the same checks the CLI's `doctor` and the dashboard's setup checklist use. Its shape, codes, setup window and rate limit are documented in [Check your install](./check-your-install.md). The guide uses:
 
-- `checks[]` (`id`, `label`, `status`, `code`, `required`) for `api`, `github_app`, `github_installed`, `models`, `email` and `admin`, each code mapped to one sentence and a fix; an unknown check shows by its label.
+- `checks[]` (`id`, `label`, `status`, `code`, `required`) for `api`, `github_app`, `github_installed`, `models`, `email`, `domain`, `google_sign_in`, `updates` and `admin`, each code mapped to one sentence and a fix; an unknown check shows by its label.
+- `domain`: when you chose your own domain, the guide shows a Domain step between AWS and GitHub with the records from the progress file, checks until the code is `ok`, then follows the install to the domain (so the GitHub App gets the domain's URLs). You can skip it and add the domain later in Settings, then System.
 - `github_manifest_ready`: one click when true; the terminal command (`pull`, then `github-app`) when false.
 - `setup_open: false` (someone has signed up): the install is shown as ready.
 

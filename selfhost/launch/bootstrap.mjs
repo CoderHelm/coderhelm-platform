@@ -10,7 +10,11 @@
 //   2. runs `coderhelm-selfhost deploy` for the release,
 //   3. stores the one-time setup key, so the install's own setup endpoint can
 //      take the GitHub App's keys from the browser (docs/self-host/setup-checks.md),
-//   4. keeps a small progress file up to date in the stack's status bucket,
+//   4. with your own domain: finds its Route 53 zone in this account (then the
+//      deploy makes the certificate and records), or else asks the install's
+//      updater for the certificate, whose DNS records the guide shows
+//      (docs/self-host/domains.md),
+//   5. keeps a small progress file up to date in the stack's status bucket,
 //      which the install guide in the browser reads. The file holds the
 //      phase, a plain message and the install's URL: no names, emails, keys
 //      or account numbers.
@@ -25,11 +29,15 @@
 //   STAGE            install name (resources start with coderhelm-<stage>)
 //   ADMIN_EMAIL      the first admin
 //   EMAIL_FROM       sender address; empty means ADMIN_EMAIL
-//   HOSTNAME_ARG, HOSTED_ZONE    optional custom domain
+//   HOSTNAME_ARG     optional: your own domain, e.g. coderhelm.example.com
+//   HOSTED_ZONE      optional: its Route 53 zone (empty: found in the account,
+//                    or another DNS provider)
 //   MODEL_PROVIDER   bedrock | anthropic
 //   BEDROCK_PREFIX   auto | us. | eu. | apac. | global. | "" (in-region ids)
 //   SIGNUP_DOMAIN    optional email domain anyone may sign up from
 //   TELEMETRY        on | off
+//   AUTO_UPDATE      on | off; UPDATE_WINDOW ("Sun 03:00", "daily 02:00") and
+//   UPDATE_TIMEZONE  (IANA) set its window (admins change them later in Settings)
 //   STATUS_BUCKET    the stack's status bucket (empty: no progress file)
 //   SETUP_TOKEN      the one-time setup key from the install guide (may be empty)
 //   AWS_REGION       set by CodeBuild
@@ -65,11 +73,48 @@ export function emailIdentity({ from, hostedZone }) {
   return from;
 }
 
+/** The public Route 53 zone in this account a hostname belongs to (longest match), or null. */
+export function findZone(zones, hostname) {
+  let best = null;
+  for (const z of zones ?? []) {
+    const name = String(z.Name ?? "").replace(/\.$/, "").toLowerCase();
+    if (!name || z.Config?.PrivateZone) continue;
+    if (hostname === name || hostname.endsWith(`.${name}`)) {
+      if (!best || name.length > best.name.length) best = { name, id: String(z.Id ?? "").replace("/hostedzone/", "") };
+    }
+  }
+  return best;
+}
+
+/** The zone's name servers are the ones public DNS answers with (else nothing it holds is seen). */
+export function isDelegated(zoneServers, publicServers) {
+  const n = (l) => [...new Set((l ?? []).map((x) => String(x).replace(/\.$/, "").toLowerCase()))].sort();
+  const a = n(zoneServers);
+  const b = n(publicServers);
+  return a.length > 0 && a.length === b.length && a.every((x, i) => x === b[i]);
+}
+
+/**
+ * How the domain is set up: none, route53 (the deploy makes the
+ * certificate and the records in the zone), or external (the updater
+ * requests the certificate after the deploy and the guide shows the
+ * records to add). `found` is the zone found in the account and whether
+ * public DNS points at it.
+ */
+export function domainPlan(env, found = null) {
+  const hostname = (env.HOSTNAME_ARG || "").trim().toLowerCase().replace(/\.$/, "");
+  const given = (env.HOSTED_ZONE || "").trim().toLowerCase().replace(/\.$/, "");
+  if (!hostname) return { mode: "none" };
+  if (given) return { mode: "route53", hostname, zone: given };
+  if (found?.name && found.delegated) return { mode: "route53", hostname, zone: found.name, zoneId: found.id };
+  return { mode: "external", hostname };
+}
+
 /**
  * The install's config (coderhelm.config.json) from the stack's parameters.
  * Throws with a plain sentence when a parameter can't work.
  */
-export function configFromEnv(env, { account }) {
+export function configFromEnv(env, { account, found = null }) {
   const region = env.AWS_REGION || env.AWS_DEFAULT_REGION;
   const stage = env.STAGE || "prod";
   const admin = (env.ADMIN_EMAIL || "").trim().toLowerCase();
@@ -80,9 +125,12 @@ export function configFromEnv(env, { account }) {
   if (!/^[a-z][a-z0-9-]{0,19}$/.test(stage)) problems.push("the install name must be lowercase letters, digits and hyphens");
   if (!EMAIL_RE.test(admin)) problems.push("the admin email is not an email address");
   if (!EMAIL_RE.test(from)) problems.push("the sender address is not an email address");
-  const hostname = (env.HOSTNAME_ARG || "").trim().toLowerCase();
-  const hostedZone = (env.HOSTED_ZONE || "").trim().toLowerCase().replace(/\.$/, "");
-  if (hostname && !hostedZone) problems.push("a custom hostname needs its Route 53 hosted zone");
+  const plan = domainPlan(env, found);
+  const hostname = plan.hostname ?? "";
+  const hostedZone = plan.mode === "route53" ? plan.zone : "";
+  if (hostname && !/^(?=.{4,253}$)([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$/.test(hostname)) {
+    problems.push(`${hostname} is not a hostname such as coderhelm.example.com`);
+  }
   if (hostname && hostedZone && !(hostname === hostedZone || hostname.endsWith(`.${hostedZone}`))) {
     problems.push(`${hostname} is not inside the hosted zone ${hostedZone}`);
   }
@@ -98,7 +146,9 @@ export function configFromEnv(env, { account }) {
     account: String(account),
     region,
     stage,
-    domain: hostname ? { hostname, hostedZone } : null,
+    // Another DNS provider: the AWS address first, the domain once its
+    // certificate is issued (the updater moves it along).
+    domain: plan.mode === "route53" ? { hostname, hostedZone, ...(plan.zoneId ? { hostedZoneId: plan.zoneId } : {}) } : null,
     models,
     email: { from, identity: emailIdentity({ from, hostedZone }) },
     admins: [admin],
@@ -106,7 +156,27 @@ export function configFromEnv(env, { account }) {
   };
   const signup = (env.SIGNUP_DOMAIN || "").trim().toLowerCase();
   if (signup) cfg.signup = { domains: [signup] };
+  const updates = updatesFromEnv(env);
+  if (updates) cfg.updates = updates;
   return cfg;
+}
+
+/** Auto-update and its window, when the stack sets them (else the config's defaults). */
+export function updatesFromEnv(env) {
+  const auto = env.AUTO_UPDATE === "on";
+  const window = (env.UPDATE_WINDOW || "").trim();
+  const timezone = (env.UPDATE_TIMEZONE || "").trim();
+  const out = {};
+  if (auto) out.auto = true;
+  if (window && window !== "Sun 03:00") {
+    if (!/^(Mon|Tue|Wed|Thu|Fri|Sat|Sun|daily) ([01]\d|2[0-3]):00$/.test(window)) throw new Error("The stack's settings need a change: the maintenance window looks like Sun 03:00 or daily 02:00.");
+    out.window = window;
+  }
+  if (timezone && timezone !== "UTC") {
+    if (!/^[A-Za-z_]+(\/[A-Za-z0-9_+-]+)+$/.test(timezone)) throw new Error("The stack's settings need a change: the time zone looks like Europe/Berlin.");
+    out.timezone = timezone;
+  }
+  return Object.keys(out).length ? out : null;
 }
 
 /** Account numbers and ARNs out of anything that goes in the public progress file. */
@@ -118,6 +188,27 @@ export function redact(text) {
     .replace(/\s+/g, " ")
     .trim()
     .slice(0, 300);
+}
+
+/**
+ * Your own domain, for the guide: the hostname, how it is set up and the DNS
+ * records to add (names and values that will be public in DNS anyway). The
+ * hostname is already in the file as the install's URL once it is live.
+ */
+export function publicDomain(d) {
+  if (!d || !d.hostname) return null;
+  const clean = (v) => String(v ?? "").replace(/\.$/, "").toLowerCase().slice(0, 253);
+  return {
+    hostname: clean(d.hostname),
+    mode: ["route53", "external"].includes(d.mode) ? d.mode : "external",
+    state: ["validating", "attaching", "live", "failed", "pending"].includes(d.state) ? d.state : "pending",
+    records: (d.records ?? []).slice(0, 4).map((r) => ({
+      purpose: r.purpose === "address" ? "address" : "certificate",
+      name: clean(r.name),
+      type: r.type === "CNAME" ? "CNAME" : String(r.type ?? "CNAME").toUpperCase().slice(0, 8),
+      value: clean(r.value),
+    })),
+  };
 }
 
 /** The progress file the install guide reads. */
@@ -134,6 +225,7 @@ export function statusDoc(fields, now = new Date()) {
     region: fields.region ?? null,
     logUrl: fields.logUrl ?? null,
     fix: fields.fix ?? null,
+    domain: publicDomain(fields.domain),
     updatedAt: now.toISOString(),
   };
   if (!PHASES.includes(doc.phase)) throw new Error(`unknown phase ${doc.phase}`);
@@ -296,6 +388,46 @@ export function realDeps(env = process.env) {
         return null;
       }
     },
+    async findZone(hostname) {
+      const r = await sh("aws", ["route53", "list-hosted-zones", "--output", "json"]);
+      if (r.code !== 0) return null;
+      let zones = [];
+      try {
+        zones = JSON.parse(r.out).HostedZones ?? [];
+      } catch {
+        return null;
+      }
+      const z = findZone(zones, hostname);
+      if (!z) return null;
+      const g = await sh("aws", ["route53", "get-hosted-zone", "--id", z.id, "--query", "DelegationSet.NameServers", "--output", "json"]);
+      let servers = [];
+      try {
+        servers = JSON.parse(g.out);
+      } catch {
+        servers = [];
+      }
+      let published = [];
+      try {
+        published = await (await import("node:dns/promises")).resolveNs(z.name);
+      } catch {
+        published = [];
+      }
+      return { ...z, delegated: isDelegated(servers, published) };
+    },
+    async setDomain(stage, hostname) {
+      const t = writeTemp({ action: "domain_set", hostname, actor: "install" });
+      const out = path.join(path.dirname(t.file), "out.json");
+      try {
+        const r = await sh("aws", ["lambda", "invoke", "--function-name", `coderhelm-${stage}-updater`, "--region", region,
+          "--cli-binary-format", "raw-in-base64-out", "--payload", `file://${t.file}`, out]);
+        if (r.code !== 0) return null;
+        return JSON.parse(fs.readFileSync(out, "utf8"));
+      } catch {
+        return null;
+      } finally {
+        t.done();
+      }
+    },
     async putSecret(name, value) {
       const t = writeTemp(value);
       try {
@@ -334,10 +466,15 @@ export async function run({ env = process.env, deps = realDeps(env), tgz = "code
 
   // A second launch with the same install name upgrades it.
   const pulled = await deps.pull(stage);
+  let plan = { mode: "none" };
   if (pulled.code !== 0) {
     let cfg;
     try {
-      cfg = configFromEnv(env, { account: await deps.account() });
+      const host = (env.HOSTNAME_ARG || "").trim().toLowerCase().replace(/\.$/, "");
+      // Your domain's zone in this account, if it has one that public DNS uses.
+      const found = host && !env.HOSTED_ZONE && deps.findZone ? await deps.findZone(host) : null;
+      plan = domainPlan(env, found);
+      cfg = configFromEnv(env, { account: await deps.account(), found });
     } catch (e) {
       return fail(e.message, "Launch again with corrected settings.");
     }
@@ -378,7 +515,21 @@ export async function run({ env = process.env, deps = realDeps(env), tgz = "code
   }
 
   if (!url) return fail("CoderHelm deployed, but its address could not be read.", "Open the CloudFormation stack named coderhelm-" + stage + "-web and copy its PublicUrl output.");
-  return status({ phase: "done", message: "CoderHelm is running", url, step: progress.steps, steps: progress.steps });
+
+  // Your own domain at another DNS provider: the install runs on its AWS
+  // address now; the updater requests the certificate and attaches the
+  // domain once the records the guide shows are in place.
+  let domain = null;
+  if (plan.mode === "route53") domain = { hostname: plan.hostname, mode: "route53", state: "live", records: [] };
+  if (plan.mode === "external") {
+    const r = deps.setDomain ? await deps.setDomain(stage, plan.hostname) : null;
+    if (r && r.ok !== false) domain = { hostname: plan.hostname, mode: "external", state: r.state, records: r.records };
+    else {
+      log(`Could not request the certificate for ${plan.hostname}${r?.error ? `: ${r.error}` : ""}. Add the domain from Settings, then System.`);
+      domain = { hostname: plan.hostname, mode: "external", state: "failed", records: [] };
+    }
+  }
+  return status({ phase: "done", message: "CoderHelm is running", url, step: progress.steps, steps: progress.steps, domain });
 }
 
 if (process.argv[1] && fileURLToPath(import.meta.url) === path.resolve(process.argv[1])) {

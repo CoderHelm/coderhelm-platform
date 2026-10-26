@@ -2,7 +2,8 @@
  * Updates for a self-hosted install, run in its own account.
  *
  * - The updater Lambda (lambda/updater) checks GitHub for releases every
- *   hour, emails install admins about a new one (and posts to
+ *   hour, moves a domain added from Settings along (every 5 minutes:
+ *   certificate, then the build that puts it on CloudFront), emails install admins about a new one (and posts to
  *   `updates.webhookUrl`), and starts the update build when auto-update
  *   allows it: on, in the maintenance window, majors only when allowed.
  *   Settings → System and `coderhelm-selfhost auto-update` change its
@@ -79,7 +80,11 @@ export function updateBuildSpec(cfg: ResolvedConfig): codebuild.BuildSpec {
           "npm install -g ./coderhelm-selfhost.tgz",
           `coderhelm-selfhost pull --stage ${cfg.stage} --region "$AWS_REGION"${cfg.raw.resourcePrefix ? ` --resource-prefix ${cfg.raw.resourcePrefix}` : ""}`,
           'EXTRA=""; if [ "$MODE" = "rollback" ]; then EXTRA="--rollback"; fi',
-          'coderhelm-selfhost update --to "$VERSION" --yes --require-signature --auto-rollback --actor "$ACTOR" --result-file /tmp/result.json $EXTRA',
+          // A domain change (MODE=domain) redeploys the release that runs,
+          // with the new address in the config (installer/lib/domain.mjs).
+          'if [ "$MODE" = "domain" ]; then ' +
+            'coderhelm-selfhost domain apply --yes --require-signature --version "$VERSION" --action "${DOMAIN_ACTION:-attach}" --hostname "${DOMAIN_HOSTNAME:-}" --certificate-arn "${DOMAIN_CERT:-}" --zone "${DOMAIN_ZONE:-}" --zone-id "${DOMAIN_ZONE_ID:-}" --result-file /tmp/result.json; ' +
+            'else coderhelm-selfhost update --to "$VERSION" --yes --require-signature --auto-rollback --actor "$ACTOR" --result-file /tmp/result.json $EXTRA; fi',
         ],
       },
       post_build: {
@@ -169,6 +174,11 @@ export class UpdatesStack extends cdk.Stack {
           ACTOR: { value: "auto" },
           MODE: { value: "update" },
           HISTORY_ID: { value: "" },
+          DOMAIN_ACTION: { value: "" },
+          DOMAIN_HOSTNAME: { value: "" },
+          DOMAIN_CERT: { value: "" },
+          DOMAIN_ZONE: { value: "" },
+          DOMAIN_ZONE_ID: { value: "" },
         },
       },
       logging: { cloudWatch: { logGroup: buildLogs } },
@@ -201,6 +211,9 @@ export class UpdatesStack extends cdk.Stack {
         RELEASE_REPO: "CoderHelm/coderhelm-platform",
         // Restarted after the gateway stores new keys (refresh_secrets).
         REFRESH_FUNCTIONS: secretReaders(prefix).join(","),
+        // Your own domain (docs/self-host/domains.md).
+        DISTRIBUTION_DOMAIN_PARAMETER: cfg.distributionDomainParameter,
+        RESOURCE_PREFIX: prefix,
         ...(cfg.updates.webhookUrl ? { UPDATE_WEBHOOK_URL: cfg.updates.webhookUrl } : {}),
         ...stampEnvironment(stamp),
       },
@@ -223,6 +236,48 @@ export class UpdatesStack extends cdk.Stack {
       actions: ["lambda:GetFunctionConfiguration", "lambda:UpdateFunctionConfiguration"],
       resources: secretReaders(prefix).map((f) => `arn:aws:lambda:${this.region}:${this.account}:function:${f}`),
     }));
+
+    // Your own domain: request its certificate in us-east-1 (CloudFront's
+    // region), add the validation record when the zone is in Route 53 here,
+    // and read the CloudFront hostname for the record people add elsewhere.
+    this.updaterFunction.addToRolePolicy(new iam.PolicyStatement({
+      sid: "DomainCertificate",
+      actions: ["acm:DescribeCertificate", "acm:AddTagsToCertificate"],
+      resources: [`arn:aws:acm:us-east-1:${this.account}:certificate/*`],
+    }));
+    this.updaterFunction.addToRolePolicy(new iam.PolicyStatement({
+      sid: "DomainCertificateRequest",
+      actions: ["acm:RequestCertificate"],
+      resources: ["*"],
+      conditions: { StringEquals: { "aws:RequestedRegion": "us-east-1" } },
+    }));
+    this.updaterFunction.addToRolePolicy(new iam.PolicyStatement({
+      sid: "DomainZoneLookup",
+      actions: ["route53:ListHostedZones", "route53:GetHostedZone"],
+      resources: ["*"],
+    }));
+    this.updaterFunction.addToRolePolicy(new iam.PolicyStatement({
+      sid: "DomainValidationRecord",
+      actions: ["route53:ChangeResourceRecordSets"],
+      resources: ["arn:aws:route53:::hostedzone/*"],
+      conditions: {
+        // Only the CNAME ACM checks (its name always starts with an underscore).
+        "ForAllValues:StringEquals": { "route53:ChangeResourceRecordSetsRecordTypes": ["CNAME"] },
+        "ForAllValues:StringLike": { "route53:ChangeResourceRecordSetsNormalizedRecordNames": ["_*"] },
+      },
+    }));
+    this.updaterFunction.addToRolePolicy(new iam.PolicyStatement({
+      sid: "DomainTarget",
+      actions: ["ssm:GetParameter"],
+      resources: [`arn:aws:ssm:${this.region}:${this.account}:parameter${cfg.distributionDomainParameter}`],
+    }));
+
+    new events.Rule(this, "DomainCheck", {
+      ruleName: `${prefix}-domain-check`,
+      description: "Every 5 minutes: a domain waiting for its certificate? Attach it once issued",
+      schedule: events.Schedule.rate(cdk.Duration.minutes(5)),
+      targets: [new targets.LambdaFunction(this.updaterFunction, { event: events.RuleTargetInput.fromObject({ action: "domain_status" }) })],
+    });
 
     new events.Rule(this, "UpdateCheck", {
       ruleName: `${prefix}-update-check`,

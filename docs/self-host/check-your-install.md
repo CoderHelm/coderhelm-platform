@@ -61,6 +61,7 @@ The last result is kept in `.coderhelm/doctor.json`.
 | Web address | TLS certificate issued | Wrong region, wrong name, or still validating | The validation records to add, or the ACM request page |
 | Web address | Web address answers | DNS doesn't resolve, the certificate is refused, or CloudFront answers an error | The DNS record to add, or the ACM or CloudFront console |
 | Web address | API answers | `/api` doesn't answer | `aws logs tail` for the gateway, then deploy again |
+| Web address | Your own domain (Settings, then Setup) | The certificate waits for its record, a record has the wrong value, CAA blocks Amazon, the hostname is a zone apex, or HTTPS or the API doesn't answer on it | The records to add with their exact values; every code is in [Domains](./domains.md#checks) |
 | Install health | CloudFormation stacks | A stack is missing or stuck in a rollback | The stack's Events tab, then `deploy` |
 | Install health | Functions | gateway, worker or streaming isn't active | `deploy` (it replaces the function) |
 | Install health | No failed events waiting | Messages wait in the dead-letter queue (a warning) | The failed events page in the dashboard |
@@ -77,6 +78,7 @@ The last result is kept in `.coderhelm/doctor.json`.
 | Claude | Claude answers | A real one-token call fails | The model access page, or the inference prefix to check |
 | Claude | Anthropic API key works | The key is refused, can't use the model, or has no credit | The Anthropic console's keys or billing page |
 | Notices | Slack or Teams webhook | The webhook was removed or the URL is wrong | How to create a new one |
+| Integrations | Sign in with Google (Settings, then Setup) | It is on, but its keys aren't in the secret | The keys to add; see [Sign-in and people](./sign-in.md) |
 
 ## The guided install
 
@@ -101,7 +103,7 @@ A check that comes with an action, such as running the CDK bootstrap, asks first
 
 ## In the dashboard
 
-**Settings, then Setup** shows every server-side check with its status and its fix: a link, a page in CoderHelm, or a command to copy. **Check again** reruns them. The checks: the web address, the GitHub App (keys, permissions and events, installations, webhook URL and the latest deliveries), the email sender (verification and DKIM) and the sandbox, a real one-token model call with your team's key or through Bedrock, the dead-letter queue, the updater, and Slack, Teams and Jira when you use them.
+**Settings, then Setup** shows every server-side check with its status and its fix: a link, a page in CoderHelm, or a command to copy. **Check again** reruns them. The checks: the web address, your own domain (records, certificate, HTTPS and the API on it), the GitHub App (keys, permissions and events, installations, webhook URL and the latest deliveries), the email sender (verification and DKIM) and the sandbox, a real one-token model call with your team's key or through Bedrock, the dead-letter queue, the updater, Slack, Teams and Jira when you use them, and Google sign-in.
 
 **Settings, then System** shows **Update readiness**: what would stop an update right now (a failing check, an update already running) and what to read first (a major release's notes, a release whose last try failed), each with its fix.
 
@@ -132,7 +134,11 @@ Install admins (`admins` in the config) who are team admins can call these while
 }
 ```
 
-`status` is `pass`, `warn`, `fail` or `skip` (an optional integration that isn't set up). `fix` has `text` and any of `command` (to copy), `url` (outside CoderHelm) and `href` (a dashboard page). `ready` is true when nothing fails. Keys: `url`, `github_keys`, `github_app`, `github_permissions`, `github_installations`, `github_webhook`, `email_identity`, `email_sandbox`, `model`, `dlq`, `updates`, `slack`, `teams`, `jira`.
+`status` is `pass`, `warn`, `fail` or `skip` (an optional integration that isn't set up). `fix` has `text` and any of `command` (to copy), `url` (outside CoderHelm) and `href` (a dashboard page). `ready` is true when nothing fails. Keys: `url`, `domain`, `github_keys`, `github_app`, `github_permissions`, `github_installations`, `github_webhook`, `email_identity`, `email_sandbox`, `model`, `dlq`, `updates`, `slack`, `teams`, `jira`, `google_sign_in`.
+
+### `GET /api/system/domain`, `PUT /api/system/domain`, `DELETE /api/system/domain`
+
+Your own domain (install admins; Settings, then System uses them). `GET` answers with the updater's view (`hostname`, `state`, `mode`, `target`, `certificate`, `records` to add, `name_servers` for a Route 53 zone), the decision (`status`, `code`, as in [Domains](./domains.md#checks)) and the `check` with its fix. `PUT {"hostname": "coderhelm.example.com"}` requests the certificate; `DELETE` goes back to the AWS address. A refusal (a change already running, the same hostname) is a 400 with `error` in plain words.
 
 ### `GET /api/system/preflight`
 
@@ -175,6 +181,9 @@ For the [install guide](https://docs.coderhelm.com/self-host/install/) to poll f
     { "id": "github_installed", "label": "GitHub App installed on your repositories", "status": "wait", "code": "needs_app" },
     { "id": "models", "label": "Claude access", "status": "fail", "code": "use_case_required" },
     { "id": "email", "label": "Email", "status": "warn", "code": "sandbox", "required": false },
+    { "id": "domain", "label": "Your domain", "status": "wait", "code": "validating", "required": false },
+    { "id": "google_sign_in", "label": "Sign in with Google", "status": "skip", "code": "off", "required": false },
+    { "id": "updates", "label": "Automatic updates", "status": "skip", "code": "auto_off", "required": false },
     { "id": "admin", "label": "First admin signed up", "status": "wait", "code": "not_signed_up" }
   ]
 }
@@ -192,9 +201,14 @@ For the [install guide](https://docs.coderhelm.com/self-host/install/) to poll f
 | `github_installed` | `ok`, `needs_app` (wait), `not_installed` (wait), `app_rejected`, `bad_key`, `github_unreachable` (warn) | Install the app on your repositories. `app_rejected` and `bad_key`: create a new app with `github-app --force`. |
 | `models` | `ok`, `use_case_required`, `access_denied`, `subscription_pending` (warn), `marketplace_failed`, `iam_denied`, `not_available`, `unknown`; `anthropic_keys_per_team` (skip) | Bedrock: one real one-token call (a pass is kept 10 minutes, a failure 20 seconds). Submit Anthropic's use case form or request access in the Bedrock console for your region, wait for the subscription, fix the payment method, or allow Bedrock model calls. With Anthropic API keys, each team adds its key after signing in. |
 | `email` | `ok`, `identity_unverified`, `sandbox`, `unknown` (all warn, never blocking) | Verify the sender (DKIM records, or the link AWS emailed); request SES production access. |
+| `domain` | `none` (skip), `validating` (wait), `attaching` (wait), `removing` (wait), `dns_missing` (wait), `zone_not_delegated`, `validation_wrong_value`, `caa_blocked`, `certificate_failed`, `attach_failed`, `dns_wrong_value`, `cname_at_apex`, `https_failed`, `api_unreachable`, `unknown` (warn), `ok`; never blocking | See [Domains](./domains.md#checks). The hostname and the records are never in this answer: the guide has them from the progress file. |
+| `google_sign_in` | `off` (skip), `missing_keys`, `ok`; never blocking | See [Sign-in and people](./sign-in.md). |
+| `updates` | `auto_off` (skip), `ok`, `unknown` (warn); never blocking | Turn automatic updates on in Settings, then System. |
 | `admin` | `ok`, `not_signed_up` (wait) | Sign up at your CoderHelm address with the admin email. |
 
 The guide builds its own links (the Bedrock console for the region it launched in, `https://github.com/apps/<slug>/installations/new` from the slug the manifest landing hands back), so the install never has to publish them.
+
+`?probe=1` answers only `{"schema": 1, "service": "coderhelm", "probe": true}`, at once and without running any check: the domain check calls it on your hostname to see that CoderHelm's API answers there.
 
 It answers only while the setup window is open: until the first person has an account. After that it answers only:
 

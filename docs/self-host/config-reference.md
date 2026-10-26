@@ -18,7 +18,7 @@ The smallest config:
 }
 ```
 
-Two complete examples live in the repo: [`infra/config/selfhost.example.json`](../../infra/config/selfhost.example.json) (no domain, Anthropic) and [`infra/config/selfhost.domain.example.json`](../../infra/config/selfhost.domain.example.json) (your domain, Bedrock in eu-west-1). The hosted deployment's own config is [`infra/config/hosted.prod.json`](../../infra/config/hosted.prod.json).
+[Everything you can set up](./options.md) lists every setting with where else to set it (the install guide, the Launch Stack, the dashboard). Two complete examples live in the repo: [`infra/config/selfhost.example.json`](../../infra/config/selfhost.example.json) (no domain, Anthropic) and [`infra/config/selfhost.domain.example.json`](../../infra/config/selfhost.domain.example.json) (your domain, Bedrock in eu-west-1). The hosted deployment's own config is [`infra/config/hosted.prod.json`](../../infra/config/hosted.prod.json).
 
 ## Where things go
 

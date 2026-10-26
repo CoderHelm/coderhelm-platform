@@ -138,6 +138,13 @@ async fn main() -> Result<(), Error> {
         .route("/system/update", post(routes::system::update_now))
         .route("/system/rollback", post(routes::system::rollback))
         .route("/system/test-email", post(routes::system::test_email))
+        // Your own domain: status and records, set, back to the AWS address.
+        .route(
+            "/system/domain",
+            get(routes::system::domain)
+                .put(routes::system::set_domain)
+                .delete(routes::system::remove_domain),
+        )
         // Setup checks and update readiness, each with its fix (install admins).
         .route("/system/checks", get(routes::setup_checks::checks))
         .route(

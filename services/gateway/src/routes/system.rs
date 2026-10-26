@@ -226,6 +226,90 @@ pub async fn test_email(
     }
 }
 
+/// The updater's domain view without its `ok` flag.
+fn domain_view(view: Option<Value>) -> Value {
+    let mut v = view.unwrap_or(Value::Null);
+    if let Some(o) = v.as_object_mut() {
+        o.remove("ok");
+    }
+    v
+}
+
+/// GET /api/system/domain: your own domain, the DNS records to add, and its
+/// check with the fix (docs/self-host/domains.md).
+pub async fn domain(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<Claims>,
+) -> Reply {
+    claims.require_role(3).map_err(status_only)?;
+    allowed(&claims).map_err(status_only)?;
+    if updater().is_none() {
+        return Ok(Json(json!({
+            "available": false,
+            "reason": "This install has no updater: set domain in coderhelm.config.json and deploy.",
+        })));
+    }
+    let (facts, view) = super::setup_checks::domain_facts_now(&state).await;
+    let (status, code) = super::setup_checks::domain_code(&facts);
+    Ok(Json(json!({
+        "available": true,
+        "status": status,
+        "code": code,
+        "domain": domain_view(view),
+        "check": super::setup_checks::domain(&facts),
+    })))
+}
+
+/// The hostname a request names, or the plain refusal.
+pub fn hostname_from(body: &Value) -> Result<String, &'static str> {
+    let h = body
+        .get("hostname")
+        .and_then(Value::as_str)
+        .map(|h| h.trim().to_ascii_lowercase())
+        .unwrap_or_default();
+    if h.is_empty() || h.len() > 253 || h.contains(char::is_whitespace) {
+        return Err("send the hostname, such as coderhelm.example.com");
+    }
+    Ok(h)
+}
+
+/// PUT /api/system/domain `{hostname}`: use your own domain. The updater
+/// requests its certificate (and adds the validation record when the zone
+/// is in Route 53 in this account); the domain goes live once it is issued.
+pub async fn set_domain(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<Claims>,
+    Json(body): Json<Value>,
+) -> Reply {
+    claims.require_role(3).map_err(status_only)?;
+    allowed(&claims).map_err(status_only)?;
+    let hostname =
+        hostname_from(&body).map_err(|m| (StatusCode::BAD_REQUEST, Json(json!({ "error": m }))))?;
+    let body = call(
+        &state,
+        json!({ "action": "domain_set", "hostname": hostname, "actor": claims.email }),
+    )
+    .await
+    .map_err(status_only)?;
+    answer(body)
+}
+
+/// DELETE /api/system/domain: back to the AWS (CloudFront) address.
+pub async fn remove_domain(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<Claims>,
+) -> Reply {
+    claims.require_role(3).map_err(status_only)?;
+    allowed(&claims).map_err(status_only)?;
+    let body = call(
+        &state,
+        json!({ "action": "domain_remove", "actor": claims.email }),
+    )
+    .await
+    .map_err(status_only)?;
+    answer(body)
+}
+
 /// A plain reason for a failed send, without the SDK's noise.
 pub fn short_reason(raw: &str) -> &'static str {
     let r = raw.to_ascii_lowercase();
@@ -262,6 +346,20 @@ mod tests {
         assert_eq!(code, StatusCode::BAD_REQUEST);
         assert_eq!(body.0["error"], "an update is already running");
         assert!(answer(json!({"ok": true, "version": "v1.2.0"})).is_ok());
+    }
+
+    #[test]
+    fn a_domain_request_needs_a_hostname() {
+        assert_eq!(
+            hostname_from(&json!({"hostname": " Helm.Example.org "})),
+            Ok("helm.example.org".to_string())
+        );
+        assert!(hostname_from(&json!({})).is_err());
+        assert!(hostname_from(&json!({"hostname": "a b.example.org"})).is_err());
+        assert_eq!(
+            domain_view(Some(json!({"ok": true, "state": "live"}))),
+            json!({"state": "live"})
+        );
     }
 
     #[test]
