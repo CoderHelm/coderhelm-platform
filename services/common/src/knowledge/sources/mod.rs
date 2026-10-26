@@ -48,6 +48,7 @@ pub mod sanity_mcp;
 pub mod store;
 pub mod sync;
 pub mod text;
+pub mod token;
 pub mod web;
 pub mod webhook;
 

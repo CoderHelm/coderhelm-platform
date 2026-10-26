@@ -285,6 +285,7 @@ pub async fn connectors(
             "signed_in": st.signed_in,
             "signed_in_as": if account.is_empty() { claims.email.clone() } else { account },
             "has_saved_key": st.has_saved_key,
+            "token_path": st.token_path,
             "live_updates": kind.has_webhooks(),
             "picker": if kind == Kind::Web { "address" } else { "tree" },
         }));

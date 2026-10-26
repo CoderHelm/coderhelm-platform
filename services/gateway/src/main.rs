@@ -210,6 +210,11 @@ async fn main() -> Result<(), Error> {
         .route("/admin/dlq", get(routes::admin::admin_dlq))
         // The daily check of recorded usage against Anthropic's report
         .route("/admin/usage-check", get(routes::admin::admin_usage_check))
+        // Which sign-in apps (Notion, Atlassian, Google Drive) the install has
+        .route(
+            "/admin/sign-in-apps",
+            get(routes::knowledge_tokens::sign_in_apps),
+        )
         .route("/admin/dlq/delete", post(routes::admin::admin_dlq_delete))
         .route("/admin/beta-signups", get(routes::admin::beta_signups))
         .route(
@@ -551,6 +556,10 @@ async fn main() -> Result<(), Error> {
         .route(
             "/knowledge/connectors/:kind/signin",
             post(routes::knowledge_sources::signin),
+        )
+        .route(
+            "/knowledge/connectors/:kind/token",
+            post(routes::knowledge_tokens::save_token),
         )
         .route(
             "/knowledge/connectors/:kind/browse",

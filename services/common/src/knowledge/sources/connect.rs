@@ -178,6 +178,25 @@ impl Env {
     }
 }
 
+impl Env {
+    /// The team has a Confluence API token saved whose last check didn't
+    /// fail (a token Confluence refused doesn't count as connected).
+    pub async fn confluence_token_ok(&self) -> bool {
+        let saved_ok = conns::get(
+            &self.dynamo,
+            &self.settings_table,
+            &self.team,
+            ConnKind::Confluence,
+            "",
+        )
+        .await
+        .ok()
+        .flatten()
+        .is_some_and(|c| c.status != "error");
+        saved_ok && self.confluence_token().await.is_some()
+    }
+}
+
 fn not_connected(kind: Kind) -> ConnectorError {
     ConnectorError::Reconnect(format!("{} isn't connected.", kind.label()))
 }
@@ -534,6 +553,20 @@ pub struct ConnStatus {
     pub signed_in: bool,
     /// The team also has an API token saved for it.
     pub has_saved_key: bool,
+    /// It can also connect with a token pasted in the add flow (Notion,
+    /// Confluence): `POST /api/knowledge/connectors/:kind/token`.
+    pub token_path: bool,
+}
+
+/// What the add flow says when the install has no sign-in app for `kind`
+/// and the team has no saved token: the way it can still connect.
+pub fn no_app_hint(kind: Kind) -> &'static str {
+    match kind {
+        Kind::Notion => "Notion sign-in isn't set up on this Coderhelm, so connect Notion with a token from a Notion connection instead.",
+        Kind::Confluence => "Atlassian sign-in isn't set up on this Coderhelm, so connect Confluence with an Atlassian API token instead.",
+        Kind::GoogleDrive => "Google Drive connects only through Google sign-in, and it isn't set up on this Coderhelm yet.",
+        _ => "",
+    }
 }
 
 /// How `kind` stands for the team and for `member` (the person asking).
@@ -578,6 +611,7 @@ pub async fn status(env: &Env, kind: Kind, app_configured: bool, member: &str) -
             }
         }
         Kind::Notion | Kind::Confluence | Kind::GoogleDrive => {
+            st.token_path = kind != Kind::GoogleDrive;
             let (signed_in, reason, by) = env.oauth_state(kind).await;
             st.connected_by = by;
             if signed_in {
@@ -590,18 +624,14 @@ pub async fn status(env: &Env, kind: Kind, app_configured: bool, member: &str) -
                         .plugin_credentials("notion")
                         .await
                         .is_some_and(|c| c.get("api_key").is_some_and(|k| !k.is_empty())),
-                    Kind::Confluence => env.confluence_token().await.is_some(),
+                    Kind::Confluence => env.confluence_token_ok().await,
                     _ => false,
                 };
                 if saved {
                     st.connected = true;
                     st.via = "saved_key".into();
                 } else if !app_configured {
-                    st.hint = match kind {
-                        Kind::Notion => "Add a Notion integration token on the Integrations page, or ask whoever runs Coderhelm to set up Notion sign-in.".into(),
-                        Kind::Confluence => "Save a Confluence email and API token on the Integrations page, or ask whoever runs Coderhelm to set up Atlassian sign-in.".into(),
-                        _ => "Ask whoever runs Coderhelm to set up Google sign-in for Drive.".into(),
-                    };
+                    st.hint = no_app_hint(kind).into();
                 }
             }
         }
@@ -838,6 +868,18 @@ mod tests {
             ..Default::default()
         });
         assert_eq!(super::super::source_error(&src, &e).action, "sign_in");
+    }
+
+    #[test]
+    fn without_a_sign_in_app_the_hint_names_the_way_that_still_works() {
+        assert!(no_app_hint(Kind::Notion).contains("token"));
+        assert!(no_app_hint(Kind::Confluence).contains("API token"));
+        assert!(no_app_hint(Kind::GoogleDrive).contains("only through Google sign-in"));
+        for k in [Kind::Notion, Kind::Confluence, Kind::GoogleDrive] {
+            // The page and its link are named by the page, not here.
+            assert!(!no_app_hint(k).contains("Integrations page"));
+            assert!(!no_app_hint(k).contains("Connected apps"));
+        }
     }
 
     #[test]

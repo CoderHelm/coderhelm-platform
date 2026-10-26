@@ -455,6 +455,7 @@ pub const CAPABILITIES: &[Capability] = &[
             "plugins::update_credentials",
             "plugins::update_prompt",
             "plugins::test_connection",
+            "knowledge_tokens::save_token",
             "mcp_servers::detect_auth",
             "mcp_servers::create",
             "mcp_servers::remove",
