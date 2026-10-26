@@ -33,6 +33,9 @@ pub struct Proof<'a> {
     pub manual: &'a str,
     pub ci: &'a [CiCommand],
     pub mirrors: &'a [super::completeness::Mirror],
+    /// For a run started from a log finding: what its evidence step found.
+    /// The description is checked against it (see `log_fix_checks`).
+    pub log: Option<&'a super::log_evidence::LogEvidence>,
 }
 
 /// What the writer is told about the checks CI runs on the PR: never a
@@ -424,6 +427,28 @@ Return ONLY the markdown body text."#,
         )
         .await;
     }
+
+    // A fix from a log finding: the description is checked against the
+    // run's evidence, sent back once, and rewritten where it still fails.
+    let body_text = match proof.log {
+        Some(ev) => {
+            super::log_fix_checks::enforce(
+                state,
+                msg,
+                run_id,
+                &diff,
+                body_text,
+                ev,
+                provider,
+                &system,
+                &mut messages,
+                write_opts,
+                usage,
+            )
+            .await
+        }
+        None => body_text,
+    };
 
     // A Verification step never asks a person to run what CI runs on the PR.
     let body_text = ci_verification(&body_text, proof.ci);
@@ -1818,6 +1843,7 @@ mod refresh_tests {
             manual: "",
             ci: &[],
             mirrors: &mirrors,
+            log: None,
         };
         let owned = super::owned_sections(&plan, &proof, "acme/infra");
         let body = assemble(

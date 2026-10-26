@@ -113,6 +113,9 @@ pub const BUILTIN: &[(&str, Risk)] = &[
     ("run_codegen", Risk::Write),
     ("run_checks", Risk::Write),
     ("update_pr_description", Risk::Write),
+    // A pull request in a repository other than the ticket's (a fix that
+    // also needs the infrastructure code changed).
+    ("open_pull_request", Risk::Write),
     ("confluence_append", Risk::Write),
 ];
 

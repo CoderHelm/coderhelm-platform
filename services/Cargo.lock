@@ -5547,6 +5547,7 @@ dependencies = [
  "aws-sdk-cloudwatchlogs",
  "aws-sdk-codebuild",
  "aws-sdk-dynamodb",
+ "aws-sdk-ecs",
  "aws-sdk-kms",
  "aws-sdk-lambda",
  "aws-sdk-s3",

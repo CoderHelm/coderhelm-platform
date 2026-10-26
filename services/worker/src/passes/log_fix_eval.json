@@ -1,0 +1,253 @@
+{
+ "about": "A made-up web app whose fetch cache fills the container disk, from a real case with every name changed.",
+ "now": "2026-03-12 12:00",
+ "target": {
+  "log_group": "/ecs/storefront-web",
+  "needle": "ENOSPC: no space left on device"
+ },
+ "aws": {
+  "streams": [
+   {
+    "stream": "web/storefront/0f1e2d3c4b5a",
+    "count": 41210,
+    "first_ms": 1773054000000,
+    "last_ms": 1773316560000
+   },
+   {
+    "stream": "web/storefront/9a8b7c6d5e4f",
+    "count": 3324,
+    "first_ms": 1772740800000,
+    "last_ms": 1772840400000
+   }
+  ],
+  "clusters": [
+   "shop-prod"
+  ],
+  "services": [
+   {
+    "cluster": "shop-prod",
+    "name": "orders-api",
+    "task_definition": "arn:td/orders-api:31",
+    "launch_type": "FARGATE",
+    "running": 2
+   },
+   {
+    "cluster": "shop-prod",
+    "name": "storefront-web",
+    "task_definition": "arn:td/storefront-web:12",
+    "launch_type": "FARGATE",
+    "running": 2
+   }
+  ],
+  "task_defs": [
+   {
+    "arn": "arn:td/orders-api:31",
+    "family": "orders-api",
+    "revision": 31,
+    "cpu": "512",
+    "memory": "1024",
+    "ephemeral_gib": null,
+    "requires_fargate": true,
+    "containers": [
+     {
+      "name": "api",
+      "image": "orders-api:31",
+      "command": [],
+      "entry_point": [],
+      "working_directory": "",
+      "log_group": "/ecs/orders-api",
+      "stream_prefix": "api"
+     }
+    ]
+   },
+   {
+    "arn": "arn:td/storefront-web:12",
+    "family": "storefront-web",
+    "revision": 12,
+    "cpu": "1024",
+    "memory": "2048",
+    "ephemeral_gib": null,
+    "requires_fargate": true,
+    "containers": [
+     {
+      "name": "storefront",
+      "image": "storefront-web:12",
+      "command": [
+       "npm",
+       "run",
+       "start:prod"
+      ],
+      "entry_point": [],
+      "working_directory": "",
+      "log_group": "/ecs/storefront-web",
+      "stream_prefix": "web"
+     }
+    ]
+   }
+  ],
+  "tasks": [
+   {
+    "id": "0f1e2d3c4b5a",
+    "last_status": "RUNNING",
+    "started_ms": 1772841600000,
+    "task_definition": "arn:td/storefront-web:12"
+   },
+   {
+    "id": "1a2b3c4d5e6f",
+    "last_status": "RUNNING",
+    "started_ms": 1773302400000,
+    "task_definition": "arn:td/storefront-web:12"
+   }
+  ],
+  "refuse": {}
+ },
+ "expect_evidence": {
+  "service": "storefront-web",
+  "disk_gib": 20,
+  "fill_mb_per_hour": 347.0,
+  "hours_to_first_error": 59.0,
+  "failing_now": [
+   "0f1e2d3c4b5a"
+  ],
+  "total_errors": 44534
+ },
+ "repo_files": {
+  "Dockerfile": "FROM node:20-slim\nWORKDIR /app\nCOPY . .\nCMD [\"npm\", \"start\"]\n",
+  "package.json": "{\"scripts\":{\"start\":\"next start\",\"start:prod\":\"node server.js\"}}"
+ },
+ "expect_start": {
+  "command": "npm run start:prod",
+  "script": "start:prod: node server.js",
+  "working_directory": "/app"
+ },
+ "repos": [
+  {
+   "full_name": "shop/storefront",
+   "enabled": true,
+   "role": "web",
+   "description": "The storefront site"
+  },
+  {
+   "full_name": "shop/orders-api",
+   "enabled": true,
+   "role": "backend",
+   "description": ""
+  },
+  {
+   "full_name": "shop/platform-infra",
+   "enabled": true,
+   "role": "",
+   "description": "Terraform for ECS task definitions and CloudWatch alarms"
+  },
+  {
+   "full_name": "shop/docs",
+   "enabled": false,
+   "role": "",
+   "description": ""
+  }
+ ],
+ "primary": "shop/storefront",
+ "code_hits": [
+  {
+   "repo": "shop/orders-api",
+   "path": "src/logging.ts",
+   "term": "/ecs/storefront-web"
+  },
+  {
+   "repo": "shop/platform-infra",
+   "path": "modules/ecs-service/storefront-web.tf",
+   "term": "storefront-web"
+  },
+  {
+   "repo": "shop/platform-infra",
+   "path": "modules/ecs-service/alarms.tf",
+   "term": "/ecs/storefront-web"
+  }
+ ],
+ "expect_infra_repo": "shop/platform-infra",
+ "outside_change": {
+  "system": "infrastructure",
+  "change": "Raise the storefront-web task's ephemeral storage and alarm on EphemeralStorageUtilized",
+  "where": "the Terraform that defines the task",
+  "verify": "the alarm shows in CloudWatch"
+ },
+ "diffs": {
+  "app": {
+   "files": [
+    {
+     "filename": "cache-handler.js",
+     "patch": "+const path = require('path');\n+const MAX_FETCH_CACHE_BYTES = 2 * 1024 * 1024 * 1024;\n+const CACHE_DIR = path.join(process.cwd(), '.next/cache/fetch-cache');\n+// Evicts the oldest entries once the directory is over the byte budget."
+    },
+    {
+     "filename": "next.config.js",
+     "patch": "+  cacheHandler: require.resolve('./cache-handler.js'),\n+  cacheMaxMemorySize: 0,"
+    }
+   ]
+  },
+  "infra": {
+   "files": [
+    {
+     "filename": "modules/ecs-service/storefront-web.tf",
+     "patch": "+  ephemeral_storage {\n+    size_in_gib = 50\n+  }"
+    },
+    {
+     "filename": "modules/ecs-service/alarms.tf",
+     "patch": "+resource \"aws_cloudwatch_metric_alarm\" \"storefront_web_disk\" {\n+  metric_name = \"EphemeralStorageUtilized\"\n+  threshold   = 40\n+  period      = 300\n+}"
+    }
+   ]
+  }
+ },
+ "descriptions": [
+  {
+   "name": "original description (hedges, no numbers)",
+   "diff": "app",
+   "body": "Bounds the fetch cache so the site stops failing with ENOSPC.\n\n**Also needed outside the code**\nThe error lines come from the web service's log group, not the API service. The framework appears to write cached fetch results to the container's ephemeral disk and never evict them. I inferred this from the framework's behaviour and could not read the disk or the framework's source to confirm it. Raise ephemeral storage if it is at the 21 GiB default and add an EphemeralStorageUtilized alarm.\n* Task start times: unconfirmed.\n* Disk size: unconfirmed.",
+   "expect": {
+    "hedges": false,
+    "limits": false,
+    "start_path": false
+   }
+  },
+  {
+   "name": "evidence-first description",
+   "diff": "app",
+   "body": "**Problem.** Task `0f1e2d3c4b5a` of `storefront-web` has failed every fetch-cache write with ENOSPC since 2026-03-09 11:00 UTC (41,210 lines; 44,534 across tasks this week). Each task gets 20 GiB (no `ephemeralStorage` set, so the Fargate default; the ticket said 21 GiB). That task started 2026-03-07 00:00, so the disk filled in 59 h: about 347 MB/h.\n\n**Changes.** `cache-handler.js` keeps the fetch cache under a 2 GiB byte budget and evicts the oldest entries; `next.config.js` uses it.\n\n**Why 2 GiB.** At 347 MB/h a 2 GiB budget holds about 6 h of entries and leaves 18 GiB for everything else.\n\n**Start path.** Production starts the container with `npm run start:prod` (task definition storefront-web:12 `command`, which overrides the image's CMD), which runs `node server.js` from `/app`; `process.cwd()` is `/app`, so the cache directory is `/app/.next/cache/fetch-cache`.\n\n**Failing now.** `0f1e2d3c4b5a` is failing now (since 2026-03-09 11:00 UTC). Stopping that task relieves it; a person has to do that.\n\n**Not in this PR.** Why the cache grows without eviction (follow-up).\n\n**Risk:** Low. **Verification:** CI runs the tests; after deploy, the ENOSPC lines stop.",
+   "expect": {
+    "hedges": true,
+    "limits": true,
+    "start_path": true
+   }
+  },
+  {
+   "name": "open item naming the refused source",
+   "diff": "app",
+   "refuse": "ecs:DescribeTasks",
+   "body": "**Problem.** Task `0f1e2d3c4b5a` of `storefront-web` has failed every fetch-cache write with ENOSPC since 2026-03-09 11:00 UTC (41,210 lines; 44,534 across tasks this week). Each task gets 20 GiB (no `ephemeralStorage` set, so the Fargate default; the ticket said 21 GiB). That task started 2026-03-07 00:00, so the disk filled in 59 h: about 347 MB/h.\n\n**Changes.** `cache-handler.js` keeps the fetch cache under a 2 GiB byte budget and evicts the oldest entries; `next.config.js` uses it.\n\n**Why 2 GiB.** At 347 MB/h a 2 GiB budget holds about 6 h of entries and leaves 18 GiB for everything else.\n\n**Start path.** Production starts the container with `npm run start:prod` (task definition storefront-web:12 `command`, which overrides the image's CMD), which runs `node server.js` from `/app`; `process.cwd()` is `/app`, so the cache directory is `/app/.next/cache/fetch-cache`.\n\nWhich tasks are running now is unconfirmed: `ecs:DescribeTasks` was refused. **Failing now.** `0f1e2d3c4b5a` is failing now (since 2026-03-09 11:00 UTC). Stopping that task relieves it; a person has to do that.\n\n**Not in this PR.** Why the cache grows without eviction (follow-up).\n\n**Risk:** Low. **Verification:** CI runs the tests; after deploy, the ENOSPC lines stop.",
+   "expect": {
+    "hedges": true,
+    "limits": true,
+    "start_path": true
+   }
+  },
+  {
+   "name": "infra PR with the arithmetic",
+   "diff": "infra",
+   "body": "**Problem.** `storefront-web` tasks fill their 20 GiB disk in about 59 h (347 MB/h).\n\n**Changes.** Ephemeral storage 20 GiB to 50 GiB; alarm on `EphemeralStorageUtilized` at 40 GiB over 300 s periods.\n\n**Why these limits.** 50 GiB at 347 MB/h lasts about 147 h; the alarm at 40 GiB fires about 29 h before the disk is full.\n\n**Risk:** Low. **Verification:** CI runs `terraform plan` on this PR.",
+   "expect": {
+    "hedges": true,
+    "limits": true,
+    "start_path": true
+   }
+  },
+  {
+   "name": "infra PR without numbers",
+   "diff": "infra",
+   "body": "Raises the storage and adds an alarm. The size should be plenty; we could not confirm the current setting.",
+   "expect": {
+    "hedges": false,
+    "limits": false,
+    "start_path": true
+   }
+  }
+ ]
+}

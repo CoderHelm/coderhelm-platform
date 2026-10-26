@@ -66,6 +66,19 @@ Resources:
                 Action:
                   - "sts:GetCallerIdentity"
                 Resource: "*"
+              # Before a fix for a log error is written: which tasks of the
+              # service behind a log group are running, since when, and how
+              # they start. Lists and describes only.
+              - Sid: DescribeTasksBehindLogErrors
+                Effect: Allow
+                Action:
+                  - "ecs:ListClusters"
+                  - "ecs:ListServices"
+                  - "ecs:DescribeServices"
+                  - "ecs:DescribeTaskDefinition"
+                  - "ecs:ListTasks"
+                  - "ecs:DescribeTasks"
+                Resource: "*"
         - PolicyName: CloudWatchMetricsAndAirflowReadOnly
           PolicyDocument:
             Version: "2012-10-17"

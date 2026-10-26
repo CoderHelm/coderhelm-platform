@@ -702,6 +702,7 @@ pub mod health_check;
 pub mod hidden_suggest;
 mod implement;
 pub mod infra_analyze;
+mod infra_repo;
 pub mod jira_comment;
 pub mod knowledge;
 pub mod knowledge_sync;
@@ -709,6 +710,10 @@ pub mod lessons;
 pub mod line_count;
 pub mod live_sources;
 pub mod log_autofix;
+pub mod log_evidence;
+mod log_fix_checks;
+#[cfg(test)]
+mod log_fix_eval;
 pub mod onboard;
 pub mod ops_tools;
 mod plan;
@@ -1596,6 +1601,15 @@ async fn run_passes(
     )
     .await;
 
+    // --- Evidence: a run started from a log finding reads the logs and the
+    // ECS service behind them before planning, and every agent gets it ---
+    let mut log_ev = log_evidence::gather_for_run(state, msg).await;
+    if let Some(ev) = log_ev.as_ref() {
+        log_evidence::save(state, &msg.team_id, run_id, ev).await;
+        add_progress_note(state, &msg.team_id, run_id, &log_evidence::summary_note(ev)).await;
+        msg.team_instructions = log_evidence::with_instructions(&msg.team_instructions, ev);
+    }
+
     // --- Pass 2: Plan ---
     check_cancelled(state, &msg.team_id, run_id).await?;
     update_pass(state, &msg.team_id, run_id, "plan").await?;
@@ -1764,6 +1778,10 @@ async fn run_passes(
                 msg.team_instructions =
                     load_team_instructions(state, &msg.team_id, &msg.repo_owner, &msg.repo_name)
                         .await;
+                if let Some(ev) = log_ev.as_ref() {
+                    msg.team_instructions =
+                        log_evidence::with_instructions(&msg.team_instructions, ev);
+                }
                 close_memory(state, agent_memory.take()).await;
                 agent_memory =
                     AgentMemory::open(state, &msg.team_id, &msg.repo_owner, &msg.repo_name).await;
@@ -2000,6 +2018,32 @@ async fn run_passes(
     // A code change AND a change outside the code: the ticket hears about the
     // outside part now (the PR body carries it too), so a person can make it
     // while the code is written.
+    // A fix from a log finding that also needs a change in another connected
+    // repository (the infrastructure code that defines the task): that
+    // repository gets its own linked pull request, when one defines the
+    // resource and the team's permissions allow it.
+    let mut approved_repos: Vec<String> = Vec::new();
+    if fix_route == fix_location::Route::CodeAndOutside && plan_result.repo_tasks.is_empty() {
+        if let Some(ev) = log_ev.as_ref() {
+            if infra_repo::link_outside_change(
+                state,
+                &github,
+                &provider,
+                msg,
+                run_id,
+                &mut plan_result,
+                ev,
+                implement_deadline,
+            )
+            .await
+            {
+                fix_route = fix_location::Route::Code;
+                if let Some(r) = plan_result.repo_tasks.get(1) {
+                    approved_repos.push(format!("{}/{}", r.owner, r.name).to_ascii_lowercase());
+                }
+            }
+        }
+    }
     if fix_route == fix_location::Route::CodeAndOutside {
         if let Some(decision) = plan_result.fix.as_ref() {
             report_also_outside(state, msg, run_id, &github, decision).await;
@@ -3102,6 +3146,25 @@ async fn run_passes(
             }
 
             for (repo_task, repo_branch) in plan_result.repo_tasks.iter().zip(repo_branches) {
+                // A pull request in a repository other than the ticket's asks
+                // the team's agent permissions first.
+                let full = format!("{}/{}", repo_task.owner, repo_task.name);
+                let own =
+                    full.eq_ignore_ascii_case(&format!("{}/{}", msg.repo_owner, msg.repo_name));
+                if !own && !approved_repos.contains(&full.to_ascii_lowercase()) {
+                    if let Err(why) =
+                        infra_repo::may_open_pr(state, &provider, &full, implement_deadline).await
+                    {
+                        add_progress_note(
+                            state,
+                            &msg.team_id,
+                            run_id,
+                            &format!("No pull request in {full}: the team's agent permissions didn't allow it ({why})"),
+                        )
+                        .await;
+                        continue;
+                    }
+                }
                 // Override msg repo for this iteration
                 let mut repo_msg = msg.clone();
                 repo_msg.repo_owner = repo_task.owner.clone();
@@ -3123,6 +3186,10 @@ async fn run_passes(
                     &repo_task.name,
                 )
                 .await;
+                if let Some(ev) = log_ev.as_ref() {
+                    repo_msg.team_instructions =
+                        log_evidence::with_instructions(&repo_msg.team_instructions, ev);
+                }
 
                 match run_repo_pipeline(
                     state,
@@ -3143,6 +3210,7 @@ async fn run_passes(
                     run_id,
                     &mut agent_memory,
                     implement_deadline,
+                    log_ev.as_ref(),
                 )
                 .await
                 {
@@ -3824,6 +3892,18 @@ async fn run_passes(
         Err(e) => warn!(run_id, error = %e, "Conflict resolution failed, proceeding"),
     }
 
+    // How production starts the container, read from this branch, for the
+    // description's start-path check.
+    if let Some(ev) = log_ev.as_mut() {
+        let files = log_evidence::GithubFiles {
+            github: &github,
+            owner: &msg.repo_owner,
+            repo: &msg.repo_name,
+            git_ref: &branch_name,
+        };
+        ev.start = Some(log_evidence::resolve_start(&files, ev).await);
+        log_evidence::save(state, &msg.team_id, run_id, ev).await;
+    }
     let pass_start = std::time::Instant::now();
     let usage_before = usage.clone();
     let pr_result = pr::run(
@@ -3839,6 +3919,7 @@ async fn run_passes(
             manual: &proof::manual_steps(&gaps),
             ci: &evidence.ci_commands,
             mirrors: &completeness::parse_mirrors(&evidence.notes),
+            log: log_ev.as_ref(),
         },
         &provider,
         usage,
@@ -4003,6 +4084,7 @@ async fn run_repo_pipeline(
     run_id: &str,
     _agent_memory: &mut Option<AgentMemory>,
     implement_deadline: Option<std::time::Instant>,
+    log_ev: Option<&log_evidence::LogEvidence>,
 ) -> Result<RepoPrResult, Box<dyn std::error::Error + Send + Sync>> {
     let repo_owner = &msg.repo_owner;
     let repo_name = &msg.repo_name;
@@ -4330,6 +4412,22 @@ async fn run_repo_pipeline(
 
     let pass_start = std::time::Instant::now();
     let usage_before = usage.clone();
+    // How production starts the container, read from this repository's
+    // branch, for the description's start-path check.
+    let repo_ev = match log_ev {
+        Some(ev) => {
+            let mut ev = ev.clone();
+            let files = log_evidence::GithubFiles {
+                github,
+                owner: repo_owner,
+                repo: repo_name,
+                git_ref: branch_name,
+            };
+            ev.start = Some(log_evidence::resolve_start(&files, &ev).await);
+            Some(ev)
+        }
+        None => None,
+    };
     let pr_result = pr::run(
         state,
         msg,
@@ -4343,6 +4441,7 @@ async fn run_repo_pipeline(
             manual: &proof::manual_steps(&gaps),
             ci: &evidence.ci_commands,
             mirrors: &completeness::parse_mirrors(&evidence.notes),
+            log: repo_ev.as_ref(),
         },
         provider,
         usage,
