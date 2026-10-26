@@ -881,8 +881,14 @@ pub async fn update_role(
         .table_name(&state.config.users_table_name)
         .key("pk", attr_s(&claims.team_id))
         .key("sk", attr_s(&sk))
-        .update_expression("SET #r = :role, updated_at = :now")
+        // Their sessions end with the change: they sign in again with the new role.
+        .update_expression("SET #r = :role, updated_at = :now, #va = :va")
         .expression_attribute_names("#r", "role")
+        .expression_attribute_names("#va", crate::routes::sign_in::VALID_AFTER)
+        .expression_attribute_values(
+            ":va",
+            AttributeValue::N((chrono::Utc::now().timestamp() + 1).to_string()),
+        )
         .expression_attribute_values(":role", attr_s(&body.role))
         .expression_attribute_values(":now", attr_s(&chrono::Utc::now().to_rfc3339()))
         .condition_expression(condition);
@@ -1270,7 +1276,8 @@ pub async fn mfa_verify_setup(
 pub async fn mfa_disable(
     State(state): State<Arc<AppState>>,
     Extension(claims): Extension<Claims>,
-) -> Result<Json<Value>, StatusCode> {
+    proof: Option<Extension<crate::auth::jwt::SignInProof>>,
+) -> Result<axum::response::Response, StatusCode> {
     if role_level(&claims.role) < 3 && claims.email.is_empty() {
         return Err(StatusCode::FORBIDDEN);
     }
@@ -1306,8 +1313,16 @@ pub async fn mfa_disable(
     if crate::routes::sign_in::applies() {
         crate::routes::sign_in::note_factor(&state, &claims.team_id, &claims.sub, None).await;
     }
-
-    Ok(Json(json!({ "status": "disabled" })))
+    // Every other session of theirs ends; this one carries on.
+    let proof = proof.map(|p| p.0).unwrap_or_default();
+    let cookie = crate::routes::sign_in::end_other_sessions(&state, &claims, &proof)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let mut resp = Json(json!({ "status": "disabled" })).into_response();
+    if let Ok(v) = axum::http::HeaderValue::from_str(&cookie) {
+        resp.headers_mut().append(axum::http::header::SET_COOKIE, v);
+    }
+    Ok(resp)
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────

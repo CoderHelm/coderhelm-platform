@@ -483,13 +483,18 @@ pub async fn mfa_verify(
     Json(body): Json<MfaChallengeRequest>,
 ) -> Result<Response, StatusCode> {
     let email = body.email.trim().to_lowercase();
+    // A paused person gets no more tries; a wrong code counts against them.
+    let key = sign_in::person_key(&email, "", "");
+    if let Some(left) = sign_in::lockout_left(&state, &key).await {
+        return Ok(sign_in::locked_response(left));
+    }
     let hash = cognito_secret_hash(
         &state.cognito_client_secret,
         &email,
         &state.config.cognito_client_id,
     );
 
-    let result = state
+    let challenge = state
         .cognito
         .respond_to_auth_challenge()
         .client_id(&state.config.cognito_client_id)
@@ -499,11 +504,22 @@ pub async fn mfa_verify(
         .challenge_responses("USERNAME", &email)
         .challenge_responses("SECRET_HASH", &hash)
         .send()
-        .await
-        .map_err(|e| {
+        .await;
+    let result = match challenge {
+        Ok(r) => r,
+        Err(e) => {
             error!("MFA verification failed: {e}");
-            StatusCode::UNAUTHORIZED
-        })?;
+            // Only a wrong code counts (not an expired Cognito session).
+            if format!("{e:?}").contains("CodeMismatch") {
+                if let Some(left) = sign_in::record_failure(&state, &key).await {
+                    sign_in::notify_lockout(&state, &email, left).await;
+                    return Ok(sign_in::locked_response(left));
+                }
+            }
+            return Err(StatusCode::UNAUTHORIZED);
+        }
+    };
+    sign_in::record_success(&state, &key).await;
 
     let auth_result = result
         .authentication_result()
@@ -948,6 +964,7 @@ async fn google_callback_inner(
             role: role.clone(),
             github_login: github_login.clone(),
             via: "google".into(),
+            jti: String::new(),
             aud: String::new(),
             iat: 0,
             exp: 0,
@@ -1638,6 +1655,7 @@ async fn github_callback_inner(
             role: role.clone(),
             github_login: Some(github_login.to_string()),
             via: "github".into(),
+            jti: String::new(),
             aud: String::new(),
             iat: 0,
             exp: 0,

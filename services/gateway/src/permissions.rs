@@ -748,7 +748,8 @@ pub const CUSTOM_PREFIX: &str = "custom:";
 /// Capabilities a custom role can never hold, whatever the table says about
 /// them: managing roles, and support (checked by built-in role inside the
 /// support handlers), stay with built-in admins and owners.
-pub const NEVER_IN_CUSTOM_ROLES: &[&str] = &["roles", "sign_in", "support", "system", "system.models"];
+pub const NEVER_IN_CUSTOM_ROLES: &[&str] =
+    &["roles", "sign_in", "support", "system", "system.models"];
 
 /// The id in a `custom:<id>` role, or `None` for a built-in role.
 pub fn custom_role_id(role: &str) -> Option<&str> {

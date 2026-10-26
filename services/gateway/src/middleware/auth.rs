@@ -119,6 +119,12 @@ pub async fn require_auth(
     // screens that set one up; the rule is read on every request, so sessions
     // from before it was turned on are held at their next request.
     let proof = jwt::read_proof(token, &state.secrets.jwt_secret);
+    // The session against the member's record, read on every request: a
+    // removal, a role change, a two-factor reset or turning two-factor off
+    // ends every session issued before it.
+    if let Err(ended) = sign_in::check_member_session(&state, &claims).await {
+        return Ok(ended);
+    }
     if sign_in::applies() {
         if let Err(held) = sign_in::check_session(&state, &proof, handler).await {
             return Ok(held);

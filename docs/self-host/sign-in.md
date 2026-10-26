@@ -44,6 +44,28 @@ With it on:
 
 **Settings, Sign-in** shows who has set it up. If someone loses their phone, an admin can reset their two-factor sign-in after checking it's really them (a video call, say). The admin writes how they checked; the reset and the reason go in the log under **Settings, Roles**. The person sets it up again at their next sign-in. Only an owner can reset an admin's or another owner's. Nobody can reset their own.
 
+### Wrong codes
+
+Every place CoderHelm checks a code counts wrong ones against the person, by email, across every way in: the code after Google or GitHub, the code after a password, and turning the app code off.
+
+- **Ten wrong codes in 15 minutes** pause that person's sign-in with a code for 15 minutes. Each pause after that is twice as long, up to a day. After a quiet day the count starts over. A right code clears the wrong ones so far.
+- **One sign-in through Google or GitHub** allows five wrong codes; after that the person starts again from the sign-in screen.
+- **The person** sees a plain sentence saying how long the pause lasts.
+- **Admins** get an email, and a line in the log under **Settings, Roles**. If they lost their phone, check it's them and reset; if it wasn't them, someone may know their password or have their Google or GitHub account.
+
+Cognito also limits wrong passwords on its own.
+
+### Sessions that end
+
+A person's existing sessions end, everywhere, when:
+
+- an admin resets their two-factor sign-in;
+- an admin removes them from the team;
+- their role changes;
+- they turn their own two-factor sign-in off (the session they did it from keeps working).
+
+Every request checks the person's record, so the next request from an ended session goes back to the sign-in screen.
+
 Why an authenticator app and not passkeys: Cognito's passkeys need its paid Essentials tier, a fixed sign-in domain (passkeys break when the CloudFront address changes to your own domain) and Cognito's hosted sign-in pages. Authenticator apps work on every install, including one on its free CloudFront address.
 
 ## Email and password

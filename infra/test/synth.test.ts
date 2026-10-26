@@ -576,6 +576,7 @@ test("the release check reads models.json only after the signature check, and ca
   assert.ok(actions.every((a) => a === "lambda:InvokeFunction" || a.startsWith("logs:") || /^codebuild:(Create|Update|BatchPut)/.test(a)), JSON.stringify(actions));
   assert.ok(!actions.some((a) => /sts:|secretsmanager:|ssm:|cloudformation:|bedrock:/.test(a)));
   assert.equal(envOf(u, "coderhelm-prod-updater").RELEASE_CHECK_PROJECT_NAME, "coderhelm-prod-release-check");
+});
 
 test("sign-in: self-host checks every new account in Cognito (pre-sign-up trigger); MFA stays optional with authenticator apps", () => {
   const t = synth(selfHost({ signup: { domains: ["Example.org"], emails: ["b@example.org"], requireTwoFactor: true } }));

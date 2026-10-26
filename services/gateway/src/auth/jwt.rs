@@ -117,6 +117,9 @@ pub struct SecondStep {
     #[serde(default)]
     pub github_login: Option<String>,
     pub via: String,
+    /// This token's id: its wrong codes are counted, and it dies after five.
+    #[serde(default)]
+    pub jti: String,
     pub aud: String,
     pub iat: u64,
     pub exp: u64,
@@ -129,6 +132,11 @@ pub fn create_second_step(
 ) -> Result<String, jsonwebtoken::errors::Error> {
     let now = chrono::Utc::now().timestamp() as u64;
     let s = SecondStep {
+        jti: if step.jti.is_empty() {
+            ulid::Ulid::new().to_string()
+        } else {
+            step.jti.clone()
+        },
         aud: SECOND_STEP_AUDIENCE.to_string(),
         iat: now,
         exp: now + ttl_secs,
@@ -277,13 +285,20 @@ mod tests {
             role: "member".into(),
             github_login: None,
             via: "github".into(),
+            jti: String::new(),
             aud: String::new(),
             iat: 0,
             exp: 0,
         };
         let t = create_second_step(&step, secret, 300).unwrap();
         assert!(validate_token(&t, secret).is_err());
-        assert_eq!(validate_second_step(&t, secret).unwrap().sub, "USER#1");
+        let back = validate_second_step(&t, secret).unwrap();
+        assert_eq!(back.sub, "USER#1");
+        // Each token gets its own id (wrong codes are counted against it).
+        assert_eq!(back.jti.len(), 26);
+        let other =
+            validate_second_step(&create_second_step(&step, secret, 300).unwrap(), secret).unwrap();
+        assert_ne!(back.jti, other.jti);
         let session = create_token("u", "t", "e@x.com", "member", None, secret, 300).unwrap();
         assert!(validate_second_step(&session, secret).is_err());
     }

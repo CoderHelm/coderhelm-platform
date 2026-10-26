@@ -1131,8 +1131,9 @@ pub async fn app_verify(
 pub async fn app_disable(
     State(state): State<Arc<AppState>>,
     Extension(claims): Extension<Claims>,
+    proof: Option<Extension<SignInProof>>,
     Json(body): Json<CodeBody>,
-) -> Result<Json<Value>, ApiError> {
+) -> Result<Response, ApiError> {
     if !applies() {
         return Err(fail(StatusCode::NOT_FOUND, "Not available here."));
     }
@@ -1156,20 +1157,32 @@ pub async fn app_disable(
             "Two-factor sign-in is already off.",
         ));
     }
+    let key = person_key(&claims.email, &claims.team_id, &claims.sub);
+    if let Some(left) = lockout_left(&state, &key).await {
+        return Ok(locked_response(left));
+    }
     if !use_app_code(&state, &item, &body.code)
         .await
         .map_err(|e| internal("Code not checked", e))?
     {
+        if let Some(left) = record_failure(&state, &key).await {
+            notify_lockout(&state, &claims.display_name(), left).await;
+            return Ok(locked_response(left));
+        }
         return Err(fail_code(
             StatusCode::BAD_REQUEST,
             "That code didn't match. Enter the current 6-digit code from the app.",
             "wrong_code",
         ));
     }
+    record_success(&state, &key).await;
     clear_app_factor(&state, &claims.team_id, &claims.sub)
         .await
         .map_err(|e| internal("Two-factor not turned off", e))?;
-    Ok(Json(json!({ "status": "disabled" })))
+    // Every other session of theirs ends; this one carries on.
+    let proof = proof.map(|p| p.0).unwrap_or_default();
+    let cookie = end_other_sessions(&state, &claims, &proof).await?;
+    Ok(with_cookie(json!({ "status": "disabled" }), &cookie))
 }
 
 async fn clear_app_factor(state: &AppState, team: &str, user: &str) -> Result<(), String> {
@@ -1187,6 +1200,489 @@ async fn clear_app_factor(state: &AppState, team: &str, user: &str) -> Result<()
         .await
         .map(|_| ())
         .map_err(|e| format!("{e}"))
+}
+
+// ── Wrong codes: per-person lockout ─────────────────────────────────
+//
+// Every place CoderHelm checks a two-factor code counts a wrong one against
+// the person (by email, or their record when there is none): the code after
+// Google or GitHub, Cognito's code after a password, and turning the app
+// code off. Ten wrong codes in 15 minutes pause that person's code sign-in;
+// each pause is twice as long as the last (15 minutes up to a day), and the
+// count starts over after a quiet day. A pending second-step token also dies
+// after five wrong codes. Admins of the organization are told.
+
+/// Wrong codes in this window count toward a pause.
+pub const WINDOW_SECS: i64 = 900;
+/// Wrong codes in a window that pause sign-in.
+pub const MAX_FAILS: u32 = 10;
+/// Wrong codes one pending second-step token survives.
+pub const STEP_MAX_FAILS: i64 = 5;
+const LOCK_PK: &str = "SIGNIN_LOCK";
+const STEP_PK: &str = "SIGNIN_STEP";
+
+/// How long the `n`th pause in a row lasts: 15 minutes, doubling, at most a day.
+pub fn cooldown_secs(n: u32) -> i64 {
+    (900i64 << n.saturating_sub(1).min(7)).min(86_400)
+}
+
+/// One person's wrong codes.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Attempts {
+    pub window_start: i64,
+    pub fails: u32,
+    pub locked_until: i64,
+    /// Pauses so far (the next one is longer).
+    pub lockouts: u32,
+    pub last_lockout: i64,
+}
+
+impl Attempts {
+    /// Seconds left in a pause, if paused.
+    pub fn locked_for(&self, now: i64) -> Option<i64> {
+        (self.locked_until > now).then(|| self.locked_until - now)
+    }
+
+    /// One more wrong code. `true` when it starts a pause.
+    pub fn fail(mut self, now: i64) -> (Self, bool) {
+        if self.last_lockout > 0 && now - self.last_lockout > 86_400 {
+            self.lockouts = 0;
+        }
+        if now - self.window_start >= WINDOW_SECS {
+            self.window_start = now;
+            self.fails = 0;
+        }
+        self.fails += 1;
+        if self.fails >= MAX_FAILS {
+            self.lockouts += 1;
+            self.last_lockout = now;
+            self.locked_until = now + cooldown_secs(self.lockouts);
+            self.fails = 0;
+            self.window_start = now;
+            return (self, true);
+        }
+        (self, false)
+    }
+
+    /// A right code: the count starts over (earlier pauses still lengthen the next).
+    pub fn success(mut self) -> Self {
+        self.fails = 0;
+        self.window_start = 0;
+        self
+    }
+
+    fn from_item(i: &Item) -> Self {
+        let n = |k: &str| {
+            i.get(k)
+                .and_then(|v| v.as_n().ok())
+                .and_then(|v| v.parse::<i64>().ok())
+                .unwrap_or(0)
+        };
+        Attempts {
+            window_start: n("window_start"),
+            fails: n("fails").max(0) as u32,
+            locked_until: n("locked_until"),
+            lockouts: n("lockouts").max(0) as u32,
+            last_lockout: n("last_lockout"),
+        }
+    }
+}
+
+/// Who wrong codes count against: the email (the same person through every
+/// way in), else their record.
+pub fn person_key(email: &str, team_id: &str, user_id: &str) -> String {
+    let e = normalize_email(email);
+    if e.contains('@') {
+        format!("EMAIL#{e}")
+    } else {
+        format!("USER#{team_id}#{user_id}")
+    }
+}
+
+/// The plain sentence for someone paused.
+pub fn locked_message(secs: i64) -> String {
+    let mins = ((secs + 59) / 60).max(1);
+    let when = if mins >= 120 {
+        format!("{} hours", (mins + 59) / 60)
+    } else if mins == 1 {
+        "a minute".to_string()
+    } else {
+        format!("{mins} minutes")
+    };
+    format!(
+        "Too many wrong codes. To keep your account safe, sign-in with a code is paused for {when}. If this wasn't you, tell an admin."
+    )
+}
+
+pub fn locked_response(secs: i64) -> Response {
+    let mut resp = (
+        StatusCode::TOO_MANY_REQUESTS,
+        Json(json!({ "error": locked_message(secs), "code": "locked_out", "retry_after": secs })),
+    )
+        .into_response();
+    if let Ok(v) = HeaderValue::from_str(&secs.to_string()) {
+        resp.headers_mut().insert(header::RETRY_AFTER, v);
+    }
+    resp
+}
+
+async fn load_attempts(state: &AppState, key: &str) -> Result<(Attempts, i64), String> {
+    let out = state
+        .dynamo
+        .get_item()
+        .table_name(&state.config.settings_table_name)
+        .key("pk", attr_s(LOCK_PK))
+        .key("sk", attr_s(key))
+        .consistent_read(true)
+        .send()
+        .await
+        .map_err(|e| format!("{e}"))?;
+    Ok(match out.item() {
+        Some(i) => (
+            Attempts::from_item(i),
+            i.get("ver")
+                .and_then(|v| v.as_n().ok())
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0),
+        ),
+        None => (Attempts::default(), 0),
+    })
+}
+
+/// Seconds left in this person's pause, if any. A read that fails counts as
+/// paused for a minute (the safe answer).
+pub async fn lockout_left(state: &AppState, key: &str) -> Option<i64> {
+    match load_attempts(state, key).await {
+        Ok((a, _)) => a.locked_for(chrono::Utc::now().timestamp()),
+        Err(e) => {
+            error!(error = %e, "Wrong-code count not read; treated as paused");
+            Some(60)
+        }
+    }
+}
+
+async fn save_attempts(state: &AppState, key: &str, a: &Attempts, ver: i64) -> bool {
+    let n = |v: i64| AttributeValue::N(v.to_string());
+    let ttl = chrono::Utc::now().timestamp() + 3 * 86_400;
+    state
+        .dynamo
+        .put_item()
+        .table_name(&state.config.settings_table_name)
+        .item("pk", attr_s(LOCK_PK))
+        .item("sk", attr_s(key))
+        .item("window_start", n(a.window_start))
+        .item("fails", n(i64::from(a.fails)))
+        .item("locked_until", n(a.locked_until))
+        .item("lockouts", n(i64::from(a.lockouts)))
+        .item("last_lockout", n(a.last_lockout))
+        .item("ver", n(ver + 1))
+        .item("ttl", n(ttl.max(a.locked_until + 86_400)))
+        .condition_expression("attribute_not_exists(pk) OR ver = :v")
+        .expression_attribute_values(":v", n(ver))
+        .send()
+        .await
+        .is_ok()
+}
+
+/// Counts one wrong code. Returns the pause it starts, in seconds, if any.
+pub async fn record_failure(state: &AppState, key: &str) -> Option<i64> {
+    for _ in 0..5 {
+        let Ok((a, ver)) = load_attempts(state, key).await else {
+            break;
+        };
+        let now = chrono::Utc::now().timestamp();
+        let (next, locked) = a.fail(now);
+        if save_attempts(state, key, &next, ver).await {
+            return locked.then(|| next.locked_until - now);
+        }
+    }
+    error!("Wrong code not counted after retries");
+    None
+}
+
+/// A right code: the count starts over.
+pub async fn record_success(state: &AppState, key: &str) {
+    if let Ok((a, ver)) = load_attempts(state, key).await {
+        if a.fails > 0 {
+            save_attempts(state, key, &a.success(), ver).await;
+        }
+    }
+}
+
+/// One more wrong code on a pending second-step token; its new count.
+async fn step_failure(state: &AppState, jti: &str) -> i64 {
+    let ttl = chrono::Utc::now().timestamp() + 900;
+    state
+        .dynamo
+        .update_item()
+        .table_name(&state.config.settings_table_name)
+        .key("pk", attr_s(STEP_PK))
+        .key("sk", attr_s(jti))
+        .update_expression("ADD fails :one SET #t = :ttl")
+        .expression_attribute_names("#t", "ttl")
+        .expression_attribute_values(":one", AttributeValue::N("1".into()))
+        .expression_attribute_values(":ttl", AttributeValue::N(ttl.to_string()))
+        .return_values(aws_sdk_dynamodb::types::ReturnValue::UpdatedNew)
+        .send()
+        .await
+        .ok()
+        .and_then(|o| o.attributes)
+        .and_then(|a| {
+            a.get("fails")
+                .and_then(|v| v.as_n().ok())
+                .and_then(|n| n.parse().ok())
+        })
+        // Not counted: treat the token as spent (the safe answer).
+        .unwrap_or(STEP_MAX_FAILS)
+}
+
+async fn step_failures(state: &AppState, jti: &str) -> i64 {
+    state
+        .dynamo
+        .get_item()
+        .table_name(&state.config.settings_table_name)
+        .key("pk", attr_s(STEP_PK))
+        .key("sk", attr_s(jti))
+        .consistent_read(true)
+        .send()
+        .await
+        .ok()
+        .and_then(|o| o.item)
+        .and_then(|i| {
+            i.get("fails")
+                .and_then(|v| v.as_n().ok())
+                .and_then(|n| n.parse().ok())
+        })
+        .unwrap_or(0)
+}
+
+/// A pending token is dead after this many wrong codes.
+pub fn step_spent(fails: i64) -> bool {
+    fails >= STEP_MAX_FAILS
+}
+
+/// Tells the organization's admins that someone's code sign-in is paused:
+/// a line in the log under Settings, Roles and an email to each admin and
+/// owner. Self-hosted installs only (the hosted side has no organization).
+pub async fn notify_lockout(state: &AppState, who: &str, secs: i64) {
+    if !applies() {
+        return;
+    }
+    let Ok(Some(org)) = load_org(state).await else {
+        return;
+    };
+    let mins = (secs + 59) / 60;
+    let detail = format!(
+        "Two-factor sign-in paused for {mins} minutes for {who} after too many wrong codes."
+    );
+    warn!(team_id = %org.team_id, "Two-factor sign-in paused after wrong codes");
+    let now = chrono::Utc::now();
+    let at = now.to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    let _ = state
+        .dynamo
+        .put_item()
+        .table_name(&state.config.settings_table_name)
+        .item("pk", attr_s(&org.team_id))
+        .item(
+            "sk",
+            attr_s(&format!(
+                "{}{at}#{}",
+                super::roles::AUDIT_PREFIX,
+                ulid::Ulid::new()
+            )),
+        )
+        .item("record_type", attr_s("role_audit"))
+        .item("at", attr_s(&at))
+        .item("actor", attr_s("Coderhelm"))
+        .item("actor_id", attr_s("SYSTEM"))
+        .item("action", attr_s("two_factor_lockout"))
+        .item("role_id", attr_s(""))
+        .item("role_name", attr_s(""))
+        .item("detail", attr_s(&detail))
+        .item(
+            "ttl",
+            AttributeValue::N((now + chrono::Duration::days(365)).timestamp().to_string()),
+        )
+        .send()
+        .await;
+    let admins: Vec<String> = team_members(state, &org.team_id)
+        .await
+        .unwrap_or_default()
+        .iter()
+        .filter(|i| !is_invite(i) && matches!(s(i, "role"), "owner" | "admin"))
+        .map(|i| s(i, "email").to_string())
+        .filter(|e| e.contains('@'))
+        .collect();
+    let body = format!(
+        "{detail}\n\nIf they lost their phone, check it's really them, then reset their two-factor sign-in in Settings, Sign-in. If it wasn't them, someone may know their password or have their Google or GitHub account: ask them to change it.\n"
+    );
+    for to in admins {
+        let content = aws_sdk_sesv2::types::EmailContent::builder()
+            .simple(
+                aws_sdk_sesv2::types::Message::builder()
+                    .subject(
+                        aws_sdk_sesv2::types::Content::builder()
+                            .data("Two-factor sign-in paused after wrong codes")
+                            .build()
+                            .expect("subject"),
+                    )
+                    .body(
+                        aws_sdk_sesv2::types::Body::builder()
+                            .text(
+                                aws_sdk_sesv2::types::Content::builder()
+                                    .data(&body)
+                                    .build()
+                                    .expect("body"),
+                            )
+                            .build(),
+                    )
+                    .build(),
+            )
+            .build();
+        if let Err(e) = state
+            .ses
+            .send_email()
+            .from_email_address(&state.config.ses_from_address)
+            .destination(
+                aws_sdk_sesv2::types::Destination::builder()
+                    .to_addresses(&to)
+                    .build(),
+            )
+            .content(content)
+            .send()
+            .await
+        {
+            warn!(error = %e, "Lockout email not sent");
+        }
+    }
+}
+
+// ── Sessions: ended by a reset, a removal or a role change ──────────
+
+/// The member record field: sessions issued before this time (unix seconds)
+/// are refused.
+pub const VALID_AFTER: &str = "sessions_valid_after";
+
+/// Why a session no longer counts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Ended {
+    /// No longer on the team.
+    Removed,
+    /// Ended by a reset, a role change or turning two-factor off.
+    Revoked,
+}
+
+/// Whether a session issued at `iat` still counts against the member's
+/// record now. Pure.
+pub fn session_state(item: Option<&Item>, iat: u64) -> Result<(), Ended> {
+    let Some(i) = item else {
+        return Err(Ended::Removed);
+    };
+    if is_invite(i) {
+        return Err(Ended::Removed);
+    }
+    let after = i
+        .get(VALID_AFTER)
+        .and_then(|v| v.as_n().ok())
+        .and_then(|n| n.parse::<u64>().ok())
+        .unwrap_or(0);
+    if iat < after {
+        return Err(Ended::Revoked);
+    }
+    Ok(())
+}
+
+pub fn session_ended(why: Ended) -> Response {
+    let msg = match why {
+        Ended::Removed => "You're no longer on this team. Sign in again, or ask an admin.",
+        Ended::Revoked => {
+            "Your session ended because your access or two-factor sign-in changed. Sign in again."
+        }
+    };
+    let mut resp = (
+        StatusCode::UNAUTHORIZED,
+        Json(json!({ "error": msg, "code": "session_ended" })),
+    )
+        .into_response();
+    if let Ok(v) = HeaderValue::from_str(
+        "__Host-coderhelm_session=; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age=0",
+    ) {
+        resp.headers_mut().append(header::SET_COOKIE, v);
+    }
+    resp
+}
+
+/// The middleware's check of one session against the member's record, read
+/// fresh on every request. A read that fails refuses the request.
+pub async fn check_member_session(state: &AppState, claims: &Claims) -> Result<(), Response> {
+    let item = match state
+        .dynamo
+        .get_item()
+        .table_name(&state.config.users_table_name)
+        .key("pk", attr_s(&claims.team_id))
+        .key("sk", attr_s(&claims.sub))
+        .projection_expression("pk, #st, #va")
+        .expression_attribute_names("#st", "status")
+        .expression_attribute_names("#va", VALID_AFTER)
+        .send()
+        .await
+    {
+        Ok(o) => o.item,
+        Err(e) => {
+            error!(error = %e, "Member record not read; request refused");
+            return Err(StatusCode::SERVICE_UNAVAILABLE.into_response());
+        }
+    };
+    session_state(item.as_ref(), claims.iat).map_err(session_ended)
+}
+
+/// Ends every session of a member issued before now. `include_now` also ends
+/// one issued this very second (someone else's action); without it, a session
+/// re-issued right after for the person acting keeps working.
+pub async fn end_sessions(
+    state: &AppState,
+    team_id: &str,
+    user_id: &str,
+    include_now: bool,
+) -> Result<(), String> {
+    let at = chrono::Utc::now().timestamp() + i64::from(include_now);
+    state
+        .dynamo
+        .update_item()
+        .table_name(&state.config.users_table_name)
+        .key("pk", attr_s(team_id))
+        .key("sk", attr_s(user_id))
+        .update_expression("SET #va = :at")
+        .condition_expression("attribute_exists(pk)")
+        .expression_attribute_names("#va", VALID_AFTER)
+        .expression_attribute_values(":at", AttributeValue::N(at.to_string()))
+        .send()
+        .await
+        .map(|_| ())
+        .map_err(|e| format!("{e}"))
+}
+
+/// The caller's other sessions end; this one gets a fresh cookie.
+pub async fn end_other_sessions(
+    state: &AppState,
+    claims: &Claims,
+    proof: &SignInProof,
+) -> Result<String, ApiError> {
+    end_sessions(state, &claims.team_id, &claims.sub, false)
+        .await
+        .map_err(|e| internal("Sessions not ended", e))?;
+    let token = jwt::create_session_token(
+        &claims.sub,
+        &claims.team_id,
+        &claims.email,
+        claims.session_role(),
+        claims.github_login.as_deref(),
+        proof,
+        &state.secrets.jwt_secret,
+        SESSION_TTL_SECS,
+    )
+    .map_err(|e| internal("Session not made", e))?;
+    Ok(session_cookie(&token))
 }
 
 // ── Two-factor: the step after Google or GitHub ─────────────────────
@@ -1252,6 +1748,36 @@ pub async fn verify_second_step(
             "second_step_expired",
         )
     })?;
+    let clear_step = || {
+        HeaderValue::from_str(&format!(
+            "{SECOND_STEP_COOKIE}=; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=0"
+        ))
+        .ok()
+    };
+    let with_cleared = |mut r: Response| {
+        if let Some(v) = clear_step() {
+            r.headers_mut().append(header::SET_COOKIE, v);
+        }
+        r
+    };
+    let spent = || {
+        with_cleared(
+            fail_code(
+                StatusCode::UNAUTHORIZED,
+                "Too many wrong codes for this sign-in. Sign in again.",
+                "second_step_expired",
+            )
+            .into_response(),
+        )
+    };
+    // A paused person, or a token with five wrong codes, gets no more tries.
+    let key = person_key(&step.email, &step.team_id, &step.sub);
+    if let Some(left) = lockout_left(&state, &key).await {
+        return Ok(with_cleared(locked_response(left)));
+    }
+    if step_spent(step_failures(&state, &step.jti).await) {
+        return Ok(spent());
+    }
     let item = member(&state, &step.team_id, &step.sub)
         .await
         .map_err(|e| internal("Member not read", e))?
@@ -1262,12 +1788,29 @@ pub async fn verify_second_step(
             .map_err(|e| internal("Code not checked", e))?
     {
         warn!(team_id = %step.team_id, "Second-step code refused");
+        let token_fails = step_failure(&state, &step.jti).await;
+        if let Some(left) = record_failure(&state, &key).await {
+            let who = [
+                step.email.as_str(),
+                step.github_login.as_deref().unwrap_or(""),
+            ]
+            .into_iter()
+            .find(|v| !v.is_empty())
+            .unwrap_or("a member")
+            .to_string();
+            notify_lockout(&state, &who, left).await;
+            return Ok(with_cleared(locked_response(left)));
+        }
+        if step_spent(token_fails) {
+            return Ok(spent());
+        }
         return Err(fail_code(
             StatusCode::UNAUTHORIZED,
             "That code didn't work. Open your authenticator app and enter the current 6-digit code.",
             "wrong_code",
         ));
     }
+    record_success(&state, &key).await;
     let session = jwt::create_session_token(
         &step.sub,
         &step.team_id,
@@ -1610,6 +2153,10 @@ pub async fn reset_two_factor(
     clear_app_factor(&state, &claims.team_id, &sk)
         .await
         .map_err(|e| internal("Two-factor not reset", e))?;
+    // Their sessions end: whoever holds one signs in again and sets it up.
+    end_sessions(&state, &claims.team_id, &sk, true)
+        .await
+        .map_err(|e| internal("Sessions not ended", e))?;
     info!(team_id = %claims.team_id, "Two-factor sign-in reset by an admin");
     Ok(Json(json!({ "status": "reset" })))
 }
@@ -2032,6 +2579,175 @@ mod tests {
         let u = body(include_str!("sign_in.rs"), "update_settings");
         assert!(before(u, "set_up_yours_first", "roles::record"));
         assert!(before(u, "roles::record", ".update_item()"));
+    }
+
+    #[test]
+    fn ten_wrong_codes_in_15_minutes_pause_and_each_pause_is_longer() {
+        let t0 = 1_800_000_000i64;
+        let mut a = Attempts::default();
+        for i in 0..9 {
+            let (next, locked) = a.fail(t0 + i * 60);
+            assert!(!locked, "wrong code {}", i + 1);
+            a = next;
+        }
+        assert_eq!(a.locked_for(t0 + 600), None);
+        let (a, locked) = a.fail(t0 + 600);
+        assert!(locked, "the 10th wrong code pauses");
+        assert_eq!(a.locked_for(t0 + 600), Some(900));
+        assert_eq!(a.locked_for(t0 + 600 + 900), None);
+        // The next pause is twice as long, then doubles up to a day.
+        let mut b = a;
+        for _ in 0..10 {
+            b = b.fail(t0 + 2000).0;
+        }
+        assert_eq!(b.locked_for(t0 + 2000), Some(1800));
+        assert_eq!(
+            (1..=10).map(cooldown_secs).collect::<Vec<_>>(),
+            vec![900, 1800, 3600, 7200, 14_400, 28_800, 57_600, 86_400, 86_400, 86_400]
+        );
+        // After a quiet day, pauses start short again.
+        let mut c = b;
+        for _ in 0..10 {
+            c = c.fail(t0 + 2000 + 2 * 86_400).0;
+        }
+        assert_eq!(c.lockouts, 1);
+        assert_eq!(c.locked_for(t0 + 2000 + 2 * 86_400), Some(900));
+    }
+
+    #[test]
+    fn wrong_codes_spread_out_or_followed_by_a_right_one_do_not_pause() {
+        let t0 = 1_800_000_000i64;
+        // Nine wrong codes every 15 minutes: never ten in one window.
+        let mut a = Attempts::default();
+        for i in 0..36 {
+            let (next, locked) = a.fail(t0 + (i / 9) * WINDOW_SECS + i % 9);
+            assert!(!locked, "{i}");
+            a = next;
+        }
+        let mut b = Attempts::default();
+        for i in 0..9 {
+            b = b.fail(t0 + i).0;
+        }
+        b = b.success();
+        assert!(!b.fail(t0 + 10).1, "a right code starts the count over");
+        let mut w = Attempts::default();
+        for i in 0..9 {
+            w = w.fail(t0 + i).0;
+        }
+        assert!(!w.fail(t0 + WINDOW_SECS + 1).1, "the window moved on");
+    }
+
+    #[test]
+    fn a_pending_token_dies_after_five_wrong_codes() {
+        assert!(!step_spent(4));
+        assert!(step_spent(5));
+        assert!(step_spent(6));
+    }
+
+    #[test]
+    fn wrong_codes_count_against_the_person_through_every_way_in() {
+        // The same email through Google, GitHub and a password: one count.
+        assert_eq!(
+            person_key("Ann+x@Example.com", "TEAM#a", "USER#Google_1"),
+            "EMAIL#ann@example.com"
+        );
+        assert_eq!(
+            person_key("ann@example.com", "", ""),
+            "EMAIL#ann@example.com"
+        );
+        // No email (GitHub without one): their record.
+        assert_eq!(person_key("", "TEAM#a", "USER#9"), "USER#TEAM#a#USER#9");
+        assert!(locked_message(900).contains("15 minutes"));
+        assert!(locked_message(30).contains("a minute"));
+        assert!(locked_message(86_400).contains("24 hours"));
+        let r = locked_response(900);
+        assert_eq!(r.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(r.headers()[header::RETRY_AFTER], "900");
+    }
+
+    #[test]
+    fn a_session_ends_with_a_removal_a_role_change_or_a_reset() {
+        let rec = |after: Option<u64>, status: Option<&str>| {
+            let mut m: Item = HashMap::from([("pk".to_string(), attr_s("TEAM#a"))]);
+            if let Some(a) = after {
+                m.insert(VALID_AFTER.into(), AttributeValue::N(a.to_string()));
+            }
+            if let Some(st) = status {
+                m.insert("status".into(), attr_s(st));
+            }
+            m
+        };
+        assert_eq!(session_state(Some(&rec(None, None)), 100), Ok(()));
+        assert_eq!(session_state(None, 100), Err(Ended::Removed));
+        assert_eq!(
+            session_state(Some(&rec(None, Some("invited"))), 100),
+            Err(Ended::Removed)
+        );
+        assert_eq!(
+            session_state(Some(&rec(Some(200), None)), 100),
+            Err(Ended::Revoked)
+        );
+        assert_eq!(
+            session_state(Some(&rec(Some(200), None)), 200),
+            Ok(()),
+            "issued at the cut"
+        );
+        assert_eq!(
+            session_state(Some(&rec(Some(200), None)), 300),
+            Ok(()),
+            "a later sign-in"
+        );
+        let r = session_ended(Ended::Revoked);
+        assert_eq!(r.status(), StatusCode::UNAUTHORIZED);
+        assert!(r.headers()[header::SET_COOKIE]
+            .to_str()
+            .unwrap()
+            .contains("Max-Age=0"));
+    }
+
+    /// Every code check counts wrong codes and refuses a paused person first;
+    /// every change that must end sessions ends them.
+    #[test]
+    fn every_code_check_is_capped_and_every_change_ends_sessions() {
+        let me = include_str!("sign_in.rs");
+        let auth = include_str!("auth.rs");
+        let users = include_str!("users.rs");
+        let step = body(me, "verify_second_step");
+        assert!(before(step, "lockout_left", "use_app_code"));
+        assert!(before(step, "step_spent(step_failures", "use_app_code"));
+        assert!(before(step, "step_failure(&state", "record_success"));
+        assert!(step.contains("record_failure") && step.contains("notify_lockout"));
+        let mfa = body(auth, "mfa_verify");
+        assert!(before(
+            mfa,
+            "sign_in::lockout_left",
+            ".respond_to_auth_challenge()"
+        ));
+        assert!(mfa.contains("sign_in::record_failure") && mfa.contains("sign_in::notify_lockout"));
+        let off = body(me, "app_disable");
+        assert!(before(off, "lockout_left", "use_app_code"));
+        assert!(before(off, "clear_app_factor", "end_other_sessions"));
+        let reset = body(me, "reset_two_factor");
+        assert!(before(
+            reset,
+            "clear_app_factor",
+            "end_sessions(&state, &claims.team_id, &sk, true)"
+        ));
+        assert!(body(users, "update_role").contains("sign_in::VALID_AFTER"));
+        assert!(body(users, "mfa_disable").contains("end_other_sessions"));
+        // A removal deletes the record, and the middleware refuses a session
+        // with no record.
+        assert!(body(users, "remove_user").contains(".delete_item()"));
+        let mw = body(include_str!("../middleware/auth.rs"), "require_auth");
+        assert!(before(mw, "api_key_request", "check_member_session"));
+        assert!(before(
+            mw,
+            "check_member_session",
+            "match permissions::resolve_access"
+        ));
+        assert!(!body(me, "check_member_session")
+            .to_lowercase()
+            .contains("cache"));
     }
 
     #[test]
