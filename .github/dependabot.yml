@@ -1,0 +1,14 @@
+# Keeps the SHA-pinned GitHub Actions current: each update is a PR that moves
+# the commit SHA and its "# vX.Y.Z" comment together, and goes through CI
+# and review like any change.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      actions:
+        patterns: ["*"]
+    commit-message:
+      prefix: "ci"

@@ -41,7 +41,7 @@ order: 11
 
 ## Supply chain
 
-Releases are built by GitHub Actions from a tag, with checksums and build provenance attestations (Sigstore, through GitHub). The installer checks both. You can also deploy from source (`--source`) after reviewing the code.
+Releases are built by GitHub Actions from a signed tag on `main`, published only after a maintainer approves, and signed keylessly (Sigstore) with build provenance attestations. The installer, the update build and the Launch Stack check that the signature was made by exactly CoderHelm's release workflow on that release's tag, and refuse anything else, including older releases you never ran. [How updates are kept safe](./updates-security.md) has the details and the commands to check a release yourself. You can also deploy from source (`--source`) after reviewing the code.
 
 ## Hybrid threat model
 

@@ -10,6 +10,7 @@ import * as cdk from "aws-cdk-lib";
 import { Template } from "aws-cdk-lib/assertions";
 import { CfnInclude } from "aws-cdk-lib/cloudformation-include";
 import { repoPath } from "../lib/paths";
+import { CHECK_VERSION, COSIGN_LINUX_AMD64_SHA256, installCosignCommands, VERIFY_SUMS } from "../lib/release-verify";
 
 const FILE = repoPath("infra", "cfn", "coderhelm-selfhost-launch.yaml");
 
@@ -67,8 +68,21 @@ test("the build checks the release's signature and checksums before running anyt
   const sums = spec.lastIndexOf("sha256sum -c -");
   const runs = at("node launch-bootstrap.mjs");
   assert.ok(verify < sums && sums < runs, "verify, then checksums, then run");
-  assert.match(spec, /release\.yml@refs\/tags\/v/, "signed by the release workflow, on a tag");
-  assert.match(spec, /coderhelm-selfhost\\\.tgz\|launch-bootstrap\\\.mjs/);
+  assert.ok(spec.includes(VERIFY_SUMS), "the exact identity: release.yml on refs/tags/$VERSION, GitHub's issuer");
+  assert.ok(spec.indexOf(CHECK_VERSION) >= 0 && spec.indexOf(CHECK_VERSION) < verify, "VERSION is a release tag before it is used");
+  for (const line of installCosignCommands()) assert.ok(spec.includes(line), `pinned cosign: ${line}`);
+  assert.ok(spec.includes(COSIGN_LINUX_AMD64_SHA256));
+  assert.ok(spec.includes("grep ' coderhelm-selfhost.tgz$' SHA256SUMS | sha256sum -c -"));
+  assert.ok(spec.includes("grep ' launch-bootstrap.mjs$' SHA256SUMS | sha256sum -c -"));
+});
+
+test("no loose signature checks: no identity regexp, no skipped transparency log, HTTPS-only downloads", () => {
+  const spec: string = load().toJSON().Resources.InstallerProject.Properties.Source.BuildSpec;
+  assert.doesNotMatch(spec, /identity-regexp|insecure-ignore|ignore-tlog|--offline/);
+  for (const line of spec.split("\n").filter((l) => /\bcurl\b/.test(l))) {
+    assert.match(line, /curl --proto =https --proto-redir =https --tlsv1\.2/, line);
+  }
+  assert.ok(spec.includes('B="https://github.com/CoderHelm/coderhelm-platform/releases/download/$VERSION"'));
 });
 
 test("the starter may only start the installer and open the progress file", () => {

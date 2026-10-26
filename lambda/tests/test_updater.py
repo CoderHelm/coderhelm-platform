@@ -179,6 +179,72 @@ class Handler(unittest.TestCase):
         self.assertIsNone(self.store.get("AUTO_UPDATE"))
 
 
+class NoDowngrade(unittest.TestCase):
+    """Only forward, unless an admin rolls back to a version this install ran; a stale list can't hide a release."""
+
+    def setUp(self):
+        self.db = FakeDynamo()
+        self.store = u.Store(self.db, "t")
+        self.builds = []
+        u.start_build = lambda env, version, actor, mode, hid, extra=None: self.builds.append((version, mode)) or "b"
+        u.notify = lambda subject, text, env=None: 1
+        self.env = {"CODERHELM_VERSION": "v1.2.0", "APP_URL": "https://helm.example.org", "UPDATE_PROJECT_NAME": "p"}
+        self.fetch = lambda _r: [rel("v1.3.0")]
+
+    def test_update_now_never_goes_back_or_sideways(self):
+        for v in ("v1.1.0", "v1.2.0", "v1.2.0-rc.1"):
+            with self.assertRaisesRegex(ValueError, "not newer"):
+                u.handle({"action": "update_now", "version": v}, self.env, self.store, SUNDAY_3AM, self.fetch)
+        self.assertEqual(self.builds, [])
+        u.handle({"action": "update_now", "version": "v1.3.0"}, self.env, self.store, SUNDAY_3AM, self.fetch)
+        self.assertEqual(self.builds, [("v1.3.0", "update")])
+
+    def test_rollback_only_to_a_version_this_install_ran(self):
+        # Never ran v1.0.0 (an older signed release): refused.
+        with self.assertRaisesRegex(ValueError, "not a version this install ran"):
+            u.handle({"action": "rollback", "version": "v1.0.0"}, self.env, self.store, SUNDAY_3AM, self.fetch)
+        # The running version is not a rollback target either.
+        with self.assertRaisesRegex(ValueError, "not a version this install ran"):
+            u.handle({"action": "rollback", "version": "v1.2.0"}, self.env, self.store, SUNDAY_3AM, self.fetch)
+        # Run v1.2.0, update to v1.3.0: now v1.2.0 is a version it ran.
+        e = u.handle({"action": "update_now", "version": "v1.3.0"}, self.env, self.store, SUNDAY_3AM, self.fetch)
+        u.handle({"action": "finished", "status": "succeeded", "history_id": e["id"]}, self.env, self.store, SUNDAY_3AM, self.fetch)
+        self.assertEqual(self.store.get("UPDATE_STATE")["ran_versions"], ["v1.2.0", "v1.3.0"])
+        on13 = dict(self.env, CODERHELM_VERSION="v1.3.0")
+        r = u.handle({"action": "rollback", "version": "v1.2.0", "actor": "admin"}, on13, self.store, SUNDAY_3AM + timedelta(hours=1), self.fetch)
+        self.assertEqual((r["version"], r["mode"]), ("v1.2.0", "rollback"))
+        with self.assertRaisesRegex(ValueError, "not a version this install ran"):
+            u.handle({"action": "rollback", "version": "v1.1.0"}, on13, self.store, SUNDAY_3AM + timedelta(hours=1), self.fetch)
+
+    def test_a_stale_release_list_is_not_believed(self):
+        u.handle({"action": "status"}, self.env, self.store, SUNDAY_3AM, lambda r: [rel("v1.3.0"), rel("v1.2.0")])
+        # An hour later the "latest" list no longer has v1.3.0 (a stale mirror or cache).
+        later = SUNDAY_3AM + timedelta(hours=2)
+        s = u.handle({"action": "status"}, self.env, self.store, later, lambda r: [rel("v1.2.0"), rel("v1.1.0")])
+        self.assertIsNone(s["latest"], "nothing older than the running version is offered")
+        self.assertTrue(s["releases"]["stale"])
+        self.assertIn("v1.3.0", s["releases"]["reason"])
+        # A fresh list with v1.3.0 (or newer) is believed again.
+        s = u.handle({"action": "status"}, self.env, self.store, later + timedelta(hours=2), lambda r: [rel("v1.4.0"), rel("v1.3.0")])
+        self.assertEqual(s["latest"]["version"], "v1.4.0")
+        self.assertFalse(s["releases"]["stale"])
+
+    def test_an_old_list_is_reported_stale(self):
+        u.handle({"action": "status"}, self.env, self.store, SUNDAY_3AM, self.fetch)
+        def down(_r):
+            raise OSError("GitHub is down")
+        s = u.handle({"action": "status"}, self.env, self.store, SUNDAY_3AM + timedelta(days=4), down)
+        self.assertTrue(s["releases"]["stale"])
+
+    def test_releases_only_from_coderhelms_repository(self):
+        calls = []
+        s = u.handle({"action": "status"}, dict(self.env, RELEASE_REPO="evil/coderhelm-platform"), self.store, SUNDAY_3AM, lambda r: calls.append(r) or [rel("v9.0.0")])
+        self.assertEqual(calls, [])
+        self.assertIsNone(s["latest"])
+        with self.assertRaises(ValueError):
+            u.fetch_releases("evil/coderhelm-platform")
+
+
 class FakeLambda:
     def __init__(self, conflicts=0):
         self.env = {"f-gateway": {"A": "1"}, "f-worker": {}}

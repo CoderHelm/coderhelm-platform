@@ -9,14 +9,19 @@
 //   SHA256SUMS.sigstore.json    cosign's keyless signature of SHA256SUMS,
 //                               made by this repository's release workflow
 //
-// Every file is checked against SHA256SUMS before use, and SHA256SUMS
-// against its signature (cosign) or the files' GitHub build attestations
-// (gh) when either tool is installed. `--require-signature` (the update
-// build always passes it) refuses a release that can't be verified.
+// Nothing from a release is used until it checks out: every file against
+// SHA256SUMS, and SHA256SUMS against its signature, which must have been made
+// by exactly this repository's release.yml, on the release's own tag, with
+// a GitHub Actions certificate logged in Rekor (cosign), or else every file
+// against its GitHub build attestation from that same workflow and tag (gh).
+// No cosign and no gh, no bundle, or any mismatch: the release is refused.
+// There is no switch that skips this; deploy from a checkout (--source) to
+// run code that isn't a signed release.
 import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
 import { REPO, sha256File } from "./util.mjs";
+import { checkBundleIdentity } from "./sigstore.mjs";
 
 export const ASSETS = ["gateway.zip", "worker.zip", "mcp-proxy.zip", "dashboard.tar.gz", "source.tar.gz"];
 
@@ -26,6 +31,14 @@ export function releasesDir() {
     : path.join(os.homedir(), ".coderhelm", "releases");
 }
 
+/** A release tag: vX.Y.Z, or vX.Y.Z-pre (also selfhost/launch/stamp-template.mjs). */
+export const TAG_RE = /^v\d+\.\d+\.\d+(-[0-9A-Za-z.-]+)?$/;
+
+export function checkTag(tag) {
+  if (typeof tag !== "string" || !TAG_RE.test(tag)) throw new Error(`${JSON.stringify(tag)} is not a CoderHelm release (vX.Y.Z).`);
+  return tag;
+}
+
 /** The latest release tag, from GitHub. */
 export async function latestVersion(fetchImpl = fetch) {
   const r = await fetchImpl(`https://api.github.com/repos/${REPO}/releases/latest`, {
@@ -33,7 +46,43 @@ export async function latestVersion(fetchImpl = fetch) {
   });
   if (!r.ok) throw new Error(`Could not look up the latest release (GitHub answered ${r.status}).`);
   const j = await r.json();
-  return j.tag_name;
+  if (j.draft || j.prerelease) throw new Error("GitHub's latest release is a draft or a pre-release: pass --to vX.Y.Z.");
+  return checkTag(j.tag_name);
+}
+
+/**
+ * Where release files may come from: GitHub's release download URL for this
+ * repository, over HTTPS, and the hosts GitHub redirects those downloads to.
+ */
+export const DOWNLOAD_HOSTS = ["github.com", "objects.githubusercontent.com", "release-assets.githubusercontent.com"];
+
+export function releaseUrl(tag, name) {
+  return `https://github.com/${REPO}/releases/download/${checkTag(tag)}/${name}`;
+}
+
+/** Throws unless a (possibly redirected) download came from an expected HTTPS host. */
+export function checkDownloadUrl(url) {
+  let u;
+  try {
+    u = new URL(url);
+  } catch {
+    throw new Error(`Refusing a download from ${url}: not a URL.`);
+  }
+  if (u.protocol !== "https:" || !DOWNLOAD_HOSTS.includes(u.hostname) || u.username || u.password || u.port) {
+    throw new Error(`Refusing a download from ${u.origin}: releases come only from GitHub over HTTPS.`);
+  }
+  if (u.hostname === "github.com" && !u.pathname.startsWith(`/${REPO}/releases/download/`)) {
+    throw new Error(`Refusing a download from ${u.href}: not a ${REPO} release.`);
+  }
+  return u.href;
+}
+
+async function download(fetchImpl, tag, name) {
+  const url = releaseUrl(tag, name);
+  const r = await fetchImpl(url, { redirect: "follow" });
+  if (!r.ok) throw new Error(`Could not download ${name} for ${tag} (${r.status}). Is ${tag} a CoderHelm release?`);
+  checkDownloadUrl(r.url || url);
+  return Buffer.from(await r.arrayBuffer());
 }
 
 /** Parses SHA256SUMS ("<hex>  <file>" per line). */
@@ -60,6 +109,7 @@ export function verifySums(dir, sums, names = ASSETS) {
  * it, and unpacks the source and dashboard. Returns the paths deploy needs.
  */
 export async function fetchRelease(tag, { runner, fetchImpl = fetch, log = console.log }) {
+  checkTag(tag);
   const dir = path.join(releasesDir(), tag);
   const done = path.join(dir, ".ready");
   const paths = releasePaths(dir);
@@ -67,19 +117,21 @@ export async function fetchRelease(tag, { runner, fetchImpl = fetch, log = conso
     log(`  [dry run] download release ${tag} into ${dir} and check SHA256SUMS`);
     return paths;
   }
-  if (fs.existsSync(done)) return paths;
-  fs.mkdirSync(dir, { recursive: true });
-  const base = `https://github.com/${REPO}/releases/download/${tag}`;
-  for (const n of ["SHA256SUMS", ...ASSETS]) {
-    log(`  downloading ${n}`);
-    const r = await fetchImpl(`${base}/${n}`, { redirect: "follow" });
-    if (!r.ok) throw new Error(`Could not download ${n} for ${tag} (${r.status}). Is ${tag} a CoderHelm release?`);
-    fs.writeFileSync(path.join(dir, n), Buffer.from(await r.arrayBuffer()));
+  // A release downloaded before is checked again: its files may have changed since.
+  if (fs.existsSync(done)) {
+    verifySums(dir, parseSums(fs.readFileSync(path.join(dir, "SHA256SUMS"), "utf8")));
+    await verifySignature(paths, runner, { tag, log });
+    return paths;
   }
-  // The signature is optional to download; verifySignature decides if it is needed.
-  const sig = await fetchImpl(`${base}/${SIGNATURE}`, { redirect: "follow" }).catch(() => null);
-  if (sig?.ok) fs.writeFileSync(path.join(dir, SIGNATURE), Buffer.from(await sig.arrayBuffer()));
+  fs.rmSync(dir, { recursive: true, force: true });
+  fs.mkdirSync(dir, { recursive: true });
+  for (const n of ["SHA256SUMS", SIGNATURE, ...ASSETS]) {
+    log(`  downloading ${n}`);
+    fs.writeFileSync(path.join(dir, n), await download(fetchImpl, tag, n));
+  }
+  // Checked before anything is unpacked or run.
   verifySums(dir, parseSums(fs.readFileSync(path.join(dir, "SHA256SUMS"), "utf8")));
+  await verifySignature(paths, runner, { tag, log });
   fs.mkdirSync(paths.source, { recursive: true });
   fs.mkdirSync(paths.dashboard, { recursive: true });
   await runner.run("tar", ["-xzf", path.join(dir, "source.tar.gz"), "-C", paths.source, "--strip-components=1"]);
@@ -101,9 +153,37 @@ export function releasePaths(dir) {
 }
 
 export const SIGNATURE = "SHA256SUMS.sigstore.json";
-/** Who may have signed a release: this repository's release workflow, on a tag. */
-export const SIGNER_IDENTITY = `^https://github.com/${REPO}/.github/workflows/release.yml@refs/tags/v`;
 export const SIGNER_ISSUER = "https://token.actions.githubusercontent.com";
+export const SIGNER_WORKFLOW = `${REPO}/.github/workflows/release.yml`;
+
+/** The one certificate identity a release's signature may have: release.yml, run on that release's tag. */
+export function signerIdentity(tag) {
+  return `https://github.com/${SIGNER_WORKFLOW}@refs/tags/${checkTag(tag)}`;
+}
+
+/** cosign's arguments: the exact identity, issuer, repository and ref (and Rekor, which cosign requires by default). */
+export function cosignArgs(tag, bundle, file) {
+  return [
+    "verify-blob", "--bundle", bundle,
+    "--certificate-identity", signerIdentity(tag),
+    "--certificate-oidc-issuer", SIGNER_ISSUER,
+    "--certificate-github-workflow-repository", REPO,
+    "--certificate-github-workflow-ref", `refs/tags/${tag}`,
+    file,
+  ];
+}
+
+/** gh's arguments: the attestation must come from release.yml in this repository, on the tag, on GitHub's runners. */
+export function attestationArgs(tag, file) {
+  return [
+    "attestation", "verify", file,
+    "--repo", REPO,
+    "--signer-workflow", SIGNER_WORKFLOW,
+    "--source-ref", `refs/tags/${checkTag(tag)}`,
+    "--cert-oidc-issuer", SIGNER_ISSUER,
+    "--deny-self-hosted-runners",
+  ];
+}
 
 const has = async (runner, cmd, args) => {
   const r = await runner.run(cmd, args, { capture: true, allowFail: true }).catch(() => null);
@@ -112,35 +192,40 @@ const has = async (runner, cmd, args) => {
 
 /**
  * Checks that the release was built and signed by this repository's release
- * workflow: SHA256SUMS against its cosign signature, or the artifacts'
- * GitHub attestations. Returns how it was verified, or null when no tool
- * was there; throws on a bad signature, and when `require` is set and it
- * couldn't be checked.
+ * workflow on `tag`: the signature bundle's certificate must name exactly
+ * that workflow and tag, then SHA256SUMS is checked against it with cosign,
+ * or every asset against its GitHub attestation with gh. Throws on any
+ * mismatch, a missing bundle, or when neither tool is installed; returns
+ * how it was verified. (`require` is accepted for older callers: it is
+ * always required now.)
  */
-export async function verifySignature(paths, runner, { require = false, log = console.log } = {}) {
+export async function verifySignature(paths, runner, { tag, log = console.log } = {}) {
+  checkTag(tag);
   const sigFile = path.join(paths.dir, SIGNATURE);
-  if (fs.existsSync(sigFile) && (await has(runner, "cosign", ["version"]))) {
-    const r = await runner.run("cosign", [
-      "verify-blob", "--bundle", sigFile,
-      "--certificate-identity-regexp", SIGNER_IDENTITY,
-      "--certificate-oidc-issuer", SIGNER_ISSUER,
-      path.join(paths.dir, "SHA256SUMS"),
-    ], { capture: true, allowFail: true });
+  if (!fs.existsSync(sigFile)) throw new Error(`The release has no signature (${SIGNATURE}): not installing it.`);
+  try {
+    checkBundleIdentity(fs.readFileSync(sigFile, "utf8"), {
+      identity: signerIdentity(tag),
+      issuer: SIGNER_ISSUER,
+      repositoryUri: `https://github.com/${REPO}`,
+      ref: `refs/tags/${tag}`,
+    });
+  } catch (e) {
+    throw new Error(`The release's signature is not CoderHelm's release workflow for ${tag}: ${e.message}. Not installing it.`);
+  }
+  if (await has(runner, "cosign", ["version"])) {
+    const r = await runner.run("cosign", cosignArgs(tag, sigFile, path.join(paths.dir, "SHA256SUMS")), { capture: true, allowFail: true });
     if (r.code !== 0) throw new Error(`The release's signature does not verify: not installing it.${r.stderr ? `\n${r.stderr.trim()}` : ""}`);
-    log("  signature verified (cosign: signed by this repository's release workflow)");
+    log(`  signature verified (cosign: ${SIGNER_WORKFLOW} on ${tag}, in the Rekor log)`);
     return "cosign";
   }
   if (await has(runner, "gh", ["--version"])) {
-    for (const n of ["gateway.zip", "worker.zip", "source.tar.gz"]) {
-      const r = await runner.run("gh", ["attestation", "verify", path.join(paths.dir, n), "--repo", REPO], { capture: true, allowFail: true });
-      if (r.code !== 0) throw new Error(`${n} has no valid build attestation from ${REPO}: not installing it.`);
+    for (const n of ASSETS) {
+      const r = await runner.run("gh", attestationArgs(tag, path.join(paths.dir, n)), { capture: true, allowFail: true });
+      if (r.code !== 0) throw new Error(`${n} has no valid build attestation from ${SIGNER_WORKFLOW} on ${tag}: not installing it.`);
     }
-    log("  provenance verified (gh: built by this repository's release workflow)");
+    log(`  provenance verified (gh: built by ${SIGNER_WORKFLOW} on ${tag})`);
     return "attestation";
   }
-  if (require) {
-    throw new Error("Can't verify the release's signature (install cosign or the GitHub CLI), and --require-signature is set: not installing it.");
-  }
-  log("  (cosign and gh not found: checksums verified, signature not checked)");
-  return null;
+  throw new Error("Can't check the release's signature: install cosign (https://docs.sigstore.dev/cosign/system_config/installation/) or the GitHub CLI (gh), then run this again. Nothing was installed.");
 }

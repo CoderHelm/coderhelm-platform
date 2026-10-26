@@ -16,6 +16,8 @@ import { Template } from "aws-cdk-lib/assertions";
 import { buildApp } from "../lib/app";
 import { CoderhelmConfig, loadConfigFile, resolveConfig, ResolvedConfig } from "../lib/config";
 import { API_PATHS, STREAM_PATH, runtimeConfigScript } from "../lib/web-stack";
+import { updateBuildSpec } from "../lib/updates-stack";
+import { CHECK_VERSION, COSIGN_LINUX_AMD64_SHA256, VERIFY_SUMS } from "../lib/release-verify";
 
 const INFRA = path.join(__dirname, "..", "..");
 
@@ -252,6 +254,14 @@ test("updates: on by default for self-host, with a least-privilege build role; o
   const spec = JSON.stringify(u.findResources("AWS::CodeBuild::Project"));
   assert.ok(spec.includes("cosign verify-blob"));
   assert.ok(spec.includes("--require-signature --auto-rollback"));
+  const commands: string[] = [...Object.values((updateBuildSpec(cfg) as any).spec.phases)].flatMap((p: any) => p.commands);
+  const verifyAt = commands.indexOf(VERIFY_SUMS);
+  assert.ok(verifyAt >= 0, "exact identity: release.yml on refs/tags/$VERSION");
+  assert.ok(commands.indexOf(CHECK_VERSION) >= 0 && commands.indexOf(CHECK_VERSION) < verifyAt, "VERSION must be a release tag first");
+  assert.ok(verifyAt < commands.findIndex((c) => c.startsWith("npm install")), "verified before the installer is installed");
+  assert.doesNotMatch(commands.join("\n"), /identity-regexp|insecure-ignore|ignore-tlog/);
+  assert.ok(commands.some((c) => c.includes(COSIGN_LINUX_AMD64_SHA256)), "cosign pinned by its hash");
+  assert.ok(commands.includes("npm install -g --ignore-scripts ./coderhelm-selfhost.tgz"));
   // The gateway knows the updater and may call it.
   assert.equal(envOf(t["coderhelm-prod-api"], "coderhelm-prod-gateway").UPDATER_FUNCTION_NAME, "coderhelm-prod-updater");
   assert.ok(json(t["coderhelm-prod-api"]).includes("function:coderhelm-prod-updater"));
@@ -346,7 +356,7 @@ test("the manifest landing: self-host only, may write only this install's secret
   });
 });
 
-test("the release publisher: only v* tag builds of the platform repo, only launch/* in the public bucket", () => {
+test("the release publisher: only the platform repo's approved release environment, only launch/* in the public bucket", () => {
   const cfg = loadConfigFile(path.join(INFRA, "config", "hosted.prod.json"), { CDK_DEFAULT_ACCOUNT: "654654210434" });
   const t = synth(cfg, zoneContext("654654210434", "us-east-1", "coderhelm.com"));
   const w = t["coderhelm-prod-worker"];
@@ -356,8 +366,11 @@ test("the release publisher: only v* tag builds of the platform repo, only launc
   const [st] = role.Properties.AssumeRolePolicyDocument.Statement;
   assert.equal(st.Action, "sts:AssumeRoleWithWebIdentity");
   assert.deepEqual(st.Condition, {
-    StringEquals: { "token.actions.githubusercontent.com:aud": "sts.amazonaws.com" },
-    StringLike: { "token.actions.githubusercontent.com:sub": "repo:CoderHelm/coderhelm-platform:ref:refs/tags/v*" },
+    StringEquals: {
+      "token.actions.githubusercontent.com:aud": "sts.amazonaws.com",
+      // Only a job in the release environment, which needs a reviewer's approval.
+      "token.actions.githubusercontent.com:sub": "repo:CoderHelm/coderhelm-platform:environment:release",
+    },
   });
   const policies = Object.values(w.findResources("AWS::IAM::Policy")) as any[];
   const mine = policies.filter((p) => JSON.stringify(p.Properties.Roles).includes("ReleasePublisherRole"));

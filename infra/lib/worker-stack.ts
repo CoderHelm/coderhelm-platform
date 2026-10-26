@@ -552,11 +552,16 @@ export class WorkerStack extends cdk.Stack {
       if (cfg.publicBucketName) {
         const publisher = new iam.Role(this, "ReleasePublisherRole", {
           roleName: `${prefix}-release-publisher`,
-          description: "Release workflow (GitHub Actions, v* tags): publishes the Launch Stack template to the public bucket",
+          description: "Release workflow (GitHub Actions, release environment): publishes the Launch Stack template to the public bucket",
           maxSessionDuration: cdk.Duration.hours(1),
           assumedBy: new iam.WebIdentityPrincipal(githubOidc.openIdConnectProviderArn, {
-            StringEquals: { "token.actions.githubusercontent.com:aud": "sts.amazonaws.com" },
-            StringLike: { "token.actions.githubusercontent.com:sub": `repo:${RELEASE_REPO}:ref:refs/tags/v*` },
+            // Only a job in the repository's "release" environment (which
+            // needs a reviewer's approval, .github/workflows/release.yml):
+            // with an environment, GitHub's token names it, not the tag.
+            StringEquals: {
+              "token.actions.githubusercontent.com:aud": "sts.amazonaws.com",
+              "token.actions.githubusercontent.com:sub": `repo:${RELEASE_REPO}:environment:release`,
+            },
           }),
         });
         publisher.addToPolicy(

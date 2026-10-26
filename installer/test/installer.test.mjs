@@ -12,7 +12,7 @@ import http from "node:http";
 import { main } from "../lib/cli.mjs";
 import * as cmd from "../lib/commands.mjs";
 import { buildManifest, convertCode, EVENTS, formPage, newAppUrl, PERMISSIONS, runManifestFlow, secretKeysFromApp } from "../lib/github-app.mjs";
-import { parseSums, verifySignature, verifySums } from "../lib/release.mjs";
+import { parseSums, verifySums } from "../lib/release.mjs";
 import { initialSecret, hasGithubApp } from "../lib/secrets.mjs";
 import { checkPrereqs } from "../lib/prereqs.mjs";
 import { redactArg, Runner } from "../lib/runner.mjs";
@@ -327,6 +327,16 @@ test("upgrade refuses to go backwards; rollback needs a recorded version", async
   assert.match(same.out, /Already on v1.4.0/);
 });
 
+test("rollback refuses a release the install never ran (no downgrade to an old signed release)", async () => {
+  const dir = tmpdir();
+  const file = writeConfig(dir);
+  fs.mkdirSync(path.join(dir, ".coderhelm"));
+  fs.writeFileSync(path.join(dir, ".coderhelm", "state.json"), JSON.stringify({ version: "v1.4.0", previousVersion: "v1.3.0" }));
+  const deps = { runner: new FakeRunner(awsAnswers()), log: () => {}, interactive: false, ask: quietAsk(), resolveSource: fakeSource([]) };
+  await assert.rejects(() => main(["rollback", "--config", file, "--to", "v1.0.0"], deps), /not a release this install ran before/);
+  await assert.rejects(() => main(["update", "--config", file, "--to", "v1.0.0", "--rollback"], deps), /not a release this install ran before|older than/);
+});
+
 test("update --dry-run: health check, deploy with live progress, health check; no bootstrap", async () => {
   const dir = tmpdir();
   const file = writeConfig(dir);
@@ -401,24 +411,7 @@ test("update: a healthy release succeeds; an unhealthy install isn't touched", a
   assert.equal(JSON.parse(fs.readFileSync(path.join(sick.dir, "r.json"), "utf8")).status, "failed");
 });
 
-test("signature: a bad signature refuses the release; --require-signature refuses an unverifiable one", async () => {
-  const dir = tmpdir();
-  fs.writeFileSync(path.join(dir, "SHA256SUMS"), "x");
-  fs.writeFileSync(path.join(dir, "SHA256SUMS.sigstore.json"), "{}");
-  const paths = { dir };
-  const bad = new FakeRunner({ "cosign version": "v2.4.1", "cosign verify-blob": { code: 1, stderr: "none of the expected identities matched" } });
-  await assert.rejects(() => verifySignature(paths, bad, { log: () => {} }), /signature does not verify/);
-  const good = new FakeRunner({ "cosign version": "v2.4.1", "cosign verify-blob": "Verified OK" });
-  assert.equal(await verifySignature(paths, good, { log: () => {} }), "cosign");
-  const verify = good.commands.find((c) => c.args[0] === "verify-blob");
-  assert.ok(verify.args.join(" ").includes("release.yml@refs/tags/v"), "only this repository's release workflow may sign");
-  const none = new FakeRunner({ "cosign version": { code: 127 }, "gh --version": { code: 127 } });
-  await assert.rejects(() => verifySignature(paths, none, { require: true, log: () => {} }), /--require-signature/);
-  assert.equal(await verifySignature(paths, none, { log: () => {} }), null);
-  const ghBad = new FakeRunner({ "cosign version": { code: 127 }, "gh --version": "gh 2", "gh attestation verify": { code: 1 } });
-  fs.rmSync(path.join(dir, "SHA256SUMS.sigstore.json"));
-  await assert.rejects(() => verifySignature(paths, ghBad, { log: () => {} }), /no valid build attestation/);
-});
+// Signature and download checks: test/release-security.test.mjs.
 
 test("auto-update on with a window: saved in the config and sent to the running updater", async () => {
   const { file } = stateDir("v1.0.0");
