@@ -34,14 +34,17 @@
 //! kept by `mcp_remote` and sealed by KMS, a team's saved integration key,
 //! the GitHub App) and the worker opens it for each sync.
 
+pub mod alert;
 pub mod confluence;
 pub mod connect;
 pub mod connector;
 pub mod gdrive;
 pub mod github;
+pub mod mcp;
 pub mod notion;
 pub mod oauth;
 pub mod sanity;
+pub mod sanity_mcp;
 pub mod store;
 pub mod sync;
 pub mod text;
@@ -79,6 +82,10 @@ pub const DEFAULT_INTERVAL_MINS: i64 = 60;
 /// How often a source whose provider sends webhooks is still synced on
 /// schedule, as a backstop for a missed event.
 pub const WEBHOOK_INTERVAL_MINS: i64 = 6 * 60;
+/// How often a source read through a person's sign-in is synced: no
+/// webhook reaches it, and each sync asks only for what changed, so it can
+/// look often.
+pub const SIGNIN_INTERVAL_MINS: i64 = 15;
 /// A sync holds its source this long at most; a crashed sync's hold runs out
 /// and the next one takes over.
 pub const LEASE_SECS: i64 = 14 * 60;
@@ -197,6 +204,69 @@ pub struct SourceError {
     pub at: String,
 }
 
+/// Whose sign-in a source reads with (a source synced through a provider's
+/// remote MCP server). Set by the server only, never from what a page sends:
+/// it names the person whose connection every sync uses.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SignIn {
+    /// The MCP server record that holds the sign-in (the team's Connected
+    /// apps entry for the provider, or Knowledge's own `ks-<kind>` one).
+    pub server_id: String,
+    /// The connection's owner on that record (`user:<email>` or `team`).
+    pub owner: String,
+    /// The member who connected it.
+    pub email: String,
+    /// Their name, for "Synced with Ada's Sanity sign-in".
+    #[serde(default)]
+    pub name: String,
+    /// The provider account the sign-in belongs to ("Connected as").
+    #[serde(default)]
+    pub account: String,
+    /// When the team's admins were told it stopped working (cleared once
+    /// it works again), so they are told once.
+    #[serde(default)]
+    pub alerted_at: String,
+}
+
+impl SignIn {
+    /// The name a page shows for the member: their name, else their email.
+    pub fn who(&self) -> &str {
+        if self.name.trim().is_empty() {
+            &self.email
+        } else {
+            self.name.trim()
+        }
+    }
+}
+
+/// The error a source shows. A source read through someone's sign-in says
+/// whose sign-in stopped working, and any admin can sign in again.
+pub fn source_error(s: &Source, e: &ConnectorError) -> SourceError {
+    let kind = s.kind.unwrap_or(Kind::Web);
+    match (&s.signin, e) {
+        (Some(si), ConnectorError::Reconnect(_)) => signin_error(si, kind, e.to_string(), false),
+        _ => e.for_source(kind),
+    }
+}
+
+/// The one sentence a sign-in source shows when its sign-in can't be used,
+/// with the "Sign in again" button (`sign_in`) any admin can press.
+pub fn signin_error(si: &SignIn, kind: Kind, message: String, member_gone: bool) -> SourceError {
+    let who = si.who();
+    let label = kind.label();
+    let fix = if member_gone {
+        format!("{who} is no longer on the team, so their {label} sign-in can't be used. Sign in again to keep this up to date.")
+    } else {
+        format!("{who}'s {label} sign-in stopped working. Sign in again to keep this up to date.")
+    };
+    SourceError {
+        message,
+        fix,
+        action: "sign_in".into(),
+        at: chrono::Utc::now().to_rfc3339(),
+    }
+}
+
 /// Progress of the sync running now.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Progress {
@@ -270,12 +340,17 @@ pub struct Source {
     /// it has one.
     #[serde(default)]
     pub hook: String,
+    /// Read through a person's sign-in (not an API key).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signin: Option<SignIn>,
 }
 
 impl Source {
     /// Minutes between scheduled syncs.
     pub fn interval_mins(&self) -> i64 {
-        if self.webhook {
+        if self.signin.is_some() && !self.webhook {
+            SIGNIN_INTERVAL_MINS
+        } else if self.webhook {
             WEBHOOK_INTERVAL_MINS
         } else {
             DEFAULT_INTERVAL_MINS
@@ -666,6 +741,42 @@ mod tests {
         assert_eq!(next_sync(&s, 0, true), 15 * 60);
         s.webhook = true;
         assert_eq!(next_sync(&s, 0, false), WEBHOOK_INTERVAL_MINS * 60);
+        s.webhook = false;
+        s.signin = Some(SignIn::default());
+        assert_eq!(next_sync(&s, 0, false), SIGNIN_INTERVAL_MINS * 60);
+    }
+
+    #[test]
+    fn a_sign_in_source_says_whose_sign_in_stopped_working() {
+        let mut s = Source {
+            kind: Some(Kind::Sanity),
+            ..Default::default()
+        };
+        let gone = ConnectorError::Reconnect("expired".into());
+        assert_eq!(source_error(&s, &gone).action, "reconnect");
+        s.signin = Some(SignIn {
+            email: "ada@example.com".into(),
+            name: "Ada".into(),
+            ..Default::default()
+        });
+        let e = source_error(&s, &gone);
+        assert_eq!(e.action, "sign_in");
+        assert_eq!(
+            e.fix,
+            "Ada's Sanity sign-in stopped working. Sign in again to keep this up to date."
+        );
+        let e = signin_error(
+            s.signin.as_ref().unwrap(),
+            Kind::Sanity,
+            String::new(),
+            true,
+        );
+        assert!(e.fix.starts_with("Ada is no longer on the team"));
+        // Other errors read as before.
+        assert_eq!(
+            source_error(&s, &ConnectorError::Temporary("x".into())).action,
+            "retry"
+        );
     }
 
     #[test]

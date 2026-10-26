@@ -73,4 +73,4 @@ These run in every install, as EventBridge rules that drop a message on the tick
 
 ## Knowledge sources
 
-Notion, Confluence, Sanity, Google Drive, GitHub and website sources work without settings. One-click sign-in for Notion, Confluence and Google Drive, and instant updates from Notion, need OAuth apps of your own: see [Knowledge sources](./knowledge-sources.md).
+Notion, Confluence, Sanity, Google Drive, GitHub and website sources work without settings, and Sanity connects by signing in with nothing to set up. One-click sign-in for Notion, Confluence and Google Drive, and instant updates from Notion, need OAuth apps of your own: see [Knowledge sources](./knowledge-sources.md).
