@@ -17,6 +17,58 @@
         ],
         "type": "object"
       },
+      "CreateEndpointBody": {
+        "description": "A new endpoint.",
+        "properties": {
+          "description": {
+            "description": "A note for people: what the endpoint is for.",
+            "examples": [
+              "Deploy bot"
+            ],
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "enabled": {
+            "description": "Defaults to `true`.",
+            "examples": [
+              true
+            ],
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "events": {
+            "description": "Event types to receive, or `[\"*\"]` for every event. Defaults to every\nevent.",
+            "examples": [
+              [
+                "run.completed",
+                "run.failed"
+              ]
+            ],
+            "items": {
+              "type": "string"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
+          "url": {
+            "description": "An `https://` address on the public internet.",
+            "examples": [
+              "https://hooks.example.com/coderhelm"
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "url"
+        ],
+        "type": "object"
+      },
       "CreatePlan": {
         "description": "A new plan.",
         "examples": [
@@ -97,6 +149,26 @@
         ],
         "type": "object"
       },
+      "CreatedEndpoint": {
+        "description": "A new endpoint and its signing secret. The secret is shown here once;\nreveal it later with `GET …/secret`.",
+        "properties": {
+          "endpoint": {
+            "$ref": "#/components/schemas/WebhookEndpoint"
+          },
+          "secret": {
+            "description": "`whsec_` and 32 random bytes in base64. Verify signatures with it.",
+            "examples": [
+              "whsec_C2FVsBQIhrscChlQIMV+b5sSYspob7oD7vS8nSUIQ2c="
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "endpoint",
+          "secret"
+        ],
+        "type": "object"
+      },
       "CreatedPlan": {
         "description": "The plan that was made.",
         "properties": {
@@ -134,6 +206,52 @@
         "required": [
           "id",
           "name"
+        ],
+        "type": "object"
+      },
+      "DeliveryAttempt": {
+        "description": "One attempt.",
+        "properties": {
+          "at": {
+            "description": "When it was sent.",
+            "examples": [
+              "2026-10-26T14:31:47.901Z"
+            ],
+            "type": "string"
+          },
+          "code": {
+            "description": "The endpoint's HTTP status, when it answered.",
+            "examples": [
+              401
+            ],
+            "format": "int32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "duration_ms": {
+            "description": "How long it took.",
+            "examples": [
+              112
+            ],
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "error": {
+            "description": "What went wrong, when it did.",
+            "examples": [
+              "Answered 401: bad signature"
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "at",
+          "duration_ms",
+          "error"
         ],
         "type": "object"
       },
@@ -1327,6 +1445,73 @@
         ],
         "type": "object"
       },
+      "ReplayBody": {
+        "description": "Which kept events to send again.",
+        "properties": {
+          "only_failed": {
+            "description": "Only events whose deliveries to this endpoint all failed, or that it\nnever got. Defaults to `false` (every event it subscribes to).",
+            "examples": [
+              true
+            ],
+            "type": "boolean"
+          },
+          "since": {
+            "description": "RFC 3339. At most 14 days ago (events are kept that long).",
+            "examples": [
+              "2026-10-25T00:00:00Z"
+            ],
+            "type": "string"
+          },
+          "until": {
+            "description": "RFC 3339. Defaults to now.",
+            "examples": [
+              "2026-10-26T00:00:00Z"
+            ],
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "since"
+        ],
+        "type": "object"
+      },
+      "ReplayResult": {
+        "description": "What a replay queued.",
+        "properties": {
+          "capped": {
+            "description": "More matched than one replay sends (500); replay again from the last one.",
+            "examples": [
+              false
+            ],
+            "type": "boolean"
+          },
+          "found": {
+            "description": "Kept events in the range (of every type).",
+            "examples": [
+              40
+            ],
+            "minimum": 0,
+            "type": "integer"
+          },
+          "queued": {
+            "description": "Events queued to send again.",
+            "examples": [
+              12
+            ],
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "queued",
+          "found",
+          "capped"
+        ],
+        "type": "object"
+      },
       "Repo": {
         "description": "A repository connected to the team.",
         "properties": {
@@ -1717,6 +1902,49 @@
         },
         "required": [
           "reviews"
+        ],
+        "type": "object"
+      },
+      "RotateBody": {
+        "description": "How long the old secret keeps signing.",
+        "properties": {
+          "overlap_hours": {
+            "description": "Hours the old secret keeps signing beside the new one: 0 to 168.\nDefaults to 24. With 0 the old secret stops at once.",
+            "examples": [
+              24
+            ],
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
+      "RotatedSecret": {
+        "description": "A rotated secret.",
+        "properties": {
+          "previous_secret_expires_at": {
+            "description": "Until then, requests carry a second signature made with the old one.",
+            "examples": [
+              "2026-10-27T09:00:00Z"
+            ],
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "secret": {
+            "description": "The new secret. Requests are signed with it from now on.",
+            "examples": [
+              "whsec_k0q8vX2mZp5Rr3t1YbN6cH9dLwE4fJ7aS1uG0iT2oQs="
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "secret"
         ],
         "type": "object"
       },
@@ -2411,6 +2639,32 @@
         ],
         "type": "object"
       },
+      "SecretView": {
+        "description": "An endpoint's signing secret.",
+        "properties": {
+          "previous_secret_expires_at": {
+            "description": "While the previous secret still signs too, when it stops.",
+            "examples": [
+              null
+            ],
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "secret": {
+            "description": "The current secret.",
+            "examples": [
+              "whsec_C2FVsBQIhrscChlQIMV+b5sSYspob7oD7vS8nSUIQ2c="
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "secret"
+        ],
+        "type": "object"
+      },
       "SnsEnvelope": {
         "description": "An Amazon SNS message, as SNS posts it to an HTTPS subscription.",
         "examples": [
@@ -2514,6 +2768,57 @@
           "Signature",
           "SigningCertURL"
         ],
+        "type": "object"
+      },
+      "UpdateEndpointBody": {
+        "description": "Changes to an endpoint. Only the fields sent change.",
+        "properties": {
+          "description": {
+            "description": "A new note.",
+            "examples": [
+              "Deploy bot (staging)"
+            ],
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "enabled": {
+            "description": "Turning an endpoint back on starts its failure count again.",
+            "examples": [
+              true
+            ],
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "events": {
+            "description": "The new subscription list, or `[\"*\"]`.",
+            "examples": [
+              [
+                "*"
+              ]
+            ],
+            "items": {
+              "type": "string"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
+          "url": {
+            "description": "A new `https://` address.",
+            "examples": [
+              "https://hooks.example.com/coderhelm/v2"
+            ],
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
         "type": "object"
       },
       "Usage": {
@@ -2764,6 +3069,264 @@
           "used"
         ],
         "type": "object"
+      },
+      "WebhookDelivery": {
+        "description": "One delivery of an event to an endpoint.",
+        "properties": {
+          "attempts": {
+            "description": "Every attempt, oldest first (the last 20).",
+            "items": {
+              "$ref": "#/components/schemas/DeliveryAttempt"
+            },
+            "type": "array"
+          },
+          "created_at": {
+            "description": "When the event was first sent to this endpoint.",
+            "examples": [
+              "2026-10-26T14:31:47.780Z"
+            ],
+            "type": "string"
+          },
+          "event": {
+            "description": "The event type.",
+            "examples": [
+              "run.completed"
+            ],
+            "type": "string"
+          },
+          "event_id": {
+            "description": "The event's id: the same `webhook-id` on every attempt.",
+            "examples": [
+              "evt_01JBEVNT8M1N4P7Q0R3S6T9V2W"
+            ],
+            "type": "string"
+          },
+          "headers": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "description": "The request's headers, the signature removed.",
+            "examples": [
+              {
+                "webhook-id": "evt_01JBEVNT8M1N4P7Q0R3S6T9V2W",
+                "webhook-signature": "[redacted]",
+                "webhook-timestamp": "1792420307"
+              }
+            ],
+            "propertyNames": {
+              "type": "string"
+            },
+            "type": "object"
+          },
+          "id": {
+            "description": "The Deliveries record's id.",
+            "examples": [
+              "01JBDLVR5T8V1W4X7Y0Z3A6B9C"
+            ],
+            "type": "string"
+          },
+          "next_retry_at": {
+            "description": "When the next retry is due, while one is.",
+            "examples": [
+              null
+            ],
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "outcome": {
+            "description": "What happened, in a few words.",
+            "examples": [
+              "Refused (401)"
+            ],
+            "type": "string"
+          },
+          "payload_preview": {
+            "description": "The body that was sent, with secret-looking values masked, cut at 4 KB.",
+            "examples": [
+              "{\n  \"id\": \"evt_01JBEVNT8M1N4P7Q0R3S6T9V2W\" …"
+            ],
+            "type": "string"
+          },
+          "reason": {
+            "description": "A reason code when it failed.",
+            "examples": [
+              "webhook_refused"
+            ],
+            "type": "string"
+          },
+          "reason_fix": {
+            "description": "What to do about it.",
+            "examples": [
+              "Check that the endpoint verifies signatures with the right secret and accepts JSON, then press Resend."
+            ],
+            "type": "string"
+          },
+          "reason_message": {
+            "description": "The reason in plain words.",
+            "examples": [
+              "Your webhook endpoint refused the event (a 4xx answer), so it isn't retried."
+            ],
+            "type": "string"
+          },
+          "status": {
+            "description": "`pending` (being retried), `handled` (delivered) or `failed`.",
+            "examples": [
+              "failed"
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "event_id",
+          "event",
+          "status",
+          "outcome",
+          "reason",
+          "reason_message",
+          "reason_fix",
+          "attempts",
+          "created_at",
+          "payload_preview",
+          "headers"
+        ],
+        "type": "object"
+      },
+      "WebhookEndpoint": {
+        "description": "A webhook endpoint. Never carries its secret.",
+        "properties": {
+          "created_at": {
+            "description": "When it was added.",
+            "examples": [
+              "2026-10-20T09:00:00Z"
+            ],
+            "type": "string"
+          },
+          "created_by": {
+            "description": "Who added it.",
+            "examples": [
+              "lead@example.com"
+            ],
+            "type": "string"
+          },
+          "description": {
+            "description": "A note for people: what the endpoint is for.",
+            "examples": [
+              "Deploy bot"
+            ],
+            "type": "string"
+          },
+          "disabled_reason": {
+            "description": "Why it's off: `manual` (turned off by a person) or `failing` (turned\noff by CoderHelm after 5 days of failed deliveries). Empty while on.",
+            "examples": [
+              ""
+            ],
+            "type": "string"
+          },
+          "enabled": {
+            "description": "Off: nothing is sent (tests still are).",
+            "examples": [
+              true
+            ],
+            "type": "boolean"
+          },
+          "events": {
+            "description": "Event types it receives; `[\"*\"]` is every event, including types\nadded later.",
+            "examples": [
+              [
+                "run.completed",
+                "run.failed"
+              ]
+            ],
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "failing_since": {
+            "description": "The first failed delivery since the last success.",
+            "examples": [
+              null
+            ],
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "id": {
+            "description": "`ep_` and a ULID.",
+            "examples": [
+              "ep_01jbendpt4a7b0c3d6e9f2g5h8"
+            ],
+            "type": "string"
+          },
+          "last_failure_at": {
+            "description": "The last failed attempt.",
+            "examples": [
+              "2026-10-25T08:02:11.004Z"
+            ],
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "last_success_at": {
+            "description": "The last delivered attempt.",
+            "examples": [
+              "2026-10-26T14:31:48.120Z"
+            ],
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "previous_secret_expires_at": {
+            "description": "While a rotated-out secret still signs too, when it stops.",
+            "examples": [
+              "2026-10-27T09:00:00Z"
+            ],
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "secret_hint": {
+            "description": "The last characters of the signing secret.",
+            "examples": [
+              "whsec_…Q2c="
+            ],
+            "type": "string"
+          },
+          "updated_at": {
+            "description": "When it last changed.",
+            "examples": [
+              "2026-10-20T09:00:00Z"
+            ],
+            "type": "string"
+          },
+          "url": {
+            "description": "Where events are POSTed. Always `https://`.",
+            "examples": [
+              "https://hooks.example.com/coderhelm"
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "url",
+          "description",
+          "events",
+          "enabled",
+          "disabled_reason",
+          "secret_hint",
+          "created_at",
+          "created_by",
+          "updated_at"
+        ],
+        "type": "object"
       }
     },
     "securitySchemes": {
@@ -2816,7 +3379,7 @@
       "name": "CoderHelm support",
       "url": "https://docs.coderhelm.com/api"
     },
-    "description": "The CoderHelm API lets your own programs start and follow CoderHelm's work: list and inspect runs, retry or cancel them, create and run plans, read the reviewer's reviews, and check token usage.\n\nEvery request is authenticated with a team API key sent as a bearer token. Admins create keys in the dashboard under Settings, API keys. A key holds scopes, never more than the admin who made it, and has its own rate limit.\n\nCI jobs upload test reports with a GitHub Actions OIDC token instead of a key, and the webhooks are verified by their signatures.",
+    "description": "The CoderHelm API lets your own programs start and follow CoderHelm's work: list and inspect runs, retry or cancel them, create and run plans, read the reviewer's reviews, check token usage, and manage the webhook endpoints CoderHelm sends your team's events to.\n\nEvery request is authenticated with a team API key sent as a bearer token. Admins create keys in the dashboard under Settings, API keys. A key holds scopes, never more than the admin who made it, and has its own rate limit.\n\nCI jobs upload test reports with a GitHub Actions OIDC token instead of a key, and the webhooks are verified by their signatures.",
     "license": {
       "identifier": "MIT",
       "name": "MIT"
@@ -4638,6 +5201,1765 @@
         ]
       }
     },
+    "/api/webhooks/endpoints": {
+      "get": {
+        "description": "The team's webhook endpoints, oldest first. Secrets are never listed.",
+        "operationId": "listWebhookEndpoints",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "example": {
+                  "endpoints": [
+                    {
+                      "created_at": "2026-10-20T09:00:00Z",
+                      "created_by": "lead@example.com",
+                      "description": "Deploy bot",
+                      "disabled_reason": "",
+                      "enabled": true,
+                      "events": [
+                        "*"
+                      ],
+                      "id": "ep_01jbendpt4a7b0c3d6e9f2g5h8",
+                      "secret_hint": "whsec_…Q2c=",
+                      "updated_at": "2026-10-20T09:00:00Z",
+                      "url": "https://hooks.example.com/coderhelm"
+                    }
+                  ],
+                  "max": 20
+                },
+                "schema": {
+                  "type": "object"
+                }
+              }
+            },
+            "description": "The endpoints.",
+            "headers": {
+              "RateLimit-Limit": {
+                "description": "Requests this key may make in a minute.",
+                "schema": {
+                  "type": "integer"
+                }
+              },
+              "RateLimit-Remaining": {
+                "description": "Requests left in the current minute.",
+                "schema": {
+                  "type": "integer"
+                }
+              },
+              "RateLimit-Reset": {
+                "description": "Seconds until the current minute ends and the count starts over.",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            }
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "The key is missing, malformed, revoked or expired, or the person who made it left the team."
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "The key lacks the scope this endpoint needs (`missing_scope`)."
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "Over the key's rate limit (`rate_limited`), or, for endpoints that start work, over the team's monthly token limit (`token_limit_reached`).",
+            "headers": {
+              "RateLimit-Limit": {
+                "description": "Requests this key may make in a minute.",
+                "schema": {
+                  "type": "integer"
+                }
+              },
+              "RateLimit-Remaining": {
+                "description": "Requests left in the current minute.",
+                "schema": {
+                  "type": "integer"
+                }
+              },
+              "RateLimit-Reset": {
+                "description": "Seconds until the current minute ends and the count starts over.",
+                "schema": {
+                  "type": "integer"
+                }
+              },
+              "Retry-After": {
+                "description": "With `rate_limited`: seconds to wait before trying again.",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            }
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "Something failed on CoderHelm's side. Safe to retry reads."
+          }
+        },
+        "security": [
+          {
+            "api_key": [
+              "webhooks"
+            ]
+          }
+        ],
+        "summary": "List webhook endpoints",
+        "tags": [
+          "Webhooks"
+        ]
+      },
+      "post": {
+        "description": "Adds an endpoint and makes its signing secret, which this answer shows once. The address must be `https://` and on the public internet: private, local and cloud metadata addresses are refused here and again before every delivery. A team has at most 20 endpoints.",
+        "operationId": "createWebhookEndpoint",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateEndpointBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CreatedEndpoint"
+                }
+              }
+            },
+            "description": "Created. Keep the secret.",
+            "headers": {
+              "RateLimit-Limit": {
+                "description": "Requests this key may make in a minute.",
+                "schema": {
+                  "type": "integer"
+                }
+              },
+              "RateLimit-Remaining": {
+                "description": "Requests left in the current minute.",
+                "schema": {
+                  "type": "integer"
+                }
+              },
+              "RateLimit-Reset": {
+                "description": "Seconds until the current minute ends and the count starts over.",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            }
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "The address, events or description were refused; `field` names which."
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "The key is missing, malformed, revoked or expired, or the person who made it left the team."
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "The key lacks the scope this endpoint needs (`missing_scope`)."
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "The team already has 20 endpoints."
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "Over the key's rate limit (`rate_limited`), or, for endpoints that start work, over the team's monthly token limit (`token_limit_reached`).",
+            "headers": {
+              "RateLimit-Limit": {
+                "description": "Requests this key may make in a minute.",
+                "schema": {
+                  "type": "integer"
+                }
+              },
+              "RateLimit-Remaining": {
+                "description": "Requests left in the current minute.",
+                "schema": {
+                  "type": "integer"
+                }
+              },
+              "RateLimit-Reset": {
+                "description": "Seconds until the current minute ends and the count starts over.",
+                "schema": {
+                  "type": "integer"
+                }
+              },
+              "Retry-After": {
+                "description": "With `rate_limited`: seconds to wait before trying again.",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            }
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "Something failed on CoderHelm's side. Safe to retry reads."
+          }
+        },
+        "security": [
+          {
+            "api_key": [
+              "webhooks"
+            ]
+          }
+        ],
+        "summary": "Create a webhook endpoint",
+        "tags": [
+          "Webhooks"
+        ]
+      }
+    },
+    "/api/webhooks/endpoints/{endpoint_id}": {
+      "delete": {
+        "description": "Stops all deliveries to it, including retries already queued.",
+        "operationId": "deleteWebhookEndpoint",
+        "parameters": [
+          {
+            "description": "The endpoint's id.",
+            "example": "ep_01jbendpt4a7b0c3d6e9f2g5h8",
+            "in": "path",
+            "name": "endpoint_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "example": {
+                  "deleted": true
+                },
+                "schema": {
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Deleted.",
+            "headers": {
+              "RateLimit-Limit": {
+                "description": "Requests this key may make in a minute.",
+                "schema": {
+                  "type": "integer"
+                }
+              },
+              "RateLimit-Remaining": {
+                "description": "Requests left in the current minute.",
+                "schema": {
+                  "type": "integer"
+                }
+              },
+              "RateLimit-Reset": {
+                "description": "Seconds until the current minute ends and the count starts over.",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            }
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "The key is missing, malformed, revoked or expired, or the person who made it left the team."
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "The key lacks the scope this endpoint needs (`missing_scope`)."
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "No such endpoint on this team."
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "Over the key's rate limit (`rate_limited`), or, for endpoints that start work, over the team's monthly token limit (`token_limit_reached`).",
+            "headers": {
+              "RateLimit-Limit": {
+                "description": "Requests this key may make in a minute.",
+                "schema": {
+                  "type": "integer"
+                }
+              },
+              "RateLimit-Remaining": {
+                "description": "Requests left in the current minute.",
+                "schema": {
+                  "type": "integer"
+                }
+              },
+              "RateLimit-Reset": {
+                "description": "Seconds until the current minute ends and the count starts over.",
+                "schema": {
+                  "type": "integer"
+                }
+              },
+              "Retry-After": {
+                "description": "With `rate_limited`: seconds to wait before trying again.",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            }
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "Something failed on CoderHelm's side. Safe to retry reads."
+          }
+        },
+        "security": [
+          {
+            "api_key": [
+              "webhooks"
+            ]
+          }
+        ],
+        "summary": "Delete a webhook endpoint",
+        "tags": [
+          "Webhooks"
+        ]
+      },
+      "get": {
+        "description": "One endpoint, with its health: when it last delivered, and since when it has been failing, if it is.",
+        "operationId": "getWebhookEndpoint",
+        "parameters": [
+          {
+            "description": "The endpoint's id.",
+            "example": "ep_01jbendpt4a7b0c3d6e9f2g5h8",
+            "in": "path",
+            "name": "endpoint_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WebhookEndpoint"
+                }
+              }
+            },
+            "description": "The endpoint.",
+            "headers": {
+              "RateLimit-Limit": {
+                "description": "Requests this key may make in a minute.",
+                "schema": {
+                  "type": "integer"
+                }
+              },
+              "RateLimit-Remaining": {
+                "description": "Requests left in the current minute.",
+                "schema": {
+                  "type": "integer"
+                }
+              },
+              "RateLimit-Reset": {
+                "description": "Seconds until the current minute ends and the count starts over.",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            }
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "The key is missing, malformed, revoked or expired, or the person who made it left the team."
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "The key lacks the scope this endpoint needs (`missing_scope`)."
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "No such endpoint on this team."
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "Over the key's rate limit (`rate_limited`), or, for endpoints that start work, over the team's monthly token limit (`token_limit_reached`).",
+            "headers": {
+              "RateLimit-Limit": {
+                "description": "Requests this key may make in a minute.",
+                "schema": {
+                  "type": "integer"
+                }
+              },
+              "RateLimit-Remaining": {
+                "description": "Requests left in the current minute.",
+                "schema": {
+                  "type": "integer"
+                }
+              },
+              "RateLimit-Reset": {
+                "description": "Seconds until the current minute ends and the count starts over.",
+                "schema": {
+                  "type": "integer"
+                }
+              },
+              "Retry-After": {
+                "description": "With `rate_limited`: seconds to wait before trying again.",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            }
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "Something failed on CoderHelm's side. Safe to retry reads."
+          }
+        },
+        "security": [
+          {
+            "api_key": [
+              "webhooks"
+            ]
+          }
+        ],
+        "summary": "Get a webhook endpoint",
+        "tags": [
+          "Webhooks"
+        ]
+      },
+      "put": {
+        "description": "Changes the address, description, events, or turns the endpoint on or off. Fields left out keep their value. Turning an endpoint back on starts its failure count again; events missed while it was off are not sent by themselves (replay them).",
+        "operationId": "updateWebhookEndpoint",
+        "parameters": [
+          {
+            "description": "The endpoint's id.",
+            "example": "ep_01jbendpt4a7b0c3d6e9f2g5h8",
+            "in": "path",
+            "name": "endpoint_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateEndpointBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WebhookEndpoint"
+                }
+              }
+            },
+            "description": "The endpoint as saved.",
+            "headers": {
+              "RateLimit-Limit": {
+                "description": "Requests this key may make in a minute.",
+                "schema": {
+                  "type": "integer"
+                }
+              },
+              "RateLimit-Remaining": {
+                "description": "Requests left in the current minute.",
+                "schema": {
+                  "type": "integer"
+                }
+              },
+              "RateLimit-Reset": {
+                "description": "Seconds until the current minute ends and the count starts over.",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            }
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "A field was refused; `field` names which."
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "The key is missing, malformed, revoked or expired, or the person who made it left the team."
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "The key lacks the scope this endpoint needs (`missing_scope`)."
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "No such endpoint on this team."
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "Over the key's rate limit (`rate_limited`), or, for endpoints that start work, over the team's monthly token limit (`token_limit_reached`).",
+            "headers": {
+              "RateLimit-Limit": {
+                "description": "Requests this key may make in a minute.",
+                "schema": {
+                  "type": "integer"
+                }
+              },
+              "RateLimit-Remaining": {
+                "description": "Requests left in the current minute.",
+                "schema": {
+                  "type": "integer"
+                }
+              },
+              "RateLimit-Reset": {
+                "description": "Seconds until the current minute ends and the count starts over.",
+                "schema": {
+                  "type": "integer"
+                }
+              },
+              "Retry-After": {
+                "description": "With `rate_limited`: seconds to wait before trying again.",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            }
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "Something failed on CoderHelm's side. Safe to retry reads."
+          }
+        },
+        "security": [
+          {
+            "api_key": [
+              "webhooks"
+            ]
+          }
+        ],
+        "summary": "Update a webhook endpoint",
+        "tags": [
+          "Webhooks"
+        ]
+      }
+    },
+    "/api/webhooks/endpoints/{endpoint_id}/deliveries": {
+      "get": {
+        "description": "The endpoint's deliveries, newest first, each with every attempt. Kept 14 days.",
+        "operationId": "listWebhookDeliveries",
+        "parameters": [
+          {
+            "description": "The endpoint's id.",
+            "example": "ep_01jbendpt4a7b0c3d6e9f2g5h8",
+            "in": "path",
+            "name": "endpoint_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "`pending`, `failed`, `ok` or `all` (default).",
+            "in": "query",
+            "name": "status",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "1 to 100, default 25.",
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "minimum": 0,
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "example": {
+                  "deliveries": [
+                    {
+                      "attempts": [
+                        {
+                          "at": "2026-10-26T14:31:47.901Z",
+                          "code": 200,
+                          "duration_ms": 87,
+                          "error": ""
+                        }
+                      ],
+                      "created_at": "2026-10-26T14:31:47.780Z",
+                      "event": "run.completed",
+                      "event_id": "evt_01JBEVNT8M1N4P7Q0R3S6T9V2W",
+                      "id": "01JBDLVR5T8V1W4X7Y0Z3A6B9C",
+                      "next_retry_at": null,
+                      "outcome": "Delivered (200)",
+                      "reason": "",
+                      "reason_fix": "",
+                      "reason_message": "",
+                      "status": "handled"
+                    }
+                  ]
+                },
+                "schema": {
+                  "type": "object"
+                }
+              }
+            },
+            "description": "The deliveries.",
+            "headers": {
+              "RateLimit-Limit": {
+                "description": "Requests this key may make in a minute.",
+                "schema": {
+                  "type": "integer"
+                }
+              },
+              "RateLimit-Remaining": {
+                "description": "Requests left in the current minute.",
+                "schema": {
+                  "type": "integer"
+                }
+              },
+              "RateLimit-Reset": {
+                "description": "Seconds until the current minute ends and the count starts over.",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            }
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "The key is missing, malformed, revoked or expired, or the person who made it left the team."
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "The key lacks the scope this endpoint needs (`missing_scope`)."
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "No such endpoint on this team."
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "Over the key's rate limit (`rate_limited`), or, for endpoints that start work, over the team's monthly token limit (`token_limit_reached`).",
+            "headers": {
+              "RateLimit-Limit": {
+                "description": "Requests this key may make in a minute.",
+                "schema": {
+                  "type": "integer"
+                }
+              },
+              "RateLimit-Remaining": {
+                "description": "Requests left in the current minute.",
+                "schema": {
+                  "type": "integer"
+                }
+              },
+              "RateLimit-Reset": {
+                "description": "Seconds until the current minute ends and the count starts over.",
+                "schema": {
+                  "type": "integer"
+                }
+              },
+              "Retry-After": {
+                "description": "With `rate_limited`: seconds to wait before trying again.",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            }
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "Something failed on CoderHelm's side. Safe to retry reads."
+          }
+        },
+        "security": [
+          {
+            "api_key": [
+              "webhooks"
+            ]
+          }
+        ],
+        "summary": "List an endpoint's deliveries",
+        "tags": [
+          "Webhooks"
+        ]
+      }
+    },
+    "/api/webhooks/endpoints/{endpoint_id}/deliveries/{delivery_id}/resend": {
+      "post": {
+        "description": "Sends the same event (the same body and `webhook-id`, signed now) to the endpoint once more and adds the attempt to the delivery. Works on any delivery whose event is still kept (14 days), delivered or not.",
+        "operationId": "resendWebhookDelivery",
+        "parameters": [
+          {
+            "description": "The endpoint's id.",
+            "example": "ep_01jbendpt4a7b0c3d6e9f2g5h8",
+            "in": "path",
+            "name": "endpoint_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "The delivery's id.",
+            "example": "01JBDLVR5T8V1W4X7Y0Z3A6B9C",
+            "in": "path",
+            "name": "delivery_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WebhookDelivery"
+                }
+              }
+            },
+            "description": "The delivery with the new attempt.",
+            "headers": {
+              "RateLimit-Limit": {
+                "description": "Requests this key may make in a minute.",
+                "schema": {
+                  "type": "integer"
+                }
+              },
+              "RateLimit-Remaining": {
+                "description": "Requests left in the current minute.",
+                "schema": {
+                  "type": "integer"
+                }
+              },
+              "RateLimit-Reset": {
+                "description": "Seconds until the current minute ends and the count starts over.",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            }
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "The key is missing, malformed, revoked or expired, or the person who made it left the team."
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "The key lacks the scope this endpoint needs (`missing_scope`)."
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "No such endpoint or delivery."
+          },
+          "410": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "The event is no longer kept."
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "Over the key's rate limit (`rate_limited`), or, for endpoints that start work, over the team's monthly token limit (`token_limit_reached`).",
+            "headers": {
+              "RateLimit-Limit": {
+                "description": "Requests this key may make in a minute.",
+                "schema": {
+                  "type": "integer"
+                }
+              },
+              "RateLimit-Remaining": {
+                "description": "Requests left in the current minute.",
+                "schema": {
+                  "type": "integer"
+                }
+              },
+              "RateLimit-Reset": {
+                "description": "Seconds until the current minute ends and the count starts over.",
+                "schema": {
+                  "type": "integer"
+                }
+              },
+              "Retry-After": {
+                "description": "With `rate_limited`: seconds to wait before trying again.",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            }
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "Something failed on CoderHelm's side. Safe to retry reads."
+          }
+        },
+        "security": [
+          {
+            "api_key": [
+              "webhooks"
+            ]
+          }
+        ],
+        "summary": "Resend a delivery",
+        "tags": [
+          "Webhooks"
+        ]
+      }
+    },
+    "/api/webhooks/endpoints/{endpoint_id}/replay": {
+      "post": {
+        "description": "Sends the kept events made in a time range to this endpoint again, each as a new delivery with retries, oldest first. Only event types the endpoint subscribes to now are sent. Events carry their original `id`, so a receiver that already handled one can skip it. At most 500 per call; events are kept 14 days.",
+        "operationId": "replayWebhookEvents",
+        "parameters": [
+          {
+            "description": "The endpoint's id.",
+            "example": "ep_01jbendpt4a7b0c3d6e9f2g5h8",
+            "in": "path",
+            "name": "endpoint_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ReplayBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "202": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ReplayResult"
+                }
+              }
+            },
+            "description": "Queued.",
+            "headers": {
+              "RateLimit-Limit": {
+                "description": "Requests this key may make in a minute.",
+                "schema": {
+                  "type": "integer"
+                }
+              },
+              "RateLimit-Remaining": {
+                "description": "Requests left in the current minute.",
+                "schema": {
+                  "type": "integer"
+                }
+              },
+              "RateLimit-Reset": {
+                "description": "Seconds until the current minute ends and the count starts over.",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            }
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "The range is not valid, or the endpoint is off."
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "The key is missing, malformed, revoked or expired, or the person who made it left the team."
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "The key lacks the scope this endpoint needs (`missing_scope`)."
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "No such endpoint on this team."
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "Over the key's rate limit (`rate_limited`), or, for endpoints that start work, over the team's monthly token limit (`token_limit_reached`).",
+            "headers": {
+              "RateLimit-Limit": {
+                "description": "Requests this key may make in a minute.",
+                "schema": {
+                  "type": "integer"
+                }
+              },
+              "RateLimit-Remaining": {
+                "description": "Requests left in the current minute.",
+                "schema": {
+                  "type": "integer"
+                }
+              },
+              "RateLimit-Reset": {
+                "description": "Seconds until the current minute ends and the count starts over.",
+                "schema": {
+                  "type": "integer"
+                }
+              },
+              "Retry-After": {
+                "description": "With `rate_limited`: seconds to wait before trying again.",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            }
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "Something failed on CoderHelm's side. Safe to retry reads."
+          }
+        },
+        "security": [
+          {
+            "api_key": [
+              "webhooks"
+            ]
+          }
+        ],
+        "summary": "Replay events",
+        "tags": [
+          "Webhooks"
+        ]
+      }
+    },
+    "/api/webhooks/endpoints/{endpoint_id}/secret": {
+      "get": {
+        "description": "The endpoint's current signing secret. Each reveal is written to the team's audit log.",
+        "operationId": "getWebhookSecret",
+        "parameters": [
+          {
+            "description": "The endpoint's id.",
+            "example": "ep_01jbendpt4a7b0c3d6e9f2g5h8",
+            "in": "path",
+            "name": "endpoint_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SecretView"
+                }
+              }
+            },
+            "description": "The secret.",
+            "headers": {
+              "RateLimit-Limit": {
+                "description": "Requests this key may make in a minute.",
+                "schema": {
+                  "type": "integer"
+                }
+              },
+              "RateLimit-Remaining": {
+                "description": "Requests left in the current minute.",
+                "schema": {
+                  "type": "integer"
+                }
+              },
+              "RateLimit-Reset": {
+                "description": "Seconds until the current minute ends and the count starts over.",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            }
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "The key is missing, malformed, revoked or expired, or the person who made it left the team."
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "The key lacks the scope this endpoint needs (`missing_scope`)."
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "No such endpoint on this team."
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "Over the key's rate limit (`rate_limited`), or, for endpoints that start work, over the team's monthly token limit (`token_limit_reached`).",
+            "headers": {
+              "RateLimit-Limit": {
+                "description": "Requests this key may make in a minute.",
+                "schema": {
+                  "type": "integer"
+                }
+              },
+              "RateLimit-Remaining": {
+                "description": "Requests left in the current minute.",
+                "schema": {
+                  "type": "integer"
+                }
+              },
+              "RateLimit-Reset": {
+                "description": "Seconds until the current minute ends and the count starts over.",
+                "schema": {
+                  "type": "integer"
+                }
+              },
+              "Retry-After": {
+                "description": "With `rate_limited`: seconds to wait before trying again.",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            }
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "Something failed on CoderHelm's side. Safe to retry reads."
+          }
+        },
+        "security": [
+          {
+            "api_key": [
+              "webhooks"
+            ]
+          }
+        ],
+        "summary": "Reveal the signing secret",
+        "tags": [
+          "Webhooks"
+        ]
+      }
+    },
+    "/api/webhooks/endpoints/{endpoint_id}/secret/rotate": {
+      "post": {
+        "description": "Makes a new secret. For `overlap_hours` (24 unless set) every request carries two signatures, one per secret, so a receiver verifying with either keeps working while you update it. Then only the new secret signs.",
+        "operationId": "rotateWebhookSecret",
+        "parameters": [
+          {
+            "description": "The endpoint's id.",
+            "example": "ep_01jbendpt4a7b0c3d6e9f2g5h8",
+            "in": "path",
+            "name": "endpoint_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RotateBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RotatedSecret"
+                }
+              }
+            },
+            "description": "The new secret, shown once here.",
+            "headers": {
+              "RateLimit-Limit": {
+                "description": "Requests this key may make in a minute.",
+                "schema": {
+                  "type": "integer"
+                }
+              },
+              "RateLimit-Remaining": {
+                "description": "Requests left in the current minute.",
+                "schema": {
+                  "type": "integer"
+                }
+              },
+              "RateLimit-Reset": {
+                "description": "Seconds until the current minute ends and the count starts over.",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            }
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "`overlap_hours` is outside 0 to 168."
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "The key is missing, malformed, revoked or expired, or the person who made it left the team."
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "The key lacks the scope this endpoint needs (`missing_scope`)."
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "No such endpoint on this team."
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "Over the key's rate limit (`rate_limited`), or, for endpoints that start work, over the team's monthly token limit (`token_limit_reached`).",
+            "headers": {
+              "RateLimit-Limit": {
+                "description": "Requests this key may make in a minute.",
+                "schema": {
+                  "type": "integer"
+                }
+              },
+              "RateLimit-Remaining": {
+                "description": "Requests left in the current minute.",
+                "schema": {
+                  "type": "integer"
+                }
+              },
+              "RateLimit-Reset": {
+                "description": "Seconds until the current minute ends and the count starts over.",
+                "schema": {
+                  "type": "integer"
+                }
+              },
+              "Retry-After": {
+                "description": "With `rate_limited`: seconds to wait before trying again.",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            }
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "Something failed on CoderHelm's side. Safe to retry reads."
+          }
+        },
+        "security": [
+          {
+            "api_key": [
+              "webhooks"
+            ]
+          }
+        ],
+        "summary": "Rotate the signing secret",
+        "tags": [
+          "Webhooks"
+        ]
+      }
+    },
+    "/api/webhooks/endpoints/{endpoint_id}/test": {
+      "post": {
+        "description": "Sends one `webhook.test` event to the endpoint now, signed like every other event, and answers with the attempt. A test is tried once (no retries) and is sent even when the endpoint is off or doesn't subscribe to it.",
+        "operationId": "sendWebhookTest",
+        "parameters": [
+          {
+            "description": "The endpoint's id.",
+            "example": "ep_01jbendpt4a7b0c3d6e9f2g5h8",
+            "in": "path",
+            "name": "endpoint_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WebhookDelivery"
+                }
+              }
+            },
+            "description": "The delivery, delivered or not.",
+            "headers": {
+              "RateLimit-Limit": {
+                "description": "Requests this key may make in a minute.",
+                "schema": {
+                  "type": "integer"
+                }
+              },
+              "RateLimit-Remaining": {
+                "description": "Requests left in the current minute.",
+                "schema": {
+                  "type": "integer"
+                }
+              },
+              "RateLimit-Reset": {
+                "description": "Seconds until the current minute ends and the count starts over.",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            }
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "The key is missing, malformed, revoked or expired, or the person who made it left the team."
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "The key lacks the scope this endpoint needs (`missing_scope`)."
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "No such endpoint on this team."
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "Over the key's rate limit (`rate_limited`), or, for endpoints that start work, over the team's monthly token limit (`token_limit_reached`).",
+            "headers": {
+              "RateLimit-Limit": {
+                "description": "Requests this key may make in a minute.",
+                "schema": {
+                  "type": "integer"
+                }
+              },
+              "RateLimit-Remaining": {
+                "description": "Requests left in the current minute.",
+                "schema": {
+                  "type": "integer"
+                }
+              },
+              "RateLimit-Reset": {
+                "description": "Seconds until the current minute ends and the count starts over.",
+                "schema": {
+                  "type": "integer"
+                }
+              },
+              "Retry-After": {
+                "description": "With `rate_limited`: seconds to wait before trying again.",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            }
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "Something failed on CoderHelm's side. Safe to retry reads."
+          }
+        },
+        "security": [
+          {
+            "api_key": [
+              "webhooks"
+            ]
+          }
+        ],
+        "summary": "Send a test event",
+        "tags": [
+          "Webhooks"
+        ]
+      }
+    },
+    "/api/webhooks/event-types": {
+      "get": {
+        "description": "Every event type CoderHelm sends, with an example event. The `webhooks` section of this document has each one's schema.",
+        "operationId": "listWebhookEventTypes",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "example": {
+                  "api_version": "2026-10-26",
+                  "event_types": [
+                    {
+                      "description": "…",
+                      "example": {},
+                      "group": "Runs",
+                      "summary": "A run finished",
+                      "type": "run.completed"
+                    }
+                  ]
+                },
+                "schema": {
+                  "type": "object"
+                }
+              }
+            },
+            "description": "The catalog.",
+            "headers": {
+              "RateLimit-Limit": {
+                "description": "Requests this key may make in a minute.",
+                "schema": {
+                  "type": "integer"
+                }
+              },
+              "RateLimit-Remaining": {
+                "description": "Requests left in the current minute.",
+                "schema": {
+                  "type": "integer"
+                }
+              },
+              "RateLimit-Reset": {
+                "description": "Seconds until the current minute ends and the count starts over.",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            }
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "The key is missing, malformed, revoked or expired, or the person who made it left the team."
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "The key lacks the scope this endpoint needs (`missing_scope`)."
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "Over the key's rate limit (`rate_limited`), or, for endpoints that start work, over the team's monthly token limit (`token_limit_reached`).",
+            "headers": {
+              "RateLimit-Limit": {
+                "description": "Requests this key may make in a minute.",
+                "schema": {
+                  "type": "integer"
+                }
+              },
+              "RateLimit-Remaining": {
+                "description": "Requests left in the current minute.",
+                "schema": {
+                  "type": "integer"
+                }
+              },
+              "RateLimit-Reset": {
+                "description": "Seconds until the current minute ends and the count starts over.",
+                "schema": {
+                  "type": "integer"
+                }
+              },
+              "Retry-After": {
+                "description": "With `rate_limited`: seconds to wait before trying again.",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            }
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "Something failed on CoderHelm's side. Safe to retry reads."
+          }
+        },
+        "security": [
+          {
+            "api_key": [
+              "webhooks"
+            ]
+          }
+        ],
+        "summary": "List event types",
+        "tags": [
+          "Webhooks"
+        ]
+      }
+    },
     "/webhooks/alerts/sns": {
       "post": {
         "description": "Subscribe CoderHelm to an SNS topic with an HTTPS subscription to this address and add the topic under Alert routes in the dashboard. Every message's SNS signature is checked (signature versions 1 and 2) and the signing certificate must come from SNS. The subscription is confirmed automatically once the topic has an enabled route; messages from topics without one are accepted and ignored. A message that matches one of the route's rules becomes a run that opens a pull request.",
@@ -4669,7 +6991,7 @@
         ],
         "summary": "AWS SNS alerts",
         "tags": [
-          "Webhooks"
+          "Incoming webhooks"
         ]
       }
     },
@@ -4867,7 +7189,7 @@
         ],
         "summary": "GitHub App events",
         "tags": [
-          "Webhooks"
+          "Incoming webhooks"
         ]
       }
     },
@@ -4916,7 +7238,7 @@
         ],
         "summary": "Jira webhook",
         "tags": [
-          "Webhooks"
+          "Incoming webhooks"
         ]
       }
     },
@@ -4967,7 +7289,7 @@
         ],
         "summary": "Knowledge source change",
         "tags": [
-          "Webhooks"
+          "Incoming webhooks"
         ]
       }
     },
@@ -5042,7 +7364,7 @@
         ],
         "summary": "Events from CoderHelm's relay",
         "tags": [
-          "Webhooks"
+          "Incoming webhooks"
         ]
       }
     }
@@ -5090,9 +7412,2664 @@
       "x-displayName": "CI"
     },
     {
-      "description": "Events CoderHelm receives from GitHub, Jira, AWS SNS, Sanity and Notion. Each is verified before anything happens.",
+      "description": "Webhook endpoints: where CoderHelm sends your team's events (runs, pull requests, reviews, CI fixes, alerts, log findings, releases, plans). Each request is signed the Standard Webhooks way. The `webhooks` section of this document has every event's schema.",
       "name": "Webhooks",
       "x-displayName": "Webhooks"
+    },
+    {
+      "description": "Events CoderHelm receives from GitHub, Jira, AWS SNS, Sanity and Notion. Each is verified before anything happens.",
+      "name": "Incoming webhooks",
+      "x-displayName": "Incoming webhooks"
     }
-  ]
+  ],
+  "webhooks": {
+    "alert.received": {
+      "post": {
+        "description": "An alert came in on one of the team's alert addresses, and CoderHelm decided what to do with it. Sent as `POST` to each endpoint subscribed to `alert.received` (or to every event).",
+        "operationId": "event.alert.received",
+        "parameters": [
+          {
+            "description": "The event id (`evt_…`). The same on every retry: use it to skip an event you already handled.",
+            "example": "evt_01JBEVNT8M1N4P7Q0R3S6T9V2W",
+            "in": "header",
+            "name": "webhook-id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Unix seconds when this attempt was sent. Refuse a request more than 5 minutes off.",
+            "example": "1792420307",
+            "in": "header",
+            "name": "webhook-timestamp",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Space-separated `v1,<base64>` signatures: HMAC-SHA256 of `<webhook-id>.<webhook-timestamp>.<raw body>` keyed with the endpoint's secret (the bytes after `whsec_`, base64-decoded). Two while a rotated secret still signs; accept the request when any matches.",
+            "example": "v1,K5oZfzN95Z9UVu1EsfQmfVNQhnkZ2pj9o9NDN/H/pI4=",
+            "in": "header",
+            "name": "webhook-signature",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "examples": {
+                "event": {
+                  "value": {
+                    "api_version": "2026-10-26",
+                    "created_at": "2026-10-26T14:31:47.512Z",
+                    "data": {
+                      "alert_id": "01JBALERT3K8P2N6Q9R1S4T7V0",
+                      "kind": "cloudwatch_alarm",
+                      "outcome": "run_started",
+                      "received_at": "2026-10-26T09:14:03.000Z",
+                      "repo": "example-org/api",
+                      "severity": "alarm",
+                      "ticket_id": "ALERT-3f9c2a71",
+                      "title": "ALARM: api-5xx-rate"
+                    },
+                    "id": "evt_01JBEVNT8M1N4P7Q0R3S6T9V2W",
+                    "team_id": "TEAM#7c1f0e2a",
+                    "type": "alert.received"
+                  }
+                }
+              },
+              "schema": {
+                "properties": {
+                  "api_version": {
+                    "const": "2026-10-26",
+                    "description": "The version of this event's shape.",
+                    "type": "string"
+                  },
+                  "created_at": {
+                    "description": "When it happened.",
+                    "format": "date-time",
+                    "type": "string"
+                  },
+                  "data": {
+                    "properties": {
+                      "alert_id": {
+                        "description": "The alert's id in CoderHelm.",
+                        "type": "string"
+                      },
+                      "kind": {
+                        "description": "What sent it, e.g. `cloudwatch_alarm`, `datadog`, `sentry`, `generic`.",
+                        "type": "string"
+                      },
+                      "outcome": {
+                        "description": "What CoderHelm did with it: `run_started` (a fix run was queued), `notified`, `duplicate`, `in_flight` (a run for it is already working), `recovered`, `no_open_alert`, `not_alarm`, `no_match`, `route_paused`, `budget`, `alert_budget`, `daily_cap`, `misconfigured` or `error`. More may be added.",
+                        "type": "string"
+                      },
+                      "received_at": {
+                        "description": "When CoderHelm received it.",
+                        "format": "date-time",
+                        "type": "string"
+                      },
+                      "repo": {
+                        "description": "The repository the alert is routed to, if any.",
+                        "type": [
+                          "string",
+                          "null"
+                        ]
+                      },
+                      "severity": {
+                        "description": "How it reads at a glance.",
+                        "enum": [
+                          "alarm",
+                          "warning",
+                          "resolved",
+                          "info"
+                        ],
+                        "type": "string"
+                      },
+                      "ticket_id": {
+                        "description": "The alert's ticket: the same alert repeating has the same one, and a run started for it carries it as its `ticket_id`.",
+                        "type": "string"
+                      },
+                      "title": {
+                        "description": "The alert's title.",
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "alert_id",
+                      "kind",
+                      "title",
+                      "severity",
+                      "outcome",
+                      "repo",
+                      "ticket_id",
+                      "received_at"
+                    ],
+                    "type": "object"
+                  },
+                  "id": {
+                    "description": "The event's id (`evt_` and a ULID). The same on every retry and every endpoint: use it to ignore an event you already handled. Also sent as the `webhook-id` header.",
+                    "type": "string"
+                  },
+                  "team_id": {
+                    "description": "The CoderHelm team it belongs to (as `GET /api/me` returns it).",
+                    "type": "string"
+                  },
+                  "type": {
+                    "const": "alert.received",
+                    "description": "The event type.",
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "id",
+                  "type",
+                  "created_at",
+                  "team_id",
+                  "api_version",
+                  "data"
+                ],
+                "type": "object"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "2XX": {
+            "description": "Received. Answer within 10 seconds; do the work afterwards."
+          },
+          "410": {
+            "description": "Gone: the delivery is final (not retried). Any 4xx other than 408 and 429 is final."
+          },
+          "5XX": {
+            "description": "Retried with backoff for about a day, as are timeouts, 408 and 429."
+          }
+        },
+        "security": [],
+        "summary": "An alert arrived",
+        "tags": [
+          "Events: Alerts"
+        ]
+      }
+    },
+    "ci_fix.completed": {
+      "post": {
+        "description": "The CI fix finished. `outcome` says whether a fix was pushed. Sent as `POST` to each endpoint subscribed to `ci_fix.completed` (or to every event).",
+        "operationId": "event.ci_fix.completed",
+        "parameters": [
+          {
+            "description": "The event id (`evt_…`). The same on every retry: use it to skip an event you already handled.",
+            "example": "evt_01JBEVNT8M1N4P7Q0R3S6T9V2W",
+            "in": "header",
+            "name": "webhook-id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Unix seconds when this attempt was sent. Refuse a request more than 5 minutes off.",
+            "example": "1792420307",
+            "in": "header",
+            "name": "webhook-timestamp",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Space-separated `v1,<base64>` signatures: HMAC-SHA256 of `<webhook-id>.<webhook-timestamp>.<raw body>` keyed with the endpoint's secret (the bytes after `whsec_`, base64-decoded). Two while a rotated secret still signs; accept the request when any matches.",
+            "example": "v1,K5oZfzN95Z9UVu1EsfQmfVNQhnkZ2pj9o9NDN/H/pI4=",
+            "in": "header",
+            "name": "webhook-signature",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "examples": {
+                "event": {
+                  "value": {
+                    "api_version": "2026-10-26",
+                    "created_at": "2026-10-26T14:31:47.512Z",
+                    "data": {
+                      "attempt": 1,
+                      "branch": "coderhelm/eng-142-rate-limit-export",
+                      "files_changed": 2,
+                      "outcome": "pushed",
+                      "pr_number": 318,
+                      "repo": "example-org/api",
+                      "run_id": "01JBRUN7Q2X9M3V6T8W1K4HZ5C"
+                    },
+                    "id": "evt_01JBEVNT8M1N4P7Q0R3S6T9V2W",
+                    "team_id": "TEAM#7c1f0e2a",
+                    "type": "ci_fix.completed"
+                  }
+                }
+              },
+              "schema": {
+                "properties": {
+                  "api_version": {
+                    "const": "2026-10-26",
+                    "description": "The version of this event's shape.",
+                    "type": "string"
+                  },
+                  "created_at": {
+                    "description": "When it happened.",
+                    "format": "date-time",
+                    "type": "string"
+                  },
+                  "data": {
+                    "properties": {
+                      "attempt": {
+                        "description": "Which fix this was, from 1.",
+                        "type": "integer"
+                      },
+                      "branch": {
+                        "description": "The branch.",
+                        "type": "string"
+                      },
+                      "files_changed": {
+                        "description": "Files the fix changed.",
+                        "type": "integer"
+                      },
+                      "outcome": {
+                        "description": "`pushed`: a fix was pushed and the checks run again. `no_changes`: nothing to change, so the pull request goes to people. `failed`: the fix could not be made.",
+                        "enum": [
+                          "pushed",
+                          "no_changes",
+                          "failed"
+                        ],
+                        "type": "string"
+                      },
+                      "pr_number": {
+                        "description": "The pull request.",
+                        "type": "integer"
+                      },
+                      "repo": {
+                        "description": "`owner/name`.",
+                        "type": "string"
+                      },
+                      "run_id": {
+                        "description": "The run.",
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "run_id",
+                      "repo",
+                      "pr_number",
+                      "branch",
+                      "attempt",
+                      "outcome",
+                      "files_changed"
+                    ],
+                    "type": "object"
+                  },
+                  "id": {
+                    "description": "The event's id (`evt_` and a ULID). The same on every retry and every endpoint: use it to ignore an event you already handled. Also sent as the `webhook-id` header.",
+                    "type": "string"
+                  },
+                  "team_id": {
+                    "description": "The CoderHelm team it belongs to (as `GET /api/me` returns it).",
+                    "type": "string"
+                  },
+                  "type": {
+                    "const": "ci_fix.completed",
+                    "description": "The event type.",
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "id",
+                  "type",
+                  "created_at",
+                  "team_id",
+                  "api_version",
+                  "data"
+                ],
+                "type": "object"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "2XX": {
+            "description": "Received. Answer within 10 seconds; do the work afterwards."
+          },
+          "410": {
+            "description": "Gone: the delivery is final (not retried). Any 4xx other than 408 and 429 is final."
+          },
+          "5XX": {
+            "description": "Retried with backoff for about a day, as are timeouts, 408 and 429."
+          }
+        },
+        "security": [],
+        "summary": "A CI fix finished",
+        "tags": [
+          "Events: CI fixes"
+        ]
+      }
+    },
+    "ci_fix.started": {
+      "post": {
+        "description": "A pull request CoderHelm opened failed its checks, and CoderHelm started fixing it. Sent as `POST` to each endpoint subscribed to `ci_fix.started` (or to every event).",
+        "operationId": "event.ci_fix.started",
+        "parameters": [
+          {
+            "description": "The event id (`evt_…`). The same on every retry: use it to skip an event you already handled.",
+            "example": "evt_01JBEVNT8M1N4P7Q0R3S6T9V2W",
+            "in": "header",
+            "name": "webhook-id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Unix seconds when this attempt was sent. Refuse a request more than 5 minutes off.",
+            "example": "1792420307",
+            "in": "header",
+            "name": "webhook-timestamp",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Space-separated `v1,<base64>` signatures: HMAC-SHA256 of `<webhook-id>.<webhook-timestamp>.<raw body>` keyed with the endpoint's secret (the bytes after `whsec_`, base64-decoded). Two while a rotated secret still signs; accept the request when any matches.",
+            "example": "v1,K5oZfzN95Z9UVu1EsfQmfVNQhnkZ2pj9o9NDN/H/pI4=",
+            "in": "header",
+            "name": "webhook-signature",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "examples": {
+                "event": {
+                  "value": {
+                    "api_version": "2026-10-26",
+                    "created_at": "2026-10-26T14:31:47.512Z",
+                    "data": {
+                      "attempt": 1,
+                      "branch": "coderhelm/eng-142-rate-limit-export",
+                      "failing_checks": [
+                        "test (20.x)",
+                        "lint"
+                      ],
+                      "pr_number": 318,
+                      "repo": "example-org/api",
+                      "run_id": "01JBRUN7Q2X9M3V6T8W1K4HZ5C"
+                    },
+                    "id": "evt_01JBEVNT8M1N4P7Q0R3S6T9V2W",
+                    "team_id": "TEAM#7c1f0e2a",
+                    "type": "ci_fix.started"
+                  }
+                }
+              },
+              "schema": {
+                "properties": {
+                  "api_version": {
+                    "const": "2026-10-26",
+                    "description": "The version of this event's shape.",
+                    "type": "string"
+                  },
+                  "created_at": {
+                    "description": "When it happened.",
+                    "format": "date-time",
+                    "type": "string"
+                  },
+                  "data": {
+                    "properties": {
+                      "attempt": {
+                        "description": "Which fix this is for the run, from 1.",
+                        "type": "integer"
+                      },
+                      "branch": {
+                        "description": "The branch the fix is pushed to.",
+                        "type": "string"
+                      },
+                      "failing_checks": {
+                        "description": "The checks that failed.",
+                        "items": {
+                          "type": "string"
+                        },
+                        "type": "array"
+                      },
+                      "pr_number": {
+                        "description": "The pull request.",
+                        "type": "integer"
+                      },
+                      "repo": {
+                        "description": "`owner/name`.",
+                        "type": "string"
+                      },
+                      "run_id": {
+                        "description": "The run whose pull request failed its checks.",
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "run_id",
+                      "repo",
+                      "pr_number",
+                      "branch",
+                      "attempt",
+                      "failing_checks"
+                    ],
+                    "type": "object"
+                  },
+                  "id": {
+                    "description": "The event's id (`evt_` and a ULID). The same on every retry and every endpoint: use it to ignore an event you already handled. Also sent as the `webhook-id` header.",
+                    "type": "string"
+                  },
+                  "team_id": {
+                    "description": "The CoderHelm team it belongs to (as `GET /api/me` returns it).",
+                    "type": "string"
+                  },
+                  "type": {
+                    "const": "ci_fix.started",
+                    "description": "The event type.",
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "id",
+                  "type",
+                  "created_at",
+                  "team_id",
+                  "api_version",
+                  "data"
+                ],
+                "type": "object"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "2XX": {
+            "description": "Received. Answer within 10 seconds; do the work afterwards."
+          },
+          "410": {
+            "description": "Gone: the delivery is final (not retried). Any 4xx other than 408 and 429 is final."
+          },
+          "5XX": {
+            "description": "Retried with backoff for about a day, as are timeouts, 408 and 429."
+          }
+        },
+        "security": [],
+        "summary": "A CI fix started",
+        "tags": [
+          "Events: CI fixes"
+        ]
+      }
+    },
+    "log_finding.created": {
+      "post": {
+        "description": "The log analysis found a new problem in a connected AWS account's logs. Sent as `POST` to each endpoint subscribed to `log_finding.created` (or to every event).",
+        "operationId": "event.log_finding.created",
+        "parameters": [
+          {
+            "description": "The event id (`evt_…`). The same on every retry: use it to skip an event you already handled.",
+            "example": "evt_01JBEVNT8M1N4P7Q0R3S6T9V2W",
+            "in": "header",
+            "name": "webhook-id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Unix seconds when this attempt was sent. Refuse a request more than 5 minutes off.",
+            "example": "1792420307",
+            "in": "header",
+            "name": "webhook-timestamp",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Space-separated `v1,<base64>` signatures: HMAC-SHA256 of `<webhook-id>.<webhook-timestamp>.<raw body>` keyed with the endpoint's secret (the bytes after `whsec_`, base64-decoded). Two while a rotated secret still signs; accept the request when any matches.",
+            "example": "v1,K5oZfzN95Z9UVu1EsfQmfVNQhnkZ2pj9o9NDN/H/pI4=",
+            "in": "header",
+            "name": "webhook-signature",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "examples": {
+                "event": {
+                  "value": {
+                    "api_version": "2026-10-26",
+                    "created_at": "2026-10-26T14:31:47.512Z",
+                    "data": {
+                      "account_id": "123456789012",
+                      "finding_id": "01JBFIND6W3X8Y1Z4A7B0C2D5E",
+                      "log_group": "/aws/lambda/invoice-worker",
+                      "severity": "critical",
+                      "title": "Unhandled TimeoutError in the invoice worker",
+                      "url": "https://app.coderhelm.com/logs/?finding=01JBFIND6W3X8Y1Z4A7B0C2D5E"
+                    },
+                    "id": "evt_01JBEVNT8M1N4P7Q0R3S6T9V2W",
+                    "team_id": "TEAM#7c1f0e2a",
+                    "type": "log_finding.created"
+                  }
+                }
+              },
+              "schema": {
+                "properties": {
+                  "api_version": {
+                    "const": "2026-10-26",
+                    "description": "The version of this event's shape.",
+                    "type": "string"
+                  },
+                  "created_at": {
+                    "description": "When it happened.",
+                    "format": "date-time",
+                    "type": "string"
+                  },
+                  "data": {
+                    "properties": {
+                      "account_id": {
+                        "description": "The AWS account whose logs it was found in.",
+                        "type": "string"
+                      },
+                      "finding_id": {
+                        "description": "The finding's id.",
+                        "type": "string"
+                      },
+                      "log_group": {
+                        "description": "The log group the matching lines are in.",
+                        "type": [
+                          "string",
+                          "null"
+                        ]
+                      },
+                      "severity": {
+                        "description": "How bad it is.",
+                        "enum": [
+                          "critical",
+                          "warning",
+                          "info"
+                        ],
+                        "type": "string"
+                      },
+                      "title": {
+                        "description": "What is wrong, in a line.",
+                        "type": "string"
+                      },
+                      "url": {
+                        "description": "The finding on the Logs page.",
+                        "format": "uri",
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "finding_id",
+                      "account_id",
+                      "title",
+                      "severity",
+                      "log_group",
+                      "url"
+                    ],
+                    "type": "object"
+                  },
+                  "id": {
+                    "description": "The event's id (`evt_` and a ULID). The same on every retry and every endpoint: use it to ignore an event you already handled. Also sent as the `webhook-id` header.",
+                    "type": "string"
+                  },
+                  "team_id": {
+                    "description": "The CoderHelm team it belongs to (as `GET /api/me` returns it).",
+                    "type": "string"
+                  },
+                  "type": {
+                    "const": "log_finding.created",
+                    "description": "The event type.",
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "id",
+                  "type",
+                  "created_at",
+                  "team_id",
+                  "api_version",
+                  "data"
+                ],
+                "type": "object"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "2XX": {
+            "description": "Received. Answer within 10 seconds; do the work afterwards."
+          },
+          "410": {
+            "description": "Gone: the delivery is final (not retried). Any 4xx other than 408 and 429 is final."
+          },
+          "5XX": {
+            "description": "Retried with backoff for about a day, as are timeouts, 408 and 429."
+          }
+        },
+        "security": [],
+        "summary": "A new log finding",
+        "tags": [
+          "Events: Logs"
+        ]
+      }
+    },
+    "log_finding.resolved": {
+      "post": {
+        "description": "A complete log analysis no longer saw a finding that was open. Sent as `POST` to each endpoint subscribed to `log_finding.resolved` (or to every event).",
+        "operationId": "event.log_finding.resolved",
+        "parameters": [
+          {
+            "description": "The event id (`evt_…`). The same on every retry: use it to skip an event you already handled.",
+            "example": "evt_01JBEVNT8M1N4P7Q0R3S6T9V2W",
+            "in": "header",
+            "name": "webhook-id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Unix seconds when this attempt was sent. Refuse a request more than 5 minutes off.",
+            "example": "1792420307",
+            "in": "header",
+            "name": "webhook-timestamp",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Space-separated `v1,<base64>` signatures: HMAC-SHA256 of `<webhook-id>.<webhook-timestamp>.<raw body>` keyed with the endpoint's secret (the bytes after `whsec_`, base64-decoded). Two while a rotated secret still signs; accept the request when any matches.",
+            "example": "v1,K5oZfzN95Z9UVu1EsfQmfVNQhnkZ2pj9o9NDN/H/pI4=",
+            "in": "header",
+            "name": "webhook-signature",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "examples": {
+                "event": {
+                  "value": {
+                    "api_version": "2026-10-26",
+                    "created_at": "2026-10-26T14:31:47.512Z",
+                    "data": {
+                      "account_id": "123456789012",
+                      "finding_id": "01JBFIND6W3X8Y1Z4A7B0C2D5E",
+                      "resolved_at": "2026-10-27T06:00:12.000Z",
+                      "severity": "critical",
+                      "title": "Unhandled TimeoutError in the invoice worker",
+                      "url": "https://app.coderhelm.com/logs/?finding=01JBFIND6W3X8Y1Z4A7B0C2D5E"
+                    },
+                    "id": "evt_01JBEVNT8M1N4P7Q0R3S6T9V2W",
+                    "team_id": "TEAM#7c1f0e2a",
+                    "type": "log_finding.resolved"
+                  }
+                }
+              },
+              "schema": {
+                "properties": {
+                  "api_version": {
+                    "const": "2026-10-26",
+                    "description": "The version of this event's shape.",
+                    "type": "string"
+                  },
+                  "created_at": {
+                    "description": "When it happened.",
+                    "format": "date-time",
+                    "type": "string"
+                  },
+                  "data": {
+                    "properties": {
+                      "account_id": {
+                        "description": "The AWS account.",
+                        "type": "string"
+                      },
+                      "finding_id": {
+                        "description": "The finding's id.",
+                        "type": "string"
+                      },
+                      "resolved_at": {
+                        "description": "When a complete analysis no longer saw it.",
+                        "format": "date-time",
+                        "type": "string"
+                      },
+                      "severity": {
+                        "description": "How bad it was.",
+                        "enum": [
+                          "critical",
+                          "warning",
+                          "info"
+                        ],
+                        "type": "string"
+                      },
+                      "title": {
+                        "description": "What was wrong.",
+                        "type": "string"
+                      },
+                      "url": {
+                        "description": "The finding on the Logs page.",
+                        "format": "uri",
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "finding_id",
+                      "account_id",
+                      "title",
+                      "severity",
+                      "resolved_at",
+                      "url"
+                    ],
+                    "type": "object"
+                  },
+                  "id": {
+                    "description": "The event's id (`evt_` and a ULID). The same on every retry and every endpoint: use it to ignore an event you already handled. Also sent as the `webhook-id` header.",
+                    "type": "string"
+                  },
+                  "team_id": {
+                    "description": "The CoderHelm team it belongs to (as `GET /api/me` returns it).",
+                    "type": "string"
+                  },
+                  "type": {
+                    "const": "log_finding.resolved",
+                    "description": "The event type.",
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "id",
+                  "type",
+                  "created_at",
+                  "team_id",
+                  "api_version",
+                  "data"
+                ],
+                "type": "object"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "2XX": {
+            "description": "Received. Answer within 10 seconds; do the work afterwards."
+          },
+          "410": {
+            "description": "Gone: the delivery is final (not retried). Any 4xx other than 408 and 429 is final."
+          },
+          "5XX": {
+            "description": "Retried with backoff for about a day, as are timeouts, 408 and 429."
+          }
+        },
+        "security": [],
+        "summary": "A log finding went away",
+        "tags": [
+          "Events: Logs"
+        ]
+      }
+    },
+    "plan.approved": {
+      "post": {
+        "description": "Someone approved a plan and started its tasks (Approve and run in the dashboard, or the API). Sent as `POST` to each endpoint subscribed to `plan.approved` (or to every event).",
+        "operationId": "event.plan.approved",
+        "parameters": [
+          {
+            "description": "The event id (`evt_…`). The same on every retry: use it to skip an event you already handled.",
+            "example": "evt_01JBEVNT8M1N4P7Q0R3S6T9V2W",
+            "in": "header",
+            "name": "webhook-id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Unix seconds when this attempt was sent. Refuse a request more than 5 minutes off.",
+            "example": "1792420307",
+            "in": "header",
+            "name": "webhook-timestamp",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Space-separated `v1,<base64>` signatures: HMAC-SHA256 of `<webhook-id>.<webhook-timestamp>.<raw body>` keyed with the endpoint's secret (the bytes after `whsec_`, base64-decoded). Two while a rotated secret still signs; accept the request when any matches.",
+            "example": "v1,K5oZfzN95Z9UVu1EsfQmfVNQhnkZ2pj9o9NDN/H/pI4=",
+            "in": "header",
+            "name": "webhook-signature",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "examples": {
+                "event": {
+                  "value": {
+                    "api_version": "2026-10-26",
+                    "created_at": "2026-10-26T14:31:47.512Z",
+                    "data": {
+                      "approved_by": "lead@example.com",
+                      "plan_id": "01JBPLAN2F5G8H1J4K7L0M3N6P",
+                      "task_count": 4,
+                      "title": "Move exports to the background queue",
+                      "url": "https://app.coderhelm.com/plans/detail/?id=01JBPLAN2F5G8H1J4K7L0M3N6P"
+                    },
+                    "id": "evt_01JBEVNT8M1N4P7Q0R3S6T9V2W",
+                    "team_id": "TEAM#7c1f0e2a",
+                    "type": "plan.approved"
+                  }
+                }
+              },
+              "schema": {
+                "properties": {
+                  "api_version": {
+                    "const": "2026-10-26",
+                    "description": "The version of this event's shape.",
+                    "type": "string"
+                  },
+                  "created_at": {
+                    "description": "When it happened.",
+                    "format": "date-time",
+                    "type": "string"
+                  },
+                  "data": {
+                    "properties": {
+                      "approved_by": {
+                        "description": "Who approved it: their GitHub login or email, or `api_key:<id>` for a request made with an API key.",
+                        "type": "string"
+                      },
+                      "plan_id": {
+                        "description": "The plan's id. `GET /api/plans/{plan_id}` returns it.",
+                        "type": "string"
+                      },
+                      "task_count": {
+                        "description": "Tasks approved to run.",
+                        "type": "integer"
+                      },
+                      "title": {
+                        "description": "The plan's title.",
+                        "type": "string"
+                      },
+                      "url": {
+                        "description": "The plan in the dashboard.",
+                        "format": "uri",
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "plan_id",
+                      "title",
+                      "task_count",
+                      "approved_by",
+                      "url"
+                    ],
+                    "type": "object"
+                  },
+                  "id": {
+                    "description": "The event's id (`evt_` and a ULID). The same on every retry and every endpoint: use it to ignore an event you already handled. Also sent as the `webhook-id` header.",
+                    "type": "string"
+                  },
+                  "team_id": {
+                    "description": "The CoderHelm team it belongs to (as `GET /api/me` returns it).",
+                    "type": "string"
+                  },
+                  "type": {
+                    "const": "plan.approved",
+                    "description": "The event type.",
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "id",
+                  "type",
+                  "created_at",
+                  "team_id",
+                  "api_version",
+                  "data"
+                ],
+                "type": "object"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "2XX": {
+            "description": "Received. Answer within 10 seconds; do the work afterwards."
+          },
+          "410": {
+            "description": "Gone: the delivery is final (not retried). Any 4xx other than 408 and 429 is final."
+          },
+          "5XX": {
+            "description": "Retried with backoff for about a day, as are timeouts, 408 and 429."
+          }
+        },
+        "security": [],
+        "summary": "A plan was approved",
+        "tags": [
+          "Events: Plans"
+        ]
+      }
+    },
+    "plugin.run.completed": {
+      "post": {
+        "description": "A plugin run finished or failed. Sent only to teams with plugins turned on. Sent as `POST` to each endpoint subscribed to `plugin.run.completed` (or to every event).",
+        "operationId": "event.plugin.run.completed",
+        "parameters": [
+          {
+            "description": "The event id (`evt_…`). The same on every retry: use it to skip an event you already handled.",
+            "example": "evt_01JBEVNT8M1N4P7Q0R3S6T9V2W",
+            "in": "header",
+            "name": "webhook-id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Unix seconds when this attempt was sent. Refuse a request more than 5 minutes off.",
+            "example": "1792420307",
+            "in": "header",
+            "name": "webhook-timestamp",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Space-separated `v1,<base64>` signatures: HMAC-SHA256 of `<webhook-id>.<webhook-timestamp>.<raw body>` keyed with the endpoint's secret (the bytes after `whsec_`, base64-decoded). Two while a rotated secret still signs; accept the request when any matches.",
+            "example": "v1,K5oZfzN95Z9UVu1EsfQmfVNQhnkZ2pj9o9NDN/H/pI4=",
+            "in": "header",
+            "name": "webhook-signature",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "examples": {
+                "event": {
+                  "value": {
+                    "api_version": "2026-10-26",
+                    "created_at": "2026-10-26T14:31:47.512Z",
+                    "data": {
+                      "error": null,
+                      "plugin_id": "release-announcer",
+                      "run_id": "01JBPRUN9Q2R5S8T1U4V7W0X3Y",
+                      "status": "completed",
+                      "trigger": "schedule"
+                    },
+                    "id": "evt_01JBEVNT8M1N4P7Q0R3S6T9V2W",
+                    "team_id": "TEAM#7c1f0e2a",
+                    "type": "plugin.run.completed"
+                  }
+                }
+              },
+              "schema": {
+                "properties": {
+                  "api_version": {
+                    "const": "2026-10-26",
+                    "description": "The version of this event's shape.",
+                    "type": "string"
+                  },
+                  "created_at": {
+                    "description": "When it happened.",
+                    "format": "date-time",
+                    "type": "string"
+                  },
+                  "data": {
+                    "properties": {
+                      "error": {
+                        "description": "Why it failed.",
+                        "type": [
+                          "string",
+                          "null"
+                        ]
+                      },
+                      "plugin_id": {
+                        "description": "The plugin.",
+                        "type": "string"
+                      },
+                      "run_id": {
+                        "description": "The plugin run's id.",
+                        "type": "string"
+                      },
+                      "status": {
+                        "description": "How it ended.",
+                        "enum": [
+                          "completed",
+                          "failed"
+                        ],
+                        "type": "string"
+                      },
+                      "trigger": {
+                        "description": "What started it: `manual`, `schedule`, `event` or `api`.",
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "run_id",
+                      "plugin_id",
+                      "status",
+                      "trigger",
+                      "error"
+                    ],
+                    "type": "object"
+                  },
+                  "id": {
+                    "description": "The event's id (`evt_` and a ULID). The same on every retry and every endpoint: use it to ignore an event you already handled. Also sent as the `webhook-id` header.",
+                    "type": "string"
+                  },
+                  "team_id": {
+                    "description": "The CoderHelm team it belongs to (as `GET /api/me` returns it).",
+                    "type": "string"
+                  },
+                  "type": {
+                    "const": "plugin.run.completed",
+                    "description": "The event type.",
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "id",
+                  "type",
+                  "created_at",
+                  "team_id",
+                  "api_version",
+                  "data"
+                ],
+                "type": "object"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "2XX": {
+            "description": "Received. Answer within 10 seconds; do the work afterwards."
+          },
+          "410": {
+            "description": "Gone: the delivery is final (not retried). Any 4xx other than 408 and 429 is final."
+          },
+          "5XX": {
+            "description": "Retried with backoff for about a day, as are timeouts, 408 and 429."
+          }
+        },
+        "security": [],
+        "summary": "A plugin run finished",
+        "tags": [
+          "Events: Plugins"
+        ]
+      }
+    },
+    "pull_request.opened": {
+      "post": {
+        "description": "A run opened a pull request. Pull requests people open are not sent. Sent as `POST` to each endpoint subscribed to `pull_request.opened` (or to every event).",
+        "operationId": "event.pull_request.opened",
+        "parameters": [
+          {
+            "description": "The event id (`evt_…`). The same on every retry: use it to skip an event you already handled.",
+            "example": "evt_01JBEVNT8M1N4P7Q0R3S6T9V2W",
+            "in": "header",
+            "name": "webhook-id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Unix seconds when this attempt was sent. Refuse a request more than 5 minutes off.",
+            "example": "1792420307",
+            "in": "header",
+            "name": "webhook-timestamp",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Space-separated `v1,<base64>` signatures: HMAC-SHA256 of `<webhook-id>.<webhook-timestamp>.<raw body>` keyed with the endpoint's secret (the bytes after `whsec_`, base64-decoded). Two while a rotated secret still signs; accept the request when any matches.",
+            "example": "v1,K5oZfzN95Z9UVu1EsfQmfVNQhnkZ2pj9o9NDN/H/pI4=",
+            "in": "header",
+            "name": "webhook-signature",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "examples": {
+                "event": {
+                  "value": {
+                    "api_version": "2026-10-26",
+                    "created_at": "2026-10-26T14:31:47.512Z",
+                    "data": {
+                      "base_branch": "main",
+                      "branch": "coderhelm/eng-142-rate-limit-export",
+                      "draft": true,
+                      "number": 318,
+                      "repo": "example-org/api",
+                      "run_id": "01JBRUN7Q2X9M3V6T8W1K4HZ5C",
+                      "title": "Add rate limiting to the export endpoint",
+                      "url": "https://github.com/example-org/api/pull/318"
+                    },
+                    "id": "evt_01JBEVNT8M1N4P7Q0R3S6T9V2W",
+                    "team_id": "TEAM#7c1f0e2a",
+                    "type": "pull_request.opened"
+                  }
+                }
+              },
+              "schema": {
+                "properties": {
+                  "api_version": {
+                    "const": "2026-10-26",
+                    "description": "The version of this event's shape.",
+                    "type": "string"
+                  },
+                  "created_at": {
+                    "description": "When it happened.",
+                    "format": "date-time",
+                    "type": "string"
+                  },
+                  "data": {
+                    "properties": {
+                      "base_branch": {
+                        "description": "The branch it merges into, when the work named one (otherwise the repository's default branch).",
+                        "type": [
+                          "string",
+                          "null"
+                        ]
+                      },
+                      "branch": {
+                        "description": "The head branch.",
+                        "type": "string"
+                      },
+                      "draft": {
+                        "description": "Opened as a draft (CoderHelm marks it ready when its checks pass).",
+                        "type": "boolean"
+                      },
+                      "number": {
+                        "description": "The pull request number.",
+                        "type": "integer"
+                      },
+                      "repo": {
+                        "description": "`owner/name`.",
+                        "type": "string"
+                      },
+                      "run_id": {
+                        "description": "The run that opened it.",
+                        "type": "string"
+                      },
+                      "title": {
+                        "description": "The run's title (the ticket or task the pull request is for).",
+                        "type": "string"
+                      },
+                      "url": {
+                        "description": "The pull request on GitHub.",
+                        "format": "uri",
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "run_id",
+                      "repo",
+                      "number",
+                      "url",
+                      "title",
+                      "branch",
+                      "base_branch",
+                      "draft"
+                    ],
+                    "type": "object"
+                  },
+                  "id": {
+                    "description": "The event's id (`evt_` and a ULID). The same on every retry and every endpoint: use it to ignore an event you already handled. Also sent as the `webhook-id` header.",
+                    "type": "string"
+                  },
+                  "team_id": {
+                    "description": "The CoderHelm team it belongs to (as `GET /api/me` returns it).",
+                    "type": "string"
+                  },
+                  "type": {
+                    "const": "pull_request.opened",
+                    "description": "The event type.",
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "id",
+                  "type",
+                  "created_at",
+                  "team_id",
+                  "api_version",
+                  "data"
+                ],
+                "type": "object"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "2XX": {
+            "description": "Received. Answer within 10 seconds; do the work afterwards."
+          },
+          "410": {
+            "description": "Gone: the delivery is final (not retried). Any 4xx other than 408 and 429 is final."
+          },
+          "5XX": {
+            "description": "Retried with backoff for about a day, as are timeouts, 408 and 429."
+          }
+        },
+        "security": [],
+        "summary": "CoderHelm opened a pull request",
+        "tags": [
+          "Events: Pull requests"
+        ]
+      }
+    },
+    "release_notes.published": {
+      "post": {
+        "description": "CoderHelm wrote and published the notes for a release tag. Sent as `POST` to each endpoint subscribed to `release_notes.published` (or to every event).",
+        "operationId": "event.release_notes.published",
+        "parameters": [
+          {
+            "description": "The event id (`evt_…`). The same on every retry: use it to skip an event you already handled.",
+            "example": "evt_01JBEVNT8M1N4P7Q0R3S6T9V2W",
+            "in": "header",
+            "name": "webhook-id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Unix seconds when this attempt was sent. Refuse a request more than 5 minutes off.",
+            "example": "1792420307",
+            "in": "header",
+            "name": "webhook-timestamp",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Space-separated `v1,<base64>` signatures: HMAC-SHA256 of `<webhook-id>.<webhook-timestamp>.<raw body>` keyed with the endpoint's secret (the bytes after `whsec_`, base64-decoded). Two while a rotated secret still signs; accept the request when any matches.",
+            "example": "v1,K5oZfzN95Z9UVu1EsfQmfVNQhnkZ2pj9o9NDN/H/pI4=",
+            "in": "header",
+            "name": "webhook-signature",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "examples": {
+                "event": {
+                  "value": {
+                    "api_version": "2026-10-26",
+                    "created_at": "2026-10-26T14:31:47.512Z",
+                    "data": {
+                      "channels": [
+                        "github",
+                        "email"
+                      ],
+                      "release_url": "https://github.com/example-org/api/releases/tag/v2.14.0",
+                      "repo": "example-org/api",
+                      "sha": "4b7e9d1c0a2f3e5d6c8b9a0f1e2d3c4b5a6f7e8d",
+                      "tag": "v2.14.0"
+                    },
+                    "id": "evt_01JBEVNT8M1N4P7Q0R3S6T9V2W",
+                    "team_id": "TEAM#7c1f0e2a",
+                    "type": "release_notes.published"
+                  }
+                }
+              },
+              "schema": {
+                "properties": {
+                  "api_version": {
+                    "const": "2026-10-26",
+                    "description": "The version of this event's shape.",
+                    "type": "string"
+                  },
+                  "created_at": {
+                    "description": "When it happened.",
+                    "format": "date-time",
+                    "type": "string"
+                  },
+                  "data": {
+                    "properties": {
+                      "channels": {
+                        "description": "Where the notes went: `github`, `confluence`, `email`.",
+                        "items": {
+                          "type": "string"
+                        },
+                        "type": "array"
+                      },
+                      "release_url": {
+                        "description": "The GitHub Release, when one was written.",
+                        "format": "uri",
+                        "type": [
+                          "string",
+                          "null"
+                        ]
+                      },
+                      "repo": {
+                        "description": "`owner/name`.",
+                        "type": "string"
+                      },
+                      "sha": {
+                        "description": "The commit the tag points at.",
+                        "type": "string"
+                      },
+                      "tag": {
+                        "description": "The release tag.",
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "repo",
+                      "tag",
+                      "sha",
+                      "release_url",
+                      "channels"
+                    ],
+                    "type": "object"
+                  },
+                  "id": {
+                    "description": "The event's id (`evt_` and a ULID). The same on every retry and every endpoint: use it to ignore an event you already handled. Also sent as the `webhook-id` header.",
+                    "type": "string"
+                  },
+                  "team_id": {
+                    "description": "The CoderHelm team it belongs to (as `GET /api/me` returns it).",
+                    "type": "string"
+                  },
+                  "type": {
+                    "const": "release_notes.published",
+                    "description": "The event type.",
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "id",
+                  "type",
+                  "created_at",
+                  "team_id",
+                  "api_version",
+                  "data"
+                ],
+                "type": "object"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "2XX": {
+            "description": "Received. Answer within 10 seconds; do the work afterwards."
+          },
+          "410": {
+            "description": "Gone: the delivery is final (not retried). Any 4xx other than 408 and 429 is final."
+          },
+          "5XX": {
+            "description": "Retried with backoff for about a day, as are timeouts, 408 and 429."
+          }
+        },
+        "security": [],
+        "summary": "Release notes went out",
+        "tags": [
+          "Events: Releases"
+        ]
+      }
+    },
+    "review.completed": {
+      "post": {
+        "description": "CoderHelm's reviewer posted a review on a pull request, with its verdict. Sent as `POST` to each endpoint subscribed to `review.completed` (or to every event).",
+        "operationId": "event.review.completed",
+        "parameters": [
+          {
+            "description": "The event id (`evt_…`). The same on every retry: use it to skip an event you already handled.",
+            "example": "evt_01JBEVNT8M1N4P7Q0R3S6T9V2W",
+            "in": "header",
+            "name": "webhook-id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Unix seconds when this attempt was sent. Refuse a request more than 5 minutes off.",
+            "example": "1792420307",
+            "in": "header",
+            "name": "webhook-timestamp",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Space-separated `v1,<base64>` signatures: HMAC-SHA256 of `<webhook-id>.<webhook-timestamp>.<raw body>` keyed with the endpoint's secret (the bytes after `whsec_`, base64-decoded). Two while a rotated secret still signs; accept the request when any matches.",
+            "example": "v1,K5oZfzN95Z9UVu1EsfQmfVNQhnkZ2pj9o9NDN/H/pI4=",
+            "in": "header",
+            "name": "webhook-signature",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "examples": {
+                "event": {
+                  "value": {
+                    "api_version": "2026-10-26",
+                    "created_at": "2026-10-26T14:31:47.512Z",
+                    "data": {
+                      "head_sha": "9f1c2ab7e04d3c5a8b6f0e1d2c3b4a5f6e7d8c9b",
+                      "posted_as": "request_changes",
+                      "pr_number": 902,
+                      "pr_url": "https://github.com/example-org/web/pull/902",
+                      "repo": "example-org/web",
+                      "risk": "medium",
+                      "trigger": "opened",
+                      "url": "https://app.coderhelm.com/reviewer/?repo=example-org%2Fweb&pr=902",
+                      "verdict": "request_changes"
+                    },
+                    "id": "evt_01JBEVNT8M1N4P7Q0R3S6T9V2W",
+                    "team_id": "TEAM#7c1f0e2a",
+                    "type": "review.completed"
+                  }
+                }
+              },
+              "schema": {
+                "properties": {
+                  "api_version": {
+                    "const": "2026-10-26",
+                    "description": "The version of this event's shape.",
+                    "type": "string"
+                  },
+                  "created_at": {
+                    "description": "When it happened.",
+                    "format": "date-time",
+                    "type": "string"
+                  },
+                  "data": {
+                    "properties": {
+                      "head_sha": {
+                        "description": "The commit the review is for.",
+                        "type": "string"
+                      },
+                      "posted_as": {
+                        "description": "How the review was posted on GitHub. On CoderHelm's own pull requests GitHub allows only `comment`, whatever the verdict.",
+                        "enum": [
+                          "approve",
+                          "request_changes",
+                          "comment"
+                        ],
+                        "type": "string"
+                      },
+                      "pr_number": {
+                        "description": "The pull request reviewed.",
+                        "type": "integer"
+                      },
+                      "pr_url": {
+                        "description": "The pull request on GitHub.",
+                        "format": "uri",
+                        "type": "string"
+                      },
+                      "repo": {
+                        "description": "`owner/name`.",
+                        "type": "string"
+                      },
+                      "risk": {
+                        "description": "The reviewer's risk rating (`low`, `medium`, `high`), or `n/a`.",
+                        "type": "string"
+                      },
+                      "trigger": {
+                        "description": "What asked for the review: `opened`, `synchronize`, `labeled`, `requested`, `run` and others.",
+                        "type": "string"
+                      },
+                      "url": {
+                        "description": "The review in the CoderHelm dashboard.",
+                        "format": "uri",
+                        "type": "string"
+                      },
+                      "verdict": {
+                        "description": "What the reviewer decided.",
+                        "enum": [
+                          "approve",
+                          "request_changes",
+                          "comment"
+                        ],
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "repo",
+                      "pr_number",
+                      "pr_url",
+                      "head_sha",
+                      "verdict",
+                      "posted_as",
+                      "risk",
+                      "trigger",
+                      "url"
+                    ],
+                    "type": "object"
+                  },
+                  "id": {
+                    "description": "The event's id (`evt_` and a ULID). The same on every retry and every endpoint: use it to ignore an event you already handled. Also sent as the `webhook-id` header.",
+                    "type": "string"
+                  },
+                  "team_id": {
+                    "description": "The CoderHelm team it belongs to (as `GET /api/me` returns it).",
+                    "type": "string"
+                  },
+                  "type": {
+                    "const": "review.completed",
+                    "description": "The event type.",
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "id",
+                  "type",
+                  "created_at",
+                  "team_id",
+                  "api_version",
+                  "data"
+                ],
+                "type": "object"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "2XX": {
+            "description": "Received. Answer within 10 seconds; do the work afterwards."
+          },
+          "410": {
+            "description": "Gone: the delivery is final (not retried). Any 4xx other than 408 and 429 is final."
+          },
+          "5XX": {
+            "description": "Retried with backoff for about a day, as are timeouts, 408 and 429."
+          }
+        },
+        "security": [],
+        "summary": "A review was posted",
+        "tags": [
+          "Events: Reviews"
+        ]
+      }
+    },
+    "run.completed": {
+      "post": {
+        "description": "The run finished: its pull request passed its checks and is ready for people, or no code change was needed. Sent as `POST` to each endpoint subscribed to `run.completed` (or to every event).",
+        "operationId": "event.run.completed",
+        "parameters": [
+          {
+            "description": "The event id (`evt_…`). The same on every retry: use it to skip an event you already handled.",
+            "example": "evt_01JBEVNT8M1N4P7Q0R3S6T9V2W",
+            "in": "header",
+            "name": "webhook-id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Unix seconds when this attempt was sent. Refuse a request more than 5 minutes off.",
+            "example": "1792420307",
+            "in": "header",
+            "name": "webhook-timestamp",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Space-separated `v1,<base64>` signatures: HMAC-SHA256 of `<webhook-id>.<webhook-timestamp>.<raw body>` keyed with the endpoint's secret (the bytes after `whsec_`, base64-decoded). Two while a rotated secret still signs; accept the request when any matches.",
+            "example": "v1,K5oZfzN95Z9UVu1EsfQmfVNQhnkZ2pj9o9NDN/H/pI4=",
+            "in": "header",
+            "name": "webhook-signature",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "examples": {
+                "event": {
+                  "value": {
+                    "api_version": "2026-10-26",
+                    "created_at": "2026-10-26T14:31:47.512Z",
+                    "data": {
+                      "branch": "coderhelm/eng-142-rate-limit-export",
+                      "created_at": "2026-10-26T14:02:11.000Z",
+                      "error": null,
+                      "pr_number": 318,
+                      "pr_url": "https://github.com/example-org/api/pull/318",
+                      "repo": "example-org/api",
+                      "run_id": "01JBRUN7Q2X9M3V6T8W1K4HZ5C",
+                      "source": "jira",
+                      "status": "completed",
+                      "ticket_id": "ENG-142",
+                      "title": "Add rate limiting to the export endpoint",
+                      "updated_at": "2026-10-26T14:31:47.000Z",
+                      "url": "https://app.coderhelm.com/runs/detail/?id=01JBRUN7Q2X9M3V6T8W1K4HZ5C"
+                    },
+                    "id": "evt_01JBEVNT8M1N4P7Q0R3S6T9V2W",
+                    "team_id": "TEAM#7c1f0e2a",
+                    "type": "run.completed"
+                  }
+                }
+              },
+              "schema": {
+                "properties": {
+                  "api_version": {
+                    "const": "2026-10-26",
+                    "description": "The version of this event's shape.",
+                    "type": "string"
+                  },
+                  "created_at": {
+                    "description": "When it happened.",
+                    "format": "date-time",
+                    "type": "string"
+                  },
+                  "data": {
+                    "properties": {
+                      "branch": {
+                        "description": "The branch CoderHelm works on.",
+                        "type": [
+                          "string",
+                          "null"
+                        ]
+                      },
+                      "created_at": {
+                        "description": "When the run started.",
+                        "format": "date-time",
+                        "type": "string"
+                      },
+                      "error": {
+                        "description": "Why the run failed or what it needs, in plain words.",
+                        "type": [
+                          "string",
+                          "null"
+                        ]
+                      },
+                      "pr_number": {
+                        "description": "The pull request CoderHelm opened, once there is one.",
+                        "type": [
+                          "integer",
+                          "null"
+                        ]
+                      },
+                      "pr_url": {
+                        "description": "The pull request's address on GitHub.",
+                        "format": "uri",
+                        "type": [
+                          "string",
+                          "null"
+                        ]
+                      },
+                      "repo": {
+                        "description": "`owner/name` of the repository the run works in.",
+                        "type": "string"
+                      },
+                      "run_id": {
+                        "description": "The run's id. `GET /api/runs/{run_id}` returns the whole run.",
+                        "type": "string"
+                      },
+                      "source": {
+                        "description": "Where the work came from: `github`, `jira` or `alert` today; more may be added.",
+                        "type": "string"
+                      },
+                      "status": {
+                        "description": "The run's status when the event happened.",
+                        "enum": [
+                          "running",
+                          "awaiting_ci",
+                          "needs_input",
+                          "needs_outside_change",
+                          "completed",
+                          "merged",
+                          "failed",
+                          "cancelled",
+                          "closed"
+                        ],
+                        "type": "string"
+                      },
+                      "ticket_id": {
+                        "description": "The ticket's key or number at its source (empty for a task without one).",
+                        "type": "string"
+                      },
+                      "title": {
+                        "description": "The ticket or task title.",
+                        "type": "string"
+                      },
+                      "updated_at": {
+                        "description": "When the run last changed.",
+                        "format": "date-time",
+                        "type": "string"
+                      },
+                      "url": {
+                        "description": "The run in the CoderHelm dashboard.",
+                        "format": "uri",
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "run_id",
+                      "status",
+                      "title",
+                      "repo",
+                      "source",
+                      "ticket_id",
+                      "pr_number",
+                      "pr_url",
+                      "branch",
+                      "error",
+                      "url",
+                      "created_at",
+                      "updated_at"
+                    ],
+                    "type": "object"
+                  },
+                  "id": {
+                    "description": "The event's id (`evt_` and a ULID). The same on every retry and every endpoint: use it to ignore an event you already handled. Also sent as the `webhook-id` header.",
+                    "type": "string"
+                  },
+                  "team_id": {
+                    "description": "The CoderHelm team it belongs to (as `GET /api/me` returns it).",
+                    "type": "string"
+                  },
+                  "type": {
+                    "const": "run.completed",
+                    "description": "The event type.",
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "id",
+                  "type",
+                  "created_at",
+                  "team_id",
+                  "api_version",
+                  "data"
+                ],
+                "type": "object"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "2XX": {
+            "description": "Received. Answer within 10 seconds; do the work afterwards."
+          },
+          "410": {
+            "description": "Gone: the delivery is final (not retried). Any 4xx other than 408 and 429 is final."
+          },
+          "5XX": {
+            "description": "Retried with backoff for about a day, as are timeouts, 408 and 429."
+          }
+        },
+        "security": [],
+        "summary": "A run finished",
+        "tags": [
+          "Events: Runs"
+        ]
+      }
+    },
+    "run.created": {
+      "post": {
+        "description": "CoderHelm started work on a ticket, task or alert. Sent as `POST` to each endpoint subscribed to `run.created` (or to every event).",
+        "operationId": "event.run.created",
+        "parameters": [
+          {
+            "description": "The event id (`evt_…`). The same on every retry: use it to skip an event you already handled.",
+            "example": "evt_01JBEVNT8M1N4P7Q0R3S6T9V2W",
+            "in": "header",
+            "name": "webhook-id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Unix seconds when this attempt was sent. Refuse a request more than 5 minutes off.",
+            "example": "1792420307",
+            "in": "header",
+            "name": "webhook-timestamp",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Space-separated `v1,<base64>` signatures: HMAC-SHA256 of `<webhook-id>.<webhook-timestamp>.<raw body>` keyed with the endpoint's secret (the bytes after `whsec_`, base64-decoded). Two while a rotated secret still signs; accept the request when any matches.",
+            "example": "v1,K5oZfzN95Z9UVu1EsfQmfVNQhnkZ2pj9o9NDN/H/pI4=",
+            "in": "header",
+            "name": "webhook-signature",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "examples": {
+                "event": {
+                  "value": {
+                    "api_version": "2026-10-26",
+                    "created_at": "2026-10-26T14:31:47.512Z",
+                    "data": {
+                      "branch": null,
+                      "created_at": "2026-10-26T14:02:11.000Z",
+                      "error": null,
+                      "pr_number": null,
+                      "pr_url": null,
+                      "repo": "example-org/api",
+                      "run_id": "01JBRUN7Q2X9M3V6T8W1K4HZ5C",
+                      "source": "jira",
+                      "status": "running",
+                      "ticket_id": "ENG-142",
+                      "title": "Add rate limiting to the export endpoint",
+                      "updated_at": "2026-10-26T14:31:47.000Z",
+                      "url": "https://app.coderhelm.com/runs/detail/?id=01JBRUN7Q2X9M3V6T8W1K4HZ5C"
+                    },
+                    "id": "evt_01JBEVNT8M1N4P7Q0R3S6T9V2W",
+                    "team_id": "TEAM#7c1f0e2a",
+                    "type": "run.created"
+                  }
+                }
+              },
+              "schema": {
+                "properties": {
+                  "api_version": {
+                    "const": "2026-10-26",
+                    "description": "The version of this event's shape.",
+                    "type": "string"
+                  },
+                  "created_at": {
+                    "description": "When it happened.",
+                    "format": "date-time",
+                    "type": "string"
+                  },
+                  "data": {
+                    "properties": {
+                      "branch": {
+                        "description": "The branch CoderHelm works on.",
+                        "type": [
+                          "string",
+                          "null"
+                        ]
+                      },
+                      "created_at": {
+                        "description": "When the run started.",
+                        "format": "date-time",
+                        "type": "string"
+                      },
+                      "error": {
+                        "description": "Why the run failed or what it needs, in plain words.",
+                        "type": [
+                          "string",
+                          "null"
+                        ]
+                      },
+                      "pr_number": {
+                        "description": "The pull request CoderHelm opened, once there is one.",
+                        "type": [
+                          "integer",
+                          "null"
+                        ]
+                      },
+                      "pr_url": {
+                        "description": "The pull request's address on GitHub.",
+                        "format": "uri",
+                        "type": [
+                          "string",
+                          "null"
+                        ]
+                      },
+                      "repo": {
+                        "description": "`owner/name` of the repository the run works in.",
+                        "type": "string"
+                      },
+                      "run_id": {
+                        "description": "The run's id. `GET /api/runs/{run_id}` returns the whole run.",
+                        "type": "string"
+                      },
+                      "source": {
+                        "description": "Where the work came from: `github`, `jira` or `alert` today; more may be added.",
+                        "type": "string"
+                      },
+                      "status": {
+                        "description": "The run's status when the event happened.",
+                        "enum": [
+                          "running",
+                          "awaiting_ci",
+                          "needs_input",
+                          "needs_outside_change",
+                          "completed",
+                          "merged",
+                          "failed",
+                          "cancelled",
+                          "closed"
+                        ],
+                        "type": "string"
+                      },
+                      "ticket_id": {
+                        "description": "The ticket's key or number at its source (empty for a task without one).",
+                        "type": "string"
+                      },
+                      "title": {
+                        "description": "The ticket or task title.",
+                        "type": "string"
+                      },
+                      "updated_at": {
+                        "description": "When the run last changed.",
+                        "format": "date-time",
+                        "type": "string"
+                      },
+                      "url": {
+                        "description": "The run in the CoderHelm dashboard.",
+                        "format": "uri",
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "run_id",
+                      "status",
+                      "title",
+                      "repo",
+                      "source",
+                      "ticket_id",
+                      "pr_number",
+                      "pr_url",
+                      "branch",
+                      "error",
+                      "url",
+                      "created_at",
+                      "updated_at"
+                    ],
+                    "type": "object"
+                  },
+                  "id": {
+                    "description": "The event's id (`evt_` and a ULID). The same on every retry and every endpoint: use it to ignore an event you already handled. Also sent as the `webhook-id` header.",
+                    "type": "string"
+                  },
+                  "team_id": {
+                    "description": "The CoderHelm team it belongs to (as `GET /api/me` returns it).",
+                    "type": "string"
+                  },
+                  "type": {
+                    "const": "run.created",
+                    "description": "The event type.",
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "id",
+                  "type",
+                  "created_at",
+                  "team_id",
+                  "api_version",
+                  "data"
+                ],
+                "type": "object"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "2XX": {
+            "description": "Received. Answer within 10 seconds; do the work afterwards."
+          },
+          "410": {
+            "description": "Gone: the delivery is final (not retried). Any 4xx other than 408 and 429 is final."
+          },
+          "5XX": {
+            "description": "Retried with backoff for about a day, as are timeouts, 408 and 429."
+          }
+        },
+        "security": [],
+        "summary": "A run started",
+        "tags": [
+          "Events: Runs"
+        ]
+      }
+    },
+    "run.failed": {
+      "post": {
+        "description": "The run stopped on an error. `error` says why. Sent as `POST` to each endpoint subscribed to `run.failed` (or to every event).",
+        "operationId": "event.run.failed",
+        "parameters": [
+          {
+            "description": "The event id (`evt_…`). The same on every retry: use it to skip an event you already handled.",
+            "example": "evt_01JBEVNT8M1N4P7Q0R3S6T9V2W",
+            "in": "header",
+            "name": "webhook-id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Unix seconds when this attempt was sent. Refuse a request more than 5 minutes off.",
+            "example": "1792420307",
+            "in": "header",
+            "name": "webhook-timestamp",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Space-separated `v1,<base64>` signatures: HMAC-SHA256 of `<webhook-id>.<webhook-timestamp>.<raw body>` keyed with the endpoint's secret (the bytes after `whsec_`, base64-decoded). Two while a rotated secret still signs; accept the request when any matches.",
+            "example": "v1,K5oZfzN95Z9UVu1EsfQmfVNQhnkZ2pj9o9NDN/H/pI4=",
+            "in": "header",
+            "name": "webhook-signature",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "examples": {
+                "event": {
+                  "value": {
+                    "api_version": "2026-10-26",
+                    "created_at": "2026-10-26T14:31:47.512Z",
+                    "data": {
+                      "branch": null,
+                      "created_at": "2026-10-26T14:02:11.000Z",
+                      "error": "The repository's install step failed: npm ERR! 404 Not Found - @example/internal-ui",
+                      "pr_number": null,
+                      "pr_url": null,
+                      "repo": "example-org/api",
+                      "run_id": "01JBRUN7Q2X9M3V6T8W1K4HZ5C",
+                      "source": "jira",
+                      "status": "failed",
+                      "ticket_id": "ENG-142",
+                      "title": "Add rate limiting to the export endpoint",
+                      "updated_at": "2026-10-26T14:31:47.000Z",
+                      "url": "https://app.coderhelm.com/runs/detail/?id=01JBRUN7Q2X9M3V6T8W1K4HZ5C"
+                    },
+                    "id": "evt_01JBEVNT8M1N4P7Q0R3S6T9V2W",
+                    "team_id": "TEAM#7c1f0e2a",
+                    "type": "run.failed"
+                  }
+                }
+              },
+              "schema": {
+                "properties": {
+                  "api_version": {
+                    "const": "2026-10-26",
+                    "description": "The version of this event's shape.",
+                    "type": "string"
+                  },
+                  "created_at": {
+                    "description": "When it happened.",
+                    "format": "date-time",
+                    "type": "string"
+                  },
+                  "data": {
+                    "properties": {
+                      "branch": {
+                        "description": "The branch CoderHelm works on.",
+                        "type": [
+                          "string",
+                          "null"
+                        ]
+                      },
+                      "created_at": {
+                        "description": "When the run started.",
+                        "format": "date-time",
+                        "type": "string"
+                      },
+                      "error": {
+                        "description": "Why the run failed or what it needs, in plain words.",
+                        "type": [
+                          "string",
+                          "null"
+                        ]
+                      },
+                      "pr_number": {
+                        "description": "The pull request CoderHelm opened, once there is one.",
+                        "type": [
+                          "integer",
+                          "null"
+                        ]
+                      },
+                      "pr_url": {
+                        "description": "The pull request's address on GitHub.",
+                        "format": "uri",
+                        "type": [
+                          "string",
+                          "null"
+                        ]
+                      },
+                      "repo": {
+                        "description": "`owner/name` of the repository the run works in.",
+                        "type": "string"
+                      },
+                      "run_id": {
+                        "description": "The run's id. `GET /api/runs/{run_id}` returns the whole run.",
+                        "type": "string"
+                      },
+                      "source": {
+                        "description": "Where the work came from: `github`, `jira` or `alert` today; more may be added.",
+                        "type": "string"
+                      },
+                      "status": {
+                        "description": "The run's status when the event happened.",
+                        "enum": [
+                          "running",
+                          "awaiting_ci",
+                          "needs_input",
+                          "needs_outside_change",
+                          "completed",
+                          "merged",
+                          "failed",
+                          "cancelled",
+                          "closed"
+                        ],
+                        "type": "string"
+                      },
+                      "ticket_id": {
+                        "description": "The ticket's key or number at its source (empty for a task without one).",
+                        "type": "string"
+                      },
+                      "title": {
+                        "description": "The ticket or task title.",
+                        "type": "string"
+                      },
+                      "updated_at": {
+                        "description": "When the run last changed.",
+                        "format": "date-time",
+                        "type": "string"
+                      },
+                      "url": {
+                        "description": "The run in the CoderHelm dashboard.",
+                        "format": "uri",
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "run_id",
+                      "status",
+                      "title",
+                      "repo",
+                      "source",
+                      "ticket_id",
+                      "pr_number",
+                      "pr_url",
+                      "branch",
+                      "error",
+                      "url",
+                      "created_at",
+                      "updated_at"
+                    ],
+                    "type": "object"
+                  },
+                  "id": {
+                    "description": "The event's id (`evt_` and a ULID). The same on every retry and every endpoint: use it to ignore an event you already handled. Also sent as the `webhook-id` header.",
+                    "type": "string"
+                  },
+                  "team_id": {
+                    "description": "The CoderHelm team it belongs to (as `GET /api/me` returns it).",
+                    "type": "string"
+                  },
+                  "type": {
+                    "const": "run.failed",
+                    "description": "The event type.",
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "id",
+                  "type",
+                  "created_at",
+                  "team_id",
+                  "api_version",
+                  "data"
+                ],
+                "type": "object"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "2XX": {
+            "description": "Received. Answer within 10 seconds; do the work afterwards."
+          },
+          "410": {
+            "description": "Gone: the delivery is final (not retried). Any 4xx other than 408 and 429 is final."
+          },
+          "5XX": {
+            "description": "Retried with backoff for about a day, as are timeouts, 408 and 429."
+          }
+        },
+        "security": [],
+        "summary": "A run failed",
+        "tags": [
+          "Events: Runs"
+        ]
+      }
+    },
+    "run.needs_input": {
+      "post": {
+        "description": "The run asked a question on its ticket or pull request and waits for an answer. `error` holds the question. Sent as `POST` to each endpoint subscribed to `run.needs_input` (or to every event).",
+        "operationId": "event.run.needs_input",
+        "parameters": [
+          {
+            "description": "The event id (`evt_…`). The same on every retry: use it to skip an event you already handled.",
+            "example": "evt_01JBEVNT8M1N4P7Q0R3S6T9V2W",
+            "in": "header",
+            "name": "webhook-id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Unix seconds when this attempt was sent. Refuse a request more than 5 minutes off.",
+            "example": "1792420307",
+            "in": "header",
+            "name": "webhook-timestamp",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Space-separated `v1,<base64>` signatures: HMAC-SHA256 of `<webhook-id>.<webhook-timestamp>.<raw body>` keyed with the endpoint's secret (the bytes after `whsec_`, base64-decoded). Two while a rotated secret still signs; accept the request when any matches.",
+            "example": "v1,K5oZfzN95Z9UVu1EsfQmfVNQhnkZ2pj9o9NDN/H/pI4=",
+            "in": "header",
+            "name": "webhook-signature",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "examples": {
+                "event": {
+                  "value": {
+                    "api_version": "2026-10-26",
+                    "created_at": "2026-10-26T14:31:47.512Z",
+                    "data": {
+                      "branch": null,
+                      "created_at": "2026-10-26T14:02:11.000Z",
+                      "error": "Should the limit apply per API key or per team?",
+                      "pr_number": null,
+                      "pr_url": null,
+                      "repo": "example-org/api",
+                      "run_id": "01JBRUN7Q2X9M3V6T8W1K4HZ5C",
+                      "source": "jira",
+                      "status": "needs_input",
+                      "ticket_id": "ENG-142",
+                      "title": "Add rate limiting to the export endpoint",
+                      "updated_at": "2026-10-26T14:31:47.000Z",
+                      "url": "https://app.coderhelm.com/runs/detail/?id=01JBRUN7Q2X9M3V6T8W1K4HZ5C"
+                    },
+                    "id": "evt_01JBEVNT8M1N4P7Q0R3S6T9V2W",
+                    "team_id": "TEAM#7c1f0e2a",
+                    "type": "run.needs_input"
+                  }
+                }
+              },
+              "schema": {
+                "properties": {
+                  "api_version": {
+                    "const": "2026-10-26",
+                    "description": "The version of this event's shape.",
+                    "type": "string"
+                  },
+                  "created_at": {
+                    "description": "When it happened.",
+                    "format": "date-time",
+                    "type": "string"
+                  },
+                  "data": {
+                    "properties": {
+                      "branch": {
+                        "description": "The branch CoderHelm works on.",
+                        "type": [
+                          "string",
+                          "null"
+                        ]
+                      },
+                      "created_at": {
+                        "description": "When the run started.",
+                        "format": "date-time",
+                        "type": "string"
+                      },
+                      "error": {
+                        "description": "Why the run failed or what it needs, in plain words.",
+                        "type": [
+                          "string",
+                          "null"
+                        ]
+                      },
+                      "pr_number": {
+                        "description": "The pull request CoderHelm opened, once there is one.",
+                        "type": [
+                          "integer",
+                          "null"
+                        ]
+                      },
+                      "pr_url": {
+                        "description": "The pull request's address on GitHub.",
+                        "format": "uri",
+                        "type": [
+                          "string",
+                          "null"
+                        ]
+                      },
+                      "repo": {
+                        "description": "`owner/name` of the repository the run works in.",
+                        "type": "string"
+                      },
+                      "run_id": {
+                        "description": "The run's id. `GET /api/runs/{run_id}` returns the whole run.",
+                        "type": "string"
+                      },
+                      "source": {
+                        "description": "Where the work came from: `github`, `jira` or `alert` today; more may be added.",
+                        "type": "string"
+                      },
+                      "status": {
+                        "description": "The run's status when the event happened.",
+                        "enum": [
+                          "running",
+                          "awaiting_ci",
+                          "needs_input",
+                          "needs_outside_change",
+                          "completed",
+                          "merged",
+                          "failed",
+                          "cancelled",
+                          "closed"
+                        ],
+                        "type": "string"
+                      },
+                      "ticket_id": {
+                        "description": "The ticket's key or number at its source (empty for a task without one).",
+                        "type": "string"
+                      },
+                      "title": {
+                        "description": "The ticket or task title.",
+                        "type": "string"
+                      },
+                      "updated_at": {
+                        "description": "When the run last changed.",
+                        "format": "date-time",
+                        "type": "string"
+                      },
+                      "url": {
+                        "description": "The run in the CoderHelm dashboard.",
+                        "format": "uri",
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "run_id",
+                      "status",
+                      "title",
+                      "repo",
+                      "source",
+                      "ticket_id",
+                      "pr_number",
+                      "pr_url",
+                      "branch",
+                      "error",
+                      "url",
+                      "created_at",
+                      "updated_at"
+                    ],
+                    "type": "object"
+                  },
+                  "id": {
+                    "description": "The event's id (`evt_` and a ULID). The same on every retry and every endpoint: use it to ignore an event you already handled. Also sent as the `webhook-id` header.",
+                    "type": "string"
+                  },
+                  "team_id": {
+                    "description": "The CoderHelm team it belongs to (as `GET /api/me` returns it).",
+                    "type": "string"
+                  },
+                  "type": {
+                    "const": "run.needs_input",
+                    "description": "The event type.",
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "id",
+                  "type",
+                  "created_at",
+                  "team_id",
+                  "api_version",
+                  "data"
+                ],
+                "type": "object"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "2XX": {
+            "description": "Received. Answer within 10 seconds; do the work afterwards."
+          },
+          "410": {
+            "description": "Gone: the delivery is final (not retried). Any 4xx other than 408 and 429 is final."
+          },
+          "5XX": {
+            "description": "Retried with backoff for about a day, as are timeouts, 408 and 429."
+          }
+        },
+        "security": [],
+        "summary": "A run is waiting for a person",
+        "tags": [
+          "Events: Runs"
+        ]
+      }
+    },
+    "webhook.test": {
+      "post": {
+        "description": "Sent by Send test event in Settings, Webhooks (or the API), to that endpoint only. Never sent by real work. Sent as `POST` to each endpoint subscribed to `webhook.test` (or to every event).",
+        "operationId": "event.webhook.test",
+        "parameters": [
+          {
+            "description": "The event id (`evt_…`). The same on every retry: use it to skip an event you already handled.",
+            "example": "evt_01JBEVNT8M1N4P7Q0R3S6T9V2W",
+            "in": "header",
+            "name": "webhook-id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Unix seconds when this attempt was sent. Refuse a request more than 5 minutes off.",
+            "example": "1792420307",
+            "in": "header",
+            "name": "webhook-timestamp",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Space-separated `v1,<base64>` signatures: HMAC-SHA256 of `<webhook-id>.<webhook-timestamp>.<raw body>` keyed with the endpoint's secret (the bytes after `whsec_`, base64-decoded). Two while a rotated secret still signs; accept the request when any matches.",
+            "example": "v1,K5oZfzN95Z9UVu1EsfQmfVNQhnkZ2pj9o9NDN/H/pI4=",
+            "in": "header",
+            "name": "webhook-signature",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "examples": {
+                "event": {
+                  "value": {
+                    "api_version": "2026-10-26",
+                    "created_at": "2026-10-26T14:31:47.512Z",
+                    "data": {
+                      "endpoint_id": "ep_01JBENDPT4A7B0C3D6E9F2G5H8",
+                      "message": "A test event from CoderHelm. Nothing happened."
+                    },
+                    "id": "evt_01JBEVNT8M1N4P7Q0R3S6T9V2W",
+                    "team_id": "TEAM#7c1f0e2a",
+                    "type": "webhook.test"
+                  }
+                }
+              },
+              "schema": {
+                "properties": {
+                  "api_version": {
+                    "const": "2026-10-26",
+                    "description": "The version of this event's shape.",
+                    "type": "string"
+                  },
+                  "created_at": {
+                    "description": "When it happened.",
+                    "format": "date-time",
+                    "type": "string"
+                  },
+                  "data": {
+                    "properties": {
+                      "endpoint_id": {
+                        "description": "The endpoint it was sent to.",
+                        "type": "string"
+                      },
+                      "message": {
+                        "description": "A note that this is a test.",
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "message",
+                      "endpoint_id"
+                    ],
+                    "type": "object"
+                  },
+                  "id": {
+                    "description": "The event's id (`evt_` and a ULID). The same on every retry and every endpoint: use it to ignore an event you already handled. Also sent as the `webhook-id` header.",
+                    "type": "string"
+                  },
+                  "team_id": {
+                    "description": "The CoderHelm team it belongs to (as `GET /api/me` returns it).",
+                    "type": "string"
+                  },
+                  "type": {
+                    "const": "webhook.test",
+                    "description": "The event type.",
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "id",
+                  "type",
+                  "created_at",
+                  "team_id",
+                  "api_version",
+                  "data"
+                ],
+                "type": "object"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "2XX": {
+            "description": "Received. Answer within 10 seconds; do the work afterwards."
+          },
+          "410": {
+            "description": "Gone: the delivery is final (not retried). Any 4xx other than 408 and 429 is final."
+          },
+          "5XX": {
+            "description": "Retried with backoff for about a day, as are timeouts, 408 and 429."
+          }
+        },
+        "security": [],
+        "summary": "A test event",
+        "tags": [
+          "Events: Testing"
+        ]
+      }
+    }
+  }
 }

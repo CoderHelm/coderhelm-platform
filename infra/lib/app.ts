@@ -69,6 +69,7 @@ export function buildApp(app: cdk.App, cfg: ResolvedConfig) {
     ticketQueue: api.ticketQueue,
     ciFixQueue: api.ciFixQueue,
     feedbackQueue: api.feedbackQueue,
+    webhookQueue: api.webhookQueue,
     dlq: api.dlq,
     mcpProxyFunction: api.mcpProxyFunction,
     encryptionKey: database.encryptionKey,
@@ -92,6 +93,7 @@ export function buildApp(app: cdk.App, cfg: ResolvedConfig) {
     mcpProxyFunction: api.mcpProxyFunction,
     secretsKey: database.secretsKey,
     ticketQueue: api.ticketQueue,
+    webhookQueue: api.webhookQueue,
   });
 
   // --- Web (single-origin only): dashboard + one URL for everything ---
@@ -156,6 +158,7 @@ export function buildApp(app: cdk.App, cfg: ResolvedConfig) {
       awsInsightsTable: database.awsInsightsTable,
       settingsTable: database.settingsTable,
       secretsKey: database.secretsKey,
+      webhookQueue: api.webhookQueue,
     });
   }
 

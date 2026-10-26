@@ -512,3 +512,56 @@ class BedrockProvider(unittest.TestCase):
         self.assertEqual(len(recorded), 1)
         u, call_id, estimated = recorded[0][5], recorded[0][6], recorded[0][7]
         self.assertEqual((u["uncached_input"], u["output"], call_id, estimated), (10, 3, "r1", False))
+
+
+class WebhookEvents(unittest.TestCase):
+    """Findings become log_finding.* events on the webhooks queue, in the
+    envelope the worker reads (common::webhooks::Event)."""
+
+    def setUp(self):
+        self.sent = []
+        h.WEBHOOK_QUEUE_URL = "https://sqs.example/queue"
+
+    def tearDown(self):
+        h.WEBHOOK_QUEUE_URL = ""
+
+    def send(self, **kw):
+        self.sent.append(kw)
+
+    def test_an_event_has_the_envelope_and_an_uppercase_ulid(self):
+        import json
+
+        item = {"title": "Timeouts", "severity": "critical", "source_log_group": "/aws/lambda/x"}
+        data = h.finding_event_data("01abc", "123456789012", item)
+        eid = h.emit_event("TEAM#a", "log_finding.created", data, send=self.send)
+        self.assertTrue(eid.startswith("evt_") and eid[4:] == eid[4:].upper() and len(eid) == 30)
+        msg = json.loads(self.sent[0]["MessageBody"])
+        self.assertEqual(msg["type"], "webhook_emit")
+        ev = msg["event"]
+        self.assertEqual(list(ev), ["id", "type", "created_at", "team_id", "api_version", "data"])
+        self.assertEqual(ev["api_version"], h.WEBHOOK_API_VERSION)
+        self.assertTrue(ev["created_at"].endswith("Z"))
+        self.assertEqual(
+            sorted(ev["data"]),
+            sorted(["finding_id", "account_id", "title", "severity", "log_group", "url"]),
+        )
+        self.assertEqual(ev["data"]["url"], h.finding_url("01abc"))
+
+    def test_resolved_findings_name_when_and_unknown_severities_read_as_info(self):
+        data = h.finding_event_data("01abc", "1", {"title": "t", "severity": "weird"}, resolved_at="2026-10-27T06:00:12Z")
+        self.assertEqual(
+            sorted(data),
+            sorted(["finding_id", "account_id", "title", "severity", "resolved_at", "url"]),
+        )
+        self.assertEqual(data["severity"], "info")
+
+    def test_without_a_queue_or_when_sending_fails_nothing_breaks(self):
+        h.WEBHOOK_QUEUE_URL = ""
+        self.assertIsNone(h.emit_event("TEAM#a", "log_finding.created", {}, send=self.send))
+        self.assertEqual(self.sent, [])
+        h.WEBHOOK_QUEUE_URL = "https://sqs.example/queue"
+
+        def boom(**kw):
+            raise RuntimeError("down")
+
+        self.assertIsNone(h.emit_event("TEAM#a", "log_finding.created", {}, send=boom))

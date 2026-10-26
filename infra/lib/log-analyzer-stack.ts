@@ -8,6 +8,7 @@ import * as kms from "aws-cdk-lib/aws-kms";
 import * as logs from "aws-cdk-lib/aws-logs";
 import * as s3 from "aws-cdk-lib/aws-s3";
 import * as s3deploy from "aws-cdk-lib/aws-s3-deployment";
+import * as sqs from "aws-cdk-lib/aws-sqs";
 import { Construct } from "constructs";
 import { ResolvedConfig } from "./config";
 import { repoPath } from "./paths";
@@ -23,6 +24,8 @@ interface LogAnalyzerStackProps extends cdk.StackProps {
   settingsTable: dynamodb.TableV2;
   /** Opens the sealed Teams/Slack webhooks new findings post to. */
   secretsKey: kms.Key;
+  /** New and resolved findings go here as webhook events (log_finding.*). */
+  webhookQueue: sqs.IQueue;
 }
 
 export class LogAnalyzerStack extends cdk.Stack {
@@ -86,6 +89,7 @@ export class LogAnalyzerStack extends cdk.Stack {
         CODERHELM_ACCOUNT_ID: this.account,
         LOOKBACK_HOURS: "6",
         DASHBOARD_URL: props.appUrl,
+        WEBHOOK_QUEUE_URL: props.webhookQueue.queueUrl,
         ...modelProviderEnvironment(props.cfg),
       },
     });
@@ -98,6 +102,7 @@ export class LogAnalyzerStack extends cdk.Stack {
     // Webhook URLs are sealed with the secrets key (bound to the team), like
     // the worker's: the analyzer only opens them.
     props.secretsKey.grantDecrypt(analyzerFunction);
+    props.webhookQueue.grantSendMessages(analyzerFunction);
     // Decoupled by name (like the worker) to avoid a cross-stack export.
     dynamodb.TableV2.fromTableName(this, "AnalyticsTableRef", `${prefix}-analytics`)
       .grantWriteData(analyzerFunction);

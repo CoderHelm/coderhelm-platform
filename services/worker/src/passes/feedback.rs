@@ -2497,7 +2497,7 @@ pub(crate) async fn close_own_pr_outside(
 
 async fn finish_without_change(state: &WorkerState, msg: &FeedbackMessage) {
     let now = chrono::Utc::now().to_rfc3339();
-    let _ = state
+    let wrote = state
         .dynamo
         .update_item()
         .table_name(&state.config.runs_table_name)
@@ -2526,7 +2526,11 @@ async fn finish_without_change(state: &WorkerState, msg: &FeedbackMessage) {
         )
         .expression_attribute_values(":t", aws_sdk_dynamodb::types::AttributeValue::S(now))
         .send()
-        .await;
+        .await
+        .is_ok();
+    if wrote {
+        super::webhooks::emit_run(state, &msg.team_id, &msg.run_id, "completed").await;
+    }
 }
 
 /// While a run is awaiting CI or running, the resume flow owns CI fixing
@@ -2642,7 +2646,7 @@ async fn hand_off_to_human(state: &WorkerState, github: &GitHubClient, msg: &Fee
     // (2) Finalize the run — completed, stale error cleared, never clobbering a
     // cancel. Safe to repeat on redelivery.
     let now = chrono::Utc::now().to_rfc3339();
-    let _ = state
+    let wrote = state
         .dynamo
         .update_item()
         .table_name(&state.config.runs_table_name)
@@ -2662,7 +2666,11 @@ async fn hand_off_to_human(state: &WorkerState, github: &GitHubClient, msg: &Fee
         .expression_attribute_values(":t", AttributeValue::S(now))
         .ended_values()
         .send()
-        .await;
+        .await
+        .is_ok();
+    if wrote {
+        super::webhooks::emit_run(state, &msg.team_id, &msg.run_id, "completed").await;
+    }
     // When it was handed off (the first time only), for the weekly summary.
     super::record_ci_outcome(
         state,

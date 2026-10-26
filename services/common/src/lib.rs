@@ -23,6 +23,8 @@ pub mod dlq;
 /// Hybrid self-hosting: CoderHelm addresses, the event relay, the token
 /// broker and the signatures between an install and the hosted side.
 pub mod hybrid;
+/// Outbound webhooks: the event catalog, endpoints, signing and delivery.
+pub mod webhooks;
 
 /// Agent permissions: one policy engine (allow, ask, deny) every agent loop
 /// asks before every call, approval cards, sign-in prompts and the pause.

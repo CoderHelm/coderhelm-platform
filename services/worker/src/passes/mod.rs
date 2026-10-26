@@ -763,6 +763,7 @@ pub mod tool_proposals;
 mod triage;
 pub mod usage_reconcile;
 pub mod web_check;
+pub mod webhooks;
 pub mod weekly_summary;
 pub mod write_guard;
 
@@ -2163,6 +2164,7 @@ async fn run_passes(
             )
             .send()
             .await;
+        self::webhooks::emit_run(state, &msg.team_id, run_id, "completed").await;
 
         // Update analytics counters
         let analytics_month = chrono::Utc::now().format("%Y-%m").to_string();
@@ -3486,7 +3488,7 @@ async fn run_passes(
             let duration = start.elapsed().as_secs();
             let cost = usage.estimated_cost();
             let now = chrono::Utc::now().to_rfc3339();
-            let _ = state
+            let wrote = state
                 .dynamo
                 .update_item()
                 .table_name(&state.config.runs_table_name)
@@ -3515,7 +3517,11 @@ async fn run_passes(
                 .expression_attribute_values(":t", attr_s(&now))
                 .expression_attribute_values(":cp", attr_s("done"))
                 .send()
-                .await;
+                .await
+                .is_ok();
+            if wrote {
+                self::webhooks::emit_run(state, &msg.team_id, run_id, "completed").await;
+            }
             close_memory(state, agent_memory.take()).await;
             return Ok(());
         }
@@ -3602,6 +3608,7 @@ async fn run_passes(
                 .expression_attribute_values(":cp", attr_s("done"))
                 .send()
                 .await;
+            self::webhooks::emit_run(state, &msg.team_id, run_id, "needs_input").await;
             close_memory(state, agent_memory.take()).await;
             return Ok(());
         }
@@ -3941,6 +3948,14 @@ async fn run_passes(
     )
     .await;
     info!(run_id, pr_url = %pr_result.pr_url, "Draft PR created");
+    self::webhooks::emit_pr_opened(
+        state,
+        msg,
+        run_id,
+        &format!("{}/{}", msg.repo_owner, msg.repo_name),
+        &pr_result,
+    )
+    .await;
     add_progress_note(
         state,
         &msg.team_id,
@@ -4464,6 +4479,14 @@ async fn run_repo_pipeline(
     .await;
 
     info!(run_id, repo = %format!("{repo_owner}/{repo_name}"), pr_url = %pr_result.pr_url, "Draft PR created");
+    self::webhooks::emit_pr_opened(
+        state,
+        msg,
+        run_id,
+        &format!("{repo_owner}/{repo_name}"),
+        &pr_result,
+    )
+    .await;
     add_progress_note(
         state,
         &msg.team_id,
@@ -4582,6 +4605,7 @@ async fn create_run_record(
         }
     }
     put.send().await?;
+    self::webhooks::emit_run(state, &msg.team_id, run_id, "running").await;
 
     // Increment analytics counters (current month + all-time). A counter is
     // best effort: it must never stop a run whose record is already written.
@@ -5039,6 +5063,7 @@ async fn mark_run_needs_input(
         )
         .send()
         .await;
+    self::webhooks::emit_run(state, &msg.team_id, run_id, "needs_input").await;
 
     // Update analytics counters
     let analytics_month = chrono::Utc::now().format("%Y-%m").to_string();
@@ -5371,7 +5396,7 @@ async fn fail_run(
     )
     .await
     {
-        Ok(true) => {}
+        Ok(true) => self::webhooks::emit_run(state, &msg.team_id, run_id, "failed").await,
         // Cancelled or merged meanwhile: nothing failed, so nothing to tell.
         Ok(false) => return,
         Err(e) => warn!(run_id, error = %e, "Could not mark the run failed"),
@@ -7602,6 +7627,7 @@ async fn salvage_timeout_pr(
         .expression_attribute_values(":err", attr_s("Partial implementation — agent timed out"))
         .send()
         .await;
+    self::webhooks::emit_run(state, &msg.team_id, run_id, "completed").await;
 
     Ok(pr_url)
 }

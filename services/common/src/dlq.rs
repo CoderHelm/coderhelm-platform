@@ -24,6 +24,8 @@ use serde::Serialize;
 pub const WORKER_MESSAGE_TYPES: &[&str] = &[
     "ticket",
     "relay_retry",
+    "webhook_emit",
+    "webhook_send",
     "tool_proposals",
     "hidden_suggest",
     "feedback",

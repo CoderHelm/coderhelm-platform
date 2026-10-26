@@ -197,6 +197,43 @@ async fn main() -> Result<(), Error> {
             "/system/hybrid/settings",
             put(routes::hybrid_install::put_settings),
         )
+        // Outbound webhooks: the team's endpoints and their deliveries (admins
+        // and API keys with the webhooks scope).
+        .route("/webhooks/event-types", get(routes::webhooks::event_types))
+        .route(
+            "/webhooks/endpoints",
+            get(routes::webhooks::list_endpoints).post(routes::webhooks::create_endpoint),
+        )
+        .route(
+            "/webhooks/endpoints/:endpoint_id",
+            get(routes::webhooks::get_endpoint)
+                .put(routes::webhooks::update_endpoint)
+                .delete(routes::webhooks::delete_endpoint),
+        )
+        .route(
+            "/webhooks/endpoints/:endpoint_id/secret",
+            get(routes::webhooks::reveal_secret),
+        )
+        .route(
+            "/webhooks/endpoints/:endpoint_id/secret/rotate",
+            post(routes::webhooks::rotate_secret),
+        )
+        .route(
+            "/webhooks/endpoints/:endpoint_id/test",
+            post(routes::webhooks::send_test),
+        )
+        .route(
+            "/webhooks/endpoints/:endpoint_id/deliveries",
+            get(routes::webhooks::list_endpoint_deliveries),
+        )
+        .route(
+            "/webhooks/endpoints/:endpoint_id/deliveries/:delivery_id/resend",
+            post(routes::webhooks::resend_delivery),
+        )
+        .route(
+            "/webhooks/endpoints/:endpoint_id/replay",
+            post(routes::webhooks::replay),
+        )
         // Deliveries: every event in and out, with what happened (admins).
         .route("/deliveries", get(routes::deliveries::list))
         .route("/deliveries/:id", get(routes::deliveries::get))

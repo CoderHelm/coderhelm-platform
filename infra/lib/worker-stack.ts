@@ -37,6 +37,8 @@ interface WorkerStackProps extends cdk.StackProps {
   ticketQueue: sqs.Queue;
   ciFixQueue: sqs.Queue;
   feedbackQueue: sqs.Queue;
+  /** Outbound webhook events and retries: the worker sends them and queues retries. */
+  webhookQueue: sqs.Queue;
   /** The shared DLQ: the daily cleanup archives and deletes unreadable messages. */
   dlq: sqs.Queue;
   mcpProxyFunction: lambda.Function;
@@ -126,6 +128,7 @@ export class WorkerStack extends cdk.Stack {
         PLUGIN_SCHEDULE_GROUP: `${prefix}-plugins`,
         PLUGIN_SCHEDULER_ROLE_ARN: `arn:aws:iam::${this.account}:role/${prefix}-plugin-scheduler`,
         FEEDBACK_QUEUE_URL: props.feedbackQueue.queueUrl,
+        WEBHOOK_QUEUE_URL: props.webhookQueue.queueUrl,
         DLQ_URL: props.dlq.queueUrl,
         RUST_LOG: "info",
         ...serviceEnvironment(cfg, this.account),
@@ -275,6 +278,16 @@ export class WorkerStack extends cdk.Stack {
         maxConcurrency: 5,
       })
     );
+
+    // Outbound webhooks: one event (or one retry) per message. The worker
+    // queues each delivery's next try back on this queue.
+    this.workerFunction.addEventSource(
+      new eventsources.SqsEventSource(props.webhookQueue, {
+        batchSize: 1,
+        maxConcurrency: 5,
+      })
+    );
+    props.webhookQueue.grantSendMessages(this.workerFunction);
 
     // Grant worker permission to invoke the MCP proxy (owned by api-stack)
     props.mcpProxyFunction.grantInvoke(this.workerFunction);

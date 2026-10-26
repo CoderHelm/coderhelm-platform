@@ -51,6 +51,8 @@ export class ApiStack extends cdk.Stack {
   public readonly ticketQueue: sqs.Queue;
   public readonly ciFixQueue: sqs.Queue;
   public readonly feedbackQueue: sqs.Queue;
+  /** Outbound webhook events and their retries (common::webhooks). */
+  public readonly webhookQueue: sqs.Queue;
   /** The shared dead-letter queue (the worker's DLQ cleanup reads it). */
   public readonly dlq: sqs.Queue;
   /** The HTTP API (the single-origin web stack forwards to it). */
@@ -293,6 +295,16 @@ export class ApiStack extends cdk.Stack {
       deadLetterQueue: { queue: dlq, maxReceiveCount: 3 },
     });
 
+    // Outbound webhooks: events the work emits (`webhook_emit`) and the
+    // delayed retries of their deliveries (`webhook_send`). Its own queue so
+    // a delivery never waits behind long runs on the tickets queue.
+    this.webhookQueue = new sqs.Queue(this, "WebhookQueue", {
+      queueName: `${prefix}-webhooks`,
+      visibilityTimeout: cdk.Duration.minutes(16),
+      encryption: sqs.QueueEncryption.SQS_MANAGED,
+      deadLetterQueue: { queue: dlq, maxReceiveCount: 3 },
+    });
+
     // Review-reminder sweep: every 20 min, drop a constant message on the ticket
     // queue; the worker's ReviewReminder handler scans repos with reminders
     // configured and nudges their Teams webhook about PRs still awaiting review.
@@ -513,6 +525,7 @@ export class ApiStack extends cdk.Stack {
         PLUGIN_SCHEDULER_ROLE_ARN: pluginSchedulerRole.roleArn,
         CI_FIX_QUEUE_URL: this.ciFixQueue.queueUrl,
         FEEDBACK_QUEUE_URL: this.feedbackQueue.queueUrl,
+        WEBHOOK_QUEUE_URL: this.webhookQueue.queueUrl,
         DLQ_URL: dlq.queueUrl,
         SECRETS_NAME: `${props.cfg.secretName}`,
         SES_FROM_ADDRESS: cfg.email.from,
@@ -603,6 +616,7 @@ export class ApiStack extends cdk.Stack {
     );
     this.ciFixQueue.grantSendMessages(this.gatewayFunction);
     this.feedbackQueue.grantSendMessages(this.gatewayFunction);
+    this.webhookQueue.grantSendMessages(this.gatewayFunction);
     dlq.grantConsumeMessages(this.gatewayFunction);
     this.gatewayFunction.addToRolePolicy(
       new iam.PolicyStatement({

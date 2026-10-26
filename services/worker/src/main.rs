@@ -506,6 +506,18 @@ async fn handle_message(state: Arc<WorkerState>, message: models::WorkerMessage)
                 error!("Health check failed: {e:?}");
             }
         }
+        models::WorkerMessage::WebhookEmit(msg) => {
+            info!(team_id = %msg.event.team_id, event = %msg.event.event_type, id = %msg.event.id, "Webhook event");
+            if let Err(e) = passes::webhooks::dispatch(&state, msg).await {
+                error!("Webhook dispatch failed: {e:?}");
+            }
+        }
+        models::WorkerMessage::WebhookSend(msg) => {
+            info!(team_id = %msg.team_id, endpoint = %msg.endpoint_id, delivery = %msg.delivery_id, "Webhook retry");
+            if let Err(e) = passes::webhooks::send(&state, msg).await {
+                error!("Webhook send failed: {e:?}");
+            }
+        }
         models::WorkerMessage::RelayRetry(msg) => {
             info!(install = %msg.install_id, delivery = %msg.delivery_id, "Relay retry");
             if let Err(e) = passes::relay_retry::run(&state, msg).await {

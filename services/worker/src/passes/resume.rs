@@ -1824,6 +1824,23 @@ pub async fn run(
         }
 
         // Implement fix
+        let repo_full = format!("{repo_owner}/{repo_name}");
+        let ci_fix = super::webhooks::CiFix {
+            team_id: &msg.team_id,
+            run_id: &msg.run_id,
+            repo: &repo_full,
+            pr_number,
+            branch: &branch,
+            attempt: cycle + 1,
+        };
+        let failing_checks: Vec<String> = events
+            .iter()
+            .filter(|e| e.event_type == "ci_failed")
+            .filter_map(|e| e.payload["workflow_name"].as_str().map(str::to_string))
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        super::webhooks::emit_ci_fix_started(state, &ci_fix, &failing_checks).await;
         let pass_start = std::time::Instant::now();
         let usage_before = usage.clone();
         super::update_pass(state, &msg.team_id, &msg.run_id, "implement").await?;
@@ -1923,6 +1940,7 @@ pub async fn run(
                         run_id = msg.run_id,
                         "CI fix produced no changes — completing with PR for human review"
                     );
+                    super::webhooks::emit_ci_fix_completed(state, &ci_fix, "no_changes", 0).await;
                     super::record_ci_outcome(
                         state,
                         &msg.team_id,
@@ -1955,12 +1973,20 @@ pub async fn run(
                     .await;
                     return Ok(());
                 }
+                super::webhooks::emit_ci_fix_completed(
+                    state,
+                    &ci_fix,
+                    "pushed",
+                    result.files_modified.len(),
+                )
+                .await;
             }
             Err(e) => {
                 if requeue_after_model_error(state, &msg, &*e).await {
                     return Ok(());
                 }
                 error!(run_id = msg.run_id, error = %e, "CI fix implementation failed — completing with PR for human review");
+                super::webhooks::emit_ci_fix_completed(state, &ci_fix, "failed", 0).await;
                 super::record_ci_outcome(
                     state,
                     &msg.team_id,
@@ -3392,7 +3418,7 @@ async fn complete_run_with_status(
         .send()
         .await;
     match res {
-        Ok(_) => {}
+        Ok(_) => super::webhooks::emit_run(state, &msg.team_id, run_id, status).await,
         Err(e) if format!("{e:?}").contains("ConditionalCheckFailed") => {
             info!(run_id, "Run is cancelled — not overwriting with completion");
             return Ok(());
@@ -3676,5 +3702,6 @@ async fn set_run_complete(
         .expression_attribute_values(":d", attr_n(duration))
         .send()
         .await;
+    super::webhooks::emit_run(state, team_id, run_id, "completed").await;
     info!(run_id, duration, "Run marked complete (no CI / CI passed)");
 }

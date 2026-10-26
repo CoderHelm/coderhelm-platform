@@ -2915,6 +2915,11 @@ async fn store_review_record(
     if let Err(e) = put.send().await {
         warn!(pr = msg.pr_number, error = %e, "Failed to persist review record (non-fatal)");
     }
+    // A posted review is an event for the team's webhooks (an answer to a
+    // question isn't a review).
+    if counts.posted && verdict != "QUESTION" {
+        super::webhooks::emit_review(state, msg, head_sha, verdict, posted_as, risk).await;
+    }
     // A small, time-ordered copy for analytics (no body).
     let stat = common::review_stats::stat_item(
         &msg.team_id,

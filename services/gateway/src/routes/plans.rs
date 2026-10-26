@@ -1145,6 +1145,15 @@ pub async fn approve_all_and_execute(
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
 
+    super::webhooks::emit_plan_approved(
+        &state,
+        &claims,
+        &plan_id,
+        &super::webhooks::plan_title(result.items(), &plan_id),
+        task_ids.len(),
+    )
+    .await;
+
     // Mark tasks as queued
     for (task_id, _) in &task_ids {
         let task_sk = format!("PLAN#{plan_id}#TASK#{task_id}");

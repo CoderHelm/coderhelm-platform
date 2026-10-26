@@ -1217,7 +1217,7 @@ pub struct KnowledgeWebhookBody {
 #[utoipa::path(
     post,
     path = "/webhooks/knowledge/{token}",
-    tag = "Webhooks",
+    tag = "Incoming webhooks",
     operation_id = "receiveKnowledgeWebhook",
     summary = "Knowledge source change",
     description = "Tells CoderHelm that pages of a connected knowledge source changed, so it syncs \
