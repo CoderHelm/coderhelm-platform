@@ -66,6 +66,22 @@ pub fn allow_setup_poll(headers: &axum::http::HeaderMap) -> Result<(), StatusCod
     check_rate_limit(&ip, "setup", 120, 300)
 }
 
+/// A per-address limit for one public scope (hybrid name checks, registration).
+pub fn allow(
+    headers: &axum::http::HeaderMap,
+    scope: &str,
+    max: u64,
+    window_secs: u64,
+) -> Result<(), StatusCode> {
+    let ip = headers
+        .get("x-forwarded-for")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.split(',').next())
+        .map(|s| s.trim().to_string())
+        .unwrap_or_else(|| "unknown".to_string());
+    check_rate_limit(&ip, scope, max, window_secs)
+}
+
 /// In-memory sliding window rate limiter.
 /// Zero latency, no external calls. Resets on cold start.
 fn check_rate_limit(

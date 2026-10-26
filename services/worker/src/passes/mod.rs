@@ -721,6 +721,8 @@ mod pr;
 pub mod pr_outcomes;
 mod proof;
 pub mod quarantine;
+/// Hosted side of hybrid: forward a held event to a self-hosted install again.
+pub mod relay_retry;
 pub mod release_notes;
 pub mod remote_mcp;
 pub(crate) mod repo_pick;

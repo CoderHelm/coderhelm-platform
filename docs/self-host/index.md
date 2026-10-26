@@ -6,6 +6,8 @@ order: 0
 
 CoderHelm runs entirely on AWS serverless services: Lambda, API Gateway, SQS, DynamoDB, S3, CloudFront, Cognito, SES, EventBridge and CodeBuild. Self-hosting puts all of it in your AWS account. Your code, tickets, logs and model calls never pass through CoderHelm's own account.
 
+**Two setups.** **Fully private** (the default): your own address and your own GitHub App, and nothing reaches CoderHelm. **[Hybrid](./hybrid.md)**: the same install, plus a `yourname.coderhelm.com` address and CoderHelm's GitHub App and integration apps where that's easier; the [trust model](./hybrid.md#trust-model) says exactly what passes through CoderHelm.
+
 **The fastest way:** the [install guide](https://docs.coderhelm.com/self-host/install/) installs CoderHelm from your browser with one click into your AWS account, then checks every step against your own install. Prefer a terminal? Use the [quick start](./quick-start.md).
 
 ## How it works
@@ -27,21 +29,23 @@ CoderHelm runs entirely on AWS serverless services: Lambda, API Gateway, SQS, Dy
 ## The guides
 
 1. [Quick start](./quick-start.md)
-2. [Everything you can set up](./options.md)
-3. [Requirements](./requirements.md)
-4. [Config reference](./config-reference.md)
-5. [The GitHub App](./github-app.md)
-6. [Model providers](./model-providers.md)
-7. [Integrations](./integrations.md)
-8. [Sign-in and people](./sign-in.md)
-9. [Email](./email.md)
-10. [Domains](./domains.md)
-11. [Updates](./updates.md)
-12. [Backups](./backups.md)
-13. [Security model](./security.md)
-14. [Check your install](./check-your-install.md)
-15. [Troubleshooting](./troubleshooting.md)
-16. [FAQ](./faq.md)
+2. [Hybrid: CoderHelm's address and apps](./hybrid.md)
+3. [Everything you can set up](./options.md)
+4. [Requirements](./requirements.md)
+5. [Config reference](./config-reference.md)
+6. [The GitHub App](./github-app.md)
+7. [Model providers](./model-providers.md)
+8. [Integrations](./integrations.md)
+9. [Sign-in and people](./sign-in.md)
+10. [Email](./email.md)
+11. [Domains](./domains.md)
+12. [Updates](./updates.md)
+13. [Backups](./backups.md)
+14. [Security model](./security.md)
+15. [Check your install](./check-your-install.md)
+16. [Deliveries](./deliveries.md)
+17. [Troubleshooting](./troubleshooting.md)
+18. [FAQ](./faq.md)
 
 ## License
 

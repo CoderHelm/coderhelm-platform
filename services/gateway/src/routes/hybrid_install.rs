@@ -1,0 +1,1532 @@
+//! The install side of hybrid self-hosting: Settings, System, Hybrid, the
+//! install guide's hybrid steps, and the relay intake.
+//!
+//! - `/api/system/hybrid…` (install admins) and `/api/setup/hybrid…` (the
+//!   install guide, with the one-time setup key, only until the first person
+//!   signs up) register the install with CoderHelm, claim a
+//!   `{name}.coderhelm.com` address, link CoderHelm's GitHub App, choose
+//!   which integrations use CoderHelm's apps, and choose what delivery data
+//!   is shared with support.
+//! - `POST /webhooks/relay` takes events CoderHelm's relay forwards: it checks
+//!   the signature (the install's relay key), refuses anything older than 5
+//!   minutes and any delivery id seen before, then handles the event exactly
+//!   as if GitHub (or Jira) had sent it here.
+//! - `GET /webhooks/relay/proof` answers CoderHelm's ownership challenge.
+//!
+//! The registration (id, secret, relay key) lives in the install's own
+//! secret; everything else here is the `SYSTEM`/`HYBRID` settings item.
+
+use std::sync::{Arc, Mutex, RwLock};
+use std::time::{Duration, Instant};
+
+use aws_sdk_dynamodb::types::AttributeValue;
+use axum::{
+    body::Bytes,
+    extract::{Path, Query, State},
+    http::{HeaderMap, StatusCode},
+    Extension, Json,
+};
+use common::deliveries::{self, Delivery, Direction, Status};
+use common::hybrid::client::{self, Credentials};
+use common::hybrid::{integrations, names, sign};
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
+use tracing::{info, warn};
+
+use crate::models::Claims;
+use crate::AppState;
+
+type Reply = Result<Json<Value>, (StatusCode, Json<Value>)>;
+
+fn fail(code: StatusCode, reason: &str, message: &str) -> (StatusCode, Json<Value>) {
+    (code, Json(json!({ "code": reason, "error": message })))
+}
+
+fn admins_only(c: StatusCode) -> (StatusCode, Json<Value>) {
+    fail(c, "forbidden", "Admins only.")
+}
+
+fn from_call(e: client::CallError) -> (StatusCode, Json<Value>) {
+    let code = match e.status {
+        None => StatusCode::BAD_GATEWAY,
+        Some(s) => StatusCode::from_u16(s).unwrap_or(StatusCode::BAD_GATEWAY),
+    };
+    fail(code, &e.code, &e.message)
+}
+
+// ── The local settings ───────────────────────────────────────────────────
+
+/// What this install chose (the `SYSTEM`/`HYBRID` item).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Local {
+    #[serde(default)]
+    pub install_id: String,
+    #[serde(default)]
+    pub cloudfront: String,
+    #[serde(default)]
+    pub registered_at: String,
+    #[serde(default)]
+    pub verified_at: String,
+    /// The claimed `{name}.coderhelm.com` name.
+    #[serde(default)]
+    pub name: String,
+    /// `own` (the install's GitHub App) or `hosted` (CoderHelm's, relayed).
+    #[serde(default)]
+    pub github_mode: String,
+    /// Integrations using CoderHelm's apps (common::hybrid::integrations).
+    #[serde(default)]
+    pub integrations: Vec<String>,
+    #[serde(default)]
+    pub sharing: bool,
+    #[serde(default)]
+    pub share_payloads: bool,
+    /// The records last sent for the name (so they're sent once per change).
+    #[serde(default)]
+    pub records_sent: String,
+}
+
+static LOCAL: RwLock<Option<(Instant, Local)>> = RwLock::new(None);
+
+/// The last settings read in this process (for paths that can't wait on a read).
+pub fn cached_local() -> Option<Local> {
+    LOCAL
+        .read()
+        .ok()
+        .and_then(|g| g.as_ref().map(|(_, l)| l.clone()))
+}
+
+pub async fn local(state: &AppState) -> Local {
+    if let Some((at, l)) = LOCAL.read().ok().and_then(|g| g.clone()) {
+        if at.elapsed() < Duration::from_secs(30) {
+            return l;
+        }
+    }
+    let l: Local = state
+        .dynamo
+        .get_item()
+        .table_name(&state.config.settings_table_name)
+        .key("pk", AttributeValue::S("SYSTEM".into()))
+        .key("sk", AttributeValue::S("HYBRID".into()))
+        .send()
+        .await
+        .ok()
+        .and_then(|r| {
+            r.item()
+                .and_then(|i| i.get("data"))
+                .and_then(|v| v.as_s().ok())
+                .cloned()
+        })
+        .and_then(|t| serde_json::from_str(&t).ok())
+        .unwrap_or_default();
+    if let Ok(mut g) = LOCAL.write() {
+        *g = Some((Instant::now(), l.clone()));
+    }
+    l
+}
+
+async fn save_local(state: &AppState, l: &Local) -> Result<(), (StatusCode, Json<Value>)> {
+    state
+        .dynamo
+        .put_item()
+        .table_name(&state.config.settings_table_name)
+        .item("pk", AttributeValue::S("SYSTEM".into()))
+        .item("sk", AttributeValue::S("HYBRID".into()))
+        .item(
+            "data",
+            AttributeValue::S(serde_json::to_string(l).unwrap_or_default()),
+        )
+        .send()
+        .await
+        .map_err(|e| {
+            warn!(error = %e, "hybrid: settings write failed");
+            fail(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "store_unavailable",
+                "Try again in a minute.",
+            )
+        })?;
+    if let Ok(mut g) = LOCAL.write() {
+        *g = Some((Instant::now(), l.clone()));
+    }
+    Ok(())
+}
+
+/// The registration, from memory or (after another instance registered) the secret.
+async fn creds_now() -> Option<Credentials> {
+    if let Some(c) = client::credentials() {
+        return Some(c);
+    }
+    let s = super::setup::read_secret().await.ok()?;
+    let c = Credentials::from_parts(
+        s["hybrid_install_id"].as_str(),
+        s["hybrid_install_secret"].as_str(),
+        s["hybrid_relay_key"].as_str(),
+    )?;
+    client::set_credentials(Some(c.clone()));
+    Some(c)
+}
+
+// ── Who may ask ──────────────────────────────────────────────────────────
+
+fn admin(claims: &Claims) -> Result<(), (StatusCode, Json<Value>)> {
+    claims.require_role(3).map_err(admins_only)?;
+    if !super::api::is_platform_admin(claims) {
+        return Err(fail(
+            StatusCode::FORBIDDEN,
+            "forbidden",
+            "Install admins only.",
+        ));
+    }
+    if !super::setup_checks::self_hosted() {
+        return Err(fail(
+            StatusCode::NOT_FOUND,
+            "not_self_hosted",
+            "Hybrid is for self-hosted installs.",
+        ));
+    }
+    if common::hybrid::turned_off() {
+        return Err(fail(
+            StatusCode::NOT_FOUND,
+            "turned_off",
+            "Hybrid is turned off in this install's config (hybridUrl: null).",
+        ));
+    }
+    Ok(())
+}
+
+/// The install guide: the one-time setup key from the launch, only while
+/// nobody has signed up.
+async fn setup_key(state: &AppState, headers: &HeaderMap) -> Result<(), (StatusCode, Json<Value>)> {
+    if !super::setup::enabled() || common::hybrid::turned_off() {
+        return Err(fail(StatusCode::NOT_FOUND, "not_found", "Not found."));
+    }
+    let got = headers
+        .get("x-coderhelm-setup-token")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    let secret = super::setup::read_secret().await.unwrap_or(Value::Null);
+    if !super::setup::state_matches(secret.get("setup_token").and_then(Value::as_str), got) {
+        return Err(fail(StatusCode::UNAUTHORIZED, "bad_setup_key", "This browser's setup key doesn't match your install. Finish in CoderHelm: Settings, System, Hybrid."));
+    }
+    if !super::setup_checks::setup_open(state).await {
+        return Err(fail(
+            StatusCode::FORBIDDEN,
+            "setup_closed",
+            "Setup is finished. Continue in CoderHelm: Settings, System, Hybrid.",
+        ));
+    }
+    Ok(())
+}
+
+// ── Core actions (shared by Settings and the guide) ──────────────────────
+
+/// This install's CloudFront hostname (the relay and the name point there).
+async fn cloudfront(state: &AppState) -> Option<String> {
+    let (_, view) = super::setup_checks::domain_facts_now(state).await;
+    let from_view = view
+        .as_ref()
+        .and_then(|v| v["target"].as_str())
+        .map(|t| t.trim_end_matches('.').to_ascii_lowercase())
+        .filter(|t| names::is_cloudfront_domain(t));
+    from_view.or_else(|| {
+        let u = common::public_urls::app_url(&state.config.stage);
+        let host = u
+            .trim_start_matches("https://")
+            .split('/')
+            .next()
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        names::is_cloudfront_domain(&host).then_some(host)
+    })
+}
+
+async fn do_register(state: &AppState) -> Result<Local, (StatusCode, Json<Value>)> {
+    let mut l = local(state).await;
+    if creds_now().await.is_some() && !l.install_id.is_empty() {
+        return Ok(l);
+    }
+    let cf = cloudfront(state).await.ok_or_else(|| {
+        fail(StatusCode::CONFLICT, "no_cloudfront", "This install's CloudFront address isn't known yet. Wait until it finishes deploying, then try again.")
+    })?;
+    let version = std::env::var("CODERHELM_VERSION").unwrap_or_default();
+    let r = state
+        .http
+        .post(format!("{}/hybrid/installs", common::hybrid::hosted_url()))
+        .timeout(Duration::from_secs(10))
+        .json(&json!({ "cloudfront": cf, "version": version }))
+        .send()
+        .await
+        .map_err(|_| fail(StatusCode::BAD_GATEWAY, "hosted_unreachable", "CoderHelm's servers didn't answer. Check that your install can reach api.coderhelm.com, then try again."))?;
+    let code = r.status();
+    let v: Value = r.json().await.unwrap_or_default();
+    if !code.is_success() {
+        return Err(fail(
+            code,
+            v["code"].as_str().unwrap_or("register_failed"),
+            v["error"]
+                .as_str()
+                .unwrap_or("CoderHelm refused the registration."),
+        ));
+    }
+    let c = Credentials::from_parts(
+        v["install_id"].as_str(),
+        v["secret"].as_str(),
+        v["relay_key"].as_str(),
+    )
+    .ok_or_else(|| {
+        fail(
+            StatusCode::BAD_GATEWAY,
+            "register_failed",
+            "CoderHelm answered without keys. Try again.",
+        )
+    })?;
+    let mut secret = super::setup::read_secret().await.map_err(|_| {
+        fail(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "secret_unreadable",
+            "CoderHelm can't read its own secret. Open the installer log in AWS.",
+        )
+    })?;
+    secret["hybrid_install_id"] = json!(c.install_id);
+    secret["hybrid_install_secret"] = json!(c.secret);
+    secret["hybrid_relay_key"] = json!(c.relay_key);
+    let revision = super::setup::write_secret(&secret).await.map_err(|_| {
+        fail(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "secret_unwritable",
+            "CoderHelm couldn't save the keys in its secret.",
+        )
+    })?;
+    client::set_credentials(Some(c.clone()));
+    // The worker and the other gateway copies read the keys at start.
+    super::setup::refresh_services(state, &revision).await;
+    l.install_id = c.install_id.clone();
+    l.cloudfront = cf;
+    l.registered_at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    l.verified_at.clear();
+    save_local(state, &l).await?;
+    info!(install = %c.install_id, "hybrid: registered with CoderHelm");
+    let _ = do_verify(state, &mut l).await;
+    Ok(l)
+}
+
+async fn do_verify(state: &AppState, l: &mut Local) -> Result<(), (StatusCode, Json<Value>)> {
+    let c = creds_now().await.ok_or_else(not_registered)?;
+    client::call(
+        &state.http,
+        &c,
+        "POST",
+        "/hybrid/installs/verify",
+        Some(&json!({})),
+    )
+    .await
+    .map_err(from_call)?;
+    l.verified_at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    save_local(state, l).await
+}
+
+fn not_registered() -> (StatusCode, Json<Value>) {
+    fail(
+        StatusCode::CONFLICT,
+        "not_registered",
+        "Register this install with CoderHelm first.",
+    )
+}
+
+async fn ensure_verified(
+    state: &AppState,
+) -> Result<(Credentials, Local), (StatusCode, Json<Value>)> {
+    let mut l = local(state).await;
+    let c = creds_now().await.ok_or_else(not_registered)?;
+    if l.verified_at.is_empty() {
+        do_verify(state, &mut l).await?;
+    }
+    Ok((c, l))
+}
+
+async fn do_claim(
+    state: &AppState,
+    raw: &str,
+    actor: &str,
+) -> Result<Local, (StatusCode, Json<Value>)> {
+    let name = names::validate_name(raw)
+        .map_err(|p| fail(StatusCode::BAD_REQUEST, p.code(), p.message()))?;
+    let (c, mut l) = ensure_verified(state).await?;
+    client::call(
+        &state.http,
+        &c,
+        "PUT",
+        "/hybrid/names",
+        Some(&json!({ "name": name })),
+    )
+    .await
+    .map_err(from_call)?;
+    l.name = name.clone();
+    l.records_sent.clear();
+    save_local(state, &l).await?;
+    // Ask the updater for the certificate; it finds no zone for
+    // coderhelm.com in this account and lists the two records, which
+    // `sync_name_records` sends to CoderHelm.
+    if super::system::has_updater() {
+        let body = super::system::call(state, json!({ "action": "domain_set", "hostname": names::hostname(&name), "actor": actor }))
+            .await
+            .map_err(|c| fail(c, "domain_set_failed", "The address is yours, but requesting its certificate failed. Press Try again in Settings, System, Domain."))?;
+        if body.get("ok").and_then(Value::as_bool) == Some(false) {
+            return Err(fail(
+                StatusCode::BAD_REQUEST,
+                "domain_set_failed",
+                body["error"]
+                    .as_str()
+                    .unwrap_or("Requesting the certificate failed."),
+            ));
+        }
+    }
+    Ok(l)
+}
+
+async fn do_release(state: &AppState, actor: &str) -> Result<Local, (StatusCode, Json<Value>)> {
+    let c = creds_now().await.ok_or_else(not_registered)?;
+    let mut l = local(state).await;
+    client::call(&state.http, &c, "DELETE", "/hybrid/names", None)
+        .await
+        .map_err(from_call)?;
+    if super::system::has_updater() && !l.name.is_empty() {
+        let _ =
+            super::system::call(state, json!({ "action": "domain_remove", "actor": actor })).await;
+    }
+    l.name.clear();
+    l.records_sent.clear();
+    save_local(state, &l).await?;
+    Ok(l)
+}
+
+/// The records the updater lists for this install's CoderHelm address, as
+/// the hosted side takes them. Empty unless the domain is the claimed name.
+/// The address record waits until the install answers on the name (the
+/// updater's `live`): until then the name shows CoderHelm's "being set up"
+/// page instead of a CloudFront error.
+pub fn records_for(view: &Value, name: &str) -> Vec<names::NameRecord> {
+    if name.is_empty() || view["hostname"].as_str() != Some(names::hostname(name).as_str()) {
+        return vec![];
+    }
+    let attached = view["state"].as_str() == Some("live");
+    view["records"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|r| {
+                    Some(names::NameRecord {
+                        purpose: r["purpose"].as_str()?.to_string(),
+                        name: r["name"].as_str()?.trim_end_matches('.').to_string(),
+                        rtype: r["type"].as_str().unwrap_or("CNAME").to_string(),
+                        value: r["value"].as_str()?.trim_end_matches('.').to_string(),
+                    })
+                })
+                .filter(|r| attached || r.purpose != "address")
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Sends the name's records to CoderHelm when they're new or changed.
+/// Called wherever the domain is checked, so it follows the certificate.
+pub async fn sync_name_records(state: &AppState, view: Option<&Value>) {
+    let l = local(state).await;
+    if l.name.is_empty() {
+        return;
+    }
+    let Some(view) = view else { return };
+    let recs = records_for(view, &l.name);
+    if recs.is_empty() {
+        return;
+    }
+    let key = serde_json::to_string(&recs).unwrap_or_default();
+    if key == l.records_sent {
+        return;
+    }
+    let Some(c) = creds_now().await else { return };
+    match client::call(
+        &state.http,
+        &c,
+        "PUT",
+        "/hybrid/names/records",
+        Some(&json!({ "records": recs })),
+    )
+    .await
+    {
+        Ok(_) => {
+            let mut l = l;
+            l.records_sent = key;
+            let _ = save_local(state, &l).await;
+            info!(name = %l.name, "hybrid: name records sent to CoderHelm");
+        }
+        Err(e) => {
+            let mut d = Delivery::new(
+                Direction::Outbound,
+                "hybrid",
+                "name.records",
+                &names::hostname(&l.name),
+            );
+            d.finish(
+                Status::Failed,
+                "CoderHelm didn't take the records",
+                if e.code == "broker_unreachable" {
+                    "broker_unreachable"
+                } else {
+                    "broker_refused"
+                },
+            );
+            d.attempts.push(deliveries::Attempt {
+                at: d.created_at.clone(),
+                code: e.status,
+                duration_ms: 0,
+                error: e.message.clone(),
+            });
+            super::deliveries::save(state, super::deliveries::UNROUTED, &d).await;
+            warn!(error = %e, "hybrid: name records not taken");
+        }
+    }
+}
+
+async fn do_link(
+    state: &AppState,
+    return_url: Option<&str>,
+) -> Result<Value, (StatusCode, Json<Value>)> {
+    let (c, _) = ensure_verified(state).await?;
+    let ret = return_url
+        .filter(|u| u.starts_with("https://"))
+        .map(str::to_string)
+        .unwrap_or_else(|| {
+            format!(
+                "{}/settings/system/#hybrid",
+                common::public_urls::app_url(&state.config.stage)
+            )
+        });
+    client::call(
+        &state.http,
+        &c,
+        "POST",
+        "/hybrid/github/link-start",
+        Some(&json!({ "return_url": ret })),
+    )
+    .await
+    .map_err(from_call)
+}
+
+#[derive(Deserialize, Default)]
+pub struct SettingsBody {
+    #[serde(default)]
+    pub github_mode: Option<String>,
+    #[serde(default)]
+    pub integrations: Option<Vec<String>>,
+    #[serde(default)]
+    pub sharing: Option<SharingBody>,
+}
+
+#[derive(Deserialize, Default, Clone)]
+pub struct SharingBody {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub payloads: bool,
+}
+
+/// Applies a settings change to the local choices (pure; tested).
+pub fn apply_settings(l: &mut Local, b: &SettingsBody) -> Result<(), &'static str> {
+    if let Some(m) = &b.github_mode {
+        match m.as_str() {
+            "own" | "hosted" => l.github_mode = m.clone(),
+            _ => return Err("github_mode is own or hosted"),
+        }
+    }
+    if let Some(list) = &b.integrations {
+        let allowed: Vec<&str> = integrations::hosted_ids().collect();
+        if let Some(bad) = list.iter().find(|i| !allowed.contains(&i.as_str())) {
+            let _ = bad;
+            return Err("an integration that can't use CoderHelm's app");
+        }
+        l.integrations = list.clone();
+    }
+    // GitHub through CoderHelm's app is the "github" integration.
+    l.integrations.retain(|i| i != "github");
+    if l.github_mode == "hosted" {
+        l.integrations.insert(0, "github".into());
+    }
+    if let Some(s) = &b.sharing {
+        l.sharing = s.enabled;
+        l.share_payloads = s.enabled && s.payloads;
+    }
+    Ok(())
+}
+
+async fn do_settings(
+    state: &AppState,
+    b: &SettingsBody,
+) -> Result<Local, (StatusCode, Json<Value>)> {
+    let mut l = local(state).await;
+    apply_settings(&mut l, b).map_err(|m| fail(StatusCode::BAD_REQUEST, "bad_settings", m))?;
+    if let Some(c) = creds_now().await {
+        client::call(
+            &state.http,
+            &c,
+            "PUT",
+            "/hybrid/settings",
+            Some(&json!({ "integrations": l.integrations, "sharing": { "enabled": l.sharing, "payloads": l.share_payloads } })),
+        )
+        .await
+        .map_err(from_call)?;
+    } else if !l.integrations.is_empty() || l.sharing {
+        return Err(not_registered());
+    }
+    save_local(state, &l).await?;
+    Ok(l)
+}
+
+// ── Status and checks ────────────────────────────────────────────────────
+
+/// One hybrid check: id, status, code, plain title and fix.
+fn check(id: &str, status: &str, code: &str, title: &str, fix: &str) -> Value {
+    json!({ "id": id, "status": status, "code": code, "title": title, "fix": if fix.is_empty() { Value::Null } else { json!(fix) } })
+}
+
+static LAST_INTAKE_PROBLEM: Mutex<Option<(Instant, &'static str)>> = Mutex::new(None);
+
+/// A relay signature problem from the last hour, if any.
+fn recent_intake_problem() -> Option<&'static str> {
+    LAST_INTAKE_PROBLEM
+        .lock()
+        .ok()
+        .and_then(|g| *g)
+        .filter(|(at, _)| at.elapsed() < Duration::from_secs(3600))
+        .map(|(_, p)| p)
+}
+
+/// The checks for Settings and the guide, from what's known (pure; tested).
+pub fn checks(
+    l: &Local,
+    registered: bool,
+    hosted: Option<&Value>,
+    domain_code: Option<&str>,
+    intake_problem: Option<&str>,
+) -> Vec<Value> {
+    let mut out = vec![];
+    if !registered {
+        out.push(check(
+            "hybrid_registered",
+            "todo",
+            "not_registered",
+            "Not registered with CoderHelm",
+            "Press Register: it takes a few seconds and changes nothing in AWS.",
+        ));
+        return out;
+    }
+    let verified = hosted
+        .map(|h| h["verified"].as_bool() == Some(true))
+        .unwrap_or(!l.verified_at.is_empty());
+    out.push(if verified {
+        check("hybrid_registered", "pass", "ok", "Registered and verified", "")
+    } else {
+        check("hybrid_registered", "fail", "proof_failed", "CoderHelm can't reach your install yet", "It restarts after registering. Wait a minute and press Check again; if it stays, check that its CloudFront address opens.")
+    });
+    if hosted.is_some_and(|h| h["status"].as_str() == Some("revoked")) {
+        out.push(check(
+            "hybrid_access",
+            "fail",
+            "broker_revoked",
+            "CoderHelm turned off this install's access",
+            "Contact support, or switch to your own GitHub App and domain.",
+        ));
+    }
+    if !l.name.is_empty() {
+        let host = names::hostname(&l.name);
+        out.push(match domain_code {
+            Some("ok") => check("hybrid_name", "pass", "ok", &format!("{host} is live"), ""),
+            Some("validating") | Some("dns_missing") => check("hybrid_name", "wait", "cert_pending", &format!("Setting up {host}"), "CoderHelm added the records. AWS issues the certificate within about 30 minutes, then CoderHelm moves to the address by itself."),
+            Some("attaching") => check("hybrid_name", "wait", "attaching", &format!("Moving to {host}"), "About 10 minutes. CoderHelm keeps working on its AWS address meanwhile."),
+            Some(c) if c != "none" => check("hybrid_name", "fail", c, &format!("{host} isn't working yet"), "Open Settings, System, Domain for the reason and press Try again."),
+            _ => check("hybrid_name", "wait", "requested", &format!("Requesting the certificate for {host}"), "This page checks again by itself."),
+        });
+    }
+    if l.github_mode == "hosted" {
+        let links = hosted
+            .and_then(|h| h["github"]["links"].as_array())
+            .map(Vec::len)
+            .unwrap_or(0);
+        out.push(if links > 0 {
+            check(
+                "hybrid_github",
+                "pass",
+                "ok",
+                "CoderHelm's GitHub App is linked",
+                "",
+            )
+        } else {
+            check(
+                "hybrid_github",
+                "todo",
+                "no_link",
+                "Install CoderHelm's GitHub App on your organization",
+                "Press Install on GitHub, pick the repositories, and you come back here linked.",
+            )
+        });
+    }
+    if let Some(p) = intake_problem {
+        let sp = match p {
+            "signature_mismatch" => sign::SignatureProblem::Mismatch,
+            "signature_stale" => sign::SignatureProblem::Stale,
+            _ => sign::SignatureProblem::Malformed,
+        };
+        out.push(check("hybrid_relay", "fail", p, sp.message(), sp.fix()));
+    }
+    out
+}
+
+async fn status_value(state: &AppState, deep: bool) -> Value {
+    let mut l = local(state).await;
+    let creds = creds_now().await;
+    let hosted = match &creds {
+        Some(c) => client::call(&state.http, c, "GET", "/hybrid/status", None)
+            .await
+            .ok(),
+        None => None,
+    };
+    if let (Some(_), Some(h)) = (&creds, &hosted) {
+        if h["verified"].as_bool() != Some(true) && deep {
+            let _ = do_verify(state, &mut l).await;
+        }
+    }
+    let (facts, view) = super::setup_checks::domain_facts_now(state).await;
+    sync_name_records(state, view.as_ref()).await;
+    let (_, code) = super::setup_checks::domain_code(&facts);
+    let problem = recent_intake_problem();
+    let mut list = checks(&l, creds.is_some(), hosted.as_ref(), Some(code), problem);
+    if deep && l.github_mode == "hosted" {
+        if let Some(first) = hosted
+            .as_ref()
+            .and_then(|h| h["github"]["links"][0]["installation_id"].as_u64())
+        {
+            list.push(match client::github_token(&state.http, first).await {
+                Ok(_) => check(
+                    "hybrid_broker",
+                    "pass",
+                    "ok",
+                    "Tokens from CoderHelm's broker work",
+                    "",
+                ),
+                Err(e) => {
+                    let r = deliveries::reason(&e.code);
+                    check("hybrid_broker", "fail", &e.code, r.message, r.fix)
+                }
+            });
+        }
+    }
+    let chosen: Vec<Value> = integrations::CATALOG
+        .iter()
+        .map(|e| {
+            let mut v = serde_json::to_value(e).unwrap_or_default();
+            v["uses_coderhelm"] = json!(l.integrations.iter().any(|i| i == e.id));
+            v
+        })
+        .collect();
+    json!({
+        "available": super::setup_checks::self_hosted(),
+        "hosted_url": common::hybrid::hosted_url(),
+        "registered": creds.is_some(),
+        "install_id": creds.as_ref().map(|c| c.install_id.clone()),
+        "cloudfront": l.cloudfront,
+        "verified": hosted.as_ref().map(|h| h["verified"].as_bool() == Some(true)).unwrap_or(false),
+        "name": if l.name.is_empty() { Value::Null } else { json!({ "name": l.name, "hostname": names::hostname(&l.name), "code": code }) },
+        "github": {
+            "mode": if l.github_mode.is_empty() { "own" } else { l.github_mode.as_str() },
+            "links": hosted.as_ref().map(|h| h["github"]["links"].clone()).unwrap_or(json!([])),
+            "app_slug": hosted.as_ref().map(|h| h["github"]["app_slug"].clone()).unwrap_or(Value::Null),
+        },
+        "integrations": chosen,
+        "sharing": { "enabled": l.sharing, "payloads": l.share_payloads },
+        "checks": list,
+    })
+}
+
+// ── Settings routes (install admins) ─────────────────────────────────────
+
+/// GET /api/system/hybrid?deep=1
+pub async fn get_status(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<Claims>,
+    Query(q): Query<DeepQuery>,
+) -> Reply {
+    admin(&claims)?;
+    Ok(Json(status_value(&state, q.deep.is_some()).await))
+}
+
+#[derive(Deserialize, Default)]
+pub struct DeepQuery {
+    deep: Option<String>,
+}
+
+/// POST /api/system/hybrid/register
+pub async fn register(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<Claims>,
+) -> Reply {
+    admin(&claims)?;
+    do_register(&state).await?;
+    Ok(Json(status_value(&state, false).await))
+}
+
+/// DELETE /api/system/hybrid: leave hybrid (release the name, unlink,
+/// revoke the sign-ins) and forget the registration.
+pub async fn unregister(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<Claims>,
+) -> Reply {
+    admin(&claims)?;
+    if let Some(c) = creds_now().await {
+        client::call(&state.http, &c, "DELETE", "/hybrid/installs", None)
+            .await
+            .map_err(from_call)?;
+    }
+    if let Ok(mut secret) = super::setup::read_secret().await {
+        if let Some(o) = secret.as_object_mut() {
+            o.remove("hybrid_install_id");
+            o.remove("hybrid_install_secret");
+            o.remove("hybrid_relay_key");
+        }
+        if let Ok(rev) = super::setup::write_secret(&secret).await {
+            super::setup::refresh_services(&state, &rev).await;
+        }
+    }
+    client::set_credentials(None);
+    save_local(&state, &Local::default()).await?;
+    Ok(Json(status_value(&state, false).await))
+}
+
+/// GET /api/system/hybrid/names/:name — is it free? (CoderHelm's public check)
+pub async fn name_available(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<Claims>,
+    Path(name): Path<String>,
+) -> Reply {
+    admin(&claims)?;
+    available(&state, &name).await
+}
+
+async fn available(state: &AppState, raw: &str) -> Reply {
+    if let Err(p) = names::validate_name(raw) {
+        return Ok(Json(
+            json!({ "name": raw, "available": false, "code": p.code(), "error": p.message() }),
+        ));
+    }
+    let url = format!(
+        "{}/hybrid/names/{}",
+        common::hybrid::hosted_url(),
+        urlencoding::encode(raw.trim())
+    );
+    let r = state
+        .http
+        .get(url)
+        .timeout(Duration::from_secs(6))
+        .send()
+        .await
+        .map_err(|_| {
+            fail(
+                StatusCode::BAD_GATEWAY,
+                "hosted_unreachable",
+                "CoderHelm's servers didn't answer.",
+            )
+        })?;
+    Ok(Json(r.json().await.unwrap_or_default()))
+}
+
+#[derive(Deserialize, Default)]
+pub struct NameBody {
+    #[serde(default)]
+    name: String,
+}
+
+/// PUT /api/system/hybrid/name `{name}`
+pub async fn claim_name(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<Claims>,
+    Json(b): Json<NameBody>,
+) -> Reply {
+    admin(&claims)?;
+    do_claim(&state, &b.name, &claims.email).await?;
+    Ok(Json(status_value(&state, false).await))
+}
+
+/// DELETE /api/system/hybrid/name
+pub async fn release_name(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<Claims>,
+) -> Reply {
+    admin(&claims)?;
+    do_release(&state, &claims.email).await?;
+    Ok(Json(status_value(&state, false).await))
+}
+
+#[derive(Deserialize, Default)]
+pub struct LinkBody {
+    #[serde(default)]
+    return_url: Option<String>,
+}
+
+/// POST /api/system/hybrid/github/link — where to install CoderHelm's GitHub App.
+pub async fn github_link(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<Claims>,
+    body: Option<Json<LinkBody>>,
+) -> Reply {
+    admin(&claims)?;
+    let b = body.map(|Json(b)| b).unwrap_or_default();
+    Ok(Json(do_link(&state, b.return_url.as_deref()).await?))
+}
+
+/// PUT /api/system/hybrid/github/:installation_id `{repositories}`
+pub async fn github_repositories(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<Claims>,
+    Path(iid): Path<u64>,
+    Json(b): Json<Value>,
+) -> Reply {
+    admin(&claims)?;
+    let c = creds_now().await.ok_or_else(not_registered)?;
+    client::call(
+        &state.http,
+        &c,
+        "PUT",
+        &format!("/hybrid/github/links/{iid}"),
+        Some(&json!({ "repositories": b["repositories"] })),
+    )
+    .await
+    .map_err(from_call)?;
+    Ok(Json(status_value(&state, false).await))
+}
+
+/// DELETE /api/system/hybrid/github/:installation_id
+pub async fn github_unlink(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<Claims>,
+    Path(iid): Path<u64>,
+) -> Reply {
+    admin(&claims)?;
+    let c = creds_now().await.ok_or_else(not_registered)?;
+    client::call(
+        &state.http,
+        &c,
+        "DELETE",
+        &format!("/hybrid/github/links/{iid}"),
+        None,
+    )
+    .await
+    .map_err(from_call)?;
+    Ok(Json(status_value(&state, false).await))
+}
+
+/// PUT /api/system/hybrid/settings `{github_mode?, integrations?, sharing?}`
+pub async fn put_settings(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<Claims>,
+    Json(b): Json<SettingsBody>,
+) -> Reply {
+    admin(&claims)?;
+    do_settings(&state, &b).await?;
+    Ok(Json(status_value(&state, false).await))
+}
+
+// ── Guide routes (setup key, until the first sign-up) ────────────────────
+//
+// The install guide (docs.coderhelm.com) calls these from the browser. Each
+// is a simple cross-origin POST (a text/plain JSON body carrying the setup
+// key, no custom headers), so there is no preflight; the answer allows any
+// origin, since the setup key in the body is the only credential.
+
+#[derive(Deserialize, Default)]
+pub struct GuideBody {
+    #[serde(default)]
+    setup_token: String,
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    return_url: Option<String>,
+    #[serde(default)]
+    github_mode: Option<String>,
+    #[serde(default)]
+    integrations: Option<Vec<String>>,
+    #[serde(default)]
+    sharing: Option<SharingBody>,
+}
+
+fn guide_body(body: &[u8]) -> GuideBody {
+    serde_json::from_slice(body).unwrap_or_default()
+}
+
+/// Any origin may read a guide answer (no cookies are involved).
+fn guide_reply(r: Reply) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    let cors = [(axum::http::header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")];
+    match r {
+        Ok(v) => (cors, v).into_response(),
+        Err((code, v)) => (code, cors, v).into_response(),
+    }
+}
+
+async fn guide_key(state: &AppState, b: &GuideBody) -> Result<(), (StatusCode, Json<Value>)> {
+    let mut h = HeaderMap::new();
+    if let Ok(v) = b.setup_token.parse() {
+        h.insert("x-coderhelm-setup-token", v);
+    }
+    setup_key(state, &h).await
+}
+
+/// POST /api/setup/hybrid `{setup_token}`: the hybrid checks for the guide.
+pub async fn setup_status(
+    State(state): State<Arc<AppState>>,
+    body: Bytes,
+) -> axum::response::Response {
+    let b = guide_body(&body);
+    let r = async {
+        guide_key(&state, &b).await?;
+        Ok(Json(status_value(&state, true).await))
+    }
+    .await;
+    guide_reply(r)
+}
+
+/// POST /api/setup/hybrid/register `{setup_token}`
+pub async fn setup_register(
+    State(state): State<Arc<AppState>>,
+    body: Bytes,
+) -> axum::response::Response {
+    let b = guide_body(&body);
+    let r = async {
+        guide_key(&state, &b).await?;
+        do_register(&state).await?;
+        Ok(Json(status_value(&state, false).await))
+    }
+    .await;
+    guide_reply(r)
+}
+
+/// POST /api/setup/hybrid/name `{setup_token, name}`
+pub async fn setup_claim_name(
+    State(state): State<Arc<AppState>>,
+    body: Bytes,
+) -> axum::response::Response {
+    let b = guide_body(&body);
+    let r = async {
+        guide_key(&state, &b).await?;
+        do_claim(&state, &b.name, "install guide").await?;
+        Ok(Json(status_value(&state, false).await))
+    }
+    .await;
+    guide_reply(r)
+}
+
+/// POST /api/setup/hybrid/github/link `{setup_token, return_url}`
+pub async fn setup_github_link(
+    State(state): State<Arc<AppState>>,
+    body: Bytes,
+) -> axum::response::Response {
+    let b = guide_body(&body);
+    let r = async {
+        guide_key(&state, &b).await?;
+        Ok(Json(do_link(&state, b.return_url.as_deref()).await?))
+    }
+    .await;
+    guide_reply(r)
+}
+
+/// POST /api/setup/hybrid/settings `{setup_token, github_mode?, integrations?, sharing?}`
+pub async fn setup_settings(
+    State(state): State<Arc<AppState>>,
+    body: Bytes,
+) -> axum::response::Response {
+    let b = guide_body(&body);
+    let r = async {
+        guide_key(&state, &b).await?;
+        let s = SettingsBody {
+            github_mode: b.github_mode.clone(),
+            integrations: b.integrations.clone(),
+            sharing: b.sharing.clone(),
+        };
+        do_settings(&state, &s).await?;
+        Ok(Json(status_value(&state, false).await))
+    }
+    .await;
+    guide_reply(r)
+}
+
+// ── The relay intake ─────────────────────────────────────────────────────
+
+fn note_intake_problem(p: &'static str) {
+    if let Ok(mut g) = LAST_INTAKE_PROBLEM.lock() {
+        *g = Some((Instant::now(), p));
+    }
+}
+
+/// POST /webhooks/relay: an event CoderHelm's relay forwarded.
+#[utoipa::path(
+    post,
+    path = "/webhooks/relay",
+    tag = "Webhooks",
+    operation_id = "receiveRelayedEvent",
+    summary = "Events from CoderHelm's relay",
+    description = "On a hybrid self-hosted install, where CoderHelm's hosted relay forwards the events \
+        of CoderHelm's GitHub App (and Jira app) after checking the provider's own signature. Each \
+        request is signed with the install's relay key: `X-CoderHelm-Relay-Signature: t=<unix \
+        seconds>,d=<delivery id>,v1=<hex>`, the HMAC-SHA256 of `<t>.<d>.<raw body>`. Requests older \
+        than 5 minutes are refused, and so is a delivery id the install has already taken (`409`). \
+        `X-CoderHelm-Relay-Source` is `github` or `jira`; for GitHub, `X-CoderHelm-Relay-Event` is \
+        GitHub's event type and the body is GitHub's payload, unchanged.",
+    params(
+        ("X-CoderHelm-Relay-Signature" = String, Header, description = "`t=<unix seconds>,d=<delivery id>,v1=<hex HMAC-SHA256>`.", example = "t=1761436800,d=72d3162e-cc78-11e3-81ab-4c9367dc0958,v1=5d1a…"),
+        ("X-CoderHelm-Relay-Source" = String, Header, description = "Where the event came from: `github` or `jira`.", example = "github"),
+        ("X-CoderHelm-Relay-Event" = Option<String>, Header, description = "The provider's event type.", example = "pull_request"),
+    ),
+    request_body(content = Object, description = "The provider's payload, unchanged.", content_type = "application/json"),
+    responses(
+        (status = 200, description = "Handled (or acknowledged and ignored)."),
+        (status = 401, description = "The signature is missing, wrong, or more than 5 minutes old."),
+        (status = 404, description = "This install isn't registered for the relay."),
+        (status = 409, description = "This delivery id was already received; the copy was refused."),
+    ),
+    security(("relay_signature" = [])),
+)]
+pub async fn intake(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<StatusCode, (StatusCode, Json<Value>)> {
+    let Some(c) = creds_now().await else {
+        return Err(fail(
+            StatusCode::NOT_FOUND,
+            "not_registered",
+            "This install isn't registered for CoderHelm's relay.",
+        ));
+    };
+    let h = |k: &str| {
+        headers
+            .get(k)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string()
+    };
+    let source = h(sign::RELAY_SOURCE_HEADER);
+    let event = h(sign::RELAY_EVENT_HEADER);
+    let stamp = match sign::verify_relay(
+        &c.relay_key,
+        headers
+            .get(sign::RELAY_HEADER)
+            .and_then(|v| v.to_str().ok()),
+        &body,
+        chrono::Utc::now().timestamp(),
+    ) {
+        Ok(s) => s,
+        Err(p) => {
+            note_intake_problem(p.code());
+            let mut d = Delivery::new(
+                Direction::Inbound,
+                "relay",
+                &format!("{source}.{event}"),
+                "",
+            )
+            .with_headers(
+                headers
+                    .iter()
+                    .filter_map(|(k, v)| Some((k.as_str(), v.to_str().ok()?))),
+            );
+            d.finish(Status::Failed, "Refused: bad signature", p.code());
+            super::deliveries::save(&state, super::deliveries::UNROUTED, &d).await;
+            return Err(fail(StatusCode::UNAUTHORIZED, p.code(), p.message()));
+        }
+    };
+    // Each delivery id once (claims outlive the 5-minute window).
+    let claim = common::claim::claim(
+        &state.dynamo,
+        &state.config.settings_table_name,
+        "SYSTEM",
+        &sign::replay_key(&stamp.delivery_id),
+        sign::REPLAY_TTL_SECS as u64,
+    )
+    .await;
+    if matches!(claim, common::claim::Claim::Held) {
+        return Err(fail(
+            StatusCode::CONFLICT,
+            sign::SignatureProblem::Replayed.code(),
+            sign::SignatureProblem::Replayed.message(),
+        ));
+    }
+    match source.as_str() {
+        "github" => {
+            let payload: Value = serde_json::from_slice(&body).map_err(|_| {
+                fail(
+                    StatusCode::BAD_REQUEST,
+                    "bad_payload",
+                    "The body isn't JSON.",
+                )
+            })?;
+            let installation_id = payload["installation"]["id"].as_u64().ok_or_else(|| {
+                fail(
+                    StatusCode::BAD_REQUEST,
+                    "bad_payload",
+                    "The body names no installation.",
+                )
+            })?;
+            let mut gh = headers.clone();
+            gh.insert(
+                "x-github-event",
+                event
+                    .parse()
+                    .unwrap_or(axum::http::HeaderValue::from_static("unknown")),
+            );
+            gh.insert(
+                "x-github-delivery",
+                stamp
+                    .delivery_id
+                    .parse()
+                    .unwrap_or(axum::http::HeaderValue::from_static("")),
+            );
+            let mut d = super::github_webhook::inbound_delivery(&gh, &body, &event);
+            // The redelivery for a relayed event is the relay's own record.
+            d.redeliver = None;
+            super::github_webhook::process(&state, &event, &payload, installation_id, &mut d)
+                .await
+                .map_err(|code| fail(code, "handler_error", "Handling the event failed."))
+        }
+        "jira" => {
+            let mut payload: Value = serde_json::from_slice(&body).map_err(|_| {
+                fail(
+                    StatusCode::BAD_REQUEST,
+                    "bad_payload",
+                    "The body isn't JSON.",
+                )
+            })?;
+            if event == "register" {
+                if payload["team_id"].as_str().is_some_and(sign::is_install_id) {
+                    if let Some(o) = payload.as_object_mut() {
+                        o.remove("team_id");
+                    }
+                }
+                let team = only_team(&state).await.ok_or_else(|| {
+                    fail(
+                        StatusCode::CONFLICT,
+                        "no_team",
+                        "This install has no team yet. Sign up first.",
+                    )
+                })?;
+                payload["team_id"] = json!(team);
+                return super::api::forge_register_urls(State(state.clone()), Json(payload))
+                    .await
+                    .map_err(|code| {
+                        fail(
+                            code,
+                            "handler_error",
+                            "Registering the Jira app's links failed.",
+                        )
+                    });
+            }
+            // The Forge app was set up with this install's id as its team id:
+            // the install's own team takes the event.
+            if payload
+                .pointer("/coderhelm/team_id")
+                .and_then(Value::as_str)
+                .is_some_and(sign::is_install_id)
+            {
+                let team = only_team(&state).await.ok_or_else(|| {
+                    fail(
+                        StatusCode::CONFLICT,
+                        "no_team",
+                        "This install has no team yet. Sign up first.",
+                    )
+                })?;
+                payload["coderhelm"]["team_id"] = json!(team);
+            }
+            let bytes = Bytes::from(serde_json::to_vec(&payload).unwrap_or_default());
+            super::jira_webhook::handle_forge(State(state.clone()), bytes)
+                .await
+                .map_err(|code| fail(code, "handler_error", "Handling the Jira event failed."))
+        }
+        _ => Err(fail(
+            StatusCode::BAD_REQUEST,
+            "unknown_source",
+            "This release doesn't take that kind of event yet. Update CoderHelm.",
+        )),
+    }
+}
+
+/// The install's team, when it has exactly one (the usual self-hosted case).
+async fn only_team(state: &AppState) -> Option<String> {
+    let r = state
+        .dynamo
+        .scan()
+        .table_name(&state.config.teams_table_name)
+        .filter_expression("sk = :m")
+        .expression_attribute_values(":m", AttributeValue::S("META".into()))
+        .projection_expression("team_id")
+        .limit(50)
+        .send()
+        .await
+        .ok()?;
+    let ids: Vec<String> = r
+        .items()
+        .iter()
+        .filter_map(|i| i.get("team_id")?.as_s().ok().cloned())
+        .collect();
+    (ids.len() == 1).then(|| ids[0].clone())
+}
+
+#[derive(Deserialize, Default)]
+pub struct ProofQuery {
+    challenge: Option<String>,
+}
+
+/// GET /webhooks/relay/proof?challenge= — CoderHelm checks this install
+/// holds the registration secret and answers on its CloudFront address.
+pub async fn proof(
+    headers: HeaderMap,
+    Query(q): Query<ProofQuery>,
+) -> Result<Json<Value>, StatusCode> {
+    crate::middleware::rate_limit::allow(&headers, "hybrid-proof", 30, 60)?;
+    let c = creds_now().await.ok_or(StatusCode::NOT_FOUND)?;
+    let ch = q.challenge.unwrap_or_default();
+    if ch.is_empty() || ch.len() > 100 {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    Ok(Json(
+        json!({ "install_id": c.install_id, "proof": sign::proof(&c.secret, &ch) }),
+    ))
+}
+
+// ── Sharing with support ─────────────────────────────────────────────────
+
+/// What a shared failure carries: metadata, and the payload preview only
+/// when the install chose to share payloads (pure; tested).
+pub fn shared_copy(d: &Delivery, payloads: bool) -> Delivery {
+    let mut s = d.clone();
+    s.headers.clear();
+    if !payloads {
+        s.payload_preview.clear();
+    }
+    s
+}
+
+/// Sends a failed delivery's metadata to CoderHelm support, when sharing is on.
+pub async fn share_failure(state: &AppState, d: &Delivery) {
+    let Some(l) = cached_local() else { return };
+    if !l.sharing {
+        return;
+    }
+    let Some(c) = client::credentials() else {
+        return;
+    };
+    let copy = shared_copy(d, l.share_payloads);
+    let body = json!({ "delivery": copy });
+    let call = client::call(
+        &state.http,
+        &c,
+        "POST",
+        "/hybrid/deliveries/shared",
+        Some(&body),
+    );
+    if tokio::time::timeout(Duration::from_secs(2), call)
+        .await
+        .is_err()
+    {
+        warn!("hybrid: sharing a failure timed out");
+    }
+}
+
+/// The fixed label of each public hybrid check (the public status never
+/// carries addresses or names).
+pub fn public_label(id: &str) -> &'static str {
+    match id {
+        "hybrid_registered" => "Registered with CoderHelm",
+        "hybrid_name" => "Your CoderHelm address",
+        "hybrid_github" => "CoderHelm's GitHub App",
+        "hybrid_access" => "Access to CoderHelm's apps",
+        "hybrid_relay" => "Events from CoderHelm's relay",
+        _ => "Hybrid",
+    }
+}
+
+/// The public setup status's hybrid checks (ids, statuses, codes only).
+pub async fn public_checks(state: &AppState) -> Vec<Value> {
+    let l = local(state).await;
+    if l.install_id.is_empty() && l.github_mode.is_empty() {
+        return vec![];
+    }
+    let creds = creds_now().await;
+    let hosted = match &creds {
+        Some(c) => client::call(&state.http, c, "GET", "/hybrid/status", None)
+            .await
+            .ok(),
+        None => None,
+    };
+    let code = if l.name.is_empty() {
+        None
+    } else {
+        let (facts, view) = super::setup_checks::domain_facts_now(state).await;
+        sync_name_records(state, view.as_ref()).await;
+        Some(super::setup_checks::domain_code(&facts).1)
+    };
+    checks(&l, creds.is_some(), hosted.as_ref(), code, recent_intake_problem())
+        .into_iter()
+        .map(|c| {
+            let id = c["id"].as_str().unwrap_or("").to_string();
+            json!({ "id": id, "status": c["status"], "code": c["code"], "label": public_label(&id), "required": false })
+        })
+        .collect()
+}
+
+/// How many GitHub installations are linked to this install (0 when unknown).
+pub async fn linked_installations(state: &AppState) -> usize {
+    let Some(c) = creds_now().await else { return 0 };
+    client::call(&state.http, &c, "GET", "/hybrid/status", None)
+        .await
+        .ok()
+        .and_then(|v| v["github"]["links"].as_array().map(Vec::len))
+        .unwrap_or(0)
+}
+
+/// The registration to sign in with when this install chose CoderHelm's app
+/// for a knowledge provider (Notion, Confluence, Google Drive).
+pub fn brokered(kind: common::knowledge::sources::Kind) -> Option<Credentials> {
+    let l = cached_local()?;
+    l.integrations
+        .iter()
+        .any(|i| i == kind.key())
+        .then(client::credentials)
+        .flatten()
+}
+
+/// For the public GitHub checks: is GitHub going through CoderHelm's app?
+pub async fn github_hosted(state: &AppState) -> bool {
+    local(state).await.github_mode == "hosted"
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn registered() -> Local {
+        Local {
+            install_id: "ins_abcdefghijklmnopqrstuvwx".into(),
+            verified_at: "t".into(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn settings_keep_github_and_sharing_consistent() {
+        let mut l = Local::default();
+        let b = SettingsBody {
+            github_mode: Some("hosted".into()),
+            integrations: Some(vec!["notion".into()]),
+            sharing: Some(SharingBody {
+                enabled: false,
+                payloads: true,
+            }),
+        };
+        apply_settings(&mut l, &b).unwrap();
+        assert_eq!(l.integrations, vec!["github", "notion"]);
+        assert!(!l.share_payloads, "payloads only with sharing on");
+        let b = SettingsBody {
+            github_mode: Some("own".into()),
+            ..Default::default()
+        };
+        apply_settings(&mut l, &b).unwrap();
+        assert_eq!(l.integrations, vec!["notion"]);
+        let bad = SettingsBody {
+            integrations: Some(vec!["slack_commands".into()]),
+            ..Default::default()
+        };
+        assert!(apply_settings(&mut l, &bad).is_err());
+        let bad = SettingsBody {
+            github_mode: Some("both".into()),
+            ..Default::default()
+        };
+        assert!(apply_settings(&mut l, &bad).is_err());
+        let on = SettingsBody {
+            sharing: Some(SharingBody {
+                enabled: true,
+                payloads: true,
+            }),
+            ..Default::default()
+        };
+        apply_settings(&mut l, &on).unwrap();
+        assert!(l.sharing && l.share_payloads);
+    }
+
+    #[test]
+    fn checks_say_what_to_do_next() {
+        let c = checks(&Local::default(), false, None, None, None);
+        assert_eq!(c.len(), 1);
+        assert_eq!(c[0]["code"], "not_registered");
+        let mut l = registered();
+        l.name = "example".into();
+        l.github_mode = "hosted".into();
+        let hosted = json!({"verified": true, "status": "active", "github": {"links": []}});
+        let c = checks(&l, true, Some(&hosted), Some("validating"), None);
+        let by = |id: &str| c.iter().find(|x| x["id"] == id).cloned().unwrap();
+        assert_eq!(by("hybrid_registered")["status"], "pass");
+        assert_eq!(by("hybrid_name")["code"], "cert_pending");
+        assert!(by("hybrid_name")["title"]
+            .as_str()
+            .unwrap()
+            .contains("example.coderhelm.com"));
+        assert_eq!(by("hybrid_github")["code"], "no_link");
+        let hosted = json!({"verified": false, "status": "revoked", "github": {"links": [{"installation_id": 1}]}});
+        let c = checks(
+            &l,
+            true,
+            Some(&hosted),
+            Some("ok"),
+            Some("signature_mismatch"),
+        );
+        let by = |id: &str| c.iter().find(|x| x["id"] == id).cloned().unwrap();
+        assert_eq!(by("hybrid_registered")["code"], "proof_failed");
+        assert_eq!(by("hybrid_access")["code"], "broker_revoked");
+        assert_eq!(by("hybrid_name")["status"], "pass");
+        assert_eq!(by("hybrid_github")["status"], "pass");
+        assert_eq!(by("hybrid_relay")["code"], "signature_mismatch");
+        assert!(c
+            .iter()
+            .all(|x| x["title"].as_str().is_some_and(|t| !t.is_empty())));
+    }
+
+    #[test]
+    fn only_the_claimed_names_records_are_sent() {
+        let view = json!({
+            "hostname": "example.coderhelm.com",
+            "state": "live",
+            "records": [
+                {"purpose": "certificate", "name": "_abc.example.coderhelm.com.", "type": "CNAME", "value": "_def.acm-validations.aws."},
+                {"purpose": "address", "name": "example.coderhelm.com", "type": "CNAME", "value": "d1abcdef234567.cloudfront.net"}
+            ]
+        });
+        let r = records_for(&view, "example");
+        assert_eq!(r.len(), 2);
+        assert_eq!(r[0].name, "_abc.example.coderhelm.com");
+        assert_eq!(r[0].value, "_def.acm-validations.aws");
+        assert!(records_for(&view, "other").is_empty());
+        let mut early = view.clone();
+        early["state"] = json!("validating");
+        let r = records_for(&early, "example");
+        assert_eq!(r.len(), 1, "the address waits for the certificate");
+        assert_eq!(r[0].purpose, "certificate");
+        assert!(records_for(&view, "").is_empty());
+    }
+
+    #[test]
+    fn shared_failures_carry_metadata_and_payloads_only_when_chosen() {
+        let d = Delivery::new(Direction::Inbound, "github", "push", "TEAM#1")
+            .with_headers([("X-GitHub-Event", "push")])
+            .with_payload(br#"{"a":1}"#);
+        let m = shared_copy(&d, false);
+        assert!(m.headers.is_empty() && m.payload_preview.is_empty());
+        assert_eq!(m.event, "push");
+        let p = shared_copy(&d, true);
+        assert!(!p.payload_preview.is_empty() && p.headers.is_empty());
+    }
+}

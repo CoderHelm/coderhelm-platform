@@ -745,6 +745,17 @@ pub async fn handle_forge(
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
 
+    // Hosted side of hybrid: the Forge app was set up with a self-hosted
+    // install's id, so the event goes to that install through the relay.
+    if let Some(tid) = team_id
+        .as_deref()
+        .filter(|t| common::hybrid::sign::is_install_id(t))
+    {
+        if let Some(code) = super::hybrid::relay_jira(&state, tid, "event", &body).await {
+            return Ok(code);
+        }
+    }
+
     let team_id = match team_id {
         Some(tid) if !tid.is_empty() => {
             if tid.starts_with("TEAM#") {

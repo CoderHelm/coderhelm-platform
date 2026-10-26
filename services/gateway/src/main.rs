@@ -68,6 +68,13 @@ async fn main() -> Result<(), Error> {
         std::env::var("SECRETS_NAME").unwrap_or_else(|_| "coderhelm/prod/secrets".to_string());
     let secrets = models::Secrets::load(&sm, &secrets_name).await?;
 
+    // A hybrid install's registration with CoderHelm (none on other installs).
+    common::hybrid::client::set_credentials(common::hybrid::client::Credentials::from_parts(
+        secrets.hybrid_install_id.as_deref(),
+        secrets.hybrid_install_secret.as_deref(),
+        secrets.hybrid_relay_key.as_deref(),
+    ));
+
     let config = models::Config::from_env();
     // A model call whose usage can't be written waits on the tickets queue.
     common::usage::set_fallback(Arc::new(common::usage::SqsFallback {
@@ -144,6 +151,50 @@ async fn main() -> Result<(), Error> {
             get(routes::system::domain)
                 .put(routes::system::set_domain)
                 .delete(routes::system::remove_domain),
+        )
+        // Hybrid: CoderHelm's address, GitHub App relay, integrations and
+        // delivery sharing (install admins; routes::hybrid_install).
+        .route(
+            "/system/hybrid",
+            get(routes::hybrid_install::get_status).delete(routes::hybrid_install::unregister),
+        )
+        .route(
+            "/system/hybrid/register",
+            post(routes::hybrid_install::register),
+        )
+        .route(
+            "/system/hybrid/names/:name",
+            get(routes::hybrid_install::name_available),
+        )
+        .route(
+            "/system/hybrid/name",
+            put(routes::hybrid_install::claim_name).delete(routes::hybrid_install::release_name),
+        )
+        .route(
+            "/system/hybrid/github/link",
+            post(routes::hybrid_install::github_link),
+        )
+        .route(
+            "/system/hybrid/github/:installation_id",
+            put(routes::hybrid_install::github_repositories)
+                .delete(routes::hybrid_install::github_unlink),
+        )
+        .route(
+            "/system/hybrid/settings",
+            put(routes::hybrid_install::put_settings),
+        )
+        // Deliveries: every event in and out, with what happened (admins).
+        .route("/deliveries", get(routes::deliveries::list))
+        .route("/deliveries/:id", get(routes::deliveries::get))
+        .route(
+            "/deliveries/:id/redeliver",
+            post(routes::deliveries::redeliver),
+        )
+        // Hybrid installs, for CoderHelm's operators (hosted side).
+        .route("/admin/hybrid", get(routes::hybrid::admin_list))
+        .route(
+            "/admin/hybrid/:install_id/revoke",
+            post(routes::hybrid::admin_revoke),
         )
         // Setup checks and update readiness, each with its fix (install admins).
         .route("/system/checks", get(routes::setup_checks::checks))
@@ -1060,7 +1111,46 @@ async fn main() -> Result<(), Error> {
         )
         // CI calls signed with a GitHub Actions OIDC token
         .route("/ci/tests/results", post(routes::tests::ci_upload))
-        .route("/ci/tests/quarantine", get(routes::tests::ci_quarantine));
+        .route("/ci/tests/quarantine", get(routes::tests::ci_quarantine))
+        // Events CoderHelm's relay forwards to a hybrid install, and its
+        // ownership proof (routes::hybrid_install).
+        .route("/relay", post(routes::hybrid_install::intake))
+        .route("/relay/proof", get(routes::hybrid_install::proof));
+
+    // The hosted side of hybrid: what self-hosted installs call, signed with
+    // their registration secret (404 everywhere else; routes::hybrid).
+    let hybrid_routes = Router::new()
+        .route(
+            "/installs",
+            post(routes::hybrid::register).delete(routes::hybrid::unregister),
+        )
+        .route("/installs/verify", post(routes::hybrid::verify))
+        .route("/status", get(routes::hybrid::status))
+        .route("/settings", put(routes::hybrid::settings))
+        .route(
+            "/names",
+            put(routes::hybrid::claim_name).delete(routes::hybrid::delete_name),
+        )
+        .route("/names/records", put(routes::hybrid::put_records))
+        .route("/names/:name", get(routes::hybrid::name_available))
+        .route("/fallback", get(routes::hybrid::fallback))
+        .route("/github/link-start", post(routes::hybrid::link_start))
+        .route("/github/setup", get(routes::hybrid::github_setup))
+        .route(
+            "/github/links/:installation_id",
+            put(routes::hybrid::set_link_repos).delete(routes::hybrid::delete_link),
+        )
+        .route("/github/token", post(routes::hybrid::github_token))
+        .route("/deliveries", get(routes::hybrid::list_deliveries))
+        .route("/deliveries/shared", post(routes::hybrid::share))
+        .route("/deliveries/:id/redeliver", post(routes::hybrid::redeliver))
+        .route(
+            "/oauth/:kind/authorize",
+            get(routes::hybrid::oauth_authorize),
+        )
+        .route("/oauth/callback", post(routes::hybrid::oauth_callback))
+        .route("/oauth/token", post(routes::hybrid::oauth_token))
+        .route("/oauth/revoke", post(routes::hybrid::oauth_revoke));
 
     // Auth routes (public, rate-limited)
     let auth_routes = Router::new()
@@ -1075,6 +1165,11 @@ async fn main() -> Result<(), Error> {
         .route("/google/callback", get(routes::auth::google_callback))
         .route("/github", get(routes::auth::github_login))
         .route("/github/callback", get(routes::auth::github_callback))
+        // Hybrid linking: GitHub sign-in that proves an installation is yours.
+        .route(
+            "/github/callback/hybrid",
+            get(routes::hybrid::github_signin_return),
+        )
         .route("/logout", post(routes::auth::logout))
         .layer(axum_middleware::from_fn_with_state(
             state.clone(),
@@ -1144,8 +1239,31 @@ async fn main() -> Result<(), Error> {
         // ids, labels, statuses and codes only, and only until the first
         // person has an account (routes::setup_checks). 404 on hosted.
         .route("/api/setup/status", get(routes::setup_checks::status))
+        // The install guide's hybrid steps: the one-time setup key, only
+        // until the first person signs up (routes::hybrid_install).
+        .route(
+            "/api/setup/hybrid",
+            get(routes::hybrid_install::setup_status),
+        )
+        .route(
+            "/api/setup/hybrid/register",
+            post(routes::hybrid_install::setup_register),
+        )
+        .route(
+            "/api/setup/hybrid/name",
+            post(routes::hybrid_install::setup_claim_name),
+        )
+        .route(
+            "/api/setup/hybrid/github/link",
+            post(routes::hybrid_install::setup_github_link),
+        )
+        .route(
+            "/api/setup/hybrid/settings",
+            post(routes::hybrid_install::setup_settings),
+        )
         .route("/api/brain/stream", post(routes::brain::brain_stream))
         .nest("/webhooks", webhook_routes)
+        .nest("/hybrid", hybrid_routes)
         .route(
             "/integrations/jira/forge-register",
             post(routes::api::forge_register_urls),

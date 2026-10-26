@@ -705,7 +705,15 @@ pub async fn invite_user(
         })?;
 
     let team_name = get_team_name(state.clone(), &claims).await;
-    let _ = send_invite_email(&state, &email, &claims.email, &team_name, role).await;
+    let _ = send_invite_email(
+        &state,
+        &claims.team_id,
+        &email,
+        &claims.email,
+        &team_name,
+        role,
+    )
+    .await;
 
     info!(role = %role, status, team_id = %claims.team_id, "User invited");
 
@@ -729,9 +737,16 @@ pub async fn resend_invite(
     let role = role_of(&item);
 
     let team_name = get_team_name(state.clone(), &claims).await;
-    send_invite_email(&state, email, &claims.email, &team_name, role)
-        .await
-        .map_err(|_| internal("Failed to resend invite", "email send failed"))?;
+    send_invite_email(
+        &state,
+        &claims.team_id,
+        email,
+        &claims.email,
+        &team_name,
+        role,
+    )
+    .await
+    .map_err(|_| internal("Failed to resend invite", "email send failed"))?;
 
     // The email went out, so the invite is good again from now (this is also
     // how an expired invite is renewed). Only while it is still an invite: if
@@ -1294,6 +1309,7 @@ async fn get_team_name(state: Arc<AppState>, claims: &Claims) -> String {
 
 async fn send_invite_email(
     state: &AppState,
+    team: &str,
     to: &str,
     inviter: &str,
     org: &str,
@@ -1307,7 +1323,7 @@ async fn send_invite_email(
     }))
     .unwrap_or_default();
 
-    state
+    let sent = state
         .ses
         .send_email()
         .from_email_address(&state.config.ses_from_address)
@@ -1327,13 +1343,15 @@ async fn send_invite_email(
                 .build(),
         )
         .send()
-        .await
-        .map_err(|e| {
-            error!("Failed to send invite email: {e}");
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
-
-    Ok(())
+        .await;
+    let result = sent
+        .map(|_| ())
+        .map_err(|e| aws_sdk_sesv2::error::DisplayErrorContext(&e).to_string());
+    super::deliveries::record_email(state, team, "invite", to, result.clone()).await;
+    result.map_err(|e| {
+        error!("Failed to send invite email: {e}");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })
 }
 
 #[cfg(test)]

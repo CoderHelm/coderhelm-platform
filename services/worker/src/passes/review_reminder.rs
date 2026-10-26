@@ -252,11 +252,14 @@ async fn sweep_repo(
         let msg = notify::messages::review_reminder(
             &cfg.repo, pr_number, title, author, url, &age, &reviewers,
         );
-        let sent = notify::deliver(
+        let sent = notify::deliver_recorded(
             &notify::Http(&state.http),
             &cfg.channels,
             &msg,
             "review_reminder",
+            &state.dynamo,
+            &state.config.settings_table_name,
+            &cfg.team_id,
         )
         .await;
         // One channel taking it counts: re-posting would repeat it there.

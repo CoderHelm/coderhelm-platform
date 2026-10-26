@@ -129,6 +129,12 @@ pub const PUBLIC_ROUTES: &[PublicRoute] = &[
         handler: "knowledge_sources::webhook",
         auth: RouteAuth::Webhook,
     },
+    PublicRoute {
+        method: "POST",
+        path: "/webhooks/relay",
+        handler: "hybrid_install::intake",
+        auth: RouteAuth::Webhook,
+    },
 ];
 
 /// May an API key call this routed handler with this method?
@@ -229,6 +235,7 @@ are verified by their signatures.";
         crate::routes::jira_webhook::handle,
         crate::routes::alerts::handle_sns,
         crate::routes::knowledge_sources::webhook,
+        crate::routes::hybrid_install::intake,
     ),
     components(schemas(ErrorBody)),
     modifiers(&Common),
@@ -304,6 +311,13 @@ impl Modify for Common {
             SecurityScheme::ApiKey(ApiKey::Header(ApiKeyValue::with_description(
                 "X-Hub-Signature-256",
                 "`sha256=` and the hex HMAC-SHA256 of the raw body, keyed with the GitHub App's webhook secret.",
+            ))),
+        );
+        components.add_security_scheme(
+            "relay_signature",
+            SecurityScheme::ApiKey(ApiKey::Header(ApiKeyValue::with_description(
+                "X-CoderHelm-Relay-Signature",
+                "`t=<unix seconds>,d=<delivery id>,v1=<hex>`: the HMAC-SHA256 of `<t>.<d>.<raw body>`, keyed with the install's relay key.",
             ))),
         );
         components.add_security_scheme(

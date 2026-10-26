@@ -146,6 +146,17 @@ pub async fn send_notification(
             .send()
             .await;
 
+        let outcome = result
+            .as_ref()
+            .map(|_| ())
+            .map_err(|e| aws_sdk_sesv2::error::DisplayErrorContext(e).to_string());
+        common::deliveries::record(
+            &state.dynamo,
+            &state.config.settings_table_name,
+            team_id,
+            &common::deliveries::email(template_suffix, &email, &outcome),
+        )
+        .await;
         match result {
             Ok(_) => info!(email = %email, template = %template_name, "Email sent"),
             Err(e) => warn!(email = %email, error = %e, "Failed to send email — continuing"),

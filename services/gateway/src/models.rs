@@ -112,10 +112,17 @@ impl Config {
 /// Secrets loaded from AWS Secrets Manager.
 #[derive(Deserialize)]
 pub struct Secrets {
+    /// The install's own GitHub App. Empty on a hybrid install that uses
+    /// CoderHelm's app through the relay and the token broker.
+    #[serde(default)]
     pub github_app_id: String,
+    #[serde(default)]
     pub github_private_key: String,
+    #[serde(default)]
     pub github_webhook_secret: String,
+    #[serde(default)]
     pub github_client_id: String,
+    #[serde(default)]
     pub github_client_secret: String,
     pub jwt_secret: String,
     #[serde(default)]
@@ -144,6 +151,19 @@ pub struct Secrets {
     pub google_drive_client_id: Option<String>,
     #[serde(default)]
     pub google_drive_client_secret: Option<String>,
+    /// Hosted side of hybrid only: the key every install's registration
+    /// secret and relay key are derived from (common::hybrid::sign). Absent
+    /// on self-hosted installs, which then never serve `/hybrid/*`.
+    #[serde(default)]
+    pub hybrid_master_key: Option<String>,
+    /// A hybrid install's registration with the hosted side (written by
+    /// Settings, System, Hybrid; common::hybrid::client).
+    #[serde(default)]
+    pub hybrid_install_id: Option<String>,
+    #[serde(default)]
+    pub hybrid_install_secret: Option<String>,
+    #[serde(default)]
+    pub hybrid_relay_key: Option<String>,
 }
 
 impl Secrets {

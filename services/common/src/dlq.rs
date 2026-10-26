@@ -23,6 +23,7 @@ use serde::Serialize;
 /// enum differ, so the gateway's "can it be read?" answer is the worker's.
 pub const WORKER_MESSAGE_TYPES: &[&str] = &[
     "ticket",
+    "relay_retry",
     "tool_proposals",
     "hidden_suggest",
     "feedback",

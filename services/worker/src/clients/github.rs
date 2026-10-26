@@ -237,6 +237,12 @@ impl GitHubClient {
     async fn get_installation_token(
         &self,
     ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+        // A hybrid install without its own app: CoderHelm's broker (it caches).
+        if common::hybrid::client::github_via_broker(&self.private_key) {
+            return common::hybrid::client::github_token(&self.http, self.installation_id)
+                .await
+                .map_err(|e| e.to_string().into());
+        }
         // Check cache
         {
             let cache = self.token_cache.lock().unwrap();
@@ -277,6 +283,11 @@ impl GitHubClient {
     /// stamped as committer on every commit the platform creates via the API.
     /// Used to distinguish our own commits from foreign (user) commits.
     async fn app_bot_login(&self) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+        if common::hybrid::client::github_via_broker(&self.private_key) {
+            self.get_installation_token().await?;
+            return common::hybrid::client::bot_login()
+                .ok_or_else(|| "the broker named no bot".into());
+        }
         let jwt = self.generate_jwt()?;
         let resp: serde_json::Value = self
             .http

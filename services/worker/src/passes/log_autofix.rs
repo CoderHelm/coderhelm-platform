@@ -277,11 +277,14 @@ pub async fn notify_pr(
         format!("{base}/logs?finding={}", ticket.rec_id)
     };
     let msg = lf::fix_message(ticket, repo, number, title, url, &finding_url);
-    common::notify::deliver(
+    common::notify::deliver_recorded(
         &common::notify::Http(&state.http),
         &channels,
         &msg,
         "log_fix_pr",
+        &state.dynamo,
+        &state.config.settings_table_name,
+        team_id,
     )
     .await;
 }

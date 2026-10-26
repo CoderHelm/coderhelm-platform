@@ -15,6 +15,7 @@ use crate::models::{
     TicketMessage, TicketSource, WorkerMessage,
 };
 use crate::AppState;
+use common::deliveries::{self, Delivery, Direction, Status};
 use common::merge_gate;
 
 /// Look up team_id by GitHub installation_id using the teams table GSI.
@@ -213,21 +214,34 @@ pub async fn handle(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<StatusCode, StatusCode> {
-    // Verify signature
-    let signature = headers
-        .get("x-hub-signature-256")
-        .and_then(|v| v.to_str().ok())
-        .ok_or(StatusCode::UNAUTHORIZED)?;
-
-    if !verify_github_signature(&state.secrets.github_webhook_secret, &body, signature) {
-        warn!("Invalid GitHub webhook signature");
-        return Err(StatusCode::UNAUTHORIZED);
-    }
-
     let event_type = headers
         .get("x-github-event")
         .and_then(|v| v.to_str().ok())
-        .unwrap_or("unknown");
+        .unwrap_or("unknown")
+        .to_string();
+    let mut d = inbound_delivery(&headers, &body, &event_type);
+
+    // Verify signature
+    let signature = headers
+        .get("x-hub-signature-256")
+        .and_then(|v| v.to_str().ok());
+    let verified = signature.is_some_and(|sig| {
+        verify_github_signature(&state.secrets.github_webhook_secret, &body, sig)
+    });
+    if !verified {
+        warn!("Invalid GitHub webhook signature");
+        // Recorded on a self-hosted install, where a mismatch is a setup
+        // problem its admins fix; on the hosted side it's just noise.
+        if super::setup_checks::self_hosted() {
+            d.finish(
+                Status::Failed,
+                "Signature didn't match",
+                "signature_mismatch",
+            );
+            super::deliveries::save(&state, super::deliveries::UNROUTED, &d).await;
+        }
+        return Err(StatusCode::UNAUTHORIZED);
+    }
 
     let payload: Value = serde_json::from_slice(&body).map_err(|e| {
         error!("Failed to parse webhook body: {e}");
@@ -240,47 +254,185 @@ pub async fn handle(
 
     info!(event_type, installation_id, "GitHub webhook received");
 
-    // Installation events handle their own team resolution/creation
-    if event_type == "installation" {
-        return handle_installation(&state, &payload, installation_id).await;
+    // Hosted side of hybrid: an installation linked to a self-hosted install
+    // is forwarded there (re-signed) instead of being handled here.
+    let action = payload["action"].as_str().unwrap_or("");
+    if let Some(code) = super::hybrid::relay_github(
+        &state,
+        installation_id,
+        &event_type,
+        action,
+        &headers,
+        &body,
+    )
+    .await
+    {
+        return Ok(code);
     }
-    if event_type == "installation_repositories" {
-        return handle_installation_repos(&state, &payload, installation_id).await;
+
+    process(&state, &event_type, &payload, installation_id, &mut d).await
+}
+
+/// The delivery record for one GitHub event, before anything is decided.
+pub(crate) fn inbound_delivery(headers: &HeaderMap, body: &[u8], event_type: &str) -> Delivery {
+    let payload: Value = serde_json::from_slice(body).unwrap_or(Value::Null);
+    let action = payload["action"].as_str().unwrap_or("");
+    let event = if action.is_empty() {
+        event_type.to_string()
+    } else {
+        format!("{event_type}.{action}")
+    };
+    let mut d = Delivery::new(Direction::Inbound, "github", &event, "")
+        .with_headers(
+            headers
+                .iter()
+                .filter_map(|(k, v)| Some((k.as_str(), v.to_str().ok()?))),
+        )
+        .with_payload(body);
+    d.external_id = headers
+        .get("x-github-delivery")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    d.repo = payload["repository"]["full_name"]
+        .as_str()
+        .unwrap_or("")
+        .to_string();
+    d.pr = payload["pull_request"]["number"]
+        .as_u64()
+        .or_else(|| {
+            payload["issue"]["pull_request"]
+                .is_object()
+                .then(|| payload["issue"]["number"].as_u64())
+                .flatten()
+        })
+        .or_else(|| payload["check_run"]["pull_requests"][0]["number"].as_u64());
+    d.redeliver = Some(deliveries::Redeliver::Github);
+    d
+}
+
+/// The event types CoderHelm acts on (the rest are acknowledged and ignored).
+pub const HANDLED_EVENTS: &[&str] = &[
+    "installation",
+    "installation_repositories",
+    "issues",
+    "issue_comment",
+    "pull_request",
+    "pull_request_review",
+    "pull_request_review_comment",
+    "push",
+    "check_run",
+    "check_suite",
+    "repository",
+    "workflow_run",
+];
+
+/// Handles one verified GitHub event (from GitHub, or from CoderHelm's relay
+/// on a hybrid install) and records the delivery with what happened.
+pub(crate) async fn process(
+    state: &AppState,
+    event_type: &str,
+    payload: &Value,
+    installation_id: u64,
+    d: &mut Delivery,
+) -> Result<StatusCode, StatusCode> {
+    let started = std::time::Instant::now();
+    let (r, pk) = route(state, event_type, payload, installation_id, d).await;
+    d.duration_ms = started.elapsed().as_millis() as u64;
+    match (&r, d.status) {
+        (Err(code), _) => {
+            let reason = if code.as_u16() >= 500 {
+                "enqueue_failed"
+            } else {
+                "handler_error"
+            };
+            d.finish(Status::Failed, "Handling failed", reason);
+        }
+        (Ok(_), Status::Received) => {
+            if HANDLED_EVENTS.contains(&event_type) {
+                d.finish(Status::Handled, "Handled", "");
+            } else {
+                d.finish(Status::Ignored, "Not an event CoderHelm acts on", "");
+            }
+        }
+        _ => {}
+    }
+    let pk = if pk.is_empty() && super::setup_checks::self_hosted() {
+        super::deliveries::UNROUTED.to_string()
+    } else {
+        pk
+    };
+    if !pk.is_empty() {
+        super::deliveries::save(state, &pk, d).await;
+    }
+    r
+}
+
+/// Routes a verified event; returns the result and the team it went to.
+async fn route(
+    state: &AppState,
+    event_type: &str,
+    payload: &Value,
+    installation_id: u64,
+    d: &mut Delivery,
+) -> (Result<StatusCode, StatusCode>, String) {
+    // Installation events handle their own team resolution/creation
+    if event_type == "installation" || event_type == "installation_repositories" {
+        let r = if event_type == "installation" {
+            handle_installation(state, payload, installation_id).await
+        } else {
+            handle_installation_repos(state, payload, installation_id).await
+        };
+        let team = resolve_team_by_installation(state, installation_id)
+            .await
+            .unwrap_or_default();
+        d.target = team.clone();
+        return (r, team);
     }
 
     // For all other events, resolve team_id from the installation
-    let team_id = match resolve_team_by_installation(&state, installation_id).await {
+    let team_id = match resolve_team_by_installation(state, installation_id).await {
         Some(tid) => tid,
         None => {
             warn!(
                 installation_id,
                 event_type, "No team linked to this GitHub installation"
             );
-            return Ok(StatusCode::OK);
+            d.finish(Status::Failed, "No team for this installation", "no_team");
+            return (Ok(StatusCode::OK), String::new());
         }
     };
+    d.target = team_id.clone();
+    let team_id = team_id.as_str();
+    let r = dispatch(state, event_type, payload, installation_id, team_id).await;
+    (r, team_id.to_string())
+}
 
+async fn dispatch(
+    state: &AppState,
+    event_type: &str,
+    payload: &Value,
+    installation_id: u64,
+    team_id: &str,
+) -> Result<StatusCode, StatusCode> {
     // People's pushback on a CoderHelm review (a reply, a PR comment, a
     // dismissal, a close over its change request) queues one judgment per PR.
-    super::review_lessons::on_webhook(&state, event_type, &payload, installation_id, &team_id)
-        .await;
+    super::review_lessons::on_webhook(state, event_type, payload, installation_id, team_id).await;
 
     match event_type {
-        "issues" => handle_issue_event(&state, &payload, installation_id, &team_id).await,
-        "issue_comment" => handle_issue_comment(&state, &payload, installation_id, &team_id).await,
-        "pull_request" => handle_pull_request(&state, &payload, installation_id, &team_id).await,
-        "pull_request_review" => {
-            handle_pr_review(&state, &payload, installation_id, &team_id).await
-        }
+        "issues" => handle_issue_event(state, payload, installation_id, team_id).await,
+        "issue_comment" => handle_issue_comment(state, payload, installation_id, team_id).await,
+        "pull_request" => handle_pull_request(state, payload, installation_id, team_id).await,
+        "pull_request_review" => handle_pr_review(state, payload, installation_id, team_id).await,
         "pull_request_review_comment" => {
-            handle_review_comment(&state, &payload, installation_id, &team_id).await
+            handle_review_comment(state, payload, installation_id, team_id).await
         }
         "pull_request_review_thread" => Ok(StatusCode::OK),
-        "push" => handle_push(&state, &payload, installation_id, &team_id).await,
-        "check_run" => handle_check_run(&state, &payload, installation_id, &team_id).await,
-        "check_suite" => handle_check_suite(&state, &payload, installation_id, &team_id).await,
-        "repository" => handle_repository_event(&state, &payload, installation_id, &team_id).await,
-        "workflow_run" => handle_workflow_run(&state, &payload, installation_id, &team_id).await,
+        "push" => handle_push(state, payload, installation_id, team_id).await,
+        "check_run" => handle_check_run(state, payload, installation_id, team_id).await,
+        "check_suite" => handle_check_suite(state, payload, installation_id, team_id).await,
+        "repository" => handle_repository_event(state, payload, installation_id, team_id).await,
+        "workflow_run" => handle_workflow_run(state, payload, installation_id, team_id).await,
         // Log-only events — acknowledge but no action needed
         "workflow_dispatch" | "workflow_job" => {
             info!(event_type, "Workflow event received — logged");

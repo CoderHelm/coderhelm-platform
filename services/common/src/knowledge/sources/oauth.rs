@@ -175,9 +175,75 @@ pub fn connection_record(
     s
 }
 
+/// The connection record for `kind` signed in through CoderHelm's broker
+/// (a hybrid install that chose CoderHelm's app): the hosted side is the
+/// authorization server, the install id is the client id and the
+/// registration secret is the client secret. The provider's own scopes and
+/// app live on the hosted side; refresh, sealing and reconnect work as for
+/// any other connection.
+pub fn brokered_connection_record(
+    kind: Kind,
+    hosted: &str,
+    install_id: &str,
+    sealed_secret: &str,
+) -> ServerRecord {
+    let hosted = hosted.trim_end_matches('/');
+    let mut s = ServerRecord::new(
+        &connection_id(kind),
+        &format!("{} (knowledge)", kind.label()),
+        hosted,
+    );
+    s.catalog_id = catalog_id(kind);
+    s.auth = AuthKind::OAuth;
+    s.sharing = Sharing::Shared;
+    s.oauth = Some(OAuthSettings {
+        issuer: hosted.into(),
+        authorization_endpoint: format!("{hosted}/hybrid/oauth/{}/authorize", kind.key()),
+        token_endpoint: format!("{hosted}/hybrid/oauth/token"),
+        registration_endpoint: None,
+        revocation_endpoint: Some(format!("{hosted}/hybrid/oauth/revoke")),
+        iss_supported: false,
+        cimd_supported: false,
+        token_auth_methods: vec![ClientAuth::ClientSecretPost.as_str().into()],
+        resource: String::new(),
+        scopes: vec![],
+        client_id: install_id.into(),
+        client_auth: ClientAuth::ClientSecretPost,
+        client_secret_sealed: sealed_secret.into(),
+        registration: "manual".into(),
+        legacy: false,
+        extra_authorize: vec![],
+        token_body_json: false,
+    });
+    s
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn brokered_records_point_at_the_hosted_broker() {
+        let r = brokered_connection_record(
+            Kind::Notion,
+            "https://api.coderhelm.com/",
+            "ins_abcdefghijklmnopqrstuvwx",
+            "sealed",
+        );
+        let o = r.oauth.unwrap();
+        assert_eq!(
+            o.authorization_endpoint,
+            "https://api.coderhelm.com/hybrid/oauth/notion/authorize"
+        );
+        assert_eq!(
+            o.token_endpoint,
+            "https://api.coderhelm.com/hybrid/oauth/token"
+        );
+        assert_eq!(o.client_id, "ins_abcdefghijklmnopqrstuvwx");
+        assert_eq!(o.client_auth, ClientAuth::ClientSecretPost);
+        assert!(is_source_connection(&r.catalog_id));
+        assert!(r.tools.is_empty());
+    }
 
     #[test]
     fn oauth_kinds_have_providers_and_records() {

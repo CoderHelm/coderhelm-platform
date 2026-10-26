@@ -11,6 +11,7 @@
     "infra_analyze": {"type":"infra_analyze","team_id":"TEAM#team-a","triggered_by":"someone","repo":"acme/widgets"},
     "resume": {"type":"resume","team_id":"TEAM#team-a","run_id":"r1","installation_id":1},
     "review": {"type":"review","team_id":"TEAM#team-a","installation_id":1,"repo_owner":"acme","repo_name":"widgets","pr_number":2,"head_sha":"abc","label":"coderhelm-review","question":"why?","trigger":"labeled","dedup_key":"d","reply_to_comment_id":6,"requested_by":"someone"},
+    "relay_retry": {"type":"relay_retry","install_id":"ins_abcdefghijklmnopqrstuvwx","delivery_id":"01hzzdelivery","relay_delivery_id":"72d3162e-cc78-11e3-81ab-4c9367dc0958","event":"pull_request","source":"github"},
     "await_merge": {"type":"await_merge","team_id":"TEAM#team-a","installation_id":1,"repo_owner":"acme","repo_name":"widgets","pr_number":2,"head_sha":"abc","base_branch":"main","self_authored":true,"attempts":1,"chain_id":"c","error_retries":0},
     "graph_index": {"type":"graph_index","team_id":"TEAM#team-a","installation_id":1,"repo_owner":"acme","repo_name":"widgets","branch":"main","changed_files":["a.rs"]},
     "release_notes": {"type":"release_notes","team_id":"TEAM#team-a","installation_id":1,"repo_owner":"acme","repo_name":"widgets","tag":"v1.0.0","sha":"abc","resend":"","check_branch":true},

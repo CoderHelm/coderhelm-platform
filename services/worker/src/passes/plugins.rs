@@ -752,11 +752,14 @@ pub async fn notify_review(state: &WorkerState, team: &str, artifact: &str) {
         }
         if !channels.is_empty() {
             let card = common::plugins::chat::review_card(&a, &excerpt, base);
-            common::notify::deliver(
+            common::notify::deliver_recorded(
                 &common::notify::Http(&state.http),
                 &channels,
                 &card,
                 "plugin review",
+                &state.dynamo,
+                &state.config.settings_table_name,
+                team,
             )
             .await;
         }

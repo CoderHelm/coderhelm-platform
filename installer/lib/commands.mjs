@@ -8,6 +8,7 @@ import { fetchRelease, latestVersion, releasePaths, releasesDir, verifySignature
 import { openBrowser } from "./github-app.mjs";
 import { ensureSecret, hasGithubApp, mergeSecret, readSecret } from "./secrets.mjs";
 import { runManifestFlow, secretKeysFromApp } from "./github-app.mjs";
+import { leaveHybrid } from "./hybrid.mjs";
 import { DEFAULT_TELEMETRY_ENDPOINT, derived, readJson, semverCompare, writeJson } from "./util.mjs";
 
 export const STATE_DIR = ".coderhelm";
@@ -571,6 +572,9 @@ export async function uninstall(ctx) {
   }
   const state = loadState(flags);
   await telemetryPing(ctx, cfg, state, "uninstall");
+  // A hybrid install gives back its CoderHelm address and links first.
+  const secret = await readSecret(runner, d.secretName, cfg.region);
+  await leaveHybrid(ctx, secret, cfg.hybridUrl || undefined);
   const src = await resolveSource(ctx, state.version);
   await cdk(ctx, src, ["destroy", "--all", "--force"]);
   log("\nThe stacks are deleted.");

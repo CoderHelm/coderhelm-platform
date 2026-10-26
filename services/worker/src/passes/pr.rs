@@ -744,11 +744,14 @@ async fn notify_alert_pr(
         url,
         &alert_url,
     );
-    common::notify::deliver(
+    common::notify::deliver_recorded(
         &common::notify::Http(&state.http),
         &channels,
         &card,
         "alert_pr",
+        &state.dynamo,
+        &state.config.settings_table_name,
+        &msg.team_id,
     )
     .await;
 }

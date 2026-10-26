@@ -57,6 +57,12 @@ async fn main() -> Result<(), Error> {
 
     let config = models::Config::from_env();
     let secrets = models::Secrets::load(&sm, &config.secrets_name).await?;
+    // A hybrid install's registration: GitHub tokens come from CoderHelm's broker.
+    common::hybrid::client::set_credentials(common::hybrid::client::Credentials::from_parts(
+        secrets.hybrid_install_id.as_deref(),
+        secrets.hybrid_install_secret.as_deref(),
+        secrets.hybrid_relay_key.as_deref(),
+    ));
     // A model call whose usage can't be written waits on the tickets queue.
     common::usage::set_fallback(Arc::new(common::usage::SqsFallback {
         sqs: sqs.clone(),
@@ -489,6 +495,12 @@ async fn handle_message(state: Arc<WorkerState>, message: models::WorkerMessage)
             info!(team_id = %msg.team_id, pr = msg.pr_number, attempt = msg.attempts, "Post-merge health check");
             if let Err(e) = passes::health_check::run(&state, msg).await {
                 error!("Health check failed: {e:?}");
+            }
+        }
+        models::WorkerMessage::RelayRetry(msg) => {
+            info!(install = %msg.install_id, delivery = %msg.delivery_id, "Relay retry");
+            if let Err(e) = passes::relay_retry::run(&state, msg).await {
+                error!("Relay retry failed: {e:?}");
             }
         }
         models::WorkerMessage::AwaitMerge(msg) => {

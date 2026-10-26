@@ -567,6 +567,16 @@ pub const CAPABILITIES: &[Capability] = &[
         ],
     },
     Capability {
+        key: "deliveries",
+        label: "See every event in and out (webhooks, relay forwards, notifications, email) and send failed ones again",
+        min_role: "admin",
+        handlers: &[
+            "deliveries::list",
+            "deliveries::get",
+            "deliveries::redeliver",
+        ],
+    },
+    Capability {
         key: "budget",
         label: "Set the monthly token limit",
         min_role: "admin",
@@ -582,7 +592,7 @@ pub const CAPABILITIES: &[Capability] = &[
     },
     Capability {
         key: "system",
-        label: "See this install's version, setup checks and update readiness, update it or roll it back, change its domain, and send a test email (self-hosted installs; install admins only)",
+        label: "See this install's version, setup checks and update readiness, update it or roll it back, change its domain, use CoderHelm's address, apps and event relay (hybrid), and send a test email (self-hosted installs; install admins only)",
         min_role: "admin",
         // Also checked inside each handler: the person must be an install
         // admin (PLATFORM_ADMIN_EMAILS).
@@ -597,6 +607,16 @@ pub const CAPABILITIES: &[Capability] = &[
             "system::remove_domain",
             "setup_checks::checks",
             "setup_checks::preflight_route",
+            "hybrid_install::get_status",
+            "hybrid_install::register",
+            "hybrid_install::unregister",
+            "hybrid_install::name_available",
+            "hybrid_install::claim_name",
+            "hybrid_install::release_name",
+            "hybrid_install::github_link",
+            "hybrid_install::github_repositories",
+            "hybrid_install::github_unlink",
+            "hybrid_install::put_settings",
         ],
     },
     Capability {

@@ -60,6 +60,12 @@ function handler(event) {
 `;
 
 /** The page shown until a dashboard build is uploaded. */
+/** A file in infra/error-pages (from lib/ or the compiled dist/lib/). */
+export function errorPage(name: string): string {
+  const a = path.join(__dirname, "..", "error-pages", name);
+  return fs.existsSync(a) ? a : path.join(__dirname, "..", "..", "error-pages", name);
+}
+
 const PLACEHOLDER_HTML = `<!doctype html><html><head><meta charset="utf-8"><title>CoderHelm</title>
 <meta name="viewport" content="width=device-width,initial-scale=1"></head>
 <body style="font-family:system-ui,sans-serif;background:#0a0a0a;color:#ddd;padding:48px">
@@ -214,7 +220,11 @@ export class WebStack extends cdk.Stack {
       httpVersion: cloudfront.HttpVersion.HTTP2_AND_3,
       minimumProtocolVersion: cloudfront.SecurityPolicyProtocol.TLS_V1_2_2021,
       defaultBehavior: {
-        origin: origins.S3BucketOrigin.withOriginAccessControl(bucket),
+        // List too, so a file that isn't there is a 404 (not S3's 403),
+        // which the error response below turns into the install's own page.
+        origin: origins.S3BucketOrigin.withOriginAccessControl(bucket, {
+          originAccessLevels: [cloudfront.AccessLevel.READ, cloudfront.AccessLevel.LIST],
+        }),
         viewerProtocolPolicy: cloudfront.ViewerProtocolPolicy.REDIRECT_TO_HTTPS,
         cachePolicy: cloudfront.CachePolicy.CACHING_OPTIMIZED,
         responseHeadersPolicy: securityHeaders,
@@ -223,6 +233,15 @@ export class WebStack extends cdk.Stack {
         ],
       },
       additionalBehaviors,
+      // A page that isn't there, on any address the install answers on (its
+      // own domain, a CoderHelm address or the AWS address): the install's
+      // 404 page, with a 404. CloudFront applies this to the whole
+      // distribution, so an API 404 also arrives with this page as its body
+      // (the status is unchanged and the dashboard reads the status); other
+      // API errors keep their JSON answers, which is why only 404 is mapped.
+      errorResponses: [
+        { httpStatus: 404, responseHttpStatus: 404, responsePagePath: "/_errors/404.html", ttl: cdk.Duration.seconds(60) },
+      ],
     });
 
     const hostname = domain ? domain.hostname : this.distribution.distributionDomainName;
@@ -253,6 +272,8 @@ export class WebStack extends cdk.Stack {
 
     // --- Dashboard upload ---
     const runtimeConfig = s3deploy.Source.data("runtime-config.js", runtimeConfigScript(cfg));
+    // The install's own 404 page (infra/error-pages/404.html).
+    const notFound = s3deploy.Source.data("_errors/404.html", fs.readFileSync(errorPage("404.html"), "utf8"));
     const assetDir = cfg.dashboardAssetDir ? path.resolve(cfg.dashboardAssetDir) : null;
     if (assetDir && !fs.existsSync(path.join(assetDir, "index.html"))) {
       throw new Error(`dashboard.assetDir ${assetDir} has no index.html: point it at a dashboard build (the static export).`);
@@ -270,7 +291,7 @@ export class WebStack extends cdk.Stack {
         memoryLimit: 512,
       });
       const pages = new s3deploy.BucketDeployment(this, "DashboardPages", {
-        sources: [s3deploy.Source.asset(assetDir, { exclude: ["_next/**", "runtime-config.js"] }), runtimeConfig],
+        sources: [s3deploy.Source.asset(assetDir, { exclude: ["_next/**", "runtime-config.js"] }), runtimeConfig, notFound],
         destinationBucket: bucket,
         exclude: ["_next/*"],
         prune: true,
@@ -282,7 +303,7 @@ export class WebStack extends cdk.Stack {
       pages.node.addDependency(assets);
     } else {
       new s3deploy.BucketDeployment(this, "DashboardPlaceholder", {
-        sources: [s3deploy.Source.data("index.html", PLACEHOLDER_HTML), runtimeConfig],
+        sources: [s3deploy.Source.data("index.html", PLACEHOLDER_HTML), runtimeConfig, notFound],
         destinationBucket: bucket,
         cacheControl: [s3deploy.CacheControl.fromString(PAGE_CACHE_CONTROL)],
         distribution: this.distribution,

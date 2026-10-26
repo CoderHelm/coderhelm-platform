@@ -14,6 +14,9 @@
     "corsOrigins": ["https://app.coderhelm.com", "https://coderhelm.com", "https://www.coderhelm.com"],
     "streamCorsOrigins": ["https://app.coderhelm.com", "https://coderhelm.com"]
   },
+  "hybrid": {
+    "zone": "coderhelm.com"
+  },
   "retainData": true,
   "models": {
     "provider": "anthropic",

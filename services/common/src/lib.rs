@@ -13,9 +13,15 @@ pub mod claim;
 
 /// The code graph's per-repo switch and build status (gateway and worker).
 pub mod code_graph;
+/// Every delivery in and out (webhooks, relay forwards, notifications,
+/// email), with what happened, for the Deliveries page.
+pub mod deliveries;
 /// The shared dead-letter queue: whose each failed message is, whether the
 /// worker can read it, and when the cleanup archives it.
 pub mod dlq;
+/// Hybrid self-hosting: CoderHelm addresses, the event relay, the token
+/// broker and the signatures between an install and the hosted side.
+pub mod hybrid;
 
 /// Agent permissions: one policy engine (allow, ask, deny) every agent loop
 /// asks before every call, approval cards, sign-in prompts and the pause.

@@ -54,6 +54,13 @@ export class StorageStack extends cdk.Stack {
           noncurrentVersionExpiration: cdk.Duration.days(30),
         },
         {
+          // Hybrid relay: event bodies held while a forward is retried
+          // (about 24 hours); anything left is gone after two days.
+          prefix: "relay/",
+          expiration: cdk.Duration.days(2),
+          noncurrentVersionExpiration: cdk.Duration.days(1),
+        },
+        {
           // Move old run artifacts to Infrequent Access after 90 days
           transitions: [
             {

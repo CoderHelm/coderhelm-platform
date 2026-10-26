@@ -948,9 +948,18 @@ async fn notify_channels(
         console_url: console.as_deref(),
         context: &context,
     });
-    let posted = notify::deliver(&notify::Http(&state.http), &channels, &card, "alert")
-        .await
-        .any_ok();
+    let started = std::time::Instant::now();
+    let sent = notify::deliver(&notify::Http(&state.http), &channels, &card, "alert").await;
+    common::deliveries::record_chat(
+        &state.dynamo,
+        &state.config.settings_table_name,
+        &route.team_id,
+        "alert",
+        &sent,
+        started.elapsed().as_millis() as u64,
+    )
+    .await;
+    let posted = sent.any_ok();
     if posted && alert.actionable {
         open_alert(state, &route.team_id, alert, &id, &msg.timestamp).await;
     }

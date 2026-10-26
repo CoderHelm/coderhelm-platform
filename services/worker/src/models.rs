@@ -112,12 +112,26 @@ impl Config {
 
 #[derive(Deserialize)]
 pub struct Secrets {
+    /// Empty on a hybrid install that uses CoderHelm's GitHub App (tokens
+    /// come from the hosted broker; common::hybrid::client).
+    #[serde(default)]
     pub github_app_id: String,
+    #[serde(default)]
     pub github_private_key: String,
     /// Signs unsubscribe links (a key derived from it, never the secret
     /// itself); the gateway checks them with the same secret.
     #[serde(default)]
     pub jwt_secret: String,
+    /// Hosted side of hybrid: the key relay keys are derived from.
+    #[serde(default)]
+    pub hybrid_master_key: Option<String>,
+    /// A hybrid install's registration with the hosted side.
+    #[serde(default)]
+    pub hybrid_install_id: Option<String>,
+    #[serde(default)]
+    pub hybrid_install_secret: Option<String>,
+    #[serde(default)]
+    pub hybrid_relay_key: Option<String>,
 }
 
 impl Secrets {

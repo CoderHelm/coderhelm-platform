@@ -2145,7 +2145,7 @@ pub fn closed_status(version: Value) -> Value {
 }
 
 /// Only on a self-hosted install (the hosted deployment answers 404).
-fn self_hosted() -> bool {
+pub(crate) fn self_hosted() -> bool {
     std::env::var("SETUP_ENDPOINTS").is_ok_and(|v| v == "1") || super::system::has_updater()
 }
 
@@ -2158,7 +2158,7 @@ static MODEL_CACHE: Mutex<Option<(Instant, ModelProbe)>> = Mutex::new(None);
 const CACHE_FOR: Duration = Duration::from_secs(10);
 const FRESH_FOR: Duration = Duration::from_secs(3);
 
-async fn setup_open(state: &AppState) -> bool {
+pub(crate) async fn setup_open(state: &AppState) -> bool {
     if *CLOSED.lock().unwrap_or_else(|e| e.into_inner()) {
         return false;
     }
@@ -2200,7 +2200,34 @@ async fn stored_secret() -> Option<Value> {
     serde_json::from_str(r.secret_string()?).ok()
 }
 
+/// GitHub through CoderHelm's app (hybrid): the app is CoderHelm's, and it's
+/// installed once an installation is linked to this install.
+pub fn public_github_hosted(links: usize) -> [PublicCheck; 2] {
+    [
+        PublicCheck::new("github_app", "GitHub App", "pass", "hosted_app"),
+        if links > 0 {
+            PublicCheck::new(
+                "github_installed",
+                "Installed on your repositories",
+                "pass",
+                "ok",
+            )
+        } else {
+            PublicCheck::new(
+                "github_installed",
+                "Installed on your repositories",
+                "fail",
+                "not_linked",
+            )
+        },
+    ]
+}
+
 async fn public_github_now(state: &AppState) -> ([PublicCheck; 2], bool) {
+    if super::hybrid_install::github_hosted(state).await {
+        let links = super::hybrid_install::linked_installations(state).await;
+        return (public_github_hosted(links), false);
+    }
     let secret = stored_secret().await;
     let keys = app_keys(secret.as_ref());
     let manifest_ready = matches!(keys, AppKeys::Missing { setup_key: true });
@@ -2356,7 +2383,7 @@ pub async fn status(
         public_email_now(&state),
         public_optional_now(&state),
     );
-    let v = public_status(
+    let mut v = public_status(
         version,
         true,
         github,
@@ -2365,6 +2392,15 @@ pub async fn status(
         optional,
         manifest_ready,
     );
+    // Hybrid's own checks (registered, the CoderHelm address, the GitHub
+    // link), before the admin check, when the install chose hybrid.
+    let hybrid = super::hybrid_install::public_checks(&state).await;
+    if let Some(list) = v["checks"].as_array_mut() {
+        let at = list.len().saturating_sub(1);
+        for c in hybrid.into_iter().rev() {
+            list.insert(at, c);
+        }
+    }
     *CACHE.lock().unwrap_or_else(|e| e.into_inner()) = Some((Instant::now(), v.clone()));
     (cors, Json(v)).into_response()
 }

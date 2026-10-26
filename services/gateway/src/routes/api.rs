@@ -2777,6 +2777,15 @@ pub async fn forge_register_urls(
         .get("team_id")
         .and_then(|v| v.as_str())
         .ok_or(StatusCode::BAD_REQUEST)?;
+    // Hosted side of hybrid: a Forge app set up for a self-hosted install
+    // registers its links with that install, through the relay.
+    if common::hybrid::sign::is_install_id(raw_team_id) {
+        let bytes = serde_json::to_vec(&body).unwrap_or_default();
+        if let Some(code) = super::hybrid::relay_jira(&state, raw_team_id, "register", &bytes).await
+        {
+            return Ok(code);
+        }
+    }
     let team_id = if raw_team_id.starts_with("TEAM#") {
         raw_team_id.to_string()
     } else {
