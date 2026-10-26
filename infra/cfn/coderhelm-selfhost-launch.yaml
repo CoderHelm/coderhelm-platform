@@ -224,10 +224,10 @@ Resources:
                 nodejs: 20
               commands:
                 - set -euo pipefail
-                # cosign, checked against its own release's checksums.
-                - curl -fsSLo /tmp/cosign https://github.com/sigstore/cosign/releases/download/v2.4.1/cosign-linux-amd64
-                - curl -fsSLo /tmp/cosign_checksums.txt https://github.com/sigstore/cosign/releases/download/v2.4.1/cosign_checksums.txt
-                - (cd /tmp && grep ' cosign-linux-amd64$' cosign_checksums.txt | sed 's/cosign-linux-amd64$/cosign/' | sha256sum -c -)
+                # cosign, pinned by its SHA-256. These lines and the checks below
+                # match infra/lib/release-verify.ts (infra/test/launch-stack.test.ts).
+                - curl --proto =https --proto-redir =https --tlsv1.2 -fsSL -o /tmp/cosign https://github.com/sigstore/cosign/releases/download/v2.4.1/cosign-linux-amd64
+                - echo "8b24b946dd5809c6bd93de08033bcf6bc0ed7d336b7785787c080f574b89249b  /tmp/cosign" | sha256sum -c -
                 - install -m 0755 /tmp/cosign /usr/local/bin/cosign
             build:
               commands:
@@ -235,16 +235,19 @@ Resources:
                 - REPO=CoderHelm/coderhelm-platform
                 - |
                   if [ "$VERSION" = "latest" ]; then
-                    VERSION=$(curl -fsSL "https://api.github.com/repos/$REPO/releases/latest" | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>console.log(JSON.parse(s).tag_name))')
+                    VERSION=$(curl --proto =https --proto-redir =https --tlsv1.2 -fsSL "https://api.github.com/repos/$REPO/releases/latest" | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{const r=JSON.parse(s);if(r.draft||r.prerelease)process.exit(1);console.log(r.tag_name)})')
                     export VERSION
                   fi
+                - '[[ "$VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]] || { echo "VERSION=$VERSION is not a release tag"; exit 1; }'
                 - echo "Installing CoderHelm $VERSION"
                 - mkdir -p /tmp/ch && cd /tmp/ch
-                - B="https://github.com/$REPO/releases/download/$VERSION"
-                - for f in SHA256SUMS SHA256SUMS.sigstore.json coderhelm-selfhost.tgz launch-bootstrap.mjs; do curl -fsSLo "$f" "$B/$f"; done
-                # The checksums were signed by this repository's release workflow, on a tag.
-                - cosign verify-blob --bundle SHA256SUMS.sigstore.json --certificate-identity-regexp '^https://github.com/CoderHelm/coderhelm-platform/.github/workflows/release.yml@refs/tags/v' --certificate-oidc-issuer https://token.actions.githubusercontent.com SHA256SUMS
-                - grep -E ' (coderhelm-selfhost\.tgz|launch-bootstrap\.mjs)$' SHA256SUMS | sha256sum -c -
+                - B="https://github.com/CoderHelm/coderhelm-platform/releases/download/$VERSION"
+                - for f in SHA256SUMS SHA256SUMS.sigstore.json coderhelm-selfhost.tgz launch-bootstrap.mjs; do curl --proto =https --proto-redir =https --tlsv1.2 -fsSL -o "$f" "$B/$f"; done
+                # Signed by exactly this repository's release.yml, on this tag, logged in Rekor.
+                - cosign verify-blob --bundle SHA256SUMS.sigstore.json --certificate-identity "https://github.com/CoderHelm/coderhelm-platform/.github/workflows/release.yml@refs/tags/$VERSION" --certificate-oidc-issuer https://token.actions.githubusercontent.com --certificate-github-workflow-repository CoderHelm/coderhelm-platform --certificate-github-workflow-ref "refs/tags/$VERSION" SHA256SUMS
+                # Both files, each matched by name: grep finding one is not enough.
+                - grep ' coderhelm-selfhost.tgz$' SHA256SUMS | sha256sum -c -
+                - grep ' launch-bootstrap.mjs$' SHA256SUMS | sha256sum -c -
                 - node launch-bootstrap.mjs
             post_build:
               commands:
@@ -257,7 +260,7 @@ Resources:
                   URL=$(node -e 'try{console.log(require("/tmp/coderhelm-final.json").url||"")}catch{console.log("")}')
                   if [ -n "$WAIT_URL" ]; then
                     if [ "$CODEBUILD_BUILD_SUCCEEDING" = "1" ] && [ -n "$URL" ]; then S=SUCCESS; R="CoderHelm is running"; else S=FAILURE; R="The install failed: open the installer log (CloudWatch, /aws/codebuild/${CODEBUILD_BUILD_ID%%:*})"; fi
-                    curl -fsS -X PUT -H 'Content-Type:' --data-binary "{\"Status\":\"$S\",\"Reason\":\"$R\",\"UniqueId\":\"install\",\"Data\":\"$URL\"}" "$WAIT_URL"
+                    curl --proto =https --proto-redir =https --tlsv1.2 -fsS -X PUT -H 'Content-Type:' --data-binary "{\"Status\":\"$S\",\"Reason\":\"$R\",\"UniqueId\":\"install\",\"Data\":\"$URL\"}" "$WAIT_URL"
                   fi
 
   StarterRole:

@@ -49,6 +49,9 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 export const STATUS_SCHEMA = 1;
+
+/** A release tag (installer/lib/release.mjs TAG_RE). */
+export const RELEASE_TAG_RE = /^v\d+\.\d+\.\d+(-[0-9A-Za-z.-]+)?$/;
 export const STATUS_KEY = "status.json";
 
 /** The phases the guide shows, in order. */
@@ -361,7 +364,7 @@ export function realDeps(env = process.env) {
       }
     },
     async installCli(tgz) {
-      return sh("npm", ["install", "-g", "--no-audit", "--no-fund", tgz]);
+      return sh("npm", ["install", "-g", "--ignore-scripts", "--no-audit", "--no-fund", tgz]);
     },
     async pull(stage) {
       return sh("coderhelm-selfhost", ["pull", "--stage", stage, "--region", region]);
@@ -460,6 +463,10 @@ export async function run({ env = process.env, deps = realDeps(env), tgz = "code
   };
   const fail = (message, fix, extra = {}) => status({ phase: "failed", message, fix, ...extra });
 
+  // The buildspec resolved VERSION and checked this file and the installer
+  // against the release's signed SHA256SUMS; the installer checks the rest of
+  // the release the same way before deploying it.
+  if (!RELEASE_TAG_RE.test(String(version ?? ""))) return fail("The release to install is not a version such as v0.7.0.", "Launch again with a release version.");
   await status({ phase: "preparing", message: `Downloading CoderHelm ${version}` });
   const inst = await deps.installCli(tgz);
   if (inst.code !== 0) return fail("The installer could not be set up.", "Open the log, then launch again.");

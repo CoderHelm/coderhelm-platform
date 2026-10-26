@@ -56,7 +56,7 @@ Options
                       Enterprise Server); secrets come from GITHUB_WEBHOOK_SECRET
                       and GITHUB_CLIENT_SECRET
   --skip-github-app   deploy: don't create the GitHub App now
-  --require-signature update/deploy: refuse a release whose signature can't be checked
+  --require-signature (always on: a release whose signature can't be checked is refused)
   --auto-rollback     update: deploy the previous release again if health fails
   --result-file <f>   update: write {status, from, to, reason} to this file
   --skip-checks <ids> init: go on past these failed checks (comma-separated

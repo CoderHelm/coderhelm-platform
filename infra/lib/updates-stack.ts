@@ -32,14 +32,14 @@ import { Construct } from "constructs";
 import { ResolvedConfig } from "./config";
 import { repoPath } from "./paths";
 import { releaseStamp, stampEnvironment } from "./release";
+import { CHECK_VERSION, CURL, installCosignCommands, RELEASE_BASE, RELEASE_REPO, VERIFY_SUMS } from "./release-verify";
 
 /** The functions that read the install's secret once, at start. */
 export function secretReaders(prefix: string): string[] {
   return [`${prefix}-gateway`, `${prefix}-streaming`, `${prefix}-worker`];
 }
 
-/** The cosign release the update build installs (checked against its checksums). */
-export const COSIGN_VERSION = "v2.4.1";
+export { COSIGN_VERSION } from "./release-verify";
 
 export interface UpdatesStackProps extends cdk.StackProps {
   cfg: ResolvedConfig;
@@ -49,8 +49,6 @@ export interface UpdatesStackProps extends cdk.StackProps {
 
 /** The update build's script (also checked by the tests). */
 export function updateBuildSpec(cfg: ResolvedConfig): codebuild.BuildSpec {
-  const repo = "CoderHelm/coderhelm-platform";
-  const identity = `^https://github.com/${repo}/.github/workflows/release.yml@refs/tags/v`;
   return codebuild.BuildSpec.fromObject({
     version: "0.2",
     env: { shell: "bash" },
@@ -59,25 +57,25 @@ export function updateBuildSpec(cfg: ResolvedConfig): codebuild.BuildSpec {
         "runtime-versions": { nodejs: 20 },
         commands: [
           "set -euo pipefail",
-          // cosign, checked against its release's checksums.
-          `curl -fsSLo /tmp/cosign https://github.com/sigstore/cosign/releases/download/${COSIGN_VERSION}/cosign-linux-amd64`,
-          `curl -fsSLo /tmp/cosign_checksums.txt https://github.com/sigstore/cosign/releases/download/${COSIGN_VERSION}/cosign_checksums.txt`,
-          "(cd /tmp && grep ' cosign-linux-amd64$' cosign_checksums.txt | sed 's/cosign-linux-amd64$/cosign/' | sha256sum -c -)",
-          "install -m 0755 /tmp/cosign /usr/local/bin/cosign",
+          // cosign, pinned by its SHA-256 (infra/lib/release-verify.ts).
+          ...installCosignCommands(),
         ],
       },
       build: {
         commands: [
           "set -euo pipefail",
+          CHECK_VERSION,
           "mkdir -p /tmp/ch && cd /tmp/ch",
-          `B="https://github.com/${repo}/releases/download/$VERSION"`,
-          'curl -fsSLo SHA256SUMS "$B/SHA256SUMS"',
-          'curl -fsSLo SHA256SUMS.sigstore.json "$B/SHA256SUMS.sigstore.json"',
-          // The checksums were signed by the release workflow for this repo.
-          `cosign verify-blob --bundle SHA256SUMS.sigstore.json --certificate-identity-regexp '${identity}' --certificate-oidc-issuer https://token.actions.githubusercontent.com SHA256SUMS`,
-          'curl -fsSLo coderhelm-selfhost.tgz "$B/coderhelm-selfhost.tgz"',
+          RELEASE_BASE,
+          `${CURL} -o SHA256SUMS "$B/SHA256SUMS"`,
+          `${CURL} -o SHA256SUMS.sigstore.json "$B/SHA256SUMS.sigstore.json"`,
+          // Signed by exactly this repository's release.yml, on this tag, in Rekor.
+          VERIFY_SUMS,
+          `${CURL} -o coderhelm-selfhost.tgz "$B/coderhelm-selfhost.tgz"`,
           "grep ' coderhelm-selfhost.tgz$' SHA256SUMS | sha256sum -c -",
-          "npm install -g ./coderhelm-selfhost.tgz",
+          // The installer then checks every other file of the release the same way,
+          // and refuses an older release unless it is a rollback to one this install ran.
+          "npm install -g --ignore-scripts ./coderhelm-selfhost.tgz",
           `coderhelm-selfhost pull --stage ${cfg.stage} --region "$AWS_REGION"${cfg.raw.resourcePrefix ? ` --resource-prefix ${cfg.raw.resourcePrefix}` : ""}`,
           'EXTRA=""; if [ "$MODE" = "rollback" ]; then EXTRA="--rollback"; fi',
           // A domain change (MODE=domain) redeploys the release that runs,
@@ -208,7 +206,7 @@ export class UpdatesStack extends cdk.Stack {
         ADMIN_EMAILS: cfg.admins.join(","),
         SES_FROM_ADDRESS: cfg.email.from,
         APP_URL: props.appUrl,
-        RELEASE_REPO: "CoderHelm/coderhelm-platform",
+        RELEASE_REPO,
         // Restarted after the gateway stores new keys (refresh_secrets).
         REFRESH_FUNCTIONS: secretReaders(prefix).join(","),
         // Your own domain (docs/self-host/domains.md).

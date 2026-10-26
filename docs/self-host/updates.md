@@ -68,7 +68,7 @@ From the terminal, `update` runs a preflight first and stops before anything cha
 
 The update runs as a CodeBuild job in your account, `coderhelm-<stage>-update`:
 
-1. **Checks the release.** It downloads the release's `SHA256SUMS` and checks its signature with cosign: it must be signed, keyless, by `CoderHelm/coderhelm-platform`'s release workflow on a version tag. Every file is then checked against `SHA256SUMS`. A release that fails either check is refused.
+1. **Checks the release.** It downloads the release's `SHA256SUMS` and checks its signature with cosign: it must be signed, keyless, by exactly `CoderHelm/coderhelm-platform`'s `release.yml`, on that release's own tag, and be in the Rekor transparency log. Every file is then checked against `SHA256SUMS`. A release that fails either check is refused, and so is an older release than the one you run unless it is a rollback. See [How updates are kept safe](./updates-security.md).
 2. **Checks health first.** The stacks, functions, dead-letter queue, keys and URLs. An unhealthy install is not updated.
 3. **Reads the migration notes.** Every release between yours and the target is listed. One that needs action stops an automatic update; an admin does what it says, then updates by hand.
 4. **Deploys.** It runs the release's CDK app through the CDK roles in your account.
@@ -97,7 +97,7 @@ The job's role can only assume the CDK bootstrap roles (which do the deploying),
 
 ## Roll back
 
-**Settings, then System, then Roll back** (or `coderhelm-selfhost rollback`) deploys the release before the last successful update. To pick a version: `coderhelm-selfhost rollback --to v0.7.0`.
+**Settings, then System, then Roll back** (or `coderhelm-selfhost rollback`) deploys the release before the last successful update. To pick a version: `coderhelm-selfhost rollback --to v0.7.0`. Only a release this install ran before can be picked: an older release it never ran is refused, even though it is signed.
 
 Data written by a newer release stays. Releases only add fields to stored items, so an older release keeps reading them. CloudFormation also rolls a stack back by itself if a deploy fails partway.
 
@@ -106,10 +106,10 @@ Data written by a newer release stays. Releases only add fields to stored items,
 ```sh
 npx -y github:CoderHelm/coderhelm-platform update                # latest release
 npx -y github:CoderHelm/coderhelm-platform update --to v0.8.0
-npx -y github:CoderHelm/coderhelm-platform update --auto-rollback --require-signature
+npx -y github:CoderHelm/coderhelm-platform update --auto-rollback
 ```
 
-The terminal update runs the same steps on your machine. It shows `cdk diff` and asks before deploying unless you pass `--yes`. Signatures are checked when `cosign` or the GitHub CLI is installed; `--require-signature` refuses a release that can't be checked.
+The terminal update runs the same steps on your machine. It shows `cdk diff` and asks before deploying unless you pass `--yes`. It needs `cosign` or the GitHub CLI (`gh`) to check the signature, and refuses the release without one of them. (`--require-signature` is still accepted; it is always on.)
 
 ## Another machine
 
@@ -133,4 +133,4 @@ Each release (a `vX.Y.Z` tag) has, on its GitHub release page:
 | `install.sh`, `launch-stack.yaml` | The install script and the Launch Stack template |
 | `SHA256SUMS`, `SHA256SUMS.sigstore.json` | Checksums, and their keyless signature |
 
-Every artifact also has a GitHub build provenance attestation (`gh attestation verify <file> --repo CoderHelm/coderhelm-platform`).
+Every artifact also has a GitHub build provenance attestation. To check a release yourself, see [How updates are kept safe](./updates-security.md#check-a-release-yourself).

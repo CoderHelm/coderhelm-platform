@@ -260,3 +260,13 @@ test("updates: off by default; on with a window and time zone from the stack", (
   assert.throws(() => updatesFromEnv({ UPDATE_WINDOW: "whenever" }), /maintenance window/);
   assert.throws(() => updatesFromEnv({ UPDATE_TIMEZONE: "Mars" }), /time zone/);
 });
+
+test("run: a VERSION that isn't a release tag stops before anything is installed", async () => {
+  for (const bad of ["latest", "v1.2.3;id", "../v1", ""]) {
+    let installed = false;
+    const { deps } = fakes({ installCli: async () => ((installed = true), { code: 0 }) });
+    const doc = await run({ env: { ...ENV, VERSION: bad }, deps, log: () => {} });
+    assert.equal(doc.phase, "failed", bad);
+    assert.equal(installed, false, bad);
+  }
+});

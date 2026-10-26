@@ -10,7 +10,10 @@ Actions (the `action` field of the event):
             release notes, settings, history.
 - settings  saves auto-update settings (validated).
 - update_now  starts the update build for a version (default: the latest).
-- rollback  starts the build for the version before the last update.
+            Only a version newer than the one running: going back is a
+            rollback.
+- rollback  starts the build for the version before the last update, or an
+            admin's pick, which must be a version this install ran before.
 - finished  the update build reports its result; history and notices.
 - refresh_secrets  the gateway stored new keys in the install's secret (the
             GitHub App, from the install guide): restart the services that
@@ -27,6 +30,12 @@ Actions (the `action` field of the event):
 The build itself (CodeBuild, infra/lib/updates-stack.ts) runs
 `coderhelm-selfhost update`: health check, checksum and signature check,
 deploy, health check, and a rollback when the new version is unhealthy.
+The build checks the release itself (signature made by exactly this
+repository's release.yml on the version's tag), so the release list read
+here only decides what to offer, never what is trusted. It is still checked:
+it must come from api.github.com for CoderHelm/coderhelm-platform, and a list
+that no longer shows the newest version seen before is reported as stale in
+status (a stale copy can't quietly hold an install back).
 
 State lives on the settings table under pk SYSTEM. The domain's states and
 checks are documented in docs/self-host/domains.md.
@@ -48,6 +57,10 @@ DAYS = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
 CHANNELS = ("stable", "preview")
 MAJORS = ("ask", "auto")
 CACHE_SECONDS = 3600
+# A release list not refreshed for this long is shown as stale.
+STALE_SECONDS = 3 * 24 * 3600
+RELEASE_REPO = "CoderHelm/coderhelm-platform"
+RELEASES_URL = f"https://api.github.com/repos/{RELEASE_REPO}/releases?per_page=30"
 RUNNING_STALE = timedelta(hours=3)
 PK = "SYSTEM"
 
@@ -260,13 +273,36 @@ def client(name, region=None):
     return _clients[key]
 
 
+def check_repo(repo):
+    """Releases come only from CoderHelm's own repository."""
+    if repo != RELEASE_REPO:
+        raise ValueError(f"releases come only from {RELEASE_REPO}, not {repo}")
+    return repo
+
+
 def fetch_releases(repo):
+    check_repo(repo)
     req = urllib.request.Request(
-        f"https://api.github.com/repos/{repo}/releases?per_page=30",
+        RELEASES_URL,
         headers={"accept": "application/vnd.github+json", "user-agent": "coderhelm-updater"},
     )
     with urllib.request.urlopen(req, timeout=10) as r:
+        # A redirect anywhere but GitHub's API over HTTPS is refused.
+        if not r.geturl().startswith("https://api.github.com/"):
+            raise ValueError(f"the release list came from {r.geturl()}")
         return json.loads(r.read())
+
+
+def newest(releases):
+    """The highest release version in a list (drafts and odd tags skipped), or None."""
+    best = None
+    for r in releases or []:
+        tag = r.get("tag_name") or r.get("version")
+        if r.get("draft") or not parse_version(tag):
+            continue
+        if best is None or compare(tag, best) > 0:
+            best = tag
+    return best
 
 
 def releases_cached(store, repo, now_ts, fetch=fetch_releases):
@@ -274,6 +310,7 @@ def releases_cached(store, repo, now_ts, fetch=fetch_releases):
     if cached and now_ts - cached.get("fetched_at", 0) < CACHE_SECONDS:
         return cached.get("releases", [])
     try:
+        check_repo(repo)
         rel = [
             {k: r.get(k) for k in ("tag_name", "prerelease", "draft", "body", "published_at", "html_url")}
             for r in fetch(repo)
@@ -281,8 +318,43 @@ def releases_cached(store, repo, now_ts, fetch=fetch_releases):
     except Exception as e:  # GitHub down: keep the old list
         logger.warning(f"Could not read releases: {e}")
         return cached.get("releases", [])
-    store.put("RELEASES_CACHE", {"fetched_at": now_ts, "releases": rel})
+    # Freshness: a list without the newest version seen before is either a
+    # stale copy or a release that was withdrawn. Either way it can only hold
+    # back an update (nothing below the running version is ever applied), so
+    # the list is used as it is, and admins see why it looks older.
+    seen = cached.get("newest_seen") if cached else None
+    top = newest(rel)
+    doc = {"fetched_at": now_ts, "releases": rel, "newest_seen": top or seen}
+    if seen and (top is None or compare(top, seen) < 0):
+        logger.warning(f"Release list looks stale: newest is {top}, {seen} was seen before")
+        doc.update(newest_seen=seen, stale_reason=f"GitHub's release list no longer shows {seen} (withdrawn, or a stale copy)")
+    store.put("RELEASES_CACHE", doc)
     return rel
+
+
+def releases_freshness(store, now_ts):
+    """Whether the release list is current: {fetched_at, stale, reason}."""
+    cached = store.get("RELEASES_CACHE", {}) or {}
+    at = cached.get("fetched_at")
+    reason = cached.get("stale_reason")
+    if not reason and (not at or now_ts - at > STALE_SECONDS):
+        reason = "the release list has not been read from GitHub for over 3 days"
+    return {"fetched_at": at, "stale": bool(reason), "reason": reason}
+
+
+def ran_versions(store, state, current):
+    """Every version this install has run: recorded ones, the history, the current one."""
+    out = set(v for v in (state.get("ran_versions") or []) if parse_version(v))
+    for h in store.history(50):
+        if h.get("mode") == "domain":
+            continue
+        if h.get("from_version") and parse_version(h["from_version"]):
+            out.add(h["from_version"])
+        if h.get("status") == "succeeded" and parse_version(h.get("version")):
+            out.add(h["version"])
+    if parse_version(current):
+        out.add(current)
+    return out
 
 
 def notify(subject, text, env=None):
@@ -604,6 +676,8 @@ def begin(store, env, now, version, actor, mode, extra=None, note=None):
     if running(state, now):
         raise ValueError("an update is already running")
     current = env.get("CODERHELM_VERSION", "")
+    if parse_version(current):
+        state["ran_versions"] = sorted(set(state.get("ran_versions") or []) | {current})
     hid = f"UPDATE#{now.strftime('%Y-%m-%dT%H:%M:%SZ')}#{uuid.uuid4().hex[:8]}"
     entry = {"version": version, "from_version": current, "actor": actor, "mode": mode,
              "status": "running", "started_at": now.isoformat(), "reason": ""}
@@ -637,6 +711,7 @@ def handle(event, env, store, now, fetch=fetch_releases):
             },
             "latest": latest,
             "update_available": latest is not None,
+            "releases": releases_freshness(store, now.timestamp()),
             "settings": settings,
             "running": running(state, now),
             # Releases whose last try failed or rolled back: the dashboard's
@@ -659,6 +734,9 @@ def handle(event, env, store, now, fetch=fetch_releases):
             version = latest["version"]
         if not parse_version(version):
             raise ValueError("version must look like v1.2.3")
+        # Forward only: an older (or the same) release is a rollback.
+        if parse_version(current) and compare(version, current) <= 0:
+            raise ValueError(f"{version} is not newer than {current}; use Roll back to go to an earlier release")
         return begin(store, env, now, version, event.get("actor") or "unknown", "update")
 
     if action == "rollback":
@@ -670,6 +748,11 @@ def handle(event, env, store, now, fetch=fetch_releases):
             target = done[0]["from_version"]
         if not parse_version(target):
             raise ValueError("version must look like v1.2.3")
+        # Only to a release this install ran: an old signed release with a
+        # since-fixed problem can't be pushed onto it.
+        ran = ran_versions(store, state, current) - {current}
+        if target not in ran:
+            raise ValueError(f"{target} is not a version this install ran before, so it can't be rolled back to")
         return begin(store, env, now, target, event.get("actor") or "unknown", "rollback")
 
     if action == "finished":
@@ -691,6 +774,8 @@ def handle(event, env, store, now, fetch=fetch_releases):
             failed = set(state.get("failed_versions") or [])
             failed.add(version)
             state["failed_versions"] = sorted(failed)
+        if status == "succeeded" and parse_version(version):
+            state["ran_versions"] = sorted(set(state.get("ran_versions") or []) | {version})
         store.put("UPDATE_STATE", state)
         words = {"succeeded": "is now on", "failed": "could not update to", "rolled_back": "rolled back after trying"}[status]
         notify(

@@ -4,7 +4,7 @@ import fs from "node:fs";
 import path from "node:path";
 import crypto from "node:crypto";
 import { checkPrereqs } from "./prereqs.mjs";
-import { fetchRelease, latestVersion, releasePaths, releasesDir, verifySignature } from "./release.mjs";
+import { checkTag, fetchRelease, latestVersion, releasePaths, releasesDir, TAG_RE } from "./release.mjs";
 import { openBrowser } from "./github-app.mjs";
 import { ensureSecret, hasGithubApp, mergeSecret, readSecret } from "./secrets.mjs";
 import { runManifestFlow, secretKeysFromApp } from "./github-app.mjs";
@@ -84,8 +84,8 @@ export async function resolveSource(ctx, version) {
   }
   const tag = version ?? (runner.dryRun ? "v0.0.0-dry-run" : await latestVersion(ctx.fetchImpl));
   log(`Release ${tag}`);
+  // Downloads, then checks the checksums and the signature before unpacking.
   const paths = await fetchRelease(tag, { runner, fetchImpl: ctx.fetchImpl, log });
-  if (!runner.dryRun) await verifySignature(paths, runner, { require: !!flags.requireSignature, log });
   return {
     version: tag,
     infra: paths.infra,
@@ -146,6 +146,7 @@ export async function deploy(ctx) {
   const publicUrl = known ?? "https://<your CloudFront URL>";
   const next = { ...state, installId: state.installId ?? crypto.randomUUID(), version: src.version, deployedAt: new Date().toISOString(), ...(known ? { publicUrl: known } : {}) };
   if (state.version && state.version !== src.version) next.previousVersion = state.version;
+  next.versions = ranVersions(next);
   saveState(flags, next, runner);
   await saveRemote(ctx, cfg, next);
 
@@ -325,8 +326,8 @@ export function migrationNotes(migrations, from, to) {
 /**
  * Moves the install to a release, safely:
  *   1. health check first (an unhealthy install isn't updated, unless --force);
- *   2. the release's checksums and signature (--require-signature refuses
- *      one that can't be verified);
+ *   2. the release's checksums and signature (always: a release that can't
+ *      be verified is refused);
  *   3. the migration notes it crosses (action-needed ones stop it without --yes);
  *   4. deploy;
  *   5. health check after; when it fails and --auto-rollback is set, the
@@ -352,6 +353,9 @@ export async function update(ctx) {
     if (state.version && semverCompare(target, state.version) < 0 && !flags.rollback) {
       throw new Error(`${target} is older than ${state.version}. Use "coderhelm-selfhost rollback" to go back.`);
     }
+    // Going back only to a release this install ran before: an older signed
+    // release with a since-fixed problem can't be pushed onto it.
+    if (flags.rollback) checkRollbackTarget(state, target);
     log(`${flags.rollback ? "Rolling back" : "Updating"} ${state.version ?? "(unknown)"} to ${target}`);
 
     // Preflight: what would stop the update, each with its fix, before
@@ -468,6 +472,21 @@ const HEALTH_FIX = {
   Dashboard: "Deploy again; the dashboard files are uploaded with it.",
   API: "Check the gateway function's logs in CloudWatch, then deploy again.",
 };
+
+/** Every release this install has run (state.versions, plus the current and previous one). */
+export function ranVersions(state) {
+  const all = [...(state.versions ?? []), state.previousVersion, state.version];
+  return [...new Set(all.filter((v) => typeof v === "string" && TAG_RE.test(v)))].sort(semverCompare).slice(-50);
+}
+
+/** A rollback goes only to an older release this install ran before. */
+export function checkRollbackTarget(state, target) {
+  checkTag(target);
+  const ran = ranVersions(state).filter((v) => v !== state.version);
+  if (!ran.includes(target)) {
+    throw plainError(`${target} is not a release this install ran before (${ran.join(", ") || "none recorded"}), so it can't be rolled back to. Update forward instead.`);
+  }
+}
 
 /** The old name for update. */
 export const upgrade = update;
