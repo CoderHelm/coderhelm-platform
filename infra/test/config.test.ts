@@ -251,3 +251,11 @@ test("updates settings", () => {
   assert.equal(r.updates.enabled, true);
   assert.deepEqual(r.updates.defaults, { auto: false, channel: "stable", day: "sun", hour: 3, timezone: "UTC", majors: "ask" });
 });
+
+test("signup.requireTwoFactor: off unless set, and only a boolean", () => {
+  const base = (over: Record<string, unknown> = {}) =>
+    resolveConfig({ account: "111122223333", region: "us-west-2", stage: "prod", email: { from: "a@example.org" }, admins: ["a@example.org"], ...over } as any);
+  assert.equal(base().signup.requireTwoFactor, false);
+  assert.equal(base({ signup: { requireTwoFactor: true } }).signup.requireTwoFactor, true);
+  assert.throws(() => base({ signup: { requireTwoFactor: "yes" } }), /requireTwoFactor/);
+});

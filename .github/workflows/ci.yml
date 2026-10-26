@@ -72,6 +72,8 @@ jobs:
         with:
           python-version: "3.12"
       - run: python3 -m unittest discover -s lambda/tests
+      # The Cognito pre-sign-up trigger, against the cases the gateway uses.
+      - run: node --test lambda/pre-signup/handler.test.js
 
   mcp-proxy:
     name: MCP Proxy (Node)

@@ -102,10 +102,10 @@ Your email: you@example.com
 Emails come from [coderhelm@example.com]:
   example.com is your Route 53 zone: the deploy adds its DKIM records and SES verifies it in minutes.
   This account is in the SES sandbox: email only reaches verified addresses, 200 a day. ...
-Let anyone with this email domain sign up (empty: only you) [example.com]:
+This install is for one organization. Let people from your company join: an email domain such as example.com (empty: only people you invite) []:
 ```
 
-You become the first admin. It checks the sender's SES identity (verified, with DKIM; when not, it prints the three DNS records to add) and whether the account is still in the SES sandbox (a warning, with the link to request production access). See [Email](./email.md).
+You become the first admin. Nobody else can sign up unless you invite them or allow their email domain (change it later in **Settings, Sign-in**; see [Sign-in and people](./sign-in.md)). It checks the sender's SES identity (verified, with DKIM; when not, it prints the three DNS records to add) and whether the account is still in the SES sandbox (a warning, with the link to request production access). See [Email](./email.md).
 
 ## Step 6: optional extras
 
@@ -196,7 +196,7 @@ The [install guide](https://docs.coderhelm.com/self-host/install/) builds this l
 - Quick-create link (replace both regions with yours):
   `https://us-east-1.console.aws.amazon.com/cloudformation/home?region=us-east-1#/stacks/create/review?stackName=coderhelm-prod&templateURL=https://coderhelm-public.s3.amazonaws.com/launch/v0.7.0/coderhelm-launch.yaml&param_AdminEmail=you@example.com`
 
-Only your email is required. The optional parameters: `Hostname` (your own domain: a Route 53 zone in the account is found and set up for you, any other DNS provider gets two records to add, see [Domains](./domains.md)), `EmailFrom`, `SignupDomain`, `AutoUpdate` with `UpdateWindow` and `UpdateTimezone`, `BedrockInferencePrefix` and `Telemetry`. [Everything you can set up](./options.md) lists each with its config setting. Tick the box that lets the stack create IAM roles and press **Create stack**. A CodeBuild project in your account downloads the release, checks its signature and checksums, deploys every CoderHelm stack (about 20 minutes) and finishes with your URL in the stack's **Outputs**. Its log stays in CloudWatch under `/aws/codebuild/<stack name>-installer`, also if the stack is rolled back.
+Only your email is required. The optional parameters: `Hostname` (your own domain: a Route 53 zone in the account is found and set up for you, any other DNS provider gets two records to add, see [Domains](./domains.md)), `EmailFrom`, `SignupDomain` (empty: only people you invite) and `RequireTwoFactor`, `AutoUpdate` with `UpdateWindow` and `UpdateTimezone`, `BedrockInferencePrefix` and `Telemetry`. [Everything you can set up](./options.md) lists each with its config setting. Tick the box that lets the stack create IAM roles and press **Create stack**. A CodeBuild project in your account downloads the release, checks its signature and checksums, deploys every CoderHelm stack (about 20 minutes) and finishes with your URL in the stack's **Outputs**. Its log stays in CloudWatch under `/aws/codebuild/<stack name>-installer`, also if the stack is rolled back.
 
 Without the guide's setup key, create the GitHub App from your computer with the two commands in the **GitHubAppWithoutTheGuide** output (`pull`, then `github-app`).
 

@@ -12,7 +12,8 @@ use std::sync::Arc;
 use tracing::{error, info, warn};
 
 use super::oauth_signin::{self, CallbackQuery, Provider, Reason, SignInFailure};
-use crate::auth::jwt;
+use super::sign_in::{self, Join};
+use crate::auth::jwt::{self, SecondStep, SignInProof};
 use crate::middleware::auth::SESSION_TTL_SECS;
 use crate::AppState;
 
@@ -175,8 +176,22 @@ pub async fn signup(
         ));
     }
 
-    // Closed beta: check allowlist
-    if !is_email_allowed(&state, &email).await {
+    // A self-hosted install: one organization, joined only by invite or an
+    // allowed email domain (the first admin starts it).
+    if sign_in::applies() {
+        let join = sign_in::may_sign_up(&state, &email).await.map_err(|e| {
+            error!("Sign-up check failed: {e}");
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({ "error": "Sign-up is unavailable just now. Try again shortly." })),
+            )
+        })?;
+        if !join.allowed() {
+            info!(outcome = join.key(), "Self-hosted sign-up refused");
+            return Err(not_invited_json());
+        }
+    } else if !is_email_allowed(&state, &email).await {
+        // Closed beta: check allowlist
         return Err((
             StatusCode::FORBIDDEN,
             Json(serde_json::json!({
@@ -217,7 +232,11 @@ pub async fn signup(
     }
 
     let result = req.send().await.map_err(|e| {
-        let msg = format!("{e}");
+        let msg = format!("{e:?}");
+        // The pre-sign-up trigger said no (a self-hosted install's rules).
+        if msg.contains("UserLambdaValidationException") {
+            return not_invited_json();
+        }
         if msg.contains("UsernameExistsException") {
             return (
                 StatusCode::CONFLICT,
@@ -295,6 +314,15 @@ pub async fn verify_email(
         })?;
 
     let cognito_sub = user_result.username();
+
+    // A self-hosted install makes no team here: the person's place in the
+    // organization is settled at their first sign-in.
+    if sign_in::applies() {
+        return Ok(Json(serde_json::json!({
+            "status": "verified",
+            "message": "Email verified. You can now log in."
+        })));
+    }
 
     // Someone invited (or already on a team) lands there at first sign-in:
     // no personal team for them. A failed lookup falls back to making one, as
@@ -438,7 +466,13 @@ pub async fn login_email(
         .access_token()
         .ok_or(StatusCode::INTERNAL_SERVER_ERROR)?;
 
-    issue_session_from_cognito(&state, &email, access_token).await
+    issue_session_from_cognito(
+        &state,
+        &email,
+        access_token,
+        &SignInProof::new(false, "password"),
+    )
+    .await
 }
 
 // ── MFA verify ───────────────────────────────────────────────────────
@@ -498,7 +532,136 @@ pub async fn mfa_verify(
         .and_then(|a| a.value().map(|v| v.to_string()))
         .unwrap_or_default();
 
-    issue_session_from_cognito(&state, &email, access_token).await
+    let resp = issue_session_from_cognito(
+        &state,
+        &email,
+        access_token,
+        &SignInProof::new(true, "password"),
+    )
+    .await?;
+    if sign_in::applies() && resp.status().is_success() {
+        let sub = format!("USER#{}", user.username());
+        if let Some(team) = cognito_member_team(&state, &email, &sub).await {
+            sign_in::note_factor(&state, &team, &sub, Some("cognito")).await;
+        }
+    }
+    Ok(resp)
+}
+
+/// The organization team a Cognito user's own record is in, if any.
+async fn cognito_member_team(state: &AppState, email: &str, sub: &str) -> Option<String> {
+    let org = sign_in::load_org(state).await.ok()??;
+    state
+        .dynamo
+        .get_item()
+        .table_name(&state.config.users_table_name)
+        .key("pk", attr_s(&org.team_id))
+        .key("sk", attr_s(sub))
+        .send()
+        .await
+        .ok()?
+        .item
+        .filter(|i| {
+            i.get("email")
+                .and_then(|v| v.as_s().ok())
+                .map(|e| normalize_email(e))
+                == Some(normalize_email(email))
+        })
+        .map(|_| org.team_id)
+}
+
+/// The answer to someone a self-hosted install won't let in.
+fn not_invited_json() -> (StatusCode, Json<serde_json::Value>) {
+    (
+        StatusCode::FORBIDDEN,
+        Json(serde_json::json!({ "error": sign_in::NOT_INVITED, "code": "not_invited" })),
+    )
+}
+
+/// Where a refused Google or GitHub sign-in lands.
+fn not_invited_url(dash: &str) -> String {
+    format!("{dash}?error=not_invited")
+}
+
+/// A self-hosted install: the organization record this person signs in to,
+/// made when the rules let them in (the first admin, an invite, an allowed
+/// domain). `None` when they may not join.
+async fn selfhost_landing(
+    state: &AppState,
+    email: &str,
+    user_id: &str,
+    name: &str,
+    avatar: &str,
+) -> Result<Option<HashMap<String, AttributeValue>>, String> {
+    let facts = sign_in::facts_for(state, email).await?;
+    let join = sign_in::decide_join(&facts, chrono::Utc::now());
+    info!(outcome = join.key(), "Self-hosted sign-in");
+    match join {
+        Join::Member { team_id, user_id } => Ok(facts
+            .records
+            .iter()
+            .find(|i| {
+                i.get("pk").and_then(|v| v.as_s().ok()) == Some(&team_id)
+                    && i.get("sk").and_then(|v| v.as_s().ok()) == Some(&user_id)
+            })
+            .cloned()),
+        Join::Invite => {
+            let Some(org) = facts.org.as_ref() else {
+                return Ok(None);
+            };
+            let mine: Vec<_> = facts
+                .records
+                .iter()
+                .filter(|i| i.get("pk").and_then(|v| v.as_s().ok()) == Some(&org.team_id))
+                .cloned()
+                .collect();
+            Ok(accept_pending_invites(state, &mine, user_id, email)
+                .await
+                .into_iter()
+                .next())
+        }
+        Join::Domain => {
+            let Some(org) = facts.org.as_ref() else {
+                return Ok(None);
+            };
+            sign_in::join_by_domain(state, org, user_id, email, name, avatar)
+                .await
+                .map(Some)
+        }
+        Join::FirstAdmin => {
+            let Some(team_id) = sign_in::create_org(state, user_id, email, name, avatar).await?
+            else {
+                return Ok(None);
+            };
+            Ok(state
+                .dynamo
+                .get_item()
+                .table_name(&state.config.users_table_name)
+                .key("pk", attr_s(&team_id))
+                .key("sk", attr_s(user_id))
+                .consistent_read(true)
+                .send()
+                .await
+                .map_err(|e| format!("{e}"))?
+                .item)
+        }
+        Join::Listed | Join::Refused => Ok(None),
+    }
+}
+
+/// The landing record's team, user id, role and GitHub login.
+fn landing_parts(
+    item: &HashMap<String, AttributeValue>,
+) -> (String, String, String, Option<String>) {
+    let g = |k: &str| item.get(k).and_then(|v| v.as_s().ok()).cloned();
+    (
+        g("pk").unwrap_or_default(),
+        g("sk").unwrap_or_default(),
+        g("role")
+            .filter(|r| !r.is_empty())
+            .unwrap_or_else(|| "member".to_string()),
+        g("github_login").filter(|l| !l.is_empty()),
+    )
 }
 
 // ── Forgot password ──────────────────────────────────────────────────
@@ -762,6 +925,53 @@ async fn google_callback_inner(
         .and_then(|r| r.items)
         .unwrap_or_default();
 
+    if sign_in::applies() {
+        let dash = common::public_urls::app_url(&state.config.stage);
+        let landed = selfhost_landing(
+            state,
+            &email,
+            &format!("USER#{cognito_sub}"),
+            name.as_deref().unwrap_or(""),
+            picture.as_deref().unwrap_or(""),
+        )
+        .await
+        .map_err(|e| SignInFailure::new(P, Reason::Server, "join", e))?;
+        let Some(record) = landed else {
+            return Ok(Redirect::temporary(&not_invited_url(dash)).into_response());
+        };
+        let (team_id, user_id, role, github_login) = landing_parts(&record);
+        touch_last_login(state, &team_id, &user_id).await;
+        let step = SecondStep {
+            sub: user_id.clone(),
+            team_id: team_id.clone(),
+            email: email.clone(),
+            role: role.clone(),
+            github_login: github_login.clone(),
+            via: "google".into(),
+            aud: String::new(),
+            iat: 0,
+            exp: 0,
+        };
+        if let Some(resp) = sign_in::second_step(state, step, dash)
+            .await
+            .map_err(|e| SignInFailure::new(P, Reason::Server, "second_step", e))?
+        {
+            return Ok(resp);
+        }
+        let token = jwt::create_session_token(
+            &user_id,
+            &team_id,
+            &email,
+            &role,
+            github_login.as_deref(),
+            &SignInProof::new(false, "google"),
+            &state.secrets.jwt_secret,
+            SESSION_TTL_SECS,
+        )
+        .map_err(|e| SignInFailure::new(P, Reason::Server, "session_token", e))?;
+        return Ok(session_redirect(P, &token, dash));
+    }
+
     // Closed beta: only allow new users on the allowlist (existing users can always log in)
     if existing.is_empty() && !is_email_allowed(state, &email).await {
         let dash = common::public_urls::app_url(&state.config.stage);
@@ -965,8 +1175,12 @@ async fn github_callback_inner(
         .map_err(|e| SignInFailure::new(P, Reason::Provider, "installations", e))?;
 
     // Check if user already has a session (connecting GitHub to existing account)
-    let existing_claims = extract_cookie(cookie_header(headers), "__Host-coderhelm_session")
-        .and_then(|token| jwt::validate_token(token, &state.secrets.jwt_secret).ok());
+    let session_token = extract_cookie(cookie_header(headers), "__Host-coderhelm_session");
+    let existing_claims =
+        session_token.and_then(|token| jwt::validate_token(token, &state.secrets.jwt_secret).ok());
+    let existing_proof = session_token
+        .map(|t| jwt::read_proof(t, &state.secrets.jwt_secret))
+        .unwrap_or_default();
 
     let now = chrono::Utc::now().to_rfc3339();
 
@@ -1095,13 +1309,15 @@ async fn github_callback_inner(
             );
         }
 
-        // Re-issue JWT with github_login (keep the user's existing team)
-        let token = jwt::create_token(
+        // Re-issue JWT with github_login (keep the user's existing team and
+        // how they signed in)
+        let token = jwt::create_session_token(
             &claims.sub,
             &claims.team_id,
             &claims.email,
             &claims.role,
             Some(github_login),
+            &existing_proof,
             &state.secrets.jwt_secret,
             SESSION_TTL_SECS,
         )
@@ -1155,6 +1371,38 @@ async fn github_callback_inner(
     };
 
     let existing_user = existing_by_github.or(existing_by_email);
+
+    // A self-hosted install: only the organization's own records, or a join
+    // its rules allow; never a new team.
+    let existing_user = if sign_in::applies() {
+        let org_team = sign_in::ensure_org(state)
+            .await
+            .map_err(|e| SignInFailure::new(P, Reason::Server, "join", e))?
+            .map(|o| o.team_id);
+        let in_org = existing_user.filter(|i| {
+            org_team.is_some() && i.get("pk").and_then(|v| v.as_s().ok()) == org_team.as_ref()
+        });
+        let landed = match in_org {
+            Some(rec) => Some(rec),
+            None if !email.is_empty() => selfhost_landing(
+                state,
+                email,
+                &github_user_id,
+                user["name"].as_str().unwrap_or(""),
+                user["avatar_url"].as_str().unwrap_or(""),
+            )
+            .await
+            .map_err(|e| SignInFailure::new(P, Reason::Server, "join", e))?,
+            None => None,
+        };
+        let Some(rec) = landed else {
+            let dash = common::public_urls::app_url(&state.config.stage);
+            return Ok(Redirect::temporary(&not_invited_url(dash)).into_response());
+        };
+        Some(rec)
+    } else {
+        existing_user
+    };
 
     let has_existing_record = existing_user.is_some();
 
@@ -1381,12 +1629,35 @@ async fn github_callback_inner(
         "User authenticated via GitHub"
     );
 
-    let token = jwt::create_token(
+    if sign_in::applies() {
+        touch_last_login(state, &team_id, &user_id).await;
+        let step = SecondStep {
+            sub: user_id.clone(),
+            team_id: team_id.clone(),
+            email: email.to_string(),
+            role: role.clone(),
+            github_login: Some(github_login.to_string()),
+            via: "github".into(),
+            aud: String::new(),
+            iat: 0,
+            exp: 0,
+        };
+        let dash = common::public_urls::app_url(&state.config.stage);
+        if let Some(resp) = sign_in::second_step(state, step, dash)
+            .await
+            .map_err(|e| SignInFailure::new(P, Reason::Server, "second_step", e))?
+        {
+            return Ok(resp);
+        }
+    }
+
+    let token = jwt::create_session_token(
         &user_id,
         &team_id,
         email,
         &role,
         Some(github_login),
+        &SignInProof::new(false, "github"),
         &state.secrets.jwt_secret,
         SESSION_TTL_SECS,
     )
@@ -1568,6 +1839,7 @@ async fn issue_session_from_cognito(
     state: &Arc<AppState>,
     email: &str,
     access_token: &str,
+    proof: &SignInProof,
 ) -> Result<Response, StatusCode> {
     // Get Cognito user info
     let user = state
@@ -1582,6 +1854,29 @@ async fn issue_session_from_cognito(
         })?;
 
     let cognito_sub = user.username();
+
+    if sign_in::applies() {
+        let landed = selfhost_landing(state, email, &format!("USER#{cognito_sub}"), "", "")
+            .await
+            .map_err(|e| {
+                error!("Self-hosted sign-in check failed: {e}");
+                StatusCode::SERVICE_UNAVAILABLE
+            })?;
+        let Some(record) = landed else {
+            return Ok(not_invited_json().into_response());
+        };
+        let (team_id, user_id, role, github_login) = landing_parts(&record);
+        touch_last_login(state, &team_id, &user_id).await;
+        return session_json(
+            state,
+            &team_id,
+            &user_id,
+            email,
+            &role,
+            github_login.as_deref(),
+            proof,
+        );
+    }
 
     // Look up user by email (GSI2) — includes personal team + any pending invites
     let existing = state
@@ -1686,13 +1981,34 @@ async fn issue_session_from_cognito(
     };
 
     touch_last_login(state, &team_id, &user_id).await;
-
-    let token = jwt::create_token(
-        &user_id,
+    session_json(
+        state,
         &team_id,
+        &user_id,
         email,
         &role,
         github_login.as_deref(),
+        proof,
+    )
+}
+
+/// The JSON answer to an email sign-in, with its session cookie.
+fn session_json(
+    state: &AppState,
+    team_id: &str,
+    user_id: &str,
+    email: &str,
+    role: &str,
+    github_login: Option<&str>,
+    proof: &SignInProof,
+) -> Result<Response, StatusCode> {
+    let token = jwt::create_session_token(
+        user_id,
+        team_id,
+        email,
+        role,
+        github_login,
+        proof,
         &state.secrets.jwt_secret,
         SESSION_TTL_SECS,
     )

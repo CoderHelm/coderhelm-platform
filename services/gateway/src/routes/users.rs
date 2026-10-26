@@ -2,6 +2,7 @@ use aws_sdk_dynamodb::types::{AttributeValue, Delete, TransactWriteItem, Update}
 use axum::{
     extract::{Extension, Path, State},
     http::StatusCode,
+    response::IntoResponse,
     Json,
 };
 use serde::Deserialize;
@@ -1169,7 +1170,7 @@ pub async fn mfa_verify_setup(
     State(state): State<Arc<AppState>>,
     Extension(claims): Extension<Claims>,
     Json(body): Json<VerifyMfaRequest>,
-) -> Result<Json<Value>, StatusCode> {
+) -> Result<axum::response::Response, StatusCode> {
     // Authenticate to get a Cognito access token
     let hash = cognito_secret_hash(
         &state.cognito_client_secret,
@@ -1246,7 +1247,23 @@ pub async fn mfa_verify_setup(
 
     info!(email = %claims.email, "MFA enabled");
 
-    Ok(Json(json!({ "status": "enabled" })))
+    // A self-hosted install: the factor is recorded for admins, and this
+    // session, which just proved the password and a code, counts as signed
+    // in with two factors.
+    if crate::routes::sign_in::applies() {
+        crate::routes::sign_in::note_factor(&state, &claims.team_id, &claims.sub, Some("cognito"))
+            .await;
+        let cookie =
+            crate::routes::sign_in::session_with_second_factor(&state, &claims, "password")
+                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        let mut resp = Json(json!({ "status": "enabled" })).into_response();
+        if let Ok(v) = axum::http::HeaderValue::from_str(&cookie) {
+            resp.headers_mut().append(axum::http::header::SET_COOKIE, v);
+        }
+        return Ok(resp);
+    }
+
+    Ok(Json(json!({ "status": "enabled" })).into_response())
 }
 
 /// DELETE /api/users/mfa — Disable TOTP MFA.
@@ -1256,6 +1273,15 @@ pub async fn mfa_disable(
 ) -> Result<Json<Value>, StatusCode> {
     if role_level(&claims.role) < 3 && claims.email.is_empty() {
         return Err(StatusCode::FORBIDDEN);
+    }
+    // A self-hosted install that requires two-factor sign-in keeps it on.
+    if crate::routes::sign_in::applies()
+        && crate::routes::sign_in::load_org(&state)
+            .await
+            .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?
+            .is_some_and(|o| o.require_2fa)
+    {
+        return Err(StatusCode::CONFLICT);
     }
 
     state
@@ -1277,6 +1303,9 @@ pub async fn mfa_disable(
         })?;
 
     info!(email = %claims.email, "MFA disabled");
+    if crate::routes::sign_in::applies() {
+        crate::routes::sign_in::note_factor(&state, &claims.team_id, &claims.sub, None).await;
+    }
 
     Ok(Json(json!({ "status": "disabled" })))
 }

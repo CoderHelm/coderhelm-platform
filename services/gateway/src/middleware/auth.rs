@@ -13,7 +13,7 @@ use crate::auth::jwt;
 use crate::models::{ApiKeyRef, Claims};
 use crate::openapi;
 use crate::permissions::{self, Access, Capability};
-use crate::routes::{roles, support_access};
+use crate::routes::{roles, sign_in, support_access};
 use crate::AppState;
 
 /// Session TTL: 7 days. Used by both token creation and cookie Max-Age.
@@ -114,6 +114,17 @@ pub async fn require_auth(
         .extensions()
         .get::<MatchedPath>()
         .and_then(|m| permissions::routed_handler(req.method().as_str(), m.as_str()));
+    // How this session signed in. On a self-hosted install that requires
+    // two-factor sign-in, a session without a second factor reaches only the
+    // screens that set one up; the rule is read on every request, so sessions
+    // from before it was turned on are held at their next request.
+    let proof = jwt::read_proof(token, &state.secrets.jwt_secret);
+    if sign_in::applies() {
+        if let Err(held) = sign_in::check_session(&state, &proof, handler).await {
+            return Ok(held);
+        }
+    }
+
     let holder = roles::holder_for(&state, &claims).await;
     match permissions::resolve_access(&holder, handler) {
         Access::Deny { capability } => return Ok(refused_for(capability)),
@@ -127,6 +138,7 @@ pub async fn require_auth(
 
     note_activity(&state, &claims.team_id, &claims.sub).await;
     req.extensions_mut().insert(claims.clone());
+    req.extensions_mut().insert(proof.clone());
     let mut response = next.run(req).await;
 
     // The refreshed token carries the member's CURRENT role, and a removed
@@ -139,12 +151,14 @@ pub async fn require_auth(
     };
 
     if let Some(role) = current_role {
-        if let Ok(new_token) = jwt::create_token(
+        // The refreshed session keeps how it signed in.
+        if let Ok(new_token) = jwt::create_session_token(
             &claims.sub,
             &claims.team_id,
             &claims.email,
             &role,
             claims.github_login.as_deref(),
+            &proof,
             &state.secrets.jwt_secret,
             SESSION_TTL_SECS,
         ) {

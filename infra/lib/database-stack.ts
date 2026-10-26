@@ -615,9 +615,15 @@ export class DatabaseStack extends cdk.Stack {
     // Who may sign up: the config's admins, addresses and domains go on the
     // allowlist the sign-up check reads (settings table, pk ALLOWLIST).
     // Entries are only ever added here; remove one from the dashboard.
-    const allow = [
-      ...props.cfg.signup.emails.map((e) => `EMAIL#${e}`),
-      ...props.cfg.signup.domains.map((d) => `EMAIL#*@${d}`),
+    // On a self-hosted install this is the first boot's list: the first admin
+    // comes from it, and when the organization is made its other addresses
+    // become invites and its domains the allowed domains (changed after that
+    // in Settings, Sign-in). `kind` tells an admin from an invite.
+    const admins = new Set(props.cfg.admins.map((a) => a.toLowerCase()));
+    const allow: { sk: string; kind: string }[] = [
+      ...props.cfg.signup.emails.map((e) => ({ sk: `EMAIL#${e}`, kind: admins.has(e) ? "admin" : "invite" })),
+      ...props.cfg.signup.domains.map((d) => ({ sk: `EMAIL#*@${d}`, kind: "domain" })),
+      ...(props.cfg.signup.requireTwoFactor ? [{ sk: "TWO_FACTOR", kind: "rule" }] : []),
     ];
     for (let i = 0; i < allow.length; i += 25) {
       const chunk = allow.slice(i, i + 25);
@@ -626,18 +632,20 @@ export class DatabaseStack extends cdk.Stack {
         action: "batchWriteItem",
         parameters: {
           RequestItems: {
-            [this.settingsTable.tableName]: chunk.map((sk) => ({
+            [this.settingsTable.tableName]: chunk.map(({ sk, kind }) => ({
               PutRequest: {
                 Item: {
                   pk: { S: "ALLOWLIST" },
                   sk: { S: sk },
+                  kind: { S: kind },
                   added_by: { S: "config" },
+                  ...(sk === "TWO_FACTOR" ? { require: { BOOL: true } } : {}),
                 },
               },
             })),
           },
         },
-        physicalResourceId: cr.PhysicalResourceId.of(`allowlist-${chunk.join(",")}`.slice(0, 1000)),
+        physicalResourceId: cr.PhysicalResourceId.of(`allowlist-${chunk.map((c) => c.sk).join(",")}`.slice(0, 1000)),
       };
       const seed = new cr.AwsCustomResource(this, `SignupAllowlist${i / 25}`, {
         onCreate: call,

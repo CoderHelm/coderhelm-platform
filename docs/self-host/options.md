@@ -40,10 +40,14 @@ One list of everything you can set up, and where. Required items are steps in th
   *Launch Stack:* `EmailFrom`\
   *Config:* `email.from`, `email.identity`\
   *Checked by:* `email`, `email_identity`
-- **Who else may sign up**\
+- **Let people from your company join** (default: only people you invite)\
   *Install guide:* More options\
   *Launch Stack:* `SignupDomain`\
   *Config:* `signup.domains`, `signup.emails`
+- **Require two-factor sign-in**\
+  *Install guide:* More options\
+  *Launch Stack:* `RequireTwoFactor`\
+  *Config:* `signup.requireTwoFactor`
 - **Automatic updates and the window**\
   *Install guide:* More options\
   *Launch Stack:* `AutoUpdate`, `UpdateWindow`, `UpdateTimezone`\

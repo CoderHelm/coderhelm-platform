@@ -144,6 +144,10 @@ pub const CAPABILITIES: &[Capability] = &[
             "users::mfa_setup",
             "users::mfa_verify_setup",
             "users::mfa_disable",
+            "sign_in::my_status",
+            "sign_in::app_setup",
+            "sign_in::app_verify",
+            "sign_in::app_disable",
             "api::update_notification_prefs",
         ],
     },
@@ -332,6 +336,18 @@ pub const CAPABILITIES: &[Capability] = &[
             "users::update_role",
             "users::remove_user",
             "users::link_github",
+        ],
+    },
+    Capability {
+        key: "sign_in",
+        label: "Change who may join (allowed email domains) and whether two-factor sign-in is required, see who has it, and reset a person's two-factor sign-in (self-hosted installs)",
+        min_role: "admin",
+        // Sign-in rules stay with built-in admins and owners
+        // (`NEVER_IN_CUSTOM_ROLES`).
+        handlers: &[
+            "sign_in::get_settings",
+            "sign_in::update_settings",
+            "sign_in::reset_two_factor",
         ],
     },
     Capability {
@@ -732,7 +748,7 @@ pub const CUSTOM_PREFIX: &str = "custom:";
 /// Capabilities a custom role can never hold, whatever the table says about
 /// them: managing roles, and support (checked by built-in role inside the
 /// support handlers), stay with built-in admins and owners.
-pub const NEVER_IN_CUSTOM_ROLES: &[&str] = &["roles", "support", "system", "system.models"];
+pub const NEVER_IN_CUSTOM_ROLES: &[&str] = &["roles", "sign_in", "support", "system", "system.models"];
 
 /// The id in a `custom:<id>` role, or `None` for a built-in role.
 pub fn custom_role_id(role: &str) -> Option<&str> {

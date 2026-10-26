@@ -21,8 +21,10 @@ Metadata:
         Parameters: [Stage, ModelProvider, Version]
       - Label: { default: "Optional: your own domain (leave empty to use a free CloudFront address)" }
         Parameters: [Hostname, HostedZone]
+      - Label: { default: "Who may join (this install is for one organization; change these later in Settings, Sign-in)" }
+        Parameters: [SignupDomain, RequireTwoFactor]
       - Label: { default: "Optional" }
-        Parameters: [EmailFrom, SignupDomain, BedrockInferencePrefix, Telemetry]
+        Parameters: [EmailFrom, BedrockInferencePrefix, Telemetry]
       - Label: { default: "Optional: updates (you can change these later in Settings, System)" }
         Parameters: [AutoUpdate, UpdateWindow, UpdateTimezone]
       - Label: { default: "Filled in by the install guide (leave as they are)" }
@@ -35,7 +37,8 @@ Metadata:
       Hostname: { default: "Hostname" }
       HostedZone: { default: "Route 53 hosted zone" }
       EmailFrom: { default: "Send email from" }
-      SignupDomain: { default: "Who else may sign up" }
+      SignupDomain: { default: "Let people from your company join" }
+      RequireTwoFactor: { default: "Require two-factor sign-in" }
       BedrockInferencePrefix: { default: "Bedrock inference profile" }
       Telemetry: { default: "Anonymous install pings" }
       AutoUpdate: { default: "Install new releases by themselves" }
@@ -89,8 +92,15 @@ Parameters:
   SignupDomain:
     Type: String
     Default: ""
-    Description: Let anyone with an email at this domain sign up, e.g. example.com. Empty for only you (you can invite people later).
+    Description: >
+      Empty (the default) means only people you invite. Or an email domain, e.g. example.com: anyone with an email
+      there may join. This install is for one organization only; nobody else can sign up.
     AllowedPattern: "^$|^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\\.)+[a-z]{2,63}$"
+  RequireTwoFactor:
+    Type: String
+    Default: "off"
+    AllowedValues: ["off", "on"]
+    Description: on makes everyone set up an authenticator app before they can use CoderHelm, you included.
   BedrockInferencePrefix:
     Type: String
     Default: auto
@@ -205,6 +215,7 @@ Resources:
           - { Name: MODEL_PROVIDER, Value: !Ref ModelProvider }
           - { Name: BEDROCK_PREFIX, Value: !Ref BedrockInferencePrefix }
           - { Name: SIGNUP_DOMAIN, Value: !Ref SignupDomain }
+          - { Name: REQUIRE_TWO_FACTOR, Value: !Ref RequireTwoFactor }
           - { Name: TELEMETRY, Value: !Ref Telemetry }
           - { Name: AUTO_UPDATE, Value: !Ref AutoUpdate }
           - { Name: UPDATE_WINDOW, Value: !Ref UpdateWindow }

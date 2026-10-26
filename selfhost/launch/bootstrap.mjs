@@ -34,7 +34,9 @@
 //                    or another DNS provider)
 //   MODEL_PROVIDER   bedrock | anthropic
 //   BEDROCK_PREFIX   auto | us. | eu. | apac. | global. | "" (in-region ids)
-//   SIGNUP_DOMAIN    optional email domain anyone may sign up from
+//   SIGNUP_DOMAIN    optional: people with an email at this domain may join
+//                    the organization (empty: only people the admins invite)
+//   REQUIRE_TWO_FACTOR on | off: start with two-factor sign-in required
 //   TELEMETRY        on | off
 //   AUTO_UPDATE      on | off; UPDATE_WINDOW ("Sun 03:00", "daily 02:00") and
 //   UPDATE_TIMEZONE  (IANA) set its window (admins change them later in Settings)
@@ -159,6 +161,7 @@ export function configFromEnv(env, { account, found = null }) {
   };
   const signup = (env.SIGNUP_DOMAIN || "").trim().toLowerCase();
   if (signup) cfg.signup = { domains: [signup] };
+  if (env.REQUIRE_TWO_FACTOR === "on") cfg.signup = { ...(cfg.signup ?? {}), requireTwoFactor: true };
   const updates = updatesFromEnv(env);
   if (updates) cfg.updates = updates;
   return cfg;

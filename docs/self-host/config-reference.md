@@ -91,11 +91,13 @@ See [Email](./email.md).
 - **`admins`** *list of emails, required*\
   Admins of the whole install: the admin pages (teams, the failed message queue, support). They may always sign up.
 - **`signup.emails`** *list of emails, default `[]`*\
-  Others who may create an account.
+  First boot only: invited to the organization as members. After that, invite people in Settings, Team.
 - **`signup.domains`** *list of domains, default `[]`*\
-  Anyone with an email at these domains may create an account.
+  First boot only: anyone with an email at these domains may join. After that, change them in Settings, Sign-in. Empty: only people the admins invite.
+- **`signup.requireTwoFactor`** *boolean, default `false`*\
+  First boot only: start with two-factor sign-in required for everyone. After that, Settings, Sign-in.
 
-Sign-up is closed to everyone else. People already on a team invite others from the dashboard.
+A self-hosted install is one organization: sign-up is closed to everyone else. Admins invite people and allow email domains in the dashboard (see [Sign-in and people](./sign-in.md)).
 
 ## Integrations
 

@@ -1,5 +1,36 @@
 use crate::models::Claims;
 use jsonwebtoken::{decode, encode, DecodingKey, EncodingKey, Header, Validation};
+use serde::{Deserialize, Serialize};
+
+/// How a session signed in, carried in the session token beside its claims:
+/// whether the sign-in passed a second factor, and the way in (`password`,
+/// `google` or `github`). A token from before this existed reads as no second
+/// factor, so a required second factor reaches old sessions too.
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
+pub struct SignInProof {
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub mfa: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub via: Option<String>,
+}
+
+impl SignInProof {
+    pub fn new(mfa: bool, via: &str) -> Self {
+        Self {
+            mfa,
+            via: Some(via.to_string()),
+        }
+    }
+}
+
+/// A session token: the claims and the sign-in proof, flattened into one.
+#[derive(Serialize)]
+struct SessionToken<'a> {
+    #[serde(flatten)]
+    claims: &'a Claims,
+    #[serde(flatten)]
+    proof: &'a SignInProof,
+}
 
 pub fn create_token(
     user_id: &str,
@@ -7,6 +38,30 @@ pub fn create_token(
     email: &str,
     role: &str,
     github_login: Option<&str>,
+    secret: &str,
+    ttl_secs: u64,
+) -> Result<String, jsonwebtoken::errors::Error> {
+    create_session_token(
+        user_id,
+        team_id,
+        email,
+        role,
+        github_login,
+        &SignInProof::default(),
+        secret,
+        ttl_secs,
+    )
+}
+
+/// A session token that records how the person signed in.
+#[allow(clippy::too_many_arguments)]
+pub fn create_session_token(
+    user_id: &str,
+    team_id: &str,
+    email: &str,
+    role: &str,
+    github_login: Option<&str>,
+    proof: &SignInProof,
     secret: &str,
     ttl_secs: u64,
 ) -> Result<String, jsonwebtoken::errors::Error> {
@@ -26,9 +81,78 @@ pub fn create_token(
     };
     encode(
         &Header::default(),
-        &claims,
+        &SessionToken {
+            claims: &claims,
+            proof,
+        },
         &EncodingKey::from_secret(secret.as_bytes()),
     )
+}
+
+/// The sign-in proof of a session token. Call it only on a token
+/// [`validate_token`] accepted; anything unreadable is no proof.
+pub fn read_proof(token: &str, secret: &str) -> SignInProof {
+    let mut validation = Validation::default();
+    validation.set_audience(&["coderhelm-dashboard"]);
+    decode::<SignInProof>(
+        token,
+        &DecodingKey::from_secret(secret.as_bytes()),
+        &validation,
+    )
+    .map(|t| t.claims)
+    .unwrap_or_default()
+}
+
+/// Audience of the short token between a Google or GitHub sign-in and its
+/// second step: accepted only by `POST /auth/2fa/verify`.
+pub const SECOND_STEP_AUDIENCE: &str = "coderhelm-2fa";
+
+/// Who is between a federated sign-in and their two-factor code.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct SecondStep {
+    pub sub: String,
+    pub team_id: String,
+    pub email: String,
+    pub role: String,
+    #[serde(default)]
+    pub github_login: Option<String>,
+    pub via: String,
+    pub aud: String,
+    pub iat: u64,
+    pub exp: u64,
+}
+
+pub fn create_second_step(
+    step: &SecondStep,
+    secret: &str,
+    ttl_secs: u64,
+) -> Result<String, jsonwebtoken::errors::Error> {
+    let now = chrono::Utc::now().timestamp() as u64;
+    let s = SecondStep {
+        aud: SECOND_STEP_AUDIENCE.to_string(),
+        iat: now,
+        exp: now + ttl_secs,
+        ..step.clone()
+    };
+    encode(
+        &Header::default(),
+        &s,
+        &EncodingKey::from_secret(secret.as_bytes()),
+    )
+}
+
+pub fn validate_second_step(
+    token: &str,
+    secret: &str,
+) -> Result<SecondStep, jsonwebtoken::errors::Error> {
+    let mut validation = Validation::default();
+    validation.set_audience(&[SECOND_STEP_AUDIENCE]);
+    Ok(decode::<SecondStep>(
+        token,
+        &DecodingKey::from_secret(secret.as_bytes()),
+        &validation,
+    )?
+    .claims)
 }
 
 /// Audience of the brain chat's short-lived stream token: accepted only by
@@ -127,6 +251,41 @@ mod tests {
         assert!(validate_scoped_token(&session, BRAIN_AUDIENCE, secret).is_err());
         let back = validate_scoped_token(&brain, BRAIN_AUDIENCE, secret).unwrap();
         assert_eq!((back.sub.as_str(), back.role.as_str()), ("u", "member"));
+    }
+
+    #[test]
+    fn a_session_carries_its_sign_in_proof_and_old_tokens_have_none() {
+        let secret = "test-jwt-secret-at-least-32-chars!";
+        let proof = SignInProof::new(true, "google");
+        let t =
+            create_session_token("u", "t", "e@x.com", "member", None, &proof, secret, 300).unwrap();
+        assert_eq!(validate_token(&t, secret).unwrap().sub, "u");
+        assert_eq!(read_proof(&t, secret), proof);
+        let old = create_token("u", "t", "e@x.com", "member", None, secret, 300).unwrap();
+        assert!(!read_proof(&old, secret).mfa);
+        // A proof is read only from a token signed with the secret.
+        assert!(!read_proof(&t, "another-secret-of-at-least-32-chars").mfa);
+    }
+
+    #[test]
+    fn a_second_step_token_is_not_a_session_and_a_session_is_not_one() {
+        let secret = "test-jwt-secret-at-least-32-chars!";
+        let step = SecondStep {
+            sub: "USER#1".into(),
+            team_id: "TEAM#a".into(),
+            email: "a@x.com".into(),
+            role: "member".into(),
+            github_login: None,
+            via: "github".into(),
+            aud: String::new(),
+            iat: 0,
+            exp: 0,
+        };
+        let t = create_second_step(&step, secret, 300).unwrap();
+        assert!(validate_token(&t, secret).is_err());
+        assert_eq!(validate_second_step(&t, secret).unwrap().sub, "USER#1");
+        let session = create_token("u", "t", "e@x.com", "member", None, secret, 300).unwrap();
+        assert!(validate_second_step(&session, secret).is_err());
     }
 
     #[test]
