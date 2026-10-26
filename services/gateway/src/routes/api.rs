@@ -897,6 +897,9 @@ pub struct RunNote {
 /// One run, in full.
 #[derive(serde::Serialize, utoipa::ToSchema)]
 pub struct Run {
+    /// The run's id, a ULID: the same id as in the path.
+    #[schema(example = "01JB8X6F4M2C9QZ3T7V5W1K0HA")]
+    pub run_id: String,
     /// Where the run is: `pending`, `running`, `awaiting_ci`, `completed`,
     /// `failed`, `needs_input`, `needs_outside_change`, `cancelled`,
     /// `retried` or `closed`. Treat a value you don't know as in progress.
@@ -1132,6 +1135,37 @@ pub async fn get_run(
         (tokens_in, tokens_out, cache_read, cache_write, cost_usd)
     };
 
+    Ok(Json(run_of(
+        item,
+        &run_id,
+        RunUsage {
+            tokens_in,
+            tokens_out,
+            cache_read,
+            cache_write,
+            cost_usd,
+        },
+    )))
+}
+
+/// A run's token use and cost: the run's own, or summed from its traces.
+struct RunUsage {
+    tokens_in: u64,
+    tokens_out: u64,
+    cache_read: u64,
+    cache_write: u64,
+    cost_usd: f64,
+}
+
+/// The run `get_run` answers with, from its row in the runs table.
+fn run_of(item: &run_search::Item, run_id: &str, usage: RunUsage) -> Run {
+    let RunUsage {
+        tokens_in,
+        tokens_out,
+        cache_read,
+        cache_write,
+        cost_usd,
+    } = usage;
     let st = |k: &str| item.get(k).and_then(|v| v.as_s().ok()).cloned();
     let num = |k: &str| {
         item.get(k)
@@ -1161,7 +1195,8 @@ pub async fn get_run(
                 .collect::<Vec<_>>()
         })
     };
-    Ok(Json(Run {
+    Run {
+        run_id: run_id.to_string(),
         status: st("status"),
         ticket_source: st("ticket_source"),
         ticket_id: st("ticket_id"),
@@ -1236,7 +1271,7 @@ pub async fn get_run(
                 .map(|(_, _, message, timestamp)| RunNote { message, timestamp })
                 .collect()
         }),
-    }))
+    }
 }
 
 /// What a pass kept about what it did (e.g. which team agents reviewed a
@@ -5347,8 +5382,42 @@ pub async fn reset_account(
 
 #[cfg(test)]
 mod tests {
-    use super::{budget_json, platform_admin_listed, reset_allowed, usage_json, verified_identity};
+    use super::{
+        budget_json, platform_admin_listed, reset_allowed, run_of, usage_json, verified_identity,
+        RunUsage,
+    };
     use serde_json::json;
+
+    /// The run detail page shows and copies `run_id`; `get_run` answers with
+    /// it even when the row has nothing but a status.
+    #[test]
+    fn get_run_answers_with_the_run_id() {
+        use aws_sdk_dynamodb::types::AttributeValue as A;
+        let item = std::collections::HashMap::from([
+            (
+                "run_id".to_string(),
+                A::S("01JB8X6F4M2C9QZ3T7V5W1K0HA".into()),
+            ),
+            ("status".to_string(), A::S("completed".into())),
+        ]);
+        let usage = || RunUsage {
+            tokens_in: 0,
+            tokens_out: 0,
+            cache_read: 0,
+            cache_write: 0,
+            cost_usd: 0.0,
+        };
+        let run =
+            serde_json::to_value(run_of(&item, "01JB8X6F4M2C9QZ3T7V5W1K0HA", usage())).unwrap();
+        assert_eq!(run["run_id"], "01JB8X6F4M2C9QZ3T7V5W1K0HA");
+        assert_eq!(run["status"], "completed");
+        // The id comes from the request, so a row without the attribute
+        // still answers with it.
+        let bare =
+            std::collections::HashMap::from([("status".to_string(), A::S("running".into()))]);
+        let run = serde_json::to_value(run_of(&bare, "01JB8Y", usage())).unwrap();
+        assert_eq!(run["run_id"], "01JB8Y");
+    }
 
     #[test]
     fn github_only_identities_are_never_platform_admins() {
