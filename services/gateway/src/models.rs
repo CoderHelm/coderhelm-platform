@@ -148,8 +148,9 @@ pub struct Secrets {
     pub atlassian_client_id: Option<String>,
     #[serde(default)]
     pub atlassian_client_secret: Option<String>,
-    /// Google Drive; falls back to `google_client_id` / `google_client_secret`
-    /// (the Google sign-in app) when unset.
+    /// Google Drive: a Google OAuth client of its own (Web application) with
+    /// the Knowledge redirect address and the Drive scope. Never the Google
+    /// sign-in client: without these two, Drive sign-in is not set up.
     #[serde(default)]
     pub google_drive_client_id: Option<String>,
     #[serde(default)]
@@ -170,6 +171,20 @@ pub struct Secrets {
 }
 
 impl Secrets {
+    /// A knowledge source sign-in key by its name in the secret
+    /// (`oauth::Provider::id_key` / `secret_key`). Only those keys answer.
+    pub fn oauth_key(&self, key: &str) -> Option<String> {
+        match key {
+            "notion_client_id" => self.notion_client_id.clone(),
+            "notion_client_secret" => self.notion_client_secret.clone(),
+            "atlassian_client_id" => self.atlassian_client_id.clone(),
+            "atlassian_client_secret" => self.atlassian_client_secret.clone(),
+            "google_drive_client_id" => self.google_drive_client_id.clone(),
+            "google_drive_client_secret" => self.google_drive_client_secret.clone(),
+            _ => None,
+        }
+    }
+
     pub async fn load(
         client: &aws_sdk_secretsmanager::Client,
         name: &str,

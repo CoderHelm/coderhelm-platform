@@ -14,9 +14,17 @@
 //! (client id and secret) is the install's own and comes from configuration
 //! ([`App`]). Without one, the connector's card says which settings are
 //! missing and offers the team's saved key instead where there is one.
+//!
+//! An app is read from the provider's own two keys and nothing else
+//! ([`App::from_keys`]). Google Drive once fell back to the Google sign-in
+//! client (`google_client_id`), which has neither the Knowledge redirect
+//! address nor the Drive scope registered, so Google answered every sign-in
+//! with `redirect_uri_mismatch`. A provider without its own app is "not set
+//! up", and [`start_sign_in`] never builds an authorize address for it.
 
 use crate::mcp_remote::oauth::ClientAuth;
-use crate::mcp_remote::store::{AuthKind, OAuthSettings, ServerRecord, Sharing};
+use crate::mcp_remote::runtime::Runtime;
+use crate::mcp_remote::store::{AuthKind, OAuthSettings, Owner, ServerRecord, Sharing};
 
 use super::Kind;
 
@@ -114,6 +122,119 @@ impl App {
     pub fn is_set(&self) -> bool {
         !self.client_id.trim().is_empty() && !self.client_secret.trim().is_empty()
     }
+
+    /// The app for `kind`, read from the provider's own keys
+    /// ([`Provider::id_key`], [`Provider::secret_key`]) through `get`, which
+    /// looks a key up in the install's secret. No other key is ever read: an
+    /// app registered for something else (the Google sign-in client) lacks
+    /// this provider's redirect address and scopes.
+    pub fn from_keys(kind: Kind, get: impl Fn(&str) -> Option<String>) -> App {
+        let Some(p) = provider(kind) else {
+            return App::default();
+        };
+        let read = |key: &str| {
+            get(key)
+                .map(|v| v.trim().to_string())
+                .filter(|v| !v.is_empty())
+                .unwrap_or_default()
+        };
+        App {
+            client_id: read(p.id_key),
+            client_secret: read(p.secret_key),
+        }
+    }
+}
+
+/// How a sign-in reaches the provider.
+#[derive(Debug, Clone, Copy)]
+pub enum Via<'a> {
+    /// The install's own app for the provider.
+    App(&'a App),
+    /// CoderHelm's broker, for a hybrid install that chose CoderHelm's app:
+    /// the install id is the client id, its registration secret the secret.
+    Broker {
+        hosted: &'a str,
+        install_id: &'a str,
+        secret: &'a str,
+    },
+}
+
+/// Who starts a sign-in, and the callback it returns to.
+#[derive(Debug, Clone)]
+pub struct Starter<'a> {
+    pub user_sub: &'a str,
+    pub user_email: &'a str,
+    /// When a new connection record was added (the starter is who added it).
+    pub added_at: &'a str,
+    /// The callback page, exactly as registered with the provider's app.
+    pub redirect_uri: &'a str,
+}
+
+/// Why a sign-in didn't start.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StartError {
+    /// The install has no app for this provider (and no broker).
+    NotSetUp,
+    /// This kind doesn't sign in with OAuth.
+    NotOAuth,
+    /// Sealing or saving failed.
+    Internal(String),
+    /// The sign-in itself was refused.
+    Refused(String),
+}
+
+/// Starts the team's one-click sign-in to `kind`: saves its connection
+/// record (keeping who first added it and its status) and returns where to
+/// send the browser. Refuses before building anything when the app isn't
+/// set up, so an address with somebody else's client id never reaches the
+/// provider.
+pub async fn start_sign_in(
+    rt: &Runtime,
+    kind: Kind,
+    via: Via<'_>,
+    who: &Starter<'_>,
+) -> Result<String, StartError> {
+    let p = provider(kind).ok_or(StartError::NotOAuth)?;
+    let (client_id, secret) = match via {
+        Via::App(a) if a.is_set() => (a.client_id.trim(), a.client_secret.trim()),
+        Via::Broker {
+            install_id, secret, ..
+        } if !install_id.trim().is_empty() && !secret.trim().is_empty() => {
+            (install_id.trim(), secret.trim())
+        }
+        _ => return Err(StartError::NotSetUp),
+    };
+    let id = connection_id(kind);
+    let sealed = rt
+        .seal_client_secret(&id, secret)
+        .await
+        .map_err(StartError::Internal)?;
+    let mut rec = match via {
+        Via::Broker { hosted, .. } => brokered_connection_record(kind, hosted, client_id, &sealed),
+        Via::App(_) => connection_record(kind, &p, client_id, &sealed),
+    };
+    rec.added_by = who.user_email.to_string();
+    rec.added_at = who.added_at.to_string();
+    if let Ok(Some(old)) = rt.store.get_server(&rt.team, &id).await {
+        rec.status = old.status;
+        rec.status_reason = old.status_reason;
+        rec.added_by = old.added_by;
+        rec.added_at = old.added_at;
+    }
+    rt.store
+        .put_server(&rt.team, &rec)
+        .await
+        .map_err(StartError::Internal)?;
+    rt.start_sign_in(
+        &mut rec,
+        &Owner::Team,
+        who.user_sub,
+        who.user_email,
+        who.redirect_uri,
+        None,
+    )
+    .await
+    .map_err(StartError::Refused)
 }
 
 /// The id of a kind's connection record.
@@ -221,6 +342,150 @@ pub fn brokered_connection_record(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::mcp_remote::http::fake::Fake;
+    use crate::mcp_remote::runtime::testing::FakeKms;
+    use crate::mcp_remote::store::fake::MemStore;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    const REDIRECT: &str = "https://app.coderhelm.com/settings/integrations/mcp-callback/";
+
+    fn rt() -> Runtime {
+        Runtime {
+            store: Arc::new(MemStore::default()),
+            cipher: Arc::new(FakeKms),
+            http: Arc::new(Fake::default()),
+            team: "TEAM#a".into(),
+            clock: Arc::new(|| 1_000_000),
+        }
+    }
+
+    fn who() -> Starter<'static> {
+        Starter {
+            user_sub: "sub-1",
+            user_email: "ada@example.com",
+            added_at: "2026-10-26T00:00:00Z",
+            redirect_uri: REDIRECT,
+        }
+    }
+
+    fn secret(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    /// The hosted secret as it was: the Google sign-in client only.
+    fn sign_in_client_only() -> HashMap<String, String> {
+        secret(&[
+            ("google_client_id", "signin.apps.googleusercontent.com"),
+            ("google_client_secret", "signin-secret"),
+        ])
+    }
+
+    #[test]
+    fn drive_never_borrows_the_google_sign_in_client() {
+        let s = sign_in_client_only();
+        let a = App::from_keys(Kind::GoogleDrive, |k| s.get(k).cloned());
+        assert!(!a.is_set());
+        assert_eq!(a, App::default());
+        // Half an app is no app.
+        let half = secret(&[("google_drive_client_id", "drive.apps.googleusercontent.com")]);
+        assert!(!App::from_keys(Kind::GoogleDrive, |k| half.get(k).cloned()).is_set());
+        let blank = secret(&[
+            ("google_drive_client_id", "  "),
+            ("google_drive_client_secret", "x"),
+        ]);
+        assert!(!App::from_keys(Kind::GoogleDrive, |k| blank.get(k).cloned()).is_set());
+    }
+
+    #[test]
+    fn each_provider_reads_only_its_own_keys() {
+        let s = secret(&[
+            ("notion_client_id", " n-id "),
+            ("notion_client_secret", "n-secret"),
+            ("atlassian_client_id", "a-id"),
+            ("atlassian_client_secret", "a-secret"),
+            ("google_drive_client_id", "d-id"),
+            ("google_drive_client_secret", "d-secret"),
+            ("google_client_id", "signin"),
+            ("google_client_secret", "signin-secret"),
+        ]);
+        let get = |k: &str| s.get(k).cloned();
+        assert_eq!(App::from_keys(Kind::Notion, get).client_id, "n-id");
+        assert_eq!(App::from_keys(Kind::Confluence, get).client_id, "a-id");
+        let d = App::from_keys(Kind::GoogleDrive, get);
+        assert_eq!(
+            (d.client_id.as_str(), d.client_secret.as_str()),
+            ("d-id", "d-secret")
+        );
+        assert!(!App::from_keys(Kind::Sanity, get).is_set());
+    }
+
+    #[tokio::test]
+    async fn without_a_drive_app_no_authorize_address_is_built() {
+        let s = sign_in_client_only();
+        let a = App::from_keys(Kind::GoogleDrive, |k| s.get(k).cloned());
+        let rt = rt();
+        let r = start_sign_in(&rt, Kind::GoogleDrive, Via::App(&a), &who()).await;
+        assert_eq!(r, Err(StartError::NotSetUp));
+        // Nothing was saved: no record, so no sign-in can follow from it.
+        assert!(rt
+            .store
+            .get_server(&rt.team, &connection_id(Kind::GoogleDrive))
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn a_drive_app_signs_in_with_exactly_the_registered_redirect() {
+        let s = secret(&[
+            ("google_drive_client_id", "drive.apps.googleusercontent.com"),
+            ("google_drive_client_secret", "drive-secret"),
+            ("google_client_id", "signin.apps.googleusercontent.com"),
+            ("google_client_secret", "signin-secret"),
+        ]);
+        let a = App::from_keys(Kind::GoogleDrive, |k| s.get(k).cloned());
+        let url = start_sign_in(&rt(), Kind::GoogleDrive, Via::App(&a), &who())
+            .await
+            .unwrap();
+        let u = reqwest::Url::parse(&url).unwrap();
+        assert_eq!(u.host_str(), Some("accounts.google.com"));
+        assert_eq!(u.path(), "/o/oauth2/v2/auth");
+        let q: HashMap<String, String> = u.query_pairs().into_owned().collect();
+        assert_eq!(q["redirect_uri"], REDIRECT);
+        assert_eq!(q["client_id"], "drive.apps.googleusercontent.com");
+        assert_eq!(q["scope"], "https://www.googleapis.com/auth/drive.readonly");
+        assert_eq!(q["access_type"], "offline");
+        assert_eq!(q["code_challenge_method"], "S256");
+        assert!(!url.contains("signin.apps"));
+        assert_eq!(
+            u.query_pairs().filter(|(k, _)| k == "redirect_uri").count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn a_broker_without_credentials_is_not_set_up_either() {
+        let r = start_sign_in(
+            &rt(),
+            Kind::GoogleDrive,
+            Via::Broker {
+                hosted: "https://api.coderhelm.com",
+                install_id: "",
+                secret: "",
+            },
+            &who(),
+        )
+        .await;
+        assert_eq!(r, Err(StartError::NotSetUp));
+        assert_eq!(
+            start_sign_in(&rt(), Kind::Web, Via::App(&App::default()), &who()).await,
+            Err(StartError::NotOAuth)
+        );
+    }
 
     #[test]
     fn brokered_records_point_at_the_hosted_broker() {

@@ -564,7 +564,7 @@ pub fn no_app_hint(kind: Kind) -> &'static str {
     match kind {
         Kind::Notion => "Notion sign-in isn't set up on this Coderhelm, so connect Notion with a token from a Notion connection instead.",
         Kind::Confluence => "Atlassian sign-in isn't set up on this Coderhelm, so connect Confluence with an Atlassian API token instead.",
-        Kind::GoogleDrive => "Google Drive connects only through Google sign-in, and it isn't set up on this Coderhelm yet.",
+        Kind::GoogleDrive => "Google Drive sign-in isn't set up on this Coderhelm yet. Ask whoever runs Coderhelm to set up Google Drive sign-in.",
         _ => "",
     }
 }
@@ -874,7 +874,8 @@ mod tests {
     fn without_a_sign_in_app_the_hint_names_the_way_that_still_works() {
         assert!(no_app_hint(Kind::Notion).contains("token"));
         assert!(no_app_hint(Kind::Confluence).contains("API token"));
-        assert!(no_app_hint(Kind::GoogleDrive).contains("only through Google sign-in"));
+        assert!(no_app_hint(Kind::GoogleDrive)
+            .ends_with("Ask whoever runs Coderhelm to set up Google Drive sign-in."));
         for k in [Kind::Notion, Kind::Confluence, Kind::GoogleDrive] {
             // The page and its link are named by the page, not here.
             assert!(!no_app_hint(k).contains("Integrations page"));

@@ -681,6 +681,28 @@ pub fn checks(
     out
 }
 
+/// The hosted side's `offered` list; `None` from a hosted side that predates
+/// it (then everything hosted counts as offered).
+pub fn offered_by(hosted: Option<&Value>) -> Option<Vec<String>> {
+    hosted?["offered"].as_array().map(|a| {
+        a.iter()
+            .filter_map(Value::as_str)
+            .map(str::to_string)
+            .collect()
+    })
+}
+
+/// Drops chosen integrations the hosted side doesn't offer; true when any
+/// were dropped (pure; tested).
+pub fn drop_unoffered(l: &mut Local, offered: Option<&[String]>) -> bool {
+    let Some(o) = offered else {
+        return false;
+    };
+    let before = l.integrations.len();
+    l.integrations.retain(|i| o.iter().any(|x| x == i));
+    l.integrations.len() != before
+}
+
 async fn status_value(state: &AppState, deep: bool) -> Value {
     let mut l = local(state).await;
     let creds = creds_now().await;
@@ -720,11 +742,19 @@ async fn status_value(state: &AppState, deep: bool) -> Value {
             });
         }
     }
+    // What the hosted side can serve now: a choice it no longer offers (its
+    // app for that provider isn't set up) is dropped, so the add flow never
+    // offers a sign-in the broker would refuse.
+    let offered = offered_by(hosted.as_ref());
+    if drop_unoffered(&mut l, offered.as_deref()) {
+        let _ = save_local(state, &l).await;
+    }
     let chosen: Vec<Value> = integrations::CATALOG
         .iter()
         .map(|e| {
             let mut v = serde_json::to_value(e).unwrap_or_default();
             v["uses_coderhelm"] = json!(l.integrations.iter().any(|i| i == e.id));
+            v["offered"] = json!(offered.as_ref().is_none_or(|o| o.iter().any(|i| i == e.id)));
             v
         })
         .collect();
@@ -1434,6 +1464,21 @@ pub async fn github_hosted(state: &AppState) -> bool {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_choice_the_hosted_side_no_longer_offers_is_dropped() {
+        let mut l = Local {
+            integrations: vec!["github".into(), "notion".into(), "google_drive".into()],
+            ..Default::default()
+        };
+        assert!(!drop_unoffered(&mut l, None));
+        assert_eq!(l.integrations.len(), 3);
+        let hosted = serde_json::json!({ "offered": ["github", "jira", "notion"] });
+        let o = offered_by(Some(&hosted));
+        assert!(drop_unoffered(&mut l, o.as_deref()));
+        assert_eq!(l.integrations, vec!["github", "notion"]);
+        assert!(offered_by(Some(&serde_json::json!({}))).is_none());
+    }
 
     #[test]
     fn the_intake_never_takes_a_copy_it_couldnt_record() {

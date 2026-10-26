@@ -487,6 +487,7 @@ pub async fn status(
     let slug = crate::auth::github_app::app_slug(&state).await;
     let mut v = install.view();
     v["github"] = json!({ "links": links, "app_slug": slug });
+    v["offered"] = json!(offered_ids(&state));
     Ok(Json(v))
 }
 
@@ -501,7 +502,7 @@ pub async fn settings(
     let mut install = signed(&state, &headers, &method, &uri, &body).await?;
     let b = body_json(&body);
     if let Some(list) = b["integrations"].as_array() {
-        let allowed: Vec<&str> = common::hybrid::integrations::hosted_ids().collect();
+        let allowed = offered_ids(&state);
         install.integrations = list
             .iter()
             .filter_map(Value::as_str)
@@ -2140,6 +2141,24 @@ fn kind_of(raw: &str) -> Option<common::knowledge::sources::Kind> {
     }
 }
 
+/// The hosted integrations this side can actually serve: a knowledge
+/// provider only when CoderHelm's own app for it is set up (Google Drive
+/// needs `google_drive_client_id` and `google_drive_client_secret`, never
+/// the Google sign-in client). Installs see this as `offered` and can't
+/// choose the rest.
+pub fn offered_ids(state: &AppState) -> Vec<&'static str> {
+    offered_from(|k| super::knowledge_sources::app(state, k).is_set())
+}
+
+/// [`offered_ids`] for a given "is this provider's app set up" (pure; tested).
+pub fn offered_from(
+    app_set: impl Fn(common::knowledge::sources::Kind) -> bool,
+) -> Vec<&'static str> {
+    common::hybrid::integrations::hosted_ids()
+        .filter(|id| kind_of(id).is_none_or(&app_set))
+        .collect()
+}
+
 fn hosted_team(install: &str) -> String {
     relay::install_pk(install)
 }
@@ -2715,6 +2734,18 @@ pub async fn admin_revoke(
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn drive_is_offered_to_installs_only_with_its_own_app() {
+        use common::knowledge::sources::Kind;
+        let none = offered_from(|_| false);
+        assert_eq!(none, vec!["github", "jira"]);
+        let no_drive = offered_from(|k| k != Kind::GoogleDrive);
+        assert!(!no_drive.contains(&"google_drive"));
+        assert!(no_drive.contains(&"notion") && no_drive.contains(&"confluence"));
+        assert!(offered_from(|_| true).contains(&"google_drive"));
+    }
+
     use super::*;
 
     #[test]

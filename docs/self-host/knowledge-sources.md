@@ -44,7 +44,7 @@ When an app isn't set up, the add flow says so and offers the token path in the 
 
 - **Notion.** A short how-to (create an internal connection at <https://www.notion.so/profile/integrations>, tick **Read content** only, share pages with **•••**, **Connections**, **+ Add connection**), then a field for the token. CoderHelm checks the token with one Notion search before saving it, and saves it exactly as the Integrations page does (the `notion` entry, sealed with your KMS key). A token Notion refuses is never saved; one that sees no pages yet is saved, and the flow says how to share pages.
 - **Confluence.** The Confluence address, the Atlassian account email and an API token from <https://id.atlassian.com/manage-profile/security/api-tokens>. They go through the Integrations page's own save, which signs in once and records the result; a refused token isn't counted as connected.
-- **Google Drive.** There is no token path: Drive connects only through Google sign-in, and the dialog says so.
+- **Google Drive.** There is no token path: Drive connects only through Google sign-in. The dialog says so in one sentence and asks for whoever runs CoderHelm to set it up; a platform admin also gets a link to these steps.
 
 Only admins and owners save tokens (the `integrations` capability). Anyone else who can add knowledge sees "Ask an admin to connect Notion". The request is `POST /api/knowledge/connectors/{kind}/token` with `{ "token" }` (Notion) or `{ "token", "site", "email" }` (Confluence).
 
@@ -100,16 +100,40 @@ CoderHelm asks for `offline_access` too, so the sign-in renews itself.
 
 ## Google Drive
 
-1. In Google Cloud, enable the **Google Drive API** for a project.
-2. Create an **OAuth client ID** of type **Web application** with the sign-in address above as an authorized redirect URI.
-3. On the OAuth consent screen, add the scope `https://www.googleapis.com/auth/drive.readonly`. Google reviews apps that request it before people outside your organization can use them; an **Internal** consent screen needs no review.
-4. Add to the secret:
+Google Drive connects only through Google sign-in, with an OAuth client of its own. CoderHelm reads `google_drive_client_id` and `google_drive_client_secret` and nothing else: the client from [Google sign-in](./integrations.md#google-sign-in) (`google_client_id`) is never used for Drive, because it is registered for a different redirect address and has no Drive scope, so Google refuses it with `Error 400: redirect_uri_mismatch`. Without the two Drive keys, the add flow says "Google Drive sign-in isn't set up on this Coderhelm yet. Ask whoever runs Coderhelm to set up Google Drive sign-in." and the **Sign-in apps** section shows Google Drive as not set up.
+
+### Which scope, and why
+
+CoderHelm asks for `https://www.googleapis.com/auth/drive.readonly`. A knowledge source keeps a folder in sync: it lists the folder, reads every file in it and picks up files added later. Google's three candidate scopes compare like this:
+
+| Scope | Google's class | What CoderHelm could do with it |
+|---|---|---|
+| `drive.readonly` | restricted | Browse Drive in the add flow, pick folders and files, read them and keep folders in sync, including files added later. |
+| `drive.file` with the Google Picker | non-sensitive | Read only the files a person picks in Google's picker. Picking a folder doesn't grant its contents, so a folder can't be synced and new files never appear until someone picks them. |
+| `drive.metadata.readonly` | restricted | Names, folders and dates only, never file contents: nothing to index. Restricted anyway, so it saves no review. |
+
+`drive.readonly` is a restricted scope. An **Internal** app (only people in your own Google Workspace) needs no verification. An **External** app used by anyone outside your Workspace must pass Google's verification for restricted scopes, which includes an annual third-party security assessment (CASA). Until then it stays in **Testing**: only the test users you list (up to 100) can sign in, they see an "unverified app" warning, and their sign-ins expire after 7 days.
+
+- **Self-hosted:** make the app **Internal** in your Workspace. No verification, no test users, and sign-ins that don't expire.
+- **A shared, public install (like the hosted service):** `drive.readonly` with Google's verification. Until it's verified, list the people who need Drive as test users.
+
+### Register the app
+
+1. In [Google Cloud](https://console.cloud.google.com/), pick or create a project, open **APIs and services**, **Library**, and enable the **Google Drive API**.
+2. Open **Google Auth Platform** (formerly **OAuth consent screen**):
+   - **Branding**: app name, support email, and your dashboard's domain under **Authorized domains**.
+   - **Audience**: **Internal** for a self-hosted install in your own Workspace. **External** otherwise; while it is in **Testing**, add each person who will connect Drive under **Test users**.
+   - **Data access**: **Add or remove scopes**, then add `https://www.googleapis.com/auth/drive.readonly` (paste it under **Manually add scopes** if it isn't listed).
+3. **Clients**, **Create client**: type **Web application**, any name. Under **Authorized redirect URIs**, add exactly the sign-in address above, with the trailing slash. **Authorized JavaScript origins** can stay empty.
+4. Copy the client ID and client secret into the secret:
 
 ```json
 { "google_drive_client_id": "<client ID>", "google_drive_client_secret": "<client secret>" }
 ```
 
-If you already set up [Google sign-in](./integrations.md#google-sign-in), you can reuse that client instead: add the redirect URI and the Drive scope to it and leave these two keys out. CoderHelm falls back to `google_client_id` and `google_client_secret`.
+5. Redeploy, or wait for a new gateway instance. **Sign-in apps** then shows Google Drive as set up, from `google_drive_client_id`.
+
+On a hybrid install that chose CoderHelm's Google app, Drive is offered only while the hosted service has its own Drive app; otherwise the choice is unavailable and the install falls back to its own keys.
 
 ## What runs
 
