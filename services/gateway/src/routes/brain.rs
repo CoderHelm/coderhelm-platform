@@ -1,11 +1,15 @@
 //! The company brain: a chat that answers questions from the team's own
 //! sources, with a citation on every claim.
 //!
-//! Sources a question may use (picked per question, see [`SOURCE_KINDS`]):
-//! knowledge bases, connections (the MCP servers on the Connections page),
-//! repositories and the code graph, memories, data sources, and team skills.
-//! Knowledge is retrieved first, in code, before the model's first step;
-//! tools are offered for live data. Every passage and tool result is
+//! Sources a question may use (see [`SOURCE_KINDS`]): knowledge bases,
+//! connections (the MCP servers on the Connections page), repositories and
+//! the code graph, memories, data sources, and team skills. By default a
+//! question may use every source the asker can see; the asker can narrow it
+//! by mentioning a repository or a knowledge base. Knowledge is retrieved
+//! first, in code, before the model's first step; the model then reads code
+//! and live data with tools, over several steps, until it can answer
+//! (`chat_agent`), and an answer that hands the asker work its tools could
+//! do is sent back to the tools once. Every passage and tool result is
 //! registered as a citable source (`common::knowledge::answer`), and the
 //! answer's citations come only from that registry: an answer that cites
 //! nothing is replaced by a plain "the sources don't cover this".
@@ -29,27 +33,27 @@ use axum::{
     response::sse::Event,
     Extension, Json,
 };
-use common::knowledge::answer::{finalize, Final, Registry, SourceRef};
+use common::knowledge::answer::{finalize, CodeRef, Final, Registry, SourceRef};
 use common::knowledge::chunk::chunk;
 use common::knowledge::extract::{extract, Kind};
 use common::knowledge::search::{search, term_overlap, terms, Store, Titan};
 use common::knowledge::{self as kb, read_data, MAX_ATTACHMENT_BYTES};
-use common::model_stream::SseParser;
-use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tracing::{error, info, warn};
 
+use super::chat_agent::{self, Called, Sink, Toolbox};
+use super::chat_code;
 use super::plan_chat_tools::{ChatScope, Used, WorkerTools};
 use super::plans::{
-    compact_tool_result_for_model, execute_github_tool, invoke_mcp_tool, is_empty_tool_result,
-    load_enabled_plugins, load_mcp_tool_cache, sse_event, summarize_tool_result,
+    compact_tool_result_for_model, invoke_mcp_tool, is_empty_tool_result, load_enabled_plugins,
+    load_mcp_tool_cache, summarize_tool_result,
 };
 use crate::models::Claims;
 use crate::AppState;
+use common::repo_read::{CodeReader, GitHubHost, RepoInfo};
 
 type Reply = Result<Json<Value>, (StatusCode, Json<Value>)>;
-type Tx = tokio::sync::mpsc::Sender<Result<Event, std::convert::Infallible>>;
 
 fn fail(status: StatusCode, message: &str) -> (StatusCode, Json<Value>) {
     (status, Json(json!({ "error": message })))
@@ -134,9 +138,81 @@ pub struct Picks {
     /// Installed plugins (ids) the question may ask; only active ones are used.
     #[serde(default)]
     pub plugins: Vec<String>,
-    /// The repository code, memories and data sources are read for.
+    /// The repository skills and data sources are read for.
     #[serde(default)]
     pub repo: Option<String>,
+    /// The repositories code may be read in; empty for all of the team's.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub repos: Vec<String>,
+    /// Chosen by Chat (everything the asker can see), not narrowed.
+    #[serde(default)]
+    pub auto: bool,
+}
+
+/// Something the asker mentioned with @ to narrow a question.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Mention {
+    /// `repo` or `knowledge`.
+    pub kind: String,
+    /// The repository (`owner/name`) or knowledge base id.
+    pub id: String,
+}
+
+/// What a question reads. With mentions, only what was mentioned (a
+/// repository's code and past work, or a knowledge base); with picks sent
+/// by an older client, those; otherwise everything the asker can see.
+/// `readable` are the knowledge bases the asker may read, `repos` the
+/// team's repositories.
+pub fn resolve_picks(
+    sent: Option<&Picks>,
+    mentions: &[Mention],
+    readable: &[String],
+    repos: &[String],
+) -> Picks {
+    let mentioned = |kind: &str| -> Vec<String> {
+        mentions
+            .iter()
+            .filter(|m| m.kind == kind)
+            .map(|m| m.id.clone())
+            .collect()
+    };
+    let m_repos: Vec<String> = mentioned("repo")
+        .into_iter()
+        .filter(|r| repos.contains(r))
+        .collect();
+    let m_kbs: Vec<String> = mentioned("knowledge")
+        .into_iter()
+        .filter(|k| readable.contains(k))
+        .collect();
+    if !m_repos.is_empty() || !m_kbs.is_empty() {
+        return Picks {
+            knowledge: m_kbs,
+            code: !m_repos.is_empty(),
+            memories: !m_repos.is_empty(),
+            repo: m_repos.first().cloned(),
+            repos: m_repos,
+            ..Default::default()
+        };
+    }
+    if let Some(p) = sent.filter(|p| SOURCE_KINDS.iter().any(|k| p.allows(k.key))) {
+        let mut p = p.clone();
+        p.knowledge.retain(|k| readable.contains(k));
+        p.repos.retain(|r| repos.contains(r));
+        return p;
+    }
+    Picks {
+        knowledge: readable.to_vec(),
+        connections: true,
+        code: !repos.is_empty(),
+        memories: !repos.is_empty(),
+        data_sources: true,
+        skills: true,
+        // Every active plugin, looked up when the question is asked.
+        plugins: Vec::new(),
+        repo: None,
+        repos: Vec::new(),
+        auto: true,
+    }
 }
 
 impl Picks {
@@ -204,6 +280,9 @@ pub struct Message {
     /// What the question could read.
     #[serde(default)]
     pub sources: Picks,
+    /// What the asker mentioned with @ to narrow the question.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mentions: Vec<Mention>,
     /// Files attached to the question (names).
     #[serde(default)]
     pub attachments: Vec<String>,
@@ -457,40 +536,67 @@ pub async fn delete_thread(
 
 // ── What can be picked ──────────────────────────────────────────────────────
 
-/// The team's enabled repositories and their default branches.
-async fn load_repos(state: &AppState, team_id: &str) -> HashMap<String, String> {
-    let r = state
-        .dynamo
-        .query()
-        .table_name(&state.config.repos_table_name)
-        .key_condition_expression("pk = :pk AND begins_with(sk, :p)")
-        .expression_attribute_values(":pk", AttributeValue::S(team_id.to_string()))
-        .expression_attribute_values(":p", AttributeValue::S("REPO#".into()))
-        .limit(50)
-        .send()
-        .await;
-    let mut out = HashMap::new();
-    if let Ok(r) = r {
+/// The team's enabled repositories: name, default branch, and the role
+/// (and description, when one is stored) the team gave each. Every member
+/// who may ask reads every enabled repository; Coderhelm has no narrower
+/// repository access to honor.
+async fn load_repos(state: &AppState, team_id: &str) -> Vec<RepoInfo> {
+    let mut out = Vec::new();
+    let mut start: Option<HashMap<String, AttributeValue>> = None;
+    loop {
+        let r = state
+            .dynamo
+            .query()
+            .table_name(&state.config.repos_table_name)
+            .key_condition_expression("pk = :pk AND begins_with(sk, :p)")
+            .expression_attribute_values(":pk", AttributeValue::S(team_id.to_string()))
+            .expression_attribute_values(":p", AttributeValue::S("REPO#".into()))
+            .set_exclusive_start_key(start.take())
+            .send()
+            .await;
+        let Ok(r) = r else {
+            warn!(team_id, "Chat: couldn't read the team's repositories");
+            break;
+        };
         for item in r.items() {
+            let s = |k: &str| {
+                item.get(k)
+                    .and_then(|v| v.as_s().ok())
+                    .map(|v| v.trim().to_string())
+                    .filter(|v| !v.is_empty())
+            };
             let enabled = item
                 .get("enabled")
                 .and_then(|v| v.as_bool().ok())
                 .copied()
                 .unwrap_or(false);
-            let Some(name) = item.get("repo_name").and_then(|v| v.as_s().ok()) else {
+            let Some(name) = s("repo_name").filter(|n| n.contains('/')) else {
                 continue;
             };
             if enabled {
-                let branch = item
-                    .get("default_branch")
-                    .and_then(|v| v.as_s().ok())
-                    .cloned()
-                    .unwrap_or_else(|| "main".into());
-                out.insert(name.clone(), branch);
+                out.push(RepoInfo {
+                    branch: s("default_branch").unwrap_or_else(|| "main".into()),
+                    role: s("role"),
+                    description: s("description"),
+                    name,
+                });
             }
         }
+        match r.last_evaluated_key() {
+            Some(k) if !k.is_empty() && out.len() < 500 => start = Some(k.clone()),
+            _ => break,
+        }
     }
+    out.sort_by(|a, b| a.name.cmp(&b.name));
     out
+}
+
+/// Repository names to default branches.
+fn branches(repos: &[RepoInfo]) -> HashMap<String, String> {
+    repos
+        .iter()
+        .map(|r| (r.name.clone(), r.branch.clone()))
+        .collect()
 }
 
 /// GET /api/brain/sources — what the picker offers this person.
@@ -535,8 +641,7 @@ pub async fn sources(
             .filter(|(id, creds, _)| *creds && !remote.iter().any(|(r, _)| &r.id == id))
             .map(|(id, _, _)| json!({ "id": id })),
     );
-    let mut repo_names: Vec<&String> = repos.keys().collect();
-    repo_names.sort();
+    let repo_names: Vec<&String> = repos.iter().map(|r| &r.name).collect();
     let plugins = common::plugins::brain::sources(&plugin_kv(&state), &claims.team_id).await;
     let kinds: Vec<&SourceKind> = SOURCE_KINDS
         .iter()
@@ -548,6 +653,10 @@ pub async fn sources(
         "knowledge": knowledge,
         "connections": connections,
         "repos": repo_names,
+        // The repositories with what each is for, for @ mentions.
+        "repositories": repos.iter().map(|r| json!({
+            "name": r.name, "short": r.short(), "role": r.role,
+        })).collect::<Vec<_>>(),
         "can_ask": claims.holder().holds("brain_ask"),
     })))
 }
@@ -740,8 +849,7 @@ pub async fn starters(
             ready.push((b.id, b.name));
         }
     }
-    let mut repo_names: Vec<String> = repos.into_keys().collect();
-    repo_names.sort();
+    let repo_names: Vec<String> = repos.into_iter().map(|r| r.name).collect();
     Ok(Json(json!({
         "starters": starter_questions(&ready, &repo_names, &runs),
     })))
@@ -883,15 +991,55 @@ fn user_folder(user_id: &str) -> String {
 
 // ── Asking ──────────────────────────────────────────────────────────────────
 
-const BRAIN_SYSTEM: &str = r#"You are Chat, the assistant for a software team that uses Coderhelm. You answer questions using only the team's own sources: passages from their knowledge bases, files attached to the question, and the results of tools you call (connections, repositories and the code graph, memories, data sources, team skills).
+const CHAT_SYSTEM: &str = r#"You are Chat, the assistant for a software team that uses Coderhelm. You answer questions about the team's work from the team's own sources: their code (which you read with your tools), passages from their knowledge bases, files attached to the question, and the results of tools for connected apps, past work, data sources and team skills.
 
-Rules:
+How to work:
+- Research before you answer. You can take many steps: look a repository over, list folders, read files, search the code, follow imports, read more. Keep going until you can answer from what you read. Most code questions need several reads.
+- The team's repositories are listed below. When the question names one, by its full or short name however it is written, it means that repository. Open it with github__repo_overview; don't search the code or the code graph for the repository's own name.
+- "How is X put together?" (built, structured, organized): look it over, then read the entry points and the files that tie it together (app or server setup, routing, main modules, configuration). Explain the main parts, what each does, and how a request or a job moves through them.
+- "Where is X handled?": search the code for the words and the likely names, read the matching files to confirm, and name the file and the function.
+- "What does file Y do?": read it (in ranges when it is long) and the files it leans on when that matters.
+- Never hand work back. Don't ask the person to open, read, paste or attach a file, to say which repository or who owns it, or to look something up: your tools do that. When a tool fails, try another way (another path, a search, the file listing). Say something isn't there only after you looked, and say where you looked.
+- Ask the person only for what no tool can reach, such as a decision or a preference.
+
+Citations:
 - Ground every claim. After each sentence that uses a source, cite it with its id in square brackets, like [S2] or [S1, S4]. Cite only ids you were given in <source> blocks. Never invent an id.
-- Read the <source> passages first. Call tools when the question needs live data (current status, numbers, tickets, code) or when the passages don't cover it.
-- If the sources don't answer the question, say plainly that the selected sources don't cover it and what you looked at. Do not answer from general knowledge, do not guess, and never make up names, numbers, dates, links or policies.
-- When sources disagree, prefer the one marked source_of_truth, then the one with the newer as_of date. Say that they disagree and cite both. If two figures differ, give both; never average them.
-- Mention a source's as-of date when the answer depends on how current it is.
-- Lead with the answer, then the details. Keep it short: a few sentences or a list. Markdown is fine; no headings for short answers."#;
+- Answer from what the sources say, not from general knowledge. Never make up names, paths, numbers, dates, links or policies.
+- When sources disagree, prefer the one marked source_of_truth, then the newer one. Say that they disagree and cite both.
+
+How to write:
+- Lead with the answer in a sentence or two, then the details. Use a short list or a few short sections when it helps; no headings for a short answer.
+- Name real files and functions in backticks, like `src/app/page.tsx`. Quote code only when it helps: a short fenced block with its language and the file's path as its title, like ```ts title="src/app/page.tsx"
+- Write for the whole team, in plain words; explain a technical term in a few words the first time."#;
+
+/// The system prompt: how to work, and the repositories this question may
+/// read (with what each is for).
+pub fn system_prompt(repos: &[RepoInfo], can_read_code: bool) -> String {
+    let mut s = CHAT_SYSTEM.to_string();
+    if repos.is_empty() {
+        return s;
+    }
+    s.push_str(
+        "\n\nThe team's repositories you may read (owner/name, default branch, what it is for):",
+    );
+    for r in repos {
+        s.push_str(&format!("\n- {} ({})", r.name, r.branch));
+        if let Some(role) = r.role.as_deref() {
+            s.push_str(&format!(", the {role} repository"));
+        }
+        if let Some(d) = r.description.as_deref() {
+            s.push_str(&format!(": {}", common::truncate_str(d, 200)));
+        }
+    }
+    if !can_read_code {
+        s.push_str(
+            "\n\nCoderhelm can't read these repositories right now (GitHub didn't give it access). \
+             If the question needs the code, say that plainly and that an admin can check the GitHub \
+             connection in Settings; don't ask the person to open or paste files.",
+        );
+    }
+    s
+}
 
 /// What one question carries.
 #[derive(Debug, Deserialize)]
@@ -899,8 +1047,13 @@ pub struct AskBody {
     #[serde(default)]
     pub thread_id: Option<String>,
     pub question: String,
+    /// What to read, from an older client. Left out, Chat reads everything
+    /// the asker can see (narrowed by `mentions`).
     #[serde(default)]
-    pub sources: Picks,
+    pub sources: Option<Picks>,
+    /// Repositories and knowledge bases the asker mentioned with @.
+    #[serde(default)]
+    pub mentions: Vec<Mention>,
     #[serde(default)]
     pub attachments: Vec<AttachmentRef>,
 }
@@ -917,8 +1070,6 @@ const MAX_QUESTION_CHARS: usize = 8_000;
 const MAX_ATTACHMENTS: usize = 3;
 /// Earlier messages sent with a question.
 const HISTORY: usize = 12;
-/// Tool-use turns per answer.
-const MAX_TURNS: usize = 6;
 /// Knowledge passages retrieved before the model's first step.
 const RETRIEVE_K: usize = 8;
 
@@ -943,10 +1094,15 @@ struct Run {
     user_email: String,
     api_key: String,
     model_id: String,
+    /// The lighter model, for the answer check.
+    check_model_id: String,
     picks: Picks,
     /// Knowledge bases the asker may read, among those picked.
     kb_ids: Vec<String>,
+    /// Every enabled repository to its default branch.
     repos: HashMap<String, String>,
+    /// The repositories code may be read in for this question.
+    code_repos: Vec<RepoInfo>,
     github_token: Option<String>,
     mcp_tools: Vec<Value>,
     /// Active plugins among those picked.
@@ -961,6 +1117,9 @@ struct Run {
 /// The tools this question may call.
 fn tool_defs(run: &Run) -> Vec<Value> {
     let mut tools: Vec<Value> = Vec::new();
+    if run.picks.code && run.github_token.is_some() {
+        tools.extend(chat_code::defs(&run.code_repos));
+    }
     if !run.kb_ids.is_empty() {
         tools.push(json!({
             "name": KNOWLEDGE_TOOL,
@@ -985,26 +1144,13 @@ fn tool_defs(run: &Run) -> Vec<Value> {
             }, "required": ["repo", "query"]}
         }));
     }
-    if run.picks.code && run.github_token.is_some() && !repo_enum.is_empty() {
-        tools.push(json!({
-            "name": "github__search_code",
-            "description": "Search code in a repository. Returns matching paths and lines.",
-            "input_schema": {"type": "object", "properties": {
-                "repo": {"type": "string", "enum": repo_enum},
-                "query": {"type": "string"}
-            }, "required": ["repo", "query"]}
-        }));
-        tools.push(json!({
-            "name": "github__read_file",
-            "description": "Read a file from a repository's default branch.",
-            "input_schema": {"type": "object", "properties": {
-                "repo": {"type": "string", "enum": repo_enum},
-                "path": {"type": "string"}
-            }, "required": ["repo", "path"]}
-        }));
-    }
     if run.picks.connections {
-        tools.extend(run.mcp_tools.iter().cloned());
+        tools.extend(
+            run.mcp_tools
+                .iter()
+                .filter(|t| !chat_code::is_code_tool(t["name"].as_str().unwrap_or("")))
+                .cloned(),
+        );
     }
     if !run.plugin_ids.is_empty() {
         tools.push(common::plugins::brain::ask_tool(&run.plugin_ids));
@@ -1029,15 +1175,14 @@ fn tool_defs(run: &Run) -> Vec<Value> {
 fn tool_label(name: &str, input: &Value) -> String {
     let s = |k: &str| input[k].as_str().unwrap_or("").to_string();
     match name {
+        n if chat_code::is_code_tool(n) => chat_code::label(n, input),
         KNOWLEDGE_TOOL => format!(
-            "Searched knowledge for \"{}\"",
+            "Searched knowledge for \u{201c}{}\u{201d}",
             common::truncate_str(&s("query"), 60)
         ),
-        MEMORY_TOOL => format!("Searched memories of {}", s("repo")),
+        MEMORY_TOOL => format!("Searched past work in {}", short_repo(&s("repo"))),
         common::plugins::brain::ASK_TOOL => format!("Asked the {} plugin", s("plugin")),
-        "github__search_code" => format!("Searched code in {}", s("repo")),
-        "github__read_file" => format!("Read {}", s("path")),
-        n if n.starts_with("graph_") => format!("Code graph: {}", n.trim_start_matches("graph_")),
+        n if n.starts_with("graph_") => chat_code::graph_label(n, input),
         n if n.contains("__") => {
             let (server, tool) = n.split_once("__").unwrap_or((n, ""));
             format!("{server}: {}", tool.replace('_', " "))
@@ -1071,8 +1216,75 @@ fn live_stamp() -> String {
     chrono::Utc::now().format("%Y-%m-%d %H:%M UTC").to_string()
 }
 
-/// Runs one tool and registers what it read. Returns the text the model
-/// reads and a short summary for the dashboard.
+/// A code graph answer as sources, one per file it names (with the line,
+/// linked on the default branch). Returns the source ids.
+fn graph_sources(
+    run: &Run,
+    reg: &mut Registry,
+    name: &str,
+    input: &Value,
+    text: &str,
+) -> Vec<String> {
+    let repo = input["repo"]
+        .as_str()
+        .map(str::trim)
+        .filter(|r| !r.is_empty())
+        .unwrap_or(&run.scope.repo)
+        .to_string();
+    let branch = run
+        .repos
+        .get(&repo)
+        .cloned()
+        .unwrap_or_else(|| "HEAD".into());
+    let places = chat_code::graph_places(text);
+    if places.is_empty() {
+        return vec![reg.add(SourceRef {
+            kind: "code".into(),
+            title: tool_label(name, input),
+            loc: short_repo(&repo).to_string(),
+            as_of: live_stamp(),
+            passage: text.to_string(),
+            ..Default::default()
+        })];
+    }
+    places
+        .into_iter()
+        .take(12)
+        .map(|(path, line)| {
+            let passage = text
+                .lines()
+                .filter(|l| l.contains(&path))
+                .take(4)
+                .collect::<Vec<_>>()
+                .join("\n");
+            reg.add(SourceRef {
+                kind: "code".into(),
+                loc: if line > 0 {
+                    format!("{} · line {line}", short_repo(&repo))
+                } else {
+                    short_repo(&repo).to_string()
+                },
+                url: Some(common::repo_read::blob_url(
+                    &repo, &branch, &path, line, line,
+                )),
+                code: Some(CodeRef {
+                    repo: repo.clone(),
+                    path: path.clone(),
+                    commit: branch.clone(),
+                    start_line: line,
+                    end_line: line,
+                }),
+                title: path,
+                passage,
+                ..Default::default()
+            })
+        })
+        .collect()
+}
+
+/// Runs one tool other than the code tools and registers what it read.
+/// Returns the text the model reads, a short summary for the dashboard, and
+/// whether it failed.
 async fn run_tool(
     run: &Run,
     reg: &mut Registry,
@@ -1083,7 +1295,7 @@ async fn run_tool(
     let kind = kind_of_tool(name);
     if !run.picks.allows(kind) {
         return (
-            "That source isn't turned on for this question.".into(),
+            "That source isn't part of this question.".into(),
             "Not allowed".into(),
             true,
         );
@@ -1175,7 +1387,7 @@ async fn run_tool(
                         .map(|m| {
                             reg.add(SourceRef {
                                 kind: "memory".into(),
-                                title: format!("Memory of {repo}"),
+                                title: format!("Past work in {}", short_repo(repo)),
                                 loc: repo.to_string(),
                                 as_of: m.created.clone(),
                                 passage: m.content.clone(),
@@ -1188,18 +1400,18 @@ async fn run_tool(
                             })
                         })
                         .collect();
-                    (reg.render(&ids), format!("{} memories", ids.len()), false)
+                    (reg.render(&ids), format!("{} notes", ids.len()), false)
                 }
                 Ok(_) => (
-                    "No memories matched.".into(),
-                    "No memories matched".into(),
+                    "Nothing from past work matched.".into(),
+                    "Nothing matched".into(),
                     false,
                 ),
                 Err(e) => {
                     warn!(error = %e, "Chat memory search failed");
                     (
-                        "Error: memories couldn't be read.".into(),
-                        "Memory read failed".into(),
+                        "Error: past work couldn't be read.".into(),
+                        "Couldn't read".into(),
                         true,
                     )
                 }
@@ -1211,24 +1423,11 @@ async fn run_tool(
                     super::plan_chat_tools::call(state, &run.scope, used, name, input).await;
                 json!(text)
             } else if let Some((server, tool)) = name.split_once("__") {
-                if server == "github" {
-                    json!(
-                        execute_github_tool(
-                            &state.http,
-                            &run.github_token,
-                            &run.repos,
-                            tool,
-                            input
-                        )
-                        .await
-                    )
-                } else {
-                    match invoke_mcp_tool(state, &run.team_id, &run.user_email, server, tool, input)
-                        .await
-                    {
-                        Ok(r) => r,
-                        Err(e) => json!(format!("Error: {e}")),
-                    }
+                match invoke_mcp_tool(state, &run.team_id, &run.user_email, server, tool, input)
+                    .await
+                {
+                    Ok(r) => r,
+                    Err(e) => json!(format!("Error: {e}")),
                 }
             } else {
                 json!(format!("Unknown tool: {name}"))
@@ -1247,17 +1446,20 @@ async fn run_tool(
                 };
                 return (text, summary, is_error);
             }
+            if name.starts_with("graph_") {
+                let text = result.as_str().unwrap_or("").to_string();
+                let ids = graph_sources(run, reg, name, input, &text);
+                let files = ids.len();
+                return (
+                    format!(
+                        "{}\nThe graph is an index: read the files you rely on before you answer from them.",
+                        reg.render(&ids)
+                    ),
+                    format!("{files} files"),
+                    false,
+                );
+            }
             let passage = compact_tool_result_for_model(&result);
-            let (title, loc) = match name {
-                "github__read_file" => (
-                    input["path"].as_str().unwrap_or("file").to_string(),
-                    input["repo"].as_str().unwrap_or("").to_string(),
-                ),
-                _ => (
-                    tool_label(name, input),
-                    input["repo"].as_str().unwrap_or("").to_string(),
-                ),
-            };
             let id = reg.add(SourceRef {
                 kind: match kind {
                     "connections" => "connection",
@@ -1266,13 +1468,88 @@ async fn run_tool(
                     other => other,
                 }
                 .into(),
-                title,
-                loc,
+                title: tool_label(name, input),
+                loc: input["repo"].as_str().unwrap_or("").to_string(),
                 as_of: live_stamp(),
                 passage,
                 ..Default::default()
             });
             (reg.render(&[id]), summarize_tool_result(&result), false)
+        }
+    }
+}
+
+/// Chat's tools behind the agent permission gate: every call is asked of
+/// the gate first, a connection the asker can't use yet is offered as a
+/// sign-in card, and the code tools read through one [`CodeReader`].
+struct BrainTools<'a> {
+    run: &'a Run,
+    reader: Option<CodeReader<'a>>,
+    gate: common::agent_policy::Gate,
+    defs: Vec<Value>,
+    used: Used,
+}
+
+#[async_trait::async_trait]
+impl Toolbox for BrainTools<'_> {
+    fn defs(&self) -> &[Value] {
+        &self.defs
+    }
+
+    async fn call(
+        &mut self,
+        reg: &mut Registry,
+        sink: &dyn Sink,
+        name: &str,
+        input: &Value,
+    ) -> Called {
+        let label = tool_label(name, input);
+        let kind = kind_of_tool(name).to_string();
+        let verdict = if name == super::chat_policy::SIGN_IN_TOOL {
+            let (text, event) = super::chat_policy::sign_in(
+                &self.run.state,
+                &self.run.team_id,
+                &self.gate.ctx.thread_id,
+                &self.run.missing,
+                self.run.is_admin,
+                input,
+            )
+            .await;
+            super::chat_policy::Checked::Answer { text, event }
+        } else {
+            super::chat_policy::check(&self.gate, name, input).await
+        };
+        let (text, summary, is_error) = match verdict {
+            super::chat_policy::Checked::Run if chat_code::is_code_tool(name) => {
+                match (&self.reader, self.run.picks.allows("code")) {
+                    (Some(reader), true) => {
+                        let o = chat_code::run(reader, reg, name, input).await;
+                        (o.text, o.summary, o.is_error)
+                    }
+                    _ => (
+                        "Error: Coderhelm can't read the code for this question.".into(),
+                        "Couldn't read".into(),
+                        true,
+                    ),
+                }
+            }
+            super::chat_policy::Checked::Run => {
+                run_tool(self.run, reg, &mut self.used, name, input).await
+            }
+            super::chat_policy::Checked::Answer { text, event } => {
+                if let Some((k, v)) = event {
+                    sink.send(&k, v).await;
+                }
+                (text, "Not run".to_string(), true)
+            }
+            super::chat_policy::Checked::Stop(note) => return Called::Stop(note),
+        };
+        Called::Done {
+            text,
+            label,
+            summary,
+            is_error,
+            kind,
         }
     }
 }
@@ -1359,9 +1636,9 @@ async fn read_attachments(
     (ids, problems)
 }
 
-/// The team's model key and the model the brain uses (the heavy model,
-/// like the plan chat).
-async fn load_provider(state: &AppState, team_id: &str) -> (Option<String>, String) {
+/// The team's model key, the model answers are written with (the heavy
+/// model, like the plan chat) and the lighter one for the answer check.
+async fn load_provider(state: &AppState, team_id: &str) -> (Option<String>, String, String) {
     let item = state
         .dynamo
         .get_item()
@@ -1372,43 +1649,33 @@ async fn load_provider(state: &AppState, team_id: &str) -> (Option<String>, Stri
         .await
         .ok()
         .and_then(|r| r.item().cloned());
+    let field = |k: &str| {
+        item.as_ref()
+            .and_then(|i| i.get(k))
+            .and_then(|v| v.as_s().ok())
+            .filter(|s| !s.is_empty())
+            .map(|s| common::model_ids::current(s).to_string())
+    };
     let key = item
         .as_ref()
         .and_then(|i| i.get("api_key"))
         .and_then(|v| v.as_s().ok())
         .cloned();
-    let model = item
-        .as_ref()
-        .and_then(|i| {
-            i.get("heavy_model")
-                .and_then(|v| v.as_s().ok())
-                .filter(|s| !s.is_empty())
-                .or_else(|| i.get("primary_model").and_then(|v| v.as_s().ok()))
-        })
-        .cloned()
+    let primary = field("primary_model");
+    let model = field("heavy_model")
+        .or_else(|| primary.clone())
         .unwrap_or_else(|| "claude-sonnet-5-5".to_string());
-    (key, model)
+    let check = primary.unwrap_or_else(|| model.clone());
+    (key, model, check)
 }
 
+/// The team's GitHub App token (either table's spelling of the
+/// installation, as every other reader of it does).
 async fn github_token(state: &AppState, team_id: &str) -> Option<String> {
-    let id = state
-        .dynamo
-        .get_item()
-        .table_name(&state.config.teams_table_name)
-        .key("team_id", AttributeValue::S(team_id.to_string()))
-        .key("sk", AttributeValue::S("META".into()))
-        .projection_expression("github_installation_id")
-        .send()
-        .await
-        .ok()?
-        .item()?
-        .get("github_installation_id")
-        .and_then(|v| v.as_n().ok())
-        .and_then(|n| n.parse::<u64>().ok())
-        .filter(|&n| n > 0)?;
+    let id = super::graph::installation_id(state, team_id).await?;
     crate::auth::github_app::get_installation_token(state, id)
         .await
-        .inspect_err(|e| warn!(error = %e, "Brain: no GitHub token"))
+        .inspect_err(|e| warn!(error = %e, "Chat: no GitHub token"))
         .ok()
 }
 
@@ -1454,10 +1721,10 @@ async fn connection_tools(state: &AppState, team_id: &str, user_email: &str) -> 
 
 /// POST /api/brain/stream — ask a question; the answer streams back as
 /// server-sent events (`thread`, `retrieved`, `tool_start`, `tool_result`,
-/// `text_delta`, `answer`, `done`, or `error`). Authorized by the short-lived
-/// token from `/api/brain/token` (its own audience); what the asker holds
-/// is read again here, so the stream is decided by capability like every
-/// other route.
+/// `step`, `text_delta`, `text_reset`, `answer`, `done`, or `error`).
+/// Authorized by the short-lived token from `/api/brain/token` (its own
+/// audience); what the asker holds is read again here, so the stream is
+/// decided by capability like every other route.
 #[allow(clippy::type_complexity)]
 pub async fn brain_stream(
     State(state): State<Arc<AppState>>,
@@ -1533,28 +1800,44 @@ pub async fn brain_stream(
         }
     };
 
-    let (api_key, model_id) = load_provider(&state, &claims.team_id).await;
-    let picks = body.sources.clone();
+    let (api_key, model_id, check_model_id) = load_provider(&state, &claims.team_id).await;
     let st = super::knowledge::store(&state);
     let readable: Vec<String> = st
         .bases(&claims.team_id)
         .await
         .unwrap_or_default()
         .into_iter()
-        .filter(|b| b.readable_by(reader) && picks.knowledge.contains(&b.id))
+        .filter(|b| b.readable_by(reader))
         .map(|b| b.id)
         .collect();
-    let repos = load_repos(&state, &claims.team_id).await;
-    let repo = picks
-        .repo
-        .clone()
-        .filter(|r| repos.contains_key(r))
-        .or_else(|| {
-            let mut r: Vec<&String> = repos.keys().collect();
-            r.sort();
-            r.first().map(|s| s.to_string())
-        })
+    let all_repos = load_repos(&state, &claims.team_id).await;
+    let repo_names: Vec<String> = all_repos.iter().map(|r| r.name.clone()).collect();
+    let picks = resolve_picks(
+        body.sources.as_ref(),
+        &body.mentions,
+        &readable,
+        &repo_names,
+    );
+    let code_repos: Vec<RepoInfo> = if picks.code {
+        all_repos
+            .iter()
+            .filter(|r| picks.repos.is_empty() || picks.repos.contains(&r.name))
+            .cloned()
+            .collect()
+    } else {
+        Vec::new()
+    };
+    // The repository skills, data sources and the code graph start from: the
+    // one named in the question, else the one picked, else the first.
+    let named = common::repo_read::mentioned(&code_repos, &question)
+        .first()
+        .map(|r| r.name.clone());
+    let repo = named
+        .or_else(|| picks.repo.clone().filter(|r| repo_names.contains(r)))
+        .or_else(|| code_repos.first().map(|r| r.name.clone()))
+        .or_else(|| repo_names.first().cloned())
         .unwrap_or_default();
+    let repos = branches(&all_repos);
     let scope = ChatScope {
         team_id: claims.team_id.clone(),
         chat_id: format!("brain-{}", thread.id),
@@ -1573,7 +1856,7 @@ pub async fn brain_stream(
             }
         },
         async {
-            if picks.code {
+            if picks.code && !code_repos.is_empty() {
                 github_token(&state, &claims.team_id).await
             } else {
                 None
@@ -1587,16 +1870,27 @@ pub async fn brain_stream(
             }
         },
     );
-    let plugin_ids = active_plugins(&state, &claims.team_id, &picks.plugins).await;
+    // Chosen by Chat: every active plugin; narrowed: the ones picked.
+    let plugin_ids = if picks.auto {
+        common::plugins::brain::sources(&plugin_kv(&state), &claims.team_id)
+            .await
+            .into_iter()
+            .filter_map(|v| v["id"].as_str().map(str::to_string))
+            .collect()
+    } else {
+        active_plugins(&state, &claims.team_id, &picks.plugins).await
+    };
     let run = Run {
         state: state.clone(),
         team_id: claims.team_id.clone(),
         user_email: claims.email.clone(),
         api_key: api_key.unwrap_or_default(),
         model_id,
-        picks: picks.clone(),
-        kb_ids: readable,
+        check_model_id,
+        kb_ids: picks.knowledge.clone(),
+        picks,
         repos,
+        code_repos,
         github_token: github,
         mcp_tools,
         plugin_ids,
@@ -1607,39 +1901,40 @@ pub async fn brain_stream(
         is_admin: claims.holder().holds("integrations"),
     };
 
-    let (tx, rx) = tokio::sync::mpsc::channel::<Result<Event, std::convert::Infallible>>(64);
+    let (tx, rx) = tokio::sync::mpsc::channel::<Result<Event, std::convert::Infallible>>(256);
     let user_id = claims.sub.clone();
     let attachments = body.attachments.clone();
-    info!(team_id = %claims.team_id, thread = %thread.id, kbs = run.kb_ids.len(), "Chat question");
+    let mentions = body.mentions.clone();
+    info!(
+        team_id = %claims.team_id,
+        thread = %thread.id,
+        kbs = run.kb_ids.len(),
+        repos = run.code_repos.len(),
+        code = run.github_token.is_some(),
+        "Chat question"
+    );
     tokio::spawn(async move {
-        let _ = tx
-            .send(sse_event(
-                "thread",
-                json!({ "id": thread.id, "title": thread.title }),
-            ))
+        let sink = chat_agent::ChannelSink(tx.clone());
+        sink.send("thread", json!({ "id": thread.id, "title": thread.title }))
             .await;
-        let (fin, used) = if run.api_key.is_empty() && !common::model_provider::is_bedrock() {
-            let _ = tx
-                .send(sse_event("error", json!({ "message": "Add a model provider key in your AI model settings to use Chat." })))
+        if run.api_key.is_empty() && !common::model_provider::is_bedrock() {
+            sink.send("error", json!({ "message": "Add a model provider key in your AI model settings to use Chat." }))
                 .await;
-            let _ = tx.send(sse_event("done", json!({}))).await;
+            sink.send("done", json!({})).await;
             return;
-        } else {
-            match answer(&run, &tx, &user_id, &question, &history, &attachments).await {
-                Some(done) => done,
-                // The model couldn't be reached: the error was sent, nothing is kept.
-                None => {
-                    let _ = tx.send(sse_event("done", json!({}))).await;
-                    return;
-                }
-            }
+        }
+        let Some((fin, used)) =
+            answer(&run, &sink, &user_id, &question, &history, &attachments).await
+        else {
+            // The model couldn't be reached: the error was sent, nothing is kept.
+            sink.send("done", json!({})).await;
+            return;
         };
-        let _ = tx
-            .send(sse_event(
-                "answer",
-                json!({ "text": fin.text, "citations": fin.citations, "grounded": fin.grounded }),
-            ))
-            .await;
+        sink.send(
+            "answer",
+            json!({ "text": fin.text, "citations": fin.citations, "grounded": fin.grounded }),
+        )
+        .await;
         // Keep the exchange.
         let seq = thread.messages;
         let names: Vec<String> = attachments
@@ -1652,6 +1947,7 @@ pub async fn brain_stream(
             content: question.clone(),
             grounded: true,
             sources: run.picks.clone(),
+            mentions,
             attachments: names,
             at: now(),
             ..Default::default()
@@ -1689,7 +1985,7 @@ pub async fn brain_stream(
         if let Err(e) = saved {
             error!(error = %e, "Chat answer not saved");
         }
-        let _ = tx.send(sse_event("done", json!({}))).await;
+        sink.send("done", json!({})).await;
     });
 
     let stream: std::pin::Pin<
@@ -1703,7 +1999,7 @@ pub async fn brain_stream(
 }
 
 /// The model's input for this question: the earlier exchange, then the
-/// retrieved sources and the question.
+/// retrieved sources, any notes, and the question.
 fn build_messages(
     history: &[Message],
     sources_block: &str,
@@ -1744,21 +2040,34 @@ fn build_messages(
     out
 }
 
-/// Retrieves, asks the model (with tools) and finalizes the answer. None
-/// when the model couldn't be reached (the error was already sent).
+/// A note naming the repositories a question mentions, so the model opens
+/// them instead of looking for their names in the code.
+pub fn mention_note(repos: &[RepoInfo], question: &str) -> String {
+    let named = common::repo_read::mentioned(repos, question);
+    if named.is_empty() {
+        return String::new();
+    }
+    let names: Vec<&str> = named.iter().map(|r| r.name.as_str()).collect();
+    format!(
+        "\nThe question names the team's repository {}. Read it with your code tools.\n",
+        names.join(" and ")
+    )
+}
+
+/// Retrieves, runs the answer loop and finalizes the answer. None when the
+/// model couldn't be reached (the error was already sent).
 async fn answer(
     run: &Run,
-    tx: &Tx,
+    sink: &chat_agent::ChannelSink,
     user_id: &str,
     question: &str,
     history: &[Message],
     attachments: &[AttachmentRef],
 ) -> Option<(Final, Vec<Value>)> {
     let mut reg = Registry::default();
-    let mut used_tools: Vec<Value> = Vec::new();
     let state = &run.state;
 
-    // 1. Retrieve first, in code.
+    // 1. Retrieve knowledge first, in code.
     let mut first_ids: Vec<String> = Vec::new();
     if !run.kb_ids.is_empty() {
         let meter = crate::model_call::chat_meter(state, &run.team_id);
@@ -1795,11 +2104,13 @@ async fn answer(
     )
     .await;
     first_ids.extend(att_ids);
-    let _ = tx
-        .send(sse_event("retrieved", json!({
+    sink.send(
+        "retrieved",
+        json!({
             "sources": first_ids.iter().filter_map(|id| reg.get(id)).cloned().collect::<Vec<_>>(),
-        })))
-        .await;
+        }),
+    )
+    .await;
 
     let mut tools = tool_defs(run);
     // Agent permissions: a connection the asker can't use yet is offered as
@@ -1820,10 +2131,10 @@ async fn answer(
         .await;
     // Nothing found and nothing to look up: say so without a model call.
     if reg.is_empty() && tools.is_empty() {
-        return Some((finalize("", &reg), used_tools));
+        return Some((finalize("", &reg), Vec::new()));
     }
 
-    let mut notes = String::new();
+    let mut notes = mention_note(&run.code_repos, question);
     if !problems.is_empty() {
         notes.push_str(&format!(
             "\nAttached files that couldn't be read: {}\n",
@@ -1836,146 +2147,47 @@ async fn answer(
             run.worker.prompt
         ));
     }
-    let mut messages = build_messages(history, &reg.render(&first_ids), &notes, question);
-    let http = reqwest::Client::new();
-    let meter = crate::model_call::chat_meter(state, &run.team_id);
-    let mut worker_used = Used::default();
-    let mut last_text = String::new();
-
-    for turn in 0..MAX_TURNS {
-        let last_turn = turn + 1 == MAX_TURNS;
-        let mut body = json!({
-            "model": run.model_id,
-            "max_tokens": 4096,
-            "stream": true,
-            "system": [{"type": "text", "text": BRAIN_SYSTEM, "cache_control": {"type": "ephemeral"}}],
-            "messages": messages,
-        });
-        if common::is_always_thinking_model(&run.model_id) {
-            body["output_config"] = json!({"effort": "medium"});
-        }
-        if !tools.is_empty() && !last_turn {
-            body["tools"] = json!(tools);
-        }
-        let (resp, mut flight) = match crate::model_call::open_brain_stream(
-            &http,
-            &run.api_key,
-            &body,
-            &meter,
-            &run.model_id,
-        )
+    let messages = build_messages(history, &reg.render(&first_ids), &notes, question);
+    let host_http = common::mcp_remote::http::GuardedHttps;
+    let host = run.github_token.as_ref().map(|t| GitHubHost {
+        http: &host_http,
+        auth: format!("Bearer {t}"),
+    });
+    let mut toolbox = BrainTools {
+        run,
+        reader: host
+            .as_ref()
+            .map(|h| CodeReader::new(h, run.code_repos.clone())),
+        gate,
+        defs: tools,
+        used: Used::default(),
+    };
+    let model = chat_agent::ApiModel {
+        http: reqwest::Client::new(),
+        api_key: run.api_key.clone(),
+        meter: crate::model_call::chat_meter(state, &run.team_id),
+        model_id: run.model_id.clone(),
+        check_model_id: run.check_model_id.clone(),
+        kind_of: kind_of_tool,
+    };
+    let ask = chat_agent::Ask {
+        system: system_prompt(&run.code_repos, run.github_token.is_some()),
+        messages,
+        question,
+        limits: chat_agent::LIMITS,
+    };
+    let out = chat_agent::run(&model, &mut toolbox, sink, &mut reg, ask)
         .await
-        {
-            Ok(r) => r,
-            Err(e) => {
-                error!(transient = e.is_transient(), "Chat model call failed: {e}");
-                let _ = tx
-                        .send(sse_event("error", json!({ "message": "The model couldn't be reached. Try again in a moment." })))
-                        .await;
-                return None;
-            }
-        };
-        let mut parser = SseParser::default();
-        let mut stream = resp;
-        while let Some(chunk) = stream.next().await {
-            let Ok(chunk) = chunk else { break };
-            for ev in parser.push(&chunk) {
-                flight.acc.feed(&ev);
-                match ev["type"].as_str() {
-                    Some("content_block_delta") if ev["delta"]["type"] == "text_delta" => {
-                        if let Some(t) = ev["delta"]["text"].as_str() {
-                            let _ = tx.send(sse_event("text_delta", json!({ "text": t }))).await;
-                        }
-                    }
-                    Some("content_block_start") if ev["content_block"]["type"] == "tool_use" => {
-                        let name = ev["content_block"]["name"].as_str().unwrap_or("");
-                        let _ = tx
-                            .send(sse_event("tool_start", json!({
-                                "id": ev["content_block"]["id"], "name": name, "kind": kind_of_tool(name),
-                            })))
-                            .await;
-                    }
-                    _ => {}
-                }
-            }
-        }
-        flight.finish().await;
-        let message = std::mem::take(&mut flight.acc).into_message();
-        let content = message["content"].as_array().cloned().unwrap_or_default();
-        let stop = message["stop_reason"].as_str().unwrap_or("").to_string();
-        let text: String = content
-            .iter()
-            .filter(|b| b["type"] == "text")
-            .filter_map(|b| b["text"].as_str())
-            .collect();
-        if !text.trim().is_empty() {
-            last_text = text;
-        }
-        if !content.is_empty() {
-            messages.push(json!({ "role": "assistant", "content": content }));
-        }
-        let tool_uses: Vec<Value> = content
-            .iter()
-            .filter(|b| b["type"] == "tool_use")
-            .cloned()
-            .collect();
-        if stop != "tool_use" || tool_uses.is_empty() {
-            break;
-        }
-        let mut results = Vec::new();
-        for tu in &tool_uses {
-            let name = tu["name"].as_str().unwrap_or("");
-            let input = &tu["input"];
-            let label = tool_label(name, input);
-            let verdict = if name == super::chat_policy::SIGN_IN_TOOL {
-                let (text, event) = super::chat_policy::sign_in(
-                    state,
-                    &run.team_id,
-                    &gate.ctx.thread_id,
-                    &run.missing,
-                    run.is_admin,
-                    input,
-                )
-                .await;
-                super::chat_policy::Checked::Answer { text, event }
-            } else {
-                super::chat_policy::check(&gate, name, input).await
-            };
-            let (text, summary, is_error) = match verdict {
-                super::chat_policy::Checked::Run => {
-                    run_tool(run, &mut reg, &mut worker_used, name, input).await
-                }
-                super::chat_policy::Checked::Answer { text, event } => {
-                    if let Some((kind, v)) = event {
-                        let _ = tx.send(sse_event(&kind, v)).await;
-                    }
-                    (text, "Not run".to_string(), true)
-                }
-                super::chat_policy::Checked::Stop(note) => {
-                    let _ = tx
-                        .send(sse_event("text_delta", json!({ "text": note })))
-                        .await;
-                    return Some((finalize(&note, &reg), used_tools));
-                }
-            };
-            let _ = tx
-                .send(sse_event(
-                    "tool_result",
-                    json!({
-                        "id": tu["id"], "name": name, "label": label,
-                        "status": if is_error { "error" } else { "success" }, "summary": summary,
-                    }),
-                ))
-                .await;
-            used_tools.push(json!({ "kind": kind_of_tool(name), "label": label }));
-            results
-                .push(json!({ "type": "tool_result", "tool_use_id": tu["id"], "content": text }));
-        }
-        messages.push(json!({ "role": "user", "content": results }));
-        // The next turn's text replaces what was said before the tools.
-        let _ = tx.send(sse_event("text_reset", json!({}))).await;
-    }
-    Some((finalize(&last_text, &reg), used_tools))
+        .ok()?;
+    info!(
+        team_id = %run.team_id,
+        calls = out.calls.len(),
+        rechecked = out.rechecked,
+        grounded = out.fin.grounded,
+        cited = out.fin.citations.len(),
+        "Chat answered"
+    );
+    Some((out.fin, out.used))
 }
 
 #[cfg(test)]
@@ -2190,10 +2402,78 @@ mod tests {
     }
 
     #[test]
+    fn by_default_a_question_reads_everything_the_asker_can_see() {
+        let kbs = vec!["kb1".to_string(), "kb2".to_string()];
+        let repos = vec!["acme/api".to_string(), "acme/web".to_string()];
+        let p = resolve_picks(None, &[], &kbs, &repos);
+        assert!(p.auto && p.code && p.memories && p.connections && p.data_sources && p.skills);
+        assert_eq!(p.knowledge, kbs);
+        assert!(p.repos.is_empty(), "all repositories");
+        // Without repositories, code isn't offered.
+        assert!(!resolve_picks(None, &[], &kbs, &[]).code);
+    }
+
+    #[test]
+    fn a_mention_narrows_the_question_to_what_was_mentioned() {
+        let kbs = vec!["kb1".to_string()];
+        let repos = vec!["acme/api".to_string(), "acme/web".to_string()];
+        let m = |kind: &str, id: &str| Mention {
+            kind: kind.into(),
+            id: id.into(),
+        };
+        let p = resolve_picks(None, &[m("repo", "acme/web")], &kbs, &repos);
+        assert!(!p.auto && p.code && p.memories && !p.connections);
+        assert_eq!(p.repos, ["acme/web"]);
+        assert!(p.knowledge.is_empty());
+        let p = resolve_picks(None, &[m("knowledge", "kb1")], &kbs, &repos);
+        assert_eq!(p.knowledge, ["kb1"]);
+        assert!(!p.code);
+        // A base the asker can't read, or a repository that isn't the team's,
+        // narrows nothing: everything they can see is read instead.
+        let p = resolve_picks(
+            None,
+            &[m("knowledge", "secret"), m("repo", "x/y")],
+            &kbs,
+            &repos,
+        );
+        assert!(p.auto);
+        // An older client's picks are honored, minus what the asker can't read.
+        let old = Picks {
+            knowledge: vec!["kb1".into(), "secret".into()],
+            ..Default::default()
+        };
+        let p = resolve_picks(Some(&old), &[], &kbs, &repos);
+        assert_eq!(p.knowledge, ["kb1"]);
+        assert!(!p.auto && !p.code);
+    }
+
+    #[test]
+    fn the_system_prompt_lists_the_repositories_and_what_each_is_for() {
+        let repos = vec![
+            RepoInfo {
+                role: Some("backend".into()),
+                ..RepoInfo::new("acme/api", "main")
+            },
+            RepoInfo::new("acme/web", "trunk"),
+        ];
+        let p = system_prompt(&repos, true);
+        assert!(p.contains("- acme/api (main), the backend repository"));
+        assert!(p.contains("- acme/web (trunk)"));
+        assert!(!p.contains("can't read these repositories"));
+        assert!(system_prompt(&repos, false).contains("can't read these repositories"));
+        assert!(mention_note(&repos, "How is api put together?").contains("acme/api"));
+        assert_eq!(mention_note(&repos, "How do refunds work?"), "");
+    }
+
+    #[test]
     fn tool_labels_read_plainly() {
         assert_eq!(
             tool_label("github__read_file", &json!({"path": "src/a.rs"})),
             "Read src/a.rs"
+        );
+        assert_eq!(
+            tool_label("graph_definition", &json!({"name": "pay"})),
+            "Found where \u{201c}pay\u{201d} is defined"
         );
         assert_eq!(
             tool_label("notion__search_pages", &json!({})),

@@ -246,15 +246,16 @@ mod tests {
         assert!(t["description"].as_str().unwrap().contains("Figma (figma)"));
     }
 
-    /// Both plan chat loops ask the gate before any tool runs: in each loop,
-    /// the first `chat_policy::check(` comes before every way a tool is run.
+    /// Both plan chat loops and Chat's toolbox ask the gate before any tool
+    /// runs: in each, the first `chat_policy::check(` comes before every way
+    /// a tool is run.
     #[test]
     fn plan_chat_loops_never_run_a_tool_before_the_gate() {
         let src = [include_str!("plans.rs"), include_str!("brain.rs")].concat();
         for start in [
             "pub async fn plan_chat(",
             "async fn run_anthropic_stream(",
-            "async fn answer(",
+            "    async fn call(",
         ] {
             let body = src.split(start).nth(1).expect("the loop exists");
             let body = &body[..body.find("\n}\n").unwrap_or(body.len())];
@@ -265,12 +266,24 @@ mod tests {
                 "plan_chat_tools::call(",
                 "execute_github_tool(",
                 "invoke_mcp_tool(",
+                "chat_code::run(",
+                "run_tool(",
             ] {
                 for (at, _) in body.match_indices(runs) {
                     assert!(at > gate_at, "{start}: {runs} before the policy gate");
                 }
             }
         }
+        // Chat runs its tools only from that gated toolbox.
+        let chat = include_str!("brain.rs");
+        let chat = &chat[..chat.find("#[cfg(test)]").unwrap_or(chat.len())];
+        assert_eq!(chat.matches("chat_code::run(").count(), 1);
+        assert_eq!(
+            chat.matches(" run_tool(").count(),
+            2,
+            "the definition and the gated call"
+        );
+        assert!(!chat.contains("execute_github_tool("));
     }
 
     #[tokio::test]

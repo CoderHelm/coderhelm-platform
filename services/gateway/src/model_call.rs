@@ -32,9 +32,32 @@ pub async fn chat_turn(
     meter: &UsageMeter,
     model_id: &str,
 ) -> Result<Value, ModelCallError> {
+    whole_turn(http, api_key, body, meter, model_id, feature::CHAT).await
+}
+
+/// [`chat_turn`] for Chat's own small calls (the answer check): recorded
+/// under feature `brain`.
+pub async fn brain_turn(
+    http: &reqwest::Client,
+    api_key: &str,
+    body: &Value,
+    meter: &UsageMeter,
+    model_id: &str,
+) -> Result<Value, ModelCallError> {
+    whole_turn(http, api_key, body, meter, model_id, feature::BRAIN).await
+}
+
+async fn whole_turn(
+    http: &reqwest::Client,
+    api_key: &str,
+    body: &Value,
+    meter: &UsageMeter,
+    model_id: &str,
+    feature_tag: &'static str,
+) -> Result<Value, ModelCallError> {
     if common::model_provider::is_bedrock() {
         let (mut stream, mut flight) =
-            open_bedrock_stream(body, meter, model_id, feature::CHAT).await?;
+            open_bedrock_stream(body, meter, model_id, feature_tag).await?;
         let mut parser = SseParser::default();
         while let Some(chunk) = stream.next().await {
             match chunk {
@@ -80,7 +103,7 @@ pub async fn chat_turn(
         model_id,
         bytes.len() as u64,
     );
-    Ok(with_feature(feature::CHAT, call).await?.message)
+    Ok(with_feature(feature_tag, call).await?.message)
 }
 
 /// Open a plan chat stream for the caller to relay event by event. The

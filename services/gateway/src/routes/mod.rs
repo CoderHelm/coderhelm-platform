@@ -8,6 +8,10 @@ pub mod api_keys;
 pub mod auth;
 pub mod banners;
 pub mod brain;
+pub mod chat_agent;
+pub mod chat_code;
+#[cfg(test)]
+pub mod chat_eval;
 pub mod chat_policy;
 pub mod connectors;
 pub mod data_sources;

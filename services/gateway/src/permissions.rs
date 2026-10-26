@@ -1340,6 +1340,8 @@ mod tests {
         let sources: &[(&str, &str)] = &[
             ("permissions.rs", include_str!("permissions.rs")),
             ("routes/brain.rs", include_str!("routes/brain.rs")),
+            ("routes/chat_agent.rs", include_str!("routes/chat_agent.rs")),
+            ("routes/chat_code.rs", include_str!("routes/chat_code.rs")),
             ("routes/knowledge.rs", include_str!("routes/knowledge.rs")),
             (
                 "routes/chat_policy.rs",

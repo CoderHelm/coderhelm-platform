@@ -14,8 +14,8 @@ use super::search::Hit;
 
 /// The answer given when nothing in the chosen sources supports one.
 pub const NO_SOURCE_ANSWER: &str =
-    "Nothing in what you chose to search answers this, so I won't guess. \
-Try searching more places, adding the document to Knowledge, or attaching it to your question.";
+    "I looked through your team's code and knowledge and found nothing that answers this, so I won't guess. \
+If it lives in a document Coderhelm can't see yet, add it to Knowledge or attach it to your question.";
 
 /// Longest passage kept on a citation.
 const PASSAGE_CHARS: usize = 1_600;
@@ -55,6 +55,24 @@ pub struct SourceRef {
     /// The connector a synced passage came from (`notion`, `confluence`).
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub source_kind: String,
+    /// Where in a repository, for a file of code: the citation card shows
+    /// the path and lines and links to them at this commit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub code: Option<CodeRef>,
+}
+
+/// A place in a repository at one commit.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct CodeRef {
+    /// `owner/name`.
+    pub repo: String,
+    pub path: String,
+    pub commit: String,
+    /// 1-based, inclusive; 0 when the source is the whole file or a folder.
+    #[serde(default)]
+    pub start_line: usize,
+    #[serde(default)]
+    pub end_line: usize,
 }
 
 /// The sources read while answering one question.
@@ -115,30 +133,41 @@ impl Registry {
     /// The sources `ids` as the block the model reads: each with its id,
     /// title, place, date and text.
     pub fn render(&self, ids: &[String]) -> String {
-        let mut out = String::new();
-        for id in ids {
-            let Some(r) = self.get(id) else { continue };
-            out.push_str(&format!(
-                "<source id=\"{}\" kind=\"{}\" title=\"{}\"",
-                r.id,
-                r.kind,
-                attr(&r.title)
-            ));
-            if !r.loc.is_empty() {
-                out.push_str(&format!(" where=\"{}\"", attr(&r.loc)));
-            }
-            if !r.as_of.is_empty() {
-                out.push_str(&format!(" as_of=\"{}\"", attr(&r.as_of)));
-            }
-            if r.authoritative {
-                out.push_str(" source_of_truth=\"yes\"");
-            }
-            out.push_str(">\n");
-            out.push_str(r.passage.trim());
-            out.push_str("\n</source>\n");
-        }
-        out
+        ids.iter()
+            .filter_map(|id| self.get(id).map(|r| render_one(r, &r.passage)))
+            .collect()
     }
+
+    /// One source with `body` in place of its kept passage: the model reads
+    /// the whole of what was read (a file's lines), the citation keeps an
+    /// excerpt.
+    pub fn render_with(&self, id: &str, body: &str) -> String {
+        self.get(id)
+            .map(|r| render_one(r, body))
+            .unwrap_or_default()
+    }
+}
+
+fn render_one(r: &SourceRef, body: &str) -> String {
+    let mut out = format!(
+        "<source id=\"{}\" kind=\"{}\" title=\"{}\"",
+        r.id,
+        r.kind,
+        attr(&r.title)
+    );
+    if !r.loc.is_empty() {
+        out.push_str(&format!(" where=\"{}\"", attr(&r.loc)));
+    }
+    if !r.as_of.is_empty() {
+        out.push_str(&format!(" as_of=\"{}\"", attr(&r.as_of)));
+    }
+    if r.authoritative {
+        out.push_str(" source_of_truth=\"yes\"");
+    }
+    out.push_str(">\n");
+    out.push_str(body.trim_end());
+    out.push_str("\n</source>\n");
+    out
 }
 
 /// A synced item's address, only when it is a plain https link (never a
