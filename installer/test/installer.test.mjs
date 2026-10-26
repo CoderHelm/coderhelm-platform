@@ -622,3 +622,130 @@ test("domain apply: bad values fail before deploying, and the result file says w
   assert.equal(JSON.parse(fs.readFileSync(file, "utf8")).domain, null, "config unchanged");
   assert.equal(JSON.parse(fs.readFileSync(result, "utf8")).status, "failed");
 });
+
+// ── The model check before an update from this machine ───────────────────
+
+const MANIFEST = {
+  schema: 1, version: "v1.1.0",
+  calls: ["claude-opus-5-5", "claude-sonnet-5-5"],
+  bedrock: { "claude-opus-5-5": { "us.": "us.anthropic.claude-opus-5-5" }, "claude-sonnet-5-5": { "us.": "us.anthropic.claude-sonnet-5-5" } },
+};
+const TERMS = {
+  status: "fail", code: "marketplace_failed",
+  detail: "Bedrock refused us.anthropic.claude-sonnet-5-5: Anthropic's terms for this model haven't been accepted in AWS Marketplace.",
+  fix: "Have someone allowed to subscribe in AWS Marketplace accept the terms for claude-sonnet-5-5 on the Bedrock console's Model access page, then check again.",
+  url: "https://console.aws.amazon.com/bedrock/home?region=us-west-2#/modelaccess",
+};
+
+/** A signed release with a model list, as resolveSource returns it after the signature check. */
+const signedSource = (manifest = MANIFEST) => async (_ctx, version) => ({ version, models: manifest, infra: path.join(tmpdir(), "infra"), dashboard: null, env: {} });
+
+/** The install's worker answering the model check (the outfile is its reply); no real model calls. */
+function workerAnswers(results, { fail = false, payloads = [] } = {}) {
+  return {
+    "dynamodb get-item": { Item: { data: { S: JSON.stringify({ provider: "bedrock", probe_team: "TEAM#1" }) } } },
+    "lambda invoke --function-name coderhelm-prod-worker": (args) => {
+      payloads.push(JSON.parse(args[args.indexOf("--payload") + 1]));
+      if (fail) return { code: 255, stderr: "AccessDenied" };
+      const out = args[args.length - 1];
+      const targets = payloads.at(-1).model_check.targets;
+      fs.writeFileSync(out, JSON.stringify({ provider: "bedrock", region: "us-west-2", ok: false, results: results(targets) }));
+      return "{}";
+    },
+  };
+}
+
+function modelRunner(results, opts) {
+  const base = healthyThen(99);
+  Object.assign(base.answers, workerAnswers(results, opts));
+  return base;
+}
+
+/** Runs the CLI; a refusal (thrown, like every update refusal) comes back as code 1 with its message. */
+async function attempt(argv, deps) {
+  const logs = [];
+  try {
+    const code = await main(argv, { log: (m) => logs.push(String(m)), interactive: false, ask: quietAsk(), ...deps });
+    return { code, out: logs.join("\n") };
+  } catch (e) {
+    return { code: 1, out: `${logs.join("\n")}\n${e.message}` };
+  }
+}
+
+const pass = (t) => ({ model: t.model, id: t.bedrock_ids["us."] ?? t.model, status: "pass", code: "ok", detail: "answered" });
+
+test("update: a refused model the release calls stops it before anything deploys, with the fix and the link", async () => {
+  const { dir, file } = stateDir("v1.0.0");
+  const payloads = [];
+  const runner = modelRunner((ts) => ts.map((t) => (t.model === "claude-sonnet-5-5" ? { ...TERMS, model: t.model } : pass(t))), { payloads });
+  const result = path.join(dir, "r.json");
+  const r = await attempt(["update", "--config", file, "--to", "v1.1.0", "--yes", "--skip-model-check", "--result-file", result], { runner, resolveSource: signedSource() });
+  assert.equal(r.code, 1);
+  assert.match(r.out, /FAIL {2}claude-sonnet-5-5: Bedrock refused/);
+  assert.match(r.out, /How to fix: Have someone allowed to subscribe/);
+  assert.match(r.out, /#\/modelaccess/);
+  assert.match(r.out, /Update to v1\.1\.0 needs your action: claude-sonnet-5-5 was refused.*can't be skipped/s);
+  assert.ok(!runner.commands.some((c) => c.args.includes("deploy")), "nothing deployed, --skip-model-check or not");
+  assert.equal(JSON.parse(fs.readFileSync(result, "utf8")).status, "failed");
+  // The worker was asked about every model the release calls, with the release's Bedrock ids and the probe team.
+  assert.deepEqual(payloads[0].model_check.targets.map((t) => t.model), ["claude-opus-5-5", "claude-sonnet-5-5"]);
+  assert.equal(payloads[0].model_check.targets[0].bedrock_ids["us."], "us.anthropic.claude-opus-5-5");
+  assert.equal(payloads[0].model_check.probe_team, "TEAM#1");
+  // Nothing accepts terms or subscribes.
+  assert.ok(!runner.lines().some((l) => /marketplace|agreement|use-case|subscribe/i.test(l)));
+});
+
+test("update: every model answers, so the update deploys", async () => {
+  const { dir, file } = stateDir("v1.0.0");
+  const runner = modelRunner((ts) => ts.map(pass));
+  const result = path.join(dir, "r.json");
+  const r = await attempt(["update", "--config", file, "--to", "v1.1.0", "--yes", "--result-file", result], { runner, resolveSource: signedSource() });
+  assert.equal(r.code, 0, r.out);
+  assert.match(r.out, /PASS {2}claude-opus-5-5/);
+  assert.ok(runner.commands.some((c) => c.args.includes("deploy")));
+  assert.equal(JSON.parse(fs.readFileSync(result, "utf8")).status, "succeeded");
+});
+
+test("update: --skip-model-check passes only a model the release doesn't call", async () => {
+  const extra = (ts) => [...ts.map(pass), { ...TERMS, model: "claude-haiku-4-5", id: "us.anthropic.claude-haiku-4-5-20251001-v1:0" }];
+  const a = stateDir("v1.0.0");
+  const refused = await attempt(["update", "--config", a.file, "--to", "v1.1.0", "--yes"], { runner: modelRunner(extra), resolveSource: signedSource() });
+  assert.equal(refused.code, 1);
+  assert.match(refused.out, /doesn't call it, so --skip-model-check lets the update go ahead/);
+
+  const b = stateDir("v1.0.0");
+  const runner = modelRunner(extra);
+  const result = path.join(b.dir, "r.json");
+  const ok = await attempt(["update", "--config", b.file, "--to", "v1.1.0", "--yes", "--skip-model-check", "--result-file", result], { runner, resolveSource: signedSource() });
+  assert.equal(ok.code, 0, ok.out);
+  assert.match(ok.out, /skipped for claude-haiku-4-5/);
+  assert.equal(JSON.parse(fs.readFileSync(result, "utf8")).note, "model check skipped for claude-haiku-4-5");
+});
+
+test("update: a model the config names is required too, and a worker that doesn't answer stops the update", async () => {
+  const { file } = stateDir("v1.0.0");
+  fs.writeFileSync(file, JSON.stringify({ ...JSON.parse(fs.readFileSync(file, "utf8")), models: { provider: "bedrock", primary: "claude-opus-4-8" } }));
+  const payloads = [];
+  const runner = modelRunner((ts) => ts.map((t) => (t.model === "claude-opus-4-8" ? { ...TERMS, model: t.model } : pass(t))), { payloads });
+  const r = await attempt(["update", "--config", file, "--to", "v1.1.0", "--yes", "--skip-model-check"], { runner, resolveSource: signedSource() });
+  assert.equal(r.code, 1);
+  assert.ok(payloads[0].model_check.targets.some((t) => t.model === "claude-opus-4-8"));
+  assert.ok(!runner.commands.some((c) => c.args.includes("deploy")));
+
+  const down = stateDir("v1.0.0");
+  const runner2 = modelRunner(() => [], { fail: true });
+  const r2 = await attempt(["update", "--config", down.file, "--to", "v1.1.0", "--yes"], { runner: runner2, resolveSource: signedSource() });
+  assert.equal(r2.code, 1);
+  assert.match(r2.out, /model check couldn't run/);
+  assert.ok(!runner2.commands.some((c) => c.args.includes("deploy")));
+});
+
+test("update: a signed release without a model list, a rollback and a checkout skip the model check", async () => {
+  const unit = { flags: {}, runner: new FakeRunner(), log: () => {} };
+  assert.equal(await cmd.updateModelCheck(unit, { region: "us-west-2", stage: "prod" }, { version: "v1.1.0", models: null }, "v1.1.0"), null);
+  assert.equal(await cmd.updateModelCheck(unit, { region: "us-west-2", stage: "prod" }, { version: "source" }, "source"), null);
+  assert.equal(unit.runner.commands.length, 0, "no AWS calls");
+  const v = cmd.modelCheckVerdict([{ model: "a", status: "fail" }, { model: "b", status: "fail" }], new Set(["a"]), true);
+  assert.equal(v.ok, false);
+  assert.deepEqual(v.blocking.map((x) => x.model), ["a"]);
+});

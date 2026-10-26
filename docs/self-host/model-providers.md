@@ -73,7 +73,7 @@ The deploy config's `models` settings are only the first-boot default. Once you 
 
 A new release can call a model your install hasn't used before. Each release publishes `models.json` with the models it calls and their Bedrock ids for every prefix. It is made from the code, so it can't miss one. It is listed in the release's signed `SHA256SUMS`, and your install only reads it through a small read-only build (`<prefix>-release-check`) that checks the signature first, exactly like an update does; a file that doesn't match is never used.
 
-Before the updater applies a release, automatically or with **Update now**, it makes one test call to each of those models (plus the ones your config names) through your current provider:
+Before a release is applied (automatically, with **Update now**, or with `update` from your machine), CoderHelm makes one test call to each of those models (plus the ones your config names) through your current provider:
 
 - **All answer:** the update goes ahead as usual.
 - **One is refused** (model access off, use case form missing, Marketplace terms not accepted or still processing, IAM, or the model isn't offered in your region): the update doesn't start. **Settings, System** and **Setup** show **Update to vX needs your action** with the model, the fix and the console link. Install admins get one email (and a post to `updates.webhookUrl` if set).

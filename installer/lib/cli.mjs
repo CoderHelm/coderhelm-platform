@@ -59,6 +59,8 @@ Options
   --require-signature (always on: a release whose signature can't be checked is refused)
   --auto-rollback     update: deploy the previous release again if health fails
   --result-file <f>   update: write {status, from, to, reason} to this file
+  --skip-model-check  update: go on when only a model the release doesn't call
+                      was refused (a model it calls can never be skipped)
   --skip-checks <ids> init: go on past these failed checks (comma-separated
                       ids, or "all"); without a terminal a failed check stops
   --verbose           Show full error details (they are always saved to a

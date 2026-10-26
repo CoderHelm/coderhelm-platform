@@ -5,6 +5,7 @@
 //   mcp-proxy.zip               the MCP proxy Lambda
 //   dashboard.tar.gz            the dashboard (static export, no API URL baked in)
 //   source.tar.gz               this repository at the tag (the CDK app)
+//   models.json                 the models the release calls (newer releases)
 //   SHA256SUMS                  checksums of all of the above
 //   SHA256SUMS.sigstore.json    cosign's keyless signature of SHA256SUMS,
 //                               made by this repository's release workflow
@@ -119,8 +120,10 @@ export async function fetchRelease(tag, { runner, fetchImpl = fetch, log = conso
   }
   // A release downloaded before is checked again: its files may have changed since.
   if (fs.existsSync(done)) {
-    verifySums(dir, parseSums(fs.readFileSync(path.join(dir, "SHA256SUMS"), "utf8")));
-    await verifySignature(paths, runner, { tag, log });
+    const sums = parseSums(fs.readFileSync(path.join(dir, "SHA256SUMS"), "utf8"));
+    verifySums(dir, sums);
+    const method = await verifySignature(paths, runner, { tag, log });
+    paths.models = await releaseModels(dir, sums, { runner, fetchImpl, tag, method, log });
     return paths;
   }
   fs.rmSync(dir, { recursive: true, force: true });
@@ -130,14 +133,51 @@ export async function fetchRelease(tag, { runner, fetchImpl = fetch, log = conso
     fs.writeFileSync(path.join(dir, n), await download(fetchImpl, tag, n));
   }
   // Checked before anything is unpacked or run.
-  verifySums(dir, parseSums(fs.readFileSync(path.join(dir, "SHA256SUMS"), "utf8")));
-  await verifySignature(paths, runner, { tag, log });
+  const sums = parseSums(fs.readFileSync(path.join(dir, "SHA256SUMS"), "utf8"));
+  verifySums(dir, sums);
+  const method = await verifySignature(paths, runner, { tag, log });
+  paths.models = await releaseModels(dir, sums, { runner, fetchImpl, tag, method, log });
   fs.mkdirSync(paths.source, { recursive: true });
   fs.mkdirSync(paths.dashboard, { recursive: true });
   await runner.run("tar", ["-xzf", path.join(dir, "source.tar.gz"), "-C", paths.source, "--strip-components=1"]);
   await runner.run("tar", ["-xzf", path.join(dir, "dashboard.tar.gz"), "-C", paths.dashboard]);
   fs.writeFileSync(done, new Date().toISOString());
   return paths;
+}
+
+export const MODELS = "models.json";
+
+/**
+ * The release's model manifest (models.json: the models it calls, with their
+ * Bedrock ids per inference profile prefix), read only after the signature
+ * check passed, only when the signed SHA256SUMS lists it, and only when it
+ * matches its checksum (verified with gh, it must carry its own build
+ * attestation too). null for a signed release that lists none (releases
+ * from before model manifests). Throws on any mismatch.
+ */
+export async function releaseModels(dir, sums, { runner, fetchImpl = fetch, tag, method, log = console.log }) {
+  if (!method) throw new Error("The release's signature wasn't checked: not reading its model list.");
+  if (!sums[MODELS]) return null;
+  const file = path.join(dir, MODELS);
+  if (!fs.existsSync(file)) {
+    log(`  downloading ${MODELS}`);
+    fs.writeFileSync(file, await download(fetchImpl, tag, MODELS));
+  }
+  verifySums(dir, sums, [MODELS]);
+  if (method === "attestation") {
+    const r = await runner.run("gh", attestationArgs(tag, file), { capture: true, allowFail: true });
+    if (r.code !== 0) throw new Error(`${MODELS} has no valid build attestation from ${SIGNER_WORKFLOW} on ${tag}: not using it.`);
+  }
+  let m;
+  try {
+    m = JSON.parse(fs.readFileSync(file, "utf8"));
+  } catch {
+    throw new Error(`${MODELS} of ${tag} isn't valid JSON.`);
+  }
+  if (!m || !Array.isArray(m.calls) || (m.version !== undefined && m.version !== tag)) {
+    throw new Error(`${MODELS} of ${tag} isn't a model list for this release.`);
+  }
+  return m;
 }
 
 export function releasePaths(dir) {

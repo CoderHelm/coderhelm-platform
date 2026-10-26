@@ -261,3 +261,57 @@ test("rollback: only to a release this install ran before", () => {
   assert.throws(() => checkRollbackTarget(state, "v1.4.0"), /not a release this install ran before/);
   assert.throws(() => checkRollbackTarget({ version: "v1.4.0" }, "v1.0.0"), /none recorded/);
 });
+
+// ── models.json: read only after the signature check ─────────────────────
+
+import { MODELS, releaseModels } from "../lib/release.mjs";
+
+const MANIFEST_BODY = Buffer.from(JSON.stringify({ schema: 1, version: TAG, calls: ["claude-opus-5-5"], bedrock: {} }));
+
+/** A release whose signed SHA256SUMS lists models.json. */
+function filesWithModels(body = MANIFEST_BODY) {
+  const files = releaseFiles();
+  files[MODELS] = body;
+  files.SHA256SUMS = Buffer.from(String(files.SHA256SUMS) + `${sha(MANIFEST_BODY)}  ${MODELS}\n`);
+  return files;
+}
+
+test("models.json is downloaded only after the signature verifies, and must match the signed checksum", async () => {
+  process.env.CODERHELM_HOME = tmpdir();
+  const runner = cosignOk();
+  const gh = fakeGithub(filesWithModels());
+  const paths = await fetchRelease(TAG, { runner, fetchImpl: gh.fetchImpl, log: () => {} });
+  assert.deepEqual(paths.models.calls, ["claude-opus-5-5"]);
+  const verifiedAt = runner.commands.findIndex((c) => c.args[0] === "verify-blob");
+  assert.ok(verifiedAt >= 0);
+  assert.equal(gh.asked.filter((u) => u.endsWith(`/${MODELS}`)).length, 1);
+
+  // Changed after signing: refused.
+  process.env.CODERHELM_HOME = tmpdir();
+  const swapped = fakeGithub(filesWithModels(Buffer.from(JSON.stringify({ schema: 1, version: TAG, calls: [] }))));
+  await assert.rejects(() => fetchRelease(TAG, { runner: cosignOk(), fetchImpl: swapped.fetchImpl, log: () => {} }), /models\.json does not match its checksum/);
+
+  // A signature that doesn't verify: models.json is never fetched.
+  process.env.CODERHELM_HOME = tmpdir();
+  const bad = new FakeRunner({ "cosign version": "v2.4.1", "cosign verify-blob": { code: 1, stderr: "no" } });
+  const gh2 = fakeGithub(filesWithModels());
+  await assert.rejects(() => fetchRelease(TAG, { runner: bad, fetchImpl: gh2.fetchImpl, log: () => {} }), /does not verify/);
+  assert.ok(!gh2.asked.some((u) => u.endsWith(`/${MODELS}`)));
+});
+
+test("models.json: a release that doesn't list it has none; with gh it needs its own attestation; never without a check", async () => {
+  process.env.CODERHELM_HOME = tmpdir();
+  const plain = await fetchRelease(TAG, { runner: cosignOk(), fetchImpl: fakeGithub(releaseFiles()).fetchImpl, log: () => {} });
+  assert.equal(plain.models, null);
+
+  const dir = tmpdir();
+  fs.writeFileSync(path.join(dir, MODELS), MANIFEST_BODY);
+  const sums = { [MODELS]: sha(MANIFEST_BODY) };
+  const noAttestation = new FakeRunner({ "gh attestation verify": { code: 1 } });
+  await assert.rejects(() => releaseModels(dir, sums, { runner: noAttestation, tag: TAG, method: "attestation", log: () => {} }), /no valid build attestation/);
+  const attested = new FakeRunner({ "gh attestation verify": "ok" });
+  assert.equal((await releaseModels(dir, sums, { runner: attested, tag: TAG, method: "attestation", log: () => {} })).version, TAG);
+  await assert.rejects(() => releaseModels(dir, sums, { runner: attested, tag: TAG, method: undefined, log: () => {} }), /signature wasn't checked/);
+  // Another release's list is refused.
+  await assert.rejects(() => releaseModels(dir, sums, { runner: attested, tag: "v9.9.9", method: "cosign", log: () => {} }), /isn't a model list for this release/);
+});
