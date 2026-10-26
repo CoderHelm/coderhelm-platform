@@ -6,13 +6,21 @@ order: 10
 
 ## What holds data
 
-| Where | What | Protection |
-|---|---|---|
-| DynamoDB tables `coderhelm-<stage>-*` | Teams, runs, settings, plans, usage, memories' metadata | Point-in-time recovery (35 days) on every table; deletion protection and retention while `retainData` is true |
-| S3 `coderhelm-<stage>-data-<account>` | Run artifacts, memory snapshots, images from tickets | Versioning (old versions kept 30 days); retained |
-| Secrets Manager `coderhelm/<stage>/secrets` | GitHub App keys, session signing key | Kept when stacks are deleted |
-| KMS keys | Encrypt the tables, the bucket and sealed credentials | Retained, yearly rotation |
-| Cognito user pool | Accounts and passwords | Retained while `retainData` is true |
+- **DynamoDB tables** `coderhelm-<stage>-*`\
+  *Holds:* Teams, runs, settings, plans, usage, memories' metadata.\
+  *Protection:* Point-in-time recovery (35 days) on every table; deletion protection and retention while `retainData` is true.
+- **S3** `coderhelm-<stage>-data-<account>`\
+  *Holds:* Run artifacts, memory snapshots, images from tickets.\
+  *Protection:* Versioning (old versions kept 30 days); retained.
+- **Secrets Manager** `coderhelm/<stage>/secrets`\
+  *Holds:* GitHub App keys, session signing key.\
+  *Protection:* Kept when stacks are deleted.
+- **KMS keys**\
+  *Holds:* The keys that encrypt the tables, the bucket and sealed credentials.\
+  *Protection:* Retained, yearly rotation.
+- **Cognito user pool**\
+  *Holds:* Accounts and passwords.\
+  *Protection:* Retained while `retainData` is true.
 
 Everything else (functions, queues, the dashboard bucket, logs) is rebuilt by a deploy.
 

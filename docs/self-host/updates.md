@@ -32,13 +32,16 @@ Turn them on in **Settings, then System**, at install (the install guide's **Mor
 npx -y github:CoderHelm/coderhelm-platform auto-update on --window "Sun 03:00" --timezone Europe/Berlin --channel stable --majors ask
 ```
 
-| Setting | Values | Default |
-|---|---|---|
-| Auto-update | on, off | off |
-| Window | a day (or `daily`) and an hour | Sun 03:00 |
-| Time zone | any IANA name | UTC |
-| Channel | `stable`, or `preview` for release candidates too | stable |
-| Majors | `ask`: a new major version waits for an admin; `auto`: it installs too | ask |
+- **Auto-update** *default off*\
+  On, off.
+- **Window** *default Sun 03:00*\
+  A day (or `daily`) and an hour.
+- **Time zone** *default UTC*\
+  Any IANA name.
+- **Channel** *default stable*\
+  `stable`, or `preview` for release candidates too.
+- **Majors** *default ask*\
+  `ask`: a new major version waits for an admin; `auto`: it installs too.
 
 The settings take effect at once (no deploy). The same values in `coderhelm.config.json` under `updates` are the starting point of a new install.
 

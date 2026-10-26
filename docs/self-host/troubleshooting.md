@@ -16,21 +16,32 @@ In the dashboard, **Settings, then Setup** runs the server-side checks live. Eve
 
 Each step checks what you did before it moves on. When a check fails, fix it and press **Enter** to check again; nothing restarts. Type **skip** to go on anyway (the doctor at the end lists it again) or **back** to change an answer. Without a terminal, the install stops with the same text: fix it and run the same command again (it picks up where it stopped), or pass `--skip-checks <id>`.
 
-| Check | Usual fix |
-|---|---|
-| **Signed in to AWS** | `aws sso login --profile <name>` (expired), or `aws configure sso` (no profile yet) |
-| **The right AWS account** | `export AWS_PROFILE=<profile for that account>` |
-| **AWS permissions for the install** | The missing actions are listed. Use a role with AdministratorAccess, or ask your AWS admin to allow them. If it says the permissions couldn't be checked, your role lacks `iam:SimulatePrincipalPolicy`: carry on if you have AdministratorAccess |
-| **Region has every service** | Pick a region the check doesn't flag (us-east-1, us-west-2, eu-west-1 and eu-central-1 have everything) |
-| **CDK set up** | `npx -y cdk bootstrap aws://<account>/<region>` (the installer offers to run it; with a domain outside us-east-1, us-east-1 too). If the `CDKToolkit` stack is in a failed state, delete it first |
-| **Route 53 zone** | Create the zone (`aws route53 create-hosted-zone --name <zone> --caller-reference <anything>`), or leave the hostname empty |
-| **Points at Route 53** | Set the NS records at your registrar to the four the check prints; it also shows what public DNS answers now. Changes can take up to an hour |
-| **TLS certificate issued** | Add the validation records the check prints, or request a certificate in us-east-1 for the exact hostname |
-| **Claude models enabled in Bedrock** | Open the Model access link the check prints and enable the models it names |
-| **Anthropic API key works** | 401: copy the key again. 403 or 404: the key's workspace can't use the model. "No credit": add credit in the Anthropic console |
-| **Email sender verified** | Add the three DKIM records the check prints at your DNS provider |
-| **Email can reach anyone** | A warning: request SES production access with the link the check prints |
-| **Slack or Teams webhook** | Create a new incoming webhook; the old one was removed |
+- **Signed in to AWS**\
+  `aws sso login --profile <name>` (expired), or `aws configure sso` (no profile yet).
+- **The right AWS account**\
+  `export AWS_PROFILE=<profile for that account>`.
+- **AWS permissions for the install**\
+  The missing actions are listed. Use a role with AdministratorAccess, or ask your AWS admin to allow them. If it says the permissions couldn't be checked, your role lacks `iam:SimulatePrincipalPolicy`: carry on if you have AdministratorAccess.
+- **Region has every service**\
+  Pick a region the check doesn't flag (us-east-1, us-west-2, eu-west-1 and eu-central-1 have everything).
+- **CDK set up**\
+  `npx -y cdk bootstrap aws://<account>/<region>` (the installer offers to run it; with a domain outside us-east-1, us-east-1 too). If the `CDKToolkit` stack is in a failed state, delete it first.
+- **Route 53 zone**\
+  Create the zone (`aws route53 create-hosted-zone --name <zone> --caller-reference <anything>`), or leave the hostname empty.
+- **Points at Route 53**\
+  Set the NS records at your registrar to the four the check prints; it also shows what public DNS answers now. Changes can take up to an hour.
+- **TLS certificate issued**\
+  Add the validation records the check prints, or request a certificate in us-east-1 for the exact hostname.
+- **Claude models enabled in Bedrock**\
+  Open the Model access link the check prints and enable the models it names.
+- **Anthropic API key works**\
+  401: copy the key again. 403 or 404: the key's workspace can't use the model. "No credit": add credit in the Anthropic console.
+- **Email sender verified**\
+  Add the three DKIM records the check prints at your DNS provider.
+- **Email can reach anyone**\
+  A warning: request SES production access with the link the check prints.
+- **Slack or Teams webhook**\
+  Create a new incoming webhook; the old one was removed.
 
 ## Installing
 

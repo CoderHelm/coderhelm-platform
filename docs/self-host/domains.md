@@ -74,23 +74,50 @@ Many providers add your domain to the name for you: if the form shows `.example.
 
 Settings, then Setup, Settings, then System, and the install guide check the domain from the outside: the records in public DNS (asked over DNS-over-HTTPS from the install), the certificate in ACM, and whether CoderHelm answers on `https://<hostname>` (the page and the API). Each result has one sentence and one fix:
 
-| Code | What it means | The fix |
-|---|---|---|
-| `none` | No domain: the AWS address | Optional: add one in Settings, then System |
-| `validating` | The certificate waits for its DNS record | Add the records; new records can take up to an hour to show up |
-| `zone_not_delegated` | The Route 53 zone is in the account, but public DNS uses other name servers | Set the name servers shown at your registrar (up to a day) |
-| `validation_wrong_value` | The certificate record exists with another value | Change its value to the one shown |
-| `caa_blocked` | Your domain's CAA records don't allow Amazon to issue certificates | Add `0 issue "amazon.com"` as a CAA record, then **Try again** |
-| `certificate_failed` | AWS couldn't issue the certificate | Check the records, then **Try again** (a new certificate) |
-| `attaching` | The certificate is issued; CoderHelm is moving to the domain | Nothing: about 10 minutes |
-| `attach_failed` | The redeploy failed (most often: the hostname is on another CloudFront distribution) | Remove it there, then **Try again**; the update history has the log |
-| `dns_missing` | The address record isn't there yet | Add it; it can take up to an hour |
-| `dns_wrong_value` | The hostname points somewhere else | Change the value to the CloudFront address |
-| `cname_at_apex` | The hostname is the root of the domain, where a `CNAME` isn't allowed | Use a subdomain, or an ALIAS, ANAME or flattened CNAME if your provider has one |
-| `https_failed` | Something answers, but not CoderHelm over HTTPS | Point the record at CloudFront with no proxy in front |
-| `api_unreachable` | The page loads but the API doesn't answer on the domain | Run the doctor |
-| `removing` | Moving back to the AWS address | Nothing: about 10 minutes |
-| `ok` | CoderHelm answers on the domain with its certificate | |
+- **`none`**\
+  No domain: the AWS address.\
+  *Fix:* Optional: add one in Settings, then System.
+- **`validating`**\
+  The certificate waits for its DNS record.\
+  *Fix:* Add the records; new records can take up to an hour to show up.
+- **`zone_not_delegated`**\
+  The Route 53 zone is in the account, but public DNS uses other name servers.\
+  *Fix:* Set the name servers shown at your registrar (up to a day).
+- **`validation_wrong_value`**\
+  The certificate record exists with another value.\
+  *Fix:* Change its value to the one shown.
+- **`caa_blocked`**\
+  Your domain's CAA records don't allow Amazon to issue certificates.\
+  *Fix:* Add `0 issue "amazon.com"` as a CAA record, then **Try again**.
+- **`certificate_failed`**\
+  AWS couldn't issue the certificate.\
+  *Fix:* Check the records, then **Try again** (a new certificate).
+- **`attaching`**\
+  The certificate is issued; CoderHelm is moving to the domain.\
+  *Fix:* Nothing: about 10 minutes.
+- **`attach_failed`**\
+  The redeploy failed (most often: the hostname is on another CloudFront distribution).\
+  *Fix:* Remove it there, then **Try again**; the update history has the log.
+- **`dns_missing`**\
+  The address record isn't there yet.\
+  *Fix:* Add it; it can take up to an hour.
+- **`dns_wrong_value`**\
+  The hostname points somewhere else.\
+  *Fix:* Change the value to the CloudFront address.
+- **`cname_at_apex`**\
+  The hostname is the root of the domain, where a `CNAME` isn't allowed.\
+  *Fix:* Use a subdomain, or an ALIAS, ANAME or flattened CNAME if your provider has one.
+- **`https_failed`**\
+  Something answers, but not CoderHelm over HTTPS.\
+  *Fix:* Point the record at CloudFront with no proxy in front.
+- **`api_unreachable`**\
+  The page loads but the API doesn't answer on the domain.\
+  *Fix:* Run the doctor.
+- **`removing`**\
+  Moving back to the AWS address.\
+  *Fix:* Nothing: about 10 minutes.
+- **`ok`**\
+  CoderHelm answers on the domain with its certificate.
 
 ## After the move
 
