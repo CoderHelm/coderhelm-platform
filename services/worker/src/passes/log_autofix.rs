@@ -7,6 +7,11 @@
 //! team's token limit, the daily cap). A finding that doesn't start records
 //! why ("daily cap reached", "already fixing", ...), and the Logs page shows
 //! it. Off by default: nothing runs for a team that never turned it on.
+//!
+//! A log group with no saved repo has its repo worked out
+//! ([`common::log_repo`]): a high-confidence answer starts the run there;
+//! anything less records the best guess, posts a "which repo?" message
+//! where the team's findings post, and leaves the start to a person.
 
 use chrono::{DateTime, Utc};
 use common::log_findings::{self as lf, AutoFix, Finding, Skip, Start, StartEnv, Starter};
@@ -160,6 +165,152 @@ async fn samples(state: &WorkerState, team_id: &str, f: &Finding) -> Vec<String>
         .collect()
 }
 
+/// The resolver's model call, metered on the team's client as log analysis.
+struct WorkerJudge {
+    provider: crate::agent::provider::ModelProvider,
+    model: String,
+}
+
+#[async_trait::async_trait]
+impl common::log_repo::live::Judge for WorkerJudge {
+    async fn judge(&self, system: &str, user: &str) -> Result<String, String> {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "repo": {"type": ["string", "null"]},
+                "confidence": {"type": "string", "enum": ["high", "medium", "low"]},
+                "reason": {"type": "string"},
+                "evidence": {"type": "array", "items": {"type": "string"}},
+                "candidates": {"type": "array", "items": {"type": "object", "properties": {
+                    "repo": {"type": "string"}, "reason": {"type": "string"}
+                }, "required": ["repo", "reason"], "additionalProperties": false}}
+            },
+            "required": ["repo", "confidence", "reason", "evidence", "candidates"],
+            "additionalProperties": false
+        });
+        let mut usage = crate::models::TokenUsage::default();
+        let v = common::usage::with_feature(
+            common::usage::feature::LOG_ANALYSIS,
+            crate::agent::anthropic::converse_json(
+                &self.provider.client(),
+                &self.model,
+                system,
+                user,
+                &schema,
+                true,
+                "low",
+                1024,
+                &mut usage,
+            ),
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+        Ok(v.to_string())
+    }
+}
+
+/// The repo for a finding with no saved one.
+async fn resolve_repo(
+    state: &WorkerState,
+    team_id: &str,
+    f: &Finding,
+    cfg: &AutoFix,
+    findings: &[Finding],
+) -> common::log_repo::Resolution {
+    let provider = crate::agent::provider::ModelProvider::load_for_team(
+        &state.dynamo,
+        &state.config.settings_table_name,
+        team_id,
+    )
+    .await;
+    let token = match super::review_reminder::team_installation_id(state, team_id)
+        .await
+        .filter(|id| *id > 0)
+    {
+        Some(id) => match crate::clients::github::GitHubClient::new(
+            &state.secrets.github_app_id,
+            &state.secrets.github_private_key,
+            id,
+            &state.http,
+        ) {
+            Ok(gh) => gh.installation_token().await.ok(),
+            Err(_) => None,
+        },
+        None => None,
+    };
+    let http = common::mcp_remote::http::GuardedHttps;
+    let host = token.map(|t| common::repo_read::GitHubHost {
+        http: &http,
+        auth: format!("Bearer {t}"),
+    });
+    let team = common::log_repo::live::Team {
+        dynamo: &state.dynamo,
+        sts: &state.sts,
+        settings_table: &state.config.settings_table_name,
+        repos_table: &state.config.repos_table_name,
+        runs_table: &state.config.runs_table_name,
+        insights_table: &state.config.aws_insights_table_name,
+        team_id,
+    };
+    let host_ref = host.as_ref().map(|h| h as &dyn common::repo_read::RepoHost);
+    match provider {
+        Ok(provider) => {
+            let judge = WorkerJudge {
+                model: provider.primary_model_id().to_string(),
+                provider,
+            };
+            common::log_repo::live::for_finding(&team, host_ref, &judge, f, cfg, findings, false)
+                .await
+        }
+        Err(e) => {
+            warn!(team_id, error = %e, "No model provider to work out the repo");
+            struct NoModel;
+            #[async_trait::async_trait]
+            impl common::log_repo::live::Judge for NoModel {
+                async fn judge(&self, _: &str, _: &str) -> Result<String, String> {
+                    Err("no model provider".into())
+                }
+            }
+            common::log_repo::live::for_finding(&team, host_ref, &NoModel, f, cfg, findings, false)
+                .await
+        }
+    }
+}
+
+/// Ask a person to check the repo (where the team's findings post).
+async fn ask_for_repo(
+    state: &WorkerState,
+    team_id: &str,
+    f: &Finding,
+    r: &common::log_repo::Resolution,
+) {
+    let cipher = common::mcp_credentials::Kms {
+        client: &state.kms,
+        key_id: "",
+    };
+    let channels = lf::channels(
+        &state.dynamo,
+        &cipher,
+        &state.config.settings_table_name,
+        team_id,
+    )
+    .await;
+    if channels.is_empty() {
+        return;
+    }
+    let base = super::skills::app_url(&state.config.stage);
+    let url = format!("{base}/logs?finding={}", f.rec_id);
+    let candidates: Vec<String> = r.candidates.iter().map(|c| c.repo.clone()).collect();
+    let msg = lf::repo_check_message(f, r.repo.as_deref(), &r.reason, &candidates, &url);
+    common::notify::deliver(
+        &common::notify::Http(&state.http),
+        &channels,
+        &msg,
+        "log_fix_repo",
+    )
+    .await;
+}
+
 async fn sweep_team(state: &WorkerState, team_id: &str, cfg: &AutoFix, report: &mut Report) {
     let mut findings = match lf::list_findings(
         &state.dynamo,
@@ -178,7 +329,24 @@ async fn sweep_team(state: &WorkerState, team_id: &str, cfg: &AutoFix, report: &
     order(&mut findings);
     for f in &findings {
         let now = Utc::now();
-        let outcome = match lf::screen(cfg, f, now) {
+        let screened = match lf::screen(cfg, f, now) {
+            Ok(Some(repo)) => Ok(repo),
+            Ok(None) => {
+                let r = resolve_repo(state, team_id, f, cfg, &findings).await;
+                match r.repo.clone() {
+                    Some(repo) if r.is_sure() => {
+                        info!(team_id, rec_id = %f.rec_id, repo = %repo, reason = %r.reason, "Repo worked out for an automatic fix");
+                        Ok(repo)
+                    }
+                    guess => {
+                        ask_for_repo(state, team_id, f, &r).await;
+                        Err(Skip::RepoUnsure(guess.unwrap_or_default()))
+                    }
+                }
+            }
+            Err(skip) => Err(skip),
+        };
+        let outcome = match screened {
             Ok(repo) => {
                 let lines = samples(state, team_id, f).await;
                 let env = WorkerEnv {

@@ -386,7 +386,7 @@ pub const STATUSES: &[&str] = &["new", "acknowledged", "fixing", "fixed", "ignor
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum Scope {
-    /// Every log group with a repo.
+    /// Every log group whose repo is saved or found with high confidence.
     #[default]
     All,
     /// Only log groups turned on below.
@@ -563,6 +563,9 @@ pub enum Skip {
     NotIncluded,
     BelowSeverity,
     NoRepo,
+    /// The repo was worked out but not with high confidence: a person
+    /// checks it. Carries the best guess (empty when none).
+    RepoUnsure(String),
     /// Tried again after the quiet hours.
     QuietHours,
     AlreadyFixing,
@@ -583,6 +586,12 @@ impl Skip {
             Skip::NotIncluded => "log group not included".into(),
             Skip::BelowSeverity => "below the minimum severity".into(),
             Skip::NoRepo => "no repo mapped to this log group".into(),
+            Skip::RepoUnsure(guess) if guess.is_empty() => {
+                "couldn't tell which repo this log group's code is in; choose one".into()
+            }
+            Skip::RepoUnsure(guess) => {
+                format!("not sure the repo is {guess}; check it and start the fix")
+            }
             Skip::QuietHours => "waiting for quiet hours to end".into(),
             Skip::AlreadyFixing => "already fixing".into(),
             Skip::DailyCap => "daily cap reached".into(),
@@ -608,8 +617,9 @@ impl Skip {
 }
 
 /// Pure: the checks that need nothing but the setting, the finding and the
-/// time. `Ok` carries the repo the run goes to.
-pub fn screen(cfg: &AutoFix, f: &Finding, now: DateTime<Utc>) -> Result<String, Skip> {
+/// time. `Ok` carries the repo saved for the log group, or `None` when the
+/// repo has to be worked out ([`crate::log_repo`]).
+pub fn screen(cfg: &AutoFix, f: &Finding, now: DateTime<Utc>) -> Result<Option<String>, Skip> {
     if !cfg.enabled {
         return Err(Skip::Disabled);
     }
@@ -630,13 +640,10 @@ pub fn screen(cfg: &AutoFix, f: &Finding, now: DateTime<Utc>) -> Result<String, 
     if f.severity < p.min_severity {
         return Err(Skip::BelowSeverity);
     }
-    let Some(repo) = p.repo else {
-        return Err(Skip::NoRepo);
-    };
     if cfg.quiet_hours.is_some_and(|q| q.contains(now.hour())) {
         return Err(Skip::QuietHours);
     }
-    Ok(repo)
+    Ok(p.repo)
 }
 
 /// Who started a fix.
@@ -1237,6 +1244,58 @@ pub async fn channels(
     }
 }
 
+/// Pure: the message when an automatic fix waits for a person to check the
+/// repo it would go to.
+pub fn repo_check_message(
+    f: &Finding,
+    guess: Option<&str>,
+    reason: &str,
+    candidates: &[String],
+    finding_url: &str,
+) -> Message {
+    let title = "🔎 Which repo should this fix go to?".to_string();
+    let mut facts = vec![(
+        "Log group".to_string(),
+        crate::truncate_str(&f.source_log_group, 200).to_string(),
+    )];
+    if let Some(g) = guess {
+        facts.push(("Best guess".into(), g.to_string()));
+    }
+    if candidates.len() > 1 {
+        facts.push(("Also possible".into(), candidates[1..].join(", ")));
+    }
+    if !reason.is_empty() {
+        facts.push(("Why".into(), crate::truncate_str(reason, 300).to_string()));
+    }
+    let mut buttons = Vec::new();
+    if !finding_url.is_empty() {
+        buttons.push(Button::new("Check and start the fix", finding_url));
+    }
+    Message {
+        summary: format!("{title} {}", crate::truncate_str(&f.title, 200)),
+        blocks: vec![
+            Block::Banner {
+                text: title,
+                tone: Tone::Accent,
+                size: Size::Medium,
+            },
+            Block::Text(
+                Text::new(format!(
+                    "An automatic fix for \"{}\" didn't start: CoderHelm isn't sure which repo the code is in.",
+                    crate::truncate_str(f.title.trim(), 200).replace('\n', " ")
+                ))
+                .spacing(Spacing::Small),
+            ),
+            Block::Facts {
+                facts,
+                spacing: Spacing::Default,
+            },
+        ],
+        buttons,
+        full_width: true,
+    }
+}
+
 /// Pure: the message when a fix run opens its pull request.
 pub fn fix_message(
     t: &TicketRecord,
@@ -1355,6 +1414,18 @@ pub fn pattern_literal(pattern: &str) -> Option<String> {
 pub struct Sample {
     pub timestamp: String,
     pub message: String,
+    /// The log group the line was read from (`@log`, without the account).
+    pub log_group: String,
+}
+
+/// Pure: the log group in an Insights `@log` value (`<account>:<group>`).
+pub fn log_of(v: &str) -> String {
+    match v.split_once(':') {
+        Some((acct, g)) if acct.len() == 12 && acct.bytes().all(|b| b.is_ascii_digit()) => {
+            g.to_string()
+        }
+        _ => v.to_string(),
+    }
 }
 
 /// Most sample lines shown.
@@ -1376,7 +1447,7 @@ pub async fn fetch_samples(
         None => "filter @message like /(?i)(error|exception|fatal|panic|traceback)/".to_string(),
     };
     let query = format!(
-        "fields @timestamp, @message | {filter} | sort @timestamp desc | limit {MAX_SAMPLES}"
+        "fields @timestamp, @message, @log | {filter} | sort @timestamp desc | limit {MAX_SAMPLES}"
     );
     let end = Utc::now().timestamp();
     let q = client
@@ -1416,6 +1487,7 @@ pub async fn fetch_samples(
                         Sample {
                             timestamp: get("@timestamp"),
                             message: scrub(crate::truncate_str(get("@message").trim(), 2_000)),
+                            log_group: log_of(&get("@log")),
                         }
                     })
                     .collect())
@@ -1761,26 +1833,33 @@ mod tests {
     #[test]
     fn severity_floor_scope_and_repo_decide_what_starts() {
         let now = t("2026-10-21T10:00:00Z");
-        assert_eq!(screen(&cfg(), &finding(), now), Ok("acme/shop".into()));
+        assert_eq!(
+            screen(&cfg(), &finding(), now),
+            Ok(Some("acme/shop".into()))
+        );
 
         let mut f = finding();
         f.severity = Severity::Warning;
         assert_eq!(screen(&cfg(), &f, now), Err(Skip::BelowSeverity));
         let mut c = cfg();
         c.min_severity = Severity::Warning;
-        assert_eq!(screen(&c, &f, now), Ok("acme/shop".into()));
+        assert_eq!(screen(&c, &f, now), Ok(Some("acme/shop".into())));
         // A group's own floor wins over the team's.
         c.overrides[0].min_severity = Some(Severity::Critical);
         assert_eq!(screen(&c, &f, now), Err(Skip::BelowSeverity));
 
         let mut other = finding();
         other.source_log_group = "/aws/lambda/unmapped".into();
-        assert_eq!(screen(&cfg(), &other, now), Err(Skip::NoRepo));
+        // No saved repo: worked out by the resolver, not refused here.
+        assert_eq!(screen(&cfg(), &other, now), Ok(None));
         let mut listed = cfg();
         listed.scope = Scope::Listed;
         assert_eq!(screen(&listed, &finding(), now), Err(Skip::NotIncluded));
         listed.overrides[0].auto = Some(true);
-        assert_eq!(screen(&listed, &finding(), now), Ok("acme/shop".into()));
+        assert_eq!(
+            screen(&listed, &finding(), now),
+            Ok(Some("acme/shop".into()))
+        );
         let mut off = cfg();
         off.overrides[0].auto = Some(false);
         assert_eq!(screen(&off, &finding(), now), Err(Skip::NotIncluded));
