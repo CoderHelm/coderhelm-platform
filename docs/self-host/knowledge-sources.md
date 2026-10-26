@@ -9,11 +9,13 @@ Teams add connected apps to a knowledge base from the **Knowledge** page. Sign-i
 | Source | Works without setup | One-click sign-in needs | Instant updates need |
 |---|---|---|---|
 | Sanity | yes: people sign in with their own Sanity account | nothing (Sanity's remote MCP server registers CoderHelm by itself) | an API token instead of a sign-in (see below) |
-| Notion | yes, with a Notion integration token saved on the Integrations page | a Notion public integration | a Notion webhook subscription |
-| Confluence | yes, with the Confluence email and API token saved on the Integrations page | an Atlassian OAuth 2.0 (3LO) app | nothing more (synced every hour) |
+| Notion | yes, with a token from a Notion internal connection, pasted in the add flow or on the Integrations page | a Notion public connection (OAuth) | a Notion webhook subscription |
+| Confluence | yes, with an Atlassian API token, email and site, pasted in the add flow or on the Integrations page | an Atlassian OAuth 2.0 (3LO) app | nothing more (synced every hour) |
 | Google Drive | no | a Google OAuth client | nothing more (synced every hour) |
 | GitHub | yes, through your GitHub App | not used | nothing: pushes arrive through the GitHub App's webhook |
 | Website | yes | not used | not used (synced every hour) |
+
+The **Sign-in apps** section of the platform admin page (`/admin`) shows which of the three apps your install has, the redirect URI to register and the key names below. It never shows a client secret.
 
 All the settings below are optional keys in your deployment's secret, `coderhelm/<stage>/secrets` (the same JSON that holds `github_app_id`). Add them, then redeploy or wait for the gateway to start a new instance. Leave a key out to keep that source on its saved token.
 
@@ -36,6 +38,16 @@ The token path stays as the second choice in the add flow ("Use an API token ins
 
 Notion (`mcp.notion.com`) and Atlassian (`mcp.atlassian.com`) also run remote MCP servers with dynamic registration, but their tools can't keep a knowledge base in sync yet: Notion's can't list a page's children or give an edit time without reading each whole page, and cuts long pages short; Atlassian's doesn't publish its tools' arguments or answers. Their sources keep using the OAuth apps below, or the keys saved on the Integrations page. Agents can still use both servers through Connected apps.
 
+## Without a sign-in app: tokens in the add flow
+
+When an app isn't set up, the add flow says so and offers the token path in the same dialog, so nobody is sent elsewhere:
+
+- **Notion.** A short how-to (create an internal connection at <https://www.notion.so/profile/integrations>, tick **Read content** only, share pages with **•••**, **Connections**, **+ Add connection**), then a field for the token. CoderHelm checks the token with one Notion search before saving it, and saves it exactly as the Integrations page does (the `notion` entry, sealed with your KMS key). A token Notion refuses is never saved; one that sees no pages yet is saved, and the flow says how to share pages.
+- **Confluence.** The Confluence address, the Atlassian account email and an API token from <https://id.atlassian.com/manage-profile/security/api-tokens>. They go through the Integrations page's own save, which signs in once and records the result; a refused token isn't counted as connected.
+- **Google Drive.** There is no token path: Drive connects only through Google sign-in, and the dialog says so.
+
+Only admins and owners save tokens (the `integrations` capability). Anyone else who can add knowledge sees "Ask an admin to connect Notion". The request is `POST /api/knowledge/connectors/{kind}/token` with `{ "token" }` (Notion) or `{ "token", "site", "email" }` (Confluence).
+
 ## The sign-in address
 
 Every provider sends people back to the dashboard's sign-in page, the same one remote MCP servers use:
@@ -44,14 +56,15 @@ Every provider sends people back to the dashboard's sign-in page, the same one r
 https://<your dashboard URL>/settings/integrations/mcp-callback/
 ```
 
-Register exactly this address (with the trailing slash) as the redirect URI in each app below.
+Register exactly this address (with the trailing slash) as the redirect URI in each app below. On the hosted service it is `https://app.coderhelm.com/settings/integrations/mcp-callback/`, and the secret is `coderhelm/prod/secrets` in Secrets Manager (the gateway reads `SECRETS_NAME`, which the deploy sets to `coderhelm/<stage>/secrets`, or `<prefix>/secrets` for a custom prefix).
 
 ## Notion
 
-1. Open <https://www.notion.so/profile/integrations> and create a **Public** integration.
-2. Capabilities: **Read content** only. No insert, update or comment capabilities are needed.
-3. Redirect URI: the sign-in address above.
-4. Add to the secret:
+1. Open <https://www.notion.so/profile/integrations> (Notion's developer page, now called connections) and create a **Public** connection (older workspaces: a new integration of type **Public**). Notion asks for a company name, website, privacy policy and terms URLs.
+2. Capabilities: **Read content** only. No insert, update or comment capabilities, and no user information, are needed.
+3. Redirect URI: the sign-in address above. CoderHelm asks for no scopes (Notion has none); it sends `owner=user`, so each person picks pages on Notion's own consent screen.
+4. Copy the **OAuth client ID** and **OAuth client secret** from the Configuration tab.
+5. Add to the secret:
 
 ```json
 { "notion_client_id": "<OAuth client ID>", "notion_client_secret": "<OAuth client secret>" }

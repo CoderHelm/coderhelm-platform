@@ -122,6 +122,85 @@ pub(crate) async fn load_credentials(
     mcp_credentials::load(&kms, team_id, plugin_id, &stored).await
 }
 
+/// Why saved credentials weren't stored.
+#[derive(Debug)]
+pub(crate) enum StoreError {
+    TooLong,
+    Failed(String),
+}
+
+/// Turns a catalog plugin on for a team when it isn't yet (what the
+/// Integrations page's Enable does), keeping a record that is already there.
+pub(crate) async fn enable_if_missing(
+    state: &AppState,
+    team_id: &str,
+    plugin_id: &str,
+) -> Result<(), String> {
+    let now = chrono::Utc::now().to_rfc3339();
+    match state
+        .dynamo
+        .put_item()
+        .table_name(mcp_table(state))
+        .item("pk", attr_s(team_id))
+        .item("sk", attr_s(&format!("PLUGIN#{plugin_id}")))
+        .item("enabled", AttributeValue::Bool(true))
+        .item("has_credentials", AttributeValue::Bool(false))
+        .item("enabled_at", attr_s(&now))
+        .condition_expression("attribute_not_exists(pk)")
+        .send()
+        .await
+    {
+        Ok(_) => Ok(()),
+        Err(e)
+            if e.as_service_error()
+                .is_some_and(|s| s.is_conditional_check_failed_exception()) =>
+        {
+            Ok(())
+        }
+        Err(e) => Err(format!("enable plugin: {e}")),
+    }
+}
+
+/// Seals `creds` for one team and plugin and stores them on its record (which
+/// must exist). The one way credentials are saved: the Integrations page and
+/// the Knowledge add flow both come here. Never logs a value.
+pub(crate) async fn store_credentials(
+    state: &AppState,
+    team_id: &str,
+    plugin_id: &str,
+    creds: &Credentials,
+) -> Result<(), StoreError> {
+    let sealed = mcp_credentials::seal(&cipher(state), team_id, plugin_id, creds)
+        .await
+        .map_err(|e| {
+            if e.contains("too long") {
+                StoreError::TooLong
+            } else {
+                StoreError::Failed(e)
+            }
+        })?;
+    let now = chrono::Utc::now().to_rfc3339();
+    state
+        .dynamo
+        .update_item()
+        .table_name(mcp_table(state))
+        .key("pk", attr_s(team_id))
+        .key("sk", attr_s(&format!("PLUGIN#{plugin_id}")))
+        .update_expression(
+            "SET #sealed = :creds, has_credentials = :hc, credentials_updated_at = :ts REMOVE #plain",
+        )
+        .expression_attribute_names("#sealed", mcp_credentials::SEALED_ATTR)
+        .expression_attribute_names("#plain", mcp_credentials::PLAIN_ATTR)
+        .expression_attribute_values(":creds", attr_s(&sealed))
+        .expression_attribute_values(":hc", AttributeValue::Bool(true))
+        .expression_attribute_values(":ts", attr_s(&now))
+        .condition_expression("attribute_exists(pk)")
+        .send()
+        .await
+        .map_err(|e| StoreError::Failed(format!("update credentials: {e}")))?;
+    Ok(())
+}
+
 /// GET /api/plugins/catalog — return all available plugins.
 pub async fn list_catalog() -> Json<Value> {
     Json(json!({ "plugins": CATALOG }))
@@ -294,41 +373,16 @@ pub async fn update_credentials(
                 .map(|v| (f.key.to_string(), v.to_string()))
         })
         .collect();
-    let sealed =
-        match mcp_credentials::seal(&cipher(&state), &claims.team_id, &plugin_id, &creds).await {
-            Ok(s) => s,
-            Err(e) if e.contains("too long") => {
-                return Ok(Json(json!({ "error": "Credentials are too long" })));
-            }
-            Err(e) => {
-                error!(plugin = %plugin_id, "Failed to seal credentials: {e}");
-                return Err(StatusCode::INTERNAL_SERVER_ERROR);
-            }
-        };
-
-    let now = chrono::Utc::now().to_rfc3339();
-
-    state
-        .dynamo
-        .update_item()
-        .table_name(mcp_table(&state))
-        .key("pk", attr_s(&claims.team_id))
-        .key("sk", attr_s(&format!("PLUGIN#{plugin_id}")))
-        .update_expression(
-            "SET #sealed = :creds, has_credentials = :hc, credentials_updated_at = :ts REMOVE #plain",
-        )
-        .expression_attribute_names("#sealed", mcp_credentials::SEALED_ATTR)
-        .expression_attribute_names("#plain", mcp_credentials::PLAIN_ATTR)
-        .expression_attribute_values(":creds", attr_s(&sealed))
-        .expression_attribute_values(":hc", AttributeValue::Bool(true))
-        .expression_attribute_values(":ts", attr_s(&now))
-        .condition_expression("attribute_exists(pk)")
-        .send()
-        .await
-        .map_err(|e| {
-            error!("Failed to update credentials for {plugin_id}: {e}");
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
+    match store_credentials(&state, &claims.team_id, &plugin_id, &creds).await {
+        Ok(()) => {}
+        Err(StoreError::TooLong) => {
+            return Ok(Json(json!({ "error": "Credentials are too long" })));
+        }
+        Err(StoreError::Failed(e)) => {
+            error!(plugin = %plugin_id, "Failed to save credentials: {e}");
+            return Err(StatusCode::INTERNAL_SERVER_ERROR);
+        }
+    }
 
     info!(team = %claims.team_id, plugin = %plugin_id, "Plugin credentials updated");
     Ok(Json(json!({ "status": "saved" })))
