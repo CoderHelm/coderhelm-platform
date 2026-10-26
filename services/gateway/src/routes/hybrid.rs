@@ -2150,7 +2150,11 @@ fn hosted_team(install: &str) -> String {
 /// authorize link is public, so whoever follows it could otherwise put their
 /// own provider account (or nothing) in place of the install's.
 pub fn signin_team(install: &str, flow: &str) -> String {
-    format!("{}#SIGNIN#{flow}", relay::install_pk(install))
+    format!(
+        "{}{}{flow}",
+        relay::install_pk(install),
+        common::mcp_remote::store::HOLDING_MARKER
+    )
 }
 
 /// A flow id: what [`signin_team`] is keyed by.
@@ -2993,6 +2997,9 @@ mod tests {
         let hold = signin_team(id, &flow);
         assert_ne!(hold, hosted_team(id));
         assert!(hold.starts_with(&format!("{}#SIGNIN#fl_", hosted_team(id))));
+        // Its records expire by themselves if the install never takes them.
+        assert!(common::mcp_remote::store::holding_expiry(&hold, 0).is_some());
+        assert!(common::mcp_remote::store::holding_expiry(&hosted_team(id), 0).is_none());
         assert!(!is_flow(""));
         assert!(!is_flow("fl_short"));
         assert!(!is_flow(&format!("fl_{}#x", "a".repeat(38))));

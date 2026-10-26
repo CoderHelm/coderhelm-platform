@@ -359,6 +359,7 @@ impl ServerRecord {
 
     pub fn to_item(&self, team: &str) -> Item {
         let mut i = Item::new();
+        add_holding_ttl(&mut i, team);
         i.insert("pk".into(), av(team));
         i.insert("sk".into(), av(self.sk()));
         i.insert("name".into(), av(&self.name));
@@ -525,9 +526,31 @@ pub fn token_sk(server_id: &str, owner: &Owner) -> String {
     format!("{TOKEN_PREFIX}{server_id}#{}", owner.key())
 }
 
+/// Marks a holding partition: a team key with this in it holds one sign-in
+/// that isn't anyone's yet (the hosted hybrid broker finishes a provider
+/// sign-in there and moves it to the install only when the install redeems
+/// the code). Its server and token records expire on their own.
+pub const HOLDING_MARKER: &str = "#SIGNIN#";
+
+/// How long a holding partition's records live when nobody takes them.
+pub const HOLDING_TTL_SECS: i64 = 24 * 3600;
+
+/// When a record in `team` expires: only in a holding partition.
+pub fn holding_expiry(team: &str, now: i64) -> Option<i64> {
+    team.contains(HOLDING_MARKER)
+        .then_some(now + HOLDING_TTL_SECS)
+}
+
+fn add_holding_ttl(i: &mut Item, team: &str) {
+    if let Some(t) = holding_expiry(team, chrono::Utc::now().timestamp()) {
+        i.insert("ttl".into(), num(t));
+    }
+}
+
 impl TokenRecord {
     pub fn to_item(&self, team: &str, server_id: &str) -> Item {
         let mut i = Item::new();
+        add_holding_ttl(&mut i, team);
         i.insert("pk".into(), av(team));
         i.insert("sk".into(), av(token_sk(server_id, &self.owner)));
         i.insert("token_sealed".into(), av(&self.sealed));
@@ -1261,6 +1284,37 @@ pub mod fake {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A holding partition's sign-in that nobody takes is gone within a
+    /// day; every other team's records never expire.
+    #[test]
+    fn holding_partitions_expire_and_nothing_else_does() {
+        let now = chrono::Utc::now().timestamp();
+        let hold = "HYBRID#ins_abcdefghijklmnopqrstuvwx#SIGNIN#fl_x";
+        let s = ServerRecord::new("docs", "Docs", "https://mcp.example.com/mcp");
+        let t = TokenRecord {
+            owner: Owner::Team,
+            sealed: "x".into(),
+            expires_at: None,
+            scope: String::new(),
+            version: 1,
+            status: Status::Connected,
+            status_reason: String::new(),
+            step_up: vec![],
+            connected_by: String::new(),
+            connected_at: String::new(),
+        };
+        for item in [s.to_item(hold), t.to_item(hold, "docs")] {
+            let ttl: i64 = item["ttl"].as_n().unwrap().parse().unwrap();
+            assert!(ttl >= now + HOLDING_TTL_SECS && ttl <= now + HOLDING_TTL_SECS + 60);
+        }
+        for team in ["TEAM#a", "HYBRID#ins_abcdefghijklmnopqrstuvwx"] {
+            assert!(!s.to_item(team).contains_key("ttl"), "{team}");
+            assert!(!t.to_item(team, "docs").contains_key("ttl"), "{team}");
+        }
+        assert_eq!(holding_expiry("TEAM#a", 10), None);
+        assert_eq!(holding_expiry(hold, 10), Some(10 + HOLDING_TTL_SECS));
+    }
 
     fn sample() -> ServerRecord {
         let mut s = ServerRecord::new("docs", "Docs", "https://mcp.example.com/mcp");
