@@ -701,6 +701,19 @@ mod tests {
         let run_id = &doc["components"]["schemas"]["RunSummary"]["properties"]["run_id"];
         assert!(run_id.get("example").is_none());
         assert_eq!(run_id["examples"][0], "01JB8X6F4M2C9QZ3T7V5W1K0HA");
+        // A run in full always says which run it is (the dashboard shows and
+        // copies it).
+        let run = &doc["components"]["schemas"]["Run"];
+        assert_eq!(
+            run["properties"]["run_id"]["examples"][0],
+            "01JB8X6F4M2C9QZ3T7V5W1K0HA"
+        );
+        assert!(
+            run["required"]
+                .as_array()
+                .is_some_and(|r| r.iter().any(|f| f == "run_id")),
+            "Run.run_id must be required"
+        );
         // Key routes carry the rate-limit headers and the error responses.
         let runs = &doc["paths"]["/api/runs"]["get"]["responses"];
         assert!(runs["200"]["headers"]["RateLimit-Remaining"].is_object());

@@ -2055,6 +2055,13 @@
               "null"
             ]
           },
+          "run_id": {
+            "description": "The run's id, a ULID: the same id as in the path.",
+            "examples": [
+              "01JB8X6F4M2C9QZ3T7V5W1K0HA"
+            ],
+            "type": "string"
+          },
           "sign_in_prompts": {
             "description": "Sign-in prompts the run raised: connections it could have used that\nits person hadn't made (or the team hadn't set up).",
             "examples": [
@@ -2135,6 +2142,7 @@
           }
         },
         "required": [
+          "run_id",
           "tokens_in",
           "tokens_out",
           "cache_read_tokens",
