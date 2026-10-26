@@ -10,6 +10,8 @@ CoderHelm runs entirely on AWS serverless services: Lambda, API Gateway, SQS, Dy
 
 **The fastest way:** the [install guide](https://docs.coderhelm.com/self-host/install/) installs CoderHelm from your browser with one click into your AWS account, then checks every step against your own install. Prefer a terminal? Use the [quick start](./quick-start.md).
 
+**Moving from CoderHelm cloud?** [Talk to us](mailto:support@coderhelm.com?subject=Moving%20to%20self-hosted%20CoderHelm) and we'll help move your data.
+
 ## How it works
 
 - **One config file.** `coderhelm.config.json` holds everything that differs between installs: account, region, a short name, your domain (or none), the model provider, the email sender and which optional parts run. The hosted CoderHelm deployment is built from the same code with its own config.
