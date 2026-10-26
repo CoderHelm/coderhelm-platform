@@ -241,9 +241,9 @@ pub struct RelayStamp {
     pub ts: i64,
 }
 
-/// Checks a relayed event's signature and age. With `v2` present, the
-/// source and event headers must be the ones that were signed (a `v1` alone
-/// is accepted from an older hosted side). Replays are the caller's second
+/// Checks a relayed event's signature and age. Both `v1` and `v2` must
+/// match, so the source and event headers are the ones that were signed.
+/// Replays are the caller's second
 /// step: claim [`replay_key`] once, refuse when it is already held.
 pub fn verify_relay(
     key: &str,
@@ -291,10 +291,12 @@ pub fn verify_relay(
     if !ct_eq(&got, &want) {
         return Err(SignatureProblem::Mismatch);
     }
-    if let Some(got2) = v2 {
-        if !ct_eq(&got2, &routed_mac(key, ts, &d, source, event, body)) {
-            return Err(SignatureProblem::Mismatch);
-        }
+    // The route (source and event) must be signed: a v1 alone is refused.
+    let Some(got2) = v2 else {
+        return Err(SignatureProblem::Malformed);
+    };
+    if !ct_eq(&got2, &routed_mac(key, ts, &d, source, event, body)) {
+        return Err(SignatureProblem::Mismatch);
     }
     Ok(RelayStamp { delivery_id: d, ts })
 }
@@ -462,7 +464,14 @@ mod tests {
     fn a_relayed_event_verifies_with_its_delivery_id() {
         let k = relay_key(MASTER, "ins_a");
         let body = br#"{"action":"opened"}"#;
-        let h = sign_relay(&k, NOW, "72d3162e-cc78-11e3-81ab-4c9367dc0958", body);
+        let h = sign_relay_routed(
+            &k,
+            NOW,
+            "72d3162e-cc78-11e3-81ab-4c9367dc0958",
+            "github",
+            "push",
+            body,
+        );
         let stamp = verify_relay(&k, Some(&h), "github", "push", body, NOW + 5).unwrap();
         assert_eq!(stamp.delivery_id, "72d3162e-cc78-11e3-81ab-4c9367dc0958");
         assert_eq!(stamp.ts, NOW);
@@ -476,7 +485,7 @@ mod tests {
     fn a_relayed_event_is_refused_when_changed_old_or_from_another_key() {
         let k = relay_key(MASTER, "ins_a");
         let body = b"{}";
-        let h = sign_relay(&k, NOW, "d1", body);
+        let h = sign_relay_routed(&k, NOW, "d1", "github", "push", body);
         assert_eq!(
             verify_relay(&k, Some(&h), "github", "push", b"{ }", NOW),
             Err(SignatureProblem::Mismatch)
@@ -529,8 +538,8 @@ mod tests {
     }
 
     /// The source and event headers decide how the install handles a body,
-    /// so they are signed too (`v2`). A copy with them changed is refused;
-    /// an older hosted side that sends only `v1` still verifies.
+    /// so they are signed too (`v2`). A copy with them changed, or with no
+    /// `v2` at all, is refused.
     #[test]
     fn the_route_of_a_relayed_event_is_signed() {
         let k = relay_key(MASTER, "ins_a");
@@ -558,9 +567,12 @@ mod tests {
             verify_relay(&k, Some(&forged), "github", "pull_request", body, NOW),
             Err(SignatureProblem::Mismatch)
         );
-        // An older hosted side (v1 only) still verifies.
+        // A v1 alone is refused: the route must be signed.
         let old = sign_relay(&k, NOW, "d1", body);
-        assert!(verify_relay(&k, Some(&old), "github", "push", body, NOW).is_ok());
+        assert_eq!(
+            verify_relay(&k, Some(&old), "github", "push", body, NOW),
+            Err(SignatureProblem::Malformed)
+        );
     }
 
     #[test]
