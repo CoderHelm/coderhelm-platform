@@ -1,6 +1,6 @@
 use axum::{
     extract::{Query, State},
-    http::{header, HeaderMap, StatusCode},
+    http::{header, HeaderMap, HeaderValue, StatusCode},
     response::{IntoResponse, Redirect, Response},
     Json,
 };
@@ -11,6 +11,7 @@ use sha2::Sha256;
 use std::sync::Arc;
 use tracing::{error, info, warn};
 
+use super::oauth_signin::{self, CallbackQuery, Provider, Reason, SignInFailure};
 use crate::auth::jwt;
 use crate::middleware::auth::SESSION_TTL_SECS;
 use crate::AppState;
@@ -155,18 +156,6 @@ pub struct MfaChallengeRequest {
     pub session: String,
     pub code: String,
     pub email: String,
-}
-
-#[derive(Deserialize)]
-pub struct CallbackParams {
-    code: String,
-    state: Option<String>,
-}
-
-#[derive(Deserialize)]
-pub struct GoogleCallbackParams {
-    code: String,
-    state: Option<String>,
 }
 
 // ── Signup ───────────────────────────────────────────────────────────
@@ -577,23 +566,60 @@ pub async fn confirm_reset(
 
 // ── Google OAuth ─────────────────────────────────────────────────────
 
-/// CSRF `state` for OAuth: random value carried both in the authorize URL and
-/// an HttpOnly cookie; the callback requires them to match. Without it, an
-/// attacker could complete the dance with their own `code` in a victim's
-/// browser (login-CSRF / session fixation).
-fn oauth_state_cookie(name: &str, value: &str) -> String {
-    format!("{name}={value}; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=600")
+// CSRF `state` for OAuth: a random value carried both in the authorize URL and
+// an HttpOnly cookie; the callback requires them to match. Without it, an
+// attacker could complete the dance with their own `code` in a victim's
+// browser (login-CSRF / session fixation). See oauth_signin.rs.
+
+fn user_agent(headers: &HeaderMap) -> &str {
+    headers
+        .get(header::USER_AGENT)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
 }
 
-fn validate_oauth_state(req_cookies: &str, cookie_name: &str, query_state: Option<&str>) -> bool {
-    let Some(expected) = extract_cookie(req_cookies, cookie_name) else {
-        return false;
-    };
-    query_state.is_some_and(|s| !s.is_empty() && s == expected)
+fn cookie_header(headers: &HeaderMap) -> &str {
+    headers
+        .get(header::COOKIE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+}
+
+/// The end of every successful sign-in: the session cookie, the state cookie
+/// cleared, and the dashboard.
+fn session_redirect(provider: Provider, token: &str, dashboard_url: &str) -> Response {
+    let session = format!(
+        "__Host-coderhelm_session={token}; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age={SESSION_TTL_SECS}"
+    );
+    let mut resp = (
+        StatusCode::FOUND,
+        [(header::LOCATION, dashboard_url.to_string())],
+    )
+        .into_response();
+    for c in [session, oauth_signin::clear_state_cookie(provider)] {
+        if let Ok(v) = HeaderValue::from_str(&c) {
+            resp.headers_mut().append(header::SET_COOKIE, v);
+        }
+    }
+    resp
 }
 
 /// GET /auth/google — Redirect to Cognito hosted UI for Google login.
-pub async fn google_login(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+///
+/// Google refuses sign-in inside an app's built-in browser and shows "This
+/// browser or app may not be secure", a dead end with no way back. Such a
+/// browser goes back to the sign-in screen instead, which says to open the page
+/// in Safari or Chrome.
+pub async fn google_login(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+    if oauth_signin::is_in_app_browser(user_agent(&headers)) {
+        return SignInFailure::new(
+            Provider::Google,
+            Reason::InAppBrowser,
+            "start",
+            user_agent(&headers).chars().take(200).collect::<String>(),
+        )
+        .into_redirect(common::public_urls::app_url(&state.config.stage));
+    }
     let redirect_uri = format!(
         "{}/auth/google/callback",
         common::public_urls::api_url(&state.config.stage)
@@ -623,26 +649,34 @@ pub async fn google_login(State(state): State<Arc<AppState>>) -> impl IntoRespon
     (
         [(
             header::SET_COOKIE,
-            oauth_state_cookie("__Host-oauth_state_g", &csrf),
+            oauth_signin::state_cookie(Provider::Google, &csrf),
         )],
         Redirect::temporary(&url),
     )
+        .into_response()
 }
 
-/// GET /auth/google/callback — Handle Cognito/Google OAuth callback.
+/// GET /auth/google/callback — Handle Cognito/Google OAuth callback. Any
+/// failure lands on the dashboard's sign-in screen with a short reason.
 pub async fn google_callback(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
-    Query(params): Query<GoogleCallbackParams>,
-) -> Result<Response, StatusCode> {
-    let cookies = headers
-        .get(header::COOKIE)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("");
-    if !validate_oauth_state(cookies, "__Host-oauth_state_g", params.state.as_deref()) {
-        warn!("Google OAuth callback with missing/mismatched CSRF state");
-        return Err(StatusCode::FORBIDDEN);
+    Query(params): Query<CallbackQuery>,
+) -> Response {
+    let app = common::public_urls::app_url(&state.config.stage);
+    match google_callback_inner(&state, &headers, &params).await {
+        Ok(resp) => resp,
+        Err(f) => f.into_redirect(app),
     }
+}
+
+async fn google_callback_inner(
+    state: &Arc<AppState>,
+    headers: &HeaderMap,
+    params: &CallbackQuery,
+) -> Result<Response, SignInFailure> {
+    const P: Provider = Provider::Google;
+    let code = oauth_signin::check_callback(P, cookie_header(headers), params)?;
     let redirect_uri = format!(
         "{}/auth/google/callback",
         common::public_urls::api_url(&state.config.stage)
@@ -666,26 +700,23 @@ pub async fn google_callback(
         .post(&token_url)
         .form(&[
             ("grant_type", "authorization_code"),
-            ("code", &params.code),
+            ("code", code),
             ("client_id", client_id),
             ("client_secret", client_secret),
             ("redirect_uri", &redirect_uri),
         ])
         .send()
         .await
-        .map_err(|e| {
-            error!("Google token exchange failed: {e}");
-            StatusCode::BAD_GATEWAY
-        })?;
+        .map_err(|e| SignInFailure::new(P, Reason::Provider, "token_exchange", e))?;
 
-    let token_data: serde_json::Value = token_resp.json().await.map_err(|e| {
-        error!("Failed to parse Cognito token response: {e}");
-        StatusCode::BAD_GATEWAY
-    })?;
+    let token_data: serde_json::Value = token_resp
+        .json()
+        .await
+        .map_err(|e| SignInFailure::new(P, Reason::Provider, "token_exchange", e))?;
 
     let access_token = token_data["access_token"].as_str().ok_or_else(|| {
-        error!("No access_token in Cognito response: {token_data}");
-        StatusCode::BAD_GATEWAY
+        let err = token_data["error"].as_str().unwrap_or("no access_token");
+        SignInFailure::new(P, Reason::Provider, "token_exchange", err)
     })?;
 
     // Get user info from Cognito
@@ -695,10 +726,7 @@ pub async fn google_callback(
         .access_token(access_token)
         .send()
         .await
-        .map_err(|e| {
-            error!("Failed to get Cognito user: {e:?}");
-            StatusCode::BAD_GATEWAY
-        })?;
+        .map_err(|e| SignInFailure::new(P, Reason::Provider, "profile", format!("{e:?}")))?;
 
     let cognito_sub = user.username();
     let email = user
@@ -735,7 +763,7 @@ pub async fn google_callback(
         .unwrap_or_default();
 
     // Closed beta: only allow new users on the allowlist (existing users can always log in)
-    if existing.is_empty() && !is_email_allowed(&state, &email).await {
+    if existing.is_empty() && !is_email_allowed(state, &email).await {
         let dash = common::public_urls::app_url(&state.config.stage);
         let redirect = format!("{dash}?error=closed_beta");
         return Ok(Redirect::temporary(&redirect).into_response());
@@ -744,7 +772,7 @@ pub async fn google_callback(
     // Accept pending invites first: Google sign-ins never accepted them, so an
     // invited teammate got a personal team and the invite stayed pending.
     let accepted =
-        accept_pending_invites(&state, &existing, &format!("USER#{cognito_sub}"), &email).await;
+        accept_pending_invites(state, &existing, &format!("USER#{cognito_sub}"), &email).await;
     let pool = landing_records(&existing, accepted);
 
     // Prefer a real team the user joined over their personal team (dropped the
@@ -766,7 +794,7 @@ pub async fn google_callback(
             .and_then(|v| v.as_s().ok())
             .cloned()
             .unwrap_or_else(|| "member".to_string());
-        touch_last_login(&state, &tid, &uid).await;
+        touch_last_login(state, &tid, &uid).await;
         (tid, uid, r)
     } else {
         // New user — create personal team
@@ -819,28 +847,16 @@ pub async fn google_callback(
         &state.secrets.jwt_secret,
         SESSION_TTL_SECS,
     )
-    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    .map_err(|e| SignInFailure::new(P, Reason::Server, "session_token", e))?;
 
     let dashboard_url = common::public_urls::app_url(&state.config.stage);
-
-    let cookie = format!(
-        "__Host-coderhelm_session={token}; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age={SESSION_TTL_SECS}"
-    );
-
-    Ok((
-        [
-            (header::SET_COOKIE, cookie),
-            (header::LOCATION, dashboard_url.to_string()),
-        ],
-        StatusCode::FOUND,
-    )
-        .into_response())
+    Ok(session_redirect(P, &token, dashboard_url))
 }
 
 // ── GitHub OAuth (connect GitHub, not identity) ──────────────────────
 
 /// GET /auth/github — Redirect to GitHub OAuth (for connecting GitHub account).
-pub async fn github_login(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+pub async fn github_login(State(state): State<Arc<AppState>>) -> Response {
     let client_id = &state.secrets.github_client_id;
     let redirect_uri = format!(
         "{}/auth/github/callback",
@@ -853,30 +869,38 @@ pub async fn github_login(State(state): State<Arc<AppState>>) -> impl IntoRespon
     (
         [(
             header::SET_COOKIE,
-            oauth_state_cookie("__Host-oauth_state_gh", &csrf),
+            oauth_signin::state_cookie(Provider::Github, &csrf),
         )],
         Redirect::temporary(&url),
     )
+        .into_response()
 }
 
 /// GET /auth/github/callback — GitHub OAuth callback.
 /// Works in two modes:
 /// 1. If user has a session cookie → connect GitHub to existing account
 /// 2. If no session → legacy login flow (creates account from GitHub)
+///
+/// Any failure lands on the dashboard's sign-in screen with a short reason.
 pub async fn github_callback(
     State(state): State<Arc<AppState>>,
-    Query(params): Query<CallbackParams>,
-    req: axum::extract::Request,
-) -> Result<Response, StatusCode> {
-    let cookies = req
-        .headers()
-        .get(header::COOKIE)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("");
-    if !validate_oauth_state(cookies, "__Host-oauth_state_gh", params.state.as_deref()) {
-        warn!("GitHub OAuth callback with missing/mismatched CSRF state");
-        return Err(StatusCode::FORBIDDEN);
+    headers: HeaderMap,
+    Query(params): Query<CallbackQuery>,
+) -> Response {
+    let app = common::public_urls::app_url(&state.config.stage);
+    match github_callback_inner(&state, &headers, &params).await {
+        Ok(resp) => resp,
+        Err(f) => f.into_redirect(app),
     }
+}
+
+async fn github_callback_inner(
+    state: &Arc<AppState>,
+    headers: &HeaderMap,
+    params: &CallbackQuery,
+) -> Result<Response, SignInFailure> {
+    const P: Provider = Provider::Github;
+    let code = oauth_signin::check_callback(P, cookie_header(headers), params)?;
 
     // Exchange code for access token
     let client = &state.http;
@@ -886,23 +910,23 @@ pub async fn github_callback(
         .json(&serde_json::json!({
             "client_id": state.secrets.github_client_id,
             "client_secret": state.secrets.github_client_secret,
-            "code": params.code,
+            "code": code,
         }))
         .send()
         .await
-        .map_err(|e| {
-            error!("GitHub token exchange failed: {e}");
-            StatusCode::BAD_GATEWAY
-        })?;
+        .map_err(|e| SignInFailure::new(P, Reason::Provider, "token_exchange", e))?;
 
-    let token_data: serde_json::Value = token_resp.json().await.map_err(|e| {
-        error!("Failed to parse GitHub token response: {e}");
-        StatusCode::BAD_GATEWAY
+    let token_data: serde_json::Value = token_resp
+        .json()
+        .await
+        .map_err(|e| SignInFailure::new(P, Reason::Provider, "token_exchange", e))?;
+
+    // GitHub answers 200 with {"error": "bad_verification_code", ...} for a
+    // used or expired code.
+    let access_token = token_data["access_token"].as_str().ok_or_else(|| {
+        let err = token_data["error"].as_str().unwrap_or("no access_token");
+        SignInFailure::new(P, Reason::Provider, "token_exchange", err)
     })?;
-
-    let access_token = token_data["access_token"]
-        .as_str()
-        .ok_or(StatusCode::BAD_GATEWAY)?;
 
     // Fetch user profile
     let user_resp = client
@@ -911,14 +935,28 @@ pub async fn github_callback(
         .header("User-Agent", "Coderhelm")
         .send()
         .await
-        .map_err(|_| StatusCode::BAD_GATEWAY)?;
+        .map_err(|e| SignInFailure::new(P, Reason::Provider, "profile", e))?;
 
     let user: serde_json::Value = user_resp
         .json()
         .await
-        .map_err(|_| StatusCode::BAD_GATEWAY)?;
-    let github_id = user["id"].as_u64().ok_or(StatusCode::BAD_GATEWAY)?;
-    let github_login = user["login"].as_str().ok_or(StatusCode::BAD_GATEWAY)?;
+        .map_err(|e| SignInFailure::new(P, Reason::Provider, "profile", e))?;
+    let github_id = user["id"].as_u64().ok_or_else(|| {
+        SignInFailure::new(
+            P,
+            Reason::Provider,
+            "profile",
+            "no id in the GitHub profile",
+        )
+    })?;
+    let github_login = user["login"].as_str().ok_or_else(|| {
+        SignInFailure::new(
+            P,
+            Reason::Provider,
+            "profile",
+            "no login in the GitHub profile",
+        )
+    })?;
 
     // Fetch user's app installations to find team
     let installs_resp = client
@@ -927,12 +965,12 @@ pub async fn github_callback(
         .header("User-Agent", "Coderhelm")
         .send()
         .await
-        .map_err(|_| StatusCode::BAD_GATEWAY)?;
+        .map_err(|e| SignInFailure::new(P, Reason::Provider, "installations", e))?;
 
     let installs: serde_json::Value = installs_resp
         .json()
         .await
-        .map_err(|_| StatusCode::BAD_GATEWAY)?;
+        .map_err(|e| SignInFailure::new(P, Reason::Provider, "installations", e))?;
 
     let our_app_id: u64 = state.secrets.github_app_id.parse().unwrap_or(0);
 
@@ -949,13 +987,7 @@ pub async fn github_callback(
         .collect();
 
     // Check if user already has a session (connecting GitHub to existing account)
-    let cookie_header = req
-        .headers()
-        .get("cookie")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("");
-
-    let existing_claims = extract_cookie(cookie_header, "__Host-coderhelm_session")
+    let existing_claims = extract_cookie(cookie_header(headers), "__Host-coderhelm_session")
         .and_then(|token| jwt::validate_token(token, &state.secrets.jwt_secret).ok());
 
     let now = chrono::Utc::now().to_rfc3339();
@@ -983,7 +1015,7 @@ pub async fn github_callback(
 
         // Link GitHub installations to the user's team in both tables
         for (inst_id, org) in &all_installations {
-            let owner = super::github_webhook::resolve_team_by_installation(&state, *inst_id).await;
+            let owner = super::github_webhook::resolve_team_by_installation(state, *inst_id).await;
             if !may_link_installation(owner.as_deref(), &claims.team_id) {
                 warn!(
                     installation_id = inst_id,
@@ -1040,7 +1072,7 @@ pub async fn github_callback(
             );
 
             // Sync repos from the installation (only add repos not already present)
-            let repos = super::github_webhook::fetch_installation_repos(&state, *inst_id).await;
+            let repos = super::github_webhook::fetch_installation_repos(state, *inst_id).await;
             for repo in &repos {
                 let full = format!("{}/{}", repo.owner, repo.name);
                 let _ = state
@@ -1078,24 +1110,12 @@ pub async fn github_callback(
             &state.secrets.jwt_secret,
             SESSION_TTL_SECS,
         )
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        .map_err(|e| SignInFailure::new(P, Reason::Server, "session_token", e))?;
 
         info!(github_login, "GitHub connected to existing account");
 
         let dashboard_url = common::public_urls::app_url(&state.config.stage);
-
-        let cookie = format!(
-            "__Host-coderhelm_session={token}; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age={SESSION_TTL_SECS}"
-        );
-
-        return Ok((
-            [
-                (header::SET_COOKIE, cookie),
-                (header::LOCATION, dashboard_url.to_string()),
-            ],
-            StatusCode::FOUND,
-        )
-            .into_response());
+        return Ok(session_redirect(P, &token, dashboard_url));
     }
 
     // No existing session — GitHub-only login flow
@@ -1144,7 +1164,7 @@ pub async fn github_callback(
     let has_existing_record = existing_user.is_some();
 
     // Closed beta: check allowlist for new GitHub users
-    if !has_existing_record && !email.is_empty() && !is_email_allowed(&state, email).await {
+    if !has_existing_record && !email.is_empty() && !is_email_allowed(state, email).await {
         let dash = common::public_urls::app_url(&state.config.stage);
         let redirect = format!("{dash}?error=closed_beta");
         return Ok(Redirect::temporary(&redirect).into_response());
@@ -1158,7 +1178,7 @@ pub async fn github_callback(
     if !has_existing_record {
         for (inst_id, org) in &all_installations {
             if let Some(owner) =
-                super::github_webhook::resolve_team_by_installation(&state, *inst_id).await
+                super::github_webhook::resolve_team_by_installation(state, *inst_id).await
             {
                 info!(
                     github_login,
@@ -1267,14 +1287,14 @@ pub async fn github_callback(
             .await;
 
         // Send welcome email for new GitHub signups
-        send_welcome_email(&state, email).await;
+        send_welcome_email(state, email).await;
     }
 
     // Link GitHub installations to the team in the teams table — only when no
     // OTHER team owns the installation already.
     let link_target = match all_installations.first() {
         Some(&(inst_id, _)) => {
-            let owner = super::github_webhook::resolve_team_by_installation(&state, inst_id).await;
+            let owner = super::github_webhook::resolve_team_by_installation(state, inst_id).await;
             if may_link_installation(owner.as_deref(), &team_id) {
                 Some(inst_id)
             } else {
@@ -1337,7 +1357,7 @@ pub async fn github_callback(
         );
 
         // Sync repos from the installation (only add repos not already present)
-        let repos = super::github_webhook::fetch_installation_repos(&state, inst_id).await;
+        let repos = super::github_webhook::fetch_installation_repos(state, inst_id).await;
         for repo in &repos {
             let full = format!("{}/{}", repo.owner, repo.name);
             let _ = state
@@ -1375,22 +1395,10 @@ pub async fn github_callback(
         &state.secrets.jwt_secret,
         SESSION_TTL_SECS,
     )
-    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    .map_err(|e| SignInFailure::new(P, Reason::Server, "session_token", e))?;
 
     let dashboard_url = common::public_urls::app_url(&state.config.stage);
-
-    let cookie = format!(
-        "__Host-coderhelm_session={token}; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age={SESSION_TTL_SECS}"
-    );
-
-    Ok((
-        [
-            (header::SET_COOKIE, cookie),
-            (header::LOCATION, dashboard_url.to_string()),
-        ],
-        StatusCode::FOUND,
-    )
-        .into_response())
+    Ok(session_redirect(P, &token, dashboard_url))
 }
 
 /// Record when a member last signed in (shown on the team page). Only that one
