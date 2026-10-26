@@ -1,15 +1,12 @@
-# Plugin examples
+# Plugin examples have moved
 
-Plugins a team can install in CoderHelm. Each folder under `plugins/` is one
-plugin: a `plugin.yaml` manifest plus the skills and agents it uses. This
-repository is itself a plugin source: add `https://github.com/CoderHelm/coderhelm-platform`
-on the Plugins page and the plugins below show up in the catalog.
+The example plugins now live in their own repository:
+**[CoderHelm/coderhelm-plugins](https://github.com/CoderHelm/coderhelm-plugins)**.
 
-- [`marketing`](marketing/): drafts launch posts, emails and blog updates
-  from releases and briefs, for a person to approve before anything goes
-  out.
+It has the marketing plugin that used to be here, plus release notes,
+incident summaries, dependency checks, docs updates and an annotated
+starter, each with a README and validated in CI.
 
-Plugins are declarative. They are text plus the tools a team approves:
-nothing here is run as code. To make one for your team, copy a folder into
-your own repository (public, or private on your GitHub App installation),
-change the text, and add that repository as a source.
+To install them, add `https://github.com/CoderHelm/coderhelm-plugins` as a
+source on the **Plugins** page. To write your own, copy a folder from it
+into your own repository. See https://docs.coderhelm.com/plugins.
