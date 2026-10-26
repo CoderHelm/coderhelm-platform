@@ -1077,7 +1077,8 @@ fn note_intake_problem(p: &'static str) {
         request is signed with the install's relay key: `X-CoderHelm-Relay-Signature: t=<unix \
         seconds>,d=<delivery id>,v1=<hex>,v2=<hex>`, where `v1` is the HMAC-SHA256 of \
         `<t>.<d>.<raw body>` and `v2` of `v2.<t>.<d>.<source>.<event>.<raw body>` (so the two \
-        headers below are signed too). Requests older than 5 minutes are refused, and so is a \
+        headers below are signed too). Both must match: a request without `v2` is refused. \
+        Requests older than 5 minutes are refused, and so is a \
         delivery id the install has already taken (`409`). \
         `X-CoderHelm-Relay-Source` is `github` or `jira`; for GitHub, `X-CoderHelm-Relay-Event` is \
         GitHub's event type and the body is GitHub's payload, unchanged.",
