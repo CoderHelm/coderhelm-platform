@@ -1,10 +1,10 @@
 {
-  "about": "One entry per release that needs more than a redeploy. `coderhelm-selfhost upgrade` prints every entry between the installed and the target version, and stops at an entry with breaking: true until it is run again with --yes (after doing what the entry says). Releases with no entry are plain redeploys: tables and buckets keep their data, items only gain fields.",
+  "about": "One entry per release that needs more than a redeploy. `coderhelm-selfhost update` prints every entry between the installed and the target version, and stops at an entry with breaking: true until it is run again with --yes (after doing what the entry says). An entry with breaking: true should also have \"action\": what to do, in one sentence; the installer and the dashboard show it. Releases with no entry are plain redeploys: tables and buckets keep their data, items only gain fields.",
   "releases": [
     {
-      "version": "v0.1.0",
+      "version": "v0.7.0",
       "breaking": false,
-      "notes": "First self-host release: one config file, the single-origin web stack, Bedrock as a model provider."
+      "notes": "First self-host release: one config file, the single-origin web stack, Bedrock as a model provider, setup checks with fixes (doctor, Settings then Setup) and update readiness. The v0.2.x to v0.6.0 tags are from before self-hosting and have no releases."
     }
   ]
 }

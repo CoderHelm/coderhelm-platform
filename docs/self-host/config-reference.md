@@ -104,7 +104,7 @@ See [Integrations](./integrations.md).
 | `updates.majors` | `ask` or `auto` | `ask` | `ask`: major releases wait for an admin. |
 | `updates.webhookUrl` | string | | A Slack or Teams incoming webhook for update notices (admins are emailed either way). |
 
-These are the starting point; admins change them in **Settings → System** without a deploy. See [Updates](./updates.md).
+These are the starting point; admins change them in **Settings, then System** without a deploy. See [Updates](./updates.md).
 
 ## Everything else
 

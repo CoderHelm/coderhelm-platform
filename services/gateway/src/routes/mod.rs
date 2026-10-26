@@ -43,6 +43,7 @@ pub mod run_close;
 pub mod run_search;
 pub mod search;
 pub mod setup;
+pub mod setup_checks;
 pub mod skills;
 pub mod sns;
 pub mod support;

@@ -95,7 +95,7 @@ test("prerequisites: old Node, AWS CLI v1, wrong account", async () => {
 test("init writes a config from flags (non-interactive)", async () => {
   const dir = tmpdir();
   const file = path.join(dir, "coderhelm.config.json");
-  const runner = new FakeRunner(awsAnswers());
+  const runner = new FakeRunner(awsAnswers({ "get-foundation-model-availability": { authorizationStatus: "AUTHORIZED" } }));
   const { code } = await run(
     ["init", "--config", file, "--region", "eu-west-1", "--admin", "me@example.org", "--provider", "bedrock", "--telemetry", "off"],
     { runner },

@@ -1,16 +1,36 @@
 ---
 title: Troubleshooting
 description: The problems people hit when installing and running CoderHelm, and what fixes them.
-order: 12
+order: 13
 ---
 
-Start with:
+Start with the doctor. It checks everything (your AWS sign-in and permissions, the region, CDK, DNS, the certificate, the stacks, the GitHub App, email and a real model call) and says, for each problem, what is wrong, why it matters and how to fix it:
 
 ```sh
-npx -y github:CoderHelm/coderhelm-platform health
+npx -y github:CoderHelm/coderhelm-platform doctor
 ```
 
-Every check names what to do when it fails. Function logs are in CloudWatch under `/aws/lambda/coderhelm-<stage>-gateway`, `-worker`, `-streaming` and `-mcp-proxy`.
+In the dashboard, **Settings, then Setup** runs the server-side checks live. Every check and its fix is listed in [Check your install](./check-your-install.md). Errors print a short message; the full details (with the failed command's output) are saved under `.coderhelm/logs/`, and `--verbose` prints them. Function logs are in CloudWatch under `/aws/lambda/coderhelm-<stage>-gateway`, `-worker`, `-streaming` and `-mcp-proxy`.
+
+## The guided install stops at a check
+
+Each step checks what you did before it moves on. When a check fails, fix it and press **Enter** to check again; nothing restarts. Type **skip** to go on anyway (the doctor at the end lists it again) or **back** to change an answer. Without a terminal, the install stops with the same text: fix it and run the same command again (it picks up where it stopped), or pass `--skip-checks <id>`.
+
+| Check | Usual fix |
+|---|---|
+| **Signed in to AWS** | `aws sso login --profile <name>` (expired), or `aws configure sso` (no profile yet) |
+| **The right AWS account** | `export AWS_PROFILE=<profile for that account>` |
+| **AWS permissions for the install** | The missing actions are listed. Use a role with AdministratorAccess, or ask your AWS admin to allow them. If it says the permissions couldn't be checked, your role lacks `iam:SimulatePrincipalPolicy`: carry on if you have AdministratorAccess |
+| **Region has every service** | Pick a region the check doesn't flag (us-east-1, us-west-2, eu-west-1 and eu-central-1 have everything) |
+| **CDK set up** | `npx -y cdk bootstrap aws://<account>/<region>` (the installer offers to run it; with a domain outside us-east-1, us-east-1 too). If the `CDKToolkit` stack is in a failed state, delete it first |
+| **Route 53 zone** | Create the zone (`aws route53 create-hosted-zone --name <zone> --caller-reference <anything>`), or leave the hostname empty |
+| **Points at Route 53** | Set the NS records at your registrar to the four the check prints; it also shows what public DNS answers now. Changes can take up to an hour |
+| **TLS certificate issued** | Add the validation records the check prints, or request a certificate in us-east-1 for the exact hostname |
+| **Claude models enabled in Bedrock** | Open the Model access link the check prints and enable the models it names |
+| **Anthropic API key works** | 401: copy the key again. 403 or 404: the key's workspace can't use the model. "No credit": add credit in the Anthropic console |
+| **Email sender verified** | Add the three DKIM records the check prints at your DNS provider |
+| **Email can reach anyone** | A warning: request SES production access with the link the check prints |
+| **Slack or Teams webhook** | Create a new incoming webhook; the old one was removed |
 
 ## Installing
 
@@ -38,10 +58,11 @@ Every check names what to do when it fails. Function logs are in CloudWatch unde
 
 ## GitHub
 
-**Nothing happens when I assign an issue.**
-1. The app is installed on that repository (GitHub → the app → **Install App**).
-2. The app's webhook URL is `<your URL>/webhooks/github` and recent deliveries show `200` (GitHub → the app → **Advanced**).
-3. `health` shows the GitHub App keys as stored. If you stored them by hand, redeploy so the functions read them: `coderhelm-selfhost github-app` does this for you.
+**Nothing happens when I assign an issue.** Run the doctor or open **Settings, then Setup**: the GitHub checks cover each cause.
+1. **GitHub App installed:** the app is installed on that repository (on GitHub: the app, then **Install App**).
+2. **GitHub webhook reaches this install:** the webhook URL is `<your URL>/webhooks/github` and the latest delivery shows `200` (on GitHub: the app, then **Advanced**).
+3. **GitHub App permissions and events:** every permission and event is granted. A missing one, such as **Workflows: write**, is named with the page to change it; after saving, accept the new permissions on each installation.
+4. **GitHub accepts the app's keys:** if you stored them by hand, `coderhelm-selfhost github-app` stores them and restarts the services.
 
 **Webhook deliveries show 401.** The app's webhook secret doesn't match the stored one. Run `github-app --force` to create a fresh app, or fix the secret in Secrets Manager and redeploy.
 
@@ -49,11 +70,19 @@ Every check names what to do when it fails. Function logs are in CloudWatch unde
 
 ## Runs
 
-**Runs fail with "Anthropic API key is not configured".** With the `anthropic` provider each team adds its key in **Settings → Model Provider**. Or switch to [Bedrock](./model-providers.md#amazon-bedrock).
+**Runs fail with "Anthropic API key is not configured".** With the `anthropic` provider each team adds its key in **Settings, AI models**. **Settings, then Setup** tests it with a real one-token call. Or switch to [Bedrock](./model-providers.md#amazon-bedrock).
 
 **Bedrock "AccessDeniedException" or "model identifier is invalid".** Enable the model in Bedrock **Model access** for your region, check `bedrockInferencePrefix` matches your region, or map the model to an exact id with `bedrockModelIds`.
 
-**Failed messages pile up.** The admin queue page (`/admin/queue/`) lists dead-letter messages with their error, and can resend or delete them. `health` shows the count.
+**Failed messages pile up.** The admin queue page (`/admin/queue/`) lists dead-letter messages with their error, and can resend or delete them. The doctor and **Setup** show the count.
+
+## Updates
+
+**Update now is greyed out.** **Update readiness** on **Settings, then System** lists what blocks it, each with its fix. Press **Check again** after fixing it.
+
+**An update rolled back.** The history says why. Your data is untouched. Run the doctor, fix what fails, then update again: automatic updates skip that release until an admin updates to it by hand. See [Updates](./updates.md#when-an-update-fails).
+
+**`update` says there isn't enough space.** Releases are kept in `~/.coderhelm/releases`. Delete old ones (keep the one you run), or set `CODERHELM_HOME` to a bigger disk.
 
 ## Links point to localhost
 

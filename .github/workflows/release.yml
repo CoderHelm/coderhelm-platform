@@ -35,6 +35,28 @@ jobs:
           ref: ${{ steps.tag.outputs.tag }}
           fetch-depth: 0
 
+      # The updater and the installer compare versions: a release must sort
+      # above every earlier one, including the v0.2.x to v0.6.0 tags from
+      # before self-hosting (they have no releases). The first self-host
+      # release is v0.7.0. The installer's version must match the tag, and
+      # MIGRATIONS.json must be valid JSON.
+      - name: Check the version
+        env:
+          TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          node -e '
+            const tag = process.env.TAG;
+            const m = tag.match(/^v(\d+)\.(\d+)\.(\d+)(-[0-9A-Za-z.-]+)?$/);
+            if (!m) { console.error(`${tag} is not vX.Y.Z`); process.exit(1); }
+            const n = (v) => v.replace(/^v/, "").split(/[.-]/).slice(0, 3).map(Number);
+            const [a, b] = [n(tag), n("v0.6.0")];
+            const above = a[0] !== b[0] ? a[0] > b[0] : a[1] !== b[1] ? a[1] > b[1] : a[2] > b[2];
+            if (!above) { console.error(`${tag} must sort above v0.6.0 (the last tag from before self-hosting); the first self-host release is v0.7.0`); process.exit(1); }
+            const pkg = require("./installer/package.json").version;
+            if (`v${pkg}` !== tag.replace(/-.*/, "") && `v${pkg}` !== tag) console.log(`note: installer/package.json says ${pkg}; the release stamps ${tag}`);
+            require("./selfhost/MIGRATIONS.json");
+          '
+
       # ── Rust Lambdas ───────────────────────────────────────────────
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -90,7 +112,7 @@ jobs:
       - name: Source and installer
         run: |
           TAG="${{ steps.tag.outputs.tag }}"
-          # The source, plus the release stamp each install shows (Settings → System).
+          # The source, plus the release stamp each install shows (Settings, then System).
           SRC="$RUNNER_TEMP/src/coderhelm-platform-${TAG#v}"
           mkdir -p "$SRC" && git archive --format=tar "$TAG" | tar -x -C "$SRC"
           printf '{"version":"%s","commit":"%s","releasedAt":"%s"}\n' "$TAG" "$(git rev-parse "$TAG^{commit}")" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$SRC/selfhost/release.json"
@@ -140,7 +162,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           TAG="${{ steps.tag.outputs.tag }}"
-          NOTES="Self-host release ${TAG}. Install: npx -y github:${GITHUB_REPOSITORY}#${TAG} init, then deploy. Upgrade: coderhelm-selfhost upgrade --to ${TAG}. See docs/self-host."
+          NOTES="Self-host release ${TAG}. Install: npx -y github:${GITHUB_REPOSITORY}#${TAG} init, then deploy. Update: npx -y github:${GITHUB_REPOSITORY}#${TAG} update --to ${TAG}. Check an install: npx -y github:${GITHUB_REPOSITORY} doctor. See docs/self-host."
           if gh release view "$TAG" >/dev/null 2>&1; then
             gh release upload "$TAG" dist/* --clobber
           else

@@ -5,14 +5,25 @@
 // every step (.coderhelm/wizard.json, no secrets), so running it again picks
 // up where it stopped. Without a terminal (CI), every answer comes from flags
 // or --answers <file>, and a bad one stops with the reason.
+//
+// Every step checks what it was told before moving on (lib/checks.mjs):
+// sign-in and permissions, the region, the domain's DNS, the certificate,
+// Bedrock model access or the Anthropic key (a real one-token call), email.
+// A failed check says what is wrong, why it matters and how to fix it, and
+// waits: press Enter to check again, "skip" to go on, "back" to change an
+// answer (lib/gate.mjs). After the deploy, the doctor runs every check and
+// only then says the install is ready.
 import fs from "node:fs";
 import path from "node:path";
 import { checkPrereqs } from "./prereqs.mjs";
+import * as C from "./checks.mjs";
+import { BACK, gate } from "./gate.mjs";
+import { runDoctor, readyMessage } from "./doctor.mjs";
 import { ensureSecret, mergeSecret } from "./secrets.mjs";
 import { configPath, deploy, statePath } from "./commands.mjs";
 import { readJson, writeJson } from "./util.mjs";
 
-export const BACK = Symbol("back");
+export { BACK };
 
 export const STEPS = [
   { id: "prereqs", title: "Your machine and AWS sign-in" },
@@ -77,9 +88,9 @@ async function yesNo(ctx, question, def) {
 async function stepPrereqs(ctx, answers) {
   const { runner, log, flags } = ctx;
   log("CoderHelm deploys with the AWS CLI and Node.js from this machine. Checking them.");
-  let { problems, identity } = await checkPrereqs(runner, {});
-  const blocking = problems.filter((p) => !/credentials/i.test(p));
-  if (blocking.length) throw new Error(`Fix these first, then run this again:\n  - ${blocking.join("\n  - ")}`);
+  const tools = await gate(ctx, async () => [C.checkNode(ctx.nodeVersion), await C.checkAwsCli(ctx), await C.checkTar(ctx)], { heading: "Checking this machine" });
+  if (tools === BACK) return BACK;
+  let { identity } = await checkPrereqs(runner, {});
   if (!identity) {
     const profiles = ((await runner.run("aws", ["configure", "list-profiles"], { capture: true, allowFail: true })).stdout || "")
       .split("\n").map((s) => s.trim()).filter(Boolean);
@@ -97,11 +108,20 @@ async function stepPrereqs(ctx, answers) {
       await runner.run("aws", ["sso", "login", "--profile", profile]);
     }
     ({ identity } = await checkPrereqs(runner, {}));
-    if (!identity) throw new Error(`Still no AWS credentials for profile ${profile}. Sign in and run this again.`);
+    if (!identity) {
+      // Wait here until the sign-in works (what's wrong and the command to fix it).
+      const signed = await gate(ctx, async () => {
+        const r = await C.checkSignIn(ctx, { profile });
+        identity = r.identity;
+        return [r.result];
+      }, { heading: "Checking the AWS sign-in" });
+      if (signed === BACK) return BACK;
+      if (!identity) throw new Error(`Still no AWS credentials for profile ${profile}. Sign in and run this again.`);
+    }
     answers.profile = profile;
   }
   log(`  Signed in to account ${identity.Account} as ${identity.Arn}`);
-  return { ...answers, detectedAccount: identity.Account };
+  return { ...answers, detectedAccount: identity.Account, detectedArn: identity.Arn };
 }
 
 async function stepAccount(ctx, answers) {
@@ -120,6 +140,13 @@ async function stepAccount(ctx, answers) {
   if (region === BACK) return BACK;
   const stage = await answer(ctx, pick(flags, answers, "stage"), "A short name for this install", "prod", (v) => (/^[a-z][a-z0-9-]{0,19}$/.test(v) ? null : "Lowercase letters, digits and hyphens, up to 20."));
   if (stage === BACK) return BACK;
+  const identity = { Account: answers.detectedAccount ?? account, Arn: answers.detectedArn ?? "" };
+  const checked = await gate(ctx, async () => [
+    await C.checkRegion(ctx, region),
+    identity.Arn ? await C.checkPermissions(ctx, identity) : null,
+    await C.checkBootstrap(ctx, account, region, { missing: C.WARN }),
+  ], { heading: `Checking ${account} / ${region}` });
+  if (checked === BACK) return BACK;
   return { ...answers, account, region, stage };
 }
 
@@ -137,13 +164,26 @@ async function stepDomain(ctx, answers) {
   const zone = zones.find((z) => hostname === z || hostname.endsWith(`.${z}`));
   if (zone) {
     log(`  ${zone} is in Route 53: the certificate and DNS records are created for you.`);
+    const checked = await gate(ctx, async () => {
+      const z = await C.checkHostedZone(ctx, zone);
+      return [z.result, await C.checkDelegation(ctx, zone, z.zoneId), ...(await usEast1Bootstrap(ctx, answers, false))];
+    }, { heading: `Checking ${zone}'s DNS` });
+    if (checked === BACK) return BACK;
     return { ...answers, domain: hostname, hostedZone: zone, certificateArn: undefined };
   }
   log("  That hostname isn't in a Route 53 zone here. Create an ACM certificate for it in us-east-1 (CloudFront only uses us-east-1), and you'll add one CNAME after the deploy.");
   const certificateArn = await answer(ctx, pick(flags, answers, "certificateArn"), "ACM certificate ARN (us-east-1)", "",
     (v) => (/^arn:aws[a-z-]*:acm:us-east-1:\d{12}:certificate\/[0-9a-f-]+$/.test(v) ? null : "An ACM certificate ARN in us-east-1."));
   if (certificateArn === BACK) return BACK;
+  const checked = await gate(ctx, async () => [await C.checkCertificate(ctx, certificateArn, hostname)], { heading: "Checking the certificate" });
+  if (checked === BACK) return BACK;
   return { ...answers, domain: hostname, hostedZone: undefined, certificateArn };
+}
+
+/** CloudFront's certificate is made in us-east-1: CDK must be set up there too. */
+async function usEast1Bootstrap(ctx, answers, hasCert) {
+  if (hasCert || answers.region === "us-east-1") return [];
+  return [await C.checkBootstrap(ctx, answers.account, "us-east-1", { missing: C.WARN })];
 }
 
 export function bedrockPrefixFor(region) {
@@ -162,40 +202,29 @@ async function stepModel(ctx, answers) {
     const key = flags.anthropicKey ?? process.env.ANTHROPIC_API_KEY ?? (ctx.interactive ? await askValid(ctx, "An Anthropic API key to check now (empty to skip; it is not saved)", "") : "");
     if (key === BACK) return BACK;
     if (key) {
-      const ok = await checkAnthropicKey(ctx, key);
-      if (ok === false) {
+      const r = await C.checkAnthropicKey(ctx, key);
+      log(C.formatResults([r]));
+      if (r.status === C.FAIL) {
         const msg = "Anthropic refused that key.";
-        if (!ctx.interactive) throw new Error(msg);
+        if (!ctx.interactive) throw new Error(`${msg}\n${C.formatResults([r])}`);
         log(`  ${msg} Try again, or leave it empty.`);
         return stepModel(ctx, answers);
       }
-      log(ok ? "  The key works. Add it in Settings → AI models after you sign up (keys belong to teams, not the install)." : "  Couldn't reach Anthropic to check the key; you can add it later.");
+      log(r.status === C.PASS ? "  The key works. Add it in Settings, AI models after you sign up (keys belong to teams, not the install)." : "  You can add the key later in Settings, AI models.");
     }
     return { ...answers, provider, bedrockPrefix: undefined };
   }
   const bedrockPrefix = await answer(ctx, pick(flags, answers, "bedrockPrefix"), "Bedrock inference profile prefix", bedrockPrefixFor(answers.region), (v) => (/^([a-z]{2,6}\.)?$/.test(v) ? null : 'Such as "us.", "eu.", "apac." or empty.'));
   if (bedrockPrefix === BACK) return BACK;
-  const access = await checkBedrockAccess(runner, answers.region, ["anthropic.claude-opus-5-5", "anthropic.claude-sonnet-5-5"]);
-  for (const [model, ok] of Object.entries(access)) log(`  ${ok ? "ok  " : "TODO"} ${model}${ok ? "" : " is not enabled in this region"}`);
-  if (Object.values(access).some((ok) => !ok)) {
-    log(`  Enable model access here before your first run: https://console.aws.amazon.com/bedrock/home?region=${answers.region}#/modelaccess`);
-  }
+  const checked = await gate(ctx, async () => [await C.checkRegion(ctx, answers.region, { bedrock: true }), await C.checkBedrock(ctx, answers.region)], { heading: "Checking Bedrock in this region" });
+  if (checked === BACK) return BACK;
   return { ...answers, provider, bedrockPrefix };
 }
 
-/** true: key works; false: refused; null: couldn't check. */
+/** true: key works; false: refused; null: couldn't check (a real one-token call). */
 export async function checkAnthropicKey(ctx, key) {
-  try {
-    const r = await (ctx.fetchImpl ?? fetch)("https://api.anthropic.com/v1/models?limit=1", {
-      headers: { "x-api-key": key, "anthropic-version": "2023-06-01" },
-      signal: AbortSignal.timeout(8000),
-    });
-    if (r.status === 200) return true;
-    if (r.status === 401 || r.status === 403) return false;
-    return null;
-  } catch {
-    return null;
-  }
+  const r = await C.checkAnthropicKey(ctx, key);
+  return r.status === C.PASS ? true : r.status === C.FAIL ? false : null;
 }
 
 /** Whether each model is usable in the region (Bedrock model access). */
@@ -219,15 +248,14 @@ async function stepEmail(ctx, answers) {
   const defDomain = answers.hostedZone ?? admin.split("@")[1];
   const emailFrom = await answer(ctx, pick(flags, answers, "emailFrom"), "Emails come from", `coderhelm@${defDomain}`, (v) => (EMAIL_RE.test(v) ? null : "An email address."));
   if (emailFrom === BACK) return BACK;
-  const domain = emailFrom.split("@")[1];
-  const id = await runner.json("aws", ["sesv2", "get-email-identity", "--email-identity", domain, "--region", answers.region, "--output", "json"], { allowFail: true, dryRunAnswer: "null" });
-  if (id?.VerifiedForSendingStatus) log(`  ${domain} is verified in SES.`);
-  else if (answers.hostedZone && domain === answers.hostedZone) log(`  ${domain} is your Route 53 zone: the deploy adds its DKIM records and SES verifies it in minutes.`);
-  else log(`  ${domain} isn't verified in SES yet. The deploy creates the identity; add the three DKIM CNAMEs SES shows (SES → Identities → ${domain}).`);
-  const acct = await runner.json("aws", ["sesv2", "get-account", "--region", answers.region, "--output", "json"], { allowFail: true, dryRunAnswer: "null" });
-  if (acct && !acct.ProductionAccessEnabled) {
-    log("  This account is in the SES sandbox: email only reaches verified addresses, 200 a day. Request production access in the SES console (Account dashboard → Request production access).");
-  }
+  let sandbox;
+  const checked = await gate(ctx, async () => {
+    const results = [await C.checkSesIdentity(ctx, emailFrom, answers.region, { zone: answers.hostedZone }), await C.checkSesSandbox(ctx, answers.region)];
+    sandbox = results[1].status !== C.PASS;
+    return results;
+  }, { heading: "Checking Amazon SES" });
+  if (checked === BACK) return BACK;
+  const acct = runner.dryRun ? null : { ProductionAccessEnabled: !sandbox };
   const signupDomain = await answer(ctx, pick(flags, answers, "signupDomain"), "Let anyone with this email domain sign up (empty: only you)", admin.split("@")[1], (v) => (!v || HOST_RE.test(v) ? null : "A domain such as example.com, or empty."));
   if (signupDomain === BACK) return BACK;
   return { ...answers, admin, emailFrom, signupDomain, sesSandbox: acct ? !acct.ProductionAccessEnabled : undefined };
@@ -236,9 +264,13 @@ async function stepEmail(ctx, answers) {
 async function stepIntegrations(ctx, answers) {
   const { flags, log, runner } = ctx;
   log("Optional. Each can be added later too.");
-  log("  Jira: connect from Settings → Jira after sign-up (a webhook, or your own copy of the Forge app).");
+  log("  Jira: connect from Settings, Integrations, Jira after sign-up (a webhook, or your own copy of the Forge app).");
   const webhook = await answer(ctx, pick(flags, answers, "updatesWebhook"), "A Slack or Teams incoming webhook for update notices (empty: email only)", "", (v) => (!v || /^https:\/\/\S+$/.test(v) ? null : "An https URL, or empty."));
   if (webhook === BACK) return BACK;
+  if (webhook) {
+    const checked = await gate(ctx, async () => [await C.checkWebhook(ctx, webhook)], { heading: "Checking the webhook" });
+    if (checked === BACK) return BACK;
+  }
   let google = flags.google !== undefined ? flags.google === true || flags.google === "yes" : answers.google ?? false;
   if (flags.google === undefined && answers.domain) {
     const g = await yesNo(ctx, "Turn on Sign in with Google (needs a Google OAuth client)?", google);
@@ -315,8 +347,8 @@ async function stepSummary(ctx, answers) {
   log(`  Auto-update        ${cfg.updates.auto ? `on, ${cfg.updates.window} ${cfg.updates.timezone}, majors: ${cfg.updates.majors}` : "off (you're emailed about new releases)"}`);
   const c = estimateMonthlyCost(answers);
   log("\nEstimated AWS cost per month for a small team (USD):");
-  for (const [item, lo, hi] of c.lines) log(`  ${item.padEnd(50)} ${lo === hi ? `${lo}` : `${lo}–${hi}`}`);
-  log(`  ${"Total".padEnd(50)} about ${c.low}–${c.high}`);
+  for (const [item, lo, hi] of c.lines) log(`  ${item.padEnd(50)} ${lo === hi ? `${lo}` : `${lo} to ${hi}`}`);
+  log(`  ${"Total".padEnd(50)} about ${c.low} to ${c.high}`);
   log(`  Not included: ${c.model}.`);
   if (flags.deploy !== undefined) return { ...answers, deploy: flags.deploy !== "no" && flags.deploy !== false };
   if (!ctx.interactive) return { ...answers, deploy: false };
@@ -406,9 +438,27 @@ export async function wizard(ctx) {
   else writeJson(file, cfg);
   log(`\nSaved ${file}.`);
   if (w.answers.deploy && !w.done.includes("deployed")) {
-    await deploy({ ...ctx, flags: { ...flags, githubApp: true } });
+    await deploy({ ...ctx, flags: { ...flags, githubApp: true, quietReady: true } });
     w.done = [...w.done, "deployed"];
     save();
+    // Every check against the running install; "ready" only when all pass.
+    log("\nChecking the install from end to end (the same checks as the doctor command)");
+    for (;;) {
+      const report = await runDoctor(ctx);
+      if (report.ok) {
+        log(readyMessage(report));
+        break;
+      }
+      if (!ctx.interactive) {
+        log(`\nNot ready yet: fix what failed above, then run: ${C.CLI} doctor`);
+        break;
+      }
+      const a = String(await ctx.ask.ask('Fix what failed above, then press Enter to check again ("done" to stop here)', "")).trim().toLowerCase();
+      if (a === "done" || a === "skip") {
+        log(`\nRun "${C.CLI} doctor" any time to check again.`);
+        break;
+      }
+    }
   } else if (!w.answers.deploy) {
     log('Deploy when you are ready: coderhelm-selfhost deploy');
   }

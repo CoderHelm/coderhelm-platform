@@ -99,7 +99,7 @@ test("back returns to the previous step and keeps going", async () => {
     ["AWS account", ACCOUNT],
     ["AWS region", "us-east-1"],
     ["short name", "prod"],
-    ["Hostname", "back"], // → Where to install again
+    ["Hostname", "back"], // back to "Where to install"
     ["AWS account", ACCOUNT],
     ["AWS region", "us-west-2"],
     ["short name", "team"],
@@ -222,12 +222,18 @@ test("not signed in: offers the profiles and an SSO sign-in", async () => {
   delete process.env.AWS_PROFILE;
 });
 
-test("Bedrock access is checked per model, with the link to turn it on", async () => {
+test("Bedrock access is checked per model; without a terminal a missing model stops the install with the fix", async () => {
   const dir = tmp();
   const runner = aws({ "get-foundation-model-availability": { authorizationStatus: "NOT_AUTHORIZED" } });
-  const { out } = await run(["init", "--yes", "--config", path.join(dir, "c.json"), "--region", "eu-west-1", "--admin", "a@example.org", "--provider", "bedrock"], { runner, interactive: false });
-  assert.match(out, /TODO anthropic\.claude-opus-5-5 is not enabled/);
-  assert.match(out, /bedrock\/home\?region=eu-west-1#\/modelaccess/);
+  const err = await main(["init", "--yes", "--config", path.join(dir, "c.json"), "--region", "eu-west-1", "--admin", "a@example.org", "--provider", "bedrock"], { runner, interactive: false, log: () => {} }).catch((e) => e);
+  assert.ok(err instanceof Error);
+  assert.match(err.message, /FAIL\s+Claude models enabled in Bedrock/);
+  assert.match(err.message, /Claude Opus 5\.5 \(anthropic\.claude-opus-5-5\)/);
+  assert.match(err.message, /bedrock\/home\?region=eu-west-1#\/modelaccess/);
+  assert.doesNotMatch(err.message, /\n\s+at /, "no stack trace in the message");
+  // --skip-checks lets it through (the doctor still reports it later).
+  const ok = await run(["init", "--yes", "--config", path.join(dir, "d.json"), "--region", "eu-west-1", "--admin", "a@example.org", "--provider", "bedrock", "--skip-checks", "bedrock"], { runner, interactive: false });
+  assert.equal(ok.code, 0);
 });
 
 test("helpers: progress bar, prefixes, key check, cost, config", async () => {

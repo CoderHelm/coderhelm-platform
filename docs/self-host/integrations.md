@@ -14,7 +14,7 @@ Required. See [The GitHub App](./github-app.md).
 
 Two ways, both pointing at your own URL:
 
-**Jira webhook (simplest).** In **Settings → Jira**, CoderHelm shows a webhook URL for your team (`<your URL>/webhooks/jira/<token>`) and its secret. Add it as a webhook in Jira's system settings for issue events. Nothing else to install.
+**Jira webhook (simplest).** In **Settings, Integrations, Jira**, CoderHelm shows a webhook URL for your team (`<your URL>/webhooks/jira/<token>`) and its secret. Add it as a webhook in Jira's system settings for issue events. Nothing else to install.
 
 **Your own copy of the Forge app.** The Forge app in [`coderhelm-jira/`](../../coderhelm-jira) adds the settings page inside Jira and Confluence publishing. Forge apps are owned by the account that registers them, so you deploy your own copy:
 
@@ -36,7 +36,7 @@ Teams connect their own incoming webhooks in the dashboard's notification settin
 
 ## Connected AWS accounts (logs, metrics, Airflow)
 
-Teams connect their own AWS accounts read-only from **Settings → Integrations → AWS**. CoderHelm shows a CloudFormation quick-create link for a `CoderHelmLogReader` role that trusts **your** install's account with an external id. The template comes from `logReaderTemplateUrl` (CoderHelm's public copy by default; the same template is in [`infra/cfn/`](../../infra/cfn) if you prefer to host it).
+Teams connect their own AWS accounts read-only from **Settings, Integrations, AWS**. CoderHelm shows a CloudFormation quick-create link for a `CoderHelmLogReader` role that trusts **your** install's account with an external id. The template comes from `logReaderTemplateUrl` (CoderHelm's public copy by default; the same template is in [`infra/cfn/`](../../infra/cfn) if you prefer to host it).
 
 `integrations.logAnalyzer` (on by default) runs a scheduled analysis of those accounts' logs every 6 hours.
 

@@ -160,6 +160,9 @@ class Handler(unittest.TestCase):
         self.assertEqual((h["status"], h["reason"]), ("rolled_back", "health check failed after deploy"))
         self.assertIn("v2.0.0", self.store.get("UPDATE_STATE")["failed_versions"])
         self.assertTrue(self.notices[-1].startswith("CoderHelm rolled back"))
+        # The dashboard's preflight reads the failed versions from status.
+        s = u.handle({"action": "status"}, self.env, self.store, SUNDAY_3AM, self.fetch)
+        self.assertEqual(s["failed_versions"], ["v2.0.0"])
 
     def test_rollback_targets_the_version_before_the_last_success(self):
         with self.assertRaises(ValueError):

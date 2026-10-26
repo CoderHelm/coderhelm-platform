@@ -580,7 +580,7 @@ pub const CAPABILITIES: &[Capability] = &[
     },
     Capability {
         key: "system",
-        label: "See this install's version, update it or roll it back, and send a test email (self-hosted installs; install admins only)",
+        label: "See this install's version, setup checks and update readiness, update it or roll it back, and send a test email (self-hosted installs; install admins only)",
         min_role: "admin",
         // Also checked inside each handler: the person must be an install
         // admin (PLATFORM_ADMIN_EMAILS).
@@ -590,6 +590,8 @@ pub const CAPABILITIES: &[Capability] = &[
             "system::update_now",
             "system::rollback",
             "system::test_email",
+            "setup_checks::checks",
+            "setup_checks::preflight_route",
         ],
     },
     Capability {
