@@ -54,6 +54,7 @@ pub mod sns;
 pub mod support;
 pub mod support_access;
 pub mod system;
+pub mod system_models;
 pub mod telemetry;
 pub mod tests;
 pub mod tests_setup;

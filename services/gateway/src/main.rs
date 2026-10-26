@@ -1,4 +1,5 @@
 use axum::{
+    extract::State,
     http::header,
     middleware as axum_middleware,
     routing::{delete, get, post, put},
@@ -56,7 +57,8 @@ async fn main() -> Result<(), Error> {
     let kms = aws_sdk_kms::Client::new(&aws_config);
     let sts = aws_sdk_sts::Client::new(&aws_config);
     let bedrock = aws_sdk_bedrockruntime::Client::new(&aws_config);
-    // Claude through Bedrock when the deployment says so (MODEL_PROVIDER).
+    // Claude through Bedrock: set on every install, so a switch to Bedrock
+    // in Settings needs no restart.
     common::model_provider::set_bedrock_client(bedrock.clone());
     let scheduler = common::plugins::schedule::aws_sdk_scheduler::Client::new(&aws_config);
     let sm = aws_sdk_secretsmanager::Client::new(&aws_config);
@@ -145,6 +147,18 @@ async fn main() -> Result<(), Error> {
         .route("/system/update", post(routes::system::update_now))
         .route("/system/rollback", post(routes::system::rollback))
         .route("/system/test-email", post(routes::system::test_email))
+        // The model check before an update, run again now ("Check again").
+        .route("/system/update-check", post(routes::system::check_update))
+        // How the install calls Claude: Bedrock or Anthropic API keys,
+        // switched at any time once every model answers.
+        .route(
+            "/system/models",
+            get(routes::system_models::get_models).put(routes::system_models::set_models),
+        )
+        .route(
+            "/system/models/check",
+            post(routes::system_models::check_models),
+        )
         // Your own domain: status and records, set, back to the AWS address.
         .route(
             "/system/domain",
@@ -1296,10 +1310,16 @@ async fn main() -> Result<(), Error> {
             header::CACHE_CONTROL,
             header::HeaderValue::from_static("no-store"),
         ))
-        // The public URL, if it couldn't be read at start (first deploy).
-        .layer(axum::middleware::from_fn(
-            |req: axum::extract::Request, next: axum::middleware::Next| async move {
+        // The public URL, if it couldn't be read at start (first deploy),
+        // and the install's model provider (Settings, System, Models), read
+        // again at most every 30 seconds.
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            |State(st): State<Arc<AppState>>,
+             req: axum::extract::Request,
+             next: axum::middleware::Next| async move {
                 common::public_urls::ensure().await;
+                common::model_provider::refresh(&st.dynamo, &st.config.settings_table_name).await;
                 next.run(req).await
             },
         ))

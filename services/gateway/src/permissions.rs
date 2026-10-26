@@ -603,6 +603,7 @@ pub const CAPABILITIES: &[Capability] = &[
             "system::version",
             "system::set_auto_update",
             "system::update_now",
+            "system::check_update",
             "system::rollback",
             "system::test_email",
             "system::domain",
@@ -620,6 +621,18 @@ pub const CAPABILITIES: &[Capability] = &[
             "hybrid_install::github_repositories",
             "hybrid_install::github_unlink",
             "hybrid_install::put_settings",
+        ],
+    },
+    Capability {
+        key: "system.models",
+        label: "Change how this install calls Claude (Amazon Bedrock or Anthropic API keys), after every model it uses answers a test call (self-hosted installs; install admins only)",
+        min_role: "admin",
+        // Also checked inside each handler: the person must be an install
+        // admin (PLATFORM_ADMIN_EMAILS).
+        handlers: &[
+            "system_models::get_models",
+            "system_models::check_models",
+            "system_models::set_models",
         ],
     },
     Capability {
@@ -719,7 +732,7 @@ pub const CUSTOM_PREFIX: &str = "custom:";
 /// Capabilities a custom role can never hold, whatever the table says about
 /// them: managing roles, and support (checked by built-in role inside the
 /// support handlers), stay with built-in admins and owners.
-pub const NEVER_IN_CUSTOM_ROLES: &[&str] = &["roles", "support", "system"];
+pub const NEVER_IN_CUSTOM_ROLES: &[&str] = &["roles", "support", "system", "system.models"];
 
 /// The id in a `custom:<id>` role, or `None` for a built-in role.
 pub fn custom_role_id(role: &str) -> Option<&str> {

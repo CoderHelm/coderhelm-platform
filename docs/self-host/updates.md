@@ -42,13 +42,17 @@ npx -y github:CoderHelm/coderhelm-platform auto-update on --window "Sun 03:00" -
 
 The settings take effect at once (no deploy). The same values in `coderhelm.config.json` under `updates` are the starting point of a new install.
 
-An update starts only when all of these hold: auto-update is on, the hour is the window's hour in your time zone, the release is on your channel, it isn't a major release while majors are `ask`, no update is running, and that version hasn't already failed (an admin can still start it by hand).
+An update starts only when all of these hold: auto-update is on, the hour is the window's hour in your time zone, the release is on your channel, it isn't a major release while majors are `ask`, no update is running, that version hasn't already failed (an admin can still start it by hand), and every model the release calls answers a test call through your provider.
+
+## The model check
+
+Each release lists the models it calls (`models.json`, made from the code and covered by the signed `SHA256SUMS`). The updater reads it only after a read-only build has checked the release's signature and the file's checksum; until then the update waits. Before an update, automatic or **Update now**, the updater asks the worker to make one test call to each, through your current provider (Bedrock or Anthropic keys). If one is refused, the update waits: **Settings, System** and **Setup** say **Update to vX needs your action** with the model, the fix and the AWS console link, and admins get one email. The check runs again daily and the update applies by itself once it passes (with auto-update on). **Check again** reruns it now. CoderHelm never accepts model terms or submits forms for you; see [Model providers](./model-providers.md#bedrock-model-access).
 
 ## Update readiness
 
 Before you update, **Settings, then System** shows **Update readiness**: the same checks an update makes, run now, each with its fix.
 
-- **Blocks the update:** a check that fails (the update's health check would stop it), or an update already running. **Update now** stays off until it is fixed.
+- **Blocks the update:** a check that fails (the update's health check would stop it), a model the release calls that was refused, or an update already running. **Update now** stays off until it is fixed.
 - **Read first:** a major release whose notes ask you to do something, or a release whose last try failed or rolled back (with the reason).
 
 Each item says what is wrong and how to fix it: a command to copy, a link, or a page in CoderHelm. **Check again** reruns them. The same list is `GET /api/system/preflight`; see [Check your install](./check-your-install.md).

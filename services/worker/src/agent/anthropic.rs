@@ -386,6 +386,34 @@ pub async fn converse_simple(
     extract_text(&resp.blocks())
 }
 
+/// The model check's test call: one token out, recorded on the client's
+/// meter like any call. `Ok` when the model answered (a reply cut at the
+/// one-token limit is an answer).
+pub async fn probe(
+    client: &AnthropicClient,
+    model_id: &str,
+    usage: &mut crate::models::TokenUsage,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let request = MessagesRequest {
+        model: model_id.to_string(),
+        max_tokens: 1,
+        system: vec![],
+        messages: vec![ApiMessage {
+            role: "user".to_string(),
+            content: vec![json!({ "type": "text", "text": "Reply with OK." })],
+        }],
+        tools: None,
+        cache_control: None,
+        thinking: None,
+        output_config: None,
+        context_management: None,
+        fallbacks: None,
+        tool_choice: None,
+        temperature: None,
+    };
+    send_request(client, &request, usage).await.map(|_| ())
+}
+
 /// One call whose answer is a JSON object matching `schema`, parsed. With
 /// `constrained`, the API holds the answer to the schema (structured
 /// outputs); without, the schema is in the instructions and the answer's

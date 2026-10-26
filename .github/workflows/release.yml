@@ -181,7 +181,12 @@ jobs:
           # The publish job uploads this same launch-stack.yaml to S3.
           node selfhost/launch/stamp-template.mjs infra/cfn/coderhelm-selfhost-launch.yaml "$TAG" > dist/launch-stack.yaml
           cp selfhost/launch/bootstrap.mjs dist/launch-bootstrap.mjs
-          (cd dist && sha256sum gateway.zip worker.zip mcp-proxy.zip dashboard.tar.gz source.tar.gz coderhelm-selfhost.tgz install.sh launch-stack.yaml launch-bootstrap.mjs > SHA256SUMS)
+          # The models this release calls, read from the code, with their
+          # Bedrock ids per inference profile prefix. In the signed
+          # SHA256SUMS: the updater reads it only through the update build,
+          # after the signature check (lambda/updater, model_check).
+          node selfhost/launch/release-models.mjs "$TAG" > dist/models.json
+          (cd dist && sha256sum gateway.zip worker.zip mcp-proxy.zip dashboard.tar.gz source.tar.gz coderhelm-selfhost.tgz install.sh launch-stack.yaml launch-bootstrap.mjs models.json > SHA256SUMS)
           cat dist/SHA256SUMS
 
       # The release's own CDK app synthesizes for a fresh self-host config.
@@ -258,6 +263,7 @@ jobs:
             dist/install.sh
             dist/launch-bootstrap.mjs
             dist/launch-stack.yaml
+            dist/models.json
 
       # A published release's files are never replaced: a re-run only fills in
       # a release that has no SHA256SUMS yet (one made by hand, without

@@ -444,6 +444,35 @@ class BedrockProvider(unittest.TestCase):
         env["BEDROCK_MODEL_IDS"] = '{"claude-sonnet-5-5": "arn:aws:bedrock:eu-west-1:1:application-inference-profile/p"}'
         self.assertTrue(self.u.bedrock_model_id("claude-sonnet-5-5", env).startswith("arn:"))
 
+    def test_the_stored_switch_wins_and_is_read_every_30_seconds(self):
+        u = self.u
+        reads = []
+        stored = {"provider": "bedrock", "inference_prefix": "eu.", "model_ids": {}}
+        old = (u.RUNTIME_LOADER, dict(u._runtime))
+        self.addCleanup(lambda: (setattr(u, "RUNTIME_LOADER", old[0]), u._runtime.update(old[1])))
+        u.RUNTIME_LOADER = lambda: reads.append(1) or stored
+        u._runtime.update(at=None, value=None)
+        clock = [100.0]
+        tick = lambda: clock[0]
+        self.assertEqual(u.provider_settings({}, tick)["provider"], "bedrock")
+        self.assertEqual(u.provider_settings({}, tick)["inference_prefix"], "eu.")
+        self.assertEqual(len(reads), 1)
+        # Switched back to keys: seen after 30 seconds.
+        stored = {"provider": "anthropic"}
+        u.RUNTIME_LOADER = lambda: reads.append(1) or stored
+        clock[0] += 31
+        self.assertEqual(u.provider_settings({"MODEL_PROVIDER": "bedrock"}, tick)["provider"], "anthropic")
+        # A broken record: the deploy config.
+        for bad in ({"provider": "openai"}, {"provider": "bedrock", "inference_prefix": "US"},
+                    {"provider": "bedrock", "model_ids": {"x": "gpt"}}, None, "x"):
+            self.assertEqual(u.resolve_settings(bad, u.deploy_settings({"MODEL_PROVIDER": "bedrock"}))["provider"], "bedrock")
+
+    def test_bedrock_names_match_the_release_manifest(self):
+        import json as _j
+        import pathlib as _p
+        m = _j.loads((_p.Path(__file__).resolve().parents[2] / "services/common/release_models.json").read_text())
+        self.assertEqual(self.u.BEDROCK_NAMES, m["bedrock_names"])
+
     def test_body(self):
         b = self.u.bedrock_body({"model": "m", "stream": True, "max_tokens": 5})
         self.assertEqual(b, {"max_tokens": 5, "anthropic_version": "bedrock-2023-05-31"})

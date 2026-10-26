@@ -115,6 +115,10 @@ class Handler(unittest.TestCase):
         self.builds, self.notices = [], []
         u.start_build = lambda env, version, actor, mode, hid, extra=None: self.builds.append((version, actor, mode, hid)) or f"b-{len(self.builds)}"
         u.notify = lambda subject, text, env=None: self.notices.append(subject) or 1
+        # Releases checked by the build and listing no models: nothing to check.
+        real = u.verified_manifest
+        u.verified_manifest = lambda store, version: (True, None)
+        self.addCleanup(setattr, u, "verified_manifest", real)
         self.env = {"CODERHELM_VERSION": "v1.0.0", "APP_URL": "https://helm.example.org", "UPDATE_PROJECT_NAME": "p"}
 
     def fetch(self, _repo):
@@ -190,6 +194,10 @@ class NoDowngrade(unittest.TestCase):
         u.notify = lambda subject, text, env=None: 1
         self.env = {"CODERHELM_VERSION": "v1.2.0", "APP_URL": "https://helm.example.org", "UPDATE_PROJECT_NAME": "p"}
         self.fetch = lambda _r: [rel("v1.3.0")]
+        # Signed releases that list no models: the model check has nothing to hold.
+        real = u.verified_manifest
+        u.verified_manifest = lambda store, version: (True, None)
+        self.addCleanup(setattr, u, "verified_manifest", real)
 
     def test_update_now_never_goes_back_or_sideways(self):
         for v in ("v1.1.0", "v1.2.0", "v1.2.0-rc.1"):
@@ -243,6 +251,250 @@ class NoDowngrade(unittest.TestCase):
         self.assertIsNone(s["latest"])
         with self.assertRaises(ValueError):
             u.fetch_releases("evil/coderhelm-platform")
+
+
+MANIFEST = {
+    "schema": 1, "version": "v1.1.0",
+    "calls": ["claude-opus-5-5", "claude-sonnet-5-5"],
+    "bedrock": {
+        "claude-opus-5-5": {"us.": "us.anthropic.claude-opus-5-5", "eu.": "eu.anthropic.claude-opus-5-5"},
+        "claude-sonnet-5-5": {"us.": "us.anthropic.claude-sonnet-5-5", "eu.": "eu.anthropic.claude-sonnet-5-5"},
+    },
+}
+
+REFUSED = {
+    "status": "fail", "code": "use_case_required",
+    "detail": "Bedrock refused us.anthropic.claude-sonnet-5-5: Anthropic's use case details haven't been submitted for this AWS account.",
+    "fix": "Submit the use case details on the Bedrock console's Model access page (a person fills in the form once per account), then check again.",
+    "url": "https://console.aws.amazon.com/bedrock/home?region=us-east-1#/modelaccess",
+}
+
+
+class FakeWorker:
+    """Stands in for the worker's model check: no real model calls."""
+
+    def __init__(self, refuse=("claude-sonnet-5-5",)):
+        self.refuse = set(refuse)
+        self.payloads = []
+
+    def __call__(self, env, payload):
+        self.payloads.append(payload)
+        out = []
+        for t in payload["targets"]:
+            m = t["model"]
+            if m in self.refuse:
+                out.append(dict(REFUSED, model=m, id=t["bedrock_ids"].get("us.", m)))
+            else:
+                out.append({"model": m, "id": t["bedrock_ids"].get("us.", m), "status": "pass", "code": "ok", "detail": "answered"})
+        return {"provider": "bedrock", "region": "us-east-1", "inference_prefix": "us.", "results": out}
+
+
+class ModelCheck(unittest.TestCase):
+    """The check before an update: a refused model holds it, a pass lets it go."""
+
+    def setUp(self):
+        self.db = FakeDynamo()
+        self.store = u.Store(self.db, "t")
+        self.builds, self.notices, self.texts = [], [], []
+        real_build, real_notify = u.start_build, u.notify
+        u.start_build = lambda env, version, actor, mode, hid, extra=None: self.builds.append((version, actor, mode)) or "b-1"
+        u.notify = lambda subject, text, env=None: self.notices.append(subject) or self.texts.append(text) or 1
+        self.addCleanup(setattr, u, "start_build", real_build)
+        self.addCleanup(setattr, u, "notify", real_notify)
+        real_check = u.start_check
+        u.start_check = lambda env, version: self.builds.append((version, "check", "release-check")) or "c-1"
+        self.addCleanup(setattr, u, "start_check", real_check)
+        self.env = {"CODERHELM_VERSION": "v1.0.0", "APP_URL": "https://helm.example.org", "UPDATE_PROJECT_NAME": "p",
+                    "WORKER_FUNCTION_NAME": "coderhelm-prod-worker", "CONFIGURED_MODELS": "claude-opus-5-5,claude-sonnet-5-5"}
+        self.worker = FakeWorker()
+        # The update build checked v1.1.0's signature and models.json.
+        self.store.put("MANIFEST#v1.1.0", {"verified": True, "manifest": MANIFEST})
+        u.handle({"action": "settings", "settings": {"auto": True, "day": "daily"}}, self.env, self.store, SUNDAY_3AM, self.releases)
+
+    def releases(self, _repo):
+        return [rel("v1.1.0")]
+
+    def tick(self, at):
+        return u.handle({"action": "tick"}, self.env, self.store, at, self.releases, self.worker)
+
+    def test_a_refused_model_holds_the_update_and_tells_the_admins_once(self):
+        d = self.tick(SUNDAY_3AM)
+        self.assertEqual(d["action"], "notify")
+        self.assertIn("model this release calls was refused", d["reason"])
+        self.assertEqual(self.builds, [])
+        self.assertIn("Update to v1.1.0 needs your action", self.notices)
+        text = self.texts[self.notices.index("Update to v1.1.0 needs your action")]
+        self.assertIn("claude-sonnet-5-5", text)
+        self.assertIn("#/modelaccess", text)
+        self.assertIn("done by a person in the AWS console", text)
+        # The worker was asked with the release's Bedrock ids per prefix.
+        t = self.worker.payloads[0]["targets"]
+        self.assertEqual([x["model"] for x in t], ["claude-opus-5-5", "claude-sonnet-5-5"])
+        self.assertEqual(t[0]["bedrock_ids"]["eu."], "eu.anthropic.claude-opus-5-5")
+        # Status carries the check for Settings, System and Setup.
+        s = u.handle({"action": "status"}, self.env, self.store, SUNDAY_3AM, self.releases)
+        self.assertFalse(s["model_check"]["ok"])
+        self.assertTrue(s["model_check"]["results"][1]["required"])
+        # An hour later: not checked again, not notified again.
+        self.tick(SUNDAY_3AM + timedelta(hours=1))
+        self.assertEqual(len(self.worker.payloads), 1)
+        self.assertEqual(self.notices.count("Update to v1.1.0 needs your action"), 1)
+
+    def test_the_daily_retry_applies_the_update_once_it_passes(self):
+        self.tick(SUNDAY_3AM)
+        self.assertEqual(self.builds, [])
+        # A person submitted the form; the next day's check passes.
+        self.worker.refuse = set()
+        nextday = SUNDAY_3AM + timedelta(days=1)
+        d = self.tick(nextday)
+        self.assertEqual(d["action"], "update")
+        self.assertEqual(self.builds, [("v1.1.0", "auto", "update")])
+        # Checked on first sight, the daily retry, and again right before applying.
+        self.assertEqual(len(self.worker.payloads), 3)
+        self.assertEqual(self.notices.count("Update to v1.1.0 needs your action"), 1)
+
+    def test_a_pass_applies_in_the_window(self):
+        self.worker.refuse = set()
+        d = self.tick(SUNDAY_3AM)
+        self.assertEqual(d["action"], "update")
+        self.assertEqual(self.builds[0][0], "v1.1.0")
+        self.assertNotIn("Update to v1.1.0 needs your action", self.notices)
+
+    def test_a_refusal_found_right_before_applying_stops_it(self):
+        # Checked an hour before the window: passes, nothing applied yet.
+        self.worker.refuse = set()
+        self.assertEqual(self.tick(SUNDAY_3AM - timedelta(hours=1))["action"], "notify")
+        # Model access was turned off since: the check right before applying stops it.
+        self.worker.refuse = {"claude-opus-5-5"}
+        d = self.tick(SUNDAY_3AM)
+        self.assertEqual(d["action"], "none")
+        self.assertEqual(self.builds, [])
+        self.assertIn("Update to v1.1.0 needs your action", self.notices)
+
+    def test_update_now_is_refused_with_the_check_and_no_override(self):
+        with self.assertRaises(u.ModelsBlocked) as e:
+            u.handle({"action": "update_now", "actor": "a@example.org", "skip_check": True}, self.env, self.store,
+                     SUNDAY_3AM, self.releases, self.worker)
+        self.assertTrue(str(e.exception).startswith("Update to v1.1.0 needs your action"))
+        self.assertEqual(e.exception.record["results"][1]["code"], "use_case_required")
+        self.assertNotIn("skippable", e.exception.record)
+        self.assertEqual(self.builds, [])
+        # Fixed: Update now goes ahead.
+        self.worker.refuse = set()
+        e2 = u.handle({"action": "update_now", "actor": "a@example.org"}, self.env, self.store, SUNDAY_3AM,
+                      self.releases, self.worker)
+        self.assertEqual(e2["version"], "v1.1.0")
+
+    def test_skip_is_offered_only_for_a_model_the_release_doesnt_call(self):
+        # The worker reports a model the release doesn't call (not required).
+        class Extra(FakeWorker):
+            def __call__(self, env, payload):
+                out = super().__call__(env, payload)
+                out["results"].append(dict(REFUSED, model="claude-haiku-4-5", id="us.anthropic.claude-haiku-4-5-20251001-v1:0"))
+                return out
+        self.worker = Extra(refuse=())
+        with self.assertRaises(u.ModelsBlocked) as e:
+            u.handle({"action": "update_now", "actor": "a"}, self.env, self.store, SUNDAY_3AM, self.releases, self.worker)
+        self.assertTrue(e.exception.record["skippable"])
+        self.assertIn("you can skip this check", str(e.exception))
+        done = u.handle({"action": "update_now", "actor": "a", "skip_check": True}, self.env, self.store, SUNDAY_3AM,
+                        self.releases, self.worker)
+        self.assertEqual(done["note"], "model check skipped for claude-haiku-4-5")
+
+    def test_check_again_runs_now(self):
+        self.tick(SUNDAY_3AM)
+        self.worker.refuse = set()
+        r = u.handle({"action": "model_check"}, self.env, self.store, SUNDAY_3AM + timedelta(minutes=5),
+                     self.releases, self.worker)
+        self.assertTrue(r["model_check"]["ok"])
+        self.assertEqual(len(self.worker.payloads), 2)
+
+    def test_a_signed_release_without_a_manifest_has_nothing_to_check(self):
+        self.store.put("MANIFEST#v1.1.0", {"verified": True, "manifest": None})
+        r = u.handle({"action": "model_check"}, self.env, self.store, SUNDAY_3AM, self.releases, self.worker)
+        self.assertTrue(r["model_check"]["ok"])
+        self.assertEqual(self.worker.payloads, [])
+
+    def test_the_manifest_is_read_only_after_the_signature_check(self):
+        # Nothing verified yet: the build is started in its read-only mode, and the update waits.
+        self.db.items.pop(("SYSTEM", "MANIFEST#v1.1.0"))
+        self.worker.refuse = set()
+        d = self.tick(SUNDAY_3AM)
+        self.assertEqual(self.builds, [("v1.1.0", "check", "release-check")])
+        self.assertEqual(d["action"], "notify")
+        self.assertEqual(self.worker.payloads, [])
+        self.assertTrue(self.store.get("MODEL_CHECK")["pending"])
+        with self.assertRaises(u.ModelsBlocked) as e:
+            u.handle({"action": "update_now", "actor": "a"}, self.env, self.store, SUNDAY_3AM, self.releases, self.worker)
+        self.assertIn("signature", str(e.exception))
+        # Not started again within 30 minutes.
+        self.assertEqual(self.builds, [("v1.1.0", "check", "release-check")])
+        # A failed signature check trusts nothing.
+        u.handle({"action": "models_verified", "version": "v1.1.0", "status": "failed", "reason": "bad signature"},
+                 self.env, self.store, SUNDAY_3AM, self.releases, self.worker)
+        self.assertIsNone(self.store.get("MANIFEST#v1.1.0"))
+        # The build reports the verified file: the check runs at once.
+        r = u.handle({"action": "models_verified", "version": "v1.1.0", "status": "verified", "manifest": MANIFEST},
+                     self.env, self.store, SUNDAY_3AM, self.releases, self.worker)
+        self.assertTrue(r["model_check"]["ok"])
+        self.assertEqual(len(self.worker.payloads), 1)
+        # A manifest for another release is refused.
+        with self.assertRaises(ValueError):
+            u.handle({"action": "models_verified", "version": "v1.2.0", "status": "verified", "manifest": MANIFEST},
+                     self.env, self.store, SUNDAY_3AM, self.releases, self.worker)
+
+    def test_the_source_never_downloads_models_json_itself(self):
+        src = PATH.read_text()
+        self.assertNotIn("releases/download", src)
+
+    def test_a_worker_that_doesnt_answer_holds_the_update(self):
+        def broken(env, payload):
+            raise RuntimeError("timeout")
+        d = u.handle({"action": "tick"}, self.env, self.store, SUNDAY_3AM, self.releases, broken)
+        self.assertEqual(d["action"], "notify")
+        self.assertEqual(self.builds, [])
+        self.assertEqual(self.store.get("MODEL_CHECK")["results"][0]["code"], "unreachable")
+
+    def test_the_handler_returns_the_check_with_a_refusal(self):
+        real_handle = u.handle
+        u.handle = lambda event, env, store, now: real_handle(event, env, store, now, self.releases, self.worker)
+        self.addCleanup(setattr, u, "handle", real_handle)
+        real_client = u.client
+        u.client = lambda name, region=None: self.db
+        self.addCleanup(setattr, u, "client", real_client)
+        import os
+        old = dict(os.environ)
+        os.environ.update(self.env, SETTINGS_TABLE_NAME="t")
+        self.addCleanup(lambda: (os.environ.clear(), os.environ.update(old)))
+        out = u.handler({"action": "update_now", "actor": "a"}, None)
+        self.assertFalse(out["ok"])
+        self.assertEqual(out["model_check"]["version"], "v1.1.0")
+
+
+class NeverAcceptsTerms(unittest.TestCase):
+    """The updater only checks: no subscription, agreement or form is ever sent."""
+
+    def test_the_source_never_calls_an_accepting_api(self):
+        src = PATH.read_text()
+        for word in ("aws-marketplace", "marketplace", "create_foundation_model_agreement",
+                     "put_use_case_for_model_access", "accept_agreement", "subscribe("):
+            code = "\n".join(l for l in src.splitlines() if not l.strip().startswith("#") and '"""' not in l)
+            self.assertNotIn(word, code.lower() if word.islower() else code, word)
+
+    def test_the_worker_call_is_the_only_aws_call(self):
+        calls = []
+
+        class Recorder:
+            def __getattr__(self, name):
+                def f(**kw):
+                    calls.append(name)
+                    return {"Payload": type("P", (), {"read": lambda self: json.dumps({"results": []}).encode()})()}
+                return f
+        real = u.client
+        u.client = lambda name, region=None: calls.append(f"client:{name}") or Recorder()
+        self.addCleanup(setattr, u, "client", real)
+        u.invoke_worker({"WORKER_FUNCTION_NAME": "w"}, {"targets": []})
+        self.assertEqual(calls, ["client:lambda", "invoke"])
 
 
 class FakeLambda:

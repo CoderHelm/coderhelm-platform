@@ -714,6 +714,7 @@ pub mod log_evidence;
 mod log_fix_checks;
 #[cfg(test)]
 mod log_fix_eval;
+pub mod model_check;
 pub mod onboard;
 pub mod ops_tools;
 mod plan;

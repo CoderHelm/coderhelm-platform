@@ -47,6 +47,15 @@ dynamodb = boto3.resource("dynamodb")
 dynamodb_client = boto3.client("dynamodb")
 aws_insights_table = dynamodb.Table(AWS_INSIGHTS_TABLE)
 settings_table = dynamodb.Table(SETTINGS_TABLE)
+
+
+def _stored_model_provider():
+    """The install's model provider from Settings, System, Models (or None)."""
+    item = settings_table.get_item(Key={"pk": "SYSTEM", "sk": "MODELS"}).get("Item") or {}
+    return json.loads(item["data"]) if item.get("data") else None
+
+
+usage.RUNTIME_LOADER = _stored_model_provider
 sts_client = boto3.client("sts")
 kms_client = boto3.client("kms")
 

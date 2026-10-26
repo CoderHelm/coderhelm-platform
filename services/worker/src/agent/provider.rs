@@ -33,6 +33,8 @@ impl ModelProvider {
         settings_table: &str,
         team_id: &str,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        // The install's provider as it is now (Settings, System, Models).
+        common::model_provider::refresh(dynamo, settings_table).await;
         let result = dynamo
             .get_item()
             .table_name(settings_table)
@@ -142,16 +144,43 @@ impl ModelProvider {
         &self.api_key
     }
 
-    /// A client whose every response is counted for this team.
+    /// A client whose every response is counted for this team, on the
+    /// install's provider as it is now. A run that started on Bedrock with
+    /// no team key loaded keeps Bedrock after a switch to Anthropic keys, so
+    /// a switch never breaks a run under way.
     pub fn client(&self) -> AnthropicClient {
         let meter = self.meter.clone().unwrap_or_else(|| {
             tracing::warn!("Model provider without a usage meter; usage stays uncounted");
             common::usage::UsageMeter::memory("").0
         });
-        match common::model_provider::bedrock_client() {
-            Some(bedrock) => AnthropicClient::bedrock(bedrock.clone(), meter),
-            None => AnthropicClient::new(self.api_key.clone(), meter),
+        let bedrock = common::model_provider::any_bedrock_client();
+        match pick_client(
+            common::model_provider::is_bedrock(),
+            bedrock.is_some(),
+            !self.api_key.is_empty(),
+        ) {
+            ClientKind::Bedrock => match bedrock {
+                Some(b) => AnthropicClient::bedrock(b.clone(), meter),
+                None => AnthropicClient::new(self.api_key.clone(), meter),
+            },
+            ClientKind::Anthropic => AnthropicClient::new(self.api_key.clone(), meter),
         }
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum ClientKind {
+    Bedrock,
+    Anthropic,
+}
+
+/// Which client a call gets: the provider in force, except that a run with
+/// no team key stays on Bedrock (it started there before a switch).
+fn pick_client(bedrock_now: bool, have_bedrock: bool, have_key: bool) -> ClientKind {
+    if have_bedrock && (bedrock_now || !have_key) {
+        ClientKind::Bedrock
+    } else {
+        ClientKind::Anthropic
     }
 }
 
@@ -171,6 +200,8 @@ pub async fn converse(
     on_tool_call: Option<&super::llm::OnToolCall>,
     conversation_log: Option<&mut Vec<serde_json::Value>>,
 ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    // A switch in Settings, System, Models reaches the next loop.
+    common::model_provider::refresh(&state.dynamo, &state.config.settings_table_name).await;
     let client = provider.client();
     // Every call this loop makes is asked of the policy gate first.
     let gate = super::policy::gate(state, provider.scope.ctx(agent), opts.deadline)
@@ -196,13 +227,32 @@ pub async fn converse(
 
 /// Simple one-shot converse (no tools) via Anthropic Messages API.
 pub async fn converse_simple(
-    _state: &crate::WorkerState,
+    state: &crate::WorkerState,
     provider: &ModelProvider,
     model_id: &str,
     system_prompt: &str,
     user_message: &str,
     usage: &mut TokenUsage,
 ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    common::model_provider::refresh(&state.dynamo, &state.config.settings_table_name).await;
     let client = provider.client();
     anthropic::converse_simple(&client, model_id, system_prompt, user_message, usage).await
+}
+
+#[cfg(test)]
+mod client_tests {
+    use super::*;
+
+    #[test]
+    fn a_switch_never_strands_a_run() {
+        // Bedrock now: Bedrock.
+        assert_eq!(pick_client(true, true, false), ClientKind::Bedrock);
+        assert_eq!(pick_client(true, true, true), ClientKind::Bedrock);
+        // Switched to Anthropic keys: the team's key when it has one...
+        assert_eq!(pick_client(false, true, true), ClientKind::Anthropic);
+        // ...and a run that started on Bedrock without a key finishes there.
+        assert_eq!(pick_client(false, true, false), ClientKind::Bedrock);
+        // No Bedrock client at all: the Anthropic API.
+        assert_eq!(pick_client(false, false, true), ClientKind::Anthropic);
+    }
 }

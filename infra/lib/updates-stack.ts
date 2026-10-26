@@ -48,6 +48,49 @@ export interface UpdatesStackProps extends cdk.StackProps {
 }
 
 /** The update build's script (also checked by the tests). */
+/**
+ * The release check (read-only): before the updater applies a release, it
+ * needs the models that release calls. This build checks SHA256SUMS's
+ * signature exactly as the update build does, then reads models.json only
+ * when the signed SHA256SUMS lists it and its checksum matches, and reports
+ * it to the updater (models_verified). It installs and deploys nothing, and
+ * its role can only report back.
+ */
+export function releaseCheckBuildSpec(cfg: ResolvedConfig): codebuild.BuildSpec {
+  return codebuild.BuildSpec.fromObject({
+    version: "0.2",
+    env: { shell: "bash" },
+    phases: {
+      install: { "runtime-versions": { nodejs: 20 }, commands: ["set -euo pipefail", ...installCosignCommands()] },
+      build: {
+        commands: [
+          "set -euo pipefail",
+          CHECK_VERSION,
+          "mkdir -p /tmp/ch && cd /tmp/ch",
+          RELEASE_BASE,
+          `${CURL} -o SHA256SUMS "$B/SHA256SUMS"`,
+          `${CURL} -o SHA256SUMS.sigstore.json "$B/SHA256SUMS.sigstore.json"`,
+          VERIFY_SUMS,
+          // A signed release from before model manifests lists none.
+          "if grep -q ' models.json$' SHA256SUMS; then " +
+            `${CURL} -o models.json "$B/models.json"; ` +
+            "grep ' models.json$' SHA256SUMS | sha256sum -c -; " +
+            'node -e \'process.stdout.write(JSON.stringify({status:"verified",manifest:JSON.parse(require("fs").readFileSync("models.json","utf8"))}))\' > /tmp/result.json; ' +
+            'else echo \'{"status":"verified","manifest":null}\' > /tmp/result.json; fi',
+        ],
+      },
+      post_build: {
+        commands: [
+          // Anything short of a verified result reports a failure (nothing is trusted).
+          'if [ "${CODEBUILD_BUILD_SUCCEEDING:-0}" != "1" ] || [ ! -s /tmp/result.json ]; then echo \'{"status":"failed","reason":"the release check failed: see its log"}\' > /tmp/result.json; fi',
+          'node -e \'const r=require("/tmp/result.json");process.stdout.write(JSON.stringify({action:"models_verified",version:process.env.VERSION,status:r.status,reason:r.reason,manifest:r.manifest??null}))\' > /tmp/payload.json',
+          `aws lambda invoke --function-name ${cfg.prefix}-updater --cli-binary-format raw-in-base64-out --payload file:///tmp/payload.json /tmp/out.json`,
+        ],
+      },
+    },
+  });
+}
+
 export function updateBuildSpec(cfg: ResolvedConfig): codebuild.BuildSpec {
   return codebuild.BuildSpec.fromObject({
     version: "0.2",
@@ -100,6 +143,7 @@ export function updateBuildSpec(cfg: ResolvedConfig): codebuild.BuildSpec {
 export class UpdatesStack extends cdk.Stack {
   public readonly updaterFunction: lambda.Function;
   public readonly project: codebuild.Project;
+  public readonly checkProject: codebuild.Project;
 
   constructor(scope: Construct, id: string, props: UpdatesStackProps) {
     super(scope, id, props);
@@ -183,6 +227,37 @@ export class UpdatesStack extends cdk.Stack {
       buildSpec: updateBuildSpec(cfg),
     });
 
+    // --- The release check (read-only; the model check reads its result) ---
+    const checkRole = new iam.Role(this, "ReleaseCheckRole", {
+      roleName: `${prefix}-release-check`,
+      description: "CoderHelm release check: verifies a release's signature and reads its model list; can only report to the updater",
+      assumedBy: new iam.ServicePrincipal("codebuild.amazonaws.com"),
+    });
+    checkRole.addToPolicy(new iam.PolicyStatement({
+      sid: "ReportResult",
+      actions: ["lambda:InvokeFunction"],
+      resources: [`arn:aws:lambda:${this.region}:${this.account}:function:${prefix}-updater`],
+    }));
+    const checkLogs = new logs.LogGroup(this, "ReleaseCheckLogs", {
+      logGroupName: `/aws/codebuild/${prefix}-release-check`,
+      retention: logs.RetentionDays.ONE_MONTH,
+      removalPolicy: cdk.RemovalPolicy.DESTROY,
+    });
+    this.checkProject = new codebuild.Project(this, "ReleaseCheck", {
+      projectName: `${prefix}-release-check`,
+      description: "Checks a CoderHelm release's signature and reads the models it calls (no install, no deploy)",
+      role: checkRole,
+      timeout: cdk.Duration.minutes(15),
+      concurrentBuildLimit: 1,
+      environment: {
+        buildImage: codebuild.LinuxBuildImage.STANDARD_7_0,
+        computeType: codebuild.ComputeType.SMALL,
+        environmentVariables: { VERSION: { value: "" } },
+      },
+      logging: { cloudWatch: { logGroup: checkLogs } },
+      buildSpec: releaseCheckBuildSpec(cfg),
+    });
+
     // --- The updater ---
     const updaterLogs = new logs.LogGroup(this, "UpdaterLogs", {
       logGroupName: `/aws/lambda/${prefix}-updater`,
@@ -197,7 +272,8 @@ export class UpdatesStack extends cdk.Stack {
       handler: "handler.handler",
       code: lambda.Code.fromAsset(repoPath("lambda/updater"), { exclude: ["__pycache__"] }),
       memorySize: 256,
-      timeout: cdk.Duration.seconds(60),
+      // The model check waits on the worker's test calls (retried when Bedrock is busy).
+      timeout: cdk.Duration.minutes(3),
       logGroup: updaterLogs,
       environment: {
         SETTINGS_TABLE_NAME: props.settingsTable.tableName,
@@ -212,6 +288,11 @@ export class UpdatesStack extends cdk.Stack {
         // Your own domain (docs/self-host/domains.md).
         DISTRIBUTION_DOMAIN_PARAMETER: cfg.distributionDomainParameter,
         RESOURCE_PREFIX: prefix,
+        // The model check before an update: the worker makes the test calls
+        // for every model the next release calls, plus the config's own.
+        WORKER_FUNCTION_NAME: `${prefix}-worker`,
+        RELEASE_CHECK_PROJECT_NAME: `${prefix}-release-check`,
+        CONFIGURED_MODELS: [...new Set([cfg.models.primary, cfg.models.light])].join(","),
         ...(cfg.updates.webhookUrl ? { UPDATE_WEBHOOK_URL: cfg.updates.webhookUrl } : {}),
         ...stampEnvironment(stamp),
       },
@@ -219,12 +300,21 @@ export class UpdatesStack extends cdk.Stack {
     props.settingsTable.grantReadWriteData(this.updaterFunction);
     this.updaterFunction.addToRolePolicy(new iam.PolicyStatement({
       actions: ["codebuild:StartBuild"],
-      resources: [this.project.projectArn],
+      resources: [this.project.projectArn, this.checkProject.projectArn],
     }));
     this.updaterFunction.addToRolePolicy(new iam.PolicyStatement({
       actions: ["ses:SendEmail"],
       resources: ["*"],
       conditions: { StringEquals: { "ses:FromAddress": cfg.email.from } },
+    }));
+
+    // The model check: the worker makes the test calls with its own role (or
+    // a team's key). The updater itself never calls a model, and nothing in
+    // the install may subscribe in AWS Marketplace or accept model terms.
+    this.updaterFunction.addToRolePolicy(new iam.PolicyStatement({
+      sid: "ModelCheckThroughWorker",
+      actions: ["lambda:InvokeFunction"],
+      resources: [`arn:aws:lambda:${this.region}:${this.account}:function:${prefix}-worker`],
     }));
 
     // refresh_secrets: stamp SECRETS_REVISION on the functions that read

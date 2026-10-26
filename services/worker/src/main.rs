@@ -42,7 +42,8 @@ async fn main() -> Result<(), Error> {
     let s3 = aws_sdk_s3::Client::new(&aws_config);
     let ses = aws_sdk_sesv2::Client::new(&aws_config);
     let bedrock = aws_sdk_bedrockruntime::Client::new(&aws_config);
-    // Claude through Bedrock when the deployment says so (MODEL_PROVIDER).
+    // Claude through Bedrock: set on every install, so a switch to Bedrock
+    // in Settings needs no restart.
     common::model_provider::set_bedrock_client(bedrock.clone());
     let lambda_client = aws_sdk_lambda::Client::new(&aws_config);
     let sqs = aws_sdk_sqs::Client::new(&aws_config);
@@ -104,6 +105,9 @@ async fn handle_event(
 ) -> Result<serde_json::Value, Error> {
     let (payload, context) = event.into_parts();
     common::public_urls::ensure().await;
+    // The install's model provider (Settings, System, Models), read again
+    // at most every 30 seconds.
+    common::model_provider::refresh(&state.dynamo, &state.config.settings_table_name).await;
     // In-flight model calls are cancelled (and their usage recorded) this
     // long before the Lambda's own deadline, leaving time for the writes.
     common::model_stream::set_deadline_epoch_ms(Some(
@@ -119,6 +123,11 @@ async fn handle_event(
         };
         let call = passes::plan_chat::handle(&state, req);
         Ok(common::usage::with_feature(feature, call).await)
+    } else if let Some(req) = payload.get("model_check") {
+        // The updater's check before it applies a release: one test call
+        // per model, through the install's provider.
+        let req: passes::model_check::Request = serde_json::from_value(req.clone())?;
+        Ok(passes::model_check::run(&state, req).await)
     } else if let Some(req) = payload.get("knowledge_ingest") {
         // A knowledge base file the browser finished uploading (called
         // asynchronously by the gateway).

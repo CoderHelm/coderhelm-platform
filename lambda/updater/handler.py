@@ -26,6 +26,15 @@ Actions (the `action` field of the event):
             the build that puts the domain on CloudFront (mode "domain").
             Also every 5 minutes (EventBridge).
 - domain_remove  back to the AWS (CloudFront) address.
+- model_check  every model the next release calls gets one test call through
+            the install's provider (Settings, System, Models), made by the
+            worker with the install's own role or key. Also before every
+            update (automatic or Update now), on first sight of a release,
+            and once a day while a model is refused. A refused model holds
+            the update: admins are told which model, the fix and the console
+            page, and it applies by itself once the check passes (with
+            auto-update on). Nothing here accepts terms or subscribes to
+            anything; a person does that in the AWS console.
 
 The build itself (CodeBuild, infra/lib/updates-stack.ts) runs
 `coderhelm-selfhost update`: health check, checksum and signature check,
@@ -62,6 +71,8 @@ STALE_SECONDS = 3 * 24 * 3600
 RELEASE_REPO = "CoderHelm/coderhelm-platform"
 RELEASES_URL = f"https://api.github.com/repos/{RELEASE_REPO}/releases?per_page=30"
 RUNNING_STALE = timedelta(hours=3)
+# A refused model is checked again this often (and a pass re-proven before applying).
+MODEL_RETRY = timedelta(days=1)
 PK = "SYSTEM"
 
 DEFAULT_SETTINGS = {
@@ -200,7 +211,7 @@ def pick_latest(releases, channel, current):
     return best
 
 
-def decide(now_utc, settings, current, releases, state):
+def decide(now_utc, settings, current, releases, state, model_check=None):
     """What the hourly check does: none, notify or update (with the reason)."""
     latest = pick_latest(releases, settings["channel"], current)
     if not latest:
@@ -212,6 +223,8 @@ def decide(now_utc, settings, current, releases, state):
     quiet = {"action": "notify" if notify else "none", "version": v}
     if v in (state.get("failed_versions") or []):
         return {**quiet, "reason": "this version failed before; an admin can retry it"}
+    if blocking(model_check, v):
+        return {**quiet, "reason": "a model this release calls was refused; checking again daily"}
     if not settings["auto"]:
         return {**quiet, "reason": "auto-update is off"}
     if latest["breaking"] and settings["majors"] == "ask":
@@ -664,6 +677,201 @@ def domain_finished(store, env, now, entry, status):
     return {"status": status, "domain": dom.get("state") or "none"}
 
 
+# ── The model check before an update ──────────────────────────────────────
+#
+# One record on the settings table (pk SYSTEM, sk MODEL_CHECK):
+#   {version, checked_at, provider, region, inference_prefix, ok, results,
+#    notified}
+# results: one per model, from the worker (common::model_access): model, id,
+# status (pass, fail, skip), code, detail, fix, url, and `required` (the
+# release calls it, or the deploy config names it).
+#
+# The release's models.json (written by its release workflow from the code,
+# selfhost/release-models.mjs, and covered by the signed SHA256SUMS) lists
+# the models it calls and their Bedrock ids for every inference profile
+# prefix. The updater never downloads it: the release
+# check build (its own read-only project) checks SHA256SUMS's signature and
+# the file's checksum, and reports it back (models_verified). Until then the check is pending and
+# holds the update. A signed release without one (older releases) has
+# nothing to check.
+#
+# The check only calls models. It never subscribes, accepts an agreement or
+# submits a form for anyone: those stay a person's action in the console.
+
+
+class ModelsBlocked(ValueError):
+    """Update now refused by the model check (the record goes with it)."""
+
+    def __init__(self, message, record):
+        super().__init__(message)
+        self.record = record
+
+
+VERIFY_RETRY = timedelta(minutes=30)
+
+
+def verified_manifest(store, version):
+    """(known, manifest): the release's models.json as the update build
+    reported it after checking SHA256SUMS's signature and the file's
+    checksum. Never read from anywhere else: an unverified file is never
+    trusted. `manifest` is None for a signed release that lists no models."""
+    rec = store.get(f"MANIFEST#{version}")
+    if rec is None or not rec.get("verified"):
+        return False, None
+    return True, rec.get("manifest")
+
+
+def start_check(env, version):
+    """Starts the release check build (infra/lib/updates-stack.ts,
+    releaseCheckBuildSpec): read-only, it only verifies and reports."""
+    r = client("codebuild").start_build(
+        projectName=env["RELEASE_CHECK_PROJECT_NAME"],
+        environmentVariablesOverride=[{"name": "VERSION", "value": str(version), "type": "PLAINTEXT"}],
+    )
+    return r["build"]["id"]
+
+
+def start_verify(store, env, now, version):
+    """Starts the release check: it verifies the release's signature, reads
+    models.json only when the signed checksums list it and it matches, and
+    reports back (models_verified). At most once every 30 minutes per release."""
+    state = store.get("UPDATE_STATE", {})
+    v = state.get("verifying") or {}
+    if v.get("version") == version:
+        try:
+            if now - datetime.fromisoformat(v["at"]) < VERIFY_RETRY:
+                return False
+        except (KeyError, ValueError):
+            pass
+    try:
+        start_check(env, version)
+    except Exception as e:
+        logger.warning(f"Release check not started: {e}")
+        return False
+    state["verifying"] = {"version": version, "at": now.isoformat()}
+    store.put("UPDATE_STATE", state)
+    return True
+
+
+def configured_models(env):
+    return [m for m in (env.get("CONFIGURED_MODELS") or "").split(",") if m]
+
+
+def check_targets(manifest, env):
+    """Every model the release calls, plus the models the deploy config names,
+    with the release's Bedrock id for each prefix."""
+    calls = list(manifest.get("calls") or [])
+    for m in configured_models(env):
+        if m not in calls:
+            calls.append(m)
+    ids = manifest.get("bedrock") or {}
+    return [{"model": m, "bedrock_ids": ids.get(m) or {}} for m in calls]
+
+
+def invoke_worker(env, payload):
+    """The worker makes the test calls (its role, its meter) and explains them."""
+    r = client("lambda").invoke(
+        FunctionName=env["WORKER_FUNCTION_NAME"],
+        InvocationType="RequestResponse",
+        Payload=json.dumps({"model_check": payload}).encode(),
+    )
+    if r.get("FunctionError"):
+        raise RuntimeError(f"the worker's model check failed: {r['Payload'].read()[:300]!r}")
+    return json.loads(r["Payload"].read() or b"{}")
+
+
+def blocking(record, version):
+    """True when the check for `version` found a model the release calls
+    refused, or hasn't run yet because the release's signature is being checked."""
+    return bool(record and record.get("version") == version
+                and (record.get("pending") or failures(record, required=True)))
+
+
+def failures(record, required=None):
+    out = [r for r in (record or {}).get("results") or [] if r.get("status") == "fail"]
+    if required is not None:
+        out = [r for r in out if bool(r.get("required", True)) == required]
+    return out
+
+
+def model_check(store, env, now, version, repo, probe=invoke_worker):
+    """Runs the check for `version` and stores it. Until the release's
+    signature has been checked, the record is pending (and holds updates)."""
+    known, manifest = verified_manifest(store, version)
+    if not known:
+        start_verify(store, env, now, version)
+        record = {"version": version, "checked_at": now.isoformat(), "ok": False, "pending": True, "results": [],
+                  "note": "checking the release's signature before reading the models it calls"}
+        store.put("MODEL_CHECK", dict(record, notified=False))
+        return record
+    if manifest is None:
+        record = {"version": version, "checked_at": now.isoformat(), "ok": True, "results": [],
+                  "note": "this release lists no models to check"}
+    else:
+        targets = check_targets(manifest, env)
+        required = set(manifest.get("calls") or []) | set(configured_models(env))
+        models = store.get("MODELS") or {}
+        try:
+            answer = probe(env, {"targets": targets, "probe_team": models.get("probe_team")})
+        except Exception as e:  # the worker didn't answer: unknown, not refused
+            logger.warning(f"Model check not run: {e}")
+            answer = {"results": [{"model": t["model"], "id": t["model"], "status": "fail", "code": "unreachable",
+                                   "detail": "The model check couldn't run.",
+                                   "fix": "Check again in a few minutes; if it keeps failing, see the worker's log.",
+                                   } for t in targets]}
+        results = [dict(r, required=r.get("model") in required) for r in answer.get("results") or []]
+        record = {
+            "version": version, "checked_at": now.isoformat(),
+            "provider": answer.get("provider"), "region": answer.get("region"),
+            "inference_prefix": answer.get("inference_prefix"),
+            "ok": not any(r.get("status") == "fail" for r in results),
+            "results": results,
+        }
+    old = store.get("MODEL_CHECK") or {}
+    # Admins hear about a refused model once per release, not every day.
+    record["notified"] = bool(old.get("version") == version and old.get("notified"))
+    store.put("MODEL_CHECK", record)
+    return record
+
+
+def needs_check(record, version, now):
+    if not record or record.get("version") != version or record.get("pending"):
+        return True
+    try:
+        at = datetime.fromisoformat(record["checked_at"])
+    except (KeyError, ValueError):
+        return True
+    return now - at >= MODEL_RETRY
+
+
+def blocked_text(record, env):
+    lines = []
+    for f in failures(record, required=True):
+        lines.append(f"- {f.get('model')}: {f.get('detail')}\n  Fix: {f.get('fix')}" + (f"\n  {f['url']}" if f.get("url") else ""))
+    return (
+        f"CoderHelm won't update to {record['version']} until every model it calls answers.\n\n"
+        + "\n".join(lines)
+        + "\n\nAgreeing to model terms and the Bedrock use case form are done by a person in the AWS console; "
+        "CoderHelm only checks. The check runs again daily, and the update applies by itself once it passes "
+        "if auto-update is on. Check again now: "
+        f"{app_url(env)}/settings/system/#readiness"
+    )
+
+
+def notify_blocked(store, env, record):
+    if record.get("notified") or not failures(record, required=True):
+        return
+    notify(f"Update to {record['version']} needs your action", blocked_text(record, env), env)
+    record["notified"] = True
+    store.put("MODEL_CHECK", record)
+
+
+def blocked_message(record):
+    first = failures(record, required=True) or failures(record)
+    f = first[0] if first else {}
+    return f"Update to {record['version']} needs your action: {f.get('detail', 'a model was refused.')} {f.get('fix', '')}".strip()
+
+
 # ── Actions ───────────────────────────────────────────────────────────────
 
 def app_url(env):
@@ -692,7 +900,8 @@ def begin(store, env, now, version, actor, mode, extra=None, note=None):
     return dict(entry, id=hid)
 
 
-def handle(event, env, store, now, fetch=fetch_releases):
+def handle(event, env, store, now, fetch=fetch_releases, probe=None):
+    probe = probe or invoke_worker
     action = (event or {}).get("action", "tick")
     current = env.get("CODERHELM_VERSION", "")
     repo = env.get("RELEASE_REPO", "CoderHelm/coderhelm-platform")
@@ -718,6 +927,9 @@ def handle(event, env, store, now, fetch=fetch_releases):
             # update preflight shows them with the reason from history.
             "failed_versions": sorted(state.get("failed_versions") or []),
             "history": store.history(),
+            # The model check for the latest release (Settings, System and Setup).
+            "model_check": (lambda mc: mc if latest and mc and mc.get("version") == latest["version"] else None)(
+                store.get("MODEL_CHECK")),
         }
 
     if action == "settings":
@@ -737,7 +949,50 @@ def handle(event, env, store, now, fetch=fetch_releases):
         # Forward only: an older (or the same) release is a rollback.
         if parse_version(current) and compare(version, current) <= 0:
             raise ValueError(f"{version} is not newer than {current}; use Roll back to go to an earlier release")
-        return begin(store, env, now, version, event.get("actor") or "unknown", "update")
+        if running(state, now):
+            raise ValueError("an update is already running")
+        mc = model_check(store, env, now, version, repo, probe)
+        if mc.get("pending"):
+            raise ModelsBlocked(f"Checking {version}'s signature and the models it calls first; try Update now again in a few minutes.", mc)
+        if failures(mc, required=True):
+            # No override: the release would call a model this install can't.
+            raise ModelsBlocked(blocked_message(mc), mc)
+        note = None
+        if failures(mc):
+            if not event.get("skip_check"):
+                raise ModelsBlocked(blocked_message(mc) + " This release doesn't call it, so you can skip this check.",
+                                    dict(mc, skippable=True))
+            note = "model check skipped for " + ", ".join(f.get("model", "?") for f in failures(mc))
+        return begin(store, env, now, version, event.get("actor") or "unknown", "update", note=note)
+
+    if action == "models_verified":
+        # From the release check build, after the signature check.
+        version = event.get("version")
+        if not parse_version(version):
+            raise ValueError("version must look like v1.2.3")
+        if event.get("status") != "verified":
+            logger.warning(f"Release check for {version} failed: {event.get('reason')}")
+            state.pop("verifying", None)
+            store.put("UPDATE_STATE", state)
+            return {"verified": False}
+        m = event.get("manifest")
+        if m is not None and (not isinstance(m, dict) or not isinstance(m.get("calls"), list) or m.get("version") not in (None, version)):
+            raise ValueError("models.json isn't a model manifest for this release")
+        store.put(f"MANIFEST#{version}", {"verified": True, "manifest": m, "at": now.isoformat()})
+        state.pop("verifying", None)
+        store.put("UPDATE_STATE", state)
+        mc = model_check(store, env, now, version, repo, probe)
+        notify_blocked(store, env, mc)
+        return {"verified": True, "model_check": mc}
+
+    if action == "model_check":
+        version = event.get("version")
+        if not version:
+            latest = pick_latest(releases_cached(store, repo, now.timestamp(), fetch), settings["channel"], current)
+            if not latest:
+                return {"model_check": None}
+            version = latest["version"]
+        return {"model_check": model_check(store, env, now, version, repo, probe)}
 
     if action == "rollback":
         target = event.get("version")
@@ -801,7 +1056,13 @@ def handle(event, env, store, now, fetch=fetch_releases):
 
     if action == "tick":
         rel = releases_cached(store, repo, now.timestamp(), fetch)
-        d = decide(now, settings, current, rel, state)
+        latest = pick_latest(rel, settings["channel"], current)
+        mc = store.get("MODEL_CHECK")
+        # First sight of a release, and daily while a model is refused.
+        if latest and not running(state, now) and needs_check(mc, latest["version"], now):
+            mc = model_check(store, env, now, latest["version"], repo, probe)
+            notify_blocked(store, env, mc)
+        d = decide(now, settings, current, rel, state, mc)
         if d["action"] in ("notify", "update") and state.get("notified_version") != d.get("version"):
             latest = pick_latest(rel, settings["channel"], current) or {}
             notify(
@@ -815,7 +1076,14 @@ def handle(event, env, store, now, fetch=fetch_releases):
             state["notified_version"] = d["version"]
             store.put("UPDATE_STATE", state)
         if d["action"] == "update":
-            begin(store, env, now, d["version"], "auto", "update")
+            # Proven again right before applying, whatever the last check said.
+            mc = model_check(store, env, now, d["version"], repo, probe)
+            if blocking(mc, d["version"]):
+                notify_blocked(store, env, mc)
+                d = {"action": "none", "version": d["version"],
+                     "reason": "a model this release calls was refused; checking again daily"}
+            else:
+                begin(store, env, now, d["version"], "auto", "update")
         logger.info(json.dumps(d))
         return d
 
@@ -828,5 +1096,7 @@ def handler(event, context):
     now = datetime.now(timezone.utc)
     try:
         return {"ok": True, **handle(event, env, store, now)}
+    except ModelsBlocked as e:
+        return {"ok": False, "error": str(e), "model_check": e.record}
     except ValueError as e:
         return {"ok": False, "error": str(e)}
