@@ -1,7 +1,7 @@
 use aws_lambda_events::event::sqs::SqsEvent;
 use lambda_runtime::{service_fn, Error, LambdaEvent};
 use std::sync::Arc;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
 mod agent;
@@ -9,6 +9,7 @@ mod clients;
 pub mod memory;
 mod models;
 mod passes;
+mod team_installation;
 
 pub struct WorkerState {
     pub dynamo: aws_sdk_dynamodb::Client,
@@ -152,7 +153,13 @@ async fn handle_sqs(state: Arc<WorkerState>, event: LambdaEvent<SqsEvent>) -> Re
         let body = record.body.unwrap_or_default();
         info!("Processing SQS message");
 
-        let message: models::WorkerMessage = serde_json::from_str(&body)?;
+        // Parsed once: the installation check, the pause hold and the parse
+        // into a message all read the same value.
+        let raw: serde_json::Value = serde_json::from_str(&body)?;
+        if !installation_is_teams_own(&state, &raw).await? {
+            continue;
+        }
+        let message: models::WorkerMessage = serde_json::from_value(raw.clone())?;
         // A held usage record: added once by its call id. A failure fails
         // the message, so SQS delivers it again (and the DLQ keeps it).
         if let models::WorkerMessage::UsageRecord(rec) = &message {
@@ -166,7 +173,6 @@ async fn handle_sqs(state: Arc<WorkerState>, event: LambdaEvent<SqsEvent>) -> Re
         }
         // "Pause all agents": agent work for a paused team is kept exactly as
         // it came and sent again when the pause ends. Nothing is dropped.
-        let raw: serde_json::Value = serde_json::from_str(&body).unwrap_or_default();
         let work = message
             .agent_work()
             .map(|(t, label, run)| (t.to_string(), label, run));
@@ -220,6 +226,46 @@ impl common::agent_policy::pause::Resender for SqsResender<'_> {
             .await
             .map(|_| ())
             .map_err(|e| e.to_string())
+    }
+}
+
+/// A message that names a GitHub installation must name its team's stored
+/// one; anything else is dropped with a warning (see team_installation). A
+/// failed read of the team is returned as an error so SQS retries it.
+async fn installation_is_teams_own(
+    state: &WorkerState,
+    raw: &serde_json::Value,
+) -> Result<bool, Error> {
+    use team_installation::{claims, decide, single_team, stored_installation, Verdict};
+    let kind = raw.get("type").and_then(|t| t.as_str()).unwrap_or("");
+    let (claimed, teams) = claims(raw);
+    if claimed.is_empty() {
+        return Ok(true);
+    }
+    let team = match single_team(&teams) {
+        Ok(t) => t,
+        Err(reason) => {
+            warn!(kind, reason, "Refusing queued message");
+            return Ok(false);
+        }
+    };
+    let stored = match team {
+        Some(t) => stored_installation(&state.dynamo, &state.config.teams_table_name, t).await?,
+        None => None,
+    };
+    match decide(&claimed, team, stored) {
+        Verdict::Allow => Ok(true),
+        Verdict::Refuse(reason) => {
+            warn!(
+                kind,
+                team_id = team.unwrap_or(""),
+                claimed = ?claimed,
+                stored = ?stored,
+                reason,
+                "Refusing queued message: installation does not belong to the team"
+            );
+            Ok(false)
+        }
     }
 }
 

@@ -129,6 +129,22 @@ pub fn detect(event_type: &str, payload: &Value) -> Option<LessonTrigger> {
     }
 }
 
+/// Pure: the comment or review whose author did the pushing back, when the
+/// trigger is one (a reply, a PR comment, a review body, an approval). That
+/// author must have standing before anything is judged: anyone can comment
+/// on or approve a public repository's PR, and an outsider's pushback must
+/// not teach the reviewer. Dismissing a review and merging or closing a PR
+/// already take write access on GitHub, so those have no author to check.
+pub fn pushback_author<'a>(event_type: &str, payload: &'a Value) -> Option<&'a Value> {
+    match event_type {
+        "pull_request_review_comment" | "issue_comment" => Some(&payload["comment"]),
+        "pull_request_review" if payload["action"].as_str() == Some("submitted") => {
+            Some(&payload["review"])
+        }
+        _ => None,
+    }
+}
+
 /// Pure: does the PR qualify, given CoderHelm's review records' verdicts
 /// (newest first)? It must have reviewed the PR; a close also needs its
 /// latest verdict to request changes.
@@ -192,6 +208,11 @@ pub async fn on_webhook(
     let Some(t) = detect(event_type, payload) else {
         return;
     };
+    if let Some(author) = pushback_author(event_type, payload) {
+        if !super::github_webhook::may_start_work(state, team_id, author, "review pushback").await {
+            return;
+        }
+    }
     if !qualifies(
         &verdicts(state, team_id, &t).await,
         t.needs_changes_requested,
@@ -328,6 +349,34 @@ pub async fn delete_lesson(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn pushback_by_words_or_approval_names_its_author() {
+        let p = serde_json::json!({
+            "action": "submitted",
+            "comment": {"id": 1},
+            "review": {"id": 2},
+        });
+        assert_eq!(
+            super::pushback_author("issue_comment", &p),
+            Some(&p["comment"])
+        );
+        assert_eq!(
+            super::pushback_author("pull_request_review_comment", &p),
+            Some(&p["comment"])
+        );
+        assert_eq!(
+            super::pushback_author("pull_request_review", &p),
+            Some(&p["review"])
+        );
+        // Dismissals and closes take write access on GitHub already.
+        let dismissed = serde_json::json!({"action": "dismissed", "review": {"id": 2}});
+        assert_eq!(
+            super::pushback_author("pull_request_review", &dismissed),
+            None
+        );
+        assert_eq!(super::pushback_author("pull_request", &p), None);
+    }
+
     use super::*;
 
     fn repo() -> Value {

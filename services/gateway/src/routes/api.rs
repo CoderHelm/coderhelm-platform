@@ -2860,8 +2860,9 @@ pub async fn forge_register_urls(
         .and_then(|item| item.get("forge_secret"))
         .and_then(|v| v.as_s().ok())
         .map(|s| s.as_str());
+    // Compared in constant time, as the Forge webhook compares it.
     match stored_secret {
-        Some(s) if s == forge_secret => {}
+        Some(s) if super::jira_webhook::forge_secret_matches(s, forge_secret) => {}
         Some(_) => {
             warn!(team_id, "forge-register: invalid forge_secret");
             return Err(StatusCode::FORBIDDEN);

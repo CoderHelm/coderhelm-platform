@@ -1,70 +1,81 @@
 # CoderHelm Platform
 
-Backend services for [CoderHelm](https://coderhelm.com) — the autonomous AI coding agent that turns tickets into pull requests.
+The backend for [CoderHelm](https://coderhelm.com), the AI coding agent that turns GitHub issues and Jira tickets into pull requests and then stays on the code: it fixes its own failing CI, answers review comments, reviews your team's pull requests, turns alerts into fixes and answers questions about your code in Chat.
 
-## How it works
+[Docs](https://docs.coderhelm.com) · [Self-host install guide](https://docs.coderhelm.com/self-host/install/) · [API](https://docs.coderhelm.com/api/) · [Dashboard and sites](https://github.com/CoderHelm/coderhelm)
 
-1. A developer assigns a GitHub issue or Jira ticket to CoderHelm
-2. The **Gateway** receives the webhook, resolves the team/repo, uploads any image attachments to S3, and enqueues a job
-3. The **Worker** picks up the job and runs a multi-pass AI pipeline:
-   - **Triage** — classifies complexity, selects target repo (with image context if available)
-   - **Plan** — generates a task breakdown using codebase context and MCP tools
-   - **Implement** — writes code, creates/edits files, commits to a feature branch
-   - **CI Check** — waits for GitHub Actions, auto-fixes failures (up to 3 attempts)
-   - **Self-Review** — reviews its own diff, fixes issues before requesting human review
-4. A draft PR is opened with a summary, linked ticket, and progress notes
+## How a run works
+
+1. Someone assigns a GitHub issue or Jira ticket to CoderHelm, adds the `coderhelm` label or comments `/coderhelm`.
+2. The **gateway** checks the webhook's signature, finds the team and repository, and puts a job on the queue.
+3. The **worker** runs the job: triage, a plan with the files it will touch, the change on a `coderhelm/` branch, your build and tests in a sandbox with no credentials, up to three rounds of self review and a security check.
+4. It opens the pull request, then keeps working on it: failing checks, review comments, conflicts and, with auto merge on, the deploy check after a person approves.
+
+Every agent call goes through the team's agent permissions (allow, ask or deny), so anything risky waits for a person.
+
+## What else runs here
+
+- **Chat and knowledge:** Chat reads the team's repositories itself (overview, files, code search, code graph) and cites real file paths and lines; knowledge sources sync from Notion, Confluence, Google Drive, Sanity, GitHub, websites and uploaded files.
+- **Reviewer:** reviews any pull request with the review label, with line suggestions, a risk level and a new review on every push.
+- **Tests, releases, logs and alerts:** flaky test detection and quarantine, release tags and notes, log findings every six hours, and alert routes for CloudWatch alarms through SNS.
+- **Team controls:** roles and custom roles, monthly token limits, usage and audit records, team API keys for the [public API](https://docs.coderhelm.com/api/) (its OpenAPI document is generated from the handlers) and a weekly summary email.
+- **Plugins:** packages, runs, approvals and a private marketplace, behind a team flag while the dashboard side is finished.
 
 ## Run it in your own AWS account
 
+The [install guide](https://docs.coderhelm.com/self-host/install/) installs CoderHelm from your browser: one click opens an AWS quick create page, the guide follows the install, creates your GitHub App in one click, checks model access on Amazon Bedrock and helps with your own domain. From a terminal:
+
 ```sh
-npx -y github:CoderHelm/coderhelm-platform init     # a few questions → coderhelm.config.json
-npx -y github:CoderHelm/coderhelm-platform deploy   # deploy, upload the dashboard, create your GitHub App
+npx -y github:CoderHelm/coderhelm-platform init     # a few questions, writes coderhelm.config.json
+npx -y github:CoderHelm/coderhelm-platform deploy   # deploys, uploads the dashboard, creates your GitHub App
+npx -y github:CoderHelm/coderhelm-platform doctor   # checks the install and says how to fix what fails
 ```
 
-No Rust, Docker or domain needed: releases ship built Lambda code, and without a domain CoderHelm runs on a CloudFront URL. Models through your teams' Anthropic keys or Bedrock in your account. Guides: [`docs/self-host/`](docs/self-host/index.md).
+No Rust, Docker or domain needed: releases ship built Lambda code, and without a domain CoderHelm runs on a CloudFront address. Models come through Amazon Bedrock in your account or each team's Anthropic API key. Installs can update themselves in a maintenance window. Guides: [`docs/self-host/`](docs/self-host/index.md), also at [docs.coderhelm.com/self-host](https://docs.coderhelm.com/self-host/).
+
+The first public self-host release is not out yet. Until it is published on the [releases page](https://github.com/CoderHelm/coderhelm-platform/releases), an install cannot finish.
 
 ## Architecture
 
 ```
-services/gateway/    Rust Lambda — GitHub & Jira webhooks, OAuth, REST API, SQS dispatch
-services/worker/     Rust Lambda — AI orchestration (triage → plan → implement → review)
-coderhelm-jira/      Atlassian Forge app — bridges Jira Cloud events to the gateway
-infra/               AWS CDK v2 — all cloud infrastructure, built from one config file (infra/config/)
-installer/           coderhelm-selfhost: install, upgrade, health, backup, uninstall
-selfhost/            Release metadata: migration notes, the dashboard version, install.sh
+services/gateway/    Rust Lambda: webhooks (GitHub, Jira, SNS, knowledge), OAuth, the REST API, queue dispatch
+services/worker/     Rust Lambda: runs, reviews, plans, CI fixes and the other agent work
+services/common/     Shared Rust code: models, knowledge, agent permissions, plugins, notifications
+lambda/              Smaller Lambdas: log analyzer, updater, MCP proxy, stuck run cleanup, sign-in messages
+coderhelm-jira/      Atlassian Forge app that sends Jira Cloud events to the gateway
+infra/               AWS CDK v2: all cloud infrastructure, built from one config file (infra/config/)
+installer/           coderhelm-selfhost: install, doctor, upgrade, backup, uninstall
+selfhost/            Release metadata: migration notes, the dashboard version, install.sh, the launch bootstrap
+plugins/             Example plugin packages
 docs/self-host/      Self-hosting guides
 ```
 
-### Data Flow
+### Data flow
 
 ```
-GitHub issue / Jira ticket (with optional image attachments)
-        │
-        ▼
-  Gateway Lambda  ──▶  validates webhook, resolves team & repo, uploads images to S3
-        │
-        ▼
-      SQS Queue
-        │
-        ▼
-  Worker Lambda   ──▶  triage → plan → implement → CI check → self-review (Anthropic Claude)
-        │
-        ▼
-  Draft PR opened on GitHub with summary & linked ticket
+GitHub issue, Jira ticket or alert
+        |
+  Gateway Lambda    checks the signature, finds the team and repository
+        |
+     SQS queue
+        |
+  Worker Lambda     triage, plan, implement, test, self review (Claude)
+        |
+  Pull request on GitHub, then CI fixes, review replies and the deploy check
 ```
 
-## Tech Stack
+## Tech stack
 
 | Component | Technology |
 |---|---|
-| Gateway & Worker | Rust (async, compiled to ARM64 Lambda) |
-| AI Provider | Anthropic Claude (Opus, Sonnet, Haiku) |
+| Gateway and worker | Rust (async, compiled for ARM64 Lambda) |
+| Models | Claude (Anthropic API or Amazon Bedrock) |
 | Infrastructure | AWS CDK v2 (TypeScript) |
-| Compute | AWS Lambda (ARM64, up to 15 min timeout) |
-| Queue | Amazon SQS (with DLQ) |
-| Storage | Amazon DynamoDB + S3 |
-| Jira Integration | Atlassian Forge (Node.js) |
-| CI/CD | GitHub Actions → CDK deploy |
+| Compute | AWS Lambda (ARM64, up to 15 minutes) |
+| Queue | Amazon SQS (with a dead letter queue) |
+| Storage | Amazon DynamoDB and S3 |
+| Jira integration | Atlassian Forge (Node.js) |
+| CI/CD | GitHub Actions and CDK deploy |
 
 ## Prerequisites
 

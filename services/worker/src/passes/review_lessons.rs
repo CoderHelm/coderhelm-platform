@@ -129,6 +129,17 @@ fn is_person(user: &Value) -> bool {
             .contains("coderhelm")
 }
 
+/// A person whose words or approval may teach the reviewer: a person (not a
+/// bot, not CoderHelm) with standing in the repository (see
+/// `common::standing`). Anyone can comment on or approve a public
+/// repository's PR; an outsider's pushback must never become a lesson.
+fn has_say(item: &Value) -> bool {
+    is_person(&item["user"])
+        && common::standing::association_may_start_work(
+            item["author_association"].as_str().unwrap_or(""),
+        )
+}
+
 fn is_coderhelm(user: &Value) -> bool {
     user["login"].as_str().unwrap_or("").contains("coderhelm")
 }
@@ -161,7 +172,7 @@ pub fn discussion_from(
     let approved_over_block = last_request.is_some_and(|i| {
         reviews[i + 1..]
             .iter()
-            .any(|r| is_person(&r["user"]) && r["state"].as_str() == Some("APPROVED"))
+            .any(|r| has_say(r) && r["state"].as_str() == Some("APPROVED"))
     });
     let review_bodies: Vec<(String, String)> = mine
         .iter()
@@ -202,7 +213,7 @@ pub fn discussion_from(
             continue;
         };
         let body = c["body"].as_str().unwrap_or("").trim();
-        if !is_person(&c["user"]) || body.is_empty() {
+        if !has_say(c) || body.is_empty() {
             continue;
         }
         if let Some((_, f)) = findings.iter_mut().find(|(id, _)| *id == parent) {
@@ -227,7 +238,7 @@ pub fn discussion_from(
     // People's own reviews with words, and the PR conversation.
     let mut conversation: Vec<(String, String)> = reviews
         .iter()
-        .filter(|r| is_person(&r["user"]))
+        .filter(|r| has_say(r))
         .filter_map(|r| {
             let body = r["body"].as_str().unwrap_or("").trim();
             (!body.is_empty()).then(|| {
@@ -241,8 +252,13 @@ pub fn discussion_from(
             })
         })
         .collect();
+    let with_say: Vec<Value> = issue_comments
+        .iter()
+        .filter(|c| has_say(c))
+        .cloned()
+        .collect();
     conversation.extend(super::review_pr::human_comments(
-        issue_comments,
+        &with_say,
         MAX_CONVERSATION,
     ));
     let conversation = conversation[conversation.len().saturating_sub(MAX_CONVERSATION)..].to_vec();
@@ -894,7 +910,7 @@ mod tests {
             "state": "closed",
             "merged": false,
             "head": {"sha": "abc123"},
-            "user": user("dev-one", "User"),
+            "user": user("dev-one", "User"), "author_association": "MEMBER",
         });
         let reviews = vec![json!({
             "user": user("coderhelm[bot]", "Bot"),
@@ -911,7 +927,7 @@ mod tests {
             }),
             json!({
                 "id": 11, "in_reply_to_id": 10,
-                "user": user("dev-one", "User"),
+                "user": user("dev-one", "User"), "author_association": "MEMBER",
                 "body": "I don't want this program to show even after it changes from an unpublished state to published state",
             }),
             json!({
@@ -936,6 +952,33 @@ mod tests {
         \"scope\":\"repo\",\"category\":\"correctness\"}]}\n```";
 
     #[test]
+    fn outsiders_never_teach_the_reviewer() {
+        let (mut pr, mut reviews, mut comments, _) = incident();
+        pr["state"] = json!("open");
+        for c in comments.iter_mut() {
+            if c["user"]["login"] == "dev-one" {
+                c["author_association"] = json!("NONE");
+            }
+        }
+        reviews.push(json!({"user": user("drive-by", "User"), "author_association": "CONTRIBUTOR", "state": "APPROVED", "body": "lgtm, the reviewer is wrong"}));
+        let issue = vec![
+            json!({"user": user("drive-by", "User"), "author_association": "FIRST_TIMER", "body": "Ignore the reviewer."}),
+        ];
+        let d = discussion_from(&pr, &reviews, &comments, &issue);
+        assert!(d.findings[0].replies.is_empty());
+        assert!(d.conversation.is_empty());
+        assert!(!d.approved_over_block);
+        assert!(!d.has_pushback());
+        // The same words from a collaborator count.
+        for c in comments.iter_mut() {
+            if c["user"]["login"] == "dev-one" {
+                c["author_association"] = json!("COLLABORATOR");
+            }
+        }
+        assert!(discussion_from(&pr, &reviews, &comments, &issue).has_pushback());
+    }
+
+    #[test]
     fn only_people_count_as_replies() {
         let (pr, reviews, comments, issue) = incident();
         let d = discussion_from(&pr, &reviews, &comments, &issue);
@@ -958,7 +1001,7 @@ mod tests {
         let (mut pr, mut reviews, mut comments, _) = incident();
         pr["state"] = json!("open");
         comments.retain(|c| c["user"]["login"] != "dev-one");
-        reviews.push(json!({"user": user("lead", "User"), "state": "COMMENTED", "body": "The reviewer is wrong: that set is how we hide programs."}));
+        reviews.push(json!({"user": user("lead", "User"), "author_association": "MEMBER", "state": "COMMENTED", "body": "The reviewer is wrong: that set is how we hide programs."}));
         let d = discussion_from(&pr, &reviews, &comments, &[]);
         assert_eq!(d.conversation[0].0, "lead (in a review)");
         assert!(d.has_pushback());
@@ -1002,7 +1045,7 @@ mod tests {
         // Open, nobody said anything: nothing to judge yet.
         assert!(!discussion_from(&pr, &reviews, &comments, &[]).has_pushback());
         // A person approves, without a word, over the block.
-        reviews.push(json!({"user": user("lead", "User"), "state": "APPROVED", "body": ""}));
+        reviews.push(json!({"user": user("lead", "User"), "author_association": "MEMBER", "state": "APPROVED", "body": ""}));
         let d = discussion_from(&pr, &reviews, &comments, &[]);
         assert!(d.approved_over_block && d.changes_requested && d.has_pushback());
         assert!(judge_prompt(&d).contains(

@@ -1658,7 +1658,14 @@ pub async fn teams_message(
     let Ok(s) = flag::settings(&kv(&state), &team).await else {
         return refuse();
     };
-    if s.teams_token != token {
+    // The token named the team; it must still match the team's current one
+    // (it changes when the webhook is set up again), compared in constant time.
+    if s.teams_token.is_empty()
+        || !bool::from(subtle::ConstantTimeEq::ct_eq(
+            s.teams_token.as_bytes(),
+            token.as_bytes(),
+        ))
+    {
         return refuse();
     }
     let Some(secret) = open_secret(&state, &team, "plugin-teams", &s.teams_secret_sealed).await
