@@ -147,6 +147,34 @@ export class Hybrid extends Construct {
         },
       }),
     );
+    // IAM's `*` crosses dots, so the allow above also matches deeper names.
+    // A separate deny (conditions inside one statement would AND together)
+    // fences what the code never writes: anything under a host CoderHelm serves
+    // (such as `_acme-challenge.app.<zone>`, which could get a certificate
+    // for the dashboard), mail and certificate-authority records anywhere in
+    // the zone, and names three or more labels deep.
+    fn_.addToRolePolicy(
+      new iam.PolicyStatement({
+        sid: "HybridNeverDeeper",
+        effect: iam.Effect.DENY,
+        actions: ["route53:ChangeResourceRecordSets"],
+        resources: [zoneArn],
+        conditions: {
+          "ForAnyValue:StringLike": {
+            "route53:ChangeResourceRecordSetsNormalizedRecordNames": [
+              `*.*.*.${h.zone}`,
+              "*_domainkey*",
+              "*_dmarc*",
+              "*_mta-sts*",
+              "*_smtp*",
+              "*_acme-challenge*",
+              "*_spf*",
+              ...reserved.zoneRecords.map((n) => `*.${n}.${h.zone}`),
+            ],
+          },
+        },
+      }),
+    );
     fn_.addEnvironment("HYBRID_ZONE_ID", zone.hostedZoneId);
     fn_.addEnvironment("HYBRID_FALLBACK_DOMAIN", this.fallback.distributionDomainName);
 

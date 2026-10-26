@@ -10,7 +10,9 @@
 //!   `"{ts}.{METHOD}.{path}.{sha256(body) hex}"`.
 //! - **Relayed events** the hosted router forwards to an install: signed with
 //!   the install's relay key. Header `X-CoderHelm-Relay-Signature:
-//!   t=<ts>,d=<delivery id>,v1=<hex>` over `"{ts}.{delivery id}.{body}"`. The
+//!   t=<ts>,d=<delivery id>,v1=<hex>,v2=<hex>`: `v1` over
+//!   `"{ts}.{delivery id}.{body}"`, `v2` over
+//!   `"v2.{ts}.{delivery id}.{source}.{event}.{body}"` ([`sign_relay_routed`]). The
 //!   install refuses anything older than [`TOLERANCE_SECS`] and any delivery
 //!   id it has seen (the caller claims the id; see [`replay_key`]).
 //! - **Ownership proofs**: the hosted side asks an install's CloudFront
@@ -195,6 +197,43 @@ pub fn sign_relay(key: &str, ts: i64, delivery_id: &str, body: &[u8]) -> String 
     format!("t={ts},d={delivery_id},v1={}", hex::encode(sig))
 }
 
+/// The relay header value with the route signed too: `v1` (the body and
+/// delivery id, what older installs check) and `v2`, which also covers the
+/// source and event headers the install routes on.
+pub fn sign_relay_routed(
+    key: &str,
+    ts: i64,
+    delivery_id: &str,
+    source: &str,
+    event: &str,
+    body: &[u8],
+) -> String {
+    format!(
+        "{},v2={}",
+        sign_relay(key, ts, delivery_id, body),
+        hex::encode(routed_mac(key, ts, delivery_id, source, event, body))
+    )
+}
+
+fn routed_mac(key: &str, ts: i64, d: &str, source: &str, event: &str, body: &[u8]) -> Vec<u8> {
+    // Source and event are fixed words (no dots), so the parts can't run together.
+    mac(
+        key.as_bytes(),
+        &[
+            b"v2.",
+            ts.to_string().as_bytes(),
+            b".",
+            d.as_bytes(),
+            b".",
+            source.as_bytes(),
+            b".",
+            event.as_bytes(),
+            b".",
+            body,
+        ],
+    )
+}
+
 /// A verified relayed event's delivery id and timestamp.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RelayStamp {
@@ -202,18 +241,22 @@ pub struct RelayStamp {
     pub ts: i64,
 }
 
-/// Checks a relayed event's signature and age. Replays are the caller's
-/// second step: claim [`replay_key`] once, refuse when it is already held.
+/// Checks a relayed event's signature and age. With `v2` present, the
+/// source and event headers must be the ones that were signed (a `v1` alone
+/// is accepted from an older hosted side). Replays are the caller's second
+/// step: claim [`replay_key`] once, refuse when it is already held.
 pub fn verify_relay(
     key: &str,
     header: Option<&str>,
+    source: &str,
+    event: &str,
     body: &[u8],
     now: i64,
 ) -> Result<RelayStamp, SignatureProblem> {
     let Some(h) = header else {
         return Err(SignatureProblem::Missing);
     };
-    let (mut ts, mut d, mut v1) = (None, None, None);
+    let (mut ts, mut d, mut v1, mut v2) = (None, None, None, None);
     for part in h.split(',') {
         let (k, v) = part
             .trim()
@@ -223,6 +266,7 @@ pub fn verify_relay(
             "t" => ts = v.parse::<i64>().ok(),
             "d" => d = Some(v.to_string()),
             "v1" => v1 = hex::decode(v).ok(),
+            "v2" => v2 = Some(hex::decode(v).map_err(|_| SignatureProblem::Malformed)?),
             _ => {}
         }
     }
@@ -246,6 +290,11 @@ pub fn verify_relay(
     );
     if !ct_eq(&got, &want) {
         return Err(SignatureProblem::Mismatch);
+    }
+    if let Some(got2) = v2 {
+        if !ct_eq(&got2, &routed_mac(key, ts, &d, source, event, body)) {
+            return Err(SignatureProblem::Mismatch);
+        }
     }
     Ok(RelayStamp { delivery_id: d, ts })
 }
@@ -414,7 +463,7 @@ mod tests {
         let k = relay_key(MASTER, "ins_a");
         let body = br#"{"action":"opened"}"#;
         let h = sign_relay(&k, NOW, "72d3162e-cc78-11e3-81ab-4c9367dc0958", body);
-        let stamp = verify_relay(&k, Some(&h), body, NOW + 5).unwrap();
+        let stamp = verify_relay(&k, Some(&h), "github", "push", body, NOW + 5).unwrap();
         assert_eq!(stamp.delivery_id, "72d3162e-cc78-11e3-81ab-4c9367dc0958");
         assert_eq!(stamp.ts, NOW);
         assert_eq!(
@@ -429,40 +478,89 @@ mod tests {
         let body = b"{}";
         let h = sign_relay(&k, NOW, "d1", body);
         assert_eq!(
-            verify_relay(&k, Some(&h), b"{ }", NOW),
+            verify_relay(&k, Some(&h), "github", "push", b"{ }", NOW),
             Err(SignatureProblem::Mismatch)
         );
         assert_eq!(
-            verify_relay(&k, Some(&h), body, NOW + TOLERANCE_SECS + 1),
+            verify_relay(
+                &k,
+                Some(&h),
+                "github",
+                "push",
+                body,
+                NOW + TOLERANCE_SECS + 1
+            ),
             Err(SignatureProblem::Stale)
         );
         assert_eq!(
-            verify_relay(&relay_key(MASTER, "ins_b"), Some(&h), body, NOW),
+            verify_relay(
+                &relay_key(MASTER, "ins_b"),
+                Some(&h),
+                "github",
+                "push",
+                body,
+                NOW
+            ),
             Err(SignatureProblem::Mismatch)
         );
         // The delivery id is signed: swapping it breaks the signature.
         let swapped = h.replace("d=d1", "d=d2");
         assert_eq!(
-            verify_relay(&k, Some(&swapped), body, NOW),
+            verify_relay(&k, Some(&swapped), "github", "push", body, NOW),
             Err(SignatureProblem::Mismatch)
         );
         assert_eq!(
-            verify_relay(&k, None, body, NOW),
+            verify_relay(&k, None, "github", "push", body, NOW),
             Err(SignatureProblem::Missing)
         );
         assert_eq!(
-            verify_relay(&k, Some("t=1"), body, NOW),
+            verify_relay(&k, Some("t=1"), "github", "push", body, NOW),
             Err(SignatureProblem::Malformed)
         );
         assert_eq!(
-            verify_relay(&k, Some("garbage"), body, NOW),
+            verify_relay(&k, Some("garbage"), "github", "push", body, NOW),
             Err(SignatureProblem::Malformed)
         );
         let bad_id = sign_relay(&k, NOW, "d 1", body);
         assert_eq!(
-            verify_relay(&k, Some(&bad_id), body, NOW),
+            verify_relay(&k, Some(&bad_id), "github", "push", body, NOW),
             Err(SignatureProblem::Malformed)
         );
+    }
+
+    /// The source and event headers decide how the install handles a body,
+    /// so they are signed too (`v2`). A copy with them changed is refused;
+    /// an older hosted side that sends only `v1` still verifies.
+    #[test]
+    fn the_route_of_a_relayed_event_is_signed() {
+        let k = relay_key(MASTER, "ins_a");
+        let body = br#"{"action":"opened"}"#;
+        let h = sign_relay_routed(&k, NOW, "d1", "github", "pull_request", body);
+        assert!(h.contains(",v1=") && h.contains(",v2="));
+        assert_eq!(
+            verify_relay(&k, Some(&h), "github", "pull_request", body, NOW).map(|s| s.delivery_id),
+            Ok("d1".to_string())
+        );
+        for (src, ev) in [
+            ("github", "issue_comment"),
+            ("jira", "pull_request"),
+            ("", ""),
+        ] {
+            assert_eq!(
+                verify_relay(&k, Some(&h), src, ev, body, NOW),
+                Err(SignatureProblem::Mismatch),
+                "{src} {ev}"
+            );
+        }
+        // A v2 that doesn't match is never rescued by a good v1.
+        let forged = format!("{},v2={}", sign_relay(&k, NOW, "d1", body), "00".repeat(32));
+        assert_eq!(
+            verify_relay(&k, Some(&forged), "github", "pull_request", body, NOW),
+            Err(SignatureProblem::Mismatch)
+        );
+        // An older hosted side (v1 only) still verifies.
+        let old = sign_relay(&k, NOW, "d1", body);
+        assert!(verify_relay(&k, Some(&old), "github", "push", body, NOW).is_ok());
     }
 
     #[test]

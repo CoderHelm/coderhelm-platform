@@ -1153,6 +1153,7 @@ async fn main() -> Result<(), Error> {
         .route("/fallback", get(routes::hybrid::fallback))
         .route("/github/link-start", post(routes::hybrid::link_start))
         .route("/github/setup", get(routes::hybrid::github_setup))
+        .route("/github/confirm", post(routes::hybrid::github_confirm))
         .route(
             "/github/links/:installation_id",
             put(routes::hybrid::set_link_repos).delete(routes::hybrid::delete_link),

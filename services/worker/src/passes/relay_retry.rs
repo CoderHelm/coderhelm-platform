@@ -101,17 +101,14 @@ pub async fn run(state: &WorkerState, msg: RelayRetryMessage) -> Result<(), Erro
         }
     };
     let relay_key = sign::relay_key(master, &msg.install_id);
-    let attempt = relay::send(
-        &state.http,
-        &relay::Forward {
-            origin: &origin,
-            relay_key: &relay_key,
-            source: &msg.source,
-            event: &msg.event,
-            delivery_id: &msg.relay_delivery_id,
-            body: &body,
-        },
-    )
+    let attempt = relay::send(&relay::Forward {
+        origin: &origin,
+        relay_key: &relay_key,
+        source: &msg.source,
+        event: &msg.event,
+        delivery_id: &msg.relay_delivery_id,
+        body: &body,
+    })
     .await;
     match relay::apply(&mut d, attempt) {
         relay::Next::RetryIn(secs) => {

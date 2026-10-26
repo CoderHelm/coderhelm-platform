@@ -31,9 +31,56 @@ pub struct GithubLink {
     /// The account (organization or user) the installation is on.
     pub account: String,
     /// The repositories the customer chose for this install. Empty: every
-    /// repository the installation itself grants on GitHub.
+    /// repository the link allows ([`GithubLink::ceiling`]).
     #[serde(default)]
     pub repositories: Vec<String>,
+    /// The repositories the person who linked the installation may push to
+    /// on GitHub, read at link time ([`writable_repositories`]): no token is
+    /// ever wider. None only for links made before the ceiling existed
+    /// (whatever the installation grants).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ceiling: Option<Vec<String>>,
+}
+
+/// GitHub caps a token at this many named repositories, so a ceiling is
+/// never longer.
+pub const MAX_CEILING: usize = 500;
+
+/// The repositories in a page of GitHub's `GET /user/installations/{id}/repositories`
+/// (asked with the person's own token) they may push to: their own
+/// permissions, not the installation's.
+pub fn writable_repositories(page: &serde_json::Value) -> Vec<String> {
+    page["repositories"]
+        .as_array()
+        .map(|a| a.as_slice())
+        .unwrap_or_default()
+        .iter()
+        .filter(|r| {
+            let p = &r["permissions"];
+            p["push"].as_bool() == Some(true) || p["admin"].as_bool() == Some(true)
+        })
+        .filter_map(|r| r["name"].as_str())
+        .map(|n| n.to_ascii_lowercase())
+        .collect()
+}
+
+fn norm_repo(r: &str) -> String {
+    r.trim()
+        .rsplit('/')
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase()
+}
+
+/// Whether every repository in `asked` is inside the link's ceiling.
+pub fn ceiling_allows(link: &GithubLink, asked: &[String]) -> bool {
+    match &link.ceiling {
+        None => true,
+        Some(c) => {
+            let c: Vec<String> = c.iter().map(|r| norm_repo(r)).collect();
+            asked.iter().all(|r| c.contains(&norm_repo(r)))
+        }
+    }
 }
 
 /// The permissions a brokered token may ever carry: what CoderHelm's app
@@ -112,14 +159,27 @@ pub fn plan_token(links: &[GithubLink], ask: &TokenAsk) -> Result<MintBody, Brok
         .iter()
         .find(|l| l.installation_id == ask.installation_id)
         .ok_or(BrokerRefusal::NotLinked)?;
-    let norm = |r: &str| {
-        r.trim()
-            .rsplit('/')
-            .next()
-            .unwrap_or("")
-            .to_ascii_lowercase()
+    let norm = norm_repo;
+    let chosen: Vec<String> = link.repositories.iter().map(|r| norm(r)).collect();
+    let allowed: Vec<String> = match &link.ceiling {
+        None => chosen,
+        Some(c) => {
+            let c: Vec<String> = c.iter().map(|r| norm(r)).take(MAX_CEILING).collect();
+            if c.is_empty() {
+                return Err(BrokerRefusal::RepositoryNotAllowed);
+            }
+            if chosen.is_empty() {
+                c
+            } else {
+                // A chosen list never reaches past the ceiling.
+                let inside: Vec<String> = chosen.into_iter().filter(|r| c.contains(r)).collect();
+                if inside.is_empty() {
+                    return Err(BrokerRefusal::RepositoryNotAllowed);
+                }
+                inside
+            }
+        }
     };
-    let allowed: Vec<String> = link.repositories.iter().map(|r| norm(r)).collect();
     let mut repositories: Vec<String> = Vec::new();
     for r in &ask.repositories {
         let n = norm(r);
@@ -232,13 +292,66 @@ mod tests {
                 installation_id: 11,
                 account: "example-org".into(),
                 repositories: vec!["web".into(), "api".into()],
+                ceiling: None,
             },
             GithubLink {
                 installation_id: 22,
                 account: "example-user".into(),
                 repositories: vec![],
+                ceiling: None,
             },
         ]
+    }
+
+    /// A link holds what the person who linked it may push to on GitHub
+    /// (its ceiling): someone with read access to one repository can't link
+    /// the organization's installation and mint write tokens for every
+    /// repository in it. The ceiling goes to GitHub as the token's
+    /// `repositories`, so GitHub enforces it too.
+    #[test]
+    fn a_link_never_reaches_past_what_its_linker_can_push_to() {
+        let link = GithubLink {
+            installation_id: 44,
+            account: "example-org".into(),
+            repositories: vec![],
+            ceiling: Some(vec!["web".into(), "docs-site".into()]),
+        };
+        let ask = |repos: &[&str]| TokenAsk {
+            installation_id: 44,
+            repositories: repos.iter().map(|r| r.to_string()).collect(),
+            ..Default::default()
+        };
+        let all = plan_token(std::slice::from_ref(&link), &ask(&[])).unwrap();
+        assert_eq!(all.repositories, vec!["web", "docs-site"]);
+        assert_eq!(
+            plan_token(std::slice::from_ref(&link), &ask(&["payments"])),
+            Err(BrokerRefusal::RepositoryNotAllowed)
+        );
+        assert!(ceiling_allows(&link, &["web".into()]));
+        assert!(!ceiling_allows(&link, &["web".into(), "payments".into()]));
+        // A chosen list outside the ceiling (stored before) is cut back to it.
+        let mut wide = link.clone();
+        wide.repositories = vec!["web".into(), "payments".into()];
+        let t = plan_token(std::slice::from_ref(&wide), &ask(&[])).unwrap();
+        assert_eq!(t.repositories, vec!["web"]);
+        // Nothing the linker can push to: nothing at all, never "everything".
+        let mut none = link.clone();
+        none.ceiling = Some(vec![]);
+        assert_eq!(
+            plan_token(&[none], &ask(&[])),
+            Err(BrokerRefusal::RepositoryNotAllowed)
+        );
+    }
+
+    #[test]
+    fn writable_repositories_come_from_the_persons_own_permissions() {
+        let page = serde_json::json!({"repositories": [
+            {"name": "web", "permissions": {"admin": false, "push": true, "pull": true}},
+            {"name": "Docs", "permissions": {"admin": true, "push": true, "pull": true}},
+            {"name": "readonly", "permissions": {"admin": false, "push": false, "pull": true}},
+            {"name": "noperms"}
+        ]});
+        assert_eq!(writable_repositories(&page), vec!["web", "docs"]);
     }
 
     #[test]

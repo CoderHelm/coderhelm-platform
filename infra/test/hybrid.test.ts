@@ -59,9 +59,10 @@ function str(v: unknown): string {
 test("the provisioning API may change only CNAMEs (and the setup alias) under the zone, in that zone only", () => {
   const api = hosted()["coderhelm-prod-api"];
   const all = statements(api).filter((s) => [].concat(s.Action).some((a: string) => a.startsWith("route53:Change")));
-  assert.equal(all.length, 2, "one allow and one deny");
+  assert.equal(all.length, 3, "one allow and two denies");
   const allow = all.find((s) => s.Effect === "Allow");
-  const deny = all.find((s) => s.Effect === "Deny");
+  const deny = all.find((s) => s.Effect === "Deny" && s.Condition["ForAnyValue:StringEquals"]);
+  const deep = all.find((s) => s.Effect === "Deny" && s.Condition["ForAnyValue:StringLike"]);
   assert.equal(allow.Action, "route53:ChangeResourceRecordSets");
   assert.match(str(allow.Resource), /hostedzone\/ZTEST000001/);
   assert.ok(!str(allow.Resource).includes("hostedzone/*"), "never every zone");
@@ -71,10 +72,26 @@ test("the provisioning API may change only CNAMEs (and the setup alias) under th
   for (const n of ["coderhelm.com", "*.coderhelm.com", "api.coderhelm.com", "app.coderhelm.com", "auth.coderhelm.com", "docs.coderhelm.com", "stream.coderhelm.com", "www.coderhelm.com", "mail.coderhelm.com", "status.coderhelm.com", "admin.coderhelm.com", "careers.coderhelm.com"]) {
     assert.ok(denied.includes(n), `${n} is denied`);
   }
+  // IAM's `*` crosses dots, so the allow alone would let a change reach
+  // deeper names: under a reserved host (`x.api.coderhelm.com`, a
+  // `_acme-challenge.app.coderhelm.com` that could get a certificate for the
+  // dashboard), mail records (`_domainkey`, `_dmarc`), or three labels deep.
+  // A separate deny fences those (a second condition in the same statement
+  // would AND with the first and fence nothing).
+  assert.ok(deep, "a deny for deeper names");
+  const like: string[] = deep.Condition["ForAnyValue:StringLike"]["route53:ChangeResourceRecordSetsNormalizedRecordNames"];
+  const matches = (pattern: string, name: string) =>
+    new RegExp("^" + pattern.split("*").map((p) => p.replace(/[.?+^$()[\]{}|\\]/g, "\\$&")).join(".*") + "$").test(name);
+  for (const n of ["x.api.coderhelm.com", "_acme-challenge.app.coderhelm.com", "_0123456789abcdef0123456789abcdef.app.coderhelm.com", "s1._domainkey.coderhelm.com", "_dmarc.coderhelm.com", "_dmarc.example.coderhelm.com", "a.b.example.coderhelm.com", "_acme-challenge.example.coderhelm.com", "_mta-sts.coderhelm.com"]) {
+    assert.ok(like.some((p) => matches(p, n)), `${n} is fenced`);
+  }
+  for (const n of ["example.coderhelm.com", "_0123456789abcdef0123456789abcdef.example.coderhelm.com"]) {
+    assert.ok(!like.some((p) => matches(p, n)), `${n} stays writable`);
+  }
   // No other statement anywhere grants record changes.
   for (const t of Object.values(hosted())) {
     for (const s of statements(t)) {
-      if (s === allow || s === deny) continue;
+      if (s === allow || s === deny || s === deep) continue;
       assert.ok(![].concat(s.Action).some((a: string) => a === "route53:ChangeResourceRecordSets" || a === "route53:*") || t !== api, "only the hybrid statements");
     }
   }

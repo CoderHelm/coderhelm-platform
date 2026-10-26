@@ -40,19 +40,50 @@ pub struct Forward<'a> {
     pub body: &'a [u8],
 }
 
+/// The HTTP client for every request the hosted side makes to an install's
+/// address (relayed events and ownership proofs). It never follows a
+/// redirect: the install's CloudFront is the only place these requests may
+/// go, and a redirect from it (to the Lambda runtime API, a metadata address
+/// or anything else inside AWS) is answered as the redirect status itself.
+pub fn install_client() -> &'static reqwest::Client {
+    static C: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+    C.get_or_init(|| {
+        reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .user_agent("coderhelm-relay")
+            .build()
+            .expect("a client with no redirects")
+    })
+}
+
+/// How much of an install's answer is ever read (the rest is dropped).
+pub const MAX_ANSWER_BYTES: usize = 16 * 1024;
+
+/// Reads at most [`MAX_ANSWER_BYTES`] of an answer.
+pub async fn read_capped(mut resp: reqwest::Response) -> Vec<u8> {
+    let mut out = Vec::new();
+    while let Ok(Some(chunk)) = resp.chunk().await {
+        let room = MAX_ANSWER_BYTES - out.len();
+        out.extend_from_slice(&chunk[..chunk.len().min(room)]);
+        if out.len() >= MAX_ANSWER_BYTES {
+            break;
+        }
+    }
+    out
+}
+
 /// Sends one forward and returns the attempt (with the HTTP status when the
 /// install answered).
-pub async fn send(http: &reqwest::Client, f: &Forward<'_>) -> Attempt {
+pub async fn send(f: &Forward<'_>) -> Attempt {
     let ts = chrono::Utc::now().timestamp();
     let started = Instant::now();
-    let r = http
+    let r = install_client()
         .post(target(f.origin))
         .timeout(std::time::Duration::from_secs(8))
         .header("content-type", "application/json")
-        .header("user-agent", "coderhelm-relay")
         .header(
             sign::RELAY_HEADER,
-            sign::sign_relay(f.relay_key, ts, f.delivery_id, f.body),
+            sign::sign_relay_routed(f.relay_key, ts, f.delivery_id, f.source, f.event, f.body),
         )
         .header(sign::RELAY_SOURCE_HEADER, f.source)
         .header(sign::RELAY_EVENT_HEADER, f.event)
@@ -66,13 +97,18 @@ pub async fn send(http: &reqwest::Client, f: &Forward<'_>) -> Attempt {
             let code = resp.status().as_u16();
             let error = if resp.status().is_success() {
                 String::new()
+            } else if resp.status().is_redirection() {
+                "answered with a redirect, which the relay never follows".into()
             } else {
-                let text = resp.text().await.unwrap_or_default();
+                let text = String::from_utf8_lossy(&read_capped(resp).await).to_string();
                 let v: serde_json::Value = serde_json::from_str(&text).unwrap_or_default();
                 v["error"]
                     .as_str()
                     .map(str::to_string)
-                    .unwrap_or_else(|| text.chars().take(200).collect())
+                    .unwrap_or(text)
+                    .chars()
+                    .take(200)
+                    .collect()
             };
             Attempt {
                 at,
@@ -223,5 +259,84 @@ mod tests {
         assert_eq!(d.reason, "relay_refused");
         let mut d = Delivery::new(Direction::Outbound, "relay", "push", "ins_x");
         assert!(matches!(apply(&mut d, att(Some(429))), Next::RetryIn(_)));
+    }
+}
+
+#[cfg(test)]
+mod redirect_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// A one-route HTTP server that answers every request with `answer` and
+    /// counts how many connections it took.
+    async fn serve(answer: String) -> (String, Arc<AtomicUsize>) {
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = format!("http://{}", l.local_addr().unwrap());
+        let hits = Arc::new(AtomicUsize::new(0));
+        let h = hits.clone();
+        tokio::spawn(async move {
+            while let Ok((mut s, _)) = l.accept().await {
+                h.fetch_add(1, Ordering::SeqCst);
+                let mut buf = vec![0u8; 8192];
+                let _ = s.read(&mut buf).await;
+                let _ = s.write_all(answer.as_bytes()).await;
+                let _ = s.shutdown().await;
+            }
+        });
+        (addr, hits)
+    }
+
+    /// An install's CloudFront answers with a redirect to an internal
+    /// address: the relay must never follow it (no request to anything but
+    /// the install's own verified address).
+    #[tokio::test]
+    async fn the_relay_never_follows_a_redirect() {
+        let (internal, internal_hits) = serve(
+            "HTTP/1.1 500 Internal\r\ncontent-length: 21\r\nconnection: close\r\n\r\n{\"error\":\"internal\"}"
+                .to_string(),
+        )
+        .await;
+        for code in [301, 302, 303, 307, 308] {
+            let (install, _) = serve(format!(
+                "HTTP/1.1 {code} Moved\r\nlocation: {internal}/2018-06-01/runtime/invocation/next\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+            ))
+            .await;
+            let a = send(&Forward {
+                origin: &install,
+                relay_key: "k",
+                source: "github",
+                event: "push",
+                delivery_id: "d1",
+                body: b"{}",
+            })
+            .await;
+            assert_eq!(a.code, Some(code), "{code}");
+            assert!(!a.error.contains("internal"), "{code}: {}", a.error);
+        }
+        assert_eq!(internal_hits.load(Ordering::SeqCst), 0);
+    }
+
+    /// A huge error answer is cut, never read whole.
+    #[tokio::test]
+    async fn a_large_error_answer_is_cut() {
+        let big = "x".repeat(200_000);
+        let (install, _) = serve(format!(
+            "HTTP/1.1 400 Bad\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{big}",
+            big.len()
+        ))
+        .await;
+        let a = send(&Forward {
+            origin: &install,
+            relay_key: "k",
+            source: "github",
+            event: "push",
+            delivery_id: "d1",
+            body: b"{}",
+        })
+        .await;
+        assert_eq!(a.code, Some(400));
+        assert!(a.error.chars().count() <= 200);
     }
 }

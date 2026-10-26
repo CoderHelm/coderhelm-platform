@@ -362,6 +362,15 @@ pub async fn register(
             "Send the install's CloudFront address, such as d1234abcd.cloudfront.net.",
         ));
     }
+    // A CloudFront address whose install CoderHelm turned off can't come
+    // back as a new registration: revoking would mean nothing otherwise.
+    if cloudfront_revoked(&state, &cloudfront).await {
+        return Err(fail(
+            StatusCode::FORBIDDEN,
+            broker::BrokerRefusal::Revoked.code(),
+            broker::BrokerRefusal::Revoked.message(),
+        ));
+    }
     let id = sign::new_install_id();
     let install = Install {
         id: id.clone(),
@@ -385,16 +394,38 @@ pub async fn register(
     })))
 }
 
+/// The record that keeps a revoked install's CloudFront address from registering again.
+pub fn revoked_cloudfront_key(cloudfront: &str) -> String {
+    format!(
+        "HYBRIDREVOKED#{}",
+        cloudfront.trim().trim_end_matches('.').to_ascii_lowercase()
+    )
+}
+
+async fn cloudfront_revoked(state: &AppState, cloudfront: &str) -> bool {
+    state
+        .dynamo
+        .get_item()
+        .table_name(&state.config.settings_table_name)
+        .key("pk", s(&revoked_cloudfront_key(cloudfront)))
+        .key("sk", s("REVOKED"))
+        .send()
+        .await
+        .map(|r| r.item().is_some())
+        // Can't tell: refuse, the person tries again in a minute.
+        .unwrap_or(true)
+}
+
 /// Asks the install's CloudFront address to answer a challenge with its
 /// registration secret. True when it does.
-async fn prove(state: &AppState, master: &str, install: &Install) -> bool {
+async fn prove(master: &str, install: &Install) -> bool {
     let challenge = broker::new_handle("ch");
     let url = format!(
         "{}/webhooks/relay/proof?challenge={challenge}",
         install.origin()
     );
-    let Ok(r) = state
-        .http
+    // Never a redirect, never more than a small answer (relay::install_client).
+    let Ok(r) = relay::install_client()
         .get(&url)
         .timeout(std::time::Duration::from_secs(6))
         .send()
@@ -402,7 +433,10 @@ async fn prove(state: &AppState, master: &str, install: &Install) -> bool {
     else {
         return false;
     };
-    let v: Value = r.json().await.unwrap_or_default();
+    if !r.status().is_success() {
+        return false;
+    }
+    let v: Value = serde_json::from_slice(&relay::read_capped(r).await).unwrap_or_default();
     v["install_id"].as_str() == Some(install.id.as_str())
         && sign::check_proof(
             &sign::install_secret(master, &install.id),
@@ -421,7 +455,7 @@ pub async fn verify(
 ) -> Reply {
     let mut install = signed(&state, &headers, &method, &uri, &body).await?;
     let master = master(&state).ok_or_else(not_here)?.to_string();
-    if !prove(&state, &master, &install).await {
+    if !prove(&master, &install).await {
         return Err(fail(
             StatusCode::BAD_REQUEST,
             "proof_failed",
@@ -847,7 +881,7 @@ pub async fn put_records(
                 .map_err(|why| fail(StatusCode::BAD_REQUEST, "record_refused", why))?,
         );
     }
-    if !prove(&state, &master, &install).await {
+    if !prove(&master, &install).await {
         return Err(fail(StatusCode::BAD_REQUEST, "proof_failed", "CoderHelm couldn't confirm your install at its CloudFront address just now. Try again in a minute."));
     }
     let (old, pending) = stored_name(&state, &install.name).await;
@@ -1133,19 +1167,10 @@ pub async fn link_start(
             "Verify the install first.",
         ));
     }
-    let ret = body_json(&body)["return_url"]
-        .as_str()
-        .unwrap_or("")
-        .to_string();
-    let ret = if ret.starts_with(&install.origin())
-        || ret.starts_with("https://docs.coderhelm.com/")
-        || (!install.name.is_empty()
-            && ret.starts_with(&format!("https://{}", names::hostname(&install.name))))
-    {
-        ret
-    } else {
-        format!("{}/settings/system/#hybrid", install.origin())
-    };
+    let ret = return_url_for(
+        &install,
+        body_json(&body)["return_url"].as_str().unwrap_or(""),
+    );
     let st = broker::new_handle("hyb");
     put_state(
         &state,
@@ -1167,6 +1192,34 @@ pub async fn link_start(
         "state": st,
         "install_url": format!("https://github.com/apps/{slug}/installations/new?state={st}"),
     })))
+}
+
+/// Where the person goes back to after linking: an address on one of the
+/// install's own hosts (or the docs install guide), compared host by host,
+/// never by text prefix (`https://d1.cloudfront.net.example.org` starts with
+/// the install's origin too); anything else gets the install's settings page.
+pub fn return_url_for(install: &Install, asked: &str) -> String {
+    let fallback = format!("{}/settings/system/#hybrid", install.origin());
+    let Ok(u) = url::Url::parse(asked.trim()) else {
+        return fallback;
+    };
+    if u.scheme() != "https"
+        || !u.username().is_empty()
+        || u.password().is_some()
+        || u.port().is_some()
+    {
+        return fallback;
+    }
+    let host = u.host_str().unwrap_or("").to_ascii_lowercase();
+    let mut hosts = vec![install.cloudfront.clone(), "docs.coderhelm.com".to_string()];
+    if !install.name.is_empty() {
+        hosts.push(names::hostname(&install.name));
+    }
+    if hosts.contains(&host) {
+        u.to_string()
+    } else {
+        fallback
+    }
 }
 
 async fn put_state(
@@ -1301,13 +1354,107 @@ pub async fn github_signin_return(
     link_with_code(&state, &st, iid, &code).await
 }
 
-/// Does this GitHub user see the installation (`GET /user/installations`)?
-pub fn user_sees_installation(user_installations: &Value, installation_id: u64) -> Option<String> {
+/// Does this GitHub user see the installation of CoderHelm's own app
+/// (`GET /user/installations`)? An installation of any other app never counts.
+pub fn user_sees_installation(
+    user_installations: &Value,
+    installation_id: u64,
+    app_id: u64,
+) -> Option<String> {
+    if app_id == 0 {
+        return None;
+    }
     user_installations["installations"]
         .as_array()?
         .iter()
-        .find(|i| i["id"].as_u64() == Some(installation_id))
+        .find(|i| i["id"].as_u64() == Some(installation_id) && i["app_id"].as_u64() == Some(app_id))
         .map(|i| i["account"]["login"].as_str().unwrap_or("").to_string())
+}
+
+/// The repositories in the installation the person may push to (their own
+/// permissions, asked with their token), at most [`broker::MAX_CEILING`].
+async fn writable_in_installation(
+    state: &AppState,
+    user_token: &str,
+    installation_id: u64,
+) -> Result<Vec<String>, ()> {
+    let mut out: Vec<String> = Vec::new();
+    for page in 1..=10 {
+        let v: Value = state
+            .http
+            .get(format!(
+                "https://api.github.com/user/installations/{installation_id}/repositories?per_page=100&page={page}"
+            ))
+            .header("Authorization", format!("Bearer {user_token}"))
+            .header("Accept", "application/vnd.github+json")
+            .header("User-Agent", "Coderhelm-bot")
+            .send()
+            .await
+            .map_err(|_| ())?
+            .json()
+            .await
+            .map_err(|_| ())?;
+        let n = v["repositories"].as_array().map_or(0, Vec::len);
+        for r in broker::writable_repositories(&v) {
+            if !out.contains(&r) && out.len() < broker::MAX_CEILING {
+                out.push(r);
+            }
+        }
+        if n < 100 || out.len() >= broker::MAX_CEILING {
+            break;
+        }
+    }
+    Ok(out)
+}
+
+/// The page that asks the person to confirm the link: which GitHub account,
+/// which install (by its own address), and how many repositories. Nothing
+/// is linked until they press the button; it can't be framed.
+pub fn confirm_page(account: &str, install_address: &str, repos: usize, token: &str) -> Response {
+    let esc = |t: &str| {
+        t.replace('&', "&amp;")
+            .replace('<', "&lt;")
+            .replace('>', "&gt;")
+            .replace('"', "&quot;")
+            .replace('\'', "&#39;")
+    };
+    let (account, address, token) = (esc(account), esc(install_address), esc(token));
+    let plural = if repos == 1 {
+        "repository"
+    } else {
+        "repositories"
+    };
+    let html = format!(
+        r#"<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="robots" content="noindex,nofollow"><title>Link GitHub to a self-hosted CoderHelm</title><style>
+:root{{--bg:#fafafa;--fg:#111;--muted:#5c5c66;--line:#e4e4e7;--brand:#2563eb;--on-brand:#fff;--card:#fff;--warn:#92400e}}
+@media (prefers-color-scheme:dark){{:root{{--bg:#0a0a0b;--fg:#f4f4f5;--muted:#a1a1aa;--line:#27272a;--brand:#60a5fa;--on-brand:#0b1220;--card:#111113;--warn:#fbbf24}}}}
+*{{box-sizing:border-box}}body{{margin:0;min-height:100vh;display:grid;place-items:center;background:var(--bg);color:var(--fg);font:16px/1.55 ui-sans-serif,system-ui,-apple-system,"Segoe UI",sans-serif;padding:24px 16px}}
+main{{max-width:560px;width:100%;background:var(--card);border:1px solid var(--line);border-radius:16px;padding:32px}}
+h1{{font-size:22px;line-height:1.3;margin:0 0 12px}}p{{margin:0 0 16px;color:var(--muted)}}code{{color:var(--fg);font-weight:600;word-break:break-all}}.warn{{color:var(--warn)}}
+form{{display:flex;flex-wrap:wrap;gap:10px;margin-top:24px}}button{{min-height:44px;padding:0 16px;border-radius:10px;border:1px solid var(--line);background:transparent;color:var(--fg);font:inherit;font-weight:600;cursor:pointer}}
+button.primary{{background:var(--brand);border-color:var(--brand);color:var(--on-brand)}}@media (max-width:420px){{main{{padding:24px}}button{{width:100%}}}}
+</style></head><body><main><h1>Link <code>{account}</code> to a self-hosted CoderHelm?</h1>
+<p>The CoderHelm install at <code>{address}</code> will get short-lived GitHub tokens that can read and change code in the {repos} {plural} you can push to in <code>{account}</code>, and it will receive that account's GitHub events.</p>
+<p class="warn">Only continue if you started this from that install yourself. If someone sent you this link, choose Cancel.</p>
+<form method="post" action="/hybrid/github/confirm"><input type="hidden" name="token" value="{token}"><button class="primary" type="submit" name="choice" value="link">Link {account}</button><button type="submit" name="choice" value="cancel">Cancel</button></form></main></body></html>"#
+    );
+    let mut r = (StatusCode::OK, html).into_response();
+    for (k, v) in [
+        ("content-type", "text/html; charset=utf-8"),
+        ("cache-control", "no-store"),
+        ("x-frame-options", "DENY"),
+        (
+            "content-security-policy",
+            "default-src 'none'; style-src 'unsafe-inline'; frame-ancestors 'none'; base-uri 'none'",
+        ),
+        ("referrer-policy", "no-referrer"),
+        ("x-robots-tag", "noindex, nofollow"),
+    ] {
+        if let Ok(v) = axum::http::HeaderValue::from_str(v) {
+            r.headers_mut().insert(k, v);
+        }
+    }
+    r
 }
 
 async fn link_with_code(state: &AppState, st: &str, iid: u64, code: &str) -> Response {
@@ -1353,7 +1500,8 @@ async fn link_with_code(state: &AppState, st: &str, iid: u64, code: &str) -> Res
         Ok(r) => r.json().await.unwrap_or_default(),
         Err(_) => return page_redirect(&ret, "github_unreachable"),
     };
-    let Some(account) = user_sees_installation(&installs, iid) else {
+    let app_id: u64 = state.secrets.github_app_id.trim().parse().unwrap_or(0);
+    let Some(account) = user_sees_installation(&installs, iid, app_id) else {
         audit(
             state,
             &install_id,
@@ -1363,10 +1511,64 @@ async fn link_with_code(state: &AppState, st: &str, iid: u64, code: &str) -> Res
         .await;
         return page_redirect(&ret, "not_yours");
     };
+    if let Some(r) = link_blocked(state, &install_id, iid).await {
+        return page_redirect(&ret, r);
+    }
+    // What the person may push to themselves: the link never reaches past it.
+    let Ok(ceiling) = writable_in_installation(state, user_token, iid).await else {
+        return page_redirect(&ret, "github_unreachable");
+    };
+    if ceiling.is_empty() {
+        audit(
+            state,
+            &install_id,
+            "link_refused",
+            json!({ "installation_id": iid, "why": "no repository the person can push to" }),
+        )
+        .await;
+        return page_redirect(&ret, "no_write_access");
+    }
+    let Ok(Some(install)) = load_install(state, &install_id).await else {
+        return page_redirect(&ret, "install_off");
+    };
+    let token = broker::new_handle("hl");
+    let ceiling_json = serde_json::to_string(&ceiling).unwrap_or_default();
+    let iid_s = iid.to_string();
+    if put_state(
+        state,
+        &format!("HYBRIDCONFIRM#{token}"),
+        &[
+            ("install_id", &install_id),
+            ("installation_id", &iid_s),
+            ("account", &account),
+            ("return_url", &ret),
+            ("ceiling", &ceiling_json),
+        ],
+        600,
+    )
+    .await
+    .is_err()
+    {
+        return page_redirect(&ret, "store_failed");
+    }
+    let address = if install.name.is_empty() {
+        install.cloudfront.clone()
+    } else {
+        names::hostname(&install.name)
+    };
+    confirm_page(&account, &address, ceiling.len(), &token)
+}
+
+/// Why an installation can't be linked to this install right now, if it can't.
+async fn link_blocked(state: &AppState, install_id: &str, iid: u64) -> Option<&'static str> {
+    match load_install(state, install_id).await {
+        Ok(Some(i)) if i.verified() => {}
+        _ => return Some("install_off"),
+    }
     // Already linked elsewhere: one install per installation.
     if let Some(other) = install_for_installation(state, iid).await {
         if other != install_id {
-            return page_redirect(&ret, "linked_elsewhere");
+            return Some("linked_elsewhere");
         }
     }
     // A hosted team already owns it: never take a hosted customer's installation.
@@ -1374,12 +1576,61 @@ async fn link_with_code(state: &AppState, st: &str, iid: u64, code: &str) -> Res
         .await
         .is_some()
     {
-        return page_redirect(&ret, "used_by_hosted_team");
+        return Some("used_by_hosted_team");
+    }
+    None
+}
+
+/// POST /hybrid/github/confirm `token=&choice=link|cancel` (form, from
+/// [`confirm_page`]): the person's answer. Only `link` links.
+pub async fn github_confirm(State(state): State<Arc<AppState>>, body: Bytes) -> Response {
+    if master(&state).is_none() {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    let f = form(&body);
+    let token = f.get("token").cloned().unwrap_or_default();
+    if !token.starts_with("hl_") || token.len() > 60 {
+        return (StatusCode::BAD_REQUEST, "Unknown link.").into_response();
+    }
+    let Some(p) = take_state(&state, &format!("HYBRIDCONFIRM#{token}")).await else {
+        return (
+            StatusCode::BAD_REQUEST,
+            "That link expired or was already used. Start it again from your install.",
+        )
+            .into_response();
+    };
+    let g = |k: &str| {
+        p.get(k)
+            .and_then(|v| v.as_s().ok())
+            .cloned()
+            .unwrap_or_default()
+    };
+    let (install_id, ret, account) = (g("install_id"), g("return_url"), g("account"));
+    let Ok(iid) = g("installation_id").parse::<u64>() else {
+        return (StatusCode::BAD_REQUEST, "Unknown link.").into_response();
+    };
+    if f.get("choice").map(String::as_str) != Some("link") {
+        audit(
+            &state,
+            &install_id,
+            "link_declined",
+            json!({ "installation_id": iid }),
+        )
+        .await;
+        return page_redirect(&ret, "declined");
+    }
+    if let Some(r) = link_blocked(&state, &install_id, iid).await {
+        return page_redirect(&ret, r);
+    }
+    let ceiling: Vec<String> = serde_json::from_str(&g("ceiling")).unwrap_or_default();
+    if ceiling.is_empty() {
+        return page_redirect(&ret, "no_write_access");
     }
     let link = broker::GithubLink {
         installation_id: iid,
         account: account.clone(),
         repositories: vec![],
+        ceiling: Some(ceiling.clone()),
     };
     let ok = state
         .dynamo
@@ -1399,6 +1650,9 @@ async fn link_with_code(state: &AppState, st: &str, iid: u64, code: &str) -> Res
             .item("pk", s(&format!("HYBRIDGH#{iid}")))
             .item("sk", s("LINK"))
             .item("install_id", s(&install_id))
+            // Never over another install's link made in the meantime.
+            .condition_expression("attribute_not_exists(pk) OR install_id = :i")
+            .expression_attribute_values(":i", s(&install_id))
             .send()
             .await
             .is_ok();
@@ -1406,10 +1660,10 @@ async fn link_with_code(state: &AppState, st: &str, iid: u64, code: &str) -> Res
         return page_redirect(&ret, "store_failed");
     }
     audit(
-        state,
+        &state,
         &install_id,
         "link_github",
-        json!({ "installation_id": iid, "account": account }),
+        json!({ "installation_id": iid, "account": account, "repositories": ceiling.len() }),
     )
     .await;
     page_redirect(&ret, "linked")
@@ -1438,7 +1692,7 @@ pub async fn set_link_repos(
                 broker::BrokerRefusal::NotLinked.message(),
             )
         })?;
-    link.repositories = body_json(&body)["repositories"]
+    let chosen: Vec<String> = body_json(&body)["repositories"]
         .as_array()
         .map(|a| {
             a.iter()
@@ -1449,6 +1703,14 @@ pub async fn set_link_repos(
                 .collect()
         })
         .unwrap_or_default();
+    if !broker::ceiling_allows(link, &chosen) {
+        return Err(fail(
+            StatusCode::FORBIDDEN,
+            broker::BrokerRefusal::RepositoryNotAllowed.code(),
+            broker::BrokerRefusal::RepositoryNotAllowed.message(),
+        ));
+    }
+    link.repositories = chosen;
     state
         .dynamo
         .update_item()
@@ -1631,17 +1893,14 @@ pub async fn relay_github(
     };
     let key = sign::relay_key(master, &install_id);
     let origin = install.origin();
-    let attempt = relay::send(
-        &state.http,
-        &relay::Forward {
-            origin: &origin,
-            relay_key: &key,
-            source: "github",
-            event: event_type,
-            delivery_id: &delivery_id,
-            body,
-        },
-    )
+    let attempt = relay::send(&relay::Forward {
+        origin: &origin,
+        relay_key: &key,
+        source: "github",
+        event: event_type,
+        delivery_id: &delivery_id,
+        body,
+    })
     .await;
     if let relay::Next::RetryIn(secs) = relay::apply(&mut d, attempt) {
         {
@@ -1713,17 +1972,14 @@ pub async fn relay_jira(
     let key = sign::relay_key(master, install_id);
     let origin = install.origin();
     let id = d.id.clone();
-    let attempt = relay::send(
-        &state.http,
-        &relay::Forward {
-            origin: &origin,
-            relay_key: &key,
-            source: "jira",
-            event: path_event,
-            delivery_id: &id,
-            body,
-        },
-    )
+    let attempt = relay::send(&relay::Forward {
+        origin: &origin,
+        relay_key: &key,
+        source: "jira",
+        event: path_event,
+        delivery_id: &id,
+        body,
+    })
     .await;
     let next = relay::apply(&mut d, attempt);
     deliveries::record(&state.dynamo, &state.config.settings_table_name, &pk, &d).await;
@@ -1814,17 +2070,14 @@ pub async fn redeliver(
     };
     let key = sign::relay_key(&master, &install.id);
     let origin = install.origin();
-    let a = relay::send(
-        &state.http,
-        &relay::Forward {
-            origin: &origin,
-            relay_key: &key,
-            source: "github",
-            event: &event,
-            delivery_id: &rid,
-            body: &bytes,
-        },
-    )
+    let a = relay::send(&relay::Forward {
+        origin: &origin,
+        relay_key: &key,
+        source: "github",
+        event: &event,
+        delivery_id: &rid,
+        body: &bytes,
+    })
     .await;
     let next = relay::apply(&mut d, a);
     if matches!(next, relay::Next::Delivered | relay::Next::AlreadyDelivered) {
@@ -1891,6 +2144,21 @@ fn hosted_team(install: &str) -> String {
     relay::install_pk(install)
 }
 
+/// The holding partition one provider sign-in is finished in. It moves into
+/// the install's own ([`hosted_team`]) only when the install redeems the
+/// code with its secret and the PKCE verifier ([`oauth_token`]): the
+/// authorize link is public, so whoever follows it could otherwise put their
+/// own provider account (or nothing) in place of the install's.
+pub fn signin_team(install: &str, flow: &str) -> String {
+    format!("{}#SIGNIN#{flow}", relay::install_pk(install))
+}
+
+/// A flow id: what [`signin_team`] is keyed by.
+fn is_flow(flow: &str) -> bool {
+    flow.strip_prefix("fl_")
+        .is_some_and(|t| t.len() == 40 && t.chars().all(|c| c.is_ascii_alphanumeric()))
+}
+
 #[derive(Deserialize, Default)]
 pub struct AuthorizeQuery {
     client_id: Option<String>,
@@ -1907,10 +2175,19 @@ pub struct AuthorizeQuery {
 pub async fn oauth_authorize(
     State(state): State<Arc<AppState>>,
     Path(kind): Path<String>,
+    headers: HeaderMap,
     Query(q): Query<AuthorizeQuery>,
 ) -> Response {
     if master(&state).is_none() {
         return StatusCode::NOT_FOUND.into_response();
+    }
+    // Public: each start writes a holding partition, so it is limited per address.
+    if crate::middleware::rate_limit::allow(&headers, "hybrid-authorize", 20, 600).is_err() {
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            "Too many sign-ins started from here. Try again in a few minutes.",
+        )
+            .into_response();
     }
     let Some(k) = kind_of(&kind) else {
         return (StatusCode::NOT_FOUND, "Unknown provider.").into_response();
@@ -1938,8 +2215,10 @@ pub async fn oauth_authorize(
         )
             .into_response();
     }
-    // The provider sign-in itself: CoderHelm's app, stored under the install's partition.
-    let team = hosted_team(&install.id);
+    // The provider sign-in itself: CoderHelm's app, finished in a holding
+    // partition of its own; the install's partition is never touched here.
+    let flow = broker::new_handle("fl");
+    let team = signin_team(&install.id, &flow);
     let rt = super::mcp_servers::runtime(&state, &team);
     let a = super::knowledge_sources::app(&state, k);
     let Some(p) = common::knowledge::sources::oauth::provider(k) else {
@@ -1997,6 +2276,7 @@ pub async fn oauth_authorize(
         ("redirect_uri", redirect.as_str()),
         ("install_state", install_state.as_str()),
         ("code_challenge", challenge.as_str()),
+        ("flow", flow.as_str()),
     ];
     if put_state(&state, &key, &fields, 900).await.is_err() {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
@@ -2031,13 +2311,18 @@ pub async fn oauth_callback(State(state): State<Arc<AppState>>, body: Bytes) -> 
             .cloned()
             .unwrap_or_default()
     };
-    let (install_id, kind, redirect, install_state, challenge) = (
+    let (install_id, kind, redirect, install_state, challenge, flow) = (
         g("install_id"),
         g("kind"),
         g("redirect_uri"),
         g("install_state"),
         g("code_challenge"),
+        g("flow"),
     );
+    // A flow started before holding partitions existed has none: start again.
+    if !is_flow(&flow) {
+        return Err(not_here());
+    }
     let back = |q: &str| {
         format!(
             "{redirect}?{q}&state={}",
@@ -2049,7 +2334,7 @@ pub async fn oauth_callback(State(state): State<Arc<AppState>>, body: Bytes) -> 
             json!({ "redirect": back(&format!("error={}", urlencoding::encode(err))) }),
         ));
     }
-    let team = hosted_team(&install_id);
+    let team = signin_team(&install_id, &flow);
     let rt = super::mcp_servers::runtime(&state, &team);
     let sub = format!("hybrid:{install_id}");
     if let Err(e) = rt
@@ -2075,6 +2360,7 @@ pub async fn oauth_callback(State(state): State<Arc<AppState>>, body: Bytes) -> 
             ("kind", &kind),
             ("code_challenge", &challenge),
             ("redirect_uri", &redirect),
+            ("flow", &flow),
         ],
         300,
     )
@@ -2083,6 +2369,37 @@ pub async fn oauth_callback(State(state): State<Arc<AppState>>, body: Bytes) -> 
     Ok(Json(
         json!({ "redirect": back(&format!("code={}", urlencoding::encode(&code))) }),
     ))
+}
+
+/// Moves a finished provider sign-in from its holding partition into the
+/// install's own, with CoderHelm's app as the connection there.
+async fn adopt_provider_sign_in(
+    state: &AppState,
+    install_id: &str,
+    kind: &str,
+    flow: &str,
+) -> Result<(), String> {
+    if !is_flow(flow) {
+        return Err("no holding partition".into());
+    }
+    let k = kind_of(kind).ok_or("unknown provider")?;
+    let p = common::knowledge::sources::oauth::provider(k).ok_or("unknown provider")?;
+    let a = super::knowledge_sources::app(state, k);
+    if !a.is_set() {
+        return Err("CoderHelm's app for this provider isn't set up".into());
+    }
+    let team = hosted_team(install_id);
+    let rt = super::mcp_servers::runtime(state, &team);
+    let hold = super::mcp_servers::runtime(state, &signin_team(install_id, flow));
+    let id = common::knowledge::sources::oauth::connection_id(k);
+    let sealed = rt.seal_client_secret(&id, a.client_secret.trim()).await?;
+    let mut rec =
+        common::knowledge::sources::oauth::connection_record(k, &p, a.client_id.trim(), &sealed);
+    rec.added_by = format!("hybrid:{install_id}");
+    rec.added_at = now();
+    rt.store.put_server(&team, &rec).await?;
+    rt.adopt_sign_in(&hold, &id, &common::mcp_remote::store::Owner::Team)
+        .await
 }
 
 fn token_error(code: &str, desc: &str) -> (StatusCode, Json<Value>) {
@@ -2150,6 +2467,17 @@ pub async fn oauth_token(State(state): State<Arc<AppState>>, body: Bytes) -> Rep
                 ));
             }
             let kind = cg("kind");
+            // Only now, with the install's secret and verifier checked, does
+            // the sign-in become the install's.
+            adopt_provider_sign_in(&state, &install.id, &kind, &cg("flow"))
+                .await
+                .map_err(|e| {
+                    warn!(install = %install.id, error = %e, "hybrid: sign-in not taken");
+                    token_error(
+                        "invalid_grant",
+                        "The sign-in couldn't be finished. Start it again.",
+                    )
+                })?;
             let handle = broker::new_handle("hr");
             state
                 .dynamo
@@ -2346,8 +2674,31 @@ pub async fn admin_revoke(
         .await?
         .ok_or_else(|| fail(StatusCode::NOT_FOUND, "not_found", "No such install."))?;
     release_name(&state, &mut install).await?;
+    // Its GitHub installations stop relaying here and are free again.
+    for l in github_links(&state, &install.id).await {
+        unlink(&state, &install.id, l.installation_id).await;
+    }
     install.status = "revoked".into();
+    install.integrations.clear();
     save_install(&state, &install).await?;
+    // And the same CloudFront can't simply register again.
+    state
+        .dynamo
+        .put_item()
+        .table_name(&state.config.settings_table_name)
+        .item("pk", s(&revoked_cloudfront_key(&install.cloudfront)))
+        .item("sk", s("REVOKED"))
+        .item("install_id", s(&install.id))
+        .item("at", s(&now()))
+        .send()
+        .await
+        .map_err(|_| {
+            fail(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "store_unavailable",
+                "Try again in a minute.",
+            )
+        })?;
     audit(
         &state,
         &id,
@@ -2408,13 +2759,85 @@ mod tests {
 
     #[test]
     fn linking_needs_the_person_to_see_the_installation() {
-        let v = json!({"installations": [{"id": 5, "account": {"login": "example-org"}}, {"id": 6, "account": {"login": "other"}}]});
+        let v = json!({"installations": [
+            {"id": 5, "app_id": 9, "account": {"login": "example-org"}},
+            {"id": 6, "app_id": 9, "account": {"login": "other"}},
+            {"id": 8, "app_id": 1234, "account": {"login": "another-app"}}
+        ]});
         assert_eq!(
-            user_sees_installation(&v, 5).as_deref(),
+            user_sees_installation(&v, 5, 9).as_deref(),
             Some("example-org")
         );
-        assert_eq!(user_sees_installation(&v, 7), None);
-        assert_eq!(user_sees_installation(&json!({}), 5), None);
+        assert_eq!(user_sees_installation(&v, 7, 9), None);
+        assert_eq!(user_sees_installation(&json!({}), 5, 9), None);
+        // Another app's installation never counts, nor does an unknown app id.
+        assert_eq!(user_sees_installation(&v, 8, 9), None);
+        assert_eq!(user_sees_installation(&v, 5, 0), None);
+    }
+
+    #[test]
+    fn the_return_address_is_one_of_the_installs_own_hosts() {
+        let i = Install {
+            id: "ins_abcdefghijklmnopqrstuvwx".into(),
+            status: "active".into(),
+            cloudfront: "d1abcdef234567.cloudfront.net".into(),
+            name: "example".into(),
+            ..Default::default()
+        };
+        let home = "https://d1abcdef234567.cloudfront.net/settings/system/#hybrid";
+        for ok in [
+            "https://d1abcdef234567.cloudfront.net/settings/system/?x=1#hybrid",
+            "https://example.coderhelm.com/settings/system/",
+            "https://docs.coderhelm.com/self-host/install/",
+        ] {
+            assert_eq!(
+                return_url_for(&i, ok),
+                url::Url::parse(ok).unwrap().to_string(),
+                "{ok}"
+            );
+        }
+        for bad in [
+            "https://d1abcdef234567.cloudfront.net.example.org/x",
+            "https://d1abcdef234567.cloudfront.net@example.org/x",
+            "https://example.coderhelm.com.example.org/",
+            "https://docs.coderhelm.com.example.org/",
+            "http://d1abcdef234567.cloudfront.net/",
+            "https://d1abcdef234567.cloudfront.net:8443/",
+            "javascript:alert(1)",
+            "//example.org",
+            "",
+        ] {
+            assert_eq!(return_url_for(&i, bad), home, "{bad}");
+        }
+    }
+
+    #[test]
+    fn the_link_confirmation_names_the_install_and_cant_be_framed() {
+        let r = confirm_page("example-org", "example.coderhelm.com", 3, "hl_abc");
+        assert_eq!(r.status(), StatusCode::OK);
+        let h = r.headers();
+        assert_eq!(h.get("x-frame-options").unwrap(), "DENY");
+        assert!(h
+            .get("content-security-policy")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .contains("frame-ancestors 'none'"));
+        assert_eq!(h.get("cache-control").unwrap(), "no-store");
+        let r = confirm_page("<b>x</b>", "a\"b", 1, "hl_\"><script>");
+        let body = futures_body(r);
+        assert!(!body.contains("<b>x</b>") && !body.contains("<script>"));
+        assert!(body.contains("&lt;b&gt;x&lt;/b&gt;") && body.contains("1 repository"));
+    }
+
+    fn futures_body(r: Response) -> String {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let b = rt
+            .block_on(axum::body::to_bytes(r.into_body(), 1 << 20))
+            .unwrap();
+        String::from_utf8(b.to_vec()).unwrap()
     }
 
     #[test]
@@ -2560,6 +2983,31 @@ mod tests {
         assert!(cookie_lines >= 5, "the scan found the session cookies");
         // The cookie names the format strings use are __Host- too.
         assert!(super::super::support_access::SUPPORT_COOKIE.starts_with("__Host-"));
+    }
+
+    #[test]
+    fn a_provider_sign_in_is_held_apart_from_the_install() {
+        let id = "ins_abcdefghijklmnopqrstuvwx";
+        let flow = broker::new_handle("fl");
+        assert!(is_flow(&flow));
+        let hold = signin_team(id, &flow);
+        assert_ne!(hold, hosted_team(id));
+        assert!(hold.starts_with(&format!("{}#SIGNIN#fl_", hosted_team(id))));
+        assert!(!is_flow(""));
+        assert!(!is_flow("fl_short"));
+        assert!(!is_flow(&format!("fl_{}#x", "a".repeat(38))));
+    }
+
+    #[test]
+    fn a_revoked_cloudfront_is_one_key_however_it_is_written() {
+        assert_eq!(
+            revoked_cloudfront_key("D1ABCDEF234567.cloudfront.net."),
+            revoked_cloudfront_key("d1abcdef234567.cloudfront.net")
+        );
+        assert_eq!(
+            revoked_cloudfront_key("d1abcdef234567.cloudfront.net"),
+            "HYBRIDREVOKED#d1abcdef234567.cloudfront.net"
+        );
     }
 
     #[test]
