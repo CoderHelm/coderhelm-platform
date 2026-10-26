@@ -1,6 +1,22 @@
 {
   "components": {
     "schemas": {
+      "Backfill": {
+        "description": "Whether the records from before rollups existed are all counted yet.",
+        "properties": {
+          "complete": {
+            "description": "False while older records are still being counted; numbers grow until it is true.",
+            "examples": [
+              true
+            ],
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "complete"
+        ],
+        "type": "object"
+      },
       "CiUploadResult": {
         "description": "A report that was taken in.",
         "properties": {
@@ -209,6 +225,261 @@
         ],
         "type": "object"
       },
+      "DeliveryAnalytics": {
+        "description": "The Deliveries overview for one period.",
+        "examples": [
+          {
+            "backfill": {
+              "complete": true
+            },
+            "endpoints": [
+              {
+                "deleted": false,
+                "deliveries": 214,
+                "description": "Incident bot",
+                "disabled_reason": "",
+                "enabled": true,
+                "failed": 12,
+                "failing_since": null,
+                "id": "ep_01JBENDPT4K2M8N3P5Q7R9S1T3",
+                "last_failure_at": "2026-10-26T09:14:02Z",
+                "last_failure_message": "Your webhook endpoint answered with a server error (5xx).",
+                "last_failure_reason": "webhook_server_error",
+                "last_success_at": "2026-10-26T15:02:40Z",
+                "ok": 202,
+                "p50_ms": 320,
+                "p95_ms": 2900,
+                "streak": 0,
+                "success_rate": 0.9439,
+                "url": "https://hooks.example.com/coderhelm"
+              }
+            ],
+            "events": [
+              {
+                "event": "run.failed",
+                "failed": 9,
+                "source": "webhook"
+              }
+            ],
+            "from": "2026-10-20T00:00:00Z",
+            "granularity": "day",
+            "kept_days": 120,
+            "period": "7d",
+            "previous": {
+              "deliveries": 1120,
+              "failed": 28,
+              "handled": 1040,
+              "ignored": 52,
+              "p50_ms": 170,
+              "p95_ms": 1100,
+              "p99_ms": 4100,
+              "retried": 30,
+              "retried_ok": 26,
+              "retries": 44,
+              "success_rate": 0.975
+            },
+            "previous_from": "2026-10-13T00:00:00Z",
+            "previous_to": "2026-10-20T00:00:00Z",
+            "reasons": [
+              {
+                "code": "webhook_server_error",
+                "count": 12,
+                "fix": "Check your endpoint's logs for this event id. CoderHelm retries for about a day.",
+                "message": "Your webhook endpoint answered with a server error (5xx).",
+                "previous_count": 3,
+                "sources": [
+                  "webhook"
+                ]
+              }
+            ],
+            "records_kept_days": 14,
+            "seen_sources": [
+              "github",
+              "webhook",
+              "slack",
+              "email"
+            ],
+            "series": [
+              {
+                "deliveries": 190,
+                "end": "2026-10-27T00:00:00Z",
+                "failed": 4,
+                "ok": 186,
+                "p95_ms": 1100,
+                "previous_deliveries": 171,
+                "start": "2026-10-26T00:00:00Z",
+                "success_rate": 0.9789
+              }
+            ],
+            "sources": [
+              {
+                "deliveries": 912,
+                "direction": "inbound",
+                "failed": 7,
+                "ok": 905,
+                "p95_ms": 640,
+                "previous_deliveries": 870,
+                "previous_success_rate": 0.9897,
+                "source": "github",
+                "success_rate": 0.9923
+              }
+            ],
+            "summary": {
+              "deliveries": 1284,
+              "failed": 33,
+              "handled": 1190,
+              "ignored": 61,
+              "p50_ms": 180,
+              "p95_ms": 1240,
+              "p99_ms": 4800,
+              "retried": 41,
+              "retried_ok": 37,
+              "retries": 58,
+              "success_rate": 0.9743
+            },
+            "to": "2026-10-27T00:00:00Z"
+          }
+        ],
+        "properties": {
+          "backfill": {
+            "$ref": "#/components/schemas/Backfill"
+          },
+          "endpoints": {
+            "description": "The team's outbound webhook endpoints, and any that had deliveries\nin the period since. Empty when another source is chosen.",
+            "items": {
+              "$ref": "#/components/schemas/EndpointRow"
+            },
+            "type": "array"
+          },
+          "events": {
+            "description": "The event types that failed most (up to 10).",
+            "items": {
+              "$ref": "#/components/schemas/EventRow"
+            },
+            "type": "array"
+          },
+          "from": {
+            "description": "The period: from (inclusive) to (exclusive), RFC 3339.",
+            "examples": [
+              "2026-10-20T00:00:00Z"
+            ],
+            "type": "string"
+          },
+          "granularity": {
+            "description": "`hour` or `day`.",
+            "examples": [
+              "day"
+            ],
+            "type": "string"
+          },
+          "kept_days": {
+            "description": "Days the counts are kept.",
+            "examples": [
+              120
+            ],
+            "format": "int64",
+            "type": "integer"
+          },
+          "period": {
+            "description": "`24h`, `7d` or `30d`.",
+            "examples": [
+              "7d"
+            ],
+            "type": "string"
+          },
+          "previous": {
+            "$ref": "#/components/schemas/Totals"
+          },
+          "previous_from": {
+            "description": "The period before, as long as this one.",
+            "examples": [
+              "2026-10-13T00:00:00Z"
+            ],
+            "type": "string"
+          },
+          "previous_to": {
+            "description": "The end of the period before, exclusive.",
+            "examples": [
+              "2026-10-20T00:00:00Z"
+            ],
+            "type": "string"
+          },
+          "reasons": {
+            "description": "Failures by reason, most first.",
+            "items": {
+              "$ref": "#/components/schemas/ReasonRow"
+            },
+            "type": "array"
+          },
+          "records_kept_days": {
+            "description": "Days each delivery's record is kept (what a drill-in can list).",
+            "examples": [
+              14
+            ],
+            "format": "int64",
+            "type": "integer"
+          },
+          "seen_sources": {
+            "description": "Every source with deliveries in either period, for the filter.",
+            "examples": [
+              [
+                "github",
+                "webhook",
+                "slack",
+                "email"
+              ]
+            ],
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "series": {
+            "description": "One point per hour (24h) or day, oldest first.",
+            "items": {
+              "$ref": "#/components/schemas/Point"
+            },
+            "type": "array"
+          },
+          "sources": {
+            "description": "By source and direction, most deliveries first.",
+            "items": {
+              "$ref": "#/components/schemas/SourceRow"
+            },
+            "type": "array"
+          },
+          "summary": {
+            "$ref": "#/components/schemas/Totals"
+          },
+          "to": {
+            "description": "The end of the period, exclusive.",
+            "examples": [
+              "2026-10-27T00:00:00Z"
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "period",
+          "granularity",
+          "from",
+          "to",
+          "previous_from",
+          "previous_to",
+          "summary",
+          "previous",
+          "series",
+          "sources",
+          "reasons",
+          "events",
+          "endpoints",
+          "seen_sources",
+          "backfill",
+          "kept_days",
+          "records_kept_days"
+        ],
+        "type": "object"
+      },
       "DeliveryAttempt": {
         "description": "One attempt.",
         "properties": {
@@ -255,6 +526,183 @@
         ],
         "type": "object"
       },
+      "EndpointRow": {
+        "description": "One outbound webhook endpoint.",
+        "properties": {
+          "deleted": {
+            "description": "The endpoint no longer exists; its counts stay for the period.",
+            "examples": [
+              false
+            ],
+            "type": "boolean"
+          },
+          "deliveries": {
+            "description": "Finished deliveries to it in the period.",
+            "examples": [
+              214
+            ],
+            "format": "int64",
+            "type": "integer"
+          },
+          "description": {
+            "description": "The endpoint's description, as the team wrote it.",
+            "examples": [
+              "Incident bot"
+            ],
+            "type": "string"
+          },
+          "disabled_reason": {
+            "description": "Why it's off: `manual` or `failing`. Empty while on.",
+            "examples": [
+              ""
+            ],
+            "type": "string"
+          },
+          "enabled": {
+            "description": "Whether the endpoint is on.",
+            "examples": [
+              true
+            ],
+            "type": "boolean"
+          },
+          "failed": {
+            "description": "Failed.",
+            "examples": [
+              12
+            ],
+            "format": "int64",
+            "type": "integer"
+          },
+          "failing_since": {
+            "description": "The first failure since its last success, while it's failing.",
+            "examples": [
+              null
+            ],
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "id": {
+            "description": "The endpoint's id.",
+            "examples": [
+              "ep_01JBENDPT4K2M8N3P5Q7R9S1T3"
+            ],
+            "type": "string"
+          },
+          "last_failure_at": {
+            "description": "When it last failed.",
+            "examples": [
+              "2026-10-26T09:14:02Z"
+            ],
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "last_failure_message": {
+            "description": "The last failure's reason in plain words.",
+            "examples": [
+              "Your webhook endpoint answered with a server error (5xx)."
+            ],
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "last_failure_reason": {
+            "description": "The last failure's reason code.",
+            "examples": [
+              "webhook_server_error"
+            ],
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "last_success_at": {
+            "description": "When it last took a delivery.",
+            "examples": [
+              "2026-10-26T15:02:40Z"
+            ],
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "ok": {
+            "description": "Delivered.",
+            "examples": [
+              202
+            ],
+            "format": "int64",
+            "type": "integer"
+          },
+          "p50_ms": {
+            "description": "Median latency, milliseconds.",
+            "examples": [
+              320
+            ],
+            "format": "int64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "p95_ms": {
+            "description": "95th percentile latency, milliseconds.",
+            "examples": [
+              2900
+            ],
+            "format": "int64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "streak": {
+            "description": "Failures in a row since its last success.",
+            "examples": [
+              0
+            ],
+            "format": "int64",
+            "type": "integer"
+          },
+          "success_rate": {
+            "description": "Delivered, out of finished. Null with none.",
+            "examples": [
+              0.9439
+            ],
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "url": {
+            "description": "The endpoint's address (empty once the endpoint is deleted).",
+            "examples": [
+              "https://hooks.example.com/coderhelm"
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "url",
+          "description",
+          "deleted",
+          "enabled",
+          "disabled_reason",
+          "deliveries",
+          "ok",
+          "failed",
+          "streak"
+        ],
+        "type": "object"
+      },
       "ErrorBody": {
         "description": "The body of every error an API key request gets.",
         "examples": [
@@ -293,6 +741,39 @@
         "required": [
           "error",
           "code"
+        ],
+        "type": "object"
+      },
+      "EventRow": {
+        "description": "An event type that failed.",
+        "properties": {
+          "event": {
+            "description": "The event or message type.",
+            "examples": [
+              "run.failed"
+            ],
+            "type": "string"
+          },
+          "failed": {
+            "description": "Failures of this type in the period.",
+            "examples": [
+              9
+            ],
+            "format": "int64",
+            "type": "integer"
+          },
+          "source": {
+            "description": "Where it came from or went.",
+            "examples": [
+              "webhook"
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "event",
+          "source",
+          "failed"
         ],
         "type": "object"
       },
@@ -1331,6 +1812,89 @@
         ],
         "type": "object"
       },
+      "Point": {
+        "description": "One hour or day of the period.",
+        "properties": {
+          "deliveries": {
+            "description": "Finished deliveries in the bucket.",
+            "examples": [
+              190
+            ],
+            "format": "int64",
+            "type": "integer"
+          },
+          "end": {
+            "description": "The bucket's end, exclusive.",
+            "examples": [
+              "2026-10-27T00:00:00Z"
+            ],
+            "type": "string"
+          },
+          "failed": {
+            "description": "Failed.",
+            "examples": [
+              4
+            ],
+            "format": "int64",
+            "type": "integer"
+          },
+          "ok": {
+            "description": "Handled or ignored.",
+            "examples": [
+              186
+            ],
+            "format": "int64",
+            "type": "integer"
+          },
+          "p95_ms": {
+            "description": "95th percentile latency, milliseconds.",
+            "examples": [
+              1100
+            ],
+            "format": "int64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "previous_deliveries": {
+            "description": "Deliveries in the matching bucket of the period before.",
+            "examples": [
+              171
+            ],
+            "format": "int64",
+            "type": "integer"
+          },
+          "start": {
+            "description": "The bucket's start (RFC 3339, UTC).",
+            "examples": [
+              "2026-10-26T00:00:00Z"
+            ],
+            "type": "string"
+          },
+          "success_rate": {
+            "description": "Handled or ignored, out of finished. Null with none.",
+            "examples": [
+              0.9789
+            ],
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "start",
+          "end",
+          "deliveries",
+          "ok",
+          "failed",
+          "previous_deliveries"
+        ],
+        "type": "object"
+      },
       "Quarantine": {
         "description": "The tests quarantined for the calling repository.",
         "properties": {
@@ -1442,6 +2006,69 @@
           "text",
           "rating",
           "at"
+        ],
+        "type": "object"
+      },
+      "ReasonRow": {
+        "description": "Failures with one reason.",
+        "properties": {
+          "code": {
+            "description": "The reason code, as on each delivery.",
+            "examples": [
+              "webhook_server_error"
+            ],
+            "type": "string"
+          },
+          "count": {
+            "description": "Failures with this reason in the period.",
+            "examples": [
+              12
+            ],
+            "format": "int64",
+            "type": "integer"
+          },
+          "fix": {
+            "description": "What to do about it.",
+            "examples": [
+              "Check your endpoint's logs for this event id. CoderHelm retries for about a day."
+            ],
+            "type": "string"
+          },
+          "message": {
+            "description": "What happened, in plain words.",
+            "examples": [
+              "Your webhook endpoint answered with a server error (5xx)."
+            ],
+            "type": "string"
+          },
+          "previous_count": {
+            "description": "Failures with this reason in the period before.",
+            "examples": [
+              3
+            ],
+            "format": "int64",
+            "type": "integer"
+          },
+          "sources": {
+            "description": "The sources it happened on, most first.",
+            "examples": [
+              [
+                "webhook"
+              ]
+            ],
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "code",
+          "message",
+          "fix",
+          "count",
+          "previous_count",
+          "sources"
         ],
         "type": "object"
       },
@@ -2770,6 +3397,220 @@
         ],
         "type": "object"
       },
+      "SourceRow": {
+        "description": "One source and direction.",
+        "properties": {
+          "deliveries": {
+            "description": "Finished deliveries in the period.",
+            "examples": [
+              912
+            ],
+            "format": "int64",
+            "type": "integer"
+          },
+          "direction": {
+            "description": "`inbound` or `outbound`.",
+            "examples": [
+              "inbound"
+            ],
+            "type": "string"
+          },
+          "failed": {
+            "description": "Failed.",
+            "examples": [
+              7
+            ],
+            "format": "int64",
+            "type": "integer"
+          },
+          "ok": {
+            "description": "Handled or ignored.",
+            "examples": [
+              905
+            ],
+            "format": "int64",
+            "type": "integer"
+          },
+          "p95_ms": {
+            "description": "95th percentile latency, milliseconds.",
+            "examples": [
+              640
+            ],
+            "format": "int64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "previous_deliveries": {
+            "description": "Finished deliveries in the period before.",
+            "examples": [
+              870
+            ],
+            "format": "int64",
+            "type": "integer"
+          },
+          "previous_success_rate": {
+            "description": "The success rate in the period before.",
+            "examples": [
+              0.9897
+            ],
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "source": {
+            "description": "`github`, `relay`, `webhook`, `alerts`, `jira`, `slack`, `teams`, `email`, `broker`, `knowledge`.",
+            "examples": [
+              "github"
+            ],
+            "type": "string"
+          },
+          "success_rate": {
+            "description": "Handled or ignored, out of finished. Null with none.",
+            "examples": [
+              0.9923
+            ],
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "source",
+          "direction",
+          "deliveries",
+          "ok",
+          "failed",
+          "previous_deliveries"
+        ],
+        "type": "object"
+      },
+      "Totals": {
+        "description": "Headline numbers for one period.",
+        "properties": {
+          "deliveries": {
+            "description": "Finished deliveries (handled, ignored or failed).",
+            "examples": [
+              1284
+            ],
+            "format": "int64",
+            "type": "integer"
+          },
+          "failed": {
+            "description": "Finished and failed.",
+            "examples": [
+              33
+            ],
+            "format": "int64",
+            "type": "integer"
+          },
+          "handled": {
+            "description": "Finished and handled.",
+            "examples": [
+              1190
+            ],
+            "format": "int64",
+            "type": "integer"
+          },
+          "ignored": {
+            "description": "Finished and ignored on purpose (a duplicate, an event nothing needed).",
+            "examples": [
+              61
+            ],
+            "format": "int64",
+            "type": "integer"
+          },
+          "p50_ms": {
+            "description": "Latency percentiles in milliseconds (the last attempt's), from a\nhistogram, so within a bucket's width. Null with no timed deliveries.",
+            "examples": [
+              180
+            ],
+            "format": "int64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "p95_ms": {
+            "description": "95th percentile latency, milliseconds.",
+            "examples": [
+              1240
+            ],
+            "format": "int64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "p99_ms": {
+            "description": "99th percentile latency, milliseconds.",
+            "examples": [
+              4800
+            ],
+            "format": "int64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "retried": {
+            "description": "Deliveries that took more than one attempt.",
+            "examples": [
+              41
+            ],
+            "format": "int64",
+            "type": "integer"
+          },
+          "retried_ok": {
+            "description": "Of those, the ones that went fine in the end.",
+            "examples": [
+              37
+            ],
+            "format": "int64",
+            "type": "integer"
+          },
+          "retries": {
+            "description": "Attempts after the first, in all. Null when a status filter is on.",
+            "examples": [
+              58
+            ],
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "success_rate": {
+            "description": "Handled or ignored, out of finished. Null with none.",
+            "examples": [
+              0.9743
+            ],
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "deliveries",
+          "handled",
+          "ignored",
+          "failed",
+          "retried",
+          "retried_ok"
+        ],
+        "type": "object"
+      },
       "UpdateEndpointBody": {
         "description": "Changes to an endpoint. Only the fields sent change.",
         "properties": {
@@ -3379,7 +4220,7 @@
       "name": "CoderHelm support",
       "url": "https://docs.coderhelm.com/api"
     },
-    "description": "The CoderHelm API lets your own programs start and follow CoderHelm's work: list and inspect runs, retry or cancel them, create and run plans, read the reviewer's reviews, check token usage, and manage the webhook endpoints CoderHelm sends your team's events to.\n\nEvery request is authenticated with a team API key sent as a bearer token. Admins create keys in the dashboard under Settings, API keys. A key holds scopes, never more than the admin who made it, and has its own rate limit.\n\nCI jobs upload test reports with a GitHub Actions OIDC token instead of a key, and the webhooks are verified by their signatures.",
+    "description": "The CoderHelm API lets your own programs start and follow CoderHelm's work: list and inspect runs, retry or cancel them, create and run plans, read the reviewer's reviews, check token usage, manage the webhook endpoints CoderHelm sends your team's events to, and see how deliveries went.\n\nEvery request is authenticated with a team API key sent as a bearer token. Admins create keys in the dashboard under Settings, API keys. A key holds scopes, never more than the admin who made it, and has its own rate limit.\n\nCI jobs upload test reports with a GitHub Actions OIDC token instead of a key, and the webhooks are verified by their signatures.",
     "license": {
       "identifier": "MIT",
       "name": "MIT"
@@ -3389,6 +4230,173 @@
   },
   "openapi": "3.1.0",
   "paths": {
+    "/api/deliveries/analytics": {
+      "get": {
+        "description": "How the team's deliveries went over a period, against the period before: webhooks CoderHelm received (GitHub, Jira, alerts), events it relayed, and what it sent (webhook endpoints, Slack, Teams, email). Per hour for `24h`, per day otherwise: volume, success rate, latency percentiles, retries and how many of them went fine, failures by reason in plain words, the event types that failed most, and each webhook endpoint's success rate, latency, failure streak and whether it is turned off. Counts are kept 120 days; each delivery's own record 14.",
+        "operationId": "getDeliveryAnalytics",
+        "parameters": [
+          {
+            "description": "`24h` (by hour), `7d` or `30d` (by day). Default `7d`. Each is\ncompared with the period before it, as long.",
+            "example": "7d",
+            "in": "query",
+            "name": "period",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Only one source: `github`, `relay`, `webhook`, `alerts`, `jira`,\n`slack`, `teams`, `email`, `broker`, `knowledge`.",
+            "example": "webhook",
+            "in": "query",
+            "name": "source",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "`all` (default), `ok` (handled or ignored), `handled`, `ignored` or\n`failed`. Retrying deliveries count once they finish.",
+            "example": "failed",
+            "in": "query",
+            "name": "status",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Only one outbound webhook endpoint (its id).",
+            "example": "ep_01JBENDPT4K2M8N3P5Q7R9S1T3",
+            "in": "query",
+            "name": "endpoint",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DeliveryAnalytics"
+                }
+              }
+            },
+            "description": "The overview.",
+            "headers": {
+              "RateLimit-Limit": {
+                "description": "Requests this key may make in a minute.",
+                "schema": {
+                  "type": "integer"
+                }
+              },
+              "RateLimit-Remaining": {
+                "description": "Requests left in the current minute.",
+                "schema": {
+                  "type": "integer"
+                }
+              },
+              "RateLimit-Reset": {
+                "description": "Seconds until the current minute ends and the count starts over.",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            }
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "An unknown `period` or `status`."
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "The key is missing, malformed, revoked or expired, or the person who made it left the team."
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "The key lacks the scope this endpoint needs (`missing_scope`)."
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "Over the key's rate limit (`rate_limited`), or, for endpoints that start work, over the team's monthly token limit (`token_limit_reached`).",
+            "headers": {
+              "RateLimit-Limit": {
+                "description": "Requests this key may make in a minute.",
+                "schema": {
+                  "type": "integer"
+                }
+              },
+              "RateLimit-Remaining": {
+                "description": "Requests left in the current minute.",
+                "schema": {
+                  "type": "integer"
+                }
+              },
+              "RateLimit-Reset": {
+                "description": "Seconds until the current minute ends and the count starts over.",
+                "schema": {
+                  "type": "integer"
+                }
+              },
+              "Retry-After": {
+                "description": "With `rate_limited`: seconds to wait before trying again.",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            }
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "Something failed on CoderHelm's side. Safe to retry reads."
+          }
+        },
+        "security": [
+          {
+            "api_key": [
+              "deliveries"
+            ]
+          }
+        ],
+        "summary": "Get delivery analytics",
+        "tags": [
+          "Deliveries"
+        ]
+      }
+    },
     "/api/me": {
       "get": {
         "description": "Returns who the request is authenticated as. With an API key this is the key itself: its name, who made it, when it expires, its rate limit, and in `capabilities` the scopes it holds right now (cut down to what its maker holds). Call it first to check a key works.",
@@ -7405,6 +8413,11 @@
       "description": "Tokens used this month and the team's limits.",
       "name": "Usage",
       "x-displayName": "Usage"
+    },
+    {
+      "description": "How the webhooks CoderHelm receives and the messages it sends went over time: volume, success rate, latency, retries and failures by reason.",
+      "name": "Deliveries",
+      "x-displayName": "Deliveries"
     },
     {
       "description": "Endpoints a CI job calls with its GitHub Actions OIDC token, so no CoderHelm secret is stored in CI.",

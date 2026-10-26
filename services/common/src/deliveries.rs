@@ -550,12 +550,19 @@ pub struct Filter {
     /// Only deliveries at or after this time (RFC 3339).
     #[serde(default)]
     pub since: Option<String>,
+    /// Only deliveries before this time (RFC 3339): with `since`, one hour
+    /// or day of the overview.
+    #[serde(default)]
+    pub until: Option<String>,
     /// A delivery id, GitHub delivery id, repository or PR number.
     #[serde(default)]
     pub q: Option<String>,
     /// Only deliveries to this webhook endpoint.
     #[serde(default)]
     pub endpoint: Option<String>,
+    /// Only failures with this reason code (a drill-in from the overview).
+    #[serde(default)]
+    pub reason: Option<String>,
 }
 
 impl Filter {
@@ -583,13 +590,23 @@ impl Filter {
                 return false;
             }
         }
+        if let Some(r) = self.reason.as_deref().filter(|r| !r.is_empty()) {
+            if d.reason != r {
+                return false;
+            }
+        }
         if let Some(ep) = self.endpoint.as_deref().filter(|e| !e.is_empty()) {
             if d.endpoint_id != ep {
                 return false;
             }
         }
         if let Some(since) = self.since.as_deref().filter(|s| !s.is_empty()) {
-            if d.created_at.as_str() < since {
+            if !before_or_at(since, &d.created_at) {
+                return false;
+            }
+        }
+        if let Some(until) = self.until.as_deref().filter(|s| !s.is_empty()) {
+            if before_or_at(until, &d.created_at) {
                 return false;
             }
         }
@@ -607,6 +624,18 @@ impl Filter {
             }
         }
         true
+    }
+}
+
+/// `a` is at or before `b` (RFC 3339 times; compared as instants when both
+/// parse, so `Z` and `.000Z` forms agree, as text otherwise).
+fn before_or_at(a: &str, b: &str) -> bool {
+    match (
+        chrono::DateTime::parse_from_rfc3339(a),
+        chrono::DateTime::parse_from_rfc3339(b),
+    ) {
+        (Ok(x), Ok(y)) => x <= y,
+        _ => a <= b,
     }
 }
 
@@ -636,6 +665,11 @@ pub fn to_item(
         "ttl".into(),
         AttributeValue::N(ttl_from(now_epoch).to_string()),
     );
+    // Counted by the rollups as it is written ([`record`]).
+    item.insert(
+        crate::deliveries_rollup::ROLLED.into(),
+        AttributeValue::N("1".into()),
+    );
     item
 }
 
@@ -645,21 +679,44 @@ pub fn from_item(item: &std::collections::HashMap<String, AttributeValue>) -> Op
     serde_json::from_str(data).ok()
 }
 
-/// Writes (or replaces) one delivery record. Failures are logged and never
-/// fail the delivery itself: the record is for people, the work matters more.
+/// The record an item held before it was replaced, when the rollups had
+/// counted it (it carries `rolled`). A record written before rollups existed
+/// is counted by the backfill instead, so it is not taken away here.
+pub fn counted_before(
+    old: Option<&std::collections::HashMap<String, AttributeValue>>,
+) -> Option<Delivery> {
+    old.filter(|i| i.contains_key(crate::deliveries_rollup::ROLLED))
+        .and_then(from_item)
+}
+
+/// Writes (or replaces) one delivery record, and moves the rollups by the
+/// difference from the record it replaced ([`crate::deliveries_rollup`]).
+/// Failures are logged and never fail the delivery itself: the record is for
+/// people, the work matters more.
 pub async fn record(dynamo: &aws_sdk_dynamodb::Client, table: &str, pk: &str, d: &Delivery) {
     if table.is_empty() || pk.is_empty() {
         return;
     }
     let now = chrono::Utc::now().timestamp();
-    if let Err(e) = dynamo
+    match dynamo
         .put_item()
         .table_name(table)
         .set_item(Some(to_item(pk, d, now)))
+        .return_values(aws_sdk_dynamodb::types::ReturnValue::AllOld)
         .send()
         .await
     {
-        tracing::warn!(error = %e, delivery = %d.id, source = %d.source, "Could not record a delivery");
+        Ok(r) => {
+            let old = counted_before(r.attributes());
+            let store = crate::deliveries_rollup::Dynamo {
+                client: dynamo,
+                table,
+            };
+            crate::deliveries_rollup::apply(&store, pk, old.as_ref(), d).await;
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, delivery = %d.id, source = %d.source, "Could not record a delivery");
+        }
     }
 }
 
@@ -793,6 +850,15 @@ mod tests {
         );
         assert_eq!(item["status"].as_s().unwrap(), "handled");
         assert_eq!(from_item(&item).unwrap(), d);
+        assert!(
+            item.contains_key("rolled"),
+            "written records are counted by the rollups"
+        );
+        assert_eq!(counted_before(Some(&item)), Some(d.clone()));
+        let mut before_rollups = item.clone();
+        before_rollups.remove("rolled");
+        assert_eq!(counted_before(Some(&before_rollups)), None);
+        assert_eq!(counted_before(None), None);
     }
 
     #[test]
@@ -935,8 +1001,10 @@ mod tests {
             source: source.map(Into::into),
             status: status.map(Into::into),
             since: None,
+            until: None,
             q: q.map(Into::into),
             endpoint: None,
+            reason: None,
         };
         assert!(f(Some("github"), Some("failed"), None).matches(&d));
         assert!(!f(Some("relay"), None, None).matches(&d));
@@ -968,5 +1036,31 @@ mod tests {
             "webhook_server_error"
         );
         assert_eq!(reason_for_http("webhook", None), "webhook_unreachable");
+        // One hour of the overview: from (inclusive) to (exclusive), however
+        // the times are written.
+        let hour = |a: &str, b: &str| Filter {
+            since: Some(a.into()),
+            until: Some(b.into()),
+            ..Default::default()
+        };
+        assert!(hour("2026-10-25T10:00:00Z", "2026-10-25T11:00:00Z").matches(&d));
+        assert!(!hour("2026-10-25T09:00:00Z", "2026-10-25T10:00:00Z").matches(&d));
+        let mut ms = d.clone();
+        ms.created_at = "2026-10-25T10:59:59.999Z".into();
+        assert!(hour("2026-10-25T10:00:00Z", "2026-10-25T11:00:00Z").matches(&ms));
+        let mut ep = d.clone();
+        ep.endpoint_id = "ep_1".into();
+        let by_ep = Filter {
+            endpoint: Some("ep_1".into()),
+            ..Default::default()
+        };
+        assert!(by_ep.matches(&ep) && !by_ep.matches(&d));
+        let mut why = d.clone();
+        why.reason = "handler_error".into();
+        let by_reason = Filter {
+            reason: Some("handler_error".into()),
+            ..Default::default()
+        };
+        assert!(by_reason.matches(&why) && !by_reason.matches(&d));
     }
 }

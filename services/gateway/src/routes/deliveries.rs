@@ -61,7 +61,9 @@ pub async fn record_email(
     save(state, pk, &deliveries::email(kind, to, &result)).await;
 }
 
-fn alert_to_delivery(item: &std::collections::HashMap<String, AttributeValue>) -> Option<Delivery> {
+pub fn alert_to_delivery(
+    item: &std::collections::HashMap<String, AttributeValue>,
+) -> Option<Delivery> {
     let g = |k: &str| {
         item.get(k)
             .and_then(|v| v.as_s().ok())
@@ -94,7 +96,7 @@ fn alert_to_delivery(item: &std::collections::HashMap<String, AttributeValue>) -
     Some(d)
 }
 
-fn jira_to_delivery(v: &Value) -> Option<Delivery> {
+pub fn jira_to_delivery(v: &Value) -> Option<Delivery> {
     let s = |k: &str| v[k].as_str().unwrap_or("").to_string();
     let id = s("event_id");
     if id.is_empty() {
@@ -216,7 +218,10 @@ pub struct ListQuery {
     source: Option<String>,
     status: Option<String>,
     since: Option<String>,
+    until: Option<String>,
     q: Option<String>,
+    endpoint: Option<String>,
+    reason: Option<String>,
     limit: Option<usize>,
 }
 
@@ -229,7 +234,7 @@ fn sharing_view() -> Value {
     })
 }
 
-/// GET /api/deliveries?source=&status=&since=&q=&limit=
+/// GET /api/deliveries?source=&status=&since=&until=&q=&endpoint=&reason=&limit=
 pub async fn list(
     State(state): State<Arc<AppState>>,
     Extension(claims): Extension<Claims>,
@@ -240,15 +245,24 @@ pub async fn list(
         source: q.source,
         status: q.status,
         since: q.since,
+        until: q.until,
         q: q.q,
-        endpoint: None,
+        endpoint: q.endpoint,
+        reason: q.reason,
     };
     let limit = q.limit.unwrap_or(100).clamp(1, 500);
     let all = everything(&state, &claims, &f).await;
     // The summary always covers the last 24 hours, whatever the filters say.
     let day_ago = (chrono::Utc::now() - chrono::Duration::hours(24))
         .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
-    let recent = if f.source.is_none() && f.status.is_none() && f.q.is_none() && f.since.is_none() {
+    let recent = if f.source.is_none()
+        && f.status.is_none()
+        && f.q.is_none()
+        && f.since.is_none()
+        && f.until.is_none()
+        && f.endpoint.is_none()
+        && f.reason.is_none()
+    {
         all.clone()
     } else {
         everything(&state, &claims, &Filter::default()).await

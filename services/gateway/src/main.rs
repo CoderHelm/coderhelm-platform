@@ -236,6 +236,10 @@ async fn main() -> Result<(), Error> {
         )
         // Deliveries: every event in and out, with what happened (admins).
         .route("/deliveries", get(routes::deliveries::list))
+        .route(
+            "/deliveries/analytics",
+            get(routes::deliveries_analytics::analytics),
+        )
         .route("/deliveries/:id", get(routes::deliveries::get))
         .route(
             "/deliveries/:id/redeliver",
@@ -1224,6 +1228,7 @@ async fn main() -> Result<(), Error> {
         .route("/github/token", post(routes::hybrid::github_token))
         .route("/deliveries", get(routes::hybrid::list_deliveries))
         .route("/deliveries/shared", post(routes::hybrid::share))
+        .route("/deliveries/rollups", post(routes::hybrid::rollups))
         .route("/deliveries/:id/redeliver", post(routes::hybrid::redeliver))
         .route(
             "/oauth/:kind/authorize",

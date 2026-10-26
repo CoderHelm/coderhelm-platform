@@ -145,6 +145,11 @@ pub const PUBLIC_ROUTES: &[PublicRoute] = &[
         "/api/webhooks/endpoints/:endpoint_id/replay",
         "webhooks::replay",
     ),
+    key(
+        "GET",
+        "/api/deliveries/analytics",
+        "deliveries_analytics::analytics",
+    ),
     PublicRoute {
         method: "POST",
         path: "/webhooks/ci/tests/results",
@@ -250,7 +255,7 @@ pub fn default_code(status: axum::http::StatusCode) -> &'static str {
 const DESCRIPTION: &str =
     "The CoderHelm API lets your own programs start and follow CoderHelm's work: \
 list and inspect runs, retry or cancel them, create and run plans, read the reviewer's reviews, \
-check token usage, and manage the webhook endpoints CoderHelm sends your team's events to.\n\n\
+check token usage, manage the webhook endpoints CoderHelm sends your team's events to, and see how deliveries went.\n\n\
 Every request is authenticated with a team API key sent as a bearer token. Admins create keys in \
 the dashboard under Settings, API keys. A key holds scopes, never more than the admin who made it, \
 and has its own rate limit.\n\n\
@@ -293,6 +298,7 @@ are verified by their signatures.";
         crate::routes::webhooks::list_endpoint_deliveries,
         crate::routes::webhooks::resend_delivery,
         crate::routes::webhooks::replay,
+        crate::routes::deliveries_analytics::analytics,
         crate::routes::tests::ci_upload,
         crate::routes::tests::ci_quarantine,
         crate::routes::github_webhook::handle,
@@ -310,6 +316,7 @@ are verified by their signatures.";
         (name = "Repositories", description = "The repositories connected to the team through the CoderHelm GitHub App."),
         (name = "Reviews", description = "Pull request reviews written by CoderHelm's reviewer."),
         (name = "Usage", description = "Tokens used this month and the team's limits."),
+        (name = "Deliveries", description = "How the webhooks CoderHelm receives and the messages it sends went over time: volume, success rate, latency, retries and failures by reason."),
         (name = "CI", description = "Endpoints a CI job calls with its GitHub Actions OIDC token, so no CoderHelm secret is stored in CI."),
         (name = "Webhook endpoints", description = "Where CoderHelm sends your team's events (runs, pull requests, reviews, CI fixes, alerts, log findings, releases, plans). Each request is signed the Standard Webhooks way. The `webhooks` section of this document has every event's schema."),
         (name = "Webhooks", description = "Webhooks CoderHelm receives from GitHub, Jira, AWS SNS, Sanity and Notion. CoderHelm verifies each one before anything happens."),

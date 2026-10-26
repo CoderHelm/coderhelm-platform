@@ -2024,6 +2024,36 @@ pub async fn list_deliveries(
     Ok(Json(json!({ "deliveries": own })))
 }
 
+/// POST /hybrid/deliveries/rollups (signed) `{from, to}`: this install's
+/// relay and broker counters between two rollup sort keys, for its own
+/// Deliveries overview. A POST so the signature covers the range.
+pub async fn rollups(
+    State(state): State<Arc<AppState>>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Reply {
+    let install = signed(&state, &headers, &method, &uri, &body).await?;
+    let b = body_json(&body);
+    let (Some(from), Some(to)) = (b["from"].as_str(), b["to"].as_str()) else {
+        return Err(fail(
+            StatusCode::BAD_REQUEST,
+            "bad_request",
+            "Send {from, to}.",
+        ));
+    };
+    Ok(Json(
+        super::deliveries_analytics::install_rollups(
+            &state,
+            &relay::install_pk(&install.id),
+            from,
+            to,
+        )
+        .await,
+    ))
+}
+
 /// POST /hybrid/deliveries/:id/redeliver (signed): forward a held event again.
 pub async fn redeliver(
     State(state): State<Arc<AppState>>,

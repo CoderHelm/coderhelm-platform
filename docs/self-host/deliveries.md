@@ -28,6 +28,22 @@ Open a row for its details:
 
 Records are kept for 14 days, then deleted.
 
+## Overview
+
+The **Overview** tab shows how deliveries went over the last 24 hours (by hour), 7 days or 30 days (by day), against the period before:
+
+- the success rate, the number of deliveries and failures, and how long the slowest 5% took;
+- deliveries and the success rate over time;
+- failures by reason, in plain words with the fix;
+- each outbound webhook endpoint's success rate, latency, last failure, failures in a row and whether it is turned off;
+- deliveries by source, and the event types that failed most.
+
+It has the same source and status filters as the list, plus the endpoint. Every bar, tile, reason, endpoint and source opens the list filtered to it.
+
+The overview reads counters that are updated as each delivery is recorded, one set per hour (kept 3 days) and per day (kept 120 days), so it stays fast however many deliveries there are, and it covers more than the 14 days records are kept. A delivery counts once it finishes (retries included), so one still retrying shows in the list but not yet in the overview. The first time it opens after an update, deliveries recorded before then are counted once, which can take a few reloads on a busy install. On a hybrid install, the relay's counters come from CoderHelm, like its records.
+
+The same numbers are in the API: `GET /api/deliveries/analytics` with an API key holding the `deliveries` scope.
+
 ## Sharing with CoderHelm support
 
 Self-hosted and hybrid installs can choose to share delivery data with CoderHelm support, in the install guide or in **Settings, System, Hybrid**. It's **off** by default.

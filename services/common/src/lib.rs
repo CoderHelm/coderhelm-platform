@@ -17,6 +17,7 @@ pub mod code_graph;
 /// Every delivery in and out (webhooks, relay forwards, notifications,
 /// email), with what happened, for the Deliveries page.
 pub mod deliveries;
+pub mod deliveries_rollup;
 /// The shared dead-letter queue: whose each failed message is, whether the
 /// worker can read it, and when the cleanup archives it.
 pub mod dlq;

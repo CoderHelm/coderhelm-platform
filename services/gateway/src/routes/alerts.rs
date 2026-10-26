@@ -1310,10 +1310,43 @@ async fn record_event(
         None => put,
     }
     .item("ttl", AttributeValue::N(ttl.to_string()))
+    .item(
+        common::deliveries_rollup::ROLLED,
+        AttributeValue::N("1".into()),
+    )
+    .return_values(aws_sdk_dynamodb::types::ReturnValue::AllOld)
     .send()
     .await;
-    if let Err(e) = written {
-        warn!(topic = %msg.topic_arn, ticket = %tid, error = %e, "Could not record alert event");
+    match written {
+        Ok(r) => {
+            // The Deliveries overview counts alerts too. An SNS redelivery
+            // rewrites the same record, so the rollups move by the difference.
+            let old = r
+                .attributes()
+                .filter(|i| i.contains_key(common::deliveries_rollup::ROLLED))
+                .and_then(super::deliveries::alert_to_delivery);
+            let mut item = std::collections::HashMap::new();
+            for (k, v) in [
+                ("id", id.as_str()),
+                ("received_at", received_at.as_str()),
+                ("topic_arn", msg.topic_arn.as_str()),
+                ("repo", repo),
+                ("kind", alert.kind),
+                ("outcome", outcome.as_str()),
+            ] {
+                item.insert(k.to_string(), attr_s(v));
+            }
+            if let Some(new) = super::deliveries::alert_to_delivery(&item) {
+                let store = common::deliveries_rollup::Dynamo {
+                    client: &state.dynamo,
+                    table: &state.config.settings_table_name,
+                };
+                common::deliveries_rollup::apply(&store, &route.team_id, old.as_ref(), &new).await;
+            }
+        }
+        Err(e) => {
+            warn!(topic = %msg.topic_arn, ticket = %tid, error = %e, "Could not record alert event");
+        }
     }
     // The alert's id seeds the event's, so an SNS redelivery is sent once.
     common::webhooks::emit_event_keyed(
