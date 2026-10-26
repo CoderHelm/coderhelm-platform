@@ -187,6 +187,11 @@ pub fn sqs_delay(secs: i64) -> i32 {
 /// sends it to every endpoint that wants it. Returns the endpoints that
 /// this turned off. A second copy of the same message does nothing.
 pub async fn dispatch(ctx: &Ctx<'_>, e: &Event) -> Result<Vec<endpoint::Endpoint>, String> {
+    // Events built outside `Event::new` (the log analyzer's) are scrubbed
+    // here too: nothing that looks like a credential is ever sent.
+    let mut e = e.clone();
+    e.data = event::scrub(&e.data);
+    let e = &e;
     let all = endpoint::list(ctx.dynamo, ctx.table, &e.team_id).await?;
     if all.is_empty() {
         return Ok(vec![]);
@@ -281,6 +286,88 @@ pub fn replayable<'a>(ep: &endpoint::Endpoint, events: &'a [event::Kept]) -> Vec
 mod tests {
     use super::*;
     use serde_json::json;
+
+    fn source(rel: &str) -> String {
+        std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("..")
+                .join(rel),
+        )
+        .unwrap()
+    }
+
+    /// No log line in the webhook code names a secret's value: secrets are
+    /// only ever sealed, sent once to the person who made them, or used to
+    /// sign.
+    #[test]
+    fn signing_secrets_are_never_logged() {
+        for f in [
+            "common/src/webhooks/mod.rs",
+            "common/src/webhooks/endpoint.rs",
+            "common/src/webhooks/deliver.rs",
+            "common/src/webhooks/sign.rs",
+            "common/src/webhooks/event.rs",
+            "gateway/src/routes/webhooks.rs",
+            "worker/src/passes/webhooks.rs",
+        ] {
+            let src = source(f);
+            let code = src.split("#[cfg(test)]").next().unwrap();
+            let calls = ["tracing::", "warn!(", "info!(", "error!(", "debug!("]
+                .iter()
+                .flat_map(|m| code.split(m).skip(1));
+            for (i, chunk) in calls.enumerate() {
+                // The call ends at its statement or its closing parenthesis.
+                let end = [";", ")\n", "),"]
+                    .iter()
+                    .filter_map(|t| chunk.find(t))
+                    .min()
+                    .unwrap_or(chunk.len());
+                let call = &chunk[..end];
+                for bad in [
+                    "secret =", "%secret", "?secret", "secrets", "{secret}", "sealed",
+                ] {
+                    assert!(
+                        !call.contains(bad),
+                        "{f}: log call {i} may print a secret: {call}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Every endpoint route reads and writes only the caller's team, and
+    /// only admins (and keys with the scope) reach it.
+    #[test]
+    fn every_endpoint_route_is_scoped_to_the_callers_team_and_role() {
+        let src = source("gateway/src/routes/webhooks.rs");
+        let code = src.split("#[cfg(test)]").next().unwrap();
+        let mut n = 0;
+        for chunk in code.split("\npub async fn ").skip(1) {
+            let name = chunk.split('(').next().unwrap();
+            if !chunk.contains("Extension(claims): Extension<Claims>") {
+                continue;
+            }
+            n += 1;
+            let body = chunk.split("\n}\n").next().unwrap();
+            assert!(
+                body.contains("claims.require_role(3)"),
+                "{name} has no admin check"
+            );
+            if name != "event_types" {
+                assert!(
+                    body.contains("claims.team_id"),
+                    "{name} doesn't scope to the caller's team"
+                );
+            }
+            assert!(
+                !body.contains("team_id: String") && !body.contains("q.team"),
+                "{name} takes a team from the request"
+            );
+        }
+        assert_eq!(n, 12, "every endpoint route checked");
+        // A delivery is resent only through the endpoint it belongs to.
+        assert!(code.contains(".filter(|d| d.endpoint_id == endpoint_id)"));
+    }
 
     #[test]
     fn replays_send_only_what_the_endpoint_subscribes_to() {

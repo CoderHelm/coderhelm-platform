@@ -26,6 +26,9 @@ use super::{endpoint, sign};
 
 pub const SOURCE: &str = "webhook";
 pub const TIMEOUT_SECS: u64 = 10;
+/// The most of an endpoint's answer CoderHelm reads (for the record only:
+/// an answer is never acted on). The rest is never downloaded.
+pub const MAX_RESPONSE_BYTES: usize = 4096;
 pub const DISABLE_AFTER_DAYS: i64 = 5;
 pub const USER_AGENT: &str = "CoderHelm-Webhooks/1.0 (+https://docs.coderhelm.com/api/webhooks/)";
 /// Seconds to wait after the Nth failed attempt (N from 1). Ten attempts in
@@ -372,7 +375,7 @@ pub async fn send(sender: &Sender<'_>, req: &Request<'_>) -> Sent {
             let error = if resp.status().is_success() {
                 String::new()
             } else {
-                let text = resp.text().await.unwrap_or_default();
+                let text = read_capped(resp, MAX_RESPONSE_BYTES).await;
                 format!(
                     "Answered {code}: {}",
                     text.chars().take(200).collect::<String>()
@@ -410,6 +413,19 @@ pub async fn send(sender: &Sender<'_>, req: &Request<'_>) -> Sent {
             }
         }
     }
+}
+
+/// Reads at most `max` bytes of an answer, then stops (the connection is
+/// dropped with the rest unread).
+async fn read_capped(mut resp: reqwest::Response, max: usize) -> String {
+    let mut buf: Vec<u8> = Vec::new();
+    while buf.len() < max {
+        match resp.chunk().await {
+            Ok(Some(c)) => buf.extend_from_slice(&c[..c.len().min(max - buf.len())]),
+            _ => break,
+        }
+    }
+    String::from_utf8_lossy(&buf).into_owned()
 }
 
 /// Keeps the request's headers on the record (the signature is removed).
@@ -668,6 +684,18 @@ mod tests {
             "8.8.8.8:443".parse().unwrap()
         );
         assert!(pick_address(&[]).is_err());
+        // The IPv6 forms are refused the same way.
+        for v6 in [
+            "[::1]:443",
+            "[fe80::1]:443",
+            "[fd12::1]:443",
+            "[::ffff:169.254.169.254]:443",
+            "[::ffff:10.0.0.1]:443",
+            "[64:ff9b::a9fe:a9fe]:443",
+        ] {
+            assert!(pick_address(&[v6.parse().unwrap()]).is_err(), "{v6}");
+        }
+        assert!(pick_address(&["[2606:4700:4700::1111]:443".parse().unwrap()]).is_ok());
     }
 
     /// A one-request HTTP server on loopback that answers `status` after
@@ -763,6 +791,57 @@ mod tests {
             Next::RetryIn(5)
         ));
         assert_eq!(d.reason, "webhook_timeout");
+    }
+
+    #[tokio::test]
+    async fn a_huge_answer_is_read_only_up_to_the_limit() {
+        // An endpoint that answers 500 with a body far over the limit and
+        // never ends it: the read stops at the limit instead of hanging or
+        // filling memory.
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = l.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let (mut sock, _) = l.accept().await.unwrap();
+            let mut buf = vec![0u8; 16384];
+            let _ = sock.read(&mut buf).await;
+            let _ = sock
+                .write_all(b"HTTP/1.1 500 X\r\ncontent-length: 100000000\r\n\r\n")
+                .await;
+            let chunk = vec![b'x'; 65536];
+            for _ in 0..1000 {
+                if sock.write_all(&chunk).await.is_err() {
+                    break;
+                }
+            }
+        });
+        let secrets = vec![sign::new_secret()];
+        let mut s = Sender::new(&Loopback);
+        s.local_for_tests = true;
+        s.timeout = Duration::from_secs(5);
+        let sent = send(&s, &req(&format!("http://receiver.test:{port}/"), &secrets)).await;
+        assert_eq!(sent.attempt.code, Some(500));
+        assert!(sent.attempt.error.len() < 300, "only a short note is kept");
+        let body = read_capped_len_check().await;
+        assert!(body <= MAX_RESPONSE_BYTES);
+    }
+
+    /// `read_capped` itself never returns more than its limit.
+    async fn read_capped_len_check() -> usize {
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = l.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let (mut sock, _) = l.accept().await.unwrap();
+            let mut buf = vec![0u8; 4096];
+            let _ = sock.read(&mut buf).await;
+            let _ = sock
+                .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 200000\r\n\r\n")
+                .await;
+            let _ = sock.write_all(&vec![b'y'; 200000]).await;
+        });
+        let r = reqwest::get(format!("http://127.0.0.1:{port}/"))
+            .await
+            .unwrap();
+        read_capped(r, MAX_RESPONSE_BYTES).await.len()
     }
 
     #[tokio::test]

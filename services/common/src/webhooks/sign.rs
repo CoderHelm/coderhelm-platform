@@ -100,6 +100,7 @@ pub fn verify(
     }
 }
 
+/// Constant time for equal lengths: every byte is compared, whatever matches.
 fn subtle_eq(a: &[u8], b: &[u8]) -> bool {
     a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
@@ -185,6 +186,22 @@ mod tests {
         assert_eq!(key_of(&a).unwrap().len(), 32);
         assert_ne!(a, new_secret());
         assert!(key_of("whsec_not base64!").is_err());
+        // From the OS-seeded CSPRNG: no repeats, no fixed bytes.
+        let many: std::collections::HashSet<String> = (0..2000).map(|_| new_secret()).collect();
+        assert_eq!(many.len(), 2000);
+        let mut ones = 0u32;
+        for s in many.iter().take(200) {
+            ones += key_of(s)
+                .unwrap()
+                .iter()
+                .map(|b| b.count_ones())
+                .sum::<u32>();
+        }
+        let bits = 200 * 32 * 8;
+        assert!(
+            (bits * 45 / 100..bits * 55 / 100).contains(&ones),
+            "bits look random: {ones}/{bits}"
+        );
         assert!(hint(&a).starts_with("whsec_…") && hint(&a).ends_with(&a[a.len() - 4..]));
         assert_eq!(hint("short"), "");
     }

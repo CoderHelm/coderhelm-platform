@@ -684,6 +684,34 @@ mod tests {
         out
     }
 
+    /// Outbound webhooks only go out: no unauthenticated or signature-only
+    /// route takes anything on that path, so whoever controls an endpoint
+    /// can't send events, answers or "deliveries" into CoderHelm.
+    #[test]
+    fn outbound_webhooks_have_no_inbound_path() {
+        for r in PUBLIC_ROUTES
+            .iter()
+            .filter(|r| r.handler.starts_with("webhooks::"))
+        {
+            assert_eq!(r.auth, RouteAuth::ApiKey, "{} must need an API key", r.path);
+            assert!(r.path.starts_with("/api/webhooks/"), "{}", r.path);
+        }
+        let main = include_str!("main.rs");
+        let inbound = main
+            .split(".nest(\"/webhooks\", webhook_routes)")
+            .next()
+            .unwrap();
+        let webhook_router = inbound.rsplit("let webhook_routes").next().unwrap_or("");
+        assert!(
+            !webhook_router.contains("routes::webhooks::"),
+            "an outbound webhook handler is on the unauthenticated /webhooks router"
+        );
+        // What an endpoint answers is only kept as a short note; nothing parses it.
+        let deliver = include_str!("../../common/src/webhooks/deliver.rs");
+        let code = deliver.split("#[cfg(test)]").next().unwrap();
+        assert!(!code.contains(".json::<") && !code.contains("resp.json("));
+    }
+
     #[test]
     fn openapi_documents_exactly_the_public_routes() {
         let public: BTreeSet<(String, String)> = PUBLIC_ROUTES

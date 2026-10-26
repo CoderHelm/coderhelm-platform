@@ -42,13 +42,99 @@ impl Event {
             created_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
             team_id: team_id.into(),
             api_version: catalog::API_VERSION.into(),
-            data,
+            data: scrub(&data),
         }
     }
 
     /// The body every endpoint gets for this event.
     pub fn body(&self) -> String {
         serde_json::to_string(self).unwrap_or_default()
+    }
+}
+
+/// The most of one text field an event carries.
+pub const MAX_TEXT: usize = 2000;
+
+/// Prefixes of credentials that may turn up inside text (an error message
+/// quoting a command line, a log line).
+const SECRET_PREFIXES: &[&str] = &[
+    "ghp_",
+    "ghs_",
+    "gho_",
+    "ghu_",
+    "ghr_",
+    "github_pat_",
+    "xoxb-",
+    "xoxp-",
+    "xoxa-",
+    "sk-ant-",
+    "sk-",
+    "AKIA",
+    "ASIA",
+    "chk_",
+    "whsec_",
+    "eyJ",
+];
+
+/// One text value with anything that looks like a credential replaced by
+/// `[redacted]`: tokens by their prefix, the word after `Bearer`/`token`,
+/// `user:password@` in addresses, `key=value` pairs whose key names a
+/// secret, and whole private-key blocks. Long text is cut.
+pub fn scrub_text(s: &str) -> String {
+    if s.contains("-----BEGIN") {
+        return "[redacted]".into();
+    }
+    let mut out: Vec<String> = Vec::new();
+    let mut redact_next = false;
+    for word in s.split(' ') {
+        let bare = word.trim_matches(|c: char| !c.is_alphanumeric() && c != '_' && c != '-');
+        let lower = bare.to_ascii_lowercase();
+        let secretish_kv = word.split_once('=').is_some_and(|(k, _)| {
+            let k = k.to_ascii_lowercase();
+            [
+                "token",
+                "secret",
+                "password",
+                "passwd",
+                "api_key",
+                "apikey",
+                "authorization",
+            ]
+            .iter()
+            .any(|w| k.contains(w))
+        });
+        let creds_in_url = word.contains("://")
+            && word
+                .split("://")
+                .nth(1)
+                .is_some_and(|r| r.split('/').next().unwrap_or("").contains('@'));
+        let token = SECRET_PREFIXES
+            .iter()
+            .any(|p| bare.starts_with(p) && bare.len() >= p.len() + 8);
+        if redact_next || token || secretish_kv || creds_in_url {
+            out.push("[redacted]".into());
+        } else {
+            out.push(word.to_string());
+        }
+        redact_next = matches!(lower.as_str(), "bearer" | "token" | "authorization:");
+    }
+    let joined = out.join(" ");
+    if joined.chars().count() > MAX_TEXT {
+        format!("{}…", joined.chars().take(MAX_TEXT).collect::<String>())
+    } else {
+        joined
+    }
+}
+
+/// An event's `data` with every text scrubbed ([`scrub_text`]) and every
+/// field whose name says it holds a secret masked
+/// ([`crate::deliveries::redact_json`]). Events never carry credentials.
+pub fn scrub(v: &Value) -> Value {
+    match crate::deliveries::redact_json(v) {
+        Value::String(s) => Value::String(scrub_text(&s)),
+        Value::Array(a) => Value::Array(a.iter().map(scrub).collect()),
+        Value::Object(m) => Value::Object(m.iter().map(|(k, v)| (k.clone(), scrub(v))).collect()),
+        other => other,
     }
 }
 
@@ -258,6 +344,46 @@ mod tests {
         let at = |k: &str| body.find(&format!("\"{k}\":")).unwrap();
         let order = ["id", "type", "created_at", "team_id", "api_version", "data"].map(at);
         assert!(order.windows(2).all(|w| w[0] < w[1]), "{body}");
+    }
+
+    #[test]
+    fn events_never_carry_credentials() {
+        let e = Event::new(
+            "TEAM#a",
+            "run.failed",
+            json!({
+                "error": "git push failed: remote: Invalid token ghp_abcdefghijklmnopqrstuvwxyz0123 for https://bot:hunter2secret@github.com/o/r.git, Authorization: Bearer eyJhbGciOiJIUzI1NiJ9.payload.sig and AWS key AKIAABCDEFGHIJKLMNOP; set API_KEY=sk-live-123 then retry",
+                "title": "Normal words stay",
+                "pem": "-----BEGIN RSA PRIVATE KEY-----\nMIIE...",
+                "token": "abc",
+                "nested": [{"secret": "x"}, "whsec_C2FVsBQIhrscChlQIMV"],
+                "long": "x".repeat(5000),
+            }),
+        );
+        let body = e.body();
+        for leak in [
+            "ghp_abc",
+            "hunter2",
+            "eyJhbG",
+            "AKIAABCD",
+            "sk-live",
+            "MIIE",
+            "whsec_C2F",
+            "\"abc\"",
+        ] {
+            assert!(!body.contains(leak), "{leak} leaked: {body}");
+        }
+        assert_eq!(e.data["title"], "Normal words stay");
+        assert!(e.data["error"]
+            .as_str()
+            .unwrap()
+            .starts_with("git push failed: remote: Invalid token [redacted]"));
+        assert!(e.data["long"].as_str().unwrap().chars().count() <= MAX_TEXT + 1);
+        // Catalog examples pass through unchanged: real data isn't damaged.
+        for t in catalog::EVENTS {
+            let ex = catalog::example_data(t.name);
+            assert_eq!(scrub(&ex), ex, "{}", t.name);
+        }
     }
 
     #[test]

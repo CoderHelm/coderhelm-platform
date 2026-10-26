@@ -769,7 +769,7 @@ def finding_event_data(rec_id, account_id, item, resolved_at=None):
     data = {
         "finding_id": rec_id,
         "account_id": account_id,
-        "title": str(item.get("title", "")),
+        "title": scrub_secrets(str(item.get("title", ""))),
         "severity": item.get("severity") if item.get("severity") in ("critical", "warning", "info") else "info",
     }
     if resolved_at is None:
