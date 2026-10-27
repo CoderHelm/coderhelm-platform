@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 pub use common::messages::*;
 
 /// App configuration from environment variables.
+#[cfg_attr(test, derive(Default))]
 pub struct Config {
     pub stage: String,
     pub table_name: String,

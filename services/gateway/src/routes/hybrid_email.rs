@@ -18,8 +18,8 @@ use std::sync::Arc;
 use aws_sdk_dynamodb::types::AttributeValue;
 use axum::{
     body::Bytes,
-    extract::{Path, State},
-    http::{HeaderMap, Method, StatusCode, Uri},
+    extract::{OriginalUri, Path, State},
+    http::{HeaderMap, Method, StatusCode},
     Extension, Json,
 };
 use common::deliveries::{self, Delivery, Direction, Status};
@@ -96,12 +96,20 @@ fn name_host(i: &Install) -> Option<String> {
     (!i.name.is_empty()).then(|| common::hybrid::names::hostname(&i.name))
 }
 
+/// The install's daily quota, lower while it is new.
+fn day_quota(i: &Install) -> u64 {
+    let verified = chrono::DateTime::parse_from_rfc3339(&i.verified_at)
+        .ok()
+        .map(|t| t.timestamp());
+    relay::day_quota(verified, epoch())
+}
+
 /// A verified, active install that signed the request, and its relay sender.
 async fn verified(
     state: &AppState,
     headers: &HeaderMap,
     method: &Method,
-    uri: &Uri,
+    uri: &OriginalUri,
     body: &[u8],
 ) -> Result<(Install, String), (StatusCode, Json<Value>)> {
     let install = signed(state, headers, method, uri, body).await?;
@@ -258,7 +266,7 @@ pub fn relay_delivery(template: &str, to: &str, outcome: Result<(), &str>) -> De
 pub async fn send(
     State(state): State<Arc<AppState>>,
     method: Method,
-    uri: Uri,
+    uri: OriginalUri,
     headers: HeaderMap,
     body: Bytes,
 ) -> Reply {
@@ -320,7 +328,7 @@ pub async fn send(
         &relay::day_sk(&today()),
         "sent",
         1,
-        Some(relay::PER_DAY),
+        Some(day_quota(&install)),
         40 * 86_400,
     )
     .await?
@@ -442,7 +450,7 @@ pub async fn send_ses(
 pub async fn recipients(
     State(state): State<Arc<AppState>>,
     method: Method,
-    uri: Uri,
+    uri: OriginalUri,
     headers: HeaderMap,
     body: Bytes,
 ) -> Reply {
@@ -456,14 +464,8 @@ pub async fn recipients(
             .await?
             .as_ref(),
     );
-    let list_meta = get(&state, &install.id, "EMAILLIST").await?;
-    let admins_listed = list_meta
-        .as_ref()
-        .and_then(|i| i.get("admins"))
-        .and_then(|v| v.as_n().ok())
-        .and_then(|v| v.parse::<i64>().ok())
-        .unwrap_or(0)
-        > 0;
+    let list_meta = get(&state, &install.id, LIST_SK).await?;
+    let spent = bootstrap_spent(list_meta.as_ref());
     let day = get(&state, &install.id, &relay::day_sk(&today())).await?;
     let new_today = day
         .as_ref()
@@ -471,7 +473,12 @@ pub async fn recipients(
         .and_then(|v| v.as_n().ok())
         .and_then(|v| v.parse::<u64>().ok())
         .unwrap_or(0);
-    relay::may_list(&req, by_kind, admins_listed, new_today).map_err(refuse)?;
+    relay::may_list(&req, by_kind, spent, new_today).map_err(refuse)?;
+    if !spent && relay::bootstrap_request(&req) && !claim_bootstrap(&state, &install.id).await? {
+        // Another request took the first listing meanwhile: this one is an
+        // ordinary listing.
+        relay::may_list(&req, by_kind, true, new_today).map_err(refuse)?;
+    }
 
     let cipher = common::mcp_credentials::Kms {
         client: &state.kms,
@@ -555,7 +562,7 @@ pub async fn recipients(
             .update_item()
             .table_name(&state.config.settings_table_name)
             .key("pk", s(&hybrid_relay::install_pk(&install.id)))
-            .key("sk", s("EMAILLIST"))
+            .key("sk", s(LIST_SK))
             .update_expression("ADD admins :d SET opted_in_at = if_not_exists(opted_in_at, :now)")
             .expression_attribute_values(":d", n(admins))
             .expression_attribute_values(":now", s(&chrono::Utc::now().to_rfc3339()))
@@ -573,6 +580,54 @@ pub async fn recipients(
     Ok(Json(
         json!({ "ok": true, "added": added, "removed": removed }),
     ))
+}
+
+/// The install's list record: admin count, when it opted in, and when its
+/// one first listing happened.
+const LIST_SK: &str = "EMAILLIST";
+
+/// Whether the install already had its first listing. `bootstrapped_at` is
+/// written once and never removed; installs from before it count as having
+/// had it once they ever listed an admin (`opted_in_at`, also never removed).
+pub fn bootstrap_spent(list: Option<&HashMap<String, AttributeValue>>) -> bool {
+    list.is_some_and(|i| {
+        i.contains_key("bootstrapped_at")
+            || i.contains_key("opted_in_at")
+            || i.get("admins")
+                .and_then(|v| v.as_n().ok())
+                .and_then(|v| v.parse::<i64>().ok())
+                .is_some_and(|n| n > 0)
+    })
+}
+
+/// Takes the install's one first listing. False when it was already taken.
+async fn claim_bootstrap(
+    state: &AppState,
+    install: &str,
+) -> Result<bool, (StatusCode, Json<Value>)> {
+    let r = state
+        .dynamo
+        .update_item()
+        .table_name(&state.config.settings_table_name)
+        .key("pk", s(&hybrid_relay::install_pk(install)))
+        .key("sk", s(LIST_SK))
+        .update_expression("SET bootstrapped_at = :now")
+        .condition_expression("attribute_not_exists(bootstrapped_at)")
+        .expression_attribute_values(":now", s(&chrono::Utc::now().to_rfc3339()))
+        .send()
+        .await;
+    match r {
+        Ok(_) => Ok(true),
+        Err(e) => {
+            let text = aws_sdk_dynamodb::error::DisplayErrorContext(&e).to_string();
+            if text.contains("ConditionalCheckFailed") {
+                Ok(false)
+            } else {
+                warn!(error = %text, "email relay: first listing claim failed");
+                Err(unavailable())
+            }
+        }
+    }
 }
 
 async fn seal_admin(
@@ -607,12 +662,18 @@ async fn custom_domain(
 }
 
 /// Whether the install answers its own proof on `host` over HTTPS: the
-/// name resolves to it and its certificate is valid. Never a redirect, at
-/// most a small answer.
+/// name resolves to it (public addresses only, connected to the address
+/// checked) and its certificate is valid. Never a redirect, at most a small
+/// answer.
 async fn proves_on(master: &str, install: &Install, host: &str) -> bool {
+    let Ok(client) =
+        hybrid_relay::pinned_client(&common::webhooks::deliver::SystemDns, host, 443).await
+    else {
+        return false;
+    };
     let challenge = common::hybrid::broker::new_handle("ch");
     let url = format!("https://{host}/webhooks/relay/proof?challenge={challenge}");
-    let Ok(r) = hybrid_relay::install_client()
+    let Ok(r) = client
         .get(&url)
         .timeout(std::time::Duration::from_secs(6))
         .send()
@@ -639,14 +700,23 @@ async fn proves_on(master: &str, install: &Install, host: &str) -> bool {
 pub async fn domain(
     State(state): State<Arc<AppState>>,
     method: Method,
-    uri: Uri,
+    uri: OriginalUri,
     headers: HeaderMap,
     body: Bytes,
 ) -> Reply {
     let (install, _) = verified(&state, &headers, &method, &uri, &body).await?;
     let master = master(&state).ok_or_else(not_here)?.to_string();
-    crate::middleware::rate_limit::allow(&headers, "hybrid-email-domain", 20, 3600)
-        .map_err(|_| refuse(relay::Refusal::RateLimited))?;
+    // Each request fetches from the install's domain: limited per install,
+    // across instances.
+    crate::middleware::rate_limit::allow_shared(
+        &state,
+        "hybrid-email-domain",
+        &install.id,
+        20,
+        3600,
+    )
+    .await
+    .map_err(|_| refuse(relay::Refusal::RateLimited))?;
     let host = serde_json::from_slice::<Value>(&body).unwrap_or_default()["hostname"]
         .as_str()
         .unwrap_or("")
@@ -697,7 +767,7 @@ pub async fn domain(
 pub async fn status(
     State(state): State<Arc<AppState>>,
     method: Method,
-    uri: Uri,
+    uri: OriginalUri,
     headers: HeaderMap,
     body: Bytes,
 ) -> Reply {
@@ -723,7 +793,7 @@ pub async fn status(
         "verified": install.verified(),
         "paused": pause.as_ref().map(|_| json!({ "reason": text(&pause, "reason"), "at": text(&pause, "at") })),
         "sent_today": num(&day, "sent"),
-        "quota": relay::PER_DAY,
+        "quota": day_quota(&install),
         "per_minute": relay::PER_MINUTE,
         "new_recipients_today": num(&day, "new_recipients"),
         "new_recipients_per_day": relay::NEW_RECIPIENTS_PER_DAY,
@@ -826,6 +896,28 @@ mod tests {
             own_hosts(&install("")),
             vec!["d1abcdef234567.cloudfront.net"]
         );
+    }
+
+    #[test]
+    fn the_first_listing_happens_once_per_install_ever() {
+        let item = |pairs: &[(&str, AttributeValue)]| -> HashMap<String, AttributeValue> {
+            pairs
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.clone()))
+                .collect()
+        };
+        assert!(!bootstrap_spent(None));
+        assert!(!bootstrap_spent(Some(&item(&[("admins", n(0))]))));
+        assert!(bootstrap_spent(Some(&item(&[("admins", n(1))]))));
+        assert!(bootstrap_spent(Some(&item(&[(
+            "bootstrapped_at",
+            s("2026-10-27T00:00:00Z")
+        )]))));
+        // Every admin removed again: still spent.
+        assert!(bootstrap_spent(Some(&item(&[
+            ("admins", n(0)),
+            ("opted_in_at", s("2026-10-01T00:00:00Z")),
+        ]))));
     }
 
     #[test]

@@ -360,6 +360,7 @@ const REASONS: &[Reason] = &[
     Reason { code: "email_bounced", message: "The address doesn't exist or refuses mail.", fix: "Fix the address on the team page; CoderHelm's relay won't send to it again." },
     Reason { code: "email_complained", message: "The recipient marked the email as spam.", fix: "Nothing more is sent to them through CoderHelm." },
     Reason { code: "broker_not_linked", message: "That GitHub installation isn't linked to this install.", fix: "Link the installation again in Settings, System, Hybrid." },
+    Reason { code: "broker_relink_needed", message: "That GitHub installation was linked before CoderHelm recorded which repositories it may reach, so CoderHelm's token broker issues no token for it.", fix: "Link the installation again in Settings, System, Hybrid." },
     Reason { code: "broker_repository_not_allowed", message: "That repository isn't one this install was given.", fix: "Add it on GitHub and in Settings, System, Hybrid." },
     Reason { code: "broker_refused", message: "CoderHelm's token broker refused the request.", fix: "Open Settings, System, Hybrid: it shows the link's state and how to fix it." },
     Reason { code: "broker_unreachable", message: "CoderHelm's token broker didn't answer.", fix: "Usually temporary; the next request retries. status.coderhelm.com shows any outage." },
@@ -966,6 +967,7 @@ mod tests {
             "chat_webhook_gone",
             "email_sandbox",
             "broker_not_linked",
+            "broker_relink_needed",
         ] {
             let r = reason(code);
             assert_eq!(r.code, code);

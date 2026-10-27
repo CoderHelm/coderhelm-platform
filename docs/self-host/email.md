@@ -74,8 +74,8 @@ If CoderHelm's mail service can't be reached, the email fails and shows in **Del
 
 - Your install sends a template id and its parameters, signed with its registration secret, never a subject or HTML. CoderHelm writes the email from its own templates.
 - Mail comes from `notifications@notify.coderhelm.com` with your install's address as the name (`acme.coderhelm.com via CoderHelm`), and no Reply-To. The footer names your install and its admin.
-- Every link in the email goes to your install's own verified address: its CloudFront address, its CoderHelm name, or its own domain once CoderHelm has reached your install over HTTPS on that name (DNS and certificate working). Your install asks for that by itself the first time it needs it, and the proof counts for a week at a time.
-- It only sends to your install's people and pending invites, listed by an install admin, at most 50 new addresses a day, 30 emails a minute and 500 a day.
+- Every link in the email goes to your install's own verified address: its CloudFront address, its CoderHelm name, or its own domain once CoderHelm has reached your install over HTTPS on that name (DNS and certificate working) and the domain name doesn't read as CoderHelm's own. Your install asks for that by itself the first time it needs it, and the proof counts for a week at a time.
+- It only sends to your install's people and pending invites, listed by an install admin, at most 50 new addresses a day, 30 emails a minute and 500 a day (100 a day for the first 14 days after your install proves its address).
 - An address that bounces or marks an email as spam gets nothing more. Too many bounces or complaints pause email for your install, and your install admins are told.
 
 See [Threat model](./hybrid.md#email-threat-model) for what each of these protects against.

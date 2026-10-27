@@ -1341,10 +1341,10 @@ pub struct ProofQuery {
 /// GET /webhooks/relay/proof?challenge= — CoderHelm checks this install
 /// holds the registration secret and answers on its CloudFront address.
 pub async fn proof(
-    headers: HeaderMap,
+    ip: crate::middleware::rate_limit::ClientIp,
     Query(q): Query<ProofQuery>,
 ) -> Result<Json<Value>, StatusCode> {
-    crate::middleware::rate_limit::allow(&headers, "hybrid-proof", 30, 60)?;
+    crate::middleware::rate_limit::allow(&ip, "hybrid-proof", 30, 60)?;
     let c = creds_now().await.ok_or(StatusCode::NOT_FOUND)?;
     let ch = q.challenge.unwrap_or_default();
     if ch.is_empty() || ch.len() > 100 {

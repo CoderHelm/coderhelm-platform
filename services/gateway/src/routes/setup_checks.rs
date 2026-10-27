@@ -2725,7 +2725,7 @@ pub fn probe_answer() -> Value {
 pub async fn status(
     State(state): State<Arc<AppState>>,
     axum::extract::Query(q): axum::extract::Query<StatusQuery>,
-    headers: axum::http::HeaderMap,
+    ip: crate::middleware::rate_limit::ClientIp,
 ) -> axum::response::Response {
     use axum::response::IntoResponse;
     let cors = [
@@ -2738,7 +2738,7 @@ pub async fn status(
     if q.probe.as_deref() == Some("1") {
         return (cors, Json(probe_answer())).into_response();
     }
-    if let Err(code) = crate::middleware::rate_limit::allow_setup_poll(&headers) {
+    if let Err(code) = crate::middleware::rate_limit::allow_setup_poll(&ip) {
         return (code, cors).into_response();
     }
     let version = super::system::stamp()["version"].clone();

@@ -24,10 +24,10 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use aws_sdk_dynamodb::types::AttributeValue;
+use aws_sdk_dynamodb::types::{AttributeValue, Put, TransactWriteItem};
 use axum::{
     body::Bytes,
-    extract::{Path, Query, State},
+    extract::{OriginalUri, Path, Query, State},
     http::{HeaderMap, Method, StatusCode, Uri},
     response::{IntoResponse, Redirect, Response},
     Extension, Json,
@@ -38,6 +38,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use tracing::{info, warn};
 
+use crate::middleware::rate_limit::{self, ClientIp};
 use crate::models::Claims;
 use crate::AppState;
 
@@ -281,11 +282,14 @@ pub(crate) async fn audit(state: &AppState, install: &str, action: &str, detail:
 }
 
 /// The install a signed request comes from, after checking the signature.
+/// The signature covers the full path the install called (`/hybrid/...`).
+/// These routes are nested under `/hybrid`, where a handler's own `Uri` has
+/// the prefix taken off, so only [`OriginalUri`] is accepted here.
 pub(crate) async fn signed(
     state: &AppState,
     headers: &HeaderMap,
     method: &Method,
-    uri: &Uri,
+    uri: &OriginalUri,
     body: &[u8],
 ) -> Result<Install, (StatusCode, Json<Value>)> {
     let master = master(state).ok_or_else(not_here)?;
@@ -336,19 +340,17 @@ fn body_json(body: &[u8]) -> Value {
 /// its id, registration secret and relay key once; the install keeps them
 /// in its own secret. Nothing works until the install proves it answers on
 /// that CloudFront address ([`verify`]).
-pub async fn register(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-    body: Bytes,
-) -> Reply {
+pub async fn register(State(state): State<Arc<AppState>>, ip: ClientIp, body: Bytes) -> Reply {
     let master = master(&state).ok_or_else(not_here)?.to_string();
-    crate::middleware::rate_limit::allow(&headers, "hybrid-register", 10, 3600).map_err(|_| {
-        fail(
-            StatusCode::TOO_MANY_REQUESTS,
-            "rate_limited",
-            "Too many registrations from here. Try again in an hour.",
-        )
-    })?;
+    rate_limit::allow_shared(&state, "hybrid-register", &ip.0, 10, 3600)
+        .await
+        .map_err(|_| {
+            fail(
+                StatusCode::TOO_MANY_REQUESTS,
+                "rate_limited",
+                "Too many registrations from here. Try again in an hour.",
+            )
+        })?;
     let b = body_json(&body);
     let cloudfront = b["cloudfront"]
         .as_str()
@@ -449,7 +451,7 @@ async fn prove(master: &str, install: &Install) -> bool {
 pub async fn verify(
     State(state): State<Arc<AppState>>,
     method: Method,
-    uri: Uri,
+    uri: OriginalUri,
     headers: HeaderMap,
     body: Bytes,
 ) -> Reply {
@@ -478,7 +480,7 @@ pub async fn verify(
 pub async fn status(
     State(state): State<Arc<AppState>>,
     method: Method,
-    uri: Uri,
+    uri: OriginalUri,
     headers: HeaderMap,
     body: Bytes,
 ) -> Reply {
@@ -495,7 +497,7 @@ pub async fn status(
 pub async fn settings(
     State(state): State<Arc<AppState>>,
     method: Method,
-    uri: Uri,
+    uri: OriginalUri,
     headers: HeaderMap,
     body: Bytes,
 ) -> Reply {
@@ -525,7 +527,7 @@ pub async fn settings(
 pub async fn unregister(
     State(state): State<Arc<AppState>>,
     method: Method,
-    uri: Uri,
+    uri: OriginalUri,
     headers: HeaderMap,
     body: Bytes,
 ) -> Reply {
@@ -548,10 +550,10 @@ pub async fn unregister(
 /// address.
 pub async fn name_available(
     State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
+    ip: ClientIp,
     Path(raw): Path<String>,
 ) -> Response {
-    public_reply(name_check(&state, &headers, &raw).await)
+    public_reply(name_check(&state, &ip, &raw).await)
 }
 
 /// A public answer any origin may read, never with credentials
@@ -564,15 +566,9 @@ pub fn public_reply(r: Reply) -> Response {
     }
 }
 
-async fn name_check(state: &AppState, headers: &HeaderMap, raw: &str) -> Reply {
+async fn name_check(state: &AppState, ip: &ClientIp, raw: &str) -> Reply {
     master(state).ok_or_else(not_here)?;
-    crate::middleware::rate_limit::allow(
-        headers,
-        "hybrid-names",
-        names::CHECKS_PER_MINUTE as u64,
-        60,
-    )
-    .map_err(|_| {
+    rate_limit::allow(ip, "hybrid-names", names::CHECKS_PER_MINUTE as u64, 60).map_err(|_| {
         fail(
             StatusCode::TOO_MANY_REQUESTS,
             "rate_limited",
@@ -629,7 +625,7 @@ async fn name_owner(
 pub async fn claim_name(
     State(state): State<Arc<AppState>>,
     method: Method,
-    uri: Uri,
+    uri: OriginalUri,
     headers: HeaderMap,
     body: Bytes,
 ) -> Reply {
@@ -851,7 +847,7 @@ async fn stored_name(state: &AppState, name: &str) -> (Vec<names::NameRecord>, b
 pub async fn put_records(
     State(state): State<Arc<AppState>>,
     method: Method,
-    uri: Uri,
+    uri: OriginalUri,
     headers: HeaderMap,
     body: Bytes,
 ) -> Reply {
@@ -966,7 +962,7 @@ async fn release_name(
 pub async fn delete_name(
     State(state): State<Arc<AppState>>,
     method: Method,
-    uri: Uri,
+    uri: OriginalUri,
     headers: HeaderMap,
     body: Bytes,
 ) -> Reply {
@@ -1156,7 +1152,7 @@ async fn unlink(state: &AppState, install: &str, installation_id: u64) {
 pub async fn link_start(
     State(state): State<Arc<AppState>>,
     method: Method,
-    uri: Uri,
+    uri: OriginalUri,
     headers: HeaderMap,
     body: Bytes,
 ) -> Reply {
@@ -1633,30 +1629,16 @@ pub async fn github_confirm(State(state): State<Arc<AppState>>, body: Bytes) -> 
         repositories: vec![],
         ceiling: Some(ceiling.clone()),
     };
-    let ok = state
-        .dynamo
-        .put_item()
-        .table_name(&state.config.settings_table_name)
-        .item("pk", s(&relay::install_pk(&install_id)))
-        .item("sk", s(&format!("GHLINK#{iid}")))
-        .item("data", s(&serde_json::to_string(&link).unwrap_or_default()))
-        .item("linked_at", s(&now()))
-        .send()
-        .await
-        .is_ok()
-        && state
+    let ok = match link_writes(&state.config.settings_table_name, &install_id, &link) {
+        Ok(items) => state
             .dynamo
-            .put_item()
-            .table_name(&state.config.settings_table_name)
-            .item("pk", s(&format!("HYBRIDGH#{iid}")))
-            .item("sk", s("LINK"))
-            .item("install_id", s(&install_id))
-            // Never over another install's link made in the meantime.
-            .condition_expression("attribute_not_exists(pk) OR install_id = :i")
-            .expression_attribute_values(":i", s(&install_id))
+            .transact_write_items()
+            .set_transact_items(Some(items))
             .send()
             .await
-            .is_ok();
+            .is_ok(),
+        Err(_) => false,
+    };
     if !ok {
         return page_redirect(&ret, "store_failed");
     }
@@ -1670,14 +1652,44 @@ pub async fn github_confirm(State(state): State<Arc<AppState>>, body: Bytes) -> 
     page_redirect(&ret, "linked")
 }
 
+/// The link under the install and the installation's reverse index, written
+/// together or not at all: the reverse index is never written over another
+/// install's link made in the meantime, and then the link isn't kept either.
+fn link_writes(
+    table: &str,
+    install_id: &str,
+    link: &broker::GithubLink,
+) -> Result<Vec<TransactWriteItem>, aws_sdk_dynamodb::error::BuildError> {
+    let iid = link.installation_id;
+    let own = Put::builder()
+        .table_name(table)
+        .item("pk", s(&relay::install_pk(install_id)))
+        .item("sk", s(&format!("GHLINK#{iid}")))
+        .item("data", s(&serde_json::to_string(link).unwrap_or_default()))
+        .item("linked_at", s(&now()))
+        .build()?;
+    let reverse = Put::builder()
+        .table_name(table)
+        .item("pk", s(&format!("HYBRIDGH#{iid}")))
+        .item("sk", s("LINK"))
+        .item("install_id", s(install_id))
+        .condition_expression("attribute_not_exists(pk) OR install_id = :i")
+        .expression_attribute_values(":i", s(install_id))
+        .build()?;
+    Ok(vec![
+        TransactWriteItem::builder().put(own).build(),
+        TransactWriteItem::builder().put(reverse).build(),
+    ])
+}
+
 /// PUT /hybrid/github/links/:installation_id (signed) `{repositories}`: the
-/// repositories this install may get tokens for (empty: all the
-/// installation grants).
+/// repositories this install may get tokens for (empty: every repository in
+/// the link's ceiling).
 pub async fn set_link_repos(
     State(state): State<Arc<AppState>>,
     Path(iid): Path<u64>,
     method: Method,
-    uri: Uri,
+    uri: OriginalUri,
     headers: HeaderMap,
     body: Bytes,
 ) -> Reply {
@@ -1704,6 +1716,10 @@ pub async fn set_link_repos(
                 .collect()
         })
         .unwrap_or_default();
+    if link.ceiling.is_none() {
+        let r = broker::BrokerRefusal::RelinkNeeded;
+        return Err(fail(StatusCode::FORBIDDEN, r.code(), r.message()));
+    }
     if !broker::ceiling_allows(link, &chosen) {
         return Err(fail(
             StatusCode::FORBIDDEN,
@@ -1745,7 +1761,7 @@ pub async fn delete_link(
     State(state): State<Arc<AppState>>,
     Path(iid): Path<u64>,
     method: Method,
-    uri: Uri,
+    uri: OriginalUri,
     headers: HeaderMap,
     body: Bytes,
 ) -> Reply {
@@ -1759,7 +1775,7 @@ pub async fn delete_link(
 pub async fn github_token(
     State(state): State<Arc<AppState>>,
     method: Method,
-    uri: Uri,
+    uri: OriginalUri,
     headers: HeaderMap,
     body: Bytes,
 ) -> Reply {
@@ -1998,7 +2014,7 @@ pub async fn relay_jira(
 pub async fn list_deliveries(
     State(state): State<Arc<AppState>>,
     method: Method,
-    uri: Uri,
+    uri: OriginalUri,
     headers: HeaderMap,
     body: Bytes,
 ) -> Reply {
@@ -2031,7 +2047,7 @@ pub async fn list_deliveries(
 pub async fn rollups(
     State(state): State<Arc<AppState>>,
     method: Method,
-    uri: Uri,
+    uri: OriginalUri,
     headers: HeaderMap,
     body: Bytes,
 ) -> Reply {
@@ -2060,7 +2076,7 @@ pub async fn redeliver(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
     method: Method,
-    uri: Uri,
+    uri: OriginalUri,
     headers: HeaderMap,
     body: Bytes,
 ) -> Reply {
@@ -2130,7 +2146,7 @@ pub async fn redeliver(
 pub async fn share(
     State(state): State<Arc<AppState>>,
     method: Method,
-    uri: Uri,
+    uri: OriginalUri,
     headers: HeaderMap,
     body: Bytes,
 ) -> Reply {
@@ -2228,14 +2244,14 @@ pub struct AuthorizeQuery {
 pub async fn oauth_authorize(
     State(state): State<Arc<AppState>>,
     Path(kind): Path<String>,
-    headers: HeaderMap,
+    ip: ClientIp,
     Query(q): Query<AuthorizeQuery>,
 ) -> Response {
     if master(&state).is_none() {
         return StatusCode::NOT_FOUND.into_response();
     }
     // Public: each start writes a holding partition, so it is limited per address.
-    if crate::middleware::rate_limit::allow(&headers, "hybrid-authorize", 20, 600).is_err() {
+    if rate_limit::allow(&ip, "hybrid-authorize", 20, 600).is_err() {
         return (
             StatusCode::TOO_MANY_REQUESTS,
             "Too many sign-ins started from here. Try again in a few minutes.",
@@ -2777,6 +2793,38 @@ mod tests {
     }
 
     use super::*;
+
+    /// Linking writes the install's link and the installation's reverse
+    /// index in one transaction; the reverse index carries the condition,
+    /// so a link held by another install fails both.
+    #[test]
+    fn a_link_and_its_reverse_index_are_written_together() {
+        let link = broker::GithubLink {
+            installation_id: 42,
+            account: "example-org".into(),
+            repositories: vec![],
+            ceiling: Some(vec!["web".into()]),
+        };
+        let items = link_writes("settings", "ins_abcdefghijklmnopqrstuvwx", &link).unwrap();
+        assert_eq!(items.len(), 2);
+        let own = items[0].put().unwrap();
+        assert_eq!(
+            own.item()["pk"],
+            s(&relay::install_pk("ins_abcdefghijklmnopqrstuvwx"))
+        );
+        assert_eq!(own.item()["sk"], s("GHLINK#42"));
+        assert!(own.condition_expression().is_none());
+        let reverse = items[1].put().unwrap();
+        assert_eq!(reverse.item()["pk"], s("HYBRIDGH#42"));
+        assert_eq!(
+            reverse.condition_expression(),
+            Some("attribute_not_exists(pk) OR install_id = :i")
+        );
+        assert_eq!(
+            reverse.expression_attribute_values().unwrap()[":i"],
+            s("ins_abcdefghijklmnopqrstuvwx")
+        );
+    }
 
     #[test]
     fn an_install_round_trips_through_its_item() {
