@@ -838,22 +838,42 @@ pub async fn orchestrate_ticket(
             );
             return Ok(());
         }
-    } else if let Err(e) = create_run_record(state, &msg, &run_id).await {
-        // The record may already be written: left alone it would sit in
-        // "running" with no pass until the stuck-run sweep called it a timeout.
-        // Say why now; with no record, nothing is written.
-        let reason = format!(
-            "Could not start the run: {}",
-            common::run_fail::error_text(&*e)
-        );
+    } else if let Err(e) = create_run_record(state, &msg, &run_id, RecordDetail::Full).await {
+        // Left alone, a record that was written would sit in "running" with
+        // no pass until the stuck-run sweep called it a timeout "during
+        // unknown pass", and a record that wasn't would leave the ticket with
+        // no answer at all. Fail it now, plainly, with the cause.
+        let reason = start_failure_reason(&common::run_fail::error_text(&*e));
         error!(run_id, error = %reason, "Run record write failed");
-        fail_run(state, &msg, &run_id, &reason, &usage, 0).await;
+        if !run_record_exists(state, &msg.team_id, &run_id).await {
+            // The full record was refused (too large a ticket, a bad
+            // value): keep a small one so the run page can say why.
+            if let Err(e2) = create_run_record(state, &msg, &run_id, RecordDetail::Minimal).await {
+                warn!(run_id, error = %common::run_fail::error_text(&*e2), "Minimal run record write failed too");
+            }
+        }
+        if run_record_exists(state, &msg.team_id, &run_id).await {
+            fail_run(state, &msg, &run_id, &reason, &usage, 0).await;
+        } else {
+            // No record to fail: the ticket still hears why.
+            notify_ticket_failed(state, &msg, &run_id, &reason).await;
+        }
+        release_ticket_lock(state, &msg.team_id, &msg.ticket_id).await;
         return Err(reason.into());
     }
 
     match tokio::time::timeout(
         std::time::Duration::from_secs(LAMBDA_TIMEOUT_SECS - 30), // 30s buffer for cleanup
-        run_passes(state, &mut msg, &run_id, &mut usage, &start),
+        // A panic must fail the run with a reason like any other error: left
+        // to the runtime, SQS delivered the ticket again, the duplicate check
+        // dropped it, and the run sat "running" until the stuck-run sweep.
+        async {
+            use futures::FutureExt;
+            std::panic::AssertUnwindSafe(run_passes(state, &mut msg, &run_id, &mut usage, &start))
+                .catch_unwind()
+                .await
+                .unwrap_or_else(|p| Err(panic_reason(p.as_ref()).into()))
+        },
     )
     .await
     {
@@ -4985,11 +5005,62 @@ async fn resume_run_to_running(state: &WorkerState, team_id: &str, run_id: &str)
         .is_ok()
 }
 
+/// The reason a run that panicked gives.
+fn panic_reason(p: &(dyn std::any::Any + Send)) -> String {
+    let what = p
+        .downcast_ref::<&str>()
+        .map(|s| s.to_string())
+        .or_else(|| p.downcast_ref::<String>().cloned())
+        .unwrap_or_default();
+    if what.trim().is_empty() {
+        "CoderHelm stopped on an internal error.".to_string()
+    } else {
+        format!("CoderHelm stopped on an internal error: {}", what.trim())
+    }
+}
+
+/// How much of the ticket a new run record carries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RecordDetail {
+    Full,
+    /// No ticket body or images: written when the full record was refused,
+    /// so a run that can't start still has a record that says why.
+    Minimal,
+}
+
+/// The reason a run that could not start gives, in plain words, with the
+/// cause underneath (the SDK's own text is only "service error").
+fn start_failure_reason(cause: &str) -> String {
+    let cause = cause.trim();
+    if cause.is_empty() {
+        "CoderHelm could not start this run: saving the run failed.".to_string()
+    } else {
+        format!("CoderHelm could not start this run: saving the run failed ({cause}).")
+    }
+}
+
+async fn run_record_exists(state: &WorkerState, team_id: &str, run_id: &str) -> bool {
+    state
+        .dynamo
+        .get_item()
+        .table_name(&state.config.runs_table_name)
+        .key("team_id", attr_s(team_id))
+        .key("run_id", attr_s(run_id))
+        .projection_expression("run_id")
+        .consistent_read(true)
+        .send()
+        .await
+        .map(|o| o.item().is_some())
+        .unwrap_or(false)
+}
+
 async fn create_run_record(
     state: &WorkerState,
     msg: &TicketMessage,
     run_id: &str,
+    detail: RecordDetail,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let full = detail == RecordDetail::Full;
     let now = chrono::Utc::now().to_rfc3339();
     let repo = format!("{}/{}", msg.repo_owner, msg.repo_name);
     let mut put = state
@@ -5024,7 +5095,7 @@ async fn create_run_record(
         .item(
             "ticket_body",
             attr_s(
-                if matches!(msg.source, TicketSource::Jira | TicketSource::Alert) {
+                if full && matches!(msg.source, TicketSource::Jira | TicketSource::Alert) {
                     &msg.body
                 } else {
                     ""
@@ -5033,7 +5104,11 @@ async fn create_run_record(
         )
         .item(
             "image_attachments",
-            AttributeValue::S(serde_json::to_string(&msg.image_attachments).unwrap_or_default()),
+            AttributeValue::S(if full {
+                serde_json::to_string(&msg.image_attachments).unwrap_or_default()
+            } else {
+                "[]".to_string()
+            }),
         )
         .item("tokens_in", attr_n(0))
         .item("tokens_out", attr_n(0))
@@ -5916,6 +5991,17 @@ async fn fail_run(
     // Check token usage against limit and send warning if needed
     check_token_usage_warning(state, &msg.team_id, usage).await;
 
+    notify_ticket_failed(state, msg, run_id, error_msg).await;
+}
+
+/// Tells the ticket the run failed and why: a GitHub issue comment or a Jira
+/// comment, with a link to the run.
+async fn notify_ticket_failed(
+    state: &WorkerState,
+    msg: &TicketMessage,
+    run_id: &str,
+    error_msg: &str,
+) {
     // Comment on the GitHub issue so the user knows the run failed
     if matches!(msg.source, TicketSource::Github) && msg.issue_number > 0 {
         if let Ok(gh) = GitHubClient::new(
@@ -9614,6 +9700,61 @@ mod run_usage_tests {
         assert!(
             offenders.is_empty(),
             "add run usage with if_not_exists(field, :uzero) + :v: {offenders:?}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod start_failure_tests {
+    use super::{panic_reason, start_failure_reason};
+
+    /// A run that can't start says so plainly and keeps the cause the SDK
+    /// hides behind "service error".
+    #[test]
+    fn a_start_failure_is_plain_and_keeps_the_cause() {
+        let r = start_failure_reason(
+            "service error: ValidationException: Item size has exceeded the maximum allowed size",
+        );
+        assert!(r.starts_with("CoderHelm could not start this run"));
+        assert!(r.contains("ValidationException: Item size has exceeded"));
+        assert_eq!(
+            start_failure_reason("  "),
+            "CoderHelm could not start this run: saving the run failed."
+        );
+    }
+
+    #[test]
+    fn a_panic_becomes_a_reason() {
+        let p: Box<dyn std::any::Any + Send> = Box::new("index out of bounds");
+        assert_eq!(
+            panic_reason(p.as_ref()),
+            "CoderHelm stopped on an internal error: index out of bounds"
+        );
+        let p: Box<dyn std::any::Any + Send> = Box::new(String::from("boom"));
+        assert!(panic_reason(p.as_ref()).ends_with("boom"));
+        let p: Box<dyn std::any::Any + Send> = Box::new(7u8);
+        assert_eq!(
+            panic_reason(p.as_ref()),
+            "CoderHelm stopped on an internal error."
+        );
+    }
+
+    /// Every way a ticket run ends in error fails the run itself: the worker
+    /// only logs what orchestrate_ticket returns, so each `return Err` in it
+    /// must come after a failed-status write or a ticket notice.
+    #[test]
+    fn orchestrate_ticket_fails_the_run_before_returning_an_error() {
+        let src = include_str!("mod.rs");
+        let start = src.find("pub async fn orchestrate_ticket(").unwrap();
+        let end = start + src[start..].find("\n}\n").unwrap();
+        let body = &src[start..end];
+        let returns = body.matches("return Err(").count();
+        assert_eq!(returns, 1, "a new error return must fail the run first");
+        let before = &body[..body.find("return Err(").unwrap()];
+        assert!(before.contains("fail_run(") && before.contains("notify_ticket_failed("));
+        assert!(
+            !body.contains(".await?"),
+            "a `?` in orchestrate_ticket skips the failure"
         );
     }
 }
