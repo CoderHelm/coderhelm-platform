@@ -91,6 +91,44 @@
         ],
         "type": "object"
       },
+      "CodegenEnvMissing": {
+        "description": "The run stopped before its pull request because a code generator needed\npublic values the repository's codegen environment doesn't set.",
+        "properties": {
+          "command": {
+            "description": "The generator that failed.",
+            "examples": [
+              "pnpm run typegen"
+            ],
+            "type": "string"
+          },
+          "repo": {
+            "description": "The repository, `owner/name`.",
+            "examples": [
+              "acme/web"
+            ],
+            "type": "string"
+          },
+          "vars": {
+            "description": "The public variable names it needs that aren't set. Set them in the\ndashboard under Settings, Repositories, the repository's Codegen\nenvironment (public values only, never secrets), then retry the run.",
+            "examples": [
+              [
+                "SANITY_STUDIO_PROJECT_ID",
+                "SANITY_STUDIO_DATASET"
+              ]
+            ],
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "repo",
+          "command",
+          "vars"
+        ],
+        "type": "object"
+      },
       "CreateEndpointBody": {
         "description": "A new endpoint.",
         "properties": {
@@ -2875,6 +2913,17 @@
             "type": [
               "string",
               "null"
+            ]
+          },
+          "codegen_env_missing": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/CodegenEnvMissing",
+                "description": "Set when the run stopped before its pull request because a code\ngenerator needed public values the repository doesn't set. Null\notherwise."
+              }
             ]
           },
           "continued_run_id": {

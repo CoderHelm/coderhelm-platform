@@ -7381,7 +7381,7 @@ pub(crate) async fn load_codegen_env(
     owner: &str,
     repo: &str,
 ) -> Vec<(String, String)> {
-    let sk = format!("SETTINGS#CODEGEN_ENV#{owner}/{repo}");
+    let sk = common::codegen_env::sk(&format!("{owner}/{repo}"));
     let item = state
         .dynamo
         .get_item()

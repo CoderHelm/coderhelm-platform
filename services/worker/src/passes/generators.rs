@@ -173,6 +173,8 @@ pub fn candidate_files(tree: &[String]) -> Vec<String> {
                 || b == "schema.prisma"
                 || b == "buf.gen.yaml"
                 || b == "openapitools.json"
+                || b.starts_with("sanity.cli.")
+                || b.starts_with("sanity.config.")
                 || CODEGEN_CONFIGS.contains(&b)
                 || DOC_FILES.contains(&p.as_str())
         })
@@ -747,24 +749,30 @@ pub async fn load(github: &GitHubClient, owner: &str, repo: &str, git_ref: &str)
 enum Ran {
     /// It ran; these files changed (committed when there were any).
     Regenerated(Vec<String>),
-    Failed(String),
+    /// It ran and failed: why, and its output.
+    Failed(String, String),
     /// The sandbox isn't set up, is out of time, or the team's policy holds
     /// the command.
     NotRun(String),
 }
 
-async fn run_in_sandbox(w: &Work<'_>, repo: &RepoFiles, g: &Generator, attempt: usize) -> Ran {
+async fn run_in_sandbox(
+    w: &Work<'_>,
+    g: &Generator,
+    cmd: &str,
+    env: &[(String, String)],
+    attempt: usize,
+) -> Ran {
     let state = w.state;
     if state.config.sandbox_bucket_name.is_empty() || state.config.sandbox_project_name.is_empty() {
         return Ran::NotRun("no sandbox".into());
     }
-    let cmd = sandbox_command(&repo.tree, g);
     let gate = crate::agent::policy::gate(
         state,
         w.provider.scope.ctx(common::agent_policy::Agent::Coder),
         w.deadline,
     );
-    match gate.check_command(&cmd, "Regenerate generated files").await {
+    match gate.check_command(cmd, "Regenerate generated files").await {
         common::agent_policy::Outcome::Run { .. } => {}
         _ => return Ran::NotRun("the team's agent permissions hold this command".into()),
     }
@@ -794,15 +802,14 @@ async fn run_in_sandbox(w: &Work<'_>, repo: &RepoFiles, g: &Generator, attempt: 
         Err(e) => return Ran::NotRun(format!("snapshot failed: {e}")),
     };
     let node = super::detect_node_version(w.github, owner, name, w.branch).await;
-    let env = super::load_codegen_env(state, &w.msg.team_id, owner, name).await;
     match sandbox
         .run_codegen(
             w.run_id,
             100 + attempt,
             &source,
-            &cmd,
+            cmd,
             node.as_deref(),
-            &env,
+            env,
             w.deadline,
         )
         .await
@@ -829,49 +836,95 @@ async fn run_in_sandbox(w: &Work<'_>, repo: &RepoFiles, g: &Generator, attempt: 
                 .await
             {
                 Ok(_) => Ran::Regenerated(paths),
-                Err(e) => Ran::Failed(format!("its output couldn't be committed ({e})")),
+                Err(e) => Ran::Failed(
+                    format!("its output couldn't be committed ({e})"),
+                    String::new(),
+                ),
             }
         }
-        Ok(o) if o.ran => Ran::Failed(format!(
-            "running it failed: {}",
-            common::truncate_str(o.output.trim(), 300)
-        )),
+        Ok(o) if o.ran => Ran::Failed(
+            format!(
+                "running it failed: {}",
+                common::truncate_str(o.output.trim(), 300)
+            ),
+            o.output,
+        ),
         Ok(o) => Ran::NotRun(o.output),
         Err(e) => Ran::NotRun(e.to_string()),
     }
 }
 
+/// What one pass over the affected generators found.
+enum Pass {
+    /// Generators still out of date (empty: all up to date).
+    Problems(Vec<(Generator, Vec<String>, String)>),
+    /// A generator failed for public values the codegen environment lacks:
+    /// no fix round can settle that, a person sets them.
+    MissingEnv(String),
+}
+
+/// Whether a generator runs through the repository's package scripts (the
+/// worker's own codegen command already runs those).
+fn is_script(g: &Generator) -> bool {
+    let c = g.command.trim_start();
+    let c = c.split("&& ").last().unwrap_or(c);
+    ["npm run ", "pnpm run ", "yarn ", "bun run "]
+        .iter()
+        .any(|p| c.starts_with(p))
+}
+
 /// One pass over the affected generators: regenerate in the sandbox when it
-/// can, and name each one still out of date.
-async fn regenerate(
-    w: &Work<'_>,
-    attempt: usize,
-    notes: &mut Vec<String>,
-) -> Option<Vec<(Generator, Vec<String>, String)>> {
-    let repo = load(w.github, &w.msg.repo_owner, &w.msg.repo_name, w.branch).await;
+/// can, and name each one still out of date. Package-script generators run
+/// through the worker's codegen command (`detect_codegen_command`), once,
+/// with the repository's public codegen environment (`load_codegen_env`).
+async fn regenerate(w: &Work<'_>, attempt: usize, notes: &mut Vec<String>) -> Option<Pass> {
+    let (owner, name) = (&w.msg.repo_owner, &w.msg.repo_name);
+    let repo = load(w.github, owner, name, w.branch).await;
     let gens = detect(&repo);
     if gens.is_empty() {
         return None;
     }
-    let mut changed = super::plan_coverage::changed_files(
-        w.github,
-        &w.msg.repo_owner,
-        &w.msg.repo_name,
-        &w.msg.base_branch,
-        w.branch,
-    )
-    .await?;
+    let mut changed =
+        super::plan_coverage::changed_files(w.github, owner, name, &w.msg.base_branch, w.branch)
+            .await?;
     let hits: Vec<(Generator, Vec<String>)> = affected(&gens, &changed)
         .into_iter()
         .map(|(g, i)| (g.clone(), i))
         .collect();
+    if hits.is_empty() {
+        return Some(Pass::Problems(Vec::new()));
+    }
+    let scripts_cmd = super::detect_codegen_command(w.github, owner, name, w.branch).await;
+    let env = super::load_codegen_env(w.state, &w.msg.team_id, owner, name).await;
+    let mut shared_run: Option<Ran> = None;
     let mut problems = Vec::new();
     for (i, (g, inputs)) in hits.into_iter().enumerate() {
-        match run_in_sandbox(w, &repo, &g, attempt * 10 + i).await {
+        let ran = match (&scripts_cmd, is_script(&g)) {
+            (Some(cmd), true) => match &shared_run {
+                // The shared run already counted its files.
+                Some(Ran::Regenerated(_)) => Ran::Regenerated(Vec::new()),
+                Some(Ran::Failed(a, b)) => Ran::Failed(a.clone(), b.clone()),
+                Some(Ran::NotRun(a)) => Ran::NotRun(a.clone()),
+                None => {
+                    let r = run_in_sandbox(w, &g, cmd, &env, attempt * 10 + i).await;
+                    shared_run = Some(match &r {
+                        Ran::Regenerated(p) => Ran::Regenerated(p.clone()),
+                        Ran::Failed(a, b) => Ran::Failed(a.clone(), b.clone()),
+                        Ran::NotRun(a) => Ran::NotRun(a.clone()),
+                    });
+                    r
+                }
+            },
+            _ => {
+                let cmd = sandbox_command(&repo.tree, &g);
+                run_in_sandbox(w, &g, &cmd, &env, attempt * 10 + i).await
+            }
+        };
+        match ran {
             Ran::Regenerated(paths) => {
                 if paths.is_empty() {
                     notes.push(format!(
-                        "`{}` ran; the generated files were already up to date",
+                        "`{}` ran; the generated files are up to date",
                         g.name
                     ));
                 } else {
@@ -883,7 +936,30 @@ async fn regenerate(
                     changed.extend(paths);
                 }
             }
-            Ran::Failed(why) => problems.push((g, inputs, format!("{why}."))),
+            Ran::Failed(why, output) => {
+                // Public values the generator reads that the repository's
+                // codegen environment doesn't set: a person's to add.
+                let refs: std::collections::BTreeSet<String> = repo
+                    .files
+                    .iter()
+                    .filter(|(p, _)| {
+                        let b = base_name(p);
+                        b.starts_with("sanity.cli.")
+                            || b.starts_with("sanity.config.")
+                            || CODEGEN_CONFIGS.contains(&b)
+                    })
+                    .flat_map(|(_, t)| common::codegen_env::env_refs(t))
+                    .collect();
+                let missing = common::codegen_env::missing(&refs, &output, &env);
+                if !missing.is_empty() {
+                    let full = format!("{owner}/{name}");
+                    record_missing_env(w, &full, &g.name, &missing).await;
+                    return Some(Pass::MissingEnv(common::codegen_env::failure_reason(
+                        &full, &g.name, &missing,
+                    )));
+                }
+                problems.push((g, inputs, format!("{why}.")));
+            }
             Ran::NotRun(why) => {
                 info!(generator = %g.name, why, "Generator not run in the sandbox");
                 if outputs_missing(&g, &changed) {
@@ -904,7 +980,35 @@ async fn regenerate(
             }
         }
     }
-    Some(problems)
+    Some(Pass::Problems(problems))
+}
+
+/// Keeps on the run which public values codegen was missing, for the run
+/// page to show with a link to where they're set.
+async fn record_missing_env(w: &Work<'_>, repo: &str, command: &str, missing: &[String]) {
+    use aws_sdk_dynamodb::types::AttributeValue as A;
+    let value = A::M(HashMap::from([
+        ("repo".to_string(), A::S(repo.to_string())),
+        ("command".to_string(), A::S(command.to_string())),
+        (
+            "vars".to_string(),
+            A::L(missing.iter().map(|m| A::S(m.clone())).collect()),
+        ),
+    ]));
+    if let Err(e) = w
+        .state
+        .dynamo
+        .update_item()
+        .table_name(&w.state.config.runs_table_name)
+        .key("team_id", super::attr_s(&w.msg.team_id))
+        .key("run_id", super::attr_s(w.run_id))
+        .update_expression("SET codegen_env_missing = :m")
+        .expression_attribute_values(":m", value)
+        .send()
+        .await
+    {
+        warn!(run_id = w.run_id, error = %e, "Could not record the missing codegen values");
+    }
 }
 
 /// Before the pull request: generators whose inputs changed are run and
@@ -916,12 +1020,12 @@ pub async fn gate(
     usage: &mut crate::models::TokenUsage,
 ) -> Result<Vec<String>, String> {
     let mut notes = Vec::new();
-    let Some(problems) = regenerate(w, 0, &mut notes).await else {
-        return Ok(notes);
+    let problems = match regenerate(w, 0, &mut notes).await {
+        None => return Ok(notes),
+        Some(Pass::MissingEnv(why)) => return Err(why),
+        Some(Pass::Problems(p)) if p.is_empty() => return Ok(notes),
+        Some(Pass::Problems(p)) => p,
     };
-    if problems.is_empty() {
-        return Ok(notes);
-    }
     super::add_progress_note(
         w.state,
         &w.msg.team_id,
@@ -960,7 +1064,11 @@ pub async fn gate(
         warn!(run_id = w.run_id, error = %e, "Generator fix round failed");
     }
     let mut notes2 = Vec::new();
-    let still = regenerate(w, 1, &mut notes2).await.unwrap_or_default();
+    let still = match regenerate(w, 1, &mut notes2).await {
+        Some(Pass::MissingEnv(why)) => return Err(why),
+        Some(Pass::Problems(p)) => p,
+        None => Vec::new(),
+    };
     notes.extend(notes2);
     match still.first() {
         None => Ok(notes),
@@ -1187,6 +1295,26 @@ mod tests {
         assert!(c.contains(&"apps/studio/sanity-typegen.json".to_string()));
         assert!(!c.iter().any(|p| p.contains("node_modules")));
         assert!(!c.contains(&"src/index.ts".to_string()));
+    }
+
+    #[test]
+    fn package_script_generators_run_through_the_workers_codegen_command() {
+        let g = |c: &str| Generator {
+            kind: GenKind::Sanity,
+            name: c.into(),
+            command: c.into(),
+            inputs: vec![],
+            outputs: vec![],
+        };
+        assert!(is_script(&g("pnpm run typegen")));
+        assert!(is_script(&g("cd apps/studio && npm run codegen")));
+        assert!(!is_script(&g("npx graphql-codegen --config codegen.yml")));
+        assert!(!is_script(&g("make client")));
+        // Sanity's own config files are read for the env values they need.
+        assert_eq!(
+            candidate_files(&["apps/studio/sanity.cli.ts".to_string()]).len(),
+            1
+        );
     }
 
     #[test]

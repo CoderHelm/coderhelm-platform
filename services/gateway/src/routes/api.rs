@@ -909,6 +909,23 @@ pub struct RunNote {
     pub timestamp: Option<String>,
 }
 
+/// The run stopped before its pull request because a code generator needed
+/// public values the repository's codegen environment doesn't set.
+#[derive(serde::Serialize, utoipa::ToSchema)]
+pub struct CodegenEnvMissing {
+    /// The repository, `owner/name`.
+    #[schema(example = "acme/web")]
+    pub repo: String,
+    /// The generator that failed.
+    #[schema(example = "pnpm run typegen")]
+    pub command: String,
+    /// The public variable names it needs that aren't set. Set them in the
+    /// dashboard under Settings, Repositories, the repository's Codegen
+    /// environment (public values only, never secrets), then retry the run.
+    #[schema(example = json!(["SANITY_STUDIO_PROJECT_ID", "SANITY_STUDIO_DATASET"]))]
+    pub vars: Vec<String>,
+}
+
 /// A commit a fix round pushed before it stopped.
 #[derive(serde::Serialize, utoipa::ToSchema)]
 pub struct PushedCommit {
@@ -1096,6 +1113,32 @@ pub struct Run {
     /// otherwise. Resume it with `POST /api/runs/{run_id}/retry`.
     #[schema(example = json!(null))]
     pub round_incomplete: Option<RoundIncomplete>,
+    /// Set when the run stopped before its pull request because a code
+    /// generator needed public values the repository doesn't set. Null
+    /// otherwise.
+    #[schema(example = json!(null))]
+    pub codegen_env_missing: Option<CodegenEnvMissing>,
+}
+
+/// The public values a run's code generator was missing, as the API shows them.
+fn codegen_env_missing_of(item: &run_search::Item) -> Option<CodegenEnvMissing> {
+    let m = item.get("codegen_env_missing")?.as_m().ok()?;
+    let s = |k: &str| {
+        m.get(k)
+            .and_then(|v| v.as_s().ok())
+            .cloned()
+            .unwrap_or_default()
+    };
+    let vars: Vec<String> = m
+        .get("vars")
+        .and_then(|v| v.as_l().ok())
+        .map(|l| l.iter().filter_map(|v| v.as_s().ok().cloned()).collect())
+        .unwrap_or_default();
+    (!vars.is_empty()).then(|| CodegenEnvMissing {
+        repo: s("repo"),
+        command: s("command"),
+        vars,
+    })
 }
 
 /// The run's unfinished fix round, as the API shows it.
@@ -1468,6 +1511,7 @@ fn run_of(
         answers_url: st("answers_url"),
         continued_run_id: st("continued_run_id"),
         round_incomplete: round_incomplete_of(item),
+        codegen_env_missing: codegen_env_missing_of(item),
     }
 }
 
@@ -4317,6 +4361,118 @@ pub async fn update_repo_instructions(
 }
 
 /// Validate repo path parameter to prevent DynamoDB key injection.
+/// GET /api/repos/:owner/:name/codegen-env — the repository's public
+/// codegen environment (admins). Its values are public by rule, so they are
+/// shown as kept.
+pub async fn get_codegen_env(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<Claims>,
+    axum::extract::Path((owner, name)): axum::extract::Path<(String, String)>,
+) -> Result<Json<Value>, StatusCode> {
+    claims.require_role(3)?; // admin+
+    let repo = format!("{owner}/{name}");
+    validate_repo_name(&repo)?;
+    let item = state
+        .dynamo
+        .get_item()
+        .table_name(&state.config.settings_table_name)
+        .key("pk", attr_s(&claims.team_id))
+        .key("sk", attr_s(&common::codegen_env::sk(&repo)))
+        .send()
+        .await
+        .map_err(|e| {
+            error!("Failed to read the codegen environment for {repo}: {e}");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?
+        .item;
+    let mut vars: Vec<(String, String)> = item
+        .and_then(|i| i.get("env").and_then(|v| v.as_m().ok()).cloned())
+        .map(|m| {
+            m.into_iter()
+                .filter_map(|(k, v)| v.as_s().ok().map(|s| (k, s.clone())))
+                .collect()
+        })
+        .unwrap_or_default();
+    vars.sort();
+    Ok(Json(json!({
+        "repo": repo,
+        "vars": vars.iter().map(|(n, v)| json!({"name": n, "value": v})).collect::<Vec<_>>(),
+    })))
+}
+
+/// The variables a codegen environment write carries, checked
+/// ([`common::codegen_env::validate`]): public values only.
+fn codegen_vars(body: &Value) -> Result<Vec<(String, String)>, String> {
+    let vars: Vec<(String, String)> = body["vars"]
+        .as_array()
+        .ok_or("Send `vars`: a list of {name, value}.")?
+        .iter()
+        .map(|v| {
+            (
+                v["name"].as_str().unwrap_or("").trim().to_string(),
+                v["value"].as_str().unwrap_or("").trim().to_string(),
+            )
+        })
+        .filter(|(n, _)| !n.is_empty())
+        .collect();
+    common::codegen_env::validate(&vars)?;
+    Ok(vars)
+}
+
+/// PUT /api/repos/:owner/:name/codegen-env — replace the repository's public
+/// codegen environment (admins). Names or values that look like credentials
+/// are refused with the reason; an empty list removes it.
+pub async fn put_codegen_env(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<Claims>,
+    axum::extract::Path((owner, name)): axum::extract::Path<(String, String)>,
+    Json(body): Json<Value>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let fail = |code: StatusCode, msg: &str| (code, Json(json!({ "error": msg })));
+    // admin+
+    let allowed = claims.require_role(3);
+    allowed.map_err(|c| fail(c, "Only admins can change the codegen environment."))?;
+    let repo = format!("{owner}/{name}");
+    validate_repo_name(&repo).map_err(|c| fail(c, "Not a repository name."))?;
+    let vars = codegen_vars(&body).map_err(|m| fail(StatusCode::BAD_REQUEST, &m))?;
+    let key = common::codegen_env::sk(&repo);
+    let res = if vars.is_empty() {
+        state
+            .dynamo
+            .delete_item()
+            .table_name(&state.config.settings_table_name)
+            .key("pk", attr_s(&claims.team_id))
+            .key("sk", attr_s(&key))
+            .send()
+            .await
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    } else {
+        state
+            .dynamo
+            .put_item()
+            .table_name(&state.config.settings_table_name)
+            .item("pk", attr_s(&claims.team_id))
+            .item("sk", attr_s(&key))
+            .item(
+                "env",
+                AttributeValue::M(vars.iter().map(|(n, v)| (n.clone(), attr_s(v))).collect()),
+            )
+            .item("updated_at", attr_s(&chrono::Utc::now().to_rfc3339()))
+            .item("updated_by", attr_s(&claims.email))
+            .send()
+            .await
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    };
+    res.map_err(|e| {
+        error!("Failed to write the codegen environment for {repo}: {e}");
+        fail(StatusCode::INTERNAL_SERVER_ERROR, "Could not save.")
+    })?;
+    info!(repo, count = vars.len(), "Codegen environment saved");
+    Ok(Json(json!({ "repo": repo, "count": vars.len() })))
+}
+
 fn validate_repo_name(repo: &str) -> Result<(), StatusCode> {
     if repo.is_empty()
         || repo.len() > 200
@@ -5965,6 +6121,59 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(super::resume_route(&fb, now), super::ResumeRoute::Feedback);
+    }
+
+    #[test]
+    fn codegen_env_writes_take_public_values_only() {
+        let ok = super::codegen_vars(&json!({"vars": [
+            {"name": "SANITY_STUDIO_PROJECT_ID", "value": "abc123"},
+            {"name": "  ", "value": "ignored"}
+        ]}))
+        .unwrap();
+        assert_eq!(
+            ok,
+            vec![("SANITY_STUDIO_PROJECT_ID".to_string(), "abc123".to_string())]
+        );
+        assert!(super::codegen_vars(
+            &json!({"vars": [{"name": "SANITY_AUTH_TOKEN", "value": "x"}]})
+        )
+        .is_err());
+        assert!(super::codegen_vars(&json!({})).is_err());
+        assert!(super::codegen_vars(&json!({"vars": []}))
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn a_run_stopped_for_missing_codegen_values_names_them() {
+        use aws_sdk_dynamodb::types::AttributeValue as A;
+        let item = std::collections::HashMap::from([
+            ("status".to_string(), A::S("failed".into())),
+            (
+                "codegen_env_missing".to_string(),
+                A::M(std::collections::HashMap::from([
+                    ("repo".to_string(), A::S("acme/web".into())),
+                    ("command".to_string(), A::S("pnpm run typegen".into())),
+                    (
+                        "vars".to_string(),
+                        A::L(vec![A::S("SANITY_STUDIO_PROJECT_ID".into())]),
+                    ),
+                ])),
+            ),
+        ]);
+        let usage = RunUsage {
+            tokens_in: 0,
+            tokens_out: 0,
+            cache_read: 0,
+            cache_write: 0,
+            cost_usd: 0.0,
+        };
+        let run = serde_json::to_value(run_of(&item, "r", usage)).unwrap();
+        assert_eq!(
+            run["codegen_env_missing"]["vars"][0],
+            "SANITY_STUDIO_PROJECT_ID"
+        );
+        assert_eq!(run["codegen_env_missing"]["repo"], "acme/web");
     }
 
     #[test]

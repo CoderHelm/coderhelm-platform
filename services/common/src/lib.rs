@@ -14,6 +14,9 @@ pub mod claim;
 
 /// The code graph's per-repo switch and build status (gateway and worker).
 pub mod code_graph;
+/// A repository's public codegen environment: what may be kept, and what
+/// a failed generator is missing.
+pub mod codegen_env;
 /// Every delivery in and out (webhooks, relay forwards, notifications,
 /// email), with what happened, for the Deliveries page.
 pub mod deliveries;
