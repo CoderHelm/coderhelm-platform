@@ -8,7 +8,9 @@ Triggered by EventBridge every 6 hours. For each team with an AWS connection:
 3. Send that evidence to Anthropic Claude, which writes the findings' words
 4. Credit each finding to the log groups whose lines match it, check each
    group alone, guard the title against services the evidence doesn't show
-   (attribution.py), then deduplicate and store in DynamoDB
+   (attribution.py), then match each to the finding it already is, by the
+   error signature of its lines (fingerprint.py, lifecycle.py), and store it
+   in DynamoDB
 5. Post new findings to the team's Teams channel, when turned on
 
 Raw logs are not stored: only counts, times and up to three scrubbed sample
@@ -16,12 +18,11 @@ lines per finding, each with its log group and stream.
 """
 
 import base64
-import hashlib
 import json
 import logging
 import os
 import time
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 from urllib.request import Request, urlopen
 from urllib.error import HTTPError
 
@@ -29,6 +30,8 @@ import boto3
 from botocore.exceptions import ClientError
 
 import attribution
+import fingerprint
+import lifecycle
 import usage
 
 logger = logging.getLogger()
@@ -327,7 +330,9 @@ def analyze_connection(conn):
                     }
                 )
 
-    existing = list_pending_recommendations(team_id, account_id)
+    # Every finding a sighting could be: open, acknowledged, being fixed,
+    # ignored, or resolved recently (lifecycle.is_recent).
+    existing = list_recent_findings(team_id, account_id)
 
     if not batches:
         record_connection_success(team_id, account_id)
@@ -345,12 +350,11 @@ def analyze_connection(conn):
     seen_ids = set()
     new_recs = []
 
-    advisory = secrets_advisory(batches, evidence, account_id)
-    if advisory:
+    for advisory in secrets_advisories(batches, evidence, account_id):
         rec_id, is_new = store_finding(team_id, account_id, advisory, existing, None, (start, end))
         if rec_id:
             seen_ids.add(rec_id)
-        if is_new:
+        if is_new or advisory.get("seen_again"):
             new_recs.append(advisory)
 
     # The model reads the attributed evidence and writes the words.
@@ -378,10 +382,12 @@ def analyze_connection(conn):
         rec_id, is_new = store_finding(team_id, account_id, cand, existing, cw_logs, (start, end))
         if rec_id:
             seen_ids.add(rec_id)
-        if is_new:
+        # A resolved finding that came back is news; an ignored one is not.
+        if is_new or cand.get("seen_again"):
             new_recs.append(cand)
 
-    # Resolve findings that no longer appear — only after a complete run.
+    # Resolve findings that stopped appearing for the quiet period — only
+    # after a complete run.
     if not any_query_failed:
         resolve_stale_recommendations(team_id, existing, seen_ids)
 
@@ -390,53 +396,74 @@ def analyze_connection(conn):
     return len(new_recs)
 
 
-def secrets_advisory(batches, evidence, account_id):
-    """A finding when secrets appear in the raw query rows (before scrubbing),
-    counted from those rows; None when there are none."""
-    raw_text = json.dumps([b["results"] for b in batches], default=str)
-    secrets_found = 0
-    secret_types = set()
-    groups = set()
-    for pattern, replacement in SECRET_PATTERNS:
-        matches = pattern.findall(raw_text)
-        if matches and replacement:
-            secrets_found += len(matches)
-            secret_types.add(replacement.strip("[]"))
-    if not secrets_found:
-        return None
-    for e in evidence:
-        if any(tag in e["message"] for tag in secret_types):
-            groups.add(e["log_group"])
-    firsts = [e["first"] for e in evidence if e["first"]]
-    lasts = [e["last"] for e in evidence if e["last"]]
-    types_str = ", ".join(sorted(secret_types))
-    group = next(iter(groups)) if len(groups) == 1 else "multiple"
-    return {
-        "id": "secrets",
-        "title": f"Secrets detected in CloudWatch Logs ({secrets_found} instances)",
-        "severity": "critical",
-        "summary": (
-            f"We detected {secrets_found} potential secrets or tokens in your CloudWatch Logs "
-            f"(types: {types_str}). These were automatically scrubbed before AI analysis, "
-            f"but they still exist in your logs and could be exposed."
-        ),
-        "suggested_action": (
-            "1. Rotate any exposed credentials immediately. "
-            "2. Add a CloudWatch Logs subscription filter or Lambda to strip secrets at ingestion. "
-            "3. Update your application to avoid logging sensitive values — use environment variables "
-            "and never pass secrets as command-line arguments or log them at any level. "
-            "4. Consider using AWS Secrets Manager or Parameter Store for credential management."
-        ),
-        "log_group": group,
-        "account": account_id,
-        "literal": f"secrets_in_logs_{account_id}",
-        "stats": {
-            "count": secrets_found,
-            "first": min(firsts) if firsts else None,
-            "last": max(lasts) if lasts else None,
-            "samples": [],
-        },
-    }
+def secrets_advisories(batches, evidence, account_id):
+    """One finding per log group whose raw query rows (before scrubbing)
+    carry secrets, counted from that group's rows; [] when there are none.
+    Each is credited to the group its lines are in, never to "multiple"."""
+    per_group = {}
+    for b in batches:
+        scope = tuple(b.get("log_groups", []))
+        for row in b.get("results", []):
+            account, group = attribution.split_log(row.get("@log"), scope)
+            if not group:
+                continue
+            raw = str(row.get("@message", ""))
+            found, types = 0, set()
+            for pattern, replacement in SECRET_PATTERNS:
+                if not replacement:
+                    continue
+                matches = pattern.findall(raw)
+                if matches:
+                    found += len(matches)
+                    types.add(replacement.strip("[]"))
+            if not found:
+                continue
+            g = per_group.setdefault(group, {
+                "account": account, "found": 0, "types": set(), "lines": 0, "streams": {},
+            })
+            n = attribution.as_int(row.get("n") or 1) or 1
+            g["found"] += found
+            g["types"] |= types
+            g["lines"] += n
+            stream = str(row.get("@logStream", "") or "")
+            if stream:
+                g["streams"][stream] = g["streams"].get(stream, 0) + n
+    out = []
+    for group, g in sorted(per_group.items()):
+        mine = [e for e in evidence if e["log_group"] == group]
+        firsts = [e["first"] for e in mine if e["first"]]
+        lasts = [e["last"] for e in mine if e["last"]]
+        types_str = ", ".join(sorted(g["types"]))
+        out.append({
+            "id": f"secrets-{group}",
+            "title": f"Secrets detected in CloudWatch Logs ({g['found']} instances)",
+            "severity": "critical",
+            "summary": (
+                f"We detected {g['found']} potential secrets or tokens in {group} "
+                f"(types: {types_str}). These were automatically scrubbed before AI analysis, "
+                f"but they still exist in your logs and could be exposed."
+            ),
+            "suggested_action": (
+                "1. Rotate any exposed credentials immediately. "
+                "2. Add a CloudWatch Logs subscription filter or Lambda to strip secrets at ingestion. "
+                "3. Update your application to avoid logging sensitive values — use environment variables "
+                "and never pass secrets as command-line arguments or log them at any level. "
+                "4. Consider using AWS Secrets Manager or Parameter Store for credential management."
+            ),
+            "log_group": group,
+            "account": g["account"] or account_id,
+            "literal": f"secrets_in_logs_{account_id}",
+            # One finding per group whatever the count or wording.
+            "signature": "secrets | secrets in logs |",
+            "stats": {
+                "count": g["lines"],
+                "first": min(firsts) if firsts else None,
+                "last": max(lasts) if lasts else None,
+                "streams": g["streams"],
+                "samples": [],
+            },
+        })
+    return out
 
 
 def attribute_recommendations(cw_logs, recommendations, evidence, start, end, run=None):
@@ -479,6 +506,13 @@ def attribute_recommendations(cw_logs, recommendations, evidence, start, end, ru
                 "account": g["account"],
                 "literal": literal,
                 "stats": g,
+                # This run's distinct lines of the error in this group, with
+                # their counts: what its signature is worked out from.
+                "lines": [
+                    (e["message"], e["count"])
+                    for e in evidence
+                    if e["log_group"] == g["log_group"] and literal in e["message"]
+                ],
                 "others": [
                     {"log_group": o["log_group"], "lines": o["count"]}
                     for o in credited
@@ -598,14 +632,17 @@ def analysis_prompt(evidence, account_id, existing=None):
     if len(context) > 50000:
         context = context[:50000] + "\n... (truncated)"
 
+    # Findings people act on first, then the latest; at most 60.
+    ranked = sorted(existing or [], key=lambda r: (lifecycle.rank(r), r.get("last_seen_at") or ""))
     known = [
         {
             "id": r["rec_id"],
             "title": r.get("title", ""),
+            "status": r.get("status", "pending"),
             "source_log_group": r.get("source_log_group", ""),
             "error_pattern": r.get("error_pattern", "")[:300],
         }
-        for r in (existing or [])
+        for r in ranked[:60]
     ]
     known_json = json.dumps(known, indent=2)
 
@@ -636,14 +673,14 @@ Return a JSON array of recommendations. Each must have:
 - "evidence_ids": The ids of every evidence entry this finding is about. If the same error appears in several log groups, cite all of them; each log group becomes its own finding.
 - "error_pattern": Text copied exactly from the cited evidence messages that every occurrence of this error shares, at most 80 characters. Leave out ids, hashes, timestamps and numbers that change between lines.
 - "suspected_location": The file, function or module the error text points to (from a stack trace, logger name or path in the messages), or null when the logs don't show one. Never guess.
-- "existing_id": If this is the same underlying issue as one of the already-open findings below, that finding's "id"; otherwise null. Reuse an id only for the same issue, even if the wording differs.
+- "existing_id": If this is the same underlying issue as one of the known findings below (open, ignored or resolved), that finding's "id"; otherwise null. Reuse an id only for the same issue, even if the wording differs.
 
 Name a service or log group in the title, summary or suggested action only when it is the log_group of evidence you cite. Never infer a service from another log group.
 
-Already-open findings for this account:
-<open_findings>
+Known findings for this account:
+<known_findings>
 {known_json}
-</open_findings>
+</known_findings>
 
 Severity guide:
 - critical = service down/crashing, data loss risk, active security breach
@@ -671,19 +708,19 @@ def analyze_with_anthropic(evidence, account_id, api_key, existing=None, team_id
     return recommendations
 
 
-def list_pending_recommendations(team_id, account_id):
-    """All pending findings for this account (paginated)."""
+def list_recent_findings(team_id, account_id, now=None):
+    """Every finding of this account a new sighting could be (paginated):
+    open, acknowledged, being fixed, ignored, or resolved within
+    lifecycle.REOPEN_DAYS. Merged duplicates are left out."""
     items = []
     last_key = None
     while True:
         query_kwargs = {
             "KeyConditionExpression": "pk = :pk AND begins_with(sk, :prefix)",
-            "FilterExpression": "#s = :pending AND source_account_id = :acct",
-            "ExpressionAttributeNames": {"#s": "status"},
+            "FilterExpression": "source_account_id = :acct",
             "ExpressionAttributeValues": {
                 ":pk": team_id,
                 ":prefix": "REC#",
-                ":pending": "pending",
                 ":acct": account_id,
             },
         }
@@ -692,29 +729,32 @@ def list_pending_recommendations(team_id, account_id):
         result = aws_insights_table.query(**query_kwargs)
         for item in result.get("Items", []):
             item["rec_id"] = item["sk"][len("REC#"):]
-            items.append(item)
+            if lifecycle.is_recent(item, now):
+                items.append(item)
         last_key = result.get("LastEvaluatedKey")
         if not last_key:
             break
     return items
 
 
-def resolve_stale_recommendations(team_id, existing, seen_ids):
-    """Mark open findings resolved when this complete run didn't see them."""
-    now = datetime.now(timezone.utc).isoformat()
+def resolve_stale_recommendations(team_id, existing, seen_ids, now=None):
+    """Mark open findings resolved when this complete run didn't see them and
+    no matching line came for lifecycle.QUIET_DAYS. One missed run never
+    resolves a finding: the next sighting would have to make a new one."""
+    now_dt = now or datetime.now(timezone.utc)
+    now_iso = now_dt.isoformat()
     resolved_count = 0
-    for item in existing:
-        if item["rec_id"] in seen_ids:
-            continue
+    for item in lifecycle.stale(existing, seen_ids, now_dt):
         try:
             aws_insights_table.update_item(
                 Key={"pk": team_id, "sk": item["sk"]},
                 UpdateExpression="SET #s = :s, resolved_at = :t, updated_at = :t",
                 ConditionExpression="#s = :pending",
                 ExpressionAttributeNames={"#s": "status"},
-                ExpressionAttributeValues={":s": "resolved", ":t": now, ":pending": "pending"},
+                ExpressionAttributeValues={":s": "resolved", ":t": now_iso, ":pending": "pending"},
             )
             resolved_count += 1
+            item["status"], item["resolved_at"] = "resolved", now_iso
             emit_event(
                 team_id,
                 "log_finding.resolved",
@@ -722,7 +762,7 @@ def resolve_stale_recommendations(team_id, existing, seen_ids):
                     item["rec_id"],
                     item.get("source_account_id", ""),
                     item,
-                    resolved_at=now.replace("+00:00", "Z"),
+                    resolved_at=now_iso.replace("+00:00", "Z"),
                 ),
             )
         except ClientError as e:
@@ -781,8 +821,37 @@ def finding_event_data(rec_id, account_id, item, resolved_at=None):
 
 
 def error_hash_for(account_id, rec):
-    raw = f"{account_id}:{rec.get('source_log_group', '')}:{rec.get('error_pattern', rec.get('title', ''))}"
-    return hashlib.sha256(raw.encode()).hexdigest()[:16]
+    """The identity findings had before error signatures (account, group and
+    the model's error pattern). Still matched, so older findings are found;
+    new findings use sighting_of's fingerprint."""
+    return lifecycle.legacy_hash(
+        account_id, rec.get("source_log_group", ""), rec.get("error_pattern", rec.get("title", ""))
+    )
+
+
+def sighting_of(account_id, cand):
+    """What identifies a candidate: its error signatures, worked out from its
+    lines (this run's evidence lines in its group, then its sample lines),
+    never from the words the model wrote. Returns a dict for
+    lifecycle.find_match plus the signature and fingerprint to store."""
+    group = str(cand["log_group"])
+    literal = str(cand.get("literal", ""))
+    lines = list(cand.get("lines") or [])
+    lines += [s.get("message", "") for s in cand.get("stats", {}).get("samples", []) if s.get("message")]
+    if cand.get("signature"):
+        sigs = [cand["signature"]]
+    else:
+        sigs = fingerprint.signatures(lines) or fingerprint.signatures([literal])
+    main = sigs[0] if sigs else ""
+    return {
+        "log_group": group,
+        "signature": main,
+        "fingerprint": fingerprint.fingerprint(account_id, group, main) if main else "",
+        "signature_hashes": [fingerprint.signature_hash(x) for x in sigs],
+        "legacy_hash": error_hash_for(account_id, {"source_log_group": group, "error_pattern": literal}),
+        "lines": [l[0] if isinstance(l, tuple) else l for l in lines],
+        "existing_id": cand.get("existing_id"),
+    }
 
 
 def suspected_location(rec):
@@ -792,19 +861,6 @@ def suspected_location(rec):
         return ""
     loc = loc.strip()
     return "" if loc.lower() in ("", "null", "none", "unknown") else loc[:300]
-
-
-def match_existing(rec, existing, error_hash):
-    """The open finding this recommendation is the same issue as, if any: the
-    model's existing_id when it names an open finding, else the same hash."""
-    by_id = {e["rec_id"]: e for e in existing}
-    claimed = rec.get("existing_id")
-    if isinstance(claimed, str) and claimed in by_id:
-        return by_id[claimed]
-    for e in existing:
-        if e.get("error_hash") == error_hash:
-            return e
-    return None
 
 
 def lines_since(cw_logs, group, literal, prev, window):
@@ -825,32 +881,48 @@ def lines_since(cw_logs, group, literal, prev, window):
     return checked["count"] if checked else 0
 
 
-def store_finding(team_id, account_id, cand, existing, cw_logs=None, window=None):
-    """Store a finding credited to one log group, or refresh the open one it
-    repeats there. `cand` carries the evidence: log_group, account, literal
-    and checked stats (count, first, last, samples). Returns (rec_id, is_new);
-    rec_id is None when the write failed.
+def store_finding(team_id, account_id, cand, existing, cw_logs=None, window=None, now=None):
+    """Store a finding credited to one log group, or refresh the stored one it
+    is. `cand` carries the evidence: log_group, account, literal, lines and
+    checked stats (count, first, last, streams, samples). Returns (rec_id,
+    is_new); rec_id is None when the write failed. Sets cand["seen_again"]
+    when a resolved finding came back and was reopened.
+
+    Identity is the error signature of the lines (sighting_of), matched
+    against every recent finding (lifecycle.find_match), whatever its status:
+    an open, acknowledged or fixing finding is refreshed, an ignored one is
+    counted and stays ignored, a resolved one is reopened.
 
     Every number written comes from the stats: error_count = lines in this
     run's window, seen_count = matching lines over every run, first_seen_at
-    and last_seen_at = the first and last line's own time."""
+    and last_seen_at = the first and last line's own time, log_streams = the
+    streams the lines are in, daily_lines = new lines per day."""
     window = window or lookback_window()
     group = str(cand["log_group"])
     literal = str(cand["literal"])
     stats = cand["stats"]
-    error_hash = error_hash_for(account_id, {"source_log_group": group, "error_pattern": literal})
-    now = datetime.now(timezone.utc).isoformat()
-    # Open findings stay as long as they keep appearing.
-    ttl_epoch = int((datetime.now(timezone.utc) + timedelta(days=7)).timestamp())
+    now_dt = now or datetime.now(timezone.utc)
+    now = now_dt.isoformat()
+    today = now_dt.strftime("%Y-%m-%d")
+    ttl_epoch = lifecycle.ttl_from(now_dt)
     samples = [dict(s) for s in stats.get("samples", [])][: attribution.MAX_SAMPLES]
+    sighting = sighting_of(account_id, cand)
+    # Chat cards name the group the lines are in.
+    cand["source_log_group"] = group
+    streams = lifecycle.streams_of(stats)
+    others = lifecycle.others_of(cand)
 
-    # Only a finding in the same log group can be the same finding: a match
-    # by id in another group would move its credit without evidence.
-    same_group = [e for e in existing if e.get("source_log_group", group) == group]
-    match = match_existing(cand, same_group, error_hash)
+    match = lifecycle.find_match(sighting, existing, now_dt)
     if match:
         new_lines = lines_since(cw_logs, group, literal, match, window)
         seen, first, last = attribution.merge_seen(match, stats, new_lines)
+        added = stats["count"] if new_lines is None else new_lines
+        hashes = fingerprint.merge_hashes(
+            sorted(fingerprint.item_hashes(match)) if not match.get("signature_hashes")
+            else match.get("signature_hashes"),
+            sighting["signature_hashes"],
+        )
+        history = lifecycle.add_history(match.get("daily_lines"), today, added)
         values = {
             ":t": now,
             ":ttl": ttl_epoch,
@@ -861,35 +933,71 @@ def store_finding(team_id, account_id, cand, existing, cw_logs=None, window=None
             ":basis": "events",
             ":samples": samples,
             ":acct": cand.get("account") or account_id,
+            ":sigs": hashes,
+            ":streams": streams,
+            ":others": others,
+            ":hist": history,
+            ":fp": sighting["fingerprint"],
+            ":sig": sighting["signature"][:300],
         }
         sets = (
             "last_seen_at = :l, first_seen_at = :f, updated_at = :t, error_count = :c, "
-            "seen_count = :seen, count_basis = :basis, samples = :samples, log_account_id = :acct"
+            "seen_count = :seen, count_basis = :basis, samples = :samples, log_account_id = :acct, "
+            "signature_hashes = :sigs, log_streams = :streams, also_in = :others, daily_lines = :hist, "
+            "fingerprint = if_not_exists(fingerprint, :fp), #sig = if_not_exists(#sig, :sig)"
         )
-        try:
-            aws_insights_table.update_item(
-                Key={"pk": team_id, "sk": match["sk"]},
-                # A finding being fixed has no TTL; seeing it again keeps it so.
-                UpdateExpression=f"SET {sets}, #ttl = :ttl",
-                ConditionExpression="attribute_not_exists(fix_ticket_id)",
-                ExpressionAttributeNames={"#ttl": "ttl"},
-                ExpressionAttributeValues=values,
+        names = {"#sig": "signature"}
+        reopened = match.get("status") == "resolved"
+        removes = ""
+        if reopened:
+            # Seen again after it was resolved: the same finding, open again.
+            values.update({
+                ":open": "pending",
+                ":was": match.get("resolved_at") or now,
+                ":one": 1,
+                ":zero": 0,
+            })
+            sets += (
+                ", #s = :open, reopened_at = :t, last_resolved_at = :was, "
+                "reopen_count = if_not_exists(reopen_count, :zero) + :one"
             )
-        except ClientError as e:
-            if e.response.get("Error", {}).get("Code") == "ConditionalCheckFailedException":
-                refresh_fixing(team_id, match["sk"], sets, values)
-            else:
+            names["#s"] = "status"
+            removes = " REMOVE resolved_at"
+        if match.get("status") == "approved":
+            # A finding with a plan has no TTL (the gateway removed it when
+            # the plan was made); seeing it again keeps it so.
+            refresh_fixing(team_id, match["sk"], sets + removes, values, names)
+        else:
+            try:
+                aws_insights_table.update_item(
+                    Key={"pk": team_id, "sk": match["sk"]},
+                    # A finding being fixed has no TTL; seeing it again keeps it so.
+                    UpdateExpression=f"SET {sets}, #ttl = :ttl{removes}",
+                    ConditionExpression="attribute_not_exists(fix_ticket_id)",
+                    ExpressionAttributeNames={**names, "#ttl": "ttl"},
+                    ExpressionAttributeValues=values,
+                )
+            except ClientError as e:
+                if e.response.get("Error", {}).get("Code") == "ConditionalCheckFailedException":
+                    refresh_fixing(team_id, match["sk"], sets + removes, values, names)
+                else:
+                    logger.warning(f"Failed to refresh {match['sk']}: {e}")
+            except Exception as e:
                 logger.warning(f"Failed to refresh {match['sk']}: {e}")
-        except Exception as e:
-            logger.warning(f"Failed to refresh {match['sk']}: {e}")
         match.update({
             "last_seen_at": values[":l"], "first_seen_at": values[":f"],
-            "seen_count": seen, "count_basis": "events",
+            "seen_count": seen, "count_basis": "events", "signature_hashes": hashes,
+            "daily_lines": history,
         })
+        if reopened:
+            match.update({"status": "pending", "reopened_at": now})
+            match.pop("resolved_at", None)
+            cand["seen_again"] = True
         return match["rec_id"], False
 
     first, last = stats.get("first"), stats.get("last")
     rec_id = ulid_now()
+    error_hash = sighting["fingerprint"] or sighting["legacy_hash"]
     item = {
         "pk": team_id,
         "sk": f"REC#{rec_id}",
@@ -902,7 +1010,15 @@ def store_finding(team_id, account_id, cand, existing, cw_logs=None, window=None
         "source_account_id": account_id,
         "log_account_id": cand.get("account") or account_id,
         "error_pattern": literal[:500],
+        # The fix ticket id is made from error_hash (Finding::fingerprint),
+        # so it is the signature fingerprint too.
         "error_hash": error_hash,
+        "fingerprint": sighting["fingerprint"],
+        "signature": sighting["signature"][:300],
+        "signature_hashes": sighting["signature_hashes"][: fingerprint.MAX_SIGNATURES],
+        "log_streams": streams,
+        "also_in": others,
+        "daily_lines": lifecycle.add_history([], today, stats["count"]),
         "created_at": now,
         "updated_at": now,
         "first_seen_at": attribution.iso(first) or now,
@@ -920,9 +1036,12 @@ def store_finding(team_id, account_id, cand, existing, cw_logs=None, window=None
         aws_insights_table.put_item(Item=item)
         emit_event(team_id, "log_finding.created", finding_event_data(rec_id, account_id, item))
         existing.append({
-            "rec_id": rec_id, "sk": f"REC#{rec_id}", "error_hash": error_hash,
+            "rec_id": rec_id, "sk": f"REC#{rec_id}", "status": "pending", "error_hash": error_hash,
+            "fingerprint": item["fingerprint"], "signature_hashes": list(item["signature_hashes"]),
+            "error_pattern": item["error_pattern"], "created_at": now,
             "source_log_group": group, "count_basis": "events", "seen_count": stats["count"],
             "first_seen_at": item["first_seen_at"], "last_seen_at": item["last_seen_at"],
+            "daily_lines": item["daily_lines"],
         })
         return rec_id, True
     except Exception as e:
@@ -930,14 +1049,16 @@ def store_finding(team_id, account_id, cand, existing, cw_logs=None, window=None
         return None, False
 
 
-def refresh_fixing(team_id, sk, sets, values):
+def refresh_fixing(team_id, sk, sets, values, names=None):
     """Refresh a finding that has a fix run, keeping it without a TTL."""
     values = {k: v for k, v in values.items() if k != ":ttl"}
+    kw = {"ExpressionAttributeNames": names} if names else {}
     try:
         aws_insights_table.update_item(
             Key={"pk": team_id, "sk": sk},
             UpdateExpression=f"SET {sets}",
             ExpressionAttributeValues=values,
+            **kw,
         )
     except Exception as e:
         logger.warning(f"Failed to refresh {sk}: {e}")
@@ -1057,6 +1178,13 @@ def pick_webhook(mode, own_url, team_url, team_enabled):
     return pick_channels(mode, own, team, team_enabled).get("teams")
 
 
+def card_title(rec):
+    """A finding's title in chat; one that came back after it was resolved
+    says so."""
+    title = str(rec.get("title", "Finding"))
+    return f"Seen again: {title}" if rec.get("seen_again") else title
+
+
 def recommendations_card(account_id, recs, dashboard_url):
     """Adaptive Card (Teams Workflows webhook) listing new findings."""
     recs = sorted(recs, key=lambda r: SEVERITY_ORDER.get(r.get("severity"), 3))
@@ -1088,7 +1216,7 @@ def recommendations_card(account_id, recs, dashboard_url):
         items = [
             {
                 "type": "TextBlock",
-                "text": f"{SEVERITY_ICON.get(sev, '⚪')} {str(r.get('title', 'Finding'))[:150]}",
+                "text": f"{SEVERITY_ICON.get(sev, '⚪')} {card_title(r)[:150]}",
                 "weight": "Bolder", "wrap": True,
             },
             {
@@ -1143,7 +1271,7 @@ def recommendations_slack(account_id, recs, dashboard_url):
     ]
     for r in recs[:5]:
         sev = r.get("severity", "info")
-        head = f"{SEVERITY_ICON.get(sev, '⚪')} *{slack_text(str(r.get('title', 'Finding'))[:150])}*"
+        head = f"{SEVERITY_ICON.get(sev, '⚪')} *{slack_text(card_title(r)[:150])}*"
         summary = slack_text(str(r.get("summary", ""))[:400])
         blocks.append({"type": "divider"})
         blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": f"{head}\n{summary}".strip()[:3000]}})

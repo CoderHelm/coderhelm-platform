@@ -138,6 +138,12 @@ pub fn finding_json(
         "console_url": region.and_then(|r| lf::console_url(r, &f.source_log_group)),
         "fix": fix_json,
         "auto": auto,
+        // Where the lines are: this group's streams and the other groups the
+        // same error was counted in, never a list of the account's groups.
+        "log_streams": f.log_streams.iter().map(|c| json!({ "log_stream": c.name, "lines": c.lines })).collect::<Vec<_>>(),
+        "also_in": f.also_in.iter().map(|c| json!({ "log_group": c.name, "lines": c.lines })).collect::<Vec<_>>(),
+        "reopened_at": (!f.reopened_at.is_empty()).then_some(&f.reopened_at),
+        "reopen_count": f.reopen_count,
     })
 }
 
@@ -860,6 +866,42 @@ mod tests {
         assert!(
             plain["fix"].is_null() && plain["console_url"].is_null() && plain["repo"].is_null()
         );
+    }
+
+    #[test]
+    fn a_row_names_its_streams_other_groups_and_reopen() {
+        let mut f = finding();
+        f.log_streams = vec![lf::Counted {
+            name: "web/web/a1".into(),
+            lines: 30,
+        }];
+        f.also_in = vec![lf::Counted {
+            name: "/aws/lambda/jobs".into(),
+            lines: 4,
+        }];
+        f.reopened_at = "2026-10-27T06:00:00+00:00".into();
+        f.reopen_count = 1;
+        let row = finding_json(&f, lf::FixState::None, None, &AutoFix::default(), None);
+        assert_eq!(
+            row["log_streams"],
+            json!([{ "log_stream": "web/web/a1", "lines": 30 }])
+        );
+        assert_eq!(
+            row["also_in"],
+            json!([{ "log_group": "/aws/lambda/jobs", "lines": 4 }])
+        );
+        assert_eq!(row["reopened_at"], "2026-10-27T06:00:00+00:00");
+        assert_eq!(row["reopen_count"], 1);
+        assert_eq!(row["status"], "new");
+        let plain = finding_json(
+            &finding(),
+            lf::FixState::None,
+            None,
+            &AutoFix::default(),
+            None,
+        );
+        assert!(plain["reopened_at"].is_null());
+        assert_eq!(plain["log_streams"], json!([]));
     }
 
     #[test]
