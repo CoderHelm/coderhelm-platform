@@ -404,7 +404,16 @@ async fn route(
     };
     d.target = team_id.clone();
     let team_id = team_id.as_str();
-    let r = dispatch(state, event_type, payload, installation_id, team_id).await;
+    let delivery_id = d.external_id.clone();
+    let r = dispatch(
+        state,
+        event_type,
+        payload,
+        installation_id,
+        team_id,
+        &delivery_id,
+    )
+    .await;
     (r, team_id.to_string())
 }
 
@@ -414,6 +423,7 @@ async fn dispatch(
     payload: &Value,
     installation_id: u64,
     team_id: &str,
+    delivery_id: &str,
 ) -> Result<StatusCode, StatusCode> {
     // People's pushback on a CoderHelm review (a reply, a PR comment, a
     // dismissal, a close over its change request) queues one judgment per PR.
@@ -422,7 +432,9 @@ async fn dispatch(
     match event_type {
         "issues" => handle_issue_event(state, payload, installation_id, team_id).await,
         "issue_comment" => handle_issue_comment(state, payload, installation_id, team_id).await,
-        "pull_request" => handle_pull_request(state, payload, installation_id, team_id).await,
+        "pull_request" => {
+            handle_pull_request(state, payload, installation_id, team_id, delivery_id).await
+        }
         "pull_request_review" => handle_pr_review(state, payload, installation_id, team_id).await,
         "pull_request_review_comment" => {
             handle_review_comment(state, payload, installation_id, team_id).await
@@ -1411,12 +1423,41 @@ async fn handle_issue_comment(
     send_to_queue(state, &state.config.ticket_queue_url, &message).await
 }
 
+/// The job key for a press of GitHub's "Re-request review": GitHub's id for
+/// this delivery (`X-GitHub-Delivery`, the same on a redelivery of the same
+/// event and new on every press) and who was requested. A second press on
+/// the same commit is a new ask with its own verdict; a redelivery is not.
+/// Without a delivery id, the moment GitHub stamped on the pull request
+/// for this request stands in for it.
+pub(crate) fn rerequest_key(delivery_id: &str, payload: &Value) -> String {
+    let reviewer = payload["requested_reviewer"]["id"]
+        .as_u64()
+        .map(|id| id.to_string())
+        .or_else(|| {
+            payload["requested_reviewer"]["login"]
+                .as_str()
+                .map(String::from)
+        })
+        .unwrap_or_default();
+    let delivery = delivery_id.trim();
+    if !delivery.is_empty() {
+        return format!("rerequest#{delivery}#{reviewer}");
+    }
+    let pr = &payload["pull_request"];
+    format!(
+        "rerequest#{}#{}#{reviewer}",
+        pr["head"]["sha"].as_str().unwrap_or(""),
+        pr["updated_at"].as_str().unwrap_or("")
+    )
+}
+
 /// Track PR merges for Coderhelm branches — updates run status to "merged".
 async fn handle_pull_request(
     state: &AppState,
     payload: &Value,
     installation_id: u64,
     team_id: &str,
+    delivery_id: &str,
 ) -> Result<StatusCode, StatusCode> {
     let action = payload["action"].as_str().unwrap_or("");
 
@@ -1452,22 +1493,10 @@ async fn handle_pull_request(
             owner,
             name, pr_number, "Reviewer: native re-request review → review job"
         );
-        // Dedup a redelivered `review_requested` by the head it targets (the
-        // payload carries it even though the worker resolves head fresh).
-        let req_head = payload["pull_request"]["head"]["sha"]
-            .as_str()
-            .filter(|s| !s.is_empty())
-            .map(|s| s.to_string())
-            .unwrap_or_else(|| format!("pr{pr_number}"));
-        record_rereview(
-            state,
-            team_id,
-            owner,
-            name,
-            pr_number,
-            &format!("rerequest#{req_head}"),
-        )
-        .await;
+        // Every press is its own ask and gets its own verdict; only a
+        // redelivery of the same event is the same job.
+        let key = rerequest_key(delivery_id, payload);
+        record_rereview(state, team_id, owner, name, pr_number, &key).await;
         let message = WorkerMessage::Review(ReviewMessage {
             team_id: team_id.to_string(),
             installation_id,
@@ -1478,7 +1507,7 @@ async fn handle_pull_request(
             label: cfg.label,
             question: None,
             trigger: "rerequest".to_string(),
-            dedup_key: format!("rerequest#{req_head}"),
+            dedup_key: key,
             reply_to_comment_id: None,
             requested_by: String::new(),
             ..Default::default()
@@ -4442,5 +4471,52 @@ mod thread_reply_tests {
         assert!(!is_quote_reply("> Is the source bucket encrypted?"));
         assert!(!is_quote_reply("No quote, just words."));
         assert!(!is_quote_reply("> ok\n\nYes."));
+    }
+}
+
+#[cfg(test)]
+mod rerequest_tests {
+    use super::rerequest_key;
+    use serde_json::json;
+
+    fn press(updated_at: &str) -> serde_json::Value {
+        json!({
+            "action": "review_requested",
+            "requested_reviewer": {"login": "coderhelm[bot]", "id": 4242, "type": "Bot"},
+            "sender": {"login": "pr-author", "id": 501},
+            "pull_request": {"number": 42, "head": {"sha": "abc123"}, "updated_at": updated_at},
+        })
+    }
+
+    #[test]
+    fn two_presses_on_the_same_commit_are_two_asks() {
+        let first = rerequest_key(
+            "6f1c0e00-0000-11f0-8000-000000000001",
+            &press("2026-10-27T10:00:00Z"),
+        );
+        let second = rerequest_key(
+            "6f1c0e00-0000-11f0-8000-000000000002",
+            &press("2026-10-27T10:05:00Z"),
+        );
+        assert_ne!(first, second, "a second press must reach the worker");
+        assert!(first.starts_with("rerequest#6f1c0e00-0000-11f0-8000-000000000001#4242"));
+    }
+
+    #[test]
+    fn a_redelivery_of_the_same_event_is_the_same_job() {
+        let p = press("2026-10-27T10:00:00Z");
+        let d = "6f1c0e00-0000-11f0-8000-000000000001";
+        assert_eq!(rerequest_key(d, &p), rerequest_key(d, &p.clone()));
+        // Surrounding whitespace in the header doesn't make a new job.
+        assert_eq!(rerequest_key(d, &p), rerequest_key(&format!(" {d} "), &p));
+    }
+
+    #[test]
+    fn without_a_delivery_id_each_request_still_has_its_own_key() {
+        let a = rerequest_key("", &press("2026-10-27T10:00:00Z"));
+        let b = rerequest_key("", &press("2026-10-27T10:05:00Z"));
+        assert_ne!(a, b);
+        assert_eq!(a, rerequest_key("", &press("2026-10-27T10:00:00Z")));
+        assert!(a.contains("abc123"));
     }
 }
