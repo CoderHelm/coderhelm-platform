@@ -36,8 +36,9 @@ pub struct GithubLink {
     pub repositories: Vec<String>,
     /// The repositories the person who linked the installation may push to
     /// on GitHub, read at link time ([`writable_repositories`]): no token is
-    /// ever wider. None only for links made before the ceiling existed
-    /// (whatever the installation grants).
+    /// ever wider. None only for links made before the ceiling existed: those
+    /// get no token until the installation is linked again
+    /// ([`BrokerRefusal::RelinkNeeded`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ceiling: Option<Vec<String>>,
 }
@@ -72,10 +73,11 @@ fn norm_repo(r: &str) -> String {
         .to_ascii_lowercase()
 }
 
-/// Whether every repository in `asked` is inside the link's ceiling.
+/// Whether every repository in `asked` is inside the link's ceiling. A link
+/// without one allows nothing.
 pub fn ceiling_allows(link: &GithubLink, asked: &[String]) -> bool {
     match &link.ceiling {
-        None => true,
+        None => false,
         Some(c) => {
             let c: Vec<String> = c.iter().map(|r| norm_repo(r)).collect();
             asked.iter().all(|r| c.contains(&norm_repo(r)))
@@ -100,6 +102,9 @@ pub const MAX_PERMISSIONS: &[(&str, &str)] = &[
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BrokerRefusal {
     NotLinked,
+    /// Linked before CoderHelm recorded which repositories the person who
+    /// linked it may push to, so there is no limit to hold a token to.
+    RelinkNeeded,
     RepositoryNotAllowed,
     PermissionNotAllowed,
     Revoked,
@@ -109,6 +114,7 @@ impl BrokerRefusal {
     pub fn code(self) -> &'static str {
         match self {
             Self::NotLinked => "broker_not_linked",
+            Self::RelinkNeeded => "broker_relink_needed",
             Self::RepositoryNotAllowed => "broker_repository_not_allowed",
             Self::PermissionNotAllowed => "broker_permission_not_allowed",
             Self::Revoked => "broker_revoked",
@@ -118,6 +124,7 @@ impl BrokerRefusal {
     pub fn message(self) -> &'static str {
         match self {
             Self::NotLinked => "That GitHub installation isn't linked to this install.",
+            Self::RelinkNeeded => "That GitHub installation was linked before CoderHelm recorded which repositories it may reach, so no token is issued for it.",
             Self::RepositoryNotAllowed => "That repository isn't one this install was given.",
             Self::PermissionNotAllowed => {
                 "A permission was asked for that CoderHelm's app doesn't grant."
@@ -128,7 +135,7 @@ impl BrokerRefusal {
 
     pub fn fix(self) -> &'static str {
         match self {
-            Self::NotLinked => "Link the installation again in Settings, System, Hybrid.",
+            Self::NotLinked | Self::RelinkNeeded => "Link the installation again in Settings, System, Hybrid.",
             Self::RepositoryNotAllowed => "Add the repository on GitHub (the app's Configure page) and to this install in Settings, System, Hybrid.",
             Self::PermissionNotAllowed => "Update CoderHelm: a newer release may ask for less.",
             Self::Revoked => "Contact CoderHelm support, or switch to your own GitHub App in Settings, System, Hybrid.",
@@ -162,7 +169,9 @@ pub fn plan_token(links: &[GithubLink], ask: &TokenAsk) -> Result<MintBody, Brok
     let norm = norm_repo;
     let chosen: Vec<String> = link.repositories.iter().map(|r| norm(r)).collect();
     let allowed: Vec<String> = match &link.ceiling {
-        None => chosen,
+        // Never wider than what the linker could push to: without that
+        // limit, no token.
+        None => return Err(BrokerRefusal::RelinkNeeded),
         Some(c) => {
             let c: Vec<String> = c.iter().map(|r| norm(r)).take(MAX_CEILING).collect();
             if c.is_empty() {
@@ -292,13 +301,13 @@ mod tests {
                 installation_id: 11,
                 account: "example-org".into(),
                 repositories: vec!["web".into(), "api".into()],
-                ceiling: None,
+                ceiling: Some(vec!["web".into(), "api".into(), "docs".into()]),
             },
             GithubLink {
                 installation_id: 22,
                 account: "example-user".into(),
                 repositories: vec![],
-                ceiling: None,
+                ceiling: Some(vec!["x".into(), "y".into()]),
             },
         ]
     }
@@ -341,6 +350,36 @@ mod tests {
             plan_token(&[none], &ask(&[])),
             Err(BrokerRefusal::RepositoryNotAllowed)
         );
+    }
+
+    /// A link made before the ceiling existed gets no token and no new
+    /// repository list: the install is asked to link it again.
+    #[test]
+    fn a_link_without_a_ceiling_must_be_made_again() {
+        let old = GithubLink {
+            installation_id: 55,
+            account: "example-org".into(),
+            repositories: vec![],
+            ceiling: None,
+        };
+        let ask = TokenAsk {
+            installation_id: 55,
+            ..Default::default()
+        };
+        assert_eq!(
+            plan_token(std::slice::from_ref(&old), &ask),
+            Err(BrokerRefusal::RelinkNeeded)
+        );
+        let mut chosen = old.clone();
+        chosen.repositories = vec!["web".into()];
+        assert_eq!(
+            plan_token(&[chosen], &ask),
+            Err(BrokerRefusal::RelinkNeeded)
+        );
+        assert!(!ceiling_allows(&old, &[]));
+        assert!(!ceiling_allows(&old, &["web".into()]));
+        let r = BrokerRefusal::RelinkNeeded;
+        assert!(r.message().ends_with('.') && r.fix().contains("Link the installation again"));
     }
 
     #[test]
@@ -401,7 +440,7 @@ mod tests {
             plan_token(&links(), &other),
             Err(BrokerRefusal::RepositoryNotAllowed)
         );
-        // A link with no list: whatever the installation grants on GitHub.
+        // A link with no list: anything inside its ceiling.
         let any = plan_token(
             &links(),
             &TokenAsk {

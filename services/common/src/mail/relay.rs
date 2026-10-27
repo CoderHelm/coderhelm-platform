@@ -10,8 +10,9 @@
 //! - the request id is new (kept for [`REPLAY_TTL_SECS`]);
 //! - the recipient is on the install's list (members, admins and pending
 //!   invites the install registered, [`Recipients`]) and not suppressed;
-//! - the install is within its per-minute rate and daily quota, and email
-//!   isn't paused for it (bounces or complaints, [`should_pause`]).
+//! - the install is within its per-minute rate and daily quota (lower while
+//!   it is new, [`day_quota`]), and email isn't paused for it (bounces or
+//!   complaints, [`should_pause`]).
 //!
 //! The hosted side keeps a salted hash of each listed address, never the
 //! address, except admins' addresses sealed with KMS so the relay can tell
@@ -26,6 +27,10 @@ use sha2::{Digest, Sha256};
 pub const PER_MINUTE: u64 = 30;
 /// Sends per install per UTC day.
 pub const PER_DAY: u64 = 500;
+/// Sends per UTC day while an install is new ([`day_quota`]).
+pub const NEW_INSTALL_PER_DAY: u64 = 100;
+/// How long an install counts as new, from when it proved its address.
+pub const NEW_INSTALL_DAYS: i64 = 14;
 /// New addresses an install may list per UTC day.
 pub const NEW_RECIPIENTS_PER_DAY: u64 = 50;
 /// The first listing (turning the relay on) may bring the install's
@@ -289,13 +294,23 @@ pub fn may_send(to: &str, listing: &Listing, paused: bool) -> Result<(), Refusal
     Ok(())
 }
 
+/// Whether a listing request is the first listing: the admin who turns the
+/// relay on lists themself (and the install's people, up to
+/// [`BOOTSTRAP_RECIPIENTS`]).
+pub fn bootstrap_request(req: &RecipientsRequest) -> bool {
+    req.add
+        .iter()
+        .any(|r| r.kind == RecipientKind::Admin && normalize(&r.email) == normalize(&req.by))
+}
+
 /// May this listing request change the list? `by_kind` is what `by` is on
-/// the list now; `admins_listed` whether the list has any admin yet.
+/// the list now; `bootstrap_spent` whether the install ever had its first
+/// listing (kept for good: removing every admin never opens it again).
 /// `new_today` is how many addresses were added today before this request.
 pub fn may_list(
     req: &RecipientsRequest,
     by_kind: Option<RecipientKind>,
-    admins_listed: bool,
+    bootstrap_spent: bool,
     new_today: u64,
 ) -> Result<(), Refusal> {
     if req.add.len() + req.remove.len() > MAX_PER_REQUEST || !valid_address(&req.by) {
@@ -310,12 +325,8 @@ pub fn may_list(
         }
     }
     let by_is_admin = by_kind == Some(RecipientKind::Admin);
-    // The first listing: the admin who turns the relay on lists themself.
-    let bootstrap = !admins_listed
-        && req
-            .add
-            .iter()
-            .any(|r| r.kind == RecipientKind::Admin && normalize(&r.email) == normalize(&req.by));
+    // The first listing, once per install ever.
+    let bootstrap = !bootstrap_spent && bootstrap_request(req);
     if !by_is_admin && !bootstrap {
         return Err(Refusal::NotAdmin);
     }
@@ -328,6 +339,16 @@ pub fn may_list(
         return Err(Refusal::TooManyNew);
     }
     Ok(())
+}
+
+/// The daily quota for an install that proved its address at `verified_at`
+/// (epoch seconds): [`NEW_INSTALL_PER_DAY`] for its first
+/// [`NEW_INSTALL_DAYS`], then [`PER_DAY`]. Unknown counts as new.
+pub fn day_quota(verified_at: Option<i64>, now: i64) -> u64 {
+    match verified_at {
+        Some(at) if now - at >= NEW_INSTALL_DAYS * 86_400 => PER_DAY,
+        _ => NEW_INSTALL_PER_DAY,
+    }
 }
 
 /// The day's send counters for one install.
@@ -473,7 +494,7 @@ pub struct CustomDomain {
 
 /// A hostname an install may ask the relay to link to: lowercase labels, a
 /// real top-level domain, not an AWS address, not CoderHelm's own zone, not
-/// an IP address.
+/// an IP address, and nothing that reads as CoderHelm ([`reads_as_coderhelm`]).
 pub fn custom_domain_ok(host: &str) -> bool {
     let h = host.trim().trim_end_matches('.').to_ascii_lowercase();
     if h.len() < 4 || h.len() > 253 || !h.contains('.') {
@@ -491,7 +512,37 @@ pub fn custom_domain_ok(host: &str) -> bool {
     let tld_ok = tld.len() >= 2 && tld.chars().all(|c| c.is_ascii_lowercase());
     let not_ours = !(h == "coderhelm.com" || h.ends_with(".coderhelm.com"));
     let not_aws = !(h.ends_with(".cloudfront.net") || h.ends_with(".amazonaws.com"));
-    labels_ok && tld_ok && not_ours && not_aws
+    labels_ok && tld_ok && not_ours && not_aws && !reads_as_coderhelm(&h)
+}
+
+/// Whether a domain could pass for CoderHelm's own in a link: a label that
+/// reads "coderhelm" with look-alike characters (`c0derhe1m`, `coder-helm`),
+/// or a domain label that is a CoderHelm look-alike word
+/// ([`crate::hybrid::names::looks_like_coderhelm`]: `support`, `login`,
+/// `billing`, ...). The first label of a longer name is the organization's
+/// own choice on its own domain: it may use any word, and may be exactly
+/// `coderhelm` (`coderhelm.example.com`, the name the docs suggest), but no
+/// look-alike spelling of it. The top-level domain is only checked for the
+/// name itself (`.app` is a real one).
+pub fn reads_as_coderhelm(host: &str) -> bool {
+    let labels: Vec<&str> = host.split('.').collect();
+    let names_it = |l: &str| {
+        unconfuse(l).iter().any(|plain| {
+            let plain = plain.replace('-', "");
+            plain.contains("coderhelm") || plain.contains("coderheim")
+        })
+    };
+    labels.iter().enumerate().any(|(i, l)| {
+        let own_first = i == 0 && labels.len() >= 3;
+        let tld = i + 1 == labels.len();
+        if own_first {
+            *l != "coderhelm" && names_it(l)
+        } else if tld {
+            names_it(l)
+        } else {
+            names_it(l) || crate::hybrid::names::looks_like_coderhelm(l)
+        }
+    })
 }
 
 /// The hosts a relayed email's links may point at: the install's verified
@@ -674,9 +725,12 @@ mod tests {
             &[("admin@acme.test", Admin), ("dev@acme.test", Member)],
         );
         assert_eq!(may_list(&first, None, false, 0), Ok(()));
-        // Not a bootstrap once an admin is listed: `by` must be that admin.
+        assert!(bootstrap_request(&first));
+        // Not a bootstrap once the install had one (even if every admin was
+        // removed since): `by` must be a listed admin.
         assert_eq!(may_list(&first, None, true, 0), Err(Refusal::NotAdmin));
         let invite = req("dev@acme.test", &[("new@acme.test", Invite)]);
+        assert!(!bootstrap_request(&invite));
         assert_eq!(
             may_list(&invite, Some(Member), true, 0),
             Err(Refusal::NotAdmin)
@@ -692,6 +746,21 @@ mod tests {
         assert_eq!(
             may_list(&ch, Some(Admin), true, 0),
             Err(Refusal::CoderhelmAddress)
+        );
+    }
+
+    #[test]
+    fn a_new_install_starts_with_a_lower_daily_quota() {
+        let now = 1_800_000_000;
+        assert_eq!(day_quota(None, now), NEW_INSTALL_PER_DAY);
+        assert_eq!(day_quota(Some(now - 3600), now), NEW_INSTALL_PER_DAY);
+        assert_eq!(
+            day_quota(Some(now - NEW_INSTALL_DAYS * 86_400 + 1), now),
+            NEW_INSTALL_PER_DAY
+        );
+        assert_eq!(
+            day_quota(Some(now - NEW_INSTALL_DAYS * 86_400), now),
+            PER_DAY
         );
     }
 
@@ -908,6 +977,37 @@ mod tests {
             "",
         ] {
             assert!(!custom_domain_ok(bad), "{bad}");
+        }
+    }
+
+    #[test]
+    fn a_custom_domain_that_reads_as_coderhelm_is_refused() {
+        for bad in [
+            "coderhelm.io",
+            "c0derhe1m.net",
+            "coder-helm.org",
+            "coderhelm-security.com",
+            "mycoderhe1m.dev",
+            "login.c0derhelm.app",
+            "coderhelm.coderhe1m.com",
+            "c0derhelm.example.com",
+            "example-support.com",
+            "app.billing.example.com",
+            "acme.login.example.com",
+            "x.coderhelm.org",
+        ] {
+            assert!(!custom_domain_ok(bad), "{bad}");
+        }
+        // An organization's own name on its own domain, the docs' suggestion
+        // included.
+        for good in [
+            "coderhelm.example.com",
+            "app.example.com",
+            "support.example.co.uk",
+            "helm.example.app",
+            "ci.eng.example.org",
+        ] {
+            assert!(custom_domain_ok(good), "{good}");
         }
     }
 

@@ -56,6 +56,29 @@ pub fn install_client() -> &'static reqwest::Client {
     })
 }
 
+/// A client for requests to a name an install chose itself (its own
+/// domain), which could point anywhere: the name is resolved first, every
+/// address it answers with must be public (no private, loopback,
+/// link-local, metadata or unique-local address, IPv4-mapped ones
+/// included; the outbound webhook sender's rule), and the connection goes
+/// to the checked address only, so a second lookup can't move it. No
+/// redirects, no proxy.
+pub async fn pinned_client(
+    dns: &dyn crate::webhooks::deliver::Resolve,
+    host: &str,
+    port: u16,
+) -> Result<reqwest::Client, String> {
+    let addrs = dns.lookup(host, port).await?;
+    let addr = crate::webhooks::deliver::pick_address(&addrs)?;
+    reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .user_agent("coderhelm-relay")
+        .resolve(host, addr)
+        .no_proxy()
+        .build()
+        .map_err(|e| e.to_string())
+}
+
 /// How much of an install's answer is ever read (the rest is dropped).
 pub const MAX_ANSWER_BYTES: usize = 16 * 1024;
 
@@ -192,6 +215,51 @@ pub fn apply(d: &mut Delivery, a: Attempt) -> Next {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct FakeDns(Vec<&'static str>);
+
+    #[async_trait::async_trait]
+    impl crate::webhooks::deliver::Resolve for FakeDns {
+        async fn lookup(
+            &self,
+            _host: &str,
+            port: u16,
+        ) -> Result<Vec<std::net::SocketAddr>, String> {
+            Ok(self
+                .0
+                .iter()
+                .map(|ip| std::net::SocketAddr::new(ip.parse().unwrap(), port))
+                .collect())
+        }
+    }
+
+    /// An install's own domain is fetched only when every address it
+    /// resolves to is public.
+    #[tokio::test]
+    async fn a_domain_proof_never_reaches_inside_a_network() {
+        for inside in [
+            vec!["10.0.0.5"],
+            vec!["127.0.0.1"],
+            vec!["169.254.169.254"],
+            vec!["fd00:ec2::254"],
+            vec!["::ffff:10.0.0.1"],
+            vec!["fe80::1"],
+            vec!["93.184.216.34", "192.168.1.1"],
+            vec![],
+        ] {
+            assert!(
+                pinned_client(&FakeDns(inside.clone()), "helm.example.org", 443)
+                    .await
+                    .is_err(),
+                "{inside:?}"
+            );
+        }
+        assert!(
+            pinned_client(&FakeDns(vec!["93.184.216.34"]), "helm.example.org", 443)
+                .await
+                .is_ok()
+        );
+    }
     use crate::deliveries::Direction;
 
     fn att(code: Option<u16>) -> Attempt {

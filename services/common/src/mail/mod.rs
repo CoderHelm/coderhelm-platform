@@ -803,7 +803,7 @@ mod adversarial {
         // Every subject is fixed, and every email says whose install sent it.
         let (t, v) = check("test_email", &Map::new(), &hosts(), true).unwrap();
         let r = templates::render(t, &v, "acme.coderhelm.com", None);
-        assert_eq!(r.subject, "CoderHelm test email");
+        assert_eq!(r.subject, "Test email from your install");
         assert!(r
             .text
             .contains("self-hosted CoderHelm install at acme.coderhelm.com"));

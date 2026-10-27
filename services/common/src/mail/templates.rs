@@ -83,7 +83,9 @@ pub enum Part {
 #[derive(Debug, Clone, Copy)]
 pub struct Template {
     pub id: &'static str,
-    /// The whole subject. Never filled from a parameter.
+    /// The whole subject. Never filled from a parameter, and for what an
+    /// install may send, never naming CoderHelm: the mail comes from someone
+    /// else's install, so its subject must not read as CoderHelm's own.
     pub subject: &'static str,
     pub params: &'static [Param],
     pub body: &'static [Part],
@@ -105,7 +107,7 @@ pub const UPDATE_WHAT: &[&str] = &[
 pub const TEMPLATES: &[Template] = &[
     Template {
         id: "test_email",
-        subject: "CoderHelm test email",
+        subject: "Test email from your install",
         params: &[],
         body: &[Part::Para(
             "Email from your CoderHelm install works. Run results, invites and update notices will arrive like this one.",
@@ -114,7 +116,7 @@ pub const TEMPLATES: &[Template] = &[
     },
     Template {
         id: "team_invite",
-        subject: "You're invited to a CoderHelm workspace",
+        subject: "You're invited to your team's workspace",
         params: &[
             p("team", Kind::Line(80)),
             p("inviter", Kind::Line(80)),
@@ -129,7 +131,7 @@ pub const TEMPLATES: &[Template] = &[
     },
     Template {
         id: "welcome",
-        subject: "Welcome to CoderHelm",
+        subject: "Your account is ready",
         params: &[p("link", Kind::Link)],
         body: &[
             Part::Para("Your account is ready. Connect a repository and CoderHelm starts on your next ticket."),
@@ -222,7 +224,7 @@ pub const TEMPLATES: &[Template] = &[
     },
     Template {
         id: "update_notice",
-        subject: "Your CoderHelm install has an update notice",
+        subject: "Your install has an update notice",
         params: &[
             p("what", Kind::OneOf(UPDATE_WHAT)),
             optional("version", Kind::Version),
@@ -236,7 +238,7 @@ pub const TEMPLATES: &[Template] = &[
     },
     Template {
         id: "weekly_summary",
-        subject: "Your CoderHelm weekly summary",
+        subject: "Your weekly summary",
         params: &[
             p("team", Kind::Line(80)),
             p("period", Kind::Line(40)),
@@ -258,7 +260,7 @@ pub const TEMPLATES: &[Template] = &[
     },
     Template {
         id: "webhook_disabled",
-        subject: "CoderHelm turned off a webhook endpoint",
+        subject: "A webhook endpoint was turned off",
         // No endpoint URL or host: the address can carry a secret, and
         // the relay never needs it.
         params: &[p("days", Kind::Number), p("link", Kind::Link)],
@@ -793,6 +795,21 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn what_an_install_sends_has_a_subject_that_never_names_coderhelm() {
+        for t in TEMPLATES.iter().filter(|t| t.install_may_send) {
+            let plain = t.subject.to_ascii_lowercase().replace([' ', '-'], "");
+            assert!(
+                !plain.contains("coderhelm") && !uses_reserved_wording(t.subject),
+                "{}: {}",
+                t.id,
+                t.subject
+            );
+        }
+        // The relay's own notice is CoderHelm speaking, and says so.
+        assert!(get("relay_paused").unwrap().subject.contains("CoderHelm"));
     }
 
     #[test]

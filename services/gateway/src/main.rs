@@ -1226,49 +1226,6 @@ async fn main() -> Result<(), Error> {
         .route("/relay", post(routes::hybrid_install::intake))
         .route("/relay/proof", get(routes::hybrid_install::proof));
 
-    // The hosted side of hybrid: what self-hosted installs call, signed with
-    // their registration secret (404 everywhere else; routes::hybrid).
-    let hybrid_routes = Router::new()
-        .route(
-            "/installs",
-            post(routes::hybrid::register).delete(routes::hybrid::unregister),
-        )
-        .route("/installs/verify", post(routes::hybrid::verify))
-        .route("/status", get(routes::hybrid::status))
-        // CoderHelm's mail relay: templates only, listed recipients
-        // (routes::hybrid_email).
-        .route("/email", post(routes::hybrid_email::send))
-        .route("/email/recipients", post(routes::hybrid_email::recipients))
-        .route("/email/domain", post(routes::hybrid_email::domain))
-        .route("/email/status", get(routes::hybrid_email::status))
-        .route("/settings", put(routes::hybrid::settings))
-        .route(
-            "/names",
-            put(routes::hybrid::claim_name).delete(routes::hybrid::delete_name),
-        )
-        .route("/names/records", put(routes::hybrid::put_records))
-        .route("/names/:name", get(routes::hybrid::name_available))
-        .route("/fallback", get(routes::hybrid::fallback))
-        .route("/github/link-start", post(routes::hybrid::link_start))
-        .route("/github/setup", get(routes::hybrid::github_setup))
-        .route("/github/confirm", post(routes::hybrid::github_confirm))
-        .route(
-            "/github/links/:installation_id",
-            put(routes::hybrid::set_link_repos).delete(routes::hybrid::delete_link),
-        )
-        .route("/github/token", post(routes::hybrid::github_token))
-        .route("/deliveries", get(routes::hybrid::list_deliveries))
-        .route("/deliveries/shared", post(routes::hybrid::share))
-        .route("/deliveries/rollups", post(routes::hybrid::rollups))
-        .route("/deliveries/:id/redeliver", post(routes::hybrid::redeliver))
-        .route(
-            "/oauth/:kind/authorize",
-            get(routes::hybrid::oauth_authorize),
-        )
-        .route("/oauth/callback", post(routes::hybrid::oauth_callback))
-        .route("/oauth/token", post(routes::hybrid::oauth_token))
-        .route("/oauth/revoke", post(routes::hybrid::oauth_revoke));
-
     // Auth routes (public, rate-limited)
     let auth_routes = Router::new()
         .route("/signup", post(routes::auth::signup))
@@ -1383,7 +1340,7 @@ async fn main() -> Result<(), Error> {
         )
         .route("/api/brain/stream", post(routes::brain::brain_stream))
         .nest("/webhooks", webhook_routes)
-        .nest("/hybrid", hybrid_routes)
+        .nest("/hybrid", hybrid_routes())
         .route(
             "/integrations/jira/forge-register",
             post(routes::api::forge_register_urls),
@@ -1425,5 +1382,181 @@ async fn main() -> Result<(), Error> {
         Ok(())
     } else {
         run(app).await
+    }
+}
+
+/// The hosted side of hybrid: what self-hosted installs call, signed with
+/// their registration secret (404 everywhere else; routes::hybrid).
+/// Signatures cover the full path (`/hybrid/...`), so the handlers read it
+/// with `OriginalUri` (routes::hybrid::signed).
+fn hybrid_routes() -> Router<Arc<AppState>> {
+    Router::new()
+        .route(
+            "/installs",
+            post(routes::hybrid::register).delete(routes::hybrid::unregister),
+        )
+        .route("/installs/verify", post(routes::hybrid::verify))
+        .route("/status", get(routes::hybrid::status))
+        // CoderHelm's mail relay: templates only, listed recipients
+        // (routes::hybrid_email).
+        .route("/email", post(routes::hybrid_email::send))
+        .route("/email/recipients", post(routes::hybrid_email::recipients))
+        .route("/email/domain", post(routes::hybrid_email::domain))
+        .route("/email/status", get(routes::hybrid_email::status))
+        .route("/settings", put(routes::hybrid::settings))
+        .route(
+            "/names",
+            put(routes::hybrid::claim_name).delete(routes::hybrid::delete_name),
+        )
+        .route("/names/records", put(routes::hybrid::put_records))
+        .route("/names/:name", get(routes::hybrid::name_available))
+        .route("/fallback", get(routes::hybrid::fallback))
+        .route("/github/link-start", post(routes::hybrid::link_start))
+        .route("/github/setup", get(routes::hybrid::github_setup))
+        .route("/github/confirm", post(routes::hybrid::github_confirm))
+        .route(
+            "/github/links/:installation_id",
+            put(routes::hybrid::set_link_repos).delete(routes::hybrid::delete_link),
+        )
+        .route("/github/token", post(routes::hybrid::github_token))
+        .route("/deliveries", get(routes::hybrid::list_deliveries))
+        .route("/deliveries/shared", post(routes::hybrid::share))
+        .route("/deliveries/rollups", post(routes::hybrid::rollups))
+        .route("/deliveries/:id/redeliver", post(routes::hybrid::redeliver))
+        .route(
+            "/oauth/:kind/authorize",
+            get(routes::hybrid::oauth_authorize),
+        )
+        .route("/oauth/callback", post(routes::hybrid::oauth_callback))
+        .route("/oauth/token", post(routes::hybrid::oauth_token))
+        .route("/oauth/revoke", post(routes::hybrid::oauth_revoke))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use common::hybrid::sign;
+    use tower::ServiceExt;
+
+    const MASTER: &str = "a-hosted-master-key-of-32-or-more-chars";
+
+    /// A hosted-side state whose AWS clients have no credentials: a request
+    /// that passes the signature check stops at the first store read.
+    pub(crate) fn hosted_state() -> Arc<AppState> {
+        let aws = aws_config::SdkConfig::builder()
+            .behavior_version(aws_config::BehaviorVersion::latest())
+            .region(aws_config::Region::new("us-east-1"))
+            .build();
+        let secrets: models::Secrets = serde_json::from_value(serde_json::json!({
+            "jwt_secret": "test",
+            "hybrid_master_key": MASTER,
+        }))
+        .unwrap();
+        Arc::new(AppState {
+            dynamo: aws_sdk_dynamodb::Client::new(&aws),
+            sqs: aws_sdk_sqs::Client::new(&aws),
+            ses: aws_sdk_sesv2::Client::new(&aws),
+            s3: aws_sdk_s3::Client::new(&aws),
+            cognito: aws_sdk_cognitoidentityprovider::Client::new(&aws),
+            lambda: aws_sdk_lambda::Client::new(&aws),
+            kms: aws_sdk_kms::Client::new(&aws),
+            sts: aws_sdk_sts::Client::new(&aws),
+            bedrock: aws_sdk_bedrockruntime::Client::new(&aws),
+            scheduler: common::plugins::schedule::aws_sdk_scheduler::Client::new(&aws),
+            http: reqwest::Client::new(),
+            secrets,
+            config: models::Config {
+                settings_table_name: "settings".into(),
+                ..Default::default()
+            },
+            cognito_client_secret: String::new(),
+        })
+    }
+
+    /// A request signed exactly as `common::hybrid::client::call` signs it,
+    /// sent to `sent_to`.
+    fn install_request(
+        method: &str,
+        signed_path: &str,
+        sent_to: &str,
+        body: &[u8],
+    ) -> Request<Body> {
+        let id = sign::new_install_id();
+        let secret = sign::install_secret(MASTER, &id);
+        let ts = chrono::Utc::now().timestamp();
+        let sig = sign::sign_request(&secret, ts, method, signed_path, body);
+        Request::builder()
+            .method(method)
+            .uri(sent_to)
+            .header(sign::INSTALL_HEADER, id)
+            .header(sign::TIMESTAMP_HEADER, ts.to_string())
+            .header(sign::SIGNATURE_HEADER, sig)
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_vec()))
+            .unwrap()
+    }
+
+    async fn code_of(res: axum::response::Response) -> (StatusCode, String) {
+        let status = res.status();
+        let bytes = axum::body::to_bytes(res.into_body(), 1 << 16)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap_or_default();
+        (status, v["code"].as_str().unwrap_or("").to_string())
+    }
+
+    /// The hybrid router as main() mounts it: an install's signature over
+    /// the full `/hybrid/...` path is accepted, and one over any other path
+    /// is refused.
+    #[tokio::test]
+    async fn the_hosted_side_accepts_what_an_install_signs() {
+        let app = Router::new()
+            .nest("/hybrid", hybrid_routes())
+            .with_state(hosted_state());
+        let body = br#"{"request_id":"01JABCDEFGHJKMNPQRSTVWXYZ0","to":"a@example.com","template":"test_email"}"#;
+        for (method, path, b) in [
+            ("POST", "/hybrid/email", &body[..]),
+            ("GET", "/hybrid/status", &b""[..]),
+            (
+                "POST",
+                "/hybrid/github/token",
+                &br#"{"installation_id":1}"#[..],
+            ),
+            (
+                "PUT",
+                "/hybrid/github/links/42",
+                &br#"{"repositories":[]}"#[..],
+            ),
+        ] {
+            let res = app
+                .clone()
+                .oneshot(install_request(method, path, path, b))
+                .await
+                .unwrap();
+            // Past the signature: the install lookup is the first store read.
+            assert_eq!(
+                code_of(res).await,
+                (StatusCode::SERVICE_UNAVAILABLE, "store_unavailable".into()),
+                "{method} {path}"
+            );
+        }
+        // Signed for one route, sent to another; or signed without the prefix.
+        for (signed_path, sent_to) in [
+            ("/hybrid/email/status", "/hybrid/email"),
+            ("/email", "/hybrid/email"),
+        ] {
+            let res = app
+                .clone()
+                .oneshot(install_request("POST", signed_path, sent_to, body))
+                .await
+                .unwrap();
+            assert_eq!(
+                code_of(res).await,
+                (StatusCode::UNAUTHORIZED, "signature_mismatch".into()),
+                "signed {signed_path}, sent to {sent_to}"
+            );
+        }
     }
 }
