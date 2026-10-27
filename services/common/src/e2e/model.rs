@@ -420,6 +420,10 @@ pub struct Settings {
     /// Days a test stays quarantined before its owner gets a ticket.
     #[serde(default = "default_ticket_after_days")]
     pub ticket_after_days: u32,
+    /// Where each repository's test reports are kept, and the address its
+    /// tests run against (see [`super::report_source`]).
+    #[serde(default)]
+    pub report_sources: Vec<super::report_source::ReportSource>,
 }
 
 fn default_tickets() -> String {
@@ -445,6 +449,7 @@ impl Default for Settings {
             burn_in: false,
             repos: Vec::new(),
             ticket_after_days: DEFAULT_TICKET_AFTER_DAYS,
+            report_sources: Vec::new(),
         }
     }
 }
@@ -455,8 +460,22 @@ impl Settings {
             && (self.repos.is_empty() || self.repos.iter().any(|r| r.eq_ignore_ascii_case(repo)))
     }
 
+    /// Where `repo`'s test reports are kept, when the team said.
+    pub fn report_source(&self, repo: &str) -> Option<&super::report_source::ReportSource> {
+        self.report_sources
+            .iter()
+            .find(|s| s.repo.eq_ignore_ascii_case(repo) && !s.location.trim().is_empty())
+    }
+
     /// Why a requested change can't be saved, if it can't.
     pub fn validate(&self) -> Result<(), String> {
+        for s in self
+            .report_sources
+            .iter()
+            .filter(|s| !s.location.trim().is_empty())
+        {
+            s.validate()?;
+        }
         if !TICKET_AFTER_DAYS_RANGE.contains(&self.ticket_after_days) {
             return Err(format!(
                 "Pick between {} and {} days before a ticket is filed.",
@@ -481,6 +500,7 @@ impl Settings {
             r.split('/').count() == 2 && !r.starts_with('/') && !r.ends_with('/') && r.len() <= 200
         });
         self.repos.truncate(200);
+        self.report_sources = super::report_source::sanitize(self.report_sources);
         self
     }
 }
@@ -645,5 +665,33 @@ mod tests {
         };
         assert!(s.validate().is_ok());
         assert_eq!(s.sanitized().ticket_after_days, 7);
+    }
+
+    #[test]
+    fn report_sources_are_validated_kept_and_found_per_repo() {
+        use super::super::report_source::ReportSource;
+        let old: Settings = serde_json::from_str(r#"{"enabled":true}"#).unwrap();
+        assert!(old.report_sources.is_empty());
+        let s = Settings {
+            report_sources: vec![ReportSource {
+                repo: "acme/web".into(),
+                location: "s3://reports/{run_id}/{attempt}/".into(),
+                target_url: "https://staging.example.com".into(),
+            }],
+            ..Default::default()
+        };
+        assert!(s.validate().is_ok());
+        assert!(s.report_source("Acme/Web").is_some());
+        assert!(s.report_source("acme/api").is_none());
+        let bad = Settings {
+            report_sources: vec![ReportSource {
+                repo: "acme/web".into(),
+                location: "s3://reports/latest/".into(),
+                target_url: String::new(),
+            }],
+            ..Default::default()
+        };
+        assert!(bad.validate().unwrap_err().contains("{run_id}"));
+        assert!(bad.sanitized().report_sources.is_empty());
     }
 }

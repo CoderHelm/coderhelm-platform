@@ -228,6 +228,13 @@ pub struct OpsTools {
     /// Each lookup and how it ended, for the check that runs before a pull
     /// request opens and for the review's findings.
     evidence: std::sync::Mutex<Vec<Lookup>>,
+    /// The repository's test reports, when the team said where they are.
+    reports: Option<super::test_fix::ReportTools>,
+}
+
+/// The test report tools' names.
+fn is_report_tool(name: &str) -> bool {
+    matches!(name, "test_report" | "test_pass_counts")
 }
 
 /// The system a lookup asked, as the run's evidence groups lookups: one
@@ -491,7 +498,8 @@ impl OpsTools {
                 }
             }
         }
-        if loaded.is_empty() && roles.is_empty() {
+        let reports = super::test_fix::ReportTools::load(state, team_id, repo).await;
+        if loaded.is_empty() && roles.is_empty() && reports.is_none() {
             return None;
         }
         info!(
@@ -513,6 +521,7 @@ impl OpsTools {
             calls: AtomicUsize::new(0),
             writes: AtomicUsize::new(0),
             evidence: Default::default(),
+            reports,
         })
     }
 
@@ -659,6 +668,9 @@ impl OpsTools {
                 json!({ "type": "object", "properties": { "environment": env } }),
             ));
         }
+        if let Some(r) = &self.reports {
+            out.extend(r.tools());
+        }
         out
     }
 
@@ -678,6 +690,9 @@ impl OpsTools {
         if !self.aws.airflow.is_empty() {
             s.push_str(&format!("- {}\n", describe_airflow(&self.aws)));
         }
+        if let Some(r) = &self.reports {
+            s.push_str(&r.prompt_line());
+        }
         s.push_str(&format!(
             "At most {MAX_CALLS_PER_RUN} lookups across these.\n"
         ));
@@ -688,6 +703,7 @@ impl OpsTools {
     pub async fn handle(&self, state: &WorkerState, name: &str, input: &Value) -> Option<String> {
         let kind = match name {
             "aws_identity" => None,
+            n if is_report_tool(n) => None,
             n if n.starts_with("newrelic_") => Some(ConnKind::NewRelic),
             n if n.starts_with("confluence_") => Some(ConnKind::Confluence),
             n if n.starts_with("metrics_") => Some(ConnKind::Metrics),
@@ -711,6 +727,9 @@ impl OpsTools {
         };
         let (source_id, source_name) = match kind {
             Some(k) => (k.activity_id(), k.label().to_string()),
+            None if is_report_tool(name) => {
+                ("test-reports".to_string(), "Test reports".to_string())
+            }
             None => ("connector-aws".to_string(), "AWS identity".to_string()),
         };
         let logged = store::log_activity_in(
@@ -738,7 +757,11 @@ impl OpsTools {
                     .into(),
             );
         }
-        let source = lookup_source(kind, input);
+        let source = if is_report_tool(name) {
+            "Test reports".to_string()
+        } else {
+            lookup_source(kind, input)
+        };
         Some(match outcome {
             Ok((text, _, empty)) => {
                 let ended = if empty {
@@ -808,6 +831,11 @@ impl OpsTools {
         name: &str,
         input: &Value,
     ) -> Result<(String, String, bool), StepError> {
+        if is_report_tool(name) {
+            if let Some(r) = &self.reports {
+                return r.run(state, &self.team_id, name, input).await;
+            }
+        }
         let now = chrono::Utc::now().timestamp();
         let actor = format!("{}-pr{}", self.actor, self.pr);
         let pretty = |v: &Value| serde_json::to_string_pretty(v).unwrap_or_default();
@@ -1239,7 +1267,29 @@ mod tests {
             calls: AtomicUsize::new(0),
             writes: AtomicUsize::new(0),
             evidence: Default::default(),
+            reports: None,
         }
+    }
+
+    #[test]
+    fn a_repo_with_a_report_location_offers_the_report_tools() {
+        let mut o = ops(vec![]);
+        assert!(!o.tools().iter().any(|t| t.name == "test_report"));
+        o.reports = Some(super::super::test_fix::ReportTools {
+            source: common::e2e::report_source::ReportSource {
+                repo: "o/r".into(),
+                location: "s3://reports/{run_id}/{attempt}/".into(),
+                target_url: String::new(),
+            },
+            installation_id: None,
+        });
+        let names: Vec<String> = o.tools().into_iter().map(|t| t.name).collect();
+        assert!(names.contains(&"test_report".to_string()));
+        assert!(names.contains(&"test_pass_counts".to_string()));
+        assert!(o
+            .prompt_section()
+            .contains("s3://reports/{run_id}/{attempt}/"));
+        assert!(is_report_tool("test_report") && !is_report_tool("metrics_query"));
     }
 
     fn checked_account(id: &str, metrics: bool, envs: &[&str]) -> AwsAccount {

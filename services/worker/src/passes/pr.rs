@@ -39,6 +39,9 @@ pub struct Proof<'a> {
     /// The live link and redirect checks' section (see `link_checks`),
     /// empty when the change has no redirects or links.
     pub links: &'a str,
+    /// For a failing- or flaky-test fix: the failure, the counts and the
+    /// checks (see `test_fix`).
+    pub test_fix: Option<&'a super::test_fix::PrFacts>,
 }
 
 /// What the writer is told about the checks CI runs on the PR: never a
@@ -263,7 +266,12 @@ pub async fn run(
         String::new()
     };
 
-    let instructions = if pr_template.is_some() {
+    // A small failing-test fix is described in four sections (see
+    // `test_fix::writer_block`), unless the repository has a template.
+    let small_test_fix = pr_template.is_none() && proof.test_fix.is_some_and(|t| t.small);
+    let instructions = if small_test_fix {
+        "Follow the four sections given under Failing-test evidence above."
+    } else if pr_template.is_some() {
         "Follow the PR template above. Fill in every section with relevant content from this change. Remove any placeholder/instruction text."
     } else {
         "Write a PR description following this structure, and nothing else:\n\n\
@@ -273,10 +281,14 @@ pub async fn run(
          4. **Verification** — Numbered steps to verify the change."
     };
     let evidence_block = format!(
-        "{}{}{}",
+        "{}{}{}{}",
         evidence_instructions(proof.evidence),
         manual_instructions(proof.manual),
-        ci_instructions(proof.ci)
+        ci_instructions(proof.ci),
+        proof
+            .test_fix
+            .map(super::test_fix::writer_block)
+            .unwrap_or_default()
     );
 
     let diff_patches = format_diff_patches(&diff);
@@ -468,6 +480,12 @@ Return ONLY the markdown body text."#,
 
     // A Verification step never asks a person to run what CI runs on the PR.
     let body_text = ci_verification(&body_text, proof.ci);
+    // A failing-test fix quotes the real error; a small one stays four
+    // sections.
+    let body_text = match proof.test_fix {
+        Some(t) => super::test_fix::shape_body(body_text, t),
+        None => body_text,
+    };
 
     // Add issue link for GitHub tickets.
     // Strip any "Closes #N" the model may have included to avoid duplication.
@@ -651,6 +669,12 @@ Return ONLY the markdown body text."#,
         }
         (number, url, nid)
     };
+
+    // A failing-test fix leaves draft only when its checks and repeat run
+    // pass on its head (see `test_fix::ready_gate`).
+    if let Some(t) = proof.test_fix {
+        super::test_fix::register_pr(state, msg, run_id, pr_number, t).await;
+    }
 
     // Label CoderHelm's own PR at creation — this is the PR MAKER, so it owns the
     // PR's labels. Two things get added here, only when the reviewer is enabled for
@@ -1336,15 +1360,25 @@ fn is_lockfile(path: &str) -> bool {
 /// merge order is added once every PR of a multi-repo run exists
 /// ([`link_siblings`]).
 fn owned_sections(plan: &PlanResult, proof: &Proof<'_>, repo: &str) -> super::completeness::Owned {
+    let small_test_fix = proof.test_fix.is_some_and(|t| t.small);
     super::completeness::Owned {
         links: proof.links.to_string(),
         mirrors: super::completeness::mirrors_section(proof.mirrors),
         merge_order: String::new(),
         not_in_pr: super::completeness::for_people_section(
             &super::fix_location::not_in_pr_steps(plan.fix.as_ref(), repo),
-            plan.fix.as_ref().map_or(&[][..], |d| &d.questions),
+            if small_test_fix {
+                &[][..]
+            } else {
+                plan.fix.as_ref().map_or(&[][..], |d| &d.questions)
+            },
         ),
-        open_items: proof.gaps.to_string(),
+        // A small failing-test fix carries no open items or questions.
+        open_items: if small_test_fix {
+            String::new()
+        } else {
+            proof.gaps.to_string()
+        },
     }
 }
 
@@ -1878,6 +1912,7 @@ mod refresh_tests {
             mirrors: &mirrors,
             log: None,
             links: "",
+            test_fix: None,
         };
         let owned = super::owned_sections(&plan, &proof, "acme/infra");
         let body = assemble(

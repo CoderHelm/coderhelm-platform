@@ -761,6 +761,7 @@ pub mod syntax_check;
 pub(crate) mod terraform;
 #[allow(dead_code)]
 mod test;
+pub mod test_fix;
 pub mod ticket_history;
 pub mod tool_proposals;
 mod triage;
@@ -1616,6 +1617,13 @@ async fn run_passes(
         add_progress_note(state, &msg.team_id, run_id, &log_evidence::summary_note(ev)).await;
         msg.team_instructions = log_evidence::with_instructions(&msg.team_instructions, ev);
     }
+    // --- Evidence: a ticket about a failing or flaky test (the model reads
+    // it) gets the failing run's report read now, while it is still kept,
+    // and its pass counts; every agent gets them with the rules ---
+    let test_ev = test_fix::for_run(state, msg, &github, &provider, usage, run_id).await;
+    if let Some(ev) = test_ev.as_ref() {
+        msg.team_instructions = test_fix::with_instructions(&msg.team_instructions, ev);
+    }
 
     // --- Pass 2: Plan ---
     check_cancelled(state, &msg.team_id, run_id).await?;
@@ -1788,6 +1796,9 @@ async fn run_passes(
                 if let Some(ev) = log_ev.as_ref() {
                     msg.team_instructions =
                         log_evidence::with_instructions(&msg.team_instructions, ev);
+                }
+                if let Some(ev) = test_ev.as_ref() {
+                    msg.team_instructions = test_fix::with_instructions(&msg.team_instructions, ev);
                 }
                 close_memory(state, agent_memory.take()).await;
                 agent_memory =
@@ -3198,6 +3209,10 @@ async fn run_passes(
                     repo_msg.team_instructions =
                         log_evidence::with_instructions(&repo_msg.team_instructions, ev);
                 }
+                if let Some(ev) = test_ev.as_ref() {
+                    repo_msg.team_instructions =
+                        test_fix::with_instructions(&repo_msg.team_instructions, ev);
+                }
 
                 match run_repo_pipeline(
                     state,
@@ -3898,6 +3913,13 @@ async fn run_passes(
     })
     .await
     .map_err(|why| format!("Link and redirect check blocked the pull request: {why}"))?;
+    // A failing- or flaky-test fix: no waits without evidence, no helper
+    // that walks every row, test packages checked where they live.
+    let test_pr = test_fix::gate(&work, &mut evidence, usage, || {
+        has_time_for_remediation(start)
+    })
+    .await
+    .map_err(|why| format!("The failing-test rules blocked the pull request: {why}"))?;
 
     // --- Create Draft PR (triggers CI) ---
     check_cancelled(state, &msg.team_id, run_id).await?;
@@ -3939,6 +3961,7 @@ async fn run_passes(
             mirrors: &completeness::parse_mirrors(&evidence.notes),
             log: log_ev.as_ref(),
             links: &links,
+            test_fix: test_pr.as_ref(),
         },
         &provider,
         usage,
@@ -4429,6 +4452,13 @@ async fn run_repo_pipeline(
     })
     .await
     .map_err(|why| format!("Link and redirect check blocked the pull request: {why}"))?;
+    // A failing- or flaky-test fix: no waits without evidence, no helper
+    // that walks every row, test packages checked where they live.
+    let test_pr = test_fix::gate(&work, &mut evidence, usage, || {
+        has_time_for_remediation(start)
+    })
+    .await
+    .map_err(|why| format!("The failing-test rules blocked the pull request: {why}"))?;
 
     // --- Create Draft PR ---
     check_cancelled(state, &msg.team_id, run_id).await?;
@@ -4473,6 +4503,7 @@ async fn run_repo_pipeline(
             mirrors: &completeness::parse_mirrors(&evidence.notes),
             log: repo_ev.as_ref(),
             links: &links,
+            test_fix: test_pr.as_ref(),
         },
         provider,
         usage,

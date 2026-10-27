@@ -213,7 +213,7 @@ const MAX_HTML_PART: u64 = 50 * 1024 * 1024;
 /// The zip of results Playwright embeds in its HTML report, as a
 /// `data:application/zip;base64,` URL (in a script variable in older versions,
 /// a `<template>` element in newer ones).
-fn html_report_zip(bytes: &[u8]) -> Option<Vec<u8>> {
+pub fn html_report_zip(bytes: &[u8]) -> Option<Vec<u8>> {
     use base64::{engine::general_purpose::STANDARD, Engine};
     let text = std::str::from_utf8(bytes).ok()?;
     const MARK: &str = "data:application/zip;base64,";

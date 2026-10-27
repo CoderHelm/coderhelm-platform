@@ -671,6 +671,21 @@ async fn mark_pr_ready(
         info!(pr_number = msg.pr_number, converted_by = %who, "PR was put back into draft by a person — not marking ready");
         return Ok(());
     }
+    // A failing-test fix stays a draft until the checks that test it are
+    // green on its head and a repeat run passed (this message also brings
+    // the check back while it waits).
+    if let passes::test_fix::Hold::Wait(_) = passes::test_fix::ready_gate(
+        state,
+        &github,
+        &msg.team_id,
+        &msg.repo_owner,
+        &msg.repo_name,
+        msg.pr_number,
+    )
+    .await
+    {
+        return Ok(());
+    }
     let node_id = pr
         .get("node_id")
         .and_then(|v| v.as_str())
