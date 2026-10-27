@@ -1236,9 +1236,30 @@ async fn log_jira_event(
     if let Some(r) = repo {
         put = put.item("repo", attr_s(r));
     }
+    // Counted by the Deliveries overview as it is written.
+    put = put.item(
+        common::deliveries_rollup::ROLLED,
+        aws_sdk_dynamodb::types::AttributeValue::N("1".into()),
+    );
 
     if let Err(e) = put.send().await {
         error!("Failed to log Jira event: {e}");
+        return;
+    }
+    let logged = serde_json::json!({
+        "event_id": event_id,
+        "event_type": event_type,
+        "ticket_key": ticket_key,
+        "status": status,
+        "created_at": now,
+        "repo": repo.unwrap_or(""),
+    });
+    if let Some(d) = super::deliveries::jira_to_delivery(&logged) {
+        let store = common::deliveries_rollup::Dynamo {
+            client: &state.dynamo,
+            table: &state.config.settings_table_name,
+        };
+        common::deliveries_rollup::apply(&store, team_id, None, &d).await;
     }
 }
 

@@ -16,6 +16,7 @@ pub mod chat_policy;
 pub mod connectors;
 pub mod data_sources;
 pub mod deliveries;
+pub mod deliveries_analytics;
 pub mod dlq;
 pub mod email;
 pub mod github;

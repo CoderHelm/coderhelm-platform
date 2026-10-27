@@ -606,10 +606,11 @@ pub const CAPABILITIES: &[Capability] = &[
     },
     Capability {
         key: "deliveries",
-        label: "See every event in and out (webhooks, relay forwards, notifications, email) and send failed ones again",
+        label: "See every event in and out (webhooks, relay forwards, notifications, email), how they went over time, and send failed ones again",
         min_role: "admin",
         handlers: &[
             "deliveries::list",
+            "deliveries_analytics::analytics",
             "deliveries::get",
             "deliveries::redeliver",
         ],
