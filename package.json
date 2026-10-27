@@ -6,6 +6,6 @@
   "bin": {
     "coderhelm-selfhost": "installer/bin/coderhelm.mjs"
   },
-  "files": ["installer/bin", "installer/lib", "installer/package.json"],
+  "files": ["installer/bin", "installer/lib", "installer/package.json", "selfhost/maintainers.json"],
   "engines": { "node": ">=20" }
 }

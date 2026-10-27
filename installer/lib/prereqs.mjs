@@ -1,5 +1,6 @@
 // What must be on the machine before an install: Node 20+, the AWS CLI v2
-// with credentials for the target account, and tar. Docker and Rust are not
+// with credentials for the target account, tar, and git with ssh-keygen (to
+// check the release's signed tag, lib/source-tag.mjs). Docker and Rust are not
 // needed (the release ships built Lambda code).
 
 /** Every missing prerequisite, as messages; empty when all are there. */
@@ -27,5 +28,9 @@ export async function checkPrereqs(runner, { account, nodeVersion = process.vers
 
   const tar = await runner.run("tar", ["--version"], { capture: true, allowFail: true, dryRunAnswer: "tar" }).catch(() => null);
   if (!tar || tar.code !== 0) problems.push("tar is needed to unpack the release.");
+  const git = await runner.run("git", ["--version"], { capture: true, allowFail: true, dryRunAnswer: "git version 2.43.0" }).catch(() => null);
+  if (!git || git.code !== 0) problems.push("git 2.34 or newer is needed to check the release's signed tag: https://git-scm.com/downloads");
+  const keygen = await runner.run("ssh-keygen", ["-Y", "check-novalidate", "-n", "git", "-s", "/dev/null"], { capture: true, allowFail: true, input: "", dryRunAnswer: "" }).catch(() => null);
+  if (!keygen || keygen.code === 127) problems.push("ssh-keygen (OpenSSH 8.2 or newer) is needed to check the release's signed tag.");
   return { problems, identity };
 }

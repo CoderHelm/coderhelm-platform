@@ -39,9 +39,13 @@ Actions (the `action` field of the event):
 The build itself (CodeBuild, infra/lib/updates-stack.ts) runs
 `coderhelm-selfhost update`: health check, checksum and signature check,
 deploy, health check, and a rollback when the new version is unhealthy.
-The build checks the release itself (signature made by exactly this
-repository's release.yml on the version's tag), so the release list read
-here only decides what to offer, never what is trusted. It is still checked:
+The build checks the release itself (infra/lib/release-verify.ts: the tag
+is an annotated tag signed with a maintainer key pinned in the running
+release's selfhost/maintainers.json, on a commit on main; the signature was
+made by exactly this repository's release.yml on that tag, from that same
+commit), so the release list read here only decides what to offer, never
+what is trusted. The release check build (models_verified) runs the same
+checks first, so a release that fails them stays held and is never applied. The release list is still checked:
 it must come from api.github.com for CoderHelm/coderhelm-platform, and a list
 that no longer shows the newest version seen before is reported as stale in
 status (a stale copy can't quietly hold an install back).

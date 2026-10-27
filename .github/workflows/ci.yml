@@ -41,6 +41,10 @@ jobs:
           echo "${ACTIONLINT_SHA256}  $RUNNER_TEMP/al.tgz" | sha256sum -c -
           tar -xzf "$RUNNER_TEMP/al.tgz" -C "$RUNNER_TEMP" actionlint
           "$RUNNER_TEMP/actionlint" -color
+      # A signed release ships the dashboard commit reviewed here: a full SHA,
+      # never a branch (selfhost/versions.json, scripts/bump-dashboard.sh).
+      - name: The dashboard is pinned by commit
+        run: node scripts/check-dashboard-ref.mjs
 
   rust:
     name: Rust (workspace)

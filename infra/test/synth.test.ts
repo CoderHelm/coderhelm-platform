@@ -17,7 +17,7 @@ import { buildApp } from "../lib/app";
 import { CoderhelmConfig, loadConfigFile, resolveConfig, ResolvedConfig } from "../lib/config";
 import { API_PATHS, STREAM_PATH, runtimeConfigScript } from "../lib/web-stack";
 import { releaseCheckBuildSpec, updateBuildSpec } from "../lib/updates-stack";
-import { CHECK_VERSION, COSIGN_LINUX_AMD64_SHA256, VERIFY_SUMS } from "../lib/release-verify";
+import { CHECK_VERSION, COSIGN_LINUX_AMD64_SHA256, VERIFY_SUMS, verifyTagCommands } from "../lib/release-verify";
 
 const INFRA = path.join(__dirname, "..", "..");
 
@@ -262,6 +262,9 @@ test("updates: on by default for self-host, with a least-privilege build role; o
   assert.ok(verifyAt >= 0, "exact identity: release.yml on refs/tags/$VERSION");
   assert.ok(commands.indexOf(CHECK_VERSION) >= 0 && commands.indexOf(CHECK_VERSION) < verifyAt, "VERSION must be a release tag first");
   assert.ok(verifyAt < commands.findIndex((c) => c.startsWith("npm install")), "verified before the installer is installed");
+  const tagAt = commands.indexOf(verifyTagCommands()[0]);
+  assert.ok(tagAt > 0 && tagAt < verifyAt, "the tag (maintainer key, on main) is checked before the signature");
+  for (const line of verifyTagCommands()) assert.ok(commands.includes(line), line);
   assert.doesNotMatch(commands.join("\n"), /identity-regexp|insecure-ignore|ignore-tlog/);
   assert.ok(commands.some((c) => c.includes(COSIGN_LINUX_AMD64_SHA256)), "cosign pinned by its hash");
   assert.ok(commands.includes("npm install -g --ignore-scripts ./coderhelm-selfhost.tgz"));
@@ -337,7 +340,9 @@ test("AWS connections: the role and update templates are released with each vers
     assert.ok(wf.includes(`cp infra/cfn/${f} dist/${f}`), `${f} is built into the release`);
     assert.ok(wf.includes(`dist/${f}`) && wf.includes(f + " "), `${f} is in SHA256SUMS`);
   }
-  assert.ok(wf.includes('k="launch/$TAG/$f"'), "published under launch/<tag>/, which the publisher role may write");
+  assert.ok(wf.includes('k="launch/$TAG/${pair#*:}"'), "published under launch/<tag>/, which the publisher role may write");
+  for (const f of ["coderhelm-log-reader.yaml", "coderhelm-log-reader-update.yaml"]) assert.ok(wf.includes(`${f}:${f}`), `${f} is uploaded`);
+  assert.ok(wf.includes("launch-stack.yaml:coderhelm-launch.yaml"));
   const role = fs.readFileSync(path.join(INFRA, "cfn", "coderhelm-log-reader.yaml"), "utf8");
   assert.ok(role.includes('"sts:ExternalId": !Ref ExternalId'));
   assert.ok(role.includes('"aws:PrincipalArn": !Sub "arn:aws:iam::${CoderHelmAccountId}:role/${TrustedRolePrefix}*"'));
@@ -438,32 +443,57 @@ test("the manifest landing: self-host only, may write only this install's secret
   });
 });
 
-test("the release publisher: only the platform repo's approved release environment, only launch/* in the public bucket", () => {
+test("the release roles: only release.yml on a v* tag in the approved release environment; templates never replaced; latest.json alone", () => {
   const cfg = loadConfigFile(path.join(INFRA, "config", "hosted.prod.json"), { CDK_DEFAULT_ACCOUNT: "654654210434" });
   const t = synth(cfg, zoneContext("654654210434", "us-east-1", "coderhelm.com"));
   const w = t["coderhelm-prod-worker"];
-  const role = Object.values(w.findResources("AWS::IAM::Role", { Properties: { RoleName: "coderhelm-prod-release-publisher" } }))[0] as any;
-  assert.ok(role, "the role exists on hosted");
-  assert.equal(role.Properties.MaxSessionDuration, 3600);
-  const [st] = role.Properties.AssumeRolePolicyDocument.Statement;
-  assert.equal(st.Action, "sts:AssumeRoleWithWebIdentity");
-  assert.deepEqual(st.Condition, {
+  const policies = Object.values(w.findResources("AWS::IAM::Policy")) as any[];
+  const trust = {
     StringEquals: {
       "token.actions.githubusercontent.com:aud": "sts.amazonaws.com",
-      // Only a job in the release environment, which needs a reviewer's approval.
+      // A job in the release environment, which needs a reviewer's approval...
       "token.actions.githubusercontent.com:sub": "repo:CoderHelm/coderhelm-platform:environment:release",
     },
-  });
-  const policies = Object.values(w.findResources("AWS::IAM::Policy")) as any[];
-  const mine = policies.filter((p) => JSON.stringify(p.Properties.Roles).includes("ReleasePublisherRole"));
-  assert.equal(mine.length, 1);
-  assert.deepEqual(mine[0].Properties.PolicyDocument.Statement, [
-    { Action: "s3:PutObject", Effect: "Allow", Resource: "arn:aws:s3:::coderhelm-public/launch/*" },
+    StringLike: {
+      // ...that is release.yml itself, run on a v* tag: another workflow naming the environment gets nothing.
+      "token.actions.githubusercontent.com:job_workflow_ref": "CoderHelm/coderhelm-platform/.github/workflows/release.yml@refs/tags/v*",
+      "token.actions.githubusercontent.com:ref": "refs/tags/v*",
+    },
+  };
+  const statementsOf = (roleName: string, logicalPrefix: string) => {
+    const role = Object.values(w.findResources("AWS::IAM::Role", { Properties: { RoleName: roleName } }))[0] as any;
+    assert.ok(role, `${roleName} exists on hosted`);
+    assert.equal(role.Properties.MaxSessionDuration, 3600);
+    const [st] = role.Properties.AssumeRolePolicyDocument.Statement;
+    assert.equal(st.Action, "sts:AssumeRoleWithWebIdentity");
+    assert.deepEqual(st.Condition, trust);
+    const mine = policies.filter((p) => JSON.stringify(p.Properties.Roles).includes(logicalPrefix));
+    assert.equal(mine.length, 1);
+    return mine[0].Properties.PolicyDocument.Statement;
+  };
+  assert.deepEqual(statementsOf("coderhelm-prod-release-publisher", "ReleasePublisherRole"), [
+    {
+      Action: "s3:PutObject", Effect: "Allow", Resource: "arn:aws:s3:::coderhelm-public/launch/v*/*",
+      Condition: { Null: { "s3:if-none-match": "false" } },
+    },
+  ]);
+  assert.deepEqual(statementsOf("coderhelm-prod-release-latest", "ReleaseLatestRole"), [
+    { Action: "s3:PutObject", Effect: "Allow", Resource: "arn:aws:s3:::coderhelm-public/launch/latest.json", Condition: { Null: { "s3:if-none-match": "false" } } },
+    { Action: "s3:PutObject", Effect: "Allow", Resource: "arn:aws:s3:::coderhelm-public/launch/latest.json", Condition: { Null: { "s3:if-match": "false" } } },
   ]);
   w.hasOutput("ReleasePublisherRoleArn", {});
+  w.hasOutput("ReleaseLatestRoleArn", {});
+  // The workflow writes templates only with If-None-Match, and latest.json only with the second role.
+  const wf = fs.readFileSync(path.join(INFRA, "..", ".github", "workflows", "release.yml"), "utf8");
+  const puts = wf.split("\n").filter((l) => /s3api put-object|aws s3 cp/.test(l));
+  assert.ok(puts.length >= 3);
+  for (const l of puts) assert.match(l, /--if-none-match '\*'|--if-match "\$etag"/, l);
+  assert.ok(!/aws s3 cp/.test(wf), "no unconditional writes");
+  assert.ok(wf.indexOf("role/coderhelm-prod-release-latest") > wf.indexOf("role/coderhelm-prod-release-publisher"));
   // Self-host installs have no publisher.
   const sh = synth(selfHost());
   assert.ok(!json(sh["coderhelm-prod-worker"]).includes("release-publisher"));
+  assert.ok(!json(sh["coderhelm-prod-worker"]).includes("release-latest"));
 });
 
 // ── Your own domain (docs/self-host/domains.md) ────────────────────────────
@@ -637,6 +667,7 @@ test("the release check reads models.json only after the signature check, and ca
   const verifyAt = commands.indexOf(VERIFY_SUMS);
   assert.ok(verifyAt > 0, "the same exact signature check as the update build");
   assert.ok(commands.indexOf(CHECK_VERSION) < verifyAt);
+  for (const line of verifyTagCommands()) assert.ok(commands.indexOf(line) > 0 && commands.indexOf(line) < verifyAt, line);
   const readAt = commands.findIndex((c) => c.includes("models.json"));
   assert.ok(readAt > verifyAt, "models.json only after the signature check");
   assert.ok(commands[readAt].includes("grep ' models.json$' SHA256SUMS | sha256sum -c -"), "and only when its checksum matches");

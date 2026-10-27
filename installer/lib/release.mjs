@@ -10,12 +10,14 @@
 //   SHA256SUMS.sigstore.json    cosign's keyless signature of SHA256SUMS,
 //                               made by this repository's release workflow
 //
-// Nothing from a release is used until it checks out: every file against
-// SHA256SUMS, and SHA256SUMS against its signature, which must have been made
-// by exactly this repository's release.yml, on the release's own tag, with
-// a GitHub Actions certificate logged in Rekor (cosign), or else every file
-// against its GitHub build attestation from that same workflow and tag (gh).
-// No cosign and no gh, no bundle, or any mismatch: the release is refused.
+// Nothing from a release is used until it checks out: its tag must be an
+// annotated tag signed with a maintainer key pinned in selfhost/maintainers.json,
+// on a commit on main (lib/source-tag.mjs); every file must match SHA256SUMS;
+// and SHA256SUMS must carry a signature made by exactly this repository's
+// release.yml, on the release's own tag, from that same commit, with a GitHub
+// Actions certificate logged in Rekor (cosign), or else every file must carry
+// a GitHub build attestation from that same workflow, tag and commit (gh).
+// No git, no cosign and no gh, no bundle, or any mismatch: the release is refused.
 // There is no switch that skips this; deploy from a checkout (--source) to
 // run code that isn't a signed release.
 import fs from "node:fs";
@@ -23,6 +25,7 @@ import path from "node:path";
 import os from "node:os";
 import { REPO, sha256File } from "./util.mjs";
 import { checkBundleIdentity } from "./sigstore.mjs";
+import { verifySourceTag } from "./source-tag.mjs";
 
 export const ASSETS = ["gateway.zip", "worker.zip", "mcp-proxy.zip", "dashboard.tar.gz", "source.tar.gz"];
 
@@ -122,8 +125,8 @@ export async function fetchRelease(tag, { runner, fetchImpl = fetch, log = conso
   if (fs.existsSync(done)) {
     const sums = parseSums(fs.readFileSync(path.join(dir, "SHA256SUMS"), "utf8"));
     verifySums(dir, sums);
-    const method = await verifySignature(paths, runner, { tag, log });
-    paths.models = await releaseModels(dir, sums, { runner, fetchImpl, tag, method, log });
+    const { method, commit } = await verifySignature(paths, runner, { tag, log });
+    paths.models = await releaseModels(dir, sums, { runner, fetchImpl, tag, method, commit, log });
     return paths;
   }
   fs.rmSync(dir, { recursive: true, force: true });
@@ -135,8 +138,8 @@ export async function fetchRelease(tag, { runner, fetchImpl = fetch, log = conso
   // Checked before anything is unpacked or run.
   const sums = parseSums(fs.readFileSync(path.join(dir, "SHA256SUMS"), "utf8"));
   verifySums(dir, sums);
-  const method = await verifySignature(paths, runner, { tag, log });
-  paths.models = await releaseModels(dir, sums, { runner, fetchImpl, tag, method, log });
+  const { method, commit } = await verifySignature(paths, runner, { tag, log });
+  paths.models = await releaseModels(dir, sums, { runner, fetchImpl, tag, method, commit, log });
   fs.mkdirSync(paths.source, { recursive: true });
   fs.mkdirSync(paths.dashboard, { recursive: true });
   await runner.run("tar", ["-xzf", path.join(dir, "source.tar.gz"), "-C", paths.source, "--strip-components=1"]);
@@ -155,7 +158,7 @@ export const MODELS = "models.json";
  * attestation too). null for a signed release that lists none (releases
  * from before model manifests). Throws on any mismatch.
  */
-export async function releaseModels(dir, sums, { runner, fetchImpl = fetch, tag, method, log = console.log }) {
+export async function releaseModels(dir, sums, { runner, fetchImpl = fetch, tag, method, commit, log = console.log }) {
   if (!method) throw new Error("The release's signature wasn't checked: not reading its model list.");
   if (!sums[MODELS]) return null;
   const file = path.join(dir, MODELS);
@@ -165,7 +168,7 @@ export async function releaseModels(dir, sums, { runner, fetchImpl = fetch, tag,
   }
   verifySums(dir, sums, [MODELS]);
   if (method === "attestation") {
-    const r = await runner.run("gh", attestationArgs(tag, file), { capture: true, allowFail: true });
+    const r = await runner.run("gh", attestationArgs(tag, file, commit), { capture: true, allowFail: true });
     if (r.code !== 0) throw new Error(`${MODELS} has no valid build attestation from ${SIGNER_WORKFLOW} on ${tag}: not using it.`);
   }
   let m;
@@ -201,25 +204,32 @@ export function signerIdentity(tag) {
   return `https://github.com/${SIGNER_WORKFLOW}@refs/tags/${checkTag(tag)}`;
 }
 
-/** cosign's arguments: the exact identity, issuer, repository and ref (and Rekor, which cosign requires by default). */
-export function cosignArgs(tag, bundle, file) {
+const checkCommit = (commit) => {
+  if (!/^[0-9a-f]{40}$/.test(String(commit))) throw new Error("no source commit to check the release against");
+  return commit;
+};
+
+/** cosign's arguments: the exact identity, issuer, repository, ref and commit (and Rekor, which cosign requires by default). */
+export function cosignArgs(tag, bundle, file, commit) {
   return [
     "verify-blob", "--bundle", bundle,
     "--certificate-identity", signerIdentity(tag),
     "--certificate-oidc-issuer", SIGNER_ISSUER,
     "--certificate-github-workflow-repository", REPO,
     "--certificate-github-workflow-ref", `refs/tags/${tag}`,
+    "--certificate-github-workflow-sha", checkCommit(commit),
     file,
   ];
 }
 
-/** gh's arguments: the attestation must come from release.yml in this repository, on the tag, on GitHub's runners. */
-export function attestationArgs(tag, file) {
+/** gh's arguments: the attestation must come from release.yml in this repository, on the tag and commit, on GitHub's runners. */
+export function attestationArgs(tag, file, commit) {
   return [
     "attestation", "verify", file,
     "--repo", REPO,
     "--signer-workflow", SIGNER_WORKFLOW,
     "--source-ref", `refs/tags/${checkTag(tag)}`,
+    "--source-digest", checkCommit(commit),
     "--cert-oidc-issuer", SIGNER_ISSUER,
     "--deny-self-hosted-runners",
   ];
@@ -232,40 +242,49 @@ const has = async (runner, cmd, args) => {
 
 /**
  * Checks that the release was built and signed by this repository's release
- * workflow on `tag`: the signature bundle's certificate must name exactly
- * that workflow and tag, then SHA256SUMS is checked against it with cosign,
- * or every asset against its GitHub attestation with gh. Throws on any
- * mismatch, a missing bundle, or when neither tool is installed; returns
- * how it was verified. (`require` is accepted for older callers: it is
- * always required now.)
+ * workflow on `tag`, from the commit a maintainer signed: the tag itself is
+ * checked first (signed with a pinned maintainer key, on main), then the
+ * signature bundle's certificate must name exactly that workflow, tag and
+ * commit, then SHA256SUMS is checked against it with cosign, or every asset
+ * against its GitHub attestation with gh. Throws on any mismatch, a missing
+ * bundle, or when a needed tool is missing; returns how it was verified
+ * ({method: "cosign" | "attestation", commit}).
+ * (`require` is accepted for older callers: it is always required now.)
  */
-export async function verifySignature(paths, runner, { tag, log = console.log } = {}) {
+export async function verifySignature(paths, runner, { tag, log = console.log, remote } = {}) {
   checkTag(tag);
   const sigFile = path.join(paths.dir, SIGNATURE);
   if (!fs.existsSync(sigFile)) throw new Error(`The release has no signature (${SIGNATURE}): not installing it.`);
+  let commit;
+  try {
+    commit = await verifySourceTag(tag, { runner, log, ...(remote ? { remote } : {}) });
+  } catch (e) {
+    throw new Error(`The release's tag doesn't check out: ${e.message}. Not installing it.`);
+  }
   try {
     checkBundleIdentity(fs.readFileSync(sigFile, "utf8"), {
       identity: signerIdentity(tag),
       issuer: SIGNER_ISSUER,
       repositoryUri: `https://github.com/${REPO}`,
       ref: `refs/tags/${tag}`,
+      commit,
     });
   } catch (e) {
     throw new Error(`The release's signature is not CoderHelm's release workflow for ${tag}: ${e.message}. Not installing it.`);
   }
   if (await has(runner, "cosign", ["version"])) {
-    const r = await runner.run("cosign", cosignArgs(tag, sigFile, path.join(paths.dir, "SHA256SUMS")), { capture: true, allowFail: true });
+    const r = await runner.run("cosign", cosignArgs(tag, sigFile, path.join(paths.dir, "SHA256SUMS"), commit), { capture: true, allowFail: true });
     if (r.code !== 0) throw new Error(`The release's signature does not verify: not installing it.${r.stderr ? `\n${r.stderr.trim()}` : ""}`);
     log(`  signature verified (cosign: ${SIGNER_WORKFLOW} on ${tag}, in the Rekor log)`);
-    return "cosign";
+    return { method: "cosign", commit };
   }
   if (await has(runner, "gh", ["--version"])) {
     for (const n of ASSETS) {
-      const r = await runner.run("gh", attestationArgs(tag, path.join(paths.dir, n)), { capture: true, allowFail: true });
+      const r = await runner.run("gh", attestationArgs(tag, path.join(paths.dir, n), commit), { capture: true, allowFail: true });
       if (r.code !== 0) throw new Error(`${n} has no valid build attestation from ${SIGNER_WORKFLOW} on ${tag}: not installing it.`);
     }
     log(`  provenance verified (gh: built by ${SIGNER_WORKFLOW} on ${tag})`);
-    return "attestation";
+    return { method: "attestation", commit };
   }
   throw new Error("Can't check the release's signature: install cosign (https://docs.sigstore.dev/cosign/system_config/installation/) or the GitHub CLI (gh), then run this again. Nothing was installed.");
 }
