@@ -2628,12 +2628,21 @@ async fn run_passes(
                 let pass_start = std::time::Instant::now();
                 let usage_before = usage.clone();
 
+                // A fix round on an open PR: checkpoints go to its own WIP
+                // branch, and the PR gets one commit (one push) at the end.
+                let fix_base =
+                    round::branch_head(&github, &msg.repo_owner, &msg.repo_name, &branch_name)
+                        .await;
+                let fix_wip =
+                    round::open_wip(&github, &msg.repo_owner, &msg.repo_name, &branch_name, "")
+                        .await?;
+
                 match implement::run(
                     state,
                     msg,
                     &github,
                     &plan_result,
-                    &branch_name,
+                    &fix_wip,
                     &[],
                     "",
                     Some(&feedback),
@@ -2642,14 +2651,51 @@ async fn run_passes(
                     usage,
                     &file_cache,
                     Some(run_id),
-                    None,
+                    implement_deadline,
                     // Scoped only when purely CI-driven; human review comments
                     // in the feedback mean the human's ask wins (unscoped).
                     !has_review_feedback,
                 )
                 .await
-                {
+                .and_then(|r| {
+                    // Partial work never reaches the PR: it stays on the WIP
+                    // branch, and the run starts over below.
+                    if r.timed_out {
+                        Err(format!("ran out of time; its work is kept on `{fix_wip}`").into())
+                    } else {
+                        Ok(r)
+                    }
+                }) {
                     Ok(result) => {
+                        let landed = round::land(
+                            &round::Pr {
+                                github: &github,
+                                owner: &msg.repo_owner,
+                                repo: &msg.repo_name,
+                                branch: &branch_name,
+                            },
+                            &fix_wip,
+                            &fix_base,
+                            &conventions.commit_message(
+                                &tokens,
+                                "Fix the pull request's checks and review comments",
+                            ),
+                        )
+                        .await;
+                        if let round::Landed::Refused(why) = &landed {
+                            warn!(
+                                run_id,
+                                why,
+                                "Fix on re-run didn't land; its work is kept on the WIP branch"
+                            );
+                            add_progress_note(
+                                state,
+                                &msg.team_id,
+                                run_id,
+                                &format!("The fix for PR #{pr_number} didn't land ({why}); its work is kept on `{fix_wip}`"),
+                            )
+                            .await;
+                        }
                         write_pass_trace(
                             state,
                             &msg.team_id,

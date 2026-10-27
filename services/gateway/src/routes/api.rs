@@ -6070,7 +6070,7 @@ mod tests {
             cache_write: 0,
             cost_usd: 0.0,
         };
-        let run = serde_json::to_value(run_of(&item, "r1", usage)).unwrap();
+        let run = serde_json::to_value(run_of(&item, "r1", usage, &Default::default())).unwrap();
         let r = &run["round_incomplete"];
         assert_eq!(run["status"], "completed");
         assert_eq!(r["kind"], "review_fix");
@@ -6092,7 +6092,8 @@ mod tests {
             cost_usd: 0.0,
         };
         assert!(
-            serde_json::to_value(run_of(&plain, "r2", usage)).unwrap()["round_incomplete"]
+            serde_json::to_value(run_of(&plain, "r2", usage, &Default::default())).unwrap()
+                ["round_incomplete"]
                 .is_null()
         );
     }
@@ -6174,7 +6175,7 @@ mod tests {
             cache_write: 0,
             cost_usd: 0.0,
         };
-        let run = serde_json::to_value(run_of(&item, "r", usage)).unwrap();
+        let run = serde_json::to_value(run_of(&item, "r", usage, &Default::default())).unwrap();
         assert_eq!(
             run["codegen_env_missing"]["vars"][0],
             "SANITY_STUDIO_PROJECT_ID"
