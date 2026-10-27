@@ -51,6 +51,8 @@ pub struct Entry {
     pub parent: String,
     /// Properties as text (database rows).
     pub props: String,
+    /// Its icon: an emoji or an image address (empty for none).
+    pub icon: String,
 }
 
 /// A Notion id without dashes, lowercased, so ids from different calls
@@ -178,8 +180,90 @@ pub fn entry(obj: &Value) -> Option<Entry> {
         } else {
             String::new()
         },
+        icon: icon_of(&obj["icon"]),
         object,
     })
+}
+
+/// A page's or database's icon as an emoji or an `https://` image address
+/// (an uploaded file, an external image, a custom emoji). Notion's own
+/// named icons carry no address and come back empty.
+pub fn icon_of(icon: &Value) -> String {
+    let url = |u: &Value| {
+        u.as_str()
+            .filter(|u| u.starts_with("https://"))
+            .unwrap_or("")
+            .to_string()
+    };
+    match icon["type"].as_str().unwrap_or("") {
+        "emoji" => icon["emoji"].as_str().unwrap_or("").to_string(),
+        "external" => url(&icon["external"]["url"]),
+        "file" => url(&icon["file"]["url"]),
+        "custom_emoji" => url(&icon["custom_emoji"]["url"]),
+        _ => String::new(),
+    }
+}
+
+/// What the picker can say about each entry from one listing of everything
+/// the connection sees: how many entries sit directly under it, how many
+/// pages it brings in with everything inside (itself included), and the
+/// titles above it.
+pub struct Tree<'e> {
+    by_id: HashMap<&'e str, &'e Entry>,
+    children: HashMap<&'e str, Vec<&'e Entry>>,
+}
+
+impl<'e> Tree<'e> {
+    pub fn new(entries: &'e [Entry]) -> Self {
+        let by_id: HashMap<&str, &Entry> = entries.iter().map(|e| (e.id.as_str(), e)).collect();
+        let mut children: HashMap<&str, Vec<&Entry>> = HashMap::new();
+        for e in entries {
+            if !e.parent.is_empty() {
+                children.entry(e.parent.as_str()).or_default().push(e);
+            }
+        }
+        Tree { by_id, children }
+    }
+
+    pub fn child_count(&self, id: &str) -> u64 {
+        self.children.get(id).map_or(0, |c| c.len() as u64)
+    }
+
+    /// Pages under it and itself (a database counts its rows, not itself),
+    /// the same pages a pick with everything inside syncs.
+    pub fn item_count(&self, id: &str) -> u64 {
+        let mut n = 0;
+        let mut seen: HashSet<&str> = HashSet::new();
+        let mut stack: Vec<&str> = vec![id];
+        while let Some(cur) = stack.pop() {
+            if !seen.insert(cur) || seen.len() > 50_000 {
+                continue;
+            }
+            if self.by_id.get(cur).is_some_and(|e| e.object == "page") {
+                n += 1;
+            }
+            for c in self.children.get(cur).into_iter().flatten() {
+                stack.push(c.id.as_str());
+            }
+        }
+        n
+    }
+
+    /// Titles above it, top first.
+    pub fn path(&self, id: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut cur = self.by_id.get(id).map(|e| e.parent.as_str());
+        while let Some(p) = cur.filter(|p| !p.is_empty()) {
+            let Some(e) = self.by_id.get(p) else { break };
+            out.push(e.title.clone());
+            if out.len() > 30 {
+                break;
+            }
+            cur = Some(e.parent.as_str());
+        }
+        out.reverse();
+        out
+    }
 }
 
 /// The entries under each selected id (and the selected ones themselves),
@@ -458,6 +542,24 @@ fn node(e: &Entry, has_children: bool) -> Node {
         } else {
             String::new()
         },
+        icon: e.icon.clone(),
+        ..Default::default()
+    }
+}
+
+/// A node with what a whole listing knows about it: its counts (and no
+/// chevron when nothing is under it) and, for a search result, its path.
+fn counted(e: &Entry, tree: &Tree, with_path: bool) -> Node {
+    let kids = tree.child_count(&e.id);
+    Node {
+        child_count: Some(kids),
+        item_count: Some(tree.item_count(&e.id)),
+        path: if with_path {
+            tree.path(&e.id)
+        } else {
+            Vec::new()
+        },
+        ..node(e, kids > 0)
     }
 }
 
@@ -480,21 +582,69 @@ impl Connector for Notion<'_> {
             let (object, id) = split_id(p);
             let mut kids = self.children(&id, object).await?;
             kids.retain(|n| matches(query, &n.title));
+            // A page's child blocks keep the page's own order but carry no
+            // icon and no counts; one listing of what the connection sees
+            // fills them in (a failed or partial listing leaves them as is).
+            if let Ok((entries, true)) = self.search("", 5).await {
+                let tree = Tree::new(&entries);
+                let by_id: HashMap<&str, &Entry> =
+                    entries.iter().map(|e| (e.id.as_str(), e)).collect();
+                for k in &mut kids {
+                    let (_, kid) = split_id(&k.id);
+                    if let Some(e) = by_id.get(kid.as_str()) {
+                        let c = counted(e, &tree, false);
+                        k.icon = c.icon;
+                        k.child_count = c.child_count;
+                        k.item_count = c.item_count;
+                        k.has_children = c.has_children;
+                        if k.updated_at.is_empty() {
+                            k.updated_at = c.updated_at;
+                        }
+                    }
+                }
+            }
             return Ok(kids);
         }
-        let (entries, _) = self
-            .search(query, if query.trim().is_empty() { 5 } else { 2 })
-            .await?;
+        // One listing of everything the connection sees (newest edit
+        // first) gives each entry's counts and path. Search words narrow it
+        // here, on titles, the way Notion's own search matches them.
+        let (entries, complete) = self.search("", 5).await?;
+        let tree = Tree::new(&entries);
         let ids: HashSet<&str> = entries.iter().map(|e| e.id.as_str()).collect();
+        let words = !query.trim().is_empty();
         // With no search words: the top-most pages the connection can see.
-        // With words: every match, wherever it is.
+        // With words: every match, wherever it is, with the titles above it.
         let mut out: Vec<Node> = entries
             .iter()
             .filter(|e| {
-                !query.trim().is_empty() || e.parent.is_empty() || !ids.contains(e.parent.as_str())
+                if words {
+                    matches(query, &e.title)
+                } else {
+                    e.parent.is_empty() || !ids.contains(e.parent.as_str())
+                }
             })
-            .map(|e| node(e, true))
+            .map(|e| {
+                if complete {
+                    counted(e, &tree, words)
+                } else {
+                    // Part of a big workspace: counts would be short, so
+                    // none are given; paths are still right as far as known.
+                    Node {
+                        path: if words { tree.path(&e.id) } else { Vec::new() },
+                        ..node(e, true)
+                    }
+                }
+            })
             .collect();
+        if words && !complete {
+            // More than one listing holds: Notion's search finds the rest.
+            let (found, _) = self.search(query, 2).await?;
+            for e in &found {
+                if !ids.contains(e.id.as_str()) {
+                    out.push(node(e, true));
+                }
+            }
+        }
         out.sort_by_key(|n| n.title.to_lowercase());
         Ok(out)
     }
@@ -579,9 +729,16 @@ mod tests {
 
     fn rig() -> Fake {
         let http = Fake::default();
+        let mut eng = page(
+            "aaaa-1",
+            "Engineering",
+            json!({"type":"workspace","workspace":true}),
+            "2026-10-01T00:00:00.000Z",
+        );
+        eng["icon"] = json!({"type": "emoji", "emoji": "🛠️"});
         let results = json!({
             "results": [
-                page("aaaa-1", "Engineering", json!({"type":"workspace","workspace":true}), "2026-10-01T00:00:00.000Z"),
+                eng,
                 page("bbbb-2", "Runbooks", json!({"type":"page_id","page_id":"aaaa1"}), "2026-10-02T00:00:00.000Z"),
                 page("cccc-3", "Deploy", json!({"type":"page_id","page_id":"bbbb-2"}), "2026-10-03T00:00:00.000Z"),
                 page("dddd-4", "Marketing", json!({"type":"workspace","workspace":true}), "2026-10-04T00:00:00.000Z"),
@@ -597,6 +754,17 @@ mod tests {
                         {"id":"b1","type":"heading_2","has_children":false,"heading_2":{"rich_text":[{"plain_text":"Steps"}]}},
                         {"id":"b2","type":"bulleted_list_item","has_children":true,"bulleted_list_item":{"rich_text":[{"plain_text":"Build"}]}},
                         {"id":"b3","type":"code","has_children":false,"code":{"language":"bash","rich_text":[{"plain_text":"make deploy"}]}}
+                    ],
+                    "has_more": false
+                }))
+            })
+        });
+        http.with(|r| {
+            r.url.contains("/blocks/aaaa1/children").then(|| {
+                fjson(200, json!({
+                    "results": [
+                        {"id":"bbbb-2","type":"child_page","has_children":true,"child_page":{"title":"Runbooks"},"last_edited_time":"2026-10-02T00:00:00.000Z"},
+                        {"id":"x1","type":"paragraph","has_children":false,"paragraph":{"rich_text":[{"plain_text":"Intro"}]}}
                     ],
                     "has_more": false
                 }))
@@ -698,6 +866,98 @@ mod tests {
             "children sit under their parent: {all}"
         );
         assert!(d.sections.iter().any(|s| s.loc == "Deploy > Steps"));
+    }
+
+    #[tokio::test]
+    async fn top_pages_carry_their_icon_and_what_is_inside() {
+        let http = rig();
+        let n = Notion {
+            http: &http,
+            auth: "Bearer t".into(),
+        };
+        let top = n.browse(None, "").await.unwrap();
+        let eng = &top[0];
+        assert_eq!(eng.icon, "🛠️");
+        assert_eq!(eng.child_count, Some(1), "Runbooks sits under it");
+        assert_eq!(eng.item_count, Some(3), "itself, Runbooks and Deploy");
+        assert!(eng.has_children);
+        assert!(eng.path.is_empty());
+        let marketing = &top[1];
+        assert_eq!(marketing.child_count, Some(0));
+        assert!(!marketing.has_children, "nothing to open: no chevron");
+        // The new fields stay out of the answer when unknown, so an older
+        // dashboard sees exactly the shape it knew.
+        let v = serde_json::to_value(Node::default()).unwrap();
+        for k in ["icon", "child_count", "item_count", "bytes", "path"] {
+            assert!(v.get(k).is_none(), "{k} left out when unknown");
+        }
+        let old: Node = serde_json::from_value(json!({
+            "id": "page:a", "title": "A", "kind": "page", "has_children": false, "selectable": true
+        }))
+        .unwrap();
+        assert_eq!(old.child_count, None);
+    }
+
+    #[tokio::test]
+    async fn search_results_say_where_they_are() {
+        let http = rig();
+        let n = Notion {
+            http: &http,
+            auth: "Bearer t".into(),
+        };
+        let found = n.browse(None, "dep").await.unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].title, "Deploy");
+        assert_eq!(found[0].path, ["Engineering", "Runbooks"]);
+        assert_eq!(found[0].item_count, Some(1));
+        let top = n.browse(None, "eng").await.unwrap();
+        assert_eq!(top[0].title, "Engineering");
+        assert!(top[0].path.is_empty(), "a top page has nothing above it");
+    }
+
+    #[tokio::test]
+    async fn opening_a_page_keeps_its_order_and_fills_in_icons_and_counts() {
+        let http = rig();
+        let n = Notion {
+            http: &http,
+            auth: "Bearer t".into(),
+        };
+        let kids = n.browse(Some("page:aaaa1"), "").await.unwrap();
+        assert_eq!(kids.len(), 1);
+        assert_eq!(kids[0].id, "page:bbbb2");
+        assert_eq!(kids[0].child_count, Some(1));
+        assert_eq!(kids[0].item_count, Some(2));
+        assert_eq!(kids[0].updated_at, "2026-10-02T00:00:00.000Z");
+    }
+
+    #[test]
+    fn icons_are_an_emoji_or_an_https_image() {
+        assert_eq!(icon_of(&json!({"type":"emoji","emoji":"📘"})), "📘");
+        assert_eq!(
+            icon_of(&json!({"type":"external","external":{"url":"https://x.test/i.png"}})),
+            "https://x.test/i.png"
+        );
+        assert_eq!(
+            icon_of(
+                &json!({"type":"file","file":{"url":"https://s3.test/i.png","expiry_time":"t"}})
+            ),
+            "https://s3.test/i.png"
+        );
+        assert_eq!(
+            icon_of(
+                &json!({"type":"custom_emoji","custom_emoji":{"id":"1","name":"a","url":"https://x.test/e.png"}})
+            ),
+            "https://x.test/e.png"
+        );
+        assert_eq!(
+            icon_of(&json!({"type":"external","external":{"url":"http://x.test/i.png"}})),
+            ""
+        );
+        assert_eq!(
+            icon_of(&json!({"type":"icon","icon":{"name":"book","color":"gray"}})),
+            ""
+        );
+        assert_eq!(icon_of(&Value::Null), "");
     }
 
     #[test]
