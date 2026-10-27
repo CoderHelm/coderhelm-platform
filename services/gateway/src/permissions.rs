@@ -341,7 +341,7 @@ pub const CAPABILITIES: &[Capability] = &[
     },
     Capability {
         key: "sign_in",
-        label: "Change who may join (allowed email domains) and whether two-factor sign-in is required, see who has it, and reset a person's two-factor sign-in (self-hosted installs)",
+        label: "Require two-factor sign-in for the team, see who has it, reset a person's two-factor sign-in, and on a self-hosted install change who may join (allowed email domains)",
         min_role: "admin",
         // Sign-in rules stay with built-in admins and owners
         // (`NEVER_IN_CUSTOM_ROLES`).

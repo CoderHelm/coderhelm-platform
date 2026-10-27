@@ -281,6 +281,27 @@ pub const TEMPLATES: &[Template] = &[
         ],
         install_may_send: true,
     },
+    Template {
+        id: "two_factor_required",
+        subject: "Two-factor sign-in is now required",
+        // No team or admin name: the install's own SES email carries those.
+        params: &[p("link", Kind::Link)],
+        body: &[
+            Part::Para("Two-factor sign-in is now required for you. The next time you sign in, you'll set up an authenticator app on your phone first (it takes about a minute); nothing else works until then."),
+            Part::Button("Set it up now", "link"),
+        ],
+        install_may_send: true,
+    },
+    Template {
+        id: "two_factor_reset",
+        subject: "Your two-factor sign-in was reset",
+        params: &[p("link", Kind::Link)],
+        body: &[
+            Part::Para("An admin reset your two-factor sign-in. Set it up again at your next sign-in. If you didn't ask for this, tell your admins and change your password now."),
+            Part::Button("Open Security settings", "link"),
+        ],
+        install_may_send: true,
+    },
     // The relay's own notice to an install's admins. Installs can't ask for it.
     Template {
         id: "relay_paused",
