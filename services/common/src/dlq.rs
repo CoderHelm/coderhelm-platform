@@ -58,6 +58,7 @@ pub const WORKER_MESSAGE_TYPES: &[&str] = &[
     "jira_comment",
     "dlq_cleanup",
     "log_autofix",
+    "aws_permissions_sweep",
     // Resumes agent work kept while a team's agents were paused.
     "agent_resume_sweep",
     // A model call's usage, held because its counters couldn't be written.
@@ -84,6 +85,7 @@ pub const GLOBAL_MESSAGE_TYPES: &[&str] = &[
     "usage_reconcile",
     "dlq_cleanup",
     "log_autofix",
+    "aws_permissions_sweep",
     "agent_resume_sweep",
     "knowledge_sync_sweep",
     "plugin_sweep",

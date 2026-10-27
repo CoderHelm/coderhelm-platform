@@ -141,8 +141,8 @@ These are the starting point; admins change them in **Settings, then System** wi
   Anonymous install, upgrade and health pings from the installer.
 - **`telemetry.endpoint`** *string, default CoderHelm's*\
   Where pings go.
-- **`logReaderTemplateUrl`** *string, default CoderHelm's public copy*\
-  The CloudFormation template teams create the log reader role from.
+- **`logReaderTemplateUrl`** *string, default this release's published copy*\
+  The CloudFormation template teams create the read-only AWS role from. By default a release links to the copy published with it (`https://coderhelm-public.s3.amazonaws.com/launch/<version>/coderhelm-log-reader.yaml`, byte for byte the template built into that release); a development build links to CoderHelm's current copy. To host it yourself, put this release's `infra/cfn/coderhelm-log-reader.yaml` and `coderhelm-log-reader-update.yaml` side by side in an S3 bucket and set this to the first one's URL. Setup checks compare both with the release.
 - **`publicBucketName`** *string or null, default `null`*\
   Create a public bucket that serves the templates in `infra/cfn` (the hosted deployment does).
 - **`siteUrl`** *string or null, default `null`*\
@@ -164,8 +164,9 @@ The CDK app turns the config into environment variables on the gateway, streamin
 | `PUBLIC_URL_PARAMETER` | The SSM parameter that holds the CloudFront URL, when you have no domain |
 | `SELF_HOSTED` | `1` on every self-hosted install: links never fall back to CoderHelm's hosted addresses, and support goes to `SUPPORT_INBOX` |
 | `SITE_URL` | `siteUrl` |
-| `CODERHELM_ACCOUNT_ID` | `account` (the account teams' read-only roles trust) |
-| `LOG_READER_TEMPLATE_URL` | `logReaderTemplateUrl` |
+| `CODERHELM_ACCOUNT_ID` | `account` (the account teams' read-only roles trust; a self-hosted install never falls back to CoderHelm's) |
+| `LOG_READER_TEMPLATE_URL` | `logReaderTemplateUrl`, or this release's published copy |
+| `RESOURCE_PREFIX` | `resourcePrefix` (a self-hosted install's role link narrows the role's trust to roles named `<prefix>-*`) |
 | `PLATFORM_ADMIN_EMAILS` | `admins` |
 | `CODERHELM_VERSION`, `CODERHELM_COMMIT`, `CODERHELM_RELEASED_AT`, `CODERHELM_CONFIG_FINGERPRINT` | The release stamp and a hash of the config |
 | `UPDATER_FUNCTION_NAME` | The updater, when `updates.enabled` |

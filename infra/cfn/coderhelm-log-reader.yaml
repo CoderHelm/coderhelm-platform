@@ -15,8 +15,17 @@ Parameters:
   CoderHelmAccountId:
     Type: String
     Default: "654654210434"
-    Description: The AWS account ID of Coderhelm (do not change this value).
+    Description: The AWS account ID of Coderhelm, or of your self-hosted install (do not change this value).
     AllowedPattern: "^\\d{12}$"
+
+  TrustedRolePrefix:
+    Type: String
+    Default: ""
+    Description: >
+      Only roles whose names start with this may take on the role (a self-hosted
+      install's resource prefix and a dash, such as coderhelm-prod-). Empty
+      allows any role in that account (do not change this value).
+    AllowedPattern: "^[A-Za-z0-9_-]{0,41}$"
 
 Resources:
   CoderHelmLogReaderRole:
@@ -37,6 +46,11 @@ Resources:
             Condition:
               StringEquals:
                 "sts:ExternalId": !Ref ExternalId
+              # Only CoderHelm's own roles in that account, not its people
+              # or other workloads (a self-hosted install's account is often
+              # shared).
+              ArnLike:
+                "aws:PrincipalArn": !Sub "arn:aws:iam::${CoderHelmAccountId}:role/${TrustedRolePrefix}*"
       Policies:
         - PolicyName: CloudWatchLogsReadOnly
           PolicyDocument:
@@ -66,6 +80,14 @@ Resources:
                 Action:
                   - "sts:GetCallerIdentity"
                 Resource: "*"
+              # Lets CoderHelm check which of these permissions the role
+              # has (IAM's policy simulator, on this role only), so the
+              # dashboard can say when a release needs a new one.
+              - Sid: CheckOwnPermissions
+                Effect: Allow
+                Action:
+                  - "iam:SimulatePrincipalPolicy"
+                Resource: !Sub "arn:aws:iam::${AWS::AccountId}:role/CoderHelmLogReader"
               # Before a fix for a log error is written: which tasks of the
               # service behind a log group are running, since when, and how
               # they start. Lists and describes only.

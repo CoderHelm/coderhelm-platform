@@ -420,6 +420,24 @@ export class ApiStack extends cdk.Stack {
       ],
     });
 
+    // AWS permissions: daily 14:00 UTC, check every connected account's
+    // read-only role against the permissions this release uses, so the AWS
+    // page is current and each team hears once when a release needs an
+    // update. Read-only in the teams' accounts; does nothing without
+    // connected accounts.
+    new events.Rule(this, "AwsPermissionsSchedule", {
+      ruleName: `${prefix}-aws-permissions`,
+      description: "Check connected AWS accounts against this release's read-only permissions (daily)",
+      schedule: events.Schedule.cron({ minute: "0", hour: "14" }),
+      targets: [
+        new targets.SqsQueue(this.ticketQueue, {
+          message: events.RuleTargetInput.fromObject({
+            type: "aws_permissions_sweep",
+          }),
+        }),
+      ],
+    });
+
     // Usage reconciliation: daily 06:00 UTC, compares the previous day's
     // recorded model usage with Anthropic's usage/cost report. The worker
     // does nothing unless the coderhelm/<stage>/anthropic-admin-keys secret

@@ -290,6 +290,56 @@ test("the release stamp reaches the services and the dashboard", () => {
   assert.equal(hosted.updates.enabled, false);
 });
 
+test("AWS connections: a self-hosted install's roles trust its own account, from its own release's template", () => {
+  process.env.CODERHELM_VERSION = "v1.2.3";
+  try {
+    const t = synth(selfHost());
+    for (const [stack, fn] of [
+      ["coderhelm-prod-api", "coderhelm-prod-gateway"],
+      ["coderhelm-prod-worker", "coderhelm-prod-worker"],
+      ["coderhelm-prod-streaming", "coderhelm-prod-streaming"],
+    ]) {
+      const env = envOf(t[stack], fn);
+      // This install's own account (the stack's), never CoderHelm's.
+      assert.equal(env.CODERHELM_ACCOUNT_ID, "111122223333", fn);
+      assert.equal(env.LOG_READER_TEMPLATE_URL, "https://coderhelm-public.s3.amazonaws.com/launch/v1.2.3/coderhelm-log-reader.yaml", fn);
+      assert.equal(env.RESOURCE_PREFIX, "coderhelm-prod", fn);
+    }
+    const analyzer = envOf(t["coderhelm-prod-log-analyzer"], "coderhelm-prod-log-analyzer");
+    assert.equal(analyzer.CODERHELM_ACCOUNT_ID, "111122223333");
+  } finally {
+    delete process.env.CODERHELM_VERSION;
+  }
+  // A development build (no release) and an operator's own template.
+  const dev = envOf(synth(selfHost())["coderhelm-prod-api"], "coderhelm-prod-gateway");
+  assert.equal(dev.LOG_READER_TEMPLATE_URL, "https://coderhelm-public.s3.amazonaws.com/cfn/coderhelm-log-reader.yaml");
+  const own = envOf(synth(selfHost({ logReaderTemplateUrl: "https://my-bucket.s3.amazonaws.com/coderhelm-log-reader.yaml" }))["coderhelm-prod-api"], "coderhelm-prod-gateway");
+  assert.equal(own.LOG_READER_TEMPLATE_URL, "https://my-bucket.s3.amazonaws.com/coderhelm-log-reader.yaml");
+
+  // The gateway, the worker and the analyzer may take on a team's role
+  // (in any account, the install's own included), and nothing else of it.
+  const t = synth(selfHost());
+  for (const stack of ["coderhelm-prod-api", "coderhelm-prod-worker", "coderhelm-prod-log-analyzer"]) {
+    const s = json(t[stack]);
+    assert.ok(s.includes("arn:aws:iam::*:role/CoderHelmLogReader"), `${stack} may assume the log reader role`);
+  }
+  // The role's name prefix the trust policy is narrowed to matches the
+  // stacks whose generated role names start with it.
+  for (const name of Object.keys(t)) assert.ok(name.startsWith("coderhelm-prod-"), name);
+});
+
+test("AWS connections: the role and update templates are released with each version", () => {
+  const wf = fs.readFileSync(path.join(INFRA, "..", ".github", "workflows", "release.yml"), "utf8");
+  for (const f of ["coderhelm-log-reader.yaml", "coderhelm-log-reader-update.yaml"]) {
+    assert.ok(wf.includes(`cp infra/cfn/${f} dist/${f}`), `${f} is built into the release`);
+    assert.ok(wf.includes(`dist/${f}`) && wf.includes(f + " "), `${f} is in SHA256SUMS`);
+  }
+  assert.ok(wf.includes('k="launch/$TAG/$f"'), "published under launch/<tag>/, which the publisher role may write");
+  const role = fs.readFileSync(path.join(INFRA, "cfn", "coderhelm-log-reader.yaml"), "utf8");
+  assert.ok(role.includes('"sts:ExternalId": !Ref ExternalId'));
+  assert.ok(role.includes('"aws:PrincipalArn": !Sub "arn:aws:iam::${CoderHelmAccountId}:role/${TrustedRolePrefix}*"'));
+});
+
 /** Does an HTTP API route key (`GET /api/{proxy+}`) take this request? */
 function routeTakes(routeKey: string, method: string, requestPath: string): boolean {
   const [m, pattern] = routeKey.split(" ");

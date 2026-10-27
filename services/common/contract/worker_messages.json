@@ -38,6 +38,7 @@
     "usage_reconcile": {"type":"usage_reconcile"},
     "dlq_cleanup": {"type":"dlq_cleanup"},
     "log_autofix": {"type":"log_autofix"},
+    "aws_permissions_sweep": {"type":"aws_permissions_sweep"},
     "agent_resume_sweep": {"type":"agent_resume_sweep"},
     "knowledge_sync_sweep": {"type":"knowledge_sync_sweep"},
     "knowledge_sync": {"type":"knowledge_sync","team_id":"TEAM#team-a","kb_id":"kb1","source_id":"src1"},

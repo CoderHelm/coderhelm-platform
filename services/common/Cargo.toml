@@ -47,6 +47,7 @@ aws-sdk-ecs = "1"
 aws-sdk-lambda = "1"
 aws-sdk-cloudformation = "1"
 aws-sdk-ecr = "1"
+aws-sdk-iam = "1"
 aws-sdk-mwaa = "1"
 # public_urls: the deployment's URL when CloudFront picked it (single origin)
 aws-sdk-ssm = "1"

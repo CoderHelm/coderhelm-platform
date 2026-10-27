@@ -1,0 +1,83 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Brings the existing CoderHelmLogReader role up to date with the read-only
+  permissions the current CoderHelm release uses. Every permission here is
+  read-only: CoderHelm can list, describe and query, never change anything.
+  Created from the dashboard's Update link; you can delete older
+  CoderHelmLogReaderUpdate stacks once this one is in place.
+
+Parameters:
+  RoleName:
+    Type: String
+    Default: CoderHelmLogReader
+    Description: The CoderHelm role to update (do not change this value).
+    AllowedPattern: "^CoderHelmLogReader$"
+
+Resources:
+  CoderHelmReadOnlyUpdate:
+    Type: AWS::IAM::Policy
+    Properties:
+      # One policy per update stack, so a newer update never collides with
+      # an older one.
+      PolicyName: !Ref AWS::StackName
+      Roles:
+        - !Ref RoleName
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: LogsAndAlarms
+            Effect: Allow
+            Action:
+              - "logs:DescribeLogGroups"
+              - "logs:FilterLogEvents"
+              - "logs:GetLogEvents"
+              - "logs:StartQuery"
+              - "logs:GetQueryResults"
+              - "logs:StopQuery"
+              - "cloudwatch:DescribeAlarms"
+              - "sts:GetCallerIdentity"
+            Resource: "*"
+          - Sid: CheckOwnPermissions
+            Effect: Allow
+            Action:
+              - "iam:SimulatePrincipalPolicy"
+            Resource: !Sub "arn:aws:iam::${AWS::AccountId}:role/${RoleName}"
+          - Sid: ReadMetrics
+            Effect: Allow
+            Action:
+              - "cloudwatch:GetMetricData"
+              - "cloudwatch:ListMetrics"
+            Resource: "*"
+          - Sid: ListAirflowEnvironments
+            Effect: Allow
+            Action:
+              - "airflow:ListEnvironments"
+              - "airflow:GetEnvironment"
+            Resource: "*"
+          - Sid: ReadAirflowAsViewer
+            Effect: Allow
+            Action:
+              - "airflow:InvokeRestApi"
+            Resource: "arn:aws:airflow:*:*:role/*/Viewer"
+          - Sid: DescribeServicesAndTasks
+            Effect: Allow
+            Action:
+              - "ecs:ListClusters"
+              - "ecs:ListServices"
+              - "ecs:DescribeServices"
+              - "ecs:DescribeTaskDefinition"
+              - "ecs:ListTasks"
+              - "ecs:DescribeTasks"
+            Resource: "*"
+          - Sid: FindTheCodeBehindALogGroup
+            Effect: Allow
+            Action:
+              - "lambda:GetFunction"
+              - "lambda:GetFunctionConfiguration"
+              - "lambda:ListFunctions"
+              - "lambda:ListTags"
+              - "logs:ListTagsForResource"
+              - "cloudformation:DescribeStacks"
+              - "ecr:BatchGetImage"
+              - "ecr:ListTagsForResource"
+            Resource: "*"

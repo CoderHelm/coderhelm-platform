@@ -135,6 +135,11 @@ pub enum WorkerMessage {
     /// teams that turned automatic fixes on. Does nothing for anyone else.
     #[serde(rename = "log_autofix")]
     LogAutofix,
+    /// Daily (EventBridge, then SQS): check every connected AWS account's role
+    /// against this release's permissions and tell each team once when an
+    /// update is needed.
+    #[serde(rename = "aws_permissions_sweep")]
+    AwsPermissionsSweep,
     /// People pushed back on a CoderHelm review (a reply, a dismissal, a close
     /// over its change request): judge whether the reviewer was wrong.
     #[serde(rename = "review_lesson")]
@@ -351,7 +356,8 @@ impl WorkerMessage {
             | WorkerMessage::DlqCleanup
             | WorkerMessage::KnowledgeSyncSweep
             | WorkerMessage::AgentResumeSweep
-            | WorkerMessage::LogAutofix => f::OTHER,
+            | WorkerMessage::LogAutofix
+            | WorkerMessage::AwsPermissionsSweep => f::OTHER,
             WorkerMessage::PluginRun(_)
             | WorkerMessage::PluginPublish(_)
             | WorkerMessage::PluginSync(_)

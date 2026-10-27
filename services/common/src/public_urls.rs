@@ -301,23 +301,45 @@ pub fn api_url_from_env() -> &'static str {
     api_url(&env_stage())
 }
 
+/// The hosted deployment's AWS account (the default only there).
+const HOSTED_ACCOUNT: &str = "654654210434";
+/// The hosted deployment's public copy of the log reader template.
+const HOSTED_LOG_READER_TEMPLATE: &str =
+    "https://coderhelm-public.s3.amazonaws.com/cfn/coderhelm-log-reader.yaml";
+
 /// The AWS account teams' read-only roles trust: this deployment's own
-/// (CODERHELM_ACCOUNT_ID, set by the deploy), else the hosted one.
+/// (CODERHELM_ACCOUNT_ID, set by the deploy). The hosted account is the
+/// default on the hosted deployment only: a self-hosted install without it
+/// gives "" (no Launch Stack link, and Setup checks fail), never an account
+/// that isn't its own.
 pub fn platform_account_id() -> String {
-    std::env::var("CODERHELM_ACCOUNT_ID")
-        .ok()
-        .filter(|a| a.len() == 12 && a.chars().all(|c| c.is_ascii_digit()))
-        .unwrap_or_else(|| "654654210434".to_string())
+    platform_account_id_from(std::env::var("CODERHELM_ACCOUNT_ID").ok(), self_hosted())
 }
 
-/// The CloudFormation template teams create that role from.
+/// [`platform_account_id`]'s rule, on given values.
+pub fn platform_account_id_from(v: Option<String>, self_hosted: bool) -> String {
+    match v
+        .map(|a| a.trim().to_string())
+        .filter(|a| a.len() == 12 && a.chars().all(|c| c.is_ascii_digit()))
+    {
+        Some(a) => a,
+        None if self_hosted => String::new(),
+        None => HOSTED_ACCOUNT.to_string(),
+    }
+}
+
+/// The CloudFormation template teams create that role from:
+/// LOG_READER_TEMPLATE_URL (set by the deploy: on a self-hosted release, the
+/// copy published with that release), else the hosted public copy.
 pub fn log_reader_template_url() -> String {
-    std::env::var("LOG_READER_TEMPLATE_URL")
-        .ok()
+    log_reader_template_url_from(std::env::var("LOG_READER_TEMPLATE_URL").ok())
+}
+
+/// [`log_reader_template_url`]'s rule, on a given value.
+pub fn log_reader_template_url_from(v: Option<String>) -> String {
+    v.map(|u| u.trim().to_string())
         .filter(|u| u.starts_with("https://"))
-        .unwrap_or_else(|| {
-            "https://coderhelm-public.s3.amazonaws.com/cfn/coderhelm-log-reader.yaml".to_string()
-        })
+        .unwrap_or_else(|| HOSTED_LOG_READER_TEMPLATE.to_string())
 }
 
 /// The marketing site linked from email footers: SITE_URL, none when it is
@@ -527,6 +549,42 @@ mod tests {
         );
         assert_eq!(hosted_mentions("API.CODERHELM.COM").len(), 1);
         assert!(hosted_mentions("coderhelm.company").is_empty());
+    }
+
+    #[test]
+    fn a_self_hosted_install_trusts_only_its_own_account() {
+        let s = |v: &str| Some(v.to_string());
+        assert_eq!(
+            platform_account_id_from(s("111122223333"), true),
+            "111122223333"
+        );
+        assert_eq!(
+            platform_account_id_from(s(" 111122223333 "), false),
+            "111122223333"
+        );
+        // Never the hosted account on a self-hosted install.
+        assert_eq!(platform_account_id_from(None, true), "");
+        assert_eq!(platform_account_id_from(s("12"), true), "");
+        assert_eq!(platform_account_id_from(None, false), HOSTED_ACCOUNT);
+    }
+
+    #[test]
+    fn the_template_comes_from_the_deploy() {
+        let s = |v: &str| Some(v.to_string());
+        assert_eq!(
+            log_reader_template_url_from(s(
+                "https://coderhelm-public.s3.amazonaws.com/launch/v1.2.3/coderhelm-log-reader.yaml"
+            )),
+            "https://coderhelm-public.s3.amazonaws.com/launch/v1.2.3/coderhelm-log-reader.yaml"
+        );
+        assert_eq!(
+            log_reader_template_url_from(s("http://x/y.yaml")),
+            HOSTED_LOG_READER_TEMPLATE
+        );
+        assert_eq!(
+            log_reader_template_url_from(None),
+            HOSTED_LOG_READER_TEMPLATE
+        );
     }
 
     #[test]

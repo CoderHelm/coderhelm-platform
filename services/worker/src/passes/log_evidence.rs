@@ -165,6 +165,23 @@ impl LogEvidence {
         self.tried.iter().filter(|t| !t.ok).collect()
     }
 
+    /// Lookups the team's role wasn't allowed to make (its permissions are
+    /// older than this release's): each source once.
+    pub fn refused_sources(&self) -> Vec<&str> {
+        let mut out: Vec<&str> = Vec::new();
+        for t in self.tried.iter().filter(|t| !t.ok) {
+            let o = t.outcome.to_ascii_lowercase();
+            let refused = o.contains("accessdenied")
+                || o.contains("access denied")
+                || o.contains("not authorized")
+                || o.contains("unauthorizedoperation");
+            if refused && !out.contains(&t.source.as_str()) {
+                out.push(t.source.as_str());
+            }
+        }
+        out
+    }
+
     /// The tasks failing now.
     pub fn failing_now(&self) -> Vec<&TaskErrors> {
         self.tasks.iter().filter(|t| t.failing_now).collect()
@@ -737,6 +754,13 @@ pub fn facts_markdown(ev: &LogEvidence) -> String {
             out.push_str(&format!("* Start path not resolved: {}.\n", sp.missing));
         }
     }
+    let refused = ev.refused_sources();
+    if !refused.is_empty() {
+        out.push_str(&format!(
+            "\nThe team's AWS role isn't allowed {} yet (its permissions predate this release). Work with the facts above; name these sources when something stays open, and never ask for more access in the PR.\n",
+            refused.iter().map(|r| format!("`{r}`")).collect::<Vec<_>>().join(", ")
+        ));
+    }
     out.push_str("\nSources tried:\n");
     for t in &ev.tried {
         out.push_str(&format!(
@@ -1162,6 +1186,13 @@ pub fn summary_note(ev: &LogEvidence) -> String {
     if let Some(r) = ev.fill_mb_per_hour {
         s.push_str(&format!("; fills at about {} MB/h", fmt_f(r)));
     }
+    let refused = ev.refused_sources();
+    if !refused.is_empty() {
+        s.push_str(&format!(
+            "; the AWS role can't read {} yet, so those steps were skipped (an admin can update its permissions in one click in Settings, Integrations, AWS)",
+            refused.join(", ")
+        ));
+    }
     let failing = ev.failing_now();
     if !failing.is_empty() {
         s.push_str(&format!(
@@ -1174,6 +1205,52 @@ pub fn summary_note(ev: &LogEvidence) -> String {
         ));
     }
     s
+}
+
+#[cfg(test)]
+mod refused_tests {
+    use super::*;
+
+    #[test]
+    fn refused_lookups_point_at_the_one_click_update() {
+        let ev = LogEvidence {
+            tried: vec![
+                SourceTry {
+                    source: "logs:StartQuery".into(),
+                    question: "q".into(),
+                    ok: true,
+                    outcome: "12 rows".into(),
+                },
+                SourceTry {
+                    source: "ecs:DescribeTasks".into(),
+                    question: "q".into(),
+                    ok: false,
+                    outcome:
+                        "AccessDeniedException: User is not authorized to perform ecs:DescribeTasks"
+                            .into(),
+                },
+                SourceTry {
+                    source: "ecs:DescribeTasks".into(),
+                    question: "q2".into(),
+                    ok: false,
+                    outcome: "AccessDenied".into(),
+                },
+                SourceTry {
+                    source: "ecs:ListClusters".into(),
+                    question: "q".into(),
+                    ok: false,
+                    outcome: "timed out".into(),
+                },
+            ],
+            ..Default::default()
+        };
+        assert_eq!(ev.refused_sources(), vec!["ecs:DescribeTasks"]);
+        let note = summary_note(&ev);
+        assert!(note.contains("can't read ecs:DescribeTasks yet"), "{note}");
+        assert!(note.contains("Settings, Integrations, AWS"));
+        assert!(facts_markdown(&ev).contains("isn't allowed `ecs:DescribeTasks` yet"));
+        assert!(!summary_note(&LogEvidence::default()).contains("can't read"));
+    }
 }
 
 #[cfg(test)]

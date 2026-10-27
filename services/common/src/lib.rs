@@ -44,6 +44,7 @@ pub mod live;
 /// Log findings and the fix runs started from them.
 pub mod log_findings;
 // Which repo a log group's or alarm's code lives in, from evidence.
+pub mod log_reader;
 pub mod log_repo;
 /// The MCP servers a team can switch on: one catalog for gateway and worker.
 pub mod mcp_catalog;
