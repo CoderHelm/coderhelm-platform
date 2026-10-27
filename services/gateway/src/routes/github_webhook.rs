@@ -1273,6 +1273,33 @@ async fn handle_issue_comment(
             let name = repo["name"].as_str().unwrap_or("");
             let pr_number = payload["issue"]["number"].as_u64().unwrap_or(0);
 
+            // The answer to CoderHelm's one question on a PR closed without
+            // a reason: it goes to the lessons, never to the fix loop.
+            if payload["issue"]["state"].as_str() == Some("closed") {
+                if let Some(item) =
+                    lookup_run_item_by_pr(state, team_id, owner, name, pr_number).await
+                {
+                    if awaits_close_reason(&item) {
+                        let lesson = WorkerMessage::Lesson(crate::models::LessonMessage {
+                            team_id: team_id.to_string(),
+                            installation_id,
+                            run_id: common::paged::run_id_of(&item).unwrap_or_default(),
+                            repo_owner: owner.to_string(),
+                            repo_name: name.to_string(),
+                            pr_number,
+                            trigger: common::run_status::CLOSE_REASON_TRIGGER.to_string(),
+                            ..Default::default()
+                        });
+                        if let Err(e) =
+                            send_to_queue(state, &state.config.ticket_queue_url, &lesson).await
+                        {
+                            warn!(pr_number, status = ?e, "Could not queue the close reason's lesson");
+                        }
+                        return Ok(StatusCode::OK);
+                    }
+                }
+            }
+
             let run_id = lookup_run_by_pr(state, team_id, owner, name, pr_number).await;
             if run_id.is_empty() {
                 warn!(pr_number, "No run found for PR comment — skipping");
@@ -1659,7 +1686,10 @@ async fn handle_pull_request(
             );
             // Learn from it: the worker reads the ticket, the plan's findings
             // and what people wrote, and records a lesson for the repository
-            // when the fix belonged outside the code.
+            // when the fix belonged outside the code; when nobody said why,
+            // it asks once. A PR CoderHelm closed itself (superseded, the fix
+            // belonged elsewhere) already says why.
+            let closed_by_us = is_own_actor(&payload["sender"]);
             let lesson = WorkerMessage::Lesson(crate::models::LessonMessage {
                 team_id: team_id.to_string(),
                 installation_id,
@@ -1670,7 +1700,14 @@ async fn handle_pull_request(
                 trigger: "pr_closed".to_string(),
                 ..Default::default()
             });
-            if let Err(e) = send_to_queue(state, &state.config.ticket_queue_url, &lesson).await {
+            if closed_by_us {
+                info!(
+                    team_id,
+                    run_id, pr_number, "CoderHelm closed its own PR — no lesson to ask for"
+                );
+            } else if let Err(e) =
+                send_to_queue(state, &state.config.ticket_queue_url, &lesson).await
+            {
                 warn!(team_id, run_id, pr_number, status = ?e, "Could not queue the closed PR's lesson");
             }
             queue_reward_outcome(
@@ -1784,6 +1821,19 @@ async fn handle_pull_request(
     }
 
     Ok(StatusCode::OK)
+}
+
+/// Whether a webhook's sender is CoderHelm itself (its app or bot user).
+fn is_own_actor(sender: &Value) -> bool {
+    sender["login"]
+        .as_str()
+        .is_some_and(|l| l.to_ascii_lowercase().contains("coderhelm"))
+}
+
+/// Whether CoderHelm asked why this run's PR was closed and nobody has
+/// answered yet.
+fn awaits_close_reason(item: &common::paged::Item) -> bool {
+    item.contains_key("close_asked_at") && !item.contains_key("close_answered_at")
 }
 
 /// A multi-repo run's PR that isn't the one its record names closed: its
@@ -4621,5 +4671,32 @@ mod rerequest_tests {
         assert_ne!(a, b);
         assert_eq!(a, rerequest_key("", &press("2026-10-27T10:00:00Z")));
         assert!(a.contains("abc123"));
+    }
+}
+
+#[cfg(test)]
+mod close_reason_tests {
+    use super::*;
+    use aws_sdk_dynamodb::types::AttributeValue;
+
+    /// A comment on a closed PR is the answer only while CoderHelm's one
+    /// question is open; after that it is ordinary conversation.
+    #[test]
+    fn only_an_open_question_takes_the_answer() {
+        let mut item: common::paged::Item = std::collections::HashMap::new();
+        assert!(!awaits_close_reason(&item));
+        item.insert("close_asked_at".into(), AttributeValue::S("t".into()));
+        assert!(awaits_close_reason(&item));
+        item.insert("close_answered_at".into(), AttributeValue::S("t".into()));
+        assert!(!awaits_close_reason(&item));
+    }
+
+    #[test]
+    fn coderhelm_closing_its_own_pr_is_not_asked_about() {
+        assert!(is_own_actor(
+            &serde_json::json!({"login": "coderhelm[bot]"})
+        ));
+        assert!(!is_own_actor(&serde_json::json!({"login": "pat"})));
+        assert!(!is_own_actor(&serde_json::json!({})));
     }
 }

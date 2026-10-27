@@ -61,6 +61,10 @@ pub fn ended_by_person(status: &str) -> bool {
     ENDED_BY_PERSON.contains(&status)
 }
 
+/// The lesson trigger for a person's answer to "why was this closed?" on
+/// CoderHelm's PR (the gateway sends it, the worker's lessons read it).
+pub const CLOSE_REASON_TRIGGER: &str = "close_reason";
+
 /// The condition that refuses to overwrite a run a person ended, for the
 /// status attribute behind `status_name` (`#s`, `#status`). Add its values
 /// with [`EndedValues::ended_values`].
