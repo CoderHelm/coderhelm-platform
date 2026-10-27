@@ -107,6 +107,8 @@ fn plain(s: &str) -> String {
 /// its place.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Section {
+    /// The live link and redirect checks, dated (see `link_checks`).
+    Links,
     /// The blocks the change copied, under Changes.
     Mirrors,
     /// The sibling PRs of a multi-repo run, in merge order.
@@ -118,7 +120,8 @@ pub enum Section {
 }
 
 impl Section {
-    const ALL: [Section; 4] = [
+    const ALL: [Section; 5] = [
+        Section::Links,
         Section::Mirrors,
         Section::MergeOrder,
         Section::NotInPr,
@@ -128,6 +131,7 @@ impl Section {
     /// Its start and end markers.
     pub fn markers(self) -> (&'static str, &'static str) {
         match self {
+            Section::Links => (super::link_checks::START, super::link_checks::END),
             Section::Mirrors => ("<!-- coderhelm:mirrors -->", "<!-- /coderhelm:mirrors -->"),
             Section::MergeOrder => (
                 "<!-- coderhelm:merge-order -->",
@@ -165,6 +169,7 @@ pub fn split_section(body: &str, start: &str, end: &str) -> (String, String) {
 /// CoderHelm's own sections of a description, as written.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Owned {
+    pub links: String,
     pub mirrors: String,
     pub merge_order: String,
     pub not_in_pr: String,
@@ -174,6 +179,7 @@ pub struct Owned {
 impl Owned {
     fn slot(&mut self, s: Section) -> &mut String {
         match s {
+            Section::Links => &mut self.links,
             Section::Mirrors => &mut self.mirrors,
             Section::MergeOrder => &mut self.merge_order,
             Section::NotInPr => &mut self.not_in_pr,
@@ -285,18 +291,23 @@ pub fn normalize_open_items(section: &str) -> String {
 }
 
 /// Puts a description together in its order: the writer's Summary and
-/// Changes, then the blocks the change mirrors, the merge order and the
+/// Changes, then the link and redirect checks, the blocks the change mirrors, the merge order and the
 /// steps not in this PR (before the Risk heading, or before Verification
 /// when there is no Risk), the writer's Risk and Verification, then Open
 /// items at the bottom, above the footer. Empty sections are left out.
 pub fn assemble(rest: &str, owned: &Owned) -> String {
     let (main, footer) = split_footer(rest);
     let main = main.trim();
-    let middle: Vec<&str> = [&owned.mirrors, &owned.merge_order, &owned.not_in_pr]
-        .into_iter()
-        .map(|s| s.trim())
-        .filter(|s| !s.is_empty())
-        .collect();
+    let middle: Vec<&str> = [
+        &owned.links,
+        &owned.mirrors,
+        &owned.merge_order,
+        &owned.not_in_pr,
+    ]
+    .into_iter()
+    .map(|s| s.trim())
+    .filter(|s| !s.is_empty())
+    .collect();
     let mut body = if middle.is_empty() {
         main.to_string()
     } else {
@@ -1036,9 +1047,29 @@ mod tests {
     }
 
     #[test]
+    fn link_checks_go_before_risk_and_survive_a_rewrite() {
+        let links = format!(
+            "{}\n## Link and redirect checks\n| a | b |\n{}",
+            super::super::link_checks::START,
+            super::super::link_checks::END
+        );
+        let body = with_section(
+            "**Summary** x\n\n**Changes**\n* y\n\n**Risk** Low",
+            Section::Links,
+            links.clone(),
+        );
+        assert!(body.find("Link and redirect").unwrap() < body.find("**Risk**").unwrap());
+        let (owned, rest) = take_owned(&body);
+        assert_eq!(owned.links, links);
+        assert!(!rest.contains("Link and redirect"));
+        assert!(!with_section(&body, Section::Links, String::new()).contains("Link and redirect"));
+    }
+
+    #[test]
     fn the_description_is_put_together_in_its_order() {
         let writer = "Closes #9\n\n**Summary** The report needs a reader.\n\n**Changes**\n* **Users** add `analytics_reader`\n\n**Risk** **Low**: one new user.\n\n**Verification**\n1. Run the plan.";
         let owned = Owned {
+            links: String::new(),
             mirrors: mirrors_section(&[Mirror {
                 path: "envs/prod/users.tf".into(),
                 name: "billing_reader".into(),

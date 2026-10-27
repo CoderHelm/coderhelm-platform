@@ -1298,6 +1298,41 @@ async fn merge(
     quarantined: Option<Vec<String>>,
 ) -> Result<Next, BoxError> {
     let (owner, repo) = (msg.repo_owner.as_str(), msg.repo_name.as_str());
+    // CoderHelm's own PR: its redirects and links are checked again right
+    // before merging, the description's dated table updated, and a target
+    // that fails now stops the merge.
+    if msg.self_authored {
+        if let Some(r) = super::link_checks::refresh_pr(
+            state,
+            github,
+            &msg.team_id,
+            owner,
+            repo,
+            msg.pr_number,
+            "",
+            true,
+        )
+        .await
+        .filter(|r| !r.blocking.is_empty())
+        {
+            let reason = format!(
+                "Link and redirect checks fail now: {}",
+                common::truncate_str(&r.blocking.join("; "), 300)
+            );
+            warn!(pr = msg.pr_number, reason = %reason, "await-merge: not merging");
+            lines.push((Mark::Blocked, reason.clone()));
+            set_state(state, msg, STATE_DECLINED, &reason).await;
+            let body = render_status(
+                &msg.head_sha,
+                &msg.base_branch,
+                &lines,
+                None,
+                Some(&control_url(state, msg, Control::Stop)),
+            );
+            publish_status(state, github, msg, record, &body).await;
+            return Ok(Next::Stop);
+        }
+    }
     match github
         .merge_pull_request(owner, repo, msg.pr_number, &msg.head_sha, &cfg.merge_method)
         .await?

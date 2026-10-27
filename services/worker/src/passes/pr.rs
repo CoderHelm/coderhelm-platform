@@ -36,6 +36,9 @@ pub struct Proof<'a> {
     /// For a run started from a log finding: what its evidence step found.
     /// The description is checked against it (see `log_fix_checks`).
     pub log: Option<&'a super::log_evidence::LogEvidence>,
+    /// The live link and redirect checks' section (see `link_checks`),
+    /// empty when the change has no redirects or links.
+    pub links: &'a str,
 }
 
 /// What the writer is told about the checks CI runs on the PR: never a
@@ -449,6 +452,19 @@ Return ONLY the markdown body text."#,
         }
         None => body_text,
     };
+
+    // The description names only entries and files the diff contains.
+    let body_text = super::link_checks::enforce_claims(
+        state,
+        provider,
+        &system,
+        &mut messages,
+        write_opts,
+        usage,
+        &diff,
+        body_text,
+    )
+    .await;
 
     // A Verification step never asks a person to run what CI runs on the PR.
     let body_text = ci_verification(&body_text, proof.ci);
@@ -1321,6 +1337,7 @@ fn is_lockfile(path: &str) -> bool {
 /// ([`link_siblings`]).
 fn owned_sections(plan: &PlanResult, proof: &Proof<'_>, repo: &str) -> super::completeness::Owned {
     super::completeness::Owned {
+        links: proof.links.to_string(),
         mirrors: super::completeness::mirrors_section(proof.mirrors),
         merge_order: String::new(),
         not_in_pr: super::completeness::for_people_section(
@@ -1458,25 +1475,27 @@ Return ONLY the markdown body text, then a line `{CHANGES_MARK}` and one bullet 
         "user".to_string(),
         vec![serde_json::json!({"type": "text", "text": prompt})],
     )];
+    let system = format!(
+        "You keep pull request descriptions accurate to their code.{}",
+        super::team_instructions_block(team_instructions)
+    );
+    let opts = llm::ConverseOptions {
+        max_turns: 1,
+        max_tokens: 4096,
+        deadline: None,
+        effort: Some("low"),
+    };
     let text = match provider::converse(
         state,
         provider,
         common::agent_policy::Agent::Coder,
         provider.primary_model_id(),
-        &format!(
-            "You keep pull request descriptions accurate to their code.{}",
-            super::team_instructions_block(team_instructions)
-        ),
+        &system,
         &mut messages,
         &[],
         &super::triage::NoOpExecutor,
         usage,
-        llm::ConverseOptions {
-            max_turns: 1,
-            max_tokens: 4096,
-            deadline: None,
-            effort: Some("low"),
-        },
+        opts,
         None,
         None,
     )
@@ -1489,6 +1508,20 @@ Return ONLY the markdown body text, then a line `{CHANGES_MARK}` and one bullet 
         }
     };
     let (written, changes) = split_changes(&text);
+    // Rewritten from the diff on every push: it names only entries and
+    // files the diff contains.
+    let written = super::link_checks::enforce_claims(
+        state,
+        provider,
+        &system,
+        &mut messages,
+        opts,
+        usage,
+        &diff,
+        written,
+    )
+    .await;
+    let written = split_changes(&written).0;
     if !keeps_ticket_line(&old, &written) {
         warn!(
             pr_number,
@@ -1844,6 +1877,7 @@ mod refresh_tests {
             ci: &[],
             mirrors: &mirrors,
             log: None,
+            links: "",
         };
         let owned = super::owned_sections(&plan, &proof, "acme/infra");
         let body = assemble(

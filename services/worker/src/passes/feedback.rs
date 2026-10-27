@@ -471,7 +471,7 @@ pub async fn run(
 ## Instructions
 For each comment:
 - **Question** — read the relevant code, answer concisely
-- **Change request** — fix the code (prefer edit_file for targeted changes, especially in large files; write_file only for whole-file rewrites), then confirm (e.g. "Done — added error handling.")
+- **Change request** — fix the code (prefer edit_file for targeted changes, especially in large files; write_file only for whole-file rewrites), then say what changed, where, and what you checked (e.g. "Pointed `/a` at `/b`; `/b` returns 200."). Never reply with only "Done" or "Fixed"
 - **Description change** — call update_pr_description with the change, in the person's words with every value they gave; don't commit anything for it
 
 If there are CI failures listed above, also fix those — read the failing files, diagnose the issue, and commit a fix.
@@ -739,6 +739,46 @@ Rules:
         description_reply(&asked, changed.as_deref())
     } else {
         String::new()
+    };
+
+    // Redirects and links the PR changes are checked again after a push
+    // (or when the evidence is a day old) and the description's table
+    // updated in the same round; replies point at it, and a bare "Done" is
+    // replaced by where the evidence is.
+    let links = super::link_checks::refresh_pr(
+        state,
+        &github,
+        &msg.team_id,
+        &msg.repo_owner,
+        &msg.repo_name,
+        msg.pr_number,
+        &msg.run_id,
+        fix_pushed,
+    )
+    .await;
+    let head_sha = if fix_pushed {
+        github
+            .get_pull_request(&msg.repo_owner, &msg.repo_name, msg.pr_number)
+            .await
+            .ok()
+            .and_then(|p| p["head"]["sha"].as_str().map(String::from))
+    } else {
+        None
+    };
+    let pr_url = format!(
+        "https://github.com/{}/{}/pull/{}",
+        msg.repo_owner, msg.repo_name, msg.pr_number
+    );
+    let sections: Vec<String> = sections
+        .iter()
+        .map(|s| {
+            super::link_checks::evidenced_reply(s, links.as_ref(), &pr_url, head_sha.as_deref())
+        })
+        .collect();
+    let response = if sections.is_empty() {
+        response
+    } else {
+        sections.join("\n---SPLIT---\n")
     };
 
     // Which team agents were asked goes once, on the last reply, after what
