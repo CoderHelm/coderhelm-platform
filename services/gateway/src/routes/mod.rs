@@ -51,6 +51,7 @@ pub mod roles;
 pub mod run_answer;
 pub mod run_close;
 pub mod run_search;
+pub mod run_trigger;
 pub mod search;
 pub mod setup;
 pub mod setup_checks;

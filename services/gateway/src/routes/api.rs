@@ -6,6 +6,7 @@ use std::sync::Arc;
 use tracing::{error, info, warn};
 
 use super::run_search;
+use super::run_trigger;
 use crate::auth::jwt;
 use crate::middleware::auth::SESSION_TTL_SECS;
 use crate::models::{
@@ -678,6 +679,10 @@ pub struct RunsQuery {
     /// One repo, `owner/name` (exact, case-insensitive).
     #[param(example = "acme/web")]
     repo: Option<String>,
+    /// Comma-separated ways the run was started (`trigger.kind`): `jira`,
+    /// `github`, `coderhelm`, `alert`, `plan`, `dashboard`, `chat`.
+    #[param(example = "coderhelm,alert")]
+    started_by: Option<String>,
 }
 
 /// One run in a list.
@@ -728,6 +733,10 @@ pub struct RunSummary {
     /// When the run started (RFC 3339).
     #[schema(example = "2026-10-22T14:03:11Z")]
     pub created_at: Option<String>,
+    /// How the run was started and by whom, worked out from the fields
+    /// above and what started it. Show this instead of an internal
+    /// `ticket_id` such as `E2E-FIX-…`.
+    pub trigger: run_trigger::RunTrigger,
 }
 
 /// A page of runs.
@@ -776,7 +785,8 @@ pub async fn list_runs(
         params.status.as_deref(),
         params.source.as_deref(),
     )
-    .with_repo(params.repo.as_deref());
+    .with_repo(params.repo.as_deref())
+    .with_started_by(params.started_by.as_deref());
     let mut start = params.cursor.as_deref().filter(|c| c.len() <= 64).map(|c| {
         std::collections::HashMap::from([
             ("team_id".to_string(), attr_s(&claims.team_id)),
@@ -844,9 +854,11 @@ pub async fn list_runs(
             .and_then(|v| v.as_n().ok())
             .and_then(|n| n.parse::<u64>().ok())
     };
+    let lookups = run_trigger::load_lookups(&state, &claims.team_id, matched.iter()).await;
     let runs: Vec<RunSummary> = matched
         .iter()
         .map(|item| RunSummary {
+            trigger: run_trigger::trigger(item, &lookups),
             run_id: str_of(item, "run_id"),
             status: str_of(item, "status"),
             ticket_source: str_of(item, "ticket_source"),
@@ -1030,6 +1042,8 @@ pub struct Run {
     /// The run that picked the answers up and continued the work.
     #[schema(example = json!(null))]
     pub continued_run_id: Option<String>,
+    /// How the run was started and by whom (as in the runs list).
+    pub trigger: run_trigger::RunTrigger,
 }
 
 /// A question a run asked a person.
@@ -1196,6 +1210,7 @@ pub async fn get_run(
         (tokens_in, tokens_out, cache_read, cache_write, cost_usd)
     };
 
+    let lookups = run_trigger::load_lookups(&state, &claims.team_id, [item]).await;
     Ok(Json(run_of(
         item,
         &run_id,
@@ -1206,6 +1221,7 @@ pub async fn get_run(
             cache_write,
             cost_usd,
         },
+        &lookups,
     )))
 }
 
@@ -1219,7 +1235,12 @@ struct RunUsage {
 }
 
 /// The run `get_run` answers with, from its row in the runs table.
-fn run_of(item: &run_search::Item, run_id: &str, usage: RunUsage) -> Run {
+fn run_of(
+    item: &run_search::Item,
+    run_id: &str,
+    usage: RunUsage,
+    lookups: &run_trigger::Lookups,
+) -> Run {
     let RunUsage {
         tokens_in,
         tokens_out,
@@ -1258,6 +1279,7 @@ fn run_of(item: &run_search::Item, run_id: &str, usage: RunUsage) -> Run {
     };
     let asked = run_asked(item);
     Run {
+        trigger: run_trigger::trigger(item, lookups),
         run_id: run_id.to_string(),
         status: st("status"),
         ticket_source: st("ticket_source"),
@@ -5513,15 +5535,21 @@ mod tests {
             cache_write: 0,
             cost_usd: 0.0,
         };
-        let run =
-            serde_json::to_value(run_of(&item, "01JB8X6F4M2C9QZ3T7V5W1K0HA", usage())).unwrap();
+        let run = serde_json::to_value(run_of(
+            &item,
+            "01JB8X6F4M2C9QZ3T7V5W1K0HA",
+            usage(),
+            &Default::default(),
+        ))
+        .unwrap();
         assert_eq!(run["run_id"], "01JB8X6F4M2C9QZ3T7V5W1K0HA");
         assert_eq!(run["status"], "completed");
         // The id comes from the request, so a row without the attribute
         // still answers with it.
         let bare =
             std::collections::HashMap::from([("status".to_string(), A::S("running".into()))]);
-        let run = serde_json::to_value(run_of(&bare, "01JB8Y", usage())).unwrap();
+        let run =
+            serde_json::to_value(run_of(&bare, "01JB8Y", usage(), &Default::default())).unwrap();
         assert_eq!(run["run_id"], "01JB8Y");
         assert_eq!(run["questions"], json!([]));
         assert_eq!(run["answers"], json!([]));
@@ -5564,6 +5592,7 @@ mod tests {
                 cache_write: 0,
                 cost_usd: 0.0,
             },
+            &Default::default(),
         ))
         .unwrap();
         assert_eq!(

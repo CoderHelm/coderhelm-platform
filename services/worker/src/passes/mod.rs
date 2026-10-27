@@ -4717,6 +4717,32 @@ async fn create_run_record(
             put = put.item("requester_email", attr_s(&r.email));
         }
     }
+    // A ticket a plan's task opened: the run says which plan (see
+    // plan_execute::link_ticket_to_plan, which also covers a run that
+    // starts before the link is written).
+    let plan_ticket = match msg.source {
+        TicketSource::Github if msg.issue_number > 0 => Some(plan_execute::PlanTicket::Github {
+            repo: &repo,
+            issue_number: msg.issue_number,
+        }),
+        TicketSource::Jira if !msg.ticket_id.is_empty() => {
+            Some(plan_execute::PlanTicket::Jira(&msg.ticket_id))
+        }
+        _ => None,
+    };
+    if let Some(ticket) = plan_ticket {
+        if let Some((plan_id, title, by)) =
+            plan_execute::plan_of_ticket(state, &msg.team_id, &ticket).await
+        {
+            put = put.item("plan_id", attr_s(&plan_id));
+            if !title.is_empty() {
+                put = put.item("plan_title", attr_s(&title));
+            }
+            if !by.is_empty() {
+                put = put.item("plan_by", attr_s(&by));
+            }
+        }
+    }
     put.send().await?;
     self::webhooks::emit_run(state, &msg.team_id, run_id, "running").await;
 
