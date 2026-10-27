@@ -144,6 +144,10 @@ pub async fn run(
         }
     };
 
+    // The run's ticket and what its requester said not to do in earlier
+    // rounds: a stored "one push" skips the extra update push below.
+    let ticket_info = super::review_fix::Ticket::load(state, &msg.team_id, &msg.run_id).await;
+
     // Whether the pre-feedback conflict resolution pushed a merge commit —
     // that push triggers CI, so completing without awaiting_ci would leave
     // the CI result with no consumer (and a salvaged draft PR stuck in
@@ -205,7 +209,13 @@ pub async fn run(
             // `main`-only files that would masquerade as out-of-scope changes and
             // trigger an endless revert/re-merge loop.
             let base_branch = resolve_pr_base(&github, &msg).await;
-            if !branch.is_empty() {
+            // The start-of-round update. "One push" skips it, unless a
+            // person explicitly asked for the update (then it is the push).
+            let may_update = ticket_info.constraints.may_update_branch(false);
+            if !branch.is_empty() && !may_update {
+                info!(run_id = %msg.run_id, "The requester asked for one push — not pushing a conflict merge first");
+            }
+            if !branch.is_empty() && may_update {
                 // The run's ticket, so the merge commit carries its real key.
                 let ticket_msg = crate::models::TicketMessage {
                     team_id: msg.team_id.clone(),
@@ -401,6 +411,29 @@ pub async fn run(
 
     let formatted = format_review_comments(&msg.review_body, &comments);
 
+    // What the person asked CoderHelm not to do ("don't comment", "don't
+    // merge", "one push"), read from the ticket and this thread by the
+    // model; the passes obey it.
+    let human_round = !(comments.is_empty() && msg.review_body.trim().is_empty());
+    let constraints = if human_round {
+        super::review_fix::read_constraints(
+            state,
+            &github,
+            &provider,
+            &msg.team_id,
+            &msg.run_id,
+            &msg.repo_owner,
+            &msg.repo_name,
+            msg.pr_number,
+            &ticket_info,
+            &formatted,
+            &mut usage,
+        )
+        .await
+    } else {
+        ticket_info.constraints.clone()
+    };
+
     // Load voice instructions (repo-specific falls back to global)
     let voice = {
         let repo_voice = super::load_content(
@@ -451,7 +484,12 @@ pub async fn run(
          banner, a name in it), call update_pr_description with exactly what to change; never \
          edit files for that. CoderHelm rewrites the description and adds what changed to your \
          reply. \
-         Your output is posted directly as a GitHub comment — write natural replies, no meta-commentary.{voice_block}{team_block}{tests_block}",
+         Change only what each comment asks for: code next to it that looks alike but that the \
+         comment did not name stays exactly as it is. \
+         Your changes land on the pull request as one commit in one push when you finish, after \
+         CoderHelm checks them (scope, logs, the full test suite). \
+         Your output is posted directly as a GitHub comment — write natural replies, no meta-commentary.{voice_block}{team_block}{tests_block}{logs_block}",
+        logs_block = super::review_fix::logs::GUIDANCE,
         owner = msg.repo_owner,
         repo = msg.repo_name,
     );
@@ -499,7 +537,7 @@ If multiple comments, write a separate reply for each, separated by `---SPLIT---
 Rules:
 - Address every comment
 - Follow the reviewer's suggestions exactly unless they conflict with codebase conventions
-- Don't make unrelated changes
+- Don't make unrelated changes: change only what the comment names. Similar code nearby that the comment didn't point at stays as it is
 - {commit_hint}
 - Use GitHub markdown (backticks for code, triple-backtick for blocks)
 - Keep replies SHORT — 1-2 sentences max. Just say what you did, not what was wrong or why. Example: "Fixed — reformatted to multi-line with trailing comma." Do NOT list every file or explain every change in detail."#,
@@ -757,7 +795,7 @@ Rules:
     )];
 
     let model_id = provider.primary_model_id();
-    let response = provider::converse(
+    let mut response = provider::converse(
         state,
         &provider,
         common::agent_policy::Agent::Coder,
@@ -832,6 +870,255 @@ Rules:
         common::truncate_str(&response, 200)
     );
 
+    // What the round wrote is on its WIP branch. Check it (scope against
+    // the threads, logs, the full test suite), give the agent one fix-up
+    // turn for what the checks find, check again, then land it as the
+    // round's one commit, or hold it.
+    let mut checks_round = super::review_fix::Round::new(
+        state,
+        &github,
+        &provider,
+        &msg.team_id,
+        &msg.run_id,
+        &msg.repo_owner,
+        &msg.repo_name,
+        &feedback_round.wip_branch,
+        msg.pr_number,
+    );
+    checks_round.requests = review_requests(&comments);
+    checks_round.review_body = msg.review_body.clone();
+    checks_round.ci_failures = has_ci_failures;
+    checks_round.deadline = Some(super::round::deadline(start));
+    let land_pr = super::round::Pr {
+        github: &github,
+        owner: &msg.repo_owner,
+        repo: &msg.repo_name,
+        branch: &branch,
+    };
+    let mut fix_pushed = false;
+    let mut held: Vec<String> = Vec::new();
+    let mut evidence_lines: Vec<String> = Vec::new();
+    let mut dismissed: Vec<String> = Vec::new();
+    let mut commit_subject = String::new();
+    if *executor.files_modified.lock().unwrap() {
+        let load = || {
+            super::review_fix::load_wip(
+                &github,
+                &msg.repo_owner,
+                &msg.repo_name,
+                &feedback_round.base_sha,
+                &feedback_round.wip_branch,
+            )
+        };
+        let staged = load().await;
+        let loaded = staged.changes();
+        let first = super::review_fix::check(&checks_round, &staged, &mut usage, false).await;
+        super::review_fix::write_back(
+            &github,
+            &msg.repo_owner,
+            &msg.repo_name,
+            &feedback_round.wip_branch,
+            &loaded,
+            &staged,
+        )
+        .await;
+        let (staged, last) = match first.retry_prompt() {
+            Some(fix_up) => {
+                info!(run_id = %msg.run_id, findings = first.findings.len(), "Review fix checks found problems — one fix-up turn");
+                messages.push((
+                    "user".to_string(),
+                    vec![serde_json::json!({"type": "text", "text": fix_up})],
+                ));
+                match provider::converse(
+                    state,
+                    &provider,
+                    common::agent_policy::Agent::Coder,
+                    model_id,
+                    &full_system,
+                    &mut messages,
+                    &tools,
+                    &executor,
+                    &mut usage,
+                    llm::ConverseOptions {
+                        max_turns: 20,
+                        max_tokens: 16384,
+                        deadline: Some(super::round::deadline(start)),
+                        effort: None,
+                    },
+                    None,
+                    None,
+                )
+                .await
+                {
+                    Ok(again)
+                        if !again.trim().is_empty()
+                            && !super::implement::reached_deadline(
+                                &again,
+                                Some(super::round::deadline(start)),
+                                std::time::Instant::now(),
+                            ) =>
+                    {
+                        response = again
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        warn!(run_id = %msg.run_id, error = %e, "Fix-up turn failed — checking the round as it stands")
+                    }
+                }
+                // What the first check took out stays on the record.
+                evidence_lines.extend(
+                    first
+                        .evidence
+                        .iter()
+                        .filter(|l| l.starts_with("Scope: took out"))
+                        .cloned(),
+                );
+                let staged = load().await;
+                let loaded = staged.changes();
+                let last = super::review_fix::check(&checks_round, &staged, &mut usage, true).await;
+                super::review_fix::write_back(
+                    &github,
+                    &msg.repo_owner,
+                    &msg.repo_name,
+                    &feedback_round.wip_branch,
+                    &loaded,
+                    &staged,
+                )
+                .await;
+                (staged, last)
+            }
+            None => (staged, first),
+        };
+        evidence_lines.extend(last.evidence.iter().cloned());
+        held = last.hold.clone();
+        if staged.is_empty() && held.is_empty() {
+            held.push(
+                "every change was outside what the review comments asked for, so nothing was pushed"
+                    .to_string(),
+            );
+        }
+        if held.is_empty() {
+            let (message, how) = super::review_fix::commit_message(
+                &github,
+                &msg.repo_owner,
+                &msg.repo_name,
+                &base,
+                &executor.commits.0,
+                &executor.commits.1,
+                &staged.messages(),
+            )
+            .await;
+            evidence_lines.push(format!("Commit message: {how}"));
+            commit_subject = message.lines().next().unwrap_or("").to_string();
+            let approvers_before = github
+                .list_pr_reviews(&msg.repo_owner, &msg.repo_name, msg.pr_number)
+                .await
+                .map(|r| super::review_fix::approvals::approvers(&r))
+                .unwrap_or_default();
+            // The round's own landing: one commit, one push.
+            match super::round::land(
+                &land_pr,
+                &feedback_round.wip_branch,
+                &feedback_round.base_sha,
+                &message,
+            )
+            .await
+            {
+                super::round::Landed::Pushed { .. } => {
+                    fix_pushed = true;
+                    dismissed = super::review_fix::dismissed_after_push(
+                        &github,
+                        &msg.repo_owner,
+                        &msg.repo_name,
+                        msg.pr_number,
+                        &approvers_before,
+                    )
+                    .await;
+                }
+                super::round::Landed::Nothing => {}
+                super::round::Landed::Refused(why) => {
+                    super::round::finish_incomplete(
+                        state,
+                        &msg.team_id,
+                        &msg.run_id,
+                        &land_pr,
+                        &feedback_round,
+                        &format!("its changes couldn't land on the pull request: {why}"),
+                    )
+                    .await;
+                    super::webhooks::emit_run(state, &msg.team_id, &msg.run_id, "completed").await;
+                    return Ok(());
+                }
+            }
+        } else {
+            info!(run_id = %msg.run_id, reasons = ?held, "Review fix held — not landed; its WIP branch is kept");
+        }
+        let head = if fix_pushed {
+            super::round::branch_head(&github, &msg.repo_owner, &msg.repo_name, &branch).await
+        } else {
+            String::new()
+        };
+        let round_record = super::review_fix::evidence::Round {
+            date: chrono::Utc::now().format("%Y-%m-%d").to_string(),
+            commit: head[..head.len().min(7)].to_string(),
+            headline: if fix_pushed {
+                commit_subject.clone()
+            } else {
+                held.join("; ")
+            },
+            lines: {
+                let mut l = evidence_lines.clone();
+                if !dismissed.is_empty() {
+                    l.push(format!(
+                        "Approvals dismissed by the push: {}; told the requester",
+                        dismissed.join(", ")
+                    ));
+                }
+                if !constraints.is_empty() {
+                    l.push(format!(
+                        "Requester constraints obeyed: {}",
+                        constraints.lines().join(", ")
+                    ));
+                }
+                l
+            },
+        };
+        if fix_pushed || !held.is_empty() {
+            super::review_fix::record_round(
+                &github,
+                &msg.repo_owner,
+                &msg.repo_name,
+                msg.pr_number,
+                &round_record,
+            )
+            .await;
+        }
+    }
+    if !dismissed.is_empty() {
+        super::review_fix::mark_reapproval(state, &msg.team_id, &msg.run_id, &dismissed).await;
+        super::review_fix::tell_requester(
+            state,
+            &github,
+            &msg.team_id,
+            &msg.run_id,
+            &ticket_info,
+            "Approval needed again",
+            &super::review_fix::approvals::notice_plain(&checks_round.pr_url(), &dismissed),
+        )
+        .await;
+    }
+    // A held round's replies say so, first.
+    let response = super::review_fix::held_replies(&response, &held);
+    // Who must approve again, on the reply to the person who asked.
+    let reapproval_note = if dismissed.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "\n\n{}",
+            super::review_fix::approvals::notice(&checks_round.pr_url(), &dismissed)
+        )
+    };
+
     // Reply to each review comment in its own thread.
     // Split the response by ---SPLIT--- markers to get per-comment replies.
     let sections: Vec<&str> = response
@@ -843,49 +1130,7 @@ Rules:
     // The description: rewritten when the code changed (so it stays true)
     // or when a person with write access asked for a change to it, even
     // with no code change. What changed goes on the reply.
-    // The round's changes land on the pull request as one commit, one push.
-    let fix_pushed = if *executor.files_modified.lock().unwrap() {
-        let pr = super::round::Pr {
-            github: &github,
-            owner: &msg.repo_owner,
-            repo: &msg.repo_name,
-            branch: &branch,
-        };
-        let ticket_msg = crate::models::TicketMessage {
-            ticket_id: ticket.0.clone(),
-            title: ticket.1.clone(),
-            issue_number: ticket.2,
-            ..Default::default()
-        };
-        let message =
-            super::round::round_message(state, &msg.team_id, &ticket_msg, &feedback_round).await;
-        match super::round::land(
-            &pr,
-            &feedback_round.wip_branch,
-            &feedback_round.base_sha,
-            &message,
-        )
-        .await
-        {
-            super::round::Landed::Pushed { .. } => true,
-            super::round::Landed::Nothing => false,
-            super::round::Landed::Refused(why) => {
-                super::round::finish_incomplete(
-                    state,
-                    &msg.team_id,
-                    &msg.run_id,
-                    &pr,
-                    &feedback_round,
-                    &format!("its changes couldn't land on the pull request: {why}"),
-                )
-                .await;
-                super::webhooks::emit_run(state, &msg.team_id, &msg.run_id, "completed").await;
-                return Ok(());
-            }
-        }
-    } else {
-        false
-    };
+    // The round's changes landed above, as one commit in one push.
     let asked = executor.description.taken();
     let description_note = if fix_pushed || !asked.is_empty() {
         let changed = super::pr::refresh_description(
@@ -921,8 +1166,9 @@ Rules:
     )
     .await;
     // What the failing-test rules refuse in the pushed change is said on
-    // the PR (the ready check keeps it a draft).
-    if fix_pushed {
+    // the PR (the ready check keeps it a draft), unless the requester asked
+    // for no PR comments.
+    if fix_pushed && constraints.may_comment() {
         super::test_fix::after_feedback(
             state,
             &github,
@@ -961,7 +1207,7 @@ Rules:
     // Which team agents were asked goes once, on the last reply, after what
     // changed in the description.
     let consulted = format!(
-        "{description_note}{}",
+        "{description_note}{}{reapproval_note}",
         skills
             .as_ref()
             .map(|s| s.consulted_markdown(super::skills::app_url(&state.config.stage)))
@@ -974,7 +1220,24 @@ Rules:
         .filter(|c| c.comment_id.is_some() && !c.is_context)
         .collect();
 
-    if let Some(reply) = top_level_reply(
+    if !constraints.may_comment() {
+        // The requester said not to post on the pull request: the replies go
+        // to them on the run page and the ticket instead.
+        let text = format!("{}{consulted}", response.replace("---SPLIT---", "\n\n"));
+        if !actionable_comments.is_empty() || !msg.trigger_author.trim().is_empty() {
+            super::review_fix::tell_requester(
+                state,
+                &github,
+                &msg.team_id,
+                &msg.run_id,
+                &ticket_info,
+                &format!("Review fix on pull request #{}", msg.pr_number),
+                text.trim(),
+            )
+            .await;
+        }
+        info!(run_id = %msg.run_id, "Requester asked for no PR comments — replies sent to the run and the ticket");
+    } else if let Some(reply) = top_level_reply(
         &msg.trigger_author,
         actionable_comments.len(),
         &response,
@@ -1427,6 +1690,26 @@ fn format_review_comments(review_body: &str, comments: &[ReviewComment]) -> Stri
     }
 
     parts.join("\n")
+}
+
+/// What each review thread asks, for the scope check: one request per
+/// comment to answer, with the earlier comments of its thread (same file
+/// and line) as context.
+fn review_requests(comments: &[ReviewComment]) -> Vec<super::review_fix::scope::Request> {
+    comments
+        .iter()
+        .filter(|c| !c.is_context)
+        .map(|c| super::review_fix::scope::Request {
+            path: c.path.clone(),
+            line: c.line,
+            body: c.body.clone(),
+            context: comments
+                .iter()
+                .filter(|o| o.is_context && o.path == c.path && o.line == c.line)
+                .map(|o| o.body.clone())
+                .collect(),
+        })
+        .collect()
 }
 
 /// Fetch review comments from GitHub API for a given review.
@@ -3154,6 +3437,37 @@ async fn ensure_pr_open(
     }
 
     true
+}
+
+#[cfg(test)]
+mod review_request_tests {
+    use super::*;
+
+    fn comment(path: &str, line: u64, body: &str, context: bool) -> ReviewComment {
+        ReviewComment {
+            path: path.into(),
+            line: Some(line),
+            body: body.into(),
+            comment_id: Some(line),
+            node_id: None,
+            is_context: context,
+        }
+    }
+
+    #[test]
+    fn each_comment_to_answer_is_one_request_with_its_own_thread_as_context() {
+        let comments = vec![
+            comment("jobs/sync.py", 10, "[alice]: why INFO?", true),
+            comment("jobs/sync.py", 30, "[bob]: unrelated", true),
+            comment("jobs/sync.py", 10, "Make this DEBUG", false),
+            comment("api/views.py", 5, "Rename this", false),
+        ];
+        let r = review_requests(&comments);
+        assert_eq!(r.len(), 2);
+        assert_eq!(r[0].body, "Make this DEBUG");
+        assert_eq!(r[0].context, vec!["[alice]: why INFO?".to_string()]);
+        assert!(r[1].context.is_empty());
+    }
 }
 
 #[cfg(test)]

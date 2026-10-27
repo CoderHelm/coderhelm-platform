@@ -1298,6 +1298,31 @@ async fn merge(
     quarantined: Option<Vec<String>>,
 ) -> Result<Next, BoxError> {
     let (owner, repo) = (msg.repo_owner.as_str(), msg.repo_name.as_str());
+    // The person who asked for the work said not to merge it (read from the
+    // ticket and the review thread, see `review_fix::constraints`): the gate
+    // never merges it, whatever the team's on-approve setting.
+    let asked =
+        super::review_fix::pr_constraints(state, &msg.team_id, owner, repo, msg.pr_number).await;
+    if !asked.may_merge() {
+        let reason = format!(
+            "The requester asked not to merge this pull request (\"{}\")",
+            asked.quotes.join("\", \"")
+        );
+        info!(pr = msg.pr_number, reason = %reason, "await-merge: not merging");
+        lines.push((Mark::Blocked, reason.clone()));
+        set_state(state, msg, STATE_DECLINED, &reason).await;
+        if asked.may_comment() {
+            let body = render_status(
+                &msg.head_sha,
+                &msg.base_branch,
+                &lines,
+                None,
+                Some(&control_url(state, msg, Control::Stop)),
+            );
+            publish_status(state, github, msg, record, &body).await;
+        }
+        return Ok(Next::Stop);
+    }
     // CoderHelm's own PR: its redirects and links are checked again right
     // before merging, the description's dated table updated, and a target
     // that fails now stops the merge.

@@ -115,16 +115,20 @@ pub enum Section {
     MergeOrder,
     /// The steps outside this PR, each with its owner.
     NotInPr,
+    /// What each review fix round checked before its push (see
+    /// `review_fix`).
+    ReviewFixes,
     /// What is still open, at the bottom (#238's "Not yet verified").
     OpenItems,
 }
 
 impl Section {
-    const ALL: [Section; 5] = [
+    const ALL: [Section; 6] = [
         Section::Links,
         Section::Mirrors,
         Section::MergeOrder,
         Section::NotInPr,
+        Section::ReviewFixes,
         Section::OpenItems,
     ];
 
@@ -140,6 +144,10 @@ impl Section {
             Section::NotInPr => (
                 "<!-- coderhelm:not-in-pr -->",
                 "<!-- /coderhelm:not-in-pr -->",
+            ),
+            Section::ReviewFixes => (
+                super::review_fix::evidence::START,
+                super::review_fix::evidence::END,
             ),
             Section::OpenItems => (super::proof::UNVERIFIED_START, super::proof::UNVERIFIED_END),
         }
@@ -173,6 +181,7 @@ pub struct Owned {
     pub mirrors: String,
     pub merge_order: String,
     pub not_in_pr: String,
+    pub review_fixes: String,
     pub open_items: String,
 }
 
@@ -183,6 +192,7 @@ impl Owned {
             Section::Mirrors => &mut self.mirrors,
             Section::MergeOrder => &mut self.merge_order,
             Section::NotInPr => &mut self.not_in_pr,
+            Section::ReviewFixes => &mut self.review_fixes,
             Section::OpenItems => &mut self.open_items,
         }
     }
@@ -303,6 +313,7 @@ pub fn assemble(rest: &str, owned: &Owned) -> String {
         &owned.mirrors,
         &owned.merge_order,
         &owned.not_in_pr,
+        &owned.review_fixes,
     ]
     .into_iter()
     .map(|s| s.trim())
@@ -1083,6 +1094,7 @@ mod tests {
                 0,
             ),
             not_in_pr: for_people_section(&[("Allow the IP".into(), "the network team".into())], &[]),
+            review_fixes: String::new(),
             open_items: format!(
                 "{}\n## Open items\n- **Waiting on CI:** tests did not run. Settles when this PR's CI passes. <!-- coderhelm:ci -->\n{}",
                 crate::passes::proof::UNVERIFIED_START,
