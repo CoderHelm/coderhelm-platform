@@ -6,10 +6,8 @@
 //! When the deployment uses Amazon Bedrock (`common::model_provider`), the
 //! same requests go to Bedrock and its events are read as the same SSE.
 
-use futures::StreamExt;
-
 use common::model_retry::{ModelCallError, ModelErrorKind};
-use common::model_stream::{send_metered, InFlight, SseParser};
+use common::model_stream::{send_metered, InFlight, MESSAGES_URL};
 use common::usage::{feature, with_feature, UsageMeter};
 use serde_json::{json, Value};
 
@@ -107,41 +105,25 @@ async fn whole_turn_via(
     feature_tag: &'static str,
 ) -> Result<Value, ModelCallError> {
     if let Via::Bedrock(bedrock_id) = via {
-        let (mut stream, mut flight) =
-            open_bedrock_stream(&bedrock_id, body, meter, model_id, feature_tag).await?;
-        let mut parser = SseParser::default();
-        while let Some(chunk) = stream.next().await {
-            match chunk {
-                Ok(c) => {
-                    for ev in parser.push(&c) {
-                        flight.acc.feed(&ev);
-                    }
-                }
-                Err(_) => break,
-            }
-        }
-        flight.finish().await;
-        let acc = std::mem::take(&mut flight.acc);
-        if let Some(err) = acc.stream_error() {
-            return Err(ModelCallError::new(
-                ModelErrorKind::Network,
-                err.to_string(),
-            ));
-        }
-        if !acc.finished() {
-            return Err(ModelCallError::new(
-                ModelErrorKind::Network,
-                "the Bedrock reply broke off",
-            ));
-        }
-        return Ok(acc.into_message());
+        let client = bedrock_client()?;
+        let bytes =
+            serde_json::to_vec(&common::model_provider::bedrock_body(body)).unwrap_or_default();
+        let call = common::model_stream::send_bedrock_metered(
+            client,
+            &bedrock_id,
+            &bytes,
+            &common::model_retry::INTERACTIVE_BACKOFF_SECS,
+            meter,
+            model_id,
+        );
+        return Ok(with_feature(feature_tag, call).await?.message);
     }
     let mut body = body.clone();
     body["stream"] = json!(true);
     let bytes = serde_json::to_vec(&body).unwrap_or_default();
     let call = send_metered(
         || {
-            http.post("https://api.anthropic.com/v1/messages")
+            http.post(MESSAGES_URL)
                 .header("x-api-key", api_key)
                 .header("anthropic-version", "2023-06-01")
                 .header("anthropic-beta", "prompt-caching-2024-07-31")
@@ -233,9 +215,9 @@ async fn open_stream(
         return open_bedrock_stream(&bedrock_id, body, meter, model_id, feature_tag).await;
     }
     let bytes = serde_json::to_vec(body).unwrap_or_default();
-    let resp = common::model_retry::send_streaming(
+    let open = common::model_stream::open_metered(
         || {
-            http.post("https://api.anthropic.com/v1/messages")
+            http.post(MESSAGES_URL)
                 .header("x-api-key", api_key)
                 .header("anthropic-version", "2023-06-01")
                 .header("anthropic-beta", "prompt-caching-2024-07-31")
@@ -244,29 +226,29 @@ async fn open_stream(
         },
         &common::model_retry::INTERACTIVE_BACKOFF_SECS,
         "plan_chat_stream",
-    )
-    .await?;
-    let request_id = resp
-        .headers()
-        .get("request-id")
-        .and_then(|v| v.to_str().ok())
-        .map(String::from);
-    let flight = with_feature(feature_tag, async {
-        InFlight::new(meter, model_id, request_id, bytes.len() as u64)
-    })
-    .await;
-    let stream = resp
-        .bytes_stream()
-        .map(|r| r.map(|b| b.to_vec()).map_err(|e| e.to_string()));
-    Ok((Box::pin(stream), flight))
+        meter,
+        model_id,
+        bytes.len() as u64,
+    );
+    with_feature(feature_tag, open).await
 }
 
 /// A plan chat reply's bytes as Anthropic SSE text.
-pub type ChatBytes = std::pin::Pin<Box<dyn futures::Stream<Item = Result<Vec<u8>, String>> + Send>>;
+pub type ChatBytes = common::model_stream::ReplyBytes;
+
+fn bedrock_client() -> Result<&'static aws_sdk_bedrockruntime::Client, ModelCallError> {
+    common::model_provider::any_bedrock_client().ok_or_else(|| {
+        ModelCallError::new(
+            ModelErrorKind::Network,
+            "Bedrock is the model provider but no client was set up",
+        )
+    })
+}
 
 /// The same request through Bedrock's streaming call, retried by status
-/// until a stream starts. Bedrock's events are framed as SSE, so callers
-/// read them exactly like the Anthropic API's.
+/// until a stream starts (`common::model_stream::open_bedrock_metered`).
+/// Bedrock's events are framed as SSE, so callers read them exactly like
+/// the Anthropic API's.
 async fn open_bedrock_stream(
     bedrock_id: &str,
     body: &Value,
@@ -274,62 +256,15 @@ async fn open_bedrock_stream(
     model_id: &str,
     feature_tag: &'static str,
 ) -> Result<(ChatBytes, InFlight), ModelCallError> {
-    use aws_sdk_bedrockruntime::types::ResponseStream;
-    use common::model_retry::{backoff, is_transient_status, INTERACTIVE_BACKOFF_SECS};
-    let Some(client) = common::model_provider::any_bedrock_client() else {
-        return Err(ModelCallError::new(
-            ModelErrorKind::Network,
-            "Bedrock is the model provider but no client was set up",
-        ));
-    };
+    let client = bedrock_client()?;
     let bytes = serde_json::to_vec(&common::model_provider::bedrock_body(body)).unwrap_or_default();
-    let mut attempt = 0;
-    let out = loop {
-        let result = client
-            .invoke_model_with_response_stream()
-            .model_id(bedrock_id)
-            .content_type("application/json")
-            .accept("application/json")
-            .body(aws_smithy_types::Blob::new(bytes.clone()))
-            .send()
-            .await;
-        match result {
-            Ok(out) => break out,
-            Err(e) => {
-                let status = e.raw_response().map(|r| r.status().as_u16());
-                let text = aws_sdk_bedrockruntime::error::DisplayErrorContext(&e).to_string();
-                if !status.is_none_or(is_transient_status)
-                    || attempt >= INTERACTIVE_BACKOFF_SECS.len()
-                {
-                    return Err(ModelCallError::new(
-                        status.map_or(ModelErrorKind::Network, ModelErrorKind::Status),
-                        text,
-                    ));
-                }
-                tracing::warn!(model = %bedrock_id, attempt, status = ?status, "Bedrock stream failed to start — retrying");
-                tokio::time::sleep(backoff(&INTERACTIVE_BACKOFF_SECS, attempt, None)).await;
-                attempt += 1;
-            }
-        }
-    };
-    let flight = with_feature(feature_tag, async {
-        InFlight::new(meter, model_id, None, bytes.len() as u64)
-    })
-    .await;
-    let events = futures::stream::unfold(Some(out.body), |rx| async move {
-        let mut rx = rx?;
-        match rx.recv().await {
-            Ok(Some(ResponseStream::Chunk(part))) => {
-                let raw = part.bytes.map(|b| b.into_inner()).unwrap_or_default();
-                Some((Ok(common::model_provider::sse_frame(&raw)), Some(rx)))
-            }
-            Ok(Some(_)) => Some((Ok(Vec::new()), Some(rx))),
-            Ok(None) => None,
-            Err(e) => Some((
-                Err(aws_sdk_bedrockruntime::error::DisplayErrorContext(&e).to_string()),
-                None,
-            )),
-        }
-    });
-    Ok((Box::pin(events), flight))
+    let open = common::model_stream::open_bedrock_metered(
+        client,
+        bedrock_id,
+        &bytes,
+        &common::model_retry::INTERACTIVE_BACKOFF_SECS,
+        meter,
+        model_id,
+    );
+    with_feature(feature_tag, open).await
 }

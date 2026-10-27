@@ -163,6 +163,70 @@ class UsageAccounting(unittest.TestCase):
         self.u.record_usage(Broken(), "t", "team1", "log_analysis", "claude-sonnet-5-5", {"input_tokens": 1})
 
 
+    def test_breakdowns_split_cache_writes_by_lifetime(self):
+        u = self.u.call_usage({"input_tokens": 1, "output_tokens": 1, "cache_creation_input_tokens": 30,
+                               "cache_creation": {"ephemeral_5m_input_tokens": 10, "ephemeral_1h_input_tokens": 20}})
+        _, names, values = self.u.add_expression("log_analysis", "claude-sonnet-5-5", u)
+        attrs = {names[k]: values[k.replace("#a", ":v")]["N"] for k in names}
+        self.assertEqual(attrs["feature#log_analysis#cache_write"], "30")
+        self.assertEqual(attrs["feature#log_analysis#cache_write_5m"], "10")
+        self.assertEqual(attrs["feature#log_analysis#cache_write_1h"], "20")
+        self.assertEqual(attrs["model#claude-sonnet-5-5#cache_write_1h"], "20")
+
+    def test_limits_match_the_rust_rules(self):
+        n = lambda v: {"N": str(v)}
+        month = {"total_tokens_in": n(100), "total_tokens_out": n(50),
+                 "cache_read_tokens": n(10_000), "cache_write_tokens": n(900)}
+        r = self.u.limit_reason
+        self.assertIsNone(r(None, month))
+        self.assertIsNone(r({"max_new_tokens": n(151)}, month))
+        self.assertIn("new tokens", r({"max_new_tokens": n(150)}, month))
+        self.assertIn("cache write tokens", r({"max_cache_write_tokens": n(900), "max_new_tokens": n(0)}, month))
+        # The new fields win over the old pair, even at 0 (= no limit).
+        self.assertIsNone(r({"max_new_tokens": n(0), "max_tokens": n(1)}, month))
+        # The old single limit: new tokens only, unless it counts cache.
+        self.assertIsNone(r({"max_tokens": n(200)}, month, env_counts_cache=""))
+        self.assertIsNotNone(r({"max_tokens": n(200), "counts_cache": {"BOOL": True}}, month))
+        self.assertIsNotNone(r({"max_tokens": n(200)}, month, env_counts_cache="true"))
+
+    def test_a_team_over_its_limit_makes_no_call(self):
+        n = lambda v: {"N": str(v)}
+
+        class Client:
+            def __init__(self):
+                self.reads = []
+
+            def get_item(self, TableName, Key):
+                self.reads.append(TableName)
+                if TableName == "settings":
+                    return {"Item": {"max_new_tokens": n(10)}}
+                return {"Item": {"total_tokens_in": n(8), "total_tokens_out": n(2)}}
+
+        c = Client()
+        with self.assertRaises(self.u.LimitReached):
+            self.u.admit(c, "analytics", "team1", settings_table="settings")
+        self.assertEqual(c.reads, ["settings", "analytics"])
+
+        sent = []
+        with self.assertRaises(self.u.LimitReached):
+            old = self.u.SETTINGS_TABLE
+            self.u.SETTINGS_TABLE = "settings"
+            try:
+                self.u.call_messages("k", {"model": "m", "messages": []}, "claude-sonnet-5-5", c,
+                                     "analytics", "team1", "log_analysis",
+                                     opener=lambda *a, **k: sent.append(a), sleep=lambda s: None)
+            finally:
+                self.u.SETTINGS_TABLE = old
+        self.assertEqual(sent, [], "nothing was sent")
+
+    def test_an_unreadable_limit_lets_the_call_through(self):
+        class Down:
+            def get_item(self, **kw):
+                raise RuntimeError("down")
+
+        self.u.admit(Down(), "analytics", "team1", settings_table="settings")
+        self.u.admit(Down(), "analytics", "team1", settings_table="")
+
 class ModelCallTest(unittest.TestCase):
     """The Anthropic call is streamed; every attempt is counted, broken ones
     with the output estimated; transient failures are retried by status."""

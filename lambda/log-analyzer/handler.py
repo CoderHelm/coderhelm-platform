@@ -44,6 +44,8 @@ LOOKBACK_HOURS = int(os.environ.get("LOOKBACK_HOURS", "24"))
 DASHBOARD_URL = os.environ["DASHBOARD_URL"].rstrip("/")
 # Team usage counters (empty: usage isn't counted).
 ANALYTICS_TABLE = os.environ.get("ANALYTICS_TABLE_NAME", "")
+# Every model call asks the team's token limits (settings) first.
+usage.SETTINGS_TABLE = SETTINGS_TABLE
 # Outbound webhook events go on this queue (empty: none are sent). The
 # worker sends them to the team's endpoints (common::webhooks).
 WEBHOOK_QUEUE_URL = os.environ.get("WEBHOOK_QUEUE_URL", "")
@@ -580,6 +582,9 @@ def ask_model(prompt, api_key, team_id=None):
                 dynamodb_client, ANALYTICS_TABLE, team_id, usage.FEATURE_LOG_ANALYSIS,
             )
         return response_text(response_data)
+    except usage.LimitReached as e:
+        logger.warning(f"Analysis skipped for {team_id}: {e}")
+        return None
     except HTTPError as e:
         error_body = e.read().decode("utf-8") if e.fp else ""
         logger.error(f"Anthropic API error ({e.code}): {error_body}")

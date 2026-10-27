@@ -127,6 +127,8 @@ def add_expression(feature, model_id, u):
             (f"{prefix}#{key}#tokens_in", u["uncached_input"]),
             (f"{prefix}#{key}#cache_read", u["cache_read"]),
             (f"{prefix}#{key}#cache_write", cw),
+            (f"{prefix}#{key}#cache_write_5m", u["cache_write_5m"]),
+            (f"{prefix}#{key}#cache_write_1h", u["cache_write_1h"]),
             (f"{prefix}#{key}#tokens_out", u["output"]),
             (f"{prefix}#{key}#cost_usd", cost),
             (f"{prefix}#{key}#calls", 1),
@@ -226,6 +228,85 @@ def record_usage(client, table, team_id, feature, model_id, usage, call_id=None)
         record_call(client, table, team_id, feature, model_id, call_usage(usage), call_id=call_id)
     except Exception as e:
         logger.warning(f"Couldn't record model usage for {team_id}: {e}")
+
+
+# ── The team's monthly token limits, asked before every call ─────────────
+#
+# The Python twin of services/common/src/token_limits.rs: the three limits
+# (new tokens, cache read, cache write; 0 or missing = none), or the old
+# single max_tokens with counts_cache (team flag, else the
+# TOKEN_LIMIT_COUNTS_CACHE env default). A failed read lets the call through.
+
+SETTINGS_TABLE = os.environ.get("SETTINGS_TABLE_NAME", "")
+_NEW_FIELDS = (
+    ("max_new_tokens", "new tokens"),
+    ("max_cache_read_tokens", "cache read tokens"),
+    ("max_cache_write_tokens", "cache write tokens"),
+)
+
+
+class LimitReached(Exception):
+    """The team reached a monthly token limit: the call was not sent."""
+
+
+def _n(item, k):
+    try:
+        return max(0, int(float((item.get(k) or {}).get("N", 0))))
+    except (TypeError, ValueError):
+        return 0
+
+
+def limit_reason(limits_item, month_item, env_counts_cache=None):
+    """Why a call is refused, or None: the first limit the month has reached."""
+    item = limits_item or {}
+    month = month_item or {}
+    t_in, t_out = _n(month, "total_tokens_in"), _n(month, "total_tokens_out")
+    read, write = _n(month, "cache_read_tokens"), _n(month, "cache_write_tokens")
+    used_of = {
+        "max_new_tokens": t_in + t_out,
+        "max_cache_read_tokens": read,
+        "max_cache_write_tokens": write,
+    }
+    if any(f in item for f, _ in _NEW_FIELDS):
+        checks = [(label, _n(item, f), used_of[f]) for f, label in _NEW_FIELDS]
+    else:
+        flag = (item.get("counts_cache") or {}).get("BOOL")
+        if flag is None:
+            env = os.environ.get("TOKEN_LIMIT_COUNTS_CACHE") if env_counts_cache is None else env_counts_cache
+            flag = (env or "").strip().lower() == "true"
+        used = t_in + t_out + (read + write if flag else 0)
+        checks = [("token", _n(item, "max_tokens"), used)]
+    for label, mx, used in checks:
+        if mx > 0 and used >= mx:
+            return (f"Monthly {label} limit reached ({used} of {mx}). New model calls are "
+                    "stopped until the month turns or an admin raises the limit in Settings, Token Limit.")
+    return None
+
+
+def admit(client, table, team_id, settings_table=None, now=None):
+    """Raise LimitReached when the team has reached a monthly limit. Asked
+    before every attempt, so a retry loop stops at the limit too."""
+    settings_table = SETTINGS_TABLE if settings_table is None else settings_table
+    if not settings_table or not table or not team_id:
+        return
+    try:
+        limits = client.get_item(
+            TableName=settings_table,
+            Key={"pk": {"S": team_id}, "sk": {"S": "SETTINGS#TOKEN_LIMIT"}},
+        ).get("Item")
+        if not limits:
+            return
+        month = (now or datetime.now(timezone.utc)).strftime("%Y-%m")
+        totals = client.get_item(
+            TableName=table, Key={"team_id": {"S": team_id}, "period": {"S": month}},
+        ).get("Item")
+    except Exception as e:  # an outage must not stop every team's analysis
+        logger.warning(f"Token limits not read for {team_id}; the call goes ahead: {e}")
+        return
+    reason = limit_reason(limits, totals)
+    if reason:
+        logger.warning(f"Model call refused for {team_id}: {reason}")
+        raise LimitReached(reason)
 
 
 # ── The one Anthropic call, streamed and metered per attempt ─────────────
@@ -342,6 +423,7 @@ def call_messages(api_key, body, model_id, client, table, team_id, feature,
     data = json.dumps(dict(body, stream=True)).encode("utf-8")
     for attempt in range(len(backoff) + 1):
         last = attempt == len(backoff)
+        admit(client, table, team_id)
         req = Request(
             "https://api.anthropic.com/v1/messages",
             data=data,
@@ -498,6 +580,7 @@ def call_messages_bedrock(body, model_id, client, table, team_id, feature, bedro
     data = json.dumps(bedrock_body(body)).encode("utf-8")
     for attempt in range(len(backoff) + 1):
         last = attempt == len(backoff)
+        admit(client, table, team_id)
         try:
             resp = bedrock.invoke_model_with_response_stream(
                 modelId=bedrock_model_id(model_id), body=data,

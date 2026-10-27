@@ -162,6 +162,14 @@ fn clear_tool_uses_edit() -> Value {
     }]})
 }
 
+/// The top-level (automatic) breakpoint for a tool loop turn: only when
+/// another turn may read it back.
+fn tail_cache(another_turn_may_follow: bool) -> Option<CacheControl> {
+    another_turn_may_follow.then(|| CacheControl {
+        r#type: "ephemeral".to_string(),
+    })
+}
+
 /// Fill the model-family fields of a request. `effort` None → "high".
 fn apply_model_family(request: &mut MessagesRequest, effort: Option<&str>, tool_loop: bool) {
     if ModelFamily::of(&request.model) != ModelFamily::AlwaysThinking {
@@ -296,6 +304,9 @@ impl MessagesResponse {
     }
 }
 
+/// The usage a response carries, for logs. What is counted (the team's
+/// counters and the run's totals) comes from the stream, per attempt
+/// (`common::model_stream`), never from here.
 #[derive(Deserialize, Debug)]
 struct ApiUsage {
     /// Uncached input only.
@@ -306,38 +317,6 @@ struct ApiUsage {
     cache_creation_input_tokens: u64,
     #[serde(default)]
     cache_read_input_tokens: u64,
-    /// Cache writes by lifetime (`ephemeral_5m_input_tokens`,
-    /// `ephemeral_1h_input_tokens`), priced differently.
-    #[serde(default)]
-    cache_creation: Option<Value>,
-}
-
-impl ApiUsage {
-    fn call(&self) -> common::usage::CallUsage {
-        let mut v = json!({
-            "input_tokens": self.input_tokens,
-            "output_tokens": self.output_tokens,
-            "cache_creation_input_tokens": self.cache_creation_input_tokens,
-            "cache_read_input_tokens": self.cache_read_input_tokens,
-        });
-        if let Some(c) = &self.cache_creation {
-            v["cache_creation"] = c.clone();
-        }
-        // Every request this client sends caches with the 5-minute lifetime.
-        common::usage::CallUsage::from_api(&v, common::usage::CacheTtl::FiveMinutes)
-    }
-}
-
-#[derive(Deserialize, Debug)]
-struct ApiError {
-    error: ApiErrorDetail,
-}
-
-#[derive(Deserialize, Debug)]
-struct ApiErrorDetail {
-    message: String,
-    #[serde(default)]
-    r#type: String,
 }
 
 // --- Public API ---
@@ -754,10 +733,12 @@ pub async fn converse_tool_loop(
                 Some(api_tools.clone())
             },
             // Auto-cache: caches the entire prefix (tools + system + messages)
-            // up to the last cacheable block. On turn N, all prior turns are cached.
-            cache_control: Some(CacheControl {
-                r#type: "ephemeral".to_string(),
-            }),
+            // up to the last cacheable block, so turn N+1 reads turns 1..N.
+            // Only when a turn N+1 can follow: on a call that is the last
+            // (no tools, or the answer-now turn) the tail would be written
+            // at 1.25x input and never read. The system and tool breakpoints
+            // still cache what other calls share.
+            cache_control: tail_cache(!api_tools.is_empty() && !answer_now),
             thinking: None,
             output_config: None,
             context_management: None,
@@ -995,9 +976,7 @@ async fn send_request(
     usage: &mut TokenUsage,
 ) -> Result<MessagesResponse, Box<dyn std::error::Error + Send + Sync>> {
     if let Some(bedrock) = &client.bedrock {
-        let resp = send_bedrock(client, bedrock, request).await?;
-        usage.add_call(&request.model, &resp.usage.call());
-        return Ok(resp);
+        return send_bedrock(client, bedrock, request, usage).await;
     }
     let mut body = serde_json::to_value(request)?;
     body["stream"] = json!(true);
@@ -1005,7 +984,7 @@ async fn send_request(
     let url = client
         .url
         .as_deref()
-        .unwrap_or("https://api.anthropic.com/v1/messages");
+        .unwrap_or(common::model_stream::MESSAGES_URL);
     let streamed = common::model_stream::send_metered(
         || {
             client
@@ -1024,17 +1003,12 @@ async fn send_request(
         body.len() as u64,
     )
     .await
-    .map_err(Box::new)?;
+    .map_err(model_err)?;
     for broken in &streamed.retried {
         usage.add_call(&request.model, broken);
     }
     usage.add_call(&request.model, &streamed.usage);
-    serde_json::from_value(streamed.message).map_err(|e| {
-        Box::new(common::model_retry::ModelCallError::new(
-            common::model_retry::ModelErrorKind::Network,
-            format!("the response couldn't be read: {e}"),
-        )) as Box<dyn std::error::Error + Send + Sync>
-    })
+    read_message(streamed.message)
 }
 
 /// The Bedrock body for a Messages request: the same fields, with the model
@@ -1057,80 +1031,49 @@ fn bedrock_body(request: &MessagesRequest) -> Result<Value, serde_json::Error> {
     Ok(body)
 }
 
-/// One Messages request through Bedrock's InvokeModel, retried on the same
-/// transient statuses and schedule as the Anthropic API path, and recorded
-/// on the client's meter. Used only by the reviewer evals (CI), which call
-/// Bedrock without a key.
+/// One Messages request through Amazon Bedrock with the deployment's own
+/// role: streamed and metered per attempt exactly like the Anthropic API
+/// path (`common::model_stream::send_bedrock_metered`), the limit asked
+/// before each attempt. Every Bedrock install's runs go through here.
 async fn send_bedrock(
     client: &AnthropicClient,
     bedrock: &aws_sdk_bedrockruntime::Client,
     request: &MessagesRequest,
+    usage: &mut TokenUsage,
 ) -> Result<MessagesResponse, Box<dyn std::error::Error + Send + Sync>> {
-    use common::model_retry::{
-        backoff, is_transient_status, ModelCallError, ModelErrorKind, Reply, WORKER_BACKOFF_SECS,
-    };
     let body = serde_json::to_vec(&bedrock_body(request)?)?;
-    let mut attempt = 0;
-    loop {
-        let result = bedrock
-            .invoke_model()
-            .model_id(common::model_provider::bedrock_model_id(&request.model))
-            .content_type("application/json")
-            .accept("application/json")
-            .body(aws_smithy_types::Blob::new(body.clone()))
-            .send()
-            .await;
-        let (status, text) = match result {
-            Ok(out) => {
-                let resp = api_result(Reply {
-                    status: 200,
-                    body: out.body.into_inner(),
-                })?;
-                let meter = &client.meter;
-                meter.record(&request.model, &resp.usage.call()).await;
-                return Ok(resp);
-            }
-            Err(e) => (
-                e.raw_response().map(|r| r.status().as_u16()),
-                aws_sdk_bedrockruntime::error::DisplayErrorContext(&e).to_string(),
-            ),
-        };
-        let transient = status.is_none_or(is_transient_status);
-        if !transient || attempt >= WORKER_BACKOFF_SECS.len() {
-            return Err(Box::new(ModelCallError::new(
-                status.map_or(ModelErrorKind::Network, ModelErrorKind::Status),
-                text,
-            )));
-        }
-        warn!(model = %request.model, attempt, status = ?status, "Bedrock call failed — retrying");
-        tokio::time::sleep(backoff(&WORKER_BACKOFF_SECS, attempt, None)).await;
-        attempt += 1;
+    let streamed = common::model_stream::send_bedrock_metered(
+        bedrock,
+        &common::model_provider::bedrock_model_id(&request.model),
+        &body,
+        &common::model_retry::WORKER_BACKOFF_SECS,
+        &client.meter,
+        &request.model,
+    )
+    .await
+    .map_err(model_err)?;
+    for broken in &streamed.retried {
+        usage.add_call(&request.model, broken);
     }
+    usage.add_call(&request.model, &streamed.usage);
+    read_message(streamed.message)
 }
 
-/// A final response read as the API's answer or its error.
-/// Every failure is a [`ModelCallError`], so callers decide what to do from
-/// its kind (`is_transient`), never from its text.
-fn api_result(
-    reply: common::model_retry::Reply,
+/// A model call failure as the boxed error callers get, the failure itself
+/// in the box (`.map_err(Box::new)?` boxed it twice, so
+/// `model_retry::model_error` could not find its kind: a transient 5xx read
+/// as final, a refused key as unreachable).
+fn model_err(e: common::model_retry::ModelCallError) -> Box<dyn std::error::Error + Send + Sync> {
+    Box::new(e)
+}
+
+fn read_message(
+    message: Value,
 ) -> Result<MessagesResponse, Box<dyn std::error::Error + Send + Sync>> {
-    use common::model_retry::{ModelCallError, ModelErrorKind};
-    if !reply.is_success() {
-        let status = reply.status;
-        let body = reply.text();
-        let message = match serde_json::from_str::<ApiError>(&body) {
-            Ok(api_err) => format!("{}: {}", api_err.error.r#type, api_err.error.message),
-            Err(_) => body,
-        };
-        return Err(Box::new(ModelCallError::new(
-            ModelErrorKind::Status(status),
-            message,
-        )));
-    }
-    serde_json::from_slice(&reply.body).map_err(|e| {
-        Box::new(ModelCallError::new(
-            ModelErrorKind::Network,
-            format!("the response body couldn't be read: {e}"),
+    serde_json::from_value(message).map_err(|e| {
+        Box::new(common::model_retry::ModelCallError::new(
+            common::model_retry::ModelErrorKind::Network,
+            format!("the response couldn't be read: {e}"),
         )) as Box<dyn std::error::Error + Send + Sync>
     })
 }
@@ -1474,5 +1417,409 @@ mod tests {
         }))
         .unwrap();
         assert!(resp.refusal().unwrap().contains("cyber"));
+    }
+}
+
+/// What a team is billed and what CoderHelm counts, reconciled end to end
+/// on a fake Messages endpoint: a tool loop's every attempt (a broken one
+/// retried included), parallel calls, the limit checked before each call,
+/// and where the cache breakpoints go.
+#[cfg(test)]
+mod accounting_tests {
+    use super::*;
+    use common::usage::{
+        record_expression, CallRecord, LimitCheck, RecordedCall, UsageMeter, UsageTotals,
+    };
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex};
+
+    fn sse(events: &[Value]) -> String {
+        events
+            .iter()
+            .map(|e| format!("event: {}\ndata: {e}\n\n", e["type"].as_str().unwrap()))
+            .collect()
+    }
+
+    fn start(input: u64, read: u64, w5: u64, w1: u64) -> Value {
+        json!({"type":"message_start","message":{"id":"m","type":"message","role":"assistant","model":"x","content":[],"stop_reason":null,
+            "usage":{"input_tokens":input,"output_tokens":1,"cache_read_input_tokens":read,"cache_creation_input_tokens":w5 + w1,
+            "cache_creation":{"ephemeral_5m_input_tokens":w5,"ephemeral_1h_input_tokens":w1}}}})
+    }
+
+    /// A turn that calls `read_file` (stop reason `tool_use`).
+    fn tool_turn(read: u64, write: u64) -> String {
+        sse(&[
+            start(5, read, write, 0),
+            json!({"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":format!("tu{read}"),"name":"read_file","input":{}}}),
+            json!({"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"path\":\"a.rs\"}"}}),
+            json!({"type":"content_block_stop","index":0}),
+            json!({"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":40}}),
+            json!({"type":"message_stop"}),
+        ])
+    }
+
+    /// The final answer.
+    fn answer_turn(read: u64, write: u64) -> String {
+        sse(&[
+            start(3, read, write, 0),
+            json!({"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}),
+            json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"done"}}),
+            json!({"type":"content_block_stop","index":0}),
+            json!({"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":120}}),
+            json!({"type":"message_stop"}),
+        ])
+    }
+
+    /// A fake endpoint that keeps every request body; each request gets the
+    /// next reply (the last repeats).
+    async fn server(replies: Vec<String>) -> (String, Arc<Mutex<Vec<Value>>>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let bodies = Arc::new(Mutex::new(Vec::new()));
+        let seen = bodies.clone();
+        tokio::spawn(async move {
+            let mut n = 0;
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    return;
+                };
+                let reply = replies.get(n).or(replies.last()).unwrap().clone();
+                n += 1;
+                // Read the head, then the body by its length.
+                let mut buf = Vec::new();
+                let mut chunk = vec![0u8; 1 << 16];
+                while let Ok(k) = sock.read(&mut chunk).await {
+                    if k == 0 {
+                        break;
+                    }
+                    buf.extend_from_slice(&chunk[..k]);
+                    let text = String::from_utf8_lossy(&buf).to_string();
+                    if let Some(h) = text.find("\r\n\r\n") {
+                        let len = text[..h]
+                            .lines()
+                            .find_map(|l| {
+                                let l = l.to_ascii_lowercase();
+                                l.strip_prefix("content-length:")
+                                    .and_then(|v| v.trim().parse::<usize>().ok())
+                            })
+                            .unwrap_or(0);
+                        if buf.len() >= h + 4 + len {
+                            if let Ok(v) = serde_json::from_slice::<Value>(&buf[h + 4..h + 4 + len])
+                            {
+                                seen.lock().unwrap().push(v);
+                            }
+                            break;
+                        }
+                    }
+                }
+                let head = "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\n";
+                let _ = sock.write_all(head.as_bytes()).await;
+                let _ = sock.write_all(reply.as_bytes()).await;
+                let _ = sock.shutdown().await;
+            }
+        });
+        (format!("http://{addr}/v1/messages"), bodies)
+    }
+
+    struct Files;
+
+    #[async_trait::async_trait]
+    impl super::super::llm::ToolExecutor for Files {
+        async fn execute(
+            &self,
+            _name: &str,
+            _input: &Value,
+        ) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
+            Ok(json!("fn main() {}"))
+        }
+    }
+
+    async fn run_loop(
+        client: &AnthropicClient,
+        tools: &[ToolDefinition],
+        usage: &mut TokenUsage,
+    ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+        let gate = common::agent_policy::Gate::new(
+            Arc::new(common::agent_policy::store::MemStore::new()),
+            common::agent_policy::GateCtx::new("t", common::agent_policy::Agent::Reviewer),
+        )
+        .offering(tools.iter().map(|t| t.name.clone()));
+        let mut messages = vec![(
+            "user".to_string(),
+            vec![json!({"type":"text","text":"review"})],
+        )];
+        converse_tool_loop(
+            client,
+            "claude-opus-5-5",
+            "You review code.",
+            &mut messages,
+            tools,
+            &Files,
+            &gate,
+            usage,
+            10,
+            1024,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+    }
+
+    /// The analytics month item after these calls: each record's ADD
+    /// expression applied, as DynamoDB would.
+    fn month_item(
+        recs: &[RecordedCall],
+    ) -> HashMap<String, aws_sdk_dynamodb::types::AttributeValue> {
+        let mut item: HashMap<String, f64> = HashMap::new();
+        for r in recs {
+            let rec = CallRecord {
+                call_id: r.call_id.clone(),
+                team_id: r.team_id.clone(),
+                at_ms: 0,
+                feature: r.feature.clone(),
+                model: r.model.clone(),
+                billed_to: r.billed_to,
+                estimated: r.estimated,
+                usage: r.usage,
+                tag: String::new(),
+            };
+            let (expr, names, values) = record_expression(&rec, false);
+            for part in expr.trim_start_matches("ADD ").split(", ") {
+                let (n, v) = part.split_once(' ').unwrap();
+                let v: f64 = values[v].as_n().unwrap().parse().unwrap();
+                *item.entry(names[n].clone()).or_default() += v;
+            }
+        }
+        item.into_iter()
+            .map(|(k, v)| (k, aws_sdk_dynamodb::types::AttributeValue::N(v.to_string())))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_runs_totals_equal_the_teams_counters_call_for_call() {
+        // Turn 1: a tool call; turn 2 breaks off mid-reply and is sent
+        // again (both attempts billed); turn 3 answers.
+        let broken = tool_turn(20_000, 2_000)
+            .split("event: content_block_stop")
+            .next()
+            .unwrap()
+            .to_string();
+        let (url, _) = server(vec![
+            tool_turn(0, 12_000),
+            broken,
+            tool_turn(12_000, 900),
+            answer_turn(12_900, 300),
+        ])
+        .await;
+        let (meter, calls) = UsageMeter::memory("team-1");
+        let client = AnthropicClient::new("k".into(), meter).at(&url);
+        let mut run = TokenUsage::default();
+        let tools = crate::passes::review_agent::review_tools();
+        let text = common::usage::with_feature(
+            common::usage::feature::REVIEW,
+            run_loop(&client, &tools, &mut run),
+        )
+        .await
+        .unwrap();
+        assert_eq!(text, "done");
+        let recs = calls.lock().unwrap().clone();
+        assert_eq!(recs.len(), 4, "every attempt is a recorded call");
+        assert_eq!(recs.iter().filter(|r| r.estimated).count(), 1);
+        // The run's own totals (what the run item stores) ...
+        let sum = |f: fn(&RecordedCall) -> u64| recs.iter().map(f).sum::<u64>();
+        assert_eq!(run.input_tokens, sum(|r| r.usage.uncached_input));
+        assert_eq!(run.cache_read_tokens, sum(|r| r.usage.cache_read));
+        assert_eq!(run.cache_write_tokens, sum(|r| r.usage.cache_write()));
+        assert_eq!(run.output_tokens, sum(|r| r.usage.output));
+        // ... equal the team's month counters, part by part, and the
+        // feature and model breakdowns add up to the same totals.
+        let item = month_item(&recs);
+        let month = UsageTotals::from_item(Some(&item));
+        assert_eq!(month.tokens_in_uncached, run.input_tokens);
+        assert_eq!(month.cache_read, run.cache_read_tokens);
+        assert_eq!(month.cache_write, run.cache_write_tokens);
+        assert_eq!(month.tokens_out, run.output_tokens);
+        let by_feature = common::usage::feature_totals(Some(&item));
+        assert_eq!(by_feature.len(), 1);
+        assert_eq!(by_feature[0].0, "review");
+        assert_eq!(by_feature[0].1, month);
+        let n = |k: &str| item[k].as_n().unwrap().parse::<f64>().unwrap();
+        assert!((n("total_cost_usd") - run.cost_usd).abs() < 1e-6);
+        assert!((n("feature#review#cost_usd") - run.cost_usd).abs() < 1e-6);
+        assert!((n("model#claude-opus-5-5#cost_usd") - run.cost_usd).abs() < 1e-6);
+        assert_eq!(n("model_calls") as usize, recs.len());
+        assert_eq!(
+            n("feature#review#cache_write_5m") + n("feature#review#cache_write_1h"),
+            n("feature#review#cache_write")
+        );
+        // Cache reads are never input and writes never reads: each part at
+        // its own Opus 5.5 rate, once.
+        let want = (run.input_tokens as f64 * 4.0
+            + run.cache_read_tokens as f64 * 0.20
+            + run.cache_write_tokens as f64 * 5.0
+            + run.output_tokens as f64 * 20.0)
+            / 1e6;
+        assert!(
+            (run.cost_usd - want).abs() < 1e-9,
+            "{} vs {want}",
+            run.cost_usd
+        );
+    }
+
+    #[tokio::test]
+    async fn an_api_error_keeps_its_kind_for_the_caller() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                let mut buf = vec![0u8; 1 << 16];
+                let _ = sock.read(&mut buf).await;
+                let body = r#"{"type":"error","error":{"type":"permission_error","message":"no"}}"#;
+                let head = format!(
+                    "HTTP/1.1 403 Forbidden\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = sock.write_all(head.as_bytes()).await;
+                let _ = sock.write_all(body.as_bytes()).await;
+                let _ = sock.shutdown().await;
+            }
+        });
+        let (meter, calls) = UsageMeter::memory("team-1");
+        let client =
+            AnthropicClient::new("k".into(), meter).at(&format!("http://{addr}/v1/messages"));
+        let err = converse_simple(
+            &client,
+            "claude-opus-5-5",
+            "s",
+            "u",
+            &mut TokenUsage::default(),
+        )
+        .await
+        .unwrap_err();
+        // Found by the callers that decide retry vs give up by kind.
+        let m = err
+            .downcast_ref::<common::model_retry::ModelCallError>()
+            .expect("the failure itself, boxed once");
+        assert_eq!(m.kind, common::model_retry::ModelErrorKind::Status(403));
+        assert!(
+            calls.lock().unwrap().is_empty(),
+            "a refused request is not billed"
+        );
+    }
+
+    #[tokio::test]
+    async fn parallel_calls_are_each_counted_once() {
+        let (url, _) = server(vec![answer_turn(0, 1_500)]).await;
+        let (meter, calls) = UsageMeter::memory("team-1");
+        let client = AnthropicClient::new("k".into(), meter).at(&url);
+        let (mut a, mut b, mut c) = Default::default();
+        let (ra, rb, rc) = tokio::join!(
+            converse_simple(&client, "claude-sonnet-5-5", "s", "a", &mut a),
+            converse_simple(&client, "claude-sonnet-5-5", "s", "b", &mut b),
+            converse_simple(&client, "claude-sonnet-5-5", "s", "c", &mut c),
+        );
+        assert!(ra.is_ok() && rb.is_ok() && rc.is_ok());
+        let recs = calls.lock().unwrap().clone();
+        assert_eq!(recs.len(), 3);
+        let team: u64 = recs.iter().map(|r| r.usage.total()).sum();
+        let runs: TokenUsage = [a, b, c].iter().fold(TokenUsage::default(), |mut t, u| {
+            t.merge(u);
+            t
+        });
+        assert_eq!(team, runs.total_tokens());
+    }
+
+    /// A limit on everything the team has spent so far in this meter.
+    struct Spent {
+        calls: Arc<Mutex<Vec<RecordedCall>>>,
+        max: u64,
+    }
+
+    #[async_trait::async_trait]
+    impl LimitCheck for Spent {
+        async fn reached(&self, _team: &str) -> Option<String> {
+            let used: u64 = self
+                .calls
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|c| c.usage.total())
+                .sum();
+            (used >= self.max)
+                .then(|| format!("Monthly token limit reached ({used} of {})", self.max))
+        }
+    }
+
+    #[tokio::test]
+    async fn a_runaway_loop_stops_at_the_limit_one_call_past_it_at_most() {
+        // A loop that would call tools forever (10 turns).
+        let (url, bodies) = server(vec![tool_turn(10_000, 500)]).await;
+        let (meter, calls) = UsageMeter::memory("team-1");
+        // Each turn is 10_000 + 500 + 5 + 40 = 10_545 tokens.
+        let meter = meter.with_limits(Arc::new(Spent {
+            calls: calls.clone(),
+            max: 15_000,
+        }));
+        let client = AnthropicClient::new("k".into(), meter).at(&url);
+        let mut run = TokenUsage::default();
+        let tools = crate::passes::review_agent::review_tools();
+        let err = run_loop(&client, &tools, &mut run).await.unwrap_err();
+        let e = common::model_retry::model_error(err.as_ref())
+            .unwrap_or_else(|| panic!("a model call error: {err}"));
+        assert_eq!(e.kind, common::model_retry::ModelErrorKind::LimitReached);
+        assert!(!e.is_transient(), "never retried");
+        // Call 1 (10.5K) was under the limit, call 2 crossed it, call 3 was
+        // never sent.
+        assert_eq!(bodies.lock().unwrap().len(), 2);
+        assert_eq!(calls.lock().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn the_conversation_tail_is_cached_only_when_another_turn_can_read_it() {
+        let (url, bodies) = server(vec![tool_turn(0, 4_000), answer_turn(4_000, 100)]).await;
+        let (meter, _) = UsageMeter::memory("team-1");
+        let client = AnthropicClient::new("k".into(), meter).at(&url);
+        let tools = crate::passes::review_agent::review_tools();
+        run_loop(&client, &tools, &mut TokenUsage::default())
+            .await
+            .unwrap();
+        // A loop with tools: the tail breakpoint on every turn, after the
+        // tools and system ones, which are the same bytes on every turn.
+        let b = bodies.lock().unwrap().clone();
+        assert_eq!(b.len(), 2);
+        for body in &b {
+            assert_eq!(body["cache_control"]["type"], "ephemeral");
+            assert_eq!(body["system"][0]["cache_control"]["type"], "ephemeral");
+            let tools = body["tools"].as_array().unwrap();
+            assert!(tools.last().unwrap().get("cache_control").is_some());
+            assert_eq!(
+                tools
+                    .iter()
+                    .filter(|t| t.get("cache_control").is_some())
+                    .count(),
+                1
+            );
+        }
+        assert_eq!(
+            b[0]["tools"], b[1]["tools"],
+            "tool order is the same on every turn"
+        );
+        assert_eq!(b[0]["system"], b[1]["system"]);
+        // A one-shot loop (no tools): its only call is its last, so its
+        // unique tail is not written to the cache; the system prompt still is.
+        let (url, bodies) = server(vec![answer_turn(0, 100)]).await;
+        let (meter, _) = UsageMeter::memory("team-1");
+        let client = AnthropicClient::new("k".into(), meter).at(&url);
+        run_loop(&client, &[], &mut TokenUsage::default())
+            .await
+            .unwrap();
+        let b = bodies.lock().unwrap().clone();
+        assert_eq!(b.len(), 1);
+        assert!(b[0].get("cache_control").is_none(), "{}", b[0]);
+        assert_eq!(b[0]["system"][0]["cache_control"]["type"], "ephemeral");
     }
 }

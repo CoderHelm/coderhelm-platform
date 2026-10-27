@@ -418,6 +418,16 @@ pub fn add_expression(
         adds.push((name_of(key, "tokens_in"), call.uncached_input.to_string()));
         adds.push((name_of(key, "cache_read"), call.cache_read.to_string()));
         adds.push((name_of(key, "cache_write"), call.cache_write().to_string()));
+        // The write split by lifetime, so each feature's TTL choice can be
+        // judged from its own counters (a 1-hour write costs 1.6x a 5-minute one).
+        adds.push((
+            name_of(key, "cache_write_5m"),
+            call.cache_write_5m.to_string(),
+        ));
+        adds.push((
+            name_of(key, "cache_write_1h"),
+            call.cache_write_1h.to_string(),
+        ));
         adds.push((name_of(key, "tokens_out"), call.output.to_string()));
         adds.push((name_of(key, "cost_usd"), cost_n(cost)));
         adds.push((name_of(key, "calls"), "1".into()));
@@ -850,6 +860,39 @@ pub async fn replay(store: &dyn UsageStore, rec: &CallRecord) -> Result<Added, S
     store.add(rec, true).await
 }
 
+// ── The limit check before each call ───────────────────────────────────────
+
+/// Whether a team has reached one of its monthly token limits, asked before
+/// every model call ([`UsageMeter::admit`]). `Some(reason)` stops the call.
+#[async_trait::async_trait]
+pub trait LimitCheck: Send + Sync {
+    async fn reached(&self, team_id: &str) -> Option<String>;
+}
+
+static LIMITS: OnceLock<Arc<dyn LimitCheck>> = OnceLock::new();
+
+/// The process's limit check (set once at startup by the worker and gateway;
+/// see `token_limits::DynamoLimitCheck`).
+pub fn set_limit_check(l: Arc<dyn LimitCheck>) {
+    let _ = LIMITS.set(l);
+}
+
+/// A fixed answer (tests): `Some(reason)` refuses every call, and it counts
+/// how often it was asked.
+#[derive(Default)]
+pub struct FixedLimit {
+    pub reason: Mutex<Option<String>>,
+    pub asked: std::sync::atomic::AtomicUsize,
+}
+
+#[async_trait::async_trait]
+impl LimitCheck for FixedLimit {
+    async fn reached(&self, _team_id: &str) -> Option<String> {
+        self.asked.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.reason.lock().ok().and_then(|r| r.clone())
+    }
+}
+
 // ── The meter ───────────────────────────────────────────────────────────────
 
 /// Waits (ms) before each retry of a failed counter write.
@@ -861,6 +904,8 @@ pub struct UsageMeter {
     pub team_id: String,
     store: Arc<dyn UsageStore>,
     fallback: Option<Arc<dyn UsageFallback>>,
+    /// This meter's own limit check (tests); otherwise the process's.
+    limits: Option<Arc<dyn LimitCheck>>,
     retry_ms: &'static [u64],
 }
 
@@ -888,6 +933,7 @@ impl UsageMeter {
             team_id: team_id.to_string(),
             store,
             fallback: None,
+            limits: None,
             retry_ms: &WRITE_RETRY_MS,
         }
     }
@@ -911,6 +957,39 @@ impl UsageMeter {
     pub fn without_waits(mut self) -> Self {
         self.retry_ms = &[0, 0];
         self
+    }
+
+    /// This meter with its own limit check instead of the process's (tests).
+    pub fn with_limits(mut self, l: Arc<dyn LimitCheck>) -> Self {
+        self.limits = Some(l);
+        self
+    }
+
+    /// Whether the team may make one more model call: `Err` with the reason
+    /// once any of its monthly token limits is reached. Every metered helper
+    /// asks this before EACH request it sends (retries included), so a long
+    /// tool loop or a runaway retry stops at the limit instead of running
+    /// the run to its end: the overshoot is at most the calls already in
+    /// flight when the limit was crossed. A meter with no team (setup
+    /// probes, tests) and a process with no check set are never limited.
+    pub async fn admit(&self) -> Result<(), crate::model_retry::ModelCallError> {
+        if self.team_id.is_empty() {
+            return Ok(());
+        }
+        let check = self.limits.clone().or_else(|| LIMITS.get().cloned());
+        let Some(check) = check else {
+            return Ok(());
+        };
+        match check.reached(&self.team_id).await {
+            None => Ok(()),
+            Some(reason) => {
+                warn!(team_id = %self.team_id, %reason, "Model call refused: token limit reached");
+                Err(crate::model_retry::ModelCallError::new(
+                    crate::model_retry::ModelErrorKind::LimitReached,
+                    reason,
+                ))
+            }
+        }
     }
 
     /// Count one call under the current task's feature. Never fails the

@@ -390,6 +390,99 @@ pub async fn write_new_limits(
     Ok(())
 }
 
+// ── The check before every model call ──────────────────────────────────────
+
+/// Why a call is refused when `hit` is reached: names the limit, the month's
+/// count and the limit, and how to raise it.
+pub fn call_refused_reason(hit: &LimitUse) -> String {
+    format!(
+        "Monthly {} limit reached ({} of {}). New model calls are stopped until \
+         the month turns or an admin raises the limit in Settings, Token Limit.",
+        hit.kind.label(),
+        short_tokens(hit.used),
+        short_tokens(hit.max)
+    )
+}
+
+/// How long a team's limit settings are kept before they are read again.
+/// The month's usage is read fresh on every call.
+pub const LIMITS_TTL: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// The limit check every model call asks first ([`crate::usage::UsageMeter::admit`]):
+/// the team's limits (kept [`LIMITS_TTL`]) against its month's counters on
+/// the analytics table, read on each call. The counters are the ones every
+/// call is added to as it finishes, so a long loop sees its own spend on its
+/// next call. A failed read lets the call through (and logs it), as the
+/// check at the start of a run always has: an outage of the settings or
+/// analytics table must not stop every team's work.
+pub struct DynamoLimitCheck {
+    pub dynamo: aws_sdk_dynamodb::Client,
+    pub settings_table: String,
+    pub analytics_table: String,
+    cache: std::sync::Mutex<HashMap<String, (std::time::Instant, TokenLimits)>>,
+}
+
+impl DynamoLimitCheck {
+    pub fn new(
+        dynamo: aws_sdk_dynamodb::Client,
+        settings_table: &str,
+        analytics_table: &str,
+    ) -> Self {
+        Self {
+            dynamo,
+            settings_table: settings_table.to_string(),
+            analytics_table: analytics_table.to_string(),
+            cache: Default::default(),
+        }
+    }
+
+    async fn limits(&self, team_id: &str) -> Option<TokenLimits> {
+        if let Ok(c) = self.cache.lock() {
+            if let Some((at, l)) = c.get(team_id) {
+                if at.elapsed() < LIMITS_TTL {
+                    return Some(l.clone());
+                }
+            }
+        }
+        match load(&self.dynamo, &self.settings_table, team_id).await {
+            Ok(l) => {
+                if let Ok(mut c) = self.cache.lock() {
+                    c.insert(team_id.to_string(), (std::time::Instant::now(), l.clone()));
+                }
+                Some(l)
+            }
+            Err(e) => {
+                tracing::warn!(team_id, error = %e, "Token limits not read; the call goes ahead");
+                None
+            }
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::usage::LimitCheck for DynamoLimitCheck {
+    async fn reached(&self, team_id: &str) -> Option<String> {
+        if self.settings_table.is_empty() || self.analytics_table.is_empty() {
+            return None;
+        }
+        let limits = self.limits(team_id).await?;
+        if limits.is_empty() {
+            return None;
+        }
+        let month = chrono::Utc::now().format("%Y-%m").to_string();
+        let totals = match load_month_usage(&self.dynamo, &self.analytics_table, team_id, &month)
+            .await
+        {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::warn!(team_id, error = %e, "Month usage not read; the call goes ahead");
+                return None;
+            }
+        };
+        limits.reached(&totals).map(|hit| call_refused_reason(&hit))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -633,5 +726,21 @@ mod tests {
         assert_eq!(short_tokens(1_500), "1.5K");
         assert_eq!(short_tokens(2_000_000), "2M");
         assert_eq!(short_tokens(1_120_000), "1.1M");
+    }
+
+    #[test]
+    fn a_refused_call_names_the_limit_and_the_numbers() {
+        let l = TokenLimits {
+            limits: vec![Limit {
+                kind: LimitKind::CacheWrite,
+                max: 8_000_000,
+            }],
+            legacy: false,
+        };
+        let hit = l.reached(&usage()).expect("8.8M of 8M cache writes");
+        let r = call_refused_reason(&hit);
+        assert!(r.contains("cache write tokens limit reached"), "{r}");
+        assert!(r.contains("8.8M of 8M"), "{r}");
+        assert!(!r.contains('\u{2192}'), "no arrow glyphs: {r}");
     }
 }

@@ -92,6 +92,8 @@ pub enum ModelErrorKind {
     Truncated,
     /// The answer arrived but wasn't in the shape asked for.
     BadOutput,
+    /// The team reached a monthly token limit: the call was not sent.
+    LimitReached,
 }
 
 impl ModelCallError {
@@ -107,9 +109,10 @@ impl ModelCallError {
         match self.kind {
             ModelErrorKind::Status(s) => is_transient_status(s),
             ModelErrorKind::Network => true,
-            ModelErrorKind::Refusal | ModelErrorKind::Truncated | ModelErrorKind::BadOutput => {
-                false
-            }
+            ModelErrorKind::Refusal
+            | ModelErrorKind::Truncated
+            | ModelErrorKind::BadOutput
+            | ModelErrorKind::LimitReached => false,
         }
     }
 
@@ -130,6 +133,7 @@ impl std::fmt::Display for ModelCallError {
             ModelErrorKind::Refusal => write!(f, "The model declined: {}", self.message),
             ModelErrorKind::Truncated => write!(f, "The answer was cut off: {}", self.message),
             ModelErrorKind::BadOutput => write!(f, "The answer wasn't usable: {}", self.message),
+            ModelErrorKind::LimitReached => write!(f, "{}", self.message),
         }
     }
 }
