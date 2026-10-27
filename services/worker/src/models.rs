@@ -267,6 +267,8 @@ mod tests {
             plan_cache_key: None,
             team_instructions: String::new(),
             person_direction: None,
+            answers: Vec::new(),
+            new_run_id: None,
         });
         let json = serde_json::to_string(&msg).unwrap();
         let parsed: WorkerMessage = serde_json::from_str(&json).unwrap();

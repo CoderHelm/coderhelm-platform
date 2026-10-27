@@ -406,7 +406,7 @@ async fn load_run(state: &AppState, team_id: &str, run_id: &str) -> Result<Optio
         .map_err(|e| common::run_fail::error_text(&e))
 }
 
-async fn profile_name(state: &AppState, claims: &Claims) -> Option<String> {
+pub(crate) async fn profile_name(state: &AppState, claims: &Claims) -> Option<String> {
     let id = claims.sub.strip_prefix("USER#").unwrap_or(&claims.sub);
     state
         .dynamo

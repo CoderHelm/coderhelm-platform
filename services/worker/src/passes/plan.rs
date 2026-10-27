@@ -278,7 +278,19 @@ set tasks.md to EXACTLY `NO_CHANGES_NEEDED: <reason>`.
 **Ambiguous values:** If the issue asks to change a value but does NOT include the new value:
 1. Check if the issue body contains URLs. If so, call the appropriate MCP tool to fetch them.
 2. Do NOT proactively search external tools unless a URL is present.
-3. If you cannot determine the value, set tasks.md to `CLARIFICATION_NEEDED: <what is missing>`.
+3. If you cannot determine the value, set tasks.md to `CLARIFICATION_NEEDED:` followed by one
+   block per question a person must answer (a short plain question; why it blocks the change;
+   candidate answers you found in the code or the data, separated by `|`, when you have any):
+   ```
+   CLARIFICATION_NEEDED:
+   - question: Which environments get the new limit?
+     why: config/limits.yml holds one value per environment.
+     options: production only | every environment
+   ```
+   Ask only what blocks the change, at most a few questions, and never a question the ticket or
+   the resolved decisions below already settle. Never ask a person to decide what is CoderHelm's
+   own call: closing or replacing a pull request someone else opened is never asked; when told to
+   open its own, it leaves the other one open.
 
 Otherwise, generate four openspec files:
 
@@ -329,11 +341,16 @@ Then the ```fix_location.json block described above."#,
         body = msg.body,
         complexity_guidance = complexity_guidance,
     );
-    // The ticket's history comes right after the issue's own text.
+    // The ticket's history comes right after the issue's own text, then
+    // the answers people gave to an earlier run's questions, word for word.
     let prompt = match msg.ticket_history_note.as_deref() {
         Some(h) if !h.trim().is_empty() => format!("{prompt}{h}"),
         _ => prompt,
     };
+    let prompt = format!(
+        "{prompt}{}",
+        common::run_questions::answers_note(&msg.answers)
+    );
 
     let mut tools = read_only_tools();
 
@@ -670,7 +687,11 @@ Then the ```fix_location.json block described above."#,
     let judge_prompt = |files: &PlanResult| {
         super::plan_judge::prompt(
             &msg.title,
-            &msg.body,
+            &format!(
+                "{}{}",
+                msg.body,
+                common::run_questions::answers_note(&msg.answers)
+            ),
             history_note,
             &live.as_ref().map(|l| l.connected()).unwrap_or_default(),
             &live
@@ -730,6 +751,49 @@ Then the ```fix_location.json block described above."#,
     }
 
     let mut files = parse_openspec_files(&response, intent);
+    // A plan that asks what is settled on the ticket (answers given in
+    // CoderHelm, choices people made on its notices), or what CoderHelm
+    // decides itself, goes back once with the answers (the model judges
+    // each question against them, see `resolved`). What it still asks
+    // after that is filtered below.
+    let asked = clarification_of(&files.tasks);
+    let verdicts = super::resolved::judge(state, provider, &asked, &msg.answers, usage).await;
+    let repeats: Vec<(common::run_questions::Question, super::resolved::Verdict)> = asked
+        .iter()
+        .cloned()
+        .zip(verdicts)
+        .filter(|(_, v)| !v.may_ask())
+        .collect();
+    if !repeats.is_empty() {
+        info!(
+            ticket_id = %msg.ticket_id,
+            repeated = repeats.len(),
+            "Plan asks a settled question again — sending it back"
+        );
+        messages.push((
+            "user".to_string(),
+            vec![serde_json::json!({
+                "type": "text",
+                "text": super::resolved::send_back(&repeats, &msg.answers),
+            })],
+        ));
+        response = provider::converse(
+            state,
+            provider,
+            common::agent_policy::Agent::Planner,
+            model_id,
+            &full_system,
+            &mut messages,
+            &tools,
+            &executor,
+            usage,
+            plan_opts,
+            None,
+            None,
+        )
+        .await?;
+        files = parse_openspec_files(&response, intent);
+    }
     let gaps = super::fix_location::gaps(files.fix.as_ref(), can_look_up, lookups(), &read());
     if !gaps.is_empty() && msg.person_direction.is_some() {
         // A person told CoderHelm where the fix is and to go ahead: their
@@ -876,6 +940,30 @@ Then the ```fix_location.json block described above."#,
         }
     }
 
+    // Never ask a person what is settled, or what CoderHelm decides itself:
+    // the decision's questions and a clarification are checked once more.
+    if !msg.answers.is_empty() {
+        let asked = clarification_of(&files.tasks);
+        if !asked.is_empty() {
+            let v = super::resolved::judge(state, provider, &asked, &msg.answers, usage).await;
+            if v.iter().any(|v| !v.may_ask()) {
+                files.tasks = super::resolved::keep_open(&asked, &v);
+            }
+        }
+        if let Some(d) = files.fix.as_mut() {
+            let qs = common::run_questions::from_lines(&d.questions);
+            let v = super::resolved::judge(state, provider, &qs, &msg.answers, usage).await;
+            if v.iter().any(|v| !v.may_ask()) {
+                d.questions = qs
+                    .into_iter()
+                    .zip(v)
+                    .filter(|(_, v)| v.may_ask())
+                    .map(|(q, _)| q.question)
+                    .collect();
+            }
+        }
+    }
+
     // The questions only a person can answer are part of the plan people read.
     if let Some(d) = files.fix.as_ref() {
         files.proposal = with_questions(&files.proposal, d);
@@ -1004,6 +1092,15 @@ Then the ```fix_location.json block described above."#,
         .await;
 
     Ok(files)
+}
+
+/// The questions in a `CLARIFICATION_NEEDED:` tasks file; none otherwise.
+fn clarification_of(tasks: &str) -> Vec<common::run_questions::Question> {
+    tasks
+        .trim_start()
+        .strip_prefix("CLARIFICATION_NEEDED:")
+        .map(common::run_questions::parse)
+        .unwrap_or_default()
 }
 
 /// The proposal with the decision's questions for a person after it, once.

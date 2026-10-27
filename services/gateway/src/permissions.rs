@@ -223,6 +223,7 @@ pub const CAPABILITIES: &[Capability] = &[
         min_role: "member",
         handlers: &[
             "api::retry_run",
+            "run_answer::answer_run",
             "api::reset_and_rerun",
             "api::re_review_run",
             "api::cancel_run",

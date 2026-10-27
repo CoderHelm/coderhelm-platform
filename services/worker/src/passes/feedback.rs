@@ -231,6 +231,8 @@ pub async fn run(
                     plan_cache_key: None,
                     team_instructions: String::new(),
                     person_direction: None,
+                    answers: Vec::new(),
+                    new_run_id: None,
                 };
                 match super::pr::resolve_conflicts(
                     state,
@@ -2290,6 +2292,8 @@ async fn handle_wrong_repo(
         plan_cache_key: None,
         team_instructions: String::new(),
         person_direction: None,
+        answers: Vec::new(),
+        new_run_id: None,
     });
 
     if state.config.ticket_queue_url.is_empty() {

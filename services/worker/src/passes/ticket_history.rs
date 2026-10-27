@@ -37,6 +37,8 @@ pub struct PriorRun {
     pub context_hash: String,
     /// What people wrote on its PR, as (author, text), newest last.
     pub pr_comments: Vec<(String, String)>,
+    /// Answers people gave in CoderHelm to the questions it stopped to ask.
+    pub answers: Vec<common::run_questions::Answer>,
 }
 
 impl PriorRun {
@@ -69,6 +71,9 @@ pub struct TicketHistory {
     /// Every pull request for this ticket in the team's repositories
     /// (CoderHelm's or anyone's), as GitHub shows it now, oldest first.
     pub prs: Vec<EarlierPr>,
+    /// Choices people made on CoderHelm's notices (see
+    /// `ticket_state::Decision`), oldest first.
+    pub decisions: Vec<ticket_state::Decision>,
 }
 
 /// An earlier pull request for the ticket, read from GitHub: what it said,
@@ -556,6 +561,8 @@ fn prior_run(item: &Item) -> PriorRun {
         fix_decision: serde_json::from_str(&s(item, "fix_decision")).ok(),
         context_hash: s(item, "context_hash"),
         pr_comments: Vec::new(),
+        answers: serde_json::from_str(&s(item, common::run_questions::FIELD_ANSWERS))
+            .unwrap_or_default(),
     }
 }
 
@@ -888,6 +895,8 @@ pub async fn load(
     {
         if let Some(item) = out.item() {
             history.notes = ticket_state::parse_notes(&s(item, ticket_state::FIELD_NOTES));
+            history.decisions =
+                ticket_state::parse_decisions(&s(item, ticket_state::FIELD_DECISIONS));
             if s(item, ticket_state::FIELD_STATE) == ticket_state::STATE_DONE {
                 history.done_hash = s(item, ticket_state::FIELD_DONE_HASH);
             }
@@ -940,6 +949,7 @@ mod tests {
             notes: vec![],
             done_hash: String::new(),
             prs: vec![],
+            decisions: vec![],
         }
     }
 
@@ -1017,6 +1027,7 @@ mod tests {
             }],
             done_hash: "h1".into(),
             prs: vec![],
+            decisions: vec![],
         };
         match h.guard(Some(&override_plan("")), "h1") {
             Guard::Stop {
@@ -1126,6 +1137,7 @@ mod traced_guard_tests {
             notes: vec![],
             done_hash: String::new(),
             prs: vec![],
+            decisions: vec![],
         }
     }
 
@@ -1294,5 +1306,25 @@ mod earlier_pr_tests {
         assert!(h
             .plan_gaps("#7 kept; #41 closed by a-maintainer on 2026-01-11, asking why.")
             .is_empty());
+    }
+
+    /// Answers given in CoderHelm on an earlier run are read with it (the
+    /// run merges them into its own, see `passes::run_passes`).
+    #[test]
+    fn an_earlier_runs_answers_are_read() {
+        let mut item = Item::new();
+        item.insert("run_id".into(), attr_s("01Q"));
+        item.insert("status".into(), attr_s("retried"));
+        item.insert(
+            "answers".into(),
+            attr_s(
+                r#"[{"question_id":"q1","question":"Which environments get the new limit?","answer":"Production only","author":"Pat Doe","answered_at":"2026-10-27T10:00:00Z"}]"#,
+            ),
+        );
+        let r = prior_run(&item);
+        assert_eq!(r.answers.len(), 1);
+        assert_eq!(r.answers[0].answer, "Production only");
+        item.remove("answers");
+        assert!(prior_run(&item).answers.is_empty());
     }
 }

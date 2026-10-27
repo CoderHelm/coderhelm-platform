@@ -120,6 +120,13 @@ pub async fn run(
         ""
     };
 
+    // Answers people gave to an earlier run's questions are part of the
+    // ticket.
+    let body = format!(
+        "{}{}",
+        msg.body,
+        common::run_questions::answers_note(&msg.answers)
+    );
     let prompt = format!(
         r#"Analyze this GitHub issue and return a JSON classification.
 
@@ -152,7 +159,7 @@ Rules:
         repo = msg.repo_name,
         number = msg.issue_number,
         title = msg.title,
-        body = msg.body,
+        body = body,
         image_hint = image_hint,
         tree_hint = tree_hint,
     );

@@ -1566,6 +1566,8 @@ pub async fn run(
         )
         .await,
         person_direction: None,
+        answers: Vec::new(),
+        new_run_id: None,
     };
 
     let provider = ModelProvider::load_for_team(
