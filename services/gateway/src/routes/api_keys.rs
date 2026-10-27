@@ -93,8 +93,30 @@ pub async fn list(
             })
         })
         .collect();
+    // With two-factor sign-in required: the keys made before the rule, and
+    // whether their maker has a second factor now (a key never signs in).
+    let reviews = if super::sign_in::applies() {
+        super::sign_in::key_reviews(&state, &claims.team_id, &all)
+            .await
+            .unwrap_or_else(|e| {
+                error!("API key two-factor review not read: {e}");
+                Default::default()
+            })
+    } else {
+        Default::default()
+    };
+    let views: Vec<Value> = all
+        .iter()
+        .map(|k| {
+            let mut v = key_view(k, now);
+            if let Some(r) = reviews.get(&k.id) {
+                v["two_factor_review"] = r.clone();
+            }
+            v
+        })
+        .collect();
     Ok(Json(json!({
-        "keys": all.iter().map(|k| key_view(k, now)).collect::<Vec<_>>(),
+        "keys": views,
         "scopes": scopes,
         "limits": {
             "default_rate_per_minute": DEFAULT_RATE_PER_MINUTE,

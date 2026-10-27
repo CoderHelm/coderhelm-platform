@@ -951,6 +951,16 @@ pub async fn remove_user(
 
     info!(user_id = %sk, team_id = %claims.team_id, "User removed");
 
+    // Off every plugin's approvers, unless another record of theirs stays.
+    let email = s(target, "email");
+    if !email.is_empty()
+        && !items
+            .iter()
+            .any(|i| s(i, "sk") != sk && s(i, "email").eq_ignore_ascii_case(email))
+    {
+        super::plugin_pkgs::member_removed(&state, &claims.team_id, email, &claims.email).await;
+    }
+
     Ok(Json(json!({ "status": "removed" })))
 }
 
@@ -1108,6 +1118,13 @@ pub async fn mfa_setup(
     Extension(claims): Extension<Claims>,
     Json(body): Json<EnableMfaRequest>,
 ) -> Result<Json<Value>, StatusCode> {
+    // A self-hosted install: one second factor per member, so none is set
+    // up over the authenticator-app code.
+    if crate::routes::sign_in::applies() {
+        crate::routes::sign_in::check_enroll(&state, &claims)
+            .await
+            .map_err(|(code, _)| code)?;
+    }
     // Authenticate to get a Cognito access token
     let hash = cognito_secret_hash(
         &state.cognito_client_secret,
@@ -1177,6 +1194,13 @@ pub async fn mfa_verify_setup(
     Extension(claims): Extension<Claims>,
     Json(body): Json<VerifyMfaRequest>,
 ) -> Result<axum::response::Response, StatusCode> {
+    // A self-hosted install: one second factor per member, so none is set
+    // up over the authenticator-app code.
+    if crate::routes::sign_in::applies() {
+        crate::routes::sign_in::check_enroll(&state, &claims)
+            .await
+            .map_err(|(code, _)| code)?;
+    }
     // Authenticate to get a Cognito access token
     let hash = cognito_secret_hash(
         &state.cognito_client_secret,
@@ -1281,7 +1305,11 @@ pub async fn mfa_disable(
     if role_level(&claims.role) < 3 && claims.email.is_empty() {
         return Err(StatusCode::FORBIDDEN);
     }
-    // A self-hosted install that requires two-factor sign-in keeps it on.
+    // A self-hosted install: only a session that passed this code turns it
+    // off, and an install that requires two-factor sign-in keeps it on.
+    if crate::routes::sign_in::applies() && !proof.as_ref().is_some_and(|p| p.mfa) {
+        return Err(StatusCode::FORBIDDEN);
+    }
     if crate::routes::sign_in::applies()
         && crate::routes::sign_in::load_org(&state)
             .await

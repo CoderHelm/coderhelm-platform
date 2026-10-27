@@ -315,6 +315,11 @@ pub fn simulated_resource(action: &str, role_arn: &str, region: &str, account: &
             format!("arn:aws:airflow:{region}:{account}:role/coderhelm-permission-check/Viewer")
         }
         "iam:SimulatePrincipalPolicy" => role_arn.to_string(),
+        // Allowed on CoderHelm's own update stacks only.
+        "cloudformation:DescribeStacks" => format!(
+            "arn:aws:cloudformation:{region}:{account}:stack/{}/coderhelm-permission-check",
+            log_reader::update_stack_name()
+        ),
         _ => "*".to_string(),
     }
 }
@@ -423,9 +428,10 @@ async fn probes(s: &Session) -> Vec<(&'static str, Option<bool>)> {
         .await
         .map(|_| ())
         .map_err(|e| refused(&e));
-    let code = client!(aws_sdk_lambda, s, s.region.clone())
-        .list_functions()
-        .max_items(1)
+    // The role's own stack: a refusal means the ability is missing.
+    let code = client!(aws_sdk_cloudformation, s, s.region.clone())
+        .list_stack_resources()
+        .stack_name(log_reader::ROLE_STACK)
         .send()
         .await
         .map(|_| ())
@@ -607,7 +613,7 @@ mod tests {
             .missing
             .contains(&"iam:SimulatePrincipalPolicy".to_string()));
         assert!(c.missing.contains(&"ecs:DescribeTasks".to_string()));
-        assert!(c.missing.contains(&"lambda:GetFunction".to_string()));
+        assert!(c.missing.contains(&"lambda:ListTags".to_string()));
         assert!(!c.missing.iter().any(|m| m.starts_with("airflow:")));
         assert_eq!(c.missing_abilities(), vec!["check", "ecs", "code"]);
     }
@@ -704,5 +710,15 @@ mod tests {
             simulated_resource("ecs:ListTasks", &t.role_arn, "r", "a"),
             "*"
         );
+        // The stack read is allowed on CoderHelm's update stacks only.
+        assert!(simulated_resource(
+            "cloudformation:DescribeStacks",
+            &t.role_arn,
+            "eu-west-1",
+            "111122223333"
+        )
+        .starts_with(
+            "arn:aws:cloudformation:eu-west-1:111122223333:stack/CoderHelmLogReaderUpdate-"
+        ));
     }
 }

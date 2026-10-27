@@ -9,9 +9,10 @@
 //!    definition that write to the log group (found by the task's own log
 //!    configuration, not by its name), their container images and image
 //!    labels (`org.opencontainers.image.source`), the ECR image's manifest
-//!    annotations and repository tags, the Lambda function and its tags, the
-//!    CloudFormation stack behind them (tags and description), and the log
-//!    group's own tags. A value that points at one of the team's repos (a
+//!    annotations and repository tags, the Lambda function's tags (never
+//!    its configuration, which carries its environment, nor its code), the
+//!    CloudFormation stack behind them (its name, and the functions in its
+//!    resource list), and the log group's own tags. A value that points at one of the team's repos (a
 //!    GitHub URL, `owner/name`, or a repo's exact name) is evidence.
 //! 3. The team's code: a code search for the identifiers AWS gave (the log
 //!    group, service, task family, function, image repository and stack
@@ -30,8 +31,8 @@
 //! for another repo is low.
 //!
 //! A resolution is cached per log group ([`Cached`]) and used again until
-//! the evidence it rested on changes (a new task definition revision, new
-//! Lambda code, the team's repos), or a week passes.
+//! the evidence it rested on changes (a new task definition revision, the
+//! log group's tags, the team's repos), or a week passes.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -163,7 +164,8 @@ pub struct LambdaFact {
     /// Container image, for image functions.
     pub image: String,
     pub tags: BTreeMap<String, String>,
-    /// Changes when new code is deployed.
+    /// Changes when new code is deployed. No longer read (it comes only
+    /// with the function's configuration); kept for cached resolutions.
     pub code_sha: String,
     pub description: String,
 }

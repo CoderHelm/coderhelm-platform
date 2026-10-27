@@ -1444,6 +1444,88 @@ pub struct EmailDecision {
     decision: String,
 }
 
+type Item = std::collections::HashMap<String, aws_sdk_dynamodb::types::AttributeValue>;
+
+/// The role of the team member with this email, if one is on the team now
+/// (an invite doesn't count).
+fn current_role(items: &[Item], email: &str) -> Option<String> {
+    let get = |i: &Item, k: &str| {
+        i.get(k)
+            .and_then(|v| v.as_s().ok())
+            .cloned()
+            .unwrap_or_default()
+    };
+    items
+        .iter()
+        .find(|i| {
+            get(i, "email").trim().eq_ignore_ascii_case(email.trim())
+                && get(i, "status") != "invited"
+        })
+        .map(|i| match get(i, "role").as_str() {
+            "" => "member".to_string(),
+            r => r.to_string(),
+        })
+}
+
+/// The person an email link was sent to, as they are now: still on the team
+/// and still allowed to approve plugin drafts. A link outlives neither.
+async fn email_actor(state: &AppState, team: &str, email: &str) -> Result<drafts::Actor, String> {
+    let gone = || "You aren't on this team any more, so this link no longer works.".to_string();
+    let mut items = Vec::new();
+    let mut start = None;
+    loop {
+        let out = state
+            .dynamo
+            .query()
+            .table_name(&state.config.users_table_name)
+            .key_condition_expression("pk = :pk AND begins_with(sk, :p)")
+            .expression_attribute_values(
+                ":pk",
+                aws_sdk_dynamodb::types::AttributeValue::S(team.into()),
+            )
+            .expression_attribute_values(
+                ":p",
+                aws_sdk_dynamodb::types::AttributeValue::S("USER#".into()),
+            )
+            .set_exclusive_start_key(start)
+            .send()
+            .await
+            .map_err(|e| {
+                warn!(error = %e, "Team not read for an email approval");
+                "CoderHelm couldn't check this link just now. Try again.".to_string()
+            })?;
+        items.extend(out.items().iter().cloned());
+        match out.last_evaluated_key() {
+            Some(k) if !k.is_empty() => start = Some(k.clone()),
+            _ => break,
+        }
+    }
+    let role = current_role(&items, email).ok_or_else(gone)?;
+    if !super::roles::holder_for_role(state, team, &role)
+        .await
+        .holds(CAP_APPROVE)
+    {
+        return Err("Your role can't approve plugin drafts any more.".into());
+    }
+    Ok(drafts::Actor::new(email, false))
+}
+
+/// The capability behind every plugin draft decision.
+const CAP_APPROVE: &str = "plugins.approve";
+
+/// Takes a person who left the team off every plugin's approvers. Logged on
+/// failure; the removal itself has happened (and an email link checks the
+/// team anyway).
+pub async fn member_removed(state: &AppState, team: &str, email: &str, by: &str) {
+    match install::drop_approver(&kv(state), team, email, by).await {
+        Ok(changed) if !changed.is_empty() => {
+            info!(team_id = %team, plugins = changed.len(), "Removed member taken off plugin approvers")
+        }
+        Ok(_) => {}
+        Err(r) => warn!(team_id = %team, error = %r.error, "Plugin approvers not updated"),
+    }
+}
+
 /// POST /plugins/approve (form: t, decision) — approves or rejects exactly
 /// the version the link names, as the approver it names.
 pub async fn email_approve(
@@ -1461,8 +1543,17 @@ pub async fn email_approve(
         }
     };
     let team = link.team_id.as_str();
+    let who = match email_actor(&state, team, &link.email).await {
+        Ok(w) => w,
+        Err(e) => {
+            return (
+                StatusCode::FORBIDDEN,
+                page("Can't use this link", &format!("<p>{}</p>", esc(&e))),
+            )
+                .into_response()
+        }
+    };
     let approvers = approvers_of(&kv, team, &a.plugin_id).await;
-    let who = drafts::Actor::new(&link.email, false);
     let result = if f.decision == "reject" {
         drafts::reject(
             &kv,
@@ -1716,5 +1807,64 @@ pub async fn on_push(state: &AppState, team: &str, installation_id: u64, repo: &
         if let Err(e) = send(state, body).await {
             warn!(team, source = %s.id, error = ?e.1 .0, "Couldn't queue a plugin source sync");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use aws_sdk_dynamodb::types::AttributeValue;
+
+    fn rec(email: &str, role: &str, status: &str) -> Item {
+        let mut i = Item::new();
+        i.insert("email".into(), AttributeValue::S(email.into()));
+        if !role.is_empty() {
+            i.insert("role".into(), AttributeValue::S(role.into()));
+        }
+        if !status.is_empty() {
+            i.insert("status".into(), AttributeValue::S(status.into()));
+        }
+        i
+    }
+
+    /// An email link counts only for someone on the team now: an invite or a
+    /// removed member is no one.
+    #[test]
+    fn an_email_approval_needs_someone_on_the_team_now() {
+        let items = vec![
+            rec("admin@a.io", "admin", ""),
+            rec("plain@a.io", "", "active"),
+            rec("invited@a.io", "member", "invited"),
+        ];
+        assert_eq!(
+            current_role(&items, "ADMIN@a.io ").as_deref(),
+            Some("admin")
+        );
+        assert_eq!(
+            current_role(&items, "plain@a.io").as_deref(),
+            Some("member")
+        );
+        assert_eq!(current_role(&items, "invited@a.io"), None);
+        assert_eq!(current_role(&items, "left@a.io"), None);
+    }
+
+    /// The link checks the person and their role before anything changes, and
+    /// a removal takes them off the approver lists.
+    #[test]
+    fn the_email_link_checks_the_team_before_deciding() {
+        let me = include_str!("plugin_pkgs.rs");
+        let start = me.find("pub async fn email_approve(").unwrap();
+        let f = &me[start..start + me[start..].find("\n}\n").unwrap()];
+        let check = f.find("email_actor(").unwrap();
+        assert!(check < f.find("drafts::reject(").unwrap());
+        assert!(check < f.find("drafts::approve(").unwrap());
+        assert!(me.contains("holds(CAP_APPROVE)"));
+        assert!(crate::permissions::CAPABILITIES
+            .iter()
+            .any(|c| c.key == CAP_APPROVE && c.handlers.contains(&"plugin_pkgs::approve_draft")));
+        let users = include_str!("users.rs");
+        let start = users.find("pub async fn remove_user(").unwrap();
+        let f = &users[start..start + users[start..].find("\n}\n").unwrap()];
+        assert!(f.find(".delete_item()").unwrap() < f.find("plugin_pkgs::member_removed").unwrap());
     }
 }

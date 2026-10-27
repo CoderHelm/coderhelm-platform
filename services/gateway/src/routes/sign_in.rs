@@ -20,7 +20,12 @@
 //! Two-factor: password accounts use Cognito's authenticator-app (TOTP) MFA.
 //! Google and GitHub sign-ins never pass through Cognito MFA, so CoderHelm
 //! asks for its own authenticator-app code after them (secret sealed with
-//! the install's KMS key on the member record). The session token records
+//! the install's KMS key on the member record). Every way in reaches the
+//! same member record (by email), so a member has one second factor, and it
+//! is asked for however they sign in: the app code after a password too, and
+//! a member whose factor is the password account's code signs in with the
+//! password (only Cognito can check that code). Neither kind can be set up
+//! while the record has one ([`may_enroll`]). The session token records
 //! whether its sign-in passed a second factor ([`SignInProof`]); with the
 //! rule on, the auth middleware lets a session without one reach only the
 //! screens that set it up ([`gate`]). The rule is read on every request, so
@@ -1028,16 +1033,8 @@ pub async fn app_setup(
     if !applies() {
         return Err(fail(StatusCode::NOT_FOUND, "Not available here."));
     }
-    let item = member(&state, &claims.team_id, &claims.sub)
-        .await
-        .map_err(|e| internal("Member not read", e))?
-        .ok_or_else(|| fail(StatusCode::NOT_FOUND, "You aren't on this team."))?;
-    if app_enabled(&item) {
-        return Err(fail(
-            StatusCode::CONFLICT,
-            "Two-factor sign-in is already on for you.",
-        ));
-    }
+    // One second factor per member: none may be set up over another.
+    check_enroll(&state, &claims).await?;
     let mut secret = [0u8; 20];
     rand::RngCore::fill_bytes(&mut rand::rng(), &mut secret);
     let sealed = seal(&state, &claims.team_id, &claims.sub, &secret)
@@ -1089,6 +1086,8 @@ pub async fn app_verify(
             "Start the setup first: it shows the code to scan.",
         ));
     }
+    // A factor set up since the setup started (on the password account) wins.
+    check_enroll(&state, &claims).await?;
     let secret = unseal(&state, &claims.team_id, &claims.sub, pending)
         .await
         .map_err(|e| internal("Two-factor secret not read", e))?;
@@ -1672,37 +1671,187 @@ pub async fn end_other_sessions(
     Ok(session_cookie(&token))
 }
 
-// ── Two-factor: the step after Google or GitHub ─────────────────────
+// ── Two-factor: one second factor per member, on every way in ───────
 
-/// After a Google or GitHub sign-in: when the person has the
-/// authenticator-app factor, the session waits for their code. Returns the
-/// redirect to the code screen, or `None` to sign them straight in (no
-/// factor yet: with the rule on, the session can then only set one up).
+/// The member's second factor, read to decide a sign-in or a setup: `app`
+/// (CoderHelm's authenticator-app code) or `cognito` (the authenticator code
+/// on their password account). Cognito is asked live, so a factor turned off
+/// there doesn't linger. Unlike [`factor_of`], a read that fails is an error
+/// (the caller refuses).
+async fn enrolled_factor(state: &AppState, item: &Item) -> Result<Option<String>, String> {
+    if app_enabled(item) {
+        return Ok(Some("app".into()));
+    }
+    let email = s(item, "email");
+    if email.is_empty() {
+        return Ok(None);
+    }
+    match state
+        .cognito
+        .admin_get_user()
+        .user_pool_id(&state.config.cognito_user_pool_id)
+        .username(email)
+        .send()
+        .await
+    {
+        Ok(u) => Ok(u
+            .user_mfa_setting_list
+            .is_some_and(|l| l.iter().any(|m| m == "SOFTWARE_TOKEN_MFA"))
+            .then(|| "cognito".to_string())),
+        Err(e) => {
+            let msg = format!("{e:?}");
+            if msg.contains("UserNotFound") {
+                Ok(None)
+            } else {
+                Err(msg)
+            }
+        }
+    }
+}
+
+/// What a sign-in still needs before it gets a session.
+#[derive(Debug, PartialEq, Eq)]
+pub enum StepNeeded {
+    /// Nothing more: no second factor, or it was just passed.
+    None,
+    /// CoderHelm's authenticator-app code.
+    AppCode,
+    /// The factor is the authenticator code on the password account, which
+    /// only Cognito can check: sign in with email and password.
+    UsePassword,
+}
+
+/// Whichever second factor the member has must be passed, however they
+/// signed in. `passed` is a Cognito code on this very sign-in.
+pub fn step_needed(factor: Option<&str>, passed: bool) -> StepNeeded {
+    match factor {
+        None => StepNeeded::None,
+        Some(_) if passed => StepNeeded::None,
+        Some("app") => StepNeeded::AppCode,
+        Some(_) => StepNeeded::UsePassword,
+    }
+}
+
+/// What this sign-in still needs, read from the member's record.
+async fn needed_for(
+    state: &AppState,
+    step: &SecondStep,
+    passed: bool,
+) -> Result<StepNeeded, String> {
+    // A Cognito code on this sign-in is a factor the member has.
+    if passed {
+        return Ok(StepNeeded::None);
+    }
+    let Some(item) = member(state, &step.team_id, &step.sub).await? else {
+        return Ok(StepNeeded::None);
+    };
+    Ok(step_needed(
+        enrolled_factor(state, &item).await?.as_deref(),
+        passed,
+    ))
+}
+
+fn second_step_cookie(state: &AppState, step: &SecondStep) -> Result<HeaderValue, String> {
+    let token = jwt::create_second_step(step, &state.secrets.jwt_secret, SECOND_STEP_SECS)
+        .map_err(|e| e.to_string())?;
+    HeaderValue::from_str(&format!(
+        "{SECOND_STEP_COOKIE}={token}; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age={SECOND_STEP_SECS}"
+    ))
+    .map_err(|e| e.to_string())
+}
+
+/// The error code for a federated or password sign-in whose factor is the
+/// password account's code.
+pub const USE_PASSWORD: &str = "two_factor_use_password";
+
+/// After a Google or GitHub sign-in: the member's second factor, whichever
+/// it is. Returns the redirect to the code screen (the authenticator-app
+/// factor), back to sign-in with email and password (the password account's
+/// factor), or `None` to sign them straight in (no factor yet: with the rule
+/// on, the session can then only set one up).
 pub async fn second_step(
     state: &AppState,
     step: SecondStep,
     app_url: &str,
 ) -> Result<Option<Response>, String> {
-    let Some(item) = member(state, &step.team_id, &step.sub).await? else {
-        return Ok(None);
+    match needed_for(state, &step, false).await? {
+        StepNeeded::None => Ok(None),
+        StepNeeded::UsePassword => Ok(Some(
+            (
+                StatusCode::FOUND,
+                [(header::LOCATION, format!("{app_url}/?error={USE_PASSWORD}"))],
+            )
+                .into_response(),
+        )),
+        StepNeeded::AppCode => {
+            let mut resp = (
+                StatusCode::FOUND,
+                [(header::LOCATION, format!("{app_url}/?two_factor=1"))],
+            )
+                .into_response();
+            resp.headers_mut()
+                .append(header::SET_COOKIE, second_step_cookie(state, &step)?);
+            Ok(Some(resp))
+        }
+    }
+}
+
+/// After an email and password sign-in: a member whose second factor is the
+/// authenticator-app code enters it next (the same step as after Google or
+/// GitHub). `passed` is whether Cognito asked for and took its own code.
+/// Returns the answer to send instead of a session, or `None`.
+pub async fn password_step(
+    state: &AppState,
+    step: SecondStep,
+    passed: bool,
+) -> Result<Option<Response>, String> {
+    match needed_for(state, &step, passed).await? {
+        StepNeeded::None => Ok(None),
+        StepNeeded::UsePassword => Ok(Some(
+            fail_code(
+                StatusCode::FORBIDDEN,
+                "Your two-factor code couldn't be checked. Sign in again.",
+                USE_PASSWORD,
+            )
+            .into_response(),
+        )),
+        StepNeeded::AppCode => {
+            let mut resp = Json(json!({ "status": "second_step" })).into_response();
+            resp.headers_mut()
+                .append(header::SET_COOKIE, second_step_cookie(state, &step)?);
+            Ok(Some(resp))
+        }
+    }
+}
+
+/// May a member set up a second factor (either kind)? A member has one: while their record has one, neither kind can be set up (a
+/// held session included); to change it, turn the one they have off first,
+/// which takes its code.
+pub fn may_enroll(existing: Option<&str>) -> Result<(), &'static str> {
+    match existing {
+        None => Ok(()),
+        Some("app") => Err(
+            "You already have two-factor sign-in with an authenticator app. Turn it off first (that takes a current code).",
+        ),
+        Some(_) => Err(
+            "You already have two-factor sign-in on your password account. Turn it off first.",
+        ),
+    }
+}
+
+/// The setup check, read from the caller's own record. `Err` is the answer.
+pub async fn check_enroll(state: &AppState, claims: &Claims) -> Result<(), ApiError> {
+    let Some(item) = member(state, &claims.team_id, &claims.sub)
+        .await
+        .map_err(|e| internal("Member not read", e))?
+    else {
+        return Err(fail(StatusCode::NOT_FOUND, "You aren't on this team."));
     };
-    if !app_enabled(&item) {
-        return Ok(None);
-    }
-    let token = jwt::create_second_step(&step, &state.secrets.jwt_secret, SECOND_STEP_SECS)
-        .map_err(|e| e.to_string())?;
-    let mut resp = (
-        StatusCode::FOUND,
-        [(header::LOCATION, format!("{app_url}/?two_factor=1"))],
-    )
-        .into_response();
-    let cookie = format!(
-        "{SECOND_STEP_COOKIE}={token}; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age={SECOND_STEP_SECS}"
-    );
-    if let Ok(v) = HeaderValue::from_str(&cookie) {
-        resp.headers_mut().append(header::SET_COOKIE, v);
-    }
-    Ok(Some(resp))
+    let factor = enrolled_factor(state, &item)
+        .await
+        .map_err(|e| internal("Two-factor sign-in not read", e))?;
+    may_enroll(factor.as_deref())
+        .map_err(|m| fail_code(StatusCode::CONFLICT, m, "has_second_factor"))
 }
 
 fn cookie_value<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
@@ -1921,9 +2070,34 @@ pub async fn get_settings(
             .unwrap_or_default()
             .iter()
             .filter(|k| k.is_live(now))
-            .map(|k| json!({ "id": k.id, "name": k.name, "created_by": k.created_by_name }))
+            .map(|k| json!({ "id": k.id, "name": k.name, "created_by": k.created_by_name, "created_by_id": k.created_by, "created_at": k.created_at }))
             .collect()
     };
+    // Keys made before the rule: whether their maker has a second factor now.
+    let require = org.as_ref().is_some_and(|o| o.require_2fa);
+    let since = org.as_ref().and_then(|o| o.require_2fa_since.clone());
+    let keys: Vec<Value> = keys
+        .into_iter()
+        .map(|mut k| {
+            let before = made_before_rule(
+                k["created_at"].as_str().unwrap_or_default(),
+                require,
+                since.as_deref(),
+            );
+            let maker = people
+                .iter()
+                .zip(active.iter())
+                .find(|(_, i)| k["created_by_id"].as_str() == Some(s(i, "sk")))
+                .map(|(p, _)| p["two_factor"].clone());
+            k["made_before_rule"] = json!(before);
+            k["maker_on_team"] = json!(maker.is_some());
+            k["maker_two_factor"] = maker.unwrap_or(Value::Null);
+            if let Some(o) = k.as_object_mut() {
+                o.remove("created_by_id");
+            }
+            k
+        })
+        .collect();
     Ok(Json(json!({
         "self_hosted": true,
         "is_org": org.as_ref().is_some_and(|o| o.team_id == claims.team_id),
@@ -1935,6 +2109,69 @@ pub async fn get_settings(
         "api_keys": keys,
         "your_session_has_2fa": proof.is_some_and(|p| p.mfa),
     })))
+}
+
+/// Was this key made before two-factor sign-in was required? A key never
+/// signs in, so the rule doesn't hold it back: one made before the rule may
+/// have been made from a session without a second factor. Unknown (no time
+/// for the rule, or a time that doesn't read) counts as before.
+pub fn made_before_rule(created_at: &str, require_2fa: bool, since: Option<&str>) -> bool {
+    if !require_2fa {
+        return false;
+    }
+    let at = |v: &str| chrono::DateTime::parse_from_rfc3339(v).ok();
+    match (at(created_at), since.and_then(at)) {
+        (Some(made), Some(rule)) => made < rule,
+        _ => true,
+    }
+}
+
+/// For each live API key made before the rule was turned on: whether its
+/// maker is still on the team and which second factor they have now. Keyed
+/// by key id; keys that need no look are left out.
+pub async fn key_reviews(
+    state: &AppState,
+    team_id: &str,
+    keys: &[crate::api_keys::StoredKey],
+) -> Result<HashMap<String, Value>, String> {
+    let now = chrono::Utc::now();
+    let Some(org) = load_org(state).await? else {
+        return Ok(HashMap::new());
+    };
+    let flagged: Vec<&crate::api_keys::StoredKey> = keys
+        .iter()
+        .filter(|k| {
+            k.is_live(now)
+                && made_before_rule(
+                    &k.created_at,
+                    org.require_2fa,
+                    org.require_2fa_since.as_deref(),
+                )
+        })
+        .collect();
+    if flagged.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let members = team_members(state, team_id).await?;
+    let mut out = HashMap::new();
+    for k in flagged {
+        let maker = members
+            .iter()
+            .find(|m| !is_invite(m) && s(m, "sk") == k.created_by);
+        let factor = match maker {
+            Some(m) => factor_of(state, m).await,
+            None => None,
+        };
+        out.insert(
+            k.id.clone(),
+            json!({
+                "made_before_rule": true,
+                "maker_on_team": maker.is_some(),
+                "maker_two_factor": factor,
+            }),
+        );
+    }
+    Ok(out)
 }
 
 #[derive(Deserialize)]
@@ -2735,6 +2972,97 @@ mod tests {
         assert!(!body(me, "check_member_session")
             .to_lowercase()
             .contains("cache"));
+    }
+
+    /// Whichever second factor a member has is asked for after every way in.
+    #[test]
+    fn the_members_one_second_factor_is_asked_for_however_they_sign_in() {
+        // No factor: straight in (with the rule on, held until one is set up).
+        assert_eq!(step_needed(None, false), StepNeeded::None);
+        // The app code: after Google, GitHub and a password alike.
+        assert_eq!(step_needed(Some("app"), false), StepNeeded::AppCode);
+        // The password account's code: only Cognito checks it, so Google or
+        // GitHub goes back to the password sign-in.
+        assert_eq!(step_needed(Some("cognito"), false), StepNeeded::UsePassword);
+        // A Cognito code passed on this sign-in is the factor.
+        assert_eq!(step_needed(Some("cognito"), true), StepNeeded::None);
+        assert_eq!(step_needed(Some("app"), true), StepNeeded::None);
+        // Every path asks before it makes a session.
+        let auth = include_str!("auth.rs");
+        let google = body(auth, "google_callback_inner");
+        assert!(before(
+            google,
+            "sign_in::second_step",
+            "SignInProof::new(false, \"google\")"
+        ));
+        let github = body(auth, "github_callback_inner");
+        assert!(before(
+            github,
+            "sign_in::second_step",
+            "SignInProof::new(false, \"github\")"
+        ));
+        let issue = body(auth, "issue_session_from_cognito");
+        assert!(before(issue, "sign_in::password_step", "session_json("));
+        assert!(issue.contains("proof.mfa"));
+        // The step reads the member's factor, either kind, and fails closed.
+        let me = include_str!("sign_in.rs");
+        for f in ["second_step", "password_step"] {
+            assert!(body(me, f).contains("needed_for(state"), "{f}");
+        }
+        let read = body(me, "enrolled_factor");
+        assert!(read.contains("app_enabled(item)") && read.contains("SOFTWARE_TOKEN_MFA"));
+        assert!(read.contains("Err(msg)"));
+    }
+
+    /// A member has one second factor: neither kind is set up over the other
+    /// or over itself, by a held session or any other.
+    #[test]
+    fn neither_factor_is_set_up_while_the_record_has_one() {
+        assert!(may_enroll(None).is_ok());
+        assert!(may_enroll(Some("app")).is_err());
+        assert!(may_enroll(Some("cognito")).is_err());
+        let me = include_str!("sign_in.rs");
+        let users = include_str!("users.rs");
+        assert!(before(body(me, "app_setup"), "check_enroll", "seal(&state"));
+        assert!(before(
+            body(me, "app_verify"),
+            "check_enroll",
+            ".update_item()"
+        ));
+        assert!(before(
+            body(users, "mfa_setup"),
+            "sign_in::check_enroll",
+            ".associate_software_token()"
+        ));
+        assert!(before(
+            body(users, "mfa_verify_setup"),
+            "sign_in::check_enroll",
+            ".verify_software_token()"
+        ));
+        // Turning the password account's code off takes a session that passed it.
+        assert!(before(
+            body(users, "mfa_disable"),
+            "p.mfa",
+            ".admin_set_user_mfa_preference()"
+        ));
+        assert!(body(me, "check_enroll").contains("enrolled_factor"));
+    }
+
+    /// With the rule on, keys made before it are flagged for a look.
+    #[test]
+    fn keys_made_before_the_rule_are_flagged() {
+        let since = Some("2026-10-20T12:00:00.000+00:00");
+        assert!(!made_before_rule("2026-10-01T00:00:00Z", false, since));
+        assert!(made_before_rule("2026-10-01T00:00:00Z", true, since));
+        assert!(!made_before_rule("2026-10-21T00:00:00Z", true, since));
+        // No time for the rule, or a key time that doesn't read: flagged.
+        assert!(made_before_rule("2026-10-21T00:00:00Z", true, None));
+        assert!(made_before_rule("yesterday", true, since));
+        // Both the API keys page and Settings, Sign-in show it.
+        let keys = include_str!("api_keys.rs");
+        assert!(body(keys, "list").contains("sign_in::key_reviews"));
+        let settings = body(include_str!("sign_in.rs"), "get_settings");
+        assert!(settings.contains("made_before_rule") && settings.contains("maker_two_factor"));
     }
 
     #[test]

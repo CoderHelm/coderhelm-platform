@@ -88,9 +88,20 @@ Resources:
                 Action:
                   - "iam:SimulatePrincipalPolicy"
                 Resource: !Sub "arn:aws:iam::${AWS::AccountId}:role/CoderHelmLogReader"
+              # Whether the dashboard's Update link was used: the status of
+              # CoderHelm's own update stacks only, no other stack.
+              - Sid: CheckOwnUpdateStack
+                Effect: Allow
+                Action:
+                  - "cloudformation:DescribeStacks"
+                Resource: !Sub "arn:aws:cloudformation:*:${AWS::AccountId}:stack/CoderHelmLogReaderUpdate-*/*"
               # Before a fix for a log error is written: which tasks of the
               # service behind a log group are running, since when, and how
-              # they start. Lists and describes only.
+              # they start. Lists and describes only. A task definition as
+              # ECS returns it includes its containers' environment
+              # variables; CoderHelm keeps only the log configuration, start
+              # command, image, labels, storage, cpu and memory from it, and
+              # never stores or shows the environment.
               - Sid: DescribeTasksBehindLogErrors
                 Effect: Allow
                 Action:
@@ -127,21 +138,19 @@ Resources:
             Version: "2012-10-17"
             Statement:
               # Which service writes a log group, so a fix goes to the repo its
-              # code lives in: describes and tags only. No image layers, no
-              # function code, nothing is changed.
+              # code lives in: tags, a stack's resource list (names and types)
+              # and image manifests only. No function configuration (it holds
+              # environment variables), no function code, no stack
+              # parameters, no image layers; nothing is changed.
               - Sid: DescribeServicesBehindLogGroups
                 Effect: Allow
                 Action:
                   - "ecs:ListClusters"
                   - "ecs:ListServices"
                   - "ecs:DescribeServices"
-                  - "ecs:DescribeTaskDefinition"
-                  - "lambda:GetFunction"
-                  - "lambda:GetFunctionConfiguration"
-                  - "lambda:ListFunctions"
                   - "lambda:ListTags"
                   - "logs:ListTagsForResource"
-                  - "cloudformation:DescribeStacks"
+                  - "cloudformation:ListStackResources"
                   - "ecr:BatchGetImage"
                   - "ecr:ListTagsForResource"
                 Resource: "*"

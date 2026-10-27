@@ -40,7 +40,15 @@ With it on:
 - **People who sign in with a password** use Cognito's own two-factor codes: Cognito asks for the code at every sign-in.
 - **People who sign in with Google or GitHub** don't pass through Cognito's two-factor step, so CoderHelm asks for its own authenticator-app code right after Google or GitHub. Their secret is sealed with the install's KMS key. No sign-in path skips the code.
 - **Sessions from before the switch** are checked at their next request: someone already signed in without a code is sent to the setup screen, or asked to sign in again with their code.
-- **API keys** are not people and keep working. **Settings, Sign-in** lists them, so you can revoke any you don't want.
+- **API keys** are not people and keep working: a key never signs in, so the rule doesn't hold it back. **Settings, Sign-in** and **Settings, API keys** mark each live key made before the rule was turned on, with whether the person who made it has a second factor now (or has left the team). Such a key may have been made from a session without a second factor: check them and revoke any you don't recognize in **Settings, API keys**. Keys made after the rule is on come from sessions that passed it.
+
+### One second factor per person
+
+Email and password, Google and GitHub all lead to the same person in CoderHelm (by email), so each person has **one** second factor, and it is asked for however they sign in, whether the rule is on or not:
+
+- **An authenticator app set up in CoderHelm** (after Google or GitHub): its code is asked for after Google, GitHub and a password alike.
+- **Cognito's code on the password account**: only Cognito can check it, so it is asked for at the password sign-in. Signing in with Google or GitHub sends the person back to sign in with their email and password.
+- **Neither kind can be set up while the person has one**, from any session, including one held at the setup screen. To change it, turn the current one off first: the app code takes a current code to turn off, and the password account's code can be turned off only from a session that passed it. If someone lost their phone, an admin resets it (below).
 
 **Settings, Sign-in** shows who has set it up. If someone loses their phone, an admin can reset their two-factor sign-in after checking it's really them (a video call, say). The admin writes how they checked; the reset and the reason go in the log under **Settings, Roles**. The person sets it up again at their next sign-in. Only an owner can reset an admin's or another owner's. Nobody can reset their own.
 

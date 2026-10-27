@@ -922,6 +922,53 @@ pub async fn set_limit(
     Ok(p)
 }
 
+/// Takes a person who left the team off every plugin's approvers, so a
+/// link already in their mail can't be used and they get no new ones. The
+/// number of approvals a draft needs stays; an admin picks a new approver
+/// when too few are left. Returns the plugins changed.
+pub async fn drop_approver(
+    kv: &dyn Kv,
+    team: &str,
+    email: &str,
+    by: &str,
+) -> Result<Vec<String>, Refusal> {
+    let gone = email.trim().to_ascii_lowercase();
+    if gone.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut changed = Vec::new();
+    for listed in list(kv, team).await? {
+        if !listed.approvers.members.iter().any(|m| m == &gone) {
+            continue;
+        }
+        // Read again with its revision: a change meanwhile is kept.
+        let (mut p, rev) = get(kv, team, &listed.id).await?;
+        p.approvers.members.retain(|m| m != &gone);
+        save(kv, team, &mut p, Some(rev)).await?;
+        let version = p
+            .current
+            .as_ref()
+            .map(|c| c.version.clone())
+            .unwrap_or_default();
+        audit::record(
+            kv,
+            team,
+            ev(
+                by,
+                ActorKind::Person,
+                action::PLUGIN_SETTINGS,
+                "ok",
+                &p,
+                &version,
+            )
+            .detail(format!("approver {gone} removed: left the team")),
+        )
+        .await;
+        changed.push(p.id);
+    }
+    Ok(changed)
+}
+
 /// Who approves the plugin's drafts (emails), and how many approvals each
 /// draft needs.
 pub async fn set_approvers(
@@ -1214,6 +1261,38 @@ pub(crate) mod tests {
         assert_eq!(p.status, Status::Active);
         assert_eq!(p.hash(), Some(hash.as_str()));
         assert_eq!(p.monthly_tokens, 2_000_000);
+    }
+
+    #[tokio::test]
+    async fn a_person_who_leaves_the_team_is_taken_off_every_approver_list() {
+        let kv = Memory::new();
+        let (_, src) = with_source(&kv).await;
+        install(&kv, TEAM, &src, "plugins/marketing", "admin@a.io", 1)
+            .await
+            .unwrap();
+        set_approvers(
+            &kv,
+            TEAM,
+            "marketing",
+            vec!["left@a.io".into(), "stays@a.io".into()],
+            1,
+            None,
+            "admin@a.io",
+        )
+        .await
+        .unwrap();
+        let changed = drop_approver(&kv, TEAM, " Left@A.io ", "admin@a.io")
+            .await
+            .unwrap();
+        assert_eq!(changed, vec!["marketing".to_string()]);
+        let (p, _) = get(&kv, TEAM, "marketing").await.unwrap();
+        assert_eq!(p.approvers.members, vec!["stays@a.io".to_string()]);
+        assert_eq!(p.approvers.min, 1);
+        // Someone on no list changes nothing.
+        assert!(drop_approver(&kv, TEAM, "nobody@a.io", "admin@a.io")
+            .await
+            .unwrap()
+            .is_empty());
     }
 
     #[tokio::test]
