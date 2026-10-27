@@ -710,6 +710,7 @@ pub mod knowledge;
 pub mod knowledge_sync;
 pub mod lessons;
 pub mod line_count;
+mod link_checks;
 pub mod live_sources;
 pub mod log_autofix;
 pub mod log_evidence;
@@ -3874,24 +3875,29 @@ async fn run_passes(
     check_cancelled(state, &msg.team_id, run_id).await?;
     update_pass(state, &msg.team_id, run_id, "review").await?;
     let mut evidence = impl_result.evidence.clone();
-    let gaps = proof::prove(
-        &proof::Work {
-            state,
-            msg,
-            github: &github,
-            plan: &plan_result,
-            branch: &branch_name,
-            rules: &rules,
-            repo_instructions: &repo_instructions,
-            provider: &provider,
-            file_cache: &file_cache,
-            run_id,
-        },
-        &mut evidence,
-        usage,
-        || has_time_for_remediation(start),
-    )
+    let work = proof::Work {
+        state,
+        msg,
+        github: &github,
+        plan: &plan_result,
+        branch: &branch_name,
+        rules: &rules,
+        repo_instructions: &repo_instructions,
+        provider: &provider,
+        file_cache: &file_cache,
+        run_id,
+    };
+    let gaps = proof::prove(&work, &mut evidence, usage, || {
+        has_time_for_remediation(start)
+    })
     .await;
+    // Every redirect and link the change adds or changes, checked live; a
+    // failure that survives its fix round stops the run before the PR.
+    let links = link_checks::gate(&work, &mut evidence, usage, || {
+        has_time_for_remediation(start)
+    })
+    .await
+    .map_err(|why| format!("Link and redirect check blocked the pull request: {why}"))?;
 
     // --- Create Draft PR (triggers CI) ---
     check_cancelled(state, &msg.team_id, run_id).await?;
@@ -3932,6 +3938,7 @@ async fn run_passes(
             ci: &evidence.ci_commands,
             mirrors: &completeness::parse_mirrors(&evidence.notes),
             log: log_ev.as_ref(),
+            links: &links,
         },
         &provider,
         usage,
@@ -4401,24 +4408,27 @@ async fn run_repo_pipeline(
     check_cancelled(state, &msg.team_id, run_id).await?;
     update_pass(state, &msg.team_id, run_id, "review").await?;
     let mut evidence = impl_result.evidence.clone();
-    let gaps = proof::prove(
-        &proof::Work {
-            state,
-            msg,
-            github,
-            plan: &repo_plan,
-            branch: branch_name,
-            rules,
-            repo_instructions,
-            provider,
-            file_cache,
-            run_id,
-        },
-        &mut evidence,
-        usage,
-        || has_time_for_remediation(start),
-    )
+    let work = proof::Work {
+        state,
+        msg,
+        github,
+        plan: &repo_plan,
+        branch: branch_name,
+        rules,
+        repo_instructions,
+        provider,
+        file_cache,
+        run_id,
+    };
+    let gaps = proof::prove(&work, &mut evidence, usage, || {
+        has_time_for_remediation(start)
+    })
     .await;
+    let links = link_checks::gate(&work, &mut evidence, usage, || {
+        has_time_for_remediation(start)
+    })
+    .await
+    .map_err(|why| format!("Link and redirect check blocked the pull request: {why}"))?;
 
     // --- Create Draft PR ---
     check_cancelled(state, &msg.team_id, run_id).await?;
@@ -4462,6 +4472,7 @@ async fn run_repo_pipeline(
             ci: &evidence.ci_commands,
             mirrors: &completeness::parse_mirrors(&evidence.notes),
             log: repo_ev.as_ref(),
+            links: &links,
         },
         provider,
         usage,

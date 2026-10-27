@@ -3158,6 +3158,18 @@ pub(crate) async fn mark_pr_ready(
     repo_name: &str,
     pr_number: u64,
 ) {
+    // Asking people to merge: the PR's redirects and links are checked
+    // again and the description's table updated; one that fails now keeps
+    // the PR a draft, with the reason in that table.
+    if let Some(r) = super::link_checks::refresh_pr(
+        state, github, team_id, repo_owner, repo_name, pr_number, "", true,
+    )
+    .await
+    .filter(|r| !r.blocking.is_empty())
+    {
+        warn!(pr_number, blocking = ?r.blocking, "Link and redirect checks fail now; the PR stays a draft");
+        return;
+    }
     // With a team commit template, the final squash keeps the message the
     // run's first commit was given from it; otherwise the PR title, as always.
     let keep_first = super::load_git_conventions(state, team_id, "")

@@ -158,7 +158,7 @@ pub enum CheckError {
 }
 
 impl CheckError {
-    fn text(&self) -> &str {
+    pub fn text(&self) -> &str {
         match self {
             CheckError::Refused(s) | CheckError::Failed(s) => s,
         }
@@ -658,6 +658,8 @@ pub struct WebCheck {
     /// Hosts the repository search already decided.
     searched: Mutex<HashMap<String, bool>>,
     used: AtomicUsize,
+    /// URLs this run may check ([`MAX_CHECKS`] unless set).
+    limit: usize,
     /// One line per checked URL, for the critic.
     results: Mutex<Vec<String>>,
 }
@@ -732,6 +734,7 @@ impl WebCheck {
             },
             searched: Mutex::new(HashMap::new()),
             used: AtomicUsize::new(0),
+            limit: MAX_CHECKS,
             results: Mutex::new(Vec::new()),
         }
     }
@@ -741,6 +744,13 @@ impl WebCheck {
             run_id: run_id.to_string(),
             origin,
         };
+        self
+    }
+
+    /// A different number of URLs this run may check: the link and redirect
+    /// check before a PR opens checks every entry of the change.
+    pub fn with_limit(mut self, limit: usize) -> Self {
+        self.limit = limit;
         self
     }
 
@@ -793,7 +803,61 @@ impl WebCheck {
     }
 
     fn take(&self) -> bool {
-        self.used.fetch_add(1, Ordering::SeqCst) < MAX_CHECKS
+        self.used.fetch_add(1, Ordering::SeqCst) < self.limit
+    }
+
+    /// One URL checked by the pipeline itself (not the agent): the same
+    /// host rules, addresses and budget as the tool, written to the same
+    /// activity log. A result that can't be logged is withheld.
+    pub async fn verify(
+        &self,
+        state: &WorkerState,
+        github: &GitHubClient,
+        u: &str,
+    ) -> Result<Checked, CheckError> {
+        let gate = RepoGate { web: self, github };
+        let (res, ms) = self.checked(&gate, &Net, u, &[]).await;
+        let (outcome, detail) = outcome_of(&res);
+        if !self.log(state, u, outcome, &detail, ms).await {
+            return Err(CheckError::Failed(
+                "the check could not be recorded, so its result is withheld".into(),
+            ));
+        }
+        res
+    }
+
+    /// Writes one call to the team's activity log; false when it failed.
+    async fn log(
+        &self,
+        state: &WorkerState,
+        u: &str,
+        outcome: &'static str,
+        detail: &str,
+        ms: u128,
+    ) -> bool {
+        let logged = store::log_activity_in(
+            &state.dynamo,
+            &state.config.settings_table_name,
+            &self.team_id,
+            &Activity {
+                source_id: SOURCE_ID.into(),
+                source_name: SOURCE_NAME.into(),
+                actor: self.reader.clone(),
+                repo: self.repo.clone(),
+                pr: self.pr,
+                query: common::truncate_str(u, 400).to_string(),
+                outcome,
+                detail: common::truncate_str(detail, 300).to_string(),
+                ms,
+            },
+            &self.run,
+        )
+        .await;
+        if let Err(e) = logged {
+            warn!(error = %e, "Could not record a page check; withholding its result");
+            return false;
+        }
+        true
     }
 
     /// Runs the tool. `None` when `name` isn't this tool.
@@ -826,26 +890,7 @@ impl WebCheck {
         let mut out = String::new();
         for u in urls {
             let (outcome, text, detail, ms) = self.one(gate, t, &u, &find).await;
-            let logged = store::log_activity_in(
-                &state.dynamo,
-                &state.config.settings_table_name,
-                &self.team_id,
-                &Activity {
-                    source_id: SOURCE_ID.into(),
-                    source_name: SOURCE_NAME.into(),
-                    actor: self.reader.clone(),
-                    repo: self.repo.clone(),
-                    pr: self.pr,
-                    query: common::truncate_str(&u, 400).to_string(),
-                    outcome,
-                    detail: common::truncate_str(&detail, 300).to_string(),
-                    ms,
-                },
-                &self.run,
-            )
-            .await;
-            if let Err(e) = logged {
-                warn!(error = %e, "Could not record a page check; withholding its result");
+            if !self.log(state, &u, outcome, &detail, ms).await {
                 out.push_str(&format!(
                     "{u}\n  The check could not be recorded, so its result is withheld.\n"
                 ));
@@ -864,21 +909,7 @@ impl WebCheck {
         u: &str,
         find: &[String],
     ) -> (&'static str, String, String, u128) {
-        let started = Instant::now();
-        if !self.take() {
-            let msg = format!(
-                "All {MAX_CHECKS} page checks for this run are used. Don't call check_url again in this run; say which pages weren't checked."
-            );
-            return ("refused", format!("{u}\n  {msg}\n"), msg, 0);
-        }
-        let res = match tokio::time::timeout(TIMEOUT, check_and_find(u, find, gate, t)).await {
-            Ok(r) => r,
-            Err(_) => Err(CheckError::Failed(format!(
-                "timed out after {}s",
-                TIMEOUT.as_secs()
-            ))),
-        };
-        let ms = started.elapsed().as_millis();
+        let (res, ms) = self.checked(gate, t, u, find).await;
         match res {
             Ok(c) => {
                 let line = format!("{u}: {}", c.line());
@@ -889,12 +920,13 @@ impl WebCheck {
                     Some(s) => format!("{} · {}", s, c.line()),
                     None => c.line(),
                 };
-                let left = MAX_CHECKS.saturating_sub(self.used.load(Ordering::SeqCst));
+                let left = self.limit.saturating_sub(self.used.load(Ordering::SeqCst));
                 (
                     "ok",
                     format!(
-                        "{}  ({left} of {MAX_CHECKS} page checks left in this run)\n",
-                        c.render(u).trim_end()
+                        "{}  ({left} of {} page checks left in this run)\n",
+                        c.render(u).trim_end(),
+                        self.limit
                     ),
                     detail,
                     ms,
@@ -908,6 +940,51 @@ impl WebCheck {
                 ("failed", format!("{u}\n  could not check: {m}\n"), m, ms)
             }
         }
+    }
+}
+
+impl WebCheck {
+    /// One URL within the run's budget, timed: the check, or why not.
+    async fn checked(
+        &self,
+        gate: &dyn HostGate,
+        t: &dyn Transport,
+        u: &str,
+        find: &[String],
+    ) -> (Result<Checked, CheckError>, u128) {
+        let started = Instant::now();
+        if !self.take() {
+            return (
+                Err(refused(format!(
+                    "All {} page checks for this run are used. Don't call check_url again in this run; say which pages weren't checked.",
+                    self.limit
+                ))),
+                0,
+            );
+        }
+        let res = match tokio::time::timeout(TIMEOUT, check_and_find(u, find, gate, t)).await {
+            Ok(r) => r,
+            Err(_) => Err(CheckError::Failed(format!(
+                "timed out after {}s",
+                TIMEOUT.as_secs()
+            ))),
+        };
+        (res, started.elapsed().as_millis())
+    }
+}
+
+/// A check's outcome and detail for the activity log.
+fn outcome_of(res: &Result<Checked, CheckError>) -> (&'static str, String) {
+    match res {
+        Ok(c) => (
+            "ok",
+            match c.status() {
+                Some(s) => format!("{} · {}", s, c.line()),
+                None => c.line(),
+            },
+        ),
+        Err(CheckError::Refused(m)) => ("refused", m.clone()),
+        Err(CheckError::Failed(m)) => ("failed", m.clone()),
     }
 }
 
