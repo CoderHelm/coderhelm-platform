@@ -2373,19 +2373,39 @@ async fn run_passes(
     // stops and asks, once.
     let mut open_pr_settled = msg.person_direction.is_some();
     let mut other_open_pr: Option<open_pr_choice::OtherPr> = None;
+    // CoderHelm's own pull request for this ticket that an earlier run
+    // opened and is still open in this repo: the re-run continues on it
+    // (its branch, its PR) instead of opening another one.
+    let own_open = history
+        .own_open_pr(&format!("{}/{}", msg.repo_owner, msg.repo_name))
+        .map(|p| (p.number, p.branch.clone()));
     let branch_name = if can_skip_implement {
         checkpoint.as_ref().unwrap().1.clone()
     } else {
-        let own_branch = resolve_run_branch(
-            &github,
-            &msg.repo_owner,
-            &msg.repo_name,
-            &msg.ticket_id,
-            &conventions,
-            &tokens,
-            "",
-        )
-        .await;
+        let own_branch = match &own_open {
+            Some((number, branch)) => {
+                add_progress_note(
+                    state,
+                    &msg.team_id,
+                    run_id,
+                    &format!("Continuing on my open pull request #{number} for this ticket"),
+                )
+                .await;
+                branch.clone()
+            }
+            None => {
+                resolve_run_branch(
+                    &github,
+                    &msg.repo_owner,
+                    &msg.repo_name,
+                    &msg.ticket_id,
+                    &conventions,
+                    &tokens,
+                    "",
+                )
+                .await
+            }
+        };
         match open_pr_for_ticket(
             &github,
             &msg.repo_owner,
@@ -3585,6 +3605,8 @@ async fn run_passes(
                 pr_count = pr_results.len(),
                 "Multi-repo run set to awaiting_ci"
             );
+            let repos: Vec<String> = run_prs.iter().map(|p| p.repo.clone()).collect();
+            supersede_moved_prs(&github, &history, &repos, &primary.url).await;
 
             // Schedule a safety-net resume
             if !state.config.ci_fix_queue_url.is_empty() {
@@ -4348,6 +4370,15 @@ async fn run_passes(
     )
     .await;
     info!(run_id, pr_url = %pr_result.pr_url, "Draft PR created");
+    // The plan moved the change out of a repo an earlier run of this ticket
+    // opened a PR in: that PR is closed with a note naming this one.
+    supersede_moved_prs(
+        &github,
+        &history,
+        &[format!("{}/{}", msg.repo_owner, msg.repo_name)],
+        &pr_result.pr_url,
+    )
+    .await;
     self::webhooks::emit_pr_opened(
         state,
         msg,
@@ -6443,6 +6474,44 @@ fn own_pr_branch_for_ticket(prs: &serde_json::Value, ticket_id: &str) -> Option<
             && (mentions_ticket(head, ticket_id) || mentions_ticket(title, ticket_id)))
         .then(|| head.to_string())
     })
+}
+
+/// Closes CoderHelm's own open pull requests for this ticket in repositories
+/// the plan no longer changes, each with a note naming where the change is
+/// now. A PR in a repository the run still changes is never closed: the
+/// re-run continues on it.
+async fn supersede_moved_prs(
+    github: &GitHubClient,
+    history: &ticket_history::TicketHistory,
+    repos: &[String],
+    now_at: &str,
+) {
+    for p in history.own_open_prs_elsewhere(repos) {
+        let Some((owner, name)) = p.repo.split_once('/') else {
+            continue;
+        };
+        let note = format!(
+            "Superseded by {now_at}: the plan for this ticket now changes {} instead of `{}`, \
+             so this pull request is closed. Its branch `{}` is kept.",
+            repos
+                .iter()
+                .map(|r| format!("`{r}`"))
+                .collect::<Vec<_>>()
+                .join(", "),
+            p.repo,
+            p.branch
+        );
+        if let Err(e) = github
+            .create_issue_comment(owner, name, p.number, &note)
+            .await
+        {
+            warn!(repo = %p.repo, pr = p.number, error = %e, "Could not note the superseded PR; leaving it open");
+            continue;
+        }
+        if let Err(e) = github.close_pull_request(owner, name, p.number).await {
+            warn!(repo = %p.repo, pr = p.number, error = %e, "Could not close the superseded PR");
+        }
+    }
 }
 
 /// Whether a GitHub login is CoderHelm's app (it opens CoderHelm's PRs).
