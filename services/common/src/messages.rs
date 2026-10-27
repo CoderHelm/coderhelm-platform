@@ -611,6 +611,16 @@ pub struct ReviewMessage {
     /// answer is posted back into that thread instead of the conversation.
     #[serde(default)]
     pub reply_to_comment_id: Option<u64>,
+    /// Set for a reply inside an inline review thread (trigger
+    /// `thread_reply`): the id of the thread's first comment. When CoderHelm
+    /// wrote that comment, the reply is an answer to its finding and is
+    /// handled with or without a mention.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thread_root_id: Option<u64>,
+    /// The reply addressed CoderHelm (`@coderhelm …`). A thread reply that
+    /// doesn't is handled only in CoderHelm's own threads.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub mentioned: bool,
     /// Login of the person whose comment asked for this job (empty for
     /// label, push and sweep triggers). On CoderHelm's own PRs a fix request
     /// goes on to the fix loop, which answers this person on the PR.

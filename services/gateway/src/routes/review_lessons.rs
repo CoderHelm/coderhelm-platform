@@ -58,7 +58,19 @@ pub fn detect(event_type: &str, payload: &Value) -> Option<LessonTrigger> {
         // A reply inside a review thread.
         "pull_request_review_comment" => {
             let c = &payload["comment"];
-            (action == "created"
+            // An edit counts when it changed what the reply says (an answer
+            // added after the first words); one that only adds a mention or
+            // fixes a typo doesn't.
+            let edited_words = action == "edited"
+                && payload["changes"]["body"]["from"]
+                    .as_str()
+                    .is_some_and(|old| {
+                        super::github_webhook::reply_fingerprint(old)
+                            != super::github_webhook::reply_fingerprint(
+                                c["body"].as_str().unwrap_or(""),
+                            )
+                    });
+            ((action == "created" || edited_words)
                 && is_person(&c["user"])
                 && c["in_reply_to_id"].as_u64().is_some()
                 && has_body(&c["body"]))
@@ -159,10 +171,33 @@ pub fn qualifies(verdicts_newest_first: &[String], needs_changes_requested: bool
             .is_some_and(|v| v == "REQUEST_CHANGES")
 }
 
+/// CoderHelm reviewed this PR (it has a review record of it).
+pub async fn reviewed_by_coderhelm(
+    state: &AppState,
+    team_id: &str,
+    owner: &str,
+    name: &str,
+    pr_number: u64,
+) -> bool {
+    !pr_verdicts(state, team_id, owner, name, pr_number)
+        .await
+        .is_empty()
+}
+
+async fn verdicts(state: &AppState, team_id: &str, t: &LessonTrigger) -> Vec<String> {
+    pr_verdicts(state, team_id, &t.owner, &t.name, t.pr_number).await
+}
+
 /// CoderHelm's verdicts on this PR, newest first (empty when it never
 /// reviewed it).
-async fn verdicts(state: &AppState, team_id: &str, t: &LessonTrigger) -> Vec<String> {
-    let prefix = format!("REVIEW#{}/{}#{:06}#", t.owner, t.name, t.pr_number);
+async fn pr_verdicts(
+    state: &AppState,
+    team_id: &str,
+    owner: &str,
+    name: &str,
+    pr_number: u64,
+) -> Vec<String> {
+    let prefix = format!("REVIEW#{owner}/{name}#{pr_number:06}#");
     match state
         .dynamo
         .query()
@@ -210,6 +245,7 @@ pub async fn on_webhook(
     };
     if let Some(author) = pushback_author(event_type, payload) {
         if !super::github_webhook::may_start_work(state, team_id, author, "review pushback").await {
+            info!(owner = %t.owner, name = %t.name, pr = t.pr_number, trigger = t.trigger, reason = "the author has no standing", "Pushback on a review not judged");
             return;
         }
     }
@@ -217,6 +253,7 @@ pub async fn on_webhook(
         &verdicts(state, team_id, &t).await,
         t.needs_changes_requested,
     ) {
+        info!(owner = %t.owner, name = %t.name, pr = t.pr_number, trigger = t.trigger, reason = "CoderHelm hasn't reviewed this PR, or its verdict doesn't request changes", "Pushback on a review not judged");
         return;
     }
     let event_at = match rl::mark_event(
@@ -413,10 +450,20 @@ mod tests {
         p["comment"]["user"] = person("dev-one");
         p["comment"]["in_reply_to_id"] = Value::Null;
         assert_eq!(detect("pull_request_review_comment", &p), None);
-        // An edit is not news.
+        // An edit that changes nothing is not news, nor is one that only
+        // adds a mention.
         p["comment"]["in_reply_to_id"] = json!(10);
         p["action"] = json!("edited");
         assert_eq!(detect("pull_request_review_comment", &p), None);
+        p["changes"] = json!({"body": {"from": "This is intended."}});
+        p["comment"]["body"] = json!("@coderhelm This is intended.");
+        assert_eq!(detect("pull_request_review_comment", &p), None);
+        // An edit that adds the answer is.
+        p["comment"]["body"] = json!("This is intended: the bucket uses our own KMS key.");
+        assert_eq!(
+            detect("pull_request_review_comment", &p).map(|t| t.trigger),
+            Some(rl::TRIGGER_THREAD_REPLY)
+        );
     }
 
     #[test]

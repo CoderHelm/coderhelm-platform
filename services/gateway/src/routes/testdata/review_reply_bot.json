@@ -1,0 +1,19 @@
+{
+  "action": "created",
+  "comment": {
+    "id": 2002,
+    "in_reply_to_id": 1999,
+    "body": "Coverage report: 81% (+0.2%)",
+    "author_association": "NONE",
+    "created_at": "2026-10-27T14:03:00Z",
+    "updated_at": "2026-10-27T14:03:00Z",
+    "user": { "login": "ci-reporter[bot]", "id": 900, "type": "Bot" }
+  },
+  "pull_request": {
+    "number": 42,
+    "user": { "login": "pr-author", "type": "User" }
+  },
+  "repository": { "name": "infra", "owner": { "login": "acme" } },
+  "sender": { "login": "ci-reporter[bot]", "type": "Bot" },
+  "installation": { "id": 7 }
+}

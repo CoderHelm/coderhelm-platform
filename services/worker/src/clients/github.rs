@@ -2463,7 +2463,7 @@ impl GitHubClient {
         let mut cursor: Option<String> = None;
         for _ in 0..10 {
             let query = serde_json::json!({
-                "query": "query($owner:String!,$name:String!,$pr:Int!,$after:String){ repository(owner:$owner,name:$name){ pullRequest(number:$pr){ reviewThreads(first:100, after:$after){ pageInfo{ hasNextPage endCursor } nodes{ id isResolved isOutdated path line originalLine resolvedBy{ login } comments(first:30){ nodes{ author{ login } body } } } } } } }",
+                "query": "query($owner:String!,$name:String!,$pr:Int!,$after:String){ repository(owner:$owner,name:$name){ pullRequest(number:$pr){ reviewThreads(first:100, after:$after){ pageInfo{ hasNextPage endCursor } nodes{ id isResolved isOutdated path line originalLine resolvedBy{ login } comments(first:30){ nodes{ databaseId author{ login } body } } } } } } }",
                 "variables": { "owner": owner, "name": repo, "pr": pr_number, "after": cursor }
             });
             let resp = self.post("https://api.github.com/graphql", &query).await?;
@@ -2487,6 +2487,7 @@ impl GitHubClient {
                 let resolved = t["isResolved"].as_bool().unwrap_or(false);
                 let resolved_by = t["resolvedBy"]["login"].as_str().unwrap_or("");
                 out.push(BotReviewThread {
+                    root_id: first["databaseId"].as_u64().unwrap_or(0),
                     replies: comments[1..]
                         .iter()
                         .map(|c| ThreadReply {
@@ -3339,6 +3340,9 @@ pub struct ThreadReply {
 pub struct BotReviewThread {
     /// GraphQL node id (what resolveReviewThread takes).
     pub id: String,
+    /// The REST id of the thread's first comment (what a reply's
+    /// `in_reply_to_id` names); 0 when unknown.
+    pub root_id: u64,
     pub path: String,
     pub line: u64,
     /// GitHub marks a thread outdated when its anchored lines changed.

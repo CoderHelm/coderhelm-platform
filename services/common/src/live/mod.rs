@@ -26,6 +26,7 @@ pub mod airflow;
 pub mod api;
 pub mod aws;
 pub mod aws_account;
+pub mod aws_settings;
 pub mod catalog;
 pub mod confluence;
 pub mod connectors;

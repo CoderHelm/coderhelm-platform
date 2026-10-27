@@ -31,7 +31,7 @@ use common::live::newrelic::NewRelic;
 use common::live::opensearch::OpenSearch;
 use common::live::rest::Rest;
 use common::live::store::{self, Activity, RunRef};
-use common::live::{airflow, identity, metrics, secret, StepError};
+use common::live::{airflow, aws_settings, identity, metrics, secret, StepError};
 use serde_json::{json, Value};
 use tracing::{info, warn};
 
@@ -205,6 +205,48 @@ impl AwsAbilities {
         }
     }
 
+    /// The account to read bucket or key settings in: the one asked for,
+    /// the one a key's ARN names, or the only one.
+    pub fn settings_account(
+        &self,
+        asked: Option<&str>,
+        named: Option<&str>,
+    ) -> Result<&AwsAccount, StepError> {
+        let list = || {
+            self.accounts
+                .iter()
+                .map(|a| a.account.clone())
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        let want = asked
+            .map(str::trim)
+            .filter(|a| !a.is_empty())
+            .or(named.filter(|a| !a.is_empty()));
+        match want {
+            Some(a) => self.accounts.iter().find(|x| x.account == a).ok_or_else(|| {
+                StepError::new(
+                    "read_only",
+                    format!("Account {a} isn't connected to CoderHelm, so its settings can't be read."),
+                    format!("Connected accounts: {}.", list()),
+                )
+            }),
+            None => match self.accounts.as_slice() {
+                [one] => Ok(one),
+                [] => Err(StepError::new(
+                    "read_only",
+                    "No AWS account is connected.",
+                    "An admin connects one in Settings, Integrations, AWS.",
+                )),
+                _ => Err(StepError::new(
+                    "read_only",
+                    "Say which AWS account the bucket or key is in.",
+                    format!("Accounts: {}.", list()),
+                )),
+            },
+        }
+    }
+
     fn metric_accounts(&self) -> Vec<String> {
         self.metrics
             .iter()
@@ -230,6 +272,21 @@ pub struct OpsTools {
     evidence: std::sync::Mutex<Vec<Lookup>>,
     /// The repository's test reports, when the team said where they are.
     reports: Option<super::test_fix::ReportTools>,
+}
+
+/// The bucket and key settings tools' names.
+fn is_settings_tool(name: &str) -> bool {
+    matches!(name, "aws_bucket_settings" | "aws_kms_key")
+}
+
+/// What the last permission check of `account` found about `action`:
+/// `Some(false)` the role lacks it, `Some(true)` it has it, `None` unknown
+/// (never checked, the check couldn't run, or it was for another release's
+/// permissions).
+pub fn role_has(account: &AwsAccount, action: &str) -> Option<bool> {
+    let c = account.permissions.as_ref()?;
+    (c.works && c.permissions_id == common::log_reader::permissions_id())
+        .then(|| !c.missing.iter().any(|m| m == action))
 }
 
 /// The test report tools' names.
@@ -557,6 +614,31 @@ impl OpsTools {
                 json!({ "type": "object", "properties": {} }),
             ));
         }
+        if !self.aws.accounts.is_empty() {
+            let mut bucket_props = json!({ "bucket": { "type": "string", "description": "bucket name, s3://bucket or its ARN" } });
+            let mut key_props = json!({ "key": { "type": "string", "description": "KMS key id, alias (alias/name) or ARN" } });
+            if self.aws.accounts.len() > 1 {
+                let accounts: Vec<String> = self
+                    .aws
+                    .accounts
+                    .iter()
+                    .map(|a| a.account.clone())
+                    .collect();
+                let account = json!({ "type": "string", "description": format!("AWS account: {}", accounts.join(", ")) });
+                bucket_props["account"] = account.clone();
+                key_props["account"] = account;
+            }
+            out.push(tool(
+                "aws_bucket_settings",
+                "Read an S3 bucket's settings in the team's AWS account: its default encryption (SSE-S3, SSE-KMS and which key), its bucket policy, and whether that policy makes it public. Settings only, never objects. When access is denied the result names the missing permission.",
+                json!({ "type": "object", "properties": bucket_props, "required": ["bucket"] }),
+            ));
+            out.push(tool(
+                "aws_kms_key",
+                "Read a KMS key's description (customer or AWS managed, state, spec, origin) and its key policy in the team's AWS account. Never encrypts or decrypts. When access is denied the result names the missing permission.",
+                json!({ "type": "object", "properties": key_props, "required": ["key"] }),
+            ));
+        }
         if let Some(l) = self.get(ConnKind::NewRelic) {
             let account = json!({ "type": "string", "description": format!("New Relic account id{}", if l.conn.account_ids.is_empty() { String::new() } else { format!(": {}", l.conn.account_ids.join(", ")) }) });
             out.push(tool(
@@ -681,6 +763,9 @@ impl OpsTools {
         if !self.roles.is_empty() {
             s.push_str("- `aws_identity`: which AWS account, role and region Coderhelm uses, and whether each works.\n");
         }
+        if !self.aws.accounts.is_empty() {
+            s.push_str("- `aws_bucket_settings` and `aws_kms_key`: an S3 bucket's encryption, bucket policy and public status, and a KMS key's manager, state and key policy. When a finding or an answer hinges on such a setting (is the bucket encrypted with a customer-managed key, does the key policy let a role decrypt, is the bucket public), look it up FIRST and state what came back, citing the lookup; never ask a person for something these can read. Ask a person only when the lookup can't be made, and then say exactly why, quoting the missing permission the result names.\n");
+        }
         for l in &self.loaded {
             s.push_str(&format!("- {}\n", describe(&l.conn)));
         }
@@ -703,6 +788,7 @@ impl OpsTools {
     pub async fn handle(&self, state: &WorkerState, name: &str, input: &Value) -> Option<String> {
         let kind = match name {
             "aws_identity" => None,
+            n if is_settings_tool(n) => None,
             n if is_report_tool(n) => None,
             n if n.starts_with("newrelic_") => Some(ConnKind::NewRelic),
             n if n.starts_with("confluence_") => Some(ConnKind::Confluence),
@@ -729,6 +815,9 @@ impl OpsTools {
             Some(k) => (k.activity_id(), k.label().to_string()),
             None if is_report_tool(name) => {
                 ("test-reports".to_string(), "Test reports".to_string())
+            }
+            None if is_settings_tool(name) => {
+                ("connector-aws".to_string(), "AWS settings".to_string())
             }
             None => ("connector-aws".to_string(), "AWS identity".to_string()),
         };
@@ -759,6 +848,8 @@ impl OpsTools {
         }
         let source = if is_report_tool(name) {
             "Test reports".to_string()
+        } else if is_settings_tool(name) {
+            "AWS settings".to_string()
         } else {
             lookup_source(kind, input)
         };
@@ -821,6 +912,43 @@ impl OpsTools {
             out.push(describe_airflow(&self.aws));
         }
         out
+    }
+
+    /// A bucket's or a key's settings. Every read refused: the lookup fails
+    /// with each missing permission named; some refused: the rest is shown
+    /// with those named.
+    async fn read_settings(
+        &self,
+        state: &WorkerState,
+        name: &str,
+        input: &Value,
+        actor: &str,
+    ) -> Result<(String, String, bool), StepError> {
+        if name == "aws_kms_key" {
+            let key = aws_settings::check_key(s_in(input, "key").unwrap_or(""))?;
+            let account = self
+                .aws
+                .settings_account(s_in(input, "account"), key.account.as_deref())?;
+            let session = assume(&state.sts, &account.target(), actor).await?;
+            let read = aws_settings::read_key(&session, &key).await;
+            let has = |a: &str| role_has(account, a);
+            let text = aws_settings::format_key(&read, &has);
+            let denied = aws_settings::key_denied(&read);
+            if denied.len() == 2 {
+                return Err(StepError::new("read", text, ""));
+            }
+            return Ok((text, format!("key {}", key.id), false));
+        }
+        let bucket = aws_settings::check_bucket(s_in(input, "bucket").unwrap_or(""))?;
+        let account = self.aws.settings_account(s_in(input, "account"), None)?;
+        let session = assume(&state.sts, &account.target(), actor).await?;
+        let read = aws_settings::read_bucket(&session, &bucket).await;
+        let has = |a: &str| role_has(account, a);
+        let text = aws_settings::format_bucket(&read, &has);
+        if aws_settings::bucket_denied(&read).len() == 3 {
+            return Err(StepError::new("read", text, ""));
+        }
+        Ok((text, format!("bucket {bucket}"), false))
     }
 
     /// The text that came back and a short note for the activity log.
@@ -901,6 +1029,9 @@ impl OpsTools {
             let session = assume(&state.sts, target, &actor).await?;
             let (text, _hidden) = airflow::read(&airflow::Mwaa { session: &session }, &get).await?;
             return Ok((text, get.describe(), false));
+        }
+        if is_settings_tool(name) {
+            return self.read_settings(state, name, input, &actor).await;
         }
         let Some(kind) = kind else {
             let mut lines = Vec::new();
@@ -1290,6 +1421,54 @@ mod tests {
             .prompt_section()
             .contains("s3://reports/{run_id}/{attempt}/"));
         assert!(is_report_tool("test_report") && !is_report_tool("metrics_query"));
+    }
+
+    #[test]
+    fn settings_are_read_in_the_named_or_only_account() {
+        let one = AwsAbilities::from_parts(vec![checked_account("111122223333", false, &[])], &[]);
+        assert_eq!(
+            one.settings_account(None, None).unwrap().account,
+            "111122223333"
+        );
+        assert!(one.settings_account(Some("999988887777"), None).is_err());
+        let two = AwsAbilities::from_parts(
+            vec![
+                checked_account("111122223333", false, &[]),
+                checked_account("444455556666", false, &[]),
+            ],
+            &[],
+        );
+        let e = two.settings_account(None, None).unwrap_err();
+        assert!(e.fix.contains("111122223333, 444455556666"), "{}", e.fix);
+        // A key's ARN names its account.
+        assert_eq!(
+            two.settings_account(None, Some("444455556666"))
+                .unwrap()
+                .account,
+            "444455556666"
+        );
+        assert!(AwsAbilities::default()
+            .settings_account(None, None)
+            .is_err());
+        assert!(is_settings_tool("aws_kms_key") && is_settings_tool("aws_bucket_settings"));
+        assert!(!is_settings_tool("aws_identity"));
+    }
+
+    #[test]
+    fn the_role_check_says_which_settings_permission_is_missing() {
+        use common::live::permissions::PermissionCheck;
+        let mut a = checked_account("111122223333", false, &[]);
+        assert_eq!(role_has(&a, "kms:GetKeyPolicy"), None);
+        let mut c = PermissionCheck::new(&a.target(), "2026-10-27T00:00:00Z");
+        c.works = true;
+        c.missing = vec!["kms:GetKeyPolicy".into()];
+        a.permissions = Some(c.clone());
+        assert_eq!(role_has(&a, "kms:GetKeyPolicy"), Some(false));
+        assert_eq!(role_has(&a, "s3:GetBucketPolicy"), Some(true));
+        // A check of another release's permissions says nothing.
+        c.permissions_id = "00000000".into();
+        a.permissions = Some(c);
+        assert_eq!(role_has(&a, "kms:GetKeyPolicy"), None);
     }
 
     fn checked_account(id: &str, metrics: bool, envs: &[&str]) -> AwsAccount {

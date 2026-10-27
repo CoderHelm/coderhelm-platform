@@ -77,6 +77,8 @@ pub const BUILTIN: &[(&str, Risk)] = &[
     ("api_get", Risk::Read),
     ("search_read", Risk::Read),
     ("aws_identity", Risk::Read),
+    ("aws_bucket_settings", Risk::Read),
+    ("aws_kms_key", Risk::Read),
     ("newrelic_accounts", Risk::Read),
     ("newrelic_nrql", Risk::Read),
     ("newrelic_entities", Risk::Read),
