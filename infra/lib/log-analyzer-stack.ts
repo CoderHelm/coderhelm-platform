@@ -105,7 +105,7 @@ export class LogAnalyzerStack extends cdk.Stack {
     props.webhookQueue.grantSendMessages(analyzerFunction);
     // Decoupled by name (like the worker) to avoid a cross-stack export.
     dynamodb.TableV2.fromTableName(this, "AnalyticsTableRef", `${prefix}-analytics`)
-      .grantWriteData(analyzerFunction);
+      .grantReadWriteData(analyzerFunction);
 
     // STS AssumeRole — the analyzer needs to assume roles in customer accounts
     analyzerFunction.addToRolePolicy(

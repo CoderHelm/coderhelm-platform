@@ -2,7 +2,6 @@
 //! deployment uses Amazon Bedrock (`common::model_provider`), Bedrock with
 //! the deployment's own AWS role and no key.
 
-use serde::{Deserialize, Serialize};
 use tracing::info;
 
 use crate::models::TokenUsage;
@@ -11,17 +10,16 @@ use super::anthropic::{self, AnthropicClient};
 use super::llm::{ConverseOptions, ToolDefinition, ToolExecutor};
 
 /// Team's Anthropic model provider settings.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
 pub struct ModelProvider {
     pub api_key: String,
     pub primary_model: String,
     pub heavy_model: String,
-    /// Counts this team's model calls (set by `load_for_team`).
-    #[serde(skip)]
-    pub meter: Option<common::usage::UsageMeter>,
+    /// Counts this team's model calls (set by `load_for_team`). Required:
+    /// there is no provider, so no client, whose calls go uncounted.
+    pub meter: common::usage::UsageMeter,
     /// The team, run, repository and person every loop on this provider is
     /// gated for (set by `load_for_team` and [`ModelProvider::for_run`]).
-    #[serde(skip)]
     pub scope: super::policy::PolicyScope,
 }
 
@@ -93,11 +91,7 @@ impl ModelProvider {
             api_key,
             primary_model,
             heavy_model,
-            meter: Some(common::usage::UsageMeter::dynamo(
-                dynamo.clone(),
-                &analytics_table,
-                team_id,
-            )),
+            meter: common::usage::UsageMeter::dynamo(dynamo.clone(), &analytics_table, team_id),
             scope: super::policy::PolicyScope {
                 team: team_id.to_string(),
                 ..Default::default()
@@ -149,10 +143,7 @@ impl ModelProvider {
     /// no team key loaded keeps Bedrock after a switch to Anthropic keys, so
     /// a switch never breaks a run under way.
     pub fn client(&self) -> AnthropicClient {
-        let meter = self.meter.clone().unwrap_or_else(|| {
-            tracing::warn!("Model provider without a usage meter; usage stays uncounted");
-            common::usage::UsageMeter::memory("").0
-        });
+        let meter = self.meter.clone();
         let bedrock = common::model_provider::any_bedrock_client();
         match pick_client(
             common::model_provider::is_bedrock(),

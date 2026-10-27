@@ -502,6 +502,8 @@ where
         if past(d) {
             return Err(deadline_error());
         }
+        // Every attempt is a billed call: each one asks the limit first.
+        meter.admit().await?;
         let sent = tokio::select! {
             r = build().send() => r,
             _ = until(d) => return Err(deadline_error()),
@@ -601,6 +603,229 @@ where
     unreachable!("the last attempt always returns")
 }
 
+// ── Amazon Bedrock, the same way ────────────────────────────────────────────
+
+/// The Anthropic Messages endpoint. The only place its address is written:
+/// every call to it goes through [`send_metered`] or [`open_metered`].
+pub const MESSAGES_URL: &str = "https://api.anthropic.com/v1/messages";
+
+/// A reply's bytes as Anthropic SSE text (Bedrock's events are framed the
+/// same way), for callers that relay a stream as it arrives.
+pub type ReplyBytes =
+    std::pin::Pin<Box<dyn futures::Stream<Item = Result<Vec<u8>, String>> + Send>>;
+
+/// Open an Anthropic Messages stream for the caller to read event by event.
+/// The limit is asked first, the request is retried by status until a stream
+/// starts (a stream already flowing is never resent), and the returned
+/// [`InFlight`] must see every event (`flight.acc.feed`); it is recorded by
+/// `flight.finish().await`, or on drop if the caller stops reading.
+pub async fn open_metered<F>(
+    build: F,
+    schedule: &[u64],
+    label: &str,
+    meter: &UsageMeter,
+    model_id: &str,
+    request_bytes: u64,
+) -> Result<(ReplyBytes, InFlight), ModelCallError>
+where
+    F: Fn() -> reqwest::RequestBuilder,
+{
+    meter.admit().await?;
+    let resp = crate::model_retry::send_streaming(build, schedule, label).await?;
+    let request_id = resp
+        .headers()
+        .get("request-id")
+        .and_then(|v| v.to_str().ok())
+        .map(String::from);
+    let flight = InFlight::new(meter, model_id, request_id, request_bytes);
+    let stream = resp
+        .bytes_stream()
+        .map(|r| r.map(|b| b.to_vec()).map_err(|e| e.to_string()));
+    Ok((Box::pin(stream), flight))
+}
+
+/// One attempt to start a Bedrock stream: the limit asked, the deadline
+/// kept. `body` is already in Bedrock's shape (see
+/// `model_provider::bedrock_body`).
+async fn start_bedrock(
+    client: &aws_sdk_bedrockruntime::Client,
+    bedrock_id: &str,
+    body: &[u8],
+    meter: &UsageMeter,
+    model_id: &str,
+) -> Result<(ReplyBytes, InFlight), ModelCallError> {
+    use aws_sdk_bedrockruntime::operation::RequestId;
+    use aws_sdk_bedrockruntime::types::ResponseStream;
+    let d = deadline();
+    if past(d) {
+        return Err(deadline_error());
+    }
+    meter.admit().await?;
+    let sent = tokio::select! {
+        r = client
+            .invoke_model_with_response_stream()
+            .model_id(bedrock_id)
+            .content_type("application/json")
+            .accept("application/json")
+            .body(aws_smithy_types::Blob::new(body.to_vec()))
+            .send() => r,
+        _ = until(d) => return Err(deadline_error()),
+    };
+    let out = match sent {
+        Ok(out) => out,
+        Err(e) => {
+            let status = e.raw_response().map(|r| r.status().as_u16());
+            let text = aws_sdk_bedrockruntime::error::DisplayErrorContext(&e).to_string();
+            return Err(ModelCallError::new(
+                status.map_or(ModelErrorKind::Network, ModelErrorKind::Status),
+                text,
+            ));
+        }
+    };
+    let request_id = out.request_id().map(String::from);
+    let flight = InFlight::new(meter, model_id, request_id, body.len() as u64);
+    let events = futures::stream::unfold(Some(out.body), |rx| async move {
+        let mut rx = rx?;
+        match rx.recv().await {
+            Ok(Some(ResponseStream::Chunk(part))) => {
+                let raw = part.bytes.map(|b| b.into_inner()).unwrap_or_default();
+                Some((Ok(crate::model_provider::sse_frame(&raw)), Some(rx)))
+            }
+            Ok(Some(_)) => Some((Ok(Vec::new()), Some(rx))),
+            Ok(None) => None,
+            Err(e) => Some((
+                Err(aws_sdk_bedrockruntime::error::DisplayErrorContext(&e).to_string()),
+                None,
+            )),
+        }
+    });
+    Ok((Box::pin(events), flight))
+}
+
+/// [`open_metered`] on Bedrock: retried by status until a stream starts.
+pub async fn open_bedrock_metered(
+    client: &aws_sdk_bedrockruntime::Client,
+    bedrock_id: &str,
+    body: &[u8],
+    schedule: &[u64],
+    meter: &UsageMeter,
+    model_id: &str,
+) -> Result<(ReplyBytes, InFlight), ModelCallError> {
+    let attempts = schedule.len() + 1;
+    for attempt in 0..attempts {
+        match start_bedrock(client, bedrock_id, body, meter, model_id).await {
+            Ok(x) => return Ok(x),
+            Err(e) if attempt + 1 == attempts || !e.is_transient() || past(deadline()) => {
+                return Err(e)
+            }
+            Err(e) => {
+                warn!(model = %bedrock_id, attempt, error = %e, "Bedrock stream failed to start, retrying");
+                tokio::time::sleep(backoff(schedule, attempt, None)).await;
+            }
+        }
+    }
+    unreachable!("the last attempt always returns")
+}
+
+/// [`send_metered`] on Bedrock: one Messages request through Bedrock's
+/// streaming call, read whole, every attempt recorded (a reply that broke off
+/// with its output estimated, a dropped call on drop), retried on transient
+/// failures and broken replies. A non-streaming InvokeModel that died after
+/// Bedrock started work was billed and recorded as nothing; this path can't
+/// lose it.
+pub async fn send_bedrock_metered(
+    client: &aws_sdk_bedrockruntime::Client,
+    bedrock_id: &str,
+    body: &[u8],
+    schedule: &[u64],
+    meter: &UsageMeter,
+    model_id: &str,
+) -> Result<Streamed, ModelCallError> {
+    let attempts = schedule.len() + 1;
+    let mut retried = Vec::new();
+    for attempt in 0..attempts {
+        let last = attempt + 1 == attempts;
+        let (mut stream, mut flight) = match start_bedrock(
+            client, bedrock_id, body, meter, model_id,
+        )
+        .await
+        {
+            Ok(x) => x,
+            Err(e) => {
+                if last || !e.is_transient() || past(deadline()) {
+                    return Err(e);
+                }
+                warn!(model = %bedrock_id, attempt, error = %e, "Bedrock call failed, retrying");
+                tokio::time::sleep(backoff(schedule, attempt, None)).await;
+                continue;
+            }
+        };
+        let (usage, estimated, broke) = read_whole(&mut stream, &mut flight).await;
+        if !estimated && flight.acc.stream_error().is_none() {
+            let acc = std::mem::take(&mut flight.acc);
+            return Ok(Streamed {
+                message: acc.into_message(),
+                request_id: None,
+                usage,
+                retried,
+            });
+        }
+        let err = match (broke, flight.acc.stream_error()) {
+            (_, Some(e)) => stream_error_kind(e),
+            (Some(e), None) => e,
+            (None, None) => ModelCallError::new(
+                ModelErrorKind::Network,
+                "the Bedrock reply ended before its final usage",
+            ),
+        };
+        if last || !err.is_transient() || past(deadline()) {
+            return Err(err);
+        }
+        retried.push(usage);
+        warn!(model = %bedrock_id, error = %err, attempt = attempt + 1, "Bedrock reply broke off, retrying");
+        tokio::time::sleep(backoff(schedule, attempt, None)).await;
+    }
+    unreachable!("the last attempt always returns")
+}
+
+/// Read a reply to its end (or the deadline, or an error), feeding every
+/// event, then record it. Returns its usage, whether that is an estimate,
+/// and the transport error if the stream broke.
+async fn read_whole(
+    stream: &mut ReplyBytes,
+    flight: &mut InFlight,
+) -> (CallUsage, bool, Option<ModelCallError>) {
+    let d = deadline();
+    let mut parser = SseParser::default();
+    let mut broke = None;
+    loop {
+        let next = tokio::select! {
+            n = stream.next() => n,
+            _ = until(d) => {
+                broke = Some(deadline_error());
+                break;
+            }
+        };
+        match next {
+            None => break,
+            Some(Err(e)) => {
+                broke = Some(ModelCallError::new(ModelErrorKind::Network, e));
+                break;
+            }
+            Some(Ok(chunk)) => {
+                for ev in parser.push(&chunk) {
+                    flight.acc.feed(&ev);
+                }
+                if flight.acc.stream_error().is_some() {
+                    break;
+                }
+            }
+        }
+    }
+    let (usage, estimated) = flight.finish().await;
+    (usage, estimated, broke)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -696,6 +921,57 @@ mod tests {
             400,
         )
         .await
+    }
+
+    #[tokio::test]
+    async fn a_team_over_its_limit_sends_nothing_and_each_attempt_asks_again() {
+        use crate::usage::FixedLimit;
+        let body = start(10, 2000, 300) + &text_block("hello") + &end(42);
+        let (url, hits) = server(vec![Reply::Stream(body.clone())]).await;
+        let limit = Arc::new(FixedLimit::default());
+        *limit.reason.lock().unwrap() = Some("Monthly new tokens limit reached".into());
+        let (meter, calls) = UsageMeter::memory("t1");
+        let meter = meter.with_limits(limit.clone());
+        let err = call(&url, &[0, 0], &meter).await.unwrap_err();
+        assert_eq!(err.kind, ModelErrorKind::LimitReached);
+        assert!(!err.is_transient());
+        assert_eq!(hits.load(Ordering::SeqCst), 0, "nothing was sent");
+        assert!(calls.lock().unwrap().is_empty());
+        assert_eq!(limit.asked.load(Ordering::SeqCst), 1, "not retried");
+        // Under the limit: asked before the attempt, then sent.
+        *limit.reason.lock().unwrap() = None;
+        call(&url, &[0, 0], &meter).await.unwrap();
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+        assert_eq!(limit.asked.load(Ordering::SeqCst), 2);
+        // A retried attempt asks again: a broken reply, then the limit.
+        let (url, hits) = server(vec![Reply::Stream(start(10, 0, 0)), Reply::Stream(body)]).await;
+        struct AfterOne(std::sync::atomic::AtomicUsize);
+        #[async_trait::async_trait]
+        impl crate::usage::LimitCheck for AfterOne {
+            async fn reached(&self, _t: &str) -> Option<String> {
+                (self.0.fetch_add(1, Ordering::SeqCst) >= 1).then(|| "limit".to_string())
+            }
+        }
+        let (meter, calls) = UsageMeter::memory("t1");
+        let meter = meter.with_limits(Arc::new(AfterOne(Default::default())));
+        let err = call(&url, &[0, 0], &meter).await.unwrap_err();
+        assert_eq!(err.kind, ModelErrorKind::LimitReached);
+        assert_eq!(hits.load(Ordering::SeqCst), 1, "the retry was not sent");
+        assert_eq!(
+            calls.lock().unwrap().len(),
+            1,
+            "the broken attempt is counted"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_meter_without_a_team_is_never_limited() {
+        use crate::usage::FixedLimit;
+        let limit = Arc::new(FixedLimit::default());
+        *limit.reason.lock().unwrap() = Some("x".into());
+        let (meter, _) = UsageMeter::memory("");
+        assert!(meter.with_limits(limit.clone()).admit().await.is_ok());
+        assert_eq!(limit.asked.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]

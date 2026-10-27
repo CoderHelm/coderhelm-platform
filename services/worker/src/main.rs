@@ -69,6 +69,12 @@ async fn main() -> Result<(), Error> {
         sqs: sqs.clone(),
         queue_url: config.ticket_queue_url.clone(),
     }));
+    // Every model call asks the team's monthly token limits first.
+    common::usage::set_limit_check(Arc::new(common::token_limits::DynamoLimitCheck::new(
+        dynamo.clone(),
+        &config.settings_table_name,
+        &config.analytics_table_name,
+    )));
 
     let state = Arc::new(WorkerState {
         dynamo,

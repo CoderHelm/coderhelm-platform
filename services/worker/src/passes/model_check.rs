@@ -53,6 +53,13 @@ fn answer_of(r: Result<(), Box<dyn std::error::Error + Send + Sync>>) -> Answer 
             Some(m) => match m.kind {
                 ModelErrorKind::Status(code) => Answer::Refused(code, m.message.clone()),
                 ModelErrorKind::Network => Answer::Unreachable(m.message.clone()),
+                // Not sent: the key's team is at its monthly token limit.
+                // The key was accepted when it was saved, and a release
+                // update must not wait on one team's limit.
+                ModelErrorKind::LimitReached => {
+                    tracing::warn!(message = %m.message, "Model check skipped: token limit reached");
+                    Answer::Ok
+                }
                 // It answered (cut at one token, or declined "Reply with OK").
                 _ => Answer::Ok,
             },
@@ -196,6 +203,7 @@ mod tests {
             Answer::Unreachable("m".into())
         );
         assert_eq!(answer_of(e(ModelErrorKind::Truncated)), Answer::Ok);
+        assert_eq!(answer_of(e(ModelErrorKind::LimitReached)), Answer::Ok);
     }
 
     #[test]
