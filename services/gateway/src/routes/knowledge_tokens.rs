@@ -155,15 +155,12 @@ async fn save_confluence(state: Arc<AppState>, claims: Claims, body: TokenBody) 
 
 // ── Sign-in apps (operator view) ────────────────────────────────────────────
 
-/// Where each provider's app comes from in the install's secret.
-fn app_source(state: &AppState, kind: Kind) -> &'static str {
-    let s = &state.secrets;
-    let set = |v: &Option<String>| v.as_deref().is_some_and(|v| !v.trim().is_empty());
-    match kind {
-        Kind::Notion if set(&s.notion_client_id) => "notion_client_id",
-        Kind::Confluence if set(&s.atlassian_client_id) => "atlassian_client_id",
-        Kind::GoogleDrive if set(&s.google_drive_client_id) => "google_drive_client_id",
-        Kind::GoogleDrive if set(&s.google_client_id) => "google_client_id",
+/// Where each provider's app comes from in the install's secret: only ever
+/// its own id key, and only when its app is set (Drive never counts the
+/// Google sign-in client).
+fn app_source(s: &crate::models::Secrets, kind: Kind) -> &'static str {
+    match oauth::provider(kind) {
+        Some(p) if super::knowledge_sources::app_from(s, kind).is_set() => p.id_key,
         _ => "",
     }
 }
@@ -212,7 +209,7 @@ pub async fn sign_in_apps(
             // A hybrid install may sign in through Coderhelm's own app instead.
             let brokered = super::hybrid_install::brokered(k).is_some();
             let source = if app(&state, k).is_set() || !brokered {
-                app_source(&state, k)
+                app_source(&state.secrets, k)
             } else {
                 "Coderhelm's app (hybrid)"
             };
@@ -248,7 +245,7 @@ mod tests {
             .unwrap()
             .iter()
             .any(|s| s == "offline_access"));
-        let g = app_row(Kind::GoogleDrive, true, "google_client_id", "x");
+        let g = app_row(Kind::GoogleDrive, true, "google_drive_client_id", "x");
         assert_eq!(
             g["scopes"][0],
             "https://www.googleapis.com/auth/drive.readonly"
@@ -258,5 +255,47 @@ mod tests {
         assert!(!fields
             .iter()
             .any(|f| f == "client_secret" || f == "client_id"));
+    }
+
+    fn secrets(extra: Value) -> crate::models::Secrets {
+        let mut v = json!({ "jwt_secret": "x" });
+        v.as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        serde_json::from_value(v).unwrap()
+    }
+
+    #[test]
+    fn drive_is_not_set_up_with_only_the_google_sign_in_client() {
+        // The hosted secret as it was: Cognito's Google client, no Drive keys.
+        let s = secrets(json!({
+            "google_client_id": "signin.apps.googleusercontent.com",
+            "google_client_secret": "signin-secret",
+        }));
+        assert!(!super::super::knowledge_sources::app_from(&s, Kind::GoogleDrive).is_set());
+        assert_eq!(app_source(&s, Kind::GoogleDrive), "");
+        let row = app_row(
+            Kind::GoogleDrive,
+            false,
+            app_source(&s, Kind::GoogleDrive),
+            "https://app.coderhelm.com/settings/integrations/mcp-callback/",
+        );
+        assert_eq!(row["configured"], false);
+        assert_eq!(row["id_key"], "google_drive_client_id");
+        assert_eq!(row["secret_key"], "google_drive_client_secret");
+    }
+
+    #[test]
+    fn drive_is_set_up_from_its_own_keys() {
+        let s = secrets(json!({
+            "google_client_id": "signin.apps.googleusercontent.com",
+            "google_client_secret": "signin-secret",
+            "google_drive_client_id": "drive.apps.googleusercontent.com",
+            "google_drive_client_secret": "drive-secret",
+        }));
+        let a = super::super::knowledge_sources::app_from(&s, Kind::GoogleDrive);
+        assert_eq!(a.client_id, "drive.apps.googleusercontent.com");
+        assert_eq!(app_source(&s, Kind::GoogleDrive), "google_drive_client_id");
+        assert_eq!(app_source(&s, Kind::Notion), "");
     }
 }

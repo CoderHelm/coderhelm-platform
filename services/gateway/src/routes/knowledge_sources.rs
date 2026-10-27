@@ -84,30 +84,16 @@ pub(crate) fn sync_store(state: &AppState) -> store::AwsSyncStore {
     }
 }
 
-/// The install's OAuth app for `kind`, from its secrets.
+/// The install's OAuth app for `kind`, from its secrets: the provider's own
+/// two keys only ([`oauth::App::from_keys`]). Google Drive never borrows the
+/// Google sign-in client; without `google_drive_client_id` and
+/// `google_drive_client_secret` it is not set up.
 pub(crate) fn app(state: &AppState, kind: Kind) -> oauth::App {
-    let s = &state.secrets;
-    let pick = |a: &Option<String>, b: &Option<String>| {
-        a.clone()
-            .filter(|v| !v.trim().is_empty())
-            .or_else(|| b.clone())
-            .unwrap_or_default()
-    };
-    match kind {
-        Kind::Notion => oauth::App {
-            client_id: pick(&s.notion_client_id, &None),
-            client_secret: pick(&s.notion_client_secret, &None),
-        },
-        Kind::Confluence => oauth::App {
-            client_id: pick(&s.atlassian_client_id, &None),
-            client_secret: pick(&s.atlassian_client_secret, &None),
-        },
-        Kind::GoogleDrive => oauth::App {
-            client_id: pick(&s.google_drive_client_id, &s.google_client_id),
-            client_secret: pick(&s.google_drive_client_secret, &s.google_client_secret),
-        },
-        _ => oauth::App::default(),
-    }
+    app_from(&state.secrets, kind)
+}
+
+pub(crate) fn app_from(s: &crate::models::Secrets, kind: Kind) -> oauth::App {
+    oauth::App::from_keys(kind, |key| s.oauth_key(key))
 }
 
 async fn github_token(state: &AppState, team: &str) -> Option<String> {
@@ -295,6 +281,14 @@ pub async fn connectors(
     ))
 }
 
+/// What a sign-in that isn't set up says: one sentence, then who can fix it.
+fn not_set_up(kind: Kind) -> String {
+    format!(
+        "{label} sign-in isn't set up on this Coderhelm yet. Ask whoever runs Coderhelm to set up {label} sign-in.",
+        label = kind.label()
+    )
+}
+
 /// POST /api/knowledge/connectors/:kind/connect — start the one-click
 /// sign-in. Returns where to send the browser; the existing sign-in
 /// callback page finishes it.
@@ -305,71 +299,39 @@ pub async fn connect(
 ) -> Reply {
     claims.require_role(3).map_err(forbidden)?;
     let kind = kind_of(&kind)?;
-    let provider = oauth::provider(kind).ok_or_else(|| {
-        fail(
-            StatusCode::BAD_REQUEST,
-            "This kind of source doesn't sign in.",
-        )
-    })?;
     // A hybrid install that chose CoderHelm's app for this provider signs in
     // through CoderHelm's broker (its client id is the install id).
     let brokered = super::hybrid_install::brokered(kind);
-    let a = match &brokered {
-        Some(c) => oauth::App {
-            client_id: c.install_id.clone(),
-            client_secret: c.secret.clone(),
+    let own = app(&state, kind);
+    let hosted = common::hybrid::hosted_url();
+    let via = match &brokered {
+        Some(c) => oauth::Via::Broker {
+            hosted: &hosted,
+            install_id: &c.install_id,
+            secret: &c.secret,
         },
-        None => app(&state, kind),
+        None => oauth::Via::App(&own),
     };
-    if !a.is_set() {
-        return Err(fail(
-            StatusCode::BAD_REQUEST,
-            &format!(
-                "{} sign-in isn't set up on this Coderhelm yet. Ask whoever runs it to add the {} app.",
-                kind.label(),
-                kind.label()
-            ),
-        ));
-    }
     let rt = super::mcp_servers::runtime(&state, &claims.team_id);
-    let id = oauth::connection_id(kind);
-    let sealed = rt
-        .seal_client_secret(&id, a.client_secret.trim())
-        .await
-        .map_err(|e| internal("seal knowledge client", e))?;
-    let mut rec = if brokered.is_some() {
-        oauth::brokered_connection_record(
-            kind,
-            &common::hybrid::hosted_url(),
-            a.client_id.trim(),
-            &sealed,
-        )
-    } else {
-        oauth::connection_record(kind, &provider, a.client_id.trim(), &sealed)
+    let redirect = super::mcp_servers::redirect_uri(&state.config.stage);
+    let added_at = now();
+    let who = oauth::Starter {
+        user_sub: &claims.sub,
+        user_email: &claims.email,
+        added_at: &added_at,
+        redirect_uri: &redirect,
     };
-    rec.added_by = claims.email.clone();
-    rec.added_at = now();
-    if let Ok(Some(old)) = rt.store.get_server(&claims.team_id, &id).await {
-        rec.status = old.status;
-        rec.status_reason = old.status_reason;
-        rec.added_by = old.added_by;
-        rec.added_at = old.added_at;
-    }
-    rt.store
-        .put_server(&claims.team_id, &rec)
+    let url = oauth::start_sign_in(&rt, kind, via, &who)
         .await
-        .map_err(|e| internal("knowledge connection", e))?;
-    let url = rt
-        .start_sign_in(
-            &mut rec,
-            &common::mcp_remote::store::Owner::Team,
-            &claims.sub,
-            &claims.email,
-            &super::mcp_servers::redirect_uri(&state.config.stage),
-            None,
-        )
-        .await
-        .map_err(|e| fail(StatusCode::BAD_REQUEST, &e))?;
+        .map_err(|e| match e {
+            oauth::StartError::NotSetUp => fail(StatusCode::BAD_REQUEST, &not_set_up(kind)),
+            oauth::StartError::NotOAuth => fail(
+                StatusCode::BAD_REQUEST,
+                "This kind of source doesn't sign in.",
+            ),
+            oauth::StartError::Internal(e) => internal("knowledge connection", e),
+            oauth::StartError::Refused(e) => fail(StatusCode::BAD_REQUEST, &e),
+        })?;
     info!(team = %claims.team_id, kind = kind.key(), "Knowledge sign-in started");
     Ok(Json(json!({ "authorize_url": url })))
 }
