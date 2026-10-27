@@ -165,6 +165,12 @@ async fn handle_sqs(state: Arc<WorkerState>, event: LambdaEvent<SqsEvent>) -> Re
         // Parsed once: the installation check, the pause hold and the parse
         // into a message all read the same value.
         let raw: serde_json::Value = serde_json::from_str(&body)?;
+        // A bounce or complaint for CoderHelm's mail relay (hosted side),
+        // delivered raw by the relay's SNS topic.
+        if common::mail::relay::is_ses_event(&raw) {
+            passes::email_events::handle(&state, &raw).await;
+            continue;
+        }
         if !installation_is_teams_own(&state, &raw).await? {
             continue;
         }

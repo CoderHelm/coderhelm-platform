@@ -24,7 +24,7 @@ Metadata:
       - Label: { default: "Who may join (this install is for one organization; change these later in Settings, Sign-in)" }
         Parameters: [SignupDomain, RequireTwoFactor]
       - Label: { default: "Optional" }
-        Parameters: [EmailFrom, BedrockInferencePrefix, Telemetry]
+        Parameters: [EmailTransport, EmailFrom, BedrockInferencePrefix, Telemetry]
       - Label: { default: "Optional: updates (you can change these later in Settings, System)" }
         Parameters: [AutoUpdate, UpdateWindow, UpdateTimezone]
       - Label: { default: "Filled in by the install guide (leave as they are)" }
@@ -36,6 +36,7 @@ Metadata:
       Version: { default: "CoderHelm release" }
       Hostname: { default: "Hostname" }
       HostedZone: { default: "Route 53 hosted zone" }
+      EmailTransport: { default: "Send email" }
       EmailFrom: { default: "Send email from" }
       SignupDomain: { default: "Let people from your company join" }
       RequireTwoFactor: { default: "Require two-factor sign-in" }
@@ -84,6 +85,11 @@ Parameters:
     Default: ""
     Description: Leave empty (the zone is found in this account). Only to pick one, e.g. example.com.
     AllowedPattern: "^$|^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\\.)+[a-z]{2,63}$"
+  EmailTransport:
+    Type: String
+    Default: ses
+    AllowedValues: [ses, coderhelm]
+    Description: "ses: through this account's Amazon SES (the default). coderhelm: through CoderHelm's mail service (hybrid; CoderHelm sees each recipient's address and the email's parameters, and keeps only delivery metadata)."
   EmailFrom:
     Type: String
     Default: ""
@@ -210,6 +216,7 @@ Resources:
           - { Name: STAGE, Value: !Ref Stage }
           - { Name: ADMIN_EMAIL, Value: !Ref AdminEmail }
           - { Name: EMAIL_FROM, Value: !Ref EmailFrom }
+          - { Name: EMAIL_TRANSPORT, Value: !Ref EmailTransport }
           - { Name: HOSTNAME_ARG, Value: !Ref Hostname }
           - { Name: HOSTED_ZONE, Value: !Ref HostedZone }
           - { Name: MODEL_PROVIDER, Value: !Ref ModelProvider }

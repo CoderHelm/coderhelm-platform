@@ -237,43 +237,38 @@ async fn tell_admins(state: &WorkerState, team: &str, src: &Source) {
         )
         .await;
     }
-    if state.config.ses_from_address.is_empty() {
-        return;
-    }
     let (subject, body) = alert::signin_email(app, src, e);
+    use common::mail::templates::fit;
     for to in admin_emails(state, team).await {
-        let content = |d: &str| {
-            aws_sdk_sesv2::types::Content::builder()
-                .data(d)
-                .build()
-                .ok()
+        let mail = common::mail::Mail {
+            kind: "knowledge_signin".into(),
+            to: to.clone(),
+            template: "knowledge_signin",
+            params: serde_json::json!({
+                "source": fit(&src.name, 80),
+                "problem": fit(&e.fix, 300),
+                "link": alert::source_link(app, src),
+            })
+            .as_object()
+            .cloned()
+            .unwrap_or_default(),
+            ses: common::mail::SesBody::Simple {
+                subject: subject.clone(),
+                text: body.clone(),
+                html: None,
+                headers: vec![],
+            },
         };
-        let (Some(subj), Some(text)) = (content(&subject), content(&body)) else {
-            return;
-        };
-        let sent = state
-            .ses
-            .send_email()
-            .from_email_address(&state.config.ses_from_address)
-            .destination(
-                aws_sdk_sesv2::types::Destination::builder()
-                    .to_addresses(&to)
-                    .build(),
-            )
-            .content(
-                aws_sdk_sesv2::types::EmailContent::builder()
-                    .simple(
-                        aws_sdk_sesv2::types::Message::builder()
-                            .subject(subj)
-                            .body(aws_sdk_sesv2::types::Body::builder().text(text).build())
-                            .build(),
-                    )
-                    .build(),
-            )
-            .send()
-            .await;
+        let sent = common::mail::send(&crate::clients::email::sender(state), &mail).await;
+        common::deliveries::record(
+            &state.dynamo,
+            &state.config.settings_table_name,
+            team,
+            &common::mail::delivery("knowledge_signin", &to, &sent),
+        )
+        .await;
         if let Err(err) = sent {
-            warn!(team, error = %err, "Knowledge sign-in email not sent");
+            warn!(team, code = %err.code, "Knowledge sign-in email not sent");
         }
     }
 }

@@ -83,6 +83,8 @@ See [Model providers](./model-providers.md).
   Logo in email headers.
 - **`email.privacyUrl`** *string or null, default `null`*\
   A privacy page linked in email footers.
+- **`email.transport`** *`"ses"` or `"coderhelm"`, default `"ses"`*\
+  How email is sent until an admin changes it in Settings, Emails: this install's own Amazon SES, or CoderHelm's mail service (needs the install registered for hybrid).
 
 See [Email](./email.md).
 
@@ -107,8 +109,8 @@ A self-hosted install is one organization: sign-up is closed to everyone else. A
   The CodeBuild sandbox that runs a repo's build and checks during runs.
 - **`integrations.logAnalyzer`** *boolean, default `true`*\
   Scheduled log analysis for AWS accounts teams connect.
-- **`integrations.weeklySummary`** *boolean, default `true`*\
-  The Monday summary email.
+- **`integrations.weeklySummary`** *boolean, default `false`*\
+  The Monday summary email's starting value. An install admin turns it on or off in Settings, Emails; that choice wins.
 - **`integrations.weeklySummaryListedTeamsOnly`** *boolean, default `false`*\
   Only teams with a rollout list get the summary.
 

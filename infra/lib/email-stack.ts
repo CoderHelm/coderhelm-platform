@@ -208,6 +208,7 @@ export class EmailStack extends cdk.Stack {
       value: this.configSet.configurationSetName,
     });
   }
+
 }
 
 // ─── Email templates (Mustache-style {{var}} placeholders for SES) ───

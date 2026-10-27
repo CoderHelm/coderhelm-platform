@@ -21,7 +21,8 @@ import { Construct } from "constructs";
 import { ResolvedConfig } from "./config";
 import { repoPath } from "./paths";
 import { Hybrid } from "./hybrid";
-import { serviceEnvironment, modelPolicyStatements, publicUrlReadStatement, recordNameIn, setupEnvironment, setupStatements, updaterInvokeStatement } from "./service-env";
+import { serviceEnvironment, modelPolicyStatements, publicUrlReadStatement, recordNameIn, setupEnvironment, setupStatements, updaterInvokeStatement, weeklySummaryScheduled } from "./service-env";
+import { MailRelay, relaySendStatement } from "./mail-relay";
 
 interface ApiStackProps extends cdk.StackProps {
   stage: string;
@@ -49,6 +50,7 @@ export class ApiStack extends cdk.Stack {
   public readonly gatewayFunction: lambda.Function;
   public readonly mcpProxyFunction: lambda.Function;
   public readonly ticketQueue: sqs.Queue;
+  /** The mail relay's bounces and complaints (hosted side of hybrid only). */
   public readonly ciFixQueue: sqs.Queue;
   public readonly feedbackQueue: sqs.Queue;
   /** Outbound webhook events and their retries (common::webhooks). */
@@ -281,6 +283,12 @@ export class ApiStack extends cdk.Stack {
       deadLetterQueue: { queue: dlq, maxReceiveCount: 3 },
     });
 
+    // CoderHelm's mail relay (hosted side of hybrid only): its sending
+    // subdomain, DNS, configuration set, and bounces to the worker.
+    if (cfg.mailRelay) {
+      new MailRelay(this, "MailRelay", { cfg, ticketQueue: this.ticketQueue });
+    }
+
     this.ciFixQueue = new sqs.Queue(this, "CiFixQueue", {
       queueName: `${prefix}-ci-fix`,
       visibilityTimeout: cdk.Duration.minutes(16),
@@ -393,7 +401,9 @@ export class ApiStack extends cdk.Stack {
     new events.Rule(this, "WeeklySummarySchedule", {
       ruleName: `${prefix}-weekly-summary`,
       description: "Weekly summary email (Mondays 13:00 UTC)",
-      enabled: cfg.integrations.weeklySummary,
+      // Always there on a self-hosted install: the worker sends nothing
+      // until an install admin turns the summary on (Settings, Emails).
+      enabled: weeklySummaryScheduled(cfg),
       schedule: events.Schedule.cron({ minute: "0", hour: "13", weekDay: "MON" }),
       targets: [
         new targets.SqsQueue(this.ticketQueue, {
@@ -559,7 +569,7 @@ export class ApiStack extends cdk.Stack {
         ...serviceEnvironment(cfg, this.account),
       },
     });
-    for (const st of [...modelPolicyStatements(cfg, this), publicUrlReadStatement(cfg, this), updaterInvokeStatement(cfg, this)]) {
+    for (const st of [...modelPolicyStatements(cfg, this), publicUrlReadStatement(cfg, this), updaterInvokeStatement(cfg, this), relaySendStatement(cfg, this.account)]) {
       if (st) this.gatewayFunction.addToRolePolicy(st);
     }
     // A self-hosted install's GitHub App manifest landing (routes/setup.rs,

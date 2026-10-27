@@ -31,6 +31,7 @@ import * as logs from "aws-cdk-lib/aws-logs";
 import { Construct } from "constructs";
 import { ResolvedConfig } from "./config";
 import { repoPath } from "./paths";
+import { hybridUrlEnvironment } from "./service-env";
 import { releaseStamp, stampEnvironment } from "./release";
 import { CHECK_VERSION, CURL, installCosignCommands, RELEASE_BASE, RELEASE_REPO, VERIFY_SUMS } from "./release-verify";
 
@@ -307,6 +308,14 @@ export class UpdatesStack extends cdk.Stack {
         WORKER_FUNCTION_NAME: `${prefix}-worker`,
         RELEASE_CHECK_PROJECT_NAME: `${prefix}-release-check`,
         CONFIGURED_MODELS: [...new Set([cfg.models.primary, cfg.models.light])].join(","),
+        // How update notices are emailed: Settings, Emails, else this.
+        EMAIL_TRANSPORT_DEFAULT: cfg.email.transport,
+        // The install's hybrid registration, read only to email through
+        // CoderHelm's mail relay when an admin chose it.
+        SECRETS_NAME: cfg.secretName,
+        // Where the hosted side is: "off" when the config turned hybrid
+        // off, a non-default URL, or nothing (the default).
+        ...hybridUrlEnvironment(cfg),
         ...(cfg.updates.webhookUrl ? { UPDATE_WEBHOOK_URL: cfg.updates.webhookUrl } : {}),
         ...stampEnvironment(stamp),
       },
@@ -315,6 +324,11 @@ export class UpdatesStack extends cdk.Stack {
     this.updaterFunction.addToRolePolicy(new iam.PolicyStatement({
       actions: ["codebuild:StartBuild"],
       resources: [this.project.projectArn, this.checkProject.projectArn],
+    }));
+    this.updaterFunction.addToRolePolicy(new iam.PolicyStatement({
+      sid: "ReadHybridRegistrationForMail",
+      actions: ["secretsmanager:GetSecretValue"],
+      resources: [`arn:aws:secretsmanager:${this.region}:${this.account}:secret:${cfg.secretName}-??????`],
     }));
     this.updaterFunction.addToRolePolicy(new iam.PolicyStatement({
       actions: ["ses:SendEmail"],

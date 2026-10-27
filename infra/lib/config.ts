@@ -147,6 +147,13 @@ export interface CoderhelmConfig {
     logoUrl?: string;
     /** Privacy policy link in email footers. Default: none. */
     privacyUrl?: string | null;
+    /**
+     * Self-hosted installs: how email leaves until an admin changes it in
+     * Settings, Emails. `ses` (default): this install's own Amazon SES.
+     * `coderhelm`: CoderHelm's mail service (hybrid; needs the install
+     * registered with CoderHelm).
+     */
+    transport?: "ses" | "coderhelm";
   };
   /** People with admin rights over the whole deployment (the first one is you). */
   admins?: string[];
@@ -172,7 +179,11 @@ export interface CoderhelmConfig {
     sandbox?: boolean;
     /** The scheduled log analyzer for connected AWS accounts. Default true. */
     logAnalyzer?: boolean;
-    /** The Monday summary email. Default true. */
+    /**
+     * The Monday summary email. Hosted deployment: default true. Self-hosted
+     * installs: default false, the starting value until an install admin
+     * turns it on or off in Settings, Emails.
+     */
     weeklySummary?: boolean;
     /** While true, only teams with a rollout list get the Monday summary. Default false. */
     weeklySummaryListedTeamsOnly?: boolean;
@@ -271,7 +282,14 @@ export interface ResolvedConfig {
     cognitoUsesSes: boolean;
     logoUrl: string | null;
     privacyUrl: string | null;
+    transport: "ses" | "coderhelm";
   };
+  /**
+   * The hosted side of CoderHelm's mail relay (only with `hybrid`): its own
+   * sending subdomain, so relayed mail never touches the main domain's
+   * reputation. null everywhere else.
+   */
+  mailRelay: { domain: string; from: string } | null;
   admins: string[];
   signup: { emails: string[]; domains: string[]; requireTwoFactor: boolean };
   integrations: Required<NonNullable<CoderhelmConfig["integrations"]>>;
@@ -484,6 +502,9 @@ export function validateConfig(c: unknown): string[] {
       const v = e[k];
       if (v !== undefined && v !== null && !URL_RE.test(String(v))) p.push(`email.${k}: a URL`);
     }
+    if (e.transport !== undefined && e.transport !== "ses" && e.transport !== "coderhelm") {
+      p.push('email.transport: "ses" or "coderhelm"');
+    }
   }
 
   if (cfg.admins !== undefined) {
@@ -627,7 +648,14 @@ export function resolveConfig(cfg: CoderhelmConfig, opts: { skipValidation?: boo
       cognitoUsesSes: e.cognitoUsesSes ?? false,
       logoUrl: e.logoUrl ?? null,
       privacyUrl: e.privacyUrl ?? null,
+      transport: e.transport ?? "ses",
     },
+    mailRelay: cfg.hybrid
+      ? {
+          domain: `notify.${cfg.hybrid.zone.toLowerCase()}`,
+          from: `notifications@notify.${cfg.hybrid.zone.toLowerCase()}`,
+        }
+      : null,
     admins,
     signup: {
       emails: [...new Set([...admins, ...(cfg.signup?.emails ?? [])].map((x) => x.toLowerCase()))],
@@ -638,7 +666,9 @@ export function resolveConfig(cfg: CoderhelmConfig, opts: { skipValidation?: boo
       googleSignIn: i.googleSignIn ?? false,
       sandbox: i.sandbox ?? true,
       logAnalyzer: i.logAnalyzer ?? true,
-      weeklySummary: i.weeklySummary ?? true,
+      // Optional email is opt-in on a self-hosted install, on as before for
+      // the hosted deployment (split layout).
+      weeklySummary: i.weeklySummary ?? layout === "split",
       weeklySummaryListedTeamsOnly: i.weeklySummaryListedTeamsOnly ?? false,
     },
     dashboardAssetDir: cfg.dashboard?.assetDir ?? null,

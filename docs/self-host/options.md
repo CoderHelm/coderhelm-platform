@@ -35,11 +35,14 @@ One list of everything you can set up, and where. Required items are steps in th
   *Launch Stack:* `Hostname` (`HostedZone` to pick a zone)\
   *Config:* `domain`\
   *Checked by:* `domain`
-- **Send email from**\
-  *Install guide:* More options\
-  *Launch Stack:* `EmailFrom`\
-  *Config:* `email.from`, `email.identity`\
-  *Checked by:* `email`, `email_identity`
+- **Send email: your own Amazon SES or through CoderHelm**\
+  *Install guide:* More options, Send email\
+  *Launch Stack:* `EmailTransport`, `EmailFrom`\
+  *Config:* `email.transport`, `email.from`, `email.identity`\
+  *Checked by:* `email`, `email_identity`, `optional_emails`
+- **Weekly summary email (off; turn on in Settings)**\
+  *Config:* `integrations.weeklySummary`\
+  *Checked by:* `optional_emails`
 - **Let people from your company join** (default: only people you invite)\
   *Install guide:* More options\
   *Launch Stack:* `SignupDomain`\
@@ -85,6 +88,10 @@ One list of everything you can set up, and where. Required items are steps in th
 - **Sign-up and password emails through SES**\
   *Where:* `email.cognitoUsesSes`\
   *Guide:* [Email](./email.md)
+- **Optional emails (weekly summary, welcome) and how email is sent**\
+  *Where:* Settings, Emails\
+  *Checked by:* `optional_emails`\
+  *Guide:* [Email](./email.md)
 - **Sign in with Google**\
   *Where:* Google Cloud, the secret, `integrations.googleSignIn`\
   *Checked by:* `google_sign_in`\
@@ -129,7 +136,7 @@ One list of everything you can set up, and where. Required items are steps in th
 - **Keep data when stacks are deleted**\
   *Where:* `retainData` (on)\
   *Guide:* [Config reference](./config-reference.md)
-- **The build sandbox, log analysis, weekly summary**\
+- **The build sandbox, log analysis**\
   *Where:* `integrations.*`\
   *Guide:* [Integrations](./integrations.md)
 - **Support access for install admins**\

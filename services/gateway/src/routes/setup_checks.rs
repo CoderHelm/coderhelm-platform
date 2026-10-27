@@ -1342,6 +1342,105 @@ pub fn public_domain(f: &DomainFacts) -> PublicCheck {
 // ── Sign-in and updates (optional) ────────────────────────────────────────
 
 /// "Sign in with Google": on in the config, and its keys in the secret.
+/// Settings, Emails: which optional emails are on, and whether CoderHelm's
+/// mail relay answers when the install sends through it. Optional on the
+/// checklist; a relay that doesn't answer fails (nothing falls back to SES).
+pub fn optional_emails(
+    transport: common::mail::Transport,
+    on: &[&str],
+    relay: Option<Result<Value, String>>,
+) -> Check {
+    let label = "Emails";
+    let key = "optional_emails";
+    let which = if on.is_empty() {
+        "Optional emails are off".to_string()
+    } else {
+        format!("On: {}", on.join(", "))
+    };
+    let fix = || Fix::text("Open Settings, Emails.").href("/settings/emails/");
+    match (transport, relay) {
+        (common::mail::Transport::Ses, _) if on.is_empty() => Check::not_ok(
+            Status::Skip,
+            key,
+            X,
+            label,
+            "Optional emails (the weekly summary, the welcome email) are off. Essential emails send through this install's Amazon SES.",
+            "Turn on the ones your team wants; each person can still unsubscribe.",
+            fix(),
+        ),
+        (common::mail::Transport::Ses, _) => Check::pass(
+            key,
+            X,
+            label,
+            format!("{which}. Sent through this install's Amazon SES."),
+        ),
+        (common::mail::Transport::Coderhelm, Some(Ok(v))) if v["paused"].is_object() => Check::not_ok(
+            Status::Fail,
+            key,
+            X,
+            label,
+            "CoderHelm paused email for this install after bounces or complaints.",
+            "No email leaves the install until it resumes or switches to Amazon SES.",
+            fix(),
+        ),
+        (common::mail::Transport::Coderhelm, Some(Ok(_))) => Check::pass(
+            key,
+            X,
+            label,
+            format!("{which}. Email goes through CoderHelm's mail service."),
+        ),
+        (common::mail::Transport::Coderhelm, Some(Err(e))) => Check::not_ok(
+            Status::Fail,
+            key,
+            X,
+            label,
+            format!("Email is set to go through CoderHelm, but its mail service didn't answer: {e}"),
+            "Nothing is sent another way meanwhile; Deliveries lists each email that failed.",
+            fix(),
+        ),
+        (common::mail::Transport::Coderhelm, None) => Check::not_ok(
+            Status::Fail,
+            key,
+            X,
+            label,
+            "Email is set to go through CoderHelm, but this install isn't registered with CoderHelm.",
+            "Nothing is sent another way meanwhile; Deliveries lists each email that failed.",
+            Fix::text("Register the install in Settings, System, Hybrid, or switch Settings, Emails back to Amazon SES.").href("/settings/emails/"),
+        ),
+    }
+}
+
+async fn optional_emails_now(state: &AppState) -> Check {
+    use common::mail;
+    let stored = mail::load(&state.dynamo, &state.config.settings_table_name)
+        .await
+        .ok()
+        .flatten();
+    let defaults = mail::config_defaults();
+    let on: Vec<&str> = mail::OPTIONAL
+        .iter()
+        .filter(|o| {
+            mail::optional_on(
+                mail::Deployment::SelfHosted,
+                stored.as_ref(),
+                &defaults,
+                o.id,
+            )
+        })
+        .map(|o| o.label)
+        .collect();
+    let transport = mail::transport_of(stored.as_ref(), mail::transport_default());
+    let relay = match (transport, common::hybrid::client::credentials()) {
+        (mail::Transport::Coderhelm, Some(c)) => Some(
+            common::hybrid::client::call(&state.http, &c, "GET", mail::relay::PATH_STATUS, None)
+                .await
+                .map_err(|e| e.message),
+        ),
+        _ => None,
+    };
+    optional_emails(transport, &on, relay)
+}
+
 pub fn google_sign_in(enabled: bool, has_keys: bool) -> Check {
     let label = "Sign in with Google";
     match (enabled, has_keys) {
@@ -2105,6 +2204,7 @@ pub async fn run_all(state: &AppState, team_id: &str) -> (Vec<Check>, Option<Val
         google_enabled(),
         google_keys(&state.secrets),
     ));
+    checks.push(optional_emails_now(state).await);
     (checks, updater)
 }
 
@@ -3532,5 +3632,31 @@ mod tests {
         for g in ['\u{2192}', '\u{21D2}', '\u{279C}', '\u{25B6}'] {
             assert!(!text.contains(g));
         }
+    }
+
+    #[test]
+    fn the_emails_check_is_optional_and_a_silent_relay_fails() {
+        use common::mail::Transport;
+        let off = optional_emails(Transport::Ses, &[], None);
+        assert_eq!(off.status, Status::Skip);
+        assert_eq!(
+            optional_emails(Transport::Ses, &["Weekly summary"], None).status,
+            Status::Pass
+        );
+        let ok = optional_emails(Transport::Coderhelm, &[], Some(Ok(json!({"paused": null}))));
+        assert_eq!(ok.status, Status::Pass);
+        let paused = optional_emails(
+            Transport::Coderhelm,
+            &[],
+            Some(Ok(json!({"paused": {"reason": "bounces"}}))),
+        );
+        assert_eq!(paused.status, Status::Fail);
+        let down = optional_emails(Transport::Coderhelm, &[], Some(Err("timed out".into())));
+        assert_eq!(down.status, Status::Fail);
+        assert!(down.detail.contains("timed out"));
+        assert_eq!(
+            optional_emails(Transport::Coderhelm, &[], None).status,
+            Status::Fail
+        );
     }
 }

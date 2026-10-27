@@ -41,6 +41,13 @@ test("config: a domain in a hosted zone gets a domain identity", () => {
   assert.equal(configFromEnv({ ...ENV, REQUIRE_TWO_FACTOR: "off" }, { account: "123456789012" }).signup, undefined);
 });
 
+test("config: email through CoderHelm only when chosen, with no SES identity to verify", () => {
+  assert.equal(configFromEnv(ENV, { account: "123456789012" }).email.transport, undefined);
+  const cfg = configFromEnv({ ...ENV, EMAIL_TRANSPORT: "coderhelm" }, { account: "123456789012" });
+  assert.deepEqual(cfg.email, { from: "ada@example.com", identity: null, transport: "coderhelm" });
+  assert.equal(configFromEnv({ ...ENV, EMAIL_TRANSPORT: "smtp" }, { account: "123456789012" }).email.transport, undefined);
+});
+
 test("config: anthropic has no Bedrock prefix; explicit prefixes are kept", () => {
   assert.deepEqual(configFromEnv({ ...ENV, MODEL_PROVIDER: "anthropic" }, { account: "123456789012" }).models, { provider: "anthropic" });
   assert.equal(configFromEnv({ ...ENV, BEDROCK_PREFIX: "" }, { account: "123456789012" }).models.bedrockInferencePrefix, "");

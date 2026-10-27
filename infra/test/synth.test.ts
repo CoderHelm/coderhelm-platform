@@ -12,7 +12,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import * as cdk from "aws-cdk-lib";
-import { Template } from "aws-cdk-lib/assertions";
+import { Match, Template } from "aws-cdk-lib/assertions";
 import { buildApp } from "../lib/app";
 import { CoderhelmConfig, loadConfigFile, resolveConfig, ResolvedConfig } from "../lib/config";
 import { API_PATHS, STREAM_PATH, runtimeConfigScript } from "../lib/web-stack";
@@ -199,8 +199,11 @@ test("optional parts can be turned off", () => {
   assert.equal(t["coderhelm-prod-log-analyzer"], undefined);
   const env = envOf(t["coderhelm-prod-worker"], "coderhelm-prod-worker");
   assert.equal(env.SANDBOX_PROJECT_NAME, undefined);
-  assert.equal(env.WEEKLY_SUMMARY_ENABLED, "false");
-  t["coderhelm-prod-api"].hasResourceProperties("AWS::Events::Rule", { Name: "coderhelm-prod-weekly-summary", State: "DISABLED" });
+  // The weekly summary is the install admin's choice at runtime (Settings,
+  // Emails): the schedule stays, and the config starts it off.
+  assert.equal(env.WEEKLY_SUMMARY_ENABLED, "true");
+  assert.equal(env.OPTIONAL_EMAIL_DEFAULTS, "");
+  t["coderhelm-prod-api"].hasResourceProperties("AWS::Events::Rule", { Name: "coderhelm-prod-weekly-summary", State: "ENABLED" });
 });
 
 test("the sandbox build role has no S3 access: builds use the URLs the worker signs", () => {
@@ -750,4 +753,86 @@ test("the update build may run the installer's model check: ask the worker, read
   const read = statements.find((s: any) => s.Sid === "ModelCheckSetting");
   assert.deepEqual(read.Action, "dynamodb:GetItem");
   assert.deepEqual(read.Condition, { "ForAllValues:StringEquals": { "dynamodb:LeadingKeys": ["SYSTEM"] } });
+});
+
+// ── Optional email and CoderHelm's mail relay ──────────────────────────────
+
+test("self-host: optional email starts off, own SES, and nothing that mails CoderHelm", () => {
+  const cfg = loadConfigFile(path.join(INFRA, "config", "selfhost.example.json"), {});
+  assert.equal(cfg.integrations.weeklySummary, false, "the example config starts it off");
+  assert.equal(selfHost().integrations.weeklySummary, false, "and so does a config that says nothing");
+  assert.equal(cfg.email.transport, "ses");
+  assert.equal(cfg.mailRelay, null);
+  const t = synth(cfg);
+  for (const fn of ["coderhelm-prod-worker", "coderhelm-prod-gateway"]) {
+    const stack = fn.endsWith("worker") ? "coderhelm-prod-worker" : "coderhelm-prod-api";
+    const env = envOf(t[stack], fn);
+    assert.equal(env.DEPLOYMENT_KIND, "self-hosted", fn);
+    assert.equal(env.OPTIONAL_EMAIL_DEFAULTS, "", fn);
+    assert.equal(env.EMAIL_TRANSPORT_DEFAULT, "ses", fn);
+    assert.equal(env.HYBRID_EMAIL_FROM, undefined, fn);
+    // No CoderHelm address anywhere a service could send to.
+    for (const [k, v] of Object.entries(env)) {
+      assert.ok(!/@(?:[a-z0-9-]+\.)*coderhelm\.com/i.test(String(v)), `${fn} ${k}=${v} names a CoderHelm address`);
+    }
+  }
+  // The email templates and every stack: no CoderHelm mailbox in a self-hosted install.
+  for (const [name, tpl] of Object.entries(t)) {
+    assert.ok(!/@(?:[a-z0-9-]+\.)*coderhelm\.com/i.test(json(tpl)), `${name} names a CoderHelm address`);
+    assert.equal(Object.keys(tpl.findResources("AWS::SNS::Topic")).filter((k) => k.includes("MailRelay")).length, 0, name);
+  }
+  t["coderhelm-prod-api"].hasResourceProperties("AWS::Events::Rule", { Name: "coderhelm-prod-weekly-summary", State: "ENABLED" });
+});
+
+test("self-host: a config that turns the weekly summary on, or chooses CoderHelm's mail, starts the install that way", () => {
+  const t = synth(selfHost({ integrations: { weeklySummary: true }, email: { from: "coderhelm@example.org", transport: "coderhelm" } }));
+  const env = envOf(t["coderhelm-prod-worker"], "coderhelm-prod-worker");
+  assert.equal(env.OPTIONAL_EMAIL_DEFAULTS, "weekly_summary");
+  assert.equal(env.EMAIL_TRANSPORT_DEFAULT, "coderhelm");
+  assert.throws(() => selfHost({ email: { from: "a@example.org", transport: "smtp" as never } }), /email.transport/);
+});
+
+test("hosted: the weekly summary stays on for everyone, and the mail relay sends only as notify.coderhelm.com", () => {
+  const cfg = loadConfigFile(path.join(INFRA, "config", "hosted.prod.json"), { CDK_DEFAULT_ACCOUNT: "654654210434" });
+  assert.equal(cfg.integrations.weeklySummary, true);
+  assert.deepEqual(cfg.mailRelay, { domain: "notify.coderhelm.com", from: "notifications@notify.coderhelm.com" });
+  const t = synth(cfg, zoneContext("654654210434", "us-east-1", "coderhelm.com"));
+  const api = t["coderhelm-prod-api"];
+  const worker = envOf(t["coderhelm-prod-worker"], "coderhelm-prod-worker");
+  assert.equal(worker.DEPLOYMENT_KIND, "hosted");
+  assert.equal(worker.WEEKLY_SUMMARY_ENABLED, "true");
+  assert.equal(worker.OPTIONAL_EMAIL_DEFAULTS, undefined);
+  api.hasResourceProperties("AWS::Events::Rule", { Name: "coderhelm-prod-weekly-summary", State: "ENABLED" });
+  const gw = envOf(api, "coderhelm-prod-gateway");
+  assert.equal(gw.HYBRID_EMAIL_FROM, "notifications@notify.coderhelm.com");
+  assert.equal(gw.HYBRID_EMAIL_CONFIG_SET, "coderhelm-prod-relay");
+  // Its own identity with Easy DKIM and a custom MAIL FROM.
+  api.hasResourceProperties("AWS::SES::EmailIdentity", {
+    EmailIdentity: "notify.coderhelm.com",
+    DkimSigningAttributes: Match.absent(),
+    MailFromAttributes: { MailFromDomain: "bounce.notify.coderhelm.com", BehaviorOnMxFailure: "REJECT_MESSAGE" },
+  });
+  // SPF, DMARC reject, MAIL FROM MX, three DKIM CNAMEs.
+  const recs = Object.values(api.findResources("AWS::Route53::RecordSet")).map((r: any) => r.Properties);
+  const txt = (name: string) => recs.filter((p) => p.Type === "TXT" && p.Name === name).flatMap((p) => p.ResourceRecords);
+  assert.ok(txt("_dmarc.notify.coderhelm.com.").some((v: string) => v.includes("p=reject")), "DMARC rejects");
+  assert.ok(txt("notify.coderhelm.com.").some((v: string) => v.includes("include:amazonses.com -all")), "SPF");
+  assert.ok(txt("bounce.notify.coderhelm.com.").some((v: string) => v.includes("include:amazonses.com -all")), "MAIL FROM SPF");
+  assert.ok(recs.some((p) => p.Type === "MX" && p.Name === "bounce.notify.coderhelm.com."), "MAIL FROM MX");
+  assert.equal(recs.filter((p) => p.Type === "CNAME" && JSON.stringify(p.Name).includes("DkimDNSTokenName")).length, 3, "Easy DKIM");
+  // Bounces and complaints reach the worker through SNS, raw.
+  api.hasResourceProperties("AWS::SES::ConfigurationSetEventDestination", {
+    ConfigurationSetName: Match.anyValue(),
+    EventDestination: Match.objectLike({ MatchingEventTypes: Match.arrayWith(["bounce", "complaint"]) }),
+  });
+  api.hasResourceProperties("AWS::SNS::Subscription", { Protocol: "sqs", RawMessageDelivery: true });
+  // Sending as the relay: only its identity and configuration set, only from its address.
+  for (const [stack, role] of [["coderhelm-prod-api", api], ["coderhelm-prod-worker", t["coderhelm-prod-worker"]]] as const) {
+    const sts = Object.values(role.findResources("AWS::IAM::Policy")).flatMap((p: any) => p.Properties.PolicyDocument.Statement);
+    const relay = sts.filter((st: any) => st.Sid === "MailRelaySendsOnlyAsTheRelay");
+    assert.equal(relay.length, 1, stack);
+    assert.deepEqual(relay[0].Condition, { StringEquals: { "ses:FromAddress": "notifications@notify.coderhelm.com" } });
+    assert.ok(JSON.stringify(relay[0].Resource).includes("identity/notify.coderhelm.com"), stack);
+    assert.ok(!JSON.stringify(relay[0].Resource).includes("identity/coderhelm.com"), stack);
+  }
 });

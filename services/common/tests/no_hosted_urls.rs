@@ -23,6 +23,7 @@ const ALLOWED: &[(&str, &str)] = &[
     ("infra/lib/config.ts", "hybrid: the hosted API's default URL"),
     ("infra/lib/service-env.ts", "hybrid: the hosted API's default URL"),
     ("installer/lib/hybrid.mjs", "hybrid: the hosted API's default URL"),
+    ("lambda/updater/handler.py", "hybrid: the hosted API's default URL, used for update notices only when an admin chose email through CoderHelm"),
     ("installer/lib/util.mjs", "telemetry endpoint, off unless the admin turns it on"),
 ];
 

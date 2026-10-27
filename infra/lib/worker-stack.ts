@@ -15,7 +15,8 @@ import { Construct } from "constructs";
 import { ResolvedConfig } from "./config";
 import { repoPath } from "./paths";
 import * as path from "path";
-import { serviceEnvironment, modelPolicyStatements, publicUrlReadStatement } from "./service-env";
+import { relaySendStatement } from "./mail-relay";
+import { serviceEnvironment, modelPolicyStatements, publicUrlReadStatement, weeklySummaryScheduled } from "./service-env";
 
 interface WorkerStackProps extends cdk.StackProps {
   stage: string;
@@ -118,7 +119,9 @@ export class WorkerStack extends cdk.Stack {
         SES_FROM_ADDRESS: cfg.email.from,
         SES_TEMPLATE_PREFIX: `${props.cfg.prefix}`,
         // The Monday weekly summary sends nothing unless this is "true".
-        WEEKLY_SUMMARY_ENABLED: cfg.integrations.weeklySummary ? "true" : "false",
+        // On a self-hosted install the install's own setting decides
+        // (Settings, Emails; off until an admin turns it on).
+        WEEKLY_SUMMARY_ENABLED: weeklySummaryScheduled(cfg) ? "true" : "false",
         // While "true", only teams with a rollout list get the summary.
         WEEKLY_SUMMARY_LISTED_TEAMS_ONLY: cfg.integrations.weeklySummaryListedTeamsOnly ? "true" : "false",
         CI_FIX_QUEUE_URL: props.ciFixQueue.queueUrl,
@@ -134,7 +137,7 @@ export class WorkerStack extends cdk.Stack {
         ...serviceEnvironment(cfg, this.account),
       },
     });
-    for (const st of [...modelPolicyStatements(cfg, this), publicUrlReadStatement(cfg, this)]) {
+    for (const st of [...modelPolicyStatements(cfg, this), publicUrlReadStatement(cfg, this), relaySendStatement(cfg, this.account)]) {
       if (st) this.workerFunction.addToRolePolicy(st);
     }
 

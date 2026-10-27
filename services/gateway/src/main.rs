@@ -159,6 +159,12 @@ async fn main() -> Result<(), Error> {
             "/system/models/check",
             post(routes::system_models::check_models),
         )
+        // Settings, Emails: optional emails and how the install sends
+        // (install admins on self-hosted installs).
+        .route(
+            "/system/emails",
+            get(routes::email_settings::get).put(routes::email_settings::put),
+        )
         // Your own domain: status and records, set, back to the AWS address.
         .route(
             "/system/domain",
@@ -247,6 +253,17 @@ async fn main() -> Result<(), Error> {
         )
         // Hybrid installs, for CoderHelm's operators (hosted side).
         .route("/admin/hybrid", get(routes::hybrid::admin_list))
+        // Self-hosted installs at a glance: hybrid parts, relay and email
+        // numbers, audit log (platform admins; routes::hybrid_admin).
+        .route("/admin/hybrid/summary", get(routes::hybrid_admin::summary))
+        .route(
+            "/admin/hybrid/:install_id",
+            get(routes::hybrid_admin::detail),
+        )
+        .route(
+            "/admin/hybrid/:install_id/email/pause",
+            post(routes::hybrid_email::admin_pause),
+        )
         .route(
             "/admin/hybrid/:install_id/revoke",
             post(routes::hybrid::admin_revoke),
@@ -1218,6 +1235,11 @@ async fn main() -> Result<(), Error> {
         )
         .route("/installs/verify", post(routes::hybrid::verify))
         .route("/status", get(routes::hybrid::status))
+        // CoderHelm's mail relay: templates only, listed recipients
+        // (routes::hybrid_email).
+        .route("/email", post(routes::hybrid_email::send))
+        .route("/email/recipients", post(routes::hybrid_email::recipients))
+        .route("/email/status", get(routes::hybrid_email::status))
         .route("/settings", put(routes::hybrid::settings))
         .route(
             "/names",

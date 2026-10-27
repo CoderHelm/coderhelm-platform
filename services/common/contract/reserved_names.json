@@ -1,6 +1,6 @@
 {
   "_comment": "Names under the hybrid parent zone (coderhelm.com) that no install may claim. zone_records: every host CoderHelm itself serves there (the CDK stacks' records, plus the dashboard, docs and marketing site deployed elsewhere); infra/test/hybrid.test.ts fails when a hosted stack adds a record that isn't listed. blocklist: names that would mislead or that infrastructure commonly uses.",
-  "zone_records": ["api", "app", "auth", "docs", "stream", "www", "fallback"],
+  "zone_records": ["api", "app", "auth", "docs", "stream", "www", "fallback", "notify"],
   "blocklist": [
     "about", "account", "accounts", "admin", "administrator", "alerts", "apps", "assets", "autodiscover",
     "beta", "billing", "blog", "careers", "cdn", "chat", "coderhelm", "community", "console", "dashboard",

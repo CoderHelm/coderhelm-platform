@@ -1516,43 +1516,30 @@ pub async fn notify_lockout(state: &AppState, who: &str, secs: i64) {
     let body = format!(
         "{detail}\n\nIf they lost their phone, check it's really them, then reset their two-factor sign-in in Settings, Sign-in. If it wasn't them, someone may know their password or have their Google or GitHub account: ask them to change it.\n"
     );
+    // Through common::mail: the install's own SES, or CoderHelm's relay
+    // when an install admin chose it (a fixed template, no names).
+    let link = format!("{}/settings/", common::public_urls::app_url_from_env());
+    let mut params = serde_json::Map::new();
+    params.insert("minutes".into(), serde_json::Value::from(mins));
+    params.insert("link".into(), serde_json::Value::from(link));
     for to in admins {
-        let content = aws_sdk_sesv2::types::EmailContent::builder()
-            .simple(
-                aws_sdk_sesv2::types::Message::builder()
-                    .subject(
-                        aws_sdk_sesv2::types::Content::builder()
-                            .data("Two-factor sign-in paused after wrong codes")
-                            .build()
-                            .expect("subject"),
-                    )
-                    .body(
-                        aws_sdk_sesv2::types::Body::builder()
-                            .text(
-                                aws_sdk_sesv2::types::Content::builder()
-                                    .data(&body)
-                                    .build()
-                                    .expect("body"),
-                            )
-                            .build(),
-                    )
-                    .build(),
-            )
-            .build();
-        if let Err(e) = state
-            .ses
-            .send_email()
-            .from_email_address(&state.config.ses_from_address)
-            .destination(
-                aws_sdk_sesv2::types::Destination::builder()
-                    .to_addresses(&to)
-                    .build(),
-            )
-            .content(content)
-            .send()
-            .await
-        {
-            warn!(error = %e, "Lockout email not sent");
+        let m = common::mail::Mail {
+            kind: "two_factor_lockout".into(),
+            to: to.clone(),
+            template: "two_factor_lockout",
+            params: params.clone(),
+            ses: common::mail::SesBody::Simple {
+                subject: "Two-factor sign-in paused after wrong codes".into(),
+                text: body.clone(),
+                html: None,
+                headers: vec![],
+            },
+        };
+        let result = common::mail::send(&super::email_settings::sender(state), &m).await;
+        super::deliveries::record_mail(state, &org.team_id, "two_factor_lockout", &to, &result)
+            .await;
+        if let Err(e) = result {
+            warn!(code = %e.code, error = %e.message, "Lockout email not sent");
         }
     }
 }

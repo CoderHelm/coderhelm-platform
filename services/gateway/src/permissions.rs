@@ -674,6 +674,26 @@ pub const CAPABILITIES: &[Capability] = &[
         ],
     },
     Capability {
+        key: "emails",
+        label: "Choose which optional emails this install sends and whether it sends through its own Amazon SES or CoderHelm (self-hosted installs; install admins only)",
+        min_role: "admin",
+        // Also checked inside each handler: the person must be an install
+        // admin (PLATFORM_ADMIN_EMAILS).
+        handlers: &["email_settings::get", "email_settings::put"],
+    },
+    Capability {
+        key: "platform_admin",
+        label: "See self-hosted installs that use CoderHelm's hosted parts, and pause their email (CoderHelm's own platform admins only)",
+        min_role: "admin",
+        // Also checked inside each handler: the person must be a platform
+        // admin on the hosted deployment.
+        handlers: &[
+            "hybrid_admin::summary",
+            "hybrid_admin::detail",
+            "hybrid_email::admin_pause",
+        ],
+    },
+    Capability {
         key: "plugins.install",
         label: "Add plugin sources, install, update, pin or roll back plugins, and set their settings, approvers and limits",
         min_role: "admin",
@@ -770,8 +790,15 @@ pub const CUSTOM_PREFIX: &str = "custom:";
 /// Capabilities a custom role can never hold, whatever the table says about
 /// them: managing roles, and support (checked by built-in role inside the
 /// support handlers), stay with built-in admins and owners.
-pub const NEVER_IN_CUSTOM_ROLES: &[&str] =
-    &["roles", "sign_in", "support", "system", "system.models"];
+pub const NEVER_IN_CUSTOM_ROLES: &[&str] = &[
+    "roles",
+    "sign_in",
+    "support",
+    "system",
+    "system.models",
+    "emails",
+    "platform_admin",
+];
 
 /// The id in a `custom:<id>` role, or `None` for a built-in role.
 pub fn custom_role_id(role: &str) -> Option<&str> {

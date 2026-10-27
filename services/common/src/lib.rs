@@ -24,6 +24,9 @@ pub mod dlq;
 /// Hybrid self-hosting: CoderHelm addresses, the event relay, the token
 /// broker and the signatures between an install and the hosted side.
 pub mod hybrid;
+/// Which emails an install sends, and how: its own SES or CoderHelm's mail
+/// relay (templates only, listed recipients, never CoderHelm's addresses).
+pub mod mail;
 /// Outbound webhooks: the event catalog, endpoints, signing and delivery.
 pub mod webhooks;
 

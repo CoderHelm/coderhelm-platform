@@ -370,13 +370,94 @@ def ran_versions(store, state, current):
     return out
 
 
-def notify(subject, text, env=None):
-    """Email every install admin, and post to the updates webhook if set."""
+# Hybrid: the hosted API (services/common/src/hybrid/mod.rs), used only once
+# an admin chose to send email through CoderHelm. HYBRID_URL overrides it,
+# or is "off" when the config turned hybrid off.
+DEFAULT_HOSTED_URL = "https://api.coderhelm.com"
+CODERHELM_ADDRESS = re.compile(r"@(?:[a-z0-9-]+\.)*coderhelm\.com$", re.I)
+UPDATE_WHAT = ("available", "succeeded", "failed", "rolled_back", "blocked", "domain_live", "domain_failed", "domain_removed")
+NOTICE_VERSION_RE = re.compile(r"^[A-Za-z0-9.+-]{1,40}$")
+
+
+def email_transport(env):
+    """How the install sends: Settings, Emails (services/common/src/mail), else
+    the config's starting value, else its own SES. None when unreadable."""
+    try:
+        r = client("dynamodb").get_item(
+            TableName=env["SETTINGS_TABLE_NAME"],
+            Key={"pk": {"S": "SYSTEM"}, "sk": {"S": "SETTINGS#EMAIL_OPTIONAL"}},
+            ConsistentRead=True,
+        )
+        data = (r.get("Item") or {}).get("data", {}).get("S")
+        if data:
+            t = json.loads(data).get("transport")
+            if t in ("ses", "coderhelm"):
+                return t
+    except Exception as e:
+        logger.warning(f"Email settings unreadable: {e}")
+        return None
+    t = (env.get("EMAIL_TRANSPORT_DEFAULT") or "ses").strip()
+    return t if t in ("ses", "coderhelm") else "ses"
+
+
+def sign_request(secret, ts, method, path, body):
+    """The hybrid request signature (services/common/src/hybrid/sign.rs)."""
+    import hashlib
+    import hmac
+    msg = f"{ts}.{method.upper()}.{path}.{hashlib.sha256(body).hexdigest()}"
+    return "v1=" + hmac.new(secret.encode(), msg.encode(), hashlib.sha256).hexdigest()
+
+
+def relay_call(env, creds, path, payload, opener=None):
+    url_base = (env.get("HYBRID_URL") or DEFAULT_HOSTED_URL).strip().rstrip("/")
+    if not url_base.startswith("https://"):
+        raise RuntimeError("no hosted address for CoderHelm's mail service")
+    body = json.dumps(payload).encode()
+    ts = int(time.time())
+    req = urllib.request.Request(
+        url_base + path,
+        data=body,
+        method="POST",
+        headers={
+            "content-type": "application/json",
+            "user-agent": "coderhelm-selfhost",
+            "x-coderhelm-install": creds["id"],
+            "x-coderhelm-timestamp": str(ts),
+            "x-coderhelm-signature": sign_request(creds["secret"], ts, "POST", path, body),
+        },
+    )
+    (opener or urllib.request.urlopen)(req, timeout=10).close()
+
+
+def relay_credentials(env):
+    try:
+        raw = client("secretsmanager").get_secret_value(SecretId=env["SECRETS_NAME"])["SecretString"]
+        s = json.loads(raw)
+        if s.get("hybrid_install_id") and s.get("hybrid_install_secret"):
+            return {"id": s["hybrid_install_id"], "secret": s["hybrid_install_secret"]}
+    except Exception as e:
+        logger.warning(f"Hybrid registration unreadable: {e}")
+    return None
+
+
+def update_params(what, version, env):
+    p = {"what": what if what in UPDATE_WHAT else "available", "link": f"{app_url(env)}/settings/system/"}
+    if version and NOTICE_VERSION_RE.match(str(version)):
+        p["version"] = str(version)
+    return p
+
+
+def notify(subject, text, env=None, what="available", version=None, opener=None):
+    """Email every install admin by the install's route (its own SES, or
+    CoderHelm's mail relay when an admin chose it, never both), and post to
+    the updates webhook if set. A CoderHelm address is never emailed."""
     env = os.environ if env is None else env
     admins = [a.strip() for a in (env.get("ADMIN_EMAILS") or "").split(",") if a.strip()]
+    admins = [a for a in admins if not CODERHELM_ADDRESS.search(a)]
     sender = env.get("SES_FROM_ADDRESS")
     sent = 0
-    if admins and sender:
+    transport = email_transport(env) if admins else None
+    if admins and transport == "ses" and sender:
         try:
             client("sesv2").send_email(
                 FromEmailAddress=sender,
@@ -386,6 +467,29 @@ def notify(subject, text, env=None):
             sent += 1
         except Exception as e:
             logger.warning(f"Update email not sent: {e}")
+    elif admins and transport == "coderhelm":
+        hosted = (env.get("HYBRID_URL") or DEFAULT_HOSTED_URL).strip()
+        creds = relay_credentials(env) if hosted.startswith("https://") else None
+        if not creds:
+            logger.warning("Update email not sent: email goes through CoderHelm but this install isn't registered")
+        else:
+            try:
+                relay_call(env, creds, "/hybrid/email/recipients", {
+                    "request_id": uuid.uuid4().hex,
+                    "by": admins[0],
+                    "add": [{"email": a, "kind": "admin"} for a in admins],
+                }, opener)
+                for a in admins:
+                    relay_call(env, creds, "/hybrid/email", {
+                        "request_id": uuid.uuid4().hex,
+                        "to": a,
+                        "template": "update_notice",
+                        "params": update_params(what, version, env),
+                        "contact": admins[0],
+                    }, opener)
+                sent += 1
+            except Exception as e:
+                logger.warning(f"Update email not sent through CoderHelm: {e}")
     hook = env.get("UPDATE_WEBHOOK_URL")
     if hook and hook.startswith("https://"):
         try:
@@ -673,7 +777,8 @@ def domain_finished(store, env, now, entry, status):
         dom = dict(dom, state="failed", reason=entry.get("reason") or "the build failed: see its log")
         store.put("DOMAIN", dom)
         subject = "CoderHelm could not change its address"
-    notify(subject, f"{entry.get('reason') or 'Done.'}\nActor: {entry.get('actor', 'auto')}\n{app_url(env)}/settings/system/#domain", env)
+    what = "domain_failed" if status != "succeeded" else ("domain_removed" if removing else "domain_live")
+    notify(subject, f"{entry.get('reason') or 'Done.'}\nActor: {entry.get('actor', 'auto')}\n{app_url(env)}/settings/system/#domain", env, what=what)
     return {"status": status, "domain": dom.get("state") or "none"}
 
 
@@ -861,7 +966,7 @@ def blocked_text(record, env):
 def notify_blocked(store, env, record):
     if record.get("notified") or not failures(record, required=True):
         return
-    notify(f"Update to {record['version']} needs your action", blocked_text(record, env), env)
+    notify(f"Update to {record['version']} needs your action", blocked_text(record, env), env, what="blocked", version=record.get("version"))
     record["notified"] = True
     store.put("MODEL_CHECK", record)
 
@@ -1037,6 +1142,8 @@ def handle(event, env, store, now, fetch=fetch_releases, probe=None):
             f"CoderHelm {words} {version}",
             f"{entry.get('reason') or 'Done.'}\nActor: {entry.get('actor', 'auto')}\n{app_url(env)}/settings/system/",
             env,
+            what=status,
+            version=version,
         )
         return {"status": status, "version": version}
 
@@ -1071,6 +1178,8 @@ def handle(event, env, store, now, fetch=fetch_releases, probe=None):
                 f"{'This is a major release. ' if latest.get('breaking') else ''}"
                 f"Release notes and Update now: {app_url(env)}/settings/system/",
                 env,
+                what="available",
+                version=d["version"],
             )
             state = store.get("UPDATE_STATE", {})
             state["notified_version"] = d["version"]

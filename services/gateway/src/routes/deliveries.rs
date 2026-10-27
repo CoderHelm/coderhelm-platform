@@ -50,15 +50,16 @@ pub async fn save(state: &AppState, pk: &str, d: &Delivery) {
     }
 }
 
-/// Records one email send (the recipient's domain only, never the address).
-pub async fn record_email(
+/// Records one send through `common::mail` (SES or CoderHelm's relay), with
+/// its reason code when it failed.
+pub async fn record_mail(
     state: &AppState,
     pk: &str,
     kind: &str,
     to: &str,
-    result: Result<(), String>,
+    result: &Result<common::mail::Route, common::mail::SendError>,
 ) {
-    save(state, pk, &deliveries::email(kind, to, &result)).await;
+    save(state, pk, &common::mail::delivery(kind, to, result)).await;
 }
 
 pub fn alert_to_delivery(

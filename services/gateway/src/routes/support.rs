@@ -36,7 +36,6 @@
 //! subject or message are replaced before anything is stored or emailed.
 
 use aws_sdk_dynamodb::types::{AttributeValue, Put, TransactWriteItem};
-use aws_sdk_sesv2::types::{Body, Content, Destination, EmailContent, Message as SesMessage};
 use axum::{
     extract::{Path, State},
     http::{HeaderMap, StatusCode},
@@ -2019,38 +2018,32 @@ fn inbox() -> String {
     common::public_urls::support_inbox()
 }
 
-/// Send through SES from the same address as the weekly summary. A failed
-/// email is logged, never a failed request: the ticket is already saved.
+/// Send through the install's email route (SES, or CoderHelm's relay on a
+/// self-hosted install that chose it). A failed email is logged, never a
+/// failed request: the ticket is already saved.
 async fn send(state: &AppState, mail: Mail) {
-    let content = |v: &str| Content::builder().data(v).charset("UTF-8").build();
-    let built = (|| -> Result<SesMessage, aws_sdk_sesv2::error::BuildError> {
-        Ok(SesMessage::builder()
-            .subject(content(&mail.subject)?)
-            .body(
-                Body::builder()
-                    .html(content(&mail.html)?)
-                    .text(content(&mail.text)?)
-                    .build(),
-            )
-            .build())
-    })();
-    let message = match built {
-        Ok(m) => m,
-        Err(e) => {
-            error!(error = %e, "support email could not be built");
-            return;
-        }
+    use common::mail::{self as m, templates::fit};
+    let out = m::Mail {
+        kind: "support".into(),
+        to: mail.to.clone(),
+        template: "support_update",
+        params: serde_json::json!({
+            "ticket": fit(&mail.subject, 200),
+            "note": fit(&mail.text, 2000),
+            "link": format!("{}/support/", common::public_urls::app_url_from_env()),
+        })
+        .as_object()
+        .cloned()
+        .unwrap_or_default(),
+        ses: m::SesBody::Simple {
+            subject: mail.subject,
+            text: mail.text,
+            html: Some(mail.html),
+            headers: vec![],
+        },
     };
-    if let Err(e) = state
-        .ses
-        .send_email()
-        .from_email_address(&state.config.ses_from_address)
-        .destination(Destination::builder().to_addresses(&mail.to).build())
-        .content(EmailContent::builder().simple(message).build())
-        .send()
-        .await
-    {
-        warn!(error = %aws_sdk_sesv2::error::DisplayErrorContext(&e), "support email not sent");
+    if let Err(e) = m::send(&super::email_settings::sender(state), &out).await {
+        warn!(code = %e.code, error = %e.message, "support email not sent");
     }
 }
 
