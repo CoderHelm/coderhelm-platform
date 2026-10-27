@@ -1308,6 +1308,7 @@ async fn run_once(
         state,
         &msg.team_id,
         &format!("{}/{}", msg.repo_owner, msg.repo_name),
+        msg.pr_number,
         &reward_paths,
         &format!("{title}\n{}", reward_paths.join("\n")),
     )
