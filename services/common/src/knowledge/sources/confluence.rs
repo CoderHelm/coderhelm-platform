@@ -65,6 +65,42 @@ fn page_of(v: &Value) -> Option<Page> {
     })
 }
 
+/// How many pages sit under each page of one space's listing.
+pub struct Counts<'p> {
+    kids: HashMap<&'p str, Vec<&'p str>>,
+}
+
+impl<'p> Counts<'p> {
+    pub fn new(pages: &'p [Page]) -> Self {
+        let mut kids: HashMap<&str, Vec<&str>> = HashMap::new();
+        for p in pages {
+            if !p.parent.is_empty() {
+                kids.entry(p.parent.as_str())
+                    .or_default()
+                    .push(p.id.as_str());
+            }
+        }
+        Counts { kids }
+    }
+
+    /// Pages directly under it.
+    pub fn children(&self, id: &str) -> u64 {
+        self.kids.get(id).map_or(0, |k| k.len() as u64)
+    }
+
+    /// It and every page under it.
+    pub fn items(&self, id: &str) -> u64 {
+        let mut seen: HashSet<&str> = HashSet::new();
+        let mut stack = vec![id];
+        while let Some(cur) = stack.pop() {
+            if seen.insert(cur) && seen.len() <= 50_000 {
+                stack.extend(self.kids.get(cur).into_iter().flatten().copied());
+            }
+        }
+        seen.len() as u64
+    }
+}
+
 /// `space:<id>` or `page:<id>@<space id>` as (kind, id, space id).
 pub fn split_id(raw: &str) -> Option<(&str, &str, &str)> {
     let (kind, rest) = raw.split_once(':')?;
@@ -150,7 +186,8 @@ impl Confluence<'_> {
 
     async fn spaces(&self, query: &str) -> Result<Vec<Node>, ConnectorError> {
         let mut out = Vec::new();
-        let mut path = Some("/wiki/api/v2/spaces?limit=250&status=current".to_string());
+        let mut path =
+            Some("/wiki/api/v2/spaces?limit=250&status=current&include-icon=true".to_string());
         let mut calls = 0;
         while let Some(p) = path.take() {
             calls += 1;
@@ -174,6 +211,7 @@ impl Confluence<'_> {
                         s["_links"]["webui"].as_str().unwrap_or("")
                     ),
                     detail: format!("Space {}", s["key"].as_str().unwrap_or("")),
+                    icon: self.icon_url(&s["icon"]),
                     ..Default::default()
                 });
             }
@@ -235,7 +273,23 @@ impl Confluence<'_> {
             selectable: true,
             url: self.page_url(&p.webui, &p.id),
             updated_at: p.edited.clone(),
-            detail: String::new(),
+            ..Default::default()
+        }
+    }
+
+    /// A space's icon as an address on the site. Atlassian serves it to a
+    /// browser signed in to the site; elsewhere the picker shows its own.
+    fn icon_url(&self, icon: &Value) -> String {
+        match icon["path"].as_str() {
+            Some(p)
+                if p.starts_with('/')
+                    && !p.starts_with("//")
+                    && self.site.starts_with("https://") =>
+            {
+                let p = p.strip_prefix("/wiki").unwrap_or(p);
+                format!("{}/wiki{p}", self.site)
+            }
+            _ => String::new(),
         }
     }
 
@@ -255,7 +309,7 @@ impl Confluence<'_> {
         let v = send_json(
             self.http,
             self.get(&format!(
-                "/wiki/rest/api/content/search?limit=25&expand=space&cql={}",
+                "/wiki/rest/api/content/search?limit=25&expand=space,ancestors,version&cql={}",
                 enc(&cql)
             )),
             "Confluence",
@@ -276,6 +330,20 @@ impl Confluence<'_> {
                     selectable: true,
                     url: self.page_url(r["_links"]["webui"].as_str().unwrap_or(""), id),
                     detail: r["space"]["name"].as_str().unwrap_or("").to_string(),
+                    updated_at: r["version"]["when"].as_str().unwrap_or("").to_string(),
+                    // The space, then the pages above it, top first.
+                    path: r["space"]["name"]
+                        .as_str()
+                        .into_iter()
+                        .chain(
+                            r["ancestors"]
+                                .as_array()
+                                .into_iter()
+                                .flatten()
+                                .filter_map(|a| a["title"].as_str()),
+                        )
+                        .map(str::to_string)
+                        .collect(),
                     ..Default::default()
                 })
             })
@@ -299,14 +367,25 @@ impl Connector for Confluence<'_> {
                 Ok(out)
             }
             Some(("space", space, _)) => {
-                let (pages, _) = self.space_pages(space).await?;
+                let (pages, complete) = self.space_pages(space).await?;
                 let ids: HashSet<&str> = pages.iter().map(|p| p.id.as_str()).collect();
-                // The space's top pages: those whose parent isn't a page of it.
+                let counts = Counts::new(&pages);
+                // The space's top pages: those whose parent isn't a page of it,
+                // with how much is under each when the whole space was read.
                 let mut out: Vec<Node> = pages
                     .iter()
                     .filter(|p| p.parent.is_empty() || !ids.contains(p.parent.as_str()))
                     .filter(|p| matches(query, &p.title))
-                    .map(|p| self.page_node(p, space))
+                    .map(|p| {
+                        let mut n = self.page_node(p, space);
+                        if complete {
+                            let kids = counts.children(&p.id);
+                            n.child_count = Some(kids);
+                            n.item_count = Some(counts.items(&p.id));
+                            n.has_children = kids > 0;
+                        }
+                        n
+                    })
                     .collect();
                 out.sort_by_key(|n| n.title.to_lowercase());
                 Ok(out)
@@ -510,6 +589,56 @@ mod tests {
         assert_eq!(whole.items.len(), 4);
         let one = c.list(&source(&[("page:2@77", false)])).await.unwrap();
         assert_eq!(one.items.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_space_shows_its_top_pages_with_what_is_under_them() {
+        let http = rig();
+        let c = conn(&http);
+        let top = c.browse(Some("space:77"), "").await.unwrap();
+        assert_eq!(top.len(), 1);
+        assert_eq!(top[0].title, "Home");
+        assert_eq!(top[0].child_count, Some(2), "Runbooks and Archive");
+        assert_eq!(top[0].item_count, Some(4));
+        assert!(top[0].has_children);
+        assert_eq!(top[0].updated_at, "2026-10-01T00:00:00Z");
+    }
+
+    #[tokio::test]
+    async fn spaces_carry_their_icon_and_search_results_their_path() {
+        let http = Fake::default();
+        http.with(|r| {
+            r.url.contains("/wiki/api/v2/spaces?").then(|| {
+                assert!(r.url.contains("include-icon=true"));
+                fjson(200, json!({"results": [
+                    {"id": "77", "key": "ENG", "name": "Engineering", "icon": {"path": "/wiki/download/attachments/1/ENG?version=1"}, "_links": {"webui": "/spaces/ENG"}},
+                    {"id": "78", "key": "OPS", "name": "Ops", "icon": {"path": "https://evil.test/x.png"}, "_links": {}}
+                ], "_links": {}}))
+            })
+        });
+        http.with(|r| {
+            r.url.contains("/content/search").then(|| {
+                assert!(r.url.contains("expand=space,ancestors,version"));
+                fjson(200, json!({"results": [{
+                    "id": "3", "title": "Deploy",
+                    "space": {"id": 77, "name": "Engineering"},
+                    "ancestors": [{"id": "1", "title": "Home"}, {"id": "2", "title": "Runbooks"}],
+                    "version": {"when": "2026-10-02T00:00:00.000Z"},
+                    "_links": {"webui": "/spaces/ENG/pages/3"}
+                }]}))
+            })
+        });
+        let c = conn(&http);
+        let spaces = c.browse(None, "").await.unwrap();
+        assert_eq!(
+            spaces[0].icon,
+            "https://acme.atlassian.net/wiki/download/attachments/1/ENG?version=1"
+        );
+        assert_eq!(spaces[1].icon, "", "only an address on the site");
+        let found = c.browse(None, "dep").await.unwrap();
+        let deploy = found.iter().find(|n| n.title == "Deploy").unwrap();
+        assert_eq!(deploy.path, ["Engineering", "Home", "Runbooks"]);
+        assert_eq!(deploy.updated_at, "2026-10-02T00:00:00.000Z");
     }
 
     #[tokio::test]

@@ -53,6 +53,27 @@ pub struct Node {
     /// A short note under the title ("Database", "12 documents").
     #[serde(default)]
     pub detail: String,
+    /// The provider's own icon: an emoji (a Notion page's), or an `https://`
+    /// image address (a Drive file type, a Notion uploaded icon, a GitHub
+    /// owner's avatar). Empty when the provider gives none.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub icon: String,
+    /// How many entries sit directly under it, when the provider's answer
+    /// says so (unknown is `None`, not 0).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub child_count: Option<u64>,
+    /// How many items picking it (with everything inside) brings in, itself
+    /// included, when known from the same answer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub item_count: Option<u64>,
+    /// Its size in bytes, for a file whose provider reports one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bytes: Option<u64>,
+    /// The titles above it, top first, for a search result that can sit
+    /// anywhere ("Engineering", "Runbooks"). Empty at the top or when the
+    /// provider doesn't say.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub path: Vec<String>,
 }
 
 /// One item a selection covers, without its content.

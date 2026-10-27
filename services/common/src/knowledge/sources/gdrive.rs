@@ -20,7 +20,10 @@ use crate::mcp_remote::http::{Http, HttpRequest, Limit};
 
 pub const API: &str = "https://www.googleapis.com/drive/v3";
 const FOLDER: &str = "application/vnd.google-apps.folder";
-const FIELDS: &str = "nextPageToken,files(id,name,mimeType,modifiedTime,webViewLink,parents,size)";
+/// `iconLink` is Drive's own small file type icon, a public image address
+/// (only the picker uses it).
+const FIELDS: &str =
+    "nextPageToken,files(id,name,mimeType,modifiedTime,webViewLink,parents,size,iconLink)";
 /// Folder listings per sync at most.
 const MAX_FOLDER_CALLS: usize = 300;
 
@@ -72,8 +75,44 @@ fn node(f: &Value) -> Option<Node> {
         selectable: true,
         url: f["webViewLink"].as_str().unwrap_or("").to_string(),
         updated_at: f["modifiedTime"].as_str().unwrap_or("").to_string(),
-        detail: String::new(),
+        detail: type_label(mime, name).into(),
+        icon: f["iconLink"]
+            .as_str()
+            .filter(|u| u.starts_with("https://"))
+            .unwrap_or("")
+            .to_string(),
+        // Drive gives a size (as a string) for uploaded files only, not for
+        // Docs, Sheets or Slides.
+        bytes: f["size"]
+            .as_str()
+            .and_then(|b| b.parse().ok())
+            .or_else(|| f["size"].as_u64()),
+        ..Default::default()
     })
+}
+
+/// A file's type in a word or two, for the line under its name.
+pub fn type_label(mime: &str, name: &str) -> &'static str {
+    match mime {
+        FOLDER => "Folder",
+        "application/vnd.google-apps.document" => "Google Doc",
+        "application/vnd.google-apps.spreadsheet" => "Google Sheet",
+        "application/vnd.google-apps.presentation" => "Google Slides",
+        "application/pdf" => "PDF",
+        _ => match name
+            .rsplit_once('.')
+            .map(|(_, e)| e.to_ascii_lowercase())
+            .as_deref()
+        {
+            Some("docx" | "doc") => "Word document",
+            Some("xlsx" | "xls") => "Excel spreadsheet",
+            Some("md" | "markdown") => "Markdown",
+            Some("csv") => "CSV",
+            Some("html" | "htm") => "Web page",
+            Some("txt" | "text") => "Text",
+            _ => "File",
+        },
+    }
 }
 
 impl Drive<'_> {
@@ -314,6 +353,44 @@ mod tests {
     fn f(id: &str, name: &str, mime: &str) -> Value {
         json!({"id": id, "name": name, "mimeType": mime, "modifiedTime": "2026-10-01T00:00:00Z",
                "webViewLink": format!("https://docs.google.com/d/{id}")})
+    }
+
+    #[tokio::test]
+    async fn the_picker_shows_drive_icons_types_and_sizes() {
+        let http = Fake::default();
+        http.with(|r| {
+            r.url.contains("q=%27top%27").then(|| {
+                fjson(
+                    200,
+                    json!({"files": [
+                        {"id": "d1", "name": "Handbook", "mimeType": "application/vnd.google-apps.document",
+                         "iconLink": "https://drive-thirdparty.googleusercontent.com/16/type/application/vnd.google-apps.document"},
+                        {"id": "p1", "name": "Leave.pdf", "mimeType": "application/pdf", "size": "48213",
+                         "iconLink": "http://insecure.test/i.png"},
+                        {"id": "sub", "name": "Policies", "mimeType": FOLDER}
+                    ]}),
+                )
+            })
+        });
+        let d = Drive {
+            http: &http,
+            auth: "Bearer t".into(),
+        };
+        let kids = d.browse(Some("folder:top"), "").await.unwrap();
+        let titles: Vec<&str> = kids.iter().map(|n| n.title.as_str()).collect();
+        assert_eq!(
+            titles,
+            ["Policies", "Handbook", "Leave.pdf"],
+            "folders first"
+        );
+        assert_eq!(kids[0].detail, "Folder");
+        assert_eq!(kids[1].detail, "Google Doc");
+        assert!(kids[1].icon.starts_with("https://drive-thirdparty"));
+        assert_eq!(kids[1].bytes, None, "a Google Doc has no size");
+        assert_eq!(kids[2].detail, "PDF");
+        assert_eq!(kids[2].bytes, Some(48_213));
+        assert_eq!(kids[2].icon, "", "only https icons");
+        assert!(http.sent()[0].url.contains("iconLink"));
     }
 
     #[tokio::test]

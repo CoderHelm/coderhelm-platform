@@ -179,6 +179,12 @@ impl Connector for GitHub<'_> {
                         selectable: true,
                         url: r["html_url"].as_str().unwrap_or("").to_string(),
                         detail: "Every Markdown file".into(),
+                        updated_at: r["pushed_at"].as_str().unwrap_or("").to_string(),
+                        icon: r["owner"]["avatar_url"]
+                            .as_str()
+                            .filter(|u| u.starts_with("https://"))
+                            .unwrap_or("")
+                            .to_string(),
                         ..Default::default()
                     })
                 })
@@ -215,6 +221,7 @@ impl Connector for GitHub<'_> {
                     has_children: dir,
                     selectable: true,
                     url: e["html_url"].as_str().unwrap_or("").to_string(),
+                    bytes: if dir { None } else { e["size"].as_u64() },
                     ..Default::default()
                 })
             })
@@ -456,6 +463,45 @@ mod tests {
             .unwrap();
         assert_eq!(d.title, "Setup");
         assert!(!d.sections.iter().any(|s| s.text.contains("title: x")));
+    }
+
+    #[tokio::test]
+    async fn the_picker_shows_owner_avatars_and_file_sizes() {
+        let http = Fake::default();
+        http.with(|r| {
+            r.url.contains("/installation/repositories").then(|| {
+                fjson(
+                    200,
+                    json!({"repositories": [{
+                        "full_name": "acme/docs", "html_url": "https://github.com/acme/docs",
+                        "pushed_at": "2026-10-20T10:00:00Z",
+                        "owner": {"avatar_url": "https://avatars.githubusercontent.com/u/1?v=4"}
+                    }]}),
+                )
+            })
+        });
+        http.with(|r| {
+            r.url.ends_with("/repos/acme/docs/contents").then(|| {
+                fjson(200, json!([
+                    {"path": "README.md", "name": "README.md", "type": "file", "size": 2048, "html_url": ""},
+                    {"path": "docs", "name": "docs", "type": "dir", "size": 0, "html_url": ""}
+                ]))
+            })
+        });
+        let g = GitHub {
+            http: &http,
+            auth: "Bearer t".into(),
+        };
+        let repos = g.browse(None, "").await.unwrap();
+        assert_eq!(
+            repos[0].icon,
+            "https://avatars.githubusercontent.com/u/1?v=4"
+        );
+        assert_eq!(repos[0].updated_at, "2026-10-20T10:00:00Z");
+        let kids = g.browse(Some("repo:acme/docs"), "").await.unwrap();
+        assert_eq!(kids[0].title, "docs");
+        assert_eq!(kids[0].bytes, None);
+        assert_eq!(kids[1].bytes, Some(2048));
     }
 
     #[test]
