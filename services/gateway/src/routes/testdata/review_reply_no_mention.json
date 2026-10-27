@@ -1,0 +1,19 @@
+{
+  "action": "created",
+  "comment": {
+    "id": 2001,
+    "in_reply_to_id": 1999,
+    "body": "Yes. The source bucket uses SSE-KMS with our own customer-managed key, and the copy role has kms:Decrypt on it.",
+    "author_association": "MEMBER",
+    "created_at": "2026-10-27T14:02:11Z",
+    "updated_at": "2026-10-27T14:02:11Z",
+    "user": { "login": "pr-author", "id": 501, "type": "User" }
+  },
+  "pull_request": {
+    "number": 42,
+    "user": { "login": "pr-author", "type": "User" }
+  },
+  "repository": { "name": "infra", "owner": { "login": "acme" } },
+  "sender": { "login": "pr-author", "type": "User" },
+  "installation": { "id": 7 }
+}

@@ -1969,6 +1969,9 @@ pub struct ReplyConclusion {
     pub new_nonblocking_items: bool,
     /// The reply without those new items (only meaningful when set).
     pub revised_reply: String,
+    /// The person was answering one of CoderHelm's findings, and the reply
+    /// accepts that the answer settles it (nothing about it is left to do).
+    pub settles_finding: bool,
 }
 
 /// What the reply-conclusion check is told.
@@ -1985,7 +1988,11 @@ pub const REPLY_CONCLUSION_SYSTEM: &str =
      fine or ready to merge, and this reply brings up non-blocking items (description wording or \
      counts, a file the description doesn't mention, style) that no earlier reply mentioned. \
      revised_reply: when new_nonblocking_items is true, the reply with exactly those new items \
-     removed and nothing else changed; otherwise an empty string.";
+     removed and nothing else changed; otherwise an empty string. \
+     settles_finding: true only when what the person wrote answers one of CoderHelm's review \
+     findings (the finding is quoted with it) and the reply accepts that the answer settles that \
+     finding, so nothing about it is left to do; false when the reply says something about it is \
+     still open, and false when the person wasn't answering a finding.";
 
 /// The JSON schema of the reply-conclusion answer.
 pub fn reply_conclusion_schema() -> serde_json::Value {
@@ -1995,9 +2002,10 @@ pub fn reply_conclusion_schema() -> serde_json::Value {
             "verdict_change": {"type": "string", "enum": ["none", "clear", "block"]},
             "reason": {"type": "string"},
             "new_nonblocking_items": {"type": "boolean"},
-            "revised_reply": {"type": "string"}
+            "revised_reply": {"type": "string"},
+            "settles_finding": {"type": "boolean"}
         },
-        "required": ["verdict_change", "reason", "new_nonblocking_items", "revised_reply"],
+        "required": ["verdict_change", "reason", "new_nonblocking_items", "revised_reply", "settles_finding"],
         "additionalProperties": false
     })
 }
@@ -2040,6 +2048,7 @@ pub fn parse_reply_conclusion(v: &serde_json::Value) -> ReplyConclusion {
         new_nonblocking_items: v["new_nonblocking_items"].as_bool().unwrap_or(false)
             && !revised_reply.is_empty(),
         revised_reply,
+        settles_finding: v["settles_finding"].as_bool().unwrap_or(false),
     }
 }
 

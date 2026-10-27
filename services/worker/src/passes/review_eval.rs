@@ -367,6 +367,8 @@ impl Sim {
             trigger: "synchronize".into(),
             dedup_key: dedup_key.into(),
             reply_to_comment_id: None,
+            thread_root_id: None,
+            mentioned: false,
             requested_by: String::new(),
             attempt: 0,
             wait_secs: 0,
@@ -1178,6 +1180,7 @@ fn live_violations(want: &LiveExpect, got: &LiveOutcome) -> Vec<String> {
 /// The earlier-threads section for a re-review after `r`.
 fn prior_section(r: &AfterReply) -> String {
     let thread = crate::clients::github::BotReviewThread {
+        root_id: 0,
         id: "t1".into(),
         path: r.thread.path.clone(),
         line: r.thread.line,

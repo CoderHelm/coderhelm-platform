@@ -765,6 +765,7 @@ mod tests {
     #[test]
     fn only_untouched_threads_count_as_ignored() {
         let t = |resolved, outdated, replies: Vec<ThreadReply>| BotReviewThread {
+            root_id: 0,
             id: "T".into(),
             path: "a".into(),
             line: 1,

@@ -107,6 +107,18 @@ pub const ABILITIES: &[Ability] = &[
             "ecr:ListTagsForResource",
         ],
     },
+    Ability {
+        key: "settings",
+        name: "Bucket and key settings",
+        why: "Reads an S3 bucket's default encryption, its bucket policy and whether that policy makes it public, and a KMS key's description and key policy, so a review can check a fact like \"is this bucket encrypted with our own key\" instead of asking. Settings only: never an object in a bucket, and never encrypts or decrypts anything.",
+        actions: &[
+            "s3:GetEncryptionConfiguration",
+            "s3:GetBucketPolicy",
+            "s3:GetBucketPolicyStatus",
+            "kms:DescribeKey",
+            "kms:GetKeyPolicy",
+        ],
+    },
 ];
 
 /// Every action of [`ABILITIES`], once each, in order.
@@ -391,6 +403,29 @@ mod tests {
             assert_eq!(t.matches("cloudformation:DescribeStacks").count(), 1);
         }
         assert!(update_stack_name().starts_with("CoderHelmLogReaderUpdate-"));
+    }
+
+    /// The reviewer's bucket and key lookups use exactly the settings
+    /// ability's actions, all reads of settings: no object reads, no
+    /// encrypt or decrypt.
+    #[test]
+    fn the_settings_ability_is_what_the_lookups_use() {
+        let a = ability("settings").unwrap();
+        assert_eq!(a.actions, crate::live::aws_settings::ACTIONS);
+        for t in [ROLE_TEMPLATE, UPDATE_TEMPLATE] {
+            let all = template_actions(t);
+            for x in a.actions {
+                assert!(all.iter().any(|y| y == x), "{x}");
+            }
+            for no in [
+                "s3:GetObject",
+                "s3:ListBucket",
+                "kms:Decrypt",
+                "kms:Encrypt",
+            ] {
+                assert!(!all.iter().any(|y| y == no), "{no}");
+            }
+        }
     }
 
     #[test]

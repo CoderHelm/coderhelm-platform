@@ -154,6 +154,24 @@ Resources:
                   - "ecr:BatchGetImage"
                   - "ecr:ListTagsForResource"
                 Resource: "*"
+        - PolicyName: BucketAndKeySettingsReadOnly
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              # Settings only, so a review can check a fact instead of asking:
+              # a bucket's default encryption, its bucket policy and whether
+              # that policy makes it public; a KMS key's description and key
+              # policy. Never an object in a bucket, never an encrypt or
+              # decrypt call.
+              - Sid: ReadBucketAndKeySettings
+                Effect: Allow
+                Action:
+                  - "s3:GetEncryptionConfiguration"
+                  - "s3:GetBucketPolicy"
+                  - "s3:GetBucketPolicyStatus"
+                  - "kms:DescribeKey"
+                  - "kms:GetKeyPolicy"
+                Resource: "*"
 
 Outputs:
   RoleArn:

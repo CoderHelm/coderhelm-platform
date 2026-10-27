@@ -677,115 +677,299 @@ pub(crate) fn ask_added_by_edit(old_body: &str, new_body: &str) -> Option<Review
     parse_reviewer_ask(new_body)
 }
 
-/// A reply inside an inline review thread (`pull_request_review_comment`). Same
-/// asks as a conversation comment — `@coderhelm re-review` / `@coderhelm <question>` —
-/// and the answer goes back into that thread. On CoderHelm's own PRs only a
-/// re-review ask is handled here; other thread replies there are fix requests,
-/// handled by the feedback path (pull_request_review).
+/// A CoderHelm account (the app's bot user), read from GitHub's structured
+/// user type and the app's login. A person whose login happens to contain
+/// "coderhelm" is still a person.
+pub(crate) fn is_coderhelm_user(user: &Value) -> bool {
+    let login = user["login"].as_str().unwrap_or("").to_ascii_lowercase();
+    login.contains("coderhelm")
+        && (user["type"].as_str() == Some("Bot") || login.ends_with("[bot]"))
+}
+
+/// What a reply's words say, for telling two versions of a reply apart:
+/// the text without quoted lines and without any `@coderhelm` address,
+/// lower case, letters and digits only. Adding or removing a mention, a
+/// space or punctuation leaves it unchanged.
+pub(crate) fn reply_fingerprint(body: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let text: String = body
+        .lines()
+        .filter(|l| !l.trim_start().starts_with('>'))
+        .collect::<Vec<_>>()
+        .join("\n")
+        .to_ascii_lowercase()
+        .replace("@coderhelm[bot]", " ")
+        .replace("@coderhelm", " ")
+        .replace("/coderhelm", " ");
+    let key: String = text.chars().filter(|c| c.is_alphanumeric()).collect();
+    hex::encode(&Sha256::digest(key.as_bytes())[..6])
+}
+
+/// What to do with a `pull_request_review_comment` event, decided from the
+/// payload alone. Every way out names its reason, so a reply that isn't
+/// handled is never dropped without a log line.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum ReviewCommentRoute {
+    Ignore(&'static str),
+    /// A reply in a thread (`root` is the thread's first comment). Handled
+    /// in CoderHelm's own threads with or without a mention, and in other
+    /// threads only when it addresses CoderHelm (the worker checks whose
+    /// thread it is).
+    ThreadReply {
+        comment_id: u64,
+        root: u64,
+        ask: Option<ReviewerAsk>,
+        fingerprint: String,
+    },
+    /// A new top-level inline comment that addresses CoderHelm.
+    Ask {
+        comment_id: u64,
+        ask: ReviewerAsk,
+    },
+}
+
+/// The worker's claim key for a thread reply: the comment and the version
+/// of its words. A duplicate delivery, or an edit that only adds a mention,
+/// gives the same key and is handled once.
+pub(crate) fn thread_reply_key(comment_id: u64, fingerprint: &str) -> String {
+    format!("thread#{comment_id}#{fingerprint}")
+}
+
+pub(crate) fn route_review_comment(payload: &Value) -> ReviewCommentRoute {
+    use ReviewCommentRoute::*;
+    let action = payload["action"].as_str().unwrap_or("");
+    if action != "created" && action != "edited" {
+        return Ignore("not a new or edited comment");
+    }
+    let c = &payload["comment"];
+    if is_coderhelm_user(&c["user"]) {
+        return Ignore("CoderHelm's own comment");
+    }
+    if c["user"]["type"].as_str() == Some("Bot") {
+        return Ignore("written by a bot account");
+    }
+    let body = c["body"].as_str().unwrap_or("");
+    if body.trim().is_empty() {
+        return Ignore("empty comment");
+    }
+    let comment_id = c["id"].as_u64().unwrap_or(0);
+    if comment_id == 0 {
+        return Ignore("no comment id");
+    }
+    let ask = parse_reviewer_ask(body);
+    let root = c["in_reply_to_id"].as_u64().filter(|r| *r != 0);
+    let old = payload["changes"]["body"]["from"].as_str();
+    match root {
+        Some(root) => {
+            let fingerprint = reply_fingerprint(body);
+            if action == "edited" {
+                // An edit counts when it changed what the reply says, or
+                // when it added the address (a reply in a person's thread
+                // is handled only once it addresses CoderHelm). Each version
+                // is handled once: the worker's claim is keyed by the
+                // comment and these words, so an edit that only adds a
+                // mention to a reply already answered is not answered again.
+                let Some(old) = old else {
+                    return Ignore("an edit that didn't change the text");
+                };
+                let words_changed = reply_fingerprint(old) != fingerprint;
+                let address_added = ask_added_by_edit(old, body).is_some();
+                if !words_changed && !address_added {
+                    return Ignore("an edit that didn't change what the reply says");
+                }
+            }
+            ThreadReply {
+                comment_id,
+                root,
+                ask,
+                fingerprint,
+            }
+        }
+        None => {
+            let ask = if action == "edited" {
+                ask_added_by_edit(old.unwrap_or(""), body)
+            } else {
+                ask
+            };
+            match ask {
+                Some(ask) => Ask { comment_id, ask },
+                None => Ignore("a new inline comment that doesn't address CoderHelm"),
+            }
+        }
+    }
+}
+
+/// A comment inside an inline review thread (`pull_request_review_comment`).
+///
+/// On a person's PR: a reply in a thread CoderHelm started (one of its
+/// findings) is the author answering it, and is handled with or without a
+/// mention: the reviewer acknowledges the answer, settles the finding
+/// (resolving the thread when the answer settles it) and re-checks its
+/// verdict. A reply in anyone else's thread, or a new inline comment, is
+/// handled when it addresses CoderHelm (`@coderhelm re-review` /
+/// `@coderhelm <question>`). The answer goes back into that thread. On
+/// CoderHelm's own PRs only a re-review ask is handled here; other thread
+/// replies there are fix requests, handled by the feedback path
+/// (pull_request_review).
 async fn handle_review_comment(
     state: &AppState,
     payload: &Value,
     installation_id: u64,
     team_id: &str,
 ) -> Result<StatusCode, StatusCode> {
-    match payload["action"].as_str() {
-        Some("created") => {}
-        Some("edited") => {
-            let old = payload["changes"]["body"]["from"].as_str().unwrap_or("");
-            let new = payload["comment"]["body"].as_str().unwrap_or("");
-            if ask_added_by_edit(old, new).is_none() {
-                return Ok(StatusCode::OK);
-            }
-        }
-        _ => return Ok(StatusCode::OK),
-    }
+    let repo = &payload["repository"];
+    let owner = repo["owner"]["login"].as_str().unwrap_or("");
+    let name = repo["name"].as_str().unwrap_or("");
+    let pr = &payload["pull_request"];
+    let pr_number = pr["number"].as_u64().unwrap_or(0);
     let commenter = payload["comment"]["user"]["login"].as_str().unwrap_or("");
-    if commenter.contains("coderhelm") {
-        return Ok(StatusCode::OK);
-    }
-    let body = payload["comment"]["body"].as_str().unwrap_or("");
-    let Some(ask) = parse_reviewer_ask(body) else {
-        return Ok(StatusCode::OK);
+    let ignored = |reason: &str| {
+        info!(
+            owner,
+            name,
+            pr_number,
+            commenter,
+            action = payload["action"].as_str().unwrap_or(""),
+            reason,
+            "Reviewer: review comment not handled"
+        );
+        Ok(StatusCode::OK)
+    };
+    let route = route_review_comment(payload);
+    let (comment_id, ask, thread) = match route {
+        ReviewCommentRoute::Ignore(reason) => return ignored(reason),
+        ReviewCommentRoute::Ask { comment_id, ask } => (comment_id, Some(ask), None),
+        ReviewCommentRoute::ThreadReply {
+            comment_id,
+            root,
+            ask,
+            fingerprint,
+        } => (comment_id, ask, Some((root, fingerprint))),
     };
     if !may_start_work(state, team_id, &payload["comment"], "review thread reply").await {
-        return Ok(StatusCode::OK);
+        return ignored("the author has no standing in the repository or on the team");
     }
-    let pr = &payload["pull_request"];
-    if let Some(control) = ask.question.as_deref().and_then(merge_gate::parse_control) {
-        let repo = &payload["repository"];
+    if let Some(control) = ask
+        .as_ref()
+        .and_then(|a| a.question.as_deref())
+        .and_then(merge_gate::parse_control)
+    {
         return super::merge_control::on_comment(
             state,
             team_id,
             installation_id,
-            repo["owner"]["login"].as_str().unwrap_or(""),
-            repo["name"].as_str().unwrap_or(""),
-            pr["number"].as_u64().unwrap_or(0),
-            commenter,
-            control,
-            super::merge_control::CommentRef::ReviewThread(
-                payload["comment"]["id"].as_u64().unwrap_or(0),
-            ),
-        )
-        .await;
-    }
-    let bot_pr = pr["user"]["login"]
-        .as_str()
-        .unwrap_or("")
-        .contains("coderhelm");
-    if bot_pr && !ask.rereview {
-        return Ok(StatusCode::OK);
-    }
-    let repo = &payload["repository"];
-    let owner = repo["owner"]["login"].as_str().unwrap_or("");
-    let name = repo["name"].as_str().unwrap_or("");
-    let pr_number = pr["number"].as_u64().unwrap_or(0);
-    let comment_id = payload["comment"]["id"].as_u64().unwrap_or(0);
-    let cfg = load_review_config(state, team_id, owner, name).await?;
-    if !cfg.enabled || cfg.killed || pr_number == 0 || comment_id == 0 {
-        info!(
-            owner,
-            name, pr_number, "Reviewer: thread reply ignored — review is off for this repo"
-        );
-        return Ok(StatusCode::OK);
-    }
-    if let Some(reason) = check_run_budget(state, team_id).await {
-        post_limit_comment(state, installation_id, owner, name, pr_number, &reason).await;
-        return Ok(StatusCode::OK);
-    }
-    info!(
-        owner,
-        name,
-        pr_number,
-        is_rereview = ask.rereview,
-        "Reviewer: thread reply → review job"
-    );
-    if ask.rereview {
-        record_rereview(
-            state,
-            team_id,
             owner,
             name,
             pr_number,
-            &format!("reply#{comment_id}"),
+            commenter,
+            control,
+            super::merge_control::CommentRef::ReviewThread(comment_id),
         )
         .await;
     }
-    let message = WorkerMessage::Review(ReviewMessage {
-        team_id: team_id.to_string(),
-        installation_id,
-        repo_owner: owner.to_string(),
-        repo_name: name.to_string(),
-        pr_number,
-        head_sha: String::new(),
-        label: cfg.label,
-        question: ask.question,
-        trigger: "reply".to_string(),
-        dedup_key: format!("reply#{comment_id}"),
-        reply_to_comment_id: Some(comment_id),
-        requested_by: commenter.to_string(),
-        ..Default::default()
-    });
-    send_to_queue(state, &state.config.ticket_queue_url, &message).await
+    let bot_pr = is_coderhelm_user(&pr["user"])
+        || pr["user"]["login"]
+            .as_str()
+            .unwrap_or("")
+            .contains("coderhelm");
+    let rereview = ask.as_ref().is_some_and(|a| a.rereview);
+    if bot_pr && !rereview {
+        return ignored("CoderHelm's own PR: thread replies there go to the fix loop");
+    }
+    let cfg = load_review_config(state, team_id, owner, name).await?;
+    if !cfg.enabled || cfg.killed || pr_number == 0 {
+        return ignored("review is off for this repo");
+    }
+    if let Some(reason) = check_run_budget(state, team_id).await {
+        post_limit_comment(state, installation_id, owner, name, pr_number, &reason).await;
+        return ignored("the team's token limit is reached");
+    }
+    let body = payload["comment"]["body"].as_str().unwrap_or("");
+    // A thread reply that isn't a re-review command goes to the worker as
+    // a thread reply: it checks whose thread it is and answers there.
+    let message = match thread {
+        Some((root, fingerprint)) if !rereview => {
+            let question = ask
+                .as_ref()
+                .and_then(|a| a.question.clone())
+                .filter(|q| !q.trim().is_empty())
+                .unwrap_or_else(|| body.trim().to_string());
+            info!(
+                owner,
+                name,
+                pr_number,
+                comment_id,
+                root,
+                mentioned = ask.is_some(),
+                "Reviewer: thread reply → review job"
+            );
+            ReviewMessage {
+                team_id: team_id.to_string(),
+                installation_id,
+                repo_owner: owner.to_string(),
+                repo_name: name.to_string(),
+                pr_number,
+                head_sha: String::new(),
+                label: cfg.label,
+                question: Some(question),
+                trigger: "thread_reply".to_string(),
+                // One job per version of the reply's words: a duplicate
+                // delivery, or an edit that only adds a mention, is the
+                // same job.
+                dedup_key: thread_reply_key(comment_id, &fingerprint),
+                reply_to_comment_id: Some(comment_id),
+                thread_root_id: Some(root),
+                mentioned: ask.is_some(),
+                requested_by: commenter.to_string(),
+                ..Default::default()
+            }
+        }
+        _ => {
+            let Some(ask) = ask else {
+                return ignored("not addressed to CoderHelm");
+            };
+            info!(
+                owner,
+                name,
+                pr_number,
+                is_rereview = ask.rereview,
+                "Reviewer: thread reply → review job"
+            );
+            if ask.rereview {
+                record_rereview(
+                    state,
+                    team_id,
+                    owner,
+                    name,
+                    pr_number,
+                    &format!("reply#{comment_id}"),
+                )
+                .await;
+            }
+            ReviewMessage {
+                team_id: team_id.to_string(),
+                installation_id,
+                repo_owner: owner.to_string(),
+                repo_name: name.to_string(),
+                pr_number,
+                head_sha: String::new(),
+                label: cfg.label,
+                question: ask.question,
+                trigger: "reply".to_string(),
+                dedup_key: format!("reply#{comment_id}"),
+                reply_to_comment_id: Some(comment_id),
+                mentioned: true,
+                requested_by: commenter.to_string(),
+                ..Default::default()
+            }
+        }
+    };
+    send_to_queue(
+        state,
+        &state.config.ticket_queue_url,
+        &WorkerMessage::Review(message),
+    )
+    .await
 }
 
 /// True when the comment's author is a bot account, read from GitHub's
@@ -849,6 +1033,76 @@ async fn is_linked_team_member(state: &AppState, team_id: &str, github_id: u64) 
     }
 }
 
+/// The comment quotes something (a `> ` line) and says something of its own.
+pub(crate) fn is_quote_reply(body: &str) -> bool {
+    let quoted = body.lines().any(|l| {
+        let t = l.trim_start();
+        t.starts_with('>') && t.trim_start_matches('>').trim().len() >= 8
+    });
+    let own = addressed_text(body).trim().len() >= 2;
+    quoted && own
+}
+
+/// A person's PR-conversation comment that quotes text: when the PR is one
+/// CoderHelm reviewed, the worker checks whether the quote is from its
+/// review or replies and, if so, answers it like a reply in its thread.
+async fn handle_quote_reply(
+    state: &AppState,
+    payload: &Value,
+    installation_id: u64,
+    team_id: &str,
+) -> Result<StatusCode, StatusCode> {
+    let repo = &payload["repository"];
+    let owner = repo["owner"]["login"].as_str().unwrap_or("");
+    let name = repo["name"].as_str().unwrap_or("");
+    let pr_number = payload["issue"]["number"].as_u64().unwrap_or(0);
+    let comment_id = payload["comment"]["id"].as_u64().unwrap_or(0);
+    let commenter = payload["comment"]["user"]["login"].as_str().unwrap_or("");
+    let ignored = |reason: &str| {
+        info!(
+            owner,
+            name, pr_number, commenter, reason, "Reviewer: quote reply not handled"
+        );
+        Ok(StatusCode::OK)
+    };
+    if pr_number == 0 || comment_id == 0 {
+        return ignored("no PR or comment id");
+    }
+    if !super::review_lessons::reviewed_by_coderhelm(state, team_id, owner, name, pr_number).await {
+        return ignored("CoderHelm hasn't reviewed this PR");
+    }
+    if !may_start_work(state, team_id, &payload["comment"], "quote reply").await {
+        return ignored("the author has no standing in the repository or on the team");
+    }
+    let cfg = load_review_config(state, team_id, owner, name).await?;
+    if !cfg.enabled || cfg.killed {
+        return ignored("review is off for this repo");
+    }
+    if check_run_budget(state, team_id).await.is_some() {
+        return ignored("the team's token limit is reached");
+    }
+    let body = payload["comment"]["body"].as_str().unwrap_or("");
+    info!(
+        owner,
+        name, pr_number, comment_id, "Reviewer: quote reply → review job"
+    );
+    let message = WorkerMessage::Review(ReviewMessage {
+        team_id: team_id.to_string(),
+        installation_id,
+        repo_owner: owner.to_string(),
+        repo_name: name.to_string(),
+        pr_number,
+        head_sha: String::new(),
+        label: cfg.label,
+        question: Some(body.trim().to_string()),
+        trigger: "quote_reply".to_string(),
+        dedup_key: format!("quote#{comment_id}#{}", reply_fingerprint(body)),
+        requested_by: commenter.to_string(),
+        ..Default::default()
+    });
+    send_to_queue(state, &state.config.ticket_queue_url, &message).await
+}
+
 async fn handle_issue_comment(
     state: &AppState,
     payload: &Value,
@@ -856,8 +1110,18 @@ async fn handle_issue_comment(
     team_id: &str,
 ) -> Result<StatusCode, StatusCode> {
     let action = payload["action"].as_str().unwrap_or("");
+    let not_handled = |reason: &str| {
+        info!(
+            issue = payload["issue"]["number"].as_u64().unwrap_or(0),
+            commenter = payload["comment"]["user"]["login"].as_str().unwrap_or(""),
+            action,
+            reason,
+            "Comment not handled"
+        );
+        Ok(StatusCode::OK)
+    };
     if action != "created" && action != "edited" {
-        return Ok(StatusCode::OK);
+        return not_handled("not a new or edited comment");
     }
     // An edit counts only when it adds a command to the reviewer; every
     // other edit is ignored (the original comment was already handled).
@@ -865,7 +1129,7 @@ async fn handle_issue_comment(
         let old = payload["changes"]["body"]["from"].as_str().unwrap_or("");
         let new = payload["comment"]["body"].as_str().unwrap_or("");
         if ask_added_by_edit(old, new).is_none() {
-            return Ok(StatusCode::OK);
+            return not_handled("an edit that didn't add an ask to CoderHelm");
         }
     }
 
@@ -873,7 +1137,7 @@ async fn handle_issue_comment(
     // are never instructions. They used to reach the feedback fixer as
     // review_id 0 and spawn unbudgeted fix cycles.
     if is_bot_comment(payload) {
-        return Ok(StatusCode::OK);
+        return not_handled("written by a bot account");
     }
     let body = payload["comment"]["body"].as_str().unwrap_or("");
     let commenter = payload["comment"]["user"]["login"].as_str().unwrap_or("");
@@ -925,6 +1189,20 @@ async fn handle_issue_comment(
         || lower.trim_start().starts_with("/coderhelm")
         || lower.contains("@coderhelm");
     if !on_bot_pr && !addressed {
+        // A person quoting CoderHelm's review in the PR conversation (GitHub's
+        // "Quote reply") is answering it, mention or not.
+        if action == "created"
+            && is_quote_reply(body)
+            && payload["issue"]["pull_request"].is_object()
+        {
+            return handle_quote_reply(state, payload, installation_id, team_id).await;
+        }
+        info!(
+            commenter,
+            issue = payload["issue"]["number"].as_u64().unwrap_or(0),
+            reason = "not on CoderHelm's PR, not addressed to it and not quoting it",
+            "Comment not handled"
+        );
         return Ok(StatusCode::OK);
     }
     if !may_start_work(state, team_id, &payload["comment"], "comment").await {
@@ -3981,5 +4259,188 @@ mod own_pr_ci_after_run_tests {
         ] {
             assert!(!reopens_for_ci(s), "{s}");
         }
+    }
+}
+
+#[cfg(test)]
+mod thread_reply_tests {
+    use super::{
+        is_coderhelm_user, is_quote_reply, reply_fingerprint, route_review_comment,
+        thread_reply_key, ReviewCommentRoute,
+    };
+    use serde_json::{json, Value};
+
+    fn fixture(name: &str) -> Value {
+        let text = match name {
+            "no_mention" => include_str!("testdata/review_reply_no_mention.json"),
+            "edited" => include_str!("testdata/review_reply_edited.json"),
+            "bot" => include_str!("testdata/review_reply_bot.json"),
+            _ => unreachable!(),
+        };
+        serde_json::from_str(text).unwrap()
+    }
+
+    fn key_of(r: &ReviewCommentRoute) -> String {
+        match r {
+            ReviewCommentRoute::ThreadReply {
+                comment_id,
+                fingerprint,
+                ..
+            } => thread_reply_key(*comment_id, fingerprint),
+            other => panic!("not a thread reply: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_reply_without_a_mention_in_a_thread_is_handled() {
+        let r = route_review_comment(&fixture("no_mention"));
+        match &r {
+            ReviewCommentRoute::ThreadReply {
+                comment_id,
+                root,
+                ask,
+                ..
+            } => {
+                assert_eq!(*comment_id, 2001);
+                assert_eq!(*root, 1999);
+                assert!(ask.is_none(), "no mention, still handled");
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_reply_with_a_mention_keeps_working() {
+        let mut p = fixture("no_mention");
+        p["comment"]["body"] = json!("@CoderHelm yes, it's our own KMS key.");
+        match route_review_comment(&p) {
+            ReviewCommentRoute::ThreadReply { ask: Some(a), .. } => {
+                assert_eq!(a.question.as_deref(), Some("yes, it's our own KMS key."));
+            }
+            other => panic!("{other:?}"),
+        }
+        // A new top-level inline comment needs the mention.
+        let mut top = fixture("no_mention");
+        top["comment"]["in_reply_to_id"] = Value::Null;
+        assert!(matches!(
+            route_review_comment(&top),
+            ReviewCommentRoute::Ignore(_)
+        ));
+        top["comment"]["body"] = json!("@coderhelm re-review");
+        assert!(matches!(
+            route_review_comment(&top),
+            ReviewCommentRoute::Ask { .. }
+        ));
+    }
+
+    #[test]
+    fn an_edit_that_adds_the_answer_is_handled_once_per_version() {
+        let p = fixture("edited");
+        let r = route_review_comment(&p);
+        let edited_key = key_of(&r);
+        // The created version had other words: a different job.
+        let mut created = p.clone();
+        created["action"] = json!("created");
+        created["comment"]["body"] = json!("Checking, one sec.");
+        assert_ne!(key_of(&route_review_comment(&created)), edited_key);
+        // An edit that only fixes spacing or punctuation is not handled.
+        let mut typo = p.clone();
+        typo["changes"]["body"]["from"] = p["comment"]["body"].clone();
+        typo["comment"]["body"] = json!(format!("{}!!  ", p["comment"]["body"].as_str().unwrap()));
+        assert!(matches!(
+            route_review_comment(&typo),
+            ReviewCommentRoute::Ignore(_)
+        ));
+        // An edit that only adds the mention to an answered reply is routed,
+        // but with the same key as the version already answered.
+        let mut mention = p.clone();
+        mention["changes"]["body"]["from"] = p["comment"]["body"].clone();
+        mention["comment"]["body"] = json!(format!(
+            "@coderhelm {}",
+            p["comment"]["body"].as_str().unwrap()
+        ));
+        assert_eq!(key_of(&route_review_comment(&mention)), edited_key);
+        // An edit event without the old text changed nothing we can see.
+        let mut no_from = p.clone();
+        no_from["changes"] = json!({});
+        assert!(matches!(
+            route_review_comment(&no_from),
+            ReviewCommentRoute::Ignore(_)
+        ));
+    }
+
+    #[test]
+    fn a_reply_from_a_bot_or_from_coderhelm_is_ignored() {
+        assert_eq!(
+            route_review_comment(&fixture("bot")),
+            ReviewCommentRoute::Ignore("written by a bot account")
+        );
+        let mut own = fixture("no_mention");
+        own["comment"]["user"] = json!({"login": "coderhelm[bot]", "type": "Bot"});
+        assert_eq!(
+            route_review_comment(&own),
+            ReviewCommentRoute::Ignore("CoderHelm's own comment")
+        );
+        // A person whose login contains the name is still a person.
+        let mut named = fixture("no_mention");
+        named["comment"]["user"] = json!({"login": "coderhelm-fan", "type": "User"});
+        assert!(matches!(
+            route_review_comment(&named),
+            ReviewCommentRoute::ThreadReply { .. }
+        ));
+        assert!(!is_coderhelm_user(
+            &json!({"login": "coderhelm-fan", "type": "User"})
+        ));
+        assert!(is_coderhelm_user(
+            &json!({"login": "CoderHelm[bot]", "type": "Bot"})
+        ));
+    }
+
+    #[test]
+    fn a_duplicate_delivery_gives_the_same_job_key() {
+        let a = route_review_comment(&fixture("no_mention"));
+        let b = route_review_comment(&fixture("no_mention"));
+        assert_eq!(a, b);
+        assert_eq!(key_of(&a), key_of(&b));
+        assert!(key_of(&a).starts_with("thread#2001#"));
+    }
+
+    #[test]
+    fn every_other_action_is_ignored_with_a_reason() {
+        let mut p = fixture("no_mention");
+        p["action"] = json!("deleted");
+        assert_eq!(
+            route_review_comment(&p),
+            ReviewCommentRoute::Ignore("not a new or edited comment")
+        );
+        p["action"] = json!("created");
+        p["comment"]["body"] = json!("   ");
+        assert_eq!(
+            route_review_comment(&p),
+            ReviewCommentRoute::Ignore("empty comment")
+        );
+    }
+
+    #[test]
+    fn the_fingerprint_ignores_mentions_quotes_and_punctuation() {
+        assert_eq!(
+            reply_fingerprint("@CoderHelm Yes, it is."),
+            reply_fingerprint("yes it is")
+        );
+        assert_eq!(
+            reply_fingerprint("> Is it encrypted?\n\nYes it is"),
+            reply_fingerprint("Yes, it is!")
+        );
+        assert_ne!(reply_fingerprint("yes"), reply_fingerprint("no"));
+    }
+
+    #[test]
+    fn a_quote_reply_quotes_and_adds_words() {
+        assert!(is_quote_reply(
+            "> Is the source bucket encrypted with a customer-managed key?\n\nYes."
+        ));
+        assert!(!is_quote_reply("> Is the source bucket encrypted?"));
+        assert!(!is_quote_reply("No quote, just words."));
+        assert!(!is_quote_reply("> ok\n\nYes."));
     }
 }

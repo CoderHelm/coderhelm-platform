@@ -721,6 +721,35 @@ async fn run_once(
     // (old in-flight messages) or a transient DynamoDB error falls through to
     // processing — `claim_once_ttl` fails OPEN, so a real review is never lost. The
     // short TTL lets a failed review be re-driven later.
+    let github = GitHubClient::new(
+        &state.secrets.github_app_id,
+        &state.secrets.github_private_key,
+        msg.installation_id,
+        &state.http,
+    )?;
+
+    // A reply that may answer one of CoderHelm's findings, mention or not:
+    // what it answers, checked before the job is claimed so a reply in a
+    // person's own thread that didn't address CoderHelm leaves no claim
+    // (an edit that adds the mention is then handled).
+    let answered = if super::review_thread_reply::is_answer_trigger(&msg.trigger) {
+        match super::review_thread_reply::find(&github, &msg).await? {
+            Some(f) => Some(f),
+            None if msg.mentioned => None,
+            None => {
+                info!(
+                    pr = msg.pr_number,
+                    trigger = %msg.trigger,
+                    reason = "it doesn't answer CoderHelm's review and doesn't address CoderHelm",
+                    "Reviewer: reply not handled"
+                );
+                return Ok(DONE);
+            }
+        }
+    } else {
+        None
+    };
+
     if !msg.dedup_key.is_empty() {
         let sk = format!(
             "REVIEWJOB#{}/{}#{:06}#{}",
@@ -737,13 +766,6 @@ async fn run_once(
             return Ok(DONE);
         }
     }
-
-    let github = GitHubClient::new(
-        &state.secrets.github_app_id,
-        &state.secrets.github_private_key,
-        msg.installation_id,
-        &state.http,
-    )?;
 
     // PR metadata. head_sha may be empty on reply-triggered reviews — resolve it
     // from the PR so a reply always targets the latest commit.
@@ -939,6 +961,13 @@ async fn run_once(
             }
             s
         };
+        // A person answering one of CoderHelm's findings: the finding, the
+        // thread so far and the answer, instead of a bare question.
+        let asked = match &answered {
+            Some(f) => super::review_thread_reply::answer_prompt(f, &msg.requested_by, question),
+            None => question.clone(),
+        };
+        let question = &asked;
         let prompt = format!(
             "PR #{}: {title}\n\n{pr_body}{earlier_section}\n\n## Question from a reviewer\n{question}\n\n## Diff (base...head)\n{diff}",
             msg.pr_number,
@@ -1154,18 +1183,54 @@ async fn run_once(
                 },
             )
         });
+        // An answered finding: recorded, and when the reply concludes the
+        // answer settles it, its thread is resolved. A settled finding while
+        // the standing verdict requests changes re-runs the formal review.
+        let mut decision = decision;
+        let mut settle_reason = String::new();
+        if let Some(f) = &answered {
+            let settled = conclusion.as_ref().is_some_and(|c| c.settles_finding);
+            let mut resolved = f.thread.as_ref().is_some_and(|t| t.resolved);
+            if settled {
+                match super::review_thread_reply::settle(&github, &msg, f).await {
+                    Some(note) => answer = format!("{}\n\n{note}", answer.trim_end()),
+                    None => resolved = f.thread.is_some(),
+                }
+                let holds = standing
+                    .as_ref()
+                    .is_some_and(|s| s.verdict == "REQUEST_CHANGES");
+                if holds && decision != Some(super::review_verdict::Decision::Review) {
+                    decision = Some(super::review_verdict::Decision::Review);
+                    settle_reason =
+                        "A person's answer settled a finding while the review requested changes."
+                            .to_string();
+                }
+            }
+            super::review_thread_reply::record(state, &msg, f, settled, resolved, &answer).await;
+            info!(
+                pr = msg.pr_number,
+                settled, resolved, "Reviewer: answered a reply to its finding"
+            );
+        }
         if decision == Some(super::review_verdict::Decision::Review) {
-            let c = conclusion.as_ref().expect("checked above");
+            let reason = if settle_reason.is_empty() {
+                conclusion
+                    .as_ref()
+                    .map(|c| c.reason.clone())
+                    .unwrap_or_default()
+            } else {
+                settle_reason
+            };
             info!(
                 pr = msg.pr_number,
                 head = %head_sha,
-                change = ?c.verdict_change,
+                change = ?conclusion.as_ref().map(|c| c.verdict_change),
                 standing = ?standing,
                 "Reply conclusion differs from the standing verdict; formal review runs first"
             );
             record_review_usage(state, &msg.team_id, None, &usage).await;
             return Ok(Outcome::ReviewThenReply {
-                review: Box::new(reconcile_message(&msg, &head_sha, &c.reason)),
+                review: Box::new(reconcile_message(&msg, &head_sha, &reason)),
                 reply: Box::new(PendingReply {
                     head_sha: head_sha.clone(),
                     answer,
@@ -1426,7 +1491,7 @@ async fn run_once(
         bot_threads.iter().filter(|t| !t.resolved).collect();
     let settled_threads: Vec<&crate::clients::github::BotReviewThread> = bot_threads
         .iter()
-        .filter(|t| t.resolved_by_person)
+        .filter(|t| settled_by_answer_or_person(t))
         .collect();
     // What people wrote in the PR conversation, including the text of a
     // re-review ask.
@@ -2402,6 +2467,8 @@ pub async fn review_for_run(
         // The key the ready-for-review trigger uses for this head.
         dedup_key: format!("head#{head_sha}"),
         reply_to_comment_id: None,
+        thread_root_id: None,
+        mentioned: false,
         requested_by: String::new(),
         attempt: 0,
         wait_secs: 0,
@@ -3257,6 +3324,13 @@ pub(crate) fn human_comments(comments: &[serde_json::Value], max: usize) -> Vec<
     human.into_iter().skip(skip).collect()
 }
 
+/// A resolved thread a person settled: they resolved it, or they answered
+/// it and CoderHelm resolved it on that answer. Shown to a re-review so the
+/// same concern isn't raised again.
+pub(crate) fn settled_by_answer_or_person(t: &crate::clients::github::BotReviewThread) -> bool {
+    t.resolved && (t.resolved_by_person || t.replies.iter().any(|r| !r.by_bot))
+}
+
 /// Earlier threads the model reported fixed or answered. Indices that are out
 /// of range or duplicated are ignored; anything else stays open.
 fn settled_prior_threads<'a>(
@@ -3311,6 +3385,7 @@ mod prior_thread_tests {
 
     fn t(id: &str) -> BotReviewThread {
         BotReviewThread {
+            root_id: 0,
             id: id.into(),
             path: "a.rs".into(),
             line: 1,
@@ -3326,6 +3401,26 @@ mod prior_thread_tests {
             index,
             status: status.into(),
         }
+    }
+
+    #[test]
+    fn a_thread_coderhelm_resolved_on_a_persons_answer_counts_as_settled() {
+        use crate::clients::github::ThreadReply;
+        let mut a = t("A");
+        assert!(!settled_by_answer_or_person(&a));
+        a.resolved = true;
+        // Resolved by CoderHelm because the code fixed it: not a person's answer.
+        assert!(!settled_by_answer_or_person(&a));
+        a.replies.push(ThreadReply {
+            author: "author".into(),
+            by_bot: false,
+            body: "Yes, it uses our own key.".into(),
+        });
+        assert!(settled_by_answer_or_person(&a));
+        let mut b = t("B");
+        b.resolved = true;
+        b.resolved_by_person = true;
+        assert!(settled_by_answer_or_person(&b));
     }
 
     #[test]
@@ -3551,6 +3646,8 @@ mod superseded_tests {
             trigger: "synchronize".into(),
             dedup_key: String::new(),
             reply_to_comment_id: None,
+            thread_root_id: None,
+            mentioned: false,
             requested_by: String::new(),
             attempt: 0,
             wait_secs: 0,
@@ -3877,6 +3974,8 @@ mod failure_tests {
             trigger: "synchronize".into(),
             dedup_key: "head#a1b2c3d4".into(),
             reply_to_comment_id: None,
+            thread_root_id: None,
+            mentioned: false,
             requested_by: String::new(),
             attempt: 0,
             wait_secs: 0,
