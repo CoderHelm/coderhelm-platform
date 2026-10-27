@@ -455,6 +455,61 @@ pub fn from_header(display: &str, address: &str) -> String {
     format!("\"{d}\" <{address}>")
 }
 
+pub const PATH_DOMAIN: &str = "/hybrid/email/domain";
+pub const DOMAIN_SK: &str = "EMAILDOMAIN";
+/// How long a custom domain's proof counts. The install asks again (it does
+/// whenever the relay refuses one of its links, and on its setup checks), so
+/// a domain that stops answering stops counting within this.
+pub const DOMAIN_PROOF_SECS: i64 = 7 * 86_400;
+
+/// A custom domain an install asked the relay to link to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CustomDomain {
+    pub hostname: String,
+    /// When the relay last reached the install over HTTPS on it (epoch
+    /// seconds); `None` until it has.
+    pub verified_at: Option<i64>,
+}
+
+/// A hostname an install may ask the relay to link to: lowercase labels, a
+/// real top-level domain, not an AWS address, not CoderHelm's own zone, not
+/// an IP address.
+pub fn custom_domain_ok(host: &str) -> bool {
+    let h = host.trim().trim_end_matches('.').to_ascii_lowercase();
+    if h.len() < 4 || h.len() > 253 || !h.contains('.') {
+        return false;
+    }
+    let labels_ok = h.split('.').all(|l| {
+        !l.is_empty()
+            && l.len() <= 63
+            && !l.starts_with('-')
+            && !l.ends_with('-')
+            && l.chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+    });
+    let tld = h.rsplit('.').next().unwrap_or("");
+    let tld_ok = tld.len() >= 2 && tld.chars().all(|c| c.is_ascii_lowercase());
+    let not_ours = !(h == "coderhelm.com" || h.ends_with(".coderhelm.com"));
+    let not_aws = !(h.ends_with(".cloudfront.net") || h.ends_with(".amazonaws.com"));
+    labels_ok && tld_ok && not_ours && not_aws
+}
+
+/// The hosts a relayed email's links may point at: the install's verified
+/// CloudFront address and CoderHelm name, plus its own domain only while
+/// the relay's last HTTPS proof on it is recent.
+pub fn link_hosts(base: &[String], domain: Option<&CustomDomain>, now: i64) -> Vec<String> {
+    let mut out = base.to_vec();
+    if let Some(d) = domain {
+        let fresh = d
+            .verified_at
+            .is_some_and(|at| at <= now && now - at <= DOMAIN_PROOF_SECS);
+        if fresh && custom_domain_ok(&d.hostname) {
+            out.push(d.hostname.trim_end_matches('.').to_ascii_lowercase());
+        }
+    }
+    out
+}
+
 /// A bounce or complaint, read from the SES event the topic delivers.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MailEvent {
@@ -802,5 +857,105 @@ mod tests {
         });
         assert!(parse_event(&untagged).is_none());
         assert!(!is_ses_event(&json!({"type": "ticket", "mail": {}})));
+    }
+
+    #[test]
+    fn a_custom_domain_counts_only_while_its_proof_is_recent() {
+        let base = vec!["d1.cloudfront.net".to_string()];
+        let now = 1_800_000_000;
+        let unverified = CustomDomain {
+            hostname: "helm.example.org".into(),
+            verified_at: None,
+        };
+        assert_eq!(link_hosts(&base, Some(&unverified), now), base);
+        let fresh = CustomDomain {
+            hostname: "Helm.Example.org.".into(),
+            verified_at: Some(now - 60),
+        };
+        assert_eq!(
+            link_hosts(&base, Some(&fresh), now),
+            vec!["d1.cloudfront.net", "helm.example.org"]
+        );
+        let stale = CustomDomain {
+            hostname: "helm.example.org".into(),
+            verified_at: Some(now - DOMAIN_PROOF_SECS - 1),
+        };
+        assert_eq!(link_hosts(&base, Some(&stale), now), base);
+        let future = CustomDomain {
+            hostname: "helm.example.org".into(),
+            verified_at: Some(now + 3600),
+        };
+        assert_eq!(link_hosts(&base, Some(&future), now), base);
+        assert_eq!(link_hosts(&base, None, now), base);
+    }
+
+    #[test]
+    fn only_a_real_domain_outside_aws_and_coderhelm_can_be_asked_for() {
+        assert!(custom_domain_ok("helm.example.org"));
+        assert!(custom_domain_ok("ci-2.helm.example.co.uk"));
+        for bad in [
+            "coderhelm.com",
+            "app.coderhelm.com",
+            "acme.coderhelm.com",
+            "d1.cloudfront.net",
+            "x.s3.amazonaws.com",
+            "10.0.0.1",
+            "localhost",
+            "-bad.example.org",
+            "a_b.example.org",
+            "helm.example.org/path",
+            "helm.example.org:8443",
+            "",
+        ] {
+            assert!(!custom_domain_ok(bad), "{bad}");
+        }
+    }
+
+    #[test]
+    fn an_unverified_custom_domain_link_is_still_refused() {
+        use super::super::templates::{check, Refusal};
+        let base = vec!["d1.cloudfront.net".to_string()];
+        let now = 1_800_000_000;
+        let params = |link: &str| {
+            serde_json::json!({ "link": link })
+                .as_object()
+                .unwrap()
+                .clone()
+        };
+        let unverified = CustomDomain {
+            hostname: "helm.example.org".into(),
+            verified_at: None,
+        };
+        let hosts = link_hosts(&base, Some(&unverified), now);
+        assert_eq!(
+            check(
+                "welcome",
+                &params("https://helm.example.org/"),
+                &hosts,
+                true
+            )
+            .unwrap_err(),
+            Refusal::LinkNotOwnHost("link".into())
+        );
+        let verified = CustomDomain {
+            verified_at: Some(now),
+            ..unverified
+        };
+        let hosts = link_hosts(&base, Some(&verified), now);
+        assert!(check(
+            "welcome",
+            &params("https://helm.example.org/"),
+            &hosts,
+            true
+        )
+        .is_ok());
+        // Another domain is still refused.
+        assert!(check(
+            "welcome",
+            &params("https://other.example.org/"),
+            &hosts,
+            true
+        )
+        .is_err());
     }
 }

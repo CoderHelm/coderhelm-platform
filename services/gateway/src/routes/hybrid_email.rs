@@ -266,14 +266,18 @@ pub async fn send(
     let req: relay::SendRequest =
         serde_json::from_slice(&body).map_err(|_| refuse(relay::Refusal::BadRequest))?;
     let fail_with = |code: &str| relay_delivery(&req.template, &req.to, Err(code));
-    let (template, values) =
-        match templates::check(&req.template, &req.params, &own_hosts(&install), true) {
-            Ok(v) => v,
-            Err(r) => {
-                record(&state, &install.id, &fail_with(r.code())).await;
-                return Err(fail(StatusCode::BAD_REQUEST, r.code(), &r.message()));
-            }
-        };
+    let hosts = relay::link_hosts(
+        &own_hosts(&install),
+        custom_domain(&state, &install.id).await?.as_ref(),
+        epoch(),
+    );
+    let (template, values) = match templates::check(&req.template, &req.params, &hosts, true) {
+        Ok(v) => v,
+        Err(r) => {
+            record(&state, &install.id, &fail_with(r.code())).await;
+            return Err(fail(StatusCode::BAD_REQUEST, r.code(), &r.message()));
+        }
+    };
     first_use(&state, &install.id, &req.request_id).await?;
     let hash = relay::recipient_hash(&install.id, &req.to);
     let listing = relay::Listing {
@@ -582,6 +586,110 @@ async fn seal_admin(
         .encrypt(ctx, relay::normalize(email).as_bytes())
         .await?;
     Ok(base64::engine::general_purpose::STANDARD.encode(blob))
+}
+
+/// The install's own domain, as last asked for and proved.
+async fn custom_domain(
+    state: &AppState,
+    install: &str,
+) -> Result<Option<relay::CustomDomain>, (StatusCode, Json<Value>)> {
+    Ok(get(state, install, relay::DOMAIN_SK).await?.and_then(|i| {
+        let hostname = i.get("hostname")?.as_s().ok()?.clone();
+        let verified_at = i
+            .get("verified_at")
+            .and_then(|v| v.as_n().ok())
+            .and_then(|v| v.parse().ok());
+        Some(relay::CustomDomain {
+            hostname,
+            verified_at,
+        })
+    }))
+}
+
+/// Whether the install answers its own proof on `host` over HTTPS: the
+/// name resolves to it and its certificate is valid. Never a redirect, at
+/// most a small answer.
+async fn proves_on(master: &str, install: &Install, host: &str) -> bool {
+    let challenge = common::hybrid::broker::new_handle("ch");
+    let url = format!("https://{host}/webhooks/relay/proof?challenge={challenge}");
+    let Ok(r) = hybrid_relay::install_client()
+        .get(&url)
+        .timeout(std::time::Duration::from_secs(6))
+        .send()
+        .await
+    else {
+        return false;
+    };
+    if !r.status().is_success() {
+        return false;
+    }
+    let v: Value = serde_json::from_slice(&hybrid_relay::read_capped(r).await).unwrap_or_default();
+    v["install_id"].as_str() == Some(install.id.as_str())
+        && common::hybrid::sign::check_proof(
+            &common::hybrid::sign::install_secret(master, &install.id),
+            &challenge,
+            v["proof"].as_str().unwrap_or(""),
+        )
+}
+
+/// POST /hybrid/email/domain (signed) `{hostname}`: let relayed emails link
+/// to the install's own domain. The relay proves it first, over HTTPS on
+/// that name, the same proof as the CloudFront address; until then (and
+/// once the proof is a week old) links there are refused.
+pub async fn domain(
+    State(state): State<Arc<AppState>>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Reply {
+    let (install, _) = verified(&state, &headers, &method, &uri, &body).await?;
+    let master = master(&state).ok_or_else(not_here)?.to_string();
+    crate::middleware::rate_limit::allow(&headers, "hybrid-email-domain", 20, 3600)
+        .map_err(|_| refuse(relay::Refusal::RateLimited))?;
+    let host = serde_json::from_slice::<Value>(&body).unwrap_or_default()["hostname"]
+        .as_str()
+        .unwrap_or("")
+        .trim()
+        .trim_end_matches('.')
+        .to_ascii_lowercase();
+    if !relay::custom_domain_ok(&host) {
+        return Err(fail(
+            StatusCode::BAD_REQUEST,
+            "bad_domain",
+            "Send the install's own domain, such as coderhelm.example.com.",
+        ));
+    }
+    let ok = proves_on(&master, &install, &host).await;
+    let mut put = state
+        .dynamo
+        .put_item()
+        .table_name(&state.config.settings_table_name)
+        .item("pk", s(&hybrid_relay::install_pk(&install.id)))
+        .item("sk", s(relay::DOMAIN_SK))
+        .item("hostname", s(&host));
+    if ok {
+        put = put.item("verified_at", n(epoch()));
+    }
+    put.send().await.map_err(|e| {
+        warn!(error = %e, "email relay: domain write failed");
+        unavailable()
+    })?;
+    audit(
+        &state,
+        &install.id,
+        "email_domain",
+        json!({ "hostname": host, "verified": ok }),
+    )
+    .await;
+    if !ok {
+        return Err(fail(
+            StatusCode::BAD_REQUEST,
+            "domain_not_proved",
+            "CoderHelm couldn't reach this install over HTTPS on that domain. Check its DNS records and certificate in Settings, System, Domain.",
+        ));
+    }
+    Ok(Json(json!({ "ok": true, "hostname": host })))
 }
 
 /// GET /hybrid/email/status (signed): what the install's Settings, Emails
