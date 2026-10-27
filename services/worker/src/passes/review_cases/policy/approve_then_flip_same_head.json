@@ -1,0 +1,31 @@
+{
+  "description": "CoderHelm approved a commit; a bare re-review ask on the same commit came back with a new high finding and flipped to request changes. With nothing new, the approval stands and the finding is a note. After a person's reply that changes the facts, the flip is allowed and explained.",
+  "steps": [
+    {"push": {"head": "d00d001"}},
+    {"review": {"trigger": "synchronize", "dedup_key": "head#d00d001",
+      "model": {"verdict": "APPROVE", "summary": "Maps refund rows.", "findings": []}}},
+    {"claims_expire": {}},
+    {"comment": {"by": "dev-a", "text": "@coderhelm re-review"}},
+    {"review": {"trigger": "reply", "dedup_key": "reply#601",
+      "model": {"verdict": "REQUEST_CHANGES", "summary": "x", "findings": [
+        {"file": "src/refunds.rs", "line": 22, "severity": "high", "category": "bug", "evidence": "verified-defect", "title": "status may be null", "body": "The mapper unwraps status."}
+      ]}}},
+    {"comment": {"by": "lead-b", "text": "Refund rows from the payment system arrive with status null until they settle, so the unwrap on line 22 will panic."}},
+    {"review": {"trigger": "reply", "dedup_key": "reply#602",
+      "model": {"verdict": "REQUEST_CHANGES", "summary": "x",
+        "change_of_mind": "lead-b says refund rows arrive with a null status, which this code unwraps.",
+        "findings": [
+          {"file": "src/refunds.rs", "line": 22, "severity": "high", "category": "bug", "evidence": "verified-defect", "title": "status may be null", "body": "The mapper unwraps status.", "prompted_by_reply": true}
+        ]}}}
+  ],
+  "expect": {
+    "formal": [["d00d001", "APPROVE"], ["d00d001", "APPROVE"], ["d00d001", "REQUEST_CHANGES"]],
+    "skipped": 0,
+    "body_contains": [
+      [1, "my earlier verdict (approve) stands"],
+      [1, "second look at a commit I already approved"],
+      [2, "Changed my verdict"],
+      [2, "null status"]
+    ]
+  }
+}

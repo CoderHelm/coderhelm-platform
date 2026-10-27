@@ -1,0 +1,18 @@
+{
+  "description": "Learned lessons from the audit: the reviewer blocked on a log level, a naming nit, hardening that isn't a defect, a follow-up the description already tracks, and a medium finding. All are notes; only a high-severity defect caused by the diff would block.",
+  "steps": [
+    {"push": {"head": "ab12cd3"}},
+    {"review": {"trigger": "synchronize", "dedup_key": "head#ab12cd3",
+      "model": {"verdict": "REQUEST_CHANGES", "summary": "x", "findings": [
+        {"file": "src/sync.rs", "line": 3, "severity": "high", "category": "logging", "evidence": "verified-defect", "title": "Use warn, not info", "body": "Log level."},
+        {"file": "src/sync.rs", "line": 4, "severity": "blocking", "category": "style", "evidence": "verified-defect", "title": "Rename x", "body": "Naming."},
+        {"file": "src/sync.rs", "line": 5, "severity": "high", "category": "hardening", "evidence": "verified-defect", "title": "Add a timeout", "body": "Nice to have."},
+        {"file": "src/sync.rs", "line": 6, "severity": "high", "category": "bug", "evidence": "verified-defect", "tracked": true, "title": "Backfill old rows", "body": "The description lists this as a follow-up."},
+        {"file": "src/sync.rs", "line": 7, "severity": "medium", "category": "bug", "evidence": "verified-defect", "title": "Edge case", "body": "Medium."}
+      ]}}}
+  ],
+  "expect": {
+    "formal": [["ab12cd3", "APPROVE"]],
+    "last_notes": 5
+  }
+}

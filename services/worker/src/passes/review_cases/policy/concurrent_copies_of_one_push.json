@@ -1,0 +1,16 @@
+{
+  "description": "Two copies of one push trigger started before either finished (a redelivery racing the first delivery): only one verdict is posted.",
+  "steps": [
+    {"push": {"head": "aa11bb2"}},
+    {"together": [
+      {"trigger": "synchronize", "dedup_key": "head#aa11bb2",
+       "model": {"verdict": "APPROVE", "summary": "ok", "findings": []}},
+      {"trigger": "synchronize", "dedup_key": "head#aa11bb2",
+       "model": {"verdict": "APPROVE", "summary": "ok", "findings": []}}
+    ]}
+  ],
+  "expect": {
+    "formal": [["aa11bb2", "APPROVE"]],
+    "skipped": 0
+  }
+}

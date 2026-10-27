@@ -1,0 +1,17 @@
+{
+  "description": "The PR's integration-tests check failed, but it fails on the base branch too; the reviewer requested changes for it. A failure the diff didn't cause is a note.",
+  "steps": [
+    {"base_failing": ["integration-tests"]},
+    {"push": {"head": "f00f00f"}},
+    {"review": {"trigger": "synchronize", "dedup_key": "head#f00f00f",
+      "model": {"verdict": "REQUEST_CHANGES", "summary": "x", "findings": [
+        {"file": "src/api.rs", "line": 5, "severity": "high", "category": "tests", "evidence": "verified-defect", "title": "integration-tests check is red", "body": "The integration-tests job fails on this head."},
+        {"file": "src/api.rs", "line": 9, "severity": "high", "category": "bug", "evidence": "verified-defect", "caused_by_diff": false, "title": "Old parser bug", "body": "This parser bug predates the PR."}
+      ]}}}
+  ],
+  "expect": {
+    "formal": [["f00f00f", "APPROVE"]],
+    "last_notes": 2,
+    "body_contains": [[0, "fails on the base branch too"]]
+  }
+}

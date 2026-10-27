@@ -51,6 +51,19 @@ pub struct Finding {
     /// one that doesn't is a note on the approval. Unset means it doesn't.
     #[serde(default)]
     pub blocks: Option<bool>,
+    /// False when the problem isn't caused by this PR's change: it is on the
+    /// base branch already (a check failing there too, code the diff didn't
+    /// touch). Such a finding is a note ([`super::review_policy`]).
+    #[serde(default)]
+    pub caused_by_diff: Option<bool>,
+    /// True when the PR description already tracks this as a follow-up, or
+    /// the work lies outside this repository. A note, never a block.
+    #[serde(default)]
+    pub tracked: Option<bool>,
+    /// True when a person's reply since the previous review is what made
+    /// this finding relevant (it may then block on code reviewed before).
+    #[serde(default)]
+    pub prompted_by_reply: Option<bool>,
 }
 
 /// What a finding rests on. The verdict depends on it: only a defect the
@@ -137,6 +150,10 @@ pub struct ReviewOutput {
     /// requests changes ([`decide_verdict`]); the rest are notes.
     #[serde(default)]
     pub unconfirmed_facts: Vec<UnconfirmedFact>,
+    /// When the reviewer's verdict differs from its previous review of the
+    /// same commit: what new information changed it, in one sentence.
+    #[serde(default)]
+    pub change_of_mind: String,
 }
 
 /// A fact the PR's own evidence says is unconfirmed, and whether the change
@@ -523,7 +540,12 @@ impl Finding {
 
     /// A verified defect (or a repo policy) requests changes, and so does a
     /// question the change's correctness rests on: its ask is the change.
+    /// Only at high severity: a low or medium finding is a note
+    /// ([`super::review_policy`]).
     pub fn holds_merge(&self) -> bool {
+        if !super::review_policy::blocking_severity(&self.severity) {
+            return false;
+        }
         match self.evidence() {
             Evidence::VerifiedDefect => true,
             Evidence::Question => self.blocks == Some(true),
@@ -1323,6 +1345,7 @@ pub fn review_system_prompt(
          {UNCONFIRMED_RULE}\
          {REPLIES_RULE}\
          {TEST_STATE_RULE}\
+         {BLOCKING_RULE}\
          {MANUAL_CHECK_RULE}\
          {SOURCE_DATA_RULE}\
 {EXISTING_PATTERN_RULE}\
@@ -1337,15 +1360,17 @@ pub fn review_system_prompt(
          {{\n  \"verdict\": \"APPROVE\" | \"REQUEST_CHANGES\",\n  \"risk\": \"LOW\" | \"MEDIUM\" | \"HIGH\",\n  \
          \"summary\": \"2-4 sentence overview\",\n  \"findings\": [{{\n    \"file\": \"path\", \"line\": <int, a line present on the RIGHT side of the diff>,\n    \
          \"end_line\": <optional int for a range>, \"severity\": \"blocking|high|medium|low|nit\",\n    \
-         \"category\": \"bug|security|correctness|perf|convention|scope|tests|source-data-override|manual-check|question\", \"title\": \"short\",\n    \
+         \"category\": \"bug|security|correctness|perf|convention|style|logging|hardening|follow-up|scope|tests|source-data-override|manual-check|question\", \"title\": \"short\",\n    \
          \"evidence\": \"verified-defect|unverified-concern|question\",\n    \
          \"lookups\": [\"L1\"]  (ids of the live lookups the finding rests on, if any),\n    \
          \"blocks\": <bool, questions only: true when the change's correctness rests on the answer>,\n    \
+         \"caused_by_diff\": <bool, false when the PR's change didn't cause it>, \"tracked\": <bool, true for a follow-up the PR tracks or work outside the repo>, \"prompted_by_reply\": <bool, true when a person's reply since your previous review made it relevant>,\n    \
          \"body\": \"why it's a problem, be specific\", \"suggestion\": \"optional exact replacement code for the anchored line(s)\"\n  }}],\n  \
          \"unconfirmed_facts\": [{{\"fact\": \"...\", \"blocks\": <bool>, \"why\": \"one short sentence\"}}]  (each fact about a system the repository doesn't own that the PR's OWN description or evidence says is unconfirmed, unverified, not measured or never read from a real payload, in a few words, copying a listed fact's text as given; `blocks` and `why` per UNCONFIRMED FACTS; empty when it says none),\n  \
          \"prior\": [{{\"index\": <int>, \"status\": \"fixed\" | \"answered\" | \"open\"}}]  (one per earlier unresolved comment listed, if any),\n  \
          \"labels\": [{{\"name\": \"label\", \"reason\": \"changed file(s) that need it\"}}]  (only if a PR-labels section is given),\n  \
-         \"tests_note\": \"which tests will run and where, or why none are needed\"  (only if a PR-labels section is given)\n}}\n\
+         \"tests_note\": \"which tests will run and where, or why none are needed\"  (only if a PR-labels section is given),\n  \
+         \"change_of_mind\": \"one sentence: the new information that changed your verdict\"  (only when your previous review of this same commit is listed and your verdict differs)\n}}\n\
          A `suggestion` becomes a one-click GitHub \"Commit suggestion\": it REPLACES lines `line`..`end_line` \
          (just `line` without end_line) at the PR head with exactly its text. Give one ONLY when the whole fix is \
          that in-place replacement: the full new text of every anchored line, nothing outside them. A fix that \
@@ -2171,6 +2196,20 @@ pub const CAPABILITIES_RULE: &str = "WHAT YOU CAN DO: you post the formal review
 
 /// Asks to test something by hand (on a device, a staging build, before a
 /// store release) can't be met in CI and belong to the people shipping it.
+/// What may hold the merge (`review_policy` enforces it on the output).
+pub const BLOCKING_RULE: &str =
+    "WHAT BLOCKS: only a high-severity defect that this PR's own change \
+     causes requests changes: severity \"blocking\" or \"high\". Everything else is a note \
+     posted with the approval, whatever its evidence: low and medium findings; style, naming, \
+     wording and log-level points (category \"style\" or \"logging\"); hardening that would be \
+     nice but isn't a defect (category \"hardening\"); follow-up work the PR description already \
+     tracks, or work outside this repository (set `tracked`: true); and anything the PR didn't \
+     cause, such as a check that fails on the base branch too or a problem in code the diff \
+     didn't touch (set `caused_by_diff`: false). RAISE EVERYTHING NOW: the first review of a \
+     commit must raise every blocking finding it can; read the whole change before deciding. \
+     A later review blocks only on lines changed since the previous review, or on something a \
+     person's reply made relevant (`prompted_by_reply`: true). ";
+
 pub const MANUAL_CHECK_RULE: &str = "MANUAL CHECKS: a suggestion to test something by hand (on a \
      device, a simulator, a staging build, before a store release) is a note, never a defect: \
      raise it at most once, with category \"manual-check\" and evidence \"unverified-concern\", \
@@ -2266,6 +2305,9 @@ mod tests {
                 evidence: None,
                 lookups: Vec::new(),
                 blocks: None,
+                caused_by_diff: None,
+                tracked: None,
+                prompted_by_reply: None,
             },
             Finding {
                 file: "a.rs".into(),
@@ -2279,6 +2321,9 @@ mod tests {
                 evidence: None,
                 lookups: Vec::new(),
                 blocks: None,
+                caused_by_diff: None,
+                tracked: None,
+                prompted_by_reply: None,
             },
         ];
         let mut changed = HashMap::new();
@@ -2309,6 +2354,9 @@ mod anchoring_tests {
             evidence: None,
             lookups: Vec::new(),
             blocks: None,
+            caused_by_diff: None,
+            tracked: None,
+            prompted_by_reply: None,
         }
     }
 
@@ -2419,6 +2467,9 @@ mod required_tests_tests {
             evidence: None,
             lookups: Vec::new(),
             blocks: None,
+            caused_by_diff: None,
+            tracked: None,
+            prompted_by_reply: None,
         }
     }
 
@@ -2527,6 +2578,9 @@ mod required_tests_tests {
             evidence: None,
             lookups: Vec::new(),
             blocks: None,
+            caused_by_diff: None,
+            tracked: None,
+            prompted_by_reply: None,
         }
     }
 
@@ -2857,7 +2911,7 @@ mod evidence_tests {
         let q = |blocks: Option<bool>| Finding {
             file: "src/sync.rs".into(),
             line: 3,
-            severity: "medium".into(),
+            severity: "high".into(),
             category: "question".into(),
             evidence: Some("question".into()),
             title: "Confirm `status` on refunds".into(),
