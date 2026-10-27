@@ -183,11 +183,15 @@ fn add_commit_statuses(summary: &mut CheckSummary, status: &serde_json::Value) {
 }
 
 /// What a quarantine check does to a failing verdict: only quarantined tests
-/// failed → green; a test report still being read → pending (keep waiting).
+/// failed makes it green; a test report still being read, or every failure
+/// fixed in a separate test-fix pull request, makes it pending (keep
+/// waiting).
 fn with_quarantine(ci: Ci, gate: &crate::passes::quarantine::Gate) -> Ci {
     use crate::passes::quarantine::Gate;
     match (ci, gate) {
         (Ci::Failing(_), Gate::OnlyQuarantined(_)) => Ci::Green,
+        // Blocked on a separate test fix: not failing, so keep waiting.
+        (Ci::Failing(names), Gate::Unrelated(_)) => Ci::Pending(names),
         (Ci::Failing(names), Gate::Waiting) => Ci::Pending(names),
         (ci, _) => ci,
     }
@@ -1490,6 +1494,11 @@ mod ci_tests {
         ));
         assert!(matches!(
             with_quarantine(Ci::Pending(vec![]), &only),
+            Ci::Pending(_)
+        ));
+        // Blocked on a separate test fix: wait, don't treat as failing.
+        assert!(matches!(
+            with_quarantine(failing(), &Gate::Unrelated(vec!["Blocked on #9".into()])),
             Ci::Pending(_)
         ));
     }

@@ -694,6 +694,7 @@ pub mod code_graph;
 mod completeness;
 pub mod dlq_cleanup;
 pub mod e2e;
+pub mod e2e_attribution;
 pub mod e2e_setup;
 pub mod email_events;
 pub mod feedback;
@@ -4787,6 +4788,9 @@ pub(crate) enum GaveUp {
     FixError,
     /// Every failing check fails on the base branch too.
     RedOnBase,
+    /// Every failing end-to-end test fails for a reason outside the change
+    /// and is fixed in a separate pull request.
+    UnrelatedTest,
 }
 
 impl GaveUp {
@@ -4798,6 +4802,7 @@ impl GaveUp {
             GaveUp::NoProgress => "no_progress",
             GaveUp::FixError => "fix_error",
             GaveUp::RedOnBase => "red_on_base",
+            GaveUp::UnrelatedTest => "unrelated_test",
         }
     }
 }
