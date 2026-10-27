@@ -205,9 +205,10 @@ pub async fn run(
          Research the codebase using the provided tools, then generate an implementation plan.\n\n\
          You have access to these repos:\n{repos_list}\n\n\
          All tools default to {owner}/{repo} when the `repo` parameter is omitted. \
-         To explore another repo, pass `repo` as `owner/name` (e.g. `\"{default_repo}\"`).{instructions_block}{team_block}{tests_block}",
+         To explore another repo, pass `repo` as `owner/name` (e.g. `\"{default_repo}\"`).{instructions_block}{team_block}{tests_block}{feature_block}",
         owner = msg.repo_owner,
         repo = msg.repo_name,
+        feature_block = super::feature::planner_block(intent),
     );
 
     let complexity_guidance = match triage.complexity.as_str() {
@@ -297,7 +298,7 @@ Otherwise, generate four openspec files:
 1. **proposal.md** — Problem statement, proposed approach, scope boundaries, risks
 2. **design.md** — Technical design: which files to modify/create (use full paths from repo root e.g. `src/services/payments.ts`), patterns to follow, data flow
 3. **tasks.md** — Step-by-step implementation checklist. Each task MUST follow this format:
-   `- [ ] <file_path>: <description>` (e.g. `- [ ] src/resolvers/join.ts: Add optional billingAddress param to OnlineJoin mutation`)
+   {task_format}
    Tasks should be atomic and ordered. Include the full file path from the repo root in every task. \
 Only include tasks that can be accomplished by writing code (creating files, editing files, updating config). \
 Do NOT include manual verification tasks, post-deploy checks, browser testing, or anything requiring human interaction.
@@ -335,6 +336,7 @@ After researching, output the four files using this exact format:
 
 Then the ```fix_location.json block described above."#,
         fix_guidance = super::fix_location::planner_guidance(intent),
+        task_format = super::feature::plan_files::PLANNER_FORMAT,
         intent = intent.as_str(),
         title = msg.title,
         summary = triage.summary,
@@ -717,6 +719,10 @@ Then the ```fix_location.json block described above."#,
             .iter()
             .map(super::plan_judge::PlanFinding::line),
     );
+    // The new-feature rules' plan sections (see feature): earlier attempts,
+    // reuse and the closest sibling.
+    let feature_gaps = super::feature::plan_gaps(&draft, intent, &ticket_history.prior);
+    back.extend(feature_gaps.iter().cloned());
     if !back.is_empty() {
         info!(
             ticket_id = %msg.ticket_id,
@@ -819,6 +825,19 @@ Then the ```fix_location.json block described above."#,
                 super::fix_location::mark_untraced(d, &gaps)
             }
         });
+    }
+    if !feature_gaps.is_empty() {
+        let left = super::feature::plan_gaps(&files, intent, &ticket_history.prior);
+        if !left.is_empty() {
+            warn!(ticket_id = %msg.ticket_id, gaps = ?left, "Feature plan sections still missing after one send-back");
+            super::add_progress_note(
+                state,
+                &msg.team_id,
+                run_id,
+                &format!("Plan check (new-feature rules): {}", left.join(" ")),
+            )
+            .await;
+        }
     }
     // What the plan's own check still finds after the send-back stays on
     // the decision: the ticket, the PR and the reviewer see it.

@@ -390,6 +390,10 @@ pub const CAPABILITIES: &[Capability] = &[
             "graph::rebuild",
             "infrastructure::refresh_infrastructure",
             "infrastructure::refresh_repo_infrastructure",
+            // The staging-only CMS write connection (see routes::staging_cms).
+            "staging_cms::get",
+            "staging_cms::put",
+            "staging_cms::delete",
         ],
     },
     Capability {

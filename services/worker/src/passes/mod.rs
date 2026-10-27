@@ -696,6 +696,7 @@ pub mod dlq_cleanup;
 pub mod e2e;
 pub mod e2e_setup;
 pub mod email_events;
+pub mod feature;
 pub mod feedback;
 pub mod fix_location;
 pub mod formatter;
@@ -1658,10 +1659,47 @@ async fn run_passes(
     // Compute context hash to detect ticket changes (body, images)
     let context_hash = plan::compute_ticket_context_hash(msg);
 
+    // Earlier attempts at the same feature in the run's repository (pull
+    // requests and branches for the ticket, the tickets it names, similar
+    // titles), read before planning; the run's branch always starts from
+    // the default branch, never from one of them (see feature::prior).
+    if !is_internal_ticket(&msg.ticket_id) && msg.continuation == 0 {
+        history.prior = feature::find_attempts(&github, msg, "", &history.prs).await;
+        if history
+            .prior
+            .attempts
+            .iter()
+            .any(|a| a.branch == msg.base_branch)
+        {
+            let default_branch = github
+                .get_default_branch(&msg.repo_owner, &msg.repo_name)
+                .await
+                .unwrap_or_default();
+            let base = feature::prior::fresh_base(
+                &msg.base_branch,
+                &default_branch,
+                &history.prior.attempts,
+            )
+            .to_string();
+            msg.base_branch = base;
+        }
+    }
+
     // The ticket's history (read before the repo was chosen) goes to the
     // planner.
-    if !history.is_empty() {
-        msg.ticket_history_note = Some(history.planner_note());
+    if !history.prior.is_empty() {
+        info!(
+            run_id,
+            attempts = history.prior.attempts.len(),
+            "Earlier attempts at this feature — the planner gets them"
+        );
+    }
+    if !history.is_empty() || !history.prior.is_empty() {
+        msg.ticket_history_note = Some(format!(
+            "{}{}",
+            history.planner_note(),
+            history.prior.note()
+        ));
         info!(
             run_id,
             earlier_runs = history.runs.len(),
@@ -1888,27 +1926,29 @@ async fn run_passes(
                 fix_location::route_for_plan(plan_result.fix.as_ref(), &plan_result.tasks),
                 fix_location::Route::Code | fix_location::Route::CodeAndOutside
             );
-        if codes && !v.missing_files.is_empty() {
+        if codes && (!v.missing_files.is_empty() || !v.file_problems.is_empty()) {
             info!(
                 run_id,
                 missing = ?v.missing_files,
-                "Plan names files that don't exist — planning again"
+                tags = ?v.file_problems,
+                "Plan names files that don't match the repository — planning again"
             );
             add_progress_note(
                 state,
                 &msg.team_id,
                 run_id,
                 &format!(
-                    "Plan named {} files that don't exist in {}/{} — planning again",
-                    v.missing_files.len(),
+                    "Plan named {} files that don't match {}/{} (missing, or new files that already exist) — planning again",
+                    v.missing_files.len() + v.file_problems.len(),
                     msg.repo_owner,
                     msg.repo_name
                 ),
             )
             .await;
             let mut corrected = msg.clone();
-            corrected.body.push_str(&missing_files_note(
+            corrected.body.push_str(&feature::plan_files::replan_note(
                 &v.missing_files,
+                &v.file_problems,
                 &format!("{}/{}", msg.repo_owner, msg.repo_name),
             ));
             plan_was_reused = false;
@@ -1939,17 +1979,26 @@ async fn run_passes(
             )
             .await;
             v.switch_repo = None;
-            if !v.missing_files.is_empty() {
-                warn!(run_id, missing = ?v.missing_files, "Plan still names files that don't exist — not implementing");
+            if !v.missing_files.is_empty() || !v.file_problems.is_empty() {
+                warn!(run_id, missing = ?v.missing_files, tags = ?v.file_problems, "Plan still names files that don't match the repository — not implementing");
                 let decision = fix_location::FixDecision {
                     fix_location: fix_location::FixLocation::Unknown,
                     cause: format!(
-                        "The plan for this ticket names files that don't exist in {}/{} ({}), \
+                        "The plan for this ticket names files that don't match {}/{} ({}), \
                          even after planning again, so I stopped before changing any code. \
                          The ticket may belong in another repository.",
                         msg.repo_owner,
                         msg.repo_name,
-                        v.missing_files.join(", ")
+                        v.missing_files
+                            .iter()
+                            .cloned()
+                            .chain(
+                                v.file_problems
+                                    .iter()
+                                    .map(feature::plan_files::Problem::line)
+                            )
+                            .collect::<Vec<_>>()
+                            .join(", ")
                     ),
                     ..Default::default()
                 };
@@ -3989,6 +4038,19 @@ async fn run_passes(
     })
     .await
     .map_err(|why| format!("The failing-test rules blocked the pull request: {why}"))?;
+    // New-feature rules: nothing carried over from an earlier attempt,
+    // every registration, reuse, staging content, the verification
+    // checklist and open product questions (see feature).
+    let feature_pr = feature::gate(
+        &work,
+        &mut evidence,
+        usage,
+        triage_result.intent,
+        &history.prior,
+        || has_time_for_remediation(start),
+    )
+    .await
+    .map_err(|why| format!("The new-feature rules blocked the pull request: {why}"))?;
 
     // --- Create Draft PR (triggers CI) ---
     check_cancelled(state, &msg.team_id, run_id).await?;
@@ -4031,6 +4093,7 @@ async fn run_passes(
             log: log_ev.as_ref(),
             links: &links,
             test_fix: test_pr.as_ref(),
+            feature: feature_pr.as_ref(),
         },
         &provider,
         usage,
@@ -4573,6 +4636,8 @@ async fn run_repo_pipeline(
             log: repo_ev.as_ref(),
             links: &links,
             test_fix: test_pr.as_ref(),
+            // Multi-repo runs: the new-feature rules check single-repo runs.
+            feature: None,
         },
         provider,
         usage,
@@ -7272,17 +7337,9 @@ struct PlanValidation {
     /// Files the plan changes that don't exist in the repo (and aren't
     /// created by a task), when enough are missing to warn about.
     missing_files: Vec<String>,
-}
-
-/// The note a re-plan gets when the plan named files that don't exist.
-fn missing_files_note(missing: &[String], repo: &str) -> String {
-    format!(
-        "\n\n---\n\n**Planning note (from CoderHelm):** the previous plan for this ticket named \
-         files that don't exist in {repo}: {}. Look the paths up with your tools and plan only \
-         with files that exist (or tasks that create them, marked as new). If the change doesn't \
-         belong in this repository, say so instead of planning code.",
-        missing.join(", ")
-    )
+    /// Tasks whose create/modify/delete/replace tag doesn't match the repo
+    /// (see `feature::plan_files`).
+    file_problems: Vec<feature::plan_files::Problem>,
 }
 
 /// A file one plan task changes, read from the `- [ ] <path>: <description>`
@@ -7297,40 +7354,15 @@ struct PlanTaskFile {
 /// Files the plan's task checklist actually changes, deduped, in order.
 /// Empty when the tasks don't follow the checklist format.
 fn plan_task_files(tasks: &str) -> Vec<PlanTaskFile> {
-    let mut out: Vec<PlanTaskFile> = Vec::new();
-    for line in tasks.lines() {
-        let l = line.trim_start();
-        let Some(rest) = l
-            .strip_prefix("- [ ]")
-            .or_else(|| l.strip_prefix("- [x]"))
-            .or_else(|| l.strip_prefix("- [X]"))
-        else {
-            continue;
-        };
-        let Some((head, desc)) = rest.split_once(':') else {
-            continue;
-        };
-        let path = head.trim().trim_matches(|c| c == '`' || c == '*').trim();
-        let looks_like_path = !path.is_empty()
-            && path.len() < 300
-            && !path.chars().any(char::is_whitespace)
-            && (path.contains('/') || path.contains('.'));
-        if !looks_like_path {
-            continue;
-        }
-        let path = path.trim_start_matches("./").to_string();
-        let d = desc.to_lowercase();
-        let is_new = d.contains("create")
-            || d.contains("new file")
-            || d.contains("(new)")
-            || d.trim_start().starts_with("new ")
-            || d.trim_start().starts_with("add new");
-        match out.iter_mut().find(|f| f.path == path) {
-            Some(f) => f.is_new |= is_new,
-            None => out.push(PlanTaskFile { path, is_new }),
-        }
-    }
-    out
+    // Each task's tag (`[create]`, `[modify]`, ...) says whether its file is
+    // new; an untagged task keeps the old reading of its words.
+    feature::plan_files::planned_files(tasks)
+        .into_iter()
+        .map(|f| PlanTaskFile {
+            is_new: f.is_new(),
+            path: f.path,
+        })
+        .collect()
 }
 
 /// Appended to the ticket for the one narrowed re-plan.
@@ -7363,6 +7395,8 @@ async fn validate_plan(
     let mut switch_repo: Option<String> = None;
     let mut switch_reason = String::new();
     let mut missing_files: Vec<String> = Vec::new();
+    // Whether each planned path looked up exists, for the task tags' check.
+    let mut exists: HashMap<String, bool> = HashMap::new();
 
     // Extract file paths from plan text (design + tasks)
     let plan_text = format!("{}\n{}", plan.design, plan.tasks);
@@ -7445,9 +7479,13 @@ async fn validate_plan(
         let sample: Vec<&String> = existing_expected.iter().take(10).copied().collect();
         let mut missing = Vec::new();
         for path in &sample {
-            match github.read_file(repo_owner, repo_name, path, "HEAD").await {
-                Ok(_) => {}
-                Err(_) => missing.push(path.to_string()),
+            let there = github
+                .read_file(repo_owner, repo_name, path, "HEAD")
+                .await
+                .is_ok();
+            exists.insert(path.to_string(), there);
+            if !there {
+                missing.push(path.to_string());
             }
         }
         files_here = missing.is_empty();
@@ -7751,6 +7789,29 @@ Respond with ONLY one line: either "CORRECT" or "SWITCH owner/name"."#,
         }
     }
 
+    // A task tagged [create] must not name a file that's already there; one
+    // tagged [modify], [delete] or [replace] must name one that is.
+    let planned = feature::plan_files::planned_files(&plan.tasks);
+    let (_, created) = feature::plan_files::paths_to_look_up(&planned, 10);
+    for path in created {
+        let there = github
+            .read_file(repo_owner, repo_name, &path, "HEAD")
+            .await
+            .is_ok();
+        exists.insert(path, there);
+    }
+    let file_problems = feature::plan_files::check(&planned, &exists);
+    if !file_problems.is_empty() {
+        warnings.push(format!(
+            "Plan task tags don't match the repository: {}",
+            file_problems
+                .iter()
+                .map(feature::plan_files::Problem::line)
+                .collect::<Vec<_>>()
+                .join("; ")
+        ));
+    }
+
     PlanValidation {
         warnings,
         blocked,
@@ -7759,6 +7820,7 @@ Respond with ONLY one line: either "CORRECT" or "SWITCH owner/name"."#,
         mentioned_file_count: changed_files.len(),
         over_cap,
         missing_files,
+        file_problems,
     }
 }
 

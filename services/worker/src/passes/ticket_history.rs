@@ -74,6 +74,9 @@ pub struct TicketHistory {
     /// Choices people made on CoderHelm's notices (see
     /// `ticket_state::Decision`), oldest first.
     pub decisions: Vec<ticket_state::Decision>,
+    /// Earlier attempts at the same feature in the run's repository, found
+    /// before planning (see `feature::prior`).
+    pub prior: crate::passes::feature::prior::Found,
 }
 
 /// An earlier pull request for the ticket, read from GitHub: what it said,
@@ -707,7 +710,7 @@ pub async fn add_earlier_prs(
 }
 
 /// One pull request read in full. None when it can't be read.
-async fn read_pr(
+pub(crate) async fn read_pr(
     github: &crate::clients::github::GitHubClient,
     repo: &str,
     number: u64,
@@ -950,6 +953,7 @@ mod tests {
             done_hash: String::new(),
             prs: vec![],
             decisions: vec![],
+            prior: Default::default(),
         }
     }
 
@@ -1028,6 +1032,7 @@ mod tests {
             done_hash: "h1".into(),
             prs: vec![],
             decisions: vec![],
+            prior: Default::default(),
         };
         match h.guard(Some(&override_plan("")), "h1") {
             Guard::Stop {
@@ -1138,6 +1143,7 @@ mod traced_guard_tests {
             done_hash: String::new(),
             prs: vec![],
             decisions: vec![],
+            prior: Default::default(),
         }
     }
 
