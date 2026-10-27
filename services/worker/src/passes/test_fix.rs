@@ -33,11 +33,13 @@
 
 use std::collections::HashMap;
 
+use common::e2e::bug_rules::{self, Nature, ViewsRead};
 use common::e2e::check_gate;
 use common::e2e::failure::{self, FailureExtract};
 use common::e2e::fix_guard;
 use common::e2e::fix_ticket::{self, TicketRead};
 use common::e2e::flake::{self, RunResult, Tally};
+use common::e2e::integrity;
 use common::e2e::model::ParsedTest;
 use common::e2e::parse::Links;
 use common::e2e::report_source::{Location, ReportSource};
@@ -106,6 +108,18 @@ pub struct Evidence {
     pub tried: Vec<Tried>,
     #[serde(default)]
     pub fetched_at: String,
+    /// The repeat run on the base branch before planning, retries off.
+    #[serde(default)]
+    pub base_repeat: Option<Repeat>,
+    /// Flaky, or failing every time (a bug), as measured.
+    #[serde(default)]
+    pub nature: Nature,
+    /// What the failing assertion compares, as the model read it.
+    #[serde(default)]
+    pub views: Option<ViewsRead>,
+    /// Spec files the failure is in, as found in the repository.
+    #[serde(default)]
+    pub spec_files: Vec<String>,
 }
 
 impl Evidence {
@@ -128,6 +142,22 @@ impl Evidence {
     /// The pass counts, one line per test.
     pub fn counts(&self) -> Vec<String> {
         self.tallies.iter().map(Tally::line).collect()
+    }
+
+    /// The test fails every time: a bug, not a flake.
+    pub fn is_bug(&self) -> bool {
+        self.nature == Nature::Deterministic
+    }
+
+    /// The failing assertion compares two views of the same data.
+    pub fn divergent(&self) -> bool {
+        self.views.as_ref().is_some_and(|v| v.divergent_views)
+    }
+
+    /// A wait is justified: a timing failure in a report, and the test
+    /// isn't failing every time (no wait fixes that).
+    pub fn waits_justified(&self) -> bool {
+        self.timing() && !self.is_bug()
     }
 
     /// The first failure's error, for the description.
@@ -181,6 +211,23 @@ pub fn facts_markdown(ev: &Evidence) -> String {
                 s.push_str(&format!("- {c}\n"));
             }
         }
+    }
+    if ev.nature != Nature::Unknown {
+        s.push_str(&format!(
+            "\n{}\n",
+            bug_rules::nature_line(ev.nature, None, ev.base_repeat)
+        ));
+    }
+    if ev.is_bug() {
+        s.push('\n');
+        s.push_str(bug_rules::BUG_RULES);
+        s.push('\n');
+    }
+    if let Some(v) = ev.views.as_ref().filter(|v| v.divergent_views) {
+        s.push_str(&format!(
+            "\nThe failing assertion compares two views that disagree ({}). Compare what each requests from the backend and look up the records involved, and write both in your notes as `View compared:` and `Record checked:` lines; the pull request won't open without them.\n",
+            v.views.join(" and ")
+        ));
     }
     let failed: Vec<&Tried> = ev.tried.iter().filter(|t| !t.ok).collect();
     if !failed.is_empty() {
@@ -1148,10 +1195,77 @@ pub async fn for_run(
     if let Some(ev) = load(state, &msg.team_id, run_id).await {
         return Some(ev);
     }
-    let ev = gather(state, msg, github, provider, usage).await?;
-    save(state, &msg.team_id, run_id, &ev).await;
+    let mut ev = gather(state, msg, github, provider, usage).await?;
     super::add_progress_note(state, &msg.team_id, run_id, &summary_note(&ev)).await;
+    classify(state, msg, github, provider, usage, run_id, &mut ev).await;
+    save(state, &msg.team_id, run_id, &ev).await;
     Some(ev)
+}
+
+/// Before planning: repeats the failing spec on the base branch (retries
+/// off) to tell a flaky test from one that fails every time, and asks the
+/// model whether the failing assertion compares two views. A test that
+/// fails every time switches the run to a bug investigation.
+async fn classify(
+    state: &WorkerState,
+    msg: &TicketMessage,
+    github: &GitHubClient,
+    provider: &ModelProvider,
+    usage: &mut TokenUsage,
+    run_id: &str,
+    ev: &mut Evidence,
+) {
+    let mut hints: Vec<String> = ev.failures.iter().map(|f| f.file.clone()).collect();
+    hints.extend(ev.read.tests.iter().filter(|t| t.contains('.')).cloned());
+    hints.dedup();
+    let repo = format!("{}/{}", msg.repo_owner, msg.repo_name);
+    let target = test_target(state, &msg.team_id, &repo, None).await;
+    let plan = super::test_bug::repeat_plan(
+        github,
+        &msg.repo_owner,
+        &msg.repo_name,
+        &msg.base_branch,
+        &hints,
+        target,
+    )
+    .await;
+    if let Some(p) = &plan {
+        ev.spec_files = p.specs.clone();
+        let runner = super::test_bug::Runner {
+            state,
+            github,
+            owner: &msg.repo_owner,
+            repo: &msg.repo_name,
+            team_id: &msg.team_id,
+            run_id,
+            provider,
+        };
+        let base = github
+            .get_ref(&msg.repo_owner, &msg.repo_name, &msg.base_branch)
+            .await
+            .unwrap_or_default();
+        match super::test_bug::measure(&runner, p, &base).await {
+            Ok(r) => ev.base_repeat = Some(r),
+            Err(e) => ev.tried.push(Tried {
+                what: format!("repeat run on {}", msg.base_branch),
+                ok: false,
+                outcome: e,
+            }),
+        }
+    }
+    ev.nature = bug_rules::nature(None, ev.base_repeat, &ev.tallies);
+    if ev.nature != Nature::Unknown {
+        let line = bug_rules::nature_line(ev.nature, None, ev.base_repeat);
+        super::test_bug::record_nature(state, &msg.team_id, run_id, ev.nature, &line).await;
+    }
+    if let (Some(f), Some(spec)) = (ev.failures.first(), ev.spec_files.first()) {
+        let text = github
+            .read_file(&msg.repo_owner, &msg.repo_name, spec, &msg.base_branch)
+            .await
+            .unwrap_or_default();
+        ev.views =
+            super::test_bug::read_views(state, provider, usage, &f.error, &f.snippet, &text).await;
+    }
 }
 
 // ── before the pull request opens ────────────────────────────────────────
@@ -1176,6 +1290,25 @@ pub struct PrFacts {
     /// Spec files the repeat run covers.
     #[serde(default)]
     pub specs: Vec<String>,
+    /// Flaky or failing every time, from the repeat runs on both branches.
+    #[serde(default)]
+    pub nature: Nature,
+    #[serde(default)]
+    pub nature_line: String,
+    /// `View compared:` and `Record checked:` lines from the coder's notes.
+    #[serde(default)]
+    pub views: Vec<String>,
+    #[serde(default)]
+    pub records: Vec<String>,
+    /// The unit test failing before the fix and passing after, said once.
+    #[serde(default)]
+    pub unit_proof: String,
+    /// Wait or timeout tweaks tried without, and what became of each.
+    #[serde(default)]
+    pub necessity: Vec<String>,
+    /// The evidence that the expectation itself was wrong, when cited.
+    #[serde(default)]
+    pub expectation_wrong: Option<String>,
 }
 
 /// (path, status, patch) of each file in a compare.
@@ -1435,37 +1568,86 @@ async fn test_target(
         .target_for(pr)
 }
 
+/// The facts the pull request is opened with.
+#[allow(clippy::too_many_arguments)]
+fn facts(
+    ev: &Evidence,
+    pk: PackageRun,
+    repeat: Option<Repeat>,
+    specs: Vec<String>,
+    head: String,
+    diff: &Value,
+    notes: &str,
+    unit_proof: String,
+    necessity: Vec<String>,
+    expectation_wrong: Option<String>,
+) -> PrFacts {
+    PrFacts {
+        evidence: ev.clone(),
+        package_lines: pk.lines,
+        repeat,
+        repeat_sha: head,
+        repeat_target: pk.target,
+        small: fix_ticket::is_small(&sizes(diff)),
+        specs,
+        nature: ev.nature,
+        nature_line: if ev.nature == Nature::Unknown {
+            String::new()
+        } else {
+            bug_rules::nature_line(ev.nature, repeat, ev.base_repeat)
+        },
+        views: bug_rules::note_lines(notes, "View compared:"),
+        records: bug_rules::note_lines(notes, "Record checked:"),
+        unit_proof,
+        necessity,
+        expectation_wrong,
+    }
+}
+
 /// The check before the pull request opens, for runs with failing-test
-/// evidence: refuses waits without a timing failure and helpers that walk
-/// every row, checks test packages where they live and repeats the spec.
-/// Each problem gets a fix round; one that survives blocks the pull request.
-/// `Ok(None)` for any other run.
+/// evidence. It refuses waits without a timing failure, helpers that walk
+/// every row, and loosened tests (one fix round, then the pull request is
+/// blocked); checks test packages where they live; repeats the failing spec
+/// with retries off on the branch and the base, and a test that fails every
+/// time is held to a bug fix: in the app, with a unit test that fails before
+/// and passes after, and for two views that disagree, both requests and
+/// the records compared. Once it passes, each wait or timeout tweak is
+/// tried without and dropped when the test passes anyway. `Ok(None)` for
+/// any other run.
 pub async fn gate(
     w: &super::proof::Work<'_>,
     evidence: &mut super::proof::RunEvidence,
     usage: &mut TokenUsage,
     has_time: impl Fn() -> bool,
 ) -> Result<Option<PrFacts>, String> {
-    let Some(ev) = load(w.state, &w.msg.team_id, w.run_id).await else {
+    let Some(mut ev) = load(w.state, &w.msg.team_id, w.run_id).await else {
         return Ok(None);
     };
+    let (owner, repo) = (&w.msg.repo_owner, &w.msg.repo_name);
+    let runner = super::test_bug::Runner {
+        state: w.state,
+        github: w.github,
+        owner,
+        repo,
+        team_id: &w.msg.team_id,
+        run_id: w.run_id,
+        provider: w.provider,
+    };
+    let target = test_target(w.state, &w.msg.team_id, &format!("{owner}/{repo}"), None).await;
     let mut rounds = 0;
+    let mut integrity_rounds = 0;
+    let mut base_tried = ev.base_repeat.is_some();
+    let mut unit_seen: Option<(String, Result<Option<String>, String>)> = None;
     loop {
         let diff = w
             .github
-            .get_diff(
-                &w.msg.repo_owner,
-                &w.msg.repo_name,
-                &w.msg.base_branch,
-                w.branch,
-            )
+            .get_diff(owner, repo, &w.msg.base_branch, w.branch)
             .await
             .map_err(|e| format!("the diff couldn't be read ({e})"))?;
         let files = patches(&diff);
-        let refused = fix_guard::refused(&files, ev.timing());
         let head = w
             .github
-            .get_ref(&w.msg.repo_owner, &w.msg.repo_name, w.branch)
+            .get_ref(owner, repo, w.branch)
             .await
             .unwrap_or_default();
         let changed: Vec<String> = files
@@ -1473,73 +1655,235 @@ pub async fn gate(
             .filter(|(_, s, _)| s != "removed")
             .map(|(p, _, _)| p.clone())
             .collect();
-        let pk = if refused.is_empty() {
+        let ids: Vec<String> = evidence.lookups.iter().map(|l| l.id.clone()).collect();
+        let wrong = bug_rules::expectation_wrong(&evidence.notes, &ids);
+        let weak = if wrong.is_some() {
+            Vec::new()
+        } else {
+            integrity::weakenings(&files)
+        };
+        let early = fix_guard::refused(&files, ev.waits_justified());
+        let clean = early.is_empty() && weak.is_empty();
+        let mut pk = if clean {
             check_packages(w, &ev, &changed, &head).await
         } else {
             PackageRun::default()
         };
-        let repeat_red = pk.repeat.is_some_and(|r| !r.green());
+
+        // The failing spec, repeated with retries off on this branch, and
+        // once on the base when that wasn't measured before planning.
+        let mut repeat = pk.repeat;
+        let mut specs = pk.specs.clone();
+        let mut hints = ev.spec_files.clone();
+        hints.extend(ev.failures.iter().map(|f| f.file.clone()));
+        hints.extend(changed.iter().filter(|c| fix_guard::is_spec(c)).cloned());
+        let plan = if clean {
+            super::test_bug::repeat_plan(w.github, owner, repo, w.branch, &hints, target.clone())
+                .await
+        } else {
+            None
+        };
+        if let (None, Some(p)) = (repeat, &plan) {
+            match super::test_bug::measure(&runner, p, &head).await {
+                Ok(r) => {
+                    repeat = Some(r);
+                    specs = p.specs.clone();
+                    pk.target = p.target.clone().unwrap_or_default();
+                    pk.lines.push(format!(
+                        "- repeat run of {}: {}",
+                        p.specs.join(", "),
+                        r.line()
+                    ));
+                }
+                Err(e) => pk.lines.push(format!("- repeat run: {e}")),
+            }
+        }
+        if let (false, Some(p)) = (base_tried, &plan) {
+            base_tried = true;
+            let base = w
+                .github
+                .get_ref(owner, repo, &w.msg.base_branch)
+                .await
+                .unwrap_or_default();
+            if let Ok(r) = super::test_bug::measure(&runner, p, &base).await {
+                ev.base_repeat = Some(r);
+            }
+        }
+        let nature = bug_rules::nature(repeat, ev.base_repeat, &ev.tallies);
+        if nature != ev.nature {
+            ev.nature = nature;
+            let line = bug_rules::nature_line(nature, repeat, ev.base_repeat);
+            super::test_bug::record_nature(w.state, &w.msg.team_id, w.run_id, nature, &line).await;
+            save(w.state, &w.msg.team_id, w.run_id, &ev).await;
+        }
+        let bug = ev.is_bug();
+        let refused = fix_guard::refused(&files, ev.waits_justified());
+        let bug_problems = if bug {
+            bug_rules::bug_fix_problems(&files, wrong.is_some())
+        } else {
+            Vec::new()
+        };
+
+        // A bug fix's unit test must fail before the fix and pass after.
+        let mut unit_line = String::new();
+        let mut unit_problem: Option<String> = None;
+        if bug
+            && bug_problems.is_empty()
+            && wrong.is_none()
+            && refused.is_empty()
+            && weak.is_empty()
+        {
+            let outcome = match &unit_seen {
+                Some((sha, o)) if *sha == head => o.clone(),
+                _ => {
+                    let (_, unit, _) = bug_rules::roles(&files);
+                    let o = match super::test_bug::unit_before_after(&runner, &w.msg.base_branch, w.branch, &unit).await {
+                        Ok((b, a)) => bug_rules::unit_proof(b, a),
+                        Err(why) => Ok(Some(format!(
+                            "The unit test couldn't be run before and after the fix here ({why}); CI runs it on the pull request."
+                        ))),
+                    };
+                    unit_seen = Some((head.clone(), o.clone()));
+                    o
+                }
+            };
+            match outcome {
+                Ok(Some(l)) => unit_line = l,
+                Ok(None) => {}
+                Err(p) => unit_problem = Some(p),
+            }
+        }
+        let views_missing = if ev.divergent() {
+            bug_rules::views_missing(&evidence.notes, &ids, !evidence.sources.is_empty())
+        } else {
+            Vec::new()
+        };
+        let repeat_red = repeat.is_some_and(|r| !r.green());
         info!(
             run_id = w.run_id,
             refused = refused.len(),
+            loosened = weak.len(),
             package_failures = pk.failed.len(),
-            repeat = ?pk.repeat,
+            nature = ?ev.nature,
+            bug_problems = bug_problems.len(),
+            views_missing = views_missing.len(),
+            repeat = ?repeat,
             rounds,
             "Failing-test rules checked before the pull request"
         );
-        if refused.is_empty() && pk.failed.is_empty() && !repeat_red {
+        let blocking: Vec<String> = refused
+            .iter()
+            .map(fix_guard::Finding::sentence)
+            .chain(weak.iter().map(integrity::Weakening::sentence))
+            .chain(
+                pk.failed
+                    .iter()
+                    .take(pk.failed.len().saturating_sub(1).max(1))
+                    .cloned(),
+            )
+            .chain(bug_problems.iter().cloned())
+            .chain(unit_problem.iter().cloned())
+            .chain(
+                views_missing
+                    .iter()
+                    .map(|m| format!("the notes don't record {m}")),
+            )
+            .collect();
+        if blocking.is_empty() && !repeat_red {
+            // Only the changes the evidence shows matter stay.
+            let necessity = match &plan {
+                Some(p) if repeat.is_some_and(|r| r.green()) => {
+                    super::test_bug::necessity(&runner, &w.msg.base_branch, w.branch, p).await
+                }
+                _ => Vec::new(),
+            };
             super::add_progress_note(
                 w.state,
                 &w.msg.team_id,
                 w.run_id,
                 &format!(
-                    "Failing-test rules passed{}",
-                    pk.repeat
+                    "Failing-test rules passed{}{}",
+                    repeat
                         .map(|r| format!("; repeat run {}", r.line()))
-                        .unwrap_or_default()
+                        .unwrap_or_default(),
+                    if necessity.is_empty() {
+                        String::new()
+                    } else {
+                        format!(
+                            "; {} wait or timeout change(s) checked for necessity",
+                            necessity.len()
+                        )
+                    }
                 ),
             )
             .await;
-            return Ok(Some(PrFacts {
-                evidence: ev.clone(),
-                package_lines: pk.lines,
-                repeat: pk.repeat,
-                repeat_sha: head,
-                repeat_target: pk.target,
-                small: fix_ticket::is_small(&sizes(&diff)),
-                specs: pk.specs,
-            }));
+            let head = w
+                .github
+                .get_ref(owner, repo, w.branch)
+                .await
+                .unwrap_or(head);
+            return Ok(Some(facts(
+                &ev,
+                pk,
+                repeat,
+                specs,
+                head,
+                &diff,
+                &evidence.notes,
+                unit_line,
+                necessity,
+                wrong,
+            )));
+        }
+        // Loosened tests get one fix round; then the pull request is blocked.
+        if !weak.is_empty() && integrity_rounds >= 1 {
+            return Err(format!(
+                "the change still loosens tests: {}",
+                blocking.join("; ")
+            ));
         }
         if rounds >= MAX_FIX_ROUNDS || !has_time() {
-            if !refused.is_empty() {
-                return Err(refused
-                    .iter()
-                    .map(fix_guard::Finding::sentence)
-                    .collect::<Vec<_>>()
-                    .join("; "));
-            }
-            if !pk.failed.is_empty() {
-                return Err(format!(
-                    "the test package's checks fail: {}",
-                    pk.failed[..pk.failed.len().saturating_sub(1).max(1)].join("; ")
-                ));
+            if !blocking.is_empty() {
+                return Err(blocking.join("; "));
             }
             // The repeat run still fails: the pull request opens as a draft
             // and stays one (the ready check needs a green repeat run).
-            return Ok(Some(PrFacts {
-                evidence: ev.clone(),
-                package_lines: pk.lines,
-                repeat: pk.repeat,
-                repeat_sha: head,
-                repeat_target: pk.target,
-                small: fix_ticket::is_small(&sizes(&diff)),
-                specs: pk.specs,
-            }));
+            return Ok(Some(facts(
+                &ev,
+                pk,
+                repeat,
+                specs,
+                head,
+                &diff,
+                &evidence.notes,
+                unit_line,
+                Vec::new(),
+                wrong,
+            )));
         }
         rounds += 1;
+        if !weak.is_empty() {
+            integrity_rounds += 1;
+        }
         let mut feedback = String::new();
+        if bug {
+            feedback.push_str(&format!(
+                "{}\n\n{}\n",
+                bug_rules::nature_line(ev.nature, repeat, ev.base_repeat),
+                bug_rules::BUG_RULES
+            ));
+        }
         if !refused.is_empty() {
-            feedback.push_str(&fix_guard::fix_feedback(&refused, ev.timing()));
+            feedback.push_str(&fix_guard::fix_feedback(&refused, ev.waits_justified()));
+        }
+        if !weak.is_empty() {
+            feedback.push_str(&integrity::fix_feedback(&weak));
+        }
+        for p in bug_problems.iter().chain(unit_problem.iter()) {
+            feedback.push_str(&format!("\n- {p}"));
+        }
+        for m in &views_missing {
+            feedback.push_str(&format!("\n- Record {m}."));
         }
         if !pk.failed.is_empty() {
             feedback.push_str("\nThe test package is checked on its own (its own install, type-check and lint) and fails:\n");
@@ -1549,8 +1893,8 @@ pub async fn gate(
         }
         if repeat_red {
             feedback.push_str(&format!(
-                "\nThe affected spec still fails when repeated ({}). Read the output, find why, and fix the cause:\n```\n{}\n```\n",
-                pk.repeat.map(|r| r.line()).unwrap_or_default(),
+                "\nThe affected spec still fails when repeated with retries off ({}). Read the output, find why, and fix the cause:\n```\n{}\n```\n",
+                repeat.map(|r| r.line()).unwrap_or_default(),
                 pk.repeat_output
             ));
         }
@@ -1562,6 +1906,8 @@ pub async fn gate(
         )
         .await;
         let _ = super::update_pass(w.state, &w.msg.team_id, w.run_id, "implement").await;
+        // A bug moved into the app needs files the branch doesn't touch yet.
+        let scoped = bug_problems.is_empty();
         match super::implement::run(
             w.state,
             w.msg,
@@ -1577,7 +1923,7 @@ pub async fn gate(
             w.file_cache,
             Some(w.run_id),
             None,
-            true,
+            scoped,
         )
         .await
         {
@@ -1641,6 +1987,33 @@ pub fn writer_block(f: &PrFacts) -> String {
             s.push_str(&format!("{l}\n"));
         }
     }
+    if !f.nature_line.is_empty() {
+        s.push_str(&format!(
+            "Flaky or not (say it in the description): {}\n",
+            f.nature_line
+        ));
+    }
+    if !f.views.is_empty() || !f.records.is_empty() {
+        s.push_str("The two views compared (put these in the Evidence section):\n");
+        for v in &f.views {
+            s.push_str(&format!("- View: {v}\n"));
+        }
+        for r in &f.records {
+            s.push_str(&format!("- Record: {r}\n"));
+        }
+    }
+    if !f.unit_proof.is_empty() {
+        s.push_str(&format!("Unit test: {}\n", f.unit_proof));
+    }
+    if let Some(w) = &f.expectation_wrong {
+        s.push_str(&format!("The expectation itself was wrong: {w}\n"));
+    }
+    if !f.necessity.is_empty() {
+        s.push_str("Changes checked for necessity (list what was dropped and why):\n");
+        for l in &f.necessity {
+            s.push_str(&format!("- {l}\n"));
+        }
+    }
     if f.small {
         s.push('\n');
         s.push_str(fix_ticket::SMALL_SHAPE);
@@ -1692,6 +2065,10 @@ pub struct GateRecord {
     /// The commit the last hold was explained on.
     #[serde(default)]
     pub noted: String,
+    /// The evidence showed the expectation itself was wrong, so changing
+    /// it isn't loosening the test.
+    #[serde(default)]
+    pub expectation_wrong: bool,
     #[serde(default)]
     pub polls: u32,
 }
@@ -1754,7 +2131,8 @@ pub async fn register_pr(
     tests.truncate(5);
     let g = GateRecord {
         run_id: run_id.to_string(),
-        timing: f.evidence.timing(),
+        timing: f.evidence.waits_justified(),
+        expectation_wrong: f.expectation_wrong.is_some(),
         tests,
         specs: f.specs.clone(),
         sandbox_repeat: f.repeat.filter(Repeat::green),
@@ -1762,6 +2140,24 @@ pub async fn register_pr(
         ..Default::default()
     };
     save_gate(state, &msg.team_id, &repo, pr, &g).await;
+}
+
+/// What the rules refuse in a pull request's diff as it is now: waits
+/// without a timing failure, helpers that walk every row, and loosened
+/// tests (unless the evidence showed the expectation was wrong).
+pub fn refusals(files: &[(String, String, String)], g: &GateRecord) -> Vec<String> {
+    let mut out: Vec<String> = fix_guard::refused(files, g.timing)
+        .iter()
+        .map(fix_guard::Finding::sentence)
+        .collect();
+    if !g.expectation_wrong {
+        out.extend(
+            integrity::weakenings(files)
+                .iter()
+                .map(integrity::Weakening::sentence),
+        );
+    }
+    out
 }
 
 /// What the ready check decided.
@@ -1789,18 +2185,14 @@ fn ci_repeat_result(runs: &[Value], sha: &str, since: &str) -> Option<bool> {
 
 /// The decision, from what was found. Pure, so every case is tested.
 pub fn decide(
-    refused: &[fix_guard::Finding],
+    refused: &[String],
     standing: &check_gate::Standing,
     repeat_ok: Option<bool>,
 ) -> Hold {
     if !refused.is_empty() {
         return Hold::Wait(format!(
             "it adds what the failing-test rules refuse: {}",
-            refused
-                .iter()
-                .map(fix_guard::Finding::sentence)
-                .collect::<Vec<_>>()
-                .join("; ")
+            refused.join("; ")
         ));
     }
     if !standing.ready() {
@@ -1866,7 +2258,7 @@ pub async fn ready_gate(
         .compare_files_with_patches(owner, repo, &base, &sha)
         .await
     {
-        Ok(files) => fix_guard::refused(&files, g.timing),
+        Ok(files) => refusals(&files, &g),
         Err(_) => Vec::new(),
     };
 
@@ -2057,7 +2449,7 @@ pub async fn after_feedback(
     else {
         return;
     };
-    let refused = fix_guard::refused(&files, g.timing);
+    let refused = refusals(&files, &g);
     if refused.is_empty() {
         return;
     }
@@ -2065,7 +2457,7 @@ pub async fn after_feedback(
         "This change now adds what the failing-test rules refuse, so it stays a draft:\n{}",
         refused
             .iter()
-            .map(|f| format!("- {}", f.sentence()))
+            .map(|f| format!("- {f}"))
             .collect::<Vec<_>>()
             .join("\n")
     );
@@ -2492,7 +2884,7 @@ mod tests {
             what: "waitForTimeout".into(),
         };
         assert!(
-            matches!(decide(&[finding], &green, Some(true)), Hold::Wait(w) if w.contains("refuse"))
+            matches!(decide(&[finding.sentence()], &green, Some(true)), Hold::Wait(w) if w.contains("refuse"))
         );
     }
 
@@ -2562,5 +2954,72 @@ mod tests {
             .map(|(n, _)| n)
             .collect();
         assert_eq!(names, vec!["index.html", "data/abc.md"]);
+    }
+
+    #[test]
+    fn a_test_that_fails_every_time_is_investigated_as_a_bug() {
+        let mut ev = ev_with(Some("Error: expect(locator).toHaveCount(12)\nReceived: 9"));
+        ev.base_repeat = Some(Repeat {
+            passed: 0,
+            failed: 20,
+            flaky: 0,
+        });
+        ev.nature = bug_rules::nature(None, ev.base_repeat, &[]);
+        assert!(ev.is_bug());
+        // A timing failure doesn't justify waits on a test that always fails.
+        ev.failures[0].status = "timedOut".into();
+        assert!(ev.timing() && !ev.waits_justified());
+        ev.views = Some(ViewsRead {
+            divergent_views: true,
+            views: vec!["filtered list".into(), "unfiltered list".into()],
+        });
+        let md = facts_markdown(&ev);
+        assert!(md.contains("Not flaky"));
+        assert!(md.contains("This is a bug, not a flaky test"));
+        assert!(md.contains("filtered list and unfiltered list"));
+        assert!(md.contains("View compared:"));
+    }
+
+    #[test]
+    fn loosened_tests_hold_the_pr_unless_the_expectation_was_wrong() {
+        let files = vec![(
+            "e2e/items.spec.ts".to_string(),
+            "modified".to_string(),
+            "-  await expect(rows).toHaveCount(12);\n+  await expect(rows).toHaveCount(9);"
+                .to_string(),
+        )];
+        let g = GateRecord::default();
+        let r = refusals(&files, &g);
+        assert_eq!(r.len(), 1);
+        assert!(r[0].contains("lowers an expected count"));
+        let ok = GateRecord {
+            expectation_wrong: true,
+            ..Default::default()
+        };
+        assert!(refusals(&files, &ok).is_empty());
+    }
+
+    #[test]
+    fn the_description_says_bug_or_flake_views_and_what_was_dropped() {
+        let f = PrFacts {
+            evidence: ev_with(Some("Error: counts differ")),
+            nature: Nature::Deterministic,
+            nature_line: bug_rules::nature_line(
+                Nature::Deterministic,
+                Some(Repeat { passed: 0, failed: 20, flaky: 0 }),
+                Some(Repeat { passed: 0, failed: 20, flaky: 0 }),
+            ),
+            views: vec!["filtered list: query listItems, variables {status}, page size 25".into()],
+            records: vec!["item 42: status CLOSED (L1)".into()],
+            unit_proof: "The unit test fails on the code before the fix and passes after it.".into(),
+            necessity: vec!["Dropped `e2e/a.spec.ts`: `await page.waitForLoadState('networkidle');`: the test still passed 20/20 passed without it.".into()],
+            ..Default::default()
+        };
+        let b = writer_block(&f);
+        assert!(b.contains("Not flaky: the test failed every run (0/20 passed on the base branch, 0/20 passed on this branch"));
+        assert!(b.contains("- View: filtered list"));
+        assert!(b.contains("- Record: item 42"));
+        assert!(b.contains("fails on the code before the fix"));
+        assert!(b.contains("Dropped `e2e/a.spec.ts`"));
     }
 }

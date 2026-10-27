@@ -20,7 +20,11 @@
 //! - [`check_gate`] keeps the pull request a draft until the checks that
 //!   test it are green on its head.
 //! - [`fix_ticket`] reads the ticket and shapes the description.
+//! - [`integrity`] refuses fixes that ask less of a test.
+//! - [`bug_rules`] tells a bug from a flake and holds a bug fix to the app,
+//!   with a unit test, keeping only the changes that matter.
 
+pub mod bug_rules;
 pub mod check_gate;
 pub mod ci_setup;
 pub mod coverage;
@@ -29,6 +33,7 @@ pub mod failure;
 pub mod fix_guard;
 pub mod fix_ticket;
 pub mod flake;
+pub mod integrity;
 pub mod messages;
 pub mod model;
 pub mod owners;

@@ -763,6 +763,7 @@ pub mod syntax_check;
 pub(crate) mod terraform;
 #[allow(dead_code)]
 mod test;
+pub mod test_bug;
 pub mod test_fix;
 pub mod ticket_history;
 pub mod tool_proposals;
@@ -6737,7 +6738,7 @@ fn is_typecheck_cmd(line: &str) -> bool {
 /// services and would false-RED in the sandbox — the exact reason tests were
 /// originally left out of the gate entirely). Callers scope it to the changed
 /// test files via [`build_scoped_test_cmd`] so we never run a full suite.
-async fn detect_ci_test(
+pub(crate) async fn detect_ci_test(
     github: &crate::clients::github::GitHubClient,
     owner: &str,
     repo: &str,
