@@ -101,6 +101,9 @@ pub mod review_stats;
 pub mod rewards;
 /// The one way a run is marked failed: always with a reason and a pass.
 pub mod run_fail;
+/// The questions a run asks when it needs a person's answer, and the
+/// answers people give in CoderHelm.
+pub mod run_questions;
 /// Run statuses; which ones a person set; closing and reopening a run.
 pub mod run_status;
 #[cfg(test)]

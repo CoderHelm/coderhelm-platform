@@ -1015,6 +1015,58 @@ pub struct Run {
     /// Notes it wrote while working, in order.
     #[schema(example = json!([{"message": "Tests pass; opening the pull request.", "timestamp": "2026-10-22T14:15:02Z"}]))]
     pub progress_notes: Option<Vec<RunNote>>,
+    /// What the run asked when it stopped as `needs_input`, one question
+    /// each. Answer them with `POST /api/runs/{run_id}/answer`. Empty when
+    /// it asked nothing it can take answers for here.
+    pub questions: Vec<RunQuestion>,
+    /// The comment with the questions on the ticket or issue, when known.
+    #[schema(example = "https://github.com/acme/web/issues/42#issuecomment-2210")]
+    pub questions_url: Option<String>,
+    /// Answers people gave to its questions in CoderHelm.
+    pub answers: Vec<RunAnswer>,
+    /// The reply with those answers on the ticket or issue, when known.
+    #[schema(example = json!(null))]
+    pub answers_url: Option<String>,
+    /// The run that picked the answers up and continued the work.
+    #[schema(example = json!(null))]
+    pub continued_run_id: Option<String>,
+}
+
+/// A question a run asked a person.
+#[derive(serde::Serialize, utoipa::ToSchema)]
+pub struct RunQuestion {
+    /// The question's id within the run (`q1`, `q2`, ...).
+    #[schema(example = "q1")]
+    pub id: String,
+    /// The question, in plain words.
+    #[schema(example = "Which environments get the new rate limit?")]
+    pub question: String,
+    /// Why it matters: what it blocks.
+    #[schema(example = "config/limits.yml holds one value per environment.")]
+    pub why: Option<String>,
+    /// Candidate answers the run found in the code or the data.
+    #[schema(example = json!(["Production only", "Every environment"]))]
+    pub suggestions: Vec<String>,
+}
+
+/// An answer given in CoderHelm to a run's question.
+#[derive(serde::Serialize, utoipa::ToSchema)]
+pub struct RunAnswer {
+    /// The question it answers.
+    #[schema(example = "q1")]
+    pub question_id: String,
+    /// That question, as asked.
+    #[schema(example = "Which environments get the new rate limit?")]
+    pub question: String,
+    /// The answer, as written.
+    #[schema(example = "Production only.")]
+    pub answer: String,
+    /// Who answered, as the ticket shows them.
+    #[schema(example = "Pat Doe")]
+    pub author: String,
+    /// When (RFC 3339).
+    #[schema(example = "2026-10-22T14:20:00Z")]
+    pub answered_at: String,
 }
 
 /// GET /api/runs/:run_id — get single run detail (from runs table).
@@ -1198,6 +1250,7 @@ fn run_of(item: &run_search::Item, run_id: &str, usage: RunUsage) -> Run {
                 .collect::<Vec<_>>()
         })
     };
+    let asked = run_asked(item);
     Run {
         run_id: run_id.to_string(),
         status: st("status"),
@@ -1274,7 +1327,49 @@ fn run_of(item: &run_search::Item, run_id: &str, usage: RunUsage) -> Run {
                 .map(|(_, _, message, timestamp)| RunNote { message, timestamp })
                 .collect()
         }),
+        questions: asked
+            .as_ref()
+            .map(|a| {
+                a.questions
+                    .iter()
+                    .map(|q| RunQuestion {
+                        id: q.id.clone(),
+                        question: q.question.clone(),
+                        why: (!q.why.is_empty()).then(|| q.why.clone()),
+                        suggestions: q.suggestions.clone(),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default(),
+        questions_url: asked.and_then(|a| a.comment_url),
+        answers: run_answers(item)
+            .into_iter()
+            .map(|a| RunAnswer {
+                question_id: a.question_id,
+                question: a.question,
+                answer: a.answer,
+                author: a.author,
+                answered_at: a.answered_at,
+            })
+            .collect(),
+        answers_url: st("answers_url"),
+        continued_run_id: st("continued_run_id"),
     }
+}
+
+/// What a run asked when it stopped (see `common::run_questions`).
+pub(crate) fn run_asked(item: &run_search::Item) -> Option<common::run_questions::Asked> {
+    item.get(common::run_questions::FIELD_QUESTIONS)
+        .and_then(|v| v.as_s().ok())
+        .and_then(|s| serde_json::from_str(s).ok())
+}
+
+/// The answers given on a run in CoderHelm.
+pub(crate) fn run_answers(item: &run_search::Item) -> Vec<common::run_questions::Answer> {
+    item.get(common::run_questions::FIELD_ANSWERS)
+        .and_then(|v| v.as_s().ok())
+        .and_then(|s| serde_json::from_str(s).ok())
+        .unwrap_or_default()
 }
 
 /// What a pass kept about what it did (e.g. which team agents reviewed a
@@ -1585,100 +1680,10 @@ pub async fn retry_run(
         return Err(StatusCode::BAD_REQUEST);
     }
 
-    let repo = item
-        .get("repo")
-        .and_then(|v| v.as_s().ok())
-        .map(|s| s.as_str())
-        .unwrap_or("");
-    let parts: Vec<&str> = repo.splitn(2, '/').collect();
-    if parts.len() != 2 {
-        return Err(StatusCode::INTERNAL_SERVER_ERROR);
-    }
-
-    // Prefer stored installation_id; fall back to reading from team META
-    let mut installation_id = item
-        .get("installation_id")
-        .and_then(|v| v.as_n().ok())
-        .and_then(|n| n.parse::<u64>().ok())
-        .unwrap_or(0);
-    if installation_id == 0 {
-        installation_id = get_team_installation_id(&state, &claims.team_id).await?;
-    }
-    let issue_number = item
-        .get("issue_number")
-        .and_then(|v| v.as_n().ok())
-        .and_then(|n| n.parse::<u64>().ok())
-        .unwrap_or(0);
-
-    let ticket_source = item
-        .get("ticket_source")
-        .and_then(|v| v.as_s().ok())
-        .map(|s| s.as_str())
-        .unwrap_or("github");
-    let source = match ticket_source {
-        "jira" => TicketSource::Jira,
-        "alert" => TicketSource::Alert,
-        _ => TicketSource::Github,
-    };
-
-    let ticket_id = item
-        .get("ticket_id")
-        .and_then(|v| v.as_s().ok())
-        .map(|s| s.as_str())
-        .unwrap_or("");
-
+    let ticket = retry_message(&state, &claims, item).await?;
     // Dashboard retry: force-delete existing lock so re-enqueue always succeeds
-    delete_ticket_lock(&state, &claims.team_id, ticket_id).await;
-
-    // For Jira tickets, clear repo_owner/repo_name so the worker's
-    // select_repo LLM can pick the correct repo fresh (the old run
-    // may have been routed to the wrong repo).
-    let (retry_owner, retry_name) = if matches!(source, TicketSource::Jira) {
-        (String::new(), String::new())
-    } else {
-        (parts[0].to_string(), parts[1].to_string())
-    };
-
-    // For Jira, restore the ticket body from the run record (GitHub re-fetches from API)
-    let body = if matches!(source, TicketSource::Jira | TicketSource::Alert) {
-        item.get("ticket_body")
-            .and_then(|v| v.as_s().ok())
-            .map(|s| s.to_string())
-            .unwrap_or_default()
-    } else {
-        String::new()
-    };
-
-    let message = WorkerMessage::Ticket(TicketMessage {
-        team_id: claims.team_id.clone(),
-        installation_id,
-        source,
-        ticket_id: ticket_id.to_string(),
-        title: item
-            .get("title")
-            .and_then(|v| v.as_s().ok())
-            .map(|s| s.as_str())
-            .unwrap_or("")
-            .to_string(),
-        body,
-        repo_owner: retry_owner,
-        repo_name: retry_name,
-        issue_number,
-        sender: claims
-            .github_login
-            .clone()
-            .unwrap_or_else(|| claims.email.clone()),
-        requester: common::requester::Requester::member(
-            claims.github_login.as_deref(),
-            &claims.email,
-        ),
-        image_attachments: item
-            .get("image_attachments")
-            .and_then(|v| v.as_s().ok())
-            .and_then(|s| serde_json::from_str(s).ok())
-            .unwrap_or_default(),
-        ..Default::default()
-    });
+    delete_ticket_lock(&state, &claims.team_id, &ticket.ticket_id).await;
+    let message = WorkerMessage::Ticket(ticket);
 
     let body = serde_json::to_string(&message).map_err(|e| {
         error!("Failed to serialize retry message: {e}");
@@ -1718,6 +1723,108 @@ pub async fn retry_run(
     Ok(Json(RunActionResult {
         status: "retrying".into(),
     }))
+}
+
+/// The message that starts a run's ticket again, from the run's record:
+/// the ticket, its repository (cleared for Jira, so the worker picks it
+/// fresh), its body for Jira and alerts (GitHub re-reads the issue) and the
+/// person asking.
+pub(crate) async fn retry_message(
+    state: &AppState,
+    claims: &Claims,
+    item: &std::collections::HashMap<String, AttributeValue>,
+) -> Result<TicketMessage, StatusCode> {
+    let repo = item
+        .get("repo")
+        .and_then(|v| v.as_s().ok())
+        .map(|s| s.as_str())
+        .unwrap_or("");
+    let parts: Vec<&str> = repo.splitn(2, '/').collect();
+    if parts.len() != 2 {
+        return Err(StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    // Prefer stored installation_id; fall back to reading from team META
+    let mut installation_id = item
+        .get("installation_id")
+        .and_then(|v| v.as_n().ok())
+        .and_then(|n| n.parse::<u64>().ok())
+        .unwrap_or(0);
+    if installation_id == 0 {
+        installation_id = get_team_installation_id(state, &claims.team_id).await?;
+    }
+    let issue_number = item
+        .get("issue_number")
+        .and_then(|v| v.as_n().ok())
+        .and_then(|n| n.parse::<u64>().ok())
+        .unwrap_or(0);
+
+    let ticket_source = item
+        .get("ticket_source")
+        .and_then(|v| v.as_s().ok())
+        .map(|s| s.as_str())
+        .unwrap_or("github");
+    let source = match ticket_source {
+        "jira" => TicketSource::Jira,
+        "alert" => TicketSource::Alert,
+        _ => TicketSource::Github,
+    };
+
+    let ticket_id = item
+        .get("ticket_id")
+        .and_then(|v| v.as_s().ok())
+        .map(|s| s.as_str())
+        .unwrap_or("");
+
+    // For Jira tickets, clear repo_owner/repo_name so the worker's
+    // select_repo LLM can pick the correct repo fresh (the old run
+    // may have been routed to the wrong repo).
+    let (retry_owner, retry_name) = if matches!(source, TicketSource::Jira) {
+        (String::new(), String::new())
+    } else {
+        (parts[0].to_string(), parts[1].to_string())
+    };
+
+    // For Jira, restore the ticket body from the run record (GitHub re-fetches from API)
+    let body = if matches!(source, TicketSource::Jira | TicketSource::Alert) {
+        item.get("ticket_body")
+            .and_then(|v| v.as_s().ok())
+            .map(|s| s.to_string())
+            .unwrap_or_default()
+    } else {
+        String::new()
+    };
+
+    Ok(TicketMessage {
+        team_id: claims.team_id.clone(),
+        installation_id,
+        source,
+        ticket_id: ticket_id.to_string(),
+        title: item
+            .get("title")
+            .and_then(|v| v.as_s().ok())
+            .map(|s| s.as_str())
+            .unwrap_or("")
+            .to_string(),
+        body,
+        repo_owner: retry_owner,
+        repo_name: retry_name,
+        issue_number,
+        sender: claims
+            .github_login
+            .clone()
+            .unwrap_or_else(|| claims.email.clone()),
+        requester: common::requester::Requester::member(
+            claims.github_login.as_deref(),
+            &claims.email,
+        ),
+        image_attachments: item
+            .get("image_attachments")
+            .and_then(|v| v.as_s().ok())
+            .and_then(|s| serde_json::from_str(s).ok())
+            .unwrap_or_default(),
+        ..Default::default()
+    })
 }
 
 /// Close a PR and delete a branch via the GitHub App token. Best-effort.
@@ -5409,6 +5516,65 @@ mod tests {
             std::collections::HashMap::from([("status".to_string(), A::S("running".into()))]);
         let run = serde_json::to_value(run_of(&bare, "01JB8Y", usage())).unwrap();
         assert_eq!(run["run_id"], "01JB8Y");
+        assert_eq!(run["questions"], json!([]));
+        assert_eq!(run["answers"], json!([]));
+    }
+
+    /// What a run stored when it stopped to ask comes back on `get_run`:
+    /// each question with its reason and candidate answers, the comment's
+    /// address, the answers given and the run that continued.
+    #[test]
+    fn get_run_returns_the_questions_the_run_stored() {
+        use aws_sdk_dynamodb::types::AttributeValue as A;
+        let asked = json!({
+            "questions": [
+                {"id": "q1", "question": "Which environments get the new limit?",
+                 "why": "Each environment has its own value.",
+                 "suggestions": ["Production only", "Every environment"]},
+                {"id": "q2", "question": "What is the new limit?"}
+            ],
+            "asked_at": "2026-10-27T10:00:00Z",
+            "comment_url": "https://example.atlassian.net/browse/ABC-1?focusedCommentId=10001"
+        });
+        let answers = json!([{
+            "question_id": "q1", "question": "Which environments get the new limit?",
+            "answer": "Production only", "author": "Pat Doe",
+            "answered_at": "2026-10-27T10:05:00Z"
+        }]);
+        let item = std::collections::HashMap::from([
+            ("status".to_string(), A::S("retried".into())),
+            ("questions".to_string(), A::S(asked.to_string())),
+            ("answers".to_string(), A::S(answers.to_string())),
+            ("continued_run_id".to_string(), A::S("01JB8Z".into())),
+        ]);
+        let run = serde_json::to_value(run_of(
+            &item,
+            "01JB8Y",
+            RunUsage {
+                tokens_in: 0,
+                tokens_out: 0,
+                cache_read: 0,
+                cache_write: 0,
+                cost_usd: 0.0,
+            },
+        ))
+        .unwrap();
+        assert_eq!(
+            run["questions"],
+            json!([
+                {"id": "q1", "question": "Which environments get the new limit?",
+                 "why": "Each environment has its own value.",
+                 "suggestions": ["Production only", "Every environment"]},
+                {"id": "q2", "question": "What is the new limit?", "why": null, "suggestions": []}
+            ])
+        );
+        assert_eq!(
+            run["questions_url"],
+            "https://example.atlassian.net/browse/ABC-1?focusedCommentId=10001"
+        );
+        assert_eq!(run["answers"][0]["answer"], "Production only");
+        assert_eq!(run["answers"][0]["author"], "Pat Doe");
+        assert_eq!(run["continued_run_id"], "01JB8Z");
     }
 
     #[test]

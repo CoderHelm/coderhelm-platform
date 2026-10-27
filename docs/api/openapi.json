@@ -1,6 +1,64 @@
 {
   "components": {
     "schemas": {
+      "AnswerRun": {
+        "description": "Answers to a run's questions.",
+        "properties": {
+          "answers": {
+            "description": "One entry per question answered. Questions left out (or blank) stay\nopen; at least one needs an answer.",
+            "items": {
+              "$ref": "#/components/schemas/GivenAnswer"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "answers"
+        ],
+        "type": "object"
+      },
+      "AnswerRunResult": {
+        "description": "What answering did.",
+        "properties": {
+          "comment_url": {
+            "description": "The reply on the ticket or issue, when its address is known.",
+            "examples": [
+              "https://github.com/acme/web/issues/42#issuecomment-2211"
+            ],
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "posted": {
+            "description": "Whether the answers were posted on the ticket or issue.",
+            "examples": [
+              true
+            ],
+            "type": "boolean"
+          },
+          "run_id": {
+            "description": "The id of the run that continues the work. It shows in\n`GET /api/runs/{run_id}` once it starts, within seconds.",
+            "examples": [
+              "01JB8Z3N5Q7S9V1X3Z5B7D9F1H"
+            ],
+            "type": "string"
+          },
+          "status": {
+            "description": "`continuing`: the ticket is queued again with the answers.",
+            "examples": [
+              "continuing"
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "status",
+          "run_id",
+          "posted"
+        ],
+        "type": "object"
+      },
       "Backfill": {
         "description": "Whether the records from before rollups existed are all counted yet.",
         "properties": {
@@ -774,6 +832,30 @@
           "event",
           "source",
           "failed"
+        ],
+        "type": "object"
+      },
+      "GivenAnswer": {
+        "description": "The answer to one question.",
+        "properties": {
+          "answer": {
+            "description": "The answer, in plain words. At most 4000 characters.",
+            "examples": [
+              "Production only. Staging keeps the old limit."
+            ],
+            "type": "string"
+          },
+          "question_id": {
+            "description": "The question's `id` from the run's `questions`.",
+            "examples": [
+              "q1"
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "question_id",
+          "answer"
         ],
         "type": "object"
       },
@@ -2578,6 +2660,23 @@
       "Run": {
         "description": "One run, in full.",
         "properties": {
+          "answers": {
+            "description": "Answers people gave to its questions in CoderHelm.",
+            "items": {
+              "$ref": "#/components/schemas/RunAnswer"
+            },
+            "type": "array"
+          },
+          "answers_url": {
+            "description": "The reply with those answers on the ticket or issue, when known.",
+            "examples": [
+              null
+            ],
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "applied_standards": {
             "description": "The team standards the run was given in full (\"always apply\").",
             "examples": [
@@ -2665,6 +2764,16 @@
           },
           "closed_from": {
             "description": "The status it had when it was closed.",
+            "examples": [
+              null
+            ],
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "continued_run_id": {
+            "description": "The run that picked the answers up and continued the work.",
             "examples": [
               null
             ],
@@ -2900,6 +3009,23 @@
               "null"
             ]
           },
+          "questions": {
+            "description": "What the run asked when it stopped as `needs_input`, one question\neach. Answer them with `POST /api/runs/{run_id}/answer`. Empty when\nit asked nothing it can take answers for here.",
+            "items": {
+              "$ref": "#/components/schemas/RunQuestion"
+            },
+            "type": "array"
+          },
+          "questions_url": {
+            "description": "The comment with the questions on the ticket or issue, when known.",
+            "examples": [
+              "https://github.com/acme/web/issues/42#issuecomment-2210"
+            ],
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "repo": {
             "description": "The repository, `owner/name`.",
             "examples": [
@@ -3004,7 +3130,9 @@
           "cache_write_tokens",
           "cost_usd",
           "applied_standards",
-          "sign_in_prompts"
+          "sign_in_prompts",
+          "questions",
+          "answers"
         ],
         "type": "object"
       },
@@ -3021,6 +3149,54 @@
         },
         "required": [
           "status"
+        ],
+        "type": "object"
+      },
+      "RunAnswer": {
+        "description": "An answer given in CoderHelm to a run's question.",
+        "properties": {
+          "answer": {
+            "description": "The answer, as written.",
+            "examples": [
+              "Production only."
+            ],
+            "type": "string"
+          },
+          "answered_at": {
+            "description": "When (RFC 3339).",
+            "examples": [
+              "2026-10-22T14:20:00Z"
+            ],
+            "type": "string"
+          },
+          "author": {
+            "description": "Who answered, as the ticket shows them.",
+            "examples": [
+              "Pat Doe"
+            ],
+            "type": "string"
+          },
+          "question": {
+            "description": "That question, as asked.",
+            "examples": [
+              "Which environments get the new rate limit?"
+            ],
+            "type": "string"
+          },
+          "question_id": {
+            "description": "The question it answers.",
+            "examples": [
+              "q1"
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "question_id",
+          "question",
+          "answer",
+          "author",
+          "answered_at"
         ],
         "type": "object"
       },
@@ -3074,6 +3250,54 @@
             ]
           }
         },
+        "type": "object"
+      },
+      "RunQuestion": {
+        "description": "A question a run asked a person.",
+        "properties": {
+          "id": {
+            "description": "The question's id within the run (`q1`, `q2`, ...).",
+            "examples": [
+              "q1"
+            ],
+            "type": "string"
+          },
+          "question": {
+            "description": "The question, in plain words.",
+            "examples": [
+              "Which environments get the new rate limit?"
+            ],
+            "type": "string"
+          },
+          "suggestions": {
+            "description": "Candidate answers the run found in the code or the data.",
+            "examples": [
+              [
+                "Production only",
+                "Every environment"
+              ]
+            ],
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "why": {
+            "description": "Why it matters: what it blocks.",
+            "examples": [
+              "config/limits.yml holds one value per environment."
+            ],
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "id",
+          "question",
+          "suggestions"
+        ],
         "type": "object"
       },
       "RunSummary": {
@@ -5799,6 +6023,173 @@
           }
         ],
         "summary": "Get a run",
+        "tags": [
+          "Runs"
+        ]
+      }
+    },
+    "/api/runs/{run_id}/answer": {
+      "post": {
+        "description": "Answers the questions a `needs_input` run asked (its `questions`) and continues the work: the answers are posted on the ticket or issue as a reply from you, kept on the run, and the ticket starts again as a new run whose plan reads them word for word. The old run becomes `retried` with `continued_run_id` set. A run that isn't `needs_input` any more (answered, retried or closed meanwhile) is refused with `409`.",
+        "operationId": "answerRun",
+        "parameters": [
+          {
+            "description": "The run's id.",
+            "example": "01JB8X6F4M2C9QZ3T7V5W1K0HA",
+            "in": "path",
+            "name": "run_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AnswerRun"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AnswerRunResult"
+                }
+              }
+            },
+            "description": "The work continues with the answers.",
+            "headers": {
+              "RateLimit-Limit": {
+                "description": "Requests this key may make in a minute.",
+                "schema": {
+                  "type": "integer"
+                }
+              },
+              "RateLimit-Remaining": {
+                "description": "Requests left in the current minute.",
+                "schema": {
+                  "type": "integer"
+                }
+              },
+              "RateLimit-Reset": {
+                "description": "Seconds until the current minute ends and the count starts over.",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            }
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "No answer written, an answer too long, or a question the run didn't ask."
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "The key is missing, malformed, revoked or expired, or the person who made it left the team."
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "The key lacks the scope this endpoint needs (`missing_scope`)."
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "No run with this id in the team."
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "The run isn't waiting for an answer, or asked nothing to answer here."
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "Over the key's rate limit (`rate_limited`), or, for endpoints that start work, over the team's monthly token limit (`token_limit_reached`).",
+            "headers": {
+              "RateLimit-Limit": {
+                "description": "Requests this key may make in a minute.",
+                "schema": {
+                  "type": "integer"
+                }
+              },
+              "RateLimit-Remaining": {
+                "description": "Requests left in the current minute.",
+                "schema": {
+                  "type": "integer"
+                }
+              },
+              "RateLimit-Reset": {
+                "description": "Seconds until the current minute ends and the count starts over.",
+                "schema": {
+                  "type": "integer"
+                }
+              },
+              "Retry-After": {
+                "description": "With `rate_limited`: seconds to wait before trying again.",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            }
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "Something failed on CoderHelm's side. Safe to retry reads."
+          }
+        },
+        "security": [
+          {
+            "api_key": [
+              "runs"
+            ]
+          }
+        ],
+        "summary": "Answer a run's questions",
         "tags": [
           "Runs"
         ]

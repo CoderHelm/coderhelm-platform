@@ -278,7 +278,17 @@ set tasks.md to EXACTLY `NO_CHANGES_NEEDED: <reason>`.
 **Ambiguous values:** If the issue asks to change a value but does NOT include the new value:
 1. Check if the issue body contains URLs. If so, call the appropriate MCP tool to fetch them.
 2. Do NOT proactively search external tools unless a URL is present.
-3. If you cannot determine the value, set tasks.md to `CLARIFICATION_NEEDED: <what is missing>`.
+3. If you cannot determine the value, set tasks.md to `CLARIFICATION_NEEDED:` followed by one
+   block per question a person must answer (a short plain question; why it blocks the change;
+   candidate answers you found in the code or the data, separated by `|`, when you have any):
+   ```
+   CLARIFICATION_NEEDED:
+   - question: Which environments get the new limit?
+     why: config/limits.yml holds one value per environment.
+     options: production only | every environment
+   ```
+   Ask only what blocks the change, at most a few questions, and never a question the ticket or
+   the answers below already settle.
 
 Otherwise, generate four openspec files:
 
@@ -329,11 +339,16 @@ Then the ```fix_location.json block described above."#,
         body = msg.body,
         complexity_guidance = complexity_guidance,
     );
-    // The ticket's history comes right after the issue's own text.
+    // The ticket's history comes right after the issue's own text, then
+    // the answers people gave to an earlier run's questions, word for word.
     let prompt = match msg.ticket_history_note.as_deref() {
         Some(h) if !h.trim().is_empty() => format!("{prompt}{h}"),
         _ => prompt,
     };
+    let prompt = format!(
+        "{prompt}{}",
+        common::run_questions::answers_note(&msg.answers)
+    );
 
     let mut tools = read_only_tools();
 
@@ -670,7 +685,11 @@ Then the ```fix_location.json block described above."#,
     let judge_prompt = |files: &PlanResult| {
         super::plan_judge::prompt(
             &msg.title,
-            &msg.body,
+            &format!(
+                "{}{}",
+                msg.body,
+                common::run_questions::answers_note(&msg.answers)
+            ),
             history_note,
             &live.as_ref().map(|l| l.connected()).unwrap_or_default(),
             &live
@@ -730,6 +749,40 @@ Then the ```fix_location.json block described above."#,
     }
 
     let mut files = parse_openspec_files(&response, intent);
+    // A plan that asks again what people answered in CoderHelm goes back
+    // once with the answers; what it still asks after that is filtered when
+    // the run stops (see `clarification_questions`).
+    let repeats = common::run_questions::repeated(&files.tasks, &msg.answers);
+    if !repeats.is_empty() {
+        info!(
+            ticket_id = %msg.ticket_id,
+            repeated = repeats.len(),
+            "Plan asks an answered question again — sending it back"
+        );
+        messages.push((
+            "user".to_string(),
+            vec![serde_json::json!({
+                "type": "text",
+                "text": common::run_questions::send_back(&repeats, &msg.answers),
+            })],
+        ));
+        response = provider::converse(
+            state,
+            provider,
+            common::agent_policy::Agent::Planner,
+            model_id,
+            &full_system,
+            &mut messages,
+            &tools,
+            &executor,
+            usage,
+            plan_opts,
+            None,
+            None,
+        )
+        .await?;
+        files = parse_openspec_files(&response, intent);
+    }
     let gaps = super::fix_location::gaps(files.fix.as_ref(), can_look_up, lookups(), &read());
     if !gaps.is_empty() && msg.person_direction.is_some() {
         // A person told CoderHelm where the fix is and to go ahead: their

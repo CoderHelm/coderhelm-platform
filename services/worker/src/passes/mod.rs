@@ -791,10 +791,17 @@ pub async fn orchestrate_ticket(
             .as_deref()
             .map(|s| !s.is_empty())
             .unwrap_or(false);
+    // A fresh run takes the id its sender named, when it is a ULID (an
+    // answer on the dashboard links the asking run to this one).
     let run_id = msg
         .continuation_run_id
         .clone()
         .filter(|s| !s.is_empty())
+        .or_else(|| {
+            msg.new_run_id
+                .clone()
+                .filter(|s| ulid::Ulid::from_string(s).is_ok())
+        })
         .unwrap_or_else(|| ulid::Ulid::new().to_string());
     let mut usage = TokenUsage::default();
     let start = std::time::Instant::now();
@@ -1173,6 +1180,12 @@ async fn run_passes(
     // the planner is shown it and held to it below.
     let mut history = ticket_history::load(state, &msg.team_id, &msg.ticket_id, run_id).await;
     ticket_history::add_pr_comments(&mut history, &github).await;
+    // Answers people gave in CoderHelm on any earlier stop of this ticket
+    // count for this run too: triage and the planner read them, and they
+    // are not asked again.
+    for r in &history.runs {
+        common::run_questions::merge(&mut msg.answers, &r.answers);
+    }
     // Every pull request for the ticket in the team's repositories (this
     // repo first; CoderHelm's or anyone's), read in full with how it ended:
     // an earlier attempt often holds the design, and its close event says
@@ -1645,7 +1658,11 @@ async fn run_passes(
     let plan_key = plan::plan_cache_key(
         &context_hash,
         &memory_context,
-        &history.digest(),
+        &format!(
+            "{}{}",
+            history.digest(),
+            common::run_questions::digest(&msg.answers)
+        ),
         &msg.team_instructions,
         &review_key,
     );
@@ -1803,7 +1820,11 @@ async fn run_passes(
                     msg.plan_cache_key = Some(plan::plan_cache_key(
                         &context_hash,
                         &format!("{memory_context}{ctx}"),
-                        &history.digest(),
+                        &format!(
+                            "{}{}",
+                            history.digest(),
+                            common::run_questions::digest(&msg.answers)
+                        ),
                         &msg.team_instructions,
                         &review_key,
                     ));
@@ -2199,37 +2220,34 @@ async fn run_passes(
             detail, "Plan needs clarification from the ticket author"
         );
 
+        // The questions, one by one: on the ticket, and kept on the run so
+        // its page lists them and takes answers. Questions people answered
+        // already in CoderHelm are not asked again.
+        let questions = clarification_questions(detail, &msg.answers);
+        let list_md = common::run_questions::markdown(&questions);
+        let list_plain = common::run_questions::plain(&questions);
         let raw_github = format!(
-            "❓ **Clarification needed**\n\n{detail}\n\nPlease update the issue with the missing details and re-trigger the run."
+            "❓ **Clarification needed**\n\n{list_md}\n\nReply here, or answer on the run page in \
+             CoderHelm, and I'll continue."
         );
         let github_comment =
             formatter::format_with_voice(state, &voice, &raw_github, &provider, usage).await;
         let raw_jira = format!(
-            "{detail}\n\nPlease update the issue with the missing details and comment to re-trigger."
+            "{list_plain}\n\nReply here, or answer on the run page in CoderHelm, and I'll continue."
         );
         let jira_comment =
             formatter::format_with_voice(state, &voice, &raw_jira, &provider, usage).await;
-
-        if matches!(msg.source, TicketSource::Github) && msg.issue_number > 0 {
-            let _ = github
-                .create_issue_comment(
-                    &msg.repo_owner,
-                    &msg.repo_name,
-                    msg.issue_number,
-                    &github_comment,
-                )
-                .await;
-        } else if matches!(msg.source, TicketSource::Jira) && !msg.ticket_id.is_empty() {
-            let _ = post_jira_comment(
-                state,
-                &msg.team_id,
-                &msg.ticket_id,
-                &jira_comment,
-                "clarification",
-                "Clarification needed",
-            )
-            .await;
-        }
+        ask_on_ticket(
+            state,
+            msg,
+            run_id,
+            &github,
+            &questions,
+            &github_comment,
+            &jira_comment,
+            "Clarification needed",
+        )
+        .await;
 
         // Mark the run as needs_input so a comment can re-trigger it
         mark_run_needs_input(state, msg, run_id, usage, start, &used_mcp_ids).await;
@@ -3555,32 +3573,24 @@ async fn run_passes(
             let clarification =
                 formatter::format_with_voice(state, &voice, raw_clarification, &provider, usage)
                     .await;
-            if matches!(msg.source, TicketSource::Github) && msg.issue_number > 0 {
-                if let Err(e) = github
-                    .create_issue_comment(
-                        &msg.repo_owner,
-                        &msg.repo_name,
-                        msg.issue_number,
-                        &clarification,
-                    )
-                    .await
-                {
-                    warn!(run_id, error = %e, "Failed to comment on issue about empty implementation");
-                }
-            } else if matches!(msg.source, TicketSource::Jira) && !msg.ticket_id.is_empty() {
-                if let Err(e) = post_jira_comment(
-                    state,
-                    &msg.team_id,
-                    &msg.ticket_id,
-                    &clarification,
-                    "clarification",
-                    "More detail needed",
-                )
-                .await
-                {
-                    warn!(run_id, error = %e, "Failed to comment on Jira ticket about empty implementation");
-                }
-            }
+            // With no other repo to point at, the two things a person can
+            // add are asked one by one, so the run page takes the answers.
+            let questions = if elsewhere_note.is_some() {
+                Vec::new()
+            } else {
+                empty_change_questions()
+            };
+            ask_on_ticket(
+                state,
+                msg,
+                run_id,
+                &github,
+                &questions,
+                &clarification,
+                &clarification,
+                "More detail needed",
+            )
+            .await;
 
             let duration = start.elapsed().as_secs();
             let cost = usage.estimated_cost();
@@ -4827,31 +4837,50 @@ async fn finish_without_code(
     );
     add_progress_note(state, &msg.team_id, run_id, jira_title).await;
 
-    if matches!(msg.source, TicketSource::Github) && msg.issue_number > 0 {
-        if let Err(e) = github
-            .create_issue_comment(
-                &msg.repo_owner,
-                &msg.repo_name,
-                msg.issue_number,
-                &format!("{heading}{report}"),
+    let github_body = format!("{heading}{report}");
+    let jira_body = fix_location::jira_text(&report);
+    if outside {
+        if matches!(msg.source, TicketSource::Github) && msg.issue_number > 0 {
+            if let Err(e) = github
+                .create_issue_comment(
+                    &msg.repo_owner,
+                    &msg.repo_name,
+                    msg.issue_number,
+                    &github_body,
+                )
+                .await
+            {
+                warn!(run_id, error = %e, "Could not post the outside-the-code report on the issue");
+            }
+        } else if matches!(msg.source, TicketSource::Jira) && !msg.ticket_id.is_empty() {
+            if let Err(e) = post_jira_comment(
+                state,
+                &msg.team_id,
+                &msg.ticket_id,
+                &jira_body,
+                jira_type,
+                jira_title,
             )
             .await
-        {
-            warn!(run_id, error = %e, "Could not post the outside-the-code report on the issue");
+            {
+                warn!(run_id, error = %e, "Could not post the outside-the-code report on the ticket");
+            }
         }
-    } else if matches!(msg.source, TicketSource::Jira) && !msg.ticket_id.is_empty() {
-        if let Err(e) = post_jira_comment(
+    } else {
+        // Not knowing where the fix belongs is a question for a person: the
+        // run page lists the decision's questions and takes the answers.
+        let questions = unknown_fix_questions(decision, &msg.answers);
+        ask_on_ticket(
             state,
-            &msg.team_id,
-            &msg.ticket_id,
-            &fix_location::jira_text(&report),
-            jira_type,
+            msg,
+            run_id,
+            github,
+            &questions,
+            &github_body,
+            &jira_body,
             jira_title,
         )
-        .await
-        {
-            warn!(run_id, error = %e, "Could not post the outside-the-code report on the ticket");
-        }
+        .await;
     }
 
     if !outside {
@@ -5827,7 +5856,22 @@ async fn post_jira_comment(
     comment_type: &str,
     title: &str,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let url = state
+    post_jira_comment_link(state, team_id, issue_key, comment, comment_type, title)
+        .await
+        .map(|_| ())
+}
+
+/// Posts a comment on a Jira ticket through the team's Jira app and returns
+/// the comment's address, when the app said its id and the site is known.
+async fn post_jira_comment_link(
+    state: &WorkerState,
+    team_id: &str,
+    issue_key: &str,
+    comment: &str,
+    comment_type: &str,
+    title: &str,
+) -> Result<Option<String>, Box<dyn std::error::Error + Send + Sync>> {
+    let config = state
         .dynamo
         .get_item()
         .table_name(&state.config.jira_config_table_name)
@@ -5841,14 +5885,17 @@ async fn post_jira_comment(
         )
         .send()
         .await?
-        .item
-        .and_then(|item| {
-            item.get("add_comment_url")
-                .and_then(|v| v.as_s().ok())
-                .filter(|s| !s.is_empty())
-                .cloned()
-        })
-        .ok_or("No Jira add_comment_url configured")?;
+        .item;
+    let field = |k: &str| {
+        config
+            .as_ref()
+            .and_then(|item| item.get(k))
+            .and_then(|v| v.as_s().ok())
+            .filter(|s| !s.is_empty())
+            .cloned()
+    };
+    let url = field("add_comment_url").ok_or("No Jira add_comment_url configured")?;
+    let site = field("site_url");
 
     let payload = serde_json::json!({
         "issueKey": issue_key,
@@ -5870,8 +5917,202 @@ async fn post_jira_comment(
         let body = resp.text().await.unwrap_or_default();
         return Err(format!("Jira comment failed ({status}): {body}").into());
     }
+    let id = resp
+        .json::<serde_json::Value>()
+        .await
+        .ok()
+        .and_then(|v| match &v["id"] {
+            serde_json::Value::String(s) => Some(s.clone()),
+            serde_json::Value::Number(n) => Some(n.to_string()),
+            _ => None,
+        });
+    Ok(jira_comment_link(site.as_deref(), issue_key, id.as_deref()))
+}
 
-    Ok(())
+/// The address of a comment on a Jira ticket.
+fn jira_comment_link(site: Option<&str>, issue_key: &str, id: Option<&str>) -> Option<String> {
+    let site = site?.trim().trim_end_matches('/');
+    if site.is_empty() || issue_key.is_empty() {
+        return None;
+    }
+    Some(match id.filter(|i| !i.is_empty()) {
+        Some(id) => format!("{site}/browse/{issue_key}?focusedCommentId={id}"),
+        None => format!("{site}/browse/{issue_key}"),
+    })
+}
+
+/// Posts a run's questions on the ticket it came from (`github_body` on a
+/// GitHub issue, `jira_body` under `jira_title` on a Jira ticket) and keeps
+/// them on the run with the comment's address, so the run page lists them
+/// and takes answers. Best effort: a comment that fails is logged, and the
+/// questions are kept anyway.
+#[allow(clippy::too_many_arguments)]
+async fn ask_on_ticket(
+    state: &WorkerState,
+    msg: &TicketMessage,
+    run_id: &str,
+    github: &GitHubClient,
+    questions: &[common::run_questions::Question],
+    github_body: &str,
+    jira_body: &str,
+    jira_title: &str,
+) {
+    let mut comment_url = None;
+    if matches!(msg.source, TicketSource::Github) && msg.issue_number > 0 {
+        match github
+            .create_issue_comment(
+                &msg.repo_owner,
+                &msg.repo_name,
+                msg.issue_number,
+                github_body,
+            )
+            .await
+        {
+            Ok(c) => {
+                comment_url = c["html_url"]
+                    .as_str()
+                    .filter(|u| !u.is_empty())
+                    .map(str::to_string)
+            }
+            Err(e) => warn!(run_id, error = %e, "Could not post the run's questions on the issue"),
+        }
+    } else if matches!(msg.source, TicketSource::Jira) && !msg.ticket_id.is_empty() {
+        match post_jira_comment_link(
+            state,
+            &msg.team_id,
+            &msg.ticket_id,
+            jira_body,
+            "clarification",
+            jira_title,
+        )
+        .await
+        {
+            Ok(link) => comment_url = link,
+            Err(e) => warn!(run_id, error = %e, "Could not post the run's questions on the ticket"),
+        }
+    }
+    record_questions(state, &msg.team_id, run_id, questions, comment_url).await;
+}
+
+/// What a run asks when it wrote no change and the ticket names no other
+/// repository: the files, and the behaviour or values.
+fn empty_change_questions() -> Vec<common::run_questions::Question> {
+    let why = "I ran but made no file changes. If the ticket already says this, Retry: it is \
+               usually a one-off miss.";
+    vec![
+        common::run_questions::Question {
+            id: "q1".to_string(),
+            question: "Which files or components should change?".to_string(),
+            why: why.to_string(),
+            suggestions: Vec::new(),
+        },
+        common::run_questions::Question {
+            id: "q2".to_string(),
+            question: "What should happen instead: the expected behaviour, or the exact values or \
+                       text to use?"
+                .to_string(),
+            why: "Without it I can't tell what the finished change looks like.".to_string(),
+            suggestions: Vec::new(),
+        },
+    ]
+}
+
+/// What a run asks when it doesn't know where the fix belongs: the plan's
+/// own questions not answered already, else one question by the kind of
+/// ticket, with the cause as its reason.
+fn unknown_fix_questions(
+    decision: &fix_location::FixDecision,
+    answers: &[common::run_questions::Answer],
+) -> Vec<common::run_questions::Question> {
+    let own = common::run_questions::unanswered(
+        common::run_questions::from_lines(&decision.questions),
+        answers,
+    );
+    if !own.is_empty() {
+        return own;
+    }
+    let question = match decision.intent {
+        fix_location::TicketIntent::Bug => "Where does the fix belong: which system or part of it?",
+        fix_location::TicketIntent::Feature | fix_location::TicketIntent::Chore => {
+            "What else does this need before I build it?"
+        }
+        fix_location::TicketIntent::Question => "Does this answer it, or what should happen next?",
+    };
+    vec![common::run_questions::Question {
+        id: "q1".to_string(),
+        question: question.to_string(),
+        why: common::truncate_str(
+            &decision
+                .cause
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" "),
+            600,
+        )
+        .to_string(),
+        suggestions: Vec::new(),
+    }]
+}
+
+/// Keeps what a run asked on its record (see `common::run_questions`).
+async fn record_questions(
+    state: &WorkerState,
+    team_id: &str,
+    run_id: &str,
+    questions: &[common::run_questions::Question],
+    comment_url: Option<String>,
+) {
+    if questions.is_empty() {
+        return;
+    }
+    let asked = common::run_questions::Asked {
+        questions: questions.to_vec(),
+        asked_at: chrono::Utc::now().to_rfc3339(),
+        comment_url,
+    };
+    let Ok(json) = serde_json::to_string(&asked) else {
+        return;
+    };
+    if let Err(e) = state
+        .dynamo
+        .update_item()
+        .table_name(&state.config.runs_table_name)
+        .key("team_id", attr_s(team_id))
+        .key("run_id", attr_s(run_id))
+        .update_expression("SET #q = :q")
+        .expression_attribute_names("#q", common::run_questions::FIELD_QUESTIONS)
+        .expression_attribute_values(":q", attr_s(&json))
+        .send()
+        .await
+    {
+        warn!(run_id, error = %e, "Could not keep the run's questions on its record");
+    }
+}
+
+/// The questions a plan's `CLARIFICATION_NEEDED:` text asks, less those
+/// people answered already. When it asks only answered ones, one question
+/// says the answers didn't settle it.
+fn clarification_questions(
+    detail: &str,
+    answers: &[common::run_questions::Answer],
+) -> Vec<common::run_questions::Question> {
+    let asked = common::run_questions::parse(detail);
+    let left = common::run_questions::unanswered(asked.clone(), answers);
+    if !left.is_empty() || asked.is_empty() {
+        return left;
+    }
+    vec![common::run_questions::Question {
+        id: "q1".to_string(),
+        question:
+            "The answers so far didn't settle it. What else should I know to make this change?"
+                .to_string(),
+        why: common::truncate_str(
+            &detail.split_whitespace().collect::<Vec<_>>().join(" "),
+            600,
+        )
+        .to_string(),
+        suggestions: Vec::new(),
+    }]
 }
 
 /// Check if there is already an active run for this ticket. "Active" means
@@ -8632,5 +8873,111 @@ mod open_pr_tests {
         assert!(!mentions_ticket("ABC-123 something else", "ABC-12"));
         assert!(!mentions_ticket("XABC-12", "ABC-12"));
         assert!(!mentions_ticket("anything", ""));
+    }
+}
+
+#[cfg(test)]
+mod asking_tests {
+    use super::{clarification_questions, jira_comment_link, unknown_fix_questions};
+    use crate::passes::fix_location::{FixDecision, FixLocation, TicketIntent};
+    use common::run_questions::Answer;
+
+    fn answered(q: &str, a: &str) -> Answer {
+        Answer {
+            question_id: "q1".into(),
+            question: q.into(),
+            answer: a.into(),
+            author: "Pat Doe".into(),
+            answered_at: "2026-10-27T10:00:00Z".into(),
+        }
+    }
+
+    /// The plan's questions are kept one by one, with why and options.
+    #[test]
+    fn a_clarification_becomes_questions() {
+        let qs = clarification_questions(
+            "- question: Which environments get the new limit?\n  why: One value per \
+             environment.\n  options: Production only | Every environment\n- question: What is \
+             the new limit?",
+            &[],
+        );
+        assert_eq!(qs.len(), 2);
+        assert_eq!(qs[0].why, "One value per environment.");
+        assert_eq!(qs[0].suggestions.len(), 2);
+    }
+
+    /// A question people answered in CoderHelm is not asked again; one
+    /// still open is.
+    #[test]
+    fn an_answered_question_is_not_asked_again() {
+        let answers = [answered(
+            "Which environments get the new rate limit?",
+            "Production only",
+        )];
+        let qs = clarification_questions(
+            "- question: Which environments should get the new rate limit?\n- question: What \
+             should the error message say?",
+            &answers,
+        );
+        assert_eq!(qs.len(), 1);
+        assert_eq!(qs[0].question, "What should the error message say?");
+
+        // Asking only answered questions again: one question says the
+        // answers didn't settle it, never the same question.
+        let qs = clarification_questions(
+            "- question: Which environments should get the new rate limit?",
+            &answers,
+        );
+        assert_eq!(qs.len(), 1);
+        assert!(qs[0]
+            .question
+            .starts_with("The answers so far didn't settle it"));
+        assert!(!qs[0].question.contains("environments"));
+    }
+
+    #[test]
+    fn not_knowing_where_the_fix_goes_asks_the_plans_questions() {
+        let d = FixDecision {
+            fix_location: FixLocation::Unknown,
+            cause: "Two jobs write the same table.".into(),
+            intent: TicketIntent::Bug,
+            questions: vec![
+                "Which job should own the table?".into(),
+                "Is the nightly job still needed?".into(),
+            ],
+            ..Default::default()
+        };
+        let qs = unknown_fix_questions(
+            &d,
+            &[answered(
+                "Which job should own the table?",
+                "The hourly one",
+            )],
+        );
+        assert_eq!(qs.len(), 1);
+        assert_eq!(qs[0].question, "Is the nightly job still needed?");
+        // No questions of its own: one by the kind of ticket, the cause as why.
+        let bare = FixDecision {
+            questions: vec![],
+            ..d
+        };
+        let qs = unknown_fix_questions(&bare, &[]);
+        assert_eq!(qs.len(), 1);
+        assert!(qs[0].question.starts_with("Where does the fix belong"));
+        assert_eq!(qs[0].why, "Two jobs write the same table.");
+    }
+
+    #[test]
+    fn a_jira_comment_link_needs_the_site() {
+        assert_eq!(
+            jira_comment_link(
+                Some("https://example.atlassian.net/"),
+                "ABC-7",
+                Some("10001")
+            )
+            .as_deref(),
+            Some("https://example.atlassian.net/browse/ABC-7?focusedCommentId=10001")
+        );
+        assert_eq!(jira_comment_link(None, "ABC-7", Some("1")), None);
     }
 }

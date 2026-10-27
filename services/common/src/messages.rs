@@ -738,6 +738,16 @@ pub struct TicketMessage {
     /// "author: words". The planner's trace checks then inform, not block.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub person_direction: Option<String>,
+    /// Answers people gave in CoderHelm to an earlier run's questions on
+    /// this ticket. Triage and the planner read them word for word, and the
+    /// planner doesn't ask them again (see `run_questions`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub answers: Vec<crate::run_questions::Answer>,
+    /// The id the new run takes, when whoever sent the ticket named it
+    /// first (answering on the dashboard links the asking run to the run
+    /// that picks the answers up). A continuation keeps its own id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub new_run_id: Option<String>,
 }
 
 fn default_branch() -> String {
@@ -770,6 +780,8 @@ impl Default for TicketMessage {
             plan_cache_key: None,
             team_instructions: String::new(),
             person_direction: None,
+            answers: Vec::new(),
+            new_run_id: None,
         }
     }
 }
