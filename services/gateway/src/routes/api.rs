@@ -909,6 +909,74 @@ pub struct RunNote {
     pub timestamp: Option<String>,
 }
 
+/// The run stopped before its pull request because a code generator needed
+/// public values the repository's codegen environment doesn't set.
+#[derive(serde::Serialize, utoipa::ToSchema)]
+pub struct CodegenEnvMissing {
+    /// The repository, `owner/name`.
+    #[schema(example = "acme/web")]
+    pub repo: String,
+    /// The generator that failed.
+    #[schema(example = "pnpm run typegen")]
+    pub command: String,
+    /// The public variable names it needs that aren't set. Set them in the
+    /// dashboard under Settings, Repositories, the repository's Codegen
+    /// environment (public values only, never secrets), then retry the run.
+    #[schema(example = json!(["SANITY_STUDIO_PROJECT_ID", "SANITY_STUDIO_DATASET"]))]
+    pub vars: Vec<String>,
+}
+
+/// A checkpoint commit a fix round saved on its WIP branch before it stopped.
+#[derive(serde::Serialize, utoipa::ToSchema)]
+pub struct PushedCommit {
+    /// The commit's SHA.
+    #[schema(example = "4f2a9c1e7b3d5a6c8e0f1a2b3c4d5e6f7a8b9c0d")]
+    pub sha: String,
+    /// Its subject line.
+    #[schema(example = "WEB-42: Add the gallery tabs")]
+    pub message: String,
+}
+
+/// The last fix round on the run's open pull request didn't finish. The
+/// run's status stays `completed` (the pull request is open); this says
+/// which round stopped, why, and what it pushed.
+#[derive(serde::Serialize, utoipa::ToSchema)]
+pub struct RoundIncomplete {
+    /// The round: `ci_fix` (CI failed and CoderHelm was fixing it),
+    /// `review_fix` (CoderHelm's reviewer asked for changes) or `feedback`
+    /// (a person's review or comments).
+    #[schema(example = "review_fix")]
+    pub kind: Option<String>,
+    /// Which fix of the run it was (1 for the first; 0 when not numbered).
+    #[schema(example = 3)]
+    pub number: u32,
+    /// Why it stopped, in plain words.
+    #[schema(example = "the review fix round ran out of its time budget 3 times in a row")]
+    pub reason: String,
+    /// The run's status as a person reads it.
+    #[schema(
+        example = "Pull request open; the last fix round didn't finish: the review fix round ran out of its time budget 3 times in a row."
+    )]
+    pub summary: String,
+    /// The checkpoint commits the round saved on `wip_branch` before it
+    /// stopped, oldest first (never on the pull request).
+    pub pushed: Vec<PushedCommit>,
+    /// The files those commits changed.
+    #[schema(example = json!(["src/blocks/gallery/tabs.tsx"]))]
+    pub files: Vec<String>,
+    /// The branch the round's work so far is saved on. A round that didn't
+    /// finish never pushes to the pull request; Resume continues from here.
+    #[schema(example = "coderhelm-wip/web-42-gallery")]
+    pub wip_branch: String,
+    /// When it stopped (RFC 3339).
+    #[schema(example = "2026-10-22T15:40:02Z")]
+    pub at: String,
+    /// Whether `POST /api/runs/{run_id}/retry` resumes the round on the same
+    /// pull request.
+    #[schema(example = true)]
+    pub can_resume: bool,
+}
+
 /// One run, in full.
 #[derive(serde::Serialize, utoipa::ToSchema)]
 pub struct Run {
@@ -1044,6 +1112,70 @@ pub struct Run {
     pub continued_run_id: Option<String>,
     /// How the run was started and by whom (as in the runs list).
     pub trigger: run_trigger::RunTrigger,
+    /// Set when the run's pull request is open but the last fix round on it
+    /// (a CI fix, a review fix or a feedback round) didn't finish. Null
+    /// otherwise. Resume it with `POST /api/runs/{run_id}/retry`.
+    #[schema(example = json!(null))]
+    pub round_incomplete: Option<RoundIncomplete>,
+    /// Set when the run stopped before its pull request because a code
+    /// generator needed public values the repository doesn't set. Null
+    /// otherwise.
+    #[schema(example = json!(null))]
+    pub codegen_env_missing: Option<CodegenEnvMissing>,
+}
+
+/// The public values a run's code generator was missing, as the API shows them.
+fn codegen_env_missing_of(item: &run_search::Item) -> Option<CodegenEnvMissing> {
+    let m = item.get("codegen_env_missing")?.as_m().ok()?;
+    let s = |k: &str| {
+        m.get(k)
+            .and_then(|v| v.as_s().ok())
+            .cloned()
+            .unwrap_or_default()
+    };
+    let vars: Vec<String> = m
+        .get("vars")
+        .and_then(|v| v.as_l().ok())
+        .map(|l| l.iter().filter_map(|v| v.as_s().ok().cloned()).collect())
+        .unwrap_or_default();
+    (!vars.is_empty()).then(|| CodegenEnvMissing {
+        repo: s("repo"),
+        command: s("command"),
+        vars,
+    })
+}
+
+/// The run's unfinished fix round, as the API shows it.
+fn round_incomplete_of(item: &run_search::Item) -> Option<RoundIncomplete> {
+    let inc = common::run_round::Incomplete::from_item(item)?;
+    let status = item
+        .get("status")
+        .and_then(|v| v.as_s().ok())
+        .map(String::as_str)
+        .unwrap_or("");
+    let pr_number = item
+        .get("pr_number")
+        .and_then(|v| v.as_n().ok())
+        .and_then(|n| n.parse::<u64>().ok())
+        .unwrap_or(0);
+    Some(RoundIncomplete {
+        kind: inc.kind.map(|k| k.as_str().to_string()),
+        number: inc.number,
+        summary: inc.status_line(),
+        reason: inc.reason,
+        pushed: inc
+            .pushed
+            .into_iter()
+            .map(|p| PushedCommit {
+                sha: p.sha,
+                message: p.message,
+            })
+            .collect(),
+        files: inc.files,
+        wip_branch: inc.wip_branch,
+        at: inc.at,
+        can_resume: common::run_round::may_resume(status, pr_number, true),
+    })
 }
 
 /// A question a run asked a person.
@@ -1383,6 +1515,8 @@ fn run_of(
             .collect(),
         answers_url: st("answers_url"),
         continued_run_id: st("continued_run_id"),
+        round_incomplete: round_incomplete_of(item),
+        codegen_env_missing: codegen_env_missing_of(item),
     }
 }
 
@@ -1642,7 +1776,8 @@ pub async fn get_run_openspec(
 /// What a run action did.
 #[derive(serde::Serialize, utoipa::ToSchema)]
 pub struct RunActionResult {
-    /// `retrying` after a retry, `cancelled` after a cancel.
+    /// `retrying` after a retry, `resuming` when a retry resumed the run's
+    /// unfinished fix round, `cancelled` after a cancel.
     #[schema(example = "retrying")]
     pub status: String,
 }
@@ -1657,10 +1792,14 @@ pub struct RunActionResult {
     description = "Starts the run's ticket again as a new run. Only a run that is `failed`, \
         `needs_input`, `needs_outside_change`, `cancelled` or `closed` can be retried; the old run \
         becomes `retried`, so retrying it twice is refused with `400`. Find the new run with \
-        `GET /api/runs?q=<ticket id>`.",
+        `GET /api/runs?q=<ticket id>`.\n\n\
+        A `completed` run whose `round_incomplete` is set (its pull request is open but the last \
+        fix round on it didn't finish) is resumed instead: the same run picks the round up again \
+        on the same pull request, with a fresh time budget, and the answer's status is \
+        `resuming`.",
     params(("run_id" = String, Path, description = "The run's id.", example = "01JB8X6F4M2C9QZ3T7V5W1K0HA")),
     responses(
-        (status = 200, description = "The ticket is queued again.", body = RunActionResult,
+        (status = 200, description = "The ticket is queued again (`retrying`), or the unfinished round is resumed on the same run (`resuming`).", body = RunActionResult,
             example = json!({ "status": "retrying" })),
         (status = 400, description = "The run is not in a state that can be retried.", body = crate::openapi::ErrorBody),
         (status = 404, description = "No run with this id in the team.", body = crate::openapi::ErrorBody),
@@ -1702,6 +1841,21 @@ pub async fn retry_run(
         .and_then(|v| v.as_s().ok())
         .map(|s| s.as_str())
         .unwrap_or("");
+    // The run's pull request is open and its last fix round didn't finish:
+    // resume that round on the same run instead of starting the ticket over.
+    if let Some(inc) = common::run_round::Incomplete::from_item(item) {
+        let pr_number = item
+            .get("pr_number")
+            .and_then(|v| v.as_n().ok())
+            .and_then(|n| n.parse::<u64>().ok())
+            .unwrap_or(0);
+        if common::run_round::may_resume(status, pr_number, true) {
+            resume_round(&state, &claims, &run_id, item, &inc, pr_number).await?;
+            return Ok(Json(RunActionResult {
+                status: "resuming".into(),
+            }));
+        }
+    }
     if !matches!(
         status,
         "failed" | "needs_input" | "needs_outside_change" | "cancelled" | "closed"
@@ -1854,6 +2008,158 @@ pub(crate) async fn retry_message(
             .unwrap_or_default(),
         ..Default::default()
     })
+}
+
+/// How Resume picks up a run's unfinished fix round.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ResumeRoute {
+    /// The round's own instructions are kept: park it, and the resume runs
+    /// it first with a fresh budget.
+    Parked(common::run_round::Round),
+    /// Nothing kept to run directly: the resume reads CI and the review on
+    /// the head again, which brings the fix back.
+    Recheck,
+    /// A person's comments: the feedback round reads them again.
+    Feedback,
+}
+
+fn resume_route(
+    inc: &common::run_round::Incomplete,
+    now: chrono::DateTime<chrono::Utc>,
+) -> ResumeRoute {
+    use common::run_round::Kind;
+    match inc.kind {
+        Some(Kind::Feedback) => ResumeRoute::Feedback,
+        Some(_) if !inc.feedback.trim().is_empty() => match inc.resume_round(now) {
+            Some(r) => ResumeRoute::Parked(r),
+            None => ResumeRoute::Recheck,
+        },
+        _ => ResumeRoute::Recheck,
+    }
+}
+
+/// Resumes a run's unfinished fix round on its open pull request: the run
+/// goes back to work under the same id, and the round gets a fresh budget.
+/// A person asking is one more fix: one slot of the automated-fix budget is
+/// given back so the round isn't refused for the budget it already used.
+async fn resume_round(
+    state: &AppState,
+    claims: &Claims,
+    run_id: &str,
+    item: &run_search::Item,
+    inc: &common::run_round::Incomplete,
+    pr_number: u64,
+) -> Result<(), StatusCode> {
+    let text = |k: &str| {
+        item.get(k)
+            .and_then(|v| v.as_s().ok())
+            .cloned()
+            .unwrap_or_default()
+    };
+    let repo = text("repo");
+    let (owner, name) = repo
+        .split_once('/')
+        .ok_or(StatusCode::INTERNAL_SERVER_ERROR)?;
+    let mut installation_id = item
+        .get("installation_id")
+        .and_then(|v| v.as_n().ok())
+        .and_then(|n| n.parse::<u64>().ok())
+        .unwrap_or(0);
+    if installation_id == 0 {
+        installation_id = get_team_installation_id(state, &claims.team_id).await?;
+    }
+    let now = chrono::Utc::now();
+    let route = resume_route(inc, now);
+    let (status, pass) = match route {
+        ResumeRoute::Feedback => ("running", "feedback"),
+        _ => ("awaiting_ci", "awaiting_ci"),
+    };
+    let mut update = state
+        .dynamo
+        .update_item()
+        .table_name(&state.config.runs_table_name)
+        .key("team_id", attr_s(&claims.team_id))
+        .key("run_id", attr_s(run_id))
+        .condition_expression("#s = :from")
+        .expression_attribute_names("#s", "status")
+        .expression_attribute_names("#inc", common::run_round::INCOMPLETE_FIELD)
+        .expression_attribute_names("#round", common::run_round::FIELD)
+        .expression_attribute_values(":from", attr_s(&text("status")))
+        .expression_attribute_values(":s", attr_s(status))
+        .expression_attribute_values(":sri", attr_s(&format!("{status}#{run_id}")))
+        .expression_attribute_values(":p", attr_s(pass))
+        .expression_attribute_values(":t", attr_s(&now.to_rfc3339()));
+    update = match &route {
+        ResumeRoute::Parked(round) => update
+            .update_expression(
+                "SET #s = :s, status_run_id = :sri, current_pass = :p, updated_at = :t, #round = :r \
+                 REMOVE #inc",
+            )
+            .expression_attribute_values(":r", round.to_attr()),
+        _ => update.update_expression(
+            "SET #s = :s, status_run_id = :sri, current_pass = :p, updated_at = :t \
+             REMOVE #inc, #round",
+        ),
+    };
+    update.send().await.map_err(|e| {
+        if common::run_fail::is_condition_failed(&e) {
+            StatusCode::CONFLICT
+        } else {
+            error!("Failed to resume the run's round: {e}");
+            StatusCode::INTERNAL_SERVER_ERROR
+        }
+    })?;
+    // One automated-fix slot back for the person's ask (best effort).
+    let _ = state
+        .dynamo
+        .update_item()
+        .table_name(&state.config.runs_table_name)
+        .key("team_id", attr_s(&claims.team_id))
+        .key("run_id", attr_s(run_id))
+        .update_expression("ADD auto_fix_pushes :minus")
+        .condition_expression("auto_fix_pushes > :zero")
+        .expression_attribute_values(":minus", AttributeValue::N("-1".into()))
+        .expression_attribute_values(":zero", AttributeValue::N("0".into()))
+        .send()
+        .await;
+    let (queue, message) = match route {
+        ResumeRoute::Feedback => (
+            &state.config.feedback_queue_url,
+            WorkerMessage::Feedback(FeedbackMessage {
+                team_id: claims.team_id.clone(),
+                installation_id,
+                run_id: run_id.to_string(),
+                repo_owner: owner.to_string(),
+                repo_name: name.to_string(),
+                pr_number,
+                review_id: 0,
+                ..Default::default()
+            }),
+        ),
+        _ => (
+            &state.config.ticket_queue_url,
+            WorkerMessage::Resume(common::messages::ResumeMessage {
+                team_id: claims.team_id.clone(),
+                run_id: run_id.to_string(),
+                installation_id,
+                ..Default::default()
+            }),
+        ),
+    };
+    let body = serde_json::to_string(&message).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    state
+        .sqs
+        .send_message()
+        .queue_url(queue)
+        .message_body(&body)
+        .send()
+        .await
+        .map_err(|e| {
+            error!("Failed to enqueue the resumed round: {e}");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+    info!(run_id, pr_number, "Unfinished fix round resumed");
+    Ok(())
 }
 
 /// Close a PR and delete a branch via the GitHub App token. Best-effort.
@@ -4061,6 +4367,118 @@ pub async fn update_repo_instructions(
 }
 
 /// Validate repo path parameter to prevent DynamoDB key injection.
+/// GET /api/repos/:owner/:name/codegen-env — the repository's public
+/// codegen environment (admins). Its values are public by rule, so they are
+/// shown as kept.
+pub async fn get_codegen_env(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<Claims>,
+    axum::extract::Path((owner, name)): axum::extract::Path<(String, String)>,
+) -> Result<Json<Value>, StatusCode> {
+    claims.require_role(3)?; // admin+
+    let repo = format!("{owner}/{name}");
+    validate_repo_name(&repo)?;
+    let item = state
+        .dynamo
+        .get_item()
+        .table_name(&state.config.settings_table_name)
+        .key("pk", attr_s(&claims.team_id))
+        .key("sk", attr_s(&common::codegen_env::sk(&repo)))
+        .send()
+        .await
+        .map_err(|e| {
+            error!("Failed to read the codegen environment for {repo}: {e}");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?
+        .item;
+    let mut vars: Vec<(String, String)> = item
+        .and_then(|i| i.get("env").and_then(|v| v.as_m().ok()).cloned())
+        .map(|m| {
+            m.into_iter()
+                .filter_map(|(k, v)| v.as_s().ok().map(|s| (k, s.clone())))
+                .collect()
+        })
+        .unwrap_or_default();
+    vars.sort();
+    Ok(Json(json!({
+        "repo": repo,
+        "vars": vars.iter().map(|(n, v)| json!({"name": n, "value": v})).collect::<Vec<_>>(),
+    })))
+}
+
+/// The variables a codegen environment write carries, checked
+/// ([`common::codegen_env::validate`]): public values only.
+fn codegen_vars(body: &Value) -> Result<Vec<(String, String)>, String> {
+    let vars: Vec<(String, String)> = body["vars"]
+        .as_array()
+        .ok_or("Send `vars`: a list of {name, value}.")?
+        .iter()
+        .map(|v| {
+            (
+                v["name"].as_str().unwrap_or("").trim().to_string(),
+                v["value"].as_str().unwrap_or("").trim().to_string(),
+            )
+        })
+        .filter(|(n, _)| !n.is_empty())
+        .collect();
+    common::codegen_env::validate(&vars)?;
+    Ok(vars)
+}
+
+/// PUT /api/repos/:owner/:name/codegen-env — replace the repository's public
+/// codegen environment (admins). Names or values that look like credentials
+/// are refused with the reason; an empty list removes it.
+pub async fn put_codegen_env(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<Claims>,
+    axum::extract::Path((owner, name)): axum::extract::Path<(String, String)>,
+    Json(body): Json<Value>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let fail = |code: StatusCode, msg: &str| (code, Json(json!({ "error": msg })));
+    // admin+
+    let allowed = claims.require_role(3);
+    allowed.map_err(|c| fail(c, "Only admins can change the codegen environment."))?;
+    let repo = format!("{owner}/{name}");
+    validate_repo_name(&repo).map_err(|c| fail(c, "Not a repository name."))?;
+    let vars = codegen_vars(&body).map_err(|m| fail(StatusCode::BAD_REQUEST, &m))?;
+    let key = common::codegen_env::sk(&repo);
+    let res = if vars.is_empty() {
+        state
+            .dynamo
+            .delete_item()
+            .table_name(&state.config.settings_table_name)
+            .key("pk", attr_s(&claims.team_id))
+            .key("sk", attr_s(&key))
+            .send()
+            .await
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    } else {
+        state
+            .dynamo
+            .put_item()
+            .table_name(&state.config.settings_table_name)
+            .item("pk", attr_s(&claims.team_id))
+            .item("sk", attr_s(&key))
+            .item(
+                "env",
+                AttributeValue::M(vars.iter().map(|(n, v)| (n.clone(), attr_s(v))).collect()),
+            )
+            .item("updated_at", attr_s(&chrono::Utc::now().to_rfc3339()))
+            .item("updated_by", attr_s(&claims.email))
+            .send()
+            .await
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    };
+    res.map_err(|e| {
+        error!("Failed to write the codegen environment for {repo}: {e}");
+        fail(StatusCode::INTERNAL_SERVER_ERROR, "Could not save.")
+    })?;
+    info!(repo, count = vars.len(), "Codegen environment saved");
+    Ok(Json(json!({ "repo": repo, "count": vars.len() })))
+}
+
 fn validate_repo_name(repo: &str) -> Result<(), StatusCode> {
     if repo.is_empty()
         || repo.len() > 200
@@ -5612,6 +6030,157 @@ mod tests {
         assert_eq!(run["answers"][0]["answer"], "Production only");
         assert_eq!(run["answers"][0]["author"], "Pat Doe");
         assert_eq!(run["continued_run_id"], "01JB8Z");
+    }
+
+    /// A run whose PR is open and whose last fix round didn't finish reads
+    /// as such, never as failed, and offers Resume.
+    #[test]
+    fn an_unfinished_round_shows_on_the_run_with_resume() {
+        use aws_sdk_dynamodb::types::AttributeValue as A;
+        use common::run_round::{Incomplete, Kind, Pushed, Round};
+        let round = Round::start(
+            Kind::ReviewFix,
+            3,
+            "abc",
+            "Add the tabs",
+            true,
+            chrono::Utc::now(),
+        );
+        let mut inc = Incomplete::of(
+            &round,
+            "the review fix round ran out of its time budget",
+            "2026-10-22T15:40:02Z",
+        );
+        inc.pushed = vec![Pushed {
+            sha: "4f2a9c1".into(),
+            message: "Add the tabs".into(),
+        }];
+        let item = std::collections::HashMap::from([
+            ("status".to_string(), A::S("completed".into())),
+            ("pr_number".to_string(), A::N("41".into())),
+            (
+                common::run_round::INCOMPLETE_FIELD.to_string(),
+                inc.to_attr(),
+            ),
+        ]);
+        let usage = RunUsage {
+            tokens_in: 0,
+            tokens_out: 0,
+            cache_read: 0,
+            cache_write: 0,
+            cost_usd: 0.0,
+        };
+        let run = serde_json::to_value(run_of(&item, "r1", usage, &Default::default())).unwrap();
+        let r = &run["round_incomplete"];
+        assert_eq!(run["status"], "completed");
+        assert_eq!(r["kind"], "review_fix");
+        assert_eq!(r["number"], 3);
+        assert_eq!(r["can_resume"], true);
+        assert_eq!(r["pushed"][0]["sha"], "4f2a9c1");
+        assert!(r["summary"]
+            .as_str()
+            .unwrap()
+            .starts_with("Pull request open; the last fix round didn't finish"));
+        // Without one, the field is null.
+        let plain =
+            std::collections::HashMap::from([("status".to_string(), A::S("completed".into()))]);
+        let usage = RunUsage {
+            tokens_in: 0,
+            tokens_out: 0,
+            cache_read: 0,
+            cache_write: 0,
+            cost_usd: 0.0,
+        };
+        assert!(
+            serde_json::to_value(run_of(&plain, "r2", usage, &Default::default())).unwrap()
+                ["round_incomplete"]
+                .is_null()
+        );
+    }
+
+    #[test]
+    fn resume_parks_a_round_it_can_run_and_rechecks_one_it_cannot() {
+        use common::run_round::{Incomplete, Kind, Round, State};
+        let now = chrono::Utc::now();
+        let round = Round::start(Kind::ReviewFix, 2, "abc", "Add the tabs", true, now);
+        let inc = Incomplete::of(&round, "out of time", "t");
+        match super::resume_route(&inc, now) {
+            super::ResumeRoute::Parked(r) => {
+                assert_eq!(r.state, State::Pending);
+                assert_eq!(r.attempt, 1);
+                assert_eq!(r.feedback, "Add the tabs");
+                assert_eq!(r.kind, Kind::ReviewFix);
+            }
+            other => panic!("{other:?}"),
+        }
+        // The sweep keeps no instructions: the resume reads CI and review again.
+        let swept = Incomplete {
+            kind: Some(Kind::ReviewFix),
+            ..Default::default()
+        };
+        assert_eq!(
+            super::resume_route(&swept, now),
+            super::ResumeRoute::Recheck
+        );
+        let fb = Incomplete {
+            kind: Some(Kind::Feedback),
+            feedback: "x".into(),
+            ..Default::default()
+        };
+        assert_eq!(super::resume_route(&fb, now), super::ResumeRoute::Feedback);
+    }
+
+    #[test]
+    fn codegen_env_writes_take_public_values_only() {
+        let ok = super::codegen_vars(&json!({"vars": [
+            {"name": "SANITY_STUDIO_PROJECT_ID", "value": "abc123"},
+            {"name": "  ", "value": "ignored"}
+        ]}))
+        .unwrap();
+        assert_eq!(
+            ok,
+            vec![("SANITY_STUDIO_PROJECT_ID".to_string(), "abc123".to_string())]
+        );
+        assert!(super::codegen_vars(
+            &json!({"vars": [{"name": "SANITY_AUTH_TOKEN", "value": "x"}]})
+        )
+        .is_err());
+        assert!(super::codegen_vars(&json!({})).is_err());
+        assert!(super::codegen_vars(&json!({"vars": []}))
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn a_run_stopped_for_missing_codegen_values_names_them() {
+        use aws_sdk_dynamodb::types::AttributeValue as A;
+        let item = std::collections::HashMap::from([
+            ("status".to_string(), A::S("failed".into())),
+            (
+                "codegen_env_missing".to_string(),
+                A::M(std::collections::HashMap::from([
+                    ("repo".to_string(), A::S("acme/web".into())),
+                    ("command".to_string(), A::S("pnpm run typegen".into())),
+                    (
+                        "vars".to_string(),
+                        A::L(vec![A::S("SANITY_STUDIO_PROJECT_ID".into())]),
+                    ),
+                ])),
+            ),
+        ]);
+        let usage = RunUsage {
+            tokens_in: 0,
+            tokens_out: 0,
+            cache_read: 0,
+            cache_write: 0,
+            cost_usd: 0.0,
+        };
+        let run = serde_json::to_value(run_of(&item, "r", usage, &Default::default())).unwrap();
+        assert_eq!(
+            run["codegen_env_missing"]["vars"][0],
+            "SANITY_STUDIO_PROJECT_ID"
+        );
+        assert_eq!(run["codegen_env_missing"]["repo"], "acme/web");
     }
 
     #[test]

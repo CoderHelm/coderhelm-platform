@@ -316,6 +316,20 @@ async fn handle_message(state: Arc<WorkerState>, message: models::WorkerMessage)
                 }
                 let reason = common::run_fail::error_text(err);
                 error!(run_id, error = %reason, "Feedback run failed");
+                // The run's pull request is open: a feedback round that
+                // failed leaves it so, said plainly, with Resume. Not failed.
+                if passes::round::end_unfinished(
+                    &state,
+                    &team_id,
+                    &run_id,
+                    common::run_round::Kind::Feedback,
+                    &reason,
+                    false,
+                )
+                .await
+                {
+                    return;
+                }
                 // The one failed-status write. It never overwrites a run that
                 // was cancelled (a closed PR) or merged meanwhile.
                 if let Err(werr) = common::run_fail::fail_run(
@@ -423,8 +437,22 @@ async fn handle_message(state: Arc<WorkerState>, message: models::WorkerMessage)
         }
         models::WorkerMessage::Resume(msg) => {
             info!(team_id = %msg.team_id, run_id = %msg.run_id, "Resuming run from webhook event");
+            let (team_id, run_id) = (msg.team_id.clone(), msg.run_id.clone());
             if let Err(e) = passes::resume::run(&state, msg).await {
                 error!("Resume failed: {e:?}");
+                // A round this resume claimed (the run is "running") ends
+                // here: with its pull request open, the run says the round
+                // didn't finish instead of waiting for the sweep to fail it.
+                let reason = common::run_fail::error_text(&*e);
+                passes::round::end_unfinished(
+                    &state,
+                    &team_id,
+                    &run_id,
+                    common::run_round::Kind::ReviewFix,
+                    &reason,
+                    true,
+                )
+                .await;
             }
         }
         models::WorkerMessage::Review(msg) => {

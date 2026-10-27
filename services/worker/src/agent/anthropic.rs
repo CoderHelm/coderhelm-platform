@@ -11,6 +11,22 @@ use tracing::{info, warn};
 
 use crate::models::TokenUsage;
 
+/// The reply of a tool loop that reached its deadline before the agent
+/// finished: what was done so far is on the branch, the rest is not.
+pub const TIMED_OUT_REPLY: &str = "(timed out — partial implementation)";
+
+/// The note an agent gets when its deadline is two minutes away. Every
+/// write it made is already a commit on the branch; a file it finished but
+/// hasn't written yet is the only work that can still be lost, so it writes
+/// that one (complete, never a stub) and stops.
+pub const WRAP_UP_NOTE: &str = "[SYSTEM NOTE — DEADLINE] You are almost out of time. Your \
+    completed edits are ALREADY committed (each write is its own commit on the branch), so do \
+    NOT start anything new. If a file you have FINISHED is not written yet, write it now, \
+    complete, in one call. Never write a stub, placeholder, or half-finished file to 'save \
+    progress': a partial file breaks the build and is worse than leaving it unwritten (the next \
+    step picks the task up). Then output a short summary: the tasks you finished, and the tasks \
+    still to do. This is your LAST turn.";
+
 static ANTHROPIC_VERSION: &str = "2023-06-01";
 
 /// Reusable Anthropic client.
@@ -693,7 +709,7 @@ pub async fn converse_tool_loop(
             if remaining < 30 {
                 // Hard stop — not enough time even for one more API call
                 warn!("Deadline imminent (<30s), forcing exit");
-                return Ok("(timed out — partial implementation)".to_string());
+                return Ok(TIMED_OUT_REPLY.to_string());
             } else if remaining < 120 && !deadline_warned {
                 deadline_warned = true;
                 warn!(
@@ -703,13 +719,7 @@ pub async fn converse_tool_loop(
                 messages.push((
                     "user".to_string(),
                     vec![json!({"type": "text", "text":
-                        "[SYSTEM NOTE — DEADLINE] You are almost out of time. Your completed \
-                         edits are ALREADY committed (each edit committed as you made it), so \
-                         do NOT dump remaining work now. Above all, do NOT write a stub, \
-                         placeholder, or half-finished file to 'save progress' — a partial file \
-                         breaks the build and is worse than leaving it unfinished. Stop, and \
-                         output a short summary of what you finished and what still needs doing. \
-                         This is your LAST turn."
+                        WRAP_UP_NOTE
                     })],
                 ));
             }

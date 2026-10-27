@@ -378,11 +378,13 @@ pub const CAPABILITIES: &[Capability] = &[
     },
     Capability {
         key: "repos",
-        label: "Manage repositories: sync, turn on, roles, code graph (turn off, rebuild) and infrastructure scans",
+        label: "Manage repositories: sync, turn on, roles, codegen environment, code graph (turn off, rebuild) and infrastructure scans",
         min_role: "admin",
         handlers: &[
             "api::sync_repos",
             "api::set_repo_role",
+            "api::get_codegen_env",
+            "api::put_codegen_env",
             "api::update_repo",
             "api::delete_repo",
             "api::regenerate_repo",

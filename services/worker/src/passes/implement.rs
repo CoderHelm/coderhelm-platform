@@ -124,6 +124,9 @@ fn checks_report(
 
 pub struct ImplementResult {
     pub files_modified: Vec<String>,
+    /// The pass reached its deadline before the agent finished: what it
+    /// wrote is committed on the branch, the rest of the work is not done.
+    pub timed_out: bool,
     pub conversation_log: Vec<serde_json::Value>,
     /// What the pass could read, looked up, and wrote as its evidence.
     pub evidence: super::proof::RunEvidence,
@@ -345,8 +348,24 @@ pub async fn run(
         None
     };
     let codegen_cmd = if sandbox.is_some() {
-        super::detect_codegen_command(github, &msg.repo_owner, &msg.repo_name, &msg.base_branch)
-            .await
+        match super::detect_codegen_command(
+            github,
+            &msg.repo_owner,
+            &msg.repo_name,
+            &msg.base_branch,
+        )
+        .await
+        {
+            Some(cmd) => Some(cmd),
+            // Generators found from their configs and the repo's docs
+            // (GraphQL codegen, Prisma, buf, documented rules): run_codegen
+            // runs every one of them.
+            None => {
+                let repo =
+                    super::generators::load(github, &msg.repo_owner, &msg.repo_name, branch).await;
+                super::generators::all_command(&repo)
+            }
+        }
     } else {
         None
     };
@@ -837,7 +856,7 @@ pub async fn run(
     let mut conv_log: Vec<serde_json::Value> = Vec::new();
 
     // The coder's closing reply: its summary and `Evidence:` section.
-    let closing = provider::converse(
+    let mut closing = provider::converse(
         state,
         provider,
         common::agent_policy::Agent::Coder,
@@ -1000,6 +1019,13 @@ pub async fn run(
         .cloned()
         .collect();
 
+    // Cut short by the deadline: the loop's own marker, or the pass ended
+    // inside the wrap-up window (the agent summarized what was left).
+    let timed_out = reached_deadline(&closing, deadline, std::time::Instant::now());
+    if closing == crate::agent::anthropic::TIMED_OUT_REPLY {
+        closing.clear();
+    }
+
     // What this pass could read and what it looked up, for the check before
     // the PR opens and for the PR description.
     let mut sources = Vec::new();
@@ -1030,6 +1056,7 @@ pub async fn run(
     let ci_gates = super::checks::kinds_from(&ci);
     Ok(ImplementResult {
         files_modified: files,
+        timed_out,
         conversation_log: conv_log,
         evidence: super::proof::RunEvidence {
             sources,
@@ -1043,6 +1070,21 @@ pub async fn run(
             environments: Vec::new(),
         },
     })
+}
+
+/// How close to its deadline a pass that ended counts as cut short by it:
+/// the tool loop asks the agent to wrap up at two minutes left.
+const WRAP_UP_WINDOW: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// Whether a pass that ended with `closing` at `now` was cut short by its
+/// deadline rather than finishing its work.
+pub(crate) fn reached_deadline(
+    closing: &str,
+    deadline: Option<std::time::Instant>,
+    now: std::time::Instant,
+) -> bool {
+    closing.trim() == crate::agent::anthropic::TIMED_OUT_REPLY
+        || deadline.is_some_and(|d| now + WRAP_UP_WINDOW >= d)
 }
 
 /// The parts of the coder's task prompt.
@@ -1092,6 +1134,7 @@ Go DIRECTLY to the target files listed in the OpenSpec.
 - Use `edit_file` for modifying existing files (search/replace). Only use `write_file` for new files.
 - You should need 2-5 tool calls total, plus any lookups the rules below call for.
 - Only implement the listed tasks. Do not add extras.
+- Write each file as soon as its change is done; never hold finished changes back for one write at the end.
 - NEVER leave placeholder text like TODO, FIXME, REPLACE_ME, or stub implementations. Every line you write must be complete, working code.
 - {commit}
 - {evidence_output}
@@ -1120,6 +1163,7 @@ Go DIRECTLY to the target files listed in the OpenSpec.
 - Refer to the Design section for which files to modify and patterns to follow.
 - Validate your changes against the Acceptance Criteria.
 - Use `batch_write` for atomic multi-file changes (new files or when edit_file won't work).
+- Write each task's files as soon as that task is done, so every finished task is its own commit on the branch. Never hold the files of several tasks back to write them all at the end: a step that runs out of time loses whatever wasn't written.
 - Follow existing code patterns exactly (imports, naming, structure, test style).
 - NEVER leave placeholder text like TODO, FIXME, REPLACE_ME, or stub implementations. Every line you write must be complete, working code.
 - NEVER delete existing functions, methods, or logic unless the task explicitly requires removing them. Modify code, don't gut it.
@@ -3034,6 +3078,56 @@ mod task_prompt_tests {
         assert!(with.find("## Repository Instructions") < with.find("## Your team's instructions"));
         let without = coder_system("acme", "web", "", "  \n", "");
         assert!(!without.contains("team's instructions"));
+    }
+}
+
+#[cfg(test)]
+mod deadline_tests {
+    use super::reached_deadline;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn a_pass_cut_by_its_deadline_says_so() {
+        let now = Instant::now();
+        // The loop's own marker.
+        assert!(reached_deadline(
+            crate::agent::anthropic::TIMED_OUT_REPLY,
+            Some(now + Duration::from_secs(600)),
+            now
+        ));
+        // Ended inside the wrap-up window: the agent summarized what's left.
+        assert!(reached_deadline(
+            "Done: tasks 1-2. Still to do: task 3.",
+            Some(now + Duration::from_secs(60)),
+            now
+        ));
+        // Finished with time to spare, or no deadline at all.
+        assert!(!reached_deadline(
+            "All tasks done.",
+            Some(now + Duration::from_secs(600)),
+            now
+        ));
+        assert!(!reached_deadline("All tasks done.", None, now));
+    }
+
+    #[test]
+    fn the_coder_is_told_to_commit_each_task_as_it_finishes_it() {
+        for simple in [true, false] {
+            let p = super::task_prompt(&super::TaskPrompt {
+                simple,
+                number: 1,
+                title: "t",
+                design: "",
+                continuation: "",
+                openspec: "",
+                files_hint: "",
+                feedback: "",
+                issue: "",
+                commit: "",
+            });
+            assert!(p.contains("as soon as"), "simple={simple}");
+            assert!(p.contains("at the end"), "simple={simple}");
+        }
     }
 }
 

@@ -379,6 +379,10 @@ async fn main() -> Result<(), Error> {
         )
         .route("/repos/:owner/:name/role", post(routes::api::set_repo_role))
         .route(
+            "/repos/:owner/:name/codegen-env",
+            get(routes::api::get_codegen_env).put(routes::api::put_codegen_env),
+        )
+        .route(
             "/integrations/jira/check",
             get(routes::api::get_jira_integration_check)
                 .post(routes::api::validate_jira_integration_payload)

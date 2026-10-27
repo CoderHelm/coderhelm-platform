@@ -821,6 +821,11 @@ pub struct FeedbackMessage {
     /// Times this feedback was sent again after a transient model error.
     #[serde(default)]
     pub model_retries: u32,
+    /// Steps this feedback round already used: each step has its own time
+    /// budget, and a round that runs out of it with work left continues in
+    /// the next step (see `run_round`).
+    #[serde(default)]
+    pub round_attempt: u32,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]

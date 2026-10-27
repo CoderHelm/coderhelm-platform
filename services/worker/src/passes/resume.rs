@@ -11,6 +11,7 @@ use crate::passes::{
     attr_n, attr_s, implement, plan, review, save_checkpoint, write_pass_trace, FileCache,
 };
 use crate::WorkerState;
+use common::run_round;
 
 const MAX_CI_FIX_CYCLES: usize = 10;
 const MAX_LOG_CHARS: usize = 15_000;
@@ -1068,6 +1069,14 @@ pub async fn run(
         return resume_multi_repo(state, &msg, &pr_urls, created_at).await;
     }
 
+    // A fix round parked for a fresh invocation runs first, with its whole
+    // budget: its own clock, never the run's.
+    if let Some(pending) =
+        run_round::Round::from_item(&run_record).filter(|r| r.state == run_round::State::Pending)
+    {
+        return run_pending_round(state, &msg, &run_record, pending, created_at, &start).await;
+    }
+
     // Wall-clock backstop: the reschedule loop has no cycle cap of its own
     // (unlike CI fixes), so a check that never concludes would keep a run in
     // awaiting_ci forever. Past the cap, hand the PR to a human as-is.
@@ -1525,70 +1534,27 @@ pub async fn run(
         return Ok(());
     }
 
-    // Rehydrate the ticket's design mockups from the run record so the review
-    // pass (and review-fix implement) can check the code AGAINST the design —
-    // the empty vec here meant post-CI passes never saw the mockups.
-    let image_attachments: Vec<crate::models::ImageAttachment> = run_record
-        .get("image_attachments")
-        .and_then(|v| v.as_s().ok())
-        .and_then(|s| serde_json::from_str(s).ok())
-        .unwrap_or_default();
-
-    // Build a minimal TicketMessage for the implement/review passes
-    let ticket_msg = TicketMessage {
-        team_id: msg.team_id.clone(),
-        installation_id: msg.installation_id,
-        source: TicketSource::Github,
-        ticket_id,
-        title: title.clone(),
-        body: String::new(),
-        repo_owner: repo_owner.clone(),
-        repo_name: repo_name.clone(),
-        issue_number,
-        sender: String::new(),
-        requester: None,
-        base_branch: base_branch.clone(),
-        image_attachments,
-        continuation: 0,
-        continuation_run_id: None,
-        first_attempt_ms: 0,
-        model_retries: 0,
-        ticket_update_note: None,
-        ticket_history_note: None,
-        plan_cache_key: None,
-        // Loaded once here; the fix and review rounds below read it from
-        // the message.
-        team_instructions: super::load_team_instructions(
-            state,
-            &msg.team_id,
-            &repo_owner,
-            &repo_name,
-        )
-        .await,
-        person_direction: None,
-        answers: Vec::new(),
-        new_run_id: None,
-    };
-
-    let provider = ModelProvider::load_for_team(
-        &state.dynamo,
-        &state.config.settings_table_name,
-        &msg.team_id,
+    let FixContext {
+        ticket_msg,
+        provider,
+        github,
+        mut usage,
+        rules,
+        repo_instructions,
+    } = fix_context(
+        state,
+        &msg,
+        &run_record,
+        &FixTarget {
+            owner: &repo_owner,
+            repo: &repo_name,
+            base_branch: &base_branch,
+            ticket_id: &ticket_id,
+            title: &title,
+            issue_number,
+        },
     )
     .await?;
-
-    let github = GitHubClient::new(
-        &state.secrets.github_app_id,
-        &state.secrets.github_private_key,
-        msg.installation_id,
-        &state.http,
-    )?;
-
-    let mut usage = load_usage_from_checkpoint(state, &msg.team_id, &msg.run_id).await;
-
-    // Load rules and repo instructions so CI fix / review fix have full context
-    let rules = super::load_rules(state, &ticket_msg).await;
-    let repo_instructions = super::load_repo_instructions(&github, &repo_owner, &repo_name).await;
 
     // Collect any review feedback (comments on the PR) — useful for both CI fix and review paths
     let review_feedback = collect_review_feedback(&events);
@@ -1891,6 +1857,49 @@ pub async fn run(
              Full logs:\n{logs}{review_context}{base_note}"
         );
 
+        // The CI fix is a round of its own (common::run_round): its own
+        // budget, on the run record while it works, and parked for a fresh
+        // invocation when this one has too little left to finish it.
+        let round_base = match branch_head.as_deref() {
+            Some(h) if !h.is_empty() => h.to_string(),
+            _ => super::round::branch_head(&github, &repo_owner, &repo_name, &branch).await,
+        };
+        let mut ci_round = run_round::Round::start(
+            run_round::Kind::CiFix,
+            (cycle + 1).min(u32::MAX as usize) as u32,
+            &round_base,
+            &feedback,
+            review_feedback.is_empty(),
+            chrono::Utc::now(),
+        );
+        let pr_ref = PrRef {
+            owner: &repo_owner,
+            repo: &repo_name,
+            branch: &branch,
+            number: pr_number,
+            url: &pr_url,
+        };
+        if !super::round::may_start(start, std::time::Instant::now()) {
+            mark_events_processed(state, &msg.run_id, &events).await;
+            park_round(
+                state,
+                &msg,
+                (&ticket_msg, &usage),
+                &pr_ref,
+                &ci_round,
+                false,
+                created_at,
+                &start,
+            )
+            .await?;
+            return Ok(());
+        }
+        // The fix writes its checkpoints to its own WIP branch; the pull
+        // request gets one commit when it's done.
+        ci_round.wip_branch =
+            super::round::open_wip(&github, &repo_owner, &repo_name, &branch, "").await?;
+        super::round::record(state, &msg.team_id, &msg.run_id, &ci_round).await;
+
         // The tree before the fix: compared with the tree after it to tell a
         // fix that changed code from one that only rewrote the same bytes.
         let tree_before = github
@@ -1903,7 +1912,7 @@ pub async fn run(
             &ticket_msg,
             &github,
             &plan_result,
-            &branch,
+            &ci_round.wip_branch,
             &rules,
             &repo_instructions,
             Some(&feedback),
@@ -1912,14 +1921,113 @@ pub async fn run(
             &mut usage,
             &file_cache,
             Some(&msg.run_id),
-            None,
+            Some(super::round::deadline(start)),
             // Scope to the PR only when this cycle is purely CI-driven; if
             // human review comments ride along, the human's ask wins.
             review_feedback.is_empty(),
         )
         .await
         {
-            Ok(result) => {
+            Ok(result) if result.timed_out => {
+                // Out of its budget with work left: what it wrote is
+                // committed; the rest continues in a fresh step, or the run
+                // says the round didn't finish.
+                write_pass_trace(
+                    state,
+                    &msg.team_id,
+                    &msg.run_id,
+                    &format!("ci_fix:{}", cycle + 1),
+                    pass_start,
+                    &usage_before,
+                    &usage,
+                    None,
+                )
+                .await;
+                mark_events_processed(state, &msg.run_id, &events).await;
+                if ci_round.may_continue() {
+                    park_round(
+                        state,
+                        &msg,
+                        (&ticket_msg, &usage),
+                        &pr_ref,
+                        &ci_round,
+                        true,
+                        created_at,
+                        &start,
+                    )
+                    .await?;
+                    return Ok(());
+                }
+                super::round::finish_incomplete(
+                    state,
+                    &msg.team_id,
+                    &msg.run_id,
+                    &super::round::Pr {
+                        github: &github,
+                        owner: &repo_owner,
+                        repo: &repo_name,
+                        branch: &branch,
+                    },
+                    &ci_round,
+                    &run_round::out_of_time(ci_round.kind, ci_round.attempt),
+                )
+                .await;
+                complete_run_with_status(
+                    state,
+                    &ticket_msg,
+                    &msg.run_id,
+                    "completed",
+                    &pr_url,
+                    pr_number,
+                    &branch,
+                    &usage,
+                    wall_clock_secs(created_at, &start),
+                )
+                .await?;
+                return Ok(());
+            }
+            Ok(mut result) => {
+                // One commit, one push: the fix lands on the pull request.
+                let message =
+                    super::round::round_message(state, &msg.team_id, &ticket_msg, &ci_round).await;
+                let gh = super::round::Pr {
+                    github: &github,
+                    owner: &repo_owner,
+                    repo: &repo_name,
+                    branch: &branch,
+                };
+                match super::round::land(&gh, &ci_round.wip_branch, &ci_round.base_sha, &message)
+                    .await
+                {
+                    super::round::Landed::Pushed { .. } => {}
+                    super::round::Landed::Nothing => result.files_modified.clear(),
+                    super::round::Landed::Refused(why) => {
+                        mark_events_processed(state, &msg.run_id, &events).await;
+                        super::round::finish_incomplete(
+                            state,
+                            &msg.team_id,
+                            &msg.run_id,
+                            &gh,
+                            &ci_round,
+                            &format!("its changes couldn't land on the pull request: {why}"),
+                        )
+                        .await;
+                        complete_run_with_status(
+                            state,
+                            &ticket_msg,
+                            &msg.run_id,
+                            "completed",
+                            &pr_url,
+                            pr_number,
+                            &branch,
+                            &usage,
+                            wall_clock_secs(created_at, &start),
+                        )
+                        .await?;
+                        return Ok(());
+                    }
+                }
+                super::round::clear(state, &msg.team_id, &msg.run_id).await;
                 info!(
                     run_id = msg.run_id,
                     files = result.files_modified.len(),
@@ -1987,7 +2095,7 @@ pub async fn run(
                 if requeue_after_model_error(state, &msg, &*e).await {
                     return Ok(());
                 }
-                error!(run_id = msg.run_id, error = %e, "CI fix implementation failed — completing with PR for human review");
+                error!(run_id = msg.run_id, error = %e, "CI fix implementation failed — the PR stays open, the round is named as not finished");
                 super::webhooks::emit_ci_fix_completed(state, &ci_fix, "failed", 0).await;
                 super::record_ci_outcome(
                     state,
@@ -1997,6 +2105,23 @@ pub async fn run(
                 )
                 .await;
                 mark_events_processed(state, &msg.run_id, &events).await;
+                // Not "failed", and not handed over as if done: the run says
+                // the round didn't finish and what it pushed; Resume runs it
+                // again.
+                super::round::finish_incomplete(
+                    state,
+                    &msg.team_id,
+                    &msg.run_id,
+                    &super::round::Pr {
+                        github: &github,
+                        owner: &repo_owner,
+                        repo: &repo_name,
+                        branch: &branch,
+                    },
+                    &ci_round,
+                    &run_round::errored(ci_round.kind, &common::run_fail::error_text(&*e)),
+                )
+                .await;
                 complete_run_with_status(
                     state,
                     &ticket_msg,
@@ -2009,15 +2134,6 @@ pub async fn run(
                     wall_clock_secs(created_at, &start),
                 )
                 .await?;
-                mark_pr_ready(
-                    state,
-                    &msg.team_id,
-                    &github,
-                    &repo_owner,
-                    &repo_name,
-                    pr_number,
-                )
-                .await;
                 return Ok(());
             }
         }
@@ -2441,83 +2557,65 @@ pub async fn run(
                 run_id = msg.run_id,
                 "Review found issues — implementing fix"
             );
-            super::update_pass(state, &msg.team_id, &msg.run_id, "implement").await?;
-            let pass_start = std::time::Instant::now();
-            let usage_before = usage.clone();
-
-            match implement::run(
-                state,
-                &ticket_msg,
-                &github,
-                &plan_result,
-                &branch,
-                &rules,
-                &repo_instructions,
-                Some(&review_result.summary),
-                "medium",
-                &provider,
-                &mut usage,
-                &file_cache,
-                Some(&msg.run_id),
-                None,
+            // The fix is a round of its own: its own budget, parked for a
+            // fresh invocation when the review used most of this one, and
+            // never a failed run when it can't finish.
+            let base_sha =
+                super::round::branch_head(&github, &repo_owner, &repo_name, &branch).await;
+            let fix_round = run_round::Round::start(
+                run_round::Kind::ReviewFix,
+                (cycle + 1).min(u32::MAX as usize) as u32,
+                &base_sha,
+                &review_result.summary,
                 // Bot self-review fix — scoped, unless human comments were
                 // folded into the review context.
                 review_feedback.is_empty(),
-            )
-            .await
-            {
-                Ok(result) => {
-                    write_pass_trace(
+                chrono::Utc::now(),
+            );
+            let mut ctx = FixContext {
+                ticket_msg,
+                provider,
+                github,
+                usage,
+                rules,
+                repo_instructions,
+            };
+            let pr = PrRef {
+                owner: &repo_owner,
+                repo: &repo_name,
+                branch: &branch,
+                number: pr_number,
+                url: &pr_url,
+            };
+            let end =
+                run_fix_round(state, &msg, &mut ctx, &pr, fix_round, created_at, &start).await?;
+            mark_events_processed(state, &msg.run_id, &events).await;
+            match end {
+                RoundEnd::Parked => return Ok(()),
+                RoundEnd::Incomplete => {
+                    complete_run_with_status(
                         state,
-                        &msg.team_id,
+                        &ctx.ticket_msg,
                         &msg.run_id,
-                        "implement:review_fix",
-                        pass_start,
-                        &usage_before,
-                        &usage,
-                        None,
+                        "completed",
+                        &pr_url,
+                        pr_number,
+                        &branch,
+                        &ctx.usage,
+                        wall_clock_secs(created_at, &start),
                     )
-                    .await;
-
-                    if result.files_modified.is_empty() {
-                        warn!(
-                            run_id = msg.run_id,
-                            "Review fix produced no changes — completing anyway"
-                        );
-                        mark_pr_ready(
-                            state,
-                            &msg.team_id,
-                            &github,
-                            &repo_owner,
-                            &repo_name,
-                            pr_number,
-                        )
-                        .await;
-                        complete_run_with_status(
-                            state,
-                            &ticket_msg,
-                            &msg.run_id,
-                            "completed",
-                            &pr_url,
-                            pr_number,
-                            &branch,
-                            &usage,
-                            wall_clock_secs(created_at, &start),
-                        )
-                        .await?;
-                        return Ok(());
-                    }
+                    .await?;
+                    return Ok(());
                 }
-                Err(e) => {
-                    if requeue_after_model_error(state, &msg, &*e).await {
-                        return Ok(());
-                    }
-                    error!(run_id = msg.run_id, error = %e, "Review fix implementation failed");
-                    // Still mark PR ready, let human review
+                RoundEnd::Done { files: 0 } => {
+                    warn!(
+                        run_id = msg.run_id,
+                        "Review fix produced no changes — completing anyway"
+                    );
                     mark_pr_ready(
                         state,
                         &msg.team_id,
-                        &github,
+                        &ctx.github,
                         &repo_owner,
                         &repo_name,
                         pr_number,
@@ -2525,18 +2623,19 @@ pub async fn run(
                     .await;
                     complete_run_with_status(
                         state,
-                        &ticket_msg,
+                        &ctx.ticket_msg,
                         &msg.run_id,
                         "completed",
                         &pr_url,
                         pr_number,
                         &branch,
-                        &usage,
+                        &ctx.usage,
                         wall_clock_secs(created_at, &start),
                     )
                     .await?;
                     return Ok(());
                 }
+                RoundEnd::Done { .. } => {}
             }
 
             // Back to awaiting_ci for the next CI run. Increment the shared
@@ -2548,18 +2647,17 @@ pub async fn run(
                 "pr",
                 &branch,
                 (cycle + 1).min(u8::MAX as usize) as u8,
-                &usage,
+                &ctx.usage,
             )
             .await;
-            mark_events_processed(state, &msg.run_id, &events).await;
             let still_active = set_run_awaiting_ci(
                 state,
-                &ticket_msg,
+                &ctx.ticket_msg,
                 &msg.run_id,
                 &pr_url,
                 pr_number,
                 &branch,
-                &usage,
+                &ctx.usage,
                 wall_clock_secs(created_at, &start),
             )
             .await?;
@@ -2568,6 +2666,7 @@ pub async fn run(
             if still_active {
                 send_delayed_resume(state, &msg, 120).await;
             }
+            return Ok(());
         }
     }
 
@@ -2600,6 +2699,536 @@ pub async fn run(
     // Mark events processed only after all work completes successfully
     mark_events_processed(state, &msg.run_id, &events).await;
 
+    Ok(())
+}
+
+/// What a fix round on the run's pull request works with.
+struct FixContext {
+    ticket_msg: TicketMessage,
+    provider: ModelProvider,
+    github: GitHubClient,
+    usage: TokenUsage,
+    rules: Vec<String>,
+    repo_instructions: String,
+}
+
+/// The pull request's repository and ticket, read from the run record.
+struct FixTarget<'a> {
+    owner: &'a str,
+    repo: &'a str,
+    base_branch: &'a str,
+    ticket_id: &'a str,
+    title: &'a str,
+    issue_number: u64,
+}
+
+/// Loads what a fix round needs: the ticket (with its design mockups), the
+/// team's model provider, GitHub, the run's usage so far, rules and the
+/// repository's instructions.
+async fn fix_context(
+    state: &WorkerState,
+    msg: &ResumeMessage,
+    run_record: &std::collections::HashMap<String, AttributeValue>,
+    t: &FixTarget<'_>,
+) -> Result<FixContext, Box<dyn std::error::Error + Send + Sync>> {
+    // Rehydrate the ticket's design mockups from the run record so the review
+    // pass (and review-fix implement) can check the code AGAINST the design —
+    // the empty vec here meant post-CI passes never saw the mockups.
+    let image_attachments: Vec<crate::models::ImageAttachment> = run_record
+        .get("image_attachments")
+        .and_then(|v| v.as_s().ok())
+        .and_then(|s| serde_json::from_str(s).ok())
+        .unwrap_or_default();
+
+    // Build a minimal TicketMessage for the implement/review passes
+    let ticket_msg = TicketMessage {
+        team_id: msg.team_id.clone(),
+        installation_id: msg.installation_id,
+        source: TicketSource::Github,
+        ticket_id: t.ticket_id.to_string(),
+        title: t.title.to_string(),
+        body: String::new(),
+        repo_owner: t.owner.to_string(),
+        repo_name: t.repo.to_string(),
+        issue_number: t.issue_number,
+        sender: String::new(),
+        requester: None,
+        base_branch: t.base_branch.to_string(),
+        image_attachments,
+        continuation: 0,
+        continuation_run_id: None,
+        first_attempt_ms: 0,
+        model_retries: 0,
+        ticket_update_note: None,
+        ticket_history_note: None,
+        plan_cache_key: None,
+        // Loaded once here; the fix and review rounds read it from the
+        // message.
+        team_instructions: super::load_team_instructions(state, &msg.team_id, t.owner, t.repo)
+            .await,
+        person_direction: None,
+        answers: Vec::new(),
+        new_run_id: None,
+    };
+
+    let provider = ModelProvider::load_for_team(
+        &state.dynamo,
+        &state.config.settings_table_name,
+        &msg.team_id,
+    )
+    .await?;
+
+    let github = GitHubClient::new(
+        &state.secrets.github_app_id,
+        &state.secrets.github_private_key,
+        msg.installation_id,
+        &state.http,
+    )?;
+
+    let usage = load_usage_from_checkpoint(state, &msg.team_id, &msg.run_id).await;
+
+    // Load rules and repo instructions so CI fix / review fix have full context
+    let rules = super::load_rules(state, &ticket_msg).await;
+    let repo_instructions = super::load_repo_instructions(&github, t.owner, t.repo).await;
+    Ok(FixContext {
+        ticket_msg,
+        provider,
+        github,
+        usage,
+        rules,
+        repo_instructions,
+    })
+}
+
+/// The run's pull request, as a round needs it.
+struct PrRef<'a> {
+    owner: &'a str,
+    repo: &'a str,
+    branch: &'a str,
+    number: u64,
+    url: &'a str,
+}
+
+/// How a round's invocation ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RoundEnd {
+    /// The round's work is done; `files` changed.
+    Done { files: usize },
+    /// Parked: it continues in a fresh invocation with its own budget.
+    Parked,
+    /// It can't finish: the run is completed with the round named as not
+    /// finished, and Resume can run it again.
+    Incomplete,
+}
+
+/// Parks a round for a fresh invocation: the run waits (awaiting_ci) with
+/// the round on its record, and a resume picks it up first thing.
+#[allow(clippy::too_many_arguments)]
+async fn park_round(
+    state: &WorkerState,
+    msg: &ResumeMessage,
+    ctx: (&TicketMessage, &TokenUsage),
+    pr: &PrRef<'_>,
+    round: &run_round::Round,
+    next_attempt: bool,
+    created_at: Option<chrono::DateTime<chrono::Utc>>,
+    start: &std::time::Instant,
+) -> Result<RoundEnd, Box<dyn std::error::Error + Send + Sync>> {
+    let parked = round.parked(next_attempt);
+    super::round::record(state, &msg.team_id, &msg.run_id, &parked).await;
+    let note = if next_attempt {
+        format!(
+            "The {} (fix {}) used its time budget with work left; it continues in a fresh step with its own budget (step {} of {}).",
+            round.kind.label(),
+            round.number,
+            parked.attempt,
+            run_round::MAX_ATTEMPTS
+        )
+    } else {
+        format!(
+            "The {} (fix {}) starts in a fresh step so it gets its whole time budget.",
+            round.kind.label(),
+            round.number
+        )
+    };
+    super::add_progress_note(state, &msg.team_id, &msg.run_id, &note).await;
+    let still_active = set_run_awaiting_ci(
+        state,
+        ctx.0,
+        &msg.run_id,
+        pr.url,
+        pr.number,
+        pr.branch,
+        ctx.1,
+        wall_clock_secs(created_at, start),
+    )
+    .await?;
+    if still_active {
+        send_delayed_resume(state, msg, 5).await;
+    }
+    Ok(RoundEnd::Parked)
+}
+
+/// Runs one fix round's implement inside its own budget. A round that would
+/// start with too little of this invocation left, or that uses its budget
+/// with work left, is parked for a fresh invocation (bounded by
+/// `run_round::MAX_ATTEMPTS`); a round that can't finish leaves the run
+/// completed with the pull request open and says what it pushed.
+#[allow(clippy::too_many_arguments)]
+async fn run_fix_round(
+    state: &WorkerState,
+    msg: &ResumeMessage,
+    ctx: &mut FixContext,
+    pr: &PrRef<'_>,
+    round: run_round::Round,
+    created_at: Option<chrono::DateTime<chrono::Utc>>,
+    start: &std::time::Instant,
+) -> Result<RoundEnd, Box<dyn std::error::Error + Send + Sync>> {
+    if !super::round::may_start(*start, std::time::Instant::now()) {
+        return park_round(
+            state,
+            msg,
+            (&ctx.ticket_msg, &ctx.usage),
+            pr,
+            &round,
+            false,
+            created_at,
+            start,
+        )
+        .await;
+    }
+    // A round resumed by a person starts from the branch as it is now.
+    let mut round = round;
+    if round.base_sha.is_empty() {
+        round.base_sha = super::round::branch_head(&ctx.github, pr.owner, pr.repo, pr.branch).await;
+    }
+    // The round writes to its own WIP branch, never the pull request's: a
+    // continuing round picks up the one it has.
+    let continuing = !round.wip_branch.is_empty();
+    round.wip_branch =
+        super::round::open_wip(&ctx.github, pr.owner, pr.repo, pr.branch, &round.wip_branch)
+            .await?;
+    super::round::record(state, &msg.team_id, &msg.run_id, &round).await;
+    super::update_pass(state, &msg.team_id, &msg.run_id, "implement").await?;
+    let feedback = if round.attempt > 1 || continuing {
+        format!(
+            "{}\n\n## CONTINUING THIS ROUND\nAn earlier step of this round stopped before it \
+             finished; everything it wrote is already committed on this branch. Read the files you \
+             need first, then finish only what is left.",
+            round.feedback
+        )
+    } else {
+        round.feedback.clone()
+    };
+    let plan_result = plan::PlanResult {
+        proposal: String::new(),
+        tasks: String::new(),
+        spec: String::new(),
+        design: String::new(),
+        repo_tasks: vec![],
+        fix: None,
+    };
+    let pass_start = std::time::Instant::now();
+    let usage_before = ctx.usage.clone();
+    let result = implement::run(
+        state,
+        &ctx.ticket_msg,
+        &ctx.github,
+        &plan_result,
+        &round.wip_branch,
+        &ctx.rules,
+        &ctx.repo_instructions,
+        Some(&feedback),
+        "medium",
+        &ctx.provider,
+        &mut ctx.usage,
+        &FileCache::default(),
+        Some(&msg.run_id),
+        Some(super::round::deadline(*start)),
+        round.scoped,
+    )
+    .await;
+    write_pass_trace(
+        state,
+        &msg.team_id,
+        &msg.run_id,
+        &format!("{}:{}", round.kind.as_str(), round.number),
+        pass_start,
+        &usage_before,
+        &ctx.usage,
+        None,
+    )
+    .await;
+    let gh = super::round::Pr {
+        github: &ctx.github,
+        owner: pr.owner,
+        repo: pr.repo,
+        branch: pr.branch,
+    };
+    match result {
+        Ok(r) if r.timed_out => {
+            if round.may_continue() {
+                park_round(
+                    state,
+                    msg,
+                    (&ctx.ticket_msg, &ctx.usage),
+                    pr,
+                    &round,
+                    true,
+                    created_at,
+                    start,
+                )
+                .await
+            } else {
+                super::round::finish_incomplete(
+                    state,
+                    &msg.team_id,
+                    &msg.run_id,
+                    &gh,
+                    &round,
+                    &run_round::out_of_time(round.kind, round.attempt),
+                )
+                .await;
+                Ok(RoundEnd::Incomplete)
+            }
+        }
+        Ok(_) => {
+            // Done: the round's changes land on the pull request as one
+            // commit, one push.
+            let message =
+                super::round::round_message(state, &msg.team_id, &ctx.ticket_msg, &round).await;
+            match super::round::land(&gh, &round.wip_branch, &round.base_sha, &message).await {
+                super::round::Landed::Pushed { files } => {
+                    super::round::clear(state, &msg.team_id, &msg.run_id).await;
+                    Ok(RoundEnd::Done { files })
+                }
+                super::round::Landed::Nothing => {
+                    super::round::clear(state, &msg.team_id, &msg.run_id).await;
+                    Ok(RoundEnd::Done { files: 0 })
+                }
+                super::round::Landed::Refused(why) => {
+                    super::round::finish_incomplete(
+                        state,
+                        &msg.team_id,
+                        &msg.run_id,
+                        &gh,
+                        &round,
+                        &format!("its changes couldn't land on the pull request: {why}"),
+                    )
+                    .await;
+                    Ok(RoundEnd::Incomplete)
+                }
+            }
+        }
+        Err(e) => {
+            let err: &(dyn std::error::Error + 'static) = &*e;
+            // A transient model failure is another step of the same round
+            // (bounded by its attempts), not the round failing.
+            if common::model_retry::is_transient_model_error(err) && round.may_continue() {
+                warn!(run_id = msg.run_id, error = %e, "Fix round hit a transient model error — continuing in a fresh step");
+                return park_round(
+                    state,
+                    msg,
+                    (&ctx.ticket_msg, &ctx.usage),
+                    pr,
+                    &round,
+                    true,
+                    created_at,
+                    start,
+                )
+                .await;
+            }
+            error!(run_id = msg.run_id, error = %e, "Fix round failed");
+            super::round::finish_incomplete(
+                state,
+                &msg.team_id,
+                &msg.run_id,
+                &gh,
+                &round,
+                &run_round::errored(round.kind, &common::run_fail::error_text(err)),
+            )
+            .await;
+            Ok(RoundEnd::Incomplete)
+        }
+    }
+}
+
+/// A parked round, picked up by a fresh invocation with its whole budget:
+/// it runs before anything else the resume would do.
+async fn run_pending_round(
+    state: &WorkerState,
+    msg: &ResumeMessage,
+    run_record: &std::collections::HashMap<String, AttributeValue>,
+    pending: run_round::Round,
+    created_at: Option<chrono::DateTime<chrono::Utc>>,
+    start: &std::time::Instant,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let text = |k: &str| {
+        run_record
+            .get(k)
+            .and_then(|v| v.as_s().ok())
+            .cloned()
+            .unwrap_or_default()
+    };
+    let num = |k: &str| {
+        run_record
+            .get(k)
+            .and_then(|v| v.as_n().ok())
+            .and_then(|n| n.parse::<u64>().ok())
+            .unwrap_or(0)
+    };
+    let repo_full = text("repo");
+    let (owner, repo) = repo_full.split_once('/').unwrap_or(("", ""));
+    let branch = text("branch");
+    let pr_number = num("pr_number");
+    let pr_url = text("pr_url");
+    if owner.is_empty() || branch.is_empty() || pr_number == 0 {
+        warn!(
+            run_id = msg.run_id,
+            "Parked round on a run without its pull request — dropping it"
+        );
+        super::round::clear(state, &msg.team_id, &msg.run_id).await;
+        return Ok(());
+    }
+    // Claim the run, as every resume that works does.
+    let claimed = state
+        .dynamo
+        .update_item()
+        .table_name(&state.config.runs_table_name)
+        .key("team_id", attr_s(&msg.team_id))
+        .key("run_id", attr_s(&msg.run_id))
+        .update_expression(
+            "SET #s = :new_s, status_run_id = :sri, current_pass = :cp, updated_at = :t",
+        )
+        .condition_expression("#s = :expected")
+        .expression_attribute_names("#s", "status")
+        .expression_attribute_values(":expected", attr_s("awaiting_ci"))
+        .expression_attribute_values(":new_s", attr_s("running"))
+        .expression_attribute_values(":sri", attr_s(&format!("running#{}", msg.run_id)))
+        .expression_attribute_values(":cp", attr_s("implement"))
+        .expression_attribute_values(":t", attr_s(&chrono::Utc::now().to_rfc3339()))
+        .send()
+        .await
+        .is_ok();
+    if !claimed {
+        info!(
+            run_id = msg.run_id,
+            "Could not claim the run for its parked round, skipping"
+        );
+        return Ok(());
+    }
+    let base_branch = run_record
+        .get("base_branch")
+        .and_then(|v| v.as_s().ok())
+        .cloned()
+        .unwrap_or_else(|| "main".to_string());
+    let mut ctx = fix_context(
+        state,
+        msg,
+        run_record,
+        &FixTarget {
+            owner,
+            repo,
+            base_branch: &base_branch,
+            ticket_id: &text("ticket_id"),
+            title: &text("title"),
+            issue_number: num("issue_number"),
+        },
+    )
+    .await?;
+    let pr = PrRef {
+        owner,
+        repo,
+        branch: &branch,
+        number: pr_number,
+        url: &pr_url,
+    };
+    info!(
+        run_id = msg.run_id,
+        kind = pending.kind.as_str(),
+        number = pending.number,
+        attempt = pending.attempt,
+        "Running a parked fix round with its own budget"
+    );
+    let round = pending.resumed(chrono::Utc::now());
+    let kind = round.kind;
+    let number = round.number;
+    match run_fix_round(state, msg, &mut ctx, &pr, round, created_at, start).await? {
+        RoundEnd::Parked => {}
+        RoundEnd::Incomplete => {
+            complete_run_with_status(
+                state,
+                &ctx.ticket_msg,
+                &msg.run_id,
+                "completed",
+                &pr_url,
+                pr_number,
+                &branch,
+                &ctx.usage,
+                wall_clock_secs(created_at, start),
+            )
+            .await?;
+        }
+        RoundEnd::Done { files: 0 } => {
+            if kind == run_round::Kind::CiFix {
+                super::record_ci_outcome(
+                    state,
+                    &msg.team_id,
+                    &msg.run_id,
+                    super::CiOutcome::HandedOff(super::GaveUp::NoChange),
+                )
+                .await;
+            }
+            mark_pr_ready(state, &msg.team_id, &ctx.github, owner, repo, pr_number).await;
+            complete_run_with_status(
+                state,
+                &ctx.ticket_msg,
+                &msg.run_id,
+                "completed",
+                &pr_url,
+                pr_number,
+                &branch,
+                &ctx.usage,
+                wall_clock_secs(created_at, start),
+            )
+            .await?;
+        }
+        RoundEnd::Done { .. } => {
+            if kind == run_round::Kind::CiFix {
+                super::record_ci_outcome(
+                    state,
+                    &msg.team_id,
+                    &msg.run_id,
+                    super::CiOutcome::FixCommitted,
+                )
+                .await;
+            }
+            save_checkpoint(
+                state,
+                &msg.team_id,
+                &msg.run_id,
+                "pr",
+                &branch,
+                number.min(u8::MAX as u32) as u8,
+                &ctx.usage,
+            )
+            .await;
+            let still_active = set_run_awaiting_ci(
+                state,
+                &ctx.ticket_msg,
+                &msg.run_id,
+                &pr_url,
+                pr_number,
+                &branch,
+                &ctx.usage,
+                wall_clock_secs(created_at, start),
+            )
+            .await?;
+            if still_active {
+                send_delayed_resume(state, msg, 120).await;
+            }
+        }
+    }
     Ok(())
 }
 
@@ -3113,11 +3742,13 @@ async fn set_run_awaiting_ci(
              tokens_in = :ti, tokens_out = :to, cache_read_tokens = :crt, cache_write_tokens = :cwt, \
              cost_usd = :c, duration_s = :d, updated_at = :t, current_pass = :cp, \
              status_run_id = :sri \
-             REMOVE error_message, #err",
+             REMOVE error_message, #err, #inc",
         )
         .condition_expression(common::run_status::not_ended("#s"))
         .expression_attribute_names("#s", "status")
         .expression_attribute_names("#err", "error")
+        // A round is being worked again: its earlier "didn't finish" is over.
+        .expression_attribute_names("#inc", run_round::INCOMPLETE_FIELD)
         .ended_values()
         .expression_attribute_values(":s", attr_s("awaiting_ci"))
         .expression_attribute_values(":pr", attr_s(pr_url))

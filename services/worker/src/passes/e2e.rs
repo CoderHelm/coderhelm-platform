@@ -831,6 +831,7 @@ async fn own_pr_failures(
             trigger_author: String::new(),
             defer_count: 0,
             model_retries: 0,
+            round_attempt: 0,
         };
         let queue = if state.config.feedback_queue_url.is_empty() {
             &state.config.ticket_queue_url

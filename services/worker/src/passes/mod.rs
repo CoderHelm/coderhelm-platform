@@ -699,6 +699,7 @@ pub mod email_events;
 pub mod feedback;
 pub mod fix_location;
 pub mod formatter;
+pub(crate) mod generators;
 pub mod github_history;
 pub mod health_check;
 pub mod hidden_suggest;
@@ -723,6 +724,7 @@ pub mod open_pr_choice;
 pub mod ops_tools;
 mod plan;
 pub mod plan_chat;
+pub(crate) mod plan_coverage;
 pub mod plan_execute;
 mod plan_judge;
 /// Plugin runs, publishing, source sync and results.
@@ -753,6 +755,7 @@ pub mod review_scope;
 pub mod review_sweep;
 pub mod review_verdict;
 pub mod rewards;
+pub(crate) mod round;
 mod security;
 #[cfg(test)]
 mod selfhost_links;
@@ -2383,6 +2386,7 @@ async fn run_passes(
             checks::detect_ci(&github, &msg.repo_owner, &msg.repo_name, &msg.base_branch).await;
         implement::ImplementResult {
             files_modified,
+            timed_out: false,
             conversation_log: vec![],
             // The first attempt's lookups weren't kept; the proof check's
             // fix round can make them again.
@@ -2624,12 +2628,21 @@ async fn run_passes(
                 let pass_start = std::time::Instant::now();
                 let usage_before = usage.clone();
 
+                // A fix round on an open PR: checkpoints go to its own WIP
+                // branch, and the PR gets one commit (one push) at the end.
+                let fix_base =
+                    round::branch_head(&github, &msg.repo_owner, &msg.repo_name, &branch_name)
+                        .await;
+                let fix_wip =
+                    round::open_wip(&github, &msg.repo_owner, &msg.repo_name, &branch_name, "")
+                        .await?;
+
                 match implement::run(
                     state,
                     msg,
                     &github,
                     &plan_result,
-                    &branch_name,
+                    &fix_wip,
                     &[],
                     "",
                     Some(&feedback),
@@ -2638,14 +2651,51 @@ async fn run_passes(
                     usage,
                     &file_cache,
                     Some(run_id),
-                    None,
+                    implement_deadline,
                     // Scoped only when purely CI-driven; human review comments
                     // in the feedback mean the human's ask wins (unscoped).
                     !has_review_feedback,
                 )
                 .await
-                {
+                .and_then(|r| {
+                    // Partial work never reaches the PR: it stays on the WIP
+                    // branch, and the run starts over below.
+                    if r.timed_out {
+                        Err(format!("ran out of time; its work is kept on `{fix_wip}`").into())
+                    } else {
+                        Ok(r)
+                    }
+                }) {
                     Ok(result) => {
+                        let landed = round::land(
+                            &round::Pr {
+                                github: &github,
+                                owner: &msg.repo_owner,
+                                repo: &msg.repo_name,
+                                branch: &branch_name,
+                            },
+                            &fix_wip,
+                            &fix_base,
+                            &conventions.commit_message(
+                                &tokens,
+                                "Fix the pull request's checks and review comments",
+                            ),
+                        )
+                        .await;
+                        if let round::Landed::Refused(why) = &landed {
+                            warn!(
+                                run_id,
+                                why,
+                                "Fix on re-run didn't land; its work is kept on the WIP branch"
+                            );
+                            add_progress_note(
+                                state,
+                                &msg.team_id,
+                                run_id,
+                                &format!("The fix for PR #{pr_number} didn't land ({why}); its work is kept on `{fix_wip}`"),
+                            )
+                            .await;
+                        }
                         write_pass_trace(
                             state,
                             &msg.team_id,
@@ -2791,8 +2841,29 @@ async fn run_passes(
             })
         };
 
+        // A continuation of this same run (out of time, a model error) keeps
+        // the commits its earlier attempt pushed: resetting the branch to its
+        // base here threw that work away before the continuation could build
+        // on it.
+        let keep_own_branch = same_run
+            && !skip_branch_reset
+            && ticket_update_pr.is_none()
+            && existing_pr.is_none()
+            && github
+                .get_ref(&msg.repo_owner, &msg.repo_name, &branch_name)
+                .await
+                .is_ok();
         if ticket_update_pr.is_some() {
             // Progress note already posted; the branch keeps the PR's head.
+        } else if keep_own_branch {
+            info!(run_id, branch = %branch_name, "Continuation: keeping the earlier attempt's commits");
+            add_progress_note(
+                state,
+                &msg.team_id,
+                run_id,
+                &format!("Continuing on {branch_name} from the earlier attempt's commits"),
+            )
+            .await;
         } else if skip_branch_reset {
             let pr_number = existing_pr
                 .as_ref()
@@ -3488,6 +3559,12 @@ async fn run_passes(
             usage,
         )
         .await;
+        // A continuation picks up the planned tasks the branch doesn't do yet.
+        let still_to_do = if msg.continuation > 0 {
+            continuation_feedback(&github, msg, &plan_result, &branch_name).await
+        } else {
+            None
+        };
         let pass_start = std::time::Instant::now();
         let usage_before = usage.clone();
         let result = implement::run(
@@ -3498,7 +3575,7 @@ async fn run_passes(
             &branch_name,
             &rules,
             &repo_instructions,
-            None,
+            still_to_do.as_deref(),
             &effective_complexity,
             &provider,
             usage,
@@ -3700,32 +3777,105 @@ async fn run_passes(
             return Ok(());
         }
 
-        // Mark all tasks as done in S3 openspec so retries/dashboard see progress
-        let tasks_key = format!(
-            "{}/tasks.md",
-            openspec_prefix(
-                &msg.team_id,
-                &msg.ticket_id,
-                &msg.repo_owner,
-                &msg.repo_name
-            )
-        );
-        let checked = plan_result.tasks.replace("- [ ]", "- [x]");
-        if let Err(e) = state
-            .s3
-            .put_object()
-            .bucket(&state.config.bucket_name)
-            .key(&tasks_key)
-            .body(checked.as_bytes().to_vec().into())
-            .content_type("text/markdown")
-            .send()
-            .await
-        {
-            warn!(run_id, error = %e, "Failed to update tasks.md with checked items");
-        }
-
         result
     };
+
+    // --- Plan check: the plan is done, task by task, before the PR ---
+    // What the implement pass changed is compared with the plan's checklist;
+    // tasks not done get rounds aimed at them, then a fresh invocation, and a
+    // pull request never opens with planned work missing.
+    check_cancelled(state, &msg.team_id, run_id).await?;
+    let mut impl_result = impl_result;
+    let mut plan_optional: Vec<proof::Finding> = Vec::new();
+    let coverage = plan_coverage::close_gaps(
+        &plan_coverage::Work {
+            state,
+            msg,
+            github: &github,
+            plan: &plan_result,
+            branch: &branch_name,
+            rules: &rules,
+            repo_instructions: &repo_instructions,
+            provider: &provider,
+            file_cache: &file_cache,
+            run_id,
+            deadline: implement_deadline,
+        },
+        &mut impl_result.evidence,
+        usage,
+        || has_time_for_remediation(start),
+    )
+    .await;
+    if let Some(cov) = coverage {
+        // Only the tasks the branch did are checked off, so the run page and
+        // a later attempt see the truth.
+        save_checked_tasks(
+            state,
+            msg,
+            run_id,
+            &plan_coverage::checked_tasks_md(&plan_result.tasks, &cov),
+        )
+        .await;
+        add_progress_note(
+            state,
+            &msg.team_id,
+            run_id,
+            &plan_coverage::progress_note(&cov),
+        )
+        .await;
+        match plan_coverage::next(&cov, plan_coverage::MAX_ROUNDS, false) {
+            plan_coverage::Next::Complete => {}
+            plan_coverage::Next::OpenWithOptional => {
+                plan_optional = plan_coverage::optional_findings(&cov);
+            }
+            plan_coverage::Next::Round | plan_coverage::Next::Unfinished => {
+                // A fresh invocation, with its own time, continues from this
+                // branch (bounded); the continuation is told what's left.
+                save_checkpoint(
+                    state,
+                    &msg.team_id,
+                    run_id,
+                    "implement_started",
+                    &branch_name,
+                    0,
+                    usage,
+                )
+                .await;
+                let resume_from = Some(("implement_started".to_string(), branch_name.clone(), 0u8));
+                if try_auto_continue(state, msg, run_id, &resume_from, &["implement_started"]).await
+                {
+                    add_progress_note(
+                        state,
+                        &msg.team_id,
+                        run_id,
+                        &format!(
+                            "{} planned task(s) not done yet: continuing in a fresh step with its own time budget",
+                            cov.required_missing().len()
+                        ),
+                    )
+                    .await;
+                    close_memory(state, agent_memory.take()).await;
+                    return Ok(());
+                }
+                // Out of continuations: stop without a pull request, the
+                // work kept on a branch a later run won't reset.
+                save_checkpoint(
+                    state,
+                    &msg.team_id,
+                    run_id,
+                    "implement",
+                    &branch_name,
+                    0,
+                    usage,
+                )
+                .await;
+                let kept =
+                    keep_wip_branch(&github, &msg.repo_owner, &msg.repo_name, &branch_name).await;
+                close_memory(state, agent_memory.take()).await;
+                return Err(plan_coverage::stop_reason(&cov, &kept).into());
+            }
+        }
+    }
 
     // --- Adversarial Test (multi-repo path) ---
     check_cancelled(state, &msg.team_id, run_id).await?;
@@ -3958,6 +4108,37 @@ async fn run_passes(
     // --- Proof check (before PR — what the change rests on is proven) ---
     check_cancelled(state, &msg.team_id, run_id).await?;
     update_pass(state, &msg.team_id, run_id, "review").await?;
+    // --- Generated files: regenerated with the change, or the PR waits ---
+    match generators::gate(
+        &plan_coverage::Work {
+            state,
+            msg,
+            github: &github,
+            plan: &plan_result,
+            branch: &branch_name,
+            rules: &rules,
+            repo_instructions: &repo_instructions,
+            provider: &provider,
+            file_cache: &file_cache,
+            run_id,
+            deadline: implement_deadline,
+        },
+        usage,
+    )
+    .await
+    {
+        Ok(notes) => {
+            for n in notes {
+                add_progress_note(state, &msg.team_id, run_id, &n).await;
+            }
+        }
+        Err(why) => {
+            let kept =
+                keep_wip_branch(&github, &msg.repo_owner, &msg.repo_name, &branch_name).await;
+            close_memory(state, agent_memory.take()).await;
+            return Err(format!("{why} The work so far is kept on branch `{kept}`.").into());
+        }
+    }
     let mut evidence = impl_result.evidence.clone();
     let work = proof::Work {
         state,
@@ -3970,11 +4151,25 @@ async fn run_passes(
         provider: &provider,
         file_cache: &file_cache,
         run_id,
+        deadline: implement_deadline,
     };
-    let gaps = proof::prove(&work, &mut evidence, usage, || {
+    let mut gaps = proof::prove(&work, &mut evidence, usage, || {
         has_time_for_remediation(start)
     })
     .await;
+    // Planned work the check found not done is never an Open item: the pull
+    // request doesn't open without it.
+    if !proof::planned_work(&gaps).is_empty() {
+        let kept = keep_wip_branch(&github, &msg.repo_owner, &msg.repo_name, &branch_name).await;
+        close_memory(state, agent_memory.take()).await;
+        return Err(format!(
+            "{} The work so far is kept on branch `{kept}`.",
+            proof::unfinished_reason(&gaps)
+        )
+        .into());
+    }
+    // Tasks the plan marks optional and the change left out, named.
+    gaps.extend(plan_optional);
     // Every redirect and link the change adds or changes, checked live; a
     // failure that survives its fix round stops the run before the PR.
     let links = link_checks::gate(&work, &mut evidence, usage, || {
@@ -4181,6 +4376,71 @@ async fn run_passes(
     Ok(())
 }
 
+/// Keeps a branch's commits on `coderhelm-wip/<branch>` when a run stops before its
+/// pull request: a later run of the ticket resets the run branch to its
+/// base, and the work must survive that. Returns the branch the work is on
+/// (the run branch itself when the copy can't be made).
+async fn keep_wip_branch(github: &GitHubClient, owner: &str, repo: &str, branch: &str) -> String {
+    let wip = common::run_round::wip_branch(branch);
+    match github.create_branch(owner, repo, &wip, branch).await {
+        Ok(_) => wip,
+        Err(e) => {
+            warn!(branch, error = %e, "Could not keep the work on a WIP branch");
+            branch.to_string()
+        }
+    }
+}
+
+/// The plan's checklist with only the done tasks checked, written where the
+/// run page and a later attempt read it.
+async fn save_checked_tasks(state: &WorkerState, msg: &TicketMessage, run_id: &str, md: &str) {
+    let tasks_key = format!(
+        "{}/tasks.md",
+        openspec_prefix(
+            &msg.team_id,
+            &msg.ticket_id,
+            &msg.repo_owner,
+            &msg.repo_name
+        )
+    );
+    if let Err(e) = state
+        .s3
+        .put_object()
+        .bucket(&state.config.bucket_name)
+        .key(&tasks_key)
+        .body(md.as_bytes().to_vec().into())
+        .content_type("text/markdown")
+        .send()
+        .await
+    {
+        warn!(run_id, error = %e, "Failed to update tasks.md with checked items");
+    }
+}
+
+/// For a continuation: the planned tasks its branch doesn't do yet, as the
+/// implement pass's instructions. `None` when all are done or it can't tell.
+async fn continuation_feedback(
+    github: &GitHubClient,
+    msg: &TicketMessage,
+    plan: &plan::PlanResult,
+    branch: &str,
+) -> Option<String> {
+    let tasks = plan_coverage::plan_tasks(&plan.tasks);
+    if tasks.is_empty() {
+        return None;
+    }
+    let changed = plan_coverage::changed_files(
+        github,
+        &msg.repo_owner,
+        &msg.repo_name,
+        &msg.base_branch,
+        branch,
+    )
+    .await?;
+    let cov = plan_coverage::coverage(&tasks, &changed);
+    (!cov.required_missing().is_empty()).then(|| plan_coverage::round_feedback(&cov))
+}
+
 /// Run implement → security → PR for a single repo.
 /// Returns a RepoPrResult with the created PR info.
 #[allow(clippy::too_many_arguments)]
@@ -4313,6 +4573,48 @@ async fn run_repo_pipeline(
             repo_owner, repo_name
         )
         .into());
+    }
+
+    // --- Plan check: this repository's tasks are done before its PR ---
+    let mut impl_result = impl_result;
+    let mut plan_optional: Vec<proof::Finding> = Vec::new();
+    if let Some(cov) = plan_coverage::close_gaps(
+        &plan_coverage::Work {
+            state,
+            msg,
+            github,
+            plan: &repo_plan,
+            branch: branch_name,
+            rules,
+            repo_instructions,
+            provider,
+            file_cache,
+            run_id,
+            deadline: implement_deadline,
+        },
+        &mut impl_result.evidence,
+        usage,
+        || has_time_for_remediation(start),
+    )
+    .await
+    {
+        add_progress_note(
+            state,
+            &msg.team_id,
+            run_id,
+            &plan_coverage::progress_note(&cov),
+        )
+        .await;
+        match plan_coverage::next(&cov, plan_coverage::MAX_ROUNDS, false) {
+            plan_coverage::Next::Complete => {}
+            plan_coverage::Next::OpenWithOptional => {
+                plan_optional = plan_coverage::optional_findings(&cov);
+            }
+            plan_coverage::Next::Round | plan_coverage::Next::Unfinished => {
+                let kept = keep_wip_branch(github, repo_owner, repo_name, branch_name).await;
+                return Err(plan_coverage::stop_reason(&cov, &kept).into());
+            }
+        }
     }
 
     // --- Adversarial Test (catches bugs before security/PR) ---
@@ -4498,6 +4800,35 @@ async fn run_repo_pipeline(
 
     // --- Proof check ---
     check_cancelled(state, &msg.team_id, run_id).await?;
+    // Generated files: regenerated with the change, or this repo's PR waits.
+    match generators::gate(
+        &plan_coverage::Work {
+            state,
+            msg,
+            github,
+            plan: &repo_plan,
+            branch: branch_name,
+            rules,
+            repo_instructions,
+            provider,
+            file_cache,
+            run_id,
+            deadline: implement_deadline,
+        },
+        usage,
+    )
+    .await
+    {
+        Ok(notes) => {
+            for n in notes {
+                add_progress_note(state, &msg.team_id, run_id, &n).await;
+            }
+        }
+        Err(why) => {
+            let kept = keep_wip_branch(github, repo_owner, repo_name, branch_name).await;
+            return Err(format!("{why} The work so far is kept on branch `{kept}`.").into());
+        }
+    }
     update_pass(state, &msg.team_id, run_id, "review").await?;
     let mut evidence = impl_result.evidence.clone();
     let work = proof::Work {
@@ -4511,11 +4842,21 @@ async fn run_repo_pipeline(
         provider,
         file_cache,
         run_id,
+        deadline: implement_deadline,
     };
-    let gaps = proof::prove(&work, &mut evidence, usage, || {
+    let mut gaps = proof::prove(&work, &mut evidence, usage, || {
         has_time_for_remediation(start)
     })
     .await;
+    if !proof::planned_work(&gaps).is_empty() {
+        let kept = keep_wip_branch(github, repo_owner, repo_name, branch_name).await;
+        return Err(format!(
+            "{} The work so far is kept on branch `{kept}`.",
+            proof::unfinished_reason(&gaps)
+        )
+        .into());
+    }
+    gaps.extend(plan_optional);
     let links = link_checks::gate(&work, &mut evidence, usage, || {
         has_time_for_remediation(start)
     })
@@ -7086,7 +7427,7 @@ pub(crate) async fn load_codegen_env(
     owner: &str,
     repo: &str,
 ) -> Vec<(String, String)> {
-    let sk = format!("SETTINGS#CODEGEN_ENV#{owner}/{repo}");
+    let sk = common::codegen_env::sk(&format!("{owner}/{repo}"));
     let item = state
         .dynamo
         .get_item()
