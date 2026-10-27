@@ -1191,7 +1191,7 @@ async fn dispatch_support(
     dispatch_inputs(path, &yaml)
 }
 
-fn grep_for(titles: &[String]) -> String {
+pub(crate) fn grep_for(titles: &[String]) -> String {
     titles
         .iter()
         .map(|t| t.rsplit(" › ").next().unwrap_or(t))

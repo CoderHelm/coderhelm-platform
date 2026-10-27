@@ -637,6 +637,26 @@ pub fn logs_client(s: &Session) -> aws_sdk_cloudwatchlogs::Client {
     )
 }
 
+/// S3 through the team's read-only role: only to read the test reports a
+/// team pointed Coderhelm at (`crate::e2e::report_source`).
+pub fn s3_client(s: &Session) -> aws_sdk_s3::Client {
+    use aws_sdk_s3::config::{BehaviorVersion, Credentials, Region};
+    let creds = Credentials::new(
+        &s.access_key_id,
+        &s.secret_access_key,
+        Some(s.session_token.clone()),
+        None,
+        "coderhelm-team-role",
+    );
+    aws_sdk_s3::Client::from_conf(
+        aws_sdk_s3::Config::builder()
+            .behavior_version(BehaviorVersion::latest())
+            .region(Region::new(s.region.clone()))
+            .credentials_provider(creds)
+            .build(),
+    )
+}
+
 pub fn rdsdata_client(s: &Session) -> aws_sdk_rdsdata::Client {
     use aws_sdk_rdsdata::config::{BehaviorVersion, Credentials, Region};
     let creds = Credentials::new(

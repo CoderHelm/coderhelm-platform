@@ -3109,6 +3109,116 @@ impl GitHubClient {
         self.post(&url, &payload).await?;
         Ok(())
     }
+
+    // ─── Test fixes: history, checks and re-runs ────────────────
+
+    /// The installation this client acts for.
+    pub fn installation_id(&self) -> u64 {
+        self.installation_id
+    }
+
+    /// Commits on the default branch that touched `path`, newest first,
+    /// since `since` (RFC 3339) when given.
+    pub async fn commits_for_path(
+        &self,
+        owner: &str,
+        repo: &str,
+        path: &str,
+        since: Option<&str>,
+        per_page: u32,
+    ) -> Result<Vec<serde_json::Value>, Box<dyn std::error::Error + Send + Sync>> {
+        let mut url = format!(
+            "{API_BASE}/repos/{owner}/{repo}/commits?path={}&per_page={}",
+            urlencoding::encode(path),
+            per_page.min(100)
+        );
+        if let Some(s) = since.filter(|s| !s.is_empty()) {
+            url.push_str(&format!("&since={}", urlencoding::encode(s)));
+        }
+        Ok(self
+            .get(&url)
+            .await?
+            .as_array()
+            .cloned()
+            .unwrap_or_default())
+    }
+
+    /// One workflow run.
+    pub async fn get_workflow_run(
+        &self,
+        owner: &str,
+        repo: &str,
+        run_id: u64,
+    ) -> Result<serde_json::Value, Box<dyn std::error::Error + Send + Sync>> {
+        self.get(&format!(
+            "{API_BASE}/repos/{owner}/{repo}/actions/runs/{run_id}"
+        ))
+        .await
+    }
+
+    /// Runs of one workflow (by file name) on a branch, newest first.
+    pub async fn list_workflow_runs(
+        &self,
+        owner: &str,
+        repo: &str,
+        workflow_file: &str,
+        branch: &str,
+    ) -> Result<Vec<serde_json::Value>, Box<dyn std::error::Error + Send + Sync>> {
+        let url = format!(
+            "{API_BASE}/repos/{owner}/{repo}/actions/workflows/{}/runs?branch={}&per_page=20",
+            urlencoding::encode(workflow_file),
+            urlencoding::encode(branch)
+        );
+        Ok(self.get(&url).await?["workflow_runs"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default())
+    }
+
+    /// Runs a whole workflow run again (every job, so a skipped one is
+    /// evaluated again).
+    pub async fn rerun_workflow_run(
+        &self,
+        owner: &str,
+        repo: &str,
+        run_id: u64,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.post_empty(
+            &format!("{API_BASE}/repos/{owner}/{repo}/actions/runs/{run_id}/rerun"),
+            &serde_json::json!({}),
+        )
+        .await
+    }
+
+    /// The rules that apply to a branch (rulesets), readable with metadata
+    /// access.
+    pub async fn branch_rules(
+        &self,
+        owner: &str,
+        repo: &str,
+        branch: &str,
+    ) -> Result<serde_json::Value, Box<dyn std::error::Error + Send + Sync>> {
+        self.get(&format!(
+            "{API_BASE}/repos/{owner}/{repo}/rules/branches/{}",
+            urlencoding::encode(branch)
+        ))
+        .await
+    }
+
+    /// Classic branch protection's required status checks (needs read
+    /// access to administration; callers treat an error as none).
+    pub async fn required_status_checks(
+        &self,
+        owner: &str,
+        repo: &str,
+        branch: &str,
+    ) -> Result<serde_json::Value, Box<dyn std::error::Error + Send + Sync>> {
+        self.get(&format!(
+            "{API_BASE}/repos/{owner}/{repo}/branches/{}/protection/required_status_checks",
+            urlencoding::encode(branch)
+        ))
+        .await
+    }
 }
 
 // ─── Types ──────────────────────────────────────────────────

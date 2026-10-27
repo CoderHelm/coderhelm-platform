@@ -7,15 +7,35 @@
 //! - [`detect`] decides healthy, flaky, broken or fixed; pure and tested.
 //! - [`coverage`] maps code to the areas tests cover.
 //! - [`store`] keeps runs, tests, failure groups and recommendations.
+//!
+//! Fixing a failing or flaky test from a ticket or pull request:
+//!
+//! - [`report_source`] is where a team keeps each repository's reports.
+//! - [`failure`] reads the real error and the page state at the failure.
+//! - [`flake`] counts passes and failures across the reports kept.
+//! - [`fix_guard`] refuses waits without evidence and helpers that walk
+//!   every row.
+//! - [`test_package`] checks test code in its own package and repeats the
+//!   affected spec.
+//! - [`check_gate`] keeps the pull request a draft until the checks that
+//!   test it are green on its head.
+//! - [`fix_ticket`] reads the ticket and shapes the description.
 
+pub mod check_gate;
 pub mod ci_setup;
 pub mod coverage;
 pub mod detect;
+pub mod failure;
+pub mod fix_guard;
+pub mod fix_ticket;
+pub mod flake;
 pub mod messages;
 pub mod model;
 pub mod owners;
 pub mod parse;
+pub mod report_source;
 pub mod signature;
 pub mod stats;
 pub mod store;
+pub mod test_package;
 pub mod triage;

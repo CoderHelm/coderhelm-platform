@@ -93,6 +93,9 @@ pub const BUILTIN: &[(&str, Risk)] = &[
     ("airflow_task_log", Risk::Read),
     ("airflow_import_errors", Risk::Read),
     ("airflow_health", Risk::Read),
+    // A repository's test reports, where the team keeps them.
+    ("test_report", Risk::Read),
+    ("test_pass_counts", Risk::Read),
     // Team skills and agents.
     ("read_skill", Risk::Read),
     ("read_skill_file", Risk::Read),

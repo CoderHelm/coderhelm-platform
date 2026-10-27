@@ -422,6 +422,9 @@ pub async fn run(
     // code changes and the description rewrite all follow them.
     let team_instructions =
         super::load_team_instructions(state, &msg.team_id, &msg.repo_owner, &msg.repo_name).await;
+    // A failing-test fix's run keeps its failure evidence and rules.
+    let team_instructions =
+        super::test_fix::with_saved(state, &msg.team_id, &msg.run_id, team_instructions).await;
     let team_block = super::team_instructions_block(&team_instructions);
 
     // Code changes made while addressing comments follow the same test rule.
@@ -758,6 +761,19 @@ Rules:
         fix_pushed,
     )
     .await;
+    // What the failing-test rules refuse in the pushed change is said on
+    // the PR (the ready check keeps it a draft).
+    if fix_pushed {
+        super::test_fix::after_feedback(
+            state,
+            &github,
+            &msg.team_id,
+            &msg.repo_owner,
+            &msg.repo_name,
+            msg.pr_number,
+        )
+        .await;
+    }
     let head_sha = if fix_pushed {
         github
             .get_pull_request(&msg.repo_owner, &msg.repo_name, msg.pr_number)

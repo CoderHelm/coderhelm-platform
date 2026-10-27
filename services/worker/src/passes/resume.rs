@@ -3172,6 +3172,13 @@ pub(crate) async fn mark_pr_ready(
         warn!(pr_number, blocking = ?r.blocking, "Link and redirect checks fail now; the PR stays a draft");
         return;
     }
+    // A failing-test fix stays a draft until the checks that test it are
+    // green on its head and a repeat run passed.
+    if let super::test_fix::Hold::Wait(_) =
+        super::test_fix::ready_gate(state, github, team_id, repo_owner, repo_name, pr_number).await
+    {
+        return;
+    }
     // With a team commit template, the final squash keeps the message the
     // run's first commit was given from it; otherwise the PR title, as always.
     let keep_first = super::load_git_conventions(state, team_id, "")
