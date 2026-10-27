@@ -3255,6 +3255,16 @@
       "RunQuestion": {
         "description": "A question a run asked a person.",
         "properties": {
+          "decision": {
+            "description": "Set when the question is a choice CoderHelm records on the ticket and\nhonours on every later run, such as what to do about a pull request\nsomeone else opened (`open_pr:owner/name#number`).",
+            "examples": [
+              null
+            ],
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "id": {
             "description": "The question's id within the run (`q1`, `q2`, ...).",
             "examples": [
@@ -3270,7 +3280,7 @@
             "type": "string"
           },
           "suggestions": {
-            "description": "Candidate answers the run found in the code or the data.",
+            "description": "Candidate answers the run found in the code or the data. When\n`decision` is set, these are the choices.",
             "examples": [
               [
                 "Production only",

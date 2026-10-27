@@ -718,6 +718,7 @@ mod log_fix_checks;
 mod log_fix_eval;
 pub mod model_check;
 pub mod onboard;
+pub mod open_pr_choice;
 pub mod ops_tools;
 mod plan;
 pub mod plan_chat;
@@ -735,6 +736,7 @@ pub mod release_notes;
 pub mod remote_mcp;
 pub(crate) mod repo_pick;
 mod resolve;
+mod resolved;
 pub mod resume;
 mod review;
 pub mod review_actions;
@@ -1186,6 +1188,14 @@ async fn run_passes(
     for r in &history.runs {
         common::run_questions::merge(&mut msg.answers, &r.answers);
     }
+    // So do the choices people made on CoderHelm's notices (an open pull
+    // request: work on it, or open CoderHelm's own), as settled questions.
+    let decided: Vec<common::run_questions::Answer> = history
+        .decisions
+        .iter()
+        .map(common::ticket_state::decision_answer)
+        .collect();
+    common::run_questions::merge(&mut msg.answers, &decided);
     // Every pull request for the ticket in the team's repositories (this
     // repo first; CoderHelm's or anyone's), read in full with how it ended:
     // an earlier attempt often holds the design, and its close event says
@@ -2260,10 +2270,18 @@ async fn run_passes(
     // The team's branch/commit/PR title templates, read once for the run.
     let conventions = load_git_conventions(state, &msg.team_id, &msg.ticket_id).await;
     let tokens = ticket_tokens(msg);
+    // A pull request someone else opened for this ticket: what a person
+    // decided about it (their replies to CoderHelm's notice, read newest
+    // first and recorded on the ticket, so every later run honours them).
+    // `own`: open CoderHelm's own and leave the other one as it is.
+    // `existing`: work on the other one's branch. Undecided: the guard below
+    // stops and asks, once.
+    let mut open_pr_settled = msg.person_direction.is_some();
+    let mut other_open_pr: Option<open_pr_choice::OtherPr> = None;
     let branch_name = if can_skip_implement {
         checkpoint.as_ref().unwrap().1.clone()
     } else {
-        resolve_run_branch(
+        let own_branch = resolve_run_branch(
             &github,
             &msg.repo_owner,
             &msg.repo_name,
@@ -2272,7 +2290,51 @@ async fn run_passes(
             &tokens,
             "",
         )
+        .await;
+        match open_pr_for_ticket(
+            &github,
+            &msg.repo_owner,
+            &msg.repo_name,
+            &msg.ticket_id,
+            &own_branch,
+        )
         .await
+        {
+            Some(other) if !open_pr_settled => {
+                match open_pr_choice::decide(state, &provider, msg, &github, &other, usage).await {
+                    open_pr_choice::Choice::Own => {
+                        open_pr_settled = true;
+                        add_progress_note(
+                            state,
+                            &msg.team_id,
+                            run_id,
+                            &format!(
+                                "Opening my own pull request, as a person said; #{} stays open as it is.",
+                                other.number
+                            ),
+                        )
+                        .await;
+                        own_branch
+                    }
+                    open_pr_choice::Choice::Existing if other.same_repo => {
+                        open_pr_settled = true;
+                        add_progress_note(
+                            state,
+                            &msg.team_id,
+                            run_id,
+                            &format!("Working on #{}, as a person said.", other.number),
+                        )
+                        .await;
+                        other.head.clone()
+                    }
+                    _ => {
+                        other_open_pr = Some(other);
+                        own_branch
+                    }
+                }
+            }
+            _ => own_branch,
+        }
     };
 
     let impl_result = if can_skip_implement {
@@ -2349,20 +2411,11 @@ async fn run_passes(
             }
         };
         // Someone else's open pull request for this ticket (a person's, or an
-        // earlier run's on another branch): don't open a second one unless a
-        // person said to go ahead.
-        if existing_pr.is_none() && msg.person_direction.is_none() {
-            if let Some(other) = open_pr_for_ticket(
-                &github,
-                &msg.repo_owner,
-                &msg.repo_name,
-                &msg.ticket_id,
-                &branch_name,
-            )
-            .await
-            {
-                let repo = format!("{}/{}", msg.repo_owner, msg.repo_name);
-                stop_for_open_pr(state, msg, &github, run_id, usage, start, &repo, &other).await;
+        // earlier run's on another branch), and nobody has said what to do
+        // about it: don't open a second one; ask (once).
+        if existing_pr.is_none() && !open_pr_settled {
+            if let Some(other) = other_open_pr.as_ref() {
+                stop_for_open_pr(state, msg, &github, run_id, usage, start, other).await;
                 close_memory(state, agent_memory.take()).await;
                 return Ok(());
             }
@@ -3149,7 +3202,8 @@ async fn run_passes(
             }
 
             // A pull request for this ticket already open in any of the repos
-            // (a person's, or an earlier run's): none is opened twice.
+            // (a person's, or an earlier run's): none is opened twice, unless
+            // a person said to open CoderHelm's own.
             if msg.person_direction.is_none() {
                 for (repo_task, own) in plan_result.repo_tasks.iter().zip(&repo_branches) {
                     if let Some(other) = open_pr_for_ticket(
@@ -3161,9 +3215,13 @@ async fn run_passes(
                     )
                     .await
                     {
-                        let repo = format!("{}/{}", repo_task.owner, repo_task.name);
-                        stop_for_open_pr(state, msg, &github, run_id, usage, start, &repo, &other)
-                            .await;
+                        let choice =
+                            open_pr_choice::decide(state, &provider, msg, &github, &other, usage)
+                                .await;
+                        if choice == open_pr_choice::Choice::Own {
+                            continue;
+                        }
+                        stop_for_open_pr(state, msg, &github, run_id, usage, start, &other).await;
                         close_memory(state, agent_memory.take()).await;
                         return Ok(());
                     }
@@ -5742,16 +5800,17 @@ pub fn is_own_login(login: &str) -> bool {
 }
 
 /// An open pull request in `owner/name` that already names the ticket (in
-/// its title, branch or description), other than the one on `own_branch`:
-/// `(number, title, author)`. A failed lookup finds none.
+/// its title, branch or description), other than the one on `own_branch`.
+/// A failed lookup finds none.
 async fn open_pr_for_ticket(
     github: &GitHubClient,
     owner: &str,
     name: &str,
     ticket: &str,
     own_branch: &str,
-) -> Option<(u64, String, String)> {
+) -> Option<open_pr_choice::OtherPr> {
     let prs = github.list_open_pulls(owner, name).await.ok()?;
+    let repo = format!("{owner}/{name}");
     prs.as_array()?.iter().find_map(|p| {
         let head = p["head"]["ref"].as_str().unwrap_or("");
         let title = p["title"].as_str().unwrap_or("");
@@ -5760,12 +5819,15 @@ async fn open_pr_for_ticket(
             && (mentions_ticket(title, ticket)
                 || mentions_ticket(head, ticket)
                 || mentions_ticket(body, ticket)))
-        .then(|| {
-            (
-                p["number"].as_u64().unwrap_or(0),
-                title.to_string(),
-                p["user"]["login"].as_str().unwrap_or("").to_string(),
-            )
+        .then(|| open_pr_choice::OtherPr {
+            repo: repo.clone(),
+            number: p["number"].as_u64().unwrap_or(0),
+            title: title.to_string(),
+            author: p["user"]["login"].as_str().unwrap_or("").to_string(),
+            head: head.to_string(),
+            same_repo: p["head"]["repo"]["full_name"]
+                .as_str()
+                .is_some_and(|f| f.eq_ignore_ascii_case(&repo)),
         })
     })
 }
@@ -5793,8 +5855,8 @@ async fn repo_of_ticket_pr(
         let Some((owner, name)) = r.split_once('/') else {
             continue;
         };
-        if let Some((number, _, _)) = open_pr_for_ticket(github, owner, name, ticket_id, "").await {
-            found.push((r.clone(), number));
+        if let Some(pr) = open_pr_for_ticket(github, owner, name, ticket_id, "").await {
+            found.push((r.clone(), pr.number));
         }
     }
     match found.as_slice() {
@@ -5806,8 +5868,10 @@ async fn repo_of_ticket_pr(
     }
 }
 
-/// Stops a run because a pull request for its ticket is already open: says
-/// so on the ticket and the run, and waits for a person to say what to do.
+/// Stops a run because a pull request for its ticket is already open and
+/// nobody has said what to do about it: posts the notice on the ticket
+/// (once: a notice already posted and not answered is linked, never
+/// repeated) and leaves the choice on the run page as a question.
 #[allow(clippy::too_many_arguments)]
 async fn stop_for_open_pr(
     state: &WorkerState,
@@ -5816,35 +5880,29 @@ async fn stop_for_open_pr(
     run_id: &str,
     usage: &TokenUsage,
     start: &std::time::Instant,
-    repo: &str,
-    pr: &(u64, String, String),
+    pr: &open_pr_choice::OtherPr,
 ) {
-    let note = format!(
-        "An open pull request for {} already exists in {repo}: #{} \"{}\" by {}. I didn't open another. Reply here to have me work on that pull request, or to go ahead with my own.",
-        msg.ticket_id, pr.0, pr.1, pr.2
-    );
+    let note = open_pr_choice::notice_text(&msg.ticket_id, pr);
     info!(
         run_id,
-        repo,
-        pr = pr.0,
+        repo = %pr.repo,
+        pr = pr.number,
         "Open pull request for the ticket exists — not opening another"
     );
     add_progress_note(state, &msg.team_id, run_id, &note).await;
-    if matches!(msg.source, TicketSource::Github) && msg.issue_number > 0 {
-        let _ = github
-            .create_issue_comment(&msg.repo_owner, &msg.repo_name, msg.issue_number, &note)
-            .await;
-    } else if matches!(msg.source, TicketSource::Jira) && !msg.ticket_id.is_empty() {
-        let _ = post_jira_comment(
-            state,
-            &msg.team_id,
-            &msg.ticket_id,
-            &note,
-            "clarification",
-            "A pull request is already open",
-        )
-        .await;
-    }
+    let question = open_pr_choice::notice_question(pr);
+    ask_on_ticket_keyed(
+        state,
+        msg,
+        run_id,
+        github,
+        std::slice::from_ref(&question),
+        &note,
+        &note,
+        "A pull request is already open",
+        &pr.key(),
+    )
+    .await;
     mark_run_needs_input(state, msg, run_id, usage, start, &[]).await;
 }
 
@@ -5957,7 +6015,72 @@ async fn ask_on_ticket(
     jira_body: &str,
     jira_title: &str,
 ) {
+    ask_on_ticket_keyed(
+        state,
+        msg,
+        run_id,
+        github,
+        questions,
+        github_body,
+        jira_body,
+        jira_title,
+        "",
+    )
+    .await
+}
+
+/// [`ask_on_ticket`], for a notice about `key` (a decision key, or empty):
+/// one already posted with the same text, or about the same key and not
+/// decided since, is linked instead of posted again.
+#[allow(clippy::too_many_arguments)]
+async fn ask_on_ticket_keyed(
+    state: &WorkerState,
+    msg: &TicketMessage,
+    run_id: &str,
+    github: &GitHubClient,
+    questions: &[common::run_questions::Question],
+    github_body: &str,
+    jira_body: &str,
+    jira_title: &str,
+    key: &str,
+) {
+    let text_hash = common::sha256_hex(&[
+        &questions
+            .iter()
+            .map(|q| q.question.as_str())
+            .collect::<Vec<_>>()
+            .join("\n"),
+        key,
+    ]);
+    let rec = open_pr_choice::load_record(state, &msg.team_id, &msg.ticket_id).await;
+    let decided = common::ticket_state::decision_on(&rec.decisions, key).is_some();
+    if let Some(earlier) =
+        common::ticket_state::posted_before(&rec.notices, key, &text_hash, decided)
+    {
+        info!(
+            run_id,
+            key, "Same notice posted before — linking it instead of posting again"
+        );
+        add_progress_note(
+            state,
+            &msg.team_id,
+            run_id,
+            &if earlier.url.is_empty() {
+                "Still waiting on the answer to my earlier comment on the ticket.".to_string()
+            } else {
+                format!(
+                    "Still waiting on the answer to my earlier comment: {}",
+                    earlier.url
+                )
+            },
+        )
+        .await;
+        let url = (!earlier.url.is_empty()).then(|| earlier.url.clone());
+        record_questions(state, &msg.team_id, run_id, questions, url).await;
+        return;
+    }
     let mut comment_url = None;
+    let mut posted = false;
     if matches!(msg.source, TicketSource::Github) && msg.issue_number > 0 {
         match github
             .create_issue_comment(
@@ -5969,6 +6092,7 @@ async fn ask_on_ticket(
             .await
         {
             Ok(c) => {
+                posted = true;
                 comment_url = c["html_url"]
                     .as_str()
                     .filter(|u| !u.is_empty())
@@ -5987,9 +6111,26 @@ async fn ask_on_ticket(
         )
         .await
         {
-            Ok(link) => comment_url = link,
+            Ok(link) => {
+                posted = true;
+                comment_url = link
+            }
             Err(e) => warn!(run_id, error = %e, "Could not post the run's questions on the ticket"),
         }
+    }
+    if posted && !questions.is_empty() {
+        open_pr_choice::record_notice(
+            state,
+            &msg.team_id,
+            &msg.ticket_id,
+            common::ticket_state::Notice {
+                key: key.to_string(),
+                text_hash,
+                url: comment_url.clone().unwrap_or_default(),
+                at: chrono::Utc::now().to_rfc3339(),
+            },
+        )
+        .await;
     }
     record_questions(state, &msg.team_id, run_id, questions, comment_url).await;
 }
@@ -6005,6 +6146,7 @@ fn empty_change_questions() -> Vec<common::run_questions::Question> {
             question: "Which files or components should change?".to_string(),
             why: why.to_string(),
             suggestions: Vec::new(),
+            decision: String::new(),
         },
         common::run_questions::Question {
             id: "q2".to_string(),
@@ -6013,6 +6155,7 @@ fn empty_change_questions() -> Vec<common::run_questions::Question> {
                 .to_string(),
             why: "Without it I can't tell what the finished change looks like.".to_string(),
             suggestions: Vec::new(),
+            decision: String::new(),
         },
     ]
 }
@@ -6051,6 +6194,7 @@ fn unknown_fix_questions(
         )
         .to_string(),
         suggestions: Vec::new(),
+        decision: String::new(),
     }]
 }
 
@@ -6112,6 +6256,7 @@ fn clarification_questions(
         )
         .to_string(),
         suggestions: Vec::new(),
+        decision: String::new(),
     }]
 }
 
@@ -8889,6 +9034,7 @@ mod asking_tests {
             answer: a.into(),
             author: "Pat Doe".into(),
             answered_at: "2026-10-27T10:00:00Z".into(),
+            decision: String::new(),
         }
     }
 

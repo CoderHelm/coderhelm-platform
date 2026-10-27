@@ -39,6 +39,11 @@ pub struct Question {
     /// Candidate answers the run found in the code or the data.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub suggestions: Vec<String>,
+    /// Set when the question is a choice CoderHelm records on the ticket
+    /// (see `ticket_state::Decision`), e.g. `open_pr:acme/web#12`; its
+    /// `suggestions` are then the choices.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub decision: String,
 }
 
 /// What a run asked when it stopped, and where it asked it.
@@ -67,6 +72,9 @@ pub struct Answer {
     /// When (RFC 3339).
     #[serde(default)]
     pub answered_at: String,
+    /// The question's `decision` key, when it was a recorded choice.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub decision: String,
 }
 
 /// Why answers were refused.
@@ -130,6 +138,7 @@ pub fn validate(
                 answer: text.to_string(),
                 author: author.to_string(),
                 answered_at: now.to_string(),
+                decision: q.decision.clone(),
             })
         })
         .collect();
@@ -240,6 +249,7 @@ fn tidy(questions: Vec<Question>) -> Vec<Question> {
                 .filter(|s| !s.is_empty())
                 .take(MAX_SUGGESTIONS)
                 .collect(),
+            decision: q.decision,
         })
         .collect()
 }
@@ -336,11 +346,14 @@ pub fn answers_note(answers: &[Answer]) -> String {
         return String::new();
     }
     let mut out = String::from(
-        "\n\n## Answers to CoderHelm's earlier questions (given in CoderHelm, word for word)\n\
-         An earlier run stopped to ask about this ticket, and people answered. Treat each answer \
-         as part of the ticket. These questions are settled: plan with the answers and never ask \
-         them again. Ask only about something the answers leave open, and say what is still \
-         missing.\n",
+        "\n\n## Resolved decisions (people's answers to CoderHelm's earlier questions and \
+         notices, word for word)\n\
+         An earlier run stopped to ask about this ticket, or posted a notice on it, and people \
+         answered. Treat each answer as part of the ticket. These are settled: plan with them and \
+         never ask them again, in any wording. Ask only about something they leave open, and say \
+         what is still missing. Never ask a person to settle what CoderHelm decides itself: \
+         closing or replacing a pull request someone else opened is never CoderHelm's call; once \
+         told to open its own, it leaves the other one open and opens its own.\n",
     );
     for a in answers {
         out.push_str(&format!(
@@ -516,6 +529,7 @@ mod tests {
             answer: a.into(),
             author: "Pat Doe".into(),
             answered_at: "2026-10-27T10:00:00Z".into(),
+            decision: String::new(),
         }
     }
 
@@ -620,6 +634,7 @@ mod tests {
         assert!(note.contains("Which environments get the new limit?"));
         assert!(note.contains("Answer from Pat Doe: Production only.\n  Staging keeps 100."));
         assert!(note.contains("never ask them again"));
+        assert!(note.contains("Resolved decisions"));
         assert!(answers_note(&[]).is_empty());
     }
 

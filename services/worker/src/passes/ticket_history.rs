@@ -71,6 +71,9 @@ pub struct TicketHistory {
     /// Every pull request for this ticket in the team's repositories
     /// (CoderHelm's or anyone's), as GitHub shows it now, oldest first.
     pub prs: Vec<EarlierPr>,
+    /// Choices people made on CoderHelm's notices (see
+    /// `ticket_state::Decision`), oldest first.
+    pub decisions: Vec<ticket_state::Decision>,
 }
 
 /// An earlier pull request for the ticket, read from GitHub: what it said,
@@ -892,6 +895,8 @@ pub async fn load(
     {
         if let Some(item) = out.item() {
             history.notes = ticket_state::parse_notes(&s(item, ticket_state::FIELD_NOTES));
+            history.decisions =
+                ticket_state::parse_decisions(&s(item, ticket_state::FIELD_DECISIONS));
             if s(item, ticket_state::FIELD_STATE) == ticket_state::STATE_DONE {
                 history.done_hash = s(item, ticket_state::FIELD_DONE_HASH);
             }
@@ -944,6 +949,7 @@ mod tests {
             notes: vec![],
             done_hash: String::new(),
             prs: vec![],
+            decisions: vec![],
         }
     }
 
@@ -1021,6 +1027,7 @@ mod tests {
             }],
             done_hash: "h1".into(),
             prs: vec![],
+            decisions: vec![],
         };
         match h.guard(Some(&override_plan("")), "h1") {
             Guard::Stop {
@@ -1130,6 +1137,7 @@ mod traced_guard_tests {
             notes: vec![],
             done_hash: String::new(),
             prs: vec![],
+            decisions: vec![],
         }
     }
 

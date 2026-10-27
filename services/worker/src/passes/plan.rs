@@ -288,7 +288,9 @@ set tasks.md to EXACTLY `NO_CHANGES_NEEDED: <reason>`.
      options: production only | every environment
    ```
    Ask only what blocks the change, at most a few questions, and never a question the ticket or
-   the answers below already settle.
+   the resolved decisions below already settle. Never ask a person to decide what is CoderHelm's
+   own call: closing or replacing a pull request someone else opened is never asked; when told to
+   open its own, it leaves the other one open.
 
 Otherwise, generate four openspec files:
 
@@ -749,21 +751,30 @@ Then the ```fix_location.json block described above."#,
     }
 
     let mut files = parse_openspec_files(&response, intent);
-    // A plan that asks again what people answered in CoderHelm goes back
-    // once with the answers; what it still asks after that is filtered when
-    // the run stops (see `clarification_questions`).
-    let repeats = common::run_questions::repeated(&files.tasks, &msg.answers);
+    // A plan that asks what is settled on the ticket (answers given in
+    // CoderHelm, choices people made on its notices), or what CoderHelm
+    // decides itself, goes back once with the answers (the model judges
+    // each question against them, see `resolved`). What it still asks
+    // after that is filtered below.
+    let asked = clarification_of(&files.tasks);
+    let verdicts = super::resolved::judge(state, provider, &asked, &msg.answers, usage).await;
+    let repeats: Vec<(common::run_questions::Question, super::resolved::Verdict)> = asked
+        .iter()
+        .cloned()
+        .zip(verdicts)
+        .filter(|(_, v)| !v.may_ask())
+        .collect();
     if !repeats.is_empty() {
         info!(
             ticket_id = %msg.ticket_id,
             repeated = repeats.len(),
-            "Plan asks an answered question again — sending it back"
+            "Plan asks a settled question again — sending it back"
         );
         messages.push((
             "user".to_string(),
             vec![serde_json::json!({
                 "type": "text",
-                "text": common::run_questions::send_back(&repeats, &msg.answers),
+                "text": super::resolved::send_back(&repeats, &msg.answers),
             })],
         ));
         response = provider::converse(
@@ -929,6 +940,30 @@ Then the ```fix_location.json block described above."#,
         }
     }
 
+    // Never ask a person what is settled, or what CoderHelm decides itself:
+    // the decision's questions and a clarification are checked once more.
+    if !msg.answers.is_empty() {
+        let asked = clarification_of(&files.tasks);
+        if !asked.is_empty() {
+            let v = super::resolved::judge(state, provider, &asked, &msg.answers, usage).await;
+            if v.iter().any(|v| !v.may_ask()) {
+                files.tasks = super::resolved::keep_open(&asked, &v);
+            }
+        }
+        if let Some(d) = files.fix.as_mut() {
+            let qs = common::run_questions::from_lines(&d.questions);
+            let v = super::resolved::judge(state, provider, &qs, &msg.answers, usage).await;
+            if v.iter().any(|v| !v.may_ask()) {
+                d.questions = qs
+                    .into_iter()
+                    .zip(v)
+                    .filter(|(_, v)| v.may_ask())
+                    .map(|(q, _)| q.question)
+                    .collect();
+            }
+        }
+    }
+
     // The questions only a person can answer are part of the plan people read.
     if let Some(d) = files.fix.as_ref() {
         files.proposal = with_questions(&files.proposal, d);
@@ -1057,6 +1092,15 @@ Then the ```fix_location.json block described above."#,
         .await;
 
     Ok(files)
+}
+
+/// The questions in a `CLARIFICATION_NEEDED:` tasks file; none otherwise.
+fn clarification_of(tasks: &str) -> Vec<common::run_questions::Question> {
+    tasks
+        .trim_start()
+        .strip_prefix("CLARIFICATION_NEEDED:")
+        .map(common::run_questions::parse)
+        .unwrap_or_default()
 }
 
 /// The proposal with the decision's questions for a person after it, once.

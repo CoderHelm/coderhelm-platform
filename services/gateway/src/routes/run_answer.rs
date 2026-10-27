@@ -225,6 +225,15 @@ pub async fn answer(
         &now,
     )
     .await?;
+    // A choice made with its button is recorded on the ticket now; words
+    // typed instead are read by the next run (see the worker's
+    // `open_pr_choice`), the way a reply on the ticket is.
+    for (a, d) in answers
+        .iter()
+        .filter_map(|a| chosen(&questions, a).map(|d| (a, d)))
+    {
+        record_decision(state, &claims.team_id, &s(&item, "ticket_id"), a, d).await;
+    }
 
     let queued = match serde_json::to_string(&WorkerMessage::Ticket(ticket.clone())) {
         Ok(msg) => {
@@ -277,6 +286,84 @@ pub async fn answer(
         posted,
         comment_url: comment_url.flatten(),
     })
+}
+
+/// The decision an answer makes when it is one of its question's offered
+/// choices, word for word: for an open pull request, "Work on #N" works on
+/// it and "Open my own" opens CoderHelm's own. `(kind, subject, choice)`.
+pub fn chosen(
+    questions: &[run_questions::Question],
+    answer: &Answer,
+) -> Option<(String, String, &'static str)> {
+    let q = questions.iter().find(|q| q.id == answer.question_id)?;
+    let (kind, subject) = q.decision.split_once(':')?;
+    if kind != common::ticket_state::KIND_OPEN_PR
+        || !q.suggestions.iter().any(|s| s == &answer.answer)
+    {
+        return None;
+    }
+    let number = subject.rsplit_once('#')?.1;
+    let choice = if answer.answer == format!("Work on #{number}") {
+        common::ticket_state::CHOICE_EXISTING
+    } else if answer.answer == "Open my own" {
+        common::ticket_state::CHOICE_OWN
+    } else {
+        return None;
+    };
+    Some((kind.to_string(), subject.to_string(), choice))
+}
+
+/// Records a choice on the ticket's record, in place of an earlier one.
+async fn record_decision(
+    state: &AppState,
+    team_id: &str,
+    ticket_id: &str,
+    answer: &Answer,
+    (kind, subject, choice): (String, String, &'static str),
+) {
+    use common::ticket_state as ts;
+    let earlier = state
+        .dynamo
+        .get_item()
+        .table_name(&state.config.settings_table_name)
+        .key("pk", AttributeValue::S(team_id.to_string()))
+        .key("sk", AttributeValue::S(ts::sk(ticket_id)))
+        .consistent_read(true)
+        .send()
+        .await
+        .ok()
+        .and_then(|o| o.item)
+        .map(|i| ts::parse_decisions(&s(&i, ts::FIELD_DECISIONS)))
+        .unwrap_or_default();
+    let all = ts::with_decision(
+        earlier,
+        ts::Decision {
+            kind,
+            subject,
+            choice: choice.to_string(),
+            said: answer.answer.clone(),
+            by: answer.author.clone(),
+            at: answer.answered_at.clone(),
+        },
+    );
+    if let Err(e) = state
+        .dynamo
+        .update_item()
+        .table_name(&state.config.settings_table_name)
+        .key("pk", AttributeValue::S(team_id.to_string()))
+        .key("sk", AttributeValue::S(ts::sk(ticket_id)))
+        .update_expression("SET #d = :d, updated_at = :t")
+        .expression_attribute_names("#d", ts::FIELD_DECISIONS)
+        .expression_attribute_values(
+            ":d",
+            AttributeValue::S(serde_json::to_string(&all).unwrap_or_default()),
+        )
+        .expression_attribute_values(":t", AttributeValue::S(answer.answered_at.clone()))
+        .send()
+        .await
+    {
+        warn!(ticket_id, error = %aws_sdk_dynamodb::error::DisplayErrorContext(&e), "answer: could not record the choice on the ticket");
+    }
 }
 
 /// Marks the run answered, only while it still waits: two answers or an
@@ -512,6 +599,42 @@ mod tests {
         assert!(not_answerable("needs_outside_change", true)
             .unwrap()
             .contains("needs outside change"));
+    }
+
+    #[test]
+    fn a_choice_button_records_the_decision_typed_words_do_not() {
+        let q = run_questions::Question {
+            id: "q1".into(),
+            question: "A pull request is already open: work on #12, or open my own?".into(),
+            suggestions: vec!["Work on #12".into(), "Open my own".into()],
+            decision: "open_pr:acme/web#12".into(),
+            ..Default::default()
+        };
+        let a = |text: &str| Answer {
+            question_id: "q1".into(),
+            answer: text.into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            chosen(std::slice::from_ref(&q), &a("Open my own")),
+            Some(("open_pr".into(), "acme/web#12".into(), "own"))
+        );
+        assert_eq!(
+            chosen(std::slice::from_ref(&q), &a("Work on #12"))
+                .unwrap()
+                .2,
+            "existing"
+        );
+        // Typed words are read by the next run's model, not matched here.
+        assert_eq!(
+            chosen(std::slice::from_ref(&q), &a("go ahead with yours")),
+            None
+        );
+        let plain = run_questions::Question {
+            decision: String::new(),
+            ..q
+        };
+        assert_eq!(chosen(&[plain], &a("Open my own")), None);
     }
 
     #[test]
@@ -798,6 +921,51 @@ mod tests {
             updates.last().unwrap()["ExpressionAttributeValues"][":u"]["S"],
             "https://example.atlassian.net/browse/ABC-7?focusedCommentId=10042"
         );
+    }
+
+    /// The open pull request notice, answered with its "Open my own" button:
+    /// the choice is on the ticket's record before the next run starts.
+    #[tokio::test]
+    async fn choosing_open_my_own_records_the_decision_on_the_ticket() {
+        let (fake, state) = fixture("needs_input").await;
+        let asked = json!({
+            "questions": [{
+                "id": "q1",
+                "question": "A pull request is already open: work on #12, or open my own?",
+                "suggestions": ["Work on #12", "Open my own"],
+                "decision": "open_pr:acme/web#12"
+            }]
+        });
+        fake.lock().unwrap().items.get_mut("runs").unwrap()["questions"] =
+            json!({"S": asked.to_string()});
+        answer(
+            &state,
+            &claims("member"),
+            RUN,
+            body(&[("q1", "Open my own")]),
+        )
+        .await
+        .unwrap();
+        let f = fake.lock().unwrap();
+        let recorded = f
+            .ops("UpdateItem")
+            .into_iter()
+            .find(|u| u["TableName"] == "settings")
+            .expect("the decision is written to the ticket's record");
+        assert_eq!(recorded["Key"]["sk"]["S"], "TICKETSTATE#ABC-7");
+        let decisions: Vec<common::ticket_state::Decision> = serde_json::from_str(
+            recorded["ExpressionAttributeValues"][":d"]["S"]
+                .as_str()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(decisions.len(), 1);
+        assert_eq!(decisions[0].subject, "acme/web#12");
+        assert_eq!(decisions[0].choice, "own");
+        // And the run that continues carries the answer with its key.
+        let sent = f.ops("SendMessage");
+        let msg: Value = serde_json::from_str(sent[0]["MessageBody"].as_str().unwrap()).unwrap();
+        assert_eq!(msg["answers"][0]["decision"], "open_pr:acme/web#12");
     }
 
     #[tokio::test]

@@ -1044,9 +1044,15 @@ pub struct RunQuestion {
     /// Why it matters: what it blocks.
     #[schema(example = "config/limits.yml holds one value per environment.")]
     pub why: Option<String>,
-    /// Candidate answers the run found in the code or the data.
+    /// Candidate answers the run found in the code or the data. When
+    /// `decision` is set, these are the choices.
     #[schema(example = json!(["Production only", "Every environment"]))]
     pub suggestions: Vec<String>,
+    /// Set when the question is a choice CoderHelm records on the ticket and
+    /// honours on every later run, such as what to do about a pull request
+    /// someone else opened (`open_pr:owner/name#number`).
+    #[schema(example = json!(null))]
+    pub decision: Option<String>,
 }
 
 /// An answer given in CoderHelm to a run's question.
@@ -1337,6 +1343,7 @@ fn run_of(item: &run_search::Item, run_id: &str, usage: RunUsage) -> Run {
                         question: q.question.clone(),
                         why: (!q.why.is_empty()).then(|| q.why.clone()),
                         suggestions: q.suggestions.clone(),
+                        decision: (!q.decision.is_empty()).then(|| q.decision.clone()),
                     })
                     .collect()
             })
@@ -5564,8 +5571,9 @@ mod tests {
             json!([
                 {"id": "q1", "question": "Which environments get the new limit?",
                  "why": "Each environment has its own value.",
-                 "suggestions": ["Production only", "Every environment"]},
-                {"id": "q2", "question": "What is the new limit?", "why": null, "suggestions": []}
+                 "suggestions": ["Production only", "Every environment"], "decision": null},
+                {"id": "q2", "question": "What is the new limit?", "why": null, "suggestions": [],
+                 "decision": null}
             ])
         );
         assert_eq!(
