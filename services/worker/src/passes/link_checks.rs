@@ -1322,7 +1322,7 @@ pub async fn gate(
             usage,
             w.file_cache,
             Some(w.run_id),
-            None,
+            w.deadline,
             true, // bot-driven link fix — scoped to the PR
         )
         .await;

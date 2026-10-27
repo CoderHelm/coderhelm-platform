@@ -341,8 +341,9 @@ pub struct Finding {
     /// `assumption`, `structured_field`, `survey`, `silent_fallback`,
     /// `fixtures`, `one_record`, `team_rule`, `ci_pending`,
     /// `manual_check`, `pattern_cited`, `end_to_end`, `environment`,
-    /// `env_unproven`, `near_match_unresolved` or `history_used`; or
-    /// `unrun_check`, which only [`classify`] sets.
+    /// `env_unproven`, `near_match_unresolved`, `history_used` or
+    /// `planned_work`; or `unrun_check`, which only [`classify`] sets, or
+    /// `optional_task`, which only the plan check sets.
     pub point: String,
     /// What is unverified, in one sentence.
     pub detail: String,
@@ -395,7 +396,7 @@ impl Finding {
         match self.point.trim() {
             "ci_pending" => Settler::Ci,
             "manual_check" => Settler::Person,
-            "end_to_end" => Settler::Owner,
+            "end_to_end" | "optional_task" => Settler::Owner,
             _ => Settler::Proof,
         }
     }
@@ -421,6 +422,8 @@ impl Finding {
             "env_unproven" => "Environment a lookup hit not proven",
             "near_match_unresolved" => "Close match not followed up",
             "history_used" => "Earlier pull requests not built on",
+            "planned_work" => "Planned work not done",
+            "optional_task" => "Optional task left out",
             other => other,
         }
     }
@@ -678,6 +681,11 @@ pub const JUDGE_SYSTEM: &str = "You check a code change before its pull request 
      18. history_used: when the plan names earlier pull requests for this ticket, a miss when \
      the diff repeats a change a reviewer turned down on one of them, or ignores what the plan \
      says it reuses from them.\n\
+     19. planned_work: a task in the plan's task checklist (below the plan) that the diff doesn't \
+     do, or does only in part (a file it creates as an empty shell, a step it skips). Name the \
+     task and its file. Not a miss for a task the checklist marks optional. Planned work is \
+     never a note for later: it is sent back to the coder, and the pull request doesn't open \
+     without it.\n\
      Many changes touch none of these: a change that relies on nothing outside its own code, \
      changes no stored records and adds no logs passes all of them. Judge only what the evidence \
      shows and do not invent concerns. A fact the lookups confirm is proven even when the notes \
@@ -686,7 +694,7 @@ pub const JUDGE_SYSTEM: &str = "You check a code change before its pull request 
      exact field, records, log line, assumption or check); `settle` is ONE sentence on how to \
      settle it (which connected source to read, what to count, which log to lower, which check \
      result). No lists, no preamble, no repeating the rule's text.\n\
-     Output ONLY a fenced ```json block: {\"findings\":[{\"point\":\"external_fact|impact|logging|assumption|structured_field|survey|silent_fallback|fixtures|one_record|team_rule|ci_pending|manual_check|pattern_cited|end_to_end|environment|env_unproven|near_match_unresolved|history_used\",\"detail\":\"one sentence\",\"settle\":\"one sentence\",\"check\":\"format|lint|typecheck|build|tests|plan|security, or empty\",\"command\":\"the command the check needs, or empty\",\"ci\":\"the CI command id (C1), or empty\"}]}. \
+     Output ONLY a fenced ```json block: {\"findings\":[{\"point\":\"external_fact|impact|logging|assumption|structured_field|survey|silent_fallback|fixtures|one_record|team_rule|ci_pending|manual_check|pattern_cited|end_to_end|environment|env_unproven|near_match_unresolved|history_used|planned_work\",\"detail\":\"one sentence\",\"settle\":\"one sentence\",\"check\":\"format|lint|typecheck|build|tests|plan|security, or empty\",\"command\":\"the command the check needs, or empty\",\"ci\":\"the CI command id (C1), or empty\"}]}. \
      An empty list when all pass.";
 
 /// The judge's prompt: the change and everything the run gathered.
@@ -736,6 +744,9 @@ pub enum Next {
     FixRound,
     /// Gaps remain and no round is left: open the PR with them listed under Open items.
     OpenWithGaps,
+    /// Planned work is still not done and no round is left: the PR doesn't
+    /// open. Planned work is never downgraded to an Open item.
+    Unfinished,
 }
 
 /// Decides what follows a judgment. `None` is a judge that couldn't answer:
@@ -745,8 +756,30 @@ pub fn next(findings: Option<&[Finding]>, rounds_done: u32, has_time: bool) -> N
     match findings.map_or(0, proof_gaps) {
         0 => Next::Open,
         _ if rounds_done < MAX_FIX_ROUNDS && has_time => Next::FixRound,
+        _ if findings.is_some_and(|f| !planned_work(f).is_empty()) => Next::Unfinished,
         _ => Next::OpenWithGaps,
     }
+}
+
+/// The findings that are planned work not done: never Open items.
+pub fn planned_work(findings: &[Finding]) -> Vec<&Finding> {
+    findings
+        .iter()
+        .filter(|f| f.point.trim() == "planned_work")
+        .collect()
+}
+
+/// Why the run stops when planned work is still not done after its rounds:
+/// one plain sentence naming the tasks.
+pub fn unfinished_reason(findings: &[Finding]) -> String {
+    let items: Vec<String> = planned_work(findings)
+        .iter()
+        .map(|f| sentence(&f.detail, 120))
+        .collect();
+    format!(
+        "Stopped before opening a pull request: the check before it found planned work not done: {}",
+        items.join("; ")
+    )
 }
 
 /// How many of `findings` are proof gaps.
@@ -1166,7 +1199,8 @@ pub fn fix_feedback(findings: &[Finding]) -> String {
          back, count the affected records and name a few, lower per-record or per-run INFO logs \
          to DEBUG, read the structured field instead of a name, survey the live records by \
          shape, warn on unexpected shapes, build fixtures from real payloads, fix the rule instead \
-         of the record, follow the team's instructions, or change the code so it no longer \
+         of the record, follow the team's instructions, do the planned task a `Planned work not \
+         done` item names (in full: every file the task needs), or change the code so it no longer \
          depends on what you can't prove. When no \
          connected source can answer, say which source is missing. Then write your `Evidence:` \
          section again in full.\n\n{}",
@@ -1251,6 +1285,11 @@ fn plan_context(plan: &PlanResult) -> String {
     let mut out = plan.proposal.trim().to_string();
     if let Some(d) = &plan.fix {
         out.push_str(&super::fix_location::reviewer_context(d));
+    }
+    // The checklist the change is held to (point 19).
+    if !plan.tasks.trim().is_empty() {
+        out.push_str("\n\n### The plan's task checklist\n");
+        out.push_str(common::truncate_str(plan.tasks.trim(), 8_000));
     }
     out
 }
@@ -1337,6 +1376,8 @@ pub struct Work<'a> {
     pub provider: &'a ModelProvider,
     pub file_cache: &'a FileCache,
     pub run_id: &'a str,
+    /// When the fix round must wrap up (the invocation's deadline).
+    pub deadline: Option<std::time::Instant>,
 }
 
 /// Judges the change, runs the fix round a gap earns, and judges again.
@@ -1397,6 +1438,20 @@ pub async fn prove(
                 // What CI or a person settles still reaches the PR.
                 return findings.unwrap_or_default();
             }
+            Next::Unfinished => {
+                let gaps = findings.unwrap_or_default();
+                super::add_progress_note(
+                    w.state,
+                    &w.msg.team_id,
+                    w.run_id,
+                    &format!(
+                        "Proof check: {} planned task(s) still not done; the pull request won't open without them",
+                        planned_work(&gaps).len()
+                    ),
+                )
+                .await;
+                return gaps;
+            }
             Next::OpenWithGaps => {
                 let gaps = findings.unwrap_or_default();
                 super::add_progress_note(
@@ -1430,6 +1485,8 @@ pub async fn prove(
                 let _ = super::update_pass(w.state, &w.msg.team_id, w.run_id, "implement").await;
                 let pass_start = std::time::Instant::now();
                 let usage_before = usage.clone();
+                // Planned work may need files the branch doesn't change yet.
+                let scoped = planned_work(&gaps).is_empty();
                 let fixed = super::implement::run(
                     w.state,
                     w.msg,
@@ -1444,8 +1501,8 @@ pub async fn prove(
                     usage,
                     w.file_cache,
                     Some(w.run_id),
-                    None,
-                    true, // bot-driven proof fix — scoped to the PR
+                    w.deadline,
+                    scoped, // bot-driven proof fix — scoped to the PR
                 )
                 .await;
                 super::write_pass_trace(
@@ -2375,6 +2432,66 @@ mod tests {
 }
 
 #[cfg(test)]
+mod planned_work_tests {
+    use super::*;
+
+    fn f(point: &str, detail: &str) -> Finding {
+        Finding {
+            point: point.into(),
+            detail: detail.into(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn planned_work_gets_a_round_then_holds_the_pr() {
+        let gaps = vec![
+            f(
+                "planned_work",
+                "The tabs in src/blocks/gallery/tabs.tsx are not built.",
+            ),
+            f("impact", "Records affected were not counted."),
+        ];
+        assert_eq!(next(Some(&gaps), 0, true), Next::FixRound);
+        // No round left: never "open with the gaps listed".
+        assert_eq!(next(Some(&gaps), 1, true), Next::Unfinished);
+        assert_eq!(next(Some(&gaps), 0, false), Next::Unfinished);
+        // Other gaps alone still open with Open items.
+        assert_eq!(next(Some(&gaps[1..]), 1, true), Next::OpenWithGaps);
+        let why = unfinished_reason(&gaps);
+        assert!(why.starts_with("Stopped before opening a pull request"));
+        assert!(why.contains("tabs.tsx"));
+        assert!(!why.contains("Records affected"));
+        assert_eq!(gaps[0].settler(), Settler::Proof);
+        assert!(fix_feedback(&gaps).contains("Planned work not done"));
+    }
+
+    #[test]
+    fn optional_tasks_are_open_items_for_a_person() {
+        let opt = f("optional_task", "`docs/x.md`: mention it");
+        assert_eq!(opt.settler(), Settler::Owner);
+        let section = gaps_section(std::slice::from_ref(&opt));
+        assert!(section.contains("Optional task left out"));
+        assert_eq!(next(Some(&[opt]), 1, true), Next::Open);
+    }
+
+    #[test]
+    fn the_judge_sees_the_task_checklist() {
+        let plan = PlanResult {
+            proposal: "Add a gallery block.".into(),
+            tasks: "- [ ] `src/a.ts`: Create it".into(),
+            spec: String::new(),
+            design: String::new(),
+            repo_tasks: vec![],
+            fix: None,
+        };
+        let ctx = plan_context(&plan);
+        assert!(ctx.contains("The plan's task checklist"));
+        assert!(ctx.contains("`src/a.ts`"));
+    }
+}
+
+#[cfg(test)]
 mod env_near_history_tests {
     use super::*;
 
@@ -2388,6 +2505,7 @@ mod env_near_history_tests {
         assert!(JUDGE_SYSTEM.contains("16. env_unproven"));
         assert!(JUDGE_SYSTEM.contains("17. near_match_unresolved"));
         assert!(JUDGE_SYSTEM.contains("18. history_used"));
+        assert!(JUDGE_SYSTEM.contains("19. planned_work"));
         assert!(
             JUDGE_SYSTEM.contains("environment|env_unproven|near_match_unresolved|history_used")
         );

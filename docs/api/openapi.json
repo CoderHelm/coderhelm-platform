@@ -1977,6 +1977,30 @@
         ],
         "type": "object"
       },
+      "PushedCommit": {
+        "description": "A commit a fix round pushed before it stopped.",
+        "properties": {
+          "message": {
+            "description": "Its subject line.",
+            "examples": [
+              "WEB-42: Add the gallery tabs"
+            ],
+            "type": "string"
+          },
+          "sha": {
+            "description": "The commit's SHA.",
+            "examples": [
+              "4f2a9c1e7b3d5a6c8e0f1a2b3c4d5e6f7a8b9c0d"
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "sha",
+          "message"
+        ],
+        "type": "object"
+      },
       "Quarantine": {
         "description": "The tests quarantined for the calling repository.",
         "properties": {
@@ -2657,6 +2681,87 @@
         ],
         "type": "object"
       },
+      "RoundIncomplete": {
+        "description": "The last fix round on the run's open pull request didn't finish. The\nrun's status stays `completed` (the pull request is open); this says\nwhich round stopped, why, and what it pushed.",
+        "properties": {
+          "at": {
+            "description": "When it stopped (RFC 3339).",
+            "examples": [
+              "2026-10-22T15:40:02Z"
+            ],
+            "type": "string"
+          },
+          "can_resume": {
+            "description": "Whether `POST /api/runs/{run_id}/retry` resumes the round on the same\npull request.",
+            "examples": [
+              true
+            ],
+            "type": "boolean"
+          },
+          "files": {
+            "description": "The files those commits changed.",
+            "examples": [
+              [
+                "src/blocks/gallery/tabs.tsx"
+              ]
+            ],
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "kind": {
+            "description": "The round: `ci_fix` (CI failed and CoderHelm was fixing it),\n`review_fix` (CoderHelm's reviewer asked for changes) or `feedback`\n(a person's review or comments).",
+            "examples": [
+              "review_fix"
+            ],
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "number": {
+            "description": "Which fix of the run it was (1 for the first; 0 when not numbered).",
+            "examples": [
+              3
+            ],
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "pushed": {
+            "description": "The commits the round pushed to the pull request's branch before it\nstopped, oldest first.",
+            "items": {
+              "$ref": "#/components/schemas/PushedCommit"
+            },
+            "type": "array"
+          },
+          "reason": {
+            "description": "Why it stopped, in plain words.",
+            "examples": [
+              "the review fix round ran out of its time budget 3 times in a row"
+            ],
+            "type": "string"
+          },
+          "summary": {
+            "description": "The run's status as a person reads it.",
+            "examples": [
+              "Pull request open; the last fix round didn't finish: the review fix round ran out of its time budget 3 times in a row."
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "number",
+          "reason",
+          "summary",
+          "pushed",
+          "files",
+          "at",
+          "can_resume"
+        ],
+        "type": "object"
+      },
       "Run": {
         "description": "One run, in full.",
         "properties": {
@@ -3036,6 +3141,17 @@
               "null"
             ]
           },
+          "round_incomplete": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/RoundIncomplete",
+                "description": "Set when the run's pull request is open but the last fix round on it\n(a CI fix, a review fix or a feedback round) didn't finish. Null\notherwise. Resume it with `POST /api/runs/{run_id}/retry`."
+              }
+            ]
+          },
           "run_id": {
             "description": "The run's id, a ULID: the same id as in the path.",
             "examples": [
@@ -3145,7 +3261,7 @@
         "description": "What a run action did.",
         "properties": {
           "status": {
-            "description": "`retrying` after a retry, `cancelled` after a cancel.",
+            "description": "`retrying` after a retry, `resuming` when a retry resumed the run's\nunfinished fix round, `cancelled` after a cancel.",
             "examples": [
               "retrying"
             ],
@@ -6433,7 +6549,7 @@
     },
     "/api/runs/{run_id}/retry": {
       "post": {
-        "description": "Starts the run's ticket again as a new run. Only a run that is `failed`, `needs_input`, `needs_outside_change`, `cancelled` or `closed` can be retried; the old run becomes `retried`, so retrying it twice is refused with `400`. Find the new run with `GET /api/runs?q=<ticket id>`.",
+        "description": "Starts the run's ticket again as a new run. Only a run that is `failed`, `needs_input`, `needs_outside_change`, `cancelled` or `closed` can be retried; the old run becomes `retried`, so retrying it twice is refused with `400`. Find the new run with `GET /api/runs?q=<ticket id>`.\n\nA `completed` run whose `round_incomplete` is set (its pull request is open but the last fix round on it didn't finish) is resumed instead: the same run picks the round up again on the same pull request, with a fresh time budget, and the answer's status is `resuming`.",
         "operationId": "retryRun",
         "parameters": [
           {
@@ -6459,7 +6575,7 @@
                 }
               }
             },
-            "description": "The ticket is queued again.",
+            "description": "The ticket is queued again (`retrying`), or the unfinished round is resumed on the same run (`resuming`).",
             "headers": {
               "RateLimit-Limit": {
                 "description": "Requests this key may make in a minute.",

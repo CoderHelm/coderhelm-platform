@@ -104,6 +104,9 @@ pub mod run_fail;
 /// The questions a run asks when it needs a person's answer, and the
 /// answers people give in CoderHelm.
 pub mod run_questions;
+/// Fix rounds on an open pull request: each with its own time budget,
+/// resumable, and never a failed run when one doesn't finish.
+pub mod run_round;
 /// Run statuses; which ones a person set; closing and reopening a run.
 pub mod run_status;
 #[cfg(test)]

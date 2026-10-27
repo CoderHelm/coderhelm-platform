@@ -909,6 +909,53 @@ pub struct RunNote {
     pub timestamp: Option<String>,
 }
 
+/// A commit a fix round pushed before it stopped.
+#[derive(serde::Serialize, utoipa::ToSchema)]
+pub struct PushedCommit {
+    /// The commit's SHA.
+    #[schema(example = "4f2a9c1e7b3d5a6c8e0f1a2b3c4d5e6f7a8b9c0d")]
+    pub sha: String,
+    /// Its subject line.
+    #[schema(example = "WEB-42: Add the gallery tabs")]
+    pub message: String,
+}
+
+/// The last fix round on the run's open pull request didn't finish. The
+/// run's status stays `completed` (the pull request is open); this says
+/// which round stopped, why, and what it pushed.
+#[derive(serde::Serialize, utoipa::ToSchema)]
+pub struct RoundIncomplete {
+    /// The round: `ci_fix` (CI failed and CoderHelm was fixing it),
+    /// `review_fix` (CoderHelm's reviewer asked for changes) or `feedback`
+    /// (a person's review or comments).
+    #[schema(example = "review_fix")]
+    pub kind: Option<String>,
+    /// Which fix of the run it was (1 for the first; 0 when not numbered).
+    #[schema(example = 3)]
+    pub number: u32,
+    /// Why it stopped, in plain words.
+    #[schema(example = "the review fix round ran out of its time budget 3 times in a row")]
+    pub reason: String,
+    /// The run's status as a person reads it.
+    #[schema(
+        example = "Pull request open; the last fix round didn't finish: the review fix round ran out of its time budget 3 times in a row."
+    )]
+    pub summary: String,
+    /// The commits the round pushed to the pull request's branch before it
+    /// stopped, oldest first.
+    pub pushed: Vec<PushedCommit>,
+    /// The files those commits changed.
+    #[schema(example = json!(["src/blocks/gallery/tabs.tsx"]))]
+    pub files: Vec<String>,
+    /// When it stopped (RFC 3339).
+    #[schema(example = "2026-10-22T15:40:02Z")]
+    pub at: String,
+    /// Whether `POST /api/runs/{run_id}/retry` resumes the round on the same
+    /// pull request.
+    #[schema(example = true)]
+    pub can_resume: bool,
+}
+
 /// One run, in full.
 #[derive(serde::Serialize, utoipa::ToSchema)]
 pub struct Run {
@@ -1044,6 +1091,43 @@ pub struct Run {
     pub continued_run_id: Option<String>,
     /// How the run was started and by whom (as in the runs list).
     pub trigger: run_trigger::RunTrigger,
+    /// Set when the run's pull request is open but the last fix round on it
+    /// (a CI fix, a review fix or a feedback round) didn't finish. Null
+    /// otherwise. Resume it with `POST /api/runs/{run_id}/retry`.
+    #[schema(example = json!(null))]
+    pub round_incomplete: Option<RoundIncomplete>,
+}
+
+/// The run's unfinished fix round, as the API shows it.
+fn round_incomplete_of(item: &run_search::Item) -> Option<RoundIncomplete> {
+    let inc = common::run_round::Incomplete::from_item(item)?;
+    let status = item
+        .get("status")
+        .and_then(|v| v.as_s().ok())
+        .map(String::as_str)
+        .unwrap_or("");
+    let pr_number = item
+        .get("pr_number")
+        .and_then(|v| v.as_n().ok())
+        .and_then(|n| n.parse::<u64>().ok())
+        .unwrap_or(0);
+    Some(RoundIncomplete {
+        kind: inc.kind.map(|k| k.as_str().to_string()),
+        number: inc.number,
+        summary: inc.status_line(),
+        reason: inc.reason,
+        pushed: inc
+            .pushed
+            .into_iter()
+            .map(|p| PushedCommit {
+                sha: p.sha,
+                message: p.message,
+            })
+            .collect(),
+        files: inc.files,
+        at: inc.at,
+        can_resume: common::run_round::may_resume(status, pr_number, true),
+    })
 }
 
 /// A question a run asked a person.
@@ -1383,6 +1467,7 @@ fn run_of(
             .collect(),
         answers_url: st("answers_url"),
         continued_run_id: st("continued_run_id"),
+        round_incomplete: round_incomplete_of(item),
     }
 }
 
@@ -1642,7 +1727,8 @@ pub async fn get_run_openspec(
 /// What a run action did.
 #[derive(serde::Serialize, utoipa::ToSchema)]
 pub struct RunActionResult {
-    /// `retrying` after a retry, `cancelled` after a cancel.
+    /// `retrying` after a retry, `resuming` when a retry resumed the run's
+    /// unfinished fix round, `cancelled` after a cancel.
     #[schema(example = "retrying")]
     pub status: String,
 }
@@ -1657,10 +1743,14 @@ pub struct RunActionResult {
     description = "Starts the run's ticket again as a new run. Only a run that is `failed`, \
         `needs_input`, `needs_outside_change`, `cancelled` or `closed` can be retried; the old run \
         becomes `retried`, so retrying it twice is refused with `400`. Find the new run with \
-        `GET /api/runs?q=<ticket id>`.",
+        `GET /api/runs?q=<ticket id>`.\n\n\
+        A `completed` run whose `round_incomplete` is set (its pull request is open but the last \
+        fix round on it didn't finish) is resumed instead: the same run picks the round up again \
+        on the same pull request, with a fresh time budget, and the answer's status is \
+        `resuming`.",
     params(("run_id" = String, Path, description = "The run's id.", example = "01JB8X6F4M2C9QZ3T7V5W1K0HA")),
     responses(
-        (status = 200, description = "The ticket is queued again.", body = RunActionResult,
+        (status = 200, description = "The ticket is queued again (`retrying`), or the unfinished round is resumed on the same run (`resuming`).", body = RunActionResult,
             example = json!({ "status": "retrying" })),
         (status = 400, description = "The run is not in a state that can be retried.", body = crate::openapi::ErrorBody),
         (status = 404, description = "No run with this id in the team.", body = crate::openapi::ErrorBody),
@@ -1702,6 +1792,21 @@ pub async fn retry_run(
         .and_then(|v| v.as_s().ok())
         .map(|s| s.as_str())
         .unwrap_or("");
+    // The run's pull request is open and its last fix round didn't finish:
+    // resume that round on the same run instead of starting the ticket over.
+    if let Some(inc) = common::run_round::Incomplete::from_item(item) {
+        let pr_number = item
+            .get("pr_number")
+            .and_then(|v| v.as_n().ok())
+            .and_then(|n| n.parse::<u64>().ok())
+            .unwrap_or(0);
+        if common::run_round::may_resume(status, pr_number, true) {
+            resume_round(&state, &claims, &run_id, item, &inc, pr_number).await?;
+            return Ok(Json(RunActionResult {
+                status: "resuming".into(),
+            }));
+        }
+    }
     if !matches!(
         status,
         "failed" | "needs_input" | "needs_outside_change" | "cancelled" | "closed"
@@ -1854,6 +1959,157 @@ pub(crate) async fn retry_message(
             .unwrap_or_default(),
         ..Default::default()
     })
+}
+
+/// How Resume picks up a run's unfinished fix round.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ResumeRoute {
+    /// The round's own instructions are kept: park it, and the resume runs
+    /// it first with a fresh budget.
+    Parked(common::run_round::Round),
+    /// Nothing kept to run directly: the resume reads CI and the review on
+    /// the head again, which brings the fix back.
+    Recheck,
+    /// A person's comments: the feedback round reads them again.
+    Feedback,
+}
+
+fn resume_route(
+    inc: &common::run_round::Incomplete,
+    now: chrono::DateTime<chrono::Utc>,
+) -> ResumeRoute {
+    use common::run_round::{Kind, Round};
+    match inc.kind {
+        Some(Kind::Feedback) => ResumeRoute::Feedback,
+        Some(kind) if !inc.feedback.trim().is_empty() => ResumeRoute::Parked(
+            Round::start(kind, inc.number, "", &inc.feedback, inc.scoped, now).parked(false),
+        ),
+        _ => ResumeRoute::Recheck,
+    }
+}
+
+/// Resumes a run's unfinished fix round on its open pull request: the run
+/// goes back to work under the same id, and the round gets a fresh budget.
+/// A person asking is one more fix: one slot of the automated-fix budget is
+/// given back so the round isn't refused for the budget it already used.
+async fn resume_round(
+    state: &AppState,
+    claims: &Claims,
+    run_id: &str,
+    item: &run_search::Item,
+    inc: &common::run_round::Incomplete,
+    pr_number: u64,
+) -> Result<(), StatusCode> {
+    let text = |k: &str| {
+        item.get(k)
+            .and_then(|v| v.as_s().ok())
+            .cloned()
+            .unwrap_or_default()
+    };
+    let repo = text("repo");
+    let (owner, name) = repo
+        .split_once('/')
+        .ok_or(StatusCode::INTERNAL_SERVER_ERROR)?;
+    let mut installation_id = item
+        .get("installation_id")
+        .and_then(|v| v.as_n().ok())
+        .and_then(|n| n.parse::<u64>().ok())
+        .unwrap_or(0);
+    if installation_id == 0 {
+        installation_id = get_team_installation_id(state, &claims.team_id).await?;
+    }
+    let now = chrono::Utc::now();
+    let route = resume_route(inc, now);
+    let (status, pass) = match route {
+        ResumeRoute::Feedback => ("running", "feedback"),
+        _ => ("awaiting_ci", "awaiting_ci"),
+    };
+    let mut update = state
+        .dynamo
+        .update_item()
+        .table_name(&state.config.runs_table_name)
+        .key("team_id", attr_s(&claims.team_id))
+        .key("run_id", attr_s(run_id))
+        .condition_expression("#s = :from")
+        .expression_attribute_names("#s", "status")
+        .expression_attribute_names("#inc", common::run_round::INCOMPLETE_FIELD)
+        .expression_attribute_names("#round", common::run_round::FIELD)
+        .expression_attribute_values(":from", attr_s(&text("status")))
+        .expression_attribute_values(":s", attr_s(status))
+        .expression_attribute_values(":sri", attr_s(&format!("{status}#{run_id}")))
+        .expression_attribute_values(":p", attr_s(pass))
+        .expression_attribute_values(":t", attr_s(&now.to_rfc3339()));
+    update = match &route {
+        ResumeRoute::Parked(round) => update
+            .update_expression(
+                "SET #s = :s, status_run_id = :sri, current_pass = :p, updated_at = :t, #round = :r \
+                 REMOVE #inc",
+            )
+            .expression_attribute_values(":r", round.to_attr()),
+        _ => update.update_expression(
+            "SET #s = :s, status_run_id = :sri, current_pass = :p, updated_at = :t \
+             REMOVE #inc, #round",
+        ),
+    };
+    update.send().await.map_err(|e| {
+        if common::run_fail::is_condition_failed(&e) {
+            StatusCode::CONFLICT
+        } else {
+            error!("Failed to resume the run's round: {e}");
+            StatusCode::INTERNAL_SERVER_ERROR
+        }
+    })?;
+    // One automated-fix slot back for the person's ask (best effort).
+    let _ = state
+        .dynamo
+        .update_item()
+        .table_name(&state.config.runs_table_name)
+        .key("team_id", attr_s(&claims.team_id))
+        .key("run_id", attr_s(run_id))
+        .update_expression("ADD auto_fix_pushes :minus")
+        .condition_expression("auto_fix_pushes > :zero")
+        .expression_attribute_values(":minus", AttributeValue::N("-1".into()))
+        .expression_attribute_values(":zero", AttributeValue::N("0".into()))
+        .send()
+        .await;
+    let (queue, message) = match route {
+        ResumeRoute::Feedback => (
+            &state.config.feedback_queue_url,
+            WorkerMessage::Feedback(FeedbackMessage {
+                team_id: claims.team_id.clone(),
+                installation_id,
+                run_id: run_id.to_string(),
+                repo_owner: owner.to_string(),
+                repo_name: name.to_string(),
+                pr_number,
+                review_id: 0,
+                ..Default::default()
+            }),
+        ),
+        _ => (
+            &state.config.ticket_queue_url,
+            WorkerMessage::Resume(common::messages::ResumeMessage {
+                team_id: claims.team_id.clone(),
+                run_id: run_id.to_string(),
+                installation_id,
+                ..Default::default()
+            }),
+        ),
+    };
+    let body = serde_json::to_string(&message).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    state
+        .sqs
+        .send_message()
+        .queue_url(queue)
+        .message_body(&body)
+        .send()
+        .await
+        .map_err(|e| {
+            error!("Failed to enqueue the resumed round: {e}");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+    info!(run_id, pr_number, "Unfinished fix round resumed");
+    Ok(())
 }
 
 /// Close a PR and delete a branch via the GitHub App token. Best-effort.
@@ -5612,6 +5868,103 @@ mod tests {
         assert_eq!(run["answers"][0]["answer"], "Production only");
         assert_eq!(run["answers"][0]["author"], "Pat Doe");
         assert_eq!(run["continued_run_id"], "01JB8Z");
+    }
+
+    /// A run whose PR is open and whose last fix round didn't finish reads
+    /// as such, never as failed, and offers Resume.
+    #[test]
+    fn an_unfinished_round_shows_on_the_run_with_resume() {
+        use aws_sdk_dynamodb::types::AttributeValue as A;
+        use common::run_round::{Incomplete, Kind, Pushed, Round};
+        let round = Round::start(
+            Kind::ReviewFix,
+            3,
+            "abc",
+            "Add the tabs",
+            true,
+            chrono::Utc::now(),
+        );
+        let mut inc = Incomplete::of(
+            &round,
+            "the review fix round ran out of its time budget",
+            "2026-10-22T15:40:02Z",
+        );
+        inc.pushed = vec![Pushed {
+            sha: "4f2a9c1".into(),
+            message: "Add the tabs".into(),
+        }];
+        let item = std::collections::HashMap::from([
+            ("status".to_string(), A::S("completed".into())),
+            ("pr_number".to_string(), A::N("41".into())),
+            (
+                common::run_round::INCOMPLETE_FIELD.to_string(),
+                inc.to_attr(),
+            ),
+        ]);
+        let usage = RunUsage {
+            tokens_in: 0,
+            tokens_out: 0,
+            cache_read: 0,
+            cache_write: 0,
+            cost_usd: 0.0,
+        };
+        let run = serde_json::to_value(run_of(&item, "r1", usage)).unwrap();
+        let r = &run["round_incomplete"];
+        assert_eq!(run["status"], "completed");
+        assert_eq!(r["kind"], "review_fix");
+        assert_eq!(r["number"], 3);
+        assert_eq!(r["can_resume"], true);
+        assert_eq!(r["pushed"][0]["sha"], "4f2a9c1");
+        assert!(r["summary"]
+            .as_str()
+            .unwrap()
+            .starts_with("Pull request open; the last fix round didn't finish"));
+        // Without one, the field is null.
+        let plain =
+            std::collections::HashMap::from([("status".to_string(), A::S("completed".into()))]);
+        let usage = RunUsage {
+            tokens_in: 0,
+            tokens_out: 0,
+            cache_read: 0,
+            cache_write: 0,
+            cost_usd: 0.0,
+        };
+        assert!(
+            serde_json::to_value(run_of(&plain, "r2", usage)).unwrap()["round_incomplete"]
+                .is_null()
+        );
+    }
+
+    #[test]
+    fn resume_parks_a_round_it_can_run_and_rechecks_one_it_cannot() {
+        use common::run_round::{Incomplete, Kind, Round, State};
+        let now = chrono::Utc::now();
+        let round = Round::start(Kind::ReviewFix, 2, "abc", "Add the tabs", true, now);
+        let inc = Incomplete::of(&round, "out of time", "t");
+        match super::resume_route(&inc, now) {
+            super::ResumeRoute::Parked(r) => {
+                assert_eq!(r.state, State::Pending);
+                assert_eq!(r.attempt, 1);
+                assert_eq!(r.feedback, "Add the tabs");
+                assert_eq!(r.kind, Kind::ReviewFix);
+            }
+            other => panic!("{other:?}"),
+        }
+        // The sweep keeps no instructions: the resume reads CI and review again.
+        let swept = Incomplete {
+            kind: Some(Kind::ReviewFix),
+            ..Default::default()
+        };
+        assert_eq!(
+            super::resume_route(&swept, now),
+            super::ResumeRoute::Recheck
+        );
+        let fb = Incomplete {
+            kind: Some(Kind::Feedback),
+            feedback: "x".into(),
+            ..Default::default()
+        };
+        assert_eq!(super::resume_route(&fb, now), super::ResumeRoute::Feedback);
     }
 
     #[test]

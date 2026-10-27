@@ -12,6 +12,15 @@ The pass is the last one the run is known to have reached: the record's
 checkpoint, else its newest pass trace. A run that reached none of them
 stopped before its first pass, and the message says so instead of
 "during unknown pass".
+
+Fix rounds (services/common/src/run_round.rs): a CI fix, review fix or
+feedback round on an open pull request has its own time budget, recorded on
+the run as `round` with a `deadline_at`. The sweep leaves a run alone until
+that deadline (plus a grace period) has passed, however long the run itself
+has existed. And a stuck run whose pull request is open is never marked
+failed: it is completed with `round_incomplete` saying the last round didn't
+finish, so the person sees "Pull request open; the last fix round didn't
+finish" and can resume it.
 """
 
 import logging
@@ -36,6 +45,17 @@ SWEPT_STATUSES = ("running", "awaiting_ci")
 # Values of current_pass that name a state, not a pass the run was doing.
 NOT_A_PASS = {"", "unknown", "cancelled", "closed", "done", "awaiting_ci"}
 BEFORE_FIRST_PASS = "before its first pass"
+
+# Mirrors services/common/src/run_round.rs (a test there reads these lines).
+ROUND_FIELD = "round"
+INCOMPLETE_FIELD = "round_incomplete"
+ROUND_BUDGET_SECONDS = 750
+ROUND_SWEEP_GRACE_SECONDS = 300
+ROUND_LABELS = {
+    "ci_fix": "CI fix round",
+    "review_fix": "review fix round",
+    "feedback": "feedback round",
+}
 
 _dynamodb = None
 
@@ -74,6 +94,83 @@ def failure_message(pass_name):
         "Run stopped before its first pass started (auto-cleanup); "
         "the worker never reported progress"
     )
+
+
+def _parse_time(value):
+    try:
+        t = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return None
+    return t if t.tzinfo else t.replace(tzinfo=timezone.utc)
+
+
+def round_in_budget(run, now):
+    """True while the run's fix round is inside its own budget (plus grace).
+
+    A round's clock starts when the round does, never when the run started:
+    a run that is days old can be working a fresh round.
+    """
+    rnd = run.get(ROUND_FIELD) or {}
+    if not isinstance(rnd, dict) or rnd.get("state", "running") != "running":
+        return False
+    deadline = _parse_time(rnd.get("deadline_at"))
+    if deadline is None:
+        started = _parse_time(rnd.get("started_at"))
+        if started is None:
+            return False
+        deadline = started + timedelta(seconds=ROUND_BUDGET_SECONDS)
+    return now < deadline + timedelta(seconds=ROUND_SWEEP_GRACE_SECONDS)
+
+
+def has_pull_request(run):
+    try:
+        number = int(run.get("pr_number") or 0)
+    except (TypeError, ValueError):
+        number = 0
+    return number > 0 or bool((run.get("pr_url") or "").strip())
+
+
+def round_kind(run, pass_name):
+    """The round a stuck run was working: the one it recorded, else the one
+    its pass points to (the same mapping as run_round::Kind::of_pass)."""
+    rnd = run.get(ROUND_FIELD) or {}
+    kind = rnd.get("kind") if isinstance(rnd, dict) else ""
+    if kind in ROUND_LABELS:
+        return kind
+    p = (pass_name or "").split(":")[0]
+    if p in ("ci_fix", "test"):
+        return "ci_fix"
+    if p == "feedback":
+        return "feedback"
+    return "review_fix"
+
+
+def incomplete_reason(kind, pass_name):
+    label = ROUND_LABELS.get(kind, "fix round")
+    where = f" during the {pass_name} pass" if pass_name else ""
+    return f"the {label} stopped{where} without reporting back (time limit)"
+
+
+def incomplete_record(run, pass_name, now_iso):
+    """The `round_incomplete` map for a stuck run whose pull request is open."""
+    rnd = run.get(ROUND_FIELD) or {}
+    if not isinstance(rnd, dict):
+        rnd = {}
+    kind = round_kind(run, pass_name)
+    return {
+        "kind": kind,
+        "number": rnd.get("number", 0),
+        "reason": incomplete_reason(kind, pass_name),
+        "pushed": [],
+        "files": [],
+        "at": now_iso,
+        "feedback": rnd.get("feedback", ""),
+        "scoped": rnd.get("scoped", True),
+    }
+
+
+def status_line(reason):
+    return f"Pull request open; the last fix round didn't finish: {reason}."
 
 
 def _checkpoint_pass(team_id, run_id):
@@ -137,9 +234,11 @@ def handler(event, context):
             ":awaiting": SWEPT_STATUSES[1],
         },
         "ProjectionExpression": (
-            "team_id, run_id, created_at, updated_at, title, current_pass, pass_history, #s"
+            "team_id, run_id, created_at, updated_at, title, current_pass, pass_history, #s, "
+            "#round, pr_number, pr_url"
         ),
     }
+    scan_kwargs["ExpressionAttributeNames"]["#round"] = ROUND_FIELD
 
     while True:
         resp = runs_table.scan(**scan_kwargs)
@@ -147,6 +246,9 @@ def handler(event, context):
             updated = item.get("updated_at", item.get("created_at", ""))
             status = item.get("status", "")
             cutoff = running_cutoff if status == "running" else awaiting_cutoff
+            if status == "running" and round_in_budget(item, now):
+                # Its fix round is still inside its own budget.
+                continue
             if updated and updated < cutoff:
                 stuck_runs.append(item)
 
@@ -179,9 +281,29 @@ def handler(event, context):
 
         names = {"#s": "status"}
         values = {":now": datetime.now(timezone.utc).isoformat(), ":orig": orig_status}
-        # A stuck "running" run is a hard failure; a stuck "awaiting_ci" run is
-        # finalized as completed (its PR exists — hand it to a human).
-        if orig_status == "awaiting_ci":
+        # A stuck "running" run is a hard failure, unless its pull request is
+        # open: then a fix round on it stopped, and the run says so instead
+        # of failing. A stuck "awaiting_ci" run is finalized as completed (its
+        # PR exists — hand it to a human).
+        if orig_status == "running" and has_pull_request(run):
+            now_iso = datetime.now(timezone.utc).isoformat()
+            record = incomplete_record(run, pass_name, now_iso)
+            names["#round"] = ROUND_FIELD
+            names["#inc"] = INCOMPLETE_FIELD
+            update = (
+                "SET #s = :new, status_run_id = :sri, #inc = :inc, current_pass = :cp, "
+                "updated_at = :now REMOVE #round"
+            )
+            values.update(
+                {
+                    ":new": "completed",
+                    ":sri": f"completed#{run_id}",
+                    ":inc": record,
+                    ":cp": "done",
+                }
+            )
+            logger.warning(f"Run {run_id}: {status_line(record['reason'])}")
+        elif orig_status == "awaiting_ci":
             update = "SET #s = :new, status_run_id = :sri, error_message = :err, updated_at = :now"
             values.update(
                 {

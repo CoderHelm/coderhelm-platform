@@ -59,5 +59,54 @@ class Swept(unittest.TestCase):
         self.assertEqual(sweep.last_known_pass(run), "implement")
 
 
+class Rounds(unittest.TestCase):
+    NOW = sweep.datetime(2026, 10, 26, 15, 0, tzinfo=sweep.timezone.utc)
+
+    def test_a_round_inside_its_own_budget_is_not_swept(self):
+        # The run is days old; its round started a few minutes ago.
+        run = {
+            "created_at": "2026-10-20T09:00:00+00:00",
+            "round": {"state": "running", "deadline_at": "2026-10-26T15:05:00+00:00"},
+        }
+        self.assertTrue(sweep.round_in_budget(run, self.NOW))
+        # Past the deadline and the grace period, it is.
+        late = self.NOW + sweep.timedelta(seconds=300 + sweep.ROUND_SWEEP_GRACE_SECONDS + 1)
+        self.assertFalse(sweep.round_in_budget(run, late))
+
+    def test_a_round_without_a_deadline_uses_its_start_and_the_budget(self):
+        run = {"round": {"state": "running", "started_at": "2026-10-26T14:55:00+00:00"}}
+        self.assertTrue(sweep.round_in_budget(run, self.NOW))
+
+    def test_a_parked_round_or_no_round_has_no_budget_to_wait_for(self):
+        self.assertFalse(sweep.round_in_budget({}, self.NOW))
+        parked = {"round": {"state": "pending", "deadline_at": "2026-10-26T16:00:00+00:00"}}
+        self.assertFalse(sweep.round_in_budget(parked, self.NOW))
+
+    def test_a_stuck_run_with_an_open_pr_is_not_failed(self):
+        run = {
+            "pr_number": 41,
+            "current_pass": "implement",
+            "round": {"kind": "review_fix", "number": 3, "feedback": "Add the tabs"},
+        }
+        self.assertTrue(sweep.has_pull_request(run))
+        rec = sweep.incomplete_record(run, "implement", "2026-10-26T15:00:00+00:00")
+        self.assertEqual(rec["kind"], "review_fix")
+        self.assertEqual(rec["number"], 3)
+        self.assertEqual(rec["feedback"], "Add the tabs")
+        line = sweep.status_line(rec["reason"])
+        self.assertTrue(line.startswith("Pull request open; the last fix round didn't finish:"))
+        self.assertNotIn("failed", line.lower())
+
+    def test_the_round_kind_falls_back_to_the_pass(self):
+        self.assertEqual(sweep.round_kind({}, "ci_fix:2"), "ci_fix")
+        self.assertEqual(sweep.round_kind({}, "feedback"), "feedback")
+        self.assertEqual(sweep.round_kind({}, "implement"), "review_fix")
+
+    def test_no_pr_means_no_pr(self):
+        self.assertFalse(sweep.has_pull_request({}))
+        self.assertFalse(sweep.has_pull_request({"pr_number": 0, "pr_url": ""}))
+        self.assertTrue(sweep.has_pull_request({"pr_url": "https://example.com/pull/1"}))
+
+
 if __name__ == "__main__":
     unittest.main()

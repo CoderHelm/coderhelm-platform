@@ -14,6 +14,9 @@ pub async fn run(
     state: &WorkerState,
     mut msg: FeedbackMessage,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    // This round's own clock (common::run_round): the time budget starts
+    // with this invocation, never with the run.
+    let start = std::time::Instant::now();
     let mut usage = TokenUsage::default();
 
     // Load team's Anthropic API key (required), gated for this run.
@@ -467,9 +470,17 @@ pub async fn run(
     );
     let commit_hint = conventions.commit_hint(&tokens);
 
+    // A later step of the same round: the earlier one's commits are there.
+    let continuing = if msg.round_attempt > 0 {
+        "\n## Continuing this round\nAn earlier step of this round ran out of time; everything it \
+         wrote is already committed on the branch. Read the files first and finish only what is \
+         left; don't redo or revert it.\n"
+    } else {
+        ""
+    };
     let prompt = format!(
         r#"A reviewer left comments on PR #{pr_number}.
-
+{continuing}
 ## Review Comments
 {comments}
 {ci_failures}
@@ -684,6 +695,32 @@ Rules:
         vec![serde_json::json!({"type": "text", "text": prompt})],
     )];
 
+    // The round on the run record, with its deadline, while it works: the
+    // stuck-run sweep waits for that deadline, not the run's age.
+    if !super::round::may_start(start, std::time::Instant::now()) {
+        // Too little of this invocation is left for the round: the same
+        // feedback runs first in a fresh one, with its whole budget.
+        info!(run_id = %msg.run_id, "Feedback round deferred to a fresh step for its full budget");
+        if send_delayed_feedback(state, &msg, 5).await {
+            return Ok(());
+        }
+    }
+    let feedback_round = {
+        let base_sha =
+            super::round::branch_head(&github, &msg.repo_owner, &msg.repo_name, &branch).await;
+        let mut r = common::run_round::Round::start(
+            common::run_round::Kind::Feedback,
+            0,
+            &base_sha,
+            &formatted,
+            ci_only,
+            chrono::Utc::now(),
+        );
+        r.attempt = msg.round_attempt + 1;
+        r
+    };
+    super::round::record(state, &msg.team_id, &msg.run_id, &feedback_round).await;
+
     let model_id = provider.primary_model_id();
     let response = provider::converse(
         state,
@@ -698,7 +735,7 @@ Rules:
         llm::ConverseOptions {
             max_turns: 40,
             max_tokens: 16384,
-            deadline: None,
+            deadline: Some(super::round::deadline(start)),
             effort: None,
         },
         None,
@@ -707,6 +744,51 @@ Rules:
     .await?;
     if let Some(s) = &skills {
         s.drain_usage_into(&mut usage);
+    }
+
+    // Out of this step's budget with work left: what it wrote is committed.
+    // The round continues in a fresh step (the comments are still
+    // unanswered, so it picks them up), or the run says it didn't finish.
+    // Nothing half-done is posted as a reply.
+    if super::implement::reached_deadline(
+        &response,
+        Some(super::round::deadline(start)),
+        std::time::Instant::now(),
+    ) {
+        if feedback_round.may_continue() {
+            let mut next = msg.clone();
+            next.round_attempt = feedback_round.attempt;
+            if send_delayed_feedback(state, &next, 5).await {
+                super::add_progress_note(
+                    state,
+                    &msg.team_id,
+                    &msg.run_id,
+                    &format!(
+                        "The feedback round used its time budget with work left; it continues in a fresh step with its own budget (step {} of {}).",
+                        feedback_round.attempt + 1,
+                        common::run_round::MAX_ATTEMPTS
+                    ),
+                )
+                .await;
+                return Ok(());
+            }
+        }
+        super::round::finish_incomplete(
+            state,
+            &msg.team_id,
+            &msg.run_id,
+            &super::round::Pr {
+                github: &github,
+                owner: &msg.repo_owner,
+                repo: &msg.repo_name,
+                branch: &branch,
+            },
+            &feedback_round,
+            &common::run_round::out_of_time(feedback_round.kind, feedback_round.attempt),
+        )
+        .await;
+        super::webhooks::emit_run(state, &msg.team_id, &msg.run_id, "completed").await;
+        return Ok(());
     }
 
     info!(
@@ -971,11 +1053,14 @@ Rules:
              cost_usd = if_not_exists(cost_usd, :zero) + :c, \
              updated_at = :t, #s = :s, current_pass = :p, status_run_id = :sri, \
              pass_history = list_append(if_not_exists(pass_history, :empty), :entry) \
-             REMOVE error_message, #err",
+             REMOVE error_message, #err, #round, #inc",
         )
         .condition_expression(common::run_status::not_ended("#s"))
         .expression_attribute_names("#s", "status")
         .expression_attribute_names("#err", "error")
+        // The round finished.
+        .expression_attribute_names("#round", common::run_round::FIELD)
+        .expression_attribute_names("#inc", common::run_round::INCOMPLETE_FIELD)
         .ended_values()
         .expression_attribute_values(
             ":ti",
