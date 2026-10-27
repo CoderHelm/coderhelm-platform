@@ -867,23 +867,24 @@ pub async fn orchestrate_ticket(
             if err_msg.contains("cancelled by user") {
                 info!(run_id, duration, "Run cancelled — preserving tokens");
                 // Update token counts but keep status as cancelled
-                let cost = usage.estimated_cost();
-                let _ = state
+                let delta = usage.unrecorded();
+                let res = state
                     .dynamo
                     .update_item()
                     .table_name(&state.config.runs_table_name)
                     .key("team_id", attr_s(&msg.team_id))
                     .key("run_id", attr_s(&run_id))
-                    .update_expression("SET tokens_in = :ti, tokens_out = :to, cache_read_tokens = :crt, cache_write_tokens = :cwt, cost_usd = :c, duration_s = :d, updated_at = :t")
-                    .expression_attribute_values(":ti", attr_n(usage.input_tokens))
-                    .expression_attribute_values(":to", attr_n(usage.output_tokens))
-                    .expression_attribute_values(":crt", attr_n(usage.cache_read_tokens))
-                    .expression_attribute_values(":cwt", attr_n(usage.cache_write_tokens))
-                    .expression_attribute_values(":c", attr_n(format!("{cost:.4}")))
+                    .update_expression("SET tokens_in = if_not_exists(tokens_in, :uzero) + :ti, tokens_out = if_not_exists(tokens_out, :uzero) + :to, \
+             cache_read_tokens = if_not_exists(cache_read_tokens, :uzero) + :crt, cache_write_tokens = if_not_exists(cache_write_tokens, :uzero) + :cwt, \
+             cost_usd = if_not_exists(cost_usd, :uzero) + :c, duration_s = :d, updated_at = :t")
+                    .usage_values(&delta)
                     .expression_attribute_values(":d", attr_n(duration))
                     .expression_attribute_values(":t", attr_s(&chrono::Utc::now().to_rfc3339()))
                     .send()
                     .await;
+                if res.is_ok() {
+                    usage.mark_recorded(&delta);
+                }
                 // The team's counters already have these tokens: each model
                 // call is counted as it happens (common::usage).
             } else {
@@ -2184,26 +2185,24 @@ async fn run_passes(
 
         // Complete the run with no PR
         let duration = start.elapsed().as_secs();
-        let cost = usage.estimated_cost();
+        let delta = usage.unrecorded();
         let now = chrono::Utc::now().to_rfc3339();
-        let _ = state
+        let usage_res = state
             .dynamo
             .update_item()
             .table_name(&state.config.runs_table_name)
             .key("team_id", attr_s(&msg.team_id))
             .key("run_id", attr_s(run_id))
             .update_expression(
-                "SET #status = :s, tokens_in = :ti, tokens_out = :to, cache_read_tokens = :crt, cache_write_tokens = :cwt, cost_usd = :c, \
+                "SET #status = :s, tokens_in = if_not_exists(tokens_in, :uzero) + :ti, tokens_out = if_not_exists(tokens_out, :uzero) + :to, \
+             cache_read_tokens = if_not_exists(cache_read_tokens, :uzero) + :crt, cache_write_tokens = if_not_exists(cache_write_tokens, :uzero) + :cwt, \
+             cost_usd = if_not_exists(cost_usd, :uzero) + :c, \
                  duration_s = :d, updated_at = :t, current_pass = :cp, \
                  status_run_id = :sri, mcp_servers = :mcp",
             )
             .expression_attribute_names("#status", "status")
             .expression_attribute_values(":s", attr_s("completed"))
-            .expression_attribute_values(":ti", attr_n(usage.input_tokens))
-            .expression_attribute_values(":to", attr_n(usage.output_tokens))
-            .expression_attribute_values(":crt", attr_n(usage.cache_read_tokens))
-            .expression_attribute_values(":cwt", attr_n(usage.cache_write_tokens))
-            .expression_attribute_values(":c", attr_n(format!("{:.4}", cost)))
+            .usage_values(&delta)
             .expression_attribute_values(":d", attr_n(duration))
             .expression_attribute_values(":t", attr_s(&now))
             .expression_attribute_values(":cp", attr_s("done"))
@@ -2214,6 +2213,9 @@ async fn run_passes(
             )
             .send()
             .await;
+        if usage_res.is_ok() {
+            usage.mark_recorded(&delta);
+        }
         self::webhooks::emit_run(state, &msg.team_id, run_id, "completed").await;
 
         // Update analytics counters
@@ -2724,9 +2726,9 @@ async fn run_passes(
 
                         // Store PR info on run record and go to awaiting_ci
                         let now = chrono::Utc::now().to_rfc3339();
-                        let cost = usage.estimated_cost();
+                        let delta = usage.unrecorded();
                         let duration = start.elapsed().as_secs();
-                        let _ = state.dynamo.update_item()
+                        let usage_res = state.dynamo.update_item()
                             .table_name(&state.config.runs_table_name)
                             .key("team_id", attr_s(&msg.team_id))
                             .key("run_id", attr_s(run_id))
@@ -2734,8 +2736,9 @@ async fn run_passes(
                                 "SET #s = :s, status_run_id = :sri, current_pass = :cp, \
                                  pr_number = :pn, pr_url = :pu, branch = :b, \
                                  repo = :repo, team_repo = :tr, \
-                                 tokens_in = :ti, tokens_out = :to, cache_read_tokens = :crt, cache_write_tokens = :cwt, \
-                                 cost_usd = :cost, duration_s = :d, updated_at = :t"
+                                 tokens_in = if_not_exists(tokens_in, :uzero) + :ti, tokens_out = if_not_exists(tokens_out, :uzero) + :to, \
+             cache_read_tokens = if_not_exists(cache_read_tokens, :uzero) + :crt, cache_write_tokens = if_not_exists(cache_write_tokens, :uzero) + :cwt, \
+             cost_usd = if_not_exists(cost_usd, :uzero) + :c, duration_s = :d, updated_at = :t"
                             )
                             .expression_attribute_names("#s", "status")
                             // Never resurrect a cancelled run: if the user cancelled
@@ -2754,14 +2757,13 @@ async fn run_passes(
                             .expression_attribute_values(":repo", attr_s(&format!("{}/{}", msg.repo_owner, msg.repo_name)))
                             .expression_attribute_values(":tr", attr_s(&format!("{}#{}/{}", msg.team_id, msg.repo_owner, msg.repo_name)))
                             .expression_attribute_values(":t", attr_s(&now))
-                            .expression_attribute_values(":ti", attr_n(usage.input_tokens))
-                            .expression_attribute_values(":to", attr_n(usage.output_tokens))
-                            .expression_attribute_values(":crt", attr_n(usage.cache_read_tokens))
-                            .expression_attribute_values(":cwt", attr_n(usage.cache_write_tokens))
-                            .expression_attribute_values(":cost", attr_n(format!("{:.4}", cost)))
+                            .usage_values(&delta)
                             .expression_attribute_values(":d", attr_n(duration))
                             .send()
                             .await;
+                        if usage_res.is_ok() {
+                            usage.mark_recorded(&delta);
+                        }
 
                         save_checkpoint(state, &msg.team_id, run_id, "pr", &branch_name, 1, usage)
                             .await;
@@ -3432,7 +3434,7 @@ async fn run_passes(
 
             let duration = start.elapsed().as_secs();
             let now = chrono::Utc::now().to_rfc3339();
-            let cost = usage.estimated_cost();
+            let delta = usage.unrecorded();
 
             // Build PR list attributes
             let pr_urls: Vec<AttributeValue> =
@@ -3453,8 +3455,9 @@ async fn run_passes(
                     "SET #status = :s, pr_url = :pr, pr_number = :pn, branch = :b, \
                      pr_urls = :prs, pr_numbers = :pns, branches = :bs, \
                      repo = :repo, team_repo = :tr, \
-                     tokens_in = :ti, tokens_out = :to, cache_read_tokens = :crt, cache_write_tokens = :cwt, \
-                     cost_usd = :c, duration_s = :d, updated_at = :t, current_pass = :cp, \
+                     tokens_in = if_not_exists(tokens_in, :uzero) + :ti, tokens_out = if_not_exists(tokens_out, :uzero) + :to, \
+             cache_read_tokens = if_not_exists(cache_read_tokens, :uzero) + :crt, cache_write_tokens = if_not_exists(cache_write_tokens, :uzero) + :cwt, \
+             cost_usd = if_not_exists(cost_usd, :uzero) + :c, duration_s = :d, updated_at = :t, current_pass = :cp, \
                      status_run_id = :sri, mcp_servers = :mcp",
                 )
                 .expression_attribute_names("#status", "status")
@@ -3470,11 +3473,7 @@ async fn run_passes(
                 .expression_attribute_values(":bs", AttributeValue::L(branches))
                 .expression_attribute_values(":repo", attr_s(&format!("{}/{}", msg.repo_owner, msg.repo_name)))
                 .expression_attribute_values(":tr", attr_s(&format!("{}#{}/{}", msg.team_id, msg.repo_owner, msg.repo_name)))
-                .expression_attribute_values(":ti", attr_n(usage.input_tokens))
-                .expression_attribute_values(":to", attr_n(usage.output_tokens))
-                .expression_attribute_values(":crt", attr_n(usage.cache_read_tokens))
-                .expression_attribute_values(":cwt", attr_n(usage.cache_write_tokens))
-                .expression_attribute_values(":c", attr_n(format!("{:.4}", cost)))
+                .usage_values(&delta)
                 .expression_attribute_values(":d", attr_n(duration))
                 .expression_attribute_values(":t", attr_s(&now))
                 .expression_attribute_values(":cp", attr_s("awaiting_ci"))
@@ -3495,6 +3494,7 @@ async fn run_passes(
                 }
                 return Err(e.into());
             }
+            usage.mark_recorded(&delta);
 
             info!(
                 run_id,
@@ -3659,7 +3659,7 @@ async fn run_passes(
                 .unwrap_or("")
                 .to_string();
             let duration = start.elapsed().as_secs();
-            let cost = usage.estimated_cost();
+            let delta = usage.unrecorded();
             let now = chrono::Utc::now().to_rfc3339();
             let wrote = state
                 .dynamo
@@ -3669,8 +3669,9 @@ async fn run_passes(
                 .key("run_id", attr_s(run_id))
                 .update_expression(
                     "SET #status = :s, status_run_id = :sri, pr_number = :pn, pr_url = :pu, \
-                     branch = :b, tokens_in = :ti, tokens_out = :to, cache_read_tokens = :crt, \
-                     cache_write_tokens = :cwt, cost_usd = :c, duration_s = :d, updated_at = :t, \
+                     branch = :b, tokens_in = if_not_exists(tokens_in, :uzero) + :ti, tokens_out = if_not_exists(tokens_out, :uzero) + :to, \
+             cache_read_tokens = if_not_exists(cache_read_tokens, :uzero) + :crt, cache_write_tokens = if_not_exists(cache_write_tokens, :uzero) + :cwt, \
+             cost_usd = if_not_exists(cost_usd, :uzero) + :c, duration_s = :d, updated_at = :t, \
                      current_pass = :cp",
                 )
                 .expression_attribute_names("#status", "status")
@@ -3681,11 +3682,7 @@ async fn run_passes(
                 .expression_attribute_values(":pn", attr_n(pr_number))
                 .expression_attribute_values(":pu", attr_s(&pr_url))
                 .expression_attribute_values(":b", attr_s(&branch_name))
-                .expression_attribute_values(":ti", attr_n(usage.input_tokens))
-                .expression_attribute_values(":to", attr_n(usage.output_tokens))
-                .expression_attribute_values(":crt", attr_n(usage.cache_read_tokens))
-                .expression_attribute_values(":cwt", attr_n(usage.cache_write_tokens))
-                .expression_attribute_values(":c", attr_n(format!("{:.4}", cost)))
+                .usage_values(&delta)
                 .expression_attribute_values(":d", attr_n(duration))
                 .expression_attribute_values(":t", attr_s(&now))
                 .expression_attribute_values(":cp", attr_s("done"))
@@ -3693,6 +3690,7 @@ async fn run_passes(
                 .await
                 .is_ok();
             if wrote {
+                usage.mark_recorded(&delta);
                 self::webhooks::emit_run(state, &msg.team_id, run_id, "completed").await;
             }
             close_memory(state, agent_memory.take()).await;
@@ -3746,9 +3744,9 @@ async fn run_passes(
             .await;
 
             let duration = start.elapsed().as_secs();
-            let cost = usage.estimated_cost();
+            let delta = usage.unrecorded();
             let now = chrono::Utc::now().to_rfc3339();
-            let _ = state
+            let usage_res = state
                 .dynamo
                 .update_item()
                 .table_name(&state.config.runs_table_name)
@@ -3756,23 +3754,23 @@ async fn run_passes(
                 .key("run_id", attr_s(run_id))
                 .update_expression(
                     "SET #status = :s, status_run_id = :sri, error_message = :em, \
-                     tokens_in = :ti, tokens_out = :to, cache_read_tokens = :crt, cache_write_tokens = :cwt, \
-                     cost_usd = :c, duration_s = :d, updated_at = :t, current_pass = :cp",
+                     tokens_in = if_not_exists(tokens_in, :uzero) + :ti, tokens_out = if_not_exists(tokens_out, :uzero) + :to, \
+             cache_read_tokens = if_not_exists(cache_read_tokens, :uzero) + :crt, cache_write_tokens = if_not_exists(cache_write_tokens, :uzero) + :cwt, \
+             cost_usd = if_not_exists(cost_usd, :uzero) + :c, duration_s = :d, updated_at = :t, current_pass = :cp",
                 )
                 .expression_attribute_names("#status", "status")
                 .expression_attribute_values(":s", attr_s("needs_input"))
                 .expression_attribute_values(":sri", attr_s(&format!("needs_input#{run_id}")))
                 .expression_attribute_values(":em", attr_s(raw_clarification))
-                .expression_attribute_values(":ti", attr_n(usage.input_tokens))
-                .expression_attribute_values(":to", attr_n(usage.output_tokens))
-                .expression_attribute_values(":crt", attr_n(usage.cache_read_tokens))
-                .expression_attribute_values(":cwt", attr_n(usage.cache_write_tokens))
-                .expression_attribute_values(":c", attr_n(format!("{:.4}", cost)))
+                .usage_values(&delta)
                 .expression_attribute_values(":d", attr_n(duration))
                 .expression_attribute_values(":t", attr_s(&now))
                 .expression_attribute_values(":cp", attr_s("done"))
                 .send()
                 .await;
+            if usage_res.is_ok() {
+                usage.mark_recorded(&delta);
+            }
             self::webhooks::emit_run(state, &msg.team_id, run_id, "needs_input").await;
             close_memory(state, agent_memory.take()).await;
             return Ok(());
@@ -4268,7 +4266,7 @@ async fn run_passes(
     // Update run record with PR info + awaiting_ci status
     let duration = start.elapsed().as_secs();
     let now = chrono::Utc::now().to_rfc3339();
-    let cost = usage.estimated_cost();
+    let delta = usage.unrecorded();
 
     let awaiting_res = state
         .dynamo
@@ -4278,7 +4276,9 @@ async fn run_passes(
         .key("run_id", attr_s(run_id))
         .update_expression(
             "SET #status = :s, pr_url = :pr, pr_number = :pn, branch = :b, \
-             tokens_in = :ti, tokens_out = :to, cache_read_tokens = :crt, cache_write_tokens = :cwt, cost_usd = :c, \
+             tokens_in = if_not_exists(tokens_in, :uzero) + :ti, tokens_out = if_not_exists(tokens_out, :uzero) + :to, \
+             cache_read_tokens = if_not_exists(cache_read_tokens, :uzero) + :crt, cache_write_tokens = if_not_exists(cache_write_tokens, :uzero) + :cwt, \
+             cost_usd = if_not_exists(cost_usd, :uzero) + :c, \
              duration_s = :d, updated_at = :t, current_pass = :cp, \
              status_run_id = :sri, \
              repo = :repo, team_repo = :tr, mcp_servers = :mcp",
@@ -4302,11 +4302,7 @@ async fn run_passes(
             )),
         )
         .expression_attribute_values(":b", attr_s(&branch_name))
-        .expression_attribute_values(":ti", attr_n(usage.input_tokens))
-        .expression_attribute_values(":to", attr_n(usage.output_tokens))
-        .expression_attribute_values(":crt", attr_n(usage.cache_read_tokens))
-        .expression_attribute_values(":cwt", attr_n(usage.cache_write_tokens))
-        .expression_attribute_values(":c", attr_n(format!("{:.4}", cost)))
+        .usage_values(&delta)
         .expression_attribute_values(":d", attr_n(duration))
         .expression_attribute_values(":t", attr_s(&now))
         .expression_attribute_values(":cp", attr_s("awaiting_ci"))
@@ -4332,6 +4328,7 @@ async fn run_passes(
         }
         return Err(e.into());
     }
+    usage.mark_recorded(&delta);
 
     info!(
         run_id,
@@ -5363,25 +5360,24 @@ async fn finish_without_code(
     let duration = start.elapsed().as_secs();
     let now = chrono::Utc::now().to_rfc3339();
     let decision_json = serde_json::to_string(decision).unwrap_or_default();
-    let _ = state
+    // After mark_run_needs_input: only what it didn't already add.
+    let delta = usage.unrecorded();
+    let usage_res = state
         .dynamo
         .update_item()
         .table_name(&state.config.runs_table_name)
         .key("team_id", attr_s(&msg.team_id))
         .key("run_id", attr_s(run_id))
         .update_expression(
-            "SET #status = :s, tokens_in = :ti, tokens_out = :to, cache_read_tokens = :crt, \
-             cache_write_tokens = :cwt, cost_usd = :c, duration_s = :d, updated_at = :t, \
+            "SET #status = :s, tokens_in = if_not_exists(tokens_in, :uzero) + :ti, tokens_out = if_not_exists(tokens_out, :uzero) + :to, \
+             cache_read_tokens = if_not_exists(cache_read_tokens, :uzero) + :crt, cache_write_tokens = if_not_exists(cache_write_tokens, :uzero) + :cwt, \
+             cost_usd = if_not_exists(cost_usd, :uzero) + :c, duration_s = :d, updated_at = :t, \
              current_pass = :cp, status_run_id = :sri, mcp_servers = :mcp, \
              fix_location = :fl, fix_decision = :fd, outside_change_report = :rep",
         )
         .expression_attribute_names("#status", "status")
         .expression_attribute_values(":s", attr_s(status))
-        .expression_attribute_values(":ti", attr_n(usage.input_tokens))
-        .expression_attribute_values(":to", attr_n(usage.output_tokens))
-        .expression_attribute_values(":crt", attr_n(usage.cache_read_tokens))
-        .expression_attribute_values(":cwt", attr_n(usage.cache_write_tokens))
-        .expression_attribute_values(":c", attr_n(format!("{:.4}", usage.estimated_cost())))
+        .usage_values(&delta)
         .expression_attribute_values(":d", attr_n(duration))
         .expression_attribute_values(":t", attr_s(&now))
         .expression_attribute_values(":cp", attr_s("done"))
@@ -5395,6 +5391,9 @@ async fn finish_without_code(
         .expression_attribute_values(":rep", attr_s(&format!("{heading}{report}")))
         .send()
         .await;
+    if usage_res.is_ok() {
+        usage.mark_recorded(&delta);
+    }
 
     if outside {
         let analytics_month = chrono::Utc::now().format("%Y-%m").to_string();
@@ -5533,26 +5532,24 @@ async fn mark_run_needs_input(
     mcp_ids: &[String],
 ) {
     let duration = start.elapsed().as_secs();
-    let cost = usage.estimated_cost();
+    let delta = usage.unrecorded();
     let now = chrono::Utc::now().to_rfc3339();
-    let _ = state
+    let usage_res = state
         .dynamo
         .update_item()
         .table_name(&state.config.runs_table_name)
         .key("team_id", attr_s(&msg.team_id))
         .key("run_id", attr_s(run_id))
         .update_expression(
-            "SET #status = :s, tokens_in = :ti, tokens_out = :to, cache_read_tokens = :crt, cache_write_tokens = :cwt, cost_usd = :c, \
+            "SET #status = :s, tokens_in = if_not_exists(tokens_in, :uzero) + :ti, tokens_out = if_not_exists(tokens_out, :uzero) + :to, \
+             cache_read_tokens = if_not_exists(cache_read_tokens, :uzero) + :crt, cache_write_tokens = if_not_exists(cache_write_tokens, :uzero) + :cwt, \
+             cost_usd = if_not_exists(cost_usd, :uzero) + :c, \
              duration_s = :d, updated_at = :t, current_pass = :cp, \
              status_run_id = :sri, mcp_servers = :mcp",
         )
         .expression_attribute_names("#status", "status")
         .expression_attribute_values(":s", attr_s("needs_input"))
-        .expression_attribute_values(":ti", attr_n(usage.input_tokens))
-        .expression_attribute_values(":to", attr_n(usage.output_tokens))
-        .expression_attribute_values(":crt", attr_n(usage.cache_read_tokens))
-        .expression_attribute_values(":cwt", attr_n(usage.cache_write_tokens))
-        .expression_attribute_values(":c", attr_n(format!("{:.4}", cost)))
+        .usage_values(&delta)
         .expression_attribute_values(":d", attr_n(duration))
         .expression_attribute_values(":t", attr_s(&now))
         .expression_attribute_values(":cp", attr_s("done"))
@@ -5563,6 +5560,9 @@ async fn mark_run_needs_input(
         )
         .send()
         .await;
+    if usage_res.is_ok() {
+        usage.mark_recorded(&delta);
+    }
     self::webhooks::emit_run(state, &msg.team_id, run_id, "needs_input").await;
 
     // Update analytics counters
@@ -5722,7 +5722,7 @@ async fn complete_run(
     duration: u64,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let now = chrono::Utc::now().to_rfc3339();
-    let cost = usage.estimated_cost();
+    let delta = usage.unrecorded();
 
     // Update run record in runs table
     state
@@ -5733,7 +5733,9 @@ async fn complete_run(
         .key("run_id", attr_s(run_id))
         .update_expression(
             "SET #status = :s, pr_url = :pr, pr_number = :pn, branch = :b, \
-             tokens_in = :ti, tokens_out = :to, cache_read_tokens = :crt, cache_write_tokens = :cwt, cost_usd = :c, \
+             tokens_in = if_not_exists(tokens_in, :uzero) + :ti, tokens_out = if_not_exists(tokens_out, :uzero) + :to, \
+             cache_read_tokens = if_not_exists(cache_read_tokens, :uzero) + :crt, cache_write_tokens = if_not_exists(cache_write_tokens, :uzero) + :cwt, \
+             cost_usd = if_not_exists(cost_usd, :uzero) + :c, \
              duration_s = :d, updated_at = :t, current_pass = :cp, \
              status_run_id = :sri, files_modified = :fm, \
              repo = :repo, team_repo = :tr, mcp_servers = :mcp \
@@ -5756,11 +5758,7 @@ async fn complete_run(
             )),
         )
         .expression_attribute_values(":b", attr_s(&pr.branch))
-        .expression_attribute_values(":ti", attr_n(usage.input_tokens))
-        .expression_attribute_values(":to", attr_n(usage.output_tokens))
-        .expression_attribute_values(":crt", attr_n(usage.cache_read_tokens))
-        .expression_attribute_values(":cwt", attr_n(usage.cache_write_tokens))
-        .expression_attribute_values(":c", attr_n(format!("{:.4}", cost)))
+        .usage_values(&delta)
         .expression_attribute_values(":d", attr_n(duration))
         .expression_attribute_values(":t", attr_s(&now))
         .expression_attribute_values(":cp", attr_s("done"))
@@ -5781,6 +5779,7 @@ async fn complete_run(
         )
         .send()
         .await?;
+    usage.mark_recorded(&delta);
 
     // Update analytics counters (current month + all-time)
     let month = chrono::Utc::now().format("%Y-%m").to_string();
@@ -5871,21 +5870,15 @@ async fn fail_run(
         crate::agent::policy::end_run_for_stop(state, &msg.team_id, run_id, &stop).await;
         return;
     }
-    let cost = usage.estimated_cost();
+    let delta = usage.unrecorded();
 
     // The one failed-status write: reason, and the pass the record names.
     let failure = common::run_fail::RunFailure {
         reason: error_msg,
         pass: None,
         only_from: None,
-        extra: vec![
-            ("tokens_in", attr_n(usage.input_tokens)),
-            ("tokens_out", attr_n(usage.output_tokens)),
-            ("cache_read_tokens", attr_n(usage.cache_read_tokens)),
-            ("cache_write_tokens", attr_n(usage.cache_write_tokens)),
-            ("cost_usd", attr_n(format!("{:.4}", cost))),
-            ("duration_s", attr_n(duration)),
-        ],
+        extra: vec![("duration_s", attr_n(duration))],
+        add: usage_adds(&delta),
     };
     match common::run_fail::fail_run(
         &state.dynamo,
@@ -5896,7 +5889,10 @@ async fn fail_run(
     )
     .await
     {
-        Ok(true) => self::webhooks::emit_run(state, &msg.team_id, run_id, "failed").await,
+        Ok(true) => {
+            usage.mark_recorded(&delta);
+            self::webhooks::emit_run(state, &msg.team_id, run_id, "failed").await
+        }
         // Cancelled or merged meanwhile: nothing failed, so nothing to tell.
         Ok(false) => return,
         Err(e) => warn!(run_id, error = %e, "Could not mark the run failed"),
@@ -5994,6 +5990,42 @@ pub(crate) fn attr_s(val: &str) -> aws_sdk_dynamodb::types::AttributeValue {
 
 pub(crate) fn attr_n(val: impl std::fmt::Display) -> aws_sdk_dynamodb::types::AttributeValue {
     aws_sdk_dynamodb::types::AttributeValue::N(val.to_string())
+}
+
+/// Adds the values a run write's token and cost fields name (`:ti`, `:to`,
+/// `:crt`, `:cwt`, `:c`, `:uzero`). Those fields are always ADDed
+/// (`tokens_in = if_not_exists(tokens_in, :uzero) + :ti`): an invocation
+/// knows only its own calls, so a SET wiped what earlier ones recorded once
+/// the checkpoint holding the running total expired. Mark the delta with
+/// [`TokenUsage::mark_recorded`] once the write succeeds.
+pub(crate) trait RunUsageValues {
+    fn usage_values(self, d: &crate::models::UsageDelta) -> Self;
+}
+
+impl RunUsageValues
+    for aws_sdk_dynamodb::operation::update_item::builders::UpdateItemFluentBuilder
+{
+    fn usage_values(self, d: &crate::models::UsageDelta) -> Self {
+        self.expression_attribute_values(":ti", attr_n(d.input_tokens))
+            .expression_attribute_values(":to", attr_n(d.output_tokens))
+            .expression_attribute_values(":crt", attr_n(d.cache_read_tokens))
+            .expression_attribute_values(":cwt", attr_n(d.cache_write_tokens))
+            .expression_attribute_values(":c", attr_n(format!("{:.6}", d.cost_usd)))
+            .expression_attribute_values(":uzero", attr_n(0))
+    }
+}
+
+/// The run record's token and cost fields for a failure: added, never set.
+pub(crate) fn usage_adds(
+    d: &crate::models::UsageDelta,
+) -> Vec<(&'static str, aws_sdk_dynamodb::types::AttributeValue)> {
+    vec![
+        ("tokens_in", attr_n(d.input_tokens)),
+        ("tokens_out", attr_n(d.output_tokens)),
+        ("cache_read_tokens", attr_n(d.cache_read_tokens)),
+        ("cache_write_tokens", attr_n(d.cache_write_tokens)),
+        ("cost_usd", attr_n(format!("{:.6}", d.cost_usd))),
+    ]
 }
 
 /// Release a ticket-level lock after a run completes (any terminal state).
@@ -8396,8 +8428,8 @@ async fn salvage_timeout_pr(
 
     // Mark run as completed (not failed) — it produced a PR
     let now = chrono::Utc::now().to_rfc3339();
-    let cost = usage.estimated_cost();
-    let _ = state
+    let delta = usage.unrecorded();
+    let usage_res = state
         .dynamo
         .update_item()
         .table_name(&state.config.runs_table_name)
@@ -8405,9 +8437,9 @@ async fn salvage_timeout_pr(
         .key("run_id", attr_s(run_id))
         .update_expression(
             "SET #s = :s, status_run_id = :sri, pr_url = :pu, pr_number = :pn, \
-             branch = :b, tokens_in = :ti, tokens_out = :to, \
-             cache_read_tokens = :crt, cache_write_tokens = :cwt, \
-             cost_usd = :c, duration_s = :d, updated_at = :t, \
+             branch = :b, tokens_in = if_not_exists(tokens_in, :uzero) + :ti, tokens_out = if_not_exists(tokens_out, :uzero) + :to, \
+             cache_read_tokens = if_not_exists(cache_read_tokens, :uzero) + :crt, cache_write_tokens = if_not_exists(cache_write_tokens, :uzero) + :cwt, \
+             cost_usd = if_not_exists(cost_usd, :uzero) + :c, duration_s = :d, updated_at = :t, \
              error_message = :err",
         )
         .expression_attribute_names("#s", "status")
@@ -8416,16 +8448,15 @@ async fn salvage_timeout_pr(
         .expression_attribute_values(":pu", attr_s(&pr_url))
         .expression_attribute_values(":pn", attr_n(pr_number))
         .expression_attribute_values(":b", attr_s(branch))
-        .expression_attribute_values(":ti", attr_n(usage.input_tokens))
-        .expression_attribute_values(":to", attr_n(usage.output_tokens))
-        .expression_attribute_values(":crt", attr_n(usage.cache_read_tokens))
-        .expression_attribute_values(":cwt", attr_n(usage.cache_write_tokens))
-        .expression_attribute_values(":c", attr_n(format!("{cost:.4}")))
+        .usage_values(&delta)
         .expression_attribute_values(":d", attr_n(duration))
         .expression_attribute_values(":t", attr_s(&now))
         .expression_attribute_values(":err", attr_s("Partial implementation — agent timed out"))
         .send()
         .await;
+    if usage_res.is_ok() {
+        usage.mark_recorded(&delta);
+    }
     self::webhooks::emit_run(state, &msg.team_id, run_id, "completed").await;
 
     Ok(pr_url)
@@ -9536,5 +9567,53 @@ mod asking_tests {
             Some("https://example.atlassian.net/browse/ABC-7?focusedCommentId=10001")
         );
         assert_eq!(jira_comment_link(None, "ABC-7", Some("1")), None);
+    }
+}
+
+#[cfg(test)]
+mod run_usage_tests {
+    /// A run's tokens and cost are only ever added to. An invocation knows its
+    /// own calls; a SET of its total over the record wiped what earlier
+    /// invocations recorded (a resume after the checkpoint expired wrote a
+    /// near-zero cost over the run). This reads the worker's sources for a SET
+    /// of those fields. The review record (REVIEW#, one write per review) is
+    /// not a run record.
+    #[test]
+    fn run_records_never_set_tokens_or_cost() {
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut offenders = Vec::new();
+        let mut stack = vec![src];
+        while let Some(dir) = stack.pop() {
+            for entry in std::fs::read_dir(&dir).unwrap().flatten() {
+                let p = entry.path();
+                if p.is_dir() {
+                    stack.push(p);
+                    continue;
+                }
+                if p.extension().and_then(|e| e.to_str()) != Some("rs")
+                    || p.ends_with("passes/review_pr.rs")
+                {
+                    continue;
+                }
+                let text = std::fs::read_to_string(&p).unwrap_or_default();
+                for (i, line) in text.lines().enumerate() {
+                    for field in [
+                        "tokens_in",
+                        "tokens_out",
+                        "cache_read_tokens",
+                        "cache_write_tokens",
+                        "cost_usd",
+                    ] {
+                        if line.contains(&format!("{field} = :")) {
+                            offenders.push(format!("{}:{}", p.display(), i + 1));
+                        }
+                    }
+                }
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "add run usage with if_not_exists(field, :uzero) + :v: {offenders:?}"
+        );
     }
 }

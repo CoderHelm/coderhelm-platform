@@ -171,7 +171,23 @@ pub struct TokenUsage {
     pub cost_usd: f64,
     pub tool_calls: u64,
     pub tool_names: Vec<String>,
+    /// How much of this usage is already on the run record. Shared by
+    /// clones: a clone is a snapshot of the same run's usage.
+    pub(crate) recorded: Recorded,
 }
+
+/// Tokens and cost one run write adds to the run record.
+#[derive(Debug, Default, Clone, Copy, PartialEq)]
+pub struct UsageDelta {
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cache_read_tokens: u64,
+    pub cache_write_tokens: u64,
+    pub cost_usd: f64,
+}
+
+#[derive(Debug, Default, Clone)]
+pub(crate) struct Recorded(std::sync::Arc<std::sync::Mutex<UsageDelta>>);
 
 impl TokenUsage {
     /// Add one model call's usage, priced at `model_id`'s rates.
@@ -212,29 +228,35 @@ impl TokenUsage {
         self.cost_usd
     }
 
-    /// Rebuild a saved usage. Old checkpoints carry no cost: their tokens are
-    /// priced at `model_id`'s rates.
-    pub fn restored(
-        model_id: &str,
-        input: u64,
-        output: u64,
-        cache_read: u64,
-        cache_write: u64,
-        cost_usd: Option<f64>,
-    ) -> Self {
-        let call = common::usage::CallUsage {
-            uncached_input: input,
-            cache_read,
-            cache_write_5m: cache_write,
-            cache_write_1h: 0,
-            output,
-        };
-        let mut u = TokenUsage::default();
-        u.add_call(model_id, &call);
-        if let Some(c) = cost_usd {
-            u.cost_usd = c;
+    /// What this usage adds to the run record now: everything since the
+    /// last write from this invocation ([`TokenUsage::mark_recorded`]).
+    /// Every run write ADDs this instead of SETting a total, so a fresh
+    /// invocation (a continuation, a resume, a CI fix) never overwrites the
+    /// cost earlier invocations recorded.
+    pub fn unrecorded(&self) -> UsageDelta {
+        let done = *self.recorded.0.lock().unwrap_or_else(|e| e.into_inner());
+        UsageDelta {
+            input_tokens: self.input_tokens.saturating_sub(done.input_tokens),
+            output_tokens: self.output_tokens.saturating_sub(done.output_tokens),
+            cache_read_tokens: self
+                .cache_read_tokens
+                .saturating_sub(done.cache_read_tokens),
+            cache_write_tokens: self
+                .cache_write_tokens
+                .saturating_sub(done.cache_write_tokens),
+            cost_usd: (self.cost_usd - done.cost_usd).max(0.0),
         }
-        u
+    }
+
+    /// `delta` is on the run record: the next write adds only what follows.
+    /// Called after the write succeeded; a refused write leaves it pending.
+    pub fn mark_recorded(&self, delta: &UsageDelta) {
+        let mut done = self.recorded.0.lock().unwrap_or_else(|e| e.into_inner());
+        done.input_tokens += delta.input_tokens;
+        done.output_tokens += delta.output_tokens;
+        done.cache_read_tokens += delta.cache_read_tokens;
+        done.cache_write_tokens += delta.cache_write_tokens;
+        done.cost_usd += delta.cost_usd;
     }
 }
 
@@ -379,13 +401,45 @@ mod tests {
         assert!((merged.cost_usd - usage.cost_usd).abs() < 1e-12);
     }
 
+    /// Each write adds only what came after the last one, so the run's
+    /// total is the sum of every invocation's calls, however many there were.
     #[test]
-    fn restored_usage_keeps_a_saved_cost_or_prices_the_tokens() {
-        let r = TokenUsage::restored("claude-opus-5-5", 10, 20, 30, 40, Some(1.5));
-        assert_eq!(r.total_tokens(), 100);
-        assert_eq!(r.cost_usd, 1.5);
-        let r = TokenUsage::restored("claude-opus-5-5", 1_000_000, 0, 0, 0, None);
-        assert!((r.cost_usd - 4.0).abs() < 1e-9);
+    fn run_writes_add_only_what_is_not_yet_recorded() {
+        let call = common::usage::CallUsage {
+            uncached_input: 100,
+            cache_read: 10,
+            cache_write_5m: 5,
+            cache_write_1h: 0,
+            output: 50,
+        };
+        let mut usage = TokenUsage::default();
+        usage.add_call("claude-opus-5-5", &call);
+        let first = usage.unrecorded();
+        assert_eq!(first.input_tokens, 100);
+        assert_eq!(first.cache_write_tokens, 5);
+        assert!(first.cost_usd > 0.0);
+        usage.mark_recorded(&first);
+        assert_eq!(usage.unrecorded(), UsageDelta::default());
+
+        usage.add_call("claude-opus-5-5", &call);
+        let second = usage.unrecorded();
+        assert_eq!(second.input_tokens, 100);
+        assert_eq!(second.output_tokens, 50);
+        // A write that failed is not marked: the next one carries it.
+        usage.add_call("claude-opus-5-5", &call);
+        assert_eq!(usage.unrecorded().input_tokens, 200);
+
+        // A snapshot shares what is recorded and never goes negative.
+        let before = usage.clone();
+        let all = usage.unrecorded();
+        usage.mark_recorded(&all);
+        assert_eq!(before.unrecorded(), UsageDelta::default());
+
+        // A new invocation starts at zero: it adds its own calls only,
+        // never a near-zero total over the earlier cost.
+        let mut next = TokenUsage::default();
+        next.add_call("claude-opus-5-5", &call);
+        assert_eq!(next.unrecorded().input_tokens, 100);
     }
 
     #[test]
