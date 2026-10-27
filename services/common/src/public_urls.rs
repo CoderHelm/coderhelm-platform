@@ -41,6 +41,8 @@ const HOSTED_SITE: &str = "https://coderhelm.com";
 /// there; a self-hosted install uses its own).
 const HOSTED_SUPPORT: &str = "support@coderhelm.com";
 const HOSTED_ADMIN: &str = "admin@coderhelm.com";
+/// The hosted deployment's sender, when SES_FROM_ADDRESS is unset.
+const HOSTED_FROM: &str = "notifications@coderhelm.com";
 
 fn clean(u: &str) -> String {
     u.trim().trim_end_matches('/').to_string()
@@ -401,6 +403,17 @@ pub fn default_platform_admins() -> &'static str {
     }
 }
 
+/// The sender when SES_FROM_ADDRESS is unset: the hosted sender on the
+/// hosted deployment, none on a self-hosted install (its deploy always sets
+/// its own; sending fails visibly rather than as CoderHelm).
+pub fn default_from_address() -> &'static str {
+    if self_hosted() {
+        ""
+    } else {
+        HOSTED_FROM
+    }
+}
+
 /// The host part of a URL (`app.example.com`), for display.
 pub fn host_of(url: &str) -> &str {
     let rest = url.split_once("://").map(|(_, r)| r).unwrap_or(url);
@@ -585,6 +598,23 @@ mod tests {
             log_reader_template_url_from(None),
             HOSTED_LOG_READER_TEMPLATE
         );
+    }
+
+    #[test]
+    fn a_self_hosted_install_never_sends_as_coderhelm() {
+        override_for_this_thread(Some(Override {
+            urls: None,
+            site: None,
+            self_hosted: true,
+        }));
+        assert_eq!(default_from_address(), "");
+        override_for_this_thread(Some(Override {
+            urls: None,
+            site: None,
+            self_hosted: false,
+        }));
+        assert_eq!(default_from_address(), HOSTED_FROM);
+        override_for_this_thread(None);
     }
 
     #[test]

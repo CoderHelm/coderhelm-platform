@@ -94,7 +94,7 @@ impl Config {
             webhook_queue_url: std::env::var("WEBHOOK_QUEUE_URL").unwrap_or_default(),
             dlq_url: std::env::var("DLQ_URL").unwrap_or_default(),
             ses_from_address: std::env::var("SES_FROM_ADDRESS")
-                .unwrap_or_else(|_| "notifications@coderhelm.com".to_string()),
+                .unwrap_or_else(|_| common::public_urls::default_from_address().to_string()),
             ses_template_prefix: std::env::var("SES_TEMPLATE_PREFIX")
                 .unwrap_or_else(|_| "coderhelm-prod".to_string()),
             model_id: std::env::var("MODEL_ID").unwrap_or_else(|_| "claude-sonnet-5-5".to_string()),

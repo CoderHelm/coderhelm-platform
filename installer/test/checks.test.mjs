@@ -235,6 +235,13 @@ test("GitHub: the stored keys sign a JWT GitHub accepts, and everything passes",
   assert.ok(verified, "a valid RS256 signature");
 });
 
+test("GitHub: an install on CoderHelm's app (hybrid) isn't failed for having no app of its own", async () => {
+  const r = await C.checkGithubApp({ fetchImpl: github().fetchImpl }, { github_app_id: "" }, "https://h", { github_mode: "hosted" });
+  assert.deepEqual(r.map((x) => [x.id, x.status]), [["github_keys", "pass"]]);
+  const own = await C.checkGithubApp({ fetchImpl: github().fetchImpl }, { github_app_id: "" }, "https://h", { github_mode: "own" });
+  assert.equal(own[0].status, "fail");
+});
+
 test("GitHub: no app, refused keys, missing permissions, wrong webhook, bad secret, no installs, bad OAuth client", async () => {
   const none = await C.checkGithubApp({ fetchImpl: github().fetchImpl }, { github_app_id: "" }, "https://h");
   assertExplained(none[0]);

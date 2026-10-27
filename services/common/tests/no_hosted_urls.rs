@@ -17,6 +17,8 @@ const ALLOWED: &[(&str, &str)] = &[
     ("services/gateway/src/routes/hybrid.rs", "hybrid: the hosted side's fallback page for {name}.coderhelm.com"),
     ("services/gateway/src/routes/hybrid_install.rs", "hybrid: tells an install it can't reach the hosted API"),
     ("services/gateway/src/openapi.rs", "the committed API document names the hosted server; a self-hosted install serves its own (served_document)"),
+    ("services/gateway/src/routes/support_access.rs", "the support view's session names who is looking (an identity on a read-only session, never an address anyone is sent to)"),
+    ("services/common/src/deliveries.rs", "hybrid: a broker outage names CoderHelm's status page (only reached through CoderHelm's token broker)"),
     ("services/common/src/mcp_remote/http.rs", "the User-Agent names the product; not a link anyone opens"),
     ("infra/lib/config.ts", "hybrid: the hosted API's default URL"),
     ("infra/lib/service-env.ts", "hybrid: the hosted API's default URL"),
@@ -78,6 +80,9 @@ fn hosted(line: &str) -> Option<&'static str> {
         "api.coderhelm.com",
         "stream.coderhelm.com",
         "auth.coderhelm.com",
+        "status.coderhelm.com",
+        "notifications@coderhelm.com",
+        "support@coderhelm.com",
         "://coderhelm.com",
         "://www.coderhelm.com",
     ]

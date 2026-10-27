@@ -375,6 +375,30 @@ test("every public API path, and the OpenAPI document itself, has an HTTP API ro
   assert.ok(!routeTakes("POST /webhooks/github", "POST", "/webhooks/ci/tests/results"));
 });
 
+test("single origin: every public route the gateway serves outside /api reaches it through CloudFront", () => {
+  const main = fs.readFileSync(path.join(INFRA, "..", "services", "gateway", "src", "main.rs"), "utf8");
+  // Top-level routers, and the paths of the routers nested there.
+  const nested = [...main.matchAll(/\.nest\("(\/[a-z-]+)",\s*([a-z_]+)\)/g)].map((m) => ({ prefix: m[1], router: m[2] }));
+  assert.ok(nested.length >= 6, "found the top-level routers");
+  const covered = (p: string) =>
+    API_PATHS.some((a) => (a.endsWith("/*") ? p.startsWith(a.slice(0, -1)) : a.endsWith("*") ? p.startsWith(a.slice(0, -1)) : p === a));
+  // Hosted-only: the hosted API's hybrid relay (a self-hosted install never serves it).
+  const hostedOnly = ["/hybrid"];
+  for (const { prefix, router } of nested) {
+    if (hostedOnly.includes(prefix)) continue;
+    const body = main.slice(main.indexOf(`let ${router} = Router::new()`));
+    const end = body.indexOf(";");
+    const paths = [...body.slice(0, end).matchAll(/\.route\(\s*"([^"]+)"/g)].map((m) => prefix + m[1]);
+    for (const p of paths.length ? paths : [prefix + "/x"]) {
+      assert.ok(covered(p.replace(/:[a-z_]+/g, "x")), `${p} isn't in API_PATHS: on a single-origin install it would reach the dashboard's bucket`);
+    }
+  }
+  // The dashboard's own plugin pages still go to the dashboard.
+  assert.ok(!covered("/plugins/installed"));
+  assert.ok(covered("/plugins/approve"));
+  assert.ok(covered("/agent-approvals/link"));
+});
+
 test("self-host serves the OpenAPI document through CloudFront", () => {
   assert.ok(API_PATHS.includes("/openapi.json"));
 });
