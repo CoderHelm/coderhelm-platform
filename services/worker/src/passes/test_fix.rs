@@ -120,6 +120,13 @@ pub struct Evidence {
     /// Spec files the failure is in, as found in the repository.
     #[serde(default)]
     pub spec_files: Vec<String>,
+    /// For a test fixed because it failed on another pull request for a
+    /// reason outside that change: the evidence its expectation was wrong
+    /// (the page snapshot), and that pull request.
+    #[serde(default)]
+    pub expectation_wrong: Option<String>,
+    #[serde(default)]
+    pub origin_pr: Option<String>,
 }
 
 impl Evidence {
@@ -405,12 +412,15 @@ pub async fn read_run(
     let picked = if named.is_empty() { all } else { named };
     let mut failures = Vec::new();
     for (dir, mut f) in picked.into_iter().take(QUOTED * 2) {
+        // Attachments are relative to the report; keep them relative to
+        // the run's folder, so they can be read as they are.
+        f.attachments = f.attachments.iter().map(|a| format!("{dir}{a}")).collect();
         f.run_id = run_id;
         f.attempt = attempt.max(1);
         f.source = r.label(run_id, attempt);
         if failures.len() < QUOTED {
             if let Some(p) = failure::context_path(&f).map(str::to_string) {
-                if let Some(md) = r.file(run_id, attempt, &format!("{dir}{p}")).await {
+                if let Some(md) = r.file(run_id, attempt, &p).await {
                     let (page, dialogs) = failure::page_state(&String::from_utf8_lossy(&md));
                     f.page_state = page;
                     f.dialogs = dialogs;
@@ -755,7 +765,12 @@ pub fn zip_files(bytes: &[u8]) -> Vec<(String, Vec<u8>)> {
     for i in 0..zip.len() {
         let Ok(f) = zip.by_index(i) else { continue };
         let name = f.name().to_string();
-        let wanted = (is_report_name(&name) || name.ends_with(".md"))
+        // Reports, and the page files, screenshots and traces a failure
+        // points at.
+        let wanted = (is_report_name(&name)
+            || name.ends_with(".md")
+            || name.ends_with(".png")
+            || (name.ends_with(".zip") && name.contains("data/")))
             && !f.is_dir()
             && (f.size() as usize) <= common::e2e::parse::MAX_REPORT_BYTES;
         if !wanted {
@@ -813,7 +828,7 @@ impl Reports for CiReports<'_> {
 
 /// The team's AWS session that can read `location`: the first connected
 /// account whose role lists it.
-async fn open_s3(
+pub(crate) async fn open_s3(
     state: &WorkerState,
     team_id: &str,
     location: &Location,
@@ -1195,7 +1210,52 @@ pub async fn for_run(
     if let Some(ev) = load(state, &msg.team_id, run_id).await {
         return Some(ev);
     }
-    let mut ev = gather(state, msg, github, provider, usage).await?;
+    let seed = super::e2e_attribution::load_seed(state, &msg.team_id, &msg.ticket_id).await;
+    let mut ev = match (gather(state, msg, github, provider, usage).await, &seed) {
+        (Some(ev), _) => ev,
+        (None, Some(_)) => Evidence {
+            read: TicketRead {
+                about_tests: true,
+                ..Default::default()
+            },
+            fetched_at: chrono::Utc::now().to_rfc3339(),
+            ..Default::default()
+        },
+        (None, None) => return None,
+    };
+    if let Some(seed) = &seed {
+        let a = &seed.attribution;
+        if !ev.failures.iter().any(|f| a.test.ends_with(&f.test)) {
+            ev.failures.insert(
+                0,
+                FailureExtract {
+                    test: a.test.clone(),
+                    file: a.file.clone(),
+                    run_id: a.run_id,
+                    status: "failed".into(),
+                    error: a.error.clone(),
+                    page_state: a.page_state.clone(),
+                    dialogs: a.dialogs.clone(),
+                    source: a.source.clone(),
+                    ..Default::default()
+                },
+            );
+        }
+        ev.expectation_wrong = Some(format!(
+            "the page snapshot from {} shows a valid state the test didn't accept ({})",
+            if a.source.is_empty() {
+                "the failing run's report"
+            } else {
+                &a.source
+            },
+            if a.state.is_empty() {
+                &a.shown
+            } else {
+                &a.state
+            }
+        ));
+        ev.origin_pr = Some(format!("{}/{}#{}", seed.owner, seed.repo, seed.pr));
+    }
     super::add_progress_note(state, &msg.team_id, run_id, &summary_note(&ev)).await;
     classify(state, msg, github, provider, usage, run_id, &mut ev).await;
     save(state, &msg.team_id, run_id, &ev).await;
@@ -1656,7 +1716,8 @@ pub async fn gate(
             .map(|(p, _, _)| p.clone())
             .collect();
         let ids: Vec<String> = evidence.lookups.iter().map(|l| l.id.clone()).collect();
-        let wrong = bug_rules::expectation_wrong(&evidence.notes, &ids);
+        let wrong = bug_rules::expectation_wrong(&evidence.notes, &ids)
+            .or_else(|| ev.expectation_wrong.clone());
         let weak = if wrong.is_some() {
             Vec::new()
         } else {
@@ -2140,6 +2201,21 @@ pub async fn register_pr(
         ..Default::default()
     };
     save_gate(state, &msg.team_id, &repo, pr, &g).await;
+    // A test fixed because it failed on another pull request: that pull
+    // request links here and is blocked on this one.
+    if msg
+        .ticket_id
+        .starts_with(super::e2e_attribution::FIX_PREFIX)
+    {
+        if let Ok(gh) = GitHubClient::new(
+            &state.secrets.github_app_id,
+            &state.secrets.github_private_key,
+            msg.installation_id,
+            &state.http,
+        ) {
+            super::e2e_attribution::link_fix(state, &gh, &msg.team_id, &msg.ticket_id, pr).await;
+        }
+    }
 }
 
 /// What the rules refuse in a pull request's diff as it is now: waits
@@ -2953,7 +3029,7 @@ mod tests {
             .into_iter()
             .map(|(n, _)| n)
             .collect();
-        assert_eq!(names, vec!["index.html", "data/abc.md"]);
+        assert_eq!(names, vec!["index.html", "data/abc.md", "data/abc.zip"]);
     }
 
     #[test]

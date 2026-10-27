@@ -39,6 +39,10 @@ pub enum Gate {
     Waiting,
     /// Every failing check failed only on these quarantined tests.
     OnlyQuarantined(Vec<String>),
+    /// Every failing end-to-end test fails for a reason outside the change
+    /// and is fixed in a separate pull request: CI is blocked on that fix,
+    /// not failing (see `e2e_attribution`). Carries the lines saying so.
+    Unrelated(Vec<String>),
 }
 
 /// The failing checks on a commit, grouped by the workflow run they came from.
@@ -202,7 +206,18 @@ pub async fn gate(
             }
         }
     }
-    let g = decide(&failing, &outcomes, Utc::now());
+    let mut g = decide(&failing, &outcomes, Utc::now());
+    if g == Gate::Real {
+        let sha = checks
+            .iter()
+            .find_map(|c| c["head_sha"].as_str())
+            .unwrap_or(git_ref);
+        if let Some(lines) =
+            super::e2e_attribution::blocked(state, team_id, &full, sha, &failing.runs).await
+        {
+            g = Gate::Unrelated(lines);
+        }
+    }
     info!(repo = %full, git_ref, runs = ?failing.runs, gate = ?g, "Quarantine check");
     g
 }

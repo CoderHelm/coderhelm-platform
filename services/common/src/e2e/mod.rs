@@ -21,9 +21,12 @@
 //!   test it are green on its head.
 //! - [`fix_ticket`] reads the ticket and shapes the description.
 //! - [`integrity`] refuses fixes that ask less of a test.
+//! - [`attribution`] decides whether a failure on Coderhelm's own pull
+//!   request comes from the change, from the page and the code it runs.
 //! - [`bug_rules`] tells a bug from a flake and holds a bug fix to the app,
 //!   with a unit test, keeping only the changes that matter.
 
+pub mod attribution;
 pub mod bug_rules;
 pub mod check_gate;
 pub mod ci_setup;

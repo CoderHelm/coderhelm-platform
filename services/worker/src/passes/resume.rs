@@ -382,6 +382,10 @@ enum FailRoute {
     Wait,
     /// Only quarantined tests failed: carry on as if CI passed.
     TreatAsPassed(Vec<String>),
+    /// Every failing end-to-end test fails for a reason outside the change
+    /// and is fixed in a separate pull request: no fix round; the run is
+    /// blocked on that fix.
+    Blocked(Vec<String>),
 }
 
 fn fail_route(gate: Gate) -> FailRoute {
@@ -389,6 +393,7 @@ fn fail_route(gate: Gate) -> FailRoute {
         Gate::Real => FailRoute::Fix,
         Gate::Waiting => FailRoute::Wait,
         Gate::OnlyQuarantined(names) => FailRoute::TreatAsPassed(names),
+        Gate::Unrelated(lines) => FailRoute::Blocked(lines),
     }
 }
 
@@ -466,6 +471,10 @@ mod ci_verdict_tests {
         );
         assert_eq!(fail_route(Gate::Waiting), FailRoute::Wait);
         assert_eq!(fail_route(Gate::Real), FailRoute::Fix);
+        assert_eq!(
+            fail_route(Gate::Unrelated(vec!["Blocked on #9".into()])),
+            FailRoute::Blocked(vec!["Blocked on #9".into()])
+        );
     }
 
     #[test]
@@ -1471,6 +1480,7 @@ pub async fn run(
     }
 
     let mut quarantined_only: Option<Vec<String>> = None;
+    let mut blocked_on: Option<Vec<String>> = None;
     if has_ci_fail && !red_on_base_only && !repo_owner.is_empty() && !repo_name.is_empty() {
         if let Ok(gh) = GitHubClient::new(
             &state.secrets.github_app_id,
@@ -1500,6 +1510,13 @@ pub async fn run(
                     has_ci_fail = false;
                     has_ci_pass = true;
                     quarantined_only = Some(names);
+                }
+                FailRoute::Blocked(lines) => {
+                    info!(
+                        run_id = msg.run_id,
+                        "Every E2E failure is outside this change and fixed separately; no fix round"
+                    );
+                    blocked_on = Some(lines);
                 }
             }
         }
@@ -1573,6 +1590,32 @@ pub async fn run(
                 super::CiOutcome::RedOnBase(on_base.clone()),
             )
             .await;
+        }
+        if let Some(lines) = &blocked_on {
+            // The failures aren't this change's: they are fixed in a
+            // separate pull request, and this one waits for it as a draft.
+            super::add_progress_note(state, &msg.team_id, &msg.run_id, &lines.join(" ")).await;
+            super::record_ci_outcome(
+                state,
+                &msg.team_id,
+                &msg.run_id,
+                super::CiOutcome::HandedOff(super::GaveUp::UnrelatedTest),
+            )
+            .await;
+            mark_events_processed(state, &msg.run_id, &events).await;
+            complete_run_with_status(
+                state,
+                &ticket_msg,
+                &msg.run_id,
+                "completed",
+                &pr_url,
+                pr_number,
+                &branch,
+                &usage,
+                wall_clock_secs(created_at, &start),
+            )
+            .await?;
+            return Ok(());
         }
         if red_on_base_only {
             // Every failing check fails on the base branch too: red before
