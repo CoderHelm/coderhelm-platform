@@ -752,6 +752,27 @@ impl Store {
                         #area = if_not_exists(#area, :area), #t = if_not_exists(#t, :text), \
                         #pr = if_not_exists(#pr, :pr), #ca = if_not_exists(#ca, :at)"
             .to_string();
+        // How it reads on the page: written once; the reason follows the
+        // latest outcome.
+        for (alias, name, value, always) in [
+            ("#ti", "title", &ex.title, false),
+            ("#su", "summary", &ex.summary, false),
+            ("#ri", "run_id", &ex.run_id, false),
+            ("#re", "reason", &ex.reason, true),
+        ] {
+            if value.is_empty() {
+                continue;
+            }
+            let v = format!(":{}", &alias[1..]);
+            if always {
+                expr.push_str(&format!(", {alias} = {v}"));
+            } else {
+                expr.push_str(&format!(", {alias} = if_not_exists({alias}, {v})"));
+            }
+            req = req
+                .expression_attribute_names(alias, name)
+                .expression_attribute_values(v, s(value));
+        }
         for (alias, name) in [
             ("#reward", "reward"),
             ("#events", "events"),
@@ -803,8 +824,17 @@ impl Store {
         Ok(items.iter().map(exemplar_of).collect())
     }
 
-    pub async fn count_exemplar_use(&self, team_id: &str, ex: &[Exemplar]) {
+    /// Counts one use of each example and keeps when and by what: the
+    /// latest [`exemplars::MAX_USES_KEPT`] uses, from the copies read for
+    /// this prompt (two prompts at once may each keep only their own).
+    pub async fn count_exemplar_use(&self, team_id: &str, ex: &[Exemplar], by: &exemplars::Use) {
         for e in ex {
+            let kept: Vec<AttributeValue> = e
+                .uses_after(by.clone())
+                .iter()
+                .filter_map(|u| serde_json::to_string(u).ok())
+                .map(AttributeValue::S)
+                .collect();
             let _ = self
                 .dynamo
                 .update_item()
@@ -812,9 +842,13 @@ impl Store {
                 .key("pk", s(team_id))
                 .key("sk", s(&exemplars::sk(&e.repo, &e.id)))
                 .condition_expression("attribute_exists(sk)")
-                .update_expression("ADD #u :one")
+                .update_expression("ADD #u :one SET #lu = :at, #ub = :ub")
                 .expression_attribute_names("#u", "uses")
+                .expression_attribute_names("#lu", "last_used_at")
+                .expression_attribute_names("#ub", "used_by")
                 .expression_attribute_values(":one", n(1))
+                .expression_attribute_values(":at", s(&by.at))
+                .expression_attribute_values(":ub", AttributeValue::L(kept))
                 .send()
                 .await;
         }
@@ -1030,6 +1064,21 @@ pub fn exemplar_of(i: &Item) -> Exemplar {
         category: gs(i, "category"),
         area: gs(i, "area"),
         text: gs(i, "text"),
+        title: gs(i, "title"),
+        summary: gs(i, "summary"),
+        reason: gs(i, "reason"),
+        run_id: gs(i, "run_id"),
+        last_used_at: gs(i, "last_used_at"),
+        used_by: i
+            .get("used_by")
+            .and_then(|v| v.as_l().ok())
+            .map(|l| {
+                l.iter()
+                    .filter_map(|v| v.as_s().ok())
+                    .filter_map(|s| serde_json::from_str(s).ok())
+                    .collect()
+            })
+            .unwrap_or_default(),
         reward: gf(i, "reward"),
         events: gu(i, "events"),
         uses: gu(i, "uses"),
@@ -1147,6 +1196,21 @@ mod tests {
         ]));
         assert_eq!(e.embedding, vec![1.0, 2.0]);
         assert_eq!(e.polarity(), Some("good"));
+        assert!(e.used_by.is_empty() && e.title.is_empty());
+        let e = exemplar_of(&item(&[
+            ("title", s("Retry once")),
+            ("last_used_at", s("2026-01-02T00:00:00Z")),
+            (
+                "used_by",
+                AttributeValue::L(vec![
+                    s(r#"{"at":"2026-01-02T00:00:00Z","agent":"coder","run_id":"R1"}"#),
+                    s("not json"),
+                ]),
+            ),
+        ]));
+        assert_eq!(e.title, "Retry once");
+        assert_eq!(e.used_by.len(), 1);
+        assert_eq!(e.used_by[0].run_id, "R1");
         let l = lesson_of(&item(&[
             ("id", s("L")),
             ("text", s("t")),

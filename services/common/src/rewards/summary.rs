@@ -8,6 +8,9 @@ use super::exemplars::Exemplar;
 use super::score::{self, Dim, Weights};
 use serde_json::{json, Value};
 
+/// Most examples listed on the page.
+pub const MAX_EXEMPLARS: usize = 200;
+
 /// Everything the page is built from.
 pub struct Inputs<'a> {
     pub team_id: &'a str,
@@ -104,21 +107,29 @@ pub fn build(i: &Inputs<'_>) -> Value {
         .iter()
         .filter(|e| in_repo(&e.repo) && e.polarity().is_some())
         .collect();
+    // Most used first, then the biggest reward: the ones shaping prompts.
     ex.sort_by(|a, b| {
-        b.reward
-            .abs()
-            .partial_cmp(&a.reward.abs())
-            .unwrap_or(std::cmp::Ordering::Equal)
+        b.uses.cmp(&a.uses).then_with(|| {
+            b.reward
+                .abs()
+                .partial_cmp(&a.reward.abs())
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
     });
     let exemplars: Vec<Value> = ex
         .into_iter()
-        .take(60)
+        .take(MAX_EXEMPLARS)
         .map(|e| {
+            let d = e.display();
             json!({
                 "id": e.id, "repo": e.repo, "kind": e.kind, "polarity": e.polarity(),
                 "category": e.category, "area": e.area,
-                "text": crate::truncate_str(&e.text, 400),
-                "reward": r3(e.reward), "uses": e.uses, "created_at": e.created_at, "pr": e.pr,
+                "title": d.title, "summary": d.summary, "reason": d.reason,
+                // Kept for older dashboards: one clean line, never raw markup.
+                "text": super::example_text::cut_words(&d.line(), 240),
+                "reward": r3(e.reward), "events": e.events, "uses": e.uses,
+                "created_at": e.created_at, "pr": e.pr, "run_id": e.run_id,
+                "last_used_at": e.last_used_at, "used_by": e.used_by,
             })
         })
         .collect();
@@ -258,5 +269,77 @@ mod tests {
         });
         assert_eq!(all["totals"]["events"], 2);
         assert_eq!(all["repos"].as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn examples_read_clean_and_most_used_first() {
+        use super::super::exemplars::{Exemplar, Use, KIND_FINDING, KIND_FIX};
+        let old = Exemplar {
+            id: "old".into(),
+            repo: "acme/web".into(),
+            kind: KIND_FINDING.into(),
+            text: "Missing test: <!-- coderhelm:x -->The **retry** path has no test.".into(),
+            reward: 2.5,
+            uses: 1,
+            ..Default::default()
+        };
+        let used = Exemplar {
+            id: "used".into(),
+            repo: "acme/web".into(),
+            kind: KIND_FIX.into(),
+            reward: 1.2,
+            uses: 9,
+            reason: "CI passed on the first try, merged without changes".into(),
+            run_id: "R1".into(),
+            last_used_at: "2026-10-02T00:00:00Z".into(),
+            used_by: vec![Use {
+                at: "2026-10-02T00:00:00Z".into(),
+                agent: "coder".into(),
+                run_id: "R2".into(),
+                pr: 0,
+            }],
+            ..Default::default()
+        }
+        .with_text(
+            "Retry payments",
+            "Source ticket: OPS-1\n\n**Summary** Retry once.",
+        );
+        let neutral = Exemplar {
+            id: "neutral".into(),
+            repo: "acme/web".into(),
+            reward: 0.2,
+            uses: 50,
+            ..Default::default()
+        };
+        let w = Weights::default();
+        let v = build(&Inputs {
+            team_id: "TEAM#a",
+            days: 30,
+            repo: "",
+            can_manage: true,
+            weights: &w,
+            events: &[],
+            categories: &[],
+            changes: &[],
+            exemplars: &[old, used, neutral],
+            arms: &[],
+        });
+        let ex = v["exemplars"].as_array().unwrap();
+        assert_eq!(ex.len(), 2, "no polarity, not listed");
+        assert_eq!(ex[0]["id"], "used");
+        assert_eq!(ex[0]["title"], "Retry payments");
+        assert_eq!(ex[0]["summary"], "Retry once.");
+        assert_eq!(
+            ex[0]["reason"],
+            "CI passed on the first try, merged without changes"
+        );
+        assert_eq!(ex[0]["run_id"], "R1");
+        assert_eq!(ex[0]["used_by"][0]["run_id"], "R2");
+        assert!(ex[0]["used_by"][0].get("pr").is_none());
+        assert_eq!(ex[1]["title"], "Missing test");
+        assert_eq!(ex[1]["summary"], "The **retry** path has no test.");
+        assert_eq!(ex[1]["reason"], "The team acted on this comment");
+        assert_eq!(ex[1]["text"], "Missing test: The retry path has no test.");
+        assert!(!ex[1]["text"].as_str().unwrap().contains("<!--"));
     }
 }

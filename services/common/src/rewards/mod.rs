@@ -21,6 +21,7 @@ pub mod bandit;
 pub mod calibration;
 pub mod changes;
 pub mod event;
+pub mod example_text;
 pub mod exemplars;
 pub mod lessons;
 pub mod mapping;

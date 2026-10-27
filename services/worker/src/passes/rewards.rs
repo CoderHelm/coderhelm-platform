@@ -296,20 +296,25 @@ pub async fn score_outcome(state: &WorkerState, msg: RewardOutcomeMessage) -> Re
         .map(|e| score::score(e, &weights))
         .sum();
     if fix_score != 0.0 {
-        let text = format!(
-            "{}: {}",
-            pr["title"].as_str().unwrap_or(""),
-            common::truncate_str(pr["body"].as_str().unwrap_or(""), 500)
-        );
+        let outcome: Vec<(RewardKind, f64)> = events
+            .iter()
+            .filter(|e| e.agent == rev::AGENT_CODER)
+            .filter_map(|e| e.kind.map(|k| (k, e.value)))
+            .collect();
         let ex = Exemplar {
             id: exemplars::id_for(&repo, msg.pr_number, "fix"),
             repo: repo.clone(),
             kind: exemplars::KIND_FIX.into(),
             area: ctx.area.clone(),
-            text,
             pr: msg.pr_number,
+            run_id: msg.run_id.clone(),
+            reason: exemplars::fix_reason(&outcome),
             ..Default::default()
-        };
+        }
+        .with_text(
+            pr["title"].as_str().unwrap_or(""),
+            common::truncate_str(pr["body"].as_str().unwrap_or(""), 4000),
+        );
         add_example(state, &msg.team_id, ex, fix_score).await;
     }
 
@@ -397,21 +402,21 @@ pub async fn record_accepted(
 }
 
 fn finding_example(repo: &str, pr: u64, t: &BotReviewThread) -> Exemplar {
-    let body: String = t.body.lines().skip(2).collect::<Vec<_>>().join(" ");
+    let body: String = t.body.lines().skip(2).collect::<Vec<_>>().join("\n");
     Exemplar {
         id: exemplars::id_for(repo, pr, &t.id),
         repo: repo.to_string(),
         kind: exemplars::KIND_FINDING.into(),
         category: mapping::thread_category(&t.body),
         area: rev::file_area(&t.path),
-        text: format!(
-            "{}: {}",
-            mapping::thread_title(&t.body),
-            common::truncate_str(&body, 400)
-        ),
         pr,
+        reason: exemplars::finding_reason(RewardKind::FindingAccepted),
         ..Default::default()
     }
+    .with_text(
+        &mapping::thread_title(&t.body),
+        common::truncate_str(&body, 4000),
+    )
 }
 
 /// Records a review comment the team argued with as dismissed, once the
@@ -449,10 +454,11 @@ pub async fn record_dismissed(
                 repo: repo.to_string(),
                 kind: exemplars::KIND_FINDING.into(),
                 category: e.category.clone(),
-                text: format!("{title}: {why}"),
                 pr,
+                reason: exemplars::finding_reason(RewardKind::FindingDismissed),
                 ..Default::default()
-            };
+            }
+            .with_text(title, why);
             add_example(state, team_id, ex, score::score(&e, &weights)).await;
         }
         Ok(false) => {}
@@ -480,6 +486,7 @@ pub async fn review_learning(
     state: &WorkerState,
     team_id: &str,
     repo: &str,
+    pr: u64,
     paths: &[String],
     query: &str,
 ) -> ReviewLearning {
@@ -505,8 +512,22 @@ pub async fn review_learning(
     let addendum = bandit::arm(rev::AGENT_REVIEWER, &choice.arm)
         .map(|a| a.addendum)
         .unwrap_or("");
-    let examples =
-        examples_block(state, team_id, repo, exemplars::KIND_FINDING, paths, query).await;
+    let by = exemplars::Use {
+        at: chrono::Utc::now().to_rfc3339(),
+        agent: rev::AGENT_REVIEWER.into(),
+        run_id: String::new(),
+        pr,
+    };
+    let examples = examples_block(
+        state,
+        team_id,
+        repo,
+        exemplars::KIND_FINDING,
+        paths,
+        query,
+        &by,
+    )
+    .await;
     let now = chrono::Utc::now();
     let kept = st.lessons(team_id, Some(repo)).await.unwrap_or_default();
     let lesson_block = lessons::prompt_block(&lessons::recall(&kept, rev::AGENT_REVIEWER, now));
@@ -555,9 +576,21 @@ pub async fn note_review_variant(
 
 /// The coder's learning for `repo`: examples of merged and rejected changes
 /// and evidence-backed lessons. Empty when there are none.
-pub async fn coder_learning(state: &WorkerState, team_id: &str, repo: &str, query: &str) -> String {
+pub async fn coder_learning(
+    state: &WorkerState,
+    team_id: &str,
+    repo: &str,
+    run_id: &str,
+    query: &str,
+) -> String {
     let st = store(state);
-    let examples = examples_block(state, team_id, repo, exemplars::KIND_FIX, &[], query).await;
+    let by = exemplars::Use {
+        at: chrono::Utc::now().to_rfc3339(),
+        agent: rev::AGENT_CODER.into(),
+        run_id: run_id.to_string(),
+        pr: 0,
+    };
+    let examples = examples_block(state, team_id, repo, exemplars::KIND_FIX, &[], query, &by).await;
     let kept = st.lessons(team_id, Some(repo)).await.unwrap_or_default();
     let lesson_block = lessons::prompt_block(&lessons::recall(
         &kept,
@@ -574,6 +607,7 @@ async fn examples_block(
     kind: &str,
     paths: &[String],
     query: &str,
+    by: &exemplars::Use,
 ) -> String {
     let st = store(state);
     let cands = st.exemplars(team_id, Some(repo)).await.unwrap_or_default();
@@ -595,7 +629,7 @@ async fn examples_block(
         },
     );
     let used: Vec<Exemplar> = good.iter().chain(avoid.iter()).cloned().collect();
-    st.count_exemplar_use(team_id, &used).await;
+    st.count_exemplar_use(team_id, &used, by).await;
     exemplars::prompt_block(kind, &good, &avoid)
 }
 

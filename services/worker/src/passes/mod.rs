@@ -1536,6 +1536,7 @@ async fn run_passes(
             state,
             &msg.team_id,
             &format!("{}/{}", msg.repo_owner, msg.repo_name),
+            run_id,
             &format!("{} {}", msg.title, common::truncate_str(&msg.body, 1500)),
         )
         .await
