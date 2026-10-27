@@ -114,10 +114,11 @@ pub async fn require_auth(
         .extensions()
         .get::<MatchedPath>()
         .and_then(|m| permissions::routed_handler(req.method().as_str(), m.as_str()));
-    // How this session signed in. On a self-hosted install that requires
-    // two-factor sign-in, a session without a second factor reaches only the
-    // screens that set one up; the rule is read on every request, so sessions
-    // from before it was turned on are held at their next request.
+    // How this session signed in. When the team it acts in (a self-hosted
+    // install: the organization) requires two-factor sign-in, a session
+    // without a second factor reaches only the screens that set one up; the
+    // rule is read on every request, so sessions from before it was turned
+    // on are held at their next request.
     let proof = jwt::read_proof(token, &state.secrets.jwt_secret);
     // The session against the member's record, read on every request: a
     // removal, a role change, a two-factor reset or turning two-factor off
@@ -125,10 +126,8 @@ pub async fn require_auth(
     if let Err(ended) = sign_in::check_member_session(&state, &claims).await {
         return Ok(ended);
     }
-    if sign_in::applies() {
-        if let Err(held) = sign_in::check_session(&state, &proof, handler).await {
-            return Ok(held);
-        }
+    if let Err(held) = sign_in::check_session(&state, &claims.team_id, &proof, handler).await {
+        return Ok(held);
     }
 
     let holder = roles::holder_for(&state, &claims).await;

@@ -1118,13 +1118,11 @@ pub async fn mfa_setup(
     Extension(claims): Extension<Claims>,
     Json(body): Json<EnableMfaRequest>,
 ) -> Result<Json<Value>, StatusCode> {
-    // A self-hosted install: one second factor per member, so none is set
+    // One second factor per member (on every deployment), so none is set
     // up over the authenticator-app code.
-    if crate::routes::sign_in::applies() {
-        crate::routes::sign_in::check_enroll(&state, &claims)
-            .await
-            .map_err(|(code, _)| code)?;
-    }
+    crate::routes::sign_in::check_enroll(&state, &claims)
+        .await
+        .map_err(|(code, _)| code)?;
     // Authenticate to get a Cognito access token
     let hash = cognito_secret_hash(
         &state.cognito_client_secret,
@@ -1194,13 +1192,11 @@ pub async fn mfa_verify_setup(
     Extension(claims): Extension<Claims>,
     Json(body): Json<VerifyMfaRequest>,
 ) -> Result<axum::response::Response, StatusCode> {
-    // A self-hosted install: one second factor per member, so none is set
+    // One second factor per member (on every deployment), so none is set
     // up over the authenticator-app code.
-    if crate::routes::sign_in::applies() {
-        crate::routes::sign_in::check_enroll(&state, &claims)
-            .await
-            .map_err(|(code, _)| code)?;
-    }
+    crate::routes::sign_in::check_enroll(&state, &claims)
+        .await
+        .map_err(|(code, _)| code)?;
     // Authenticate to get a Cognito access token
     let hash = cognito_secret_hash(
         &state.cognito_client_secret,
@@ -1277,23 +1273,23 @@ pub async fn mfa_verify_setup(
 
     info!(email = %claims.email, "MFA enabled");
 
-    // A self-hosted install: the factor is recorded for admins, and this
-    // session, which just proved the password and a code, counts as signed
-    // in with two factors.
-    if crate::routes::sign_in::applies() {
-        crate::routes::sign_in::note_factor(&state, &claims.team_id, &claims.sub, Some("cognito"))
-            .await;
-        let cookie =
-            crate::routes::sign_in::session_with_second_factor(&state, &claims, "password")
-                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-        let mut resp = Json(json!({ "status": "enabled" })).into_response();
-        if let Ok(v) = axum::http::HeaderValue::from_str(&cookie) {
-            resp.headers_mut().append(axum::http::header::SET_COOKIE, v);
-        }
-        return Ok(resp);
+    // The factor is recorded for admins, and this session, which just
+    // proved the password and a code, counts as signed in with two factors.
+    crate::routes::sign_in::note_factor(
+        &state,
+        &claims.team_id,
+        &claims.sub,
+        &claims.email,
+        Some("cognito"),
+    )
+    .await;
+    let cookie = crate::routes::sign_in::session_with_second_factor(&state, &claims, "password")
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let mut resp = Json(json!({ "status": "enabled" })).into_response();
+    if let Ok(v) = axum::http::HeaderValue::from_str(&cookie) {
+        resp.headers_mut().append(axum::http::header::SET_COOKIE, v);
     }
-
-    Ok(Json(json!({ "status": "enabled" })).into_response())
+    Ok(resp)
 }
 
 /// DELETE /api/users/mfa — Disable TOTP MFA.
@@ -1305,16 +1301,15 @@ pub async fn mfa_disable(
     if role_level(&claims.role) < 3 && claims.email.is_empty() {
         return Err(StatusCode::FORBIDDEN);
     }
-    // A self-hosted install: only a session that passed this code turns it
-    // off, and an install that requires two-factor sign-in keeps it on.
-    if crate::routes::sign_in::applies() && !proof.as_ref().is_some_and(|p| p.mfa) {
+    // Only a session that passed this code turns it off, and it stays on
+    // while a team the person is on (self-hosted: the organization) requires
+    // two-factor sign-in.
+    if !proof.as_ref().is_some_and(|p| p.mfa) {
         return Err(StatusCode::FORBIDDEN);
     }
-    if crate::routes::sign_in::applies()
-        && crate::routes::sign_in::load_org(&state)
-            .await
-            .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?
-            .is_some_and(|o| o.require_2fa)
+    if crate::routes::sign_in::must_keep(&state, &claims.team_id, &claims.sub, &claims.email)
+        .await
+        .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?
     {
         return Err(StatusCode::CONFLICT);
     }
@@ -1338,9 +1333,8 @@ pub async fn mfa_disable(
         })?;
 
     info!(email = %claims.email, "MFA disabled");
-    if crate::routes::sign_in::applies() {
-        crate::routes::sign_in::note_factor(&state, &claims.team_id, &claims.sub, None).await;
-    }
+    crate::routes::sign_in::note_factor(&state, &claims.team_id, &claims.sub, &claims.email, None)
+        .await;
     // Every other session of theirs ends; this one carries on.
     let proof = proof.map(|p| p.0).unwrap_or_default();
     let cookie = crate::routes::sign_in::end_other_sessions(&state, &claims, &proof)

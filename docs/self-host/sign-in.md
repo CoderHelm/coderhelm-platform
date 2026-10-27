@@ -34,6 +34,8 @@ An install from before this change keeps working: its oldest team becomes the or
 
 Anyone can turn on two-factor sign-in for themselves in **Settings, Security**. Admins can require it for everyone: **Settings, Sign-in, Require two-factor sign-in**. Turn it on for yourself first; the switch asks for that, so you can't lock yourself out.
 
+When you turn it on, everyone who has no second factor yet gets an email saying so, with a link to set it up (Deliveries shows each one). **Settings, Sign-in** shows how many people haven't set it up, before and after.
+
 With it on:
 
 - **Everyone** must set up an authenticator app (any TOTP app: 1Password, Google Authenticator, Authy and so on) before they can use CoderHelm. At their next sign-in they see a setup screen with a code to scan, and nothing else works until they enter a code from the app.
@@ -50,7 +52,7 @@ Email and password, Google and GitHub all lead to the same person in CoderHelm (
 - **Cognito's code on the password account**: only Cognito can check it, so it is asked for at the password sign-in. Signing in with Google or GitHub sends the person back to sign in with their email and password.
 - **Neither kind can be set up while the person has one**, from any session, including one held at the setup screen. To change it, turn the current one off first: the app code takes a current code to turn off, and the password account's code can be turned off only from a session that passed it. If someone lost their phone, an admin resets it (below).
 
-**Settings, Sign-in** shows who has set it up. If someone loses their phone, an admin can reset their two-factor sign-in after checking it's really them (a video call, say). The admin writes how they checked; the reset and the reason go in the log under **Settings, Roles**. The person sets it up again at their next sign-in. Only an owner can reset an admin's or another owner's. Nobody can reset their own.
+**Settings, Sign-in** shows who has set it up. If someone loses their phone, an admin can reset their two-factor sign-in after checking it's really them (a video call, say). The admin writes how they checked; the reset and the reason go in the log under **Settings, Roles**. The person sets it up again at their next sign-in, and gets an email saying their two-factor sign-in was reset, so a reset they didn't ask for doesn't go unnoticed. Only an owner can reset an admin's or another owner's. Nobody can reset their own.
 
 ### Wrong codes
 

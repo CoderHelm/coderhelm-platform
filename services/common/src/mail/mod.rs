@@ -96,6 +96,8 @@ pub const ESSENTIAL: &[EssentialEmail] = &[
     EssentialEmail { id: "support_update", label: "Support ticket updates", why: "Replies and status changes on tickets someone filed." },
     EssentialEmail { id: "webhook_disabled", label: "Webhook endpoint turned off", why: "Tells a team's admins when CoderHelm stopped sending to an endpoint that failed for days." },
     EssentialEmail { id: "two_factor_lockout", label: "Two-factor lockout alerts", why: "Tells admins and owners when someone's two-factor sign-in was paused after too many wrong codes." },
+    EssentialEmail { id: "two_factor_required", label: "Two-factor sign-in required", why: "Tells people without a second factor that an admin now requires one, before their next sign-in is held." },
+    EssentialEmail { id: "two_factor_reset", label: "Two-factor sign-in reset", why: "Tells a person an admin reset their second factor, so a reset they didn't ask for doesn't go unnoticed." },
     EssentialEmail { id: "update_notice", label: "Update notices", why: "Tells install admins about new releases, finished or failed updates and address changes." },
     EssentialEmail { id: "test_email", label: "Test email", why: "Sent only when an admin presses Send test email in Setup." },
 ];

@@ -32,7 +32,16 @@
 //! sessions from before it was turned on are held at their next request. API
 //! keys are not people and are not affected.
 //!
-//! The hosted deployment keeps its behavior: none of this applies there.
+//! The hosted deployment has no organization and no join rules, but the
+//! two-factor part works the same way, per team:
+//! - Each team's admins can require two-factor sign-in for that team
+//!   (`pk = <team>`, `sk = SETTINGS#SIGN_IN` in the settings table). The
+//!   rule is read fresh on every request of a session acting in that team.
+//! - A person's second factor is theirs, not a team's: it is kept on one
+//!   record of their own in the users table (`pk = PERSON#EMAIL#<email>`,
+//!   `sk = TWO_FACTOR`; see [`hosted_home_key`]), so every team they are on
+//!   sees the same factor, and every way in asks for it whether or not a
+//!   team requires it.
 
 use aws_sdk_dynamodb::types::AttributeValue;
 use axum::{
@@ -104,6 +113,89 @@ fn admin(claims: &Claims) -> Result<(), ApiError> {
 /// Only on a self-hosted install.
 pub fn applies() -> bool {
     super::setup_checks::self_hosted()
+}
+
+// ── The two-factor rule, per team ───────────────────────────────────
+
+/// Where a hosted team's own two-factor rule lives (settings table, `pk =
+/// <team>`).
+pub const TEAM_RULE_SK: &str = "SETTINGS#SIGN_IN";
+/// The hosted deployment's record of a person's second factor (users
+/// table): `pk = PERSON#...`, `sk = TWO_FACTOR`.
+pub const PERSON_PREFIX: &str = "PERSON#";
+pub const FACTOR_SK: &str = "TWO_FACTOR";
+
+/// Whether a team requires two-factor sign-in, and since when.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Rule {
+    pub require_2fa: bool,
+    /// When the rule was last turned on.
+    pub since: Option<String>,
+}
+
+impl Rule {
+    pub fn from_item(item: &Item) -> Rule {
+        Rule {
+            require_2fa: item
+                .get("require_2fa")
+                .and_then(|v| v.as_bool().ok())
+                .copied()
+                .unwrap_or(false),
+            since: Some(s(item, "require_2fa_since"))
+                .filter(|v| !v.is_empty())
+                .map(str::to_string),
+        }
+    }
+}
+
+/// The two-factor rule for a session acting in `team_id`: on a self-hosted
+/// install the organization's (one rule for the install), on the hosted
+/// deployment the team's own. Read fresh (a consistent read, no cache); a
+/// read that fails is an error, and callers refuse.
+pub async fn team_rule(state: &AppState, team_id: &str) -> Result<Rule, String> {
+    if applies() {
+        return Ok(load_org(state)
+            .await?
+            .map(|o| Rule {
+                require_2fa: o.require_2fa,
+                since: o.require_2fa_since,
+            })
+            .unwrap_or_default());
+    }
+    let out = state
+        .dynamo
+        .get_item()
+        .table_name(&state.config.settings_table_name)
+        .key("pk", attr_s(team_id))
+        .key("sk", attr_s(TEAM_RULE_SK))
+        .consistent_read(true)
+        .send()
+        .await
+        .map_err(|e| format!("{e}"))?;
+    Ok(out.item().map(Rule::from_item).unwrap_or_default())
+}
+
+/// Where the hosted deployment keeps a person's second factor: by their
+/// email (the same person through Google, GitHub and a password, on every
+/// team), else by their member record's id (GitHub without an email).
+pub fn hosted_home_key(user_id: &str, email: &str) -> (String, String) {
+    let e = normalize_email(email);
+    let who = if e.contains('@') {
+        format!("EMAIL#{e}")
+    } else {
+        user_id.trim().to_string()
+    };
+    (format!("{PERSON_PREFIX}{who}"), FACTOR_SK.to_string())
+}
+
+/// Where a member's second factor is kept: their member record on a
+/// self-hosted install (one team), the person's own record on hosted.
+pub fn home_key(team_id: &str, user_id: &str, email: &str) -> (String, String) {
+    if applies() {
+        (team_id.to_string(), user_id.to_string())
+    } else {
+        hosted_home_key(user_id, email)
+    }
 }
 
 // ── The organization ────────────────────────────────────────────────
@@ -737,31 +829,41 @@ pub fn gate(require_2fa: bool, proof: &SignInProof, handler: Option<&str>) -> bo
     !require_2fa || proof.mfa || handler.is_some_and(|h| SETUP_HANDLERS.contains(&h))
 }
 
+/// Who requires it, in the words a person reads.
+fn required_by() -> &'static str {
+    if applies() {
+        "Your organization"
+    } else {
+        "This team"
+    }
+}
+
 /// The answer to a held session.
 pub fn two_factor_required() -> Response {
     (
         StatusCode::FORBIDDEN,
         Json(json!({
-            "error": "Your organization requires two-factor sign-in. Set it up to continue.",
+            "error": format!("{} requires two-factor sign-in. Set it up to continue.", required_by()),
             "code": "two_factor_required",
         })),
     )
         .into_response()
 }
 
-/// The middleware's check for one session request on a self-hosted install.
-/// The rule is read fresh each time; when it can't be read the request is
-/// refused (the safe answer).
+/// The middleware's check for one session request acting in `team_id`, on
+/// either deployment. The rule is read fresh each time; when it can't be
+/// read the request is refused (the safe answer).
 pub async fn check_session(
     state: &AppState,
+    team_id: &str,
     proof: &SignInProof,
     handler: Option<&str>,
 ) -> Result<(), Response> {
     if proof.mfa {
         return Ok(());
     }
-    let require = match load_org(state).await {
-        Ok(org) => org.is_some_and(|o| o.require_2fa),
+    let require = match team_rule(state, team_id).await {
+        Ok(rule) => rule.require_2fa,
         Err(e) => {
             error!(error = %e, "Two-factor rule not read; request refused");
             return Err(StatusCode::SERVICE_UNAVAILABLE.into_response());
@@ -775,37 +877,42 @@ pub async fn check_session(
 }
 
 /// GET /api/users/2fa — this person's two-factor sign-in: whether the
-/// organization requires it, whether this session is held until it is set
-/// up, which kind they set up (`app`, `cognito` or none), and which kind fits
-/// how they signed in (`cognito` after a password, `app` after Google or
-/// GitHub).
+/// organization (hosted: the team they are acting in) requires it, whether
+/// this session is held until it is set up, which kind they set up (`app`,
+/// `cognito` or none), which kind fits how they signed in (`cognito` after a
+/// password, `app` after Google or GitHub), and whether they must keep it
+/// (a team they are on requires it).
 pub async fn my_status(
     State(state): State<Arc<AppState>>,
     Extension(claims): Extension<Claims>,
     proof: Option<Extension<SignInProof>>,
 ) -> Result<Json<Value>, ApiError> {
-    if !applies() {
-        return Ok(Json(
-            json!({ "self_hosted": false, "required": false, "held": false }),
-        ));
-    }
-    let required = load_org(&state)
+    let required = team_rule(&state, &claims.team_id)
         .await
-        .map_err(|e| internal("Organization not read", e))?
-        .is_some_and(|o| o.require_2fa);
+        .map_err(|e| internal("Two-factor rule not read", e))?
+        .require_2fa;
     let passed = proof.as_ref().is_some_and(|p| p.mfa);
     let via = via_of(proof.as_ref());
     let item = member(&state, &claims.team_id, &claims.sub)
         .await
         .map_err(|e| internal("Member not read", e))?;
     let factor = match &item {
-        Some(i) => factor_of(&state, i).await,
+        Some(i) => member_factor(&state, i).await,
         None => None,
     };
+    // Shown only (turning it off checks again): a read that fails shows it kept.
+    let keep = required
+        || must_keep(&state, &claims.team_id, &claims.sub, &claims.email)
+            .await
+            .unwrap_or_else(|e| {
+                warn!(error = %e, "Two-factor rules of other teams not read");
+                true
+            });
     Ok(Json(json!({
-        "self_hosted": true,
+        "self_hosted": applies(),
         "required": required,
         "held": required && !passed,
+        "must_keep": keep,
         "session_has_2fa": passed,
         "signed_in_with": via,
         "set_up": factor,
@@ -960,20 +1067,76 @@ async fn use_app_code(state: &AppState, item: &Item, code: &str) -> Result<bool,
     Ok(used.is_ok())
 }
 
-/// Records which second factor a member has (shown to admins).
-pub async fn note_factor(state: &AppState, team_id: &str, user_id: &str, factor: Option<&str>) {
-    let mut up = state
+/// The record that holds a member's second factor ([`home_key`]): the
+/// member record itself on a self-hosted install. On hosted, the person's
+/// own record, or (none yet) an empty one with its keys and the member's
+/// email, so the password account's code is still asked of Cognito.
+async fn factor_home(state: &AppState, member: &Item) -> Result<Item, String> {
+    if applies() {
+        return Ok(member.clone());
+    }
+    let email = s(member, "email");
+    let (pk, sk) = hosted_home_key(s(member, "sk"), email);
+    let out = state
+        .dynamo
+        .get_item()
+        .table_name(&state.config.users_table_name)
+        .key("pk", attr_s(&pk))
+        .key("sk", attr_s(&sk))
+        .consistent_read(true)
+        .send()
+        .await
+        .map_err(|e| format!("{e}"))?;
+    Ok(out.item.unwrap_or_else(|| {
+        HashMap::from([
+            ("pk".to_string(), attr_s(&pk)),
+            ("sk".to_string(), attr_s(&sk)),
+            ("email".to_string(), attr_s(email)),
+        ])
+    }))
+}
+
+/// A member's second factor for showing it (admins' list, key reviews):
+/// `app`, `cognito` or none. A read that fails shows as none.
+async fn member_factor(state: &AppState, member: &Item) -> Option<String> {
+    match factor_home(state, member).await {
+        Ok(home) => factor_of(state, &home).await,
+        Err(e) => {
+            warn!(error = %e, "Second factor not read");
+            None
+        }
+    }
+}
+
+/// Records which second factor a member has (shown to admins), where their
+/// factor is kept ([`home_key`]).
+pub async fn note_factor(
+    state: &AppState,
+    team_id: &str,
+    user_id: &str,
+    email: &str,
+    factor: Option<&str>,
+) {
+    let (pk, sk) = home_key(team_id, user_id, email);
+    let up = state
         .dynamo
         .update_item()
         .table_name(&state.config.users_table_name)
-        .key("pk", attr_s(team_id))
-        .key("sk", attr_s(user_id))
-        .condition_expression("attribute_exists(pk)");
-    up = match factor {
-        Some(f) => up
+        .key("pk", attr_s(&pk))
+        .key("sk", attr_s(&sk));
+    let up = match factor {
+        Some(f) if applies() => up
             .update_expression("SET two_factor = :f")
+            .condition_expression("attribute_exists(pk)")
             .expression_attribute_values(":f", attr_s(f)),
-        None => up.update_expression("REMOVE two_factor"),
+        // Hosted: the person's own record, made when it is new.
+        Some(f) => up
+            .update_expression("SET two_factor = :f, email = :e")
+            .expression_attribute_values(":f", attr_s(f))
+            .expression_attribute_values(":e", attr_s(email)),
+        None => up
+            .update_expression("REMOVE two_factor")
+            .condition_expression("attribute_exists(pk)"),
     };
     let _ = up.send().await;
 }
@@ -1030,26 +1193,30 @@ pub async fn app_setup(
     State(state): State<Arc<AppState>>,
     Extension(claims): Extension<Claims>,
 ) -> Result<Json<Value>, ApiError> {
-    if !applies() {
-        return Err(fail(StatusCode::NOT_FOUND, "Not available here."));
-    }
     // One second factor per member: none may be set up over another.
-    check_enroll(&state, &claims).await?;
+    let home = check_enroll(&state, &claims).await?;
+    let (pk, sk) = (s(&home, "pk"), s(&home, "sk"));
     let mut secret = [0u8; 20];
     rand::RngCore::fill_bytes(&mut rand::rng(), &mut secret);
-    let sealed = seal(&state, &claims.team_id, &claims.sub, &secret)
+    let sealed = seal(&state, pk, sk, &secret)
         .await
         .map_err(|e| internal("Two-factor secret not sealed", e))?;
-    state
+    let up = state
         .dynamo
         .update_item()
         .table_name(&state.config.users_table_name)
-        .key("pk", attr_s(&claims.team_id))
-        .key("sk", attr_s(&claims.sub))
-        .update_expression("SET totp_pending = :p")
-        .condition_expression("attribute_exists(pk)")
-        .expression_attribute_values(":p", attr_s(&sealed))
-        .send()
+        .key("pk", attr_s(pk))
+        .key("sk", attr_s(sk))
+        .expression_attribute_values(":p", attr_s(&sealed));
+    let up = if applies() {
+        up.update_expression("SET totp_pending = :p")
+            .condition_expression("attribute_exists(pk)")
+    } else {
+        // Hosted: the person's own record, made when it is new.
+        up.update_expression("SET totp_pending = :p, email = :e")
+            .expression_attribute_values(":e", attr_s(s(&home, "email")))
+    };
+    up.send()
         .await
         .map_err(|e| internal("Two-factor setup not saved", e))?;
     let b32 = base32(&secret);
@@ -1072,14 +1239,15 @@ pub async fn app_verify(
     proof: Option<Extension<SignInProof>>,
     Json(body): Json<CodeBody>,
 ) -> Result<Response, ApiError> {
-    if !applies() {
-        return Err(fail(StatusCode::NOT_FOUND, "Not available here."));
-    }
     let item = member(&state, &claims.team_id, &claims.sub)
         .await
         .map_err(|e| internal("Member not read", e))?
         .ok_or_else(|| fail(StatusCode::NOT_FOUND, "You aren't on this team."))?;
-    let pending = s(&item, "totp_pending");
+    let home = factor_home(&state, &item)
+        .await
+        .map_err(|e| internal("Two-factor sign-in not read", e))?;
+    let (pk, sk) = (s(&home, "pk"), s(&home, "sk"));
+    let pending = s(&home, "totp_pending");
     if pending.is_empty() {
         return Err(fail(
             StatusCode::BAD_REQUEST,
@@ -1088,7 +1256,7 @@ pub async fn app_verify(
     }
     // A factor set up since the setup started (on the password account) wins.
     check_enroll(&state, &claims).await?;
-    let secret = unseal(&state, &claims.team_id, &claims.sub, pending)
+    let secret = unseal(&state, pk, sk, pending)
         .await
         .map_err(|e| internal("Two-factor secret not read", e))?;
     let unix = chrono::Utc::now().timestamp().max(0) as u64;
@@ -1103,8 +1271,8 @@ pub async fn app_verify(
         .dynamo
         .update_item()
         .table_name(&state.config.users_table_name)
-        .key("pk", attr_s(&claims.team_id))
-        .key("sk", attr_s(&claims.sub))
+        .key("pk", attr_s(pk))
+        .key("sk", attr_s(sk))
         .update_expression(
             "SET totp_sealed = :s, totp_enabled = :t, totp_last_step = :st, two_factor = :f, \
              totp_enabled_at = :now REMOVE totp_pending",
@@ -1133,24 +1301,24 @@ pub async fn app_disable(
     proof: Option<Extension<SignInProof>>,
     Json(body): Json<CodeBody>,
 ) -> Result<Response, ApiError> {
-    if !applies() {
-        return Err(fail(StatusCode::NOT_FOUND, "Not available here."));
-    }
-    if load_org(&state)
+    if must_keep(&state, &claims.team_id, &claims.sub, &claims.email)
         .await
-        .map_err(|e| internal("Organization not read", e))?
-        .is_some_and(|o| o.require_2fa)
+        .map_err(|e| internal("Two-factor rule not read", e))?
     {
-        return Err(fail(
+        return Err(fail_code(
             StatusCode::CONFLICT,
-            "Your organization requires two-factor sign-in, so it stays on.",
+            keep_it(),
+            "two_factor_kept",
         ));
     }
     let item = member(&state, &claims.team_id, &claims.sub)
         .await
         .map_err(|e| internal("Member not read", e))?
         .ok_or_else(|| fail(StatusCode::NOT_FOUND, "You aren't on this team."))?;
-    if !app_enabled(&item) {
+    let home = factor_home(&state, &item)
+        .await
+        .map_err(|e| internal("Two-factor sign-in not read", e))?;
+    if !app_enabled(&home) {
         return Err(fail(
             StatusCode::CONFLICT,
             "Two-factor sign-in is already off.",
@@ -1160,7 +1328,7 @@ pub async fn app_disable(
     if let Some(left) = lockout_left(&state, &key).await {
         return Ok(locked_response(left));
     }
-    if !use_app_code(&state, &item, &body.code)
+    if !use_app_code(&state, &home, &body.code)
         .await
         .map_err(|e| internal("Code not checked", e))?
     {
@@ -1175,7 +1343,7 @@ pub async fn app_disable(
         ));
     }
     record_success(&state, &key).await;
-    clear_app_factor(&state, &claims.team_id, &claims.sub)
+    clear_app_factor(&state, s(&home, "pk"), s(&home, "sk"))
         .await
         .map_err(|e| internal("Two-factor not turned off", e))?;
     // Every other session of theirs ends; this one carries on.
@@ -1184,13 +1352,37 @@ pub async fn app_disable(
     Ok(with_cookie(json!({ "status": "disabled" }), &cookie))
 }
 
-async fn clear_app_factor(state: &AppState, team: &str, user: &str) -> Result<(), String> {
+/// Why a second factor can't be turned off.
+pub fn keep_it() -> &'static str {
+    if applies() {
+        "Your organization requires two-factor sign-in, so it stays on."
+    } else {
+        "A team you're on requires two-factor sign-in, so it stays on."
+    }
+}
+
+/// Turns the authenticator-app factor off where it is kept ([`home_key`]):
+/// its fields on a self-hosted member record; the person's whole factor
+/// record on hosted (it holds nothing else).
+async fn clear_app_factor(state: &AppState, pk: &str, sk: &str) -> Result<(), String> {
+    if !applies() {
+        return state
+            .dynamo
+            .delete_item()
+            .table_name(&state.config.users_table_name)
+            .key("pk", attr_s(pk))
+            .key("sk", attr_s(sk))
+            .send()
+            .await
+            .map(|_| ())
+            .map_err(|e| format!("{e}"));
+    }
     state
         .dynamo
         .update_item()
         .table_name(&state.config.users_table_name)
-        .key("pk", attr_s(team))
-        .key("sk", attr_s(user))
+        .key("pk", attr_s(pk))
+        .key("sk", attr_s(sk))
         .update_expression(
             "REMOVE totp_sealed, totp_enabled, totp_last_step, totp_pending, totp_enabled_at, two_factor",
         )
@@ -1648,13 +1840,86 @@ pub async fn end_sessions(
         .map_err(|e| format!("{e}"))
 }
 
-/// The caller's other sessions end; this one gets a fresh cookie.
+/// The member records of one person: this one, and on hosted every other
+/// team's record under the same email (invites left out). A self-hosted
+/// install has one team, so just this one.
+pub async fn person_records(
+    state: &AppState,
+    team_id: &str,
+    user_id: &str,
+    email: &str,
+) -> Result<Vec<(String, String)>, String> {
+    let mut out = vec![(team_id.to_string(), user_id.to_string())];
+    if applies() {
+        return Ok(out);
+    }
+    let found = if normalize_email(email).contains('@') {
+        records_by_email(state, email).await?
+    } else {
+        // GitHub without an email: their records by GitHub id.
+        state
+            .dynamo
+            .query()
+            .table_name(&state.config.users_table_name)
+            .index_name("gsi1")
+            .key_condition_expression("gsi1pk = :pk")
+            .expression_attribute_values(
+                ":pk",
+                attr_s(&format!("GHUSER#{}", user_id.trim_start_matches("USER#"))),
+            )
+            .send()
+            .await
+            .map(|r| r.items().to_vec())
+            .map_err(|e| format!("{e}"))?
+    };
+    for i in found {
+        let key = (s(&i, "pk").to_string(), s(&i, "sk").to_string());
+        if is_user(&i) && !is_invite(&i) && !out.contains(&key) {
+            out.push(key);
+        }
+    }
+    Ok(out)
+}
+
+/// Whether a person must keep their second factor: a team they are on
+/// requires two-factor sign-in (self-hosted: the organization does).
+pub async fn must_keep(
+    state: &AppState,
+    team_id: &str,
+    user_id: &str,
+    email: &str,
+) -> Result<bool, String> {
+    for (team, _) in person_records(state, team_id, user_id, email).await? {
+        if team_rule(state, &team).await?.require_2fa {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Ends a person's sessions on every team they are on (their second factor
+/// is one for all of them). See [`end_sessions`] for `include_now`.
+pub async fn end_person_sessions(
+    state: &AppState,
+    team_id: &str,
+    user_id: &str,
+    email: &str,
+    include_now: bool,
+) -> Result<(), String> {
+    for (team, user) in person_records(state, team_id, user_id, email).await? {
+        end_sessions(state, &team, &user, include_now).await?;
+    }
+    Ok(())
+}
+
+/// The caller's other sessions end (on every team they are on); this one
+/// gets a fresh cookie.
 pub async fn end_other_sessions(
     state: &AppState,
     claims: &Claims,
     proof: &SignInProof,
 ) -> Result<String, ApiError> {
-    end_sessions(state, &claims.team_id, &claims.sub, false)
+    end_person_sessions(state, &claims.team_id, &claims.sub, &claims.email, false)
         .await
         .map_err(|e| internal("Sessions not ended", e))?;
     let token = jwt::create_session_token(
@@ -1745,8 +2010,9 @@ async fn needed_for(
     let Some(item) = member(state, &step.team_id, &step.sub).await? else {
         return Ok(StepNeeded::None);
     };
+    let home = factor_home(state, &item).await?;
     Ok(step_needed(
-        enrolled_factor(state, &item).await?.as_deref(),
+        enrolled_factor(state, &home).await?.as_deref(),
         passed,
     ))
 }
@@ -1839,19 +2105,24 @@ pub fn may_enroll(existing: Option<&str>) -> Result<(), &'static str> {
     }
 }
 
-/// The setup check, read from the caller's own record. `Err` is the answer.
-pub async fn check_enroll(state: &AppState, claims: &Claims) -> Result<(), ApiError> {
+/// The setup check, read from where the caller's factor is kept
+/// ([`factor_home`]). `Err` is the answer; `Ok` is that record.
+pub async fn check_enroll(state: &AppState, claims: &Claims) -> Result<Item, ApiError> {
     let Some(item) = member(state, &claims.team_id, &claims.sub)
         .await
         .map_err(|e| internal("Member not read", e))?
     else {
         return Err(fail(StatusCode::NOT_FOUND, "You aren't on this team."));
     };
-    let factor = enrolled_factor(state, &item)
+    let home = factor_home(state, &item)
+        .await
+        .map_err(|e| internal("Two-factor sign-in not read", e))?;
+    let factor = enrolled_factor(state, &home)
         .await
         .map_err(|e| internal("Two-factor sign-in not read", e))?;
     may_enroll(factor.as_deref())
-        .map_err(|m| fail_code(StatusCode::CONFLICT, m, "has_second_factor"))
+        .map_err(|m| fail_code(StatusCode::CONFLICT, m, "has_second_factor"))?;
+    Ok(home)
 }
 
 fn cookie_value<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
@@ -1917,9 +2188,21 @@ pub async fn verify_second_step(
     let item = member(&state, &step.team_id, &step.sub)
         .await
         .map_err(|e| internal("Member not read", e))?
-        .ok_or_else(|| fail(StatusCode::UNAUTHORIZED, NOT_INVITED))?;
-    if !app_enabled(&item)
-        || !use_app_code(&state, &item, &body.code)
+        .ok_or_else(|| {
+            fail(
+                StatusCode::UNAUTHORIZED,
+                if applies() {
+                    NOT_INVITED
+                } else {
+                    "You're no longer on this team. Sign in again."
+                },
+            )
+        })?;
+    let home = factor_home(&state, &item)
+        .await
+        .map_err(|e| internal("Two-factor sign-in not read", e))?;
+    if !app_enabled(&home)
+        || !use_app_code(&state, &home, &body.code)
             .await
             .map_err(|e| internal("Code not checked", e))?
     {
@@ -2026,25 +2309,31 @@ async fn team_members(state: &AppState, team_id: &str) -> Result<Vec<Item>, Stri
     Ok(items)
 }
 
-/// GET /api/sign-in — the organization's sign-in rules, who has two-factor
-/// sign-in, and the API keys (which the rule doesn't affect).
+/// GET /api/sign-in — the sign-in rules (self-hosted: the organization's
+/// domains too), who has two-factor sign-in and how many don't, and the API
+/// keys (which the rule doesn't affect). Hosted: the acting team's own rule.
 pub async fn get_settings(
     State(state): State<Arc<AppState>>,
     Extension(claims): Extension<Claims>,
     proof: Option<Extension<SignInProof>>,
 ) -> Result<Json<Value>, ApiError> {
     admin(&claims)?;
-    if !applies() {
-        return Ok(Json(json!({ "self_hosted": false })));
-    }
-    let org = ensure_org(&state)
+    let self_hosted = applies();
+    let org = if self_hosted {
+        ensure_org(&state)
+            .await
+            .map_err(|e| internal("Organization not read", e))?
+    } else {
+        None
+    };
+    let rule = team_rule(&state, &claims.team_id)
         .await
-        .map_err(|e| internal("Organization not read", e))?;
+        .map_err(|e| internal("Two-factor rule not read", e))?;
     let items = team_members(&state, &claims.team_id)
         .await
         .map_err(|e| internal("Members not read", e))?;
     let active: Vec<&Item> = items.iter().filter(|i| !is_invite(i)).collect();
-    let factors = futures::future::join_all(active.iter().map(|i| factor_of(&state, i))).await;
+    let factors = futures::future::join_all(active.iter().map(|i| member_factor(&state, i))).await;
     let people: Vec<Value> = active
         .iter()
         .zip(factors)
@@ -2060,6 +2349,7 @@ pub async fn get_settings(
             })
         })
         .collect();
+    let without = people.iter().filter(|p| p["two_factor"].is_null()).count();
     let invites = items.iter().filter(|i| is_invite(i)).count();
     let now = chrono::Utc::now();
     let keys: Vec<Value> = {
@@ -2074,15 +2364,13 @@ pub async fn get_settings(
             .collect()
     };
     // Keys made before the rule: whether their maker has a second factor now.
-    let require = org.as_ref().is_some_and(|o| o.require_2fa);
-    let since = org.as_ref().and_then(|o| o.require_2fa_since.clone());
     let keys: Vec<Value> = keys
         .into_iter()
         .map(|mut k| {
             let before = made_before_rule(
                 k["created_at"].as_str().unwrap_or_default(),
-                require,
-                since.as_deref(),
+                rule.require_2fa,
+                rule.since.as_deref(),
             );
             let maker = people
                 .iter()
@@ -2099,13 +2387,15 @@ pub async fn get_settings(
         })
         .collect();
     Ok(Json(json!({
-        "self_hosted": true,
-        "is_org": org.as_ref().is_some_and(|o| o.team_id == claims.team_id),
+        "self_hosted": self_hosted,
+        // Hosted: the rule is the team's own, so this team is the unit.
+        "is_org": !self_hosted || org.as_ref().is_some_and(|o| o.team_id == claims.team_id),
         "domains": org.as_ref().map(|o| o.domains.clone()).unwrap_or_default(),
-        "require_2fa": org.as_ref().is_some_and(|o| o.require_2fa),
-        "require_2fa_since": org.as_ref().and_then(|o| o.require_2fa_since.clone()),
+        "require_2fa": rule.require_2fa,
+        "require_2fa_since": rule.since,
         "pending_invites": invites,
         "people": people,
+        "without_2fa": without,
         "api_keys": keys,
         "your_session_has_2fa": proof.is_some_and(|p| p.mfa),
     })))
@@ -2126,27 +2416,21 @@ pub fn made_before_rule(created_at: &str, require_2fa: bool, since: Option<&str>
     }
 }
 
-/// For each live API key made before the rule was turned on: whether its
-/// maker is still on the team and which second factor they have now. Keyed
-/// by key id; keys that need no look are left out.
+/// For each live API key made before the team's rule was turned on: whether
+/// its maker is still on the team and which second factor they have now.
+/// Keyed by key id; keys that need no look are left out.
 pub async fn key_reviews(
     state: &AppState,
     team_id: &str,
     keys: &[crate::api_keys::StoredKey],
 ) -> Result<HashMap<String, Value>, String> {
     let now = chrono::Utc::now();
-    let Some(org) = load_org(state).await? else {
-        return Ok(HashMap::new());
-    };
+    let rule = team_rule(state, team_id).await?;
     let flagged: Vec<&crate::api_keys::StoredKey> = keys
         .iter()
         .filter(|k| {
             k.is_live(now)
-                && made_before_rule(
-                    &k.created_at,
-                    org.require_2fa,
-                    org.require_2fa_since.as_deref(),
-                )
+                && made_before_rule(&k.created_at, rule.require_2fa, rule.since.as_deref())
         })
         .collect();
     if flagged.is_empty() {
@@ -2159,7 +2443,7 @@ pub async fn key_reviews(
             .iter()
             .find(|m| !is_invite(m) && s(m, "sk") == k.created_by);
         let factor = match maker {
-            Some(m) => factor_of(state, m).await,
+            Some(m) => member_factor(state, m).await,
             None => None,
         };
         out.insert(
@@ -2180,7 +2464,10 @@ pub struct SettingsBody {
     pub require_2fa: Option<bool>,
 }
 
-/// PUT /api/sign-in — change the allowed domains or the two-factor rule.
+/// PUT /api/sign-in — change the two-factor rule (self-hosted: the
+/// organization's, and its allowed domains; hosted: this team's). Turning
+/// the rule on takes an admin whose own session passed a second factor, and
+/// emails everyone on the team who has none yet.
 pub async fn update_settings(
     State(state): State<Arc<AppState>>,
     Extension(claims): Extension<Claims>,
@@ -2188,19 +2475,34 @@ pub async fn update_settings(
     Json(body): Json<SettingsBody>,
 ) -> Result<Json<Value>, ApiError> {
     admin(&claims)?;
-    if !applies() {
-        return Err(fail(StatusCode::NOT_FOUND, "Not available here."));
-    }
-    let org = ensure_org(&state)
-        .await
-        .map_err(|e| internal("Organization not read", e))?
-        .filter(|o| o.team_id == claims.team_id)
-        .ok_or_else(|| fail(StatusCode::NOT_FOUND, "This team isn't the organization."))?;
-    let domains = match &body.domains {
-        Some(d) => Some(clean_domains(d).map_err(|m| fail(StatusCode::BAD_REQUEST, &m))?),
-        None => None,
+    let self_hosted = applies();
+    let org = if self_hosted {
+        Some(
+            ensure_org(&state)
+                .await
+                .map_err(|e| internal("Organization not read", e))?
+                .filter(|o| o.team_id == claims.team_id)
+                .ok_or_else(|| fail(StatusCode::NOT_FOUND, "This team isn't the organization."))?,
+        )
+    } else {
+        None
     };
-    let turning_on = body.require_2fa == Some(true) && !org.require_2fa;
+    let domains = match (&body.domains, &org) {
+        (Some(d), Some(_)) => {
+            Some(clean_domains(d).map_err(|m| fail(StatusCode::BAD_REQUEST, &m))?)
+        }
+        (Some(_), None) => {
+            return Err(fail(
+                StatusCode::BAD_REQUEST,
+                "Allowed email domains are for self-hosted installs.",
+            ))
+        }
+        (None, _) => None,
+    };
+    let current = team_rule(&state, &claims.team_id)
+        .await
+        .map_err(|e| internal("Two-factor rule not read", e))?;
+    let turning_on = body.require_2fa == Some(true) && !current.require_2fa;
     if turning_on && !proof.as_ref().is_some_and(|p| p.mfa) {
         return Err(fail_code(
             StatusCode::CONFLICT,
@@ -2215,8 +2517,8 @@ pub async fn update_settings(
         (":now".to_string(), attr_s(&now)),
         (":by".to_string(), attr_s(&claims.display_name())),
     ]);
-    if let Some(d) = &domains {
-        if *d != org.domains {
+    if let (Some(d), Some(o)) = (&domains, &org) {
+        if *d != o.domains {
             changes.push(if d.is_empty() {
                 "Allowed domains: none (invites only)".to_string()
             } else {
@@ -2230,9 +2532,14 @@ pub async fn update_settings(
         );
     }
     if let Some(r) = body.require_2fa {
-        if r != org.require_2fa {
+        if r != current.require_2fa {
+            let whom = if self_hosted {
+                "everyone"
+            } else {
+                "everyone on this team"
+            };
             changes.push(if r {
-                "Two-factor sign-in required for everyone".to_string()
+                format!("Two-factor sign-in required for {whom}")
             } else {
                 "Two-factor sign-in no longer required".to_string()
             });
@@ -2257,28 +2564,168 @@ pub async fn update_settings(
         )
         .await?;
     }
-    state
+    // Self-hosted: the organization record (it exists). Hosted: the team's
+    // own rule record, made the first time.
+    let (pk, sk) = if self_hosted {
+        (ORG_PK.to_string(), ORG_SK)
+    } else {
+        (claims.team_id.clone(), TEAM_RULE_SK)
+    };
+    let up = state
         .dynamo
         .update_item()
         .table_name(&state.config.settings_table_name)
-        .key("pk", attr_s(ORG_PK))
-        .key("sk", attr_s(ORG_SK))
+        .key("pk", attr_s(&pk))
+        .key("sk", attr_s(sk))
         .update_expression(format!("SET {}", sets.join(", ")))
-        .set_expression_attribute_values(Some(values))
-        .condition_expression("attribute_exists(pk)")
-        .send()
+        .set_expression_attribute_values(Some(values));
+    let up = if self_hosted {
+        up.condition_expression("attribute_exists(pk)")
+    } else {
+        up
+    };
+    up.send()
         .await
         .map_err(|e| internal("Sign-in rules not saved", e))?;
     info!(changes = ?changes, "Sign-in rules changed");
-    let org = load_org(&state)
+    let rule = team_rule(&state, &claims.team_id)
         .await
-        .map_err(|e| internal("Organization not read", e))?
-        .unwrap_or(org);
+        .map_err(|e| internal("Two-factor rule not read", e))?;
+    let domains = match org {
+        Some(o) => {
+            load_org(&state)
+                .await
+                .map_err(|e| internal("Organization not read", e))?
+                .unwrap_or(o)
+                .domains
+        }
+        None => Vec::new(),
+    };
+    // Everyone without a second factor hears about it before their next
+    // request is held.
+    let notified = if turning_on {
+        notify_required(&state, &claims.team_id).await
+    } else {
+        0
+    };
     Ok(Json(json!({
-        "domains": org.domains,
-        "require_2fa": org.require_2fa,
-        "require_2fa_since": org.require_2fa_since,
+        "domains": domains,
+        "require_2fa": rule.require_2fa,
+        "require_2fa_since": rule.since,
+        "notified": notified,
     })))
+}
+
+/// The team's name for an email (hosted), or "".
+async fn team_name(state: &AppState, team_id: &str) -> String {
+    state
+        .dynamo
+        .get_item()
+        .table_name(&state.config.table_name)
+        .key("pk", attr_s(team_id))
+        .key("sk", attr_s("META"))
+        .send()
+        .await
+        .ok()
+        .and_then(|o| o.item)
+        .map(|i| s(&i, "github_org").to_string())
+        .unwrap_or_default()
+}
+
+/// Who an email's words name as requiring two-factor sign-in.
+pub fn required_by_words(self_hosted: bool, team: &str) -> String {
+    match (self_hosted, team.trim()) {
+        (true, _) => "Your organization".to_string(),
+        (false, "") => "A team you're on".to_string(),
+        (false, t) => format!("Your team {t}"),
+    }
+}
+
+/// One email through the install's or hosted deployment's sender, recorded
+/// in Deliveries. Whether it was sent.
+async fn send_mail(
+    state: &AppState,
+    team_id: &str,
+    template: &'static str,
+    to: &str,
+    params: serde_json::Map<String, Value>,
+    subject: &str,
+    text: String,
+) -> bool {
+    let m = common::mail::Mail {
+        kind: template.into(),
+        to: to.to_string(),
+        template,
+        params,
+        ses: common::mail::SesBody::Simple {
+            subject: subject.into(),
+            text,
+            html: None,
+            headers: vec![],
+        },
+    };
+    let result = common::mail::send(&super::email_settings::sender(state), &m).await;
+    super::deliveries::record_mail(state, team_id, template, to, &result).await;
+    match result {
+        Ok(_) => true,
+        Err(e) => {
+            warn!(code = %e.code, error = %e.message, template, "Two-factor email not sent");
+            false
+        }
+    }
+}
+
+/// Emails each member of the team who has no second factor yet that
+/// two-factor sign-in is now required (when the rule is turned on). How many
+/// were sent.
+async fn notify_required(state: &AppState, team_id: &str) -> usize {
+    let items = match team_members(state, team_id).await {
+        Ok(i) => i,
+        Err(e) => {
+            warn!(error = %e, "Members not read; no two-factor emails sent");
+            return 0;
+        }
+    };
+    let active: Vec<&Item> = items.iter().filter(|i| !is_invite(i)).collect();
+    let factors = futures::future::join_all(active.iter().map(|i| member_factor(state, i))).await;
+    let to: Vec<String> = active
+        .iter()
+        .zip(factors)
+        .filter(|(_, f)| f.is_none())
+        .map(|(i, _)| s(i, "email").to_string())
+        .filter(|e| e.contains('@'))
+        .collect();
+    if to.is_empty() {
+        return 0;
+    }
+    let by = required_by_words(applies(), &team_name(state, team_id).await);
+    let link = format!(
+        "{}/settings/security/",
+        common::public_urls::app_url_from_env()
+    );
+    let text = format!(
+        "{by} now requires two-factor sign-in. The next time you use it, you'll set up an authenticator app on your phone first (it takes about a minute); nothing else works until then.\n\nSet it up now: {link}\n\nIf you sign in with a password, your code goes on your password account. If you sign in with Google or GitHub, you'll get a code to scan.\n"
+    );
+    let mut params = serde_json::Map::new();
+    params.insert("link".into(), Value::from(link));
+    let mut sent = 0;
+    for addr in to {
+        if send_mail(
+            state,
+            team_id,
+            "two_factor_required",
+            &addr,
+            params.clone(),
+            "Two-factor sign-in is now required",
+            text.clone(),
+        )
+        .await
+        {
+            sent += 1;
+        }
+    }
+    info!(team_id, sent, "Two-factor rule emails sent");
+    sent
 }
 
 #[derive(Deserialize)]
@@ -2298,7 +2745,9 @@ pub fn reset_reason(how: &str) -> Result<String, &'static str> {
 
 /// POST /api/users/:user_id/2fa/reset — turn a member's second factor off
 /// after the admin checked who is asking (a lost phone). Logged first; the
-/// member sets it up again at their next sign-in when the rule is on.
+/// member sets it up again at their next sign-in when the rule is on. On
+/// hosted the factor is the person's on every team, so their sessions on
+/// every team end, and they get an email saying so.
 pub async fn reset_two_factor(
     State(state): State<Arc<AppState>>,
     Extension(claims): Extension<Claims>,
@@ -2306,9 +2755,6 @@ pub async fn reset_two_factor(
     Json(body): Json<ResetBody>,
 ) -> Result<Json<Value>, ApiError> {
     admin(&claims)?;
-    if !applies() {
-        return Err(fail(StatusCode::NOT_FOUND, "Not available here."));
-    }
     let how = reset_reason(&body.verified_how).map_err(|m| fail(StatusCode::BAD_REQUEST, m))?;
     let sk = format!("USER#{}", user_id.trim_start_matches("USER#"));
     if sk == claims.sub {
@@ -2332,6 +2778,19 @@ pub async fn reset_two_factor(
             "Only an owner can reset an admin's or owner's two-factor sign-in.",
         ));
     }
+    // Hosted: their factor protects every team they're on, so only an admin
+    // who could reset it on each of those teams may reset it here.
+    if !applies() {
+        let beyond = teams_beyond_reach(&state, &claims, &sk, s(&item, "email"))
+            .await
+            .map_err(|e| internal("Other teams not read", e))?;
+        if beyond > 0 {
+            return Err(fail_code(StatusCode::FORBIDDEN, OTHER_TEAMS, "other_teams"));
+        }
+    }
+    let home = factor_home(&state, &item)
+        .await
+        .map_err(|e| internal("Two-factor sign-in not read", e))?;
     let who = [
         s(&item, "email"),
         s(&item, "github_login"),
@@ -2374,15 +2833,103 @@ pub async fn reset_two_factor(
             }
         }
     }
-    clear_app_factor(&state, &claims.team_id, &sk)
+    clear_app_factor(&state, s(&home, "pk"), s(&home, "sk"))
         .await
         .map_err(|e| internal("Two-factor not reset", e))?;
     // Their sessions end: whoever holds one signs in again and sets it up.
-    end_sessions(&state, &claims.team_id, &sk, true)
+    end_person_sessions(&state, &claims.team_id, &sk, email, true)
         .await
         .map_err(|e| internal("Sessions not ended", e))?;
     info!(team_id = %claims.team_id, "Two-factor sign-in reset by an admin");
+    if email.contains('@') {
+        notify_reset(&state, &claims.team_id, email).await;
+    }
     Ok(Json(json!({ "status": "reset" })))
+}
+
+/// Why a hosted reset is refused.
+pub const OTHER_TEAMS: &str = "Their two-factor sign-in also protects other teams they're on, where you can't reset it. Ask an admin who manages them on every team, or ask them to contact CoderHelm support from Help.";
+
+/// The role on a member record (`member` when unset).
+fn role_of(item: &Item) -> &str {
+    match s(item, "role") {
+        "" => "member",
+        r => r,
+    }
+}
+
+/// Whether an admin on a team may reset a target there: `admin` is the
+/// admin's own record on that team (none: not on it), `target` the
+/// person's, `others` how many other active people the team has. A team
+/// with nobody else on it is only the person's own. Pure.
+pub fn may_reset_on(admin: Option<&Item>, target: &Item, others: usize) -> bool {
+    if others == 0 {
+        return true;
+    }
+    admin.is_some_and(|a| {
+        !is_invite(a) && crate::permissions::can_manage(role_of(a), role_of(target))
+    })
+}
+
+/// Hosted: how many other teams of the person (beyond the acting one) the
+/// acting admin could not reset them on.
+async fn teams_beyond_reach(
+    state: &AppState,
+    claims: &Claims,
+    target_sk: &str,
+    target_email: &str,
+) -> Result<usize, String> {
+    let mut n = 0;
+    for (team, user) in person_records(state, &claims.team_id, target_sk, target_email).await? {
+        if team == claims.team_id {
+            continue;
+        }
+        let Some(target) = member(state, &team, &user).await? else {
+            continue;
+        };
+        let admin = member(state, &team, &claims.sub).await?;
+        let others = team_members(state, &team)
+            .await?
+            .iter()
+            .filter(|i| !is_invite(i) && s(i, "sk") != user)
+            .count();
+        if !may_reset_on(admin.as_ref(), &target, others) {
+            n += 1;
+        }
+    }
+    Ok(n)
+}
+
+/// Tells a person their second factor was reset by an admin, so a reset
+/// they didn't ask for doesn't go unnoticed.
+async fn notify_reset(state: &AppState, team_id: &str, to: &str) {
+    let by = if applies() {
+        "An admin of your organization".to_string()
+    } else {
+        match team_name(state, team_id).await.trim() {
+            "" => "An admin of a team you're on".to_string(),
+            t => format!("An admin of your team {t}"),
+        }
+    };
+    let link = format!(
+        "{}/settings/security/",
+        common::public_urls::app_url_from_env()
+    );
+    let text = format!(
+        "{by} reset your two-factor sign-in. Set it up again at your next sign-in: {link}\n\nIf you didn't ask for this, tell your admins and change your password (or your Google or GitHub password) now.\n"
+    );
+    let mut params = serde_json::Map::new();
+    params.insert("link".into(), Value::from(link));
+    send_mail(
+        state,
+        team_id,
+        "two_factor_reset",
+        to,
+        params,
+        "Your two-factor sign-in was reset",
+        text,
+    )
+    .await;
 }
 
 #[cfg(test)]
@@ -2787,8 +3334,16 @@ mod tests {
         assert!(f.contains("create_session_token") && f.contains("&proof"));
         // Read fresh each time: no cache in front of the rule.
         let check = body(include_str!("sign_in.rs"), "check_session");
-        assert!(check.contains("load_org(state)"));
+        assert!(check.contains("team_rule(state, team_id)"));
         assert!(!check.to_lowercase().contains("cache"));
+        // On every deployment: the acting team's rule (self-hosted: the
+        // organization's), read with a consistent read.
+        assert!(!f.contains("sign_in::applies()"));
+        assert!(f.contains("check_session(&state, &claims.team_id, &proof, handler)"));
+        let rule = body(include_str!("sign_in.rs"), "team_rule");
+        assert!(rule.contains("load_org(state)") && rule.contains("TEAM_RULE_SK"));
+        assert!(rule.contains(".consistent_read(true)"));
+        assert!(!rule.to_lowercase().contains("cache"));
     }
 
     /// A reset is logged before anything changes, and only by an admin.
@@ -2955,8 +3510,11 @@ mod tests {
         assert!(before(
             reset,
             "clear_app_factor",
-            "end_sessions(&state, &claims.team_id, &sk, true)"
+            "end_person_sessions(&state, &claims.team_id, &sk, email, true)"
         ));
+        // A person's other sessions end on every team they are on.
+        assert!(body(me, "end_other_sessions").contains("end_person_sessions"));
+        assert!(body(me, "end_person_sessions").contains("person_records"));
         assert!(body(users, "update_role").contains("sign_in::VALID_AFTER"));
         assert!(body(users, "mfa_disable").contains("end_other_sessions"));
         // A removal deletes the record, and the middleware refuses a session
@@ -3063,6 +3621,206 @@ mod tests {
         assert!(body(keys, "list").contains("sign_in::key_reviews"));
         let settings = body(include_str!("sign_in.rs"), "get_settings");
         assert!(settings.contains("made_before_rule") && settings.contains("maker_two_factor"));
+    }
+
+    /// Hosted: a person's second factor is theirs, kept once by email, so
+    /// every team and every way in sees the same one.
+    #[test]
+    fn a_hosted_factor_is_kept_once_per_person() {
+        // Google, GitHub and a password, on any team: one record.
+        let a = hosted_home_key("USER#Google_1", "Ann+x@Example.com");
+        let b = hosted_home_key("USER#9", "ann@example.com");
+        assert_eq!(a, b);
+        assert_eq!(
+            a,
+            (
+                "PERSON#EMAIL#ann@example.com".to_string(),
+                "TWO_FACTOR".to_string()
+            )
+        );
+        // No email (GitHub without one): their member record's id.
+        assert_eq!(
+            hosted_home_key("USER#9", ""),
+            ("PERSON#USER#9".to_string(), FACTOR_SK.to_string())
+        );
+        // Never read as a member: team queries and admin scans take USER#
+        // sort keys, and no team id starts with PERSON#.
+        assert!(!FACTOR_SK.starts_with("USER#"));
+        assert!(!a.0.starts_with("TEAM#"));
+        // Every factor read and write goes through where it is kept.
+        let me = include_str!("sign_in.rs");
+        for f in [
+            "needed_for",
+            "check_enroll",
+            "verify_second_step",
+            "app_verify",
+            "app_disable",
+            "reset_two_factor",
+            "member_factor",
+        ] {
+            assert!(body(me, f).contains("factor_home("), "{f}");
+        }
+        assert!(body(me, "note_factor").contains("home_key("));
+        assert!(before(
+            body(me, "app_setup"),
+            "check_enroll",
+            "seal(&state, pk, sk"
+        ));
+    }
+
+    #[test]
+    fn a_teams_rule_reads_back_and_is_off_by_default() {
+        let item = HashMap::from([
+            ("require_2fa".to_string(), AttributeValue::Bool(true)),
+            (
+                "require_2fa_since".to_string(),
+                attr_s("2026-10-27T00:00:00Z"),
+            ),
+        ]);
+        assert_eq!(
+            Rule::from_item(&item),
+            Rule {
+                require_2fa: true,
+                since: Some("2026-10-27T00:00:00Z".into())
+            }
+        );
+        assert_eq!(Rule::from_item(&HashMap::new()), Rule::default());
+        assert!(!Rule::default().require_2fa);
+    }
+
+    /// Hosted Google, GitHub and password sign-ins ask for the person's
+    /// factor before any session, whether or not a team requires it: the
+    /// step is in the function body, not under the self-hosted branch.
+    #[test]
+    fn every_hosted_way_in_asks_for_the_factor_before_a_session() {
+        let auth = include_str!("auth.rs");
+        let google = body(auth, "google_callback_inner");
+        let tail = &google[google.find("Google user created").unwrap()..];
+        assert!(tail.contains("\n    if let Some(resp) = sign_in::second_step("));
+        assert!(before(
+            tail,
+            "sign_in::second_step",
+            "SignInProof::new(false, \"google\")"
+        ));
+        // No session without its proof.
+        assert!(!google.contains("jwt::create_token("));
+        let github = body(auth, "github_callback_inner");
+        let tail = &github[github.find("\"User authenticated via GitHub\"").unwrap()..];
+        assert!(tail.contains("\n    if let Some(resp) = sign_in::second_step("));
+        assert!(before(
+            tail,
+            "sign_in::second_step",
+            "SignInProof::new(false, \"github\")"
+        ));
+        let issue = body(auth, "issue_session_from_cognito");
+        let tail = &issue[issue
+            .find("Created new user + team on first login")
+            .unwrap()..];
+        assert!(tail.contains("\n    if let Some(resp) = sign_in::password_step("));
+        assert!(before(tail, "sign_in::password_step", "session_json("));
+        // The Cognito code passed on a hosted sign-in is recorded too.
+        let mfa = body(auth, "mfa_verify");
+        assert!(mfa.contains("sign_in::note_factor(&state, \"\", &sub, &email, Some(\"cognito\"))"));
+    }
+
+    /// The setup screens, the admin's settings and the reset work on both
+    /// deployments; none is closed to hosted any more.
+    #[test]
+    fn the_two_factor_screens_work_on_both_deployments() {
+        let me = include_str!("sign_in.rs");
+        for f in [
+            "my_status",
+            "app_setup",
+            "app_verify",
+            "app_disable",
+            "get_settings",
+            "update_settings",
+            "reset_two_factor",
+            "check_enroll",
+        ] {
+            assert!(!body(me, f).contains("Not available here"), "{f}");
+        }
+        let users = include_str!("users.rs");
+        for f in ["mfa_setup", "mfa_verify_setup", "mfa_disable"] {
+            assert!(!body(users, f).contains("sign_in::applies()"), "{f}");
+        }
+        // Turning a factor off is refused while any team of theirs requires it.
+        assert!(before(
+            body(me, "app_disable"),
+            "must_keep(",
+            "use_app_code"
+        ));
+        assert!(before(
+            body(users, "mfa_disable"),
+            "sign_in::must_keep(",
+            ".admin_set_user_mfa_preference()"
+        ));
+        assert!(body(me, "must_keep").contains("person_records"));
+        // API keys made before the team's rule are flagged on both.
+        assert!(!body(include_str!("api_keys.rs"), "list").contains("sign_in::applies()"));
+        assert!(body(me, "key_reviews").contains("team_rule(state, team_id)"));
+    }
+
+    /// Turning the rule on: the admin's own session passed a second factor,
+    /// it is logged first, the hosted rule is the team's own record, and
+    /// everyone without a factor is emailed after it is saved.
+    #[test]
+    fn turning_the_rule_on_is_safe_and_tells_people() {
+        let u = body(include_str!("sign_in.rs"), "update_settings");
+        assert!(before(u, "set_up_yours_first", "roles::record"));
+        assert!(u.contains("TEAM_RULE_SK"));
+        assert!(before(u, ".update_item()", "notify_required("));
+        // Admins see how many people have no second factor yet.
+        assert!(body(include_str!("sign_in.rs"), "get_settings").contains("\"without_2fa\""));
+        let n = body(include_str!("sign_in.rs"), "notify_required");
+        assert!(n.contains("f.is_none()") && n.contains("!is_invite(i)"));
+        assert!(n.contains("\"two_factor_required\""));
+        for id in ["two_factor_required", "two_factor_reset"] {
+            assert!(common::mail::templates::get(id).is_some(), "{id}");
+            assert!(common::mail::ESSENTIAL.iter().any(|e| e.id == id), "{id}");
+        }
+        // A reset tells the person.
+        assert!(body(include_str!("sign_in.rs"), "reset_two_factor").contains("notify_reset("));
+    }
+
+    /// Hosted: a reset strips the factor on every team, so it may not reach
+    /// into a team the admin can't manage the person on.
+    #[test]
+    fn a_hosted_reset_stays_within_what_the_admin_manages() {
+        let rec = |role: &str, status: Option<&str>| {
+            let mut m: Item = HashMap::from([("role".to_string(), attr_s(role))]);
+            if let Some(st) = status {
+                m.insert("status".into(), attr_s(st));
+            }
+            m
+        };
+        let member_rec = rec("member", None);
+        let owner_rec = rec("owner", None);
+        // The admin isn't on the other team: refused, unless only the person is.
+        assert!(!may_reset_on(None, &member_rec, 3));
+        assert!(may_reset_on(None, &member_rec, 0));
+        // On it, and may manage them there.
+        assert!(may_reset_on(Some(&rec("admin", None)), &member_rec, 3));
+        assert!(may_reset_on(Some(&owner_rec), &owner_rec, 3));
+        // An admin can't reset an owner there; a member or an invite can't at all.
+        assert!(!may_reset_on(Some(&rec("admin", None)), &owner_rec, 3));
+        assert!(!may_reset_on(Some(&rec("member", None)), &member_rec, 3));
+        assert!(!may_reset_on(
+            Some(&rec("owner", Some("invited"))),
+            &member_rec,
+            3
+        ));
+        // Checked before anything is logged or changed.
+        let f = body(include_str!("sign_in.rs"), "reset_two_factor");
+        assert!(before(f, "teams_beyond_reach", "roles::record"));
+        assert!(body(include_str!("sign_in.rs"), "teams_beyond_reach").contains("person_records"));
+    }
+
+    #[test]
+    fn emails_name_who_requires_it() {
+        assert_eq!(required_by_words(true, "Acme"), "Your organization");
+        assert_eq!(required_by_words(false, " "), "A team you're on");
+        assert_eq!(required_by_words(false, "acme"), "Your team acme");
     }
 
     #[test]

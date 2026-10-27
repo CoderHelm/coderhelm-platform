@@ -20,6 +20,8 @@ A self-hosted install sends the emails it needs, and nothing else until you turn
 | Support ticket updates | Essential | Replies and status changes on tickets someone filed. |
 | Webhook endpoint turned off | Essential | Tells a team's admins when CoderHelm stopped sending to an endpoint that failed for days. |
 | Two-factor lockout alerts | Essential | Tells admins and owners when someone's two-factor sign-in was paused after too many wrong codes. |
+| Two-factor sign-in required | Essential | Tells people without a second factor that an admin now requires one, before their next sign-in is held. |
+| Two-factor sign-in reset | Essential | Tells a person an admin reset their second factor, so a reset they didn't ask for doesn't go unnoticed. |
 | Update notices | Essential | New releases, finished or failed updates, address changes, to install admins. |
 | Test email | Essential | Only when an admin presses **Send test email** in Setup. |
 | Weekly summary | Optional, **off** | The Monday email with each team's week. |

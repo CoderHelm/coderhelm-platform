@@ -555,10 +555,15 @@ pub async fn mfa_verify(
         &SignInProof::new(true, "password"),
     )
     .await?;
-    if sign_in::applies() && resp.status().is_success() {
+    if resp.status().is_success() {
         let sub = format!("USER#{}", user.username());
-        if let Some(team) = cognito_member_team(&state, &email, &sub).await {
-            sign_in::note_factor(&state, &team, &sub, Some("cognito")).await;
+        if sign_in::applies() {
+            if let Some(team) = cognito_member_team(&state, &email, &sub).await {
+                sign_in::note_factor(&state, &team, &sub, &email, Some("cognito")).await;
+            }
+        } else {
+            // Hosted: the person's own record, by email.
+            sign_in::note_factor(&state, "", &sub, &email, Some("cognito")).await;
         }
     }
     Ok(resp)
@@ -1064,19 +1069,38 @@ async fn google_callback_inner(
         (tid, uid, "owner".to_string())
     };
 
-    // Issue JWT
-    let token = jwt::create_token(
+    // The person's second factor, whichever it is, comes before a session,
+    // whether or not a team requires it.
+    let dashboard_url = common::public_urls::app_url(&state.config.stage);
+    let step = SecondStep {
+        sub: user_id.clone(),
+        team_id: team_id.clone(),
+        email: email.clone(),
+        role: role.clone(),
+        github_login: None,
+        via: "google".into(),
+        jti: String::new(),
+        aud: String::new(),
+        iat: 0,
+        exp: 0,
+    };
+    if let Some(resp) = sign_in::second_step(state, step, dashboard_url)
+        .await
+        .map_err(|e| SignInFailure::new(P, Reason::Server, "second_step", e))?
+    {
+        return Ok(resp);
+    }
+    let token = jwt::create_session_token(
         &user_id,
         &team_id,
         &email,
         &role,
         None,
+        &SignInProof::new(false, "google"),
         &state.secrets.jwt_secret,
         SESSION_TTL_SECS,
     )
     .map_err(|e| SignInFailure::new(P, Reason::Server, "session_token", e))?;
-
-    let dashboard_url = common::public_urls::app_url(&state.config.stage);
     Ok(session_redirect(P, &token, dashboard_url))
 }
 
@@ -1648,25 +1672,27 @@ async fn github_callback_inner(
 
     if sign_in::applies() {
         touch_last_login(state, &team_id, &user_id).await;
-        let step = SecondStep {
-            sub: user_id.clone(),
-            team_id: team_id.clone(),
-            email: email.to_string(),
-            role: role.clone(),
-            github_login: Some(github_login.to_string()),
-            via: "github".into(),
-            jti: String::new(),
-            aud: String::new(),
-            iat: 0,
-            exp: 0,
-        };
-        let dash = common::public_urls::app_url(&state.config.stage);
-        if let Some(resp) = sign_in::second_step(state, step, dash)
-            .await
-            .map_err(|e| SignInFailure::new(P, Reason::Server, "second_step", e))?
-        {
-            return Ok(resp);
-        }
+    }
+    // The person's second factor, whichever it is, comes before a session,
+    // on every deployment and whether or not a team requires it.
+    let step = SecondStep {
+        sub: user_id.clone(),
+        team_id: team_id.clone(),
+        email: email.to_string(),
+        role: role.clone(),
+        github_login: Some(github_login.to_string()),
+        via: "github".into(),
+        jti: String::new(),
+        aud: String::new(),
+        iat: 0,
+        exp: 0,
+    };
+    let dash = common::public_urls::app_url(&state.config.stage);
+    if let Some(resp) = sign_in::second_step(state, step, dash)
+        .await
+        .map_err(|e| SignInFailure::new(P, Reason::Server, "second_step", e))?
+    {
+        return Ok(resp);
     }
 
     let token = jwt::create_session_token(
@@ -2021,6 +2047,29 @@ async fn issue_session_from_cognito(
     };
 
     touch_last_login(state, &team_id, &user_id).await;
+    // The person's second factor, whichever it is, comes before a session,
+    // whether or not a team requires it.
+    let step = SecondStep {
+        sub: user_id.clone(),
+        team_id: team_id.clone(),
+        email: email.to_string(),
+        role: role.clone(),
+        github_login: github_login.clone(),
+        via: "password".into(),
+        jti: String::new(),
+        aud: String::new(),
+        iat: 0,
+        exp: 0,
+    };
+    if let Some(resp) = sign_in::password_step(state, step, proof.mfa)
+        .await
+        .map_err(|e| {
+            error!("Second factor not read: {e}");
+            StatusCode::SERVICE_UNAVAILABLE
+        })?
+    {
+        return Ok(resp);
+    }
     session_json(
         state,
         &team_id,
