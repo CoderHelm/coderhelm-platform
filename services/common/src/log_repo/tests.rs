@@ -470,15 +470,15 @@ async fn when_the_model_fails_nothing_is_chosen_for_sure_or_cached() {
 async fn refused_lookups_name_the_permission_that_would_help() {
     let facts = AwsFacts {
         connected: true,
-        denied: vec!["ecs:ListClusters".into(), "lambda:GetFunction".into()],
+        denied: vec!["ecs:ListClusters".into(), "lambda:ListTags".into()],
         ..Default::default()
     };
     let env = Fake::new(facts, answer("acme/web", "low", "Only a description fits"));
     let inp = input("/ecs/prod-render-worker", &["acme/web", "acme/api"]);
     let r = resolve(&env, &inp, t(NOW)).await;
-    assert_eq!(r.permissions, ["ecs:ListClusters", "lambda:GetFunction"]);
+    assert_eq!(r.permissions, ["ecs:ListClusters", "lambda:ListTags"]);
     let p = env.prompts.lock().unwrap()[0].clone();
-    assert!(p.contains("The read-only role was refused: ecs:ListClusters, lambda:GetFunction"));
+    assert!(p.contains("The read-only role was refused: ecs:ListClusters, lambda:ListTags"));
 }
 
 #[tokio::test]
@@ -734,3 +734,50 @@ fn id_for_kind(prompt: &str, kind: &str) -> Option<String> {
 }
 
 mod eval;
+
+#[test]
+fn functions_come_from_names_default_log_groups_and_the_stack() {
+    use super::live::{function_arn, function_names, stack_lambdas};
+    let target = Target {
+        account: "111122223333".into(),
+        log_group: "/aws/lambda/render".into(),
+        functions: vec!["thumbs".into()],
+        samples: vec![LogLine {
+            log_group: "/custom/billing".into(),
+            message: "x".into(),
+        }],
+        ..Default::default()
+    };
+    let from_stack = stack_lambdas(&[
+        ("AWS::Lambda::Function".into(), "billing-fn".into()),
+        ("AWS::Logs::LogGroup".into(), "/custom/billing".into()),
+        ("AWS::Lambda::Function".into(), "render".into()),
+    ]);
+    assert_eq!(from_stack, ["billing-fn", "render"]);
+    assert_eq!(
+        function_names(&target, &from_stack),
+        ["thumbs", "render", "billing-fn"]
+    );
+    assert_eq!(
+        function_arn("eu-west-1", "111122223333", "render").as_deref(),
+        Some("arn:aws:lambda:eu-west-1:111122223333:function:render")
+    );
+    assert_eq!(function_arn("eu-west-1", "", "render"), None);
+}
+
+/// The lookups read tags, names and manifests: never a function's
+/// configuration or code, nor a stack's parameters.
+#[test]
+fn the_lookups_never_read_function_configuration_or_stack_parameters() {
+    let live = include_str!("live.rs");
+    for call in [
+        ".get_function()",
+        ".get_function_configuration()",
+        ".list_functions()",
+        ".describe_stacks()",
+        ".get_template()",
+    ] {
+        assert!(!live.contains(call), "{call}");
+    }
+    assert!(live.contains(".list_tags()") && live.contains(".list_stack_resources()"));
+}

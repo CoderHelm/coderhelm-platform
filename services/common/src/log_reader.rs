@@ -63,8 +63,8 @@ pub const ABILITIES: &[Ability] = &[
     Ability {
         key: "check",
         name: "Checking its own permissions",
-        why: "Asks IAM which of these permissions the role has, so this page can say when an update is needed. It only looks at this one role.",
-        actions: &["iam:SimulatePrincipalPolicy"],
+        why: "Asks IAM which of these permissions the role has, and whether CoderHelm's own update stack finished, so this page can say when an update is needed. It only looks at this one role and CoderHelm's update stacks.",
+        actions: &["iam:SimulatePrincipalPolicy", "cloudformation:DescribeStacks"],
     },
     Ability {
         key: "metrics",
@@ -85,7 +85,7 @@ pub const ABILITIES: &[Ability] = &[
     Ability {
         key: "ecs",
         name: "ECS services and tasks",
-        why: "Sees which tasks behind a failing log group are running, since when and how they start, as evidence before a fix.",
+        why: "Sees which tasks behind a failing log group are running, since when and how they start, as evidence before a fix. A task definition comes with its environment variables; CoderHelm keeps only the start command, image, log setting, storage, cpu and memory.",
         actions: &[
             "ecs:ListClusters",
             "ecs:ListServices",
@@ -98,14 +98,11 @@ pub const ABILITIES: &[Ability] = &[
     Ability {
         key: "code",
         name: "Finding the code behind a log group",
-        why: "Reads function, image and stack tags to work out which repository a log group's code lives in, so a fix goes to the right repo.",
+        why: "Reads function, image and log group tags, the names in a stack's resource list and image manifests to work out which repository a log group's code lives in, so a fix goes to the right repo. Never a function's configuration or code, or a stack's parameters.",
         actions: &[
-            "lambda:GetFunction",
-            "lambda:GetFunctionConfiguration",
-            "lambda:ListFunctions",
             "lambda:ListTags",
             "logs:ListTagsForResource",
-            "cloudformation:DescribeStacks",
+            "cloudformation:ListStackResources",
             "ecr:BatchGetImage",
             "ecr:ListTagsForResource",
         ],
@@ -362,11 +359,38 @@ mod tests {
             "ecs:ListTasks",
             "ecs:DescribeTasks",
             "ecs:DescribeServices",
-            "lambda:GetFunction",
+            "lambda:ListTags",
         ] {
             assert!(all.iter().any(|x| x == a), "{a}");
         }
         assert!(!all.iter().any(|x| x == "sts:AssumeRole"));
+    }
+
+    /// Nothing that hands over a function's configuration (its environment
+    /// variables) or code, or a stack's parameters; the one stack read is
+    /// CoderHelm's own update stack.
+    #[test]
+    fn no_function_configuration_code_or_stack_parameters() {
+        for t in [ROLE_TEMPLATE, UPDATE_TEMPLATE] {
+            let all = template_actions(t);
+            for a in [
+                "lambda:GetFunction",
+                "lambda:GetFunctionConfiguration",
+                "lambda:ListFunctions",
+                "lambda:ListVersionsByFunction",
+                "cloudformation:GetTemplate",
+            ] {
+                assert!(!all.iter().any(|x| x == a), "{a}");
+            }
+            let at = t.find("\"cloudformation:DescribeStacks\"").unwrap();
+            let resource = t[at..].lines().nth(1).unwrap();
+            assert!(
+                resource.contains("stack/CoderHelmLogReaderUpdate-*/*"),
+                "{resource}"
+            );
+            assert_eq!(t.matches("cloudformation:DescribeStacks").count(), 1);
+        }
+        assert!(update_stack_name().starts_with("CoderHelmLogReaderUpdate-"));
     }
 
     #[test]
@@ -376,7 +400,7 @@ mod tests {
         assert_eq!(m[0], "cloudwatch:GetMetricData");
         assert_eq!(m.len(), 8);
         assert!(m.contains(&"ecs:DescribeTasks"));
-        assert!(!m.contains(&"lambda:GetFunction"));
+        assert!(!m.contains(&"lambda:ListTags"));
     }
 
     #[test]

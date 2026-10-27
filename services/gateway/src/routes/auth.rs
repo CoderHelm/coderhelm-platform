@@ -1885,6 +1885,28 @@ async fn issue_session_from_cognito(
         };
         let (team_id, user_id, role, github_login) = landing_parts(&record);
         touch_last_login(state, &team_id, &user_id).await;
+        // The member's second factor, whichever it is, comes before a session.
+        let step = SecondStep {
+            sub: user_id.clone(),
+            team_id: team_id.clone(),
+            email: email.to_string(),
+            role: role.clone(),
+            github_login: github_login.clone(),
+            via: "password".into(),
+            jti: String::new(),
+            aud: String::new(),
+            iat: 0,
+            exp: 0,
+        };
+        if let Some(resp) = sign_in::password_step(state, step, proof.mfa)
+            .await
+            .map_err(|e| {
+                error!("Second factor not read: {e}");
+                StatusCode::SERVICE_UNAVAILABLE
+            })?
+        {
+            return Ok(resp);
+        }
         return session_json(
             state,
             &team_id,

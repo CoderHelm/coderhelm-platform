@@ -3,6 +3,8 @@ Description: >
   Brings the existing CoderHelmLogReader role up to date with the read-only
   permissions the current CoderHelm release uses. Every permission here is
   read-only: CoderHelm can list, describe and query, never change anything.
+  It only adds: to drop a permission an older release granted, update the
+  CoderHelmLogReader stack itself with the current role template.
   Created from the dashboard's Update link; you can delete older
   CoderHelmLogReaderUpdate stacks once this one is in place.
 
@@ -42,6 +44,11 @@ Resources:
             Action:
               - "iam:SimulatePrincipalPolicy"
             Resource: !Sub "arn:aws:iam::${AWS::AccountId}:role/${RoleName}"
+          - Sid: CheckOwnUpdateStack
+            Effect: Allow
+            Action:
+              - "cloudformation:DescribeStacks"
+            Resource: !Sub "arn:aws:cloudformation:*:${AWS::AccountId}:stack/CoderHelmLogReaderUpdate-*/*"
           - Sid: ReadMetrics
             Effect: Allow
             Action:
@@ -59,6 +66,10 @@ Resources:
             Action:
               - "airflow:InvokeRestApi"
             Resource: "arn:aws:airflow:*:*:role/*/Viewer"
+          # A task definition as ECS returns it includes its containers'
+          # environment variables; CoderHelm keeps only the log
+          # configuration, start command, image, labels, storage, cpu and
+          # memory from it, and never stores or shows the environment.
           - Sid: DescribeServicesAndTasks
             Effect: Allow
             Action:
@@ -69,15 +80,14 @@ Resources:
               - "ecs:ListTasks"
               - "ecs:DescribeTasks"
             Resource: "*"
+          # Tags, a stack's resource list and image manifests only: no
+          # function configuration or code, no stack parameters.
           - Sid: FindTheCodeBehindALogGroup
             Effect: Allow
             Action:
-              - "lambda:GetFunction"
-              - "lambda:GetFunctionConfiguration"
-              - "lambda:ListFunctions"
               - "lambda:ListTags"
               - "logs:ListTagsForResource"
-              - "cloudformation:DescribeStacks"
+              - "cloudformation:ListStackResources"
               - "ecr:BatchGetImage"
               - "ecr:ListTagsForResource"
             Resource: "*"

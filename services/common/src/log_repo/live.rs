@@ -28,11 +28,12 @@ const AWS_BUDGET: Duration = Duration::from_secs(20);
 const MAX_CLUSTERS: usize = 20;
 const MAX_SERVICES: usize = 300;
 const MAX_TASK_DEFS: usize = 80;
-/// Most Lambda pages (50 functions each) read when the log group isn't the
-/// function's default one.
-const MAX_LAMBDA_PAGES: usize = 10;
 /// CloudFormation's own tag on every resource a stack made.
 const STACK_TAG: &str = "aws:cloudformation:stack-name";
+/// Most pages of a stack's resource list read (100 resources each).
+const MAX_STACK_PAGES: usize = 5;
+/// Most functions from the log group's stack looked up.
+const MAX_STACK_FUNCTIONS: usize = 10;
 
 /// A described ECS service: (cluster, service name, task definition ARN,
 /// service tags, named directly by the target).
@@ -136,18 +137,23 @@ impl Live<'_> {
             }
         }
 
+        // Functions the log group's own stack made (one with its own log
+        // group setting has no `/aws/lambda/` name to go by).
+        let stack_functions = if in_time(left()) {
+            self.stack_functions(s, facts).await
+        } else {
+            Vec::new()
+        };
         if in_time(left()) {
             self.ecs(s, target, facts, started).await;
         }
         if in_time(left()) {
-            self.lambda(s, target, facts).await;
+            self.lambda(s, target, &stack_functions, facts).await;
         }
         if in_time(left()) {
             self.images(s, facts).await;
         }
-        if in_time(left()) {
-            self.stacks(s, facts).await;
-        }
+        stacks(facts);
     }
 
     /// The ECS services whose task definitions log to the group (read from
@@ -344,113 +350,83 @@ impl Live<'_> {
         }
     }
 
-    /// The Lambda function behind the log group: the function whose default
-    /// log group it is, one whose logging setting names it, or those named
-    /// directly.
-    async fn lambda(&self, s: &Session, target: &Target, facts: &mut AwsFacts) {
+    /// The Lambda functions behind the log group: the function whose default
+    /// log group it is, those the log group's stack made, and those named
+    /// directly. Only their tags are read (`lambda:ListTags`): a function's
+    /// configuration carries its environment variables and `GetFunction` a
+    /// link to its code, so neither is asked for.
+    async fn lambda(
+        &self,
+        s: &Session,
+        target: &Target,
+        from_stack: &[String],
+        facts: &mut AwsFacts,
+    ) {
         let lambda = client!(aws_sdk_lambda, s);
-        let mut names: Vec<String> = target.functions.clone();
-        let groups = target.log_groups();
-        // `/aws/lambda/<function>` is the log group AWS gives every function.
-        for g in &groups {
-            if let Some(n) = g.strip_prefix("/aws/lambda/") {
-                if !n.is_empty() && !n.contains('/') && !names.iter().any(|x| x == n) {
-                    names.push(n.to_string());
-                }
-            }
-        }
-        let mut found = false;
-        for name in &names {
-            match lambda.get_function().function_name(name).send().await {
-                Ok(o) => {
-                    let cfg = o.configuration();
-                    facts.lambdas.push(LambdaFact {
-                        name: name.clone(),
-                        image: o
-                            .code()
-                            .and_then(|c| c.image_uri())
-                            .unwrap_or_default()
-                            .to_string(),
-                        tags: o
+        let names = function_names(target, from_stack);
+        for name in names {
+            let mut fact = LambdaFact {
+                name: name.clone(),
+                ..Default::default()
+            };
+            if let Some(arn) = function_arn(&s.region, &target.account, &name) {
+                match lambda.list_tags().resource(arn).send().await {
+                    Ok(o) => {
+                        fact.tags = o
                             .tags()
                             .map(|t| t.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
-                            .unwrap_or_default(),
-                        code_sha: cfg
-                            .and_then(|c| c.code_sha256())
                             .unwrap_or_default()
-                            .to_string(),
-                        description: cfg
-                            .and_then(|c| c.description())
-                            .unwrap_or_default()
-                            .to_string(),
-                    });
-                    found = true;
+                    }
+                    Err(e) if refused(&e) => facts.deny("lambda:ListTags"),
+                    // No such function (a log group outliving it): nothing to say.
+                    Err(e) if e.code() == Some("ResourceNotFoundException") => continue,
+                    Err(_) => {}
                 }
-                Err(e) if refused(&e) => facts.deny("lambda:GetFunction"),
-                Err(_) => {}
             }
+            facts.lambdas.push(fact);
         }
-        if found || groups.iter().all(|g| g.starts_with("/aws/lambda/")) {
-            return;
-        }
-        // A function with its own log group setting.
-        let mut marker: Option<String> = None;
-        for _ in 0..MAX_LAMBDA_PAGES {
-            match lambda
-                .list_functions()
-                .set_marker(marker.take())
+    }
+
+    /// The Lambda functions the log group's CloudFormation stack made (the
+    /// stack-name tag CloudFormation puts on the group), read from the
+    /// stack's resource list: names and types only, never its parameters or
+    /// outputs.
+    async fn stack_functions(&self, s: &Session, facts: &mut AwsFacts) -> Vec<String> {
+        let Some(stack) = facts.log_group_tags.get(STACK_TAG).cloned() else {
+            return Vec::new();
+        };
+        let cfn = client!(aws_sdk_cloudformation, s);
+        let mut resources: Vec<(String, String)> = Vec::new();
+        let mut next: Option<String> = None;
+        for _ in 0..MAX_STACK_PAGES {
+            match cfn
+                .list_stack_resources()
+                .stack_name(&stack)
+                .set_next_token(next.take())
                 .send()
                 .await
             {
                 Ok(o) => {
-                    for f in o.functions() {
-                        let logs_here = f
-                            .logging_config()
-                            .and_then(|l| l.log_group())
-                            .is_some_and(|g| groups.iter().any(|x| x == g));
-                        if logs_here {
-                            let name = f.function_name().unwrap_or_default().to_string();
-                            let tags = match lambda
-                                .list_tags()
-                                .resource(f.function_arn().unwrap_or_default())
-                                .send()
-                                .await
-                            {
-                                Ok(t) => t
-                                    .tags()
-                                    .map(|t| {
-                                        t.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
-                                    })
-                                    .unwrap_or_default(),
-                                Err(e) => {
-                                    if refused(&e) {
-                                        facts.deny("lambda:ListTags");
-                                    }
-                                    BTreeMap::new()
-                                }
-                            };
-                            facts.lambdas.push(LambdaFact {
-                                name,
-                                tags,
-                                code_sha: f.code_sha256().unwrap_or_default().to_string(),
-                                description: f.description().unwrap_or_default().to_string(),
-                                ..Default::default()
-                            });
-                        }
-                    }
-                    marker = o.next_marker().map(str::to_string);
+                    resources.extend(o.stack_resource_summaries().iter().map(|r| {
+                        (
+                            r.resource_type().unwrap_or_default().to_string(),
+                            r.physical_resource_id().unwrap_or_default().to_string(),
+                        )
+                    }));
+                    next = o.next_token().map(str::to_string);
                 }
                 Err(e) => {
                     if refused(&e) {
-                        facts.deny("lambda:ListFunctions");
+                        facts.deny("cloudformation:ListStackResources");
                     }
                     break;
                 }
             }
-            if marker.is_none() {
+            if next.is_none() {
                 break;
             }
         }
+        stack_lambdas(&resources)
     }
 
     /// The ECR images the containers and functions run: the manifest's
@@ -534,43 +510,68 @@ impl Live<'_> {
             facts.images.push(fact);
         }
     }
+}
 
-    /// The CloudFormation stacks that made the resources (CloudFormation's
-    /// own stack-name tag on them).
-    async fn stacks(&self, s: &Session, facts: &mut AwsFacts) {
-        let mut names: Vec<String> = facts
-            .ecs
-            .iter()
-            .map(|e| &e.tags)
-            .chain(facts.lambdas.iter().map(|l| &l.tags))
-            .chain(std::iter::once(&facts.log_group_tags))
-            .filter_map(|t| t.get(STACK_TAG).cloned())
-            .collect();
-        names.sort();
-        names.dedup();
-        if names.is_empty() {
-            return;
+/// The CloudFormation stacks that made the resources (CloudFormation's own
+/// stack-name tag on them). Only their names: a stack's description comes
+/// with its parameters, which aren't read. The stack's own tags are on the
+/// resources it made, which are already read.
+fn stacks(facts: &mut AwsFacts) {
+    let mut names: Vec<String> = facts
+        .ecs
+        .iter()
+        .map(|e| &e.tags)
+        .chain(facts.lambdas.iter().map(|l| &l.tags))
+        .chain(std::iter::once(&facts.log_group_tags))
+        .filter_map(|t| t.get(STACK_TAG).cloned())
+        .collect();
+    names.sort();
+    names.dedup();
+    for name in names.into_iter().take(4) {
+        facts.stacks.push(StackFact {
+            name,
+            ..Default::default()
+        });
+    }
+}
+
+/// Pure: the functions to look up: those named directly, the one whose
+/// default log group (`/aws/lambda/<function>`) each group is, then those
+/// the group's stack made; once each.
+pub fn function_names(target: &Target, from_stack: &[String]) -> Vec<String> {
+    let mut names: Vec<String> = Vec::new();
+    let mut add = |n: &str| {
+        if !n.is_empty() && !n.contains('/') && !names.iter().any(|x| x == n) {
+            names.push(n.to_string());
         }
-        let cfn = client!(aws_sdk_cloudformation, s);
-        for name in names.into_iter().take(4) {
-            match cfn.describe_stacks().stack_name(&name).send().await {
-                Ok(o) => {
-                    if let Some(st) = o.stacks().first() {
-                        facts.stacks.push(StackFact {
-                            name: name.clone(),
-                            description: st.description().unwrap_or_default().to_string(),
-                            tags: tag_map(st.tags().iter().map(|t| (t.key(), t.value()))),
-                        });
-                    }
-                }
-                Err(e) => {
-                    if refused(&e) {
-                        facts.deny("cloudformation:DescribeStacks");
-                    }
-                }
-            }
+    };
+    for f in &target.functions {
+        add(f);
+    }
+    for g in target.log_groups() {
+        if let Some(n) = g.strip_prefix("/aws/lambda/") {
+            add(n);
         }
     }
+    for f in from_stack.iter().take(MAX_STACK_FUNCTIONS) {
+        add(f);
+    }
+    names
+}
+
+/// Pure: a function's ARN, for its tags. `None` without the account.
+pub fn function_arn(region: &str, account: &str, name: &str) -> Option<String> {
+    (crate::log_reader::is_account(account) && !region.is_empty() && !name.is_empty())
+        .then(|| format!("arn:aws:lambda:{region}:{account}:function:{name}"))
+}
+
+/// Pure: the Lambda functions in a stack's resource list (type, physical id).
+pub fn stack_lambdas(resources: &[(String, String)]) -> Vec<String> {
+    resources
+        .iter()
+        .filter(|(t, id)| t == "AWS::Lambda::Function" && !id.is_empty())
+        .map(|(_, id)| id.clone())
+        .collect()
 }
 
 /// Pure: an image manifest's (or index's) annotations, and those of its
@@ -626,21 +627,6 @@ impl Env for Live<'_> {
                 {
                     let now = o.services().first().and_then(|s| s.task_definition());
                     if now.is_some_and(|n| n != td) {
-                        return true;
-                    }
-                }
-            }
-        }
-        if !anchor.lambdas.is_empty() {
-            let lambda = client!(aws_sdk_lambda, s);
-            for (name, sha) in &anchor.lambdas {
-                if let Ok(o) = lambda
-                    .get_function_configuration()
-                    .function_name(name)
-                    .send()
-                    .await
-                {
-                    if o.code_sha256().is_some_and(|n| n != sha) {
                         return true;
                     }
                 }
