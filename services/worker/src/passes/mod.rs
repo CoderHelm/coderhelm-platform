@@ -699,6 +699,7 @@ pub mod email_events;
 pub mod feedback;
 pub mod fix_location;
 pub mod formatter;
+pub(crate) mod generators;
 pub mod github_history;
 pub mod health_check;
 pub mod hidden_suggest;
@@ -4061,6 +4062,37 @@ async fn run_passes(
     // --- Proof check (before PR — what the change rests on is proven) ---
     check_cancelled(state, &msg.team_id, run_id).await?;
     update_pass(state, &msg.team_id, run_id, "review").await?;
+    // --- Generated files: regenerated with the change, or the PR waits ---
+    match generators::gate(
+        &plan_coverage::Work {
+            state,
+            msg,
+            github: &github,
+            plan: &plan_result,
+            branch: &branch_name,
+            rules: &rules,
+            repo_instructions: &repo_instructions,
+            provider: &provider,
+            file_cache: &file_cache,
+            run_id,
+            deadline: implement_deadline,
+        },
+        usage,
+    )
+    .await
+    {
+        Ok(notes) => {
+            for n in notes {
+                add_progress_note(state, &msg.team_id, run_id, &n).await;
+            }
+        }
+        Err(why) => {
+            let kept =
+                keep_wip_branch(&github, &msg.repo_owner, &msg.repo_name, &branch_name).await;
+            close_memory(state, agent_memory.take()).await;
+            return Err(format!("{why} The work so far is kept on branch `{kept}`.").into());
+        }
+    }
     let mut evidence = impl_result.evidence.clone();
     let work = proof::Work {
         state,
@@ -4722,6 +4754,35 @@ async fn run_repo_pipeline(
 
     // --- Proof check ---
     check_cancelled(state, &msg.team_id, run_id).await?;
+    // Generated files: regenerated with the change, or this repo's PR waits.
+    match generators::gate(
+        &plan_coverage::Work {
+            state,
+            msg,
+            github,
+            plan: &repo_plan,
+            branch: branch_name,
+            rules,
+            repo_instructions,
+            provider,
+            file_cache,
+            run_id,
+            deadline: implement_deadline,
+        },
+        usage,
+    )
+    .await
+    {
+        Ok(notes) => {
+            for n in notes {
+                add_progress_note(state, &msg.team_id, run_id, &n).await;
+            }
+        }
+        Err(why) => {
+            let kept = keep_wip_branch(github, repo_owner, repo_name, branch_name).await;
+            return Err(format!("{why} The work so far is kept on branch `{kept}`.").into());
+        }
+    }
     update_pass(state, &msg.team_id, run_id, "review").await?;
     let mut evidence = impl_result.evidence.clone();
     let work = proof::Work {

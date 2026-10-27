@@ -348,8 +348,24 @@ pub async fn run(
         None
     };
     let codegen_cmd = if sandbox.is_some() {
-        super::detect_codegen_command(github, &msg.repo_owner, &msg.repo_name, &msg.base_branch)
-            .await
+        match super::detect_codegen_command(
+            github,
+            &msg.repo_owner,
+            &msg.repo_name,
+            &msg.base_branch,
+        )
+        .await
+        {
+            Some(cmd) => Some(cmd),
+            // Generators found from their configs and the repo's docs
+            // (GraphQL codegen, Prisma, buf, documented rules): run_codegen
+            // runs every one of them.
+            None => {
+                let repo =
+                    super::generators::load(github, &msg.repo_owner, &msg.repo_name, branch).await;
+                super::generators::all_command(&repo)
+            }
+        }
     } else {
         None
     };
