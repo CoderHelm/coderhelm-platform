@@ -73,6 +73,47 @@ pub fn release_notes_failed(owner: &str, repo: &str, tag: &str, error: &str) -> 
     }
 }
 
+/// Pure: this release needs new read-only permissions on the team's AWS
+/// role in these accounts (account, how many are missing). Sent once per
+/// set of permissions.
+pub fn aws_permissions_update(accounts: &[(String, usize)], url: &str) -> Message {
+    let title = if accounts.len() == 1 {
+        format!(
+            "AWS account {} needs {} new read-only permission{}",
+            accounts[0].0,
+            accounts[0].1,
+            if accounts[0].1 == 1 { "" } else { "s" }
+        )
+    } else {
+        format!(
+            "{} AWS accounts need new read-only permissions",
+            accounts.len()
+        )
+    };
+    let mut blocks = vec![
+        Block::Text(Text::new(title.clone()).bold().color(Tone::Attention)),
+        Block::Text(Text::new(
+            "This CoderHelm release reads a little more from your AWS accounts (still read-only: it can list, describe and query, never change anything). Until an admin updates the CoderHelmLogReader role, the parts that need it are skipped and everything else keeps working.",
+        )),
+    ];
+    if accounts.len() > 1 {
+        for (a, n) in accounts {
+            blocks.push(Block::Text(
+                Text::new(format!("Account {a}: {n} missing")).subtle(),
+            ));
+        }
+    }
+    blocks.push(Block::Text(
+        Text::new("An admin can update each account with one click on the AWS page.").subtle(),
+    ));
+    Message {
+        summary: title,
+        blocks,
+        buttons: vec![Button::new("Update permissions", url)],
+        full_width: false,
+    }
+}
+
 /// Pure: the message "Send test message" posts for a destination.
 pub fn test_message(destination: &str, dashboard_url: &str) -> Message {
     Message {
@@ -120,6 +161,30 @@ mod tests {
             "3 days",
             reviewers,
         )
+    }
+
+    #[test]
+    fn the_permissions_notice_names_the_accounts_and_stays_read_only() {
+        let one = aws_permissions_update(
+            &[("111122223333".into(), 3)],
+            "https://coderhelm.example.com/settings/integrations/aws",
+        );
+        assert_eq!(
+            one.summary,
+            "AWS account 111122223333 needs 3 new read-only permissions"
+        );
+        assert_eq!(
+            one.buttons[0].url,
+            "https://coderhelm.example.com/settings/integrations/aws"
+        );
+        let two = aws_permissions_update(
+            &[("111122223333".into(), 1), ("444455556666".into(), 2)],
+            "/x",
+        );
+        assert!(two.summary.starts_with("2 AWS accounts"));
+        let text = format!("{:?}", two.blocks);
+        assert!(text.contains("444455556666") && text.contains("read-only"));
+        assert!(!text.contains('\u{2192}'));
     }
 
     #[test]

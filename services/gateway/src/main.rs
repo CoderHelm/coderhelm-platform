@@ -747,6 +747,10 @@ async fn main() -> Result<(), Error> {
             get(routes::log_analyzer::get_cfn_url),
         )
         .route(
+            "/aws-connections/template",
+            get(routes::log_analyzer::download_template),
+        )
+        .route(
             "/aws-connections/:id",
             put(routes::log_analyzer::update_connection)
                 .delete(routes::log_analyzer::delete_connection),
@@ -766,6 +770,10 @@ async fn main() -> Result<(), Error> {
         .route(
             "/aws-connections/:id/abilities/check",
             post(routes::integrations::check_aws),
+        )
+        .route(
+            "/aws-connections/:id/permissions/check",
+            post(routes::integrations::check_aws_permissions),
         )
         .route("/integrations", get(routes::integrations::list))
         // Recommendations

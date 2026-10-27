@@ -219,6 +219,21 @@ pub fn aws_state(a: &AwsAccount) -> CardState {
     if a.status == "error" {
         return cs("error", "The last test of the role failed.", "check_again");
     }
+    if let Some(p) = a
+        .permissions
+        .as_ref()
+        .filter(|p| p.status() == "update_needed")
+    {
+        let n = p.missing.len();
+        return cs(
+            "connected",
+            format!(
+                "Update needed: {n} new read-only permission{}.",
+                if n == 1 { "" } else { "s" }
+            ),
+            "manage",
+        );
+    }
     cs("connected", "", "manage")
 }
 
@@ -232,6 +247,13 @@ pub fn aws_missing(a: &AwsAccount) -> Vec<&'static str> {
         out.push("airflow");
     }
     out
+}
+
+/// The last live check found permissions of this release missing.
+pub fn needs_update(a: &AwsAccount) -> bool {
+    a.permissions
+        .as_ref()
+        .is_some_and(|p| p.status() == "update_needed")
 }
 
 fn card(
@@ -264,8 +286,24 @@ pub(crate) async fn check_and_save(
     a: &mut AwsAccount,
     actor: &str,
 ) {
-    let c = identity::check(&state.sts, &a.target(), Vec::new(), actor, true).await;
-    a.apply_check(&c, &chrono::Utc::now().to_rfc3339());
+    let now = chrono::Utc::now().to_rfc3339();
+    let target = a.target();
+    let (c, perms) = tokio::join!(
+        identity::check(&state.sts, &target, Vec::new(), actor, true),
+        common::live::permissions::check(&state.sts, &target, actor, &now),
+    );
+    a.apply_check(&c, &now);
+    if let Err(e) = aws_account::save_permissions(
+        &state.dynamo,
+        &state.config.aws_insights_table_name,
+        team_id,
+        &perms,
+    )
+    .await
+    {
+        warn!(error = %e, account = %a.account, "Could not save the permissions check");
+    }
+    a.permissions = Some(perms);
     if let Err(e) = aws_account::save_abilities(
         &state.dynamo,
         &state.config.aws_insights_table_name,
@@ -474,7 +512,9 @@ pub async fn list(
 
     // AWS accounts: one card each (or one to connect the first).
     let stack_url = |a: &AwsAccount| {
-        (!aws_missing(a).is_empty()).then(|| super::connectors::ops_stack_url(&a.region))
+        (!aws_missing(a).is_empty() || needs_update(a))
+            .then(|| super::connectors::update_stack_url(&a.region))
+            .flatten()
     };
     if accounts.is_empty() {
         items.push(card(
@@ -491,7 +531,7 @@ pub async fn list(
             let mut detail = a.public_json();
             detail["missing"] = json!(aws_missing(a));
             detail["update_url"] = json!(stack_url(a));
-            detail["stack_name"] = json!(super::connectors::OPS_STACK_NAME);
+            detail["stack_name"] = json!(common::log_reader::update_stack_name());
             items.push(card(
                 &format!("aws-{}", a.account),
                 &format!("AWS account {}", a.account),
@@ -691,9 +731,10 @@ async fn load_account(
 fn account_reply(a: &AwsAccount) -> Value {
     let mut detail = a.public_json();
     detail["missing"] = json!(aws_missing(a));
-    detail["update_url"] =
-        json!((!aws_missing(a).is_empty()).then(|| super::connectors::ops_stack_url(&a.region)));
-    detail["stack_name"] = json!(super::connectors::OPS_STACK_NAME);
+    detail["update_url"] = json!((!aws_missing(a).is_empty() || needs_update(a))
+        .then(|| super::connectors::update_stack_url(&a.region))
+        .flatten());
+    detail["stack_name"] = json!(common::log_reader::update_stack_name());
     let st = aws_state(a);
     json!({ "account": detail, "status": st.status, "reason": st.reason, "last_check": a.abilities.checked_at })
 }
@@ -712,6 +753,36 @@ pub async fn check_aws(
     let mut a = load_account(&state, &claims.team_id, account).await?;
     check_and_save(&state, &claims.team_id, &mut a, &claims.email).await;
     Ok(Json(account_reply(&a)))
+}
+
+/// POST /api/aws-connections/:id/permissions/check — checks the role
+/// against this release's permissions, live, and saves the result. With
+/// `{"pressed": true}` (someone pressed Update), a missing or failed update
+/// stack comes back as the problem to show.
+pub async fn check_aws_permissions(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<Claims>,
+    Path(id): Path<String>,
+    body: Option<Json<Value>>,
+) -> Reply {
+    if let Err(code) = claims.require_role(3) {
+        return Err(fail(code, "Only admins can check integrations."));
+    }
+    let pressed = body
+        .as_ref()
+        .and_then(|b| b.get("pressed"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let account = account_of(&id)?;
+    let mut a = load_account(&state, &claims.team_id, account).await?;
+    check_and_save(&state, &claims.team_id, &mut a, &claims.email).await;
+    let mut reply = account_reply(&a);
+    reply["permissions"] = a
+        .permissions
+        .as_ref()
+        .map(|p| p.view(pressed, &common::public_urls::log_reader_template_url()))
+        .unwrap_or(Value::Null);
+    Ok(Json(reply))
 }
 
 /// What an admin may change about an account's abilities.
@@ -946,7 +1017,7 @@ mod tests {
         assert!(r["account"]["update_url"]
             .as_str()
             .unwrap()
-            .contains("CoderHelmLogReaderOps"));
+            .contains("CoderHelmLogReaderUpdate-"));
         assert!(account_reply(&account())["account"]["update_url"].is_null());
     }
 

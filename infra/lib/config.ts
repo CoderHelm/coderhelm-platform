@@ -282,7 +282,8 @@ export interface ResolvedConfig {
     /** The updater's starting settings (lambda/updater/handler.py). */
     defaults: { auto: boolean; channel: "stable" | "preview"; day: string; hour: number; timezone: string; majors: "ask" | "auto" };
   };
-  logReaderTemplateUrl: string;
+  /** The config's own template URL; null for the default (see service-env.ts, logReaderTemplateUrlFor). */
+  logReaderTemplateUrl: string | null;
   publicBucketName: string | null;
   siteUrl: string | null;
   reviewerEvalsRepo: string | null;
@@ -302,9 +303,24 @@ export class ConfigError extends Error {
   }
 }
 
-/** Default public copy of the log reader template. */
+/**
+ * The public bucket CloudFormation's Launch Stack links open templates from
+ * (they only open templates stored in S3).
+ */
+export const PUBLIC_TEMPLATE_BUCKET = "coderhelm-public";
+
+/** The hosted deployment's copy of the log reader template (follows main). */
 export const DEFAULT_LOG_READER_TEMPLATE_URL =
-  "https://coderhelm-public.s3.amazonaws.com/cfn/coderhelm-log-reader.yaml";
+  `https://${PUBLIC_TEMPLATE_BUCKET}.s3.amazonaws.com/cfn/coderhelm-log-reader.yaml`;
+
+/**
+ * A self-hosted release's own copy of the log reader template, published by
+ * the release workflow next to its Launch Stack template, byte for byte the
+ * one built into that release (services/common/src/log_reader.rs).
+ */
+export function releaseLogReaderTemplateUrl(version: string): string {
+  return `https://${PUBLIC_TEMPLATE_BUCKET}.s3.amazonaws.com/launch/${version}/coderhelm-log-reader.yaml`;
+}
 
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 const HOST_RE = /^(?=.{1,253}$)([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$/;
@@ -642,7 +658,7 @@ export function resolveConfig(cfg: CoderhelmConfig, opts: { skipValidation?: boo
         },
       };
     })(),
-    logReaderTemplateUrl: cfg.logReaderTemplateUrl ?? DEFAULT_LOG_READER_TEMPLATE_URL,
+    logReaderTemplateUrl: cfg.logReaderTemplateUrl ?? null,
     publicBucketName: cfg.publicBucketName ?? null,
     siteUrl: cfg.siteUrl ?? null,
     reviewerEvalsRepo: cfg.ci?.reviewerEvalsRepo ?? null,

@@ -678,32 +678,105 @@ pub async fn discover_log_groups(
     Ok(Json(json!({ "log_groups": log_groups })))
 }
 
-/// GET /api/aws-connections/cfn-url — get CloudFormation quick-create URL
+/// GET /api/aws-connections/cfn-url — the Launch Stack link for the
+/// team's read-only role, and what a person needs to make it by hand.
+///
+/// The role trusts this install's own account (never CoderHelm's, on a
+/// self-hosted install) and, on a self-hosted install, only the install's
+/// own roles. The template is the install's copy
+/// (`LOG_READER_TEMPLATE_URL`: a self-hosted release links to the copy
+/// published with it).
 pub async fn get_cfn_url(
     State(state): State<Arc<AppState>>,
     Extension(claims): Extension<Claims>,
-) -> Result<Json<Value>, StatusCode> {
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     if !is_admin_or_owner(&claims.role) {
-        return Err(StatusCode::FORBIDDEN);
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(json!({ "error": "Only admins can connect AWS accounts." })),
+        ));
     }
-
-    let external_id = team_external_id(&state, &claims.team_id).await?;
+    let account = common::public_urls::platform_account_id();
+    if account.is_empty() {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({
+                "error": "This install doesn't know its own AWS account, so it can't make the role link yet. An install admin can fix it: deploy again with the installer, which sets it.",
+                "code": "account_unknown",
+            })),
+        ));
+    }
+    let external_id = team_external_id(&state, &claims.team_id)
+        .await
+        .map_err(|c| {
+            (
+                c,
+                Json(json!({ "error": "Could not load your External ID. Try again." })),
+            )
+        })?;
     let template_url = common::public_urls::log_reader_template_url();
-    let stack_name = "CoderHelmLogReader";
-
-    let cfn_url = format!(
-        "https://console.aws.amazon.com/cloudformation/home#/stacks/quickcreate?stackName={}&templateURL={}&param_ExternalId={}&param_CoderHelmAccountId={}",
-        stack_name,
-        urlencoding::encode(&template_url),
-        external_id,
-        common::public_urls::platform_account_id(),
-    );
-
+    let prefix = if common::public_urls::self_hosted() {
+        common::log_reader::trusted_role_prefix()
+    } else {
+        String::new()
+    };
+    let cfn_url =
+        common::log_reader::quick_create_url(&template_url, &external_id, &account, &prefix);
+    let abilities: Vec<Value> = common::log_reader::ABILITIES
+        .iter()
+        .map(|a| json!({ "key": a.key, "name": a.name, "why": a.why, "actions": a.actions }))
+        .collect();
     Ok(Json(json!({
         "cfn_url": cfn_url,
         "external_id": external_id,
         "template_url": template_url,
+        "account_id": account,
+        "trusted_role_prefix": prefix,
+        "self_hosted": common::public_urls::self_hosted(),
+        "abilities": abilities,
+        "permissions_id": common::log_reader::permissions_id(),
     })))
+}
+
+#[derive(serde::Deserialize)]
+pub struct TemplateQuery {
+    which: Option<String>,
+}
+
+/// GET /api/aws-connections/template?which=role|update — the role's
+/// template as built into this release, with this install's account filled
+/// in, for teams that upload it to CloudFormation by hand.
+pub async fn download_template(
+    Extension(claims): Extension<Claims>,
+    Query(q): Query<TemplateQuery>,
+) -> Result<axum::response::Response, StatusCode> {
+    use axum::response::IntoResponse;
+    if !is_admin_or_owner(&claims.role) {
+        return Err(StatusCode::FORBIDDEN);
+    }
+    let (which, name) = match q.which.as_deref().unwrap_or("role") {
+        "role" => (common::log_reader::Which::Role, "coderhelm-log-reader.yaml"),
+        "update" => (
+            common::log_reader::Which::Update,
+            "coderhelm-log-reader-update.yaml",
+        ),
+        _ => return Err(StatusCode::BAD_REQUEST),
+    };
+    let body = common::log_reader::template_for(&common::public_urls::platform_account_id(), which);
+    Ok((
+        [
+            (
+                axum::http::header::CONTENT_TYPE,
+                "text/yaml; charset=utf-8".to_string(),
+            ),
+            (
+                axum::http::header::CONTENT_DISPOSITION,
+                format!("attachment; filename=\"{name}\""),
+            ),
+        ],
+        body,
+    )
+        .into_response())
 }
 
 // ────────────────────────────────────────────────────────────────

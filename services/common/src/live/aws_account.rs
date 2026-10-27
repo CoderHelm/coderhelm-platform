@@ -65,6 +65,8 @@ pub struct AwsAccount {
     /// `active` or `error` (from connecting or the log reader's test).
     pub status: String,
     pub abilities: Abilities,
+    /// The last live check of this release's permissions, if any.
+    pub permissions: Option<super::permissions::PermissionCheck>,
 }
 
 fn s(item: &Item, k: &str) -> String {
@@ -113,6 +115,10 @@ impl AwsAccount {
                 region
             },
             status: s(item, "status"),
+            permissions: item
+                .get("permissions_check")
+                .and_then(|v| v.as_s().ok())
+                .and_then(|j| serde_json::from_str(j).ok()),
             abilities: Abilities {
                 checked_at: s(item, "abilities_checked_at"),
                 check_error: s(item, "abilities_error"),
@@ -297,6 +303,7 @@ impl AwsAccount {
                 "skipped": a.airflow_skip,
                 "environments": self.airflow_environments(),
             },
+            "permissions": self.permissions.as_ref().map(|p| p.view(false, &crate::public_urls::log_reader_template_url())),
         })
     }
 
@@ -345,6 +352,29 @@ pub async fn list(
         .iter()
         .filter_map(AwsAccount::from_item)
         .collect())
+}
+
+/// Saves a permissions check on the account, only while it is still
+/// connected.
+pub async fn save_permissions(
+    dynamo: &aws_sdk_dynamodb::Client,
+    table: &str,
+    team_id: &str,
+    c: &super::permissions::PermissionCheck,
+) -> Result<(), String> {
+    let j = serde_json::to_string(c).map_err(|e| e.to_string())?;
+    dynamo
+        .update_item()
+        .table_name(table)
+        .key("pk", av_s(team_id))
+        .key("sk", av_s(&format!("{PREFIX}{}", c.account)))
+        .condition_expression("attribute_exists(pk)")
+        .update_expression("SET permissions_check = :j")
+        .expression_attribute_values(":j", av_s(&j))
+        .send()
+        .await
+        .map(|_| ())
+        .map_err(|e| format!("save aws permissions: {e}"))
 }
 
 /// Writes only the ability fields, and only while the account is still

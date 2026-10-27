@@ -5,7 +5,7 @@
  */
 import * as cdk from "aws-cdk-lib";
 import * as iam from "aws-cdk-lib/aws-iam";
-import { ResolvedConfig } from "./config";
+import { DEFAULT_LOG_READER_TEMPLATE_URL, ResolvedConfig, releaseLogReaderTemplateUrl } from "./config";
 import { releaseStamp, stampEnvironment } from "./release";
 
 /** Environment variables shared by gateway, streaming and worker. */
@@ -22,10 +22,13 @@ export function serviceEnvironment(cfg: ResolvedConfig, account: string): Record
   }
   // The marketing site linked from email footers ("" for none).
   env.SITE_URL = cfg.siteUrl ?? "";
-  // The account teams' read-only roles trust, and the template they create
-  // them from.
+  // The account teams' read-only roles trust (always this deployment's own:
+  // a self-hosted install never falls back to CoderHelm's), the template
+  // they create them from, and the prefix of this deployment's roles, which
+  // the role's trust policy is narrowed to on a self-hosted install.
   env.CODERHELM_ACCOUNT_ID = account;
-  env.LOG_READER_TEMPLATE_URL = cfg.logReaderTemplateUrl;
+  env.LOG_READER_TEMPLATE_URL = logReaderTemplateUrlFor(cfg);
+  env.RESOURCE_PREFIX = cfg.prefix;
   if (cfg.admins.length) env.PLATFORM_ADMIN_EMAILS = cfg.admins.join(",");
   Object.assign(env, modelProviderEnvironment(cfg));
   // Self-hosted installs: which release this is (Settings → System), and
@@ -54,6 +57,19 @@ export function serviceEnvironment(cfg: ResolvedConfig, account: string): Record
     env.SECRETS_REVISION = process.env.CODERHELM_SECRETS_REVISION;
   }
   return env;
+}
+
+/**
+ * The log reader template teams' Launch Stack links open: the config's own
+ * URL; else, on a self-hosted release, the copy published with that release
+ * (so the role matches the code that checks it); else the hosted copy.
+ */
+export function logReaderTemplateUrlFor(cfg: ResolvedConfig, version: string | null = releaseStamp(cfg).version): string {
+  if (cfg.logReaderTemplateUrl) return cfg.logReaderTemplateUrl;
+  if (cfg.layout === "single-origin" && version && /^v\d+\.\d+\.\d+(-[0-9A-Za-z.]+)?$/.test(version)) {
+    return releaseLogReaderTemplateUrl(version);
+  }
+  return DEFAULT_LOG_READER_TEMPLATE_URL;
 }
 
 /**

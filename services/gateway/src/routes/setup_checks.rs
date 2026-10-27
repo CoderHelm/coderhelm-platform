@@ -846,6 +846,87 @@ pub fn jira(connected: bool) -> Check {
     }
 }
 
+/// What a download of a role template answered: the same bytes as the
+/// template built into this release, other bytes, or nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Fetched {
+    Same,
+    Different,
+    Unreachable,
+}
+
+/// Connected AWS accounts: the install knows its own AWS account (teams'
+/// roles trust it, never CoderHelm's), and the templates its Launch Stack
+/// and update links open are this release's. `update` is None when the
+/// role template's URL has no update template next to it.
+pub fn aws_connections(
+    account: &str,
+    template_url: &str,
+    role: Fetched,
+    update: Option<Fetched>,
+) -> Check {
+    const KEY: &str = "aws_connections";
+    const LABEL: &str = "AWS connections";
+    if account.is_empty() {
+        return Check::not_ok(
+            Status::Fail,
+            KEY,
+            X,
+            LABEL,
+            "This install doesn't know its own AWS account (CODERHELM_ACCOUNT_ID isn't set).",
+            "Teams' read-only AWS roles must trust this install's account, so the role link can't be made.",
+            Fix::text("Deploy again from your machine: the installer sets it.")
+                .command(format!("{CLI} deploy")),
+        );
+    }
+    let fix = Fix::text("Remove logReaderTemplateUrl from the config to use this release's own copy, or publish this release's infra/cfn templates at that address, then deploy.")
+        .url("https://docs.coderhelm.com/self-host/integrations#connected-aws-accounts");
+    match (role, update) {
+        (Fetched::Unreachable, _) => Check::not_ok(
+            Status::Warn,
+            KEY,
+            X,
+            LABEL,
+            format!("The role template at {template_url} didn't download."),
+            "Teams' Launch Stack links open this template, so connecting an AWS account fails.",
+            fix,
+        ),
+        (Fetched::Different, _) => Check::not_ok(
+            Status::Warn,
+            KEY,
+            X,
+            LABEL,
+            format!("The role template at {template_url} isn't the one built into this release."),
+            "New roles would get other permissions than this release checks for.",
+            fix,
+        ),
+        (Fetched::Same, None) => Check::not_ok(
+            Status::Warn,
+            KEY,
+            X,
+            LABEL,
+            "There's no coderhelm-log-reader-update.yaml next to the role template.",
+            "Without it, the one-click update for an existing role can't be offered.",
+            fix,
+        ),
+        (Fetched::Same, Some(Fetched::Same)) => Check::pass(
+            KEY,
+            X,
+            LABEL,
+            format!("Teams' roles trust account {account}, and the role and update templates are this release's."),
+        ),
+        (Fetched::Same, Some(_)) => Check::not_ok(
+            Status::Warn,
+            KEY,
+            X,
+            LABEL,
+            "The update template next to the role template is missing or isn't this release's.",
+            "The one-click update would give existing roles other permissions than this release checks for.",
+            fix,
+        ),
+    }
+}
+
 // ── Your own domain ───────────────────────────────────────────────────────
 //
 // The updater requests the certificate and moves the domain along
@@ -1740,13 +1821,47 @@ async fn url_status(state: &AppState) -> (String, Option<u16>) {
     (url, code)
 }
 
+async fn fetched(state: &AppState, url: &str, built_in: &str) -> Fetched {
+    let got = state
+        .http
+        .get(url)
+        .timeout(Duration::from_secs(8))
+        .send()
+        .await
+        .ok()
+        .filter(|r| r.status().is_success());
+    match got {
+        Some(r) => match r.bytes().await {
+            Ok(b) if b.as_ref() == built_in.as_bytes() => Fetched::Same,
+            Ok(_) => Fetched::Different,
+            Err(_) => Fetched::Unreachable,
+        },
+        None => Fetched::Unreachable,
+    }
+}
+
+async fn aws_connections_check(state: &AppState) -> Check {
+    use common::log_reader;
+    let account = common::public_urls::platform_account_id();
+    let url = common::public_urls::log_reader_template_url();
+    let update_url = log_reader::update_template_url(&url);
+    let (role, update) = tokio::join!(fetched(state, &url, log_reader::ROLE_TEMPLATE), async {
+        match &update_url {
+            Some(u) => Some(fetched(state, u, log_reader::UPDATE_TEMPLATE).await),
+            None => None,
+        }
+    });
+    aws_connections(&account, &url, role, update)
+}
+
 async fn integration_checks(state: &AppState, team_id: &str) -> Vec<Check> {
     use common::notify::{store, ChannelKind};
     let jira_key = [("pk", team_id), ("sk", "JIRA#config")];
-    let (notify, jira_secret, jira_config) = tokio::join!(
+    let (notify, jira_secret, jira_config, aws) = tokio::join!(
         super::alerts::team_notify_settings(state, team_id),
         super::api::load_jira_secret(state, team_id),
         get_item(state, &state.config.jira_config_table_name, &jira_key),
+        aws_connections_check(state),
     );
     let forge = jira_config.as_ref().is_some_and(|i| {
         i.get("add_comment_url")
@@ -1767,6 +1882,7 @@ async fn integration_checks(state: &AppState, team_id: &str) -> Vec<Check> {
             notify.enabled,
         ),
         jira(forge || jira_secret.is_some()),
+        aws,
     ]
 }
 
@@ -2524,6 +2640,34 @@ pub async fn status(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn aws_connections_need_the_install_account_and_this_release_templates() {
+        use super::{aws_connections, Fetched, Status};
+        let u = "https://coderhelm-public.s3.amazonaws.com/launch/v1.2.3/coderhelm-log-reader.yaml";
+        let ok = aws_connections("111122223333", u, Fetched::Same, Some(Fetched::Same));
+        assert_eq!(ok.status, Status::Pass);
+        assert!(ok.detail.contains("111122223333"));
+        let no_account = aws_connections("", u, Fetched::Same, Some(Fetched::Same));
+        assert_eq!(no_account.status, Status::Fail);
+        assert!(no_account
+            .fix
+            .unwrap()
+            .command
+            .unwrap()
+            .ends_with(" deploy"));
+        for (role, update) in [
+            (Fetched::Unreachable, None),
+            (Fetched::Different, Some(Fetched::Same)),
+            (Fetched::Same, None),
+            (Fetched::Same, Some(Fetched::Unreachable)),
+        ] {
+            let c = aws_connections("111122223333", u, role, update);
+            assert_eq!(c.status, Status::Warn, "{role:?} {update:?}");
+            assert!(!c.detail.is_empty() && !c.why.is_empty());
+            assert!(c.fix.unwrap().text.split(". ").count() <= 2);
+        }
+    }
+
     use super::*;
 
     fn app(perms: Value, events: Value) -> Value {

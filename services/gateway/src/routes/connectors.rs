@@ -35,11 +35,6 @@ use crate::AppState;
 
 type Reply = Result<Json<Value>, (StatusCode, Json<Value>)>;
 
-/// The add-on stack that gives the existing CoderHelmLogReader role read
-/// access to metrics and Airflow.
-pub const OPS_TEMPLATE_URL: &str =
-    "https://coderhelm-public.s3.amazonaws.com/cfn/coderhelm-log-reader-ops.yaml";
-pub const OPS_STACK_NAME: &str = "CoderHelmLogReaderOps";
 const MAX_LIST: usize = 50;
 
 fn fail(status: StatusCode, message: &str) -> (StatusCode, Json<Value>) {
@@ -173,13 +168,14 @@ async fn log_reader(
         .map_err(step)
 }
 
-/// The link that adds the metrics and Airflow permissions to the team's
-/// existing CoderHelmLogReader role, as a stack in its own account.
-pub fn ops_stack_url(region: &str) -> String {
-    format!(
-        "https://console.aws.amazon.com/cloudformation/home?region={region}#/stacks/quickcreate?stackName={OPS_STACK_NAME}&templateURL={}&param_RoleName=CoderHelmLogReader",
-        urlencoding::encode(OPS_TEMPLATE_URL)
-    )
+/// The one-click link that brings the team's existing CoderHelmLogReader
+/// role up to this release's permissions (metrics, Airflow, ECS and the
+/// rest), as a stack in its own account, from the install's own template
+/// copy. None when the install's template has no update template next to
+/// it (a template URL an operator chose).
+pub fn update_stack_url(region: &str) -> Option<String> {
+    common::log_reader::update_template_url(&common::public_urls::log_reader_template_url())
+        .map(|t| common::log_reader::update_url(&t, region))
 }
 
 async fn record(
@@ -849,12 +845,13 @@ pub async fn aws_check(
     )
     .await;
     let missing = check.missing();
+    let template = common::public_urls::log_reader_template_url();
     Ok(Json(json!({
         "check": check,
         "missing": missing,
-        "update_url": if missing.is_empty() { None } else { Some(ops_stack_url(&t.region)) },
-        "stack_name": OPS_STACK_NAME,
-        "template_url": OPS_TEMPLATE_URL,
+        "update_url": if missing.is_empty() { None } else { update_stack_url(&t.region) },
+        "stack_name": common::log_reader::update_stack_name(),
+        "template_url": common::log_reader::update_template_url(&template),
     })))
 }
 
@@ -901,11 +898,11 @@ mod tests {
     }
 
     #[test]
-    fn the_update_link_opens_the_add_on_stack_for_the_existing_role() {
-        let u = ops_stack_url("us-west-2");
+    fn the_update_link_opens_the_update_stack_for_the_existing_role() {
+        let u = update_stack_url("us-west-2").unwrap();
         assert!(u.starts_with("https://console.aws.amazon.com/cloudformation/home?region=us-west-2#/stacks/quickcreate?"));
-        assert!(u.contains("stackName=CoderHelmLogReaderOps"));
-        assert!(u.contains("templateURL=https%3A%2F%2Fcoderhelm-public.s3.amazonaws.com%2Fcfn%2Fcoderhelm-log-reader-ops.yaml"));
+        assert!(u.contains("stackName=CoderHelmLogReaderUpdate-"));
+        assert!(u.contains("coderhelm-log-reader-update.yaml"));
         assert!(u.contains("param_RoleName=CoderHelmLogReader"));
     }
 

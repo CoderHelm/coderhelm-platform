@@ -605,6 +605,11 @@ async fn handle_message(state: Arc<WorkerState>, message: models::WorkerMessage)
                 Err(e) => error!("DLQ cleanup failed: {e}"),
             }
         }
+        models::WorkerMessage::AwsPermissionsSweep => {
+            if let Err(e) = passes::aws_permissions::run(&state).await {
+                error!("AWS permissions sweep failed: {e}");
+            }
+        }
         models::WorkerMessage::LogAutofix => match passes::log_autofix::run(&state).await {
             Ok(r) => info!(
                 teams = r.teams,
