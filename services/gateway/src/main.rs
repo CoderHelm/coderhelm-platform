@@ -1239,6 +1239,7 @@ async fn main() -> Result<(), Error> {
         // (routes::hybrid_email).
         .route("/email", post(routes::hybrid_email::send))
         .route("/email/recipients", post(routes::hybrid_email::recipients))
+        .route("/email/domain", post(routes::hybrid_email::domain))
         .route("/email/status", get(routes::hybrid_email::status))
         .route("/settings", put(routes::hybrid::settings))
         .route(

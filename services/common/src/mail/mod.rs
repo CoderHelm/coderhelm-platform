@@ -498,6 +498,24 @@ async fn send_relay(
                 .map(|_| ())
                 .map_err(|e| err(&e.code, e.message))
         }
+        // A link to the install's own domain the relay hasn't proved yet:
+        // ask it to (it reaches the install over HTTPS on that name), then
+        // try once more.
+        Err(e) if e.code == "link_not_own_host" => {
+            let host =
+                crate::public_urls::host_of(crate::public_urls::app_url_from_env()).to_string();
+            if !relay::custom_domain_ok(&host) {
+                return Err(err(&e.code, e.message));
+            }
+            let body = serde_json::json!({ "hostname": host });
+            crate::hybrid::client::call(http, creds, "POST", relay::PATH_DOMAIN, Some(&body))
+                .await
+                .map_err(|e| err(&e.code, e.message))?;
+            call(req(relay::new_request_id()))
+                .await
+                .map(|_| ())
+                .map_err(|e| err(&e.code, e.message))
+        }
         Err(e) => Err(err(&e.code, e.message)),
     }
 }
