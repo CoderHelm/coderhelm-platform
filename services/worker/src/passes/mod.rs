@@ -4330,12 +4330,12 @@ async fn run_passes(
     Ok(())
 }
 
-/// Keeps a branch's commits on `<branch>-wip` when a run stops before its
+/// Keeps a branch's commits on `coderhelm-wip/<branch>` when a run stops before its
 /// pull request: a later run of the ticket resets the run branch to its
 /// base, and the work must survive that. Returns the branch the work is on
 /// (the run branch itself when the copy can't be made).
 async fn keep_wip_branch(github: &GitHubClient, owner: &str, repo: &str, branch: &str) -> String {
-    let wip = format!("{branch}-wip");
+    let wip = common::run_round::wip_branch(branch);
     match github.create_branch(owner, repo, &wip, branch).await {
         Ok(_) => wip,
         Err(e) => {

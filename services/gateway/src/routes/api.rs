@@ -926,7 +926,7 @@ pub struct CodegenEnvMissing {
     pub vars: Vec<String>,
 }
 
-/// A commit a fix round pushed before it stopped.
+/// A checkpoint commit a fix round saved on its WIP branch before it stopped.
 #[derive(serde::Serialize, utoipa::ToSchema)]
 pub struct PushedCommit {
     /// The commit's SHA.
@@ -958,12 +958,16 @@ pub struct RoundIncomplete {
         example = "Pull request open; the last fix round didn't finish: the review fix round ran out of its time budget 3 times in a row."
     )]
     pub summary: String,
-    /// The commits the round pushed to the pull request's branch before it
-    /// stopped, oldest first.
+    /// The checkpoint commits the round saved on `wip_branch` before it
+    /// stopped, oldest first (never on the pull request).
     pub pushed: Vec<PushedCommit>,
     /// The files those commits changed.
     #[schema(example = json!(["src/blocks/gallery/tabs.tsx"]))]
     pub files: Vec<String>,
+    /// The branch the round's work so far is saved on. A round that didn't
+    /// finish never pushes to the pull request; Resume continues from here.
+    #[schema(example = "coderhelm-wip/web-42-gallery")]
+    pub wip_branch: String,
     /// When it stopped (RFC 3339).
     #[schema(example = "2026-10-22T15:40:02Z")]
     pub at: String,
@@ -1168,6 +1172,7 @@ fn round_incomplete_of(item: &run_search::Item) -> Option<RoundIncomplete> {
             })
             .collect(),
         files: inc.files,
+        wip_branch: inc.wip_branch,
         at: inc.at,
         can_resume: common::run_round::may_resume(status, pr_number, true),
     })
@@ -2022,12 +2027,13 @@ fn resume_route(
     inc: &common::run_round::Incomplete,
     now: chrono::DateTime<chrono::Utc>,
 ) -> ResumeRoute {
-    use common::run_round::{Kind, Round};
+    use common::run_round::Kind;
     match inc.kind {
         Some(Kind::Feedback) => ResumeRoute::Feedback,
-        Some(kind) if !inc.feedback.trim().is_empty() => ResumeRoute::Parked(
-            Round::start(kind, inc.number, "", &inc.feedback, inc.scoped, now).parked(false),
-        ),
+        Some(_) if !inc.feedback.trim().is_empty() => match inc.resume_round(now) {
+            Some(r) => ResumeRoute::Parked(r),
+            None => ResumeRoute::Recheck,
+        },
         _ => ResumeRoute::Recheck,
     }
 }

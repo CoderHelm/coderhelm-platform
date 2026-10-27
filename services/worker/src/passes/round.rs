@@ -11,7 +11,7 @@ use common::run_status::EndedValues;
 use tracing::{info, warn};
 
 use super::attr_s;
-use crate::clients::github::GitHubClient;
+use crate::clients::github::{FileOp, GitHubClient};
 use crate::WorkerState;
 
 /// When a round that starts in an invocation begun at `invocation_start`
@@ -133,7 +133,13 @@ pub(crate) async fn finish_incomplete(
 ) -> Incomplete {
     let now = chrono::Utc::now().to_rfc3339();
     let mut inc = Incomplete::of(round, reason, &now);
-    let (commits, files) = pushed(pr.github, pr.owner, pr.repo, &round.base_sha, pr.branch).await;
+    // What it saved is on its WIP branch; the pull request is untouched.
+    let wip = if round.wip_branch.is_empty() {
+        pr.branch
+    } else {
+        round.wip_branch.as_str()
+    };
+    let (commits, files) = pushed(pr.github, pr.owner, pr.repo, &round.base_sha, wip).await;
     inc.pushed = commits;
     inc.files = files;
     // The caller completes the run (with its usage) and says so.
@@ -145,7 +151,7 @@ pub(crate) async fn finish_incomplete(
         &format!(
             "{} {}",
             inc.status_line(),
-            run_round::pushed_note(&inc.pushed, &inc.files)
+            run_round::pushed_note(&inc.pushed, &inc.files, wip)
         ),
     )
     .await;
@@ -260,9 +266,193 @@ pub(crate) async fn end_unfinished(
     true
 }
 
+/// The round's WIP branch, ready to write to: the one it already has when
+/// it continues (`reuse`), else a fresh one at the pull request's head.
+/// Returns its name.
+pub(crate) async fn open_wip(
+    github: &GitHubClient,
+    owner: &str,
+    repo: &str,
+    pr_branch: &str,
+    reuse: &str,
+) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    if !reuse.is_empty() && github.get_ref(owner, repo, reuse).await.is_ok() {
+        return Ok(reuse.to_string());
+    }
+    let wip = run_round::wip_branch(pr_branch);
+    // A leftover WIP branch has no pull request, so this resets it to the
+    // pull request's head.
+    github.create_branch(owner, repo, &wip, pr_branch).await?;
+    Ok(wip)
+}
+
+/// One file the round changed, from a compare of its start and its WIP head.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Changed {
+    pub path: String,
+    pub removed: bool,
+    /// The old path of a renamed file.
+    pub previous: Option<String>,
+}
+
+/// The files a compare (`base...wip`) says the round changed.
+pub(crate) fn changed_from_compare(compare: &serde_json::Value) -> Vec<Changed> {
+    compare["files"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|f| {
+                    let path = f["filename"].as_str()?.to_string();
+                    let status = f["status"].as_str().unwrap_or("");
+                    Some(Changed {
+                        path,
+                        removed: status == "removed",
+                        previous: (status == "renamed")
+                            .then(|| f["previous_filename"].as_str().map(String::from))
+                            .flatten(),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Files the pull request changed since the round started (someone else's
+/// push) that the round changed too: landing would overwrite them.
+pub(crate) fn overlap(ours: &[Changed], theirs: &[String]) -> Vec<String> {
+    ours.iter()
+        .flat_map(|c| std::iter::once(&c.path).chain(c.previous.iter()))
+        .filter(|p| theirs.contains(p))
+        .cloned()
+        .collect()
+}
+
+/// How landing a round went.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Landed {
+    /// One commit on the pull request carries the round's changes.
+    Pushed { files: usize },
+    /// The round changed nothing.
+    Nothing,
+    /// Not landed (the WIP branch is kept): why.
+    Refused(String),
+}
+
+/// Lands a finished round on the pull request: everything it changed on its
+/// WIP branch since `base_sha`, as ONE commit with `message`, in one push.
+/// Refuses (keeping the WIP branch) when the pull request changed the same
+/// files meanwhile. The WIP branch is deleted once landed.
+pub(crate) async fn land(pr: &Pr<'_>, wip: &str, base_sha: &str, message: &str) -> Landed {
+    let (github, owner, repo) = (pr.github, pr.owner, pr.repo);
+    if wip.is_empty() || wip == pr.branch || base_sha.is_empty() {
+        return Landed::Refused("the round has no WIP branch to land".into());
+    }
+    let ours = match github.get_diff(owner, repo, base_sha, wip).await {
+        Ok(c) => changed_from_compare(&c),
+        Err(e) => return Landed::Refused(format!("its changes couldn't be read ({e})")),
+    };
+    if ours.is_empty() {
+        let _ = github.delete_branch(owner, repo, wip).await;
+        return Landed::Nothing;
+    }
+    match github.get_ref(owner, repo, pr.branch).await {
+        Ok(head) if head != base_sha => {
+            let theirs: Vec<String> = github
+                .get_diff(owner, repo, base_sha, &head)
+                .await
+                .map(|c| {
+                    changed_from_compare(&c)
+                        .into_iter()
+                        .flat_map(|c| std::iter::once(c.path).chain(c.previous))
+                        .collect()
+                })
+                .unwrap_or_default();
+            let clash = overlap(&ours, &theirs);
+            if !clash.is_empty() {
+                return Landed::Refused(format!(
+                    "the pull request changed the same files meanwhile ({})",
+                    clash.join(", ")
+                ));
+            }
+        }
+        Ok(_) => {}
+        Err(e) => {
+            return Landed::Refused(format!("the pull request's head couldn't be read ({e})"))
+        }
+    }
+    let mut ops = Vec::new();
+    for c in &ours {
+        if let Some(prev) = &c.previous {
+            ops.push(FileOp::Delete { path: prev.clone() });
+        }
+        if c.removed {
+            ops.push(FileOp::Delete {
+                path: c.path.clone(),
+            });
+            continue;
+        }
+        match github.read_file_live(owner, repo, &c.path, wip).await {
+            Ok(content) => ops.push(FileOp::Write {
+                path: c.path.clone(),
+                content,
+            }),
+            Err(e) => {
+                return Landed::Refused(format!(
+                    "`{}` couldn't be read from the WIP branch ({e})",
+                    c.path
+                ))
+            }
+        }
+    }
+    match github
+        .batch_write(owner, repo, pr.branch, message, &ops)
+        .await
+    {
+        Ok(_) => {
+            let _ = github.delete_branch(owner, repo, wip).await;
+            Landed::Pushed { files: ours.len() }
+        }
+        Err(e) => Landed::Refused(format!("the one commit couldn't be pushed ({e})")),
+    }
+}
+
+/// The one commit message a round lands with, in the team's commit style.
+pub(crate) async fn round_message(
+    state: &WorkerState,
+    team_id: &str,
+    ticket: &crate::models::TicketMessage,
+    round: &Round,
+) -> String {
+    let summary = match round.kind {
+        Kind::CiFix => "Fix the failing checks",
+        Kind::ReviewFix => "Address the review",
+        Kind::Feedback => "Address the review comments",
+    };
+    let conventions = super::load_git_conventions(state, team_id, &ticket.ticket_id).await;
+    conventions.commit_message(&super::ticket_tokens(ticket), summary)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_rounds_changes_are_read_from_its_wip_compare() {
+        let compare = serde_json::json!({"files": [
+            {"filename": "src/tabs.tsx", "status": "added"},
+            {"filename": "src/old.ts", "status": "removed"},
+            {"filename": "src/new.ts", "status": "renamed", "previous_filename": "src/was.ts"},
+            {"filename": "src/a.ts", "status": "modified"}
+        ]});
+        let c = changed_from_compare(&compare);
+        assert_eq!(c.len(), 4);
+        assert!(c[1].removed);
+        assert_eq!(c[2].previous.as_deref(), Some("src/was.ts"));
+        // Someone pushed to the PR meanwhile: only the same files block.
+        assert!(overlap(&c, &["README.md".to_string()]).is_empty());
+        assert_eq!(overlap(&c, &["src/a.ts".to_string()]), vec!["src/a.ts"]);
+        assert_eq!(overlap(&c, &["src/was.ts".to_string()]), vec!["src/was.ts"]);
+    }
 
     #[test]
     fn a_round_starts_only_with_enough_of_its_budget_left() {

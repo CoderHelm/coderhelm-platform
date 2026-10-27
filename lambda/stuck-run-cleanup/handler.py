@@ -166,6 +166,9 @@ def incomplete_record(run, pass_name, now_iso):
         "at": now_iso,
         "feedback": rnd.get("feedback", ""),
         "scoped": rnd.get("scoped", True),
+        # The round's work so far stays on its WIP branch, never the PR's.
+        "wip_branch": rnd.get("wip_branch", ""),
+        "base_sha": rnd.get("base_sha", ""),
     }
 
 

@@ -21,6 +21,13 @@
 //! - The round being worked is on the run record ([`FIELD`]) with its
 //!   deadline, so the stuck-run sweep waits for that deadline (plus
 //!   [`SWEEP_GRACE_SECS`]) before it calls the worker gone.
+//! - A round works on its own branch, [`wip_branch`] (`coderhelm-wip/<pr
+//!   branch>`), never the pull request's: every write is a checkpoint
+//!   commit there. When the round finishes, its changes land on the pull
+//!   request as ONE commit in the repository's commit style, so a round is
+//!   one push (one CI run; a repository that dismisses stale approvals
+//!   dismisses them once). A round that stops keeps its WIP branch, and
+//!   Resume continues from it; partial work never reaches the pull request.
 //! - A round that doesn't finish while the pull request is open never fails
 //!   the run. The run is `completed` with [`INCOMPLETE_FIELD`] saying which
 //!   round, why, and the commits it pushed; [`status_line`] is how a person
@@ -144,6 +151,15 @@ pub struct Round {
     /// Whether the round may only change the files the pull request already
     /// changes (a bot-driven fix).
     pub scoped: bool,
+    /// The branch the round writes its checkpoints to (empty until it
+    /// starts working).
+    pub wip_branch: String,
+}
+
+/// The branch a round on `pr_branch` keeps its checkpoints on: a branch of
+/// its own, never the pull request's head.
+pub fn wip_branch(pr_branch: &str) -> String {
+    format!("coderhelm-wip/{pr_branch}")
 }
 
 fn s(v: &str) -> AttributeValue {
@@ -193,6 +209,7 @@ impl Round {
             base_sha: base_sha.to_string(),
             feedback: cut(feedback, MAX_FEEDBACK_CHARS),
             scoped,
+            wip_branch: String::new(),
         }
     }
 
@@ -232,6 +249,7 @@ impl Round {
             ("base_sha".to_string(), s(&self.base_sha)),
             ("feedback".to_string(), s(&self.feedback)),
             ("scoped".to_string(), AttributeValue::Bool(self.scoped)),
+            ("wip_branch".to_string(), s(&self.wip_branch)),
         ]))
     }
 
@@ -255,6 +273,7 @@ impl Round {
                 .and_then(|v| v.as_bool().ok())
                 .copied()
                 .unwrap_or(true),
+            wip_branch: get_s(m, "wip_branch"),
         })
     }
 
@@ -289,6 +308,10 @@ pub struct Incomplete {
     pub feedback: String,
     /// Whether the round was a bot-driven fix scoped to the PR's files.
     pub scoped: bool,
+    /// The branch holding the round's work so far (not the pull request's).
+    pub wip_branch: String,
+    /// The pull request's head when the round started.
+    pub base_sha: String,
 }
 
 impl Incomplete {
@@ -303,6 +326,8 @@ impl Incomplete {
             at: now.to_string(),
             feedback: round.feedback.clone(),
             scoped: round.scoped,
+            wip_branch: round.wip_branch.clone(),
+            base_sha: round.base_sha.clone(),
         }
     }
 
@@ -339,6 +364,8 @@ impl Incomplete {
                 s(&cut(&self.feedback, MAX_FEEDBACK_CHARS)),
             ),
             ("scoped".to_string(), AttributeValue::Bool(self.scoped)),
+            ("wip_branch".to_string(), s(&self.wip_branch)),
+            ("base_sha".to_string(), s(&self.base_sha)),
         ]))
     }
 
@@ -373,7 +400,25 @@ impl Incomplete {
                 .and_then(|v| v.as_bool().ok())
                 .copied()
                 .unwrap_or(true),
+            wip_branch: get_s(m, "wip_branch"),
+            base_sha: get_s(m, "base_sha"),
         })
+    }
+
+    /// The round to run again on Resume: parked, continuing from its WIP
+    /// branch and its starting point, with a fresh budget.
+    pub fn resume_round(&self, now: chrono::DateTime<chrono::Utc>) -> Option<Round> {
+        let kind = self.kind?;
+        let mut r = Round::start(
+            kind,
+            self.number,
+            &self.base_sha,
+            &self.feedback,
+            self.scoped,
+            now,
+        );
+        r.wip_branch = self.wip_branch.clone();
+        Some(r.parked(false))
     }
 
     /// The unfinished round on a run record, if any.
@@ -450,18 +495,19 @@ pub fn pushed_from_compare(compare: &serde_json::Value) -> (Vec<Pushed>, Vec<Str
     (pushed.into_iter().skip(skip).collect(), files)
 }
 
-/// One line for a progress note: what an unfinished round left on the
-/// branch.
-pub fn pushed_note(pushed: &[Pushed], files: &[String]) -> String {
+/// One line for a progress note: what an unfinished round left, and where.
+/// The pull request itself is never changed by a round that didn't finish.
+pub fn pushed_note(pushed: &[Pushed], files: &[String], wip: &str) -> String {
     if pushed.is_empty() {
-        return "It pushed no commits before it stopped.".to_string();
+        return "It saved no work before it stopped; the pull request is unchanged.".to_string();
     }
     let shas: Vec<String> = pushed
         .iter()
         .map(|p| p.sha.chars().take(7).collect())
         .collect();
     format!(
-        "It pushed {} commit(s) to the pull request branch before it stopped ({}), changing {} file(s).",
+        "Its work so far ({} checkpoint commit(s): {}, {} file(s)) is saved on branch `{wip}`; \
+         the pull request is unchanged, and Resume continues from there.",
         pushed.len(),
         shas.join(", "),
         files.len()
@@ -538,6 +584,24 @@ mod tests {
     }
 
     #[test]
+    fn a_round_writes_to_its_own_branch_and_resume_continues_from_it() {
+        assert_eq!(wip_branch("feature/abc-7"), "coderhelm-wip/feature/abc-7");
+        assert_ne!(wip_branch("x"), "x");
+        let mut r = Round::start(Kind::ReviewFix, 2, "base1", "Add the tabs", true, now());
+        r.wip_branch = wip_branch("feature/abc-7");
+        let inc = Incomplete::of(&r, "out of time", "t");
+        assert_eq!(inc.wip_branch, "coderhelm-wip/feature/abc-7");
+        assert_eq!(inc.base_sha, "base1");
+        let back = Incomplete::from_attr(&inc.to_attr()).unwrap();
+        let again = back.resume_round(now()).unwrap();
+        assert_eq!(again.state, State::Pending);
+        assert_eq!(again.wip_branch, "coderhelm-wip/feature/abc-7");
+        assert_eq!(again.base_sha, "base1");
+        assert_eq!(again.feedback, "Add the tabs");
+        assert!(Incomplete::default().resume_round(now()).is_none());
+    }
+
+    #[test]
     fn the_long_feedback_of_a_parked_round_is_cut() {
         let big = "x".repeat(MAX_FEEDBACK_CHARS * 2);
         let r = Round::start(Kind::CiFix, 1, "", &big, true, now());
@@ -584,14 +648,11 @@ mod tests {
         assert_eq!(pushed.len(), 2);
         assert_eq!(pushed[0].message, "Add the tabs");
         assert_eq!(files, vec!["src/tabs.ts", "src/tabs.test.ts"]);
-        assert_eq!(
-            pushed_note(&pushed, &files),
-            "It pushed 2 commit(s) to the pull request branch before it stopped (aaaaaaa, bbbbbbb), changing 2 file(s)."
-        );
-        assert_eq!(
-            pushed_note(&[], &[]),
-            "It pushed no commits before it stopped."
-        );
+        let note = pushed_note(&pushed, &files, "coderhelm-wip/feature/x");
+        assert!(note.contains("2 checkpoint commit(s): aaaaaaa, bbbbbbb, 2 file(s)"));
+        assert!(note.contains("`coderhelm-wip/feature/x`"));
+        assert!(note.contains("the pull request is unchanged"));
+        assert!(pushed_note(&[], &[], "w").contains("the pull request is unchanged"));
     }
 
     #[test]

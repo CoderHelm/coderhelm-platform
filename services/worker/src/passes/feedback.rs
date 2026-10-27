@@ -671,11 +671,72 @@ Rules:
         s.record_applied(state).await;
     }
 
+    // The round on the run record, with its deadline, while it works: the
+    // stuck-run sweep waits for that deadline, not the run's age.
+    if !super::round::may_start(start, std::time::Instant::now()) {
+        // Too little of this invocation is left for the round: the same
+        // feedback runs first in a fresh one, with its whole budget.
+        info!(run_id = %msg.run_id, "Feedback round deferred to a fresh step for its full budget");
+        if send_delayed_feedback(state, &msg, 5).await {
+            return Ok(());
+        }
+    }
+    // A continuing step keeps the round's starting point and its WIP branch.
+    let prior = if msg.round_attempt > 0 {
+        state
+            .dynamo
+            .get_item()
+            .table_name(&state.config.runs_table_name)
+            .key(
+                "team_id",
+                aws_sdk_dynamodb::types::AttributeValue::S(msg.team_id.clone()),
+            )
+            .key(
+                "run_id",
+                aws_sdk_dynamodb::types::AttributeValue::S(msg.run_id.clone()),
+            )
+            .send()
+            .await
+            .ok()
+            .and_then(|r| r.item)
+            .and_then(|i| common::run_round::Round::from_item(&i))
+            .filter(|r| r.kind == common::run_round::Kind::Feedback)
+    } else {
+        None
+    };
+    let mut feedback_round = {
+        let base_sha = match prior.as_ref().map(|r| r.base_sha.clone()) {
+            Some(b) if !b.is_empty() => b,
+            _ => super::round::branch_head(&github, &msg.repo_owner, &msg.repo_name, &branch).await,
+        };
+        let mut r = common::run_round::Round::start(
+            common::run_round::Kind::Feedback,
+            0,
+            &base_sha,
+            &formatted,
+            ci_only,
+            chrono::Utc::now(),
+        );
+        r.attempt = msg.round_attempt + 1;
+        r
+    };
+    // The round writes its checkpoints to its own WIP branch; the pull
+    // request gets one commit when the round is done.
+    feedback_round.wip_branch = super::round::open_wip(
+        &github,
+        &msg.repo_owner,
+        &msg.repo_name,
+        &branch,
+        &prior.map(|r| r.wip_branch).unwrap_or_default(),
+    )
+    .await?;
+    super::round::record(state, &msg.team_id, &msg.run_id, &feedback_round).await;
+
     let executor = FeedbackToolExecutor {
         github: &github,
         owner: &msg.repo_owner,
         repo: &msg.repo_name,
-        branch: &branch,
+        branch: &feedback_round.wip_branch,
         base_branch: &base,
         files_modified: std::sync::Mutex::new(false),
         description: DescriptionRequests::new(may_edit_description),
@@ -694,32 +755,6 @@ Rules:
         "user".to_string(),
         vec![serde_json::json!({"type": "text", "text": prompt})],
     )];
-
-    // The round on the run record, with its deadline, while it works: the
-    // stuck-run sweep waits for that deadline, not the run's age.
-    if !super::round::may_start(start, std::time::Instant::now()) {
-        // Too little of this invocation is left for the round: the same
-        // feedback runs first in a fresh one, with its whole budget.
-        info!(run_id = %msg.run_id, "Feedback round deferred to a fresh step for its full budget");
-        if send_delayed_feedback(state, &msg, 5).await {
-            return Ok(());
-        }
-    }
-    let feedback_round = {
-        let base_sha =
-            super::round::branch_head(&github, &msg.repo_owner, &msg.repo_name, &branch).await;
-        let mut r = common::run_round::Round::start(
-            common::run_round::Kind::Feedback,
-            0,
-            &base_sha,
-            &formatted,
-            ci_only,
-            chrono::Utc::now(),
-        );
-        r.attempt = msg.round_attempt + 1;
-        r
-    };
-    super::round::record(state, &msg.team_id, &msg.run_id, &feedback_round).await;
 
     let model_id = provider.primary_model_id();
     let response = provider::converse(
@@ -808,7 +843,49 @@ Rules:
     // The description: rewritten when the code changed (so it stays true)
     // or when a person with write access asked for a change to it, even
     // with no code change. What changed goes on the reply.
-    let fix_pushed = *executor.files_modified.lock().unwrap();
+    // The round's changes land on the pull request as one commit, one push.
+    let fix_pushed = if *executor.files_modified.lock().unwrap() {
+        let pr = super::round::Pr {
+            github: &github,
+            owner: &msg.repo_owner,
+            repo: &msg.repo_name,
+            branch: &branch,
+        };
+        let ticket_msg = crate::models::TicketMessage {
+            ticket_id: ticket.0.clone(),
+            title: ticket.1.clone(),
+            issue_number: ticket.2,
+            ..Default::default()
+        };
+        let message =
+            super::round::round_message(state, &msg.team_id, &ticket_msg, &feedback_round).await;
+        match super::round::land(
+            &pr,
+            &feedback_round.wip_branch,
+            &feedback_round.base_sha,
+            &message,
+        )
+        .await
+        {
+            super::round::Landed::Pushed { .. } => true,
+            super::round::Landed::Nothing => false,
+            super::round::Landed::Refused(why) => {
+                super::round::finish_incomplete(
+                    state,
+                    &msg.team_id,
+                    &msg.run_id,
+                    &pr,
+                    &feedback_round,
+                    &format!("its changes couldn't land on the pull request: {why}"),
+                )
+                .await;
+                super::webhooks::emit_run(state, &msg.team_id, &msg.run_id, "completed").await;
+                return Ok(());
+            }
+        }
+    } else {
+        false
+    };
     let asked = executor.description.taken();
     let description_note = if fix_pushed || !asked.is_empty() {
         let changed = super::pr::refresh_description(

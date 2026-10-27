@@ -1860,10 +1860,14 @@ pub async fn run(
         // The CI fix is a round of its own (common::run_round): its own
         // budget, on the run record while it works, and parked for a fresh
         // invocation when this one has too little left to finish it.
-        let ci_round = run_round::Round::start(
+        let round_base = match branch_head.as_deref() {
+            Some(h) if !h.is_empty() => h.to_string(),
+            _ => super::round::branch_head(&github, &repo_owner, &repo_name, &branch).await,
+        };
+        let mut ci_round = run_round::Round::start(
             run_round::Kind::CiFix,
             (cycle + 1).min(u32::MAX as usize) as u32,
-            branch_head.as_deref().unwrap_or(""),
+            &round_base,
             &feedback,
             review_feedback.is_empty(),
             chrono::Utc::now(),
@@ -1890,6 +1894,10 @@ pub async fn run(
             .await?;
             return Ok(());
         }
+        // The fix writes its checkpoints to its own WIP branch; the pull
+        // request gets one commit when it's done.
+        ci_round.wip_branch =
+            super::round::open_wip(&github, &repo_owner, &repo_name, &branch, "").await?;
         super::round::record(state, &msg.team_id, &msg.run_id, &ci_round).await;
 
         // The tree before the fix: compared with the tree after it to tell a
@@ -1904,7 +1912,7 @@ pub async fn run(
             &ticket_msg,
             &github,
             &plan_result,
-            &branch,
+            &ci_round.wip_branch,
             &rules,
             &repo_instructions,
             Some(&feedback),
@@ -1978,7 +1986,47 @@ pub async fn run(
                 .await?;
                 return Ok(());
             }
-            Ok(result) => {
+            Ok(mut result) => {
+                // One commit, one push: the fix lands on the pull request.
+                let message =
+                    super::round::round_message(state, &msg.team_id, &ticket_msg, &ci_round).await;
+                let gh = super::round::Pr {
+                    github: &github,
+                    owner: &repo_owner,
+                    repo: &repo_name,
+                    branch: &branch,
+                };
+                match super::round::land(&gh, &ci_round.wip_branch, &ci_round.base_sha, &message)
+                    .await
+                {
+                    super::round::Landed::Pushed { .. } => {}
+                    super::round::Landed::Nothing => result.files_modified.clear(),
+                    super::round::Landed::Refused(why) => {
+                        mark_events_processed(state, &msg.run_id, &events).await;
+                        super::round::finish_incomplete(
+                            state,
+                            &msg.team_id,
+                            &msg.run_id,
+                            &gh,
+                            &ci_round,
+                            &format!("its changes couldn't land on the pull request: {why}"),
+                        )
+                        .await;
+                        complete_run_with_status(
+                            state,
+                            &ticket_msg,
+                            &msg.run_id,
+                            "completed",
+                            &pr_url,
+                            pr_number,
+                            &branch,
+                            &usage,
+                            wall_clock_secs(created_at, &start),
+                        )
+                        .await?;
+                        return Ok(());
+                    }
+                }
                 super::round::clear(state, &msg.team_id, &msg.run_id).await;
                 info!(
                     run_id = msg.run_id,
@@ -2854,13 +2902,19 @@ async fn run_fix_round(
     if round.base_sha.is_empty() {
         round.base_sha = super::round::branch_head(&ctx.github, pr.owner, pr.repo, pr.branch).await;
     }
+    // The round writes to its own WIP branch, never the pull request's: a
+    // continuing round picks up the one it has.
+    let continuing = !round.wip_branch.is_empty();
+    round.wip_branch =
+        super::round::open_wip(&ctx.github, pr.owner, pr.repo, pr.branch, &round.wip_branch)
+            .await?;
     super::round::record(state, &msg.team_id, &msg.run_id, &round).await;
     super::update_pass(state, &msg.team_id, &msg.run_id, "implement").await?;
-    let feedback = if round.attempt > 1 {
+    let feedback = if round.attempt > 1 || continuing {
         format!(
-            "{}\n\n## CONTINUING THIS ROUND\nAn earlier step of this round ran out of time; \
-             everything it wrote is already committed on the branch. Read the files you need \
-             first, then finish only what is left.",
+            "{}\n\n## CONTINUING THIS ROUND\nAn earlier step of this round stopped before it \
+             finished; everything it wrote is already committed on this branch. Read the files you \
+             need first, then finish only what is left.",
             round.feedback
         )
     } else {
@@ -2881,7 +2935,7 @@ async fn run_fix_round(
         &ctx.ticket_msg,
         &ctx.github,
         &plan_result,
-        pr.branch,
+        &round.wip_branch,
         &ctx.rules,
         &ctx.repo_instructions,
         Some(&feedback),
@@ -2938,11 +2992,33 @@ async fn run_fix_round(
                 Ok(RoundEnd::Incomplete)
             }
         }
-        Ok(r) => {
-            super::round::clear(state, &msg.team_id, &msg.run_id).await;
-            Ok(RoundEnd::Done {
-                files: r.files_modified.len(),
-            })
+        Ok(_) => {
+            // Done: the round's changes land on the pull request as one
+            // commit, one push.
+            let message =
+                super::round::round_message(state, &msg.team_id, &ctx.ticket_msg, &round).await;
+            match super::round::land(&gh, &round.wip_branch, &round.base_sha, &message).await {
+                super::round::Landed::Pushed { files } => {
+                    super::round::clear(state, &msg.team_id, &msg.run_id).await;
+                    Ok(RoundEnd::Done { files })
+                }
+                super::round::Landed::Nothing => {
+                    super::round::clear(state, &msg.team_id, &msg.run_id).await;
+                    Ok(RoundEnd::Done { files: 0 })
+                }
+                super::round::Landed::Refused(why) => {
+                    super::round::finish_incomplete(
+                        state,
+                        &msg.team_id,
+                        &msg.run_id,
+                        &gh,
+                        &round,
+                        &format!("its changes couldn't land on the pull request: {why}"),
+                    )
+                    .await;
+                    Ok(RoundEnd::Incomplete)
+                }
+            }
         }
         Err(e) => {
             let err: &(dyn std::error::Error + 'static) = &*e;

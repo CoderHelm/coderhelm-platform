@@ -86,13 +86,21 @@ class Rounds(unittest.TestCase):
         run = {
             "pr_number": 41,
             "current_pass": "implement",
-            "round": {"kind": "review_fix", "number": 3, "feedback": "Add the tabs"},
+            "round": {
+                "kind": "review_fix",
+                "number": 3,
+                "feedback": "Add the tabs",
+                "wip_branch": "coderhelm-wip/feature/x",
+                "base_sha": "abc",
+            },
         }
         self.assertTrue(sweep.has_pull_request(run))
         rec = sweep.incomplete_record(run, "implement", "2026-10-26T15:00:00+00:00")
         self.assertEqual(rec["kind"], "review_fix")
         self.assertEqual(rec["number"], 3)
         self.assertEqual(rec["feedback"], "Add the tabs")
+        self.assertEqual(rec["wip_branch"], "coderhelm-wip/feature/x")
+        self.assertEqual(rec["base_sha"], "abc")
         line = sweep.status_line(rec["reason"])
         self.assertTrue(line.startswith("Pull request open; the last fix round didn't finish:"))
         self.assertNotIn("failed", line.lower())

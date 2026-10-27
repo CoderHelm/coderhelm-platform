@@ -2016,7 +2016,7 @@
         "type": "object"
       },
       "PushedCommit": {
-        "description": "A commit a fix round pushed before it stopped.",
+        "description": "A checkpoint commit a fix round saved on its WIP branch before it stopped.",
         "properties": {
           "message": {
             "description": "Its subject line.",
@@ -2768,7 +2768,7 @@
             "type": "integer"
           },
           "pushed": {
-            "description": "The commits the round pushed to the pull request's branch before it\nstopped, oldest first.",
+            "description": "The checkpoint commits the round saved on `wip_branch` before it\nstopped, oldest first (never on the pull request).",
             "items": {
               "$ref": "#/components/schemas/PushedCommit"
             },
@@ -2787,6 +2787,13 @@
               "Pull request open; the last fix round didn't finish: the review fix round ran out of its time budget 3 times in a row."
             ],
             "type": "string"
+          },
+          "wip_branch": {
+            "description": "The branch the round's work so far is saved on. A round that didn't\nfinish never pushes to the pull request; Resume continues from here.",
+            "examples": [
+              "coderhelm-wip/web-42-gallery"
+            ],
+            "type": "string"
           }
         },
         "required": [
@@ -2795,6 +2802,7 @@
           "summary",
           "pushed",
           "files",
+          "wip_branch",
           "at",
           "can_resume"
         ],
