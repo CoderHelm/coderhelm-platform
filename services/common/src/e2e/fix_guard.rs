@@ -292,7 +292,7 @@ fn retry_settings(code: &str) -> Vec<(String, u64)> {
 }
 
 /// Timeout settings and calls on a line: (key, value).
-fn timeout_settings(code: &str) -> Vec<(String, u64)> {
+pub fn timeout_settings(code: &str) -> Vec<(String, u64)> {
     let mut out = settings(code, TIMEOUT_KEYS);
     for name in [
         "test.setTimeout",
@@ -313,7 +313,7 @@ fn timeout_settings(code: &str) -> Vec<(String, u64)> {
 }
 
 /// What a wait on the line is, if it is one.
-fn wait_on(code: &str) -> Option<(Kind, String)> {
+pub fn wait_on(code: &str) -> Option<(Kind, String)> {
     for name in [
         "waitForTimeout",
         "browser.pause",

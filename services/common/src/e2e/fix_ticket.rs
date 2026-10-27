@@ -87,6 +87,9 @@ pub const RULES: &str = r#"## Rules for fixing a failing or flaky test
 - Without failure evidence (no report of a failing run), change only what makes the next failure tell its cause: a clearer assertion message, the page state captured at the failure. Never add a wait, poll, sleep, retry or longer timeout to test code without a report that shows the test failed on time; such a change is refused before the pull request opens.
 - Keep shared helpers (page objects, fixtures, support code) cheap: never loop or poll over every row or card; wait on the one element the helper reads.
 - Test code in its own package (its own package.json, tsconfig or lockfile) is installed, type-checked and linted in that package, and the affected spec runs repeatedly before the pull request leaves draft.
+- Flaky or a bug is measured, not assumed: the failing spec runs repeatedly with retries off on the base branch and on this branch. A test that fails every run is a bug in the app or its data, fixed in the app with a unit test that fails before the fix and passes after.
+- Never make a test pass by asking less of it: no removed or skipped assertions, looser matchers, lower counts or caught failures, unless a lookup shows the expectation itself was wrong (say so on an `Expectation wrong:` line citing it).
+- After the fix passes, each wait or timeout tweak is tried without; one the test passes without is dropped, and the description lists what was dropped and why.
 - Keep the description proportionate: for a small change, the problem, the observed error, the change and the evidence with run counts. No open items or questions sections."#;
 
 /// Whether a change is small: at most two files and 80 changed lines, or one

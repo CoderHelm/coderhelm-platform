@@ -234,6 +234,59 @@ pub fn packages_outside(
     out
 }
 
+/// The package `file` belongs to, inside the main workspace or not (the
+/// root is `.`), to install and repeat its spec. `None` when no
+/// `package.json` is above it.
+pub fn package_of(
+    tree: &[String],
+    file: &str,
+    read: &dyn Fn(&str) -> Option<String>,
+) -> Option<TestPackage> {
+    let dir = package_dir(tree, file)?;
+    let lock = LOCKFILES
+        .iter()
+        .find(|(name, _)| tree.iter().any(|p| *p == join(&dir, name)))
+        .or_else(|| {
+            LOCKFILES
+                .iter()
+                .find(|(name, _)| tree.iter().any(|p| p == name))
+        });
+    let own = lock.is_some_and(|(n, _)| tree.iter().any(|p| *p == join(&dir, n)));
+    let pj = read(&join(&dir, "package.json")).unwrap_or_default();
+    let runner = runner_of(&pj).or_else(|| {
+        (!dir.is_empty())
+            .then(|| read("package.json"))
+            .flatten()
+            .and_then(|r| runner_of(&r))
+    });
+    let rel = if dir.is_empty() {
+        file.to_string()
+    } else {
+        file.strip_prefix(&format!("{dir}/"))
+            .unwrap_or(file)
+            .to_string()
+    };
+    // Inside a workspace, dependencies install from its root.
+    let install_dir = if own || dir.is_empty() {
+        dir.clone()
+    } else {
+        String::new()
+    };
+    Some(TestPackage {
+        dir: if dir.is_empty() {
+            ".".into()
+        } else {
+            dir.clone()
+        },
+        manager: lock.map(|(_, m)| *m).unwrap_or(Manager::Npm),
+        lockfile: lock.map(|(n, _)| join(&install_dir, n)),
+        has_tsconfig: tree.iter().any(|p| *p == join(&dir, "tsconfig.json")),
+        lint: has_eslint(tree, &dir, &pj),
+        runner,
+        files: vec![rel],
+    })
+}
+
 /// Single-quotes a path for the shell; `None` when it can't be quoted safely.
 fn q(s: &str) -> Option<String> {
     let ok = !s.is_empty()
@@ -720,5 +773,35 @@ mod tests {
                 "e2e/fixtures.js"
             ]
         );
+    }
+
+    #[test]
+    fn any_spec_has_a_package_to_repeat_it_in() {
+        let t = tree(&[
+            "package.json",
+            "package-lock.json",
+            "tests/items.spec.ts",
+            "e2e/package.json",
+            "e2e/yarn.lock",
+            "e2e/a.spec.ts",
+        ]);
+        let read = |p: &str| match p {
+            "package.json" => Some(PW.to_string()),
+            "e2e/package.json" => Some(r#"{"devDependencies":{"cypress":"13"}}"#.to_string()),
+            _ => None,
+        };
+        let root = package_of(&t, "tests/items.spec.ts", &read).unwrap();
+        assert_eq!(root.dir, ".");
+        assert_eq!(root.runner, Some(Runner::Playwright));
+        assert_eq!(root.files, vec!["tests/items.spec.ts"]);
+        assert!(repeat_cmd(&root, &root.files, 20, None)
+            .unwrap()
+            .starts_with("cd '.' && "));
+        let own = package_of(&t, "e2e/a.spec.ts", &read).unwrap();
+        assert_eq!(
+            (own.dir.as_str(), own.manager, own.runner),
+            ("e2e", Manager::Yarn, Some(Runner::Cypress))
+        );
+        assert!(package_of(&tree(&["a.spec.ts"]), "a.spec.ts", &read).is_none());
     }
 }
