@@ -1,0 +1,81 @@
+{
+  "description": "A person asks for a re-review of a commit already approved and nothing changed: the verdict is posted again, visibly, saying it is unchanged and why. Then the person pushes a docs-free code commit with nothing new to say: that commit gets its own visible review too.",
+  "steps": [
+    {
+      "push": {
+        "head": "b0b0b01"
+      }
+    },
+    {
+      "review": {
+        "trigger": "synchronize",
+        "dedup_key": "head#b0b0b01",
+        "model": {
+          "verdict": "APPROVE",
+          "summary": "ok",
+          "findings": []
+        }
+      }
+    },
+    {
+      "comment": {
+        "by": "dev-a",
+        "text": "@coderhelm re-review"
+      }
+    },
+    {
+      "review": {
+        "trigger": "rerequest",
+        "dedup_key": "rerequest#b0b0b01",
+        "model": {
+          "verdict": "APPROVE",
+          "summary": "ok",
+          "findings": []
+        }
+      }
+    },
+    {
+      "push": {
+        "head": "b0b0b02",
+        "changed": {
+          "src/app.rs": [
+            3
+          ]
+        }
+      }
+    },
+    {
+      "review": {
+        "trigger": "synchronize",
+        "dedup_key": "head#b0b0b02",
+        "model": {
+          "verdict": "APPROVE",
+          "summary": "ok",
+          "findings": []
+        }
+      }
+    }
+  ],
+  "expect": {
+    "formal": [
+      [
+        "b0b0b01",
+        "APPROVE"
+      ],
+      [
+        "b0b0b01",
+        "APPROVE"
+      ],
+      [
+        "b0b0b02",
+        "APPROVE"
+      ]
+    ],
+    "body_contains": [
+      [
+        1,
+        "Unchanged since my last review of `b0b0b01`: approve"
+      ]
+    ]
+  }
+}

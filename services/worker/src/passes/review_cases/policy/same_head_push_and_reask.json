@@ -1,20 +1,70 @@
 {
-  "description": "A push review and a person's re-review ask of the same commit ran together; the ask read the gateway's claim under the wrong field, ran anyway, and posted request-changes seconds after the approval. Then a re-label of the reviewed commit started a third review.",
+  "description": "A push review and a person's re-review ask of the same commit ran together; the ask read the gateway's claim under the wrong field, ran anyway, and posted request-changes seconds after the approval. Now the ask waits for the running review and then answers with its own visible verdict, which keeps the approval (nothing new). A later re-label of the reviewed commit is not reviewed again.",
   "steps": [
-    {"push": {"head": "c0ffee1"}},
-    {"together": [
-      {"trigger": "synchronize", "dedup_key": "head#c0ffee1",
-       "model": {"verdict": "APPROVE", "summary": "Adds a retry around the export call.", "findings": []}},
-      {"trigger": "reply", "dedup_key": "reply#501",
-       "model": {"verdict": "REQUEST_CHANGES", "summary": "x", "findings": [
-         {"file": "src/export.rs", "line": 40, "severity": "high", "category": "bug", "evidence": "verified-defect", "title": "Retry never stops", "body": "The loop has no bound."}
-       ]}}
-    ]},
-    {"claims_expire": {}},
-    {"review": {"trigger": "labeled", "dedup_key": "head#c0ffee1"}}
+    {
+      "push": {
+        "head": "c0ffee1"
+      }
+    },
+    {
+      "together": [
+        {
+          "trigger": "synchronize",
+          "dedup_key": "head#c0ffee1",
+          "model": {
+            "verdict": "APPROVE",
+            "summary": "Adds a retry around the export call.",
+            "findings": []
+          }
+        },
+        {
+          "trigger": "reply",
+          "dedup_key": "reply#501",
+          "model": {
+            "verdict": "REQUEST_CHANGES",
+            "summary": "x",
+            "findings": [
+              {
+                "file": "src/export.rs",
+                "line": 40,
+                "severity": "high",
+                "category": "bug",
+                "evidence": "verified-defect",
+                "title": "Retry never stops",
+                "body": "The loop has no bound."
+              }
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "claims_expire": {}
+    },
+    {
+      "review": {
+        "trigger": "labeled",
+        "dedup_key": "head#c0ffee1"
+      }
+    }
   ],
   "expect": {
-    "formal": [["c0ffee1", "APPROVE"]],
-    "skipped": 2
+    "formal": [
+      [
+        "c0ffee1",
+        "APPROVE"
+      ],
+      [
+        "c0ffee1",
+        "APPROVE"
+      ]
+    ],
+    "skipped": 2,
+    "body_contains": [
+      [
+        1,
+        "my earlier verdict (approve) stands"
+      ]
+    ]
   }
 }

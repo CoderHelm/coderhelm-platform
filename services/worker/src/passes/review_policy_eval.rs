@@ -124,6 +124,8 @@ struct Sim {
     threads: Vec<Thread>,
     lessons: Vec<String>,
     skipped: usize,
+    /// Asks waiting for a running review of their commit.
+    deferred: Vec<ReviewStep>,
     minute: i64,
     violations: Vec<String>,
 }
@@ -173,7 +175,10 @@ impl Sim {
         if policy::takes_head_claim(&step.trigger) {
             let sk = policy::head_claim_sk("acme", "app", 7, &head);
             if !self.claims.insert(sk) && policy::review_of_head(&self.records, &head).is_none() {
+                // Another review of the commit is running: the ask waits for
+                // it and answers after (`deferred_ask`).
                 self.skipped += 1;
+                self.deferred.push(step.clone());
                 return None;
             }
         }
@@ -257,6 +262,7 @@ impl Sim {
             &mut findings,
             new_info.as_deref(),
             &out.change_of_mind,
+            policy::trigger_kind(&job.step.trigger) == policy::TriggerKind::Explicit,
         );
         // Invariant (b).
         if let Some(prev) = &same_head {
@@ -311,6 +317,24 @@ impl Sim {
             Decision::Post { .. } if !self.claims.insert(sk) => Decision::Nothing,
             d => d,
         };
+        // Invariant (c): a person's ask always gets a visible verdict, and so
+        // does a commit a person pushed.
+        if !matches!(decision, Decision::Post { .. }) {
+            if explicit {
+                self.violations.push(format!(
+                    "a person's {} ask on {} got no visible verdict",
+                    job.step.trigger, job.head
+                ));
+            }
+            if prev.as_ref().is_some_and(|p| p.head_sha != job.head)
+                || (prev.is_none() && !self.formal.iter().any(|f| f.head == job.head))
+            {
+                self.violations.push(format!(
+                    "the pushed commit {} got no visible review",
+                    job.head
+                ));
+            }
+        }
         let at = self.tick();
         if let Decision::Post { event, .. } = decision {
             let mut body = String::new();
@@ -405,6 +429,12 @@ impl Sim {
                     let jobs: Vec<Job> = rs.iter().filter_map(|r| sim.begin(r, group)).collect();
                     for job in jobs {
                         sim.finish(job);
+                    }
+                    // The asks that waited run once the running review is done.
+                    for r in std::mem::take(&mut sim.deferred) {
+                        if let Some(job) = sim.begin(&r, group + 1000) {
+                            sim.finish(job);
+                        }
                     }
                 }
             }

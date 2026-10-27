@@ -77,6 +77,29 @@ pub fn verdict_claim_sk(
     format!("REVIEWVERDICT#{owner}/{name}#{pr:06}#{head}#{kind}")
 }
 
+/// How long a person's ask waits for a running review of the same commit
+/// before it runs, and how many times it waits.
+pub const ASK_WAIT_SECS: u64 = 180;
+pub const ASK_MAX_WAITS: u32 = 3;
+
+/// A person's re-review ask that found another review of the same commit
+/// still running: the same ask again, a little later, under its own dedup
+/// key, so it answers the person once that review has finished. `None` once
+/// it has waited [`ASK_MAX_WAITS`] times: it runs now instead.
+pub fn deferred_ask(msg: &crate::models::ReviewMessage) -> Option<crate::models::ReviewMessage> {
+    let (base, waited) = match msg.dedup_key.rsplit_once("#waited") {
+        Some((b, n)) => (b.to_string(), n.parse::<u32>().unwrap_or(ASK_MAX_WAITS)),
+        None => (msg.dedup_key.clone(), 0),
+    };
+    if waited >= ASK_MAX_WAITS {
+        return None;
+    }
+    let mut next = msg.clone();
+    next.dedup_key = format!("{base}#waited{}", waited + 1);
+    next.wait_secs = 0;
+    Some(next)
+}
+
 /// CoderHelm's finished review of `head`, if it has one (newest first).
 pub fn review_of_head<'a>(records: &'a [ReviewRecord], head: &str) -> Option<&'a ReviewRecord> {
     records.iter().find(|r| {
@@ -486,7 +509,8 @@ pub struct Stable {
 }
 
 /// Rule 2. `previous` is CoderHelm's finished review of this same head, if
-/// any. `new_info` names what is new since it (a person's comment, a reply
+/// any. `explicit`: a person asked; a verdict that didn't change then says so
+/// (a person's ask always gets a visible answer). `new_info` names what is new since it (a person's comment, a reply
 /// the formal review must follow); without it the earlier verdict stands and
 /// new blockers become notes. With it, the change is explained with
 /// `change_of_mind` (the reviewer's own sentence) or `new_info`.
@@ -496,6 +520,7 @@ pub fn stabilize(
     findings: &mut [Finding],
     new_info: Option<&str>,
     change_of_mind: &str,
+    explicit: bool,
 ) -> Stable {
     let unchanged = Stable {
         verdict,
@@ -507,10 +532,23 @@ pub fn stabilize(
         return unchanged;
     };
     let before = super::review_verdict::binary(&prev.verdict);
-    if before == verdict {
-        return unchanged;
-    }
     let short = &prev.head_sha[..prev.head_sha.len().min(7)];
+    if before == verdict {
+        if !explicit {
+            return unchanged;
+        }
+        let because = match new_info {
+            Some(info) => format!("{} doesn't change it", info.trim()),
+            None => "the code is the same and nothing new came up since".to_string(),
+        };
+        return Stable {
+            note: Some(format!(
+                "**Unchanged since my last review of `{short}`: {}**, because {because}.",
+                human(verdict)
+            )),
+            ..unchanged
+        };
+    }
     if let Some(info) = new_info {
         let why = if change_of_mind.trim().is_empty() {
             info.trim().to_string()
@@ -633,6 +671,48 @@ mod tests {
         );
         assert!(takes_head_claim("reply") && takes_head_claim("rerequest"));
         assert!(!takes_head_claim("synchronize") && !takes_head_claim("reconcile"));
+    }
+
+    /// A person's re-review ask always gets a visible answer: an unchanged
+    /// verdict says it is unchanged, and why.
+    #[test]
+    fn an_explicit_ask_with_the_same_verdict_says_it_is_unchanged() {
+        let prev = rec("h1aaaaaaa", "APPROVE", "2026-10-01T00:00:00Z");
+        let s = stabilize(Some(&prev), "APPROVE", &mut [], None, "", true);
+        assert_eq!(s.verdict, "APPROVE");
+        let note = s.note.unwrap();
+        assert!(note.contains("Unchanged since my last review of `h1aaaaa`: approve"));
+        assert!(note.contains("because the code is the same"));
+        let s = stabilize(
+            Some(&prev),
+            "APPROVE",
+            &mut [],
+            Some("what dev wrote since my last review"),
+            "",
+            true,
+        );
+        assert!(s
+            .note
+            .unwrap()
+            .contains("what dev wrote since my last review doesn't change it"));
+    }
+
+    #[test]
+    fn an_ask_that_meets_a_running_review_waits_for_it_then_runs() {
+        let msg = crate::models::ReviewMessage {
+            trigger: "reply".into(),
+            dedup_key: "reply#42".into(),
+            ..Default::default()
+        };
+        let once = deferred_ask(&msg).unwrap();
+        assert_eq!(once.dedup_key, "reply#42#waited1");
+        assert_eq!(once.trigger, "reply");
+        let mut last = once;
+        for _ in 1..ASK_MAX_WAITS {
+            last = deferred_ask(&last).unwrap();
+        }
+        assert_eq!(last.dedup_key, format!("reply#42#waited{ASK_MAX_WAITS}"));
+        assert!(deferred_ask(&last).is_none(), "after the last wait it runs");
     }
 
     #[test]
@@ -871,14 +951,14 @@ mod tests {
     fn a_verdict_never_flips_on_an_unchanged_head_without_news() {
         let prev = rec("h1aaaaaaa", "APPROVE", "2026-10-01T00:00:00Z");
         let mut fs = vec![defect("a.rs", 1, "high", "bug")];
-        let s = stabilize(Some(&prev), "REQUEST_CHANGES", &mut fs, None, "");
+        let s = stabilize(Some(&prev), "REQUEST_CHANGES", &mut fs, None, "", true);
         assert_eq!(s.verdict, "APPROVE");
         assert!(s.held && s.flipped_from.is_none());
         assert!(!fs[0].holds_merge());
         assert!(s.note.unwrap().contains("stands"));
 
         let prev_rc = rec("h1aaaaaaa", "REQUEST_CHANGES", "2026-10-01T00:00:00Z");
-        let s = stabilize(Some(&prev_rc), "APPROVE", &mut [], None, "");
+        let s = stabilize(Some(&prev_rc), "APPROVE", &mut [], None, "", false);
         assert_eq!(s.verdict, "REQUEST_CHANGES");
         assert!(s.held);
 
@@ -890,16 +970,18 @@ mod tests {
             &mut fs,
             Some("dev's reply"),
             "dev confirmed the field is null for refunds, which this code dereferences",
+            true,
         );
         assert_eq!(s.verdict, "REQUEST_CHANGES");
         assert_eq!(s.flipped_from.as_deref(), Some("APPROVE"));
         assert!(s.note.unwrap().contains("null for refunds"));
         assert!(fs[0].holds_merge());
 
-        // Same verdict, or no earlier review of this head: nothing to say.
-        let s = stabilize(Some(&prev), "APPROVE", &mut [], None, "");
+        // Same verdict on an automatic trigger, or no earlier review of this
+        // head: nothing to say.
+        let s = stabilize(Some(&prev), "APPROVE", &mut [], None, "", false);
         assert_eq!(s.note, None);
-        let s = stabilize(None, "REQUEST_CHANGES", &mut [], None, "");
+        let s = stabilize(None, "REQUEST_CHANGES", &mut [], None, "", true);
         assert_eq!((s.verdict, s.held), ("REQUEST_CHANGES", false));
     }
 }

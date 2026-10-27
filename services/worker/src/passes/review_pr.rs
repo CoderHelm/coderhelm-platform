@@ -1283,13 +1283,23 @@ async fn run_once(
         )
         .await
         {
+            // Another review of this commit is still running. The person's
+            // ask is answered after it, with its own visible verdict: the
+            // ask waits and runs again (and runs anyway after the last wait).
             common::claim::Claim::Held
                 if super::review_policy::review_of_head(&records, &head_sha).is_none() =>
             {
-                info!(pr = msg.pr_number, head = %head_sha, trigger = %msg.trigger, "Re-review ask skipped — this commit is already being reviewed");
-                return Ok(Outcome::Skipped {
-                    reason: "This commit is already being reviewed; that review answers.".into(),
-                });
+                if let Some(later) = super::review_policy::deferred_ask(&msg) {
+                    if enqueue_review(state, &later, super::review_policy::ASK_WAIT_SECS).await {
+                        info!(pr = msg.pr_number, head = %head_sha, trigger = %msg.trigger, dedup_key = %later.dedup_key, "Re-review ask waits for the running review of this commit, then answers");
+                        return Ok(Outcome::Skipped {
+                            reason: "This commit is already being reviewed; your ask is answered \
+                                     right after that review."
+                                .into(),
+                        });
+                    }
+                }
+                info!(pr = msg.pr_number, head = %head_sha, "Re-review ask runs now (waited enough, or couldn't wait)");
             }
             common::claim::Claim::Failed(e) => {
                 warn!(pr = msg.pr_number, error = %e, "Review head claim errored — reviewing (fail-open)");
@@ -2097,6 +2107,8 @@ async fn run_once(
         &mut findings,
         new_info.as_deref(),
         &output.change_of_mind,
+        super::review_policy::trigger_kind(&msg.trigger)
+            == super::review_policy::TriggerKind::Explicit,
     );
     if stable.held {
         info!(pr = msg.pr_number, head = %head_sha, kept = stable.verdict, model_verdict = verdict, "Verdict kept on an unchanged commit — nothing new since the last review");
@@ -2274,9 +2286,11 @@ async fn run_once(
         && !head_commit_by_bot(&compare, &head_sha);
     // A push and a re-review ask for the same commit run two reviews; the
     // first to finish speaks for both.
-    let already_answered = prev
-        .as_ref()
-        .is_some_and(|p| p.head_sha == head_sha && p.created_at >= job_started);
+    // A person's ask is never silenced by it: it always gets its own answer.
+    let already_answered = !explicit
+        && prev
+            .as_ref()
+            .is_some_and(|p| p.head_sha == head_sha && p.created_at >= job_started);
     let decision = super::review_verdict::decide(
         super::review_verdict::Input::Review {
             verdict,
