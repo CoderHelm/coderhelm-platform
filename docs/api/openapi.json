@@ -3171,6 +3171,23 @@
               "null"
             ]
           },
+          "prs": {
+            "description": "Every pull request the run opened, each with its own repository\n(`repo`, `pr_number`, `branch`, `url`, and `outcome` once it ended).\nBuild links and labels from these: in a run across several\nrepositories, `repo` and `pr_numbers` don't pair up.",
+            "examples": [
+              [
+                {
+                  "branch": "coderhelm/web-42-login-rate-limit",
+                  "pr_number": 318,
+                  "repo": "acme/web",
+                  "url": "https://github.com/acme/web/pull/318"
+                }
+              ]
+            ],
+            "items": {
+              "type": "object"
+            },
+            "type": "array"
+          },
           "questions": {
             "description": "What the run asked when it stopped as `needs_input`, one question\neach. Answer them with `POST /api/runs/{run_id}/answer`. Empty when\nit asked nothing it can take answers for here.",
             "items": {
@@ -3301,6 +3318,7 @@
         },
         "required": [
           "run_id",
+          "prs",
           "tokens_in",
           "tokens_out",
           "cache_read_tokens",

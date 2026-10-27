@@ -83,6 +83,7 @@ mod model_call_sites;
 pub mod paged;
 /// What happened to a PR Coderhelm opened, read from GitHub.
 pub mod pr_outcome;
+pub mod run_prs;
 // review_stats: time-ordered review records for analytics
 pub mod jira_text;
 /// Anthropic API or Amazon Bedrock, and Bedrock's model ids.

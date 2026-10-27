@@ -1018,6 +1018,12 @@ pub struct Run {
     /// Their branches, in the same order.
     #[schema(example = json!(["coderhelm/web-42-login-rate-limit"]))]
     pub branches: Option<Vec<String>>,
+    /// Every pull request the run opened, each with its own repository
+    /// (`repo`, `pr_number`, `branch`, `url`, and `outcome` once it ended).
+    /// Build links and labels from these: in a run across several
+    /// repositories, `repo` and `pr_numbers` don't pair up.
+    #[schema(value_type = Vec<Object>, example = json!([{"repo": "acme/web", "pr_number": 318, "branch": "coderhelm/web-42-login-rate-limit", "url": "https://github.com/acme/web/pull/318"}]))]
+    pub prs: Vec<common::run_prs::RunPr>,
     /// The step the run is on or ended on.
     #[schema(example = "pr")]
     pub current_pass: Option<String>,
@@ -1432,6 +1438,7 @@ fn run_of(
                     .collect()
             }),
         branches: strings("branches"),
+        prs: common::run_prs::from_item(item),
         current_pass: st("current_pass"),
         tokens_in,
         tokens_out,

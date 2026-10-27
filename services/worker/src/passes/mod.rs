@@ -3456,43 +3456,49 @@ async fn run_passes(
             let now = chrono::Utc::now().to_rfc3339();
             let delta = usage.unrecorded();
 
-            // Build PR list attributes
-            let pr_urls: Vec<AttributeValue> =
-                pr_results.iter().map(|p| attr_s(&p.pr_url)).collect();
-            let pr_numbers: Vec<AttributeValue> =
-                pr_results.iter().map(|p| attr_n(p.pr_number)).collect();
-            let branches: Vec<AttributeValue> =
-                pr_results.iter().map(|p| attr_s(&p.branch)).collect();
+            // Each pull request with its own repository; the record's repo,
+            // number, branch and URL all come from one of them (the one in
+            // the run's repo when there is one), never mixed across repos.
+            let run_prs: Vec<common::run_prs::RunPr> = pr_results
+                .iter()
+                .map(|p| common::run_prs::RunPr {
+                    repo: format!("{}/{}", p.repo.0, p.repo.1),
+                    pr_number: p.pr_number,
+                    branch: p.branch.clone(),
+                    url: p.pr_url.clone(),
+                    outcome: String::new(),
+                })
+                .collect();
+            let run_repo = format!("{}/{}", msg.repo_owner, msg.repo_name);
+            let primary = common::run_prs::primary(&run_prs, &run_repo)
+                .cloned()
+                .unwrap_or_default();
 
-            // Store first PR as primary for backward compat, plus full lists
-            let multi_res = state
+            let (prs_clause, prs_values) = common::run_prs::set_clause(&run_prs);
+            let mut multi = state
                 .dynamo
                 .update_item()
                 .table_name(&state.config.runs_table_name)
                 .key("team_id", attr_s(&msg.team_id))
                 .key("run_id", attr_s(run_id))
-                .update_expression(
-                    "SET #status = :s, pr_url = :pr, pr_number = :pn, branch = :b, \
-                     pr_urls = :prs, pr_numbers = :pns, branches = :bs, \
+                .update_expression(format!(
+                    "SET #status = :s, pr_url = :pr, pr_number = :pn, branch = :b, {prs_clause}, \
                      repo = :repo, team_repo = :tr, \
                      tokens_in = if_not_exists(tokens_in, :uzero) + :ti, tokens_out = if_not_exists(tokens_out, :uzero) + :to, \
              cache_read_tokens = if_not_exists(cache_read_tokens, :uzero) + :crt, cache_write_tokens = if_not_exists(cache_write_tokens, :uzero) + :cwt, \
              cost_usd = if_not_exists(cost_usd, :uzero) + :c, duration_s = :d, updated_at = :t, current_pass = :cp, \
                      status_run_id = :sri, mcp_servers = :mcp",
-                )
+                ))
                 .expression_attribute_names("#status", "status")
                 // Never resurrect a cancelled run (mirrors the single-repo guard).
                 .condition_expression(common::run_status::not_ended("#status"))
                 .ended_values()
                 .expression_attribute_values(":s", attr_s("awaiting_ci"))
-                .expression_attribute_values(":pr", attr_s(&pr_results[0].pr_url))
-                .expression_attribute_values(":pn", attr_n(pr_results[0].pr_number))
-                .expression_attribute_values(":b", attr_s(&pr_results[0].branch))
-                .expression_attribute_values(":prs", AttributeValue::L(pr_urls))
-                .expression_attribute_values(":pns", AttributeValue::L(pr_numbers))
-                .expression_attribute_values(":bs", AttributeValue::L(branches))
-                .expression_attribute_values(":repo", attr_s(&format!("{}/{}", msg.repo_owner, msg.repo_name)))
-                .expression_attribute_values(":tr", attr_s(&format!("{}#{}/{}", msg.team_id, msg.repo_owner, msg.repo_name)))
+                .expression_attribute_values(":pr", attr_s(&primary.url))
+                .expression_attribute_values(":pn", attr_n(primary.pr_number))
+                .expression_attribute_values(":b", attr_s(&primary.branch))
+                .expression_attribute_values(":repo", attr_s(&primary.repo))
+                .expression_attribute_values(":tr", attr_s(&format!("{}#{}", msg.team_id, primary.repo)))
                 .usage_values(&delta)
                 .expression_attribute_values(":d", attr_n(duration))
                 .expression_attribute_values(":t", attr_s(&now))
@@ -3501,9 +3507,11 @@ async fn run_passes(
                 .expression_attribute_values(
                     ":mcp",
                     AttributeValue::L(used_mcp_ids.iter().map(|id| attr_s(id)).collect()),
-                )
-                .send()
-                .await;
+                );
+            for (name, value) in prs_values {
+                multi = multi.expression_attribute_values(name, value);
+            }
+            let multi_res = multi.send().await;
             if let Err(e) = multi_res {
                 if format!("{e:?}").contains("ConditionalCheckFailed") {
                     info!(

@@ -1285,30 +1285,18 @@ async fn handle_pull_request(
     let repo = &payload["repository"];
     let owner = repo["owner"]["login"].as_str().unwrap_or("");
     let name = repo["name"].as_str().unwrap_or("");
-    let team_repo = format!("{team_id}#{owner}/{name}");
 
-    // Query repo-index GSI to find the run with this PR number
-    let result = state
-        .dynamo
-        .query()
-        .table_name(&state.config.runs_table_name)
-        .index_name("repo-index")
-        .key_condition_expression("team_repo = :tr")
-        .filter_expression("pr_number = :pn")
-        .expression_attribute_values(":tr", attr_s(&team_repo))
-        .expression_attribute_values(":pn", attr_n(pr_number))
-        .scan_index_forward(false)
-        // Limit applies BEFORE the filter — limit(1) only ever examined the
-        // repo's newest run, dropping feedback/merge events for older PRs.
-        .limit(50)
-        .send()
-        .await
-        .map_err(|e| {
-            error!("Failed to query run for merged PR: {e}");
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
-
-    if let Some(item) = result.items().first() {
+    // The run that opened this PR: its own PR, or one of a multi-repo run's.
+    let found = lookup_run_item_by_pr(state, team_id, owner, name, pr_number).await;
+    // A multi-repo run's other PR: its own outcome goes on its entry in
+    // `prs`; the run's status and outcome follow the PR its record names.
+    let is_primary = found
+        .as_ref()
+        .is_some_and(|i| common::run_prs::is_primary(i, &format!("{owner}/{name}"), pr_number));
+    if let Some(item) = found.as_ref().filter(|_| !is_primary) {
+        record_secondary_pr_outcome(state, team_id, item, owner, name, pr_number, merged).await;
+    }
+    if let Some(item) = found.as_ref() {
         let run_id = item
             .get("run_id")
             .and_then(|v| v.as_s().ok())
@@ -1319,7 +1307,8 @@ async fn handle_pull_request(
             // Closed without merging: the run keeps its status; analytics
             // record the outcome so merge rate counts it honestly.
             let pr = &payload["pull_request"];
-            let _ = state
+            if is_primary {
+                let _ = state
                 .dynamo
                 .update_item()
                 .table_name(&state.config.runs_table_name)
@@ -1332,6 +1321,7 @@ async fn handle_pull_request(
                 .send()
                 .await
                 .map_err(|e| error!(team_id, run_id, pr_number, error = %e, "Could not record the closed PR on the run"));
+            }
             info!(
                 team_id,
                 run_id, pr_number, "PR closed without merging — outcome recorded"
@@ -1364,7 +1354,20 @@ async fn handle_pull_request(
             .await;
             return Ok(StatusCode::OK);
         }
-        if !run_id.is_empty() {
+        if !run_id.is_empty() && !is_primary {
+            // A multi-repo run's other PR merged: scored like any other; the
+            // run's status follows the PR its record names.
+            queue_reward_outcome(
+                state,
+                team_id,
+                installation_id,
+                &run_id,
+                owner,
+                name,
+                pr_number,
+            )
+            .await;
+        } else if !run_id.is_empty() {
             let now = chrono::Utc::now().to_rfc3339();
             let pr = &payload["pull_request"];
             // Commits people pushed on top of Coderhelm's: none means it
@@ -1450,6 +1453,48 @@ async fn handle_pull_request(
     }
 
     Ok(StatusCode::OK)
+}
+
+/// A multi-repo run's PR that isn't the one its record names closed: its
+/// entry in `prs` gets the outcome, and it is scored and learned from like
+/// any other (with its own repository and number).
+#[allow(clippy::too_many_arguments)]
+async fn record_secondary_pr_outcome(
+    state: &AppState,
+    team_id: &str,
+    item: &common::paged::Item,
+    owner: &str,
+    name: &str,
+    pr_number: u64,
+    merged: bool,
+) {
+    let Some(run_id) = common::paged::run_id_of(item) else {
+        return;
+    };
+    let prs = common::run_prs::from_item(item);
+    if let Some(i) = common::run_prs::position(&prs, &format!("{owner}/{name}"), pr_number) {
+        if item.contains_key(common::run_prs::FIELD) {
+            let outcome = if merged { "merged" } else { "closed" };
+            if let Err(e) = state
+                .dynamo
+                .update_item()
+                .table_name(&state.config.runs_table_name)
+                .key("team_id", attr_s(team_id))
+                .key("run_id", attr_s(&run_id))
+                .update_expression(format!("SET prs[{i}].outcome = :o, updated_at = :t"))
+                .expression_attribute_values(":o", attr_s(outcome))
+                .expression_attribute_values(":t", attr_s(&chrono::Utc::now().to_rfc3339()))
+                .send()
+                .await
+            {
+                warn!(team_id, run_id, pr_number, error = %e, "Could not record the PR's outcome on its run");
+            }
+        }
+    }
+    info!(
+        team_id,
+        run_id, pr_number, merged, "A multi-repo run's other PR closed"
+    );
 }
 
 /// Hands a closed CoderHelm pull request to the worker to score (merged as
@@ -2558,16 +2603,26 @@ async fn find_run_by_branch(
         return Some(run_id);
     }
 
-    // Fallback: multi-repo runs store secondary branches in `branches` list.
-    // Query team partition and check if this branch is in the list.
+    // Fallback: a multi-repo run's other branches, by repository and branch
+    // (`branch_keys`); records from before them by branch name alone.
     let fallback = state
         .dynamo
         .query()
         .table_name(&state.config.runs_table_name)
         .key_condition_expression("team_id = :tid")
-        .filter_expression("contains(branches, :b) AND (#s = :s1 OR #s = :s2)")
+        .filter_expression(
+            "(contains(branch_keys, :bk) OR (attribute_not_exists(branch_keys) AND contains(branches, :b))) \
+             AND (#s = :s1 OR #s = :s2)",
+        )
         .expression_attribute_names("#s", "status")
         .expression_attribute_values(":tid", attr_s(team_id))
+        .expression_attribute_values(
+            ":bk",
+            attr_s(&common::run_prs::branch_key(
+                &format!("{repo_owner}/{repo_name}"),
+                branch,
+            )),
+        )
         .expression_attribute_values(":b", attr_s(branch))
         .expression_attribute_values(":s1", attr_s("awaiting_ci"))
         .expression_attribute_values(":s2", attr_s("running"))
@@ -3463,7 +3518,24 @@ async fn lookup_run_by_pr(
     name: &str,
     pr_number: u64,
 ) -> String {
-    // First try the repo-index GSI (fast path — works for primary repo)
+    lookup_run_item_by_pr(state, team_id, owner, name, pr_number)
+        .await
+        .as_ref()
+        .and_then(common::paged::run_id_of)
+        .unwrap_or_default()
+}
+
+/// The run that opened `owner/name#pr_number`: its record's own PR (the
+/// repo-index GSI), else one of a multi-repo run's PRs, matched by
+/// repository AND number (`pr_keys`). A number alone matched a PR of the
+/// same number in an unrelated repository.
+async fn lookup_run_item_by_pr(
+    state: &AppState,
+    team_id: &str,
+    owner: &str,
+    name: &str,
+    pr_number: u64,
+) -> Option<common::paged::Item> {
     let team_repo = format!("{team_id}#{owner}/{name}");
     // Limit applies BEFORE the filter, so a single page only examined the
     // repo's newest 50 runs and dropped events for older PRs. Follow
@@ -3479,29 +3551,36 @@ async fn lookup_run_by_pr(
         .expression_attribute_values(":pn", attr_n(pr_number))
         .scan_index_forward(false)
         .limit(50);
-    match common::paged::query_first_match(primary, common::paged::run_id_of).await {
-        Ok(Some(run_id)) => return run_id,
+    match common::paged::query_first_match(primary, |i| Some(i.clone())).await {
+        Ok(Some(item)) => return Some(item),
         Ok(None) => {}
         Err(e) => error!("Failed to query run by PR number: {e}"),
     }
 
-    // Fallback: multi-repo runs store secondary PRs in pr_numbers list.
-    // Query the team partition and check the list attribute, every page.
+    // Fallback: a multi-repo run's other PRs, by repository and number.
+    // Records from before `pr_keys` are matched by the PR's URL.
+    let repo = format!("{owner}/{name}");
     let fallback = state
         .dynamo
         .query()
         .table_name(&state.config.runs_table_name)
         .key_condition_expression("team_id = :tid")
-        .filter_expression("contains(pr_numbers, :pn)")
+        .filter_expression(
+            "contains(pr_keys, :k) OR (attribute_not_exists(pr_keys) AND contains(pr_urls, :u))",
+        )
         .expression_attribute_values(":tid", attr_s(team_id))
-        .expression_attribute_values(":pn", attr_n(pr_number))
+        .expression_attribute_values(":k", attr_s(&common::run_prs::pr_key(&repo, pr_number)))
+        .expression_attribute_values(
+            ":u",
+            attr_s(&format!("https://github.com/{repo}/pull/{pr_number}")),
+        )
         .scan_index_forward(false)
         .limit(100);
-    match common::paged::query_first_match(fallback, common::paged::run_id_of).await {
-        Ok(found) => found.unwrap_or_default(),
+    match common::paged::query_first_match(fallback, |i| Some(i.clone())).await {
+        Ok(found) => found,
         Err(e) => {
             error!("Failed to query run by PR number (fallback): {e}");
-            String::new()
+            None
         }
     }
 }
