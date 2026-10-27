@@ -78,6 +78,10 @@ pub enum Kind {
     /// pull request in a fresh invocation, and the pull request stays a
     /// draft until the issues are gone.
     SecurityFix,
+    /// The pull request conflicts with its base and auto-merge stopped on
+    /// it: CoderHelm merges the base into its own pull request's branch,
+    /// once (`await_merge`).
+    Conflict,
 }
 
 impl Kind {
@@ -87,6 +91,7 @@ impl Kind {
             Kind::ReviewFix => "review_fix",
             Kind::Feedback => "feedback",
             Kind::SecurityFix => "security_fix",
+            Kind::Conflict => "conflict_fix",
         }
     }
 
@@ -96,6 +101,7 @@ impl Kind {
             "review_fix" => Some(Kind::ReviewFix),
             "feedback" => Some(Kind::Feedback),
             "security_fix" => Some(Kind::SecurityFix),
+            "conflict_fix" => Some(Kind::Conflict),
             _ => None,
         }
     }
@@ -107,6 +113,7 @@ impl Kind {
             "ci_fix" | "test" => Kind::CiFix,
             "feedback" => Kind::Feedback,
             "security_fix" => Kind::SecurityFix,
+            "conflict_fix" => Kind::Conflict,
             _ => Kind::ReviewFix,
         }
     }
@@ -118,6 +125,7 @@ impl Kind {
             Kind::ReviewFix => "review fix round",
             Kind::Feedback => "feedback round",
             Kind::SecurityFix => "security fix round",
+            Kind::Conflict => "conflict round",
         }
     }
 }

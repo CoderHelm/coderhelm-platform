@@ -3085,7 +3085,7 @@ async fn plan_evidence_for_pr(state: &WorkerState, msg: &ReviewMessage) -> Strin
 }
 
 /// Newest run for a PR, via the runs-table repo-index GSI. None if untracked.
-async fn lookup_run_by_pr(
+pub(crate) async fn lookup_run_by_pr(
     state: &WorkerState,
     team_id: &str,
     owner: &str,
