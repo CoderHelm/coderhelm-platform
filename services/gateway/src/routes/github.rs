@@ -142,12 +142,87 @@ pub async fn installation_status(
         .map(|s| s.to_string());
 
     match (installation_id, github_org) {
-        (Some(id), Some(org)) => Ok(Json(json!({
-            "status": "connected",
-            "github_org": org,
-            "installation_id": id,
-        }))),
+        (Some(id), Some(org)) => {
+            // Another team receives this installation's events: this team's
+            // link is stale (an older sign-in's team). Its admins see that
+            // and can release it.
+            let owner = super::github_webhook::resolve_team_by_installation(&state, id).await;
+            if owner.as_deref().is_some_and(|o| o != claims.team_id) {
+                return Ok(Json(json!({
+                    "status": "stale",
+                    "github_org": org,
+                    "installation_id": id,
+                    "message": stale_message(&org),
+                })));
+            }
+            Ok(Json(json!({
+                "status": "connected",
+                "github_org": org,
+                "installation_id": id,
+            })))
+        }
         _ => Ok(Json(json!({ "status": "not_connected" }))),
+    }
+}
+
+/// What a team whose link is stale is told.
+fn stale_message(org: &str) -> String {
+    format!(
+        "Another CoderHelm team receives the events of the GitHub installation for {org}, so \
+         this team's link to it does nothing. An admin can remove this team's link, or ask that \
+         team's admin for an invite."
+    )
+}
+
+/// POST /api/github/release-stale-link
+///
+/// Removes this team's link to its GitHub installation when another team
+/// owns that installation (the link is stale). Admins only. The owner's link
+/// is never touched, and a team that owns its installation keeps it.
+pub async fn release_stale_link(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<Claims>,
+) -> Result<Json<Value>, StatusCode> {
+    if role_to_level(&claims.role) < 3 {
+        return Err(StatusCode::FORBIDDEN);
+    }
+    let item = state
+        .dynamo
+        .get_item()
+        .table_name(&state.config.teams_table_name)
+        .key("team_id", attr_s(&claims.team_id))
+        .key("sk", attr_s("META"))
+        .send()
+        .await
+        .map_err(|e| {
+            error!("Failed to fetch team: {e}");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+    let Some(installation_id) = item
+        .item()
+        .and_then(|i| i.get("github_installation_id"))
+        .and_then(|v| v.as_n().ok())
+        .and_then(|n| n.parse::<u64>().ok())
+    else {
+        return Ok(Json(
+            json!({ "released": false, "reason": "This team has no GitHub installation linked." }),
+        ));
+    };
+    match super::installation_owner::release_stale(&state, &claims.team_id, installation_id).await {
+        Ok(true) => {
+            info!(team_id = %claims.team_id, installation_id, by = %claims.email, "Stale GitHub installation link released");
+            Ok(Json(
+                json!({ "released": true, "installation_id": installation_id }),
+            ))
+        }
+        Ok(false) => Ok(Json(json!({
+            "released": false,
+            "reason": "This team's link isn't stale: no other team owns its installation.",
+        }))),
+        Err(e) => {
+            error!(team_id = %claims.team_id, installation_id, error = %e, "Could not release the stale link");
+            Err(StatusCode::INTERNAL_SERVER_ERROR)
+        }
     }
 }
 
@@ -333,5 +408,15 @@ mod tests {
             github_connect_url("dev"),
             format!("{}/auth/github", common::public_urls::stage_api_url("dev"))
         );
+    }
+}
+
+#[cfg(test)]
+mod stale_tests {
+    #[test]
+    fn a_stale_link_says_what_to_do() {
+        let m = super::stale_message("acme");
+        assert!(m.contains("for acme"));
+        assert!(m.contains("remove this team's link"));
     }
 }

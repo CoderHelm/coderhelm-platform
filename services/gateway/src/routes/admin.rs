@@ -788,6 +788,28 @@ pub async fn admin_teams(
             }
         }
     }
+    // Installations several teams carry: who receives their events, and
+    // which links are stale (a warning on the page, with a way to release).
+    let links: Vec<(String, u64)> = teams
+        .iter()
+        .filter_map(|t| {
+            t.installation_id
+                .trim()
+                .parse::<u64>()
+                .ok()
+                .map(|iid| (t.team_id.clone(), iid))
+        })
+        .collect();
+    let mut shared_installations: Vec<Value> = Vec::new();
+    for (iid, team_ids) in super::installation_owner::shared(&links) {
+        let owner = super::github_webhook::resolve_team_by_installation(&state, iid).await;
+        shared_installations.push(json!({
+            "installation_id": iid,
+            "owner_team_id": owner,
+            "stale_team_ids": super::installation_owner::stale_teams(&team_ids, owner.as_deref()),
+        }));
+    }
+    shared_installations.sort_by_key(|v| v["installation_id"].as_u64());
     let flat: Vec<Value> = orgs
         .iter()
         .flat_map(|o| o["teams"].as_array().cloned().unwrap_or_default())
@@ -797,12 +819,65 @@ pub async fn admin_teams(
         "month": month,
         "orgs": orgs,
         "teams": flat,
+        "shared_installations": shared_installations,
         "counts": {
             "teams": teams.len(),
             "orgs": orgs.len(),
             "active_orgs": active,
             "inactive_orgs": orgs.len() - active,
         },
+    })))
+}
+
+#[derive(serde::Deserialize, Default)]
+pub struct ReleaseStaleRequest {
+    /// Say what would be released without changing anything (the default).
+    #[serde(default = "yes")]
+    pub dry_run: bool,
+}
+
+fn yes() -> bool {
+    true
+}
+
+/// POST /api/admin/installations/:installation_id/release-stale { dry_run }
+/// — removes the installation's link from every team that carries it but
+/// doesn't own it (platform admins only). The owner keeps its link. A dry
+/// run (the default) only lists them.
+pub async fn release_stale_installation_links(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<Claims>,
+    axum::extract::Path(installation_id): axum::extract::Path<u64>,
+    body: Option<Json<ReleaseStaleRequest>>,
+) -> Result<Json<Value>, StatusCode> {
+    if !is_platform_admin(&claims) {
+        warn!(email = %claims.email, "Installation link release refused: not a platform admin");
+        return Err(StatusCode::FORBIDDEN);
+    }
+    let dry_run = body.map(|Json(b)| b.dry_run).unwrap_or(true);
+    let teams =
+        super::github_webhook::resolve_all_teams_by_installation(&state, installation_id).await;
+    let owner = super::github_webhook::resolve_team_by_installation(&state, installation_id).await;
+    let stale = super::installation_owner::stale_teams(&teams, owner.as_deref());
+    let mut released: Vec<String> = Vec::new();
+    if !dry_run && owner.is_some() {
+        for team in &stale {
+            match super::installation_owner::release_stale(&state, team, installation_id).await {
+                Ok(true) => released.push(team.clone()),
+                Ok(false) => {}
+                Err(e) => {
+                    warn!(team, installation_id, error = %e, "Could not release a stale link")
+                }
+            }
+        }
+        info!(installation_id, released = ?released, by = %claims.email, "Stale installation links released");
+    }
+    Ok(Json(json!({
+        "installation_id": installation_id,
+        "owner_team_id": owner,
+        "stale_team_ids": stale,
+        "dry_run": dry_run,
+        "released": released,
     })))
 }
 
@@ -1320,6 +1395,6 @@ mod tests {
             );
             checked += 1;
         }
-        assert_eq!(checked, 7);
+        assert_eq!(checked, 8);
     }
 }

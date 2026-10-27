@@ -51,6 +51,17 @@ pub async fn resolve_team_by_installation(
     // fresh team per person). Pick the OWNER deterministically — never
     // whichever DynamoDB lists first, which routed webhooks to the wrong team.
     if items.len() > 1 {
+        let team_ids: Vec<String> = items
+            .iter()
+            .filter_map(|i| i.get("team_id").and_then(|v| v.as_s().ok()).cloned())
+            .collect();
+        // The owner, once chosen, is recorded and stands (one read, no
+        // member counts per event, no owner that moves when people join).
+        let recorded = super::installation_owner::recorded(state, installation_id).await;
+        if let Some(owner) = super::installation_owner::choose(&team_ids, recorded.as_deref(), None)
+        {
+            return Some(owner);
+        }
         let mut candidates: Vec<InstallationCandidate> = items
             .iter()
             .filter_map(|item| {
@@ -89,13 +100,26 @@ pub async fn resolve_team_by_installation(
                 };
             }
         }
-        let owner = pick_installation_owner(&candidates);
+        let picked = pick_installation_owner(&candidates);
+        let rule = if candidates.iter().any(|c| c.linked_at.is_some()) {
+            "first_link"
+        } else {
+            "most_members"
+        };
+        let owner = match picked {
+            Some(p) => Some(
+                super::installation_owner::record(state, installation_id, &p, &team_ids, rule)
+                    .await,
+            ),
+            None => None,
+        };
         if first_time_seen_shared(installation_id) {
-            tracing::debug!(
+            tracing::warn!(
                 installation_id,
                 team_count = candidates.len(),
                 owner = owner.as_deref().unwrap_or(""),
-                "Installation is linked to several teams — routing to its owner"
+                rule,
+                "Installation is linked to several teams: routing to its recorded owner; the other links are stale (Teams page in admin)"
             );
         }
         return owner;

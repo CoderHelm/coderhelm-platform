@@ -294,6 +294,11 @@ async fn main() -> Result<(), Error> {
             get(routes::knowledge_tokens::sign_in_apps),
         )
         .route("/admin/dlq/delete", post(routes::admin::admin_dlq_delete))
+        // A GitHub installation several teams carry: release the stale links
+        .route(
+            "/admin/installations/:installation_id/release-stale",
+            post(routes::admin::release_stale_installation_links),
+        )
         .route("/admin/beta-signups", get(routes::admin::beta_signups))
         .route(
             "/admin/beta-signups/invite",
@@ -502,6 +507,10 @@ async fn main() -> Result<(), Error> {
         .route(
             "/github/installation-status",
             get(routes::github::installation_status),
+        )
+        .route(
+            "/github/release-stale-link",
+            post(routes::github::release_stale_link),
         )
         .route(
             "/notifications",
