@@ -3978,29 +3978,24 @@ async fn run_passes(
     update_pass(state, &msg.team_id, run_id, "security").await?;
     let pass_start = std::time::Instant::now();
     let usage_before = usage.clone();
-    let security_result = match security::run(
-        state,
-        msg,
-        &github,
-        &plan_result,
-        &branch_name,
-        &repo_instructions,
-        &provider,
-        usage,
-        &file_cache,
-        Some(run_id),
-    )
-    .await
-    {
-        Ok(r) => r,
-        Err(e) => {
-            warn!(run_id, error = %e, "Security pass errored, proceeding");
-            security::SecurityResult {
-                passed: true,
-                summary: format!("Security error: {e}"),
-            }
-        }
-    };
+    let mut security_verdict = security::Verdict::of(
+        security::run(
+            state,
+            msg,
+            &github,
+            &plan_result,
+            &branch_name,
+            &repo_instructions,
+            &provider,
+            usage,
+            &file_cache,
+            Some(run_id),
+        )
+        .await,
+    );
+    if let security::Verdict::NotChecked(e) = &security_verdict {
+        warn!(run_id, error = %e, "Security pass errored: the PR opens as a draft with it under Open items");
+    }
     write_pass_trace(
         state,
         &msg.team_id,
@@ -4024,35 +4019,48 @@ async fn run_passes(
     .await;
     info!(
         run_id,
-        passed = security_result.passed,
+        passed = security_verdict.passed(),
         "Security audit complete"
     );
     add_progress_note(
         state,
         &msg.team_id,
         run_id,
-        if security_result.passed {
-            "Security audit passed"
-        } else {
-            "Security issues found, fixing"
+        match &security_verdict {
+            security::Verdict::Passed => "Security audit passed",
+            security::Verdict::Findings(_) => "Security issues found, fixing",
+            security::Verdict::NotChecked(_) => {
+                "The security check couldn't run; the pull request stays a draft with that under Open items"
+            }
         },
     )
     .await;
 
-    if !security_result.passed {
+    // What a security round on the PR is told, when the fix (or the check)
+    // continues in a fresh invocation after the PR opens.
+    let mut security_round: Option<String> = None;
+    if let security::Verdict::NotChecked(why) = &security_verdict {
+        security_round = Some(security::recheck_feedback(why));
+    }
+    if let security::Verdict::Findings(summary) = security_verdict.clone() {
         if !has_time_for_remediation(start) {
+            // Too little of this invocation is left to fix them here: the fix
+            // is a round of its own on the pull request, with its own budget,
+            // and the PR stays a draft with the issues under Open items until
+            // it's done. Never skipped.
             warn!(
                 run_id,
                 remaining_secs = remaining_secs(start),
-                "Skipping security remediation — not enough time remaining"
+                "Security issues found with little time left: the fix continues in a fresh step"
             );
             add_progress_note(
                 state,
                 &msg.team_id,
                 run_id,
-                "Security issues found but skipping remediation (low time remaining)",
+                "Security issues found with too little time left in this step: the fix continues in a fresh step on the pull request, which stays a draft until they're fixed",
             )
             .await;
+            security_round = Some(security::fix_feedback(&summary));
         } else {
             info!(run_id, "Security issues found, running remediation cycle");
             check_cancelled(state, &msg.team_id, run_id).await?;
@@ -4065,10 +4073,7 @@ async fn run_passes(
                 &branch_name,
                 &rules,
                 &repo_instructions,
-                Some(&format!(
-                    "Security audit found vulnerabilities. Fix ALL of the following:\n\n{}",
-                    security_result.summary
-                )),
+                Some(&security::fix_feedback(&summary)),
                 &effective_complexity,
                 &provider,
                 usage,
@@ -4089,40 +4094,40 @@ async fn run_passes(
 
             check_cancelled(state, &msg.team_id, run_id).await?;
             update_pass(state, &msg.team_id, run_id, "security").await?;
-            let retry = match security::run(
-                state,
-                msg,
-                &github,
-                &plan_result,
-                &branch_name,
-                &repo_instructions,
-                &provider,
-                usage,
-                &file_cache,
-                Some(run_id),
-            )
-            .await
-            {
-                Ok(r) => r,
-                Err(e) => {
-                    warn!(run_id, error = %e, "Security retry errored, proceeding");
-                    security::SecurityResult {
-                        passed: true,
-                        summary: format!("Security error: {e}"),
-                    }
-                }
-            };
-            if !retry.passed {
+            security_verdict = security::Verdict::of(
+                security::run(
+                    state,
+                    msg,
+                    &github,
+                    &plan_result,
+                    &branch_name,
+                    &repo_instructions,
+                    &provider,
+                    usage,
+                    &file_cache,
+                    Some(run_id),
+                )
+                .await,
+            );
+            if !security_verdict.passed() {
                 warn!(
                     run_id,
-                    "Security issues remain after remediation, proceeding with PR"
+                    "Security issues remain after remediation (or the re-check didn't run): they go under Open items and the PR stays a draft"
                 );
+            }
+            // A re-check that didn't run runs again on the PR.
+            if let security::Verdict::NotChecked(why) = &security_verdict {
+                security_round = Some(security::recheck_feedback(why));
             }
         }
     }
+    // What is still open goes under Open items, marked: the PR stays a draft
+    // while any is listed.
+    let security_items = security::open_items(&security_verdict, security_round.is_some());
 
-    // Security findings are already posted as PR review comments and stored in the
-    // run record — no need to duplicate the full audit text into long-term memory.
+    // Security issues not fixed (or a check that didn't run) are the PR's
+    // Open items, marked so it stays a draft; the full audit text is not
+    // copied into long-term memory.
 
     // --- Proof check (before PR — what the change rests on is proven) ---
     check_cancelled(state, &msg.team_id, run_id).await?;
@@ -4189,6 +4194,8 @@ async fn run_passes(
     }
     // Tasks the plan marks optional and the change left out, named.
     gaps.extend(plan_optional);
+    // Security issues not fixed yet, or a check that didn't run.
+    gaps.extend(security_items);
     // Every redirect and link the change adds or changes, checked live; a
     // failure that survives its fix round stops the run before the PR.
     let links = link_checks::gate(&work, &mut evidence, usage, || {
@@ -4278,6 +4285,21 @@ async fn run_passes(
         &format!("Draft PR created: #{}", pr_result.pr_number),
     )
     .await;
+
+    // The security fix there wasn't time for: a round of its own on the PR,
+    // parked for the resume that follows (a fresh invocation, its own budget).
+    if let Some(feedback) = &security_round {
+        let round = common::run_round::Round::start(
+            common::run_round::Kind::SecurityFix,
+            1,
+            "",
+            feedback,
+            true,
+            chrono::Utc::now(),
+        )
+        .parked(false);
+        round::record(state, &msg.team_id, run_id, &round).await;
+    }
 
     // Save checkpoint and set awaiting_ci — Lambda returns here.
     // The webhook-driven resume flow handles CI results and review.
@@ -4369,7 +4391,8 @@ async fn run_passes(
             .send_message()
             .queue_url(&state.config.ci_fix_queue_url)
             .message_body(resume_body.to_string())
-            .delay_seconds(120)
+            // A parked security fix starts as soon as this invocation ends.
+            .delay_seconds(if security_round.is_some() { 5 } else { 120 })
             .send()
             .await;
     }
@@ -4716,29 +4739,24 @@ async fn run_repo_pipeline(
     update_pass(state, &msg.team_id, run_id, "security").await?;
     let pass_start = std::time::Instant::now();
     let usage_before = usage.clone();
-    let security_result = match security::run(
-        state,
-        msg,
-        github,
-        &repo_plan,
-        branch_name,
-        repo_instructions,
-        provider,
-        usage,
-        file_cache,
-        Some(run_id),
-    )
-    .await
-    {
-        Ok(r) => r,
-        Err(e) => {
-            warn!(run_id, error = %e, "Security pass errored, proceeding");
-            security::SecurityResult {
-                passed: true,
-                summary: format!("Security error: {e}"),
-            }
-        }
-    };
+    let mut security_verdict = security::Verdict::of(
+        security::run(
+            state,
+            msg,
+            github,
+            &repo_plan,
+            branch_name,
+            repo_instructions,
+            provider,
+            usage,
+            file_cache,
+            Some(run_id),
+        )
+        .await,
+    );
+    if let security::Verdict::NotChecked(e) = &security_verdict {
+        warn!(run_id, error = %e, "Security pass errored: the PR opens as a draft with it under Open items");
+    }
     write_pass_trace(
         state,
         &msg.team_id,
@@ -4761,21 +4779,25 @@ async fn run_repo_pipeline(
     )
     .await;
 
-    info!(run_id, repo = %format!("{repo_owner}/{repo_name}"), passed = security_result.passed, "Security audit complete");
+    info!(run_id, repo = %format!("{repo_owner}/{repo_name}"), passed = security_verdict.passed(), "Security audit complete");
     add_progress_note(
         state,
         &msg.team_id,
         run_id,
-        if security_result.passed {
-            "Security audit passed"
-        } else {
-            "Security issues found, fixing"
+        match &security_verdict {
+            security::Verdict::Passed => "Security audit passed",
+            security::Verdict::Findings(_) => "Security issues found, fixing",
+            security::Verdict::NotChecked(_) => {
+                "The security check couldn't run; the pull request stays a draft with that under Open items"
+            }
         },
     )
     .await;
 
-    // Security remediation
-    if !security_result.passed {
+    // Security remediation. A multi-repo run's pull requests have no fix
+    // rounds of their own, so findings there wasn't time to fix stay under
+    // the PR's Open items and hold it a draft.
+    if let security::Verdict::Findings(summary) = security_verdict.clone() {
         if has_time_for_remediation(start) {
             info!(run_id, "Running security remediation");
             check_cancelled(state, &msg.team_id, run_id).await?;
@@ -4787,10 +4809,7 @@ async fn run_repo_pipeline(
                 branch_name,
                 rules,
                 repo_instructions,
-                Some(&format!(
-                    "Security audit found vulnerabilities. Fix ALL of the following:\n\n{}",
-                    security_result.summary
-                )),
+                Some(&security::fix_feedback(&summary)),
                 complexity,
                 provider,
                 usage,
@@ -4808,13 +4827,31 @@ async fn run_repo_pipeline(
                 &sec_fix.conversation_log,
             )
             .await;
+            check_cancelled(state, &msg.team_id, run_id).await?;
+            security_verdict = security::Verdict::of(
+                security::run(
+                    state,
+                    msg,
+                    github,
+                    &repo_plan,
+                    branch_name,
+                    repo_instructions,
+                    provider,
+                    usage,
+                    file_cache,
+                    Some(run_id),
+                )
+                .await,
+            );
         } else {
-            warn!(run_id, "Skipping security remediation — not enough time");
+            warn!(run_id, "No time for security remediation: the findings go under Open items and the PR stays a draft");
         }
     }
+    let security_items = security::open_items(&security_verdict, false);
 
-    // Security findings are already posted as PR review comments and stored in the
-    // run record — no need to duplicate the full audit text into long-term memory.
+    // Security issues not fixed (or a check that didn't run) are the PR's
+    // Open items, marked so it stays a draft; the full audit text is not
+    // copied into long-term memory.
 
     // --- Proof check ---
     check_cancelled(state, &msg.team_id, run_id).await?;
@@ -4875,6 +4912,7 @@ async fn run_repo_pipeline(
         .into());
     }
     gaps.extend(plan_optional);
+    gaps.extend(security_items);
     let links = link_checks::gate(&work, &mut evidence, usage, || {
         has_time_for_remediation(start)
     })

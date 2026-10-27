@@ -3174,6 +3174,9 @@ async fn run_pending_round(
             .await?;
         }
         RoundEnd::Done { files: 0 } => {
+            if kind == run_round::Kind::SecurityFix {
+                recheck_security(state, msg, &mut ctx, &pr).await;
+            }
             if kind == run_round::Kind::CiFix {
                 super::record_ci_outcome(
                     state,
@@ -3207,6 +3210,9 @@ async fn run_pending_round(
                 )
                 .await;
             }
+            if kind == run_round::Kind::SecurityFix {
+                recheck_security(state, msg, &mut ctx, &pr).await;
+            }
             save_checkpoint(
                 state,
                 &msg.team_id,
@@ -3234,6 +3240,73 @@ async fn run_pending_round(
         }
     }
     Ok(())
+}
+
+/// After a security fix round: the security check runs again on the pull
+/// request, and its Open items say what it found. Fixed, the items go and
+/// the pull request may be marked ready; still failing, or a check that
+/// didn't run, the items stay (with what it found now) and it stays a draft.
+async fn recheck_security(
+    state: &WorkerState,
+    msg: &ResumeMessage,
+    ctx: &mut FixContext,
+    pr: &PrRef<'_>,
+) {
+    let _ = super::update_pass(state, &msg.team_id, &msg.run_id, "security").await;
+    let plan = plan::PlanResult {
+        proposal: String::new(),
+        tasks: String::new(),
+        spec: String::new(),
+        design: String::new(),
+        repo_tasks: vec![],
+        fix: None,
+    };
+    let verdict = super::security::Verdict::of(
+        super::security::run(
+            state,
+            &ctx.ticket_msg,
+            &ctx.github,
+            &plan,
+            pr.branch,
+            &ctx.repo_instructions,
+            &ctx.provider,
+            &mut ctx.usage,
+            &FileCache::default(),
+            Some(&msg.run_id),
+        )
+        .await,
+    );
+    let note = match &verdict {
+        super::security::Verdict::Passed => "Security check passed after the security fix",
+        super::security::Verdict::Findings(_) => {
+            "Security issues remain after the security fix: they stay under Open items and the pull request stays a draft"
+        }
+        super::security::Verdict::NotChecked(_) => {
+            "The security check couldn't run after the security fix: the pull request stays a draft"
+        }
+    };
+    super::add_progress_note(state, &msg.team_id, &msg.run_id, note).await;
+    let items = super::security::open_items(&verdict, false);
+    let body = match ctx
+        .github
+        .get_pull_request(pr.owner, pr.repo, pr.number)
+        .await
+    {
+        Ok(p) => p["body"].as_str().unwrap_or("").to_string(),
+        Err(e) => {
+            warn!(run_id = msg.run_id, error = %e, "Could not read the PR to update its security items");
+            return;
+        }
+    };
+    if let Some(updated) = super::proof::with_security_items(&body, &items) {
+        if let Err(e) = ctx
+            .github
+            .update_pr_body(pr.owner, pr.repo, pr.number, &updated)
+            .await
+        {
+            warn!(run_id = msg.run_id, error = %e, "Could not update the PR's security items");
+        }
+    }
 }
 
 async fn load_unprocessed_events(
@@ -3857,6 +3930,18 @@ async fn mark_ready(
                 // reopen/mark it ready — respect the close.
                 if pr.get("state").and_then(|v| v.as_str()) == Some("closed") {
                     info!(pr_number, "PR is closed — not marking ready");
+                    return;
+                }
+                // Security issues not fixed yet (or a security check that
+                // didn't run) are listed under Open items: the PR stays a
+                // draft until they're gone.
+                if super::proof::holds_security_items(
+                    pr.get("body").and_then(|v| v.as_str()).unwrap_or(""),
+                ) {
+                    info!(
+                        pr_number,
+                        "Security items open in the description — the PR stays a draft"
+                    );
                     return;
                 }
                 // E2E fix and generated-test PRs wait for their repeat runs.

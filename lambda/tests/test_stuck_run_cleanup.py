@@ -109,6 +109,7 @@ class Rounds(unittest.TestCase):
         self.assertEqual(sweep.round_kind({}, "ci_fix:2"), "ci_fix")
         self.assertEqual(sweep.round_kind({}, "feedback"), "feedback")
         self.assertEqual(sweep.round_kind({}, "implement"), "review_fix")
+        self.assertEqual(sweep.round_kind({}, "security_fix:1"), "security_fix")
 
     def test_no_pr_means_no_pr(self):
         self.assertFalse(sweep.has_pull_request({}))
