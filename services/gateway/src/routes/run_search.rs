@@ -34,6 +34,16 @@ pub const LIST_ATTRS: &[&str] = &[
     "duration_s",
     "current_pass",
     "created_at",
+    // How the run started (see `run_trigger`).
+    "issue_number",
+    "sender",
+    "requester_key",
+    "requester_name",
+    "requester_email",
+    "plan_id",
+    "plan_title",
+    "plan_by",
+    "plugin_id",
 ];
 
 #[derive(Debug, Default)]
@@ -45,6 +55,8 @@ pub struct RunFilter {
     source: Option<String>,
     /// One repo to keep, lowercased (exact match).
     repo: Option<String>,
+    /// How the run started; empty keeps every kind.
+    started_by: Vec<super::run_trigger::TriggerKind>,
 }
 
 impl RunFilter {
@@ -71,7 +83,20 @@ impl RunFilter {
             statuses,
             source,
             repo: None,
+            started_by: Vec::new(),
         }
+    }
+
+    /// Keep only runs started one of these ways (comma-separated
+    /// `run_trigger::TriggerKind` words). Unknown words are ignored; when
+    /// none is known, every run is kept.
+    pub fn with_started_by(mut self, started_by: Option<&str>) -> Self {
+        self.started_by = started_by
+            .unwrap_or("")
+            .split(',')
+            .filter_map(super::run_trigger::TriggerKind::parse)
+            .collect();
+        self
     }
 
     /// Keep only runs of one repo (`owner/name`, any case). Empty keeps all.
@@ -101,6 +126,10 @@ impl RunFilter {
             if s(item, "repo").to_lowercase() != *repo {
                 return false;
             }
+        }
+        if !self.started_by.is_empty() && !self.started_by.contains(&super::run_trigger::kind(item))
+        {
+            return false;
         }
         if self.terms.is_empty() {
             return true;
@@ -344,5 +373,33 @@ mod tests {
         let (found, read) = take_matches(&items, &f, 50, 100);
         assert_eq!(found.len(), 5);
         assert_eq!(read, 10);
+    }
+
+    #[test]
+    fn keeps_runs_started_the_chosen_ways() {
+        // `run` makes Jira runs.
+        let jira = run("1", "completed", "ABC-1", "Login", "acme/web", None);
+        let mut flaky = run(
+            "2",
+            "completed",
+            "E2E-FIX-abc",
+            "Fix flaky test: x",
+            "acme/web",
+            None,
+        );
+        flaky.insert("ticket_source".into(), AttributeValue::S("alert".into()));
+        let mut plan = run("3", "completed", "ABC-3", "Task", "acme/web", None);
+        plan.insert("plan_id".into(), AttributeValue::S("p1".into()));
+
+        let f = RunFilter::new(None, None, None).with_started_by(Some("coderhelm,plans"));
+        assert!(!f.matches(&jira));
+        assert!(f.matches(&flaky));
+        assert!(f.matches(&plan));
+        let j = RunFilter::new(None, None, None).with_started_by(Some("jira"));
+        assert!(j.matches(&jira));
+        assert!(!j.matches(&plan), "a plan's Jira ticket is the plan's");
+        // Unknown words keep everything.
+        let any = RunFilter::new(None, None, None).with_started_by(Some("nope"));
+        assert!(any.matches(&jira) && any.matches(&flaky));
     }
 }

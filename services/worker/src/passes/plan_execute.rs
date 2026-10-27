@@ -132,6 +132,14 @@ pub async fn run(
                 Ok(resp) if resp.status().is_success() => {
                     let body: serde_json::Value = resp.json().await.unwrap_or_default();
                     let ticket_key = body["key"].as_str().unwrap_or("UNKNOWN");
+                    link_ticket_to_plan(
+                        state,
+                        &msg.team_id,
+                        &msg.plan_id,
+                        task_id,
+                        PlanTicket::Jira(ticket_key),
+                    )
+                    .await;
                     let ticket_url = if let Some(ref site) = jira_site_url {
                         format!("{}/browse/{}", site.trim_end_matches('/'), ticket_key)
                     } else {
@@ -183,6 +191,19 @@ pub async fn run(
                 .await
             {
                 Ok((issue_number, issue_url)) => {
+                    // Before the label: the label starts the run, and the
+                    // run reads this to say it came from the plan.
+                    link_ticket_to_plan(
+                        state,
+                        &msg.team_id,
+                        &msg.plan_id,
+                        task_id,
+                        PlanTicket::Github {
+                            repo: task_repo,
+                            issue_number,
+                        },
+                    )
+                    .await;
                     // Label the issue FIRST to trigger the ticket pipeline
                     if let Err(e) = github
                         .add_label(owner, repo, issue_number, "coderhelm")
@@ -272,6 +293,171 @@ pub async fn run(
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
+
+/// The ticket a plan's task opened.
+pub(crate) enum PlanTicket<'a> {
+    /// A GitHub issue in `owner/name`.
+    Github { repo: &'a str, issue_number: u64 },
+    /// A Jira ticket key.
+    Jira(&'a str),
+}
+
+impl PlanTicket<'_> {
+    /// Settings-table sort key of the link from the ticket to its plan task.
+    pub(crate) fn sk(&self) -> String {
+        match self {
+            PlanTicket::Github { repo, issue_number } => {
+                format!("PLAN_TICKET#github#{}#{issue_number}", repo.to_lowercase())
+            }
+            PlanTicket::Jira(key) => format!("PLAN_TICKET#jira#{}", key.to_uppercase()),
+        }
+    }
+
+    /// The ticket id runs of this ticket carry.
+    fn ticket_id(&self) -> String {
+        match self {
+            PlanTicket::Github { issue_number, .. } => format!("GH-{issue_number}"),
+            PlanTicket::Jira(key) => key.to_string(),
+        }
+    }
+
+    /// The repo a run must be in to be this ticket's (GitHub numbers repeat
+    /// across repos; a Jira ticket's run can be in any repo).
+    fn repo(&self) -> Option<String> {
+        match self {
+            PlanTicket::Github { repo, .. } => Some(repo.to_lowercase()),
+            PlanTicket::Jira(_) => None,
+        }
+    }
+}
+
+/// The plan a run's ticket came from: `(plan_id, plan_title, plan_by)`.
+pub(crate) async fn plan_of_ticket(
+    state: &WorkerState,
+    team_id: &str,
+    ticket: &PlanTicket<'_>,
+) -> Option<(String, String, String)> {
+    let item = state
+        .dynamo
+        .get_item()
+        .table_name(&state.config.settings_table_name)
+        .key("pk", AttributeValue::S(team_id.to_string()))
+        .key("sk", AttributeValue::S(ticket.sk()))
+        .send()
+        .await
+        .ok()?
+        .item?;
+    let s = |k: &str| {
+        item.get(k)
+            .and_then(|v| v.as_s().ok())
+            .cloned()
+            .unwrap_or_default()
+    };
+    let plan_id = s("plan_id");
+    (!plan_id.is_empty()).then(|| (plan_id, s("plan_title"), s("plan_by")))
+}
+
+/// Records that a ticket came from a plan's task, so the runs it starts say
+/// "Plan · <title>" instead of naming the bot that opened the issue. Also
+/// marks a run that already started for it (a Jira webhook can beat this).
+/// Best effort: a failure leaves the run labelled by its ticket's source.
+async fn link_ticket_to_plan(
+    state: &WorkerState,
+    team_id: &str,
+    plan_id: &str,
+    task_id: &str,
+    ticket: PlanTicket<'_>,
+) {
+    if matches!(ticket, PlanTicket::Jira(k) if k.is_empty() || k == "UNKNOWN") {
+        return;
+    }
+    let plan = state
+        .dynamo
+        .get_item()
+        .table_name(&state.config.plans_table_name)
+        .key("pk", AttributeValue::S(team_id.to_string()))
+        .key("sk", AttributeValue::S(format!("PLAN#{plan_id}")))
+        .projection_expression("title, executed_by")
+        .send()
+        .await
+        .ok()
+        .and_then(|r| r.item);
+    let field = |k: &str| {
+        plan.as_ref()
+            .and_then(|i| i.get(k))
+            .and_then(|v| v.as_s().ok())
+            .map(|s| common::truncate_str(s, 300).to_string())
+            .unwrap_or_default()
+    };
+    let (title, by) = (field("title"), field("executed_by"));
+    let mut put = state
+        .dynamo
+        .put_item()
+        .table_name(&state.config.settings_table_name)
+        .item("pk", AttributeValue::S(team_id.to_string()))
+        .item("sk", AttributeValue::S(ticket.sk()))
+        .item("plan_id", AttributeValue::S(plan_id.to_string()))
+        .item("task_id", AttributeValue::S(task_id.to_string()));
+    if !title.is_empty() {
+        put = put.item("plan_title", AttributeValue::S(title.clone()));
+    }
+    if !by.is_empty() {
+        put = put.item("plan_by", AttributeValue::S(by.clone()));
+    }
+    if let Err(e) = put.send().await {
+        tracing::warn!(team_id, plan_id, task_id, error = %e, "Could not link the ticket to its plan");
+        return;
+    }
+    // A run that started before the link was written.
+    let Ok(found) = state
+        .dynamo
+        .query()
+        .table_name(&state.config.runs_table_name)
+        .index_name("ticket-index")
+        .key_condition_expression("team_id = :tid AND ticket_id = :ticket")
+        .expression_attribute_values(":tid", AttributeValue::S(team_id.to_string()))
+        .expression_attribute_values(":ticket", AttributeValue::S(ticket.ticket_id()))
+        .send()
+        .await
+    else {
+        return;
+    };
+    let want_repo = ticket.repo();
+    for item in found.items() {
+        let s = |k: &str| item.get(k).and_then(|v| v.as_s().ok()).map(|s| s.as_str());
+        if want_repo
+            .as_deref()
+            .is_some_and(|r| s("repo").map(str::to_lowercase).as_deref() != Some(r))
+        {
+            continue;
+        }
+        let Some(run_id) = s("run_id") else { continue };
+        let mut update = state
+            .dynamo
+            .update_item()
+            .table_name(&state.config.runs_table_name)
+            .key("team_id", AttributeValue::S(team_id.to_string()))
+            .key("run_id", AttributeValue::S(run_id.to_string()))
+            .condition_expression("attribute_exists(run_id)")
+            .expression_attribute_values(":p", AttributeValue::S(plan_id.to_string()));
+        let mut set = vec!["plan_id = :p"];
+        if !title.is_empty() {
+            set.push("plan_title = :pt");
+            update = update.expression_attribute_values(":pt", AttributeValue::S(title.clone()));
+        }
+        if !by.is_empty() {
+            set.push("plan_by = :pb");
+            update = update.expression_attribute_values(":pb", AttributeValue::S(by.clone()));
+        }
+        if let Err(e) = update
+            .update_expression(format!("SET {}", set.join(", ")))
+            .send()
+            .await
+        {
+            tracing::warn!(team_id, run_id, error = %e, "Could not mark the run as the plan's");
+        }
+    }
+}
 
 async fn get_install_id(
     state: &WorkerState,
@@ -617,6 +803,14 @@ pub async fn continue_tasks(
                 Ok(resp) if resp.status().is_success() => {
                     let body: serde_json::Value = resp.json().await.unwrap_or_default();
                     let ticket_key = body["key"].as_str().unwrap_or("UNKNOWN");
+                    link_ticket_to_plan(
+                        state,
+                        &msg.team_id,
+                        &msg.plan_id,
+                        task_id,
+                        PlanTicket::Jira(ticket_key),
+                    )
+                    .await;
                     let ticket_url = if let Some(ref site) = jira_site_url {
                         format!("{}/browse/{}", site.trim_end_matches('/'), ticket_key)
                     } else {
@@ -664,6 +858,19 @@ pub async fn continue_tasks(
                 .await
             {
                 Ok((issue_number, issue_url)) => {
+                    // Before the label: the label starts the run, and the
+                    // run reads this to say it came from the plan.
+                    link_ticket_to_plan(
+                        state,
+                        &msg.team_id,
+                        &msg.plan_id,
+                        task_id,
+                        PlanTicket::Github {
+                            repo: task_repo,
+                            issue_number,
+                        },
+                    )
+                    .await;
                     if let Err(e) = github
                         .add_label(owner, repo, issue_number, "coderhelm")
                         .await

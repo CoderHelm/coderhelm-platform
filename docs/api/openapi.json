@@ -3111,6 +3111,10 @@
             "minimum": 0,
             "type": "integer"
           },
+          "trigger": {
+            "$ref": "#/components/schemas/RunTrigger",
+            "description": "How the run was started and by whom (as in the runs list)."
+          },
           "updated_at": {
             "description": "When it last changed (RFC 3339).",
             "examples": [
@@ -3132,7 +3136,8 @@
           "applied_standards",
           "sign_in_prompts",
           "questions",
-          "answers"
+          "answers",
+          "trigger"
         ],
         "type": "object"
       },
@@ -3461,8 +3466,66 @@
               "integer",
               "null"
             ]
+          },
+          "trigger": {
+            "$ref": "#/components/schemas/RunTrigger",
+            "description": "How the run was started and by whom, worked out from the fields\nabove and what started it. Show this instead of an internal\n`ticket_id` such as `E2E-FIX-…`."
           }
         },
+        "required": [
+          "trigger"
+        ],
+        "type": "object"
+      },
+      "RunTrigger": {
+        "description": "How a run was started, in words, with a link to what started it.",
+        "properties": {
+          "by": {
+            "description": "The person who started it, when a person did: a name, GitHub login\nor email. Null for CoderHelm's own work.",
+            "examples": [
+              "Dana Reyes"
+            ],
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "kind": {
+            "$ref": "#/components/schemas/TriggerKind",
+            "description": "The group: `jira`, `github`, `coderhelm`, `alert`, `plan`,\n`dashboard` or `chat`. Treat a value you don't know as `coderhelm`."
+          },
+          "label": {
+            "description": "What started it, to show as is: `Jira`, `GitHub issue`, `Alert`,\n`Plan`, `Started by Coderhelm · flaky test`, `Dashboard · log finding`.",
+            "examples": [
+              "Jira"
+            ],
+            "type": "string"
+          },
+          "ref": {
+            "description": "The thing that started it, when it has a name people know: a ticket\nkey, `#42`, a plan's or an alert's title, a log group.",
+            "examples": [
+              "WEB-42"
+            ],
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "ref_url": {
+            "description": "Where that thing is: a full URL (GitHub, Jira) or a dashboard path\nstarting with `/` (a test, a log finding, an alert, a plan).",
+            "examples": [
+              "https://acme.atlassian.net/browse/WEB-42"
+            ],
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "kind",
+          "label"
+        ],
         "type": "object"
       },
       "RunsPage": {
@@ -3844,6 +3907,19 @@
           "retried_ok"
         ],
         "type": "object"
+      },
+      "TriggerKind": {
+        "description": "The group a run's start belongs to, which the runs list filters on.",
+        "enum": [
+          "jira",
+          "github",
+          "coderhelm",
+          "alert",
+          "plan",
+          "dashboard",
+          "chat"
+        ],
+        "type": "string"
       },
       "UpdateEndpointBody": {
         "description": "Changes to an endpoint. Only the fields sent change.",
@@ -5784,6 +5860,16 @@
             "example": "acme/web",
             "in": "query",
             "name": "repo",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Comma-separated ways the run was started (`trigger.kind`): `jira`,\n`github`, `coderhelm`, `alert`, `plan`, `dashboard`, `chat`.",
+            "example": "coderhelm,alert",
+            "in": "query",
+            "name": "started_by",
             "required": false,
             "schema": {
               "type": "string"
