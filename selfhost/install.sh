@@ -8,21 +8,29 @@
 # signed SHA256SUMS, and runs "coderhelm-selfhost init" then "deploy".
 # Nothing is installed globally.
 #
-# The signature must be cosign's keyless signature made by exactly
-# CoderHelm/coderhelm-platform's release.yml on the release's own tag
-# (cosign), or the installer's GitHub build attestation from that workflow
-# and tag (gh). Without cosign or gh, or on any mismatch, nothing runs.
+# The release's tag must be an annotated tag signed with a maintainer SSH
+# key pinned below (selfhost/maintainers.json), on a commit on main. The
+# signature must be cosign's keyless signature made by exactly
+# CoderHelm/coderhelm-platform's release.yml on the release's own tag, from
+# that commit (cosign), or the installer's GitHub build attestation from that
+# workflow, tag and commit (gh). Without git, ssh-keygen and cosign or gh, or
+# on any mismatch, nothing runs.
 set -eu
 
 REPO="CoderHelm/coderhelm-platform"
 VERSION="${CODERHELM_VERSION:-latest}"
 ISSUER="https://token.actions.githubusercontent.com"
+# The maintainer keys allowed to sign a release tag: selfhost/maintainers.json
+# (installer/test/release-security.test.mjs checks they are the same).
+SIGNERS='nambok namespaces="git" ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIH6UjRCKMcz6OyGQkv2PCBbzqzKx+ngQQmavwp8UDASV'
 
 need() { command -v "$1" >/dev/null 2>&1 || { echo "Please install $2 first: $3" >&2; exit 1; }; }
 need node "Node.js 20 or newer" "https://nodejs.org/"
 need npx "npm (comes with Node.js)" "https://nodejs.org/"
 need aws "the AWS CLI v2" "https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html"
 need curl "curl" "your package manager"
+need git "git 2.34 or newer" "https://git-scm.com/downloads"
+need ssh-keygen "OpenSSH (ssh-keygen)" "your package manager"
 
 major=$(node -p 'process.versions.node.split(".")[0]')
 [ "$major" -ge 20 ] || { echo "Node.js 20 or newer is needed (found $(node --version))." >&2; exit 1; }
@@ -43,14 +51,32 @@ get -o "$dir/coderhelm-selfhost.tgz" "$base/coderhelm-selfhost.tgz"
 get -o "$dir/SHA256SUMS" "$base/SHA256SUMS"
 get -o "$dir/SHA256SUMS.sigstore.json" "$base/SHA256SUMS.sigstore.json"
 
+# The tag: annotated, named $VERSION, signed with a pinned maintainer key, on
+# main. Git runs without your git configuration, so nothing local can make it pass.
+refuse() { echo "$1. Not running it." >&2; exit 1; }
+src="$dir/src"
+g() { GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 GIT_TERMINAL_PROMPT=0 git -C "$src" "$@"; }
+mkdir -p "$src" && g init -q --bare
+printf '%s\n' "$SIGNERS" > "$dir/allowed_signers"
+g fetch -q --no-tags --filter=tree:0 "https://github.com/$REPO.git" "+refs/tags/$VERSION:refs/tags/$VERSION" "+refs/heads/main:refs/heads/main" \
+  || refuse "Could not fetch the tag $VERSION from GitHub"
+[ "$(g cat-file -t "refs/tags/$VERSION")" = tag ] || refuse "$VERSION is not an annotated, signed tag"
+[ "$(g cat-file tag "refs/tags/$VERSION" | sed -n '/^$/q;s/^tag //p')" = "$VERSION" ] || refuse "The tag object under $VERSION is named for another version"
+[ "$(g cat-file tag "refs/tags/$VERSION" | grep -cxF -e '-----BEGIN SSH SIGNATURE-----')" = 1 ] || refuse "$VERSION has no SSH signature"
+g -c gpg.format=ssh -c gpg.ssh.allowedSignersFile="$dir/allowed_signers" -c gpg.ssh.program=ssh-keygen verify-tag "refs/tags/$VERSION" >/dev/null 2>&1 \
+  || refuse "$VERSION is not signed by a CoderHelm maintainer key"
+COMMIT=$(g rev-parse --verify "refs/tags/$VERSION^{commit}")
+g merge-base --is-ancestor "$COMMIT" refs/heads/main || refuse "$VERSION ($COMMIT) is not on main"
+
 if command -v cosign >/dev/null 2>&1; then
   cosign verify-blob --bundle "$dir/SHA256SUMS.sigstore.json" \
     --certificate-identity "$identity" --certificate-oidc-issuer "$ISSUER" \
     --certificate-github-workflow-repository "$REPO" --certificate-github-workflow-ref "refs/tags/$VERSION" \
+    --certificate-github-workflow-sha "$COMMIT" \
     "$dir/SHA256SUMS" >/dev/null 2>&1 || { echo "The release's signature does not verify. Not running it." >&2; exit 1; }
 elif command -v gh >/dev/null 2>&1; then
   gh attestation verify "$dir/coderhelm-selfhost.tgz" --repo "$REPO" \
-    --signer-workflow "$REPO/.github/workflows/release.yml" --source-ref "refs/tags/$VERSION" \
+    --signer-workflow "$REPO/.github/workflows/release.yml" --source-ref "refs/tags/$VERSION" --source-digest "$COMMIT" \
     --cert-oidc-issuer "$ISSUER" --deny-self-hosted-runners >/dev/null 2>&1 \
     || { echo "The installer has no valid build attestation from CoderHelm's release workflow. Not running it." >&2; exit 1; }
 else
@@ -62,7 +88,7 @@ want=$(grep ' coderhelm-selfhost.tgz$' "$dir/SHA256SUMS" | cut -d' ' -f1)
 if command -v sha256sum >/dev/null 2>&1; then got=$(sha256sum "$dir/coderhelm-selfhost.tgz" | cut -d' ' -f1)
 else got=$(shasum -a 256 "$dir/coderhelm-selfhost.tgz" | cut -d' ' -f1); fi
 [ -n "$want" ] && [ "$want" = "$got" ] || { echo "The installer's checksum does not match. Not running it." >&2; exit 1; }
-echo "Verified CoderHelm $VERSION (signed by $REPO's release workflow)."
+echo "Verified CoderHelm $VERSION (tag signed by a maintainer, commit $COMMIT on main, built and signed by $REPO's release workflow)."
 
 run() { npx --yes --package "$dir/coderhelm-selfhost.tgz" coderhelm-selfhost "$@" < /dev/tty; }
 [ -f coderhelm.config.json ] || run init

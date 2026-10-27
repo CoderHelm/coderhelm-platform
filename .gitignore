@@ -26,3 +26,6 @@ node_modules/
 target/
 Thumbs.db
 lambda/log-analyzer/__pycache__/
+
+# Copied from selfhost/maintainers.json by the release build (installer/lib/source-tag.mjs)
+installer/lib/maintainers.json

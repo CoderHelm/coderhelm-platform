@@ -10,7 +10,7 @@ import * as cdk from "aws-cdk-lib";
 import { Template } from "aws-cdk-lib/assertions";
 import { CfnInclude } from "aws-cdk-lib/cloudformation-include";
 import { repoPath } from "../lib/paths";
-import { CHECK_VERSION, COSIGN_LINUX_AMD64_SHA256, installCosignCommands, VERIFY_SUMS } from "../lib/release-verify";
+import { CHECK_VERSION, COSIGN_LINUX_AMD64_SHA256, installCosignCommands, VERIFY_SUMS, verifyTagCommands } from "../lib/release-verify";
 
 const FILE = repoPath("infra", "cfn", "coderhelm-selfhost-launch.yaml");
 
@@ -71,6 +71,15 @@ test("the build checks the release's signature and checksums before running anyt
   const runs = at("node launch-bootstrap.mjs");
   assert.ok(verify < sums && sums < runs, "verify, then checksums, then run");
   assert.ok(spec.includes(VERIFY_SUMS), "the exact identity: release.yml on refs/tags/$VERSION, GitHub's issuer");
+  // The tag check, with the pinned maintainer keys, before the signature (it sets $COMMIT).
+  let last = -1;
+  for (const line of verifyTagCommands()) {
+    const i = spec.indexOf(line);
+    assert.ok(i > last, `the tag check, in order: ${line}`);
+    last = i;
+  }
+  assert.ok(last < spec.indexOf(VERIFY_SUMS), "the tag is checked before the signature");
+  assert.ok(VERIFY_SUMS.includes('--certificate-github-workflow-sha "$COMMIT"'));
   assert.ok(spec.indexOf(CHECK_VERSION) >= 0 && spec.indexOf(CHECK_VERSION) < verify, "VERSION is a release tag before it is used");
   for (const line of installCosignCommands()) assert.ok(spec.includes(line), `pinned cosign: ${line}`);
   assert.ok(spec.includes(COSIGN_LINUX_AMD64_SHA256));

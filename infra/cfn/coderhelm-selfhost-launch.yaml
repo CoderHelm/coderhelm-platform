@@ -261,8 +261,30 @@ Resources:
                 - mkdir -p /tmp/ch && cd /tmp/ch
                 - B="https://github.com/CoderHelm/coderhelm-platform/releases/download/$VERSION"
                 - for f in SHA256SUMS SHA256SUMS.sigstore.json coderhelm-selfhost.tgz launch-bootstrap.mjs; do curl --proto =https --proto-redir =https --tlsv1.2 -fsSL -o "$f" "$B/$f"; done
-                # Signed by exactly this repository's release.yml, on this tag, logged in Rekor.
-                - cosign verify-blob --bundle SHA256SUMS.sigstore.json --certificate-identity "https://github.com/CoderHelm/coderhelm-platform/.github/workflows/release.yml@refs/tags/$VERSION" --certificate-oidc-issuer https://token.actions.githubusercontent.com --certificate-github-workflow-repository CoderHelm/coderhelm-platform --certificate-github-workflow-ref "refs/tags/$VERSION" SHA256SUMS
+                # The tag: an annotated tag named $VERSION, signed with a maintainer key pinned
+                # in selfhost/maintainers.json, on a commit on main ($COMMIT).
+                - |
+                  rm -rf /tmp/ch-tag && mkdir -p /tmp/ch-tag && printf '%s\n' 'nambok namespaces="git" ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIH6UjRCKMcz6OyGQkv2PCBbzqzKx+ngQQmavwp8UDASV' > /tmp/ch-tag.signers
+                - |
+                  env GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 GIT_TERMINAL_PROMPT=0 git -C /tmp/ch-tag init -q --bare
+                - |
+                  env GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 GIT_TERMINAL_PROMPT=0 git -C /tmp/ch-tag fetch -q --no-tags --filter=tree:0 https://github.com/CoderHelm/coderhelm-platform.git "+refs/tags/$VERSION:refs/tags/$VERSION" "+refs/heads/main:refs/heads/main"
+                - |
+                  [ "$(env GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 GIT_TERMINAL_PROMPT=0 git -C /tmp/ch-tag cat-file -t "refs/tags/$VERSION")" = tag ] || { echo "$VERSION is not an annotated, signed tag"; exit 1; }
+                - |
+                  [ "$(env GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 GIT_TERMINAL_PROMPT=0 git -C /tmp/ch-tag cat-file tag "refs/tags/$VERSION" | sed -n '/^$/q;s/^tag //p')" = "$VERSION" ] || { echo "the tag object under $VERSION is named for another version"; exit 1; }
+                - |
+                  [ "$(env GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 GIT_TERMINAL_PROMPT=0 git -C /tmp/ch-tag cat-file tag "refs/tags/$VERSION" | sed -n '/^$/q;s/^type //p')" = commit ] || { echo "$VERSION does not point to a commit"; exit 1; }
+                - |
+                  [ "$(env GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 GIT_TERMINAL_PROMPT=0 git -C /tmp/ch-tag cat-file tag "refs/tags/$VERSION" | grep -cxF -e '-----BEGIN SSH SIGNATURE-----')" = 1 ] || { echo "$VERSION has no SSH signature"; exit 1; }
+                - |
+                  env GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 GIT_TERMINAL_PROMPT=0 git -C /tmp/ch-tag -c gpg.format=ssh -c gpg.ssh.allowedSignersFile=/tmp/ch-tag.signers -c gpg.ssh.program=ssh-keygen verify-tag "refs/tags/$VERSION" || { echo "$VERSION is not signed by a CoderHelm maintainer key (selfhost/maintainers.json)"; exit 1; }
+                - |
+                  COMMIT=$(env GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 GIT_TERMINAL_PROMPT=0 git -C /tmp/ch-tag rev-parse --verify "refs/tags/$VERSION^{commit}")
+                - |
+                  [[ "$COMMIT" =~ ^[0-9a-f]{40}$ ]] && env GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 GIT_TERMINAL_PROMPT=0 git -C /tmp/ch-tag merge-base --is-ancestor "$COMMIT" refs/heads/main || { echo "$VERSION ($COMMIT) is not on main"; exit 1; }
+                # Signed by exactly this repository's release.yml, on this tag and that commit, logged in Rekor.
+                - cosign verify-blob --bundle SHA256SUMS.sigstore.json --certificate-identity "https://github.com/CoderHelm/coderhelm-platform/.github/workflows/release.yml@refs/tags/$VERSION" --certificate-oidc-issuer https://token.actions.githubusercontent.com --certificate-github-workflow-repository CoderHelm/coderhelm-platform --certificate-github-workflow-ref "refs/tags/$VERSION" --certificate-github-workflow-sha "$COMMIT" SHA256SUMS
                 # Both files, each matched by name: grep finding one is not enough.
                 - grep ' coderhelm-selfhost.tgz$' SHA256SUMS | sha256sum -c -
                 - grep ' launch-bootstrap.mjs$' SHA256SUMS | sha256sum -c -

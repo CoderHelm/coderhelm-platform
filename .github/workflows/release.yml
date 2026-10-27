@@ -8,16 +8,26 @@ name: Release
 # no keys to manage). The hosted deployment is not touched by this workflow.
 #
 # Who can publish (docs/self-host/updates-security.md):
-#   check     the tag is a signed, annotated vX.Y.Z tag on a commit on main.
-#   build     builds everything with a read-only token and no secrets.
+#   check     the tag is an annotated vX.Y.Z tag on a commit on main, signed
+#             with a key in main's selfhost/maintainers.json.
+#   build     builds everything with a read-only token and no secrets; the
+#             dashboard from the full commit SHA in selfhost/versions.json.
 #   publish   signs, attests and publishes. It runs in the "release"
 #             environment, so a maintainer must approve it: a tag alone
 #             publishes nothing. Only this job can write the release or
-#             assume the AWS role (whose trust names the environment).
+#             assume the AWS roles (whose trust names this file, a v* tag
+#             and the environment: infra/lib/worker-stack.ts).
+#
+# These checks run inside this file, so on their own they don't stop a
+# changed copy of it pushed under a new tag. What does: installs and updates
+# check that the signature names exactly this file on refs/tags/<version>,
+# AND that it was made from the commit the tag points to, AND that the tag is
+# signed with a pinned maintainer key and on main (installer/lib/source-tag.mjs,
+# infra/lib/release-verify.ts). A tag nobody with a maintainer key signed
+# gets nothing installed, whatever this file says.
 #
 # Every action is pinned by commit SHA (.github/scripts/check_workflows.py
-# fails CI otherwise). Installs and updates check the signature names
-# exactly this file on refs/tags/<version>.
+# fails CI otherwise).
 on:
   push:
     tags: ["v*.*.*"]
@@ -58,7 +68,9 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
       # The tag must point at reviewed code: a commit on main (which needs a
-      # PR, signed commits and passing checks).
+      # PR, signed commits and passing checks), and this run must be on it
+      # (the signing certificate names this run's commit; installs require
+      # it to be the tag's).
       - name: The tag is on main
         env:
           TAG: ${{ steps.tag.outputs.tag }}
@@ -66,6 +78,19 @@ jobs:
           git fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main
           commit=$(git rev-parse "refs/tags/$TAG^{commit}")
           git merge-base --is-ancestor "$commit" origin/main || { echo "::error::$TAG ($commit) is not on main"; exit 1; }
+          [ "$GITHUB_SHA" = "$commit" ] || { echo "::error::this run is on $GITHUB_SHA, not $TAG's commit $commit"; exit 1; }
+      # Signed with a maintainer key pinned on main, as installs check it
+      # (installer/lib/source-tag.mjs); main's copy, not the tag's.
+      - name: The tag is signed with a maintainer key
+        env:
+          TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          # shellcheck disable=SC2016 # JavaScript, not shell
+          git show origin/main:selfhost/maintainers.json \
+            | node -e 'let s="";process.stdin.on("data",(d)=>(s+=d)).on("end",()=>{for(const k of JSON.parse(s).keys)console.log(`${k.login} namespaces="git" ${k.key}`)})' > "$RUNNER_TEMP/allowed_signers"
+          git cat-file tag "refs/tags/$TAG" | sed -n '/^$/q;s/^tag //p' | grep -qxF "$TAG" || { echo "::error::the tag object under $TAG is named for another version"; exit 1; }
+          GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 git -c gpg.format=ssh -c gpg.ssh.allowedSignersFile="$RUNNER_TEMP/allowed_signers" -c gpg.ssh.program=ssh-keygen verify-tag "refs/tags/$TAG" \
+            || { echo "::error::$TAG is not signed with a key in selfhost/maintainers.json (git tag -s with your SSH signing key)"; exit 1; }
       # Signed by a maintainer, and GitHub says the signature checks out.
       - name: The tag and its commit are signed
         env:
@@ -87,6 +112,7 @@ jobs:
         env:
           TAG: ${{ steps.tag.outputs.tag }}
         run: |
+          node scripts/check-dashboard-ref.mjs
           # shellcheck disable=SC2016 # JavaScript, not shell
           node -e '
             const tag = process.env.TAG;
@@ -143,16 +169,26 @@ jobs:
         working-directory: lambda/mcp-proxy
         run: npm ci && npm run build && (cd dist && zip -q -r -X ../../../dist/mcp-proxy.zip .)
 
-      # ── Dashboard (the commit selfhost/versions.json names) ────────
+      # ── Dashboard (the full commit SHA selfhost/versions.json names) ──
+      # A branch name is refused (scripts/check-dashboard-ref.mjs): a signed
+      # release ships the dashboard commit reviewed in this repository.
       - name: Pick the dashboard commit
         id: dash
-        run: echo "ref=$(node -p 'require("./selfhost/versions.json").dashboardRef')" >> "$GITHUB_OUTPUT"
+        run: |
+          node scripts/check-dashboard-ref.mjs
+          echo "ref=$(node -p 'require("./selfhost/versions.json").dashboardRef')" >> "$GITHUB_OUTPUT"
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           repository: CoderHelm/coderhelm
           ref: ${{ steps.dash.outputs.ref }}
           path: dashboard-src
           persist-credentials: false
+      - name: The dashboard checkout is that commit
+        env:
+          WANT: ${{ steps.dash.outputs.ref }}
+        run: |
+          got=$(git -C dashboard-src rev-parse HEAD)
+          [ "$got" = "$WANT" ] || { echo "::error::checked out $got, not $WANT"; exit 1; }
       - name: Build the dashboard
         working-directory: dashboard-src/dashboard
         # No API URL baked in: a self-hosted deployment serves
@@ -173,6 +209,8 @@ jobs:
           mkdir -p "$SRC" && git archive --format=tar "$TAG" | tar -x -C "$SRC"
           printf '{"version":"%s","commit":"%s","dashboardCommit":"%s","releasedAt":"%s"}\n' "$TAG" "$(git rev-parse "$TAG^{commit}")" "$(git -C dashboard-src rev-parse HEAD)" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$SRC/selfhost/release.json"
           tar -czf dist/source.tar.gz -C "$RUNNER_TEMP/src" "coderhelm-platform-${TAG#v}"
+          # The installer checks a release's tag against these keys (installer/lib/source-tag.mjs).
+          cp selfhost/maintainers.json installer/lib/maintainers.json
           (cd installer && npm version --no-git-tag-version --allow-same-version "${TAG#v}" >/dev/null && npm pack --silent --pack-destination ../dist >/dev/null)
           mv dist/coderhelm-selfhost-*.tgz dist/coderhelm-selfhost.tgz
           cp selfhost/install.sh dist/install.sh
@@ -256,6 +294,7 @@ jobs:
             --certificate-oidc-issuer https://token.actions.githubusercontent.com \
             --certificate-github-workflow-repository "$GITHUB_REPOSITORY" \
             --certificate-github-workflow-ref "refs/tags/$TAG" \
+            --certificate-github-workflow-sha "$GITHUB_SHA" \
             dist/SHA256SUMS
 
       - uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
@@ -295,61 +334,90 @@ jobs:
           fi
 
       # CloudFormation's Launch Stack links only open templates stored in S3,
-      # so the release's template also goes to the hosted deployment's public
+      # so the release's templates also go to the hosted deployment's public
       # bucket (infra/lib/log-analyzer-stack.ts), by version, and latest.json
       # names the newest stable one for the install guide
-      # (docs.coderhelm.com/self-host/install). It is byte for byte the
-      # launch-stack.yaml in the signed SHA256SUMS.
-      # The role trusts only this repository's "release" environment
-      # (infra/lib/worker-stack.ts, ReleasePublisherRole).
+      # (docs.coderhelm.com/self-host/install). The template is byte for byte
+      # the launch-stack.yaml in the signed SHA256SUMS.
+      # Two roles (infra/lib/worker-stack.ts), each trusting only this file
+      # on a v* tag in the "release" environment:
+      #   release-publisher  creates objects under launch/v*/, never replaces
+      #                      one (If-None-Match is required by its policy);
+      #   release-latest     writes launch/latest.json only, conditionally,
+      #                      after the published release checked out below.
       - uses: aws-actions/configure-aws-credentials@7474bc4690e29a8392af63c5b98e7449536d5c3a # v4.3.1
         with:
           role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/coderhelm-prod-release-publisher
-          role-duration-seconds: 3600
+          role-duration-seconds: 900
           aws-region: us-east-1
-      - name: Upload the templates and latest.json
+      - name: Upload the templates
         run: |
-          key="launch/$TAG/coderhelm-launch.yaml"
-          url="https://$PUBLIC_BUCKET.s3.amazonaws.com/$key"
           # Written once: a template already there must be this one.
-          if curl --proto =https -fsSL -o "$RUNNER_TEMP/existing.yaml" "$url"; then
-            cmp -s "$RUNNER_TEMP/existing.yaml" dist/launch-stack.yaml || { echo "::error::$key already holds another template"; exit 1; }
-          else
-            aws s3api put-object --bucket "$PUBLIC_BUCKET" --key "$key" --body dist/launch-stack.yaml --if-none-match '*' \
-              --content-type text/yaml --cache-control "public, max-age=31536000, immutable" >/dev/null
-          fi
-          # The AWS role templates, by version, written once the same way.
-          for f in coderhelm-log-reader.yaml coderhelm-log-reader-update.yaml; do
-            k="launch/$TAG/$f"
-            if curl --proto =https -fsSL -o "$RUNNER_TEMP/existing-$f" "https://$PUBLIC_BUCKET.s3.amazonaws.com/$k"; then
-              cmp -s "$RUNNER_TEMP/existing-$f" "dist/$f" || { echo "::error::$k already holds another template"; exit 1; }
+          for pair in launch-stack.yaml:coderhelm-launch.yaml coderhelm-log-reader.yaml:coderhelm-log-reader.yaml coderhelm-log-reader-update.yaml:coderhelm-log-reader-update.yaml; do
+            src="dist/${pair%%:*}"
+            k="launch/$TAG/${pair#*:}"
+            if curl --proto =https -fsSL -o "$RUNNER_TEMP/existing" "https://$PUBLIC_BUCKET.s3.amazonaws.com/$k"; then
+              cmp -s "$RUNNER_TEMP/existing" "$src" || { echo "::error::$k already holds another template"; exit 1; }
             else
-              aws s3api put-object --bucket "$PUBLIC_BUCKET" --key "$k" --body "dist/$f" --if-none-match '*' \
-                --content-type text/yaml --cache-control "public, max-age=31536000, immutable" >/dev/null
+              aws s3api put-object --bucket "$PUBLIC_BUCKET" --key "$k" --body "$src" --if-none-match '*' --content-type text/yaml --cache-control "public, max-age=31536000, immutable" >/dev/null
             fi
           done
-          # Pre-releases (v1.2.3-rc.1) are published by version but never become latest,
-          # and latest.json only ever moves forward.
-          if [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            current=$(curl --proto =https -fsSL "https://$PUBLIC_BUCKET.s3.amazonaws.com/launch/latest.json" 2>/dev/null || echo '{}')
-            # shellcheck disable=SC2016 # JavaScript, not shell
-            CURRENT="$current" SHA=$(sha256sum dist/launch-stack.yaml | cut -d' ' -f1) node -e '
-              const tag = process.env.TAG;
-              const n = (v) => String(v || "v0.0.0").replace(/^v/, "").split(/[.-]/).slice(0, 3).map(Number);
-              let cur = {};
-              try { cur = JSON.parse(process.env.CURRENT); } catch {}
-              const [a, b] = [n(tag), n(cur.version)];
-              const newer = a[0] !== b[0] ? a[0] > b[0] : a[1] !== b[1] ? a[1] > b[1] : a[2] > b[2];
-              if (!newer && cur.version !== tag) { console.error(`latest.json names ${cur.version}, newer than ${tag}: left as it is`); process.exit(0); }
-              const bucket = process.env.PUBLIC_BUCKET;
-              require("fs").writeFileSync("latest.json", JSON.stringify({
-                version: tag,
-                templateUrl: `https://${bucket}.s3.amazonaws.com/launch/${tag}/coderhelm-launch.yaml`,
-                templateSha256: process.env.SHA,
-                publishedAt: new Date().toISOString(),
-              }));
-            '
-            if [ -f latest.json ]; then
-              aws s3 cp latest.json "s3://$PUBLIC_BUCKET/launch/latest.json" --content-type application/json --cache-control "public, max-age=300"
-            fi
+
+      # The published release, downloaded from GitHub, checks out as an
+      # install checks it: the signature, from this tag's commit, and every
+      # file against SHA256SUMS. Only then does latest.json move.
+      - name: Verify the published release
+        if: ${{ !contains(needs.check.outputs.tag, '-') }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          d="$RUNNER_TEMP/published" && mkdir -p "$d"
+          gh release download "$TAG" -R "$GITHUB_REPOSITORY" -D "$d"
+          cosign verify-blob --bundle "$d/SHA256SUMS.sigstore.json" \
+            --certificate-identity "https://github.com/$GITHUB_REPOSITORY/.github/workflows/release.yml@refs/tags/$TAG" \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+            --certificate-github-workflow-repository "$GITHUB_REPOSITORY" \
+            --certificate-github-workflow-ref "refs/tags/$TAG" \
+            --certificate-github-workflow-sha "$GITHUB_SHA" \
+            "$d/SHA256SUMS"
+          (cd "$d" && sha256sum -c SHA256SUMS)
+          curl --proto =https -fsSL "https://$PUBLIC_BUCKET.s3.amazonaws.com/launch/$TAG/coderhelm-launch.yaml" | cmp -s - "$d/launch-stack.yaml" \
+            || { echo "::error::the template in S3 is not the signed launch-stack.yaml"; exit 1; }
+      - uses: aws-actions/configure-aws-credentials@7474bc4690e29a8392af63c5b98e7449536d5c3a # v4.3.1
+        if: ${{ !contains(needs.check.outputs.tag, '-') }}
+        with:
+          role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/coderhelm-prod-release-latest
+          role-duration-seconds: 900
+          aws-region: us-east-1
+      # Pre-releases (v1.2.3-rc.1) are published by version but never become
+      # latest, and latest.json only ever moves forward. The write is
+      # conditional: a create, or a replace of the exact copy read (ETag).
+      - name: Move latest.json
+        if: ${{ !contains(needs.check.outputs.tag, '-') }}
+        run: |
+          headers="$RUNNER_TEMP/latest.headers"
+          current=$(curl --proto =https -fsSL -D "$headers" "https://$PUBLIC_BUCKET.s3.amazonaws.com/launch/latest.json" 2>/dev/null || echo '{}')
+          etag=$(sed -n 's/^[Ee][Tt][Aa][Gg]: *//p' "$headers" 2>/dev/null | tr -d '\r' | head -n1)
+          # shellcheck disable=SC2016 # JavaScript, not shell
+          CURRENT="$current" SHA=$(sha256sum dist/launch-stack.yaml | cut -d' ' -f1) node -e '
+            const tag = process.env.TAG;
+            const n = (v) => String(v || "v0.0.0").replace(/^v/, "").split(/[.-]/).slice(0, 3).map(Number);
+            let cur = {};
+            try { cur = JSON.parse(process.env.CURRENT); } catch {}
+            const [a, b] = [n(tag), n(cur.version)];
+            const newer = a[0] !== b[0] ? a[0] > b[0] : a[1] !== b[1] ? a[1] > b[1] : a[2] > b[2];
+            if (!newer && cur.version !== tag) { console.error(`latest.json names ${cur.version}, newer than ${tag}: left as it is`); process.exit(0); }
+            const bucket = process.env.PUBLIC_BUCKET;
+            require("fs").writeFileSync("latest.json", JSON.stringify({
+              version: tag,
+              templateUrl: `https://${bucket}.s3.amazonaws.com/launch/${tag}/coderhelm-launch.yaml`,
+              templateSha256: process.env.SHA,
+              publishedAt: new Date().toISOString(),
+            }));
+          '
+          [ -f latest.json ] || exit 0
+          if [ -n "$etag" ]; then
+            aws s3api put-object --bucket "$PUBLIC_BUCKET" --key launch/latest.json --body latest.json --if-match "$etag" --content-type application/json --cache-control "public, max-age=300" >/dev/null
+          else
+            aws s3api put-object --bucket "$PUBLIC_BUCKET" --key launch/latest.json --body latest.json --if-none-match '*' --content-type application/json --cache-control "public, max-age=300" >/dev/null
           fi

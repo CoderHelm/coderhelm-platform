@@ -559,34 +559,59 @@ export class WorkerStack extends cdk.Stack {
       );
       new cdk.CfnOutput(this, "ReviewerEvalsRoleArn", { value: evalRole.roleArn });
 
-      // ── Release publishing (.github/workflows/release.yml, launch-template job) ──
-      // A tag's Launch Stack template goes to the public bucket under
-      // launch/<tag>/ (CloudFormation only opens templates stored in S3).
-      // Only tag builds of the platform repository may assume it, and it may
-      // only write objects under launch/ (the bucket's policy makes them
-      // public; no ACLs).
+      // ── Release publishing (.github/workflows/release.yml, publish job) ──
+      // A tag's Launch Stack and AWS role templates go to the public bucket
+      // under launch/<tag>/ (CloudFormation only opens templates stored in
+      // S3), and launch/latest.json names the newest stable one. Two roles,
+      // both assumable only by release.yml itself, run on a v* tag, in the
+      // repository's "release" environment (which needs a reviewer's approval
+      // and only admits v* tags: scripts/release-protection.sh):
+      //   publisher  creates objects under launch/v*/ and never overwrites
+      //              one (S3 conditional writes: If-None-Match is required).
+      //   latest     writes only launch/latest.json, and only as a
+      //              conditional write (a create, or a replace of the exact
+      //              version it read), after the job has checked the release.
+      // STS has no ref_type key for GitHub; `ref` matching refs/tags/v* only
+      // matches tags. The sub claim must still be checked (STS requires it).
       if (cfg.publicBucketName) {
-        const publisher = new iam.Role(this, "ReleasePublisherRole", {
-          roleName: `${prefix}-release-publisher`,
-          description: "Release workflow (GitHub Actions, release environment): publishes the Launch Stack template to the public bucket",
-          maxSessionDuration: cdk.Duration.hours(1),
-          assumedBy: new iam.WebIdentityPrincipal(githubOidc.openIdConnectProviderArn, {
-            // Only a job in the repository's "release" environment (which
-            // needs a reviewer's approval, .github/workflows/release.yml):
-            // with an environment, GitHub's token names it, not the tag.
+        const releaseTrust = () =>
+          new iam.WebIdentityPrincipal(githubOidc.openIdConnectProviderArn, {
             StringEquals: {
               "token.actions.githubusercontent.com:aud": "sts.amazonaws.com",
               "token.actions.githubusercontent.com:sub": `repo:${RELEASE_REPO}:environment:release`,
             },
-          }),
+            StringLike: {
+              "token.actions.githubusercontent.com:job_workflow_ref": `${RELEASE_REPO}/.github/workflows/release.yml@refs/tags/v*`,
+              "token.actions.githubusercontent.com:ref": "refs/tags/v*",
+            },
+          });
+        const publisher = new iam.Role(this, "ReleasePublisherRole", {
+          roleName: `${prefix}-release-publisher`,
+          description: "release.yml on a v* tag, release environment: creates (never replaces) the release's templates under launch/v*/ in the public bucket",
+          maxSessionDuration: cdk.Duration.hours(1),
+          assumedBy: releaseTrust(),
         });
         publisher.addToPolicy(
           new iam.PolicyStatement({
             actions: ["s3:PutObject"],
-            resources: [`arn:aws:s3:::${cfg.publicBucketName}/launch/*`],
+            resources: [`arn:aws:s3:::${cfg.publicBucketName}/launch/v*/*`],
+            // Only with If-None-Match: *, so an object already there is never replaced.
+            conditions: { Null: { "s3:if-none-match": "false" } },
           }),
         );
         new cdk.CfnOutput(this, "ReleasePublisherRoleArn", { value: publisher.roleArn });
+
+        const latest = new iam.Role(this, "ReleaseLatestRole", {
+          roleName: `${prefix}-release-latest`,
+          description: "release.yml on a v* tag, release environment, after it checked the published release: writes launch/latest.json only",
+          maxSessionDuration: cdk.Duration.hours(1),
+          assumedBy: releaseTrust(),
+        });
+        const latestKey = `arn:aws:s3:::${cfg.publicBucketName}/launch/latest.json`;
+        // A create (If-None-Match) or a replace of the exact copy read (If-Match: its ETag).
+        latest.addToPolicy(new iam.PolicyStatement({ actions: ["s3:PutObject"], resources: [latestKey], conditions: { Null: { "s3:if-none-match": "false" } } }));
+        latest.addToPolicy(new iam.PolicyStatement({ actions: ["s3:PutObject"], resources: [latestKey], conditions: { Null: { "s3:if-match": "false" } } }));
+        new cdk.CfnOutput(this, "ReleaseLatestRoleArn", { value: latest.roleArn });
       }
     }
   }

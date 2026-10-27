@@ -33,7 +33,7 @@ import { ResolvedConfig } from "./config";
 import { repoPath } from "./paths";
 import { hybridUrlEnvironment } from "./service-env";
 import { releaseStamp, stampEnvironment } from "./release";
-import { CHECK_VERSION, CURL, installCosignCommands, RELEASE_BASE, RELEASE_REPO, VERIFY_SUMS } from "./release-verify";
+import { CHECK_VERSION, CURL, installCosignCommands, RELEASE_BASE, RELEASE_REPO, VERIFY_SUMS, verifyTagCommands } from "./release-verify";
 
 /** The functions that read the install's secret once, at start. */
 export function secretReaders(prefix: string): string[] {
@@ -71,6 +71,8 @@ export function releaseCheckBuildSpec(cfg: ResolvedConfig): codebuild.BuildSpec 
           RELEASE_BASE,
           `${CURL} -o SHA256SUMS "$B/SHA256SUMS"`,
           `${CURL} -o SHA256SUMS.sigstore.json "$B/SHA256SUMS.sigstore.json"`,
+          // The tag: signed by a pinned maintainer key, on main ($COMMIT).
+          ...verifyTagCommands(),
           VERIFY_SUMS,
           // A signed release from before model manifests lists none.
           "if grep -q ' models.json$' SHA256SUMS; then " +
@@ -113,7 +115,9 @@ export function updateBuildSpec(cfg: ResolvedConfig): codebuild.BuildSpec {
           RELEASE_BASE,
           `${CURL} -o SHA256SUMS "$B/SHA256SUMS"`,
           `${CURL} -o SHA256SUMS.sigstore.json "$B/SHA256SUMS.sigstore.json"`,
-          // Signed by exactly this repository's release.yml, on this tag, in Rekor.
+          // The tag: signed by a pinned maintainer key, on main ($COMMIT).
+          ...verifyTagCommands(),
+          // Signed by exactly this repository's release.yml, on this tag and commit, in Rekor.
           VERIFY_SUMS,
           `${CURL} -o coderhelm-selfhost.tgz "$B/coderhelm-selfhost.tgz"`,
           "grep ' coderhelm-selfhost.tgz$' SHA256SUMS | sha256sum -c -",

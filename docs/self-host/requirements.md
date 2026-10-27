@@ -11,8 +11,10 @@ order: 2
 | Node.js | 20 or newer | Runs the installer and the CDK app |
 | AWS CLI | v2 | Credentials, secrets and checks |
 | tar | any | Unpacks the release |
+| git | 2.34 or newer | Checks that the release's tag is signed by a CoderHelm maintainer and is on `main` |
+| ssh-keygen (OpenSSH) | 8.2 or newer | Checks the tag's SSH signature (comes with macOS and most Linux systems) |
+| cosign, or the GitHub CLI (`gh`) | cosign 2.x | Checks the release's signature (one of the two) |
 | A browser | any | One click to create the GitHub App |
-| GitHub CLI (`gh`) | optional | Checks the release's build provenance |
 
 You do not need Rust, Docker or the CDK CLI: the release ships built code, and the installer runs CDK with `npx`.
 
