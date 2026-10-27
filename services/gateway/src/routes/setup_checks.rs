@@ -2054,7 +2054,16 @@ fn google_keys(s: &crate::models::Secrets) -> bool {
 /// Every check, in the order the page shows them.
 pub async fn run_all(state: &AppState, team_id: &str) -> (Vec<Check>, Option<Value>) {
     let (gh, email, model, dlq_n, url, integrations, updater, domain_now) = tokio::join!(
-        github_checks(state, true),
+        async {
+            // Hybrid with CoderHelm's GitHub App: nothing of the install's
+            // own to check (its absence used to fail github_keys and block
+            // updates).
+            if super::hybrid_install::github_hosted(state).await {
+                github_hosted_checks(super::hybrid_install::linked_installations(state).await)
+            } else {
+                github_checks(state, true).await
+            }
+        },
         email_checks(state, true),
         model_check(state, team_id),
         dlq_count(state),
@@ -2433,6 +2442,42 @@ async fn stored_secret() -> Option<Value> {
     serde_json::from_str(r.secret_string()?).ok()
 }
 
+/// GitHub through CoderHelm's app (hybrid), for the admins' checks: there
+/// are no keys of the install's own to check, only whether CoderHelm's app
+/// is linked to this install. Never a failure outside the Integrations
+/// group, so an install on CoderHelm's app can update.
+pub fn github_hosted_checks(links: usize) -> Vec<Check> {
+    let app = Check::pass(
+        "github_app",
+        G,
+        "GitHub App",
+        "This install uses CoderHelm's GitHub App (hybrid), so there are no keys of its own to check.",
+    );
+    let installed = if links > 0 {
+        Check::pass(
+            "github_installations",
+            G,
+            "Installed on your repositories",
+            format!(
+                "CoderHelm's app is linked to this install ({links} installation{}).",
+                if links == 1 { "" } else { "s" }
+            ),
+        )
+    } else {
+        Check::not_ok(
+            Status::Warn,
+            "github_installations",
+            G,
+            "Installed on your repositories",
+            "CoderHelm's GitHub App isn't linked to this install yet.",
+            "CoderHelm can't read code or open pull requests until it is.",
+            Fix::text("Open Settings, System, Hybrid and press Install on GitHub.")
+                .href("/settings/system#hybrid"),
+        )
+    };
+    vec![app, installed]
+}
+
 /// GitHub through CoderHelm's app (hybrid): the app is CoderHelm's, and it's
 /// installed once an installation is linked to this install.
 pub fn public_github_hosted(links: usize) -> [PublicCheck; 2] {
@@ -2666,6 +2711,17 @@ mod tests {
             assert!(!c.detail.is_empty() && !c.why.is_empty());
             assert!(c.fix.unwrap().text.split(". ").count() <= 2);
         }
+    }
+
+    #[test]
+    fn an_install_on_coderhelms_github_app_is_not_blocked() {
+        use super::{github_hosted_checks, Status};
+        let linked = github_hosted_checks(2);
+        assert!(linked.iter().all(|c| c.status == Status::Pass));
+        let unlinked = github_hosted_checks(0);
+        assert!(unlinked.iter().all(|c| c.status != Status::Fail));
+        assert_eq!(unlinked[1].status, Status::Warn);
+        assert!(unlinked.iter().all(|c| c.key != "github_keys"));
     }
 
     use super::*;

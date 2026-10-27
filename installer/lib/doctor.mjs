@@ -50,7 +50,8 @@ export async function collect(ctx, cfg, state) {
   ]);
 
   const { result: secretCheck, secret } = await C.checkSecretStored(ctx, cfg);
-  add("GitHub", [secretCheck, ...(ctx.runner.dryRun ? [] : await C.checkGithubApp(ctx, secret, publicUrl))]);
+  const hybrid = ctx.runner.dryRun ? null : await C.readHybrid(ctx, cfg);
+  add("GitHub", [secretCheck, ...(ctx.runner.dryRun ? [] : await C.checkGithubApp(ctx, secret, publicUrl, hybrid))]);
 
   add("Email", [
     await C.checkSesIdentity(ctx, cfg.email?.from ?? "", cfg.region, { zone: cfg.domain?.hostedZone }),

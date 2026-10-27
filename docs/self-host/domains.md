@@ -9,7 +9,7 @@ CoderHelm serves the dashboard, the API and the chat stream from one hostname th
 | Path | Goes to |
 |---|---|
 | `/api/plans/chat/stream` | the streaming function (server-sent events) |
-| `/api/*`, `/auth/*`, `/webhooks/*`, `/email/*`, `/integrations/*` | the HTTP API |
+| `/api/*`, `/auth/*`, `/webhooks/*`, `/email/*`, `/integrations/*`, `/agent-approvals/*`, `/plugins/approve*` | the HTTP API (the last two are the Approve and Deny links in Slack, Teams and email) |
 | everything else | the dashboard (static files in S3) |
 
 One hostname keeps the session cookie first-party and removes the need for CORS.

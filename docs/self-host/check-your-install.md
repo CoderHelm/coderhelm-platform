@@ -219,7 +219,7 @@ Install admins (`admins` in the config) who are team admins can call these while
 }
 ```
 
-`status` is `pass`, `warn`, `fail` or `skip` (an optional integration that isn't set up). `fix` has `text` and any of `command` (to copy), `url` (outside CoderHelm) and `href` (a dashboard page). `ready` is true when nothing fails. Keys: `url`, `domain`, `github_keys`, `github_app`, `github_permissions`, `github_installations`, `github_webhook`, `email_identity`, `email_sandbox`, `model`, `dlq`, `updates`, `slack`, `teams`, `jira`, `aws_connections`, `google_sign_in`.
+`status` is `pass`, `warn`, `fail` or `skip` (an optional integration that isn't set up). `fix` has `text` and any of `command` (to copy), `url` (outside CoderHelm) and `href` (a dashboard page). `ready` is true when nothing fails. Keys: `url`, `domain`, `github_keys`, `github_app`, `github_permissions`, `github_installations`, `github_webhook`, `email_identity`, `email_sandbox`, `model`, `dlq`, `updates`, `slack`, `teams`, `jira`, `aws_connections`, `google_sign_in`. On an install that uses CoderHelm's GitHub App (hybrid), `github_app` and `github_installations` say whether the app is linked instead, and never block an update.
 
 ### `GET /api/system/domain`, `PUT /api/system/domain`, `DELETE /api/system/domain`
 

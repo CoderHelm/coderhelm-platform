@@ -32,8 +32,22 @@ import { ResolvedConfig } from "./config";
 import { recordNameIn } from "./service-env";
 import { releaseStamp } from "./release";
 
-/** Paths the HTTP API serves (each also matches its sub-paths). */
-export const API_PATHS = ["/api/*", "/auth/*", "/webhooks/*", "/email/*", "/integrations/*", "/openapi.json"];
+/**
+ * Paths the HTTP API serves (each also matches its sub-paths). Includes the
+ * signed approval links in Slack, Teams and email (`/agent-approvals/link`,
+ * `/plugins/approve`); only that one plugin path, since the dashboard's own
+ * pages live under `/plugins/`.
+ */
+export const API_PATHS = [
+  "/api/*",
+  "/auth/*",
+  "/webhooks/*",
+  "/email/*",
+  "/integrations/*",
+  "/agent-approvals/*",
+  "/plugins/approve*",
+  "/openapi.json",
+];
 /** The chat stream (SSE, served by the streaming function). */
 export const STREAM_PATH = "/api/plans/chat/stream";
 

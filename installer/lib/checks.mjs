@@ -543,8 +543,14 @@ async function gh(ctx, jwt, p) {
  * there means the webhook secret doesn't match), the installations, and
  * the OAuth client id and secret.
  */
-export async function checkGithubApp(ctx, secret, publicUrl) {
+export async function checkGithubApp(ctx, secret, publicUrl, hybrid = null) {
   const out = [];
+  // Hybrid with CoderHelm's GitHub App: the install has no app of its own
+  // to check (its absence isn't a failure).
+  if (hybrid?.github_mode === "hosted") {
+    out.push(pass("github_keys", "GitHub App created", "CoderHelm's GitHub App (hybrid)"));
+    return out;
+  }
   const hasKeys = secret?.github_app_id && String(secret.github_private_key ?? "").includes("PRIVATE KEY");
   if (!hasKeys) {
     out.push(problem(FAIL, "github_keys", "GitHub App created", {
@@ -744,6 +750,18 @@ export async function checkDlq(ctx, cfg) {
     why: "Each is work CoderHelm didn't do, such as a ticket that never started.",
     fix: { text: "Open the failed events page in the dashboard to retry or clear each one.", url: cfg.domain?.hostname ? `https://${cfg.domain.hostname}/admin/queue/` : undefined },
   });
+}
+
+/** The install's hybrid settings (Settings, System, Hybrid), or null. */
+export async function readHybrid(ctx, cfg) {
+  const d = derived(cfg);
+  const key = JSON.stringify({ pk: { S: "SYSTEM" }, sk: { S: "HYBRID" } });
+  const r = await aws(ctx, ["dynamodb", "get-item", "--table-name", `${d.prefix}-settings`, "--key", key], cfg.region, {});
+  try {
+    return r?.Item?.data?.S ? JSON.parse(r.Item.data.S) : null;
+  } catch {
+    return null;
+  }
 }
 
 export async function checkSecretStored(ctx, cfg) {
