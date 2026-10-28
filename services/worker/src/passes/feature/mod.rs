@@ -343,7 +343,26 @@ async fn checklist_facts(
         .filter(|(p, s, _)| s == "added" && content::is_e2e_spec(p))
         .map(|(p, _, _)| p.clone())
         .collect();
+    // Every value of each new option the change adds, against the tests the
+    // change adds or changes (read whole: a large file's patch is cut).
+    let options = checklist::new_options(files);
+    let mut tests_text = String::new();
+    if !options.is_empty() {
+        for (p, _, patch) in files
+            .iter()
+            .filter(|(p, s, _)| s != "removed" && checklist::is_test_path(p))
+            .take(15)
+        {
+            match w.github.read_file(owner, repo, p, w.branch).await {
+                Ok(t) => tests_text.push_str(&t),
+                Err(_) => tests_text.push_str(patch),
+            }
+            tests_text.push('\n');
+        }
+    }
     let facts = checklist::Facts {
+        options_found: options.len(),
+        options_untested: checklist::untested_options(&options, &tests_text),
         cases_required: checklist::acceptance_cases(&w.msg.body, &w.plan.spec),
         cases_added: checklist::unit_cases_added(files),
         ui: checklist::is_ui(&paths),
