@@ -611,7 +611,7 @@ pub async fn ingest(state: &WorkerState, msg: TestIngest) -> Result<(), Err> {
         }
         // A run that failed only on quarantined tests needs no fix or re-run.
         if failed > 0 && !run.rescued && is_own_pr(&gh, &msg, pr).await {
-            own_pr_failures(state, &gh, &msg, &run, pr, &lines).await;
+            own_pr_failures(state, &gh, &msg, &run, pr, &lines, &tests).await;
         }
         recommend_from_pr(state, &gh, &msg, pr, &changed, map.as_ref()).await;
         follow_generated(state, &gh, &msg, &run, &tests).await;
@@ -725,7 +725,7 @@ pub async fn triage_markdown(
 // ── Coderhelm's own PRs ──────────────────────────────────────────────────
 
 /// The newest Coderhelm run for a branch: (run id, status).
-async fn run_for_branch(
+pub(crate) async fn run_for_branch(
     state: &WorkerState,
     team_id: &str,
     repo: &str,
@@ -765,12 +765,41 @@ async fn own_pr_failures(
     run: &Run,
     pr: u64,
     lines: &[Line],
+    tests: &[ParsedTest],
 ) {
     let repo = format!("{}/{}", msg.repo_owner, msg.repo_name);
-    let caused: Vec<&Line> = lines
+    let mut caused: Vec<&Line> = lines
         .iter()
         .filter(|l| l.verdict == Verdict::Caused)
         .collect();
+    // Before anything is blamed on the change: what the page showed, and
+    // whether the diff touches the code the failing steps run. Unrelated
+    // failures get a separate fix and block CI; they never reach the fix
+    // loop. This runs before the run's own CI loop looks, so it finds the
+    // record (see `quarantine::gate`).
+    let mut causality: HashMap<String, String> = HashMap::new();
+    if !caused.is_empty() {
+        let failing: Vec<&ParsedTest> = tests
+            .iter()
+            .filter(|t| caused.iter().any(|l| l.title == t.full_title()))
+            .collect();
+        let found = super::e2e_attribution::handle_own_pr(state, gh, msg, pr, &failing).await;
+        caused.retain(|l| {
+            !found.iter().any(|a| {
+                a.test == l.title && a.verdict == common::e2e::attribution::Verdict::Unrelated
+            })
+        });
+        for a in found {
+            causality.insert(a.test.clone(), a.causality_line());
+        }
+        if caused.is_empty() {
+            info!(
+                pr,
+                "Every E2E failure is unrelated to this change; fixed separately"
+            );
+            return;
+        }
+    }
     if !caused.is_empty() {
         let Some((run_id, status)) =
             run_for_branch(state, &msg.team_id, &repo, &msg.head_branch).await
@@ -796,7 +825,7 @@ async fn own_pr_failures(
             )
             .await;
             let body = format!(
-                "These E2E failures look related to this change, but Coderhelm has used its automatic fix attempts on this PR, so it's over to you:\n\n{}",
+                "These E2E failures may come from this change, but Coderhelm has used its automatic fix attempts on this PR, so it's over to you:\n\n{}",
                 caused.iter().map(|l| format!("- {}", l.text)).collect::<Vec<_>>().join("\n")
             );
             let _ = gh
@@ -812,7 +841,8 @@ async fn own_pr_failures(
                 .iter()
                 .map(|l| {
                     let rel = if l.related.is_empty() { String::new() } else { format!(" Related files: {}.", l.related.join(", ")) };
-                    format!("- `{}`: {}{rel}", l.title, l.error)
+                    let path = causality.get(&l.title).map(|c| format!(" {c}.")).unwrap_or_default();
+                    format!("- `{}`: {}{rel}{path}", l.title, l.error)
                 })
                 .collect::<Vec<_>>()
                 .join("\n"),

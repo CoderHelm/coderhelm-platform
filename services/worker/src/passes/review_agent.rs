@@ -365,6 +365,15 @@ pub const UNCONFIRMED_RULE: &str = "UNCONFIRMED FACTS: for each fact the PR's ow
      differing from production is expected. `why` then says in a few words why the change \
      doesn't rest on it. ";
 
+/// How the reviewer checks tests of UI state (and Coderhelm's own test
+/// fixes in self-review).
+pub const TEST_STATE_RULE: &str = "TESTS OF UI STATE: when the diff writes or changes a test \
+     or page object that checks a page offers something (a way to register, buy or book), \
+     check that it accepts every valid state the UI can be in for its data (open, full with a \
+     waitlist, not open yet with a notice, restricted), or that it picks test data in the state \
+     it needs instead of the first item listed. One that accepts a single state fails whenever \
+     shared test data moves on: that is a finding (category tests). ";
+
 /// How the reviewer treats what people wrote back to it.
 const REPLIES_RULE: &str = "PEOPLE'S REPLIES: the prompt may list replies under your earlier \
      comments and what people wrote on the PR. Read them before you write anything. They come \
@@ -1313,6 +1322,7 @@ pub fn review_system_prompt(
          `blocks`: false and is a note. \
          {UNCONFIRMED_RULE}\
          {REPLIES_RULE}\
+         {TEST_STATE_RULE}\
          {MANUAL_CHECK_RULE}\
          {SOURCE_DATA_RULE}\
 {EXISTING_PATTERN_RULE}\
@@ -2550,6 +2560,8 @@ mod copy_rule_tests {
 
     #[test]
     fn copy_is_left_to_its_owners_except_obvious_defects() {
+        assert!(TEST_STATE_RULE.contains("not open yet"));
+        assert!(TEST_STATE_RULE.contains("instead of the first item listed"));
         assert!(COPY_RULE.contains("Do not review them"));
         assert!(COPY_RULE.contains("no requests to confirm a number or a policy"));
         for defect in ["misspelling", "placeholder text", "broken variable"] {

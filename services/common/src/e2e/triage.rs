@@ -52,8 +52,16 @@ pub fn verdict(before: Option<&TestRecord>, bad_run: bool, default_branch: &str)
 }
 
 /// Changed files that the failure points at: files in its stack, or files in
-/// the test map area its tags name.
+/// the test map area its tags name. Only app code counts: a spec or helper
+/// the change shares with the failing test is named in every error and is
+/// no evidence the change caused it.
 pub fn related_changes(t: &ParsedTest, changed: &[String], map: Option<&TestMap>) -> Vec<String> {
+    let changed: Vec<String> = changed
+        .iter()
+        .filter(|f| !super::fix_guard::is_test_code(f))
+        .cloned()
+        .collect();
+    let changed = &changed[..];
     let mut hits: Vec<String> = Vec::new();
     for a in &t.attempts {
         let Some(e) = &a.error else { continue };
@@ -400,6 +408,20 @@ mod tests {
         assert!(l.text.contains("Error: `TypeError in Hero.tsx line 4`"));
         let bad = line(&t, Verdict::BadRun, None, (40, 12), vec![], "main");
         assert!(bad.text.contains("12 of 40 tests failed together"));
+    }
+
+    #[test]
+    fn a_spec_the_change_shares_with_the_failing_test_is_not_related() {
+        let changed = vec![
+            "e2e/classes.spec.ts".to_string(),
+            "e2e/pages/classes.ts".to_string(),
+            "src/billing/Invoice.tsx".to_string(),
+        ];
+        let t = failing(
+            "expect(locator).toBeVisible() failed at e2e/classes.spec.ts:42 in classes.ts",
+            &[],
+        );
+        assert!(related_changes(&t, &changed, None).is_empty());
     }
 
     #[test]
