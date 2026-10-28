@@ -80,6 +80,9 @@ pub const ROLES: &[RoleInfo] = &[
 pub struct Capability {
     pub key: &'static str,
     pub label: &'static str,
+    /// Two to five words for a list or a checkbox (the role editor); `label`
+    /// is the full sentence shown under it.
+    pub short_label: &'static str,
     /// Lowest role allowed (a key of `ROLES`).
     pub min_role: &'static str,
     /// Route handlers (`file::function`) whose role check this row describes.
@@ -93,6 +96,8 @@ pub const CAPABILITIES: &[Capability] = &[
     Capability {
         key: "view",
         label: "See and search runs, plans, reviews, analytics, repos, tests and settings",
+
+        short_label: "See runs, plans and settings",
         min_role: "viewer",
         handlers: &[
             "api::list_runs",
@@ -119,6 +124,8 @@ pub const CAPABILITIES: &[Capability] = &[
     Capability {
         key: "brain_read",
         label: "Read knowledge open to their role and chats shared with the team",
+
+        short_label: "Read knowledge and chats",
         min_role: "viewer",
         handlers: &[
             "knowledge::list_bases",
@@ -132,12 +139,16 @@ pub const CAPABILITIES: &[Capability] = &[
     Capability {
         key: "view_team",
         label: "See who is on the team",
+
+        short_label: "See the team",
         min_role: "viewer",
         handlers: &["users::list_users", "roles::list_roles"],
     },
     Capability {
         key: "own_account",
         label: "Manage your own password, two-factor and notifications",
+
+        short_label: "Manage your own account",
         min_role: "viewer",
         handlers: &[
             "users::change_password",
@@ -154,6 +165,8 @@ pub const CAPABILITIES: &[Capability] = &[
     Capability {
         key: "plugins.view",
         label: "See installed plugins, their runs, drafts and approvals",
+
+        short_label: "See plugins",
         min_role: "viewer",
         handlers: &[
             "plugin_pkgs::get_flag",
@@ -173,6 +186,8 @@ pub const CAPABILITIES: &[Capability] = &[
     Capability {
         key: "brain_ask",
         label: "Ask questions in Chat, attach files, rate answers, and rename, share or delete their own chats",
+
+        short_label: "Ask questions in Chat",
         min_role: "member",
         handlers: &[
             "brain::stream_token",
@@ -185,6 +200,8 @@ pub const CAPABILITIES: &[Capability] = &[
     Capability {
         key: "plans",
         label: "Create, edit, approve and run plans and templates",
+
+        short_label: "Create and run plans",
         min_role: "member",
         handlers: &[
             "plans::create_plan",
@@ -209,6 +226,8 @@ pub const CAPABILITIES: &[Capability] = &[
     Capability {
         key: "mcp_connect",
         label: "Connect your own account to MCP servers that use personal sign-in",
+
+        short_label: "Sign in to MCP servers",
         min_role: "member",
         handlers: &[
             "mcp_servers::connect",
@@ -220,6 +239,8 @@ pub const CAPABILITIES: &[Capability] = &[
     Capability {
         key: "runs",
         label: "Retry, re-run, re-review, cancel, close or reopen runs",
+
+        short_label: "Retry and cancel runs",
         min_role: "member",
         handlers: &[
             "api::retry_run",
@@ -235,6 +256,8 @@ pub const CAPABILITIES: &[Capability] = &[
     Capability {
         key: "reviews",
         label: "Ask for a re-review, rate reviews, send release notes and release now",
+
+        short_label: "Act on reviews and releases",
         min_role: "member",
         handlers: &[
             "reviewer::re_review",
@@ -247,6 +270,8 @@ pub const CAPABILITIES: &[Capability] = &[
     Capability {
         key: "recommendations",
         label: "Act on log findings: create fix PRs or plans, read sample lines, acknowledge or ignore them",
+
+        short_label: "Act on log findings",
         min_role: "member",
         handlers: &[
             "log_analyzer::create_plan_from_recommendation",
@@ -262,12 +287,16 @@ pub const CAPABILITIES: &[Capability] = &[
     Capability {
         key: "agents.approve",
         label: "Approve or deny what agents ask to do (once)",
+
+        short_label: "Approve agent requests",
         min_role: "member",
         handlers: &["agent_policy::decide"],
     },
     Capability {
         key: "view_alerts",
         label: "See alerts and where they are routed",
+
+        short_label: "See alerts",
         min_role: "member",
         handlers: &[
             "alerts::list_routes",
@@ -279,12 +308,16 @@ pub const CAPABILITIES: &[Capability] = &[
     Capability {
         key: "view_integrations",
         label: "See integrations, what each can do and whether it works",
+
+        short_label: "See integrations",
         min_role: "member",
         handlers: &["integrations::list"],
     },
     Capability {
         key: "plugins.run",
         label: "Start plugin runs from a brief, edit drafts and send them for review",
+
+        short_label: "Run plugins",
         min_role: "member",
         handlers: &[
             "plugin_pkgs::start_run",
@@ -295,6 +328,8 @@ pub const CAPABILITIES: &[Capability] = &[
     Capability {
         key: "plugins.approve",
         label: "Approve, reject, stop or cancel plugin drafts (only for plugins that name you as an approver, or as an admin when a plugin names none)",
+
+        short_label: "Approve plugin drafts",
         min_role: "member",
         handlers: &[
             "plugin_pkgs::approve_draft",
@@ -307,6 +342,8 @@ pub const CAPABILITIES: &[Capability] = &[
     Capability {
         key: "knowledge_manage",
         label: "Create, change and delete knowledge bases, upload and remove their files, connect apps whose pages stay in sync, and attach them to agents",
+
+        short_label: "Manage knowledge bases",
         min_role: "admin",
         handlers: &[
             "knowledge::create_base",
@@ -330,6 +367,8 @@ pub const CAPABILITIES: &[Capability] = &[
     Capability {
         key: "people",
         label: "Invite people, resend or revoke any pending invite, link GitHub accounts, and change or remove members and viewers",
+
+        short_label: "Invite and manage people",
         min_role: "admin",
         handlers: &[
             "users::invite_user",
@@ -342,6 +381,8 @@ pub const CAPABILITIES: &[Capability] = &[
     Capability {
         key: "sign_in",
         label: "Require two-factor sign-in for the team, see who has it, reset a person's two-factor sign-in, and on a self-hosted install change who may join (allowed email domains)",
+
+        short_label: "Set sign-in rules",
         min_role: "admin",
         // Sign-in rules stay with built-in admins and owners
         // (`NEVER_IN_CUSTOM_ROLES`).
@@ -354,6 +395,8 @@ pub const CAPABILITIES: &[Capability] = &[
     Capability {
         key: "roles",
         label: "Create, edit and delete custom roles, give people a custom role, and see the log of role changes",
+
+        short_label: "Manage custom roles",
         min_role: "admin",
         // Each of these also checks for a built-in admin or owner itself
         // (`roles::role_manager`): a custom role never manages roles.
@@ -367,18 +410,24 @@ pub const CAPABILITIES: &[Capability] = &[
     Capability {
         key: "api_keys",
         label: "Create and revoke the team's API keys, each with scopes no wider than your own",
+
+        short_label: "Manage API keys",
         min_role: "admin",
         handlers: &["api_keys::list", "api_keys::create", "api_keys::revoke"],
     },
     Capability {
         key: "delete_plans",
         label: "Delete plans",
+
+        short_label: "Delete plans",
         min_role: "admin",
         handlers: &["plans::delete_plan"],
     },
     Capability {
         key: "repos",
         label: "Manage repositories: sync, turn on, roles, codegen environment, code graph (turn off, rebuild) and infrastructure scans",
+
+        short_label: "Manage repositories",
         min_role: "admin",
         handlers: &[
             "api::sync_repos",
@@ -401,6 +450,8 @@ pub const CAPABILITIES: &[Capability] = &[
     Capability {
         key: "agent_settings",
         label: "Edit instructions, rules, voice, agent context, workflow, git conventions and reviewer settings, and remove what the reviewer learned",
+
+        short_label: "Edit agent settings",
         min_role: "admin",
         handlers: &[
             "api::update_global_instructions",
@@ -421,6 +472,8 @@ pub const CAPABILITIES: &[Capability] = &[
     Capability {
         key: "agents.permissions",
         label: "Edit agent permissions: rules, presets, the autonomy limit, agent switches, pause all agents, sandbox allowlists, and approve \"always\"",
+
+        short_label: "Edit agent permissions",
         min_role: "admin",
         handlers: &[
             "agent_policy::save_settings",
@@ -437,6 +490,8 @@ pub const CAPABILITIES: &[Capability] = &[
     Capability {
         key: "learning",
         label: "Pin a prompt variant, revert or restore what Coderhelm learned, and tune the reward weights",
+
+        short_label: "Manage what agents learned",
         min_role: "admin",
         handlers: &[
             "learning::pin_variant",
@@ -448,6 +503,8 @@ pub const CAPABILITIES: &[Capability] = &[
     Capability {
         key: "memory",
         label: "Add, edit and delete team memory",
+
+        short_label: "Edit team memory",
         min_role: "admin",
         handlers: &[
             "memory::create_memory",
@@ -458,6 +515,8 @@ pub const CAPABILITIES: &[Capability] = &[
     Capability {
         key: "integrations",
         label: "Connect GitHub, Jira, AWS accounts, monitoring and docs tools, Teams and MCP servers (and the tools agents get from each), and choose what each may do",
+
+        short_label: "Connect integrations",
         min_role: "admin",
         handlers: &[
             "github::link_installation",
@@ -498,6 +557,8 @@ pub const CAPABILITIES: &[Capability] = &[
     Capability {
         key: "data_sources",
         label: "Manage data sources, team tools and skills",
+
+        short_label: "Manage data sources and tools",
         min_role: "admin",
         handlers: &[
             "data_sources::list",
@@ -548,6 +609,8 @@ pub const CAPABILITIES: &[Capability] = &[
     Capability {
         key: "tests",
         label: "Change test settings; quarantine, pin and fix tests; open setup pull requests",
+
+        short_label: "Manage tests",
         min_role: "admin",
         handlers: &[
             "tests::put_settings",
@@ -563,6 +626,8 @@ pub const CAPABILITIES: &[Capability] = &[
     Capability {
         key: "alerts",
         label: "Configure alert routes, the alert budget, alert notifications and automatic fixes for log findings",
+
+        short_label: "Configure alerts",
         min_role: "admin",
         handlers: &[
             "log_findings::put_autofix",
@@ -579,12 +644,16 @@ pub const CAPABILITIES: &[Capability] = &[
     Capability {
         key: "model_provider",
         label: "See and change the model provider key",
+
+        short_label: "Change the model provider key",
         min_role: "admin",
         handlers: &["api::get_model_provider", "api::update_model_provider"],
     },
     Capability {
         key: "system",
         label: "See system health and retry or clear failed events",
+
+        short_label: "System health and updates",
         min_role: "admin",
         handlers: &[
             "api::health",
@@ -597,6 +666,8 @@ pub const CAPABILITIES: &[Capability] = &[
     Capability {
         key: "webhooks",
         label: "Add, change and delete webhook endpoints, reveal and rotate their signing secrets, and send, resend and replay their events",
+
+        short_label: "Manage webhooks",
         min_role: "admin",
         handlers: &[
             "webhooks::event_types",
@@ -616,6 +687,8 @@ pub const CAPABILITIES: &[Capability] = &[
     Capability {
         key: "deliveries",
         label: "See every event in and out (webhooks, relay forwards, notifications, email), how they went over time, and send failed ones again",
+
+        short_label: "Resend event deliveries",
         min_role: "admin",
         handlers: &[
             "deliveries::list",
@@ -627,12 +700,16 @@ pub const CAPABILITIES: &[Capability] = &[
     Capability {
         key: "budget",
         label: "Set the monthly token limit",
+
+        short_label: "Set the token limit",
         min_role: "admin",
         handlers: &["api::update_budget"],
     },
     Capability {
         key: "support",
         label: "Let Coderhelm support into the workspace, and manage every support ticket the team files",
+
+        short_label: "Manage support access",
         min_role: "admin",
         // Enforced inside the support handlers by the built-in role, so it
         // stays with built-in admins and owners (`NEVER_IN_CUSTOM_ROLES`).
@@ -641,6 +718,8 @@ pub const CAPABILITIES: &[Capability] = &[
     Capability {
         key: "system",
         label: "See this install's version, setup checks and update readiness, update it or roll it back, change its domain, use CoderHelm's address, apps and event relay (hybrid), and send a test email (self-hosted installs; install admins only)",
+
+        short_label: "System health and updates",
         min_role: "admin",
         // Also checked inside each handler: the person must be an install
         // admin (PLATFORM_ADMIN_EMAILS).
@@ -671,6 +750,8 @@ pub const CAPABILITIES: &[Capability] = &[
     Capability {
         key: "system.models",
         label: "Change how this install calls Claude (Amazon Bedrock or Anthropic API keys), after every model it uses answers a test call (self-hosted installs; install admins only)",
+
+        short_label: "Set how models are called",
         min_role: "admin",
         // Also checked inside each handler: the person must be an install
         // admin (PLATFORM_ADMIN_EMAILS).
@@ -683,6 +764,8 @@ pub const CAPABILITIES: &[Capability] = &[
     Capability {
         key: "emails",
         label: "Choose which optional emails this install sends and whether it sends through its own Amazon SES or CoderHelm (self-hosted installs; install admins only)",
+
+        short_label: "Choose install emails",
         min_role: "admin",
         // Also checked inside each handler: the person must be an install
         // admin (PLATFORM_ADMIN_EMAILS).
@@ -691,6 +774,8 @@ pub const CAPABILITIES: &[Capability] = &[
     Capability {
         key: "platform_admin",
         label: "See self-hosted installs that use CoderHelm's hosted parts, and pause their email (CoderHelm's own platform admins only)",
+
+        short_label: "Manage hosted installs",
         min_role: "admin",
         // Also checked inside each handler: the person must be a platform
         // admin on the hosted deployment.
@@ -703,6 +788,8 @@ pub const CAPABILITIES: &[Capability] = &[
     Capability {
         key: "plugins.install",
         label: "Add plugin sources, install, update, pin or roll back plugins, and set their settings, approvers and limits",
+
+        short_label: "Install and configure plugins",
         min_role: "admin",
         handlers: &[
             "plugin_pkgs::put_settings",
@@ -725,6 +812,8 @@ pub const CAPABILITIES: &[Capability] = &[
     Capability {
         key: "plugins.audit",
         label: "Read the audit log",
+
+        short_label: "Read the audit log",
         min_role: "admin",
         handlers: &[
             "plugin_pkgs::audit_log",
@@ -734,6 +823,8 @@ pub const CAPABILITIES: &[Capability] = &[
     Capability {
         key: "manage_admins",
         label: "Make someone an admin or owner, and change or remove admins and owners",
+
+        short_label: "Manage admins and owners",
         min_role: "owner",
         // Enforced inside the people handlers by `can_manage` / `can_grant`.
         handlers: &[],
@@ -741,18 +832,24 @@ pub const CAPABILITIES: &[Capability] = &[
     Capability {
         key: "team_name",
         label: "Rename the team",
+
+        short_label: "Rename the team",
         min_role: "owner",
         handlers: &["api::rename_team"],
     },
     Capability {
         key: "disconnect",
         label: "Remove the Jira integration or the model provider key",
+
+        short_label: "Remove Jira or model key",
         min_role: "owner",
         handlers: &["api::delete_jira_integration", "api::delete_model_provider"],
     },
     Capability {
         key: "reset",
         label: "Reset account data",
+
+        short_label: "Reset account data",
         min_role: "owner",
         handlers: &["api::reset_account"],
     },
@@ -1445,12 +1542,9 @@ mod tests {
         ))
         .unwrap();
         for c in CAPABILITIES {
-            assert!(
-                !re.is_match(c.label),
-                "capability {} label: {}",
-                c.key,
-                c.label
-            );
+            for text in [c.label, c.short_label] {
+                assert!(!re.is_match(text), "capability {} label: {}", c.key, text);
+            }
         }
         let literal = regex::Regex::new(r#""((?:[^"\\]|\\.)*)""#).unwrap();
         let sources: &[(&str, &str)] = &[
@@ -1630,6 +1724,35 @@ mod tests {
         let mut sorted = levels.clone();
         sorted.sort();
         assert_eq!(levels, sorted);
+    }
+
+    #[test]
+    fn every_capability_has_a_short_label_of_two_to_five_words() {
+        let mut by_label: HashMap<&str, &str> = HashMap::new();
+        for c in CAPABILITIES {
+            let words = c.short_label.split_whitespace().count();
+            assert!(
+                (2..=5).contains(&words),
+                "{}: \"{}\" has {words} words",
+                c.key,
+                c.short_label
+            );
+            assert!(
+                c.short_label.len() < c.label.len() || c.short_label == c.label,
+                "{}: the short label is longer than the label",
+                c.key
+            );
+            assert!(!c.short_label.ends_with('.'), "{}", c.key);
+            // One short label per key (a key may have more than one row),
+            // and no two keys read the same in the role editor.
+            if let Some(other) = by_label.insert(c.short_label, c.key) {
+                assert_eq!(other, c.key, "\"{}\" names two capabilities", c.short_label);
+            }
+        }
+        for c in CAPABILITIES {
+            let first = CAPABILITIES.iter().find(|x| x.key == c.key).unwrap();
+            assert_eq!(first.short_label, c.short_label, "{}", c.key);
+        }
     }
 
     #[test]
