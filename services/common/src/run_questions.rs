@@ -44,6 +44,10 @@ pub struct Question {
     /// `suggestions` are then the choices.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub decision: String,
+    /// The evidence the question cites (`path:line`, a lookup id): what in
+    /// the code or the data makes it a question (see `stop_rules::screen`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub evidence: Vec<String>,
 }
 
 /// What a run asked when it stopped, and where it asked it.
@@ -178,6 +182,13 @@ pub fn parse(detail: &str) -> Vec<Question> {
             });
         } else if let (Some(why), Some(last)) = (field(item, "why"), out.last_mut()) {
             last.why = why.to_string();
+        } else if let (Some(ev), Some(last)) = (field(item, "evidence"), out.last_mut()) {
+            last.evidence = ev
+                .split('|')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .collect();
         } else if let (Some(opts), Some(last)) = (
             field(item, "options").or_else(|| field(item, "suggestions")),
             out.last_mut(),
@@ -250,6 +261,13 @@ fn tidy(questions: Vec<Question>) -> Vec<Question> {
                 .take(MAX_SUGGESTIONS)
                 .collect(),
             decision: q.decision,
+            evidence: q
+                .evidence
+                .iter()
+                .map(|s| clip(s.trim(), MAX_SUGGESTION_CHARS))
+                .filter(|s| !s.is_empty())
+                .take(MAX_SUGGESTIONS)
+                .collect(),
         })
         .collect()
 }
@@ -272,6 +290,16 @@ pub fn markdown(questions: &[Question]) -> String {
                     .join(", ")
             ));
         }
+        if !q.evidence.is_empty() {
+            out.push_str(&format!(
+                "   Evidence: {}\n",
+                q.evidence
+                    .iter()
+                    .map(|s| format!("`{s}`"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
     }
     out.trim_end().to_string()
 }
@@ -288,6 +316,9 @@ pub fn plain(questions: &[Question]) -> String {
             }
             if !q.suggestions.is_empty() {
                 s.push_str(&format!(" Possible answers: {}.", q.suggestions.join("; ")));
+            }
+            if !q.evidence.is_empty() {
+                s.push_str(&format!(" Evidence: {}.", q.evidence.join("; ")));
             }
             s
         })

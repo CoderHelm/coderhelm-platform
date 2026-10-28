@@ -1,0 +1,14 @@
+import { defineConfig, devices } from '@playwright/test';
+import 'dotenv/config';
+
+export default defineConfig({
+  testDir: './tests',
+  globalSetup: './support/global-setup.ts',
+  retries: process.env.CI ? 2 : 0,
+  use: {
+    baseURL: process.env.E2E_BASE_URL ?? 'https://staging.example.test',
+    storageState: 'storage/state.json',
+    extraHTTPHeaders: { 'x-dataset': process.env.TEST_DATASET || 'default' },
+  },
+  projects: [{ name: 'chromium', use: { ...devices['Desktop Chrome'] } }],
+});

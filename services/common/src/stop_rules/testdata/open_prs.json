@@ -1,0 +1,38 @@
+[
+  {
+    "number": 40,
+    "title": "Theme: darker header",
+    "body": "Darker header colours for the settings page.",
+    "head": {"ref": "theme-dark"},
+    "user": {"login": "dev-a"},
+    "html_url": "https://github.com/acme/web/pull/40",
+    "files": ["src/settings/theme.ts"]
+  },
+  {
+    "number": 41,
+    "title": "Fix cards list spec: shows the card it created",
+    "body": "The spec read the first card on the page, which on a shared environment isn't the one it made. It now selects the card by its name.",
+    "head": {"ref": "fix-cards-spec"},
+    "user": {"login": "dev-b"},
+    "html_url": "https://github.com/acme/web/pull/41",
+    "files": ["e2e/tests/cards.spec.ts", "e2e/pages/cards.page.ts"]
+  },
+  {
+    "number": 44,
+    "title": "ABC-12 follow-up notes",
+    "body": "",
+    "head": {"ref": "notes"},
+    "user": {"login": "dev-c"},
+    "html_url": "https://github.com/acme/web/pull/44",
+    "files": ["docs/notes.md"]
+  },
+  {
+    "number": 45,
+    "title": "ABC-12: cards list spec",
+    "body": "",
+    "head": {"ref": "coderhelm/abc-12"},
+    "user": {"login": "coderhelm[bot]"},
+    "html_url": "https://github.com/acme/web/pull/45",
+    "files": ["e2e/tests/cards.spec.ts"]
+  }
+]

@@ -22,6 +22,9 @@ pub const RUNNING: &str = "running";
 pub const AWAITING_CI: &str = "awaiting_ci";
 pub const NEEDS_INPUT: &str = "needs_input";
 pub const NEEDS_OUTSIDE_CHANGE: &str = "needs_outside_change";
+/// An open pull request (anyone's) already does the work: the run linked it
+/// and built no second fix (see `stop_rules::existing_work`).
+pub const COVERED_BY_PR: &str = "covered_by_pr";
 pub const COMPLETED: &str = "completed";
 /// Older runs finished with this word before `completed`.
 pub const SUCCESS: &str = "success";
@@ -36,13 +39,14 @@ pub const RETRIED: &str = "retried";
 pub const ARCHIVED: &str = "archived";
 
 /// Every status a run record carries.
-pub const ALL: [&str; 14] = [
+pub const ALL: [&str; 15] = [
     PENDING,
     QUEUED,
     RUNNING,
     AWAITING_CI,
     NEEDS_INPUT,
     NEEDS_OUTSIDE_CHANGE,
+    COVERED_BY_PR,
     COMPLETED,
     SUCCESS,
     MERGED,
@@ -198,6 +202,7 @@ mod tests {
             AWAITING_CI,
             NEEDS_INPUT,
             NEEDS_OUTSIDE_CHANGE,
+            COVERED_BY_PR,
             COMPLETED,
             SUCCESS,
             FAILED,
@@ -225,6 +230,7 @@ mod tests {
         assert_eq!(reopen_status(COMPLETED), COMPLETED);
         assert_eq!(reopen_status(FAILED), FAILED);
         assert_eq!(reopen_status(NEEDS_OUTSIDE_CHANGE), NEEDS_OUTSIDE_CHANGE);
+        assert_eq!(reopen_status(COVERED_BY_PR), COVERED_BY_PR);
         assert_eq!(reopen_status(NEEDS_INPUT), NEEDS_INPUT);
         for s in IN_FLIGHT {
             assert_eq!(reopen_status(s), NEEDS_INPUT, "{s}");

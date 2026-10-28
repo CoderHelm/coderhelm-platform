@@ -770,6 +770,7 @@ mod selfhost_links;
 pub mod skill_compat;
 pub mod skill_suggest;
 pub mod skills;
+pub(crate) mod stop_gate;
 pub mod syntax_check;
 pub(crate) mod terraform;
 #[allow(dead_code)]
@@ -1681,6 +1682,52 @@ async fn run_passes(
     if let Some(ev) = test_ev.as_ref() {
         msg.team_instructions = test_fix::with_instructions(&msg.team_instructions, ev);
     }
+    // --- The ticket's own diagnosis: a ticket that states its root cause,
+    // a fix plan and acceptance criteria is followed, and a stop must quote
+    // evidence that contradicts it (see stop_gate) ---
+    let thread: String = history
+        .notes
+        .iter()
+        .map(|n| format!("{}: {}", n.author, n.text))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let diagnosis = stop_gate::diagnosis(state, &provider, msg, run_id, &thread, usage).await;
+    msg.team_instructions = stop_gate::with_diagnosis(&msg.team_instructions, &diagnosis);
+    if diagnosis.complete() {
+        add_progress_note(
+            state,
+            &msg.team_id,
+            run_id,
+            "The ticket states its root cause, fix plan and acceptance criteria: following them",
+        )
+        .await;
+    }
+    // --- Existing work: an open pull request (anyone's) that already fixes
+    // this ends the run as covered by it, before any work starts ---
+    if !resumed_plan {
+        let (tests, specs, failure) = existing_work_inputs(test_ev.as_ref());
+        if let Some(covered) = stop_gate::existing_work(
+            state,
+            &provider,
+            usage,
+            msg,
+            &github,
+            run_id,
+            "",
+            &own_pr_numbers(&history, &msg.repo_owner, &msg.repo_name),
+            &decided_prs(&history),
+            &tests,
+            &specs,
+            &[],
+            &failure,
+        )
+        .await
+        {
+            stop_gate::finish_covered(state, msg, run_id, &github, &covered, usage, start).await;
+            close_memory(state, agent_memory.take()).await;
+            return Ok(());
+        }
+    }
 
     // --- Pass 2: Plan ---
     check_cancelled(state, &msg.team_id, run_id).await?;
@@ -1898,6 +1945,8 @@ async fn run_passes(
                 if let Some(ev) = test_ev.as_ref() {
                     msg.team_instructions = test_fix::with_instructions(&msg.team_instructions, ev);
                 }
+                msg.team_instructions =
+                    stop_gate::with_diagnosis(&msg.team_instructions, &diagnosis);
                 close_memory(state, agent_memory.take()).await;
                 agent_memory =
                     AgentMemory::open(state, &msg.team_id, &msg.repo_owner, &msg.repo_name).await;
@@ -2329,6 +2378,14 @@ async fn run_passes(
         // its page lists them and takes answers. Questions people answered
         // already in CoderHelm are not asked again.
         let questions = clarification_questions(detail, &msg.answers);
+        // Stop rule 1, at the point the questions would be asked: one that
+        // quotes the run's own tooling failing is never a question.
+        if let Some(f) = questions.iter().find_map(|q| {
+            common::stop_rules::tooling::from_text(&format!("{}\n{}", q.question, q.why))
+        }) {
+            close_memory(state, agent_memory.take()).await;
+            return Err(f.reason().into());
+        }
         let list_md = common::run_questions::markdown(&questions);
         let list_plain = common::run_questions::plain(&questions);
         let raw_github = format!(
@@ -3674,7 +3731,7 @@ async fn run_passes(
         };
         let pass_start = std::time::Instant::now();
         let usage_before = usage.clone();
-        let result = implement::run(
+        let mut result = implement::run(
             state,
             msg,
             &github,
@@ -3692,6 +3749,81 @@ async fn run_passes(
             false, // initial implement — unscoped
         )
         .await?;
+        // The run's own tooling failing is never a question (stop rule 1):
+        // a pass that changed nothing after a command failed for want of a
+        // dependency or tool gets that package's dependencies installed with
+        // its own manager and the command retried; fixed, the pass runs once
+        // more; still failing, the run ends as a tooling failure naming the
+        // exact command and error.
+        if result.files_modified.is_empty() && ticket_update_pr.is_none() {
+            let outputs = common::stop_rules::tooling::tool_outputs(&result.conversation_log);
+            let failure = common::stop_rules::tooling::from_check_lines(
+                &result.evidence.checks,
+                &outputs.join("\n"),
+            )
+            .or_else(|| common::stop_rules::tooling::from_text(&result.evidence.notes));
+            // The sandbox itself gave no result: nothing to install, and
+            // still never a question.
+            let sandbox = result.evidence.sandbox.failure.as_deref().map(|why| {
+                common::stop_rules::tooling::ToolingFailure::new(
+                    common::truncate_str(&result.evidence.checks.join("; "), 300),
+                    &format!("the sandbox gave no result: {why}"),
+                )
+            });
+            if let (None, Some(f)) = (&failure, sandbox) {
+                close_memory(state, agent_memory.take()).await;
+                return Err(f.reason().into());
+            }
+            if let Some(f) = failure {
+                warn!(run_id, command = %f.command, error = %f.error, "No change after a tooling failure");
+                match stop_gate::repair(state, &github, msg, &provider, run_id, &branch_name, &f)
+                    .await
+                {
+                    common::stop_rules::tooling::Repair::Fixed { tried } => {
+                        add_progress_note(
+                            state,
+                            &msg.team_id,
+                            run_id,
+                            &format!(
+                                "Tooling repaired (`{}` passes after {}); implementing again",
+                                f.command,
+                                tried.join("; ")
+                            ),
+                        )
+                        .await;
+                        let note = format!(
+                            "Your last attempt changed nothing after `{}` failed with: {}. That \
+                             was CoderHelm's own environment, not the ticket: the package's \
+                             dependencies are installed now and the command passes. Make the \
+                             change the plan describes.",
+                            f.command, f.error
+                        );
+                        result = implement::run(
+                            state,
+                            msg,
+                            &github,
+                            &plan_result,
+                            &branch_name,
+                            &rules,
+                            &repo_instructions,
+                            Some(&note),
+                            &effective_complexity,
+                            &provider,
+                            usage,
+                            &file_cache,
+                            Some(run_id),
+                            implement_deadline,
+                            false,
+                        )
+                        .await?;
+                    }
+                    common::stop_rules::tooling::Repair::Failed(f) => {
+                        close_memory(state, agent_memory.take()).await;
+                        return Err(f.reason().into());
+                    }
+                }
+            }
+        }
         // The ticket-update note is for the main implement only; later fix
         // passes (test/security) must not read "make no edits if it matches".
         msg.ticket_update_note = None;
@@ -4295,7 +4427,7 @@ async fn run_passes(
         has_time_for_remediation(start)
     })
     .await
-    .map_err(|why| format!("The failing-test rules blocked the pull request: {why}"))?;
+    .map_err(test_fix::blocked_reason)?;
     // New-feature rules: nothing carried over from an earlier attempt,
     // every registration, reuse, staging content, the verification
     // checklist and open product questions (see feature).
@@ -4309,6 +4441,44 @@ async fn run_passes(
     )
     .await
     .map_err(|why| format!("The new-feature rules blocked the pull request: {why}"))?;
+
+    // --- Existing work, again before the PR opens: now that the change's
+    // own files are known, an open pull request (anyone's, opened while
+    // this run worked or touching the same files) that already does this
+    // ends the run as covered by it; the work stays on a branch ---
+    {
+        let (tests, specs, failure) = existing_work_inputs(test_ev.as_ref());
+        if let Some(covered) = stop_gate::existing_work(
+            state,
+            &provider,
+            usage,
+            msg,
+            &github,
+            run_id,
+            &branch_name,
+            &own_pr_numbers(&history, &msg.repo_owner, &msg.repo_name),
+            &decided_prs(&history),
+            &tests,
+            &specs,
+            &impl_result.files_modified,
+            &failure,
+        )
+        .await
+        {
+            let kept =
+                keep_wip_branch(&github, &msg.repo_owner, &msg.repo_name, &branch_name).await;
+            add_progress_note(
+                state,
+                &msg.team_id,
+                run_id,
+                &format!("No second pull request; the work so far is kept on branch `{kept}`."),
+            )
+            .await;
+            stop_gate::finish_covered(state, msg, run_id, &github, &covered, usage, start).await;
+            close_memory(state, agent_memory.take()).await;
+            return Ok(());
+        }
+    }
 
     // --- Create Draft PR (triggers CI) ---
     check_cancelled(state, &msg.team_id, run_id).await?;
@@ -5033,7 +5203,7 @@ async fn run_repo_pipeline(
         has_time_for_remediation(start)
     })
     .await
-    .map_err(|why| format!("The failing-test rules blocked the pull request: {why}"))?;
+    .map_err(test_fix::blocked_reason)?;
 
     // --- Create Draft PR ---
     check_cancelled(state, &msg.team_id, run_id).await?;
@@ -6101,11 +6271,15 @@ async fn fail_run(
     let delta = usage.unrecorded();
 
     // The one failed-status write: reason, and the pass the record names.
+    // A tooling failure (the run's own environment) also records its kind
+    // and the exact command and error, for the run page.
+    let mut extra = vec![("duration_s", attr_n(duration))];
+    extra.extend(stop_gate::tooling_fields(error_msg));
     let failure = common::run_fail::RunFailure {
         reason: error_msg,
         pass: None,
         only_from: None,
-        extra: vec![("duration_s", attr_n(duration))],
+        extra,
         add: usage_adds(&delta),
     };
     match common::run_fail::fail_run(
@@ -6552,6 +6726,60 @@ async fn open_pr_for_ticket(
     })
 }
 
+/// What the existing-work check looks for from a failing-test run's
+/// evidence: the failing tests' names, their spec files, and the error.
+fn existing_work_inputs(ev: Option<&test_fix::Evidence>) -> (Vec<String>, Vec<String>, String) {
+    let Some(ev) = ev else {
+        return (Vec::new(), Vec::new(), String::new());
+    };
+    let mut tests: Vec<String> = ev.read.tests.clone();
+    let mut specs: Vec<String> = ev.spec_files.clone();
+    for f in &ev.failures {
+        if !f.test.is_empty() && !tests.contains(&f.test) {
+            tests.push(f.test.clone());
+        }
+        if !f.file.is_empty() && !specs.contains(&f.file) {
+            specs.push(f.file.clone());
+        }
+    }
+    // A name that is a file is a spec file, not a title.
+    let (files, names): (Vec<String>, Vec<String>) =
+        tests.into_iter().partition(|t| looks_like_path(t));
+    for f in files {
+        if !specs.contains(&f) {
+            specs.push(f);
+        }
+    }
+    (names, specs, ev.observed_error().unwrap_or("").to_string())
+}
+
+fn looks_like_path(t: &str) -> bool {
+    !t.contains(' ') && t.contains('.') && t.contains('/')
+}
+
+/// CoderHelm's own pull requests for the ticket in this repository, from
+/// its earlier runs: never "existing work" for itself.
+fn own_pr_numbers(history: &ticket_history::TicketHistory, owner: &str, name: &str) -> Vec<u64> {
+    let repo = format!("{owner}/{name}");
+    history
+        .runs
+        .iter()
+        .filter(|r| r.pr_number > 0 && (r.repo.is_empty() || r.repo.eq_ignore_ascii_case(&repo)))
+        .map(|r| r.pr_number)
+        .collect()
+}
+
+/// Pull requests a person already decided about on the ticket (work on it,
+/// or open CoderHelm's own), as `owner/name#n`.
+fn decided_prs(history: &ticket_history::TicketHistory) -> Vec<String> {
+    history
+        .decisions
+        .iter()
+        .filter(|d| d.kind == common::ticket_state::KIND_OPEN_PR)
+        .map(|d| d.subject.clone())
+        .collect()
+}
+
 /// The repo a Jira ticket's work already lives in, among the `enabled`
 /// repos, with why: CoderHelm's own pull request for the ticket (merged or
 /// open, from the ticket's history), else an open pull request in exactly
@@ -6867,6 +7095,7 @@ fn empty_change_questions() -> Vec<common::run_questions::Question> {
             why: why.to_string(),
             suggestions: Vec::new(),
             decision: String::new(),
+            evidence: Vec::new(),
         },
         common::run_questions::Question {
             id: "q2".to_string(),
@@ -6876,6 +7105,7 @@ fn empty_change_questions() -> Vec<common::run_questions::Question> {
             why: "Without it I can't tell what the finished change looks like.".to_string(),
             suggestions: Vec::new(),
             decision: String::new(),
+            evidence: Vec::new(),
         },
     ]
 }
@@ -6915,6 +7145,7 @@ fn unknown_fix_questions(
         .to_string(),
         suggestions: Vec::new(),
         decision: String::new(),
+        evidence: Vec::new(),
     }]
 }
 
@@ -6977,6 +7208,7 @@ fn clarification_questions(
         .to_string(),
         suggestions: Vec::new(),
         decision: String::new(),
+        evidence: Vec::new(),
     }]
 }
 

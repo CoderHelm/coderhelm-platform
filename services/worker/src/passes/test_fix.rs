@@ -45,6 +45,8 @@ use common::e2e::parse::Links;
 use common::e2e::report_source::{Location, ReportSource};
 use common::e2e::store::Store;
 use common::e2e::test_package::{self, Repeat, TestPackage};
+use common::stop_rules::environment::{self, TestEnvironment};
+use common::stop_rules::tooling::{self, Repair, ToolingFailure};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tracing::{info, warn};
@@ -127,6 +129,10 @@ pub struct Evidence {
     pub expectation_wrong: Option<String>,
     #[serde(default)]
     pub origin_pr: Option<String>,
+    /// Where the tests run and what data they read, read from the suite's
+    /// own config before anything is judged (see `stop_rules::environment`).
+    #[serde(default)]
+    pub environment: Option<TestEnvironment>,
 }
 
 impl Evidence {
@@ -235,6 +241,10 @@ pub fn facts_markdown(ev: &Evidence) -> String {
             "\nThe failing assertion compares two views that disagree ({}). Compare what each requests from the backend and look up the records involved, and write both in your notes as `View compared:` and `Record checked:` lines; the pull request won't open without them.\n",
             v.views.join(" and ")
         ));
+    }
+    if let Some(env) = ev.environment.as_ref() {
+        s.push('\n');
+        s.push_str(&env.markdown());
     }
     let failed: Vec<&Tried> = ev.tried.iter().filter(|t| !t.ok).collect();
     if !failed.is_empty() {
@@ -1258,8 +1268,53 @@ pub async fn for_run(
     }
     super::add_progress_note(state, &msg.team_id, run_id, &summary_note(&ev)).await;
     classify(state, msg, github, provider, usage, run_id, &mut ev).await;
+    ev.environment = read_environment(state, msg, github, &ev).await;
+    if let Some(env) = ev.environment.as_ref() {
+        super::add_progress_note(state, &msg.team_id, run_id, &env.summary_note()).await;
+    }
     save(state, &msg.team_id, run_id, &ev).await;
     Some(ev)
+}
+
+/// Where the suite runs and what it reads, from its own config on the
+/// base branch: the runner config, the suite's env files (keys, and
+/// addresses without credentials), setup files, data and fixtures, and the
+/// team's test address. `None` when nothing was found.
+async fn read_environment(
+    state: &WorkerState,
+    msg: &TicketMessage,
+    github: &GitHubClient,
+    ev: &Evidence,
+) -> Option<TestEnvironment> {
+    let (owner, repo, base) = (&msg.repo_owner, &msg.repo_name, &msg.base_branch);
+    let tree: Vec<String> = github
+        .get_tree(owner, repo, base)
+        .await
+        .ok()?
+        .into_iter()
+        .map(|e| e.path)
+        .collect();
+    let mut hints = ev.spec_files.clone();
+    hints.extend(ev.failures.iter().map(|f| f.file.clone()));
+    hints.extend(ev.read.tests.iter().filter(|t| t.contains('.')).cloned());
+    let dirs = environment::suite_dirs(&tree, &hints);
+    let mut configs = Vec::new();
+    for p in environment::config_paths(&tree, &dirs).into_iter().take(4) {
+        if let Ok(t) = github.read_file(owner, repo, &p, base).await {
+            configs.push((p, t));
+        }
+    }
+    let mut envs = Vec::new();
+    for p in environment::env_paths(&tree, &dirs).into_iter().take(6) {
+        if let Ok(t) = github.read_file(owner, repo, &p, base).await {
+            envs.push((p, t));
+        }
+    }
+    let target = test_target(state, &msg.team_id, &format!("{owner}/{repo}"), None)
+        .await
+        .unwrap_or_else(|| ev.target_url.clone());
+    let env = environment::read(&configs, &envs, &tree, &dirs, &target);
+    (!env.is_empty()).then_some(env)
 }
 
 /// Before planning: repeats the failing spec on the base branch (retries
@@ -1407,6 +1462,9 @@ struct PackageRun {
     lines: Vec<String>,
     /// Type-check or lint failures, with their output, for a fix round.
     failed: Vec<String>,
+    /// A step failed for want of a dependency or tool (the run's own
+    /// environment, never the change's): repaired, or the run ends on it.
+    tooling: Option<ToolingFailure>,
     repeat: Option<Repeat>,
     repeat_output: String,
     target: String,
@@ -1493,7 +1551,7 @@ async fn check_packages(
     let mut steps: Vec<test_package::Step> = Vec::new();
     for p in &pkgs {
         if let Some(s) = test_package::check_steps(p) {
-            steps.extend(s);
+            steps.extend(tooling::hardened(p, s));
         }
     }
     let target = test_target(state, &w.msg.team_id, &format!("{owner}/{repo}"), None).await;
@@ -1566,6 +1624,7 @@ async fn check_packages(
         Ok(o) if o.ran => {
             let n = kept.len() + usize::from(repeat.is_some());
             let codes = test_package::step_codes(&o.output, n);
+            run.tooling = tooling::from_steps(&kept, &codes, &o.output);
             for (s, c) in kept.iter().zip(&codes) {
                 let verdict = match c {
                     Some(0) => "PASS".to_string(),
@@ -1574,7 +1633,7 @@ async fn check_packages(
                 };
                 run.lines
                     .push(format!("- {}: {verdict}, `{}`", s.kind, s.cmd));
-                if matches!(c, Some(x) if *x != 0) && s.kind != "install" {
+                if matches!(c, Some(x) if *x != 0) && s.kind != "install" && run.tooling.is_none() {
                     run.failed.push(format!("{} failed: `{}`", s.kind, s.cmd));
                 }
             }
@@ -1698,6 +1757,7 @@ pub async fn gate(
     let mut integrity_rounds = 0;
     let mut base_tried = ev.base_repeat.is_some();
     let mut unit_seen: Option<(String, Result<Option<String>, String>)> = None;
+    let mut tooling_repaired = false;
     loop {
         let diff = w
             .github
@@ -1730,6 +1790,37 @@ pub async fn gate(
         } else {
             PackageRun::default()
         };
+        // The run's own tooling failing is never the change's problem and
+        // never a question: install the package's dependencies again with its
+        // own manager and retry; once that has been tried, a tooling failure
+        // ends the run naming the exact command and error.
+        if let Some(f) = pk.tooling.take() {
+            if tooling_repaired {
+                return Err(f.reason());
+            }
+            tooling_repaired = true;
+            match super::stop_gate::repair(
+                w.state, w.github, w.msg, w.provider, w.run_id, w.branch, &f,
+            )
+            .await
+            {
+                Repair::Fixed { tried } => {
+                    super::add_progress_note(
+                        w.state,
+                        &w.msg.team_id,
+                        w.run_id,
+                        &format!(
+                            "Tooling repaired: `{}` passes after {}; checking the package again",
+                            f.command,
+                            tried.join("; ")
+                        ),
+                    )
+                    .await;
+                    continue;
+                }
+                Repair::Failed(f) => return Err(f.reason()),
+            }
+        }
 
         // The failing spec, repeated with retries off on this branch, and
         // once on the base when that wasn't measured before planning.
@@ -1992,6 +2083,16 @@ pub async fn gate(
             Err(e) => return Err(format!("the fix round failed: {e}")),
         }
         let _ = super::update_pass(w.state, &w.msg.team_id, w.run_id, "review").await;
+    }
+}
+
+/// The run's failure when the gate blocks the pull request. A tooling
+/// failure keeps its own words, so the run records it as one.
+pub fn blocked_reason(why: String) -> String {
+    if why.starts_with(tooling::PREFIX) {
+        why
+    } else {
+        format!("The failing-test rules blocked the pull request: {why}")
     }
 }
 
@@ -2913,6 +3014,32 @@ mod tests {
         assert_eq!(with_instructions(&once, &ev), once);
         let none = facts_markdown(&ev_with(None));
         assert!(none.contains("No report of a failing run could be read"));
+    }
+
+    #[test]
+    fn agents_get_where_the_tests_run_before_they_judge_data() {
+        let mut ev = ev_with(Some("Expected: 'Mine'"));
+        assert!(!facts_markdown(&ev).contains("## Where the tests run"));
+        ev.environment = Some(environment::read(
+            &[(
+                "e2e/playwright.config.ts".into(),
+                "use: { baseURL: process.env.E2E_BASE_URL ?? 'https://staging.example.test' },"
+                    .into(),
+            )],
+            &[],
+            &["e2e/fixtures/cards.json".to_string()],
+            &["e2e".to_string()],
+            "",
+        ));
+        let md = facts_markdown(&ev);
+        assert!(md.contains("## Where the tests run"));
+        assert!(md.contains("https://staging.example.test (e2e/playwright.config.ts:1)"));
+        assert!(md.contains("`E2E_BASE_URL`"));
+        assert!(md.contains("`e2e/fixtures/cards.json`"));
+        assert!(md.contains("not a contradiction"));
+        // Recorded with the evidence the run keeps.
+        let back: Evidence = serde_json::from_str(&serde_json::to_string(&ev).unwrap()).unwrap();
+        assert_eq!(back.environment, ev.environment);
     }
 
     #[test]

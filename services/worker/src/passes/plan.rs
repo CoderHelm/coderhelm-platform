@@ -12,7 +12,7 @@ use crate::WorkerState;
 /// The planner's logic version. Part of every cached plan's key: bump it on
 /// any change to how plans are made or what a plan must carry, so a plan
 /// written by an older planner is never reused.
-pub const PLANNER_VERSION: &str = "2026-10-23.intent-history-env-near-match";
+pub const PLANNER_VERSION: &str = "2026-10-27.intent-history-env-near-match-stop-rules";
 
 /// The openspec file holding the plan's end-to-end checklist, readable.
 pub const END_TO_END_FILE: &str = "end_to_end.md";
@@ -287,11 +287,20 @@ set tasks.md to EXACTLY `NO_CHANGES_NEEDED: <reason>`.
    - question: Which environments get the new limit?
      why: config/limits.yml holds one value per environment.
      options: production only | every environment
+     evidence: config/limits.yml:12
    ```
    Ask only what blocks the change, at most a few questions, and never a question the ticket or
    the resolved decisions below already settle. Never ask a person to decide what is CoderHelm's
    own call: closing or replacing a pull request someone else opened is never asked; when told to
    open its own, it leaves the other one open.
+   Never ask about CoderHelm's own tooling (missing modules or dependencies, a command not found,
+   an install, type-check or lint that can't run): the checks install and retry on their own.
+   Never ask about a difference between environments (production content differs from staging):
+   the tests run in their own environment with their own data, and that is not a contradiction.
+   When the ticket states the root cause, a fix plan and acceptance criteria, follow them; ask only
+   when the code or the data contradicts the ticket, with an `evidence:` line citing it
+   (`path/to/file.ts:42`, or the lookup id such as `L2`). A question without evidence that checks
+   out is dropped and the run follows the ticket's plan.
 
 Otherwise, generate four openspec files:
 
@@ -799,6 +808,104 @@ Then the ```fix_location.json block described above."#,
         )
         .await?;
         files = parse_openspec_files(&response, intent);
+    }
+    // The stop rules (see stop_gate): a question about the run's own
+    // tooling is never asked, one resting on a difference between
+    // environments is refused, and when the ticket states its own diagnosis
+    // only a contradiction backed by evidence that checks out is asked.
+    // Held-back questions send the plan back once; what is still not
+    // admissible after that never reaches a person.
+    let lookup_lines = || {
+        live.as_ref()
+            .map(|l| l.lookups().into_iter().map(|x| x.line).collect::<Vec<_>>())
+            .unwrap_or_default()
+    };
+    let asked = clarification_of(&files.tasks);
+    if !asked.is_empty() {
+        let s = super::stop_gate::screen_questions(
+            state,
+            provider,
+            usage,
+            msg,
+            github,
+            run_id,
+            &asked,
+            &lookup_lines(),
+        )
+        .await;
+        if s.changed() {
+            let diagnosis = super::stop_gate::cached_diagnosis(run_id);
+            messages.push((
+                "user".to_string(),
+                vec![serde_json::json!({
+                    "type": "text",
+                    "text": common::stop_rules::screen::send_back(&s, diagnosis.as_ref()),
+                })],
+            ));
+            response = provider::converse(
+                state,
+                provider,
+                common::agent_policy::Agent::Planner,
+                model_id,
+                &full_system,
+                &mut messages,
+                &tools,
+                &executor,
+                usage,
+                plan_opts,
+                None,
+                None,
+            )
+            .await?;
+            files = parse_openspec_files(&response, intent);
+            let again = clarification_of(&files.tasks);
+            if !again.is_empty() {
+                let s = super::stop_gate::screen_questions(
+                    state,
+                    provider,
+                    usage,
+                    msg,
+                    github,
+                    run_id,
+                    &again,
+                    &lookup_lines(),
+                )
+                .await;
+                if s.changed() {
+                    if s.ask.is_empty() {
+                        if let Some(f) = s.tooling_failure() {
+                            return Err(f.reason().into());
+                        }
+                        return Err(format!(
+                            "The planner stopped only on questions the stop rules refuse, even \
+                             after it was sent back to plan: {}",
+                            s.notes().join(" ")
+                        )
+                        .into());
+                    }
+                    files.tasks = common::stop_rules::screen::clarification(&s.ask);
+                }
+            }
+        }
+    }
+    // The decision's own questions (where the fix belongs) are held to the
+    // same rules: what may not stop the run is left out.
+    if let Some(d) = files.fix.as_mut().filter(|d| !d.questions.is_empty()) {
+        let qs = common::run_questions::from_lines(&d.questions);
+        let s = super::stop_gate::screen_questions(
+            state,
+            provider,
+            usage,
+            msg,
+            github,
+            run_id,
+            &qs,
+            &lookup_lines(),
+        )
+        .await;
+        if s.changed() {
+            d.questions = s.ask.into_iter().map(|q| q.question).collect();
+        }
     }
     let gaps = super::fix_location::gaps(files.fix.as_ref(), can_look_up, lookups(), &read());
     if !gaps.is_empty() && msg.person_direction.is_some() {

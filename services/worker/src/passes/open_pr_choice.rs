@@ -109,6 +109,7 @@ pub fn notice_question(pr: &OtherPr) -> Question {
             choice_label(Choice::Own, pr),
         ],
         decision: pr.key(),
+        evidence: Vec::new(),
     }
 }
 
