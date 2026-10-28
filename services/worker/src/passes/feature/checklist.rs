@@ -6,6 +6,10 @@
 //! - type-check, lint and unit tests, with the repository's own scripts;
 //! - the unit tests the acceptance criteria imply: one per listed option or
 //!   case ([`acceptance_cases`]), counted in the diff ([`unit_cases_added`]);
+//! - every value of each new configurable thing the change adds (a schema
+//!   field's option list, a string-literal union prop, an on/off field's
+//!   shown and hidden cases) named in the tests ([`new_options`],
+//!   [`untested_options`]);
 //! - the end-to-end spec, and its entry in any test map the repository keeps
 //!   ([`missing_from_test_maps`]);
 //! - the checks of each test package outside the main workspace;
@@ -157,6 +161,266 @@ pub fn unit_cases_added(files: &[(String, String, String)]) -> usize {
                 .count()
         })
         .sum()
+}
+
+/// A new configurable thing the change adds and the values tests must set.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NewOption {
+    pub name: String,
+    pub values: Vec<String>,
+    /// An on/off field: its values are `true` and `false`.
+    pub toggle: bool,
+}
+
+/// Whether a path is a test file.
+pub fn is_test_path(path: &str) -> bool {
+    let l = path.to_lowercase();
+    l.contains(".test.")
+        || l.contains(".spec.")
+        || l.contains("/test/")
+        || l.contains("/tests/")
+        || l.contains("__tests__")
+        || l.starts_with("test/")
+        || l.starts_with("tests/")
+        || l.rsplit('/').next().is_some_and(|n| n.starts_with("test_"))
+        || is_e2e(path)
+}
+
+/// Source files whose new options count: code a person writes, never
+/// generated output.
+fn option_source(path: &str) -> bool {
+    let l = path.to_lowercase();
+    let code = [
+        ".ts", ".tsx", ".js", ".jsx", ".mjs", ".vue", ".svelte", ".py", ".rb", ".go", ".rs", ".kt",
+        ".java", ".cs",
+    ]
+    .iter()
+    .any(|e| l.ends_with(e));
+    code && !is_test_path(path)
+        && !l.ends_with(".d.ts")
+        && ![
+            "generated",
+            ".gen.",
+            "sanity.types",
+            "graphql.ts",
+            "schema.ts.snap",
+        ]
+        .iter()
+        .any(|m| l.contains(m))
+}
+
+/// The string literals in `text`, in order.
+fn literals(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut chars = text.char_indices().peekable();
+    while let Some((i, c)) = chars.next() {
+        if c == '\'' || c == '"' || c == '`' {
+            let rest = &text[i + 1..];
+            if let Some(end) = rest.find(c) {
+                let lit = &rest[..end];
+                if !lit.is_empty() && !lit.contains('\n') {
+                    out.push(lit.to_string());
+                }
+                // Skip past the closing quote.
+                for _ in 0..lit.chars().count() + 1 {
+                    chars.next();
+                }
+            }
+        }
+    }
+    out
+}
+
+/// The quoted value after `key:` anywhere on a line (`name: 'tabs'` and
+/// `defineField({ name: 'tabs', ...` both give `tabs`).
+fn keyed(line: &str, key: &str) -> Option<String> {
+    let mut from = 0;
+    while let Some(i) = line[from..].find(key) {
+        let at = from + i;
+        from = at + key.len();
+        let before_ok = line[..at]
+            .chars()
+            .next_back()
+            .is_none_or(|c| !(c.is_ascii_alphanumeric() || c == '_'));
+        let Some(rest) = line[from..].trim_start().strip_prefix(':') else {
+            continue;
+        };
+        let rest = rest.trim_start();
+        if before_ok && rest.starts_with(['\'', '"', '`']) {
+            return literals(rest).into_iter().next();
+        }
+    }
+    None
+}
+
+fn option_list_start(line: &str) -> bool {
+    let t = line.trim_start();
+    ["list", "options", "enum", "choices", "values"]
+        .iter()
+        .any(|k| {
+            t.strip_prefix(k)
+                .and_then(|r| r.trim_start().strip_prefix(':'))
+                .is_some_and(|r| r.trim_start().starts_with('['))
+        })
+}
+
+/// A string-literal union on one line (`variant?: 'a' | 'b'`,
+/// `type Size = "sm" | "lg"`): its name and values.
+fn union(line: &str) -> Option<(String, Vec<String>)> {
+    let t = line.trim().trim_end_matches([';', ',']);
+    let (head, body) = if let Some((h, b)) = t.split_once('=') {
+        (h, b)
+    } else {
+        t.split_once(':')?
+    };
+    let body = body.trim();
+    let parts: Vec<&str> = body
+        .split('|')
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+        .collect();
+    if parts.len() < 2 {
+        return None;
+    }
+    let mut values = Vec::new();
+    for p in &parts {
+        let q = p.chars().next()?;
+        if !(q == '\'' || q == '"') || !p.ends_with(q) || p.len() < 3 {
+            return None;
+        }
+        values.push(p[1..p.len() - 1].to_string());
+    }
+    let name = head
+        .trim()
+        .trim_start_matches("export ")
+        .trim_start_matches("type ")
+        .trim_end_matches('?')
+        .trim()
+        .to_string();
+    (!name.is_empty() && !name.contains(' ')).then_some((name, values))
+}
+
+/// The new configurable things the diff's added lines declare in source
+/// files: option lists (`list: [...]`, `options: [...]`, with `value:`
+/// keys or plain strings), string-literal unions, and on/off fields
+/// (`type: 'boolean'`), each named by the nearest `name:` before it.
+pub fn new_options(files: &[(String, String, String)]) -> Vec<NewOption> {
+    let mut out: Vec<NewOption> = Vec::new();
+    for (path, status, patch) in files {
+        if status == "removed" || !option_source(path) {
+            continue;
+        }
+        let added: Vec<&str> = patch
+            .lines()
+            .filter(|l| l.starts_with('+') && !l.starts_with("+++"))
+            .map(|l| &l[1..])
+            .collect();
+        let mut last_name: Option<String> = None;
+        let mut i = 0;
+        while i < added.len() {
+            let line = added[i];
+            if let Some(n) = keyed(line, "name") {
+                last_name = Some(n);
+            }
+            if option_list_start(line) {
+                // Collect the list to its closing bracket.
+                let mut depth = 0i32;
+                let mut text = String::new();
+                let mut j = i;
+                while j < added.len() {
+                    let l = added[j];
+                    let from = if j == i { l.find('[').unwrap_or(0) } else { 0 };
+                    for c in l[from..].chars() {
+                        match c {
+                            '[' => depth += 1,
+                            ']' => depth -= 1,
+                            _ => {}
+                        }
+                    }
+                    text.push_str(l);
+                    text.push('\n');
+                    if depth <= 0 {
+                        break;
+                    }
+                    j += 1;
+                }
+                let keyed_values: Vec<String> =
+                    text.lines().filter_map(|l| keyed(l, "value")).collect();
+                let values = if keyed_values.is_empty() {
+                    literals(&text[text.find('[').map_or(0, |k| k + 1)..])
+                } else {
+                    keyed_values
+                };
+                if values.len() >= 2 {
+                    out.push(NewOption {
+                        name: last_name
+                            .clone()
+                            .unwrap_or_else(|| "an option list".to_string()),
+                        values,
+                        toggle: false,
+                    });
+                }
+                i = j + 1;
+                continue;
+            }
+            if let Some(ty) = keyed(line, "type") {
+                if ty == "boolean" {
+                    // The field's name is before it or just after.
+                    let name = last_name.clone().or_else(|| {
+                        added[i + 1..added.len().min(i + 6)]
+                            .iter()
+                            .find_map(|l| keyed(l, "name"))
+                    });
+                    if let Some(name) = name {
+                        out.push(NewOption {
+                            name,
+                            values: vec!["true".into(), "false".into()],
+                            toggle: true,
+                        });
+                    }
+                }
+            }
+            if let Some((name, values)) = union(line) {
+                out.push(NewOption {
+                    name,
+                    values,
+                    toggle: false,
+                });
+            }
+            i += 1;
+        }
+    }
+    out.dedup();
+    out
+}
+
+/// The values of `options` no test names, as "name: value". A value is
+/// named when the tests quote it; an on/off field's case when a test line
+/// names the field with `true` (shown) or with `false` (hidden).
+pub fn untested_options(options: &[NewOption], tests: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for o in options {
+        for v in &o.values {
+            let named = if o.toggle {
+                tests
+                    .lines()
+                    .any(|l| l.contains(o.name.as_str()) && l.contains(v.as_str()))
+            } else {
+                ['\'', '"', '`']
+                    .iter()
+                    .any(|q| tests.contains(&format!("{q}{v}{q}")))
+            };
+            if !named {
+                let case = match (o.toggle, v.as_str()) {
+                    (true, "true") => "true (shown)".to_string(),
+                    (true, _) => "false (hidden)".to_string(),
+                    _ => format!("`{v}`"),
+                };
+                out.push(format!("`{}` to {case}", o.name));
+            }
+        }
+    }
+    out
 }
 
 /// Widths a spec sets its viewport to.
@@ -325,6 +589,12 @@ pub struct Facts {
     pub map_missing: Vec<String>,
     /// The repository has end-to-end tests.
     pub has_e2e: bool,
+    /// How many new configurable things the change adds.
+    #[serde(default)]
+    pub options_found: usize,
+    /// Their values no test names, as "name: value".
+    #[serde(default)]
+    pub options_untested: Vec<String>,
 }
 
 /// The items that read the diff alone.
@@ -344,6 +614,28 @@ pub fn static_items(f: &Facts) -> Vec<Item> {
                 f.cases_added, f.cases_required
             ),
         ));
+    }
+    if f.options_found > 0 {
+        if f.options_untested.is_empty() {
+            out.push(Item::new(
+                "tests for each option",
+                Status::Pass,
+                format!(
+                    "every value of {} new option(s) is named in a test",
+                    f.options_found
+                ),
+            ));
+        } else {
+            let mut shown: Vec<String> = f.options_untested.iter().take(8).cloned().collect();
+            if f.options_untested.len() > 8 {
+                shown.push(format!("{} more", f.options_untested.len() - 8));
+            }
+            out.push(Item::new(
+                "tests for each option",
+                Status::Fail,
+                format!("no test sets {}", shown.join("; ")),
+            ));
+        }
     }
     if f.has_e2e && f.ui {
         if f.specs.is_empty() {
@@ -408,7 +700,9 @@ pub fn feedback(items: &[Item]) -> String {
         s.push_str(&format!("- {f}\n"));
     }
     s.push_str(&format!(
-        "Unit tests: one test per option or case the acceptance criteria list. A new \
+        "Unit tests: one test per option or case the acceptance criteria list, and one per \
+         value of each new option the change adds (each value of an option list or union, the \
+         shown and the hidden case of an on/off field). A new \
          end-to-end spec goes in every test map the repository keeps. For UI, the spec checks \
          `document.documentElement.scrollWidth <= window.innerWidth` at a viewport {NARROW_MAX}px \
          wide or less and one {WIDE_MIN}px wide or more.\n"
@@ -505,6 +799,8 @@ mod tests {
             responsive_specs: vec![],
             map_missing: vec!["e2e/test-map.json: e2e/quote.spec.ts".into()],
             has_e2e: true,
+            options_found: 0,
+            options_untested: vec![],
         };
         let items = static_items(&f);
         assert_eq!(failing(&items).len(), 3);
@@ -518,5 +814,99 @@ mod tests {
             ..f
         };
         assert!(failing(&static_items(&ok)).is_empty());
+    }
+
+    /// The observed kind of feature: a CMS block with an option list per
+    /// tab, an on/off field and a prop union. Every value needs a test.
+    #[test]
+    fn every_value_of_a_new_option_is_named_in_a_test() {
+        let schema = "+export const heroBlock = defineType({\n\
+            +  name: 'heroBlock',\n\
+            +  fields: [\n\
+            +    defineField({\n\
+            +      name: 'sortBy',\n\
+            +      type: 'string',\n\
+            +      options: {\n\
+            +        list: [\n\
+            +          { title: 'Start date', value: 'startDate' },\n\
+            +          { title: 'Spots left', value: 'spotsLeft' },\n\
+            +        ],\n\
+            +      },\n\
+            +    }),\n\
+            +    defineField({ name: 'showBlurb', type: 'boolean' }),\n\
+            +  ],\n\
+            +});\n";
+        let component = "+type HeroProps = {\n+  size?: 'small' | 'large';\n+};\n";
+        let files = vec![
+            (
+                "studio/blocks/hero.ts".to_string(),
+                "added".to_string(),
+                schema.to_string(),
+            ),
+            (
+                "web/src/hero.tsx".to_string(),
+                "added".to_string(),
+                component.to_string(),
+            ),
+            (
+                "web/src/sanity.types.ts".to_string(),
+                "modified".to_string(),
+                "+  kind?: 'a' | 'b';\n".to_string(),
+            ),
+        ];
+        let opts = new_options(&files);
+        let names: Vec<&str> = opts.iter().map(|o| o.name.as_str()).collect();
+        assert_eq!(names, vec!["sortBy", "showBlurb", "size"], "{opts:?}");
+        assert_eq!(opts[0].values, vec!["startDate", "spotsLeft"]);
+        assert!(opts[1].toggle);
+
+        let tests = "it('sorts by start date', () => render({ sortBy: 'startDate' }))\n\
+            it('shows the blurb', () => render({ showBlurb: true }))\n\
+            it('is small', () => render({ size: \"small\" }))\n";
+        let missing = untested_options(&opts, tests);
+        assert_eq!(
+            missing,
+            vec![
+                "`sortBy` to `spotsLeft`".to_string(),
+                "`showBlurb` to false (hidden)".to_string(),
+                "`size` to `large`".to_string(),
+            ]
+        );
+        let all = format!(
+            "{tests}it('spots', () => render({{ sortBy: 'spotsLeft' }}))\n\
+             it('hides', () => render({{ showBlurb: false }}))\n\
+             it('large', () => render({{ size: 'large' }}))\n"
+        );
+        assert!(untested_options(&opts, &all).is_empty());
+
+        let f = Facts {
+            options_found: opts.len(),
+            options_untested: missing,
+            ..Default::default()
+        };
+        let items = static_items(&f);
+        assert!(markdown(&items)
+            .contains("[FAIL] tests for each option: no test sets `sortBy` to `spotsLeft`"));
+        assert!(feedback(&items).contains("the shown and the hidden case"));
+    }
+
+    #[test]
+    fn test_files_and_unrelated_brackets_are_not_options() {
+        let files = vec![
+            (
+                "src/a.test.ts".to_string(),
+                "added".to_string(),
+                "+const x: 'a' | 'b' = 'a';\n".to_string(),
+            ),
+            (
+                "src/b.ts".to_string(),
+                "added".to_string(),
+                "+const opts = { options: [...defaults, extra] };\n+const n = a | b;\n".to_string(),
+            ),
+        ];
+        assert!(new_options(&files).is_empty());
+        assert!(is_test_path("e2e/tests/hero.spec.ts"));
+        assert!(is_test_path("tests/test_hero.py"));
+        assert!(!is_test_path("src/hero.tsx"));
     }
 }

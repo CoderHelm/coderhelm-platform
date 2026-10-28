@@ -160,6 +160,32 @@ fn empty_overwrite_refusal(
     })
 }
 
+/// What [`GitHubClient::start_branch`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BranchStart {
+    /// The branch didn't exist; it starts at the base.
+    Created,
+    /// A leftover branch with no open pull request was moved to the base.
+    Reset,
+    /// The branch has an open pull request: kept at its head.
+    KeptOpenPr,
+}
+
+impl BranchStart {
+    /// The progress note for `branch` started from `base`.
+    pub fn note(self, branch: &str, base: &str) -> String {
+        match self {
+            BranchStart::Created => format!("Created branch {branch} from {base}"),
+            BranchStart::Reset => format!(
+                "Reset branch {branch} to {base} (a leftover branch with no open pull request)"
+            ),
+            BranchStart::KeptOpenPr => format!(
+                "Branch {branch} has an open pull request: continuing from its head, nothing reset"
+            ),
+        }
+    }
+}
+
 /// GitHub REST API client using installation token auth.
 pub struct GitHubClient {
     app_id: String,
@@ -1247,6 +1273,21 @@ impl GitHubClient {
         branch: &str,
         from_ref: &str,
     ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+        self.start_branch(owner, repo, branch, from_ref)
+            .await
+            .map(|(sha, _)| sha)
+    }
+
+    /// Creates `branch` at `from_ref`, or says what it did with a branch of
+    /// that name that already exists ([`BranchStart`]), so a run's progress
+    /// note never says "created" over work it kept.
+    pub async fn start_branch(
+        &self,
+        owner: &str,
+        repo: &str,
+        branch: &str,
+        from_ref: &str,
+    ) -> Result<(String, BranchStart), Box<dyn std::error::Error + Send + Sync>> {
         let sha = self.get_ref(owner, repo, from_ref).await?;
         let url = format!("{API_BASE}/repos/{owner}/{repo}/git/refs");
         let headers = self.auth_headers().await?;
@@ -1265,23 +1306,29 @@ impl GitHubClient {
             // base, which empties the PR's diff and makes GitHub AUTO-CLOSE the
             // PR (observed live: a conflict-resolution run wiped a PR this way).
             // With an open PR we continue from the branch's current head; only
-            // a stale, PR-less leftover branch is reset.
+            // a stale, PR-less leftover branch is reset. When GitHub can't say
+            // whether it has an open PR, nothing is reset: a failed lookup
+            // used to read as "no PR" and wiped the branch.
             let prs_url = format!(
                 "{API_BASE}/repos/{owner}/{repo}/pulls?head={owner}:{branch}&state=open&per_page=1"
             );
-            let has_open_pr = self
-                .get(&prs_url)
-                .await
-                .ok()
-                .and_then(|v| v.as_array().map(|a| !a.is_empty()))
-                .unwrap_or(false);
+            let has_open_pr = match self.get(&prs_url).await {
+                Ok(v) => v.as_array().is_some_and(|a| !a.is_empty()),
+                Err(e) => {
+                    return Err(format!(
+                        "branch {branch} already exists and GitHub couldn't say whether it has an \
+                         open pull request ({e}); it was left as it is"
+                    )
+                    .into())
+                }
+            };
             if has_open_pr {
                 let head = self.get_ref(owner, repo, branch).await?;
                 tracing::info!(
                     branch,
                     "Branch has an open PR — continuing from its head, NOT resetting to base"
                 );
-                return Ok(head);
+                return Ok((head, BranchStart::KeptOpenPr));
             }
             let update_url = format!("{API_BASE}/repos/{owner}/{repo}/git/refs/heads/{branch}");
             let data = self
@@ -1294,7 +1341,7 @@ impl GitHubClient {
                 .pointer("/object/sha")
                 .and_then(|v| v.as_str())
                 .ok_or("Missing sha in update ref response")?;
-            return Ok(new_sha.to_string());
+            return Ok((new_sha.to_string(), BranchStart::Reset));
         }
 
         let data: serde_json::Value = resp.error_for_status()?.json().await?;
@@ -1302,7 +1349,7 @@ impl GitHubClient {
             .pointer("/object/sha")
             .and_then(|v| v.as_str())
             .ok_or("Missing sha in create branch response")?;
-        Ok(new_sha.to_string())
+        Ok((new_sha.to_string(), BranchStart::Created))
     }
 
     // ─── Merge ───────────────────────────────────────────────────

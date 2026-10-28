@@ -733,6 +733,7 @@ mod plan_judge;
 /// Plugin runs, publishing, source sync and results.
 pub mod plugins;
 mod pr;
+mod pr_holder;
 pub mod pr_outcomes;
 mod proof;
 pub mod quarantine;
@@ -764,6 +765,7 @@ pub mod review_thread_reply;
 pub mod review_verdict;
 pub mod rewards;
 pub(crate) mod round;
+mod run_end;
 mod security;
 #[cfg(test)]
 mod selfhost_links;
@@ -1505,6 +1507,58 @@ async fn run_passes(
         .await
     {
         warn!(run_id, error = %e, "Failed to persist resolved base_branch to run record");
+    }
+
+    // --- One writer per pull request branch, across runs of the ticket ---
+    // CoderHelm's own open pull request for the ticket (an earlier run's):
+    // while that run still works on it, this run stops before writing; once
+    // it is done, this run continues it as its update and holds its writer
+    // slot, so the earlier run's feedback or CI pass waits instead of
+    // writing the same branch.
+    let mut pr_writer_guards: Vec<RunWriterGuard> = Vec::new();
+    let mut claimed_pr: Option<u64> = None;
+    if !is_internal_ticket(&msg.ticket_id) {
+        let repo_full = format!("{}/{}", msg.repo_owner, msg.repo_name);
+        if let Some(own) = history.own_open_pr(&repo_full) {
+            let (number, url, title) = (
+                own.number,
+                pr_url_of(&repo_full, own.number),
+                own.title.clone(),
+            );
+            let earlier = pr_holder::holder_runs(&history, &repo_full, number);
+            match pr_holder::claim(state, &msg.team_id, run_id, &earlier).await {
+                pr_holder::Claim::Busy {
+                    run_id: holder,
+                    why,
+                } => {
+                    pr_holder::stop_busy(
+                        state,
+                        msg,
+                        run_id,
+                        usage,
+                        start,
+                        (&repo_full, number, &url, &title),
+                        &holder,
+                        &why,
+                    )
+                    .await;
+                    return Ok(());
+                }
+                pr_holder::Claim::Free(guards) => {
+                    if msg.continuation == 0 && msg.model_retries == 0 {
+                        add_progress_note(
+                            state,
+                            &msg.team_id,
+                            run_id,
+                            &pr_holder::continue_note(number, &earlier),
+                        )
+                        .await;
+                    }
+                    pr_writer_guards.extend(guards);
+                    claimed_pr = Some(number);
+                }
+            }
+        }
     }
 
     // Load enabled MCP plugins once for this run
@@ -2441,13 +2495,16 @@ async fn run_passes(
     } else {
         let own_branch = match &own_open {
             Some((number, branch)) => {
-                add_progress_note(
-                    state,
-                    &msg.team_id,
-                    run_id,
-                    &format!("Continuing on my open pull request #{number} for this ticket"),
-                )
-                .await;
+                // Said already, with the earlier run, when it was claimed.
+                if claimed_pr != Some(*number) {
+                    add_progress_note(
+                        state,
+                        &msg.team_id,
+                        run_id,
+                        &format!("Continuing on my open pull request #{number} for this ticket"),
+                    )
+                    .await;
+                }
                 branch.clone()
             }
             None => {
@@ -2509,6 +2566,9 @@ async fn run_passes(
         }
     };
 
+    // Set when this step's implement pass wrote no file (the run's work may
+    // still be on the branch from its earlier steps).
+    let mut step_wrote_nothing = false;
     let impl_result = if can_skip_implement {
         // Resume: reconstruct impl_result from the existing branch diff
         info!(run_id, branch = %branch_name, "Checkpoint resume: skipping implement pass");
@@ -2583,6 +2643,58 @@ async fn run_passes(
                 None
             }
         };
+        // The branch's open pull request is an earlier run's of this ticket
+        // (found by the branch name, not by the ticket's own-PR lookup):
+        // the same one-writer rule as at the start of the run.
+        if let Some(number) = existing_pr
+            .as_ref()
+            .and_then(|p| p["number"].as_u64())
+            .filter(|n| claimed_pr != Some(*n))
+        {
+            let repo_full = format!("{}/{}", msg.repo_owner, msg.repo_name);
+            let earlier = pr_holder::holder_runs(&history, &repo_full, number);
+            if !earlier.is_empty() {
+                match pr_holder::claim(state, &msg.team_id, run_id, &earlier).await {
+                    pr_holder::Claim::Busy {
+                        run_id: holder,
+                        why,
+                    } => {
+                        let pr = existing_pr.as_ref().unwrap_or(&serde_json::Value::Null);
+                        pr_holder::stop_busy(
+                            state,
+                            msg,
+                            run_id,
+                            usage,
+                            start,
+                            (
+                                &repo_full,
+                                number,
+                                pr["html_url"].as_str().unwrap_or(""),
+                                pr["title"].as_str().unwrap_or(""),
+                            ),
+                            &holder,
+                            &why,
+                        )
+                        .await;
+                        close_memory(state, agent_memory.take()).await;
+                        return Ok(());
+                    }
+                    pr_holder::Claim::Free(guards) => {
+                        if msg.continuation == 0 && msg.model_retries == 0 {
+                            add_progress_note(
+                                state,
+                                &msg.team_id,
+                                run_id,
+                                &pr_holder::continue_note(number, &earlier),
+                            )
+                            .await;
+                        }
+                        pr_writer_guards.extend(guards);
+                    }
+                }
+            }
+        }
+
         // Someone else's open pull request for this ticket (a person's, or an
         // earlier run's on another branch), and nobody has said what to do
         // about it: don't open a second one; ask (once).
@@ -3000,11 +3112,12 @@ async fn run_passes(
         // A continuation of this same run (out of time, a model error) keeps
         // the commits its earlier attempt pushed: resetting the branch to its
         // base here threw that work away before the continuation could build
-        // on it.
+        // on it. That holds with an open pull request on the branch too: the
+        // continuation used to go through create_branch there, which kept the
+        // head but said "Created branch" in every step.
         let keep_own_branch = same_run
             && !skip_branch_reset
             && ticket_update_pr.is_none()
-            && existing_pr.is_none()
             && github
                 .get_ref(&msg.repo_owner, &msg.repo_name, &branch_name)
                 .await
@@ -3034,21 +3147,23 @@ async fn run_passes(
             )
             .await;
         } else {
-            // Create working branch (or reset existing one to base)
-            github
-                .create_branch(
+            // Create working branch (or reset a leftover one to base; a
+            // branch with an open pull request keeps its head). The note
+            // says which, never "created" over kept work.
+            let (_, started) = github
+                .start_branch(
                     &msg.repo_owner,
                     &msg.repo_name,
                     &branch_name,
                     &msg.base_branch,
                 )
                 .await?;
-            info!(run_id, branch = %branch_name, "Created working branch");
+            info!(run_id, branch = %branch_name, ?started, "Working branch ready");
             add_progress_note(
                 state,
                 &msg.team_id,
                 run_id,
-                &format!("Created branch {}", branch_name),
+                &started.note(&branch_name, &msg.base_branch),
             )
             .await;
 
@@ -3056,7 +3171,10 @@ async fn run_passes(
             // reused plan's `- [x]` checkmarks no longer reflect reality —
             // implement is told to skip checked tasks, which silently dropped
             // the wiped work. Reset every task to unchecked.
-            if plan_was_reused && plan_result.tasks.contains("- [x]") {
+            if started != crate::clients::github::BranchStart::KeptOpenPr
+                && plan_was_reused
+                && plan_result.tasks.contains("- [x]")
+            {
                 plan_result.tasks = plan_result.tasks.replace("- [x]", "- [ ]");
                 let tasks_key = format!(
                     "{}/tasks.md",
@@ -3935,6 +4053,130 @@ async fn run_passes(
             return Ok(());
         }
 
+        // A step that wrote no file is judged on the run's whole work: the
+        // branch's diff against its base, summed over every step (a
+        // continuation's earlier steps, or the open pull request it
+        // continues). Only a branch with none of the work, and a ticket that
+        // names no file, ever reaches the "add more detail" ending below.
+        if result.files_modified.is_empty() {
+            step_wrote_nothing = true;
+            let work = plan_coverage::changed_files(
+                &github,
+                &msg.repo_owner,
+                &msg.repo_name,
+                &msg.base_branch,
+                &branch_name,
+            )
+            .await
+            .map(|c| run_end::work_files(&c, &msg.ticket_id));
+            let tasks = plan_coverage::tasks_for(
+                &github,
+                &msg.repo_owner,
+                &msg.repo_name,
+                &branch_name,
+                &plan_result.tasks,
+            )
+            .await;
+            let ticket_names_files =
+                run_end::ticket_names_files(&format!("{}\n{}", msg.title, msg.body));
+            let mut verdict = run_end::judge(
+                work.as_deref(),
+                &tasks,
+                &run_end::coder_questions(&result.evidence.notes),
+                ticket_names_files,
+            );
+            // Nothing on the branch, and the plan says what to build: one
+            // more build, told every task, before anything is asked.
+            if matches!(verdict, run_end::Empty::Unbuilt(_))
+                && tasks.iter().any(|t| !t.optional && !t.generated)
+                && has_time_for_remediation(start)
+            {
+                add_progress_note(
+                    state,
+                    &msg.team_id,
+                    run_id,
+                    "The coder wrote no file and the branch has none of the change: building again, told every planned task",
+                )
+                .await;
+                let again = implement::run(
+                    state,
+                    msg,
+                    &github,
+                    &plan_result,
+                    &branch_name,
+                    &rules,
+                    &repo_instructions,
+                    Some(&run_end::build_round_feedback(&tasks)),
+                    &effective_complexity,
+                    &provider,
+                    usage,
+                    &file_cache,
+                    Some(run_id),
+                    implement_deadline,
+                    false,
+                )
+                .await?;
+                if again.files_modified.is_empty() {
+                    let mut evidence = std::mem::take(&mut result.evidence);
+                    evidence.merge(again.evidence);
+                    verdict = run_end::judge(
+                        work.as_deref(),
+                        &tasks,
+                        &run_end::coder_questions(&evidence.notes),
+                        ticket_names_files,
+                    );
+                    result.evidence = evidence;
+                } else {
+                    verdict = run_end::Empty::Carry(again.files_modified.clone());
+                    result.evidence.merge(again.evidence);
+                    result.conversation_log.extend(again.conversation_log);
+                }
+            }
+            match verdict {
+                run_end::Empty::Carry(files) => {
+                    add_progress_note(
+                        state,
+                        &msg.team_id,
+                        run_id,
+                        &format!(
+                            "This step wrote no new file; the branch holds the run's work on {} file(s): checking it against the plan",
+                            files.len()
+                        ),
+                    )
+                    .await;
+                    result.files_modified = files;
+                }
+                run_end::Empty::Ask(qs) => {
+                    let text = format!(
+                        "I built what I could and need a decision before I go on:\n{}",
+                        qs.iter()
+                            .map(|q| format!("- {q}"))
+                            .collect::<Vec<_>>()
+                            .join("\n")
+                    );
+                    ask_on_ticket(
+                        state,
+                        msg,
+                        run_id,
+                        &github,
+                        &run_end::questions_from(&qs),
+                        &text,
+                        &text,
+                        "A decision is needed",
+                    )
+                    .await;
+                    mark_run_needs_input(state, msg, run_id, usage, start, &used_mcp_ids).await;
+                    close_memory(state, agent_memory.take()).await;
+                    return Ok(());
+                }
+                run_end::Empty::Unbuilt(reason) => {
+                    close_memory(state, agent_memory.take()).await;
+                    return Err(reason.into());
+                }
+                run_end::Empty::Generic => {}
+            }
+        }
+
         if result.files_modified.is_empty() {
             warn!(run_id, "Implement pass produced zero file changes");
             // The files it went for were in a different repo of the org (one
@@ -4024,6 +4266,17 @@ async fn run_passes(
     check_cancelled(state, &msg.team_id, run_id).await?;
     let mut impl_result = impl_result;
     let mut plan_optional: Vec<proof::Finding> = Vec::new();
+    // The branch head before the plan rounds: a step that wrote nothing and
+    // whose rounds moved nothing made no progress, and another fresh step
+    // would only repeat it.
+    let head_before_rounds = if step_wrote_nothing {
+        github
+            .get_ref(&msg.repo_owner, &msg.repo_name, &branch_name)
+            .await
+            .ok()
+    } else {
+        None
+    };
     let coverage = plan_coverage::close_gaps(
         &plan_coverage::Work {
             state,
@@ -4060,12 +4313,60 @@ async fn run_passes(
             &plan_coverage::progress_note(&cov),
         )
         .await;
+        let generated = cov.generated_missing();
+        if !generated.is_empty() {
+            add_progress_note(
+                state,
+                &msg.team_id,
+                run_id,
+                &format!(
+                    "Generated file(s) the plan names are left to the generator check, which runs their generator before the pull request: {}",
+                    generated
+                        .iter()
+                        .map(|t| format!("`{}`", t.path))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+            )
+            .await;
+        }
         match plan_coverage::next(&cov, plan_coverage::MAX_ROUNDS, false) {
             plan_coverage::Next::Complete => {}
             plan_coverage::Next::OpenWithOptional => {
                 plan_optional = plan_coverage::optional_findings(&cov);
             }
             plan_coverage::Next::Round | plan_coverage::Next::Unfinished => {
+                let stalled = match &head_before_rounds {
+                    Some(before) => github
+                        .get_ref(&msg.repo_owner, &msg.repo_name, &branch_name)
+                        .await
+                        .is_ok_and(|now| &now == before),
+                    None => false,
+                };
+                if stalled {
+                    // This step and its rounds changed nothing for the tasks
+                    // left: say which, and why, instead of another step.
+                    save_checkpoint(
+                        state,
+                        &msg.team_id,
+                        run_id,
+                        "implement",
+                        &branch_name,
+                        0,
+                        usage,
+                    )
+                    .await;
+                    let kept =
+                        keep_wip_branch(&github, &msg.repo_owner, &msg.repo_name, &branch_name)
+                            .await;
+                    close_memory(state, agent_memory.take()).await;
+                    return Err(plan_coverage::stop_reason_why(
+                        &cov,
+                        &kept,
+                        "the last step changed no file for them",
+                    )
+                    .into());
+                }
                 // A fresh invocation, with its own time, continues from this
                 // branch (bounded); the continuation is told what's left.
                 save_checkpoint(
@@ -4700,8 +5001,23 @@ async fn run_passes(
 /// pull request: a later run of the ticket resets the run branch to its
 /// base, and the work must survive that. Returns the branch the work is on
 /// (the run branch itself when the copy can't be made).
+///
+/// `coderhelm-wip/<branch>` is also where a fix round on that branch's pull
+/// request keeps its checkpoints. A WIP branch holding commits the run
+/// branch doesn't have (a round's, or an earlier stop's) is never moved:
+/// the work is kept on a branch of its own instead.
 async fn keep_wip_branch(github: &GitHubClient, owner: &str, repo: &str, branch: &str) -> String {
-    let wip = common::run_round::wip_branch(branch);
+    let mut wip = common::run_round::wip_branch(branch);
+    if github.get_ref(owner, repo, &wip).await.is_ok() {
+        let holds_other_work = match github.get_diff(owner, repo, branch, &wip).await {
+            Ok(compare) => wip_holds_other_work(&compare),
+            // Can't tell: never move it.
+            Err(_) => true,
+        };
+        if holds_other_work {
+            wip = format!("{wip}-kept-{}", chrono::Utc::now().format("%Y%m%d%H%M%S"));
+        }
+    }
     match github.create_branch(owner, repo, &wip, branch).await {
         Ok(_) => wip,
         Err(e) => {
@@ -4709,6 +5025,12 @@ async fn keep_wip_branch(github: &GitHubClient, owner: &str, repo: &str, branch:
             branch.to_string()
         }
     }
+}
+
+/// A compare of `<run branch>...<WIP branch>` says the WIP branch has
+/// commits the run branch doesn't: moving it would lose them.
+fn wip_holds_other_work(compare: &serde_json::Value) -> bool {
+    compare["ahead_by"].as_u64().unwrap_or(1) > 0
 }
 
 /// The plan's checklist with only the done tasks checked, written where the
@@ -4745,7 +5067,9 @@ async fn continuation_feedback(
     plan: &plan::PlanResult,
     branch: &str,
 ) -> Option<String> {
-    let tasks = plan_coverage::plan_tasks(&plan.tasks);
+    let tasks =
+        plan_coverage::tasks_for(github, &msg.repo_owner, &msg.repo_name, branch, &plan.tasks)
+            .await;
     if tasks.is_empty() {
         return None;
     }
@@ -4788,18 +5112,19 @@ async fn run_repo_pipeline(
     let repo_owner = &msg.repo_owner;
     let repo_name = &msg.repo_name;
 
-    // Create working branch
-    github
-        .create_branch(repo_owner, repo_name, branch_name, base_branch)
+    // Create working branch (a branch with an open pull request keeps its
+    // head; the note says which).
+    let (_, started) = github
+        .start_branch(repo_owner, repo_name, branch_name, base_branch)
         .await?;
-    info!(run_id, repo = %format!("{repo_owner}/{repo_name}"), branch = %branch_name, "Created working branch");
+    info!(run_id, repo = %format!("{repo_owner}/{repo_name}"), branch = %branch_name, ?started, "Working branch ready");
     add_progress_note(
         state,
         &msg.team_id,
         run_id,
         &format!(
-            "Created branch {} on {}/{}",
-            branch_name, repo_owner, repo_name
+            "{} in {repo_owner}/{repo_name}",
+            started.note(branch_name, base_branch)
         ),
     )
     .await;
@@ -4887,16 +5212,32 @@ async fn run_repo_pipeline(
     )
     .await;
 
-    if impl_result.files_modified.is_empty() {
-        return Err(format!(
-            "No files modified in {}/{}. The issue may need more detail.",
-            repo_owner, repo_name
-        )
-        .into());
-    }
-
     // --- Plan check: this repository's tasks are done before its PR ---
     let mut impl_result = impl_result;
+    // A pass that wrote nothing is judged on the branch's whole work (an
+    // open pull request it continues may already hold it), never on the
+    // pass alone; with none, the reason names the planned tasks.
+    if impl_result.files_modified.is_empty() {
+        let work =
+            plan_coverage::changed_files(github, repo_owner, repo_name, base_branch, branch_name)
+                .await
+                .map(|c| run_end::work_files(&c, &msg.ticket_id));
+        let tasks =
+            plan_coverage::tasks_for(github, repo_owner, repo_name, branch_name, &repo_plan.tasks)
+                .await;
+        match run_end::judge(work.as_deref(), &tasks, &[], false) {
+            run_end::Empty::Carry(files) => impl_result.files_modified = files,
+            run_end::Empty::Unbuilt(reason) => {
+                return Err(format!("{repo_owner}/{repo_name}: {reason}").into())
+            }
+            _ => {
+                return Err(format!(
+                    "No files modified in {repo_owner}/{repo_name}, and its plan names no file to change."
+                )
+                .into())
+            }
+        }
+    }
     let mut plan_optional: Vec<proof::Finding> = Vec::new();
     if let Some(cov) = plan_coverage::close_gaps(
         &plan_coverage::Work {
@@ -6755,6 +7096,11 @@ fn existing_work_inputs(ev: Option<&test_fix::Evidence>) -> (Vec<String>, Vec<St
 
 fn looks_like_path(t: &str) -> bool {
     !t.contains(' ') && t.contains('.') && t.contains('/')
+}
+
+/// A pull request's address on GitHub.
+fn pr_url_of(repo: &str, number: u64) -> String {
+    format!("https://github.com/{repo}/pull/{number}")
 }
 
 /// CoderHelm's own pull requests for the ticket in this repository, from
@@ -9765,6 +10111,40 @@ mod ci_outcome_tests {
                 "red_on_base"
             ]
         );
+    }
+}
+
+#[cfg(test)]
+mod branch_keep_tests {
+    use super::wip_holds_other_work;
+    use crate::clients::github::BranchStart;
+
+    #[test]
+    fn a_wip_branch_with_commits_of_its_own_is_never_moved() {
+        assert!(wip_holds_other_work(
+            &serde_json::json!({"ahead_by": 2, "behind_by": 0})
+        ));
+        assert!(!wip_holds_other_work(
+            &serde_json::json!({"ahead_by": 0, "behind_by": 5})
+        ));
+        // A compare that doesn't say: never moved.
+        assert!(wip_holds_other_work(&serde_json::json!({})));
+    }
+
+    /// The observed run said "Created branch" in each of its four steps
+    /// while the branch kept an open pull request's commits.
+    #[test]
+    fn the_branch_note_says_what_happened() {
+        assert_eq!(
+            BranchStart::Created.note("feature/a", "main"),
+            "Created branch feature/a from main"
+        );
+        assert!(BranchStart::Reset
+            .note("feature/a", "main")
+            .contains("no open pull request"));
+        let kept = BranchStart::KeptOpenPr.note("feature/a", "main");
+        assert!(kept.contains("continuing from its head, nothing reset"));
+        assert!(!kept.contains("Created"));
     }
 }
 
