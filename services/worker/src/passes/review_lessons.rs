@@ -113,7 +113,10 @@ impl Discussion {
     /// change request is the strongest of these.
     pub fn has_pushback(&self) -> bool {
         self.findings.iter().any(|f| !f.replies.is_empty())
-            || !self.conversation.is_empty()
+            || self
+                .conversation
+                .iter()
+                .any(|(_, t)| !super::review_policy::is_bare_command(t))
             || self.dismissed
             || (self.changes_requested
                 && (self.closed_unmerged || self.approved_over_block || self.merged))
@@ -291,12 +294,19 @@ const JUDGE_SYSTEM: &str = "You read a code review that an automated reviewer (C
      description or people state; \"overstated\" — a fair point, but not one to block or request \
      changes on (a note at most); \"finding_correct\" — the reviewer was right: the person is \
      mistaken, or agreed, thanked it, asked a question, or fixed the code; \"unclear\" — not \
-     enough to tell. Judge from the code and the diff as well as what people said: a person \
+     enough to tell. Judge two things for each finding: whether it was right, and whether it \
+     should have held the merge. Only a high-severity defect the PR's own change causes should \
+     request changes. A finding marked [held the merge] that was a style or wording nit, a log \
+     level, hardening that isn't a defect, a follow-up the PR description already tracks or work \
+     outside this repository, a failure that comes from the base branch rather than the diff, or \
+     a blocker first raised in a later round on code that was already reviewed, is \
+     \"overstated\" even when the person went along with it or fixed it: complying with a block \
+     doesn't make the block right. Judge from the code and the diff as well as what people said: a person \
      saying \"this is intended\" is evidence about intent, not proof the code is safe, so a real \
      security or data-loss defect stays finding_correct. A PR closed without any sign it was \
      because of the review (superseded, duplicate, no longer needed) teaches nothing: unclear. \
-     For reviewer_wrong or overstated, write ONE lesson the reviewer will be given on every \
-     later review: general and reusable, naming the kind of change and what to do instead. \
+     For reviewer_wrong or overstated, `lesson` is required (never empty): ONE lesson the \
+     reviewer will be given on every later review: general and reusable, naming the kind of change and what to do instead. \
      Example: \"Adding an entry to an exclusion list the code already keeps is the team's \
      mechanism for hiding records; don't block it, at most suggest a comment saying why the \
      entry is there.\" No ids, values, names of people or customers, or ticket numbers from \
@@ -344,8 +354,13 @@ pub fn judge_prompt(d: &Discussion) -> String {
     if !d.findings.is_empty() {
         out.push_str("\n## CoderHelm's inline findings\n");
         for (i, f) in d.findings.iter().enumerate() {
+            let held = if super::review_agent::thread_holds_merge(&f.body) {
+                "held the merge"
+            } else {
+                "a note"
+            };
             out.push_str(&format!(
-                "\n### Finding {} — {}:{}\n{}\n",
+                "\n### Finding {} — {}:{} [{held}]\n{}\n",
                 i + 1,
                 f.path,
                 f.line,
@@ -399,10 +414,31 @@ pub struct Judged {
 
 impl Judged {
     /// The lesson to keep: only when the reviewer was wrong or overstated it.
-    pub fn lesson_to_store(&self) -> Option<&str> {
+    /// A judge that found it wrong but wrote no lesson still teaches: its
+    /// reason becomes the lesson (5 of 31 judgments learned anything while
+    /// the lesson was dropped whenever it came back empty).
+    pub fn lesson_to_store(&self) -> Option<String> {
+        if !matches!(self.verdict.as_str(), "reviewer_wrong" | "overstated") {
+            return None;
+        }
         let l = self.lesson.trim();
-        (matches!(self.verdict.as_str(), "reviewer_wrong" | "overstated") && !l.is_empty())
-            .then_some(l)
+        if !l.is_empty() {
+            return Some(l.to_string());
+        }
+        let why = self.why.trim().trim_end_matches('.');
+        if why.is_empty() {
+            return None;
+        }
+        let what = if self.finding.trim().is_empty() {
+            "a finding like this".to_string()
+        } else {
+            format!("a finding like \"{}\"", self.finding.trim())
+        };
+        Some(if self.verdict == "overstated" {
+            format!("Don't request changes for {what}: {why}. Say it as a note at most.")
+        } else {
+            format!("Don't raise {what}: {why}.")
+        })
     }
 }
 
@@ -412,13 +448,17 @@ struct Judgments {
     judgments: Vec<Judged>,
 }
 
+/// The JSON in a model's reply: a ```json fence, any fence, or the outermost
+/// braces (models drop or rename the fence; a reply that didn't read used to
+/// teach nothing).
 fn json_block(text: &str) -> &str {
-    match text.rfind("```json") {
-        Some(s) => {
-            let after = &text[s + 7..];
-            after[..after.find("```").unwrap_or(after.len())].trim()
-        }
-        None => text.trim(),
+    if let Some(s) = text.rfind("```json") {
+        let after = &text[s + 7..];
+        return after[..after.find("```").unwrap_or(after.len())].trim();
+    }
+    match (text.find('{'), text.rfind('}')) {
+        (Some(a), Some(b)) if a < b => &text[a..=b],
+        _ => text.trim(),
     }
 }
 
@@ -485,6 +525,7 @@ pub fn new_lesson(
     now: &str,
 ) -> Option<ReviewLesson> {
     let text = j.lesson_to_store()?;
+    let text = text.as_str();
     let scope = if j.scope.trim() == "team" {
         rl::TEAM_SCOPE.to_string()
     } else {
@@ -644,6 +685,16 @@ async fn learn(
         return Vec::new();
     }
     let judged = judge(model, &d).await;
+    let tally = |v: &str| judged.iter().filter(|j| j.verdict == v).count();
+    info!(
+        pr = pr_number,
+        judged = judged.len(),
+        reviewer_wrong = tally("reviewer_wrong"),
+        overstated = tally("overstated"),
+        finding_correct = tally("finding_correct"),
+        unclear = tally("unclear"),
+        "Review lesson: pushback judged"
+    );
     let mut learned = Vec::new();
     for j in &judged {
         // A comment the team argued with, and the judge agreed: a dismissal.
@@ -689,6 +740,75 @@ async fn learn(
         learned.push(new.lesson);
     }
     learned
+}
+
+/// The lesson a review keeps when it held back a blocker raised late
+/// (round 3 or later, on code already reviewed): one fixed lesson per
+/// repository, counted again each time instead of stored twice.
+pub fn raise_early_plan(
+    existing: &[ReviewLesson],
+    owner: &str,
+    name: &str,
+    pr: u64,
+    now: &str,
+) -> rl::StorePlan {
+    let scope = format!("{owner}/{name}");
+    let id = super::review_policy::RAISE_EARLY_LESSON_ID;
+    let new = ReviewLesson {
+        sk: rl::lesson_sk(&scope, id),
+        id: id.to_string(),
+        scope: scope.clone(),
+        lesson: super::review_policy::RAISE_EARLY_LESSON.to_string(),
+        category: "process".to_string(),
+        why: "A blocking finding was first raised in a later review round, on code that had \
+              not changed since it was reviewed."
+            .to_string(),
+        source_repo: scope,
+        source_pr: pr,
+        trigger: "late_blocker".to_string(),
+        created_at: now.to_string(),
+        seen: 1,
+        last_seen_at: now.to_string(),
+    };
+    let duplicate_of = existing
+        .iter()
+        .find(|l| l.sk == new.sk)
+        .map(|l| l.id.clone());
+    rl::plan_store(
+        existing,
+        new,
+        &Reconcile {
+            duplicate_of,
+            supersedes: vec![],
+        },
+        rl::MAX_LESSONS_PER_SCOPE,
+    )
+}
+
+/// Keeps [`raise_early_plan`]'s lesson. Best-effort.
+pub async fn learn_raise_early(
+    state: &WorkerState,
+    team_id: &str,
+    owner: &str,
+    name: &str,
+    pr: u64,
+) {
+    let existing = rl::for_repo(
+        &state.dynamo,
+        &state.config.settings_table_name,
+        team_id,
+        owner,
+        name,
+    )
+    .await
+    .unwrap_or_default();
+    let plan = raise_early_plan(&existing, owner, name, pr, &chrono::Utc::now().to_rfc3339());
+    apply_plan(state, team_id, &plan).await;
+    info!(
+        pr,
+        repeated = plan.seen_again.is_some(),
+        "Reviewer learned: raise blockers in the first review"
+    );
 }
 
 /// Takes the pending record from `pending` to `judging` when it is still at
@@ -1136,6 +1256,99 @@ mod tests {
             new_lesson(&judged[0], "acme", "web", 1, "t", "ID", "now"),
             None
         );
+    }
+
+    #[test]
+    fn a_wrong_or_overstated_judgment_always_teaches() {
+        let j = |verdict: &str, lesson: &str, why: &str| Judged {
+            finding: "Log level should be warn".into(),
+            verdict: verdict.into(),
+            why: why.into(),
+            lesson: lesson.into(),
+            ..Default::default()
+        };
+        // An empty lesson falls back to the judge's reason.
+        let l = j(
+            "overstated",
+            "",
+            "A log level is a style choice, not a defect.",
+        )
+        .lesson_to_store()
+        .unwrap();
+        assert!(
+            l.starts_with("Don't request changes for a finding like \"Log level should be warn\"")
+        );
+        assert!(l.contains("a style choice, not a defect"));
+        assert!(j("reviewer_wrong", "", "The caller filters nulls.")
+            .lesson_to_store()
+            .unwrap()
+            .contains("The caller filters nulls"));
+        assert_eq!(j("overstated", "", "").lesson_to_store(), None);
+        assert_eq!(j("finding_correct", "", "fixed").lesson_to_store(), None);
+        assert_eq!(
+            j("overstated", "Keep it short.", "x")
+                .lesson_to_store()
+                .as_deref(),
+            Some("Keep it short.")
+        );
+    }
+
+    #[test]
+    fn a_reply_without_a_json_fence_still_reads() {
+        let plain =
+            "Here you go:\n{\"judgments\":[{\"finding\":\"x\",\"verdict\":\"overstated\"}]}\nDone.";
+        assert_eq!(parse_judgments(plain).unwrap()[0].verdict, "overstated");
+        let fenced = "```\n{\"judgments\":[]}\n```";
+        assert_eq!(parse_judgments(fenced), Some(vec![]));
+    }
+
+    #[test]
+    fn a_bare_rereview_ask_is_not_pushback() {
+        let (mut pr, reviews, mut comments, _) = incident();
+        pr["state"] = json!("open");
+        comments.truncate(1);
+        let ask = vec![
+            json!({"user": user("dev-one", "User"), "author_association": "MEMBER", "body": "@coderhelm re-review"}),
+        ];
+        assert!(!discussion_from(&pr, &reviews, &comments, &ask).has_pushback());
+        let said = vec![
+            json!({"user": user("dev-one", "User"), "author_association": "MEMBER", "body": "@coderhelm the log level is our convention"}),
+        ];
+        assert!(discussion_from(&pr, &reviews, &comments, &said).has_pushback());
+    }
+
+    #[test]
+    fn the_judge_is_told_which_findings_held_the_merge_and_why_complying_isnt_agreeing() {
+        let (pr, reviews, mut comments, issue) = incident();
+        comments.push(json!({
+            "id": 20, "in_reply_to_id": null,
+            "user": user("coderhelm[bot]", "Bot"),
+            "path": "src/a.py", "line": 3,
+            "body": format!("💬 **nit** (style)\n\nx\n\n{}", crate::passes::review_agent::NON_BLOCKING_MARK),
+        }));
+        let d = discussion_from(&pr, &reviews, &comments, &issue);
+        let p = judge_prompt(&d);
+        assert!(p.contains("src/listing.py:12 [held the merge]"));
+        assert!(p.contains("src/a.py:3 [a note]"));
+        assert!(JUDGE_SYSTEM.contains("complying with a block"));
+        assert!(JUDGE_SYSTEM.contains("`lesson` is required"));
+    }
+
+    #[test]
+    fn a_late_blocker_lesson_is_kept_once_per_repository() {
+        let plan = raise_early_plan(&[], "acme", "web", 7, "2026-10-27T00:00:00Z");
+        let l = plan.put.clone().unwrap();
+        assert!(rl::is_lesson_sk(&l.sk));
+        assert_eq!(l.scope, "acme/web");
+        let again = raise_early_plan(
+            std::slice::from_ref(&l),
+            "acme",
+            "web",
+            9,
+            "2026-10-28T00:00:00Z",
+        );
+        assert_eq!(again.put, None);
+        assert_eq!(again.seen_again, Some(l.sk));
     }
 
     #[tokio::test]

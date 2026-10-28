@@ -199,12 +199,25 @@ const RATING_FOOTER: &str =
 CoderHelm dashboard so the reviewer learns. Reply **@coderhelm re-review** to re-run against the \
 latest commit, or **@coderhelm <question>** to ask._";
 
+/// The review's last line: rate it (one click on the PR's review page, where
+/// the rating reaches the reviewer's learning) or talk to it.
+pub(crate) fn rating_footer(app: &str, owner: &str, name: &str, pr: u64) -> String {
+    format!(
+        "\n\n---\n**Was this review right?** [Rate it 👍 / 👎]({app}/reviewer/pr?repo={owner}/{name}&pr={pr}) \
+         so the reviewer learns · reply `@coderhelm re-review` or `@coderhelm <question>`"
+    )
+}
+
 /// How long a processed review trigger stays claimed (consume-once dedup). Long
 /// enough to outlast any duplicate webhook / SQS redelivery of the SAME trigger
 /// (seconds–minutes apart), short enough that a review which errored out can be
 /// re-driven for the same head once it expires. Keys that are unique per action
 /// (a comment id) are unaffected by the length; head-based keys get this window.
 const REVIEW_JOB_DEDUP_TTL_SECS: u64 = 6 * 3600;
+
+/// How long a person's re-review ask holds the per-commit review claim: the
+/// gateway's window for push reviews, so the two keep each other out alike.
+const REVIEW_HEAD_CLAIM_SECS: u64 = 600;
 
 /// How long one review job may run: below the worker's 15-minute Lambda
 /// timeout, so a slow review fails (and is retried) instead of being killed.
@@ -802,18 +815,24 @@ async fn run_once(
     };
     *reviewed_head = head_sha.clone();
 
-    // A reply asking for a re-review and the author's push of the same commit
-    // arrive together and used to give two reviews of one commit, sometimes
-    // with opposite verdicts a minute apart. A reply review takes the same
-    // per-commit claim push reviews use; if a push review claimed this commit
-    // in the last few minutes, that review answers it.
-    if msg.trigger == "reply"
-        && msg.question.is_none()
-        && !head_sha.is_empty()
-        && !claim_recent_head(state, &msg, &head_sha).await
-    {
-        info!(pr = msg.pr_number, head = %head_sha, "Reply re-review skipped — this commit is already being reviewed");
-        return Ok(DONE);
+    // One review per head commit: a push, label or ready event for a commit
+    // CoderHelm already reviewed returns that verdict, with no model work.
+    let repo_slug = format!("{}/{}", msg.repo_owner, msg.repo_name);
+    let records =
+        super::review_sweep::review_records(state, &msg.team_id, &repo_slug, msg.pr_number, 10)
+            .await;
+    if msg.question.is_none() {
+        if let super::review_policy::Start::ReturnExisting { verdict } =
+            super::review_policy::start(&msg.trigger, &head_sha, &records)
+        {
+            info!(pr = msg.pr_number, head = %head_sha, trigger = %msg.trigger, verdict = %verdict, "Commit already reviewed — its verdict stands, not reviewed again");
+            return Ok(Outcome::Skipped {
+                reason: format!(
+                    "Already reviewed this commit: the verdict ({}) stands.",
+                    verdict.to_lowercase().replace('_', " ")
+                ),
+            });
+        }
     }
 
     // Real work starts here: the dashboard shows the PR as being reviewed.
@@ -881,11 +900,7 @@ async fn run_once(
     };
     let mut usage = TokenUsage::default();
 
-    let repo_slug = format!("{}/{}", msg.repo_owner, msg.repo_name);
     let self_authored = pr_author.contains("coderhelm");
-    let records =
-        super::review_sweep::review_records(state, &msg.team_id, &repo_slug, msg.pr_number, 10)
-            .await;
     let standing = super::review_sweep::standing_review(&records);
 
     // What the person's comment asks for, read by a model in context: an
@@ -1248,6 +1263,54 @@ async fn run_once(
 
     // ── Verdict mode (agentic: walk the repo, structured findings, self-critique) ──
 
+    // A person's re-review ask and a push review of the same commit used to
+    // run together and post opposite verdicts seconds apart. The ask takes
+    // the per-commit claim the gateway takes for push reviews: while another
+    // review of this commit is still running, that one answers.
+    if super::review_policy::takes_head_claim(&msg.trigger) && !head_sha.is_empty() {
+        let sk = super::review_policy::head_claim_sk(
+            &msg.repo_owner,
+            &msg.repo_name,
+            msg.pr_number,
+            &head_sha,
+        );
+        match common::claim::claim(
+            &state.dynamo,
+            &state.config.settings_table_name,
+            &msg.team_id,
+            &sk,
+            REVIEW_HEAD_CLAIM_SECS,
+        )
+        .await
+        {
+            // Another review of this commit is still running. The person's
+            // ask is answered after it, with its own visible verdict: the
+            // ask waits and runs again (and runs anyway after the last wait).
+            common::claim::Claim::Held
+                if super::review_policy::review_of_head(&records, &head_sha).is_none() =>
+            {
+                if let Some(later) = super::review_policy::deferred_ask(&msg) {
+                    if enqueue_review(state, &later, super::review_policy::ASK_WAIT_SECS).await {
+                        info!(pr = msg.pr_number, head = %head_sha, trigger = %msg.trigger, dedup_key = %later.dedup_key, "Re-review ask waits for the running review of this commit, then answers");
+                        return Ok(Outcome::Skipped {
+                            reason: "This commit is already being reviewed; your ask is answered \
+                                     right after that review."
+                                .into(),
+                        });
+                    }
+                }
+                info!(pr = msg.pr_number, head = %head_sha, "Re-review ask runs now (waited enough, or couldn't wait)");
+            }
+            common::claim::Claim::Failed(e) => {
+                warn!(pr = msg.pr_number, error = %e, "Review head claim errored — reviewing (fail-open)");
+            }
+            // Won, or held by a review of this commit that already finished:
+            // a person asked again, so it runs (and keeps its verdict unless
+            // something is new, see review_policy::stabilize).
+            _ => {}
+        }
+    }
+
     // A push after CoderHelm approved an earlier commit is reviewed from that
     // commit: only what changed since. One that changed no code or data is
     // not reviewed at all and the approval stands. A push after a request
@@ -1467,6 +1530,37 @@ async fn run_once(
             String::new()
         }
     };
+    // Checks that fail on the base branch too were not caused by this PR:
+    // the reviewer is told, and a finding resting on one is a note.
+    let base_failing: Vec<String> = if base.is_empty() {
+        Vec::new()
+    } else {
+        match github
+            .list_check_runs_for_ref(&msg.repo_owner, &msg.repo_name, base)
+            .await
+        {
+            Ok(v) => super::review_policy::failing_checks(&v),
+            Err(e) => {
+                warn!(pr = msg.pr_number, error = %e, "Could not fetch the base branch's check runs");
+                Vec::new()
+            }
+        }
+    };
+    let ci_context = if base_failing.is_empty() {
+        ci_context
+    } else {
+        format!(
+            "{ci_context}\n## Checks failing on the base branch too ({})\n{}\nThese fail without \
+             this PR's change: never block on them. Mention one as a note at most, with \
+             `caused_by_diff`: false.\n",
+            &base[..base.len().min(7)],
+            base_failing
+                .iter()
+                .map(|n| format!("- {n}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        )
+    };
     // For CoderHelm's own PR: what its planner looked up and found about
     // where the fix belongs, so a diff that overrides source data can be
     // judged against it.
@@ -1495,16 +1589,17 @@ async fn run_once(
         .collect();
     // What people wrote in the PR conversation, including the text of a
     // re-review ask.
-    let discussion = match github
+    let conversation_raw = match github
         .list_issue_comments(&msg.repo_owner, &msg.repo_name, msg.pr_number)
         .await
     {
-        Ok(c) => human_comments(&c, review_agent::MAX_DISCUSSION_COMMENTS),
+        Ok(c) => c,
         Err(e) => {
             warn!(pr = msg.pr_number, error = %e, "Could not list PR conversation comments");
             Vec::new()
         }
     };
+    let discussion = human_comments(&conversation_raw, review_agent::MAX_DISCUSSION_COMMENTS);
     let answered_context = format!(
         "{}{}",
         review_agent::format_settled_threads(&settled_threads),
@@ -1573,7 +1668,16 @@ async fn run_once(
             )
         })
         .unwrap_or_default();
-    let prior_context = format!("{prior_context}{label_context}{tests_context}{reconcile_context}");
+    // What this review is in the PR's history: a second look at a commit
+    // already reviewed keeps its verdict unless something is new; a later
+    // round blocks only on what changed since the round before.
+    let same_head_before = super::review_policy::review_of_head(&records, &head_sha).cloned();
+    let review_round = super::review_policy::round(&records, &head_sha);
+    let history_context =
+        super::review_policy::prompt_section(same_head_before.as_ref(), &review_round);
+    let prior_context = format!(
+        "{prior_context}{label_context}{tests_context}{reconcile_context}{history_context}"
+    );
 
     // Repository history through the GitHub App: no setup.
     let history = super::github_history::GithubHistory::new(
@@ -1858,42 +1962,90 @@ async fn run_once(
     review_agent::enforce_source_data_override(&mut findings);
     // A request to test something by hand is a note, never a block.
     review_agent::enforce_manual_checks_are_notes(&mut findings);
-    // Verdict hysteresis. Once CoderHelm approved an earlier commit, a new
-    // finding only holds the merge when it is in a file changed since that
-    // approval; one about code that hasn't changed is still worth saying, but
-    // as a note, not a flip back to "changes requested". Without this, 225
-    // approve-then-request-changes flips landed on 123 PRs in two months.
-    let mut held_since_approval: Vec<review_agent::Finding> = Vec::new();
-    if let Some(prev) = last_review(state, &msg)
+    // Rule 3: only a high-severity defect caused by the diff holds the merge.
+    let made_notes = super::review_policy::apply_blocking_policy(&mut findings, &base_failing);
+    if made_notes > 0 {
+        info!(
+            pr = msg.pr_number,
+            made_notes, "Blockers that aren't defects caused by the diff made notes"
+        );
+    }
+    // What people wrote since CoderHelm's previous review (conversation,
+    // inline replies): new information that may justify a new blocker on
+    // code reviewed before, or a changed verdict on the same commit.
+    let mut people_wrote = conversation_raw.clone();
+    if let Ok(c) = github
+        .get_review_comments(&msg.repo_owner, &msg.repo_name, msg.pr_number)
         .await
-        .filter(|p| p.verdict == "APPROVE" && !p.head_sha.is_empty() && p.head_sha != head_sha)
     {
-        if let Ok(since) = github
-            .get_diff(&msg.repo_owner, &msg.repo_name, &prev.head_sha, &head_sha)
-            .await
-        {
-            // When the PR's own change is the one approved (only the base
-            // branch came in), nothing of the PR's changed: every finding is
-            // about approved code.
-            let touched = if own_change_unchanged {
-                std::collections::HashSet::new()
+        people_wrote.extend(c);
+    }
+    let previous_review_at = records
+        .iter()
+        .find(|r| r.is_review() && !r.failed())
+        .map(|r| r.created_at.clone())
+        .unwrap_or_default();
+    let spoke_since_previous =
+        super::review_policy::person_spoke_since(&people_wrote, &previous_review_at);
+    // Rule 4: every blocker belongs in the first review of the code it is
+    // about. A new one on lines unchanged since the previous reviewed head is
+    // a note (225 approve-then-request-changes flips on 123 PRs, and 199
+    // blockers first raised in round 3 or later, came from this).
+    let changed_since_previous = match review_round.previous_head.as_deref() {
+        Some(prev) if prev != head_sha => {
+            if own_change_unchanged {
+                // Only the base branch came in: none of the PR's code changed.
+                Some(std::collections::HashMap::new())
             } else {
-                changed_files(&since)
-            };
-            let (keep, held) = hold_unchanged(std::mem::take(&mut findings), &touched);
-            findings = keep;
-            if !held.is_empty() {
-                info!(
-                    pr = msg.pr_number,
-                    held = held.len(),
-                    "Findings on code unchanged since approval kept as notes"
-                );
+                match github
+                    .get_diff(&msg.repo_owner, &msg.repo_name, prev, &head_sha)
+                    .await
+                {
+                    Ok(since) if super::review_scope::builds_on(&since) => {
+                        Some(super::review_policy::changed_lines(&since))
+                    }
+                    Ok(_) => None,
+                    Err(e) => {
+                        warn!(pr = msg.pr_number, error = %e, "Could not read the diff since the previous review — no late-blocker check");
+                        None
+                    }
+                }
             }
-            held_since_approval = held;
+        }
+        _ => None,
+    };
+    let earlier_threads: Vec<(String, u64)> = bot_threads
+        .iter()
+        .map(|t| (t.path.clone(), t.line))
+        .collect();
+    let late = super::review_policy::hold_late_blockers(
+        &mut findings,
+        &super::review_policy::UpFront {
+            round: &review_round,
+            changed_since_previous: changed_since_previous.as_ref(),
+            earlier_threads: &earlier_threads,
+            person_spoke: spoke_since_previous.is_some(),
+        },
+    );
+    if !late.held.is_empty() {
+        info!(
+            pr = msg.pr_number,
+            round = review_round.number,
+            held = late.held.len(),
+            "New blockers on code unchanged since the previous review kept as notes"
+        );
+        if late.self_lesson {
+            super::review_lessons::learn_raise_early(
+                state,
+                &msg.team_id,
+                &msg.repo_owner,
+                &msg.repo_name,
+                msg.pr_number,
+            )
+            .await;
         }
     }
-    let hunks = review_agent::right_line_hunks(&compare);
-    let postable = review_agent::to_postable(&findings, &changed, &hunks);
+    let held_late = late.held;
 
     // 4) Optional sandbox verification ("receipts"): actually run the affected
     // tests/build. A hard failure forces REQUEST_CHANGES.
@@ -1934,6 +2086,41 @@ async fn run_once(
     let unconfirmed = review_agent::unconfirmed_external_facts(pr_body, &output.unconfirmed_facts);
     let verdict: &'static str =
         review_agent::decide_verdict(&findings, still_open_holding, &unconfirmed, verify_failed);
+    // Rule 2: on a commit already reviewed, the verdict changes only on new
+    // information, and says what it was.
+    let new_info: Option<String> = if msg.trigger == "reconcile" {
+        Some(
+            msg.reconcile_note
+                .clone()
+                .filter(|n| !n.trim().is_empty())
+                .unwrap_or_else(|| "a reply on this PR changed the facts".to_string()),
+        )
+    } else {
+        same_head_before.as_ref().and_then(|prev| {
+            super::review_policy::person_spoke_since(&people_wrote, &prev.created_at)
+                .map(|who| format!("what {who} wrote since my last review"))
+        })
+    };
+    let stable = super::review_policy::stabilize(
+        same_head_before.as_ref(),
+        verdict,
+        &mut findings,
+        new_info.as_deref(),
+        &output.change_of_mind,
+        super::review_policy::trigger_kind(&msg.trigger)
+            == super::review_policy::TriggerKind::Explicit,
+    );
+    if stable.held {
+        info!(pr = msg.pr_number, head = %head_sha, kept = stable.verdict, model_verdict = verdict, "Verdict kept on an unchanged commit — nothing new since the last review");
+    }
+    if let Some(from) = &stable.flipped_from {
+        info!(pr = msg.pr_number, head = %head_sha, from = %from, to = stable.verdict, reason = %stable.note.as_deref().unwrap_or(""), "Verdict changed on an unchanged commit");
+    }
+    let verdict = stable.verdict;
+    // Inline comments from the findings as they stand after every rule, so a
+    // demoted finding is posted as a note.
+    let hunks = review_agent::right_line_hunks(&compare);
+    let postable = review_agent::to_postable(&findings, &changed, &hunks);
     let blocking_facts = unconfirmed.iter().filter(|f| f.blocks).count();
     if !unconfirmed.is_empty() {
         info!(
@@ -1974,7 +2161,7 @@ async fn run_once(
             verify_failed,
             notes: findings.iter().filter(|f| !f.holds_merge()).count()
                 + (unconfirmed.len() - blocking_facts)
-                + held_since_approval.len(),
+                + held_late.len(),
         },
     );
     let summary = if output.summary.trim().is_empty() {
@@ -1982,7 +2169,13 @@ async fn run_once(
     } else {
         short_overview(&output.summary)
     };
-    let mut full_body = format!("{verdict_line}\n\n{summary}\n\n{}", risk_report.markdown());
+    let mut full_body = match &stable.note {
+        Some(n) => format!(
+            "{verdict_line}\n\n{n}\n\n{summary}\n\n{}",
+            risk_report.markdown()
+        ),
+        None => format!("{verdict_line}\n\n{summary}\n\n{}", risk_report.markdown()),
+    };
     full_body.push_str(&review_agent::unconfirmed_markdown(&unconfirmed));
     if !verify_md.is_empty() {
         full_body.push_str(&format!("\n\n{verify_md}"));
@@ -1993,9 +2186,9 @@ async fn run_once(
             postable.unanchored_md
         ));
     }
-    if !held_since_approval.is_empty() {
-        full_body.push_str("\n\n#### Also worth a look\nOn code that hasn't changed since CoderHelm approved it, so these don't change the verdict:\n");
-        for f in &held_since_approval {
+    if !held_late.is_empty() {
+        full_body.push_str("\n\n#### Also worth a look\nOn code that hasn't changed since my previous review, so these are notes and don't change the verdict (they should have been raised then):\n");
+        for f in &held_late {
             full_body.push_str(&format!("- `{}:{}` {}\n", f.file, f.line, f.title));
         }
     }
@@ -2032,7 +2225,12 @@ async fn run_once(
     if let Some(s) = &skills {
         full_body.push_str(&s.consulted_markdown(super::skills::app_url(&state.config.stage)));
     }
-    full_body.push_str(RATING_FOOTER);
+    full_body.push_str(&rating_footer(
+        common::public_urls::app_url(&state.config.stage),
+        &msg.repo_owner,
+        &msg.repo_name,
+        msg.pr_number,
+    ));
 
     // Check the head again before speaking: the review takes minutes, and a
     // commit pushed seconds before this one started may not have been the PR's
@@ -2071,10 +2269,8 @@ async fn run_once(
     // see it. Only webhook-driven re-reviews (a self-fix commit, a re-label) get
     // silenced when the verdict didn't change.
     let explicit = msg.question.is_some()
-        || matches!(
-            msg.trigger.as_str(),
-            "reply" | "rerequest" | "sweep" | "reconcile"
-        );
+        || super::review_policy::trigger_kind(&msg.trigger)
+            == super::review_policy::TriggerKind::Explicit;
     // News = the verdict changed, OR there are new findings, OR earlier comments
     // got fixed. A same-verdict re-review that fixed one of three issues (and
     // found nothing new) used to be silently dropped here.
@@ -2090,9 +2286,11 @@ async fn run_once(
         && !head_commit_by_bot(&compare, &head_sha);
     // A push and a re-review ask for the same commit run two reviews; the
     // first to finish speaks for both.
-    let already_answered = prev
-        .as_ref()
-        .is_some_and(|p| p.head_sha == head_sha && p.created_at >= job_started);
+    // A person's ask is never silenced by it: it always gets its own answer.
+    let already_answered = !explicit
+        && prev
+            .as_ref()
+            .is_some_and(|p| p.head_sha == head_sha && p.created_at >= job_started);
     let decision = super::review_verdict::decide(
         super::review_verdict::Input::Review {
             verdict,
@@ -2105,17 +2303,44 @@ async fn run_once(
             self_authored,
         },
     );
-    let should_comment = matches!(decision, super::review_verdict::Decision::Post { .. });
     if already_answered {
         info!(pr = msg.pr_number, head = %head_sha, "Another review of this commit was just posted — not posting a duplicate");
     }
+    // One formal verdict per (PR, head, trigger kind): a conditional write,
+    // so two jobs for the same trigger never both post.
+    let verdict_sk = super::review_policy::verdict_claim_sk(
+        &msg.repo_owner,
+        &msg.repo_name,
+        msg.pr_number,
+        &head_sha,
+        &msg.trigger,
+        &msg.dedup_key,
+    );
+    let decision = match decision {
+        super::review_verdict::Decision::Post { .. }
+            if common::claim::claim(
+                &state.dynamo,
+                &state.config.settings_table_name,
+                &msg.team_id,
+                &verdict_sk,
+                REVIEW_JOB_DEDUP_TTL_SECS,
+            )
+            .await
+                == common::claim::Claim::Held =>
+        {
+            info!(pr = msg.pr_number, head = %head_sha, trigger = %msg.trigger, "A verdict for this commit and trigger was already posted — not posting another");
+            super::review_verdict::Decision::Nothing
+        }
+        d => d,
+    };
+    let should_comment = matches!(decision, super::review_verdict::Decision::Post { .. });
     let mut posted_event: Option<&'static str> = None;
     if let super::review_verdict::Decision::Post {
         event,
         dismiss_stale,
     } = decision
     {
-        super::review_verdict::post(
+        if let Err(e) = super::review_verdict::post(
             &github,
             &msg,
             &head_sha,
@@ -2124,7 +2349,18 @@ async fn run_once(
             &full_body,
             &postable.inline,
         )
-        .await?;
+        .await
+        {
+            // Not posted: a retry of this job may post it.
+            common::claim::release(
+                &state.dynamo,
+                &state.config.settings_table_name,
+                &msg.team_id,
+                &verdict_sk,
+            )
+            .await;
+            return Err(e);
+        }
         posted_event = Some(event);
         // Resolve the earlier threads this head fixed (after the review is up, so
         // the "N fixed" note is visible when they collapse).
@@ -2387,7 +2623,15 @@ async fn carry_approval(
         return;
     };
     let heading = carried_approval_body(approved, only_base_merged);
-    let body = format!("{heading}{RATING_FOOTER}");
+    let body = format!(
+        "{heading}{}",
+        rating_footer(
+            common::public_urls::app_url(&state.config.stage),
+            &msg.repo_owner,
+            &msg.repo_name,
+            msg.pr_number
+        )
+    );
     if let Err(e) =
         super::review_verdict::post(github, msg, head, event, dismiss_stale, &body, &[]).await
     {
@@ -3501,62 +3745,6 @@ mod prior_thread_tests {
     }
 }
 
-/// A verdict review is superseded once the PR's head is no longer the commit it
-/// was enqueued for; that commit's own review covers the latest code. Reviews
-/// that answer a question, or that resolve the head themselves (empty
-/// head_sha), always speak.
-/// How recent another review of the same commit must be for a reply
-/// re-review to stand down.
-const SAME_COMMIT_WINDOW_SECS: i64 = 90;
-
-/// Takes the per-commit review claim (the same item the gateway writes for
-/// push reviews). False when another review claimed this commit within the
-/// last few minutes; an older claim doesn't stop an explicit re-review.
-async fn claim_recent_head(state: &WorkerState, msg: &ReviewMessage, head_sha: &str) -> bool {
-    let sk = format!(
-        "REVIEWCLAIM#{}/{}#{:06}#{head_sha}",
-        msg.repo_owner, msg.repo_name, msg.pr_number
-    );
-    let now = chrono::Utc::now();
-    let existing = state
-        .dynamo
-        .get_item()
-        .table_name(&state.config.settings_table_name)
-        .key("pk", attr_s(&msg.team_id))
-        .key("sk", attr_s(&sk))
-        .consistent_read(true)
-        .send()
-        .await
-        .ok()
-        .and_then(|o| {
-            o.item()
-                .and_then(|i| i.get("created_at"))
-                .and_then(|v| v.as_s().ok())
-                .cloned()
-        })
-        .and_then(|t| chrono::DateTime::parse_from_rfc3339(&t).ok());
-    if let Some(at) = existing {
-        if (now - at.with_timezone(&chrono::Utc)).num_seconds() < SAME_COMMIT_WINDOW_SECS {
-            return false;
-        }
-    }
-    // Claim it, so a push event for this commit arriving now stands down.
-    let _ = state
-        .dynamo
-        .put_item()
-        .table_name(&state.config.settings_table_name)
-        .item("pk", attr_s(&msg.team_id))
-        .item("sk", attr_s(&sk))
-        .item("created_at", attr_s(&now.to_rfc3339()))
-        .item(
-            "ttl",
-            aws_sdk_dynamodb::types::AttributeValue::N((now.timestamp() + 6 * 3600).to_string()),
-        )
-        .send()
-        .await;
-    true
-}
-
 /// Files a compare response says changed.
 fn changed_files(compare: &serde_json::Value) -> std::collections::HashSet<String> {
     compare["files"]
@@ -3567,17 +3755,6 @@ fn changed_files(compare: &serde_json::Value) -> std::collections::HashSet<Strin
                 .collect()
         })
         .unwrap_or_default()
-}
-
-/// Splits findings into those in a file changed since the approval (they keep
-/// their weight) and those on unchanged files (kept as notes).
-fn hold_unchanged(
-    findings: Vec<review_agent::Finding>,
-    touched: &std::collections::HashSet<String>,
-) -> (Vec<review_agent::Finding>, Vec<review_agent::Finding>) {
-    findings
-        .into_iter()
-        .partition(|f| touched.contains(&f.file))
 }
 
 /// The review's overview, held to what it is asked to be: a few sentences.
@@ -3621,6 +3798,10 @@ fn moved_on(msg: &ReviewMessage, reviewed_head: &str, latest_head: &str) -> bool
         && reviewed_head != latest_head
 }
 
+/// A verdict review is superseded once the PR's head is no longer the commit it
+/// was enqueued for; that commit's own review covers the latest code. Reviews
+/// that answer a question, or that resolve the head themselves (empty
+/// head_sha), always speak.
 fn superseded(msg: &ReviewMessage, current_head: &str) -> bool {
     msg.question.is_none()
         && !msg.head_sha.is_empty()
@@ -3678,18 +3859,19 @@ mod superseded_tests {
     }
 
     #[test]
-    fn findings_on_unchanged_files_are_held_after_an_approval() {
-        let f = |file: &str| crate::passes::review_agent::Finding {
-            file: file.into(),
-            ..Default::default()
-        };
-        let touched: std::collections::HashSet<String> = ["src/a.ts".to_string()].into();
-        let (keep, held) = super::hold_unchanged(vec![f("src/a.ts"), f("src/b.ts")], &touched);
-        assert_eq!(keep.len(), 1);
-        assert_eq!(held[0].file, "src/b.ts");
+    fn changed_files_lists_every_file() {
         let compare =
             serde_json::json!({"files": [{"filename": "src/a.ts"}, {"filename": "x.md"}]});
         assert_eq!(super::changed_files(&compare).len(), 2);
+    }
+
+    #[test]
+    fn the_rating_footer_is_one_line_with_a_link() {
+        let f = super::rating_footer("https://app.example.com", "acme", "web", 7);
+        let last = f.trim().lines().last().unwrap();
+        assert_eq!(f.trim().lines().count(), 2, "a rule and one line");
+        assert!(last.contains("](https://app.example.com/reviewer/pr?repo=acme/web&pr=7)"));
+        assert!(last.contains("👍 / 👎"));
     }
 
     #[test]
@@ -3713,7 +3895,7 @@ mod verdict_tests {
         Finding {
             file: "infra/redirects.tf".into(),
             line: 12,
-            severity: "medium".into(),
+            severity: "high".into(),
             category: category.into(),
             title: "Redirect targets".into(),
             body: body.into(),
@@ -3738,7 +3920,7 @@ mod verdict_tests {
         assert_eq!(a.len(), 3);
         assert_eq!(a[0]["kind"], "defect");
         assert_eq!(a[0]["blocks"], true);
-        assert_eq!(a[0]["severity"], "medium");
+        assert_eq!(a[0]["severity"], "high");
         assert_eq!(a[0]["file"], "infra/redirects.tf");
         assert_eq!(a[0]["line"], 12);
         assert_eq!(a[0]["title"], "Redirect targets");
@@ -3776,6 +3958,10 @@ mod verdict_tests {
             finding("convention", None, "nit"),
         ];
         assert_eq!(decide_verdict(&defects, 0, &[], false), "REQUEST_CHANGES");
+        // The same defect at medium severity is a note.
+        let mut medium = finding("bug", Some("verified-defect"), "off by one");
+        medium.severity = "medium".into();
+        assert_eq!(decide_verdict(&[medium], 0, &[], false), "APPROVE");
         // an earlier requested change still open
         assert_eq!(decide_verdict(&[], 1, &[], false), "REQUEST_CHANGES");
         assert_eq!(decide_verdict(&[], 0, &[], true), "REQUEST_CHANGES");

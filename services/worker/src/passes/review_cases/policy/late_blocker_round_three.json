@@ -1,0 +1,30 @@
+{
+  "description": "Round 1 requested changes on one line; the author fixed it. Round 2 raised a new blocker on a file the fix never touched, and round 3 another: both were on code already reviewed. They become notes, the PR is approved, and round 3 teaches the reviewer to raise blockers up front.",
+  "steps": [
+    {"push": {"head": "e1e1e1e"}},
+    {"review": {"trigger": "synchronize", "dedup_key": "head#e1e1e1e",
+      "model": {"verdict": "REQUEST_CHANGES", "summary": "x", "findings": [
+        {"file": "src/jobs.rs", "line": 10, "severity": "high", "category": "bug", "evidence": "verified-defect", "title": "Job id reused", "body": "Two jobs share an id."}
+      ]}}},
+    {"push": {"head": "e2e2e2e", "changed": {"src/jobs.rs": [10, 11]}}},
+    {"review": {"trigger": "synchronize", "dedup_key": "head#e2e2e2e",
+      "model": {"verdict": "REQUEST_CHANGES", "summary": "x", "prior": [{"index": 0, "status": "fixed"}], "findings": [
+        {"file": "src/queue.rs", "line": 50, "severity": "high", "category": "bug", "evidence": "verified-defect", "title": "Queue drained twice", "body": "Unchanged since round 1."}
+      ]}}},
+    {"push": {"head": "e3e3e3e", "changed": {"src/jobs.rs": [30]}}},
+    {"review": {"trigger": "synchronize", "dedup_key": "head#e3e3e3e",
+      "model": {"verdict": "REQUEST_CHANGES", "summary": "x", "findings": [
+        {"file": "src/queue.rs", "line": 90, "severity": "blocking", "category": "correctness", "evidence": "verified-defect", "title": "Timeout too short", "body": "Unchanged since round 1."},
+        {"file": "src/jobs.rs", "line": 31, "severity": "high", "category": "bug", "evidence": "verified-defect", "title": "Off by one in the new loop", "body": "On the lines this push changed."}
+      ]}}}
+  ],
+  "expect": {
+    "formal": [["e1e1e1e", "REQUEST_CHANGES"], ["e2e2e2e", "APPROVE"], ["e3e3e3e", "REQUEST_CHANGES"]],
+    "lessons": ["raiseblockersearly"],
+    "body_contains": [
+      [1, "should have been raised then"],
+      [2, "Off by one in the new loop"],
+      [2, "should have been raised then"]
+    ]
+  }
+}

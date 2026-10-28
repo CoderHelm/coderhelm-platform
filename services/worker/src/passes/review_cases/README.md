@@ -159,3 +159,17 @@ unmerged with an outside-code lesson never gets another PR while the ticket
 is unchanged; a plan with no decision on where the fix belongs never codes; an
 informational or status-only ticket comment never starts a run; a run never
 completes while its PR reviewer's verdict blocks.
+
+## Verdict policy cases (`policy/`)
+
+`passes/review_policy_eval.rs` replays the review sequences behind the
+verdict rules in `passes/review_policy.rs` (one review per head commit, no
+flip on an unchanged commit without new information, only high-severity
+defects caused by the diff block, blockers raised up front). Each case is a
+list of steps (`push`, `comment`, `base_failing`, `claims_expire`, `review`,
+and `together` for jobs that start before any of them finishes) with the
+model output each review got, and `expect` lists the formal reviews posted.
+Every case also checks that jobs running together post one verdict per head,
+that an automatic trigger never reviews a reviewed head again, and that a
+verdict never changes on the same commit without new information and a
+reason. Runs with `cargo test -p worker review_policy`.

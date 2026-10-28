@@ -30,6 +30,13 @@ impl Claim {
     }
 }
 
+/// The per-commit review claim: the gateway takes it when a push or label
+/// starts a review of `head`, and a person's re-review ask takes the same one
+/// in the worker, so one commit is reviewed once at a time.
+pub fn review_head_sk(owner: &str, name: &str, pr: u64, head: &str) -> String {
+    format!("REVIEWCLAIM#{owner}/{name}#{pr:06}#{head}")
+}
+
 /// Take the claim `(pk, sk)` for `ttl_secs`. An expired claim is taken over.
 pub async fn claim(dynamo: &DynamoClient, table: &str, pk: &str, sk: &str, ttl_secs: u64) -> Claim {
     let now = chrono::Utc::now().timestamp().max(0) as u64;

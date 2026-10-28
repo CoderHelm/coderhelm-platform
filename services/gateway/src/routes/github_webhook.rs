@@ -3516,7 +3516,7 @@ async fn claim_review_slot(
     pr_number: u64,
     head_sha: &str,
 ) -> bool {
-    let sk = format!("REVIEWCLAIM#{owner}/{name}#{pr_number:06}#{head_sha}");
+    let sk = common::claim::review_head_sk(owner, name, pr_number, head_sha);
     // An expired claim is taken over (common::claim compares `ttl` itself;
     // DynamoDB's sweeper deletes expired items hours late).
     let c = common::claim::claim(
