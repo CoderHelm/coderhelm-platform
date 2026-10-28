@@ -374,6 +374,12 @@ async fn main() -> Result<(), Error> {
         .route("/runs/:run_id/reopen", post(routes::run_close::reopen_run))
         .route("/runs/close", post(routes::run_close::close_runs))
         .route("/repos", get(routes::api::list_repos))
+        .route(
+            "/repos/:owner/:name/staging-cms",
+            get(routes::staging_cms::get)
+                .put(routes::staging_cms::put)
+                .delete(routes::staging_cms::delete),
+        )
         .route("/repos/sync", post(routes::api::sync_repos))
         .route(
             "/repos/:owner/:name",

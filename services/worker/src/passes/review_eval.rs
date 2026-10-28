@@ -1464,6 +1464,7 @@ fn review_eval_replays_every_run_case() {
                     done_hash: String::new(),
                     prs: vec![],
                     decisions: vec![],
+                    prior: Default::default(),
                 };
                 // What the run does: the planner's route, then the history.
                 let route = match history.guard(case.plan.as_ref(), &case.current_hash) {

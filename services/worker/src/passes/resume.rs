@@ -3810,6 +3810,13 @@ pub(crate) async fn mark_pr_ready(
     {
         return;
     }
+    // A new feature stays a draft until its verification checklist passes.
+    if super::feature::ready_hold(state, github, team_id, repo_owner, repo_name, pr_number)
+        .await
+        .is_some()
+    {
+        return;
+    }
     // With a team commit template, the final squash keeps the message the
     // run's first commit was given from it; otherwise the PR title, as always.
     let keep_first = super::load_git_conventions(state, team_id, "")

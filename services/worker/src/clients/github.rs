@@ -3068,6 +3068,50 @@ impl GitHubClient {
             .collect())
     }
 
+    /// The repository's branch names, at most `max` (100 per page).
+    pub async fn list_branches(
+        &self,
+        owner: &str,
+        repo: &str,
+        max: usize,
+    ) -> Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>> {
+        let mut out = Vec::new();
+        for page in 1..=10u32 {
+            let url = format!("{API_BASE}/repos/{owner}/{repo}/branches?per_page=100&page={page}");
+            let v = self.get(&url).await?;
+            let batch: Vec<String> = v
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|b| b["name"].as_str().map(String::from))
+                .collect();
+            let done = batch.len() < 100;
+            out.extend(batch);
+            if done || out.len() >= max {
+                break;
+            }
+        }
+        out.truncate(max);
+        Ok(out)
+    }
+
+    /// The files one commit changed.
+    pub async fn commit_files(
+        &self,
+        owner: &str,
+        repo: &str,
+        sha: &str,
+    ) -> Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>> {
+        let url = format!("{API_BASE}/repos/{owner}/{repo}/commits/{sha}");
+        let v = self.get(&url).await?;
+        Ok(v["files"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|f| f["filename"].as_str().map(String::from))
+            .collect())
+    }
+
     /// Starts a workflow by its file name on a branch, with inputs.
     pub async fn dispatch_workflow(
         &self,

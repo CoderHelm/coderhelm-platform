@@ -67,6 +67,9 @@ pub mod merge_gate;
 pub mod messages;
 /// Retrying model API calls on transient failures, classified by status.
 pub mod model_retry;
+/// A repository's staging-only CMS write connection (for content the
+/// end-to-end tests read).
+pub mod staging_cms;
 // Anthropic SSE calls, metered per attempt (drops, retries, the deadline)
 pub mod model_stream;
 // Titan embeddings, metered as CoderHelm's own cost

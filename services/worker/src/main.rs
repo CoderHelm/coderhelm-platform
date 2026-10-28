@@ -720,6 +720,20 @@ async fn mark_pr_ready(
     {
         return Ok(());
     }
+    // A new feature stays a draft until its verification checklist passes.
+    if passes::feature::ready_hold(
+        state,
+        &github,
+        &msg.team_id,
+        &msg.repo_owner,
+        &msg.repo_name,
+        msg.pr_number,
+    )
+    .await
+    .is_some()
+    {
+        return Ok(());
+    }
     let node_id = pr
         .get("node_id")
         .and_then(|v| v.as_str())

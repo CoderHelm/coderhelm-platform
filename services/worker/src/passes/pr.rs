@@ -42,6 +42,10 @@ pub struct Proof<'a> {
     /// For a failing- or flaky-test fix: the failure, the counts and the
     /// checks (see `test_fix`).
     pub test_fix: Option<&'a super::test_fix::PrFacts>,
+    /// For a new feature: earlier attempts, reuse and registration, staging
+    /// content, the verification checklist and open product questions (see
+    /// `feature`).
+    pub feature: Option<&'a super::feature::PrFacts>,
 }
 
 /// What the writer is told about the checks CI runs on the PR: never a
@@ -486,6 +490,12 @@ Return ONLY the markdown body text."#,
         Some(t) => super::test_fix::shape_body(body_text, t),
         None => body_text,
     };
+    // A feature's checklist, staging content and open questions are
+    // written from what the run checked, never by the writer.
+    let body_text = match proof.feature {
+        Some(f) => super::feature::shape_body(body_text, f),
+        None => body_text,
+    };
 
     // Add issue link for GitHub tickets.
     // Strip any "Closes #N" the model may have included to avoid duplication.
@@ -674,6 +684,11 @@ Return ONLY the markdown body text."#,
     // pass on its head (see `test_fix::ready_gate`).
     if let Some(t) = proof.test_fix {
         super::test_fix::register_pr(state, msg, run_id, pr_number, t).await;
+    }
+    // A feature stays a draft until its verification checklist passes (see
+    // `feature::ready_hold`).
+    if let Some(f) = proof.feature {
+        super::feature::register_pr(state, msg, run_id, pr_number, f).await;
     }
 
     // Label CoderHelm's own PR at creation — this is the PR MAKER, so it owns the
@@ -1914,6 +1929,7 @@ mod refresh_tests {
             log: None,
             links: "",
             test_fix: None,
+            feature: None,
         };
         let owned = super::owned_sections(&plan, &proof, "acme/infra");
         let body = assemble(
