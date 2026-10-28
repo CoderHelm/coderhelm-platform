@@ -295,6 +295,8 @@ async fn handle_message(state: Arc<WorkerState>, message: models::WorkerMessage)
         models::WorkerMessage::Ticket(msg) => {
             info!(team_id = %msg.team_id, ticket_id = %msg.ticket_id, "Starting ticket run");
             if let Err(e) = passes::orchestrate_ticket(&state, msg).await {
+                // Already handled there: the run is failed with this reason
+                // and the ticket told (a test holds orchestrate_ticket to it).
                 error!(error = %common::run_fail::error_text(&*e), "Ticket run failed");
             }
         }

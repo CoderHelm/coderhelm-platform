@@ -73,6 +73,11 @@ pub enum Kind {
     ReviewFix,
     /// A person's review or comments.
     Feedback,
+    /// The security check found issues before the pull request opened, with
+    /// too little of that invocation left to fix them: the fix runs on the
+    /// pull request in a fresh invocation, and the pull request stays a
+    /// draft until the issues are gone.
+    SecurityFix,
 }
 
 impl Kind {
@@ -81,6 +86,7 @@ impl Kind {
             Kind::CiFix => "ci_fix",
             Kind::ReviewFix => "review_fix",
             Kind::Feedback => "feedback",
+            Kind::SecurityFix => "security_fix",
         }
     }
 
@@ -89,6 +95,7 @@ impl Kind {
             "ci_fix" => Some(Kind::CiFix),
             "review_fix" => Some(Kind::ReviewFix),
             "feedback" => Some(Kind::Feedback),
+            "security_fix" => Some(Kind::SecurityFix),
             _ => None,
         }
     }
@@ -99,6 +106,7 @@ impl Kind {
         match pass.split(':').next().unwrap_or("").trim() {
             "ci_fix" | "test" => Kind::CiFix,
             "feedback" => Kind::Feedback,
+            "security_fix" => Kind::SecurityFix,
             _ => Kind::ReviewFix,
         }
     }
@@ -109,6 +117,7 @@ impl Kind {
             Kind::CiFix => "CI fix round",
             Kind::ReviewFix => "review fix round",
             Kind::Feedback => "feedback round",
+            Kind::SecurityFix => "security fix round",
         }
     }
 }
@@ -660,6 +669,15 @@ mod tests {
         assert_eq!(Kind::of_pass("ci_fix:2"), Kind::CiFix);
         assert_eq!(Kind::of_pass("feedback"), Kind::Feedback);
         assert_eq!(Kind::of_pass("implement"), Kind::ReviewFix);
+        assert_eq!(Kind::of_pass("security_fix:1"), Kind::SecurityFix);
+        for k in [
+            Kind::CiFix,
+            Kind::ReviewFix,
+            Kind::Feedback,
+            Kind::SecurityFix,
+        ] {
+            assert_eq!(Kind::parse(k.as_str()), Some(k));
+        }
         for k in [Kind::CiFix, Kind::ReviewFix, Kind::Feedback] {
             assert_eq!(Kind::parse(k.as_str()), Some(k));
         }

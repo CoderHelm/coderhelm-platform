@@ -846,22 +846,42 @@ pub async fn orchestrate_ticket(
             );
             return Ok(());
         }
-    } else if let Err(e) = create_run_record(state, &msg, &run_id).await {
-        // The record may already be written: left alone it would sit in
-        // "running" with no pass until the stuck-run sweep called it a timeout.
-        // Say why now; with no record, nothing is written.
-        let reason = format!(
-            "Could not start the run: {}",
-            common::run_fail::error_text(&*e)
-        );
+    } else if let Err(e) = create_run_record(state, &msg, &run_id, RecordDetail::Full).await {
+        // Left alone, a record that was written would sit in "running" with
+        // no pass until the stuck-run sweep called it a timeout "during
+        // unknown pass", and a record that wasn't would leave the ticket with
+        // no answer at all. Fail it now, plainly, with the cause.
+        let reason = start_failure_reason(&common::run_fail::error_text(&*e));
         error!(run_id, error = %reason, "Run record write failed");
-        fail_run(state, &msg, &run_id, &reason, &usage, 0).await;
+        if !run_record_exists(state, &msg.team_id, &run_id).await {
+            // The full record was refused (too large a ticket, a bad
+            // value): keep a small one so the run page can say why.
+            if let Err(e2) = create_run_record(state, &msg, &run_id, RecordDetail::Minimal).await {
+                warn!(run_id, error = %common::run_fail::error_text(&*e2), "Minimal run record write failed too");
+            }
+        }
+        if run_record_exists(state, &msg.team_id, &run_id).await {
+            fail_run(state, &msg, &run_id, &reason, &usage, 0).await;
+        } else {
+            // No record to fail: the ticket still hears why.
+            notify_ticket_failed(state, &msg, &run_id, &reason).await;
+        }
+        release_ticket_lock(state, &msg.team_id, &msg.ticket_id).await;
         return Err(reason.into());
     }
 
     match tokio::time::timeout(
         std::time::Duration::from_secs(LAMBDA_TIMEOUT_SECS - 30), // 30s buffer for cleanup
-        run_passes(state, &mut msg, &run_id, &mut usage, &start),
+        // A panic must fail the run with a reason like any other error: left
+        // to the runtime, SQS delivered the ticket again, the duplicate check
+        // dropped it, and the run sat "running" until the stuck-run sweep.
+        async {
+            use futures::FutureExt;
+            std::panic::AssertUnwindSafe(run_passes(state, &mut msg, &run_id, &mut usage, &start))
+                .catch_unwind()
+                .await
+                .unwrap_or_else(|p| Err(panic_reason(p.as_ref()).into()))
+        },
     )
     .await
     {
@@ -875,23 +895,24 @@ pub async fn orchestrate_ticket(
             if err_msg.contains("cancelled by user") {
                 info!(run_id, duration, "Run cancelled — preserving tokens");
                 // Update token counts but keep status as cancelled
-                let cost = usage.estimated_cost();
-                let _ = state
+                let delta = usage.unrecorded();
+                let res = state
                     .dynamo
                     .update_item()
                     .table_name(&state.config.runs_table_name)
                     .key("team_id", attr_s(&msg.team_id))
                     .key("run_id", attr_s(&run_id))
-                    .update_expression("SET tokens_in = :ti, tokens_out = :to, cache_read_tokens = :crt, cache_write_tokens = :cwt, cost_usd = :c, duration_s = :d, updated_at = :t")
-                    .expression_attribute_values(":ti", attr_n(usage.input_tokens))
-                    .expression_attribute_values(":to", attr_n(usage.output_tokens))
-                    .expression_attribute_values(":crt", attr_n(usage.cache_read_tokens))
-                    .expression_attribute_values(":cwt", attr_n(usage.cache_write_tokens))
-                    .expression_attribute_values(":c", attr_n(format!("{cost:.4}")))
+                    .update_expression("SET tokens_in = if_not_exists(tokens_in, :uzero) + :ti, tokens_out = if_not_exists(tokens_out, :uzero) + :to, \
+             cache_read_tokens = if_not_exists(cache_read_tokens, :uzero) + :crt, cache_write_tokens = if_not_exists(cache_write_tokens, :uzero) + :cwt, \
+             cost_usd = if_not_exists(cost_usd, :uzero) + :c, duration_s = :d, updated_at = :t")
+                    .usage_values(&delta)
                     .expression_attribute_values(":d", attr_n(duration))
                     .expression_attribute_values(":t", attr_s(&chrono::Utc::now().to_rfc3339()))
                     .send()
                     .await;
+                if res.is_ok() {
+                    usage.mark_recorded(&delta);
+                }
                 // The team's counters already have these tokens: each model
                 // call is counted as it happens (common::usage).
             } else {
@@ -2240,26 +2261,24 @@ async fn run_passes(
 
         // Complete the run with no PR
         let duration = start.elapsed().as_secs();
-        let cost = usage.estimated_cost();
+        let delta = usage.unrecorded();
         let now = chrono::Utc::now().to_rfc3339();
-        let _ = state
+        let usage_res = state
             .dynamo
             .update_item()
             .table_name(&state.config.runs_table_name)
             .key("team_id", attr_s(&msg.team_id))
             .key("run_id", attr_s(run_id))
             .update_expression(
-                "SET #status = :s, tokens_in = :ti, tokens_out = :to, cache_read_tokens = :crt, cache_write_tokens = :cwt, cost_usd = :c, \
+                "SET #status = :s, tokens_in = if_not_exists(tokens_in, :uzero) + :ti, tokens_out = if_not_exists(tokens_out, :uzero) + :to, \
+             cache_read_tokens = if_not_exists(cache_read_tokens, :uzero) + :crt, cache_write_tokens = if_not_exists(cache_write_tokens, :uzero) + :cwt, \
+             cost_usd = if_not_exists(cost_usd, :uzero) + :c, \
                  duration_s = :d, updated_at = :t, current_pass = :cp, \
                  status_run_id = :sri, mcp_servers = :mcp",
             )
             .expression_attribute_names("#status", "status")
             .expression_attribute_values(":s", attr_s("completed"))
-            .expression_attribute_values(":ti", attr_n(usage.input_tokens))
-            .expression_attribute_values(":to", attr_n(usage.output_tokens))
-            .expression_attribute_values(":crt", attr_n(usage.cache_read_tokens))
-            .expression_attribute_values(":cwt", attr_n(usage.cache_write_tokens))
-            .expression_attribute_values(":c", attr_n(format!("{:.4}", cost)))
+            .usage_values(&delta)
             .expression_attribute_values(":d", attr_n(duration))
             .expression_attribute_values(":t", attr_s(&now))
             .expression_attribute_values(":cp", attr_s("done"))
@@ -2270,6 +2289,9 @@ async fn run_passes(
             )
             .send()
             .await;
+        if usage_res.is_ok() {
+            usage.mark_recorded(&delta);
+        }
         self::webhooks::emit_run(state, &msg.team_id, run_id, "completed").await;
 
         // Update analytics counters
@@ -2780,9 +2802,9 @@ async fn run_passes(
 
                         // Store PR info on run record and go to awaiting_ci
                         let now = chrono::Utc::now().to_rfc3339();
-                        let cost = usage.estimated_cost();
+                        let delta = usage.unrecorded();
                         let duration = start.elapsed().as_secs();
-                        let _ = state.dynamo.update_item()
+                        let usage_res = state.dynamo.update_item()
                             .table_name(&state.config.runs_table_name)
                             .key("team_id", attr_s(&msg.team_id))
                             .key("run_id", attr_s(run_id))
@@ -2790,8 +2812,9 @@ async fn run_passes(
                                 "SET #s = :s, status_run_id = :sri, current_pass = :cp, \
                                  pr_number = :pn, pr_url = :pu, branch = :b, \
                                  repo = :repo, team_repo = :tr, \
-                                 tokens_in = :ti, tokens_out = :to, cache_read_tokens = :crt, cache_write_tokens = :cwt, \
-                                 cost_usd = :cost, duration_s = :d, updated_at = :t"
+                                 tokens_in = if_not_exists(tokens_in, :uzero) + :ti, tokens_out = if_not_exists(tokens_out, :uzero) + :to, \
+             cache_read_tokens = if_not_exists(cache_read_tokens, :uzero) + :crt, cache_write_tokens = if_not_exists(cache_write_tokens, :uzero) + :cwt, \
+             cost_usd = if_not_exists(cost_usd, :uzero) + :c, duration_s = :d, updated_at = :t"
                             )
                             .expression_attribute_names("#s", "status")
                             // Never resurrect a cancelled run: if the user cancelled
@@ -2810,14 +2833,13 @@ async fn run_passes(
                             .expression_attribute_values(":repo", attr_s(&format!("{}/{}", msg.repo_owner, msg.repo_name)))
                             .expression_attribute_values(":tr", attr_s(&format!("{}#{}/{}", msg.team_id, msg.repo_owner, msg.repo_name)))
                             .expression_attribute_values(":t", attr_s(&now))
-                            .expression_attribute_values(":ti", attr_n(usage.input_tokens))
-                            .expression_attribute_values(":to", attr_n(usage.output_tokens))
-                            .expression_attribute_values(":crt", attr_n(usage.cache_read_tokens))
-                            .expression_attribute_values(":cwt", attr_n(usage.cache_write_tokens))
-                            .expression_attribute_values(":cost", attr_n(format!("{:.4}", cost)))
+                            .usage_values(&delta)
                             .expression_attribute_values(":d", attr_n(duration))
                             .send()
                             .await;
+                        if usage_res.is_ok() {
+                            usage.mark_recorded(&delta);
+                        }
 
                         save_checkpoint(state, &msg.team_id, run_id, "pr", &branch_name, 1, usage)
                             .await;
@@ -3488,49 +3510,52 @@ async fn run_passes(
 
             let duration = start.elapsed().as_secs();
             let now = chrono::Utc::now().to_rfc3339();
-            let cost = usage.estimated_cost();
+            let delta = usage.unrecorded();
 
-            // Build PR list attributes
-            let pr_urls: Vec<AttributeValue> =
-                pr_results.iter().map(|p| attr_s(&p.pr_url)).collect();
-            let pr_numbers: Vec<AttributeValue> =
-                pr_results.iter().map(|p| attr_n(p.pr_number)).collect();
-            let branches: Vec<AttributeValue> =
-                pr_results.iter().map(|p| attr_s(&p.branch)).collect();
+            // Each pull request with its own repository; the record's repo,
+            // number, branch and URL all come from one of them (the one in
+            // the run's repo when there is one), never mixed across repos.
+            let run_prs: Vec<common::run_prs::RunPr> = pr_results
+                .iter()
+                .map(|p| common::run_prs::RunPr {
+                    repo: format!("{}/{}", p.repo.0, p.repo.1),
+                    pr_number: p.pr_number,
+                    branch: p.branch.clone(),
+                    url: p.pr_url.clone(),
+                    outcome: String::new(),
+                })
+                .collect();
+            let run_repo = format!("{}/{}", msg.repo_owner, msg.repo_name);
+            let primary = common::run_prs::primary(&run_prs, &run_repo)
+                .cloned()
+                .unwrap_or_default();
 
-            // Store first PR as primary for backward compat, plus full lists
-            let multi_res = state
+            let (prs_clause, prs_values) = common::run_prs::set_clause(&run_prs);
+            let mut multi = state
                 .dynamo
                 .update_item()
                 .table_name(&state.config.runs_table_name)
                 .key("team_id", attr_s(&msg.team_id))
                 .key("run_id", attr_s(run_id))
-                .update_expression(
-                    "SET #status = :s, pr_url = :pr, pr_number = :pn, branch = :b, \
-                     pr_urls = :prs, pr_numbers = :pns, branches = :bs, \
+                .update_expression(format!(
+                    "SET #status = :s, pr_url = :pr, pr_number = :pn, branch = :b, {prs_clause}, \
                      repo = :repo, team_repo = :tr, \
-                     tokens_in = :ti, tokens_out = :to, cache_read_tokens = :crt, cache_write_tokens = :cwt, \
-                     cost_usd = :c, duration_s = :d, updated_at = :t, current_pass = :cp, \
+                     tokens_in = if_not_exists(tokens_in, :uzero) + :ti, tokens_out = if_not_exists(tokens_out, :uzero) + :to, \
+             cache_read_tokens = if_not_exists(cache_read_tokens, :uzero) + :crt, cache_write_tokens = if_not_exists(cache_write_tokens, :uzero) + :cwt, \
+             cost_usd = if_not_exists(cost_usd, :uzero) + :c, duration_s = :d, updated_at = :t, current_pass = :cp, \
                      status_run_id = :sri, mcp_servers = :mcp",
-                )
+                ))
                 .expression_attribute_names("#status", "status")
                 // Never resurrect a cancelled run (mirrors the single-repo guard).
                 .condition_expression(common::run_status::not_ended("#status"))
                 .ended_values()
                 .expression_attribute_values(":s", attr_s("awaiting_ci"))
-                .expression_attribute_values(":pr", attr_s(&pr_results[0].pr_url))
-                .expression_attribute_values(":pn", attr_n(pr_results[0].pr_number))
-                .expression_attribute_values(":b", attr_s(&pr_results[0].branch))
-                .expression_attribute_values(":prs", AttributeValue::L(pr_urls))
-                .expression_attribute_values(":pns", AttributeValue::L(pr_numbers))
-                .expression_attribute_values(":bs", AttributeValue::L(branches))
-                .expression_attribute_values(":repo", attr_s(&format!("{}/{}", msg.repo_owner, msg.repo_name)))
-                .expression_attribute_values(":tr", attr_s(&format!("{}#{}/{}", msg.team_id, msg.repo_owner, msg.repo_name)))
-                .expression_attribute_values(":ti", attr_n(usage.input_tokens))
-                .expression_attribute_values(":to", attr_n(usage.output_tokens))
-                .expression_attribute_values(":crt", attr_n(usage.cache_read_tokens))
-                .expression_attribute_values(":cwt", attr_n(usage.cache_write_tokens))
-                .expression_attribute_values(":c", attr_n(format!("{:.4}", cost)))
+                .expression_attribute_values(":pr", attr_s(&primary.url))
+                .expression_attribute_values(":pn", attr_n(primary.pr_number))
+                .expression_attribute_values(":b", attr_s(&primary.branch))
+                .expression_attribute_values(":repo", attr_s(&primary.repo))
+                .expression_attribute_values(":tr", attr_s(&format!("{}#{}", msg.team_id, primary.repo)))
+                .usage_values(&delta)
                 .expression_attribute_values(":d", attr_n(duration))
                 .expression_attribute_values(":t", attr_s(&now))
                 .expression_attribute_values(":cp", attr_s("awaiting_ci"))
@@ -3538,9 +3563,11 @@ async fn run_passes(
                 .expression_attribute_values(
                     ":mcp",
                     AttributeValue::L(used_mcp_ids.iter().map(|id| attr_s(id)).collect()),
-                )
-                .send()
-                .await;
+                );
+            for (name, value) in prs_values {
+                multi = multi.expression_attribute_values(name, value);
+            }
+            let multi_res = multi.send().await;
             if let Err(e) = multi_res {
                 if format!("{e:?}").contains("ConditionalCheckFailed") {
                     info!(
@@ -3551,6 +3578,7 @@ async fn run_passes(
                 }
                 return Err(e.into());
             }
+            usage.mark_recorded(&delta);
 
             info!(
                 run_id,
@@ -3715,7 +3743,7 @@ async fn run_passes(
                 .unwrap_or("")
                 .to_string();
             let duration = start.elapsed().as_secs();
-            let cost = usage.estimated_cost();
+            let delta = usage.unrecorded();
             let now = chrono::Utc::now().to_rfc3339();
             let wrote = state
                 .dynamo
@@ -3725,8 +3753,9 @@ async fn run_passes(
                 .key("run_id", attr_s(run_id))
                 .update_expression(
                     "SET #status = :s, status_run_id = :sri, pr_number = :pn, pr_url = :pu, \
-                     branch = :b, tokens_in = :ti, tokens_out = :to, cache_read_tokens = :crt, \
-                     cache_write_tokens = :cwt, cost_usd = :c, duration_s = :d, updated_at = :t, \
+                     branch = :b, tokens_in = if_not_exists(tokens_in, :uzero) + :ti, tokens_out = if_not_exists(tokens_out, :uzero) + :to, \
+             cache_read_tokens = if_not_exists(cache_read_tokens, :uzero) + :crt, cache_write_tokens = if_not_exists(cache_write_tokens, :uzero) + :cwt, \
+             cost_usd = if_not_exists(cost_usd, :uzero) + :c, duration_s = :d, updated_at = :t, \
                      current_pass = :cp",
                 )
                 .expression_attribute_names("#status", "status")
@@ -3737,11 +3766,7 @@ async fn run_passes(
                 .expression_attribute_values(":pn", attr_n(pr_number))
                 .expression_attribute_values(":pu", attr_s(&pr_url))
                 .expression_attribute_values(":b", attr_s(&branch_name))
-                .expression_attribute_values(":ti", attr_n(usage.input_tokens))
-                .expression_attribute_values(":to", attr_n(usage.output_tokens))
-                .expression_attribute_values(":crt", attr_n(usage.cache_read_tokens))
-                .expression_attribute_values(":cwt", attr_n(usage.cache_write_tokens))
-                .expression_attribute_values(":c", attr_n(format!("{:.4}", cost)))
+                .usage_values(&delta)
                 .expression_attribute_values(":d", attr_n(duration))
                 .expression_attribute_values(":t", attr_s(&now))
                 .expression_attribute_values(":cp", attr_s("done"))
@@ -3749,6 +3774,7 @@ async fn run_passes(
                 .await
                 .is_ok();
             if wrote {
+                usage.mark_recorded(&delta);
                 self::webhooks::emit_run(state, &msg.team_id, run_id, "completed").await;
             }
             close_memory(state, agent_memory.take()).await;
@@ -3802,9 +3828,9 @@ async fn run_passes(
             .await;
 
             let duration = start.elapsed().as_secs();
-            let cost = usage.estimated_cost();
+            let delta = usage.unrecorded();
             let now = chrono::Utc::now().to_rfc3339();
-            let _ = state
+            let usage_res = state
                 .dynamo
                 .update_item()
                 .table_name(&state.config.runs_table_name)
@@ -3812,23 +3838,23 @@ async fn run_passes(
                 .key("run_id", attr_s(run_id))
                 .update_expression(
                     "SET #status = :s, status_run_id = :sri, error_message = :em, \
-                     tokens_in = :ti, tokens_out = :to, cache_read_tokens = :crt, cache_write_tokens = :cwt, \
-                     cost_usd = :c, duration_s = :d, updated_at = :t, current_pass = :cp",
+                     tokens_in = if_not_exists(tokens_in, :uzero) + :ti, tokens_out = if_not_exists(tokens_out, :uzero) + :to, \
+             cache_read_tokens = if_not_exists(cache_read_tokens, :uzero) + :crt, cache_write_tokens = if_not_exists(cache_write_tokens, :uzero) + :cwt, \
+             cost_usd = if_not_exists(cost_usd, :uzero) + :c, duration_s = :d, updated_at = :t, current_pass = :cp",
                 )
                 .expression_attribute_names("#status", "status")
                 .expression_attribute_values(":s", attr_s("needs_input"))
                 .expression_attribute_values(":sri", attr_s(&format!("needs_input#{run_id}")))
                 .expression_attribute_values(":em", attr_s(raw_clarification))
-                .expression_attribute_values(":ti", attr_n(usage.input_tokens))
-                .expression_attribute_values(":to", attr_n(usage.output_tokens))
-                .expression_attribute_values(":crt", attr_n(usage.cache_read_tokens))
-                .expression_attribute_values(":cwt", attr_n(usage.cache_write_tokens))
-                .expression_attribute_values(":c", attr_n(format!("{:.4}", cost)))
+                .usage_values(&delta)
                 .expression_attribute_values(":d", attr_n(duration))
                 .expression_attribute_values(":t", attr_s(&now))
                 .expression_attribute_values(":cp", attr_s("done"))
                 .send()
                 .await;
+            if usage_res.is_ok() {
+                usage.mark_recorded(&delta);
+            }
             self::webhooks::emit_run(state, &msg.team_id, run_id, "needs_input").await;
             close_memory(state, agent_memory.take()).await;
             return Ok(());
@@ -4016,29 +4042,24 @@ async fn run_passes(
     update_pass(state, &msg.team_id, run_id, "security").await?;
     let pass_start = std::time::Instant::now();
     let usage_before = usage.clone();
-    let security_result = match security::run(
-        state,
-        msg,
-        &github,
-        &plan_result,
-        &branch_name,
-        &repo_instructions,
-        &provider,
-        usage,
-        &file_cache,
-        Some(run_id),
-    )
-    .await
-    {
-        Ok(r) => r,
-        Err(e) => {
-            warn!(run_id, error = %e, "Security pass errored, proceeding");
-            security::SecurityResult {
-                passed: true,
-                summary: format!("Security error: {e}"),
-            }
-        }
-    };
+    let mut security_verdict = security::Verdict::of(
+        security::run(
+            state,
+            msg,
+            &github,
+            &plan_result,
+            &branch_name,
+            &repo_instructions,
+            &provider,
+            usage,
+            &file_cache,
+            Some(run_id),
+        )
+        .await,
+    );
+    if let security::Verdict::NotChecked(e) = &security_verdict {
+        warn!(run_id, error = %e, "Security pass errored: the PR opens as a draft with it under Open items");
+    }
     write_pass_trace(
         state,
         &msg.team_id,
@@ -4062,35 +4083,48 @@ async fn run_passes(
     .await;
     info!(
         run_id,
-        passed = security_result.passed,
+        passed = security_verdict.passed(),
         "Security audit complete"
     );
     add_progress_note(
         state,
         &msg.team_id,
         run_id,
-        if security_result.passed {
-            "Security audit passed"
-        } else {
-            "Security issues found, fixing"
+        match &security_verdict {
+            security::Verdict::Passed => "Security audit passed",
+            security::Verdict::Findings(_) => "Security issues found, fixing",
+            security::Verdict::NotChecked(_) => {
+                "The security check couldn't run; the pull request stays a draft with that under Open items"
+            }
         },
     )
     .await;
 
-    if !security_result.passed {
+    // What a security round on the PR is told, when the fix (or the check)
+    // continues in a fresh invocation after the PR opens.
+    let mut security_round: Option<String> = None;
+    if let security::Verdict::NotChecked(why) = &security_verdict {
+        security_round = Some(security::recheck_feedback(why));
+    }
+    if let security::Verdict::Findings(summary) = security_verdict.clone() {
         if !has_time_for_remediation(start) {
+            // Too little of this invocation is left to fix them here: the fix
+            // is a round of its own on the pull request, with its own budget,
+            // and the PR stays a draft with the issues under Open items until
+            // it's done. Never skipped.
             warn!(
                 run_id,
                 remaining_secs = remaining_secs(start),
-                "Skipping security remediation — not enough time remaining"
+                "Security issues found with little time left: the fix continues in a fresh step"
             );
             add_progress_note(
                 state,
                 &msg.team_id,
                 run_id,
-                "Security issues found but skipping remediation (low time remaining)",
+                "Security issues found with too little time left in this step: the fix continues in a fresh step on the pull request, which stays a draft until they're fixed",
             )
             .await;
+            security_round = Some(security::fix_feedback(&summary));
         } else {
             info!(run_id, "Security issues found, running remediation cycle");
             check_cancelled(state, &msg.team_id, run_id).await?;
@@ -4103,10 +4137,7 @@ async fn run_passes(
                 &branch_name,
                 &rules,
                 &repo_instructions,
-                Some(&format!(
-                    "Security audit found vulnerabilities. Fix ALL of the following:\n\n{}",
-                    security_result.summary
-                )),
+                Some(&security::fix_feedback(&summary)),
                 &effective_complexity,
                 &provider,
                 usage,
@@ -4127,40 +4158,40 @@ async fn run_passes(
 
             check_cancelled(state, &msg.team_id, run_id).await?;
             update_pass(state, &msg.team_id, run_id, "security").await?;
-            let retry = match security::run(
-                state,
-                msg,
-                &github,
-                &plan_result,
-                &branch_name,
-                &repo_instructions,
-                &provider,
-                usage,
-                &file_cache,
-                Some(run_id),
-            )
-            .await
-            {
-                Ok(r) => r,
-                Err(e) => {
-                    warn!(run_id, error = %e, "Security retry errored, proceeding");
-                    security::SecurityResult {
-                        passed: true,
-                        summary: format!("Security error: {e}"),
-                    }
-                }
-            };
-            if !retry.passed {
+            security_verdict = security::Verdict::of(
+                security::run(
+                    state,
+                    msg,
+                    &github,
+                    &plan_result,
+                    &branch_name,
+                    &repo_instructions,
+                    &provider,
+                    usage,
+                    &file_cache,
+                    Some(run_id),
+                )
+                .await,
+            );
+            if !security_verdict.passed() {
                 warn!(
                     run_id,
-                    "Security issues remain after remediation, proceeding with PR"
+                    "Security issues remain after remediation (or the re-check didn't run): they go under Open items and the PR stays a draft"
                 );
+            }
+            // A re-check that didn't run runs again on the PR.
+            if let security::Verdict::NotChecked(why) = &security_verdict {
+                security_round = Some(security::recheck_feedback(why));
             }
         }
     }
+    // What is still open goes under Open items, marked: the PR stays a draft
+    // while any is listed.
+    let security_items = security::open_items(&security_verdict, security_round.is_some());
 
-    // Security findings are already posted as PR review comments and stored in the
-    // run record — no need to duplicate the full audit text into long-term memory.
+    // Security issues not fixed (or a check that didn't run) are the PR's
+    // Open items, marked so it stays a draft; the full audit text is not
+    // copied into long-term memory.
 
     // --- Proof check (before PR — what the change rests on is proven) ---
     check_cancelled(state, &msg.team_id, run_id).await?;
@@ -4227,6 +4258,8 @@ async fn run_passes(
     }
     // Tasks the plan marks optional and the change left out, named.
     gaps.extend(plan_optional);
+    // Security issues not fixed yet, or a check that didn't run.
+    gaps.extend(security_items);
     // Every redirect and link the change adds or changes, checked live; a
     // failure that survives its fix round stops the run before the PR.
     let links = link_checks::gate(&work, &mut evidence, usage, || {
@@ -4331,6 +4364,21 @@ async fn run_passes(
     )
     .await;
 
+    // The security fix there wasn't time for: a round of its own on the PR,
+    // parked for the resume that follows (a fresh invocation, its own budget).
+    if let Some(feedback) = &security_round {
+        let round = common::run_round::Round::start(
+            common::run_round::Kind::SecurityFix,
+            1,
+            "",
+            feedback,
+            true,
+            chrono::Utc::now(),
+        )
+        .parked(false);
+        round::record(state, &msg.team_id, run_id, &round).await;
+    }
+
     // Save checkpoint and set awaiting_ci — Lambda returns here.
     // The webhook-driven resume flow handles CI results and review.
     save_checkpoint(state, &msg.team_id, run_id, "pr", &branch_name, 0, usage).await;
@@ -4338,7 +4386,7 @@ async fn run_passes(
     // Update run record with PR info + awaiting_ci status
     let duration = start.elapsed().as_secs();
     let now = chrono::Utc::now().to_rfc3339();
-    let cost = usage.estimated_cost();
+    let delta = usage.unrecorded();
 
     let awaiting_res = state
         .dynamo
@@ -4348,7 +4396,9 @@ async fn run_passes(
         .key("run_id", attr_s(run_id))
         .update_expression(
             "SET #status = :s, pr_url = :pr, pr_number = :pn, branch = :b, \
-             tokens_in = :ti, tokens_out = :to, cache_read_tokens = :crt, cache_write_tokens = :cwt, cost_usd = :c, \
+             tokens_in = if_not_exists(tokens_in, :uzero) + :ti, tokens_out = if_not_exists(tokens_out, :uzero) + :to, \
+             cache_read_tokens = if_not_exists(cache_read_tokens, :uzero) + :crt, cache_write_tokens = if_not_exists(cache_write_tokens, :uzero) + :cwt, \
+             cost_usd = if_not_exists(cost_usd, :uzero) + :c, \
              duration_s = :d, updated_at = :t, current_pass = :cp, \
              status_run_id = :sri, \
              repo = :repo, team_repo = :tr, mcp_servers = :mcp",
@@ -4372,11 +4422,7 @@ async fn run_passes(
             )),
         )
         .expression_attribute_values(":b", attr_s(&branch_name))
-        .expression_attribute_values(":ti", attr_n(usage.input_tokens))
-        .expression_attribute_values(":to", attr_n(usage.output_tokens))
-        .expression_attribute_values(":crt", attr_n(usage.cache_read_tokens))
-        .expression_attribute_values(":cwt", attr_n(usage.cache_write_tokens))
-        .expression_attribute_values(":c", attr_n(format!("{:.4}", cost)))
+        .usage_values(&delta)
         .expression_attribute_values(":d", attr_n(duration))
         .expression_attribute_values(":t", attr_s(&now))
         .expression_attribute_values(":cp", attr_s("awaiting_ci"))
@@ -4402,6 +4448,7 @@ async fn run_passes(
         }
         return Err(e.into());
     }
+    usage.mark_recorded(&delta);
 
     info!(
         run_id,
@@ -4422,7 +4469,8 @@ async fn run_passes(
             .send_message()
             .queue_url(&state.config.ci_fix_queue_url)
             .message_body(resume_body.to_string())
-            .delay_seconds(120)
+            // A parked security fix starts as soon as this invocation ends.
+            .delay_seconds(if security_round.is_some() { 5 } else { 120 })
             .send()
             .await;
     }
@@ -4769,29 +4817,24 @@ async fn run_repo_pipeline(
     update_pass(state, &msg.team_id, run_id, "security").await?;
     let pass_start = std::time::Instant::now();
     let usage_before = usage.clone();
-    let security_result = match security::run(
-        state,
-        msg,
-        github,
-        &repo_plan,
-        branch_name,
-        repo_instructions,
-        provider,
-        usage,
-        file_cache,
-        Some(run_id),
-    )
-    .await
-    {
-        Ok(r) => r,
-        Err(e) => {
-            warn!(run_id, error = %e, "Security pass errored, proceeding");
-            security::SecurityResult {
-                passed: true,
-                summary: format!("Security error: {e}"),
-            }
-        }
-    };
+    let mut security_verdict = security::Verdict::of(
+        security::run(
+            state,
+            msg,
+            github,
+            &repo_plan,
+            branch_name,
+            repo_instructions,
+            provider,
+            usage,
+            file_cache,
+            Some(run_id),
+        )
+        .await,
+    );
+    if let security::Verdict::NotChecked(e) = &security_verdict {
+        warn!(run_id, error = %e, "Security pass errored: the PR opens as a draft with it under Open items");
+    }
     write_pass_trace(
         state,
         &msg.team_id,
@@ -4814,21 +4857,25 @@ async fn run_repo_pipeline(
     )
     .await;
 
-    info!(run_id, repo = %format!("{repo_owner}/{repo_name}"), passed = security_result.passed, "Security audit complete");
+    info!(run_id, repo = %format!("{repo_owner}/{repo_name}"), passed = security_verdict.passed(), "Security audit complete");
     add_progress_note(
         state,
         &msg.team_id,
         run_id,
-        if security_result.passed {
-            "Security audit passed"
-        } else {
-            "Security issues found, fixing"
+        match &security_verdict {
+            security::Verdict::Passed => "Security audit passed",
+            security::Verdict::Findings(_) => "Security issues found, fixing",
+            security::Verdict::NotChecked(_) => {
+                "The security check couldn't run; the pull request stays a draft with that under Open items"
+            }
         },
     )
     .await;
 
-    // Security remediation
-    if !security_result.passed {
+    // Security remediation. A multi-repo run's pull requests have no fix
+    // rounds of their own, so findings there wasn't time to fix stay under
+    // the PR's Open items and hold it a draft.
+    if let security::Verdict::Findings(summary) = security_verdict.clone() {
         if has_time_for_remediation(start) {
             info!(run_id, "Running security remediation");
             check_cancelled(state, &msg.team_id, run_id).await?;
@@ -4840,10 +4887,7 @@ async fn run_repo_pipeline(
                 branch_name,
                 rules,
                 repo_instructions,
-                Some(&format!(
-                    "Security audit found vulnerabilities. Fix ALL of the following:\n\n{}",
-                    security_result.summary
-                )),
+                Some(&security::fix_feedback(&summary)),
                 complexity,
                 provider,
                 usage,
@@ -4861,13 +4905,31 @@ async fn run_repo_pipeline(
                 &sec_fix.conversation_log,
             )
             .await;
+            check_cancelled(state, &msg.team_id, run_id).await?;
+            security_verdict = security::Verdict::of(
+                security::run(
+                    state,
+                    msg,
+                    github,
+                    &repo_plan,
+                    branch_name,
+                    repo_instructions,
+                    provider,
+                    usage,
+                    file_cache,
+                    Some(run_id),
+                )
+                .await,
+            );
         } else {
-            warn!(run_id, "Skipping security remediation — not enough time");
+            warn!(run_id, "No time for security remediation: the findings go under Open items and the PR stays a draft");
         }
     }
+    let security_items = security::open_items(&security_verdict, false);
 
-    // Security findings are already posted as PR review comments and stored in the
-    // run record — no need to duplicate the full audit text into long-term memory.
+    // Security issues not fixed (or a check that didn't run) are the PR's
+    // Open items, marked so it stays a draft; the full audit text is not
+    // copied into long-term memory.
 
     // --- Proof check ---
     check_cancelled(state, &msg.team_id, run_id).await?;
@@ -4928,6 +4990,7 @@ async fn run_repo_pipeline(
         .into());
     }
     gaps.extend(plan_optional);
+    gaps.extend(security_items);
     let links = link_checks::gate(&work, &mut evidence, usage, || {
         has_time_for_remediation(start)
     })
@@ -5060,11 +5123,62 @@ async fn resume_run_to_running(state: &WorkerState, team_id: &str, run_id: &str)
         .is_ok()
 }
 
+/// The reason a run that panicked gives.
+fn panic_reason(p: &(dyn std::any::Any + Send)) -> String {
+    let what = p
+        .downcast_ref::<&str>()
+        .map(|s| s.to_string())
+        .or_else(|| p.downcast_ref::<String>().cloned())
+        .unwrap_or_default();
+    if what.trim().is_empty() {
+        "CoderHelm stopped on an internal error.".to_string()
+    } else {
+        format!("CoderHelm stopped on an internal error: {}", what.trim())
+    }
+}
+
+/// How much of the ticket a new run record carries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RecordDetail {
+    Full,
+    /// No ticket body or images: written when the full record was refused,
+    /// so a run that can't start still has a record that says why.
+    Minimal,
+}
+
+/// The reason a run that could not start gives, in plain words, with the
+/// cause underneath (the SDK's own text is only "service error").
+fn start_failure_reason(cause: &str) -> String {
+    let cause = cause.trim();
+    if cause.is_empty() {
+        "CoderHelm could not start this run: saving the run failed.".to_string()
+    } else {
+        format!("CoderHelm could not start this run: saving the run failed ({cause}).")
+    }
+}
+
+async fn run_record_exists(state: &WorkerState, team_id: &str, run_id: &str) -> bool {
+    state
+        .dynamo
+        .get_item()
+        .table_name(&state.config.runs_table_name)
+        .key("team_id", attr_s(team_id))
+        .key("run_id", attr_s(run_id))
+        .projection_expression("run_id")
+        .consistent_read(true)
+        .send()
+        .await
+        .map(|o| o.item().is_some())
+        .unwrap_or(false)
+}
+
 async fn create_run_record(
     state: &WorkerState,
     msg: &TicketMessage,
     run_id: &str,
+    detail: RecordDetail,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let full = detail == RecordDetail::Full;
     let now = chrono::Utc::now().to_rfc3339();
     let repo = format!("{}/{}", msg.repo_owner, msg.repo_name);
     let mut put = state
@@ -5099,7 +5213,7 @@ async fn create_run_record(
         .item(
             "ticket_body",
             attr_s(
-                if matches!(msg.source, TicketSource::Jira | TicketSource::Alert) {
+                if full && matches!(msg.source, TicketSource::Jira | TicketSource::Alert) {
                     &msg.body
                 } else {
                     ""
@@ -5108,7 +5222,11 @@ async fn create_run_record(
         )
         .item(
             "image_attachments",
-            AttributeValue::S(serde_json::to_string(&msg.image_attachments).unwrap_or_default()),
+            AttributeValue::S(if full {
+                serde_json::to_string(&msg.image_attachments).unwrap_or_default()
+            } else {
+                "[]".to_string()
+            }),
         )
         .item("tokens_in", attr_n(0))
         .item("tokens_out", attr_n(0))
@@ -5439,25 +5557,24 @@ async fn finish_without_code(
     let duration = start.elapsed().as_secs();
     let now = chrono::Utc::now().to_rfc3339();
     let decision_json = serde_json::to_string(decision).unwrap_or_default();
-    let _ = state
+    // After mark_run_needs_input: only what it didn't already add.
+    let delta = usage.unrecorded();
+    let usage_res = state
         .dynamo
         .update_item()
         .table_name(&state.config.runs_table_name)
         .key("team_id", attr_s(&msg.team_id))
         .key("run_id", attr_s(run_id))
         .update_expression(
-            "SET #status = :s, tokens_in = :ti, tokens_out = :to, cache_read_tokens = :crt, \
-             cache_write_tokens = :cwt, cost_usd = :c, duration_s = :d, updated_at = :t, \
+            "SET #status = :s, tokens_in = if_not_exists(tokens_in, :uzero) + :ti, tokens_out = if_not_exists(tokens_out, :uzero) + :to, \
+             cache_read_tokens = if_not_exists(cache_read_tokens, :uzero) + :crt, cache_write_tokens = if_not_exists(cache_write_tokens, :uzero) + :cwt, \
+             cost_usd = if_not_exists(cost_usd, :uzero) + :c, duration_s = :d, updated_at = :t, \
              current_pass = :cp, status_run_id = :sri, mcp_servers = :mcp, \
              fix_location = :fl, fix_decision = :fd, outside_change_report = :rep",
         )
         .expression_attribute_names("#status", "status")
         .expression_attribute_values(":s", attr_s(status))
-        .expression_attribute_values(":ti", attr_n(usage.input_tokens))
-        .expression_attribute_values(":to", attr_n(usage.output_tokens))
-        .expression_attribute_values(":crt", attr_n(usage.cache_read_tokens))
-        .expression_attribute_values(":cwt", attr_n(usage.cache_write_tokens))
-        .expression_attribute_values(":c", attr_n(format!("{:.4}", usage.estimated_cost())))
+        .usage_values(&delta)
         .expression_attribute_values(":d", attr_n(duration))
         .expression_attribute_values(":t", attr_s(&now))
         .expression_attribute_values(":cp", attr_s("done"))
@@ -5471,6 +5588,9 @@ async fn finish_without_code(
         .expression_attribute_values(":rep", attr_s(&format!("{heading}{report}")))
         .send()
         .await;
+    if usage_res.is_ok() {
+        usage.mark_recorded(&delta);
+    }
 
     if outside {
         let analytics_month = chrono::Utc::now().format("%Y-%m").to_string();
@@ -5609,26 +5729,24 @@ async fn mark_run_needs_input(
     mcp_ids: &[String],
 ) {
     let duration = start.elapsed().as_secs();
-    let cost = usage.estimated_cost();
+    let delta = usage.unrecorded();
     let now = chrono::Utc::now().to_rfc3339();
-    let _ = state
+    let usage_res = state
         .dynamo
         .update_item()
         .table_name(&state.config.runs_table_name)
         .key("team_id", attr_s(&msg.team_id))
         .key("run_id", attr_s(run_id))
         .update_expression(
-            "SET #status = :s, tokens_in = :ti, tokens_out = :to, cache_read_tokens = :crt, cache_write_tokens = :cwt, cost_usd = :c, \
+            "SET #status = :s, tokens_in = if_not_exists(tokens_in, :uzero) + :ti, tokens_out = if_not_exists(tokens_out, :uzero) + :to, \
+             cache_read_tokens = if_not_exists(cache_read_tokens, :uzero) + :crt, cache_write_tokens = if_not_exists(cache_write_tokens, :uzero) + :cwt, \
+             cost_usd = if_not_exists(cost_usd, :uzero) + :c, \
              duration_s = :d, updated_at = :t, current_pass = :cp, \
              status_run_id = :sri, mcp_servers = :mcp",
         )
         .expression_attribute_names("#status", "status")
         .expression_attribute_values(":s", attr_s("needs_input"))
-        .expression_attribute_values(":ti", attr_n(usage.input_tokens))
-        .expression_attribute_values(":to", attr_n(usage.output_tokens))
-        .expression_attribute_values(":crt", attr_n(usage.cache_read_tokens))
-        .expression_attribute_values(":cwt", attr_n(usage.cache_write_tokens))
-        .expression_attribute_values(":c", attr_n(format!("{:.4}", cost)))
+        .usage_values(&delta)
         .expression_attribute_values(":d", attr_n(duration))
         .expression_attribute_values(":t", attr_s(&now))
         .expression_attribute_values(":cp", attr_s("done"))
@@ -5639,6 +5757,9 @@ async fn mark_run_needs_input(
         )
         .send()
         .await;
+    if usage_res.is_ok() {
+        usage.mark_recorded(&delta);
+    }
     self::webhooks::emit_run(state, &msg.team_id, run_id, "needs_input").await;
 
     // Update analytics counters
@@ -5798,7 +5919,7 @@ async fn complete_run(
     duration: u64,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let now = chrono::Utc::now().to_rfc3339();
-    let cost = usage.estimated_cost();
+    let delta = usage.unrecorded();
 
     // Update run record in runs table
     state
@@ -5809,7 +5930,9 @@ async fn complete_run(
         .key("run_id", attr_s(run_id))
         .update_expression(
             "SET #status = :s, pr_url = :pr, pr_number = :pn, branch = :b, \
-             tokens_in = :ti, tokens_out = :to, cache_read_tokens = :crt, cache_write_tokens = :cwt, cost_usd = :c, \
+             tokens_in = if_not_exists(tokens_in, :uzero) + :ti, tokens_out = if_not_exists(tokens_out, :uzero) + :to, \
+             cache_read_tokens = if_not_exists(cache_read_tokens, :uzero) + :crt, cache_write_tokens = if_not_exists(cache_write_tokens, :uzero) + :cwt, \
+             cost_usd = if_not_exists(cost_usd, :uzero) + :c, \
              duration_s = :d, updated_at = :t, current_pass = :cp, \
              status_run_id = :sri, files_modified = :fm, \
              repo = :repo, team_repo = :tr, mcp_servers = :mcp \
@@ -5832,11 +5955,7 @@ async fn complete_run(
             )),
         )
         .expression_attribute_values(":b", attr_s(&pr.branch))
-        .expression_attribute_values(":ti", attr_n(usage.input_tokens))
-        .expression_attribute_values(":to", attr_n(usage.output_tokens))
-        .expression_attribute_values(":crt", attr_n(usage.cache_read_tokens))
-        .expression_attribute_values(":cwt", attr_n(usage.cache_write_tokens))
-        .expression_attribute_values(":c", attr_n(format!("{:.4}", cost)))
+        .usage_values(&delta)
         .expression_attribute_values(":d", attr_n(duration))
         .expression_attribute_values(":t", attr_s(&now))
         .expression_attribute_values(":cp", attr_s("done"))
@@ -5857,6 +5976,7 @@ async fn complete_run(
         )
         .send()
         .await?;
+    usage.mark_recorded(&delta);
 
     // Update analytics counters (current month + all-time)
     let month = chrono::Utc::now().format("%Y-%m").to_string();
@@ -5947,21 +6067,15 @@ async fn fail_run(
         crate::agent::policy::end_run_for_stop(state, &msg.team_id, run_id, &stop).await;
         return;
     }
-    let cost = usage.estimated_cost();
+    let delta = usage.unrecorded();
 
     // The one failed-status write: reason, and the pass the record names.
     let failure = common::run_fail::RunFailure {
         reason: error_msg,
         pass: None,
         only_from: None,
-        extra: vec![
-            ("tokens_in", attr_n(usage.input_tokens)),
-            ("tokens_out", attr_n(usage.output_tokens)),
-            ("cache_read_tokens", attr_n(usage.cache_read_tokens)),
-            ("cache_write_tokens", attr_n(usage.cache_write_tokens)),
-            ("cost_usd", attr_n(format!("{:.4}", cost))),
-            ("duration_s", attr_n(duration)),
-        ],
+        extra: vec![("duration_s", attr_n(duration))],
+        add: usage_adds(&delta),
     };
     match common::run_fail::fail_run(
         &state.dynamo,
@@ -5972,7 +6086,10 @@ async fn fail_run(
     )
     .await
     {
-        Ok(true) => self::webhooks::emit_run(state, &msg.team_id, run_id, "failed").await,
+        Ok(true) => {
+            usage.mark_recorded(&delta);
+            self::webhooks::emit_run(state, &msg.team_id, run_id, "failed").await
+        }
         // Cancelled or merged meanwhile: nothing failed, so nothing to tell.
         Ok(false) => return,
         Err(e) => warn!(run_id, error = %e, "Could not mark the run failed"),
@@ -5996,6 +6113,17 @@ async fn fail_run(
     // Check token usage against limit and send warning if needed
     check_token_usage_warning(state, &msg.team_id, usage).await;
 
+    notify_ticket_failed(state, msg, run_id, error_msg).await;
+}
+
+/// Tells the ticket the run failed and why: a GitHub issue comment or a Jira
+/// comment, with a link to the run.
+async fn notify_ticket_failed(
+    state: &WorkerState,
+    msg: &TicketMessage,
+    run_id: &str,
+    error_msg: &str,
+) {
     // Comment on the GitHub issue so the user knows the run failed
     if matches!(msg.source, TicketSource::Github) && msg.issue_number > 0 {
         if let Ok(gh) = GitHubClient::new(
@@ -6070,6 +6198,42 @@ pub(crate) fn attr_s(val: &str) -> aws_sdk_dynamodb::types::AttributeValue {
 
 pub(crate) fn attr_n(val: impl std::fmt::Display) -> aws_sdk_dynamodb::types::AttributeValue {
     aws_sdk_dynamodb::types::AttributeValue::N(val.to_string())
+}
+
+/// Adds the values a run write's token and cost fields name (`:ti`, `:to`,
+/// `:crt`, `:cwt`, `:c`, `:uzero`). Those fields are always ADDed
+/// (`tokens_in = if_not_exists(tokens_in, :uzero) + :ti`): an invocation
+/// knows only its own calls, so a SET wiped what earlier ones recorded once
+/// the checkpoint holding the running total expired. Mark the delta with
+/// [`TokenUsage::mark_recorded`] once the write succeeds.
+pub(crate) trait RunUsageValues {
+    fn usage_values(self, d: &crate::models::UsageDelta) -> Self;
+}
+
+impl RunUsageValues
+    for aws_sdk_dynamodb::operation::update_item::builders::UpdateItemFluentBuilder
+{
+    fn usage_values(self, d: &crate::models::UsageDelta) -> Self {
+        self.expression_attribute_values(":ti", attr_n(d.input_tokens))
+            .expression_attribute_values(":to", attr_n(d.output_tokens))
+            .expression_attribute_values(":crt", attr_n(d.cache_read_tokens))
+            .expression_attribute_values(":cwt", attr_n(d.cache_write_tokens))
+            .expression_attribute_values(":c", attr_n(format!("{:.6}", d.cost_usd)))
+            .expression_attribute_values(":uzero", attr_n(0))
+    }
+}
+
+/// The run record's token and cost fields for a failure: added, never set.
+pub(crate) fn usage_adds(
+    d: &crate::models::UsageDelta,
+) -> Vec<(&'static str, aws_sdk_dynamodb::types::AttributeValue)> {
+    vec![
+        ("tokens_in", attr_n(d.input_tokens)),
+        ("tokens_out", attr_n(d.output_tokens)),
+        ("cache_read_tokens", attr_n(d.cache_read_tokens)),
+        ("cache_write_tokens", attr_n(d.cache_write_tokens)),
+        ("cost_usd", attr_n(format!("{:.6}", d.cost_usd))),
+    ]
 }
 
 /// Release a ticket-level lock after a run completes (any terminal state).
@@ -8469,8 +8633,8 @@ async fn salvage_timeout_pr(
 
     // Mark run as completed (not failed) — it produced a PR
     let now = chrono::Utc::now().to_rfc3339();
-    let cost = usage.estimated_cost();
-    let _ = state
+    let delta = usage.unrecorded();
+    let usage_res = state
         .dynamo
         .update_item()
         .table_name(&state.config.runs_table_name)
@@ -8478,9 +8642,9 @@ async fn salvage_timeout_pr(
         .key("run_id", attr_s(run_id))
         .update_expression(
             "SET #s = :s, status_run_id = :sri, pr_url = :pu, pr_number = :pn, \
-             branch = :b, tokens_in = :ti, tokens_out = :to, \
-             cache_read_tokens = :crt, cache_write_tokens = :cwt, \
-             cost_usd = :c, duration_s = :d, updated_at = :t, \
+             branch = :b, tokens_in = if_not_exists(tokens_in, :uzero) + :ti, tokens_out = if_not_exists(tokens_out, :uzero) + :to, \
+             cache_read_tokens = if_not_exists(cache_read_tokens, :uzero) + :crt, cache_write_tokens = if_not_exists(cache_write_tokens, :uzero) + :cwt, \
+             cost_usd = if_not_exists(cost_usd, :uzero) + :c, duration_s = :d, updated_at = :t, \
              error_message = :err",
         )
         .expression_attribute_names("#s", "status")
@@ -8489,16 +8653,15 @@ async fn salvage_timeout_pr(
         .expression_attribute_values(":pu", attr_s(&pr_url))
         .expression_attribute_values(":pn", attr_n(pr_number))
         .expression_attribute_values(":b", attr_s(branch))
-        .expression_attribute_values(":ti", attr_n(usage.input_tokens))
-        .expression_attribute_values(":to", attr_n(usage.output_tokens))
-        .expression_attribute_values(":crt", attr_n(usage.cache_read_tokens))
-        .expression_attribute_values(":cwt", attr_n(usage.cache_write_tokens))
-        .expression_attribute_values(":c", attr_n(format!("{cost:.4}")))
+        .usage_values(&delta)
         .expression_attribute_values(":d", attr_n(duration))
         .expression_attribute_values(":t", attr_s(&now))
         .expression_attribute_values(":err", attr_s("Partial implementation — agent timed out"))
         .send()
         .await;
+    if usage_res.is_ok() {
+        usage.mark_recorded(&delta);
+    }
     self::webhooks::emit_run(state, &msg.team_id, run_id, "completed").await;
 
     Ok(pr_url)
@@ -9609,5 +9772,108 @@ mod asking_tests {
             Some("https://example.atlassian.net/browse/ABC-7?focusedCommentId=10001")
         );
         assert_eq!(jira_comment_link(None, "ABC-7", Some("1")), None);
+    }
+}
+
+#[cfg(test)]
+mod run_usage_tests {
+    /// A run's tokens and cost are only ever added to. An invocation knows its
+    /// own calls; a SET of its total over the record wiped what earlier
+    /// invocations recorded (a resume after the checkpoint expired wrote a
+    /// near-zero cost over the run). This reads the worker's sources for a SET
+    /// of those fields. The review record (REVIEW#, one write per review) is
+    /// not a run record.
+    #[test]
+    fn run_records_never_set_tokens_or_cost() {
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut offenders = Vec::new();
+        let mut stack = vec![src];
+        while let Some(dir) = stack.pop() {
+            for entry in std::fs::read_dir(&dir).unwrap().flatten() {
+                let p = entry.path();
+                if p.is_dir() {
+                    stack.push(p);
+                    continue;
+                }
+                if p.extension().and_then(|e| e.to_str()) != Some("rs")
+                    || p.ends_with("passes/review_pr.rs")
+                {
+                    continue;
+                }
+                let text = std::fs::read_to_string(&p).unwrap_or_default();
+                for (i, line) in text.lines().enumerate() {
+                    for field in [
+                        "tokens_in",
+                        "tokens_out",
+                        "cache_read_tokens",
+                        "cache_write_tokens",
+                        "cost_usd",
+                    ] {
+                        if line.contains(&format!("{field} = :")) {
+                            offenders.push(format!("{}:{}", p.display(), i + 1));
+                        }
+                    }
+                }
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "add run usage with if_not_exists(field, :uzero) + :v: {offenders:?}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod start_failure_tests {
+    use super::{panic_reason, start_failure_reason};
+
+    /// A run that can't start says so plainly and keeps the cause the SDK
+    /// hides behind "service error".
+    #[test]
+    fn a_start_failure_is_plain_and_keeps_the_cause() {
+        let r = start_failure_reason(
+            "service error: ValidationException: Item size has exceeded the maximum allowed size",
+        );
+        assert!(r.starts_with("CoderHelm could not start this run"));
+        assert!(r.contains("ValidationException: Item size has exceeded"));
+        assert_eq!(
+            start_failure_reason("  "),
+            "CoderHelm could not start this run: saving the run failed."
+        );
+    }
+
+    #[test]
+    fn a_panic_becomes_a_reason() {
+        let p: Box<dyn std::any::Any + Send> = Box::new("index out of bounds");
+        assert_eq!(
+            panic_reason(p.as_ref()),
+            "CoderHelm stopped on an internal error: index out of bounds"
+        );
+        let p: Box<dyn std::any::Any + Send> = Box::new(String::from("boom"));
+        assert!(panic_reason(p.as_ref()).ends_with("boom"));
+        let p: Box<dyn std::any::Any + Send> = Box::new(7u8);
+        assert_eq!(
+            panic_reason(p.as_ref()),
+            "CoderHelm stopped on an internal error."
+        );
+    }
+
+    /// Every way a ticket run ends in error fails the run itself: the worker
+    /// only logs what orchestrate_ticket returns, so each `return Err` in it
+    /// must come after a failed-status write or a ticket notice.
+    #[test]
+    fn orchestrate_ticket_fails_the_run_before_returning_an_error() {
+        let src = include_str!("mod.rs");
+        let start = src.find("pub async fn orchestrate_ticket(").unwrap();
+        let end = start + src[start..].find("\n}\n").unwrap();
+        let body = &src[start..end];
+        let returns = body.matches("return Err(").count();
+        assert_eq!(returns, 1, "a new error return must fail the run first");
+        let before = &body[..body.find("return Err(").unwrap()];
+        assert!(before.contains("fail_run(") && before.contains("notify_ticket_failed("));
+        assert!(
+            !body.contains(".await?"),
+            "a `?` in orchestrate_ticket skips the failure"
+        );
     }
 }

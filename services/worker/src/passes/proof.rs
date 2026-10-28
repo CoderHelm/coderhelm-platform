@@ -423,6 +423,8 @@ impl Finding {
             "near_match_unresolved" => "Close match not followed up",
             "history_used" => "Earlier pull requests not built on",
             "planned_work" => "Planned work not done",
+            "security" => "Security issue not fixed yet",
+            "security_unchecked" => "Security check did not run",
             "optional_task" => "Optional task left out",
             other => other,
         }
@@ -1215,6 +1217,79 @@ pub fn fix_feedback(findings: &[Finding]) -> String {
 pub const UNVERIFIED_START: &str = "<!-- coderhelm:unverified -->";
 pub const UNVERIFIED_END: &str = "<!-- /coderhelm:unverified -->";
 const CI_MARK: &str = "<!-- coderhelm:ci -->";
+/// The mark on each security item: while one is in the description the pull
+/// request stays a draft (see `resume::mark_pr_ready`).
+pub const SECURITY_MARK: &str = "<!-- coderhelm:security -->";
+
+/// Whether a finding is a security issue or a security check that didn't run.
+fn is_security(f: &Finding) -> bool {
+    matches!(f.point.trim(), "security" | "security_unchecked")
+}
+
+/// One Open items line, with the mark its settler needs.
+fn item_line(f: &Finding) -> String {
+    if is_security(f) {
+        format!("{} {SECURITY_MARK}", f.line())
+    } else {
+        f.line()
+    }
+}
+
+/// Whether the description still holds a security item: the pull request
+/// stays a draft until none is left.
+pub fn holds_security_items(body: &str) -> bool {
+    body.contains(SECURITY_MARK)
+}
+
+/// The description with its security items replaced by `items` (all of them
+/// gone when `items` is empty), other Open items kept as they are. `None`
+/// when there is nothing to change.
+pub fn with_security_items(body: &str, items: &[Finding]) -> Option<String> {
+    let (mut owned, rest) = super::completeness::take_owned(body);
+    let new: Vec<String> = items.iter().map(item_line).collect();
+    if new.is_empty() && !owned.open_items.contains(SECURITY_MARK) {
+        return None;
+    }
+    let kept: Vec<&str> = owned
+        .open_items
+        .lines()
+        .filter(|l| !l.contains(SECURITY_MARK))
+        .collect();
+    let others: Vec<&str> = kept
+        .iter()
+        .copied()
+        .filter(|l| {
+            let l = l.trim_start_matches('>').trim_start();
+            l.starts_with("- ") || l.starts_with("* ")
+        })
+        .collect();
+    let section = if others.is_empty() && new.is_empty() {
+        String::new()
+    } else if kept.iter().any(|l| l.trim() == UNVERIFIED_END) {
+        // Into the section that is there, before its end marker.
+        let mut out: Vec<String> = Vec::new();
+        for l in kept {
+            if l.trim() == UNVERIFIED_END {
+                out.extend(new.iter().cloned());
+            }
+            out.push(l.to_string());
+        }
+        out.join("\n")
+    } else {
+        format!(
+            "{UNVERIFIED_START}\n## Open items\n{}\n{UNVERIFIED_END}",
+            others
+                .iter()
+                .map(|l| l.to_string())
+                .chain(new)
+                .collect::<Vec<_>>()
+                .join("\n")
+        )
+    };
+    owned.set(super::completeness::Section::OpenItems, section);
+    let out = super::completeness::assemble(&rest, &owned);
+    (out != body).then_some(out)
+}
 
 /// The Open items section, put at the bottom of the PR description: one
 /// bullet per proof gap, per step the plan left without an owner, and per
@@ -1225,7 +1300,7 @@ pub fn gaps_section(findings: &[Finding]) -> String {
     let of = |s: Settler| findings.iter().filter(move |f| f.settler() == s);
     let items: Vec<String> = of(Settler::Proof)
         .chain(of(Settler::Owner))
-        .map(Finding::line)
+        .map(item_line)
         .chain(of(Settler::Ci).map(|f| format!("{} {CI_MARK}", f.line())))
         .collect();
     if items.is_empty() {

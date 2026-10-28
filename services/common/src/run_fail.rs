@@ -41,8 +41,11 @@ pub struct RunFailure<'a> {
     /// Fail the run only while it is still in this status: a sweep that finds
     /// a stuck run must not overwrite one that finished meanwhile.
     pub only_from: Option<&'a str>,
-    /// More fields to set in the same write (tokens, cost, duration).
+    /// More fields to set in the same write (duration).
     pub extra: Vec<(&'static str, AttributeValue)>,
+    /// Numbers added to fields in the same write (tokens, cost): what this
+    /// invocation used, on top of what earlier ones recorded.
+    pub add: Vec<(&'static str, AttributeValue)>,
 }
 
 /// The status-index sort key of a failed run.
@@ -114,6 +117,15 @@ pub fn update(run_id: &str, f: &RunFailure<'_>, now: &str) -> Update {
     for (i, (field, value)) in f.extra.iter().enumerate() {
         let (n, v) = (format!("#x{i}"), format!(":x{i}"));
         expression.push_str(&format!(", {n} = {v}"));
+        names.insert(n, (*field).to_string());
+        values.insert(v, value.clone());
+    }
+    if !f.add.is_empty() {
+        values.insert(":zero".into(), AttributeValue::N("0".into()));
+    }
+    for (i, (field, value)) in f.add.iter().enumerate() {
+        let (n, v) = (format!("#a{i}"), format!(":a{i}"));
+        expression.push_str(&format!(", {n} = if_not_exists({n}, :zero) + {v}"));
         names.insert(n, (*field).to_string());
         values.insert(v, value.clone());
     }
@@ -296,6 +308,27 @@ mod tests {
         fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
             Some(&self.0)
         }
+    }
+
+    /// Tokens and cost are added to what the record holds, never set: a
+    /// later invocation's failure must not wipe the earlier cost.
+    #[test]
+    fn a_failure_adds_its_usage_to_the_record() {
+        let u = update(
+            "R1",
+            &RunFailure {
+                reason: "x",
+                add: vec![("cost_usd", AttributeValue::N("0.25".into()))],
+                ..Default::default()
+            },
+            "now",
+        );
+        assert!(u
+            .expression
+            .contains("#a0 = if_not_exists(#a0, :zero) + :a0"));
+        assert_eq!(u.names["#a0"], "cost_usd");
+        assert_eq!(u.values[":a0"], AttributeValue::N("0.25".into()));
+        assert_eq!(u.values[":zero"], AttributeValue::N("0".into()));
     }
 
     #[test]

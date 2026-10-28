@@ -7,6 +7,7 @@ use crate::agent::provider::ModelProvider;
 use crate::clients::github::GitHubClient;
 use crate::models::{ResumeMessage, TicketMessage, TicketSource, TokenUsage};
 use crate::passes::quarantine::{self, Gate};
+use crate::passes::RunUsageValues;
 use crate::passes::{
     attr_n, attr_s, implement, plan, review, save_checkpoint, write_pass_trace, FileCache,
 };
@@ -2828,7 +2829,10 @@ async fn fix_context(
         &state.http,
     )?;
 
-    let usage = load_usage_from_checkpoint(state, &msg.team_id, &msg.run_id).await;
+    // This invocation's calls only: every run write adds them to what the
+    // record holds. (Restoring a running total from the checkpoint and SETting
+    // it wiped the run's cost once that checkpoint's 7-day TTL expired.)
+    let usage = TokenUsage::default();
 
     // Load rules and repo instructions so CI fix / review fix have full context
     let rules = super::load_rules(state, &ticket_msg).await;
@@ -3213,6 +3217,9 @@ async fn run_pending_round(
             .await?;
         }
         RoundEnd::Done { files: 0 } => {
+            if kind == run_round::Kind::SecurityFix {
+                recheck_security(state, msg, &mut ctx, &pr).await;
+            }
             if kind == run_round::Kind::CiFix {
                 super::record_ci_outcome(
                     state,
@@ -3246,6 +3253,9 @@ async fn run_pending_round(
                 )
                 .await;
             }
+            if kind == run_round::Kind::SecurityFix {
+                recheck_security(state, msg, &mut ctx, &pr).await;
+            }
             save_checkpoint(
                 state,
                 &msg.team_id,
@@ -3273,6 +3283,73 @@ async fn run_pending_round(
         }
     }
     Ok(())
+}
+
+/// After a security fix round: the security check runs again on the pull
+/// request, and its Open items say what it found. Fixed, the items go and
+/// the pull request may be marked ready; still failing, or a check that
+/// didn't run, the items stay (with what it found now) and it stays a draft.
+async fn recheck_security(
+    state: &WorkerState,
+    msg: &ResumeMessage,
+    ctx: &mut FixContext,
+    pr: &PrRef<'_>,
+) {
+    let _ = super::update_pass(state, &msg.team_id, &msg.run_id, "security").await;
+    let plan = plan::PlanResult {
+        proposal: String::new(),
+        tasks: String::new(),
+        spec: String::new(),
+        design: String::new(),
+        repo_tasks: vec![],
+        fix: None,
+    };
+    let verdict = super::security::Verdict::of(
+        super::security::run(
+            state,
+            &ctx.ticket_msg,
+            &ctx.github,
+            &plan,
+            pr.branch,
+            &ctx.repo_instructions,
+            &ctx.provider,
+            &mut ctx.usage,
+            &FileCache::default(),
+            Some(&msg.run_id),
+        )
+        .await,
+    );
+    let note = match &verdict {
+        super::security::Verdict::Passed => "Security check passed after the security fix",
+        super::security::Verdict::Findings(_) => {
+            "Security issues remain after the security fix: they stay under Open items and the pull request stays a draft"
+        }
+        super::security::Verdict::NotChecked(_) => {
+            "The security check couldn't run after the security fix: the pull request stays a draft"
+        }
+    };
+    super::add_progress_note(state, &msg.team_id, &msg.run_id, note).await;
+    let items = super::security::open_items(&verdict, false);
+    let body = match ctx
+        .github
+        .get_pull_request(pr.owner, pr.repo, pr.number)
+        .await
+    {
+        Ok(p) => p["body"].as_str().unwrap_or("").to_string(),
+        Err(e) => {
+            warn!(run_id = msg.run_id, error = %e, "Could not read the PR to update its security items");
+            return;
+        }
+    };
+    if let Some(updated) = super::proof::with_security_items(&body, &items) {
+        if let Err(e) = ctx
+            .github
+            .update_pr_body(pr.owner, pr.repo, pr.number, &updated)
+            .await
+        {
+            warn!(run_id = msg.run_id, error = %e, "Could not update the PR's security items");
+        }
+    }
 }
 
 async fn load_unprocessed_events(
@@ -3564,52 +3641,6 @@ fn collect_review_feedback(events: &[RunEvent]) -> String {
         .join("\n\n---\n\n")
 }
 
-async fn load_usage_from_checkpoint(
-    state: &WorkerState,
-    team_id: &str,
-    run_id: &str,
-) -> TokenUsage {
-    if state.config.checkpoints_table_name.is_empty() {
-        return TokenUsage::default();
-    }
-    let result = state
-        .dynamo
-        .get_item()
-        .table_name(&state.config.checkpoints_table_name)
-        .key("team_id", attr_s(team_id))
-        .key("sk", attr_s(&format!("RUN#{run_id}")))
-        .send()
-        .await;
-
-    match result {
-        Ok(output) => {
-            if let Some(item) = output.item() {
-                let get_n = |key: &str| -> u64 {
-                    item.get(key)
-                        .and_then(|v| v.as_n().ok())
-                        .and_then(|n| n.parse().ok())
-                        .unwrap_or(0)
-                };
-                let cost = item
-                    .get("cost_usd")
-                    .and_then(|v| v.as_n().ok())
-                    .and_then(|n| n.parse::<f64>().ok());
-                TokenUsage::restored(
-                    &state.config.model_id,
-                    get_n("tokens_in"),
-                    get_n("tokens_out"),
-                    get_n("cache_read"),
-                    get_n("cache_write"),
-                    cost,
-                )
-            } else {
-                TokenUsage::default()
-            }
-        }
-        Err(_) => TokenUsage::default(),
-    }
-}
-
 /// Compare the current failure against the stored one, persist the update, and
 /// return true if the run has STALLED (same failure repeating → halt). The pure
 /// decision (`stall_decision` / `ci_failure_signature`) is unit-tested.
@@ -3768,7 +3799,7 @@ async fn set_run_awaiting_ci(
     duration: u64,
 ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
     let now = chrono::Utc::now().to_rfc3339();
-    let cost = usage.estimated_cost();
+    let delta = usage.unrecorded();
 
     // Conditional on the run NOT being cancelled: a user cancel must be
     // durable — a racing CI-fix/resume invocation used to blindly overwrite
@@ -3782,8 +3813,9 @@ async fn set_run_awaiting_ci(
         .key("run_id", attr_s(run_id))
         .update_expression(
             "SET #s = :s, pr_url = :pr, pr_number = :pn, branch = :b, \
-             tokens_in = :ti, tokens_out = :to, cache_read_tokens = :crt, cache_write_tokens = :cwt, \
-             cost_usd = :c, duration_s = :d, updated_at = :t, current_pass = :cp, \
+             tokens_in = if_not_exists(tokens_in, :uzero) + :ti, tokens_out = if_not_exists(tokens_out, :uzero) + :to, \
+             cache_read_tokens = if_not_exists(cache_read_tokens, :uzero) + :crt, cache_write_tokens = if_not_exists(cache_write_tokens, :uzero) + :cwt, \
+             cost_usd = if_not_exists(cost_usd, :uzero) + :c, duration_s = :d, updated_at = :t, current_pass = :cp, \
              status_run_id = :sri \
              REMOVE error_message, #err, #inc",
         )
@@ -3797,11 +3829,7 @@ async fn set_run_awaiting_ci(
         .expression_attribute_values(":pr", attr_s(pr_url))
         .expression_attribute_values(":pn", attr_n(pr_number))
         .expression_attribute_values(":b", attr_s(branch))
-        .expression_attribute_values(":ti", attr_n(usage.input_tokens))
-        .expression_attribute_values(":to", attr_n(usage.output_tokens))
-        .expression_attribute_values(":crt", attr_n(usage.cache_read_tokens))
-        .expression_attribute_values(":cwt", attr_n(usage.cache_write_tokens))
-        .expression_attribute_values(":c", attr_n(format!("{:.4}", cost)))
+        .usage_values(&delta)
         .expression_attribute_values(":d", attr_n(duration))
         .expression_attribute_values(":t", attr_s(&now))
         .expression_attribute_values(":cp", attr_s("awaiting_ci"))
@@ -3809,7 +3837,10 @@ async fn set_run_awaiting_ci(
         .send()
         .await;
     match res {
-        Ok(_) => Ok(true),
+        Ok(_) => {
+            usage.mark_recorded(&delta);
+            Ok(true)
+        }
         // Display for a service error is only "service error" — classify on
         // the typed error, or a cancelled run surfaced as a hard failure.
         Err(e)
@@ -3951,6 +3982,18 @@ async fn mark_ready(
                     info!(pr_number, "PR is closed — not marking ready");
                     return;
                 }
+                // Security issues not fixed yet (or a security check that
+                // didn't run) are listed under Open items: the PR stays a
+                // draft until they're gone.
+                if super::proof::holds_security_items(
+                    pr.get("body").and_then(|v| v.as_str()).unwrap_or(""),
+                ) {
+                    info!(
+                        pr_number,
+                        "Security items open in the description — the PR stays a draft"
+                    );
+                    return;
+                }
                 // E2E fix and generated-test PRs wait for their repeat runs.
                 if !proven
                     && pr
@@ -4084,7 +4127,7 @@ async fn complete_run_with_status(
     duration: u64,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let now = chrono::Utc::now().to_rfc3339();
-    let cost = usage.estimated_cost();
+    let delta = usage.unrecorded();
 
     let res = state
         .dynamo
@@ -4094,8 +4137,9 @@ async fn complete_run_with_status(
         .key("run_id", attr_s(run_id))
         .update_expression(
             "SET #s = :s, pr_url = :pr, pr_number = :pn, branch = :b, \
-             tokens_in = :ti, tokens_out = :to, cache_read_tokens = :crt, cache_write_tokens = :cwt, \
-             cost_usd = :c, duration_s = :d, updated_at = :t, current_pass = :cp, \
+             tokens_in = if_not_exists(tokens_in, :uzero) + :ti, tokens_out = if_not_exists(tokens_out, :uzero) + :to, \
+             cache_read_tokens = if_not_exists(cache_read_tokens, :uzero) + :crt, cache_write_tokens = if_not_exists(cache_write_tokens, :uzero) + :cwt, \
+             cost_usd = if_not_exists(cost_usd, :uzero) + :c, duration_s = :d, updated_at = :t, current_pass = :cp, \
              status_run_id = :sri \
              REMOVE error_message, #err",
         )
@@ -4105,11 +4149,7 @@ async fn complete_run_with_status(
         .expression_attribute_values(":pr", attr_s(pr_url))
         .expression_attribute_values(":pn", attr_n(pr_number))
         .expression_attribute_values(":b", attr_s(branch))
-        .expression_attribute_values(":ti", attr_n(usage.input_tokens))
-        .expression_attribute_values(":to", attr_n(usage.output_tokens))
-        .expression_attribute_values(":crt", attr_n(usage.cache_read_tokens))
-        .expression_attribute_values(":cwt", attr_n(usage.cache_write_tokens))
-        .expression_attribute_values(":c", attr_n(format!("{:.4}", cost)))
+        .usage_values(&delta)
         .expression_attribute_values(":d", attr_n(duration))
         .expression_attribute_values(":t", attr_s(&now))
         .expression_attribute_values(":cp", attr_s("done"))
@@ -4120,7 +4160,10 @@ async fn complete_run_with_status(
         .send()
         .await;
     match res {
-        Ok(_) => super::webhooks::emit_run(state, &msg.team_id, run_id, status).await,
+        Ok(_) => {
+            usage.mark_recorded(&delta);
+            super::webhooks::emit_run(state, &msg.team_id, run_id, status).await
+        }
         Err(e) if format!("{e:?}").contains("ConditionalCheckFailed") => {
             info!(run_id, "Run is cancelled — not overwriting with completion");
             return Ok(());
