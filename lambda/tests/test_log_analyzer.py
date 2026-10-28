@@ -64,16 +64,21 @@ class ModelRequest(unittest.TestCase):
 
 class Dedup(unittest.TestCase):
     existing = [
-        {"rec_id": "r1", "sk": "REC#r1", "error_hash": "aaa"},
-        {"rec_id": "r2", "sk": "REC#r2", "error_hash": "bbb"},
+        {"rec_id": "r1", "sk": "REC#r1", "error_hash": "aaa", "source_log_group": "/g"},
+        {"rec_id": "r2", "sk": "REC#r2", "error_hash": "bbb", "source_log_group": "/g"},
     ]
 
-    def test_model_named_match_wins(self):
-        self.assertEqual(h.match_existing({"existing_id": "r2"}, self.existing, "zzz")["rec_id"], "r2")
+    def sighting(self, **kw):
+        return {"log_group": "/g", "fingerprint": "", "signature_hashes": [], "lines": [], **kw}
 
-    def test_unknown_id_falls_back_to_hash(self):
-        self.assertEqual(h.match_existing({"existing_id": "nope"}, self.existing, "aaa")["rec_id"], "r1")
-        self.assertIsNone(h.match_existing({"existing_id": None}, self.existing, "zzz"))
+    def test_the_lines_identity_wins_over_the_models_guess(self):
+        m = h.lifecycle.find_match(self.sighting(fingerprint="aaa", existing_id="r2"), self.existing)
+        self.assertEqual(m["rec_id"], "r1")
+
+    def test_the_models_id_is_the_last_resort(self):
+        m = h.lifecycle.find_match(self.sighting(existing_id="r2"), self.existing)
+        self.assertEqual(m["rec_id"], "r2")
+        self.assertIsNone(h.lifecycle.find_match(self.sighting(existing_id="nope"), self.existing))
 
 
 class LogGroups(unittest.TestCase):

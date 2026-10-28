@@ -73,6 +73,33 @@ fn attr(v: &str) -> AttributeValue {
     AttributeValue::S(v.to_string())
 }
 
+/// Pure: `[{<name_key>: "...", "lines": n}]` lists the analyzer stores
+/// (`log_streams`, `also_in`) as (name, lines) pairs; anything else is skipped.
+fn counted(item: &Item, k: &str, name_key: &str) -> Vec<Counted> {
+    let Some(list) = item.get(k).and_then(|v| v.as_l().ok()) else {
+        return Vec::new();
+    };
+    list.iter()
+        .filter_map(|v| v.as_m().ok())
+        .filter_map(|m| {
+            let name = m.get(name_key)?.as_s().ok()?.clone();
+            let lines = m
+                .get("lines")
+                .and_then(|v| v.as_n().ok())
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0);
+            (!name.is_empty()).then_some(Counted { name, lines })
+        })
+        .collect()
+}
+
+/// A log stream or log group and how many of a finding's lines it had.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct Counted {
+    pub name: String,
+    pub lines: u64,
+}
+
 // ─── Severity ───────────────────────────────────────────────────────────────
 
 /// The analyzer's three levels, lowest first so they compare.
@@ -111,7 +138,8 @@ impl Severity {
 pub struct Finding {
     pub rec_id: String,
     /// `pending`, `approved` (a plan was made), `dismissed` or `resolved`
-    /// (the analyzer stopped seeing it).
+    /// (the analyzer saw no matching line for a week; seen again, it is
+    /// reopened as `pending` with `reopened_at`).
     pub status: String,
     pub severity: Severity,
     pub title: String,
@@ -145,6 +173,17 @@ pub struct Finding {
     pub fix_auto: bool,
     pub auto_status: String,
     pub auto_reason: String,
+    /// The log streams this finding's lines came from, most lines first.
+    pub log_streams: Vec<Counted>,
+    /// Other log groups the same error was counted in (each its own finding).
+    pub also_in: Vec<Counted>,
+    /// When a resolved finding was seen again and reopened (empty if never).
+    pub reopened_at: String,
+    /// How many times it came back after it was resolved.
+    pub reopen_count: u64,
+    /// The finding this duplicate was folded into (merge_duplicates.py);
+    /// a merged finding is not listed.
+    pub merged_into: String,
 }
 
 impl Finding {
@@ -196,6 +235,11 @@ impl Finding {
                 .unwrap_or(false),
             auto_status: s(item, "auto_status"),
             auto_reason: s(item, "auto_reason"),
+            log_streams: counted(item, "log_streams", "log_stream"),
+            also_in: counted(item, "also_in", "log_group"),
+            reopened_at: s(item, "reopened_at"),
+            reopen_count: n(item, "reopen_count").unwrap_or(0),
+            merged_into: s(item, "merged_into"),
         })
     }
 
@@ -627,6 +671,12 @@ pub fn screen(cfg: &AutoFix, f: &Finding, now: DateTime<Utc>) -> Result<Option<S
     if f.status != "pending" || decided || !f.fix_ticket_id.is_empty() {
         return Err(Skip::NotEligible);
     }
+    // Findings stored before attribution came from the lines could hold a
+    // list ("a, b (+47 more)") for their group: no repo is worked out from
+    // that, and no run starts until repair_attribution.py credits one group.
+    if !valid_log_group(&f.source_log_group) {
+        return Err(Skip::NotEligible);
+    }
     let made = DateTime::parse_from_rfc3339(&f.created_at).map(|t| t.with_timezone(&Utc));
     let on = DateTime::parse_from_rfc3339(&cfg.enabled_at).map(|t| t.with_timezone(&Utc));
     match (made, on) {
@@ -895,7 +945,8 @@ pub async fn load_finding(
     Ok(out.item().and_then(|i| Finding::from_item(team_id, i)))
 }
 
-/// Every finding of the team, newest first (at most `max`).
+/// Every finding of the team, newest first (at most `max`). Duplicates folded
+/// into another finding are left out.
 pub async fn list_findings(
     dynamo: &DynamoClient,
     insights_table: &str,
@@ -919,7 +970,8 @@ pub async fn list_findings(
         out.extend(
             page.items()
                 .iter()
-                .filter_map(|i| Finding::from_item(team_id, i)),
+                .filter_map(|i| Finding::from_item(team_id, i))
+                .filter(|f| f.merged_into.is_empty()),
         );
         match page.last_evaluated_key() {
             Some(k) if !k.is_empty() && out.len() < max => start = Some(k.clone()),
@@ -1631,6 +1683,64 @@ mod tests {
     }
 
     #[test]
+    fn where_the_lines_came_from_and_a_reopen_are_read() {
+        let mut i = item(&[
+            ("pk", TEAM),
+            ("sk", "REC#01abc"),
+            ("reopened_at", "2026-10-27T06:00:00+00:00"),
+        ]);
+        let entry = |key: &str, name: &str, lines: &str| {
+            AttributeValue::M(HashMap::from([
+                (key.to_string(), AttributeValue::S(name.into())),
+                ("lines".to_string(), AttributeValue::N(lines.into())),
+            ]))
+        };
+        i.insert(
+            "log_streams".into(),
+            AttributeValue::L(vec![
+                entry("log_stream", "web/web/a1", "30"),
+                entry("log_stream", "web/web/b2", "4"),
+                AttributeValue::S("not a map".into()),
+            ]),
+        );
+        i.insert(
+            "also_in".into(),
+            AttributeValue::L(vec![entry("log_group", "/aws/lambda/jobs", "2")]),
+        );
+        i.insert("reopen_count".into(), AttributeValue::N("2".into()));
+        let f = Finding::from_item(TEAM, &i).unwrap();
+        assert_eq!(
+            f.log_streams,
+            vec![
+                Counted {
+                    name: "web/web/a1".into(),
+                    lines: 30
+                },
+                Counted {
+                    name: "web/web/b2".into(),
+                    lines: 4
+                },
+            ]
+        );
+        assert_eq!(
+            f.also_in,
+            vec![Counted {
+                name: "/aws/lambda/jobs".into(),
+                lines: 2
+            }]
+        );
+        assert_eq!(
+            (f.reopened_at.as_str(), f.reopen_count),
+            ("2026-10-27T06:00:00+00:00", 2)
+        );
+        assert!(f.merged_into.is_empty());
+
+        // An item stored before these fields reads as empty, not an error.
+        let bare = Finding::from_item(TEAM, &item(&[("pk", TEAM), ("sk", "REC#01old")])).unwrap();
+        assert!(bare.log_streams.is_empty() && bare.also_in.is_empty() && bare.reopen_count == 0);
+    }
+
+    #[test]
     fn times_and_counts_are_the_lines_own() {
         let mut i = item(&[
             ("pk", TEAM),
@@ -1863,6 +1973,10 @@ mod tests {
         let mut off = cfg();
         off.overrides[0].auto = Some(false);
         assert_eq!(screen(&off, &finding(), now), Err(Skip::NotIncluded));
+        // A group that is a list of groups never gets a repo or a run.
+        let mut listed_groups = finding();
+        listed_groups.source_log_group = "/ecs/web, /ecs/api, /ecs/jobs (+47 more)".into();
+        assert_eq!(screen(&cfg(), &listed_groups, now), Err(Skip::NotEligible));
         // The team switch is the master switch.
         let mut disabled = cfg();
         disabled.enabled = false;

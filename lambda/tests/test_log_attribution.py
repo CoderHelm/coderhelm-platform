@@ -180,7 +180,7 @@ def run_incident(guard_reply):
     with Patch(
         get_team_api_key=lambda _t: "key",
         logs_client_for=lambda _c: cw,
-        list_pending_recommendations=lambda *_a: [],
+        list_recent_findings=lambda *_a: [],
         record_connection_success=lambda *_a: None,
         resolve_stale_recommendations=lambda *_a: None,
         notify_new_recommendations=lambda *_a: None,

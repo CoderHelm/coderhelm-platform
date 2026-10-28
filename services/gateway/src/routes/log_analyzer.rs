@@ -881,7 +881,12 @@ pub async fn list_recommendations(
         }
     }
 
-    let recommendations: Vec<Value> = items.iter().filter_map(rec_from_item).collect();
+    // Duplicates folded into another finding are not listed.
+    let recommendations: Vec<Value> = items
+        .iter()
+        .filter(|i| !i.contains_key("merged_into"))
+        .filter_map(rec_from_item)
+        .collect();
 
     Ok(Json(
         json!({ "recommendations": recommendations, "next": next }),
