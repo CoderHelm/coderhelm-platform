@@ -1401,9 +1401,18 @@ async fn merge(
             Ok(Next::Stop)
         }
         MergeOutcome::NotMergeable(reason) => {
-            // Branch protection, a required check GitHub still counts as
-            // missing, or a conflict. Keep polling: most of these clear on
-            // their own, and the reason is on the PR for the ones that don't.
+            // A conflict never clears by waiting: polling it kept the gate
+            // (and its status edits) going for hours. Stop on it.
+            let conflicted = github
+                .get_pull_request(owner, repo, msg.pr_number)
+                .await
+                .is_ok_and(|pr| common::merge_gate::is_conflict(&pr));
+            if conflicted {
+                return on_conflict(state, github, msg, record, lines).await;
+            }
+            // Branch protection, or a required check GitHub still counts as
+            // missing. Keep polling: most of these clear on their own, and
+            // the reason is on the PR for the ones that don't.
             warn!(pr = msg.pr_number, reason = %reason, "await-merge: GitHub declined the merge");
             lines.push((
                 Mark::Waiting,
@@ -1429,6 +1438,86 @@ async fn merge(
             Ok(Next::Stop)
         }
     }
+}
+
+/// The line the status comment shows for a conflict: CoderHelm updates its
+/// own PR's branch once, or a person resolves it.
+fn conflict_line(base: &str, updating: bool) -> (Mark, String) {
+    if updating {
+        (
+            Mark::Waiting,
+            format!(
+                "Merge conflict with `{base}`: CoderHelm merges `{base}` into this branch once; \
+                 the review of that commit starts auto-merge again"
+            ),
+        )
+    } else {
+        (
+            Mark::Blocked,
+            format!(
+                "Merge conflict with `{base}`: resolve it on this branch; the review of the new \
+                 commit starts auto-merge again"
+            ),
+        )
+    }
+}
+
+/// The PR conflicts with its base: the gate stops (no polls, one status
+/// update). On CoderHelm's own PR the first conflict starts a conflict round
+/// on its run, once per PR; after that, or on anyone else's PR, a person
+/// resolves it.
+async fn on_conflict(
+    state: &WorkerState,
+    github: &GitHubClient,
+    msg: &AwaitMergeMessage,
+    record: &mut GateRecord,
+    mut lines: Vec<(Mark, String)>,
+) -> Result<Next, BoxError> {
+    let (owner, repo) = (msg.repo_owner.as_str(), msg.repo_name.as_str());
+    let updating = msg.self_authored
+        && claim_conflict_round(state, msg).await
+        && super::resume::start_conflict_round(
+            state,
+            &msg.team_id,
+            msg.installation_id,
+            owner,
+            repo,
+            msg.pr_number,
+        )
+        .await;
+    info!(
+        pr = msg.pr_number,
+        updating, "await-merge: merge conflict — the gate stops"
+    );
+    let line = conflict_line(&msg.base_branch, updating);
+    set_state(state, msg, common::merge_gate::STATE_CONFLICT, &line.1).await;
+    lines.push(line);
+    let body = render_status(
+        &msg.head_sha,
+        &msg.base_branch,
+        &lines,
+        None,
+        Some(&control_url(state, msg, Control::Stop)),
+    );
+    publish_status(state, github, msg, record, &body).await;
+    Ok(Next::Stop)
+}
+
+/// Claims the one conflict round a PR gets. False when it was claimed
+/// before (or the record can't be written).
+async fn claim_conflict_round(state: &WorkerState, msg: &AwaitMergeMessage) -> bool {
+    state
+        .dynamo
+        .update_item()
+        .table_name(&state.config.settings_table_name)
+        .key("pk", attr_s(&msg.team_id))
+        .key("sk", attr_s(&record_key(msg)))
+        .update_expression("SET conflict_round_head = :h")
+        .condition_expression("attribute_exists(sk) AND attribute_not_exists(conflict_round_head)")
+        .expression_attribute_values(":h", attr_s(&msg.head_sha))
+        .send()
+        .await
+        .is_ok()
 }
 
 /// Arm the gate for a PR (called when CoderHelm approves; the gateway arms on
@@ -1501,6 +1590,20 @@ async fn send(state: &WorkerState, msg: &AwaitMergeMessage, attempts: u32, delay
 #[cfg(test)]
 mod ci_tests {
     use super::*;
+
+    /// A conflict says once what happens next, and never asks to wait on CI.
+    #[test]
+    fn a_conflict_says_who_resolves_it() {
+        let (mark, text) = conflict_line("main", true);
+        assert_eq!(mark, Mark::Waiting);
+        assert!(text.contains("CoderHelm merges `main` into this branch once"));
+        let (mark, text) = conflict_line("main", false);
+        assert_eq!(mark, Mark::Blocked);
+        assert!(text.contains("resolve it on this branch"));
+        assert!(!common::merge_gate::wakes_on_ci(
+            common::merge_gate::STATE_CONFLICT
+        ));
+    }
     use crate::passes::quarantine::Gate;
     use serde_json::json;
 

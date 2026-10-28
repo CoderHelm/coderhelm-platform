@@ -28,6 +28,7 @@ pub mod hybrid_admin;
 pub mod hybrid_email;
 pub mod hybrid_install;
 pub mod infrastructure;
+pub mod installation_owner;
 pub mod integrations;
 pub mod jira_webhook;
 pub mod knowledge;

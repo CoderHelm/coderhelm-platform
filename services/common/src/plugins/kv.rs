@@ -250,6 +250,26 @@ fn rec_of(i: &HashMap<String, AttributeValue>) -> Option<Rec> {
     Some(Rec { sk, data, rev })
 }
 
+/// The key condition for a query: the whole partition when `prefix` is
+/// empty. DynamoDB refuses an empty string as an attribute value ("empty
+/// string value. Key: sk"), so `begins_with(sk, "")` can never be sent.
+fn key_condition(prefix: &str) -> &'static str {
+    if prefix.is_empty() {
+        "pk = :p"
+    } else {
+        "pk = :p AND begins_with(sk, :s)"
+    }
+}
+
+/// The values [`key_condition`] names, never an empty string.
+fn key_values(pk: &str, prefix: &str) -> HashMap<String, AttributeValue> {
+    let mut v = HashMap::from([(":p".to_string(), s(pk))]);
+    if !prefix.is_empty() {
+        v.insert(":s".to_string(), s(prefix));
+    }
+    v
+}
+
 #[async_trait::async_trait]
 impl Kv for Dynamo {
     async fn get(&self, pk: &str, sk: &str) -> Result<Option<Rec>, String> {
@@ -324,9 +344,8 @@ impl Kv for Dynamo {
                 .client
                 .query()
                 .table_name(&self.table)
-                .key_condition_expression("pk = :p AND begins_with(sk, :s)")
-                .expression_attribute_values(":p", s(pk))
-                .expression_attribute_values(":s", s(prefix))
+                .key_condition_expression(key_condition(prefix))
+                .set_expression_attribute_values(Some(key_values(pk, prefix)))
                 .scan_index_forward(!reverse)
                 .set_exclusive_start_key(start.take());
             if let Some(n) = limit {
@@ -403,5 +422,49 @@ mod tests {
         assert_eq!(m.get("u", "A#1").await.unwrap(), None);
         m.delete("t", "A#1").await.unwrap();
         assert_eq!(m.get("t", "A#1").await.unwrap(), None);
+    }
+
+    /// The plugin source poll lists a whole index partition with an empty
+    /// prefix; the query must name only non-empty values, or DynamoDB
+    /// refuses it and no source is ever polled.
+    #[test]
+    fn an_empty_prefix_queries_the_whole_partition_with_no_empty_value() {
+        let cond = key_condition("");
+        assert_eq!(cond, "pk = :p");
+        let v = key_values(SOURCE_INDEX, "");
+        assert_eq!(v.len(), 1);
+        assert!(v
+            .values()
+            .all(|a| a.as_s().map(|t| !t.is_empty()).unwrap_or(false)));
+        for name in v.keys() {
+            assert!(cond.contains(name.as_str()));
+        }
+
+        let cond = key_condition("team|");
+        assert!(cond.contains("begins_with(sk, :s)"));
+        let v = key_values("t", "team|");
+        assert_eq!(
+            v.get(":s").and_then(|a| a.as_s().ok()).map(String::as_str),
+            Some("team|")
+        );
+    }
+
+    #[tokio::test]
+    async fn every_source_is_listed_for_the_poll() {
+        let m = Memory::new();
+        m.put(SOURCE_INDEX, "t1|a", &json!({}), Expect::Any)
+            .await
+            .unwrap();
+        m.put(SOURCE_INDEX, "t2|b", &json!({}), Expect::Any)
+            .await
+            .unwrap();
+        let all = crate::plugins::source::all(&m).await.unwrap();
+        assert_eq!(
+            all,
+            vec![
+                ("t1".to_string(), "a".to_string()),
+                ("t2".to_string(), "b".to_string())
+            ]
+        );
     }
 }

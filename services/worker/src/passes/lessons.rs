@@ -28,6 +28,31 @@ const MAX_COMMENT_CHARS: usize = 6000;
 
 pub const TRIGGER_PR_CLOSED: &str = "pr_closed";
 pub const TRIGGER_COMMENT: &str = "comment";
+/// A person answered CoderHelm's question on a PR closed without a reason.
+pub const TRIGGER_CLOSE_REASON: &str = common::run_status::CLOSE_REASON_TRIGGER;
+
+/// The outcome signal on a run whose PR a person closed without saying why,
+/// and once they answered (`close_signal` on the run record).
+pub const SIGNAL_NO_REASON: &str = "closed_no_reason";
+pub const SIGNAL_WITH_REASON: &str = "closed_with_reason";
+
+/// Marks CoderHelm's one question on a PR closed without a reason.
+pub const CLOSE_ASK_MARKER: &str = "<!-- coderhelm:close-reason -->";
+
+/// The one short question CoderHelm asks on a PR closed without a reason.
+pub fn close_reason_question() -> String {
+    format!(
+        "{CLOSE_ASK_MARKER}\nThanks for looking at this. What was wrong with it? One line here \
+         (wrong approach, not needed, the fix belonged somewhere else, ...) helps me get the next \
+         ticket like this right. I won't ask again."
+    )
+}
+
+/// Whether people said why the PR was closed: a comment on it or on the
+/// ticket's issue, or the reason picked when the run was closed in CoderHelm.
+pub fn has_reason(ctx: &LessonContext, run_close_reason: &str) -> bool {
+    !run_close_reason.trim().is_empty() || ctx.comments.iter().any(|(_, t)| !t.trim().is_empty())
+}
 
 /// What the judge is shown.
 #[derive(Debug, Default, Clone)]
@@ -405,7 +430,8 @@ pub async fn run(
                 &state.http,
             )?;
             let mut ctx = run_context(&item);
-            ctx.closed_unmerged = msg.trigger == TRIGGER_PR_CLOSED;
+            ctx.closed_unmerged =
+                msg.trigger == TRIGGER_PR_CLOSED || msg.trigger == TRIGGER_CLOSE_REASON;
             if let Ok(pr) = github
                 .get_pull_request(&msg.repo_owner, &msg.repo_name, msg.pr_number)
                 .await
@@ -433,6 +459,23 @@ pub async fn run(
                     ctx.comments
                         .extend(super::review_pr::human_comments(&c, 12));
                 }
+            }
+            // Closed in CoderHelm with a reason picked: that is what people said.
+            let run_reason = s(&item, "close_reason");
+            if !run_reason.trim().is_empty() {
+                ctx.comments.push((
+                    "the person who closed it".to_string(),
+                    format!("Closed because: {}", run_reason.trim()),
+                ));
+            }
+            if msg.trigger == TRIGGER_PR_CLOSED && !has_reason(&ctx, &run_reason) {
+                // Nobody said why: that is a signal of its own, and CoderHelm
+                // asks once. The answer comes back as a close_reason lesson.
+                ask_close_reason(state, &github, &msg).await;
+                return Ok(());
+            }
+            if msg.trigger == TRIGGER_CLOSE_REASON {
+                record_answer(state, &msg, &ctx).await;
             }
             let mut usage = TokenUsage::default();
             let judged = judge(state, &provider, &ctx, &mut usage).await;
@@ -489,6 +532,81 @@ pub async fn run(
     Ok(())
 }
 
+/// Records "closed, no reason" on the run and the team's counters, and asks
+/// on the PR, once per run (a redelivered webhook asks nothing).
+async fn ask_close_reason(state: &WorkerState, github: &GitHubClient, msg: &LessonMessage) {
+    let now = chrono::Utc::now().to_rfc3339();
+    let first = state
+        .dynamo
+        .update_item()
+        .table_name(&state.config.runs_table_name)
+        .key("team_id", attr_s(&msg.team_id))
+        .key("run_id", attr_s(&msg.run_id))
+        .update_expression("SET close_signal = :sig, close_asked_at = :t")
+        .condition_expression("attribute_exists(run_id) AND attribute_not_exists(close_asked_at)")
+        .expression_attribute_values(":sig", attr_s(SIGNAL_NO_REASON))
+        .expression_attribute_values(":t", attr_s(&now))
+        .send()
+        .await
+        .is_ok();
+    if !first {
+        return;
+    }
+    let month = chrono::Utc::now().format("%Y-%m").to_string();
+    for period in [month.as_str(), "ALL_TIME"] {
+        let _ = state
+            .dynamo
+            .update_item()
+            .table_name(&state.config.analytics_table_name)
+            .key("team_id", attr_s(&msg.team_id))
+            .key("period", attr_s(period))
+            .update_expression("ADD prs_closed_no_reason :one")
+            .expression_attribute_values(":one", crate::passes::attr_n(1))
+            .send()
+            .await;
+    }
+    info!(run_id = %msg.run_id, pr = msg.pr_number, "PR closed without a reason: asking once");
+    if let Err(e) = github
+        .create_issue_comment(
+            &msg.repo_owner,
+            &msg.repo_name,
+            msg.pr_number,
+            &close_reason_question(),
+        )
+        .await
+    {
+        warn!(run_id = %msg.run_id, error = %e, "Could not ask why the PR was closed");
+    }
+}
+
+/// The answer to the one question: kept on the run (the planner reads it
+/// with the ticket's history) and the signal moved to "closed with reason".
+async fn record_answer(state: &WorkerState, msg: &LessonMessage, ctx: &LessonContext) {
+    let Some((_, answer)) = ctx
+        .comments
+        .iter()
+        .rev()
+        .find(|(_, t)| !t.trim().is_empty())
+    else {
+        return;
+    };
+    let _ = state
+        .dynamo
+        .update_item()
+        .table_name(&state.config.runs_table_name)
+        .key("team_id", attr_s(&msg.team_id))
+        .key("run_id", attr_s(&msg.run_id))
+        .update_expression(
+            "SET close_signal = :sig, close_reason_answer = :a, close_answered_at = :t",
+        )
+        .condition_expression("attribute_exists(close_asked_at)")
+        .expression_attribute_values(":sig", attr_s(SIGNAL_WITH_REASON))
+        .expression_attribute_values(":a", attr_s(common::truncate_str(answer.trim(), 1000)))
+        .expression_attribute_values(":t", attr_s(&chrono::Utc::now().to_rfc3339()))
+        .send()
+        .await;
+}
+
 async fn mark(state: &WorkerState, msg: &LessonMessage, field: &str, value: Option<&str>) {
     let now = chrono::Utc::now().to_rfc3339();
     let mut up = state
@@ -513,6 +631,23 @@ async fn mark(state: &WorkerState, msg: &LessonMessage, field: &str, value: Opti
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A close with nothing said is asked about once; anything people said
+    /// (on the PR, the ticket, or the close dialog) is the reason.
+    #[test]
+    fn a_close_without_a_reason_is_asked_about() {
+        let mut ctx = LessonContext::default();
+        assert!(!has_reason(&ctx, ""));
+        assert!(has_reason(&ctx, "not needed"));
+        ctx.comments.push(("pat".into(), "  ".into()));
+        assert!(!has_reason(&ctx, ""));
+        ctx.comments.push(("pat".into(), "Wrong approach".into()));
+        assert!(has_reason(&ctx, ""));
+        let q = close_reason_question();
+        assert!(q.starts_with(CLOSE_ASK_MARKER));
+        assert!(q.contains("I won't ask again"));
+        assert!(q.len() < 400);
+    }
 
     fn closed_case() -> LessonContext {
         let d =

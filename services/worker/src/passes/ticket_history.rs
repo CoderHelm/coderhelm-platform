@@ -39,6 +39,8 @@ pub struct PriorRun {
     pub pr_comments: Vec<(String, String)>,
     /// Answers people gave in CoderHelm to the questions it stopped to ask.
     pub answers: Vec<common::run_questions::Answer>,
+    /// Every pull request the run opened, each with its repository.
+    pub pr_list: Vec<common::run_prs::RunPr>,
 }
 
 impl PriorRun {
@@ -166,6 +168,50 @@ pub enum Guard {
 }
 
 impl TicketHistory {
+    /// Whether an earlier run of this ticket opened `repo#number`.
+    fn opened_by_run(&self, repo: &str, number: u64) -> bool {
+        self.runs.iter().any(|r| {
+            r.pr_list
+                .iter()
+                .any(|p| p.pr_number == number && p.repo.eq_ignore_ascii_case(repo))
+        })
+    }
+
+    /// CoderHelm's own pull request for this ticket that is still open in
+    /// `repo` (an earlier run opened it), newest first: a re-run continues
+    /// on it instead of opening another.
+    pub fn own_open_pr(&self, repo: &str) -> Option<&EarlierPr> {
+        self.prs
+            .iter()
+            .filter(|p| {
+                p.state == "open"
+                    && p.repo.eq_ignore_ascii_case(repo)
+                    && super::is_own_login(&p.author)
+                    && !p.branch.is_empty()
+                    && self.opened_by_run(&p.repo, p.number)
+            })
+            .max_by(|a, b| {
+                a.created_at
+                    .cmp(&b.created_at)
+                    .then(a.number.cmp(&b.number))
+            })
+    }
+
+    /// CoderHelm's own open pull requests for this ticket in repositories
+    /// this run's plan no longer changes: superseded, with a note, once the
+    /// new pull request is open.
+    pub fn own_open_prs_elsewhere(&self, repos: &[String]) -> Vec<&EarlierPr> {
+        self.prs
+            .iter()
+            .filter(|p| {
+                p.state == "open"
+                    && !repos.iter().any(|r| r.eq_ignore_ascii_case(&p.repo))
+                    && super::is_own_login(&p.author)
+                    && self.opened_by_run(&p.repo, p.number)
+            })
+            .collect()
+    }
+
     pub fn is_empty(&self) -> bool {
         self.runs.is_empty() && self.notes.is_empty() && self.prs.is_empty()
     }
@@ -566,6 +612,7 @@ fn prior_run(item: &Item) -> PriorRun {
         pr_comments: Vec::new(),
         answers: serde_json::from_str(&s(item, common::run_questions::FIELD_ANSWERS))
             .unwrap_or_default(),
+        pr_list: common::run_prs::from_item(item),
     }
 }
 
@@ -668,12 +715,14 @@ pub async fn add_earlier_prs(
     ticket_id: &str,
 ) {
     let mut found: Vec<(String, u64)> = Vec::new();
-    for r in &history.runs {
-        if r.pr_number > 0
-            && r.repo.contains('/')
-            && !found.contains(&(r.repo.clone(), r.pr_number))
+    // Every pull request an earlier run opened, in its own repository (a
+    // multi-repo run's record pairs its repo with only one of them).
+    for p in history.runs.iter().flat_map(|r| r.pr_list.iter()) {
+        if p.pr_number > 0
+            && p.repo.contains('/')
+            && !found.contains(&(p.repo.clone(), p.pr_number))
         {
-            found.push((r.repo.clone(), r.pr_number));
+            found.push((p.repo.clone(), p.pr_number));
         }
     }
     if !ticket_id.is_empty() {
@@ -911,6 +960,71 @@ pub async fn load(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn run_with_prs(id: &str, prs: &[(&str, u64)]) -> PriorRun {
+        PriorRun {
+            run_id: id.into(),
+            pr_list: prs
+                .iter()
+                .map(|(repo, n)| common::run_prs::RunPr {
+                    repo: repo.to_string(),
+                    pr_number: *n,
+                    ..Default::default()
+                })
+                .collect(),
+            ..Default::default()
+        }
+    }
+
+    fn earlier(repo: &str, n: u64, author: &str, state: &str, at: &str) -> EarlierPr {
+        EarlierPr {
+            repo: repo.into(),
+            number: n,
+            author: author.into(),
+            branch: format!("coderhelm/t-{n}"),
+            state: state.into(),
+            created_at: at.into(),
+            ..Default::default()
+        }
+    }
+
+    /// A re-run continues on CoderHelm's own open PR in the same repo: the
+    /// newest one an earlier run opened, never a person's, a closed one, or
+    /// one no run of this ticket opened.
+    #[test]
+    fn a_rerun_finds_its_own_open_pull_request() {
+        let h = TicketHistory {
+            runs: vec![
+                run_with_prs("01A", &[("acme/web", 5)]),
+                run_with_prs("01B", &[("acme/web", 9), ("acme/api", 3)]),
+            ],
+            prs: vec![
+                earlier("acme/web", 5, "coderhelm[bot]", "closed", "2026-10-01"),
+                earlier("acme/web", 9, "coderhelm[bot]", "open", "2026-10-02"),
+                earlier("acme/web", 11, "pat", "open", "2026-10-03"),
+                earlier("acme/web", 12, "coderhelm[bot]", "open", "2026-10-04"),
+                earlier("acme/api", 3, "coderhelm[bot]", "open", "2026-10-02"),
+            ],
+            ..Default::default()
+        };
+        assert_eq!(h.own_open_pr("acme/web").map(|p| p.number), Some(9));
+        assert_eq!(h.own_open_pr("ACME/Api").map(|p| p.number), Some(3));
+        assert!(h.own_open_pr("acme/docs").is_none());
+
+        // The plan moved to acme/web only: the api PR is superseded.
+        let moved = h.own_open_prs_elsewhere(&["acme/web".to_string()]);
+        assert_eq!(
+            moved
+                .iter()
+                .map(|p| (p.repo.as_str(), p.number))
+                .collect::<Vec<_>>(),
+            [("acme/api", 3)]
+        );
+        // Both repos still in the plan: nothing to supersede.
+        assert!(h
+            .own_open_prs_elsewhere(&["acme/web".into(), "acme/api".into()])
+            .is_empty());
+    }
 
     /// The planner's decision on the rerun: a code change that forces one
     /// record active (the same change people closed before).

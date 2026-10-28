@@ -47,9 +47,21 @@ pub const STATE_MERGED: &str = "merged";
 pub const STATE_CLOSED: &str = "closed";
 /// A new commit arrived; the review of that commit re-arms the gate.
 pub const STATE_HEAD_MOVED: &str = "head_moved";
+/// The PR conflicts with its base. The gate stops: no poll, no completed
+/// check suite and no repeated status edit can clear a conflict. CoderHelm
+/// updates its own PR's branch once (a resumable round on the run); the
+/// review of the new commit re-arms the gate. Otherwise a person resolves it.
+pub const STATE_CONFLICT: &str = "conflict";
 /// A person stopped auto-merge (a PR comment or the dashboard). Nothing
 /// wakes it, not CI, a review or a new commit; only a person re-arms it.
 pub const STATE_STOPPED: &str = "stopped";
+
+/// Whether GitHub's reading of a pull request is a merge conflict with its
+/// base: `mergeable` false with `mergeable_state` "dirty". Branch protection
+/// and checks GitHub still counts as missing are "blocked", not a conflict.
+pub fn is_conflict(pr: &serde_json::Value) -> bool {
+    pr["mergeable_state"].as_str() == Some("dirty") && pr["mergeable"].as_bool() != Some(true)
+}
 
 /// Should a completed check suite on the gate's head re-arm it? Only while
 /// the gate is waiting on (or was stopped by) CI or GitHub's merge rules.
@@ -687,6 +699,19 @@ mod tests {
         for s in [STATE_MERGED, STATE_CLOSED, STATE_HEAD_MOVED, STATE_STOPPED] {
             assert!(!wakes_on_review(s), "{s}");
         }
+    }
+
+    /// A conflict is never polled: CI can't clear it. The review of a new
+    /// commit (the head moves) is what re-arms the gate.
+    #[test]
+    fn a_conflict_stops_the_gate_until_a_new_commit() {
+        assert!(!wakes_on_ci(STATE_CONFLICT));
+        assert!(wakes_on_review(STATE_CONFLICT));
+        let pr = |m: serde_json::Value, st: &str| serde_json::json!({"mergeable": m, "mergeable_state": st});
+        assert!(is_conflict(&pr(serde_json::json!(false), "dirty")));
+        assert!(!is_conflict(&pr(serde_json::json!(true), "blocked")));
+        assert!(!is_conflict(&pr(serde_json::json!(false), "blocked")));
+        assert!(!is_conflict(&pr(serde_json::Value::Null, "unknown")));
     }
 
     #[test]

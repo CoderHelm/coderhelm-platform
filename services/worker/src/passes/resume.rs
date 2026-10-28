@@ -3200,7 +3200,12 @@ async fn run_pending_round(
     let round = pending.resumed(chrono::Utc::now());
     let kind = round.kind;
     let number = round.number;
-    match run_fix_round(state, msg, &mut ctx, &pr, round, created_at, start).await? {
+    let end = if kind == run_round::Kind::Conflict {
+        run_conflict_round(state, msg, &mut ctx, &pr, &round).await
+    } else {
+        run_fix_round(state, msg, &mut ctx, &pr, round, created_at, start).await?
+    };
+    match end {
         RoundEnd::Parked => {}
         RoundEnd::Incomplete => {
             complete_run_with_status(
@@ -3283,6 +3288,154 @@ async fn run_pending_round(
         }
     }
     Ok(())
+}
+
+/// Starts the one conflict round on CoderHelm's own pull request after
+/// auto-merge found it conflicting with its base: the run (completed or
+/// waiting) gets a parked conflict round and a resume to run it. False when
+/// there is no such run, or it is busy or ended: a person resolves it then.
+pub(crate) async fn start_conflict_round(
+    state: &WorkerState,
+    team_id: &str,
+    installation_id: u64,
+    owner: &str,
+    repo: &str,
+    pr_number: u64,
+) -> bool {
+    let Some(run_id) =
+        super::review_pr::lookup_run_by_pr(state, team_id, owner, repo, pr_number).await
+    else {
+        return false;
+    };
+    let round = run_round::Round::start(
+        run_round::Kind::Conflict,
+        1,
+        "",
+        "Merge the base branch into this pull request's branch and resolve the conflicts.",
+        true,
+        chrono::Utc::now(),
+    )
+    .parked(false);
+    let claimed = state
+        .dynamo
+        .update_item()
+        .table_name(&state.config.runs_table_name)
+        .key("team_id", attr_s(team_id))
+        .key("run_id", attr_s(&run_id))
+        .update_expression(
+            "SET #s = :ac, status_run_id = :sri, #round = :r, current_pass = :ac, updated_at = :t \
+             REMOVE #inc",
+        )
+        .condition_expression("#s IN (:completed, :ac) AND attribute_not_exists(#round)")
+        .expression_attribute_names("#s", "status")
+        .expression_attribute_names("#round", run_round::FIELD)
+        .expression_attribute_names("#inc", run_round::INCOMPLETE_FIELD)
+        .expression_attribute_values(":ac", attr_s("awaiting_ci"))
+        .expression_attribute_values(":completed", attr_s("completed"))
+        .expression_attribute_values(":sri", attr_s(&format!("awaiting_ci#{run_id}")))
+        .expression_attribute_values(":r", round.to_attr())
+        .expression_attribute_values(":t", attr_s(&chrono::Utc::now().to_rfc3339()))
+        .send()
+        .await;
+    if let Err(e) = claimed {
+        if !common::run_fail::is_condition_failed(&e) {
+            warn!(run_id, error = %e, "Could not start the conflict round");
+        }
+        return false;
+    }
+    if state.config.ci_fix_queue_url.is_empty() {
+        return false;
+    }
+    let body = serde_json::json!({
+        "type": "resume",
+        "team_id": team_id,
+        "run_id": run_id,
+        "installation_id": installation_id,
+    });
+    state
+        .sqs
+        .send_message()
+        .queue_url(&state.config.ci_fix_queue_url)
+        .message_body(body.to_string())
+        .delay_seconds(5)
+        .send()
+        .await
+        .is_ok()
+}
+
+/// The conflict round: the base branch merged into the pull request's
+/// branch, the conflicting files resolved, one commit. A conflict that
+/// can't be resolved that way is handed to a person with one comment.
+async fn run_conflict_round(
+    state: &WorkerState,
+    msg: &ResumeMessage,
+    ctx: &mut FixContext,
+    pr: &PrRef<'_>,
+    round: &run_round::Round,
+) -> RoundEnd {
+    let _ = super::update_pass(state, &msg.team_id, &msg.run_id, "conflict_fix").await;
+    let base = ctx.ticket_msg.base_branch.clone();
+    match super::pr::resolve_conflicts(
+        state,
+        &ctx.ticket_msg,
+        &ctx.github,
+        pr.branch,
+        &ctx.provider,
+        &mut ctx.usage,
+    )
+    .await
+    {
+        Ok(resolved) => {
+            super::round::clear(state, &msg.team_id, &msg.run_id).await;
+            super::add_progress_note(
+                state,
+                &msg.team_id,
+                &msg.run_id,
+                &if resolved {
+                    format!(
+                        "Merged `{base}` into the branch and resolved the conflicts in one commit"
+                    )
+                } else {
+                    format!("Merged `{base}` into the branch; nothing conflicted any more")
+                },
+            )
+            .await;
+            // A new head: CI runs, the review of that commit re-arms auto-merge.
+            RoundEnd::Done { files: 1 }
+        }
+        Err(e) => {
+            let why = common::run_fail::error_text(&*e);
+            let gh = super::round::Pr {
+                github: &ctx.github,
+                owner: pr.owner,
+                repo: pr.repo,
+                branch: pr.branch,
+            };
+            super::round::finish_incomplete(
+                state,
+                &msg.team_id,
+                &msg.run_id,
+                &gh,
+                round,
+                &format!("the conflict with `{base}` couldn't be resolved automatically ({why})"),
+            )
+            .await;
+            let comment = format!(
+                "This pull request conflicts with `{base}` and CoderHelm couldn't resolve it on its \
+                 own ({}). Please resolve the conflict on this branch; auto-merge starts again with \
+                 the review of the new commit.",
+                common::truncate_str(&why, 300)
+            );
+            if let Err(e) = ctx
+                .github
+                .create_issue_comment(pr.owner, pr.repo, pr.number, &comment)
+                .await
+            {
+                warn!(run_id = msg.run_id, error = %e, "Could not hand the conflict off on the PR");
+            }
+            RoundEnd::Incomplete
+        }
+    }
 }
 
 /// After a security fix round: the security check runs again on the pull

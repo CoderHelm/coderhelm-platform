@@ -428,6 +428,7 @@ pub(crate) async fn round_message(
         Kind::ReviewFix => "Address the review",
         Kind::Feedback => "Address the review comments",
         Kind::SecurityFix => "Fix the security issues the check found",
+        Kind::Conflict => "Merge the base branch and resolve the conflicts",
     };
     let conventions = super::load_git_conventions(state, team_id, &ticket.ticket_id).await;
     conventions.commit_message(&super::ticket_tokens(ticket), summary)
