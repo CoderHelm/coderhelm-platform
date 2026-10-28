@@ -2397,6 +2397,27 @@ impl GitHubClient {
         self.get(&url).await
     }
 
+    /// The files an open PR changes, as (path, patch), first 100.
+    pub async fn list_pull_files(
+        &self,
+        owner: &str,
+        repo: &str,
+        number: u64,
+    ) -> Result<Vec<(String, String)>, Box<dyn std::error::Error + Send + Sync>> {
+        let url = format!("{API_BASE}/repos/{owner}/{repo}/pulls/{number}/files?per_page=100");
+        let v = self.get(&url).await?;
+        Ok(v.as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|f| {
+                Some((
+                    f["filename"].as_str()?.to_string(),
+                    f["patch"].as_str().unwrap_or("").to_string(),
+                ))
+            })
+            .collect())
+    }
+
     /// Every submitted review on a PR, oldest first (the two-key auto-merge
     /// gate reads approvals and dismissals from it). All pages: GitHub lists
     /// reviews chronologically, so on a busy PR the newest ones sit past the

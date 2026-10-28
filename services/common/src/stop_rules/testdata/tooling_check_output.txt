@@ -1,0 +1,10 @@
+$ cd 'e2e' && npm ci --no-audit --no-fund --workspaces=false
+npm WARN deprecated inflight@1.0.6: This module is not supported
+added 212 packages in 9s
+$ cd 'e2e' && npx --no-install tsc --noEmit -p tsconfig.json
+tests/cards.spec.ts(1,30): error TS2307: Cannot find module '@playwright/test' or its corresponding type declarations.
+pages/cards.page.ts(2,22): error TS2307: Cannot find module '@playwright/test' or its corresponding type declarations.
+--- typecheck failed (exit 2) ---
+$ cd 'e2e' && npx --no-install eslint tests/cards.spec.ts
+Oops! Something went wrong! :(
+--- lint failed (exit 1) ---

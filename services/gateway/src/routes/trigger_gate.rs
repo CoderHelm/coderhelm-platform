@@ -382,7 +382,9 @@ pub async fn gate_ticket_trigger(
 const SEEN_HASH_FIELD: &str = "seen_context_hash";
 
 /// The latest run left the ticket handled: only a change to the ticket's
-/// content starts another run. "needs_outside_change": the fix is a change in
+/// content starts another run. "covered_by_pr": an open pull request already
+/// does the work; a ticket edit asking for a separate change starts one.
+/// "needs_outside_change": the fix is a change in
 /// another system. "needs_input": CoderHelm asked; people answer by comment
 /// or by editing the ticket. "cancelled": a person stopped it, or closed its
 /// PR without merging. "closed": a person closed the run on purpose; it never
@@ -395,6 +397,7 @@ fn handled(status: &str) -> bool {
             | "success"
             | "merged"
             | "needs_outside_change"
+            | "covered_by_pr"
             | "needs_input"
             | "cancelled"
             | "closed"
@@ -593,6 +596,7 @@ mod tests {
         // ticket started the same PR again.
         assert!(handled("cancelled"));
         assert!(handled("needs_outside_change"));
+        assert!(handled("covered_by_pr"));
         assert!(handled("needs_input"));
         assert!(handled("completed"));
         assert!(!handled("failed"));

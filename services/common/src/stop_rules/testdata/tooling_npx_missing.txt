@@ -1,0 +1,4 @@
+$ cd 'tests' && npx --no-install eslint specs/list.spec.ts
+npm error could not determine executable to run
+npm error A complete log of this run can be found in: /root/.npm/_logs/debug-0.log
+--- lint failed (exit 1) ---

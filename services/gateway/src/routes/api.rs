@@ -692,7 +692,7 @@ pub struct RunSummary {
     #[schema(example = "01JB8X6F4M2C9QZ3T7V5W1K0HA")]
     pub run_id: Option<String>,
     /// Where the run is: `pending`, `running`, `awaiting_ci`, `completed`,
-    /// `failed`, `needs_input`, `needs_outside_change`, `cancelled`,
+    /// `failed`, `needs_input`, `needs_outside_change`, `covered_by_pr`, `cancelled`,
     /// `retried` or `closed`. Treat a value you don't know as in progress.
     #[schema(example = "completed")]
     pub status: Option<String>,
@@ -984,7 +984,7 @@ pub struct Run {
     #[schema(example = "01JB8X6F4M2C9QZ3T7V5W1K0HA")]
     pub run_id: String,
     /// Where the run is: `pending`, `running`, `awaiting_ci`, `completed`,
-    /// `failed`, `needs_input`, `needs_outside_change`, `cancelled`,
+    /// `failed`, `needs_input`, `needs_outside_change`, `covered_by_pr`, `cancelled`,
     /// `retried` or `closed`. Treat a value you don't know as in progress.
     #[schema(example = "completed")]
     pub status: Option<String>,
@@ -1074,6 +1074,17 @@ pub struct Run {
     /// The report written when (part of) the fix is a change outside the code.
     #[schema(example = json!(null))]
     pub outside_change_report: Option<String>,
+    /// Why the run stopped, when it was its own environment rather than a
+    /// question: `tooling` (a command the run ran failed for want of a
+    /// dependency or tool; see `tooling_failure`).
+    #[schema(example = json!(null))]
+    pub stop_kind: Option<String>,
+    /// For a tooling failure: the exact command, the error it printed and
+    /// what the run tried first.
+    pub tooling_failure: Option<RunToolingFailure>,
+    /// For a `covered_by_pr` run: the open pull request that already does the
+    /// work, and why.
+    pub covered_by: Option<RunCoveredBy>,
     /// A lesson recorded for the repository when the fix was elsewhere.
     #[schema(example = json!(null))]
     pub lesson: Option<String>,
@@ -1184,6 +1195,50 @@ fn round_incomplete_of(item: &run_search::Item) -> Option<RoundIncomplete> {
     })
 }
 
+/// A command the run itself ran that failed for want of a dependency or a
+/// tool: the run's own environment, never a question for the ticket.
+#[derive(serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
+pub struct RunToolingFailure {
+    /// The exact command.
+    #[schema(example = "cd 'e2e' && pnpm exec tsc --noEmit -p tsconfig.json")]
+    pub command: String,
+    /// The error it printed.
+    #[schema(example = "sh: 1: tsc: not found")]
+    pub error: String,
+    /// What the run tried first (installing the package's dependencies with
+    /// its own manager, then the command again), with how each ended.
+    #[serde(default)]
+    #[schema(example = json!(["`cd 'e2e' && (pnpm install --ignore-workspace --frozen-lockfile || pnpm install --ignore-workspace)` failed (exit 1)"]))]
+    pub tried: Vec<String>,
+}
+
+/// The open pull request that already does a run's work.
+#[derive(serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
+pub struct RunCoveredBy {
+    /// Its repository, `owner/name`.
+    #[schema(example = "acme/web")]
+    pub repo: String,
+    /// Its number.
+    #[schema(example = 41)]
+    pub number: u64,
+    /// Its address on GitHub.
+    #[serde(default)]
+    #[schema(example = "https://github.com/acme/web/pull/41")]
+    pub url: String,
+    /// Its title.
+    #[serde(default)]
+    #[schema(example = "Fix the cards list spec")]
+    pub title: String,
+    /// Who opened it.
+    #[serde(default)]
+    #[schema(example = "octocat")]
+    pub author: String,
+    /// Why it does the run's work, in one sentence.
+    #[serde(default)]
+    #[schema(example = "It selects the card by its name, which is the ticket's fix.")]
+    pub reason: String,
+}
+
 /// A question a run asked a person.
 #[derive(serde::Serialize, utoipa::ToSchema)]
 pub struct RunQuestion {
@@ -1205,6 +1260,11 @@ pub struct RunQuestion {
     /// someone else opened (`open_pr:owner/name#number`).
     #[schema(example = json!(null))]
     pub decision: Option<String>,
+    /// The evidence the question cites: a `path:line` in the code or a
+    /// lookup the run made. A ticket that states its own root cause and fix
+    /// plan is only questioned with evidence that contradicts it.
+    #[schema(example = json!(["config/limits.yml:12"]))]
+    pub evidence: Vec<String>,
 }
 
 /// An answer given in CoderHelm to a run's question.
@@ -1470,6 +1530,11 @@ fn run_of(
         // outside the code.
         fix_location: st("fix_location"),
         outside_change_report: st("outside_change_report"),
+        // A run that stopped on its own environment, and a run an open pull
+        // request already covers.
+        stop_kind: st("stop_kind").filter(|s| !s.is_empty()),
+        tooling_failure: st("tooling_failure").and_then(|s| serde_json::from_str(&s).ok()),
+        covered_by: st("covered_by").and_then(|s| serde_json::from_str(&s).ok()),
         // A lesson recorded for the repository when the fix was elsewhere.
         lesson: st("lesson"),
         // A person closed the run on purpose (`run_close`): who, when, why,
@@ -1505,6 +1570,7 @@ fn run_of(
                         why: (!q.why.is_empty()).then(|| q.why.clone()),
                         suggestions: q.suggestions.clone(),
                         decision: (!q.decision.is_empty()).then(|| q.decision.clone()),
+                        evidence: q.evidence.clone(),
                     })
                     .collect()
             })
@@ -1797,7 +1863,8 @@ pub struct RunActionResult {
     operation_id = "retryRun",
     summary = "Retry a run",
     description = "Starts the run's ticket again as a new run. Only a run that is `failed`, \
-        `needs_input`, `needs_outside_change`, `cancelled` or `closed` can be retried; the old run \
+        `needs_input`, `needs_outside_change`, `covered_by_pr`, `cancelled` or `closed` can be \
+        retried; the old run \
         becomes `retried`, so retrying it twice is refused with `400`. Find the new run with \
         `GET /api/runs?q=<ticket id>`.\n\n\
         A `completed` run whose `round_incomplete` is set (its pull request is open but the last \
@@ -1865,7 +1932,12 @@ pub async fn retry_run(
     }
     if !matches!(
         status,
-        "failed" | "needs_input" | "needs_outside_change" | "cancelled" | "closed"
+        "failed"
+            | "needs_input"
+            | "needs_outside_change"
+            | "covered_by_pr"
+            | "cancelled"
+            | "closed"
     ) {
         return Err(StatusCode::BAD_REQUEST);
     }
@@ -5990,7 +6062,8 @@ mod tests {
             "questions": [
                 {"id": "q1", "question": "Which environments get the new limit?",
                  "why": "Each environment has its own value.",
-                 "suggestions": ["Production only", "Every environment"]},
+                 "suggestions": ["Production only", "Every environment"],
+                 "evidence": ["config/limits.yml:12"]},
                 {"id": "q2", "question": "What is the new limit?"}
             ],
             "asked_at": "2026-10-27T10:00:00Z",
@@ -6025,9 +6098,10 @@ mod tests {
             json!([
                 {"id": "q1", "question": "Which environments get the new limit?",
                  "why": "Each environment has its own value.",
-                 "suggestions": ["Production only", "Every environment"], "decision": null},
+                 "suggestions": ["Production only", "Every environment"], "decision": null,
+                 "evidence": ["config/limits.yml:12"]},
                 {"id": "q2", "question": "What is the new limit?", "why": null, "suggestions": [],
-                 "decision": null}
+                 "decision": null, "evidence": []}
             ])
         );
         assert_eq!(

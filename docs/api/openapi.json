@@ -2952,6 +2952,17 @@
             "format": "double",
             "type": "number"
           },
+          "covered_by": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/RunCoveredBy",
+                "description": "For a `covered_by_pr` run: the open pull request that already does the\nwork, and why."
+              }
+            ]
+          },
           "created_at": {
             "description": "When the run started (RFC 3339).",
             "examples": [
@@ -3244,9 +3255,19 @@
             "type": "array"
           },
           "status": {
-            "description": "Where the run is: `pending`, `running`, `awaiting_ci`, `completed`,\n`failed`, `needs_input`, `needs_outside_change`, `cancelled`,\n`retried` or `closed`. Treat a value you don't know as in progress.",
+            "description": "Where the run is: `pending`, `running`, `awaiting_ci`, `completed`,\n`failed`, `needs_input`, `needs_outside_change`, `covered_by_pr`, `cancelled`,\n`retried` or `closed`. Treat a value you don't know as in progress.",
             "examples": [
               "completed"
+            ],
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "stop_kind": {
+            "description": "Why the run stopped, when it was its own environment rather than a\nquestion: `tooling` (a command the run ran failed for want of a\ndependency or tool; see `tooling_failure`).",
+            "examples": [
+              null
             ],
             "type": [
               "string",
@@ -3300,6 +3321,17 @@
             "format": "int64",
             "minimum": 0,
             "type": "integer"
+          },
+          "tooling_failure": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/RunToolingFailure",
+                "description": "For a tooling failure: the exact command, the error it printed and\nwhat the run tried first."
+              }
+            ]
           },
           "trigger": {
             "$ref": "#/components/schemas/RunTrigger",
@@ -3396,6 +3428,60 @@
         ],
         "type": "object"
       },
+      "RunCoveredBy": {
+        "description": "The open pull request that already does a run's work.",
+        "properties": {
+          "author": {
+            "description": "Who opened it.",
+            "examples": [
+              "octocat"
+            ],
+            "type": "string"
+          },
+          "number": {
+            "description": "Its number.",
+            "examples": [
+              41
+            ],
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "reason": {
+            "description": "Why it does the run's work, in one sentence.",
+            "examples": [
+              "It selects the card by its name, which is the ticket's fix."
+            ],
+            "type": "string"
+          },
+          "repo": {
+            "description": "Its repository, `owner/name`.",
+            "examples": [
+              "acme/web"
+            ],
+            "type": "string"
+          },
+          "title": {
+            "description": "Its title.",
+            "examples": [
+              "Fix the cards list spec"
+            ],
+            "type": "string"
+          },
+          "url": {
+            "description": "Its address on GitHub.",
+            "examples": [
+              "https://github.com/acme/web/pull/41"
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "repo",
+          "number"
+        ],
+        "type": "object"
+      },
       "RunNote": {
         "description": "A note the run wrote while it worked.",
         "properties": {
@@ -3461,6 +3547,18 @@
               "null"
             ]
           },
+          "evidence": {
+            "description": "The evidence the question cites: a `path:line` in the code or a\nlookup the run made. A ticket that states its own root cause and fix\nplan is only questioned with evidence that contradicts it.",
+            "examples": [
+              [
+                "config/limits.yml:12"
+              ]
+            ],
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
           "id": {
             "description": "The question's id within the run (`q1`, `q2`, ...).",
             "examples": [
@@ -3502,7 +3600,8 @@
         "required": [
           "id",
           "question",
-          "suggestions"
+          "suggestions",
+          "evidence"
         ],
         "type": "object"
       },
@@ -3595,7 +3694,7 @@
             ]
           },
           "status": {
-            "description": "Where the run is: `pending`, `running`, `awaiting_ci`, `completed`,\n`failed`, `needs_input`, `needs_outside_change`, `cancelled`,\n`retried` or `closed`. Treat a value you don't know as in progress.",
+            "description": "Where the run is: `pending`, `running`, `awaiting_ci`, `completed`,\n`failed`, `needs_input`, `needs_outside_change`, `covered_by_pr`, `cancelled`,\n`retried` or `closed`. Treat a value you don't know as in progress.",
             "examples": [
               "completed"
             ],
@@ -3665,6 +3764,42 @@
         },
         "required": [
           "trigger"
+        ],
+        "type": "object"
+      },
+      "RunToolingFailure": {
+        "description": "A command the run itself ran that failed for want of a dependency or a\ntool: the run's own environment, never a question for the ticket.",
+        "properties": {
+          "command": {
+            "description": "The exact command.",
+            "examples": [
+              "cd 'e2e' && pnpm exec tsc --noEmit -p tsconfig.json"
+            ],
+            "type": "string"
+          },
+          "error": {
+            "description": "The error it printed.",
+            "examples": [
+              "sh: 1: tsc: not found"
+            ],
+            "type": "string"
+          },
+          "tried": {
+            "description": "What the run tried first (installing the package's dependencies with\nits own manager, then the command again), with how each ended.",
+            "examples": [
+              [
+                "`cd 'e2e' && (pnpm install --ignore-workspace --frozen-lockfile || pnpm install --ignore-workspace)` failed (exit 1)"
+              ]
+            ],
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "command",
+          "error"
         ],
         "type": "object"
       },
@@ -6624,7 +6759,7 @@
     },
     "/api/runs/{run_id}/retry": {
       "post": {
-        "description": "Starts the run's ticket again as a new run. Only a run that is `failed`, `needs_input`, `needs_outside_change`, `cancelled` or `closed` can be retried; the old run becomes `retried`, so retrying it twice is refused with `400`. Find the new run with `GET /api/runs?q=<ticket id>`.\n\nA `completed` run whose `round_incomplete` is set (its pull request is open but the last fix round on it didn't finish) is resumed instead: the same run picks the round up again on the same pull request, with a fresh time budget, and the answer's status is `resuming`.",
+        "description": "Starts the run's ticket again as a new run. Only a run that is `failed`, `needs_input`, `needs_outside_change`, `covered_by_pr`, `cancelled` or `closed` can be retried; the old run becomes `retried`, so retrying it twice is refused with `400`. Find the new run with `GET /api/runs?q=<ticket id>`.\n\nA `completed` run whose `round_incomplete` is set (its pull request is open but the last fix round on it didn't finish) is resumed instead: the same run picks the round up again on the same pull request, with a fresh time budget, and the answer's status is `resuming`.",
         "operationId": "retryRun",
         "parameters": [
           {
@@ -10877,6 +11012,7 @@
                           "awaiting_ci",
                           "needs_input",
                           "needs_outside_change",
+                          "covered_by_pr",
                           "completed",
                           "merged",
                           "failed",
@@ -11099,6 +11235,7 @@
                           "awaiting_ci",
                           "needs_input",
                           "needs_outside_change",
+                          "covered_by_pr",
                           "completed",
                           "merged",
                           "failed",
@@ -11321,6 +11458,7 @@
                           "awaiting_ci",
                           "needs_input",
                           "needs_outside_change",
+                          "covered_by_pr",
                           "completed",
                           "merged",
                           "failed",
@@ -11543,6 +11681,7 @@
                           "awaiting_ci",
                           "needs_input",
                           "needs_outside_change",
+                          "covered_by_pr",
                           "completed",
                           "merged",
                           "failed",
