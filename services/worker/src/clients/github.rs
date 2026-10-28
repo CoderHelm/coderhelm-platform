@@ -1917,6 +1917,19 @@ impl GitHubClient {
         Ok(v.as_array().cloned().unwrap_or_default())
     }
 
+    /// An issue (title, body, author), as the issues endpoint returns it.
+    pub async fn get_issue(
+        &self,
+        owner: &str,
+        repo: &str,
+        issue_number: u64,
+    ) -> Result<serde_json::Value, Box<dyn std::error::Error + Send + Sync>> {
+        self.get(&format!(
+            "{API_BASE}/repos/{owner}/{repo}/issues/{issue_number}"
+        ))
+        .await
+    }
+
     /// The login of whoever closed a PR, via the issues endpoint (the PR
     /// object doesn't carry `closed_by`). None if open, merged, or unknown.
     pub async fn get_pr_closed_by(

@@ -55,7 +55,8 @@ Use the `get_diff` tool to see all changes compared to main. Then review for:
 7. **Must-rules** — If must-rules are listed in the system prompt, verify every rule is respected.
 8. **No placeholders** — Flag any TODO, FIXME, REPLACE_ME, stub implementations, or incomplete code left behind.
 9. **No destructive deletions** — If large blocks of existing code were REMOVED without being replaced by equivalent functionality, flag it. The agent should modify code, not gut it.
-10. **Syntax integrity** — For every modified file, verify that braces/brackets are balanced and the code would parse. If a file has orphaned catch blocks, dangling braces, or unreachable code after return/throw, it MUST be flagged.{design_check}
+10. **Syntax integrity** — For every modified file, verify that braces/brackets are balanced and the code would parse. If a file has orphaned catch blocks, dangling braces, or unreachable code after return/throw, it MUST be flagged.
+11. {log_check}{design_check}
 
 After using `get_diff`, also use `read_file` on any file that had significant changes (>20 lines modified) to verify the full file is syntactically correct. Do NOT skip this step.
 
@@ -64,13 +65,14 @@ If everything looks good, start with "LGTM" followed by a brief summary."#,
         number = msg.issue_number,
         title = msg.title,
         openspec = openspec_block,
+        log_check = super::review_fix::logs::CHECKLIST_ITEM,
         design_check = if msg.image_attachments.is_empty() {
             ""
         } else {
             // Ticket carries design mockups (attached below as images): the
             // reviewer must check per-breakpoint fidelity — text tasks lose
             // visual nuance like "mobile uses a different structure".
-            "\n11. **Design fidelity (mockups attached)** — Compare the implementation against \
+            "\n12. **Design fidelity (mockups attached)** — Compare the implementation against \
              the attached design image(s) at BOTH mobile (~375px) and desktop breakpoints. If \
              the design shows different mobile vs desktop structures (element order, a separate \
              mobile header/trigger, stacked vs inline), verify the code builds DISTINCT \
