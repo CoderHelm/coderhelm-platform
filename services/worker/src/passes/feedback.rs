@@ -160,6 +160,11 @@ pub async fn run(
     // this round follow the team's commit template with its tokens.
     let mut ticket = (String::new(), String::new(), 0u64);
 
+    // "Rebase", "update branch", "sync with main": one request, done here
+    // instead of the plain conflict merge below, in one push.
+    let update_ask = super::branch_update::asked(state, &provider, &msg, &mut usage).await;
+    let mut update_reply: Option<String> = None;
+
     // Resolve merge conflicts before processing feedback (especially on re-review)
     {
         let run_record = state
@@ -211,7 +216,8 @@ pub async fn run(
             let base_branch = resolve_pr_base(&github, &msg).await;
             // The start-of-round update. "One push" skips it, unless a
             // person explicitly asked for the update (then it is the push).
-            let may_update = ticket_info.constraints.may_update_branch(false);
+            let may_update =
+                super::branch_update::may_update(&ticket_info.constraints, update_ask.as_ref());
             if !branch.is_empty() && !may_update {
                 info!(run_id = %msg.run_id, "The requester asked for one push — not pushing a conflict merge first");
             }
@@ -247,26 +253,57 @@ pub async fn run(
                     answers: Vec::new(),
                     new_run_id: None,
                 };
-                match super::pr::resolve_conflicts(
-                    state,
-                    &ticket_msg,
-                    &github,
-                    &branch,
-                    &provider,
-                    &mut usage,
-                )
-                .await
-                {
-                    Ok(true) => {
-                        conflicts_pushed = true;
-                        info!(run_id = %msg.run_id, "Resolved merge conflicts before feedback")
-                    }
-                    Ok(false) => {}
-                    Err(e) => {
-                        warn!(run_id = %msg.run_id, error = %e, "Failed to resolve merge conflicts")
+                if let Some(ask) = &update_ask {
+                    let (line, pushed) = super::branch_update::run(
+                        state,
+                        &github,
+                        &provider,
+                        &ticket_msg,
+                        &branch,
+                        ask,
+                        &mut usage,
+                    )
+                    .await;
+                    conflicts_pushed = pushed;
+                    update_reply = Some(line);
+                } else {
+                    match super::pr::resolve_conflicts(
+                        state,
+                        &ticket_msg,
+                        &github,
+                        &branch,
+                        &provider,
+                        &mut usage,
+                    )
+                    .await
+                    {
+                        Ok(true) => {
+                            conflicts_pushed = true;
+                            info!(run_id = %msg.run_id, "Resolved merge conflicts before feedback")
+                        }
+                        Ok(false) => {}
+                        Err(e) => {
+                            warn!(run_id = %msg.run_id, error = %e, "Failed to resolve merge conflicts")
+                        }
                     }
                 }
             }
+        }
+    }
+
+    // Updating the branch was all the person asked: the update's line is the
+    // whole answer, no agent round.
+    if let (Some(ask), Some(line)) = (&update_ask, &update_reply) {
+        if ask.only {
+            return finish_branch_update(
+                state,
+                &github,
+                &msg,
+                &ticket_info,
+                line,
+                conflicts_pushed,
+            )
+            .await;
         }
     }
 
@@ -545,6 +582,16 @@ Rules:
         comments = formatted,
         ci_failures = ci_failure_block,
     );
+    // The branch update was done before this round and its answer is added
+    // to the reply for the agent.
+    let prompt = match &update_reply {
+        Some(line) => format!(
+            "{prompt}\n\n## Branch update\nThe request to bring the branch up to date with its base \
+             is already handled; this answer is added to your reply: \"{line}\". Don't act on it or \
+             mention it."
+        ),
+        None => prompt,
+    };
 
     // Determine the PR branch — we'll use the run's known branch
     // Try to extract branch from repo metadata. For now, use a convention.
@@ -1219,6 +1266,26 @@ Rules:
         .iter()
         .filter(|c| c.comment_id.is_some() && !c.is_context)
         .collect();
+
+    // The branch update's line leads the answer to the person who asked.
+    let response = match &update_reply {
+        Some(line) if actionable_comments.is_empty() || !constraints.may_comment() => {
+            format!("{line}\n\n{response}")
+        }
+        Some(line) => {
+            // Inline threads carry the rest: the update gets its own reply.
+            github
+                .create_issue_comment(
+                    &msg.repo_owner,
+                    &msg.repo_name,
+                    msg.pr_number,
+                    &addressed(&msg.trigger_author, line),
+                )
+                .await?;
+            response
+        }
+        None => response,
+    };
 
     if !constraints.may_comment() {
         // The requester said not to post on the pull request: the replies go
@@ -3501,6 +3568,103 @@ mod write_schema_tests {
         let w = tools.iter().find(|t| t.name == "write_file").unwrap();
         assert!(w.input_schema["properties"].get("sha").is_none());
     }
+}
+
+/// A comment addressed to the person who asked, when one did.
+fn addressed(author: &str, text: &str) -> String {
+    match author.trim() {
+        "" => text.to_string(),
+        a => format!("@{a} {text}"),
+    }
+}
+
+/// A round whose only request was to bring the branch up to date: the
+/// update's line answers it (in the thread it came from, else on the PR),
+/// and the run waits for CI when the update pushed.
+async fn finish_branch_update(
+    state: &WorkerState,
+    github: &GitHubClient,
+    msg: &FeedbackMessage,
+    ticket: &super::review_fix::Ticket,
+    line: &str,
+    pushed: bool,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let thread = msg
+        .comments
+        .iter()
+        .filter(|c| !c.is_context)
+        .find_map(|c| c.comment_id);
+    match thread {
+        // The requester said not to post on the pull request: the line goes
+        // to them on the run page and the ticket.
+        _ if !ticket.constraints.may_comment() => {
+            super::review_fix::tell_requester(
+                state,
+                github,
+                &msg.team_id,
+                &msg.run_id,
+                ticket,
+                &format!("Branch update on pull request #{}", msg.pr_number),
+                line,
+            )
+            .await
+        }
+        Some(id) => {
+            github
+                .reply_to_review_comment(&msg.repo_owner, &msg.repo_name, msg.pr_number, id, line)
+                .await?;
+        }
+        None => {
+            github
+                .create_issue_comment(
+                    &msg.repo_owner,
+                    &msg.repo_name,
+                    msg.pr_number,
+                    &addressed(&msg.trigger_author, line),
+                )
+                .await?;
+        }
+    }
+    info!(run_id = %msg.run_id, pushed, "Answered a request to update the branch");
+    if !pushed {
+        finish_without_change(state, msg).await;
+        return Ok(());
+    }
+    // The pushed update runs CI: the run waits for it like any feedback push.
+    use aws_sdk_dynamodb::types::AttributeValue as A;
+    let now = chrono::Utc::now().to_rfc3339();
+    let _ = state
+        .dynamo
+        .update_item()
+        .table_name(&state.config.runs_table_name)
+        .key("team_id", A::S(msg.team_id.clone()))
+        .key("run_id", A::S(msg.run_id.clone()))
+        .update_expression("SET #s = :s, status_run_id = :sri, updated_at = :t")
+        .condition_expression(common::run_status::not_ended("#s"))
+        .expression_attribute_names("#s", "status")
+        .ended_values()
+        .expression_attribute_values(":s", A::S("awaiting_ci".to_string()))
+        .expression_attribute_values(":sri", A::S(format!("awaiting_ci#{}", msg.run_id)))
+        .expression_attribute_values(":t", A::S(now))
+        .send()
+        .await;
+    if !state.config.ci_fix_queue_url.is_empty() {
+        let resume = serde_json::json!({
+            "type": "resume",
+            "team_id": msg.team_id,
+            "run_id": msg.run_id,
+            "installation_id": msg.installation_id,
+        });
+        let _ = state
+            .sqs
+            .send_message()
+            .queue_url(&state.config.ci_fix_queue_url)
+            .message_body(resume.to_string())
+            .delay_seconds(120)
+            .send()
+            .await;
+    }
+    Ok(())
 }
 
 /// Pure: the PR comment that answers a person's top-level comment or review

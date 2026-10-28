@@ -689,6 +689,7 @@ fn has_time_for_remediation(start: &Instant) -> bool {
 pub mod agent_tools;
 pub mod await_merge;
 pub mod aws_permissions;
+mod branch_update;
 mod checks;
 pub mod code_graph;
 mod completeness;

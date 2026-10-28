@@ -1344,6 +1344,302 @@ impl GitHubClient {
         }
     }
 
+    // ─── Bringing a branch up to date with its base ─────────────
+
+    /// Merges `head` into the branch `into` with the merges API and returns
+    /// the new commit, `None` on a conflict (409). `Some(Null)` when `into`
+    /// already had it (204).
+    async fn merge_returning(
+        &self,
+        owner: &str,
+        repo: &str,
+        into: &str,
+        head: &str,
+        message: &str,
+    ) -> Result<Option<serde_json::Value>, Box<dyn std::error::Error + Send + Sync>> {
+        let url = format!("{API_BASE}/repos/{owner}/{repo}/merges");
+        let headers = self.auth_headers().await?;
+        let mut req = self.http.post(&url).json(&serde_json::json!({
+            "base": into,
+            "head": head,
+            "commit_message": message,
+        }));
+        for (k, v) in &headers {
+            req = req.header(k.clone(), v.clone());
+        }
+        let resp = req.send().await?;
+        match resp.status().as_u16() {
+            201 => Ok(Some(resp.json().await?)),
+            204 => Ok(Some(serde_json::Value::Null)),
+            409 => Ok(None),
+            _ => {
+                let status = resp.status();
+                let body = resp.text().await.unwrap_or_default();
+                Err(format!("merge failed: {status} {body}").into())
+            }
+        }
+    }
+
+    /// A commit object from the git data API (tree, parents, author).
+    async fn git_commit(
+        &self,
+        owner: &str,
+        repo: &str,
+        sha: &str,
+    ) -> Result<serde_json::Value, Box<dyn std::error::Error + Send + Sync>> {
+        self.get(&format!(
+            "{API_BASE}/repos/{owner}/{repo}/git/commits/{sha}"
+        ))
+        .await
+    }
+
+    /// Writes a commit object and returns its sha.
+    async fn new_commit(
+        &self,
+        owner: &str,
+        repo: &str,
+        body: serde_json::Value,
+    ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+        let c = self
+            .post(
+                &format!("{API_BASE}/repos/{owner}/{repo}/git/commits"),
+                &body,
+            )
+            .await?;
+        c["sha"]
+            .as_str()
+            .map(String::from)
+            .ok_or_else(|| "Missing sha in new commit".into())
+    }
+
+    /// Points a scratch ref at `sha`, rewriting it (scratch refs only).
+    async fn move_scratch_ref(
+        &self,
+        owner: &str,
+        repo: &str,
+        branch: &str,
+        sha: &str,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.patch(
+            &format!("{API_BASE}/repos/{owner}/{repo}/git/refs/heads/{branch}"),
+            &serde_json::json!({"sha": sha, "force": true}),
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// Whether the branch is protected (classic branch protection).
+    /// Readable with metadata access.
+    pub async fn branch_is_protected(
+        &self,
+        owner: &str,
+        repo: &str,
+        branch: &str,
+    ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+        let b = self
+            .get(&format!(
+                "{API_BASE}/repos/{owner}/{repo}/branches/{}",
+                urlencoding::encode(branch)
+            ))
+            .await?;
+        Ok(b["protected"].as_bool().unwrap_or(false))
+    }
+
+    /// The branch protection's force push setting: `Some(true)` when force
+    /// pushes are allowed. Needs read access to administration; callers
+    /// treat an error as not known.
+    pub async fn force_pushes_allowed(
+        &self,
+        owner: &str,
+        repo: &str,
+        branch: &str,
+    ) -> Result<Option<bool>, Box<dyn std::error::Error + Send + Sync>> {
+        let p = self
+            .get(&format!(
+                "{API_BASE}/repos/{owner}/{repo}/branches/{}/protection",
+                urlencoding::encode(branch)
+            ))
+            .await?;
+        Ok(p.pointer("/allow_force_pushes/enabled")
+            .and_then(|v| v.as_bool()))
+    }
+
+    /// Whether the repository's merge settings allow squash merging. `None`
+    /// when GitHub doesn't say.
+    pub async fn allows_squash_merge(&self, owner: &str, repo: &str) -> Option<bool> {
+        self.get(&format!("{API_BASE}/repos/{owner}/{repo}"))
+            .await
+            .ok()
+            .and_then(|r| r["allow_squash_merge"].as_bool())
+    }
+
+    /// Whether every commit on `head` that `base` lacks (merge commits
+    /// aside: a rebase drops them) was made by this app. Only then may the
+    /// branch's history be rewritten. Any doubt (more commits than one page
+    /// shows, an unknown committer) is `false`.
+    pub async fn only_app_commits(
+        &self,
+        owner: &str,
+        repo: &str,
+        base: &str,
+        head: &str,
+    ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+        let bot = self.app_bot_login().await?;
+        let cmp = self
+            .get(&format!(
+                "{API_BASE}/repos/{owner}/{repo}/compare/{base}...{head}"
+            ))
+            .await?;
+        Ok(commits_all_by(&cmp, &bot))
+    }
+
+    /// Rebases `branch` onto `base` on GitHub's side: each of the branch's
+    /// own commits (merge commits are dropped, as `git rebase` does) is
+    /// replayed on top of the base with the merges API (a three-way merge
+    /// against the commit's parent, which is a cherry-pick), keeping its
+    /// message and author, on a scratch ref. The result must hold exactly
+    /// the code a merge of the base would (that is the check), and the
+    /// branch is then moved with a lease: only if it still points at
+    /// `lease`. Nothing is pushed unless all of that holds.
+    pub async fn rebase_branch(
+        &self,
+        owner: &str,
+        repo: &str,
+        branch: &str,
+        base: &str,
+        lease: &str,
+    ) -> Result<RebaseResult, Box<dyn std::error::Error + Send + Sync>> {
+        let base_sha = self.get_ref(owner, repo, base).await?;
+        let cmp = self
+            .get(&format!(
+                "{API_BASE}/repos/{owner}/{repo}/compare/{base_sha}...{lease}"
+            ))
+            .await?;
+        if cmp["behind_by"].as_u64() == Some(0) {
+            return Ok(RebaseResult::UpToDate);
+        }
+        let Some(steps) = replay_steps(&cmp) else {
+            return Ok(RebaseResult::NotClean(
+                "too many commits to replay".to_string(),
+            ));
+        };
+        let scratch = format!(
+            "coderhelm-rebase/{branch}-{}",
+            chrono::Utc::now().timestamp_millis()
+        );
+        self.create_branch(owner, repo, &scratch, &base_sha).await?;
+        let result = self
+            .replay(owner, repo, &scratch, &base_sha, lease, &steps)
+            .await;
+        let _ = self.delete_branch(owner, repo, &scratch).await;
+        let (tip, tip_tree) = match result? {
+            Ok(t) => t,
+            Err(why) => return Ok(RebaseResult::NotClean(why)),
+        };
+
+        // The check: a rebase holds the same code as merging the base in.
+        let check = format!("{scratch}-check");
+        self.create_branch(owner, repo, &check, lease).await?;
+        let merged = self
+            .merge_returning(owner, repo, &check, &base_sha, "rebase check")
+            .await;
+        let _ = self.delete_branch(owner, repo, &check).await;
+        let merged_tree = match merged? {
+            Some(c) => c
+                .pointer("/commit/tree/sha")
+                .and_then(|v| v.as_str())
+                .map(String::from),
+            None => None,
+        };
+        if merged_tree.as_deref() != Some(tip_tree.as_str()) {
+            return Ok(RebaseResult::NotClean(
+                "the rebased code differs from a merge of the base".to_string(),
+            ));
+        }
+
+        // The lease: only if nobody pushed since.
+        if self.get_ref(owner, repo, branch).await? != lease {
+            return Ok(RebaseResult::Moved);
+        }
+        self.move_scratch_ref(owner, repo, branch, &tip).await?;
+        self.invalidate_snapshot(owner, repo, branch).await;
+        Ok(RebaseResult::Rebased(tip))
+    }
+
+    /// Replays `steps` on the scratch ref starting at `base_sha`. The new
+    /// tip and its tree, or why it couldn't (a step conflicted).
+    #[allow(clippy::type_complexity)]
+    async fn replay(
+        &self,
+        owner: &str,
+        repo: &str,
+        scratch: &str,
+        base_sha: &str,
+        lease: &str,
+        steps: &[ReplayStep],
+    ) -> Result<Result<(String, String), String>, Box<dyn std::error::Error + Send + Sync>> {
+        let mut tip = base_sha.to_string();
+        let mut tip_tree = self.git_commit(owner, repo, base_sha).await?["tree"]["sha"]
+            .as_str()
+            .ok_or("Missing tree sha in base commit")?
+            .to_string();
+        for step in steps {
+            // A stand-in for the commit's parent holding the tip's code:
+            // merging the commit into it applies just the commit's change.
+            let stand_in = self
+                .new_commit(
+                    owner,
+                    repo,
+                    serde_json::json!({
+                        "message": "rebase step",
+                        "tree": tip_tree,
+                        "parents": [step.parent],
+                    }),
+                )
+                .await?;
+            self.move_scratch_ref(owner, repo, scratch, &stand_in)
+                .await?;
+            let applied = match self
+                .merge_returning(owner, repo, scratch, &step.sha, "rebase step")
+                .await?
+            {
+                None => {
+                    return Ok(Err(format!(
+                        "commit {} conflicts with the base",
+                        &step.sha[..7.min(step.sha.len())]
+                    )))
+                }
+                Some(serde_json::Value::Null) => continue,
+                Some(c) => c
+                    .pointer("/commit/tree/sha")
+                    .and_then(|v| v.as_str())
+                    .ok_or("Missing tree sha in merge")?
+                    .to_string(),
+            };
+            // A commit the base already carries replays to nothing.
+            if applied == tip_tree {
+                continue;
+            }
+            let mut body = serde_json::json!({
+                "message": step.message,
+                "tree": applied,
+                "parents": [tip],
+            });
+            if !step.author.is_null() {
+                body["author"] = step.author.clone();
+            }
+            tip = self.new_commit(owner, repo, body).await?;
+            tip_tree = applied;
+        }
+        if tip == base_sha {
+            return Ok(Err(format!(
+                "nothing of {} is left after the base",
+                &lease[..7.min(lease.len())]
+            )));
+        }
+        Ok(Ok((tip, tip_tree)))
+    }
+
     // ─── Single file write ──────────────────────────────────────
 
     /// Create or update a single file via Contents API.
@@ -3306,6 +3602,136 @@ pub enum FileOp {
 }
 
 /// Code search result.
+/// How a rebase on GitHub's side went.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RebaseResult {
+    /// The branch was moved to the rebased tip.
+    Rebased(String),
+    /// The branch already had everything of the base.
+    UpToDate,
+    /// The branch's commits didn't replay cleanly (why); nothing pushed.
+    NotClean(String),
+    /// Someone pushed to the branch meanwhile; nothing pushed.
+    Moved,
+}
+
+/// One commit to replay onto the base.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ReplayStep {
+    pub sha: String,
+    pub parent: String,
+    pub message: String,
+    /// The original author (name, email, date), kept on the new commit.
+    pub author: serde_json::Value,
+}
+
+/// Most commits a rebase replays; more falls back to a merge.
+pub const MAX_REPLAY: usize = 100;
+
+/// The commits a rebase replays, oldest first, from a compare of the base
+/// and the branch: merge commits are dropped (as `git rebase` does). `None`
+/// when the compare doesn't list them all, or there are too many.
+pub fn replay_steps(compare: &serde_json::Value) -> Option<Vec<ReplayStep>> {
+    let commits = compare["commits"].as_array()?;
+    let total = compare["total_commits"].as_u64().unwrap_or(0) as usize;
+    if total > commits.len() || commits.len() >= 250 {
+        return None;
+    }
+    let steps: Vec<ReplayStep> = commits
+        .iter()
+        .filter_map(|c| {
+            let parents = c["parents"].as_array()?;
+            if parents.len() != 1 {
+                return None;
+            }
+            Some(ReplayStep {
+                sha: c["sha"].as_str()?.to_string(),
+                parent: parents[0]["sha"].as_str()?.to_string(),
+                message: c
+                    .pointer("/commit/message")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+                author: c
+                    .pointer("/commit/author")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null),
+            })
+        })
+        .collect();
+    (steps.len() <= MAX_REPLAY).then_some(steps)
+}
+
+/// Whether a compare's commits (merge commits aside) were all committed by
+/// `login`. A truncated list is `false`: an unseen commit may be someone's.
+pub fn commits_all_by(compare: &serde_json::Value, login: &str) -> bool {
+    let Some(commits) = compare["commits"].as_array() else {
+        return false;
+    };
+    let total = compare["total_commits"].as_u64().unwrap_or(0) as usize;
+    if total > commits.len() || commits.len() >= 250 {
+        return false;
+    }
+    commits
+        .iter()
+        .filter(|c| c["parents"].as_array().map(|p| p.len()).unwrap_or(0) <= 1)
+        .all(|c| c.pointer("/committer/login").and_then(|v| v.as_str()) == Some(login))
+}
+
+#[cfg(test)]
+mod rebase_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn commit(sha: &str, parents: &[&str], by: &str) -> serde_json::Value {
+        json!({
+            "sha": sha,
+            "parents": parents.iter().map(|p| json!({"sha": p})).collect::<Vec<_>>(),
+            "commit": {"message": format!("msg {sha}"), "author": {"name": "a", "email": "a@x", "date": "2026-01-01T00:00:00Z"}},
+            "committer": {"login": by},
+        })
+    }
+
+    #[test]
+    fn a_rebase_replays_the_branch_commits_and_drops_merges_of_the_base() {
+        let cmp = json!({
+            "total_commits": 3,
+            "commits": [
+                commit("c1", &["b0"], "app[bot]"),
+                commit("m1", &["c1", "b1"], "web-flow"),
+                commit("c2", &["m1"], "app[bot]"),
+            ],
+        });
+        let steps = replay_steps(&cmp).unwrap();
+        assert_eq!(
+            steps
+                .iter()
+                .map(|s| (s.sha.as_str(), s.parent.as_str()))
+                .collect::<Vec<_>>(),
+            vec![("c1", "b0"), ("c2", "m1")]
+        );
+        assert_eq!(steps[0].message, "msg c1");
+        assert_eq!(steps[0].author["email"], "a@x");
+        // Merge commits don't make a branch someone else's.
+        assert!(commits_all_by(&cmp, "app[bot]"));
+    }
+
+    #[test]
+    fn a_person_s_commit_or_an_unseen_one_keeps_the_history() {
+        let theirs = json!({
+            "total_commits": 2,
+            "commits": [commit("c1", &["b0"], "app[bot]"), commit("c2", &["c1"], "someone")],
+        });
+        assert!(!commits_all_by(&theirs, "app[bot]"));
+        let truncated = json!({
+            "total_commits": 300,
+            "commits": [commit("c1", &["b0"], "app[bot]")],
+        });
+        assert!(!commits_all_by(&truncated, "app[bot]"));
+        assert!(replay_steps(&truncated).is_none());
+    }
+}
+
 /// Result of a SHA-guarded merge attempt.
 #[derive(Debug, PartialEq, Eq)]
 pub enum MergeOutcome {
