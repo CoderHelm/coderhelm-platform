@@ -598,15 +598,32 @@ pub struct HealthCheckMessage {
     /// Check-run names already failing at merge — excluded from new-failure alerts.
     #[serde(default)]
     pub baseline_failed: Vec<String>,
-    /// How many times this check has re-enqueued while checks were still running
-    /// (bounds the adaptive wait — no user-set timer).
+    /// How many ticks this check has sent so far. Sets the back-off between
+    /// ticks only; it never ends the check (the deploy's own runs do).
     #[serde(default)]
     pub attempts: u32,
-    /// Epoch seconds when the deploy checks FIRST went green. A green result
-    /// starts the ≥15-minute watch window; 💚 posts only after the window ends
-    /// with no new failures. None until first observed green.
+    /// Epoch seconds when the merge commit's deploy completed (all its runs
+    /// done, none newly failing). The 15-minute watch window starts here; 💚
+    /// posts only after the window ends with no new failures.
     #[serde(default)]
     pub green_since: Option<i64>,
+    /// Epoch seconds of the merge (set when the check is scheduled). The
+    /// no-deploy grace period and the safety ceiling count from here.
+    #[serde(default)]
+    pub merged_at: Option<i64>,
+    /// Deploys of the merge commit that a later commit's run superseded
+    /// (cancelled or skipped), each with the run that deployed this commit.
+    #[serde(default)]
+    pub followed: Vec<FollowedDeploy>,
+}
+
+/// A deploy run of the merge commit that was superseded, and the later run on
+/// the same workflow whose commit contains the merge commit.
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq)]
+pub struct FollowedDeploy {
+    pub superseded_run_id: u64,
+    pub run_id: u64,
+    pub head_sha: String,
 }
 
 /// A label-triggered code-review job for an existing PR. Keyed by (pr_number,
