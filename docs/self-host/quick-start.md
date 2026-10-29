@@ -192,9 +192,9 @@ npx -y github:CoderHelm/coderhelm-platform init --yes \
 
 The [install guide](https://docs.coderhelm.com/self-host/install/) builds this link for you and follows the install. To use the template directly:
 
-- Template URL, by release: `https://coderhelm-public.s3.amazonaws.com/launch/v0.7.0/coderhelm-launch.yaml` (the newest stable release is named in `https://coderhelm-public.s3.amazonaws.com/launch/latest.json`)
-- Quick-create link (replace both regions with yours):
-  `https://us-east-1.console.aws.amazon.com/cloudformation/home?region=us-east-1#/stacks/create/review?stackName=coderhelm-prod&templateURL=https://coderhelm-public.s3.amazonaws.com/launch/v0.7.0/coderhelm-launch.yaml&param_AdminEmail=you@example.com`
+- Template URL, by release: `https://coderhelm-public.s3.amazonaws.com/launch/<version>/coderhelm-launch.yaml`. Use the newest release: `https://coderhelm-public.s3.amazonaws.com/launch/latest.json` names it and its template URL (`templateUrl`). Releases are cut automatically after each update of CoderHelm, so pick the version from that file rather than writing one down.
+- Quick-create link (replace both regions with yours, and `<version>` with the one in `latest.json`):
+  `https://us-east-1.console.aws.amazon.com/cloudformation/home?region=us-east-1#/stacks/create/review?stackName=coderhelm-prod&templateURL=https://coderhelm-public.s3.amazonaws.com/launch/<version>/coderhelm-launch.yaml&param_AdminEmail=you@example.com`
 
 Only your email is required. The optional parameters: `Hostname` (your own domain: a Route 53 zone in the account is found and set up for you, any other DNS provider gets two records to add, see [Domains](./domains.md)), `EmailFrom`, `SignupDomain` (empty: only people you invite) and `RequireTwoFactor`, `AutoUpdate` with `UpdateWindow` and `UpdateTimezone`, `BedrockInferencePrefix` and `Telemetry`. [Everything you can set up](./options.md) lists each with its config setting. Tick the box that lets the stack create IAM roles and press **Create stack**. A CodeBuild project in your account downloads the release, checks its signature and checksums, deploys every CoderHelm stack (about 20 minutes) and finishes with your URL in the stack's **Outputs**. Its log stays in CloudWatch under `/aws/codebuild/<stack name>-installer`, also if the stack is rolled back.
 

@@ -11,8 +11,9 @@
 //                               made by this repository's release workflow
 //
 // Nothing from a release is used until it checks out: its tag must be an
-// annotated tag signed with a maintainer key pinned in selfhost/maintainers.json,
-// on a commit on main (lib/source-tag.mjs); every file must match SHA256SUMS;
+// annotated tag on a commit on main, signed with a maintainer key pinned in
+// selfhost/maintainers.json or attested by auto-release.yml on main for that
+// tag and commit (lib/source-tag.mjs); every file must match SHA256SUMS;
 // and SHA256SUMS must carry a signature made by exactly this repository's
 // release.yml, on the release's own tag, from that same commit, with a GitHub
 // Actions certificate logged in Rekor (cosign), or else every file must carry
@@ -242,8 +243,9 @@ const has = async (runner, cmd, args) => {
 
 /**
  * Checks that the release was built and signed by this repository's release
- * workflow on `tag`, from the commit a maintainer signed: the tag itself is
- * checked first (signed with a pinned maintainer key, on main), then the
+ * workflow on `tag`, from the tag's commit: the tag itself is checked first
+ * (on main, signed with a pinned maintainer key or attested by auto-release.yml
+ * on main for that tag and commit: lib/source-tag.mjs), then the
  * signature bundle's certificate must name exactly that workflow, tag and
  * commit, then SHA256SUMS is checked against it with cosign, or every asset
  * against its GitHub attestation with gh. Throws on any mismatch, a missing

@@ -24,9 +24,15 @@
 #     main: changes only through a pull request with an approving review and
 #     passing checks, signed commits, no force pushes, no deletion.
 #   CoderHelm/coderhelm-platform also:
-#     v* tags: signed, never updated, moved or deleted; only admins create one.
+#     v* tags: signed commits, never updated, moved or deleted; only admins
+#       and GitHub Actions (auto-release.yml) create one.
 #     the "release" environment: a listed reviewer approves every run, only v*
-#       tags may deploy to it, admins can't skip the approval.
+#       tags may deploy to it, admins can't skip the approval (releases cut
+#       by hand).
+#     the "release-auto" environment: only the main branch may deploy to it,
+#       with no reviewer (releases cut by auto-release.yml after main's
+#       deploy; the AWS release roles trust only auto-release.yml on main in
+#       it: infra/lib/worker-stack.ts).
 #     immutable releases; SHA-pinned actions; a read-only default token;
 #     outside contributors' workflows wait for approval; Dependabot.
 #
@@ -51,7 +57,7 @@ for a in "$@"; do
     --check) MODE=check ;;
     --allow-admin-tag-bypass) TAG_BYPASS=1 ;;
     --no-admin-merge-bypass) MERGE_BYPASS=0 ;;
-    -h|--help) sed -n '2,36p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,40p' "$0"; exit 0 ;;
     *) echo "Unknown option: $a (see --help)" >&2; exit 2 ;;
   esac
 done
@@ -64,7 +70,7 @@ api() { gh api -H "Accept: application/vnd.github+json" -H "X-GitHub-Api-Version
 
 RS_MAIN="main: pull requests, checks, signed"
 RS_TAGS="release tags: signed, never moved or deleted"
-RS_TAG_CREATE="release tags: only admins create"
+RS_TAG_CREATE="release tags: only admins and auto-release create"
 
 admins() { # bypass mode
   jq -n --arg m "$1" '[{actor_type: "OrganizationAdmin", actor_id: 1, bypass_mode: $m}, {actor_type: "RepositoryRole", actor_id: 5, bypass_mode: $m}]'
@@ -108,10 +114,21 @@ tags_ruleset() {
   }'
 }
 
-# Creating a v* tag is blocked for everyone but admins (the bypass), who are
-# still held to the ruleset above: signed, and never moved afterwards.
+# Creating a v* tag is blocked for everyone but admins and GitHub Actions
+# (the bypass), who are still held to the ruleset above: never moved
+# afterwards. GitHub Actions is there for auto-release.yml, which creates the
+# tag with the workflow token. GitHub can't narrow that to one workflow, so
+# any workflow given contents: write could create a v* tag; such a tag gets
+# nothing installed (installs require a maintainer's signature or
+# auto-release.yml's attestation from main), no approval-free publish of the
+# templates or latest.json (the AWS roles trust release.yml in "release" or
+# auto-release.yml on main in "release-auto"), and auto-release.yml ignores
+# tags that aren't on main. 15368 is the GitHub Actions app.
+GITHUB_ACTIONS_APP=15368
 tag_create_ruleset() {
-  jq -n --arg name "$RS_TAG_CREATE" --argjson bypass "$(admins always)" '{
+  local bypass
+  bypass=$(admins always | jq --argjson app "$GITHUB_ACTIONS_APP" '. + [{actor_type: "Integration", actor_id: $app, bypass_mode: "always"}]')
+  jq -n --arg name "$RS_TAG_CREATE" --argjson bypass "$bypass" '{
     name: $name, target: "tag", enforcement: "active",
     conditions: {ref_name: {include: ["refs/tags/v*"], exclude: []}},
     rules: [{type: "creation"}],
@@ -181,6 +198,19 @@ check_environment() {
   fi
 }
 
+check_auto_environment() {
+  local repo="$PLATFORM" env policies reviewers
+  if ! env=$(api "repos/$repo/environments/release-auto" 2>/dev/null); then no "$repo environment \"release-auto\" (it does not exist; GitHub would create it with no branch rule the first time a job names it)"; return; fi
+  reviewers=$(jq -r '[.protection_rules[]? | select(.type == "required_reviewers") | .reviewers[]?.reviewer.login] | join(",")' <<<"$env")
+  if [ -z "$reviewers" ]; then ok "$repo environment \"release-auto\": no reviewer (automatic)"; else no "$repo environment \"release-auto\": has required reviewers ($reviewers), so automatic releases wait for them"; fi
+  if [ "$(jq -r '.deployment_branch_policy.custom_branch_policies // false' <<<"$env")" = true ]; then
+    policies=$(api "repos/$repo/environments/release-auto/deployment-branch-policies" --jq '[.branch_policies[] | "\(.type):\(.name)"] | join(",")')
+    if [ "$policies" = "branch:main" ]; then ok "$repo environment \"release-auto\": only main deploys"; else no "$repo environment \"release-auto\": deployment refs are \"$policies\", want only branch:main"; fi
+  else
+    no "$repo environment \"release-auto\": any branch or tag may deploy (no deployment branch rule main)"
+  fi
+}
+
 check_platform_settings() {
   local repo="$PLATFORM" v
   if v=$(api "repos/$repo/immutable-releases" --jq .enabled 2>/dev/null); then
@@ -204,6 +234,7 @@ if [ "$MODE" = check ]; then
   check_ruleset "$PLATFORM" "$(tag_create_ruleset)"
   check_repo_basics "$PLATFORM"
   check_environment
+  check_auto_environment
   check_platform_settings
   echo "$DASHBOARD"
   check_ruleset "$DASHBOARD" "$(main_ruleset "${DASHBOARD_CHECKS[@]}")"
@@ -235,7 +266,7 @@ ruleset "$DASHBOARD" "$(main_ruleset "${DASHBOARD_CHECKS[@]}")"
 ruleset "$PLATFORM" "$(tags_ruleset)"
 ruleset "$PLATFORM" "$(tag_create_ruleset)"
 # The rulesets the first version of this script made, replaced by the two above.
-for old in "release tags: never moved or deleted" "release tags: admins create, signed"; do
+for old in "release tags: never moved or deleted" "release tags: admins create, signed" "release tags: only admins create"; do
   id=$(api "repos/$PLATFORM/rulesets" --jq ".[] | select(.name == \"$old\") | .id")
   if [ -n "$id" ]; then
     api -X DELETE "repos/$PLATFORM/rulesets/$id" >/dev/null
@@ -265,6 +296,26 @@ if ! api "repos/$PLATFORM/environments/release/deployment-branch-policies" --jq 
   api -X POST "repos/$PLATFORM/environments/release/deployment-branch-policies" -f name='v*' -f type=tag >/dev/null
 fi
 echo "$PLATFORM environment: release (reviewers: $REVIEWERS; v* tags only; admins can't skip it)"
+
+# 3b. The "release-auto" environment: automatic releases (auto-release.yml),
+#     no reviewer, and only the main branch may deploy to it. The AWS release
+#     roles trust auto-release.yml on refs/heads/main in this environment
+#     only (infra/lib/worker-stack.ts).
+api -X PUT "repos/$PLATFORM/environments/release-auto" --input - >/dev/null <<EOF
+{
+  "wait_timer": 0,
+  "reviewers": [],
+  "deployment_branch_policy": {"protected_branches": false, "custom_branch_policies": true}
+}
+EOF
+api "repos/$PLATFORM/environments/release-auto/deployment-branch-policies" --jq '.branch_policies[] | "\(.id) \(.type) \(.name)"' |
+  while read -r id type name; do
+    [ "$type $name" = "branch main" ] || { api -X DELETE "repos/$PLATFORM/environments/release-auto/deployment-branch-policies/$id" >/dev/null; echo "release-auto environment: removed $type $name"; }
+  done
+if ! api "repos/$PLATFORM/environments/release-auto/deployment-branch-policies" --jq '.branch_policies[] | select(.type == "branch") | .name' | grep -qxF main; then
+  api -X POST "repos/$PLATFORM/environments/release-auto/deployment-branch-policies" -f name=main -f type=branch >/dev/null
+fi
+echo "$PLATFORM environment: release-auto (no reviewer; main only)"
 
 # 4. Published releases can't have their files replaced, or their tag moved.
 api -X PUT "repos/$PLATFORM/immutable-releases" >/dev/null && echo "$PLATFORM immutable releases: on"

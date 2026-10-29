@@ -443,7 +443,7 @@ test("the manifest landing: self-host only, may write only this install's secret
   });
 });
 
-test("the release roles: only release.yml on a v* tag in the approved release environment; templates never replaced; latest.json alone", () => {
+test("the release roles: only release.yml on a v* tag in the approved release environment, or auto-release.yml on main in release-auto; templates never replaced; latest.json alone", () => {
   const cfg = loadConfigFile(path.join(INFRA, "config", "hosted.prod.json"), { CDK_DEFAULT_ACCOUNT: "654654210434" });
   const t = synth(cfg, zoneContext("654654210434", "us-east-1", "coderhelm.com"));
   const w = t["coderhelm-prod-worker"];
@@ -460,13 +460,29 @@ test("the release roles: only release.yml on a v* tag in the approved release en
       "token.actions.githubusercontent.com:ref": "refs/tags/v*",
     },
   };
+  // An automatic release: auto-release.yml itself, on main, in the environment that admits main alone.
+  const autoTrust = {
+    StringEquals: {
+      "token.actions.githubusercontent.com:aud": "sts.amazonaws.com",
+      "token.actions.githubusercontent.com:sub": "repo:CoderHelm/coderhelm-platform:environment:release-auto",
+      "token.actions.githubusercontent.com:job_workflow_ref": "CoderHelm/coderhelm-platform/.github/workflows/auto-release.yml@refs/heads/main",
+      "token.actions.githubusercontent.com:ref": "refs/heads/main",
+    },
+  };
   const statementsOf = (roleName: string, logicalPrefix: string) => {
     const role = Object.values(w.findResources("AWS::IAM::Role", { Properties: { RoleName: roleName } }))[0] as any;
     assert.ok(role, `${roleName} exists on hosted`);
     assert.equal(role.Properties.MaxSessionDuration, 3600);
-    const [st] = role.Properties.AssumeRolePolicyDocument.Statement;
-    assert.equal(st.Action, "sts:AssumeRoleWithWebIdentity");
-    assert.deepEqual(st.Condition, trust);
+    const sts = role.Properties.AssumeRolePolicyDocument.Statement;
+    assert.equal(sts.length, 2, "exactly two ways in");
+    for (const st of sts) {
+      assert.equal(st.Action, "sts:AssumeRoleWithWebIdentity");
+      assert.equal(st.Effect, "Allow");
+      assert.ok(JSON.stringify(st.Principal.Federated).includes("token.actions.githubusercontent.com"), JSON.stringify(st.Principal));
+    }
+    assert.deepEqual(sts[0].Condition, trust);
+    assert.deepEqual(sts[1].Condition, autoTrust);
+    assert.ok(!JSON.stringify(sts).includes("StringLike\":{\"token.actions.githubusercontent.com:sub"), "no wildcard sub");
     const mine = policies.filter((p) => JSON.stringify(p.Properties.Roles).includes(logicalPrefix));
     assert.equal(mine.length, 1);
     return mine[0].Properties.PolicyDocument.Statement;
@@ -490,6 +506,15 @@ test("the release roles: only release.yml on a v* tag in the approved release en
   for (const l of puts) assert.match(l, /--if-none-match '\*'|--if-match "\$etag"/, l);
   assert.ok(!/aws s3 cp/.test(wf), "no unconditional writes");
   assert.ok(wf.indexOf("role/coderhelm-prod-release-latest") > wf.indexOf("role/coderhelm-prod-release-publisher"));
+  // auto-release.yml: the same conditional writes, in release-auto, after it checked the published release.
+  const auto = fs.readFileSync(path.join(INFRA, "..", ".github", "workflows", "auto-release.yml"), "utf8");
+  const autoPuts = auto.split("\n").filter((l) => /s3api put-object|aws s3 cp/.test(l));
+  assert.ok(autoPuts.length >= 3);
+  for (const l of autoPuts) assert.match(l, /--if-none-match '\*'|--if-match "\$etag"/, l);
+  assert.ok(!/aws s3 cp/.test(auto));
+  assert.ok(auto.includes("environment: release-auto"));
+  assert.ok(auto.indexOf("Check the published release") < auto.indexOf("role/coderhelm-prod-release-publisher"));
+  assert.ok(auto.indexOf("role/coderhelm-prod-release-latest") > auto.indexOf("role/coderhelm-prod-release-publisher"));
   // Self-host installs have no publisher.
   const sh = synth(selfHost());
   assert.ok(!json(sh["coderhelm-prod-worker"]).includes("release-publisher"));

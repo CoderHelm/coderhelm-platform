@@ -1,5 +1,5 @@
 {
-  "about": "The SSH keys allowed to sign a release tag (git tag -s vX.Y.Z). Installs and updates refuse a release whose tag is not an annotated tag signed by one of these keys, on a commit that is on main (docs/self-host/updates-security.md). An install checks a new release with the keys of the release it already runs, so a key change reaches installs one release later: add the new key in a reviewed PR, release with the old key, and only remove the old key in a later release. See docs/self-host/updates-security.md, \"Rotating a maintainer key\".",
+  "about": "The SSH keys allowed to sign a release tag (git tag -s vX.Y.Z). Installs and updates refuse a release whose tag is not an annotated tag on a commit that is on main, signed by one of these keys or, for a release cut automatically, attested by .github/workflows/auto-release.yml on main (docs/self-host/updates-security.md). An install checks a new release with the keys of the release it already runs, so a key change reaches installs one release later: add the new key in a reviewed PR, release with the old key, and only remove the old key in a later release. See docs/self-host/updates-security.md, \"Rotating a maintainer key\".",
   "keys": [
     {
       "login": "nambok",

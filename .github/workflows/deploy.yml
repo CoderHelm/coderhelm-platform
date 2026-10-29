@@ -139,3 +139,19 @@ jobs:
           CDK_DEFAULT_ACCOUNT: ${{ secrets.AWS_ACCOUNT_ID }}
           CDK_DEFAULT_REGION: ${{ env.AWS_REGION }}
           MODEL_ID: claude-opus-4-8
+
+  # A deploy of main that went through starts a self-host release of that
+  # commit (.github/workflows/auto-release.yml). That workflow plans, skips
+  # when nothing self-hosted installs run changed, and checks again that it
+  # runs on main for a commit this workflow deployed.
+  release:
+    name: Start the self-host release
+    needs: [gate, deploy]
+    if: needs.gate.outputs.changed == 'true' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write # start auto-release.yml (workflow_dispatch)
+    steps:
+      - env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run auto-release.yml -R "$GITHUB_REPOSITORY" --ref main -f commit="$GITHUB_SHA"

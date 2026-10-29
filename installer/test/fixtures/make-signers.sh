@@ -45,6 +45,14 @@ cert otherTag "$R" release.yml refs/tags/v1.0.0 "$ISS"; echo ","
 cert otherIssuer "$R" release.yml refs/tags/v1.2.3 https://accounts.google.com; echo ","
 # Right workflow and tag, but built from another commit (a release.yml changed under a new tag).
 cert otherCommit "$R" release.yml refs/tags/v1.2.3 "$ISS" 2222222222222222222222222222222222222222; echo ","
-cert noCommit "$R" release.yml refs/tags/v1.2.3 "$ISS" none
+cert noCommit "$R" release.yml refs/tags/v1.2.3 "$ISS" none; echo ","
+# An automatic release's tag attestation (lib/source-tag.mjs): auto-release.yml
+# on main, run on the tag's commit; and the ways it can be wrong.
+cert auto "$R" auto-release.yml refs/heads/main "$ISS"; echo ","
+cert autoOtherWorkflow "$R" deploy.yml refs/heads/main "$ISS"; echo ","
+cert autoOtherRef "$R" auto-release.yml refs/heads/feature "$ISS"; echo ","
+cert autoTagRef "$R" auto-release.yml refs/tags/v1.2.3 "$ISS"; echo ","
+cert autoOtherCommit "$R" auto-release.yml refs/heads/main "$ISS" 2222222222222222222222222222222222222222; echo ","
+cert autoOtherRepo evil/coderhelm-platform auto-release.yml refs/heads/main "$ISS"
 echo
 echo "}"

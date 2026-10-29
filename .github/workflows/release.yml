@@ -7,24 +7,38 @@ name: Release
 # signature and build provenance (GitHub artifact attestations: Sigstore,
 # no keys to manage). The hosted deployment is not touched by this workflow.
 #
-# Who can publish (docs/self-host/updates-security.md):
-#   check     the tag is an annotated vX.Y.Z tag on a commit on main, signed
-#             with a key in main's selfhost/maintainers.json.
+# A release tag comes one of two ways (docs/self-host/updates-security.md):
+#   maintainer  a person signs and pushes it (git tag -s, a key in main's
+#               selfhost/maintainers.json); the publish job then waits for a
+#               maintainer's approval of the "release" environment and also
+#               uploads the Launch Stack templates and moves latest.json.
+#   automatic   .github/workflows/auto-release.yml creates it after main's
+#               deploy, with a keyless signature of "this repository, this
+#               tag, this commit" in its message, and starts this workflow on
+#               it. The publish job signs and publishes the GitHub release
+#               with no approval; auto-release.yml then checks it and uploads
+#               the templates and latest.json itself, from main, in the
+#               "release-auto" environment (main only).
+#
+#   check     the tag is an annotated vX.Y.Z tag on a commit on main, and
+#             either signed with a key in main's selfhost/maintainers.json or
+#             attested by auto-release.yml on main for this tag and commit.
 #   build     builds everything with a read-only token and no secrets; the
 #             dashboard from the full commit SHA in selfhost/versions.json.
-#   publish   signs, attests and publishes. It runs in the "release"
-#             environment, so a maintainer must approve it: a tag alone
-#             publishes nothing. Only this job can write the release or
-#             assume the AWS roles (whose trust names this file, a v* tag
-#             and the environment: infra/lib/worker-stack.ts).
+#   publish   signs, attests and publishes. On a maintainer's tag it runs in
+#             the "release" environment, so a maintainer must approve it, and
+#             only then can it assume the AWS roles (whose trust names this
+#             file, a v* tag and that environment: infra/lib/worker-stack.ts).
 #
 # These checks run inside this file, so on their own they don't stop a
 # changed copy of it pushed under a new tag. What does: installs and updates
 # check that the signature names exactly this file on refs/tags/<version>,
 # AND that it was made from the commit the tag points to, AND that the tag is
-# signed with a pinned maintainer key and on main (installer/lib/source-tag.mjs,
-# infra/lib/release-verify.ts). A tag nobody with a maintainer key signed
-# gets nothing installed, whatever this file says.
+# on main and signed with a pinned maintainer key or attested by main's
+# auto-release.yml for that tag and commit (installer/lib/source-tag.mjs,
+# infra/lib/release-verify.ts). A tag that neither a maintainer key nor
+# auto-release.yml on main vouched for gets nothing installed, whatever this
+# file says.
 #
 # Every action is pinned by commit SHA (.github/scripts/check_workflows.py
 # fails CI otherwise).
@@ -33,6 +47,7 @@ on:
     tags: ["v*.*.*"]
   # Re-run for an existing tag: choose the tag in "Use workflow from"
   # (the signature names the ref the run is on, so it must be the tag).
+  # auto-release.yml starts it this way on the tag it created.
   workflow_dispatch:
 
 permissions: {}
@@ -52,6 +67,7 @@ jobs:
       contents: read
     outputs:
       tag: ${{ steps.tag.outputs.tag }}
+      path: ${{ steps.path.outputs.path }}
     steps:
       - id: tag
         name: A version tag, nothing else
@@ -79,28 +95,60 @@ jobs:
           commit=$(git rev-parse "refs/tags/$TAG^{commit}")
           git merge-base --is-ancestor "$commit" origin/main || { echo "::error::$TAG ($commit) is not on main"; exit 1; }
           [ "$GITHUB_SHA" = "$commit" ] || { echo "::error::this run is on $GITHUB_SHA, not $TAG's commit $commit"; exit 1; }
-      # Signed with a maintainer key pinned on main, as installs check it
-      # (installer/lib/source-tag.mjs); main's copy, not the tag's.
-      - name: The tag is signed with a maintainer key
+      # Who vouches for the tag, as installs check it (installer/lib/source-tag.mjs):
+      # a maintainer's SSH signature (with a key pinned in main's copy of
+      # selfhost/maintainers.json, not the tag's) when the tag has one, or
+      # else the release attestation auto-release.yml on main put in it.
+      - uses: sigstore/cosign-installer@7e8b541eb2e61bf99390e1afd4be13a184e9ebc5 # v3.10.1
+        with:
+          cosign-release: v2.4.1
+      - id: path
+        name: The tag is signed with a maintainer key or attested by auto-release.yml on main
         env:
           TAG: ${{ steps.tag.outputs.tag }}
         run: |
-          # shellcheck disable=SC2016 # JavaScript, not shell
-          git show origin/main:selfhost/maintainers.json \
-            | node -e 'let s="";process.stdin.on("data",(d)=>(s+=d)).on("end",()=>{for(const k of JSON.parse(s).keys)console.log(`${k.login} namespaces="git" ${k.key}`)})' > "$RUNNER_TEMP/allowed_signers"
-          git cat-file tag "refs/tags/$TAG" | sed -n '/^$/q;s/^tag //p' | grep -qxF "$TAG" || { echo "::error::the tag object under $TAG is named for another version"; exit 1; }
-          GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 git -c gpg.format=ssh -c gpg.ssh.allowedSignersFile="$RUNNER_TEMP/allowed_signers" -c gpg.ssh.program=ssh-keygen verify-tag "refs/tags/$TAG" \
-            || { echo "::error::$TAG is not signed with a key in selfhost/maintainers.json (git tag -s with your SSH signing key)"; exit 1; }
-      # Signed by a maintainer, and GitHub says the signature checks out.
+          git cat-file tag "refs/tags/$TAG" > "$RUNNER_TEMP/tag"
+          sed -n '/^$/q;s/^tag //p' "$RUNNER_TEMP/tag" | grep -qxF "$TAG" || { echo "::error::the tag object under $TAG is named for another version"; exit 1; }
+          commit=$(git rev-parse "refs/tags/$TAG^{commit}")
+          if grep -qxF -e '-----BEGIN SSH SIGNATURE-----' "$RUNNER_TEMP/tag"; then
+            # shellcheck disable=SC2016 # JavaScript, not shell
+            git show origin/main:selfhost/maintainers.json \
+              | node -e 'let s="";process.stdin.on("data",(d)=>(s+=d)).on("end",()=>{for(const k of JSON.parse(s).keys)console.log(`${k.login} namespaces="git" ${k.key}`)})' > "$RUNNER_TEMP/allowed_signers"
+            [ "$(grep -cxF -e '-----BEGIN SSH SIGNATURE-----' "$RUNNER_TEMP/tag")" = 1 ] || { echo "::error::$TAG has more than one SSH signature"; exit 1; }
+            GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 git -c gpg.format=ssh -c gpg.ssh.allowedSignersFile="$RUNNER_TEMP/allowed_signers" -c gpg.ssh.program=ssh-keygen verify-tag "refs/tags/$TAG" \
+              || { echo "::error::$TAG is not signed with a key in selfhost/maintainers.json (git tag -s with your SSH signing key)"; exit 1; }
+            echo "path=maintainer" >> "$GITHUB_OUTPUT"
+          else
+            B='-----BEGIN CODERHELM RELEASE ATTESTATION-----'
+            E='-----END CODERHELM RELEASE ATTESTATION-----'
+            { [ "$(grep -cxF -e "$B" "$RUNNER_TEMP/tag")" = 1 ] && [ "$(grep -cxF -e "$E" "$RUNNER_TEMP/tag")" = 1 ]; } \
+              || { echo "::error::$TAG has no maintainer signature and no release attestation from auto-release.yml"; exit 1; }
+            sed -n "/^$B\$/,/^$E\$/p" "$RUNNER_TEMP/tag" | sed '1d;$d' | base64 -d > "$RUNNER_TEMP/tag.sigstore.json"
+            printf 'coderhelm-release-tag v1\nrepository %s\ntag %s\ncommit %s\n' "$GITHUB_REPOSITORY" "$TAG" "$commit" > "$RUNNER_TEMP/statement"
+            cosign verify-blob --bundle "$RUNNER_TEMP/tag.sigstore.json" \
+              --certificate-identity "https://github.com/$GITHUB_REPOSITORY/.github/workflows/auto-release.yml@refs/heads/main" \
+              --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+              --certificate-github-workflow-repository "$GITHUB_REPOSITORY" \
+              --certificate-github-workflow-ref refs/heads/main \
+              --certificate-github-workflow-sha "$commit" \
+              "$RUNNER_TEMP/statement" \
+              || { echo "::error::$TAG's release attestation is not from auto-release.yml on main for this tag and commit"; exit 1; }
+            echo "path=automatic" >> "$GITHUB_OUTPUT"
+          fi
+      # GitHub's own check: a maintainer's tag signature verifies, and the
+      # commit is signed (main requires signed commits).
       - name: The tag and its commit are signed
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ steps.tag.outputs.tag }}
+          VOUCHED: ${{ steps.path.outputs.path }}
         run: |
           ref=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$TAG" --jq '.object.type + " " + .object.sha')
           read -r type sha <<< "$ref"
           [ "$type" = tag ] || { echo "::error::$TAG is a lightweight tag: make it with git tag -s $TAG -m $TAG"; exit 1; }
-          [ "$(gh api "repos/$GITHUB_REPOSITORY/git/tags/$sha" --jq .verification.verified)" = true ] || { echo "::error::$TAG's signature is missing or not verified by GitHub"; exit 1; }
+          if [ "$VOUCHED" = maintainer ]; then
+            [ "$(gh api "repos/$GITHUB_REPOSITORY/git/tags/$sha" --jq .verification.verified)" = true ] || { echo "::error::$TAG's signature is missing or not verified by GitHub"; exit 1; }
+          fi
           commit=$(gh api "repos/$GITHUB_REPOSITORY/git/tags/$sha" --jq .object.sha)
           [ "$(gh api "repos/$GITHUB_REPOSITORY/commits/$commit" --jq .commit.verification.verified)" = true ] || { echo "::error::$TAG's commit is not signed and verified"; exit 1; }
       # The updater and the installer compare versions: a release must sort
@@ -253,14 +301,18 @@ jobs:
           if-no-files-found: error
           retention-days: 3
 
-  # Signs, attests and publishes what the build made. Runs only after a
-  # reviewer approves the "release" environment; runs no code from the
-  # repository (no checkout).
+  # Signs, attests and publishes what the build made; runs no code from the
+  # repository (no checkout). A maintainer's tag runs only after a reviewer
+  # approves the "release" environment, and only then gets the AWS roles for
+  # the templates and latest.json. An automatic tag runs with no environment:
+  # what it does here (a GitHub release, a signature naming this tag) installs
+  # accept only with the tag attestation checked above, and auto-release.yml
+  # does the AWS part from main.
   publish:
     name: Sign and publish
     needs: [check, build]
     runs-on: ubuntu-latest
-    environment: release
+    environment: ${{ needs.check.outputs.path == 'maintainer' && 'release' || '' }}
     permissions:
       contents: write # the GitHub release
       id-token: write # keyless signing and the AWS role
@@ -345,12 +397,15 @@ jobs:
       #                      one (If-None-Match is required by its policy);
       #   release-latest     writes launch/latest.json only, conditionally,
       #                      after the published release checked out below.
+      # A maintainer's tag only: auto-release.yml publishes these for its own.
       - uses: aws-actions/configure-aws-credentials@7474bc4690e29a8392af63c5b98e7449536d5c3a # v4.3.1
+        if: needs.check.outputs.path == 'maintainer'
         with:
           role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/coderhelm-prod-release-publisher
           role-duration-seconds: 900
           aws-region: us-east-1
       - name: Upload the templates
+        if: needs.check.outputs.path == 'maintainer'
         run: |
           # Written once: a template already there must be this one.
           for pair in launch-stack.yaml:coderhelm-launch.yaml coderhelm-log-reader.yaml:coderhelm-log-reader.yaml coderhelm-log-reader-update.yaml:coderhelm-log-reader-update.yaml; do
@@ -367,7 +422,7 @@ jobs:
       # install checks it: the signature, from this tag's commit, and every
       # file against SHA256SUMS. Only then does latest.json move.
       - name: Verify the published release
-        if: ${{ !contains(needs.check.outputs.tag, '-') }}
+        if: ${{ needs.check.outputs.path == 'maintainer' && !contains(needs.check.outputs.tag, '-') }}
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -384,7 +439,7 @@ jobs:
           curl --proto =https -fsSL "https://$PUBLIC_BUCKET.s3.amazonaws.com/launch/$TAG/coderhelm-launch.yaml" | cmp -s - "$d/launch-stack.yaml" \
             || { echo "::error::the template in S3 is not the signed launch-stack.yaml"; exit 1; }
       - uses: aws-actions/configure-aws-credentials@7474bc4690e29a8392af63c5b98e7449536d5c3a # v4.3.1
-        if: ${{ !contains(needs.check.outputs.tag, '-') }}
+        if: ${{ needs.check.outputs.path == 'maintainer' && !contains(needs.check.outputs.tag, '-') }}
         with:
           role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/coderhelm-prod-release-latest
           role-duration-seconds: 900
@@ -393,7 +448,7 @@ jobs:
       # latest, and latest.json only ever moves forward. The write is
       # conditional: a create, or a replace of the exact copy read (ETag).
       - name: Move latest.json
-        if: ${{ !contains(needs.check.outputs.tag, '-') }}
+        if: ${{ needs.check.outputs.path == 'maintainer' && !contains(needs.check.outputs.tag, '-') }}
         run: |
           headers="$RUNNER_TEMP/latest.headers"
           current=$(curl --proto =https -fsSL -D "$headers" "https://$PUBLIC_BUCKET.s3.amazonaws.com/launch/latest.json" 2>/dev/null || echo '{}')
