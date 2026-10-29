@@ -37,7 +37,102 @@ order: 11
 - Each function has its own role with only the tables, queues, keys and actions it uses.
 - The build sandbox runs a repository's own build scripts, which are untrusted: its CodeBuild role can only read and write one bucket of short-lived source tarballs and write its logs. No GitHub token, no tables, no KMS.
 - Roles in teams' AWS accounts are assumed only by name (`CoderHelmLogReader`, `CoderhelmReadOnly*`) and with an external id.
-- The installer and the Launch Stack's CodeBuild role need administrator rights to bootstrap CDK and create roles. Run later deploys with a narrower role if your policies require it.
+- Installs made with the Launch Stack, and installs an admin hardened, hold no broad standing rights in your account: see [What the installer can do in your account](#what-the-installer-can-do-in-your-account).
+
+## What the installer can do in your account
+
+This section is about installs made with the Launch Stack, and installs an admin hardened with `coderhelm-selfhost access harden` (both are called *hardened* here). [Installs from before](#installs-from-before-hardening) work differently.
+
+Nothing CoderHelm creates holds AdministratorAccess. Three pieces decide what CoderHelm can do. They are written once, in `infra/lib/access.ts`, and the Launch Stack's template is tested to be equal to them.
+
+### The permissions boundary
+
+`coderhelm-<name>-boundary` (with the Launch Stack, `coderhelm-<name>-boundary-<id>`) is the most any CoderHelm role can ever do, whatever its own policy says. Every role CoderHelm creates carries it: the functions, the builds, the updater, the installer and the deploy role. It allows only the services CoderHelm uses: Lambda, DynamoDB, S3, SQS, SNS, EventBridge, CloudWatch and its logs, Secrets Manager, KMS, SES, Cognito, CloudFront, API Gateway, CodeBuild, Systems Manager parameters, ACM, Route 53, CloudFormation, and calls to Bedrock models. Even within those, it refuses:
+
+- creating IAM users, access keys, sign-in profiles, groups or identity providers;
+- anything in Organizations, account settings, CloudTrail or GuardDuty;
+- any IAM action on a role or policy whose name doesn't start with `coderhelm-<name>-`;
+- creating or changing a role without this boundary on it, and removing a boundary from any role;
+- changing, deleting or retagging the boundary itself, or changing the deploy role;
+- changing the stack that holds the boundary and the deploy role (`coderhelm-<name>-access`);
+- assuming any other role in this account, such as the CDK bootstrap roles or yours. Roles in other accounts can still be assumed by name and external id, which is how log reading works.
+
+### The deploy role
+
+`coderhelm-<name>-deploy` is the role CloudFormation uses for CoderHelm's stacks. Only CloudFormation can assume it. It can:
+
+- create and change roles named `coderhelm-<name>-*`, and only with the boundary on them. It can pass only those roles.
+- create and change functions, tables, buckets, queues, topics, log groups, rules, schedules, alarms, build projects, parameters, email settings and key aliases whose names start with `coderhelm-<name>`. Every one of CoderHelm's resources is named that way, and a test checks it.
+- create KMS keys, user pools, CloudFront distributions and certificates. AWS names these by id, not by name, so the deploy role can change them only while they carry the tag `coderhelm:install = coderhelm-<name>`. It can never delete or disable a KMS key.
+
+It can't create IAM users or keys, give a role more than the boundary allows, use the CDK bootstrap, or touch CloudTrail, GuardDuty, Organizations or your other resources by name.
+
+### The deploy window
+
+The builds that install and update CoderHelm have **no deploy rights between runs**. While idle, the installer's role can only write its log and progress file, ask for a window and close its own. The update build's role can only ask the updater for a window and report back. Starting the project, or changing it, gains nothing.
+
+When a build runs, it asks for its window once the release's signature and checksums check out:
+
+1. The updater (for updates), or the Launch Stack's window function (for the install), reads the build from CodeBuild. The build must be running and use exactly this release's buildspec (compared by SHA-256), build image, role and settings, and the updater must have started it. A build someone started by hand, or a project someone changed, is refused, with the reason in the build's log.
+2. It adds the policy `deploy-window` to the build's role. That policy is bound to that one build's session (`aws:userid`) and ends 100 minutes later (the build stops at 90). It lets the build change CoderHelm's stacks only through the deploy role, pass only the deploy role, upload to the install's assets bucket, and read and write the install's own secret and settings.
+3. When the build ends, it removes the window, and the updater removes it too. The hourly check removes any window left while no update runs. If the Launch Stack is deleted or rolls back, it removes a window a failed install left behind.
+
+Only one build of each project runs at a time.
+
+Who can still act within the boundary:
+
+- someone who can change CoderHelm's functions (the updater or the window function) or its IAM roles. That already takes administrator rights in your account.
+- a release that passed every check in [How updates are kept safe](./updates-security.md). A malicious release could change any CoderHelm resource. It could also change the few things the deploy role can't scope by name or tag in this region: CloudFront origin access controls and response header policies, API Gateway HTTP APIs, and SES email identities. It could add CoderHelm's tag to one of your KMS keys, user pools, distributions or certificates and then change it, though never delete or disable a key. It could not create an admin role or an IAM user, touch IAM outside `coderhelm-<name>-*`, or switch off CloudTrail or GuardDuty.
+
+### What the Launch Stack creates
+
+The Launch Stack creates:
+
+- the boundary, the deploy role and an assets bucket (`coderhelm-<name>-assets-<id>-<account>`);
+- the installer (a CodeBuild project with its role);
+- a starter function, a window function, and two parameters holding the window's policy.
+
+The boundary, the deploy role and the assets bucket stay when you delete the stack, or when it rolls back after a failed install. CoderHelm keeps running and updating without the Launch Stack. Each launch names its pieces with its own short id, so launching again after a failure never collides with what the first launch left. If an install fails, the stack's events and the install guide name what AWS refused (for example `AWS refused iam:CreateRole on role/coderhelm-prod-...`). The stack then rolls back cleanly.
+
+There is no CDK bootstrap: deploys use the install's own assets bucket and the deploy role.
+
+### Check it yourself
+
+From a machine with read access to the account (IAM, CloudFormation, SSM):
+
+```sh
+AWS_PROFILE=<profile> node selfhost/check-access.mjs --stage <name> --region <region>
+```
+
+It only reads. It uses IAM's policy simulator for the idle build roles and starts nothing. It prints a PASS/FAIL table covering these checks:
+
+- every CoderHelm role carries the boundary;
+- no role has AdministratorAccess, and no policy allows `*:*`;
+- every CoderHelm stack deploys through the deploy role, and none uses the CDK bootstrap roles;
+- the deploy role's trust names only CloudFormation;
+- the idle build roles have no deploy rights and no open window;
+- the deploy role is refused IAM users, roles without the boundary, the boundary itself and key deletion.
+
+### Installs from before hardening
+
+An install made before this release, with the CLI or an older Launch Stack, still deploys the way it always has. Its updates assume the CDK bootstrap roles, whose CloudFormation role has AdministratorAccess by default, and an older Launch Stack's installer role has AdministratorAccess. Updating to this release changes neither. To move such an install onto its own boundary and deploy role, an admin runs this once, with administrator credentials, from a machine with the install's config (`coderhelm-selfhost pull`):
+
+```sh
+npx -y github:CoderHelm/coderhelm-platform access harden
+```
+
+The command works in this order:
+
+1. It deploys `coderhelm-<name>-access`, which holds the boundary, the deploy role and the assets bucket.
+2. It deploys every stack once with your credentials. This step puts the names, the boundary and the tags in place.
+3. It deploys every stack again through the deploy role.
+4. It offers to take AdministratorAccess off the old Launch Stack's installer role.
+
+Run it again if it stops part way. Afterwards `selfhost/check-access.mjs` should pass. The CDK bootstrap stays in your account (other CDK apps may use it); CoderHelm no longer can.
+
+### Rolling back past hardening
+
+A hardened install can roll back only to releases that know the boundary. A release from before hardening would remove the boundary from CoderHelm's roles, which the boundary forbids. **Roll back** refuses such a release, and an automatic rollback after an unhealthy update stops instead of trying. Going back that far needs an admin: deploy the older release with administrator credentials, knowing it puts back the old way of deploying.
 
 ## Supply chain
 

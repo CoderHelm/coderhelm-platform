@@ -11,6 +11,10 @@ import { Template } from "aws-cdk-lib/assertions";
 import { CfnInclude } from "aws-cdk-lib/cloudformation-include";
 import { repoPath } from "../lib/paths";
 import { CHECK_VERSION, COSIGN_LINUX_AMD64_SHA256, installCosignCommands, VERIFY_SUMS, verifyTagCommands } from "../lib/release-verify";
+import * as crypto from "node:crypto";
+import * as fs from "node:fs";
+import { launchAccessResources, launchNames, LAUNCH_WINDOW_PART_MAX } from "../lib/launch-access";
+import { windowPolicyParts } from "../lib/access";
 
 const FILE = repoPath("infra", "cfn", "coderhelm-selfhost-launch.yaml");
 
@@ -96,10 +100,11 @@ test("no loose signature checks: no identity regexp, no skipped transparency log
   assert.ok(spec.includes('B="https://github.com/CoderHelm/coderhelm-platform/releases/download/$VERSION"'));
 });
 
-test("the starter may only start the installer and open the progress file", () => {
+test("the starter may only start the installer, close a leftover window and open the progress file", () => {
   const t = load().toJSON();
   const statements = t.Resources.StarterRole.Properties.Policies[0].PolicyDocument.Statement;
-  assert.deepEqual(statements.map((s: any) => s.Action), ["codebuild:StartBuild", ["s3:PutBucketPolicy", "s3:PutObject"]]);
+  assert.deepEqual(statements.map((s: any) => s.Action), ["codebuild:StartBuild", "iam:DeleteRolePolicy", ["s3:PutBucketPolicy", "s3:PutObject"]]);
+  assert.match(JSON.stringify(statements[1].Resource), /InstallerRole/);
   const code: string = t.Resources.StarterFunction.Properties.Code.ZipFile;
   assert.match(code, /status\.json/);
   assert.doesNotMatch(code, /AdminEmail|ADMIN_EMAIL|SetupToken/, "nothing personal in the public file");
@@ -144,4 +149,94 @@ test("inline functions answer CloudFormation themselves, never through the cfnre
   assert.match(code, /def respond\(event, context, status/);
   assert.match(code, /urllib\.request\.Request\(event\["ResponseURL"\]/);
   assert.match(code, /respond\(event, context, "FAILED"/);
+});
+
+// ── Hardened installs (infra/lib/access.ts) ──────────────────────────────
+
+const IDS = ["Boundary", "DeployRole", "AssetsBucket"];
+
+test("no AdministratorAccess and no wildcard action anywhere in the template", () => {
+  const text = fs.readFileSync(FILE, "utf8");
+  assert.doesNotMatch(text, /AdministratorAccess/);
+  const t = load().toJSON();
+  for (const [id, r] of Object.entries<any>(t.Resources)) {
+    const docs = [...(r.Properties?.Policies ?? []).map((p: any) => p.PolicyDocument), r.Properties?.PolicyDocument].filter(Boolean);
+    for (const d of docs) for (const st of d.Statement) {
+      if (st.Effect !== "Allow") continue;
+      for (const a of [st.Action].flat()) assert.ok(a !== "*" && a !== "*:*" && a !== "iam:*", `${id}: ${a}`);
+    }
+  }
+});
+
+test("the boundary, deploy role, assets bucket and window policy are exactly infra/lib/access.ts (scripts/launch-access.sh)", () => {
+  const t = load().toJSON();
+  const want = launchAccessResources();
+  for (const [id, r] of Object.entries(want)) assert.deepEqual(t.Resources[id], r, `${id}: run scripts/launch-access.sh after changing infra/lib/access.ts`);
+  const windowIds = Object.keys(want).filter((k) => k.startsWith("WindowPolicy"));
+  assert.equal(t.Resources.WindowFunction.Properties.Environment.Variables.PARTS, String(windowIds.length));
+  assert.deepEqual([...t.Resources.StartInstall.DependsOn].sort(), ["AssetsBucket", "DeployRole", "WindowFunction", ...windowIds].sort());
+  for (const id of IDS) assert.equal((t.Resources[id] as any).DeletionPolicy, "Retain", `${id} stays: CoderHelm keeps updating after this stack is gone`);
+  // Each part fits a standard parameter with the longest names substituted.
+  const longest = (s: string) => s.split("${Stage}").join("a".repeat(20)).split("${Id}").join("12345678").split("${AWS::AccountId}").join("1".repeat(12))
+    .split("${AWS::Region}").join("ap-southeast-2").split("${AWS::Partition}").join("aws-us-gov");
+  for (const p of windowPolicyParts(launchNames(), LAUNCH_WINDOW_PART_MAX)) assert.ok(longest(p).length <= 4096, `${longest(p).length}`);
+});
+
+test("every role in the template carries the boundary; only CloudFormation may use the deploy role", () => {
+  const t = load().toJSON();
+  for (const [id, r] of Object.entries<any>(t.Resources)) {
+    if (r.Type !== "AWS::IAM::Role") continue;
+    assert.deepEqual(r.Properties.PermissionsBoundary, { Ref: "Boundary" }, `${id} carries the boundary`);
+  }
+  assert.deepEqual(t.Resources.DeployRole.Properties.AssumeRolePolicyDocument.Statement, [
+    { Effect: "Allow", Principal: { Service: "cloudformation.amazonaws.com" }, Action: "sts:AssumeRole" },
+  ]);
+});
+
+test("the installer's role, idle: logs, progress, ask for its window, close it; nothing that deploys", () => {
+  const t = load().toJSON();
+  const r = t.Resources.InstallerRole.Properties;
+  assert.equal(r.ManagedPolicyArns, undefined);
+  const actions = r.Policies.flatMap((p: any) => p.PolicyDocument.Statement.flatMap((s: any) => [s.Action].flat()));
+  assert.deepEqual(actions.sort(), ["iam:DeleteRolePolicy", "lambda:InvokeFunction", "logs:CreateLogGroup", "logs:CreateLogStream", "logs:PutLogEvents", "s3:PutObject"]);
+  assert.equal(t.Resources.InstallerProject.Properties.ConcurrentBuildLimit, 1, "a window is for one build");
+});
+
+test("the build asks for its window after every signature check, before running the release; closes it when it ends", () => {
+  const spec: string = load().toJSON().Resources.InstallerProject.Properties.Source.BuildSpec;
+  const ask = spec.indexOf('aws lambda invoke --function-name "$WINDOW_FUNCTION"');
+  assert.ok(ask > spec.lastIndexOf("sha256sum -c -") && ask > spec.indexOf("cosign verify-blob --bundle SHA256SUMS.sigstore.json"));
+  assert.ok(ask < spec.indexOf("node launch-bootstrap.mjs"));
+  const post = spec.indexOf("post_build:");
+  const close = spec.indexOf('aws iam delete-role-policy --role-name "$INSTALLER_ROLE" --policy-name deploy-window');
+  assert.ok(close > post && close < spec.indexOf("WAIT_URL", post), "closed before anything else after the build");
+  // A failure tells CloudFormation what failed (the stack's events and the guide show it).
+  assert.match(spec, /"The install failed: "\+\(f\.message/);
+});
+
+test("the window function checks this template's buildspec, image and variables", () => {
+  const t = load().toJSON();
+  const v = t.Resources.WindowFunction.Properties.Environment.Variables;
+  const spec: string = t.Resources.InstallerProject.Properties.Source.BuildSpec;
+  const norm = (x: string) => x.trim().split(/\r?\n/).map((l) => l.replace(/\s+$/, "")).join("\n");
+  assert.equal(v.BUILDSPEC_SHA256, crypto.createHash("sha256").update(norm(spec)).digest("hex"), "run scripts/launch-access.sh after changing the buildspec");
+  assert.equal(v.IMAGE, t.Resources.InstallerProject.Properties.Environment.Image);
+  assert.deepEqual(v.VARIABLES.split(","), t.Resources.InstallerProject.Properties.Environment.EnvironmentVariables.map((e: any) => e.Name));
+  for (const f of ["WindowFunction", "StarterFunction"]) assert.ok(t.Resources[f].Properties.Code.ZipFile.length <= 4096, `${f}: inline code is at most 4096 characters`);
+  assert.deepEqual(t.Resources.WindowRole.Properties.Policies[0].PolicyDocument.Statement.map((s: any) => s.Action), [
+    "codebuild:BatchGetBuilds", ["iam:GetRole", "iam:PutRolePolicy"], "ssm:GetParameter",
+  ]);
+});
+
+test("a rollback never stops: the starter answers every request and closes a leftover window on delete", () => {
+  const code: string = load().toJSON().Resources.StarterFunction.Properties.Code.ZipFile;
+  assert.match(code, /if event\["RequestType"\] == "Delete" and event\["ResourceProperties"\]\.get\("InstallerRole"\):\n\s+close_window/);
+  assert.match(code, /def close_window\(role\):[\s\S]*except Exception/, "closing never fails the delete");
+  assert.match(code, /respond\(event, context, "SUCCESS"\)/);
+});
+
+test("the description says plainly what the stack creates and the risks", () => {
+  const d: string = load().toJSON().Description;
+  assert.ok(d.length <= 1024, `${d.length} characters`);
+  for (const w of [/permissions boundary/, /no IAM users or keys/, /deploy role only\s+CloudFormation/, /no deploy rights/, /Risks:/, /cannot create an admin role/, /stay when this stack is\s+deleted/]) assert.match(d, w);
 });

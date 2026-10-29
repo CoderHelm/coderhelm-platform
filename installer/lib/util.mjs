@@ -43,6 +43,25 @@ export function derived(cfg) {
   };
 }
 
+/**
+ * A hardened install's access pieces (infra/lib/access.ts, accessNames):
+ * null for an install that deploys through the CDK bootstrap as before.
+ */
+export function accessOf(cfg) {
+  const a = cfg?.access;
+  if (!a || a.mode !== "hardened") return null;
+  const { prefix, suffix } = derived(cfg);
+  const partition = /^us-gov-/.test(cfg.region) ? "aws-us-gov" : /^cn-/.test(cfg.region) ? "aws-cn" : "aws";
+  const tail = a.owner === "launch" && a.id ? `-${a.id}` : "";
+  return {
+    owner: a.owner,
+    deployRoleArn: `arn:${partition}:iam::${cfg.account}:role/${prefix}-deploy${tail}`,
+    boundaryArn: `arn:${partition}:iam::${cfg.account}:policy/${prefix}-boundary${tail}`,
+    assetsBucket: `${prefix}-assets${tail}${suffix}`,
+    accessStackName: `${prefix}-access`,
+  };
+}
+
 /** A tiny prompt helper that falls back to defaults when not interactive. */
 export function prompter({ interactive, input = process.stdin, output = process.stdout }) {
   let rl;

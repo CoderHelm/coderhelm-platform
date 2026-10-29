@@ -10,23 +10,23 @@ import { LogAnalyzerStack } from "./log-analyzer-stack";
 import { StreamingStack } from "./streaming-stack";
 import { WebStack } from "./web-stack";
 import { UpdatesStack } from "./updates-stack";
+import { AccessStack, harden, stackBase } from "./hardening";
 
 /** Every stack of one deployment, built from its config. */
-export function buildApp(app: cdk.App, cfg: ResolvedConfig) {
-  const env = { account: cfg.account, region: cfg.region };
+export function buildApp(app: cdk.App, cfg: ResolvedConfig, opts: { accessStack?: boolean } = {}) {
   const prefix = cfg.prefix;
   const stage = cfg.stage;
 
   // --- Core Infrastructure ---
 
-  const database = new DatabaseStack(app, `${prefix}-database`, { env, stage, cfg });
+  const database = new DatabaseStack(app, `${prefix}-database`, { ...stackBase(cfg), stage, cfg });
 
-  const storage = new StorageStack(app, `${prefix}-storage`, { env, stage, cfg });
+  const storage = new StorageStack(app, `${prefix}-storage`, { ...stackBase(cfg), stage, cfg });
 
   // --- Compute ---
 
   const api = new ApiStack(app, `${prefix}-api`, {
-    env,
+    ...stackBase(cfg),
     stage,
     cfg,
     table: database.table,
@@ -49,7 +49,7 @@ export function buildApp(app: cdk.App, cfg: ResolvedConfig) {
   });
 
   const worker = new WorkerStack(app, `${prefix}-worker`, {
-    env,
+    ...stackBase(cfg),
     stage,
     cfg,
     table: database.table,
@@ -81,7 +81,7 @@ export function buildApp(app: cdk.App, cfg: ResolvedConfig) {
   // sit between them (those two link to the dashboard URL it creates).
 
   const streaming = new StreamingStack(app, `${prefix}-streaming`, {
-    env,
+    ...stackBase(cfg),
     stage,
     cfg,
     table: database.table,
@@ -101,7 +101,7 @@ export function buildApp(app: cdk.App, cfg: ResolvedConfig) {
   let web: WebStack | undefined;
   if (cfg.layout === "single-origin") {
     web = new WebStack(app, `${prefix}-web`, {
-      env,
+      ...stackBase(cfg),
       cfg,
       httpApi: api.httpApi,
       streamingFunctionUrl: streaming.functionUrl,
@@ -115,7 +115,7 @@ export function buildApp(app: cdk.App, cfg: ResolvedConfig) {
   // --- Email ---
 
   new EmailStack(app, `${prefix}-email`, {
-    env,
+    ...stackBase(cfg),
     stage,
     cfg,
     appUrl,
@@ -128,7 +128,7 @@ export function buildApp(app: cdk.App, cfg: ResolvedConfig) {
   let updates: UpdatesStack | undefined;
   if (cfg.updates.enabled) {
     updates = new UpdatesStack(app, `${prefix}-updates`, {
-      env,
+      ...stackBase(cfg),
       cfg,
       appUrl,
       settingsTable: database.settingsTable,
@@ -138,7 +138,7 @@ export function buildApp(app: cdk.App, cfg: ResolvedConfig) {
   // --- Monitoring ---
 
   new MonitoringStack(app, `${prefix}-monitoring`, {
-    env,
+    ...stackBase(cfg),
     stage,
     cfg,
     gatewayFunction: api.gatewayFunction,
@@ -151,7 +151,7 @@ export function buildApp(app: cdk.App, cfg: ResolvedConfig) {
 
   if (cfg.integrations.logAnalyzer) {
     new LogAnalyzerStack(app, `${prefix}-log-analyzer`, {
-      env,
+      ...stackBase(cfg),
       stage,
       cfg,
       appUrl,
@@ -160,6 +160,15 @@ export function buildApp(app: cdk.App, cfg: ResolvedConfig) {
       secretsKey: database.secretsKey,
       webhookQueue: api.webhookQueue,
     });
+  }
+
+  // --- A hardened install (config `access`, infra/lib/hardening.ts) ---
+
+  if (cfg.access) {
+    for (const s of app.node.children) if (s instanceof cdk.Stack) harden(s, cfg);
+    // The admin's own stack (an install hardened from the CLI); updates skip it.
+    const withAccess = opts.accessStack ?? process.env.CODERHELM_ACCESS_STACK !== "skip";
+    if (cfg.access.owner === "app" && withAccess) new AccessStack(app, cfg.access.accessStackName, { cfg });
   }
 
   return { database, storage, api, worker, streaming, web, updates };

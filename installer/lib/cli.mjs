@@ -40,6 +40,10 @@ Commands
                 in us-east-1, and --zone/--zone-id for a Route 53 zone), or
                 --action remove for the AWS address. Settings, then System
                 does all of it with checks and the DNS records to add
+  access        status | harden: how this install deploys. "harden" (an
+                admin, once) moves it onto its own permissions boundary and
+                deploy role, so updates get deploy rights only while they run
+                (docs/self-host/security.md)
   pull          Write the config and state from the account (--stage, --region),
                 to manage an install from another machine
   version       The installer's, the installed and the latest version
@@ -109,6 +113,9 @@ export async function main(argv, deps = {}) {
         return 0;
       case "pull":
         await cmd.pull(ctx);
+        return 0;
+      case "access":
+        await cmd.access(ctx);
         return 0;
       case "domain":
         return (await domain(ctx)).status === "succeeded" ? 0 : 1;
