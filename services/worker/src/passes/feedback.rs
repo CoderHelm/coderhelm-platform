@@ -936,6 +936,10 @@ Rules:
     checks_round.review_body = msg.review_body.clone();
     checks_round.ci_failures = has_ci_failures;
     checks_round.deadline = Some(super::round::deadline(start));
+    checks_round.ticket_text = std::iter::once(ticket_info.body.clone())
+        .chain(constraints.quotes.iter().cloned())
+        .collect::<Vec<_>>()
+        .join("\n\n");
     let land_pr = super::round::Pr {
         github: &github,
         owner: &msg.repo_owner,

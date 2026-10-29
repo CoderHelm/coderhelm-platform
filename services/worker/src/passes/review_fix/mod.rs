@@ -19,7 +19,11 @@
 //!    before it opened (`super::generators`), so a later round can't skip
 //!    it.
 //! 4. The full test suite ([`suite`]), found the way the repository runs it
-//!    and run in the sandbox against the staged files.
+//!    and run in the sandbox against the staged files, under bash
+//!    ([`suite_shell`]). A test command the requester named runs first. A
+//!    command CoderHelm built that breaks before any test runs is its own
+//!    failure: the next command is tried, and a round where none runs lands
+//!    saying so, never held for it.
 //!
 //! What a check finds goes back to the agent for one fix-up turn, then the
 //! round is checked again: hunks still out of scope and log wording still
@@ -40,6 +44,7 @@ pub mod logs;
 pub mod scope;
 pub mod staged;
 pub mod suite;
+pub mod suite_shell;
 
 use std::time::{Duration, Instant};
 
@@ -195,6 +200,9 @@ pub struct Round<'a> {
     pub review_body: String,
     pub ci_failures: bool,
     pub deadline: Option<Instant>,
+    /// The ticket's text and the requester's constraint quotes: where a
+    /// test command the requester named may be.
+    pub ticket_text: String,
     suite: tokio::sync::OnceCell<Result<suite::Suite, String>>,
     has_tests: tokio::sync::OnceCell<bool>,
 }
@@ -226,6 +234,7 @@ impl<'a> Round<'a> {
             review_body: String::new(),
             ci_failures: false,
             deadline: None,
+            ticket_text: String::new(),
             suite: tokio::sync::OnceCell::new(),
             has_tests: tokio::sync::OnceCell::new(),
         }
@@ -234,6 +243,19 @@ impl<'a> Round<'a> {
     /// Whether a person asked for this round (scope is judged against them).
     pub fn human(&self) -> bool {
         !self.requests.is_empty() || !self.review_body.trim().is_empty()
+    }
+
+    /// The test command the requester named: in this round's review
+    /// comments first, then the ticket.
+    pub fn requester_command(&self) -> Option<String> {
+        let mut texts: Vec<&str> = Vec::new();
+        for r in &self.requests {
+            texts.push(&r.body);
+            texts.extend(r.context.iter().map(String::as_str));
+        }
+        texts.push(&self.review_body);
+        texts.push(&self.ticket_text);
+        suite_shell::requester_command(&texts)
     }
 
     /// The PR's address, for notices.
@@ -325,28 +347,36 @@ pub async fn check(
     //    the last.
     if last || out.findings.is_empty() {
         let outcome = run_suite(round, staged).await;
-        match &outcome {
-            suite::Outcome::Failed { tail, .. } => {
-                if last {
-                    out.hold.push(outcome.line());
-                } else {
-                    out.findings.push(format!(
-                        "{}. Make every test pass (fix the code, or a test that asserts the old \
-                         behaviour the comment asked to change; never skip or delete a test). \
-                         Output:\n```\n{}\n```",
-                        outcome.line(),
-                        common::head_tail_str(tail, 4_000)
-                    ));
-                }
-            }
-            suite::Outcome::Passed { .. } | suite::Outcome::NotRun(_) => {}
-        }
-        out.suite = Some(outcome);
+        suite_step(outcome, last, &mut out);
     }
     if let Some(s) = &out.suite {
         out.evidence.push(s.line());
     }
     out
+}
+
+/// What the suite's outcome does to the round: tests that ran and failed
+/// go back to the agent, and on the last check hold the push. A command
+/// CoderHelm built that broke before any test ran (its own setup) never
+/// holds it: the evidence says plainly that the tests didn't run, and why.
+pub fn suite_step(outcome: suite::Outcome, last: bool, out: &mut Check) {
+    match &outcome {
+        suite::Outcome::Failed { tail, .. } => {
+            if last {
+                out.hold.push(outcome.line());
+            } else {
+                out.findings.push(format!(
+                    "{}. Make every test pass (fix the code, or a test that asserts the old \
+                     behaviour the comment asked to change; never skip or delete a test). \
+                     Output:\n```\n{}\n```",
+                    outcome.line(),
+                    common::head_tail_str(tail, 4_000)
+                ));
+            }
+        }
+        suite::Outcome::Broken(_) | suite::Outcome::Passed { .. } | suite::Outcome::NotRun(_) => {}
+    }
+    out.suite = Some(outcome);
 }
 
 /// A staged change as (path, status, patch), the patch holding the lines
@@ -883,7 +913,7 @@ async fn discover_suite(round: &Round<'_>, staged: &Staged) -> Result<suite::Sui
     )
     .await
     .map_err(|e| format!("could not read how the tests run: {e}"))?;
-    suite::parse(&answer)
+    suite::parse(&answer).map(|s| s.sanitized(&files))
 }
 
 /// Runs the full suite in the sandbox against the staged files.
@@ -905,37 +935,18 @@ async fn run_suite(round: &Round<'_>, staged: &Staged) -> suite::Outcome {
         .get_or_init(|| discover_suite(round, staged))
         .await
         .clone();
+    // A command the requester named runs even when the repository's files
+    // don't say how the tests run.
     let s = match found {
         Ok(s) => s,
+        Err(_) if round.requester_command().is_some() => suite::Suite::default(),
         Err(why) => return suite::Outcome::NotRun(why),
     };
-    let script = s.script();
-    // The team's agent permissions decide whether the command may run.
-    let gate = crate::agent::policy::gate(
-        state,
-        round.provider.scope.ctx(common::agent_policy::Agent::Coder),
-        round.deadline,
-    );
-    match gate
-        .check_command(
-            &script,
-            "Run the repository's full test suite before pushing a review fix",
-        )
-        .await
-    {
-        common::agent_policy::Outcome::Run { .. } => {}
-        common::agent_policy::Outcome::Stop(stop) => {
-            crate::agent::policy::record_stop(&stop);
-            return suite::Outcome::NotRun("the team's agent permissions stopped the run".into());
-        }
-        common::agent_policy::Outcome::Refused { message, .. }
-        | common::agent_policy::Outcome::Pending { message, .. } => {
-            return suite::Outcome::NotRun(format!(
-                "the team's agent permissions don't allow `{}` ({message})",
-                common::truncate_str(&script, 200)
-            ));
-        }
+    if !s.notes.is_empty() {
+        info!(run_id = %round.run_id, notes = ?s.notes, "review fix suite: workflow steps written as words were replaced");
     }
+    let requester = round.requester_command();
+    let candidates = s.candidates(requester.as_deref());
     let head = match round
         .github
         .get_ref(round.owner, round.repo, round.branch)
@@ -966,40 +977,114 @@ async fn run_suite(round: &Round<'_>, staged: &Staged) -> suite::Outcome {
         }
     };
     let node = super::detect_node_version(round.github, round.owner, round.repo, &head).await;
-    match sandbox
-        .run_checks(&source, &script, node.as_deref(), None, round.deadline)
-        .await
-    {
-        // A failing suite that couldn't connect to a host the sandbox's
-        // network allowlist refused didn't test the change: it says so.
-        Ok(o) if !o.passed && blocked_suite(&o.output).is_some() => {
-            suite::Outcome::NotRun(blocked_suite(&o.output).unwrap_or_default())
+    // The team's agent permissions decide whether each command may run.
+    let gate = crate::agent::policy::gate(
+        state,
+        round.provider.scope.ctx(common::agent_policy::Agent::Coder),
+        round.deadline,
+    );
+    // Each command in turn until one reaches the tests: a command that
+    // breaks before them (not valid bash, a missing tool, a failed setup)
+    // is CoderHelm's own failure, never the change's.
+    let mut broke: Vec<(String, String)> = Vec::new();
+    let mut setup_broke = false;
+    let mut builds = 0;
+    for c in candidates {
+        if setup_broke && !c.setup.is_empty() {
+            continue;
         }
-        Ok(o) if o.ran => {
-            let counts = suite::counts(&o.output);
-            if o.passed {
-                suite::Outcome::Passed {
-                    command: script,
-                    source: s.source.clone(),
-                    counts,
-                }
-            } else {
-                suite::Outcome::Failed {
-                    command: script,
-                    source: s.source.clone(),
-                    counts,
-                    exit: o.exit_code,
-                    tail: o.output,
-                }
+        if builds >= suite::MAX_TRIES {
+            break;
+        }
+        if let Err(e) = suite_shell::bash_syntax(&c.setup, &c.command) {
+            let why = format!("is not valid bash ({e})");
+            warn!(run_id = %round.run_id, command = %c.command, why = %why, "review fix suite: CoderHelm's own command broke; trying the next one");
+            broke.push((c.command.clone(), why));
+            continue;
+        }
+        let readable = if c.setup.is_empty() {
+            c.command.clone()
+        } else {
+            format!("{} && {}", c.setup, c.command)
+        };
+        match gate
+            .check_command(
+                &readable,
+                "Run the repository's full test suite before pushing a review fix",
+            )
+            .await
+        {
+            common::agent_policy::Outcome::Run { .. } => {}
+            common::agent_policy::Outcome::Stop(stop) => {
+                crate::agent::policy::record_stop(&stop);
+                return suite::Outcome::NotRun(
+                    "the team's agent permissions stopped the run".into(),
+                );
+            }
+            common::agent_policy::Outcome::Refused { message, .. }
+            | common::agent_policy::Outcome::Pending { message, .. } => {
+                return suite::Outcome::NotRun(format!(
+                    "the team's agent permissions don't allow `{}` ({message})",
+                    common::truncate_str(&readable, 200)
+                ));
             }
         }
-        Ok(o) => suite::Outcome::NotRun(if o.reason.is_empty() {
-            common::truncate_str(&o.output, 300).to_string()
-        } else {
-            o.reason
-        }),
-        Err(e) => suite::Outcome::NotRun(format!("the sandbox failed: {e}")),
+        builds += 1;
+        let o = match sandbox
+            .run_checks(
+                &source,
+                &suite_shell::sandbox_command(&c.setup, &c.command),
+                node.as_deref(),
+                None,
+                round.deadline,
+            )
+            .await
+        {
+            // A failing suite that couldn't connect to a host the sandbox's
+            // network allowlist refused didn't test the change: it says so.
+            Ok(o) if !o.passed && blocked_suite(&o.output).is_some() => {
+                return suite::Outcome::NotRun(blocked_suite(&o.output).unwrap_or_default())
+            }
+            Ok(o) if o.ran => o,
+            Ok(o) => {
+                return suite::Outcome::NotRun(if o.reason.is_empty() {
+                    common::truncate_str(&o.output, 300).to_string()
+                } else {
+                    o.reason
+                })
+            }
+            Err(e) => return suite::Outcome::NotRun(format!("the sandbox failed: {e}")),
+        };
+        match suite_shell::read_run(&o.output, o.exit_code) {
+            suite_shell::Run::Passed { counts } => {
+                return suite::Outcome::Passed {
+                    command: c.command,
+                    source: c.source,
+                    counts,
+                    broke,
+                }
+            }
+            suite_shell::Run::Failed { counts, exit } => {
+                return suite::Outcome::Failed {
+                    command: c.command,
+                    source: c.source,
+                    counts,
+                    exit,
+                    tail: o.output,
+                    broke,
+                }
+            }
+            suite_shell::Run::Broken { why, setup_ok } => {
+                warn!(run_id = %round.run_id, command = %c.command, why = %why, "review fix suite: CoderHelm's own command broke before the tests ran (infra, not a test failure); trying the next one");
+                if !setup_ok && !c.setup.is_empty() {
+                    setup_broke = true;
+                }
+                broke.push((c.command, why));
+            }
+        }
     }
+    warn!(run_id = %round.run_id, tried = ?broke, "review fix suite: no command reached the tests; the fix is not held for it");
+    suite::Outcome::Broken(broke)
 }
 
 /// Why a failing suite run says nothing about the change: it couldn't
