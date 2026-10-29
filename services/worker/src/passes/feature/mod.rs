@@ -28,12 +28,18 @@
 //! 8. **Open product questions** ([`questions`]): raised in the pull request,
 //!    never decided.
 //!
+//! For every ticket kind, the data rules ([`data_rules`]): a cursor column
+//! keeps advancing with its readers listed, a selection uses the same
+//! ordering as the other path making it, unexpected records are reported
+//! once per run, and the change is shown on real data.
+//!
 //! The planner reads [`planner_block`]; the plan's own check adds
 //! [`plan_gaps`]; [`gate`] runs before the pull request; [`shape_body`]
 //! writes the description's sections; [`ready_hold`] keeps the draft.
 
 pub mod checklist;
 pub mod content;
+pub mod data_rules;
 pub mod plan_files;
 pub mod prior;
 pub mod questions;
@@ -85,6 +91,7 @@ pub fn planner_block(intent: TicketIntent) -> String {
     } else {
         s.push_str(&format!("\n\n{}\n", questions::PLANNER));
     }
+    s.push_str(&format!("\n{}", data_rules::PLANNER));
     s
 }
 
@@ -380,6 +387,66 @@ async fn checklist_facts(
             .collect(),
     };
     (facts, maps)
+}
+
+/// The data rules' facts: what the diff shows, the readers of each cursor
+/// column it writes (code search on the default branch), and the
+/// selections in the changed files and their siblings.
+async fn data_facts(
+    w: &super::proof::Work<'_>,
+    files: &[(String, String, String)],
+    tree: &[String],
+) -> data_rules::Facts {
+    let (owner, repo, base) = (&w.msg.repo_owner, &w.msg.repo_name, &w.msg.base_branch);
+    let mut facts = data_rules::Facts::from_diff(files);
+    let mut cols: Vec<String> = Vec::new();
+    for c in facts.writes.iter().map(|x| x.column.clone()) {
+        if !cols.contains(&c) {
+            cols.push(c);
+        }
+    }
+    for col in cols.into_iter().take(3) {
+        let hits: Vec<(String, Vec<String>)> = w
+            .github
+            .search_code(owner, repo, base, &col)
+            .await
+            .map(|h| h.into_iter().map(|r| (r.path, r.matches)).collect())
+            .unwrap_or_default();
+        facts
+            .readers
+            .push((col.clone(), data_rules::readers(&col, &hits)));
+    }
+    if !facts.selections.is_empty() {
+        let mut paths: Vec<String> = Vec::new();
+        for s in &facts.selections {
+            if !paths.contains(&s.path) {
+                paths.push(s.path.clone());
+            }
+            let dir = s.path.rsplit_once('/').map_or("", |(d, _)| d);
+            for p in tree
+                .iter()
+                .filter(|p| p.rsplit_once('/').map_or("", |(d, _)| d) == dir && **p != s.path)
+            {
+                if !paths.contains(p) {
+                    paths.push(p.clone());
+                }
+            }
+        }
+        let mut texts = Vec::new();
+        for (i, p) in paths.iter().take(10).enumerate() {
+            // The changed files as the branch has them, siblings as base.
+            let at = if i < facts.selections.len() {
+                w.branch
+            } else {
+                base
+            };
+            if let Ok(t) = w.github.read_file(owner, repo, p, at).await {
+                texts.push((p.clone(), t));
+            }
+        }
+        facts.others = data_rules::other_selections(&facts.selections, &texts);
+    }
+    facts
 }
 
 /// The team's test address for the repository (staging or a preview with
@@ -886,6 +953,21 @@ pub async fn gate(
         } else {
             Vec::new()
         };
+        // The data rules, for every ticket kind.
+        let data_items = {
+            let df = data_facts(w, &files, &tree).await;
+            if df.is_empty() {
+                Vec::new()
+            } else {
+                let text = format!(
+                    "{}\n{}\n{}\n{}",
+                    w.plan.proposal, w.plan.design, w.plan.tasks, evidence.notes
+                );
+                data_rules::items(&df, &text)
+            }
+        };
+        let static_items: Vec<checklist::Item> =
+            static_items.into_iter().chain(data_items).collect();
         let static_fails = checklist::failing(&static_items);
         // The sandbox runs once the cheap problems are settled.
         let (sandbox, sandbox_failed) = if feature
@@ -1010,7 +1092,12 @@ pub async fn gate(
                 feedback.push_str(&format!("- {}\n", d.line()));
             }
         }
-        feedback.push_str(&checklist::feedback(&static_items));
+        let (data_part, feature_part): (Vec<checklist::Item>, Vec<checklist::Item>) = static_items
+            .iter()
+            .cloned()
+            .partition(data_rules::is_data_item);
+        feedback.push_str(&checklist::feedback(&feature_part));
+        feedback.push_str(&data_rules::feedback(&data_part));
         if !sandbox_failed.is_empty() {
             feedback.push_str("\nThe verification checks fail:\n");
             for f in &sandbox_failed {

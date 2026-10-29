@@ -1314,9 +1314,19 @@ fn evidence_instructions(evidence: &str) -> String {
          and the few examples named above. Take these only from the lookups and notes above, \
          never from guesses. Never write that something was not verified, not measured or \
          unconfirmed when the lookups above answer it; when the notes say no connected source \
-         could answer something, say which source is missing.\n"
+         could answer something, say which source is missing.\n{REAL_DATA}"
     )
 }
+
+/// What the writer is told about the change shown on real data (see
+/// `feature::data_rules`).
+const REAL_DATA: &str = "When the notes have a `Before and after:` list, add **Before and after \
+     on real data** to the Verification section, before the Evidence list: one line per record \
+     from that list (the records the ticket names, then the edge cases such as ties and nulls), \
+     each with its id, what it was before, what it is after and which result it ends with, \
+     exactly as the notes and lookups give them. When the notes say no data source could reach \
+     the data, write exactly that there, naming the missing source. Never invent a record or a \
+     value.\n";
 
 fn format_diff_summary(diff: &serde_json::Value) -> String {
     let files = match diff.get("files").and_then(|v| v.as_array()) {
@@ -1933,6 +1943,16 @@ mod refresh_tests {
         // The reviewer reads these markers back: an `Unconfirmed:` line holds
         // its approval.
         assert!(block.contains("`- Confirmed:`") && block.contains("`- Unconfirmed:`"));
+    }
+
+    #[test]
+    fn the_writer_shows_the_change_on_real_data() {
+        let block = evidence_instructions(
+            "The coder's notes:\nBefore and after:\n- item 41 (tie): before child 7, after child 7",
+        );
+        assert!(block.contains("**Before and after on real data**"));
+        assert!(block.contains("which result it ends with"));
+        assert!(block.contains("no data source could reach"));
     }
 
     #[test]
