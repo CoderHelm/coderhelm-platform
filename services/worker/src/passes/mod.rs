@@ -814,6 +814,8 @@ mod log_fix_checks;
 #[cfg(test)]
 mod log_fix_eval;
 pub mod model_check;
+#[cfg(test)]
+mod model_route_eval;
 pub mod onboard;
 pub mod open_pr_choice;
 pub mod ops_tools;

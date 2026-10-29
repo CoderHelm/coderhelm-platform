@@ -1,0 +1,14 @@
+{
+  "name": "clean_rename_helper",
+  "about": "clean: refactor",
+  "title": "Rename fmt_money to format_money",
+  "body": "Naming cleanup; no behaviour change. Every caller is updated (two of them).",
+  "diff": "\n### billing/money.py (modified, +1/-1)\n@@ -1,4 +1,4 @@\n-def fmt_money(cents: int, currency: str = \"USD\") -> str:\n+def format_money(cents: int, currency: str = \"USD\") -> str:\n     sign = \"-\" if cents < 0 else \"\"\n     cents = abs(cents)\n     return f\"{sign}{currency} {cents // 100}.{cents % 100:02d}\"\n\n### billing/invoice.py (modified, +2/-2)\n@@ -1,5 +1,5 @@\n-from .money import fmt_money\n+from .money import format_money\n \n \n def invoice_line(name: str, cents: int) -> str:\n-    return f\"{name:<30}{fmt_money(cents):>14}\"\n+    return f\"{name:<30}{format_money(cents):>14}\"\n\n### billing/receipt.py (modified, +2/-2)\n@@ -1,5 +1,5 @@\n-from .money import fmt_money\n+from .money import format_money\n \n \n def receipt_total(cents: int, currency: str) -> str:\n-    return \"Total: \" + fmt_money(cents, currency)\n+    return \"Total: \" + format_money(cents, currency)\n",
+  "files": {
+    "billing/money.py": "def format_money(cents: int, currency: str = \"USD\") -> str:\n    sign = \"-\" if cents < 0 else \"\"\n    cents = abs(cents)\n    return f\"{sign}{currency} {cents // 100}.{cents % 100:02d}\"\n",
+    "billing/invoice.py": "from .money import format_money\n\n\ndef invoice_line(name: str, cents: int) -> str:\n    return f\"{name:<30}{format_money(cents):>14}\"\n",
+    "billing/receipt.py": "from .money import format_money\n\n\ndef receipt_total(cents: int, currency: str) -> str:\n    return \"Total: \" + format_money(cents, currency)\n"
+  },
+  "defects": [],
+  "expect_blocking": false
+}

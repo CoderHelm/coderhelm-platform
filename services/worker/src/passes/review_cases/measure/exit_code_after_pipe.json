@@ -1,0 +1,18 @@
+{
+  "name": "exit_code_after_pipe",
+  "about": "misread exit code",
+  "title": "Keep the test log in CI",
+  "body": "Tees the test output to build/logs/test.log so the CI artifact has it.",
+  "diff": "\n### ci/publish.sh (modified, +3/-2)\n@@ -1,9 +1,10 @@\n #!/usr/bin/env bash\n set -u\n \n-./gradlew test\n+mkdir -p build/logs\n+./gradlew test 2>&1 | tee build/logs/test.log\n if [ $? -ne 0 ]; then\n-  echo \"tests failed\" >&2\n+  echo \"tests failed, see build/logs/test.log\" >&2\n   exit 1\n fi\n ./gradlew publish\n",
+  "files": {
+    "ci/publish.sh": "#!/usr/bin/env bash\nset -u\n\nmkdir -p build/logs\n./gradlew test 2>&1 | tee build/logs/test.log\nif [ $? -ne 0 ]; then\n  echo \"tests failed, see build/logs/test.log\" >&2\n  exit 1\nfi\n./gradlew publish\n"
+  },
+  "defects": [
+    {
+      "file": "ci/publish.sh",
+      "line": 5,
+      "what": "without pipefail, $? is tee's status, so failing tests no longer stop the publish"
+    }
+  ],
+  "expect_blocking": true
+}

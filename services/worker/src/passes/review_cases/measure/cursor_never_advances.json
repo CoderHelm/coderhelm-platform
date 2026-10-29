@@ -1,0 +1,18 @@
+{
+  "name": "cursor_never_advances",
+  "about": "frozen cursor",
+  "title": "Cap invoice paging at 500 pages",
+  "body": "Adds a page cap to the invoice fetch so a misbehaving API can't loop forever.",
+  "diff": "\n### billing/invoices.py (modified, +11/-5)\n@@ -3,16 +3,22 @@\n API = \"https://api.example.com/v2/invoices\"\n \n \n-def fetch_all(session: requests.Session, since: str):\n-    \"\"\"Every invoice created since `since`, following the API's cursor.\"\"\"\n+def fetch_all(session: requests.Session, since: str, max_pages: int = 500):\n+    \"\"\"Every invoice created since `since`, following the API's cursor.\n+\n+    Stops after `max_pages` pages so a misbehaving API can't loop forever.\n+    \"\"\"\n     out = []\n     params = {\"created_after\": since, \"limit\": 200}\n-    while True:\n+    cursor = None\n+    for _ in range(max_pages):\n+        if cursor:\n+            params[\"cursor\"] = cursor\n         resp = session.get(API, params=params, timeout=30)\n         resp.raise_for_status()\n         body = resp.json()\n         out.extend(body[\"data\"])\n-        if not body.get(\"next_cursor\"):\n+        next_cursor = body.get(\"next_cursor\")\n+        if not next_cursor:\n             break\n-        params[\"cursor\"] = body[\"next_cursor\"]\n     return out\n",
+  "files": {
+    "billing/invoices.py": "import requests\n\nAPI = \"https://api.example.com/v2/invoices\"\n\n\ndef fetch_all(session: requests.Session, since: str, max_pages: int = 500):\n    \"\"\"Every invoice created since `since`, following the API's cursor.\n\n    Stops after `max_pages` pages so a misbehaving API can't loop forever.\n    \"\"\"\n    out = []\n    params = {\"created_after\": since, \"limit\": 200}\n    cursor = None\n    for _ in range(max_pages):\n        if cursor:\n            params[\"cursor\"] = cursor\n        resp = session.get(API, params=params, timeout=30)\n        resp.raise_for_status()\n        body = resp.json()\n        out.extend(body[\"data\"])\n        next_cursor = body.get(\"next_cursor\")\n        if not next_cursor:\n            break\n    return out\n"
+  },
+  "defects": [
+    {
+      "file": "billing/invoices.py",
+      "line": 21,
+      "what": "next_cursor is read but never assigned to cursor, so every page re-fetches the first page; 500 copies of page one are returned"
+    }
+  ],
+  "expect_blocking": true
+}

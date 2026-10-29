@@ -1,0 +1,12 @@
+{
+  "name": "clean_withdraw_under_lock",
+  "about": "clean: concurrency done right",
+  "title": "Withdrawals from a wallet",
+  "body": "Adds Wallets.withdraw for the payout endpoint, which runs on the request threads. Check and debit happen under the same lock.",
+  "diff": "\n### payments/wallets.py (modified, +10/-0)\n@@ -15,3 +15,13 @@\n     def balance(self, wallet_id: str) -> int:\n         with self._lock:\n             return self._balances.get(wallet_id, 0)\n+\n+    def withdraw(self, wallet_id: str, cents: int) -> None:\n+        \"\"\"Take `cents` out; called from the request threads.\"\"\"\n+        if cents <= 0:\n+            raise ValueError(\"cents must be positive\")\n+        with self._lock:\n+            have = self._balances.get(wallet_id, 0)\n+            if have < cents:\n+                raise InsufficientFunds(wallet_id)\n+            self._balances[wallet_id] = have - cents\n",
+  "files": {
+    "payments/wallets.py": "import threading\n\nfrom .errors import InsufficientFunds\n\n\nclass Wallets:\n    def __init__(self):\n        self._balances: dict[str, int] = {}\n        self._lock = threading.Lock()\n\n    def deposit(self, wallet_id: str, cents: int) -> None:\n        with self._lock:\n            self._balances[wallet_id] = self._balances.get(wallet_id, 0) + cents\n\n    def balance(self, wallet_id: str) -> int:\n        with self._lock:\n            return self._balances.get(wallet_id, 0)\n\n    def withdraw(self, wallet_id: str, cents: int) -> None:\n        \"\"\"Take `cents` out; called from the request threads.\"\"\"\n        if cents <= 0:\n            raise ValueError(\"cents must be positive\")\n        with self._lock:\n            have = self._balances.get(wallet_id, 0)\n            if have < cents:\n                raise InsufficientFunds(wallet_id)\n            self._balances[wallet_id] = have - cents\n"
+  },
+  "defects": [],
+  "expect_blocking": false
+}

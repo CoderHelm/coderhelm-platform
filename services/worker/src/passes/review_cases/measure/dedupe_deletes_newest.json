@@ -1,0 +1,18 @@
+{
+  "name": "dedupe_deletes_newest",
+  "about": "data integrity",
+  "title": "Clean up duplicate contacts",
+  "body": "One-off job: the double-submit bug created duplicate contacts. For each email this keeps the most recently updated contact and deletes the rest.",
+  "diff": "\n### jobs/dedupe_contacts.py (added, +19/-0)\n@@ -0,0 +1,19 @@\n+\"\"\"Remove duplicate contacts created by the double-submit bug.\n+\n+For each email, keep the most recently updated contact and delete the rest.\n+\"\"\"\n+from .db import connect\n+\n+\n+def dedupe_contacts() -> int:\n+    with connect() as conn:\n+        cur = conn.execute(\n+            \"\"\"\n+            DELETE FROM contacts c\n+             USING contacts keep\n+             WHERE c.email = keep.email\n+               AND c.id <> keep.id\n+               AND c.updated_at > keep.updated_at\n+            \"\"\"\n+        )\n+        return cur.rowcount\n",
+  "files": {
+    "jobs/dedupe_contacts.py": "\"\"\"Remove duplicate contacts created by the double-submit bug.\n\nFor each email, keep the most recently updated contact and delete the rest.\n\"\"\"\nfrom .db import connect\n\n\ndef dedupe_contacts() -> int:\n    with connect() as conn:\n        cur = conn.execute(\n            \"\"\"\n            DELETE FROM contacts c\n             USING contacts keep\n             WHERE c.email = keep.email\n               AND c.id <> keep.id\n               AND c.updated_at > keep.updated_at\n            \"\"\"\n        )\n        return cur.rowcount\n"
+  },
+  "defects": [
+    {
+      "file": "jobs/dedupe_contacts.py",
+      "line": 16,
+      "what": "the comparison deletes rows NEWER than another row, keeping the oldest contact: the opposite of the stated intent, and the deleted data is gone"
+    }
+  ],
+  "expect_blocking": true
+}

@@ -657,15 +657,7 @@ pub async fn run(
     // regression canary shipped a file with zero run_checks calls). Cheap
     // insurance: one real build/type-check before finishing.
     if tools.iter().any(|t| t.name == "run_checks") {
-        full_system.push_str(
-            "\n\n## Verify before finishing (required)\nA `run_checks` tool is available that \
-             runs this repository's REAL build, type-check, and the unit tests affected by your \
-             changes against your committed code. Before you finish — even for a small, \
-             seemingly-obvious change — call `run_checks` and confirm it passes. Do NOT finish on \
-             a failure: read the real errors it returns and fix the root cause (a failing test you \
-             wrote or changed counts — fix the test or the code it exercises, never delete or skip \
-             it), then run it again.",
-        );
+        full_system.push_str(VERIFY_NOTE);
     }
 
     let tasks_key = format!(
@@ -1096,24 +1088,34 @@ pub(crate) fn reached_deadline(
 }
 
 /// The parts of the coder's task prompt.
-struct TaskPrompt<'a> {
-    simple: bool,
-    number: u64,
-    title: &'a str,
-    design: &'a str,
-    continuation: &'a str,
-    openspec: &'a str,
-    files_hint: &'a str,
-    feedback: &'a str,
-    issue: &'a str,
+pub(super) struct TaskPrompt<'a> {
+    pub(super) simple: bool,
+    pub(super) number: u64,
+    pub(super) title: &'a str,
+    pub(super) design: &'a str,
+    pub(super) continuation: &'a str,
+    pub(super) openspec: &'a str,
+    pub(super) files_hint: &'a str,
+    pub(super) feedback: &'a str,
+    pub(super) issue: &'a str,
     /// How this run's commit subjects read, with its real ticket key.
-    commit: &'a str,
+    pub(super) commit: &'a str,
 }
+
+/// The coder's note when the sandbox can run the repository's checks.
+pub(super) const VERIFY_NOTE: &str =
+    "\n\n## Verify before finishing (required)\nA `run_checks` tool is available that \
+     runs this repository's REAL build, type-check, and the unit tests affected by your \
+     changes against your committed code. Before you finish — even for a small, \
+     seemingly-obvious change — call `run_checks` and confirm it passes. Do NOT finish on \
+     a failure: read the real errors it returns and fix the root cause (a failing test you \
+     wrote or changed counts — fix the test or the code it exercises, never delete or skip \
+     it), then run it again.";
 
 /// The coder's system prompt, the same for every task prompt (simple or
 /// not) and every round of the run, so it stays cached: the rules and repo
 /// instruction files, the team's instructions, then the test rule.
-fn coder_system(
+pub(super) fn coder_system(
     owner: &str,
     repo: &str,
     repo_context: &str,
@@ -1130,7 +1132,7 @@ fn coder_system(
 /// The coder's task prompt. Every change, simple or not, carries the rules
 /// for proving what it rests on and ends with an `Evidence:` section, which
 /// the check before the PR judges and the PR description reports.
-fn task_prompt(p: &TaskPrompt) -> String {
+pub(super) fn task_prompt(p: &TaskPrompt) -> String {
     if p.simple {
         format!(
             r#"Implement for issue #{number}: {title}

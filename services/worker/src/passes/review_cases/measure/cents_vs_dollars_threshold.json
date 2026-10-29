@@ -1,0 +1,18 @@
+{
+  "name": "cents_vs_dollars_threshold",
+  "about": "data integrity",
+  "title": "Free shipping over $50",
+  "body": "Non-members now ship free when the cart is $50 or more.",
+  "diff": "\n### shop/shipping.py (modified, +6/-1)\n@@ -1,4 +1,6 @@\n from dataclasses import dataclass\n+\n+FREE_SHIPPING_OVER_DOLLARS = 50\n \n \n @dataclass\n@@ -8,4 +10,7 @@\n \n \n def shipping_cents(cart: Cart) -> int:\n-    return 0 if cart.member else 599\n+    \"\"\"Members ship free; everyone else ships free over $50.\"\"\"\n+    if cart.member or cart.subtotal_cents >= FREE_SHIPPING_OVER_DOLLARS:\n+        return 0\n+    return 599\n",
+  "files": {
+    "shop/shipping.py": "from dataclasses import dataclass\n\nFREE_SHIPPING_OVER_DOLLARS = 50\n\n\n@dataclass\nclass Cart:\n    subtotal_cents: int\n    member: bool\n\n\ndef shipping_cents(cart: Cart) -> int:\n    \"\"\"Members ship free; everyone else ships free over $50.\"\"\"\n    if cart.member or cart.subtotal_cents >= FREE_SHIPPING_OVER_DOLLARS:\n        return 0\n    return 599\n"
+  },
+  "defects": [
+    {
+      "file": "shop/shipping.py",
+      "line": 14,
+      "what": "subtotal is in cents and the threshold in dollars: every cart over 50 cents ships free"
+    }
+  ],
+  "expect_blocking": true
+}

@@ -1,0 +1,19 @@
+{
+  "name": "frozen_watermark_on_upsert",
+  "about": "frozen watermark column",
+  "title": "Keep each customer's first-seen time on re-sync",
+  "body": "The audit view should show when we first saw a customer. Re-syncing a customer overwrote updated_at, so this keeps the existing value on conflict.",
+  "diff": "\n### crm/sync.py (modified, +3/-1)\n@@ -14,7 +14,9 @@\n            SET name = EXCLUDED.name,\n                email = EXCLUDED.email,\n                tier = EXCLUDED.tier,\n-               updated_at = EXCLUDED.updated_at\n+               -- keep the original timestamp so the audit view shows when the\n+               -- customer was first seen\n+               updated_at = customers.updated_at\n         \"\"\",\n         {**row, \"now\": now},\n     )\n",
+  "files": {
+    "crm/sync.py": "import datetime\n\nfrom .db import connect\n\n\ndef upsert_customer(conn, row):\n    \"\"\"Insert or update one customer from the CRM feed.\"\"\"\n    now = datetime.datetime.now(datetime.timezone.utc)\n    conn.execute(\n        \"\"\"\n        INSERT INTO customers (id, name, email, tier, updated_at)\n        VALUES (%(id)s, %(name)s, %(email)s, %(tier)s, %(now)s)\n        ON CONFLICT (id) DO UPDATE\n           SET name = EXCLUDED.name,\n               email = EXCLUDED.email,\n               tier = EXCLUDED.tier,\n               -- keep the original timestamp so the audit view shows when the\n               -- customer was first seen\n               updated_at = customers.updated_at\n        \"\"\",\n        {**row, \"now\": now},\n    )\n\n\ndef sync(feed):\n    with connect() as conn:\n        for row in feed:\n            upsert_customer(conn, row)\n",
+    "crm/export.py": "from .db import connect\n\n\ndef changed_since(watermark):\n    \"\"\"Customers changed after the last export's watermark (incremental export).\"\"\"\n    with connect() as conn:\n        return conn.execute(\n            \"SELECT id, name, email, tier, updated_at FROM customers \"\n            \"WHERE updated_at > %(w)s ORDER BY updated_at, id\",\n            {\"w\": watermark},\n        ).fetchall()\n"
+  },
+  "defects": [
+    {
+      "file": "crm/sync.py",
+      "line": 19,
+      "what": "updated_at no longer moves on update, so the incremental export (WHERE updated_at > watermark) never sees changed customers"
+    }
+  ],
+  "expect_blocking": true
+}

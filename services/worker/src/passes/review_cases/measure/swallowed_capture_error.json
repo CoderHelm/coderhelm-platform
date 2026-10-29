@@ -1,0 +1,18 @@
+{
+  "name": "swallowed_capture_error",
+  "about": "error handling",
+  "title": "Don't fail the settle batch on a gateway timeout",
+  "body": "One gateway timeout failed the whole nightly settle batch. This catches capture errors so the rest of the batch goes on.",
+  "diff": "\n### orders/settle.py (modified, +5/-1)\n@@ -8,6 +8,10 @@\n \n def settle(order: Order) -> None:\n     \"\"\"Capture the payment for an order and mark it paid.\"\"\"\n-    capture(order.payment_id, order.total_cents)\n+    try:\n+        capture(order.payment_id, order.total_cents)\n+    except Exception:\n+        # The gateway times out now and then; don't fail the whole batch.\n+        log.warning(\"capture failed for order %s\", order.id)\n     order.status = \"paid\"\n     order.save()\n",
+  "files": {
+    "orders/settle.py": "import logging\n\nfrom .gateway import capture\nfrom .models import Order\n\nlog = logging.getLogger(__name__)\n\n\ndef settle(order: Order) -> None:\n    \"\"\"Capture the payment for an order and mark it paid.\"\"\"\n    try:\n        capture(order.payment_id, order.total_cents)\n    except Exception:\n        # The gateway times out now and then; don't fail the whole batch.\n        log.warning(\"capture failed for order %s\", order.id)\n    order.status = \"paid\"\n    order.save()\n"
+  },
+  "defects": [
+    {
+      "file": "orders/settle.py",
+      "line": 15,
+      "what": "after a failed capture the order is still marked paid: goods ship without payment"
+    }
+  ],
+  "expect_blocking": true
+}

@@ -1,0 +1,18 @@
+{
+  "name": "webhook_signature_bypass",
+  "about": "security",
+  "title": "Accept the partner's test webhooks",
+  "body": "The partner dashboard's 'send test event' button sends unsigned events, which we rejected with 401.",
+  "diff": "\n### hooks/partner.py (modified, +6/-4)\n@@ -11,7 +11,9 @@\n \n \n def handle(body: bytes, signature: str, apply) -> int:\n-    if not verify(body, signature):\n-        return 401\n-    apply(json.loads(body))\n-    return 200\n+    event = json.loads(body)\n+    # Test events from the partner dashboard are unsigned; let them through.\n+    if event.get(\"test\") or verify(body, signature):\n+        apply(event)\n+        return 200\n+    return 401\n",
+  "files": {
+    "hooks/partner.py": "import hashlib\nimport hmac\nimport json\n\nfrom .settings import WEBHOOK_SECRET\n\n\ndef verify(body: bytes, signature: str) -> bool:\n    expected = hmac.new(WEBHOOK_SECRET, body, hashlib.sha256).hexdigest()\n    return hmac.compare_digest(expected, signature)\n\n\ndef handle(body: bytes, signature: str, apply) -> int:\n    event = json.loads(body)\n    # Test events from the partner dashboard are unsigned; let them through.\n    if event.get(\"test\") or verify(body, signature):\n        apply(event)\n        return 200\n    return 401\n"
+  },
+  "defects": [
+    {
+      "file": "hooks/partner.py",
+      "line": 16,
+      "what": "anyone can skip the signature check by adding \"test\": true to the body, and the event is applied like a real one"
+    }
+  ],
+  "expect_blocking": true
+}

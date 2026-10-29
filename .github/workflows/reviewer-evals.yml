@@ -29,6 +29,39 @@ on:
         options:
           - us.anthropic.claude-opus-5-5
           - us.anthropic.claude-sonnet-5-5
+      critic_model:
+        description: >-
+          The model the review critic runs on (it decides which findings are
+          kept, and so what blocks). same: the review model.
+        type: choice
+        default: same
+        options:
+          - same
+          - us.anthropic.claude-opus-5-5
+          - us.anthropic.claude-sonnet-5-5
+      suite:
+        description: >-
+          nightly: the recorded cases (as the schedule runs them).
+          route-review: the synthetic review measurement (review_cases/measure).
+          route-implement: the synthetic implement measurement
+          (model_route_cases/implement), on implement_model.
+        type: choice
+        default: nightly
+        options:
+          - nightly
+          - route-review
+          - route-implement
+      implement_model:
+        description: The model the coder runs on (route-implement only).
+        type: choice
+        default: us.anthropic.claude-opus-5-5
+        options:
+          - us.anthropic.claude-opus-5-5
+          - us.anthropic.claude-sonnet-5-5
+      repeat:
+        description: How many times each measurement runs (route suites; 1 to 5).
+        type: string
+        default: "1"
 
 permissions:
   contents: read
@@ -66,10 +99,28 @@ jobs:
           # (infra/lib/worker-stack.ts evalReviewModel), unless a manual run
           # picked another (the nightly run has no inputs).
           EVAL_REVIEW_MODEL: ${{ inputs.review_model || 'us.anthropic.claude-opus-5-5' }}
-        run: cargo test -p worker review_eval -- --ignored --nocapture 2>&1 | tee eval.log
+          EVAL_CRITIC_MODEL: ${{ (inputs.critic_model != '' && inputs.critic_model != 'same') && inputs.critic_model || inputs.review_model || 'us.anthropic.claude-opus-5-5' }}
+          EVAL_IMPLEMENT_MODEL: ${{ inputs.implement_model || 'us.anthropic.claude-opus-5-5' }}
+          EVAL_REPEAT: ${{ inputs.repeat || '1' }}
+          SUITE: ${{ inputs.suite || 'nightly' }}
+        run: |
+          case "$SUITE" in
+            route-review) filter=model_route_eval::route_review_live ;;
+            route-implement) filter=model_route_eval::route_implement_live ;;
+            *) filter=review_eval ;;
+          esac
+          cargo test -p worker "$filter" -- --ignored --nocapture 2>&1 | tee eval.log
         shell: bash -o pipefail {0}
+      - name: Measurement summary
+        if: always() && inputs.suite != '' && inputs.suite != 'nightly'
+        run: grep -h '^ROUTE_EVAL' eval.log > route-eval.jsonl || true
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: always() && inputs.suite != '' && inputs.suite != 'nightly'
+        with:
+          name: route-eval-${{ github.run_id }}
+          path: services/route-eval.jsonl
       - name: Open an issue on failure
-        if: failure()
+        if: failure() && (github.event_name == 'schedule' || inputs.suite == 'nightly')
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
