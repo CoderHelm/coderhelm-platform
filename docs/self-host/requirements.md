@@ -20,7 +20,7 @@ You do not need Rust, Docker or the CDK CLI: the release ships built code, and t
 
 ## In AWS
 
-- **An account you can administer.** CDK bootstrap and the first deploy create IAM roles, so use administrator credentials (an SSO admin role is fine). Later deploys can use a narrower role.
+- **An account you can administer.** The first install creates IAM roles, so use administrator credentials (an SSO admin role is fine). With the Launch Stack, CoderHelm then keeps nothing broader than its own permissions boundary: [What the installer can do in your account](./security.md#what-the-installer-can-do-in-your-account).
 - **A region with Lambda on ARM64, Cognito, SES and Bedrock** (if you use Bedrock). All commercial regions with Bedrock work.
 - **Service quotas:** the defaults are enough. The worker uses up to 10 concurrent Lambda executions for tickets and 5 each for CI fixes and feedback.
 - **SES production access** to email people outside your verified addresses. New accounts start in the SES sandbox. See [Email](./email.md).

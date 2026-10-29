@@ -28,11 +28,14 @@ import * as targets from "aws-cdk-lib/aws-events-targets";
 import * as iam from "aws-cdk-lib/aws-iam";
 import * as lambda from "aws-cdk-lib/aws-lambda";
 import * as logs from "aws-cdk-lib/aws-logs";
+import * as ssm from "aws-cdk-lib/aws-ssm";
+import * as crypto from "crypto";
 import { Construct } from "constructs";
 import { ResolvedConfig } from "./config";
 import { repoPath } from "./paths";
 import { hybridUrlEnvironment } from "./service-env";
 import { releaseStamp, stampEnvironment } from "./release";
+import { WINDOW_MINUTES, WINDOW_POLICY_NAME, windowPolicyParts } from "./access";
 import { CHECK_VERSION, CURL, installCosignCommands, RELEASE_BASE, RELEASE_REPO, VERIFY_SUMS, verifyTagCommands } from "./release-verify";
 
 /** The functions that read the install's secret once, at start. */
@@ -94,8 +97,49 @@ export function releaseCheckBuildSpec(cfg: ResolvedConfig): codebuild.BuildSpec 
   });
 }
 
+/**
+ * A hardened install's update build asks the updater for its deploy window
+ * (lambda/updater/handler.py, open_window): the updater checks this is the
+ * build it started, with this buildspec, then lets this build's own session
+ * deploy until it ends. The build waits until IAM shows the window.
+ */
+export function openWindowCommands(opener: string, assetsBucket: string): string[] {
+  return [
+    'WINDOW_USER_ID=$(aws sts get-caller-identity --query UserId --output text)',
+    `printf '{"action":"open_window","build_id":"%s","user_id":"%s","history_id":"%s"}' "$CODEBUILD_BUILD_ID" "$WINDOW_USER_ID" "\${HISTORY_ID:-}" > /tmp/window.json`,
+    `aws lambda invoke --function-name ${opener} --cli-binary-format raw-in-base64-out --payload file:///tmp/window.json /tmp/window-out.json > /dev/null`,
+    `node -e 'const r=require("/tmp/window-out.json");if(!r.ok){console.error("The deploy window was refused: "+(r.error||r.errorMessage||JSON.stringify(r)));process.exit(1)}console.log("Deploy window open until "+r.until)'`,
+    `for i in $(seq 1 30); do aws s3api head-bucket --bucket ${assetsBucket} > /dev/null 2>&1 && break; [ "$i" = 30 ] && { echo "The deploy window did not take effect in 2 minutes"; exit 1; }; sleep 4; done`,
+  ];
+}
+
+export function closeWindowCommand(role: string): string {
+  return `aws iam delete-role-policy --role-name ${role} --policy-name ${WINDOW_POLICY_NAME} > /dev/null 2>&1 || true`;
+}
+
+/** The buildspec as JSON with sorted keys: what the updater hashes (canonical_json in handler.py). */
+export function canonicalJson(v: unknown): string {
+  if (Array.isArray(v)) return `[${v.map(canonicalJson).join(",")}]`;
+  if (v && typeof v === "object") {
+    return `{${Object.keys(v as object).sort().map((k) => `${JSON.stringify(k)}:${canonicalJson((v as Record<string, unknown>)[k])}`).join(",")}}`;
+  }
+  return JSON.stringify(v);
+}
+
+export function buildSpecSha256(spec: object): string {
+  return crypto.createHash("sha256").update(canonicalJson(spec), "utf8").digest("hex");
+}
+
+/** The variables the updater may set on an update build (start_build, domain_build_env). */
+export const UPDATE_BUILD_VARIABLES = ["VERSION", "ACTOR", "MODE", "HISTORY_ID", "DOMAIN_ACTION", "DOMAIN_HOSTNAME", "DOMAIN_CERT", "DOMAIN_ZONE", "DOMAIN_ZONE_ID"];
+
 export function updateBuildSpec(cfg: ResolvedConfig): codebuild.BuildSpec {
-  return codebuild.BuildSpec.fromObject({
+  return codebuild.BuildSpec.fromObject(updateBuildSpecObject(cfg));
+}
+
+/** The update build's script as a plain object (what CodeBuild stores, and what the updater checks). */
+export function updateBuildSpecObject(cfg: ResolvedConfig): Record<string, unknown> {
+  return {
     version: "0.2",
     env: { shell: "bash" },
     phases: {
@@ -124,6 +168,8 @@ export function updateBuildSpec(cfg: ResolvedConfig): codebuild.BuildSpec {
           // The installer then checks every other file of the release the same way,
           // and refuses an older release unless it is a rollback to one this install ran.
           "npm install -g --ignore-scripts ./coderhelm-selfhost.tgz",
+          // A hardened install: deploy rights only now, for this build.
+          ...(cfg.access ? openWindowCommands(`${cfg.prefix}-updater`, cfg.access.assetsBucket) : []),
           `coderhelm-selfhost pull --stage ${cfg.stage} --region "$AWS_REGION"${cfg.raw.resourcePrefix ? ` --resource-prefix ${cfg.raw.resourcePrefix}` : ""}`,
           'EXTRA=""; if [ "$MODE" = "rollback" ]; then EXTRA="--rollback"; fi',
           // A domain change (MODE=domain) redeploys the release that runs,
@@ -135,6 +181,8 @@ export function updateBuildSpec(cfg: ResolvedConfig): codebuild.BuildSpec {
       },
       post_build: {
         commands: [
+          // The window closes with the build (the updater closes it too).
+          ...(cfg.access ? [closeWindowCommand(`${cfg.prefix}-update-build`)] : []),
           // Tell the updater how it went (also when the build failed early).
           'if [ ! -s /tmp/result.json ]; then echo "{\\"status\\":\\"failed\\",\\"reason\\":\\"the update build stopped before deploying: see its log\\"}" > /tmp/result.json; fi',
           'node -e \'const r=require("/tmp/result.json");process.stdout.write(JSON.stringify({action:"finished",history_id:process.env.HISTORY_ID,status:r.status,reason:r.reason,version:process.env.VERSION}))\' > /tmp/payload.json',
@@ -142,7 +190,7 @@ export function updateBuildSpec(cfg: ResolvedConfig): codebuild.BuildSpec {
         ],
       },
     },
-  });
+  };
 }
 
 export class UpdatesStack extends cdk.Stack {
@@ -162,59 +210,75 @@ export class UpdatesStack extends cdk.Stack {
       description: "CoderHelm update build: deploys a release through the CDK bootstrap roles, checks health",
       assumedBy: new iam.ServicePrincipal("codebuild.amazonaws.com"),
     });
-    buildRole.addToPolicy(new iam.PolicyStatement({
-      sid: "DeployThroughCdkBootstrapRoles",
-      actions: ["sts:AssumeRole"],
-      resources: [`arn:aws:iam::${this.account}:role/cdk-*`],
-    }));
-    buildRole.addToPolicy(new iam.PolicyStatement({
-      sid: "ReadInstallState",
-      actions: ["ssm:GetParameter", "ssm:PutParameter"],
-      resources: [`arn:aws:ssm:${this.region}:${this.account}:parameter/${prefix}/installer/*`],
-    }));
-    buildRole.addToPolicy(new iam.PolicyStatement({
-      sid: "CdkBootstrapVersion",
-      actions: ["ssm:GetParameter"],
-      resources: [`arn:aws:ssm:*:${this.account}:parameter/cdk-bootstrap/*`],
-    }));
-    buildRole.addToPolicy(new iam.PolicyStatement({
-      sid: "HealthCheck",
-      actions: [
-        "cloudformation:ListStacks",
-        "cloudformation:DescribeStacks",
-        "sts:GetCallerIdentity",
-        "ses:GetAccount",
-      ],
-      resources: ["*"],
-    }));
-    buildRole.addToPolicy(new iam.PolicyStatement({
-      sid: "HealthCheckResources",
-      actions: ["lambda:GetFunctionConfiguration", "sqs:GetQueueUrl", "sqs:GetQueueAttributes", "secretsmanager:GetSecretValue"],
-      resources: [
-        `arn:aws:lambda:${this.region}:${this.account}:function:${prefix}-*`,
-        `arn:aws:sqs:${this.region}:${this.account}:${prefix}-*`,
-        `arn:aws:secretsmanager:${this.region}:${this.account}:secret:${cfg.secretName}-??????`,
-      ],
-    }));
-    // The installer's model check before it deploys (installer/lib/commands.mjs,
-    // updateModelCheck): the worker makes the test calls; the build only asks,
-    // and reads which team's key passed the last switch to Anthropic keys.
-    buildRole.addToPolicy(new iam.PolicyStatement({
-      sid: "InstallerModelCheck",
-      actions: ["lambda:InvokeFunction"],
-      resources: [`arn:aws:lambda:${this.region}:${this.account}:function:${prefix}-worker`],
-    }));
-    buildRole.addToPolicy(new iam.PolicyStatement({
-      sid: "ModelCheckSetting",
-      actions: ["dynamodb:GetItem"],
-      resources: [props.settingsTable.tableArn],
-      conditions: { "ForAllValues:StringEquals": { "dynamodb:LeadingKeys": ["SYSTEM"] } },
-    }));
-    buildRole.addToPolicy(new iam.PolicyStatement({
-      sid: "ReportResult",
-      actions: ["lambda:InvokeFunction"],
-      resources: [`arn:aws:lambda:${this.region}:${this.account}:function:${prefix}-updater`],
-    }));
+    if (cfg.access) {
+      // Hardened: between runs this role can only ask for its window and
+      // report; the window (written by the updater, bound to one build)
+      // holds everything else (infra/lib/access.ts, windowPolicy).
+      buildRole.addToPolicy(new iam.PolicyStatement({
+        sid: "AskForWindowAndReport",
+        actions: ["lambda:InvokeFunction"],
+        resources: [`arn:aws:lambda:${this.region}:${this.account}:function:${prefix}-updater`],
+      }));
+      buildRole.addToPolicy(new iam.PolicyStatement({
+        sid: "CloseOwnWindow",
+        actions: ["iam:DeleteRolePolicy"],
+        resources: [`arn:aws:iam::${this.account}:role/${prefix}-update-build`],
+      }));
+    } else {
+      buildRole.addToPolicy(new iam.PolicyStatement({
+        sid: "DeployThroughCdkBootstrapRoles",
+        actions: ["sts:AssumeRole"],
+        resources: [`arn:aws:iam::${this.account}:role/cdk-*`],
+      }));
+      buildRole.addToPolicy(new iam.PolicyStatement({
+        sid: "ReadInstallState",
+        actions: ["ssm:GetParameter", "ssm:PutParameter"],
+        resources: [`arn:aws:ssm:${this.region}:${this.account}:parameter/${prefix}/installer/*`],
+      }));
+      buildRole.addToPolicy(new iam.PolicyStatement({
+        sid: "CdkBootstrapVersion",
+        actions: ["ssm:GetParameter"],
+        resources: [`arn:aws:ssm:*:${this.account}:parameter/cdk-bootstrap/*`],
+      }));
+      buildRole.addToPolicy(new iam.PolicyStatement({
+        sid: "HealthCheck",
+        actions: [
+          "cloudformation:ListStacks",
+          "cloudformation:DescribeStacks",
+          "sts:GetCallerIdentity",
+          "ses:GetAccount",
+        ],
+        resources: ["*"],
+      }));
+      buildRole.addToPolicy(new iam.PolicyStatement({
+        sid: "HealthCheckResources",
+        actions: ["lambda:GetFunctionConfiguration", "sqs:GetQueueUrl", "sqs:GetQueueAttributes", "secretsmanager:GetSecretValue"],
+        resources: [
+          `arn:aws:lambda:${this.region}:${this.account}:function:${prefix}-*`,
+          `arn:aws:sqs:${this.region}:${this.account}:${prefix}-*`,
+          `arn:aws:secretsmanager:${this.region}:${this.account}:secret:${cfg.secretName}-??????`,
+        ],
+      }));
+      // The installer's model check before it deploys (installer/lib/commands.mjs,
+      // updateModelCheck): the worker makes the test calls; the build only asks,
+      // and reads which team's key passed the last switch to Anthropic keys.
+      buildRole.addToPolicy(new iam.PolicyStatement({
+        sid: "InstallerModelCheck",
+        actions: ["lambda:InvokeFunction"],
+        resources: [`arn:aws:lambda:${this.region}:${this.account}:function:${prefix}-worker`],
+      }));
+      buildRole.addToPolicy(new iam.PolicyStatement({
+        sid: "ModelCheckSetting",
+        actions: ["dynamodb:GetItem"],
+        resources: [props.settingsTable.tableArn],
+        conditions: { "ForAllValues:StringEquals": { "dynamodb:LeadingKeys": ["SYSTEM"] } },
+      }));
+      buildRole.addToPolicy(new iam.PolicyStatement({
+        sid: "ReportResult",
+        actions: ["lambda:InvokeFunction"],
+        resources: [`arn:aws:lambda:${this.region}:${this.account}:function:${prefix}-updater`],
+      }));
+    }
 
     const buildLogs = new logs.LogGroup(this, "UpdateBuildLogs", {
       logGroupName: `/aws/codebuild/${prefix}-update`,
@@ -321,6 +385,21 @@ export class UpdatesStack extends cdk.Stack {
         // off, a non-default URL, or nothing (the default).
         ...hybridUrlEnvironment(cfg),
         ...(cfg.updates.webhookUrl ? { UPDATE_WEBHOOK_URL: cfg.updates.webhookUrl } : {}),
+        ...(cfg.access
+          ? {
+              // The deploy window this updater opens (open_window): the role,
+              // the buildspec it must see, and where the policy is.
+              DEPLOY_WINDOW: JSON.stringify({
+                role: `${prefix}-update-build`,
+                buildspec: buildSpecSha256(updateBuildSpecObject(cfg)),
+                image: codebuild.LinuxBuildImage.STANDARD_7_0.imageId,
+                variables: UPDATE_BUILD_VARIABLES,
+                param: `/${prefix}/access/window-policy`,
+                parts: windowPolicyParts(cfg.access).length,
+                minutes: WINDOW_MINUTES,
+              }),
+            }
+          : {}),
         ...stampEnvironment(stamp),
       },
     });
@@ -391,6 +470,32 @@ export class UpdatesStack extends cdk.Stack {
       actions: ["ssm:GetParameter"],
       resources: [`arn:aws:ssm:${this.region}:${this.account}:parameter${cfg.distributionDomainParameter}`],
     }));
+
+    if (cfg.access) {
+      // The window's statements, in parts that fit standard parameters.
+      const parts = windowPolicyParts(cfg.access).map((value, i) => new ssm.StringParameter(this, `WindowPolicy${i + 1}`, {
+        parameterName: `/${prefix}/access/window-policy/${i + 1}`,
+        description: "CoderHelm: the deploy window an update build gets while it runs (infra/lib/access.ts)",
+        stringValue: value,
+      }));
+      this.updaterFunction.addToRolePolicy(new iam.PolicyStatement({
+        sid: "OpenAndCloseDeployWindow",
+        actions: ["iam:PutRolePolicy", "iam:DeleteRolePolicy"],
+        resources: [buildRole.roleArn],
+        conditions: { StringEquals: { "iam:PermissionsBoundary": cfg.access.boundaryArn } },
+      }));
+      this.updaterFunction.addToRolePolicy(new iam.PolicyStatement({
+        sid: "ReadBuildRole",
+        actions: ["iam:GetRole", "iam:GetRolePolicy"],
+        resources: [buildRole.roleArn],
+      }));
+      this.updaterFunction.addToRolePolicy(new iam.PolicyStatement({
+        sid: "CheckTheBuild",
+        actions: ["codebuild:BatchGetBuilds"],
+        resources: [this.project.projectArn],
+      }));
+      for (const part of parts) part.grantRead(this.updaterFunction);
+    }
 
     new events.Rule(this, "DomainCheck", {
       ruleName: `${prefix}-domain-check`,

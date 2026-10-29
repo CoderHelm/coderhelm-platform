@@ -26,6 +26,13 @@ Actions (the `action` field of the event):
             the build that puts the domain on CloudFront (mode "domain").
             Also every 5 minutes (EventBridge).
 - domain_remove  back to the AWS (CloudFront) address.
+- open_window  a hardened install's update build asks for its deploy window
+            (infra/lib/access.ts). Only for the build this updater started,
+            still running, with exactly the expected buildspec, image,
+            variables and role: then this build's own session (aws:userid)
+            may deploy through the install's deploy role until the window's
+            end time. Closed on finished, and on every tick when no update
+            runs. Installs without DEPLOY_WINDOW (not hardened) refuse it.
 - model_check  every model the next release calls gets one test call through
             the install's provider (Settings, System, Models), made by the
             worker with the install's own role or key. Also before every
@@ -62,6 +69,7 @@ import re
 import time
 import urllib.request
 import uuid
+import hashlib
 from datetime import datetime, timedelta, timezone
 
 logger = logging.getLogger()
@@ -982,6 +990,112 @@ def blocked_message(record):
     return f"Update to {record['version']} needs your action: {f.get('detail', 'a model was refused.')} {f.get('fix', '')}".strip()
 
 
+# ── The deploy window (hardened installs) ────────────────────────────────
+
+WINDOW_POLICY_NAME = "deploy-window"
+WINDOW_USER_ID = "__CODERHELM_USER_ID__"
+WINDOW_EXPIRES = "__CODERHELM_EXPIRES__"
+USER_ID_RE = re.compile(r"^(AROA[A-Z0-9]{8,}):([\w+=,.@-]{2,64})$")
+
+
+def window_config(env):
+    raw = env.get("DEPLOY_WINDOW") or ""
+    return json.loads(raw) if raw else None
+
+
+def canonical_json(value):
+    """Sorted keys, no spaces: equal to canonicalJson in infra/lib/updates-stack.ts."""
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+
+
+def buildspec_sha256(text):
+    try:
+        spec = json.loads(text or "")
+    except ValueError:
+        return None
+    return hashlib.sha256(canonical_json(spec).encode("utf-8")).hexdigest()
+
+
+def build_problems(build, cfg, env, account=None):
+    """Why a build may not get the deploy window (empty: it may)."""
+    p = []
+    if build.get("projectName") != env.get("UPDATE_PROJECT_NAME"):
+        p.append("it is not the update project's build")
+    if build.get("buildStatus") != "IN_PROGRESS":
+        p.append(f"it is {build.get('buildStatus')}, not running")
+    src = build.get("source") or {}
+    if src.get("type") != "NO_SOURCE" or build.get("secondarySources"):
+        p.append("its source was changed")
+    if buildspec_sha256(src.get("buildspec")) != cfg["buildspec"]:
+        p.append("its buildspec is not the one this release defines")
+    e = build.get("environment") or {}
+    if e.get("image") != cfg["image"] or e.get("type") != "LINUX_CONTAINER" or e.get("privilegedMode"):
+        p.append("its build image was changed")
+    allowed = set(cfg.get("variables") or [])
+    for v in e.get("environmentVariables") or []:
+        if v.get("name") not in allowed or v.get("type", "PLAINTEXT") != "PLAINTEXT":
+            p.append(f"it sets {v.get('name')}, which the update build doesn't take")
+    if not str(build.get("serviceRole") or "").endswith(f":role/{cfg['role']}"):
+        p.append("it runs as another role")
+    return p
+
+
+def window_document(env, cfg, user_id, until, ssm=None):
+    ssm = ssm or client("ssm")
+    statements = []
+    for i in range(1, int(cfg.get("parts") or 1) + 1):
+        part = ssm.get_parameter(Name=f"{cfg['param']}/{i}")["Parameter"]["Value"]
+        statements.extend(json.loads(part))
+    text = json.dumps({"Version": "2012-10-17", "Statement": statements}, separators=(",", ":"))
+    return text.replace(WINDOW_USER_ID, user_id).replace(WINDOW_EXPIRES, until)
+
+
+def open_window(store, env, now, event, cb=None, iam=None, ssm=None):
+    cfg = window_config(env)
+    if not cfg:
+        raise ValueError("this install has no deploy window (it isn't hardened)")
+    build_id = str(event.get("build_id") or "")
+    user_id = str(event.get("user_id") or "")
+    hid = event.get("history_id") or ""
+    entry = store.get(hid, {}) if hid else {}
+    if not entry or entry.get("build_id") != build_id or entry.get("status") != "running":
+        raise ValueError(f"build {build_id or '(none)'} is not an update this updater started and is running")
+    cb = cb or client("codebuild")
+    builds = cb.batch_get_builds(ids=[build_id]).get("builds") or []
+    if not builds:
+        raise ValueError(f"build {build_id} was not found")
+    problems = build_problems(builds[0], cfg, env)
+    if problems:
+        raise ValueError("the deploy window was refused: " + "; ".join(problems))
+    iam = iam or client("iam")
+    m = USER_ID_RE.match(user_id)
+    role_id = iam.get_role(RoleName=cfg["role"])["Role"]["RoleId"]
+    if not m or m.group(1) != role_id:
+        raise ValueError("the deploy window was refused: the caller is not the update build's role")
+    until = (now + timedelta(minutes=int(cfg.get("minutes") or 100))).strftime("%Y-%m-%dT%H:%M:%SZ")
+    iam.put_role_policy(RoleName=cfg["role"], PolicyName=WINDOW_POLICY_NAME,
+                        PolicyDocument=window_document(env, cfg, user_id, until, ssm))
+    entry["window_until"] = until
+    store.put(hid, entry)
+    logger.info(json.dumps({"window": "open", "build": build_id, "until": until}))
+    return {"window": "open", "until": until}
+
+
+def close_window(env, iam=None):
+    """Removes the window (nothing to do when there is none)."""
+    cfg = window_config(env)
+    if not cfg:
+        return False
+    iam = iam or client("iam")
+    try:
+        iam.delete_role_policy(RoleName=cfg["role"], PolicyName=WINDOW_POLICY_NAME)
+        return True
+    except Exception as e:  # NoSuchEntity: already closed
+        if "NoSuchEntity" not in type(e).__name__ + str(e):
+            logger.error("closing the deploy window failed: %s", e)
+        return False
+
+
 # ── Actions ───────────────────────────────────────────────────────────────
 
 def app_url(env):
@@ -1120,7 +1234,11 @@ def handle(event, env, store, now, fetch=fetch_releases, probe=None):
             raise ValueError(f"{target} is not a version this install ran before, so it can't be rolled back to")
         return begin(store, env, now, target, event.get("actor") or "unknown", "rollback")
 
+    if action == "open_window":
+        return open_window(store, env, now, event)
+
     if action == "finished":
+        close_window(env)
         hid = event.get("history_id") or state.get("running_id")
         entry = store.get(hid, {}) if hid else {}
         status = event.get("status") if event.get("status") in ("succeeded", "failed", "rolled_back") else "failed"
@@ -1167,6 +1285,9 @@ def handle(event, env, store, now, fetch=fetch_releases, probe=None):
         return domain_remove(store, env, now, event.get("actor") or "unknown")
 
     if action == "tick":
+        # No update running: no deploy window either.
+        if not running(state, now):
+            close_window(env)
         rel = releases_cached(store, repo, now.timestamp(), fetch)
         latest = pick_latest(rel, settings["channel"], current)
         mc = store.get("MODEL_CHECK")

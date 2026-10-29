@@ -102,7 +102,9 @@ What to do:
   Auto-update skips this release until an admin updates to it by hand.
 ```
 
-The job's role can only assume the CDK bootstrap roles (which do the deploying), read this install's stacks, functions, queues, secret and installer state, and report to the updater.
+On a hardened install (made with the Launch Stack, or hardened by an admin), the job's role holds no deploy rights until the updater gives this one build a deploy window. The window ends with the build, and the build deploys only through the install's own deploy role, within its permissions boundary ([what that means](./updates-security.md#what-an-update-may-do-in-your-account)). On an install from before, the job's role assumes the CDK bootstrap roles, which do the deploying, as it always has.
+
+Rolling back from a hardened install to a release from before hardening needs an admin ([why](./security.md#rolling-back-past-hardening)).
 
 ## Roll back
 

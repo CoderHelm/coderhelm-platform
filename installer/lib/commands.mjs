@@ -10,7 +10,7 @@ import { openBrowser } from "./github-app.mjs";
 import { ensureSecret, hasGithubApp, mergeSecret, readSecret } from "./secrets.mjs";
 import { runManifestFlow, secretKeysFromApp } from "./github-app.mjs";
 import { leaveHybrid } from "./hybrid.mjs";
-import { DEFAULT_TELEMETRY_ENDPOINT, derived, readJson, semverCompare, writeJson } from "./util.mjs";
+import { accessOf, DEFAULT_TELEMETRY_ENDPOINT, derived, readJson, semverCompare, writeJson } from "./util.mjs";
 
 export const STATE_DIR = ".coderhelm";
 
@@ -97,16 +97,44 @@ export async function resolveSource(ctx, version) {
   };
 }
 
-export async function cdk(ctx, src, args, extraEnv = {}) {
+/**
+ * Runs the CDK CLI on the release's app. A hardened install (config
+ * `access`) deploys and destroys through its own deploy role and never
+ * touches its access stack; anything else runs exactly as it always has.
+ * `opts.adminCredentials`: `access harden` deploys once with the admin's
+ * own credentials (no role), and its access stack only when asked.
+ */
+export async function cdk(ctx, src, args, extraEnv = {}, opts = {}) {
   const { runner, flags } = ctx;
+  const access = accessOf(safeConfig(flags));
+  let cmd = args;
+  if (access && ["deploy", "destroy"].includes(args[0]) && !opts.adminCredentials) cmd = [...args, "--role-arn", access.deployRoleArn];
   const env = {
     ...src.env,
     ...(src.dashboard ? { CODERHELM_DASHBOARD_DIR: src.dashboard } : {}),
     CODERHELM_CONFIG: configPath(flags),
+    ...(access ? { CODERHELM_ACCESS_STACK: opts.accessStack ? "include" : "skip" } : {}),
     ...extraEnv,
   };
-  return runner.run("npx", ["--yes", "cdk", ...args], { cwd: src.infra, env });
+  return runner.run("npx", ["--yes", "cdk", ...cmd], { cwd: src.infra, env });
 }
+
+function safeConfig(flags) {
+  try {
+    return loadConfig(flags);
+  } catch {
+    return null;
+  }
+}
+
+/** A release that knows hardened installs (its CDK app has infra/lib/access.ts). */
+export function releaseSupportsAccess(src, runner) {
+  if (runner?.dryRun || src.version === "source") return true;
+  return fs.existsSync(path.join(src.infra, "lib", "access.ts"));
+}
+
+const BEFORE_HARDENING = (v) =>
+  `${v} is from before hardened installs: it can't deploy into this install's permissions boundary, so going back to it needs an admin. See docs/self-host/security.md, "Rolling back past hardening".`;
 
 export async function deploy(ctx) {
   const { flags, runner, log } = ctx;
@@ -130,7 +158,8 @@ export async function deploy(ctx) {
     await runner.run("npm", ["ci", "--no-audit", "--no-fund"], { cwd: src.infra });
   }
 
-  if (!flags.skipBootstrap) {
+  // A hardened install never bootstraps: its own bucket and deploy role.
+  if (!flags.skipBootstrap && !accessOf(cfg)) {
     log("Bootstrapping CDK (once per account and region)");
     await cdk(ctx, src, ["bootstrap", `aws://${cfg.account}/${cfg.region}`]);
     if (cfg.domain?.hostname && cfg.region !== "us-east-1" && !cfg.domain.certificateArn) {
@@ -376,6 +405,7 @@ export async function update(ctx) {
     }
 
     const src = await resolveSource(ctx, target);
+    if (accessOf(loadConfig(flags)) && !releaseSupportsAccess(src, runner)) throw plainError(BEFORE_HARDENING(target));
     // Every model the release calls must answer through the install's
     // provider before anything is deployed (the same check as the updater's).
     if (!flags.rollback) {
@@ -408,6 +438,10 @@ export async function update(ctx) {
         if (flags.autoRollback && result.from && result.from !== target) {
           log(`The new release is unhealthy: rolling back to ${result.from}.`);
           const back = await resolveSource(ctx, result.from);
+          if (accessOf(loadConfig(flags)) && !releaseSupportsAccess(back, runner)) {
+            log(BEFORE_HARDENING(result.from));
+            return done("failed", `health check failed after deploying ${target}; ${BEFORE_HARDENING(result.from)}`);
+          }
           await deploy({ ...ctx, flags: { ...deployFlags, version: result.from }, resolveSource: async () => back });
           log(afterFailure(target, result.from, true));
           return done("rolled_back", `health check failed after deploying ${target}; back on ${result.from}`);
@@ -703,6 +737,103 @@ export async function uninstall(ctx) {
     log(`Kept on purpose (retainData): the ${d.prefix}-* DynamoDB tables, the ${d.prefix}-data${d.suffix} bucket, their KMS keys, the Cognito user pool and the secret ${d.secretName}.`);
     log("Delete them in the AWS console when you are sure, or set retainData to false before uninstalling.");
   }
+}
+
+// ── access (hardened installs) ───────────────────────────────────────────
+
+/**
+ * `access status`: how this install deploys.
+ * `access harden`: moves an install that deploys through the CDK bootstrap
+ * roles onto its own permissions boundary and deploy role (docs/self-host/
+ * security.md). Run once, by an admin, from a machine with admin
+ * credentials for the account, on a release that has it:
+ *   1. deploys `<prefix>-access` (boundary, deploy role, assets bucket);
+ *   2. deploys every stack once with the admin's credentials: names, the
+ *      boundary on every role, the install's tag, the update build's
+ *      window;
+ *   3. deploys every stack again through the deploy role, which from then
+ *      on is the only role CloudFormation uses for them;
+ *   4. takes AdministratorAccess off the Launch Stack installer role this
+ *      install was made with, if there is one (asks first without --yes).
+ * Updates from then on get deploy rights only while they run.
+ */
+export async function access(ctx) {
+  const { flags, runner, log } = ctx;
+  const sub = flags._[1] ?? "status";
+  const cfg = loadConfig(flags);
+  const a = accessOf(cfg);
+  if (sub === "status") {
+    if (!a) log("This install deploys through the CDK bootstrap roles (not hardened). An admin can run: coderhelm-selfhost access harden");
+    else log(`Hardened (${a.owner === "launch" ? "made by the Launch Stack" : "hardened from the CLI"}).\n  Boundary:    ${a.boundaryArn}\n  Deploy role: ${a.deployRoleArn}\n  Assets:      s3://${a.assetsBucket}`);
+    return a;
+  }
+  if (sub !== "harden") throw new Error('Use "access status" or "access harden".');
+  if (a?.owner === "launch") {
+    log("Hardened by the Launch Stack: nothing to do.");
+    return a;
+  }
+  // Hardened from the CLI already: running it again finishes or repeats the steps.
+  const state = loadState(flags);
+  const src = await resolveSource(ctx, flags.version ?? state.version);
+  if (!releaseSupportsAccess(src, runner)) throw plainError(`${src.version} has no hardened installs: update to a newer release first.`);
+  if (!flags.yes) {
+    if (!ctx.interactive) throw new Error("Pass --yes to harden without a prompt.");
+    if (!(await ctx.ask.confirm(`Harden ${cfg.stage} in ${cfg.account}? Updates will deploy only through the install's own deploy role.`, true))) return null;
+  }
+  const next = { ...cfg, access: { mode: "hardened", owner: "app" } };
+  if (!runner.dryRun) writeJson(configPath(flags), next);
+  const hardened = accessOf(next);
+  if (runner.dryRun || !fs.existsSync(path.join(src.infra, "node_modules"))) {
+    await runner.run("npm", ["ci", "--no-audit", "--no-fund"], { cwd: src.infra });
+  }
+  try {
+    log(`1/3 The boundary, deploy role and assets bucket (${hardened.accessStackName})`);
+    await cdk(ctx, src, ["deploy", hardened.accessStackName, "--exclusively", "--require-approval", "never"], {}, { adminCredentials: true, accessStack: true });
+  } catch (e) {
+    if (!runner.dryRun && !a) writeJson(configPath(flags), cfg);
+    throw plainError(`Hardening stopped before changing CoderHelm's stacks: ${String(e.message ?? e).split("\n")[0]}\nThe install keeps deploying as before. Fix what failed and run "access harden" again.`);
+  }
+  // From here the stacks change: the account's copy of the config says
+  // hardened too, so an update never deploys them the old way again.
+  await saveRemote(ctx, next, { ...state });
+  try {
+    const v = src.version && src.version !== "source" ? { CODERHELM_VERSION: src.version } : {};
+    log("2/3 Every stack, once with your credentials (names, boundary, tags)");
+    await cdk(ctx, src, ["deploy", "--all", "--require-approval", "never", "--progress", "events"], v, { adminCredentials: true });
+    log("3/3 Every stack through the deploy role, which CloudFormation uses from now on");
+    await cdk(ctx, src, ["deploy", "--all", "--require-approval", "never", "--force"], v);
+  } catch (e) {
+    throw plainError(`Hardening stopped part way: ${String(e.message ?? e).split("\n")[0]}\nRun "access harden" again (with admin credentials) to finish; updates wait for it.`);
+  }
+  await retireLaunchAdmin(ctx, next);
+  log("\nHardened. Check it with: selfhost/check-access.sh (docs/self-host/security.md).");
+  return hardened;
+}
+
+/** The Launch Stack installer role an older template gave AdministratorAccess: found, and (asked) detached. */
+export async function retireLaunchAdmin(ctx, cfg) {
+  const { runner, log, flags } = ctx;
+  const admin = "arn:aws:iam::aws:policy/AdministratorAccess";
+  const names = (await runner.json("aws", ["codebuild", "list-projects", "--region", cfg.region, "--output", "json"], { allowFail: true, dryRunAnswer: '{"projects":[]}' }))?.projects ?? [];
+  const candidates = names.filter((n) => n.endsWith("-installer"));
+  if (!candidates.length) return null;
+  const got = await runner.json("aws", ["codebuild", "batch-get-projects", "--names", ...candidates, "--region", cfg.region, "--output", "json"], { allowFail: true });
+  for (const p of got?.projects ?? []) {
+    const env = Object.fromEntries((p.environment?.environmentVariables ?? []).map((v) => [v.name, v.value]));
+    if (env.STAGE !== cfg.stage || !String(p.source?.buildspec ?? "").includes("launch-bootstrap.mjs")) continue;
+    const role = String(p.serviceRole ?? "").split("/").pop();
+    const attached = await runner.json("aws", ["iam", "list-attached-role-policies", "--role-name", role, "--output", "json"], { allowFail: true });
+    if (!(attached?.AttachedPolicies ?? []).some((x) => x.PolicyArn === admin)) continue;
+    log(`The Launch Stack's installer role ${role} (project ${p.name}) still has AdministratorAccess.`);
+    if (!flags.yes && !(ctx.interactive && (await ctx.ask.confirm("Take it off? (the old installer can't run again; updates don't use it)", true)))) {
+      log(`Left as it is. To take it off later: aws iam detach-role-policy --role-name ${role} --policy-arn ${admin}`);
+      return role;
+    }
+    await runner.run("aws", ["iam", "detach-role-policy", "--role-name", role, "--policy-arn", admin], { capture: true });
+    log(`Took AdministratorAccess off ${role}.`);
+    return role;
+  }
+  return null;
 }
 
 // ── telemetry ────────────────────────────────────────────────────────────

@@ -158,6 +158,20 @@ It is the same file, byte for byte, as `launch-stack.yaml` in that release's sig
 
 The installer then checks the rest of the release the same way. You can check the template yourself before you launch it (below).
 
+## What an update may do in your account
+
+Checking the release decides *what* runs. What it may then do in your account is limited separately. This applies to installs made with the Launch Stack, and installs an admin hardened.
+
+- **Between updates:** the update build (`coderhelm-<name>-update`) and the Launch Stack's installer hold no deploy rights. Starting them, or editing them, gains nothing.
+- **During an update:** the build asks the updater for a *deploy window*. The updater gives one only to a running build that it started, with exactly the buildspec, image and settings this release defines. The window is bound to that build's session, ends after 100 minutes, and only lets the build deploy CoderHelm's stacks through the install's deploy role. The window ends with the build.
+- **Always:** every CoderHelm role, including the deploy role, carries the install's permissions boundary. It refuses IAM users and keys, IAM outside `coderhelm-<name>-*`, roles without the boundary, Organizations, account settings, CloudTrail, GuardDuty, and assuming the CDK bootstrap's or your roles.
+
+So even a release that passed every check above can't create an admin role or reach outside CoderHelm's resources. [What the installer can do in your account](./security.md#what-the-installer-can-do-in-your-account) lists exactly what it can and can't do, what that still leaves open, and the read-only check you can run.
+
+**Auto-update** uses the same window, so turning it on adds no standing rights. Turned off, nothing runs between the updates an admin starts, and the build roles stay without deploy rights. Auto-update changes when updates run, not what they may do.
+
+An install from before hardening still updates through the CDK bootstrap roles. Updating it to a newer release doesn't change that. An admin moves it over once with `coderhelm-selfhost access harden` ([how](./security.md#installs-from-before-hardening)).
+
 ## Check a release yourself
 
 Use git 2.34 or newer, and [cosign](https://docs.sigstore.dev/cosign/system_config/installation/) 2.x or the [GitHub CLI](https://cli.github.com/).

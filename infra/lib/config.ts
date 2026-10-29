@@ -12,6 +12,7 @@
  */
 import * as fs from "fs";
 import * as path from "path";
+import { AccessNames, accessNames } from "./access";
 
 export type ModelProvider = "anthropic" | "bedrock";
 
@@ -218,6 +219,17 @@ export interface CoderhelmConfig {
   /** Anonymous install and upgrade pings from the installer. Off unless set to true. */
   telemetry?: { enabled?: boolean; endpoint?: string };
   /**
+   * Self-hosted: how the install deploys (infra/lib/access.ts,
+   * docs/self-host/security.md). Absent: as installs always have, through
+   * the CDK bootstrap roles. `hardened`: every role carries the install's
+   * permissions boundary, CloudFormation deploys with the install's own
+   * deploy role, and an update build gets deploy rights only while it runs.
+   * `owner` says who made the boundary and deploy role: `launch` (the Launch
+   * Stack; `id` is its short id) or `app` (an admin ran
+   * `coderhelm-selfhost access harden`, which deploys `<prefix>-access`).
+   */
+  access?: { mode: "hardened"; owner: "launch" | "app"; id?: string };
+  /**
    * The CloudFormation template teams use to connect an AWS account for log
    * reading. Default: the public copy CoderHelm publishes.
    */
@@ -308,6 +320,8 @@ export interface ResolvedConfig {
   /** Secrets Manager names. */
   secretName: string;
   anthropicAdminSecretName: string;
+  /** Hardened installs: the boundary, deploy role and assets bucket; null otherwise. */
+  access: (AccessNames & { owner: "launch" | "app" }) | null;
   /** Data bucket name. */
   dataBucketName: string;
   sandboxBucketName: string;
@@ -347,7 +361,7 @@ const URL_RE = /^https?:\/\/[^\s/]+(\/[^\s]*)?$/;
 const KNOWN_TOP_KEYS = new Set([
   "$schema", "account", "region", "stage", "resourcePrefix", "globalNameSuffix", "layout",
   "domain", "split", "hybrid", "hybridUrl", "retainData", "models", "email", "admins", "signup", "integrations",
-  "dashboard", "telemetry", "logReaderTemplateUrl", "publicBucketName", "siteUrl", "ci", "updates",
+  "dashboard", "telemetry", "logReaderTemplateUrl", "publicBucketName", "siteUrl", "ci", "updates", "access",
 ]);
 
 /** Every problem with a config, empty when it is valid. */
@@ -557,6 +571,22 @@ export function validateConfig(c: unknown): string[] {
       if (layout === "split" && u.enabled) p.push('updates.enabled: only for layout "single-origin" (the hosted deployment deploys from CI)');
     }
   }
+  if (cfg.access !== undefined) {
+    const a = cfg.access as Record<string, unknown> | null;
+    if (typeof a !== "object" || a === null) p.push('access: an object such as {"mode": "hardened", "owner": "launch", "id": "1a2b3c4d"}');
+    else {
+      if (a.mode !== "hardened") p.push('access.mode: "hardened"');
+      if (a.owner !== "launch" && a.owner !== "app") p.push('access.owner: "launch" or "app"');
+      if (a.owner === "launch" && !/^[a-f0-9]{8}$/.test(String(a.id ?? ""))) p.push("access.id: the Launch Stack's 8-character id");
+      if (a.owner === "app" && a.id !== undefined) p.push('access.id: only with owner "launch"');
+      if (layout !== "single-origin") p.push('access: only for layout "single-origin" (self-hosted installs)');
+      if (cfg.updates?.enabled === false) p.push("access: needs the updater (updates.enabled)");
+      const d = cfg.domain as { hostedZone?: string; certificateArn?: string } | null | undefined;
+      if (d && d.hostedZone && !d.certificateArn && cfg.region !== "us-east-1") {
+        p.push("access: a domain with a Route 53 zone outside us-east-1 needs domain.certificateArn (a hardened install has no certificate stack in us-east-1; Settings, System requests one)");
+      }
+    }
+  }
   if (cfg.logReaderTemplateUrl !== undefined && !/^https:\/\/[^\s]+\.ya?ml$/.test(String(cfg.logReaderTemplateUrl))) {
     p.push("logReaderTemplateUrl: an https URL of a .yaml template in S3");
   }
@@ -574,7 +604,7 @@ export function validateConfig(c: unknown): string[] {
   // Names that must fit AWS limits once built.
   if (p.length === 0) {
     const r = resolveConfig(cfg, { skipValidation: true });
-    if (r.dataBucketName.length > 63 || r.sandboxBucketName.length > 63 || `${r.prefix}-dashboard${r.suffix}`.length > 63) {
+    if (r.dataBucketName.length > 63 || r.sandboxBucketName.length > 63 || (r.access && r.access.assetsBucket.length > 63) || `${r.prefix}-dashboard${r.suffix}`.length > 63) {
       p.push("resourcePrefix + globalNameSuffix: bucket names would be over 63 characters; shorten them");
     }
     if (r.cognitoDomainPrefix.length > 63 || /aws|amazon|cognito/.test(r.cognitoDomainPrefix)) {
@@ -694,6 +724,12 @@ export function resolveConfig(cfg: CoderhelmConfig, opts: { skipValidation?: boo
     reviewerEvalsRepo: cfg.ci?.reviewerEvalsRepo ?? null,
     secretName: `${secretPath(cfg.stage, prefix)}/secrets`,
     anthropicAdminSecretName: `${secretPath(cfg.stage, prefix)}/anthropic-admin-keys`,
+    access: cfg.access
+      ? {
+          owner: cfg.access.owner,
+          ...accessNames({ account: cfg.account, region: cfg.region, prefix, suffix, secretName: `${secretPath(cfg.stage, prefix)}/secrets`, id: cfg.access.owner === "launch" ? cfg.access.id : undefined }),
+        }
+      : null,
     dataBucketName: `${prefix}-data${suffix}`,
     sandboxBucketName: `${prefix}-sandbox${suffix}`,
     cognitoDomainPrefix: `${prefix}${suffix}`,

@@ -43,6 +43,9 @@
 //   UPDATE_TIMEZONE  (IANA) set its window (admins change them later in Settings)
 //   STATUS_BUCKET    the stack's status bucket (empty: no progress file)
 //   SETUP_TOKEN      the one-time setup key from the install guide (may be empty)
+//   ACCESS_ID        the Launch Stack's short id: the install is hardened, with
+//                    the stack's boundary, deploy role and assets bucket
+//                    (infra/lib/access.ts). Empty: as installs were before.
 //   AWS_REGION       set by CodeBuild
 
 import { spawn } from "node:child_process";
@@ -111,6 +114,11 @@ export function domainPlan(env, found = null) {
   const hostname = (env.HOSTNAME_ARG || "").trim().toLowerCase().replace(/\.$/, "");
   const given = (env.HOSTED_ZONE || "").trim().toLowerCase().replace(/\.$/, "");
   if (!hostname) return { mode: "none" };
+  // A hardened install has no certificate stack in us-east-1: outside it,
+  // the updater requests the certificate (and adds its record when the
+  // zone is in Route 53 here), as for any other DNS provider.
+  const region = env.AWS_REGION || env.AWS_DEFAULT_REGION;
+  if (accessId(env) && region !== "us-east-1") return { mode: "external", hostname };
   if (given) return { mode: "route53", hostname, zone: given };
   if (found?.name && found.delegated) return { mode: "route53", hostname, zone: found.name, zoneId: found.id };
   return { mode: "external", hostname };
@@ -168,7 +176,35 @@ export function configFromEnv(env, { account, found = null }) {
   if (env.REQUIRE_TWO_FACTOR === "on") cfg.signup = { ...(cfg.signup ?? {}), requireTwoFactor: true };
   const updates = updatesFromEnv(env);
   if (updates) cfg.updates = updates;
+  const access = accessFromEnv(env);
+  if (access) cfg.access = access;
   return cfg;
+}
+
+/** The Launch Stack's short id when the install is hardened, else null. */
+export function accessId(env) {
+  const id = String(env.ACCESS_ID || "").trim();
+  return /^[a-f0-9]{8}$/.test(id) ? id : null;
+}
+
+/** The config's access setting for this launch (infra/lib/config.ts `access`). */
+export function accessFromEnv(env) {
+  const id = accessId(env);
+  return id ? { mode: "hardened", owner: "launch", id } : null;
+}
+
+/**
+ * A second launch for an existing install (its config pulled from the
+ * account): a hardened launch moves a hardened install onto this stack's
+ * deploy role; an install from before hardening is refused with what to do.
+ */
+export function relaunchConfig(cfg, env) {
+  const access = accessFromEnv(env);
+  if (!access) return cfg;
+  if (!cfg.access) {
+    throw new Error(`The install named ${cfg.stage} was set up before hardened installs. Update it from Settings, System, then run "coderhelm-selfhost access harden" as an admin, or launch with another install name.`);
+  }
+  return { ...cfg, access };
 }
 
 /** Auto-update and its window, when the stack sets them (else the config's defaults). */
@@ -275,12 +311,25 @@ export function createProgress() {
   return p;
 }
 
+/**
+ * AWS's refusal, naming the action and the resource (account numbers out):
+ * "AWS refused iam:CreateRole on role/coderhelm-prod-x".
+ */
+export function refusal(text) {
+  const m = String(text).match(/not authorized to perform:? ([a-z0-9-]+:[A-Za-z0-9*]+)(?: on resource:? ([^\s"'(]+))?/);
+  if (!m) return null;
+  // arn:partition:service:region:account:<resource>: only the resource part.
+  const r = m[2] ? (m[2].startsWith("arn:") ? m[2].split(":").slice(5).join(":") : m[2]) : "";
+  const resource = r ? ` on ${r}` : "";
+  return `AWS refused ${m[1]}${resource}.`;
+}
+
 /** A plain sentence (and a fix) for the errors people actually hit. */
 export function explainFailure(lines) {
   const text = lines.join("\n");
   const rules = [
     [/already exists/i, "Something with the same name is already in this account, probably from an earlier install with this install name.", "Launch again with a different install name, or delete the old CoderHelm stacks in CloudFormation first."],
-    [/not authorized to perform|AccessDenied/i, "The installer was refused a permission.", "Sign in to AWS as an administrator (or ask one) and launch again."],
+    [/not authorized to perform|AccessDenied/i, refusal(text) ?? "The installer was refused a permission.", "Nothing outside CoderHelm was changed. Delete this stack, then tell us this message (it names what AWS refused) so we can fix the release; or launch again."],
     [/LimitExceeded|quota|Maximum number of/i, "This AWS account hit a service limit.", "Request a higher limit in Service Quotas for the service named in the log, then launch again."],
     [/hosted zone|HostedZone|NoSuchHostedZone/i, "The hosted zone for your domain was not found in Route 53.", "Leave the domain empty to use the free CloudFront address, or enter a hosted zone this account owns."],
     [/CDKToolkit|bootstrap/i, "Preparing the account for deployment (CDK bootstrap) failed.", "Open the log, fix the CDKToolkit stack in CloudFormation (delete it if it is in a failed state), then launch again."],
@@ -378,6 +427,9 @@ export function realDeps(env = process.env) {
     },
     async writeConfig(cfg) {
       fs.writeFileSync("coderhelm.config.json", JSON.stringify(cfg, null, 2) + "\n");
+    },
+    readConfig() {
+      return JSON.parse(fs.readFileSync("coderhelm.config.json", "utf8"));
     },
     async deploy(version, onLine) {
       return sh("coderhelm-selfhost", ["deploy", "--yes", "--version", version, "--skip-github-app"], { onLine });
@@ -495,6 +547,13 @@ export async function run({ env = process.env, deps = realDeps(env), tgz = "code
     await deps.writeConfig(cfg);
   } else {
     log(`Found an existing install named ${stage}: upgrading it to ${version}.`);
+    if (accessId(env) && deps.readConfig && deps.writeConfig) {
+      try {
+        await deps.writeConfig(relaunchConfig(deps.readConfig(), env));
+      } catch (e) {
+        return fail(e.message, "Launch again with another install name, or update the existing install from Settings, System.");
+      }
+    }
   }
 
   await status({ phase: "deploying", message: "Creating your CoderHelm (about 20 minutes)", step: 0, steps: null });

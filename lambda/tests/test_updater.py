@@ -813,3 +813,148 @@ class EmailRouteTest(unittest.TestCase):
         u._clients["dynamodb"] = Broken()
         u.notify("s", "t", self.env, opener=self.opener)
         self.assertEqual((self.sent, self.posts), ([], []))
+
+
+# ── The deploy window (hardened installs) ─────────────────────────────────
+
+SPEC = {"version": "0.2", "phases": {"build": {"commands": ["echo é", "coderhelm-selfhost update"]}}}
+SPEC_TEXT = json.dumps(SPEC, indent=2)
+SPEC_SHA = u.buildspec_sha256(SPEC_TEXT)
+ROLE_ID = "AROAEXAMPLEROLEID01"
+
+
+class FakeBuilds:
+    def __init__(self, build):
+        self.build = build
+
+    def batch_get_builds(self, ids):
+        return {"builds": [dict(self.build, id=ids[0])] if self.build else []}
+
+
+class FakeIam:
+    def __init__(self):
+        self.policies = {}
+        self.calls = []
+
+    def get_role(self, RoleName):
+        return {"Role": {"RoleName": RoleName, "RoleId": ROLE_ID}}
+
+    def put_role_policy(self, RoleName, PolicyName, PolicyDocument):
+        self.calls.append(("put", RoleName, PolicyName))
+        self.policies[(RoleName, PolicyName)] = PolicyDocument
+
+    def delete_role_policy(self, RoleName, PolicyName):
+        self.calls.append(("delete", RoleName, PolicyName))
+        if (RoleName, PolicyName) not in self.policies:
+            raise type("NoSuchEntityException", (Exception,), {})("no such policy")
+        del self.policies[(RoleName, PolicyName)]
+
+
+class FakeParams:
+    def __init__(self, parts):
+        self.parts = parts
+
+    def get_parameter(self, Name):
+        i = int(Name.rsplit("/", 1)[1])
+        return {"Parameter": {"Value": json.dumps(self.parts[i - 1])}}
+
+
+WINDOW_PARTS = [
+    [{"Sid": "WindowStacks", "Effect": "Allow", "Action": "cloudformation:UpdateStack", "Resource": "*",
+      "Condition": {"StringEquals": {"aws:userid": u.WINDOW_USER_ID}, "DateLessThan": {"aws:CurrentTime": u.WINDOW_EXPIRES}}}],
+    [{"Sid": "WindowPass", "Effect": "Allow", "Action": "iam:PassRole", "Resource": "arn:aws:iam::111122223333:role/coderhelm-prod-deploy",
+      "Condition": {"StringEquals": {"aws:userid": u.WINDOW_USER_ID}, "DateLessThan": {"aws:CurrentTime": u.WINDOW_EXPIRES}}}],
+]
+
+
+def good_build(**over):
+    b = {
+        "projectName": "coderhelm-prod-update",
+        "buildStatus": "IN_PROGRESS",
+        "source": {"type": "NO_SOURCE", "buildspec": SPEC_TEXT},
+        "environment": {"type": "LINUX_CONTAINER", "image": "aws/codebuild/standard:7.0", "privilegedMode": False,
+                        "environmentVariables": [{"name": "VERSION", "value": "v0.8.0", "type": "PLAINTEXT"},
+                                                 {"name": "HISTORY_ID", "value": "h", "type": "PLAINTEXT"}]},
+        "serviceRole": "arn:aws:iam::111122223333:role/coderhelm-prod-update-build",
+    }
+    b.update(over)
+    return b
+
+
+class DeployWindow(unittest.TestCase):
+    def setUp(self):
+        self.db = FakeDynamo()
+        self.store = u.Store(self.db, "t")
+        self.env = {
+            "UPDATE_PROJECT_NAME": "coderhelm-prod-update",
+            "DEPLOY_WINDOW": json.dumps({"role": "coderhelm-prod-update-build", "buildspec": SPEC_SHA, "image": "aws/codebuild/standard:7.0",
+                                         "variables": ["VERSION", "ACTOR", "MODE", "HISTORY_ID"], "param": "/coderhelm-prod/access/window-policy",
+                                         "parts": 2, "minutes": 100}),
+        }
+        self.hid = "UPDATE#2026-10-25T03:00:00Z#abc"
+        self.store.put(self.hid, {"version": "v0.8.0", "status": "running", "build_id": "coderhelm-prod-update:1111"})
+        self.iam = FakeIam()
+        self.ssm = FakeParams(WINDOW_PARTS)
+
+    def ask(self, build, **event):
+        e = {"build_id": "coderhelm-prod-update:1111", "user_id": f"{ROLE_ID}:AWSCodeBuild-1111", "history_id": self.hid, **event}
+        return u.open_window(self.store, self.env, SUNDAY_3AM, e, cb=FakeBuilds(build), iam=self.iam, ssm=self.ssm)
+
+    def test_canonical_json_matches_the_infra_side(self):
+        # infra/test/access.test.ts hashes the same object with canonicalJson.
+        self.assertEqual(u.canonical_json({"b": [1, {"d": "é", "c": None}], "a": "x\n"}), '{"a":"x\\n","b":[1,{"c":null,"d":"é"}]}')
+
+    def test_opens_for_the_build_it_started_bound_to_that_session_and_an_end_time(self):
+        r = self.ask(good_build())
+        self.assertEqual(r["until"], "2026-10-25T04:55:00Z")
+        doc = json.loads(self.iam.policies[("coderhelm-prod-update-build", "deploy-window")])
+        self.assertEqual([s["Sid"] for s in doc["Statement"]], ["WindowStacks", "WindowPass"])
+        for st in doc["Statement"]:
+            self.assertEqual(st["Condition"]["StringEquals"]["aws:userid"], f"{ROLE_ID}:AWSCodeBuild-1111")
+            self.assertEqual(st["Condition"]["DateLessThan"]["aws:CurrentTime"], "2026-10-25T04:55:00Z")
+        self.assertNotIn("__CODERHELM", json.dumps(doc))
+        self.assertEqual(self.store.get(self.hid)["window_until"], "2026-10-25T04:55:00Z")
+
+    def test_refuses_a_build_it_did_not_start(self):
+        with self.assertRaisesRegex(ValueError, "not an update this updater started"):
+            self.ask(good_build(), build_id="coderhelm-prod-update:2222")
+        with self.assertRaisesRegex(ValueError, "not an update this updater started"):
+            self.ask(good_build(), history_id="")
+        self.assertEqual(self.iam.policies, {})
+
+    def test_refuses_an_edited_or_overridden_build(self):
+        cases = {
+            "buildspec": good_build(source={"type": "NO_SOURCE", "buildspec": SPEC_TEXT.replace("update", "update; curl evil")}),
+            "build image": good_build(environment=dict(good_build()["environment"], image="evil/image:1")),
+            "sets NODE_OPTIONS": good_build(environment=dict(good_build()["environment"], environmentVariables=[{"name": "NODE_OPTIONS", "value": "--require /x"}])),
+            "source was changed": good_build(source={"type": "S3", "buildspec": SPEC_TEXT}),
+            "another role": good_build(serviceRole="arn:aws:iam::111122223333:role/admin"),
+            "not running": good_build(buildStatus="SUCCEEDED"),
+        }
+        for why, build in cases.items():
+            with self.subTest(why), self.assertRaisesRegex(ValueError, why.split()[-1] if why != "build image" else "build image"):
+                self.ask(build)
+        self.assertEqual(self.iam.policies, {}, "nothing was opened")
+
+    def test_refuses_a_caller_that_is_not_the_build_role(self):
+        for uid in ["AROAOTHERROLE00001:AWSCodeBuild-1111", "AIDAUSER000000001", f"{ROLE_ID}"]:
+            with self.subTest(uid), self.assertRaisesRegex(ValueError, "not the update build's role"):
+                self.ask(good_build(), user_id=uid)
+        self.assertEqual(self.iam.policies, {})
+
+    def test_an_install_that_is_not_hardened_has_no_window(self):
+        env = {"UPDATE_PROJECT_NAME": "coderhelm-prod-update"}
+        with self.assertRaisesRegex(ValueError, "isn't hardened"):
+            u.open_window(self.store, env, SUNDAY_3AM, {"build_id": "x"}, cb=FakeBuilds(good_build()), iam=self.iam, ssm=self.ssm)
+        self.assertFalse(u.close_window(env, iam=self.iam))
+        self.assertEqual(self.iam.calls, [], "no IAM call at all without a window")
+
+    def test_finished_and_an_idle_tick_close_it(self):
+        self.ask(good_build())
+        u._clients["iam"] = self.iam
+        try:
+            self.assertTrue(u.close_window(self.env))
+            self.assertEqual(self.iam.policies, {})
+            self.assertFalse(u.close_window(self.env), "closing twice is fine")
+        finally:
+            u._clients.pop("iam", None)

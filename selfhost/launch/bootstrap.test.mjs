@@ -4,7 +4,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
   bedrockPrefixFor, configFromEnv, createProgress, domainPlan, explainFailure, findZone, isDelegated, logGroup, logUrl,
-  publicDomain, redact, run, secretName, statusDoc, updatesFromEnv, withSetupToken,
+  publicDomain, redact, refusal, relaunchConfig, run, secretName, statusDoc, updatesFromEnv, withSetupToken,
 } from "./bootstrap.mjs";
 
 const ENV = {
@@ -93,7 +93,8 @@ test("progress follows cdk deploy output", () => {
 
 test("failures come with a plain sentence and a fix", () => {
   assert.match(explainFailure(["CREATE_FAILED bucket already exists"]).message, /same name/);
-  assert.match(explainFailure(["is not authorized to perform: iam:CreateRole"]).fix, /administrator/);
+  assert.match(explainFailure(["is not authorized to perform: iam:CreateRole"]).message, /AWS refused iam:CreateRole/);
+  assert.match(explainFailure(["is not authorized to perform: iam:CreateRole"]).fix, /Delete this stack/);
   assert.match(explainFailure(["sha256sum: WARNING: 1 computed checksum did NOT match"]).message, /checksums/);
   assert.match(explainFailure(["weird thing"]).message, /weird thing/);
 });
@@ -280,4 +281,48 @@ test("run: a VERSION that isn't a release tag stops before anything is installed
     assert.equal(doc.phase, "failed", bad);
     assert.equal(installed, false, bad);
   }
+});
+
+// ── Hardened installs (ACCESS_ID from the Launch Stack) ─────────────────
+
+test("hardened: the launch's id makes the config hardened; without it nothing changes", () => {
+  assert.deepEqual(configFromEnv({ ...ENV, ACCESS_ID: "1a2b3c4d" }, { account: "123456789012" }).access, { mode: "hardened", owner: "launch", id: "1a2b3c4d" });
+  assert.equal(configFromEnv(ENV, { account: "123456789012" }).access, undefined);
+  assert.equal(configFromEnv({ ...ENV, ACCESS_ID: "not-an-id" }, { account: "123456789012" }).access, undefined);
+});
+
+test("hardened: a Route 53 zone outside us-east-1 goes through the updater's certificate, inside it through the deploy", () => {
+  const found = { name: "example.com", id: "Z1", delegated: true };
+  assert.equal(domainPlan({ ...ENV, ACCESS_ID: "1a2b3c4d", HOSTNAME_ARG: "ch.example.com" }, found).mode, "external");
+  assert.equal(domainPlan({ ...ENV, ACCESS_ID: "1a2b3c4d", AWS_REGION: "us-east-1", HOSTNAME_ARG: "ch.example.com" }, found).mode, "route53");
+  assert.equal(domainPlan({ ...ENV, HOSTNAME_ARG: "ch.example.com" }, found).mode, "route53", "unchanged without hardening");
+});
+
+test("hardened: a second launch moves a hardened install to this stack's id, and refuses one from before", () => {
+  const env = { ...ENV, ACCESS_ID: "99887766" };
+  assert.deepEqual(relaunchConfig({ stage: "prod", access: { mode: "hardened", owner: "launch", id: "1a2b3c4d" } }, env).access.id, "99887766");
+  assert.throws(() => relaunchConfig({ stage: "prod" }, env), /set up before hardened installs.*access harden/);
+  assert.deepEqual(relaunchConfig({ stage: "prod" }, ENV), { stage: "prod" }, "no change without hardening");
+});
+
+test("hardened: a refusal names the action and the resource, never the account", () => {
+  const line = "CREATE_FAILED | AWS::IAM::Role | GatewayServiceRole Resource handler returned message: \"User: arn:aws:sts::123456789012:assumed-role/coderhelm-prod-deploy-1a2b3c4d/AWSCloudFormation is not authorized to perform: iam:CreateRole on resource: arn:aws:iam::123456789012:role/coderhelm-prod-ServiceRole-ab12cd34 because no identity-based policy allows the iam:CreateRole action\"";
+  assert.equal(refusal(line), "AWS refused iam:CreateRole on role/coderhelm-prod-ServiceRole-ab12cd34.");
+  const { message, fix } = explainFailure([line]);
+  assert.equal(message, "AWS refused iam:CreateRole on role/coderhelm-prod-ServiceRole-ab12cd34.");
+  assert.match(fix, /Delete this stack/);
+  const doc = statusDoc({ phase: "failed", message, fix });
+  assert.doesNotMatch(JSON.stringify(doc), /123456789012/);
+});
+
+test("run: a second hardened launch of a hardened install writes the config with this launch's id", async () => {
+  let written = null;
+  const { deps } = fakes({ pull: async () => ({ code: 0 }), readConfig: () => ({ stage: "prod", access: { mode: "hardened", owner: "launch", id: "1a2b3c4d" } }), writeConfig: async (c) => void (written = c) });
+  const doc = await run({ env: { ...ENV, ACCESS_ID: "99887766" }, deps, log: () => {} });
+  assert.equal(doc.phase, "done");
+  assert.equal(written.access.id, "99887766");
+  const old = fakes({ pull: async () => ({ code: 0 }), readConfig: () => ({ stage: "prod" }) });
+  const refused = await run({ env: { ...ENV, ACCESS_ID: "99887766" }, deps: old.deps, log: () => {} });
+  assert.equal(refused.phase, "failed");
+  assert.match(refused.message, /set up before hardened installs/);
 });
