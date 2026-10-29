@@ -110,6 +110,14 @@ pub fn structural(
     };
     for e in &d.evidence.environments {
         let env = e.env.trim();
+        // Proof is asked for only where the plan's claims rest on that
+        // environment's data: a plan whose cause and data say nothing about
+        // `production` owes no production-only proof just because a source
+        // is connected (a schedule data fix was once sent back for proof
+        // in production and staging it never made a claim about).
+        if !rests_on_env(d, env) {
+            continue;
+        }
         if !e.proven && can_look_up {
             out.push(PlanFinding::new(
                 "env_unproven",
@@ -143,6 +151,39 @@ pub fn structural(
     out
 }
 
+/// Whether the decision's claims rest on data from `env`: its cause, what
+/// the data shows, the scope it counted or what it looked up name that
+/// environment (`prod`, `production` and `live` are one; so are `staging`
+/// and `stage`; any other name, an account or a cluster, by its own words).
+pub fn rests_on_env(d: &FixDecision, env: &str) -> bool {
+    let claims = format!(
+        "{}\n{}\n{}\n{}",
+        d.cause,
+        d.evidence.data_shows,
+        d.evidence.scope,
+        d.evidence.looked_up.join("\n")
+    )
+    .to_ascii_lowercase();
+    let said: Vec<&str> = claims
+        .split(|c: char| !c.is_ascii_alphanumeric() && c != '_' && c != '-')
+        .filter(|w| !w.is_empty())
+        .collect();
+    let env = env.trim().to_ascii_lowercase();
+    if env.is_empty() {
+        return false;
+    }
+    let aliases: &[&str] = match env.as_str() {
+        "prod" | "production" | "prd" | "live" => &["prod", "production", "prd", "live"],
+        "staging" | "stage" | "stg" => &["staging", "stage", "stg"],
+        _ => &[],
+    };
+    if aliases.is_empty() {
+        said.contains(&env.as_str())
+    } else {
+        said.iter().any(|w| aliases.contains(w))
+    }
+}
+
 /// Whether a model reading the plan could add anything: there is history to
 /// build on, or the plan rests on lookups (environments, near matches).
 pub fn worth_judging(history: &TicketHistory, lookups: usize) -> bool {
@@ -158,10 +199,12 @@ pub const SYSTEM: &str = "You check an implementation plan before it is kept. Yo
      it reuses from them and what changes this time and why; when it says it couldn't find out \
      why one was closed while the history lists who closed it and when; or when a review comment \
      on one raised something the plan ignores.\n\
-     2. env_unproven: a miss when the plan or its evidence hedges about which environment a \
-     lookup hit (it didn't confirm it was production, isn't sure which cluster or account) while \
+     2. env_unproven: only when the plan's claims (its cause, what the data shows, the scope it \
+     counted) rest on data from a specific environment. A miss when the plan or its evidence \
+     hedges about which environment a lookup hit (it didn't confirm it was production, isn't sure which cluster or account) while \
      a connected source could have shown it with data only that environment has. Not a miss when \
-     no connected source reaches it and the plan names the missing access.\n\
+     no connected source reaches it and the plan names the missing access, and never a miss for a \
+     plan whose claims don't depend on which environment the data came from.\n\
      3. near_match_unresolved: a miss when the evidence mentions an existing object close to what \
      the ticket names (a similar name, the same purpose) without saying who owns it, what is in \
      it and what created it, or without one decisive question for a person about using it \
@@ -368,6 +411,7 @@ mod tests {
     #[test]
     fn an_unproven_environment_is_a_gap_only_when_it_could_be_looked_up() {
         let d = FixDecision {
+            cause: "The grant exists in staging but not in prod.".into(),
             evidence: FixEvidence {
                 environments: vec![
                     EnvCheck {
@@ -394,6 +438,7 @@ mod tests {
         let g = structural(&files(d), &TicketHistory::default(), false);
         assert_eq!(g.len(), 1, "{g:?}");
         let proven = FixDecision {
+            cause: "Production lacks the grant.".into(),
             evidence: FixEvidence {
                 environments: vec![EnvCheck {
                     env: "prod".into(),
@@ -405,6 +450,55 @@ mod tests {
             ..Default::default()
         };
         assert!(structural(&files(proven), &TicketHistory::default(), true).is_empty());
+    }
+
+    /// A schedule data fix with a connected source: its claims are about
+    /// one class's stored time, in no particular environment. Listing
+    /// production and staging as unchecked owes no environment-only proof.
+    #[test]
+    fn an_environment_the_claims_dont_rest_on_needs_no_proof() {
+        let unproven = |env: &str| EnvCheck {
+            env: env.into(),
+            proof: "".into(),
+            proven: false,
+        };
+        let d = FixDecision {
+            cause: "The Saturday class is stored with a 9am start; the ticket says 8am.".into(),
+            evidence: FixEvidence {
+                data_shows: "class_schedule row 42 has start_time 09:00".into(),
+                environments: vec![unproven("production"), unproven("staging")],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert!(
+            structural(&files(d.clone()), &TicketHistory::default(), true).is_empty(),
+            "{:?}",
+            structural(&files(d), &TicketHistory::default(), true)
+        );
+        // The same plan claiming what production holds owes production's
+        // proof (and only production's).
+        let d = FixDecision {
+            cause: "The Saturday class is stored with a 9am start in production.".into(),
+            evidence: FixEvidence {
+                environments: vec![unproven("production"), unproven("staging")],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let g = structural(&files(d), &TicketHistory::default(), true);
+        assert_eq!(g.len(), 1, "{g:?}");
+        assert!(g[0].detail.contains("`production` unproven"), "{g:?}");
+        // Aliases and other names.
+        let named = |cause: &str| FixDecision {
+            cause: cause.into(),
+            ..Default::default()
+        };
+        assert!(rests_on_env(&named("the live site shows it"), "prod"));
+        assert!(rests_on_env(&named("on stage it differs"), "staging"));
+        assert!(rests_on_env(&named("cluster east-2 has it"), "east-2"));
+        assert!(!rests_on_env(&named("product page shows 9am"), "prod"));
+        assert!(!rests_on_env(&named("the class time is wrong"), "staging"));
     }
 
     #[test]

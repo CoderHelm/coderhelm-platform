@@ -8,9 +8,20 @@
 //!
 //! Now every place that lacks time hands off instead: the run continues in a
 //! fresh step (a NEW queue message with its own receive count and its own 15
-//! minutes) that resumes exactly where this one stopped: the implement work,
-//! the generator check ([`Gate::Generators`]) or the checks before the pull
-//! request ([`Gate::Checks`]), with the branch as it is.
+//! minutes) that resumes exactly where this one stopped: planning
+//! ([`Gate::Plan`]), the implement work, the generator check
+//! ([`Gate::Generators`]) or the checks before the pull request
+//! ([`Gate::Checks`]), with the branch as it is.
+//!
+//! Planning commits nothing to a branch, so it keeps its own state on the
+//! checkpoint ([`PlanState`]): the repository it settled on, how far it got
+//! (plan revisions, re-plans, whether the repository and file checks are
+//! done) and the plan check's open gaps; the plan files themselves are the
+//! run's own cached plan. A run once planned, switched repository, planned
+//! again, re-planned for one file and ran out of time with nothing committed:
+//! it failed "no work is committed to continue from". Planning now continues
+//! in the next step from its last plan, and a new plan revision or fewer
+//! open gaps counts as progress ([`plan_stalled_after`]).
 //!
 //! A run keeps going as long as its steps make progress ([`stalled_after`]):
 //! the branch head moved, or the run reached a later gate. It stops when two
@@ -113,15 +124,20 @@ fn where_label(at: &str) -> &str {
         "checks" => "the checks before the pull request",
         "implement_started" | "implement" => "the implement work (planned tasks)",
         "security" => "the security audit",
+        "plan" => "planning (the plan and its repository and file checks)",
         other => other,
     }
 }
 
 // ── Resume points ──────────────────────────────────────────────────────────
 
-/// A point after implement where a fresh step can pick the run up.
+/// A point where a fresh step can pick the run up: planning, or a point
+/// after implement.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Gate {
+    /// Planning, before any branch: the next step resumes from the run's own
+    /// plan and the [`PlanState`] on the checkpoint.
+    Plan,
     /// Everything after the implement work and its plan check: the
     /// generators run with the work, the adversarial test, the security
     /// audit, then the gates below.
@@ -136,6 +152,7 @@ pub enum Gate {
 impl Gate {
     pub fn as_str(self) -> &'static str {
         match self {
+            Gate::Plan => "plan",
             Gate::Verify => "verify",
             Gate::Generators => "generators",
             Gate::Checks => "checks",
@@ -144,6 +161,7 @@ impl Gate {
 
     pub fn parse(s: &str) -> Option<Gate> {
         match s {
+            "plan" => Some(Gate::Plan),
             "verify" => Some(Gate::Verify),
             "generators" => Some(Gate::Generators),
             "checks" => Some(Gate::Checks),
@@ -210,6 +228,117 @@ impl Carry {
     }
 }
 
+/// Re-plans the repository and file checks may ask for in one run: a
+/// repository switch plans once in the new repository, and a plan whose
+/// files don't match plans once more only when no switch did. Each re-plan
+/// carries every gap the plan check found in ONE send-back; what is still
+/// open after it stays on the decision and planning moves on.
+pub const MAX_PLAN_REPLANS: u32 = 1;
+
+/// How far planning got, kept on the checkpoint so a step that runs out of
+/// time while planning hands off to the next one instead of failing.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct PlanState {
+    /// The repository the plan is for (`owner/name`), after any switch.
+    #[serde(default)]
+    pub repo: String,
+    /// Its base branch.
+    #[serde(default)]
+    pub base_branch: String,
+    /// Plans made so far (each `plan::run` that finished).
+    #[serde(default)]
+    pub revision: u32,
+    /// Re-plans the repository and file checks asked for (see
+    /// [`MAX_PLAN_REPLANS`]).
+    #[serde(default)]
+    pub replans: u32,
+    /// The run switched repository (it never switches twice).
+    #[serde(default)]
+    pub switched: bool,
+    /// The repository and file checks are done: the plan is final.
+    #[serde(default)]
+    pub checked: bool,
+    /// The plan check's gaps still open on the latest plan.
+    #[serde(default)]
+    pub open_gaps: Vec<String>,
+}
+
+impl PlanState {
+    /// A fresh planning state for the run's repository.
+    pub fn new(owner: &str, name: &str, base_branch: &str) -> Self {
+        Self {
+            repo: format!("{owner}/{name}"),
+            base_branch: base_branch.to_string(),
+            ..Default::default()
+        }
+    }
+
+    pub fn to_json(&self) -> String {
+        serde_json::to_string(self).unwrap_or_default()
+    }
+
+    pub fn from_json(s: &str) -> Option<PlanState> {
+        serde_json::from_str(s).ok()
+    }
+
+    /// One more finished plan, with its open gaps.
+    pub fn planned(&mut self, open_gaps: &[String]) {
+        self.revision = self.revision.saturating_add(1);
+        self.open_gaps = open_gaps.to_vec();
+    }
+
+    /// Whether the checks may ask for another re-plan.
+    pub fn may_replan(&self) -> bool {
+        self.replans < MAX_PLAN_REPLANS
+    }
+
+    /// The repository as `(owner, name)`, when it is one.
+    pub fn owner_name(&self) -> Option<(&str, &str)> {
+        self.repo
+            .split_once('/')
+            .filter(|(o, n)| !o.is_empty() && !n.is_empty())
+    }
+
+    /// This state's progress mark (see [`plan_stalled_after`]).
+    pub fn mark(&self) -> String {
+        progress_mark(
+            "",
+            &format!("plan:r{}:g{}", self.revision, self.open_gaps.len()),
+        )
+    }
+}
+
+/// Planning steps in a row without progress, after the step that just
+/// ended: zero when planning made a new plan revision or has fewer open
+/// gaps than the last step's mark (or there is no planning mark), else one
+/// more.
+pub fn plan_stalled_after(prev: Option<&str>, now: &PlanState, stalled: u32) -> u32 {
+    let parse = |m: &str| -> Option<(u32, usize)> {
+        let at = m.split_once('|')?.1.strip_prefix("plan:r")?;
+        let (r, g) = at.split_once(":g")?;
+        Some((r.parse().ok()?, g.parse().ok()?))
+    };
+    match prev.and_then(parse) {
+        Some((rev, gaps)) if now.revision <= rev && now.open_gaps.len() >= gaps => {
+            stalled.saturating_add(1)
+        }
+        _ => 0,
+    }
+}
+
+/// Why a stalled planning run stops, in a sentence.
+pub fn plan_stall_reason(step: u32, now: &PlanState) -> String {
+    format!(
+        "Stopped: steps {} and {} made no progress in planning. The plan stayed at revision {} \
+         with {} open gaps in {}.",
+        step.saturating_sub(2).max(1),
+        step.saturating_sub(1).max(1),
+        now.revision,
+        now.open_gaps.len(),
+        now.repo
+    )
+}
+
 /// What the run's checkpoint says about steps: the gate to resume at (with
 /// what it carries), and the progress mark and stalled count of the last
 /// step.
@@ -217,6 +346,8 @@ impl Carry {
 pub struct StepState {
     pub gate: Option<Gate>,
     pub carry: Option<Carry>,
+    /// How far planning got, when the run resumes at [`Gate::Plan`].
+    pub plan: Option<PlanState>,
     pub mark: Option<String>,
     /// The step that saved `mark`.
     pub mark_step: u32,
@@ -249,6 +380,7 @@ pub async fn load(state: &WorkerState, team_id: &str, run_id: &str) -> StepState
     StepState {
         gate: s("gate").as_deref().and_then(Gate::parse),
         carry: s("gate_carry").as_deref().and_then(Carry::from_json),
+        plan: s("plan_state").as_deref().and_then(PlanState::from_json),
         mark: s("step_mark"),
         mark_step: item
             .get("step_mark_step")
@@ -290,6 +422,39 @@ pub async fn save_gate(
         .await
     {
         warn!(run_id, error = %e, "Could not save the gate the run resumes at");
+    }
+}
+
+impl StepState {
+    /// The planning state to resume from, when the run handed off while
+    /// planning.
+    pub fn planning(&self) -> Option<PlanState> {
+        (self.gate == Some(Gate::Plan))
+            .then(|| self.plan.clone())
+            .flatten()
+    }
+}
+
+/// The run resumes planning at [`Gate::Plan`], from `plan`, in its next step
+/// (or after a redelivery). Saved at the start of planning and after every
+/// plan, switch and re-plan; the implement checkpoint clears it.
+pub async fn save_plan(state: &WorkerState, team_id: &str, run_id: &str, plan: &PlanState) {
+    if state.config.checkpoints_table_name.is_empty() {
+        return;
+    }
+    if let Err(e) = state
+        .dynamo
+        .update_item()
+        .table_name(&state.config.checkpoints_table_name)
+        .key("team_id", AttributeValue::S(team_id.to_string()))
+        .key("sk", key(run_id))
+        .update_expression("SET gate = :g, plan_state = :p REMOVE gate_carry")
+        .expression_attribute_values(":g", AttributeValue::S(Gate::Plan.as_str().to_string()))
+        .expression_attribute_values(":p", AttributeValue::S(plan.to_json()))
+        .send()
+        .await
+    {
+        warn!(run_id, error = %e, "Could not save how far planning got");
     }
 }
 
@@ -432,13 +597,75 @@ mod tests {
     }
 
     #[test]
+    fn planning_resumes_while_it_makes_progress() {
+        let mut p = PlanState::new("acme", "web", "main");
+        p.planned(&["[env_unproven] a".into(), "b".into()]);
+        let first = p.mark();
+        // Same revision, same gaps: no progress.
+        assert_eq!(plan_stalled_after(Some(&first), &p, 0), 1);
+        // A new plan revision is progress.
+        let mut next = p.clone();
+        next.planned(&["a".into(), "b".into(), "c".into()]);
+        assert_eq!(plan_stalled_after(Some(&first), &next, 1), 0);
+        // Fewer open gaps is progress.
+        let mut fewer = p.clone();
+        fewer.open_gaps.pop();
+        assert_eq!(plan_stalled_after(Some(&first), &fewer, 1), 0);
+        // A mark from before planning (a branch mark) is not compared.
+        assert_eq!(plan_stalled_after(Some("abc|implement"), &p, 1), 0);
+        assert_eq!(plan_stalled_after(None, &p, 1), 0);
+        // Two stalled planning steps stop, saying where.
+        let s = plan_stalled_after(Some(&first), &p, 1);
+        assert!(stops_for_stall(s));
+        let why = plan_stall_reason(4, &p);
+        assert!(
+            why.contains("steps 2 and 3 made no progress in planning"),
+            "{why}"
+        );
+        assert!(
+            why.contains("revision 1 with 2 open gaps in acme/web"),
+            "{why}"
+        );
+    }
+
+    #[test]
+    fn plan_state_round_trips_and_bounds_replans() {
+        let mut p = PlanState::new("acme", "api", "develop");
+        assert!(p.may_replan());
+        p.switched = true;
+        p.replans = 1;
+        p.planned(&["[release] x".into()]);
+        assert!(!p.may_replan(), "one re-plan per run");
+        assert_eq!(PlanState::from_json(&p.to_json()), Some(p.clone()));
+        assert_eq!(p.owner_name(), Some(("acme", "api")));
+        // Older checkpoints without some fields still read.
+        let old = PlanState::from_json(r#"{"repo":"a/b","revision":2}"#).unwrap();
+        assert_eq!(old.revision, 2);
+        assert!(!old.checked);
+        let st = StepState {
+            gate: Some(Gate::Plan),
+            plan: Some(p.clone()),
+            ..Default::default()
+        };
+        assert_eq!(st.planning(), Some(p.clone()));
+        let after = StepState {
+            gate: Some(Gate::Generators),
+            plan: Some(p),
+            ..Default::default()
+        };
+        assert_eq!(after.planning(), None, "a later gate is not planning");
+    }
+
+    #[test]
     fn gates_order_the_resume() {
+        assert!(Gate::Plan < Gate::Verify);
+        assert!(Gate::Verify.runs_from(Some(Gate::Plan)));
         assert!(Gate::Generators.runs_from(None));
         assert!(Gate::Checks.runs_from(Some(Gate::Generators)));
         assert!(!Gate::Generators.runs_from(Some(Gate::Checks)));
         assert!(Gate::Verify.runs_from(Some(Gate::Verify)));
         assert!(!Gate::Verify.runs_from(Some(Gate::Generators)));
-        for g in [Gate::Verify, Gate::Generators, Gate::Checks] {
+        for g in [Gate::Plan, Gate::Verify, Gate::Generators, Gate::Checks] {
             assert_eq!(Gate::parse(g.as_str()), Some(g));
         }
     }

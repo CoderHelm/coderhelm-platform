@@ -152,6 +152,7 @@ pub async fn run(
     usage: &mut TokenUsage,
     run_id: &str,
     ticket_history: &super::ticket_history::TicketHistory,
+    check_files: bool,
 ) -> Result<PlanResult, Box<dyn std::error::Error + Send + Sync>> {
     let intent = triage.intent;
     // Fetch all enabled repos for this team so the planner can explore cross-repo
@@ -780,6 +781,16 @@ Then the ```fix_location.json block described above."#,
     // triggers, a fallback and its test, counts in every environment.
     let release_gaps = super::release_plan::plan_gaps(&draft, &abilities.release);
     back.extend(release_gaps.iter().cloned());
+    // The repository's files, once the repository is settled (`check_files`:
+    // a re-plan after a switch or a file mismatch): a task whose tag doesn't
+    // match the repository goes back in this same send-back, never in a
+    // whole plan of its own (a run once planned three times and ran out of
+    // time, one re-plan per check).
+    if check_files && !draft.tasks.trim().is_empty() {
+        back.extend(
+            super::plan_file_gaps(github, &msg.repo_owner, &msg.repo_name, &draft.tasks).await,
+        );
+    }
     if !back.is_empty() {
         info!(
             ticket_id = %msg.ticket_id,
@@ -981,6 +992,12 @@ Then the ```fix_location.json block described above."#,
             }
         });
     }
+    // Every check sent its gaps back in the one send-back above; what each
+    // still finds goes on the decision's open gaps (never another plan), and
+    // planning moves on. Only the checks' own findings count as open gaps.
+    if let Some(d) = files.fix.as_mut() {
+        d.open_gaps.clear();
+    }
     if !note_gaps.is_empty() {
         let left = super::outside_work::plan_gaps(&files, &abilities);
         if !left.is_empty() {
@@ -1037,6 +1054,9 @@ Then the ```fix_location.json block described above."#,
                 &format!("Plan check (new-feature rules): {}", left.join(" ")),
             )
             .await;
+            if let Some(d) = files.fix.as_mut() {
+                d.open_gaps.extend(left);
+            }
         }
     }
     // What the plan's own check still finds after the send-back stays on
@@ -1062,7 +1082,7 @@ Then the ```fix_location.json block described above."#,
             )
             .await;
             if let Some(d) = files.fix.as_mut() {
-                d.open_gaps = lines;
+                d.open_gaps.extend(lines);
             }
         }
     }

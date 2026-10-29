@@ -138,6 +138,7 @@ async fn try_auto_continue(
     run_id: &str,
     checkpoint: &Option<(String, String, u8)>,
     continuable_passes: &[&str],
+    planning: bool,
     why: &str,
 ) -> Handoff {
     // Gate on the checkpoint's pass IDENTITY, not just on there being a branch.
@@ -146,7 +147,10 @@ async fn try_auto_continue(
     // ["implement_started"] so a step-limit raised by some OTHER pass sharing the
     // agent loop (security/test) can never resume from a stale implement
     // checkpoint. Callers own this invariant; don't widen it here.
-    let has_partial = matches!(checkpoint, Some((lp, br, _))
+    // Planning commits nothing, so it continues from its own state on the
+    // checkpoint instead (`planning`: the run is at `steps::Gate::Plan`).
+    let has_partial = planning
+        || matches!(checkpoint, Some((lp, br, _))
         if !br.is_empty() && continuable_passes.contains(&lp.as_str()));
     if !has_partial {
         return Handoff::Stopped("no work is committed to continue from".into());
@@ -1037,6 +1041,7 @@ pub async fn orchestrate_ticket(
                         &run_id,
                         &checkpoint,
                         &["implement_started"],
+                        false,
                         "The coder used this step's turns with work left",
                     )
                     .await
@@ -1131,6 +1136,12 @@ pub async fn orchestrate_ticket(
             );
 
             let checkpoint = load_checkpoint(state, &msg.team_id, &run_id).await;
+            // A step that ran out of time while planning continues planning
+            // in the next step from how far it got (see `steps::PlanState`).
+            let planning = steps::load(state, &msg.team_id, &run_id)
+                .await
+                .planning()
+                .is_some();
 
             // Prefer AUTO-CONTINUATION over a partial PR: re-enqueue to resume
             // from the already-committed partial work (bounded — see helper). A
@@ -1142,7 +1153,12 @@ pub async fn orchestrate_ticket(
                 &run_id,
                 &checkpoint,
                 &["implement", "implement_started", "security"],
-                "This step reached its time limit with work left",
+                planning,
+                if planning {
+                    "This step reached its time limit while planning"
+                } else {
+                    "This step reached its time limit with work left"
+                },
             )
             .await;
 
@@ -1257,6 +1273,49 @@ async fn run_passes(
             installation_id = msg.installation_id,
             "Resolved installation_id from team META"
         );
+    }
+
+    // --- Planning that ran out of time continues here ---
+    // A step that handed off while planning (see `steps::PlanState`)
+    // resumes in the repository planning settled on, from its last plan. It
+    // first checks that the step before made progress: a new plan revision
+    // or fewer open gaps; two steps in a row without stop the run.
+    let plan_resume = if msg.continuation > 0 || msg.model_retries > 0 {
+        let st = steps::load(state, &msg.team_id, run_id).await;
+        let resume = st.planning();
+        let step = steps::step_number(msg.continuation);
+        if let Some(ps) = resume
+            .as_ref()
+            .filter(|_| msg.continuation > 0 && st.mark_step != step)
+        {
+            let stalled = steps::plan_stalled_after(st.mark.as_deref(), ps, st.stalled);
+            steps::save_mark(state, &msg.team_id, run_id, &ps.mark(), stalled, step).await;
+            if steps::stops_for_stall(stalled) {
+                return Err(steps::plan_stall_reason(step, ps).into());
+            }
+            info!(
+                run_id,
+                step,
+                stalled,
+                revision = ps.revision,
+                gaps = ps.open_gaps.len(),
+                "Continuing planning in this step"
+            );
+        }
+        resume
+    } else {
+        None
+    };
+    if let Some(ps) = plan_resume.as_ref() {
+        if let Some((owner, name)) = ps.owner_name() {
+            if owner != msg.repo_owner || name != msg.repo_name {
+                msg.repo_owner = owner.to_string();
+                msg.repo_name = name.to_string();
+                if !ps.base_branch.is_empty() {
+                    msg.base_branch = ps.base_branch.clone();
+                }
+            }
+        }
     }
 
     // Load team's Anthropic API key (required). Every agent loop in the run
@@ -1775,10 +1834,17 @@ async fn run_passes(
         None
     };
     let resumed_plan = own_plan.is_some();
+    // Planning that ran out of time before its first plan keeps this run's
+    // own triage (and what it resolved and recalled).
+    let own_triage = if own_plan.is_none() && plan_resume.is_some() {
+        load_run_triage(state, msg, run_id).await
+    } else {
+        None
+    };
 
     let mut used_mcp_ids: Vec<String> = Vec::new();
-    let (mut triage_result, own_plan) = match own_plan {
-        Some(saved) => {
+    let (mut triage_result, own_plan) = match (own_plan, own_triage) {
+        (Some(saved), _) => {
             info!(
                 run_id,
                 "Continuation: reusing this run's own triage and plan"
@@ -1793,7 +1859,22 @@ async fn run_passes(
             used_mcp_ids = saved.used_mcp_ids;
             (saved.triage, Some(saved.plan))
         }
-        None => {
+        (None, Some(saved)) => {
+            info!(
+                run_id,
+                "Continuation: planning again from this run's own triage"
+            );
+            add_progress_note(
+                state,
+                &msg.team_id,
+                run_id,
+                "Continued planning with this run's own triage",
+            )
+            .await;
+            used_mcp_ids = saved.used_mcp_ids;
+            (saved.triage, None)
+        }
+        (None, None) => {
             // --- Pass 1: Triage ---
             check_cancelled(state, &msg.team_id, run_id).await?;
             update_pass(state, &msg.team_id, run_id, "triage").await?;
@@ -1891,7 +1972,7 @@ async fn run_passes(
     }
     // --- Existing work: an open pull request (anyone's) that already fixes
     // this ends the run as covered by it, before any work starts ---
-    if !resumed_plan {
+    if !resumed_plan && plan_resume.is_none() {
         let (tests, specs, failure) = existing_work_inputs(test_ev.as_ref());
         if let Some(covered) = stop_gate::existing_work(
             state,
@@ -1919,6 +2000,20 @@ async fn run_passes(
     // --- Pass 2: Plan ---
     check_cancelled(state, &msg.team_id, run_id).await?;
     update_pass(state, &msg.team_id, run_id, "plan").await?;
+    // How far planning got: saved from here on, so a step that runs out of
+    // time while planning continues in a fresh step (see `steps::Gate::Plan`)
+    // instead of failing with nothing committed. A continuation past
+    // planning (its own plan, no planning state) has a final plan.
+    let plan_final = resumed_plan && plan_resume.as_ref().is_none_or(|p| p.checked);
+    let mut ps = plan_resume.clone().unwrap_or_else(|| {
+        steps::PlanState::new(&msg.repo_owner, &msg.repo_name, &msg.base_branch)
+    });
+    if !plan_final {
+        steps::save_plan(state, &msg.team_id, run_id, &ps).await;
+    }
+    // A plan made in a repository that is already settled (after a switch)
+    // checks its files in its own one send-back.
+    let settled_repo = ps.switched;
     let pass_start = std::time::Instant::now();
     let usage_before = usage.clone();
 
@@ -2056,6 +2151,7 @@ async fn run_passes(
                 usage,
                 run_id,
                 &history,
+                settled_repo,
             )
             .await?
         }
@@ -2070,6 +2166,7 @@ async fn run_passes(
             usage,
             run_id,
             &history,
+            settled_repo,
         )
         .await?
     };
@@ -2091,6 +2188,12 @@ async fn run_passes(
         save_checkpoint(state, &msg.team_id, run_id, "plan", "", 0, usage).await;
         add_progress_note(state, &msg.team_id, run_id, "Plan generated").await;
     }
+    if !plan_final {
+        if !plan_was_reused {
+            ps.planned(&open_gaps_of(&plan_result));
+        }
+        steps::save_plan(state, &msg.team_id, run_id, &ps).await;
+    }
     info!(run_id, "Plan complete");
     update_progress_comment(
         &github,
@@ -2107,9 +2210,14 @@ async fn run_passes(
     // one) is planned again in the right repo before its decision counts or
     // a branch is made; a plan naming files that don't exist is planned
     // again once, and never implemented while they still don't.
-    // A continuation's plan passed this check when the run first made it.
+    // A continuation's plan passed this check when the run first made it
+    // (unless the run handed off while planning: then the checks it hadn't
+    // done yet run now). The checks re-plan at most once in all
+    // (`steps::MAX_PLAN_REPLANS`): a switch plans once in the new repository,
+    // with the file check in that plan's one send-back, and a file mismatch
+    // plans once more only when no switch did.
     let mut early_validation: Option<PlanValidation> = None;
-    if !resumed_plan && !plan_result.tasks.trim().is_empty() {
+    if !plan_final && !plan_result.tasks.trim().is_empty() {
         let team_repos = plan::fetch_team_repos(state, &msg.team_id).await;
         let mut v = validate_plan(
             &plan_result,
@@ -2124,8 +2232,19 @@ async fn run_passes(
             usage,
         )
         .await;
-        if let Some(better_repo) = v.switch_repo.take() {
+        let switch_to = v.switch_repo.take();
+        if let Some(again) = switch_to
+            .as_ref()
+            .filter(|_| ps.switched || !ps.may_replan())
+        {
+            warn!(run_id, suggested = %again, "Repo check suggests switching again — staying");
+        } else if let Some(better_repo) = switch_to {
             if switch_run_repo(state, msg, run_id, &github, &better_repo, &v.switch_reason).await {
+                ps.switched = true;
+                ps.replans = ps.replans.saturating_add(1);
+                ps.repo = format!("{}/{}", msg.repo_owner, msg.repo_name);
+                ps.base_branch = msg.base_branch.clone();
+                steps::save_plan(state, &msg.team_id, run_id, &ps).await;
                 plan_was_reused = false;
                 // The repo the run uses now is the one CoderHelm picked; a
                 // note naming the repo it left would point people at the
@@ -2181,8 +2300,11 @@ async fn run_passes(
                     usage,
                     run_id,
                     &history,
+                    true,
                 )
                 .await?;
+                ps.planned(&open_gaps_of(&plan_result));
+                steps::save_plan(state, &msg.team_id, run_id, &ps).await;
                 v = validate_plan(
                     &plan_result,
                     &github,
@@ -2207,7 +2329,8 @@ async fn run_passes(
                 fix_location::route_for_plan(plan_result.fix.as_ref(), &plan_result.tasks),
                 fix_location::Route::Code | fix_location::Route::CodeAndOutside
             );
-        if codes && (!v.missing_files.is_empty() || !v.file_problems.is_empty()) {
+        if codes && (!v.missing_files.is_empty() || !v.file_problems.is_empty()) && ps.may_replan()
+        {
             info!(
                 run_id,
                 missing = ?v.missing_files,
@@ -2243,8 +2366,14 @@ async fn run_passes(
                 usage,
                 run_id,
                 &history,
+                true,
             )
             .await?;
+            // Counted once it finished: a step that runs out of time during
+            // it resumes by making this re-plan, not by skipping it.
+            ps.replans = ps.replans.saturating_add(1);
+            ps.planned(&open_gaps_of(&plan_result));
+            steps::save_plan(state, &msg.team_id, run_id, &ps).await;
             restore_plan_hash(state, msg, &context_hash).await;
             v = validate_plan(
                 &plan_result,
@@ -2260,46 +2389,55 @@ async fn run_passes(
             )
             .await;
             v.switch_repo = None;
-            if !v.missing_files.is_empty() || !v.file_problems.is_empty() {
-                warn!(run_id, missing = ?v.missing_files, tags = ?v.file_problems, "Plan still names files that don't match the repository — not implementing");
-                let decision = fix_location::FixDecision {
-                    fix_location: fix_location::FixLocation::Unknown,
-                    cause: format!(
-                        "The plan for this ticket names files that don't match {}/{} ({}), \
+        }
+        // Files that still don't match after the one re-plan (this check's,
+        // or the switch's, whose one send-back carried the file check) are
+        // never implemented.
+        if codes && (!v.missing_files.is_empty() || !v.file_problems.is_empty()) {
+            warn!(run_id, missing = ?v.missing_files, tags = ?v.file_problems, "Plan still names files that don't match the repository — not implementing");
+            let decision = fix_location::FixDecision {
+                fix_location: fix_location::FixLocation::Unknown,
+                cause: format!(
+                    "The plan for this ticket names files that don't match {}/{} ({}), \
                          even after planning again, so I stopped before changing any code. \
                          The ticket may belong in another repository.",
-                        msg.repo_owner,
-                        msg.repo_name,
-                        v.missing_files
-                            .iter()
-                            .cloned()
-                            .chain(
-                                v.file_problems
-                                    .iter()
-                                    .map(feature::plan_files::Problem::line)
-                            )
-                            .collect::<Vec<_>>()
-                            .join(", ")
-                    ),
-                    ..Default::default()
-                };
-                finish_without_code(
-                    state,
-                    msg,
-                    run_id,
-                    &github,
-                    &decision,
-                    fix_location::Route::Ask,
-                    usage,
-                    start,
-                    &used_mcp_ids,
-                )
-                .await;
-                close_memory(state, agent_memory.take()).await;
-                return Ok(());
-            }
+                    msg.repo_owner,
+                    msg.repo_name,
+                    v.missing_files
+                        .iter()
+                        .cloned()
+                        .chain(
+                            v.file_problems
+                                .iter()
+                                .map(feature::plan_files::Problem::line)
+                        )
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+                ..Default::default()
+            };
+            finish_without_code(
+                state,
+                msg,
+                run_id,
+                &github,
+                &decision,
+                fix_location::Route::Ask,
+                usage,
+                start,
+                &used_mcp_ids,
+            )
+            .await;
+            close_memory(state, agent_memory.take()).await;
+            return Ok(());
         }
         early_validation = Some(v);
+    }
+    if !plan_final {
+        // The plan is final: a step that runs out of time from here resumes
+        // from it without checking it again.
+        ps.checked = true;
+        steps::save_plan(state, &msg.team_id, run_id, &ps).await;
     }
 
     // --- Guard: a malformed/truncated plan must not proceed to implement ---
@@ -4407,6 +4545,7 @@ async fn run_passes(
                     run_id,
                     &resume_from,
                     &["implement_started"],
+                    false,
                     &format!(
                         "{} planned task(s) not done yet",
                         cov.required_missing().len()
@@ -5381,7 +5520,7 @@ async fn hand_off_at(
     save_checkpoint(state, &msg.team_id, run_id, "implement", branch, 0, usage).await;
     steps::save_gate(state, &msg.team_id, run_id, gate, carry).await;
     let from = Some(("implement".to_string(), branch.to_string(), 0u8));
-    match try_auto_continue(state, msg, run_id, &from, &["implement"], why).await {
+    match try_auto_continue(state, msg, run_id, &from, &["implement"], false, why).await {
         Handoff::Continued => Ok(()),
         Handoff::Stopped(reason) => {
             let kept = keep_wip_branch(github, &msg.repo_owner, &msg.repo_name, branch).await;
@@ -9271,6 +9410,30 @@ fn plan_task_files(tasks: &str) -> Vec<PlanTaskFile> {
         .collect()
 }
 
+/// The tasks whose create/modify/delete/replace tag doesn't match the
+/// repository, as lines for the plan's one send-back (see `plan::run`).
+pub(crate) async fn plan_file_gaps(
+    github: &GitHubClient,
+    owner: &str,
+    repo: &str,
+    tasks: &str,
+) -> Vec<String> {
+    let planned = feature::plan_files::planned_files(tasks);
+    let (existing, created) = feature::plan_files::paths_to_look_up(&planned, 10);
+    let mut exists: HashMap<String, bool> = HashMap::new();
+    for path in existing.into_iter().chain(created) {
+        if exists.contains_key(&path) {
+            continue;
+        }
+        let there = github.read_file(owner, repo, &path, "HEAD").await.is_ok();
+        exists.insert(path, there);
+    }
+    feature::plan_files::check(&planned, &exists)
+        .iter()
+        .map(|p| format!("[files] In {owner}/{repo}: {}", p.line()))
+        .collect()
+}
+
 /// Plan validation — catches bad plans before the expensive Implement pass.
 /// Uses deterministic checks (file existence, plan-text mentions, task tags)
 /// plus an LLM repo-fit check as a final safety net. How many files a plan
@@ -10030,7 +10193,7 @@ pub(crate) async fn save_checkpoint(
         if keeps_gate {
             ""
         } else {
-            " REMOVE gate, gate_carry"
+            " REMOVE gate, gate_carry, plan_state"
         }
     );
     if let Err(e) = state
@@ -10475,14 +10638,31 @@ async fn save_run_triage(
     }
 }
 
+/// The plan check's gaps still open on a plan's decision.
+fn open_gaps_of(plan: &plan::PlanResult) -> Vec<String> {
+    plan.fix
+        .as_ref()
+        .map(|d| d.open_gaps.clone())
+        .unwrap_or_default()
+}
+
+/// This run's own triage, as the run kept it for a continuation.
+async fn load_run_triage(
+    state: &WorkerState,
+    msg: &TicketMessage,
+    run_id: &str,
+) -> Option<RunTriage> {
+    serde_json::from_str(
+        &read_s3_text(state, &run_triage_key(&msg.team_id, &msg.ticket_id, run_id)).await?,
+    )
+    .ok()
+}
+
 /// This run's own triage and plan, when the cached plan files in the run's
 /// repo were written (or taken up) by this very run. None otherwise: the
 /// continuation then triages and plans as a fresh run would.
 async fn load_run_plan(state: &WorkerState, msg: &TicketMessage, run_id: &str) -> Option<OwnPlan> {
-    let saved: RunTriage = serde_json::from_str(
-        &read_s3_text(state, &run_triage_key(&msg.team_id, &msg.ticket_id, run_id)).await?,
-    )
-    .ok()?;
+    let saved = load_run_triage(state, msg, run_id).await?;
     let prefix = openspec_prefix(
         &msg.team_id,
         &msg.ticket_id,
