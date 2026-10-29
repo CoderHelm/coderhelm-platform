@@ -375,6 +375,55 @@ pub fn optional_findings(cov: &Coverage) -> Vec<Finding> {
         .collect()
 }
 
+/// The outside steps the plan check counts: none of them is done by the
+/// branch. A step handed to a person counts as not done, with its recorded
+/// reason; one handed out with no reason is not covered at all.
+pub fn outside_findings(d: Option<&super::fix_location::FixDecision>) -> Vec<Finding> {
+    let Some(c) = d
+        .filter(|d| d.effective_location() == super::fix_location::FixLocation::Both)
+        .and_then(|d| d.outside_change.as_ref())
+    else {
+        return Vec::new();
+    };
+    let h = super::outside_work::held(c);
+    let mut out = Vec::new();
+    for l in h.unjustified {
+        out.push(Finding {
+            point: "planned_work".to_string(),
+            detail: format!("Not covered: {l}"),
+            settle: "The plan gives this to a person without saying why CoderHelm couldn't do \
+                     it or how to grant the access: do it in the change or let CoderHelm do it, \
+                     or record the missing permission and how to grant it."
+                .to_string(),
+            ..Default::default()
+        });
+    }
+    for l in h.by_person {
+        out.push(Finding {
+            point: "planned_work".to_string(),
+            detail: format!("Not done by this run (a person's step): {l}"),
+            settle: "Done when its owner makes it and the confirm query returns what the note \
+                     expects."
+                .to_string(),
+            ..Default::default()
+        });
+    }
+    out
+}
+
+/// A progress note counting the outside steps.
+pub fn outside_note(d: Option<&super::fix_location::FixDecision>) -> String {
+    let Some(c) = d.and_then(|d| d.outside_change.as_ref()) else {
+        return String::new();
+    };
+    let h = super::outside_work::held(c);
+    format!(
+        "Plan check (outside the code): {} step(s) for a person with a recorded reason, {} handed out with no reason (not covered)",
+        h.by_person.len(),
+        h.unjustified.len()
+    )
+}
+
 /// The plan's checklist with only the done tasks checked: what the run page
 /// and a retry read, instead of every task ticked when the pass ended.
 pub fn checked_tasks_md(tasks_md: &str, cov: &Coverage) -> String {
@@ -720,5 +769,46 @@ mod tests {
         assert!(md.contains("- [x] `src/blocks/registry.ts`"));
         assert!(md.contains("- [ ] `src/blocks/gallery/schema.ts`"));
         assert!(md.contains("- [ ] Run the type-check"));
+    }
+
+    #[test]
+    fn an_outside_step_without_a_reason_is_not_covered() {
+        use crate::passes::fix_location::{FixDecision, FixLocation, OutsideChange};
+        use crate::passes::outside_work::NoteStep;
+        let d = FixDecision {
+            fix_location: FixLocation::Both,
+            outside_change: Some(OutsideChange {
+                system: "the CMS".into(),
+                change: "Publish the block".into(),
+                steps: vec![
+                    NoteStep {
+                        step: "Publish on production".into(),
+                        by: "person".into(),
+                        owner: "an editor".into(),
+                        ..Default::default()
+                    },
+                    NoteStep {
+                        step: "Approve the production copy".into(),
+                        by: "person".into(),
+                        owner: "an editor".into(),
+                        why_person: "production content needs an editor's approval".into(),
+                        grant: "none: CoderHelm never writes production".into(),
+                        ..Default::default()
+                    },
+                ],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let f = outside_findings(Some(&d));
+        assert_eq!(f.len(), 2);
+        assert!(f[0]
+            .detail
+            .starts_with("Not covered: 1. Publish on production"));
+        assert!(f[1]
+            .detail
+            .contains("Why a person: production content needs an editor's approval"));
+        assert!(outside_note(Some(&d)).contains("1 handed out with no reason"));
+        assert!(outside_findings(None).is_empty());
     }
 }

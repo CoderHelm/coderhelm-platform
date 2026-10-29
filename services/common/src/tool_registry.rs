@@ -68,6 +68,7 @@ pub const BUILTIN: &[(&str, Risk)] = &[
     ("graph_impact", Risk::Read),
     ("check_package", Risk::Read),
     ("check_url", Risk::Read),
+    ("query_content", Risk::Read),
     ("count_lines", Risk::Read),
     // Data sources and connections, read only.
     ("live_describe", Risk::Read),

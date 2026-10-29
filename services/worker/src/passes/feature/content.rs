@@ -22,8 +22,13 @@
 //!   blocks of that type already there ([`instance_queries`]): one in an
 //!   older shape is to be replaced or updated, by its document and key, with
 //!   the fields to set and to remove and the query that confirms it
-//!   ([`block_line`]). Without a connection to look with, the note says it
-//!   couldn't look instead of guessing.
+//!   ([`block_line`]). Without a write connection, the lookup goes through
+//!   the CMS's public read API when the repository names its project and
+//!   dataset (`outside_work::content_source`); only when neither can be read
+//!   does the note say it couldn't look, and why.
+//! - every line that stops the run is a [`Blocked`]: what must change, why
+//!   CoderHelm couldn't do it (the missing connection, by name, or why it is
+//!   an editor's choice) and how to grant it so it can next time.
 
 use std::collections::BTreeSet;
 
@@ -225,11 +230,7 @@ impl Need {
                 ),
             },
             Need::BlockOnPage { block, spec } => format!(
-                "add a `{block}` block to the staging page `{spec}` opens, so the new test finds \
-                 it. I couldn't look up existing staging content (no staging CMS connection for \
-                 this repository), so check first: if that page already has a `{block}` block, \
-                 update that one (set the new fields, remove the old ones) instead of adding a \
-                 second"
+                "add a `{block}` block to the staging page `{spec}` opens, so the new test finds it"
             ),
         }
     }
@@ -291,6 +292,39 @@ pub struct BlockShape {
     pub fields: Vec<String>,
     pub required: Vec<String>,
     pub held_in: Vec<(String, String)>,
+    /// The fewest items the spec needs on the page to check anything
+    /// ([`min_items`]).
+    pub min_items: Option<usize>,
+}
+
+/// The fewest items a spec's assertions need: `toBeGreaterThan(N)` needs
+/// N + 1, `toBeGreaterThanOrEqual(N)` and `toHaveCount(N)` need N, `.nth(N)`
+/// needs N + 1. The largest of them, or `None` when the spec has none.
+pub fn min_items(spec: &str) -> Option<usize> {
+    let mut best: Option<usize> = None;
+    for (pat, extra) in [
+        ("toBeGreaterThanOrEqual(", 0),
+        ("toBeGreaterThan(", 1),
+        ("toHaveCount(", 0),
+        (".nth(", 1),
+    ] {
+        let mut from = 0;
+        while let Some(i) = spec[from..].find(pat) {
+            let at = from + i + pat.len();
+            from = at;
+            let digits: String = spec[at..]
+                .chars()
+                .take_while(char::is_ascii_digit)
+                .collect();
+            if let Ok(n) = digits.parse::<usize>() {
+                let need = n + extra;
+                if need > 1 {
+                    best = Some(best.map_or(need, |b| b.max(need)));
+                }
+            }
+        }
+    }
+    best
 }
 
 /// The fields a schema file declares after its type's own name, and which
@@ -407,10 +441,29 @@ pub fn parse_instances(result: &Value) -> Vec<Existing> {
 /// or update the block that is there (fields to set and to remove, and the
 /// query that confirms it), or add one when none is.
 pub fn block_line(block: &str, spec: &str, shape: &BlockShape, found: &[Existing]) -> String {
+    let least = shape
+        .min_items
+        .map(|n| {
+            format!(
+                ", with at least {n} items in it: `{spec}` checks that many, so fewer leave it \
+                 nothing to check"
+            )
+        })
+        .unwrap_or_default();
     let Some(e) = found.first() else {
         return format!(
-            "add a `{block}` block to the staging page `{spec}` opens, so the new test finds it \
-             (looked up on staging: no `{block}` block exists yet)"
+            "add a `{block}` block to the staging page `{spec}` opens, so the new test finds \
+             it{least} (looked up on staging: no `{block}` block exists yet). Set {}",
+            if shape.fields.is_empty() {
+                "its required fields".to_string()
+            } else {
+                shape
+                    .fields
+                    .iter()
+                    .map(|f| format!("`{f}`"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            }
         );
     };
     let set: Vec<String> = shape
@@ -465,9 +518,9 @@ pub fn block_line(block: &str, spec: &str, shape: &BlockShape, found: &[Existing
         String::new()
     };
     format!(
-        "staging already has {target}{more} in an older shape: replace or update that one, do \
-         not add a second. Set {}; remove {}. Confirm with the query `{verify}`: it returns the \
-         block with the new fields",
+        "staging already has {target}{more} in an older shape: replace that one's content, do \
+         not add a second{least}. Set {}; remove {}. Confirm with the query `{verify}`: it returns \
+         the block with the new fields",
         list(&set),
         list(&remove)
     )
@@ -517,13 +570,71 @@ pub fn mutations(n: &Need, ids: &[String]) -> Vec<Value> {
         .collect()
 }
 
+/// Content CoderHelm couldn't change itself: what, why, and how to grant
+/// it the access so it can next time.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Blocked {
+    pub what: String,
+    pub why_person: String,
+    pub grant: String,
+}
+
+impl Blocked {
+    pub fn line(&self) -> String {
+        format!(
+            "{} (why CoderHelm didn't: {}; so it can next time: {})",
+            self.what, self.why_person, self.grant
+        )
+    }
+}
+
+/// Why CoderHelm can't change staging content without a connection, and
+/// how to give it one.
+fn no_connection(repo: &str) -> (String, String) {
+    (
+        format!("there is no staging CMS write connection for {repo}"),
+        format!(
+            "add one in Settings, Repositories, {repo}, Staging CMS (a staging-only write token); \
+             CoderHelm then removes dropped fields and sets schema defaults on staging itself"
+        ),
+    )
+}
+
+/// Why a need is a person's even with a connection, and what would let
+/// CoderHelm do it.
+fn editors_choice(n: &Need) -> (String, String) {
+    match n {
+        Need::Require { field, .. } => (
+            format!("the schema gives `{field}` no default, so its value is an editor's choice"),
+            format!(
+                "give `{field}` an `initialValue` in the schema and CoderHelm sets it on staging"
+            ),
+        ),
+        Need::BlockOnPage { spec, .. } => (
+            "which page shows the block and what it says is an editor's choice".to_string(),
+            format!(
+                "have `{spec}` create its own content in its setup (a fixture or a seeded \
+                 document), so the test needs no editor"
+            ),
+        ),
+        Need::Unset { .. } => (String::new(), String::new()),
+    }
+}
+
 /// What happened to the staging content, for the description.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Outcome {
     /// What was changed on staging, one line each.
     pub changed: Vec<String>,
-    /// What must still change, one line each: stops the pull request.
-    pub blocking: Vec<String>,
+    /// What must still change: stops the pull request.
+    pub blocking: Vec<Blocked>,
+}
+
+impl Outcome {
+    /// The blocking lines, each with why and how to grant.
+    pub fn blocking_lines(&self) -> Vec<String> {
+        self.blocking.iter().map(Blocked::line).collect()
+    }
 }
 
 /// Runs a read-only query on staging and returns its result.
@@ -573,68 +684,141 @@ async fn affected(
         .collect())
 }
 
-/// Makes what can be made on staging and lists what can't. `conn`: the
-/// repository's connection and its opened token, `None` without one.
-/// `production_in_code`: datasets the repository's production settings
-/// name, refused like production.
+/// How staging content is read and written: the repository's write
+/// connection, its CMS's public read API, or neither.
+#[derive(Clone, Copy)]
+pub struct Access<'a> {
+    /// `owner/name`, named in what to grant.
+    pub repo: &'a str,
+    /// The write connection and its opened token.
+    pub conn: Option<(&'a StagingCms, &'a str)>,
+    /// The public read API the repository's config names.
+    pub public: Option<&'a crate::passes::outside_work::ContentSource>,
+}
+
+/// Looks up blocks of `block` already there and writes the line for it.
+async fn block_need(
+    http: &reqwest::Client,
+    access: Access<'_>,
+    n: &Need,
+    block: &str,
+    spec: &str,
+    shapes: &[(String, BlockShape)],
+) -> String {
+    let shape = shapes
+        .iter()
+        .find(|(b, _)| b == block)
+        .map(|(_, s)| s.clone())
+        .unwrap_or_default();
+    let mut found = Vec::new();
+    let mut failed = None;
+    let mut looked = false;
+    for q in instance_queries(block, &shape) {
+        let r = match (access.conn, access.public) {
+            (Some((c, token)), _) => query(http, c, token, &q).await,
+            (None, Some(p)) => crate::passes::outside_work::public_query(http, p, &q).await,
+            (None, None) => break,
+        };
+        looked = true;
+        match r {
+            Ok(v) => found.extend(parse_instances(&v)),
+            Err(e) => failed = Some(e),
+        }
+    }
+    let line = n.line();
+    match failed {
+        _ if !looked => format!(
+            "{line}. I couldn't look up existing content: the repository names no CMS project id \
+             and dataset in its config or codegen environment, and it has no staging CMS \
+             connection. Check first: if that page already has a `{block}` block, replace that \
+             one's content instead of adding a second"
+        ),
+        Some(e) if found.is_empty() => format!(
+            "{line}. The lookup for existing `{block}` blocks failed ({e}): check first, and \
+             replace one that is there instead of adding a second"
+        ),
+        _ => block_line(block, spec, &shape, &found),
+    }
+}
+
+/// Makes what can be made on staging and lists what can't, each with why
+/// CoderHelm couldn't and how to grant it. `production_in_code`: datasets
+/// the repository's production settings name, refused like production.
 pub async fn settle(
     http: &reqwest::Client,
-    conn: Option<(&StagingCms, &str)>,
+    access: Access<'_>,
     production_in_code: &[String],
     needs: &[Need],
     shapes: &[(String, BlockShape)],
 ) -> Outcome {
     let mut out = Outcome::default();
-    let Some((c, token)) = conn else {
-        out.blocking = needs.iter().map(Need::line).collect();
+    let Some((c, token)) = access.conn else {
+        let (why, grant) = no_connection(access.repo);
+        for n in needs {
+            let what = match n {
+                Need::BlockOnPage { block, spec } => {
+                    block_need(http, access, n, block, spec, shapes).await
+                }
+                _ => n.line(),
+            };
+            let (why, grant) = match n {
+                Need::Unset { .. }
+                | Need::Require {
+                    default: Some(_), ..
+                } => (why.clone(), grant.clone()),
+                _ => editors_choice(n),
+            };
+            out.blocking.push(Blocked {
+                what,
+                why_person: why,
+                grant,
+            });
+        }
         return out;
     };
     if let Err(e) = c
         .check_writable()
         .and_then(|_| c.check_against_code(production_in_code))
     {
-        out.blocking = needs.iter().map(Need::line).collect();
-        out.blocking.push(e);
+        for n in needs {
+            out.blocking.push(Blocked {
+                what: n.line(),
+                why_person: e.clone(),
+                grant: "point the repository's staging CMS connection at a staging dataset".into(),
+            });
+        }
         return out;
     }
     for n in needs {
         // A block a spec needs: look for one already on staging first, so
         // the note says which to replace instead of asking for a second.
         if let Need::BlockOnPage { block, spec } = n {
-            let shape = shapes
-                .iter()
-                .find(|(b, _)| b == block)
-                .map(|(_, s)| s.clone())
-                .unwrap_or_default();
-            let mut found = Vec::new();
-            let mut failed = None;
-            for q in instance_queries(block, &shape) {
-                match query(http, c, token, &q).await {
-                    Ok(v) => found.extend(parse_instances(&v)),
-                    Err(e) => failed = Some(e),
-                }
-            }
-            out.blocking.push(match failed {
-                Some(e) if found.is_empty() => format!(
-                    "{} (the staging lookup failed: {e})",
-                    n.line().replace(
-                        "no staging CMS connection for this repository",
-                        "the lookup failed"
-                    )
-                ),
-                _ => block_line(block, spec, &shape, &found),
+            let (why, grant) = editors_choice(n);
+            out.blocking.push(Blocked {
+                what: block_need(http, access, n, block, spec, shapes).await,
+                why_person: why,
+                grant,
             });
             continue;
         }
         let Some(q) = n.automatic().then(|| affected_query(n)).flatten() else {
-            out.blocking.push(n.line());
+            let (why, grant) = editors_choice(n);
+            out.blocking.push(Blocked {
+                what: n.line(),
+                why_person: why,
+                grant,
+            });
             continue;
         };
         let ids = match affected(http, c, token, &q).await {
             Ok(ids) => ids,
             Err(e) => {
                 warn!(error = %e, "Could not read staging content");
-                out.blocking.push(format!("{} ({e})", n.line()));
+                out.blocking.push(Blocked {
+                    what: n.line(),
+                    why_person: format!("reading staging failed: {e}"),
+                    grant: "check the staging CMS connection's token can read the dataset".into(),
+                });
                 continue;
             }
         };
@@ -656,10 +840,16 @@ pub async fn settle(
                 c.dataset,
                 ids.iter().take(5).cloned().collect::<Vec<_>>().join(", ")
             )),
-            Ok(r) => out
-                .blocking
-                .push(format!("{} (staging returned {})", n.line(), r.status())),
-            Err(e) => out.blocking.push(format!("{} ({e})", n.line())),
+            Ok(r) => out.blocking.push(Blocked {
+                what: n.line(),
+                why_person: format!("staging refused the change ({})", r.status()),
+                grant: "give the staging CMS connection's token write access".into(),
+            }),
+            Err(e) => out.blocking.push(Blocked {
+                what: n.line(),
+                why_person: format!("the staging write failed: {e}"),
+                grant: "retry; if it keeps failing, check the staging CMS connection".into(),
+            }),
         }
     }
     out
@@ -772,6 +962,7 @@ mod tests {
         let shape = BlockShape {
             fields,
             required,
+            min_items: None,
             held_in: held_in(
                 "promoBanner",
                 &[
@@ -808,14 +999,51 @@ mod tests {
         // Nothing there: add, saying it was looked up.
         assert!(block_line("promoBanner", "e2e/promo.spec.ts", &shape, &[])
             .contains("looked up on staging: no `promoBanner` block exists yet"));
-        // No connection: it says it couldn't look.
-        let n = Need::BlockOnPage {
-            block: "promoBanner".into(),
-            spec: "e2e/promo.spec.ts".into(),
+        // The spec's own count sets the least content.
+        let shape = BlockShape {
+            min_items: min_items(
+                "await expect(cards).toHaveCount(3)\nexpect(n).toBeGreaterThan(4)",
+            ),
+            ..shape
         };
-        assert!(n
-            .line()
-            .contains("couldn't look up existing staging content"));
+        assert_eq!(shape.min_items, Some(5));
+        assert!(
+            block_line("promoBanner", "e2e/promo.spec.ts", &shape, &found)
+                .contains("with at least 5 items in it")
+        );
+        assert_eq!(min_items("expect(x).toBeVisible()"), None);
+    }
+
+    /// Neither a connection nor a public read API: it says it couldn't look
+    /// and why, and every blocked line says why CoderHelm didn't and how to
+    /// grant it.
+    #[tokio::test]
+    async fn without_any_access_the_note_says_why_and_how_to_grant() {
+        let n = vec![
+            Need::BlockOnPage {
+                block: "promoBanner".into(),
+                spec: "e2e/promo.spec.ts".into(),
+            },
+            Need::Require {
+                doc_type: "hero".into(),
+                field: "cta".into(),
+                default: None,
+            },
+        ];
+        let access = Access {
+            repo: "o/r",
+            conn: None,
+            public: None,
+        };
+        let out = settle(&reqwest::Client::new(), access, &[], &n, &[]).await;
+        assert!(out.blocking[0].what.contains(
+            "I couldn't look up existing content: the repository names no CMS project id"
+        ));
+        assert!(out.blocking[0].grant.contains("create its own content"));
+        assert!(out.blocking[1].why_person.contains("no default"));
+        assert!(
+            out.blocking_lines()[1].contains("so it can next time: give `cta` an `initialValue`")
+        );
     }
 
     #[tokio::test]
@@ -824,12 +1052,23 @@ mod tests {
             doc_type: "hero".into(),
             field: "subtitle".into(),
         }];
-        let out = settle(&reqwest::Client::new(), None, &[], &n, &[]).await;
+        let access = Access {
+            repo: "o/r",
+            conn: None,
+            public: None,
+        };
+        let out = settle(&reqwest::Client::new(), access, &[], &n, &[]).await;
         assert!(out.changed.is_empty());
         assert_eq!(
-            out.blocking,
-            vec!["remove `subtitle` from every `hero` document that still has it"]
+            out.blocking[0].what,
+            "remove `subtitle` from every `hero` document that still has it"
         );
+        assert!(out.blocking[0]
+            .why_person
+            .contains("no staging CMS write connection for o/r"));
+        assert!(out.blocking[0]
+            .grant
+            .contains("Settings, Repositories, o/r, Staging CMS"));
     }
 
     #[tokio::test]
@@ -845,23 +1084,31 @@ mod tests {
             doc_type: "hero".into(),
             field: "subtitle".into(),
         }];
-        let out = settle(&reqwest::Client::new(), Some((&c, "t")), &[], &n, &[]).await;
+        let access = |c| Access {
+            repo: "o/r",
+            conn: Some((c, "t")),
+            public: None,
+        };
+        let out = settle(&reqwest::Client::new(), access(&c), &[], &n, &[]).await;
         assert!(out.changed.is_empty());
-        assert!(out.blocking.iter().any(|b| b.contains("only to staging")));
+        assert!(out
+            .blocking_lines()
+            .iter()
+            .any(|b| b.contains("only to staging")));
         let c2 = StagingCms {
             dataset: "copy".into(),
-            ..c
+            ..c.clone()
         };
         let out = settle(
             &reqwest::Client::new(),
-            Some((&c2, "t")),
+            access(&c2),
             &["copy".into()],
             &n,
             &[],
         )
         .await;
         assert!(out
-            .blocking
+            .blocking_lines()
             .iter()
             .any(|b| b.contains("production settings")));
     }

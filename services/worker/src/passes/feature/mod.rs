@@ -717,15 +717,38 @@ async fn content_outcome(
                         fields,
                         required,
                         held_in: content::held_in(block, &schemas),
+                        min_items: specs
+                            .iter()
+                            .filter(|(p, _)| {
+                                matches!(n, content::Need::BlockOnPage { spec, .. } if spec == p)
+                            })
+                            .find_map(|(_, t)| content::min_items(t)),
                     },
                 ))
             }
             _ => None,
         })
         .collect();
+    // Without a write connection, existing content is still looked up
+    // through the CMS's public read API when the repository names it.
+    let env = super::load_codegen_env(w.state, &w.msg.team_id, owner, repo).await;
+    let mut cfg_files = Vec::new();
+    for p in super::outside_work::files_to_read(tree)
+        .into_iter()
+        .filter(|p| !p.starts_with(".github/") && !p.ends_with("package.json"))
+    {
+        if let Ok(t) = w.github.read_file(owner, repo, &p, base).await {
+            cfg_files.push((p, t));
+        }
+    }
+    let public = super::outside_work::content_source(&cfg_files, &env);
     let out = content::settle(
         &w.state.http,
-        conn.as_ref().map(|(c, t)| (c, t.as_str())),
+        content::Access {
+            repo: &full,
+            conn: conn.as_ref().map(|(c, t)| (c, t.as_str())),
+            public: public.as_ref(),
+        },
         &prod,
         &needs,
         &shapes,
@@ -741,7 +764,7 @@ async fn content_outcome(
 }
 
 /// The repository's staging CMS connection with its opened token.
-async fn load_connection(
+pub(crate) async fn load_connection(
     state: &WorkerState,
     team_id: &str,
     repo: &str,
@@ -923,7 +946,7 @@ pub async fn gate(
                     } else {
                         format!(" (already changed: {})", c.changed.join("; "))
                     },
-                    c.blocking.join("; ")
+                    c.blocking_lines().join("; ")
                 ));
             }
             facts.registrations_checked = places;
