@@ -93,6 +93,21 @@ test("hosted prod: the same stacks as before, with its domains, and no web stack
   t["coderhelm-prod-api"].hasResourceProperties("AWS::ApiGatewayV2::DomainName", { DomainName: "api.coderhelm.com" });
   t["coderhelm-prod-api"].resourceCountIs("AWS::Cognito::UserPoolIdentityProvider", 1);
   t["coderhelm-prod-worker"].hasResourceProperties("AWS::IAM::Role", { RoleName: "coderhelm-prod-reviewer-evals" });
+  // The evals call the models the way the worker does (streaming), on the
+  // eval, reviewer and candidate models only.
+  {
+    const evalPolicy = JSON.stringify(
+      Object.values(t["coderhelm-prod-worker"].findResources("AWS::IAM::Policy")).filter((p: any) =>
+        JSON.stringify(p.Properties.Roles).includes("ReviewerEvalsRole"),
+      ),
+    );
+    assert.ok(evalPolicy.includes("bedrock:InvokeModelWithResponseStream"));
+    for (const m of ["claude-haiku-4-5-20251001-v1:0", "claude-opus-5-5", "claude-sonnet-5-5"]) {
+      assert.ok(evalPolicy.includes(`inference-profile/us.anthropic.${m}`), m);
+      assert.ok(evalPolicy.includes(`foundation-model/anthropic.${m}`), m);
+    }
+    assert.ok(!evalPolicy.includes("anthropic.*"), "named models only");
+  }
   t["coderhelm-prod-storage"].hasResourceProperties("AWS::S3::Bucket", { BucketName: "coderhelm-prod-data" });
   t["coderhelm-prod-log-analyzer"].hasResourceProperties("AWS::S3::Bucket", { BucketName: "coderhelm-public" });
   // No allowlist entries come from the hosted config.

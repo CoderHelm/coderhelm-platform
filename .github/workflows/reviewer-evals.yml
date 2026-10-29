@@ -18,6 +18,17 @@ on:
   schedule:
     - cron: "0 7 * * *"
   workflow_dispatch:
+    inputs:
+      review_model:
+        description: >-
+          The model the diff reviews run on (the classification checks stay on
+          the eval model). The role may invoke only the models it lists in
+          infra/lib/worker-stack.ts.
+        type: choice
+        default: us.anthropic.claude-opus-5-5
+        options:
+          - us.anthropic.claude-opus-5-5
+          - us.anthropic.claude-sonnet-5-5
 
 permissions:
   contents: read
@@ -52,8 +63,9 @@ jobs:
           # Classification checks: the cheap model.
           EVAL_MODEL: us.anthropic.claude-haiku-4-5-20251001-v1:0
           # Diff reviews: the model the reviewer runs on in production
-          # (infra/lib/worker-stack.ts evalReviewModel).
-          EVAL_REVIEW_MODEL: us.anthropic.claude-opus-5-5
+          # (infra/lib/worker-stack.ts evalReviewModel), unless a manual run
+          # picked another (the nightly run has no inputs).
+          EVAL_REVIEW_MODEL: ${{ inputs.review_model || 'us.anthropic.claude-opus-5-5' }}
         run: cargo test -p worker review_eval -- --ignored --nocapture 2>&1 | tee eval.log
         shell: bash -o pipefail {0}
       - name: Open an issue on failure

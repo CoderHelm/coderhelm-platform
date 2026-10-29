@@ -519,10 +519,13 @@ export class WorkerStack extends cdk.Stack {
       // short-lived credentials, so CI stores no model key and never touches a
       // team's key. Least privilege: GitHub's OIDC token from this repository's
       // main branch only (the nightly schedule and manual runs both run there),
-      // and the one permission to invoke two models: the cheap eval model for
-      // the classification checks, and the model the reviewer runs on in
+      // and the one permission to invoke three models: the cheap eval model for
+      // the classification checks, the model the reviewer runs on in
       // production for the diff reviews (a small model passes cases the
-      // production reviewer fails). Nothing else in the account is readable.
+      // production reviewer fails), and the lighter model a review or
+      // implement route is measured against before it ships. Both the plain
+      // and the streaming invoke: the worker's model calls stream. Nothing
+      // else in the account is readable.
       const githubOidc = iam.OpenIdConnectProvider.fromOpenIdConnectProviderArn(
         this,
         "GithubActionsOidc",
@@ -533,6 +536,9 @@ export class WorkerStack extends cdk.Stack {
       // generate_review and the critic run on). Keep EVAL_REVIEW_MODEL in
       // .github/workflows/reviewer-evals.yml in step with it.
       const evalReviewModel = "anthropic.claude-opus-5-5";
+      // The candidate the evals compare against the reviewer's model
+      // (workflow_dispatch input review_model in reviewer-evals.yml).
+      const evalCandidateModel = "anthropic.claude-sonnet-5-5";
       const evalRole = new iam.Role(this, "ReviewerEvalsRole", {
         roleName: `${prefix}-reviewer-evals`,
         description:
@@ -548,10 +554,10 @@ export class WorkerStack extends cdk.Stack {
       });
       evalRole.addToPolicy(
         new iam.PolicyStatement({
-          actions: ["bedrock:InvokeModel"],
+          actions: ["bedrock:InvokeModel", "bedrock:InvokeModelWithResponseStream"],
           // For each model, the US cross-region inference profile and the
           // model it routes to (any of the profile's regions).
-          resources: [evalModel, evalReviewModel].flatMap((model) => [
+          resources: [evalModel, evalReviewModel, evalCandidateModel].flatMap((model) => [
             `arn:aws:bedrock:${this.region}:${this.account}:inference-profile/us.${model}`,
             `arn:aws:bedrock:*::foundation-model/${model}`,
           ]),
