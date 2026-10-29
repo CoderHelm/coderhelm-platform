@@ -40,6 +40,7 @@ pub const WORKER_MESSAGE_TYPES: &[&str] = &[
     "review_sweep",
     "health_check",
     "await_merge",
+    "release_steps",
     "tag_sweep",
     "release_notes",
     "graph_index",

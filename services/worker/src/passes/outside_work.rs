@@ -140,6 +140,12 @@ pub struct Abilities {
     pub fixtures_dir: Option<String>,
     /// The repository has a staging CMS write connection CoderHelm may use.
     pub staging_write: bool,
+    /// Every dataset the repository names for an environment (staging and
+    /// production), each readable with `query_content`'s `dataset`.
+    pub datasets: Vec<String>,
+    /// How the repository releases: each environment's deploy trigger, its
+    /// migration and cache-purge workflows, each environment's dataset.
+    pub release: super::release_plan::Mechanics,
 }
 
 fn valid_name(s: &str) -> bool {
@@ -413,13 +419,17 @@ pub fn abilities(
     staging_write: bool,
 ) -> Abilities {
     let (deploys, e2e) = routes(tree, files);
+    let source = content_source(files, env);
+    let release = super::release_plan::mechanics(files, source.as_ref());
     Abilities {
-        source: content_source(files, env),
+        datasets: release.datasets(),
+        source,
         deploys,
         e2e,
         migrations_dir: folder_with(tree, &["migrations"]),
         fixtures_dir: folder_with(tree, &["fixtures", "seed", "seeds"]),
         staging_write,
+        release,
     }
 }
 
@@ -1319,8 +1329,26 @@ pub async fn handle(
     if name != TOOL {
         return None;
     }
-    let Some(s) = a.source.as_ref() else {
+    let Some(base) = a.source.as_ref() else {
         return Some("No CMS project id and dataset are named in this repository.".into());
+    };
+    // Another environment's dataset (production, read only), when named.
+    let picked;
+    let s = match input["dataset"].as_str().map(str::trim) {
+        Some(d) if !d.is_empty() && d != base.dataset => {
+            if !a.datasets.iter().any(|x| x == d) {
+                return Some(format!(
+                    "Unknown dataset `{d}`. Datasets: {}.",
+                    a.datasets.join(", ")
+                ));
+            }
+            picked = ContentSource {
+                dataset: d.to_string(),
+                ..base.clone()
+            };
+            &picked
+        }
+        _ => base,
     };
     let q = input["query"].as_str().unwrap_or("").trim();
     if q.is_empty() || q.len() > 2_000 {

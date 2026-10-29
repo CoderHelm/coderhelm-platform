@@ -119,6 +119,15 @@ pub const BUILTIN: &[(&str, Risk)] = &[
     ("run_checks", Risk::Write),
     ("update_pr_description", Risk::Write),
     ("confluence_append", Risk::Write),
+    // Release steps CoderHelm runs after a pull request (see the worker's
+    // release_run): staging writes and deploys, then production's.
+    ("release_dry_run", Risk::Write),
+    ("release_staging_migration", Risk::Write),
+    ("release_staging_deploy", Risk::Write),
+    ("release_production_migration", Risk::Consequential),
+    ("release_production_deploy", Risk::Consequential),
+    ("release_production_tag", Risk::Consequential),
+    ("release_cache_purge", Risk::Consequential),
 ];
 
 /// Verbs that make a connection's tool read only, as the first word of its

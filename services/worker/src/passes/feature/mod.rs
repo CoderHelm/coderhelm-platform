@@ -908,12 +908,22 @@ pub async fn gate(
             rounds,
             "New-feature rules checked before the pull request"
         );
-        let clean = carried.is_empty()
+        // A data migration released expand then contract, with a fallback
+        // and its test (every ticket kind).
+        let release_gaps = crate::passes::release_plan::diff_gaps(&files);
+        let clean = release_gaps.is_empty()
+            && carried.is_empty()
             && missing.is_empty()
             && dups.is_empty()
             && static_fails.is_empty()
             && sandbox_failed.is_empty();
         if clean || rounds >= MAX_FIX_ROUNDS || !has_time() {
+            if !release_gaps.is_empty() {
+                return Err(format!(
+                    "the migration can't be released safely yet: {}",
+                    release_gaps.join(" ")
+                ));
+            }
             if !carried.is_empty() {
                 return Err(format!(
                     "the branch carries over changes from an earlier attempt that this ticket doesn't ask for: {}",
@@ -979,6 +989,12 @@ pub async fn gate(
         }
         rounds += 1;
         let mut feedback = String::new();
+        if !release_gaps.is_empty() {
+            feedback.push_str("\nThe migration must be released expand then contract:\n");
+            for g in &release_gaps {
+                feedback.push_str(&format!("- {g}\n"));
+            }
+        }
         if !carried.is_empty() {
             feedback.push_str("\nThe branch changes files only an earlier attempt's unrelated commits touched. Undo these changes (restore each file to the default branch's version) unless this ticket needs them:\n");
             for (p, from) in &carried {

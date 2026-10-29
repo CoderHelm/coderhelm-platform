@@ -60,6 +60,13 @@ pub enum WorkerMessage {
     /// for pending checks (e.g. a staging deploy); never merges on failing CI.
     #[serde(rename = "await_merge")]
     AwaitMerge(AwaitMergeMessage),
+    /// A pull request's release steps (self-scheduled): the dry runs, the
+    /// expand migration per environment, the deploys, the production tag,
+    /// the contract migration after the production deploy, the cache purge.
+    /// Each is gated by the team's agent permissions, waited for and
+    /// verified (`worker::passes::release_run`).
+    #[serde(rename = "release_steps")]
+    ReleaseSteps(ReleaseStepsMessage),
     /// Hosted side of hybrid: forward a held event to a self-hosted install
     /// again (self-scheduled with SQS delay, about 24 hours of backoff).
     #[serde(rename = "relay_retry")]
@@ -345,6 +352,7 @@ impl WorkerMessage {
             WorkerMessage::HiddenSuggest(_) => f::DATA_SOURCE,
             WorkerMessage::HealthCheck(_)
             | WorkerMessage::AwaitMerge(_)
+            | WorkerMessage::ReleaseSteps(_)
             | WorkerMessage::RelayRetry(_)
             | WorkerMessage::WebhookEmit(_)
             | WorkerMessage::WebhookSend(_)
@@ -517,6 +525,24 @@ pub struct AwaitMergeMessage {
     /// They are retried on their own schedule and never end the gate.
     #[serde(default)]
     pub error_retries: u32,
+}
+
+/// One tick of a pull request's release steps. The steps themselves live in
+/// one record per pull request; a tick whose chain is not the record's
+/// current one stops, so a PR never runs two loops.
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+pub struct ReleaseStepsMessage {
+    pub team_id: String,
+    pub installation_id: u64,
+    pub repo_owner: String,
+    pub repo_name: String,
+    pub pr_number: u64,
+    #[serde(default)]
+    pub run_id: String,
+    #[serde(default)]
+    pub chain_id: String,
+    #[serde(default)]
+    pub attempts: u32,
 }
 
 /// An event for the team's webhook endpoints.

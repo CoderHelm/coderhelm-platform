@@ -807,6 +807,8 @@ pub mod quarantine;
 /// Hosted side of hybrid: forward a held event to a self-hosted install again.
 pub mod relay_retry;
 pub mod release_notes;
+pub mod release_plan;
+pub mod release_run;
 pub mod remote_mcp;
 pub(crate) mod repo_pick;
 mod resolve;
@@ -840,8 +842,10 @@ mod selfhost_links;
 pub mod skill_compat;
 pub mod skill_suggest;
 pub mod skills;
+pub mod stack;
 pub(crate) mod steps;
 pub(crate) mod stop_gate;
+pub mod stop_pr;
 pub mod syntax_check;
 pub(crate) mod terraform;
 #[allow(dead_code)]
@@ -1044,6 +1048,28 @@ pub async fn orchestrate_ticket(
                             }
                             Err(salvage_err) => {
                                 warn!(run_id, error = %salvage_err, "Failed to salvage partial work");
+                                false
+                            }
+                        }
+                    } else if !branch.is_empty()
+                        && stop_pr::opens_pr(last_pass)
+                        && e.downcast_ref::<stack::Refused>().is_none()
+                        && crate::agent::policy::claim_stop(&run_id).is_none()
+                    {
+                        // A check after the work stopped the run: the work
+                        // still gets its (draft) pull request, with why.
+                        match stop_pr::open(state, &msg, &run_id, branch, &sanitize_error(&err_msg))
+                            .await
+                        {
+                            Ok(pr_url) => {
+                                info!(
+                                    run_id,
+                                    pr_url, "Opened a draft PR for a run stopped after its work"
+                                );
+                                true
+                            }
+                            Err(e) => {
+                                warn!(run_id, error = %e, "No draft PR for the stopped run");
                                 false
                             }
                         }
@@ -1898,6 +1924,19 @@ async fn run_passes(
             msg.base_branch = base;
         }
     }
+    // A ticket that depends on another open pull request builds on its
+    // branch (stacked), on every attempt, never copying its commits.
+    let stacked_on = if is_internal_ticket(&msg.ticket_id) {
+        None
+    } else {
+        let own: Vec<String> = history
+            .prior
+            .attempts
+            .iter()
+            .map(|a| a.branch.clone())
+            .collect();
+        stack::for_ticket(&github, msg, &own).await
+    };
 
     // The ticket's history (read before the repo was chosen) goes to the
     // planner.
@@ -4976,6 +5015,9 @@ async fn run_passes(
         ev.start = Some(log_evidence::resolve_start(&files, ev).await);
         log_evidence::save(state, &msg.team_id, run_id, ev).await;
     }
+    // Never another open pull request's commits under new hashes: stacked on
+    // it instead, or refused.
+    let stacked_on = stack::before_pr(&github, msg, &branch_name, stacked_on).await?;
     let pass_start = std::time::Instant::now();
     let usage_before = usage.clone();
     let pr_result = pr::run(
@@ -5029,6 +5071,27 @@ async fn run_passes(
             .await;
         }
     }
+    if let Some(d) = &stacked_on {
+        stack::note_pr(
+            &github,
+            &msg.repo_owner,
+            &msg.repo_name,
+            pr_result.pr_number,
+            d,
+        )
+        .await;
+    }
+    // A data migration's release steps: CoderHelm runs them from here on.
+    release_run::after_pr(
+        state,
+        msg,
+        run_id,
+        &github,
+        &plan_result,
+        &branch_name,
+        pr_result.pr_number,
+    )
+    .await;
     // The plan moved the change out of a repo an earlier run of this ticket
     // opened a PR in: that PR is closed with a note naming this one.
     supersede_moved_prs(
