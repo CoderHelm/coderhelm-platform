@@ -685,9 +685,10 @@ pub const JUDGE_SYSTEM: &str = "You check a code change before its pull request 
      says it reuses from them.\n\
      19. planned_work: a task in the plan's task checklist (below the plan) that the diff doesn't \
      do, or does only in part (a file it creates as an empty shell, a step it skips). Name the \
-     task and its file. Not a miss for a task the checklist marks optional. Planned work is \
-     never a note for later: it is sent back to the coder, and the pull request doesn't open \
-     without it.\n\
+     task and its file. Not a miss for a task the checklist marks optional, nor for a generated \
+     file listed under \"Generated files their generator settled\". Planned work is never a note \
+     for later: it is sent back to the coder, and the pull request stays a draft until it is \
+     done.\n\
      Many changes touch none of these: a change that relies on nothing outside its own code, \
      changes no stored records and adds no logs passes all of them. Judge only what the evidence \
      shows and do not invent concerns. A fact the lookups confirm is proven even when the notes \
@@ -769,19 +770,6 @@ pub fn planned_work(findings: &[Finding]) -> Vec<&Finding> {
         .iter()
         .filter(|f| f.point.trim() == "planned_work")
         .collect()
-}
-
-/// Why the run stops when planned work is still not done after its rounds:
-/// one plain sentence naming the tasks.
-pub fn unfinished_reason(findings: &[Finding]) -> String {
-    let items: Vec<String> = planned_work(findings)
-        .iter()
-        .map(|f| sentence(&f.detail, 120))
-        .collect();
-    format!(
-        "Stopped before opening a pull request: the check before it found planned work not done: {}",
-        items.join("; ")
-    )
 }
 
 /// How many of `findings` are proof gaps.
@@ -1216,6 +1204,9 @@ pub fn fix_feedback(findings: &[Finding]) -> String {
 /// kept whole when the description is rewritten, and read by the reviewer.
 pub const UNVERIFIED_START: &str = "<!-- coderhelm:unverified -->";
 pub const UNVERIFIED_END: &str = "<!-- /coderhelm:unverified -->";
+/// Around the planned work not done, at the top of the description.
+pub const UNFINISHED_START: &str = "<!-- coderhelm:unfinished -->";
+pub const UNFINISHED_END: &str = "<!-- /coderhelm:unfinished -->";
 const CI_MARK: &str = "<!-- coderhelm:ci -->";
 /// The mark on each security item: while one is in the description the pull
 /// request stays a draft (see `resume::mark_pr_ready`).
@@ -1233,6 +1224,36 @@ fn item_line(f: &Finding) -> String {
     } else {
         f.line()
     }
+}
+
+/// Planned work the check still found not done after its fix round, for
+/// the top of the description. The run opens the pull request as a draft
+/// with it instead of ending without one; it stays a draft while this is
+/// there ([`holds_unfinished`]). Empty when there is none.
+pub fn unfinished_section(findings: &[Finding]) -> String {
+    let items: Vec<String> = planned_work(findings)
+        .iter()
+        .map(|f| {
+            let what = sentence(&f.detail, MAX_WHAT);
+            match sentence(&f.settle, MAX_SETTLE) {
+                s if s.is_empty() => format!("- {what}"),
+                s => format!("- {what} {s}"),
+            }
+        })
+        .collect();
+    if items.is_empty() {
+        return String::new();
+    }
+    format!(
+        "{UNFINISHED_START}\n## Not finished\nThis pull request stays a draft: the check before \
+         it found planned work still not done after its fix round.\n{}\n{UNFINISHED_END}",
+        items.join("\n")
+    )
+}
+
+/// Whether the description still lists planned work not done.
+pub fn holds_unfinished(body: &str) -> bool {
+    body.contains(UNFINISHED_START)
 }
 
 /// Whether the description still holds a security item: the pull request
@@ -1297,7 +1318,12 @@ pub fn with_security_items(body: &str, items: &[Finding]) -> Option<String> {
 /// only a person can check never goes here (see [`manual_steps`]). No
 /// callout banner. Empty when there is nothing open.
 pub fn gaps_section(findings: &[Finding]) -> String {
-    let of = |s: Settler| findings.iter().filter(move |f| f.settler() == s);
+    // Planned work not done has its own section at the top.
+    let of = |s: Settler| {
+        findings
+            .iter()
+            .filter(move |f| f.settler() == s && f.point.trim() != "planned_work")
+    };
     let items: Vec<String> = of(Settler::Proof)
         .chain(of(Settler::Owner))
         .map(item_line)
@@ -1356,7 +1382,7 @@ pub fn settle_by_ci(body: &str) -> Option<String> {
 }
 
 /// What the plan says the change is for, for the judge.
-fn plan_context(plan: &PlanResult) -> String {
+fn plan_context(plan: &PlanResult, settled: &[String]) -> String {
     let mut out = plan.proposal.trim().to_string();
     if let Some(d) = &plan.fix {
         out.push_str(&super::fix_location::reviewer_context(d));
@@ -1366,7 +1392,44 @@ fn plan_context(plan: &PlanResult) -> String {
         out.push_str("\n\n### The plan's task checklist\n");
         out.push_str(common::truncate_str(plan.tasks.trim(), 8_000));
     }
+    if !settled.is_empty() {
+        out.push_str(
+            "\n\n### Generated files their generator settled\nThe generator check ran these \
+             files' generator to the end and committed its output (or verified it up to date). \
+             A checklist task for one of them is done, whatever the diff shows of it:\n",
+        );
+        for g in settled {
+            out.push_str(&format!("- `{g}`\n"));
+        }
+    }
     out
+}
+
+/// The findings without planned work for a generated file its generator
+/// settled (see `generators::GateOk`): the generator owns that file, ran to
+/// the end and its output is committed or verified, so the task is done.
+/// Paths are compared in one spelling (`..` resolved).
+pub fn drop_settled_generated(findings: Vec<Finding>, settled: &[String]) -> Vec<Finding> {
+    if settled.is_empty() {
+        return findings;
+    }
+    findings
+        .into_iter()
+        .filter(|f| {
+            if f.point.trim() != "planned_work" {
+                return true;
+            }
+            let text = format!("{} {}", f.detail, f.settle);
+            let named = text
+                .split(|c: char| {
+                    c.is_whitespace() || matches!(c, '`' | '\'' | '"' | '(' | ')' | ',' | ';')
+                })
+                .map(|t| t.trim_end_matches(['.', ':']))
+                .filter(|t| t.contains('/') || t.contains('.'))
+                .any(|t| super::generators::is_settled(settled, t));
+            !named
+        })
+        .collect()
 }
 
 /// The judge's reading of the change on `branch`. `None` when it couldn't
@@ -1379,6 +1442,7 @@ pub async fn judge(
     github: &GitHubClient,
     branch: &str,
     plan: &PlanResult,
+    settled: &[String],
     evidence: &mut RunEvidence,
     provider: &ModelProvider,
     usage: &mut TokenUsage,
@@ -1407,7 +1471,7 @@ pub async fn judge(
     let evidence = &*evidence;
     let prompt = judge_prompt(
         &msg.title,
-        &plan_context(plan),
+        &plan_context(plan, settled),
         &diff,
         evidence,
         &msg.team_instructions,
@@ -1453,6 +1517,9 @@ pub struct Work<'a> {
     pub run_id: &'a str,
     /// When the fix round must wrap up (the invocation's deadline).
     pub deadline: Option<std::time::Instant>,
+    /// Generated files their generator settled (`generators::GateOk`):
+    /// never planned work left for the coder.
+    pub generated: &'a [String],
 }
 
 /// Judges the change, runs the fix round a gap earns, and judges again.
@@ -1471,9 +1538,18 @@ pub async fn prove(
         let pass_start = std::time::Instant::now();
         let usage_before = usage.clone();
         let judged = judge(
-            w.state, w.msg, w.github, w.branch, w.plan, evidence, w.provider, usage,
+            w.state,
+            w.msg,
+            w.github,
+            w.branch,
+            w.plan,
+            w.generated,
+            evidence,
+            w.provider,
+            usage,
         )
-        .await;
+        .await
+        .map(|f| drop_settled_generated(f, w.generated));
         let recorded = recorded_gaps(evidence).len();
         let findings = with_checklist(
             with_recorded(judged, evidence),
@@ -1520,7 +1596,7 @@ pub async fn prove(
                     &w.msg.team_id,
                     w.run_id,
                     &format!(
-                        "Proof check: {} planned task(s) still not done; the pull request won't open without them",
+                        "Proof check: {} planned task(s) still not done after the fix round; they go at the top of the pull request, which stays a draft",
                         planned_work(&gaps).len()
                     ),
                 )
@@ -2518,6 +2594,51 @@ mod planned_work_tests {
         }
     }
 
+    /// The production run: the generator check committed the studio's
+    /// typegen output, and the judge still called the generated file's task
+    /// not done. A generated file its generator settled is never planned
+    /// work; other planned work still is.
+    #[test]
+    fn a_settled_generated_file_is_never_planned_work() {
+        let gaps = vec![
+            f(
+                "planned_work",
+                "The task to regenerate `apps/web/src/lib/sanity/sanity.types.ts` with `pnpm typegen` is not done, so the generated types lack the new blocks.",
+            ),
+            f(
+                "planned_work",
+                "The task for apps/studio/../web/src/lib/sanity/sanity.types.ts is not done.",
+            ),
+            f(
+                "planned_work",
+                "The hours block in `apps/web/src/components/hours.tsx` is not built.",
+            ),
+            f("impact", "apps/web/src/lib/sanity/sanity.types.ts size not measured."),
+        ];
+        let settled = vec!["apps/web/src/lib/sanity/sanity.types.ts".to_string()];
+        let kept = drop_settled_generated(gaps.clone(), &settled);
+        let details: Vec<&str> = kept.iter().map(|f| f.detail.as_str()).collect();
+        assert_eq!(kept.len(), 2, "{details:?}");
+        assert!(details[0].contains("hours.tsx"));
+        assert_eq!(kept[1].point, "impact");
+        // Nothing settled: nothing dropped.
+        assert_eq!(drop_settled_generated(gaps, &[]).len(), 4);
+        // The judge is told which files are settled.
+        let ctx = plan_context(
+            &PlanResult {
+                proposal: "p".into(),
+                tasks: "- [ ] apps/web/src/lib/sanity/sanity.types.ts: (generated)".into(),
+                spec: String::new(),
+                design: String::new(),
+                repo_tasks: vec![],
+                fix: None,
+            },
+            &settled,
+        );
+        assert!(ctx.contains("Generated files their generator settled"));
+        assert!(ctx.contains("`apps/web/src/lib/sanity/sanity.types.ts`"));
+    }
+
     #[test]
     fn planned_work_gets_a_round_then_holds_the_pr() {
         let gaps = vec![
@@ -2528,15 +2649,22 @@ mod planned_work_tests {
             f("impact", "Records affected were not counted."),
         ];
         assert_eq!(next(Some(&gaps), 0, true), Next::FixRound);
-        // No round left: never "open with the gaps listed".
+        // No round left: unfinished (the PR opens as a draft with it at
+        // the top, never without a PR).
         assert_eq!(next(Some(&gaps), 1, true), Next::Unfinished);
         assert_eq!(next(Some(&gaps), 0, false), Next::Unfinished);
         // Other gaps alone still open with Open items.
         assert_eq!(next(Some(&gaps[1..]), 1, true), Next::OpenWithGaps);
-        let why = unfinished_reason(&gaps);
-        assert!(why.starts_with("Stopped before opening a pull request"));
-        assert!(why.contains("tabs.tsx"));
-        assert!(!why.contains("Records affected"));
+        let top = unfinished_section(&gaps);
+        assert!(top.starts_with(UNFINISHED_START));
+        assert!(top.contains("## Not finished"));
+        assert!(top.contains("tabs.tsx"));
+        assert!(!top.contains("Records affected"));
+        assert!(holds_unfinished(&top));
+        // Not listed twice: Open items leave planned work to the top.
+        let open = gaps_section(&gaps);
+        assert!(!open.contains("tabs.tsx"));
+        assert!(open.contains("Records affected"));
         assert_eq!(gaps[0].settler(), Settler::Proof);
         assert!(fix_feedback(&gaps).contains("Planned work not done"));
     }
@@ -2560,7 +2688,7 @@ mod planned_work_tests {
             repo_tasks: vec![],
             fix: None,
         };
-        let ctx = plan_context(&plan);
+        let ctx = plan_context(&plan, &[]);
         assert!(ctx.contains("The plan's task checklist"));
         assert!(ctx.contains("`src/a.ts`"));
     }

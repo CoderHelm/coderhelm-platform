@@ -2472,6 +2472,21 @@ impl<'a> WriteToolExecutor<'a> {
             }
             Ok(o) if o.ran && o.passed => {
                 crate::clients::sandbox::EgressBlocks::clear(run_id);
+                // Files it changed that couldn't come back are named, never
+                // left out of the result.
+                let dropped = if o.dropped.is_empty() {
+                    String::new()
+                } else {
+                    format!(
+                        " NOT committed ({}): {}. Don't write these files by hand; the run \
+                         reports it.",
+                        "the sandbox couldn't hand them back",
+                        o.dropped.join("; ")
+                    )
+                };
+                if o.changed.is_empty() && !dropped.is_empty() {
+                    return Ok(json!(format!("Codegen ran.{dropped}")));
+                }
                 if o.changed.is_empty() {
                     return Ok(json!(format!(
                         "Codegen ran cleanly but changed no files (nothing to regenerate). \
@@ -2512,8 +2527,8 @@ impl<'a> WriteToolExecutor<'a> {
                             self.scope_guard.allow(p);
                         }
                         Ok(json!(format!(
-                            "Regenerated and committed {} file(s): {}. Now call run_checks to \
-                             confirm the type errors are resolved.",
+                            "Regenerated and committed {} file(s): {}.{dropped} Now call \
+                             run_checks to confirm the type errors are resolved.",
                             paths.len(),
                             paths.join(", ")
                         )))

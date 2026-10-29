@@ -30,6 +30,9 @@ pub struct PrResult {
 pub struct Proof<'a> {
     pub evidence: &'a str,
     pub gaps: &'a str,
+    /// Planned work not done after the check's fix round, for the top of
+    /// the description (`proof::unfinished_section`); empty when none.
+    pub unfinished: &'a str,
     pub manual: &'a str,
     pub ci: &'a [CiCommand],
     pub mirrors: &'a [super::completeness::Mirror],
@@ -1412,6 +1415,7 @@ fn owned_sections(plan: &PlanResult, proof: &Proof<'_>, repo: &str) -> super::co
         } else {
             proof.gaps.to_string()
         },
+        unfinished: proof.unfinished.to_string(),
     }
 }
 
@@ -1959,6 +1963,7 @@ mod refresh_tests {
         let proof = super::Proof {
             evidence: "",
             gaps: &gaps,
+            unfinished: "",
             manual: "",
             ci: &[],
             mirrors: &mirrors,

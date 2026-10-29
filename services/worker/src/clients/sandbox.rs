@@ -256,9 +256,15 @@ impl EgressBlocks {
 const MARKER_CODEGEN_END: &str = "CODERHELM_CODEGEN_END exit=";
 const MARKER_CODEGEN_UPLOADED: &str = "===CODERHELM_CODEGEN_UPLOADED===";
 const MARKER_CODEGEN_UPLOAD_FAILED: &str = "===CODERHELM_CODEGEN_UPLOAD_FAILED===";
-/// Caps on captured codegen output (regenerated files are large but bounded).
-const MAX_CODEGEN_FILES: usize = 40;
-const MAX_CODEGEN_FILE_BYTES: u64 = 5 * 1024 * 1024;
+/// Caps on captured codegen output (regenerated files are large but
+/// bounded). A generated types file for a large CMS schema passed the old
+/// 5 MB cap and was dropped without a word: the run committed one of the two
+/// files the generator changed and called it regenerated. A file past a cap
+/// is now named in `CodegenOutcome::dropped`, never left out silently. The
+/// size cap stays well under GitHub's 100 MB blob limit and the worker's
+/// memory.
+const MAX_CODEGEN_FILES: usize = 200;
+const MAX_CODEGEN_FILE_BYTES: u64 = 50 * 1024 * 1024;
 
 /// Result of a sandbox codegen run — the files the repo's codegen CHANGED,
 /// captured for the worker to commit back to the branch (making the sandbox
@@ -270,6 +276,10 @@ pub struct CodegenOutcome {
     pub passed: bool,
     /// (path, content) for each file codegen created or modified.
     pub changed: Vec<(String, String)>,
+    /// Files codegen changed that couldn't be brought back (too large, not
+    /// text, past the file cap), each with why. A run with any is not a
+    /// complete regeneration.
+    pub dropped: Vec<String>,
     /// Tail of the codegen output.
     pub output: String,
 }
@@ -280,9 +290,59 @@ impl CodegenOutcome {
             ran: false,
             passed: false,
             changed: Vec::new(),
+            dropped: Vec::new(),
             output: reason.into(),
         }
     }
+}
+
+/// The files of a codegen build's changed-files archive: the text files to
+/// commit, and the ones left out with why.
+#[derive(Debug, Default, PartialEq)]
+pub struct Captured {
+    pub files: Vec<(String, String)>,
+    pub dropped: Vec<String>,
+}
+
+/// Reads a changed-files archive (tar.gz, paths from the repository root).
+pub fn read_changed_tar(
+    bytes: &[u8],
+    max_files: usize,
+    max_bytes: u64,
+) -> Result<Captured, Box<dyn std::error::Error + Send + Sync>> {
+    let gz = flate2::read::GzDecoder::new(bytes);
+    let mut ar = tar::Archive::new(gz);
+    let mut out = Captured::default();
+    for entry in ar.entries()? {
+        let mut entry = entry?;
+        if entry.header().entry_type() != tar::EntryType::Regular {
+            continue;
+        }
+        let path = entry.path()?.to_string_lossy().replace('\\', "/");
+        let path = path.trim_start_matches("./").to_string();
+        if out.files.len() >= max_files {
+            out.dropped
+                .push(format!("`{path}` (more than {max_files} changed files)"));
+            continue;
+        }
+        if entry.size() > max_bytes {
+            warn!(path = %path, bytes = entry.size(), "codegen: changed file over the size cap");
+            out.dropped.push(format!(
+                "`{path}` ({} MB, over the {} MB cap)",
+                entry.size() / (1024 * 1024),
+                max_bytes / (1024 * 1024)
+            ));
+            continue;
+        }
+        let mut content = String::new();
+        use std::io::Read;
+        if entry.read_to_string(&mut content).is_err() {
+            out.dropped.push(format!("`{path}` (not a text file)"));
+            continue;
+        }
+        out.files.push((path, content));
+    }
+    Ok(out)
 }
 
 /// Thin driver over CodeBuild + S3 + CloudWatch Logs. Holds only borrows from
@@ -657,8 +717,8 @@ impl<'a> SandboxClient<'a> {
         // for builds that had ALREADY succeeded and uploaded the regenerated
         // files, so the agent re-ran the (expensive, always-succeeding) codegen
         // build over and over until the pass timed out. Check S3 first.
-        let changed = self.download_changed(out_key).await.unwrap_or_default();
-        if !changed.is_empty() {
+        let captured = self.download_changed(out_key).await.unwrap_or_default();
+        if !captured.files.is_empty() || !captured.dropped.is_empty() {
             let output = self
                 .fetch_log(group, stream)
                 .await
@@ -667,7 +727,8 @@ impl<'a> SandboxClient<'a> {
             return Ok(CodegenOutcome {
                 ran: true,
                 passed: true,
-                changed,
+                changed: captured.files,
+                dropped: captured.dropped,
                 output,
             });
         }
@@ -706,11 +767,12 @@ impl<'a> SandboxClient<'a> {
         // not be dropped as "nothing to regenerate".
         if printed(&full, MARKER_CODEGEN_UPLOADED) {
             let retry = self.download_changed(out_key).await.unwrap_or_default();
-            if !retry.is_empty() {
+            if !retry.files.is_empty() || !retry.dropped.is_empty() {
                 return Ok(CodegenOutcome {
                     ran: true,
                     passed: true,
-                    changed: retry,
+                    changed: retry.files,
+                    dropped: retry.dropped,
                     output,
                 });
             }
@@ -725,16 +787,18 @@ impl<'a> SandboxClient<'a> {
             ran: true,
             passed,
             changed: Vec::new(),
+            dropped: Vec::new(),
             output,
         })
     }
 
     /// Download the captured tar.gz of changed files and read them into
-    /// (path, content) pairs, bounded in count and per-file size.
+    /// (path, content) pairs, bounded in count and per-file size; what the
+    /// bounds leave out is named.
     async fn download_changed(
         &self,
         out_key: &str,
-    ) -> Result<Vec<(String, String)>, Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<Captured, Box<dyn std::error::Error + Send + Sync>> {
         let obj = self
             .s3
             .get_object()
@@ -744,30 +808,7 @@ impl<'a> SandboxClient<'a> {
             .await
             .map_err(|e| format!("codegen output download failed: {e}"))?;
         let bytes = obj.body.collect().await?.into_bytes();
-        let gz = flate2::read::GzDecoder::new(&bytes[..]);
-        let mut ar = tar::Archive::new(gz);
-        let mut out = Vec::new();
-        for entry in ar.entries()? {
-            let mut entry = entry?;
-            if entry.header().entry_type() != tar::EntryType::Regular {
-                continue;
-            }
-            if entry.size() > MAX_CODEGEN_FILE_BYTES {
-                warn!("codegen: skipping oversized changed file");
-                continue;
-            }
-            let path = entry.path()?.to_string_lossy().replace('\\', "/");
-            let mut content = String::new();
-            use std::io::Read;
-            if entry.read_to_string(&mut content).is_err() {
-                continue; // skip binary/non-utf8
-            }
-            out.push((path, content));
-            if out.len() >= MAX_CODEGEN_FILES {
-                break;
-            }
-        }
-        Ok(out)
+        read_changed_tar(&bytes, MAX_CODEGEN_FILES, MAX_CODEGEN_FILE_BYTES)
     }
 
     async fn build_and_read(
@@ -1404,6 +1445,52 @@ mod tests {
         assert!(get.contains("X-Amz-SignedHeaders=host&"), "{get}");
         let ttl = format!("X-Amz-Expires={}", PRESIGNED_URL_TTL.as_secs());
         assert!(get.contains(&ttl) && put.contains(&ttl), "{get}");
+    }
+
+    /// The production layout: the generator runs in `apps/studio` and writes
+    /// `../web/src/lib/sanity/sanity.types.ts`; the build lists both changed
+    /// files from the repository root. Both come back, and a file over a cap
+    /// is named, never dropped silently.
+    #[test]
+    fn both_changed_files_come_back_and_a_dropped_one_is_named() {
+        fn archive(files: &[(&str, &[u8])]) -> Vec<u8> {
+            let mut b = tar::Builder::new(flate2::write::GzEncoder::new(
+                Vec::new(),
+                flate2::Compression::fast(),
+            ));
+            for (p, data) in files {
+                let mut h = tar::Header::new_gnu();
+                h.set_size(data.len() as u64);
+                h.set_mode(0o644);
+                h.set_cksum();
+                b.append_data(&mut h, p, *data).unwrap();
+            }
+            b.into_inner().unwrap().finish().unwrap()
+        }
+        let types = vec![b'x'; 7 * 1024 * 1024];
+        let tgz = archive(&[
+            ("apps/studio/schema.json", b"{}"),
+            ("apps/web/src/lib/sanity/sanity.types.ts", &types),
+        ]);
+        let got = read_changed_tar(&tgz, MAX_CODEGEN_FILES, MAX_CODEGEN_FILE_BYTES).unwrap();
+        let paths: Vec<&str> = got.files.iter().map(|(p, _)| p.as_str()).collect();
+        assert_eq!(
+            paths,
+            [
+                "apps/studio/schema.json",
+                "apps/web/src/lib/sanity/sanity.types.ts"
+            ],
+            "the 7 MB types file passed the old 5 MB cap"
+        );
+        assert!(got.dropped.is_empty());
+        // Past a cap: named, with why.
+        let small = read_changed_tar(&tgz, MAX_CODEGEN_FILES, 5 * 1024 * 1024).unwrap();
+        assert_eq!(small.files.len(), 1);
+        assert_eq!(small.dropped.len(), 1);
+        assert!(small.dropped[0].contains("apps/web/src/lib/sanity/sanity.types.ts"));
+        assert!(small.dropped[0].contains("over the 5 MB cap"));
+        let one = read_changed_tar(&tgz, 1, MAX_CODEGEN_FILE_BYTES).unwrap();
+        assert!(one.dropped[0].contains("more than 1 changed files"));
     }
 
     #[test]

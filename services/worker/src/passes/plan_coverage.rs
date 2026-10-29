@@ -165,7 +165,7 @@ pub fn plan_tasks(tasks_md: &str) -> Vec<PlanTask> {
             || d.trim_start().starts_with("new ")
             || d.trim_start().starts_with("add new");
         out.push(PlanTask {
-            path: path.trim_start_matches("./").to_string(),
+            path: norm(path),
             task: desc.trim().to_string(),
             is_new,
             optional: is_optional(desc),
@@ -212,8 +212,9 @@ impl Coverage {
     }
 }
 
-fn norm(p: &str) -> &str {
-    p.trim().trim_start_matches("./").trim_start_matches('/')
+/// One spelling for a path (`..` resolved), the one the diff uses.
+fn norm(p: &str) -> String {
+    super::generators::normalize_path(p)
 }
 
 /// Whether the branch changes the task's file (or, for a directory, a file
@@ -221,9 +222,26 @@ fn norm(p: &str) -> &str {
 fn path_changed(path: &str, changed: &[String]) -> bool {
     let path = norm(path);
     if path.ends_with('/') {
-        return changed.iter().any(|c| norm(c).starts_with(path));
+        return changed.iter().any(|c| norm(c).starts_with(&path));
     }
     changed.iter().any(|c| norm(c) == path)
+}
+
+/// The coverage once the generator check has settled generated files:
+/// a generated task whose file its generator regenerated and committed, or
+/// verified up to date (`settled`: those generators' output globs), is
+/// done. The plan check, the proof check and the generator check then agree.
+pub fn settle_generated(mut cov: Coverage, settled: &[String]) -> Coverage {
+    let (now_done, still): (Vec<PlanTask>, Vec<PlanTask>) =
+        cov.missing.into_iter().partition(|t| {
+            t.generated
+                && settled
+                    .iter()
+                    .any(|g| super::generators::glob_match(g, &t.path))
+        });
+    cov.done.extend(now_done);
+    cov.missing = still;
+    cov
 }
 
 /// Each planned task, done when the branch changes its file. Structural, not
@@ -600,6 +618,41 @@ pub async fn close_gaps(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The production run: 32 of 33 tasks done, the open one the generated
+    /// types the studio's typegen writes to `../web/...`. Once the
+    /// generator check settles it, the plan check agrees it is done.
+    #[test]
+    fn a_settled_generated_task_is_done() {
+        let tasks_md = "- [ ] apps/studio/schemaTypes/blocks/hero.ts: add the block\n\
+                        - [ ] apps/web/src/lib/sanity/sanity.types.ts: (generated: the generator check runs it before the pull request)\n";
+        let mut tasks = plan_tasks(tasks_md);
+        mark_generated(
+            &mut tasks,
+            &["apps/studio/../web/src/lib/sanity/sanity.types.ts".to_string()],
+        );
+        assert!(tasks[1].generated);
+        let cov = coverage(
+            &tasks,
+            &["apps/studio/schemaTypes/blocks/hero.ts".to_string()],
+        );
+        assert_eq!(cov.generated_missing().len(), 1);
+        assert!(cov.required_missing().is_empty());
+        let settled = vec!["apps/web/src/lib/sanity/sanity.types.ts".to_string()];
+        let cov = settle_generated(cov, &settled);
+        assert_eq!(cov.done.len(), 2);
+        assert!(cov.missing.is_empty());
+        assert!(checked_tasks_md(tasks_md, &cov).matches("- [x]").count() == 2);
+        // A path spelled with `..` in the diff counts as the task's file.
+        let cov = coverage(
+            &tasks,
+            &["apps/studio/../web/src/lib/sanity/sanity.types.ts".to_string()],
+        );
+        assert!(cov.done.iter().any(|t| t.path.ends_with("sanity.types.ts")));
+        // Nothing settled: still the generator check's.
+        let cov = settle_generated(coverage(&tasks, &[]), &[]);
+        assert_eq!(cov.generated_missing().len(), 1);
+    }
 
     const PLAN: &str = "## Tasks\n\
         - [ ] `src/blocks/gallery/index.ts`: Create the gallery block component (new file)\n\

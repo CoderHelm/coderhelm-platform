@@ -165,6 +165,9 @@ impl Gate {
 pub struct Carry {
     pub security: security::Verdict,
     pub security_round: Option<String>,
+    /// Generated outputs the generator check settled (for a step resuming
+    /// at the checks after it).
+    pub generated: Vec<String>,
 }
 
 impl Carry {
@@ -178,6 +181,7 @@ impl Carry {
             "security": kind,
             "text": text,
             "round": self.security_round,
+            "generated": self.generated,
         })
         .to_string()
     }
@@ -194,6 +198,14 @@ impl Carry {
         Some(Carry {
             security,
             security_round: v["round"].as_str().map(str::to_string),
+            generated: v["generated"]
+                .as_array()
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|g| g.as_str().map(str::to_string))
+                        .collect()
+                })
+                .unwrap_or_default(),
         })
     }
 }
@@ -437,14 +449,17 @@ mod tests {
             Carry {
                 security: security::Verdict::Passed,
                 security_round: None,
+                generated: vec![],
             },
             Carry {
                 security: security::Verdict::Findings("### SQLi\nFile: a.rs".into()),
                 security_round: Some("fix them".into()),
+                generated: vec!["apps/web/src/lib/sanity/sanity.types.ts".into()],
             },
             Carry {
                 security: security::Verdict::NotChecked("api down".into()),
                 security_round: Some("recheck".into()),
+                generated: vec![],
             },
         ] {
             assert_eq!(Carry::from_json(&c.to_json()), Some(c));
