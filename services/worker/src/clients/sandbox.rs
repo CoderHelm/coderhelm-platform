@@ -23,6 +23,8 @@ use aws_sdk_codebuild::types::{EnvironmentVariable, EnvironmentVariableType, Sta
 use aws_sdk_s3::presigning::PresigningConfig;
 
 const MARKER_END: &str = "CODERHELM_CHECKS_END exit=";
+/// What a codegen build CodeBuild timed out reports: a tooling failure.
+pub const CODEGEN_TIMED_OUT: &str = "the sandbox build timed out (CodeBuild TIMED_OUT)";
 const MARKER_START: &str = "===CODERHELM_CHECKS_START===";
 /// Poll cadence while a build runs.
 const POLL_INTERVAL: Duration = Duration::from_secs(6);
@@ -615,6 +617,11 @@ impl<'a> SandboxClient<'a> {
                 .map_err(|e| format!("codebuild batch_get_builds failed: {e}"))?;
             let build = builds.builds().first().ok_or("no build record")?;
             let status = build.build_status();
+            if matches!(status, Some(StatusType::TimedOut)) {
+                // CodeBuild's own build timeout: the sandbox, not the change
+                // and not this step's time.
+                return Ok(CodegenOutcome::not_run(CODEGEN_TIMED_OUT));
+            }
             if !matches!(status, Some(StatusType::InProgress)) {
                 let (group, stream) = build
                     .logs()

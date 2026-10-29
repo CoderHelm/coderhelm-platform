@@ -730,6 +730,18 @@ test("sign-in: hosted keeps its open pool (no pre-sign-up trigger) and optional 
   assert.ok(pool.Properties.LambdaConfig.CustomMessage);
 });
 
+test("worker queues: visibility 6x the worker timeout, redrive count 5", () => {
+  const api = synth(selfHost())["coderhelm-prod-api"];
+  for (const name of ["tickets", "ci-fix", "feedback", "webhooks"]) {
+    const queues = api.findResources("AWS::SQS::Queue", {
+      Properties: { QueueName: `coderhelm-prod-${name}` },
+    });
+    const q = (Object.values(queues)[0] as any).Properties;
+    assert.equal(q.VisibilityTimeout, 5400, name);
+    assert.equal(q.RedrivePolicy.maxReceiveCount, 5, name);
+  }
+});
+
 test("outbound webhooks: one queue, wired to the worker, sendable by every emitter", () => {
   const t = synth(selfHost());
   const api = t["coderhelm-prod-api"];
@@ -739,9 +751,9 @@ test("outbound webhooks: one queue, wired to the worker, sendable by every emitt
   const ids = Object.keys(queues);
   assert.equal(ids.length, 1, "one webhooks queue");
   const q = (queues[ids[0]] as any).Properties;
-  // Visible longer than the worker can run, retried into the shared DLQ.
-  assert.equal(q.VisibilityTimeout, 960);
-  assert.equal(q.RedrivePolicy.maxReceiveCount, 3);
+  // AWS: visibility at least 6x the worker's 900 s, redrive count at least 5.
+  assert.equal(q.VisibilityTimeout, 5400);
+  assert.equal(q.RedrivePolicy.maxReceiveCount, 5);
   // Every function that emits or sends knows the queue.
   const gw = envOf(api, "coderhelm-prod-gateway");
   assert.ok(gw.WEBHOOK_QUEUE_URL, "gateway");

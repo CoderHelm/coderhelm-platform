@@ -10,27 +10,10 @@ const LAMBDA_TIMEOUT_SECS: u64 = 900;
 /// Minimum seconds remaining before we'll start a new implement cycle.
 const MIN_TIME_FOR_REMEDIATION_SECS: u64 = 240; // 4 minutes
 
-/// Auto-continuation: a big ticket that times out mid-implement is re-enqueued
-/// to continue from its partial (already-committed) branch state, rather than
-/// stopping at a partial PR. Hard-bounded two ways so it can NEVER loop:
-const MAX_CONTINUATIONS: u32 = 3;
-/// ...and a wall-clock backstop across all continuations (survives a bad count).
-const MAX_CONTINUATION_WALL_SECS: u64 = 45 * 60;
-
-/// May a timed-out run be auto-continued? Pure + total so it's unit-tested.
-/// False the moment EITHER bound is hit — defense in depth against a runaway.
-fn should_auto_continue(continuation: u32, first_attempt_ms: u64, now_ms: u64) -> bool {
-    if continuation >= MAX_CONTINUATIONS {
-        return false;
-    }
-    if first_attempt_ms > 0 {
-        let elapsed_secs = now_ms.saturating_sub(first_attempt_ms) / 1000;
-        if elapsed_secs >= MAX_CONTINUATION_WALL_SECS {
-            return false;
-        }
-    }
-    true
-}
+/// Before opening the pull request, at least this much of the step must be
+/// left (conflict resolution and the description are model calls); with
+/// less, the run continues in a fresh step at the checks before the PR.
+const MIN_TIME_FOR_PR_SECS: u64 = 150;
 
 /// Other repos of the same owner that an agent tried to read or edit, by the
 /// paths it passed (`owner/other-repo/path/to/file`): a sign the ticket's
@@ -125,20 +108,38 @@ async fn requeue_after_model_error(state: &WorkerState, msg: &TicketMessage, run
     }
 }
 
-/// Auto-continue a run that ran out of budget (wall-clock OR step limit) with
-/// real partial work already committed to its branch: re-enqueue the ticket to
-/// resume from that branch (reusing run_id). Hard-bounded by count AND
-/// wall-clock via `should_auto_continue` so it can NEVER loop, and only when a
-/// partial checkpoint + ticket queue exist. Returns true iff a continuation was
-/// enqueued. Shared by both orchestration death paths (timeout + error arms) so
-/// they can't drift.
+/// What asking for the next step came to.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum Handoff {
+    /// The next step is queued.
+    Continued,
+    /// No next step, and why (no work committed, the team's usage limit,
+    /// the runaway ceiling, or the queue refused it).
+    Stopped(String),
+}
+
+impl Handoff {
+    fn continued(&self) -> bool {
+        matches!(self, Handoff::Continued)
+    }
+}
+
+/// Continue a run in a fresh step (its own invocation, its own time) from
+/// the work already committed to its branch: a NEW queue message for the
+/// same run_id, one step on, so every step starts with a receive count of 1
+/// (never a retry of this message, never a timeout redelivery). The run
+/// keeps going as long as its steps make progress (checked when the next
+/// step starts, see `steps`); only the team's usage limit, a person
+/// cancelling and the runaway ceiling stop it here. `why` is what the run
+/// page reads ("... continuing in step N").
 async fn try_auto_continue(
     state: &WorkerState,
     msg: &TicketMessage,
     run_id: &str,
     checkpoint: &Option<(String, String, u8)>,
     continuable_passes: &[&str],
-) -> bool {
+    why: &str,
+) -> Handoff {
     // Gate on the checkpoint's pass IDENTITY, not just on there being a branch.
     // The wall-clock-timeout arm passes the broad set (any late pass with work
     // committed is worth resuming); the step-budget arm passes only
@@ -147,8 +148,20 @@ async fn try_auto_continue(
     // checkpoint. Callers own this invariant; don't widen it here.
     let has_partial = matches!(checkpoint, Some((lp, br, _))
         if !br.is_empty() && continuable_passes.contains(&lp.as_str()));
-    if !has_partial || state.config.ticket_queue_url.is_empty() {
-        return false;
+    if !has_partial {
+        return Handoff::Stopped("no work is committed to continue from".into());
+    }
+    if state.config.ticket_queue_url.is_empty() {
+        return Handoff::Stopped("no queue to continue on".into());
+    }
+    if let Some(reason) = check_budget_exceeded(state, &msg.team_id).await {
+        return Handoff::Stopped(reason);
+    }
+    if !steps::under_ceiling(msg.continuation) {
+        return Handoff::Stopped(format!(
+            "the run reached the safety ceiling of {} steps",
+            steps::MAX_RUN_STEPS
+        ));
     }
     let now_ms = chrono::Utc::now().timestamp_millis().max(0) as u64;
     let first_ms = if msg.first_attempt_ms > 0 {
@@ -156,39 +169,41 @@ async fn try_auto_continue(
     } else {
         now_ms
     };
-    if !should_auto_continue(msg.continuation, first_ms, now_ms) {
-        return false;
-    }
-    let mut cont = msg.clone();
-    cont.continuation = msg.continuation + 1;
-    cont.continuation_run_id = Some(run_id.to_string());
-    cont.first_attempt_ms = first_ms;
-    match serde_json::to_string(&crate::models::WorkerMessage::Ticket(cont)) {
-        Ok(body) => match state
-            .sqs
-            .send_message()
-            .queue_url(&state.config.ticket_queue_url)
-            .message_body(body)
-            .delay_seconds(5)
-            .send()
-            .await
-        {
-            Ok(_) => {
-                info!(
-                    run_id,
-                    next_continuation = msg.continuation + 1,
-                    "Ran out of budget with partial work — auto-continuing (bounded)"
-                );
-                true
-            }
-            Err(e) => {
-                warn!(run_id, error = %e, "Continuation enqueue failed — falling back to salvage");
-                false
-            }
-        },
+    let next = steps::next_message(msg, run_id, first_ms);
+    let step = steps::step_number(next.continuation);
+    let body = match serde_json::to_string(&crate::models::WorkerMessage::Ticket(next)) {
+        Ok(b) => b,
         Err(e) => {
-            warn!(run_id, error = %e, "Continuation serialize failed — falling back to salvage");
-            false
+            warn!(run_id, error = %e, "Continuation serialize failed");
+            return Handoff::Stopped(format!("the next step couldn't be written ({e})"));
+        }
+    };
+    match state
+        .sqs
+        .send_message()
+        .queue_url(&state.config.ticket_queue_url)
+        .message_body(body)
+        .delay_seconds(steps::STEP_DELAY_SECS)
+        .send()
+        .await
+    {
+        Ok(_) => {
+            info!(run_id, next_step = step, "Continuing in a fresh step");
+            add_progress_note(
+                state,
+                &msg.team_id,
+                run_id,
+                &format!("{why}: continuing in step {step} with its own time budget"),
+            )
+            .await;
+            // Last write to the run in this step: the sweep reads a queued
+            // time after the last update as "a step is waiting".
+            steps::mark_queued(state, &msg.team_id, run_id, step).await;
+            Handoff::Continued
+        }
+        Err(e) => {
+            warn!(run_id, error = %e, "Continuation enqueue failed");
+            Handoff::Stopped(format!("the next step couldn't be queued ({e})"))
         }
     }
 }
@@ -360,9 +375,7 @@ pub(crate) async fn acquire_run_writer_guard(
 
 #[cfg(test)]
 mod continuation_tests {
-    use super::{
-        is_budget_exhausted, should_auto_continue, MAX_CONTINUATIONS, MAX_CONTINUATION_WALL_SECS,
-    };
+    use super::is_budget_exhausted;
 
     #[test]
     fn budget_exhausted_classifies_step_limit() {
@@ -379,38 +392,90 @@ mod continuation_tests {
         assert!(!is_budget_exhausted("GitHub API 404: issue not found"));
     }
 
-    #[test]
-    fn stops_at_max_count() {
-        assert!(should_auto_continue(0, 0, 0));
-        assert!(should_auto_continue(MAX_CONTINUATIONS - 1, 0, 0));
-        assert!(!should_auto_continue(MAX_CONTINUATIONS, 0, 0)); // cap hit
-        assert!(!should_auto_continue(MAX_CONTINUATIONS + 5, 0, 0));
+    fn run_passes_src() -> &'static str {
+        let src = include_str!("mod.rs");
+        let start = src.find("\nasync fn run_passes(").unwrap();
+        let end = src.find("\nasync fn hand_off_at(").unwrap();
+        &src[start..end]
     }
 
+    /// The generator gate without time for its build hands the run to a
+    /// fresh step at that gate; the checks and the PR do the same.
     #[test]
-    fn stops_past_wall_clock() {
-        let start = 1_000_000_000u64;
-        // within budget → allowed
-        assert!(should_auto_continue(1, start, start + 10 * 60 * 1000));
-        // past the wall-clock budget → stopped even though count is fine
-        let past = start + (MAX_CONTINUATION_WALL_SECS + 60) * 1000;
-        assert!(!should_auto_continue(1, start, past));
+    fn a_gate_that_lacks_time_schedules_a_continuation_at_that_gate() {
+        let rp = run_passes_src();
+        let needs = rp
+            .find("Err(generators::GateStop::NeedsTime) => {")
+            .unwrap();
+        let after = &rp[needs..needs + 600];
+        assert!(after.contains("hand_off_at("));
+        assert!(after.contains("steps::Gate::Generators"));
+        for why in [
+            "The proof check found planned work not done",
+            "The link and redirect check needs a fix round",
+            "The test-fix check needs a fix round",
+            "The new-feature check needs a fix round",
+            "opening the pull request needs more time",
+        ] {
+            let at = rp
+                .find(why)
+                .unwrap_or_else(|| panic!("no hand-off for: {why}"));
+            assert!(rp[at - 400..at].contains("steps::Gate::Checks"), "{why}");
+        }
+        assert!(!rp.contains("not enough time left"));
+        // A hand-off that can't continue says why, never a bare timeout.
+        let src = include_str!("mod.rs");
+        let h = &src[src.find("\nasync fn hand_off_at(").unwrap()..];
+        let h = &h[..h.find("\n}\n").unwrap()];
+        assert!(h.contains("steps::save_gate("));
+        assert!(h.contains("try_auto_continue("));
+        assert!(h.contains("couldn't continue in a"));
     }
 
+    /// A continuation resumes at the gate the last step handed off at: the
+    /// hand-off's checkpoint ("implement") is one a step resumes from
+    /// without implementing again, and the gate decides which stages run.
     #[test]
-    fn count_cap_beats_fresh_clock() {
-        // Even with a fresh clock, the count cap still stops it.
-        assert!(!should_auto_continue(
-            MAX_CONTINUATIONS,
-            1_000_000_000,
-            1_000_000_000
-        ));
+    fn a_continuation_resumes_at_the_gate() {
+        let rp = run_passes_src();
+        let skip = rp.find("let can_skip_implement").unwrap();
+        assert!(rp[skip..skip + 300].contains("\"implement\""));
+        assert!(rp.contains("let resume_gate = if can_skip_implement {\n        step_state.gate"));
+        assert!(rp.contains("let coverage = if resume_gate.is_some() {"));
+        assert!(rp.contains("let run_verify = steps::Gate::Verify.runs_from(resume_gate);"));
+        assert!(rp.contains("if steps::Gate::Generators.runs_from(resume_gate) {"));
+        // The security verdict a resumed step skips comes from the carry.
+        assert!(rp.contains("step_state.carry.clone().filter(|_| !run_verify)"));
+        // And the worker's own generator run comes before test and security.
+        let gen = rp.find("generators::after_step(&gen_work)").unwrap();
+        let test = rp.find("// --- Adversarial Test").unwrap();
+        let sec = rp.find("// --- Security Audit").unwrap();
+        assert!(gen < test && test < sec);
     }
 
+    /// The team's usage limit stops a run between steps: the next step is
+    /// never queued once the meter says so (and a queued one is refused by
+    /// the budget gate every step starts with).
     #[test]
-    fn zero_first_attempt_ignores_wall_clock() {
-        // first_attempt_ms == 0 means "unset" — only the count bounds apply.
-        assert!(should_auto_continue(0, 0, u64::MAX));
+    fn the_usage_limit_stops_a_run_between_steps() {
+        let src = include_str!("mod.rs");
+        let start = src.find("\nasync fn try_auto_continue(").unwrap();
+        let body = &src[start..start + src[start..].find("\n}\n").unwrap()];
+        let budget = body
+            .find("check_budget_exceeded(state, &msg.team_id)")
+            .unwrap();
+        let send = body.find(".send_message()").unwrap();
+        assert!(
+            budget < send,
+            "the usage check comes before the next step is sent"
+        );
+        assert!(body.contains("return Handoff::Stopped(reason);"));
+        let rp = src.find("\nasync fn run_passes(").unwrap();
+        let gate = src[rp..]
+            .find("check_budget_exceeded(state, &msg.team_id)")
+            .unwrap();
+        let first_pass = src[rp..].find("update_pass(").unwrap();
+        assert!(gate < first_pass, "every step starts with the usage check");
     }
 }
 
@@ -768,12 +833,14 @@ pub mod review_verdict;
 pub mod rewards;
 pub(crate) mod round;
 mod run_end;
+pub(crate) mod run_lists;
 mod security;
 #[cfg(test)]
 mod selfhost_links;
 pub mod skill_compat;
 pub mod skill_suggest;
 pub mod skills;
+pub(crate) mod steps;
 pub(crate) mod stop_gate;
 pub mod syntax_check;
 pub(crate) mod terraform;
@@ -934,8 +1001,16 @@ pub async fn orchestrate_ticket(
                 // stays correct even if a future non-implement pass propagates the
                 // same step-limit message — it won't match this checkpoint.
                 let continued = is_budget_exhausted(&err_msg)
-                    && try_auto_continue(state, &msg, &run_id, &checkpoint, &["implement_started"])
-                        .await;
+                    && try_auto_continue(
+                        state,
+                        &msg,
+                        &run_id,
+                        &checkpoint,
+                        &["implement_started"],
+                        "The coder used this step's turns with work left",
+                    )
+                    .await
+                    .continued();
                 // A transient model failure (5xx incl. 520-524, 429, 529, no
                 // response) that outlasted the client's own retries is not the
                 // ticket's fault: the run is sent again later (same run_id), by
@@ -1009,18 +1084,20 @@ pub async fn orchestrate_ticket(
             // from the already-committed partial work (bounded — see helper). A
             // wall-clock timeout can strand real work in any late pass, so the
             // full continuable set applies here.
-            let continued = try_auto_continue(
+            let handoff = try_auto_continue(
                 state,
                 &msg,
                 &run_id,
                 &checkpoint,
                 &["implement", "implement_started", "security"],
+                "This step reached its time limit with work left",
             )
             .await;
 
-            // Fallback (bounds hit, no queue, or enqueue failed): salvage the
-            // partial work as a draft PR, else fail.
-            if !continued {
+            // Fallback (the usage limit, no work committed, no queue, or the
+            // enqueue failed): salvage the partial work as a draft PR, else
+            // fail with why.
+            if let Handoff::Stopped(why) = handoff {
                 let salvaged = if let Some((ref last_pass, ref branch, _)) = checkpoint {
                     if !branch.is_empty()
                         && matches!(
@@ -1056,7 +1133,9 @@ pub async fn orchestrate_ticket(
                         state,
                         &msg,
                         &run_id,
-                        "Run timed out (exceeded execution time limit). The issue may need a narrower scope.",
+                        &format!(
+                            "The step reached its time limit and the run couldn't continue in a fresh step: {why}."
+                        ),
                         &usage,
                         duration,
                     )
@@ -2570,9 +2649,48 @@ async fn run_passes(
         }
     };
 
-    // Set when this step's implement pass wrote no file (the run's work may
-    // still be on the branch from its earlier steps).
-    let mut step_wrote_nothing = false;
+    // --- Steps: a run continues while its steps make progress ---
+    // A step resumes where the last one handed off (a gate after implement,
+    // when it named one). It first compares where the run stands with
+    // where the last step started: the head moved or the run reached a
+    // later gate, or else that step made no progress; two in a row stop the
+    // run with what was stuck. A redelivery or model retry of this same
+    // step is not a new step (the mark carries its step number).
+    let step = steps::step_number(msg.continuation);
+    let step_state = if same_run {
+        steps::load(state, &msg.team_id, run_id).await
+    } else {
+        steps::StepState::default()
+    };
+    let resume_gate = if can_skip_implement {
+        step_state.gate
+    } else {
+        None
+    };
+    if msg.continuation > 0 && step_state.mark_step != step {
+        let at = resume_gate
+            .map(|g| g.as_str().to_string())
+            .or_else(|| checkpoint.as_ref().map(|c| c.0.clone()))
+            .unwrap_or_default();
+        let head = github
+            .get_ref(&msg.repo_owner, &msg.repo_name, &branch_name)
+            .await
+            .unwrap_or_default();
+        let mark = steps::progress_mark(&head, &at);
+        let stalled = if head.is_empty() {
+            0
+        } else {
+            steps::stalled_after(step_state.mark.as_deref(), &mark, step_state.stalled)
+        };
+        steps::save_mark(state, &msg.team_id, run_id, &mark, stalled, step).await;
+        if steps::stops_for_stall(stalled) {
+            let kept =
+                keep_wip_branch(&github, &msg.repo_owner, &msg.repo_name, &branch_name).await;
+            close_memory(state, agent_memory.take()).await;
+            return Err(steps::stall_reason(step, &head, &at, &kept).into());
+        }
+        info!(run_id, step, stalled, at = %at, "Continuing the run in this step");
+    }
     let impl_result = if can_skip_implement {
         // Resume: reconstruct impl_result from the existing branch diff
         info!(run_id, branch = %branch_name, "Checkpoint resume: skipping implement pass");
@@ -3931,7 +4049,6 @@ async fn run_passes(
         // continues). Only a branch with none of the work, and a ticket that
         // names no file, ever reaches the "add more detail" ending below.
         if result.files_modified.is_empty() {
-            step_wrote_nothing = true;
             let work = plan_coverage::changed_files(
                 &github,
                 &msg.repo_owner,
@@ -4138,36 +4255,31 @@ async fn run_passes(
     check_cancelled(state, &msg.team_id, run_id).await?;
     let mut impl_result = impl_result;
     let mut plan_optional: Vec<proof::Finding> = Vec::new();
-    // The branch head before the plan rounds: a step that wrote nothing and
-    // whose rounds moved nothing made no progress, and another fresh step
-    // would only repeat it.
-    let head_before_rounds = if step_wrote_nothing {
-        github
-            .get_ref(&msg.repo_owner, &msg.repo_name, &branch_name)
-            .await
-            .ok()
-    } else {
+    // A step resuming at a gate passed the plan check in an earlier step.
+    let coverage = if resume_gate.is_some() {
+        plan_optional = resumed_optional(&github, msg, &plan_result, &branch_name).await;
         None
+    } else {
+        plan_coverage::close_gaps(
+            &plan_coverage::Work {
+                state,
+                msg,
+                github: &github,
+                plan: &plan_result,
+                branch: &branch_name,
+                rules: &rules,
+                repo_instructions: &repo_instructions,
+                provider: &provider,
+                file_cache: &file_cache,
+                run_id,
+                deadline: implement_deadline,
+            },
+            &mut impl_result.evidence,
+            usage,
+            || has_time_for_remediation(start),
+        )
+        .await
     };
-    let coverage = plan_coverage::close_gaps(
-        &plan_coverage::Work {
-            state,
-            msg,
-            github: &github,
-            plan: &plan_result,
-            branch: &branch_name,
-            rules: &rules,
-            repo_instructions: &repo_instructions,
-            provider: &provider,
-            file_cache: &file_cache,
-            run_id,
-            deadline: implement_deadline,
-        },
-        &mut impl_result.evidence,
-        usage,
-        || has_time_for_remediation(start),
-    )
-    .await;
     if let Some(cov) = coverage {
         // Only the tasks the branch did are checked off, so the run page and
         // a later attempt see the truth.
@@ -4208,37 +4320,9 @@ async fn run_passes(
                 plan_optional = plan_coverage::optional_findings(&cov);
             }
             plan_coverage::Next::Round | plan_coverage::Next::Unfinished => {
-                let stalled = match &head_before_rounds {
-                    Some(before) => github
-                        .get_ref(&msg.repo_owner, &msg.repo_name, &branch_name)
-                        .await
-                        .is_ok_and(|now| &now == before),
-                    None => false,
-                };
-                if stalled {
-                    // This step and its rounds changed nothing for the tasks
-                    // left: say which, and why, instead of another step.
-                    save_checkpoint(
-                        state,
-                        &msg.team_id,
-                        run_id,
-                        "implement",
-                        &branch_name,
-                        0,
-                        usage,
-                    )
-                    .await;
-                    let kept =
-                        keep_wip_branch(&github, &msg.repo_owner, &msg.repo_name, &branch_name)
-                            .await;
-                    close_memory(state, agent_memory.take()).await;
-                    return Err(plan_coverage::stop_reason_why(
-                        &cov,
-                        &kept,
-                        "the last step changed no file for them",
-                    )
-                    .into());
-                }
+                // A step whose work and rounds moved nothing is not stopped
+                // here: the next step sees no progress, and two such steps
+                // in a row stop the run with what was stuck (see `steps`).
                 // A fresh invocation, with its own time, continues from this
                 // branch (bounded); the continuation is told what's left.
                 save_checkpoint(
@@ -4252,23 +4336,24 @@ async fn run_passes(
                 )
                 .await;
                 let resume_from = Some(("implement_started".to_string(), branch_name.clone(), 0u8));
-                if try_auto_continue(state, msg, run_id, &resume_from, &["implement_started"]).await
-                {
-                    add_progress_note(
-                        state,
-                        &msg.team_id,
-                        run_id,
-                        &format!(
-                            "{} planned task(s) not done yet: continuing in a fresh step with its own time budget",
-                            cov.required_missing().len()
-                        ),
-                    )
-                    .await;
+                let handoff = try_auto_continue(
+                    state,
+                    msg,
+                    run_id,
+                    &resume_from,
+                    &["implement_started"],
+                    &format!(
+                        "{} planned task(s) not done yet",
+                        cov.required_missing().len()
+                    ),
+                )
+                .await;
+                if handoff.continued() {
                     close_memory(state, agent_memory.take()).await;
                     return Ok(());
                 }
-                // Out of continuations: stop without a pull request, the
-                // work kept on a branch a later run won't reset.
+                // No next step (the usage limit): stop without a pull
+                // request, the work kept on a branch a later run won't reset.
                 save_checkpoint(
                     state,
                     &msg.team_id,
@@ -4287,9 +4372,77 @@ async fn run_passes(
         }
     }
 
+    // --- After the implement work: generators, test, security ---
+    // Never started without the time to finish: a fresh step with its own
+    // budget picks the run up here.
+    let run_verify = steps::Gate::Verify.runs_from(resume_gate);
+    if run_verify && !has_time_for_remediation(start) {
+        close_memory(state, agent_memory.take()).await;
+        return hand_off_at(
+            state,
+            msg,
+            &github,
+            run_id,
+            &branch_name,
+            steps::Gate::Verify,
+            None,
+            "The work is built; its test and security audit need more time than this step has left",
+            usage,
+        )
+        .await;
+    }
+    // The generators whose inputs the work changed run now, by the worker,
+    // and their output is committed with it: never left to the coder
+    // calling run_codegen. The generator check later only verifies.
+    let mut generated_at: Option<String> = None;
+    if run_verify {
+        let gen_work = plan_coverage::Work {
+            state,
+            msg,
+            github: &github,
+            plan: &plan_result,
+            branch: &branch_name,
+            rules: &rules,
+            repo_instructions: &repo_instructions,
+            provider: &provider,
+            file_cache: &file_cache,
+            run_id,
+            deadline: implement_deadline,
+        };
+        match generators::after_step(&gen_work).await {
+            generators::AfterStep::NotNeeded => {}
+            generators::AfterStep::Fresh(head, notes) => {
+                for n in notes {
+                    add_progress_note(state, &msg.team_id, run_id, &n).await;
+                }
+                generated_at = Some(head);
+            }
+            generators::AfterStep::Left(notes) => {
+                for n in notes {
+                    add_progress_note(state, &msg.team_id, run_id, &n).await;
+                }
+            }
+            generators::AfterStep::OutOfTime => {
+                close_memory(state, agent_memory.take()).await;
+                return hand_off_at(
+                    state,
+                    msg,
+                    &github,
+                    run_id,
+                    &branch_name,
+                    steps::Gate::Verify,
+                    None,
+                    "The work changed files a code generator reads and this step has too little time left for the generator's build",
+                    usage,
+                )
+                .await;
+            }
+        }
+    }
+
     // --- Adversarial Test (multi-repo path) ---
     check_cancelled(state, &msg.team_id, run_id).await?;
-    if has_time_for_remediation(start) {
+    if run_verify && has_time_for_remediation(start) {
         update_pass(state, &msg.team_id, run_id, "test").await?;
         let pass_start = std::time::Instant::now();
         let usage_before = usage.clone();
@@ -4354,7 +4507,9 @@ async fn run_passes(
                 usage,
                 &fix_cache,
                 Some(run_id),
-                None,
+                // Stops at the step deadline, never relying on the
+                // invocation being cut off.
+                implement_deadline,
                 true, // bot-driven test-fix — scoped to the PR
             )
             .await
@@ -4364,56 +4519,63 @@ async fn run_passes(
         }
     }
 
-    // --- Security Audit (before PR — ensures only security-clean code is published) ---
-    check_cancelled(state, &msg.team_id, run_id).await?;
-    update_pass(state, &msg.team_id, run_id, "security").await?;
-    let pass_start = std::time::Instant::now();
-    let usage_before = usage.clone();
-    let mut security_verdict = security::Verdict::of(
-        security::run(
+    // A step resuming at a later gate has the audit's verdict from the
+    // step that ran it.
+    let (security_verdict, security_round) = if let Some(c) =
+        step_state.carry.clone().filter(|_| !run_verify)
+    {
+        (c.security, c.security_round)
+    } else {
+        // --- Security Audit (before PR — ensures only security-clean code is published) ---
+        check_cancelled(state, &msg.team_id, run_id).await?;
+        update_pass(state, &msg.team_id, run_id, "security").await?;
+        let pass_start = std::time::Instant::now();
+        let usage_before = usage.clone();
+        let mut security_verdict = security::Verdict::of(
+            security::run(
+                state,
+                msg,
+                &github,
+                &plan_result,
+                &branch_name,
+                &repo_instructions,
+                &provider,
+                usage,
+                &file_cache,
+                Some(run_id),
+            )
+            .await,
+        );
+        if let security::Verdict::NotChecked(e) = &security_verdict {
+            warn!(run_id, error = %e, "Security pass errored: the PR opens as a draft with it under Open items");
+        }
+        write_pass_trace(
             state,
-            msg,
-            &github,
-            &plan_result,
-            &branch_name,
-            &repo_instructions,
-            &provider,
+            &msg.team_id,
+            run_id,
+            "security",
+            pass_start,
+            &usage_before,
             usage,
-            &file_cache,
-            Some(run_id),
+            None,
         )
-        .await,
-    );
-    if let security::Verdict::NotChecked(e) = &security_verdict {
-        warn!(run_id, error = %e, "Security pass errored: the PR opens as a draft with it under Open items");
-    }
-    write_pass_trace(
-        state,
-        &msg.team_id,
-        run_id,
-        "security",
-        pass_start,
-        &usage_before,
-        usage,
-        None,
-    )
-    .await;
-    save_checkpoint(
-        state,
-        &msg.team_id,
-        run_id,
-        "security",
-        &branch_name,
-        0,
-        usage,
-    )
-    .await;
-    info!(
-        run_id,
-        passed = security_verdict.passed(),
-        "Security audit complete"
-    );
-    add_progress_note(
+        .await;
+        save_checkpoint(
+            state,
+            &msg.team_id,
+            run_id,
+            "security",
+            &branch_name,
+            0,
+            usage,
+        )
+        .await;
+        info!(
+            run_id,
+            passed = security_verdict.passed(),
+            "Security audit complete"
+        );
+        add_progress_note(
         state,
         &msg.team_id,
         run_id,
@@ -4427,94 +4589,102 @@ async fn run_passes(
     )
     .await;
 
-    // What a security round on the PR is told, when the fix (or the check)
-    // continues in a fresh invocation after the PR opens.
-    let mut security_round: Option<String> = None;
-    if let security::Verdict::NotChecked(why) = &security_verdict {
-        security_round = Some(security::recheck_feedback(why));
-    }
-    if let security::Verdict::Findings(summary) = security_verdict.clone() {
-        if !has_time_for_remediation(start) {
-            // Too little of this invocation is left to fix them here: the fix
-            // is a round of its own on the pull request, with its own budget,
-            // and the PR stays a draft with the issues under Open items until
-            // it's done. Never skipped.
-            warn!(
+        // What a security round on the PR is told, when the fix (or the check)
+        // continues in a fresh invocation after the PR opens.
+        let mut security_round: Option<String> = None;
+        if let security::Verdict::NotChecked(why) = &security_verdict {
+            security_round = Some(security::recheck_feedback(why));
+        }
+        if let security::Verdict::Findings(summary) = security_verdict.clone() {
+            if !has_time_for_remediation(start) {
+                // Too little of this invocation is left to fix them here: the fix
+                // is a round of its own on the pull request, with its own budget,
+                // and the PR stays a draft with the issues under Open items until
+                // it's done. Never skipped.
+                warn!(
                 run_id,
                 remaining_secs = remaining_secs(start),
                 "Security issues found with little time left: the fix continues in a fresh step"
             );
-            add_progress_note(
+                add_progress_note(
                 state,
                 &msg.team_id,
                 run_id,
                 "Security issues found with too little time left in this step: the fix continues in a fresh step on the pull request, which stays a draft until they're fixed",
             )
             .await;
-            security_round = Some(security::fix_feedback(&summary));
-        } else {
-            info!(run_id, "Security issues found, running remediation cycle");
-            check_cancelled(state, &msg.team_id, run_id).await?;
-            update_pass(state, &msg.team_id, run_id, "implement").await?;
-            let sec_fix_result = implement::run(
-                state,
-                msg,
-                &github,
-                &plan_result,
-                &branch_name,
-                &rules,
-                &repo_instructions,
-                Some(&security::fix_feedback(&summary)),
-                &effective_complexity,
-                &provider,
-                usage,
-                &file_cache,
-                Some(run_id),
-                None,
-                true, // bot-driven security fix — scoped to the PR
-            )
-            .await?;
-            write_conversation_log(
-                state,
-                &msg.team_id,
-                run_id,
-                "security_fix",
-                &sec_fix_result.conversation_log,
-            )
-            .await;
-
-            check_cancelled(state, &msg.team_id, run_id).await?;
-            update_pass(state, &msg.team_id, run_id, "security").await?;
-            security_verdict = security::Verdict::of(
-                security::run(
+                security_round = Some(security::fix_feedback(&summary));
+            } else {
+                info!(run_id, "Security issues found, running remediation cycle");
+                check_cancelled(state, &msg.team_id, run_id).await?;
+                update_pass(state, &msg.team_id, run_id, "implement").await?;
+                let sec_fix_result = implement::run(
                     state,
                     msg,
                     &github,
                     &plan_result,
                     &branch_name,
+                    &rules,
                     &repo_instructions,
+                    Some(&security::fix_feedback(&summary)),
+                    &effective_complexity,
                     &provider,
                     usage,
                     &file_cache,
                     Some(run_id),
+                    // Stops at the step deadline, never relying on the
+                    // invocation being cut off.
+                    implement_deadline,
+                    true, // bot-driven security fix — scoped to the PR
                 )
-                .await,
-            );
-            if !security_verdict.passed() {
-                warn!(
+                .await?;
+                write_conversation_log(
+                    state,
+                    &msg.team_id,
+                    run_id,
+                    "security_fix",
+                    &sec_fix_result.conversation_log,
+                )
+                .await;
+
+                check_cancelled(state, &msg.team_id, run_id).await?;
+                update_pass(state, &msg.team_id, run_id, "security").await?;
+                security_verdict = security::Verdict::of(
+                    security::run(
+                        state,
+                        msg,
+                        &github,
+                        &plan_result,
+                        &branch_name,
+                        &repo_instructions,
+                        &provider,
+                        usage,
+                        &file_cache,
+                        Some(run_id),
+                    )
+                    .await,
+                );
+                if !security_verdict.passed() {
+                    warn!(
                     run_id,
                     "Security issues remain after remediation (or the re-check didn't run): they go under Open items and the PR stays a draft"
                 );
-            }
-            // A re-check that didn't run runs again on the PR.
-            if let security::Verdict::NotChecked(why) = &security_verdict {
-                security_round = Some(security::recheck_feedback(why));
+                }
+                // A re-check that didn't run runs again on the PR.
+                if let security::Verdict::NotChecked(why) = &security_verdict {
+                    security_round = Some(security::recheck_feedback(why));
+                }
             }
         }
-    }
+        (security_verdict, security_round)
+    };
     // What is still open goes under Open items, marked: the PR stays a draft
     // while any is listed.
     let security_items = security::open_items(&security_verdict, security_round.is_some());
+    let carry = steps::Carry {
+        security: security_verdict.clone(),
+        security_round: security_round.clone(),
+    };
 
     // Security issues not fixed (or a check that didn't run) are the PR's
     // Open items, marked so it stays a draft; the full audit text is not
@@ -4524,36 +4694,74 @@ async fn run_passes(
     check_cancelled(state, &msg.team_id, run_id).await?;
     update_pass(state, &msg.team_id, run_id, "review").await?;
     // --- Generated files: regenerated with the change, or the PR waits ---
-    match generators::gate(
-        &plan_coverage::Work {
+    if steps::Gate::Generators.runs_from(resume_gate) {
+        // A redelivery of this step, or the next one, resumes here.
+        steps::save_gate(
             state,
-            msg,
-            github: &github,
-            plan: &plan_result,
-            branch: &branch_name,
-            rules: &rules,
-            repo_instructions: &repo_instructions,
-            provider: &provider,
-            file_cache: &file_cache,
+            &msg.team_id,
             run_id,
-            deadline: implement_deadline,
-        },
-        usage,
-    )
-    .await
-    {
-        Ok(notes) => {
-            for n in notes {
-                add_progress_note(state, &msg.team_id, run_id, &n).await;
+            steps::Gate::Generators,
+            Some(&carry),
+        )
+        .await;
+        match generators::gate(
+            &plan_coverage::Work {
+                state,
+                msg,
+                github: &github,
+                plan: &plan_result,
+                branch: &branch_name,
+                rules: &rules,
+                repo_instructions: &repo_instructions,
+                provider: &provider,
+                file_cache: &file_cache,
+                run_id,
+                deadline: implement_deadline,
+            },
+            usage,
+            generated_at.as_deref(),
+        )
+        .await
+        {
+            Ok(notes) => {
+                for n in notes {
+                    add_progress_note(state, &msg.team_id, run_id, &n).await;
+                }
+            }
+            Err(generators::GateStop::NeedsTime) => {
+                close_memory(state, agent_memory.take()).await;
+                return hand_off_at(
+                    state,
+                    msg,
+                    &github,
+                    run_id,
+                    &branch_name,
+                    steps::Gate::Generators,
+                    Some(&carry),
+                    "The generator check needs a sandbox build and this step has too little time left for one",
+                    usage,
+                )
+                .await;
+            }
+            Err(generators::GateStop::Blocked(why)) => {
+                let kept =
+                    keep_wip_branch(&github, &msg.repo_owner, &msg.repo_name, &branch_name).await;
+                close_memory(state, agent_memory.take()).await;
+                return Err(format!("{why} The work so far is kept on branch `{kept}`.").into());
             }
         }
-        Err(why) => {
-            let kept =
-                keep_wip_branch(&github, &msg.repo_owner, &msg.repo_name, &branch_name).await;
-            close_memory(state, agent_memory.take()).await;
-            return Err(format!("{why} The work so far is kept on branch `{kept}`.").into());
-        }
     }
+    steps::save_gate(
+        state,
+        &msg.team_id,
+        run_id,
+        steps::Gate::Checks,
+        Some(&carry),
+    )
+    .await;
+    // The checks' "time for a fix round?" answers: one refused for time
+    // hands the run to a fresh step here instead of blocking the PR.
+    let budget = steps::step_budget(*start);
     let mut evidence = impl_result.evidence.clone();
     let work = proof::Work {
         state,
@@ -4568,13 +4776,25 @@ async fn run_passes(
         run_id,
         deadline: implement_deadline,
     };
-    let mut gaps = proof::prove(&work, &mut evidence, usage, || {
-        has_time_for_remediation(start)
-    })
-    .await;
+    let mut gaps = proof::prove(&work, &mut evidence, usage, || budget.has_time()).await;
     // Planned work the check found not done is never an Open item: the pull
     // request doesn't open without it.
     if !proof::planned_work(&gaps).is_empty() {
+        if budget.take_denied() {
+            close_memory(state, agent_memory.take()).await;
+            return hand_off_at(
+                state,
+                msg,
+                &github,
+                run_id,
+                &branch_name,
+                steps::Gate::Checks,
+                Some(&carry),
+                "The proof check found planned work not done and this step has too little time left for its fix round",
+                usage,
+            )
+            .await;
+        }
         let kept = keep_wip_branch(&github, &msg.repo_owner, &msg.repo_name, &branch_name).await;
         close_memory(state, agent_memory.take()).await;
         return Err(format!(
@@ -4603,31 +4823,82 @@ async fn run_passes(
     gaps.extend(security_items);
     // Every redirect and link the change adds or changes, checked live; a
     // failure that survives its fix round stops the run before the PR.
-    let links = link_checks::gate(&work, &mut evidence, usage, || {
-        has_time_for_remediation(start)
-    })
-    .await
-    .map_err(|why| format!("Link and redirect check blocked the pull request: {why}"))?;
+    budget.take_denied();
+    let links = match link_checks::gate(&work, &mut evidence, usage, || budget.has_time()).await {
+        Ok(l) => l,
+        Err(_) if budget.take_denied() => {
+            close_memory(state, agent_memory.take()).await;
+            return hand_off_at(
+                state,
+                msg,
+                &github,
+                run_id,
+                &branch_name,
+                steps::Gate::Checks,
+                Some(&carry),
+                "The link and redirect check needs a fix round and this step has too little time left for it",
+                usage,
+            )
+            .await;
+        }
+        Err(why) => {
+            return Err(format!("Link and redirect check blocked the pull request: {why}").into())
+        }
+    };
     // A failing- or flaky-test fix: no waits without evidence, no helper
     // that walks every row, test packages checked where they live.
-    let test_pr = test_fix::gate(&work, &mut evidence, usage, || {
-        has_time_for_remediation(start)
-    })
-    .await
-    .map_err(test_fix::blocked_reason)?;
+    let test_pr = match test_fix::gate(&work, &mut evidence, usage, || budget.has_time()).await {
+        Ok(t) => t,
+        Err(_) if budget.take_denied() => {
+            close_memory(state, agent_memory.take()).await;
+            return hand_off_at(
+                state,
+                msg,
+                &github,
+                run_id,
+                &branch_name,
+                steps::Gate::Checks,
+                Some(&carry),
+                "The test-fix check needs a fix round and this step has too little time left for it",
+                usage,
+            )
+            .await;
+        }
+        Err(e) => return Err(test_fix::blocked_reason(e).into()),
+    };
     // New-feature rules: nothing carried over from an earlier attempt,
     // every registration, reuse, staging content, the verification
     // checklist and open product questions (see feature).
-    let feature_pr = feature::gate(
+    let feature_pr = match feature::gate(
         &work,
         &mut evidence,
         usage,
         triage_result.intent,
         &history.prior,
-        || has_time_for_remediation(start),
+        || budget.has_time(),
     )
     .await
-    .map_err(|why| format!("The new-feature rules blocked the pull request: {why}"))?;
+    {
+        Ok(f) => f,
+        Err(_) if budget.take_denied() => {
+            close_memory(state, agent_memory.take()).await;
+            return hand_off_at(
+                state,
+                msg,
+                &github,
+                run_id,
+                &branch_name,
+                steps::Gate::Checks,
+                Some(&carry),
+                "The new-feature check needs a fix round and this step has too little time left for it",
+                usage,
+            )
+            .await;
+        }
+        Err(why) => {
+            return Err(format!("The new-feature rules blocked the pull request: {why}").into())
+        }
+    };
 
     // --- Existing work, again before the PR opens: now that the change's
     // own files are known, an open pull request (anyone's, opened while
@@ -4669,6 +4940,21 @@ async fn run_passes(
 
     // --- Create Draft PR (triggers CI) ---
     check_cancelled(state, &msg.team_id, run_id).await?;
+    if remaining_secs(start) < MIN_TIME_FOR_PR_SECS {
+        close_memory(state, agent_memory.take()).await;
+        return hand_off_at(
+            state,
+            msg,
+            &github,
+            run_id,
+            &branch_name,
+            steps::Gate::Checks,
+            Some(&carry),
+            "The checks passed; opening the pull request needs more time than this step has left",
+            usage,
+        )
+        .await;
+    }
     update_pass(state, &msg.team_id, run_id, "pr").await?;
 
     // Resolve conflicts with main before PR
@@ -4897,6 +5183,64 @@ async fn run_passes(
     }
 
     Ok(())
+}
+
+/// Continue the run in a fresh step at `gate`, with the branch as it is:
+/// the checkpoint names the gate (and what the skipped stages carry), and a
+/// new message starts the next step. Only a run that can't continue (the
+/// team's usage limit, the runaway ceiling, a queue error) stops here, with
+/// that reason.
+#[allow(clippy::too_many_arguments)]
+async fn hand_off_at(
+    state: &WorkerState,
+    msg: &TicketMessage,
+    github: &GitHubClient,
+    run_id: &str,
+    branch: &str,
+    gate: steps::Gate,
+    carry: Option<&steps::Carry>,
+    why: &str,
+    usage: &TokenUsage,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    save_checkpoint(state, &msg.team_id, run_id, "implement", branch, 0, usage).await;
+    steps::save_gate(state, &msg.team_id, run_id, gate, carry).await;
+    let from = Some(("implement".to_string(), branch.to_string(), 0u8));
+    match try_auto_continue(state, msg, run_id, &from, &["implement"], why).await {
+        Handoff::Continued => Ok(()),
+        Handoff::Stopped(reason) => {
+            let kept = keep_wip_branch(github, &msg.repo_owner, &msg.repo_name, branch).await;
+            Err(format!(
+                "Stopped before opening a pull request: {why}, and the run couldn't continue in a \
+                 fresh step ({reason}). The work so far is kept on branch `{kept}`."
+            )
+            .into())
+        }
+    }
+}
+
+/// For a step resuming at a gate: the optional tasks the plan check left
+/// out, read again from the branch (they go in the PR's Open items).
+async fn resumed_optional(
+    github: &GitHubClient,
+    msg: &TicketMessage,
+    plan: &plan::PlanResult,
+    branch: &str,
+) -> Vec<proof::Finding> {
+    let tasks =
+        plan_coverage::tasks_for(github, &msg.repo_owner, &msg.repo_name, branch, &plan.tasks)
+            .await;
+    let Some(changed) = plan_coverage::changed_files(
+        github,
+        &msg.repo_owner,
+        &msg.repo_name,
+        &msg.base_branch,
+        branch,
+    )
+    .await
+    else {
+        return Vec::new();
+    };
+    plan_coverage::optional_findings(&plan_coverage::coverage(&tasks, &changed))
 }
 
 /// Keeps a branch's commits on `coderhelm-wip/<branch>` when a run stops before its
@@ -5393,6 +5737,7 @@ async fn run_repo_pipeline(
             deadline: implement_deadline,
         },
         usage,
+        None,
     )
     .await
     {
@@ -5401,9 +5746,20 @@ async fn run_repo_pipeline(
                 add_progress_note(state, &msg.team_id, run_id, &n).await;
             }
         }
-        Err(why) => {
+        Err(generators::GateStop::Blocked(why)) => {
             let kept = keep_wip_branch(github, repo_owner, repo_name, branch_name).await;
             return Err(format!("{why} The work so far is kept on branch `{kept}`.").into());
+        }
+        Err(generators::GateStop::NeedsTime) => {
+            // A multi-repo run has no fresh steps yet: say exactly that.
+            let kept = keep_wip_branch(github, repo_owner, repo_name, branch_name).await;
+            return Err(format!(
+                "Stopped before opening a pull request in {repo_owner}/{repo_name}: its generator \
+                 needs a sandbox build and this step has too little time left, and a run across \
+                 several repositories can't continue in a fresh step yet. The work so far is kept \
+                 on branch `{kept}`."
+            )
+            .into());
         }
     }
     update_pass(state, &msg.team_id, run_id, "review").await?;
@@ -5755,21 +6111,24 @@ pub(crate) async fn update_pass(
         ("pass".to_string(), attr_s(pass)),
         ("started_at".to_string(), attr_s(&now)),
     ]));
-    state
-        .dynamo
-        .update_item()
-        .table_name(&state.config.runs_table_name)
-        .key("team_id", attr_s(team_id))
-        .key("run_id", attr_s(run_id))
-        .update_expression(
-            "SET current_pass = :p, updated_at = :t, pass_history = list_append(if_not_exists(pass_history, :empty), :entry)",
-        )
-        .expression_attribute_values(":p", attr_s(pass))
-        .expression_attribute_values(":t", attr_s(&now))
-        .expression_attribute_values(":entry", aws_sdk_dynamodb::types::AttributeValue::L(vec![entry]))
-        .expression_attribute_values(":empty", aws_sdk_dynamodb::types::AttributeValue::L(vec![]))
-        .send()
-        .await?;
+    // Bounded: a run of many steps never grows its record past DynamoDB's
+    // item limit (see run_lists).
+    run_lists::append(
+        &run_lists::Target {
+            dynamo: &state.dynamo,
+            table: &state.config.runs_table_name,
+            team_id,
+            run_id,
+            archive: None,
+        },
+        "pass_history",
+        entry,
+        &now,
+        run_lists::MAX_PASSES,
+        run_lists::KEEP_PASSES,
+        Some(("current_pass = :p", ":p", attr_s(pass))),
+    )
+    .await?;
     Ok(())
 }
 
@@ -6511,25 +6870,17 @@ pub(crate) async fn add_progress_note(
     run_id: &str,
     message: &str,
 ) {
-    let now = chrono::Utc::now().to_rfc3339();
-    let entry = aws_sdk_dynamodb::types::AttributeValue::M(std::collections::HashMap::from([
-        ("message".to_string(), attr_s(message)),
-        ("timestamp".to_string(), attr_s(&now)),
-    ]));
-    let _ = state
-        .dynamo
-        .update_item()
-        .table_name(&state.config.runs_table_name)
-        .key("team_id", attr_s(team_id))
-        .key("run_id", attr_s(run_id))
-        .update_expression(
-            "SET progress_notes = list_append(if_not_exists(progress_notes, :empty), :entry), updated_at = :t",
-        )
-        .expression_attribute_values(":entry", aws_sdk_dynamodb::types::AttributeValue::L(vec![entry]))
-        .expression_attribute_values(":empty", aws_sdk_dynamodb::types::AttributeValue::L(vec![]))
-        .expression_attribute_values(":t", attr_s(&now))
-        .send()
-        .await;
+    run_lists::append_note(
+        &run_lists::Target {
+            dynamo: &state.dynamo,
+            table: &state.config.runs_table_name,
+            team_id,
+            run_id,
+            archive: Some((&state.s3, &state.config.bucket_name)),
+        },
+        message,
+    )
+    .await;
 }
 
 /// Write a conversation log to S3 for the agent log viewer.
@@ -9425,22 +9776,42 @@ pub(crate) async fn save_checkpoint(
     let now = chrono::Utc::now().timestamp() as u64;
     let ttl = now + 7 * 86400; // 7 day TTL
 
+    // An update, not a put: the step's progress mark lives on this item
+    // too (see `steps`). The gate a fresh step resumes at survives only the
+    // passes it follows (implement, security); any other pass (a new
+    // implement start, the PR) clears it.
+    let keeps_gate = matches!(last_pass, "implement" | "security");
+    let expr = format!(
+        "SET last_pass = :lp, branch = :b, review_cycle = :rc, #tin = :ti, \
+         #tout = :to, cache_read = :cr, cache_write = :cw, #cost = :c, \
+         updated_at = :u, #ttl = :ttl{}",
+        if keeps_gate {
+            ""
+        } else {
+            " REMOVE gate, gate_carry"
+        }
+    );
     if let Err(e) = state
         .dynamo
-        .put_item()
+        .update_item()
         .table_name(&state.config.checkpoints_table_name)
-        .item("team_id", AttributeValue::S(team_id.to_string()))
-        .item("sk", AttributeValue::S(format!("RUN#{run_id}")))
-        .item("last_pass", AttributeValue::S(last_pass.to_string()))
-        .item("branch", AttributeValue::S(branch.to_string()))
-        .item("review_cycle", attr_n(review_cycle as u64))
-        .item("tokens_in", attr_n(usage.input_tokens))
-        .item("tokens_out", attr_n(usage.output_tokens))
-        .item("cache_read", attr_n(usage.cache_read_tokens))
-        .item("cache_write", attr_n(usage.cache_write_tokens))
-        .item("cost_usd", attr_n(format!("{:.6}", usage.estimated_cost())))
-        .item("updated_at", attr_n(now))
-        .item("ttl", attr_n(ttl))
+        .key("team_id", AttributeValue::S(team_id.to_string()))
+        .key("sk", AttributeValue::S(format!("RUN#{run_id}")))
+        .update_expression(expr)
+        .expression_attribute_names("#ttl", "ttl")
+        .expression_attribute_names("#tin", "tokens_in")
+        .expression_attribute_names("#tout", "tokens_out")
+        .expression_attribute_names("#cost", "cost_usd")
+        .expression_attribute_values(":lp", AttributeValue::S(last_pass.to_string()))
+        .expression_attribute_values(":b", AttributeValue::S(branch.to_string()))
+        .expression_attribute_values(":rc", attr_n(review_cycle as u64))
+        .expression_attribute_values(":ti", attr_n(usage.input_tokens))
+        .expression_attribute_values(":to", attr_n(usage.output_tokens))
+        .expression_attribute_values(":cr", attr_n(usage.cache_read_tokens))
+        .expression_attribute_values(":cw", attr_n(usage.cache_write_tokens))
+        .expression_attribute_values(":c", attr_n(format!("{:.6}", usage.estimated_cost())))
+        .expression_attribute_values(":u", attr_n(now))
+        .expression_attribute_values(":ttl", attr_n(ttl))
         .send()
         .await
     {
