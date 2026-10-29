@@ -3218,11 +3218,21 @@ async fn run_pending_round(
     let round = pending.resumed(chrono::Utc::now());
     let kind = round.kind;
     let number = round.number;
+    let planned = (kind == run_round::Kind::PlannedWork).then(|| round.clone());
     let end = if kind == run_round::Kind::Conflict {
         run_conflict_round(state, msg, &mut ctx, &pr, &round).await
     } else {
         run_fix_round(state, msg, &mut ctx, &pr, round, created_at, start).await?
     };
+    // Planned work: the check judges the branch again and decides the next
+    // round, the ready pull request, or the stop (`finish_planned`).
+    if let Some(planned) = planned {
+        if end != RoundEnd::Parked {
+            after_planned_round(state, msg, &mut ctx, &pr, &planned, end, created_at, start)
+                .await?;
+        }
+        return Ok(());
+    }
     match end {
         RoundEnd::Parked => {}
         RoundEnd::Incomplete => {
@@ -3242,6 +3252,10 @@ async fn run_pending_round(
         RoundEnd::Done { files: 0 } => {
             if kind == run_round::Kind::SecurityFix {
                 recheck_security(state, msg, &mut ctx, &pr).await;
+                // Planned work still listed starts its rounds now.
+                if start_planned_work(state, msg, &ctx, &pr, created_at, start).await? {
+                    return Ok(());
+                }
             }
             if kind == run_round::Kind::CiFix {
                 super::record_ci_outcome(
@@ -3278,6 +3292,9 @@ async fn run_pending_round(
             }
             if kind == run_round::Kind::SecurityFix {
                 recheck_security(state, msg, &mut ctx, &pr).await;
+                if start_planned_work(state, msg, &ctx, &pr, created_at, start).await? {
+                    return Ok(());
+                }
             }
             save_checkpoint(
                 state,
@@ -3460,6 +3477,270 @@ async fn run_conflict_round(
 /// request, and its Open items say what it found. Fixed, the items go and
 /// the pull request may be marked ready; still failing, or a check that
 /// didn't run, the items stay (with what it found now) and it stays a draft.
+/// Starts the planned-work rounds when the pull request still lists planned
+/// work not done (after a parked security round): the first round is parked
+/// for a fresh invocation. False when nothing is listed.
+async fn start_planned_work(
+    state: &WorkerState,
+    msg: &ResumeMessage,
+    ctx: &FixContext,
+    pr: &PrRef<'_>,
+    created_at: Option<chrono::DateTime<chrono::Utc>>,
+    start: &std::time::Instant,
+) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+    let body = match ctx
+        .github
+        .get_pull_request(pr.owner, pr.repo, pr.number)
+        .await
+    {
+        Ok(p) => p["body"].as_str().unwrap_or("").to_string(),
+        Err(e) => {
+            warn!(run_id = msg.run_id, error = %e, "Could not read the PR for planned work not done");
+            return Ok(false);
+        }
+    };
+    let Some(round) = super::finish_planned::first_round(&body, chrono::Utc::now()) else {
+        return Ok(false);
+    };
+    super::round::record(state, &msg.team_id, &msg.run_id, &round).await;
+    super::add_progress_note(
+        state,
+        &msg.team_id,
+        &msg.run_id,
+        &format!(
+            "{} planned task(s) are still not done: CoderHelm keeps working them on the pull request in rounds of its own",
+            super::finish_planned::listed(&body).len()
+        ),
+    )
+    .await;
+    if set_run_awaiting_ci(
+        state,
+        &ctx.ticket_msg,
+        &msg.run_id,
+        pr.url,
+        pr.number,
+        pr.branch,
+        &ctx.usage,
+        wall_clock_secs(created_at, start),
+    )
+    .await?
+    {
+        send_delayed_resume(state, msg, 5).await;
+    }
+    Ok(true)
+}
+
+/// The check before the pull request, run again on the branch for a
+/// planned-work round: the planned work it still finds not done. `None`
+/// when it couldn't answer (no plan, no diff, no reply).
+async fn recheck_planned_work(
+    state: &WorkerState,
+    msg: &ResumeMessage,
+    ctx: &mut FixContext,
+    pr: &PrRef<'_>,
+) -> Option<Vec<super::proof::Finding>> {
+    let plan = super::run_plan_files(state, &ctx.ticket_msg).await?;
+    // Generated outputs their generator settled are never planned work left.
+    let settled = super::steps::load(state, &msg.team_id, &msg.run_id)
+        .await
+        .carry
+        .map(|c| c.generated)
+        .unwrap_or_default();
+    let mut evidence = super::proof::RunEvidence::default();
+    super::proof::judge(
+        state,
+        &ctx.ticket_msg,
+        &ctx.github,
+        pr.branch,
+        &plan,
+        &settled,
+        &mut evidence,
+        &ctx.provider,
+        &mut ctx.usage,
+    )
+    .await
+    .map(|f| super::proof::drop_settled_generated(f, &settled))
+}
+
+/// After a planned-work round: judge the branch again, rewrite the "Not
+/// finished" section to what is left, and go on (another round), finish
+/// (ready) or stop (two rounds without progress) as `finish_planned` says.
+#[allow(clippy::too_many_arguments)]
+async fn after_planned_round(
+    state: &WorkerState,
+    msg: &ResumeMessage,
+    ctx: &mut FixContext,
+    pr: &PrRef<'_>,
+    round: &run_round::Round,
+    end: RoundEnd,
+    created_at: Option<chrono::DateTime<chrono::Utc>>,
+    start: &std::time::Instant,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    use super::finish_planned::{self, Next};
+    let files = match end {
+        RoundEnd::Done { files } => files,
+        RoundEnd::Parked | RoundEnd::Incomplete => 0,
+    };
+    let body = match ctx
+        .github
+        .get_pull_request(pr.owner, pr.repo, pr.number)
+        .await
+    {
+        Ok(p) => p["body"].as_str().unwrap_or("").to_string(),
+        Err(e) => {
+            warn!(run_id = msg.run_id, error = %e, "Could not read the PR after a planned-work round");
+            String::new()
+        }
+    };
+    let before = finish_planned::listed(&body);
+    let _ = super::update_pass(state, &msg.team_id, &msg.run_id, "review").await;
+    let section = recheck_planned_work(state, msg, ctx, pr)
+        .await
+        .map(|f| super::proof::unfinished_section(&f));
+    let after = section.as_deref().map(finish_planned::listed);
+    // The description says what is still not done, never the earlier list.
+    if let Some(section) = &section {
+        if !body.is_empty() {
+            let updated = super::completeness::with_section(
+                &body,
+                super::completeness::Section::Unfinished,
+                section.clone(),
+            );
+            if updated != body {
+                if let Err(e) = ctx
+                    .github
+                    .update_pr_body(pr.owner, pr.repo, pr.number, &updated)
+                    .await
+                {
+                    warn!(run_id = msg.run_id, error = %e, "Could not update the PR's Not finished section");
+                }
+            }
+        }
+    }
+    let duration = wall_clock_secs(created_at, start);
+    let next = finish_planned::next(&before, after.as_deref(), files, round);
+    let status = finish_planned::run_status(&next, files);
+    match next {
+        Next::Ready => {
+            super::add_progress_note(
+                state,
+                &msg.team_id,
+                &msg.run_id,
+                &format!(
+                    "Planned-work round {}: the check finds no planned work left; the pull request is ready once its checks pass",
+                    round.number
+                ),
+            )
+            .await;
+            if files > 0 {
+                // New commits: CI runs on them, then the usual resume marks
+                // the pull request ready.
+                save_checkpoint(
+                    state,
+                    &msg.team_id,
+                    &msg.run_id,
+                    "pr",
+                    pr.branch,
+                    0,
+                    &ctx.usage,
+                )
+                .await;
+                if set_run_awaiting_ci(
+                    state,
+                    &ctx.ticket_msg,
+                    &msg.run_id,
+                    pr.url,
+                    pr.number,
+                    pr.branch,
+                    &ctx.usage,
+                    duration,
+                )
+                .await?
+                {
+                    send_delayed_resume(state, msg, 120).await;
+                }
+            } else {
+                mark_pr_ready(
+                    state,
+                    &msg.team_id,
+                    &ctx.github,
+                    pr.owner,
+                    pr.repo,
+                    pr.number,
+                )
+                .await;
+                complete_run_with_status(
+                    state,
+                    &ctx.ticket_msg,
+                    &msg.run_id,
+                    status,
+                    pr.url,
+                    pr.number,
+                    pr.branch,
+                    &ctx.usage,
+                    duration,
+                )
+                .await?;
+            }
+        }
+        Next::Again { stalled } => {
+            let items = after.unwrap_or(before);
+            let next = finish_planned::next_round(round, &items, stalled, chrono::Utc::now());
+            super::round::record(state, &msg.team_id, &msg.run_id, &next).await;
+            super::add_progress_note(
+                state,
+                &msg.team_id,
+                &msg.run_id,
+                &format!(
+                    "Planned-work round {} {}: {} task(s) still not done; round {} continues in a fresh step",
+                    round.number,
+                    if stalled == 0 {
+                        "made progress"
+                    } else {
+                        "made no progress"
+                    },
+                    items.len(),
+                    next.number
+                ),
+            )
+            .await;
+            if set_run_awaiting_ci(
+                state,
+                &ctx.ticket_msg,
+                &msg.run_id,
+                pr.url,
+                pr.number,
+                pr.branch,
+                &ctx.usage,
+                duration,
+            )
+            .await?
+            {
+                send_delayed_resume(state, msg, 5).await;
+            }
+        }
+        Next::Stop(reason) => {
+            super::add_progress_note(state, &msg.team_id, &msg.run_id, &reason).await;
+            // Not completed: the run waits on a person, says which tasks and
+            // why, and the pull request stays a draft.
+            complete_run_with_status(
+                state,
+                &ctx.ticket_msg,
+                &msg.run_id,
+                status,
+                pr.url,
+                pr.number,
+                pr.branch,
+                &ctx.usage,
+                duration,
+            )
+            .await?;
+            super::round::stopped(state, &msg.team_id, &msg.run_id, round, &reason).await;
+        }
+    }
+    Ok(())
+}
+
 async fn recheck_security(
     state: &WorkerState,
     msg: &ResumeMessage,
@@ -4127,6 +4408,23 @@ fn first_own_commit_message(commits: &[serde_json::Value]) -> Option<String> {
     })
 }
 
+/// Why an open pull request stays a draft, read from its description and
+/// title; `None` when nothing holds it. Security items still open, planned
+/// work not done ("Not finished"), and an end-to-end fix or generated test
+/// whose repeat runs haven't proved it (`proven`) each hold it.
+pub(crate) fn draft_hold(body: &str, title: &str, proven: bool) -> Option<&'static str> {
+    if super::proof::holds_security_items(body) {
+        return Some("security items are open in the description");
+    }
+    if super::proof::holds_unfinished(body) {
+        return Some("planned work not done is listed in the description");
+    }
+    if !proven && is_e2e_proof_pr(title) {
+        return Some("an end-to-end proof PR waits for its repeat runs");
+    }
+    None
+}
+
 async fn mark_ready(
     github: &GitHubClient,
     repo_owner: &str,
@@ -4153,40 +4451,12 @@ async fn mark_ready(
                     info!(pr_number, "PR is closed — not marking ready");
                     return;
                 }
-                // Security issues not fixed yet (or a security check that
-                // didn't run) are listed under Open items: the PR stays a
-                // draft until they're gone.
-                if super::proof::holds_security_items(
+                if let Some(why) = draft_hold(
                     pr.get("body").and_then(|v| v.as_str()).unwrap_or(""),
+                    pr.get("title").and_then(|v| v.as_str()).unwrap_or(""),
+                    proven,
                 ) {
-                    info!(
-                        pr_number,
-                        "Security items open in the description — the PR stays a draft"
-                    );
-                    return;
-                }
-                // Planned work not done is listed at the top: the PR stays
-                // a draft until a person (or a later round) settles it.
-                if super::proof::holds_unfinished(
-                    pr.get("body").and_then(|v| v.as_str()).unwrap_or(""),
-                ) {
-                    info!(
-                        pr_number,
-                        "Planned work not done is listed in the description; the PR stays a draft"
-                    );
-                    return;
-                }
-                // E2E fix and generated-test PRs wait for their repeat runs.
-                if !proven
-                    && pr
-                        .get("title")
-                        .and_then(|v| v.as_str())
-                        .is_some_and(is_e2e_proof_pr)
-                {
-                    info!(
-                        pr_number,
-                        "E2E proof PR — stays a draft until its repeat runs pass"
-                    );
+                    info!(pr_number, why, "The PR stays a draft");
                     return;
                 }
                 // A person put this PR back into draft: that is their call, and

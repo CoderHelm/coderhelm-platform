@@ -67,6 +67,23 @@ jobs:
       # review histories replayed through the real decision code, no model.
       - run: cargo test --workspace
 
+  # Every run failure that reached a person, replayed through the pipeline's
+  # decision code with fakes only at the edges (docs/incidents.md).
+  incidents:
+    name: Incident regressions
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: services
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          workspaces: services
+          cache-on-failure: true
+      - run: cargo test -p worker 'incidents::'
+
   lambda-tests:
     name: Lambda (Python)
     runs-on: ubuntu-latest

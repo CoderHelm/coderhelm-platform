@@ -209,6 +209,41 @@ async fn write_incomplete(
     }
 }
 
+/// Planned-work rounds stopped without progress: the run keeps its status
+/// (`needs_input`, set by the caller) and says which round stopped and why;
+/// the round leaves the record.
+pub(crate) async fn stopped(
+    state: &WorkerState,
+    team_id: &str,
+    run_id: &str,
+    round: &Round,
+    reason: &str,
+) {
+    let now = chrono::Utc::now().to_rfc3339();
+    let inc = Incomplete::of(round, reason, &now);
+    let res = state
+        .dynamo
+        .update_item()
+        .table_name(&state.config.runs_table_name)
+        .key("team_id", attr_s(team_id))
+        .key("run_id", attr_s(run_id))
+        .update_expression("SET #inc = :inc, updated_at = :t REMOVE #round")
+        .condition_expression(common::run_status::not_ended("#s"))
+        .expression_attribute_names("#s", "status")
+        .expression_attribute_names("#inc", run_round::INCOMPLETE_FIELD)
+        .expression_attribute_names("#round", run_round::FIELD)
+        .expression_attribute_values(":inc", inc.to_attr())
+        .expression_attribute_values(":t", attr_s(&now))
+        .ended_values()
+        .send()
+        .await;
+    if let Err(e) = res {
+        if !common::run_fail::is_condition_failed(&e) {
+            warn!(run_id, error = %e, "Could not record why the planned work stopped");
+        }
+    }
+}
+
 /// After a round's worker failed outright (an error the pass returned):
 /// when the run has an open pull request, it is left completed with the
 /// round named as not finished instead of failed. Returns false when the
@@ -429,6 +464,7 @@ pub(crate) async fn round_message(
         Kind::Feedback => "Address the review comments",
         Kind::SecurityFix => "Fix the security issues the check found",
         Kind::Conflict => "Merge the base branch and resolve the conflicts",
+        Kind::PlannedWork => "Finish the planned work still not done",
     };
     let conventions = super::load_git_conventions(state, team_id, &ticket.ticket_id).await;
     conventions.commit_message(&super::ticket_tokens(ticket), summary)

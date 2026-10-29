@@ -345,6 +345,11 @@ pub fn read_changed_tar(
     Ok(out)
 }
 
+/// A codegen build's changed-files archive, read with the worker's caps.
+pub fn read_archive(bytes: &[u8]) -> Result<Captured, Box<dyn std::error::Error + Send + Sync>> {
+    read_changed_tar(bytes, MAX_CODEGEN_FILES, MAX_CODEGEN_FILE_BYTES)
+}
+
 /// Thin driver over CodeBuild + S3 + CloudWatch Logs. Holds only borrows from
 /// `WorkerState`; construct it per pass.
 pub struct SandboxClient<'a> {
@@ -708,88 +713,7 @@ impl<'a> SandboxClient<'a> {
         out_key: &str,
         build_succeeded: bool,
     ) -> Result<CodegenOutcome, Box<dyn std::error::Error + Send + Sync>> {
-        // Source of truth for "codegen produced changes" is the S3 artifact the
-        // build uploads on success — NOT the CloudWatch log marker. The build
-        // uploads out.tgz mid-run (before it finishes) and S3 is read-after-write
-        // consistent, so the artifact is reliably there the moment the build is
-        // done. The log marker, by contrast, lags CloudWatch delivery by several
-        // seconds; reading it too early made the worker report "no result marker"
-        // for builds that had ALREADY succeeded and uploaded the regenerated
-        // files, so the agent re-ran the (expensive, always-succeeding) codegen
-        // build over and over until the pass timed out. Check S3 first.
-        let captured = self.download_changed(out_key).await.unwrap_or_default();
-        if !captured.files.is_empty() || !captured.dropped.is_empty() {
-            let output = self
-                .fetch_log(group, stream)
-                .await
-                .map(|l| common::tail_str(&l, MAX_OUTPUT_CHARS).to_string())
-                .unwrap_or_default();
-            return Ok(CodegenOutcome {
-                ran: true,
-                passed: true,
-                changed: captured.files,
-                dropped: captured.dropped,
-                output,
-            });
-        }
-
-        // No artifact => codegen either passed with nothing to regenerate, or
-        // failed. Read the log for the end marker, briefly retrying to let
-        // CloudWatch flush; fall back to the CodeBuild build status if the marker
-        // never lands (so a delivery lag is never mistaken for a codegen failure).
-        if group.is_empty() {
-            return Ok(CodegenOutcome::not_run(
-                "codegen produced no logs (infra fault)",
-            ));
-        }
-        let mut full = String::new();
-        let mut code = None;
-        for attempt in 0..4 {
-            full = self.fetch_log(group, stream).await.unwrap_or_default();
-            code = parse_marker_exit(&full, MARKER_CODEGEN_END);
-            if code.is_some() {
-                break;
-            }
-            if attempt < 3 {
-                tokio::time::sleep(Duration::from_secs(3)).await;
-            }
-        }
-        let output = common::tail_str(&full, MAX_OUTPUT_CHARS).to_string();
-        // Codegen changed files but could not hand them back: that is not
-        // "nothing to regenerate", and must not be reported as a clean pass.
-        if printed(&full, MARKER_CODEGEN_UPLOAD_FAILED) {
-            return Ok(CodegenOutcome::not_run(format!(
-                "codegen ran but its changed files could not be uploaded\n{output}"
-            )));
-        }
-        // If the build logged an upload but the first artifact read came back empty
-        // (a transient S3 read), try once more — those changes are real and must
-        // not be dropped as "nothing to regenerate".
-        if printed(&full, MARKER_CODEGEN_UPLOADED) {
-            let retry = self.download_changed(out_key).await.unwrap_or_default();
-            if !retry.files.is_empty() || !retry.dropped.is_empty() {
-                return Ok(CodegenOutcome {
-                    ran: true,
-                    passed: true,
-                    changed: retry.files,
-                    dropped: retry.dropped,
-                    output,
-                });
-            }
-        }
-        // Marker exit code is authoritative for pass/fail when present; otherwise
-        // trust the build status. Either way `changed` is empty here.
-        let passed = match code {
-            Some(c) => c == 0,
-            None => build_succeeded,
-        };
-        Ok(CodegenOutcome {
-            ran: true,
-            passed,
-            changed: Vec::new(),
-            dropped: Vec::new(),
-            output,
-        })
+        Ok(codegen_outcome(self, group, stream, out_key, build_succeeded).await)
     }
 
     /// Download the captured tar.gz of changed files and read them into
@@ -808,7 +732,7 @@ impl<'a> SandboxClient<'a> {
             .await
             .map_err(|e| format!("codegen output download failed: {e}"))?;
         let bytes = obj.body.collect().await?.into_bytes();
-        read_changed_tar(&bytes, MAX_CODEGEN_FILES, MAX_CODEGEN_FILE_BYTES)
+        read_archive(&bytes)
     }
 
     async fn build_and_read(
@@ -1051,6 +975,119 @@ fn parse_marker_exit(log: &str, marker: &str) -> Option<i32> {
             .collect();
         digits.parse().ok()
     })
+}
+
+/// Where a finished codegen build's result is read from: the archive of
+/// changed files it uploaded (S3) and its log (CloudWatch). The sandbox
+/// client reads the real ones; the incident suite hands in recorded ones.
+#[async_trait::async_trait]
+pub trait CodegenSource: Sync {
+    /// The changed-files archive, read (empty when there is none).
+    async fn changed_files(&self, out_key: &str) -> Captured;
+    /// The build's whole log (empty when unreadable).
+    async fn build_log(&self, group: &str, stream: &str) -> String;
+    /// How long to wait for a log that hasn't arrived yet.
+    fn log_retry_delay(&self) -> Duration {
+        Duration::from_secs(3)
+    }
+}
+
+#[async_trait::async_trait]
+impl CodegenSource for SandboxClient<'_> {
+    async fn changed_files(&self, out_key: &str) -> Captured {
+        self.download_changed(out_key).await.unwrap_or_default()
+    }
+
+    async fn build_log(&self, group: &str, stream: &str) -> String {
+        self.fetch_log(group, stream).await.unwrap_or_default()
+    }
+}
+
+/// What a finished codegen build came to, read from its archive and log.
+pub async fn codegen_outcome<S: CodegenSource + ?Sized>(
+    src: &S,
+    group: &str,
+    stream: &str,
+    out_key: &str,
+    build_succeeded: bool,
+) -> CodegenOutcome {
+    // Source of truth for "codegen produced changes" is the S3 artifact the
+    // build uploads on success — NOT the CloudWatch log marker. The build
+    // uploads out.tgz mid-run (before it finishes) and S3 is read-after-write
+    // consistent, so the artifact is reliably there the moment the build is
+    // done. The log marker, by contrast, lags CloudWatch delivery by several
+    // seconds; reading it too early made the worker report "no result marker"
+    // for builds that had ALREADY succeeded and uploaded the regenerated
+    // files, so the agent re-ran the (expensive, always-succeeding) codegen
+    // build over and over until the pass timed out. Check S3 first.
+    let captured = src.changed_files(out_key).await;
+    if !captured.files.is_empty() || !captured.dropped.is_empty() {
+        let output =
+            common::tail_str(&src.build_log(group, stream).await, MAX_OUTPUT_CHARS).to_string();
+        return CodegenOutcome {
+            ran: true,
+            passed: true,
+            changed: captured.files,
+            dropped: captured.dropped,
+            output,
+        };
+    }
+
+    // No artifact => codegen either passed with nothing to regenerate, or
+    // failed. Read the log for the end marker, briefly retrying to let
+    // CloudWatch flush; fall back to the CodeBuild build status if the marker
+    // never lands (so a delivery lag is never mistaken for a codegen failure).
+    if group.is_empty() {
+        return CodegenOutcome::not_run("codegen produced no logs (infra fault)");
+    }
+    let mut full = String::new();
+    let mut code = None;
+    for attempt in 0..4 {
+        full = src.build_log(group, stream).await;
+        code = parse_marker_exit(&full, MARKER_CODEGEN_END);
+        if code.is_some() {
+            break;
+        }
+        if attempt < 3 {
+            tokio::time::sleep(src.log_retry_delay()).await;
+        }
+    }
+    let output = common::tail_str(&full, MAX_OUTPUT_CHARS).to_string();
+    // Codegen changed files but could not hand them back: that is not
+    // "nothing to regenerate", and must not be reported as a clean pass.
+    if printed(&full, MARKER_CODEGEN_UPLOAD_FAILED) {
+        return CodegenOutcome::not_run(format!(
+            "codegen ran but its changed files could not be uploaded\n{output}"
+        ));
+    }
+    // If the build logged an upload but the first artifact read came back empty
+    // (a transient S3 read), try once more — those changes are real and must
+    // not be dropped as "nothing to regenerate".
+    if printed(&full, MARKER_CODEGEN_UPLOADED) {
+        let retry = src.changed_files(out_key).await;
+        if !retry.files.is_empty() || !retry.dropped.is_empty() {
+            return CodegenOutcome {
+                ran: true,
+                passed: true,
+                changed: retry.files,
+                dropped: retry.dropped,
+                output,
+            };
+        }
+    }
+    // Marker exit code is authoritative for pass/fail when present; otherwise
+    // trust the build status. Either way `changed` is empty here.
+    let passed = match code {
+        Some(c) => c == 0,
+        None => build_succeeded,
+    };
+    CodegenOutcome {
+        ran: true,
+        passed,
+        changed: Vec::new(),
+        dropped: Vec::new(),
+        output,
+    }
 }
 
 /// Parse the exit code from the checks end marker.

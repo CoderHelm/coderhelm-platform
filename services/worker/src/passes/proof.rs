@@ -1246,7 +1246,8 @@ pub fn unfinished_section(findings: &[Finding]) -> String {
     }
     format!(
         "{UNFINISHED_START}\n## Not finished\nThis pull request stays a draft: the check before \
-         it found planned work still not done after its fix round.\n{}\n{UNFINISHED_END}",
+         it found planned work still not done after its fix round. CoderHelm keeps working on \
+         it here and marks the pull request ready when nothing is left.\n{}\n{UNFINISHED_END}",
         items.join("\n")
     )
 }

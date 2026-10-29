@@ -27,7 +27,7 @@ use tracing::{info, warn};
 use common::stop_rules::tooling::{self, ToolingFailure};
 
 use crate::clients::github::{FileOp, GitHubClient};
-use crate::clients::sandbox::EgressBlocks;
+use crate::clients::sandbox::{CodegenOutcome, EgressBlocks};
 use crate::passes::plan_coverage::Work;
 
 /// The tool a generator runs (a package script counts as the tool it runs).
@@ -1293,74 +1293,130 @@ async fn run_in_sandbox(
         )
         .await
     {
-        Ok(o)
-            if !o.passed && tooling::egress_failure("the generator", cmd, &o.output).is_some() =>
-        {
-            let f = tooling::egress_failure("the generator", cmd, &o.output).unwrap_or_default();
-            EgressBlocks::record(w.run_id, &f);
-            Ran::Blocked(f)
-        }
-        Ok(o) if o.ran && o.passed => {
-            EgressBlocks::clear(w.run_id);
-            // A changed file the sandbox couldn't hand back is a tooling
-            // failure, named: never "regenerated" with a file missing.
-            let dropped = (!o.dropped.is_empty()).then(|| dropped_reason(&o.dropped));
-            if o.changed.is_empty() {
-                return match dropped {
-                    Some(why) => Ran::Blocked(ToolingFailure::new(cmd, &why)),
-                    None => Ran::Regenerated(Vec::new()),
-                };
+        Ok(o) => match read_outcome(o, cmd, || sandbox.has_time(w.deadline)) {
+            Read::Refused(f) => {
+                EgressBlocks::record(w.run_id, &f);
+                Ran::Blocked(f)
             }
-            let paths: Vec<String> = o.changed.iter().map(|(p, _)| p.clone()).collect();
-            let ops: Vec<FileOp> = o
-                .changed
-                .into_iter()
-                .map(|(path, content)| FileOp::Write { path, content })
-                .collect();
-            let conventions =
-                super::load_git_conventions(state, &w.msg.team_id, &w.msg.ticket_id).await;
-            let message = conventions.commit_message(
-                &super::ticket_tokens(w.msg),
-                &format!("Regenerate generated files ({})", g.name),
-            );
-            match w
-                .github
-                .batch_write(owner, name, w.branch, &message, &ops)
-                .await
-            {
-                Ok(_) => match dropped {
-                    Some(why) => Ran::Blocked(ToolingFailure::new(cmd, &why)),
-                    None => Ran::Regenerated(paths),
-                },
-                Err(e) => Ran::Failed(
-                    format!("its output couldn't be committed ({e})"),
-                    String::new(),
-                ),
+            Read::Commit { changed, dropped } => {
+                EgressBlocks::clear(w.run_id);
+                if changed.is_empty() {
+                    return match dropped {
+                        Some(why) => Ran::Blocked(ToolingFailure::new(cmd, &why)),
+                        None => Ran::Regenerated(Vec::new()),
+                    };
+                }
+                let paths: Vec<String> = changed.iter().map(|(p, _)| p.clone()).collect();
+                let ops: Vec<FileOp> = changed
+                    .into_iter()
+                    .map(|(path, content)| FileOp::Write { path, content })
+                    .collect();
+                let conventions =
+                    super::load_git_conventions(state, &w.msg.team_id, &w.msg.ticket_id).await;
+                let message = conventions.commit_message(
+                    &super::ticket_tokens(w.msg),
+                    &format!("Regenerate generated files ({})", g.name),
+                );
+                match w
+                    .github
+                    .batch_write(owner, name, w.branch, &message, &ops)
+                    .await
+                {
+                    Ok(_) => match dropped {
+                        Some(why) => Ran::Blocked(ToolingFailure::new(cmd, &why)),
+                        None => Ran::Regenerated(paths),
+                    },
+                    Err(e) => Ran::Failed(
+                        format!("its output couldn't be committed ({e})"),
+                        String::new(),
+                    ),
+                }
             }
-        }
-        Ok(o) if o.ran => Ran::Failed(
-            format!(
-                "running it failed: {}",
-                common::truncate_str(o.output.trim(), 300)
-            ),
-            o.output,
-        ),
-        // CodeBuild timed the build out: the run's tooling, not the change.
-        Ok(o)
-            if o.output
-                .contains(crate::clients::sandbox::CODEGEN_TIMED_OUT) =>
-        {
-            Ran::Blocked(ToolingFailure::new(
-                cmd,
-                crate::clients::sandbox::CODEGEN_TIMED_OUT,
-            ))
-        }
-        // A build that stopped at the step's deadline didn't fail: it needs
-        // a step with time for it.
-        Ok(o) if out_of_time(&o.output, || sandbox.has_time(w.deadline)) => Ran::OutOfTime,
-        Ok(o) => Ran::NotRun(o.output),
+            Read::Blocked(f) => Ran::Blocked(f),
+            Read::Failed(why, output) => Ran::Failed(why, output),
+            Read::OutOfTime => Ran::OutOfTime,
+            Read::NotRun(why) => Ran::NotRun(why),
+        },
         Err(e) => Ran::NotRun(e.to_string()),
     }
+}
+
+/// What a finished codegen build means for its generator, before anything
+/// is committed.
+#[derive(Debug)]
+pub(crate) enum Read {
+    /// The sandbox's network allowlist refused a host the generator needs.
+    Refused(ToolingFailure),
+    /// It ran and passed: these files changed (to commit), and the ones the
+    /// sandbox couldn't hand back, named (a tooling failure when any).
+    Commit {
+        changed: Vec<(String, String)>,
+        dropped: Option<String>,
+    },
+    /// The run's tooling stopped it (CodeBuild timed the build out).
+    Blocked(ToolingFailure),
+    /// It ran and failed: why, and its output.
+    Failed(String, String),
+    /// It stopped at the step's deadline: a fresh step runs it.
+    OutOfTime,
+    /// It didn't run, with why.
+    NotRun(String),
+}
+
+/// What a failed codegen build printed last, for its reason: the
+/// generator's own lines, never CodeBuild's echo of the buildspec (which
+/// starts every log) or the build's markers.
+fn failure_excerpt(output: &str) -> String {
+    let lines: Vec<&str> = output
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .filter(|l| !l.starts_with("[Container]"))
+        .filter(|l| !l.starts_with("CODERHELM_") && !l.starts_with("===CODERHELM_"))
+        .collect();
+    common::tail_str(lines.join("\n").trim(), 300)
+        .trim()
+        .to_string()
+}
+
+/// Reads a finished codegen build (`has_time`: whether this step still has
+/// time for a build).
+pub(crate) fn read_outcome(o: CodegenOutcome, cmd: &str, has_time: impl Fn() -> bool) -> Read {
+    if !o.passed {
+        if let Some(f) = tooling::egress_failure("the generator", cmd, &o.output) {
+            return Read::Refused(f);
+        }
+    }
+    if o.ran && o.passed {
+        // A changed file the sandbox couldn't hand back is a tooling
+        // failure, named: never "regenerated" with a file missing.
+        let dropped = (!o.dropped.is_empty()).then(|| dropped_reason(&o.dropped));
+        return Read::Commit {
+            changed: o.changed,
+            dropped,
+        };
+    }
+    if o.ran {
+        return Read::Failed(
+            format!("running it failed: {}", failure_excerpt(&o.output)),
+            o.output,
+        );
+    }
+    // CodeBuild timed the build out: the run's tooling, not the change.
+    if o.output
+        .contains(crate::clients::sandbox::CODEGEN_TIMED_OUT)
+    {
+        return Read::Blocked(ToolingFailure::new(
+            cmd,
+            crate::clients::sandbox::CODEGEN_TIMED_OUT,
+        ));
+    }
+    // A build that stopped at the step's deadline didn't fail: it needs a
+    // step with time for it.
+    if out_of_time(&o.output, has_time) {
+        return Read::OutOfTime;
+    }
+    Read::NotRun(o.output)
 }
 
 /// Why a generator run that changed files the sandbox couldn't hand back
@@ -1386,7 +1442,7 @@ fn out_of_time(output: &str, has_time: impl Fn() -> bool) -> bool {
 }
 
 /// What one pass over the affected generators found.
-enum Pass {
+pub(crate) enum Pass {
     /// Generators still out of date (empty: all up to date).
     Problems(Vec<(Generator, Vec<String>, String)>),
     /// A generator failed for public values the codegen environment lacks:
@@ -1623,7 +1679,7 @@ pub enum GateStop {
     NeedsTime,
 }
 
-fn stop_of(p: Pass) -> Result<Vec<(Generator, Vec<String>, String)>, GateStop> {
+pub(crate) fn stop_of(p: Pass) -> Result<Vec<(Generator, Vec<String>, String)>, GateStop> {
     match p {
         Pass::MissingEnv(why) => Err(GateStop::Blocked(why)),
         Pass::Blocked(f) => Err(GateStop::Blocked(f.reason())),

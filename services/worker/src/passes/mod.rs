@@ -785,6 +785,7 @@ pub mod e2e_setup;
 pub mod email_events;
 pub mod feature;
 pub mod feedback;
+mod finish_planned;
 pub mod fix_location;
 pub mod formatter;
 pub(crate) mod generators;
@@ -792,6 +793,8 @@ pub mod github_history;
 pub mod health_check;
 pub mod hidden_suggest;
 mod implement;
+#[cfg(test)]
+mod incidents;
 pub mod infra_analyze;
 mod infra_repo;
 pub mod jira_comment;
@@ -4849,7 +4852,7 @@ async fn run_passes(
                 let kept =
                     keep_wip_branch(&github, &msg.repo_owner, &msg.repo_name, &branch_name).await;
                 close_memory(state, agent_memory.take()).await;
-                return Err(format!("{why} The work so far is kept on branch `{kept}`.").into());
+                return Err(stopped_keeping(&why, &kept).into());
             }
         }
     }
@@ -5189,6 +5192,29 @@ async fn run_passes(
     )
     .await;
 
+    // Planned work still not done is finished by CoderHelm, in rounds of its
+    // own on the pull request (`finish_planned`): the first is parked for
+    // the resume that follows. A parked security round goes first; the
+    // planned-work round starts after it.
+    let planned_round = if security_round.is_none() {
+        finish_planned::first_round(&unfinished, chrono::Utc::now())
+    } else {
+        None
+    };
+    if let Some(round) = &planned_round {
+        round::record(state, &msg.team_id, run_id, round).await;
+        add_progress_note(
+            state,
+            &msg.team_id,
+            run_id,
+            &format!(
+                "{} planned task(s) are still not done: CoderHelm keeps working them on the pull request in rounds of its own",
+                finish_planned::listed(&unfinished).len()
+            ),
+        )
+        .await;
+    }
+
     // The security fix there wasn't time for: a round of its own on the PR,
     // parked for the resume that follows (a fresh invocation, its own budget).
     if let Some(feedback) = &security_round {
@@ -5294,8 +5320,13 @@ async fn run_passes(
             .send_message()
             .queue_url(&state.config.ci_fix_queue_url)
             .message_body(resume_body.to_string())
-            // A parked security fix starts as soon as this invocation ends.
-            .delay_seconds(if security_round.is_some() { 5 } else { 120 })
+            // A parked round (a security fix, planned work) starts as soon
+            // as this invocation ends.
+            .delay_seconds(if security_round.is_some() || planned_round.is_some() {
+                5
+            } else {
+                120
+            })
             .send()
             .await;
     }
@@ -5318,6 +5349,12 @@ async fn run_passes(
     }
 
     Ok(())
+}
+
+/// The run's error when a gate stops it (a tooling failure, a value only a
+/// person can set): the gate's own reason, and where the work is kept.
+fn stopped_keeping(why: &str, kept: &str) -> String {
+    format!("{why} The work so far is kept on branch `{kept}`.")
 }
 
 /// Continue the run in a fresh step at `gate`, with the branch as it is:
@@ -5884,7 +5921,7 @@ async fn run_repo_pipeline(
         }
         Err(generators::GateStop::Blocked(why)) => {
             let kept = keep_wip_branch(github, repo_owner, repo_name, branch_name).await;
-            return Err(format!("{why} The work so far is kept on branch `{kept}`.").into());
+            return Err(stopped_keeping(&why, &kept).into());
         }
         Err(generators::GateStop::NeedsTime) => {
             // A multi-repo run has no fresh steps yet: say exactly that.
@@ -10472,6 +10509,23 @@ async fn switch_run_repo(
     )
     .await;
     true
+}
+
+/// The plan files cached for a run's ticket and repository (for a round on
+/// its pull request, which judges the branch against the plan again).
+pub(crate) async fn run_plan_files(
+    state: &WorkerState,
+    msg: &TicketMessage,
+) -> Option<plan::PlanResult> {
+    let prefix = openspec_prefix(
+        &msg.team_id,
+        &msg.ticket_id,
+        &msg.repo_owner,
+        &msg.repo_name,
+    );
+    load_cached_plan_files(state, &prefix)
+        .await
+        .filter(|p| !p.tasks.trim().is_empty())
 }
 
 async fn load_cached_plan_files(state: &WorkerState, prefix: &str) -> Option<plan::PlanResult> {
