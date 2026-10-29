@@ -1,0 +1,17 @@
+{
+  "description": "A PR whose stated goal is removing a flip between full and incremental runs, where the reviewer showed the flip still happens. The reviewer left it a medium suggestion; the independent severity check (recorded answer) found it defeats the PR's own goal, so it blocks. A second finding the reviewer itself marked as missing the goal blocks too.",
+  "steps": [
+    {"push": {"head": "c1c2c3c"}},
+    {"review": {"trigger": "synchronize", "dedup_key": "head#c1c2c3c",
+      "model": {"verdict": "APPROVE", "summary": "x", "findings": [
+        {"file": "models/orders_latest.sql", "line": 14, "severity": "medium", "category": "suggestion", "title": "Add a tie-breaker to the ordering", "body": "Rows with the same updated_at can still come out in either order."},
+        {"file": "models/orders_latest.sql", "line": 20, "severity": "low", "category": "correctness", "defeats_goal": true, "title": "The incremental filter still drops late rows", "body": "The PR says it makes incremental and full runs agree; rows arriving late are still dropped by the incremental filter."}
+      ]},
+      "judge": {"checks": [{"index": 0, "blocking": true, "reason": "the PR's stated goal is to stop this flip, and ties still flip"}]}}}
+  ],
+  "expect": {
+    "formal": [["c1c2c3c", "REQUEST_CHANGES"]],
+    "last_notes": 0,
+    "body_contains": [[0, "This blocks: the PR's stated goal is to stop this flip"]]
+  }
+}

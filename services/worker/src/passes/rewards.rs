@@ -656,6 +656,7 @@ pub fn apply_calibration(findings: &mut Vec<Finding>, states: &[CategoryState]) 
                     downgraded += 1;
                 }
                 f.weaken_to(Evidence::UnverifiedConcern);
+                f.note_only = Some("the team keeps dismissing this category".to_string());
                 if !minor {
                     f.severity = "low".into();
                 }
@@ -727,7 +728,8 @@ mod tests {
         assert_eq!(f[3].severity, "blocking");
         assert!(f[4].holds_merge());
         // Nothing to apply: nothing changes.
-        let mut g = vec![finding("style", "verified-defect", "high")];
+        let mut g = vec![finding("naming", "verified-defect", "high")];
+        g[0].category = "bug".into();
         assert_eq!(apply_calibration(&mut g, &[]), (0, 0));
         assert!(g[0].holds_merge());
     }

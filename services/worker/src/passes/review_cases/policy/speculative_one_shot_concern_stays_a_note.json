@@ -1,0 +1,15 @@
+{
+  "description": "Speculation and preferences stay notes. On a startup script, the reviewer worried a slow download might time out: nothing shows it will, and it is an optional hardening suggestion, so it doesn't block, one-shot path or not. A naming preference the reviewer inferred itself (no written team rule) is a note too.",
+  "steps": [
+    {"push": {"head": "c7c8c9c"}},
+    {"review": {"trigger": "synchronize", "dedup_key": "head#c7c8c9c",
+      "model": {"verdict": "APPROVE", "summary": "x", "findings": [
+        {"file": "modules/windows-host/main.tf", "line": 40, "severity": "medium", "category": "hardening", "evidence": "unverified-concern", "basis": "external", "title": "A slow download might time out", "body": "If the mirror is slow during provisioning, the download might time out and the startup script would throw. Nothing shows the mirror is slow; a retry would be nice to have."},
+        {"file": "src/sync/load.py", "line": 8, "severity": "high", "category": "convention", "evidence": "verified-defect", "title": "Prefer an early return", "body": "Returning early would read more clearly than the nested if."}
+      ]}}}
+  ],
+  "expect": {
+    "formal": [["c7c8c9c", "APPROVE"]],
+    "last_notes": 2
+  }
+}

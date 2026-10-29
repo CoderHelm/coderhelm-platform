@@ -704,6 +704,12 @@ async fn mark_pr_ready(
         );
         return Ok(());
     }
+    // CoderHelm's own review still lists findings it hasn't fixed: the PR
+    // stays a draft until its fix rounds clear them (`own_review`).
+    if let Some(why) = pr["body"].as_str().and_then(passes::own_review::hold) {
+        info!(pr_number = msg.pr_number, why = %why, "PR stays a draft");
+        return Ok(());
+    }
     // A person put this PR back into draft: a CI pass must not undo that. A
     // timeline that can't be read leaves the draft alone (fail closed).
     let timeline = github

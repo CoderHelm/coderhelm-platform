@@ -1424,6 +1424,7 @@ fn owned_sections(plan: &PlanResult, proof: &Proof<'_>, repo: &str) -> super::co
             },
         ),
         review_fixes: String::new(),
+        open_findings: String::new(),
         // A small failing-test fix carries no open items or questions.
         open_items: if small_test_fix {
             String::new()

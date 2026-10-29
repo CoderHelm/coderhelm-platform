@@ -1,0 +1,15 @@
+{
+  "description": "A release step's smoke check exits 1 for any HTTP status other than 200, so a 204 or 304 from the health endpoint fails the deploy. The reviewer rated it a low hardening note because the endpoint usually answers 200. HTTP defines 204 and 304 as successes, and the step isn't retried: it holds the merge.",
+  "steps": [
+    {"push": {"head": "d4d5d6d"}},
+    {"review": {"trigger": "synchronize", "dedup_key": "head#d4d5d6d",
+      "model": {"verdict": "APPROVE", "summary": "x", "findings": [
+        {"file": "scripts/deploy/smoke-check.sh", "line": 12, "severity": "low", "category": "hardening", "evidence": "unverified-concern", "title": "A 304 from the health endpoint fails the deploy check", "body": "The check exits 1 unless the status is 200. Behind the CDN the health endpoint can answer 304 Not Modified or 204 No Content, which would fail the release. It usually answers 200."}
+      ]}}}
+  ],
+  "expect": {
+    "formal": [["d4d5d6d", "REQUEST_CHANGES"]],
+    "last_notes": 0,
+    "body_contains": [[0, "RFC 9110"], [0, "This blocks: HTTP 2xx statuses"]]
+  }
+}

@@ -1,0 +1,15 @@
+{
+  "description": "The reviewer traced, file by file, how a write that keeps `updated_at` unchanged hides the row from two incremental cursors (a MAX(updated_at) watermark and a GREATEST(updated_at, ...) sync), so changes stop reaching the search index until a nightly rebuild. It posted it as a correctness concern, not verified. A defect proven by reading the code is verified, and a data-correctness defect in a production pipeline blocks.",
+  "steps": [
+    {"push": {"head": "a1a2a3a"}},
+    {"review": {"trigger": "synchronize", "dedup_key": "head#a1a2a3a",
+      "model": {"verdict": "APPROVE", "summary": "x", "findings": [
+        {"file": "src/sync/write.py", "line": 88, "severity": "medium", "category": "correctness", "evidence": "unverified-concern", "title": "The write keeps updated_at, so incremental syncs skip the row", "body": "`src/sync/write.py:88` updates the row without touching updated_at. `src/index/cursor.py:40` reads MAX(updated_at) as its watermark and `src/sync/incremental.sql:12` filters on GREATEST(updated_at, deleted_at), so neither picks the change up: the search index stays stale until the nightly rebuild, and the row is fetched again on every run."}
+      ]}}}
+  ],
+  "expect": {
+    "formal": [["a1a2a3a", "REQUEST_CHANGES"]],
+    "last_notes": 0,
+    "body_contains": [[0, "[high] The write keeps updated_at"]]
+  }
+}

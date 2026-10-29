@@ -1935,6 +1935,21 @@ async fn run_once(
         );
     }
 
+    // 2b2) Ground the classifier's fields in what each finding shows: a
+    // traced code path or a documented exit/status code is verified, and a
+    // cited team rule must be quoted from the team's rules (before the checks
+    // that may make a finding a note).
+    let grounded = super::review_severity::ground(&mut findings, &team_instructions);
+    if grounded != Default::default() {
+        info!(
+            pr = msg.pr_number,
+            documented = grounded.documented,
+            traced = grounded.traced,
+            unquoted_rules = grounded.unquoted_rules,
+            "Findings grounded for the severity classifier"
+        );
+    }
+
     // 2c) A blocking finding that rests only on a live lookup that failed or
     // came back empty rests on nothing: it is kept as a note saying so.
     let lookups: Vec<super::proof::Lookup> = live
@@ -2046,6 +2061,29 @@ async fn run_once(
         }
     }
     let held_late = late.held;
+    // Severity second pass: an independent judge checks every note against
+    // the blocking rubric (one batched call); a note it calls blocking holds
+    // the merge. Then each finding's severity is set to read like its class.
+    let second = super::review_severity::second_pass(
+        state,
+        &provider,
+        &mut findings,
+        &review_diff,
+        title,
+        pr_body,
+        &team_instructions,
+        &mut usage,
+    )
+    .await;
+    super::review_severity::finalize(&mut findings);
+    info!(
+        pr = msg.pr_number,
+        checked = second.checked,
+        raised = second.raised,
+        blocking = findings.iter().filter(|f| f.holds_merge()).count(),
+        notes = findings.iter().filter(|f| !f.holds_merge()).count(),
+        "Review severity second pass"
+    );
 
     // 4) Optional sandbox verification ("receipts"): actually run the affected
     // tests/build. A hard failure forces REQUEST_CHANGES.
@@ -2116,7 +2154,44 @@ async fn run_once(
     if let Some(from) = &stable.flipped_from {
         info!(pr = msg.pr_number, head = %head_sha, from = %from, to = stable.verdict, reason = %stable.note.as_deref().unwrap_or(""), "Verdict changed on an unchanged commit");
     }
-    let verdict = stable.verdict;
+    // Never APPROVE while a finding holds the merge. On CoderHelm's own PR,
+    // every finding that isn't strictly optional is its own to fix before
+    // the PR is marked ready or the merge armed: the review requests changes
+    // and lists them at the top of the description (`own_review`).
+    let own_open = if self_authored {
+        super::own_review::required(&findings, &held_late)
+    } else {
+        Vec::new()
+    };
+    let verdict = super::review_severity::consistent_verdict(stable.verdict, &findings);
+    let verdict = if own_open.is_empty() {
+        verdict
+    } else {
+        "REQUEST_CHANGES"
+    };
+    if self_authored {
+        let section = super::own_review::section(&own_open);
+        let updated = super::completeness::with_section(
+            pr_body,
+            super::completeness::Section::OpenFindings,
+            section,
+        );
+        if updated != pr_body {
+            if let Err(e) = github
+                .update_pr_body(&msg.repo_owner, &msg.repo_name, msg.pr_number, &updated)
+                .await
+            {
+                warn!(pr = msg.pr_number, error = %e, "Could not update the own PR's open review findings");
+            }
+        }
+        if !own_open.is_empty() {
+            info!(
+                pr = msg.pr_number,
+                open = own_open.len(),
+                "Own PR has open review findings — CoderHelm fixes them before ready"
+            );
+        }
+    }
     // Inline comments from the findings as they stand after every rule, so a
     // demoted finding is posted as a note.
     let hunks = review_agent::right_line_hunks(&compare);
@@ -2143,15 +2218,15 @@ async fn run_once(
     let risk = risk_report.level.to_string();
 
     // GitHub forbids APPROVE / REQUEST_CHANGES on your OWN PR → downgrade to COMMENT.
-    let self_authored = pr_author.contains("coderhelm");
     let effective_event = if self_authored { "COMMENT" } else { verdict };
     let verdict_line = review_agent::verdict_heading(
         verdict,
         &review_agent::HeadingCounts {
             defects: findings
                 .iter()
-                .filter(|f| f.evidence() == review_agent::Evidence::VerifiedDefect)
+                .filter(|f| f.evidence() != review_agent::Evidence::Question && f.holds_merge())
                 .count(),
+            own_open: own_open.len(),
             blocking_questions: findings
                 .iter()
                 .filter(|f| f.evidence() == review_agent::Evidence::Question && f.holds_merge())
@@ -2563,6 +2638,7 @@ async fn run_once(
     let run_review = (msg.trigger == TRIGGER_RUN).then(|| RunReview {
         verdict,
         body: record_body.clone(),
+        open_findings: own_open.clone(),
         override_finding: findings
             .iter()
             .find(|f| {
@@ -2671,12 +2747,16 @@ pub struct RunReview {
     /// A kept source-data-override finding (title and body): the diff
     /// overrides data another system owns, so the fix belongs there.
     pub override_finding: Option<String>,
+    /// The findings the run must fix before the PR is marked ready: every
+    /// one that isn't strictly optional (`own_review::required`).
+    pub open_findings: Vec<String>,
 }
 
 impl RunReview {
-    /// The verdict holds the merge.
+    /// The verdict holds the merge, or the review left findings the run
+    /// must fix first.
     pub fn blocks(&self) -> bool {
-        self.verdict == "REQUEST_CHANGES"
+        self.verdict == "REQUEST_CHANGES" || !self.open_findings.is_empty()
     }
 }
 
@@ -3306,10 +3386,16 @@ fn findings_record(findings: &[review_agent::Finding]) -> String {
                 review_agent::Evidence::UnverifiedConcern => "concern",
                 review_agent::Evidence::Question => "question",
             };
+            let check = f.severity_check.as_ref();
             serde_json::json!({
                 "severity": f.severity.trim().to_ascii_lowercase(),
+                "model_severity": f.model_severity.as_deref().unwrap_or(&f.severity).trim().to_ascii_lowercase(),
                 "kind": kind,
                 "blocks": f.holds_merge(),
+                "class_reason": super::review_severity::classify(f).reason(),
+                "severity_checked": check.is_some(),
+                "severity_check_reason": check.map(|c| c.reason.as_str()).unwrap_or(""),
+                "severity_check_raised": check.is_some_and(|c| c.blocking),
                 "file": f.file,
                 "line": f.line,
                 "title": f.title,
@@ -3964,10 +4050,13 @@ mod verdict_tests {
             finding("convention", None, "nit"),
         ];
         assert_eq!(decide_verdict(&defects, 0, &[], false), "REQUEST_CHANGES");
-        // The same defect at medium severity is a note.
+        // The same defect at medium severity still blocks: severity is only
+        // an input. A preference the reviewer inferred is a note.
         let mut medium = finding("bug", Some("verified-defect"), "off by one");
         medium.severity = "medium".into();
-        assert_eq!(decide_verdict(&[medium], 0, &[], false), "APPROVE");
+        assert_eq!(decide_verdict(&[medium], 0, &[], false), "REQUEST_CHANGES");
+        let pref = finding("convention", Some("verified-defect"), "name it `count`");
+        assert_eq!(decide_verdict(&[pref], 0, &[], false), "APPROVE");
         // an earlier requested change still open
         assert_eq!(decide_verdict(&[], 1, &[], false), "REQUEST_CHANGES");
         assert_eq!(decide_verdict(&[], 0, &[], true), "REQUEST_CHANGES");

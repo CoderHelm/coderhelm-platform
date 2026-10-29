@@ -64,6 +64,50 @@ pub struct Finding {
     /// this finding relevant (it may then block on code reviewed before).
     #[serde(default)]
     pub prompted_by_reply: Option<bool>,
+    /// What proves it: `code` | `tests` | `ci` | `documented` | `external`
+    /// (see [`Basis`]). Documented behaviour of a tool, API or platform
+    /// counts the same as the code: both are verified.
+    #[serde(default)]
+    pub basis: Option<String>,
+    /// For a `documented` finding: the documentation it cites (a name, plus
+    /// a link when one is known).
+    #[serde(default)]
+    pub source: Option<String>,
+    /// True when the code runs once in production with no automatic retry or
+    /// rollback (instance startup or user data scripts, provisioning,
+    /// migrations, deploy and release steps, one-off data writes).
+    #[serde(default)]
+    pub one_shot: Option<bool>,
+    /// True when the finding shows the PR doesn't achieve its own stated
+    /// goal (its title or description says what it fixes, and that is still
+    /// broken).
+    #[serde(default)]
+    pub defeats_goal: Option<bool>,
+    /// The text of the team's or repository's written rule the change
+    /// breaks, quoted as written (only for a rule the prompt lists).
+    #[serde(default)]
+    pub team_rule: Option<String>,
+    /// True when the current code is correct and this is an optional
+    /// improvement; false when the code as written is wrong.
+    #[serde(default)]
+    pub optional: Option<bool>,
+    /// Why a policy made this a note whatever it says (the PR tracks it,
+    /// didn't cause it, a late blocker, a lookup that returned nothing). Set
+    /// by [`super::review_policy::demote`].
+    #[serde(skip)]
+    pub note_only: Option<String>,
+    /// The independent severity check's answer, for a finding that was a
+    /// note before it ([`super::review_severity::second_pass`]).
+    #[serde(skip)]
+    pub severity_check: Option<super::review_severity::SeverityCheck>,
+    /// The severity the reviewer gave, when the class changed it
+    /// ([`super::review_severity::finalize`]).
+    #[serde(skip)]
+    pub model_severity: Option<String>,
+    /// Set when a check weakened the finding's evidence: its `basis` no
+    /// longer decides it.
+    #[serde(skip)]
+    pub weakened: bool,
 }
 
 /// What a finding rests on. The verdict depends on it: only a defect the
@@ -106,6 +150,50 @@ impl Evidence {
             Evidence::VerifiedDefect => 2,
             Evidence::UnverifiedConcern => 1,
             Evidence::Question => 0,
+        }
+    }
+}
+
+/// What a finding is proven by. Code, tests, CI, a data query and authoritative
+/// documentation (vendor docs, man pages, the language spec, documented
+/// exit and status codes) all verify a finding; only a claim that rests on
+/// unknown external state is unverified.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Basis {
+    Code,
+    Tests,
+    Ci,
+    /// A query of the team's own data (a warehouse or database lookup).
+    Data,
+    /// Documented behaviour of the tool, API or platform the code uses. The
+    /// finding names the source.
+    Documented,
+    /// State outside the repository nobody could read.
+    External,
+}
+
+impl Basis {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Basis::Code => "code",
+            Basis::Tests => "tests",
+            Basis::Ci => "ci",
+            Basis::Data => "data",
+            Basis::Documented => "documented",
+            Basis::External => "external",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Basis> {
+        let s = s.trim().to_ascii_lowercase().replace(['_', ' '], "-");
+        match s.as_str() {
+            "code" => Some(Basis::Code),
+            "tests" | "test" => Some(Basis::Tests),
+            "ci" | "check" | "checks" => Some(Basis::Ci),
+            "data" | "query" | "lookup" => Some(Basis::Data),
+            "documented" | "documentation" | "docs" | "doc" | "spec" => Some(Basis::Documented),
+            "external" | "unknown" => Some(Basis::External),
+            _ => None,
         }
     }
 }
@@ -361,6 +449,7 @@ pub fn enforce_source_data_override(findings: &mut [Finding]) {
     for f in findings.iter_mut() {
         if f.category.eq_ignore_ascii_case(SOURCE_DATA_OVERRIDE) {
             f.severity = "blocking".to_string();
+            f.optional = Some(false);
             f.evidence = Some(Evidence::VerifiedDefect.as_str().to_string());
         }
     }
@@ -515,6 +604,7 @@ pub fn enforce_required_tests(findings: &mut [Finding]) {
     for f in findings.iter_mut() {
         if f.category.eq_ignore_ascii_case("tests") {
             f.severity = "blocking".to_string();
+            f.optional = Some(false);
             f.evidence = Some(Evidence::VerifiedDefect.as_str().to_string());
         }
     }
@@ -528,35 +618,67 @@ impl Finding {
     /// What the finding rests on. A `question` finding is a question
     /// whatever else it says; a finding that doesn't say is taken as a
     /// defect (the reviewer is told to say).
+    ///
+    /// A `basis` decides it, unless a check weakened the finding since:
+    /// code, tests, CI and documentation that the finding cites are verified
+    /// alike; a `documented` finding that cites no source, and one resting
+    /// on external state, are not.
     pub fn evidence(&self) -> Evidence {
         if self.category.eq_ignore_ascii_case("question") {
             return Evidence::Question;
         }
-        self.evidence
-            .as_deref()
-            .and_then(Evidence::parse)
-            .unwrap_or(Evidence::VerifiedDefect)
+        let said = self.evidence.as_deref().and_then(Evidence::parse);
+        if said == Some(Evidence::Question) || self.weakened {
+            return said.unwrap_or(Evidence::VerifiedDefect);
+        }
+        match self.basis() {
+            Some(Basis::Code | Basis::Tests | Basis::Ci | Basis::Data) => Evidence::VerifiedDefect,
+            Some(Basis::Documented) if self.cites_source() => Evidence::VerifiedDefect,
+            Some(Basis::Documented | Basis::External) => Evidence::UnverifiedConcern,
+            None => said.unwrap_or(Evidence::VerifiedDefect),
+        }
     }
 
-    /// A verified defect (or a repo policy) requests changes, and so does a
-    /// question the change's correctness rests on: its ask is the change.
-    /// Only at high severity: a low or medium finding is a note
-    /// ([`super::review_policy`]).
+    /// What proves it, when the reviewer said.
+    pub fn basis(&self) -> Option<Basis> {
+        self.basis.as_deref().and_then(Basis::parse)
+    }
+
+    /// The documentation the finding cites, when it names one.
+    pub fn cites_source(&self) -> bool {
+        self.source.as_deref().is_some_and(|s| !s.trim().is_empty())
+    }
+
+    /// Verified by the documentation `source` cites (kept when the finding
+    /// already names one).
+    pub fn verify_by_documentation(&mut self, source: &str) {
+        self.basis = Some(Basis::Documented.as_str().to_string());
+        if !self.cites_source() {
+            self.source = Some(source.to_string());
+        }
+        self.evidence = Some(Evidence::VerifiedDefect.as_str().to_string());
+        self.weakened = false;
+    }
+
+    /// Whether it requests changes: blocking unless it is a preference, an
+    /// optional suggestion, or a concern resting on unknown external state
+    /// ([`super::review_severity::classify`]).
     pub fn holds_merge(&self) -> bool {
-        if !super::review_policy::blocking_severity(&self.severity) {
-            return false;
-        }
-        match self.evidence() {
-            Evidence::VerifiedDefect => true,
-            Evidence::Question => self.blocks == Some(true),
-            Evidence::UnverifiedConcern => false,
-        }
+        super::review_severity::classify(self).blocks()
+    }
+
+    /// Verified by reading the code (the finding traces the code path).
+    pub fn verify_by_code(&mut self) {
+        self.basis = Some(Basis::Code.as_str().to_string());
+        self.evidence = Some(Evidence::VerifiedDefect.as_str().to_string());
+        self.weakened = false;
     }
 
     /// Weakens the finding to `to` when that is weaker than what it has.
     pub fn weaken_to(&mut self, to: Evidence) {
         if to.rank() < self.evidence().rank() {
             self.evidence = Some(to.as_str().to_string());
+            self.weakened = true;
         }
     }
 }
@@ -595,6 +717,7 @@ pub fn enforce_failed_lookups(findings: &mut [Finding], lookups: &[super::proof:
             .collect();
         f.severity = "medium".to_string();
         f.weaken_to(Evidence::UnverifiedConcern);
+        f.note_only = Some("the live lookup it rests on returned no data".to_string());
         f.body = format!(
             "{}\n\nThe live lookup this rests on didn't return data ({}), so it is not evidence \
              either way and this isn't blocking.",
@@ -715,6 +838,8 @@ pub fn decide_verdict(
 #[derive(Debug, Clone, Copy, Default)]
 pub struct HeadingCounts {
     pub defects: usize,
+    /// On CoderHelm's own PR: findings it fixes itself before ready.
+    pub own_open: usize,
     pub blocking_questions: usize,
     pub blocking_facts: usize,
     pub prior_open: usize,
@@ -742,6 +867,13 @@ pub fn verdict_heading(verdict: &str, c: &HeadingCounts) -> String {
     let mut why: Vec<String> = Vec::new();
     if c.defects > 0 {
         why.push(plural(c.defects, "defect to fix", "defects to fix"));
+    }
+    if c.defects == 0 && c.own_open > 0 {
+        why.push(plural(
+            c.own_open,
+            "finding CoderHelm fixes before this PR is ready",
+            "findings CoderHelm fixes before this PR is ready",
+        ));
     }
     if c.blocking_questions > 0 {
         why.push(plural(
@@ -1333,11 +1465,13 @@ pub fn review_system_prompt(
          200\" in the summary, or a finding citing the result when it shows a defect (a 404, a \
          redirect to the wrong place). Never ask a person to confirm what you could check. \
          EVIDENCE: every finding says what it rests on in `evidence`: \"verified-defect\" only \
-         when the code you read, a tool result or a CI check shows it is wrong (say which in the \
-         body); \"unverified-concern\" when it might be wrong but you could not establish it; \
-         \"question\" when only a person can confirm it. Only verified defects request changes; \
-         the others are posted as comments and don't hold the merge, so never dress a concern \
-         you couldn't verify as a defect. A \"question\" sets `blocks`: true only when the \
+         when the code you read, a tool result, a CI check or documented behaviour of the tool, \
+         API or platform involved shows it is wrong (say which in the body); \
+         \"unverified-concern\" when it might be wrong but you could not establish it; \
+         \"question\" when only a person can confirm it. \
+         {DOCUMENTED_RULE} A concern resting on external state you couldn't check is posted as \
+         a comment and doesn't hold the merge (except on a one-shot path, see WHAT BLOCKS), so \
+         never dress such a concern as a defect, and never call a defect you proved a concern. A \"question\" sets `blocks`: true only when the \
          change's correctness rests on the answer (the code reads a field, shape or behaviour of \
          another system that nobody verified); its body then says exactly what to confirm and \
          where (\"confirm `status` from a real order payload\"). Every other question sets \
@@ -1362,6 +1496,10 @@ pub fn review_system_prompt(
          \"end_line\": <optional int for a range>, \"severity\": \"blocking|high|medium|low|nit\",\n    \
          \"category\": \"bug|security|correctness|perf|convention|style|logging|hardening|follow-up|scope|tests|source-data-override|manual-check|question\", \"title\": \"short\",\n    \
          \"evidence\": \"verified-defect|unverified-concern|question\",\n    \
+         \"basis\": \"code|tests|ci|documented|external\"  (what proves it, per DOCUMENTED BEHAVIOUR), \"source\": \"for documented: the documentation's name, plus a link if known\",\n    \
+         \"one_shot\": <bool, true when the code runs once in production with no automatic retry or rollback>,\n    \
+         \"defeats_goal\": <bool, true when the change doesn't achieve what its title or description says it does>, \"team_rule\": \"the written team or repository rule it breaks, quoted exactly\",\n    \
+         \"optional\": <bool, true when the current code is correct and this is an optional improvement, false when the code as written is wrong>,\n    \
          \"lookups\": [\"L1\"]  (ids of the live lookups the finding rests on, if any),\n    \
          \"blocks\": <bool, questions only: true when the change's correctness rests on the answer>,\n    \
          \"caused_by_diff\": <bool, false when the PR's change didn't cause it>, \"tracked\": <bool, true for a follow-up the PR tracks or work outside the repo>, \"prompted_by_reply\": <bool, true when a person's reply since your previous review made it relevant>,\n    \
@@ -1375,13 +1513,12 @@ pub fn review_system_prompt(
          (just `line` without end_line) at the PR head with exactly its text. Give one ONLY when the whole fix is \
          that in-place replacement: the full new text of every anchored line, nothing outside them. A fix that \
          moves code, or changes more than one place, gets NO suggestion; describe it in the body instead.\n\
-         Use \"blocking\" ONLY for real bugs/risks that should stop the merge. The verdict is \
-         always APPROVE or REQUEST_CHANGES, never a bare comment: the PR is approved unless a \
-         verified defect, a required test, a failed check, or a question or unconfirmed fact the \
-         change rests on is left; notes, suggestions and questions it doesn't rest on are posted \
-         with the approval. So every reason to hold the merge MUST be a verified-defect finding \
-         or a question with `blocks`: true: a concern written only in the summary holds \
-         nothing. Give every remaining item now, in this review: do not hold back non-blocking \
+         The verdict is always APPROVE or REQUEST_CHANGES, never a bare comment: the PR is \
+         approved unless a finding that blocks under WHAT BLOCKS, a required test, a failed \
+         check, or a question or unconfirmed fact the change rests on is left; preferences, \
+         optional suggestions, external concerns and questions it doesn't rest on are posted \
+         with the approval. So every reason to hold the merge MUST be a finding: a concern \
+         written only in the summary holds nothing. Give every remaining item now, in this review: do not hold back non-blocking \
          notes (wording of the PR description, counts in it) for a later round. If you are unsure whether something is a real problem, read more code until you \
          know.{graph_note}"
     )
@@ -1625,7 +1762,11 @@ pub fn critic_system_prompt(ctx: &CriticContext<'_>) -> String {
          For each kept finding also judge its evidence: \"verified-defect\" only when the \
          diff, a quoted tool result or CI shows the defect; \"unverified-concern\" when it \
          only might be wrong; \"question\" when it asks a person to confirm something \
-         (\"please confirm X works\") without evidence that X is broken. \
+         (\"please confirm X works\") without evidence that X is broken. Documented behaviour \
+         of the tool, API or platform the code uses (vendor docs, man pages, the language \
+         spec, documented exit and status codes) is evidence like the code: a candidate that \
+         cites it is \"verified-defect\", and it is never dropped or weakened because the \
+         trigger is uncommon. \
          Output ONLY a fenced ```json block: \
          {\"verdicts\":[{\"index\":<int>,\"keep\":<bool>,\"evidence\":\"verified-defect|unverified-concern|question\"}]} for every index.",
     );
@@ -1658,9 +1799,15 @@ pub fn critic_user_prompt(diff: &str, findings: &[Finding], ctx: &CriticContext<
         .enumerate()
         .map(|(i, f)| {
             format!(
-                "{i}: [{sev}, {ev}] {file}:{line} — {title}: {body}",
+                "{i}: [{sev}, {ev}{src}] {file}:{line} — {title}: {body}",
                 sev = f.severity,
                 ev = f.evidence().as_str(),
+                src = f
+                    .source
+                    .as_deref()
+                    .filter(|s| !s.trim().is_empty())
+                    .map(|s| format!(", documented: {}", s.trim()))
+                    .unwrap_or_default(),
                 file = f.file,
                 line = f.line,
                 title = f.title,
@@ -1843,6 +1990,9 @@ pub fn to_postable(
             "💬"
         };
         let kind = match f.evidence() {
+            Evidence::VerifiedDefect if f.basis() == Some(Basis::Documented) => {
+                format!("{}, documented", f.category)
+            }
             Evidence::VerifiedDefect => f.category.clone(),
             // "(question)" alone marks a question that doesn't hold the
             // merge (see `thread_holds_merge`).
@@ -1851,6 +2001,11 @@ pub fn to_postable(
             Evidence::UnverifiedConcern => format!("{}, not verified", f.category),
         };
         let mut body = format!("{emoji} **{}** ({kind})\n\n{}", f.title, f.body);
+        if let Some(src) = f.source.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            if !f.body.contains(src) {
+                body.push_str(&format!("\n\nSource: {src}"));
+            }
+        }
         if !holds {
             body.push_str(&format!("\n\n{NON_BLOCKING_MARK}"));
         }
@@ -2198,17 +2353,58 @@ pub const CAPABILITIES_RULE: &str = "WHAT YOU CAN DO: you post the formal review
 /// store release) can't be met in CI and belong to the people shipping it.
 /// What may hold the merge (`review_policy` enforces it on the output).
 pub const BLOCKING_RULE: &str =
-    "WHAT BLOCKS: only a high-severity defect that this PR's own change \
-     causes requests changes: severity \"blocking\" or \"high\". Everything else is a note \
-     posted with the approval, whatever its evidence: low and medium findings; style, naming, \
-     wording and log-level points (category \"style\" or \"logging\"); hardening that would be \
-     nice but isn't a defect (category \"hardening\"); follow-up work the PR description already \
-     tracks, or work outside this repository (set `tracked`: true); and anything the PR didn't \
-     cause, such as a check that fails on the base branch too or a problem in code the diff \
-     didn't touch (set `caused_by_diff`: false). RAISE EVERYTHING NOW: the first review of a \
-     commit must raise every blocking finding it can; read the whole change before deciding. \
-     A later review blocks only on lines changed since the previous review, or on something a \
-     person's reply made relevant (`prompted_by_reply`: true). ";
+    "WHAT BLOCKS: blocking is the default. A finding is a non-blocking note only when it is \
+     one of: (a) a style or naming preference you inferred yourself, not a written team or \
+     repository rule (category \"style\", \"naming\", \"logging\", \"convention\"); (b) an \
+     optional suggestion or improvement where the current code is correct (set `optional`: \
+     true); (c) a concern that truly depends on unknown external state you couldn't check \
+     (`basis`: \"external\"), on code that doesn't run once in production. Everything else \
+     requests changes, whatever severity you would give it: a defect verified by the code, \
+     tests or CI, a data query or documentation; a correctness or data issue; the PR missing \
+     its own goal; a broken team rule; a security issue. Set `optional`: false when the code \
+     as written is wrong. Also notes: follow-up work the PR description already tracks, or \
+     work outside this repository (set `tracked`: true); and anything the PR didn't cause, \
+     such as a check that fails on the base branch too or a problem in code the diff didn't \
+     touch (set `caused_by_diff`: false). Every note is checked again by an independent judge \
+     with this rubric. RAISE EVERYTHING NOW: the first review of a commit must raise every \
+     blocking finding it can; read the whole change before deciding. A later review blocks \
+     only on lines changed since the previous review, or on something a person's reply made \
+     relevant (`prompted_by_reply`: true). \
+     LIKELIHOOD AND IMPACT DON'T LOWER A DEFECT: never make a verified defect a note because \
+     its trigger \"usually\" won't happen, few records look affected, the affected ones look \
+     old, or the impact seems small. Severity says how bad the defect is when it happens. A \
+     data-correctness defect in a production pipeline (lost or stale writes, a cursor or \
+     watermark that skips rows, duplicates, ordering that flips between runs) blocks. \
+     ONE-SHOT PATHS: code that runs in production and that nothing retries or rolls back \
+     automatically (instance startup and user data scripts, provisioning, migrations, deploy \
+     and release steps, cron that runs once, writes to stored data) sets `one_shot`: true and \
+     is judged strictly: a failure there leaves a person to finish the work by hand, so even \
+     an unchecked concern there blocks, and a documented failure is never \"hardening\". \
+     THE PR'S OWN GOAL: read the title and description for what the PR says it fixes or \
+     achieves, and compare. A finding that the change doesn't achieve it (the very problem it \
+     sets out to remove still happens) sets `defeats_goal`: true and quotes the stated goal. \
+     TEAM RULES: when the change breaks a written rule from the team's or the repository's \
+     instructions listed in the prompt, set `team_rule` to the rule's text exactly as written. \
+     A preference you infer yourself (naming, structure, style) is not a team rule: leave \
+     `team_rule` out. ";
+
+/// What counts as verification beyond the code: documented behaviour of the
+/// tool, API or platform the code calls. A provisioning script that threw on
+/// an installer's documented "success, reboot required" exit code was once
+/// posted as an unverified hardening note because a fresh install
+/// "usually returns 0".
+pub const DOCUMENTED_RULE: &str = "DOCUMENTED BEHAVIOUR: a finding is verified when the code, a \
+     test or CI, or documented behaviour of the tool, API or platform involved proves it: \
+     vendor documentation, man pages, the language specification, well known exit codes and \
+     HTTP status codes. Code that treats a documented success as a failure (an installer's \
+     \"success, reboot required\" exit code, a 204 or 304 response) or a documented failure as \
+     a success is a verified defect, `basis`: \"documented\", and `source` names the \
+     documentation (with a link when you know one), the way you cite code. Set `basis` on every \
+     finding: \"code\", \"tests\" or \"ci\" for what you read or ran; \"external\" only when \
+     the claim rests on state outside the repository nobody could read (another system's \
+     data, production settings), and only then is it \"unverified-concern\". A defect you \
+     traced through the code, naming the files and lines, is verified (`basis`: \"code\"): \
+     never call a finding that cites the code path \"not verified\". ";
 
 pub const MANUAL_CHECK_RULE: &str = "MANUAL CHECKS: a suggestion to test something by hand (on a \
      device, a simulator, a staging build, before a store release) is a note, never a defect: \
@@ -2308,6 +2504,7 @@ mod tests {
                 caused_by_diff: None,
                 tracked: None,
                 prompted_by_reply: None,
+                ..Default::default()
             },
             Finding {
                 file: "a.rs".into(),
@@ -2324,6 +2521,7 @@ mod tests {
                 caused_by_diff: None,
                 tracked: None,
                 prompted_by_reply: None,
+                ..Default::default()
             },
         ];
         let mut changed = HashMap::new();
@@ -2357,6 +2555,7 @@ mod anchoring_tests {
             caused_by_diff: None,
             tracked: None,
             prompted_by_reply: None,
+            ..Default::default()
         }
     }
 
@@ -2470,6 +2669,7 @@ mod required_tests_tests {
             caused_by_diff: None,
             tracked: None,
             prompted_by_reply: None,
+            ..Default::default()
         }
     }
 
@@ -2581,6 +2781,7 @@ mod required_tests_tests {
             caused_by_diff: None,
             tracked: None,
             prompted_by_reply: None,
+            ..Default::default()
         }
     }
 

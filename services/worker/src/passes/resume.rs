@@ -2480,6 +2480,9 @@ pub async fn run(
         // The PR reviewer gives its verdict on this head now, and the run
         // completes only when that verdict doesn't block.
         let mut review_result = review_result;
+        // Findings of CoderHelm's own review the run must fix before the PR
+        // is marked ready (`own_review`).
+        let mut own_open: Vec<String> = Vec::new();
         if review_result.passed {
             let budget =
                 std::time::Duration::from_secs(super::remaining_secs(&start).saturating_sub(150));
@@ -2540,12 +2543,19 @@ pub async fn run(
                 if rr.blocks() {
                     info!(
                         run_id = msg.run_id,
+                        open = rr.open_findings.len(),
                         "PR reviewer requested changes — the run doesn't complete as passed"
                     );
+                    let summary = if rr.open_findings.is_empty() {
+                        format!("The PR reviewer requested changes:\n\n{}", rr.body)
+                    } else {
+                        super::own_review::fix_feedback(&rr.open_findings, &rr.body)
+                    };
                     review_result = review::ReviewResult {
                         passed: false,
-                        summary: format!("The PR reviewer requested changes:\n\n{}", rr.body),
+                        summary,
                     };
+                    own_open = rr.open_findings.clone();
                 }
             }
         }
@@ -2574,6 +2584,41 @@ pub async fn run(
             )
             .await?;
         } else {
+            // Own review findings: another round while the rounds make
+            // progress; two rounds in a row without it stop the run with the
+            // PR still a draft and the findings listed at its top.
+            if !own_open.is_empty() {
+                let (before, stalled) = own_review_progress(&run_record);
+                match super::own_review::next(before, &own_open, 0, stalled) {
+                    super::own_review::Next::Stop(reason) => {
+                        stop_on_own_findings(
+                            state,
+                            &ticket_msg,
+                            &msg.run_id,
+                            &reason,
+                            &pr_url,
+                            pr_number,
+                            &branch,
+                            &usage,
+                            wall_clock_secs(created_at, &start),
+                        )
+                        .await?;
+                        mark_events_processed(state, &msg.run_id, &events).await;
+                        return Ok(());
+                    }
+                    super::own_review::Next::Fix { stalled } => {
+                        record_own_review_progress(
+                            state,
+                            &msg.team_id,
+                            &msg.run_id,
+                            own_open.len(),
+                            stalled,
+                        )
+                        .await;
+                    }
+                    super::own_review::Next::Ready => {}
+                }
+            }
             // Review found issues — implement fix and go back to awaiting_ci.
             // Draws on the SAME bounded budget as CI fixes: this branch used
             // to run uncapped AND reset the shared counter to zero, so an
@@ -2601,6 +2646,24 @@ pub async fn run(
                     super::CiOutcome::HandedOff(super::GaveUp::Budget),
                 )
                 .await;
+                if !own_open.is_empty() {
+                    // Never hand over a PR with its own review's findings
+                    // open as if it were ready: it stays a draft, listed.
+                    stop_on_own_findings(
+                        state,
+                        &ticket_msg,
+                        &msg.run_id,
+                        &super::own_review::stop_reason(&own_open),
+                        &pr_url,
+                        pr_number,
+                        &branch,
+                        &usage,
+                        wall_clock_secs(created_at, &start),
+                    )
+                    .await?;
+                    mark_events_processed(state, &msg.run_id, &events).await;
+                    return Ok(());
+                }
                 mark_pr_ready(
                     state,
                     &msg.team_id,
@@ -2677,6 +2740,40 @@ pub async fn run(
                         wall_clock_secs(created_at, &start),
                     )
                     .await?;
+                    return Ok(());
+                }
+                RoundEnd::Done { files: 0 } if !own_open.is_empty() => {
+                    // A round without changes made no progress on the own
+                    // review's findings: the next review decides whether
+                    // that is the second in a row.
+                    warn!(
+                        run_id = msg.run_id,
+                        open = own_open.len(),
+                        "Review fix produced no changes with own review findings open — reviewing again"
+                    );
+                    let (_, stalled) = own_review_progress(&run_record);
+                    record_own_review_progress(
+                        state,
+                        &msg.team_id,
+                        &msg.run_id,
+                        own_open.len(),
+                        stalled,
+                    )
+                    .await;
+                    if set_run_awaiting_ci(
+                        state,
+                        &ctx.ticket_msg,
+                        &msg.run_id,
+                        &pr_url,
+                        pr_number,
+                        &branch,
+                        &ctx.usage,
+                        wall_clock_secs(created_at, &start),
+                    )
+                    .await?
+                    {
+                        send_delayed_resume(state, &msg, 5).await;
+                    }
                     return Ok(());
                 }
                 RoundEnd::Done { files: 0 } => {
@@ -4447,6 +4544,9 @@ pub(crate) fn draft_hold(body: &str, title: &str, proven: bool) -> Option<&'stat
     if super::proof::holds_unfinished(body) {
         return Some("planned work not done is listed in the description");
     }
+    if super::own_review::hold(body).is_some() {
+        return Some("CoderHelm's own review findings are open in the description");
+    }
     if !proven && is_e2e_proof_pr(title) {
         return Some("an end-to-end proof PR waits for its repeat runs");
     }
@@ -4592,6 +4692,81 @@ async fn mark_ready(
         }
     }
     error!(pr_number, "Failed to mark PR ready after 2 attempts");
+}
+
+/// The own-review progress the run recorded: findings open at the previous
+/// review (`None` before the first) and rounds without progress so far.
+fn own_review_progress(
+    run_record: &std::collections::HashMap<String, AttributeValue>,
+) -> (Option<usize>, u32) {
+    let n = |k: &str| {
+        run_record
+            .get(k)
+            .and_then(|v| v.as_n().ok())
+            .and_then(|v| v.parse::<u64>().ok())
+    };
+    (
+        n("own_review_open").map(|v| v as usize),
+        n("own_review_stalled").unwrap_or(0) as u32,
+    )
+}
+
+/// Records the own-review progress on the run. Best-effort.
+async fn record_own_review_progress(
+    state: &WorkerState,
+    team_id: &str,
+    run_id: &str,
+    open: usize,
+    stalled: u32,
+) {
+    if let Err(e) = state
+        .dynamo
+        .update_item()
+        .table_name(&state.config.runs_table_name)
+        .key("team_id", attr_s(team_id))
+        .key("run_id", attr_s(run_id))
+        .update_expression("SET own_review_open = :o, own_review_stalled = :s")
+        .expression_attribute_values(":o", attr_n(open as u64))
+        .expression_attribute_values(":s", attr_n(stalled as u64))
+        .send()
+        .await
+    {
+        warn!(run_id, error = %e, "Could not record own review progress (non-fatal)");
+    }
+}
+
+/// The run stops with its own review's findings still open: it says which
+/// and why, waits on a person (`needs_input`, never `completed`), and the PR
+/// stays a draft with them listed at its top.
+#[allow(clippy::too_many_arguments)]
+async fn stop_on_own_findings(
+    state: &WorkerState,
+    msg: &TicketMessage,
+    run_id: &str,
+    reason: &str,
+    pr_url: &str,
+    pr_number: u64,
+    branch: &str,
+    usage: &TokenUsage,
+    duration: u64,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    warn!(
+        run_id,
+        pr_number, "Own review findings still open — the PR stays a draft"
+    );
+    super::add_progress_note(state, &msg.team_id, run_id, reason).await;
+    complete_run_with_status(
+        state,
+        msg,
+        run_id,
+        common::run_status::NEEDS_INPUT,
+        pr_url,
+        pr_number,
+        branch,
+        usage,
+        duration,
+    )
+    .await
 }
 
 #[allow(clippy::too_many_arguments)]
