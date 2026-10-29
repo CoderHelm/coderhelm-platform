@@ -9,11 +9,18 @@
  *   command as anything else.
  * - Downloads are HTTPS only, redirects included (curl --proto =https).
  * - The tag $VERSION, fetched from this repository with git, must be an
- *   annotated tag named exactly $VERSION, signed with an SSH key pinned in
- *   selfhost/maintainers.json (written into the build at synth time, so a
- *   release is checked with the keys of the release already installed, never
- *   with keys it brings itself), on a commit that is on main. That commit is
- *   $COMMIT.
+ *   annotated tag named exactly $VERSION, on a commit that is on main (that
+ *   commit is $COMMIT), and vouched for in one of two ways:
+ *     maintainer  signed with an SSH key pinned in selfhost/maintainers.json
+ *                 (written into the build at synth time, so a release is
+ *                 checked with the keys of the release already installed,
+ *                 never with keys it brings itself);
+ *     automatic   no SSH signature, and a release attestation in the tag
+ *                 message: a keyless signature, made by exactly this
+ *                 repository's auto-release.yml on refs/heads/main run on
+ *                 $COMMIT, over the statement naming this repository,
+ *                 $VERSION and $COMMIT (AUTO_RELEASE_STATEMENT), in Rekor.
+ *   A tag with an SSH signature is only ever checked as a maintainer's.
  * - SHA256SUMS must carry a keyless signature whose certificate names
  *   exactly this repository's release.yml on refs/tags/$VERSION, run on
  *   $COMMIT, issued by GitHub Actions' OIDC issuer; cosign also requires its
@@ -32,6 +39,14 @@ import { repoPath } from "./paths";
 export const RELEASE_REPO = "CoderHelm/coderhelm-platform";
 export const RELEASE_WORKFLOW = `${RELEASE_REPO}/.github/workflows/release.yml`;
 export const SIGNER_ISSUER = "https://token.actions.githubusercontent.com";
+/** The workflow that cuts automatic releases after main's deploy, and the one ref it may sign from. */
+export const AUTO_RELEASE_WORKFLOW = `${RELEASE_REPO}/.github/workflows/auto-release.yml`;
+export const AUTO_RELEASE_REF = "refs/heads/main";
+/** The lines around the base64 Sigstore bundle in an automatic release's tag message. */
+export const ATTESTATION_BEGIN = "-----BEGIN CODERHELM RELEASE ATTESTATION-----";
+export const ATTESTATION_END = "-----END CODERHELM RELEASE ATTESTATION-----";
+/** printf arguments for the statement auto-release.yml signs (installer/lib/source-tag.mjs attestationPayload). */
+export const AUTO_RELEASE_STATEMENT = `'coderhelm-release-tag v1\\nrepository %s\\ntag %s\\ncommit %s\\n' ${RELEASE_REPO} "$VERSION" "$COMMIT"`;
 
 /** The cosign release the builds install, and its linux-amd64 binary's SHA-256 (cosign_checksums.txt of that release). */
 export const COSIGN_VERSION = "v2.4.1";
@@ -81,22 +96,43 @@ const G = `env GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 GIT_TERMINAL_PR
 
 /**
  * Checks the tag $VERSION and sets $COMMIT to the commit it points to:
- * annotated, named $VERSION, SSH-signed by a pinned maintainer key, on main.
- * Each line exits the build with the reason when its check fails.
+ * annotated, named $VERSION, on main, and either SSH-signed by a pinned
+ * maintainer key or attested by auto-release.yml on main for exactly this
+ * tag and commit (cosign must already be installed). Each line exits the
+ * build with the reason when its check fails.
  */
 export function verifyTagCommands(keys: MaintainerKey[] = maintainerKeys()): string[] {
   const lines = keys.map((k) => `'${k.login} namespaces="git" ${k.key}'`).join(" ");
+  const T = `${TAG_DIR}.tag`;
+  const SSH = "-----BEGIN SSH SIGNATURE-----";
+  const maintainer =
+    `[ "$(grep -cxF -e '${SSH}' ${T})" = 1 ] || { echo "$VERSION has more than one SSH signature"; exit 1; }; ` +
+    `${G} -c gpg.format=ssh -c gpg.ssh.allowedSignersFile=${TAG_DIR}.signers -c gpg.ssh.program=ssh-keygen verify-tag "refs/tags/$VERSION" || { echo "$VERSION is not signed by a CoderHelm maintainer key (selfhost/maintainers.json)"; exit 1; }; ` +
+    `echo "$VERSION is signed by a maintainer key"`;
+  const automatic =
+    `[ "$(grep -cxF -e '${ATTESTATION_BEGIN}' ${T})" = 1 ] && [ "$(grep -cxF -e '${ATTESTATION_END}' ${T})" = 1 ] || { echo "$VERSION has no SSH signature and no release attestation"; exit 1; }; ` +
+    `sed -n '/^${ATTESTATION_BEGIN}$/,/^${ATTESTATION_END}$/p' ${T} | sed '1d;$d' | base64 -d > ${TAG_DIR}.bundle || { echo "$VERSION's release attestation is not base64"; exit 1; }; ` +
+    `printf ${AUTO_RELEASE_STATEMENT} > ${TAG_DIR}.statement; ` +
+    "cosign verify-blob --bundle " + TAG_DIR + ".bundle" +
+    ` --certificate-identity "https://github.com/${AUTO_RELEASE_WORKFLOW}@${AUTO_RELEASE_REF}"` +
+    ` --certificate-oidc-issuer ${SIGNER_ISSUER}` +
+    ` --certificate-github-workflow-repository ${RELEASE_REPO}` +
+    ` --certificate-github-workflow-ref ${AUTO_RELEASE_REF}` +
+    ` --certificate-github-workflow-sha "$COMMIT"` +
+    ` ${TAG_DIR}.statement || { echo "$VERSION's release attestation is not from auto-release.yml on main for this tag and commit"; exit 1; }; ` +
+    `echo "$VERSION was released by auto-release.yml on main"`;
   return [
     `rm -rf ${TAG_DIR} && mkdir -p ${TAG_DIR} && printf '%s\\n' ${lines} > ${TAG_DIR}.signers`,
     `${G} init -q --bare`,
     `${G} fetch -q --no-tags --filter=tree:0 https://github.com/${RELEASE_REPO}.git "+refs/tags/$VERSION:refs/tags/$VERSION" "+refs/heads/main:refs/heads/main"`,
-    `[ "$(${G} cat-file -t "refs/tags/$VERSION")" = tag ] || { echo "$VERSION is not an annotated, signed tag"; exit 1; }`,
-    `[ "$(${G} cat-file tag "refs/tags/$VERSION" | sed -n '/^$/q;s/^tag //p')" = "$VERSION" ] || { echo "the tag object under $VERSION is named for another version"; exit 1; }`,
-    `[ "$(${G} cat-file tag "refs/tags/$VERSION" | sed -n '/^$/q;s/^type //p')" = commit ] || { echo "$VERSION does not point to a commit"; exit 1; }`,
-    `[ "$(${G} cat-file tag "refs/tags/$VERSION" | grep -cxF -e '-----BEGIN SSH SIGNATURE-----')" = 1 ] || { echo "$VERSION has no SSH signature"; exit 1; }`,
-    `${G} -c gpg.format=ssh -c gpg.ssh.allowedSignersFile=${TAG_DIR}.signers -c gpg.ssh.program=ssh-keygen verify-tag "refs/tags/$VERSION" || { echo "$VERSION is not signed by a CoderHelm maintainer key (selfhost/maintainers.json)"; exit 1; }`,
+    `[ "$(${G} cat-file -t "refs/tags/$VERSION")" = tag ] || { echo "$VERSION is not an annotated tag"; exit 1; }`,
+    `${G} cat-file tag "refs/tags/$VERSION" > ${T}`,
+    `[ "$(sed -n '/^$/q;s/^tag //p' ${T})" = "$VERSION" ] || { echo "the tag object under $VERSION is named for another version"; exit 1; }`,
+    `[ "$(sed -n '/^$/q;s/^type //p' ${T})" = commit ] || { echo "$VERSION does not point to a commit"; exit 1; }`,
     `COMMIT=$(${G} rev-parse --verify "refs/tags/$VERSION^{commit}")`,
     `[[ "$COMMIT" =~ ^[0-9a-f]{40}$ ]] && ${G} merge-base --is-ancestor "$COMMIT" refs/heads/main || { echo "$VERSION ($COMMIT) is not on main"; exit 1; }`,
+    // A maintainer's SSH signature, when there is one, decides; otherwise the automatic release's attestation must verify.
+    `if grep -qxF -e '${SSH}' ${T}; then ${maintainer}; else ${automatic}; fi`,
   ];
 }
 

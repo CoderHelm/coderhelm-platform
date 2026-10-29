@@ -71,7 +71,7 @@ export function releaseCheckBuildSpec(cfg: ResolvedConfig): codebuild.BuildSpec 
           RELEASE_BASE,
           `${CURL} -o SHA256SUMS "$B/SHA256SUMS"`,
           `${CURL} -o SHA256SUMS.sigstore.json "$B/SHA256SUMS.sigstore.json"`,
-          // The tag: signed by a pinned maintainer key, on main ($COMMIT).
+          // The tag: on main ($COMMIT), signed by a pinned maintainer key or attested by auto-release.yml on main.
           ...verifyTagCommands(),
           VERIFY_SUMS,
           // A signed release from before model manifests lists none.
@@ -115,7 +115,7 @@ export function updateBuildSpec(cfg: ResolvedConfig): codebuild.BuildSpec {
           RELEASE_BASE,
           `${CURL} -o SHA256SUMS "$B/SHA256SUMS"`,
           `${CURL} -o SHA256SUMS.sigstore.json "$B/SHA256SUMS.sigstore.json"`,
-          // The tag: signed by a pinned maintainer key, on main ($COMMIT).
+          // The tag: on main ($COMMIT), signed by a pinned maintainer key or attested by auto-release.yml on main.
           ...verifyTagCommands(),
           // Signed by exactly this repository's release.yml, on this tag and commit, in Rekor.
           VERIFY_SUMS,

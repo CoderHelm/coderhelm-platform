@@ -559,13 +559,17 @@ export class WorkerStack extends cdk.Stack {
       );
       new cdk.CfnOutput(this, "ReviewerEvalsRoleArn", { value: evalRole.roleArn });
 
-      // ── Release publishing (.github/workflows/release.yml, publish job) ──
+      // ── Release publishing (release.yml's publish job, auto-release.yml) ──
       // A tag's Launch Stack and AWS role templates go to the public bucket
       // under launch/<tag>/ (CloudFormation only opens templates stored in
       // S3), and launch/latest.json names the newest stable one. Two roles,
-      // both assumable only by release.yml itself, run on a v* tag, in the
-      // repository's "release" environment (which needs a reviewer's approval
-      // and only admits v* tags: scripts/release-protection.sh):
+      // each assumable by exactly two workflow runs (scripts/release-protection.sh
+      // sets up both environments):
+      //   a maintainer's release: release.yml itself, run on a v* tag, in the
+      //     "release" environment (a reviewer's approval; v* tags only);
+      //   an automatic release: auto-release.yml itself, run on main, in the
+      //     "release-auto" environment (main only), after it checked the
+      //     published release as an install does.
       //   publisher  creates objects under launch/v*/ and never overwrites
       //              one (S3 conditional writes: If-None-Match is required).
       //   latest     writes only launch/latest.json, and only as a
@@ -585,12 +589,28 @@ export class WorkerStack extends cdk.Stack {
               "token.actions.githubusercontent.com:ref": "refs/tags/v*",
             },
           });
+        // auto-release.yml on refs/heads/main: only main's reviewed copy of
+        // that file, in the environment that admits main alone.
+        const autoReleaseTrust = () =>
+          new iam.PolicyStatement({
+            actions: ["sts:AssumeRoleWithWebIdentity"],
+            principals: [new iam.FederatedPrincipal(githubOidc.openIdConnectProviderArn)],
+            conditions: {
+              StringEquals: {
+                "token.actions.githubusercontent.com:aud": "sts.amazonaws.com",
+                "token.actions.githubusercontent.com:sub": `repo:${RELEASE_REPO}:environment:release-auto`,
+                "token.actions.githubusercontent.com:job_workflow_ref": `${RELEASE_REPO}/.github/workflows/auto-release.yml@refs/heads/main`,
+                "token.actions.githubusercontent.com:ref": "refs/heads/main",
+              },
+            },
+          });
         const publisher = new iam.Role(this, "ReleasePublisherRole", {
           roleName: `${prefix}-release-publisher`,
-          description: "release.yml on a v* tag, release environment: creates (never replaces) the release's templates under launch/v*/ in the public bucket",
+          description: "release.yml on a v* tag (release environment) or auto-release.yml on main (release-auto): creates (never replaces) the release's templates under launch/v*/ in the public bucket",
           maxSessionDuration: cdk.Duration.hours(1),
           assumedBy: releaseTrust(),
         });
+        publisher.assumeRolePolicy?.addStatements(autoReleaseTrust());
         publisher.addToPolicy(
           new iam.PolicyStatement({
             actions: ["s3:PutObject"],
@@ -603,10 +623,11 @@ export class WorkerStack extends cdk.Stack {
 
         const latest = new iam.Role(this, "ReleaseLatestRole", {
           roleName: `${prefix}-release-latest`,
-          description: "release.yml on a v* tag, release environment, after it checked the published release: writes launch/latest.json only",
+          description: "release.yml on a v* tag (release environment) or auto-release.yml on main (release-auto), after it checked the published release: writes launch/latest.json only",
           maxSessionDuration: cdk.Duration.hours(1),
           assumedBy: releaseTrust(),
         });
+        latest.assumeRolePolicy?.addStatements(autoReleaseTrust());
         const latestKey = `arn:aws:s3:::${cfg.publicBucketName}/launch/latest.json`;
         // A create (If-None-Match) or a replace of the exact copy read (If-Match: its ETag).
         latest.addToPolicy(new iam.PolicyStatement({ actions: ["s3:PutObject"], resources: [latestKey], conditions: { Null: { "s3:if-none-match": "false" } } }));

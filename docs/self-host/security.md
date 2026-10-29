@@ -41,7 +41,7 @@ order: 11
 
 ## Supply chain
 
-Releases are built by GitHub Actions from a tag on `main` and signed keylessly (Sigstore) with build provenance attestations. The installer, the update build and the Launch Stack check two things. The release's tag must be signed with a CoderHelm maintainer key pinned in the code. The signature must be made by exactly CoderHelm's release workflow, on that tag and from the commit the tag points to. Anything else is refused, including older releases you never ran. [How updates are kept safe](./updates-security.md) has the details and the commands to check a release yourself. You can also deploy from source (`--source`) after reviewing the code.
+Releases are built by GitHub Actions from a tag on `main` and signed keylessly (Sigstore) with build provenance attestations. The installer, the update build and the Launch Stack check two things. The release's tag must be on `main`, and signed with a CoderHelm maintainer key pinned in the code or attested by CoderHelm's automatic release workflow on `main` for that exact tag and commit. The signature must be made by exactly CoderHelm's release workflow, on that tag and from the commit the tag points to. Anything else is refused, including older releases you never ran. [How updates are kept safe](./updates-security.md) has the details and the commands to check a release yourself. You can also deploy from source (`--source`) after reviewing the code.
 
 ## Hybrid threat model
 

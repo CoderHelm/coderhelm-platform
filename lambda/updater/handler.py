@@ -40,8 +40,9 @@ The build itself (CodeBuild, infra/lib/updates-stack.ts) runs
 `coderhelm-selfhost update`: health check, checksum and signature check,
 deploy, health check, and a rollback when the new version is unhealthy.
 The build checks the release itself (infra/lib/release-verify.ts: the tag
-is an annotated tag signed with a maintainer key pinned in the running
-release's selfhost/maintainers.json, on a commit on main; the signature was
+is an annotated tag on a commit on main, signed with a maintainer key
+pinned in the running release's selfhost/maintainers.json or attested by
+auto-release.yml on main for that tag and commit; the signature was
 made by exactly this repository's release.yml on that tag, from that same
 commit), so the release list read here only decides what to offer, never
 what is trusted. The release check build (models_verified) runs the same

@@ -1,0 +1,325 @@
+name: Auto release
+
+# Cuts and publishes a self-host release after main's hosted deploy, with no
+# person in the loop and no stored signing key
+# (docs/self-host/updates-security.md, "Automatic releases").
+#
+#   plan      on refs/heads/main only, for the commit main's deploy shipped:
+#             the version, the notes, or a skip when nothing that ships in a
+#             self-host release changed (.github/scripts/auto_release.py).
+#   tag       in the "release-auto" environment, which admits refs/heads/main
+#             alone. Signs the statement "this repository, tag vX.Y.Z, commit
+#             C" keylessly: the Sigstore certificate names this file on
+#             refs/heads/main, run on C, and the signature is logged in Rekor.
+#             GitHub also attests the same statement (for installs that check
+#             with gh). The signature goes into the annotated tag's message;
+#             installs and updates accept a tag without a maintainer's SSH
+#             signature only with it (installer/lib/source-tag.mjs,
+#             infra/lib/release-verify.ts, selfhost/install.sh, release.yml).
+#             A tag is created, never moved: GitHub refuses a ref that exists.
+#             Then Release (release.yml) is started on the tag.
+#   publish   in "release-auto" too. Waits for that Release run, checks the
+#             published release as an install does, uploads the Launch Stack
+#             and role templates, moves launch/latest.json, checks the install
+#             link opens, and writes the release notes. Its two AWS roles trust
+#             only this file on refs/heads/main in "release-auto"
+#             (infra/lib/worker-stack.ts); like release.yml's publish job, it
+#             runs no code from the repository.
+#
+# Started by deploy.yml's last job, after the CDK deploy succeeded (a
+# workflow_dispatch: the one event a workflow's token can start another
+# workflow with). Starting it by hand does the same and nothing more: main's
+# code, main's ref, and only for a commit main's deploy shipped.
+on:
+  workflow_dispatch:
+    inputs:
+      commit:
+        description: The main commit the hosted deploy shipped (full SHA)
+        required: true
+        type: string
+
+permissions: {}
+
+# One release at a time; a queued run plans again and finds the new tag.
+concurrency:
+  group: auto-release
+  cancel-in-progress: false
+
+jobs:
+  plan:
+    name: Plan the release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read # the deploy's job results
+      pull-requests: read # the notes
+    outputs:
+      skip: ${{ steps.plan.outputs.skip || 'true' }}
+      tag: ${{ steps.plan.outputs.tag }}
+      previous: ${{ steps.plan.outputs.previous }}
+      commit: ${{ steps.guard.outputs.commit }}
+    steps:
+      # The signature names this run's ref and commit, and installs require
+      # refs/heads/main and the tag's commit: the run must be on main, on the
+      # commit that was deployed.
+      - id: guard
+        name: On main, for the commit main's deploy shipped
+        env:
+          COMMIT: ${{ inputs.commit }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          [ "$GITHUB_REF" = refs/heads/main ] || { echo "::error::Run this on main, not $GITHUB_REF"; exit 1; }
+          [[ "$COMMIT" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::commit must be a full commit SHA"; exit 1; }
+          if [ "$GITHUB_SHA" != "$COMMIT" ]; then
+            echo "main is at $GITHUB_SHA, not the deployed $COMMIT: the next deploy releases main. Nothing to do."
+            exit 0
+          fi
+          ok=""
+          for run in $(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/deploy.yml/runs?branch=main&head_sha=$COMMIT&per_page=20" --jq '.workflow_runs[] | select(.event == "schedule" or .event == "workflow_dispatch") | .id'); do
+            if [ "$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$run/jobs" --jq '[.jobs[] | select(.name == "CDK Deploy" and .conclusion == "success")] | length')" -gt 0 ]; then ok=$run; break; fi
+          done
+          [ -n "$ok" ] || { echo "::error::No successful CDK deploy of $COMMIT on main"; exit 1; }
+          echo "Deployed by run $ok"
+          echo "commit=$COMMIT" >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        if: steps.guard.outputs.commit != ''
+        with:
+          ref: ${{ steps.guard.outputs.commit }}
+          fetch-depth: 0
+          persist-credentials: false
+      - id: plan
+        if: steps.guard.outputs.commit != ''
+        name: Version, notes, or skip
+        env:
+          COMMIT: ${{ steps.guard.outputs.commit }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          git fetch --no-tags origin '+refs/tags/v*:refs/tags/v*'
+          python3 .github/scripts/auto_release.py plan --repo "$GITHUB_REPOSITORY" --commit "$COMMIT" \
+            --notes-out "$RUNNER_TEMP/notes.md" --github-output "$GITHUB_OUTPUT"
+          touch "$RUNNER_TEMP/notes.md"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: steps.plan.outputs.skip == 'false'
+        with:
+          name: release-notes
+          path: ${{ runner.temp }}/notes.md
+          if-no-files-found: error
+          retention-days: 3
+
+  tag:
+    name: Attest and tag
+    needs: plan
+    if: needs.plan.outputs.skip == 'false'
+    runs-on: ubuntu-latest
+    environment: release-auto
+    permissions:
+      contents: write # the tag
+      id-token: write # the keyless signature
+      attestations: write # GitHub's attestation of the same statement
+      actions: write # start release.yml on the tag
+    env:
+      TAG: ${{ needs.plan.outputs.tag }}
+      COMMIT: ${{ needs.plan.outputs.commit }}
+    steps:
+      - name: The run, the tag and the commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [ "$GITHUB_REF" != refs/heads/main ] || [ "$GITHUB_SHA" != "$COMMIT" ]; then echo "::error::not main's deployed commit"; exit 1; fi
+          [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "::error::$TAG is not vX.Y.Z"; exit 1; }
+          if gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$TAG" >/dev/null 2>&1; then
+            echo "::error::$TAG exists already; a release tag is never re-cut or moved"; exit 1
+          fi
+          printf 'coderhelm-release-tag v1\nrepository %s\ntag %s\ncommit %s\n' "$GITHUB_REPOSITORY" "$TAG" "$COMMIT" > "$RUNNER_TEMP/$TAG.release-tag"
+          cat "$RUNNER_TEMP/$TAG.release-tag"
+      - uses: sigstore/cosign-installer@7e8b541eb2e61bf99390e1afd4be13a184e9ebc5 # v3.10.1
+        with:
+          cosign-release: v2.4.1
+      - name: Sign the statement
+        run: cosign sign-blob --yes --bundle "$RUNNER_TEMP/tag.sigstore.json" "$RUNNER_TEMP/$TAG.release-tag"
+      - name: Verify the signature as installs will
+        run: |
+          cosign verify-blob --bundle "$RUNNER_TEMP/tag.sigstore.json" \
+            --certificate-identity "https://github.com/$GITHUB_REPOSITORY/.github/workflows/auto-release.yml@refs/heads/main" \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+            --certificate-github-workflow-repository "$GITHUB_REPOSITORY" \
+            --certificate-github-workflow-ref refs/heads/main \
+            --certificate-github-workflow-sha "$COMMIT" \
+            "$RUNNER_TEMP/$TAG.release-tag"
+      - uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
+        with:
+          subject-path: ${{ runner.temp }}/${{ needs.plan.outputs.tag }}.release-tag
+      # The annotated tag carries the signature (base64 of the bundle) in its
+      # message. Creating the ref fails when it exists, so nothing is moved.
+      - name: Create the tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          msg="$RUNNER_TEMP/tag-message"
+          {
+            printf '%s\n\nReleased automatically by .github/workflows/auto-release.yml after the deploy of main at %s.\nHow to check it: docs/self-host/updates-security.md\n\n' "$TAG" "$COMMIT"
+            echo "-----BEGIN CODERHELM RELEASE ATTESTATION-----"
+            base64 -w 76 "$RUNNER_TEMP/tag.sigstore.json"
+            echo "-----END CODERHELM RELEASE ATTESTATION-----"
+          } > "$msg"
+          obj=$(jq -n --rawfile m "$msg" --arg t "$TAG" --arg o "$COMMIT" '{tag: $t, message: $m, object: $o, type: "commit"}' \
+            | gh api "repos/$GITHUB_REPOSITORY/git/tags" --input - --jq .sha)
+          gh api "repos/$GITHUB_REPOSITORY/git/refs" -f ref="refs/tags/$TAG" -f sha="$obj" >/dev/null
+          echo "Created $TAG ($obj) on $COMMIT"
+      # The tag, fetched back from GitHub, checks out as installs check it.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: ${{ needs.plan.outputs.commit }}
+          persist-credentials: false
+      - name: Check the tag as an install will
+        run: |
+          # shellcheck disable=SC2016 # JavaScript, not shell
+          node --input-type=module -e '
+            import { verifySourceTag } from "./installer/lib/source-tag.mjs";
+            import { Runner } from "./installer/lib/runner.mjs";
+            const commit = await verifySourceTag(process.env.TAG, { runner: new Runner({ log: () => {} }), log: console.log });
+            if (commit !== process.env.COMMIT) { console.error(`the tag points to ${commit}, not ${process.env.COMMIT}`); process.exit(1); }
+          '
+      - name: Start the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run release.yml -R "$GITHUB_REPOSITORY" --ref "$TAG"
+
+  publish:
+    name: Publish the Launch Stack and notes
+    needs: [plan, tag]
+    runs-on: ubuntu-latest
+    environment: release-auto
+    timeout-minutes: 150
+    permissions:
+      contents: write # the release notes
+      id-token: write # the AWS roles
+      actions: read # the Release run
+    env:
+      TAG: ${{ needs.plan.outputs.tag }}
+      COMMIT: ${{ needs.plan.outputs.commit }}
+      PUBLIC_BUCKET: coderhelm-public
+    steps:
+      - name: Wait for the Release run on the tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          id=""
+          for _ in $(seq 1 60); do
+            id=$(gh run list -R "$GITHUB_REPOSITORY" --workflow release.yml --event workflow_dispatch --commit "$COMMIT" --limit 1 --json databaseId --jq '.[0].databaseId // empty')
+            [ -n "$id" ] && break
+            sleep 10
+          done
+          [ -n "$id" ] || { echo "::error::no Release run started on $TAG"; exit 1; }
+          echo "Release run: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$id"
+          while :; do
+            read -r status conclusion < <(gh run view "$id" -R "$GITHUB_REPOSITORY" --json status,conclusion --jq '"\(.status) \(.conclusion)"')
+            [ "$status" = completed ] && break
+            sleep 60
+          done
+          [ "$conclusion" = success ] || { echo "::error::the Release run on $TAG ended: $conclusion"; exit 1; }
+
+      - uses: sigstore/cosign-installer@7e8b541eb2e61bf99390e1afd4be13a184e9ebc5 # v3.10.1
+        with:
+          cosign-release: v2.4.1
+      # The published release, downloaded from GitHub, checks out as an
+      # install checks it: release.yml signed it on this tag from this commit,
+      # and every file matches SHA256SUMS. Only then is anything published.
+      - name: Check the published release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          d="$RUNNER_TEMP/published" && mkdir -p "$d"
+          gh release download "$TAG" -R "$GITHUB_REPOSITORY" -D "$d"
+          cosign verify-blob --bundle "$d/SHA256SUMS.sigstore.json" \
+            --certificate-identity "https://github.com/$GITHUB_REPOSITORY/.github/workflows/release.yml@refs/tags/$TAG" \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+            --certificate-github-workflow-repository "$GITHUB_REPOSITORY" \
+            --certificate-github-workflow-ref "refs/tags/$TAG" \
+            --certificate-github-workflow-sha "$COMMIT" \
+            "$d/SHA256SUMS"
+          (cd "$d" && sha256sum -c SHA256SUMS)
+
+      # Same roles and same writes as release.yml's maintainer path: templates
+      # are created once and never replaced, latest.json only moves forward.
+      - uses: aws-actions/configure-aws-credentials@7474bc4690e29a8392af63c5b98e7449536d5c3a # v4.3.1
+        with:
+          role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/coderhelm-prod-release-publisher
+          role-duration-seconds: 900
+          aws-region: us-east-1
+      - name: Upload the templates
+        run: |
+          d="$RUNNER_TEMP/published"
+          for pair in launch-stack.yaml:coderhelm-launch.yaml coderhelm-log-reader.yaml:coderhelm-log-reader.yaml coderhelm-log-reader-update.yaml:coderhelm-log-reader-update.yaml; do
+            src="$d/${pair%%:*}"
+            k="launch/$TAG/${pair#*:}"
+            if curl --proto =https -fsSL -o "$RUNNER_TEMP/existing" "https://$PUBLIC_BUCKET.s3.amazonaws.com/$k"; then
+              cmp -s "$RUNNER_TEMP/existing" "$src" || { echo "::error::$k already holds another template"; exit 1; }
+            else
+              aws s3api put-object --bucket "$PUBLIC_BUCKET" --key "$k" --body "$src" --if-none-match '*' --content-type text/yaml --cache-control "public, max-age=31536000, immutable" >/dev/null
+            fi
+          done
+          curl --proto =https -fsSL "https://$PUBLIC_BUCKET.s3.amazonaws.com/launch/$TAG/coderhelm-launch.yaml" | cmp -s - "$d/launch-stack.yaml" \
+            || { echo "::error::the template in S3 is not the signed launch-stack.yaml"; exit 1; }
+      - uses: aws-actions/configure-aws-credentials@7474bc4690e29a8392af63c5b98e7449536d5c3a # v4.3.1
+        with:
+          role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/coderhelm-prod-release-latest
+          role-duration-seconds: 900
+          aws-region: us-east-1
+      - name: Move latest.json
+        run: |
+          headers="$RUNNER_TEMP/latest.headers"
+          current=$(curl --proto =https -fsSL -D "$headers" "https://$PUBLIC_BUCKET.s3.amazonaws.com/launch/latest.json" 2>/dev/null || echo '{}')
+          etag=$(sed -n 's/^[Ee][Tt][Aa][Gg]: *//p' "$headers" 2>/dev/null | tr -d '\r' | head -n1)
+          # shellcheck disable=SC2016 # JavaScript, not shell
+          CURRENT="$current" SHA=$(sha256sum "$RUNNER_TEMP/published/launch-stack.yaml" | cut -d' ' -f1) node -e '
+            const tag = process.env.TAG;
+            const n = (v) => String(v || "v0.0.0").replace(/^v/, "").split(/[.-]/).slice(0, 3).map(Number);
+            let cur = {};
+            try { cur = JSON.parse(process.env.CURRENT); } catch {}
+            const [a, b] = [n(tag), n(cur.version)];
+            const newer = a[0] !== b[0] ? a[0] > b[0] : a[1] !== b[1] ? a[1] > b[1] : a[2] > b[2];
+            if (!newer && cur.version !== tag) { console.error(`latest.json names ${cur.version}, newer than ${tag}: left as it is`); process.exit(0); }
+            const bucket = process.env.PUBLIC_BUCKET;
+            require("fs").writeFileSync("latest.json", JSON.stringify({
+              version: tag,
+              templateUrl: `https://${bucket}.s3.amazonaws.com/launch/${tag}/coderhelm-launch.yaml`,
+              templateSha256: process.env.SHA,
+              publishedAt: new Date().toISOString(),
+            }));
+          '
+          [ -f latest.json ] || exit 0
+          if [ -n "$etag" ]; then
+            aws s3api put-object --bucket "$PUBLIC_BUCKET" --key launch/latest.json --body latest.json --if-match "$etag" --content-type application/json --cache-control "public, max-age=300" >/dev/null
+          else
+            aws s3api put-object --bucket "$PUBLIC_BUCKET" --key launch/latest.json --body latest.json --if-none-match '*' --content-type application/json --cache-control "public, max-age=300" >/dev/null
+          fi
+      # The install guide's link: latest.json names a template that opens.
+      - name: The install link opens
+        run: |
+          url=$(curl --proto =https -fsSL "https://$PUBLIC_BUCKET.s3.amazonaws.com/launch/latest.json" | jq -r .templateUrl)
+          curl --proto =https -fsSI "$url" >/dev/null || { echo "::error::latest.json names $url, which does not open"; exit 1; }
+          echo "latest.json: $url"
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: release-notes
+          path: ${{ runner.temp }}/notes
+      # The notes go on the GitHub release: self-hosted installs read them
+      # there (Settings, then System) and email their admins about it.
+      - name: Release notes
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          f="$RUNNER_TEMP/release-notes.md"
+          {
+            echo "Self-host release ${TAG}, cut automatically after the deploy of main at ${COMMIT}."
+            echo
+            echo "Install: \`npx -y github:${GITHUB_REPOSITORY}#${TAG} init\`, then deploy. Update: \`npx -y github:${GITHUB_REPOSITORY}#${TAG} update --to ${TAG}\`. Check an install: \`npx -y github:${GITHUB_REPOSITORY} doctor\`. Verify it yourself: docs/self-host/updates-security.md."
+            echo
+            cat "$RUNNER_TEMP/notes/notes.md"
+          } > "$f"
+          gh release edit "$TAG" -R "$GITHUB_REPOSITORY" --notes-file "$f"
+          url=$(gh release view "$TAG" -R "$GITHUB_REPOSITORY" --json url --jq .url)
+          { echo "### Released [$TAG]($url)"; echo; cat "$f"; } >> "$GITHUB_STEP_SUMMARY"
+          echo "Released $TAG: $url"

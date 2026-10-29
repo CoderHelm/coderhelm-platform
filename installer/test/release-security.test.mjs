@@ -447,4 +447,237 @@ test("install.sh pins the same maintainer keys, checks the tag first and gives c
   assert.ok(sh.includes('--certificate-github-workflow-sha "$COMMIT"'));
   assert.ok(sh.includes('--source-digest "$COMMIT"'));
   assert.ok(sh.indexOf("merge-base --is-ancestor") < sh.indexOf("cosign verify-blob"));
+  // An automatic release's tag: exactly auto-release.yml on main, the tag's commit, the same statement.
+  assert.ok(sh.includes('--certificate-identity "https://github.com/$REPO/.github/workflows/auto-release.yml@refs/heads/main"'));
+  assert.ok(sh.includes("--certificate-github-workflow-ref refs/heads/main"));
+  assert.ok(sh.includes('--signer-workflow "$REPO/.github/workflows/auto-release.yml" --source-ref refs/heads/main --source-digest "$COMMIT"'));
+  assert.ok(sh.includes("printf 'coderhelm-release-tag v1\\nrepository %s\\ntag %s\\ncommit %s\\n' \"$REPO\" \"$VERSION\" \"$COMMIT\""));
+  assert.equal(attestationPayload(TAG, COMMIT), `coderhelm-release-tag v1\nrepository CoderHelm/coderhelm-platform\ntag ${TAG}\ncommit ${COMMIT}\n`);
+  assert.ok(sh.includes(`BEGIN='${ATTESTATION_BEGIN}'`) && sh.includes(`END='${ATTESTATION_END}'`));
+  assert.ok(sh.indexOf("merge-base --is-ancestor") < sh.indexOf("auto-release.yml@refs/heads/main"), "on main before the attestation");
+});
+
+// ── automatic releases: the tag attested by auto-release.yml on main ────
+
+import {
+  ATTESTATION_BEGIN, ATTESTATION_END, AUTO_RELEASE_IDENTITY, attestationBundle, attestationPayload,
+} from "../lib/source-tag.mjs";
+
+/** A tag message carrying `bundleText` as auto-release.yml writes it (base64, wrapped). */
+function attestedMessage(name, bundleText) {
+  const b64 = Buffer.from(bundleText).toString("base64").replace(/(.{76})/g, "$1\n").trim();
+  return `${name}\n\nReleased automatically.\n\n${ATTESTATION_BEGIN}\n${b64}\n${ATTESTATION_END}\n`;
+}
+
+/** git's answers for an automatic release's tag (no SSH signature, an attestation from `signer`). */
+function autoTag(signer = "auto", { commit = COMMIT, name = TAG, message, ...over } = {}) {
+  const body = `object ${commit}\ntype commit\ntag ${name}\ntagger github-actions[bot] <a@example.com> 1 +0000\n\n` + (message ?? attestedMessage(name, bundle(signer)));
+  return { ...sourceTag({ commit, name, signature: false }), "cat-file tag": body, ...over };
+}
+
+/** A runner for an automatic release whose cosign records what it was asked to verify. */
+function autoRunner(signer = "auto", { tagCosign = "Verified OK", src = {}, extra = {} } = {}) {
+  const seen = [];
+  const runner = new FakeRunner({
+    ...autoTag(signer, src),
+    "cosign version": "v2.4.1",
+    "cosign verify-blob": (args) => {
+      const file = args[args.length - 1];
+      if (file.endsWith(".release-tag")) {
+        seen.push({ args, payload: fs.readFileSync(file, "utf8") });
+        return tagCosign;
+      }
+      return "Verified OK";
+    },
+    ...extra,
+  });
+  return { runner, seen };
+}
+
+test("the release attestation statement is exactly this repository, the tag and the commit", () => {
+  assert.equal(attestationPayload(TAG, COMMIT), `coderhelm-release-tag v1\nrepository CoderHelm/coderhelm-platform\ntag ${TAG}\ncommit ${COMMIT}\n`);
+  assert.throws(() => attestationPayload("main", COMMIT), /not a CoderHelm release/);
+  assert.throws(() => attestationPayload(TAG, "abc"), /no commit/);
+  assert.equal(AUTO_RELEASE_IDENTITY, "https://github.com/CoderHelm/coderhelm-platform/.github/workflows/auto-release.yml@refs/heads/main");
+  assert.equal(attestationBundle(attestedMessage(TAG, '{"x":1}')), '{"x":1}');
+  assert.equal(attestationBundle(`${TAG}\n`), null);
+  assert.throws(() => attestationBundle(`${ATTESTATION_BEGIN}\nAAAA\n${ATTESTATION_END}\n${ATTESTATION_BEGIN}\nAAAA\n${ATTESTATION_END}\n`), /malformed/);
+  assert.throws(() => attestationBundle(`${ATTESTATION_END}\nAAAA\n${ATTESTATION_BEGIN}\n`), /end before begin/);
+  assert.throws(() => attestationBundle(`${ATTESTATION_BEGIN}\nnot base64!\n${ATTESTATION_END}\n`), /not base64/);
+});
+
+test("an automatic release: auto-release.yml on main, for this tag and commit, passes (cosign)", async () => {
+  const { runner, seen } = autoRunner();
+  assert.deepEqual(await verifySignature(releaseDir(), runner, quiet), { method: "cosign", commit: COMMIT });
+  assert.equal(seen.length, 1, "the tag's attestation is checked once");
+  const a = seen[0].args;
+  assert.equal(a[a.indexOf("--certificate-identity") + 1], AUTO_RELEASE_IDENTITY);
+  assert.equal(a[a.indexOf("--certificate-github-workflow-ref") + 1], "refs/heads/main");
+  assert.equal(a[a.indexOf("--certificate-github-workflow-sha") + 1], COMMIT);
+  assert.equal(a[a.indexOf("--certificate-oidc-issuer") + 1], "https://token.actions.githubusercontent.com");
+  assert.ok(!a.some((x) => /regexp|insecure|ignore-tlog|offline/.test(x)));
+  assert.equal(seen[0].payload, attestationPayload(TAG, COMMIT));
+  // No maintainer signature is asked for, and the release's own signature is still checked after the tag.
+  const lines = runner.lines();
+  assert.ok(!lines.some((l) => l.includes(" verify-tag ")));
+  const sums = lines.findIndex((l) => l.includes("verify-blob") && l.includes("SHA256SUMS"));
+  const tagAt = lines.findIndex((l) => l.includes("verify-blob") && l.includes(".release-tag"));
+  assert.ok(tagAt >= 0 && sums > tagAt, "tag first, then SHA256SUMS");
+  const s = runner.commands[sums].args;
+  assert.equal(s[s.indexOf("--certificate-identity") + 1], IDENTITY, "SHA256SUMS still needs release.yml on the tag");
+});
+
+for (const [signer, why] of [
+  ["autoOtherWorkflow", /deploy\.yml/],
+  ["autoOtherRef", /refs\/heads\/feature/],
+  ["autoTagRef", /refs\/tags\/v1\.2\.3/],
+  ["autoOtherCommit", /built from commit 2{40}, not 1{40}/],
+  ["autoOtherRepo", /evil\/coderhelm-platform/],
+  // release.yml's own certificate is not a tag attestation.
+  ["good", /release\.yml@refs\/tags\/v1\.2\.3, not .*auto-release\.yml@refs\/heads\/main/],
+]) {
+  test(`an automatic release's tag attested by the wrong signer is refused (${signer})`, async () => {
+    const { runner, seen } = autoRunner(signer);
+    await assert.rejects(() => verifySignature(releaseDir(), runner, quiet), (e) => /release attestation is not from .*auto-release\.yml on main/.test(e.message) && why.test(e.message));
+    assert.equal(seen.length, 0, "cosign is never asked");
+  });
+}
+
+test("an automatic release's tag: on main, a matching statement, one well-formed block", async () => {
+  // Not on main: refused before any signature is read.
+  let r = autoRunner("auto", { src: { "merge-base --is-ancestor": { code: 1 } } });
+  await assert.rejects(() => verifySignature(releaseDir(), r.runner, quiet), /is not on main/);
+  assert.equal(r.seen.length, 0);
+  // The attestation was made for another tag or commit: the statement differs, cosign says no.
+  r = autoRunner("auto", { tagCosign: { code: 1, stderr: "error: invalid signature when validating ASN.1 encoded signature" } });
+  await assert.rejects(() => verifySignature(releaseDir(), r.runner, quiet), /release attestation does not verify for this tag and commit/);
+  // The tag object is named for another version.
+  r = autoRunner("auto", { src: { name: "v1.0.0" } });
+  await assert.rejects(() => verifySignature(releaseDir(), r.runner, quiet), /named "v1\.0\.0"/);
+  // No signature and no attestation; two attestation blocks.
+  r = autoRunner("auto", { src: { message: `${TAG}\n` } });
+  await assert.rejects(() => verifySignature(releaseDir(), r.runner, quiet), /no SSH signature and no release attestation/);
+  const twice = attestedMessage(TAG, bundle("auto")) + attestedMessage(TAG, bundle("auto"));
+  r = autoRunner("auto", { src: { message: twice } });
+  await assert.rejects(() => verifySignature(releaseDir(), r.runner, quiet), /attestation block is malformed/);
+  // A bundle with no Rekor entry.
+  r = autoRunner("auto", { src: { message: attestedMessage(TAG, bundle("auto", { rekor: false })) } });
+  await assert.rejects(() => verifySignature(releaseDir(), r.runner, quiet), /no transparency log/);
+});
+
+test("an automatic release with an SSH signature that doesn't verify is refused (the signature decides)", async () => {
+  const body = `object ${COMMIT}\ntype commit\ntag ${TAG}\ntagger M <m@example.com> 1 +0000\n\n${attestedMessage(TAG, bundle("auto"))}-----BEGIN SSH SIGNATURE-----\nU1NIU0lH\n-----END SSH SIGNATURE-----\n`;
+  const { runner, seen } = autoRunner("auto", { src: { "cat-file tag": body, "verify-tag": { code: 1, stderr: "Could not verify signature." } } });
+  await assert.rejects(() => verifySignature(releaseDir(), runner, quiet), /not signed by a CoderHelm maintainer key/);
+  assert.equal(seen.length, 0);
+});
+
+test("an automatic release with only gh: GitHub's attestation of the statement, from auto-release.yml on main", async () => {
+  const asked = [];
+  const ok = new FakeRunner({
+    ...autoTag(),
+    "cosign version": { code: 127 },
+    "gh --version": "gh 2",
+    "gh attestation verify": (args) => {
+      if (args[2].endsWith(".release-tag")) asked.push({ args, payload: fs.readFileSync(args[2], "utf8") });
+      return "ok";
+    },
+  });
+  assert.equal((await verifySignature(releaseDir(), ok, quiet)).method, "attestation");
+  assert.equal(asked.length, 1);
+  const a = asked[0].args;
+  assert.equal(a[a.indexOf("--signer-workflow") + 1], "CoderHelm/coderhelm-platform/.github/workflows/auto-release.yml");
+  assert.equal(a[a.indexOf("--source-ref") + 1], "refs/heads/main");
+  assert.equal(a[a.indexOf("--source-digest") + 1], COMMIT);
+  assert.ok(a.includes("--deny-self-hosted-runners"));
+  assert.equal(asked[0].payload, attestationPayload(TAG, COMMIT));
+  const bad = new FakeRunner({
+    ...autoTag(),
+    "cosign version": { code: 127 },
+    "gh --version": "gh 2",
+    "gh attestation verify": (args) => (args[2].endsWith(".release-tag") ? { code: 1 } : "ok"),
+  });
+  await assert.rejects(() => verifySignature(releaseDir(), bad, quiet), /no valid GitHub attestation from .*auto-release\.yml on main/);
+});
+
+// Real git: automatic release tags (annotated, unsigned, with the attestation
+// block) on main and on a branch. The certificate is made here for the real
+// commit (openssl, like fixtures/make-signers.sh); cosign is stood in for by a
+// script that accepts only auto-release.yml on main and the tag's commit, and
+// only the statement the bundle was made for (as a signature binds it).
+function autoCert(commit) {
+  const dir = tmpdir();
+  const R = "https://github.com/CoderHelm/coderhelm-platform";
+  const hex = Buffer.from(commit).toString("hex");
+  execFileSync("openssl", ["req", "-x509", "-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:P-256", "-nodes", "-keyout", path.join(dir, "k"), "-subj", "/O=sigstore.dev", "-days", "1",
+    "-addext", `subjectAltName=URI:${AUTO_RELEASE_IDENTITY}`,
+    "-addext", "1.3.6.1.4.1.57264.1.8=ASN1:UTF8String:https://token.actions.githubusercontent.com",
+    "-addext", `1.3.6.1.4.1.57264.1.9=ASN1:UTF8String:${AUTO_RELEASE_IDENTITY}`,
+    "-addext", `1.3.6.1.4.1.57264.1.12=ASN1:UTF8String:${R}`,
+    "-addext", "1.3.6.1.4.1.57264.1.14=ASN1:UTF8String:refs/heads/main",
+    "-addext", `1.3.6.1.4.1.57264.1.3=DER:${hex}`,
+    "-addext", `1.3.6.1.4.1.57264.1.10=ASN1:UTF8String:${commit}`,
+    "-addext", `1.3.6.1.4.1.57264.1.13=ASN1:UTF8String:${commit}`,
+    "-out", path.join(dir, "c.pem")], { stdio: "ignore" });
+  return fs.readFileSync(path.join(dir, "c.pem"), "utf8");
+}
+
+test("source tag, with real git: an attested automatic tag on main passes; another tag's attestation or a branch doesn't", async () => {
+  const root = tmpdir();
+  const env = { ...process.env, GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_NOSYSTEM: "1", GIT_AUTHOR_NAME: "M", GIT_AUTHOR_EMAIL: "m@example.com", GIT_COMMITTER_NAME: "M", GIT_COMMITTER_EMAIL: "m@example.com" };
+  const sh = (cmd, args, cwd = root) => execFileSync(cmd, args, { cwd, env, encoding: "utf8" }).trim();
+  sh("ssh-keygen", ["-q", "-t", "ed25519", "-N", "", "-C", "", "-f", path.join(root, "maintainer")]);
+  const keysFile = path.join(root, "maintainers.json");
+  fs.writeFileSync(keysFile, JSON.stringify({ keys: [{ login: "maintainer", key: fs.readFileSync(path.join(root, "maintainer.pub"), "utf8").trim().split(" ").slice(0, 2).join(" ") }] }));
+  const repo = path.join(root, "repo");
+  fs.mkdirSync(repo);
+  const git = (...a) => sh("git", a, repo);
+  git("init", "-q", "-b", "main");
+  git("commit", "-q", "--allow-empty", "-m", "on main");
+  const onMain = git("rev-parse", "HEAD");
+  // The bundle auto-release.yml would make for `statementTag` on `commit`.
+  const autoBundle = (statementTag, commit) => JSON.stringify({
+    base64Signature: "c2ln",
+    cert: Buffer.from(autoCert(commit)).toString("base64"),
+    rekorBundle: { SignedEntryTimestamp: "c2V0", Payload: { logIndex: 1, integratedTime: 1 } },
+    testStatement: attestationPayload(statementTag, commit),
+  });
+  const tagWith = (name, bundleText) => {
+    const f = path.join(root, `${name}.msg`);
+    fs.writeFileSync(f, attestedMessage(name, bundleText));
+    git("tag", "-a", name, "-F", f);
+  };
+  tagWith("v2.0.0", autoBundle("v2.0.0", onMain));
+  // v2.0.0's attestation copied onto another tag of the same commit.
+  tagWith("v2.0.2", autoBundle("v2.0.0", onMain));
+  git("checkout", "-q", "-b", "feature");
+  git("commit", "-q", "--allow-empty", "-m", "not on main");
+  const offMain = git("rev-parse", "HEAD");
+  tagWith("v2.0.1", autoBundle("v2.0.1", offMain));
+  git("checkout", "-q", "main");
+
+  const bin = path.join(root, "bin");
+  fs.mkdirSync(bin);
+  fs.writeFileSync(path.join(bin, "cosign"), `#!/usr/bin/env node
+const a = process.argv.slice(2);
+if (a[0] === "version") process.exit(0);
+const v = (f) => a[a.indexOf(f) + 1];
+const fs = require("fs");
+const signed = JSON.parse(fs.readFileSync(v("--bundle"), "utf8")).testStatement;
+const payload = fs.readFileSync(a[a.length - 1], "utf8");
+const ok = v("--certificate-identity") === ${JSON.stringify(AUTO_RELEASE_IDENTITY)} && v("--certificate-github-workflow-ref") === "refs/heads/main"
+  && signed.endsWith("commit " + v("--certificate-github-workflow-sha") + "\\n") && payload === signed;
+process.exit(ok ? 0 : 1);
+`, { mode: 0o755 });
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${bin}${path.delimiter}${oldPath}`;
+  try {
+    const runner = new Runner({ log: () => {} });
+    const check = (tag) => verifySourceTag(tag, { runner, remote: repo, keysFile });
+    assert.equal(await check("v2.0.0"), onMain);
+    await assert.rejects(() => check("v2.0.2"), /release attestation does not verify for this tag and commit/);
+    await assert.rejects(() => check("v2.0.1"), /is not on main/);
+  } finally {
+    process.env.PATH = oldPath;
+  }
 });

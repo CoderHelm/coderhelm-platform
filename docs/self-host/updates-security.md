@@ -6,7 +6,7 @@ order: 9.5
 
 Nothing gets onto your install just because it looks like a CoderHelm release. Before an install or update uses anything from a release, it checks two things:
 
-1. **A maintainer signed the release's tag.** The tag's commit is on `main`.
+1. **The release's tag is on `main` and vouched for.** Either a maintainer signed it, or CoderHelm's automatic release workflow on `main` attested it for exactly that tag and commit.
 2. **CoderHelm's release workflow built and signed the release from that same commit.**
 
 If any check fails, nothing is installed.
@@ -20,8 +20,12 @@ The installer, the update build (`coderhelm-<stage>-update`), the release check 
 1. **The tag.** `vX.Y.Z` is fetched from `https://github.com/CoderHelm/coderhelm-platform.git` with git. Several things must hold:
    - It is an annotated tag. A lightweight tag is refused.
    - The tag object's own name is exactly `vX.Y.Z`. An old signed tag can't be moved under a new name.
-   - It is signed with one of the SSH keys in [`selfhost/maintainers.json`](#rotating-a-maintainer-key).
    - It points to a commit that is on `main`.
+   - It is vouched for in one of two ways:
+     - **A release cut by hand:** it is signed with one of the SSH keys in [`selfhost/maintainers.json`](#rotating-a-maintainer-key).
+     - **An automatic release:** it has no SSH signature, and its message carries a *release attestation*. That is a keyless Sigstore signature of the four lines `coderhelm-release-tag v1`, `repository CoderHelm/coderhelm-platform`, `tag vX.Y.Z` and `commit <the tag's commit>`. Its certificate must name exactly `https://github.com/CoderHelm/coderhelm-platform/.github/workflows/auto-release.yml@refs/heads/main`, be issued by `https://token.actions.githubusercontent.com`, name the tag's commit as the one the workflow ran on, and be in the Rekor transparency log. With only the GitHub CLI, `gh attestation verify` checks GitHub's attestation of the same four lines, from the same workflow, ref and commit.
+
+     A tag with an SSH signature is only ever checked as a maintainer's. An attestation from another workflow, a branch other than `main`, a tag ref, another commit or another tag is refused.
 
    Git runs without your own git configuration. A local key list, GPG keyring or signing program can't make a signature pass.
 2. **The signature.** `SHA256SUMS` has a keyless Sigstore signature, `SHA256SUMS.sigstore.json`. Its certificate must name exactly
@@ -31,7 +35,7 @@ The installer, the update build (`coderhelm-<stage>-update`), the release check 
    - name the tag's commit as the commit the workflow ran on (Fulcio's source repository digest, build signer digest and workflow SHA);
    - be in the Rekor transparency log.
 
-   So the workflow that signed is the `release.yml` of the commit a maintainer signed. Several kinds of signature are refused:
+   So the workflow that signed is the `release.yml` of the tag's commit on `main`. Several kinds of signature are refused:
    - one from another repository, another workflow, a branch or another tag;
    - one made from another commit, such as a `release.yml` changed and pushed under a new tag;
    - a bundle with no Rekor entry;
@@ -43,36 +47,72 @@ The installer, the update build (`coderhelm-<stage>-update`), the release check 
 
 **Whose keys.** An update build checks a new release against the maintainer keys of the release your install already runs. They are written into the build when that release was deployed. A release can't bring its own keys to vouch for itself. The installer checks with the keys in its own package, and the Launch Stack template with the keys written into it.
 
-The installer verifies the signature with `cosign` when it is installed, or else with the GitHub CLI. With the GitHub CLI it runs `gh attestation verify`, checking the same repository, workflow, tag and commit. It also needs `git` 2.34 or newer and `ssh-keygen` for the tag. If a tool is missing, it stops and asks you to install it. No flag skips any check. To run code that isn't a signed release, deploy from a checkout you reviewed (`--source`).
+The installer verifies the signature with `cosign` when it is installed, or else with the GitHub CLI. With the GitHub CLI it runs `gh attestation verify`, checking the same repository, workflow, tag and commit. It also needs `git` 2.34 or newer and `ssh-keygen` for the tag. An automatic release's tag is checked with the same `cosign` or GitHub CLI. If a tool is missing, it stops and asks you to install it. No flag skips any check. To run code that isn't a signed release, deploy from a checkout you reviewed (`--source`).
 
 ## Who can publish a release
 
-A release is a `vX.Y.Z` tag on `CoderHelm/coderhelm-platform`, built by `.github/workflows/release.yml`. The protections come from three places.
+A release is a `vX.Y.Z` tag on `CoderHelm/coderhelm-platform`, built by `.github/workflows/release.yml`. A tag comes one of two ways.
+
+**Automatic (the usual way).** When the hosted deploy of `main` succeeds, `deploy.yml` starts `.github/workflows/auto-release.yml` on `main`. It:
+
+1. checks it runs on `refs/heads/main`, on the commit that was just deployed, and that the deploy of that commit succeeded;
+2. plans the release (`.github/scripts/auto_release.py`). It skips when nothing that ships in a self-host release changed since the last release (`services/`, `lambda/`, `infra/`, `installer/`, `selfhost/`, the dashboard pin check and `release.yml`). The version is the last release plus a patch, or plus a minor when a merged pull request is labelled `enhancement` or `feature` or titled `feat:`. It is never below the version in `installer/package.json`, which is how a reviewed pull request asks for a minor or major release. The notes list the merged pull requests;
+3. signs the four lines above with Sigstore keyless signing. No key is stored anywhere: GitHub's OIDC token names the workflow file, the ref and the commit, and the certificate carries exactly those. GitHub also records an attestation of the same lines;
+4. creates the annotated tag with that signature in its message. GitHub refuses to create a tag that exists, so a tag is never re-cut or moved;
+5. starts `release.yml` on the tag. That builds and signs the release exactly as for a tag cut by hand, with no approval step;
+6. downloads the published release and checks it as an install does. Only then does it upload the Launch Stack templates and move `launch/latest.json`. It then writes the release notes on the GitHub release, where installs read them.
+
+**By hand.** A maintainer signs a tag with their SSH key and pushes it. `release.yml` runs, and a maintainer approves the `release` environment before it publishes.
+
+### What an attacker would need
+
+For installs and updates to run their code:
+
+- **Automatic path:** their code on `main`. `main` takes changes only through a pull request with an approving review and passing checks, and signed commits. A reviewer must approve the malicious change. The attestation names the commit that `auto-release.yml` ran on, and that commit's `auto-release.yml` and `release.yml` are the ones that signed. So a changed copy of either file on a branch, a fork, a tag or another workflow gets a certificate that installs refuse. Taking over GitHub Actions' OIDC issuer or Sigstore's certificate authority (Fulcio) would also do it. Rekor would then show the forged certificate publicly.
+- **Path by hand:** a maintainer's SSH signing key, and their code on `main`.
+
+For the install guide to link to their template (`launch/latest.json`, the templates under `launch/<version>/`):
+
+- **Automatic path:** a run of `auto-release.yml` from `main` in the `release-auto` environment. The AWS roles that write those objects trust only that file, on `refs/heads/main`, in that environment, and the environment admits only `main`. So again: a reviewed, merged pull request.
+- **Path by hand:** a maintainer's approval of the `release` environment.
+
+Someone with write access to the repository, but no review, could at most create a `v*` tag from a workflow on a branch, and run `release.yml` on it. That makes a GitHub release with a signature naming that tag. No install accepts it: the tag isn't on `main`, or has neither a maintainer signature nor an attestation from `auto-release.yml` on `main`. It gets no approval-free access to the AWS roles. `auto-release.yml` ignores tags that are not on `main`. Anyone with write access can already create a GitHub release by hand, so this adds nothing.
+
+The protections come from three places.
 
 ### In every install's code (always on)
 
-The checks above. Someone who could push a tag and change `release.yml` still can't make a release that installs and updates accept without a maintainer's signing key. The signature would name a commit that no maintainer signed a tag for.
+The checks above. Someone who could push a tag and change `release.yml` still can't make a release that installs and updates accept. They would need a maintainer's signing key, or a tag attested by `auto-release.yml` running on `main`. Either way the signature names a commit on `main` whose workflows signed.
 
 ### In AWS (the hosted account's IAM)
 
-The release workflow uploads the Launch Stack and AWS role templates to the public bucket `coderhelm-public`. It uses two roles (`infra/lib/worker-stack.ts`). Each trusts only a GitHub token whose claims match all of these:
+The release workflows upload the Launch Stack and AWS role templates to the public bucket `coderhelm-public`. They use two roles (`infra/lib/worker-stack.ts`). Each trusts a GitHub token only when its claims match one of these two sets.
+
+A release cut by hand (`release.yml`):
 
 - `sub` is `repo:CoderHelm/coderhelm-platform:environment:release`;
 - `job_workflow_ref` matches `CoderHelm/coderhelm-platform/.github/workflows/release.yml@refs/tags/v*`;
 - `ref` matches `refs/tags/v*`. AWS has no `ref_type` key for GitHub tokens, and only a tag's ref matches this.
 
-Another workflow that names the `release` environment gets neither role. What each role may do:
+An automatic release (`auto-release.yml`):
+
+- `sub` is `repo:CoderHelm/coderhelm-platform:environment:release-auto`;
+- `job_workflow_ref` is exactly `CoderHelm/coderhelm-platform/.github/workflows/auto-release.yml@refs/heads/main`;
+- `ref` is exactly `refs/heads/main`.
+
+Another workflow that names either environment gets neither role. What each role may do:
 
 - **`release-publisher`** may only create objects under `launch/v*/`. Its policy requires the `If-None-Match` header (S3 conditional writes), so it can't overwrite a template already there.
-- **`release-latest`** may only write `launch/latest.json`, and only as a conditional write: a create, or a replace of the exact copy it read. The workflow uses it only after it has downloaded the published release and checked it as an install would.
+- **`release-latest`** may only write `launch/latest.json`, and only as a conditional write: a create, or a replace of the exact copy it read. Both workflows use it only after they have downloaded the published release and checked it as an install would.
 
 ### In GitHub's settings (applied with `scripts/release-protection.sh`)
 
 These settings make a bad tag hard to create in the first place. They are not stored in the code. An organization owner applies them by running `scripts/release-protection.sh`. Until then they are not in force. `bash scripts/release-protection.sh --check` prints what is applied and what isn't (read only).
 
 - **`main`, on both `CoderHelm/coderhelm-platform` and `CoderHelm/coderhelm`.** Changes go in only through a pull request with an approving review and passing checks. Commits must be signed, and force pushes and deletion are blocked. Admins may merge their own pull request after the checks pass, but never push to `main` directly. `--no-admin-merge-bypass` removes that too.
-- **`v*` tags.** Tags must be signed, and nobody can update, move or delete one. There is no admin bypass unless you pass `--allow-admin-tag-bypass`. Only admins can create a `v*` tag.
-- **The `release` environment.** A listed reviewer approves every publish. Only `v*` tags may deploy to it, and admins can't skip the approval. So a pushed tag alone publishes nothing.
+- **`v*` tags.** Their commits must be signed, and nobody can update, move or delete a tag. There is no admin bypass unless you pass `--allow-admin-tag-bypass`. Only admins and GitHub Actions can create a `v*` tag. GitHub Actions is there for `auto-release.yml`. GitHub can't narrow that to one workflow, so the checks above, not this rule, are what stop a tag created by another workflow.
+- **The `release` environment.** A listed reviewer approves every publish of a tag cut by hand. Only `v*` tags may deploy to it, and admins can't skip the approval. So a pushed tag alone publishes nothing.
+- **The `release-auto` environment.** No reviewer, and only the `main` branch may deploy to it. `auto-release.yml` publishes the templates and `latest.json` from it.
 - **Immutable releases.** A published release's files can't be replaced.
 - **Actions.** Actions must be pinned by commit SHA, the default token is read-only, and workflows from outside contributors wait for approval.
 
@@ -80,8 +120,8 @@ These settings make a bad tag hard to create in the first place. They are not st
 
 These run inside `release.yml`. They catch mistakes early, but by themselves they would not stop a changed copy of the file. The install checks do that.
 
-- The tag must be signed with a key in `main`'s `selfhost/maintainers.json`, be on `main`, and be the commit the run is on.
-- The build job runs with a read-only token, no secrets and no cloud credentials. Only the publish job, in the `release` environment, can write the release or assume the AWS roles.
+- The tag must be on `main`, be the commit the run is on, and be signed with a key in `main`'s `selfhost/maintainers.json` or attested by `auto-release.yml` on `main` for that tag and commit.
+- The build job runs with a read-only token, no secrets and no cloud credentials. Only the publish job can write the release. For a tag cut by hand it runs in the `release` environment and assumes the AWS roles. For an automatic tag it does neither, and `auto-release.yml` publishes the templates from `main`.
 - A release that already exists is never given other files, and a template already in S3 is never overwritten.
 - Every GitHub Action is pinned by commit SHA, and CI fails on any action that isn't. No workflow runs on `pull_request_target`.
 
@@ -112,7 +152,7 @@ https://coderhelm-public.s3.amazonaws.com/launch/<version>/coderhelm-launch.yaml
 It is the same file, byte for byte, as `launch-stack.yaml` in that release's signed `SHA256SUMS`. `launch/latest.json` names the newest one and its SHA-256, and it only ever moves forward. The template's installer runs nothing from the release until it has:
 
 1. installed a cosign pinned by its SHA-256;
-2. checked the tag with the maintainer keys written into the template;
+2. checked the tag: on `main`, and signed with the maintainer keys written into the template or attested by `auto-release.yml` on `main`;
 3. checked `SHA256SUMS` against its signature, with the exact identity and the tag's commit;
 4. checked `coderhelm-selfhost.tgz` and `launch-bootstrap.mjs` against `SHA256SUMS`.
 
@@ -126,13 +166,29 @@ Use git 2.34 or newer, and [cosign](https://docs.sigstore.dev/cosign/system_conf
 V=v0.7.0
 R=CoderHelm/coderhelm-platform
 
-# 1. The tag is signed by a maintainer key (selfhost/maintainers.json) and is on main.
+# 1. The tag is on main, and signed by a maintainer key (selfhost/maintainers.json)
+#    or attested by auto-release.yml on main.
 git clone --quiet --filter=tree:0 --no-checkout "https://github.com/$R.git" ch && cd ch
-git show origin/main:selfhost/maintainers.json \
-  | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{for(const k of JSON.parse(s).keys)console.log(`${k.login} namespaces="git" ${k.key}`)})' > ../allowed_signers
-git -c gpg.ssh.allowedSignersFile=../allowed_signers verify-tag "$V"
 COMMIT=$(git rev-parse "$V^{commit}")
 git merge-base --is-ancestor "$COMMIT" origin/main && echo "on main: $COMMIT"
+if git cat-file tag "$V" | grep -qxF -e '-----BEGIN SSH SIGNATURE-----'; then
+  # Cut by hand.
+  git show origin/main:selfhost/maintainers.json \
+    | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{for(const k of JSON.parse(s).keys)console.log(`${k.login} namespaces="git" ${k.key}`)})' > ../allowed_signers
+  git -c gpg.ssh.allowedSignersFile=../allowed_signers verify-tag "$V"
+else
+  # Automatic: the release attestation in the tag message.
+  git cat-file tag "$V" | sed -n '/^-----BEGIN CODERHELM RELEASE ATTESTATION-----$/,/^-----END CODERHELM RELEASE ATTESTATION-----$/p' \
+    | sed '1d;$d' | base64 -d > ../tag.sigstore.json
+  printf 'coderhelm-release-tag v1\nrepository %s\ntag %s\ncommit %s\n' "$R" "$V" "$COMMIT" > ../statement
+  cosign verify-blob --bundle ../tag.sigstore.json \
+    --certificate-identity "https://github.com/$R/.github/workflows/auto-release.yml@refs/heads/main" \
+    --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+    --certificate-github-workflow-repository "$R" \
+    --certificate-github-workflow-ref refs/heads/main \
+    --certificate-github-workflow-sha "$COMMIT" \
+    ../statement
+fi
 cd ..
 
 for f in SHA256SUMS SHA256SUMS.sigstore.json coderhelm-selfhost.tgz launch-stack.yaml; do
@@ -175,7 +231,7 @@ To check `install.sh` before running it, download it with the files above and ad
 Nothing is installed or changed:
 
 - **Update build:** the history in **Settings, then System** shows the update as failed, with the step that stopped it. Admins get an email. Automatic updates skip that release until an admin tries it again by hand.
-- **Terminal:** the installer names the check that failed and exits without deploying. For example: *"The release's tag doesn't check out: v0.8.0 is not signed by a CoderHelm maintainer key"*, or *"The release's signature is not CoderHelm's release workflow for v0.8.0"*.
+- **Terminal:** the installer names the check that failed and exits without deploying. For example: *"The release's tag doesn't check out: v0.8.0 is not signed by a CoderHelm maintainer key"*, *"v0.8.0's release attestation is not from CoderHelm/coderhelm-platform/.github/workflows/auto-release.yml on main"*, or *"The release's signature is not CoderHelm's release workflow for v0.8.0"*.
 - **Launch Stack:** the install guide shows *"The release files did not match their signed checksums, so nothing was installed."* The stack ends in a failed state, and you can delete it.
 
 A failure on a release that should be good means something between you and GitHub changed the files. Please report it privately (see [Security model](./security.md#reporting-a-problem)).
