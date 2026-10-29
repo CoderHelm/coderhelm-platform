@@ -98,15 +98,43 @@ fn parts_match(pat: &[&str], path: &[&str]) -> bool {
     }
 }
 
-fn clean(p: &str) -> &str {
-    p.trim().trim_start_matches("./").trim_start_matches('/')
+/// A path (or glob) from the repository root in one spelling: `.` and
+/// empty segments dropped and `..` resolved, so a generator run from
+/// `apps/studio` writing `../web/src/lib/sanity/sanity.types.ts` names
+/// `apps/web/src/lib/sanity/sanity.types.ts`, the path the diff, the plan
+/// and the scope use. A trailing `/` (a directory) is kept.
+pub fn normalize_path(p: &str) -> String {
+    let p = p.trim();
+    let mut out: Vec<&str> = Vec::new();
+    for seg in p.split('/') {
+        match seg {
+            "" | "." => {}
+            ".." => {
+                if out.last().is_some_and(|l| *l != "..") {
+                    out.pop();
+                } else {
+                    out.push("..");
+                }
+            }
+            s => out.push(s),
+        }
+    }
+    let mut joined = out.join("/");
+    if p.ends_with('/') && !joined.is_empty() {
+        joined.push('/');
+    }
+    joined
+}
+
+fn clean(p: &str) -> String {
+    normalize_path(p)
 }
 
 /// Whether `path` matches the glob (`**`, `*`, `?`, `{a,b}`). A pattern that
 /// names a directory (ends in `/`) matches everything under it.
 pub fn glob_match(pattern: &str, path: &str) -> bool {
     let path = clean(path);
-    expand_braces(clean(pattern)).iter().any(|p| {
+    expand_braces(&clean(pattern)).iter().any(|p| {
         let p = if p.ends_with('/') {
             format!("{p}**")
         } else {
@@ -125,11 +153,12 @@ fn any_match(globs: &[String], path: &str) -> bool {
 /// A glob relative to `dir` (a nested package's directory), as a path from
 /// the repository root.
 fn under(dir: &str, glob: &str) -> String {
-    let g = clean(glob);
     if dir.is_empty() {
-        g.to_string()
+        clean(glob)
     } else {
-        format!("{dir}/{g}")
+        // Joined before normalizing: `../web/x.ts` from `apps/studio` is
+        // `apps/web/x.ts`.
+        clean(&format!("{dir}/{}", glob.trim()))
     }
 }
 
@@ -492,7 +521,7 @@ fn documented(doc: &str) -> Vec<Generator> {
         let inputs: Vec<String> = ticks
             .iter()
             .filter(|t| **t != command && !t.contains(' ') && (t.contains('/') || t.contains('*')))
-            .map(|t| clean(t).to_string())
+            .map(|t| clean(t))
             .collect();
         if !inputs.is_empty() {
             out.push(Generator {
@@ -1273,8 +1302,14 @@ async fn run_in_sandbox(
         }
         Ok(o) if o.ran && o.passed => {
             EgressBlocks::clear(w.run_id);
+            // A changed file the sandbox couldn't hand back is a tooling
+            // failure, named: never "regenerated" with a file missing.
+            let dropped = (!o.dropped.is_empty()).then(|| dropped_reason(&o.dropped));
             if o.changed.is_empty() {
-                return Ran::Regenerated(Vec::new());
+                return match dropped {
+                    Some(why) => Ran::Blocked(ToolingFailure::new(cmd, &why)),
+                    None => Ran::Regenerated(Vec::new()),
+                };
             }
             let paths: Vec<String> = o.changed.iter().map(|(p, _)| p.clone()).collect();
             let ops: Vec<FileOp> = o
@@ -1293,7 +1328,10 @@ async fn run_in_sandbox(
                 .batch_write(owner, name, w.branch, &message, &ops)
                 .await
             {
-                Ok(_) => Ran::Regenerated(paths),
+                Ok(_) => match dropped {
+                    Some(why) => Ran::Blocked(ToolingFailure::new(cmd, &why)),
+                    None => Ran::Regenerated(paths),
+                },
                 Err(e) => Ran::Failed(
                     format!("its output couldn't be committed ({e})"),
                     String::new(),
@@ -1323,6 +1361,21 @@ async fn run_in_sandbox(
         Ok(o) => Ran::NotRun(o.output),
         Err(e) => Ran::NotRun(e.to_string()),
     }
+}
+
+/// Why a generator run that changed files the sandbox couldn't hand back
+/// is not a regeneration.
+pub fn dropped_reason(dropped: &[String]) -> String {
+    format!(
+        "the generator ran, but {} it changed couldn't be brought back from the sandbox to \
+         commit: {}",
+        if dropped.len() == 1 {
+            "a file"
+        } else {
+            "files"
+        },
+        dropped.join("; ")
+    )
 }
 
 /// Whether a build that didn't run (or didn't finish) stopped for want of
@@ -1365,6 +1418,7 @@ async fn regenerate(
     attempt: usize,
     notes: &mut Vec<String>,
     fresh: Option<&str>,
+    settled: &mut Vec<String>,
 ) -> Option<Pass> {
     let (owner, name) = (&w.msg.repo_owner, &w.msg.repo_name);
     let repo = load(w.github, owner, name, w.branch).await;
@@ -1409,6 +1463,7 @@ async fn regenerate(
                     "`{}` already ran with this work; nothing it reads changed since",
                     g.name
                 ));
+                settled.extend(g.outputs.iter().cloned());
                 continue;
             }
             (Some(cmd), true) => match &shared_run {
@@ -1430,6 +1485,10 @@ async fn regenerate(
             Ran::Blocked(f) => return Some(Pass::Blocked(f)),
             Ran::OutOfTime => return Some(Pass::OutOfTime),
             Ran::Regenerated(paths) => {
+                // Ran to the end with every changed file committed (a file
+                // that couldn't come back is a tooling failure): its outputs
+                // are settled, changed or verified up to date.
+                settled.extend(g.outputs.iter().cloned());
                 if paths.is_empty() {
                     notes.push(format!(
                         "`{}` ran; the generated files are up to date",
@@ -1520,6 +1579,9 @@ async fn regenerate(
             }
         }
     }
+    // A generator with a problem left (its output lacks a new type, a hand
+    // typed copy) has nothing settled.
+    settled.retain(|o| !problems.iter().any(|(g, _, _)| g.outputs.contains(o)));
     Some(Pass::Problems(problems))
 }
 
@@ -1599,7 +1661,7 @@ pub enum AfterStep {
 /// the generator gate before the pull request then only verifies.
 pub async fn after_step(w: &Work<'_>) -> AfterStep {
     let mut notes = Vec::new();
-    match regenerate(w, 0, &mut notes, None).await {
+    match regenerate(w, 0, &mut notes, None, &mut Vec::new()).await {
         None => AfterStep::NotNeeded,
         Some(Pass::Problems(p)) if p.is_empty() && notes.is_empty() => AfterStep::NotNeeded,
         Some(Pass::Problems(p)) if p.is_empty() => {
@@ -1617,24 +1679,54 @@ pub async fn after_step(w: &Work<'_>) -> AfterStep {
     }
 }
 
+/// What the generator check settled.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct GateOk {
+    /// Notes for the run page.
+    pub notes: Vec<String>,
+    /// The output globs (from the repository root) of the generators that
+    /// ran to the end with their output committed, or verified up to date:
+    /// a planned task for one of these files is done.
+    pub settled: Vec<String>,
+}
+
+fn normalized(mut globs: Vec<String>) -> Vec<String> {
+    for g in globs.iter_mut() {
+        *g = normalize_path(g);
+    }
+    globs.sort();
+    globs.dedup();
+    globs
+}
+
+/// Whether a file is one a generator settled (`settled`, see [`GateOk`]).
+pub fn is_settled(settled: &[String], path: &str) -> bool {
+    any_match(settled, path)
+}
+
 /// Before the pull request: generators whose inputs changed are run (or,
 /// when they already ran at `fresh` and nothing they read changed since,
 /// verified) and their output committed; one still out of date gets one fix
 /// round, then blocks the pull request with a plain reason. Returns notes
-/// for the PR's progress, or why it stops: blocked, or this step needs more
-/// time (the run then continues in a fresh step at this gate).
+/// for the PR's progress and the outputs it settled, or why it stops:
+/// blocked, or this step needs more time (the run then continues in a fresh
+/// step at this gate).
 pub async fn gate(
     w: &Work<'_>,
     usage: &mut crate::models::TokenUsage,
     fresh: Option<&str>,
-) -> Result<Vec<String>, GateStop> {
+) -> Result<GateOk, GateStop> {
     let mut notes = Vec::new();
-    let problems = match regenerate(w, 0, &mut notes, fresh).await {
-        None => return Ok(notes),
+    let mut settled = Vec::new();
+    let problems = match regenerate(w, 0, &mut notes, fresh, &mut settled).await {
+        None => return Ok(GateOk { notes, settled }),
         Some(p) => stop_of(p)?,
     };
     if problems.is_empty() {
-        return Ok(notes);
+        return Ok(GateOk {
+            notes,
+            settled: normalized(settled),
+        });
     }
     super::add_progress_note(
         w.state,
@@ -1674,13 +1766,17 @@ pub async fn gate(
         warn!(run_id = w.run_id, error = %e, "Generator fix round failed");
     }
     let mut notes2 = Vec::new();
-    let still = match regenerate(w, 1, &mut notes2, None).await {
+    let mut settled2 = Vec::new();
+    let still = match regenerate(w, 1, &mut notes2, None, &mut settled2).await {
         Some(p) => stop_of(p)?,
         None => Vec::new(),
     };
     notes.extend(notes2);
     match still.first() {
-        None => Ok(notes),
+        None => Ok(GateOk {
+            notes,
+            settled: normalized(settled.into_iter().chain(settled2).collect()),
+        }),
         Some((g, inputs, why)) => Err(GateStop::Blocked(format!(
             "Stopped before opening a pull request: {}",
             block_reason(g, inputs, why)
@@ -1720,6 +1816,95 @@ mod tests {
         assert!(glob_match("src/gql/", "src/gql/graphql.ts"));
         assert!(glob_match("**/*.proto", "api/v1/user.proto"));
         assert!(!glob_match("*.ts", "src/a.ts"));
+    }
+
+    /// The production layout: the generator runs in `apps/studio` and its
+    /// config writes `../web/src/lib/sanity/sanity.types.ts`. Every output
+    /// path is in the one spelling the diff and the plan use.
+    #[test]
+    fn a_generator_writing_outside_its_directory_names_the_real_path() {
+        assert_eq!(
+            normalize_path("apps/studio/../web/src/lib/sanity/sanity.types.ts"),
+            "apps/web/src/lib/sanity/sanity.types.ts"
+        );
+        assert_eq!(normalize_path("./a/./b//c/"), "a/b/c/");
+        assert_eq!(normalize_path("../x"), "../x");
+        assert_eq!(
+            under("apps/studio", "../web/src/lib/sanity/sanity.types.ts"),
+            "apps/web/src/lib/sanity/sanity.types.ts"
+        );
+        let r = repo(
+            &[
+                (
+                    "apps/studio/package.json",
+                    r#"{"scripts":{"typegen":"sanity schema extract && sanity typegen generate"}}"#,
+                ),
+                (
+                    "apps/studio/sanity-typegen.json",
+                    r#"{"path":"../web/src/**/*.{ts,tsx}","schema":"schema.json","generates":"../web/src/lib/sanity/sanity.types.ts"}"#,
+                ),
+            ],
+            &[
+                "apps/studio/schemaTypes/blocks/hero.ts",
+                "apps/studio/schema.json",
+                "apps/web/src/lib/sanity/sanity.types.ts",
+            ],
+        );
+        let gens = detect(&r);
+        let g = gens
+            .iter()
+            .find(|g| g.kind == GenKind::Sanity)
+            .expect("the studio's typegen");
+        assert!(
+            g.outputs
+                .contains(&"apps/web/src/lib/sanity/sanity.types.ts".to_string()),
+            "{:?}",
+            g.outputs
+        );
+        assert!(
+            g.outputs.iter().all(|o| !o.contains("..")),
+            "{:?}",
+            g.outputs
+        );
+        // Matching works whichever way a path is spelled.
+        assert!(glob_match(
+            "apps/studio/../web/src/lib/sanity/sanity.types.ts",
+            "apps/web/src/lib/sanity/sanity.types.ts"
+        ));
+        // Both files the build changed are its outputs: nothing missing.
+        let committed = changed(&[
+            "apps/studio/schemaTypes/blocks/hero.ts",
+            "apps/studio/schema.json",
+            "apps/web/src/lib/sanity/sanity.types.ts",
+        ]);
+        assert!(!outputs_missing(g, &committed));
+        // Without the types file, the reason names its real path.
+        let why = not_run_reason(g, "no sandbox");
+        assert!(
+            why.contains("apps/web/src/lib/sanity/sanity.types.ts"),
+            "{why}"
+        );
+        assert!(!why.contains("studio/../web"), "{why}");
+        // What the generator check settles, and what it means for a task.
+        let settled = normalized(g.outputs.clone());
+        assert!(is_settled(
+            &settled,
+            "apps/web/src/lib/sanity/sanity.types.ts"
+        ));
+        assert!(is_settled(
+            &settled,
+            "apps/studio/../web/src/lib/sanity/sanity.types.ts"
+        ));
+        assert!(!is_settled(&settled, "apps/web/src/app/page.tsx"));
+    }
+
+    #[test]
+    fn a_file_the_sandbox_could_not_hand_back_is_named() {
+        let why = dropped_reason(&[
+            "`apps/web/src/lib/sanity/sanity.types.ts` (60 MB, over the 50 MB cap)".to_string(),
+        ]);
+        assert!(why.contains("couldn't be brought back from the sandbox"));
+        assert!(why.contains("apps/web/src/lib/sanity/sanity.types.ts"));
     }
 
     /// A step without time for the build never fails the run: the gate
@@ -1792,7 +1977,7 @@ mod tests {
         let src = include_str!("generators.rs");
         let after = &src[src.find("pub async fn after_step(").unwrap()..];
         let after = &after[..after.find("\n}\n").unwrap()];
-        assert!(after.contains("regenerate(w, 0, &mut notes, None)"));
+        assert!(after.contains("regenerate(w, 0, &mut notes, None,"));
     }
 
     /// The observed case: a CMS schema changed, the typegen script exists,

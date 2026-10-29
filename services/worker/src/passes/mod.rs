@@ -453,6 +453,26 @@ mod continuation_tests {
         assert!(gen < test && test < sec);
     }
 
+    /// A finished run always ends with a pull request: planned work the
+    /// proof check still finds after its fix round opens the PR as a draft
+    /// with it at the top (single and multi repository), and the generator
+    /// check's settled outputs reach the proof check.
+    #[test]
+    fn unfinished_planned_work_opens_a_draft_not_a_failure() {
+        // Literals split so this test doesn't count itself.
+        let src = include_str!("mod.rs");
+        assert!(!src.contains(concat!("proof::unfinished", "_reason(")));
+        let count = |a: &str, b: &str| src.matches(&format!("{a}{b}")).count();
+        assert_eq!(
+            count("let unfinished = proof::", "unfinished_section(&gaps);"),
+            2
+        );
+        assert_eq!(count("unfinished: ", "&unfinished,"), 2);
+        assert_eq!(count("generated: ", "&settled_generated,"), 2);
+        let rp = run_passes_src();
+        assert!(rp.contains(concat!("plan_coverage::", "settle_generated(")));
+    }
+
     /// The team's usage limit stops a run between steps: the next step is
     /// never queued once the meter says so (and a queued one is refused by
     /// the budget gate every step starts with).
@@ -4681,9 +4701,17 @@ async fn run_passes(
     // What is still open goes under Open items, marked: the PR stays a draft
     // while any is listed.
     let security_items = security::open_items(&security_verdict, security_round.is_some());
-    let carry = steps::Carry {
+    // Generated outputs their generator settled: from the generator check
+    // below, or the step that ran it.
+    let mut settled_generated: Vec<String> = step_state
+        .carry
+        .as_ref()
+        .map(|c| c.generated.clone())
+        .unwrap_or_default();
+    let mut carry = steps::Carry {
         security: security_verdict.clone(),
         security_round: security_round.clone(),
+        generated: settled_generated.clone(),
     };
 
     // Security issues not fixed (or a check that didn't run) are the PR's
@@ -4723,9 +4751,44 @@ async fn run_passes(
         )
         .await
         {
-            Ok(notes) => {
-                for n in notes {
+            Ok(ok) => {
+                for n in ok.notes {
                     add_progress_note(state, &msg.team_id, run_id, &n).await;
+                }
+                // A generated task the generator settled is done: the plan
+                // check's record says so too.
+                if !ok.settled.is_empty() {
+                    settled_generated = ok.settled;
+                    carry.generated = settled_generated.clone();
+                    let tasks = plan_coverage::tasks_for(
+                        &github,
+                        &msg.repo_owner,
+                        &msg.repo_name,
+                        &branch_name,
+                        &plan_result.tasks,
+                    )
+                    .await;
+                    if let Some(changed) = plan_coverage::changed_files(
+                        &github,
+                        &msg.repo_owner,
+                        &msg.repo_name,
+                        &msg.base_branch,
+                        &branch_name,
+                    )
+                    .await
+                    {
+                        let cov = plan_coverage::settle_generated(
+                            plan_coverage::coverage(&tasks, &changed),
+                            &settled_generated,
+                        );
+                        save_checked_tasks(
+                            state,
+                            msg,
+                            run_id,
+                            &plan_coverage::checked_tasks_md(&plan_result.tasks, &cov),
+                        )
+                        .await;
+                    }
                 }
             }
             Err(generators::GateStop::NeedsTime) => {
@@ -4775,10 +4838,11 @@ async fn run_passes(
         file_cache: &file_cache,
         run_id,
         deadline: implement_deadline,
+        generated: &settled_generated,
     };
     let mut gaps = proof::prove(&work, &mut evidence, usage, || budget.has_time()).await;
-    // Planned work the check found not done is never an Open item: the pull
-    // request doesn't open without it.
+    // Planned work the check found not done is never an Open item: it goes
+    // at the top of the pull request, which stays a draft until it's done.
     if !proof::planned_work(&gaps).is_empty() {
         if budget.take_denied() {
             close_memory(state, agent_memory.take()).await;
@@ -4795,14 +4859,21 @@ async fn run_passes(
             )
             .await;
         }
-        let kept = keep_wip_branch(&github, &msg.repo_owner, &msg.repo_name, &branch_name).await;
-        close_memory(state, agent_memory.take()).await;
-        return Err(format!(
-            "{} The work so far is kept on branch `{kept}`.",
-            proof::unfinished_reason(&gaps)
+        // A finished run always ends with a pull request: the planned work
+        // still not done after the fix round is listed at its top and it
+        // stays a draft.
+        add_progress_note(
+            state,
+            &msg.team_id,
+            run_id,
+            &format!(
+                "{} planned task(s) still not done after the fix round: the pull request opens as a draft with them listed at the top",
+                proof::planned_work(&gaps).len()
+            ),
         )
-        .into());
+        .await;
     }
+    let unfinished = proof::unfinished_section(&gaps);
     // Tasks the plan marks optional and the change left out, named.
     gaps.extend(plan_optional);
     // What the ticket needs that this run didn't do: a person's step (with
@@ -4988,6 +5059,7 @@ async fn run_passes(
         &pr::Proof {
             evidence: &evidence.for_pr(),
             gaps: &proof::gaps_section(&gaps),
+            unfinished: &unfinished,
             manual: &proof::manual_steps(&gaps),
             ci: &evidence.ci_commands,
             mirrors: &completeness::parse_mirrors(&evidence.notes),
@@ -5722,7 +5794,7 @@ async fn run_repo_pipeline(
     // --- Proof check ---
     check_cancelled(state, &msg.team_id, run_id).await?;
     // Generated files: regenerated with the change, or this repo's PR waits.
-    match generators::gate(
+    let settled_generated = match generators::gate(
         &plan_coverage::Work {
             state,
             msg,
@@ -5741,10 +5813,11 @@ async fn run_repo_pipeline(
     )
     .await
     {
-        Ok(notes) => {
-            for n in notes {
+        Ok(ok) => {
+            for n in ok.notes {
                 add_progress_note(state, &msg.team_id, run_id, &n).await;
             }
+            ok.settled
         }
         Err(generators::GateStop::Blocked(why)) => {
             let kept = keep_wip_branch(github, repo_owner, repo_name, branch_name).await;
@@ -5761,7 +5834,7 @@ async fn run_repo_pipeline(
             )
             .into());
         }
-    }
+    };
     update_pass(state, &msg.team_id, run_id, "review").await?;
     let mut evidence = impl_result.evidence.clone();
     let work = proof::Work {
@@ -5776,19 +5849,15 @@ async fn run_repo_pipeline(
         file_cache,
         run_id,
         deadline: implement_deadline,
+        generated: &settled_generated,
     };
     let mut gaps = proof::prove(&work, &mut evidence, usage, || {
         has_time_for_remediation(start)
     })
     .await;
-    if !proof::planned_work(&gaps).is_empty() {
-        let kept = keep_wip_branch(github, repo_owner, repo_name, branch_name).await;
-        return Err(format!(
-            "{} The work so far is kept on branch `{kept}`.",
-            proof::unfinished_reason(&gaps)
-        )
-        .into());
-    }
+    // Planned work still not done after the fix round: this repository's
+    // pull request opens as a draft with it listed at the top.
+    let unfinished = proof::unfinished_section(&gaps);
     gaps.extend(plan_optional);
     gaps.extend(security_items);
     let links = link_checks::gate(&work, &mut evidence, usage, || {
@@ -5842,6 +5911,7 @@ async fn run_repo_pipeline(
         &pr::Proof {
             evidence: &evidence.for_pr(),
             gaps: &proof::gaps_section(&gaps),
+            unfinished: &unfinished,
             manual: &proof::manual_steps(&gaps),
             ci: &evidence.ci_commands,
             mirrors: &completeness::parse_mirrors(&evidence.notes),

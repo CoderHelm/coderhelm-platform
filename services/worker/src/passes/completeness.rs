@@ -120,16 +120,21 @@ pub enum Section {
     ReviewFixes,
     /// What is still open, at the bottom (#238's "Not yet verified").
     OpenItems,
+    /// Planned work the check before the PR still found not done after its
+    /// fix round, at the top: the PR opens as a draft with it rather than
+    /// the run ending with no PR (see `proof::unfinished_section`).
+    Unfinished,
 }
 
 impl Section {
-    const ALL: [Section; 6] = [
+    const ALL: [Section; 7] = [
         Section::Links,
         Section::Mirrors,
         Section::MergeOrder,
         Section::NotInPr,
         Section::ReviewFixes,
         Section::OpenItems,
+        Section::Unfinished,
     ];
 
     /// Its start and end markers.
@@ -150,6 +155,7 @@ impl Section {
                 super::review_fix::evidence::END,
             ),
             Section::OpenItems => (super::proof::UNVERIFIED_START, super::proof::UNVERIFIED_END),
+            Section::Unfinished => (super::proof::UNFINISHED_START, super::proof::UNFINISHED_END),
         }
     }
 }
@@ -183,6 +189,7 @@ pub struct Owned {
     pub not_in_pr: String,
     pub review_fixes: String,
     pub open_items: String,
+    pub unfinished: String,
 }
 
 impl Owned {
@@ -194,6 +201,7 @@ impl Owned {
             Section::NotInPr => &mut self.not_in_pr,
             Section::ReviewFixes => &mut self.review_fixes,
             Section::OpenItems => &mut self.open_items,
+            Section::Unfinished => &mut self.unfinished,
         }
     }
 
@@ -304,7 +312,8 @@ pub fn normalize_open_items(section: &str) -> String {
 /// Changes, then the link and redirect checks, the blocks the change mirrors, the merge order and the
 /// steps not in this PR (before the Risk heading, or before Verification
 /// when there is no Risk), the writer's Risk and Verification, then Open
-/// items at the bottom, above the footer. Empty sections are left out.
+/// items at the bottom, above the footer; planned work not done, when any,
+/// above everything. Empty sections are left out.
 pub fn assemble(rest: &str, owned: &Owned) -> String {
     let (main, footer) = split_footer(rest);
     let main = main.trim();
@@ -344,6 +353,15 @@ pub fn assemble(rest: &str, owned: &Owned) -> String {
             open
         } else {
             format!("{body}\n\n{open}")
+        };
+    }
+    // Planned work not done goes first: a reader sees it before anything.
+    let unfinished = owned.unfinished.trim();
+    if !unfinished.is_empty() {
+        body = if body.is_empty() {
+            unfinished.to_string()
+        } else {
+            format!("{unfinished}\n\n{body}")
         };
     }
     format!("{body}{footer}")
@@ -1080,6 +1098,7 @@ mod tests {
     fn the_description_is_put_together_in_its_order() {
         let writer = "Closes #9\n\n**Summary** The report needs a reader.\n\n**Changes**\n* **Users** add `analytics_reader`\n\n**Risk** **Low**: one new user.\n\n**Verification**\n1. Run the plan.";
         let owned = Owned {
+            unfinished: String::new(),
             links: String::new(),
             mirrors: mirrors_section(&[Mirror {
                 path: "envs/prod/users.tf".into(),
@@ -1131,6 +1150,40 @@ mod tests {
         assert!(is_heading("3. **Risk** — Low", "risk"));
         assert!(!is_heading("## Risks", "risk"));
         assert!(!is_heading("Risk is low", "risk"));
+    }
+
+    /// Planned work not done after the fix round: the PR opens as a draft
+    /// with it above everything, and a later rewrite keeps it there.
+    #[test]
+    fn unfinished_work_goes_at_the_top() {
+        let top = crate::passes::proof::unfinished_section(&[crate::passes::proof::Finding {
+            point: "planned_work".into(),
+            detail: "The hours block in apps/web/src/components/hours.tsx is not built.".into(),
+            ..Default::default()
+        }]);
+        let owned = Owned {
+            unfinished: top.clone(),
+            open_items: crate::passes::proof::gaps_section(&[crate::passes::proof::Finding {
+                point: "impact".into(),
+                detail: "not counted".into(),
+                ..Default::default()
+            }]),
+            ..Default::default()
+        };
+        let body = assemble("Closes #4\n\n**Summary** x\n\n**Risk** Low", &owned);
+        assert!(
+            body.starts_with(crate::passes::proof::UNFINISHED_START),
+            "{body}"
+        );
+        assert!(body.contains("hours.tsx"));
+        assert!(
+            body.ends_with(crate::passes::proof::UNVERIFIED_END),
+            "{body}"
+        );
+        let (again, rest) = take_owned(&body);
+        assert_eq!(again.unfinished, top);
+        assert_eq!(assemble(&rest, &again), body);
+        assert!(crate::passes::proof::holds_unfinished(&body));
     }
 
     #[test]

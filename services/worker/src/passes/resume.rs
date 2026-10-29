@@ -4165,6 +4165,17 @@ async fn mark_ready(
                     );
                     return;
                 }
+                // Planned work not done is listed at the top: the PR stays
+                // a draft until a person (or a later round) settles it.
+                if super::proof::holds_unfinished(
+                    pr.get("body").and_then(|v| v.as_str()).unwrap_or(""),
+                ) {
+                    info!(
+                        pr_number,
+                        "Planned work not done is listed in the description; the PR stays a draft"
+                    );
+                    return;
+                }
                 // E2E fix and generated-test PRs wait for their repeat runs.
                 if !proven
                     && pr
