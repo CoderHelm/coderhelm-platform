@@ -562,9 +562,14 @@ Then the ```fix_location.json block described above."#,
         .await
     };
     if let Some(s) = &abilities.source {
-        tools.push(super::outside_work::tool(s));
+        let mut t = super::outside_work::tool(s);
+        super::release_plan::add_dataset_param(&mut t, &abilities.datasets);
+        tools.push(t);
     }
     full_system.push_str(&abilities.prompt_section());
+    // How it releases: each environment's deploy trigger, the migration
+    // workflow, each environment's dataset, expand and contract.
+    full_system.push_str(&abilities.release.prompt_section());
     // `check_url` on the team's own public pages.
     let web = super::web_check::WebCheck::load(
         state,
@@ -771,6 +776,10 @@ Then the ```fix_location.json block described above."#,
     // with a reason), looked up before claimed, ordered, valued, confirmable.
     let note_gaps = super::outside_work::plan_gaps(&draft, &abilities);
     back.extend(note_gaps.iter().cloned());
+    // A data migration: expand and contract against the real deploy
+    // triggers, a fallback and its test, counts in every environment.
+    let release_gaps = super::release_plan::plan_gaps(&draft, &abilities.release);
+    back.extend(release_gaps.iter().cloned());
     if !back.is_empty() {
         info!(
             ticket_id = %msg.ticket_id,
@@ -981,6 +990,22 @@ Then the ```fix_location.json block described above."#,
                 &msg.team_id,
                 run_id,
                 &format!("Plan check (outside steps): {}", left.join(" ")),
+            )
+            .await;
+            if let Some(d) = files.fix.as_mut() {
+                d.open_gaps.extend(left);
+            }
+        }
+    }
+    if !release_gaps.is_empty() {
+        let left = super::release_plan::plan_gaps(&files, &abilities.release);
+        if !left.is_empty() {
+            warn!(ticket_id = %msg.ticket_id, gaps = ?left, "Release plan still incomplete after one send-back");
+            super::add_progress_note(
+                state,
+                &msg.team_id,
+                run_id,
+                &format!("Plan check (release): {}", left.join(" ")),
             )
             .await;
             if let Some(d) = files.fix.as_mut() {

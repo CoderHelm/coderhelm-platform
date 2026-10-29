@@ -572,6 +572,12 @@ async fn handle_message(state: Arc<WorkerState>, message: models::WorkerMessage)
                 error!("Await-merge failed: {e:?}");
             }
         }
+        models::WorkerMessage::ReleaseSteps(msg) => {
+            info!(team_id = %msg.team_id, pr = msg.pr_number, attempt = msg.attempts, "Release steps tick");
+            if let Err(e) = passes::release_run::run(&state, msg).await {
+                error!("Release steps failed: {e:?}");
+            }
+        }
         models::WorkerMessage::ToolProposals(msg) => {
             info!(team_id = %msg.team_id, repo = %format!("{}/{}", msg.repo_owner, msg.repo_name), files = msg.paths.len(), "Tool proposals from repo");
             if let Err(e) = passes::tool_proposals::run(&state, msg).await {

@@ -293,6 +293,11 @@ pub struct FixDecision {
     /// sent back once (see `plan_judge`), one line each.
     #[serde(default, deserialize_with = "string_or_list")]
     pub open_gaps: Vec<String>,
+    /// For a change that migrates data or content: the fields, the expand
+    /// and contract migrations, the fallback and its test, the affected
+    /// counts per environment (see `release_plan`).
+    #[serde(default)]
+    pub release: Option<super::release_plan::Release>,
 }
 
 /// One step of the whole job, and who does it.

@@ -2260,6 +2260,29 @@ impl GitHubClient {
         Ok(v.as_array().cloned().unwrap_or_default())
     }
 
+    /// The files one commit changes, as (path, patch), first 300.
+    pub async fn commit_patches(
+        &self,
+        owner: &str,
+        repo: &str,
+        sha: &str,
+    ) -> Result<Vec<(String, String)>, Box<dyn std::error::Error + Send + Sync>> {
+        let v = self
+            .get(&format!("{API_BASE}/repos/{owner}/{repo}/commits/{sha}"))
+            .await?;
+        Ok(v["files"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(|f| {
+                (
+                    f["filename"].as_str().unwrap_or("").to_string(),
+                    f["patch"].as_str().unwrap_or("").to_string(),
+                )
+            })
+            .collect())
+    }
+
     /// An issue (title, body, author), as the issues endpoint returns it.
     pub async fn get_issue(
         &self,

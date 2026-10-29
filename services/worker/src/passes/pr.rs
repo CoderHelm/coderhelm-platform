@@ -215,7 +215,7 @@ pub async fn run(
     // The lowest Risk the diff allows (shared files, a network call per page
     // render), told to the writer and enforced on what it writes.
     let risk_files = super::pr_risk::diff_files(&diff);
-    let risk_floor = super::pr_risk::floor(
+    let mut risk_floor = super::pr_risk::floor(
         &risk_files,
         &super::pr_risk::importers(
             state,
@@ -226,6 +226,13 @@ pub async fn run(
         )
         .await,
     );
+    // A data migration's release steps (expand, deploy, contract), from the
+    // plan and how the repository deploys. Migrations in several
+    // environments make the Risk at least Medium.
+    let release = super::release_plan::for_run(state, msg, github, plan, branch).await;
+    if let Some(r) = &release {
+        super::release_plan::raise_floor(&mut risk_floor, &r.steps);
+    }
 
     // Check for PR template in the repo
     let pr_template =
@@ -581,6 +588,14 @@ Return ONLY the markdown body text."#,
         super::completeness::assemble(&full_body, &owned_sections(plan, proof, &repo)),
         super::skills::run_consulted(state, &msg.team_id, run_id).await
     );
+    // The release steps CoderHelm does, rendered from the same steps as the
+    // ticket note.
+    let full_body = match &release {
+        Some(r) => {
+            super::release_plan::put_section(&full_body, &super::release_plan::section(&r.lines()))
+        }
+        None => full_body,
+    };
 
     // The PR title and squash commit follow the team's templates.
     let conventions = super::load_git_conventions(state, &msg.team_id, &msg.ticket_id).await;
@@ -1502,6 +1517,10 @@ pub async fn refresh_description(
     // `settle_unverified_by_ci`): the writer rewrites the rest. A person's
     // request may change them too, so then the writer sees the whole body.
     let (owned, rest) = super::completeness::take_owned(&current);
+    // The release steps are CoderHelm's record too: kept out of the
+    // writer's text and put back as they are.
+    let release_section = super::release_plan::current_section(&rest);
+    let rest = super::release_plan::put_section(&rest, "");
     let shaped = super::completeness::assemble(&rest, &owned);
     let old = if requests.is_empty() {
         rest.trim().to_string()
@@ -1626,6 +1645,7 @@ Return ONLY the markdown body text, then a line `{CHANGES_MARK}` and one bullet 
         let (kept, rest) = super::completeness::take_owned(&written);
         super::completeness::assemble(&rest, &kept)
     };
+    let body = super::release_plan::put_section(&body, &release_section);
     if body == current {
         return None;
     }
