@@ -769,6 +769,8 @@ pub async fn run(
 
     let on_tool: Option<Box<llm::OnToolCall>> = if let Some(rid) = run_id {
         let dynamo = state.dynamo.clone();
+        let s3 = state.s3.clone();
+        let bucket = state.config.bucket_name.clone();
         let table = state.config.runs_table_name.clone();
         let events_table = state.config.events_table_name.clone();
         let team = msg.team_id.clone();
@@ -776,6 +778,8 @@ pub async fn run(
         Some(Box::new(
             move |tool_name: &str, duration_ms: u64, input_summary: &str, is_error: bool| {
                 let dynamo = dynamo.clone();
+                let s3 = s3.clone();
+                let bucket = bucket.clone();
                 let table = table.clone();
                 let events_table = events_table.clone();
                 let team = team.clone();
@@ -794,27 +798,16 @@ pub async fn run(
                             common::truncate_str(&input_summary, 100)
                         )
                     };
-                    let entry = aws_sdk_dynamodb::types::AttributeValue::M(
-                        std::collections::HashMap::from([
-                            (
-                                "message".to_string(),
-                                aws_sdk_dynamodb::types::AttributeValue::S(msg),
-                            ),
-                            (
-                                "timestamp".to_string(),
-                                aws_sdk_dynamodb::types::AttributeValue::S(now.clone()),
-                            ),
-                        ]),
-                    );
-                    let _ = dynamo.update_item()
-                    .table_name(&table)
-                    .key("team_id", aws_sdk_dynamodb::types::AttributeValue::S(team.clone()))
-                    .key("run_id", aws_sdk_dynamodb::types::AttributeValue::S(rid.clone()))
-                    .update_expression("SET progress_notes = list_append(if_not_exists(progress_notes, :empty), :entry), updated_at = :t")
-                    .expression_attribute_values(":entry", aws_sdk_dynamodb::types::AttributeValue::L(vec![entry]))
-                    .expression_attribute_values(":empty", aws_sdk_dynamodb::types::AttributeValue::L(vec![]))
-                    .expression_attribute_values(":t", aws_sdk_dynamodb::types::AttributeValue::S(now.clone()))
-                    .send()
+                    super::run_lists::append_note(
+                        &super::run_lists::Target {
+                            dynamo: &dynamo,
+                            table: &table,
+                            team_id: &team,
+                            run_id: &rid,
+                            archive: Some((&s3, &bucket)),
+                        },
+                        &msg,
+                    )
                     .await;
 
                     // Write detailed tool event to events table for agent log live view

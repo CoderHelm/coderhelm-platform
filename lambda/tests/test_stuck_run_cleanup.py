@@ -119,3 +119,25 @@ class Rounds(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class StepQueued(unittest.TestCase):
+    NOW = sweep.datetime(2026, 10, 28, 12, 0, tzinfo=sweep.timezone.utc)
+
+    def at(self, minutes):
+        return (self.NOW - sweep.timedelta(minutes=minutes)).isoformat()
+
+    def test_a_queued_step_not_started_is_not_stuck(self):
+        run = {"updated_at": self.at(40), "step_queued_at": self.at(39)}
+        self.assertTrue(sweep.step_queued(run, self.NOW))
+
+    def test_a_started_step_that_died_is_swept(self):
+        run = {"updated_at": self.at(30), "step_queued_at": self.at(45)}
+        self.assertFalse(sweep.step_queued(run, self.NOW))
+
+    def test_a_step_queued_too_long_is_swept(self):
+        run = {"updated_at": self.at(60 * 8), "step_queued_at": self.at(60 * 7)}
+        self.assertFalse(sweep.step_queued(run, self.NOW))
+
+    def test_no_step_queued(self):
+        self.assertFalse(sweep.step_queued({"updated_at": self.at(30)}, self.NOW))

@@ -12,9 +12,13 @@
 //! or CONTRIBUTING). Each comes with the inputs it reads and, where known, the
 //! files it writes (globs). When the diff touches a generator's inputs, the
 //! generator runs in the sandbox and its output is committed with the change
-//! ([`gate`]). Before the pull request opens, a generator whose inputs changed
-//! while its outputs did not (or whose run still changes tracked files) blocks
-//! it with a plain reason, after one fix round.
+//! ([`after_step`]: the worker runs it right after the implement work, never
+//! waiting for the coder to call run_codegen). Before the pull request opens,
+//! [`gate`] verifies: a generator whose inputs changed while its outputs did
+//! not (or whose run still changes tracked files) blocks it with a plain
+//! reason, after one fix round. A step without time for a sandbox build never
+//! fails the run: the gate says [`GateStop::NeedsTime`] and the run continues
+//! in a fresh step at this gate.
 
 use std::collections::HashMap;
 
@@ -1186,9 +1190,11 @@ enum Ran {
     /// It failed because the sandbox's network allowlist refused a host it
     /// needs: the run's tooling, not the change.
     Blocked(ToolingFailure),
-    /// The sandbox isn't set up, is out of time, or the team's policy holds
-    /// the command.
+    /// The sandbox isn't set up, or the team's policy holds the command.
     NotRun(String),
+    /// This step has too little time left for a sandbox build (or the build
+    /// ran out of it): a fresh step runs it.
+    OutOfTime,
 }
 
 /// The hosts a generator build may reach beyond the team's list, and the
@@ -1229,7 +1235,7 @@ async fn run_in_sandbox(
     .with_egress(crate::agent::policy::sandbox_egress(state, &w.msg.team_id).await)
     .with_generator_hosts(net.hosts.to_vec(), net.cmds.to_vec());
     if !sandbox.has_time(w.deadline) {
-        return Ran::NotRun("not enough time left".into());
+        return Ran::OutOfTime;
     }
     let (owner, name) = (&w.msg.repo_owner, &w.msg.repo_name);
     let head = match w.github.get_ref(owner, name, w.branch).await {
@@ -1301,9 +1307,29 @@ async fn run_in_sandbox(
             ),
             o.output,
         ),
+        // CodeBuild timed the build out: the run's tooling, not the change.
+        Ok(o)
+            if o.output
+                .contains(crate::clients::sandbox::CODEGEN_TIMED_OUT) =>
+        {
+            Ran::Blocked(ToolingFailure::new(
+                cmd,
+                crate::clients::sandbox::CODEGEN_TIMED_OUT,
+            ))
+        }
+        // A build that stopped at the step's deadline didn't fail: it needs
+        // a step with time for it.
+        Ok(o) if out_of_time(&o.output, || sandbox.has_time(w.deadline)) => Ran::OutOfTime,
         Ok(o) => Ran::NotRun(o.output),
         Err(e) => Ran::NotRun(e.to_string()),
     }
+}
+
+/// Whether a build that didn't run (or didn't finish) stopped for want of
+/// this step's time: the sandbox says so, or there is no runway left now.
+fn out_of_time(output: &str, has_time: impl Fn() -> bool) -> bool {
+    let o = output.to_ascii_lowercase();
+    o.contains("exceeded the time budget") || o.contains("not enough time left") || !has_time()
 }
 
 /// What one pass over the affected generators found.
@@ -1316,6 +1342,8 @@ enum Pass {
     /// A generator couldn't reach a host the sandbox's network allowlist
     /// refused: a tooling failure, never a fix round for the change.
     Blocked(ToolingFailure),
+    /// A generator needs a build and this step has too little time for one.
+    OutOfTime,
 }
 
 /// Whether a generator runs through the repository's package scripts (the
@@ -1332,7 +1360,12 @@ fn is_script(g: &Generator) -> bool {
 /// can, and name each one still out of date. Package-script generators run
 /// through the worker's codegen command (`detect_codegen_command`), once,
 /// with the repository's public codegen environment (`load_codegen_env`).
-async fn regenerate(w: &Work<'_>, attempt: usize, notes: &mut Vec<String>) -> Option<Pass> {
+async fn regenerate(
+    w: &Work<'_>,
+    attempt: usize,
+    notes: &mut Vec<String>,
+    fresh: Option<&str>,
+) -> Option<Pass> {
     let (owner, name) = (&w.msg.repo_owner, &w.msg.repo_name);
     let repo = load(w.github, owner, name, w.branch).await;
     let gens = detect(&repo);
@@ -1349,6 +1382,16 @@ async fn regenerate(w: &Work<'_>, attempt: usize, notes: &mut Vec<String>) -> Op
     if hits.is_empty() {
         return Some(Pass::Problems(Vec::new()));
     }
+    // The generators already ran with this work (right after the implement
+    // step) and nothing since touched what they read: verify only.
+    let verified = match fresh {
+        Some(at) => w
+            .github
+            .compare_changed_files(owner, name, at, w.branch)
+            .await
+            .is_ok_and(|since| !hits.iter().any(|(g, _)| reads_any(g, &since))),
+        None => false,
+    };
     let scripts_cmd = super::detect_codegen_command(w.github, owner, name, w.branch).await;
     let env = super::load_codegen_env(w.state, &w.msg.team_id, owner, name).await;
     let hosts = required_hosts(&repo, &env);
@@ -1361,6 +1404,13 @@ async fn regenerate(w: &Work<'_>, attempt: usize, notes: &mut Vec<String>) -> Op
     let mut problems = Vec::new();
     for (i, (g, inputs)) in hits.into_iter().enumerate() {
         let ran = match (&scripts_cmd, is_script(&g)) {
+            _ if verified => {
+                notes.push(format!(
+                    "`{}` already ran with this work; nothing it reads changed since",
+                    g.name
+                ));
+                continue;
+            }
             (Some(cmd), true) => match &shared_run {
                 // The shared run already counted its files.
                 Some(Ran::Regenerated(_)) => Ran::Regenerated(Vec::new()),
@@ -1378,6 +1428,7 @@ async fn regenerate(w: &Work<'_>, attempt: usize, notes: &mut Vec<String>) -> Op
         };
         match ran {
             Ran::Blocked(f) => return Some(Pass::Blocked(f)),
+            Ran::OutOfTime => return Some(Pass::OutOfTime),
             Ran::Regenerated(paths) => {
                 if paths.is_empty() {
                     notes.push(format!(
@@ -1500,22 +1551,91 @@ async fn record_missing_env(w: &Work<'_>, repo: &str, command: &str, missing: &[
     }
 }
 
-/// Before the pull request: generators whose inputs changed are run and
-/// their output committed; one still out of date gets one fix round, then
-/// blocks the pull request with a plain reason. Returns notes for the PR's
-/// progress, or the reason.
+/// Why the generator check didn't let the pull request open.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GateStop {
+    /// The change can't open as it is: a plain reason.
+    Blocked(String),
+    /// This step has too little time left for the build the check needs:
+    /// the run continues in a fresh step at this gate. Never a failure.
+    NeedsTime,
+}
+
+fn stop_of(p: Pass) -> Result<Vec<(Generator, Vec<String>, String)>, GateStop> {
+    match p {
+        Pass::MissingEnv(why) => Err(GateStop::Blocked(why)),
+        Pass::Blocked(f) => Err(GateStop::Blocked(f.reason())),
+        Pass::OutOfTime => Err(GateStop::NeedsTime),
+        Pass::Problems(p) => Ok(p),
+    }
+}
+
+/// Whether any of `paths` is an input of `g` (not one of its outputs).
+fn reads_any(g: &Generator, paths: &[String]) -> bool {
+    paths
+        .iter()
+        .any(|p| any_match(&g.inputs, p) && !any_match(&g.outputs, p))
+}
+
+/// What running the generators right after an implement step came to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AfterStep {
+    /// No generator reads what the step changed.
+    NotNeeded,
+    /// They ran (output committed when it changed); the branch head after,
+    /// for the late gate to verify against, and notes for the run page.
+    Fresh(String, Vec<String>),
+    /// This step has too little time for the build: the next step runs it
+    /// first.
+    OutOfTime,
+    /// They couldn't settle it here (a failure, a blocked host, missing
+    /// values): the generator gate deals with it, with its fix round.
+    Left(Vec<String>),
+}
+
+/// Right after an implement step: when the branch changes files a known
+/// generator reads, the worker runs that generator in the sandbox and
+/// commits its output. It never depends on the coder calling run_codegen;
+/// the generator gate before the pull request then only verifies.
+pub async fn after_step(w: &Work<'_>) -> AfterStep {
+    let mut notes = Vec::new();
+    match regenerate(w, 0, &mut notes, None).await {
+        None => AfterStep::NotNeeded,
+        Some(Pass::Problems(p)) if p.is_empty() && notes.is_empty() => AfterStep::NotNeeded,
+        Some(Pass::Problems(p)) if p.is_empty() => {
+            match w
+                .github
+                .get_ref(&w.msg.repo_owner, &w.msg.repo_name, w.branch)
+                .await
+            {
+                Ok(head) => AfterStep::Fresh(head, notes),
+                Err(_) => AfterStep::Left(notes),
+            }
+        }
+        Some(Pass::OutOfTime) => AfterStep::OutOfTime,
+        Some(_) => AfterStep::Left(notes),
+    }
+}
+
+/// Before the pull request: generators whose inputs changed are run (or,
+/// when they already ran at `fresh` and nothing they read changed since,
+/// verified) and their output committed; one still out of date gets one fix
+/// round, then blocks the pull request with a plain reason. Returns notes
+/// for the PR's progress, or why it stops: blocked, or this step needs more
+/// time (the run then continues in a fresh step at this gate).
 pub async fn gate(
     w: &Work<'_>,
     usage: &mut crate::models::TokenUsage,
-) -> Result<Vec<String>, String> {
+    fresh: Option<&str>,
+) -> Result<Vec<String>, GateStop> {
     let mut notes = Vec::new();
-    let problems = match regenerate(w, 0, &mut notes).await {
+    let problems = match regenerate(w, 0, &mut notes, fresh).await {
         None => return Ok(notes),
-        Some(Pass::MissingEnv(why)) => return Err(why),
-        Some(Pass::Blocked(f)) => return Err(f.reason()),
-        Some(Pass::Problems(p)) if p.is_empty() => return Ok(notes),
-        Some(Pass::Problems(p)) => p,
+        Some(p) => stop_of(p)?,
     };
+    if problems.is_empty() {
+        return Ok(notes);
+    }
     super::add_progress_note(
         w.state,
         &w.msg.team_id,
@@ -1554,19 +1674,17 @@ pub async fn gate(
         warn!(run_id = w.run_id, error = %e, "Generator fix round failed");
     }
     let mut notes2 = Vec::new();
-    let still = match regenerate(w, 1, &mut notes2).await {
-        Some(Pass::MissingEnv(why)) => return Err(why),
-        Some(Pass::Blocked(f)) => return Err(f.reason()),
-        Some(Pass::Problems(p)) => p,
+    let still = match regenerate(w, 1, &mut notes2, None).await {
+        Some(p) => stop_of(p)?,
         None => Vec::new(),
     };
     notes.extend(notes2);
     match still.first() {
         None => Ok(notes),
-        Some((g, inputs, why)) => Err(format!(
+        Some((g, inputs, why)) => Err(GateStop::Blocked(format!(
             "Stopped before opening a pull request: {}",
             block_reason(g, inputs, why)
-        )),
+        ))),
     }
 }
 
@@ -1602,6 +1720,79 @@ mod tests {
         assert!(glob_match("src/gql/", "src/gql/graphql.ts"));
         assert!(glob_match("**/*.proto", "api/v1/user.proto"));
         assert!(!glob_match("*.ts", "src/a.ts"));
+    }
+
+    /// A step without time for the build never fails the run: the gate
+    /// says it needs time (the run continues in a fresh step at this gate),
+    /// never "couldn't run here (not enough time left)".
+    #[test]
+    fn a_gate_without_time_needs_a_step_not_a_failure() {
+        assert_eq!(stop_of(Pass::OutOfTime), Err(GateStop::NeedsTime));
+        assert!(out_of_time("codegen exceeded the time budget", || true));
+        assert!(out_of_time(
+            "not enough time left before the pass deadline to run codegen",
+            || true
+        ));
+        assert!(
+            out_of_time("snapshot failed", || false),
+            "no runway left now"
+        );
+        assert!(!out_of_time("snapshot failed", || true));
+        // CodeBuild's own timeout is the sandbox's failure, not this step's.
+        assert!(!out_of_time(
+            crate::clients::sandbox::CODEGEN_TIMED_OUT,
+            || true
+        ));
+        let src = include_str!("generators.rs");
+        let run = &src[src.find("async fn run_in_sandbox(").unwrap()..];
+        let run = &run[..run.find("\n}\n").unwrap()];
+        assert!(run.contains("return Ran::OutOfTime;"));
+        assert!(!run.contains("Ran::NotRun(\"not enough time left\""));
+    }
+
+    /// The implement work changing a generator's inputs is what makes the
+    /// worker run it right after the step (`after_step`), and the late gate
+    /// verifies without a second build when nothing it reads changed since.
+    #[test]
+    fn implement_writing_generator_inputs_triggers_the_generator() {
+        let r = repo(
+            &[
+                (
+                    "package.json",
+                    r#"{"scripts":{"typegen":"sanity schema extract && sanity typegen generate"}}"#,
+                ),
+                (
+                    "sanity-typegen.json",
+                    r#"{"path":"./src/**/*.{ts,tsx}","schema":"schema.json","generates":"./src/sanity.types.ts"}"#,
+                ),
+            ],
+            &[
+                "src/sanity.types.ts",
+                "studio/schemaTypes/blocks/gallery.ts",
+            ],
+        );
+        let gens = detect(&r);
+        let step_wrote = changed(&["studio/schemaTypes/blocks/gallery.ts", "README.md"]);
+        let hit = affected(&gens, &step_wrote);
+        assert_eq!(
+            hit.len(),
+            1,
+            "the step's schema edit triggers the generator"
+        );
+        assert!(reads_any(hit[0].0, &step_wrote));
+        // Since the run at the fresh head only the generator's own output
+        // and files it doesn't read changed: verify only.
+        assert!(!reads_any(
+            hit[0].0,
+            &changed(&["src/sanity.types.ts", "README.md"])
+        ));
+        // A step that touched no input runs nothing.
+        assert!(affected(&gens, &changed(&["README.md"])).is_empty());
+        // The worker runs it itself, not through the coder's run_codegen.
+        let src = include_str!("generators.rs");
+        let after = &src[src.find("pub async fn after_step(").unwrap()..];
+        let after = &after[..after.find("\n}\n").unwrap()];
+        assert!(after.contains("regenerate(w, 0, &mut notes, None)"));
     }
 
     /// The observed case: a CMS schema changed, the typegen script exists,

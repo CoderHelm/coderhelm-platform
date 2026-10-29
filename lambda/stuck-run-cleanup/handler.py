@@ -50,6 +50,12 @@ BEFORE_FIRST_PASS = "before its first pass"
 ROUND_FIELD = "round"
 INCOMPLETE_FIELD = "round_incomplete"
 ROUND_BUDGET_SECONDS = 750
+# A ticket run works in steps (services/worker/src/passes/steps.rs): each
+# step queues the next as a new message and records `step_queued_at`. A step
+# that is queued and hasn't started (a full queue) is not stuck; past this
+# long, it is.
+STEP_QUEUED_FIELD = "step_queued_at"
+MAX_STEP_QUEUED_HOURS = int(os.environ.get("MAX_STEP_QUEUED_HOURS", "6"))
 ROUND_SWEEP_GRACE_SECONDS = 300
 ROUND_LABELS = {
     "ci_fix": "CI fix round",
@@ -122,6 +128,23 @@ def round_in_budget(run, now):
             return False
         deadline = started + timedelta(seconds=ROUND_BUDGET_SECONDS)
     return now < deadline + timedelta(seconds=ROUND_SWEEP_GRACE_SECONDS)
+
+
+def step_queued(run, now):
+    """True while the run's next step is queued and hasn't started yet.
+
+    A step that starts updates `updated_at`, so a queued time after the last
+    update means no step is running and one is waiting for the queue. A step
+    that started and then died (a crash) has its queued time before the last
+    update, and the run is swept as usual.
+    """
+    queued = _parse_time(run.get(STEP_QUEUED_FIELD))
+    if queued is None:
+        return False
+    updated = _parse_time(run.get("updated_at") or run.get("created_at"))
+    if updated is not None and queued < updated:
+        return False
+    return now < queued + timedelta(hours=MAX_STEP_QUEUED_HOURS)
 
 
 def has_pull_request(run):
@@ -242,6 +265,7 @@ def handler(event, context):
         },
         "ProjectionExpression": (
             "team_id, run_id, created_at, updated_at, title, current_pass, pass_history, #s, "
+            "step_queued_at, "
             "#round, pr_number, pr_url"
         ),
     }
@@ -255,6 +279,9 @@ def handler(event, context):
             cutoff = running_cutoff if status == "running" else awaiting_cutoff
             if status == "running" and round_in_budget(item, now):
                 # Its fix round is still inside its own budget.
+                continue
+            if status == "running" and step_queued(item, now):
+                # Its next step is queued and hasn't started.
                 continue
             if updated and updated < cutoff:
                 stuck_runs.append(item)

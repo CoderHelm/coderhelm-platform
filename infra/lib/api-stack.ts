@@ -268,6 +268,16 @@ export class ApiStack extends cdk.Stack {
 
     // --- SQS Queues ---
 
+    // Queues the worker reads (tickets, CI fix, feedback, webhooks). AWS
+    // asks for a visibility timeout of at least six times the function's
+    // timeout (900 s) and a redrive count of at least 5. A ticket run hands
+    // off to a NEW message before 900 s, so the visibility only matters
+    // after a crash: the message comes back after 90 minutes, and the
+    // stuck-run sweep (20 minutes without an update) has failed the run with
+    // a reason by then.
+    const WORKER_QUEUE_VISIBILITY = cdk.Duration.seconds(6 * 900);
+    const WORKER_QUEUE_MAX_RECEIVES = 5;
+
     // Dead letter queue (shared)
     const dlq = new sqs.Queue(this, "DLQ", {
       queueName: `${prefix}-dlq`,
@@ -278,9 +288,9 @@ export class ApiStack extends cdk.Stack {
 
     this.ticketQueue = new sqs.Queue(this, "TicketQueue", {
       queueName: `${prefix}-tickets`,
-      visibilityTimeout: cdk.Duration.minutes(16), // > Lambda timeout
+      visibilityTimeout: WORKER_QUEUE_VISIBILITY,
       encryption: sqs.QueueEncryption.SQS_MANAGED,
-      deadLetterQueue: { queue: dlq, maxReceiveCount: 3 },
+      deadLetterQueue: { queue: dlq, maxReceiveCount: WORKER_QUEUE_MAX_RECEIVES },
     });
 
     // CoderHelm's mail relay (hosted side of hybrid only): its sending
@@ -291,16 +301,16 @@ export class ApiStack extends cdk.Stack {
 
     this.ciFixQueue = new sqs.Queue(this, "CiFixQueue", {
       queueName: `${prefix}-ci-fix`,
-      visibilityTimeout: cdk.Duration.minutes(16),
+      visibilityTimeout: WORKER_QUEUE_VISIBILITY,
       encryption: sqs.QueueEncryption.SQS_MANAGED,
-      deadLetterQueue: { queue: dlq, maxReceiveCount: 3 },
+      deadLetterQueue: { queue: dlq, maxReceiveCount: WORKER_QUEUE_MAX_RECEIVES },
     });
 
     this.feedbackQueue = new sqs.Queue(this, "FeedbackQueue", {
       queueName: `${prefix}-feedback`,
-      visibilityTimeout: cdk.Duration.minutes(16),
+      visibilityTimeout: WORKER_QUEUE_VISIBILITY,
       encryption: sqs.QueueEncryption.SQS_MANAGED,
-      deadLetterQueue: { queue: dlq, maxReceiveCount: 3 },
+      deadLetterQueue: { queue: dlq, maxReceiveCount: WORKER_QUEUE_MAX_RECEIVES },
     });
 
     // Outbound webhooks: events the work emits (`webhook_emit`) and the
@@ -308,9 +318,9 @@ export class ApiStack extends cdk.Stack {
     // a delivery never waits behind long runs on the tickets queue.
     this.webhookQueue = new sqs.Queue(this, "WebhookQueue", {
       queueName: `${prefix}-webhooks`,
-      visibilityTimeout: cdk.Duration.minutes(16),
+      visibilityTimeout: WORKER_QUEUE_VISIBILITY,
       encryption: sqs.QueueEncryption.SQS_MANAGED,
-      deadLetterQueue: { queue: dlq, maxReceiveCount: 3 },
+      deadLetterQueue: { queue: dlq, maxReceiveCount: WORKER_QUEUE_MAX_RECEIVES },
     });
 
     // Review-reminder sweep: every 20 min, drop a constant message on the ticket
