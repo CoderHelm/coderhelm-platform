@@ -396,10 +396,7 @@ Implement → Test
 - Output: `"Warning: Plan references 4 files that don't exist: [list]. The plan may be hallucinating."`
 
 **2. Scope check**
-- Count files mentioned in the plan
-- If >15 files → flag: `"This plan modifies {N} files. Consider breaking into smaller tickets."`
-- If >25 files → hard stop: post a comment asking for a narrower scope, mark run as `needs_clarification`
-- Configurable via `SETTINGS#WORKFLOW` → `max_plan_files` (default 15, hard cap 30)
+- Removed. There is no file-count limit: a run never fails or narrows its scope because of how many files the change touches. The planner leaves out padding (changes neither the ticket nor the change needs) and never drops a file the ticket names.
 
 **3. Conflict detection**
 - Check if the target branch already has an open PR
@@ -438,7 +435,7 @@ fn validate_plan(
 If `blocked == true`, the run stops and posts a comment. If there are warnings, they're injected into the Implement pass system prompt so the LLM is aware.
 
 **New DynamoDB table:** None
-**Settings:** `SETTINGS#WORKFLOW` → `max_plan_files` (default `15`)
+**Settings:** none
 
 ---
 
@@ -603,7 +600,6 @@ If FAIL:
 |---|---|---|
 | `SETTINGS#WORKFLOW` → `max_review_cycles` | Max Implement ↔ Review iterations | `3` |
 | `SETTINGS#WORKFLOW` → `max_security_retries` | Max security remediation cycles | `1` |
-| `SETTINGS#WORKFLOW` → `max_plan_files` | Max files a plan can target before blocking | `15` |
 | `SETTINGS#WORKFLOW` → `formatter_enabled` | Enable/disable voice formatter | `true` |
 | `SETTINGS#WORKFLOW` → `parallel_passes` | Enable parallel Triage + InfraAnalyze | `true` |
 | `SETTINGS#WORKFLOW` → `security_audit_enabled` | Enable/disable security gate | `true` |

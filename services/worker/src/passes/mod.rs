@@ -3245,7 +3245,7 @@ async fn run_passes(
         // --- Plan Validation (deterministic, no LLM) ---
         let team_repos = plan::fetch_team_repos(state, &msg.team_id).await;
         // Already validated (and the repo settled) right after planning.
-        let mut plan_warnings = match early_validation.take() {
+        let plan_warnings = match early_validation.take() {
             Some(v) => v,
             None => {
                 validate_plan(
@@ -3263,110 +3263,6 @@ async fn run_passes(
                 .await
             }
         };
-        // Over the file cap: ask the planner ONCE to narrow the scope before
-        // failing the run — most oversized plans pad the change set.
-        if let Some((planned, cap)) = plan_warnings.over_cap {
-            info!(
-                run_id,
-                planned, cap, "Plan over the file cap — re-planning once with a narrower scope"
-            );
-            add_progress_note(
-                state,
-                &msg.team_id,
-                run_id,
-                &format!(
-                    "Plan changed {planned} files (cap {cap}) — re-planning with a narrower scope"
-                ),
-            )
-            .await;
-            let mut narrowed = msg.clone();
-            narrowed.body.push_str(&narrow_scope_note(planned, cap));
-            match plan::run(
-                state,
-                &narrowed,
-                &github,
-                &triage_result,
-                &repo_instructions,
-                &provider,
-                usage,
-                run_id,
-                &history,
-            )
-            .await
-            {
-                Ok(p) => {
-                    plan_result = p;
-                    // The planner stored a hash of the NARROWED ticket; put the
-                    // real ticket's hash back so the next run reuses this plan.
-                    let prefix = openspec_prefix(
-                        &msg.team_id,
-                        &msg.ticket_id,
-                        &msg.repo_owner,
-                        &msg.repo_name,
-                    );
-                    let _ = state
-                        .s3
-                        .put_object()
-                        .bucket(&state.config.bucket_name)
-                        .key(format!("{prefix}/context_hash.txt"))
-                        .body(context_hash.as_bytes().to_vec().into())
-                        .content_type("text/plain")
-                        .send()
-                        .await;
-                    // Keep the branch's openspec in step with the plan in use.
-                    if commit_openspec {
-                        let ticket_slug = msg.ticket_id.to_lowercase();
-                        let spec_files: Vec<crate::clients::github::FileOp> = [
-                            ("proposal.md", &plan_result.proposal),
-                            ("design.md", &plan_result.design),
-                            ("tasks.md", &plan_result.tasks),
-                            ("spec.md", &plan_result.spec),
-                        ]
-                        .iter()
-                        .filter(|(_, content)| !content.is_empty())
-                        .map(|(name, content)| crate::clients::github::FileOp::Write {
-                            path: format!("openspec/specs/{ticket_slug}/{name}"),
-                            content: content.to_string(),
-                        })
-                        .collect();
-                        if !spec_files.is_empty() {
-                            if let Err(e) = github
-                                .batch_write(
-                                    &msg.repo_owner,
-                                    &msg.repo_name,
-                                    &branch_name,
-                                    &conventions.commit_message(
-                                        &tokens,
-                                        &format!("Narrow openspec for {}", msg.ticket_id),
-                                    ),
-                                    &spec_files,
-                                )
-                                .await
-                            {
-                                warn!(run_id, error = %e, "Failed to commit the narrowed openspec");
-                            }
-                        }
-                    }
-                    plan_warnings = validate_plan(
-                        &plan_result,
-                        &github,
-                        &msg.repo_owner,
-                        &msg.repo_name,
-                        &msg.base_branch,
-                        state,
-                        &msg.team_id,
-                        &team_repos,
-                        &provider,
-                        usage,
-                    )
-                    .await;
-                }
-                Err(e) => {
-                    warn!(run_id, error = %e, "Narrowed re-plan failed — keeping the first plan's verdict")
-                }
-            }
-        }
-
         // Complexity upgrade valve: triage classifies with zero codebase
         // knowledge, and a wrong "simple" verdict silently strips the
         // implement agent's model tier, exploration tools, and design
@@ -3491,34 +3387,6 @@ async fn run_passes(
             }
         }
 
-        if plan_warnings.blocked {
-            let warning_text = plan_warnings.warnings.join("\n");
-            let comment = format!(
-                "⚠️ **Plan validation failed**\n\n{warning_text}\n\nPlease narrow the scope and re-trigger."
-            );
-            if matches!(msg.source, TicketSource::Github) && msg.issue_number > 0 {
-                let _ = github
-                    .create_issue_comment(
-                        &msg.repo_owner,
-                        &msg.repo_name,
-                        msg.issue_number,
-                        &comment,
-                    )
-                    .await;
-            } else if matches!(msg.source, TicketSource::Jira) && !msg.ticket_id.is_empty() {
-                let _ = post_jira_comment(
-                    state,
-                    &msg.team_id,
-                    &msg.ticket_id,
-                    &warning_text,
-                    "scope_too_large",
-                    "Plan scope too large",
-                )
-                .await;
-            }
-            close_memory(state, agent_memory.take()).await;
-            return Err(format!("Plan validation blocked: {warning_text}").into());
-        }
         if !plan_warnings.warnings.is_empty() {
             for w in &plan_warnings.warnings {
                 warn!(run_id, warning = %w, "Plan validation warning");
@@ -8646,7 +8514,6 @@ pub(crate) async fn load_content(state: &WorkerState, team_id: &str, sk: &str) -
 
 struct PlanValidation {
     warnings: Vec<String>,
-    blocked: bool,
     /// If triage picked the wrong repo, this suggests the correct one (owner/name).
     switch_repo: Option<String>,
     /// Human-readable reason for the switch, shown in the run's progress notes.
@@ -8655,8 +8522,6 @@ struct PlanValidation {
     /// plan text when it has no checklist) — used to upgrade a misclassified
     /// "simple" ticket before implement.
     mentioned_file_count: usize,
-    /// `(files the plan changes, hard cap)` when the plan is over the cap.
-    over_cap: Option<(usize, usize)>,
     /// Files the plan changes that don't exist in the repo (and aren't
     /// created by a task), when enough are missing to warn about.
     missing_files: Vec<String>,
@@ -8688,18 +8553,10 @@ fn plan_task_files(tasks: &str) -> Vec<PlanTaskFile> {
         .collect()
 }
 
-/// Appended to the ticket for the one narrowed re-plan.
-fn narrow_scope_note(planned: usize, cap: usize) -> String {
-    format!(
-        "\n\n---\nNOTE FROM CODERHELM: the previous plan for this ticket changed {planned} files, \
-         over the limit of {cap}. Plan again and change at most {cap} files: only the files this \
-         ticket strictly requires. Leave out refactors, renames, cleanups and optional follow-ups."
-    )
-}
-
 /// Plan validation — catches bad plans before the expensive Implement pass.
-/// Uses deterministic checks (scope, file existence, plan-text mentions) plus
-/// an LLM repo-fit check as a final safety net.
+/// Uses deterministic checks (file existence, plan-text mentions, task tags)
+/// plus an LLM repo-fit check as a final safety net. How many files a plan
+/// changes is never checked: a run never fails or narrows its scope by size.
 #[allow(clippy::too_many_arguments)]
 async fn validate_plan(
     plan: &plan::PlanResult,
@@ -8714,7 +8571,6 @@ async fn validate_plan(
     usage: &mut TokenUsage,
 ) -> PlanValidation {
     let mut warnings = Vec::new();
-    let mut blocked = false;
     let mut switch_repo: Option<String> = None;
     let mut switch_reason = String::new();
     let mut missing_files: Vec<String> = Vec::new();
@@ -8744,10 +8600,10 @@ async fn validate_plan(
     mentioned_files.sort();
     mentioned_files.dedup();
 
-    // The files the plan CHANGES are its checklist's task files. Every path
-    // the text merely mentions ("follow the pattern in X", "see Y") used to
-    // count toward the cap and failed reasonable plans; the regex mentions
-    // remain the fallback for a plan without the checklist format.
+    // The files the plan CHANGES are its checklist's task files. Paths the
+    // text merely mentions ("follow the pattern in X", "see Y") aren't
+    // changes; the regex mentions remain the fallback for a plan without
+    // the checklist format.
     let task_files = plan_task_files(&plan.tasks);
     let new_files: std::collections::HashSet<&str> = task_files
         .iter()
@@ -8760,30 +8616,7 @@ async fn validate_plan(
         task_files.iter().map(|f| f.path.clone()).collect()
     };
 
-    // 1. Scope check
-    let max_plan_files = load_workflow_setting_num(state, team_id, "max_plan_files")
-        .await
-        .unwrap_or(15)
-        .min(30) as usize;
-
-    let mut over_cap = None;
-    if changed_files.len() > max_plan_files + 10 {
-        warnings.push(format!(
-            "This plan modifies {} files — exceeds the hard cap of {}. Please break into smaller tickets.",
-            changed_files.len(),
-            max_plan_files + 10,
-        ));
-        blocked = true;
-        over_cap = Some((changed_files.len(), max_plan_files + 10));
-    } else if changed_files.len() > max_plan_files {
-        warnings.push(format!(
-            "This plan modifies {} files (limit: {}). Consider breaking into smaller tickets.",
-            changed_files.len(),
-            max_plan_files,
-        ));
-    }
-
-    // 2. File existence check (sample up to 10 files to avoid API spam).
+    // File existence check (sample up to 10 files to avoid API spam).
     // Read at HEAD, same as the candidate-repo checks below — reading the
     // current repo at base_branch while candidates get HEAD meant a repo
     // whose default branch isn't the message's base_branch had ALL its
@@ -9137,33 +8970,11 @@ Respond with ONLY one line: either "CORRECT" or "SWITCH owner/name"."#,
 
     PlanValidation {
         warnings,
-        blocked,
         switch_repo,
         switch_reason,
         mentioned_file_count: changed_files.len(),
-        over_cap,
         missing_files,
         file_problems,
-    }
-}
-
-/// Load a numeric workflow setting from SETTINGS#WORKFLOW.
-async fn load_workflow_setting_num(state: &WorkerState, team_id: &str, key: &str) -> Option<u64> {
-    match state
-        .dynamo
-        .get_item()
-        .table_name(&state.config.settings_table_name)
-        .key("pk", AttributeValue::S(team_id.to_string()))
-        .key("sk", AttributeValue::S("SETTINGS#WORKFLOW".to_string()))
-        .send()
-        .await
-    {
-        Ok(output) => output
-            .item()
-            .and_then(|item| item.get(key))
-            .and_then(|v| v.as_n().ok())
-            .and_then(|n| n.parse::<u64>().ok()),
-        Err(_) => None,
     }
 }
 
@@ -10413,9 +10224,37 @@ mod plan_cap_tests {
     }
 
     #[test]
-    fn narrow_note_names_the_cap() {
-        let n = narrow_scope_note(31, 25);
-        assert!(n.contains("31 files") && n.contains("at most 25 files"));
+    fn a_forty_file_plan_is_read_in_full() {
+        // Every file a large mechanical ticket needs stays in the plan:
+        // nothing caps, trims or narrows it by count.
+        let tasks: String = (0..40)
+            .map(|i| format!("- [ ] src/blocks/block_{i:02}.ts: [modify] Add the new field\n"))
+            .collect();
+        let files = plan_task_files(&tasks);
+        assert_eq!(files.len(), 40);
+        assert!(files.iter().all(|f| !f.is_new));
+    }
+
+    #[test]
+    fn plans_are_never_limited_by_file_count() {
+        // No file-count cap, no narrowed re-plan, no "split the ticket"
+        // warning, and the old plan-files workflow setting is never
+        // read (stored values are ignored). Built from pieces so this test
+        // doesn't match itself.
+        let src = include_str!("mod.rs");
+        for gone in [
+            ["max_plan", "_files"].concat(),
+            ["narrow_scope", "_note"].concat(),
+            ["over", "_cap"].concat(),
+            ["smaller", " tickets"].concat(),
+            ["hard cap", " of"].concat(),
+            ["Plan scope", " too large"].concat(),
+            ["Plan validation", " blocked"].concat(),
+        ] {
+            assert!(!src.contains(&gone), "{gone} is back in passes/mod.rs");
+        }
+        let plan_src = include_str!("plan.rs");
+        assert!(!plan_src.contains(&["tasks", " maximum"].concat()));
     }
 }
 

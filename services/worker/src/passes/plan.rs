@@ -219,7 +219,7 @@ This is a simple change. Be extremely efficient:
 - Use 1-2 `search_code` calls to locate the relevant file(s) and line numbers
 - Use `read_file_lines` on the specific section (max 100 lines), NOT whole files
 - You should need 2-4 tool calls total, then output the plan
-- The plan should have 1-2 tasks maximum"#
+- The plan usually has 1-2 tasks; when the change needs more files, list every one"#
         }
         "medium" => {
             r#"## Complexity: MEDIUM (4-10 files)
@@ -228,7 +228,7 @@ This is a medium-sized change. Be efficient:
 - Start with `search_code` to find relevant files, symbols, and line numbers
 - Use `read_file_lines` for targeted reads (max 100 lines each)
 - You should need 4-8 tool calls total
-- The plan should have 2-4 tasks"#
+- One task per file the change needs"#
         }
         _ => {
             r#"## Complexity: COMPLEX (10+ files)
@@ -238,7 +238,7 @@ This is a complex change. Research thoroughly but stay focused:
 - Use `list_directory` only if you need to understand a module's structure
 - Use `read_file_lines` for targeted reads (max 100 lines each)
 - Map out the affected code paths before planning
-- The plan should have 3-6 tasks"#
+- One task per file the change needs, however many that is"#
         }
     };
 
@@ -311,6 +311,12 @@ Otherwise, generate four openspec files:
    Tasks should be atomic and ordered. Include the full file path from the repo root in every task. \
 Only include tasks that can be accomplished by writing code (creating files, editing files, updating config). \
 Do NOT include manual verification tasks, post-deploy checks, browser testing, or anything requiring human interaction.
+
+   **Scope:** a task changes a file the ticket names or the change needs (including its tests, \
+migrations and generated output). Every file the ticket names gets its task, and there is no \
+limit on how many files a plan changes: never leave a needed file out to keep the plan small. \
+Leave out padding: refactors, renames, cleanups or optional follow-ups the ticket didn't ask for \
+and the change doesn't need.
 
    **Multi-repo:** If the issue requires changes in MORE THAN ONE repo, group tasks under `## owner/repo` headers:
    ```
