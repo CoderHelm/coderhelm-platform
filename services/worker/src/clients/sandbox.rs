@@ -215,9 +215,45 @@ impl NoResults {
     }
 }
 
+/// Builds of a run whose network call the allowlist refused, in this
+/// process: a later step of the same run that can't start a build of its
+/// own (out of time) still reports the refused host, not the change.
+pub struct EgressBlocks;
+
+type EgressBlockEntry = (String, common::stop_rules::tooling::ToolingFailure);
+
+static EGRESS_BLOCKS: std::sync::Mutex<Vec<EgressBlockEntry>> = std::sync::Mutex::new(Vec::new());
+
+impl EgressBlocks {
+    /// Keep the run's latest refused build.
+    pub fn record(run_id: &str, failure: &common::stop_rules::tooling::ToolingFailure) {
+        let Ok(mut v) = EGRESS_BLOCKS.lock() else {
+            return;
+        };
+        v.retain(|e| e.0 != run_id);
+        if v.len() >= 200 {
+            v.remove(0);
+        }
+        v.push((run_id.to_string(), failure.clone()));
+    }
+
+    /// The run's latest refused build, if any.
+    pub fn last(run_id: &str) -> Option<common::stop_rules::tooling::ToolingFailure> {
+        let v = EGRESS_BLOCKS.lock().ok()?;
+        v.iter().find(|e| e.0 == run_id).map(|e| e.1.clone())
+    }
+
+    /// A build of the run ran cleanly: an earlier refusal no longer stands.
+    pub fn clear(run_id: &str) {
+        if let Ok(mut v) = EGRESS_BLOCKS.lock() {
+            v.retain(|e| e.0 != run_id);
+        }
+    }
+}
+
 const MARKER_CODEGEN_END: &str = "CODERHELM_CODEGEN_END exit=";
-const MARKER_CODEGEN_UPLOADED: &str = "CODERHELM_CODEGEN_UPLOADED";
-const MARKER_CODEGEN_UPLOAD_FAILED: &str = "CODERHELM_CODEGEN_UPLOAD_FAILED";
+const MARKER_CODEGEN_UPLOADED: &str = "===CODERHELM_CODEGEN_UPLOADED===";
+const MARKER_CODEGEN_UPLOAD_FAILED: &str = "===CODERHELM_CODEGEN_UPLOAD_FAILED===";
 /// Caps on captured codegen output (regenerated files are large but bounded).
 const MAX_CODEGEN_FILES: usize = 40;
 const MAX_CODEGEN_FILE_BYTES: u64 = 5 * 1024 * 1024;
@@ -258,6 +294,50 @@ pub struct SandboxClient<'a> {
     /// The team's network allowlist (comma separated), when its sandbox
     /// network is limited. The build starts the allowlist proxy with it.
     egress: Option<String>,
+    /// Hosts the repository's generators reach (a CMS API, a remote schema),
+    /// added to the list for builds that run a generator: every codegen
+    /// build, and a check build whose command runs one of `generator_cmds`.
+    generator_hosts: Vec<String>,
+    /// The commands that run the repository's generators.
+    generator_cmds: Vec<String>,
+}
+
+/// The allowlist one build gets: the team's list (None: the network is
+/// open, the team's choice), plus the generator hosts when the build runs a
+/// generator. Only those hosts are added; a limited network stays limited.
+pub fn build_allowlist(
+    team: Option<&str>,
+    generator_hosts: &[String],
+    runs_generator: bool,
+) -> Option<String> {
+    let team = team?;
+    let mut list: Vec<String> = team
+        .split(',')
+        .map(str::trim)
+        .filter(|d| !d.is_empty())
+        .map(str::to_string)
+        .collect();
+    if runs_generator {
+        for h in generator_hosts {
+            if !common::agent_policy::sandbox::domain_allowed(&list, h) {
+                list.push(h.clone());
+            }
+        }
+    }
+    Some(list.join(","))
+}
+
+/// Whether a check command runs one of the repository's generators.
+pub fn runs_generator(checks_cmd: &str, generator_cmds: &[String]) -> bool {
+    generator_cmds
+        .iter()
+        .any(|g| !g.trim().is_empty() && checks_cmd.contains(g.trim()))
+}
+
+/// A log line that is exactly `marker` (the build prints its markers on
+/// lines of their own; the echoed buildspec holds them inside an `echo`).
+fn printed(log: &str, marker: &str) -> bool {
+    log.lines().any(|l| l.trim() == marker)
 }
 
 /// The proxy the build starts when the network is limited.
@@ -271,16 +351,33 @@ impl<'a> SandboxClient<'a> {
         self
     }
 
+    /// The hosts the repository's generators need and the commands that run
+    /// them: codegen builds reach those hosts too, and so does a check build
+    /// whose command runs a generator. Nothing changes when the network is
+    /// open.
+    pub fn with_generator_hosts(mut self, hosts: Vec<String>, cmds: Vec<String>) -> Self {
+        self.generator_hosts = hosts;
+        self.generator_cmds = cmds;
+        self
+    }
+
     /// The environment that turns the allowlist proxy on, when limited.
+    /// `cmd` is a check build's command; None for a codegen build.
     fn egress_env(
         &self,
+        cmd: Option<&str>,
     ) -> Result<Vec<EnvironmentVariable>, Box<dyn std::error::Error + Send + Sync>> {
         use base64::Engine;
-        let Some(allow) = &self.egress else {
+        let gen = cmd.is_none_or(|c| runs_generator(c, &self.generator_cmds));
+        let Some(allow) = build_allowlist(self.egress.as_deref(), &self.generator_hosts, gen)
+        else {
             return Ok(Vec::new());
         };
+        if gen && !self.generator_hosts.is_empty() {
+            info!(hosts = ?self.generator_hosts, "sandbox: generator hosts allowed for this build");
+        }
         Ok(vec![
-            env_var("EGRESS_ALLOW", allow)?,
+            env_var("EGRESS_ALLOW", &allow)?,
             env_var(
                 "EGRESS_PROXY_B64",
                 &base64::engine::general_purpose::STANDARD.encode(EGRESS_PROXY),
@@ -302,6 +399,8 @@ impl<'a> SandboxClient<'a> {
             bucket,
             project,
             egress: None,
+            generator_hosts: Vec::new(),
+            generator_cmds: Vec::new(),
         }
     }
 
@@ -471,7 +570,7 @@ impl<'a> SandboxClient<'a> {
             env_var("SANDBOX_PUT_URL", &self.presigned_put(out_key).await?)?,
             env_var("CODEGEN_CMD", codegen_cmd)?,
         ];
-        env.extend(self.egress_env()?);
+        env.extend(self.egress_env(None)?);
         if let Some(v) = node_version {
             env.push(env_var("NODE_VERSION", v)?);
         }
@@ -590,7 +689,7 @@ impl<'a> SandboxClient<'a> {
         let output = common::tail_str(&full, MAX_OUTPUT_CHARS).to_string();
         // Codegen changed files but could not hand them back: that is not
         // "nothing to regenerate", and must not be reported as a clean pass.
-        if full.contains(MARKER_CODEGEN_UPLOAD_FAILED) {
+        if printed(&full, MARKER_CODEGEN_UPLOAD_FAILED) {
             return Ok(CodegenOutcome::not_run(format!(
                 "codegen ran but its changed files could not be uploaded\n{output}"
             )));
@@ -598,7 +697,7 @@ impl<'a> SandboxClient<'a> {
         // If the build logged an upload but the first artifact read came back empty
         // (a transient S3 read), try once more — those changes are real and must
         // not be dropped as "nothing to regenerate".
-        if full.contains(MARKER_CODEGEN_UPLOADED) {
+        if printed(&full, MARKER_CODEGEN_UPLOADED) {
             let retry = self.download_changed(out_key).await.unwrap_or_default();
             if !retry.is_empty() {
                 return Ok(CodegenOutcome {
@@ -676,7 +775,7 @@ impl<'a> SandboxClient<'a> {
             env_var("SANDBOX_GET_URL", &self.presigned_get(key).await?)?,
             env_var("CHECKS_CMD", checks_cmd)?,
         ];
-        env.extend(self.egress_env()?);
+        env.extend(self.egress_env(Some(checks_cmd))?);
         // The buildspec switches Node to this via `n` before running checks, so
         // "green in the sandbox" tracks the repo's real toolchain (it defaults
         // to 20 when unset). Prevents false REDs like a Next.js repo needing
@@ -1101,6 +1200,61 @@ mod tests {
         // Codegen reads its marker the same way.
         let gen = build_log("===CODERHELM_CODEGEN_END exit=0===\n");
         assert_eq!(parse_marker_exit(&gen, MARKER_CODEGEN_END), Some(0));
+    }
+
+    #[test]
+    fn the_upload_markers_count_only_when_printed_not_echoed() {
+        // The incident: the echoed script holds the upload-failed marker,
+        // so every codegen build without an artifact read "could not be
+        // uploaded" and the generator's own failure was never seen.
+        let echoed = format!(
+            "{}===CODERHELM_CODEGEN_END exit=1===\n",
+            build_log("")
+                .replace(
+                    "fi\ndownload:",
+                    "  echo \"===CODERHELM_CODEGEN_UPLOADED===\"; else echo \"===CODERHELM_CODEGEN_UPLOAD_FAILED===\"; fi\nfi\ndownload:",
+                )
+        );
+        assert!(echoed.contains(MARKER_CODEGEN_UPLOAD_FAILED));
+        assert!(!printed(&echoed, MARKER_CODEGEN_UPLOAD_FAILED));
+        assert!(!printed(&echoed, MARKER_CODEGEN_UPLOADED));
+        let real = build_log("===CODERHELM_CODEGEN_UPLOAD_FAILED===\n");
+        assert!(printed(&real, MARKER_CODEGEN_UPLOAD_FAILED));
+    }
+
+    #[test]
+    fn generator_hosts_join_the_team_list_only_for_builds_that_run_a_generator() {
+        let team = "registry.npmjs.org,github.com";
+        let hosts = vec!["api.sanity.io".to_string(), "api.github.com".to_string()];
+        assert_eq!(
+            build_allowlist(Some(team), &hosts, true).as_deref(),
+            // api.github.com is already covered by github.com.
+            Some("registry.npmjs.org,github.com,api.sanity.io")
+        );
+        assert_eq!(
+            build_allowlist(Some(team), &hosts, false).as_deref(),
+            Some(team)
+        );
+        // An open network stays open; nothing is limited on the team's behalf.
+        assert_eq!(build_allowlist(None, &hosts, true), None);
+        let cmds = vec!["pnpm run typegen".to_string()];
+        assert!(runs_generator(
+            "cd apps/studio && pnpm run typegen && pnpm run lint",
+            &cmds
+        ));
+        assert!(!runs_generator("pnpm run lint", &cmds));
+        assert!(!runs_generator("pnpm run lint", &["  ".to_string()]));
+    }
+
+    #[test]
+    fn a_refused_build_is_kept_for_the_run_until_one_runs_clean() {
+        let run = "test-run-egress-blocks";
+        assert_eq!(EgressBlocks::last(run), None);
+        let f = common::stop_rules::tooling::ToolingFailure::new("pnpm run typegen", "blocked");
+        EgressBlocks::record(run, &f);
+        assert_eq!(EgressBlocks::last(run), Some(f));
+        EgressBlocks::clear(run);
+        assert_eq!(EgressBlocks::last(run), None);
     }
 
     #[test]

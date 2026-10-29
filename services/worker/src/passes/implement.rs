@@ -376,6 +376,20 @@ pub async fn run(
     } else {
         Vec::new()
     };
+    // The hosts the repository's generators reach (a CMS API, a remote
+    // schema): codegen builds, and checks that run a generator, may reach
+    // them on top of the team's list.
+    let sandbox = match sandbox {
+        Some(sb) if codegen_cmd.is_some() => {
+            let repo =
+                super::generators::load(github, &msg.repo_owner, &msg.repo_name, branch).await;
+            Some(sb.with_generator_hosts(
+                super::generators::required_hosts(&repo, &codegen_env),
+                super::generators::generator_commands(&repo),
+            ))
+        }
+        other => other,
+    };
 
     // Purely bot/CI-driven fix cycles are scoped to the files the PR already
     // changed: a lint/type warning in an untouched file pre-exists on the base
@@ -2332,13 +2346,17 @@ impl<'a> WriteToolExecutor<'a> {
                     std::sync::atomic::Ordering::SeqCst,
                 );
                 *self.check_results.lock().unwrap() = lines.clone();
-                Ok(json!(checks_report(
+                let mut report = checks_report(
                     &lines,
                     o.passed,
                     o.exit_code,
                     !steps.iter().any(|s| s.kinds.contains(&CheckKind::Tests)),
-                    &o.output
-                )))
+                    &o.output,
+                );
+                if let Some(note) = blocked_check_note(o.passed, &o.output) {
+                    report = format!("{note}\n\n{report}");
+                }
+                Ok(json!(report))
             }
             Ok(o) => {
                 let n = if o.broken {
@@ -2449,7 +2467,18 @@ impl<'a> WriteToolExecutor<'a> {
             )
             .await
         {
+            Ok(o) if !o.passed && blocked_codegen(cmd, &o.output).is_some() => {
+                let f = blocked_codegen(cmd, &o.output).unwrap_or_default();
+                crate::clients::sandbox::EgressBlocks::record(run_id, &f);
+                Ok(json!(format!(
+                    "Codegen FAILED because {} This is the sandbox's network, not your change: \
+                     don't edit code to work around it and don't hand-write the generated \
+                     files. Finish the change; the run reports the blocked host.",
+                    f.error
+                )))
+            }
             Ok(o) if o.ran && o.passed => {
+                crate::clients::sandbox::EgressBlocks::clear(run_id);
                 if o.changed.is_empty() {
                     return Ok(json!(format!(
                         "Codegen ran cleanly but changed no files (nothing to regenerate). \
@@ -2513,6 +2542,28 @@ impl<'a> WriteToolExecutor<'a> {
             Err(e) => Ok(json!(format!("Codegen error: {e}."))),
         }
     }
+}
+
+/// What the agent reads first when a failing check couldn't connect to a
+/// host the sandbox's network allowlist refused: the network, not the code.
+fn blocked_check_note(passed: bool, output: &str) -> Option<String> {
+    use common::stop_rules::tooling;
+    let hosts = tooling::blocked_hosts(output);
+    let err = tooling::network_error(output);
+    if passed || hosts.is_empty() || err.is_none() {
+        return None;
+    }
+    Some(format!(
+        "NETWORK BLOCKED: {} A failure from that connection is not a failure of your change: \
+         don't change code to work around it.",
+        tooling::blocked_message("A check", &hosts, err.as_deref())
+    ))
+}
+
+/// A failed codegen build that couldn't reach a host the sandbox's network
+/// allowlist refused.
+fn blocked_codegen(cmd: &str, output: &str) -> Option<common::stop_rules::tooling::ToolingFailure> {
+    common::stop_rules::tooling::egress_failure("the generator", cmd, output)
 }
 
 // ─── Combined tool executor (write + MCP) ───────────────────

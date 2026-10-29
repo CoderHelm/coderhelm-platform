@@ -121,9 +121,118 @@ fn missing_package(lower_line: &str, line: &str) -> Option<String> {
     package.then_some(name)
 }
 
+/// The line the sandbox's network allowlist proxy prints for a host it
+/// refused (`CODERHELM_EGRESS_BLOCKED <host>`).
+pub const EGRESS_BLOCKED: &str = "CODERHELM_EGRESS_BLOCKED";
+
+/// Where a team allows a domain, as the run names it.
+pub const EGRESS_SETTING: &str =
+    "the Network list in Settings, Agent permissions, Advanced, Sandbox";
+
+/// The hosts the sandbox's network allowlist refused, in the order the
+/// build printed them, once each. Only a line of its own counts: the build
+/// log also echoes the script that greps for the marker.
+pub fn blocked_hosts(output: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for line in output.lines() {
+        let Some(rest) = line.trim().strip_prefix(EGRESS_BLOCKED) else {
+            continue;
+        };
+        let Some(host) = rest.strip_prefix(' ').map(str::trim) else {
+            continue;
+        };
+        let plain = !host.is_empty()
+            && host.len() <= 253
+            && host
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | ':'));
+        let host = host.to_ascii_lowercase();
+        if plain && !out.contains(&host) {
+            out.push(host);
+        }
+    }
+    out
+}
+
+/// The first line of `output` that says a network call failed (a proxy
+/// that refused the tunnel, a refused or unresolved connection), trimmed.
+pub fn network_error(output: &str) -> Option<String> {
+    output
+        .lines()
+        .map(str::trim)
+        .find(|l| {
+            let lower = l.to_lowercase();
+            !lower.starts_with(&EGRESS_BLOCKED.to_lowercase())
+                && (lower.contains("tunneling socket")
+                    || lower.contains("econnrefused")
+                    || lower.contains("enotfound")
+                    || lower.contains("econnreset")
+                    || lower.contains("etimedout")
+                    || lower.contains("eai_again")
+                    || lower.contains("getaddrinfo")
+                    || lower.contains("socket hang up")
+                    || lower.contains("fetch failed")
+                    || lower.contains("403 forbidden")
+                    || lower.contains("proxy authentication")
+                    || (lower.contains("statuscode=403") && lower.contains("socket"))
+                    || lower.contains("could not resolve host")
+                    || lower.contains("failed to connect to"))
+        })
+        .map(|l| crate::truncate_str(l, 240).to_string())
+}
+
+/// What a refused host comes to, in the run's words: `who` couldn't reach
+/// it (blocked by the sandbox network allowlist), the error it printed, and
+/// how to allow it.
+pub fn blocked_message(who: &str, hosts: &[String], error: Option<&str>) -> String {
+    let mut names = hosts.iter().take(3).cloned().collect::<Vec<_>>().join(", ");
+    if hosts.len() > 3 {
+        names.push_str(&format!(" and {} more", hosts.len() - 3));
+    }
+    let mut s = format!("{who} couldn't reach {names} (blocked by the sandbox network allowlist)");
+    if let Some(e) = error.filter(|e| !e.trim().is_empty()) {
+        s.push_str(&format!(": {}", e.trim()));
+    }
+    let it = if hosts.len() == 1 { "it" } else { "them" };
+    s.push_str(&format!(
+        ". This is the sandbox's network setting, not the change. To allow {it}, add {names} to \
+         {EGRESS_SETTING}."
+    ));
+    s
+}
+
+/// A failed command whose output shows the sandbox refused a host: the
+/// tooling failure that names the host, the command and its error. `who`
+/// says what was running ("the generator", "the check").
+pub fn egress_failure(who: &str, command: &str, output: &str) -> Option<ToolingFailure> {
+    let hosts = blocked_hosts(output);
+    if hosts.is_empty() {
+        return None;
+    }
+    let error = network_error(output);
+    Some(ToolingFailure::new(
+        command,
+        &blocked_message(who, &hosts, error.as_deref()),
+    ))
+}
+
 /// The first line of `output` that says the run's tooling failed, trimmed;
-/// `None` when nothing does.
+/// `None` when nothing does. A host the sandbox refused, with a network
+/// error in the same output, comes first: the command failed because it
+/// couldn't connect, not because of the code.
 pub fn signature(output: &str) -> Option<String> {
+    let hosts = blocked_hosts(output);
+    if !hosts.is_empty() {
+        if let Some(err) = network_error(output) {
+            return Some(
+                crate::truncate_str(
+                    &blocked_message("The command", &hosts, Some(&err)),
+                    MAX_ERROR_CHARS,
+                )
+                .to_string(),
+            );
+        }
+    }
     for line in output.lines() {
         let l = line.trim();
         if l.is_empty() {
@@ -719,5 +828,66 @@ mod tests {
             ]
         })];
         assert_eq!(tool_outputs(&log), vec!["sh: 1: tsc: not found", "ok"]);
+    }
+
+    /// A generator's sandbox log when the allowlist refused its API host.
+    const BLOCKED_LOG: &str = "[Container] Running command if [ -f /tmp/egress.log ]; then grep CODERHELM_EGRESS_BLOCKED /tmp/egress.log | sort -u | head -20; fi\n\
+         > sanity schema extract --enforce-required-fields\n\
+         SchemaExtractionError: tunneling socket could not be established, statusCode=403\n\
+         ===CODERHELM_CODEGEN_END exit=1===\n\
+         CODERHELM_EGRESS_BLOCKED abc123.api.example.io\n\
+         CODERHELM_EGRESS_BLOCKED abc123.api.example.io\n";
+
+    #[test]
+    fn a_refused_host_is_read_from_its_own_line_only() {
+        assert_eq!(blocked_hosts(BLOCKED_LOG), vec!["abc123.api.example.io"]);
+        assert!(blocked_hosts("grep CODERHELM_EGRESS_BLOCKED /tmp/egress.log").is_empty());
+        assert!(blocked_hosts("CODERHELM_EGRESS_BLOCKED $(rm -rf /)").is_empty());
+        assert!(blocked_hosts("all good").is_empty());
+    }
+
+    #[test]
+    fn a_blocked_generator_is_a_tooling_failure_naming_the_host() {
+        let f = egress_failure(
+            "the generator",
+            "cd apps/web && pnpm run typegen",
+            BLOCKED_LOG,
+        )
+        .unwrap();
+        assert_eq!(f.command, "cd apps/web && pnpm run typegen");
+        assert!(f.error.starts_with(
+            "the generator couldn't reach abc123.api.example.io (blocked by the sandbox network \
+             allowlist): SchemaExtractionError: tunneling socket could not be established"
+        ));
+        assert!(f.error.contains(EGRESS_SETTING));
+        assert!(!f.error.contains("regenerated"));
+        // The run page reads it back from the run's reason.
+        assert_eq!(ToolingFailure::from_reason(&f.reason()), Some(f.clone()));
+        assert_eq!(egress_failure("the generator", "x", "error TS2322"), None);
+    }
+
+    #[test]
+    fn a_failing_check_that_could_not_connect_is_tooling_not_the_change() {
+        let lines = vec!["- test: FAIL (exit 1), `npm test`".to_string()];
+        let out = "FAIL src/api.test.ts\nError: connect ECONNREFUSED 10.0.0.1:443\nCODERHELM_EGRESS_BLOCKED api.vendor.example\n";
+        let f = from_check_lines(&lines, out).unwrap();
+        assert_eq!(f.command, "npm test");
+        assert!(f.error.contains(
+            "couldn't reach api.vendor.example (blocked by the sandbox network allowlist)"
+        ));
+        // A refused host beside a real code error, with no failed connection,
+        // stays the code's.
+        let code = format!("{CODE_ERROR}\nCODERHELM_EGRESS_BLOCKED telemetry.example.com\n");
+        assert_eq!(from_check_lines(&lines, &code), None);
+    }
+
+    #[test]
+    fn many_refused_hosts_are_named_briefly() {
+        let hosts: Vec<String> = (1..=5).map(|i| format!("h{i}.example.com")).collect();
+        let m = blocked_message("the check", &hosts, None);
+        assert!(m.starts_with(
+            "the check couldn't reach h1.example.com, h2.example.com, h3.example.com and 2 more"
+        ));
+        assert!(m.contains("To allow them"));
     }
 }

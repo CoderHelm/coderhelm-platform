@@ -20,7 +20,10 @@ use std::collections::HashMap;
 
 use tracing::{info, warn};
 
+use common::stop_rules::tooling::{self, ToolingFailure};
+
 use crate::clients::github::{FileOp, GitHubClient};
+use crate::clients::sandbox::EgressBlocks;
 use crate::passes::plan_coverage::Work;
 
 /// The tool a generator runs (a package script counts as the tool it runs).
@@ -665,6 +668,136 @@ pub fn all_command(repo: &RepoFiles) -> Option<String> {
     })
 }
 
+// ── Network: the hosts a generator must reach ───────────────────────────────
+
+/// The host of an `http(s)://` URL, lowercased, when it is a plain public
+/// domain (not localhost, not an IP address, no template placeholder).
+fn url_host(url: &str) -> Option<String> {
+    let lower = url.to_ascii_lowercase();
+    let at = lower
+        .find("https://")
+        .map(|i| i + "https://".len())
+        .or_else(|| lower.find("http://").map(|i| i + "http://".len()))?;
+    // A templated subdomain (`https://${projectId}.api.example.io/...`):
+    // the fixed domain after it covers every value.
+    let mut rest = &lower[at..];
+    if rest.starts_with("${") || rest.starts_with("{{") {
+        let close = rest.find('}')?;
+        rest = rest[close..].trim_start_matches('}').strip_prefix('.')?;
+    }
+    let authority: String = rest
+        .chars()
+        .take_while(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '@' | ':' | '_'))
+        .collect();
+    let host = authority.rsplit('@').next()?;
+    let host = host.split(':').next()?.trim_end_matches('.').to_string();
+    let numeric = host.chars().all(|c| c.is_ascii_digit() || c == '.');
+    (common::agent_policy::sandbox::valid_domain(&host) && !numeric && !host.starts_with("*."))
+        .then_some(host)
+}
+
+/// Every `http(s)://` host a text names.
+fn url_hosts(text: &str) -> Vec<String> {
+    text.split(|c: char| c.is_whitespace() || matches!(c, '`' | '<' | '>' | '[' | ']'))
+        .filter(|w| w.contains("://"))
+        .filter_map(url_host)
+        .collect()
+}
+
+/// The hosts a generator of `kind` reaches while it runs, beyond the
+/// package registries: Sanity's schema extract and typegen call the
+/// project's API (`<projectId>.api.sanity.io`, covered by `api.sanity.io`),
+/// Prisma downloads its engines, buf runs remote plugins.
+fn kind_hosts(kind: GenKind) -> &'static [&'static str] {
+    match kind {
+        GenKind::Sanity => &["api.sanity.io", "apicdn.sanity.io"],
+        GenKind::Prisma => &["binaries.prisma.sh"],
+        GenKind::Protobuf => &["buf.build"],
+        GenKind::GraphqlCodegen | GenKind::OpenApi | GenKind::Documented => &[],
+    }
+}
+
+/// The hosts one generator needs: its kind's own, and for generators that
+/// read a remote schema or spec (GraphQL codegen, OpenAPI), the hosts of the
+/// URLs its command, its config or its package script names.
+pub fn generator_hosts(g: &Generator, repo: &RepoFiles) -> Vec<String> {
+    let mut out: Vec<String> = kind_hosts(g.kind).iter().map(|h| h.to_string()).collect();
+    if matches!(g.kind, GenKind::GraphqlCodegen | GenKind::OpenApi) {
+        out.extend(url_hosts(&g.command));
+        let mut paths: Vec<&String> = repo.files.keys().collect();
+        paths.sort();
+        for p in paths {
+            let text = &repo.files[p];
+            let b = base_name(p);
+            if g.kind == GenKind::GraphqlCodegen && CODEGEN_CONFIGS.contains(&b) {
+                // The `schema:` value: a URL, a list of them, or a map
+                // keyed by them (with headers under each).
+                if let Some(sec) = section(text, "schema") {
+                    out.extend(url_hosts(&sec.join("\n")));
+                }
+            } else if b == "openapitools.json" && g.kind == GenKind::OpenApi {
+                for line in text.lines().filter(|l| l.to_lowercase().contains("spec")) {
+                    out.extend(url_hosts(line));
+                }
+            } else if b == "package.json" {
+                let Ok(pkg) = serde_json::from_str::<serde_json::Value>(text) else {
+                    continue;
+                };
+                for (name, cmd) in pkg["scripts"].as_object().into_iter().flatten() {
+                    if is_generator_script(name) && g.command.contains(name.as_str()) {
+                        out.extend(url_hosts(cmd.as_str().unwrap_or("")));
+                    }
+                }
+            }
+        }
+    }
+    let mut seen = Vec::new();
+    out.retain(|h| {
+        let new = !seen.contains(h);
+        seen.push(h.clone());
+        new
+    });
+    out
+}
+
+/// The hosts a codegen build of the repository needs: every generator's
+/// (the build runs the repository's generators), and the hosts of URL
+/// values in the repository's public codegen environment (a remote schema
+/// URL set there). Only these hosts are added to the team's list for that
+/// build; the network is never opened.
+pub fn required_hosts(repo: &RepoFiles, env: &[(String, String)]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let hosts = detect(repo)
+        .iter()
+        .flat_map(|g| generator_hosts(g, repo))
+        .chain(env.iter().filter_map(|(_, v)| url_host(v)))
+        .collect::<Vec<_>>();
+    for h in hosts {
+        if !out.contains(&h) {
+            out.push(h);
+        }
+    }
+    out
+}
+
+/// The commands that run the repository's generators, as a check command
+/// would name them (`pnpm run typegen`, `prisma generate`): a check build
+/// whose command runs one gets the generator hosts too.
+pub fn generator_commands(repo: &RepoFiles) -> Vec<String> {
+    detect(repo)
+        .iter()
+        .map(|g| {
+            g.command
+                .rsplit("&& ")
+                .next()
+                .unwrap_or(&g.command)
+                .trim()
+                .to_string()
+        })
+        .filter(|c| !c.is_empty())
+        .collect()
+}
+
 /// The generators whose inputs the change touches, with those files. A file
 /// the generator itself writes is not an input change.
 pub fn affected<'a>(
@@ -694,6 +827,18 @@ fn list(items: &[String], max: usize) -> String {
         s.push(format!("{} more", items.len() - max));
     }
     s.join(", ")
+}
+
+/// Why a generator whose outputs the change lacks couldn't settle it: it
+/// didn't run here, and why. The generator never ran, so this never says
+/// the change failed to regenerate them.
+pub fn not_run_reason(g: &Generator, why: &str) -> String {
+    format!(
+        "its generated files ({}) are not in the change and the generator couldn't run here \
+         to regenerate them ({}).",
+        list(&g.outputs, 3),
+        common::truncate_str(why.lines().next().unwrap_or(why).trim(), 200)
+    )
 }
 
 /// Why the pull request doesn't open, in a sentence.
@@ -1032,14 +1177,25 @@ pub async fn load(github: &GitHubClient, owner: &str, repo: &str, git_ref: &str)
 }
 
 /// What a sandbox run of a generator came to.
+#[derive(Clone)]
 enum Ran {
     /// It ran; these files changed (committed when there were any).
     Regenerated(Vec<String>),
     /// It ran and failed: why, and its output.
     Failed(String, String),
+    /// It failed because the sandbox's network allowlist refused a host it
+    /// needs: the run's tooling, not the change.
+    Blocked(ToolingFailure),
     /// The sandbox isn't set up, is out of time, or the team's policy holds
     /// the command.
     NotRun(String),
+}
+
+/// The hosts a generator build may reach beyond the team's list, and the
+/// commands that run the repository's generators.
+struct Network<'a> {
+    hosts: &'a [String],
+    cmds: &'a [String],
 }
 
 async fn run_in_sandbox(
@@ -1047,6 +1203,7 @@ async fn run_in_sandbox(
     g: &Generator,
     cmd: &str,
     env: &[(String, String)],
+    net: &Network<'_>,
     attempt: usize,
 ) -> Ran {
     let state = w.state;
@@ -1069,7 +1226,8 @@ async fn run_in_sandbox(
         &state.config.sandbox_bucket_name,
         &state.config.sandbox_project_name,
     )
-    .with_egress(crate::agent::policy::sandbox_egress(state, &w.msg.team_id).await);
+    .with_egress(crate::agent::policy::sandbox_egress(state, &w.msg.team_id).await)
+    .with_generator_hosts(net.hosts.to_vec(), net.cmds.to_vec());
     if !sandbox.has_time(w.deadline) {
         return Ran::NotRun("not enough time left".into());
     }
@@ -1100,7 +1258,15 @@ async fn run_in_sandbox(
         )
         .await
     {
+        Ok(o)
+            if !o.passed && tooling::egress_failure("the generator", cmd, &o.output).is_some() =>
+        {
+            let f = tooling::egress_failure("the generator", cmd, &o.output).unwrap_or_default();
+            EgressBlocks::record(w.run_id, &f);
+            Ran::Blocked(f)
+        }
         Ok(o) if o.ran && o.passed => {
+            EgressBlocks::clear(w.run_id);
             if o.changed.is_empty() {
                 return Ran::Regenerated(Vec::new());
             }
@@ -1147,6 +1313,9 @@ enum Pass {
     /// A generator failed for public values the codegen environment lacks:
     /// no fix round can settle that, a person sets them.
     MissingEnv(String),
+    /// A generator couldn't reach a host the sandbox's network allowlist
+    /// refused: a tooling failure, never a fix round for the change.
+    Blocked(ToolingFailure),
 }
 
 /// Whether a generator runs through the repository's package scripts (the
@@ -1182,6 +1351,12 @@ async fn regenerate(w: &Work<'_>, attempt: usize, notes: &mut Vec<String>) -> Op
     }
     let scripts_cmd = super::detect_codegen_command(w.github, owner, name, w.branch).await;
     let env = super::load_codegen_env(w.state, &w.msg.team_id, owner, name).await;
+    let hosts = required_hosts(&repo, &env);
+    let cmds = generator_commands(&repo);
+    let net = Network {
+        hosts: &hosts,
+        cmds: &cmds,
+    };
     let mut shared_run: Option<Ran> = None;
     let mut problems = Vec::new();
     for (i, (g, inputs)) in hits.into_iter().enumerate() {
@@ -1189,24 +1364,20 @@ async fn regenerate(w: &Work<'_>, attempt: usize, notes: &mut Vec<String>) -> Op
             (Some(cmd), true) => match &shared_run {
                 // The shared run already counted its files.
                 Some(Ran::Regenerated(_)) => Ran::Regenerated(Vec::new()),
-                Some(Ran::Failed(a, b)) => Ran::Failed(a.clone(), b.clone()),
-                Some(Ran::NotRun(a)) => Ran::NotRun(a.clone()),
+                Some(other) => other.clone(),
                 None => {
-                    let r = run_in_sandbox(w, &g, cmd, &env, attempt * 10 + i).await;
-                    shared_run = Some(match &r {
-                        Ran::Regenerated(p) => Ran::Regenerated(p.clone()),
-                        Ran::Failed(a, b) => Ran::Failed(a.clone(), b.clone()),
-                        Ran::NotRun(a) => Ran::NotRun(a.clone()),
-                    });
+                    let r = run_in_sandbox(w, &g, cmd, &env, &net, attempt * 10 + i).await;
+                    shared_run = Some(r.clone());
                     r
                 }
             },
             _ => {
                 let cmd = sandbox_command(&repo.tree, &g);
-                run_in_sandbox(w, &g, &cmd, &env, attempt * 10 + i).await
+                run_in_sandbox(w, &g, &cmd, &env, &net, attempt * 10 + i).await
             }
         };
         match ran {
+            Ran::Blocked(f) => return Some(Pass::Blocked(f)),
             Ran::Regenerated(paths) => {
                 if paths.is_empty() {
                     notes.push(format!(
@@ -1248,15 +1419,14 @@ async fn regenerate(w: &Work<'_>, attempt: usize, notes: &mut Vec<String>) -> Op
             }
             Ran::NotRun(why) => {
                 info!(generator = %g.name, why, "Generator not run in the sandbox");
+                // An earlier build of this run (the coder's run_codegen, or
+                // the first pass) was refused a host: that is why the output
+                // isn't there, not the change.
+                if let Some(f) = EgressBlocks::last(w.run_id) {
+                    return Some(Pass::Blocked(f));
+                }
                 if outputs_missing(&g, &changed) {
-                    problems.push((
-                        g.clone(),
-                        inputs,
-                        format!(
-                            "its generated files ({}) were not regenerated.",
-                            list(&g.outputs, 3)
-                        ),
-                    ));
+                    problems.push((g.clone(), inputs, not_run_reason(&g, &why)));
                 } else {
                     notes.push(format!(
                         "`{}` reads changed files and couldn't be run here ({why}); check its output",
@@ -1342,6 +1512,7 @@ pub async fn gate(
     let problems = match regenerate(w, 0, &mut notes).await {
         None => return Ok(notes),
         Some(Pass::MissingEnv(why)) => return Err(why),
+        Some(Pass::Blocked(f)) => return Err(f.reason()),
         Some(Pass::Problems(p)) if p.is_empty() => return Ok(notes),
         Some(Pass::Problems(p)) => p,
     };
@@ -1385,6 +1556,7 @@ pub async fn gate(
     let mut notes2 = Vec::new();
     let still = match regenerate(w, 1, &mut notes2).await {
         Some(Pass::MissingEnv(why)) => return Err(why),
+        Some(Pass::Blocked(f)) => return Err(f.reason()),
         Some(Pass::Problems(p)) => p,
         None => Vec::new(),
     };
@@ -1788,5 +1960,85 @@ mod tests {
         assert!(fb.contains("`npm run typegen`"));
         assert!(fb.contains("run_codegen"));
         assert!(fb.contains("`sanity.types.ts`"));
+    }
+
+    /// The observed case: a monorepo's studio typegen script extracts the
+    /// schema through the CMS API, which the default allowlist doesn't list.
+    #[test]
+    fn a_cms_generator_build_reaches_the_cms_api_and_nothing_else() {
+        let r = repo(
+            &[
+                ("package.json", r#"{"scripts":{"dev":"turbo dev"}}"#),
+                (
+                    "apps/studio/package.json",
+                    r#"{"scripts":{"typegen":"sanity schema extract --enforce-required-fields && sanity typegen generate"}}"#,
+                ),
+            ],
+            &["pnpm-lock.yaml"],
+        );
+        let env = vec![
+            ("SANITY_STUDIO_PROJECT_ID".to_string(), "abc123".to_string()),
+            (
+                "SANITY_STUDIO_DATASET".to_string(),
+                "production".to_string(),
+            ),
+        ];
+        assert_eq!(
+            required_hosts(&r, &env),
+            vec!["api.sanity.io".to_string(), "apicdn.sanity.io".to_string()]
+        );
+        // The project's own API host is a subdomain the entry covers.
+        assert!(common::agent_policy::sandbox::domain_allowed(
+            &required_hosts(&r, &env),
+            "abc123.api.sanity.io"
+        ));
+        assert_eq!(generator_commands(&r), vec!["pnpm run typegen".to_string()]);
+    }
+
+    #[test]
+    fn remote_schemas_and_engines_are_named_by_host() {
+        let r = repo(
+            &[
+                (
+                    "codegen.ts",
+                    "const config = {\n  schema: `https://${process.env.PROJECT_ID}.api.example.io/v1/graphql/${process.env.DATASET}/default`,\n  documents: ['src/**/*.graphql'],\n  generates: { './src/gql/': { preset: 'client' } },\n}\nexport default config\n",
+                ),
+                ("prisma/schema.prisma", "generator client {}"),
+            ],
+            &[],
+        );
+        let hosts = required_hosts(&r, &[]);
+        assert!(hosts.contains(&"api.example.io".to_string()), "{hosts:?}");
+        assert!(
+            hosts.contains(&"binaries.prisma.sh".to_string()),
+            "{hosts:?}"
+        );
+        // A URL in the codegen environment (a schema endpoint set there).
+        let env = vec![
+            (
+                "SCHEMA_URL".to_string(),
+                "https://graph.vendor.example/graphql".to_string(),
+            ),
+            ("DATASET".to_string(), "production".to_string()),
+        ];
+        assert!(required_hosts(&r, &env).contains(&"graph.vendor.example".to_string()));
+        // Local, numeric and templated hosts are never added.
+        assert_eq!(url_host("http://localhost:4000/graphql"), None);
+        assert_eq!(url_host("http://10.0.0.5/graphql"), None);
+        assert_eq!(url_host("https://${HOST}/graphql"), None);
+        assert_eq!(
+            url_host("'https://user@Api.Example.com:8443/x':"),
+            Some("api.example.com".into())
+        );
+        // A repository with no generator adds nothing.
+        assert!(required_hosts(&repo(&[("package.json", "{}")], &[]), &[]).is_empty());
+    }
+
+    #[test]
+    fn a_generator_that_did_not_run_is_not_said_to_have_failed_the_change() {
+        let why = not_run_reason(&sanity_gen(), "not enough time left");
+        assert!(why.contains("couldn't run here"));
+        assert!(why.contains("not enough time left"));
+        assert!(!why.contains("were not regenerated"));
     }
 }
