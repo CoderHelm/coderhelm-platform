@@ -485,11 +485,17 @@ impl Abilities {
              1. The change does it (`by: this_pr`, a task in tasks.md): a content or data migration \
              that replaces the existing item by key, test fixtures or end-to-end setup that create \
              their own content (the test then never depends on editors), config or registration.\n\
-             2. CoderHelm does it after the PR opens (`by: coderhelm`): start a deploy or end-to-end \
-             workflow listed below, run the confirm query.\n\
-             3. Only what is left goes to a person (`by: person`), each with `why_person` (the \
-             exact permission or connection CoderHelm lacks, or why a person must decide) and \
-             `grant` (how to give CoderHelm that access so it can do it next time).\n",
+             2. CoderHelm does it after the PR opens (`by: coderhelm`), production included: \
+             start a deploy or end-to-end workflow listed below, run a migration or content \
+             mutations through a write connection, run the confirm query. When the team's agent \
+             permissions say to ask, CoderHelm raises an approval card and waits for it; needing \
+             approval is never a reason to hand a step to a person.\n\
+             3. Only what no connection or permission lets CoderHelm do at all goes to a person \
+             (`by: person`), each with `why_person` (the exact connection or permission missing) \
+             and `grant` (how to give CoderHelm that access). Such a requirement is reported as \
+             not done.\n\
+             Give every step `kind` (deploy, e2e, content, migration, verify, other) and `target` \
+             (staging, production): the run decides each step's action from them.\n",
         );
         match &self.source {
             Some(s) => out.push_str(&format!(
@@ -595,6 +601,151 @@ pub struct NoteStep {
     /// CoderHelm did it and it worked.
     #[serde(default)]
     pub done: bool,
+    /// The planner's step kind: `deploy`, `e2e`, `content`, `migration`,
+    /// `verify` or `other`. Decides the action; the step's words are read
+    /// only when it is missing ([`NoteStep::step_kind`]).
+    #[serde(default)]
+    pub kind: String,
+    /// Where the step acts: `staging` or `production`.
+    #[serde(default)]
+    pub target: String,
+    /// For content or a migration CoderHelm runs: the CMS mutations, as the
+    /// CMS's mutate API takes them.
+    #[serde(default)]
+    pub mutations: Vec<Value>,
+    /// For a migration CoderHelm runs: the change's file holding its
+    /// mutations (`.json` array or `.ndjson`), read from the PR branch.
+    #[serde(default)]
+    pub migration: String,
+    /// What CoderHelm's executor is doing with the step (see
+    /// `outside_exec`): waiting on an approval card or a workflow run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run: Option<StepRun>,
+}
+
+/// What a step is, from the planner's structured `kind`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StepKind {
+    /// Deploys the studio, schema or app.
+    Deploy,
+    /// Runs the end-to-end tests.
+    E2e,
+    /// Changes content.
+    Content,
+    /// Runs a content or data migration.
+    Migration,
+    /// A read query that confirms.
+    Verify,
+    Other,
+}
+
+impl StepKind {
+    pub fn parse(s: &str) -> Option<StepKind> {
+        Some(
+            match s
+                .trim()
+                .to_ascii_lowercase()
+                .replace(['-', ' '], "_")
+                .as_str()
+            {
+                "deploy" | "release" => StepKind::Deploy,
+                "e2e" | "end_to_end" | "test" | "tests" => StepKind::E2e,
+                "content" | "data" => StepKind::Content,
+                "migration" | "migrate" => StepKind::Migration,
+                "verify" | "confirm" | "query" => StepKind::Verify,
+                "other" => StepKind::Other,
+                _ => return None,
+            },
+        )
+    }
+
+    /// Whether it changes stored content (by mutations or a migration).
+    pub fn writes(self) -> bool {
+        matches!(self, StepKind::Content | StepKind::Migration)
+    }
+}
+
+/// Where a step acts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Target {
+    Staging,
+    Production,
+}
+
+impl Target {
+    pub fn parse(s: &str) -> Option<Target> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "staging" | "stage" | "preview" | "test" => Some(Target::Staging),
+            "production" | "prod" | "live" => Some(Target::Production),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Target::Staging => "staging",
+            Target::Production => "production",
+        }
+    }
+}
+
+/// The pull request CoderHelm's outside steps run against.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Placement {
+    /// `owner/name`.
+    pub repo: String,
+    pub branch: String,
+    pub pr_number: u64,
+}
+
+/// In a run across several repositories, the one whose pull request carries
+/// the outside steps: the first the steps name (`owner/name`, or the name
+/// alone), else the first in the plan's order. `None` with no repositories.
+pub fn outside_repo<'a>(c: &OutsideChange, repos: &'a [String]) -> Option<&'a String> {
+    let text = c
+        .steps
+        .iter()
+        .map(|s| format!("{} {} {}", s.step, s.how, s.owner))
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase();
+    let named = |r: &&String| {
+        let full = r.to_lowercase();
+        let name = full.rsplit('/').next().unwrap_or(&full).to_string();
+        text.contains(&full)
+            || (name.len() >= 3
+                && (words(&text).any(|w| w == name)
+                    || (name.contains(['-', '_', '.']) && text.contains(&name))))
+    };
+    repos.iter().find(named).or_else(|| repos.first())
+}
+
+/// The executor's record of a step it started (see `outside_exec`).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StepRun {
+    /// `waiting_approval`, `running`, `done` or `failed`.
+    #[serde(default)]
+    pub state: String,
+    /// The approval card the step waits on.
+    #[serde(default)]
+    pub approval_id: String,
+    /// The workflow run it started.
+    #[serde(default)]
+    pub workflow_run_id: u64,
+    #[serde(default)]
+    pub url: String,
+    /// The workflow file it started.
+    #[serde(default)]
+    pub workflow: String,
+    /// The run's conclusion once completed.
+    #[serde(default)]
+    pub conclusion: String,
+    /// The tests that failed, read from the run.
+    #[serde(default)]
+    pub failing: Vec<String>,
+    /// When it was started (RFC 3339).
+    #[serde(default)]
+    pub started_at: String,
 }
 
 impl NoteStep {
@@ -606,12 +757,66 @@ impl NoteStep {
         format!("{} {}", self.step, self.how).to_lowercase()
     }
 
+    /// What the step is: the planner's `kind` when it gave one, else read
+    /// from the step's words.
+    pub fn step_kind(&self) -> StepKind {
+        if let Some(k) = StepKind::parse(&self.kind) {
+            return k;
+        }
+        if self.words_deploy() {
+            StepKind::Deploy
+        } else if self.words_content() {
+            StepKind::Content
+        } else if self.words_e2e() {
+            StepKind::E2e
+        } else if self.words_verify() {
+            StepKind::Verify
+        } else {
+            StepKind::Other
+        }
+    }
+
+    /// Where the step acts: the planner's `target`, else its words.
+    pub fn target(&self) -> Target {
+        if let Some(t) = Target::parse(&self.target) {
+            return t;
+        }
+        let t = self.text();
+        if t.contains("production") || words(&t).any(|w| w == "prod") {
+            Target::Production
+        } else {
+            Target::Staging
+        }
+    }
+
     fn is_deploy(&self) -> bool {
+        self.step_kind() == StepKind::Deploy
+    }
+
+    fn is_content(&self) -> bool {
+        self.step_kind().writes()
+    }
+
+    fn is_production(&self) -> bool {
+        self.target() == Target::Production
+    }
+
+    fn is_e2e_rerun(&self) -> bool {
+        self.step_kind() == StepKind::E2e
+    }
+
+    fn is_verify(&self) -> bool {
+        self.step_kind() == StepKind::Verify
+    }
+
+    // Keyword fallbacks, for a step without a `kind`.
+
+    fn words_deploy(&self) -> bool {
         let t = self.text();
         t.contains("deploy") && (t.contains("studio") || t.contains("schema") || t.contains("cms"))
     }
 
-    fn is_content(&self) -> bool {
+    fn words_content(&self) -> bool {
         let t = self.text();
         let verb = [
             "add", "create", "replace", "update", "set", "fill", "enter", "populate",
@@ -623,26 +828,18 @@ impl NoteStep {
         ]
         .iter()
         .any(|n| words(&t).any(|w| w.trim_end_matches('s') == *n));
-        verb && noun && !self.is_deploy()
+        verb && noun && !self.words_deploy()
     }
 
-    fn is_production(&self) -> bool {
-        let t = self.text();
-        t.contains("production") || words(&t).any(|w| w == "prod")
-    }
-
-    fn is_e2e_rerun(&self) -> bool {
+    fn words_e2e(&self) -> bool {
         let t = self.text();
         (t.contains("e2e") || t.contains("end-to-end") || t.contains("end to end"))
             && (t.contains("run") || t.contains("rerun"))
-            && !self.is_content()
     }
 
-    fn is_verify(&self) -> bool {
+    fn words_verify(&self) -> bool {
         let t = self.text();
-        (t.contains("confirm") || t.contains("verify") || t.contains("query"))
-            && !self.is_content()
-            && !self.is_deploy()
+        t.contains("confirm") || t.contains("verify") || t.contains("query")
     }
 }
 
@@ -738,6 +935,23 @@ const NO_LOOK: &[&str] = &[
 fn says_no_look(text: &str) -> bool {
     let t = text.to_lowercase();
     NO_LOOK.iter().any(|p| t.contains(p))
+}
+
+/// Whether a reason for a person is only that the step needs approval
+/// (which CoderHelm asks for itself), not a missing connection.
+fn says_approval(why: &str) -> bool {
+    let t = why.to_lowercase();
+    (t.contains("approval") || t.contains("approve") || t.contains("sign-off"))
+        && !t.contains("connection")
+        && !t.contains("permission")
+        && !t.contains("token")
+        && !t.contains("access")
+}
+
+/// Whether a path names a mutations file CoderHelm can read and run.
+pub fn is_mutations_file(path: &str) -> bool {
+    let p = path.trim().to_ascii_lowercase();
+    p.ends_with(".json") || p.ends_with(".ndjson")
 }
 
 /// Whether a lookup's result lists at least one item.
@@ -855,6 +1069,15 @@ pub fn gaps(c: &OutsideChange, a: &Abilities, plan: PlanFacts) -> Vec<String> {
                     one_line(&s.step)
                 ));
             }
+            // Approval is not a reason: CoderHelm asks for it itself.
+            if says_approval(&s.why_person) {
+                out.push(format!(
+                    "Step {n} goes to a person because it needs approval. CoderHelm asks for \
+                     approval itself (an agent-permissions card a person approves in one click) \
+                     and then does the step: make it `by: coderhelm`. A step goes to a person \
+                     only when no connection or permission exists to do it at all."
+                ));
+            }
             // A person step the change or CoderHelm could do.
             if s.is_deploy() {
                 if let Some(r) = a.startable_deploy() {
@@ -865,7 +1088,21 @@ pub fn gaps(c: &OutsideChange, a: &Abilities, plan: PlanFacts) -> Vec<String> {
                     ));
                 }
             } else if s.is_content() && !s.is_production() {
-                if let Some(d) = &a.migrations_dir {
+                if a.staging_write {
+                    out.push(format!(
+                        "Step {n} changes staging content by hand, and CoderHelm has this \
+                         repository's staging CMS write connection: make it `by: coderhelm` \
+                         (`kind: migration` or `content`, `target: staging`) with the exact \
+                         `mutations`{}; CoderHelm runs it after the staging deploy and then \
+                         runs the confirm query.",
+                        a.migrations_dir
+                            .as_ref()
+                            .map(|d| format!(
+                                " (write the migration in `{d}` as a task too, and name its file in `migration`)"
+                            ))
+                            .unwrap_or_default()
+                    ));
+                } else if let Some(d) = &a.migrations_dir {
                     out.push(format!(
                         "Step {n} changes staging content by hand, but the repository keeps \
                          migrations in `{d}`: write a migration there as a task (it replaces the \
@@ -882,11 +1119,6 @@ pub fn gaps(c: &OutsideChange, a: &Abilities, plan: PlanFacts) -> Vec<String> {
                             .map(|d| format!(" in `{d}`"))
                             .unwrap_or_default()
                     ));
-                } else if a.staging_write {
-                    out.push(format!(
-                        "Step {n} changes staging content, and CoderHelm has this repository's \
-                         staging CMS write connection: make it `by: coderhelm`."
-                    ));
                 }
             } else if s.is_e2e_rerun() {
                 if let Some(r) = a.startable_e2e() {
@@ -901,7 +1133,19 @@ pub fn gaps(c: &OutsideChange, a: &Abilities, plan: PlanFacts) -> Vec<String> {
                 ));
             }
         }
-        if s.is_content() && s.values.is_empty() {
+        if s.doer() == Doer::CoderHelm
+            && s.is_content()
+            && s.mutations.is_empty()
+            && !is_mutations_file(&s.migration)
+        {
+            out.push(format!(
+                "Step {n} (`{}`) has CoderHelm change content but gives nothing to run: put the \
+                 exact CMS mutations in `mutations` (createOrReplace, or patch by id with \
+                 set/unset), or name the change's `.json`/`.ndjson` migration file in `migration`.",
+                one_line(&s.step)
+            ));
+        }
+        if s.is_content() && s.values.is_empty() && s.mutations.is_empty() {
             out.push(format!(
                 "Step {n} (`{}`) changes content without exact values: list each field and value \
                  (reference targets, tab definitions with their settings) in `values` and fields \
@@ -1050,6 +1294,8 @@ pub fn step_line(n: usize, s: &NoteStep) -> (String, String) {
         Doer::CoderHelm if !s.result.trim().is_empty() => {
             let state = if s.done {
                 "Done by CoderHelm"
+            } else if under_way(s) {
+                "Under way"
             } else {
                 "CoderHelm could not do it"
             };
@@ -1212,7 +1458,11 @@ pub fn pr_lines(c: &OutsideChange) -> Vec<(String, String)> {
 /// The ticket note's body: the names and lookup, then every step in order
 /// with its owner, then how to confirm.
 pub fn note_markdown(c: &OutsideChange) -> String {
-    let mut out = String::new();
+    // What is not done comes first, with the access to grant.
+    let mut out = match not_done_block(c) {
+        b if b.is_empty() => String::new(),
+        b => format!("{b}\n"),
+    };
     for l in context_lines(c) {
         out.push_str(&format!("- {l}\n"));
     }
@@ -1251,7 +1501,7 @@ pub fn held(c: &OutsideChange) -> Held {
         match s.doer() {
             Doer::ThisPr => {}
             Doer::CoderHelm => {
-                if !s.done && !s.result.trim().is_empty() {
+                if !s.done && !s.result.trim().is_empty() && !under_way(s) {
                     h.not_done.push(line);
                 }
             }
@@ -1265,6 +1515,110 @@ pub fn held(c: &OutsideChange) -> Held {
         }
     }
     h
+}
+
+/// The questions a person is asked for each step handed out with no
+/// reason, once the plan was sent back and still gives none: the run stops
+/// on them instead of opening a pull request that silently leaves the step.
+pub fn unjustified_questions(c: &OutsideChange) -> Vec<common::run_questions::Question> {
+    c.steps
+        .iter()
+        .enumerate()
+        .filter(|(_, s)| {
+            s.doer() == Doer::Person
+                && (s.why_person.trim().is_empty() || s.grant.trim().is_empty())
+        })
+        .enumerate()
+        .map(|(q, (i, s))| common::run_questions::Question {
+            id: format!("q{}", q + 1),
+            question: format!(
+                "Step {} of the work outside the code (\"{}\") is planned for a person, but \
+                 nothing says why CoderHelm can't do it. Which connection or permission does \
+                 CoderHelm lack for it, or may CoderHelm do it itself?",
+                i + 1,
+                one_line(&s.step)
+            ),
+            why: "A requirement is never handed out silently: CoderHelm either does it, or \
+                  reports it as not done with the exact access to grant."
+                .to_string(),
+            suggestions: vec![
+                "CoderHelm may do it (it asks for approval on the Agent permissions page)"
+                    .to_string(),
+                "A person must do it, because CoderHelm has no connection for it (name it)"
+                    .to_string(),
+            ],
+            decision: String::new(),
+            evidence: Vec::new(),
+        })
+        .collect()
+}
+
+/// The requirements the run leaves not done, each with why and the access
+/// to grant: steps a person holds and CoderHelm steps that didn't work.
+pub fn not_done_lines(c: &OutsideChange) -> Vec<String> {
+    let h = held(c);
+    h.by_person.into_iter().chain(h.not_done).collect()
+}
+
+const NOT_DONE_START: &str = "<!-- coderhelm:not-done:start -->";
+const NOT_DONE_END: &str = "<!-- coderhelm:not-done:end -->";
+/// The heading of the block at the top of the PR and the ticket note.
+pub const NOT_DONE_HEADING: &str =
+    "Not done: this ticket still needs access CoderHelm doesn't have";
+
+/// The block at the top of the PR and the ticket note naming each
+/// requirement not done, why, and the access to grant. Empty when none.
+pub fn not_done_block(c: &OutsideChange) -> String {
+    let lines = not_done_lines(c);
+    if lines.is_empty() {
+        return String::new();
+    }
+    let mut out = format!("**{NOT_DONE_HEADING}**\n\n");
+    for l in lines {
+        out.push_str(&format!(
+            "- {}\n",
+            l.trim_start_matches(|ch: char| ch.is_ascii_digit() || ch == '.')
+                .trim()
+        ));
+    }
+    out
+}
+
+/// The PR body with the not-done block at its top (replaced when there,
+/// removed when nothing is left).
+pub fn with_not_done_top(body: &str, c: &OutsideChange) -> String {
+    let rest = match (body.find(NOT_DONE_START), body.find(NOT_DONE_END)) {
+        (Some(a), Some(b)) if b > a => format!("{}{}", &body[..a], &body[b + NOT_DONE_END.len()..])
+            .trim_start()
+            .to_string(),
+        _ => body.to_string(),
+    };
+    let block = not_done_block(c);
+    if block.is_empty() {
+        return rest;
+    }
+    format!(
+        "{NOT_DONE_START}\n{}\n{NOT_DONE_END}\n\n{rest}",
+        block.trim_end()
+    )
+}
+
+/// Whether a CoderHelm step is still under way (an approval card or a
+/// workflow run it waits on), so the run is not finished.
+pub fn under_way(s: &NoteStep) -> bool {
+    s.doer() == Doer::CoderHelm
+        && !s.done
+        && s.run
+            .as_ref()
+            .is_some_and(|r| r.state == "waiting_approval" || r.state == "running")
+}
+
+/// Whether the note has CoderHelm steps not finished yet: never started, or
+/// under way.
+pub fn unfinished(c: &OutsideChange) -> bool {
+    c.steps.iter().any(|s| {
+        s.doer() == Doer::CoderHelm && !s.done && (s.result.trim().is_empty() || under_way(s))
+    })
 }
 
 // ── Doing the CoderHelm steps ───────────────────────────────────────────────
@@ -1371,170 +1725,111 @@ pub async fn handle(
     })
 }
 
-/// What one CoderHelm step will do, from its text and the repository.
+/// What one CoderHelm step will do, from its kind, target and the
+/// repository. The executor (`outside_exec`) runs it through the team's
+/// agent permissions.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Action {
     /// Start this workflow on the PR branch.
     Dispatch(Route),
-    /// Add this label to the PR.
+    /// Add this label to the PR, which starts the route.
     Label(String, Route),
     /// Run the confirm query.
     Query,
+    /// Write content (mutations or a migration's file) to the target's CMS
+    /// through a write connection.
+    Write(Target),
     /// CoderHelm can't do it: why, and how to grant it.
     Cannot(String),
 }
 
+/// Whether a route deploys staging.
+fn is_staging_route(r: &Route) -> bool {
+    format!("{} {} {}", r.name, r.file, r.command)
+        .to_lowercase()
+        .contains("staging")
+}
+
 /// The action for a CoderHelm step.
 pub fn action_for(s: &NoteStep, a: &Abilities, c: &OutsideChange) -> Action {
-    let pick = |routes: &[Route]| -> Option<Action> {
+    let target = s.target();
+    let pick = |routes: &[Route], fit: &dyn Fn(&Route) -> bool| -> Option<Action> {
+        let ok = |r: &&Route| r.startable() && fit(r);
         let r = routes
             .iter()
-            .filter(|r| r.startable())
+            .filter(ok)
             .find(|r| r.named_in(&format!("{} {}", s.step, s.how)))
-            .or_else(|| routes.iter().find(|r| r.startable()))?
+            .or_else(|| routes.iter().find(ok))?
             .clone();
         Some(match &r.trigger {
             Trigger::Label(l) => Action::Label(l.clone(), r.clone()),
             _ => Action::Dispatch(r),
         })
     };
-    if s.is_deploy() {
-        return pick(&a.deploys).unwrap_or_else(|| {
-            Action::Cannot("the repository has no studio/schema deploy workflow CoderHelm can start (one with workflow_dispatch, or one that runs on a pull request label); add `workflow_dispatch:` to the deploy workflow's triggers".to_string())
-        });
-    }
-    if s.is_e2e_rerun() {
-        return pick(&a.e2e).unwrap_or_else(|| {
+    match s.step_kind() {
+        StepKind::Deploy => {
+            let fit = |r: &Route| match target {
+                Target::Production => !is_staging_route(r),
+                Target::Staging => true,
+            };
+            pick(&a.deploys, &fit).unwrap_or_else(|| {
+                Action::Cannot(format!(
+                    "the repository has no {}deploy workflow CoderHelm can start (one with \
+                     workflow_dispatch, or one that runs on a pull request label); add \
+                     `workflow_dispatch:` to the deploy workflow's triggers",
+                    if target == Target::Production { "production " } else { "" }
+                ))
+            })
+        }
+        StepKind::E2e => pick(&a.e2e, &|_| true).unwrap_or_else(|| {
             Action::Cannot("the end-to-end workflow has no workflow_dispatch trigger; add `workflow_dispatch:` to it so CoderHelm can start it".to_string())
-        });
+        }),
+        StepKind::Content | StepKind::Migration => Action::Write(target),
+        StepKind::Verify => {
+            if a.source.is_some() {
+                Action::Query
+            } else {
+                Action::Cannot("no CMS project id and dataset are named in the repository's config or codegen environment; add them to the codegen environment (Settings, repository, codegen environment)".to_string())
+            }
+        }
+        StepKind::Other => {
+            if a.source.is_some() && c.confirm.as_ref().is_some_and(|f| !f.query.is_empty()) {
+                Action::Query
+            } else {
+                Action::Cannot("CoderHelm has no action for this step".to_string())
+            }
+        }
     }
-    if s.is_verify() || (!s.is_content() && c.confirm.as_ref().is_some_and(|f| !f.query.is_empty()))
-    {
-        return if a.source.is_some() {
-            Action::Query
-        } else {
-            Action::Cannot("no CMS project id and dataset are named in the repository's config or codegen environment; add them to the codegen environment (Settings, repository, codegen environment)".to_string())
-        };
-    }
-    if s.is_content() {
-        return Action::Cannot(if s.is_production() {
-            "CoderHelm never changes production content".to_string()
-        } else if a.staging_write {
-            "content beyond removing dropped fields and setting schema defaults is not written by CoderHelm on staging; write it as a migration in the change".to_string()
-        } else {
-            "this repository has no staging CMS write connection; add one in Settings, repository, Staging CMS (a staging-only write token)".to_string()
-        });
-    }
-    Action::Cannot("CoderHelm has no action for this step".to_string())
 }
 
-/// Does the CoderHelm steps after the pull request opens, recording each
-/// result on its step (and the confirm query's on `confirm`). Returns
-/// whether anything was done.
-#[allow(clippy::too_many_arguments)]
-pub async fn perform(
-    github: &crate::clients::github::GitHubClient,
-    http: &reqwest::Client,
-    owner: &str,
-    repo: &str,
-    branch: &str,
-    pr_number: u64,
-    a: &Abilities,
-    c: &mut OutsideChange,
-) -> bool {
-    let mut any = false;
-    let snapshot = c.clone();
-    for s in c
-        .steps
-        .iter_mut()
-        .filter(|s| s.doer() == Doer::CoderHelm && !s.done)
-    {
-        any = true;
-        match action_for(s, a, &snapshot) {
-            Action::Dispatch(r) => {
-                match github
-                    .dispatch_workflow(
-                        owner,
-                        repo,
-                        r.file.rsplit('/').next().unwrap_or(&r.file),
-                        branch,
-                        &serde_json::json!({}),
-                    )
-                    .await
-                {
-                    Ok(()) => {
-                        let link = github
-                            .list_workflow_runs(
-                                owner,
-                                repo,
-                                r.file.rsplit('/').next().unwrap_or(&r.file),
-                                branch,
-                            )
-                            .await
-                            .ok()
-                            .and_then(|runs| {
-                                runs.first()
-                                    .and_then(|x| x["html_url"].as_str().map(String::from))
-                            })
-                            .unwrap_or_else(|| {
-                                format!("https://github.com/{owner}/{repo}/actions")
-                            });
-                        s.result = format!("started {} on `{branch}`: {link}", r.line());
-                        s.done = true;
-                    }
-                    Err(e) => s.result = format!("starting {} failed: {e}", r.line()),
-                }
-            }
-            Action::Label(l, r) => match github.add_label(owner, repo, pr_number, &l).await {
-                Ok(()) => {
-                    s.result = format!(
-                        "added the `{l}` label to #{pr_number}, which starts {}",
-                        r.line()
-                    );
-                    s.done = true;
-                }
-                Err(e) => s.result = format!("adding the `{l}` label failed: {e}"),
-            },
-            Action::Query => {
-                let (Some(src), Some(q)) = (
-                    a.source.as_ref(),
-                    snapshot
-                        .confirm
-                        .as_ref()
-                        .map(|f| f.query.clone())
-                        .filter(|q| !q.trim().is_empty()),
-                ) else {
-                    s.result = "no confirm query to run".to_string();
-                    continue;
-                };
-                match public_query(http, src, &q).await {
-                    Ok(v) => {
-                        let out = v.to_string();
-                        s.result = format!(
-                            "ran `{}` on {}: {}",
-                            one_line(&q),
-                            src.labels(),
-                            quote_result(&out)
-                        );
-                        s.done = true;
-                    }
-                    Err(e) => s.result = format!("ran `{}` on {}: {e}", one_line(&q), src.labels()),
-                }
-            }
-            Action::Cannot(why) => s.result = format!("not done: {why}"),
-        }
+/// The mutations a step runs: its own, else the ones in its migration file
+/// (`text`, a JSON array, an object with `mutations`, or NDJSON).
+pub fn mutations_of(s: &NoteStep, text: Option<&str>) -> Result<Vec<Value>, String> {
+    if !s.mutations.is_empty() {
+        return Ok(s.mutations.clone());
     }
-    // The confirm query's own result, whenever it can be read.
-    if let (Some(src), Some(f)) = (a.source.as_ref(), c.confirm.as_mut()) {
-        if !f.query.trim().is_empty() && f.result.is_empty() {
-            f.result = match public_query(http, src, &f.query).await {
-                Ok(v) => v.to_string(),
-                Err(e) => format!("the query failed: {e}"),
-            };
-            any = true;
-        }
+    let Some(text) = text else {
+        return Err("the step gives no mutations and no migration file".to_string());
+    };
+    let t = text.trim();
+    if let Ok(v) = serde_json::from_str::<Value>(t) {
+        let list = v.get("mutations").cloned().unwrap_or(v);
+        return match list {
+            Value::Array(a) if !a.is_empty() => Ok(a),
+            _ => Err(format!("`{}` holds no mutations", s.migration)),
+        };
     }
-    any
+    let mut out = Vec::new();
+    for (i, line) in t.lines().filter(|l| !l.trim().is_empty()).enumerate() {
+        out.push(
+            serde_json::from_str::<Value>(line)
+                .map_err(|e| format!("`{}` line {}: {e}", s.migration, i + 1))?,
+        );
+    }
+    if out.is_empty() {
+        return Err(format!("`{}` holds no mutations", s.migration));
+    }
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -1782,13 +2077,247 @@ mod tests {
             Action::Query
         );
         assert!(matches!(
-            action_for(&step("coderhelm", "Replace the block content on production"), &a, &c),
-            Action::Cannot(w) if w.contains("never changes production")
+            action_for(
+                &step("coderhelm", "Replace the block content on production"),
+                &a,
+                &c
+            ),
+            Action::Write(Target::Production)
         ));
         let none = Abilities::default();
         assert!(matches!(
             action_for(&step("coderhelm", "Deploy the studio"), &none, &c),
             Action::Cannot(w) if w.contains("workflow_dispatch")
         ));
+    }
+
+    #[test]
+    fn the_step_kind_and_target_decide_the_action_not_the_wording() {
+        let (tree, files) = repo();
+        let a = abilities(&tree, &files, &[], true);
+        let c = OutsideChange::default();
+        // Words say "content", the structured kind says deploy: deploy wins.
+        let mut s = step("coderhelm", "Publish the new content fields");
+        s.kind = "deploy".into();
+        assert_eq!(s.step_kind(), StepKind::Deploy);
+        assert!(
+            matches!(action_for(&s, &a, &c), Action::Dispatch(r) if r.file.ends_with("studio-staging.yml"))
+        );
+        // Words say deploy, the kind says verify.
+        let mut v = step(
+            "coderhelm",
+            "Deploy check: confirm the studio has the field",
+        );
+        v.kind = "verify".into();
+        assert_eq!(action_for(&v, &a, &c), Action::Query);
+        // The target is structured too: no word "production" needed.
+        let mut w = step("coderhelm", "Replace the hero block");
+        w.kind = "migration".into();
+        w.target = "production".into();
+        assert_eq!(action_for(&w, &a, &c), Action::Write(Target::Production));
+        w.target = "staging".into();
+        assert_eq!(action_for(&w, &a, &c), Action::Write(Target::Staging));
+        // A production deploy never starts the staging workflow.
+        let mut d = step("coderhelm", "Deploy");
+        d.kind = "deploy".into();
+        d.target = "production".into();
+        assert!(
+            matches!(action_for(&d, &a, &c), Action::Cannot(w) if w.contains("production deploy"))
+        );
+        // Without a kind, the words still decide (the fallback).
+        assert_eq!(
+            step("coderhelm", "Deploy the studio schema").step_kind(),
+            StepKind::Deploy
+        );
+        assert_eq!(
+            step("coderhelm", "Re-run the e2e tests").step_kind(),
+            StepKind::E2e
+        );
+        assert_eq!(
+            step("coderhelm", "Replace the block content").step_kind(),
+            StepKind::Content
+        );
+        assert_eq!(
+            step("coderhelm", "Replace the block on prod").target(),
+            Target::Production
+        );
+    }
+
+    #[test]
+    fn approval_is_never_a_reason_to_give_a_step_to_a_person() {
+        let (tree, files) = repo();
+        let a = abilities(&tree, &files, &[], true);
+        let mut s = step("person", "Deploy the app to production");
+        s.kind = "deploy".into();
+        s.target = "production".into();
+        s.why_person = "production deploys need a person's approval".into();
+        s.grant = "none".into();
+        let c = OutsideChange {
+            system: "the CMS".into(),
+            change: "Release".into(),
+            steps: vec![s.clone()],
+            ..Default::default()
+        };
+        let g = gaps(&c, &a, PlanFacts::default());
+        assert!(
+            g.iter()
+                .any(|x| x.contains("CoderHelm asks for approval itself")),
+            "{g:?}"
+        );
+        // A missing connection is a reason.
+        let mut ok = s;
+        ok.why_person = "no production deploy permission for the CoderHelm app".into();
+        let c = OutsideChange {
+            steps: vec![ok],
+            ..c
+        };
+        let g = gaps(&c, &a, PlanFacts::default());
+        assert!(!g.iter().any(|x| x.contains("asks for approval")), "{g:?}");
+    }
+
+    #[test]
+    fn staging_content_with_a_write_connection_is_coderhelms_with_mutations() {
+        let (tree, files) = repo();
+        let a = abilities(&tree, &files, &[], true);
+        let mut by_hand = step("person", "Replace the hero block content on staging");
+        by_hand.kind = "content".into();
+        by_hand.target = "staging".into();
+        by_hand.values = vec!["title = New".into()];
+        by_hand.why_person = "an editor".into();
+        by_hand.grant = "none".into();
+        let c = OutsideChange {
+            system: "the CMS".into(),
+            change: "Replace the hero".into(),
+            steps: vec![by_hand],
+            ..Default::default()
+        };
+        let g = gaps(&c, &a, PlanFacts::default());
+        assert!(
+            g.iter()
+                .any(|x| x.contains("staging CMS write connection") && x.contains("`mutations`")),
+            "{g:?}"
+        );
+        // A CoderHelm content step with nothing to run goes back.
+        let mut ours = step("coderhelm", "Run the hero migration on staging");
+        ours.kind = "migration".into();
+        ours.values = vec!["title = New".into()];
+        let c2 = OutsideChange {
+            steps: vec![ours.clone()],
+            ..c.clone()
+        };
+        assert!(gaps(&c2, &a, PlanFacts::default())
+            .iter()
+            .any(|x| x.contains("gives nothing to run")));
+        ours.migration = "studio/migrations/002-hero.ndjson".into();
+        let c3 = OutsideChange {
+            steps: vec![ours],
+            ..c
+        };
+        assert!(!gaps(&c3, &a, PlanFacts::default())
+            .iter()
+            .any(|x| x.contains("gives nothing to run")));
+    }
+
+    #[test]
+    fn a_migration_runs_its_own_mutations_or_its_file() {
+        let mut s = step("coderhelm", "Run it");
+        s.migration = "m.ndjson".into();
+        let nd = "{\"patch\":{\"id\":\"a\",\"set\":{\"x\":1}}}\n\n{\"delete\":{\"id\":\"b\"}}\n";
+        assert_eq!(mutations_of(&s, Some(nd)).unwrap().len(), 2);
+        let arr = r#"{"mutations":[{"createOrReplace":{"_id":"c","_type":"page"}}]}"#;
+        assert_eq!(mutations_of(&s, Some(arr)).unwrap().len(), 1);
+        assert!(mutations_of(&s, Some("not json")).is_err());
+        assert!(mutations_of(&s, None).is_err());
+        s.mutations = vec![serde_json::json!({"delete": {"id": "z"}})];
+        assert_eq!(mutations_of(&s, None).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn a_person_step_without_a_reason_becomes_a_question() {
+        let c = OutsideChange {
+            system: "the CMS".into(),
+            change: "Publish".into(),
+            steps: vec![
+                step("person", "Publish the page"),
+                NoteStep {
+                    why_person: "no production CMS write connection".into(),
+                    grant: "add one".into(),
+                    ..step("person", "Approve the copy")
+                },
+            ],
+            ..Default::default()
+        };
+        let q = unjustified_questions(&c);
+        assert_eq!(q.len(), 1);
+        assert!(q[0].question.contains("Step 1") && q[0].question.contains("Publish the page"));
+        assert!(q[0].question.contains("connection or permission"));
+    }
+
+    #[test]
+    fn what_is_not_done_leads_the_pr_and_the_ticket_with_the_access_to_grant() {
+        let held_step = NoteStep {
+            why_person: "no production CMS write connection exists".into(),
+            grant: "add a production write token".into(),
+            ..step("person", "Replace the hero on production")
+        };
+        let failed = NoteStep {
+            result: "not done: the end-to-end workflow has no workflow_dispatch trigger".into(),
+            ..step("coderhelm", "Re-run the e2e tests")
+        };
+        let waiting = NoteStep {
+            result: "waiting for approval".into(),
+            run: Some(StepRun {
+                state: "waiting_approval".into(),
+                ..Default::default()
+            }),
+            ..step("coderhelm", "Deploy the studio")
+        };
+        let c = OutsideChange {
+            system: "the CMS".into(),
+            change: "Release".into(),
+            steps: vec![held_step, failed, waiting],
+            ..Default::default()
+        };
+        let block = not_done_block(&c);
+        assert!(block.contains(NOT_DONE_HEADING));
+        assert!(block.contains("Why a person: no production CMS write connection exists"));
+        assert!(block.contains("So CoderHelm can do it next time: add a production write token"));
+        assert!(block.contains("workflow_dispatch"));
+        assert!(
+            !block.contains("Deploy the studio"),
+            "a step under way is not 'not done'"
+        );
+        // The ticket note starts with it.
+        assert!(note_markdown(&c).starts_with(&format!("**{NOT_DONE_HEADING}**")));
+        // The PR body gets it at the top, once, and loses it when all is done.
+        let body = with_not_done_top("## Summary\nx", &c);
+        assert!(body.starts_with(NOT_DONE_START));
+        assert!(body.ends_with("## Summary\nx"));
+        assert_eq!(with_not_done_top(&body, &c), body);
+        let done = OutsideChange {
+            steps: Vec::new(),
+            ..c.clone()
+        };
+        assert_eq!(with_not_done_top(&body, &done), "## Summary\nx");
+        assert!(unfinished(&c), "the waiting step keeps the run going");
+    }
+
+    #[test]
+    fn the_multi_repo_run_puts_the_outside_steps_on_the_repo_they_name() {
+        let repos = vec!["acme/web".to_string(), "acme/content-studio".to_string()];
+        let c = OutsideChange {
+            steps: vec![NoteStep {
+                how: "the deploy workflow in content-studio".into(),
+                ..step("coderhelm", "Deploy the studio")
+            }],
+            ..Default::default()
+        };
+        assert_eq!(outside_repo(&c, &repos), Some(&repos[1]));
+        let none = OutsideChange {
+            steps: vec![step("coderhelm", "Run the confirm query")],
+            ..Default::default()
+        };
+        assert_eq!(outside_repo(&none, &repos), Some(&repos[0]));
+        assert_eq!(outside_repo(&none, &[]), None);
     }
 }

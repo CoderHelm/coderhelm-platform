@@ -1160,6 +1160,34 @@ pub async fn run(
         );
         mark_events_processed(state, &msg.run_id, &stale_events).await;
     }
+    // The ticket's outside steps CoderHelm runs (a deploy, the end-to-end
+    // run, a staging migration): an approval answered or a workflow ended
+    // since the last look carries them on. A failed end-to-end run goes to
+    // the CI fix round; while a step is under way the run doesn't finish
+    // (a CI failure is still fixed meanwhile).
+    match super::outside_exec::on_resume(state, &msg, &run_record).await {
+        super::outside_exec::OnResume::Failed(f) => {
+            info!(
+                run_id = msg.run_id,
+                workflow_run_id = f.workflow_run_id,
+                "Started end-to-end run failed — sending it to the CI fix round"
+            );
+            super::outside_exec::record_failed(state, &msg.run_id, &f).await;
+            send_delayed_resume(state, &msg, 0).await;
+            return Ok(());
+        }
+        super::outside_exec::OnResume::Waiting
+            if !events.iter().any(|e| e.event_type == "ci_failed") =>
+        {
+            info!(
+                run_id = msg.run_id,
+                "An outside step waits on an approval or a workflow run — checking again later"
+            );
+            send_delayed_resume(state, &msg, 120).await;
+            return Ok(());
+        }
+        _ => {}
+    }
     if events.is_empty() {
         // No events — webhook may have been missed or repo has no CI.
         // Only check GitHub if we've been in awaiting_ci for >90 seconds,
@@ -4877,6 +4905,23 @@ async fn set_run_complete(
     let duration = created_at
         .map(|t| now.signed_duration_since(t).num_seconds().max(0) as u64)
         .unwrap_or(0);
+    // A requirement the ticket needs that no connection let CoderHelm do
+    // leaves the run open: it ends as needing that outside change, never as
+    // completed, and the note says what is not done and the access to grant.
+    let left = super::outside_exec::left_undone(state, team_id, run_id).await;
+    let status = end_status(&left);
+    if !left.is_empty() {
+        super::add_progress_note(
+            state,
+            team_id,
+            run_id,
+            &format!(
+                "Not done: {} requirement(s) still need access CoderHelm doesn't have; the pull request and the ticket list them at the top, with the access to grant",
+                left.len()
+            ),
+        )
+        .await;
+    }
     let _ = state
         .dynamo
         .update_item()
@@ -4892,13 +4937,40 @@ async fn set_run_complete(
         // "completed" — the single terminal-success status. This path used
         // to write "success", which every status filter in the gateway and
         // dashboard missed (dedup, comment routing, retry eligibility).
-        .expression_attribute_values(":s", attr_s("completed"))
+        .expression_attribute_values(":s", attr_s(status))
         .expression_attribute_values(":t", attr_s(&now.to_rfc3339()))
         .expression_attribute_values(":cp", attr_s("done"))
-        .expression_attribute_values(":sri", attr_s(&format!("completed#{run_id}")))
+        .expression_attribute_values(":sri", attr_s(&format!("{status}#{run_id}")))
         .expression_attribute_values(":d", attr_n(duration))
         .send()
         .await;
-    super::webhooks::emit_run(state, team_id, run_id, "completed").await;
-    info!(run_id, duration, "Run marked complete (no CI / CI passed)");
+    super::webhooks::emit_run(state, team_id, run_id, status).await;
+    info!(
+        run_id,
+        duration, status, "Run marked complete (no CI / CI passed)"
+    );
+}
+
+/// How a run whose CI passed ends: completed, or (with requirements left
+/// that need access CoderHelm lacks) needing that outside change.
+fn end_status(left: &[String]) -> &'static str {
+    if left.is_empty() {
+        "completed"
+    } else {
+        super::fix_location::STATUS_OUTSIDE
+    }
+}
+
+#[cfg(test)]
+mod end_status_tests {
+    use super::end_status;
+
+    #[test]
+    fn a_requirement_left_for_a_person_keeps_the_run_from_completing() {
+        assert_eq!(end_status(&[]), "completed");
+        assert_eq!(
+            end_status(&["1. Replace the hero on production".to_string()]),
+            crate::passes::fix_location::STATUS_OUTSIDE
+        );
+    }
 }

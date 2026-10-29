@@ -426,6 +426,16 @@ pub fn outside_findings(d: Option<&super::fix_location::FixDecision>) -> Vec<Fin
             ..Default::default()
         });
     }
+    for l in h.not_done {
+        out.push(Finding {
+            point: "planned_work".to_string(),
+            detail: format!("Not done by this run: {l}"),
+            settle: "Done when the access it names is granted and the run is retried, or its \
+                     owner makes it and the confirm query returns what the note expects."
+                .to_string(),
+            ..Default::default()
+        });
+    }
     out
 }
 
@@ -863,5 +873,34 @@ mod tests {
             .contains("Why a person: production content needs an editor's approval"));
         assert!(outside_note(Some(&d)).contains("1 handed out with no reason"));
         assert!(outside_findings(None).is_empty());
+    }
+
+    #[test]
+    fn a_coderhelm_step_that_ended_not_done_is_an_open_item() {
+        use crate::passes::fix_location::{FixDecision, FixLocation, OutsideChange};
+        use crate::passes::outside_work::NoteStep;
+        let d = FixDecision {
+            fix_location: FixLocation::Both,
+            outside_change: Some(OutsideChange {
+                system: "the CMS".into(),
+                change: "Replace the hero".into(),
+                steps: vec![NoteStep {
+                    step: "Replace the hero on production".into(),
+                    by: "coderhelm".into(),
+                    kind: "content".into(),
+                    target: "production".into(),
+                    result: "not done: no production CMS write connection exists".into(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let f = outside_findings(Some(&d));
+        assert_eq!(f.len(), 1);
+        assert!(f[0]
+            .detail
+            .starts_with("Not done by this run: 1. Replace the hero on production"));
+        assert!(f[0].detail.contains("no production CMS write connection"));
     }
 }
