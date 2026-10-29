@@ -309,10 +309,12 @@ fn names_action<'a>(piece: &str, steps: &'a [UsesStep]) -> Option<Option<&'a Use
 /// replaced by its shell ([`translate`]) or left out, and a note for each.
 pub fn sanitize(text: &str, steps: &[UsesStep], notes: &mut Vec<String>) -> String {
     let mut kept: Vec<(String, String)> = Vec::new();
+    let mut changed = false;
     for (piece, sep) in pieces(text) {
         match names_action(&piece, steps) {
             None => kept.push((piece, sep)),
             Some(step) => {
+                changed = true;
                 let what = common::truncate_str(piece.trim(), 120).to_string();
                 match step.map(translate) {
                     Some(Translation::Shell(sh)) => {
@@ -320,7 +322,7 @@ pub fn sanitize(text: &str, steps: &[UsesStep], notes: &mut Vec<String>) -> Stri
                             "`{what}` was a workflow step written as words; ran `{sh}` for it"
                         ));
                         if !kept.iter().any(|(k, _)| k.trim() == sh) {
-                            kept.push((format!(" {sh} "), sep));
+                            kept.push((sh, sep));
                         }
                     }
                     Some(Translation::Dropped(why)) => {
@@ -333,6 +335,10 @@ pub fn sanitize(text: &str, steps: &[UsesStep], notes: &mut Vec<String>) -> Stri
             }
         }
     }
+    // Nothing named a step: the text as it was, every space and newline.
+    if !changed {
+        return text.to_string();
+    }
     // Pieces left empty by a removal take their separator with them.
     let kept: Vec<(String, String)> = kept
         .into_iter()
@@ -340,17 +346,18 @@ pub fn sanitize(text: &str, steps: &[UsesStep], notes: &mut Vec<String>) -> Stri
         .collect();
     let mut out = String::new();
     for (n, (piece, sep)) in kept.iter().enumerate() {
-        out.push_str(piece);
+        out.push_str(piece.trim());
         if n + 1 < kept.len() {
-            out.push_str(if sep.is_empty() { "&&" } else { sep });
+            let joint = match sep.as_str() {
+                "\n" => "\n".to_string(),
+                ";" => "; ".to_string(),
+                "" => " && ".to_string(),
+                other => format!(" {other} "),
+            };
+            out.push_str(&joint);
         }
     }
-    out.split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
-        .replace(" ; ", "; ")
-        .trim()
-        .to_string()
+    out
 }
 
 /// The bash script the sandbox runs: the setup in this shell (so a venv it
@@ -683,8 +690,25 @@ mod tests {
         assert_eq!(notes.len(), 1, "{notes:?}");
         let cmd = "for t in tests/test_*.py; do PYTHONHASHSEED=0 python \"$t\" || exit 1; done";
         assert_eq!(bash_syntax(&fixed, cmd), Ok(()));
-        // The loop is left as it was.
+        // The loop is left as it was, and so is a multi-line setup.
         assert_eq!(sanitize(cmd, &steps, &mut notes), cmd);
+        let lines = "pip install -r requirements.txt\npip install -e .\necho \"a  b\"";
+        assert_eq!(sanitize(lines, &steps, &mut notes), lines);
+        let mut n3 = Vec::new();
+        assert_eq!(
+            sanitize(
+                "pip install -U pip\nsetup-uv with Python 3.11\npytest -q",
+                &steps,
+                &mut n3
+            ),
+            format!(
+                "pip install -U pip\n{}\npytest -q",
+                match translate(&steps[1]) {
+                    Translation::Shell(sh) => sh,
+                    other => panic!("{other:?}"),
+                }
+            )
+        );
         // A step that is left out goes with its separator.
         let mut n2 = Vec::new();
         assert_eq!(
