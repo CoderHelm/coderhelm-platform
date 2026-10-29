@@ -970,6 +970,11 @@ async fn run_suite(round: &Round<'_>, staged: &Staged) -> suite::Outcome {
         .run_checks(&source, &script, node.as_deref(), None, round.deadline)
         .await
     {
+        // A failing suite that couldn't connect to a host the sandbox's
+        // network allowlist refused didn't test the change: it says so.
+        Ok(o) if !o.passed && blocked_suite(&o.output).is_some() => {
+            suite::Outcome::NotRun(blocked_suite(&o.output).unwrap_or_default())
+        }
         Ok(o) if o.ran => {
             let counts = suite::counts(&o.output);
             if o.passed {
@@ -995,6 +1000,16 @@ async fn run_suite(round: &Round<'_>, staged: &Staged) -> suite::Outcome {
         }),
         Err(e) => suite::Outcome::NotRun(format!("the sandbox failed: {e}")),
     }
+}
+
+/// Why a failing suite run says nothing about the change: it couldn't
+/// reach a host the sandbox's network allowlist refused. None when no host
+/// was refused or nothing failed to connect.
+fn blocked_suite(output: &str) -> Option<String> {
+    use common::stop_rules::tooling;
+    let hosts = tooling::blocked_hosts(output);
+    let err = tooling::network_error(output)?;
+    (!hosts.is_empty()).then(|| tooling::blocked_message("the test suite", &hosts, Some(&err)))
 }
 
 /// The round's one commit message: the team's commit template when it set
