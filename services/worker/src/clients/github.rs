@@ -2561,6 +2561,28 @@ impl GitHubClient {
         Ok(())
     }
 
+    /// Replaces the body of a review already posted (no new notification).
+    pub async fn update_pr_review(
+        &self,
+        owner: &str,
+        repo: &str,
+        pr_number: u64,
+        review_id: u64,
+        body: &str,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let url = format!("{API_BASE}/repos/{owner}/{repo}/pulls/{pr_number}/reviews/{review_id}");
+        let headers = self.auth_headers().await?;
+        let mut req = self
+            .http
+            .put(&url)
+            .json(&serde_json::json!({ "body": body }));
+        for (k, v) in headers {
+            req = req.header(k, v);
+        }
+        ok_or_body(req.send().await?).await?;
+        Ok(())
+    }
+
     /// List tags on a repo (used to compute the next semver release tag).
     pub async fn list_tags(
         &self,

@@ -148,6 +148,10 @@ pub struct Notice {
     /// When it was posted (RFC 3339).
     #[serde(default)]
     pub at: String,
+    /// The GitHub issue comment's id, so a later update edits it instead of
+    /// posting another; 0 when unknown (a Jira comment, an older record).
+    #[serde(default)]
+    pub comment_id: u64,
 }
 
 /// The decisions on a record, oldest first; empty when unreadable.
@@ -186,8 +190,68 @@ pub fn posted_before<'a>(
         .find(|n| n.text_hash == text_hash || (!decided && n.key == key && !key.is_empty()))
 }
 
+/// A notice's text as compared with earlier ones: whitespace collapsed,
+/// markdown emphasis dropped, and dates, times and run links taken out, so
+/// the same note posted by two runs minutes apart reads the same.
+pub fn notice_text(text: &str) -> String {
+    let mut out: Vec<String> = Vec::new();
+    for word in text.split_whitespace() {
+        let w = word.replace("**", "").replace('`', "");
+        let bare = w.trim_matches(|c: char| !c.is_ascii_alphanumeric());
+        let stamp = bare.chars().filter(|c| c.is_ascii_digit()).count() >= 2
+            && bare.contains([':', '-', '/'])
+            && bare.chars().all(|c| {
+                c.is_ascii_digit() || matches!(c, '-' | ':' | '.' | 'T' | 'Z' | '+' | '/')
+            });
+        let run_link = w.contains("/runs/") || w.contains("run_id=") || w.contains("?id=");
+        if stamp || run_link || w.is_empty() {
+            continue;
+        }
+        out.push(w.to_lowercase());
+    }
+    out.join(" ")
+}
+
+/// The hash a notice is recorded under: its key and its compared text.
+pub fn notice_hash(key: &str, text: &str) -> String {
+    crate::sha256_hex(&[key, &notice_text(text)])
+}
+
+/// What to do with a notice about to be posted on the ticket.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NoticeAction<'a> {
+    /// The same text is already on the ticket: post nothing.
+    Skip(&'a Notice),
+    /// An earlier notice about the same thing says something else and can
+    /// be edited (a GitHub comment): edit it in place.
+    Edit(&'a Notice),
+    /// Nothing like it was posted, or the earlier one can't be edited.
+    Post,
+}
+
+/// One comment per thing on a ticket: a notice whose text was posted before
+/// (in any run) is not posted again; one whose key was posted with other
+/// text edits the earlier comment where the platform allows.
+pub fn notice_action<'a>(notices: &'a [Notice], key: &str, text_hash: &str) -> NoticeAction<'a> {
+    if let Some(n) = notices.iter().rev().find(|n| n.text_hash == text_hash) {
+        return NoticeAction::Skip(n);
+    }
+    match notices
+        .iter()
+        .rev()
+        .find(|n| !key.is_empty() && n.key == key && n.comment_id > 0)
+    {
+        Some(n) => NoticeAction::Edit(n),
+        None => NoticeAction::Post,
+    }
+}
+
 /// `notices` with `new` added, the oldest dropped past [`MAX_NOTICES`].
 pub fn with_notice(mut notices: Vec<Notice>, new: Notice) -> Vec<Notice> {
+    // An edited comment keeps one record: the newest text for its key.
+    if new.comment_id > 0 {
+        notices.retain(|n| !(n.key == new.key && n.comment_id == new.comment_id));
+    }
     notices.push(new);
     if notices.len() > MAX_NOTICES {
         let drop = notices.len() - MAX_NOTICES;
@@ -295,6 +359,7 @@ mod tests {
             text_hash: "h1".into(),
             url: "https://example.com/c/1".into(),
             at: "2026-10-27T10:00:00Z".into(),
+            comment_id: 0,
         };
         let all = with_notice(Vec::new(), n);
         // Same text: never again.
@@ -314,6 +379,60 @@ mod tests {
         });
         assert_eq!(many.len(), MAX_NOTICES);
         assert_eq!(many[0].key, "k10");
+    }
+
+    #[test]
+    fn the_same_note_from_two_runs_minutes_apart_is_posted_once() {
+        let first = "**Also needed outside the code**\n\nAdd the block on staging.\n\nChecked 2026-10-27T10:00:00Z, see https://app.example.com/runs/detail?id=r1";
+        let second = "**Also needed outside the code**\n\nAdd the  block on staging.\n\n\nChecked 2026-10-27T10:07:12Z, see https://app.example.com/runs/detail?id=r2";
+        assert_eq!(notice_text(first), notice_text(second));
+        let h = notice_hash("also_outside", first);
+        assert_eq!(h, notice_hash("also_outside", second));
+        // A number that is content (a PR, a count) still counts.
+        assert_ne!(notice_text("see PR #12"), notice_text("see PR #13"));
+        let posted = with_notice(
+            Vec::new(),
+            Notice {
+                key: "also_outside".into(),
+                text_hash: h.clone(),
+                comment_id: 42,
+                ..Default::default()
+            },
+        );
+        assert!(matches!(
+            notice_action(&posted, "also_outside", &h),
+            NoticeAction::Skip(_)
+        ));
+        // New text about the same thing: the earlier comment is edited.
+        let other = notice_hash("also_outside", "Replace the block instead.");
+        match notice_action(&posted, "also_outside", &other) {
+            NoticeAction::Edit(n) => assert_eq!(n.comment_id, 42),
+            a => panic!("expected an edit, got {a:?}"),
+        }
+        // A Jira comment (no id) with new text is posted.
+        let jira = with_notice(
+            Vec::new(),
+            Notice {
+                key: "also_outside".into(),
+                text_hash: h,
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            notice_action(&jira, "also_outside", &other),
+            NoticeAction::Post
+        );
+        // The edit keeps one record for the comment.
+        let edited = with_notice(
+            posted,
+            Notice {
+                key: "also_outside".into(),
+                text_hash: other,
+                comment_id: 42,
+                ..Default::default()
+            },
+        );
+        assert_eq!(edited.len(), 1);
     }
 
     #[test]

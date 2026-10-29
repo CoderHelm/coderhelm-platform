@@ -15,7 +15,12 @@
 //! - the checks of each test package outside the main workspace;
 //! - the new spec run repeatedly (`--repeat-each=5`) against the preview;
 //! - for UI work, a no-horizontal-scroll check at a narrow and a wide
-//!   viewport in the spec ([`responsive_checked`]).
+//!   viewport in the spec ([`responsive_checked`]);
+//! - a new or changed end-to-end test never skips itself when the content
+//!   or data it needs is missing: it fails, naming what is missing
+//!   ([`data_skips`]). Only a skip for a stated browser or platform
+//!   condition is allowed; a test that skips on missing content can never
+//!   fail.
 //!
 //! The counts and results go in the pull request; an item that fails keeps it
 //! a draft.
@@ -575,6 +580,72 @@ pub fn root_steps(package_json: &str, tree: &[String]) -> Vec<Step> {
     steps
 }
 
+/// Words that make a skip a browser or platform condition (allowed).
+const PLATFORM_WORDS: &[&str] = &[
+    "browsername",
+    "isMobile",
+    "ismobile",
+    "process.platform",
+    "platform",
+    "webkit",
+    "firefox",
+    "chromium",
+    "safari",
+    "devicename",
+    "project.name",
+    "testinfo.project",
+    "viewport",
+];
+
+/// Skip calls in end-to-end test code.
+const SKIP_CALLS: &[&str] = &[
+    "test.skip(",
+    "it.skip(",
+    "describe.skip(",
+    "test.describe.skip(",
+    "test.fixme(",
+    "testinfo.skip(",
+    "this.skip(",
+    "cy.skip(",
+    "pending(",
+];
+
+/// The skips a spec's diff adds that aren't for a browser or platform
+/// condition, as "spec: line". Read from the added lines of the patch with
+/// the lines just before each (an `if (!block) test.skip()` reads its
+/// condition there).
+pub fn data_skips(path: &str, patch: &str) -> Vec<String> {
+    let lines: Vec<&str> = patch.lines().filter(|l| !l.starts_with("@@")).collect();
+    let mut out = Vec::new();
+    for (i, l) in lines.iter().enumerate() {
+        if !(l.starts_with('+') && !l.starts_with("+++")) {
+            continue;
+        }
+        let code = l[1..].trim();
+        if code.starts_with("//") || code.starts_with('*') {
+            continue;
+        }
+        let low = code.to_ascii_lowercase().replace(' ', "");
+        if !SKIP_CALLS.iter().any(|c| low.contains(c)) {
+            continue;
+        }
+        let from = i.saturating_sub(3);
+        let context = lines[from..=i]
+            .iter()
+            .map(|x| x.get(1..).unwrap_or("").to_ascii_lowercase())
+            .collect::<Vec<_>>()
+            .join(" ");
+        if PLATFORM_WORDS
+            .iter()
+            .any(|w| context.contains(&w.to_ascii_lowercase()))
+        {
+            continue;
+        }
+        out.push(format!("{path}: `{}`", common::truncate_str(code, 120)));
+    }
+    out
+}
+
 /// What the static part of the checklist reads.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Facts {
@@ -595,6 +666,10 @@ pub struct Facts {
     /// Their values no test names, as "name: value".
     #[serde(default)]
     pub options_untested: Vec<String>,
+    /// Skips the new or changed specs add for missing content or data, as
+    /// "spec: line" (see [`data_skips`]).
+    #[serde(default)]
+    pub data_skips: Vec<String>,
 }
 
 /// The items that read the diff alone.
@@ -667,6 +742,24 @@ pub fn static_items(f: &Facts) -> Vec<Item> {
             ));
         }
     }
+    if !f.specs.is_empty() {
+        if f.data_skips.is_empty() {
+            out.push(Item::new(
+                "end-to-end tests fail when their content is missing",
+                Status::Pass,
+                "no new or changed spec skips itself on missing content",
+            ));
+        } else {
+            out.push(Item::new(
+                "end-to-end tests fail when their content is missing",
+                Status::Fail,
+                format!(
+                    "skips on missing content, so the test can never fail: {}",
+                    f.data_skips.join("; ")
+                ),
+            ));
+        }
+    }
     if f.ui && !f.specs.is_empty() {
         if f.responsive_specs.is_empty() {
             out.push(Item::new(
@@ -705,7 +798,11 @@ pub fn feedback(items: &[Item]) -> String {
          shown and the hidden case of an on/off field). A new \
          end-to-end spec goes in every test map the repository keeps. For UI, the spec checks \
          `document.documentElement.scrollWidth <= window.innerWidth` at a viewport {NARROW_MAX}px \
-         wide or less and one {WIDE_MIN}px wide or more.\n"
+         wide or less and one {WIDE_MIN}px wide or more. An end-to-end test never calls \
+         `test.skip` (or `fixme`, `it.skip`) when the content or data it needs is missing: rewrite \
+         it to fail with a message naming the missing content (for example \
+         `expect(block, 'staging page /x has no gallery block').toBeVisible()`); a skip is only \
+         for a stated browser or platform condition.\n"
     ));
     s
 }
@@ -713,6 +810,32 @@ pub fn feedback(items: &[Item]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_spec_that_skips_on_missing_content_fails_the_checklist() {
+        let patch = "@@ -0,0 +1,12 @@\n+test('gallery renders', async ({ page }) => {\n+  await page.goto('/events')\n+  const block = page.locator('[data-block=gallery]')\n+  if ((await block.count()) === 0) {\n+    test.skip(true, 'no gallery block on staging')\n+  }\n+  // test.skip() in a comment is fine\n+  test.skip(browserName === 'webkit', 'webkit has no clipboard')\n+})\n";
+        let skips = data_skips("e2e/gallery.spec.ts", patch);
+        assert_eq!(skips.len(), 1, "{skips:?}");
+        assert!(skips[0].contains("no gallery block on staging"));
+        let f = Facts {
+            specs: vec!["e2e/gallery.spec.ts".into()],
+            data_skips: skips,
+            ..Default::default()
+        };
+        let items = static_items(&f);
+        let item = items
+            .iter()
+            .find(|i| i.name.contains("content is missing"))
+            .unwrap();
+        assert_eq!(item.status, Status::Fail);
+        assert!(feedback(&items).contains("never calls `test.skip`"));
+        // A platform skip alone passes.
+        let ok = data_skips(
+            "e2e/a.spec.ts",
+            "@@\n+test.skip(process.platform === 'win32', 'paths')\n",
+        );
+        assert!(ok.is_empty());
+    }
 
     #[test]
     fn counts_the_cases_the_acceptance_criteria_list() {
@@ -801,6 +924,7 @@ mod tests {
             has_e2e: true,
             options_found: 0,
             options_untested: vec![],
+            data_skips: vec![],
         };
         let items = static_items(&f);
         assert_eq!(failing(&items).len(), 3);

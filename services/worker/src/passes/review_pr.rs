@@ -2362,12 +2362,18 @@ async fn run_once(
             return Err(e);
         }
         posted_event = Some(event);
-        // Resolve the earlier threads this head fixed (after the review is up, so
-        // the "N fixed" note is visible when they collapse).
-        for t in &fixed_threads {
-            if let Err(e) = github.resolve_review_thread(&t.id).await {
-                warn!(pr = msg.pr_number, thread = %t.id, error = %e, "Failed to resolve fixed thread");
-            }
+    } else if !already_answered && !head_sha.is_empty() {
+        // Nothing new to post for this commit (same verdict, CoderHelm's own
+        // push): the earlier review must not keep standing with what it
+        // said about the older commit. Its body becomes this review.
+        super::review_verdict::refresh_standing(&github, &msg, &head_sha, &full_body).await;
+    }
+    // Resolve the earlier threads this head fixed, posted or not (after the
+    // review is up when there is one, so the "N fixed" note is visible when
+    // they collapse): a thread the new commits settled never stays open.
+    for t in &fixed_threads {
+        if let Err(e) = github.resolve_review_thread(&t.id).await {
+            warn!(pr = msg.pr_number, thread = %t.id, error = %e, "Failed to resolve fixed thread");
         }
     }
 

@@ -209,6 +209,20 @@ pub async fn run(
         .get_diff(&msg.repo_owner, &msg.repo_name, &msg.base_branch, branch)
         .await?;
     let diff_summary = format_diff_summary(&diff);
+    // The lowest Risk the diff allows (shared files, a network call per page
+    // render), told to the writer and enforced on what it writes.
+    let risk_files = super::pr_risk::diff_files(&diff);
+    let risk_floor = super::pr_risk::floor(
+        &risk_files,
+        &super::pr_risk::importers(
+            state,
+            &msg.team_id,
+            msg.installation_id,
+            &format!("{}/{}", msg.repo_owner, msg.repo_name),
+            &risk_files,
+        )
+        .await,
+    );
 
     // Check for PR template in the repo
     let pr_template =
@@ -281,11 +295,12 @@ pub async fn run(
         "Write a PR description following this structure, and nothing else:\n\n\
          1. **Summary** — One sentence: the problem and what this change does about it.\n\
          2. **Changes** — Bolded per-area headers with bullet details. Keep it tight.\n\
-         3. **Risk** — State risk level in bold (**Low**, **Medium**), then why it's safe.\n\
+         3. **Risk** — State the risk level in bold (**Low**, **Medium** or **High**) and why, from the diff: a change to a file every page or request goes through, or a new network call per page render, is never Low.\n\
          4. **Verification** — Numbered steps to verify the change."
     };
     let evidence_block = format!(
-        "{}{}{}{}",
+        "{}{}{}{}{}",
+        super::pr_risk::writer_note(&risk_floor),
         evidence_instructions(proof.evidence),
         manual_instructions(proof.manual),
         ci_instructions(proof.ci),
@@ -496,6 +511,8 @@ Return ONLY the markdown body text."#,
         Some(f) => super::feature::shape_body(body_text, f),
         None => body_text,
     };
+    // The Risk it states is at least what the diff makes it, with why.
+    let body_text = super::pr_risk::enforce(&body_text, &risk_floor);
 
     // Add issue link for GitHub tickets.
     // Strip any "Closes #N" the model may have included to avoid duplication.
@@ -1463,6 +1480,7 @@ fn request_block(requests: &[String]) -> String {
 pub async fn refresh_description(
     state: &WorkerState,
     github: &GitHubClient,
+    team: (&str, u64),
     owner: &str,
     repo: &str,
     pr_number: u64,
@@ -1491,6 +1509,18 @@ pub async fn refresh_description(
     }
     let diff = github.get_diff(owner, repo, &base, &head).await.ok()?;
     let patches = format_diff_patches(&diff);
+    let risk_files = super::pr_risk::diff_files(&diff);
+    let risk_floor = super::pr_risk::floor(
+        &risk_files,
+        &super::pr_risk::importers(
+            state,
+            team.0,
+            team.1,
+            &format!("{owner}/{repo}"),
+            &risk_files,
+        )
+        .await,
+    );
     let lead = if requests.is_empty() {
         "This pull request got more commits after its description was written. Rewrite the description so every statement in it is true of the diff below, which is the whole change as it stands now."
     } else {
@@ -1513,12 +1543,16 @@ pub async fn refresh_description(
 - Keep any line that starts with "Source ticket:", "Closes #", "Fixes #" or "Resolves #" exactly as it is, and keep any HTML comments and `<sub>` lines at the end exactly as they are.
 - Remove or correct anything the diff no longer bears out (a field name, a guess, a step, a file), and describe what the later commits changed.
 - Keep the Evidence list (what was looked up and what came back), unless the diff no longer relies on what it describes.
+- Rewrite Changes from this diff, one entry per changed file or area: a statement about an earlier version ("schema only", "not registered or rendered yet", "follow-up PR") that the diff no longer bears out goes, it is never kept beside the new one.
+- Risk follows from this diff: a change to a file every page or request goes through (a shared query or fragment, a layout, middleware, global config) or a new network call per page render is never Low; say the level in bold and why.
+- Verification names only commands whose results this description's own sections show for the current commit, with their counts; a result of an earlier commit (a suite that failed then, an old count) goes.{risk_note}
 {shape_rules}
 - Don't add filler. If the description is already true and nothing was asked, return it unchanged.
 
 Return ONLY the markdown body text, then a line `{CHANGES_MARK}` and one bullet per change you made to the description, in a few words each."#,
         requests = request_block(requests),
         files = format_diff_summary(&diff),
+        risk_note = super::pr_risk::writer_note(&risk_floor),
         shape_rules = SHAPE_RULES,
     );
     let mut messages = vec![(
@@ -1572,6 +1606,8 @@ Return ONLY the markdown body text, then a line `{CHANGES_MARK}` and one bullet 
     )
     .await;
     let written = split_changes(&written).0;
+    // The Risk it states is at least what the diff now makes it.
+    let written = super::pr_risk::enforce(&written, &risk_floor);
     if !keeps_ticket_line(&old, &written) {
         warn!(
             pr_number,

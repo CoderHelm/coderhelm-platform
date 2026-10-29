@@ -1076,17 +1076,34 @@ Then the ```fix_location.json block described above."#,
                 files.tasks = super::resolved::keep_open(&asked, &v);
             }
         }
-        if let Some(d) = files.fix.as_mut() {
-            let qs = common::run_questions::from_lines(&d.questions);
-            let v = super::resolved::judge(state, provider, &qs, &msg.answers, usage).await;
-            if v.iter().any(|v| !v.may_ask()) {
-                d.questions = qs
-                    .into_iter()
-                    .zip(v)
-                    .filter(|(_, v)| v.may_ask())
-                    .map(|(q, _)| q.question)
-                    .collect();
-            }
+    }
+    // The decision's questions don't stop the run; each is checked against
+    // everything that settles it on the ticket: the answers, the ticket's
+    // own text (a ticket that says it replaces earlier work answers a
+    // question about that work) and what people wrote on it. A settled one
+    // is dropped here, so it is neither asked on the ticket nor listed in
+    // the pull request again.
+    if let Some(d) = files.fix.as_mut().filter(|d| !d.questions.is_empty()) {
+        let notes = super::open_pr_choice::load_record(state, &msg.team_id, &msg.ticket_id)
+            .await
+            .notes;
+        let settled = super::resolved::settled_on_ticket(
+            &msg.answers,
+            &ticket_text(&msg.title, &msg.body),
+            &notes,
+        );
+        let qs = common::run_questions::from_lines(&d.questions);
+        let v = super::resolved::judge(state, provider, &qs, &settled, usage).await;
+        if v.iter().any(|v| !v.may_ask()) {
+            info!(
+                ticket_id = %msg.ticket_id,
+                dropped = v.iter().filter(|v| !v.may_ask()).count(),
+                "The ticket already settles some of the plan's questions — not asking them"
+            );
+            d.questions = super::resolved::open_only(qs, &v)
+                .into_iter()
+                .map(|q| q.question)
+                .collect();
         }
     }
 
