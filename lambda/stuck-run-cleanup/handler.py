@@ -63,6 +63,7 @@ ROUND_LABELS = {
     "feedback": "feedback round",
     "security_fix": "security fix round",
     "conflict_fix": "conflict round",
+    "planned_work": "planned-work round",
 }
 
 _dynamodb = None
@@ -167,7 +168,7 @@ def round_kind(run, pass_name):
         return "ci_fix"
     if p == "feedback":
         return "feedback"
-    if p in ("security_fix", "conflict_fix"):
+    if p in ("security_fix", "conflict_fix", "planned_work"):
         return p
     return "review_fix"
 

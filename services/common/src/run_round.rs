@@ -82,6 +82,11 @@ pub enum Kind {
     /// it: CoderHelm merges the base into its own pull request's branch,
     /// once (`await_merge`).
     Conflict,
+    /// Planned work the check before the pull request still found not done
+    /// after its fix round: the pull request opened as a draft with it
+    /// listed under "Not finished", and CoderHelm keeps working it in
+    /// rounds of its own while each round makes progress.
+    PlannedWork,
 }
 
 impl Kind {
@@ -92,6 +97,7 @@ impl Kind {
             Kind::Feedback => "feedback",
             Kind::SecurityFix => "security_fix",
             Kind::Conflict => "conflict_fix",
+            Kind::PlannedWork => "planned_work",
         }
     }
 
@@ -102,6 +108,7 @@ impl Kind {
             "feedback" => Some(Kind::Feedback),
             "security_fix" => Some(Kind::SecurityFix),
             "conflict_fix" => Some(Kind::Conflict),
+            "planned_work" => Some(Kind::PlannedWork),
             _ => None,
         }
     }
@@ -114,6 +121,7 @@ impl Kind {
             "feedback" => Kind::Feedback,
             "security_fix" => Kind::SecurityFix,
             "conflict_fix" => Kind::Conflict,
+            "planned_work" => Kind::PlannedWork,
             _ => Kind::ReviewFix,
         }
     }
@@ -126,6 +134,7 @@ impl Kind {
             Kind::Feedback => "feedback round",
             Kind::SecurityFix => "security fix round",
             Kind::Conflict => "conflict round",
+            Kind::PlannedWork => "planned-work round",
         }
     }
 }
@@ -171,6 +180,9 @@ pub struct Round {
     /// The branch the round writes its checkpoints to (empty until it
     /// starts working).
     pub wip_branch: String,
+    /// Planned-work rounds in a row, before this one, that made no progress
+    /// (no task finished and nothing pushed). Two stop the work.
+    pub stalled: u32,
 }
 
 /// The branch a round on `pr_branch` keeps its checkpoints on: a branch of
@@ -227,6 +239,7 @@ impl Round {
             feedback: cut(feedback, MAX_FEEDBACK_CHARS),
             scoped,
             wip_branch: String::new(),
+            stalled: 0,
         }
     }
 
@@ -267,6 +280,7 @@ impl Round {
             ("feedback".to_string(), s(&self.feedback)),
             ("scoped".to_string(), AttributeValue::Bool(self.scoped)),
             ("wip_branch".to_string(), s(&self.wip_branch)),
+            ("stalled".to_string(), n(self.stalled)),
         ]))
     }
 
@@ -291,6 +305,7 @@ impl Round {
                 .copied()
                 .unwrap_or(true),
             wip_branch: get_s(m, "wip_branch"),
+            stalled: get_n(m, "stalled"),
         })
     }
 
@@ -678,11 +693,14 @@ mod tests {
         assert_eq!(Kind::of_pass("feedback"), Kind::Feedback);
         assert_eq!(Kind::of_pass("implement"), Kind::ReviewFix);
         assert_eq!(Kind::of_pass("security_fix:1"), Kind::SecurityFix);
+        assert_eq!(Kind::of_pass("planned_work:2"), Kind::PlannedWork);
         for k in [
             Kind::CiFix,
             Kind::ReviewFix,
             Kind::Feedback,
             Kind::SecurityFix,
+            Kind::Conflict,
+            Kind::PlannedWork,
         ] {
             assert_eq!(Kind::parse(k.as_str()), Some(k));
         }
@@ -702,5 +720,19 @@ mod tests {
         assert!(sweep.contains(&format!("ROUND_SWEEP_GRACE_SECONDS = {SWEEP_GRACE_SECS}")));
         assert!(sweep.contains(&format!("ROUND_BUDGET_SECONDS = {BUDGET_SECS}")));
         assert!(sweep.contains("Pull request open; the last fix round didn't finish"));
+        for k in [
+            Kind::CiFix,
+            Kind::ReviewFix,
+            Kind::Feedback,
+            Kind::SecurityFix,
+            Kind::Conflict,
+            Kind::PlannedWork,
+        ] {
+            assert!(
+                sweep.contains(&format!("\"{}\": \"{}\"", k.as_str(), k.label())),
+                "the sweep names the {}",
+                k.label()
+            );
+        }
     }
 }
