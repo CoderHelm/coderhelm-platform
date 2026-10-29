@@ -12,6 +12,8 @@ use std::sync::OnceLock;
 use regex::Regex;
 use serde_json::{json, Value};
 
+use super::suite_shell;
+
 /// Files that say how a repository runs its tests, read in this order.
 pub const SOURCES: &[&str] = &[
     "AGENTS.md",
@@ -52,7 +54,13 @@ tests need (the CI step's install commands, the lockfile's package manager). `co
 every test, not a subset: no file filters, no `-k`, no single package, unless the repository \
 itself always runs it that way. Leave out end-to-end suites that need a browser, a deployed \
 site or real cloud services, and name each one in `left_out`. `source` names the file and step \
-it came from. When nothing in the files says how the tests run and there are no tests, set \
+it came from. `setup` and `command` run as-is under bash: every word is a real command. A \
+workflow step with `uses:` is a GitHub Action, not shell: write the exact shell the list of \
+`uses:` steps gives for it, or leave it out; never describe a step in words. \
+`instructions_command` is the test command AGENTS.md, CLAUDE.md, CONTRIBUTING or the README \
+tell a person to run (empty when none). `simple_command` is the simplest command that runs \
+the tests with the language's own runner (`python -m pytest`, `npm test`, `go test ./...`), \
+empty when none. When nothing in the files says how the tests run and there are no tests, set \
 found to false and say why.";
 
 pub fn schema() -> Value {
@@ -64,9 +72,11 @@ pub fn schema() -> Value {
             "command": {"type": "string"},
             "source": {"type": "string"},
             "left_out": {"type": "array", "items": {"type": "string"}},
+            "instructions_command": {"type": "string"},
+            "simple_command": {"type": "string"},
             "reason": {"type": "string"}
         },
-        "required": ["found", "setup", "command", "source", "left_out", "reason"],
+        "required": ["found", "setup", "command", "source", "left_out", "instructions_command", "simple_command", "reason"],
         "additionalProperties": false
     })
 }
@@ -78,18 +88,101 @@ pub struct Suite {
     pub command: String,
     pub source: String,
     pub left_out: Vec<String>,
+    /// The test command the repository's instructions give a person.
+    pub instructions_command: String,
+    /// The simplest command that runs the tests.
+    pub simple_command: String,
+    /// What became of the workflow steps written as words.
+    pub notes: Vec<String>,
 }
 
 impl Suite {
-    /// The one shell command the sandbox runs.
-    pub fn script(&self) -> String {
-        if self.setup.trim().is_empty() {
-            self.command.trim().to_string()
-        } else {
-            format!("{} && {}", self.setup.trim(), self.command.trim())
+    /// The suite with every workflow step written as words replaced by its
+    /// shell or left out ([`suite_shell::sanitize`]), from the files read.
+    pub fn sanitized(mut self, files: &[(String, String)]) -> Suite {
+        let steps = suite_shell::workflow_steps(files);
+        let mut notes = std::mem::take(&mut self.notes);
+        self.setup = suite_shell::sanitize(&self.setup, &steps, &mut notes);
+        self.command = suite_shell::sanitize(&self.command, &steps, &mut notes);
+        for c in [&mut self.instructions_command, &mut self.simple_command] {
+            *c = suite_shell::sanitize(c, &steps, &mut notes);
         }
+        if self.simple_command.is_empty() {
+            self.simple_command = suite_shell::simplest_command(files).unwrap_or_default();
+        }
+        self.notes = notes;
+        self
+    }
+
+    /// The commands to try, in order: the one the requester named (with
+    /// the setup, then without), else the derived one; then the
+    /// repository's instructions; then the simplest. Each command once.
+    pub fn candidates(&self, requester: Option<&str>) -> Vec<Candidate> {
+        let mut out: Vec<Candidate> = Vec::new();
+        let mut add = |setup: &str, command: &str, source: String, origin: Origin| {
+            let command = command.trim();
+            if command.is_empty()
+                || out
+                    .iter()
+                    .any(|c| c.command == command && c.setup == setup.trim())
+            {
+                return;
+            }
+            out.push(Candidate {
+                setup: setup.trim().to_string(),
+                command: command.to_string(),
+                source,
+                origin,
+            });
+        };
+        let setup = self.setup.as_str();
+        if let Some(r) = requester.filter(|r| !r.trim().is_empty()) {
+            let src = "the command the requester named".to_string();
+            add(setup, r, src.clone(), Origin::Requester);
+            add("", r, src, Origin::Requester);
+        } else {
+            add(setup, &self.command, self.source.clone(), Origin::Derived);
+        }
+        let inst = "the repository's instructions".to_string();
+        add(
+            setup,
+            &self.instructions_command,
+            inst.clone(),
+            Origin::Instructions,
+        );
+        add("", &self.instructions_command, inst, Origin::Instructions);
+        let simple = "the simplest test command in the repository".to_string();
+        add(
+            setup,
+            &self.simple_command,
+            simple.clone(),
+            Origin::Simplest,
+        );
+        add("", &self.simple_command, simple, Origin::Simplest);
+        out
     }
 }
+
+/// Where a command to try came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Origin {
+    Requester,
+    Derived,
+    Instructions,
+    Simplest,
+}
+
+/// One command to try in the sandbox.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Candidate {
+    pub setup: String,
+    pub command: String,
+    pub source: String,
+    pub origin: Origin,
+}
+
+/// Most sandbox builds one round spends finding a command that runs.
+pub const MAX_TRIES: usize = 3;
 
 /// The discovery's answer read: the suite, or why there is none.
 pub fn parse(answer: &Value) -> Result<Suite, String> {
@@ -124,6 +217,9 @@ pub fn parse(answer: &Value) -> Result<Suite, String> {
                     .collect()
             })
             .unwrap_or_default(),
+        instructions_command: s("instructions_command"),
+        simple_command: s("simple_command"),
+        notes: Vec::new(),
     })
 }
 
@@ -136,6 +232,7 @@ pub fn prompt(files: &[(String, String)]) -> String {
             common::head_tail_str(text, MAX_SOURCE)
         ));
     }
+    out.push_str(&suite_shell::uses_prompt(files));
     out
 }
 
@@ -297,15 +394,21 @@ pub enum Outcome {
         command: String,
         source: String,
         counts: Option<Counts>,
+        /// The commands that broke before this one ran, and why.
+        broke: Vec<(String, String)>,
     },
-    /// Ran and failed.
+    /// Ran and failed: the tests themselves.
     Failed {
         command: String,
         source: String,
         counts: Option<Counts>,
         exit: Option<i32>,
         tail: String,
+        broke: Vec<(String, String)>,
     },
+    /// Every command tried broke before the tests ran: CoderHelm's own
+    /// setup, never the change. Each command and why.
+    Broken(Vec<(String, String)>),
     /// Could not run; why.
     NotRun(String),
 }
@@ -322,26 +425,59 @@ impl Outcome {
                 command,
                 source,
                 counts: c,
+                broke,
             } => format!(
-                "Full test suite passed: `{}` ({}), from {source}",
+                "Full test suite passed: `{}` ({}), from {source}{}",
                 one_line(command),
-                counts(c)
+                counts(c),
+                after(broke)
             ),
             Outcome::Failed {
                 command,
                 source,
                 counts: c,
                 exit,
+                broke,
                 ..
             } => format!(
-                "Full test suite FAILED (exit {}): `{}` ({}), from {source}",
+                "Full test suite FAILED (exit {}): `{}` ({}), from {source}{}",
                 exit.map(|e| e.to_string()).unwrap_or_else(|| "?".into()),
                 one_line(command),
-                counts(c)
+                counts(c),
+                after(broke)
+            ),
+            Outcome::Broken(tried) => format!(
+                "The tests could not run in the sandbox, so this change was pushed without a \
+                 sandbox test run. CoderHelm's own test setup broke, not the tests: {}",
+                tried
+                    .iter()
+                    .map(|(c, why)| format!("`{}` {}", one_line_short(c), why))
+                    .collect::<Vec<_>>()
+                    .join("; ")
             ),
             Outcome::NotRun(why) => format!("Full test suite not run: {why}"),
         }
     }
+}
+
+/// What broke before the command that ran, for its evidence line.
+fn after(broke: &[(String, String)]) -> String {
+    if broke.is_empty() {
+        return String::new();
+    }
+    format!(
+        " (after CoderHelm's own command broke before any test ran: {})",
+        broke
+            .iter()
+            .map(|(c, why)| format!("`{}` {why}", one_line_short(c)))
+            .collect::<Vec<_>>()
+            .join("; ")
+    )
+}
+
+fn one_line_short(s: &str) -> String {
+    let l = s.split_whitespace().collect::<Vec<_>>().join(" ");
+    common::truncate_str(&l, 160).to_string()
 }
 
 fn one_line(s: &str) -> String {
@@ -439,11 +575,24 @@ mod tests {
             "reason": ""
         }))
         .unwrap();
-        assert!(s
-            .script()
-            .starts_with("pip install -r requirements.txt && for f in"));
-        assert!(s.script().contains("PYTHONHASHSEED=0"));
+        assert_eq!(s.setup, "pip install -r requirements.txt");
+        assert!(s.command.starts_with("for f in"));
+        assert!(s.command.contains("PYTHONHASHSEED=0"));
         assert_eq!(s.left_out, vec!["e2e (needs a browser)".to_string()]);
+        // The derived command runs, then the fallbacks, each once.
+        let c = s.candidates(None);
+        assert_eq!(c[0].origin, Origin::Derived);
+        assert_eq!(c[0].setup, "pip install -r requirements.txt");
+        assert_eq!(c.len(), 1);
+        // The requester's command comes first, with the setup, then without.
+        let c = s.candidates(Some("make test"));
+        assert_eq!(c[0].command, "make test");
+        assert_eq!(c[0].origin, Origin::Requester);
+        assert_eq!(
+            (c[1].command.as_str(), c[1].setup.as_str()),
+            ("make test", "")
+        );
+        assert!(c.iter().all(|c| !c.command.starts_with("for f in")));
         let none = parse(
             &json!({"found": false, "setup": "", "command": "", "source": "", "left_out": [], "reason": "no tests in the repository"}),
         );
@@ -517,6 +666,7 @@ mod tests {
                 failed: 0,
                 skipped: 3,
             }),
+            broke: vec![],
         };
         assert_eq!(
             o.line(),
