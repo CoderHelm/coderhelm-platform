@@ -247,7 +247,9 @@ impl Mechanics {
 pub const RELEASE_GUIDANCE: &str = "\
 When the change migrates data or content and removes, renames or changes the meaning of a field \
 that deployed code reads, split it (expand, then contract), and write `release` in the \
-fix_location.json block:
+fix_location.json block. A migration that only writes values (a data fix such as `UPDATE ... SET \
+start_time = ..., updated_at = now()`) or only adds a field runs any time and needs no `release`; \
+never list a column it writes as an old field:
 - `fields`: each change, `{\"old\": [\"oldA\", \"oldB\"], \"new\": \"newField\", \"types\": [...]}`.
 - `migrations`: an `expand` migration that only sets the new field where it is missing (old code \
 ignores it; it can run any time), and a separate `contract` migration that removes the old fields. \
@@ -822,6 +824,13 @@ pub fn touches(text: &str) -> Touches {
             (r#"\bremove_column\s*\(?\s*:\w+\s*,\s*:(\w+)"#, 0),
             (r#"\badd_column\s*\(?\s*:\w+\s*,\s*:(\w+)"#, 1),
             (r#"\brename_column\s*\(?\s*:\w+\s*,\s*:(\w+)\s*,\s*:(\w+)"#, 2),
+            // Query-builder schema calls: `dropColumn("table", "col")`,
+            // `table.dropColumn("col")`, `renameColumn("table", "a", "b")`,
+            // `table.renameColumn("a", "b")`.
+            (r#"\bdropColumns?\(\s*["'`]?[\w.]+["'`]?\s*,\s*["'`](\w+)["'`]"#, 0),
+            (r#"\bdropColumns?\(\s*["'`](\w+)["'`]\s*\)"#, 0),
+            (r#"\brenameColumn\(\s*["'`]?[\w.]+["'`]?\s*,\s*["'`](\w+)["'`]\s*,\s*["'`](\w+)["'`]"#, 2),
+            (r#"\brenameColumn\(\s*["'`](\w+)["'`]\s*,\s*["'`](\w+)["'`]\s*\)"#, 2),
         ]
         .into_iter()
         .map(|(p, k)| (Regex::new(p).unwrap(), k))
@@ -1028,11 +1037,25 @@ fn says_no_look(t: &str) -> bool {
 /// What a plan's release lacks, as instructions to the planner (empty when
 /// it is complete or the plan migrates nothing). `task_paths`: the files
 /// the plan's tasks change.
-pub fn gaps(release: Option<&Release>, task_paths: &[String], m: &Mechanics) -> Vec<String> {
+///
+/// Only a real removal or rename is split into expand and contract: a
+/// migration that writes values (`UPDATE classes SET start_time = '08:00',
+/// updated_at = now()`) or only adds a field runs any time and needs no
+/// release. A field counts as removed when the plan's own words remove,
+/// drop, rename or unset it (`text`: the plan's text, see
+/// [`shows_removal`]) or the plan already planned the contract migration
+/// that removes it; a field the planner lists as both old and new is
+/// written, not removed.
+pub fn gaps(
+    release: Option<&Release>,
+    task_paths: &[String],
+    text: &str,
+    m: &Mechanics,
+) -> Vec<String> {
     let migrates = task_paths.iter().any(|p| is_migration(p));
     let r = match release {
         Some(r) if !r.is_empty() => r,
-        _ if migrates => {
+        _ if migrates && shows_removal(text, None) => {
             return vec![format!(
                 "The plan migrates data ({}). Write `release` in the fix_location.json block: \
                  the fields it changes, an expand and a separate contract migration, the \
@@ -1049,7 +1072,7 @@ pub fn gaps(release: Option<&Release>, task_paths: &[String], m: &Mechanics) -> 
         _ => return Vec::new(),
     };
     let mut out = Vec::new();
-    let removed = r.removed_fields();
+    let removed = real_removals(r, text);
     let in_tasks = |f: &str| {
         let f = f.trim().trim_start_matches("./");
         !f.is_empty() && task_paths.iter().any(|p| p == f || p.ends_with(f))
@@ -1172,7 +1195,7 @@ fn deploy_summary(m: &Mechanics) -> String {
     )
 }
 
-/// The release gaps of a plan, from its decision and tasks.
+/// The release gaps of a plan, from its decision, tasks and words.
 pub fn plan_gaps(plan: &super::plan::PlanResult, m: &Mechanics) -> Vec<String> {
     let paths: Vec<String> = super::plan_coverage::plan_tasks(&plan.tasks)
         .into_iter()
@@ -1181,8 +1204,116 @@ pub fn plan_gaps(plan: &super::plan::PlanResult, m: &Mechanics) -> Vec<String> {
     gaps(
         plan.fix.as_ref().and_then(|d| d.release.as_ref()),
         &paths,
+        &super::plan_judge::plan_text(plan),
         m,
     )
+}
+
+/// Verbs that take a field away. `replace` is not one: a data fix replaces
+/// values.
+const REMOVAL_VERBS: &[&str] = &[
+    "remov", "drop", "renam", "unset", "deprecat", "retir", "delet",
+];
+
+/// Words that say the object of a removal is a field.
+const FIELD_NOUNS: &[&str] = &["column", "field", "property", "attribute"];
+
+/// Whether `text` takes a field away: a migration statement that removes or
+/// renames one (see [`touches`]), or words that remove, drop, rename or
+/// unset it. With `field`, that field must be the one named next to the
+/// verb (within the same clause); without, any column or field. Writing a
+/// value is never a removal: `UPDATE t SET updated_at = now()`, `set({...})`
+/// and `DELETE FROM t WHERE ...` (rows, not a field) all say no.
+pub fn shows_removal(text: &str, field: Option<&str>) -> bool {
+    let t = touches(text);
+    match field {
+        Some(f) if t.removes.contains(f) => return true,
+        None if !t.removes.is_empty() => return true,
+        _ => {}
+    }
+    for clause in text.split(['.', '\n', ';', '!', '?']) {
+        let lower = clause.to_ascii_lowercase();
+        let words: Vec<(usize, &str)> = word_spans(&lower);
+        let verbs: Vec<usize> = words
+            .iter()
+            .enumerate()
+            .filter(|(i, (_, w))| {
+                REMOVAL_VERBS.iter().any(|v| w.starts_with(v))
+                    // `delete from t` deletes rows; `deleted_at` is a column.
+                    && !(w.starts_with("delet")
+                        && (words.get(i + 1).is_some_and(|(_, n)| *n == "from")
+                            || w.contains('_')))
+            })
+            .map(|(i, _)| i)
+            .collect();
+        if verbs.is_empty() {
+            continue;
+        }
+        let near = |pred: &dyn Fn(&str) -> bool| {
+            verbs.iter().any(|&v| {
+                let lo = v.saturating_sub(6);
+                let hi = (v + 7).min(words.len());
+                words[lo..hi].iter().any(|(_, w)| pred(w))
+            })
+        };
+        let hit = match field {
+            Some(f) => {
+                let f = f.to_ascii_lowercase();
+                near(&|w: &str| w == f)
+            }
+            None => near(&|w: &str| {
+                FIELD_NOUNS
+                    .iter()
+                    .any(|n| w == *n || w.strip_suffix('s') == Some(n))
+            }),
+        };
+        if hit {
+            return true;
+        }
+    }
+    false
+}
+
+/// The identifier-like words of `text` (letters, digits, `_`), with where
+/// each starts.
+fn word_spans(text: &str) -> Vec<(usize, &str)> {
+    let mut out = Vec::new();
+    let mut start: Option<usize> = None;
+    for (i, c) in text.char_indices() {
+        let ident = c.is_ascii_alphanumeric() || c == '_';
+        match (ident, start) {
+            (true, None) => start = Some(i),
+            (false, Some(s)) => {
+                out.push((s, &text[s..i]));
+                start = None;
+            }
+            _ => {}
+        }
+    }
+    if let Some(s) = start {
+        out.push((s, &text[s..]));
+    }
+    out
+}
+
+/// The fields a plan's release really removes: each old field that is not
+/// also the change's new field (written, not removed), and that the plan's
+/// words take away or its planned contract migration removes.
+pub fn real_removals(r: &Release, text: &str) -> Vec<String> {
+    let contract = r.contract().is_some();
+    let mut out: Vec<String> = Vec::new();
+    for f in &r.fields {
+        for o in &f.old {
+            let o = o.trim();
+            if o.is_empty() || o == f.new.trim() || out.iter().any(|x| x == o) {
+                continue;
+            }
+            if contract || shows_removal(text, Some(o)) {
+                out.push(o.to_string());
+            }
+        }
+    }
+    out
 }
 
 // ── The release steps ───────────────────────────────────────────────────────
@@ -2009,6 +2140,100 @@ jobs:
         );
     }
 
+    /// A schedule data fix: one migration writes the right class time and
+    /// bumps `updated_at`. Writing a column is not removing it, so the plan
+    /// needs no expand and contract (a run once was sent back to split a
+    /// data fix because its release listed `updated_at`).
+    #[test]
+    fn writing_a_column_is_not_a_removal() {
+        let sql = "UPDATE class_schedule SET start_time = '08:00', updated_at = now() \
+                   WHERE class_id = 42;";
+        let t = touches(sql);
+        assert!(t.removes.is_empty(), "{t:?}");
+        assert!(!shows_removal(sql, None));
+        assert!(!shows_removal(sql, Some("updated_at")));
+        let rows = "DELETE FROM class_schedule WHERE updated_at < now() - interval '1 year';";
+        assert!(
+            !shows_removal(rows, Some("updated_at")),
+            "rows, not a field"
+        );
+        let soft = "Set deleted_at on the duplicate row and update updated_at.";
+        assert!(!shows_removal(soft, Some("updated_at")));
+
+        let files = vec![(
+            "src/database/migrations/1783400000000-FixClassTime.ts".to_string(),
+            "added".to_string(),
+            format!("+await queryRunner.query(`{sql}`);"),
+        )];
+        assert!(diff_gaps(&files).is_empty(), "{:?}", diff_gaps(&files));
+
+        let plan_text = "Correct the Saturday class time from 9am to 8am with a data \
+                         migration that runs UPDATE class_schedule SET start_time = '08:00', \
+                         updated_at = now() for the one class.";
+        let paths = vec!["src/database/migrations/1783400000000-FixClassTime.ts".to_string()];
+        assert!(gaps(None, &paths, plan_text, &repo()).is_empty());
+        // The planner listed the column it writes as a changed field: still
+        // no removal.
+        let written = Release {
+            fields: vec![FieldChange {
+                old: vec!["updated_at".into()],
+                new: String::new(),
+                types: vec![],
+            }],
+            ..Default::default()
+        };
+        let g = gaps(Some(&written), &paths, plan_text, &repo()).join("\n");
+        assert!(!g.contains("removes `updated_at`"), "{g}");
+        assert!(!g.contains("Plan two migrations"), "{g}");
+        let same = Release {
+            fields: vec![FieldChange {
+                old: vec!["start_time".into()],
+                new: "start_time".into(),
+                types: vec![],
+            }],
+            ..Default::default()
+        };
+        assert!(real_removals(&same, "Drop the start_time column").is_empty());
+    }
+
+    #[test]
+    fn a_real_removal_or_rename_is_still_split() {
+        let paths = vec!["db/migrations/0042_drop_legacy.sql".to_string()];
+        // No release yet: words or a statement that drop a column ask for one.
+        for text in [
+            "Drop the legacy_flag column once the new code reads is_featured.",
+            "ALTER TABLE pages DROP COLUMN legacy_flag;",
+            "Rename the `title` field to `headline`.",
+            "await queryRunner.dropColumn(\"pages\", \"legacy_flag\");",
+            "table.renameColumn('title', 'headline')",
+        ] {
+            let g = gaps(None, &paths, text, &repo());
+            assert_eq!(g.len(), 1, "{text}: {g:?}");
+            assert!(g[0].contains("Write `release`"), "{g:?}");
+        }
+        // A release whose old field the words remove: split it.
+        let r = Release {
+            fields: vec![FieldChange {
+                old: vec!["legacy_flag".into()],
+                new: "is_featured".into(),
+                types: vec![],
+            }],
+            ..Default::default()
+        };
+        let text = "Replace legacy_flag with is_featured, then remove legacy_flag.";
+        let g = gaps(Some(&r), &paths, text, &repo()).join("\n");
+        assert!(g.contains("removes `legacy_flag`"), "{g}");
+        assert!(g.contains("Plan two migrations"), "{g}");
+        // Query-builder schema calls are read as what they are.
+        let t = touches("await queryRunner.renameColumn(\"pages\", \"title\", \"headline\")");
+        assert!(
+            t.removes.contains("title") && t.sets.contains("headline"),
+            "{t:?}"
+        );
+        let t = touches("table.dropColumn('legacy_flag')");
+        assert!(t.removes.contains("legacy_flag"), "{t:?}");
+    }
+
     #[test]
     fn sql_rename_is_expand_and_contract_at_once() {
         let t = touches("ALTER TABLE t RENAME COLUMN old_name TO new_name;");
@@ -2061,6 +2286,10 @@ jobs:
         }
     }
 
+    /// The words of a plan that replaces two fields with a new one.
+    const PLAN_TEXT: &str = "Replace the hero's oldA and oldB flags with newFlag. The contract \
+                             migration removes the oldA and oldB fields after the production deploy.";
+
     fn tasks() -> Vec<String> {
         vec![
             "studio/migrations/expand.ts".into(),
@@ -2073,15 +2302,15 @@ jobs:
     #[test]
     fn a_complete_release_passes_the_plan_check() {
         assert!(
-            gaps(Some(&release()), &tasks(), &repo()).is_empty(),
+            gaps(Some(&release()), &tasks(), PLAN_TEXT, &repo()).is_empty(),
             "{:?}",
-            gaps(Some(&release()), &tasks(), &repo())
+            gaps(Some(&release()), &tasks(), PLAN_TEXT, &repo())
         );
     }
 
     #[test]
     fn a_plan_that_migrates_without_a_release_is_sent_back() {
-        let g = gaps(None, &tasks(), &repo());
+        let g = gaps(None, &tasks(), PLAN_TEXT, &repo());
         assert_eq!(g.len(), 1);
         assert!(g[0].contains("Production deploys on a `v*` tag"), "{g:?}");
     }
@@ -2093,7 +2322,7 @@ jobs:
         r.fallback.clear();
         r.impact.truncate(1);
         r.impact[0].result = "Direct dataset queries were not possible".into();
-        let g = gaps(Some(&r), &tasks(), &repo()).join("\n");
+        let g = gaps(Some(&r), &tasks(), PLAN_TEXT, &repo()).join("\n");
         assert!(g.contains("Plan two migrations"), "{g}");
         assert!(g.contains("release.fallback"), "{g}");
         assert!(g.contains("Count the affected items in production"), "{g}");
@@ -2109,14 +2338,14 @@ jobs:
         r.impact[1].result.clear();
         r.impact[1].error = "the read API returned 401 Unauthorized".into();
         r.live_items.clear();
-        assert!(gaps(Some(&r), &tasks(), &repo()).is_empty());
+        assert!(gaps(Some(&r), &tasks(), PLAN_TEXT, &repo()).is_empty());
     }
 
     #[test]
     fn production_items_must_be_named() {
         let mut r = release();
         r.live_items.clear();
-        let g = gaps(Some(&r), &tasks(), &repo());
+        let g = gaps(Some(&r), &tasks(), PLAN_TEXT, &repo());
         assert!(g.iter().any(|x| x.contains("release.live_items")), "{g:?}");
     }
 
