@@ -125,7 +125,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          [ "$GITHUB_REF" = refs/heads/main ] && [ "$GITHUB_SHA" = "$COMMIT" ] || { echo "::error::not main's deployed commit"; exit 1; }
+          if [ "$GITHUB_REF" != refs/heads/main ] || [ "$GITHUB_SHA" != "$COMMIT" ]; then echo "::error::not main's deployed commit"; exit 1; fi
           [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "::error::$TAG is not vX.Y.Z"; exit 1; }
           if gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$TAG" >/dev/null 2>&1; then
             echo "::error::$TAG exists already; a release tag is never re-cut or moved"; exit 1
