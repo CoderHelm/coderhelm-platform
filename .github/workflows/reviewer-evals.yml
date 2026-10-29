@@ -32,11 +32,11 @@ on:
       critic_model:
         description: >-
           The model the review critic runs on (it decides which findings are
-          kept, and so what blocks). Empty: the review model.
+          kept, and so what blocks). same: the review model.
         type: choice
-        default: ""
+        default: same
         options:
-          - ""
+          - same
           - us.anthropic.claude-opus-5-5
           - us.anthropic.claude-sonnet-5-5
       suite:
@@ -99,7 +99,7 @@ jobs:
           # (infra/lib/worker-stack.ts evalReviewModel), unless a manual run
           # picked another (the nightly run has no inputs).
           EVAL_REVIEW_MODEL: ${{ inputs.review_model || 'us.anthropic.claude-opus-5-5' }}
-          EVAL_CRITIC_MODEL: ${{ inputs.critic_model || inputs.review_model || 'us.anthropic.claude-opus-5-5' }}
+          EVAL_CRITIC_MODEL: ${{ (inputs.critic_model != '' && inputs.critic_model != 'same') && inputs.critic_model || inputs.review_model || 'us.anthropic.claude-opus-5-5' }}
           EVAL_IMPLEMENT_MODEL: ${{ inputs.implement_model || 'us.anthropic.claude-opus-5-5' }}
           EVAL_REPEAT: ${{ inputs.repeat || '1' }}
           SUITE: ${{ inputs.suite || 'nightly' }}
