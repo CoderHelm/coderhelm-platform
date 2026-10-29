@@ -128,3 +128,20 @@ test("the domain and update settings reach the installer", () => {
   const env = JSON.stringify(t.findResources("AWS::CodeBuild::Project"));
   for (const v of ["HOSTNAME_ARG", "HOSTED_ZONE", "AUTO_UPDATE", "UPDATE_WINDOW", "UPDATE_TIMEZONE"]) assert.ok(env.includes(v), v);
 });
+
+test("inline functions answer CloudFormation themselves, never through the cfnresponse helper", () => {
+  // The helper isn't provided on every runtime: a missing import crashed the
+  // starter and left the stack waiting an hour for an answer that never came.
+  const fs = require("node:fs") as typeof import("node:fs");
+  for (const f of fs.readdirSync(repoPath("infra", "cfn"))) {
+    if (!f.endsWith(".yaml")) continue;
+    const src = fs.readFileSync(repoPath("infra", "cfn", f), "utf8");
+    assert.doesNotMatch(src, /^\s*import[^\n]*\bcfnresponse\b/m, `${f} imports cfnresponse`);
+    assert.doesNotMatch(src, /cfnresponse\.send\(/, `${f} calls cfnresponse.send`);
+  }
+  const t = load().toJSON();
+  const code: string = t.Resources.StarterFunction.Properties.Code.ZipFile;
+  assert.match(code, /def respond\(event, context, status/);
+  assert.match(code, /urllib\.request\.Request\(event\["ResponseURL"\]/);
+  assert.match(code, /respond\(event, context, "FAILED"/);
+});

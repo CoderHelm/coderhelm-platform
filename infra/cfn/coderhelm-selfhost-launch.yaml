@@ -339,7 +339,24 @@ Resources:
       Role: !GetAtt StarterRole.Arn
       Code:
         ZipFile: |
-          import json, time, boto3, cfnresponse
+          import json, time, urllib.request, boto3
+
+          def respond(event, context, status, reason=""):
+              """Tells CloudFormation the result. Written here, not imported:
+              the cfnresponse helper isn't provided on every runtime, and a
+              missing import left stacks waiting an hour for an answer."""
+              body = json.dumps({
+                  "Status": status,
+                  "Reason": (reason or "See the log: " + context.log_stream_name)[:500],
+                  "PhysicalResourceId": "installer",
+                  "StackId": event["StackId"],
+                  "RequestId": event["RequestId"],
+                  "LogicalResourceId": event["LogicalResourceId"],
+                  "Data": {},
+              }).encode()
+              req = urllib.request.Request(event["ResponseURL"], data=body, method="PUT",
+                                           headers={"Content-Type": "", "Content-Length": str(len(body))})
+              urllib.request.urlopen(req, timeout=30).read()
 
           def public_status(bucket, p):
               """Lets anyone read status.json (only that file). Account-wide
@@ -371,10 +388,10 @@ Resources:
                           projectName=p["Project"],
                           environmentVariablesOverride=[{"name": "WAIT_URL", "value": p["WaitUrl"], "type": "PLAINTEXT"}],
                       )
-                  cfnresponse.send(event, context, cfnresponse.SUCCESS, {}, "installer")
+                  respond(event, context, "SUCCESS")
               except Exception as e:
                   print(e)
-                  cfnresponse.send(event, context, cfnresponse.FAILED, {"Error": str(e)[:200]}, "installer")
+                  respond(event, context, "FAILED", str(e)[:200])
 
   InstallDoneHandle:
     Type: AWS::CloudFormation::WaitConditionHandle
