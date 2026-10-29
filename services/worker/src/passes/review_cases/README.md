@@ -163,12 +163,17 @@ completes while its PR reviewer's verdict blocks.
 ## Verdict policy cases (`policy/`)
 
 `passes/review_policy_eval.rs` replays the review sequences behind the
-verdict rules in `passes/review_policy.rs` (one review per head commit, no
-flip on an unchanged commit without new information, only high-severity
-defects caused by the diff block, blockers raised up front). Each case is a
-list of steps (`push`, `comment`, `base_failing`, `claims_expire`, `review`,
-and `together` for jobs that start before any of them finishes) with the
-model output each review got, and `expect` lists the formal reviews posted.
+verdict rules in `passes/review_policy.rs` and the severity rubric in
+`passes/review_severity.rs` (one review per head commit, no flip on an
+unchanged commit without new information, blocking by default with notes
+only for inferred preferences, optional improvements and unchecked external
+state, blockers raised up front). Each case is a list of steps (`push`,
+`comment`, `base_failing`, `team_rules`, `claims_expire`, `review`, and
+`together` for jobs that start before any of them finishes) with the model
+output each review got (and the severity second pass's answer, `judge`, when
+it should answer), and `expect` lists the formal reviews posted. Graded
+findings from the production audit live in the file's `misgraded_findings`
+module.
 Every case also checks that jobs running together post one verdict per head,
 that an automatic trigger never reviews a reviewed head again, and that a
 verdict never changes on the same commit without new information and a

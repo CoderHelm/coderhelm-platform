@@ -1,0 +1,15 @@
+{
+  "description": "A Windows instance startup script installs a runtime with msiexec /norestart and throws on any exit code other than 0. The reviewer posted it as a non-blocking hardening note, not verified, because a fresh install usually returns 0. msiexec documents 3010 (success, reboot required) as a success, and the script runs once at provisioning with no retry: a verified defect on a one-shot path holds the merge.",
+  "steps": [
+    {"push": {"head": "e1e2e3e"}},
+    {"review": {"trigger": "synchronize", "dedup_key": "head#e1e2e3e",
+      "model": {"verdict": "APPROVE", "summary": "x", "findings": [
+        {"file": "modules/windows-host/main.tf", "line": 42, "severity": "medium", "category": "hardening", "evidence": "unverified-concern", "title": "msiexec 3010 (success, reboot required) would be logged as a failure", "body": "With /norestart, msiexec returns 3010 when the install succeeded but wants a reboot. The new check throws on any non-zero code, so a 3010 would stop the startup script before the main install step. A fresh install usually returns 0, so this may never happen.", "suggestion": "      if ($install.ExitCode -notin 0, 3010) { throw \"install failed with exit code $($install.ExitCode)\" }"}
+      ]}}}
+  ],
+  "expect": {
+    "formal": [["e1e2e3e", "REQUEST_CHANGES"]],
+    "last_notes": 0,
+    "body_contains": [[0, "[high]"], [0, "This blocks: msiexec exit codes 3010"], [0, "runs once in production"]]
+  }
+}

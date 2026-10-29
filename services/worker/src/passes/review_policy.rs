@@ -11,10 +11,10 @@
 //!    between approve and request-changes without new information (a
 //!    person's comment, a reply the formal review must follow); a flip says
 //!    why ([`stabilize`]).
-//! 3. Blocking policy: only a high-severity defect caused by the diff holds
-//!    the merge. Low and medium findings, nits, hardening, follow-ups the PR
-//!    already tracks and failures the base branch has too are notes
-//!    ([`apply_blocking_policy`]).
+//! 3. Blocking policy: which findings hold the merge is
+//!    [`super::review_severity`]'s decision (blocking by default). On top of
+//!    it, follow-ups the PR already tracks, problems the PR didn't cause and
+//!    failures the base branch has too are notes ([`apply_blocking_policy`]).
 //! 4. Blockers up front: after the first reviewed head, a new blocker may
 //!    only sit on lines changed since the previous reviewed head (or be one
 //!    a person's reply made relevant); any other is a note, and from round 3
@@ -174,34 +174,10 @@ pub fn blocking_severity(severity: &str) -> bool {
     )
 }
 
-/// Categories that are notes whatever their severity: style and wording
-/// nits, log levels, hardening that isn't a defect, follow-up work.
-const NOTE_CATEGORIES: &[&str] = &[
-    "style",
-    "nit",
-    "naming",
-    "formatting",
-    "logging",
-    "log-level",
-    "docs",
-    "documentation",
-    "hardening",
-    "follow-up",
-    "followup",
-    "maintainability",
-];
-
-fn note_category(category: &str) -> bool {
-    let c = category
-        .trim()
-        .to_ascii_lowercase()
-        .replace(['_', ' '], "-");
-    NOTE_CATEGORIES.contains(&c.as_str())
-}
-
 /// Makes a finding a note: it is still posted, it never holds the merge.
 /// `why` is appended to its body.
 pub fn demote(f: &mut Finding, why: &str) {
+    f.note_only = Some(why.to_string());
     if blocking_severity(&f.severity) {
         f.severity = "medium".to_string();
     }
@@ -216,11 +192,6 @@ pub fn demote(f: &mut Finding, why: &str) {
 
 /// Why a finding that would hold the merge is a note under rule 3, if it is.
 fn note_reason(f: &Finding, base_failing: &[String]) -> Option<&'static str> {
-    if note_category(&f.category) {
-        return Some(
-            "A note, not a block: style, logging and hardening points never hold the merge.",
-        );
-    }
     if f.tracked == Some(true) {
         return Some(
             "A note, not a block: the PR already tracks this as a follow-up, or it is outside this repository.",
@@ -242,10 +213,9 @@ fn note_reason(f: &Finding, base_failing: &[String]) -> Option<&'static str> {
     None
 }
 
-/// Rule 3. Only a high-severity defect caused by the diff (or a repo policy
-/// such as required tests, which sets `blocking`) holds the merge; everything
-/// else that would hold it becomes a note. Low and medium findings already
-/// don't hold it ([`Finding::holds_merge`]). Returns how many were demoted.
+/// Rule 3. A finding that would hold the merge ([`Finding::holds_merge`])
+/// but that the PR already tracks, didn't cause, or that the base branch
+/// fails too becomes a note. Returns how many were demoted.
 pub fn apply_blocking_policy(findings: &mut [Finding], base_failing: &[String]) -> usize {
     let mut n = 0;
     for f in findings.iter_mut() {
@@ -735,15 +705,15 @@ mod tests {
     }
 
     #[test]
-    fn only_high_severity_defects_hold_the_merge() {
+    fn a_defect_holds_the_merge_whatever_its_rated_severity() {
         for (sev, holds) in [
             ("blocking", true),
             ("high", true),
             ("critical", true),
-            ("medium", false),
-            ("low", false),
+            ("medium", true),
+            ("low", true),
             ("nit", false),
-            ("", false),
+            ("", true),
         ] {
             assert_eq!(defect("a.rs", 1, sev, "bug").holds_merge(), holds, "{sev}");
         }
@@ -769,15 +739,17 @@ mod tests {
             },
             defect("a.rs", 7, "high", "bug"),
         ];
+        // Style, logging and hardening are notes by the classifier already;
+        // the policy makes the tracked, uncaused and base-failing ones notes.
         let n = apply_blocking_policy(&mut fs, &["integration-tests".to_string()]);
-        assert_eq!(n, 6);
+        assert_eq!(n, 3);
         let holding: Vec<u64> = fs
             .iter()
             .filter(|f| f.holds_merge())
             .map(|f| f.line)
             .collect();
         assert_eq!(holding, vec![7]);
-        assert!(fs[0].body.contains("never hold the merge"));
+        assert!(fs[5].body.contains("fails on the base branch too"));
     }
 
     #[test]
@@ -800,11 +772,11 @@ mod tests {
             previous_head: Some("h2".into()),
         };
         let mut fs = vec![
-            defect("a.rs", 42, "high", "bug"),   // near a changed line: stays
-            defect("a.rs", 200, "high", "bug"),  // unchanged: held
-            defect("b.rs", 5, "high", "bug"),    // unchanged file: held
-            defect("b.rs", 9, "high", "bug"),    // an earlier thread: stays
-            defect("b.rs", 80, "medium", "bug"), // a note anyway: stays
+            defect("a.rs", 42, "high", "bug"),  // near a changed line: stays
+            defect("a.rs", 200, "high", "bug"), // unchanged: held
+            defect("b.rs", 5, "high", "bug"),   // unchanged file: held
+            defect("b.rs", 9, "high", "bug"),   // an earlier thread: stays
+            defect("b.rs", 80, "nit", "bug"),   // a note anyway: stays
             Finding {
                 prompted_by_reply: Some(true),
                 ..defect("b.rs", 120, "high", "bug")

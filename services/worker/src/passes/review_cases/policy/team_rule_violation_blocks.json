@@ -1,0 +1,17 @@
+{
+  "description": "The code skips missing or invalid records silently, while the team's written rules require a WARNING with the record id and a count in the run summary. The reviewer posted it as a convention note. Breaking a written team rule blocks when the finding quotes it; a rule the finding cites that the team never wrote is dropped, and the finding is then a preference note.",
+  "steps": [
+    {"team_rules": "## Data jobs\n- When a record is skipped because it is missing or invalid, log a WARNING with the record id and report the count of skipped records in the run summary.\n- Use the shared HTTP client."},
+    {"push": {"head": "d1d2d3d"}},
+    {"review": {"trigger": "synchronize", "dedup_key": "head#d1d2d3d",
+      "model": {"verdict": "APPROVE", "summary": "x", "findings": [
+        {"file": "jobs/import.py", "line": 30, "severity": "medium", "category": "convention", "evidence": "verified-defect", "team_rule": "log a WARNING with the record id and report the count of skipped records in the run summary", "title": "Invalid records are skipped silently", "body": "`continue` on a missing price drops the record with no log and no count."},
+        {"file": "jobs/import.py", "line": 50, "severity": "medium", "category": "convention", "evidence": "verified-defect", "team_rule": "Name every helper with a verb first", "title": "Rename parse to parse_rows", "body": "Helper names should start with a verb."}
+      ]}}}
+  ],
+  "expect": {
+    "formal": [["d1d2d3d", "REQUEST_CHANGES"]],
+    "last_notes": 1,
+    "body_contains": [[0, "[high] Invalid records are skipped silently"], [0, "[medium] Rename parse to parse_rows"]]
+  }
+}

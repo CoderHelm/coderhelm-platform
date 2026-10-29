@@ -394,6 +394,7 @@ impl Sim {
         if self.require_tests {
             review_agent::enforce_required_tests(&mut findings);
         }
+        super::review_severity::ground(&mut findings, "");
         review_agent::enforce_source_data_override(&mut findings);
         review_agent::enforce_manual_checks_are_notes(&mut findings);
         // Earlier threads the review reports settled close.
@@ -1107,6 +1108,7 @@ async fn live_review(
             None => out.findings,
         }
     };
+    super::review_severity::ground(&mut findings, "");
     review_agent::enforce_source_data_override(&mut findings);
     review_agent::enforce_manual_checks_are_notes(&mut findings);
     let unconfirmed = review_agent::unconfirmed_external_facts(&lr.body, &out.unconfirmed_facts);
@@ -1534,6 +1536,7 @@ fn review_eval_replays_every_run_case() {
                     serde_json::from_value(case.model_output.clone().expect("model_output"))
                         .expect("model_output is a review");
                 let mut findings = out.findings.clone();
+                super::review_severity::ground(&mut findings, "");
                 review_agent::enforce_source_data_override(&mut findings);
                 review_agent::enforce_manual_checks_are_notes(&mut findings);
                 let unconfirmed =

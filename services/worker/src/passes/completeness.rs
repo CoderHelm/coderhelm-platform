@@ -124,10 +124,14 @@ pub enum Section {
     /// fix round, at the top: the PR opens as a draft with it rather than
     /// the run ending with no PR (see `proof::unfinished_section`).
     Unfinished,
+    /// Findings of CoderHelm's own review of its own PR it hasn't fixed
+    /// yet, at the very top: the PR stays a draft while any is listed (see
+    /// `own_review`).
+    OpenFindings,
 }
 
 impl Section {
-    const ALL: [Section; 7] = [
+    const ALL: [Section; 8] = [
         Section::Links,
         Section::Mirrors,
         Section::MergeOrder,
@@ -135,6 +139,7 @@ impl Section {
         Section::ReviewFixes,
         Section::OpenItems,
         Section::Unfinished,
+        Section::OpenFindings,
     ];
 
     /// Its start and end markers.
@@ -156,6 +161,7 @@ impl Section {
             ),
             Section::OpenItems => (super::proof::UNVERIFIED_START, super::proof::UNVERIFIED_END),
             Section::Unfinished => (super::proof::UNFINISHED_START, super::proof::UNFINISHED_END),
+            Section::OpenFindings => (super::own_review::START, super::own_review::END),
         }
     }
 }
@@ -190,6 +196,7 @@ pub struct Owned {
     pub review_fixes: String,
     pub open_items: String,
     pub unfinished: String,
+    pub open_findings: String,
 }
 
 impl Owned {
@@ -202,6 +209,7 @@ impl Owned {
             Section::ReviewFixes => &mut self.review_fixes,
             Section::OpenItems => &mut self.open_items,
             Section::Unfinished => &mut self.unfinished,
+            Section::OpenFindings => &mut self.open_findings,
         }
     }
 
@@ -362,6 +370,15 @@ pub fn assemble(rest: &str, owned: &Owned) -> String {
             unfinished.to_string()
         } else {
             format!("{unfinished}\n\n{body}")
+        };
+    }
+    // Open findings of CoderHelm's own review go above everything.
+    let open_findings = owned.open_findings.trim();
+    if !open_findings.is_empty() {
+        body = if body.is_empty() {
+            open_findings.to_string()
+        } else {
+            format!("{open_findings}\n\n{body}")
         };
     }
     format!("{body}{footer}")
@@ -1099,6 +1116,7 @@ mod tests {
         let writer = "Closes #9\n\n**Summary** The report needs a reader.\n\n**Changes**\n* **Users** add `analytics_reader`\n\n**Risk** **Low**: one new user.\n\n**Verification**\n1. Run the plan.";
         let owned = Owned {
             unfinished: String::new(),
+            open_findings: String::new(),
             links: String::new(),
             mirrors: mirrors_section(&[Mirror {
                 path: "envs/prod/users.tf".into(),

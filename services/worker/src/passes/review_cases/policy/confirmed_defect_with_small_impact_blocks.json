@@ -1,0 +1,14 @@
+{
+  "description": "The PR set out to stop records flipping between full and incremental runs. The reviewer confirmed with a warehouse query that ties on the sort key still flip (9 records), then posted it as a medium note because most look old and the impact is likely small. A defect a data query confirms is verified, and estimated impact never lowers it.",
+  "steps": [
+    {"push": {"head": "b1b2b3b"}},
+    {"review": {"trigger": "synchronize", "dedup_key": "head#b1b2b3b",
+      "model": {"verdict": "APPROVE", "summary": "x", "findings": [
+        {"file": "models/orders_latest.sql", "line": 14, "severity": "medium", "category": "correctness", "evidence": "verified-defect", "basis": "data", "title": "Ties on the sort key still flip between runs", "body": "ROW_NUMBER() orders by updated_at only. A warehouse query found 9 records with two rows on the same updated_at; full and incremental runs pick different ones. Most look old, so the impact is likely small."}
+      ]}}}
+  ],
+  "expect": {
+    "formal": [["b1b2b3b", "REQUEST_CHANGES"]],
+    "last_notes": 0
+  }
+}
