@@ -552,6 +552,7 @@ mod tests {
                     change: "Raise the task's ephemeral storage and alarm on its use".into(),
                     where_: "the task definition".into(),
                     verify: "the alarm shows in CloudWatch".into(),
+                    ..Default::default()
                 }),
                 ..Default::default()
             }),

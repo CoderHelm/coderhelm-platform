@@ -373,6 +373,11 @@ async fn checklist_facts(
             .map(|(m, s)| format!("{m}: {s}"))
             .collect(),
         has_e2e: tree.iter().any(|p| content::is_e2e_spec(p)),
+        data_skips: files
+            .iter()
+            .filter(|(p, s, _)| s != "removed" && content::is_e2e_spec(p))
+            .flat_map(|(p, _, patch)| checklist::data_skips(p, patch))
+            .collect(),
     };
     (facts, maps)
 }
@@ -633,6 +638,7 @@ async fn content_outcome(
     let (owner, repo, base) = (&w.msg.repo_owner, &w.msg.repo_name, &w.msg.base_branch);
     let mut changes = Vec::new();
     let mut specs = Vec::new();
+    let mut schemas: Vec<(String, String)> = Vec::new();
     for (p, s, patch) in files {
         if s == "removed" {
             continue;
@@ -656,6 +662,7 @@ async fn content_outcome(
                 patch,
                 &content::type_name(&text),
             ));
+            schemas.push((p.clone(), text));
         }
     }
     if changes.is_empty() || !tree.iter().any(|p| content::is_e2e_spec(p)) {
@@ -693,11 +700,35 @@ async fn content_outcome(
         }
     }
     let prod = common::staging_cms::production_datasets_in_code(&prod_files);
+    // Each new block's fields and where documents hold it, so a block of
+    // that type already on staging is named for replacement.
+    let shapes: Vec<(String, content::BlockShape)> = needs
+        .iter()
+        .filter_map(|n| match n {
+            content::Need::BlockOnPage { block, .. } => {
+                let (fields, required) = schemas
+                    .iter()
+                    .find(|(_, t)| content::type_name(t) == *block)
+                    .map(|(_, t)| content::fields_of(t))
+                    .unwrap_or_default();
+                Some((
+                    block.clone(),
+                    content::BlockShape {
+                        fields,
+                        required,
+                        held_in: content::held_in(block, &schemas),
+                    },
+                ))
+            }
+            _ => None,
+        })
+        .collect();
     let out = content::settle(
         &w.state.http,
         conn.as_ref().map(|(c, t)| (c, t.as_str())),
         &prod,
         &needs,
+        &shapes,
     )
     .await;
     info!(
@@ -902,7 +933,12 @@ pub async fn gate(
             facts.checklist = static_items.into_iter().chain(sandbox).collect();
             facts.facts = cf;
             facts.maps = maps;
-            facts.questions = questions::collect(&w.plan.design, &evidence.notes);
+            facts.questions = open_questions(
+                w,
+                usage,
+                questions::collect(&w.plan.design, &evidence.notes),
+            )
+            .await;
             facts.sandbox_failed = sandbox_failed;
             facts.head = head;
             super::add_progress_note(
@@ -975,6 +1011,34 @@ pub async fn gate(
         }
         let _ = super::update_pass(w.state, &w.msg.team_id, w.run_id, "review").await;
     }
+}
+
+/// The product questions nothing on the ticket settles yet: the ticket's own
+/// text, people's comments on it and the answers given in CoderHelm are read
+/// first (see `resolved::settled_on_ticket`), so an answered question leaves
+/// the description instead of being asked on every update.
+async fn open_questions(
+    w: &super::proof::Work<'_>,
+    usage: &mut TokenUsage,
+    qs: Vec<String>,
+) -> Vec<String> {
+    if qs.is_empty() {
+        return qs;
+    }
+    let notes = super::open_pr_choice::load_record(w.state, &w.msg.team_id, &w.msg.ticket_id)
+        .await
+        .notes;
+    let settled = super::resolved::settled_on_ticket(
+        &w.msg.answers,
+        &super::plan::ticket_text(&w.msg.title, &w.msg.body),
+        &notes,
+    );
+    let asked = common::run_questions::from_lines(&qs);
+    let verdicts = super::resolved::judge(w.state, w.provider, &asked, &settled, usage).await;
+    super::resolved::open_only(asked, &verdicts)
+        .into_iter()
+        .map(|q| q.question)
+        .collect()
 }
 
 // ── the ready check ─────────────────────────────────────────────────────

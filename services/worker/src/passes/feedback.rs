@@ -1183,6 +1183,7 @@ Rules:
         let changed = super::pr::refresh_description(
             state,
             &github,
+            (&msg.team_id, msg.installation_id),
             &msg.repo_owner,
             &msg.repo_name,
             msg.pr_number,

@@ -3047,6 +3047,24 @@ async fn run_fix_round(
             match super::round::land(&gh, &round.wip_branch, &round.base_sha, &message).await {
                 super::round::Landed::Pushed { files } => {
                     super::round::clear(state, &msg.team_id, &msg.run_id).await;
+                    // The pull request changed: its description is rewritten
+                    // from the whole diff now, never left on the earlier
+                    // version.
+                    if files > 0 {
+                        let _ = super::pr::refresh_description(
+                            state,
+                            &ctx.github,
+                            (&msg.team_id, ctx.ticket_msg.installation_id),
+                            pr.owner,
+                            pr.repo,
+                            pr.number,
+                            &ctx.ticket_msg.team_instructions,
+                            &[],
+                            &ctx.provider,
+                            &mut ctx.usage,
+                        )
+                        .await;
+                    }
                     Ok(RoundEnd::Done { files })
                 }
                 super::round::Landed::Nothing => {

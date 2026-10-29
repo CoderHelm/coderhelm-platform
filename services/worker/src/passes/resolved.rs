@@ -42,8 +42,74 @@ pub const SYSTEM: &str = "An automated coding agent (CoderHelm) wants to ask a p
      with the settled answer's number), or whether it is something CoderHelm must decide \
      itself and never ask a person (system_decides): whether to close, replace or take over a \
      pull request someone else opened when a person already said to open CoderHelm's own, or \
-     anything the settled answers plus ordinary engineering judgement decide. Otherwise it is \
+     anything the settled answers plus ordinary engineering judgement decide. The ticket's own \
+     text and people's comments on the ticket are listed as settled entries too: when the ticket \
+     already states the answer (for example that this work replaces an earlier pull request or \
+     attempt), or a person's comment answers it, the question is covered. Otherwise it is \
      open. Judge meaning, not wording.";
+
+/// The question a settled entry for the ticket's own text carries.
+pub const TICKET_TEXT_QUESTION: &str = "What the ticket itself says (title and description)";
+/// The question a settled entry for a person's ticket comment carries.
+pub const TICKET_COMMENT_QUESTION: &str = "A person's comment on the ticket";
+/// Most characters of the ticket's text read as settled.
+const MAX_TICKET_CHARS: usize = 6_000;
+/// Most ticket comments read as settled, newest kept.
+const MAX_TICKET_COMMENTS: usize = 10;
+
+/// Everything that settles a question on this ticket: the answers given in
+/// CoderHelm and choices on its notices (`answers`), the ticket's own text
+/// (a ticket that says it replaces earlier work answers a question about
+/// that work), and what people wrote on the ticket since (status-only
+/// comments left out). A question any of these covers is never asked.
+pub fn settled_on_ticket(
+    answers: &[Answer],
+    ticket_text: &str,
+    notes: &[common::ticket_state::Note],
+) -> Vec<Answer> {
+    let mut out = answers.to_vec();
+    if !ticket_text.trim().is_empty() {
+        out.push(Answer {
+            question_id: "ticket".to_string(),
+            question: TICKET_TEXT_QUESTION.to_string(),
+            answer: common::truncate_str(ticket_text.trim(), MAX_TICKET_CHARS).to_string(),
+            author: "the ticket".to_string(),
+            ..Default::default()
+        });
+    }
+    let people: Vec<&common::ticket_state::Note> = notes
+        .iter()
+        .filter(|n| n.intent != common::ticket_state::Intent::StatusOnly)
+        .filter(|n| !n.text.trim().is_empty())
+        .collect();
+    let skip = people.len().saturating_sub(MAX_TICKET_COMMENTS);
+    for (i, n) in people.into_iter().skip(skip).enumerate() {
+        out.push(Answer {
+            question_id: format!("ticket-comment-{}", i + 1),
+            question: TICKET_COMMENT_QUESTION.to_string(),
+            answer: common::truncate_str(n.text.trim(), 1_500).to_string(),
+            author: n.author.clone(),
+            answered_at: n.at.clone(),
+            ..Default::default()
+        });
+    }
+    out
+}
+
+/// `questions` without the ones `verdicts` says may not be asked.
+pub fn open_only(questions: Vec<Question>, verdicts: &[Verdict]) -> Vec<Question> {
+    questions
+        .into_iter()
+        .zip(
+            verdicts
+                .iter()
+                .copied()
+                .chain(std::iter::repeat(Verdict::Open)),
+        )
+        .filter(|(_, v)| v.may_ask())
+        .map(|(q, _)| q)
+        .collect()
+}
 
 pub fn schema() -> Value {
     json!({
@@ -240,6 +306,40 @@ fn one_line(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_ticket_text_and_people_comments_settle_questions() {
+        let notes = vec![
+            common::ticket_state::Note {
+                author: "Sam".into(),
+                text: "Moved to QA".into(),
+                intent: common::ticket_state::Intent::StatusOnly,
+                at: String::new(),
+            },
+            common::ticket_state::Note {
+                author: "Ana".into(),
+                text: "Yes, close the old pull request.".into(),
+                intent: common::ticket_state::Intent::Other,
+                at: "2026-10-27T10:00:00Z".into(),
+            },
+        ];
+        let s = settled_on_ticket(
+            &[],
+            "Build the gallery block. This replaces the earlier attempt in #12.",
+            &notes,
+        );
+        assert_eq!(s.len(), 2, "{s:?}");
+        assert_eq!(s[0].question, TICKET_TEXT_QUESTION);
+        assert!(s[0].answer.contains("replaces the earlier attempt"));
+        assert_eq!(s[1].author, "Ana");
+        // Nothing settled when there is nothing to read.
+        assert!(settled_on_ticket(&[], "  ", &[]).is_empty());
+        // A covered question is dropped; one the model left out stays.
+        let qs = run_questions::from_lines(&["Does this replace #12?", "Who sees it?"]);
+        let kept = open_only(qs, &[Verdict::Settled(Some(0))]);
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].question, "Who sees it?");
+    }
     use common::ticket_state::{decision_answer, Decision, CHOICE_OWN, KIND_OPEN_PR};
 
     fn q(text: &str) -> Question {

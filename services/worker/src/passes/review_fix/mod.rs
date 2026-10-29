@@ -12,7 +12,13 @@
 //!    code matches (metric filters, alarms, alert rules, scripts, runbooks,
 //!    tests) keeps its wording; a changed log level or message needs a test
 //!    that asserts it.
-//! 3. The full test suite ([`suite`]), found the way the repository runs it
+//! 3. Generated files ([`generated_step`]): a round that edits what a code
+//!    generator reads (a CMS schema, a GraphQL schema) carries the
+//!    regenerated output, the new types are in it, and no file declares its
+//!    own copy of a generated type: the same check the pull request had
+//!    before it opened (`super::generators`), so a later round can't skip
+//!    it.
+//! 4. The full test suite ([`suite`]), found the way the repository runs it
 //!    and run in the sandbox against the staged files.
 //!
 //! What a check finds goes back to the agent for one fix-up turn, then the
@@ -311,6 +317,9 @@ pub async fn check(
     // 2. Logs.
     logs_step(round, staged, usage, last, &mut out).await;
 
+    // 3. Generated files.
+    generated_step(round, staged, last, &mut out).await;
+
     // 3. The full suite: on the first check only when nothing else goes back
     //    to the agent (the fix-up turn changes the files anyway), always on
     //    the last.
@@ -338,6 +347,124 @@ pub async fn check(
         out.evidence.push(s.line());
     }
     out
+}
+
+/// A staged change as (path, status, patch), the patch holding the lines
+/// the file gains (enough for the generator checks, which read added lines).
+pub fn staged_patch(path: &str, c: &staged::Change) -> (String, String, String) {
+    let status = match (&c.original, &c.current) {
+        (None, _) => "added",
+        (_, None) => "removed",
+        _ => "modified",
+    };
+    let before: std::collections::HashSet<&str> = c
+        .original
+        .as_deref()
+        .map(|t| t.lines().collect())
+        .unwrap_or_default();
+    let patch: String = c
+        .current
+        .as_deref()
+        .unwrap_or("")
+        .lines()
+        .filter(|l| !before.contains(l))
+        .map(|l| format!("+{l}\n"))
+        .collect();
+    (path.to_string(), status.to_string(), format!("@@\n{patch}"))
+}
+
+/// What the generator checks find in a round's staged files: for each
+/// generator whose inputs the round edits, its outputs not regenerated, a
+/// new type missing from them, or a hand-written copy of a generated type.
+pub fn generated_problems(
+    gens: &[super::generators::Generator],
+    files: &[(String, String, String)],
+    outputs_of: impl Fn(&super::generators::Generator) -> Vec<(String, String)>,
+) -> Vec<String> {
+    let paths: Vec<String> = files.iter().map(|(p, _, _)| p.clone()).collect();
+    let mut out = Vec::new();
+    for (g, inputs) in super::generators::affected(gens, &paths) {
+        let mut why: Vec<String> = Vec::new();
+        let outputs = outputs_of(g);
+        let owned = super::generators::ownership_problems(g, files, &outputs);
+        if super::generators::outputs_missing(g, &paths)
+            && !super::generators::owned_types(g, files).is_empty()
+        {
+            why.push(format!(
+                "its generated files ({}) are not in this round.",
+                g.outputs
+                    .iter()
+                    .take(3)
+                    .map(|o| format!("`{o}`"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+        why.extend(owned);
+        if !why.is_empty() {
+            out.push(super::generators::block_reason(g, &inputs, &why.join(" ")));
+        }
+    }
+    out
+}
+
+async fn generated_step(round: &Round<'_>, staged: &Staged, last: bool, out: &mut Check) {
+    let files: Vec<(String, String, String)> = staged
+        .changes()
+        .iter()
+        .map(|(p, c)| staged_patch(p, c))
+        .collect();
+    if files.is_empty() {
+        return;
+    }
+    let repo = super::generators::load(round.github, round.owner, round.repo, round.branch).await;
+    let gens = super::generators::detect(&repo);
+    if gens.is_empty() {
+        return;
+    }
+    // Each generator's output as the round leaves it: staged, else the
+    // branch.
+    let mut texts: Vec<(String, String)> = Vec::new();
+    for g in &gens {
+        for p in repo
+            .tree
+            .iter()
+            .filter(|p| {
+                g.outputs
+                    .iter()
+                    .any(|o| super::generators::glob_match(o, p))
+            })
+            .take(3)
+        {
+            if !texts.iter().any(|(q, _)| q == p) {
+                texts.push((p.clone(), round.text(staged, p).await));
+            }
+        }
+    }
+    let problems = generated_problems(&gens, &files, |g| {
+        texts
+            .iter()
+            .filter(|(p, _)| {
+                g.outputs
+                    .iter()
+                    .any(|o| super::generators::glob_match(o, p))
+            })
+            .cloned()
+            .collect()
+    });
+    if problems.is_empty() {
+        return;
+    }
+    if last {
+        out.hold.extend(problems);
+    } else {
+        out.findings.push(format!(
+            "{} Regenerate the generated output (with run_codegen when it is offered, else \
+             exactly what the generator writes) in this round, and type new things from the \
+             generated types, never with a hand-written copy.",
+            problems.join(" ")
+        ));
+    }
 }
 
 async fn scope_step(
@@ -1191,6 +1318,60 @@ pub async fn mark_reapproval(state: &WorkerState, team_id: &str, run_id: &str, w
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A later round on an open PR adds a CMS block and types it by hand:
+    /// the round is held until the output is regenerated and imported.
+    #[test]
+    fn a_later_round_that_edits_a_schema_needs_the_generated_types() {
+        use super::super::generators::{GenKind, Generator};
+        let gens = vec![Generator {
+            kind: GenKind::Sanity,
+            name: "npm run typegen".into(),
+            command: "npm run typegen".into(),
+            inputs: vec!["**/schemaTypes/**".into()],
+            outputs: vec!["src/sanity.types.ts".into()],
+        }];
+        let schema = staged::Change {
+            original: None,
+            current: Some(
+                "export default defineType({\n  name: 'gallery',\n  type: 'object',\n})\n".into(),
+            ),
+        };
+        let component = staged::Change {
+            original: Some("export function Page() {}\n".into()),
+            current: Some(
+                "export function Page() {}\ntype GalleryBlock = { title: string }\n".into(),
+            ),
+        };
+        let files = vec![
+            staged_patch("studio/schemaTypes/gallery.ts", &schema),
+            staged_patch("src/components/Page.tsx", &component),
+        ];
+        assert_eq!(files[0].1, "added");
+        assert_eq!(files[1].2, "@@\n+type GalleryBlock = { title: string }\n");
+        let p = generated_problems(&gens, &files, |_| {
+            vec![("src/sanity.types.ts".into(), "export type Hero = {}".into())]
+        });
+        assert_eq!(p.len(), 1, "{p:?}");
+        assert!(p[0].contains("are not in this round"));
+        assert!(p[0].contains("has no `Gallery`"));
+        assert!(p[0].contains("declares `GalleryBlock` by hand"));
+        // Regenerated in the round and used from there: nothing.
+        let mut ok = files.clone();
+        ok[1].2 = "@@\n+import type { Gallery } from '../sanity.types'\n".into();
+        ok.push((
+            "src/sanity.types.ts".into(),
+            "modified".into(),
+            "@@\n+export type Gallery = {}\n".into(),
+        ));
+        let p = generated_problems(&gens, &ok, |_| {
+            vec![(
+                "src/sanity.types.ts".into(),
+                "export type Gallery = {}".into(),
+            )]
+        });
+        assert!(p.is_empty(), "{p:?}");
+    }
 
     #[test]
     fn only_files_the_checks_changed_are_written_back_to_the_wip_branch() {

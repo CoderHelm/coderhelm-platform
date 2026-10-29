@@ -249,6 +249,87 @@ async fn dismiss_stale_change_requests(github: &GitHubClient, msg: &ReviewMessag
     }
 }
 
+/// Marks a review body that was brought up to date for a newer commit.
+pub const UPDATED_MARK: &str = "<!-- coderhelm:review-updated -->";
+
+/// CoderHelm's newest own review with a body: its id and the commit it was
+/// of.
+pub(crate) fn own_latest_review(reviews: &serde_json::Value) -> Option<(u64, String)> {
+    reviews
+        .as_array()?
+        .iter()
+        .filter(|r| {
+            r["user"]["type"].as_str() == Some("Bot")
+                && r["user"]["login"]
+                    .as_str()
+                    .is_some_and(|l| l.contains("coderhelm"))
+                && !r["body"].as_str().unwrap_or("").trim().is_empty()
+        })
+        .filter_map(|r| {
+            Some((
+                r["id"].as_u64()?,
+                r["commit_id"].as_str().unwrap_or("").to_string(),
+            ))
+        })
+        .next_back()
+}
+
+/// The standing review's body brought up to date: this review of `head`,
+/// headed by a line saying it replaces what was written for `old_head`.
+pub fn updated_body(body: &str, old_head: &str, head: &str) -> String {
+    let short = |s: &str| s[..s.len().min(7)].to_string();
+    format!(
+        "{UPDATED_MARK}\n_Updated for `{}`: what this review said about `{}` was replaced by \
+         the review of the current commit below._\n\n{}",
+        short(head),
+        short(old_head),
+        body.trim()
+    )
+}
+
+/// When a finished review of a newer commit posts nothing (same verdict,
+/// nothing new to say), CoderHelm's own earlier review still stands on the
+/// PR with what it said about the older commit. Its body is replaced with
+/// this review, so no comment of CoderHelm's keeps claims the new commits
+/// made wrong. Best effort.
+pub async fn refresh_standing(github: &GitHubClient, msg: &ReviewMessage, head: &str, body: &str) {
+    let reviews = match github
+        .list_pr_reviews(&msg.repo_owner, &msg.repo_name, msg.pr_number)
+        .await
+    {
+        Ok(v) => v,
+        Err(e) => {
+            warn!(pr = msg.pr_number, error = %e, "Could not list reviews to bring the standing one up to date");
+            return;
+        }
+    };
+    let Some((id, old_head)) = own_latest_review(&reviews) else {
+        return;
+    };
+    if old_head == head || body.trim().is_empty() {
+        return;
+    }
+    match github
+        .update_pr_review(
+            &msg.repo_owner,
+            &msg.repo_name,
+            msg.pr_number,
+            id,
+            &updated_body(body, &old_head, head),
+        )
+        .await
+    {
+        Ok(()) => info!(
+            pr = msg.pr_number,
+            review_id = id,
+            "Brought CoderHelm's standing review up to date for the new commit"
+        ),
+        Err(e) => {
+            warn!(pr = msg.pr_number, review_id = id, error = %e, "Could not update the standing review")
+        }
+    }
+}
+
 /// Ids of CoderHelm's own reviews still in the "changes requested" state.
 pub(crate) fn own_change_requests(reviews: &serde_json::Value) -> Vec<u64> {
     reviews
@@ -503,6 +584,25 @@ mod tests {
     /// other source file in the worker is scanned for the GitHub review
     /// calls.
     #[test]
+    fn a_silent_review_of_a_new_commit_replaces_the_old_reviews_claims() {
+        let reviews = serde_json::json!([
+            {"id": 1, "commit_id": "aaaaaaa1", "body": "Schema only, not registered.", "user": {"type": "Bot", "login": "coderhelm[bot]"}},
+            {"id": 2, "commit_id": "aaaaaaa1", "body": "Looks good", "user": {"type": "User", "login": "sam"}},
+            {"id": 3, "commit_id": "bbbbbbb2", "body": "", "user": {"type": "Bot", "login": "coderhelm[bot]"}}
+        ]);
+        assert_eq!(
+            own_latest_review(&reviews),
+            Some((1, "aaaaaaa1".to_string()))
+        );
+        let b = updated_body("Registers and renders the block.", "aaaaaaa1", "ccccccc3");
+        assert!(b.starts_with(UPDATED_MARK));
+        assert!(b.contains("Updated for `ccccccc`"));
+        assert!(b.contains("about `aaaaaaa`"));
+        assert!(b.ends_with("Registers and renders the block."));
+        assert!(!b.contains("Schema only"));
+    }
+
+    #[test]
     fn no_other_module_posts_a_formal_review() {
         let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
         let mut offenders = vec![];
@@ -531,6 +631,7 @@ mod tests {
                     ".create_pr_review(",
                     ".create_pr_review_inline(",
                     ".dismiss_review(",
+                    ".update_pr_review(",
                 ] {
                     if text.contains(call) {
                         offenders.push(format!("{rel}: {call}"));

@@ -2,6 +2,9 @@
 //! before its push: the scope check, the log checks, the full test suite
 //! (its exact command and counts), the commit message's style, and any
 //! approval the push dismissed. Newest round first, the last few kept.
+//! Only the newest round keeps its check results: an older round's results
+//! (a suite that failed on an earlier commit) are about code that is gone,
+//! so it keeps its one line saying what it changed.
 
 pub const START: &str = "<!-- coderhelm:review-fixes -->";
 pub const END: &str = "<!-- /coderhelm:review-fixes -->";
@@ -60,10 +63,15 @@ fn rounds_in(section: &str) -> Vec<String> {
     out
 }
 
-/// The section with `round` added first and older rounds after it.
+/// The section with `round` added first and older rounds after it, each
+/// older one cut to its headline line.
 pub fn section(existing: &str, round: &Round) -> String {
     let mut rounds = vec![round.render()];
-    rounds.extend(rounds_in(existing));
+    rounds.extend(
+        rounds_in(existing)
+            .into_iter()
+            .map(|r| format!("{}\n", r.lines().next().unwrap_or("").trim_end())),
+    );
     rounds.truncate(MAX_ROUNDS);
     format!("{START}\n{HEADING}\n{}{END}", rounds.concat())
 }
@@ -101,6 +109,21 @@ mod tests {
         assert_eq!(s.matches("\n* ").count(), MAX_ROUNDS);
         assert!(s.find("abc7").unwrap() < s.find("abc6").unwrap());
         assert!(!s.contains("abc2"));
+    }
+
+    #[test]
+    fn an_older_rounds_results_go_when_a_newer_round_lands() {
+        let failed = Round {
+            date: "2026-10-26".into(),
+            commit: "aaa1111".into(),
+            headline: "Register the block".into(),
+            lines: vec!["Full test suite FAILED (exit 127): `npm test` (0 passed)".into()],
+        };
+        let s = section("", &failed);
+        let s = section(&s, &round(2));
+        assert!(s.contains("* 2026-10-26, commit `aaa1111`: Register the block\n"));
+        assert!(!s.contains("FAILED"), "{s}");
+        assert!(s.contains("Full test suite passed"));
     }
 
     #[test]

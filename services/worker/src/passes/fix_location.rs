@@ -192,11 +192,51 @@ pub struct OutsideChange {
     /// How to confirm it worked afterwards.
     #[serde(default)]
     pub verify: String,
+    /// For a change that adds content (a block, an entry, a record): what
+    /// was looked up about content of that kind already in the environment
+    /// the tests use, and what came back (by id); or why it couldn't be
+    /// looked up. Empty when nothing was looked up.
+    #[serde(default)]
+    pub existing: String,
 }
+
+/// Words that make a change add content.
+const ADD_WORDS: &[&str] = &["add", "adds", "create", "creates", "insert", "new"];
+/// Words that name content a person adds in another system.
+const CONTENT_WORDS: &[&str] = &[
+    "block",
+    "blocks",
+    "document",
+    "documents",
+    "entry",
+    "entries",
+    "record",
+    "records",
+    "page",
+    "pages",
+    "item",
+    "items",
+    "content",
+    "row",
+    "rows",
+    "post",
+    "posts",
+];
 
 impl OutsideChange {
     fn is_usable(&self) -> bool {
         !self.change.trim().is_empty() && !self.system.trim().is_empty()
+    }
+
+    /// Whether the change asks a person to add content in another system.
+    pub fn adds_content(&self) -> bool {
+        let low = self.change.to_ascii_lowercase();
+        let words: Vec<&str> = low
+            .split(|c: char| !c.is_ascii_alphanumeric())
+            .filter(|w| !w.is_empty())
+            .collect();
+        words.iter().any(|w| ADD_WORDS.contains(w))
+            && words.iter().any(|w| CONTENT_WORDS.contains(w))
     }
 }
 
@@ -673,7 +713,8 @@ After the four openspec files, output this block (JSON, all fields required; `ou
     "system": "the system the change is made in",
     "change": "exactly what to change, naming the record(s)",
     "where": "who can make it, or where in that system",
-    "verify": "how to confirm afterwards (for example: after the next sync, the item shows on the site)"
+    "verify": "how to confirm afterwards (for example: after the next sync, the item shows on the site); for content, the API query that shows it and what it returns",
+    "existing": "when the change adds content (a block, an entry, a record): look up content of that kind in the environment the tests use first (the team's connected data sources or CMS API), and write what came back by id and key. If one exists, `change` says to REPLACE or update that exact one (fields to set, fields to remove), never to add a second. If you could not look, say why here. Empty only when the change adds no content"
   },
   "history_check": "only when the prompt has a ticket history: each earlier pull request by number, what you reuse from it, what changes this time and why (and for one closed without a reason in its comments: who closed it and when); otherwise empty",
   "questions": ["each question only a person can answer, one decision each; [] when there are none"],
@@ -807,6 +848,12 @@ pub fn ask_title(d: &FixDecision) -> &'static str {
     }
 }
 
+/// What a note that adds content says when nothing was looked up.
+pub const NOT_LOOKED_UP: &str = "I didn't look up whether content of this kind already exists \
+     in the environment the tests use. Check there first: if one exists (even in an older \
+     shape), update or replace that one, setting the new fields and removing the old ones, \
+     instead of adding a second.";
+
 fn push_change(out: &mut String, c: &OutsideChange) {
     out.push_str(&format!("- **Where:** {}", c.system.trim()));
     if !c.where_.trim().is_empty() {
@@ -814,6 +861,13 @@ fn push_change(out: &mut String, c: &OutsideChange) {
     }
     out.push('\n');
     out.push_str(&format!("- **What to change:** {}\n", c.change.trim()));
+    // A note that adds content says what is already there, or that nobody
+    // looked: it never guesses that nothing is.
+    if !c.existing.trim().is_empty() {
+        out.push_str(&format!("- **Already there:** {}\n", one_line(&c.existing)));
+    } else if c.adds_content() {
+        out.push_str(&format!("- **Not checked:** {NOT_LOOKED_UP}\n"));
+    }
     if !c.verify.trim().is_empty() {
         out.push_str(&format!("- **How to confirm:** {}\n", c.verify.trim()));
     }
@@ -1175,6 +1229,38 @@ mod tests {
         .unwrap();
         assert_eq!(d.evidence.looked_up, vec!["one lookup".to_string()]);
         assert!(d.outside_change.is_none());
+    }
+
+    #[test]
+    fn a_note_that_adds_content_says_what_is_already_there_or_that_nobody_looked() {
+        let add = OutsideChange {
+            system: "the CMS (staging)".into(),
+            change: "Add a promo banner block to the staging events page".into(),
+            ..Default::default()
+        };
+        assert!(add.adds_content());
+        let mut out = String::new();
+        push_change(&mut out, &add);
+        assert!(out.contains("**Not checked:** I didn't look up"), "{out}");
+        let looked = OutsideChange {
+            change: "Replace the promo banner block (document page-events, key k1): set heading, remove title".into(),
+            existing: "page-events has a promoBanner block, key k1, with old fields title and image".into(),
+            ..add.clone()
+        };
+        let mut out = String::new();
+        push_change(&mut out, &looked);
+        assert!(out.contains("**Already there:** page-events has a promoBanner block"));
+        assert!(!out.contains("Not checked"));
+        // A setting change adds no content: no note.
+        let setting = OutsideChange {
+            system: "the booking system".into(),
+            change: "Set the venue's opening time to 6am".into(),
+            ..Default::default()
+        };
+        assert!(!setting.adds_content());
+        let mut out = String::new();
+        push_change(&mut out, &setting);
+        assert!(!out.contains("Not checked"));
     }
 
     #[test]

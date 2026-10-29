@@ -735,6 +735,7 @@ pub mod plugins;
 mod pr;
 mod pr_holder;
 pub mod pr_outcomes;
+mod pr_risk;
 mod proof;
 pub mod quarantine;
 /// Hosted side of hybrid: forward a held event to a self-hosted install again.
@@ -6174,29 +6175,17 @@ async fn report_also_outside(
         );
     let title = "Also needed outside the code";
     add_progress_note(state, &msg.team_id, run_id, title).await;
-    if matches!(msg.source, TicketSource::Github) && msg.issue_number > 0 {
-        let _ = github
-            .create_issue_comment(
-                &msg.repo_owner,
-                &msg.repo_name,
-                msg.issue_number,
-                &format!("**{title}**\n\n{report}"),
-            )
-            .await;
-    } else if matches!(msg.source, TicketSource::Jira) && !msg.ticket_id.is_empty() {
-        if let Err(e) = post_jira_comment(
-            state,
-            &msg.team_id,
-            &msg.ticket_id,
-            &fix_location::jira_text(&report),
-            "clarification",
-            title,
-        )
-        .await
-        {
-            warn!(run_id, error = %e, "Could not post the outside part of the fix on the ticket");
-        }
-    }
+    post_ticket_notice(
+        state,
+        msg,
+        run_id,
+        github,
+        NOTICE_ALSO_OUTSIDE,
+        &format!("**{title}**\n\n{report}"),
+        &fix_location::jira_text(&report),
+        title,
+    )
+    .await;
     let _ = state
         .dynamo
         .update_item()
@@ -6216,8 +6205,142 @@ async fn report_also_outside(
         .await;
 }
 
+/// Notice key: the part of the fix outside the code, one comment per ticket.
+const NOTICE_ALSO_OUTSIDE: &str = "also_outside";
+/// Notice key prefix: one question the plan asks, by its compared text.
+const NOTICE_QUESTION: &str = "question:";
+
+/// The notice key of one question.
+fn question_key(question: &str) -> String {
+    format!(
+        "{NOTICE_QUESTION}{}",
+        &common::sha256_hex(&[&common::ticket_state::notice_text(question)])[..16]
+    )
+}
+
+/// The questions not asked on the ticket before (by any run), in order.
+fn new_questions<'a>(
+    questions: &'a [String],
+    notices: &[common::ticket_state::Notice],
+) -> Vec<&'a String> {
+    questions
+        .iter()
+        .filter(|q| !q.trim().is_empty())
+        .filter(|q| {
+            let key = question_key(q);
+            !notices.iter().any(|n| n.key == key)
+        })
+        .collect()
+}
+
+/// Posts a notice on the ticket once: the same text (in any run, whatever
+/// its dates or run links) is never posted again, and new text about the
+/// same thing edits the earlier GitHub comment instead of adding another.
+/// A Jira comment can't be edited here, so only changed text is posted.
+/// Returns the comment's address when one was posted or edited.
+#[allow(clippy::too_many_arguments)]
+async fn post_ticket_notice(
+    state: &WorkerState,
+    msg: &TicketMessage,
+    run_id: &str,
+    github: &GitHubClient,
+    key: &str,
+    github_body: &str,
+    jira_body: &str,
+    jira_title: &str,
+) -> Option<String> {
+    use common::ticket_state::{notice_action, notice_hash, Notice, NoticeAction};
+    let github_ticket = matches!(msg.source, TicketSource::Github) && msg.issue_number > 0;
+    let jira_ticket = matches!(msg.source, TicketSource::Jira) && !msg.ticket_id.is_empty();
+    if !github_ticket && !jira_ticket {
+        return None;
+    }
+    let text_hash = notice_hash(key, github_body);
+    let rec = open_pr_choice::load_record(state, &msg.team_id, &msg.ticket_id).await;
+    let action = notice_action(&rec.notices, key, &text_hash);
+    let (url, comment_id) = match (action, github_ticket) {
+        (NoticeAction::Skip(earlier), _) => {
+            info!(
+                run_id,
+                key, "Same notice already on the ticket — not posted again"
+            );
+            return (!earlier.url.is_empty()).then(|| earlier.url.clone());
+        }
+        (NoticeAction::Edit(earlier), true) => {
+            match github
+                .edit_issue_comment(
+                    &msg.repo_owner,
+                    &msg.repo_name,
+                    earlier.comment_id,
+                    github_body,
+                )
+                .await
+            {
+                Ok(_) => {
+                    info!(run_id, key, "Edited the earlier notice on the issue");
+                    (earlier.url.clone(), earlier.comment_id)
+                }
+                Err(e) => {
+                    warn!(run_id, key, error = %e, "Could not edit the earlier notice on the issue");
+                    return None;
+                }
+            }
+        }
+        (_, true) => match github
+            .create_issue_comment(
+                &msg.repo_owner,
+                &msg.repo_name,
+                msg.issue_number,
+                github_body,
+            )
+            .await
+        {
+            Ok(c) => (
+                c["html_url"].as_str().unwrap_or("").to_string(),
+                c["id"].as_u64().unwrap_or(0),
+            ),
+            Err(e) => {
+                warn!(run_id, key, error = %e, "Could not post the notice on the issue");
+                return None;
+            }
+        },
+        (_, false) => match post_jira_comment_link(
+            state,
+            &msg.team_id,
+            &msg.ticket_id,
+            jira_body,
+            "clarification",
+            jira_title,
+        )
+        .await
+        {
+            Ok(link) => (link.unwrap_or_default(), 0),
+            Err(e) => {
+                warn!(run_id, key, error = %e, "Could not post the notice on the ticket");
+                return None;
+            }
+        },
+    };
+    open_pr_choice::record_notice(
+        state,
+        &msg.team_id,
+        &msg.ticket_id,
+        Notice {
+            key: key.to_string(),
+            text_hash,
+            url: url.clone(),
+            at: chrono::Utc::now().to_rfc3339(),
+            comment_id,
+        },
+    )
+    .await;
+    (!url.is_empty()).then_some(url)
+}
+
 /// Tells the ticket the plan's questions only a person can answer when the
-/// run goes on to write code. Nothing when the plan has none.
+/// run goes on to write code: each question once per ticket, whatever run
+/// asks it again; the run never waits on them. Nothing when the plan has
+/// none, or every one was asked before.
 async fn report_questions(
     state: &WorkerState,
     msg: &TicketMessage,
@@ -6225,7 +6348,33 @@ async fn report_questions(
     github: &GitHubClient,
     decision: &fix_location::FixDecision,
 ) {
-    let questions = fix_location::questions_markdown(decision);
+    let rec = open_pr_choice::load_record(state, &msg.team_id, &msg.ticket_id).await;
+    let fresh = new_questions(&decision.questions, &rec.notices);
+    let earlier = decision
+        .questions
+        .iter()
+        .filter(|q| !q.trim().is_empty())
+        .count()
+        - fresh.len();
+    if earlier > 0 {
+        add_progress_note(
+            state,
+            &msg.team_id,
+            run_id,
+            &format!(
+                "{earlier} question(s) already asked on the ticket — not asked again; the run goes on without the answers"
+            ),
+        )
+        .await;
+    }
+    if fresh.is_empty() {
+        return;
+    }
+    let shown = fix_location::FixDecision {
+        questions: fresh.iter().map(|q| q.to_string()).collect(),
+        ..Default::default()
+    };
+    let questions = fix_location::questions_markdown(&shown);
     let Some((_, list)) = questions.split_once('\n') else {
         return;
     };
@@ -6235,28 +6384,37 @@ async fn report_questions(
         list.trim()
     );
     add_progress_note(state, &msg.team_id, run_id, title).await;
-    if matches!(msg.source, TicketSource::Github) && msg.issue_number > 0 {
-        let _ = github
-            .create_issue_comment(
-                &msg.repo_owner,
-                &msg.repo_name,
-                msg.issue_number,
-                &format!("**{title}**\n\n{report}"),
-            )
-            .await;
-    } else if matches!(msg.source, TicketSource::Jira) && !msg.ticket_id.is_empty() {
-        if let Err(e) = post_jira_comment(
+    let key = fresh
+        .iter()
+        .map(|q| question_key(q))
+        .collect::<Vec<_>>()
+        .join(",");
+    let url = post_ticket_notice(
+        state,
+        msg,
+        run_id,
+        github,
+        &key,
+        &format!("**{title}**\n\n{report}"),
+        &fix_location::jira_text(&report),
+        title,
+    )
+    .await;
+    // Each question is kept as asked, so no later run asks it again.
+    for q in &fresh {
+        open_pr_choice::record_notice(
             state,
             &msg.team_id,
             &msg.ticket_id,
-            &fix_location::jira_text(&report),
-            "clarification",
-            title,
+            common::ticket_state::Notice {
+                key: question_key(q),
+                text_hash: common::ticket_state::notice_hash(&question_key(q), q),
+                url: url.clone().unwrap_or_default(),
+                at: chrono::Utc::now().to_rfc3339(),
+                comment_id: 0,
+            },
         )
-        .await
-        {
-            warn!(run_id, error = %e, "Could not post the plan's questions on the ticket");
-        }
+        .await;
     }
 }
 
@@ -7422,6 +7580,7 @@ async fn ask_on_ticket_keyed(
                 text_hash,
                 url: comment_url.clone().unwrap_or_default(),
                 at: chrono::Utc::now().to_rfc3339(),
+                comment_id: 0,
             },
         )
         .await;
@@ -10346,6 +10505,30 @@ mod open_pr_tests {
         assert!(!mentions_ticket("ABC-123 something else", "ABC-12"));
         assert!(!mentions_ticket("XABC-12", "ABC-12"));
         assert!(!mentions_ticket("anything", ""));
+    }
+}
+
+#[cfg(test)]
+mod ticket_notice_tests {
+    use super::{new_questions, question_key};
+    use common::ticket_state::Notice;
+
+    /// A question asked by one run is not asked again by the next, however
+    /// its spacing or emphasis changes; a new question still is.
+    #[test]
+    fn a_question_is_asked_on_the_ticket_once() {
+        let asked = vec![Notice {
+            key: question_key("Does this replace the earlier pull request #12?"),
+            ..Default::default()
+        }];
+        let next_run = vec![
+            "Does this  replace the earlier pull request **#12**?".to_string(),
+            "Who sees the block?".to_string(),
+        ];
+        let fresh = new_questions(&next_run, &asked);
+        assert_eq!(fresh, vec![&next_run[1]]);
+        assert!(new_questions(&next_run[..1], &asked).is_empty());
+        assert_ne!(question_key("Who sees it?"), question_key("Who edits it?"));
     }
 }
 

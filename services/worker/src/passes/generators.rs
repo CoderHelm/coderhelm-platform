@@ -329,6 +329,21 @@ fn sanity_globs(dir: &str, files: &HashMap<String, String>) -> (Vec<String>, Vec
     .map(|g| under(dir, g))
     .collect();
     let mut outputs = vec![under(dir, "**/sanity.types.ts")];
+    // Newer setups keep the typegen settings in the CLI config
+    // (`typegen: { generates: './src/sanity.types.ts' }`).
+    let cli = files
+        .iter()
+        .filter(|(p, _)| dir_of(p) == dir && base_name(p).starts_with("sanity.cli."))
+        .map(|(_, t)| t);
+    for text in cli {
+        let gen = values(text, "generates");
+        if !gen.is_empty() {
+            outputs = gen.iter().map(|g| under(dir, g)).collect();
+        }
+        for p in values(text, "path") {
+            inputs.push(under(dir, &p));
+        }
+    }
     if let Some(v) = cfg.and_then(|c| serde_json::from_str::<serde_json::Value>(c).ok()) {
         if let Some(p) = v["path"].as_str() {
             inputs.push(under(dir, p));
@@ -696,9 +711,10 @@ pub fn fix_feedback(problems: &[(Generator, Vec<String>, String)]) -> String {
         .iter()
         .map(|(g, inputs, why)| {
             format!(
-                "- `{}` reads {} and {why} Regenerate its output{}: call run_codegen when it is \
-                 offered, otherwise update the generated files ({}) exactly as the generator \
-                 would.",
+                "- `{}` reads {} and {why} Regenerate its output{}: call run_codegen. Only when \
+                 run_codegen is not offered, update the generated files ({}) exactly as the \
+                 generator would. Never declare a type by hand for something the generator \
+                 types: import the generated type.",
                 g.name,
                 list(inputs, 3),
                 if g.outputs.is_empty() {
@@ -719,6 +735,276 @@ pub fn fix_feedback(problems: &[(Generator, Vec<String>, String)]) -> String {
          date. Generated output is part of the change:\n{}",
         lines.join("\n")
     )
+}
+
+// ── Generated types are used, never written in parallel ───────────────────
+
+/// A type the change adds to a generator's inputs: the generator owns its
+/// type, so code that uses it imports the generated one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OwnedType {
+    /// The name the input declares (`gallery`).
+    pub name: String,
+    /// The name the generated type has (`Gallery`).
+    pub type_name: String,
+    /// The input file that declares it.
+    pub input: String,
+}
+
+/// The type name a generator gives a declared name: each word capitalised,
+/// separators dropped (`gallery-block` and `galleryBlock` both read
+/// `GalleryBlock`).
+pub fn type_name_of(name: &str) -> String {
+    name.split(|c: char| !c.is_ascii_alphanumeric())
+        .filter(|w| !w.is_empty())
+        .map(|w| {
+            let mut c = w.chars();
+            match c.next() {
+                Some(f) => f.to_ascii_uppercase().to_string() + c.as_str(),
+                None => String::new(),
+            }
+        })
+        .collect()
+}
+
+fn added_lines(patch: &str) -> impl Iterator<Item = &str> {
+    patch
+        .lines()
+        .filter(|l| l.starts_with('+') && !l.starts_with("+++"))
+        .map(|l| &l[1..])
+}
+
+/// The word after `kw` at the start of a trimmed line (`type Foo {`).
+fn keyword_name(line: &str, kws: &[&str]) -> Option<String> {
+    let t = line.trim_start();
+    let t = t.strip_prefix("export ").unwrap_or(t).trim_start();
+    for kw in kws {
+        if let Some(rest) = t.strip_prefix(kw).and_then(|r| r.strip_prefix(' ')) {
+            let n: String = rest
+                .trim_start()
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                .collect();
+            if !n.is_empty() {
+                return Some(n);
+            }
+        }
+    }
+    None
+}
+
+/// The types an input file's diff adds, by the generator's kind.
+pub fn added_types(kind: GenKind, status: &str, patch: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    match kind {
+        GenKind::Sanity => {
+            let lines: Vec<&str> = patch.lines().collect();
+            for (i, l) in lines.iter().enumerate() {
+                if !(l.starts_with('+') && l.contains("defineType(")) {
+                    continue;
+                }
+                let name = lines[i..]
+                    .iter()
+                    .take(6)
+                    .filter(|x| x.starts_with('+'))
+                    .find_map(|x| super::feature::content::declared_name(x));
+                if let Some(n) = name {
+                    out.push(n);
+                }
+            }
+            if out.is_empty() && status == "added" {
+                if let Some(n) = added_lines(patch).find_map(super::feature::content::declared_name)
+                {
+                    out.push(n);
+                }
+            }
+        }
+        GenKind::GraphqlCodegen => out.extend(
+            added_lines(patch)
+                .filter_map(|l| keyword_name(l, &["type", "input", "enum", "interface", "union"])),
+        ),
+        GenKind::Prisma => {
+            out.extend(added_lines(patch).filter_map(|l| keyword_name(l, &["model", "enum"])))
+        }
+        GenKind::Protobuf => {
+            out.extend(added_lines(patch).filter_map(|l| keyword_name(l, &["message", "enum"])))
+        }
+        GenKind::OpenApi | GenKind::Documented => {}
+    }
+    out.dedup();
+    out
+}
+
+/// The types the change adds to the inputs of `g`, from the diff as
+/// (path, status, patch).
+pub fn owned_types(g: &Generator, files: &[(String, String, String)]) -> Vec<OwnedType> {
+    let mut out: Vec<OwnedType> = Vec::new();
+    for (path, status, patch) in files {
+        if status == "removed" || !any_match(&g.inputs, path) || any_match(&g.outputs, path) {
+            continue;
+        }
+        for name in added_types(g.kind, status, patch) {
+            let type_name = type_name_of(&name);
+            if type_name.is_empty() || out.iter().any(|o| o.type_name == type_name) {
+                continue;
+            }
+            out.push(OwnedType {
+                name,
+                type_name,
+                input: path.clone(),
+            });
+        }
+    }
+    out
+}
+
+/// Whether the generated output has the type: its type name as a word, or
+/// the declared name as a quoted literal (`_type: "gallery"`).
+pub fn output_has(t: &OwnedType, output: &str) -> bool {
+    let word = output
+        .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+        .any(|w| w == t.type_name);
+    word || output.contains(&format!("\"{}\"", t.name)) || output.contains(&format!("'{}'", t.name))
+}
+
+/// Suffixes a hand-written type for a thing carries (`GalleryProps`).
+const TYPE_SUFFIXES: &[&str] = &[
+    "Props", "Block", "Data", "Fields", "Type", "Schema", "Content", "Item", "Section", "Doc",
+    "Document", "Value",
+];
+
+fn base_of(ident: &str) -> String {
+    let mut s = ident.to_string();
+    loop {
+        let before = s.clone();
+        for suf in TYPE_SUFFIXES {
+            if s.len() > suf.len() && s.ends_with(suf) {
+                s.truncate(s.len() - suf.len());
+            }
+        }
+        if s == before {
+            break;
+        }
+    }
+    s.to_ascii_lowercase()
+}
+
+/// Whether a source file may declare types (not a test, not generated).
+fn is_source(path: &str) -> bool {
+    let l = path.to_ascii_lowercase();
+    let code = [".ts", ".tsx", ".js", ".jsx", ".vue", ".svelte", ".astro"]
+        .iter()
+        .any(|e| l.ends_with(e));
+    code && !l.ends_with(".d.ts")
+        && !l.contains(".test.")
+        && !l.contains(".spec.")
+        && !l.contains("generated")
+}
+
+/// Types the change declares by hand for something a generator types:
+/// `(file, declared name, owned type)`. A declaration built from the
+/// generated type (`type GalleryProps = Gallery & {…}`) is not parallel.
+pub fn hand_typed<'a>(
+    owned: &'a [OwnedType],
+    g: &Generator,
+    files: &[(String, String, String)],
+) -> Vec<(String, String, &'a OwnedType)> {
+    let mut out = Vec::new();
+    for (path, status, patch) in files {
+        if status == "removed"
+            || !is_source(path)
+            || any_match(&g.outputs, path)
+            || any_match(&g.inputs, path)
+        {
+            continue;
+        }
+        let added: Vec<&str> = added_lines(patch).collect();
+        for (i, l) in added.iter().enumerate() {
+            let Some(ident) = keyword_name(l, &["type", "interface"]) else {
+                continue;
+            };
+            let Some(t) = owned
+                .iter()
+                .find(|t| base_of(&ident) == base_of(&t.type_name))
+            else {
+                continue;
+            };
+            // Built from the generated type: the declaration's own lines
+            // (up to its closing brace) name it as a type.
+            let mut decl: Vec<&str> = Vec::new();
+            for (j, x) in added[i..].iter().take(8).enumerate() {
+                decl.push(x);
+                let t = x.trim();
+                if (j > 0 && t.starts_with('}')) || (j == 0 && t.ends_with(';')) {
+                    break;
+                }
+            }
+            let body = decl.join(" ");
+            let derived = names_type(&body.replacen(&ident, "", 1), &t.type_name);
+            if !derived {
+                out.push((path.clone(), ident, t));
+            }
+        }
+    }
+    out
+}
+
+/// Whether `text` uses `name` as a type: the whole word, not called
+/// (`Gallery(` is a function).
+fn names_type(text: &str, name: &str) -> bool {
+    let b = text.as_bytes();
+    let word = |c: u8| c.is_ascii_alphanumeric() || c == b'_';
+    text.match_indices(name).any(|(at, _)| {
+        let before = at.checked_sub(1).map(|i| b[i]);
+        let after = b.get(at + name.len()).copied();
+        !before.is_some_and(word) && !after.is_some_and(|c| word(c) || c == b'(')
+    })
+}
+
+/// What the generated output and the code that uses it must show for the
+/// types the change adds: the output has each (else the generator didn't
+/// pick it up), and no file declares its own copy. `outputs`: the text of
+/// the generator's output files on the branch (empty when none could be
+/// read, then only the hand-typed check runs).
+pub fn ownership_problems(
+    g: &Generator,
+    files: &[(String, String, String)],
+    outputs: &[(String, String)],
+) -> Vec<String> {
+    let owned = owned_types(g, files);
+    if owned.is_empty() {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    if !outputs.is_empty() {
+        for t in &owned {
+            if !outputs.iter().any(|(_, text)| output_has(t, text)) {
+                out.push(format!(
+                    "its generated output ({}) has no `{}` for the `{}` that `{}` adds: the \
+                     generator didn't pick it up.",
+                    list(
+                        &outputs.iter().map(|(p, _)| p.clone()).collect::<Vec<_>>(),
+                        2
+                    ),
+                    t.type_name,
+                    t.name,
+                    t.input
+                ));
+            }
+        }
+    }
+    let from = outputs
+        .first()
+        .map(|(p, _)| format!(" from `{p}`"))
+        .unwrap_or_default();
+    for (path, ident, t) in hand_typed(&owned, g, files) {
+        out.push(format!(
+            "`{path}` declares `{ident}` by hand for the `{}` the generator types: import the \
+             generated `{}`{from} instead of a parallel type.",
+            t.name, t.type_name
+        ));
+    }
+    out
 }
 
 // ── Async: read the repo, run, check ────────────────────────────────────────
@@ -977,6 +1263,39 @@ async fn regenerate(w: &Work<'_>, attempt: usize, notes: &mut Vec<String>) -> Op
                         g.name
                     ));
                 }
+            }
+        }
+    }
+    // The new types are in the generated output and used from there:
+    // a run that "passed" without picking up the schema, a hand-edited
+    // output, or a parallel hand-written type are caught here.
+    if let Ok(diff) = w
+        .github
+        .compare_files_with_patches(owner, name, &w.msg.base_branch, w.branch)
+        .await
+    {
+        for g in &gens {
+            if problems.iter().any(|(p, _, _)| p == g) {
+                continue;
+            }
+            let mut outputs: Vec<(String, String)> = Vec::new();
+            for p in repo
+                .tree
+                .iter()
+                .filter(|p| any_match(&g.outputs, p))
+                .take(3)
+            {
+                if let Ok(t) = w.github.read_file(owner, name, p, w.branch).await {
+                    outputs.push((p.clone(), t));
+                }
+            }
+            let found = ownership_problems(g, &diff, &outputs);
+            if !found.is_empty() {
+                let inputs = owned_types(g, &diff)
+                    .into_iter()
+                    .map(|t| t.input)
+                    .collect::<Vec<_>>();
+                problems.push((g.clone(), inputs, found.join(" ")));
             }
         }
     }
@@ -1334,6 +1653,122 @@ mod tests {
             "npm ci --no-audit --no-fund && (npx graphql-codegen --config codegen.yml) && (npx prisma generate --schema prisma/schema.prisma)"
         );
         assert!(all_command(&RepoFiles::default()).is_none());
+    }
+
+    fn sanity_gen() -> Generator {
+        Generator {
+            kind: GenKind::Sanity,
+            name: "npm run typegen".into(),
+            command: "npm run typegen".into(),
+            inputs: vec!["**/schemaTypes/**".into()],
+            outputs: vec!["src/sanity.types.ts".into()],
+        }
+    }
+
+    /// The observed case: a new block in the CMS schema, the generated
+    /// union without it, and its props typed by hand in the component.
+    #[test]
+    fn a_new_schema_type_must_be_generated_and_imported() {
+        let g = sanity_gen();
+        let files = vec![
+            (
+                "studio/schemaTypes/blocks/gallery.ts".to_string(),
+                "added".to_string(),
+                "@@\n+import { defineType } from 'sanity'\n+export default defineType({\n+  name: 'gallery',\n+  type: 'object',\n+  fields: [{ name: 'title', type: 'string' }],\n+})\n".to_string(),
+            ),
+            (
+                "src/components/blocks/Gallery.tsx".to_string(),
+                "added".to_string(),
+                "@@\n+export interface GalleryProps {\n+  title?: string\n+}\n+export function Gallery(p: GalleryProps) {}\n".to_string(),
+            ),
+        ];
+        let owned = owned_types(&g, &files);
+        assert_eq!(owned.len(), 1);
+        assert_eq!(owned[0].type_name, "Gallery");
+        let stale = vec![(
+            "src/sanity.types.ts".to_string(),
+            "export type Hero = { _type: \"hero\" }\nexport type Block = Hero\n".to_string(),
+        )];
+        let p = ownership_problems(&g, &files, &stale);
+        assert_eq!(p.len(), 2, "{p:?}");
+        assert!(p[0].contains("has no `Gallery`"));
+        assert!(p[1].contains("declares `GalleryProps` by hand"));
+        assert!(p[1].contains("from `src/sanity.types.ts`"));
+
+        // Regenerated, and the component builds on the generated type.
+        let fresh = vec![(
+            "src/sanity.types.ts".to_string(),
+            "export type Gallery = { _type: \"gallery\"; title?: string }\n".to_string(),
+        )];
+        let mut good = files.clone();
+        good[1].2 = "@@\n+import type { Gallery } from '@/sanity.types'\n+export type GalleryProps = Gallery & { className?: string }\n".into();
+        assert!(ownership_problems(&g, &good, &fresh).is_empty());
+        // An unrelated type is never flagged.
+        let other = vec![(
+            "src/components/Nav.tsx".to_string(),
+            "modified".to_string(),
+            "@@\n+type NavProps = { open: boolean }\n".to_string(),
+        )];
+        assert!(hand_typed(&owned, &g, &other).is_empty());
+    }
+
+    #[test]
+    fn schema_languages_name_their_new_types() {
+        assert_eq!(
+            added_types(
+                GenKind::GraphqlCodegen,
+                "modified",
+                "@@\n+type Gallery {\n+  id: ID!\n+}\n+extend type Query { x: Int }\n"
+            ),
+            vec!["Gallery".to_string()]
+        );
+        assert_eq!(
+            added_types(GenKind::Prisma, "modified", "@@\n+model Booking {\n"),
+            vec!["Booking".to_string()]
+        );
+        assert_eq!(
+            added_types(
+                GenKind::Sanity,
+                "modified",
+                "@@\n   fields: [\n+    defineField({ name: 'caption', type: 'string' }),\n"
+            ),
+            Vec::<String>::new()
+        );
+        assert_eq!(type_name_of("gallery-block"), "GalleryBlock");
+        assert_eq!(type_name_of("galleryBlock"), "GalleryBlock");
+    }
+
+    #[test]
+    fn typegen_settings_in_the_sanity_cli_config_are_read() {
+        let r = repo(
+            &[
+                (
+                    "package.json",
+                    r#"{"scripts":{"typegen":"sanity schema extract && sanity typegen generate"}}"#,
+                ),
+                (
+                    "sanity.cli.ts",
+                    "export default defineCliConfig({\n  typegen: {\n    path: './app/**/*.{ts,tsx}',\n    generates: './app/types/cms.generated.ts',\n  },\n})\n",
+                ),
+            ],
+            &["studio/schemaTypes/gallery.ts"],
+        );
+        let gens = detect(&r);
+        assert_eq!(
+            gens[0].outputs,
+            vec!["app/types/cms.generated.ts".to_string()]
+        );
+        assert!(outputs_missing(
+            &gens[0],
+            &changed(&["studio/schemaTypes/gallery.ts"])
+        ));
+        assert!(!outputs_missing(
+            &gens[0],
+            &changed(&[
+                "studio/schemaTypes/gallery.ts",
+                "app/types/cms.generated.ts"
+            ])
+        ));
     }
 
     #[test]
