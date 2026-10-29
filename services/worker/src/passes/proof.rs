@@ -37,7 +37,7 @@ pub const CODER_RULES: &str = "
 - Actual data first, always: before deciding how to read another system's records, read real ones (a payload, a row) for the ticket's records and a broad sample of others, and list every field on them. Decide from what you saw, never from names in the code, a schema or a guess.
 - Key logic on the source system's structured fields and flags (booleans, type fields, numeric quantities, ids), never on parsing names, titles or descriptions, which people rename at any time. Pattern matching or a regex on text is the last resort, only when the real records have no structured field that says the same thing. Then say so in the `Evidence:` section with the fields you checked, test the pattern against every live value (counts of matches and non-matches), and log a WARNING for records it doesn't match.
 - Survey a field across all live records, not only the ticket's. Group the records by shape, say what the field means in each group, and scope the rule with the source's own flag where meanings differ. Put the count per shape and one example id each in the `Evidence:` section.
-- When a record doesn't match the expected shape, don't silently fall back: log a WARNING with the record id and add a count to the run's summary. The INFO/DEBUG rule above is for expected records; an unexpected shape is a WARNING.
+- When a record doesn't match the expected shape, don't silently fall back or skip: collect its id and report the collected ids in ONE WARNING per run (deduplicated, capped), with counts in the run's summary; never a log line per record. Expected exclusions (filtered-out categories) are counted, not warned. Where the repository or the team's instructions set a format, follow it. The INFO/DEBUG rule above is for expected records; an unexpected shape is a WARNING.
 - Tests: build fixtures from real payloads (trimmed, with the real field names and values), one per shape the survey found, and include a test that fails on the old code and passes on the new one.
 - Existing bad records are corrected by the normal pipeline or job on its next run. No manual backfills or one-off scripts unless unavoidable; then list them in the verification steps.
 - Fix the rule, never the one record: no hard-coded ids, names, seasons or prices.
@@ -64,7 +64,7 @@ pub const CODER_RULES: &str = "
 ";
 
 /// How the coder ends: its evidence becomes the PR description's.
-pub const EVIDENCE_OUTPUT: &str = "When you finish, output a one-line summary, then a section that starts with `Evidence:` listing: each fact about a system this code doesn't own that the change relies on, on its own line that starts `- Confirmed:` (the fact, the lookup that confirmed it and what came back: quote the field and its value) or `- Unconfirmed [external:<the system>]:` (the fact, and why nothing confirmed it: the source that is missing, or the lookup that failed or came back empty); a check of this repository's own (lint, type-check, tests, build, format) that didn't run or pass goes on a line of its own, `- Unconfirmed [check:<lint|typecheck|tests|build|format>]:`, never as an outside fact; how many records the change affects, where you counted them, and a few examples (ids or names); and anything no connected source could answer, naming the source that is missing. Write `Evidence: none needed` when the change relies on nothing outside the code and changes no stored records. Do NOT describe each code change in detail. Last, when the change copies an existing block, a fenced ```mirrors.json block: `[{\"path\": \"the file of the block you copied\", \"name\": \"the block (resource, function, key)\", \"differences\": [\"each intentional difference, and why\"]}]`; `[]` when it copies none.";
+pub const EVIDENCE_OUTPUT: &str = "When you finish, output a one-line summary, then a section that starts with `Evidence:` listing: each fact about a system this code doesn't own that the change relies on, on its own line that starts `- Confirmed:` (the fact, the lookup that confirmed it and what came back: quote the field and its value) or `- Unconfirmed [external:<the system>]:` (the fact, and why nothing confirmed it: the source that is missing, or the lookup that failed or came back empty); a check of this repository's own (lint, type-check, tests, build, format) that didn't run or pass goes on a line of its own, `- Unconfirmed [check:<lint|typecheck|tests|build|format>]:`, never as an outside fact; how many records the change affects, where you counted them, and a few examples (ids or names); when the change affects stored data, a `Before and after:` list read through a connected data source: the records the ticket names and the edge cases the change touches (ties, nulls, missing records), one line each with its id, what it was before the change, what it is after, and which result it ends with (or `Before and after: no data source reachable` naming the missing source when none can read that data); and anything no connected source could answer, naming the source that is missing. Write `Evidence: none needed` when the change relies on nothing outside the code and changes no stored records. Do NOT describe each code change in detail. Last, when the change copies an existing block, a fenced ```mirrors.json block: `[{\"path\": \"the file of the block you copied\", \"name\": \"the block (resource, function, key)\", \"differences\": [\"each intentional difference, and why\"]}]`; `[]` when it copies none.";
 
 /// How one lookup ended, as recorded when it ran.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -145,6 +145,9 @@ pub struct RunEvidence {
     /// The environments the diff changes, read from its paths when the
     /// change is judged (see `completeness::changed_environments`).
     pub environments: Vec<String>,
+    /// The diff changes stored data (see `feature::data_rules::touches_data`),
+    /// read from it when the change is judged.
+    pub data_change: bool,
 }
 
 /// What the sandbox came to on the run's last check: the kinds of check it
@@ -242,6 +245,7 @@ impl RunEvidence {
         if !later.environments.is_empty() {
             self.environments = later.environments;
         }
+        self.data_change |= later.data_change;
         let notes = later.notes.trim();
         if !notes.is_empty() {
             if self.notes.trim().is_empty() {
@@ -341,8 +345,8 @@ pub struct Finding {
     /// `assumption`, `structured_field`, `survey`, `silent_fallback`,
     /// `fixtures`, `one_record`, `team_rule`, `ci_pending`,
     /// `manual_check`, `pattern_cited`, `end_to_end`, `environment`,
-    /// `env_unproven`, `near_match_unresolved`, `history_used` or
-    /// `planned_work`; or `unrun_check`, which only [`classify`] sets, or
+    /// `env_unproven`, `near_match_unresolved`, `history_used`,
+    /// `planned_work` or `real_data`; or `unrun_check`, which only [`classify`] sets, or
     /// `optional_task`, which only the plan check sets.
     pub point: String,
     /// What is unverified, in one sentence.
@@ -423,6 +427,7 @@ impl Finding {
             "near_match_unresolved" => "Close match not followed up",
             "history_used" => "Earlier pull requests not built on",
             "planned_work" => "Planned work not done",
+            "real_data" => "Not shown on real data",
             "security" => "Security issue not fixed yet",
             "security_unchecked" => "Security check did not run",
             "optional_task" => "Optional task left out",
@@ -633,8 +638,10 @@ pub const JUDGE_SYSTEM: &str = "You check a code change before its pull request 
      only, with no count of the live records per shape and one example id each, or applies one \
      meaning to records whose shapes differ without scoping it by the source's own flag.\n\
      7. silent_fallback: a miss when the change quietly falls back (a default, a skip) on data \
-     that doesn't match the expected shape, instead of a WARNING log with the record id and a \
-     count in the run's summary. A WARNING for an unexpected shape is not noisy logging.\n\
+     that doesn't match the expected shape, instead of ONE WARNING per run naming the record ids \
+     (deduplicated, capped) and counts in the run's summary; also a miss for a log line per \
+     record. Expected exclusions are counted, not warned. A WARNING for an unexpected shape is \
+     not noisy logging.\n\
      8. fixtures: a miss when the change alters how another system's data is handled and its \
      tests use invented payloads instead of trimmed real ones (one per shape found), or no test \
      fails on the old code.\n\
@@ -689,6 +696,11 @@ pub const JUDGE_SYSTEM: &str = "You check a code change before its pull request 
      file listed under \"Generated files their generator settled\". Planned work is never a note \
      for later: it is sent back to the coder, and the pull request stays a draft until it is \
      done.\n\
+     20. real_data: the change affects stored data and a read-only data source is connected. A \
+     miss when the notes have no `Before and after:` list from that source showing the records \
+     the ticket names and the edge cases the change touches (ties, nulls, missing records), each \
+     with its value before, after and the result it ends with. Not a miss when no connected \
+     source can read that data and the notes say exactly that.\n\
      Many changes touch none of these: a change that relies on nothing outside its own code, \
      changes no stored records and adds no logs passes all of them. Judge only what the evidence \
      shows and do not invent concerns. A fact the lookups confirm is proven even when the notes \
@@ -697,7 +709,7 @@ pub const JUDGE_SYSTEM: &str = "You check a code change before its pull request 
      exact field, records, log line, assumption or check); `settle` is ONE sentence on how to \
      settle it (which connected source to read, what to count, which log to lower, which check \
      result). No lists, no preamble, no repeating the rule's text.\n\
-     Output ONLY a fenced ```json block: {\"findings\":[{\"point\":\"external_fact|impact|logging|assumption|structured_field|survey|silent_fallback|fixtures|one_record|team_rule|ci_pending|manual_check|pattern_cited|end_to_end|environment|env_unproven|near_match_unresolved|history_used|planned_work\",\"detail\":\"one sentence\",\"settle\":\"one sentence\",\"check\":\"format|lint|typecheck|build|tests|plan|security, or empty\",\"command\":\"the command the check needs, or empty\",\"ci\":\"the CI command id (C1), or empty\"}]}. \
+     Output ONLY a fenced ```json block: {\"findings\":[{\"point\":\"external_fact|impact|logging|assumption|structured_field|survey|silent_fallback|fixtures|one_record|team_rule|ci_pending|manual_check|pattern_cited|end_to_end|environment|env_unproven|near_match_unresolved|history_used|planned_work|real_data\",\"detail\":\"one sentence\",\"settle\":\"one sentence\",\"check\":\"format|lint|typecheck|build|tests|plan|security, or empty\",\"command\":\"the command the check needs, or empty\",\"ci\":\"the CI command id (C1), or empty\"}]}. \
      An empty list when all pass.";
 
 /// The judge's prompt: the change and everything the run gathered.
@@ -1094,6 +1106,25 @@ pub fn recorded_gaps(evidence: &RunEvidence) -> Vec<Finding> {
         }
     }
     out.extend(classify(checks, evidence));
+    // A change to stored data, with a data source connected, is shown on
+    // that data before and after (see `feature::data_rules`).
+    if evidence.data_change
+        && !evidence.sources.is_empty()
+        && super::feature::data_rules::before_after(evidence.latest_notes())
+            == super::feature::data_rules::BeforeAfter::Missing
+    {
+        out.push(Finding {
+            point: "real_data".into(),
+            detail: "The change affects stored data and a data source is connected, but the \
+                     evidence shows no record before and after the change."
+                .into(),
+            settle: "Read the ticket's records and the edge cases the change touches (ties, \
+                     nulls, missing records) through the source and list each under `Before and \
+                     after:` with the result it ends with."
+                .into(),
+            ..Default::default()
+        });
+    }
     // Each environment the diff changes needs its own evidence line.
     out.extend(super::completeness::env_gaps(
         &evidence.environments,
@@ -1462,6 +1493,18 @@ pub async fn judge(
                 })
                 .unwrap_or_default();
             evidence.environments = super::completeness::changed_environments(&paths);
+            let files: Vec<(String, String, String)> = d["files"]
+                .as_array()
+                .map(|a| {
+                    a.iter()
+                        .map(|f| {
+                            let s = |k: &str| f[k].as_str().unwrap_or("").to_string();
+                            (s("filename"), s("status"), s("patch"))
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            evidence.data_change = super::feature::data_rules::touches_data(&files);
             super::pr::format_diff_patches(&d)
         }
         Err(e) => {
@@ -1859,6 +1902,48 @@ mod tests {
     }
 
     #[test]
+    fn a_data_change_is_shown_before_and_after_on_the_connected_source() {
+        let mut ev = RunEvidence {
+            sources: vec!["warehouse (database)".into()],
+            notes: "Evidence:\n- Confirmed: items carry group_id (L1)".into(),
+            data_change: true,
+            ..Default::default()
+        };
+        let gaps = recorded_gaps(&ev);
+        let g = gaps
+            .iter()
+            .find(|g| g.point == "real_data")
+            .expect("real_data gap");
+        assert_eq!(g.settler(), Settler::Proof);
+        assert!(g.line().contains("**Not shown on real data:**"));
+        // A fix round that lists the records clears it.
+        ev.merge(RunEvidence {
+            notes: "Before and after:\n- item 41 (tie on start): before child 7, after child 7\n\
+                    - item 42 (null end): before none, after child 9"
+                .into(),
+            ..Default::default()
+        });
+        assert!(ev.data_change);
+        assert!(!recorded_gaps(&ev).iter().any(|g| g.point == "real_data"));
+        // No connected source: the description says so instead.
+        let none = RunEvidence {
+            data_change: true,
+            notes: "Evidence: none needed".into(),
+            ..Default::default()
+        };
+        assert!(!recorded_gaps(&none).iter().any(|g| g.point == "real_data"));
+        // A change that touches no data owes none.
+        let code = RunEvidence {
+            sources: vec!["warehouse (database)".into()],
+            ..Default::default()
+        };
+        assert!(!recorded_gaps(&code).iter().any(|g| g.point == "real_data"));
+        assert!(JUDGE_SYSTEM.contains("20. real_data"));
+        assert!(EVIDENCE_OUTPUT.contains("`Before and after:`"));
+        assert!(CODER_RULES.contains("ONE WARNING per run"));
+    }
+
+    #[test]
     fn gaps_are_open_items_and_the_fix_round_gets_them() {
         let gaps = [
             finding(
@@ -1965,7 +2050,7 @@ mod tests {
         assert!(CODER_RULES.contains("last resort"));
         assert!(JUDGE_SYSTEM.contains("last resort"));
         assert!(CODER_RULES.contains("Survey a field across all live records"));
-        assert!(CODER_RULES.contains("log a WARNING with the record id"));
+        assert!(CODER_RULES.contains("report the collected ids in ONE WARNING per run"));
         assert!(CODER_RULES.contains("fixtures from real payloads"));
         assert!(CODER_RULES.contains("No manual backfills or one-off scripts"));
         assert!(CODER_RULES.contains("no hard-coded ids, names, seasons or prices"));

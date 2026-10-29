@@ -1075,6 +1075,7 @@ pub async fn run(
             ci_commands: ci,
             // Read from the diff when the change is judged.
             environments: Vec::new(),
+            data_change: false,
         },
     })
 }
@@ -1145,7 +1146,7 @@ Go DIRECTLY to the target files listed in the OpenSpec.
 - NEVER leave placeholder text like TODO, FIXME, REPLACE_ME, or stub implementations. Every line you write must be complete, working code.
 - {commit}
 - {evidence_output}
-{proof_rules}"#,
+{proof_rules}{data_rules}"#,
             number = p.number,
             title = p.title,
             design = p.design,
@@ -1157,6 +1158,7 @@ Go DIRECTLY to the target files listed in the OpenSpec.
             commit = p.commit,
             evidence_output = super::proof::EVIDENCE_OUTPUT,
             proof_rules = super::proof::CODER_RULES,
+            data_rules = super::feature::data_rules::CODER_RULES,
         )
     } else {
         format!(
@@ -1177,7 +1179,7 @@ Go DIRECTLY to the target files listed in the OpenSpec.
 - {commit}
 - {evidence_output}
 - Only implement the listed tasks. Do not add extras.
-{proof_rules}{schema_rules}"#,
+{proof_rules}{data_rules}{schema_rules}"#,
             number = p.number,
             title = p.title,
             design = p.design,
@@ -1188,6 +1190,7 @@ Go DIRECTLY to the target files listed in the OpenSpec.
             commit = p.commit,
             evidence_output = super::proof::EVIDENCE_OUTPUT,
             proof_rules = super::proof::CODER_RULES,
+            data_rules = super::feature::data_rules::CODER_RULES,
             schema_rules = SCHEMA_CHANGE_RULES,
         )
     }
@@ -3073,6 +3076,13 @@ mod task_prompt_tests {
         }
         assert!(!prompt(true).contains(SCHEMA_CHANGE_RULES));
         assert!(prompt(false).contains(SCHEMA_CHANGE_RULES));
+        // The data rules reach every change, at both sizes.
+        for simple in [true, false] {
+            let p = prompt(simple);
+            assert!(p.contains(crate::passes::feature::data_rules::CODER_RULES));
+            assert!(p.contains("GREATEST(existing, new)"));
+            assert!(p.contains("ONE warning per run"));
+        }
     }
 
     #[test]

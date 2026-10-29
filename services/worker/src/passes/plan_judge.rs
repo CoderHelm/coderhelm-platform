@@ -11,7 +11,13 @@
 //!   hit while a connected source could have shown it;
 //! - `near_match_unresolved`: the evidence names an existing object close to
 //!   what the ticket asks for without its owner, contents and origin, or
-//!   without one decisive question.
+//!   without one decisive question;
+//! - `cursor_readers`: the plan changes how a timestamp, sequence or version
+//!   column is written without listing every reader of it (see
+//!   `feature::data_rules`);
+//! - `selection_parity`: the plan picks a winner, latest or first among rows
+//!   without naming the other path that makes the same choice and its
+//!   ordering key.
 //!
 //! The structured part is checked in code ([`structural`]); a model reads
 //! the plan's words for the rest ([`judge`]). A gap sends the planner back
@@ -31,7 +37,8 @@ use crate::WorkerState;
 /// One gap in a plan.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
 pub struct PlanFinding {
-    /// `history_used`, `env_unproven` or `near_match_unresolved`.
+    /// `history_used`, `env_unproven`, `near_match_unresolved`,
+    /// `cursor_readers` or `selection_parity`.
     pub point: String,
     /// What is missing, in one sentence.
     pub detail: String,
@@ -93,7 +100,10 @@ fn decision_text(d: &FixDecision) -> String {
 /// - an environment the plan lists as unproven while a lookup could reach
 ///   it, or listed as proven with no proof (`env_unproven`);
 /// - an existing object close to what the ticket names, listed without its
-///   owner, contents, origin or the question about it (`near_match_unresolved`).
+///   owner, contents, origin or the question about it (`near_match_unresolved`);
+/// - a change to how a cursor column is written with no readers section
+///   (`cursor_readers`), or a selection among rows with no section naming
+///   the other path that makes it (`selection_parity`).
 pub fn structural(
     files: &PlanResult,
     history: &TicketHistory,
@@ -105,6 +115,13 @@ pub fn structural(
         .into_iter()
         .map(|g| PlanFinding::new("history_used", g, ""))
         .collect();
+    for (point, detail, settle) in super::feature::data_rules::plan_gaps(&text) {
+        out.push(PlanFinding {
+            point: point.into(),
+            detail,
+            settle,
+        });
+    }
     let Some(d) = files.fix.as_ref() else {
         return out;
     };
@@ -192,7 +209,7 @@ pub fn worth_judging(history: &TicketHistory, lookups: usize) -> bool {
 
 /// The plan judge's system prompt.
 pub const SYSTEM: &str = "You check an implementation plan before it is kept. You judge only the \
-     three points below, from what you are given: the ticket, its history (earlier pull requests \
+     five points below, from what you are given: the ticket, its history (earlier pull requests \
      for it and how they ended), the data sources the team connected, every lookup the planner \
      made with what came back, and the plan.\n\
      1. history_used: the ticket has earlier pull requests. A miss when the plan doesn't say what \
@@ -209,10 +226,19 @@ pub const SYSTEM: &str = "You check an implementation plan before it is kept. Yo
      the ticket names (a similar name, the same purpose) without saying who owns it, what is in \
      it and what created it, or without one decisive question for a person about using it \
      instead.\n\
-     Judge only what is shown and do not invent concerns; a plan with no history, no lookups and \
-     no near match passes all three. Each finding is short: `detail` is ONE sentence naming what \
+     4. cursor_readers: a miss when the plan changes how a timestamp, sequence or version column \
+     is written (sets it conditionally, stops advancing it, moves it back) without listing every \
+     reader of that column by path (`MAX(col)` watermarks, `GREATEST(...)` change keys, `WHERE col \
+     >`, `ORDER BY col`, code comparing it), without keeping it advancing (`GREATEST(existing, \
+     new)`), or without a test that it still advances.\n\
+     5. selection_parity: a miss when the plan picks a winner, latest or first among rows and \
+     doesn't name the other path that makes the same choice (full and incremental, batch and \
+     stream, backfill and live) with its ordering key, or plans a different key, tie-break or \
+     null handling from it, or plans no test with ties and nulls in both.\n\
+     Judge only what is shown and do not invent concerns; a plan with no history, no lookups, no \
+     near match, no cursor column write and no selection among rows passes all five. Each finding is short: `detail` is ONE sentence naming what \
      is missing; `settle` is ONE sentence on how to settle it.\n\
-     Output ONLY a fenced ```json block: {\"findings\":[{\"point\":\"history_used|env_unproven|near_match_unresolved\",\"detail\":\"one sentence\",\"settle\":\"one sentence\"}]}. \
+     Output ONLY a fenced ```json block: {\"findings\":[{\"point\":\"history_used|env_unproven|near_match_unresolved|cursor_readers|selection_parity\",\"detail\":\"one sentence\",\"settle\":\"one sentence\"}]}. \
      An empty list when all pass.";
 
 /// The plan judge's prompt.
@@ -260,7 +286,7 @@ struct Judged {
 }
 
 /// The judge's findings, or `None` when its reply can't be read. Points
-/// other than the three are dropped.
+/// other than the five are dropped.
 pub fn parse_findings(reply: &str) -> Option<Vec<PlanFinding>> {
     let block = match reply.rfind("```json") {
         Some(s) => {
@@ -277,7 +303,11 @@ pub fn parse_findings(reply: &str) -> Option<Vec<PlanFinding>> {
             .filter(|f| {
                 matches!(
                     f.point.trim(),
-                    "history_used" | "env_unproven" | "near_match_unresolved"
+                    "history_used"
+                        | "env_unproven"
+                        | "near_match_unresolved"
+                        | "cursor_readers"
+                        | "selection_parity"
                 ) && !f.detail.trim().is_empty()
             })
             .collect(),
