@@ -13,12 +13,19 @@
 //! per merge. Other commits on the branch never change the verdict. A deploy
 //! superseded by a later merge's run is followed to the run that includes the
 //! commit, and the comment says so. It never says "inconclusive".
+//!
+//! Follow-up: a production deploy held for an environment approval is not
+//! stuck. The one comment reports what finished and names the job waiting
+//! for approval, in which environment, with a link; the check keeps watching
+//! (the safety ceiling does not count the wait) and updates the same comment
+//! once the approved deploy finishes. A deploy cancelled by hand with no
+//! later run is reported 🟡 cancelled, never 🔴.
 
 use super::fixture::*;
 use crate::models::{HealthCheckMessage, WorkerMessage};
 use crate::passes::health_check::{
-    assemble, decide, marker, render, successor_candidates, tick_message, Follow, Job, Next,
-    Verdict, WfRun,
+    assemble, decide, decide_from, mark, marker, render, render_interim, successor_candidates,
+    tick_message, Approval, Follow, Job, Next, Verdict, WfRun,
 };
 use serde_json::{json, Value};
 use std::collections::HashSet;
@@ -161,7 +168,125 @@ fn watch(e2e: &str, baseline: &[&str]) -> (Ending, Vec<String>, i64) {
                 end.status = "quiet".into();
                 return (end, sent, (now - epoch(0)) / 60);
             }
+            Next::Interim { .. } => panic!("nothing in this deploy waits for approval"),
         }
+    }
+    panic!("the check never reached a verdict");
+}
+
+/// The one PR comment for the merge, as the marker keeps it: every post
+/// after the first edits it.
+#[derive(Default)]
+struct Comment {
+    created: usize,
+    body: String,
+    history: Vec<String>,
+}
+
+impl Comment {
+    fn upsert(&mut self, body: String) {
+        if self.body.contains(&marker(MERGE)) {
+            if self.body == body {
+                return;
+            }
+        } else {
+            self.created += 1;
+        }
+        self.history.push(body.clone());
+        self.body = body;
+    }
+}
+
+/// A deploy whose production job is held for approval from minute 20 until
+/// `approved` (minutes), then runs 15 minutes with conclusion `prod`.
+fn approval_deploy(min: i64, approved: i64, prod: &'static str) -> (Vec<Job>, Vec<Approval>) {
+    let done = |end: i64, c: &'static str| (min >= end).then_some((end, c));
+    let mut runs = vec![
+        check_run("ci", MERGE, 10, 0, done(8, "success")),
+        check_run("deploy-staging", MERGE, 20, 8, done(20, "success")),
+    ];
+    let mut approvals = Vec::new();
+    if min >= 20 && min < approved {
+        let mut held = check_run("deploy-production", MERGE, 20, 20, None);
+        held["status"] = json!("waiting");
+        runs.push(held);
+        approvals.push(Approval {
+            suite_id: 20,
+            environments: vec!["production".into()],
+            run_url: format!("https://github.com/{OWNER}/{REPO}/actions/runs/2"),
+        });
+    } else if min >= approved {
+        runs.push(check_run(
+            "deploy-production",
+            MERGE,
+            20,
+            approved,
+            done(approved + 15, prod),
+        ));
+    }
+    let jobs = runs.iter().map(Job::from_check_run).collect();
+    (jobs, approvals)
+}
+
+/// Ticks the check through an approval wait the way `run` does.
+fn watch_approval(approved: i64, prod: &'static str) -> (Ending, Comment, i64) {
+    let mut end = Ending::default();
+    let mut comment = Comment::default();
+    let mut msg = HealthCheckMessage {
+        pr_number: 41,
+        merge_sha: MERGE.into(),
+        merged_at: Some(epoch(0)),
+        ..Default::default()
+    };
+    let none = HashSet::new();
+    let mut now = epoch(0) + 60;
+    for _ in 0..2000 {
+        let min = (now - epoch(0)) / 60;
+        let (jobs, approvals) = approval_deploy(min, approved, prod);
+        let jobs = mark(assemble(MERGE, &jobs, &[], &[]), &approvals, &[]);
+        if jobs.iter().any(Job::awaiting_approval) {
+            msg.approval_seen_at = Some(now);
+        }
+        let from = msg.approval_seen_at.unwrap_or(epoch(0));
+        let delay = match decide_from(
+            now,
+            epoch(0),
+            from,
+            msg.attempts,
+            msg.green_since,
+            &jobs,
+            &none,
+        ) {
+            Next::Wait { delay, green_since } => {
+                msg.green_since = green_since;
+                delay
+            }
+            Next::Interim {
+                finished,
+                failed,
+                waiting,
+                delay,
+            } => {
+                msg.green_since = None;
+                comment.upsert(render_interim(MERGE, finished, &failed, &waiting, &[]));
+                delay
+            }
+            Next::Post(v) => {
+                comment.upsert(render(MERGE, &v, &[]));
+                for b in &comment.history {
+                    end.said(b.clone());
+                }
+                end.status = "posted".into();
+                return (end, comment, min);
+            }
+            Next::Quiet => panic!("the deploy exists"),
+        };
+        let (body, d) = tick_message(&msg, delay).unwrap();
+        let WorkerMessage::HealthCheck(next) = serde_json::from_str(&body).unwrap() else {
+            panic!()
+        };
+        msg = next;
+        now += d as i64;
     }
     panic!("the check never reached a verdict");
 }
@@ -290,4 +415,67 @@ fn one_comment_per_merge_and_no_timer_verdict_in_the_source() {
     assert!(!run.contains("create_issue_comment("));
     assert!(!src.contains("MAX_ATTEMPTS"));
     assert!(!src.to_lowercase().contains("health check inconclusive"));
+}
+
+#[test]
+fn a_deploy_waiting_ten_hours_for_approval_is_reported_then_judged_in_the_same_comment() {
+    let (end, comment, minute) = watch_approval(600, "success");
+    assert_eq!(comment.created, 1, "one comment per merge");
+    // First what finished and what waits, with the link; then the verdict.
+    assert!(end.says("⏸ **Post-merge health check: waiting for approval.**"));
+    assert!(end.says(&format!(
+        "[**deploy-production**](https://github.com/{OWNER}/{REPO}/actions/runs/2) is waiting for approval in **production**"
+    )));
+    assert!(comment.body.starts_with("💚"), "{}", comment.body);
+    assert!(
+        minute >= 630,
+        "judged after approval and the window: {minute}"
+    );
+    // The wait was posted once, not on every look.
+    assert_eq!(comment.history.len(), 2, "{:?}", comment.history);
+    end.never_says("stuck");
+    end.never_says("still running");
+    end.never_says(OLD);
+}
+
+#[test]
+fn an_approved_deploy_that_fails_updates_the_comment_to_red() {
+    let (end, comment, _) = watch_approval(90, "failure");
+    assert_eq!(comment.created, 1);
+    assert!(end.says("waiting for approval in **production**"));
+    assert!(comment.body.starts_with("🔴"), "{}", comment.body);
+    assert!(comment.body.contains("deploy-production"));
+    end.never_says("stuck");
+}
+
+#[test]
+fn a_deploy_cancelled_by_hand_with_no_later_run_is_yellow_not_red() {
+    let own = WfRun::from_json(&workflow_run(100, 7, "Deploy", MERGE, 0, Some("cancelled")));
+    // No later run of the workflow contains the commit.
+    assert!(successor_candidates(&own, &[]).is_empty());
+    let checks = vec![
+        Job::from_check_run(&check_run("ci", MERGE, 10, 0, Some((5, "success")))),
+        Job::from_check_run(&check_run("deploy", MERGE, 1000, 0, Some((9, "cancelled")))),
+    ];
+    let jobs = mark(
+        assemble(MERGE, &checks, std::slice::from_ref(&own), &[]),
+        &[],
+        &[own],
+    );
+    let v = decide(epoch(30), epoch(0), 5, None, &jobs, &HashSet::new());
+    let Next::Post(verdict @ Verdict::Cancelled(_)) = v else {
+        panic!("{v:?}")
+    };
+    let mut end = Ending::default();
+    end.said(render(MERGE, &verdict, &[]));
+    assert!(end.says(&format!(
+        "the deploy for `{}` was cancelled; nothing later deployed it",
+        &MERGE[..7]
+    )));
+    assert!(end.says("🟡"));
+    assert!(end.says(&format!(
+        "https://github.com/{OWNER}/{REPO}/actions/runs/1000/job/6"
+    )));
+    end.never_says("FAILED");
+    end.never_says(OLD);
 }

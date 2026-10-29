@@ -3660,6 +3660,24 @@ impl GitHubClient {
             .unwrap_or_default())
     }
 
+    /// The environments a waiting workflow run is held for (each entry has
+    /// `environment.name` and `environment.html_url`).
+    pub async fn pending_deployments(
+        &self,
+        owner: &str,
+        repo: &str,
+        run_id: u64,
+    ) -> Result<Vec<serde_json::Value>, Box<dyn std::error::Error + Send + Sync>> {
+        let url =
+            format!("{API_BASE}/repos/{owner}/{repo}/actions/runs/{run_id}/pending_deployments");
+        Ok(self
+            .get(&url)
+            .await?
+            .as_array()
+            .cloned()
+            .unwrap_or_default())
+    }
+
     /// Push runs of one workflow (by id) on `branch` created at or after
     /// `created_from` (an ISO 8601 time), newest first.
     pub async fn list_push_runs_since(

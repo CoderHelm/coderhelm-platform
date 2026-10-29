@@ -615,6 +615,11 @@ pub struct HealthCheckMessage {
     /// (cancelled or skipped), each with the run that deployed this commit.
     #[serde(default)]
     pub followed: Vec<FollowedDeploy>,
+    /// Epoch seconds of the last look that saw a job waiting for an
+    /// environment approval. The safety ceiling counts from here (or the
+    /// merge), so an approval wait never runs into it.
+    #[serde(default)]
+    pub approval_seen_at: Option<i64>,
 }
 
 /// A deploy run of the merge commit that was superseded, and the later run on

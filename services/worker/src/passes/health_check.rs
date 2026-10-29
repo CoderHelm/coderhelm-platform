@@ -20,8 +20,16 @@
 //!     which starts when the merge commit's deploy completes;
 //!   - 🔴 on check failures that are NEW vs. the pre-merge baseline, naming
 //!     each failing check or job with its link;
+//!   - 🟡 when the deploy was cancelled and no later run deployed the
+//!     commit (a manual cancel is not a failure);
 //!   - nothing when the commit has no check or deploy at all after a grace
 //!     period.
+//!
+//! A job held for an environment approval is not stuck: the comment reports
+//! everything that finished and names the job waiting for approval, in which
+//! environment, with a link. The check keeps watching (the safety ceiling
+//! does not count the wait) and updates the same comment once the approved
+//! deploy finishes.
 //!
 //! One comment per merge, edited in place on a later verdict. It reports; it
 //! never rolls back a shared branch.
@@ -68,6 +76,11 @@ pub struct Job {
     /// The check suite it belongs to (a workflow run's `check_suite_id`).
     pub suite_id: u64,
     pub head_sha: String,
+    /// Held for an approval in this environment (empty name when GitHub
+    /// didn't say which).
+    pub environment: Option<String>,
+    /// Cancelled, and no later run deployed the commit: not a failure.
+    pub cancelled_undeployed: bool,
 }
 
 impl Job {
@@ -82,6 +95,7 @@ impl Job {
             completed_at: s("completed_at"),
             suite_id: v["check_suite"]["id"].as_u64().unwrap_or(0),
             head_sha: s("head_sha"),
+            ..Default::default()
         }
     }
 
@@ -105,6 +119,7 @@ impl Job {
             },
             suite_id: r.suite_id,
             head_sha: r.head_sha.clone(),
+            ..Default::default()
         }
     }
 
@@ -113,7 +128,12 @@ impl Job {
     }
 
     pub fn failed(&self) -> bool {
-        self.done() && FAILING.contains(&self.conclusion.as_str())
+        self.done() && !self.cancelled_undeployed && FAILING.contains(&self.conclusion.as_str())
+    }
+
+    /// Held for an environment approval: waiting on a person, not stuck.
+    pub fn awaiting_approval(&self) -> bool {
+        !self.done() && (self.status == "waiting" || self.environment.is_some())
     }
 }
 
@@ -237,6 +257,54 @@ pub fn assemble(
     jobs
 }
 
+/// A workflow run held for environment approval.
+#[derive(Debug, Clone, Default)]
+pub struct Approval {
+    pub suite_id: u64,
+    pub environments: Vec<String>,
+    /// The run's page, where the deploy is reviewed.
+    pub run_url: String,
+}
+
+/// Marks the jobs held for an approval and the jobs of runs that were
+/// cancelled with no later run deploying the commit (`orphans`).
+pub fn mark(mut jobs: Vec<Job>, approvals: &[Approval], orphans: &[WfRun]) -> Vec<Job> {
+    for a in approvals {
+        let env = a.environments.join(", ");
+        let held = |j: &Job| j.suite_id == a.suite_id && j.status == "waiting";
+        let target = if jobs.iter().any(held) {
+            None
+        } else {
+            jobs.iter()
+                .position(|j| j.suite_id == a.suite_id && !j.done())
+        };
+        for (i, j) in jobs.iter_mut().enumerate() {
+            if held(j) || target == Some(i) {
+                j.environment = Some(env.clone());
+                if !a.run_url.is_empty() {
+                    j.url = a.run_url.clone();
+                }
+            }
+        }
+    }
+    for o in orphans {
+        let mut any = false;
+        for j in jobs.iter_mut().filter(|j| j.suite_id == o.suite_id) {
+            if j.done() && j.conclusion == "cancelled" {
+                j.cancelled_undeployed = true;
+                any = true;
+            }
+        }
+        if !any {
+            jobs.retain(|j| !(j.suite_id == o.suite_id && j.name == o.name && j.url == o.url));
+            let mut j = Job::from_run(o);
+            j.cancelled_undeployed = true;
+            jobs.push(j);
+        }
+    }
+    jobs
+}
+
 /// What the check does after one look.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Next {
@@ -249,6 +317,14 @@ pub enum Next {
     Post(Verdict),
     /// Nothing to watch: no check or deploy ever showed up for the commit.
     Quiet,
+    /// Everything else finished; `waiting` is held for an approval. Post or
+    /// update the comment with what finished, then look again in `delay`.
+    Interim {
+        finished: usize,
+        failed: Vec<Job>,
+        waiting: Vec<Job>,
+        delay: i64,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -259,6 +335,8 @@ pub enum Verdict {
     Failed(Vec<Job>),
     /// The safety ceiling passed with these jobs still running.
     StillRunning(Vec<Job>),
+    /// The deploy was cancelled and nothing later deployed the commit.
+    Cancelled(Vec<Job>),
 }
 
 /// The delay before the next tick while the deploy runs.
@@ -273,12 +351,37 @@ fn epoch(ts: &str) -> Option<i64> {
         .map(|t| t.timestamp())
 }
 
-/// One look at the merge commit's deploy. No branch of this ever gives up
-/// because of time while the deploy is still running, except the safety
-/// ceiling, which names what is running.
+/// One look at the merge commit's deploy, with the safety ceiling counted
+/// from the merge.
+#[cfg(test)]
 pub fn decide(
     now: i64,
     merged_at: i64,
+    ticks: u32,
+    green_since: Option<i64>,
+    jobs: &[Job],
+    baseline: &HashSet<String>,
+) -> Next {
+    decide_from(
+        now,
+        merged_at,
+        merged_at,
+        ticks,
+        green_since,
+        jobs,
+        baseline,
+    )
+}
+
+/// One look at the merge commit's deploy. No branch of this ever gives up
+/// because of time while the deploy is still running, except the safety
+/// ceiling, which counts from `ceiling_from` (the merge, or the last look
+/// that saw an approval wait) and names what is running. An approval wait
+/// never hits the ceiling.
+pub fn decide_from(
+    now: i64,
+    merged_at: i64,
+    ceiling_from: i64,
     ticks: u32,
     green_since: Option<i64>,
     jobs: &[Job],
@@ -293,23 +396,48 @@ pub fn decide(
         }
         return Next::Quiet;
     }
-    let running: Vec<Job> = jobs.iter().filter(|j| !j.done()).cloned().collect();
-    if !running.is_empty() {
-        if now - merged_at >= SAFETY_CEILING_SECS {
-            return Next::Post(Verdict::StillRunning(running));
+    let new_failures: Vec<Job> = jobs
+        .iter()
+        .filter(|j| j.failed() && !baseline.contains(&j.name))
+        .cloned()
+        .collect();
+    let active: Vec<Job> = jobs
+        .iter()
+        .filter(|j| !j.done() && !j.awaiting_approval())
+        .cloned()
+        .collect();
+    if !active.is_empty() {
+        if now - ceiling_from.max(merged_at) >= SAFETY_CEILING_SECS {
+            return Next::Post(Verdict::StillRunning(active));
         }
         return Next::Wait {
             delay: backoff(ticks),
             green_since: None,
         };
     }
-    let new_failures: Vec<Job> = jobs
+    let waiting: Vec<Job> = jobs
         .iter()
-        .filter(|j| j.failed() && !baseline.contains(&j.name))
+        .filter(|j| j.awaiting_approval())
         .cloned()
         .collect();
+    if !waiting.is_empty() {
+        return Next::Interim {
+            finished: jobs.len() - waiting.len(),
+            failed: new_failures,
+            waiting,
+            delay: backoff(ticks),
+        };
+    }
     if !new_failures.is_empty() {
         return Next::Post(Verdict::Failed(new_failures));
+    }
+    let cancelled: Vec<Job> = jobs
+        .iter()
+        .filter(|j| j.cancelled_undeployed)
+        .cloned()
+        .collect();
+    if !cancelled.is_empty() {
+        return Next::Post(Verdict::Cancelled(cancelled));
     }
     // Completed and clean: the window starts when the deploy completed.
     let completed = jobs.iter().filter_map(|j| epoch(&j.completed_at)).max();
@@ -333,6 +461,24 @@ fn short(sha: &str) -> &str {
     &sha[..sha.len().min(7)]
 }
 
+fn link(name: &str, url: &str) -> String {
+    if url.is_empty() {
+        format!("**{name}**")
+    } else {
+        format!("[**{name}**]({url})")
+    }
+}
+
+fn waiting_line(j: &Job) -> String {
+    match j.environment.as_deref() {
+        Some(env) if !env.is_empty() => format!(
+            "- {} is waiting for approval in **{env}**",
+            link(&j.name, &j.url)
+        ),
+        _ => format!("- {} is waiting for approval", link(&j.name, &j.url)),
+    }
+}
+
 fn job_line(j: &Job) -> String {
     let what = if j.done() {
         j.conclusion.replace('_', " ")
@@ -354,7 +500,7 @@ fn job_line(j: &Job) -> String {
 /// The comment for one verdict on one merge.
 pub fn render(merge_sha: &str, verdict: &Verdict, follows: &[Follow]) -> String {
     let sha = short(merge_sha);
-    let mut out = match verdict {
+    let out = match verdict {
         Verdict::Green => format!(
             "💚 **Post-merge health check passed**: the deploy of `{sha}` completed and stayed \
              green for the full {}-minute watch window (no new failures vs. the pre-merge \
@@ -374,7 +520,60 @@ pub fn render(merge_sha: &str, verdict: &Verdict, follows: &[Follow]) -> String 
             SAFETY_CEILING_SECS / 3600,
             jobs.iter().map(job_line).collect::<Vec<_>>().join("\n")
         ),
+        Verdict::Cancelled(jobs) => format!(
+            "🟡 **Post-merge health check: deploy cancelled**: the deploy for `{sha}` was \
+             cancelled; nothing later deployed it.\n\n{}\n\nNo new failures in what ran. \
+             Run the deploy again if this commit should go out.",
+            jobs.iter().map(job_line).collect::<Vec<_>>().join("\n")
+        ),
     };
+    finish(out, merge_sha, follows)
+}
+
+/// The comment while part of the deploy waits for an approval: the result of
+/// everything that finished, then what is waiting and where.
+pub fn render_interim(
+    merge_sha: &str,
+    finished: usize,
+    failed: &[Job],
+    waiting: &[Job],
+    follows: &[Follow],
+) -> String {
+    let sha = short(merge_sha);
+    let waits = waiting
+        .iter()
+        .map(waiting_line)
+        .collect::<Vec<_>>()
+        .join("\n");
+    let out = if !failed.is_empty() {
+        format!(
+            "🔴 **Post-merge health check FAILED**: the merge of `{sha}` has NEW failing \
+             check(s) that were not failing before the merge:\n\n{}\n\nFailures that were \
+             already there before the merge were ignored. A person should decide on a \
+             rollback.\n\nStill to come:\n\n{waits}\n\nI'll update this comment once it is \
+             approved and finishes.",
+            failed.iter().map(job_line).collect::<Vec<_>>().join("\n")
+        )
+    } else if finished > 0 {
+        format!(
+            "⏸ **Post-merge health check: waiting for approval.** Everything in the deploy of \
+             `{sha}` that has finished passed, with no new failures vs. the pre-merge \
+             baseline.\n\n{waits}\n\nI'll keep watching and update this comment once it is \
+             approved and the deploy finishes."
+        )
+    } else {
+        format!(
+            "⏸ **Post-merge health check: waiting for approval.** The deploy of `{sha}` is \
+             held for approval:\n\n{waits}\n\nI'll keep watching and update this comment once \
+             it is approved and the deploy finishes."
+        )
+    };
+    finish(out, merge_sha, follows)
+}
+
+/// Appends what was followed and the merge marker.
+fn finish(mut out: String, merge_sha: &str, follows: &[Follow]) -> String {
+    let sha = short(merge_sha);
     for f in follows {
         let name = if f.successor.name.is_empty() {
             "the deploy".to_string()
@@ -505,6 +704,7 @@ async fn read_deploy(
     let own_runs = runs_of(github, msg, &msg.merge_sha).await?;
     let mut follows: Vec<Follow> = Vec::new();
     let mut carried: Vec<FollowedDeploy> = Vec::new();
+    let mut orphans: Vec<WfRun> = Vec::new();
     for run in own_runs
         .iter()
         .filter(|r| r.deploys_commit() && r.superseded())
@@ -543,16 +743,45 @@ async fn read_deploy(
             }
             current = next;
         }
-        if let Some(successor) = found {
-            let successor_checks = check_runs_of(github, msg, &successor.head_sha).await?;
-            follows.push(Follow {
-                superseded: run.clone(),
-                successor,
-                successor_checks,
-            });
+        match found {
+            Some(successor) => {
+                let successor_checks = check_runs_of(github, msg, &successor.head_sha).await?;
+                follows.push(Follow {
+                    superseded: run.clone(),
+                    successor,
+                    successor_checks,
+                });
+            }
+            // Cancelled and nothing later deployed it: not a failure.
+            None if run.conclusion == "cancelled" => orphans.push(run.clone()),
+            None => {}
         }
     }
-    let jobs = assemble(&msg.merge_sha, &own_checks, &own_runs, &follows);
+    // Runs held for an environment approval, and where.
+    let mut approvals: Vec<Approval> = Vec::new();
+    let live = own_runs
+        .iter()
+        .filter(|r| r.deploys_commit() && !r.superseded())
+        .chain(follows.iter().map(|f| &f.successor));
+    for r in live.filter(|r| r.status == "waiting") {
+        let environments = github
+            .pending_deployments(&msg.repo_owner, &msg.repo_name, r.id)
+            .await
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|d| d["environment"]["name"].as_str().map(String::from))
+            .collect();
+        approvals.push(Approval {
+            suite_id: r.suite_id,
+            environments,
+            run_url: r.url.clone(),
+        });
+    }
+    let jobs = mark(
+        assemble(&msg.merge_sha, &own_checks, &own_runs, &follows),
+        &approvals,
+        &orphans,
+    );
     Ok((jobs, follows, carried))
 }
 
@@ -583,15 +812,40 @@ pub async fn run(state: &WorkerState, msg: HealthCheckMessage) -> Result<(), Box
     };
     msg.followed = carried;
 
+    // An approval wait is a person's turn, not a stuck deploy: the safety
+    // ceiling counts from the last look that saw one.
+    if jobs.iter().any(Job::awaiting_approval) {
+        msg.approval_seen_at = Some(now);
+    }
+    let ceiling_from = msg.approval_seen_at.unwrap_or(merged_at);
     let baseline: HashSet<String> = msg.baseline_failed.iter().cloned().collect();
-    match decide(
+    match decide_from(
         now,
         merged_at,
+        ceiling_from,
         msg.attempts,
         msg.green_since,
         &jobs,
         &baseline,
     ) {
+        Next::Interim {
+            finished,
+            failed,
+            waiting,
+            delay,
+        } => {
+            msg.green_since = None;
+            let body = render_interim(&msg.merge_sha, finished, &failed, &waiting, &follows);
+            upsert_comment(&github, &msg, &body).await;
+            info!(
+                pr = msg.pr_number,
+                sha = %msg.merge_sha,
+                waiting = ?waiting.iter().map(|j| (&j.name, &j.environment)).collect::<Vec<_>>(),
+                delay,
+                "Health check: deploy waiting for approval, reported what finished"
+            );
+            send_tick(state, &msg, delay).await;
+        }
         Next::Wait { delay, green_since } => {
             msg.green_since = green_since;
             info!(
@@ -639,15 +893,17 @@ async fn upsert_comment(github: &GitHubClient, msg: &HealthCheckMessage, body: &
         .and_then(|cs| {
             cs.iter()
                 .find(|c| c["body"].as_str().is_some_and(|b| b.contains(&mark)))
-                .and_then(|c| c["id"].as_u64())
+                .map(|c| (c["id"].as_u64(), c["body"].as_str() == Some(body)))
         });
     let res = match existing {
-        Some(id) => {
+        // Already says this (an approval wait seen again): nothing to edit.
+        Some((_, true)) => return,
+        Some((Some(id), false)) => {
             github
                 .edit_issue_comment(&msg.repo_owner, &msg.repo_name, id, body)
                 .await
         }
-        None => {
+        Some((None, false)) | None => {
             github
                 .create_issue_comment(&msg.repo_owner, &msg.repo_name, msg.pr_number, body)
                 .await
@@ -686,6 +942,7 @@ pub async fn schedule(
         green_since: None,
         merged_at: Some(chrono::Utc::now().timestamp()),
         followed: Vec::new(),
+        approval_seen_at: None,
     };
     send_tick(state, &msg, backoff(0)).await
 }
@@ -737,6 +994,7 @@ mod tests {
             },
             suite_id: suite,
             head_sha: sha.into(),
+            ..Default::default()
         }
     }
 
@@ -947,5 +1205,204 @@ mod tests {
             .map(|r| r.id)
             .collect();
         assert_eq!(ids, vec![12, 14]);
+    }
+
+    fn waiting_run_approval() -> Approval {
+        Approval {
+            suite_id: 2,
+            environments: vec!["production".into()],
+            run_url: "https://github.com/o/r/actions/runs/2".into(),
+        }
+    }
+
+    #[test]
+    fn an_approval_wait_reports_what_finished_and_never_hits_the_ceiling() {
+        let merged = t("2026-10-28T15:00:00Z");
+        let jobs = mark(
+            vec![
+                job("build", "completed", "success", 1, "m"),
+                job("deploy-staging", "completed", "success", 2, "m"),
+                job("deploy-production", "waiting", "", 2, "m"),
+            ],
+            &[waiting_run_approval()],
+            &[],
+        );
+        // Ten hours after the merge, still waiting on a person: no ceiling.
+        let now = merged + 10 * 3600;
+        let next = decide_from(now, merged, now, 50, None, &jobs, &none());
+        let Next::Interim {
+            finished,
+            failed,
+            waiting,
+            delay,
+        } = next
+        else {
+            panic!("{next:?}")
+        };
+        assert_eq!(finished, 2);
+        assert!(failed.is_empty());
+        assert!(delay <= 900);
+        let body = render_interim("abcdef1234", finished, &failed, &waiting, &[]);
+        assert!(body.contains(
+            "[**deploy-production**](https://github.com/o/r/actions/runs/2) is waiting for approval in **production**"
+        ));
+        assert!(body.contains("that has finished passed"));
+        assert!(body.ends_with(&marker("abcdef1234")));
+        assert!(!body.to_lowercase().contains("stuck"));
+        // Even counted from the merge, an approval wait is never "still running".
+        assert!(matches!(
+            decide(now, merged, 50, None, &jobs, &none()),
+            Next::Interim { .. }
+        ));
+    }
+
+    #[test]
+    fn an_approval_wait_with_a_new_failure_reports_the_failure_and_keeps_watching() {
+        let jobs = mark(
+            vec![
+                job("e2e-staging", "completed", "failure", 2, "m"),
+                job("deploy-production", "waiting", "", 2, "m"),
+            ],
+            &[waiting_run_approval()],
+            &[],
+        );
+        let merged = t("2026-10-28T15:00:00Z");
+        let Next::Interim {
+            finished,
+            failed,
+            waiting,
+            ..
+        } = decide(merged + 3600, merged, 9, None, &jobs, &none())
+        else {
+            panic!()
+        };
+        let body = render_interim("abcdef1234", finished, &failed, &waiting, &[]);
+        assert!(body.starts_with("🔴"));
+        assert!(body.contains("e2e-staging"));
+        assert!(body.contains("is waiting for approval in **production**"));
+    }
+
+    #[test]
+    fn a_waiting_run_without_jobs_is_marked_on_the_run() {
+        let run = WfRun {
+            id: 2,
+            name: "Deploy".into(),
+            status: "waiting".into(),
+            url: "https://github.com/o/r/actions/runs/2".into(),
+            head_sha: "m".into(),
+            event: "push".into(),
+            suite_id: 2,
+            ..Default::default()
+        };
+        let jobs = mark(
+            assemble("m", &[], &[run], &[]),
+            &[waiting_run_approval()],
+            &[],
+        );
+        assert_eq!(jobs.len(), 1);
+        assert!(jobs[0].awaiting_approval());
+        assert_eq!(jobs[0].environment.as_deref(), Some("production"));
+    }
+
+    #[test]
+    fn the_ceiling_counts_from_the_last_approval_wait() {
+        let merged = t("2026-10-28T15:00:00Z");
+        let jobs = vec![job("deploy-production", "in_progress", "", 2, "m")];
+        // Approved after 9 hours of waiting; running an hour since: no ceiling.
+        let approved = merged + 9 * 3600;
+        assert!(matches!(
+            decide_from(approved + 3600, merged, approved, 40, None, &jobs, &none()),
+            Next::Wait { .. }
+        ));
+        // Running 8 hours after the approval: the ceiling names it.
+        assert!(matches!(
+            decide_from(
+                approved + SAFETY_CEILING_SECS,
+                merged,
+                approved,
+                90,
+                None,
+                &jobs,
+                &none()
+            ),
+            Next::Post(Verdict::StillRunning(_))
+        ));
+    }
+
+    #[test]
+    fn a_cancel_nothing_later_deployed_is_yellow_not_red() {
+        let orphan = WfRun {
+            id: 2,
+            name: "Deploy".into(),
+            status: "completed".into(),
+            conclusion: "cancelled".into(),
+            url: "https://github.com/o/r/actions/runs/2".into(),
+            head_sha: "m".into(),
+            event: "push".into(),
+            suite_id: 2,
+            ..Default::default()
+        };
+        let jobs = mark(
+            vec![
+                job("build", "completed", "success", 1, "m"),
+                job("deploy-production", "completed", "cancelled", 2, "m"),
+            ],
+            &[],
+            std::slice::from_ref(&orphan),
+        );
+        let merged = t("2026-10-28T15:00:00Z");
+        let v = decide(merged + 3600, merged, 9, None, &jobs, &none());
+        let Next::Post(verdict @ Verdict::Cancelled(_)) = v else {
+            panic!("{v:?}")
+        };
+        let body = render("abcdef1234", &verdict, &[]);
+        assert!(body.starts_with("🟡"));
+        assert!(body.contains("the deploy for `abcdef1` was cancelled; nothing later deployed it"));
+        assert!(
+            body.contains("[**deploy-production**](https://github.com/o/r/actions/runs/2/job/1)")
+        );
+        assert!(!body.contains("FAILED"));
+        // A run with no jobs at all is shown by the run itself.
+        let jobs = mark(
+            assemble("m", &[], std::slice::from_ref(&orphan), &[]),
+            &[],
+            &[orphan],
+        );
+        assert_eq!(jobs.len(), 1);
+        assert!(jobs[0].cancelled_undeployed && !jobs[0].failed());
+    }
+
+    #[test]
+    fn a_real_failure_beside_a_cancel_is_still_red_and_baseline_still_applies() {
+        let orphan = WfRun {
+            suite_id: 2,
+            conclusion: "cancelled".into(),
+            status: "completed".into(),
+            ..Default::default()
+        };
+        let jobs = mark(
+            vec![
+                job("e2e", "completed", "failure", 1, "m"),
+                job("deploy", "completed", "cancelled", 2, "m"),
+            ],
+            &[],
+            &[orphan],
+        );
+        let merged = t("2026-10-28T15:00:00Z");
+        assert!(matches!(
+            decide(merged + 3600, merged, 9, None, &jobs, &none()),
+            Next::Post(Verdict::Failed(f)) if f.len() == 1 && f[0].name == "e2e"
+        ));
+        let baseline: HashSet<String> = ["e2e".to_string()].into();
+        assert!(matches!(
+            decide(merged + 3600, merged, 9, None, &jobs, &baseline),
+            Next::Post(Verdict::Cancelled(_))
+        ));
+        // A cancelled job that is NOT an undeployed cancel still counts.
+        let plain = vec![job("deploy", "completed", "cancelled", 2, "m")];
+        assert!(matches!(
+            decide(merged + 3600, merged, 9, None, &plain, &none()),
+            Next::Post(Verdict::Failed(_))
+        ));
     }
 }
