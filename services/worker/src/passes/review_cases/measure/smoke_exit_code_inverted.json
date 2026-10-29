@@ -1,0 +1,18 @@
+{
+  "name": "smoke_exit_code_inverted",
+  "about": "misread exit code",
+  "title": "Gate the release on the staging smoke test",
+  "body": "Runs scripts/smoke.sh against staging before releasing; a failing smoke test stops the release.",
+  "diff": "\n### deploy/release.py (modified, +9/-0)\n@@ -6,8 +6,17 @@\n     subprocess.run([\"./manage.py\", \"migrate\", \"--noinput\"], check=True)\n \n \n+def smoke_test() -> bool:\n+    \"\"\"True when the staging smoke test passed.\"\"\"\n+    result = subprocess.run([\"./scripts/smoke.sh\", \"staging\"])\n+    return bool(result.returncode)\n+\n+\n def main() -> int:\n     run_migrations()\n+    if not smoke_test():\n+        print(\"smoke test failed; not releasing\", file=sys.stderr)\n+        return 1\n     subprocess.run([\"./scripts/release.sh\"], check=True)\n     return 0\n \n",
+  "files": {
+    "deploy/release.py": "import subprocess\nimport sys\n\n\ndef run_migrations() -> None:\n    subprocess.run([\"./manage.py\", \"migrate\", \"--noinput\"], check=True)\n\n\ndef smoke_test() -> bool:\n    \"\"\"True when the staging smoke test passed.\"\"\"\n    result = subprocess.run([\"./scripts/smoke.sh\", \"staging\"])\n    return bool(result.returncode)\n\n\ndef main() -> int:\n    run_migrations()\n    if not smoke_test():\n        print(\"smoke test failed; not releasing\", file=sys.stderr)\n        return 1\n    subprocess.run([\"./scripts/release.sh\"], check=True)\n    return 0\n\n\nif __name__ == \"__main__\":\n    sys.exit(main())\n"
+  },
+  "defects": [
+    {
+      "file": "deploy/release.py",
+      "line": 12,
+      "what": "returncode 0 means success, so bool(returncode) is False on a pass and True on a failure: the gate blocks good releases and ships failing ones"
+    }
+  ],
+  "expect_blocking": true
+}

@@ -1,0 +1,18 @@
+{
+  "name": "delete_without_owner_check",
+  "about": "security",
+  "title": "Let people delete a project",
+  "body": "Adds DELETE /projects/:id for the new delete button.",
+  "diff": "\n### src/projects.ts (modified, +5/-0)\n@@ -15,3 +15,8 @@\n   if (!p || p.ownerId !== req.user.id) return res.status(404).end();\n   res.json(await db.project.update({ where: { id: p.id }, data: { name: req.body.name } }));\n });\n+\n+projects.delete(\"/projects/:id\", requireUser, async (req, res) => {\n+  await db.project.delete({ where: { id: req.params.id } });\n+  res.status(204).end();\n+});\n",
+  "files": {
+    "src/projects.ts": "import { Router } from \"express\";\nimport { db } from \"./db\";\nimport { requireUser } from \"./auth\";\n\nexport const projects = Router();\n\nprojects.get(\"/projects/:id\", requireUser, async (req, res) => {\n  const p = await db.project.findUnique({ where: { id: req.params.id } });\n  if (!p || p.ownerId !== req.user.id) return res.status(404).end();\n  res.json(p);\n});\n\nprojects.patch(\"/projects/:id\", requireUser, async (req, res) => {\n  const p = await db.project.findUnique({ where: { id: req.params.id } });\n  if (!p || p.ownerId !== req.user.id) return res.status(404).end();\n  res.json(await db.project.update({ where: { id: p.id }, data: { name: req.body.name } }));\n});\n\nprojects.delete(\"/projects/:id\", requireUser, async (req, res) => {\n  await db.project.delete({ where: { id: req.params.id } });\n  res.status(204).end();\n});\n"
+  },
+  "defects": [
+    {
+      "file": "src/projects.ts",
+      "line": 20,
+      "what": "unlike get and patch, delete never checks ownerId: any signed-in user can delete anyone's project"
+    }
+  ],
+  "expect_blocking": true
+}

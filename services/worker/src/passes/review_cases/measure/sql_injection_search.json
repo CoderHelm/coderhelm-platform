@@ -1,0 +1,18 @@
+{
+  "name": "sql_injection_search",
+  "about": "security",
+  "title": "User search endpoint",
+  "body": "Adds GET /users/search?q= for the admin user picker.",
+  "diff": "\n### app/users.py (modified, +9/-0)\n@@ -9,3 +9,12 @@\n def get_user(user_id):\n     row = get_conn().execute(\"SELECT id, name FROM users WHERE id = ?\", (user_id,)).fetchone()\n     return jsonify(dict(row)) if row else (\"\", 404)\n+\n+\n+@bp.get(\"/users/search\")\n+def search_users():\n+    term = request.args.get(\"q\", \"\")\n+    rows = get_conn().execute(\n+        f\"SELECT id, name FROM users WHERE name LIKE '%{term}%' ORDER BY name LIMIT 20\"\n+    ).fetchall()\n+    return jsonify([dict(r) for r in rows])\n",
+  "files": {
+    "app/users.py": "from flask import Blueprint, jsonify, request\n\nfrom .db import get_conn\n\nbp = Blueprint(\"users\", __name__)\n\n\n@bp.get(\"/users/<int:user_id>\")\ndef get_user(user_id):\n    row = get_conn().execute(\"SELECT id, name FROM users WHERE id = ?\", (user_id,)).fetchone()\n    return jsonify(dict(row)) if row else (\"\", 404)\n\n\n@bp.get(\"/users/search\")\ndef search_users():\n    term = request.args.get(\"q\", \"\")\n    rows = get_conn().execute(\n        f\"SELECT id, name FROM users WHERE name LIKE '%{term}%' ORDER BY name LIMIT 20\"\n    ).fetchall()\n    return jsonify([dict(r) for r in rows])\n"
+  },
+  "defects": [
+    {
+      "file": "app/users.py",
+      "line": 18,
+      "what": "the query string is interpolated into SQL: SQL injection"
+    }
+  ],
+  "expect_blocking": true
+}

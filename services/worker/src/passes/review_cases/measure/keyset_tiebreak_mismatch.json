@@ -1,0 +1,18 @@
+{
+  "name": "keyset_tiebreak_mismatch",
+  "about": "mismatched tie-break between two paths",
+  "title": "Keyset pagination for the activity feed",
+  "body": "Adds next_page so the feed can page past the first 50 events without OFFSET.",
+  "diff": "\n### feed/pages.py (modified, +10/-0)\n@@ -7,3 +7,13 @@\n         \"ORDER BY created_at DESC, id DESC LIMIT %s\",\n         (user_id, size),\n     )\n+\n+\n+def next_page(user_id, last_created_at, last_id, size=50):\n+    \"\"\"The page after the row (last_created_at, last_id): keyset pagination.\"\"\"\n+    return query(\n+        \"SELECT id, created_at, body FROM events WHERE user_id = %s \"\n+        \"AND (created_at < %s OR (created_at = %s AND id > %s)) \"\n+        \"ORDER BY created_at DESC, id ASC LIMIT %s\",\n+        (user_id, last_created_at, last_created_at, last_id, size),\n+    )\n",
+  "files": {
+    "feed/pages.py": "from .db import query\n\n\ndef first_page(user_id, size=50):\n    return query(\n        \"SELECT id, created_at, body FROM events WHERE user_id = %s \"\n        \"ORDER BY created_at DESC, id DESC LIMIT %s\",\n        (user_id, size),\n    )\n\n\ndef next_page(user_id, last_created_at, last_id, size=50):\n    \"\"\"The page after the row (last_created_at, last_id): keyset pagination.\"\"\"\n    return query(\n        \"SELECT id, created_at, body FROM events WHERE user_id = %s \"\n        \"AND (created_at < %s OR (created_at = %s AND id > %s)) \"\n        \"ORDER BY created_at DESC, id ASC LIMIT %s\",\n        (user_id, last_created_at, last_created_at, last_id, size),\n    )\n"
+  },
+  "defects": [
+    {
+      "file": "feed/pages.py",
+      "line": 16,
+      "what": "first_page breaks ties by id DESC but next_page continues with id > last_id and orders id ASC: rows sharing a created_at are skipped or repeated across pages"
+    }
+  ],
+  "expect_blocking": true
+}

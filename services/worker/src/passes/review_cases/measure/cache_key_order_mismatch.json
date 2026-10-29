@@ -1,0 +1,18 @@
+{
+  "name": "cache_key_order_mismatch",
+  "about": "mismatched ordering between two paths",
+  "title": "Invalidate cached searches when a product changes",
+  "body": "Product edits now call invalidate() with the filters of the searches that include the product.",
+  "diff": "\n### catalog/cache.py (modified, +5/-0)\n@@ -15,3 +15,8 @@\n     result = run(filters)\n     redis.set(key, json.dumps(result), ex=600)\n     return result\n+\n+\n+def invalidate(filters: dict) -> None:\n+    \"\"\"Drop the cached result for these filters after a product changes.\"\"\"\n+    redis.delete(\"search:\" + json.dumps(filters))\n",
+  "files": {
+    "catalog/cache.py": "import json\n\nfrom .store import redis\n\n\ndef search_key(filters: dict) -> str:\n    return \"search:\" + json.dumps(filters, sort_keys=True)\n\n\ndef cached_search(filters, run):\n    key = search_key(filters)\n    hit = redis.get(key)\n    if hit is not None:\n        return json.loads(hit)\n    result = run(filters)\n    redis.set(key, json.dumps(result), ex=600)\n    return result\n\n\ndef invalidate(filters: dict) -> None:\n    \"\"\"Drop the cached result for these filters after a product changes.\"\"\"\n    redis.delete(\"search:\" + json.dumps(filters))\n"
+  },
+  "defects": [
+    {
+      "file": "catalog/cache.py",
+      "line": 22,
+      "what": "the key is built without sort_keys=True, unlike search_key, so filters given in a different key order never match and stale results stay cached"
+    }
+  ],
+  "expect_blocking": true
+}

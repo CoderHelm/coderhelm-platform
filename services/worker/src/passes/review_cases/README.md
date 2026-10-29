@@ -86,6 +86,17 @@ files the case needs. `EVAL_REVIEW_MODEL` picks the reviewing model (default
 A small model can pass a case the production reviewer model fails, so check
 a new case against the model the reviewer runs on.
 
+## Measurement cases (`measure/`)
+
+Synthetic PRs, written for the purpose (no customer code), each with its
+planted defects (file and line at the PR head) or none at all. They score a
+reviewer configuration instead of passing or failing it:
+`passes/model_route_eval.rs` reviews each one the way the diff cases are
+reviewed and reports, per case, the defects found and missed, the extra
+findings, whether the verdict blocked as it should, and the tokens and cost.
+They run only on demand (`reviewer-evals.yml`, `suite: route-review`, with the
+reviewer and critic models as inputs), never nightly.
+
 ## Add a case from a real PR (one step)
 
 ```sh

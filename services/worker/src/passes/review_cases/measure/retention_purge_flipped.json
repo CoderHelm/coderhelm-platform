@@ -1,0 +1,18 @@
+{
+  "name": "retention_purge_flipped",
+  "about": "data integrity",
+  "title": "Hourly purge of old sessions",
+  "body": "Deletes sessions not seen in 90 days. Scheduled hourly.",
+  "diff": "\n### auth/retention.py (modified, +8/-0)\n@@ -3,3 +3,11 @@\n from .db import connect\n \n RETENTION_DAYS = 90\n+\n+\n+def purge_old_sessions() -> int:\n+    \"\"\"Delete sessions older than the retention window. Runs hourly.\"\"\"\n+    cutoff = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=RETENTION_DAYS)\n+    with connect() as conn:\n+        cur = conn.execute(\"DELETE FROM sessions WHERE last_seen > %s\", (cutoff,))\n+        return cur.rowcount\n",
+  "files": {
+    "auth/retention.py": "import datetime\n\nfrom .db import connect\n\nRETENTION_DAYS = 90\n\n\ndef purge_old_sessions() -> int:\n    \"\"\"Delete sessions older than the retention window. Runs hourly.\"\"\"\n    cutoff = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=RETENTION_DAYS)\n    with connect() as conn:\n        cur = conn.execute(\"DELETE FROM sessions WHERE last_seen > %s\", (cutoff,))\n        return cur.rowcount\n"
+  },
+  "defects": [
+    {
+      "file": "auth/retention.py",
+      "line": 12,
+      "what": "last_seen > cutoff deletes every ACTIVE session (seen in the last 90 days) and keeps the stale ones"
+    }
+  ],
+  "expect_blocking": true
+}

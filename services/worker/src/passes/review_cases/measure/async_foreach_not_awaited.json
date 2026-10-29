@@ -1,0 +1,18 @@
+{
+  "name": "async_foreach_not_awaited",
+  "about": "error handling / concurrency",
+  "title": "Faster stock import",
+  "body": "The stock import ran one upsert at a time; this runs them in parallel.",
+  "diff": "\n### src/stock.ts (modified, +3/-2)\n@@ -6,12 +6,13 @@\n }\n \n export async function importStock(rows: Row[]): Promise<number> {\n-  for (const r of rows) {\n+  // Upsert in parallel: the sequential loop took minutes for big files.\n+  rows.forEach(async (r) => {\n     await db.stock.upsert({\n       where: { sku: r.sku },\n       create: { sku: r.sku, qty: r.qty },\n       update: { qty: r.qty },\n     });\n-  }\n+  });\n   return rows.length;\n }\n",
+  "files": {
+    "src/stock.ts": "import { db } from \"./db\";\n\nexport interface Row {\n  sku: string;\n  qty: number;\n}\n\nexport async function importStock(rows: Row[]): Promise<number> {\n  // Upsert in parallel: the sequential loop took minutes for big files.\n  rows.forEach(async (r) => {\n    await db.stock.upsert({\n      where: { sku: r.sku },\n      create: { sku: r.sku, qty: r.qty },\n      update: { qty: r.qty },\n    });\n  });\n  return rows.length;\n}\n"
+  },
+  "defects": [
+    {
+      "file": "src/stock.ts",
+      "line": 10,
+      "what": "forEach does not await the async callbacks: importStock returns before any write finishes and upsert failures become unhandled rejections"
+    }
+  ],
+  "expect_blocking": true
+}

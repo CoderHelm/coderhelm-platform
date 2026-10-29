@@ -1,0 +1,12 @@
+{
+  "name": "clean_go_map_with_mutex",
+  "about": "clean: concurrency done right",
+  "title": "Fetch prices concurrently",
+  "body": "Price refresh took minutes for big catalogs. This fetches the SKUs concurrently with errgroup; the result map is guarded by a mutex.",
+  "diff": "\n### prices/all.go (modified, +23/-7)\n@@ -1,20 +1,36 @@\n package prices\n \n-import \"context\"\n+import (\n+\t\"context\"\n+\t\"sync\"\n+\n+\t\"golang.org/x/sync/errgroup\"\n+)\n \n type Fetcher interface {\n \tPrice(ctx context.Context, sku string) (int64, error)\n }\n \n-// All returns the price of every SKU, one call at a time.\n+// All returns the price of every SKU, fetched concurrently.\n func All(ctx context.Context, f Fetcher, skus []string) (map[string]int64, error) {\n \tout := make(map[string]int64, len(skus))\n+\tvar mu sync.Mutex\n+\tg, ctx := errgroup.WithContext(ctx)\n \tfor _, sku := range skus {\n-\t\tp, err := f.Price(ctx, sku)\n-\t\tif err != nil {\n-\t\t\treturn nil, err\n-\t\t}\n-\t\tout[sku] = p\n+\t\tsku := sku\n+\t\tg.Go(func() error {\n+\t\t\tp, err := f.Price(ctx, sku)\n+\t\t\tif err != nil {\n+\t\t\t\treturn err\n+\t\t\t}\n+\t\t\tmu.Lock()\n+\t\t\tout[sku] = p\n+\t\t\tmu.Unlock()\n+\t\t\treturn nil\n+\t\t})\n+\t}\n+\tif err := g.Wait(); err != nil {\n+\t\treturn nil, err\n \t}\n \treturn out, nil\n }\n",
+  "files": {
+    "prices/all.go": "package prices\n\nimport (\n\t\"context\"\n\t\"sync\"\n\n\t\"golang.org/x/sync/errgroup\"\n)\n\ntype Fetcher interface {\n\tPrice(ctx context.Context, sku string) (int64, error)\n}\n\n// All returns the price of every SKU, fetched concurrently.\nfunc All(ctx context.Context, f Fetcher, skus []string) (map[string]int64, error) {\n\tout := make(map[string]int64, len(skus))\n\tvar mu sync.Mutex\n\tg, ctx := errgroup.WithContext(ctx)\n\tfor _, sku := range skus {\n\t\tsku := sku\n\t\tg.Go(func() error {\n\t\t\tp, err := f.Price(ctx, sku)\n\t\t\tif err != nil {\n\t\t\t\treturn err\n\t\t\t}\n\t\t\tmu.Lock()\n\t\t\tout[sku] = p\n\t\t\tmu.Unlock()\n\t\t\treturn nil\n\t\t})\n\t}\n\tif err := g.Wait(); err != nil {\n\t\treturn nil, err\n\t}\n\treturn out, nil\n}\n"
+  },
+  "defects": [],
+  "expect_blocking": false
+}

@@ -1,0 +1,18 @@
+{
+  "name": "go_commit_error_ignored",
+  "about": "error handling",
+  "title": "Record every transfer",
+  "body": "Writes a transfers row in the same transaction so the ledger page can list them.",
+  "diff": "\n### store/transfer.go (modified, +5/-1)\n@@ -17,5 +17,9 @@\n \tif _, err := tx.ExecContext(ctx, \"UPDATE accounts SET cents = cents + $1 WHERE id = $2\", cents, to); err != nil {\n \t\treturn err\n \t}\n-\treturn tx.Commit()\n+\tif _, err := tx.ExecContext(ctx, \"INSERT INTO transfers (src, dst, cents) VALUES ($1, $2, $3)\", from, to, cents); err != nil {\n+\t\treturn err\n+\t}\n+\t_ = tx.Commit()\n+\treturn nil\n }\n",
+  "files": {
+    "store/transfer.go": "package store\n\nimport (\n\t\"context\"\n\t\"database/sql\"\n)\n\nfunc Transfer(ctx context.Context, db *sql.DB, from, to string, cents int64) error {\n\ttx, err := db.BeginTx(ctx, nil)\n\tif err != nil {\n\t\treturn err\n\t}\n\tdefer tx.Rollback()\n\tif _, err := tx.ExecContext(ctx, \"UPDATE accounts SET cents = cents - $1 WHERE id = $2\", cents, from); err != nil {\n\t\treturn err\n\t}\n\tif _, err := tx.ExecContext(ctx, \"UPDATE accounts SET cents = cents + $1 WHERE id = $2\", cents, to); err != nil {\n\t\treturn err\n\t}\n\tif _, err := tx.ExecContext(ctx, \"INSERT INTO transfers (src, dst, cents) VALUES ($1, $2, $3)\", from, to, cents); err != nil {\n\t\treturn err\n\t}\n\t_ = tx.Commit()\n\treturn nil\n}\n"
+  },
+  "defects": [
+    {
+      "file": "store/transfer.go",
+      "line": 23,
+      "what": "the commit error is discarded and nil returned: a failed commit is reported to the caller as a successful transfer"
+    }
+  ],
+  "expect_blocking": true
+}

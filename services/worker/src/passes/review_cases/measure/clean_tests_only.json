@@ -1,0 +1,13 @@
+{
+  "name": "clean_tests_only",
+  "about": "clean: tests only",
+  "title": "Tests for fmt_money",
+  "body": "Adds unit tests for the money formatter. No code change.",
+  "diff": "\n### tests/test_money.py (added, +13/-0)\n@@ -0,0 +1,13 @@\n+from billing.money import fmt_money\n+\n+\n+def test_positive():\n+    assert fmt_money(1234) == \"USD 12.34\"\n+\n+\n+def test_negative():\n+    assert fmt_money(-5) == \"-USD 0.05\"\n+\n+\n+def test_currency():\n+    assert fmt_money(100, \"EUR\") == \"EUR 1.00\"\n",
+  "files": {
+    "billing/money.py": "def fmt_money(cents: int, currency: str = \"USD\") -> str:\n    sign = \"-\" if cents < 0 else \"\"\n    cents = abs(cents)\n    return f\"{sign}{currency} {cents // 100}.{cents % 100:02d}\"\n",
+    "tests/test_money.py": "from billing.money import fmt_money\n\n\ndef test_positive():\n    assert fmt_money(1234) == \"USD 12.34\"\n\n\ndef test_negative():\n    assert fmt_money(-5) == \"-USD 0.05\"\n\n\ndef test_currency():\n    assert fmt_money(100, \"EUR\") == \"EUR 1.00\"\n"
+  },
+  "defects": [],
+  "expect_blocking": false
+}

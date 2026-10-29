@@ -1,0 +1,82 @@
+[
+  {
+    "name": "bulk_discount",
+    "title": "Bulk discount on large order lines",
+    "body": "Wholesale customers buy in bulk. A line of 10 or more units of one item should get 10% off that line. Totals stay in integer cents; round half up.",
+    "proposal": "Give 10% off any order line of 10 or more units, in line_total, so order_total picks it up.",
+    "design": "Change `inventory/pricing.py`: `line_total(item, qty)` applies the discount when qty >= 10. Integer arithmetic only: the discounted line is `price_cents * qty * 90 / 100`, rounded half up to a whole cent. `order_total` keeps summing `line_total`.",
+    "tasks": "- [ ] In `inventory/pricing.py`, add `BULK_MIN_QTY = 10` and `BULK_DISCOUNT_PCT = 10` module constants.\n- [ ] Apply the discount in `line_total` for qty >= BULK_MIN_QTY, rounding half up to the cent with integer arithmetic.\n- [ ] Add tests in `tests/test_pricing.py`.",
+    "spec": "- 9 units of a 250-cent item cost 2250.\n- 10 units of a 250-cent item cost 2250 (2500 less 10%).\n- 10 units of a 333-cent item cost 2997.\n- 15 units of a 105-cent item cost 1418 (1575 * 0.9 = 1417.5, rounded half up).\n- order_total sums the discounted lines.",
+    "hidden": "import unittest\n\nfrom inventory.models import Item, Order\nfrom inventory.pricing import line_total, order_total\nfrom tests.helpers import store_with\n\n\nclass HiddenBulk(unittest.TestCase):\n    def test_lines(self):\n        self.assertEqual(line_total(Item(\"A\", \"a\", 0, 250), 9), 2250)\n        self.assertEqual(line_total(Item(\"A\", \"a\", 0, 250), 10), 2250)\n        self.assertEqual(line_total(Item(\"A\", \"a\", 0, 333), 10), 2997)\n        self.assertEqual(line_total(Item(\"A\", \"a\", 0, 105), 15), 1418)\n        self.assertIsInstance(line_total(Item(\"A\", \"a\", 0, 105), 15), int)\n\n    def test_order(self):\n        s = store_with(Item(\"A\", \"a\", 50, 105), Item(\"B\", \"b\", 50, 250))\n        self.assertEqual(order_total(s, Order(\"o\", [(\"A\", 15), (\"B\", 2)])), 1918)\n"
+  },
+  {
+    "name": "release_reservation",
+    "title": "Cancel a reserved order and put its stock back",
+    "body": "When a customer cancels, the reserved stock should go back on the shelf. Cancelling twice must not add the stock twice.",
+    "proposal": "Add Store.release(order) that returns a reserved order's stock and marks it cancelled.",
+    "design": "In `inventory/store.py`, `release(order)`: for an order with status `reserved`, add each line's qty back and set status `cancelled`. Releasing an order already `cancelled` does nothing (no error, no stock change). Releasing a `new` order raises ValueError and changes nothing.",
+    "tasks": "- [ ] Add `Store.release(order)` in `inventory/store.py`.\n- [ ] Tests in `tests/test_store.py` for release, a second release, and a new order.",
+    "spec": "- reserve then release restores every line's qty and sets status `cancelled`.\n- a second release is a no-op.\n- release of a `new` order raises ValueError.",
+    "hidden": "import unittest\n\nfrom inventory.models import Item, Order\nfrom tests.helpers import store_with\n\n\nclass HiddenRelease(unittest.TestCase):\n    def test_release(self):\n        s = store_with(Item(\"A\", \"a\", 5, 1), Item(\"B\", \"b\", 4, 1))\n        o = Order(\"o\", [(\"A\", 2), (\"B\", 4)])\n        s.reserve(o)\n        s.release(o)\n        self.assertEqual((s.get(\"A\").qty, s.get(\"B\").qty), (5, 4))\n        self.assertEqual(o.status, \"cancelled\")\n        s.release(o)\n        self.assertEqual((s.get(\"A\").qty, s.get(\"B\").qty), (5, 4))\n\n    def test_new(self):\n        s = store_with(Item(\"A\", \"a\", 5, 1))\n        o = Order(\"o\", [(\"A\", 2)])\n        with self.assertRaises(ValueError):\n            s.release(o)\n        self.assertEqual(s.get(\"A\").qty, 5)\n        self.assertEqual(o.status, \"new\")\n"
+  },
+  {
+    "name": "csv_quoting_and_tags",
+    "title": "CSV export breaks on names with commas",
+    "body": "An item called `Bolt, M6` produced a row with an extra column. Also the warehouse wants the tags in the export.",
+    "proposal": "Write the export with the csv module and add a tags column.",
+    "design": "In `inventory/report.py`, build the export with `csv.writer` (default dialect, `lineterminator=\"\\n\"`). Columns: `sku,name,qty,price_cents,tags`; tags joined with `;` in their stored order (empty string when none). Update the existing CSV test for the new column.",
+    "tasks": "- [ ] Rewrite `csv_export` in `inventory/report.py` with `csv.writer`.\n- [ ] Add the `tags` column.\n- [ ] Update `tests/test_report.py`.",
+    "spec": "- header `sku,name,qty,price_cents,tags`.\n- a name with a comma or a double quote is quoted per the csv module's default dialect.\n- `[\"metal\", \"sale\"]` is written `metal;sale`.\n- lines end with `\\n`.",
+    "hidden": "import unittest\n\nfrom inventory.models import Item\nfrom inventory.report import csv_export\nfrom tests.helpers import store_with\n\n\nclass HiddenCsv(unittest.TestCase):\n    def test_csv(self):\n        s = store_with(Item(\"A\", 'Bolt, M6', 2, 250, [\"metal\", \"sale\"]), Item(\"B\", 'Say \"hi\"', 1, 5))\n        self.assertEqual(\n            csv_export(s),\n            'sku,name,qty,price_cents,tags\\nA,\"Bolt, M6\",2,250,metal;sale\\nB,\"Say \"\"hi\"\"\",1,5,\\n',\n        )\n"
+  },
+  {
+    "name": "per_item_reorder_level",
+    "title": "Per-item reorder levels for the low-stock list",
+    "body": "Fast movers need a higher reorder level than the global threshold. Let an item carry its own level, and list the worst shortfalls first.",
+    "proposal": "Add an optional reorder level to Item and use it in low_stock, ordered by shortfall.",
+    "design": "`Item` gets `reorder_level: int | None = None` (last field, so existing positional construction keeps working). `low_stock(store, threshold)`: an item is low when `qty < level`, where level is its `reorder_level` when set, else `threshold`. Order by shortfall (`level - qty`) descending, then SKU ascending. The CLI `low` command keeps working unchanged.",
+    "tasks": "- [ ] Add `reorder_level` to `Item` in `inventory/models.py`.\n- [ ] Update `low_stock` in `inventory/report.py`.\n- [ ] Update `tests/test_report.py`: the existing low-stock and CLI `low` assertions change to the new order.",
+    "spec": "- an item with reorder_level 20 and qty 15 is low even when the threshold is 5.\n- an item with reorder_level 2 and qty 3 is not low even when the threshold is 5.\n- results ordered by shortfall desc, then SKU.",
+    "hidden": "import unittest\n\nfrom inventory.models import Item\nfrom inventory.report import low_stock\nfrom tests.helpers import store_with\n\n\nclass HiddenReorder(unittest.TestCase):\n    def test_levels(self):\n        s = store_with(\n            Item(\"A\", \"a\", 15, 1, [], 20),\n            Item(\"B\", \"b\", 3, 1, [], 2),\n            Item(\"C\", \"c\", 1, 1),\n            Item(\"D\", \"d\", 0, 1),\n            Item(\"E\", \"e\", 4, 1, reorder_level=8),\n        )\n        self.assertEqual(low_stock(s, 5), [\"A\", \"D\", \"C\", \"E\"])\n"
+  },
+  {
+    "name": "cli_value_command",
+    "title": "CLI: total stock value",
+    "body": "Finance asks for the value of the stock on hand from the command line.",
+    "proposal": "Add a `value` command that prints the total value of the stock on hand.",
+    "design": "In `inventory/cli.py` add a `value` subcommand. Value = sum of `qty * price_cents` over all items (no bulk discount). Print one line: `Stock value: $` followed by dollars with thousands separators and two decimals, e.g. `Stock value: $1,234.56`. Use integer arithmetic for the cents (no float rounding).",
+    "tasks": "- [ ] Add a `stock_value_cents(store)` helper in `inventory/report.py`.\n- [ ] Add the `value` subcommand in `inventory/cli.py`.\n- [ ] Tests for both.",
+    "spec": "- the demo store prints `Stock value: $89.97` (12*250 + 3*1999 + 0*120000 = 8997 cents).\n- 123456789 cents prints `$1,234,567.89`.",
+    "hidden": "import io\nimport unittest\nfrom contextlib import redirect_stdout\n\nfrom inventory import cli\nfrom inventory.models import Item\nfrom tests.helpers import store_with\n\n\nclass HiddenValue(unittest.TestCase):\n    def run_cli(self, store=None):\n        buf = io.StringIO()\n        with redirect_stdout(buf):\n            self.assertEqual(cli.main([\"value\"], store), 0)\n        return buf.getvalue().strip()\n\n    def test_demo(self):\n        self.assertEqual(self.run_cli(), \"Stock value: $89.97\")\n\n    def test_big(self):\n        s = store_with(Item(\"A\", \"a\", 1, 123456789), Item(\"B\", \"b\", 0, 5))\n        self.assertEqual(self.run_cli(s), \"Stock value: $1,234,567.89\")\n"
+  },
+  {
+    "name": "adjustment_history",
+    "title": "Keep a history of stock adjustments",
+    "body": "We can't tell why stock changed. Record each adjustment with a reason.",
+    "proposal": "Record every successful adjust with its reason, and let callers read a SKU's history.",
+    "design": "In `inventory/store.py`: `adjust(sku, delta, reason=\"manual\")` appends `(sku, delta, reason)` to the store's history only when it succeeds (a refused adjust records nothing). `history(sku)` returns that SKU's entries as `(delta, reason)` tuples, oldest first; an unknown SKU raises KeyError like `get`. `reserve` is not an adjustment and records nothing.",
+    "tasks": "- [ ] Add the history list and the `reason` parameter in `inventory/store.py`.\n- [ ] Add `Store.history(sku)`.\n- [ ] Tests in `tests/test_store.py`.",
+    "spec": "- two adjusts on A then one on B: history(\"A\") is the two A entries in order.\n- a refused adjust (would go negative) records nothing.\n- history of an unknown SKU raises KeyError.",
+    "hidden": "import unittest\n\nfrom inventory.models import Item\nfrom tests.helpers import store_with\n\n\nclass HiddenHistory(unittest.TestCase):\n    def test_history(self):\n        s = store_with(Item(\"A\", \"a\", 5, 1), Item(\"B\", \"b\", 5, 1))\n        s.adjust(\"A\", 3, \"delivery\")\n        s.adjust(\"B\", -1)\n        s.adjust(\"A\", -2)\n        with self.assertRaises(ValueError):\n            s.adjust(\"A\", -100, \"oops\")\n        self.assertEqual(s.history(\"A\"), [(3, \"delivery\"), (-2, \"manual\")])\n        self.assertEqual(s.history(\"B\"), [(-1, \"manual\")])\n        with self.assertRaises(KeyError):\n            s.history(\"Z\")\n"
+  },
+  {
+    "name": "find_by_tags",
+    "title": "Find items by tag",
+    "body": "The shop front filters by tags. We need a store query that matches all or any of a set of tags.",
+    "proposal": "Add Store.find(tags, match) for tag filtering.",
+    "design": "In `inventory/store.py`: `find(tags: list[str], match: str = \"all\") -> list[Item]`. Tag comparison is case-insensitive. `match=\"all\"`: the item has every requested tag; `match=\"any\"`: at least one. Any other `match` raises ValueError. An empty `tags` list returns every item. Results ordered by SKU.",
+    "tasks": "- [ ] Add `Store.find` in `inventory/store.py`.\n- [ ] Tests in `tests/test_store.py`.",
+    "spec": "- all/any semantics, case-insensitive.\n- empty tags returns all items by SKU.\n- `match=\"none\"` raises ValueError.",
+    "hidden": "import unittest\n\nfrom inventory.models import Item\nfrom tests.helpers import store_with\n\n\nclass HiddenFind(unittest.TestCase):\n    def setUp(self):\n        self.s = store_with(\n            Item(\"C\", \"c\", 1, 1, [\"Metal\", \"sale\"]),\n            Item(\"A\", \"a\", 1, 1, [\"metal\"]),\n            Item(\"B\", \"b\", 1, 1, [\"plastic\", \"SALE\"]),\n        )\n\n    def skus(self, items):\n        return [i.sku for i in items]\n\n    def test_all(self):\n        self.assertEqual(self.skus(self.s.find([\"metal\", \"Sale\"])), [\"C\"])\n        self.assertEqual(self.skus(self.s.find([\"METAL\"], \"all\")), [\"A\", \"C\"])\n\n    def test_any(self):\n        self.assertEqual(self.skus(self.s.find([\"sale\", \"metal\"], \"any\")), [\"A\", \"B\", \"C\"])\n        self.assertEqual(self.skus(self.s.find([\"plastic\"], \"any\")), [\"B\"])\n\n    def test_edges(self):\n        self.assertEqual(self.skus(self.s.find([])), [\"A\", \"B\", \"C\"])\n        with self.assertRaises(ValueError):\n            self.s.find([\"metal\"], \"none\")\n"
+  },
+  {
+    "name": "csv_import",
+    "title": "Import stock from a CSV file",
+    "body": "Suppliers send a CSV of stock levels. Load it into the store: new SKUs are added, known SKUs get the new quantity and price. Bad rows must not stop the import.",
+    "proposal": "Add report.import_csv(store, text) returning the problems it skipped.",
+    "design": "In `inventory/report.py`: `import_csv(store, text) -> list[str]`. The text has the header `sku,name,qty,price_cents` (parse with the csv module). For each data row: a new SKU is added as an Item (no tags); a known SKU gets its `name`, `qty` and `price_cents` replaced. A row whose qty or price_cents is not a non-negative integer is skipped and reported as `line N: <reason>` where N is the 1-based line number in the file (the header is line 1). Return the list of reports in file order.",
+    "tasks": "- [ ] Add `import_csv` in `inventory/report.py`.\n- [ ] Tests in `tests/test_report.py`.",
+    "spec": "- adds new items and updates known ones.\n- a row with qty `x` on line 3 is reported as starting with `line 3:` and the other rows still import.\n- a negative price is skipped and reported.",
+    "hidden": "import unittest\n\nfrom inventory.models import Item\nfrom inventory.report import import_csv\nfrom tests.helpers import store_with\n\n\nclass HiddenImport(unittest.TestCase):\n    def test_import(self):\n        s = store_with(Item(\"A\", \"old\", 1, 100, [\"metal\"]))\n        text = \"sku,name,qty,price_cents\\nA,Widget,7,150\\nB,Bad,x,5\\nC,Gizmo,2,999\\nD,Neg,1,-5\\n\"\n        problems = import_csv(s, text)\n        self.assertEqual(len(problems), 2)\n        self.assertTrue(problems[0].startswith(\"line 3:\"), problems)\n        self.assertTrue(problems[1].startswith(\"line 5:\"), problems)\n        a = s.get(\"A\")\n        self.assertEqual((a.name, a.qty, a.price_cents), (\"Widget\", 7, 150))\n        c = s.get(\"C\")\n        self.assertEqual((c.name, c.qty, c.price_cents, c.tags), (\"Gizmo\", 2, 999, []))\n        with self.assertRaises(KeyError):\n            s.get(\"B\")\n        with self.assertRaises(KeyError):\n            s.get(\"D\")\n"
+  }
+]

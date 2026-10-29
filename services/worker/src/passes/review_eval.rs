@@ -63,24 +63,24 @@ struct Case {
 /// own system prompt, its repository tools answered from `files`, the critic
 /// pass and the enforcement rules, then `expect` on what is left.
 #[derive(Deserialize)]
-struct LiveReview {
-    title: String,
+pub(super) struct LiveReview {
+    pub(super) title: String,
     #[serde(default)]
-    body: String,
+    pub(super) body: String,
     /// The diff as the reviewer sees it (`format_diff`'s shape).
-    diff: String,
+    pub(super) diff: String,
     /// The files at the PR head the tools can read, by path.
     #[serde(default)]
-    files: std::collections::BTreeMap<String, String>,
-    expect: LiveExpect,
+    pub(super) files: std::collections::BTreeMap<String, String>,
+    pub(super) expect: LiveExpect,
     /// The same PR re-reviewed after a person replied under an earlier
     /// CoderHelm comment.
     #[serde(default)]
-    after_reply: Option<AfterReply>,
+    pub(super) after_reply: Option<AfterReply>,
 }
 
 #[derive(Deserialize)]
-struct AfterReply {
+pub(super) struct AfterReply {
     /// The earlier CoderHelm comment, as posted.
     thread: PriorThread,
     /// What the person wrote under it.
@@ -98,7 +98,7 @@ struct PriorThread {
 
 /// What must hold for the findings left after the critic and enforcement.
 #[derive(Deserialize, Default)]
-struct LiveExpect {
+pub(super) struct LiveExpect {
     /// Nothing holds the merge (the verdict isn't REQUEST_CHANGES).
     #[serde(default)]
     no_blocking: bool,
@@ -845,7 +845,7 @@ fn review_eval_replays_every_case() {
 /// (the nightly workflow's narrow OIDC role, no API key); otherwise
 /// ANTHROPIC_API_KEY is used. EVAL_MODEL picks the model (a Bedrock model or
 /// inference profile id on Bedrock).
-async fn eval_client() -> (crate::agent::anthropic::AnthropicClient, String) {
+pub(super) async fn eval_client() -> (crate::agent::anthropic::AnthropicClient, String) {
     let meter = common::usage::UsageMeter::memory("").0;
     let bedrock = std::env::var("EVAL_PROVIDER").is_ok_and(|p| p == "bedrock");
     let (client, default_model) = if bedrock {
@@ -1024,17 +1024,20 @@ impl crate::agent::llm::ToolExecutor for CaseFiles<'_> {
 
 /// What a live review left: the findings after the critic and enforcement,
 /// its verdict, and its report on earlier threads.
-struct LiveOutcome {
-    findings: Vec<Finding>,
-    verdict: &'static str,
+pub(super) struct LiveOutcome {
+    pub(super) findings: Vec<Finding>,
+    pub(super) verdict: &'static str,
     prior: Vec<review_agent::PriorStatus>,
     unconfirmed: Vec<review_agent::UnconfirmedFact>,
 }
 
 /// Reviews `lr` with the real prompts; `prior` is the earlier-threads section.
-async fn live_review(
+/// `model` reads the PR and writes the findings; `critic_model` runs the
+/// critic, which decides which findings are kept (and so what blocks).
+pub(super) async fn live_review(
     client: &crate::agent::anthropic::AnthropicClient,
     model: &str,
+    critic_model: &str,
     lr: &LiveReview,
     prior: &str,
     usage: &mut crate::models::TokenUsage,
@@ -1095,7 +1098,7 @@ async fn live_review(
         };
         let critic = crate::agent::anthropic::converse_simple(
             client,
-            model,
+            critic_model,
             &review_agent::critic_system_prompt(&ctx),
             &review_agent::critic_user_prompt(&lr.diff, &out.findings, &ctx),
             usage,
@@ -1279,13 +1282,14 @@ fn case_files_answer_the_reviewer_s_tools() {
 async fn review_eval_live_diff_reviews() {
     let (client, model) = eval_client().await;
     let model = std::env::var("EVAL_REVIEW_MODEL").unwrap_or(model);
+    let critic_model = std::env::var("EVAL_CRITIC_MODEL").unwrap_or_else(|_| model.clone());
     let mut usage = crate::models::TokenUsage::default();
     let mut failures = vec![];
     for (file, case) in cases() {
         let Some(lr) = &case.live_review else {
             continue;
         };
-        match live_review(&client, &model, lr, "", &mut usage).await {
+        match live_review(&client, &model, &critic_model, lr, "", &mut usage).await {
             Ok(got) => {
                 println!(
                     "{file}: {} {:?}",
@@ -1302,7 +1306,16 @@ async fn review_eval_live_diff_reviews() {
             Err(e) => failures.push(format!("{file}: {e}")),
         }
         if let Some(r) = &lr.after_reply {
-            match live_review(&client, &model, lr, &prior_section(r), &mut usage).await {
+            match live_review(
+                &client,
+                &model,
+                &critic_model,
+                lr,
+                &prior_section(r),
+                &mut usage,
+            )
+            .await
+            {
                 Ok(got) => {
                     println!(
                         "{file} after the reply: {} {:?} prior {:?}",
