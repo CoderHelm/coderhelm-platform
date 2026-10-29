@@ -118,6 +118,9 @@ pub const BUILTIN: &[(&str, Risk)] = &[
     ("restore_file", Risk::Write),
     ("run_codegen", Risk::Write),
     ("run_checks", Risk::Write),
+    // Outside steps CoderHelm runs after the PR opens (worker outside_exec).
+    ("start_workflow", Risk::Write),
+    ("write_content", Risk::Write),
     ("update_pr_description", Risk::Write),
     // A pull request in a repository other than the ticket's (a fix that
     // also needs the infrastructure code changed).

@@ -216,6 +216,10 @@ pub struct OutsideChange {
     /// Identifiers the note uses, each with its label.
     #[serde(default)]
     pub names: Vec<super::outside_work::Labelled>,
+    /// The pull request whose branch CoderHelm's steps run on, set when
+    /// they start, so a later resume continues them there.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub placed: Option<super::outside_work::Placement>,
 }
 
 /// Words that make a change add content.
@@ -544,6 +548,14 @@ pub fn route_for_plan(decision: Option<&FixDecision>, tasks: &str) -> Route {
         Route::Code | Route::CodeAndOutside if tasks.trim_start().starts_with(NO_CODE_CHANGE) => {
             Route::Ask
         }
+        // The plan stops on a question (an outside step handed to a person
+        // with no reason, see `plan::unjustified_stop`): the run asks it
+        // before posting any outside note.
+        Route::CodeAndOutside | Route::OutsideOnly
+            if tasks.trim_start().starts_with("CLARIFICATION_NEEDED:") =>
+        {
+            Route::Code
+        }
         r => r,
     }
 }
@@ -716,8 +728,9 @@ List every step the ticket needs to work in production, not only this repository
 - the deploy and merge order (which repository merges first, what deploys when).
 A run does everything the ticket needs; work outside the code is the exception. Decide each piece in this order, and record it in `outside_change.steps`:
 1. The change itself does it: a task in tasks.md (a content or data migration in the repository's migrations folder that replaces the existing item by key, test fixtures or end-to-end setup that create their own content, config or registration). Then it is not an outside step at all, or a `by: this_pr` step.
-2. CoderHelm does it after the pull request opens with access it has (`by: coderhelm`): starting the repository's studio/staging deploy workflow or adding the label its CI deploys on, re-running the end-to-end workflow, running the confirm query. Its results (run link, query output) are reported on the PR and the ticket.
-3. Only what is left goes to a person (`by: person`): production content, an action that needs a person's approval, access CoderHelm lacks. Each such step says why (`why_person`, naming the missing permission or connection exactly) and how to grant it (`grant`). A person step without both is sent back, and the plan check counts it as not covered.
+2. CoderHelm does it after the pull request opens with access it has (`by: coderhelm`), production included: starting the repository's deploy workflow or adding the label its CI deploys on, re-running the end-to-end workflow, running a migration or content mutations through a write connection (after the staging deploy), running the confirm query. When the team's agent permissions say to ask, CoderHelm raises an approval card and waits for it, so needing approval is never a reason to give a step to a person. Its results (run link, conclusion, failing tests, query output) are reported on the PR and the ticket.
+3. Only what no connection or permission lets CoderHelm do at all goes to a person (`by: person`). Each such step says why (`why_person`, naming the missing connection or permission exactly) and how to grant it (`grant`); the run reports that requirement as not done. A person step without both is sent back, and if it still has none the run stops and asks.
+Give every step a `kind` and a `target`: the run picks each step's action from them, not from its wording.
 Each step says who does it: `this_pr` (this change), `other_repo` (a pull request in another repository, named in `repo`), `person` (a person or team, named in `owner`) or `vendor` (an outside company, named in `owner`). When the plan spans several repositories, order the `## owner/repo` groups in tasks.md in the order they must merge.
 
 After the four openspec files, output this block (JSON, all fields required; `outside_change` is null for `code`):
@@ -744,7 +757,7 @@ After the four openspec files, output this block (JSON, all fields required; `ou
     "existing": "when the change adds content (a block, an entry, a record): look up content of that kind in the environment the tests use first (the team's connected data sources or CMS API), and write what came back by id and key. If one exists, `change` says to REPLACE or update that exact one (fields to set, fields to remove), never to add a second. If a lookup failed, quote its error here. Empty only when the change adds no content",
     "lookup": {"endpoint": "the query endpoint you used (the CMS read API listed in your instructions, or the data source)", "query": "the exact read query", "result": "what came back, quoted", "error": "only when the attempt failed: the error, quoted"},
     "existing_items": [{"id": "document id", "key": "array key for a block inside a document", "title": "its title", "old_fields": ["fields the new schema doesn't know"], "missing_fields": ["new required fields it lacks"], "left_by": "the earlier PR or branch that left it (from the ticket's earlier PRs or git history), or where you searched"}],
-    "steps": [{"step": "each piece of work outside the code, in the order it must happen (a schema change: the studio/schema deploy first, then content)", "by": "this_pr | coderhelm | person (decide in that order, see below)", "owner": "who does it (the engineer merging, a content editor)", "how": "the workflow, command or screen", "values": ["exact field = value, reference targets, tab definitions with their settings"], "remove": ["fields to remove"], "minimum": "the least content the feature and its tests need (for example: at least one tab with more than N cards, N from the component and test code)", "why_person": "for a person only: the exact permission or connection CoderHelm lacks, or why a person must decide", "grant": "for a person only: how to give CoderHelm that access so it can do it next time"}],
+    "steps": [{"step": "each piece of work outside the code, in the order it must happen (a schema change: the studio/schema deploy first, then content)", "by": "this_pr | coderhelm | person (decide in that order, see below)", "owner": "who does it (the engineer merging, a content editor)", "how": "the workflow, command or screen", "values": ["exact field = value, reference targets, tab definitions with their settings"], "remove": ["fields to remove"], "minimum": "the least content the feature and its tests need (for example: at least one tab with more than N cards, N from the component and test code)", "kind": "deploy | e2e | content | migration | verify | other", "target": "staging | production", "mutations": [{"createOrReplace or patch": "for a content or migration step CoderHelm runs: the exact CMS mutations"}], "migration": "for a migration step: the change's .json/.ndjson file holding its mutations", "why_person": "for a person only: the exact connection or permission CoderHelm lacks", "grant": "for a person only: how to give CoderHelm that access so it can do it next time"}],
     "confirm": {"query": "the exact read query", "expect": "the result shape (exactly one item, count of tabs >= 2, reference set, old fields not defined)", "page": "the page to look at", "e2e": "the end-to-end test that must run and pass, not skip"},
     "names": [{"label": "CMS project id | dataset | environment", "value": "the value, never under another's label"}]
   },
@@ -1353,6 +1366,19 @@ mod tests {
         let d = parse(fixture::PLANNER_REPLY).unwrap();
         let tasks = "NO_CODE_CHANGE: the term's setting is off";
         assert_eq!(route_for_plan(Some(&d), tasks), Route::OutsideOnly);
+    }
+
+    #[test]
+    fn a_plan_that_stops_on_a_question_asks_before_any_outside_note() {
+        let mut d = parse(fixture::PLANNER_REPLY).unwrap();
+        let ask = "CLARIFICATION_NEEDED:\n- question: Which access is missing?";
+        assert_eq!(route_for_plan(Some(&d), ask), Route::Code);
+        d.fix_location = FixLocation::Both;
+        assert_eq!(route_for_plan(Some(&d), ask), Route::Code);
+        assert_eq!(
+            route_for_plan(Some(&d), "- [ ] a.rs: x"),
+            Route::CodeAndOutside
+        );
     }
 
     #[test]

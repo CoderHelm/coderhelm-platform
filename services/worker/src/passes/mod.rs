@@ -810,6 +810,7 @@ pub mod model_check;
 pub mod onboard;
 pub mod open_pr_choice;
 pub mod ops_tools;
+pub mod outside_exec;
 pub mod outside_work;
 mod plan;
 pub mod plan_chat;
@@ -5139,6 +5140,7 @@ async fn run_passes(
                 decision,
                 &branch_name,
                 pr_result.pr_number,
+                outside_until(start),
             )
             .await;
         }
@@ -5511,7 +5513,7 @@ async fn run_repo_pipeline(
     .await;
 
     // Build a per-repo plan with overridden tasks
-    let repo_plan = plan::PlanResult {
+    let mut repo_plan = plan::PlanResult {
         proposal: plan_result.proposal.clone(),
         design: plan_result.design.clone(),
         tasks: repo_tasks.to_string(),
@@ -5922,6 +5924,23 @@ async fn run_repo_pipeline(
     // pull request opens as a draft with it listed at the top.
     let unfinished = proof::unfinished_section(&gaps);
     gaps.extend(plan_optional);
+    // What the ticket needs outside the code, counted once: in the pull
+    // request of the repository its steps act on (the same plan check the
+    // single-repository path makes).
+    let owns_outside = outside_owner(plan_result, repo_owner, repo_name);
+    if owns_outside {
+        let outside_open = plan_coverage::outside_findings(plan_result.fix.as_ref());
+        if !outside_open.is_empty() {
+            add_progress_note(
+                state,
+                &msg.team_id,
+                run_id,
+                &plan_coverage::outside_note(plan_result.fix.as_ref()),
+            )
+            .await;
+        }
+        gaps.extend(outside_open);
+    }
     gaps.extend(security_items);
     let links = link_checks::gate(&work, &mut evidence, usage, || {
         has_time_for_remediation(start)
@@ -6020,6 +6039,28 @@ async fn run_repo_pipeline(
         ),
     )
     .await;
+    // The outside steps CoderHelm does itself, on this repository's pull
+    // request, as the single-repository path does them.
+    if owns_outside
+        && repo_plan
+            .fix
+            .as_ref()
+            .is_some_and(|d| d.effective_location() == fix_location::FixLocation::Both)
+    {
+        if let Some(decision) = repo_plan.fix.as_mut() {
+            after_pr_outside_work(
+                state,
+                msg,
+                run_id,
+                github,
+                decision,
+                branch_name,
+                pr_result.pr_number,
+                outside_until(start),
+            )
+            .await;
+        }
+    }
 
     Ok(RepoPrResult {
         repo: (repo_owner.to_string(), repo_name.to_string()),
@@ -6598,6 +6639,30 @@ async fn report_also_outside(
         .await;
 }
 
+/// How long the outside steps may wait in this invocation (for an approval
+/// card's answer or a started workflow): the time left, less the PR and
+/// wrap-up margin, at most four minutes. What outlasts it, the CI resume
+/// carries on (`outside_exec::on_resume`).
+fn outside_until(start: &Instant) -> Instant {
+    Instant::now()
+        + std::time::Duration::from_secs(remaining_secs(start).saturating_sub(180).min(240))
+}
+
+/// Whether this repository's pull request carries the ticket's outside
+/// steps in a multi-repository run (see `outside_work::outside_repo`).
+fn outside_owner(plan: &plan::PlanResult, owner: &str, name: &str) -> bool {
+    let repos: Vec<String> = plan
+        .repo_tasks
+        .iter()
+        .map(|t| format!("{}/{}", t.owner, t.name))
+        .collect();
+    match plan.fix.as_ref().and_then(|d| d.outside_change.as_ref()) {
+        Some(c) => outside_work::outside_repo(c, &repos)
+            .is_none_or(|r| r.eq_ignore_ascii_case(&format!("{owner}/{name}"))),
+        None => false,
+    }
+}
+
 /// Whether the decision's outside note has steps CoderHelm does itself.
 fn has_coderhelm_steps(d: &fix_location::FixDecision) -> bool {
     d.outside_change.as_ref().is_some_and(|c| {
@@ -6608,10 +6673,11 @@ fn has_coderhelm_steps(d: &fix_location::FixDecision) -> bool {
 }
 
 /// After the pull request opens: does the outside steps that are
-/// CoderHelm's (starting the deploy or end-to-end workflow, running the
-/// confirm query) and reports their results once, on the ticket (the same
-/// notice, edited on GitHub) and in the PR's Not in this PR section, both
-/// rendered from the same steps.
+/// CoderHelm's through the generic executor (`outside_exec`: the team's
+/// agent permissions, then wait and verify), reports their results once on
+/// the ticket and the PR, and puts what is not done (with the access to
+/// grant) at the top of both. A step still waiting on an approval or a
+/// workflow is carried on by the CI resume.
 #[allow(clippy::too_many_arguments)]
 async fn after_pr_outside_work(
     state: &WorkerState,
@@ -6621,73 +6687,77 @@ async fn after_pr_outside_work(
     decision: &mut fix_location::FixDecision,
     branch: &str,
     pr_number: u64,
+    until: Instant,
 ) {
-    if !has_coderhelm_steps(decision) {
+    let Some(c) = decision.outside_change.as_mut() else {
+        return;
+    };
+    if c.steps
+        .iter()
+        .all(|s| s.doer() == outside_work::Doer::ThisPr)
+    {
         return;
     }
-    let repo = format!("{}/{}", msg.repo_owner, msg.repo_name);
-    let env = load_codegen_env(state, &msg.team_id, &msg.repo_owner, &msg.repo_name).await;
-    let staging_write = feature::load_connection(state, &msg.team_id, &repo)
-        .await
-        .is_some();
-    let abilities = outside_work::load(
-        github,
-        &msg.repo_owner,
-        &msg.repo_name,
-        branch,
-        &env,
-        staging_write,
-    )
-    .await;
-    if let Some(c) = decision.outside_change.as_mut() {
-        outside_work::perform(
+    let ours = has_coderhelm_steps(decision);
+    if ours {
+        let repo = format!("{}/{}", msg.repo_owner, msg.repo_name);
+        let env = load_codegen_env(state, &msg.team_id, &msg.repo_owner, &msg.repo_name).await;
+        let staging_write = feature::load_connection(state, &msg.team_id, &repo)
+            .await
+            .is_some();
+        let abilities = outside_work::load(
             github,
-            &state.http,
             &msg.repo_owner,
             &msg.repo_name,
             branch,
-            pr_number,
-            &abilities,
-            c,
+            &env,
+            staging_write,
         )
         .await;
-        let done = c.steps.iter().filter(|s| s.done).count();
-        add_progress_note(
+        let cx = outside_exec::Ctx {
             state,
-            &msg.team_id,
+            github,
+            team_id: &msg.team_id,
             run_id,
-            &format!(
-                "Outside steps CoderHelm did after the PR opened: {done} of {}",
-                c.steps
-                    .iter()
-                    .filter(|s| s.doer() == outside_work::Doer::CoderHelm)
-                    .count()
-            ),
-        )
-        .await;
-    }
-    report_also_outside(state, msg, run_id, github, decision).await;
-    // The PR lists the same steps, with the same results.
-    if let Ok(pr) = github
-        .get_pull_request(&msg.repo_owner, &msg.repo_name, pr_number)
-        .await
-    {
-        let body = pr["body"].as_str().unwrap_or("");
-        let (mut owned, rest) = completeness::take_owned(body);
-        owned.not_in_pr = completeness::for_people_section(
-            &fix_location::not_in_pr_steps(Some(decision), &repo),
-            &decision.questions,
-        );
-        let updated = completeness::assemble(&rest, &owned);
-        if updated != body {
-            if let Err(e) = github
-                .update_pr_body(&msg.repo_owner, &msg.repo_name, pr_number, &updated)
-                .await
-            {
-                warn!(run_id, error = %e, "Could not update the PR's Not in this PR section");
+            owner: &msg.repo_owner,
+            repo: &msg.repo_name,
+            branch,
+            pr_number,
+        };
+        if let Some(c) = decision.outside_change.as_mut() {
+            let p = outside_exec::execute(&cx, &abilities, c, until).await;
+            let ended = |s: &&outside_work::NoteStep| {
+                s.doer() == outside_work::Doer::CoderHelm && !outside_work::under_way(s)
+            };
+            add_progress_note(
+                state,
+                &msg.team_id,
+                run_id,
+                &format!(
+                    "Outside steps CoderHelm did after the PR opened: {} of {} done{}",
+                    c.steps.iter().filter(|s| s.done).count(),
+                    c.steps
+                        .iter()
+                        .filter(|s| s.doer() == outside_work::Doer::CoderHelm)
+                        .count(),
+                    if p.waiting {
+                        "; one waits on an approval or a workflow run, and the run carries it on"
+                    } else if c.steps.iter().filter(ended).any(|s| !s.done) {
+                        "; the rest are reported as not done"
+                    } else {
+                        ""
+                    }
+                ),
+            )
+            .await;
+            if let Some(f) = &p.failed_e2e {
+                outside_exec::record_failed(state, run_id, f).await;
             }
         }
+        report_also_outside(state, msg, run_id, github, decision).await;
     }
+    outside_exec::save(state, &msg.team_id, run_id, decision).await;
+    outside_exec::refresh_pr(github, &msg.repo_owner, &msg.repo_name, pr_number, decision).await;
 }
 
 /// Notice key: the part of the fix outside the code, one comment per ticket.

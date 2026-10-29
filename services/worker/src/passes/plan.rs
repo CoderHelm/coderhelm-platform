@@ -1013,6 +1013,19 @@ Then the ```fix_location.json block described above."#,
             }
         }
     }
+    // A step still handed to a person with no reason after the send-back
+    // is never shipped silently: the run stops on a question naming it.
+    if let Some(ask) = unjustified_stop(&files) {
+        warn!(ticket_id = %msg.ticket_id, steps = ask.len(), "Outside steps handed to a person with no reason — asking");
+        super::add_progress_note(
+            state,
+            &msg.team_id,
+            run_id,
+            "Plan check (outside steps): a step is handed to a person with no recorded reason, even after the plan was sent back. Asking instead of opening a pull request without it.",
+        )
+        .await;
+        files.tasks = common::stop_rules::screen::clarification(&ask);
+    }
     if !feature_gaps.is_empty() {
         let left = super::feature::plan_gaps(&files, intent, &ticket_history.prior);
         if !left.is_empty() {
@@ -1315,6 +1328,28 @@ Then the ```fix_location.json block described above."#,
         .await;
 
     Ok(files)
+}
+
+/// The questions a plan stops on when its outside note (fix `both` or
+/// `outside_code`) still gives a person a step with no reason. `None` when
+/// every person step has its reason, or the plan already asks.
+fn unjustified_stop(files: &PlanResult) -> Option<Vec<common::run_questions::Question>> {
+    if files
+        .tasks
+        .trim_start()
+        .starts_with("CLARIFICATION_NEEDED:")
+    {
+        return None;
+    }
+    let d = files.fix.as_ref()?;
+    if !matches!(
+        d.effective_location(),
+        super::fix_location::FixLocation::Both | super::fix_location::FixLocation::OutsideCode
+    ) {
+        return None;
+    }
+    let ask = super::outside_work::unjustified_questions(d.outside_change.as_ref()?);
+    (!ask.is_empty()).then_some(ask)
 }
 
 /// The questions in a `CLARIFICATION_NEEDED:` tasks file; none otherwise.
@@ -1964,5 +1999,62 @@ mod tests {
             assert!(t.input_schema["properties"].get("repo").is_some());
         }
         assert!(system.contains("graph_impact"));
+    }
+}
+
+#[cfg(test)]
+mod unjustified_tests {
+    use super::*;
+    use crate::passes::fix_location::{FixDecision, FixLocation, OutsideChange};
+    use crate::passes::outside_work::NoteStep;
+
+    fn files(tasks: &str, why: &str) -> PlanResult {
+        PlanResult {
+            proposal: String::new(),
+            design: String::new(),
+            tasks: tasks.to_string(),
+            spec: String::new(),
+            repo_tasks: Vec::new(),
+            fix: Some(FixDecision {
+                fix_location: FixLocation::Both,
+                outside_change: Some(OutsideChange {
+                    system: "the CMS".into(),
+                    change: "Publish the hero".into(),
+                    steps: vec![NoteStep {
+                        step: "Publish the hero on production".into(),
+                        by: "person".into(),
+                        owner: "an editor".into(),
+                        why_person: why.into(),
+                        grant: if why.is_empty() {
+                            ""
+                        } else {
+                            "add a write token"
+                        }
+                        .into(),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+        }
+    }
+
+    #[test]
+    fn a_person_step_still_without_a_reason_stops_the_plan_on_a_question() {
+        let ask = unjustified_stop(&files("- [ ] a.rs: x", "")).expect("asks");
+        assert_eq!(ask.len(), 1);
+        let text = common::stop_rules::screen::clarification(&ask);
+        assert!(text.starts_with("CLARIFICATION_NEEDED:"));
+        assert!(text.contains("Publish the hero on production"));
+        // With its reason it doesn't stop: the run opens the PR and reports
+        // the requirement as not done.
+        assert!(unjustified_stop(&files(
+            "- [ ] a.rs: x",
+            "no production CMS write connection"
+        ))
+        .is_none());
+        // A plan that already asks keeps its own question.
+        assert!(unjustified_stop(&files("CLARIFICATION_NEEDED:\n- question: q", "")).is_none());
     }
 }
