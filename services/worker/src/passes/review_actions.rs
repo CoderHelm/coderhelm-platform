@@ -432,7 +432,7 @@ pub(crate) async fn post_merge_actions(
         .await
         {
             lines.push(
-                "🩺 Post-merge health check scheduled — I'll watch the deploy checks, keep watching for 15 minutes after they go green, and flag any NEW failures immediately.".to_string(),
+                "🩺 Post-merge health check scheduled: I'll watch this merge commit's deploy until it finishes, keep watching for 15 minutes after it goes green, and flag any NEW failures.".to_string(),
             );
         }
     }

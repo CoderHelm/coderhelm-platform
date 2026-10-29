@@ -3642,6 +3642,45 @@ impl GitHubClient {
             .unwrap_or_default())
     }
 
+    /// Every workflow run whose `head_sha` is `sha` (any workflow, any event),
+    /// newest first.
+    pub async fn list_workflow_runs_for_sha(
+        &self,
+        owner: &str,
+        repo: &str,
+        sha: &str,
+    ) -> Result<Vec<serde_json::Value>, Box<dyn std::error::Error + Send + Sync>> {
+        let url = format!(
+            "{API_BASE}/repos/{owner}/{repo}/actions/runs?head_sha={}&per_page=100",
+            urlencoding::encode(sha)
+        );
+        Ok(self.get(&url).await?["workflow_runs"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default())
+    }
+
+    /// Push runs of one workflow (by id) on `branch` created at or after
+    /// `created_from` (an ISO 8601 time), newest first.
+    pub async fn list_push_runs_since(
+        &self,
+        owner: &str,
+        repo: &str,
+        workflow_id: u64,
+        branch: &str,
+        created_from: &str,
+    ) -> Result<Vec<serde_json::Value>, Box<dyn std::error::Error + Send + Sync>> {
+        let url = format!(
+            "{API_BASE}/repos/{owner}/{repo}/actions/workflows/{workflow_id}/runs?branch={}&event=push&created={}&per_page=100",
+            urlencoding::encode(branch),
+            urlencoding::encode(&format!(">={created_from}"))
+        );
+        Ok(self.get(&url).await?["workflow_runs"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default())
+    }
+
     /// Runs a whole workflow run again (every job, so a skipped one is
     /// evaluated again).
     pub async fn rerun_workflow_run(
