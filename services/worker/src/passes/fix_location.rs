@@ -198,6 +198,24 @@ pub struct OutsideChange {
     /// looked up. Empty when nothing was looked up.
     #[serde(default)]
     pub existing: String,
+    /// The work outside the code, in the order it must happen, each with who
+    /// does it (`this_pr`, `coderhelm`, `person`) and, for a person, why
+    /// CoderHelm couldn't and how to grant it (see `outside_work`).
+    #[serde(default)]
+    pub steps: Vec<super::outside_work::NoteStep>,
+    /// The lookup behind the note: query, endpoint, result or error.
+    #[serde(default)]
+    pub lookup: Option<super::outside_work::ContentLookup>,
+    /// Items already there that the work replaces.
+    #[serde(default)]
+    pub existing_items: Vec<super::outside_work::ExistingItem>,
+    /// How to confirm: the query and the result it must return, the page,
+    /// the end-to-end test.
+    #[serde(default)]
+    pub confirm: Option<super::outside_work::Confirm>,
+    /// Identifiers the note uses, each with its label.
+    #[serde(default)]
+    pub names: Vec<super::outside_work::Labelled>,
 }
 
 /// Words that make a change add content.
@@ -691,6 +709,10 @@ List every step the ticket needs to work in production, not only this repository
 - permissions and read grants (roles, policies, grants on tables or schemas);
 - the handoff to whoever uses it (who is told, what they get, where it is written down);
 - the deploy and merge order (which repository merges first, what deploys when).
+A run does everything the ticket needs; work outside the code is the exception. Decide each piece in this order, and record it in `outside_change.steps`:
+1. The change itself does it: a task in tasks.md (a content or data migration in the repository's migrations folder that replaces the existing item by key, test fixtures or end-to-end setup that create their own content, config or registration). Then it is not an outside step at all, or a `by: this_pr` step.
+2. CoderHelm does it after the pull request opens with access it has (`by: coderhelm`): starting the repository's studio/staging deploy workflow or adding the label its CI deploys on, re-running the end-to-end workflow, running the confirm query. Its results (run link, query output) are reported on the PR and the ticket.
+3. Only what is left goes to a person (`by: person`): production content, an action that needs a person's approval, access CoderHelm lacks. Each such step says why (`why_person`, naming the missing permission or connection exactly) and how to grant it (`grant`). A person step without both is sent back, and the plan check counts it as not covered.
 Each step says who does it: `this_pr` (this change), `other_repo` (a pull request in another repository, named in `repo`), `person` (a person or team, named in `owner`) or `vendor` (an outside company, named in `owner`). When the plan spans several repositories, order the `## owner/repo` groups in tasks.md in the order they must merge.
 
 After the four openspec files, output this block (JSON, all fields required; `outside_change` is null for `code`):
@@ -714,7 +736,12 @@ After the four openspec files, output this block (JSON, all fields required; `ou
     "change": "exactly what to change, naming the record(s)",
     "where": "who can make it, or where in that system",
     "verify": "how to confirm afterwards (for example: after the next sync, the item shows on the site); for content, the API query that shows it and what it returns",
-    "existing": "when the change adds content (a block, an entry, a record): look up content of that kind in the environment the tests use first (the team's connected data sources or CMS API), and write what came back by id and key. If one exists, `change` says to REPLACE or update that exact one (fields to set, fields to remove), never to add a second. If you could not look, say why here. Empty only when the change adds no content"
+    "existing": "when the change adds content (a block, an entry, a record): look up content of that kind in the environment the tests use first (the team's connected data sources or CMS API), and write what came back by id and key. If one exists, `change` says to REPLACE or update that exact one (fields to set, fields to remove), never to add a second. If a lookup failed, quote its error here. Empty only when the change adds no content",
+    "lookup": {"endpoint": "the query endpoint you used (the CMS read API listed in your instructions, or the data source)", "query": "the exact read query", "result": "what came back, quoted", "error": "only when the attempt failed: the error, quoted"},
+    "existing_items": [{"id": "document id", "key": "array key for a block inside a document", "title": "its title", "old_fields": ["fields the new schema doesn't know"], "missing_fields": ["new required fields it lacks"], "left_by": "the earlier PR or branch that left it (from the ticket's earlier PRs or git history), or where you searched"}],
+    "steps": [{"step": "each piece of work outside the code, in the order it must happen (a schema change: the studio/schema deploy first, then content)", "by": "this_pr | coderhelm | person (decide in that order, see below)", "owner": "who does it (the engineer merging, a content editor)", "how": "the workflow, command or screen", "values": ["exact field = value, reference targets, tab definitions with their settings"], "remove": ["fields to remove"], "minimum": "the least content the feature and its tests need (for example: at least one tab with more than N cards, N from the component and test code)", "why_person": "for a person only: the exact permission or connection CoderHelm lacks, or why a person must decide", "grant": "for a person only: how to give CoderHelm that access so it can do it next time"}],
+    "confirm": {"query": "the exact read query", "expect": "the result shape (exactly one item, count of tabs >= 2, reference set, old fields not defined)", "page": "the page to look at", "e2e": "the end-to-end test that must run and pass, not skip"},
+    "names": [{"label": "CMS project id | dataset | environment", "value": "the value, never under another's label"}]
   },
   "history_check": "only when the prompt has a ticket history: each earlier pull request by number, what you reuse from it, what changes this time and why (and for one closed without a reason in its comments: who closed it and when); otherwise empty",
   "questions": ["each question only a person can answer, one decision each; [] when there are none"],
@@ -855,6 +882,18 @@ pub const NOT_LOOKED_UP: &str = "I didn't look up whether content of this kind a
      instead of adding a second.";
 
 fn push_change(out: &mut String, c: &OutsideChange) {
+    // A note with its steps renders from them: the same steps the pull
+    // request lists under Not in this PR.
+    if !c.steps.is_empty() {
+        out.push_str(&format!("- **Where:** {}", c.system.trim()));
+        if !c.where_.trim().is_empty() {
+            out.push_str(&format!(" ({})", c.where_.trim()));
+        }
+        out.push('\n');
+        out.push_str(&format!("- **What:** {}\n", one_line(&c.change)));
+        out.push_str(&super::outside_work::note_markdown(c));
+        return;
+    }
     out.push_str(&format!("- **Where:** {}", c.system.trim()));
     if !c.where_.trim().is_empty() {
         out.push_str(&format!(" ({})", c.where_.trim()));
@@ -1093,6 +1132,24 @@ pub fn not_in_pr_steps(d: Option<&FixDecision>, repo: &str) -> Vec<(String, Stri
         .map(|s| (one_line(&s.step), s.owner_label()))
         .collect();
     if d.effective_location() == FixLocation::Both {
+        // The note's own steps, rendered as the ticket note renders them.
+        if let Some(c) = d
+            .outside_change
+            .as_ref()
+            .filter(|c| c.is_usable() && !c.steps.is_empty())
+        {
+            let mut lines = super::outside_work::context_lines(c)
+                .into_iter()
+                .map(|l| (l, "found by CoderHelm".to_string()))
+                .collect::<Vec<_>>();
+            lines.extend(super::outside_work::pr_lines(c));
+            for l in lines {
+                if !out.iter().any(|(s, _)| s == &l.0) {
+                    out.push(l);
+                }
+            }
+            return out;
+        }
         if let Some(c) = d.outside_change.as_ref().filter(|c| c.is_usable()) {
             let step = one_line(&format!("{}: {}", c.system.trim(), c.change.trim()));
             if !out.iter().any(|(s, _)| s == &step) {
@@ -1749,5 +1806,59 @@ mod intent_tests {
         open.open_gaps = vec!["[env_unproven] staging was not checked.".into()];
         assert!(unknown_report(&open, false)
             .contains("**Not yet settled in this plan**\n- [env_unproven]"));
+    }
+
+    /// The ticket note and the PR's Not in this PR come from the same
+    /// steps: every line the PR lists is in the ticket note, word for word.
+    #[test]
+    fn the_ticket_note_and_the_pr_carry_the_same_steps() {
+        use super::super::outside_work::{Confirm, ContentLookup, NoteStep};
+        let d = FixDecision {
+            fix_location: FixLocation::Both,
+            outside_change: Some(OutsideChange {
+                system: "the CMS".into(),
+                change: "Replace the hero block's content on the events page".into(),
+                lookup: Some(ContentLookup {
+                    endpoint: "https://p1.api.sanity.io/v2021-10-21/data/query/staging".into(),
+                    query: "*[_type == \"page\"]{_id}".into(),
+                    result: "[{\"_id\":\"page-events\"}]".into(),
+                    error: String::new(),
+                }),
+                steps: vec![
+                    NoteStep {
+                        step: "Deploy the studio to staging".into(),
+                        by: "coderhelm".into(),
+                        result: "started `Deploy studio`: https://example.test/run/1".into(),
+                        done: true,
+                        ..Default::default()
+                    },
+                    NoteStep {
+                        step: "Replace the hero block's content on production".into(),
+                        by: "person".into(),
+                        owner: "a content editor".into(),
+                        values: vec!["title = Classes".into()],
+                        why_person: "CoderHelm never writes production content".into(),
+                        grant: "none: production stays with editors".into(),
+                        ..Default::default()
+                    },
+                ],
+                confirm: Some(Confirm {
+                    query: "count(*[_type == \"hero\"])".into(),
+                    expect: "exactly 1".into(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let ticket = also_outside_section(Some(&d));
+        let pr = not_in_pr_steps(Some(&d), "o/r");
+        assert!(pr.len() >= 4, "{pr:?}");
+        for (line, _) in &pr {
+            assert!(ticket.contains(line.as_str()), "{line}\n---\n{ticket}");
+        }
+        assert!(ticket.contains("1. Deploy the studio to staging Done by CoderHelm: started `Deploy studio`: https://example.test/run/1."));
+        assert!(ticket.contains("(owner: a content editor)"));
+        assert!(!ticket.contains("Not checked"));
     }
 }

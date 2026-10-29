@@ -537,6 +537,34 @@ Then the ```fix_location.json block described above."#,
         &mut tools,
         &mut full_system,
     );
+    // What the repository lets the run do itself (its CMS read API, deploy
+    // and end-to-end workflows, migrations and fixtures folders): the
+    // planner decides each outside step against it, and queries content
+    // before writing about it.
+    let abilities = {
+        let env =
+            super::load_codegen_env(state, &msg.team_id, &msg.repo_owner, &msg.repo_name).await;
+        let staging_write = super::feature::load_connection(
+            state,
+            &msg.team_id,
+            &format!("{}/{}", msg.repo_owner, msg.repo_name),
+        )
+        .await
+        .is_some();
+        super::outside_work::load(
+            github,
+            &msg.repo_owner,
+            &msg.repo_name,
+            &msg.base_branch,
+            &env,
+            staging_write,
+        )
+        .await
+    };
+    if let Some(s) = &abilities.source {
+        tools.push(super::outside_work::tool(s));
+    }
+    full_system.push_str(&abilities.prompt_section());
     // `check_url` on the team's own public pages.
     let web = super::web_check::WebCheck::load(
         state,
@@ -638,6 +666,7 @@ Then the ```fix_location.json block described above."#,
         skills: skills.as_ref(),
         knowledge: knowledge.as_ref(),
         web: Some(&web),
+        abilities: Some(&abilities),
         state,
     };
 
@@ -738,6 +767,10 @@ Then the ```fix_location.json block described above."#,
     // reuse and the closest sibling.
     let feature_gaps = super::feature::plan_gaps(&draft, intent, &ticket_history.prior);
     back.extend(feature_gaps.iter().cloned());
+    // The outside steps: decided in order (the change, CoderHelm, a person
+    // with a reason), looked up before claimed, ordered, valued, confirmable.
+    let note_gaps = super::outside_work::plan_gaps(&draft, &abilities);
+    back.extend(note_gaps.iter().cloned());
     if !back.is_empty() {
         info!(
             ticket_id = %msg.ticket_id,
@@ -938,6 +971,22 @@ Then the ```fix_location.json block described above."#,
                 super::fix_location::mark_untraced(d, &gaps)
             }
         });
+    }
+    if !note_gaps.is_empty() {
+        let left = super::outside_work::plan_gaps(&files, &abilities);
+        if !left.is_empty() {
+            warn!(ticket_id = %msg.ticket_id, gaps = ?left, "Outside steps still incomplete after one send-back");
+            super::add_progress_note(
+                state,
+                &msg.team_id,
+                run_id,
+                &format!("Plan check (outside steps): {}", left.join(" ")),
+            )
+            .await;
+            if let Some(d) = files.fix.as_mut() {
+                d.open_gaps.extend(left);
+            }
+        }
     }
     if !feature_gaps.is_empty() {
         let left = super::feature::plan_gaps(&files, intent, &ticket_history.prior);
@@ -1622,6 +1671,8 @@ struct CombinedToolExecutor<'a> {
     live: Option<&'a super::live_sources::LiveSources>,
     /// `check_url` on the team's own public pages.
     web: Option<&'a super::web_check::WebCheck>,
+    /// `query_content` on the repository's CMS read API.
+    abilities: Option<&'a super::outside_work::Abilities>,
     /// The team's written skills, read-only.
     skills: Option<&'a super::skills::TeamSkills>,
     /// Knowledge bases attached to the planner.
@@ -1651,6 +1702,11 @@ impl<'a> ToolExecutor for CombinedToolExecutor<'a> {
                 .handle(self.state, self.read_only.github, name, input)
                 .await
             {
+                return Ok(serde_json::json!(out));
+            }
+        }
+        if let Some(a) = self.abilities {
+            if let Some(out) = super::outside_work::handle(&self.state.http, a, name, input).await {
                 return Ok(serde_json::json!(out));
             }
         }

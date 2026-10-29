@@ -725,6 +725,7 @@ pub mod model_check;
 pub mod onboard;
 pub mod open_pr_choice;
 pub mod ops_tools;
+pub mod outside_work;
 mod plan;
 pub mod plan_chat;
 pub(crate) mod plan_coverage;
@@ -2280,7 +2281,9 @@ async fn run_passes(
         }
     }
     if fix_route == fix_location::Route::CodeAndOutside {
-        if let Some(decision) = plan_result.fix.as_ref() {
+        // A note with steps CoderHelm does after the pull request opens is
+        // posted once, then, with their results (see after_pr_outside_work).
+        if let Some(decision) = plan_result.fix.as_ref().filter(|d| !has_coderhelm_steps(d)) {
             report_also_outside(state, msg, run_id, &github, decision).await;
         }
     } else if fix_route == fix_location::Route::Code {
@@ -4582,6 +4585,20 @@ async fn run_passes(
     }
     // Tasks the plan marks optional and the change left out, named.
     gaps.extend(plan_optional);
+    // What the ticket needs that this run didn't do: a person's step (with
+    // why and how to grant it), or one handed out with no reason (not
+    // covered).
+    let outside_open = plan_coverage::outside_findings(plan_result.fix.as_ref());
+    if !outside_open.is_empty() {
+        add_progress_note(
+            state,
+            &msg.team_id,
+            run_id,
+            &plan_coverage::outside_note(plan_result.fix.as_ref()),
+        )
+        .await;
+    }
+    gaps.extend(outside_open);
     // Security issues not fixed yet, or a check that didn't run.
     gaps.extend(security_items);
     // Every redirect and link the change adds or changes, checked live; a
@@ -4710,6 +4727,22 @@ async fn run_passes(
     )
     .await;
     info!(run_id, pr_url = %pr_result.pr_url, "Draft PR created");
+    // The outside steps CoderHelm does itself (a deploy, the end-to-end
+    // run, the confirm query) run now; the ticket and the PR report results.
+    if fix_route == fix_location::Route::CodeAndOutside {
+        if let Some(decision) = plan_result.fix.as_mut() {
+            after_pr_outside_work(
+                state,
+                msg,
+                run_id,
+                &github,
+                decision,
+                &branch_name,
+                pr_result.pr_number,
+            )
+            .await;
+        }
+    }
     // The plan moved the change out of a repo an earlier run of this ticket
     // opened a PR in: that PR is closed with a note naming this one.
     supersede_moved_prs(
@@ -6071,6 +6104,98 @@ async fn report_also_outside(
         .expression_attribute_values(":rep", attr_s(&format!("**{title}**\n\n{report}")))
         .send()
         .await;
+}
+
+/// Whether the decision's outside note has steps CoderHelm does itself.
+fn has_coderhelm_steps(d: &fix_location::FixDecision) -> bool {
+    d.outside_change.as_ref().is_some_and(|c| {
+        c.steps
+            .iter()
+            .any(|s| s.doer() == outside_work::Doer::CoderHelm)
+    })
+}
+
+/// After the pull request opens: does the outside steps that are
+/// CoderHelm's (starting the deploy or end-to-end workflow, running the
+/// confirm query) and reports their results once, on the ticket (the same
+/// notice, edited on GitHub) and in the PR's Not in this PR section, both
+/// rendered from the same steps.
+#[allow(clippy::too_many_arguments)]
+async fn after_pr_outside_work(
+    state: &WorkerState,
+    msg: &TicketMessage,
+    run_id: &str,
+    github: &GitHubClient,
+    decision: &mut fix_location::FixDecision,
+    branch: &str,
+    pr_number: u64,
+) {
+    if !has_coderhelm_steps(decision) {
+        return;
+    }
+    let repo = format!("{}/{}", msg.repo_owner, msg.repo_name);
+    let env = load_codegen_env(state, &msg.team_id, &msg.repo_owner, &msg.repo_name).await;
+    let staging_write = feature::load_connection(state, &msg.team_id, &repo)
+        .await
+        .is_some();
+    let abilities = outside_work::load(
+        github,
+        &msg.repo_owner,
+        &msg.repo_name,
+        branch,
+        &env,
+        staging_write,
+    )
+    .await;
+    if let Some(c) = decision.outside_change.as_mut() {
+        outside_work::perform(
+            github,
+            &state.http,
+            &msg.repo_owner,
+            &msg.repo_name,
+            branch,
+            pr_number,
+            &abilities,
+            c,
+        )
+        .await;
+        let done = c.steps.iter().filter(|s| s.done).count();
+        add_progress_note(
+            state,
+            &msg.team_id,
+            run_id,
+            &format!(
+                "Outside steps CoderHelm did after the PR opened: {done} of {}",
+                c.steps
+                    .iter()
+                    .filter(|s| s.doer() == outside_work::Doer::CoderHelm)
+                    .count()
+            ),
+        )
+        .await;
+    }
+    report_also_outside(state, msg, run_id, github, decision).await;
+    // The PR lists the same steps, with the same results.
+    if let Ok(pr) = github
+        .get_pull_request(&msg.repo_owner, &msg.repo_name, pr_number)
+        .await
+    {
+        let body = pr["body"].as_str().unwrap_or("");
+        let (mut owned, rest) = completeness::take_owned(body);
+        owned.not_in_pr = completeness::for_people_section(
+            &fix_location::not_in_pr_steps(Some(decision), &repo),
+            &decision.questions,
+        );
+        let updated = completeness::assemble(&rest, &owned);
+        if updated != body {
+            if let Err(e) = github
+                .update_pr_body(&msg.repo_owner, &msg.repo_name, pr_number, &updated)
+                .await
+            {
+                warn!(run_id, error = %e, "Could not update the PR's Not in this PR section");
+            }
+        }
+    }
 }
 
 /// Notice key: the part of the fix outside the code, one comment per ticket.
