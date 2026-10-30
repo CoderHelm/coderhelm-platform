@@ -409,6 +409,7 @@ fn sweep_message(
         attempt: 0,
         wait_secs: 0,
         reconcile_note: None,
+        outstanding_work: None,
     }
 }
 

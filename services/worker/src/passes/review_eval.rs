@@ -373,6 +373,7 @@ impl Sim {
             attempt: 0,
             wait_secs: 0,
             reconcile_note: None,
+            outstanding_work: None,
         }
     }
 
@@ -889,7 +890,7 @@ async fn review_eval_live_classification() {
                 &client,
                 &model,
                 review_agent::ASK_SYSTEM,
-                &review_agent::ask_prompt(&c.text, "Changes requested.", None),
+                &review_agent::ask_prompt(&c.text, "Changes requested.", None, None),
                 &review_agent::ask_schema(),
                 true,
                 "low",

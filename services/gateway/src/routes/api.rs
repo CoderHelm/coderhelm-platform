@@ -2175,7 +2175,14 @@ async fn resume_round(
                  REMOVE #inc",
             )
             .expression_attribute_values(":r", round.to_attr()),
-        _ => update.update_expression(
+        // The feedback round reads its held or unfinished work (its WIP
+        // branch, where it started, what it was asked) from the record and
+        // continues from it; it clears the record when the work lands.
+        ResumeRoute::Feedback => update.update_expression(
+            "SET #s = :s, status_run_id = :sri, current_pass = :p, updated_at = :t \
+             REMOVE #round",
+        ),
+        ResumeRoute::Recheck => update.update_expression(
             "SET #s = :s, status_run_id = :sri, current_pass = :p, updated_at = :t \
              REMOVE #inc, #round",
         ),

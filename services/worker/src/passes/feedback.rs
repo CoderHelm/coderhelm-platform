@@ -148,6 +148,22 @@ pub async fn run(
     // rounds: a stored "one push" skips the extra update push below.
     let ticket_info = super::review_fix::Ticket::load(state, &msg.team_id, &msg.run_id).await;
 
+    // Work an earlier round left held or unfinished on this pull request
+    // comes first (common::held_work): this round continues on its WIP
+    // branch, checks it again with the current setup and lands it. What it
+    // was asked leads the round's instructions, so the scope check judges
+    // the held changes against it. A later step of the same round already
+    // has it.
+    let held_work = if msg.round_attempt == 0 {
+        outstanding_work(state, &github, &msg).await
+    } else {
+        None
+    };
+    if let Some(w) = &held_work {
+        info!(run_id = %msg.run_id, wip_branch = %w.wip_branch, held = w.held, "Resuming the round's outstanding work first");
+        msg.review_body = w.round_body(&msg.review_body);
+    }
+
     // Whether the pre-feedback conflict resolution pushed a merge commit —
     // that push triggers CI, so completing without awaiting_ci would leave
     // the CI result with no consumer (and a salvaged draft PR stuck in
@@ -471,6 +487,38 @@ pub async fn run(
         ticket_info.constraints.clone()
     };
 
+    // The person is told what CoderHelm is doing with the held work, in the
+    // channel the requester allowed: on the pull request, or on the run and
+    // the ticket when they asked for no PR comments.
+    if let Some(w) = &held_work {
+        let line = w.pickup_line();
+        if constraints.may_comment() && !msg.trigger_author.trim().is_empty() {
+            super::add_progress_note(state, &msg.team_id, &msg.run_id, &line).await;
+            if let Err(e) = github
+                .create_issue_comment(
+                    &msg.repo_owner,
+                    &msg.repo_name,
+                    msg.pr_number,
+                    &addressed(&msg.trigger_author, &line),
+                )
+                .await
+            {
+                warn!(run_id = %msg.run_id, error = %e, "Could not say the held work is being picked up");
+            }
+        } else {
+            super::review_fix::tell_requester(
+                state,
+                &github,
+                &msg.team_id,
+                &msg.run_id,
+                &ticket_info,
+                &format!("Picking up held changes on pull request #{}", msg.pr_number),
+                &line,
+            )
+            .await;
+        }
+    }
+
     // Load voice instructions (repo-specific falls back to global)
     let voice = {
         let repo_voice = super::load_content(
@@ -550,6 +598,11 @@ pub async fn run(
         "\n## Continuing this round\nAn earlier step of this round ran out of time; everything it \
          wrote is already committed on the branch. Read the files first and finish only what is \
          left; don't redo or revert it.\n"
+    } else if held_work.is_some() {
+        "\n## Resuming held work\nAn earlier round already wrote the changes for these requests; \
+         they are committed on the branch but were not landed. Read the files first, finish only \
+         what is still missing, and don't redo or revert it. When nothing is missing, change \
+         nothing: CoderHelm checks the work again and lands it.\n"
     } else {
         ""
     };
@@ -790,7 +843,11 @@ Rules:
         None
     };
     let mut feedback_round = {
-        let base_sha = match prior.as_ref().map(|r| r.base_sha.clone()) {
+        let resumed_base = prior
+            .as_ref()
+            .map(|r| r.base_sha.clone())
+            .or_else(|| held_work.as_ref().map(|w| w.base_sha.clone()));
+        let base_sha = match resumed_base {
             Some(b) if !b.is_empty() => b,
             _ => super::round::branch_head(&github, &msg.repo_owner, &msg.repo_name, &branch).await,
         };
@@ -812,7 +869,10 @@ Rules:
         &msg.repo_owner,
         &msg.repo_name,
         &branch,
-        &prior.map(|r| r.wip_branch).unwrap_or_default(),
+        &prior
+            .map(|r| r.wip_branch)
+            .or_else(|| held_work.as_ref().map(|w| w.wip_branch.clone()))
+            .unwrap_or_default(),
     )
     .await?;
     super::round::record(state, &msg.team_id, &msg.run_id, &feedback_round).await;
@@ -951,7 +1011,9 @@ Rules:
     let mut evidence_lines: Vec<String> = Vec::new();
     let mut dismissed: Vec<String> = Vec::new();
     let mut commit_subject = String::new();
-    if *executor.files_modified.lock().unwrap() {
+    let wrote = *executor.files_modified.lock().unwrap();
+    // Resumed work is checked and landed even when nothing was missing.
+    if wrote || held_work.is_some() {
         let load = || {
             super::review_fix::load_wip(
                 &github,
@@ -1042,7 +1104,7 @@ Rules:
         };
         evidence_lines.extend(last.evidence.iter().cloned());
         held = last.hold.clone();
-        if staged.is_empty() && held.is_empty() {
+        if staged.is_empty() && held.is_empty() && wrote {
             held.push(
                 "every change was outside what the review comments asked for, so nothing was pushed"
                     .to_string(),
@@ -1103,6 +1165,15 @@ Rules:
             }
         } else {
             info!(run_id = %msg.run_id, reasons = ?held, "Review fix held — not landed; its WIP branch is kept");
+            // On the record, so a mention or Resume picks it up first.
+            super::round::hold(
+                state,
+                &msg.team_id,
+                &msg.run_id,
+                &feedback_round,
+                &held.join("; "),
+            )
+            .await;
         }
         let head = if fix_pushed {
             super::round::branch_head(&github, &msg.repo_owner, &msg.repo_name, &branch).await
@@ -1446,7 +1517,7 @@ Rules:
 
     // Update run record in runs table (including status_run_id for GSI)
     let now = chrono::Utc::now().to_rfc3339();
-    let update = state
+    let mut update = state
         .dynamo
         .update_item()
         .table_name(&state.config.runs_table_name)
@@ -1458,21 +1529,22 @@ Rules:
             "run_id",
             aws_sdk_dynamodb::types::AttributeValue::S(msg.run_id.clone()),
         )
-        .update_expression(
+        .update_expression(format!(
             "SET tokens_in = tokens_in + :ti, tokens_out = tokens_out + :to, \
              cache_read_tokens = if_not_exists(cache_read_tokens, :zero) + :crt, \
              cache_write_tokens = if_not_exists(cache_write_tokens, :zero) + :cwt, \
              cost_usd = if_not_exists(cost_usd, :zero) + :c, \
              updated_at = :t, #s = :s, current_pass = :p, status_run_id = :sri, \
              pass_history = list_append(if_not_exists(pass_history, :empty), :entry) \
-             REMOVE error_message, #err, #round, #inc",
-        )
+             REMOVE error_message, #err, #round{}",
+            // A held round stays on the record (round::hold) until it lands.
+            if held.is_empty() { ", #inc" } else { "" }
+        ))
         .condition_expression(common::run_status::not_ended("#s"))
         .expression_attribute_names("#s", "status")
         .expression_attribute_names("#err", "error")
         // The round finished.
         .expression_attribute_names("#round", common::run_round::FIELD)
-        .expression_attribute_names("#inc", common::run_round::INCOMPLETE_FIELD)
         .ended_values()
         .expression_attribute_values(
             ":ti",
@@ -1532,9 +1604,11 @@ Rules:
                 ),
             ]),
         )
-        .expression_attribute_values(":empty", aws_sdk_dynamodb::types::AttributeValue::L(vec![]))
-        .send()
-        .await;
+        .expression_attribute_values(":empty", aws_sdk_dynamodb::types::AttributeValue::L(vec![]));
+    if held.is_empty() {
+        update = update.expression_attribute_names("#inc", common::run_round::INCOMPLETE_FIELD);
+    }
+    let update = update.send().await;
     match update {
         Ok(_) => {}
         // The run was cancelled while this pass worked (a person closed the
@@ -3576,6 +3650,67 @@ mod write_schema_tests {
 }
 
 /// A comment addressed to the person who asked, when one did.
+/// Work an earlier round left held or unfinished on the run's pull request
+/// (common::held_work): the unfinished round on the run record when its
+/// WIP branch is still there, else a WIP branch with changes the pull
+/// request lacks (a round held before the record kept held rounds), whose
+/// requests are the last review a person submitted before it stopped.
+async fn outstanding_work(
+    state: &WorkerState,
+    github: &GitHubClient,
+    msg: &FeedbackMessage,
+) -> Option<common::held_work::Outstanding> {
+    let item = state
+        .dynamo
+        .get_item()
+        .table_name(&state.config.runs_table_name)
+        .key(
+            "team_id",
+            aws_sdk_dynamodb::types::AttributeValue::S(msg.team_id.clone()),
+        )
+        .key(
+            "run_id",
+            aws_sdk_dynamodb::types::AttributeValue::S(msg.run_id.clone()),
+        )
+        .send()
+        .await
+        .ok()?
+        .item?;
+    // A round being worked or parked owns its WIP branch.
+    if common::run_round::Round::from_item(&item).is_some() {
+        return None;
+    }
+    if let Some(w) = common::run_round::Incomplete::from_item(&item)
+        .as_ref()
+        .and_then(common::held_work::Outstanding::from_incomplete)
+    {
+        if github
+            .get_ref(&msg.repo_owner, &msg.repo_name, &w.wip_branch)
+            .await
+            .is_ok()
+        {
+            return Some(w);
+        }
+    }
+    let branch = item.get("branch").and_then(|v| v.as_s().ok())?;
+    if branch.is_empty() {
+        return None;
+    }
+    let wip = common::run_round::wip_branch(branch);
+    let compare = github
+        .get_diff(&msg.repo_owner, &msg.repo_name, branch, &wip)
+        .await
+        .ok()?;
+    let mut w = common::held_work::Outstanding::from_wip_compare(&wip, &compare)?;
+    if let Ok(reviews) = github
+        .list_pr_reviews(&msg.repo_owner, &msg.repo_name, msg.pr_number)
+        .await
+    {
+        w.requests = common::held_work::requests_from_reviews(&reviews, &w.since);
+    }
+    Some(w)
+}
+
 fn addressed(author: &str, text: &str) -> String {
     match author.trim() {
         "" => text.to_string(),
