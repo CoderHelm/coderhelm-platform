@@ -584,6 +584,15 @@ Resources:
     Type: AWS::IAM::Role
     DeletionPolicy: Retain
     UpdateReplacePolicy: Retain
+    Metadata: {
+        "cfn-lint": {
+          "config": {
+            "ignore_checks": [
+              "W3037"
+            ]
+          }
+        }
+      }
     Properties: {
         "RoleName": {
           "Fn::Sub": [
