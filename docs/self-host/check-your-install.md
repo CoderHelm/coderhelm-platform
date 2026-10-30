@@ -161,9 +161,6 @@ The last result is kept in `.coderhelm/doctor.json`.
 
 ### Integrations
 
-- **Sign in with Google (Settings, then Setup)**\
-  *If it fails:* It is on, but its keys aren't in the secret.\
-  *Fix:* The keys to add; see [Sign-in and people](./sign-in.md).
 
 ## The guided install
 
@@ -188,7 +185,7 @@ A check that comes with an action, such as running the CDK bootstrap, asks first
 
 ## In the dashboard
 
-**Settings, then Setup** shows every server-side check with its status and its fix: a link, a page in CoderHelm, or a command to copy. **Check again** reruns them. The checks: the web address, your own domain (records, certificate, HTTPS and the API on it), the GitHub App (keys, permissions and events, installations, webhook URL and the latest deliveries), the email sender (verification and DKIM) and the sandbox, a real one-token model call with your team's key or through Bedrock, the dead-letter queue, the updater, Slack, Teams and Jira when you use them, and Google sign-in.
+**Settings, then Setup** shows every server-side check with its status and its fix: a link, a page in CoderHelm, or a command to copy. **Check again** reruns them. The checks: the web address, your own domain (records, certificate, HTTPS and the API on it), the GitHub App (keys, permissions and events, installations, webhook URL and the latest deliveries), email (the sender in use and its last send, the sender's verification with DKIM, SPF and DMARC, the SES sandbox, and who sends sign-up and password emails), a real one-token model call with your team's key or through Bedrock, the dead-letter queue, the updater, and Slack, Teams and Jira when you use them.
 
 **Settings, then System** shows **Update readiness**: what would stop an update right now (a failing check, an update already running) and what to read first (a major release's notes, a release whose last try failed), each with its fix.
 
@@ -219,7 +216,7 @@ Install admins (`admins` in the config) who are team admins can call these while
 }
 ```
 
-`status` is `pass`, `warn`, `fail` or `skip` (an optional integration that isn't set up). `fix` has `text` and any of `command` (to copy), `url` (outside CoderHelm) and `href` (a dashboard page). `ready` is true when nothing fails. Keys: `url`, `domain`, `github_keys`, `github_app`, `github_permissions`, `github_installations`, `github_webhook`, `email_identity`, `email_sandbox`, `model`, `dlq`, `updates`, `slack`, `teams`, `jira`, `aws_connections`, `google_sign_in`. On an install that uses CoderHelm's GitHub App (hybrid), `github_app` and `github_installations` say whether the app is linked instead, and never block an update.
+`status` is `pass`, `warn`, `fail` or `skip` (an optional integration that isn't set up). `fix` has `text` and any of `command` (to copy), `url` (outside CoderHelm) and `href` (a dashboard page). `ready` is true when nothing fails. Keys: `url`, `domain`, `github_keys`, `github_app`, `github_permissions`, `github_installations`, `github_webhook`, `email_sender`, `email_identity`, `email_sandbox`, `email_cognito`, `model`, `dlq`, `updates`, `slack`, `teams`, `jira`, `aws_connections`. A self-hosted install has no Google sign-in, so there is no `google_sign_in` check. On an install that uses CoderHelm's GitHub App (hybrid), `github_app` and `github_installations` say whether the app is linked instead, and never block an update.
 
 ### `GET /api/system/domain`, `PUT /api/system/domain`, `DELETE /api/system/domain`
 
@@ -267,7 +264,6 @@ For the [install guide](https://docs.coderhelm.com/self-host/install/) to poll f
     { "id": "models", "label": "Claude access", "status": "fail", "code": "use_case_required" },
     { "id": "email", "label": "Email", "status": "warn", "code": "sandbox", "required": false },
     { "id": "domain", "label": "Your domain", "status": "wait", "code": "validating", "required": false },
-    { "id": "google_sign_in", "label": "Sign in with Google", "status": "skip", "code": "off", "required": false },
     { "id": "updates", "label": "Automatic updates", "status": "skip", "code": "auto_off", "required": false },
     { "id": "admin", "label": "First admin signed up", "status": "wait", "code": "not_signed_up" }
   ]
@@ -292,14 +288,11 @@ For the [install guide](https://docs.coderhelm.com/self-host/install/) to poll f
   *Codes:* `ok`, `use_case_required`, `access_denied`, `subscription_pending` (warn), `marketplace_failed`, `iam_denied`, `not_available`, `unknown`; `anthropic_keys_per_team` (skip)\
   *Fix:* Bedrock: one real one-token call (a pass is kept 10 minutes, a failure 20 seconds). Submit Anthropic's use case form or request access in the Bedrock console for your region, wait for the subscription, fix the payment method, or allow Bedrock model calls. With Anthropic API keys, each team adds its key after signing in.
 - **`email`**\
-  *Codes:* `ok`, `identity_unverified`, `sandbox`, `unknown` (all warn, never blocking)\
-  *Fix:* Verify the sender (DKIM records, or the link AWS emailed); request SES production access.
+  *Codes:* never blocking. Through CoderHelm (Settings, Emails): `relay_ok` (pass), `relay_not_registered`, `relay_unreachable`, `relay_unverified`, `relay_paused` (warn). Through the install's own SES: `ok` (pass), `not_configured` (no `email.from`), `identity_missing`, `identity_unreadable`, `identity_unverified`, `dkim_pending`, `sandbox`, `account_unreadable` (warn). Never `unknown`: each way it can't be sure has its own code.\
+  *Fix:* Register the install, or switch Settings, Emails to Amazon SES; set `email.from`; create the SES identity (for the domain, or the one address `email.identity` names) and add its DKIM records; deploy again to restore the service's SES read permission; request SES production access. [Email](./email.md#setup-checks) has each in full.
 - **`domain`**\
   *Codes:* `none` (skip), `validating` (wait), `attaching` (wait), `removing` (wait), `dns_missing` (wait), `zone_not_delegated`, `validation_wrong_value`, `caa_blocked`, `certificate_failed`, `attach_failed`, `dns_wrong_value`, `cname_at_apex`, `https_failed`, `api_unreachable`, `unknown` (warn), `ok`; never blocking\
   *Fix:* See [Domains](./domains.md#checks). The hostname and the records are never in this answer: the guide has them from the progress file.
-- **`google_sign_in`**\
-  *Codes:* `off` (skip), `missing_keys`, `ok`; never blocking\
-  *Fix:* See [Sign-in and people](./sign-in.md).
 - **`updates`**\
   *Codes:* `auto_off` (skip), `ok`, `unknown` (warn); never blocking\
   *Fix:* Turn automatic updates on in Settings, then System.

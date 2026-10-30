@@ -21,6 +21,7 @@
 //! reaches CoderHelm.
 
 pub mod relay;
+pub mod stats;
 pub mod templates;
 
 use std::collections::BTreeMap;
@@ -429,11 +430,23 @@ async fn send_ses(s: &Sender<'_>, mail: &Mail) -> Result<(), SendError> {
             )
             .build(),
     };
+    // The kind, for the counts Deliveries shows (stats::read_event).
+    let kind = stats::kind_of(if mail.template.is_empty() {
+        &mail.kind
+    } else {
+        mail.template
+    });
+    let tag = aws_sdk_sesv2::types::MessageTag::builder()
+        .name(stats::KIND_TAG)
+        .value(kind)
+        .build()
+        .map_err(|e| err("email_failed", e.to_string()))?;
     s.ses
         .send_email()
         .from_email_address(s.from)
         .destination(Destination::builder().to_addresses(&mail.to).build())
         .content(content)
+        .email_tags(tag)
         .send()
         .await
         .map_err(|e| {

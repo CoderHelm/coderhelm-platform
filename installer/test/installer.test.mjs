@@ -588,7 +588,8 @@ test("withDomain: another DNS provider, a Route 53 zone, removal, and plain refu
   assert.throws(() => withDomain(cfg, { hostname: "helm", certificateArn: CERT }), /--hostname must be a hostname/);
   assert.throws(() => withDomain(cfg, { hostname: "helm.example.org", certificateArn: CERT.replace("us-east-1", "eu-west-1") }), /us-east-1/);
   assert.throws(() => withDomain(cfg, { hostname: "helm.example.org", certificateArn: CERT, zone: "example.net" }), /not inside the zone/);
-  assert.throws(() => withDomain({ ...cfg, integrations: { googleSignIn: true } }, { action: "remove" }), /Google sign-in needs a domain/);
+  // No Google sign-in on self-host: an old config with it on still moves back to the AWS address.
+  assert.equal(withDomain({ ...cfg, integrations: { googleSignIn: true } }, { action: "remove" }).domain, null);
   assert.equal(describeChange(null, { hostname: "helm.example.org" }), "the AWS address to https://helm.example.org");
 });
 

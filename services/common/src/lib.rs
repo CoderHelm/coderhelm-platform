@@ -24,6 +24,8 @@ pub mod deliveries_rollup;
 /// The shared dead-letter queue: whose each failed message is, whether the
 /// worker can read it, and when the cleanup archives it.
 pub mod dlq;
+/// One DNS TXT lookup through the system resolver (the email check's DMARC).
+pub mod dns_txt;
 /// Hybrid self-hosting: CoderHelm addresses, the event relay, the token
 /// broker and the signatures between an install and the hosted side.
 pub mod hybrid;

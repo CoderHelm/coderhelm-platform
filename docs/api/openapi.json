@@ -440,6 +440,17 @@
           "backfill": {
             "$ref": "#/components/schemas/Backfill"
           },
+          "email": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/EmailOverview",
+                "description": "Self-hosted installs: email by kind (sends, deliveries, bounces,\ncomplaints, rejections) over the period's UTC days, from Amazon\nSES's own events, for the sender in use (CoderHelm's relay or the\ninstall's SES), and who sends Cognito's sign-in email. Null elsewhere."
+              }
+            ]
+          },
           "endpoints": {
             "description": "The team's outbound webhook endpoints, and any that had deliveries\nin the period since. Empty when another source is chosen.",
             "items": {
@@ -515,6 +526,13 @@
             "format": "int64",
             "type": "integer"
           },
+          "relay": {
+            "description": "Hybrid installs: the events CoderHelm's relay forwarded here, one row\nper provider (GitHub, Jira), with when each last went through. Empty\nelsewhere.",
+            "items": {
+              "$ref": "#/components/schemas/RelayRow"
+            },
+            "type": "array"
+          },
           "seen_sources": {
             "description": "Every source with deliveries in either period, for the filter.",
             "examples": [
@@ -571,6 +589,7 @@
           "endpoints",
           "seen_sources",
           "backfill",
+          "relay",
           "kept_days",
           "records_kept_days"
         ],
@@ -619,6 +638,187 @@
           "at",
           "duration_ms",
           "error"
+        ],
+        "type": "object"
+      },
+      "EmailKindRow": {
+        "description": "One kind of email's counts in the overview.",
+        "properties": {
+          "bounces": {
+            "description": "Returned by the receiving server (the address doesn't exist, or a full mailbox).",
+            "examples": [
+              1
+            ],
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "complaints": {
+            "description": "Marked as spam by the recipient.",
+            "examples": [
+              0
+            ],
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "deliveries": {
+            "description": "Accepted by the receiving mail server.",
+            "examples": [
+              41
+            ],
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "kind": {
+            "description": "`sign_in`, `password_reset`, `notices`, `weekly_summary`, `alerts`,\n`other`, or `all` for the totals.",
+            "examples": [
+              "notices"
+            ],
+            "type": "string"
+          },
+          "label": {
+            "description": "The kind in words.",
+            "examples": [
+              "Run and review notices"
+            ],
+            "type": "string"
+          },
+          "rejections": {
+            "description": "Refused by SES before sending.",
+            "examples": [
+              0
+            ],
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "sends": {
+            "description": "Accepted by SES for sending (per recipient).",
+            "examples": [
+              42
+            ],
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "kind",
+          "label",
+          "sends",
+          "deliveries",
+          "bounces",
+          "complaints",
+          "rejections"
+        ],
+        "type": "object"
+      },
+      "EmailOverview": {
+        "description": "Email in the Deliveries overview (self-hosted installs).",
+        "properties": {
+          "cognito_daily_limit": {
+            "description": "Cognito's own sender's daily limit, when it is the sender.",
+            "examples": [
+              50
+            ],
+            "format": "int64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "cognito_sender": {
+            "description": "Who sends Amazon Cognito's sign-up codes and password resets:\n`cognito_default` (Cognito's own address) or `ses`. Null when the\ndeploy didn't say.",
+            "examples": [
+              "cognito_default"
+            ],
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "from": {
+            "description": "The first UTC day counted.",
+            "examples": [
+              "2026-10-24"
+            ],
+            "type": "string"
+          },
+          "kinds": {
+            "description": "Every kind, in a fixed order, zeros included.",
+            "items": {
+              "$ref": "#/components/schemas/EmailKindRow"
+            },
+            "type": "array"
+          },
+          "last_bounce_at": {
+            "description": "When an email last bounced (any period).",
+            "examples": [
+              "2026-10-21T09:12:40Z"
+            ],
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "last_complaint_at": {
+            "description": "When a recipient last marked an email as spam (any period).",
+            "examples": [
+              "2026-10-02T17:30:00Z"
+            ],
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "last_delivery_at": {
+            "description": "When an email was last delivered (any period).",
+            "examples": [
+              "2026-10-29T14:03:13Z"
+            ],
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "last_send_at": {
+            "description": "When an email was last accepted for sending (any period).",
+            "examples": [
+              "2026-10-29T14:03:11Z"
+            ],
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "sender": {
+            "description": "The sender in use: `relay` (through CoderHelm) or `ses` (the install's own).",
+            "examples": [
+              "relay"
+            ],
+            "type": "string"
+          },
+          "to": {
+            "description": "The last UTC day counted (today).",
+            "examples": [
+              "2026-10-30"
+            ],
+            "type": "string"
+          },
+          "totals": {
+            "$ref": "#/components/schemas/EmailKindRow",
+            "description": "Every kind added up."
+          }
+        },
+        "required": [
+          "sender",
+          "from",
+          "to",
+          "kinds",
+          "totals"
         ],
         "type": "object"
       },
@@ -2213,6 +2413,92 @@
           "count",
           "previous_count",
           "sources"
+        ],
+        "type": "object"
+      },
+      "RelayRow": {
+        "description": "Events CoderHelm's relay forwarded to this install for one provider.",
+        "properties": {
+          "deliveries": {
+            "description": "Finished forwards in the period (retries count once).",
+            "examples": [
+              120
+            ],
+            "format": "int64",
+            "type": "integer"
+          },
+          "failed": {
+            "description": "Failed for good (after about 24 hours of retries, or refused).",
+            "examples": [
+              1
+            ],
+            "format": "int64",
+            "type": "integer"
+          },
+          "last_delivered_at": {
+            "description": "When a forward last went through (any period).",
+            "examples": [
+              "2026-10-29T14:03:11Z"
+            ],
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "last_failed_at": {
+            "description": "When a forward last failed for good (any period).",
+            "examples": [
+              "2026-10-21T08:40:02Z"
+            ],
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "ok": {
+            "description": "Delivered to the install.",
+            "examples": [
+              119
+            ],
+            "format": "int64",
+            "type": "integer"
+          },
+          "p95_ms": {
+            "description": "95th percentile of the last attempt's time, milliseconds.",
+            "examples": [
+              420
+            ],
+            "format": "int64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "provider": {
+            "description": "`github` or `jira`.",
+            "examples": [
+              "jira"
+            ],
+            "type": "string"
+          },
+          "success_rate": {
+            "description": "Delivered, out of finished. Null with none.",
+            "examples": [
+              0.9917
+            ],
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "provider",
+          "deliveries",
+          "ok",
+          "failed"
         ],
         "type": "object"
       },

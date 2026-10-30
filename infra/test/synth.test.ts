@@ -192,7 +192,11 @@ test("self-host with a domain in another region and Bedrock", () => {
   t["coderhelm-prod-web-certificate"].hasResourceProperties("AWS::CertificateManager::Certificate", { DomainName: "helm.example.org" });
   t["coderhelm-prod-web"].resourceCountIs("AWS::Route53::RecordSet", 2);
 
+  // Google sign-in on in an old config: a self-hosted install never gets it,
+  // and the update removes the provider it had.
+  t["coderhelm-prod-api"].resourceCountIs("AWS::Cognito::UserPoolIdentityProvider", 0);
   const gw = envOf(t["coderhelm-prod-api"], "coderhelm-prod-gateway");
+  assert.equal(gw.GOOGLE_SIGN_IN, "false");
   assert.equal(gw.APP_URL, "https://helm.example.org");
   assert.equal(gw.MODEL_PROVIDER, "bedrock");
   assert.equal(gw.BEDROCK_INFERENCE_PREFIX, "eu.");
@@ -200,11 +204,6 @@ test("self-host with a domain in another region and Bedrock", () => {
   assert.ok(worker.includes("bedrock:InvokeModelWithResponseStream"));
   assert.ok(worker.includes("foundation-model/anthropic.*"));
 
-  // Google sign-in calls back to the API on the one hostname.
-  t["coderhelm-prod-api"].resourceCountIs("AWS::Cognito::UserPoolIdentityProvider", 1);
-  t["coderhelm-prod-api"].hasResourceProperties("AWS::Cognito::UserPoolClient", {
-    CallbackURLs: ["https://helm.example.org/auth/google/callback"],
-  });
   // The sender's domain is the zone: SES gets its DKIM records there.
   t["coderhelm-prod-email"].resourceCountIs("AWS::Route53::RecordSet", 3);
 });
@@ -866,6 +865,20 @@ test("self-host: optional email starts off, own SES, and nothing that mails Code
     assert.equal(Object.keys(tpl.findResources("AWS::SNS::Topic")).filter((k) => k.includes("MailRelay")).length, 0, name);
   }
   t["coderhelm-prod-api"].hasResourceProperties("AWS::Events::Rule", { Name: "coderhelm-prod-weekly-summary", State: "ENABLED" });
+  // The install's own SES events reach its worker (counted by kind for
+  // Deliveries), through the default bus, matched by the set's name.
+  t["coderhelm-prod-email"].hasResourceProperties("AWS::SES::ConfigurationSetEventDestination", {
+    EventDestination: Match.objectLike({
+      Enabled: true,
+      MatchingEventTypes: Match.arrayWith(["send", "delivery", "bounce", "complaint", "reject"]),
+      EventBridgeDestination: Match.anyValue(),
+    }),
+  });
+  t["coderhelm-prod-api"].hasResourceProperties("AWS::Events::Rule", {
+    Name: "coderhelm-prod-email-events",
+    EventPattern: { source: ["aws.ses"], detail: { mail: { tags: { "ses:configuration-set": ["coderhelm-prod-emails"] } } } },
+  });
+  assert.equal(envOf(t["coderhelm-prod-api"], "coderhelm-prod-gateway").COGNITO_EMAIL_SENDER, "cognito_default");
 });
 
 test("self-host: a config that turns the weekly summary on, or chooses CoderHelm's mail, starts the install that way", () => {
@@ -907,10 +920,10 @@ test("hosted: the weekly summary stays on for everyone, and the mail relay sends
   assert.equal(dkim.length, 3, "Easy DKIM");
   // Full names as SES gives them: the zone is never appended a second time.
   for (const p of dkim) assert.ok(!JSON.stringify(p.Name).includes("coderhelm.com."), `DKIM name has the zone appended: ${JSON.stringify(p.Name)}`);
-  // Bounces and complaints reach the worker through SNS, raw.
+  // Every event reaches the worker through SNS, raw (bounces and complaints suppress; all are counted).
   api.hasResourceProperties("AWS::SES::ConfigurationSetEventDestination", {
     ConfigurationSetName: Match.anyValue(),
-    EventDestination: Match.objectLike({ MatchingEventTypes: Match.arrayWith(["bounce", "complaint"]) }),
+    EventDestination: Match.objectLike({ MatchingEventTypes: Match.arrayWith(["send", "delivery", "bounce", "complaint", "reject"]) }),
   });
   api.hasResourceProperties("AWS::SNS::Subscription", { Protocol: "sqs", RawMessageDelivery: true });
   // Sending as the relay: only its identity and configuration set, only from its address.

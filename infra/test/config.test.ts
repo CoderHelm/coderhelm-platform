@@ -174,11 +174,14 @@ test("layout checks", () => {
   );
 });
 
-test("Google sign-in needs a domain in single-origin", () => {
-  hasProblem(base({ integrations: { googleSignIn: true } }), /googleSignIn: needs a domain/);
-  assert.deepEqual(
-    problems(base({ domain: { hostname: "ch.example.com", hostedZone: "example.com" }, integrations: { googleSignIn: true } })),
-    []
+test("Google sign-in is the hosted deployment's only: a self-hosted install never gets it", () => {
+  // An install that had it on still deploys (no problem), and the update
+  // removes the Google provider: the setting resolves to off.
+  assert.deepEqual(problems(base({ integrations: { googleSignIn: true } })), []);
+  assert.equal(resolveConfig(base({ integrations: { googleSignIn: true } })).integrations.googleSignIn, false);
+  assert.equal(
+    resolveConfig(base({ domain: { hostname: "ch.example.com", hostedZone: "example.com" }, integrations: { googleSignIn: true } })).integrations.googleSignIn,
+    false
   );
 });
 

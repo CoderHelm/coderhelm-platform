@@ -21,7 +21,7 @@ The [install guide](https://docs.coderhelm.com/self-host/install/) installs Code
 
 The guide's checks come from the install's public `GET /api/setup/status`, the same checks the CLI's `doctor` and the dashboard's setup checklist use. Its shape, codes, setup window and rate limit are documented in [Check your install](./check-your-install.md). The guide uses:
 
-- `checks[]` (`id`, `label`, `status`, `code`, `required`) for `api`, `github_app`, `github_installed`, `models`, `email`, `domain`, `google_sign_in`, `updates` and `admin`, each code mapped to one sentence and a fix; an unknown check shows by its label.
+- `checks[]` (`id`, `label`, `status`, `code`, `required`) for `api`, `github_app`, `github_installed`, `models`, `email`, `domain`, `updates`, `admin` and, on a hybrid install, the `hybrid_*` checks (`hybrid_registered`, `hybrid_name`, `hybrid_github`, `hybrid_jira`, `hybrid_access`, `hybrid_relay`), each code mapped to one sentence and a fix; an unknown check shows by its label.
 - `domain`: when you chose your own domain, the guide shows a Domain step between AWS and GitHub with the records from the progress file, checks until the code is `ok`, then follows the install to the domain (so the GitHub App gets the domain's URLs). You can skip it and add the domain later in Settings, then System.
 - `github_manifest_ready`: one click when true; the terminal command (`pull`, then `github-app`) when false.
 - `setup_open: false` (someone has signed up): the install is shown as ready.

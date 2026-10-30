@@ -152,7 +152,7 @@ async function stepAccount(ctx, answers) {
 
 async function stepDomain(ctx, answers) {
   const { flags, runner, log } = ctx;
-  log("CoderHelm needs one web address. Without a domain it uses CloudFront's own (https://dxxxx.cloudfront.net), and everything works except Google sign-in.");
+  log("CoderHelm needs one web address. Without a domain it uses CloudFront's own (https://dxxxx.cloudfront.net), and everything works.");
   const zones = ((await runner.json("aws", ["route53", "list-hosted-zones", "--output", "json"], { allowFail: true, dryRunAnswer: '{"HostedZones":[]}' }))?.HostedZones ?? [])
     .filter((z) => !z.Config?.PrivateZone)
     .map((z) => z.Name.replace(/\.$/, ""));
@@ -271,26 +271,9 @@ async function stepIntegrations(ctx, answers) {
     const checked = await gate(ctx, async () => [await C.checkWebhook(ctx, webhook)], { heading: "Checking the webhook" });
     if (checked === BACK) return BACK;
   }
-  let google = flags.google !== undefined ? flags.google === true || flags.google === "yes" : answers.google ?? false;
-  if (flags.google === undefined && answers.domain) {
-    const g = await yesNo(ctx, "Turn on Sign in with Google (needs a Google OAuth client)?", google);
-    if (g === BACK) return BACK;
-    google = g;
-  } else if (!answers.domain) {
-    google = false;
-  }
-  if (google) {
-    const id = flags.googleClientId ?? (await askValid(ctx, "Google OAuth client id", "", (v) => (v.endsWith(".apps.googleusercontent.com") ? null : "It ends in .apps.googleusercontent.com.")));
-    if (id === BACK) return BACK;
-    const secret = flags.googleClientSecret ?? process.env.GOOGLE_CLIENT_SECRET ?? (await askValid(ctx, "Google OAuth client secret", "", (v) => (v ? null : "Required for Google sign-in.")));
-    if (secret === BACK) return BACK;
-    // Straight into the install's secret: never in the config or the wizard file.
-    const name = `coderhelm/${answers.stage}/secrets`;
-    await ensureSecret(runner, name, answers.region, log);
-    await mergeSecret(runner, name, answers.region, { google_client_id: id, google_client_secret: secret });
-    log("  Stored in Secrets Manager.");
-  }
-  return { ...answers, updatesWebhook: webhook || undefined, google };
+  // No Google sign-in on a self-hosted install: people sign in with email
+  // and password, and two-factor where it's set.
+  return { ...answers, updatesWebhook: webhook || undefined };
 }
 
 async function stepUpdates(ctx, answers) {
@@ -343,7 +326,6 @@ async function stepSummary(ctx, answers) {
   log(`  Claude             ${cfg.models.provider === "bedrock" ? `Amazon Bedrock (${cfg.models.bedrockInferencePrefix || "in-region"})` : "Anthropic API, each team's key"}`);
   log(`  Admin / sender     ${cfg.admins[0]} / ${cfg.email.from}`);
   log(`  Who may join       ${cfg.signup.domains?.length ? `people you invite, and anyone at ${cfg.signup.domains[0]}` : "only people you invite"} (change it later in Settings, Sign-in)`);
-  log(`  Google sign-in     ${cfg.integrations.googleSignIn ? "on" : "off"}`);
   log(`  Auto-update        ${cfg.updates.auto ? `on, ${cfg.updates.window} ${cfg.updates.timezone}, majors: ${cfg.updates.majors}` : "off (you're emailed about new releases)"}`);
   const c = estimateMonthlyCost(answers);
   log("\nEstimated AWS cost per month for a small team (USD):");
@@ -384,7 +366,7 @@ export function configFromAnswers(a) {
     email: { from: a.emailFrom },
     admins: [a.admin],
     signup: a.signupDomain ? { domains: [a.signupDomain] } : {},
-    integrations: { googleSignIn: !!a.google, sandbox: true, logAnalyzer: true, weeklySummary: true },
+    integrations: { sandbox: true, logAnalyzer: true, weeklySummary: true },
     updates,
     telemetry: { enabled: a.telemetry === true },
   };

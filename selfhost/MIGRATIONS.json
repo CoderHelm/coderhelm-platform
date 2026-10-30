@@ -5,6 +5,12 @@
       "version": "v0.7.0",
       "breaking": false,
       "notes": "First self-host release: one config file, the single-origin web stack, Bedrock as a model provider, setup checks with fixes (doctor, Settings then Setup) and update readiness. The v0.2.x to v0.6.0 tags are from before self-hosting and have no releases."
+    },
+    {
+      "version": "v0.8.0",
+      "breaking": true,
+      "notes": "Self-hosted installs no longer offer Sign in with Google: the update removes the Google identity provider (integrations.googleSignIn is ignored). Also: hybrid installs can link a Jira site through CoderHelm, and Deliveries and Setup show email by kind and the sender's state.",
+      "action": "If people signed in to this install with Google, tell them to sign in with Forgot password on the same email after the update; they keep their account. Then run the update again with --yes."
     }
   ]
 }

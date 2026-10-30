@@ -298,6 +298,27 @@ export class ApiStack extends cdk.Stack {
     if (cfg.mailRelay) {
       new MailRelay(this, "MailRelay", { cfg, ticketQueue: this.ticketQueue });
     }
+    // A self-hosted install counts its own email by kind (Deliveries,
+    // common::mail::stats): its configuration set publishes every send,
+    // delivery, bounce, complaint and rejection to the default event bus
+    // (the email stack), and this rule hands each one, as SES wrote it, to
+    // the worker on the ticket queue. Matched by the set's name, so neither
+    // stack references the other.
+    if (cfg.layout !== "split") {
+      new events.Rule(this, "EmailEventsRule", {
+        ruleName: `${prefix}-email-events`,
+        description: "This install's own SES events, counted by kind for Deliveries",
+        eventPattern: {
+          source: ["aws.ses"],
+          detail: { mail: { tags: { "ses:configuration-set": [`${prefix}-emails`] } } },
+        },
+        targets: [
+          new targets.SqsQueue(this.ticketQueue, {
+            message: events.RuleTargetInput.fromEventPath("$.detail"),
+          }),
+        ],
+      });
+    }
 
     this.ciFixQueue = new sqs.Queue(this, "CiFixQueue", {
       queueName: `${prefix}-ci-fix`,
@@ -574,6 +595,9 @@ export class ApiStack extends cdk.Stack {
         COGNITO_USER_POOL_ID: userPool.userPoolId,
         COGNITO_CLIENT_ID: userPoolClient.userPoolClientId,
         COGNITO_DOMAIN: userPoolDomain.domainName,
+        // Who sends Cognito's sign-up codes and password resets (Setup's
+        // email_cognito check): Cognito's own sender is capped at ~50 a day.
+        COGNITO_EMAIL_SENDER: cfg.email.cognitoUsesSes ? "ses" : "cognito_default",
         RUST_LOG: "info",
         TRACES_TABLE_NAME: `${props.cfg.prefix}-traces`,
         ...serviceEnvironment(cfg, this.account),

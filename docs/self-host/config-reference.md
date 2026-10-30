@@ -103,8 +103,8 @@ A self-hosted install is one organization: sign-up is closed to everyone else. A
 
 ## Integrations
 
-- **`integrations.googleSignIn`** *boolean, default `false`*\
-  "Sign in with Google". Needs a domain and Google keys in the secret.
+- **`integrations.googleSignIn`** *ignored*\
+  Not available on a self-hosted install, which signs people in with email and password, and two-factor where it's set. An update removes a Google sign-in an install had; see [Sign-in and people](./sign-in.md#no-google-sign-in).
 - **`integrations.sandbox`** *boolean, default `true`*\
   The CodeBuild sandbox that runs a repo's build and checks during runs.
 - **`integrations.logAnalyzer`** *boolean, default `true`*\

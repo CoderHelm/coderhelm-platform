@@ -80,6 +80,32 @@ pub async fn run(state: &WorkerState, msg: RelayRetryMessage) -> Result<(), Erro
         drop_body().await;
         return Ok(());
     };
+    // A linked Jira site's event goes only while the link stands: unlinked
+    // meanwhile, the site's events are CoderHelm's again.
+    if msg.source == "jira" && (msg.event == "site" || msg.event == "site_webhook") {
+        let linked = state
+            .dynamo
+            .get_item()
+            .table_name(table)
+            .key("pk", AttributeValue::S(pk.clone()))
+            .key("sk", AttributeValue::S("JIRALINK".into()))
+            .consistent_read(true)
+            .send()
+            .await?
+            .item()
+            .is_some();
+        if !linked {
+            d.finish(
+                common::deliveries::Status::Failed,
+                "Unlinked before it was delivered",
+                "relay_not_linked",
+            );
+            d.next_retry_at = None;
+            common::deliveries::record(&state.dynamo, table, &pk, &d).await;
+            drop_body().await;
+            return Ok(());
+        }
+    }
     let body = match state
         .s3
         .get_object()
@@ -126,5 +152,6 @@ pub async fn run(state: &WorkerState, msg: RelayRetryMessage) -> Result<(), Erro
         _ => drop_body().await,
     }
     common::deliveries::record(&state.dynamo, table, &pk, &d).await;
+    relay::note_last(&state.dynamo, table, &msg.install_id, &d).await;
     Ok(())
 }

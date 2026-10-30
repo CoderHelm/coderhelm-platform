@@ -29,7 +29,6 @@ use std::time::{Duration, Instant};
 use axum::{extract::State, http::StatusCode, Extension, Json};
 use serde::Serialize;
 use serde_json::{json, Value};
-use tracing::warn;
 
 use super::api::is_platform_admin;
 use crate::models::Claims;
@@ -64,21 +63,21 @@ pub struct Fix {
 }
 
 impl Fix {
-    fn text(t: impl Into<String>) -> Self {
+    pub(crate) fn text(t: impl Into<String>) -> Self {
         Fix {
             text: t.into(),
             ..Default::default()
         }
     }
-    fn command(mut self, c: impl Into<String>) -> Self {
+    pub(crate) fn command(mut self, c: impl Into<String>) -> Self {
         self.command = Some(c.into());
         self
     }
-    fn url(mut self, u: impl Into<String>) -> Self {
+    pub(crate) fn url(mut self, u: impl Into<String>) -> Self {
         self.url = Some(u.into());
         self
     }
-    fn href(mut self, h: impl Into<String>) -> Self {
+    pub(crate) fn href(mut self, h: impl Into<String>) -> Self {
         self.href = Some(h.into());
         self
     }
@@ -100,7 +99,7 @@ pub struct Check {
 }
 
 impl Check {
-    fn pass(
+    pub(crate) fn pass(
         key: &'static str,
         group: &'static str,
         label: &'static str,
@@ -116,7 +115,7 @@ impl Check {
             fix: None,
         }
     }
-    fn not_ok(
+    pub(crate) fn not_ok(
         status: Status,
         key: &'static str,
         group: &'static str,
@@ -444,115 +443,9 @@ pub fn github_webhook(
 
 // ── Email ─────────────────────────────────────────────────────────────────
 
-const E: &str = "Email";
-
-/// What SES says about the sender identity.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct Identity {
-    pub verified: bool,
-    /// SUCCESS, PENDING, FAILED, TEMPORARY_FAILURE, NOT_STARTED.
-    pub dkim_status: String,
-    pub dkim_tokens: Vec<String>,
-}
-
 /// The domain SES verifies, from the sender address.
 pub fn sender_domain(from: &str) -> &str {
     from.rsplit_once('@').map(|(_, d)| d).unwrap_or(from)
-}
-
-/// The sender identity is verified, DKIM included.
-pub fn email_identity(from: &str, region: &str, id: Option<&Identity>) -> Check {
-    let domain = sender_domain(from);
-    let console =
-        format!("https://console.aws.amazon.com/ses/home?region={region}#/identities/{domain}");
-    let Some(id) = id else {
-        return Check::not_ok(
-            Status::Fail,
-            "email_identity",
-            E,
-            "Email sender verified",
-            format!("{domain} isn't an identity in Amazon SES in {region}."),
-            "SES refuses to send from an address it hasn't verified.",
-            Fix::text(format!("Create the identity for {domain} in SES, then add the three DKIM records it shows."))
-                .command(format!("aws sesv2 create-email-identity --email-identity {domain} --region {region}"))
-                .url(console),
-        );
-    };
-    if id.verified && id.dkim_status.eq_ignore_ascii_case("success") {
-        return Check::pass(
-            "email_identity",
-            E,
-            "Email sender verified",
-            format!("{domain} is verified, with DKIM."),
-        );
-    }
-    let records = id
-        .dkim_tokens
-        .iter()
-        .map(|t| format!("{t}._domainkey.{domain} CNAME {t}.dkim.amazonses.com"))
-        .collect::<Vec<_>>()
-        .join("\n");
-    let detail = if id.verified {
-        format!(
-            "{domain} is verified, but DKIM is {}.",
-            id.dkim_status.to_lowercase().replace('_', " ")
-        )
-    } else {
-        format!(
-            "{domain} isn't verified yet (DKIM {}).",
-            id.dkim_status.to_lowercase().replace('_', " ")
-        )
-    };
-    Check::not_ok(
-        if id.verified {
-            Status::Warn
-        } else {
-            Status::Fail
-        },
-        "email_identity",
-        E,
-        "Email sender verified",
-        detail,
-        "Mail without DKIM lands in spam, and SES won't send at all from an unverified domain.",
-        Fix {
-            text: if records.is_empty() {
-                format!(
-                    "Open {domain} in SES and add the DKIM records it shows at your DNS provider."
-                )
-            } else {
-                format!("Add these DNS records for {domain} at your DNS provider; SES checks them within an hour:")
-            },
-            command: (!records.is_empty()).then_some(records),
-            url: Some(console),
-            href: None,
-        },
-    )
-}
-
-/// Out of the SES sandbox (production access).
-pub fn email_sandbox(region: &str, production: Option<bool>) -> Check {
-    match production {
-        Some(true) => Check::pass("email_sandbox", E, "Email can reach anyone", "SES production access is on."),
-        Some(false) => Check::not_ok(
-            Status::Warn,
-            "email_sandbox",
-            E,
-            "Email can reach anyone",
-            "This AWS account is in the SES sandbox: email only reaches verified addresses, 200 a day.",
-            "Invites and run results won't reach your teammates until production access is granted.",
-            Fix::text("Request production access (Account dashboard, Request production access); AWS usually answers within a day.")
-                .url(format!("https://console.aws.amazon.com/ses/home?region={region}#/account")),
-        ),
-        None => Check::not_ok(
-            Status::Warn,
-            "email_sandbox",
-            E,
-            "Email can reach anyone",
-            "Could not read the SES account.",
-            "The check runs again each time this page opens.",
-            Fix::text("Send a test email from this page to check by hand.").href("/settings/setup#getting-started"),
-        ),
-    }
 }
 
 // ── Models ────────────────────────────────────────────────────────────────
@@ -1341,7 +1234,6 @@ pub fn public_domain(f: &DomainFacts) -> PublicCheck {
 
 // ── Sign-in and updates (optional) ────────────────────────────────────────
 
-/// "Sign in with Google": on in the config, and its keys in the secret.
 /// Settings, Emails: which optional emails are on, and whether CoderHelm's
 /// mail relay answers when the install sends through it. Optional on the
 /// checklist; a relay that doesn't answer fails (nothing falls back to SES).
@@ -1439,42 +1331,6 @@ async fn optional_emails_now(state: &AppState) -> Check {
         _ => None,
     };
     optional_emails(transport, &on, relay)
-}
-
-pub fn google_sign_in(enabled: bool, has_keys: bool) -> Check {
-    let label = "Sign in with Google";
-    match (enabled, has_keys) {
-        (true, true) => Check::pass("google_sign_in", X, label, "People can sign in with their Google account."),
-        (true, false) => Check::not_ok(
-            Status::Fail,
-            "google_sign_in",
-            X,
-            label,
-            "Google sign-in is on, but its client id and secret aren't in the install's secret.",
-            "The Google button fails until they are there.",
-            Fix::text("Add google_client_id and google_client_secret to the secret, then deploy again.")
-                .url("https://console.cloud.google.com/apis/credentials"),
-        ),
-        (false, _) => Check::not_ok(
-            Status::Skip,
-            "google_sign_in",
-            X,
-            label,
-            "Off: people sign in with email and password, with optional passkeys and two-factor codes (optional).",
-            "Google sign-in saves your team a password; it needs your own domain.",
-            Fix::text("Create an OAuth client in Google Cloud, add its keys to the secret, set integrations.googleSignIn, and deploy.")
-                .url("https://console.cloud.google.com/apis/credentials"),
-        ),
-    }
-}
-
-pub fn public_google_sign_in(enabled: bool, has_keys: bool) -> PublicCheck {
-    let c = |s, code| PublicCheck::new("google_sign_in", "Sign in with Google", s, code).optional();
-    match (enabled, has_keys) {
-        (true, true) => c("pass", "ok"),
-        (true, false) => c("fail", "missing_keys"),
-        (false, _) => c("skip", "off"),
-    }
 }
 
 /// Auto-update, from the updater's status (None: it didn't answer).
@@ -1783,48 +1639,6 @@ async fn github_checks(state: &AppState, deep: bool) -> Vec<Check> {
     });
     let config = config.map(|(_, b)| b).unwrap_or(Value::Null);
     out.push(github_webhook(&config, &expected, list.as_deref(), &app));
-    out
-}
-
-async fn email_checks(state: &AppState, deep: bool) -> Vec<Check> {
-    let region = std::env::var("AWS_REGION").unwrap_or_else(|_| "us-east-1".into());
-    let from = &state.config.ses_from_address;
-    let domain = sender_domain(from).to_string();
-    let identity = match state
-        .ses
-        .get_email_identity()
-        .email_identity(&domain)
-        .send()
-        .await
-    {
-        Ok(o) => Some(Identity {
-            verified: o.verified_for_sending_status(),
-            dkim_status: o
-                .dkim_attributes()
-                .and_then(|d| d.status())
-                .map(|s| s.as_str().to_string())
-                .unwrap_or_else(|| "NOT_STARTED".into()),
-            dkim_tokens: o
-                .dkim_attributes()
-                .map(|d| d.tokens().to_vec())
-                .unwrap_or_default(),
-        }),
-        Err(e) => {
-            warn!(error = %aws_sdk_sesv2::error::DisplayErrorContext(&e), "SES identity check");
-            None
-        }
-    };
-    let mut out = vec![email_identity(from, &region, identity.as_ref())];
-    if deep {
-        let production = state
-            .ses
-            .get_account()
-            .send()
-            .await
-            .ok()
-            .map(|a| a.production_access_enabled());
-        out.push(email_sandbox(&region, production));
-    }
     out
 }
 
@@ -2137,19 +1951,6 @@ pub async fn domain_facts_now(state: &AppState) -> (DomainFacts, Option<Value>) 
     (f, view)
 }
 
-fn google_enabled() -> bool {
-    std::env::var("GOOGLE_SIGN_IN").is_ok_and(|v| v == "true")
-}
-
-fn google_keys(s: &crate::models::Secrets) -> bool {
-    s.google_client_id
-        .as_deref()
-        .is_some_and(|v| !v.trim().is_empty())
-        && s.google_client_secret
-            .as_deref()
-            .is_some_and(|v| !v.trim().is_empty())
-}
-
 /// Every check, in the order the page shows them.
 pub async fn run_all(state: &AppState, team_id: &str) -> (Vec<Check>, Option<Value>) {
     let (gh, email, model, dlq_n, url, integrations, updater, domain_now) = tokio::join!(
@@ -2163,7 +1964,7 @@ pub async fn run_all(state: &AppState, team_id: &str) -> (Vec<Check>, Option<Val
                 github_checks(state, true).await
             }
         },
-        email_checks(state, true),
+        async { super::email_metrics::checks(&super::email_metrics::facts_now(state).await) },
         model_check(state, team_id),
         dlq_count(state),
         url_status(state),
@@ -2200,10 +2001,6 @@ pub async fn run_all(state: &AppState, team_id: &str) -> (Vec<Check>, Option<Val
         checks.extend(update_models(updater.as_ref()));
     }
     checks.extend(integrations);
-    checks.push(google_sign_in(
-        google_enabled(),
-        google_keys(&state.secrets),
-    ));
     checks.push(optional_emails_now(state).await);
     (checks, updater)
 }
@@ -2425,16 +2222,10 @@ pub fn public_models(bedrock: bool, probe: Option<&ModelProbe>) -> PublicCheck {
     }
 }
 
-/// Email: never blocks the install.
-pub fn public_email(identity: Option<&Identity>, production: Option<bool>) -> PublicCheck {
-    let c = |s, code| PublicCheck::new("email", "Email", s, code).optional();
-    match (identity, production) {
-        (None, _) => c("warn", "unknown"),
-        (Some(i), _) if !i.verified => c("warn", "identity_unverified"),
-        (Some(_), Some(false)) => c("warn", "sandbox"),
-        (Some(_), Some(true)) => c("pass", "ok"),
-        (Some(_), None) => c("warn", "unknown"),
-    }
+/// Email: never blocks the install (email_metrics::public_code has the codes).
+pub fn public_email(f: &super::email_metrics::Facts) -> PublicCheck {
+    let (status, code) = super::email_metrics::public_code(f);
+    PublicCheck::new("email", "Email", status, code).optional()
 }
 
 /// The whole answer, from its parts.
@@ -2658,23 +2449,7 @@ async fn public_models_now(state: &AppState) -> PublicCheck {
 }
 
 async fn public_email_now(state: &AppState) -> PublicCheck {
-    let domain = sender_domain(&state.config.ses_from_address).to_string();
-    let (id, acct) = tokio::join!(
-        state
-            .ses
-            .get_email_identity()
-            .email_identity(&domain)
-            .send(),
-        state.ses.get_account().send(),
-    );
-    let identity = id.ok().map(|o| Identity {
-        verified: o.verified_for_sending_status(),
-        ..Default::default()
-    });
-    public_email(
-        identity.as_ref(),
-        acct.ok().map(|a| a.production_access_enabled()),
-    )
+    public_email(&super::email_metrics::facts_now(state).await)
 }
 
 /// The optional checks the guide lists after Ready: the domain, Google
@@ -2694,16 +2469,8 @@ async fn public_optional_now(state: &AppState) -> Vec<PublicCheck> {
                 .as_ref(),
         ));
     }
-    let secret = stored_secret().await;
-    let keys = secret.as_ref().is_some_and(|s| {
-        s["google_client_id"]
-            .as_str()
-            .is_some_and(|v| !v.trim().is_empty())
-            && s["google_client_secret"]
-                .as_str()
-                .is_some_and(|v| !v.trim().is_empty())
-    });
-    out.push(public_google_sign_in(google_enabled(), keys));
+    // No Google sign-in on a self-hosted install: email and password,
+    // and two-factor where it's set.
     out
 }
 
@@ -2965,65 +2732,6 @@ mod tests {
     }
 
     #[test]
-    fn email_identity_shows_the_dkim_records() {
-        let missing = email_identity("helm@example.com", "eu-west-1", None);
-        assert_eq!(missing.status, Status::Fail);
-        assert!(missing
-            .fix
-            .as_ref()
-            .unwrap()
-            .command
-            .as_ref()
-            .unwrap()
-            .contains("create-email-identity --email-identity example.com"));
-
-        let pending = Identity {
-            verified: false,
-            dkim_status: "PENDING".into(),
-            dkim_tokens: vec!["abc".into(), "def".into()],
-        };
-        let c = email_identity("helm@example.com", "eu-west-1", Some(&pending));
-        assert_eq!(c.status, Status::Fail);
-        let cmd = c.fix.unwrap().command.unwrap();
-        assert!(cmd.contains("abc._domainkey.example.com CNAME abc.dkim.amazonses.com"));
-        assert!(cmd.contains("def._domainkey.example.com"));
-
-        let no_dkim = Identity {
-            verified: true,
-            dkim_status: "FAILED".into(),
-            dkim_tokens: vec![],
-        };
-        assert_eq!(
-            email_identity("a@example.com", "us-east-1", Some(&no_dkim)).status,
-            Status::Warn
-        );
-
-        let good = Identity {
-            verified: true,
-            dkim_status: "SUCCESS".into(),
-            dkim_tokens: vec![],
-        };
-        assert_eq!(
-            email_identity("a@example.com", "us-east-1", Some(&good)).status,
-            Status::Pass
-        );
-    }
-
-    #[test]
-    fn the_sandbox_warns_with_the_console_link() {
-        let c = email_sandbox("eu-west-1", Some(false));
-        assert_eq!(c.status, Status::Warn);
-        assert!(c
-            .fix
-            .unwrap()
-            .url
-            .unwrap()
-            .contains("region=eu-west-1#/account"));
-        assert_eq!(email_sandbox("eu-west-1", Some(true)).status, Status::Pass);
-        assert_eq!(email_sandbox("eu-west-1", None).status, Status::Warn);
-    }
-
-    #[test]
     fn model_outcomes() {
         assert_eq!(
             model(false, "us-east-1", "claude-sonnet-5-5", &ModelProbe::Ok).status,
@@ -3199,11 +2907,10 @@ mod tests {
             true,
             public_github(keys, Some(200), Some(0)),
             public_models(true, Some(&ModelProbe::Refused(403, "AccessDeniedException: arn:aws:iam::111122223333:role/x is not authorized to perform bedrock:Converse on us.anthropic.claude".into()))),
-            public_email(Some(&Identity { verified: true, ..Default::default() }), Some(false)),
+            public_email(&super::super::email_metrics::Facts::default()),
             vec![
                 public_domain(&DomainFacts { known: true, hostname: Some("helm.example.org".into()), state: "validating".into(), mode: "external".into(),
                     target: Some("d111test.cloudfront.net".into()), ..Default::default() }),
-                public_google_sign_in(false, false),
                 public_updates(Some(&json!({"settings": {"auto": false}}))),
             ],
             false,
@@ -3240,7 +2947,6 @@ mod tests {
                 "models",
                 "email",
                 "domain",
-                "google_sign_in",
                 "updates",
                 "admin"
             ]
@@ -3250,9 +2956,8 @@ mod tests {
         assert_eq!(v["checks"][4]["required"], false);
         assert_eq!(v["checks"][5]["code"], "validating");
         assert_eq!(v["checks"][5]["required"], false);
-        assert_eq!(v["checks"][6]["code"], "off");
-        assert_eq!(v["checks"][7]["code"], "auto_off");
-        assert_eq!(v["checks"][8]["status"], "wait");
+        assert_eq!(v["checks"][6]["code"], "auto_off");
+        assert_eq!(v["checks"][7]["status"], "wait");
         assert_eq!(v["ready"], false);
         // Every check has only these fields.
         for c in v["checks"].as_array().unwrap() {
@@ -3355,24 +3060,18 @@ mod tests {
             .status,
             "warn"
         );
-        assert_eq!(public_email(None, None).code, "unknown");
+        // Email never answers "unknown" (email_metrics has every code).
         assert_eq!(
-            public_email(Some(&Identity::default()), Some(true)).code,
-            "identity_unverified"
+            public_email(&super::super::email_metrics::Facts::default()).code,
+            "not_configured"
         );
-        let ok = Identity {
-            verified: true,
-            ..Default::default()
-        };
-        assert_eq!(public_email(Some(&ok), Some(false)).code, "sandbox");
-        assert_eq!(public_email(Some(&ok), Some(true)).status, "pass");
         // Optional and skipped checks don't block ready.
         let all_pass = public_status(
             json!(null),
             false,
             public_github(AppKeys::Present, Some(200), Some(1)),
             public_models(false, None),
-            public_email(None, None),
+            public_email(&super::super::email_metrics::Facts::default()),
             vec![public_domain(&DomainFacts {
                 known: true,
                 hostname: Some("h.example.org".into()),
@@ -3597,12 +3296,19 @@ mod tests {
     }
 
     #[test]
-    fn google_sign_in_and_updates_for_the_guide() {
-        assert_eq!(google_sign_in(false, false).status, Status::Skip);
-        assert_eq!(google_sign_in(true, false).status, Status::Fail);
-        assert_eq!(google_sign_in(true, true).status, Status::Pass);
-        assert_eq!(public_google_sign_in(true, false).code, "missing_keys");
-        assert!(public_google_sign_in(false, false).optional);
+    fn updates_for_the_guide_and_no_google_sign_in() {
+        // Self-hosted installs sign in with email and password: the guide
+        // never lists Google sign-in.
+        let v = public_status(
+            json!(null),
+            true,
+            public_github(AppKeys::Present, Some(200), Some(1)),
+            public_models(false, None),
+            public_email(&super::super::email_metrics::Facts::default()),
+            vec![public_updates(None)],
+            false,
+        );
+        assert!(!serde_json::to_string(&v).unwrap().contains("google"));
         assert_eq!(public_updates(None).code, "unknown");
         assert_eq!(
             public_updates(Some(&json!({"settings": {"auto": true}}))).code,
@@ -3620,7 +3326,7 @@ mod tests {
         let all = [
             github_keys("", ""),
             github_permissions(&app(json!({}), json!([]))),
-            email_identity("a@b.co", "us-east-1", None),
+            super::super::email_metrics::sender_check(&Default::default()),
             model(
                 true,
                 "us-east-1",

@@ -70,7 +70,6 @@ test("happy path: every step, a domain from Route 53, Bedrock, auto-update, a co
     ["Emails come from", "helm@example.org"],
     ["email domain", "example.org"],
     ["Slack or Teams", ""],
-    ["Sign in with Google", "no"],
     ["automatically", "yes"],
     ["Maintenance window", "Sat 22:00"],
     ["Time zone", "Europe/Berlin"],
