@@ -4,7 +4,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
   bedrockPrefixFor, configFromEnv, createProgress, domainPlan, explainFailure, findZone, isDelegated, logGroup, logUrl,
-  publicDomain, redact, refusal, relaunchConfig, run, secretName, statusDoc, updatesFromEnv, withSetupToken,
+  partLabel, publicDomain, publicPart, redact, refusal, relaunchConfig, resourceCount, run, secretName, statusDoc, updatesFromEnv, withSetupToken,
 } from "./bootstrap.mjs";
 
 const ENV = {
@@ -146,6 +146,64 @@ test("run: a fresh install writes the config, deploys, stores the key, ends done
   assert.deepEqual([...new Set(calls.status.map((s) => s.phase))], ["preparing", "deploying", "finishing", "done"]);
   assert.ok(calls.status.some((s) => s.phase === "deploying" && s.step === 1 && s.steps === 2), "per-part progress");
   for (const s of calls.status) assert.doesNotMatch(JSON.stringify(s), /ada@|123456789012|aaaaaaaa/);
+});
+
+// ── Progress inside a part ───────────────────────────────────────────────
+
+test("part progress: a plain label, resources done against the template", () => {
+  assert.equal(partLabel("coderhelm-prod-api", "prod"), "API");
+  assert.equal(partLabel("coderhelm-dev-log-analyzer", "dev"), "Log analyzer");
+  assert.equal(partLabel("coderhelm-prod-database", "prod"), "Database");
+  const template = { Resources: { A: {}, B: {}, C: {}, D: {} } };
+  assert.deepEqual(resourceCount(["CREATE_COMPLETE", "UPDATE_COMPLETE", "CREATE_IN_PROGRESS", "UPDATE_COMPLETE_CLEANUP_IN_PROGRESS"], template), { done: 2, total: 4 });
+  assert.deepEqual(resourceCount(Array(9).fill("CREATE_COMPLETE"), template), { done: 4, total: 4 });
+  assert.equal(resourceCount(["CREATE_COMPLETE"], null), null);
+  assert.equal(resourceCount([], { Resources: {} }), null);
+  // Only the label and the two counts reach the public file.
+  assert.deepEqual(publicPart({ name: "API", done: 18, total: 41, arn: "arn:aws:x" }), { name: "API", done: 18, total: 41 });
+  assert.equal(publicPart(null), null);
+  assert.equal(statusDoc({ phase: "deploying" }).part, null);
+});
+
+test("run: while a part deploys, its resources done are written about every poll, only when they change", async () => {
+  const counts = [{ done: 3, total: 41 }, { done: 3, total: 41 }, { done: 18, total: 41 }, { done: 18, total: 41 }, { done: 41, total: 41 }];
+  const asked = [];
+  const { deps, calls } = fakes({
+    stackResources: async (stack) => (asked.push(stack), counts.shift() ?? { done: 41, total: 41 }),
+    deploy: async (_v, onLine) => {
+      onLine("coderhelm-prod-database: deploying... [1/2]");
+      onLine(" ✅  coderhelm-prod-database");
+      onLine("coderhelm-prod-api: deploying... [2/2]");
+      await new Promise((r) => setTimeout(r, 120));
+      onLine(" ✅  coderhelm-prod-api");
+      return { code: 0 };
+    },
+  });
+  const doc = await run({ env: ENV, deps, log: () => {}, pollMs: 10 });
+  assert.equal(doc.phase, "done");
+  assert.ok(asked.length >= 5, `polled ${asked.length} times`);
+  assert.ok(asked.every((s) => s === "coderhelm-prod-api"), "counts the part that is deploying");
+  const deploying = calls.status.filter((s) => s.phase === "deploying" && s.step === 2);
+  // A new part first, then each new count once, in order.
+  assert.deepEqual(deploying.map((s) => s.message), ["Creating part 2 of 2", "API: 3 of 41", "API: 18 of 41", "API: 41 of 41"]);
+  assert.deepEqual(deploying.map((s) => s.part), [{ name: "API", done: null, total: null }, { name: "API", done: 3, total: 41 }, { name: "API", done: 18, total: 41 }, { name: "API", done: 41, total: 41 }]);
+  // The fields the guide already reads are unchanged.
+  for (const s of deploying) assert.equal(s.steps, 2);
+  assert.equal(calls.status.at(-1).phase, "done");
+});
+
+test("run: a part whose resources can't be counted yet keeps the part-level progress", async () => {
+  const { deps, calls } = fakes({
+    stackResources: async () => { throw new Error("Stack does not exist"); },
+    deploy: async (_v, onLine) => {
+      onLine("coderhelm-prod-api: deploying... [1/1]");
+      await new Promise((r) => setTimeout(r, 50));
+      return { code: 0 };
+    },
+  });
+  const doc = await run({ env: ENV, deps, log: () => {}, pollMs: 10 });
+  assert.equal(doc.phase, "done");
+  assert.deepEqual(calls.status.filter((s) => s.phase === "deploying" && s.step === 1).map((s) => s.message), ["Creating part 1 of 1"]);
 });
 
 test("run: an existing install of the same name is upgraded, not re-configured", async () => {

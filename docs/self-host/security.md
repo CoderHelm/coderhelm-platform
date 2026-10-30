@@ -99,7 +99,7 @@ There is no CDK bootstrap: deploys use the install's own assets bucket and the d
 
 ### Check it yourself
 
-From a machine with read access to the account (IAM, CloudFormation, SSM):
+From a machine with read access to the account (IAM, CloudFormation, CodeBuild, SSM):
 
 ```sh
 AWS_PROFILE=<profile> node selfhost/check-access.mjs --stage <name> --region <region>
@@ -111,7 +111,7 @@ It only reads. It uses IAM's policy simulator for the idle build roles and start
 - no role has AdministratorAccess, and no policy allows `*:*`;
 - every CoderHelm stack deploys through the deploy role, and none uses the CDK bootstrap roles;
 - the deploy role's trust names only CloudFormation;
-- the idle build roles have no deploy rights and no open window;
+- the idle build roles have no deploy rights and no open window (a window held by a build that is running right now passes, and the row names the build);
 - the deploy role is refused IAM users, roles without the boundary, the boundary itself and key deletion.
 
 ### Installs from before hardening

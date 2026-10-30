@@ -31,6 +31,15 @@ function healthy() {
     stacks: [{ StackName: "coderhelm-prod-api", RoleARN: DEPLOY, StackStatus: "UPDATE_COMPLETE" }, { StackName: "other-app", RoleARN: "arn:aws:iam::1:role/x", StackStatus: "CREATE_COMPLETE" }],
     allowedForBuilds: [],
     deployDecisions: {},
+    // CodeBuild projects by the role they run as. The installer's is named after the Launch Stack.
+    projects: {
+      "coderhelm-prod-update": `arn:aws:iam::${ACCOUNT}:role/coderhelm-prod-update-build`,
+      "my-launch-stack-installer": `arn:aws:iam::${ACCOUNT}:role/coderhelm-prod-installer-1a2b3c4d`,
+    },
+    builds: [
+      { project: "coderhelm-prod-update", id: "coderhelm-prod-update:0001", status: "SUCCEEDED" },
+      { project: "my-launch-stack-installer", id: "my-launch-stack-installer:0001", status: "SUCCEEDED" },
+    ],
   };
 }
 
@@ -55,6 +64,11 @@ if (k === "iam list-attached-role-policies") out({ AttachedPolicies: s.attached[
 if (k === "iam list-role-policies") out({ PolicyNames: Object.keys(s.inline[arg("--role-name")] || {}) });
 if (k === "iam get-role-policy") { const p = (s.inline[arg("--role-name")] || {})[arg("--policy-name")]; p ? out({ PolicyDocument: p }) : none(); }
 if (k === "cloudformation describe-stacks") out({ Stacks: s.stacks });
+if (k === "codebuild list-projects" && s.projectsDenied) { process.stderr.write("An error occurred (AccessDeniedException) when calling the ListProjects operation"); process.exit(254); }
+if (k === "codebuild list-projects") out({ projects: Object.keys(s.projects || {}).concat(["someone-elses-build"]) });
+if (k === "codebuild batch-get-projects") out({ projects: a.slice(a.indexOf("--names") + 1).filter((n) => !n.startsWith("--")).map((n) => ({ name: n, serviceRole: (s.projects || {})[n] || "arn:aws:iam::1:role/other" })) });
+if (k === "codebuild list-builds-for-project") out({ ids: (s.builds || []).filter((b) => b.project === arg("--project-name")).map((b) => b.id) });
+if (k === "codebuild batch-get-builds") { const ids = a.slice(a.indexOf("--ids") + 1).filter((n) => !n.startsWith("--")); out({ builds: (s.builds || []).filter((b) => ids.includes(b.id)).map((b) => ({ id: b.id, buildStatus: b.status })) }); }
 if (k === "iam simulate-principal-policy") {
   const who = arg("--policy-source-arn"), action = arg("--action-names");
   let d = "implicitDeny";
@@ -86,7 +100,7 @@ test("a hardened install passes every row, and the check only reads", () => {
   assert.match(row(out, "coderhelm-prod-update-build: no deploy rights while idle"), /^PASS/);
   assert.match(row(out, "coderhelm-prod-installer-1a2b3c4d: no deploy window while idle"), /^PASS/);
   assert.match(row(out, "refused IAM users"), /^PASS/);
-  for (const c of calls) assert.match(c, /^(sts get-caller-identity|ssm get-parameter|iam (list-|get-|simulate-principal-policy)|cloudformation describe-stacks)/, `read-only: ${c}`);
+  for (const c of calls) assert.match(c, /^(sts get-caller-identity|ssm get-parameter|iam (list-|get-|simulate-principal-policy)|cloudformation describe-stacks|codebuild (list-|batch-get-))/, `read-only: ${c}`);
   assert.doesNotMatch(out, /^FAIL/m, out);
   assert.equal(code, 0);
 });
@@ -114,6 +128,38 @@ test("an idle build role with deploy rights or an open window fails", () => {
   assert.equal(code, 1);
   assert.match(row(out, "coderhelm-prod-update-build: no deploy rights while idle"), /^FAIL.*iam:PassRole/);
   assert.match(row(out, "coderhelm-prod-update-build: no deploy window while idle"), /^FAIL.*nothing running/);
+});
+
+// 10/30: an update build started a minute before the check. It held its
+// window while it downloaded and synthesized the release, so no stack was
+// changing yet, and the check (which only looked at stacks) said "nothing
+// running". The window belongs to the running build: a PASS that says so.
+test("a window held by a running build passes with the build's id; the installer's project is found by its role", () => {
+  const s = healthy();
+  s.inline["coderhelm-prod-update-build"]["deploy-window"] = { Statement: [] };
+  s.inline["coderhelm-prod-installer-1a2b3c4d"] = { "deploy-window": { Statement: [] } };
+  s.builds.unshift(
+    { project: "coderhelm-prod-update", id: "coderhelm-prod-update:0002", status: "IN_PROGRESS" },
+    { project: "my-launch-stack-installer", id: "my-launch-stack-installer:0002", status: "IN_PROGRESS" },
+  );
+  // Every stack is settled: the build has not reached CloudFormation yet.
+  assert.ok(s.stacks.every((x) => !/_IN_PROGRESS$/.test(x.StackStatus)));
+  const { code, out, calls } = check(s);
+  assert.match(row(out, "coderhelm-prod-update-build: no deploy window while idle"), /^PASS.*window open for running build coderhelm-prod-update:0002/);
+  assert.match(row(out, "coderhelm-prod-installer-1a2b3c4d: no deploy window while idle"), /^PASS.*window open for running build my-launch-stack-installer:0002/);
+  assert.ok(!calls.some((c) => c.includes("someone-elses-build") && c.startsWith("codebuild list-builds")), "only the build roles' projects");
+  assert.doesNotMatch(out, /^FAIL/m, out);
+  assert.equal(code, 0);
+});
+
+test("a window with only finished builds, or with builds that can't be listed, fails", () => {
+  const s = healthy();
+  s.inline["coderhelm-prod-update-build"]["deploy-window"] = { Statement: [] };
+  s.stacks[0].StackStatus = "UPDATE_IN_PROGRESS";
+  let { out } = check(s);
+  assert.match(row(out, "coderhelm-prod-update-build: no deploy window while idle"), /^FAIL.*stack is changing, with no build running/);
+  ({ out } = check({ ...s, projectsDenied: true }));
+  assert.match(row(out, "coderhelm-prod-update-build: no deploy window while idle"), /^FAIL.*could not be listed.*AccessDenied/);
 });
 
 test("a deploy role that could make an IAM user fails", () => {

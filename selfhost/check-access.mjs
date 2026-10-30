@@ -1,14 +1,14 @@
 #!/usr/bin/env node
 // Checks, read-only, that a hardened CoderHelm install holds no broad standing
 // rights in its AWS account (docs/self-host/security.md). It only reads: IAM
-// roles and policies, CloudFormation stacks, one SSM parameter, and IAM's
-// policy simulator (iam:SimulatePrincipalPolicy evaluates policies; it changes
-// nothing and starts nothing).
+// roles and policies, CloudFormation stacks, CodeBuild projects and builds,
+// one SSM parameter, and IAM's policy simulator (iam:SimulatePrincipalPolicy
+// evaluates policies; it changes nothing and starts nothing).
 //
 //   AWS_PROFILE=<admin profile> node selfhost/check-access.mjs --stage prod --region us-east-1
 //
 // Prints a PASS/FAIL table and exits 1 when anything fails. Needs the AWS CLI
-// v2 and read access to IAM, CloudFormation and SSM.
+// v2 and read access to IAM, CloudFormation, CodeBuild and SSM.
 import { execFileSync } from "node:child_process";
 
 const args = Object.fromEntries(process.argv.slice(2).join(" ").split(/\s*--/).filter(Boolean).map((a) => a.trim().split(/\s+/)));
@@ -115,6 +115,33 @@ check("the CDK bootstrap roles are not used by CoderHelm", cdkUsed.length === 0,
 
 const builds = roles.filter((r) => r.RoleName === `${prefix}-update-build` || r.RoleName.startsWith(`${prefix}-installer-`));
 check("build roles found", builds.length > 0, builds.map((r) => r.RoleName).join(", "));
+
+// The builds running as each build role right now. A build holds its window
+// from its first minute, while it downloads, checks and synthesizes the
+// release, before any stack changes: so "running" is the build, not a stack.
+// The projects are found by the role they run as (the installer's project
+// is named after the Launch Stack, which can have any name).
+function runningBuilds() {
+  const byRole = new Map();
+  let names = [];
+  try {
+    names = aws("codebuild", "list-projects").projects ?? [];
+  } catch (e) {
+    return { error: e.message, byRole };
+  }
+  for (let i = 0; i < names.length; i += 100) {
+    for (const p of aws("codebuild", "batch-get-projects", "--names", ...names.slice(i, i + 100)).projects ?? []) {
+      const role = String(p.serviceRole ?? "").split("/").pop();
+      if (!builds.some((b) => b.RoleName === role)) continue;
+      // Newest first; one build runs at a time, so the latest few are enough.
+      const ids = aws("codebuild", "list-builds-for-project", "--project-name", p.name, "--sort-order", "DESCENDING", "--max-items", "10").ids ?? [];
+      const running = ids.length ? (aws("codebuild", "batch-get-builds", "--ids", ...ids).builds ?? []).filter((b) => b.buildStatus === "IN_PROGRESS").map((b) => b.id) : [];
+      byRole.set(role, [...(byRole.get(role) ?? []), ...running]);
+    }
+  }
+  return { error: null, byRole };
+}
+const running = runningBuilds();
 const deployActions = [
   ["cloudformation:CreateChangeSet", `arn:aws:cloudformation:${region}:${account}:stack/${prefix}-api/*`],
   ["cloudformation:UpdateStack", `arn:aws:cloudformation:${region}:${account}:stack/${prefix}-api/*`],
@@ -144,8 +171,14 @@ for (const r of builds) {
   } catch (e) {
     if (e.code !== "NoSuchEntity") throw e;
   }
-  const running = stacks.some((s) => /_IN_PROGRESS$/.test(s.StackStatus));
-  check(`${r.RoleName}: no deploy window while idle`, !window, window ? (running ? "a window is open and a stack is changing: an update is running, check again after it" : "a window is open with nothing running") : "none");
+  const live = running.byRole.get(r.RoleName) ?? [];
+  if (!window) check(`${r.RoleName}: no deploy window while idle`, true, "none");
+  else if (live.length) check(`${r.RoleName}: no deploy window while idle`, true, `window open for running build ${live.join(", ")}`);
+  else {
+    const changing = stacks.some((s) => /_IN_PROGRESS$/.test(s.StackStatus));
+    const why = running.error ? `a window is open; its builds could not be listed (${running.error})` : changing ? "a window is open and a stack is changing, with no build running as this role" : "a window is open with nothing running";
+    check(`${r.RoleName}: no deploy window while idle`, false, why);
+  }
 }
 
 // ── The deploy role itself (simulator) ───────────────────────────────────
