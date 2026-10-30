@@ -20,7 +20,8 @@ export const glob = (pattern: string, value: string, ci = false) => {
 export function conditionHolds(cond: Statement["Condition"], ctx: Record<string, string | string[] | undefined>): boolean {
   for (const [op, kv] of Object.entries(cond ?? {})) {
     for (const [key, want] of Object.entries(kv)) {
-      const have = ctx[key];
+      // Condition key names are not case-sensitive in IAM.
+      const have = ctx[key] ?? Object.entries(ctx).find(([k]) => k.toLowerCase() === key.toLowerCase())?.[1];
       const wants = list(want as string | string[]);
       const haves = list(have);
       const any = (f: (h: string, w: string) => boolean) => haves.some((h) => wants.some((w) => f(h, w)));
@@ -29,7 +30,10 @@ export function conditionHolds(cond: Statement["Condition"], ctx: Record<string,
         case "StringNotEquals": if (have !== undefined && any((h, w) => h === w)) return false; break;
         case "StringLike": if (!any((h, w) => glob(w, h))) return false; break;
         case "ArnLike": if (!any((h, w) => glob(w, h))) return false; break;
+        // Negated: true when the key is missing or matches none of the values.
+        case "ArnNotEquals": if (have !== undefined && any((h, w) => h === w)) return false; break;
         case "DateLessThan": if (!any((h, w) => Date.parse(h) < Date.parse(w))) return false; break;
+        case "ForAnyValue:StringEqualsIgnoreCase": if (!any((h, w) => h.toLowerCase() === w.toLowerCase())) return false; break;
         case "ForAllValues:StringEquals": if (!haves.every((h) => wants.includes(h))) return false; break;
         case "ForAllValues:StringLike": if (!haves.every((h) => wants.some((w) => glob(w, h)))) return false; break;
         default: throw new Error(`the evaluator doesn't know ${op}`);

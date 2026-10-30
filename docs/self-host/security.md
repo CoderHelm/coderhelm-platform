@@ -36,7 +36,7 @@ order: 11
 
 - Each function has its own role with only the tables, queues, keys and actions it uses.
 - The build sandbox runs a repository's own build scripts, which are untrusted: its CodeBuild role can only read and write one bucket of short-lived source tarballs and write its logs. No GitHub token, no tables, no KMS.
-- Roles in teams' AWS accounts are assumed only by name (`CoderHelmLogReader`, `CoderhelmReadOnly*`) and with an external id.
+- Roles in teams' AWS accounts are assumed only by name (`CoderHelmLogReader`, `CoderhelmReadOnly*`) and with an external id. When the data is in the install's own account, see the exception in [The permissions boundary](#the-permissions-boundary).
 - Installs made with the Launch Stack, and installs an admin hardened, hold no broad standing rights in your account: see [What the installer can do in your account](#what-the-installer-can-do-in-your-account).
 
 ## What the installer can do in your account
@@ -55,7 +55,16 @@ Nothing CoderHelm creates holds AdministratorAccess. Three pieces decide what Co
 - creating or changing a role without this boundary on it, and removing a boundary from any role;
 - changing, deleting or retagging the boundary itself, or changing the deploy role;
 - changing the stack that holds the boundary and the deploy role (`coderhelm-<name>-access`);
-- assuming any other role in this account, such as the CDK bootstrap roles or yours. Roles in other accounts can still be assumed by name and external id, which is how log reading works.
+- assuming any other role in this account, such as the CDK bootstrap roles, the deploy role, CoderHelm's own roles or yours. Roles in other accounts can still be assumed by name and external id, which is how log reading works.
+
+One exception covers an install in the same AWS account as the data it reads. There, the AWS connection uses the log reader role (`CoderHelmLogReader`, from CoderHelm's log reader template) and AWS data sources use the read-only role (`CoderhelmReadOnly`, from the data-source setup script). The boundary lets CoderHelm take on exactly these two roles in its own account, and only:
+
+- by their exact names: a role named differently (`CoderhelmReadOnly-2`, another case, a path) stays refused;
+- with `sts:AssumeRole`: no other STS action (session tags, source identity, web identity or SAML) on them;
+- by the gateway's and the worker's roles, which carry the tag `coderhelm:role` (`gateway` or `worker`). Any other role, CoderHelm's included, is refused. Only a CloudFormation deploy through the deploy role (or an admin) can set or remove that tag;
+- with the team's external id, which each role's trust policy requires. In the install's own account, anyone who can read the role can also read that id, so what limits these roles is their own permissions: read-only, as CoderHelm's template and setup script create them. `check-access.mjs` fails if either role holds more.
+
+Two limits remain. The log alerts sweep (the log analyzer) is not among these roles, so in a same-account install it can't read logs through `CoderHelmLogReader`. And the log reader can read every log group in the account, CoderHelm's own included.
 
 ### The deploy role
 
@@ -112,7 +121,19 @@ It only reads. It uses IAM's policy simulator for the idle build roles and start
 - every CoderHelm stack deploys through the deploy role, and none uses the CDK bootstrap roles;
 - the deploy role's trust names only CloudFormation;
 - the idle build roles have no deploy rights and no open window (a window held by a build that is running right now passes, and the row names the build);
-- the deploy role is refused IAM users, roles without the boundary, the boundary itself and key deletion.
+- the deploy role is refused IAM users, roles without the boundary, the boundary itself and key deletion;
+- the boundary refuses every role in the account except CoderHelm's two read roles, and those only with `sts:AssumeRole` and only by the gateway's and the worker's roles. The row names the exception when it is there, and says so when the boundary is from before it. Anything broader fails;
+- only the gateway's and the worker's roles carry `coderhelm:role`, only the deploy role may set that tag, and the policy simulator lets those two roles assume the two read roles and no other role in the account;
+- when `CoderHelmLogReader` or `CoderhelmReadOnly` exists in the account, its trust needs an external id and names only this account or the install's roles. It also has no managed policy, and nothing that allows `*`, assumes or passes roles, or writes IAM. The simulator also refuses it the install's secret and the deploy role.
+
+### When a release changes the boundary
+
+The boundary and the deploy role belong to an admin. An update never changes them, so a release that changes them says so in its notes. To pick up the change:
+
+- **Launch Stack installs.** Update the Launch Stack (the CloudFormation stack you launched, usually `coderhelm-<name>`) with the new release's template. In the CloudFormation console choose **Update stack**, then **Replace existing template**, with `https://coderhelm-public.s3.amazonaws.com/launch/<version>/coderhelm-launch.yaml`, and keep every parameter as it is. The update changes the boundary, the deploy role and the installer's pieces in place. It doesn't run the installer and doesn't touch CoderHelm's other stacks. Then update CoderHelm to the same release as usual.
+- **Installs hardened from the CLI.** Run `access harden` again with administrator credentials, on the new release. It redeploys `coderhelm-<name>-access` first.
+
+Afterwards `selfhost/check-access.mjs` should pass.
 
 ### Installs from before hardening
 

@@ -1,4 +1,5 @@
 import * as cdk from "aws-cdk-lib";
+import { RUNTIME_ROLE_TAG } from "./access";
 import * as lambda from "aws-cdk-lib/aws-lambda";
 import * as sqs from "aws-cdk-lib/aws-sqs";
 import * as dynamodb from "aws-cdk-lib/aws-dynamodb";
@@ -185,6 +186,11 @@ export class WorkerStack extends cdk.Stack {
         resources: ["arn:aws:iam::*:role/CoderHelmLogReader", "arn:aws:iam::*:role/CoderhelmReadOnly*"],
       }),
     );
+    // On a hardened install the boundary lets only the gateway's and the
+    // worker's roles take on these two roles in the install's own account
+    // (infra/lib/access.ts, ReadRolesHereOnlyGatewayAndWorker): this tag
+    // says which they are.
+    cdk.Tags.of(this.workerFunction.role!).add(RUNTIME_ROLE_TAG, "worker");
     // MCP servers: read their settings; write back a remote server's renewed
     // tokens, its status and the tool-call audit trail.
     props.mcpConfigsTable.grantReadWriteData(this.workerFunction);

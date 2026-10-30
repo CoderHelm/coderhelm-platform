@@ -12,7 +12,13 @@ with AWS's IAM policy simulator against the deploy role and its boundary.
    resource ARN and which condition keys they carry.
 3. Simulates every (action, ARN, context) with iam:SimulateCustomPolicy, the
    deploy policy as the identity policy and the boundary as its boundary.
-4. Writes infra/test/fixtures/deploy-role-sim.json, which
+4. Simulates what the boundary leaves the install's functions in its own
+   account (`runtime`): sts actions on CoderHelm's two read roles, on
+   lookalike names, the CDK bootstrap, the deploy role and the install's own
+   roles, by the gateway's and worker's roles (their coderhelm:role tag), by
+   another role and by an untagged one; and who may set that tag. The
+   identity policy allows all of it, so only the boundary decides.
+5. Writes infra/test/fixtures/deploy-role-sim.json, which
    infra/test/deploy-role-sim.test.ts checks the current policy against
    with a local evaluator (and the evaluator against these verdicts).
 
@@ -570,6 +576,47 @@ def simulate(session, deploy, boundary, rows):
 TYPES = set()
 
 
+STS_ACTIONS = ["sts:AssumeRole", "sts:AssumeRoleWithWebIdentity", "sts:AssumeRoleWithSAML", "sts:TagSession", "sts:SetSourceIdentity"]
+TAG_ACTIONS = ["iam:CreateRole", "iam:TagRole", "iam:UntagRole"]
+RUNTIME_TAG = "coderhelm:role"
+RUNTIME_IDENTITY = {"Version": "2012-10-17", "Statement": [{"Sid": "AllStsAndRoleTags", "Effect": "Allow", "Action": ["sts:*", *TAG_ACTIONS], "Resource": "*"}]}
+
+
+def runtime_rows(names):
+    """The boundary's own-account role rules: sts actions by each caller's role tag, and who may set that tag."""
+    callers = {"gateway": "gateway", "worker": "worker", "log-analyzer": "log-analyzer", "lookalike tag": "Gateway", "untagged": None}
+    roles = ["CoderHelmLogReader", "CoderhelmReadOnly", "CoderhelmReadOnly-2", "CoderHelmLogReaderAdmin", "team/CoderhelmReadOnly",
+             f"cdk-hnb659fds-cfn-exec-role-{ACCT}-{REG}", f"cdk-hnb659fds-deploy-role-{ACCT}-{REG}", names["deployRoleName"], f"{P}-ServiceRole-ab12cd34", f"{P}-update-build"]
+    rows = []
+    for r in roles:
+        for who, tag in callers.items():
+            ctx = {"aws:ResourceAccount": ACCT, **({f"aws:PrincipalTag/{RUNTIME_TAG}": tag} if tag else {})}
+            rows.append({"resource": f"arn:aws:iam::{ACCT}:role/{r}", "caller": who, "context": ctx, "names": STS_ACTIONS})
+    # Another account's log reader: unchanged by the own-account rules.
+    rows.append({"resource": "arn:aws:iam::999988887777:role/CoderHelmLogReader", "caller": "untagged", "context": {"aws:ResourceAccount": "999988887777"}, "names": STS_ACTIONS})
+    # The tag: only the deploy role sets or removes it.
+    other = f"arn:aws:iam::{ACCT}:role/{P}-update-build"
+    for who, principal in (("deploy role", names["deployRoleArn"]), ("another install role", other)):
+        for keys in ([RUNTIME_TAG], ["Coderhelm:Role"], ["other"]):
+            rows.append({"resource": f"arn:aws:iam::{ACCT}:role/{P}-ServiceRole-ab12cd34", "caller": who,
+                         "context": {"aws:PrincipalArn": principal, "aws:TagKeys": keys, "iam:PermissionsBoundary": names["boundaryArn"]}, "names": TAG_ACTIONS})
+    return rows
+
+
+def simulate_runtime(session, boundary, rows):
+    iam = session.client("iam")
+    I, B = json.dumps(RUNTIME_IDENTITY), json.dumps(boundary)
+    for r in rows:
+        ctx = [{"ContextKeyName": k, "ContextKeyValues": v if isinstance(v, list) else [v], "ContextKeyType": "stringList" if isinstance(v, list) else "string"} for k, v in r["context"].items()]
+        res = {}
+        for page in iam.get_paginator("simulate_custom_policy").paginate(
+                PolicyInputList=[I], PermissionsBoundaryPolicyInputList=[B], ActionNames=r.pop("names"), ResourceArns=[r["resource"]], ContextEntries=ctx):
+            for ev in page["EvaluationResults"]:
+                rr = ev.get("ResourceSpecificResults") or []
+                res[ev["EvalActionName"]] = rr[0]["EvalResourceDecision"] if rr else ev["EvalDecision"]
+        r["actions"] = dict(sorted(res.items()))
+
+
 def grouped(simulated):
     """Rows that share a resource and a context, as one row with each action's verdict."""
     g = {}
@@ -609,6 +656,8 @@ def main():
             simulated.append(v)
     simulated.sort(key=lambda x: (x["arn"], x["action"]))
     simulate(session, synth["deploy"], synth["boundary"], simulated)
+    runtime = runtime_rows(synth["names"])
+    simulate_runtime(session, synth["boundary"], runtime)
     collapsed = {}
     for u in unused:
         c = collapsed.setdefault((u["action"], u["reason"]), {"action": u["action"], "reason": u["reason"], "calls": set()})
@@ -619,17 +668,22 @@ def main():
         "policies": {"deploy": synth["deploy"], "boundary": synth["boundary"]},
         "types": sorted(types),
         "rows": grouped(simulated),
+        "runtime": {"identity": RUNTIME_IDENTITY, "rows": runtime},
         "notSimulated": sorted(({**c, "calls": sorted(c["calls"])} for c in collapsed.values()), key=lambda x: (x["action"], x["reason"])),
     }
     with open(args.out, "w") as f:
         # One row per line: a resource, the context its calls carry, and each action's verdict.
-        head = {k: v for k, v in fixture.items() if k not in ("rows", "notSimulated")}
+        head = {k: v for k, v in fixture.items() if k not in ("rows", "notSimulated", "runtime")}
         f.write(json.dumps(head, indent=1)[:-2] + ',\n "rows": [\n')
         f.write(",\n".join("  " + json.dumps(r, sort_keys=True) for r in fixture["rows"]))
-        f.write('\n ],\n "notSimulated": [\n')
+        f.write('\n ],\n "runtime": {\n  "identity": ' + json.dumps(RUNTIME_IDENTITY, sort_keys=True) + ',\n  "rows": [\n')
+        f.write(",\n".join("   " + json.dumps(r, sort_keys=True) for r in runtime))
+        f.write('\n  ]\n },\n "notSimulated": [\n')
         f.write(",\n".join("  " + json.dumps(r, sort_keys=True) for r in fixture["notSimulated"]))
         f.write("\n ]\n}\n")
     c = collections.Counter(r["simulator"] for r in simulated)
+    rc = collections.Counter(v for r in runtime for v in r["actions"].values())
+    print(f"runtime: {len(runtime)} (role, caller) rows: {dict(rc)}")
     print(f"{len(simulated)} (action, resource) pairs simulated: {dict(c)}; {len(fixture['notSimulated'])} registry calls not simulated")
 
 

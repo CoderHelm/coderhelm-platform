@@ -2,8 +2,9 @@
 // Checks, read-only, that a hardened CoderHelm install holds no broad standing
 // rights in its AWS account (docs/self-host/security.md). It only reads: IAM
 // roles and policies, CloudFormation stacks, CodeBuild projects and builds,
-// one SSM parameter, and IAM's policy simulator (iam:SimulatePrincipalPolicy
-// evaluates policies; it changes nothing and starts nothing).
+// one SSM parameter, and IAM's policy simulator
+// (iam:SimulatePrincipalPolicy and iam:SimulateCustomPolicy evaluate
+// policies; they change nothing and start nothing).
 //
 //   AWS_PROFILE=<admin profile> node selfhost/check-access.mjs --stage prod --region us-east-1
 //
@@ -73,8 +74,14 @@ check("CoderHelm roles found", roles.length > 0, `${roles.length} roles named ${
 const noBoundary = [];
 const admin = [];
 const star = [];
+// The tag that lets a role take on CoderHelm's read roles in this account
+// (infra/lib/access.ts RUNTIME_ROLE_TAG): only the gateway's and worker's.
+const RUNTIME_TAG = "coderhelm:role";
+const runtimeTagged = new Map();
 for (const r of roles) {
   const full = aws("iam", "get-role", "--role-name", r.RoleName).Role;
+  const tag = (full.Tags ?? []).find((t) => t.Key.toLowerCase() === RUNTIME_TAG);
+  if (tag) runtimeTagged.set(r.RoleName, tag.Value);
   if (full.PermissionsBoundary?.PermissionsBoundaryArn !== boundaryArn) noBoundary.push(`${r.RoleName} (${full.PermissionsBoundary?.PermissionsBoundaryArn ?? "none"})`);
   const attached = aws("iam", "list-attached-role-policies", "--role-name", r.RoleName).AttachedPolicies ?? [];
   for (const p of attached) {
@@ -207,6 +214,128 @@ try {
   check("the deploy role can still deploy CoderHelm", missing.length === 0, missing.join(", ") || `${allow.length} allowed`);
 } catch (e) {
   check("the deploy role (simulator)", false, e.message);
+}
+
+// ── Roles in this account: only CoderHelm's two read roles ───────────────
+//
+// An install in the same account as the data it reads takes on the log
+// reader (CoderHelmLogReader) and the data-source role (CoderhelmReadOnly)
+// here. The boundary allows exactly that: sts:AssumeRole on those two names,
+// by the gateway's and the worker's roles. Anything broader fails.
+
+const READ_ROLES = ["CoderHelmLogReader", "CoderhelmReadOnly"];
+const partition = region.startsWith("us-gov-") ? "aws-us-gov" : region.startsWith("cn-") ? "aws-cn" : "aws";
+const roleArn = (name) => `arn:${partition}:iam::${account}:role/${name}`;
+const ctxEntry = (k, v) => `ContextKeyName=${k},ContextKeyValues=${v},ContextKeyType=string`;
+try {
+  const pol = aws("iam", "get-policy", "--policy-arn", boundaryArn).Policy;
+  const boundaryDoc = decode(aws("iam", "get-policy-version", "--policy-arn", boundaryArn, "--version-id", pol.DefaultVersionId).PolicyVersion.Document);
+  // Every sts action allowed by the role's own policy: only the boundary decides.
+  const anySts = JSON.stringify({ Version: "2012-10-17", Statement: [{ Effect: "Allow", Action: "sts:*", Resource: "*" }] });
+  const decide = (action, resource, tag) =>
+    aws("iam", "simulate-custom-policy", "--policy-input-list", anySts, "--permissions-boundary-policy-input-list", JSON.stringify(boundaryDoc), "--action-names", action, "--resource-arns", resource,
+      "--context-entries", ctxEntry("aws:ResourceAccount", account), ...(tag ? [ctxEntry(`aws:PrincipalTag/${RUNTIME_TAG}`, tag)] : [])).EvaluationResults?.[0]?.EvalDecision;
+  // Who may set the tag: only the deploy role (an identity policy allowing the tag writes, so the boundary decides).
+  const anyTag = JSON.stringify({ Version: "2012-10-17", Statement: [{ Effect: "Allow", Action: ["iam:CreateRole", "iam:TagRole", "iam:UntagRole"], Resource: "*" }] });
+  const tagDecide = (action, key, principal) =>
+    aws("iam", "simulate-custom-policy", "--policy-input-list", anyTag, "--permissions-boundary-policy-input-list", JSON.stringify(boundaryDoc), "--action-names", action, "--resource-arns", roleArn(`${prefix}-check`),
+      "--context-entries", `ContextKeyName=aws:TagKeys,ContextKeyValues=${key},ContextKeyType=stringList`, ctxEntry("aws:PrincipalArn", principal), ctxEntry("iam:PermissionsBoundary", boundaryArn)).EvaluationResults?.[0]?.EvalDecision;
+  const broader = [];
+  const others = ["CoderhelmReadOnly-2", "CoderHelmLogReaderAdmin", "team/CoderhelmReadOnly", "coderhelmreadonly", `cdk-hnb659fds-deploy-role-${account}-${region}`, deployRole, `${prefix}-update-build`, "OrganizationAccountAccessRole"];
+  for (const tag of ["gateway", "worker"]) {
+    for (const r of others) for (const a of ["sts:AssumeRole", "sts:TagSession"]) if (decide(a, roleArn(r), tag) === "allowed") broader.push(`${tag}: ${a} on ${r}`);
+    for (const r of READ_ROLES) for (const a of ["sts:TagSession", "sts:SetSourceIdentity", "sts:AssumeRoleWithWebIdentity"]) if (decide(a, roleArn(r), tag) === "allowed") broader.push(`${tag}: ${a} on ${r}`);
+  }
+  for (const r of READ_ROLES) for (const tag of [null, "log-analyzer"]) if (decide("sts:AssumeRole", roleArn(r), tag) === "allowed") broader.push(`${tag ? `role tagged ${tag}` : "an untagged role"}: sts:AssumeRole on ${r}`);
+  const hasException = READ_ROLES.some((r) => ["gateway", "worker"].some((tag) => decide("sts:AssumeRole", roleArn(r), tag) === "allowed"));
+  if (hasException) {
+    for (const a of ["iam:TagRole", "iam:UntagRole", "iam:CreateRole"]) {
+      for (const key of [RUNTIME_TAG, "Coderhelm:Role"]) if (tagDecide(a, key, roleArn(`${prefix}-update-build`)) === "allowed") broader.push(`a role other than the deploy role: ${a} with tag ${key}`);
+    }
+  }
+  const exception = ["gateway", "worker"].flatMap((tag) => READ_ROLES.filter((r) => decide("sts:AssumeRole", roleArn(r), tag) === "allowed").map((r) => `${tag}: ${r}`));
+  const what = exception.length === 4 ? "expected exception: the gateway and worker may assume CoderHelmLogReader and CoderhelmReadOnly here" : exception.length ? `partial exception: ${exception.join(", ")}` : "no exception (a boundary from before it: same-account AWS data sources can't be read)";
+  check("the boundary: no other role in this account can be assumed (only CoderHelm's two read roles, by the gateway and worker)", broader.length === 0, broader.join(", ") || what);
+} catch (e) {
+  check("the boundary: no other role in this account can be assumed (only CoderHelm's two read roles, by the gateway and worker)", false, e.message);
+}
+
+// Only the gateway's and the worker's roles carry the tag, and they can
+// take on the read roles (the policy simulator, with the role's own tag).
+// The functions' roles, found in their stacks (GatewayServiceRole..., WorkerServiceRole...).
+const runtime = {};
+for (const [f, stack, id] of [["gateway", "api", "GatewayServiceRole"], ["worker", "worker", "WorkerServiceRole"]]) {
+  try {
+    const res = aws("cloudformation", "describe-stack-resources", "--stack-name", `${prefix}-${stack}`).StackResources ?? [];
+    runtime[f] = res.find((r) => r.ResourceType === "AWS::IAM::Role" && r.LogicalResourceId.startsWith(id))?.PhysicalResourceId ?? null;
+  } catch (e) {
+    runtime[f] = null;
+  }
+}
+const wrongTag = [...runtimeTagged].filter(([name, v]) => !(runtime[v] === name)).map(([name, v]) => `${name} (${RUNTIME_TAG}=${v})`);
+check(`only the gateway's and worker's roles carry ${RUNTIME_TAG}`, wrongTag.length === 0, wrongTag.join(", ") || [...runtimeTagged].map(([name, v]) => `${v}: ${name}`).join(", ") || "no role carries it yet (a release from before it)");
+try {
+  const notes = [];
+  const broader = [];
+  for (const [f, name] of Object.entries(runtime)) {
+    if (!name) continue;
+    const tag = runtimeTagged.get(name);
+    const sim = (r) => aws("iam", "simulate-principal-policy", "--policy-source-arn", roleArn(name), "--action-names", "sts:AssumeRole", "--resource-arns", roleArn(r),
+      "--context-entries", ctxEntry("aws:ResourceAccount", account), ...(tag ? [ctxEntry(`aws:PrincipalTag/${RUNTIME_TAG}`, tag)] : [])).EvaluationResults?.[0]?.EvalDecision;
+    notes.push(`${f}: ${READ_ROLES.map((r) => `${r} ${sim(r)}`).join(", ")}`);
+    for (const r of [`cdk-hnb659fds-deploy-role-${account}-${region}`, deployRole, "CoderhelmReadOnly-2"]) if (sim(r) === "allowed") broader.push(`${f}: sts:AssumeRole on ${r}`);
+  }
+  check("the gateway and worker roles: only the read roles in this account (policy simulator)", broader.length === 0, broader.join(", ") || notes.join("; "));
+} catch (e) {
+  check("the gateway and worker roles: only the read roles in this account (policy simulator)", false, e.message);
+}
+
+// CoderHelm's read roles in this account, when they exist: the boundary
+// lets the gateway and worker take them on, so they must only read. Their
+// trust needs an external id and names only this account or the install's
+// roles; no managed policies; nothing that assumes or passes roles, writes
+// IAM, or allows *; and the simulator refuses them the install's own secret
+// and the deploy role.
+{
+  const bad = [];
+  const seen = [];
+  for (const name of READ_ROLES) {
+    let role;
+    try {
+      role = aws("iam", "get-role", "--role-name", name).Role;
+    } catch (e) {
+      if (e.code === "NoSuchEntity") continue;
+      throw e;
+    }
+    seen.push(name);
+    for (const t of statements(role.AssumeRolePolicyDocument).filter((x) => x.Effect === "Allow")) {
+      const ext = Object.entries(t.Condition ?? {}).some(([op, kv]) => /^StringEquals$/i.test(op) && Object.keys(kv).some((k) => k.toLowerCase() === "sts:externalid"));
+      const who = [t.Principal?.AWS ?? []].flat();
+      const okWho = who.length > 0 && who.every((p) => p === `arn:${partition}:iam::${account}:root` || p === account || String(p).startsWith(`arn:${partition}:iam::${account}:role/${prefix}-`));
+      if (!ext) bad.push(`${name}: its trust has no sts:ExternalId condition`);
+      if (!okWho || t.Principal?.Service || t.Principal?.Federated || t.Principal === "*") bad.push(`${name}: its trust names ${JSON.stringify(t.Principal)}`);
+    }
+    for (const p of aws("iam", "list-attached-role-policies", "--role-name", name).AttachedPolicies ?? []) bad.push(`${name}: managed policy ${p.PolicyArn}`);
+    for (const pn of aws("iam", "list-role-policies", "--role-name", name).PolicyNames ?? []) {
+      const doc = aws("iam", "get-role-policy", "--role-name", name, "--policy-name", pn).PolicyDocument;
+      for (const st of statements(doc).filter((x) => x.Effect === "Allow")) {
+        const acts = [st.Action ?? []].flat().map((x) => String(x).toLowerCase());
+        if (st.NotAction || acts.some((x) => x === "*" || x.endsWith(":*") && !/^(logs|cloudwatch):\*$/.test(x) || x.startsWith("sts:assumerole") || x === "iam:passrole" || /^iam:(create|put|attach|update|delete|add|tag|untag|set|pass)/.test(x))) {
+          bad.push(`${name}: inline ${pn} allows ${st.NotAction ? `NotAction ${JSON.stringify(st.NotAction)}` : acts.join(",")}`);
+        }
+      }
+    }
+    for (const [action, resource] of [
+      ["sts:AssumeRole", deployRoleArn],
+      ["iam:PassRole", deployRoleArn],
+      ["secretsmanager:GetSecretValue", `arn:${partition}:secretsmanager:${region}:${account}:secret:coderhelm/${stage}/secrets-AbCdEf`],
+      ["iam:CreateRole", roleArn("check")],
+    ]) {
+      const d = aws("iam", "simulate-principal-policy", "--policy-source-arn", role.Arn, "--action-names", action, "--resource-arns", resource).EvaluationResults?.[0]?.EvalDecision;
+      if (d === "allowed") bad.push(`${name}: ${action} on ${resource} (policy simulator)`);
+    }
+  }
+  check("CoderHelm's read roles in this account only read (trust needs the external id)", bad.length === 0, bad.join("; ") || (seen.length ? `${seen.join(", ")}: external id required, read-only` : "none in this account"));
 }
 
 // ── The table ────────────────────────────────────────────────────────────
