@@ -55,7 +55,11 @@ pub(crate) fn valid_login(login: &str) -> bool {
         && login.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
 }
 
-async fn gh_get(state: &AppState, token: &str, url: &str) -> Result<(u16, Value), String> {
+pub(crate) async fn gh_get(
+    state: &AppState,
+    token: &str,
+    url: &str,
+) -> Result<(u16, Value), String> {
     let resp = state
         .http
         .get(url)

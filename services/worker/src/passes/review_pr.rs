@@ -920,6 +920,7 @@ async fn run_once(
             &comment,
             standing.as_ref(),
             last_reply.as_deref(),
+            msg.outstanding_work.as_deref(),
             &mut usage,
         )
         .await;
@@ -2803,6 +2804,7 @@ pub async fn review_for_run(
         attempt: 0,
         wait_secs: 0,
         reconcile_note: None,
+        outstanding_work: None,
     };
     let mut reviewed_head = head_sha.to_string();
     let job = LiveJob::start();
@@ -3577,6 +3579,7 @@ async fn classify_ask(
     comment: &str,
     standing: Option<&super::review_verdict::StandingReview>,
     last_reply: Option<&str>,
+    outstanding: Option<&str>,
     usage: &mut TokenUsage,
 ) -> review_agent::AskKind {
     let standing_line = match standing {
@@ -3595,7 +3598,7 @@ async fn classify_ask(
         &provider.client(),
         &state.config.light_model_id,
         review_agent::ASK_SYSTEM,
-        &review_agent::ask_prompt(comment, &standing_line, last_reply),
+        &review_agent::ask_prompt(comment, &standing_line, last_reply, outstanding),
         &review_agent::ask_schema(),
         true,
         "low",
@@ -3925,6 +3928,7 @@ mod superseded_tests {
             attempt: 0,
             wait_secs: 0,
             reconcile_note: None,
+            outstanding_work: None,
         }
     }
 
@@ -4261,6 +4265,7 @@ mod failure_tests {
             attempt: 0,
             wait_secs: 0,
             reconcile_note: None,
+            outstanding_work: None,
         }
     }
 

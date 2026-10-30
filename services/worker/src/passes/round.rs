@@ -162,6 +162,42 @@ pub(crate) async fn finish_incomplete(
     inc
 }
 
+/// A round whose work is done but held from landing by CoderHelm's checks:
+/// on the run record (`round_incomplete`, held), with its WIP branch, where
+/// it started and what it was asked, so a mention on the pull request or
+/// Resume picks it up first (common::held_work). The caller completes the
+/// run as usual; the record stays until the work lands.
+pub(crate) async fn hold(
+    state: &WorkerState,
+    team_id: &str,
+    run_id: &str,
+    round: &Round,
+    reason: &str,
+) {
+    let now = chrono::Utc::now().to_rfc3339();
+    let inc = Incomplete::held(round, reason, &now);
+    let res = state
+        .dynamo
+        .update_item()
+        .table_name(&state.config.runs_table_name)
+        .key("team_id", attr_s(team_id))
+        .key("run_id", attr_s(run_id))
+        .update_expression("SET #inc = :inc, updated_at = :t")
+        .condition_expression(common::run_status::not_ended("#s"))
+        .expression_attribute_names("#s", "status")
+        .expression_attribute_names("#inc", run_round::INCOMPLETE_FIELD)
+        .expression_attribute_values(":inc", inc.to_attr())
+        .expression_attribute_values(":t", attr_s(&now))
+        .ended_values()
+        .send()
+        .await;
+    if let Err(e) = res {
+        if !common::run_fail::is_condition_failed(&e) {
+            warn!(run_id, error = %e, "Could not record the held round");
+        }
+    }
+}
+
 /// The write: completed, with the round that didn't finish, never over a
 /// run a person ended.
 async fn write_incomplete(

@@ -615,6 +615,10 @@ pub(crate) struct ReviewerAsk {
     /// `review`, `review again`, or the bare mention): a fast path that
     /// skips the worker's model classification.
     pub rereview: bool,
+    /// The mention alone, with no words. On CoderHelm's own PR with work
+    /// still held or unfinished it resumes that work; otherwise it is the
+    /// re-review command (see `common::held_work`).
+    pub bare: bool,
     /// Anything else, as written. What it asks for (another look, the
     /// approval, a question, a fix) is decided by the worker's model, never
     /// by keywords here.
@@ -697,8 +701,13 @@ pub(crate) fn parse_reviewer_ask(body: &str) -> Option<ReviewerAsk> {
         cleaned = cleaned[SLASH.len()..].trim().to_string();
     }
     let rereview = is_rereview_command(&cleaned);
+    let bare = cleaned
+        .trim()
+        .trim_matches(|c: char| c.is_ascii_punctuation() || c.is_whitespace())
+        .is_empty();
     Some(ReviewerAsk {
         rereview,
+        bare,
         question: if rereview { None } else { Some(cleaned) },
     })
 }
@@ -1254,6 +1263,45 @@ async fn handle_issue_comment(
     if payload["issue"]["pull_request"].is_object() {
         let pr_user = payload["issue"]["user"]["login"].as_str().unwrap_or("");
         let bot_pr = pr_user.contains("coderhelm") && !commenter.contains("coderhelm");
+        // Work a round left held or unfinished on CoderHelm's own PR comes
+        // first (common::held_work): a bare mention resumes it, and words
+        // are read by the model told about it. Only an explicit review
+        // command skips the lookup.
+        let outstanding = match &ask {
+            Some(a) if bot_pr && !(a.rereview && !a.bare) => {
+                let repo = &payload["repository"];
+                outstanding_work(
+                    state,
+                    team_id,
+                    installation_id,
+                    repo["owner"]["login"].as_str().unwrap_or(""),
+                    repo["name"].as_str().unwrap_or(""),
+                    payload["issue"]["number"].as_u64().unwrap_or(0),
+                )
+                .await
+            }
+            _ => None,
+        };
+        if let (true, Some(a)) = (bot_pr, &ask) {
+            let route = common::held_work::mention_route(
+                a.bare,
+                a.rereview && !a.bare,
+                outstanding.is_some(),
+            );
+            info!(
+                issue = payload["issue"]["number"].as_u64().unwrap_or(0),
+                commenter,
+                route = ?route,
+                outstanding = outstanding.is_some(),
+                "Mention on CoderHelm's own PR classified"
+            );
+            if let (common::held_work::MentionRoute::ResumeWork, Some((run_id, work))) =
+                (route, &outstanding)
+            {
+                return resume_outstanding(state, payload, installation_id, team_id, run_id, work)
+                    .await;
+            }
+        }
         let review_takes_ask = if bot_pr && ask.is_some() {
             let repo = &payload["repository"];
             let cfg = load_review_config(
@@ -1402,6 +1450,7 @@ async fn handle_issue_comment(
                     dedup_key: format!("reply#{comment_id}"),
                     reply_to_comment_id: None,
                     requested_by: commenter.to_string(),
+                    outstanding_work: outstanding.as_ref().map(|(_, w)| w.note()),
                     ..Default::default()
                 });
                 return send_to_queue(state, &state.config.ticket_queue_url, &message).await;
@@ -1472,6 +1521,121 @@ async fn handle_issue_comment(
     }
 
     send_to_queue(state, &state.config.ticket_queue_url, &message).await
+}
+
+/// The run's work on its own PR that a round left held or unfinished
+/// (common::held_work): the unfinished round on the run record, else a WIP
+/// branch ahead of the PR (a round held before the record kept held
+/// rounds). Only for a run that finished with its PR open; while a run
+/// works, its WIP branch is the round in progress.
+async fn outstanding_work(
+    state: &AppState,
+    team_id: &str,
+    installation_id: u64,
+    owner: &str,
+    name: &str,
+    pr_number: u64,
+) -> Option<(String, common::held_work::Outstanding)> {
+    if owner.is_empty() || name.is_empty() || pr_number == 0 {
+        return None;
+    }
+    let item = lookup_run_item_by_pr(state, team_id, owner, name, pr_number).await?;
+    let status = item.get("status").and_then(|v| v.as_s().ok())?;
+    if !common::run_round::may_resume(status, pr_number, true) {
+        return None;
+    }
+    let run_id = common::paged::run_id_of(&item)?;
+    if let Some(work) = common::run_round::Incomplete::from_item(&item)
+        .as_ref()
+        .and_then(common::held_work::Outstanding::from_incomplete)
+    {
+        return Some((run_id, work));
+    }
+    let branch = item.get("branch").and_then(|v| v.as_s().ok())?;
+    if branch.is_empty() {
+        return None;
+    }
+    let wip = common::run_round::wip_branch(branch);
+    let token = match crate::auth::github_app::get_installation_token(state, installation_id).await
+    {
+        Ok(t) => t,
+        Err(e) => {
+            warn!(pr_number, "Could not read the PR's WIP branch: {e}");
+            return None;
+        }
+    };
+    let url = format!("https://api.github.com/repos/{owner}/{name}/compare/{branch}...{wip}");
+    match super::merge_control::gh_get(state, &token, &url).await {
+        Ok((200, compare)) => {
+            common::held_work::Outstanding::from_wip_compare(&wip, &compare).map(|w| (run_id, w))
+        }
+        // No WIP branch: nothing held.
+        Ok(_) => None,
+        Err(e) => {
+            warn!(pr_number, "Could not read the PR's WIP branch: {e}");
+            None
+        }
+    }
+}
+
+/// A mention on CoderHelm's own PR while a round's work waits unlanded:
+/// the fix loop resumes that round (checks again on its WIP, then lands it)
+/// and tells the person what it is doing, through the channel the requester
+/// allowed. Never a review.
+async fn resume_outstanding(
+    state: &AppState,
+    payload: &Value,
+    installation_id: u64,
+    team_id: &str,
+    run_id: &str,
+    work: &common::held_work::Outstanding,
+) -> Result<StatusCode, StatusCode> {
+    let repo = &payload["repository"];
+    let owner = repo["owner"]["login"].as_str().unwrap_or("");
+    let name = repo["name"].as_str().unwrap_or("");
+    let pr_number = payload["issue"]["number"].as_u64().unwrap_or(0);
+    let commenter = payload["comment"]["user"]["login"].as_str().unwrap_or("");
+    let body = payload["comment"]["body"].as_str().unwrap_or("");
+    if check_run_budget(state, team_id).await.is_some() {
+        info!(
+            team_id,
+            pr_number, "Held work not resumed — token limit reached"
+        );
+        return Ok(StatusCode::OK);
+    }
+    write_run_event(
+        state,
+        run_id,
+        "pr_comment",
+        &serde_json::json!({
+            "commenter": commenter,
+            "body": body,
+            "pr_number": pr_number,
+        }),
+    )
+    .await;
+    info!(
+        pr_number,
+        run_id,
+        commenter,
+        held = work.held,
+        wip_branch = %work.wip_branch,
+        "Mention on CoderHelm's PR → resuming its outstanding round"
+    );
+    let message = WorkerMessage::Feedback(FeedbackMessage {
+        team_id: team_id.to_string(),
+        installation_id,
+        run_id: run_id.to_string(),
+        repo_owner: owner.to_string(),
+        repo_name: name.to_string(),
+        pr_number,
+        review_id: 0,
+        review_body: body.to_string(),
+        comments: vec![],
+        trigger_author: commenter.to_string(),
+        ..Default::default()
+    });
+    send_to_queue(state, &state.config.feedback_queue_url, &message).await
 }
 
 /// The job key for a press of GitHub's "Re-request review": GitHub's id for
@@ -4155,6 +4319,15 @@ mod reviewer_ask_tests {
     fn rereview() -> Option<ReviewerAsk> {
         Some(ReviewerAsk {
             rereview: true,
+            bare: false,
+            question: None,
+        })
+    }
+
+    fn bare() -> Option<ReviewerAsk> {
+        Some(ReviewerAsk {
+            rereview: true,
+            bare: true,
             question: None,
         })
     }
@@ -4162,6 +4335,7 @@ mod reviewer_ask_tests {
     fn ask(q: &str) -> Option<ReviewerAsk> {
         Some(ReviewerAsk {
             rereview: false,
+            bare: false,
             question: Some(q.into()),
         })
     }
@@ -4173,7 +4347,23 @@ mod reviewer_ask_tests {
         assert_eq!(parse_reviewer_ask("@coderhelm review again"), rereview());
         assert_eq!(parse_reviewer_ask("@coderhelm re review!"), rereview());
         assert_eq!(parse_reviewer_ask("@coderhelm[bot] re-review"), rereview());
-        assert_eq!(parse_reviewer_ask("@CoderHelm"), rereview());
+        assert_eq!(parse_reviewer_ask("@CoderHelm"), bare());
+    }
+
+    /// The mention alone is told apart from the review command: on
+    /// CoderHelm's own PR with held work it resumes that work.
+    #[test]
+    fn a_bare_mention_is_not_the_review_command() {
+        assert_eq!(parse_reviewer_ask("@coderhelm"), bare());
+        assert_eq!(parse_reviewer_ask("  @CoderHelm !  "), bare());
+        assert_eq!(parse_reviewer_ask("/coderhelm"), bare());
+        assert_eq!(parse_reviewer_ask("@coderhelm review"), rereview());
+        // Words are passed on to be read for what they mean.
+        assert_eq!(parse_reviewer_ask("@coderhelm do it"), ask("do it"));
+        assert_eq!(
+            parse_reviewer_ask("@coderhelm please redo the held changes"),
+            ask("please redo the held changes")
+        );
     }
 
     /// Only the exact command is a fast path; what any other ask means is
@@ -4240,6 +4430,7 @@ mod reviewer_ask_tests {
             parse_reviewer_ask("@CoderHelm why is `refund` unsafe here?"),
             Some(ReviewerAsk {
                 rereview: false,
+                bare: false,
                 question: Some("why is `refund` unsafe here?".into()),
             })
         );
@@ -4257,6 +4448,7 @@ mod reviewer_ask_tests {
             parse_reviewer_ask("@CoderHelm ¿por qué? 🚀"),
             Some(ReviewerAsk {
                 rereview: false,
+                bare: false,
                 question: Some("¿por qué? 🚀".into()),
             })
         );

@@ -2255,6 +2255,10 @@ pub enum AskKind {
     Question,
     /// Asks CoderHelm to change the code.
     FixRequest,
+    /// Asks CoderHelm to carry on with work it already started or was asked
+    /// for and hasn't landed ("do it", "redo", "continue", "apply them",
+    /// "land the held changes").
+    ContinueWork,
     /// Anything else (thanks, chatter).
     Other,
 }
@@ -2285,7 +2289,12 @@ pub enum AskRoute {
 pub fn route_ask(kind: AskKind, self_authored: bool) -> AskRoute {
     if kind.wants_formal_review() {
         AskRoute::FormalReview
-    } else if self_authored && matches!(kind, AskKind::FixRequest | AskKind::Other) {
+    } else if self_authored
+        && matches!(
+            kind,
+            AskKind::FixRequest | AskKind::ContinueWork | AskKind::Other
+        )
+    {
         AskRoute::FixLoop
     } else {
         AskRoute::Reply
@@ -2298,15 +2307,19 @@ pub const ASK_SYSTEM: &str = "You classify a comment a person wrote to CoderHelm
      reviewed again; \"approve_request\" when they say the work is done or addressed and ask \
      for the approval or for another look (\"can you approve\", \"ready now?\", \"all \
      addressed, please take another look\"); \"question\" when they ask something about the \
-     code or the review; \"fix_request\" when they ask CoderHelm to change the code; \"other\" \
-     for anything else. Judge the meaning, in the context given.";
+     code or the review; \"fix_request\" when they ask CoderHelm to change the code; \
+     \"continue_work\" when they ask CoderHelm to carry on with, redo, finish, apply or land work \
+     it already started or was asked for (\"do it\", \"redo\", \"continue\", \"go ahead and \
+     apply them\"), above all when outstanding work is listed; \"other\" for anything else. \
+     When outstanding work is listed, only an explicit ask for a review is \"re_review\". Judge \
+     the meaning, in the context given.";
 
 /// The JSON schema of the ask classifier's answer.
 pub fn ask_schema() -> serde_json::Value {
     json!({
         "type": "object",
         "properties": {
-            "kind": {"type": "string", "enum": ["re_review", "approve_request", "question", "fix_request", "other"]}
+            "kind": {"type": "string", "enum": ["re_review", "approve_request", "question", "fix_request", "continue_work", "other"]}
         },
         "required": ["kind"],
         "additionalProperties": false
@@ -2314,8 +2327,19 @@ pub fn ask_schema() -> serde_json::Value {
 }
 
 /// The user message for the ask classifier.
-pub fn ask_prompt(comment: &str, standing: &str, last_reply: Option<&str>) -> String {
+pub fn ask_prompt(
+    comment: &str,
+    standing: &str,
+    last_reply: Option<&str>,
+    outstanding: Option<&str>,
+) -> String {
     let mut s = format!("## CoderHelm's formal review standing on the PR\n{standing}\n");
+    if let Some(w) = outstanding.filter(|w| !w.trim().is_empty()) {
+        s.push_str(&format!(
+            "\n## Outstanding work on the PR\n{}\n",
+            common::truncate_str(w.trim(), 1000)
+        ));
+    }
     if let Some(r) = last_reply {
         s.push_str(&format!(
             "\n## CoderHelm's last reply on the PR\n{}\n",
@@ -2336,6 +2360,7 @@ pub fn parse_ask(v: &serde_json::Value) -> AskKind {
         "re_review" => AskKind::ReReview,
         "approve_request" => AskKind::ApproveRequest,
         "fix_request" => AskKind::FixRequest,
+        "continue_work" => AskKind::ContinueWork,
         "other" => AskKind::Other,
         _ => AskKind::Question,
     }
@@ -2445,6 +2470,29 @@ mod tests {
         assert_eq!(route_ask(AskKind::FixRequest, true), AskRoute::FixLoop);
         assert_eq!(route_ask(AskKind::Other, true), AskRoute::FixLoop);
         assert_eq!(route_ask(AskKind::FixRequest, false), AskRoute::Reply);
+        // "Do it", "redo", "continue": the fix loop on CoderHelm's own PR,
+        // which resumes the held round first.
+        assert_eq!(route_ask(AskKind::ContinueWork, true), AskRoute::FixLoop);
+        assert_eq!(route_ask(AskKind::ContinueWork, false), AskRoute::Reply);
+        assert_eq!(
+            parse_ask(&json!({"kind": "continue_work"})),
+            AskKind::ContinueWork
+        );
+        assert!(ask_schema().to_string().contains("continue_work"));
+    }
+
+    #[test]
+    fn the_ask_classifier_is_told_about_outstanding_work() {
+        let p = ask_prompt(
+            "do it",
+            "APPROVE on abc1234.",
+            None,
+            Some("Held: 5 changes."),
+        );
+        assert!(p.contains("## Outstanding work on the PR\nHeld: 5 changes."));
+        let none = ask_prompt("do it", "APPROVE on abc1234.", None, None);
+        assert!(!none.contains("Outstanding work"));
+        assert!(ASK_SYSTEM.contains("only an explicit ask for a review is"));
     }
 
     #[test]

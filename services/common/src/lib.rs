@@ -88,6 +88,9 @@ pub mod paged;
 pub mod pr_outcome;
 pub mod run_prs;
 // review_stats: time-ordered review records for analytics
+/// Work CoderHelm started on its own pull request and hasn't landed, and
+/// what a person's mention there does about it.
+pub mod held_work;
 pub mod jira_text;
 /// Anthropic API or Amazon Bedrock, and Bedrock's model ids.
 pub mod model_provider;

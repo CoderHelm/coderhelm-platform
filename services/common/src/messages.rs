@@ -686,6 +686,12 @@ pub struct ReviewMessage {
     /// standing formal verdict doesn't match; the review checks it.
     #[serde(default)]
     pub reconcile_note: Option<String>,
+    /// On CoderHelm's own PR: work a fix round left held or unfinished
+    /// (`common::held_work::Outstanding::note`). The model that reads the
+    /// person's comment is told, so an ask to continue resumes that work
+    /// instead of starting a review.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outstanding_work: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Default)]

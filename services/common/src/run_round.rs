@@ -344,6 +344,9 @@ pub struct Incomplete {
     pub wip_branch: String,
     /// The pull request's head when the round started.
     pub base_sha: String,
+    /// The round finished its work but CoderHelm's checks held it from
+    /// landing; the work waits on `wip_branch`, whole.
+    pub held: bool,
 }
 
 impl Incomplete {
@@ -360,12 +363,25 @@ impl Incomplete {
             scoped: round.scoped,
             wip_branch: round.wip_branch.clone(),
             base_sha: round.base_sha.clone(),
+            held: false,
+        }
+    }
+
+    /// The round, finished but held from landing for `reason`.
+    pub fn held(round: &Round, reason: &str, now: &str) -> Incomplete {
+        Incomplete {
+            held: true,
+            ..Incomplete::of(round, reason, now)
         }
     }
 
     /// The sentence a person reads.
     pub fn status_line(&self) -> String {
-        status_line(&self.reason)
+        if self.held {
+            held_status_line(&self.reason)
+        } else {
+            status_line(&self.reason)
+        }
     }
 
     pub fn to_attr(&self) -> AttributeValue {
@@ -398,6 +414,7 @@ impl Incomplete {
             ("scoped".to_string(), AttributeValue::Bool(self.scoped)),
             ("wip_branch".to_string(), s(&self.wip_branch)),
             ("base_sha".to_string(), s(&self.base_sha)),
+            ("held".to_string(), AttributeValue::Bool(self.held)),
         ]))
     }
 
@@ -434,6 +451,11 @@ impl Incomplete {
                 .unwrap_or(true),
             wip_branch: get_s(m, "wip_branch"),
             base_sha: get_s(m, "base_sha"),
+            held: m
+                .get("held")
+                .and_then(|v| v.as_bool().ok())
+                .copied()
+                .unwrap_or(false),
         })
     }
 
@@ -467,6 +489,17 @@ pub fn status_line(reason: &str) -> String {
         "Pull request open; the last fix round didn't finish.".to_string()
     } else {
         format!("Pull request open; the last fix round didn't finish: {reason}.")
+    }
+}
+
+/// How a run reads when its last round's changes are done but held from
+/// landing by CoderHelm's checks.
+pub fn held_status_line(reason: &str) -> String {
+    let reason = reason.trim().trim_end_matches('.');
+    if reason.is_empty() {
+        "Pull request open; the last fix round's changes are held, not landed.".to_string()
+    } else {
+        format!("Pull request open; the last fix round's changes are held, not landed: {reason}.")
     }
 }
 
