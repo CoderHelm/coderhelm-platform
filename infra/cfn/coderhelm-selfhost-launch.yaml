@@ -1032,7 +1032,9 @@ Resources:
                     "apigateway:POST",
                     "apigateway:PUT",
                     "apigateway:PATCH",
-                    "apigateway:DELETE"
+                    "apigateway:DELETE",
+                    "apigateway:TagResource",
+                    "apigateway:UntagResource"
                   ],
                   "Resource": [
                     {
@@ -1043,6 +1045,12 @@ Resources:
                     },
                     {
                       "Fn::Sub": "arn:${AWS::Partition}:apigateway:${AWS::Region}::/tags/*"
+                    },
+                    {
+                      "Fn::Sub": "arn:${AWS::Partition}:apigateway:${AWS::Region}::/domainnames"
+                    },
+                    {
+                      "Fn::Sub": "arn:${AWS::Partition}:apigateway:${AWS::Region}::/domainnames/*"
                     }
                   ]
                 },

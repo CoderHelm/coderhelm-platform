@@ -18,6 +18,7 @@ import { CoderhelmConfig, loadConfigFile, resolveConfig, ResolvedConfig } from "
 import { API_PATHS, STREAM_PATH, runtimeConfigScript } from "../lib/web-stack";
 import { releaseCheckBuildSpec, updateBuildSpec } from "../lib/updates-stack";
 import { CHECK_VERSION, COSIGN_LINUX_AMD64_SHA256, VERIFY_SUMS, verifyTagCommands } from "../lib/release-verify";
+import { accessNames, deployPolicy } from "../lib/access";
 
 const INFRA = path.join(__dirname, "..", "..");
 
@@ -921,4 +922,48 @@ test("hosted: the weekly summary stays on for everyone, and the mail relay sends
     assert.ok(JSON.stringify(relay[0].Resource).includes("identity/notify.coderhelm.com"), stack);
     assert.ok(!JSON.stringify(relay[0].Resource).includes("identity/coderhelm.com"), stack);
   }
+});
+
+// The hardened deploy role (infra/lib/access.ts) is all CloudFormation has.
+// Every resource a self-host install creates must be one it may create, and
+// tag where the resource carries tags: a missing tag action fails the
+// install mid-way (an HTTP API stage did, on a real install).
+const SERVICE_OF: Record<string, string> = {
+  "AWS::ApiGatewayV2": "apigateway", "AWS::CertificateManager": "acm", "AWS::CloudFront": "cloudfront", "AWS::CloudWatch": "cloudwatch",
+  "AWS::CodeBuild": "codebuild", "AWS::Cognito": "cognito-idp", "AWS::DynamoDB": "dynamodb", "AWS::Events": "events", "AWS::IAM": "iam",
+  "AWS::KMS": "kms", "AWS::Lambda": "lambda", "AWS::Logs": "logs", "AWS::Route53": "route53", "AWS::S3": "s3", "AWS::SES": "ses",
+  "AWS::SNS": "sns", "AWS::SQS": "sqs", "AWS::SSM": "ssm", "AWS::Scheduler": "scheduler",
+};
+// Resource types that take tags (stack tags reach them).
+const TAGGABLE = new Set([
+  "AWS::ApiGatewayV2::Api", "AWS::ApiGatewayV2::Stage", "AWS::ApiGatewayV2::DomainName", "AWS::CertificateManager::Certificate",
+  "AWS::CloudFront::Distribution", "AWS::CodeBuild::Project", "AWS::Cognito::UserPool", "AWS::DynamoDB::Table", "AWS::IAM::Role",
+  "AWS::IAM::ManagedPolicy", "AWS::KMS::Key", "AWS::Lambda::Function", "AWS::Logs::LogGroup", "AWS::S3::Bucket", "AWS::SNS::Topic",
+  "AWS::SQS::Queue", "AWS::SSM::Parameter", "AWS::Events::Rule", "AWS::SES::ConfigurationSet", "AWS::SES::EmailIdentity",
+]);
+test("the deploy role may create and tag every resource a self-host install creates", () => {
+  const n = accessNames({ account: "111122223333", region: "eu-west-1", prefix: "coderhelm-prod", suffix: "-111122223333", secretName: "coderhelm-prod" });
+  const allowed = deployPolicy(n).Statement.filter((st) => st.Effect === "Allow").flatMap((st) => [st.Action ?? []].flat());
+  const may = (svc: string, re: RegExp) => allowed.some((a) => a === `${svc}:*` || (a.startsWith(`${svc}:`) && re.test(a.slice(svc.length + 1))));
+  const templates = [
+    synth(selfHost()),
+    synth(selfHost({ region: "eu-west-1", domain: { hostname: "helm.example.org", hostedZone: "example.org" }, email: { from: "helm@example.org" } }), {
+      ...zoneContext("111122223333", "eu-west-1", "example.org"),
+      ...zoneContext("111122223333", "us-east-1", "example.org"),
+    }),
+  ].flatMap((t) => Object.values(t));
+  const gaps = new Set<string>();
+  for (const t of templates) {
+    for (const r of Object.values(t.toJSON().Resources ?? {}) as any[]) {
+      const type: string = r.Type;
+      if (type.startsWith("Custom::") || type.startsWith("AWS::CloudFormation::") || type === "AWS::CDK::Metadata") continue;
+      const svc = SERVICE_OF[type.split("::").slice(0, 2).join("::")];
+      if (!svc) { gaps.add(`${type}: no service mapped (add it to SERVICE_OF and the deploy role)`); continue; }
+      if (!may(svc, /^(Create|Put|Post|POST|Request|Change|\*)/)) gaps.add(`${type}: ${svc} create`);
+      // The installer tags each stack, and CloudFormation passes stack tags
+      // to every resource that takes them, Tags property or not.
+      if (TAGGABLE.has(type) && !may(svc, /Tag/)) gaps.add(`${type}: ${svc} tagging`);
+    }
+  }
+  assert.deepEqual([...gaps].sort(), []);
 });

@@ -348,8 +348,13 @@ export function deployPolicy(n: AccessNames): PolicyDocument {
     {
       Sid: "HttpApi",
       Effect: "Allow",
-      Action: ["apigateway:GET", "apigateway:POST", "apigateway:PUT", "apigateway:PATCH", "apigateway:DELETE"],
-      Resource: [`arn:${n.partition}:apigateway:${n.region}::/apis`, `arn:${n.partition}:apigateway:${n.region}::/apis/*`, `arn:${n.partition}:apigateway:${n.region}::/tags/*`],
+      // Tagging is its own action: CloudFormation tags the API, its stage and
+      // a custom domain as it creates them.
+      Action: ["apigateway:GET", "apigateway:POST", "apigateway:PUT", "apigateway:PATCH", "apigateway:DELETE", "apigateway:TagResource", "apigateway:UntagResource"],
+      Resource: [
+        `arn:${n.partition}:apigateway:${n.region}::/apis`, `arn:${n.partition}:apigateway:${n.region}::/apis/*`, `arn:${n.partition}:apigateway:${n.region}::/tags/*`,
+        `arn:${n.partition}:apigateway:${n.region}::/domainnames`, `arn:${n.partition}:apigateway:${n.region}::/domainnames/*`,
+      ],
     },
     { Sid: "CertificatesRequest", Effect: "Allow", Action: ["acm:RequestCertificate", "acm:AddTagsToCertificate"], Resource: "*", Condition: { StringEquals: { [`aws:RequestTag/${INSTALL_TAG}`]: p } } },
     { Sid: "Certificates", Effect: "Allow", Action: "acm:*", Resource: `arn:${n.partition}:acm:*:${n.account}:certificate/*`, Condition: tagged },
