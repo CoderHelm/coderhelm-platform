@@ -40,6 +40,17 @@ async fn install_origin(state: &WorkerState, install_id: &str) -> Result<Option<
     Ok(Some(format!("https://{}", g("cloudfront"))))
 }
 
+/// Whether an event created at `created` came under the link made at
+/// `linked_at` (both RFC 3339, compared as times, not text).
+pub fn link_covers(linked_at: &str, created: &str) -> bool {
+    let t = |v: &str| chrono::DateTime::parse_from_rfc3339(v).ok();
+    match (t(linked_at), t(created)) {
+        // The link's time has whole seconds; an event in its first second counts.
+        (Some(l), Some(c)) => l.timestamp() <= c.timestamp(),
+        _ => false,
+    }
+}
+
 pub async fn run(state: &WorkerState, msg: RelayRetryMessage) -> Result<(), Error> {
     let Some(master) = state
         .secrets
@@ -98,7 +109,7 @@ pub async fn run(state: &WorkerState, msg: RelayRetryMessage) -> Result<(), Erro
             .and_then(|v| v.as_s().ok())
             .cloned();
         // Gone, or a newer link (perhaps another team's site) than the event.
-        let linked = linked_at.is_some_and(|at| at.as_str() <= d.created_at.as_str());
+        let linked = linked_at.is_some_and(|at| link_covers(&at, &d.created_at));
         if !linked {
             d.finish(
                 common::deliveries::Status::Failed,
@@ -159,4 +170,27 @@ pub async fn run(state: &WorkerState, msg: RelayRetryMessage) -> Result<(), Erro
     common::deliveries::record(&state.dynamo, table, &pk, &d).await;
     relay::note_last(&state.dynamo, table, &msg.install_id, &d).await;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::link_covers;
+
+    #[test]
+    fn a_queued_jira_retry_goes_only_under_the_link_it_came_under() {
+        assert!(link_covers(
+            "2026-10-30T10:00:00Z",
+            "2026-10-30T10:00:00.500Z"
+        ));
+        assert!(link_covers(
+            "2026-10-30T10:00:00Z",
+            "2026-10-30T11:00:00.000Z"
+        ));
+        // Linked again after the event: not sent.
+        assert!(!link_covers(
+            "2026-10-30T10:00:01Z",
+            "2026-10-30T10:00:00.500Z"
+        ));
+        assert!(!link_covers("", "2026-10-30T10:00:00.500Z"));
+    }
 }
