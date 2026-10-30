@@ -22,7 +22,7 @@ One hostname keeps the session cookie first-party and removes the need for CORS.
 | **A domain in Route 53 in the same account** | Type the hostname | Finds the zone, makes the certificate (DNS validation) and the `A` and `AAAA` records |
 | **A domain at any other DNS provider** | Type the hostname, then add two `CNAME` records | Requests the certificate, checks your records until they show up, then moves to the domain |
 
-Google sign-in needs your own domain (Google requires a fixed sign-in address); everything else works on the AWS address.
+Everything works on the AWS address.
 
 ## At install
 
@@ -42,7 +42,7 @@ You can skip the domain step in the guide and add the domain later.
 3. The page checks by itself. When AWS issues the certificate, CoderHelm redeploys the release it runs with the new address (about 10 minutes; the update history shows it). CoderHelm keeps answering on the AWS address meanwhile.
 4. With another DNS provider, the page then asks for the address record and checks until it resolves and CoderHelm answers there over HTTPS.
 
-**Use the AWS address** removes the domain again (Google sign-in must be off first).
+**Use the AWS address** removes the domain again.
 
 Behind the page: the updater function requests the certificate in us-east-1 (CloudFront only uses certificates there), adds only the validation `CNAME` to a Route 53 zone in the account, and every 5 minutes checks whether the certificate is issued. The update build then runs `coderhelm-selfhost domain apply` with the release that runs, which writes `domain` into the config and deploys.
 
@@ -122,7 +122,7 @@ Settings, then Setup, Settings, then System, and the install guide check the dom
 ## After the move
 
 - **The GitHub App** still has the old URLs. The webhook keeps arriving (the AWS address still answers), but update the app's **Homepage URL**, **Callback URL**, **Setup URL** and **Webhook URL** to the new address; the GitHub webhook check in Settings, then Setup names the value to set. See [The GitHub App](./github-app.md#urls-it-uses).
-- **Jira** webhooks and the Forge app (`set-gateway.js`), and the **Google OAuth client**, if you use them.
+- **Jira** webhooks and the Forge app (`set-gateway.js`), if you use them.
 - People's sessions start again on the new address.
 
 ## In the config

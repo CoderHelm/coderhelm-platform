@@ -121,6 +121,7 @@ export function buildApp(app: cdk.App, cfg: ResolvedConfig, opts: { accessStack?
     appUrl,
     gatewayFunction: api.gatewayFunction,
     workerFunction: worker.workerFunction,
+    emailEvents: cfg.layout !== "split",
   });
 
   // --- Updates (self-hosted installs) ---

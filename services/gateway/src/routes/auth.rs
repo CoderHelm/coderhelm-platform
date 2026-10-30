@@ -788,6 +788,19 @@ fn session_redirect(provider: Provider, token: &str, dashboard_url: &str) -> Res
     resp
 }
 
+/// A self-hosted install has no Google sign-in (people sign in with email
+/// and password, and two-factor where it's set): its Google routes answer
+/// 404 with that, whatever an older config or a stale page asks for.
+pub fn google_not_here() -> Option<Response> {
+    super::setup_checks::self_hosted().then(|| {
+        (
+            StatusCode::NOT_FOUND,
+            "Sign in with Google isn't available on a self-hosted CoderHelm. Sign in with your email and password; if you used Google before, choose Forgot password with the same email.",
+        )
+            .into_response()
+    })
+}
+
 /// GET /auth/google — Redirect to Cognito hosted UI for Google login.
 ///
 /// Google refuses sign-in inside an app's built-in browser and shows "This
@@ -795,6 +808,9 @@ fn session_redirect(provider: Provider, token: &str, dashboard_url: &str) -> Res
 /// browser goes back to the sign-in screen instead, which says to open the page
 /// in Safari or Chrome.
 pub async fn google_login(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+    if let Some(r) = google_not_here() {
+        return r;
+    }
     if oauth_signin::is_in_app_browser(user_agent(&headers)) {
         return SignInFailure::new(
             Provider::Google,
@@ -847,6 +863,9 @@ pub async fn google_callback(
     headers: HeaderMap,
     Query(params): Query<CallbackQuery>,
 ) -> Response {
+    if let Some(r) = google_not_here() {
+        return r;
+    }
     let app = common::public_urls::app_url(&state.config.stage);
     match google_callback_inner(&state, &headers, &params).await {
         Ok(resp) => resp,

@@ -54,7 +54,7 @@ export function buildConfig(a) {
     email: { from: a.emailFrom },
     admins: [a.admin],
     signup: a.signupDomain ? { domains: [a.signupDomain] } : {},
-    integrations: { googleSignIn: false, sandbox: true, logAnalyzer: true, weeklySummary: true },
+    integrations: { sandbox: true, logAnalyzer: true, weeklySummary: true },
     telemetry: { enabled: !!a.telemetry },
   };
   return cfg;

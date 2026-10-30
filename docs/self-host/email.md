@@ -38,7 +38,7 @@ The deploy creates an SES identity for `email.identity` (by default the domain o
 - **One address** (`"identity": "coderhelm@example.com"`): SES emails it a confirmation link. Good for trying CoderHelm out.
 - **null:** you manage the identity yourself.
 
-The install guide's **Optional setup** list and **Settings, then Setup** check both: the identity (`email_identity`) and the sandbox (`email_sandbox`), each with the console link pre-filled for your region.
+The install guide's **Optional setup** list and **Settings, then Setup** check it; see [Setup checks](#setup-checks).
 
 ## Leaving the SES sandbox
 
@@ -53,6 +53,25 @@ Sign-up codes and password resets come from Amazon Cognito. Until `email.cognito
 ```
 
 and deploy again. Turning it on before the identity is verified makes the deploy fail, because Cognito checks the identity.
+
+## Setup checks
+
+**Settings, then Setup** has four email checks, each with its fix:
+
+| Check | What it says |
+|---|---|
+| `email_sender` | Which sender is used (CoderHelm's mail service, or your SES from `email.from`) and the last successful send. Through CoderHelm: whether your install is registered and verified, whether CoderHelm paused its email, and today's count against the day's quota. |
+| `email_identity` | Whether the sender is verified, with DKIM, SPF (SES's custom MAIL FROM domain, when you set one) and DMARC (the `_dmarc` record of the sender's domain, looked up through your install's own DNS resolver). The identity can be the domain or the one address `email.identity` names. Through CoderHelm, the same for CoderHelm's sending domain. |
+| `email_sandbox` | Whether your AWS account is still in the SES sandbox, where email silently reaches only verified addresses. Not shown when sending through CoderHelm. |
+| `email_cognito` | Who sends sign-up codes and password resets: Amazon Cognito's own address (about 50 a day; turn on `email.cognitoUsesSes`) or your SES. |
+
+The install guide (`GET /api/setup/status`) shows one `email` check, never blocking, with a precise code: through CoderHelm `relay_ok`, `relay_not_registered`, `relay_unreachable`, `relay_unverified`, `relay_paused`; through your SES `ok`, `not_configured`, `identity_missing`, `identity_unreadable`, `identity_unverified`, `dkim_pending`, `sandbox`, `account_unreadable`.
+
+It used to answer `unknown` whenever any read failed. Three things led there on a working install: it asked SES for the sender's domain even when the identity is one address, it judged an install that sends through CoderHelm (no SES sender at all) on SES, and an account it couldn't read looked like everything else. Each now has its own code and fix.
+
+## What was sent
+
+**Deliveries** counts email by kind (sign-in and invites, password resets, run and review notices, the weekly summary, alerts): sent, delivered, bounced, complaints and rejected, from Amazon SES's own events, for either sender. See [Deliveries](./deliveries.md#email).
 
 ## Templates
 

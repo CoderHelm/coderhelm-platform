@@ -174,7 +174,13 @@ export interface CoderhelmConfig {
     requireTwoFactor?: boolean;
   };
   integrations?: {
-    /** "Sign in with Google" (needs google_client_id/secret in the secret and a domain). Default false. */
+    /**
+     * "Sign in with Google": the hosted deployment (split layout) only, with
+     * google_client_id/secret in its secret. Not available on a self-hosted
+     * install: ignored there, and an update removes a Google sign-in an
+     * install had (people sign in with email and password, and two-factor
+     * where it's set).
+     */
     googleSignIn?: boolean;
     /** The build sandbox that runs a repo's checks (CodeBuild). Default true. */
     sandbox?: boolean;
@@ -545,9 +551,6 @@ export function validateConfig(c: unknown): string[] {
   for (const [k, v] of Object.entries(i)) {
     if (typeof v !== "boolean") p.push(`integrations.${k}: true or false`);
   }
-  if (i.googleSignIn && layout === "single-origin" && !cfg.domain) {
-    p.push("integrations.googleSignIn: needs a domain (Google requires a fixed sign-in callback URL)");
-  }
   if (cfg.telemetry !== undefined) {
     if (cfg.telemetry.enabled !== undefined && typeof cfg.telemetry.enabled !== "boolean") {
       p.push("telemetry.enabled: true or false");
@@ -693,7 +696,8 @@ export function resolveConfig(cfg: CoderhelmConfig, opts: { skipValidation?: boo
       requireTwoFactor: cfg.signup?.requireTwoFactor === true,
     },
     integrations: {
-      googleSignIn: i.googleSignIn ?? false,
+      // Hosted only: a self-hosted install never gets a Google provider.
+      googleSignIn: layout === "split" ? (i.googleSignIn ?? false) : false,
       sandbox: i.sandbox ?? true,
       logAnalyzer: i.logAnalyzer ?? true,
       // Optional email is opt-in on a self-hosted install, on as before for

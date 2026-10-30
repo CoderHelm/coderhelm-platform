@@ -24,6 +24,7 @@ Your code, runs, plans, reviews, memory, knowledge and secrets stay in your AWS 
 | GitHub App relay | each event's payload, in transit: CoderHelm checks GitHub's signature and forwards it re-signed | the payload only while a forward is retried (at most 24 hours, then deleted); delivery records (ids, event types, status, timings) for 14 days |
 | Token broker | the short-lived installation token it mints for your install (scoped to the repositories you chose, never more than the app's permissions) | no tokens; a record of each mint for 14 days |
 | Jira app relay | each issue event, in transit, unchanged | as for GitHub. The Forge app's secret is checked by your install, so CoderHelm can't make an event up |
+| Jira site link | each event of the linked site (the Jira app's and a plain Jira webhook's), in transit, without the app's secret; your install's calls to the site's Jira app (comments, tickets, release notes), in transit, through CoderHelm's Jira proxy | as for GitHub; the link itself (which team's site, who linked it, when). The site's Jira app secret and links stay with CoderHelm |
 | Notion, Confluence, Google Drive | the sign-in, once | the provider sign-in, encrypted with a key only CoderHelm's services can use, so it can hand your install access tokens. Disconnecting revokes it. Notion's tokens don't expire by themselves: a copy your install holds stays valid until Notion's own integration page removes it |
 | Email through CoderHelm (opt-in, [Email](./email.md#send-through-coderhelm)) | each email's recipient address, template id and parameters (names, PR titles and run links in the weekly summary), in transit; CoderHelm writes the email from its own templates | delivery metadata only: template id, a shortened address and the status, for 3 days. Salted hashes of the addresses your install listed, and your install admins' addresses sealed with a key only CoderHelm's services can use, to tell them if email pauses |
 | Sharing with support (opt-in) | metadata of failed deliveries, and payload previews only if you also choose that | for 14 days, so support can see what failed |
@@ -70,25 +71,44 @@ A name can change five times a day. Uninstalling with `npx github:CoderHelm/code
 
 A forward that fails is retried with growing waits for about 24 hours. Both sides show it on their **Deliveries** page with each attempt, the answer and the next retry. Choose your own GitHub App again any time; signing in with GitHub on your install needs your own app.
 
+## Jira through CoderHelm
+
+A team that uses hosted CoderHelm with CoderHelm's Jira app can move that Jira site to its hybrid install without touching Jira: CoderHelm keeps receiving the site's events and forwards them to the install, the same way it forwards GitHub's.
+
+1. On your install, open **Settings, Integrations, Jira**, turn on **Link through CoderHelm**, type your Jira site's address (`example.atlassian.net`) and press **Link**. Your install asks CoderHelm (signed, install admins only) for a one-hour link for that site, and shows a **confirmation code** and **Open CoderHelm to confirm**.
+2. A CoderHelm page opens (app.coderhelm.com, **Settings, Integrations, Jira**). Sign in as an **admin of the hosted team that runs CoderHelm's Jira app on that site**. The page names your install's address, when it registered with CoderHelm, and the site, and links nothing until you type the confirmation code your install shows and press **Link**: a link someone else got hold of can't be confirmed without it. It refuses when the team's site isn't the one your install asked for, when the team doesn't run the Jira app on a site (a plain webhook alone isn't proof), when the site is already linked to another install, or when your install already has another team's site. Support views and API keys can't link.
+3. You come back to your install linked.
+
+From then on CoderHelm checks each event of that site first, exactly as it does for a hosted team (the Jira app's secret, or a plain webhook's signature), then forwards it to `https://<your CloudFront>/webhooks/relay` with source `jira`, **without the app's secret**, and stops: **CoderHelm never handles an event it relays**, so nothing runs twice. Your install refuses the forward unless **Link through CoderHelm** is on there. Forwards are signed, retried for about 24 hours, held only while retrying and recorded exactly like GitHub's, and they show on **Deliveries** beside GitHub's.
+
+**Your install never gets the site's Jira app secret or its Jira app links.** Its Jira settings point at CoderHelm's Jira proxy instead: one link per action (comment, create a ticket, publish release notes, list projects, read issues, Confluence), each with a token for your install, that action and that link (linking again makes new tokens). CoderHelm calls only the site's own Jira app links on Atlassian's Forge host, never follows a redirect, and only while the link stands and your install is active. Your install's own Jira app settings, if it had any, are kept aside and come back when you unlink.
+
+**Unlink** from either side: **Unlink** (or turning **Link through CoderHelm** off) on your install, or **Unlink** on the hosted team's Settings, Integrations, Jira. Leaving hybrid and CoderHelm revoking the install unlink too. Both records go together; CoderHelm handles the site's events itself again at once, the proxy refuses your install's calls, and retries still queued for your install stop. If your install is turned off while linked, CoderHelm handles the site's events itself rather than dropping them.
+
+The **Jira app relay** above is the other way round: a Jira site whose own Jira app is set up with your install's id, without a hosted team.
+
+The Setup checks show the link as `hybrid_jira` (in Settings, Setup and the install guide's `/api/setup/status`): `no_link` (todo) until it is linked, `syncing` (wait) while your install fetches the proxy settings, `ok` once linked.
+
 ## Integrations
 
 | Integration | Through CoderHelm's app | Notes |
 |---|---|---|
 | GitHub | yes | relay and token broker |
-| Jira (Forge app) | yes | install CoderHelm's Jira app and enter your install id as the team id |
+| Jira (Forge app) | yes | install CoderHelm's Jira app and enter your install id as the team id, or link a hosted team's site ([Jira through CoderHelm](#jira-through-coderhelm)) |
 | Notion, Confluence, Google Drive | yes | one-click sign-in through CoderHelm; tokens brokered |
 | Slack and Teams notifications | not needed | your install posts to the incoming webhook you paste |
 | Figma, Linear, Sentry, Sanity and other sign-in apps | not needed | your install registers itself with each provider |
 | Slack and Teams commands | no | there is no shared Slack or Teams app: each team uses its own app's signing secret, as today |
-| Sign in with GitHub | no | it would hand your people's identities to CoderHelm; use email, or Google with your own domain |
+| Sign in with GitHub | no | it would hand your people's identities to CoderHelm; use email and password |
+| Sign in with Google | no | a self-hosted install has no Google sign-in, through CoderHelm or its own ([Sign-in and people](./sign-in.md#no-google-sign-in)) |
 
 ## Turn hybrid off
 
-**Leave hybrid** in Settings releases the name, unlinks CoderHelm's apps and revokes the sign-ins. To make sure an install never talks to CoderHelm, set `"hybridUrl": null` in `coderhelm.config.json` and deploy.
+**Leave hybrid** in Settings releases the name, unlinks CoderHelm's apps and a linked Jira site, and revokes the sign-ins. To make sure an install never talks to CoderHelm, set `"hybridUrl": null` in `coderhelm.config.json` and deploy.
 
 ## For CoderHelm's operators
 
-The hosted side runs in the hosted deployment's API stack when `hybrid.zone` is set in its config (the parent zone is configurable, so moving customer addresses to a separate domain later is a config change). It needs `hybrid_master_key` (32 or more random characters) in the hosted secret, the callback URL `https://api.coderhelm.com/auth/github/callback/hybrid` on CoderHelm's GitHub App, and the GitHub App's setup page (the dashboard's Settings, GitHub) to forward `state=hyb_…` returns. Platform admins see every install and the audit log at `GET /api/admin/hybrid`, and revoke one with `POST /api/admin/hybrid/:install_id/revoke`.
+The hosted side runs in the hosted deployment's API stack when `hybrid.zone` is set in its config (the parent zone is configurable, so moving customer addresses to a separate domain later is a config change). It needs `hybrid_master_key` (32 or more random characters) in the hosted secret, the callback URL `https://api.coderhelm.com/auth/github/callback/hybrid` on CoderHelm's GitHub App, and the GitHub App's setup page (the dashboard's Settings, GitHub) to forward `state=hyb_…` returns. A hosted team links its Jira site with `GET` and `POST /api/hybrid/jira-link/:state` (team admins, from the dashboard's Settings, Integrations, Jira, which opens with `?hybrid_link=hyj_…`); sees and removes the link with `GET` and `DELETE /api/hybrid/jira-link`; installs call `POST /hybrid/jira/link-start`, `DELETE /hybrid/jira/link` and `POST /hybrid/jira/config` (signed), and the Jira proxy at `POST /hybrid/jira/trigger/<install>/<action>/<token>`. Platform admins see every install and the audit log (`jira_link_start`, `link_jira`, `unlink_jira`, `jira_link_refused`, `jira_link_declined`) at `GET /api/admin/hybrid`, and revoke one with `POST /api/admin/hybrid/:install_id/revoke`.
 
 
 ## Email threat model

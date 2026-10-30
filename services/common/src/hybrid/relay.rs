@@ -29,6 +29,86 @@ pub fn install_pk(install_id: &str) -> String {
     format!("HYBRID#{install_id}")
 }
 
+/// The Deliveries source of a relay forward, by provider: `relay` for
+/// GitHub (as it has always been), `relay_jira` for Jira. Kept apart so the
+/// overview counts, filters and times each provider on its own.
+pub fn source_for(provider: &str) -> &'static str {
+    match provider {
+        "jira" => "relay_jira",
+        _ => "relay",
+    }
+}
+
+/// The provider a relay record forwards for (`github` or `jira`), or None
+/// for a record that isn't a relay forward.
+pub fn provider_of(source: &str) -> Option<&'static str> {
+    match source {
+        "relay" => Some("github"),
+        "relay_jira" => Some("jira"),
+        _ => None,
+    }
+}
+
+/// Whether a Deliveries source is a relay forward (any provider).
+pub fn is_relay_source(source: &str) -> bool {
+    provider_of(source).is_some()
+}
+
+/// The source and event headers a held relay record is sent again with:
+/// the provider, and the event without the record's `jira.` prefix or
+/// GitHub's `.action` suffix.
+pub fn resend_route(d: &Delivery) -> (&'static str, String) {
+    match provider_of(&d.source) {
+        Some("jira") => (
+            "jira",
+            d.event
+                .strip_prefix("jira.")
+                .unwrap_or(&d.event)
+                .to_string(),
+        ),
+        _ => (
+            "github",
+            d.event.split('.').next().unwrap_or("").to_string(),
+        ),
+    }
+}
+
+/// The sort key of an install's last-forward times for one provider.
+pub fn last_sk(provider: &str) -> String {
+    format!("RELAYLAST#{provider}")
+}
+
+/// Notes when a provider's forward last went through, or last failed for
+/// good, on the install's partition (what Deliveries shows as "last
+/// delivered"). A record still retrying changes nothing.
+pub async fn note_last(
+    dynamo: &aws_sdk_dynamodb::Client,
+    table: &str,
+    install_id: &str,
+    d: &Delivery,
+) {
+    use aws_sdk_dynamodb::types::AttributeValue;
+    let Some(provider) = provider_of(&d.source) else {
+        return;
+    };
+    let field = match d.status {
+        s if s.is_ok() => "last_ok_at",
+        Status::Failed => "last_failed_at",
+        _ => return,
+    };
+    let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    let _ = dynamo
+        .update_item()
+        .table_name(table)
+        .key("pk", AttributeValue::S(install_pk(install_id)))
+        .key("sk", AttributeValue::S(last_sk(provider)))
+        .update_expression("SET #f = :t")
+        .expression_attribute_names("#f", field)
+        .expression_attribute_values(":t", AttributeValue::S(now))
+        .send()
+        .await;
+}
+
 /// One forward to send.
 pub struct Forward<'a> {
     pub origin: &'a str,
@@ -318,6 +398,21 @@ mod tests {
         assert_eq!(last, Next::GiveUp);
         assert_eq!(d.status, Status::Failed);
         assert_eq!(d.reason, "relay_gave_up");
+    }
+
+    #[test]
+    fn each_provider_has_its_own_source_and_resend_route() {
+        assert_eq!(source_for("github"), "relay");
+        assert_eq!(source_for("jira"), "relay_jira");
+        assert_eq!(provider_of("relay"), Some("github"));
+        assert_eq!(provider_of("relay_jira"), Some("jira"));
+        assert_eq!(provider_of("broker"), None);
+        assert!(!is_relay_source("github"));
+        let gh = Delivery::new(Direction::Outbound, "relay", "pull_request.opened", "ins_x");
+        assert_eq!(resend_route(&gh), ("github", "pull_request".to_string()));
+        let jira = Delivery::new(Direction::Outbound, "relay_jira", "jira.site", "ins_x");
+        assert_eq!(resend_route(&jira), ("jira", "site".to_string()));
+        assert_eq!(last_sk("jira"), "RELAYLAST#jira");
     }
 
     #[test]

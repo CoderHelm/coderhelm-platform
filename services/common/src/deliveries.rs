@@ -104,7 +104,9 @@ pub enum Redeliver {
 pub struct Delivery {
     pub id: String,
     pub direction: Direction,
-    /// `github`, `relay`, `jira`, `alerts`, `slack`, `teams`, `email`, `broker`, `knowledge`, `webhook`.
+    /// `github`, `relay` (GitHub events relayed by CoderHelm), `relay_jira`
+    /// (Jira events relayed by CoderHelm), `jira`, `alerts`, `slack`,
+    /// `teams`, `email`, `broker`, `knowledge`, `webhook`.
     pub source: String,
     /// The event or message type, e.g. `pull_request.opened`.
     pub event: String,
@@ -333,6 +335,8 @@ const REASONS: &[Reason] = &[
     Reason { code: "relay_refused", message: "Your install refused the forward.", fix: "Usually the event isn't one it handles yet: update CoderHelm. Redeliver once it's updated." },
     Reason { code: "relay_gave_up", message: "Forwarding stopped after 24 hours of failures.", fix: "Fix what the attempts show, then press Redeliver while the payload is still held, or redeliver from GitHub." },
     Reason { code: "relay_not_linked", message: "The installation is linked to an install that was removed or turned off.", fix: "Link it again in Settings, System, Hybrid, or uninstall the app on GitHub." },
+    Reason { code: "jira_not_linked", message: "Your install refused a Jira event from CoderHelm's relay because it hasn't linked a Jira site through CoderHelm.", fix: "Open Settings, Integrations, Jira on your install: turn on Link through CoderHelm and press Link, or unlink the site so CoderHelm handles its events again." },
+    Reason { code: "jira_link_unsynced", message: "Your install couldn't fetch the linked Jira site's settings from CoderHelm yet.", fix: "Usually temporary: CoderHelm retries the event. If it keeps failing, open Settings, Integrations, Jira on your install and press Check." },
     Reason { code: "replayed", message: "This delivery was already received once; the copy was refused.", fix: "Nothing to do: the first copy was handled." },
     Reason { code: "signature_stale", message: "The forward was more than 5 minutes old when it arrived.", fix: "Usually a slow retry; the next one passes. Check your install's clock if it keeps happening." },
     Reason { code: "chat_webhook_gone", message: "The Slack or Teams webhook doesn't exist any more.", fix: "Paste a new incoming webhook in Settings, Notifications." },
@@ -364,7 +368,7 @@ const REASONS: &[Reason] = &[
     Reason { code: "broker_repository_not_allowed", message: "That repository isn't one this install was given.", fix: "Add it on GitHub and in Settings, System, Hybrid." },
     Reason { code: "broker_refused", message: "CoderHelm's token broker refused the request.", fix: "Open Settings, System, Hybrid: it shows the link's state and how to fix it." },
     Reason { code: "broker_unreachable", message: "CoderHelm's token broker didn't answer.", fix: "Usually temporary; the next request retries. status.coderhelm.com shows any outage." },
-    Reason { code: "jira_signature", message: "The Jira webhook's signature didn't match.", fix: "Copy the webhook secret from Settings, Jira into Jira's webhook again." },
+    Reason { code: "jira_signature", message: "The Jira webhook's signature didn't match.", fix: "Copy the webhook secret from Settings, Integrations, Jira into Jira's webhook again." },
     Reason { code: "webhook_unreachable", message: "Your webhook endpoint couldn't be reached (the connection failed or its name didn't resolve).", fix: "Check the endpoint's address and that it is up. CoderHelm keeps retrying for about a day." },
     Reason { code: "webhook_timeout", message: "Your webhook endpoint didn't answer within 10 seconds.", fix: "Answer with a 2xx at once and do the work afterwards (queue it). CoderHelm retries meanwhile." },
     Reason { code: "webhook_server_error", message: "Your webhook endpoint answered with a server error (5xx).", fix: "Check your endpoint's logs for this event id. CoderHelm retries for about a day." },
@@ -393,6 +397,12 @@ pub fn reason(code: &str) -> Reason {
 
 /// The reason code for a failed HTTP forward or send.
 pub fn reason_for_http(source: &str, code: Option<u16>) -> &'static str {
+    // Jira forwards fail the same ways GitHub's do.
+    let source = if source == "relay_jira" {
+        "relay"
+    } else {
+        source
+    };
     match (source, code) {
         ("relay", None) => "relay_unreachable",
         ("relay", Some(401 | 403)) => "relay_signature",

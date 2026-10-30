@@ -86,6 +86,7 @@ def fake_id(kind, lid):
         "route": "abc1234",
         "integ": "def5678",
         "client": "4example5client6id7",
+        "ced": f"events-{h:012d}",
     }[kind]
 
 
@@ -162,6 +163,8 @@ class Stack:
             a = f"{at('acm')}:certificate/{fake_id('cert', lid)}"; return a, a
         if ty == "AWS::SES::ConfigurationSet":
             n = nm("Name"); return n, f"{at('ses')}:configuration-set/{n}"
+        if ty == "AWS::SES::ConfigurationSetEventDestination":
+            n = nm("ConfigurationSetName"); return fake_id("ced", lid), f"{at('ses')}:configuration-set/{n}"
         if ty == "AWS::SES::EmailIdentity":
             n = nm("EmailIdentity"); return n, f"{at('ses')}:identity/{n}"
         if ty == "AWS::SES::Template":

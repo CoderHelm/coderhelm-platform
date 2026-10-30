@@ -52,15 +52,15 @@ pub(crate) fn not_here() -> (StatusCode, Json<Value>) {
     fail(StatusCode::NOT_FOUND, "not_found", "Not found.")
 }
 
-fn s(v: &str) -> AttributeValue {
+pub(crate) fn s(v: &str) -> AttributeValue {
     AttributeValue::S(v.to_string())
 }
 
-fn now() -> String {
+pub(crate) fn now() -> String {
     chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
 }
 
-fn epoch() -> i64 {
+pub(crate) fn epoch() -> i64 {
     chrono::Utc::now().timestamp()
 }
 
@@ -330,7 +330,7 @@ pub(crate) async fn signed(
     Ok(install)
 }
 
-fn body_json(body: &[u8]) -> Value {
+pub(crate) fn body_json(body: &[u8]) -> Value {
     serde_json::from_slice(body).unwrap_or(Value::Null)
 }
 
@@ -489,6 +489,7 @@ pub async fn status(
     let slug = crate::auth::github_app::app_slug(&state).await;
     let mut v = install.view();
     v["github"] = json!({ "links": links, "app_slug": slug });
+    v["jira"] = json!({ "link": super::hybrid_jira::jira_link(&state, &install.id).await });
     v["offered"] = json!(offered_ids(&state));
     Ok(Json(v))
 }
@@ -536,6 +537,7 @@ pub async fn unregister(
     for l in github_links(&state, &install.id).await {
         unlink(&state, &install.id, l.installation_id).await;
     }
+    super::hybrid_jira::unlink_all(&state, &install.id).await;
     install.status = "removed".into();
     install.integrations.clear();
     save_install(&state, &install).await?;
@@ -1219,7 +1221,7 @@ pub fn return_url_for(install: &Install, asked: &str) -> String {
     }
 }
 
-async fn put_state(
+pub(crate) async fn put_state(
     state: &AppState,
     pk: &str,
     fields: &[(&str, &str)],
@@ -1250,7 +1252,10 @@ async fn put_state(
 }
 
 /// Takes a one-time state (deleted as it is read). None when unknown or expired.
-async fn take_state(state: &AppState, pk: &str) -> Option<HashMap<String, AttributeValue>> {
+pub(crate) async fn take_state(
+    state: &AppState,
+    pk: &str,
+) -> Option<HashMap<String, AttributeValue>> {
     let r = state
         .dynamo
         .delete_item()
@@ -1908,58 +1913,97 @@ pub async fn relay_github(
     } else {
         gh_delivery
     };
-    let key = sign::relay_key(master, &install_id);
-    let origin = install.origin();
-    let attempt = relay::send(&relay::Forward {
-        origin: &origin,
-        relay_key: &key,
-        source: "github",
-        event: event_type,
-        delivery_id: &delivery_id,
+    forward_and_record(
+        state,
+        master,
+        &install,
+        d,
+        "github",
+        event_type,
+        &delivery_id,
         body,
-    })
+    )
     .await;
-    if let relay::Next::RetryIn(secs) = relay::apply(&mut d, attempt) {
-        {
-            // Hold the body for the retries, then queue the first one.
-            let held = state
-                .s3
-                .put_object()
-                .bucket(&state.config.bucket_name)
-                .key(relay::payload_key(&d.id))
-                .body(body.to_vec().into())
-                .send()
-                .await
-                .is_ok();
-            let msg = json!({ "type": "relay_retry", "install_id": install_id, "delivery_id": d.id, "relay_delivery_id": delivery_id, "event": event_type, "source": "github" });
-            let queued = held
-                && state
-                    .sqs
-                    .send_message()
-                    .queue_url(&state.config.ticket_queue_url)
-                    .message_body(msg.to_string())
-                    .delay_seconds(secs.min(900) as i32)
-                    .send()
-                    .await
-                    .is_ok();
-            if !queued {
-                d.finish(
-                    Status::Failed,
-                    "Couldn't schedule a retry",
-                    "relay_unreachable",
-                );
-                d.next_retry_at = None;
-            }
-        }
-    }
-    deliveries::record(&state.dynamo, &state.config.settings_table_name, &pk, &d).await;
     // GitHub hears 200 either way: the relay owns the retries now.
     Some(StatusCode::OK)
 }
 
+/// Forwards one event to a linked install now. When that fails, the body is
+/// held in the data bucket and the first retry queued (the worker's
+/// `relay_retry` keeps going for about 24 hours, then gives up; a job that
+/// keeps failing goes to the dead-letter queue like any other). Records the
+/// delivery and the provider's last forward either way. GitHub and Jira
+/// forwards go through here alike.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn forward_and_record(
+    state: &AppState,
+    master: &str,
+    install: &Install,
+    mut d: Delivery,
+    source: &str,
+    event: &str,
+    delivery_id: &str,
+    body: &[u8],
+) -> relay::Next {
+    let pk = relay::install_pk(&install.id);
+    let key = sign::relay_key(master, &install.id);
+    let origin = install.origin();
+    let attempt = relay::send(&relay::Forward {
+        origin: &origin,
+        relay_key: &key,
+        source,
+        event,
+        delivery_id,
+        body,
+    })
+    .await;
+    let next = relay::apply(&mut d, attempt);
+    if let relay::Next::RetryIn(secs) = next {
+        // Hold the body for the retries, then queue the first one.
+        let held = state
+            .s3
+            .put_object()
+            .bucket(&state.config.bucket_name)
+            .key(relay::payload_key(&d.id))
+            .body(body.to_vec().into())
+            .send()
+            .await
+            .is_ok();
+        let msg = json!({ "type": "relay_retry", "install_id": install.id, "delivery_id": d.id, "relay_delivery_id": delivery_id, "event": event, "source": source });
+        let queued = held
+            && state
+                .sqs
+                .send_message()
+                .queue_url(&state.config.ticket_queue_url)
+                .message_body(msg.to_string())
+                .delay_seconds(secs.min(900) as i32)
+                .send()
+                .await
+                .is_ok();
+        if !queued {
+            d.finish(
+                Status::Failed,
+                "Couldn't schedule a retry",
+                "relay_unreachable",
+            );
+            d.next_retry_at = None;
+        }
+    }
+    deliveries::record(&state.dynamo, &state.config.settings_table_name, &pk, &d).await;
+    relay::note_last(
+        &state.dynamo,
+        &state.config.settings_table_name,
+        &install.id,
+        &d,
+    )
+    .await;
+    next
+}
+
 /// The relay's part of the hosted Jira Forge intake: a Forge event whose
 /// team id is an install id goes to that install, unchanged. The install
-/// checks the Forge secret itself, so this side can't make one up.
+/// checks the Forge secret itself, so this side can't make one up. Retried
+/// like a GitHub forward; Forge hears 200 once the relay owns the event.
 pub async fn relay_jira(
     state: &AppState,
     install_id: &str,
@@ -1973,11 +2017,12 @@ pub async fn relay_jira(
     let pk = relay::install_pk(install_id);
     let mut d = Delivery::new(
         Direction::Outbound,
-        "relay",
+        relay::source_for("jira"),
         &format!("jira.{path_event}"),
         install_id,
     );
     d.payload_bytes = body.len();
+    d.redeliver = Some(deliveries::Redeliver::Relay);
     let install = match load_install(state, install_id).await {
         Ok(Some(i)) if i.verified() && i.integrations.iter().any(|x| x == "jira") => i,
         _ => {
@@ -1986,25 +2031,9 @@ pub async fn relay_jira(
             return Some(StatusCode::NOT_FOUND);
         }
     };
-    let key = sign::relay_key(master, install_id);
-    let origin = install.origin();
     let id = d.id.clone();
-    let attempt = relay::send(&relay::Forward {
-        origin: &origin,
-        relay_key: &key,
-        source: "jira",
-        event: path_event,
-        delivery_id: &id,
-        body,
-    })
-    .await;
-    let next = relay::apply(&mut d, attempt);
-    deliveries::record(&state.dynamo, &state.config.settings_table_name, &pk, &d).await;
-    // Forge retries a failed trigger itself; say so with the status.
-    Some(match next {
-        relay::Next::Delivered | relay::Next::AlreadyDelivered => StatusCode::OK,
-        _ => StatusCode::BAD_GATEWAY,
-    })
+    forward_and_record(state, master, &install, d, "jira", path_event, &id, body).await;
+    Some(StatusCode::OK)
 }
 
 // ── Relay and broker deliveries for the install ──────────────────────────
@@ -2036,7 +2065,7 @@ pub async fn list_deliveries(
     })?;
     let own: Vec<_> = items
         .into_iter()
-        .filter(|d| d.source == "relay" || d.source == "broker")
+        .filter(|d| relay::is_relay_source(&d.source) || d.source == "broker")
         .collect();
     Ok(Json(json!({ "deliveries": own })))
 }
@@ -2087,7 +2116,7 @@ pub async fn redeliver(
         .await
         .ok()
         .flatten()
-        .filter(|d| d.source == "relay")
+        .filter(|d| relay::is_relay_source(&d.source))
         .ok_or_else(|| {
             fail(
                 StatusCode::NOT_FOUND,
@@ -2102,25 +2131,45 @@ pub async fn redeliver(
         .key(relay::payload_key(&d.id))
         .send()
         .await
-        .map_err(|_| fail(StatusCode::GONE, "payload_gone", "The event isn't held any more (kept up to 24 hours while retrying). Redeliver it from GitHub: the app's Advanced settings list recent deliveries."))?;
+        .map_err(|_| {
+            let from = if relay::provider_of(&d.source) == Some("jira") {
+                "Make the change in Jira again (edit the issue or add the comment)."
+            } else {
+                "Redeliver it from GitHub: the app's Advanced settings list recent deliveries."
+            };
+            fail(
+                StatusCode::GONE,
+                "payload_gone",
+                &format!(
+                    "The event isn't held any more (kept up to 24 hours while retrying). {from}"
+                ),
+            )
+        })?;
     let bytes = held
         .body
         .collect()
         .await
         .map(|b| b.into_bytes())
         .unwrap_or_default();
-    let event = d.event.split('.').next().unwrap_or("").to_string();
-    let rid = if d.external_id.is_empty() {
-        format!("{}-r{}", d.id, d.attempts.len())
+    let (source, event) = relay::resend_route(&d);
+    // A new id for the install's replay check, in the provider's own
+    // namespace (Jira's ids start `jira-`).
+    let base = if d.external_id.is_empty() {
+        &d.id
     } else {
-        format!("{}-r{}", d.external_id, d.attempts.len())
+        &d.external_id
+    };
+    let rid = if source == "jira" && !base.starts_with("jira-") {
+        format!("jira-{base}-r{}", d.attempts.len())
+    } else {
+        format!("{base}-r{}", d.attempts.len())
     };
     let key = sign::relay_key(&master, &install.id);
     let origin = install.origin();
     let a = relay::send(&relay::Forward {
         origin: &origin,
         relay_key: &key,
-        source: "github",
+        source,
         event: &event,
         delivery_id: &rid,
         body: &bytes,
@@ -2137,6 +2186,13 @@ pub async fn redeliver(
             .await;
     }
     deliveries::record(&state.dynamo, &state.config.settings_table_name, &pk, &d).await;
+    relay::note_last(
+        &state.dynamo,
+        &state.config.settings_table_name,
+        &install.id,
+        &d,
+    )
+    .await;
     Ok(Json(json!({ "delivery": d })))
 }
 
@@ -2747,6 +2803,7 @@ pub async fn admin_revoke(
     for l in github_links(&state, &install.id).await {
         unlink(&state, &install.id, l.installation_id).await;
     }
+    super::hybrid_jira::unlink_all(&state, &install.id).await;
     install.status = "revoked".into();
     install.integrations.clear();
     save_install(&state, &install).await?;

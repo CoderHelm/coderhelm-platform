@@ -141,13 +141,9 @@ The **API keys** page shows your install's own API address. The API reference at
 
 `integrations.sandbox` (on by default) creates a CodeBuild project that runs a repository's real build, lint and tests in an isolated container while CoderHelm works, so it fixes real errors instead of guessing. The project's role can only read and write one bucket of source tarballs that expire after a day. It has no GitHub token, no table access and no KMS key. Turn it off to skip those checks.
 
-## Google sign-in
+## Sign-in
 
-```json
-"integrations": { "googleSignIn": true }
-```
-
-Needs a domain (Google requires a fixed callback URL). Create an OAuth client in Google Cloud with the authorized redirect URI `https://<cognito domain>/oauth2/idpresponse` (the deploy output `SignInDomain` shows it). Then add `google_client_id` and `google_client_secret` to your deployment's secret (`coderhelm/<stage>/secrets`) before deploying.
+A self-hosted install signs people in with email and password, and two-factor where it's set. There is no Google sign-in: see [Sign-in and people](./sign-in.md#no-google-sign-in).
 
 ## Weekly summary email
 

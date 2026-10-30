@@ -1,5 +1,6 @@
 import * as cdk from "aws-cdk-lib";
 import * as ses from "aws-cdk-lib/aws-ses";
+import * as events from "aws-cdk-lib/aws-events";
 import * as iam from "aws-cdk-lib/aws-iam";
 import * as lambda from "aws-cdk-lib/aws-lambda";
 import * as route53 from "aws-cdk-lib/aws-route53";
@@ -13,6 +14,8 @@ interface EmailStackProps extends cdk.StackProps {
   appUrl: string;
   gatewayFunction: lambda.Function;
   workerFunction: lambda.Function;
+  /** Self-hosted: publish the configuration set's events to the default event bus (ApiStack's EmailEventsRule takes them). */
+  emailEvents?: boolean;
 }
 
 export class EmailStack extends cdk.Stack {
@@ -39,6 +42,25 @@ export class EmailStack extends cdk.Stack {
       reputationMetrics: true,
       sendingEnabled: true,
     });
+    // A self-hosted install counts its own email by kind (Deliveries): every
+    // send, delivery, bounce, complaint and rejection goes to its worker
+    // through the default event bus (ApiStack's EmailEventsRule).
+    // Mail is sent through this set as the identity's default, Cognito's
+    // own sign-up and reset email included once it uses SES.
+    if (props.emailEvents) {
+      this.configSet.addEventDestination("Events", {
+        destination: ses.EventDestination.eventBus(
+          events.EventBus.fromEventBusName(this, "DefaultBus", "default")
+        ),
+        events: [
+          ses.EmailSendingEvent.SEND,
+          ses.EmailSendingEvent.DELIVERY,
+          ses.EmailSendingEvent.BOUNCE,
+          ses.EmailSendingEvent.COMPLAINT,
+          ses.EmailSendingEvent.REJECT,
+        ],
+      });
+    }
 
     // SES email identity: a domain (its DKIM records are created for you
     // when it is the single-origin domain's Route 53 zone; otherwise add the

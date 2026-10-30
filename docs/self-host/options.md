@@ -92,10 +92,6 @@ One list of everything you can set up, and where. Required items are steps in th
   *Where:* Settings, Emails\
   *Checked by:* `optional_emails`\
   *Guide:* [Email](./email.md)
-- **Sign in with Google**\
-  *Where:* Google Cloud, the secret, `integrations.googleSignIn`\
-  *Checked by:* `google_sign_in`\
-  *Guide:* [Sign-in and people](./sign-in.md)
 - **Invite your team**\
   *Where:* Settings, People\
   *Guide:* [Sign-in and people](./sign-in.md)
@@ -145,7 +141,7 @@ One list of everything you can set up, and where. Required items are steps in th
 
 ## Not available yet
 
-- **Single sign-on (SAML or OIDC):** sign-in is email and password (with passkeys and two-factor codes) or Google.
+- **Single sign-on (SAML or OIDC):** sign-in is email and password (with passkeys and two-factor codes). A self-hosted install has no Google sign-in ([why](./sign-in.md#no-google-sign-in)).
 - **A private network (VPC):** the functions run without a VPC and reach GitHub, Anthropic and Bedrock over HTTPS.
 - **GitHub Enterprise Server:** CoderHelm calls `api.github.com`.
 - **Instance sizes:** everything is serverless and pay per use; there is no size to pick. Model calls are most of the bill.

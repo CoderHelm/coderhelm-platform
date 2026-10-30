@@ -7,6 +7,10 @@
 //! the install's Deliveries, and, when the install's rate over seven days is
 //! too high ([`relay::should_pause`]), pauses the relay for that install and
 //! tells its admins.
+//!
+//! Every event (sends and deliveries too) is also counted by kind
+//! (common::mail::stats): on the hosted side for the install it was for, on
+//! a self-hosted install for its own SES.
 
 use std::collections::HashMap;
 
@@ -15,7 +19,7 @@ use base64::Engine;
 use chrono::{Duration, Utc};
 use common::deliveries::{self, Delivery, Direction, Status};
 use common::hybrid::relay as hybrid_relay;
-use common::mail::{relay, templates};
+use common::mail::{relay, stats, templates};
 use serde_json::{json, Value};
 use tracing::{info, warn};
 
@@ -65,7 +69,33 @@ pub fn window(
     c
 }
 
+/// Where one SES event is counted: the install a relayed email was for
+/// (hosted side), or this install's own partition for its own SES. None for
+/// the hosted deployment's own mail, which isn't counted here.
+pub fn stats_pk(c: &stats::Counted, hosted: bool) -> Option<String> {
+    match (&c.install, hosted) {
+        (Some(id), true) => Some(hybrid_relay::install_pk(id)),
+        (None, false) => Some(stats::OWN_PK.to_string()),
+        _ => None,
+    }
+}
+
 pub async fn handle(state: &WorkerState, raw: &Value) {
+    // Every send, delivery, bounce, complaint and rejection is counted by
+    // kind, for the install's Deliveries page.
+    if let Some(c) = stats::read_event(raw) {
+        let hosted = common::mail::deployment() == common::mail::Deployment::Hosted;
+        if let Some(pk) = stats_pk(&c, hosted) {
+            stats::count(
+                &state.dynamo,
+                &state.config.settings_table_name,
+                &pk,
+                &c,
+                Utc::now(),
+            )
+            .await;
+        }
+    }
     let Some(ev) = relay::parse_event(raw) else {
         info!("Mail event without an install, or not a permanent bounce or complaint: ignored");
         return;
@@ -319,6 +349,29 @@ mod tests {
             }
         );
         assert_eq!(relay::should_pause(c), Some("bounces"));
+    }
+
+    #[test]
+    fn events_count_for_the_install_they_were_sent_for() {
+        let relayed = stats::Counted {
+            event: "delivery",
+            kind: "alerts",
+            install: Some("ins_abcdefghijklmnopqrstuvwx".into()),
+            recipients: 1,
+        };
+        let own = stats::Counted {
+            install: None,
+            ..relayed.clone()
+        };
+        assert_eq!(
+            stats_pk(&relayed, true).as_deref(),
+            Some("HYBRID#ins_abcdefghijklmnopqrstuvwx")
+        );
+        assert_eq!(stats_pk(&own, false).as_deref(), Some("SYSTEM"));
+        // The hosted deployment's own mail, and an install tag on an
+        // install's own SES, count nowhere.
+        assert_eq!(stats_pk(&own, true), None);
+        assert_eq!(stats_pk(&relayed, false), None);
     }
 
     #[test]

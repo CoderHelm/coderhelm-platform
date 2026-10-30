@@ -5,8 +5,9 @@
  * It sends from its own subdomain (`notify.<zone>`) so relayed mail can never
  * harm the main domain's reputation: Easy DKIM, a custom MAIL FROM with SPF,
  * and a DMARC policy of reject, all written as records in the zone. Its
- * configuration set publishes bounces and complaints to a topic that reaches
- * the worker raw on the ticket queue. Only the gateway (sending) and the
+ * configuration set publishes its events (sends, deliveries, bounces,
+ * complaints, rejections) to a topic that reaches the worker raw on the
+ * ticket queue. Only the gateway (sending) and the
  * worker (pause notices) may send as the relay, and only from its address.
  */
 import * as cdk from "aws-cdk-lib";
@@ -74,7 +75,15 @@ export class MailRelay extends Construct {
     });
     configSet.addEventDestination("BouncesAndComplaints", {
       destination: ses.EventDestination.snsTopic(this.topic),
-      events: [ses.EmailSendingEvent.BOUNCE, ses.EmailSendingEvent.COMPLAINT],
+      // Bounces and complaints suppress and pause; every event is also
+      // counted by kind for each install's Deliveries (common::mail::stats).
+      events: [
+        ses.EmailSendingEvent.SEND,
+        ses.EmailSendingEvent.DELIVERY,
+        ses.EmailSendingEvent.BOUNCE,
+        ses.EmailSendingEvent.COMPLAINT,
+        ses.EmailSendingEvent.REJECT,
+      ],
     });
 
     const identity = new ses.EmailIdentity(this, "Identity", {

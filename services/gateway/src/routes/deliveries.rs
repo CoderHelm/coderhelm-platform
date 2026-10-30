@@ -331,7 +331,9 @@ fn redeliver_kind(d: &Delivery) -> Option<deliveries::Redeliver> {
         ("github", Some(deliveries::Redeliver::Github)) if !d.external_id.is_empty() => {
             Some(deliveries::Redeliver::Github)
         }
-        ("relay", Some(deliveries::Redeliver::Relay)) if d.id.starts_with("relay:") => {
+        ("relay" | "relay_jira", Some(deliveries::Redeliver::Relay))
+            if d.id.starts_with("relay:") =>
+        {
             Some(deliveries::Redeliver::Relay)
         }
         ("webhook", Some(deliveries::Redeliver::Webhook))
@@ -521,6 +523,12 @@ mod tests {
             None,
             "a delivered forward isn't sent twice"
         );
+        // A Jira forward from CoderHelm redelivers the same way.
+        let mut j = Delivery::new(Direction::Outbound, "relay_jira", "jira.site", "ins");
+        j.redeliver = Some(deliveries::Redeliver::Relay);
+        j.status = Status::Failed;
+        j.id = "relay:01K".into();
+        assert_eq!(redeliver_kind(&j), Some(deliveries::Redeliver::Relay));
         let e = Delivery::new(Direction::Outbound, "email", "invite", "example.com");
         assert_eq!(redeliver_kind(&e), None);
         let mut w = Delivery::new(

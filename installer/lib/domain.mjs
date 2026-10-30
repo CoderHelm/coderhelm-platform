@@ -27,9 +27,6 @@ const ZONE_ID_RE = /^Z[A-Z0-9]{1,32}$/;
  */
 export function withDomain(cfg, { action = "attach", hostname, certificateArn, zone, zoneId } = {}) {
   if (action === "remove") {
-    if (cfg.integrations?.googleSignIn) {
-      throw new Error("Google sign-in needs a domain: turn integrations.googleSignIn off first, then go back to the AWS address.");
-    }
     return { ...cfg, domain: null };
   }
   if (action !== "attach") throw new Error(`--action is attach or remove, not ${action}.`);

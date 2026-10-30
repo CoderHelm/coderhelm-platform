@@ -206,6 +206,20 @@ async fn main() -> Result<(), Error> {
                 .delete(routes::hybrid_install::github_unlink),
         )
         .route(
+            "/system/hybrid/jira/link",
+            post(routes::hybrid_install::jira_link).delete(routes::hybrid_install::jira_unlink),
+        )
+        // The hosted side of the Jira link: a team admin confirms linking
+        // the team's Jira site to a self-hosted install (routes::hybrid_jira).
+        .route(
+            "/hybrid/jira-link",
+            get(routes::hybrid_jira::team_link).delete(routes::hybrid_jira::team_unlink),
+        )
+        .route(
+            "/hybrid/jira-link/:state",
+            get(routes::hybrid_jira::link_view).post(routes::hybrid_jira::link_confirm),
+        )
+        .route(
             "/system/hybrid/settings",
             put(routes::hybrid_install::put_settings),
         )
@@ -1429,6 +1443,7 @@ fn hybrid_routes() -> Router<Arc<AppState>> {
         .route("/email/recipients", post(routes::hybrid_email::recipients))
         .route("/email/domain", post(routes::hybrid_email::domain))
         .route("/email/status", get(routes::hybrid_email::status))
+        .route("/email/stats", post(routes::hybrid_email::stats_route))
         .route("/settings", put(routes::hybrid::settings))
         .route(
             "/names",
@@ -1445,6 +1460,13 @@ fn hybrid_routes() -> Router<Arc<AppState>> {
             put(routes::hybrid::set_link_repos).delete(routes::hybrid::delete_link),
         )
         .route("/github/token", post(routes::hybrid::github_token))
+        .route("/jira/link-start", post(routes::hybrid_jira::link_start))
+        .route("/jira/link", delete(routes::hybrid_jira::delete_link))
+        .route("/jira/config", post(routes::hybrid_jira::config))
+        .route(
+            "/jira/trigger/:install_id/:trigger/:token",
+            post(routes::hybrid_jira::trigger),
+        )
         .route("/deliveries", get(routes::hybrid::list_deliveries))
         .route("/deliveries/shared", post(routes::hybrid::share))
         .route("/deliveries/rollups", post(routes::hybrid::rollups))

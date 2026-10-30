@@ -34,7 +34,6 @@ You do not need Rust, Docker or the CDK CLI: the release ships built code, and t
 ## Optional
 
 - **A domain** in a Route 53 public hosted zone, so certificates and DNS records are created for you. A domain elsewhere works with an ACM certificate you create. See [Domains](./domains.md).
-- **Google sign-in** needs a domain and a Google OAuth client.
 
 ## What it costs
 

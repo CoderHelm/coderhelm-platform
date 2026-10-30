@@ -113,10 +113,9 @@ You become the first admin. Nobody else can sign up unless you invite them or al
 Step 6 of 8 [████████████░░░░] Optional extras
   Jira: connect from Settings, Integrations, Jira after sign-up ...
 A Slack or Teams incoming webhook for update notices (empty: email only):
-Turn on Sign in with Google (needs a Google OAuth client)? (yes/no) [no]:
 ```
 
-A Slack or Teams webhook is checked to still exist. Google's client id and secret go straight into Secrets Manager, never into a file. See [Integrations](./integrations.md).
+A Slack or Teams webhook is checked to still exist. See [Integrations](./integrations.md).
 
 ## Step 7: updates
 

@@ -48,6 +48,8 @@ pub const RATE_WINDOW_DAYS: i64 = 7;
 pub const PATH_SEND: &str = "/hybrid/email";
 pub const PATH_RECIPIENTS: &str = "/hybrid/email/recipients";
 pub const PATH_STATUS: &str = "/hybrid/email/status";
+/// The install's email counts by kind, `{from, to}` days (signed POST).
+pub const PATH_STATS: &str = "/hybrid/email/stats";
 
 /// The settings-table sort keys under `HYBRID#<install>`.
 pub fn recipient_sk(hash: &str) -> String {

@@ -24,7 +24,7 @@ use axum::{
 };
 use common::deliveries::{self, Delivery, Direction, Status};
 use common::hybrid::relay as hybrid_relay;
-use common::mail::{relay, templates};
+use common::mail::{relay, stats, templates};
 use serde_json::{json, Value};
 use tracing::{info, warn};
 
@@ -789,8 +789,15 @@ pub async fn status(
             .cloned()
             .unwrap_or_default()
     };
+    let pk = hybrid_relay::install_pk(&install.id);
+    let (last, sender) = tokio::join!(
+        stats::read_last(&state.dynamo, &state.config.settings_table_name, &pk),
+        relay_sender(&state),
+    );
     Ok(Json(json!({
         "verified": install.verified(),
+        "stats": last.ok().map(|s| stats::to_json(&s)),
+        "sender": sender,
         "paused": pause.as_ref().map(|_| json!({ "reason": text(&pause, "reason"), "at": text(&pause, "at") })),
         "sent_today": num(&day, "sent"),
         "quota": day_quota(&install),
@@ -800,6 +807,103 @@ pub async fn status(
         "from": relay_from(),
         "display_name": relay::display_name(name_host(&install).as_deref(), &install.cloudfront),
     })))
+}
+
+/// The relay's own sending domain as SES and DNS see it: verified, DKIM,
+/// the custom MAIL FROM (SPF), DMARC, and the account's production access.
+/// Read at most once every 10 minutes.
+async fn relay_sender(state: &AppState) -> Value {
+    static CACHE: std::sync::Mutex<Option<(std::time::Instant, Value)>> =
+        std::sync::Mutex::new(None);
+    if let Some((at, v)) = CACHE.lock().ok().and_then(|g| g.clone()) {
+        if at.elapsed() < std::time::Duration::from_secs(600) {
+            return v;
+        }
+    }
+    let Some(from) = relay_from() else {
+        return Value::Null;
+    };
+    let domain = from
+        .rsplit_once('@')
+        .map(|(_, d)| d)
+        .unwrap_or("")
+        .to_string();
+    let dmarc_name = format!("_dmarc.{domain}");
+    let (id, acct, dmarc) = tokio::join!(
+        state
+            .ses
+            .get_email_identity()
+            .email_identity(&domain)
+            .send(),
+        state.ses.get_account().send(),
+        common::dns_txt::lookup(&dmarc_name),
+    );
+    let id = id.ok();
+    let v = json!({
+        "domain": domain,
+        "verified": id.as_ref().map(|o| o.verified_for_sending_status()),
+        "dkim": id.as_ref().and_then(|o| o.dkim_attributes()).and_then(|d| d.status()).map(|s| s.as_str().to_string()),
+        "mail_from": id.as_ref().and_then(|o| o.mail_from_attributes()).map(|m| m.mail_from_domain_status().as_str().to_string()),
+        "dmarc": dmarc.ok().and_then(|r| common::dns_txt::dmarc_policy(&r)),
+        "production": acct.ok().map(|a| a.production_access_enabled()),
+    });
+    if let Ok(mut g) = CACHE.lock() {
+        *g = Some((std::time::Instant::now(), v.clone()));
+    }
+    v
+}
+
+/// A stats range: `from` on or before `to`, at most the days counts are kept.
+pub fn stats_range_ok(from: &str, to: &str) -> bool {
+    let p = |d: &str| chrono::NaiveDate::parse_from_str(d, "%Y-%m-%d").ok();
+    match (p(from), p(to)) {
+        (Some(a), Some(b)) => a <= b && (b - a).num_days() < stats::DAY_RETENTION_DAYS,
+        _ => false,
+    }
+}
+
+/// POST /hybrid/email/stats (signed) `{from, to}`: this install's email
+/// through the relay, by kind, per UTC day from `from` to `to` (inclusive,
+/// at most 120 days), from SES's own events.
+pub async fn stats_route(
+    State(state): State<Arc<AppState>>,
+    method: Method,
+    uri: OriginalUri,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Reply {
+    let install = signed(&state, &headers, &method, &uri, &body).await?;
+    relay_from().ok_or_else(not_here)?;
+    let b: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+    let day = |k: &str| {
+        b[k].as_str()
+            .filter(|d| chrono::NaiveDate::parse_from_str(d, "%Y-%m-%d").is_ok())
+            .map(str::to_string)
+    };
+    let (Some(from), Some(to)) = (day("from"), day("to")) else {
+        return Err(fail(
+            StatusCode::BAD_REQUEST,
+            "bad_request",
+            "Send {from, to} as yyyy-mm-dd.",
+        ));
+    };
+    if !stats_range_ok(&from, &to) {
+        return Err(fail(
+            StatusCode::BAD_REQUEST,
+            "bad_request",
+            "from must be on or before to, at most 120 days apart.",
+        ));
+    }
+    let s = stats::read(
+        &state.dynamo,
+        &state.config.settings_table_name,
+        &hybrid_relay::install_pk(&install.id),
+        &from,
+        &to,
+    )
+    .await
+    .map_err(|_| unavailable())?;
+    Ok(Json(stats::to_json(&s)))
 }
 
 /// POST /api/admin/hybrid/:install_id/email/pause `{paused, reason}`:
@@ -866,6 +970,20 @@ pub async fn admin_pause(
     )
     .await;
     Ok(Json(json!({ "ok": true, "paused": paused })))
+}
+
+#[cfg(test)]
+mod stats_range_tests {
+    use super::stats_range_ok;
+
+    #[test]
+    fn a_stats_range_is_ordered_and_bounded() {
+        assert!(stats_range_ok("2026-10-24", "2026-10-30"));
+        assert!(stats_range_ok("2026-10-30", "2026-10-30"));
+        assert!(!stats_range_ok("2026-10-30", "2026-10-24"));
+        assert!(!stats_range_ok("2026-01-01", "2026-10-30"));
+        assert!(!stats_range_ok("nope", "2026-10-30"));
+    }
 }
 
 #[cfg(test)]

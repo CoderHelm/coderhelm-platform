@@ -86,6 +86,15 @@ impl Period {
     pub fn hourly(self) -> bool {
         self == Self::Day
     }
+
+    /// The UTC days a period's email counts cover (24 hours: yesterday and today).
+    pub fn days(self) -> i64 {
+        match self {
+            Self::Day => 2,
+            Self::Week => 7,
+            Self::Month => 30,
+        }
+    }
 }
 
 /// The buckets of a period and of the one before it, oldest first, each as
@@ -616,12 +625,84 @@ pub struct DeliveryAnalytics {
     #[schema(example = json!(["github", "webhook", "slack", "email"]))]
     pub seen_sources: Vec<String>,
     pub backfill: Backfill,
+    /// Hybrid installs: the events CoderHelm's relay forwarded here, one row
+    /// per provider (GitHub, Jira), with when each last went through. Empty
+    /// elsewhere.
+    pub relay: Vec<RelayRow>,
+    /// Self-hosted installs: email by kind (sends, deliveries, bounces,
+    /// complaints, rejections) over the period's UTC days, from Amazon
+    /// SES's own events, for the sender in use (CoderHelm's relay or the
+    /// install's SES), and who sends Cognito's sign-in email. Null elsewhere.
+    pub email: Option<super::email_metrics::EmailOverview>,
     /// Days the counts are kept.
     #[schema(example = 120)]
     pub kept_days: i64,
     /// Days each delivery's record is kept (what a drill-in can list).
     #[schema(example = 14)]
     pub records_kept_days: i64,
+}
+
+/// Events CoderHelm's relay forwarded to this install for one provider.
+#[derive(Debug, Clone, PartialEq, Serialize, utoipa::ToSchema)]
+pub struct RelayRow {
+    /// `github` or `jira`.
+    #[schema(example = "jira")]
+    pub provider: String,
+    /// Finished forwards in the period (retries count once).
+    #[schema(example = 120)]
+    pub deliveries: i64,
+    /// Delivered to the install.
+    #[schema(example = 119)]
+    pub ok: i64,
+    /// Failed for good (after about 24 hours of retries, or refused).
+    #[schema(example = 1)]
+    pub failed: i64,
+    /// Delivered, out of finished. Null with none.
+    #[schema(example = 0.9917)]
+    pub success_rate: Option<f64>,
+    /// 95th percentile of the last attempt's time, milliseconds.
+    #[schema(example = 420)]
+    pub p95_ms: Option<u64>,
+    /// When a forward last went through (any period).
+    #[schema(example = "2026-10-29T14:03:11Z")]
+    pub last_delivered_at: Option<String>,
+    /// When a forward last failed for good (any period).
+    #[schema(example = "2026-10-21T08:40:02Z")]
+    pub last_failed_at: Option<String>,
+}
+
+/// The relay rows, from the period's source rows and the hosted side's
+/// last-forward times (pure; tested). GitHub always; Jira once it has had a
+/// forward or a link.
+pub fn relay_rows(sources: &[SourceRow], last: &Value, jira_linked: bool) -> Vec<RelayRow> {
+    let mut out = vec![];
+    for (provider, source) in [("github", "relay"), ("jira", "relay_jira")] {
+        let row = sources
+            .iter()
+            .find(|r| r.source == source && r.direction == "outbound");
+        let t = |k: &str| last[provider][k].as_str().map(str::to_string);
+        let last_ok = t("last_ok_at");
+        let last_failed = t("last_failed_at");
+        if provider == "jira"
+            && row.is_none()
+            && last_ok.is_none()
+            && last_failed.is_none()
+            && !jira_linked
+        {
+            continue;
+        }
+        out.push(RelayRow {
+            provider: provider.into(),
+            deliveries: row.map_or(0, |r| r.deliveries),
+            ok: row.map_or(0, |r| r.ok),
+            failed: row.map_or(0, |r| r.failed),
+            success_rate: row.and_then(|r| r.success_rate),
+            p95_ms: row.and_then(|r| r.p95_ms),
+            last_delivered_at: last_ok,
+            last_failed_at: last_failed,
+        });
+    }
+    out
 }
 
 /// An endpoint as the settings table keeps it (only what the overview
@@ -936,6 +1017,8 @@ pub fn build(
         endpoints,
         seen_sources: seen.into_iter().collect(),
         backfill: Backfill { complete: true },
+        relay: vec![],
+        email: None,
         kept_days: rollup::DAY_RETENTION_DAYS,
         records_kept_days: deliveries::RETENTION_DAYS,
     }
@@ -955,7 +1038,11 @@ pub fn merge_rows(into: &mut BTreeMap<String, Counters>, rows: Vec<(String, Coun
 /// what an install adds from CoderHelm's side.
 pub fn relay_only(c: Counters) -> Counters {
     c.into_iter()
-        .filter(|(k, _)| k.starts_with("s#relay#") || k.starts_with("s#broker#"))
+        .filter(|(k, _)| {
+            k.starts_with("s#relay#")
+                || k.starts_with("s#relay_jira#")
+                || k.starts_with("s#broker#")
+        })
         .collect()
 }
 
@@ -1168,13 +1255,14 @@ async fn endpoint_metas(state: &AppState, team: &str) -> Vec<EndpointMeta> {
     }
 }
 
-/// The hosted relay's rollups for this install (hybrid only).
-async fn relayed_rows(state: &AppState, p: &Plan) -> Vec<(String, Counters)> {
+/// The hosted relay's rollups for this install (hybrid only), and its
+/// last-forward times by provider.
+async fn relayed_rows(state: &AppState, p: &Plan) -> (Vec<(String, Counters)>, Option<Value>) {
     let Some(creds) = common::hybrid::client::credentials() else {
-        return vec![];
+        return (vec![], None);
     };
     let (Some(a), Some(b)) = (p.previous.first(), p.current.last()) else {
-        return vec![];
+        return (vec![], Some(Value::Null));
     };
     let body = json!({ "from": bucket_sk(p.hourly, *a), "to": bucket_sk(p.hourly, *b) });
     match common::hybrid::client::call(
@@ -1186,10 +1274,10 @@ async fn relayed_rows(state: &AppState, p: &Plan) -> Vec<(String, Counters)> {
     )
     .await
     {
-        Ok(v) => parse_relayed(&v),
+        Ok(v) => (parse_relayed(&v), Some(v["last"].clone())),
         Err(e) => {
             warn!(error = %e.message, "Could not read relay rollups from CoderHelm");
-            vec![]
+            (vec![], Some(Value::Null))
         }
     }
 }
@@ -1330,9 +1418,17 @@ pub async fn analytics(
     let mut rows = BTreeMap::new();
     merge_rows(&mut rows, own);
     merge_rows(&mut rows, other);
+    let (relayed, last) = relayed;
     merge_rows(&mut rows, relayed);
     let mut out = build(period, &p, &rows, &sel, &metas, &stats.unwrap_or_default());
     out.backfill.complete = own_done && unrouted_done;
+    if let Some(last) = last {
+        let linked = super::hybrid_install::cached_local().is_some_and(|l| l.jira_link);
+        out.relay = relay_rows(&out.sources, &last, linked);
+    }
+    if unrouted {
+        out.email = Some(super::email_metrics::overview(&state, period.days()).await);
+    }
     Ok(Json(out))
 }
 
@@ -1352,11 +1448,36 @@ pub async fn install_rollups(state: &AppState, pk: &str, from: &str, to: &str) -
     )
     .await;
     let rows = store(state).read(pk, from, to).await.unwrap_or_default();
+    let mut last = json!({});
+    for provider in ["github", "jira"] {
+        let item = state
+            .dynamo
+            .get_item()
+            .table_name(&state.config.settings_table_name)
+            .key("pk", AttributeValue::S(pk.to_string()))
+            .key(
+                "sk",
+                AttributeValue::S(common::hybrid::relay::last_sk(provider)),
+            )
+            .send()
+            .await
+            .ok()
+            .and_then(|r| r.item);
+        let t = |k: &str| {
+            item.as_ref()
+                .and_then(|i| i.get(k))
+                .and_then(|v| v.as_s().ok())
+                .cloned()
+        };
+        last[provider] =
+            json!({ "last_ok_at": t("last_ok_at"), "last_failed_at": t("last_failed_at") });
+    }
     json!({
         "buckets": rows
             .into_iter()
             .map(|(sk, c)| json!({ "sk": sk, "counters": relay_only(c) }))
             .collect::<Vec<_>>(),
+        "last": last,
     })
 }
 
@@ -1367,6 +1488,83 @@ mod tests {
 
     fn t(s: &str) -> DateTime<Utc> {
         DateTime::parse_from_rfc3339(s).unwrap().with_timezone(&Utc)
+    }
+
+    /// Jira forwards count, fail and time on their own row beside GitHub's,
+    /// with each provider's last forward; both reach the install.
+    #[test]
+    fn jira_relay_forwards_count_beside_githubs() {
+        let p = plan(Period::Week, t("2026-10-27T12:00:00Z"));
+        let day = bucket_sk(false, *p.current.last().unwrap());
+        let mut rows = BTreeMap::new();
+        let mut add = |src: &str, status: Status, ms: u64, attempts: usize| {
+            let mut d = Delivery::new(Direction::Outbound, src, "jira.site", "ins_x");
+            for _ in 0..attempts {
+                d.push_attempt(Attempt {
+                    at: "2026-10-27T10:00:00Z".into(),
+                    code: Some(200),
+                    duration_ms: ms,
+                    error: String::new(),
+                });
+            }
+            let reason = if status == Status::Failed {
+                "relay_gave_up"
+            } else {
+                ""
+            };
+            d.created_at = "2026-10-27T10:00:00.000Z".into();
+            d.finish(status, "", reason);
+            let c = relay_only(rollup::contribution(&d));
+            merge_rows(&mut rows, vec![(day.clone(), c)]);
+        };
+        add("relay", Status::Handled, 100, 1);
+        add("relay", Status::Handled, 120, 1);
+        add("relay_jira", Status::Handled, 300, 2);
+        add("relay_jira", Status::Failed, 900, 3);
+        // Still retrying: not counted until it finishes.
+        add("relay_jira", Status::Pending, 50, 1);
+        let sel = Selection {
+            source: None,
+            status: StatusSel::All,
+            endpoint: None,
+        };
+        let out = build(Period::Week, &p, &rows, &sel, &[], &[]);
+        let last = json!({
+            "github": { "last_ok_at": "2026-10-27T10:00:00Z", "last_failed_at": null },
+            "jira": { "last_ok_at": "2026-10-27T09:00:00Z", "last_failed_at": "2026-10-27T10:00:00Z" },
+        });
+        let r = relay_rows(&out.sources, &last, true);
+        assert_eq!(r.len(), 2);
+        assert_eq!(
+            (r[0].provider.as_str(), r[0].deliveries, r[0].failed),
+            ("github", 2, 0)
+        );
+        assert_eq!(
+            (
+                r[1].provider.as_str(),
+                r[1].deliveries,
+                r[1].ok,
+                r[1].failed
+            ),
+            ("jira", 2, 1, 1)
+        );
+        assert_eq!(r[1].success_rate, Some(0.5));
+        assert!(r[1].p95_ms.unwrap() >= 300);
+        assert_eq!(
+            r[1].last_delivered_at.as_deref(),
+            Some("2026-10-27T09:00:00Z")
+        );
+        assert_eq!(r[1].last_failed_at.as_deref(), Some("2026-10-27T10:00:00Z"));
+        assert!(out.reasons.iter().any(|x| x.code == "relay_gave_up"));
+        // Jira shows once linked or used, never as an empty row before.
+        assert_eq!(relay_rows(&[], &json!({}), false).len(), 1);
+        assert_eq!(relay_rows(&[], &json!({}), true).len(), 2);
+        // The install takes Jira's relay counters from CoderHelm.
+        let mut c = Counters::new();
+        c.insert("s#relay_jira#out#handled".into(), 3);
+        c.insert("s#github#in#handled".into(), 9);
+        let only = relay_only(c);
+        assert_eq!(only.len(), 1);
     }
 
     #[test]

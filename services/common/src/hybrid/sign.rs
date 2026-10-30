@@ -69,6 +69,29 @@ pub fn relay_key(master: &str, install_id: &str) -> String {
     hex::encode(mac(master.as_bytes(), &[b"relay:", install_id.as_bytes()]))
 }
 
+/// The capability a linked install's Jira app links carry (one per Forge
+/// trigger): the hosted Jira proxy takes a call only with it, for that
+/// install, that trigger and that link (`linked_at`: a new link is a new
+/// token), and only while the link stands.
+pub fn jira_trigger_token(
+    master: &str,
+    install_id: &str,
+    trigger: &str,
+    linked_at: &str,
+) -> String {
+    hex::encode(mac(
+        master.as_bytes(),
+        &[
+            b"jira-trigger:",
+            install_id.as_bytes(),
+            b":",
+            trigger.as_bytes(),
+            b":",
+            linked_at.as_bytes(),
+        ],
+    ))
+}
+
 /// A new install id: `ins_` and 24 random lowercase letters and digits.
 pub fn new_install_id() -> String {
     use rand::Rng;

@@ -269,7 +269,43 @@ pub async fn handle(
         StatusCode::BAD_REQUEST
     })?;
 
+    // Hosted side of hybrid: the team linked its Jira site to a self-hosted
+    // install, so the (checked) event goes there and is not handled here.
+    if let Some(code) =
+        super::hybrid_jira::relay_team(&state, &team_id, "site_webhook", &body).await
+    {
+        return Ok(code);
+    }
+
     process_jira_payload(&state, &team_id, installation_id, &payload).await
+}
+
+/// A Jira webhook CoderHelm's relay forwarded to this install for the
+/// hosted site it linked (its signature was checked on the hosted side, and
+/// the relay's own signature here). Handled for `team_id`, the install's
+/// own team, under that team's own GitHub installation.
+pub async fn process_relayed(
+    state: &AppState,
+    team_id: &str,
+    payload: &Value,
+) -> Result<StatusCode, StatusCode> {
+    let installation_id = state
+        .dynamo
+        .get_item()
+        .table_name(&state.config.teams_table_name)
+        .key("team_id", attr_s(team_id))
+        .key("sk", attr_s("META"))
+        .send()
+        .await
+        .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?
+        .item()
+        .and_then(|item| {
+            item.get("github_installation_id")
+                .and_then(|v| v.as_n().ok())
+                .and_then(|n| n.parse::<u64>().ok())
+        })
+        .unwrap_or(0);
+    process_jira_payload(state, team_id, installation_id, payload).await
 }
 
 /// Shared payload processing for both token-based and Forge webhook paths.
@@ -822,6 +858,13 @@ pub async fn handle_forge(
             "Forge Jira webhook: invalid or missing forge_secret"
         );
         return Err(StatusCode::FORBIDDEN);
+    }
+
+    // Hosted side of hybrid: the team linked its Jira site to a self-hosted
+    // install. The event passed the team's own check; it goes there, and is
+    // not handled here as well.
+    if let Some(code) = super::hybrid_jira::relay_team(&state, &team_id, "site", &body).await {
+        return Ok(code);
     }
 
     // The team's own GitHub installation, always from its record.

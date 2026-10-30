@@ -83,6 +83,17 @@ pub struct Local {
     /// The records last sent for the name (so they're sent once per change).
     #[serde(default)]
     pub records_sent: String,
+    /// Settings, Integrations, Jira, "Link through CoderHelm": a hosted team's Jira site
+    /// may be linked, and its events taken from the relay. Off by default;
+    /// turning it off unlinks.
+    #[serde(default)]
+    pub jira_link: bool,
+    /// The linked site, as last copied from CoderHelm (its `linked_at`
+    /// marks which link the copied Forge settings belong to).
+    #[serde(default)]
+    pub jira_site: String,
+    #[serde(default)]
+    pub jira_synced_at: String,
 }
 
 static LOCAL: RwLock<Option<(Instant, Local)>> = RwLock::new(None);
@@ -521,6 +532,9 @@ pub struct SettingsBody {
     pub integrations: Option<Vec<String>>,
     #[serde(default)]
     pub sharing: Option<SharingBody>,
+    /// Settings, Integrations, Jira, "Link through CoderHelm" on or off.
+    #[serde(default)]
+    pub jira_link: Option<bool>,
 }
 
 #[derive(Deserialize, Default, Clone)]
@@ -556,6 +570,9 @@ pub fn apply_settings(l: &mut Local, b: &SettingsBody) -> Result<(), &'static st
         l.sharing = s.enabled;
         l.share_payloads = s.enabled && s.payloads;
     }
+    if let Some(on) = b.jira_link {
+        l.jira_link = on;
+    }
     Ok(())
 }
 
@@ -564,7 +581,15 @@ async fn do_settings(
     b: &SettingsBody,
 ) -> Result<Local, (StatusCode, Json<Value>)> {
     let mut l = local(state).await;
+    let was_linking = l.jira_link;
     apply_settings(&mut l, b).map_err(|m| fail(StatusCode::BAD_REQUEST, "bad_settings", m))?;
+    if l.jira_link && creds_now().await.is_none() {
+        return Err(not_registered());
+    }
+    if was_linking && !l.jira_link {
+        // Off: unlink, so CoderHelm handles the site's events again.
+        jira_unlink_now(state, &mut l).await?;
+    }
     if let Some(c) = creds_now().await {
         client::call(
             &state.http,
@@ -670,6 +695,26 @@ pub fn checks(
             )
         });
     }
+    if l.jira_link {
+        let link = hosted.map(|h| &h["jira"]["link"]).filter(|v| v.is_object());
+        out.push(match link {
+            Some(v) => {
+                let site = v["site_url"].as_str().filter(|s| !s.is_empty()).unwrap_or("a Jira webhook");
+                if l.jira_synced_at.is_empty() || v["linked_at"].as_str() != Some(l.jira_synced_at.as_str()) {
+                    check("hybrid_jira", "wait", "syncing", &format!("Linking {site}"), "CoderHelm linked the site. This install copies its Jira app settings the next time this page checks.")
+                } else {
+                    check("hybrid_jira", "pass", "ok", &format!("{site} is linked through CoderHelm"), "")
+                }
+            }
+            None => check(
+                "hybrid_jira",
+                "todo",
+                "no_link",
+                "Link your Jira site through CoderHelm",
+                "Open Settings, Integrations, Jira and press Link: sign in to CoderHelm as an admin of the team that connected the site, and confirm.",
+            ),
+        });
+    }
     if let Some(p) = intake_problem {
         let sp = match p {
             "signature_mismatch" => sign::SignatureProblem::Mismatch,
@@ -720,6 +765,9 @@ async fn status_value(state: &AppState, deep: bool) -> Value {
     let (facts, view) = super::setup_checks::domain_facts_now(state).await;
     sync_name_records(state, view.as_ref()).await;
     let (_, code) = super::setup_checks::domain_code(&facts);
+    if let Some(h) = &hosted {
+        let _ = sync_jira(state, &mut l, Some(h)).await;
+    }
     let problem = recent_intake_problem();
     let mut list = checks(&l, creds.is_some(), hosted.as_ref(), Some(code), problem);
     if deep && l.github_mode == "hosted" {
@@ -773,6 +821,11 @@ async fn status_value(state: &AppState, deep: bool) -> Value {
         },
         "integrations": chosen,
         "sharing": { "enabled": l.sharing, "payloads": l.share_payloads },
+        "jira": {
+            "enabled": l.jira_link,
+            "link": hosted.as_ref().map(|h| h["jira"]["link"].clone()).unwrap_or(Value::Null),
+            "synced": !l.jira_synced_at.is_empty(),
+        },
         "checks": list,
     })
 }
@@ -827,6 +880,9 @@ pub async fn unregister(
         }
     }
     client::set_credentials(None);
+    // The linked Jira site's settings go, and the install's own come back.
+    let mut l = local(&state).await;
+    forget_jira(&state, &mut l).await;
     save_local(&state, &Local::default()).await?;
     Ok(Json(status_value(&state, false).await))
 }
@@ -899,6 +955,9 @@ pub async fn release_name(
 pub struct LinkBody {
     #[serde(default)]
     return_url: Option<String>,
+    /// Jira: the site the install expects (CoderHelm links only that one).
+    #[serde(default)]
+    site_url: Option<String>,
 }
 
 /// POST /api/system/hybrid/github/link — where to install CoderHelm's GitHub App.
@@ -951,6 +1010,290 @@ pub async fn github_unlink(
     .await
     .map_err(from_call)?;
     Ok(Json(status_value(&state, false).await))
+}
+
+/// POST /api/system/hybrid/jira/link `{return_url?}` — the CoderHelm page
+/// where an admin of the team that connected the Jira site confirms the
+/// link. Needs Settings, Integrations, Jira, "Link through CoderHelm" on.
+pub async fn jira_link(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<Claims>,
+    body: Option<Json<LinkBody>>,
+) -> Reply {
+    admin(&claims)?;
+    let l = local(&state).await;
+    if !l.jira_link {
+        return Err(fail(
+            StatusCode::CONFLICT,
+            "jira_link_off",
+            "Turn on Link through CoderHelm first.",
+        ));
+    }
+    let b = body.map(|Json(b)| b).unwrap_or_default();
+    let site = b
+        .site_url
+        .as_deref()
+        .and_then(super::hybrid_jira::site_host)
+        .ok_or_else(|| {
+            fail(
+                StatusCode::BAD_REQUEST,
+                "bad_site",
+                "Type your Jira site's address, e.g. example.atlassian.net.",
+            )
+        })?;
+    let (c, _) = ensure_verified(&state).await?;
+    let ret = b
+        .return_url
+        .filter(|u| u.starts_with("https://"))
+        .unwrap_or_else(|| {
+            format!(
+                "{}/settings/integrations/jira/",
+                common::public_urls::app_url(&state.config.stage)
+            )
+        });
+    client::call(
+        &state.http,
+        &c,
+        "POST",
+        "/hybrid/jira/link-start",
+        Some(&json!({ "return_url": ret, "site_url": site })),
+    )
+    .await
+    .map(Json)
+    .map_err(from_call)
+}
+
+/// The Jira settings a link replaces on the install's team: the site, the
+/// app's secret and its links (here a token and CoderHelm's proxy links).
+pub fn jira_fields() -> Vec<&'static str> {
+    let mut f = vec!["site_url", "forge_secret"];
+    f.extend(super::hybrid_jira::TRIGGERS.iter().map(|(field, _)| *field));
+    f
+}
+
+/// Whether the install's Jira settings are its own (not a link's copy): a
+/// link's links all go through CoderHelm's proxy.
+pub fn own_jira_settings(item: &std::collections::HashMap<String, AttributeValue>) -> bool {
+    let s = |k: &str| {
+        item.get(k)
+            .and_then(|v| v.as_s().ok())
+            .cloned()
+            .unwrap_or_default()
+    };
+    !s("forge_secret").is_empty() && !s("add_comment_url").contains("/hybrid/jira/trigger/")
+}
+
+async fn team_jira_item(
+    state: &AppState,
+    team: &str,
+) -> Option<std::collections::HashMap<String, AttributeValue>> {
+    state
+        .dynamo
+        .get_item()
+        .table_name(&state.config.jira_config_table_name)
+        .key("pk", AttributeValue::S(team.into()))
+        .key("sk", AttributeValue::S("JIRA#config".into()))
+        .consistent_read(true)
+        .send()
+        .await
+        .ok()
+        .and_then(|r| r.item)
+}
+
+/// DELETE /api/system/hybrid/jira/link — unlink the site (CoderHelm handles
+/// its events again) and forget the copied Jira app settings.
+pub async fn jira_unlink(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<Claims>,
+) -> Reply {
+    admin(&claims)?;
+    let mut l = local(&state).await;
+    jira_unlink_now(&state, &mut l).await?;
+    save_local(&state, &l).await?;
+    Ok(Json(status_value(&state, false).await))
+}
+
+async fn jira_unlink_now(state: &AppState, l: &mut Local) -> Result<(), (StatusCode, Json<Value>)> {
+    if let Some(c) = creds_now().await {
+        client::call(&state.http, &c, "DELETE", "/hybrid/jira/link", None)
+            .await
+            .map_err(from_call)?;
+    }
+    forget_jira(state, l).await;
+    Ok(())
+}
+
+/// What a sync should do, from the link CoderHelm reports and what this
+/// install last copied (pure; tested).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum JiraSync {
+    Nothing,
+    /// Copy the linked site's settings (a new link, or a relink).
+    Copy,
+    /// The link is gone on CoderHelm's side: forget the copy.
+    Forget,
+}
+
+pub fn jira_sync_plan(l: &Local, link: Option<&Value>) -> JiraSync {
+    match link.filter(|v| v.is_object()) {
+        Some(v) if l.jira_link => {
+            if v["linked_at"].as_str() == Some(l.jira_synced_at.as_str())
+                && !l.jira_synced_at.is_empty()
+            {
+                JiraSync::Nothing
+            } else {
+                JiraSync::Copy
+            }
+        }
+        _ if !l.jira_synced_at.is_empty() => JiraSync::Forget,
+        _ => JiraSync::Nothing,
+    }
+}
+
+/// Keeps this install's Jira settings in step with the link on CoderHelm:
+/// copies the linked site's Jira app settings to the install's team (so it
+/// checks the Forge secret on each event and can comment back), or forgets
+/// them once the link is gone. `hosted` is CoderHelm's status answer.
+pub async fn sync_jira(
+    state: &AppState,
+    l: &mut Local,
+    hosted: Option<&Value>,
+) -> Result<(), &'static str> {
+    let link = hosted.map(|h| &h["jira"]["link"]);
+    match jira_sync_plan(l, link) {
+        JiraSync::Nothing => Ok(()),
+        JiraSync::Forget => {
+            forget_jira(state, l).await;
+            let _ = save_local(state, l).await;
+            Ok(())
+        }
+        JiraSync::Copy => {
+            let c = creds_now().await.ok_or("jira_link_unsynced")?;
+            let team = only_team(state).await.ok_or("no_team")?;
+            let cfg = client::call(
+                &state.http,
+                &c,
+                "POST",
+                "/hybrid/jira/config",
+                Some(&json!({})),
+            )
+            .await
+            .map_err(|_| "jira_link_unsynced")?;
+            // The install's own Jira app settings, kept aside the first time
+            // a link replaces them, and put back when it is unlinked.
+            let existing = team_jira_item(state, &team).await.unwrap_or_default();
+            let keep = own_jira_settings(&existing) && !existing.contains_key("own_forge_secret");
+            let mut expr = vec!["updated_at = :at".to_string()];
+            let mut req = state
+                .dynamo
+                .update_item()
+                .table_name(&state.config.jira_config_table_name)
+                .key("pk", AttributeValue::S(team))
+                .key("sk", AttributeValue::S("JIRA#config".into()))
+                .expression_attribute_values(
+                    ":at",
+                    AttributeValue::S(chrono::Utc::now().to_rfc3339()),
+                );
+            for (n, k) in jira_fields().into_iter().enumerate() {
+                expr.push(format!("#f{n} = :f{n}"));
+                req = req
+                    .expression_attribute_names(format!("#f{n}"), k)
+                    .expression_attribute_values(
+                        format!(":f{n}"),
+                        AttributeValue::S(cfg[k].as_str().unwrap_or("").into()),
+                    );
+                if keep {
+                    if let Some(v) = existing.get(k) {
+                        expr.push(format!("#o{n} = :o{n}"));
+                        req = req
+                            .expression_attribute_names(format!("#o{n}"), format!("own_{k}"))
+                            .expression_attribute_values(format!(":o{n}"), v.clone());
+                    }
+                }
+            }
+            req.update_expression(format!("SET {}", expr.join(", ")))
+                .send()
+                .await
+                .map_err(|_| "jira_link_unsynced")?;
+            let v = link.cloned().unwrap_or_default();
+            l.jira_site = v["site_url"].as_str().unwrap_or("").to_string();
+            l.jira_synced_at = v["linked_at"].as_str().unwrap_or("").to_string();
+            save_local(state, l)
+                .await
+                .map_err(|_| "jira_link_unsynced")?;
+            info!(site = %l.jira_site, "hybrid: copied the linked Jira site's settings");
+            Ok(())
+        }
+    }
+}
+
+/// Forgets the copied Jira app settings (the Forge secret and links) once
+/// the site is unlinked, so nothing here acts for it any more.
+async fn forget_jira(state: &AppState, l: &mut Local) {
+    if l.jira_synced_at.is_empty() {
+        return;
+    }
+    if let Some(team) = only_team(state).await {
+        let existing = team_jira_item(state, &team).await.unwrap_or_default();
+        let mut sets = vec![];
+        let mut removes = vec![];
+        let mut req = state
+            .dynamo
+            .update_item()
+            .table_name(&state.config.jira_config_table_name)
+            .key("pk", AttributeValue::S(team))
+            .key("sk", AttributeValue::S("JIRA#config".into()));
+        for (n, k) in jira_fields().into_iter().enumerate() {
+            req = req.expression_attribute_names(format!("#f{n}"), k);
+            match existing.get(&format!("own_{k}")) {
+                // The install's own setting comes back.
+                Some(v) => {
+                    req = req
+                        .expression_attribute_names(format!("#o{n}"), format!("own_{k}"))
+                        .expression_attribute_values(format!(":o{n}"), v.clone());
+                    sets.push(format!("#f{n} = :o{n}"));
+                    removes.push(format!("#o{n}"));
+                }
+                None => removes.push(format!("#f{n}")),
+            }
+        }
+        let mut update = String::new();
+        if !sets.is_empty() {
+            update.push_str(&format!("SET {} ", sets.join(", ")));
+        }
+        update.push_str(&format!("REMOVE {}", removes.join(", ")));
+        let _ = req
+            .update_expression(update)
+            .condition_expression("attribute_exists(pk)")
+            .send()
+            .await;
+    }
+    l.jira_site.clear();
+    l.jira_synced_at.clear();
+}
+
+/// The linked site's settings are copied here, fetching them now when they
+/// aren't yet (the first event after linking can beat the settings page).
+async fn ensure_jira_synced(state: &AppState) -> Result<(), (StatusCode, &'static str)> {
+    let mut l = local(state).await;
+    if !l.jira_link {
+        return Err((StatusCode::NOT_FOUND, "jira_not_linked"));
+    }
+    if !l.jira_synced_at.is_empty() {
+        return Ok(());
+    }
+    let c = creds_now()
+        .await
+        .ok_or((StatusCode::NOT_FOUND, "jira_not_linked"))?;
+    let hosted = client::call(&state.http, &c, "GET", "/hybrid/status", None)
+        .await
+        .map_err(|_| (StatusCode::SERVICE_UNAVAILABLE, "jira_link_unsynced"))?;
+    if !hosted["jira"]["link"].is_object() {
+        return Err((StatusCode::NOT_FOUND, "jira_not_linked"));
+    }
+    sync_jira(state, &mut l, Some(&hosted))
+        .await
+        .map_err(|_| (StatusCode::SERVICE_UNAVAILABLE, "jira_link_unsynced"))
 }
 
 /// PUT /api/system/hybrid/settings `{github_mode?, integrations?, sharing?}`
@@ -1079,6 +1422,7 @@ pub async fn setup_settings(
             github_mode: b.github_mode.clone(),
             integrations: b.integrations.clone(),
             sharing: b.sharing.clone(),
+            jira_link: None,
         };
         do_settings(&state, &s).await?;
         Ok(Json(status_value(&state, false).await))
@@ -1189,102 +1533,142 @@ pub async fn intake(
         None => {}
         Some((code, p)) => return Err(fail(code, p, intake_claim_message(p))),
     }
-    match source.as_str() {
-        "github" => {
-            let payload: Value = serde_json::from_slice(&body).map_err(|_| {
-                fail(
-                    StatusCode::BAD_REQUEST,
-                    "bad_payload",
-                    "The body isn't JSON.",
-                )
-            })?;
-            let installation_id = payload["installation"]["id"].as_u64().ok_or_else(|| {
-                fail(
-                    StatusCode::BAD_REQUEST,
-                    "bad_payload",
-                    "The body names no installation.",
-                )
-            })?;
-            let mut gh = headers.clone();
-            gh.insert(
-                "x-github-event",
-                event
-                    .parse()
-                    .unwrap_or(axum::http::HeaderValue::from_static("unknown")),
-            );
-            gh.insert(
-                "x-github-delivery",
-                stamp
-                    .delivery_id
-                    .parse()
-                    .unwrap_or(axum::http::HeaderValue::from_static("")),
-            );
-            let mut d = super::github_webhook::inbound_delivery(&gh, &body, &event);
-            // The redelivery for a relayed event is the relay's own record.
-            d.redeliver = None;
-            super::github_webhook::process(&state, &event, &payload, installation_id, &mut d)
-                .await
-                .map_err(|code| fail(code, "handler_error", "Handling the event failed."))
-        }
-        "jira" => {
-            let mut payload: Value = serde_json::from_slice(&body).map_err(|_| {
-                fail(
-                    StatusCode::BAD_REQUEST,
-                    "bad_payload",
-                    "The body isn't JSON.",
-                )
-            })?;
-            if event == "register" {
-                if payload["team_id"].as_str().is_some_and(sign::is_install_id) {
-                    if let Some(o) = payload.as_object_mut() {
-                        o.remove("team_id");
-                    }
-                }
-                let team = only_team(&state).await.ok_or_else(|| {
+    let handled: Result<StatusCode, (StatusCode, Json<Value>)> = async {
+        match source.as_str() {
+            "github" => {
+                let payload: Value = serde_json::from_slice(&body).map_err(|_| {
                     fail(
-                        StatusCode::CONFLICT,
-                        "no_team",
-                        "This install has no team yet. Sign up first.",
+                        StatusCode::BAD_REQUEST,
+                        "bad_payload",
+                        "The body isn't JSON.",
                     )
                 })?;
-                payload["team_id"] = json!(team);
-                return super::api::forge_register_urls(State(state.clone()), Json(payload))
+                let installation_id = payload["installation"]["id"].as_u64().ok_or_else(|| {
+                    fail(
+                        StatusCode::BAD_REQUEST,
+                        "bad_payload",
+                        "The body names no installation.",
+                    )
+                })?;
+                let mut gh = headers.clone();
+                gh.insert(
+                    "x-github-event",
+                    event
+                        .parse()
+                        .unwrap_or(axum::http::HeaderValue::from_static("unknown")),
+                );
+                gh.insert(
+                    "x-github-delivery",
+                    stamp
+                        .delivery_id
+                        .parse()
+                        .unwrap_or(axum::http::HeaderValue::from_static("")),
+                );
+                let mut d = super::github_webhook::inbound_delivery(&gh, &body, &event);
+                // The redelivery for a relayed event is the relay's own record.
+                d.redeliver = None;
+                super::github_webhook::process(&state, &event, &payload, installation_id, &mut d)
                     .await
-                    .map_err(|code| {
-                        fail(
-                            code,
-                            "handler_error",
-                            "Registering the Jira app's links failed.",
-                        )
-                    });
+                    .map_err(|code| fail(code, "handler_error", "Handling the event failed."))
             }
-            // The Forge app was set up with this install's id as its team id:
-            // the install's own team takes the event.
-            if payload
-                .pointer("/coderhelm/team_id")
-                .and_then(Value::as_str)
-                .is_some_and(sign::is_install_id)
-            {
-                let team = only_team(&state).await.ok_or_else(|| {
+            "jira" => {
+                let mut payload: Value = serde_json::from_slice(&body).map_err(|_| {
                     fail(
-                        StatusCode::CONFLICT,
-                        "no_team",
-                        "This install has no team yet. Sign up first.",
+                        StatusCode::BAD_REQUEST,
+                        "bad_payload",
+                        "The body isn't JSON.",
                     )
                 })?;
-                payload["coderhelm"]["team_id"] = json!(team);
+                if event == "register" {
+                    if payload["team_id"].as_str().is_some_and(sign::is_install_id) {
+                        if let Some(o) = payload.as_object_mut() {
+                            o.remove("team_id");
+                        }
+                    }
+                    let team = only_team(&state).await.ok_or_else(|| {
+                        fail(
+                            StatusCode::CONFLICT,
+                            "no_team",
+                            "This install has no team yet. Sign up first.",
+                        )
+                    })?;
+                    payload["team_id"] = json!(team);
+                    return super::api::forge_register_urls(State(state.clone()), Json(payload))
+                        .await
+                        .map_err(|code| {
+                            fail(
+                                code,
+                                "handler_error",
+                                "Registering the Jira app's links failed.",
+                            )
+                        });
+                }
+                // A hosted team's Jira site this install linked through CoderHelm:
+                // CoderHelm checked the event (the site's Forge secret or the
+                // webhook's signature) and signed the forward; the secret itself
+                // never reaches this install. Refused unless the link is on here.
+                if event == "site" || event == "site_webhook" {
+                    if let Err((code, reason)) = ensure_jira_synced(&state).await {
+                        let msg = deliveries::reason(reason).message;
+                        return Err(fail(code, reason, msg));
+                    }
+                    let team = only_team(&state).await.ok_or_else(|| {
+                        fail(
+                            StatusCode::CONFLICT,
+                            "no_team",
+                            "This install has no team yet. Sign up first.",
+                        )
+                    })?;
+                    return super::jira_webhook::process_relayed(&state, &team, &payload)
+                        .await
+                        .map_err(|code| {
+                            fail(code, "handler_error", "Handling the Jira event failed.")
+                        });
+                }
+                // The Forge app was set up with this install's id as its team id:
+                // the install's own team takes the event.
+                if payload
+                    .pointer("/coderhelm/team_id")
+                    .and_then(Value::as_str)
+                    .is_some_and(sign::is_install_id)
+                {
+                    let team = only_team(&state).await.ok_or_else(|| {
+                        fail(
+                            StatusCode::CONFLICT,
+                            "no_team",
+                            "This install has no team yet. Sign up first.",
+                        )
+                    })?;
+                    payload["coderhelm"]["team_id"] = json!(team);
+                }
+                let bytes = Bytes::from(serde_json::to_vec(&payload).unwrap_or_default());
+                super::jira_webhook::handle_forge(State(state.clone()), bytes)
+                    .await
+                    .map_err(|code| fail(code, "handler_error", "Handling the Jira event failed."))
             }
-            let bytes = Bytes::from(serde_json::to_vec(&payload).unwrap_or_default());
-            super::jira_webhook::handle_forge(State(state.clone()), bytes)
-                .await
-                .map_err(|code| fail(code, "handler_error", "Handling the Jira event failed."))
+            _ => Err(fail(
+                StatusCode::BAD_REQUEST,
+                "unknown_source",
+                "This release doesn't take that kind of event yet. Update CoderHelm.",
+            )),
         }
-        _ => Err(fail(
-            StatusCode::BAD_REQUEST,
-            "unknown_source",
-            "This release doesn't take that kind of event yet. Update CoderHelm.",
-        )),
     }
+    .await;
+    // A copy that wasn't handled isn't "already had": let the relay's retry
+    // (or a redelivery) through again.
+    // Only a refusal from before the event was handled (the install couldn't
+    // fetch the link's settings): a handler that failed partway may have
+    // acted already, and isn't run twice.
+    if matches!(&handled, Err((code, _)) if *code == StatusCode::SERVICE_UNAVAILABLE) {
+        common::claim::release(
+            &state.dynamo,
+            &state.config.settings_table_name,
+            "SYSTEM",
+            &sign::replay_key(&stamp.delivery_id),
+        )
+        .await;
+    }
+    handled
 }
 
 /// What the intake answers for its replay claim: nothing (go on) when this
@@ -1403,6 +1787,7 @@ pub fn public_label(id: &str) -> &'static str {
         "hybrid_github" => "CoderHelm's GitHub App",
         "hybrid_access" => "Access to CoderHelm's apps",
         "hybrid_relay" => "Events from CoderHelm's relay",
+        "hybrid_jira" => "Jira through CoderHelm",
         _ => "Hybrid",
     }
 }
@@ -1507,6 +1892,107 @@ mod tests {
     }
 
     #[test]
+    fn the_jira_link_is_a_setting_and_follows_coderhelms_link() {
+        let mut l = Local::default();
+        assert!(!l.jira_link, "off by default");
+        let on = SettingsBody {
+            jira_link: Some(true),
+            ..Default::default()
+        };
+        apply_settings(&mut l, &on).unwrap();
+        assert!(l.jira_link);
+        let link = json!({ "team_id": "TEAM#1", "site_url": "https://example.atlassian.net", "linked_at": "2026-10-30T00:00:00Z" });
+        // Linked on CoderHelm, not copied yet: copy.
+        assert_eq!(jira_sync_plan(&l, Some(&link)), JiraSync::Copy);
+        l.jira_synced_at = "2026-10-30T00:00:00Z".into();
+        assert_eq!(jira_sync_plan(&l, Some(&link)), JiraSync::Nothing);
+        // Linked again (a new link): copy again.
+        let relinked = json!({ "team_id": "TEAM#1", "linked_at": "2026-10-31T00:00:00Z" });
+        assert_eq!(jira_sync_plan(&l, Some(&relinked)), JiraSync::Copy);
+        // Unlinked on CoderHelm's side: forget the copied settings.
+        assert_eq!(jira_sync_plan(&l, Some(&Value::Null)), JiraSync::Forget);
+        assert_eq!(jira_sync_plan(&l, None), JiraSync::Forget);
+        // The setting off: a link CoderHelm still reports is never copied.
+        let mut off = l.clone();
+        off.jira_link = false;
+        assert_eq!(jira_sync_plan(&off, Some(&link)), JiraSync::Forget);
+        off.jira_synced_at.clear();
+        assert_eq!(jira_sync_plan(&off, Some(&link)), JiraSync::Nothing);
+    }
+
+    #[test]
+    fn a_link_keeps_the_installs_own_jira_settings_aside() {
+        let item = |pairs: &[(&str, &str)]| {
+            pairs
+                .iter()
+                .map(|(k, v)| (k.to_string(), AttributeValue::S(v.to_string())))
+                .collect::<std::collections::HashMap<_, _>>()
+        };
+        let own = item(&[
+            ("forge_secret", "own"),
+            ("add_comment_url", "https://x.example.net/hook"),
+        ]);
+        assert!(own_jira_settings(&own));
+        let copied = item(&[
+            ("forge_secret", "token"),
+            (
+                "add_comment_url",
+                "https://api.example.com/hybrid/jira/trigger/ins_a/add_comment/t",
+            ),
+        ]);
+        assert!(!own_jira_settings(&copied));
+        assert!(!own_jira_settings(&item(&[])));
+        let f = jira_fields();
+        assert!(
+            f.contains(&"forge_secret")
+                && f.contains(&"site_url")
+                && f.contains(&"add_comment_url")
+        );
+        assert_eq!(f.len(), 8);
+    }
+
+    #[test]
+    fn the_jira_check_shows_the_link() {
+        let mut l = Local {
+            verified_at: "x".into(),
+            jira_link: true,
+            ..Default::default()
+        };
+        let hosted = json!({ "verified": true, "jira": { "link": null } });
+        let row = |l: &Local, h: &Value| {
+            checks(l, true, Some(h), None, None)
+                .into_iter()
+                .find(|c| c["id"] == "hybrid_jira")
+        };
+        let c = row(&l, &hosted).unwrap();
+        assert_eq!(
+            (c["status"].as_str(), c["code"].as_str()),
+            (Some("todo"), Some("no_link"))
+        );
+        assert!(c["fix"]
+            .as_str()
+            .unwrap()
+            .contains("Settings, Integrations, Jira"));
+        let linked = json!({ "verified": true, "jira": { "link": { "team_id": "TEAM#1", "site_url": "https://example.atlassian.net", "linked_at": "t1" } } });
+        let c = row(&l, &linked).unwrap();
+        assert_eq!(c["code"], "syncing");
+        l.jira_synced_at = "t1".into();
+        let c = row(&l, &linked).unwrap();
+        assert_eq!(
+            (c["status"].as_str(), c["code"].as_str()),
+            (Some("pass"), Some("ok"))
+        );
+        assert!(c["title"]
+            .as_str()
+            .unwrap()
+            .contains("example.atlassian.net"));
+        // Off: no Jira row at all.
+        l.jira_link = false;
+        assert!(row(&l, &linked).is_none());
+        assert_eq!(public_label("hybrid_jira"), "Jira through CoderHelm");
+    }
+
+    #[test]
     fn settings_keep_github_and_sharing_consistent() {
         let mut l = Local::default();
         let b = SettingsBody {
@@ -1516,6 +2002,7 @@ mod tests {
                 enabled: false,
                 payloads: true,
             }),
+            jira_link: None,
         };
         apply_settings(&mut l, &b).unwrap();
         assert_eq!(l.integrations, vec!["github", "notion"]);

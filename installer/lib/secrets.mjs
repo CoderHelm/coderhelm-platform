@@ -1,5 +1,5 @@
 // The deployment's secret (Secrets Manager): GitHub App keys, the session
-// signing key, optional Google sign-in keys. Values never pass through argv
+// signing key. Values never pass through argv
 // or the terminal: they go in a temporary 0600 file that is removed after.
 import fs from "node:fs";
 import os from "node:os";
