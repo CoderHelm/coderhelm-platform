@@ -144,6 +144,25 @@ pub async fn jira_link(state: &AppState, install_id: &str) -> Option<JiraLink> {
     })
 }
 
+/// The team's route: the install and when it was linked.
+async fn route_of(state: &AppState, team_id: &str) -> Option<(String, String)> {
+    let r = state
+        .dynamo
+        .get_item()
+        .table_name(&state.config.settings_table_name)
+        .key("pk", s(&reverse_pk(team_id)))
+        .key("sk", s("LINK"))
+        .consistent_read(true)
+        .send()
+        .await
+        .ok()?;
+    let i = r.item()?;
+    Some((
+        i.get("install_id")?.as_s().ok()?.clone(),
+        txt(i, "linked_at"),
+    ))
+}
+
 /// The install a hosted team's Jira site is routed to, if any.
 pub async fn install_for_team(state: &AppState, team_id: &str) -> Option<String> {
     let r = state
@@ -385,6 +404,7 @@ pub async fn link_start(
     })?;
     let ret = return_url_for(&install, b["return_url"].as_str().unwrap_or(""));
     let st = broker::new_handle("hyj");
+    let code = confirm_code();
     put_state(
         &state,
         &state_pk(&st),
@@ -392,6 +412,7 @@ pub async fn link_start(
             ("install_id", &install.id),
             ("return_url", &ret),
             ("site", &site),
+            ("code", &code),
         ],
         3600,
     )
@@ -405,11 +426,34 @@ pub async fn link_start(
     .await;
     Ok(Json(json!({
         "state": st,
+        // Shown only on the install: the team admin types it on CoderHelm's
+        // page, so a link someone else got hold of can't be confirmed.
+        "code": code,
         "link_url": format!(
             "{}/settings/integrations/jira/?hybrid_link={st}",
             common::public_urls::app_url(&state.config.stage)
         ),
     })))
+}
+
+/// A short confirmation code: 8 characters without look-alikes.
+pub fn confirm_code() -> String {
+    use rand::Rng;
+    const SET: &[u8] = b"ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+    let mut r = rand::rng();
+    (0..8)
+        .map(|_| SET[r.random_range(0..SET.len())] as char)
+        .collect()
+}
+
+/// Whether a typed code is the state's (spaces, dashes and case ignored).
+pub fn code_matches(stored: &str, typed: &str) -> bool {
+    let norm: String = typed
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .map(|c| c.to_ascii_uppercase())
+        .collect();
+    !stored.is_empty() && bool::from(stored.as_bytes().ct_eq(norm.as_bytes()))
 }
 
 /// DELETE /hybrid/jira/link (signed): unlink; the site's events come back here.
@@ -437,11 +481,17 @@ pub const TRIGGERS: &[(&str, &str)] = &[
 ];
 
 /// The proxy link the install calls for one trigger.
-pub fn proxy_url(api: &str, master: &str, install_id: &str, trigger: &str) -> String {
+pub fn proxy_url(
+    api: &str,
+    master: &str,
+    install_id: &str,
+    trigger: &str,
+    linked_at: &str,
+) -> String {
     format!(
         "{}/hybrid/jira/trigger/{install_id}/{trigger}/{}",
         api.trim_end_matches('/'),
-        sign::jira_trigger_token(master, install_id, trigger)
+        sign::jira_trigger_token(master, install_id, trigger, linked_at)
     )
 }
 
@@ -502,13 +552,19 @@ pub async fn config(
         "site_url": txt(&item, "site_url"),
         // What the install's own checks see as the app's secret: a token for
         // this install, never the site's.
-        "forge_secret": sign::jira_trigger_token(&master, &install.id, "forge"),
+        "forge_secret": sign::jira_trigger_token(&master, &install.id, "forge", &link.linked_at),
     });
     for (field, trigger) in TRIGGERS {
         out[*field] = if txt(&item, field).is_empty() {
             json!("")
         } else {
-            json!(proxy_url(api, &master, &install.id, trigger))
+            json!(proxy_url(
+                api,
+                &master,
+                &install.id,
+                trigger,
+                &link.linked_at
+            ))
         };
     }
     Ok(Json(out))
@@ -517,9 +573,23 @@ pub async fn config(
 /// How much of a Forge trigger's answer the proxy passes back.
 const MAX_TRIGGER_ANSWER: usize = 1024 * 1024;
 
-/// Whether a stored Forge link may be called: https only.
+/// Whether a stored Forge link may be called: an https Forge web trigger
+/// on Atlassian's own Forge host (`*.atlassian-dev.net`), on the default
+/// port, never an address. The links come from the team's own registration,
+/// so this is what keeps the proxy from fetching anything else.
 pub fn callable(url: &str) -> bool {
-    url::Url::parse(url).is_ok_and(|u| u.scheme() == "https" && u.host_str().is_some())
+    let Ok(u) = url::Url::parse(url) else {
+        return false;
+    };
+    let host = match u.host() {
+        Some(url::Host::Domain(d)) => d.to_ascii_lowercase(),
+        _ => return false,
+    };
+    u.scheme() == "https"
+        && u.port().is_none()
+        && u.username().is_empty()
+        && u.password().is_none()
+        && host.ends_with(".atlassian-dev.net")
 }
 
 /// The body a trigger call goes on with: the site's real Forge secret in
@@ -556,7 +626,15 @@ pub async fn trigger(
     if !sign::is_install_id(&install_id) {
         return refuse(StatusCode::NOT_FOUND, "Unknown install.");
     }
-    let want = sign::jira_trigger_token(master, &install_id, &trigger);
+    if token.len() != 64 {
+        return refuse(StatusCode::FORBIDDEN, "Wrong link.");
+    }
+    let Some(link) = link_stands(&state, &install_id).await else {
+        return refuse(StatusCode::FORBIDDEN, "Wrong link.");
+    };
+    // The token names this install, this trigger and this link: a relink
+    // is a new token, and an old one stops working.
+    let want = sign::jira_trigger_token(master, &install_id, &trigger, &link.linked_at);
     if !bool::from(want.as_bytes().ct_eq(token.as_bytes())) {
         return refuse(StatusCode::FORBIDDEN, "Wrong link.");
     }
@@ -564,12 +642,6 @@ pub async fn trigger(
         Ok(Some(i)) if i.verified() => {}
         _ => return refuse(StatusCode::FORBIDDEN, "This install's access is off."),
     }
-    let Some(link) = link_stands(&state, &install_id).await else {
-        return refuse(
-            StatusCode::FORBIDDEN,
-            "No Jira site is linked to this install.",
-        );
-    };
     let item = state
         .dynamo
         .get_item()
@@ -588,8 +660,8 @@ pub async fn trigger(
             "The site hasn't registered that trigger.",
         );
     }
-    let sent = state
-        .http
+    // Never a redirect: only the Forge link itself is ever called.
+    let sent = relay::install_client()
         .post(&url)
         .header("Content-Type", "application/json")
         .timeout(std::time::Duration::from_secs(25))
@@ -687,7 +759,6 @@ pub async fn link_view(
         "install_address": install.as_ref().map(install_address),
         "install_registered_at": install.as_ref().map(|i| i.created_at.clone()),
         "site_url": team.site_url,
-        "expected_site": txt(&p, "site"),
         "forge": team.forge,
         "blocked": blocked,
         "message": blocked.map(blocked_message),
@@ -698,6 +769,9 @@ pub async fn link_view(
 pub struct ConfirmBody {
     #[serde(default)]
     choice: String,
+    /// The code the install showed.
+    #[serde(default)]
+    code: String,
 }
 
 /// POST /api/hybrid/jira-link/:state `{choice: link|cancel}` (team admins):
@@ -732,6 +806,20 @@ pub async fn link_confirm(
         .await;
         return Ok(Json(
             json!({ "outcome": "declined", "return_url": with_outcome(&ret, "declined") }),
+        ));
+    }
+    if !code_matches(&txt(&p, "code"), &b.code) {
+        audit(
+            &state,
+            &install_id,
+            "jira_link_refused",
+            json!({ "team_id": claims.team_id, "why": "wrong_code" }),
+        )
+        .await;
+        return Err(fail(
+            StatusCode::FORBIDDEN,
+            "wrong_code",
+            "That isn't the code the install shows. Start again from the install.",
         ));
     }
     let install = load_install(&state, &install_id).await?;
@@ -875,7 +963,7 @@ pub async fn relay_team(
     body: &[u8],
 ) -> Option<StatusCode> {
     let master = master(state)?;
-    let install_id = install_for_team(state, team_id).await?;
+    let (install_id, routed_at) = route_of(state, team_id).await?;
     if jira_link(state, &install_id)
         .await
         .is_none_or(|l| l.team_id != team_id)
@@ -887,8 +975,9 @@ pub async fn relay_team(
             .table_name(&state.config.settings_table_name)
             .key("pk", s(&reverse_pk(team_id)))
             .key("sk", s("LINK"))
-            .condition_expression("install_id = :i")
+            .condition_expression("install_id = :i AND linked_at = :at")
             .expression_attribute_values(":i", s(&install_id))
+            .expression_attribute_values(":at", s(&routed_at))
             .send()
             .await;
         return None;
@@ -1116,17 +1205,24 @@ mod tests {
     #[test]
     fn the_proxy_holds_the_secret_and_each_link_its_own_token() {
         let m = "m".repeat(40);
-        let a = proxy_url("https://api.example.com/", &m, "ins_a", "add_comment");
+        let a = proxy_url("https://api.example.com/", &m, "ins_a", "add_comment", "t1");
         assert!(a.starts_with("https://api.example.com/hybrid/jira/trigger/ins_a/add_comment/"));
         // A token is for one install and one trigger.
+        let t = |i: &str, tr: &str, at: &str| sign::jira_trigger_token(&m, i, tr, at);
         assert_ne!(
-            sign::jira_trigger_token(&m, "ins_a", "add_comment"),
-            sign::jira_trigger_token(&m, "ins_b", "add_comment")
+            t("ins_a", "add_comment", "t1"),
+            t("ins_b", "add_comment", "t1")
         );
         assert_ne!(
-            sign::jira_trigger_token(&m, "ins_a", "add_comment"),
-            sign::jira_trigger_token(&m, "ins_a", "create_ticket")
+            t("ins_a", "add_comment", "t1"),
+            t("ins_a", "create_ticket", "t1")
         );
+        // A relink rotates every token.
+        assert_ne!(
+            t("ins_a", "add_comment", "t1"),
+            t("ins_a", "add_comment", "t2")
+        );
+        assert_eq!(t("ins_a", "add_comment", "t1").len(), 64);
         let out = with_site_secret(
             br#"{"forge_secret":"token-for-install","keys":["A-1"]}"#,
             "real",
@@ -1139,10 +1235,35 @@ mod tests {
         // A body without the field gains nothing.
         let plain = br#"{"issueKey":"A-1","comment":"hi"}"#;
         assert_eq!(with_site_secret(plain, "real"), plain.to_vec());
-        assert!(callable("https://example.atlassian.net/x/1"));
-        assert!(!callable("http://example.atlassian.net/x/1"));
+        // Only Forge's own web trigger host, by name, on https's own port.
+        assert!(callable("https://0a1b2c3d.hello.atlassian-dev.net/x1/abc"));
+        assert!(!callable("http://0a1b2c3d.hello.atlassian-dev.net/x1/abc"));
+        assert!(!callable(
+            "https://0a1b2c3d.hello.atlassian-dev.net:8443/x1/abc"
+        ));
+        assert!(!callable("https://attacker.example.com/x"));
+        assert!(!callable(
+            "https://atlassian-dev.net.attacker.example.com/x"
+        ));
+        assert!(!callable("https://169.254.169.254/latest"));
+        assert!(!callable("https://u:p@0a1b2c3d.hello.atlassian-dev.net/x"));
         assert!(!callable(""));
         assert_eq!(TRIGGERS.len(), 6);
+    }
+
+    #[test]
+    fn the_confirmation_code_is_short_typed_and_checked_exactly() {
+        let c = confirm_code();
+        assert_eq!(c.len(), 8);
+        assert!(c
+            .chars()
+            .all(|ch| ch.is_ascii_uppercase() || ch.is_ascii_digit()));
+        assert_ne!(confirm_code(), confirm_code());
+        assert!(code_matches("ABCD2345", "abcd-2345"));
+        assert!(code_matches("ABCD2345", " ABCD 2345 "));
+        assert!(!code_matches("ABCD2345", "ABCD2346"));
+        assert!(!code_matches("ABCD2345", ""));
+        assert!(!code_matches("", ""));
     }
 
     #[test]

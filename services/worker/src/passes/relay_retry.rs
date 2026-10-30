@@ -80,10 +80,10 @@ pub async fn run(state: &WorkerState, msg: RelayRetryMessage) -> Result<(), Erro
         drop_body().await;
         return Ok(());
     };
-    // A linked Jira site's event goes only while the link stands: unlinked
-    // meanwhile, the site's events are CoderHelm's again.
+    // A linked Jira site's event goes only while the link it came under
+    // stands: unlinked or relinked meanwhile, it isn't sent.
     if msg.source == "jira" && (msg.event == "site" || msg.event == "site_webhook") {
-        let linked = state
+        let link = state
             .dynamo
             .get_item()
             .table_name(table)
@@ -91,9 +91,14 @@ pub async fn run(state: &WorkerState, msg: RelayRetryMessage) -> Result<(), Erro
             .key("sk", AttributeValue::S("JIRALINK".into()))
             .consistent_read(true)
             .send()
-            .await?
+            .await?;
+        let linked_at = link
             .item()
-            .is_some();
+            .and_then(|i| i.get("linked_at"))
+            .and_then(|v| v.as_s().ok())
+            .cloned();
+        // Gone, or a newer link (perhaps another team's site) than the event.
+        let linked = linked_at.is_some_and(|at| at.as_str() <= d.created_at.as_str());
         if !linked {
             d.finish(
                 common::deliveries::Status::Failed,

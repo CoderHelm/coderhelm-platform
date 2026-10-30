@@ -1656,7 +1656,10 @@ pub async fn intake(
     .await;
     // A copy that wasn't handled isn't "already had": let the relay's retry
     // (or a redelivery) through again.
-    if handled.is_err() {
+    // Only a refusal from before the event was handled (the install couldn't
+    // fetch the link's settings): a handler that failed partway may have
+    // acted already, and isn't run twice.
+    if matches!(&handled, Err((code, _)) if *code == StatusCode::SERVICE_UNAVAILABLE) {
         common::claim::release(
             &state.dynamo,
             &state.config.settings_table_name,
@@ -1925,16 +1928,26 @@ mod tests {
                 .map(|(k, v)| (k.to_string(), AttributeValue::S(v.to_string())))
                 .collect::<std::collections::HashMap<_, _>>()
         };
-        let own = item(&[("forge_secret", "own"), ("add_comment_url", "https://x.example.net/hook")]);
+        let own = item(&[
+            ("forge_secret", "own"),
+            ("add_comment_url", "https://x.example.net/hook"),
+        ]);
         assert!(own_jira_settings(&own));
         let copied = item(&[
             ("forge_secret", "token"),
-            ("add_comment_url", "https://api.example.com/hybrid/jira/trigger/ins_a/add_comment/t"),
+            (
+                "add_comment_url",
+                "https://api.example.com/hybrid/jira/trigger/ins_a/add_comment/t",
+            ),
         ]);
         assert!(!own_jira_settings(&copied));
         assert!(!own_jira_settings(&item(&[])));
         let f = jira_fields();
-        assert!(f.contains(&"forge_secret") && f.contains(&"site_url") && f.contains(&"add_comment_url"));
+        assert!(
+            f.contains(&"forge_secret")
+                && f.contains(&"site_url")
+                && f.contains(&"add_comment_url")
+        );
         assert_eq!(f.len(), 8);
     }
 
