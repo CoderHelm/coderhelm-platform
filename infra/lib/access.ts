@@ -325,6 +325,9 @@ export function deployPolicy(n: AccessNames): PolicyDocument {
       Action: "ses:*",
       Resource: [`${a.at("ses")}:configuration-set/${p}-*`, `${a.at("ses")}:template/${p}-*`, `${a.at("ses")}:identity/*`],
     },
+    // CloudFormation's email template handler may use SES's first API, whose
+    // template calls take no resource ARN (AWS checks them against "*").
+    { Sid: "EmailTemplatesV1", Effect: "Allow", Action: ["ses:CreateTemplate", "ses:UpdateTemplate", "ses:DeleteTemplate"], Resource: "*" },
     // Named by id: created with the install's tag (AWS checks TagResource as
     // it creates them), changed only while they carry it. A key is never
     // deleted or disabled by a deploy (CoderHelm keeps its keys).
@@ -334,9 +337,15 @@ export function deployPolicy(n: AccessNames): PolicyDocument {
     { Sid: "UserPoolsCreate", Effect: "Allow", Action: "cognito-idp:CreateUserPool", Resource: "*" },
     { Sid: "UserPoolsTag", Effect: "Allow", Action: "cognito-idp:TagResource", Resource: "*", Condition: { StringEquals: { [`aws:RequestTag/${INSTALL_TAG}`]: p } } },
     { Sid: "UserPools", Effect: "Allow", Action: "cognito-idp:*", Resource: `${a.at("cognito-idp")}:userpool/*`, Condition: tagged },
-    { Sid: "DistributionsCreate", Effect: "Allow", Action: "cloudfront:CreateDistribution", Resource: "*" },
+    // CreateDistributionWithTags is the API CloudFormation calls; AWS's service
+    // reference authorizes it as CreateDistribution and TagResource, and it is
+    // named too in case AWS checks it by its own name (as API Gateway does TagResource).
+    { Sid: "DistributionsCreate", Effect: "Allow", Action: ["cloudfront:CreateDistribution", "cloudfront:CreateDistributionWithTags"], Resource: "*" },
     { Sid: "DistributionsTag", Effect: "Allow", Action: "cloudfront:TagResource", Resource: "*", Condition: { StringEquals: { [`aws:RequestTag/${INSTALL_TAG}`]: p } } },
     { Sid: "Distributions", Effect: "Allow", Action: "cloudfront:*", Resource: `arn:${n.partition}:cloudfront::${n.account}:distribution/*`, Condition: tagged },
+    // CreateFunction takes no resource ARN (AWS checks it against "*"); every
+    // later call on the function is scoped to its name.
+    { Sid: "EdgeFunctionsCreate", Effect: "Allow", Action: "cloudfront:CreateFunction", Resource: "*" },
     { Sid: "EdgeFunctions", Effect: "Allow", Action: "cloudfront:*", Resource: `arn:${n.partition}:cloudfront::${n.account}:function/${p}-*` },
     {
       // Not taggable or named by id only (docs/self-host/security.md lists them).
@@ -373,7 +382,7 @@ export function deployPolicy(n: AccessNames): PolicyDocument {
         "cloudfront:Get*", "cloudfront:List*", "cloudwatch:Describe*", "cloudwatch:Get*", "cloudwatch:List*",
         "cognito-idp:Describe*", "cognito-idp:List*", "dynamodb:Describe*", "dynamodb:List*", "events:Describe*", "events:List*",
         "kms:List*", "lambda:Get*", "lambda:List*", "logs:Describe*", "logs:List*", "route53:Get*", "route53:List*",
-        "ses:Get*", "ses:List*", "sqs:List*", "sns:List*", "ssm:Describe*", "acm:Describe*", "acm:List*", "codebuild:List*",
+        "ses:Get*", "ses:List*", "ses:DescribeConfigurationSet", "sqs:List*", "sns:List*", "ssm:Describe*", "acm:Describe*", "acm:List*", "codebuild:List*",
         "scheduler:List*", "sts:GetCallerIdentity",
       ],
       Resource: "*",

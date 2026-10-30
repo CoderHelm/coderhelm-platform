@@ -912,6 +912,16 @@ Resources:
                   ]
                 },
                 {
+                  "Sid": "EmailTemplatesV1",
+                  "Effect": "Allow",
+                  "Action": [
+                    "ses:CreateTemplate",
+                    "ses:UpdateTemplate",
+                    "ses:DeleteTemplate"
+                  ],
+                  "Resource": "*"
+                },
+                {
                   "Sid": "KeysCreate",
                   "Effect": "Allow",
                   "Action": [
@@ -991,7 +1001,10 @@ Resources:
                 {
                   "Sid": "DistributionsCreate",
                   "Effect": "Allow",
-                  "Action": "cloudfront:CreateDistribution",
+                  "Action": [
+                    "cloudfront:CreateDistribution",
+                    "cloudfront:CreateDistributionWithTags"
+                  ],
                   "Resource": "*"
                 },
                 {
@@ -1021,6 +1034,12 @@ Resources:
                       }
                     }
                   }
+                },
+                {
+                  "Sid": "EdgeFunctionsCreate",
+                  "Effect": "Allow",
+                  "Action": "cloudfront:CreateFunction",
+                  "Resource": "*"
                 },
                 {
                   "Sid": "EdgeFunctions",
@@ -1169,6 +1188,7 @@ Resources:
                     "route53:List*",
                     "ses:Get*",
                     "ses:List*",
+                    "ses:DescribeConfigurationSet",
                     "sqs:List*",
                     "sns:List*",
                     "ssm:Describe*",

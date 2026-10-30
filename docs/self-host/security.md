@@ -64,6 +64,7 @@ Nothing CoderHelm creates holds AdministratorAccess. Three pieces decide what Co
 - create and change roles named `coderhelm-<name>-*`, and only with the boundary on them. It can pass only those roles.
 - create and change functions, tables, buckets, queues, topics, log groups, rules, schedules, alarms, build projects, parameters, email settings and key aliases whose names start with `coderhelm-<name>`. Every one of CoderHelm's resources is named that way, and a test checks it.
 - create KMS keys, user pools, CloudFront distributions and certificates. AWS names these by id, not by name, so the deploy role can change them only while they carry the tag `coderhelm:install = coderhelm-<name>`. It can never delete or disable a KMS key.
+- create CloudFront functions and SES email templates by any name, because AWS checks those two calls against no resource at all. Every later change to a function is limited to names that start with `coderhelm-<name>`.
 
 It can't create IAM users or keys, give a role more than the boundary allows, use the CDK bootstrap, or touch CloudTrail, GuardDuty, Organizations or your other resources by name.
 
