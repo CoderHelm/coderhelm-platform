@@ -292,6 +292,9 @@ export function deployPolicy(n: AccessNames): PolicyDocument {
       Resource: "*",
       Condition: { ArnLike: { "lambda:FunctionArn": `${a.at("lambda")}:function:${p}-*` } },
     },
+    // An event source mapping's ARN is a random id, so it can't be scoped by
+    // name; CloudFormation tags each one as it creates it.
+    { Sid: "FunctionEventTags", Effect: "Allow", Action: ["lambda:TagResource", "lambda:UntagResource", "lambda:ListTags"], Resource: `${a.at("lambda")}:event-source-mapping:*` },
     { Sid: "Tables", Effect: "Allow", Action: "dynamodb:*", Resource: [`${a.at("dynamodb")}:table/${p}`, `${a.at("dynamodb")}:table/${p}/*`, `${a.at("dynamodb")}:table/${p}-*`] },
     { Sid: "Buckets", Effect: "Allow", Action: "s3:*", Resource: [`arn:${n.partition}:s3:::${p}-*`] },
     { Sid: "Queues", Effect: "Allow", Action: "sqs:*", Resource: `${a.at("sqs")}:${p}-*` },
