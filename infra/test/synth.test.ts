@@ -934,17 +934,28 @@ const SERVICE_OF: Record<string, string> = {
   "AWS::KMS": "kms", "AWS::Lambda": "lambda", "AWS::Logs": "logs", "AWS::Route53": "route53", "AWS::S3": "s3", "AWS::SES": "ses",
   "AWS::SNS": "sns", "AWS::SQS": "sqs", "AWS::SSM": "ssm", "AWS::Scheduler": "scheduler",
 };
-// Resource types that take tags (stack tags reach them).
-const TAGGABLE = new Set([
-  "AWS::ApiGatewayV2::Api", "AWS::ApiGatewayV2::Stage", "AWS::ApiGatewayV2::DomainName", "AWS::CertificateManager::Certificate",
-  "AWS::CloudFront::Distribution", "AWS::CodeBuild::Project", "AWS::Cognito::UserPool", "AWS::DynamoDB::Table", "AWS::IAM::Role",
-  "AWS::IAM::ManagedPolicy", "AWS::KMS::Key", "AWS::Lambda::Function", "AWS::Logs::LogGroup", "AWS::S3::Bucket", "AWS::SNS::Topic",
-  "AWS::SQS::Queue", "AWS::SSM::Parameter", "AWS::Events::Rule", "AWS::SES::ConfigurationSet", "AWS::SES::EmailIdentity",
-]);
+// Resource types that take tags (stack tags reach them), with the piece of
+// their ARN a grant must cover: a tag allowed on functions doesn't reach an
+// event source mapping (a real install was refused there).
+const TAGGABLE: Record<string, string> = {
+  "AWS::ApiGatewayV2::Api": "::/apis", "AWS::ApiGatewayV2::Stage": "::/apis", "AWS::ApiGatewayV2::DomainName": "::/domainnames",
+  "AWS::CertificateManager::Certificate": ":certificate/", "AWS::CloudFront::Distribution": ":distribution/", "AWS::CodeBuild::Project": ":project/",
+  "AWS::Cognito::UserPool": ":userpool/", "AWS::DynamoDB::Table": ":table/", "AWS::DynamoDB::GlobalTable": ":table/", "AWS::IAM::Role": ":role/",
+  "AWS::IAM::ManagedPolicy": ":policy/", "AWS::KMS::Key": ":key/", "AWS::Lambda::Function": ":function:",
+  "AWS::Lambda::EventSourceMapping": ":event-source-mapping:", "AWS::Logs::LogGroup": ":log-group:", "AWS::S3::Bucket": ":::",
+  "AWS::SNS::Topic": ":sns:", "AWS::SQS::Queue": ":sqs:", "AWS::SSM::Parameter": ":parameter/", "AWS::Events::Rule": ":rule/",
+  "AWS::SES::ConfigurationSet": ":configuration-set/", "AWS::SES::EmailIdentity": ":identity/",
+};
 test("the deploy role may create and tag every resource a self-host install creates", () => {
   const n = accessNames({ account: "111122223333", region: "eu-west-1", prefix: "coderhelm-prod", suffix: "-111122223333", secretName: "coderhelm-prod" });
   const allowed = deployPolicy(n).Statement.filter((st) => st.Effect === "Allow").flatMap((st) => [st.Action ?? []].flat());
   const may = (svc: string, re: RegExp) => allowed.some((a) => a === `${svc}:*` || (a.startsWith(`${svc}:`) && re.test(a.slice(svc.length + 1))));
+  // A tag grant that reaches this kind of resource: the action, and a
+  // Resource of "*" or one naming that kind of ARN.
+  const allows = deployPolicy(n).Statement.filter((st) => st.Effect === "Allow");
+  const mayTag = (svc: string, kind: string) => allows.some((st) =>
+    [st.Action ?? []].flat().some((a) => a === `${svc}:*` || (a.startsWith(`${svc}:`) && /Tag/.test(a))) &&
+    [st.Resource ?? []].flat().some((r) => r === "*" || r.includes(kind)));
   const templates = [
     synth(selfHost()),
     synth(selfHost({ region: "eu-west-1", domain: { hostname: "helm.example.org", hostedZone: "example.org" }, email: { from: "helm@example.org" } }), {
@@ -962,7 +973,7 @@ test("the deploy role may create and tag every resource a self-host install crea
       if (!may(svc, /^(Create|Put|Post|POST|Request|Change|\*)/)) gaps.add(`${type}: ${svc} create`);
       // The installer tags each stack, and CloudFormation passes stack tags
       // to every resource that takes them, Tags property or not.
-      if (TAGGABLE.has(type) && !may(svc, /Tag/)) gaps.add(`${type}: ${svc} tagging`);
+      if (TAGGABLE[type] && !mayTag(svc, TAGGABLE[type])) gaps.add(`${type}: ${svc} tagging on ${TAGGABLE[type]}`);
     }
   }
   assert.deepEqual([...gaps].sort(), []);
