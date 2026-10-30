@@ -16,8 +16,9 @@
 //      (docs/self-host/domains.md),
 //   5. keeps a small progress file up to date in the stack's status bucket,
 //      which the install guide in the browser reads. The file holds the
-//      phase, a plain message and the install's URL: no names, emails, keys
-//      or account numbers.
+//      phase, a plain message, the part being deployed with its resources
+//      done so far (every 15 seconds or so, only when they change) and the
+//      install's URL: no names, emails, keys or account numbers.
 //
 // No Node, AWS CLI or Rust on the person's machine: CodeBuild has them.
 //
@@ -257,6 +258,37 @@ export function publicDomain(d) {
   };
 }
 
+/** How a part (a CloudFormation stack) is named for people: "coderhelm-prod-api" is "API". */
+export function partLabel(stack, stage = "prod") {
+  const name = String(stack ?? "");
+  const short = name.startsWith(`coderhelm-${stage}-`) ? name.slice(`coderhelm-${stage}-`.length) : name.split("-").pop();
+  const known = { api: "API", "log-analyzer": "Log analyzer" };
+  if (known[short]) return known[short];
+  const words = short.replace(/-/g, " ").trim();
+  return words ? words[0].toUpperCase() + words.slice(1) : "";
+}
+
+/**
+ * Resources done in one part: those CloudFormation reports CREATE_COMPLETE or
+ * UPDATE_COMPLETE, against the number of resources in the stack's template.
+ * Null when the template is not readable yet (the stack is still being made).
+ */
+export function resourceCount(statuses, template) {
+  const total = Object.keys(template?.Resources ?? {}).length;
+  if (!total) return null;
+  const done = (statuses ?? []).filter((x) => x === "CREATE_COMPLETE" || x === "UPDATE_COMPLETE").length;
+  return { done: Math.min(done, total), total };
+}
+
+/** The part in the progress file: its label and counts, nothing else. */
+export function publicPart(part) {
+  if (!part || !part.name) return null;
+  const n = (v) => (Number.isInteger(v) && v >= 0 ? Math.min(v, 100_000) : null);
+  const total = n(part.total);
+  const done = n(part.done);
+  return { name: String(part.name).replace(/[^A-Za-z0-9 .-]/g, "").slice(0, 40), done: done === null || total === null ? null : Math.min(done, total), total };
+}
+
 /** The progress file the install guide reads. */
 export function statusDoc(fields, now = new Date()) {
   const doc = {
@@ -272,6 +304,7 @@ export function statusDoc(fields, now = new Date()) {
     logUrl: fields.logUrl ?? null,
     fix: fields.fix ?? null,
     domain: publicDomain(fields.domain),
+    part: publicPart(fields.part),
     updatedAt: now.toISOString(),
   };
   if (!PHASES.includes(doc.phase)) throw new Error(`unknown phase ${doc.phase}`);
@@ -368,7 +401,7 @@ export function withSetupToken(secret, token) {
 // ── Running ────────────────────────────────────────────────────────────────
 
 /** Runs a command; resolves with {code, out}. Each output line goes to onLine too. */
-export function sh(cmd, args, { cwd, env, onLine, input } = {}) {
+export function sh(cmd, args, { cwd, env, onLine, input, quiet = false } = {}) {
   return new Promise((resolve) => {
     const child = spawn(cmd, args, { cwd, env: env ?? process.env, stdio: ["pipe", "pipe", "pipe"] });
     let out = "";
@@ -376,7 +409,7 @@ export function sh(cmd, args, { cwd, env, onLine, input } = {}) {
     const take = (d) => {
       const s = d.toString();
       out += s;
-      process.stdout.write(s);
+      if (!quiet) process.stdout.write(s);
       buf += s;
       const lines = buf.split("\n");
       buf = lines.pop();
@@ -404,6 +437,23 @@ function writeTemp(value) {
 /** The real side effects; the tests pass fakes. */
 export function realDeps(env = process.env) {
   const region = env.AWS_REGION;
+  // A part's template does not change while it deploys: read it once.
+  const templates = new Map();
+  const templateOf = async (stack) => {
+    if (templates.has(stack)) return templates.get(stack);
+    const r = await sh("aws", ["cloudformation", "get-template", "--stack-name", stack, "--region", region,
+      "--query", "TemplateBody", "--output", "json"], { quiet: true });
+    if (r.code !== 0) return null;
+    try {
+      let body = JSON.parse(r.out);
+      // A JSON template comes back as an object; a YAML one as its text.
+      if (typeof body === "string") body = JSON.parse(body);
+      if (body?.Resources) templates.set(stack, body);
+      return body;
+    } catch {
+      return null;
+    }
+  };
   return {
     async account() {
       const r = await sh("aws", ["sts", "get-caller-identity", "--query", "Account", "--output", "text"]);
@@ -417,6 +467,18 @@ export function realDeps(env = process.env) {
           "--content-type", "application/json", "--cache-control", "no-store", "--only-show-errors"]);
       } finally {
         t.done();
+      }
+    },
+    /** One part's resources done against its template (null when not readable yet). */
+    async stackResources(stack) {
+      const r = await sh("aws", ["cloudformation", "list-stack-resources", "--stack-name", stack, "--region", region,
+        "--query", "StackResourceSummaries[].ResourceStatus", "--output", "json"], { quiet: true });
+      if (r.code !== 0) return null;
+      const t = await templateOf(stack);
+      try {
+        return resourceCount(JSON.parse(r.out), t);
+      } catch {
+        return null;
       }
     },
     async installCli(tgz) {
@@ -506,7 +568,7 @@ export function realDeps(env = process.env) {
  * The whole install. Resolves with the final status document; never throws
  * (a failure is a "failed" status the guide shows with its fix).
  */
-export async function run({ env = process.env, deps = realDeps(env), tgz = "coderhelm-selfhost.tgz", log = console.log } = {}) {
+export async function run({ env = process.env, deps = realDeps(env), tgz = "coderhelm-selfhost.tgz", log = console.log, pollMs = 15_000 } = {}) {
   const region = env.AWS_REGION;
   const stage = env.STAGE || "prod";
   const version = env.VERSION;
@@ -558,18 +620,58 @@ export async function run({ env = process.env, deps = realDeps(env), tgz = "code
 
   await status({ phase: "deploying", message: "Creating your CoderHelm (about 20 minutes)", step: 0, steps: null });
   const progress = createProgress();
-  let last = 0;
   const lines = [];
-  const deployed = await deps.deploy(version, (line) => {
-    lines.push(line);
-    if (lines.length > 400) lines.shift();
-    const kind = progress.feed(line);
-    // One progress write per new part, at most every 10 seconds.
-    if (kind === "step" && Date.now() - last > 10_000) {
-      last = Date.now();
-      void status({ phase: "deploying", message: `Creating part ${progress.step} of ${progress.steps}`, step: progress.step, steps: progress.steps });
+  // Progress inside a part: some take several minutes, so every pollMs the
+  // part's resources done are counted, and the file is written only when the
+  // part or its count changed. Writes go one after another, in order.
+  let part = null;
+  let written = null;
+  let writes = Promise.resolve();
+  const publish = () => {
+    if (!progress.steps) return;
+    const label = progress.current ? partLabel(progress.current, stage) : "";
+    const p = label ? { name: label, done: part?.done ?? null, total: part?.total ?? null } : null;
+    const key = JSON.stringify([progress.step, progress.steps, p]);
+    if (key === written) return;
+    written = key;
+    const message = p && p.total ? `${p.name}: ${p.done} of ${p.total}` : `Creating part ${progress.step} of ${progress.steps}`;
+    const fields = { phase: "deploying", message, step: progress.step, steps: progress.steps, part: p };
+    writes = writes.then(() => status(fields));
+  };
+  let polling = false;
+  const poll = async () => {
+    const stack = progress.current;
+    if (polling || !stack || !deps.stackResources) return;
+    polling = true;
+    try {
+      const c = await deps.stackResources(stack);
+      if (c && progress.current === stack) {
+        part = c;
+        publish();
+      }
+    } catch (e) {
+      log(`(could not count ${stack}'s resources: ${e.message})`);
+    } finally {
+      polling = false;
     }
-  });
+  };
+  const timer = setInterval(() => void poll(), pollMs);
+  timer.unref?.();
+  let deployed;
+  try {
+    deployed = await deps.deploy(version, (line) => {
+      lines.push(line);
+      if (lines.length > 400) lines.shift();
+      const kind = progress.feed(line);
+      if (kind === "step") {
+        part = null;
+        publish();
+      }
+    });
+  } finally {
+    clearInterval(timer);
+  }
+  await writes;
   if (deployed.code !== 0) {
     const { message, fix } = explainFailure(progress.errors.length ? progress.errors : lines.slice(-20));
     return fail(message, fix, { step: progress.step || null, steps: progress.steps });
