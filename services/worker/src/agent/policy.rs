@@ -107,10 +107,15 @@ pub fn gate(state: &WorkerState, ctx: GateCtx, deadline: Option<Instant>) -> Gat
         })
 }
 
-/// Announces approval cards on the team's notification channels (the same
-/// Slack and Teams channels its alerts use), with signed Approve and Deny
-/// links. Nothing is sent when the team has none set up; the card is still
-/// on the run page and in the approvals queue.
+/// Where a team's approval channels are kept: their own settings item,
+/// separate from the alert channels (`common::alert_notify::TEAM_SETTINGS_SK`).
+pub const APPROVAL_CHANNELS_SK: &str = "APPROVAL_NOTIFY";
+
+/// Announces approval cards and sign-in prompts, with signed Approve and Deny
+/// links, on the team's approval channels only. Alert channels are for
+/// alerts and never receive these. Nothing is sent when the team has no
+/// approval channels; the card is still on the run page and in the
+/// approvals queue.
 pub struct ChannelNotifier {
     pub dynamo: aws_sdk_dynamodb::Client,
     pub kms: aws_sdk_kms::Client,
@@ -120,7 +125,8 @@ pub struct ChannelNotifier {
 }
 
 impl ChannelNotifier {
-    /// The team's notification channels, opened, when notifications are on.
+    /// The team's approval channels, opened, when they are on. Never the
+    /// alert channels.
     async fn channels(&self, team: &str) -> Option<common::notify::Channels> {
         let item = match self
             .dynamo
@@ -132,9 +138,7 @@ impl ChannelNotifier {
             )
             .key(
                 "sk",
-                aws_sdk_dynamodb::types::AttributeValue::S(
-                    common::alert_notify::TEAM_SETTINGS_SK.to_string(),
-                ),
+                aws_sdk_dynamodb::types::AttributeValue::S(APPROVAL_CHANNELS_SK.to_string()),
             )
             .send()
             .await
@@ -682,5 +686,19 @@ mod tests {
                 out.push(p);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod channel_tests {
+    use super::*;
+
+    #[test]
+    fn approvals_never_read_the_alert_channels() {
+        assert_ne!(APPROVAL_CHANNELS_SK, common::alert_notify::TEAM_SETTINGS_SK);
+        let src = include_str!("policy.rs");
+        let notifier = src.split("impl ChannelNotifier").nth(1).unwrap();
+        let notifier = notifier.split("mod channel_tests").next().unwrap();
+        assert!(!notifier.contains(concat!("alert_notify::", "TEAM_SETTINGS_SK")));
     }
 }
