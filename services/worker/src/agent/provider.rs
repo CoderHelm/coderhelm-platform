@@ -15,6 +15,10 @@ pub struct ModelProvider {
     pub api_key: String,
     pub primary_model: String,
     pub heavy_model: String,
+    /// The team chose its heavy model in Settings. Then every heavy route
+    /// runs on it; otherwise the routes measured to hold their quality on a
+    /// lighter model (`MEASURED_LIGHT_MODEL`) run there.
+    pub heavy_model_chosen: bool,
     /// Counts this team's model calls (set by `load_for_team`). Required:
     /// there is no provider, so no client, whose calls go uncounted.
     pub meter: common::usage::UsageMeter,
@@ -73,9 +77,10 @@ impl ModelProvider {
             .and_then(|v| v.as_s().ok())
             .map(|m| common::model_ids::current(m).to_string())
             .unwrap_or_else(|| "claude-sonnet-5-5".to_string());
-        let heavy_model = item
-            .get("heavy_model")
-            .and_then(|v| v.as_s().ok())
+        let heavy_saved = item.get("heavy_model").and_then(|v| v.as_s().ok());
+        let heavy_model_chosen = heavy_saved.is_some_and(|m| !m.trim().is_empty());
+        let heavy_model = heavy_saved
+            .filter(|m| !m.trim().is_empty())
             .map(|m| common::model_ids::current(m).to_string())
             .unwrap_or_else(|| "claude-opus-5-5".to_string());
 
@@ -91,6 +96,7 @@ impl ModelProvider {
             api_key,
             primary_model,
             heavy_model,
+            heavy_model_chosen,
             meter: common::usage::UsageMeter::dynamo(dynamo.clone(), &analytics_table, team_id),
             scope: super::policy::PolicyScope {
                 team: team_id.to_string(),
@@ -133,6 +139,34 @@ impl ModelProvider {
         &self.heavy_model
     }
 
+    /// The reviewer's reading and writing of a review (`generate_review`).
+    /// The critic, which decides which findings are kept and so what blocks,
+    /// stays on [`Self::heavy_model_id`].
+    pub fn review_model_id(&self) -> &str {
+        self.heavy_route(Route::ReviewWriting)
+    }
+
+    /// The coder's model for a ticket of this complexity: simple tickets on
+    /// the primary model, medium on the measured route, complex on heavy.
+    pub fn implement_model_id(&self, complexity: &str) -> &str {
+        match complexity {
+            "simple" => self.primary_model_id(),
+            "medium" => self.heavy_route(Route::MediumImplement),
+            _ => self.heavy_model_id(),
+        }
+    }
+
+    /// A heavy route's model: the team's own heavy model when it chose one,
+    /// else the lighter model the route was measured on.
+    fn heavy_route(&self, route: Route) -> &str {
+        if self.heavy_model_chosen {
+            return self.heavy_model_id();
+        }
+        match route {
+            Route::ReviewWriting | Route::MediumImplement => MEASURED_LIGHT_MODEL,
+        }
+    }
+
     /// Get the Anthropic API key.
     pub fn api_key(&self) -> &str {
         &self.api_key
@@ -157,6 +191,20 @@ impl ModelProvider {
             ClientKind::Anthropic => AnthropicClient::new(self.api_key.clone(), meter),
         }
     }
+}
+
+/// The model the routes below were measured on and held their quality
+/// (`passes/model_route_eval.rs`, `reviewer-evals.yml` route suites):
+/// review writing with the heavy critic kept 40/40 planted defects and
+/// blocked 55/56 cases right against 40/40 and 53/56 on the heavy model;
+/// medium tickets passed 20/20 on both.
+pub const MEASURED_LIGHT_MODEL: &str = "claude-sonnet-5-5";
+
+/// A heavy route that may run on [`MEASURED_LIGHT_MODEL`].
+#[derive(Debug, Clone, Copy)]
+enum Route {
+    ReviewWriting,
+    MediumImplement,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -245,5 +293,36 @@ mod client_tests {
         assert_eq!(pick_client(false, true, false), ClientKind::Bedrock);
         // No Bedrock client at all: the Anthropic API.
         assert_eq!(pick_client(false, false, true), ClientKind::Anthropic);
+    }
+    fn provider(heavy: &str, chosen: bool) -> ModelProvider {
+        ModelProvider {
+            api_key: String::new(),
+            primary_model: "claude-haiku-4-5".into(),
+            heavy_model: heavy.into(),
+            heavy_model_chosen: chosen,
+            meter: common::usage::UsageMeter::memory("t").0,
+            scope: Default::default(),
+        }
+    }
+
+    #[test]
+    fn measured_routes_run_light_unless_the_team_chose_its_heavy_model() {
+        let default = provider("claude-opus-5-5", false);
+        assert_eq!(default.review_model_id(), MEASURED_LIGHT_MODEL);
+        assert_eq!(default.implement_model_id("medium"), MEASURED_LIGHT_MODEL);
+        // Unmeasured routes keep their models: the critic and complex
+        // tickets on heavy, simple tickets on primary.
+        assert_eq!(default.heavy_model_id(), "claude-opus-5-5");
+        assert_eq!(default.implement_model_id("complex"), "claude-opus-5-5");
+        assert_eq!(default.implement_model_id("simple"), "claude-haiku-4-5");
+
+        // A team that set its heavy model keeps it everywhere.
+        let chosen = provider("claude-opus-4-8", true);
+        assert_eq!(chosen.review_model_id(), "claude-opus-4-8");
+        assert_eq!(chosen.implement_model_id("medium"), "claude-opus-4-8");
+        assert_eq!(chosen.implement_model_id("complex"), "claude-opus-4-8");
+        assert_eq!(chosen.implement_model_id("simple"), "claude-haiku-4-5");
+        // The measured model is one this release calls.
+        assert!(common::model_ids::is_selectable(MEASURED_LIGHT_MODEL));
     }
 }

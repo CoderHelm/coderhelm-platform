@@ -2505,7 +2505,7 @@ async fn run_once(
         &msg.team_id,
         &record_sk,
         &reward.arm,
-        provider.heavy_model_id(),
+        provider.review_model_id(),
     )
     .await;
     info!(
