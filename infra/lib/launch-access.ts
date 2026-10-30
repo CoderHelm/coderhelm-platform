@@ -64,6 +64,10 @@ export function launchAccessResources(): Record<string, unknown> {
     DeployRole: {
       Type: "AWS::IAM::Role",
       ...keep,
+      // W3037: cfn-lint's action list lacks apigateway:TagResource and
+      // UntagResource, which AWS checks when CloudFormation tags an HTTP API
+      // or its stage (a real install was refused without them).
+      Metadata: { "cfn-lint": { config: { ignore_checks: ["W3037"] } } },
       Properties: {
         RoleName: sub(n.deployRoleName),
         Description: "CoderHelm: CloudFormation's role for this install's stacks",
