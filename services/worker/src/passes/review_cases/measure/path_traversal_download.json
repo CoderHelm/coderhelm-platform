@@ -3,15 +3,15 @@
   "about": "security",
   "title": "Download an export by name",
   "body": "The exports page lists files; this lets people download one.",
-  "diff": "\n### api/exports.py (modified, +8/-0)\n@@ -10,3 +10,11 @@\n @router.get(\"/exports\")\n def list_exports():\n     return sorted(os.listdir(EXPORT_DIR))\n+\n+\n+@router.get(\"/exports/{name}\")\n+def download_export(name: str):\n+    path = os.path.join(EXPORT_DIR, name)\n+    if not os.path.isfile(path):\n+        raise HTTPException(status_code=404)\n+    return FileResponse(path)\n",
+  "diff": "\n### api/exports.py (modified, +9/-0)\n@@ -10,3 +10,12 @@\n @router.get(\"/exports\")\n def list_exports():\n     return sorted(os.listdir(EXPORT_DIR))\n+\n+\n+@router.get(\"/exports/download\")\n+def download_export(name: str):\n+    \"\"\"GET /exports/download?name=<file>\"\"\"\n+    path = os.path.join(EXPORT_DIR, name)\n+    if not os.path.isfile(path):\n+        raise HTTPException(status_code=404)\n+    return FileResponse(path)\n",
   "files": {
-    "api/exports.py": "import os\n\nfrom fastapi import APIRouter, HTTPException\nfrom fastapi.responses import FileResponse\n\nrouter = APIRouter()\nEXPORT_DIR = \"/var/app/exports\"\n\n\n@router.get(\"/exports\")\ndef list_exports():\n    return sorted(os.listdir(EXPORT_DIR))\n\n\n@router.get(\"/exports/{name}\")\ndef download_export(name: str):\n    path = os.path.join(EXPORT_DIR, name)\n    if not os.path.isfile(path):\n        raise HTTPException(status_code=404)\n    return FileResponse(path)\n"
+    "api/exports.py": "import os\n\nfrom fastapi import APIRouter, HTTPException\nfrom fastapi.responses import FileResponse\n\nrouter = APIRouter()\nEXPORT_DIR = \"/var/app/exports\"\n\n\n@router.get(\"/exports\")\ndef list_exports():\n    return sorted(os.listdir(EXPORT_DIR))\n\n\n@router.get(\"/exports/download\")\ndef download_export(name: str):\n    \"\"\"GET /exports/download?name=<file>\"\"\"\n    path = os.path.join(EXPORT_DIR, name)\n    if not os.path.isfile(path):\n        raise HTTPException(status_code=404)\n    return FileResponse(path)\n"
   },
   "defects": [
     {
       "file": "api/exports.py",
-      "line": 17,
-      "what": "name is joined unchecked; an encoded ../ (or an absolute path) reads any file on the host"
+      "line": 18,
+      "what": "name comes from the query string and is joined unchecked: ?name=../../etc/passwd (or an absolute path) reads any file on the host"
     }
   ],
   "expect_blocking": true
