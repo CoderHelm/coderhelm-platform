@@ -182,6 +182,26 @@ test("Google sign-in needs a domain in single-origin", () => {
   );
 });
 
+test("migrateUsersFrom: a pool and client of another CoderHelm, self-host only", () => {
+  const ok = { region: "us-east-1", userPoolId: "us-east-1_AbC123", clientId: "abc123def456" };
+  assert.deepEqual(problems(base({ migrateUsersFrom: ok })), []);
+  assert.deepEqual(problems(base({ migrateUsersFrom: { ...ok, clientSecretKey: "migrate_client_secret" } })), []);
+  assert.deepEqual(problems(base({ migrateUsersFrom: null })), []);
+  hasProblem(base({ migrateUsersFrom: { ...ok, region: "mars" } }), /migrateUsersFrom.region/);
+  hasProblem(base({ migrateUsersFrom: { ...ok, userPoolId: "pool" } }), /migrateUsersFrom.userPoolId/);
+  hasProblem(base({ migrateUsersFrom: { ...ok, clientId: "Not An Id" } }), /migrateUsersFrom.clientId/);
+  hasProblem(base({ migrateUsersFrom: { ...ok, clientSecretKey: "a b" } }), /migrateUsersFrom.clientSecretKey/);
+  hasProblem(base({ migrateUsersFrom: { ...ok, password: "x" } as never }), /migrateUsersFrom.password: unknown/);
+  hasProblem(
+    base({
+      layout: "split",
+      split: { zone: null, appUrl: "https://a", apiUrl: "https://b", corsOrigins: [], streamCorsOrigins: [] },
+      migrateUsersFrom: ok,
+    }),
+    /migrateUsersFrom: only for a self-hosted install/
+  );
+});
+
 test("models", () => {
   hasProblem(base({ models: { provider: "openai" as never } }), /models.provider/);
   hasProblem(base({ models: { primary: "Claude Opus" } }), /models.primary/);

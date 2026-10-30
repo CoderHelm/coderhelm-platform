@@ -762,12 +762,45 @@ test("sign-in: self-host checks every new account in Cognito (pre-sign-up trigge
   }
 });
 
+test("sign-in: migrateUsersFrom adds the user-migration trigger, which reads only its client secret", () => {
+  const from = { region: "us-east-1", userPoolId: "us-east-1_AbC123", clientId: "abc123def456", clientSecretKey: "migrate_client_secret" };
+  const api = synth(selfHost({ migrateUsersFrom: from }))["coderhelm-prod-api"];
+  const pool = Object.values(api.findResources("AWS::Cognito::UserPool"))[0] as any;
+  const fns = api.findResources("AWS::Lambda::Function");
+  const [fnId, fn] = Object.entries(fns).find(([, r]) => (r as any).Properties.FunctionName === "coderhelm-prod-user-migration") as [string, any];
+  assert.deepEqual(pool.Properties.LambdaConfig.UserMigration, { "Fn::GetAtt": [fnId, "Arn"] });
+  const env = fn.Properties.Environment.Variables;
+  assert.equal(env.FROM_REGION, "us-east-1");
+  assert.equal(env.FROM_POOL_ID, "us-east-1_AbC123");
+  assert.equal(env.FROM_CLIENT_ID, "abc123def456");
+  assert.equal(env.SECRET_KEY, "migrate_client_secret");
+  api.hasResourceProperties("AWS::Lambda::Permission", { Principal: "cognito-idp.amazonaws.com", FunctionName: { "Fn::GetAtt": [fnId, "Arn"] } });
+  const policy = Object.values(api.findResources("AWS::IAM::Policy")).find((p: any) =>
+    JSON.stringify(p.Properties.Roles).includes(fn.Properties.Role["Fn::GetAtt"][0]),
+  ) as any;
+  const actions = JSON.stringify(policy.Properties.PolicyDocument.Statement.map((s: any) => s.Action));
+  assert.ok(actions.includes("secretsmanager:GetSecretValue"), actions);
+  assert.ok(!/dynamodb|cognito-idp|s3:/.test(actions), `user migration needs nothing else: ${actions}`);
+
+  // Without a client secret: no secret read at all.
+  const { clientSecretKey: _k, ...noSecret } = from;
+  const api2 = synth(selfHost({ migrateUsersFrom: noSecret }))["coderhelm-prod-api"];
+  const fn2 = Object.values(api2.findResources("AWS::Lambda::Function")).find((r: any) => r.Properties.FunctionName === "coderhelm-prod-user-migration") as any;
+  assert.equal(fn2.Properties.Environment.Variables.SECRET_KEY, undefined);
+  assert.equal(api2.findResources("AWS::IAM::Policy", { Properties: { Roles: [{ Ref: fn2.Properties.Role["Fn::GetAtt"][0] }] } }).length ?? 0, 0);
+
+  // Off by default.
+  const plain = Object.values(synth(selfHost())["coderhelm-prod-api"].findResources("AWS::Cognito::UserPool"))[0] as any;
+  assert.equal(plain.Properties.LambdaConfig.UserMigration, undefined);
+});
+
 test("sign-in: hosted keeps its open pool (no pre-sign-up trigger) and optional MFA", () => {
   const cfg = loadConfigFile(path.join(INFRA, "config", "hosted.prod.json"), { CDK_DEFAULT_ACCOUNT: "654654210434" });
   const api = synth(cfg, zoneContext("654654210434", "us-east-1", "coderhelm.com"))["coderhelm-prod-api"];
   const pool = Object.values(api.findResources("AWS::Cognito::UserPool"))[0] as any;
   assert.equal(pool.Properties.MfaConfiguration, "OPTIONAL");
   assert.equal(pool.Properties.LambdaConfig.PreSignUp, undefined);
+  assert.equal(pool.Properties.LambdaConfig.UserMigration, undefined);
   assert.ok(pool.Properties.LambdaConfig.CustomMessage);
 });
 

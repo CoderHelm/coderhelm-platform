@@ -82,6 +82,16 @@ Why an authenticator app and not passkeys: Cognito's passkeys need its paid Esse
 
 Always on. People confirm their email with a code. Sign-up and password emails come from Amazon Cognito until `email.cognitoUsesSes` is on (see [Email](./email.md#sign-up-and-password-emails)); Cognito's own address is limited to 50 emails a day.
 
+## Moving from another CoderHelm
+
+When a team moves to this install from the hosted CoderHelm (or another install), its people keep signing in as before:
+
+- **Email and password:** set `migrateUsersFrom` in the config (the other user pool, and an app client of it that allows `USER_PASSWORD_AUTH`) and deploy. Someone's first sign-in here checks their password against the other pool once (Cognito's user-migration trigger); when it matches, their account is made here with the same password and they land on their member record, found by email. A wrong password, or a second factor on the other pool, is refused like any wrong password. Forgot-password works once they have signed in here.
+- **Google:** turn on Google sign-in (below). A Google account lands on its member record by email.
+- **GitHub:** GitHub sign-ins land by GitHub account or email.
+
+Remove `migrateUsersFrom` and deploy once everyone has signed in.
+
 ## Sign in with Google
 
 Optional, and it needs your own domain (Google requires a fixed sign-in address; see [Domains](./domains.md)). It follows the same rules: only invited people and allowed domains.

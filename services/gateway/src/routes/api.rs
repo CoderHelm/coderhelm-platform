@@ -3357,6 +3357,13 @@ pub async fn forge_register_urls(
     } else {
         format!("TEAM#{raw_team_id}")
     };
+    // A team that moved to a self-hosted install registers there.
+    if let Some(install) = super::hybrid::moved_to(&state, &team_id).await {
+        let bytes = serde_json::to_vec(&body).unwrap_or_default();
+        if let Some(code) = super::hybrid::relay_jira(&state, &install, "register", &bytes).await {
+            return Ok(code);
+        }
+    }
     let forge_secret = body
         .get("forge_secret")
         .and_then(|v| v.as_str())

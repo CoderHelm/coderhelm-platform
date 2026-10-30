@@ -1957,6 +1957,34 @@ pub async fn relay_github(
     Some(StatusCode::OK)
 }
 
+/// A hosted team that moved to a self-hosted install. Written on hosted when
+/// the team switches over (settings: `pk = HYBRIDMOVE#<team>`, `sk = MOVE`,
+/// `install_id`): from then on the Forge app that still names the hosted
+/// team sends its events and registrations to that install through the relay,
+/// exactly as one set up with the install's id would. Removing the record
+/// moves them back.
+pub const MOVE_SK: &str = "MOVE";
+
+pub fn move_pk(team_id: &str) -> String {
+    format!("HYBRIDMOVE#{team_id}")
+}
+
+/// The install a hosted team moved to, if it did (hosted side only).
+pub async fn moved_to(state: &AppState, team_id: &str) -> Option<String> {
+    master(state)?;
+    let out = state
+        .dynamo
+        .get_item()
+        .table_name(&state.config.settings_table_name)
+        .key("pk", s(&move_pk(team_id)))
+        .key("sk", s(MOVE_SK))
+        .send()
+        .await
+        .ok()?;
+    let id = out.item()?.get("install_id")?.as_s().ok()?.to_string();
+    sign::is_install_id(&id).then_some(id)
+}
+
 /// The relay's part of the hosted Jira Forge intake: a Forge event whose
 /// team id is an install id goes to that install, unchanged. The install
 /// checks the Forge secret itself, so this side can't make one up.
@@ -2780,6 +2808,11 @@ pub async fn admin_revoke(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_moved_team_is_found_by_its_own_id() {
+        assert_eq!(super::move_pk("TEAM#abc"), "HYBRIDMOVE#TEAM#abc");
+        assert_eq!(super::MOVE_SK, "MOVE");
+    }
 
     #[test]
     fn drive_is_offered_to_installs_only_with_its_own_app() {

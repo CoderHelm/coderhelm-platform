@@ -788,6 +788,14 @@ pub async fn handle_forge(
         }
     };
 
+    // Hosted side of hybrid: a team that moved to a self-hosted install keeps
+    // its Forge app as it was; its events go to that install.
+    if let Some(install) = super::hybrid::moved_to(&state, &team_id).await {
+        if let Some(code) = super::hybrid::relay_jira(&state, &install, "event", &body).await {
+            return Ok(code);
+        }
+    }
+
     // Verify this team actually exists by checking jira config
     let config_item = state
         .dynamo

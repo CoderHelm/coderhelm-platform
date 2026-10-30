@@ -189,6 +189,25 @@ export interface CoderhelmConfig {
     /** While true, only teams with a rollout list get the Monday summary. Default false. */
     weeklySummaryListedTeamsOnly?: boolean;
   };
+  /**
+   * single-origin only, optional and temporary: sign people in with the
+   * password they had on another CoderHelm user pool (moving from the hosted
+   * deployment or another install). On a person's first email sign-in the
+   * install checks the password against that pool (Cognito's UserMigration
+   * trigger) and makes their account here with the same password; nothing
+   * else is read from the other pool. Remove it once everyone has signed in.
+   */
+  migrateUsersFrom?: {
+    region: string;
+    userPoolId: string;
+    /** An app client of that pool that allows USER_PASSWORD_AUTH. */
+    clientId: string;
+    /**
+     * When that client has a secret: the key in this install's secret
+     * (secretName) that holds it. Omit for a client without one.
+     */
+    clientSecretKey?: string;
+  } | null;
   /** single-origin only: the dashboard this deployment serves. */
   dashboard?: {
     /** A built dashboard (static export) to upload. The installer fills it in. */
@@ -306,6 +325,7 @@ export interface ResolvedConfig {
   signup: { emails: string[]; domains: string[]; requireTwoFactor: boolean };
   integrations: Required<NonNullable<CoderhelmConfig["integrations"]>>;
   dashboardAssetDir: string | null;
+  migrateUsersFrom: { region: string; userPoolId: string; clientId: string; clientSecretKey: string | null } | null;
   updates: {
     enabled: boolean;
     webhookUrl: string | null;
@@ -361,7 +381,7 @@ const URL_RE = /^https?:\/\/[^\s/]+(\/[^\s]*)?$/;
 const KNOWN_TOP_KEYS = new Set([
   "$schema", "account", "region", "stage", "resourcePrefix", "globalNameSuffix", "layout",
   "domain", "split", "hybrid", "hybridUrl", "retainData", "models", "email", "admins", "signup", "integrations",
-  "dashboard", "telemetry", "logReaderTemplateUrl", "publicBucketName", "siteUrl", "ci", "updates", "access",
+  "dashboard", "migrateUsersFrom", "telemetry", "logReaderTemplateUrl", "publicBucketName", "siteUrl", "ci", "updates", "access",
 ]);
 
 /** Every problem with a config, empty when it is valid. */
@@ -548,6 +568,25 @@ export function validateConfig(c: unknown): string[] {
   if (i.googleSignIn && layout === "single-origin" && !cfg.domain) {
     p.push("integrations.googleSignIn: needs a domain (Google requires a fixed sign-in callback URL)");
   }
+  if (cfg.migrateUsersFrom !== undefined && cfg.migrateUsersFrom !== null) {
+    const m = cfg.migrateUsersFrom as Record<string, unknown>;
+    if (typeof m !== "object" || Array.isArray(m)) {
+      p.push("migrateUsersFrom: {region, userPoolId, clientId} or null");
+    } else {
+      if (layout !== "single-origin") p.push("migrateUsersFrom: only for a self-hosted install");
+      if (!REGION_RE.test(String(m.region ?? ""))) p.push("migrateUsersFrom.region: an AWS region such as us-east-1");
+      if (!/^[a-z]{2}(-gov)?-[a-z]+-\d_[A-Za-z0-9]+$/.test(String(m.userPoolId ?? ""))) {
+        p.push("migrateUsersFrom.userPoolId: a Cognito user pool id such as us-east-1_AbC123");
+      }
+      if (!/^[a-z0-9]{1,128}$/.test(String(m.clientId ?? ""))) p.push("migrateUsersFrom.clientId: an app client id of that pool");
+      if (m.clientSecretKey !== undefined && !/^[A-Za-z0-9_]{1,64}$/.test(String(m.clientSecretKey))) {
+        p.push("migrateUsersFrom.clientSecretKey: the key in this install's secret that holds the client's secret");
+      }
+      for (const k of Object.keys(m)) {
+        if (!["region", "userPoolId", "clientId", "clientSecretKey"].includes(k)) p.push(`migrateUsersFrom.${k}: unknown setting`);
+      }
+    }
+  }
   if (cfg.telemetry !== undefined) {
     if (cfg.telemetry.enabled !== undefined && typeof cfg.telemetry.enabled !== "boolean") {
       p.push("telemetry.enabled: true or false");
@@ -702,6 +741,14 @@ export function resolveConfig(cfg: CoderhelmConfig, opts: { skipValidation?: boo
       weeklySummaryListedTeamsOnly: i.weeklySummaryListedTeamsOnly ?? false,
     },
     dashboardAssetDir: cfg.dashboard?.assetDir ?? null,
+    migrateUsersFrom: cfg.migrateUsersFrom
+      ? {
+          region: cfg.migrateUsersFrom.region,
+          userPoolId: cfg.migrateUsersFrom.userPoolId,
+          clientId: cfg.migrateUsersFrom.clientId,
+          clientSecretKey: cfg.migrateUsersFrom.clientSecretKey ?? null,
+        }
+      : null,
     updates: (() => {
       const u = cfg.updates ?? {};
       const w = parseWindow(u.window ?? "Sun 03:00") ?? { day: "sun", hour: 3 };

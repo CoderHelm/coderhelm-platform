@@ -82,6 +82,10 @@ A forward that fails is retried with growing waits for about 24 hours. Both side
 | Slack and Teams commands | no | there is no shared Slack or Teams app: each team uses its own app's signing secret, as today |
 | Sign in with GitHub | no | it would hand your people's identities to CoderHelm; use email, or Google with your own domain |
 
+### A team that moved from hosted CoderHelm
+
+When a team moves from hosted CoderHelm to an install, its Jira site doesn't need to change anything: CoderHelm records the move, and the events and link registrations of the Forge app set up for the hosted team go to the install through the relay, as for one set up with the install's id. The install checks the same Forge secret. Removing the record moves them back.
+
 ## Turn hybrid off
 
 **Leave hybrid** in Settings releases the name, unlinks CoderHelm's apps and revokes the sign-ins. To make sure an install never talks to CoderHelm, set `"hybridUrl": null` in `coderhelm.config.json` and deploy.

@@ -817,7 +817,7 @@ pub async fn google_login(State(state): State<Arc<AppState>>, headers: HeaderMap
     let base = if domain.contains('.') {
         format!("https://{domain}")
     } else {
-        format!("https://{domain}.auth.us-east-1.amazoncognito.com")
+        cognito_prefix_domain_url(domain)
     };
 
     let csrf = ulid::Ulid::new().to_string();
@@ -873,7 +873,7 @@ async fn google_callback_inner(
     let base = if domain.contains('.') {
         format!("https://{domain}")
     } else {
-        format!("https://{domain}.auth.us-east-1.amazoncognito.com")
+        cognito_prefix_domain_url(domain)
     };
     let token_url = format!("{base}/oauth2/token");
 
@@ -2424,6 +2424,27 @@ async fn send_welcome_email(state: &AppState, email: &str) {
     match mail::send(&super::email_settings::sender(state), &m).await {
         Ok(_) => info!("Welcome email sent"),
         Err(e) => error!(code = %e.code, "Failed to send welcome email: {}", e.message),
+    }
+}
+
+/// A Cognito prefix domain's sign-in address, in the install's own region.
+fn cognito_prefix_domain_url(domain: &str) -> String {
+    let region = std::env::var("AWS_REGION").unwrap_or_else(|_| "us-east-1".to_string());
+    prefix_domain_url(domain, &region)
+}
+
+fn prefix_domain_url(domain: &str, region: &str) -> String {
+    format!("https://{domain}.auth.{region}.amazoncognito.com")
+}
+
+#[cfg(test)]
+mod prefix_domain_tests {
+    #[test]
+    fn cognito_prefix_domains_use_the_install_region() {
+        assert_eq!(
+            super::prefix_domain_url("coderhelm-prod-1", "eu-west-1"),
+            "https://coderhelm-prod-1.auth.eu-west-1.amazoncognito.com"
+        );
     }
 }
 

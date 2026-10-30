@@ -116,6 +116,11 @@ A self-hosted install is one organization: sign-up is closed to everyone else. A
 
 See [Integrations](./integrations.md).
 
+## Moving people from another CoderHelm
+
+- **`migrateUsersFrom`** *object or `null`, default `null`*\
+  `{ "region", "userPoolId", "clientId", "clientSecretKey"? }`: another CoderHelm's Cognito user pool and an app client of it that allows `USER_PASSWORD_AUTH`. A person's first email sign-in here checks their password against that pool and, when it matches, makes their account here with the same password (no reset, no welcome email). `clientSecretKey` names the key in this install's secret that holds the client's secret, when it has one. Temporary: remove it once everyone has signed in. See [Sign-in and people](./sign-in.md#moving-from-another-coderhelm).
+
 ## Updates
 
 - **`updates.enabled`** *boolean, default `true`*\

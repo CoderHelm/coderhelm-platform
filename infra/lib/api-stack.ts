@@ -159,6 +159,37 @@ export class ApiStack extends cdk.Stack {
       userPool.addTrigger(cognito.UserPoolOperation.PRE_SIGN_UP, preSignUpFn);
     }
 
+    // Moving people from another CoderHelm user pool (migrateUsersFrom): on
+    // a first email sign-in Cognito asks this function, which checks the
+    // password against the other pool's app client (InitiateAuth and GetUser
+    // are public Cognito calls: no IAM grant in the other account) and makes
+    // the account here with the same password. The join rules still apply
+    // when the session is made (routes/sign_in.rs).
+    if (cfg.layout === "single-origin" && cfg.migrateUsersFrom) {
+      const m = cfg.migrateUsersFrom;
+      const migrateFn = new lambda.Function(this, "UserMigrationFn", {
+        functionName: `${prefix}-user-migration`,
+        runtime: lambda.Runtime.NODEJS_22_X,
+        handler: "handler.handler",
+        code: lambda.Code.fromAsset(repoPath("lambda/user-migration"), {
+          exclude: ["*.test.js"],
+        }),
+        timeout: cdk.Duration.seconds(10),
+        memorySize: 128,
+        environment: {
+          FROM_REGION: m.region,
+          FROM_POOL_ID: m.userPoolId,
+          FROM_CLIENT_ID: m.clientId,
+          ...(m.clientSecretKey ? { SECRET_NAME: cfg.secretName, SECRET_KEY: m.clientSecretKey } : {}),
+        },
+        logRetention: logs.RetentionDays.ONE_MONTH,
+      });
+      if (m.clientSecretKey) {
+        secretsmanager.Secret.fromSecretNameV2(this, "MigrateClientSecret", cfg.secretName).grantRead(migrateFn);
+      }
+      userPool.addTrigger(cognito.UserPoolOperation.USER_MIGRATION, migrateFn);
+    }
+
     // Google identity provider (optional: integrations.googleSignIn).
     // google_client_id and google_client_secret live in the deployment's
     // secret (cfg.secretName). Callback URL:
