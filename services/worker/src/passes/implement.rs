@@ -743,11 +743,8 @@ pub async fn run(
     }
     let mut messages = vec![("user".to_string(), content_blocks)];
 
-    // Route simple issues to primary (Sonnet), medium/complex to heavy (Opus)
-    let model_id = match complexity {
-        "simple" => provider.primary_model_id(),
-        _ => provider.heavy_model_id(),
-    };
+    // Simple on primary, medium on the measured route, complex on heavy.
+    let model_id = provider.implement_model_id(complexity);
     let opts = llm::ConverseOptions {
         max_turns: match complexity {
             "simple" => 40,

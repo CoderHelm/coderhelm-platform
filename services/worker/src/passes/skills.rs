@@ -2203,6 +2203,7 @@ mod tests {
             api_key: String::new(),
             primary_model: "team-primary".into(),
             heavy_model: "team-heavy".into(),
+            heavy_model_chosen: true,
             meter: common::usage::UsageMeter::memory("t").0,
             scope: Default::default(),
         };

@@ -1640,7 +1640,7 @@ pub async fn generate_review(
         state,
         provider,
         common::agent_policy::Agent::Reviewer,
-        provider.heavy_model_id(),
+        provider.review_model_id(),
         &system,
         &mut messages,
         &tools,
