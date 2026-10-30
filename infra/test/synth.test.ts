@@ -902,7 +902,10 @@ test("hosted: the weekly summary stays on for everyone, and the mail relay sends
   assert.ok(txt("notify.coderhelm.com.").some((v: string) => v.includes("include:amazonses.com -all")), "SPF");
   assert.ok(txt("bounce.notify.coderhelm.com.").some((v: string) => v.includes("include:amazonses.com -all")), "MAIL FROM SPF");
   assert.ok(recs.some((p) => p.Type === "MX" && p.Name === "bounce.notify.coderhelm.com."), "MAIL FROM MX");
-  assert.equal(recs.filter((p) => p.Type === "CNAME" && JSON.stringify(p.Name).includes("DkimDNSTokenName")).length, 3, "Easy DKIM");
+  const dkim = recs.filter((p) => p.Type === "CNAME" && JSON.stringify(p.Name).includes("DkimDNSTokenName"));
+  assert.equal(dkim.length, 3, "Easy DKIM");
+  // Full names as SES gives them: the zone is never appended a second time.
+  for (const p of dkim) assert.ok(!JSON.stringify(p.Name).includes("coderhelm.com."), `DKIM name has the zone appended: ${JSON.stringify(p.Name)}`);
   // Bounces and complaints reach the worker through SNS, raw.
   api.hasResourceProperties("AWS::SES::ConfigurationSetEventDestination", {
     ConfigurationSetName: Match.anyValue(),
