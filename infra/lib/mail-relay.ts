@@ -84,11 +84,14 @@ export class MailRelay extends Construct {
       mailFromDomain: mailFrom,
       mailFromBehaviorOnMxFailure: ses.MailFromBehaviorOnMxFailure.REJECT_MESSAGE,
     });
-    // Easy DKIM: the three CNAMEs SES signs with.
+    // Easy DKIM: the three CNAMEs SES signs with. Their names are tokens
+    // that resolve to full names, which CDK can't see; without the trailing
+    // dot it appends the zone again (`...notify.<zone>.<zone>`) and SES never
+    // finds them.
     identity.dkimRecords.forEach((r, i) => {
       new route53.CnameRecord(this, `Dkim${i + 1}`, {
         zone,
-        recordName: r.name,
+        recordName: `${r.name}.`,
         domainName: r.value,
         ttl: cdk.Duration.hours(1),
       });
