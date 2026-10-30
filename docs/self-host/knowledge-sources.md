@@ -100,7 +100,7 @@ CoderHelm asks for `offline_access` too, so the sign-in renews itself.
 
 ## Google Drive
 
-Google Drive connects only through Google sign-in, with an OAuth client of its own. CoderHelm reads `google_drive_client_id` and `google_drive_client_secret` and nothing else: the client from [Google sign-in](./integrations.md#google-sign-in) (`google_client_id`) is never used for Drive, because it is registered for a different redirect address and has no Drive scope, so Google refuses it with `Error 400: redirect_uri_mismatch`. Without the two Drive keys, the add flow says "Google Drive sign-in isn't set up on this Coderhelm yet. Ask whoever runs Coderhelm to set up Google Drive sign-in." and the **Sign-in apps** section shows Google Drive as not set up.
+Google Drive connects only through Google sign-in, with an OAuth client of its own. CoderHelm reads `google_drive_client_id` and `google_drive_client_secret` and nothing else (a self-hosted install has no Google sign-in client to borrow; a `google_client_id` left in an old secret is never used for Drive). Without the two Drive keys, the add flow says "Google Drive sign-in isn't set up on this Coderhelm yet. Ask whoever runs Coderhelm to set up Google Drive sign-in." and the **Sign-in apps** section shows Google Drive as not set up.
 
 ### Which scope, and why
 
