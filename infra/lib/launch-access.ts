@@ -66,7 +66,8 @@ export function launchAccessResources(): Record<string, unknown> {
       ...keep,
       // W3037: cfn-lint's action list lacks apigateway:TagResource and
       // UntagResource, which AWS checks when CloudFormation tags an HTTP API
-      // or its stage (a real install was refused without them).
+      // or its stage (a real install was refused without them), and
+      // cloudfront:CreateDistributionWithTags (infra/lib/access.ts).
       Metadata: { "cfn-lint": { config: { ignore_checks: ["W3037"] } } },
       Properties: {
         RoleName: sub(n.deployRoleName),

@@ -15,6 +15,7 @@ import * as cdk from "aws-cdk-lib";
 import { buildApp } from "../lib/app";
 import { resolveConfig, ResolvedConfig, CoderhelmConfig } from "../lib/config";
 import { AccessNames, accessNames, boundaryPolicy, BOUNDARY_SERVICES, deployPolicy, INSTALL_TAG, PolicyDocument, Statement, WINDOW_EXPIRES, WINDOW_USER_ID, windowPolicy, windowPolicyParts } from "../lib/access";
+import { allowed, glob, list, Request } from "./iam-eval";
 import { installName } from "../lib/hardening";
 import { buildSpecSha256, canonicalJson, updateBuildSpecObject, UPDATE_BUILD_VARIABLES } from "../lib/updates-stack";
 import { repoPath } from "../lib/paths";
@@ -43,57 +44,8 @@ function synth(over: Partial<CoderhelmConfig> = {}, opts: { accessStack?: boolea
 const hardened = (over: Partial<CoderhelmConfig> = {}) => synth({ access: { mode: "hardened", owner: "app" }, ...over }, { accessStack: true });
 const names = (): AccessNames => resolveConfig({ ...BASE, access: { mode: "hardened", owner: "app" } }).access!;
 
-// ── A small IAM evaluator ────────────────────────────────────────────────
-
-interface Request {
-  action: string;
-  resource: string;
-  context?: Record<string, string | string[] | undefined>;
-}
-
-const list = (v: string | string[] | undefined): string[] => (v === undefined ? [] : Array.isArray(v) ? v : [v]);
-const glob = (pattern: string, value: string, ci = false) => {
-  const re = new RegExp(`^${pattern.split("*").map((p) => p.split("?").map((q) => q.replace(/[.+^${}()|[\]\\]/g, "\\$&")).join(".")).join(".*")}$`, ci ? "i" : "");
-  return re.test(value);
-};
-
-function conditionHolds(cond: Statement["Condition"], ctx: Record<string, string | string[] | undefined>): boolean {
-  for (const [op, kv] of Object.entries(cond ?? {})) {
-    for (const [key, want] of Object.entries(kv)) {
-      const have = ctx[key];
-      const wants = list(want as string | string[]);
-      const haves = list(have);
-      const any = (f: (h: string, w: string) => boolean) => haves.some((h) => wants.some((w) => f(h, w)));
-      switch (op) {
-        case "StringEquals": if (!any((h, w) => h === w)) return false; break;
-        case "StringNotEquals": if (have !== undefined && any((h, w) => h === w)) return false; break;
-        case "StringLike": if (!any((h, w) => glob(w, h))) return false; break;
-        case "ArnLike": if (!any((h, w) => glob(w, h))) return false; break;
-        case "DateLessThan": if (!any((h, w) => Date.parse(h) < Date.parse(w))) return false; break;
-        case "ForAllValues:StringEquals": if (!haves.every((h) => wants.includes(h))) return false; break;
-        case "ForAllValues:StringLike": if (!haves.every((h) => wants.some((w) => glob(w, h)))) return false; break;
-        default: throw new Error(`the evaluator doesn't know ${op}`);
-      }
-    }
-  }
-  return true;
-}
-
-function matches(s: Statement, r: Request): boolean {
-  const actionHit = s.Action !== undefined ? list(s.Action).some((a) => glob(a, r.action, true)) : !list(s.NotAction).some((a) => glob(a, r.action, true));
-  if (!actionHit) return false;
-  const resHit = s.Resource !== undefined ? list(s.Resource).some((x) => glob(x, r.resource)) : !list(s.NotResource).some((x) => glob(x, r.resource));
-  return resHit && conditionHolds(s.Condition, r.context ?? {});
-}
-
-/** Allowed when an identity statement allows, the boundary (if any) allows, and nothing denies. */
-function allowed(identity: PolicyDocument[], boundary: PolicyDocument | null, r: Request): boolean {
-  const all = [...identity, ...(boundary ? [boundary] : [])].flatMap((d) => d.Statement);
-  if (all.some((s) => s.Effect === "Deny" && matches(s, r))) return false;
-  const byIdentity = identity.flatMap((d) => d.Statement).some((s) => s.Effect === "Allow" && matches(s, r));
-  const byBoundary = !boundary || boundary.Statement.some((s) => s.Effect === "Allow" && matches(s, r));
-  return byIdentity && byBoundary;
-}
+// The IAM evaluator (test/iam-eval.ts) is checked against AWS's policy
+// simulator by test/deploy-role-sim.test.ts.
 
 /** A synthesized policy statement, its intrinsics made plain (Fn::Join of strings, Fn::GetAtt as a placeholder). */
 function plain(v: any): any {
