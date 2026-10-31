@@ -1,0 +1,17 @@
+From: "Acme CoderHelm" <notifications@notify.coderhelm.com>
+Subject: Acme CoderHelm: a knowledge source needs signing in again
+
+CoderHelm can't read the Engineering wiki knowledge source any more, so it stopped syncing. Work goes on without what it holds until someone signs in again.
+
+Source: Engineering wiki
+
+What went wrong:
+> The sign-in expired on 2026-10-30.
+
+Open the source in Settings, Knowledge and sign in again. The next sync picks up where it stopped.
+
+Sign in again: https://helm.example.org/settings/knowledge/
+
+
+
+Sent through CoderHelm's mail service for the self-hosted CoderHelm install at helm.example.org. Links in this email go only to that install. Questions about it go to the install's admin, admin@example.org. CoderHelm never asks for your password or sign-in codes by email.

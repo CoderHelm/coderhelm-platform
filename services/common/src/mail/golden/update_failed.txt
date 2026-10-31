@@ -1,0 +1,29 @@
+From: "Acme CoderHelm" <notifications@notify.coderhelm.com>
+Subject: Acme CoderHelm: update to v0.8.0 failed
+
+The update to v0.8.0 failed.
+
+Install: helm.example.org
+Was running: v0.7.4
+Tried to install: v0.8.0
+Failed: 2026-10-31 14:22 UTC
+
+What went wrong:
+> The deploy stopped: the api stack failed to update (resource limit reached).
+
+What to do:
+> Open the update's log under Update history, fix what it names, then press Update now.
+
+Open Settings, then System, then Update history for the full log. Fix what it shows, then press Update now to try again. From a terminal:
+
+    npx -y github:CoderHelm/coderhelm-platform doctor
+
+    npx -y github:CoderHelm/coderhelm-platform update --to v0.8.0
+
+Open Settings, System: https://helm.example.org/settings/system/
+
+Read the release notes: https://helm.example.org/settings/system/#version
+
+
+
+Sent through CoderHelm's mail service for the self-hosted CoderHelm install at helm.example.org. Links in this email go only to that install. Questions about it go to the install's admin, admin@example.org. CoderHelm never asks for your password or sign-in codes by email.

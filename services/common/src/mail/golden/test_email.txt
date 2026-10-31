@@ -1,0 +1,12 @@
+From: "Acme CoderHelm" <notifications@notify.coderhelm.com>
+Subject: Acme CoderHelm: test email, delivery works
+
+This is a test email from your CoderHelm install. It arrived, so email works: run results, invites and update notices will come the same way.
+
+Install: helm.example.org
+
+Nothing to do. An admin sent it with Send test email in Setup.
+
+
+
+Sent through CoderHelm's mail service for the self-hosted CoderHelm install at helm.example.org. Links in this email go only to that install. Questions about it go to the install's admin, admin@example.org. CoderHelm never asks for your password or sign-in codes by email.

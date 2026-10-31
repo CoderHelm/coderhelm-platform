@@ -1,0 +1,14 @@
+From: "Acme CoderHelm" <notifications@notify.coderhelm.com>
+Subject: Acme CoderHelm: two-factor sign-in paused for 15 minutes
+
+Two-factor sign-in was paused for 15 minutes for someone in your organization after too many wrong codes.
+
+Paused for: 15 minutes
+
+If they lost their phone, check it's really them, then reset their two-factor sign-in in Settings, Sign-in. If it wasn't them, someone may know their password: ask them to change it.
+
+Open Settings: https://helm.example.org/settings/sign-in/
+
+
+
+Sent through CoderHelm's mail service for the self-hosted CoderHelm install at helm.example.org. Links in this email go only to that install. Questions about it go to the install's admin, admin@example.org. CoderHelm never asks for your password or sign-in codes by email.

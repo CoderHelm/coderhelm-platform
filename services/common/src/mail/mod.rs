@@ -20,9 +20,13 @@
 //! inside the install (its own sender, or the install's SES), so a code never
 //! reaches CoderHelm.
 
+pub mod naming;
 pub mod relay;
 pub mod stats;
 pub mod templates;
+
+#[cfg(test)]
+mod golden_tests;
 
 use std::collections::BTreeMap;
 use std::sync::Mutex;
@@ -443,7 +447,7 @@ async fn send_ses(s: &Sender<'_>, mail: &Mail) -> Result<(), SendError> {
         .map_err(|e| err("email_failed", e.to_string()))?;
     s.ses
         .send_email()
-        .from_email_address(s.from)
+        .from_email_address(ses_from(s.from))
         .destination(Destination::builder().to_addresses(&mail.to).build())
         .content(content)
         .email_tags(tag)
@@ -464,6 +468,23 @@ async fn send_ses(s: &Sender<'_>, mail: &Mail) -> Result<(), SendError> {
     Ok(())
 }
 
+/// The install's own SES From line: its address with a name
+/// ([`naming::ses_display_name`]) on a self-hosted install. A sender that
+/// already carries a name, and the hosted deployment's, stay as they are.
+pub fn ses_from(from: &str) -> String {
+    if deployment() == Deployment::Hosted || from.contains('<') {
+        return from.to_string();
+    }
+    let app = crate::public_urls::app_url_from_env();
+    let name = naming::ses_display_name(
+        std::env::var("EMAIL_FROM_NAME").ok().as_deref(),
+        std::env::var("ORGANIZATION_NAME").ok().as_deref(),
+        crate::public_urls::host_of(app),
+        &naming::coderhelm_zone(),
+    );
+    naming::from_header(&name, from)
+}
+
 /// Sends through CoderHelm's relay. An address the relay doesn't know yet is
 /// listed once (as a member, vouched for by an install admin) and the send
 /// tried again; invites are listed by the invite handler before sending.
@@ -481,6 +502,7 @@ async fn send_relay(
         template: t.id.to_string(),
         params: mail.params.clone(),
         contact: install_admin(),
+        org: naming::org_from_env(),
     };
     let call = |r: relay::SendRequest| async move {
         let body = serde_json::to_value(&r).unwrap_or(Value::Null);
@@ -792,18 +814,17 @@ mod adversarial {
             true,
         );
         assert_eq!(r.unwrap_err().code(), "param_reserved");
-        // A claimed name like support.coderhelm.com can't become the sender name.
-        assert_eq!(
-            relay::display_name(Some("support.coderhelm.com"), "d1example.cloudfront.net"),
-            "d1example.cloudfront.net via CoderHelm"
-        );
-        assert_eq!(
-            relay::display_name(
-                Some("coderhelm-security.coderhelm.com"),
-                "d1example.cloudfront.net"
-            ),
-            "d1example.cloudfront.net via CoderHelm"
-        );
+        // A claimed name like support.coderhelm.com, or an organization
+        // named "CoderHelm Support", can't become the sender name.
+        for (org, name) in [
+            (None, "support.coderhelm.com"),
+            (None, "coderhelm-security.coderhelm.com"),
+            (Some("CoderHelm Support"), "c0derhe1m.coderhelm.com"),
+            (Some("Billing"), "d1example.cloudfront.net"),
+        ] {
+            let label = relay::sender_label(org, None, Some(name), NOW);
+            assert_eq!(relay::display_name(label.as_deref()), "CoderHelm", "{name}");
+        }
         // The relay's own notices (pause) can't be asked for by an install.
         assert_eq!(
             check(
@@ -817,8 +838,8 @@ mod adversarial {
         );
         // Every subject is fixed, and every email says whose install sent it.
         let (t, v) = check("test_email", &Map::new(), &hosts(), true).unwrap();
-        let r = templates::render(t, &v, "acme.coderhelm.com", None);
-        assert_eq!(r.subject, "Test email from your install");
+        let r = templates::render(t, &v, "acme.coderhelm.com", None, Some("acme"));
+        assert_eq!(r.subject, "acme CoderHelm: test email, delivery works");
         assert!(r
             .text
             .contains("self-hosted CoderHelm install at acme.coderhelm.com"));
@@ -901,7 +922,7 @@ mod adversarial {
             true,
         )
         .unwrap();
-        let r = templates::render(t, &v, "acme.coderhelm.com", None);
+        let r = templates::render(t, &v, "acme.coderhelm.com", None, None);
         for bad in ["evil.example", "evil.com"] {
             assert!(
                 !r.text.contains(bad) && !r.html.contains(bad),

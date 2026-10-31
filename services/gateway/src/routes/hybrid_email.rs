@@ -83,8 +83,14 @@ pub fn own_hosts(i: &Install) -> Vec<String> {
         .collect()
 }
 
-/// The install's address for the From line and the footer.
-pub fn install_host(i: &Install) -> String {
+/// The install's address for the body and footer: its own domain while
+/// the relay's proof on it is fresh, else its CoderHelm name, else (only
+/// then) its CloudFront address, where its links go. Never the From line
+/// ([`relay::sender_label`]).
+pub fn install_host(i: &Install, domain: Option<&relay::CustomDomain>, now: i64) -> String {
+    if let Some(d) = domain.and_then(|d| relay::fresh_domain(d, now)) {
+        return d;
+    }
     if i.name.is_empty() {
         i.cloudfront.clone()
     } else {
@@ -274,11 +280,8 @@ pub async fn send(
     let req: relay::SendRequest =
         serde_json::from_slice(&body).map_err(|_| refuse(relay::Refusal::BadRequest))?;
     let fail_with = |code: &str| relay_delivery(&req.template, &req.to, Err(code));
-    let hosts = relay::link_hosts(
-        &own_hosts(&install),
-        custom_domain(&state, &install.id).await?.as_ref(),
-        epoch(),
-    );
+    let domain = custom_domain(&state, &install.id).await?;
+    let hosts = relay::link_hosts(&own_hosts(&install), domain.as_ref(), epoch());
     let (template, values) = match templates::check(&req.template, &req.params, &hosts, true) {
         Ok(v) => v,
         Err(r) => {
@@ -357,19 +360,27 @@ pub async fn send(
         }
         None => None,
     };
-    let host = install_host(&install);
-    let email = templates::render(template, &values, &host, contact.as_deref());
-    let display = relay::display_name(name_host(&install).as_deref(), &install.cloudfront);
-    let sent = send_ses(
-        &state,
-        &from,
-        &display,
-        &req.to,
-        &email,
-        &install.id,
-        template.id,
-    )
-    .await;
+    let host = install_host(&install, domain.as_ref(), epoch());
+    let label = relay::sender_label(
+        req.org.as_deref(),
+        domain.as_ref(),
+        name_host(&install).as_deref(),
+        epoch(),
+    );
+    let email = templates::render(
+        template,
+        &values,
+        &host,
+        contact.as_deref(),
+        label.as_deref(),
+    );
+    let display = relay::display_name(label.as_deref());
+    let sender = RelaySender {
+        from: &from,
+        display: &display,
+        reply_to: contact.as_deref(),
+    };
+    let sent = send_ses(&state, &sender, &req.to, &email, &install.id, template.id).await;
     let d = relay_delivery(
         template.id,
         &req.to,
@@ -394,10 +405,16 @@ pub async fn send(
 
 /// Sends a written email from the relay's sender, tagged with the install
 /// so bounces and complaints find their way back.
+/// Who a relayed email is from, and where replies go.
+pub struct RelaySender<'a> {
+    pub from: &'a str,
+    pub display: &'a str,
+    pub reply_to: Option<&'a str>,
+}
+
 pub async fn send_ses(
     state: &AppState,
-    from: &str,
-    display: &str,
+    sender: &RelaySender<'_>,
     to: &str,
     email: &templates::Rendered,
     install_id: &str,
@@ -430,11 +447,16 @@ pub async fn send_ses(
     let mut req = state
         .ses
         .send_email()
-        .from_email_address(relay::from_header(display, from))
+        .from_email_address(relay::from_header(sender.display, sender.from))
         .destination(Destination::builder().to_addresses(to).build())
         .content(EmailContent::builder().simple(message).build())
         .email_tags(tag(relay::INSTALL_TAG, install_id)?)
         .email_tags(tag(relay::TEMPLATE_TAG, template)?);
+    // Replies reach the install's admin, a person, not the relay's
+    // no-reply sender. Only a listed admin of the install (checked above).
+    if let Some(r) = sender.reply_to.filter(|r| relay::valid_address(r)) {
+        req = req.reply_to_addresses(r);
+    }
     if let Ok(set) = std::env::var("HYBRID_EMAIL_CONFIG_SET") {
         if !set.trim().is_empty() {
             req = req.configuration_set_name(set.trim());
@@ -775,6 +797,7 @@ pub async fn status(
     relay_from().ok_or_else(not_here)?;
     let pause = get(&state, &install.id, relay::PAUSE_SK).await?;
     let day = get(&state, &install.id, &relay::day_sk(&today())).await?;
+    let domain = custom_domain(&state, &install.id).await?;
     let num = |i: &Option<HashMap<String, AttributeValue>>, k: &str| {
         i.as_ref()
             .and_then(|i| i.get(k))
@@ -805,7 +828,11 @@ pub async fn status(
         "new_recipients_today": num(&day, "new_recipients"),
         "new_recipients_per_day": relay::NEW_RECIPIENTS_PER_DAY,
         "from": relay_from(),
-        "display_name": relay::display_name(name_host(&install).as_deref(), &install.cloudfront),
+        // Without the organization (a status read carries none); the
+        // install puts its own in front (email_settings).
+        "display_name": relay::display_name(
+            relay::sender_label(None, domain.as_ref(), name_host(&install).as_deref(), epoch()).as_deref()
+        ),
     })))
 }
 
@@ -1008,8 +1035,24 @@ mod tests {
             own_hosts(&i),
             vec!["d1abcdef234567.cloudfront.net", "acme.coderhelm.com"]
         );
-        assert_eq!(install_host(&i), "acme.coderhelm.com");
-        assert_eq!(install_host(&install("")), "d1abcdef234567.cloudfront.net");
+        assert_eq!(install_host(&i, None, 0), "acme.coderhelm.com");
+        assert_eq!(
+            install_host(&install(""), None, 0),
+            "d1abcdef234567.cloudfront.net"
+        );
+        let proved = relay::CustomDomain {
+            hostname: "helm.example.org".into(),
+            verified_at: Some(100),
+        };
+        assert_eq!(
+            install_host(&install(""), Some(&proved), 160),
+            "helm.example.org"
+        );
+        // The From line never carries the CloudFront address.
+        let label = relay::sender_label(None, None, name_host(&install("")).as_deref(), 0);
+        assert_eq!(relay::display_name(label.as_deref()), "CoderHelm");
+        let label = relay::sender_label(Some("Acme"), None, name_host(&i).as_deref(), 0);
+        assert_eq!(relay::display_name(label.as_deref()), "Acme CoderHelm");
         assert_eq!(
             own_hosts(&install("")),
             vec!["d1abcdef234567.cloudfront.net"]

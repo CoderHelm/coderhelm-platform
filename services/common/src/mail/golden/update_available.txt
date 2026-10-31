@@ -1,0 +1,26 @@
+From: "Acme CoderHelm" <notifications@notify.coderhelm.com>
+Subject: Acme CoderHelm: v0.8.0 is available
+
+CoderHelm v0.8.0 is out, and this install can move to it.
+
+Install: helm.example.org
+Running now: v0.7.4
+New release: v0.8.0
+Not applied yet because: automatic updates are off
+Checked: 2026-10-31 14:05 UTC
+
+What's new:
+> Faster reviews on large pull requests.
+> A guided uninstall.
+
+To update, open Settings, then System, and press Update now to v0.8.0. Or run this where the install's AWS sign-in works:
+
+    npx -y github:CoderHelm/coderhelm-platform update --to v0.8.0
+
+Open Settings, System: https://helm.example.org/settings/system/
+
+Read the release notes: https://helm.example.org/settings/system/#version
+
+
+
+Sent through CoderHelm's mail service for the self-hosted CoderHelm install at helm.example.org. Links in this email go only to that install. Questions about it go to the install's admin, admin@example.org. CoderHelm never asks for your password or sign-in codes by email.

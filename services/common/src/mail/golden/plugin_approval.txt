@@ -1,0 +1,21 @@
+From: "Acme CoderHelm" <notifications@notify.coderhelm.com>
+Subject: Acme CoderHelm: a plugin draft is waiting for your approval
+
+A draft from the Release notes plugin is waiting for your approval before it publishes.
+
+Plugin: Release notes
+Draft: Weekly release notes for web
+Version: 4
+
+What it says:
+> Three fixes and one new page this week.
+
+Approve or reject this exact version. The approval link works for three days and only for you; nothing is published until someone other than the requester approves it.
+
+Approve or reject: https://helm.example.org/plugins/approve/?t=SIGNED
+
+Review it in CoderHelm: https://helm.example.org/plugins/draft/?id=d1
+
+
+
+Sent through CoderHelm's mail service for the self-hosted CoderHelm install at helm.example.org. Links in this email go only to that install. Questions about it go to the install's admin, admin@example.org. CoderHelm never asks for your password or sign-in codes by email.

@@ -1,0 +1,12 @@
+From: "Acme CoderHelm" <notifications@notify.coderhelm.com>
+Subject: Acme CoderHelm: your two-factor sign-in was reset
+
+An admin reset your two-factor sign-in. You'll set it up again at your next sign-in.
+
+If you didn't ask for this, tell your admins and change your password now.
+
+Open Security settings: https://helm.example.org/settings/security/
+
+
+
+Sent through CoderHelm's mail service for the self-hosted CoderHelm install at helm.example.org. Links in this email go only to that install. Questions about it go to the install's admin, admin@example.org. CoderHelm never asks for your password or sign-in codes by email.

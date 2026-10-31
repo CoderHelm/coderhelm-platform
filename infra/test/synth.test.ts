@@ -889,6 +889,20 @@ test("self-host: a config that turns the weekly summary on, or chooses CoderHelm
   assert.throws(() => selfHost({ email: { from: "a@example.org", transport: "smtp" as never } }), /email.transport/);
 });
 
+test("self-host: the organization names every email, by either route", () => {
+  const t = synth(selfHost({ email: { from: "coderhelm@example.org", organization: " Acme " } }));
+  for (const [stack, fn] of [["coderhelm-prod-worker", "coderhelm-prod-worker"], ["coderhelm-prod-api", "coderhelm-prod-gateway"], ["coderhelm-prod-updates", "coderhelm-prod-updater"]]) {
+    const env = envOf(t[stack], fn);
+    assert.equal(env.ORGANIZATION_NAME, "Acme", fn);
+    assert.equal(env.EMAIL_FROM_NAME, "CoderHelm", fn);
+  }
+  const plain = envOf(synth(selfHost())["coderhelm-prod-worker"], "coderhelm-prod-worker");
+  assert.equal(plain.ORGANIZATION_NAME, undefined, "no organization: the install's own address names it");
+  assert.throws(() => selfHost({ email: { from: "a@example.org", organization: "Acme\r\nBcc: x@example.org" } }), /email.organization/);
+  assert.throws(() => selfHost({ email: { from: "a@example.org", organization: "x".repeat(61) } }), /email.organization/);
+  assert.throws(() => selfHost({ email: { from: "a@example.org", fromName: "\"Acme\" <x@example.org>" } }), /email.fromName/);
+});
+
 test("hosted: the weekly summary stays on for everyone, and the mail relay sends only as notify.coderhelm.com", () => {
   const cfg = loadConfigFile(path.join(INFRA, "config", "hosted.prod.json"), { CDK_DEFAULT_ACCOUNT: "654654210434" });
   assert.equal(cfg.integrations.weeklySummary, true);

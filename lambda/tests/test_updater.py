@@ -154,7 +154,7 @@ class Handler(unittest.TestCase):
         d = u.handle({"action": "tick"}, self.env, self.store, SUNDAY_3AM, lambda r: [rel("v1.1.0")])
         self.assertEqual(d["action"], "update")
         self.assertEqual(self.builds[0][:3], ("v1.1.0", "auto", "update"))
-        self.assertEqual(self.notices, ["CoderHelm v1.1.0 is available"])
+        self.assertEqual(self.notices, ["v1.1.0 is available"])
         again = u.handle({"action": "tick"}, self.env, self.store, SUNDAY_3AM + timedelta(minutes=1), lambda r: [rel("v1.1.0")])
         self.assertEqual(again["reason"], "an update is running")
         self.assertEqual(len(self.builds), 1)
@@ -170,7 +170,7 @@ class Handler(unittest.TestCase):
         h = self.store.history()[0]
         self.assertEqual((h["status"], h["reason"]), ("rolled_back", "health check failed after deploy"))
         self.assertIn("v2.0.0", self.store.get("UPDATE_STATE")["failed_versions"])
-        self.assertTrue(self.notices[-1].startswith("CoderHelm rolled back"))
+        self.assertEqual(self.notices[-1], "update to v2.0.0 rolled back")
         # The dashboard's preflight reads the failed versions from status.
         s = u.handle({"action": "status"}, self.env, self.store, SUNDAY_3AM, self.fetch)
         self.assertEqual(s["failed_versions"], ["v2.0.0"])
@@ -329,8 +329,8 @@ class ModelCheck(unittest.TestCase):
         self.assertEqual(d["action"], "notify")
         self.assertIn("model this release calls was refused", d["reason"])
         self.assertEqual(self.builds, [])
-        self.assertIn("Update to v1.1.0 needs your action", self.notices)
-        text = self.texts[self.notices.index("Update to v1.1.0 needs your action")]
+        self.assertIn("update to v1.1.0 needs your OK", self.notices)
+        text = self.texts[self.notices.index("update to v1.1.0 needs your OK")]
         self.assertIn("claude-sonnet-5-5", text)
         self.assertIn("#/modelaccess", text)
         self.assertIn("done by a person in the AWS console", text)
@@ -345,7 +345,7 @@ class ModelCheck(unittest.TestCase):
         # An hour later: not checked again, not notified again.
         self.tick(SUNDAY_3AM + timedelta(hours=1))
         self.assertEqual(len(self.worker.payloads), 1)
-        self.assertEqual(self.notices.count("Update to v1.1.0 needs your action"), 1)
+        self.assertEqual(self.notices.count("update to v1.1.0 needs your OK"), 1)
 
     def test_the_daily_retry_applies_the_update_once_it_passes(self):
         self.tick(SUNDAY_3AM)
@@ -358,14 +358,14 @@ class ModelCheck(unittest.TestCase):
         self.assertEqual(self.builds, [("v1.1.0", "auto", "update")])
         # Checked on first sight, the daily retry, and again right before applying.
         self.assertEqual(len(self.worker.payloads), 3)
-        self.assertEqual(self.notices.count("Update to v1.1.0 needs your action"), 1)
+        self.assertEqual(self.notices.count("update to v1.1.0 needs your OK"), 1)
 
     def test_a_pass_applies_in_the_window(self):
         self.worker.refuse = set()
         d = self.tick(SUNDAY_3AM)
         self.assertEqual(d["action"], "update")
         self.assertEqual(self.builds[0][0], "v1.1.0")
-        self.assertNotIn("Update to v1.1.0 needs your action", self.notices)
+        self.assertNotIn("update to v1.1.0 needs your OK", self.notices)
 
     def test_a_refusal_found_right_before_applying_stops_it(self):
         # Checked an hour before the window: passes, nothing applied yet.
@@ -376,7 +376,7 @@ class ModelCheck(unittest.TestCase):
         d = self.tick(SUNDAY_3AM)
         self.assertEqual(d["action"], "none")
         self.assertEqual(self.builds, [])
-        self.assertIn("Update to v1.1.0 needs your action", self.notices)
+        self.assertIn("update to v1.1.0 needs your OK", self.notices)
 
     def test_update_now_is_refused_with_the_check_and_no_override(self):
         with self.assertRaises(u.ModelsBlocked) as e:
@@ -663,7 +663,7 @@ class Domain(unittest.TestCase):
         hid = self.store.get("DOMAIN")["history_id"]
         r = self.h({"action": "finished", "status": "succeeded", "history_id": hid})
         self.assertEqual(r["domain"], "live")
-        self.assertEqual(self.notices[-1], "CoderHelm now answers on helm.example.org")
+        self.assertEqual(self.notices[-1], "now answers on helm.example.org")
         self.assertNotIn("failed_versions", self.store.get("UPDATE_STATE"))
 
     def test_a_route53_zone_gets_the_validation_record_automatically(self):
@@ -702,7 +702,7 @@ class Domain(unittest.TestCase):
         self.h({"action": "finished", "status": "failed", "reason": "deploy failed: CNAMEAlreadyExists", "history_id": hid})
         d = self.store.get("DOMAIN")
         self.assertEqual((d["state"], d["reason"]), ("failed", "deploy failed: CNAMEAlreadyExists"))
-        self.assertEqual(self.notices[-1], "CoderHelm could not change its address")
+        self.assertEqual(self.notices[-1], "the address change failed")
         later = SUNDAY_3AM + timedelta(minutes=30)
         self.assertEqual(self.h({"action": "domain_set", "hostname": "helm.example.org"}, now=later)["state"], "attaching")
 
@@ -731,7 +731,7 @@ class Domain(unittest.TestCase):
         hid = self.store.get("DOMAIN")["history_id"]
         self.h({"action": "finished", "status": "succeeded", "history_id": hid}, env=live)
         self.assertEqual(self.store.get("DOMAIN"), {})
-        self.assertEqual(self.notices[-1], "CoderHelm is back on its AWS address")
+        self.assertEqual(self.notices[-1], "back on the AWS address")
 
 
 class EmailRouteTest(unittest.TestCase):
@@ -820,6 +820,74 @@ class EmailRouteTest(unittest.TestCase):
         u._clients["dynamodb"] = Broken()
         u.notify("s", "t", self.env, opener=self.opener)
         self.assertEqual((self.sent, self.posts), ([], []))
+
+    BLOCKED = {"current": "v0.7.4", "checked_at": "2026-10-31 14:05 UTC",
+               "reason": "- claude-opus-5-5: Bedrock refused the call.",
+               "action": "- claude-opus-5-5: request model access in the Bedrock console."}
+
+    def test_own_ses_names_the_install_never_its_cloudfront_address(self):
+        u._clients["dynamodb"] = self.Dyn()
+        u.notify("s", "t", self.env, what="blocked", version="v0.8.0", opener=self.opener, facts=self.BLOCKED)
+        msg = self.sent[0]
+        self.assertEqual(msg["FromEmailAddress"], '"CoderHelm" <ch@example.org>')
+        self.assertNotIn("cloudfront", msg["FromEmailAddress"])
+        self.assertEqual(msg["Content"]["Simple"]["Subject"]["Data"], "Your CoderHelm install: update to v0.8.0 needs your OK")
+        self.sent.clear()
+        env = dict(self.env, ORGANIZATION_NAME="Acme")
+        u.notify("s", "t", env, what="blocked", version="v0.8.0", opener=self.opener, facts=self.BLOCKED)
+        msg = self.sent[0]
+        self.assertEqual(msg["FromEmailAddress"], '"Acme CoderHelm" <ch@example.org>')
+        self.assertEqual(msg["Content"]["Simple"]["Subject"]["Data"], "Acme CoderHelm: update to v0.8.0 needs your OK")
+        # The install's own address when no organization is named.
+        self.sent.clear()
+        u.notify("s", "t", dict(self.env, APP_URL="https://acme.coderhelm.com"), what="available", version="v0.8.0", opener=self.opener)
+        self.assertEqual(self.sent[0]["FromEmailAddress"], '"acme CoderHelm" <ch@example.org>')
+        # An admin's own sender name wins, and a non-ASCII one is encoded.
+        self.sent.clear()
+        u.notify("s", "t", dict(self.env, EMAIL_FROM_NAME="Société Robots"), what="available", version="v0.8.0", opener=self.opener)
+        self.assertTrue(self.sent[0]["FromEmailAddress"].startswith("=?UTF-8?B?"))
+        self.assertTrue(self.sent[0]["FromEmailAddress"].endswith(" <ch@example.org>"))
+
+    def test_the_blocked_notice_says_which_install_versions_why_and_what_to_do(self):
+        n = u.notice("blocked", "v0.8.0", dict(self.env, APP_URL="https://helm.example.org"), self.BLOCKED)
+        for want in ["Install: helm.example.org", "Running now: v0.7.4", "Waiting to install: v0.8.0",
+                     "Checked: 2026-10-31 14:05 UTC", "Why it's blocked:", "Bedrock refused the call", "What to do:",
+                     "Update readiness", "Check again", "update --to v0.8.0", "doctor",
+                     "https://helm.example.org/settings/system/#readiness", "https://helm.example.org/settings/system/#version"]:
+            self.assertIn(want, n["text"])
+        self.assertIn("<table", n["html"])
+        self.assertEqual(n["subject"], "helm.example.org CoderHelm: update to v0.8.0 needs your OK")
+        # An older shape: no facts, nothing blank.
+        n = u.notice("blocked", "v0.8.0", self.env)
+        self.assertNotIn("Running now", n["text"])
+        self.assertNotIn("{", n["text"])
+
+    def test_through_coderhelm_the_notice_carries_the_facts_and_the_organization(self):
+        u._clients["dynamodb"] = self.Dyn({"data": {"S": json.dumps({"transport": "coderhelm"})}})
+        env = dict(self.env, ORGANIZATION_NAME="Acme")
+        u.notify("s", "t", env, what="blocked", version="v0.8.0", opener=self.opener, facts=self.BLOCKED)
+        body = self.posts[1][1]
+        self.assertEqual(body["org"], "Acme")
+        p = body["params"]
+        self.assertEqual((p["what"], p["version"], p["current"]), ("blocked", "v0.8.0", "v0.7.4"))
+        self.assertEqual(p["link"], "https://d1.cloudfront.net/settings/system/#readiness")
+        self.assertEqual(p["notes_link"], "https://d1.cloudfront.net/settings/system/#version")
+        self.assertIn("Bedrock refused", p["reason"])
+        self.assertEqual(p["checked_at"], "2026-10-31 14:05 UTC")
+
+    def test_relay_parameters_stay_within_the_templates_limits(self):
+        p = u.update_params("available", "v0.8.0", self.env, {
+            "current": "not a version!", "checked_at": "x" * 100, "waiting": "line\nbreak " * 40,
+            "notes": "n" * 5000, "reason": "Ask CoderHelm support for help", "major": True})
+        self.assertNotIn("current", p)
+        self.assertLessEqual(len(p["checked_at"]), 40)
+        self.assertLessEqual(len(p["waiting"]), 160)
+        self.assertNotIn("\n", p["waiting"])
+        self.assertLessEqual(len(p["notes"]), 1200)
+        self.assertNotIn("reason", p, "wording the relay refuses is left out, not sent")
+        self.assertEqual(p["major"], "yes")
+        self.assertEqual(set(p) - {"what", "version", "link", "current", "checked_at", "reason", "action",
+                                   "waiting", "notes", "major", "notes_link"}, set())
 
 
 # ── The deploy window (hardened installs) ─────────────────────────────────

@@ -1,0 +1,14 @@
+From: "Acme CoderHelm" <notifications@notify.coderhelm.com>
+Subject: Acme CoderHelm: your account is ready
+
+Your CoderHelm account is ready.
+
+Install: helm.example.org
+
+Next: connect a repository in Settings, Repositories, then assign CoderHelm a ticket. It opens a pull request and keeps working on it through review.
+
+Open CoderHelm: https://helm.example.org/
+
+
+
+Sent through CoderHelm's mail service for the self-hosted CoderHelm install at helm.example.org. Links in this email go only to that install. Questions about it go to the install's admin, admin@example.org. CoderHelm never asks for your password or sign-in codes by email.

@@ -29,6 +29,8 @@
      "RESOURCE_PREFIX": "coderhelm-prod",
      "SECRETS_NAME": "coderhelm/prod/secrets",
      "SES_FROM_ADDRESS": "a@example.org",
+     "EMAIL_FROM_NAME": "CoderHelm",
+     "ORGANIZATION_NAME": "",
      "SETTINGS_TABLE_NAME": {
       "Fn::ImportValue": "coderhelm-prod-database:ExportsOutputRefSettingsTable4DB0CCD0297D747B"
      },

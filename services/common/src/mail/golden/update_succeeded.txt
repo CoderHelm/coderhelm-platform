@@ -1,0 +1,19 @@
+From: "Acme CoderHelm" <notifications@notify.coderhelm.com>
+Subject: Acme CoderHelm: updated to v0.8.0
+
+This install finished updating to v0.8.0.
+
+Install: helm.example.org
+Updated from: v0.7.4
+Now running: v0.8.0
+Finished: 2026-10-31 14:22 UTC
+
+Nothing to do. The release notes say what changed.
+
+Open Settings, System: https://helm.example.org/settings/system/
+
+Read the release notes: https://helm.example.org/settings/system/#version
+
+
+
+Sent through CoderHelm's mail service for the self-hosted CoderHelm install at helm.example.org. Links in this email go only to that install. Questions about it go to the install's admin, admin@example.org. CoderHelm never asks for your password or sign-in codes by email.

@@ -1,0 +1,16 @@
+From: "Acme CoderHelm" <notifications@notify.coderhelm.com>
+Subject: Acme CoderHelm: 81% of the monthly token limit used
+
+Your team has used 81% of its monthly new tokens limit for October 2026.
+
+Used: 8.1M
+Limit: 10M
+Month: October 2026
+
+At 100% new work waits until an admin raises the limit in Settings, Usage, or the month ends. Work already running finishes.
+
+See usage: https://helm.example.org/settings/usage/
+
+
+
+Sent through CoderHelm's mail service for the self-hosted CoderHelm install at helm.example.org. Links in this email go only to that install. Questions about it go to the install's admin, admin@example.org. CoderHelm never asks for your password or sign-in codes by email.

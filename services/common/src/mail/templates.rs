@@ -69,13 +69,23 @@ const fn optional(name: &'static str, kind: Kind) -> Param {
     }
 }
 
-/// One piece of an email body.
+/// One piece of an email body. `{name}` in any text is replaced by that
+/// parameter, escaped; `{install}` is the install's address, which the
+/// relay supplies. A piece that names an optional parameter the request left
+/// out is left out whole, so an email never shows a blank where a number
+/// should be.
 #[derive(Debug, Clone, Copy)]
 pub enum Part {
-    /// A paragraph; `{name}` is replaced by that parameter, escaped.
+    /// A paragraph.
     Para(&'static str),
-    /// A parameter's text set apart as a quote.
-    Quote(&'static str),
+    /// A parameter's text set apart as a quote, under a short heading.
+    Quote(&'static str, &'static str),
+    /// Label and value rows (`("Running now", "{current}")`).
+    Facts(&'static [(&'static str, &'static str)]),
+    /// A command to paste into a terminal.
+    Command(&'static str),
+    /// The parts for one value of a `OneOf` parameter.
+    Case(&'static str, &'static [(&'static str, &'static [Part])]),
     /// A button: label and the link parameter it opens.
     Button(&'static str, &'static str),
 }
@@ -83,10 +93,16 @@ pub enum Part {
 #[derive(Debug, Clone, Copy)]
 pub struct Template {
     pub id: &'static str,
-    /// The whole subject. Never filled from a parameter, and for what an
-    /// install may send, never naming CoderHelm: the mail comes from someone
-    /// else's install, so its subject must not read as CoderHelm's own.
+    /// The subject after the install's prefix (`Acme CoderHelm: `, added by
+    /// [`render`]). It may name only parameters whose values can't carry
+    /// words (versions, numbers, one of a fixed list), never free text, and
+    /// for what an install may send it never names CoderHelm itself.
     pub subject: &'static str,
+    /// A sharper subject for one value of the parameter `subject_by`; the
+    /// plain `subject` when that value has none or names a missing
+    /// parameter.
+    pub subject_by: &'static str,
+    pub subjects: &'static [(&'static str, &'static str)],
     pub params: &'static [Param],
     pub body: &'static [Part],
     /// Whether an install may ask for it (false: the relay's own notices).
@@ -104,19 +120,54 @@ pub const UPDATE_WHAT: &[&str] = &[
     "domain_removed",
 ];
 
+/// How to update from a terminal (docs/self-host/updates.md).
+macro_rules! cli {
+    ($rest:literal) => {
+        concat!("npx -y github:CoderHelm/coderhelm-platform ", $rest)
+    };
+}
+
+const UPDATE_PARAMS: &[Param] = &[
+    p("what", Kind::OneOf(UPDATE_WHAT)),
+    optional("version", Kind::Version),
+    p("link", Kind::Link),
+    // What the install ran when this happened (before an update, or now).
+    optional("current", Kind::Version),
+    // When the updater looked, as the install's admins read it
+    // ("2026-10-31 14:05 UTC").
+    optional("checked_at", Kind::Line(40)),
+    // Why: the update check's findings, the build's error, the domain's
+    // problem. Links in it are taken out.
+    optional("reason", Kind::Text(1500)),
+    // What a person has to do about it.
+    optional("action", Kind::Text(800)),
+    // Why an available release hasn't been applied yet.
+    optional("waiting", Kind::Line(160)),
+    // The start of the release notes.
+    optional("notes", Kind::Text(1200)),
+    optional("major", Kind::OneOf(&["yes"])),
+    optional("notes_link", Kind::Link),
+];
+
 pub const TEMPLATES: &[Template] = &[
     Template {
         id: "test_email",
-        subject: "Test email from your install",
+        subject: "test email, delivery works",
+        subject_by: "",
+        subjects: &[],
         params: &[],
-        body: &[Part::Para(
-            "Email from your CoderHelm install works. Run results, invites and update notices will arrive like this one.",
-        )],
+        body: &[
+            Part::Para("This is a test email from your CoderHelm install. It arrived, so email works: run results, invites and update notices will come the same way."),
+            Part::Facts(&[("Install", "{install}")]),
+            Part::Para("Nothing to do. An admin sent it with Send test email in Setup."),
+        ],
         install_may_send: true,
     },
     Template {
         id: "team_invite",
-        subject: "You're invited to your team's workspace",
+        subject: "you're invited to join a team",
+        subject_by: "",
+        subjects: &[],
         params: &[
             p("team", Kind::Line(80)),
             p("inviter", Kind::Line(80)),
@@ -124,24 +175,32 @@ pub const TEMPLATES: &[Template] = &[
             p("link", Kind::Link),
         ],
         body: &[
-            Part::Para("{inviter} invited you to the {team} workspace as {role}."),
+            Part::Para("{inviter} invited you to the {team} workspace on your organization's CoderHelm."),
+            Part::Facts(&[("Team", "{team}"), ("Your role", "{role}"), ("Invited by", "{inviter}"), ("Install", "{install}")]),
+            Part::Para("Press the button to create your account (or sign in) and join. If you weren't expecting this, ignore it: nothing happens until you accept."),
             Part::Button("Accept the invite", "link"),
         ],
         install_may_send: true,
     },
     Template {
         id: "welcome",
-        subject: "Your account is ready",
+        subject: "your account is ready",
+        subject_by: "",
+        subjects: &[],
         params: &[p("link", Kind::Link)],
         body: &[
-            Part::Para("Your account is ready. Connect a repository and CoderHelm starts on your next ticket."),
+            Part::Para("Your CoderHelm account is ready."),
+            Part::Facts(&[("Install", "{install}")]),
+            Part::Para("Next: connect a repository in Settings, Repositories, then assign CoderHelm a ticket. It opens a pull request and keeps working on it through review."),
             Part::Button("Open CoderHelm", "link"),
         ],
         install_may_send: true,
     },
     Template {
         id: "plugin_approval",
-        subject: "A plugin draft is waiting for your approval",
+        subject: "a plugin draft is waiting for your approval",
+        subject_by: "",
+        subjects: &[],
         params: &[
             p("plugin", Kind::Line(80)),
             p("title", Kind::Line(200)),
@@ -151,9 +210,10 @@ pub const TEMPLATES: &[Template] = &[
             p("review_link", Kind::Link),
         ],
         body: &[
-            Part::Para("A draft from the {plugin} plugin is waiting for your approval: {title}"),
-            Part::Quote("excerpt"),
-            Part::Para("Approve or reject this exact version (version {version}). The link works for three days and only for you."),
+            Part::Para("A draft from the {plugin} plugin is waiting for your approval before it publishes."),
+            Part::Facts(&[("Plugin", "{plugin}"), ("Draft", "{title}"), ("Version", "{version}")]),
+            Part::Quote("What it says", "excerpt"),
+            Part::Para("Approve or reject this exact version. The approval link works for three days and only for you; nothing is published until someone other than the requester approves it."),
             Part::Button("Approve or reject", "approve_link"),
             Part::Button("Review it in CoderHelm", "review_link"),
         ],
@@ -161,22 +221,28 @@ pub const TEMPLATES: &[Template] = &[
     },
     Template {
         id: "knowledge_signin",
-        subject: "A knowledge source needs signing in again",
+        subject: "a knowledge source needs signing in again",
+        subject_by: "",
+        subjects: &[],
         params: &[
             p("source", Kind::Line(80)),
             p("problem", Kind::Text(300)),
             p("link", Kind::Link),
         ],
         body: &[
-            Part::Para("CoderHelm can't read the {source} knowledge source any more."),
-            Part::Quote("problem"),
+            Part::Para("CoderHelm can't read the {source} knowledge source any more, so it stopped syncing. Work goes on without what it holds until someone signs in again."),
+            Part::Facts(&[("Source", "{source}")]),
+            Part::Quote("What went wrong", "problem"),
+            Part::Para("Open the source in Settings, Knowledge and sign in again. The next sync picks up where it stopped."),
             Part::Button("Sign in again", "link"),
         ],
         install_may_send: true,
     },
     Template {
         id: "token_warning",
-        subject: "Your team is near its monthly token limit",
+        subject: "{pct}% of the monthly token limit used",
+        subject_by: "",
+        subjects: &[],
         params: &[
             p("limit_name", Kind::Line(40)),
             p("month", Kind::Line(20)),
@@ -186,14 +252,18 @@ pub const TEMPLATES: &[Template] = &[
             p("link", Kind::Link),
         ],
         body: &[
-            Part::Para("Your team has used {pct}% of its monthly {limit_name} limit for {month}: {used} of {limit}."),
+            Part::Para("Your team has used {pct}% of its monthly {limit_name} limit for {month}."),
+            Part::Facts(&[("Used", "{used}"), ("Limit", "{limit}"), ("Month", "{month}")]),
+            Part::Para("At 100% new work waits until an admin raises the limit in Settings, Usage, or the month ends. Work already running finishes."),
             Part::Button("See usage", "link"),
         ],
         install_may_send: true,
     },
     Template {
         id: "token_limit_reached",
-        subject: "Your team reached its monthly token limit",
+        subject: "monthly token limit reached, new work waits",
+        subject_by: "",
+        subjects: &[],
         params: &[
             p("limit_name", Kind::Line(40)),
             p("month", Kind::Line(20)),
@@ -202,43 +272,177 @@ pub const TEMPLATES: &[Template] = &[
             p("link", Kind::Link),
         ],
         body: &[
-            Part::Para("Your team reached its monthly {limit_name} limit for {month}: {used} of {limit}. New work waits until an admin raises the limit or the month ends."),
+            Part::Para("Your team reached its monthly {limit_name} limit for {month}. New work waits until an admin raises the limit or the month ends."),
+            Part::Facts(&[("Used", "{used}"), ("Limit", "{limit}"), ("Month", "{month}")]),
+            Part::Para("To go on now, an admin raises the limit in Settings, Usage."),
             Part::Button("See usage", "link"),
         ],
         install_may_send: true,
     },
     Template {
         id: "support_update",
-        subject: "Update on a support ticket",
+        subject: "news on a support ticket",
+        subject_by: "",
+        subjects: &[],
         params: &[
             p("ticket", Kind::Line(200)),
             p("note", Kind::Text(2000)),
             p("link", Kind::Link),
         ],
         body: &[
-            Part::Para("There is news on the ticket \"{ticket}\"."),
-            Part::Quote("note"),
+            Part::Para("There is news on the support ticket \"{ticket}\"."),
+            Part::Quote("The update", "note"),
+            Part::Para("Reply or follow it from the ticket page."),
             Part::Button("Open the ticket", "link"),
         ],
         install_may_send: true,
     },
     Template {
         id: "update_notice",
-        subject: "Your install has an update notice",
-        params: &[
-            p("what", Kind::OneOf(UPDATE_WHAT)),
-            optional("version", Kind::Version),
-            p("link", Kind::Link),
+        subject: "an update notice",
+        subject_by: "what",
+        subjects: &[
+            ("available", "{version} is available"),
+            ("succeeded", "updated to {version}"),
+            ("failed", "update to {version} failed"),
+            ("rolled_back", "update to {version} rolled back"),
+            ("blocked", "update to {version} needs your OK"),
+            ("domain_live", "the new address is live"),
+            ("domain_failed", "the address change failed"),
+            ("domain_removed", "back on the AWS address"),
         ],
-        body: &[
-            Part::Para("Update notice: {what} {version}."),
-            Part::Button("Open Settings, System", "link"),
-        ],
+        params: UPDATE_PARAMS,
+        body: &[Part::Case(
+            "what",
+            &[
+                (
+                    "available",
+                    &[
+                        Part::Para("CoderHelm {version} is out, and this install can move to it."),
+                        Part::Facts(&[
+                            ("Install", "{install}"),
+                            ("Running now", "{current}"),
+                            ("New release", "{version}"),
+                            ("Not applied yet because", "{waiting}"),
+                            ("Checked", "{checked_at}"),
+                        ]),
+                        Part::Case("major", &[("yes", &[Part::Para("This is a major release. Read its notes before you update.")])]),
+                        Part::Quote("What's new", "notes"),
+                        Part::Para("To update, open Settings, then System, and press Update now to {version}. Or run this where the install's AWS sign-in works:"),
+                        Part::Command(cli!("update --to {version}")),
+                        Part::Button("Open Settings, System", "link"),
+                        Part::Button("Read the release notes", "notes_link"),
+                    ],
+                ),
+                (
+                    "blocked",
+                    &[
+                        Part::Para("This install won't update to {version} until someone fixes what the update check found. Nothing has changed yet."),
+                        Part::Facts(&[
+                            ("Install", "{install}"),
+                            ("Running now", "{current}"),
+                            ("Waiting to install", "{version}"),
+                            ("Checked", "{checked_at}"),
+                        ]),
+                        Part::Quote("Why it's blocked", "reason"),
+                        Part::Quote("What to do", "action"),
+                        Part::Para("Once it is fixed, open Settings, then System, then Update readiness, and press Check again. Once it passes, press Update now to {version}. The check also runs by itself every day, and with automatic updates on the update then goes ahead on its own."),
+                        Part::Para("From a terminal, see what fails and how to fix it, then update:"),
+                        Part::Command(cli!("doctor")),
+                        Part::Command(cli!("update --to {version}")),
+                        Part::Button("Open Update readiness", "link"),
+                        Part::Button("Read the release notes", "notes_link"),
+                    ],
+                ),
+                (
+                    "succeeded",
+                    &[
+                        Part::Para("This install finished updating to {version}."),
+                        Part::Facts(&[
+                            ("Install", "{install}"),
+                            ("Updated from", "{current}"),
+                            ("Now running", "{version}"),
+                            ("Finished", "{checked_at}"),
+                        ]),
+                        Part::Quote("Notes from the update", "reason"),
+                        Part::Para("Nothing to do. The release notes say what changed."),
+                        Part::Button("Open Settings, System", "link"),
+                        Part::Button("Read the release notes", "notes_link"),
+                    ],
+                ),
+                (
+                    "failed",
+                    &[
+                        Part::Para("The update to {version} failed."),
+                        Part::Facts(&[
+                            ("Install", "{install}"),
+                            ("Was running", "{current}"),
+                            ("Tried to install", "{version}"),
+                            ("Failed", "{checked_at}"),
+                        ]),
+                        Part::Quote("What went wrong", "reason"),
+                        Part::Quote("What to do", "action"),
+                        Part::Para("Open Settings, then System, then Update history for the full log. Fix what it shows, then press Update now to try again. From a terminal:"),
+                        Part::Command(cli!("doctor")),
+                        Part::Command(cli!("update --to {version}")),
+                        Part::Button("Open Settings, System", "link"),
+                        Part::Button("Read the release notes", "notes_link"),
+                    ],
+                ),
+                (
+                    "rolled_back",
+                    &[
+                        Part::Para("This install tried {version}, found it unhealthy, and went back to the release it ran before."),
+                        Part::Facts(&[
+                            ("Install", "{install}"),
+                            ("Running now", "{current}"),
+                            ("Tried", "{version}"),
+                            ("Rolled back", "{checked_at}"),
+                        ]),
+                        Part::Quote("What went wrong", "reason"),
+                        Part::Quote("What to do", "action"),
+                        Part::Para("Open Settings, then System, then Update history for the full log. Fix what it shows, then press Update now to try again. From a terminal:"),
+                        Part::Command(cli!("doctor")),
+                        Part::Command(cli!("update --to {version}")),
+                        Part::Button("Open Settings, System", "link"),
+                        Part::Button("Read the release notes", "notes_link"),
+                    ],
+                ),
+                (
+                    "domain_live",
+                    &[
+                        Part::Para("This install now answers on its new address. Tell your team to sign in there from now on."),
+                        Part::Facts(&[("Install", "{install}"), ("Changed", "{checked_at}")]),
+                        Part::Button("Open Settings, System", "link"),
+                    ],
+                ),
+                (
+                    "domain_failed",
+                    &[
+                        Part::Para("This install couldn't change its address, so it still answers on the old one."),
+                        Part::Facts(&[("Install", "{install}"), ("Tried", "{checked_at}")]),
+                        Part::Quote("What went wrong", "reason"),
+                        Part::Para("Open Settings, then System, then Domain to see the DNS records and certificate it waits for. Fix them and try again."),
+                        Part::Button("Open Settings, System", "link"),
+                    ],
+                ),
+                (
+                    "domain_removed",
+                    &[
+                        Part::Para("This install is back on its AWS address. People sign in there from now on."),
+                        Part::Facts(&[("Install", "{install}"), ("Changed", "{checked_at}")]),
+                        Part::Button("Open Settings, System", "link"),
+                    ],
+                ),
+            ],
+        )],
         install_may_send: true,
     },
     Template {
         id: "weekly_summary",
-        subject: "Your weekly summary",
+        subject: "your week: {merged} merged, {runs} runs",
+        subject_by: "",
+        subjects: &[],
         params: &[
             p("team", Kind::Line(80)),
             p("period", Kind::Line(40)),
@@ -251,8 +455,15 @@ pub const TEMPLATES: &[Template] = &[
             secret("unsubscribe", Kind::Link),
         ],
         body: &[
-            Part::Para("{team}, {period}: {merged} pull requests merged, {runs} runs finished, {reviews} reviews written, {waiting} waiting on someone."),
-            Part::Quote("highlights"),
+            Part::Para("{team}'s week with CoderHelm, {period}."),
+            Part::Facts(&[
+                ("Pull requests merged", "{merged}"),
+                ("Runs finished", "{runs}"),
+                ("Reviews written", "{reviews}"),
+                ("Waiting on someone", "{waiting}"),
+            ]),
+            Part::Quote("Highlights", "highlights"),
+            Part::Para("Anything waiting on someone is on the Runs page, oldest first."),
             Part::Button("Open CoderHelm", "link"),
             Part::Button("Stop these emails", "unsubscribe"),
         ],
@@ -260,44 +471,58 @@ pub const TEMPLATES: &[Template] = &[
     },
     Template {
         id: "webhook_disabled",
-        subject: "A webhook endpoint was turned off",
+        subject: "a webhook endpoint was turned off after {days} days of failures",
+        subject_by: "",
+        subjects: &[],
         // No endpoint URL or host: the address can carry a secret, and
         // the relay never needs it.
         params: &[p("days", Kind::Number), p("link", Kind::Link)],
         body: &[
-            Part::Para("Every delivery to one of your team's webhook endpoints failed for {days} days, so CoderHelm stopped sending to it. Fix it, turn it back on in Settings, Webhooks, and replay what it missed."),
+            Part::Para("Every delivery to one of your team's webhook endpoints failed for {days} days, so CoderHelm stopped sending to it."),
+            Part::Facts(&[("Failing for", "{days} days")]),
+            Part::Para("Open Settings, Webhooks to see the endpoint's last errors. Fix the receiving side, turn the endpoint back on, then replay what it missed."),
             Part::Button("Open Webhooks", "link"),
         ],
         install_may_send: true,
     },
     Template {
         id: "two_factor_lockout",
-        subject: "Two-factor sign-in paused after wrong codes",
+        subject: "two-factor sign-in paused for {minutes} minutes",
+        subject_by: "",
+        subjects: &[],
         // No name or address: the install's own SES email carries those.
         params: &[p("minutes", Kind::Number), p("link", Kind::Link)],
         body: &[
-            Part::Para("Two-factor sign-in was paused for {minutes} minutes for someone in your organization after too many wrong codes. If they lost their phone, check it's really them, then reset their two-factor sign-in in Settings, Sign-in. If it wasn't them, someone may know their password: ask them to change it."),
+            Part::Para("Two-factor sign-in was paused for {minutes} minutes for someone in your organization after too many wrong codes."),
+            Part::Facts(&[("Paused for", "{minutes} minutes")]),
+            Part::Para("If they lost their phone, check it's really them, then reset their two-factor sign-in in Settings, Sign-in. If it wasn't them, someone may know their password: ask them to change it."),
             Part::Button("Open Settings", "link"),
         ],
         install_may_send: true,
     },
     Template {
         id: "two_factor_required",
-        subject: "Two-factor sign-in is now required",
+        subject: "two-factor sign-in is now required",
+        subject_by: "",
+        subjects: &[],
         // No team or admin name: the install's own SES email carries those.
         params: &[p("link", Kind::Link)],
         body: &[
-            Part::Para("Two-factor sign-in is now required for you. The next time you sign in, you'll set up an authenticator app on your phone first (it takes about a minute); nothing else works until then."),
+            Part::Para("An admin now requires two-factor sign-in for you."),
+            Part::Para("The next time you sign in, you'll set up an authenticator app on your phone first (it takes about a minute); nothing else works until then. You can do it now instead."),
             Part::Button("Set it up now", "link"),
         ],
         install_may_send: true,
     },
     Template {
         id: "two_factor_reset",
-        subject: "Your two-factor sign-in was reset",
+        subject: "your two-factor sign-in was reset",
+        subject_by: "",
+        subjects: &[],
         params: &[p("link", Kind::Link)],
         body: &[
-            Part::Para("An admin reset your two-factor sign-in. Set it up again at your next sign-in. If you didn't ask for this, tell your admins and change your password now."),
+            Part::Para("An admin reset your two-factor sign-in. You'll set it up again at your next sign-in."),
+            Part::Para("If you didn't ask for this, tell your admins and change your password now."),
             Part::Button("Open Security settings", "link"),
         ],
         install_may_send: true,
@@ -306,10 +531,13 @@ pub const TEMPLATES: &[Template] = &[
     Template {
         id: "relay_paused",
         subject: "CoderHelm paused email for your install",
+        subject_by: "",
+        subjects: &[],
         params: &[p("reason", Kind::OneOf(&["bounces", "complaints"]))],
-        body: &[Part::Para(
-            "CoderHelm stopped sending email for your self-hosted install because too many recent emails {reason}. Check the recipients in Settings, Emails, then ask CoderHelm to resume, or switch the install to its own Amazon SES.",
-        )],
+        body: &[
+            Part::Para("CoderHelm stopped sending email for your self-hosted install because too many recent emails {reason}."),
+            Part::Para("Check the recipients in Settings, Emails and remove addresses that bounce, then ask CoderHelm to resume. Or switch the install to its own Amazon SES in the same place."),
+        ],
         install_may_send: false,
     },
 ];
@@ -695,36 +923,103 @@ fn fill(pattern: &str, v: &Values, html: bool) -> String {
     out
 }
 
-/// Writes the email. `install_host` is the install's verified address,
-/// named in the footer so a reader knows whose email this is; `contact` is
-/// the install admin people can ask (the relay checks it is one).
-pub fn render(t: &Template, v: &Values, install_host: &str, contact: Option<&str>) -> Rendered {
-    let mut text = Vec::new();
-    let mut html = String::new();
-    for part in t.body {
+/// The `{name}`s a piece of text uses.
+pub fn slots(text: &str) -> Vec<&str> {
+    text.split('{')
+        .skip(1)
+        .filter_map(|x| x.split_once('}').map(|(n, _)| n))
+        .collect()
+}
+
+/// Whether every `{name}` in `text` has a value.
+fn complete(text: &str, v: &Values) -> bool {
+    slots(text).iter().all(|n| !v.get(n).is_empty())
+}
+
+/// The value `{install}` stands for: the install's address.
+pub const INSTALL_SLOT: &str = "install";
+
+/// The subject after the install's prefix: the sharper one for the
+/// `subject_by` value when every parameter it names is there, else the
+/// plain one.
+pub fn subject(t: &Template, v: &Values) -> String {
+    let sharp = (!t.subject_by.is_empty())
+        .then(|| v.get(t.subject_by))
+        .and_then(|value| t.subjects.iter().find(|(k, _)| *k == value))
+        .map(|(_, s)| *s)
+        .filter(|s| complete(s, v));
+    fill(sharp.unwrap_or(t.subject), v, false)
+}
+
+const P_STYLE: &str = "color:#222;font-size:15px;line-height:1.5;margin:0 0 16px";
+const HEAD_STYLE: &str = "color:#222;font-size:14px;font-weight:600;margin:0 0 6px";
+const QUOTE_STYLE: &str =
+    "border-left:3px solid #ccc;margin:0 0 16px;padding:4px 12px;color:#444;white-space:pre-wrap";
+const LABEL_STYLE: &str =
+    "color:#666;font-size:14px;padding:3px 16px 3px 0;vertical-align:top;white-space:nowrap";
+const VALUE_STYLE: &str = "color:#222;font-size:14px;padding:3px 0;vertical-align:top";
+const CODE_STYLE: &str = "background:#f5f5f5;border:1px solid #e5e5e5;border-radius:6px;padding:10px 12px;margin:0 0 16px;font-family:SFMono-Regular,Menlo,Consolas,monospace;font-size:13px;color:#222;white-space:pre-wrap;word-break:break-all";
+const BUTTON_STYLE: &str = "display:inline-block;background:#222;color:#fff;padding:10px 16px;border-radius:6px;text-decoration:none";
+
+fn write_parts(parts: &[Part], v: &Values, text: &mut Vec<String>, html: &mut String) {
+    for part in parts {
         match part {
             Part::Para(p) => {
+                if !complete(p, v) {
+                    continue;
+                }
                 text.push(fill(p, v, false));
-                html.push_str(&format!(
-                    "<p style=\"color:#222;font-size:15px;line-height:1.5;margin:0 0 16px\">{}</p>",
-                    fill(p, v, true)
-                ));
+                html.push_str(&format!("<p style=\"{P_STYLE}\">{}</p>", fill(p, v, true)));
             }
-            Part::Quote(name) => {
+            Part::Quote(heading, name) => {
                 let q = v.get(name);
                 if q.is_empty() {
                     continue;
                 }
+                let quoted = q.lines().map(|l| format!("> {l}")).collect::<Vec<_>>();
+                text.push(format!("{heading}:\n{}", quoted.join("\n")));
+                html.push_str(&format!(
+                    "<p style=\"{HEAD_STYLE}\">{}</p><blockquote style=\"{QUOTE_STYLE}\">{}</blockquote>",
+                    escape(heading),
+                    escape(q)
+                ));
+            }
+            Part::Facts(rows) => {
+                let rows: Vec<_> = rows.iter().filter(|(_, val)| complete(val, v)).collect();
+                if rows.is_empty() {
+                    continue;
+                }
                 text.push(
-                    q.lines()
-                        .map(|l| format!("> {l}"))
+                    rows.iter()
+                        .map(|(label, val)| format!("{label}: {}", fill(val, v, false)))
                         .collect::<Vec<_>>()
                         .join("\n"),
                 );
+                html.push_str("<table role=\"presentation\" style=\"border-collapse:collapse;margin:0 0 16px\">");
+                for (label, val) in rows {
+                    html.push_str(&format!(
+                        "<tr><td style=\"{LABEL_STYLE}\">{}</td><td style=\"{VALUE_STYLE}\">{}</td></tr>",
+                        escape(label),
+                        fill(val, v, true)
+                    ));
+                }
+                html.push_str("</table>");
+            }
+            Part::Command(c) => {
+                if !complete(c, v) {
+                    continue;
+                }
+                text.push(format!("    {}", fill(c, v, false)));
                 html.push_str(&format!(
-                    "<blockquote style=\"border-left:3px solid #ccc;margin:0 0 16px;padding:4px 12px;color:#444;white-space:pre-wrap\">{}</blockquote>",
-                    escape(q)
+                    "<pre style=\"{CODE_STYLE}\"><code>{}</code></pre>",
+                    fill(c, v, true)
                 ));
+            }
+            Part::Case(name, cases) => {
+                let value = v.get(name);
+                if let Some((_, inner)) = cases.iter().find(|(k, _)| *k == value) {
+                    write_parts(inner, v, text, html);
+                }
             }
             Part::Button(label, name) => {
                 let link = v.get(name);
@@ -733,13 +1028,31 @@ pub fn render(t: &Template, v: &Values, install_host: &str, contact: Option<&str
                 }
                 text.push(format!("{label}: {link}"));
                 html.push_str(&format!(
-                    "<p style=\"margin:0 0 16px\"><a href=\"{}\" style=\"display:inline-block;background:#222;color:#fff;padding:10px 16px;border-radius:6px;text-decoration:none\">{}</a></p>",
+                    "<p style=\"margin:0 0 16px\"><a href=\"{}\" style=\"{BUTTON_STYLE}\">{}</a></p>",
                     escape(link),
                     escape(label)
                 ));
             }
         }
     }
+}
+
+/// Writes the email. `install_host` is the install's address, named in the
+/// body and footer so a reader knows whose email this is; `contact` is the
+/// install admin people can ask (the relay checks it is one); `label` is
+/// the install's name for the subject ([`super::naming::label`]).
+pub fn render(
+    t: &Template,
+    v: &Values,
+    install_host: &str,
+    contact: Option<&str>,
+    label: Option<&str>,
+) -> Rendered {
+    let mut v = v.clone();
+    v.0.insert(INSTALL_SLOT.to_string(), install_host.to_string());
+    let mut text = Vec::new();
+    let mut html = String::new();
+    write_parts(t.body, &v, &mut text, &mut html);
     let footer = footer(install_host, contact);
     text.push(String::new());
     text.push(footer.clone());
@@ -747,8 +1060,13 @@ pub fn render(t: &Template, v: &Values, install_host: &str, contact: Option<&str
         "<p style=\"color:#777;font-size:12px;border-top:1px solid #ddd;padding-top:12px;margin-top:24px\">{}</p>",
         escape(&footer)
     ));
+    let subject = if t.install_may_send {
+        format!("{}{}", super::naming::subject_prefix(label), subject(t, &v))
+    } else {
+        subject(t, &v)
+    };
     Rendered {
-        subject: t.subject.to_string(),
+        subject,
         text: text.join("\n\n"),
         html: format!(
             "<!DOCTYPE html><html><head><meta charset=\"utf-8\"></head><body style=\"font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:#fff;padding:24px\">{html}</body></html>"
@@ -784,35 +1102,104 @@ mod tests {
         v.as_object().unwrap().clone()
     }
 
+    /// Every `{name}` and parameter a list of parts uses, with buttons'
+    /// links and cases' parameters.
+    fn used(parts: &[Part], out: &mut Vec<(&'static str, bool)>) {
+        for part in parts {
+            match part {
+                Part::Para(s) | Part::Command(s) => {
+                    out.extend(slots(s).into_iter().map(|n| (n, false)));
+                }
+                Part::Facts(rows) => {
+                    for (_, v) in *rows {
+                        out.extend(slots(v).into_iter().map(|n| (n, false)));
+                    }
+                }
+                Part::Quote(_, n) => out.push((n, false)),
+                Part::Button(_, n) => out.push((n, true)),
+                Part::Case(n, cases) => {
+                    out.push((n, false));
+                    for (_, inner) in *cases {
+                        used(inner, out);
+                    }
+                }
+            }
+        }
+    }
+
     #[test]
-    fn every_template_has_a_fixed_subject_and_known_parameters() {
+    fn every_template_uses_only_known_parameters() {
         for t in TEMPLATES {
             assert!(
-                !t.subject.contains('{'),
-                "{} subject takes a parameter",
+                !t.params.iter().any(|p| p.name == INSTALL_SLOT),
+                "{}: {INSTALL_SLOT} is the relay's",
                 t.id
             );
-            for part in t.body {
-                let names: Vec<&str> = match part {
-                    Part::Para(s) => s
-                        .split('{')
-                        .skip(1)
-                        .filter_map(|x| x.split('}').next())
-                        .collect(),
-                    Part::Quote(n) | Part::Button(_, n) => vec![n],
-                };
-                for n in names {
-                    assert!(
-                        t.params.iter().any(|p| p.name == n),
-                        "{} uses {n} without declaring it",
+            let mut names = Vec::new();
+            used(t.body, &mut names);
+            for (n, button) in names {
+                if n == INSTALL_SLOT {
+                    continue;
+                }
+                let spec = t.params.iter().find(|p| p.name == n);
+                assert!(spec.is_some(), "{} uses {n} without declaring it", t.id);
+                if button {
+                    assert_eq!(
+                        spec.unwrap().kind,
+                        Kind::Link,
+                        "{}: a button opens a link",
                         t.id
                     );
                 }
             }
             for part in t.body {
-                if let Part::Button(_, n) = part {
-                    let spec = t.params.iter().find(|p| p.name == *n).unwrap();
-                    assert_eq!(spec.kind, Kind::Link, "{}: a button opens a link", t.id);
+                if let Part::Case(n, cases) = part {
+                    let Kind::OneOf(words) = t.params.iter().find(|p| p.name == *n).unwrap().kind
+                    else {
+                        panic!("{}: a case is on a OneOf parameter", t.id);
+                    };
+                    for (k, _) in *cases {
+                        assert!(words.contains(k), "{}: {k} isn't a value of {n}", t.id);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_subject_names_only_values_that_cannot_carry_words() {
+        for t in TEMPLATES {
+            let all = std::iter::once(t.subject).chain(t.subjects.iter().map(|(_, s)| *s));
+            for subject in all {
+                for n in slots(subject) {
+                    let spec = t.params.iter().find(|p| p.name == n);
+                    let kind = spec.map(|p| p.kind);
+                    assert!(
+                        matches!(kind, Some(Kind::Version | Kind::Number | Kind::OneOf(_))),
+                        "{}: subject \"{subject}\" names {n}",
+                        t.id
+                    );
+                }
+            }
+            // The plain subject works whatever optional value is missing.
+            for n in slots(t.subject) {
+                assert!(
+                    t.params.iter().any(|p| p.name == n && p.required),
+                    "{}: the plain subject needs {n}",
+                    t.id
+                );
+            }
+            if !t.subject_by.is_empty() {
+                let Some(Kind::OneOf(words)) = t
+                    .params
+                    .iter()
+                    .find(|p| p.name == t.subject_by)
+                    .map(|p| p.kind)
+                else {
+                    panic!("{}: subject_by is a OneOf parameter", t.id);
+                };
+                for (k, _) in t.subjects {
+                    assert!(words.contains(k), "{}: {k}", t.id);
                 }
             }
         }
@@ -821,16 +1208,78 @@ mod tests {
     #[test]
     fn what_an_install_sends_has_a_subject_that_never_names_coderhelm() {
         for t in TEMPLATES.iter().filter(|t| t.install_may_send) {
-            let plain = t.subject.to_ascii_lowercase().replace([' ', '-'], "");
-            assert!(
-                !plain.contains("coderhelm") && !uses_reserved_wording(t.subject),
-                "{}: {}",
-                t.id,
-                t.subject
-            );
+            let all = std::iter::once(t.subject).chain(t.subjects.iter().map(|(_, s)| *s));
+            for subject in all {
+                let plain = subject.to_ascii_lowercase().replace([' ', '-'], "");
+                assert!(
+                    !plain.contains("coderhelm") && !uses_reserved_wording(subject),
+                    "{}: {subject}",
+                    t.id
+                );
+            }
         }
         // The relay's own notice is CoderHelm speaking, and says so.
         assert!(get("relay_paused").unwrap().subject.contains("CoderHelm"));
+    }
+
+    #[test]
+    fn the_subject_says_what_happened_and_whose_install() {
+        let (t, v) = check(
+            "update_notice",
+            &obj(json!({"what": "blocked", "version": "v0.8.0", "link": "https://acme.coderhelm.com/settings/system/"})),
+            &hosts(),
+            true,
+        )
+        .unwrap();
+        let r = render(t, &v, "acme.coderhelm.com", None, Some("acme"));
+        assert_eq!(r.subject, "acme CoderHelm: update to v0.8.0 needs your OK");
+        let r = render(t, &v, "acme.coderhelm.com", None, None);
+        assert_eq!(
+            r.subject,
+            "Your CoderHelm install: update to v0.8.0 needs your OK"
+        );
+        // Without a version, the plain subject (never "update to  needs...").
+        let (t, v) = check(
+            "update_notice",
+            &obj(json!({"what": "blocked", "link": "https://acme.coderhelm.com/settings/system/"})),
+            &hosts(),
+            true,
+        )
+        .unwrap();
+        let r = render(t, &v, "acme.coderhelm.com", None, Some("Acme"));
+        assert_eq!(r.subject, "Acme CoderHelm: an update notice");
+        // The relay's own notice keeps its own subject.
+        let (t, v) = check(
+            "relay_paused",
+            &obj(json!({"reason": "bounces"})),
+            &hosts(),
+            false,
+        )
+        .unwrap();
+        let r = render(t, &v, "acme.coderhelm.com", None, Some("acme"));
+        assert_eq!(r.subject, "CoderHelm paused email for your install");
+    }
+
+    #[test]
+    fn a_part_naming_a_missing_value_is_left_out() {
+        // An older install sends only what, version and link.
+        let (t, v) = check(
+            "update_notice",
+            &obj(json!({"what": "available", "version": "v0.8.0", "link": "https://acme.coderhelm.com/settings/system/"})),
+            &hosts(),
+            true,
+        )
+        .unwrap();
+        let r = render(t, &v, "acme.coderhelm.com", None, None);
+        assert!(r.text.contains("CoderHelm v0.8.0 is out"));
+        assert!(r.text.contains("New release: v0.8.0"));
+        assert!(!r.text.contains("Running now"), "{}", r.text);
+        assert!(
+            !r.text.contains(": \n") && !r.text.contains(" ."),
+            "{}",
+            r.text
+        );
+        assert!(r.text.contains("update --to v0.8.0"));
     }
 
     #[test]
@@ -899,13 +1348,16 @@ mod tests {
             true,
         )
         .unwrap();
-        let r = render(t, &v, "acme.coderhelm.com", Some("admin@acme.test"));
+        let r = render(t, &v, "acme.coderhelm.com", Some("admin@acme.test"), None);
         assert!(r.text.contains("admin@acme.test"));
         assert!(!r.html.contains("<script>"));
         assert!(!r.html.contains("<b>Hi"));
         assert!(r.html.contains("&lt;script&gt;"));
         assert!(r.html.contains("&lt;a href=x&gt;"));
-        assert_eq!(r.subject, "Update on a support ticket");
+        assert_eq!(
+            r.subject,
+            "Your CoderHelm install: news on a support ticket"
+        );
         assert!(r.text.contains("acme.coderhelm.com"));
     }
 
@@ -1041,7 +1493,7 @@ mod tests {
             }
             let (t, v) = check(t.id, &params, std::slice::from_ref(&host), false)
                 .unwrap_or_else(|e| panic!("{}: {e:?}", t.id));
-            let r = render(t, &v, &host, Some("admin@acme.test"));
+            let r = render(t, &v, &host, Some("admin@acme.test"), Some("Acme"));
             for part in [&r.subject, &r.text, &r.html] {
                 assert_eq!(hosted_mentions(part), Vec::<String>::new(), "{}", t.id);
             }

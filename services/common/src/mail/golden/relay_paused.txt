@@ -1,0 +1,10 @@
+From: "CoderHelm mail service" <notifications@notify.coderhelm.com>
+Subject: CoderHelm paused email for your install
+
+CoderHelm stopped sending email for your self-hosted install because too many recent emails bounces.
+
+Check the recipients in Settings, Emails and remove addresses that bounce, then ask CoderHelm to resume. Or switch the install to its own Amazon SES in the same place.
+
+
+
+Sent through CoderHelm's mail service for the self-hosted CoderHelm install at helm.example.org. Links in this email go only to that install. Questions about it go to the install's admin, admin@example.org. CoderHelm never asks for your password or sign-in codes by email.
