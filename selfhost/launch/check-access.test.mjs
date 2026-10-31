@@ -25,7 +25,12 @@ function healthy() {
       "coderhelm-prod-update-build": role("coderhelm-prod-update-build"),
       "coderhelm-prod-installer-1a2b3c4d": role("coderhelm-prod-installer-1a2b3c4d"),
       "coderhelm-prod-ServiceRole-ab12cd34": role("coderhelm-prod-ServiceRole-ab12cd34"),
+      "coderhelm-prod-ServiceRole-0000aaaa": role("coderhelm-prod-ServiceRole-0000aaaa", { Tags: [{ Key: "coderhelm:role", Value: "gateway" }] }),
+      "coderhelm-prod-ServiceRole-1111bbbb": role("coderhelm-prod-ServiceRole-1111bbbb", { Tags: [{ Key: "coderhelm:role", Value: "worker" }] }),
     },
+    functions: { "coderhelm-prod-gateway": "coderhelm-prod-ServiceRole-0000aaaa", "coderhelm-prod-worker": "coderhelm-prod-ServiceRole-1111bbbb" },
+    // What the boundary allows in this account, as "<caller tag>|<action>|<role>" (the simulator's answer).
+    boundaryAllows: ["gateway", "worker"].flatMap((t) => ["CoderHelmLogReader", "CoderhelmReadOnly"].map((r) => `${t}|sts:AssumeRole|${r}`)),
     attached: { "coderhelm-prod-ServiceRole-ab12cd34": [{ PolicyArn: "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole" }] },
     inline: { "coderhelm-prod-update-build": { idle: { Statement: [{ Effect: "Allow", Action: "lambda:InvokeFunction", Resource: "arn:aws:lambda:x" }] } } },
     stacks: [{ StackName: "coderhelm-prod-api", RoleARN: DEPLOY, StackStatus: "UPDATE_COMPLETE" }, { StackName: "other-app", RoleARN: "arn:aws:iam::1:role/x", StackStatus: "CREATE_COMPLETE" }],
@@ -64,6 +69,19 @@ if (k === "iam list-attached-role-policies") out({ AttachedPolicies: s.attached[
 if (k === "iam list-role-policies") out({ PolicyNames: Object.keys(s.inline[arg("--role-name")] || {}) });
 if (k === "iam get-role-policy") { const p = (s.inline[arg("--role-name")] || {})[arg("--policy-name")]; p ? out({ PolicyDocument: p }) : none(); }
 if (k === "cloudformation describe-stacks") out({ Stacks: s.stacks });
+if (k === "iam get-policy") out({ Policy: { DefaultVersionId: "v3" } });
+if (k === "iam get-policy-version") out({ PolicyVersion: { Document: { Version: "2012-10-17", Statement: [] } } });
+if (k === "cloudformation describe-stack-resources") {
+  const st = arg("--stack-name"), f = st === "coderhelm-prod-api" ? "coderhelm-prod-gateway" : st === "coderhelm-prod-worker" ? "coderhelm-prod-worker" : null;
+  const id = st === "coderhelm-prod-api" ? "GatewayServiceRole162DEA77" : "WorkerServiceRole8543584E";
+  out({ StackResources: f && (s.functions || {})[f] ? [{ ResourceType: "AWS::IAM::Role", LogicalResourceId: "OtherServiceRole1", PhysicalResourceId: "coderhelm-prod-ServiceRole-ab12cd34" }, { ResourceType: "AWS::IAM::Role", LogicalResourceId: id, PhysicalResourceId: s.functions[f] }] : [] });
+}
+if (k === "iam simulate-custom-policy") {
+  const all = a.join(" "), tag = (all.match(/aws:PrincipalTag[/]coderhelm:role,ContextKeyValues=([^,]+)/) || [])[1] || "";
+  const action = arg("--action-names"), role = arg("--resource-arns").split(":role/").pop();
+  if (action.startsWith("iam:")) out({ EvaluationResults: [{ EvalActionName: action, EvalDecision: s.tagGuardMissing || all.includes("deploy-1a2b3c4d") ? "allowed" : "explicitDeny" }] });
+  out({ EvaluationResults: [{ EvalActionName: action, EvalDecision: s.boundaryAllows.includes(tag + "|" + action + "|" + role) ? "allowed" : "explicitDeny" }] });
+}
 if (k === "codebuild list-projects" && s.projectsDenied) { process.stderr.write("An error occurred (AccessDeniedException) when calling the ListProjects operation"); process.exit(254); }
 if (k === "codebuild list-projects") out({ projects: Object.keys(s.projects || {}).concat(["someone-elses-build"]) });
 if (k === "codebuild batch-get-projects") out({ projects: a.slice(a.indexOf("--names") + 1).filter((n) => !n.startsWith("--")).map((n) => ({ name: n, serviceRole: (s.projects || {})[n] || "arn:aws:iam::1:role/other" })) });
@@ -73,7 +91,9 @@ if (k === "iam simulate-principal-policy") {
   const who = arg("--policy-source-arn"), action = arg("--action-names");
   let d = "implicitDeny";
   const all = a.join(" ");
-  if (who.includes("deploy")) d = s.deployDecisions[action] || ((action === "lambda:UpdateFunctionCode" && all.includes("function:coderhelm-prod-")) || (action === "iam:CreateRole" && all.includes("role/coderhelm-prod-check") && all.includes("iam:PermissionsBoundary")) ? "allowed" : "implicitDeny");
+  const tagged = all.match(/aws:PrincipalTag[/]coderhelm:role,ContextKeyValues=([^,]+)/);
+  if (action === "sts:AssumeRole" && tagged) d = s.boundaryAllows.includes(tagged[1] + "|sts:AssumeRole|" + arg("--resource-arns").split(":role/").pop()) ? "allowed" : "explicitDeny";
+  else if (who.includes("deploy")) d = s.deployDecisions[action] || ((action === "lambda:UpdateFunctionCode" && all.includes("function:coderhelm-prod-")) || (action === "iam:CreateRole" && all.includes("role/coderhelm-prod-check") && all.includes("iam:PermissionsBoundary")) ? "allowed" : "implicitDeny");
   else if (s.allowedForBuilds.includes(action)) d = "allowed";
   out({ EvaluationResults: [{ EvalActionName: action, EvalDecision: d }] });
 }
@@ -100,7 +120,11 @@ test("a hardened install passes every row, and the check only reads", () => {
   assert.match(row(out, "coderhelm-prod-update-build: no deploy rights while idle"), /^PASS/);
   assert.match(row(out, "coderhelm-prod-installer-1a2b3c4d: no deploy window while idle"), /^PASS/);
   assert.match(row(out, "refused IAM users"), /^PASS/);
-  for (const c of calls) assert.match(c, /^(sts get-caller-identity|ssm get-parameter|iam (list-|get-|simulate-principal-policy)|cloudformation describe-stacks|codebuild (list-|batch-get-))/, `read-only: ${c}`);
+  assert.match(row(out, "no other role in this account can be assumed"), /^PASS.*expected exception: the gateway and worker may assume CoderHelmLogReader and CoderhelmReadOnly/);
+  assert.match(row(out, "only the gateway's and worker's roles carry coderhelm:role"), /^PASS.*gateway: coderhelm-prod-ServiceRole-0000aaaa/);
+  assert.match(row(out, "the gateway and worker roles: only the read roles"), /^PASS.*gateway: CoderHelmLogReader allowed, CoderhelmReadOnly allowed/);
+  assert.match(row(out, "read roles in this account only read"), /^PASS.*none in this account/);
+  for (const c of calls) assert.match(c, /^(sts get-caller-identity|ssm get-parameter|iam (list-|get-|simulate-principal-policy|simulate-custom-policy)|cloudformation describe-stack(s|-resources)|codebuild (list-|batch-get-))/, `read-only: ${c}`);
   assert.doesNotMatch(out, /^FAIL/m, out);
   assert.equal(code, 0);
 });
@@ -167,4 +191,65 @@ test("a deploy role that could make an IAM user fails", () => {
   s.deployDecisions = { "iam:CreateUser": "allowed" };
   const { out } = check(s);
   assert.match(row(out, "refused IAM users"), /^FAIL.*iam:CreateUser/);
+});
+
+// Same-account data sources: the boundary may let the gateway and worker
+// take on CoderHelm's two read roles here, and nothing broader.
+test("a boundary from before the read-role exception passes and says so", () => {
+  const s = healthy();
+  s.boundaryAllows = [];
+  for (const r of Object.values(s.roles)) delete r.Tags;
+  const { code, out } = check(s);
+  assert.match(row(out, "no other role in this account can be assumed"), /^PASS.*no exception/);
+  assert.match(row(out, "only the gateway's and worker's roles carry coderhelm:role"), /^PASS.*no role carries it yet/);
+  assert.equal(code, 0, out);
+});
+
+test("a boundary that lets the gateway assume another role here, or more than AssumeRole, or an untagged role in, fails", () => {
+  for (const extra of ["gateway|sts:AssumeRole|coderhelm-prod-deploy-1a2b3c4d", "worker|sts:AssumeRole|CoderhelmReadOnly-2", "gateway|sts:TagSession|CoderhelmReadOnly", "|sts:AssumeRole|CoderHelmLogReader", "log-analyzer|sts:AssumeRole|CoderhelmReadOnly"]) {
+    const s = healthy();
+    s.boundaryAllows.push(extra);
+    const { code, out } = check(s);
+    assert.equal(code, 1, extra);
+    assert.match(row(out, "no other role in this account can be assumed"), /^FAIL/, extra);
+  }
+});
+
+test("another role carrying the gateway or worker tag fails", () => {
+  const s = healthy();
+  s.roles["coderhelm-prod-ServiceRole-ab12cd34"].Tags = [{ Key: "Coderhelm:Role", Value: "worker" }];
+  const { code, out } = check(s);
+  assert.equal(code, 1);
+  assert.match(row(out, "only the gateway's and worker's roles carry coderhelm:role"), /^FAIL.*ServiceRole-ab12cd34/);
+});
+
+test("a boundary with the exception but without the tag guard fails", () => {
+  const s = healthy();
+  s.tagGuardMissing = true;
+  const { code, out } = check(s);
+  assert.equal(code, 1);
+  assert.match(row(out, "no other role in this account can be assumed"), /^FAIL.*a role other than the deploy role: iam:TagRole with tag coderhelm:role/);
+});
+
+test("read roles here: one that only reads with an external id passes; no external id, another account, a managed policy or a role-passing statement fails", () => {
+  const trust = (extra = {}) => ({ Statement: [{ Effect: "Allow", Principal: { AWS: "arn:aws:iam::111122223333:root" }, Action: "sts:AssumeRole", Condition: { StringEquals: { "sts:ExternalId": "x" } }, ...extra }] });
+  const ok = healthy();
+  ok.roles.CoderhelmReadOnly = { RoleName: "CoderhelmReadOnly", Arn: "arn:aws:iam::111122223333:role/CoderhelmReadOnly", AssumeRolePolicyDocument: trust() };
+  ok.inline.CoderhelmReadOnly = { "coderhelm-read-logs": { Statement: [{ Effect: "Allow", Action: ["logs:FilterLogEvents", "logs:StartQuery"], Resource: "*" }] } };
+  let r = check(ok);
+  assert.match(row(r.out, "read roles in this account only read"), /^PASS.*CoderhelmReadOnly: external id required/);
+  const cases = [
+    [(s) => { s.roles.CoderhelmReadOnly.AssumeRolePolicyDocument = trust({ Condition: {} }); }, /no sts:ExternalId/],
+    [(s) => { s.roles.CoderhelmReadOnly.AssumeRolePolicyDocument = trust({ Principal: { AWS: "arn:aws:iam::999988887777:root" } }); }, /trust names/],
+    [(s) => { s.attached.CoderhelmReadOnly = [{ PolicyArn: "arn:aws:iam::aws:policy/ReadOnlyAccess" }]; }, /managed policy/],
+    [(s) => { s.inline.CoderhelmReadOnly.more = { Statement: [{ Effect: "Allow", Action: "iam:PassRole", Resource: "*" }] }; }, /allows iam:passrole/],
+    [(s) => { s.inline.CoderhelmReadOnly.more = { Statement: [{ Effect: "Allow", Action: "s3:*", Resource: "*" }] }; }, /allows s3:\*/],
+  ];
+  for (const [change, why] of cases) {
+    const s = JSON.parse(JSON.stringify(ok));
+    change(s);
+    r = check(s);
+    assert.equal(r.code, 1, String(why));
+    assert.match(row(r.out, "read roles in this account only read"), new RegExp("^FAIL.*" + why.source), String(why));
+  }
 });

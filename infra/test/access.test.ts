@@ -14,7 +14,7 @@ import * as path from "node:path";
 import * as cdk from "aws-cdk-lib";
 import { buildApp } from "../lib/app";
 import { resolveConfig, ResolvedConfig, CoderhelmConfig } from "../lib/config";
-import { AccessNames, accessNames, boundaryPolicy, BOUNDARY_SERVICES, deployPolicy, INSTALL_TAG, PolicyDocument, Statement, WINDOW_EXPIRES, WINDOW_USER_ID, windowPolicy, windowPolicyParts } from "../lib/access";
+import { AccessNames, accessNames, boundaryPolicy, BOUNDARY_SERVICES, OWN_READ_ROLES, RUNTIME_ROLE_TAG, RUNTIME_ROLES, deployPolicy, INSTALL_TAG, PolicyDocument, Statement, WINDOW_EXPIRES, WINDOW_USER_ID, windowPolicy, windowPolicyParts } from "../lib/access";
 import { allowed, glob, list, Request } from "./iam-eval";
 import { installName } from "../lib/hardening";
 import { buildSpecSha256, canonicalJson, updateBuildSpecObject, UPDATE_BUILD_VARIABLES } from "../lib/updates-stack";
@@ -118,6 +118,76 @@ test("boundary: even a role whose own policy allows everything stays inside it",
   }
   // A log reader role in another account can still be assumed (log reading).
   assert.ok(can("sts:AssumeRole", "arn:aws:iam::999988887777:role/coderhelm-log-reader", { "aws:ResourceAccount": "999988887777" }));
+});
+
+// An install in the same AWS account as the data it reads takes on
+// CoderHelm's own read roles there. The boundary allows exactly that: only
+// sts:AssumeRole, only on those two names, only by the gateway's and the
+// worker's roles (their coderhelm:role tag).
+test("boundary: in its own account, only the gateway and worker may assume only CoderHelm's two read roles", () => {
+  const sts: PolicyDocument = { Version: "2012-10-17", Statement: [{ Sid: "AllSts", Effect: "Allow", Action: "sts:*", Resource: "*" }] };
+  const can = (action: string, resource: string, tag?: string) =>
+    allowed([sts], BOUNDARY, { action, resource, context: { "aws:ResourceAccount": resource.split(":")[4], ...(tag ? { [`aws:PrincipalTag/${RUNTIME_ROLE_TAG}`]: tag } : {}) } });
+  for (const r of ["CoderHelmLogReader", "CoderhelmReadOnly"]) {
+    for (const t of RUNTIME_ROLES) assert.ok(can("sts:AssumeRole", role(r), t), `${t} may assume ${r} here`);
+    // Any other caller: another function's role, a build, an untagged role, a lookalike tag value.
+    for (const t of ["log-analyzer", "update-build", "Gateway", "gateway-x", "", undefined]) assert.ok(!can("sts:AssumeRole", role(r), t), `${t ?? "no tag"} may not assume ${r}`);
+    // Only AssumeRole: no other STS action on them, even from the gateway.
+    for (const a of ["sts:TagSession", "sts:SetSourceIdentity", "sts:AssumeRoleWithWebIdentity", "sts:AssumeRoleWithSAML"]) assert.ok(!can(a, role(r), "gateway"), `${a} on ${r}`);
+  }
+  // Every other role here stays refused, even for the gateway and worker:
+  // lookalike names, a path, other case, the CDK bootstrap, the deploy role, the install's own.
+  for (const r of [
+    "CoderhelmReadOnly-2", "CoderhelmReadOnlyAdmin", "CoderHelmLogReaderAdmin", "team/CoderhelmReadOnly", "coderhelmreadonly", "CoderHelmReadOnly",
+    "cdk-hnb659fds-cfn-exec-role-111122223333-us-west-2", n.deployRoleName, "coderhelm-prod-ServiceRole-ab12cd34", "coderhelm-prod-update-build", "OrganizationAccountAccessRole",
+  ]) {
+    for (const t of RUNTIME_ROLES) {
+      for (const a of ["sts:AssumeRole", "sts:TagSession", "sts:SetSourceIdentity", "sts:AssumeRoleWithWebIdentity"]) assert.ok(!can(a, role(r), t), `${t}: ${a} on ${r}`);
+    }
+  }
+  // Other accounts are unchanged: the log reader there by name.
+  assert.ok(can("sts:AssumeRole", "arn:aws:iam::999988887777:role/CoderHelmLogReader"));
+});
+
+test("boundary: fits IAM's managed policy limit (6,144 characters without whitespace) with room to spare", () => {
+  const size = JSON.stringify(BOUNDARY).length;
+  assert.ok(size < 5600, `boundary is ${size} characters`);
+});
+
+test("boundary: only the deploy role may set or remove the gateway and worker tag", () => {
+  const everything: PolicyDocument = { Version: "2012-10-17", Statement: [{ Sid: "All", Effect: "Allow", Action: "*", Resource: "*" }] };
+  const can = (action: string, keys: string[], principal: string) =>
+    allowed([everything], BOUNDARY, { action, resource: role("coderhelm-prod-ServiceRole-ab12cd34"), context: { "aws:TagKeys": keys, "aws:PrincipalArn": principal, "iam:PermissionsBoundary": n.boundaryArn } });
+  for (const a of ["iam:TagRole", "iam:UntagRole", "iam:CreateRole"]) {
+    assert.ok(can(a, [RUNTIME_ROLE_TAG], n.deployRoleArn), `the deploy role: ${a}`);
+    for (const keys of [[RUNTIME_ROLE_TAG], ["Coderhelm:Role"], ["other", RUNTIME_ROLE_TAG]]) {
+      assert.ok(!can(a, keys, role("coderhelm-prod-update-build")), `another role: ${a} ${keys}`);
+    }
+    assert.ok(can(a, ["other"], role("coderhelm-prod-update-build")), `other tags unchanged: ${a}`);
+  }
+});
+
+test("boundary: the read role names are the ones CoderHelm's own template and setup script create; only the gateway and worker roles carry the tag", () => {
+  const tmpl = fs.readFileSync(repoPath("infra", "cfn", "coderhelm-log-reader.yaml"), "utf8");
+  assert.match(tmpl, /^\s+RoleName: CoderHelmLogReader$/m);
+  const aws = fs.readFileSync(repoPath("services", "common", "src", "live", "aws.rs"), "utf8");
+  assert.match(aws, /pub const ROLE_PREFIX: &str = "CoderhelmReadOnly";/);
+  assert.match(aws, /^ROLE=\{ROLE_PREFIX\}$/m, "the setup script creates exactly ROLE_PREFIX");
+  assert.match(aws, /pub const LOG_READER_ROLE: &str = "CoderHelmLogReader";/);
+  assert.deepEqual(OWN_READ_ROLES, ["CoderHelmLogReader", "CoderhelmReadOnly"]);
+  const stacks = hardened();
+  const tagged: Record<string, string> = {};
+  for (const t of Object.values<any>(stacks)) {
+    const res = t.Resources ?? {};
+    for (const [id, r] of Object.entries<any>(res)) {
+      if (r.Type !== "AWS::IAM::Role") continue;
+      const tag = (r.Properties.Tags ?? []).find((x: any) => x.Key === RUNTIME_ROLE_TAG);
+      if (!tag) continue;
+      const fn = Object.values<any>(res).find((f) => f.Type === "AWS::Lambda::Function" && JSON.stringify(f.Properties.Role).includes(`"${id}"`));
+      tagged[tag.Value] = fn?.Properties.FunctionName;
+    }
+  }
+  assert.deepEqual(tagged, { gateway: "coderhelm-prod-gateway", worker: "coderhelm-prod-worker" });
 });
 
 test("boundary: allows every action every synthesized CoderHelm role is given", () => {

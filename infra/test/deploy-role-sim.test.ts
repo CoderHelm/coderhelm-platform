@@ -34,6 +34,7 @@ interface Fixture {
   policies: { deploy: PolicyDocument; boundary: PolicyDocument };
   types: string[];
   rows: Row[];
+  runtime: { identity: PolicyDocument; rows: { resource: string; caller: string; context: Record<string, string | string[]>; actions: Record<string, Verdict> }[] };
   notSimulated: { action: string; reason: string; calls: string[] }[];
 }
 
@@ -64,7 +65,7 @@ test("the fixture is AWS's own verdict on thousands of calls, none of them on a 
   assert.ok(pairs().length > 2000, `${pairs().length} pairs`);
   assert.equal(FIXTURE.account, "111122223333");
   const accounts = new Set([...JSON.stringify(FIXTURE).matchAll(/:(\d{12}):/g)].map((m) => m[1]));
-  assert.deepEqual([...accounts].sort(), ["111122223333", "753240598075"], "the example account, and the public Lambda adapter layer's");
+  assert.deepEqual([...accounts].sort(), ["111122223333", "753240598075", "999988887777"], "the example account, the public Lambda adapter layer's, and an example other account");
 });
 
 test("the local IAM evaluator gives AWS's policy simulator verdict on every call", () => {
@@ -89,6 +90,42 @@ test("the deploy role may make every call CloudFormation makes for a self-host i
   assert.deepEqual(gaps, []);
   // Each refusal still matches a call the registry lists, so the list can't go stale.
   for (const a of Object.keys(REFUSED)) assert.ok(pairs().some((p) => p.action === a), `${a} is no longer a call`);
+});
+
+// What the boundary leaves the install's functions in its own account
+// (infra/lib/access.ts, NoOtherRolesHere and the read-role exception), as
+// AWS's simulator saw it: an identity policy allowing every sts action and
+// role tag, so the boundary alone decides.
+test("own-account roles: the evaluator gives the simulator's verdict, and only the gateway and worker may assume only the two read roles", () => {
+  const { identity, rows } = FIXTURE.runtime;
+  const { boundary } = FIXTURE.policies;
+  const wrong = rows.flatMap((r) => Object.entries(r.actions).filter(([action, v]) => decision([identity], boundary, { action, resource: r.resource, context: r.context }) !== v).map(([a]) => `${a} on ${r.resource} as ${r.caller}`));
+  assert.deepEqual(wrong, []);
+  const allowedNow = rows.flatMap((r) => Object.entries(r.actions).filter(([, v]) => v === "allowed").map(([a]) => `${r.caller}: ${a} on ${r.resource.split(":").slice(4).join(":")}${r.context["aws:TagKeys"] ? ` tags ${r.context["aws:TagKeys"]}` : ""}`)).sort();
+  assert.deepEqual(allowedNow, [
+    "another install role: iam:CreateRole on 111122223333:role/coderhelm-prod-ServiceRole-ab12cd34 tags other",
+    "another install role: iam:TagRole on 111122223333:role/coderhelm-prod-ServiceRole-ab12cd34 tags other",
+    "another install role: iam:UntagRole on 111122223333:role/coderhelm-prod-ServiceRole-ab12cd34 tags other",
+    "deploy role: iam:CreateRole on 111122223333:role/coderhelm-prod-ServiceRole-ab12cd34 tags Coderhelm:Role",
+    "deploy role: iam:CreateRole on 111122223333:role/coderhelm-prod-ServiceRole-ab12cd34 tags coderhelm:role",
+    "deploy role: iam:CreateRole on 111122223333:role/coderhelm-prod-ServiceRole-ab12cd34 tags other",
+    "deploy role: iam:TagRole on 111122223333:role/coderhelm-prod-ServiceRole-ab12cd34 tags Coderhelm:Role",
+    "deploy role: iam:TagRole on 111122223333:role/coderhelm-prod-ServiceRole-ab12cd34 tags coderhelm:role",
+    "deploy role: iam:TagRole on 111122223333:role/coderhelm-prod-ServiceRole-ab12cd34 tags other",
+    "deploy role: iam:UntagRole on 111122223333:role/coderhelm-prod-ServiceRole-ab12cd34 tags Coderhelm:Role",
+    "deploy role: iam:UntagRole on 111122223333:role/coderhelm-prod-ServiceRole-ab12cd34 tags coderhelm:role",
+    "deploy role: iam:UntagRole on 111122223333:role/coderhelm-prod-ServiceRole-ab12cd34 tags other",
+    "gateway: sts:AssumeRole on 111122223333:role/CoderHelmLogReader",
+    "gateway: sts:AssumeRole on 111122223333:role/CoderhelmReadOnly",
+    "untagged: sts:AssumeRole on 999988887777:role/CoderHelmLogReader",
+    "worker: sts:AssumeRole on 111122223333:role/CoderHelmLogReader",
+    "worker: sts:AssumeRole on 111122223333:role/CoderhelmReadOnly",
+  ]);
+  // Today's boundary gives the same verdicts the simulator recorded.
+  const n = accessNames({ account: FIXTURE.account, region: FIXTURE.region, prefix: FIXTURE.prefix, suffix: `-${FIXTURE.account}`, secretName: "coderhelm/prod/secrets", id: FIXTURE.launchId });
+  const now = boundaryPolicy(n);
+  const drift = rows.flatMap((r) => Object.entries(r.actions).filter(([action, v]) => decision([identity], now, { action, resource: r.resource, context: r.context }) !== v).map(([a]) => `${a} on ${r.resource} as ${r.caller}`));
+  assert.deepEqual(drift, [], "run infra/scripts/deploy-role-sim.py again");
 });
 
 test("the fixture covers every resource type a hardened install synthesizes", () => {

@@ -1,4 +1,5 @@
 import * as cdk from "aws-cdk-lib";
+import { RUNTIME_ROLE_TAG } from "./access";
 import * as lambda from "aws-cdk-lib/aws-lambda";
 import * as apigatewayv2 from "aws-cdk-lib/aws-apigatewayv2";
 import * as integrations from "aws-cdk-lib/aws-apigatewayv2-integrations";
@@ -697,6 +698,11 @@ export class ApiStack extends cdk.Stack {
         resources: ["arn:aws:iam::*:role/CoderHelmLogReader", "arn:aws:iam::*:role/CoderhelmReadOnly*"],
       })
     );
+    // On a hardened install the boundary lets only the gateway's and the
+    // worker's roles take on these two roles in the install's own account
+    // (infra/lib/access.ts, ReadRolesHereOnlyGatewayAndWorker): this tag
+    // says which they are.
+    cdk.Tags.of(this.gatewayFunction.role!).add(RUNTIME_ROLE_TAG, "gateway");
 
     // Bedrock: Titan embeddings only (memory pages, metered in
     // common::embed). Plan chat calls Anthropic directly with the team's key.

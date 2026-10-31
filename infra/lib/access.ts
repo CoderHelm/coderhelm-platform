@@ -14,7 +14,9 @@
  *   the services CoderHelm uses and denies IAM users and access keys,
  *   Organizations, account settings, CloudTrail and GuardDuty, IAM outside
  *   the install's prefix, a role without this boundary, assuming other
- *   roles in this account, and any change to the boundary itself.
+ *   roles in this account (all but CoderHelm's two read roles, which only
+ *   the gateway and worker may assume), and any change to the boundary
+ *   itself.
  * - The deploy role (`<prefix>-deploy`): CloudFormation's role for the
  *   install's stacks. Only CloudFormation may assume it; it may create roles
  *   only with the boundary, pass only the install's roles, and change only
@@ -116,8 +118,28 @@ function arns(n: AccessNames) {
     at,
     stacks: `${at("cloudformation")}:stack/${n.prefix}-*/*`,
     accessStack: `${at("cloudformation")}:stack/${n.accessStackName}/*`,
+    ownReadRoles: OWN_READ_ROLES.map((r) => `${iam}:role/${r}`),
   };
 }
+
+/**
+ * The two read-only roles CoderHelm itself has teams create, by their exact
+ * names: the log reader (infra/cfn/coderhelm-log-reader.yaml, `RoleName:
+ * CoderHelmLogReader`) and the data-source role (the setup script in
+ * services/common/src/live/aws.rs, `ROLE=CoderhelmReadOnly`). An install in
+ * the same account as the data it reads takes these on in its own account;
+ * the boundary allows exactly that and nothing else there.
+ */
+export const OWN_READ_ROLES = ["CoderHelmLogReader", "CoderhelmReadOnly"];
+/**
+ * The roles that take on those roles: the gateway's and the worker's, which
+ * carry this tag (infra/lib/api-stack.ts, infra/lib/worker-stack.ts). Only
+ * the deploy role can set or remove it (`RuntimeTagOnlyByDeploy`).
+ */
+export const RUNTIME_ROLE_TAG = "coderhelm:role";
+export const RUNTIME_ROLES = ["gateway", "worker"];
+/** STS actions on a role in this account: all denied, except sts:AssumeRole on the read roles above. */
+const ROLE_SESSION_ACTIONS = ["sts:AssumeRole", "sts:AssumeRoleWithWebIdentity", "sts:AssumeRoleWithSAML", "sts:TagSession", "sts:SetSourceIdentity"];
 
 /** Role and policy writes: only with the boundary on the role. */
 export const ROLE_WRITES = [
@@ -247,12 +269,40 @@ export function guardrails(n: AccessNames): Statement[] {
       Resource: a.accessStack,
     },
     {
-      // Other roles in this account (the CDK bootstrap's, yours) can't be assumed.
+      // Other roles in this account (the CDK bootstrap's, the deploy role,
+      // the install's own, yours) can't be assumed. The one exception is
+      // CoderHelm's two read roles, by exact name (the next two statements).
       Sid: "NoOtherRolesHere",
       Effect: "Deny",
-      Action: ["sts:AssumeRole", "sts:AssumeRoleWithWebIdentity", "sts:AssumeRoleWithSAML", "sts:TagSession", "sts:SetSourceIdentity"],
-      Resource: "*",
+      Action: ROLE_SESSION_ACTIONS,
+      NotResource: a.ownReadRoles,
       Condition: { StringEquals: { "aws:ResourceAccount": n.account } },
+    },
+    {
+      // On the read roles: sts:AssumeRole only, no other STS action.
+      Sid: "ReadRolesHereAssumeOnly",
+      Effect: "Deny",
+      Action: ROLE_SESSION_ACTIONS.filter((x) => x !== "sts:AssumeRole"),
+      Resource: a.ownReadRoles,
+    },
+    {
+      // And only by the gateway's and the worker's roles (their tag; a role
+      // without it is refused). Each read role's trust policy still requires
+      // the team's external id.
+      Sid: "ReadRolesHereOnlyGatewayAndWorker",
+      Effect: "Deny",
+      Action: "sts:AssumeRole",
+      Resource: a.ownReadRoles,
+      Condition: { StringNotEquals: { [`aws:PrincipalTag/${RUNTIME_ROLE_TAG}`]: RUNTIME_ROLES } },
+    },
+    {
+      // That tag is set and removed only by CloudFormation through the
+      // deploy role, so no other role can give itself the exception.
+      Sid: "RuntimeTagOnlyByDeploy",
+      Effect: "Deny",
+      Action: ["iam:CreateRole", "iam:TagRole", "iam:UntagRole"],
+      Resource: "*",
+      Condition: { "ForAnyValue:StringEqualsIgnoreCase": { "aws:TagKeys": [RUNTIME_ROLE_TAG] }, ArnNotEquals: { "aws:PrincipalArn": n.deployRoleArn } },
     },
   ];
 }

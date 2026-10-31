@@ -568,11 +568,106 @@ Resources:
                 "sts:TagSession",
                 "sts:SetSourceIdentity"
               ],
-              "Resource": "*",
+              "NotResource": [
+                {
+                  "Fn::Sub": "arn:${AWS::Partition}:iam::${AWS::AccountId}:role/CoderHelmLogReader"
+                },
+                {
+                  "Fn::Sub": "arn:${AWS::Partition}:iam::${AWS::AccountId}:role/CoderhelmReadOnly"
+                }
+              ],
               "Condition": {
                 "StringEquals": {
                   "aws:ResourceAccount": {
                     "Fn::Sub": "${AWS::AccountId}"
+                  }
+                }
+              }
+            },
+            {
+              "Sid": "ReadRolesHereAssumeOnly",
+              "Effect": "Deny",
+              "Action": [
+                "sts:AssumeRoleWithWebIdentity",
+                "sts:AssumeRoleWithSAML",
+                "sts:TagSession",
+                "sts:SetSourceIdentity"
+              ],
+              "Resource": [
+                {
+                  "Fn::Sub": "arn:${AWS::Partition}:iam::${AWS::AccountId}:role/CoderHelmLogReader"
+                },
+                {
+                  "Fn::Sub": "arn:${AWS::Partition}:iam::${AWS::AccountId}:role/CoderhelmReadOnly"
+                }
+              ]
+            },
+            {
+              "Sid": "ReadRolesHereOnlyGatewayAndWorker",
+              "Effect": "Deny",
+              "Action": "sts:AssumeRole",
+              "Resource": [
+                {
+                  "Fn::Sub": "arn:${AWS::Partition}:iam::${AWS::AccountId}:role/CoderHelmLogReader"
+                },
+                {
+                  "Fn::Sub": "arn:${AWS::Partition}:iam::${AWS::AccountId}:role/CoderhelmReadOnly"
+                }
+              ],
+              "Condition": {
+                "StringNotEquals": {
+                  "aws:PrincipalTag/coderhelm:role": [
+                    "gateway",
+                    "worker"
+                  ]
+                }
+              }
+            },
+            {
+              "Sid": "RuntimeTagOnlyByDeploy",
+              "Effect": "Deny",
+              "Action": [
+                "iam:CreateRole",
+                "iam:TagRole",
+                "iam:UntagRole"
+              ],
+              "Resource": "*",
+              "Condition": {
+                "ForAnyValue:StringEqualsIgnoreCase": {
+                  "aws:TagKeys": [
+                    "coderhelm:role"
+                  ]
+                },
+                "ArnNotEquals": {
+                  "aws:PrincipalArn": {
+                    "Fn::Sub": [
+                      "arn:${AWS::Partition}:iam::${AWS::AccountId}:role/coderhelm-${Stage}-deploy-${Id}",
+                      {
+                        "Id": {
+                          "Fn::Select": [
+                            0,
+                            {
+                              "Fn::Split": [
+                                "-",
+                                {
+                                  "Fn::Select": [
+                                    2,
+                                    {
+                                      "Fn::Split": [
+                                        "/",
+                                        {
+                                          "Ref": "AWS::StackId"
+                                        }
+                                      ]
+                                    }
+                                  ]
+                                }
+                              ]
+                            }
+                          ]
+                        }
+                      }
+                    ]
                   }
                 }
               }
