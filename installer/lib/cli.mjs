@@ -34,13 +34,18 @@ Commands
                 [--channel stable|preview] [--majors ask|auto]
   health        The quick health check the updater runs (doctor checks more)
   backup        Take on-demand backups of every table
-  uninstall     Remove CoderHelm from the account: its stacks, Launch Stack,
-                permissions boundary, deploy role, buckets, logs and
-                parameters. Keeps the data (tables, data bucket, KMS keys,
-                user pool, secret) unless --everything. Shows the list and
-                asks for the install name first. --verify lists what is left
-                (read-only). The guided uninstall does the same from the
-                browser: docs.coderhelm.com/self-host/uninstall/
+  uninstall     A native install (one stack, coderhelm-<name>): Delete stack in
+                CloudFormation, with KeepDataOnDelete. An install from before:
+                remove its stacks and pieces by name (--everything deletes the
+                data too). docs.coderhelm.com/self-host/uninstall/
+  leftovers     Read-only: anything still named or tagged for the install in
+                this region (what KeepDataOnDelete kept, an earlier failed
+                install's pieces, the auto-update role). --delete removes them
+                after you type the install name, never while its stack exists
+  migrate       Move an install from before native releases to one stack
+                (resource import, data kept; a check stops it before any
+                table, bucket, key, user pool or secret would be replaced).
+                Without --yes it stops at the checked change set
   telemetry     on | off | status: anonymous install and upgrade pings (off by default)
   domain apply  Put your own domain on the install (--hostname, --certificate-arn
                 in us-east-1, and --zone/--zone-id for a Route 53 zone), or
@@ -63,7 +68,8 @@ Options
   --everything        uninstall: delete the data too (also --delete-data);
                       KMS keys after AWS's 7-day minimum
   --verify            uninstall: only list what is left of the install
-  --stage, --region   uninstall: the install, without a config file
+  --delete            leftovers: remove what is left (asks for the install name)
+  --stage, --region   uninstall, leftovers: the install, without a config file
   --org <name>        github-app: create the app in this GitHub organization
   --app-id, --client-id, --private-key-file
                       github-app: store an app you made by hand (GitHub
@@ -152,6 +158,10 @@ export async function main(argv, deps = {}) {
         return 0;
       case "uninstall":
         return (await cmd.uninstall(ctx)) ?? 0;
+      case "leftovers":
+        return (await cmd.leftovers(ctx)) ?? 0;
+      case "migrate":
+        return (await cmd.migrate(ctx)) ?? 0;
       case "telemetry":
         await cmd.telemetry(ctx);
         return 0;

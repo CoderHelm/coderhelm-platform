@@ -1,6 +1,6 @@
 ---
 title: Everything you can set up
-description: Every setting of a self-hosted install, where to set it (the install guide, the Launch Stack, the dashboard or the config), and how it is checked.
+description: Every setting of a self-hosted install, where to set it (the install guide, Launch Stack parameters, the dashboard or the config), and how it is checked.
 order: 1.5
 ---
 
@@ -32,7 +32,7 @@ One list of everything you can set up, and where. Required items are steps in th
   *Checked by:* `model`
 - **Your own domain**\
   *Install guide:* More options, then the Domain step\
-  *Launch Stack:* `Hostname` (`HostedZone` to pick a zone)\
+  *Launch Stack:* `Hostname`\
   *Config:* `domain`\
   *Checked by:* `domain`
 - **Send email: your own Amazon SES or through CoderHelm**\
@@ -53,15 +53,17 @@ One list of everything you can set up, and where. Required items are steps in th
   *Config:* `signup.requireTwoFactor`
 - **Automatic updates and the window**\
   *Install guide:* More options\
-  *Launch Stack:* `AutoUpdate`, `UpdateWindow`, `UpdateTimezone`\
+  *Launch Stack:* `AutoUpdate`, `UpdateDay`, `UpdateHour`, `UpdateTimezone`\
   *Config:* `updates.*`\
   *Checked by:* `updates`
+- **Keep the data when the stack is deleted**\
+  *Launch Stack:* `KeepDataOnDelete` (default `true`; see [Uninstall](./uninstall.md))\
+  *Config:* `retainData`
 - **Anonymous install pings**\
-  *Launch Stack:* `Telemetry`\
   *Config:* `telemetry.enabled`
 - **The release**\
   *Install guide:* (the newest)\
-  *Launch Stack:* `Version`\
+  *Launch Stack:* the template you launch (`launch/<version>/coderhelm.json`)\
   *Config:* `--version`
 - **GitHub App** *required*\
   *Install guide:* The GitHub step\
@@ -129,9 +131,9 @@ One list of everything you can set up, and where. Required items are steps in th
 - **Backups**\
   *Where:* On by the install (point-in-time recovery on every table, versioned bucket); on-demand with `backup`; AWS Backup plans\
   *Guide:* [Backups](./backups.md)
-- **Keep data when stacks are deleted**\
-  *Where:* `retainData` (on)\
-  *Guide:* [Config reference](./config-reference.md)
+- **Keep data when the stack is deleted**\
+  *Where:* the stack parameter `KeepDataOnDelete` (`true`); `retainData` on an install from before native releases\
+  *Guide:* [Uninstall](./uninstall.md#keep-the-data-or-delete-it-too)
 - **The build sandbox, log analysis**\
   *Where:* `integrations.*`\
   *Guide:* [Integrations](./integrations.md)

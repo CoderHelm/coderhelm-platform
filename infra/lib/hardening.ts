@@ -24,6 +24,14 @@ import { ResolvedConfig } from "./config";
 
 /** The stack properties every stack of the app gets: its environment, and for a hardened install its synthesizer. */
 export function stackBase(cfg: ResolvedConfig): { env: cdk.Environment; synthesizer?: cdk.IStackSynthesizer } {
+  if (cfg.native) {
+    // One template for every account and region; assets from the install's
+    // own bucket (the packager makes the sentinel a Ref).
+    return {
+      env: { region: cfg.region },
+      synthesizer: new cdk.CliCredentialsStackSynthesizer({ fileAssetsBucketName: cfg.access!.assetsBucket, bucketPrefix: "assets/" }),
+    };
+  }
   const env = { account: cfg.account, region: cfg.region };
   if (!cfg.access) return { env };
   return {

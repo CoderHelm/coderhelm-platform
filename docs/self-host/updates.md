@@ -26,7 +26,11 @@ The updater (a Lambda in your account) checks GitHub for releases every hour, ke
 
 ## Automatic updates
 
-Turn them on in **Settings, then System**, at install (the install guide's **More options**, or the Launch Stack's `AutoUpdate`, `UpdateWindow` and `UpdateTimezone`), or:
+Automatic updates are off by default. With them off, CoderHelm still prepares each new release for you to review (see [What an update does](#what-an-update-does)).
+
+On an install made with Launch Stack, set the stack parameter **AutoUpdate** to `on`, with **UpdateDay**, **UpdateHour** and **UpdateTimezone** for the maintenance window. You can set them at launch, or later: select the stack `coderhelm-<name>`, choose **Update**, **Use current template**, and change only those parameters. **AutoUpdate** `on` adds the auto-update role, `coderhelm-<name>-deploy-stack`, which is what lets the updater apply a release without you ([what it may do](./security.md#updates-and-the-optional-auto-update-role)). Without it, an update waits for your review even when the setting in **Settings, then System** is on.
+
+On an install from before native releases, turn them on in **Settings, then System**, or:
 
 ```sh
 npx -y github:CoderHelm/coderhelm-platform auto-update on --window "Sun 03:00" --timezone Europe/Berlin --channel stable --majors ask
@@ -43,9 +47,9 @@ npx -y github:CoderHelm/coderhelm-platform auto-update on --window "Sun 03:00" -
 - **Majors** *default ask*\
   `ask`: a new major version waits for an admin; `auto`: it installs too.
 
-The settings take effect at once (no deploy). The same values in `coderhelm.config.json` under `updates` are the starting point of a new install.
+The settings in **Settings, then System** take effect at once (no deploy). The launch parameters, or the same values in `coderhelm.config.json` under `updates`, are the starting point of a new install.
 
-An update starts only when all of these hold: auto-update is on, the hour is the window's hour in your time zone, the release is on your channel, it isn't a major release while majors are `ask`, no update is running, that version hasn't already failed (an admin can still start it by hand), and every model the release calls answers a test call through your provider.
+An automatic update starts only when all of these hold: auto-update is on, the hour is the window's hour in your time zone, the release is on your channel, it isn't a major release while majors are `ask`, no update is running, that version hasn't already failed (an admin can still start it by hand), and every model the release calls answers a test call through your provider.
 
 ## The model check
 
@@ -71,27 +75,37 @@ From the terminal, `update` runs a preflight first and stops before anything cha
 
 ## Update now
 
-**Settings, then System, then Update now** (or `coderhelm-selfhost update`) starts the same update as the automatic one, and records who started it.
+**Settings, then System, then Update now** starts the same update as the automatic one, and records who started it. With auto-update off, it prepares the change set for you to review.
 
 ## What an update does
 
-The update runs as a CodeBuild job in your account, `coderhelm-<stage>-update`:
+On an install made with Launch Stack, an update is a stack update of `coderhelm-<name>` to the new release's `coderhelm.json`, prepared as a CloudFormation change set. Creating a change set changes nothing.
 
-1. **Checks the release.** It checks the release's tag: it must be on a commit on `main`, and be signed with a maintainer key pinned in the release your install runs or attested by CoderHelm's automatic release workflow on `main` for that tag and commit. It then downloads the release's `SHA256SUMS` and checks its signature with cosign. It must be signed, keyless, by exactly `CoderHelm/coderhelm-platform`'s `release.yml`, on that release's own tag and from the tag's commit, and be in the Rekor transparency log. Every file is then checked against `SHA256SUMS`. A release that fails either check is refused, and so is an older release than the one you run unless it is a rollback. See [How updates are kept safe](./updates-security.md).
-2. **Checks health first.** The stacks, functions, dead-letter queue, keys and URLs. An unhealthy install is not updated.
-3. **Reads the migration notes.** Every release between yours and the target is listed. One that needs action stops an automatic update; an admin does what it says, then updates by hand.
-4. **Deploys.** It runs the release's CDK app through the CDK roles in your account.
-5. **Checks health again.** If the new release is unhealthy, the previous release is deployed again automatically.
-6. **Reports.** The history in **Settings, then System** shows the version, when, who (or "auto") and the result: succeeded, failed, or rolled back with the reason. Admins get an email either way.
+1. **Checks the release.** A read-only build in your account checks the release's tag: it must be on a commit on `main`, and be signed with a maintainer key pinned in the release your install runs or attested by CoderHelm's automatic release workflow on `main` for that tag and commit. It then downloads the release's `SHA256SUMS` and checks its signature with cosign. It must be signed, keyless, by exactly `CoderHelm/coderhelm-platform`'s `release.yml`, on that release's own tag and from the tag's commit, and be in the Rekor transparency log. It reports the sha256 of `coderhelm.json` from the signed `SHA256SUMS`. A release that fails is refused. See [How updates are kept safe](./updates-security.md).
+2. **Checks the models** the release calls ([the model check](#the-model-check)).
+3. **Prepares the change set.** The updater downloads `coderhelm.json` from `https://coderhelm-public.s3.amazonaws.com/launch/<version>/`, where release files are written once and never replaced, and proposes it only if its sha256 matches the signed one. Every parameter keeps its current value.
+4. **Waits for you, or applies it.**
+   - **Auto-update off (the default):** **Settings, then System, then Update** shows the change set's summary (how many resources are added, changed and removed, which ones are replaced, and which parts it touches) and a link to it in the CloudFormation console. Admins get an email with the same link. Review it there and choose **Execute**; it runs with your own permissions.
+   - **Auto-update on:** the updater executes it in your maintenance window, through the auto-update role.
+5. **Follows it.** Every 5 minutes the updater reads the change set and the stack until the update ends. When the stack update starts, the install's own copy step checks every file of the release against the sha256 that `coderhelm.json` lists before any part changes. If a part fails, CloudFormation rolls the whole stack back to the previous release by itself.
+6. **Reports.** The history in **Settings, then System** shows the version, when, who (or "auto") and the result: succeeded, failed, or rolled back, with CloudFormation's own reason for the first resource that failed. Admins get an email either way.
+
+A change set that waits too long can go stale (the stack changed since it was made); the history then says so, and **Update now** prepares a new one.
+
+### Installs from before native releases
+
+An install from before native releases updates with a CodeBuild job in your account, `coderhelm-<stage>-update`. It runs the same release checks, checks health first, reads the migration notes (a release that needs action stops an automatic update), deploys the release's CDK app, checks health again and deploys the previous release again if the new one is unhealthy. On an install an admin hardened, the job's role holds no deploy rights until the updater gives this one build a deploy window, and the build deploys only through the install's own deploy role ([what that means](./updates-security.md#what-an-update-may-do-in-your-account)). Otherwise the job's role assumes the CDK bootstrap roles, as it always has. To move such an install to one stack, see [Migrate to one stack](./migrate.md).
 
 ## When an update fails
 
 The history entry says what happened and what to do next:
 
-- **Rolled back:** the new release deployed but wasn't healthy, so the previous one was deployed again. Your data is untouched. Fix what **Settings, then Setup** (or `doctor`) lists, then update again. Automatic updates skip that release until an admin updates to it by hand.
+- **Rolled back:** the update didn't finish, so CloudFormation (or, on an install from before, the update job) put the previous release back. Your data is untouched. Fix what the reason and **Settings, then Setup** (or `doctor`) list, then update again. Automatic updates skip that release until an admin updates to it by hand.
 - **Failed:** the update stopped before or during the deploy. Check **Setup** for what fails and how to fix it. If the install isn't working, roll back.
 
-The terminal prints the same guidance:
+On an install made with Launch Stack, the stack's **Events** tab in the CloudFormation console shows every step and the first error.
+
+The terminal (installs from before native releases) prints the same guidance:
 
 ```text
 The update to v0.8.0 deployed, but the install wasn't healthy afterwards, so it went back to v0.7.0. Your data is untouched.
@@ -101,8 +115,6 @@ What to do:
   3. Then try again: npx -y github:CoderHelm/coderhelm-platform update --to v0.8.0
   Auto-update skips this release until an admin updates to it by hand.
 ```
-
-On a hardened install (made with the Launch Stack, or hardened by an admin), the job's role holds no deploy rights until the updater gives this one build a deploy window. The window ends with the build, and the build deploys only through the install's own deploy role, within its permissions boundary ([what that means](./updates-security.md#what-an-update-may-do-in-your-account)). On an install from before, the job's role assumes the CDK bootstrap roles, which do the deploying, as it always has.
 
 Rolling back from a hardened install to a release from before hardening needs an admin ([why](./security.md#rolling-back-past-hardening)).
 
@@ -114,6 +126,8 @@ Data written by a newer release stays. Releases only add fields to stored items,
 
 ## From the terminal
 
+For installs from before native releases (an install made with Launch Stack updates as a stack update, above):
+
 ```sh
 npx -y github:CoderHelm/coderhelm-platform update                # latest release
 npx -y github:CoderHelm/coderhelm-platform update --to v0.8.0
@@ -124,7 +138,7 @@ The terminal update runs the same steps on your machine. It shows `cdk diff` and
 
 ## Another machine
 
-The installer keeps your config and the installed version in SSM in your account (`/coderhelm-<stage>/installer/config` and `/state`, no secrets in either). To manage an install from a new machine:
+For installs from before native releases: the installer keeps your config and the installed version in SSM in your account (`/coderhelm-<stage>/installer/config` and `/state`, no secrets in either). To manage an install from a new machine:
 
 ```sh
 npx -y github:CoderHelm/coderhelm-platform pull --stage prod --region us-east-1
@@ -141,7 +155,13 @@ Each release (a `vX.Y.Z` tag) has, on its GitHub release page:
 | `dashboard.tar.gz` | The dashboard (it reads its API location at runtime) |
 | `source.tar.gz` | The repository at the tag, with `selfhost/release.json` (the version stamp) |
 | `coderhelm-selfhost.tgz` | The installer |
-| `install.sh`, `launch-stack.yaml` | The install script and the Launch Stack template |
+| `install.sh` | The install script |
+| `coderhelm.json` | The Launch Stack template: the parent stack, with the sha256 of every other file below |
+| `coderhelm-native.tar.gz` | The nested stack templates (`stacks/<Part>.json`) and the code bundles (`assets/<hash>.zip`) that `coderhelm.json` pins |
+| `models.json` | The models the release calls |
+| `coderhelm-log-reader.yaml`, `coderhelm-log-reader-update.yaml` | The log reader role template, and its update |
 | `SHA256SUMS`, `SHA256SUMS.sigstore.json` | Checksums, and their keyless signature |
 
-Every artifact also has a GitHub build provenance attestation. To check a release yourself, see [How updates are kept safe](./updates-security.md#check-a-release-yourself).
+The Launch Stack files are also in S3, written once by version: `https://coderhelm-public.s3.amazonaws.com/launch/<version>/coderhelm.json`, with `stacks/<Part>.json` and `assets/<hash>.zip` next to it. `https://coderhelm-public.s3.amazonaws.com/launch/latest.json` names the newest stable release, its `templateUrl` and the `templateSha256` of its `coderhelm.json`.
+
+Every artifact also has a GitHub build provenance attestation. To check a release yourself, see [Verify a release before launching](./updates-security.md#verify-a-release-before-launching) and [How updates are kept safe](./updates-security.md#check-a-release-yourself).

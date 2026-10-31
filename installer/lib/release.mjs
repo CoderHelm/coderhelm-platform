@@ -82,7 +82,7 @@ export function checkDownloadUrl(url) {
   return u.href;
 }
 
-async function download(fetchImpl, tag, name) {
+export async function download(fetchImpl, tag, name) {
   const url = releaseUrl(tag, name);
   const r = await fetchImpl(url, { redirect: "follow" });
   if (!r.ok) throw new Error(`Could not download ${name} for ${tag} (${r.status}). Is ${tag} a CoderHelm release?`);
@@ -289,4 +289,23 @@ export async function verifySignature(paths, runner, { tag, log = console.log, r
     return { method: "attestation", commit };
   }
   throw new Error("Can't check the release's signature: install cosign (https://docs.sigstore.dev/cosign/system_config/installation/) or the GitHub CLI (gh), then run this again. Nothing was installed.");
+}
+
+/**
+ * A native release's parent template sha256, from its SHA256SUMS after the
+ * signature check (the template pins every other native file). Throws when
+ * the release isn't signed or has no native template.
+ */
+export async function verifiedTemplateSha(tag, { runner, fetchImpl = fetch, log = console.log, verify = verifySignature } = {}) {
+  checkTag(tag);
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "ch-native-"));
+  try {
+    for (const n of ["SHA256SUMS", SIGNATURE]) fs.writeFileSync(path.join(dir, n), await download(fetchImpl, tag, n));
+    await verify({ dir }, runner, { tag, log });
+    const sha = parseSums(fs.readFileSync(path.join(dir, "SHA256SUMS"), "utf8"))["coderhelm.json"];
+    if (!sha) throw new Error(`${tag} has no one-stack template (coderhelm.json): migrate to a release that has one.`);
+    return sha;
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
 }

@@ -45,7 +45,7 @@ class Version(unittest.TestCase):
 
 class Shipped(unittest.TestCase):
     def test_paths_the_release_is_built_from(self):
-        for p in ("services/worker/src/lib.rs", "lambda/mcp-proxy/src/index.ts", "lambda/updater/handler.py", "infra/cfn/coderhelm-selfhost-launch.yaml",
+        for p in ("services/worker/src/lib.rs", "lambda/mcp-proxy/src/index.ts", "lambda/updater/handler.py", "infra/lib/native/parent.ts", "lambda/native-helper/handler.py",
                   "installer/lib/release.mjs", "selfhost/versions.json", "selfhost/install.sh", "scripts/check-dashboard-ref.mjs", ".github/workflows/release.yml"):
             self.assertEqual(ar.ships([p]), [p], p)
         for p in ("docs/self-host/updates.md", "README.md", ".github/workflows/ci.yml", "coderhelm-jira/src/index.js", "plugins/x.md",

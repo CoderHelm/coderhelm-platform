@@ -1,6 +1,6 @@
 ---
 title: The GitHub App
-description: How the installer creates your own GitHub App with one click, what it may do, and how to replace it.
+description: How the install guide or the command line creates your own GitHub App with one click, what it may do, and how to replace it.
 order: 4
 ---
 
@@ -8,7 +8,7 @@ Your install uses its own GitHub App, owned by your account or organization. Cod
 
 ## Creating it
 
-`deploy` runs this for you the first time. To run it on its own:
+With Launch Stack, the [install guide](https://docs.coderhelm.com/self-host/install/) creates it in its GitHub step, with the one-time setup key the stack stored for it ([how](./setup-checks.md#how-the-install-guide-works)). From the command line, `deploy` runs this for you the first time. To run it on its own:
 
 ```sh
 npx -y github:CoderHelm/coderhelm-platform github-app             # under your account
@@ -17,10 +17,10 @@ npx -y github:CoderHelm/coderhelm-platform github-app --org acme   # under an or
 
 It uses GitHub's [manifest flow](https://docs.github.com/en/apps/sharing-github-apps/registering-a-github-app-from-a-manifest):
 
-1. The installer starts a page on `127.0.0.1` and opens it. The page sends GitHub a description of the app: its name, your URLs, the permissions and events below.
+1. The command starts a page on `127.0.0.1` and opens it. The page sends GitHub a description of the app: its name, your URLs, the permissions and events below.
 2. GitHub shows the app. Change the name if you like, then press **Create GitHub App**.
 3. GitHub redirects back to the local page with a one-time code (valid for an hour, checked against a random state value).
-4. The installer trades the code for the app's id, private key, webhook secret and OAuth client, and writes them into your deployment's secret in Secrets Manager. They are never printed or saved anywhere else.
+4. The command trades the code for the app's id, private key, webhook secret and OAuth client, and writes them into your deployment's secret in Secrets Manager. They are never printed or saved anywhere else.
 5. It redeploys the three Rust functions so they read the new keys, and prints the link to install the app on your repositories.
 
 ## What the app may do

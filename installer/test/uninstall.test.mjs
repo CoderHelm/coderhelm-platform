@@ -104,6 +104,8 @@ function world({ hybrid = false } = {}) {
       case "s3api get-bucket-location": return { LocationConstraint: w.buckets[arg("--bucket")]?.region === "us-east-1" ? null : w.buckets[arg("--bucket")]?.region };
       case "s3api list-object-versions": return { Versions: Array.from({ length: w.buckets[arg("--bucket")]?.objects ?? 0 }, (_, i) => ({ Key: `k${i}`, VersionId: `v${i}` })) };
       case "dynamodb list-tables": return { TableNames: Object.keys(w.tables) };
+      case "dynamodb describe-table": return w.tables[arg("--table-name")] ? { Table: { TableName: arg("--table-name"), TableStatus: "ACTIVE", DeletionProtectionEnabled: false } } : null;
+      case "lambda list-event-source-mappings": return { EventSourceMappings: w.esms ?? [] };
       case "dynamodb list-tags-of-resource": return { Tags: w.tables[arg("--resource-arn").split("/").pop()] ?? [] };
       case "dynamodb list-backups": return { BackupSummaries: w.backups };
       case "kms list-aliases": return { Aliases: w.aliases };
@@ -143,7 +145,13 @@ function world({ hybrid = false } = {}) {
       }
       case "s3api delete-objects": w.buckets[arg("--bucket")].objects = 0; return ok;
       case "s3api delete-bucket": if (w.buckets[arg("--bucket")].objects) return { ok: false, error: "BucketNotEmpty" }; delete w.buckets[arg("--bucket")]; return ok;
-      case "dynamodb delete-table": delete w.tables[arg("--table-name")]; return ok;
+      case "dynamodb delete-table": {
+        // A GlobalTable that refuses a few times while a replica settles (seen in a real uninstall).
+        const n = arg("--table-name");
+        if (w.flaky?.[n] > 0) { w.flaky[n]--; return { ok: false, error: "An error occurred (ResourceInUseException) when calling the DeleteTable operation: Table is being updated" }; }
+        delete w.tables[n]; return ok;
+      }
+      case "lambda delete-event-source-mapping": w.esms = (w.esms ?? []).filter((m) => m.UUID !== arg("--uuid")); return ok;
       case "dynamodb delete-backup": w.backups = w.backups.filter((b) => b.BackupArn !== arg("--backup-arn")); return ok;
       case "kms delete-alias": w.aliases = w.aliases.filter((a) => a.AliasName !== arg("--alias-name")); return ok;
       case "kms schedule-key-deletion": w.keys[arg("--key-id")].state = "PendingDeletion"; return { ...ok, out: JSON.stringify({ DeletionDate: "2026-11-06T00:00:00Z" }) };
@@ -401,4 +409,66 @@ test("terminal: --everything with the name typed removes it all; --dry-run and -
   assert.equal(v2.code, 1);
   assert.match(v2.out, /pieces left/);
   assert.equal(writes(w).length, before);
+});
+
+// ── After Delete stack: leftovers ─────────────────────────────────────────
+
+test("a GlobalTable that refuses while a replica settles is retried until it is gone", async () => {
+  const w = world();
+  w.flaky = { "coderhelm-prod-runs": 3 };
+  const r = await un.deleteTable(ctxFor(w), "coderhelm-prod-runs");
+  assert.deepEqual(r, { ok: true });
+  assert.ok(!w.tables["coderhelm-prod-runs"]);
+  const stuck = world();
+  stuck.flaky = { "coderhelm-prod-runs": 1e9 };
+  const s = await un.deleteTable(ctxFor(stuck, { maxPolls: 5 }), "coderhelm-prod-runs");
+  assert.equal(s.ok, false);
+  assert.match(s.error, /ResourceInUseException/, "the reason is AWS's own");
+});
+
+/** What a real "delete everything" left behind (the owner's list), minus the stacks. */
+function leftoverWorld() {
+  const w = world();
+  for (const n of Object.keys(w.stacks)) if (n.startsWith("coderhelm-prod") && n !== "coderhelm-prod-eu-api" && n !== "coderhelm-prod-2") delete w.stacks[n];
+  w.pools["us-east-1_prodold"] = { Name: "coderhelm-prod-users", tag: "coderhelm-prod" }; // an earlier failed install's
+  w.esms = [
+    { UUID: "e1", FunctionArn: arn("lambda", "function:coderhelm-prod-worker"), EventSourceArn: arn("sqs", "coderhelm-prod-tickets") },
+    { UUID: "e2", FunctionArn: arn("lambda", "function:coderhelm-prod-eu-worker"), EventSourceArn: arn("sqs", "coderhelm-prod-eu-tickets") },
+    { UUID: "e3", FunctionArn: arn("lambda", "function:my-app"), EventSourceArn: arn("sqs", "q") },
+  ];
+  return w;
+}
+
+test("leftovers: read-only, lists both same-named user pools, orphaned event source mappings, and every kind the real uninstall left", async () => {
+  const file = cfgDir();
+  const w = leftoverWorld();
+  const r = await cli(["leftovers", "--config", file], { aws: w });
+  assert.equal(r.code, 1, r.out);
+  assert.equal(writes(w).length, 0, "read-only");
+  for (const kind of ["table", "data bucket", "KMS key", "user pool", "secret", "log group", "parameter", "role", "permissions boundary", "event source mapping"]) assert.match(r.out, new RegExp(`  ${kind} `), kind);
+  assert.equal((r.out.match(/user pool +coderhelm-prod-users/g) ?? []).length, 2, "both pools of the same name");
+  assert.match(r.out, /coderhelm-prod-worker <- coderhelm-prod-tickets/);
+  assert.ok(!/coderhelm-prod-eu-worker|my-app <-/.test(r.out), "another install's and someone else's mappings are not listed");
+});
+
+test("leftovers --delete removes only this install's pieces, with each reason when one stays", async () => {
+  const file = cfgDir();
+  const w = leftoverWorld();
+  w.flaky = { "coderhelm-prod": 2 };
+  const r = await cli(["leftovers", "--delete", "--config", file], { aws: w, interactive: true, ask: quietAsk({ "Type the install name (prod)": "prod" }) });
+  assert.equal(r.code, 0, r.out + String(r.error?.message));
+  for (const c of writes(w)) assert.ok(isThisInstalls(target(c)) || c.op === "delete-event-source-mapping", `${c.svc} ${c.op} ${target(c)}`);
+  assert.deepEqual(w.esms.map((m) => m.UUID).sort(), ["e2", "e3"]);
+  assert.ok(!Object.values(w.pools).some((p) => p.Name === "coderhelm-prod-users"), "both pools are gone");
+  const after = await cli(["leftovers", "--config", file], { aws: w });
+  assert.match(after.out, /nothing left/);
+});
+
+test("leftovers --delete never takes a native install apart while its stack exists", async () => {
+  const file = cfgDir();
+  const w = leftoverWorld();
+  w.stacks["coderhelm-prod"] = { tags: tag("coderhelm-prod"), exports: [] };
+  const r = await cli(["leftovers", "--delete", "--config", file], { aws: w, interactive: true, ask: quietAsk({ "Type the install name (prod)": "prod" }) });
+  assert.match(String(r.error), /delete it in CloudFormation \(Delete stack\)/);
+  assert.equal(writes(w).length, 0);
 });

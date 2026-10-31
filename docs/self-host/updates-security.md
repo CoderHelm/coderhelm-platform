@@ -15,7 +15,7 @@ This page says what each protection is and what enforces it: your install's own 
 
 ## What installs and updates check
 
-The installer, the update build (`coderhelm-<stage>-update`), the release check build that runs before an update (`coderhelm-<stage>-release-check`) and the Launch Stack's installer make the same checks. They run before anything from the release is used:
+The release check build that runs before every update (`coderhelm-<stage>-release-check`), the command line installer, and the update build of an install from before native releases (`coderhelm-<stage>-update`) make the same checks. They run before anything from the release is used. For Launch Stack, you check the template and the install checks everything else against it: see [The Launch Stack](#the-launch-stack).
 
 1. **The tag.** `vX.Y.Z` is fetched from `https://github.com/CoderHelm/coderhelm-platform.git` with git. Several things must hold:
    - It is an annotated tag. A lightweight tag is refused.
@@ -40,12 +40,12 @@ The installer, the update build (`coderhelm-<stage>-update`), the release check 
    - one made from another commit, such as a `release.yml` changed and pushed under a new tag;
    - a bundle with no Rekor entry;
    - a missing signature.
-3. **The files.** Every file must match its line in `SHA256SUMS`. That covers the Lambdas, the dashboard, the source, the installer, `install.sh`, `launch-stack.yaml` and `launch-bootstrap.mjs`. A file changed after signing is refused before anything is unpacked.
+3. **The files.** Every file must match its line in `SHA256SUMS`. That covers the Lambdas, the dashboard, the source, the installer, `install.sh`, the Launch Stack template `coderhelm.json`, and `coderhelm-native.tar.gz` (the nested templates and code bundles that `coderhelm.json` pins). A file changed after signing is refused before anything is unpacked.
 4. **Where files come from.** Files come only from `https://github.com/CoderHelm/coderhelm-platform/releases/download/<version>/` over HTTPS, including after GitHub's redirects. Any other host, plain HTTP, or a version that isn't `vX.Y.Z` is refused.
 5. **No going back.** An update only goes to a newer release than the one running. A rollback only goes to a release this install has run before. An admin starts it from **Settings, then System**, or with `coderhelm-selfhost rollback`. An older signed release that this install never ran can't be pushed onto it.
 6. **A fresh release list.** The updater reads the release list only from `api.github.com` for this repository. If the list stops showing the newest version it saw before, **Settings, then System** marks the list as stale. It does the same when the list hasn't been read for over 3 days. A stale copy can hold an install back, but it can never make it go back. The list only decides what to offer. What is trusted is decided by the checks above, in the build.
 
-**Whose keys.** An update build checks a new release against the maintainer keys of the release your install already runs. They are written into the build when that release was deployed. A release can't bring its own keys to vouch for itself. The installer checks with the keys in its own package, and the Launch Stack template with the keys written into it.
+**Whose keys.** An update build checks a new release against the maintainer keys of the release your install already runs. They are written into the build when that release was deployed. A release can't bring its own keys to vouch for itself. The installer checks with the keys in its own package.
 
 The installer verifies the signature with `cosign` when it is installed, or else with the GitHub CLI. With the GitHub CLI it runs `gh attestation verify`, checking the same repository, workflow, tag and commit. It also needs `git` 2.34 or newer and `ssh-keygen` for the tag. An automatic release's tag is checked with the same `cosign` or GitHub CLI. If a tool is missing, it stops and asks you to install it. No flag skips any check. To run code that isn't a signed release, deploy from a checkout you reviewed (`--source`).
 
@@ -143,34 +143,65 @@ If a key is lost or exposed, remove it in a release signed with another listed k
 
 ## The Launch Stack
 
-CloudFormation can't check a signature on a template. So the template is published at one fixed CoderHelm address per release:
+CloudFormation can't check a signature on a template. So the release's parent template is published at one fixed CoderHelm address per release, written once and never replaced:
 
 ```text
-https://coderhelm-public.s3.amazonaws.com/launch/<version>/coderhelm-launch.yaml
+https://coderhelm-public.s3.amazonaws.com/launch/<version>/coderhelm.json
 ```
 
-It is the same file, byte for byte, as `launch-stack.yaml` in that release's signed `SHA256SUMS`. `launch/latest.json` names the newest one and its SHA-256, and it only ever moves forward. The template's installer runs nothing from the release until it has:
+It is the same file, byte for byte, as `coderhelm.json` in that release's signed `SHA256SUMS`; the release workflow checks that before `launch/latest.json` moves. `launch/latest.json` names the newest stable release, its `templateUrl` and the `templateSha256` of its `coderhelm.json`, and it only ever moves forward.
 
-1. installed a cosign pinned by its SHA-256;
-2. checked the tag: on `main`, and signed with the maintainer keys written into the template or attested by `auto-release.yml` on `main`;
-3. checked `SHA256SUMS` against its signature, with the exact identity and the tag's commit;
-4. checked `coderhelm-selfhost.tgz` and `launch-bootstrap.mjs` against `SHA256SUMS`.
+`coderhelm.json` pins everything else. It lists every nested template (`stacks/<Part>.json`) and every code bundle (`assets/<hash>.zip`) with its sha256, and the install helper's code is written inside it. When the stack is created or updated, the install's copy step downloads each of those files from `launch/<version>/`, checks it against the sha256 in `coderhelm.json`, and refuses any file that doesn't match before any part of CoderHelm is created or changed. The nested stacks and functions read only the install's own checked copies. So once `coderhelm.json` checks out, so does everything the stack runs.
 
-The installer then checks the rest of the release the same way. You can check the template yourself before you launch it (below).
+## Verify a release before launching
+
+Check `coderhelm.json` before you launch it, or before you execute an update's change set yourself. Use [cosign](https://docs.sigstore.dev/cosign/system_config/installation/) 2.x.
+
+```sh
+V=v0.9.0
+R=CoderHelm/coderhelm-platform
+COMMIT=$(git ls-remote "https://github.com/$R.git" "refs/tags/$V^{}" | cut -f1)
+
+for f in SHA256SUMS SHA256SUMS.sigstore.json; do
+  curl --proto =https -fsSLO "https://github.com/$R/releases/download/$V/$f"
+done
+curl --proto =https -fsSLO "https://coderhelm-public.s3.amazonaws.com/launch/$V/coderhelm.json"
+
+# 1. The checksums were signed by CoderHelm's release workflow, on this tag, from its commit.
+cosign verify-blob --bundle SHA256SUMS.sigstore.json \
+  --certificate-identity "https://github.com/$R/.github/workflows/release.yml@refs/tags/$V" \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+  --certificate-github-workflow-repository "$R" \
+  --certificate-github-workflow-ref "refs/tags/$V" \
+  --certificate-github-workflow-sha "$COMMIT" \
+  SHA256SUMS
+
+# 2. The template is the signed one (on macOS: shasum -a 256 -c -).
+grep ' coderhelm.json$' SHA256SUMS | sha256sum -c -
+
+# 3. For the newest release: the same sha256 as latest.json names.
+curl --proto =https -fsSL https://coderhelm-public.s3.amazonaws.com/launch/latest.json
+sha256sum coderhelm.json
+```
+
+Step 2 must print `coderhelm.json: OK`, and for the newest release the sha256 in step 3 must equal `templateSha256`. To check that the tag itself is on `main` and vouched for, run step 1 of [Check a release yourself](#check-a-release-yourself) too.
+
+You don't need to check the other files: `coderhelm.json` pins every one of them by sha256, and the install refuses any that doesn't match.
 
 ## What an update may do in your account
 
-Checking the release decides *what* runs. What it may then do in your account is limited separately. This applies to installs made with the Launch Stack, and installs an admin hardened.
+Checking the release decides *what* runs. What it may then do in your account is limited separately.
 
-- **Between updates:** the update build (`coderhelm-<name>-update`) and the Launch Stack's installer hold no deploy rights. Starting them, or editing them, gains nothing.
-- **During an update:** the build asks the updater for a *deploy window*. The updater gives one only to a running build that it started, with exactly the buildspec, image and settings this release defines. The window is bound to that build's session, ends after 100 minutes, and only lets the build deploy CoderHelm's stacks through the install's deploy role. The window ends with the build.
-- **Always:** every CoderHelm role, including the deploy role, carries the install's permissions boundary. It refuses IAM users and keys, IAM outside `coderhelm-<name>-*`, roles without the boundary, Organizations, account settings, CloudTrail, GuardDuty, and assuming the CDK bootstrap's or your roles.
+On an install made with Launch Stack, an update is a stack update to the new release's `coderhelm.json`, prepared as a change set:
 
-So even a release that passed every check above can't create an admin role or reach outside CoderHelm's resources. [What the installer can do in your account](./security.md#what-the-installer-can-do-in-your-account) lists exactly what it can and can't do, what that still leaves open, and the read-only check you can run.
+- **The updater can propose, not choose the code.** It may create a change set only on the install's own stack, and only with a template from `https://coderhelm-public.s3.amazonaws.com/launch/v*.*.*/coderhelm.json`. It proposes one only after the release check verified the release and reported the template's sha256, and only when the template it downloads matches it.
+- **Auto-update off (the default):** there is no deploy role. You review the change set in the CloudFormation console and execute it with your own permissions.
+- **Auto-update on:** the stack adds a CloudFormation service role, `coderhelm-<name>-deploy-stack`, and the updater executes the change set through it in your maintenance window. The updater may pass that role only to CloudFormation. The role can change only CoderHelm's resources.
+- **Always:** every CoderHelm role, including the auto-update role, carries the install's permissions boundary. It refuses IAM users and keys, IAM outside `coderhelm-<name>-*`, roles without the boundary, Organizations, account settings, CloudTrail, GuardDuty, and assuming the CDK bootstrap's or your roles.
 
-**Auto-update** uses the same window, so turning it on adds no standing rights. Turned off, nothing runs between the updates an admin starts, and the build roles stay without deploy rights. Auto-update changes when updates run, not what they may do.
+So even a release that passed every check above can't create an admin role or reach outside CoderHelm's resources. [What an install can do in your account](./security.md#what-an-install-can-do-in-your-account) lists exactly what the updater, the auto-update role and the install helper can and can't do, what that still leaves open, and the read-only check you can run.
 
-An install from before hardening still updates through the CDK bootstrap roles. Updating it to a newer release doesn't change that. An admin moves it over once with `coderhelm-selfhost access harden` ([how](./security.md#installs-from-before-hardening)).
+An install from before native releases updates with a build. If an admin hardened it, the build holds no deploy rights between updates and gets a *deploy window* from the updater only while it runs, bound to its session and ending after 100 minutes; otherwise it updates through the CDK bootstrap roles. [Migrate to one stack](./migrate.md) moves it to the model above.
 
 ## Check a release yourself
 
@@ -205,7 +236,7 @@ else
 fi
 cd ..
 
-for f in SHA256SUMS SHA256SUMS.sigstore.json coderhelm-selfhost.tgz launch-stack.yaml; do
+for f in SHA256SUMS SHA256SUMS.sigstore.json coderhelm-selfhost.tgz coderhelm.json; do
   curl --proto =https -fsSLO "https://github.com/$R/releases/download/$V/$f"
 done
 
@@ -229,14 +260,7 @@ gh attestation verify coderhelm-selfhost.tgz --repo "$R" \
   --deny-self-hosted-runners
 ```
 
-To check the Launch Stack template before you launch it, compare it with the signed one:
-
-```sh
-curl --proto =https -fsSL "https://coderhelm-public.s3.amazonaws.com/launch/$V/coderhelm-launch.yaml" | sha256sum
-grep ' launch-stack.yaml$' SHA256SUMS
-```
-
-The two hashes must be the same.
+To check the Launch Stack template against the copy in S3, see [Verify a release before launching](#verify-a-release-before-launching).
 
 To check `install.sh` before running it, download it with the files above and add `install.sh` to the `for` line. Run step 3, then `sh install.sh`. The script checks the tag and the installer's signature itself before running it. Its maintainer keys are written into it.
 
@@ -244,8 +268,8 @@ To check `install.sh` before running it, download it with the files above and ad
 
 Nothing is installed or changed:
 
-- **Update build:** the history in **Settings, then System** shows the update as failed, with the step that stopped it. Admins get an email. Automatic updates skip that release until an admin tries it again by hand.
+- **Update:** the history in **Settings, then System** shows the update as failed, with the step that stopped it. No change set is proposed. Admins get an email. Automatic updates skip that release until an admin tries it again by hand.
 - **Terminal:** the installer names the check that failed and exits without deploying. For example: *"The release's tag doesn't check out: v0.8.0 is not signed by a CoderHelm maintainer key"*, *"v0.8.0's release attestation is not from CoderHelm/coderhelm-platform/.github/workflows/auto-release.yml on main"*, or *"The release's signature is not CoderHelm's release workflow for v0.8.0"*.
-- **Launch Stack:** the install guide shows *"The release files did not match their signed checksums, so nothing was installed."* The stack ends in a failed state, and you can delete it.
+- **Launch Stack:** a file that doesn't match the sha256 in `coderhelm.json` stops the copy step, which names the file and both sha256s in the stack's events. A first launch rolls back and deletes what it created; an update rolls back to the release that was running. The install guide shows CloudFormation's reason.
 
 A failure on a release that should be good means something between you and GitHub changed the files. Please report it privately (see [Security model](./security.md#reporting-a-problem)).

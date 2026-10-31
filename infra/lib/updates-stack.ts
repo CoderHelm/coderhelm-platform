@@ -77,6 +77,10 @@ export function releaseCheckBuildSpec(cfg: ResolvedConfig): codebuild.BuildSpec 
           // The tag: on main ($COMMIT), signed by a pinned maintainer key or attested by auto-release.yml on main.
           ...verifyTagCommands(),
           VERIFY_SUMS,
+          // A native release's parent template: its sha256 as the signed
+          // SHA256SUMS lists it (the updater checks the downloaded template
+          // against it before it proposes the stack update).
+          "TEMPLATE_SHA256=$(awk '$2==\"coderhelm.json\"{print $1}' SHA256SUMS); export TEMPLATE_SHA256",
           // A signed release from before model manifests lists none.
           "if grep -q ' models.json$' SHA256SUMS; then " +
             `${CURL} -o models.json "$B/models.json"; ` +
@@ -89,7 +93,7 @@ export function releaseCheckBuildSpec(cfg: ResolvedConfig): codebuild.BuildSpec 
         commands: [
           // Anything short of a verified result reports a failure (nothing is trusted).
           'if [ "${CODEBUILD_BUILD_SUCCEEDING:-0}" != "1" ] || [ ! -s /tmp/result.json ]; then echo \'{"status":"failed","reason":"the release check failed: see its log"}\' > /tmp/result.json; fi',
-          'node -e \'const r=require("/tmp/result.json");process.stdout.write(JSON.stringify({action:"models_verified",version:process.env.VERSION,status:r.status,reason:r.reason,manifest:r.manifest??null}))\' > /tmp/payload.json',
+          'node -e \'const r=require("/tmp/result.json");process.stdout.write(JSON.stringify({action:"models_verified",version:process.env.VERSION,status:r.status,reason:r.reason,manifest:r.manifest??null,template_sha256:r.status==="verified"&&/^[0-9a-f]{64}$/.test(process.env.TEMPLATE_SHA256||"")?process.env.TEMPLATE_SHA256:null}))\' > /tmp/payload.json',
           `aws lambda invoke --function-name ${cfg.prefix}-updater --cli-binary-format raw-in-base64-out --payload file:///tmp/payload.json /tmp/out.json`,
         ],
       },
@@ -195,17 +199,21 @@ export function updateBuildSpecObject(cfg: ResolvedConfig): Record<string, unkno
 
 export class UpdatesStack extends cdk.Stack {
   public readonly updaterFunction: lambda.Function;
-  public readonly project: codebuild.Project;
+  /** The update build (absent in a native release: updates are stack updates). */
+  public readonly project?: codebuild.Project;
   public readonly checkProject: codebuild.Project;
 
   constructor(scope: Construct, id: string, props: UpdatesStackProps) {
     super(scope, id, props);
     const cfg = props.cfg;
+    const native = !!cfg.native;
     const prefix = cfg.prefix;
     const stamp = releaseStamp(cfg);
 
-    // --- The update build ---
-    const buildRole = new iam.Role(this, "UpdateBuildRole", {
+    // --- The update build (not in a native release: updates are stack updates) ---
+    let buildRole: iam.Role | undefined;
+    if (!native) {
+    buildRole = new iam.Role(this, "UpdateBuildRole", {
       roleName: `${prefix}-update-build`,
       description: "CoderHelm update build: deploys a release through the CDK bootstrap roles, checks health",
       assumedBy: new iam.ServicePrincipal("codebuild.amazonaws.com"),
@@ -309,6 +317,7 @@ export class UpdatesStack extends cdk.Stack {
       logging: { cloudWatch: { logGroup: buildLogs } },
       buildSpec: updateBuildSpec(cfg),
     });
+    }
 
     // --- The release check (read-only; the model check reads its result) ---
     const checkRole = new iam.Role(this, "ReleaseCheckRole", {
@@ -360,8 +369,9 @@ export class UpdatesStack extends cdk.Stack {
       logGroup: updaterLogs,
       environment: {
         SETTINGS_TABLE_NAME: props.settingsTable.tableName,
-        UPDATE_PROJECT_NAME: this.project.projectName,
-        UPDATE_DEFAULTS: JSON.stringify(cfg.updates.defaults),
+        ...(this.project ? { UPDATE_PROJECT_NAME: this.project.projectName } : {}),
+        // A native release: the launch parameters' JSON (the parent builds it).
+        UPDATE_DEFAULTS: native ? cdk.Fn.ref("UpdateDefaultsJson") : JSON.stringify(cfg.updates.defaults),
         ADMIN_EMAILS: cfg.admins.join(","),
         SES_FROM_ADDRESS: cfg.email.from,
         // The sender name and subject prefix, as the services use them.
@@ -380,7 +390,7 @@ export class UpdatesStack extends cdk.Stack {
         RELEASE_CHECK_PROJECT_NAME: `${prefix}-release-check`,
         CONFIGURED_MODELS: [...new Set([cfg.models.primary, cfg.models.light])].join(","),
         // How update notices are emailed: Settings, Emails, else this.
-        EMAIL_TRANSPORT_DEFAULT: cfg.email.transport,
+        EMAIL_TRANSPORT_DEFAULT: native ? cdk.Fn.ref("EmailTransport") : cfg.email.transport,
         // The install's hybrid registration, read only to email through
         // CoderHelm's mail relay when an admin chose it.
         SECRETS_NAME: cfg.secretName,
@@ -388,7 +398,7 @@ export class UpdatesStack extends cdk.Stack {
         // off, a non-default URL, or nothing (the default).
         ...hybridUrlEnvironment(cfg),
         ...(cfg.updates.webhookUrl ? { UPDATE_WEBHOOK_URL: cfg.updates.webhookUrl } : {}),
-        ...(cfg.access
+        ...(cfg.access && !native
           ? {
               // The deploy window this updater opens (open_window): the role,
               // the buildspec it must see, and where the policy is.
@@ -409,7 +419,7 @@ export class UpdatesStack extends cdk.Stack {
     props.settingsTable.grantReadWriteData(this.updaterFunction);
     this.updaterFunction.addToRolePolicy(new iam.PolicyStatement({
       actions: ["codebuild:StartBuild"],
-      resources: [this.project.projectArn, this.checkProject.projectArn],
+      resources: [...(this.project ? [this.project.projectArn] : []), this.checkProject.projectArn],
     }));
     this.updaterFunction.addToRolePolicy(new iam.PolicyStatement({
       sid: "ReadHybridRegistrationForMail",
@@ -474,7 +484,7 @@ export class UpdatesStack extends cdk.Stack {
       resources: [`arn:aws:ssm:${this.region}:${this.account}:parameter${cfg.distributionDomainParameter}`],
     }));
 
-    if (cfg.access) {
+    if (cfg.access && !native && buildRole && this.project) {
       // The window's statements, in parts that fit standard parameters.
       const parts = windowPolicyParts(cfg.access).map((value, i) => new ssm.StringParameter(this, `WindowPolicy${i + 1}`, {
         parameterName: `/${prefix}/access/window-policy/${i + 1}`,
@@ -484,21 +494,23 @@ export class UpdatesStack extends cdk.Stack {
       this.updaterFunction.addToRolePolicy(new iam.PolicyStatement({
         sid: "OpenAndCloseDeployWindow",
         actions: ["iam:PutRolePolicy", "iam:DeleteRolePolicy"],
-        resources: [buildRole.roleArn],
+        resources: [buildRole!.roleArn],
         conditions: { StringEquals: { "iam:PermissionsBoundary": cfg.access.boundaryArn } },
       }));
       this.updaterFunction.addToRolePolicy(new iam.PolicyStatement({
         sid: "ReadBuildRole",
         actions: ["iam:GetRole", "iam:GetRolePolicy"],
-        resources: [buildRole.roleArn],
+        resources: [buildRole!.roleArn],
       }));
       this.updaterFunction.addToRolePolicy(new iam.PolicyStatement({
         sid: "CheckTheBuild",
         actions: ["codebuild:BatchGetBuilds"],
-        resources: [this.project.projectArn],
+        resources: [this.project!.projectArn],
       }));
       for (const part of parts) part.grantRead(this.updaterFunction);
     }
+
+    if (native) nativeUpdates(this, cfg, this.updaterFunction);
 
     new events.Rule(this, "DomainCheck", {
       ruleName: `${prefix}-domain-check`,
@@ -515,6 +527,66 @@ export class UpdatesStack extends cdk.Stack {
     });
 
     new cdk.CfnOutput(this, "UpdaterFunctionName", { value: this.updaterFunction.functionName });
-    new cdk.CfnOutput(this, "UpdateProjectName", { value: this.project.projectName });
+    if (this.project) new cdk.CfnOutput(this, "UpdateProjectName", { value: this.project.projectName });
   }
+}
+
+/** Where native releases publish their parent template (write-once, by version). */
+export const NATIVE_TEMPLATE_BASE = "https://coderhelm-public.s3.amazonaws.com/launch";
+/** The parent template's file name, in SHA256SUMS and under launch/<version>/. */
+export const NATIVE_TEMPLATE_FILE = "coderhelm.json";
+
+/**
+ * A native release's updates (docs DESIGN, "3. Update"): the updater proposes
+ * a stack update to a verified release as a change set on the parent stack
+ * (`coderhelm-<stage>`) and, only with auto-update on, executes it through the
+ * parent's DeployRole. It may pass that role only to CloudFormation, and
+ * CloudFormation accepts the change set only for this stack, with that role,
+ * from a published release template.
+ */
+function nativeUpdates(scope: Construct, cfg: ResolvedConfig, fn: lambda.Function): void {
+  const stack = cdk.Stack.of(scope);
+  // The parent stack, by its own name (the parent passes AWS::StackName).
+  const rootName = cdk.Fn.ref("RootStackName");
+  const root = `arn:${stack.partition}:cloudformation:${stack.region}:${stack.account}:stack/${rootName}/*`;
+  const parts = `arn:${stack.partition}:cloudformation:${stack.region}:${stack.account}:stack/${rootName}-*/*`;
+  const deployRole = cfg.access!.deployRoleArn.replace(/^arn:aws:/, `arn:${stack.partition}:`);
+  fn.addEnvironment("NATIVE_STACK", rootName);
+  fn.addEnvironment("NATIVE_TEMPLATE_BASE", NATIVE_TEMPLATE_BASE);
+  fn.addEnvironment("NATIVE_TEMPLATE_FILE", NATIVE_TEMPLATE_FILE);
+  // "" while auto-update is off (the role exists only with AutoUpdate=on).
+  fn.addEnvironment("DEPLOY_ROLE_ARN", cdk.Fn.ref("DeployRoleArn"));
+  fn.addToRolePolicy(new iam.PolicyStatement({
+    sid: "ProposeReleaseUpdate",
+    actions: ["cloudformation:CreateChangeSet"],
+    resources: [root],
+    conditions: {
+      StringLike: { "cloudformation:TemplateUrl": [`${NATIVE_TEMPLATE_BASE}/v*.*.*/${NATIVE_TEMPLATE_FILE}`] },
+      // With auto-update on, only through the stack's own deploy role.
+      StringEqualsIfExists: { "cloudformation:RoleArn": deployRole },
+    },
+  }));
+  fn.addToRolePolicy(new iam.PolicyStatement({
+    sid: "ReviewAndApplyReleaseUpdate",
+    actions: [
+      "cloudformation:DescribeChangeSet", "cloudformation:ListChangeSets", "cloudformation:ExecuteChangeSet",
+      "cloudformation:DeleteChangeSet", "cloudformation:DescribeStacks", "cloudformation:DescribeStackEvents",
+      // What CloudFormation actually fetched, compared with the verified template before anything runs.
+      "cloudformation:GetTemplate",
+    ],
+    // The parts' nested change sets too (each data change is checked before auto-update applies it).
+    resources: [root, parts],
+  }));
+  fn.addToRolePolicy(new iam.PolicyStatement({
+    sid: "AutoUpdateThroughDeployRole",
+    actions: ["iam:PassRole"],
+    resources: [deployRole],
+    conditions: { StringEquals: { "iam:PassedToService": "cloudformation.amazonaws.com" } },
+  }));
+  new events.Rule(scope, "NativeUpdatePoll", {
+    ruleName: `${cfg.prefix}-update-poll`,
+    description: "Every 5 minutes: follow a proposed or running stack update",
+    schedule: events.Schedule.rate(cdk.Duration.minutes(5)),
+    targets: [new targets.LambdaFunction(fn, { event: events.RuleTargetInput.fromObject({ action: "native_poll" }) })],
+  });
 }

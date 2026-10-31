@@ -258,7 +258,8 @@ export class WebStack extends cdk.Stack {
       ],
     });
 
-    const hostname = domain ? domain.hostname : this.distribution.distributionDomainName;
+    let hostname = domain ? domain.hostname : this.distribution.distributionDomainName;
+    if (cfg.native) hostname = this.nativeDomain(this.distribution);
     this.publicUrl = `https://${hostname}`;
 
     if (domain && zone) {
@@ -270,11 +271,14 @@ export class WebStack extends cdk.Stack {
 
     // Read by gateway, streaming and worker at start when the URL wasn't
     // known at synth (no custom domain).
-    new ssm.StringParameter(this, "PublicUrlParameter", {
+    const publicUrlParameter = new ssm.StringParameter(this, "PublicUrlParameter", {
       parameterName: cfg.publicUrlParameter,
       stringValue: this.publicUrl,
       description: "CoderHelm's public URL (dashboard and API)",
     });
+    // A native release's URL depends on a condition, which can't cross into
+    // another part: the other parts read it from the parameter (an output).
+    if (cfg.native) this.publicUrl = publicUrlParameter.stringValue;
 
     // CloudFront's own hostname, the target of the DNS record for a domain
     // added later (the updater shows it; docs/self-host/domains.md).
@@ -330,11 +334,54 @@ export class WebStack extends cdk.Stack {
     new cdk.CfnOutput(this, "GithubWebhookUrl", { value: `${this.publicUrl}/webhooks/github` });
     new cdk.CfnOutput(this, "DistributionId", { value: this.distribution.distributionId });
     new cdk.CfnOutput(this, "DashboardBucketName", { value: bucket.bucketName });
-    if (domain && !zone) {
+    if (domain && !zone && !cfg.native) {
       new cdk.CfnOutput(this, "DnsRecord", {
         value: `${domain.hostname} CNAME ${this.distribution.distributionDomainName}`,
         description: "Create this DNS record at your DNS provider",
       });
     }
+  }
+
+  /**
+   * A native release's own domain: stack parameters, not a redeploy. The
+   * updater requests the certificate (Settings, System, or the Hostname
+   * launch parameter through the parent's Domain custom resource), then
+   * proposes a stack update that sets DomainName and DomainCertificateArn
+   * (and DomainZoneId when the zone is in Route 53 here, for the alias
+   * records). Empty values: CloudFront's own address.
+   */
+  private nativeDomain(distribution: cloudfront.Distribution): string {
+    const name = new cdk.CfnParameter(this, "DomainName", { type: "String", default: "" });
+    const cert = new cdk.CfnParameter(this, "DomainCertificateArn", { type: "String", default: "" });
+    const zoneId = new cdk.CfnParameter(this, "DomainZoneId", { type: "String", default: "" });
+    const has = new cdk.CfnCondition(this, "HasDomain", {
+      expression: cdk.Fn.conditionAnd(
+        cdk.Fn.conditionNot(cdk.Fn.conditionEquals(name.valueAsString, "")),
+        cdk.Fn.conditionNot(cdk.Fn.conditionEquals(cert.valueAsString, "")),
+      ),
+    });
+    const inZone = new cdk.CfnCondition(this, "HasDomainZone", {
+      expression: cdk.Fn.conditionAnd(has, cdk.Fn.conditionNot(cdk.Fn.conditionEquals(zoneId.valueAsString, ""))),
+    });
+    const cfn = distribution.node.defaultChild as cloudfront.CfnDistribution;
+    cfn.addPropertyOverride("DistributionConfig.Aliases", cdk.Fn.conditionIf(has.logicalId, [name.valueAsString], cdk.Aws.NO_VALUE));
+    cfn.addPropertyOverride(
+      "DistributionConfig.ViewerCertificate",
+      cdk.Fn.conditionIf(
+        has.logicalId,
+        { AcmCertificateArn: cert.valueAsString, SslSupportMethod: "sni-only", MinimumProtocolVersion: "TLSv1.2_2021" },
+        cdk.Aws.NO_VALUE,
+      ),
+    );
+    for (const type of ["A", "AAAA"]) {
+      const r = new route53.CfnRecordSet(this, `NativeAlias${type}`, {
+        hostedZoneId: zoneId.valueAsString,
+        name: name.valueAsString,
+        type,
+        aliasTarget: { dnsName: distribution.distributionDomainName, hostedZoneId: "Z2FDTNDATAQYW2" },
+      });
+      r.cfnOptions.condition = inZone;
+    }
+    return cdk.Token.asString(cdk.Fn.conditionIf(has.logicalId, name.valueAsString, distribution.distributionDomainName));
   }
 }

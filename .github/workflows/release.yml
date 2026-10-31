@@ -262,13 +262,6 @@ jobs:
           (cd installer && npm version --no-git-tag-version --allow-same-version "${TAG#v}" >/dev/null && npm pack --silent --pack-destination ../dist >/dev/null)
           mv dist/coderhelm-selfhost-*.tgz dist/coderhelm-selfhost.tgz
           cp selfhost/install.sh dist/install.sh
-          # The Launch Stack template, pinned to this release, and the
-          # installer its CodeBuild project runs (checked against SHA256SUMS).
-          # The publish job uploads this same launch-stack.yaml to S3.
-          node selfhost/launch/stamp-template.mjs infra/cfn/coderhelm-selfhost-launch.yaml "$TAG" > dist/launch-stack.yaml
-          # The guided uninstall's stack, pinned to this release the same way.
-          node selfhost/launch/stamp-template.mjs infra/cfn/coderhelm-selfhost-uninstall.yaml "$TAG" > dist/uninstall-stack.yaml
-          cp selfhost/launch/bootstrap.mjs dist/launch-bootstrap.mjs
           # The read-only role teams create in their own AWS accounts, and the
           # stack that brings an existing role up to date: byte for byte the
           # templates built into this release's gateway
@@ -281,8 +274,6 @@ jobs:
           # SHA256SUMS: the updater reads it only through the update build,
           # after the signature check (lambda/updater, model_check).
           node selfhost/launch/release-models.mjs "$TAG" > dist/models.json
-          (cd dist && sha256sum gateway.zip worker.zip mcp-proxy.zip dashboard.tar.gz source.tar.gz coderhelm-selfhost.tgz install.sh launch-stack.yaml uninstall-stack.yaml launch-bootstrap.mjs models.json coderhelm-log-reader.yaml coderhelm-log-reader-update.yaml > SHA256SUMS)
-          cat dist/SHA256SUMS
 
       # The release's own CDK app synthesizes for a fresh self-host config.
       - name: Synth check
@@ -295,6 +286,29 @@ jobs:
           npm ci
           mkdir -p "$RUNNER_TEMP/dash" && tar -xzf ../dist/dashboard.tar.gz -C "$RUNNER_TEMP/dash"
           CODERHELM_DASHBOARD_DIR="$RUNNER_TEMP/dash" npx cdk synth --all --quiet -c config=config/selfhost.example.json -o "$RUNNER_TEMP/synth"
+
+      # The native release (one CloudFormation stack per install): the parent
+      # template Launch Stack opens, and the parts and code it pins by
+      # sha256 (infra/lib/native). coderhelm.json is in the signed
+      # SHA256SUMS; every other native file is checked against the sha256 in
+      # coderhelm.json, by the install itself before anything runs.
+      - name: Native release
+        working-directory: infra
+        env:
+          GATEWAY_ZIP: ${{ github.workspace }}/dist/gateway.zip
+          WORKER_ZIP: ${{ github.workspace }}/dist/worker.zip
+          MCP_PROXY_DIR: ${{ github.workspace }}/dist/mcp-proxy.zip
+        run: |
+          npx tsc -p .
+          CODERHELM_DASHBOARD_DIR="$RUNNER_TEMP/dash" node dist/lib/native/build.js "$TAG" "$RUNNER_TEMP/native"
+          pip install --quiet cfn-lint==1.58.0
+          cfn-lint -i W3005 -i W2531 -- "$RUNNER_TEMP/native/coderhelm.json" "$RUNNER_TEMP/native"/stacks/*.json
+          cp "$RUNNER_TEMP/native/coderhelm.json" ../dist/coderhelm.json
+          tar -czf ../dist/coderhelm-native.tar.gz -C "$RUNNER_TEMP/native" stacks assets
+      - name: Checksums
+        run: |
+          (cd dist && sha256sum gateway.zip worker.zip mcp-proxy.zip dashboard.tar.gz source.tar.gz coderhelm-selfhost.tgz install.sh coderhelm.json coderhelm-native.tar.gz models.json coderhelm-log-reader.yaml coderhelm-log-reader-update.yaml > SHA256SUMS)
+          cat dist/SHA256SUMS
 
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
@@ -361,9 +375,8 @@ jobs:
             dist/source.tar.gz
             dist/coderhelm-selfhost.tgz
             dist/install.sh
-            dist/launch-bootstrap.mjs
-            dist/launch-stack.yaml
-            dist/uninstall-stack.yaml
+            dist/coderhelm.json
+            dist/coderhelm-native.tar.gz
             dist/models.json
             dist/coderhelm-log-reader.yaml
             dist/coderhelm-log-reader-update.yaml
@@ -393,7 +406,7 @@ jobs:
       # bucket (infra/lib/log-analyzer-stack.ts), by version, and latest.json
       # names the newest stable one for the install guide
       # (docs.coderhelm.com/self-host/install). The template is byte for byte
-      # the launch-stack.yaml in the signed SHA256SUMS.
+      # the coderhelm.json in the signed SHA256SUMS.
       # Two roles (infra/lib/worker-stack.ts), each trusting only this file
       # on a v* tag in the "release" environment:
       #   release-publisher  creates objects under launch/v*/, never replaces
@@ -410,16 +423,31 @@ jobs:
       - name: Upload the templates
         if: needs.check.outputs.path == 'maintainer'
         run: |
-          # Written once: a template already there must be this one.
-          for pair in launch-stack.yaml:coderhelm-launch.yaml uninstall-stack.yaml:coderhelm-uninstall.yaml coderhelm-log-reader.yaml:coderhelm-log-reader.yaml coderhelm-log-reader-update.yaml:coderhelm-log-reader-update.yaml; do
-            src="dist/${pair%%:*}"
-            k="launch/$TAG/${pair#*:}"
-            if curl --proto =https -fsSL -o "$RUNNER_TEMP/existing" "https://$PUBLIC_BUCKET.s3.amazonaws.com/$k"; then
-              cmp -s "$RUNNER_TEMP/existing" "$src" || { echo "::error::$k already holds another template"; exit 1; }
+          # Written once: a file already there must be this one.
+          put() {
+            if curl --proto =https -fsSL -o "$RUNNER_TEMP/existing" "https://$PUBLIC_BUCKET.s3.amazonaws.com/$2"; then
+              cmp -s "$RUNNER_TEMP/existing" "$1" || { echo "::error::$2 already holds another file"; exit 1; }
             else
-              aws s3api put-object --bucket "$PUBLIC_BUCKET" --key "$k" --body "$src" --if-none-match '*' --content-type text/yaml --cache-control "public, max-age=31536000, immutable" >/dev/null
+              aws s3api put-object --bucket "$PUBLIC_BUCKET" --key "$2" --body "$1" --if-none-match '*' --content-type "$3" --cache-control "public, max-age=31536000, immutable" >/dev/null
             fi
-          done
+          }
+          for f in coderhelm-log-reader.yaml coderhelm-log-reader-update.yaml; do put "dist/$f" "launch/$TAG/$f" text/yaml; done
+          # The native files, each checked against the sha256 coderhelm.json pins, then the parent last.
+          mkdir -p "$RUNNER_TEMP/native" && tar -xzf dist/coderhelm-native.tar.gz -C "$RUNNER_TEMP/native"
+          # shellcheck disable=SC2016 # JavaScript, not shell
+          node -e '
+            const fs = require("fs"), c = require("crypto");
+            const t = JSON.parse(fs.readFileSync("dist/coderhelm.json", "utf8"));
+            for (const f of t.Resources.ReleaseAssets.Properties.Files) {
+              const got = c.createHash("sha256").update(fs.readFileSync(process.env.RUNNER_TEMP + "/native/" + f.Key)).digest("hex");
+              if (got !== f.Sha256) { console.error(`${f.Key} is not the file coderhelm.json pins`); process.exit(1); }
+              console.log(f.Key);
+            }' > "$RUNNER_TEMP/native-files"
+          while read -r k; do
+            case "$k" in *.json) ct=application/json ;; *) ct=application/zip ;; esac
+            put "$RUNNER_TEMP/native/$k" "launch/$TAG/$k" "$ct"
+          done < "$RUNNER_TEMP/native-files"
+          put dist/coderhelm.json "launch/$TAG/coderhelm.json" application/json
 
       # The published release, downloaded from GitHub, checks out as an
       # install checks it: the signature, from this tag's commit, and every
@@ -439,8 +467,8 @@ jobs:
             --certificate-github-workflow-sha "$GITHUB_SHA" \
             "$d/SHA256SUMS"
           (cd "$d" && sha256sum -c SHA256SUMS)
-          curl --proto =https -fsSL "https://$PUBLIC_BUCKET.s3.amazonaws.com/launch/$TAG/coderhelm-launch.yaml" | cmp -s - "$d/launch-stack.yaml" \
-            || { echo "::error::the template in S3 is not the signed launch-stack.yaml"; exit 1; }
+          curl --proto =https -fsSL "https://$PUBLIC_BUCKET.s3.amazonaws.com/launch/$TAG/coderhelm.json" | cmp -s - "$d/coderhelm.json" \
+            || { echo "::error::the template in S3 is not the signed coderhelm.json"; exit 1; }
       - uses: aws-actions/configure-aws-credentials@7474bc4690e29a8392af63c5b98e7449536d5c3a # v4.3.1
         if: ${{ needs.check.outputs.path == 'maintainer' && !contains(needs.check.outputs.tag, '-') }}
         with:
@@ -457,7 +485,7 @@ jobs:
           current=$(curl --proto =https -fsSL -D "$headers" "https://$PUBLIC_BUCKET.s3.amazonaws.com/launch/latest.json" 2>/dev/null || echo '{}')
           etag=$(sed -n 's/^[Ee][Tt][Aa][Gg]: *//p' "$headers" 2>/dev/null | tr -d '\r' | head -n1)
           # shellcheck disable=SC2016 # JavaScript, not shell
-          CURRENT="$current" SHA=$(sha256sum dist/launch-stack.yaml | cut -d' ' -f1) node -e '
+          CURRENT="$current" SHA=$(sha256sum dist/coderhelm.json | cut -d' ' -f1) node -e '
             const tag = process.env.TAG;
             const n = (v) => String(v || "v0.0.0").replace(/^v/, "").split(/[.-]/).slice(0, 3).map(Number);
             let cur = {};
@@ -468,7 +496,7 @@ jobs:
             const bucket = process.env.PUBLIC_BUCKET;
             require("fs").writeFileSync("latest.json", JSON.stringify({
               version: tag,
-              templateUrl: `https://${bucket}.s3.amazonaws.com/launch/${tag}/coderhelm-launch.yaml`,
+              templateUrl: `https://${bucket}.s3.amazonaws.com/launch/${tag}/coderhelm.json`,
               templateSha256: process.env.SHA,
               publishedAt: new Date().toISOString(),
             }));
