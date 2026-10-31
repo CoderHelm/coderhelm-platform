@@ -51,7 +51,9 @@ def problems(b, user_id, role_id):
         if v.get("type", "PLAINTEXT") != "PLAINTEXT" or (n not in want and n != "WAIT_URL"):
             p.append("it sets " + str(n))
         elif n == "WAIT_URL":
-            if v.get("value") and not str(v.get("value")).startswith("https://cloudformation-waitcondition-"): p.append("it sets WAIT_URL")
+            host = re.match(r"^https://([^/?#]+)/", str(v.get("value") or ""))
+            if v.get("value") and not (host and re.fullmatch(r"cloudformation-waitcondition-[a-z0-9-]+\.s3(\.[a-z0-9-]+)?\.amazonaws\.com", host.group(1))):
+                p.append("it sets WAIT_URL")
         elif v.get("value") != want[n]:
             p.append("it changes " + str(n))
     if not str(b.get("serviceRole") or "").endswith(":role/" + E["ROLE"]): p.append("it runs as another role")
@@ -139,7 +141,17 @@ def discover(stage, account, region, cfn, s3, tags, secrets, iam=None, own_statu
                     others.add(m.group(1))
     others |= tagged
     sib = sorted(x for x in others if x.startswith(prefix + "-") and re.fullmatch("coderhelm-" + NAME, x))
-    anchored = bool(launch) or prefix in tagged or secret_here
+    # A regional resource tagged for the install (CloudFront and Route 53 are global: in us-east-1 they show for any region's install).
+    regional = False
+    if prefix in tagged:
+        kw = {"TagFilters": [{"Key": "coderhelm:install", "Values": [prefix]}]}
+        while not regional:
+            r = tags.get_resources(**kw)
+            regional = any(":" + region + ":" in a["ResourceARN"] for a in r.get("ResourceTagMappingList", []))
+            if not r.get("PaginationToken"):
+                break
+            kw["PaginationToken"] = r["PaginationToken"]
+    anchored = bool(launch) or regional or secret_here
     return {"ids": sorted(ids), "launch": sorted(launch), "setup": sorted(setup), "siblings": sib, "buckets": buckets, "data": data, "anchored": anchored}
 
 

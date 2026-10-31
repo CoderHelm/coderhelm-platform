@@ -58,7 +58,7 @@ export function isOurName(scope, name) {
   const n = String(name ?? "");
   const P = scope.prefix;
   if (n !== P && !n.startsWith(`${P}-`)) return false;
-  if (n.startsWith(`${P}-uninstall`)) return false;
+  if (n.startsWith("coderhelm--")) return false;
   return !scope.siblings.some((s) => n === s || n.startsWith(`${s}-`));
 }
 
@@ -191,7 +191,8 @@ export async function discover(ctx, base, { mode = "keep", installStatus = "", o
   const aliases = (await pages(aws, "kms", "list-aliases", [], "Aliases")).filter((a) => isOurName(scope, String(a.AliasName).replace(/^alias\//, "")));
   inv.aliases = aliases.map((a) => ({ name: a.AliasName, key: a.TargetKeyId }));
   const keyIds = new Set(inv.tagged.filter((a) => a.includes(":key/")).map((a) => a.split("/").pop()));
-  if (!strictTags) for (const a of aliases) if (a.TargetKeyId) keyIds.add(a.TargetKeyId);
+  // An older install's keys carry no tag: behind its aliases, and only for an install from before hardening (no Launch Stack ids).
+  if (!strictTags && !inv.ids.length) for (const a of aliases) if (a.TargetKeyId) keyIds.add(a.TargetKeyId);
   for (const id of keyIds) {
     const k = (await aws.read("kms", "describe-key", ["--key-id", id]))?.KeyMetadata;
     if (!k || k.KeyManager !== "CUSTOMER") continue;
@@ -221,7 +222,7 @@ export async function discover(ctx, base, { mode = "keep", installStatus = "", o
     }
   }
   for (const p of await pages(aws, "ssm", "get-parameters-by-path", ["--path", `/${P}`, "--recursive"], "Parameters")) {
-    if (p.Name.startsWith(`/${P}/`) && !p.Name.startsWith(`/${P}/uninstall-`)) inv.params.push(p.Name);
+    if (p.Name.startsWith(`/${P}/`)) inv.params.push(p.Name);
   }
 
   // IAM (global): the boundaries and roles of this region's Launch Stacks, and roles tagged for the install.
@@ -244,7 +245,9 @@ export async function discover(ctx, base, { mode = "keep", installStatus = "", o
     } else inv.skipped.push({ kind: "role", name: r.RoleName, why: tag && tag !== P ? `tagged for ${tag}` : "carries none of this region's install boundaries" });
   }
   // Something of the install must be in this region (a Launch Stack, its tag or its secret) before anything is removed.
-  inv.anchored = inv.launch.length > 0 || inv.tagged.length > 0 || inv.secrets.length > 0 || (!strictTags && inv.stacks.length > 0);
+  // CloudFront and Route 53 are global: in us-east-1 they show for any region's install, so they don't count.
+  const regional = inv.tagged.some((a) => a.includes(`:${region}:`));
+  inv.anchored = inv.launch.length > 0 || regional || inv.secrets.length > 0;
   return inv;
 }
 

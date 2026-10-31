@@ -197,7 +197,8 @@ test("an install's names: its own, never a longer install's, never the uninstall
   assert.ok(un.isOurName(s, "coderhelm-prod-runs"));
   assert.ok(!un.isOurName(s, "coderhelm-prod-eu"));
   assert.ok(!un.isOurName(s, "coderhelm-prod-eu-runs"));
-  assert.ok(!un.isOurName(s, "coderhelm-prod-uninstall-build-5e6f7a8b"));
+  assert.ok(!un.isOurName(s, "coderhelm--uninstall-prod-build-5e6f7a8b"));
+  assert.ok(un.isOurName(s, "coderhelm-prod-uninstallnotes"), "an install resource named that way is still the install's");
   assert.ok(!un.isOurName(s, "coderhelm-production"));
   assert.ok(!un.isOurName(s, "coderhelm-pro"));
   assert.ok(un.isLaunchName(s, "coderhelm-prod") && un.isLaunchName(s, "coderhelm-prod-2") && !un.isLaunchName(s, "coderhelm-prod-api"));

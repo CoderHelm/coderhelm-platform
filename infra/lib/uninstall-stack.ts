@@ -238,7 +238,7 @@ export function uninstallTemplate(): Record<string, unknown> {
               { Sid: "WriteTheWindow", Effect: "Allow", Action: ["iam:GetRole", "iam:PutRolePolicy"], Resource: roleArn(n.buildRole) },
               { Sid: "WindowStatements", Effect: "Allow", Action: "ssm:GetParameter", Resource: `${P}:ssm:\${AWS::Region}:\${AWS::AccountId}:parameter${n.paramPath}/*` },
               // Read-only: what it finds decides only which of this install's names go in the window.
-              { Sid: "FindTheInstall", Effect: "Allow", Action: ["cloudformation:ListStacks", "cloudformation:DescribeStacks", "s3:ListAllMyBuckets", "tag:GetTagValues", "secretsmanager:ListSecrets", "iam:ListPolicies"], Resource: "*" },
+              { Sid: "FindTheInstall", Effect: "Allow", Action: ["cloudformation:ListStacks", "cloudformation:DescribeStacks", "s3:ListAllMyBuckets", "tag:GetTagValues", "tag:GetResources", "secretsmanager:ListSecrets", "iam:ListPolicies"], Resource: "*" },
               { Sid: "BucketRegions", Effect: "Allow", Action: "s3:GetBucketLocation", Resource: `${P}:s3:::coderhelm-\${Stage}-*` },
               { Sid: "InstallProgress", Effect: "Allow", Action: "s3:GetObject", Resource: `${P}:s3:::coderhelm-setup-\${InstallStatusId}/status.json` },
             ],

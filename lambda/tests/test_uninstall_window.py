@@ -98,8 +98,14 @@ class S3:
 
 
 class Tags:
+    def __init__(self, arns=None):
+        self.arns = arns if arns is not None else ["arn:aws:dynamodb:us-east-1:111122223333:table/coderhelm-prod-runs"]
+
     def get_tag_values(self, **kw):
         return {"TagValues": ["coderhelm-prod", "coderhelm-prod-eu", "coderhelm-production", "my-app"]}
+
+    def get_resources(self, **kw):
+        return {"ResourceTagMappingList": [{"ResourceARN": a} for a in self.arns]}
 
 
 class Iam:
@@ -156,14 +162,16 @@ class Discover(unittest.TestCase):
 
     def test_nothing_of_the_install_in_this_region_is_no_anchor(self):
         cfn, s3 = world()
-        f = W.discover("prod", A, "us-west-2", Cfn({}), s3, type("T", (), {"get_tag_values": lambda self, **k: {"TagValues": ["coderhelm-prod"]}})(), Secrets(), Iam())
-        self.assertTrue(f["anchored"], "its tag is here")
-        class NoTags:
-            def get_tag_values(self, **k):
-                return {"TagValues": []}
         class NoSecrets:
             def get_paginator(self, op):
                 return Paginator([{"SecretList": []}])
+        f = W.discover("prod", A, "us-west-2", Cfn({}), s3, Tags(["arn:aws:dynamodb:us-west-2:111122223333:table/coderhelm-prod-runs"]), NoSecrets(), Iam())
+        self.assertTrue(f["anchored"], "a regional resource tagged for it is here")
+        f = W.discover("prod", A, "us-east-1", Cfn({}), s3, Tags(["arn:aws:cloudfront::111122223333:distribution/E2QWRUHEXAMPLE"]), NoSecrets(), Iam())
+        self.assertFalse(f["anchored"], "a global CloudFront distribution shows in us-east-1 for any region's install")
+        class NoTags:
+            def get_tag_values(self, **k):
+                return {"TagValues": []}
         f = W.discover("prod", A, "us-west-2", Cfn({}), s3, NoTags(), NoSecrets(), Iam())
         self.assertFalse(f["anchored"])
         self.assertEqual((f["buckets"], f["data"]), ([], []), "us-east-1's buckets of the name are not us-west-2's")
@@ -279,6 +287,7 @@ class Window(unittest.TestCase):
         self.refused("changes VERSION", environment={**env, "environmentVariables": [{"name": "VERSION", "value": "v0.1.0"}]})
         self.refused("changes MODE", environment={**env, "environmentVariables": [{"name": "MODE", "value": "everything"}]})
         self.refused("WAIT_URL", environment={**env, "environmentVariables": [{"name": "WAIT_URL", "value": "https://evil.example/x"}]})
+        self.refused("WAIT_URL", environment={**env, "environmentVariables": [{"name": "WAIT_URL", "value": "https://cloudformation-waitcondition-x.attacker.example/x"}]})
         self.refused("debug session", debugSession={"sessionEnabled": True})
         self.refused("another fleet", fleet={"fleetArn": "x"})
         self.refused("starter did not start it", initiator="someone/else")
