@@ -24,7 +24,8 @@ The guide's checks come from the install's public `GET /api/setup/status`, the s
 - `checks[]` (`id`, `label`, `status`, `code`, `required`) for `api`, `github_app`, `github_installed`, `models`, `email`, `domain`, `updates`, `admin` and, on a hybrid install, the `hybrid_*` checks (`hybrid_registered`, `hybrid_name`, `hybrid_github`, `hybrid_jira`, `hybrid_access`, `hybrid_relay`), each code mapped to one sentence and a fix; an unknown check shows by its label.
 - `domain`: when you chose your own domain, the guide shows a Domain step between AWS and GitHub, checks until the code is `ok`, then follows the install to the domain (so the GitHub App gets the domain's URLs). The records to add are in Settings, then System. You can skip it and add the domain later there.
 - `github_manifest_ready`: one click when true; the terminal command (`pull`, then `github-app`) when false.
-- `setup_open: false` (someone has signed up): the install is shown as ready.
+- `setup_open: false` (someone has signed up): the install is shown as ready. A hybrid install with **Link through CoderHelm** on still reports `hybrid_jira` then, because linking a Jira site needs an install admin: the guide's Jira step follows it until `ok`.
+- `POST /api/setup/hybrid/settings` (with the setup key, while nobody has signed up) takes `github_mode`, `sharing` and `jira_link`; the guide sends `jira_link: true` when **Use CoderHelm's Jira app** is on, so the install reports `hybrid_jira` from then on.
 
 The answer carries no ids or URLs, so the guide makes its own links: the Bedrock console for the region it launched in, the models a new install calls (the release's defaults with the region's inference profile prefix), the SES console for that region, and `https://github.com/apps/<slug>/installations/new` from the slug the manifest landing hands back.
 

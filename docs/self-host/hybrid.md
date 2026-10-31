@@ -4,13 +4,14 @@ description: Run CoderHelm in your AWS account and use CoderHelm's address, GitH
 order: 1.7
 ---
 
-A **hybrid** install runs entirely in your AWS account, like any self-hosted CoderHelm, and borrows up to three things from CoderHelm's hosted side so you don't have to set them up yourself:
+A **hybrid** install runs entirely in your AWS account, like any self-hosted CoderHelm, and borrows up to four things from CoderHelm's hosted side so you don't have to set them up yourself:
 
 | Part | Instead of | What you get |
 |---|---|---|
 | **A CoderHelm address**, `yourname.coderhelm.com` | buying a domain and adding DNS records | a real address with HTTPS in a few minutes, set up end to end |
 | **CoderHelm's GitHub App**, through the event relay | creating and keeping your own GitHub App | install one app on your organization; events and tokens arrive at your install |
-| **CoderHelm's integration apps** (Jira, Notion, Confluence, Google Drive) | registering an app with each provider | sign in with one click, as on coderhelm.com |
+| **CoderHelm's Jira app**, through the event relay | setting up your own Jira app | link your Jira site once; its events arrive at your install, without the app's secret |
+| **CoderHelm's integration apps** (Notion, Confluence, Google Drive) | registering an app with each provider | sign in with one click, as on coderhelm.com |
 
 Each part is a separate choice, at install time (the [install guide](/self-host/install/)) or later in **Settings, System, Hybrid**. **Fully private** (your own domain or the AWS address, your own GitHub App and apps) stays the default and sends nothing to CoderHelm.
 
@@ -75,6 +76,8 @@ A forward that fails is retried with growing waits for about 24 hours. Both side
 
 A team that uses hosted CoderHelm with CoderHelm's Jira app can move that Jira site to its hybrid install without touching Jira: CoderHelm keeps receiving the site's events and forwards them to the install, the same way it forwards GitHub's.
 
+**In the install guide**, **Use CoderHelm's Jira app** (under What CoderHelm sets up for you) is on by default in the hybrid setup and can be turned off. With it on, the guide turns on **Link through CoderHelm** in your install as soon as it registers (with its setup key), and after Claude answers it shows a **Jira** step: sign up as the admin if you haven't, type your Jira site's address, and **Open Settings, Integrations, Jira** opens your install there with the site filled in (`/settings/integrations/jira/?link=coderhelm&site=<site>#link`). Steps 1 to 3 below follow; the guide checks `hybrid_jira` every few seconds until it's `ok`. **Link later in Settings** skips the step.
+
 1. On your install, open **Settings, Integrations, Jira**, turn on **Link through CoderHelm**, type your Jira site's address (`example.atlassian.net`) and press **Link**. Your install asks CoderHelm (signed, install admins only) for a one-hour link for that site, and shows a **confirmation code** and **Open CoderHelm to confirm**.
 2. A CoderHelm page opens (app.coderhelm.com, **Settings, Integrations, Jira**). Sign in as an **admin of the hosted team that runs CoderHelm's Jira app on that site**. The page names your install's address, when it registered with CoderHelm, and the site, and links nothing until you type the confirmation code your install shows and press **Link**: a link someone else got hold of can't be confirmed without it. It refuses when the team's site isn't the one your install asked for, when the team doesn't run the Jira app on a site (a plain webhook alone isn't proof), when the site is already linked to another install, or when your install already has another team's site. Support views and API keys can't link.
 3. You come back to your install linked.
@@ -87,7 +90,7 @@ From then on CoderHelm checks each event of that site first, exactly as it does 
 
 The **Jira app relay** above is the other way round: a Jira site whose own Jira app is set up with your install's id, without a hosted team.
 
-The Setup checks show the link as `hybrid_jira` (in Settings, Setup and the install guide's `/api/setup/status`): `no_link` (todo) until it is linked, `syncing` (wait) while your install fetches the proxy settings, `ok` once linked.
+The Setup checks show the link as `hybrid_jira` (in Settings, Setup and the install guide's `/api/setup/status`): `no_link` (todo) until it is linked, `syncing` (wait) while your install fetches the proxy settings, `ok` once linked. Linking needs an install admin, so `/api/setup/status` keeps reporting this one check (its code only) after someone has signed up, while Link through CoderHelm is on.
 
 ## Integrations
 

@@ -1328,6 +1328,11 @@ pub struct GuideBody {
     integrations: Option<Vec<String>>,
     #[serde(default)]
     sharing: Option<SharingBody>,
+    /// The guide's "Use CoderHelm's Jira app": turns on Settings,
+    /// Integrations, Jira, "Link through CoderHelm" (linking itself needs an
+    /// install admin, after sign-up).
+    #[serde(default)]
+    jira_link: Option<bool>,
 }
 
 fn guide_body(body: &[u8]) -> GuideBody {
@@ -1410,7 +1415,7 @@ pub async fn setup_github_link(
     guide_reply(r)
 }
 
-/// POST /api/setup/hybrid/settings `{setup_token, github_mode?, integrations?, sharing?}`
+/// POST /api/setup/hybrid/settings `{setup_token, github_mode?, integrations?, sharing?, jira_link?}`
 pub async fn setup_settings(
     State(state): State<Arc<AppState>>,
     body: Bytes,
@@ -1422,7 +1427,7 @@ pub async fn setup_settings(
             github_mode: b.github_mode.clone(),
             integrations: b.integrations.clone(),
             sharing: b.sharing.clone(),
-            jira_link: None,
+            jira_link: b.jira_link,
         };
         do_settings(&state, &s).await?;
         Ok(Json(status_value(&state, false).await))
@@ -1812,13 +1817,63 @@ pub async fn public_checks(state: &AppState) -> Vec<Value> {
         sync_name_records(state, view.as_ref()).await;
         Some(super::setup_checks::domain_code(&facts).1)
     };
-    checks(&l, creds.is_some(), hosted.as_ref(), code, recent_intake_problem())
-        .into_iter()
-        .map(|c| {
-            let id = c["id"].as_str().unwrap_or("").to_string();
-            json!({ "id": id, "status": c["status"], "code": c["code"], "label": public_label(&id), "required": false })
-        })
-        .collect()
+    checks(
+        &l,
+        creds.is_some(),
+        hosted.as_ref(),
+        code,
+        recent_intake_problem(),
+    )
+    .iter()
+    .map(public_check)
+    .collect()
+}
+
+/// One hybrid check as the public status shows it: id, status, code and the
+/// fixed label (never the title, which can name the site or the address).
+pub fn public_check(c: &Value) -> Value {
+    let id = c["id"].as_str().unwrap_or("").to_string();
+    json!({ "id": id, "status": c["status"], "code": c["code"], "label": public_label(&id), "required": false })
+}
+
+/// The `hybrid_jira` check alone, for the public status once someone has
+/// signed up: linking a Jira site needs an install admin, so it happens
+/// after the setup window closes and the install guide follows it there.
+/// `None` when Link through CoderHelm is off, the install isn't registered,
+/// or CoderHelm didn't answer (the guide then shows nothing rather than a
+/// wrong "not linked"). Kept 10 seconds (3 with `fresh`).
+pub async fn public_jira_check(state: &AppState, fresh: bool) -> Option<Value> {
+    static KEPT: Mutex<Option<(Instant, Option<Value>)>> = Mutex::new(None);
+    let keep = Duration::from_secs(if fresh { 3 } else { 10 });
+    if let Some((at, v)) = KEPT.lock().ok().and_then(|g| g.clone()) {
+        if at.elapsed() < keep {
+            return v;
+        }
+    }
+    let l = local(state).await;
+    let v = if !l.jira_link {
+        None
+    } else {
+        match creds_now().await {
+            None => None,
+            Some(c) => client::call(&state.http, &c, "GET", "/hybrid/status", None)
+                .await
+                .ok()
+                .and_then(|h| jira_public_check(&l, &h)),
+        }
+    };
+    if let Ok(mut g) = KEPT.lock() {
+        *g = Some((Instant::now(), v.clone()));
+    }
+    v
+}
+
+/// The public `hybrid_jira` check from CoderHelm's status answer (pure; tested).
+pub fn jira_public_check(l: &Local, hosted: &Value) -> Option<Value> {
+    checks(l, true, Some(hosted), None, None)
+        .iter()
+        .find(|c| c["id"] == "hybrid_jira")
+        .map(public_check)
 }
 
 /// How many GitHub installations are linked to this install (0 when unknown).
@@ -1986,9 +2041,23 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("example.atlassian.net"));
+        // The public form (after sign-up): codes and the fixed label only,
+        // never the site.
+        let p = jira_public_check(&l, &linked).unwrap();
+        assert_eq!(
+            (p["code"].as_str(), p["status"].as_str()),
+            (Some("ok"), Some("pass"))
+        );
+        assert_eq!(p["label"], "Jira through CoderHelm");
+        assert_eq!(p["required"], false);
+        assert!(!p.to_string().contains("atlassian"));
+        l.jira_synced_at.clear();
+        assert_eq!(jira_public_check(&l, &linked).unwrap()["code"], "syncing");
+        assert_eq!(jira_public_check(&l, &hosted).unwrap()["code"], "no_link");
         // Off: no Jira row at all.
         l.jira_link = false;
         assert!(row(&l, &linked).is_none());
+        assert!(jira_public_check(&l, &linked).is_none());
         assert_eq!(public_label("hybrid_jira"), "Jira through CoderHelm");
     }
 
