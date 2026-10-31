@@ -235,6 +235,23 @@ export async function discover(ctx, base, { mode = "keep", installStatus = "", o
     const m = pol.PolicyName.match(boundaryRe);
     if (m && ids.has(m[1])) inv.boundaries.push({ name: pol.PolicyName, arn: pol.Arn, id: m[1] });
   }
+  // A native install's auto-update role and boundaries are kept on delete (IAM refuses to delete a policy a
+  // role still carries). Their names have no region (one install per name per account), so only when this
+  // region's coderhelm-<stage> stack is gone and the kept role trusts that stack, or the boundary is unused.
+  let nativeAnchored = false;
+  if (!described.some((x) => x.d.StackName === P)) {
+    const nr = (await aws.read("iam", "get-role", ["--role-name", `${P}-deploy-stack`]))?.Role;
+    nativeAnchored = !!nr && JSON.stringify(nr.AssumeRolePolicyDocument ?? "").includes(`:cloudformation:${region}:${scope.account}:stack/${P}/`);
+    for (const pol of policies) {
+      if (pol.PolicyName !== `${P}-boundary-stack` && pol.PolicyName !== `${P}-deploy-boundary-stack`) continue;
+      const carried = nativeAnchored && nr?.PermissionsBoundary?.PermissionsBoundaryArn === pol.Arn;
+      // Unused for over an hour: not one another region's install is creating right now (its boundary comes before its roles).
+      const old = Date.now() - Date.parse(pol.CreateDate ?? "") > 3600_000;
+      const unused = old && Number(pol.PermissionsBoundaryUsageCount ?? 1) === 0 && Number(pol.AttachmentCount ?? 1) === 0;
+      if (carried || unused) inv.boundaries.push({ name: pol.PolicyName, arn: pol.Arn, id: "stack" });
+      else inv.skipped.push({ kind: "permissions boundary", name: pol.PolicyName, why: "a native install's boundary still in use, and not by this region's deleted stack" });
+    }
+  }
   const boundaryArns = new Set(inv.boundaries.map((b) => b.arn));
   for (const r of await pages(aws, "iam", "list-roles", [], "Roles")) {
     if (!isOurName(scope, r.RoleName)) continue;
@@ -251,7 +268,7 @@ export async function discover(ctx, base, { mode = "keep", installStatus = "", o
   // Something of the install must be in this region (a Launch Stack, its tag or its secret) before anything is removed.
   // CloudFront and Route 53 are global: in us-east-1 they show for any region's install, so they don't count.
   const regional = inv.tagged.some((a) => a.includes(`:${region}:`));
-  inv.anchored = inv.launch.length > 0 || regional || inv.secrets.length > 0;
+  inv.anchored = inv.launch.length > 0 || regional || inv.secrets.length > 0 || nativeAnchored;
   return inv;
 }
 

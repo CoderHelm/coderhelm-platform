@@ -39,6 +39,55 @@ export function nativeNames(): AccessNames {
 /** The suffix of a native install's boundary and auto-update role names. */
 export const NATIVE_ID = "stack";
 
+/** The auto-update role's own copy of the boundary (kept with the role on delete). */
+export const DEPLOY_BOUNDARY_NAME = "coderhelm-${Stage}-deploy-boundary-stack";
+export const DEPLOY_BOUNDARY_ARN = `arn:\${AWS::Partition}:iam::\${AWS::AccountId}:policy/${DEPLOY_BOUNDARY_NAME}`;
+
+/** Where the install keeps the release's files: parameters and pseudo parameters only. */
+export const ASSETS_BUCKET_NAME = "coderhelm-${Stage}-release-${AWS::AccountId}";
+
+/**
+ * A child template's URL. Only parameters and pseudo parameters, never a
+ * resource: CloudFormation resolves it while it builds a change set with
+ * the nested stacks included (the updater stages the files first).
+ */
+export function childTemplateUrl(version: string, name: string): string {
+  return `https://${ASSETS_BUCKET_NAME}.s3.\${AWS::Region}.amazonaws.com/${childKey(version, name).dest}`;
+}
+
+/**
+ * The exact log group names the parts declare (every function's and build
+ * project's). Final deletes these on a stack delete whatever their tags:
+ * Lambda (or CodeBuild) recreates a group when the last logs arrive after
+ * CloudFormation deleted it.
+ */
+export function declaredLogGroups(children: Child[]): string[] {
+  const out = new Set<string>();
+  const ours = /^\/aws\/(lambda|codebuild)\/coderhelm-\$\{Stage\}-[A-Za-z0-9_.-]+$/;
+  for (const c of children) {
+    for (const [id, r] of Object.entries((c.template.Resources ?? {}) as Record<string, Json>)) {
+      if (r.Type !== "AWS::Logs::LogGroup") continue;
+      const name = flatSub(r.Properties?.LogGroupName);
+      if (name !== null && ours.test(name)) out.add(name);
+      else if (r.Metadata?.["coderhelm:native-log"] || name !== null) {
+        throw new Error(`${c.name}.${id}: a declared log group whose name isn't /aws/lambda/coderhelm-\${Stage}-<name> (${JSON.stringify(r.Properties?.LogGroupName)})`);
+      }
+    }
+  }
+  return [...out].sort();
+}
+
+/** A name made of strings and `Fn::Sub` strings (no other intrinsics) as one Sub string. */
+function flatSub(v: Json): string | null {
+  if (typeof v === "string") return v;
+  if (v && typeof v === "object" && typeof v["Fn::Sub"] === "string") return v["Fn::Sub"];
+  if (v && typeof v === "object" && Array.isArray(v["Fn::Join"]) && v["Fn::Join"][0] === "") {
+    const parts = (v["Fn::Join"][1] as Json[]).map(flatSub);
+    return parts.some((x) => x === null) ? null : parts.join("");
+  }
+  return null;
+}
+
 /** Regions and their Bedrock cross-region inference prefix ("auto"). */
 export const BEDROCK_PREFIX: Record<string, string> = {
   "us-east-1": "us.", "us-east-2": "us.", "us-west-1": "us.", "us-west-2": "us.", "ca-central-1": "us.", "ca-west-1": "us.",
@@ -122,8 +171,9 @@ export function helperPolicy(): PolicyDocument {
       { Sid: "ReleaseFiles", Effect: "Allow", Action: ["s3:GetObject", "s3:PutObject", "s3:DeleteObject", "s3:ListBucket", "s3:ListBucketVersions", "s3:DeleteObjectVersion"], Resource: [`arn:\${AWS::Partition}:s3:::${p}-release-\${AWS::AccountId}`, `arn:\${AWS::Partition}:s3:::${p}-release-\${AWS::AccountId}/*`] },
       { Sid: "EmptyDataBucketsOnDelete", Effect: "Allow", Action: ["s3:ListBucket", "s3:ListBucketVersions", "s3:DeleteObject", "s3:DeleteObjectVersion"], Resource: [`arn:\${AWS::Partition}:s3:::${p}-*`, `arn:\${AWS::Partition}:s3:::${p}-*/*`] },
       { Sid: "StatusFile", Effect: "Allow", Action: ["s3:PutObject", "s3:PutBucketPolicy", "s3:ListBucket", "s3:ListBucketVersions", "s3:DeleteObject", "s3:DeleteObjectVersion"], Resource: ["arn:${AWS::Partition}:s3:::coderhelm-setup-${StatusId}", "arn:${AWS::Partition}:s3:::coderhelm-setup-${StatusId}/*"] },
-      { Sid: "Secret", Effect: "Allow", Action: ["secretsmanager:GetSecretValue", "secretsmanager:PutSecretValue"], Resource: `${at("secretsmanager")}:secret:coderhelm/\${Stage}/secrets-??????` },
-      { Sid: "AllowlistAndTablesOnDelete", Effect: "Allow", Action: ["dynamodb:BatchWriteItem", "dynamodb:DescribeTable", "dynamodb:DeleteTable", "dynamodb:UpdateTable"], Resource: `${at("dynamodb")}:table/${p}-*` },
+      // DeleteSecret: only on a stack delete with KeepDataOnDelete=false (Final).
+      { Sid: "Secret", Effect: "Allow", Action: ["secretsmanager:GetSecretValue", "secretsmanager:PutSecretValue", "secretsmanager:DeleteSecret"], Resource: `${at("secretsmanager")}:secret:coderhelm/\${Stage}/secrets-??????` },
+      { Sid: "AllowlistAndTablesOnDelete", Effect: "Allow", Action: ["dynamodb:BatchWriteItem", "dynamodb:DescribeTable", "dynamodb:DeleteTable", "dynamodb:UpdateTable"], Resource: [`${at("dynamodb")}:table/${p}`, `${at("dynamodb")}:table/${p}-*`] },
       { Sid: "TableKey", Effect: "Allow", Action: ["kms:Encrypt", "kms:Decrypt", "kms:GenerateDataKey*", "kms:DescribeKey"], Resource: "*", Condition: { StringEquals: { [`aws:ResourceTag/${INSTALL_TAG}`]: p } } },
       { Sid: "Domain", Effect: "Allow", Action: "lambda:InvokeFunction", Resource: `${at("lambda")}:function:${p}-updater` },
       { Sid: "RootStack", Effect: "Allow", Action: ["cloudformation:DescribeStacks", "cloudformation:DescribeStackEvents"], Resource: "arn:${AWS::Partition}:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/${AWS::StackName}/*" },
@@ -189,21 +239,40 @@ export function buildParent(input: ParentInput): Json {
   const helper = { ServiceToken: { "Fn::GetAtt": ["Helper", "Arn"] }, ...root };
   const R: Json = {};
 
+  // No AWS::LanguageExtensions here: CloudFormation stores a template with
+  // that transform already resolved, so a later "use the current template"
+  // update would silently keep every old parameter value (KeepDataOnDelete
+  // included). Every policy in this template is a literal.
+  const boundaryDoc = sub(boundaryPolicy(n, [DEPLOY_BOUNDARY_ARN]));
   R.Boundary = {
     Type: "AWS::IAM::ManagedPolicy",
-    // The kept auto-update role still carries it (IAM refuses to delete a
-    // policy in use): kept with it, and both listed by the leftover check.
-    DeletionPolicy: { "Fn::If": ["AutoUpdateOn", "Retain", "Delete"] },
+    // Only roles the stack deletes carry it (the kept auto-update role has its own copy).
+    DeletionPolicy: "Delete",
     UpdateReplacePolicy: "Retain",
     Properties: {
       ManagedPolicyName: sub(n.boundaryName),
       Description: "CoderHelm: the most any CoderHelm role can do (docs/self-host/security.md)",
-      PolicyDocument: sub(boundaryPolicy(n)),
+      PolicyDocument: boundaryDoc,
+    },
+  };
+  // The same boundary for the auto-update role. That role is kept on delete,
+  // and IAM refuses to delete a policy a role still carries: kept with it,
+  // and both listed by the leftover check.
+  R.DeployBoundary = {
+    Type: "AWS::IAM::ManagedPolicy",
+    Condition: "AutoUpdateOn",
+    DeletionPolicy: "Retain",
+    UpdateReplacePolicy: "Retain",
+    Metadata: { "cfn-lint": { config: { ignore_checks: ["W3011"] } } },
+    Properties: {
+      ManagedPolicyName: sub(DEPLOY_BOUNDARY_NAME),
+      Description: "CoderHelm: the auto-update role's boundary, the same as every CoderHelm role's (docs/self-host/security.md)",
+      PolicyDocument: boundaryDoc,
     },
   };
   R.AssetsBucket = {
     Type: "AWS::S3::Bucket",
-    Properties: { BucketName: sub("coderhelm-${Stage}-release-${AWS::AccountId}"), ...s3Secure, Tags: [{ Key: INSTALL_TAG, Value: sub("coderhelm-${Stage}") }] },
+    Properties: { BucketName: sub(ASSETS_BUCKET_NAME), ...s3Secure, Tags: [{ Key: INSTALL_TAG, Value: sub("coderhelm-${Stage}") }] },
   };
   // Only the helper may write or delete the release files (it checks each one).
   R.AssetsBucketPolicy = {
@@ -223,8 +292,10 @@ export function buildParent(input: ParentInput): Json {
   };
   R.InstallSecret = {
     Type: "AWS::SecretsManager::Secret",
-    DeletionPolicy: { "Fn::If": [KEEP_CONDITION, "RetainExceptOnCreate", "Delete"] },
-    UpdateReplacePolicy: { "Fn::If": [KEEP_CONDITION, "Retain", "Delete"] },
+    // Kept by CloudFormation; with KeepDataOnDelete=false, Final deletes it
+    // after everything that reads it on delete (HybridLeave, SetupKey).
+    DeletionPolicy: "RetainExceptOnCreate",
+    UpdateReplacePolicy: "Retain",
     Properties: {
       Name: sub(n.secretName),
       Description: "CoderHelm: GitHub App keys and the session signing key",
@@ -268,6 +339,8 @@ export function buildParent(input: ParentInput): Json {
       Role: { "Fn::GetAtt": ["HelperRole", "Arn"] },
       LoggingConfig: { LogGroup: { Ref: "HelperLogs" } },
       Code: { ZipFile: input.helperCode },
+      // stage: the only bucket it copies a release's child templates to.
+      Environment: { Variables: { ASSETS_BUCKET: { Ref: "AssetsBucket" } } },
       Tags: [{ Key: INSTALL_TAG, Value: sub("coderhelm-${Stage}") }],
     },
   };
@@ -303,6 +376,8 @@ export function buildParent(input: ParentInput): Json {
       KeepData: { Ref: "KeepDataOnDelete" },
       StatusBucket: statusProps.StatusBucket,
       LogGroupPrefixes: [sub("/aws/lambda/coderhelm-${Stage}-"), sub("/aws/codebuild/coderhelm-${Stage}-")],
+      LogGroupNames: declaredLogGroups(children).map((x) => sub(x)),
+      SecretId: { Ref: "InstallSecret" },
     },
   };
   R.DeployRole = {
@@ -326,7 +401,7 @@ export function buildParent(input: ParentInput): Json {
           },
         }],
       },
-      PermissionsBoundary: { Ref: "Boundary" },
+      PermissionsBoundary: { Ref: "DeployBoundary" },
       Policies: [{ PolicyName: "deploy", PolicyDocument: sub(deployRolePolicy(n)) }],
       Tags: [{ Key: INSTALL_TAG, Value: sub("coderhelm-${Stage}") }],
     },
@@ -356,7 +431,7 @@ export function buildParent(input: ParentInput): Json {
       Type: "AWS::CloudFormation::Stack",
       DependsOn: [...deps].sort(),
       Properties: {
-        TemplateURL: { "Fn::Sub": `https://\${AssetsBucket}.s3.\${AWS::Region}.amazonaws.com/${childKey(version, c.name).dest}` },
+        TemplateURL: { "Fn::Sub": childTemplateUrl(version, c.name) },
         Parameters: params,
         Tags: [{ Key: INSTALL_TAG, Value: sub("coderhelm-${Stage}") }],
       },
@@ -376,8 +451,9 @@ export function buildParent(input: ParentInput): Json {
       Properties: { ...helper, Table: { "Fn::GetAtt": ["Database", "Outputs.SettingsTableName"] }, Admin: { Ref: "AdminEmail" }, Domain: { Ref: "SignupDomain" }, TwoFactor: { Ref: "RequireTwoFactor" } },
     };
   }
-  R.SetupKey = { Type: "Custom::SetupKey", Condition: "HasSetupToken", Properties: { ...helper, SecretId: { Ref: "InstallSecret" }, Token: { Ref: "SetupToken" } } };
-  R.HybridLeave = { Type: "Custom::HybridLeave", Properties: { ...helper, SecretId: { Ref: "InstallSecret" } } };
+  // Both read the secret on delete: deleted before Final (which may delete the secret).
+  R.SetupKey = { Type: "Custom::SetupKey", Condition: "HasSetupToken", DependsOn: ["Final"], Properties: { ...helper, SecretId: { Ref: "InstallSecret" }, Token: { Ref: "SetupToken" } } };
+  R.HybridLeave = { Type: "Custom::HybridLeave", DependsOn: ["Final"], Properties: { ...helper, SecretId: { Ref: "InstallSecret" } } };
   if (names.has("Updates")) {
     R.Domain = {
       Type: "Custom::Domain",
@@ -408,7 +484,6 @@ export function buildParent(input: ParentInput): Json {
 
   return {
     AWSTemplateFormatVersion: "2010-09-09",
-    Transform: "AWS::LanguageExtensions",
     Description:
       `CoderHelm ${version} (about 20 minutes). One stack holds the whole install: a permissions boundary every CoderHelm role carries, ` +
       "a private bucket with this release's files (each checked against the sha256 in this signed template), the install's secret, " +

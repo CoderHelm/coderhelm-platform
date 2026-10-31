@@ -210,8 +210,12 @@ export const BOUNDARY_SERVICES = [
 ];
 
 /** The guardrails every CoderHelm policy repeats (boundary, deploy role, window). */
-export function guardrails(n: AccessNames): Statement[] {
+export function guardrails(n: AccessNames, otherBoundaries: string[] = []): Statement[] {
   const a = arns(n);
+  // A native install's two boundaries (its own and the auto-update role's copy) as one pattern, to stay
+  // within IAM's 6,144 characters: coderhelm-<name>-boundary-stack and coderhelm-<name>-deploy-boundary-stack.
+  const boundaries = n.boundaryArn.replace(/-boundary(-[a-z0-9]+)$/, "-*boundary$1");
+  for (const o of otherBoundaries) if (!new RegExp(`^${boundaries.replace(/[.$^{}()|[\]\\+?]/g, "\\$&").replace(/\*/g, ".*")}$`).test(o)) throw new Error(`${o} is not covered by ${boundaries}`);
   return [
     {
       Sid: "NoIamUsersOrKeys",
@@ -242,13 +246,27 @@ export function guardrails(n: AccessNames): Statement[] {
       Resource: "*",
       Condition: { StringNotEquals: { "iam:PermissionsBoundary": n.boundaryArn } },
     },
-    {
-      // No role's boundary comes off, and the boundary itself can't be edited.
-      Sid: "TheBoundaryStays",
-      Effect: "Deny",
-      Action: ["iam:DeleteRolePermissionsBoundary", "iam:CreatePolicyVersion", "iam:DeletePolicy", "iam:DeletePolicyVersion", "iam:SetDefaultPolicyVersion", "iam:TagPolicy", "iam:UntagPolicy"],
-      Resource: [n.boundaryArn, a.anyRoleHere],
-    },
+    ...(otherBoundaries.length === 0
+      ? [{
+          // No role's boundary comes off, and the boundary itself can't be edited.
+          Sid: "TheBoundaryStays",
+          Effect: "Deny" as const,
+          Action: ["iam:DeleteRolePermissionsBoundary", "iam:CreatePolicyVersion", "iam:DeletePolicy", "iam:DeletePolicyVersion", "iam:SetDefaultPolicyVersion", "iam:TagPolicy", "iam:UntagPolicy"],
+          Resource: [n.boundaryArn, a.anyRoleHere],
+        }]
+      : [
+          {
+            // A native install: no role's boundary comes off, neither the boundary nor the auto-update
+            // role's own copy can be edited or deleted, and no role can create a policy under either name.
+            // The first launch, turning auto-update on and a delete run with an admin's own permissions.
+            Sid: "TheBoundaryStays",
+            Effect: "Deny" as const,
+            // CreatePolicy*: CreatePolicy, CreatePolicyVersion; DeletePolicy*: DeletePolicy, DeletePolicyVersion;
+            // SetDefault*: SetDefaultPolicyVersion; *agPolicy: TagPolicy, UntagPolicy.
+            Action: ["iam:DeleteRolePermissionsBoundary", "iam:CreatePolicy*", "iam:DeletePolicy*", "iam:SetDefault*", "iam:*agPolicy"],
+            Resource: [boundaries, a.anyRoleHere],
+          },
+        ]),
     {
       // Changes only to the install's own functions, stacks, buckets, secret
       // and parameters (another function's code or a stack with an admin
@@ -329,8 +347,12 @@ export function guardrails(n: AccessNames): Statement[] {
   ];
 }
 
-/** The permissions boundary: the most any CoderHelm role can do. */
-export function boundaryPolicy(n: AccessNames): PolicyDocument {
+/**
+ * The permissions boundary: the most any CoderHelm role can do.
+ * `otherBoundaries`: a native install's auto-update role carries its own
+ * copy (kept on delete); neither copy can be edited by an install role.
+ */
+export function boundaryPolicy(n: AccessNames, otherBoundaries: string[] = []): PolicyDocument {
   const a = arns(n);
   return doc([
     { Sid: "CoderHelmServices", Effect: "Allow", Action: BOUNDARY_SERVICES, Resource: "*" },
@@ -338,7 +360,7 @@ export function boundaryPolicy(n: AccessNames): PolicyDocument {
     // The same calls as ROLE_MANAGE and POLICY_MANAGE, shorter (the boundary must fit IAM's 6,144 characters).
     { Sid: "InstallRoles", Effect: "Allow", Action: ["iam:Get*", "iam:List*", "iam:DeleteRole", "iam:UpdateRole*", "iam:UpdateAssumeRolePolicy", "iam:TagRole", "iam:UntagRole", "iam:PassRole"], Resource: a.role },
     { Sid: "InstallPolicies", Effect: "Allow", Action: ["iam:CreatePolicy*", "iam:DeletePolicy*", "iam:Get*", "iam:List*", "iam:TagPolicy", "iam:UntagPolicy"], Resource: a.policy },
-    ...guardrails(n),
+    ...guardrails(n, otherBoundaries),
   ]);
 }
 

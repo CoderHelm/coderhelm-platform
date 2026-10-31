@@ -32,6 +32,7 @@ export function conditionHolds(cond: Statement["Condition"], ctx: Record<string,
         case "ArnLike": if (!any((h, w) => glob(w, h))) return false; break;
         // Negated: true when the key is missing or matches none of the values.
         case "ArnNotEquals": if (have !== undefined && any((h, w) => h === w)) return false; break;
+        case "ArnNotLike": if (have !== undefined && any((h, w) => glob(w, h))) return false; break;
         case "DateLessThan": if (!any((h, w) => Date.parse(h) < Date.parse(w))) return false; break;
         case "DateGreaterThan": if (!any((h, w) => Date.parse(h) > Date.parse(w))) return false; break;
         // "true": the key is absent from the request; "false": it is there.

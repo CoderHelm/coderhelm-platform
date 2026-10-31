@@ -71,12 +71,16 @@ class FakeS3:
 
 
 class FakeCfn:
-    def __init__(self, status):
+    def __init__(self, status, params=None):
         self.status = status
         self.events = []
+        self.params = params
 
     def describe_stacks(self, StackName):
-        return {"Stacks": [{"StackStatus": self.status}]}
+        stack = {"StackStatus": self.status}
+        if self.params is not None:
+            stack["Parameters"] = [{"ParameterKey": k, "ParameterValue": v} for k, v in self.params.items()]
+        return {"Stacks": [stack]}
 
     def describe_stack_events(self, StackName):
         return {"StackEvents": self.events}
@@ -346,3 +350,221 @@ class Status(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class FakeLogs:
+    def __init__(self, groups):
+        self.groups = set(groups)
+        self.deleted = []
+
+    def delete_log_group(self, logGroupName):
+        if logGroupName not in self.groups:
+            raise type("ResourceNotFoundException", (Exception,), {})("gone")
+        self.groups.discard(logGroupName)
+        self.deleted.append(logGroupName)
+
+    def get_paginator(self, name):
+        groups = self.groups
+
+        class P:
+            def paginate(self, logGroupNamePrefix):
+                return [{"logGroups": [{"logGroupName": g, "arn": f"arn:{g}:*"} for g in sorted(groups) if g.startswith(logGroupNamePrefix)]}]
+        return P()
+
+    def list_tags_for_resource(self, resourceArn):
+        return {"tags": {}}  # what Lambda makes by itself has no tags
+
+
+class FakeSecrets:
+    def __init__(self, exists=True):
+        self.exists = exists
+        self.deleted = []
+
+    def delete_secret(self, SecretId, ForceDeleteWithoutRecovery):
+        if not self.exists:
+            raise type("ResourceNotFoundException", (Exception,), {})("gone")
+        self.deleted.append((SecretId, ForceDeleteWithoutRecovery))
+        self.exists = False
+
+
+class FakeAcm:
+    def get_paginator(self, name):
+        class P:
+            def paginate(self):
+                return [{"CertificateSummaryList": []}]
+        return P()
+
+
+class Final(unittest.TestCase):
+    """Deleted after every part: the log groups Lambda recreated (the live
+    test left two), and with KeepDataOnDelete=false the install's secret."""
+
+    RECREATED = ["/aws/lambda/coderhelm-prod-Handler-cd8e80af", "/aws/lambda/coderhelm-prod-LogRetentionaae0aa3c5b4d-1532c9b8"]
+
+    def setUp(self):
+        self.saved = dict(h._clients)
+        self.logs = FakeLogs(self.RECREATED + ["/aws/lambda/coderhelm-prodx-worker", "/aws/lambda/other-app"])
+        self.sm = FakeSecrets()
+        h._clients["logs@None"] = self.logs
+        h._clients["secretsmanager@None"] = self.sm
+        h._clients["acm@us-east-1"] = FakeAcm()
+        h._clients["route53@None"] = object()
+
+    def tearDown(self):
+        h._clients.clear()
+        h._clients.update(self.saved)
+
+    def final(self, keep, status="DELETE_IN_PROGRESS", names=None):
+        h._clients["cloudformation@None"] = FakeCfn(status)
+        props = {"Prefix": "coderhelm-prod", "KeepData": keep, "RootStackId": "root", "SecretId": "arn:secret:coderhelm/prod/secrets-abc123",
+                 "LogGroupPrefixes": ["/aws/lambda/coderhelm-prod-"],
+                 "LogGroupNames": names if names is not None else self.RECREATED + ["/aws/lambda/coderhelm-prod-never-recreated"]}
+        return h.handle({"ResourceType": "Custom::Final", "RequestType": "Delete", "LogicalResourceId": "Final", "ResourceProperties": props})
+
+    def test_recreated_log_groups_go_by_their_exact_names_even_when_keeping_data(self):
+        status, reason, _ = self.final("true")
+        self.assertEqual(status, "SUCCESS", reason)
+        self.assertEqual(sorted(self.logs.deleted), sorted(self.RECREATED))
+        # Never another install's or another app's, and the secret stays.
+        self.assertIn("/aws/lambda/coderhelm-prodx-worker", self.logs.groups)
+        self.assertIn("/aws/lambda/other-app", self.logs.groups)
+        self.assertEqual(self.sm.deleted, [])
+
+    def test_a_name_outside_this_install_is_refused(self):
+        status, reason, _ = self.final("true", names=["/aws/lambda/other-app"])
+        self.assertEqual(status, "FAILED")
+        self.assertIn("not this install's", reason)
+        self.assertIn("/aws/lambda/other-app", self.logs.groups)
+
+    def test_without_keep_data_the_secret_goes_too_without_a_recovery_window(self):
+        status, reason, _ = self.final("false")
+        self.assertEqual(status, "SUCCESS", reason)
+        self.assertEqual(self.sm.deleted, [("arn:secret:coderhelm/prod/secrets-abc123", True)])
+        self.assertIn("the install's secret", reason)
+
+    def test_a_secret_already_gone_is_fine(self):
+        self.sm.exists = False
+        status, reason, _ = self.final("false")
+        self.assertEqual(status, "SUCCESS", reason)
+
+    def test_an_update_never_deletes_anything(self):
+        status, reason, _ = self.final("false", status="UPDATE_COMPLETE_CLEANUP_IN_PROGRESS")
+        self.assertEqual((status, reason), ("SUCCESS", "nothing to do"))
+        self.assertEqual(self.logs.deleted, [])
+        self.assertEqual(self.sm.deleted, [])
+
+
+class Stage(unittest.TestCase):
+    """The updater's step before a change set with the nested stacks: the
+    release's child templates into the install's bucket, from its verified
+    coderhelm.json, each checked."""
+
+    V = "v1.2.0"
+    BASE = f"https://coderhelm-public.s3.amazonaws.com/launch/{V}"
+
+    def release(self, base=None, version=None):
+        child = b'{"Resources":{}}'
+        files = [
+            {"Key": "stacks/Database.json", "Dest": f"releases/{self.V}/stacks/Database.json", "Sha256": hashlib.sha256(child).hexdigest()},
+            {"Key": "assets/big.zip", "Dest": f"releases/{self.V}/assets/big.zip", "Sha256": "0" * 64},
+        ]
+        template = json.dumps({"Resources": {"ReleaseAssets": {"Type": "Custom::ReleaseAssets", "Properties": {
+            "BaseUrl": base or self.BASE, "Version": version or self.V, "Files": files}}}}).encode()
+        served = {f"{self.BASE}/coderhelm.json": template, f"{self.BASE}/stacks/Database.json": child}
+        self.fetched = []
+
+        def opener(req, timeout=None):
+            self.fetched.append(req.full_url)
+            return Resp(served[req.full_url])
+        return template, opener
+
+    def test_stages_only_the_child_templates_each_checked(self):
+        template, opener = self.release()
+        s3 = FakeS3()
+        r = h.stage_release({"version": self.V, "template_sha256": hashlib.sha256(template).hexdigest()}, "coderhelm-prod-release-1", s3=s3, opener=opener)
+        self.assertEqual(r, {"ok": True, "version": self.V, "staged": 1, "copied": 1})
+        self.assertEqual(list(s3.objects), [f"releases/{self.V}/stacks/Database.json"])
+        self.assertNotIn(f"{self.BASE}/assets/big.zip", self.fetched)  # the code waits for the update itself
+
+    def test_a_template_that_is_not_the_verified_one_is_refused(self):
+        template, opener = self.release()
+        s3 = FakeS3()
+        with self.assertRaisesRegex(ValueError, "refused"):
+            h.stage_release({"version": self.V, "template_sha256": "1" * 64}, "b", s3=s3, opener=opener)
+        self.assertEqual(s3.objects, {})
+
+    def test_a_template_listing_another_releases_files_is_refused(self):
+        template, opener = self.release(version="v1.1.0")
+        with self.assertRaisesRegex(ValueError, "another release"):
+            h.stage_release({"version": self.V, "template_sha256": hashlib.sha256(template).hexdigest()}, "b", s3=FakeS3(), opener=opener)
+
+    def test_bad_input_is_refused_before_anything_is_fetched(self):
+        for ev in ({"version": "../x", "template_sha256": "a" * 64}, {"version": self.V, "template_sha256": "nope"}):
+            with self.assertRaises(ValueError):
+                h.stage_release(ev, "b", s3=FakeS3(), opener=lambda *a, **k: self.fail("fetched"))
+
+    def test_called_directly_it_answers_the_caller_not_cloudformation(self):
+        saved = h.stage_release
+        h.stage_release = lambda event, bucket: {"ok": True, "bucket": bucket}
+        try:
+            import os
+            os.environ["ASSETS_BUCKET"] = "coderhelm-prod-release-1"
+            self.assertEqual(h.handler({"action": "stage"}, None), {"ok": True, "bucket": "coderhelm-prod-release-1"})
+            h.stage_release = lambda event, bucket: (_ for _ in ()).throw(ValueError("refused"))
+            self.assertEqual(h.handler({"action": "stage"}, None), {"ok": False, "error": "ValueError: refused"})
+        finally:
+            h.stage_release = saved
+            os.environ.pop("ASSETS_BUCKET", None)
+
+
+class OnlyWhatTheStackSays(unittest.TestCase):
+    """Delete work follows the root stack's own KeepDataOnDelete, never only
+    the event's, and an event without CloudFormation's answer URL does nothing."""
+
+    def setUp(self):
+        self.saved = dict(h._clients)
+
+    def tearDown(self):
+        h._clients.clear()
+        h._clients.update(self.saved)
+
+    def test_an_event_saying_false_while_the_stack_says_true_keeps_everything(self):
+        h._clients["cloudformation@None"] = FakeCfn("DELETE_IN_PROGRESS", {"KeepDataOnDelete": "true"})
+        sm = FakeSecrets()
+        s3 = FakeS3(versions=[{"Key": "k", "VersionId": "1"}])
+        h._clients.update({"secretsmanager@None": sm, "s3@None": s3, "logs@None": FakeLogs([]), "acm@us-east-1": FakeAcm(), "route53@None": object()})
+        ev = lambda kind, props: {"ResourceType": kind, "RequestType": "Delete", "LogicalResourceId": "X", "ResourceProperties": dict(props, RootStackId="root")}
+        status, reason, _ = h.handle(ev("Custom::Sweep", {"KeepData": "false", "Buckets": ["data"], "Tables": []}))
+        self.assertEqual((status, reason), ("SUCCESS", "data kept"))
+        status, _, _ = h.handle(ev("Custom::Final", {"KeepData": "false", "Prefix": "coderhelm-prod", "SecretId": "s", "LogGroupNames": []}))
+        self.assertEqual(status, "SUCCESS")
+        self.assertEqual(sm.deleted, [])
+        self.assertEqual(s3.deleted, [])
+
+    def test_the_stack_saying_false_is_what_deletes(self):
+        h._clients["cloudformation@None"] = FakeCfn("DELETE_IN_PROGRESS", {"KeepDataOnDelete": "false"})
+        sm = FakeSecrets()
+        h._clients.update({"secretsmanager@None": sm, "logs@None": FakeLogs([]), "acm@us-east-1": FakeAcm(), "route53@None": object()})
+        h.handle({"ResourceType": "Custom::Final", "RequestType": "Delete", "LogicalResourceId": "Final",
+                  "ResourceProperties": {"RootStackId": "root", "KeepData": "true", "Prefix": "coderhelm-prod", "SecretId": "s", "LogGroupNames": []}})
+        self.assertEqual(sm.deleted, [("s", True)])
+
+    def test_an_event_without_cloudformations_answer_url_does_nothing(self):
+        called = []
+        saved = h.handle
+        h.handle = lambda *a, **k: called.append(1) or ("SUCCESS", "", {})
+        try:
+            self.assertIsNone(h.handler({"ResourceType": "Custom::Final", "RequestType": "Delete", "LogicalResourceId": "Final",
+                                         "ResponseURL": "https://attacker.example.com/x", "ResourceProperties": {}}, None))
+        finally:
+            h.handle = saved
+        self.assertEqual(called, [])
+
+    def test_stage_refuses_an_odd_part_template_name(self):
+        v = "v1.2.0"
+        base = f"https://coderhelm-public.s3.amazonaws.com/launch/{v}"
+        bad = json.dumps({"Resources": {"ReleaseAssets": {"Properties": {"BaseUrl": base, "Version": v, "Files": [
+            {"Key": "stacks/Database.json", "Dest": f"releases/{v}/stacks/../../other.json", "Sha256": "0" * 64}]}}}}).encode()
+        opener = lambda req, timeout=None: Resp(bad)
+        with self.assertRaisesRegex(ValueError, "odd part template"):
+            h.stage_release({"version": v, "template_sha256": hashlib.sha256(bad).hexdigest()}, "b", s3=FakeS3(), opener=opener)

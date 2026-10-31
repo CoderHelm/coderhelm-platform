@@ -13,8 +13,11 @@
  * - every Ref to a launch parameter becomes a declared parameter;
  * - data (tables, retained buckets, keys, the user pool) follows
  *   KeepDataOnDelete through DataDeletionPolicy / DataReplacePolicy, with
- *   the AWS::LanguageExtensions transform that allows Refs there; deletion
- *   protection follows the same switch; keys wait 7 days;
+ *   the AWS::LanguageExtensions transform that allows Refs there (only in
+ *   the children: the parent passes the values on every update, and
+ *   CloudFormation reads a nested stack's template from its URL each time,
+ *   while the parent itself stays free of transforms, see parent.ts);
+ *   deletion protection follows the same switch; keys wait 7 days;
  * - the data tables' and buckets' names are outputs, for the parent's Sweep.
  */
 import * as childProcess from "child_process";

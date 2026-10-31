@@ -28,8 +28,20 @@ Resource types (event["ResourceType"]):
                          left to fail on.
   Custom::Final          deleted after every part: the certificates the updater
                          requested for this install (and their validation
-                         records), and, with KeepDataOnDelete=false, the log
-                         groups Lambda made by itself.
+                         records); the exact log groups the parts declare
+                         (Lambda recreates one when a function's last logs
+                         arrive after CloudFormation deleted it); with
+                         KeepDataOnDelete=false, the other log groups Lambda
+                         made by itself, and the install's secret (after
+                         HybridLeave and SetupKey, which read it).
+
+Called directly (not by CloudFormation), {"action": "stage", "version",
+"template_sha256"} from the updater: copies that release's child templates
+into the install's assets bucket before it proposes the update, so
+CloudFormation can read them while it builds the change set with the nested
+stacks. The helper reads the release's coderhelm.json itself from the
+release location, checks it against the sha256 (from the signed
+SHA256SUMS), and copies only the files that template lists, each checked.
 
 Delete-time work runs only when the ROOT stack is being deleted (or its first
 create is rolling back), never when an update removes or replaces one of
@@ -49,6 +61,9 @@ import time
 import urllib.request
 
 RELEASE_HOST = "coderhelm-public.s3.amazonaws.com"
+RELEASE_FILE = "coderhelm.json"
+VERSION_RE = re.compile(r"^v\d+\.\d+\.\d+(-[0-9A-Za-z.-]+)?$")
+SHA_RE = re.compile(r"^[0-9a-f]{64}$")
 SETUP_TOKEN_RE = re.compile(r"^[A-Za-z0-9]{32,64}$")
 INSTALL_ID_RE = re.compile(r"^ins_[a-z0-9]{24}$")
 
@@ -93,22 +108,27 @@ def respond(event, status, reason="", data=None, physical=None, put=None):
     urllib.request.urlopen(req, timeout=30).read()
 
 
-def root_status(props, cfn=None):
-    """The root stack's status ("" when it can't be read)."""
+def root_stack(props, cfn=None):
+    """The root stack as CloudFormation describes it ({} when it can't be read)."""
     root = props.get("RootStackId")
     if not root:
-        return ""
+        return {}
     try:
-        return (cfn or client("cloudformation")).describe_stacks(StackName=root)["Stacks"][0]["StackStatus"]
+        return (cfn or client("cloudformation")).describe_stacks(StackName=root)["Stacks"][0]
     except Exception as e:
         log("could not read the root stack:", e)
-        return ""
+        return {}
 
 
-def tearing_down(props, cfn=None):
+def root_status(props, cfn=None):
+    """The root stack's status ("" when it can't be read)."""
+    return root_stack(props, cfn).get("StackStatus", "")
+
+
+def tearing_down(props, cfn=None, stack=None):
     """"delete" while the root stack is deleted, "rollback" while its first
     create rolls back, else None (an update: never clean anything)."""
-    st = root_status(props, cfn)
+    st = (stack if stack is not None else root_stack(props, cfn)).get("StackStatus", "")
     if st == "DELETE_IN_PROGRESS":
         return "delete"
     if st == "ROLLBACK_IN_PROGRESS":
@@ -116,8 +136,15 @@ def tearing_down(props, cfn=None):
     return None
 
 
-def keep_data(props):
-    return str(props.get("KeepData", "true")).lower() != "false"
+def keep_data(props, cfn=None, stack=None):
+    """KeepDataOnDelete as the root stack itself has it (never only what the
+    event says): data and the secret go only when the stack says false."""
+    stack = stack if stack is not None else root_stack(props, cfn)
+    if not stack:
+        return True  # unreadable: keep
+    params = {p.get("ParameterKey"): p.get("ParameterValue") for p in stack.get("Parameters") or []}
+    value = params["KeepDataOnDelete"] if "KeepDataOnDelete" in params else props.get("KeepData", "true")
+    return str(value).lower() != "false"
 
 
 def first_failure(root, cfn=None):
@@ -238,6 +265,57 @@ def prune_assets(props, old, s3=None):
     if gone:
         log("removed files no version in use lists:", len(gone))
     return gone
+
+
+def stage_release(event, bucket, s3=None, opener=None):
+    """The updater's step before a change set: the child templates of
+    `version` into the assets bucket, from its verified coderhelm.json."""
+    version = str(event.get("version") or "")
+    want = str(event.get("template_sha256") or "").lower()
+    if not VERSION_RE.match(version):
+        raise ValueError(f"not a release version: {version!r}")
+    if not SHA_RE.match(want):
+        raise ValueError("the template's sha256 is missing")
+    if not bucket:
+        raise ValueError("no assets bucket")
+    base = f"https://{RELEASE_HOST}/launch/{version}"
+    path = download_verified(release_url(base, RELEASE_FILE), want, opener)
+    try:
+        with open(path, "rb") as fh:
+            template = json.load(fh)
+    finally:
+        os.unlink(path)
+    props = ((template.get("Resources") or {}).get("ReleaseAssets") or {}).get("Properties") or {}
+    if props.get("Version") != version or str(props.get("BaseUrl", "")).rstrip("/") != base:
+        raise ValueError(f"{version}'s template lists another release's files: refused")
+    prefix = f"releases/{version}/stacks/"
+    child = re.compile(r"^stacks/([A-Za-z0-9_-]+)\.json$")
+    files = []
+    for f in props.get("Files") or []:
+        if not str(f.get("Dest", "")).startswith(prefix):
+            continue
+        m = child.match(str(f.get("Key", "")))
+        if not m or f.get("Dest") != f"{prefix}{m.group(1)}.json" or not SHA_RE.match(str(f.get("Sha256", ""))):
+            raise ValueError(f"{version}'s template lists an odd part template: {f.get('Key')!r} -> {f.get('Dest')!r}")
+        files.append(f)
+    if not files:
+        raise ValueError(f"{version}'s template lists no child templates")
+    data = copy_assets({"Bucket": bucket, "BaseUrl": base, "Files": files}, s3=s3, opener=opener)
+    return {"ok": True, "version": version, "staged": int(data["Files"]), "copied": int(data["Copied"])}
+
+
+def delete_secret(secret_id, sm=None):
+    """The install's secret, without the recovery window (CloudFormation's
+    own delete does the same); one already gone is fine."""
+    sm = sm or client("secretsmanager")
+    try:
+        sm.delete_secret(SecretId=secret_id, ForceDeleteWithoutRecovery=True)
+        log("deleted the install's secret")
+        return True
+    except Exception as e:
+        if "ResourceNotFound" in type(e).__name__ + str(e):
+            return False
+        raise
 
 
 def list_keys(s3, bucket):
@@ -494,6 +572,26 @@ def remove_record(r53, rr):
             log("validation record left as it was:", name, e)
 
 
+def delete_named_log_groups(names, prefix, logs=None):
+    """The exact log groups the parts declare (CloudFormation already
+    deleted each once; anything there now Lambda recreated). Only names
+    under this install's own /aws/lambda/<prefix>- ."""
+    logs = logs or client("logs")
+    gone, problems = [], []
+    for name in names or []:
+        if not (str(name).startswith(f"/aws/lambda/{prefix}-") or str(name).startswith(f"/aws/codebuild/{prefix}-")):
+            problems.append(f"{name}: not this install's")
+            continue
+        try:
+            logs.delete_log_group(logGroupName=name)
+            gone.append(name)
+            log("deleted recreated log group", name)
+        except Exception as e:
+            if "ResourceNotFound" not in type(e).__name__ + str(e):
+                problems.append(f"{name}: {e}")
+    return gone, problems
+
+
 def delete_log_groups(prefixes, tag=None, logs=None):
     """Log groups under the prefixes, only those tagged coderhelm:install=<tag>
     (every log group the stack declares is): never another install's."""
@@ -579,8 +677,10 @@ def handle(event, context=None):
         return "SUCCESS", "nothing to do", {}
 
     if kind == "Custom::Sweep":
-        mode = tearing_down(props) if rt == "Delete" else None
-        if mode is None or (mode == "delete" and keep_data(props)):
+        # One read of the root stack decides both whether it is a delete and whether data goes.
+        stack = root_stack(props) if rt == "Delete" else {}
+        mode = tearing_down(props, stack=stack) if rt == "Delete" else None
+        if mode is None or (mode == "delete" and keep_data(props, stack=stack)):
             return "SUCCESS", "data kept" if mode == "delete" else "nothing to do", {}
         problems = []
         for b in props.get("Buckets") or []:
@@ -597,7 +697,8 @@ def handle(event, context=None):
         return "SUCCESS", f"emptied {len(props.get('Buckets') or [])} buckets, deleted {len(props.get('Tables') or [])} tables", {}
 
     if kind == "Custom::Final":
-        mode = tearing_down(props) if rt == "Delete" else None
+        stack = root_stack(props) if rt == "Delete" else {}
+        mode = tearing_down(props, stack=stack) if rt == "Delete" else None
         if mode is None:
             return "SUCCESS", "nothing to do", {}
         certs, problems = delete_certificates(props["Prefix"])
@@ -606,11 +707,19 @@ def handle(event, context=None):
                 empty_bucket(props["StatusBucket"])
             except Exception as e:
                 problems.append(f"bucket {props['StatusBucket']}: {e}")
-        groups = []
-        if mode == "rollback" or not keep_data(props):
-            groups, more = delete_log_groups(props.get("LogGroupPrefixes") or [], tag=props["Prefix"])
+        groups, more = delete_named_log_groups(props.get("LogGroupNames") or [], props["Prefix"])
+        problems += more
+        if mode == "rollback" or not keep_data(props, stack=stack):
+            tagged, more = delete_log_groups(props.get("LogGroupPrefixes") or [], tag=props["Prefix"])
+            groups += tagged
             problems += more
-        msg = f"deleted {len(certs)} certificates and {len(groups)} log groups"
+        secret = ""
+        if mode == "delete" and not keep_data(props, stack=stack) and props.get("SecretId"):
+            try:
+                secret = " and the install's secret" if delete_secret(props["SecretId"]) else ""
+            except Exception as e:
+                problems.append(f"secret: {e}")
+        msg = f"deleted {len(certs)} certificates and {len(groups)} log groups{secret}"
         if problems:
             return "FAILED", msg + "; not removed: " + "; ".join(problems), {}
         return "SUCCESS", msg, {}
@@ -619,6 +728,19 @@ def handle(event, context=None):
 
 
 def handler(event, context):
+    if event.get("action") == "stage":
+        # The updater, directly (CloudFormation's events have no "action").
+        try:
+            r = stage_release(event, os.environ.get("ASSETS_BUCKET", ""))
+        except Exception as e:
+            log("stage FAILED:", type(e).__name__, e)
+            r = {"ok": False, "error": f"{type(e).__name__}: {e}"}
+        log("stage", json.dumps(r))
+        return r
+    if not RESPONSE_URL_RE.match(str(event.get("ResponseURL", ""))):
+        # Only CloudFormation asks with its own presigned answer URL: anything else is not a stack, so nothing is done.
+        log("ignored: the response URL is not CloudFormation's")
+        return None
     try:
         status, reason, data = handle(event, context)
     except Exception as e:

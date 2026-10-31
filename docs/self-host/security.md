@@ -55,7 +55,7 @@ The stack you launch (the parent, from the release's `coderhelm.json`) creates:
 - the install helper: one function, `coderhelm-<name>-install-helper`, with its role and its log group. Its code is written inline in `coderhelm.json`, so the signature that covers the template covers it too;
 - the parts of CoderHelm (database, storage, API, worker, web and the rest) as nested stacks, each read from the release bucket above;
 - a few custom resources the install helper answers (below);
-- only with **AutoUpdate** set to `on`: the auto-update role, `coderhelm-<name>-deploy-stack`.
+- only with **AutoUpdate** set to `on`: the auto-update role, `coderhelm-<name>-deploy-stack`, and its own copy of the boundary, `coderhelm-<name>-deploy-boundary-stack`.
 
 An install's name is lowercase letters and digits only, with no hyphen, so `coderhelm-<name>-*` never also names another install (`prod` and `prod-eu` would overlap).
 
@@ -74,13 +74,13 @@ If the first launch fails, CloudFormation rolls the stack back and deletes what 
 | Status | With the install guide's progress id: writes a small public progress file (the phase, and your URL when done). On a failed first launch it writes CloudFormation's own reason. |
 | HybridLeave | When the stack is deleted: releases the CoderHelm address and links of a [hybrid](./hybrid.md) install. |
 | Sweep | When the stack is deleted with **KeepDataOnDelete** `false`: empties the data buckets and deletes the tables. See [Uninstall](./uninstall.md). |
-| Final | When the stack is deleted: deletes the certificates the updater requested for this install and their validation records. With **KeepDataOnDelete** `false`, it also deletes the install's log groups that are still there, only those tagged `coderhelm:install = coderhelm-<name>`. |
+| Final | When the stack is deleted, after every part and after HybridLeave and SetupKey: deletes the certificates the updater requested for this install and their validation records, and every log group the parts declare, by its exact name (Lambda makes one again when a function's last logs arrive after CloudFormation deleted it). With **KeepDataOnDelete** `false`, it also deletes the install's other log groups that are still there, only those tagged `coderhelm:install = coderhelm-<name>`, and the install's secret, without a recovery window. |
 
 Delete work happens only while the root stack itself is being deleted, or while its first launch rolls back. An update that removes or replaces one of these resources never empties or deletes anything. Every step and every AWS error goes to the helper's log group, and the reason goes back to CloudFormation, which shows it in the stack's events.
 
 ### The permissions boundary
 
-`coderhelm-<name>-boundary-stack` is the most any CoderHelm role can ever do, whatever its own policy says. Every role CoderHelm creates carries it: the functions, the updater, the install helper and the auto-update role. Its text is written once, in `infra/lib/access.ts`. It allows only the services CoderHelm uses: Lambda, DynamoDB, S3, SQS, SNS, EventBridge, CloudWatch and its logs, Secrets Manager, KMS, SES, Cognito, CloudFront, API Gateway, CodeBuild, Systems Manager parameters, ACM, Route 53, CloudFormation, and calls to Bedrock models. Even within those, it refuses:
+`coderhelm-<name>-boundary-stack` is the most any CoderHelm role can ever do, whatever its own policy says. Every role CoderHelm creates carries it: the functions, the updater and the install helper. The auto-update role carries an identical copy, `coderhelm-<name>-deploy-boundary-stack`: that role is kept when the stack is deleted, and IAM refuses to delete a policy a role still carries, so its copy is kept with it while the boundary every other role carries goes with the stack. Its text is written once, in `infra/lib/access.ts`. It allows only the services CoderHelm uses: Lambda, DynamoDB, S3, SQS, SNS, EventBridge, CloudWatch and its logs, Secrets Manager, KMS, SES, Cognito, CloudFront, API Gateway, CodeBuild, Systems Manager parameters, ACM, Route 53, CloudFormation, and calls to Bedrock models. Even within those, it refuses:
 
 - creating IAM users, access keys, sign-in profiles, groups or identity providers;
 - anything in Organizations, account settings, CloudTrail or GuardDuty;
@@ -88,7 +88,7 @@ Delete work happens only while the root stack itself is being deleted, or while 
 - creating or changing a role without this boundary on it, and removing a boundary from any role;
 - changing, invoking or creating a function, changing a stack, writing or deleting in a bucket, reading or changing a secret, or changing a parameter, unless it is the install's own: functions and layers named `coderhelm-<name>-*`, stacks named `coderhelm-<name>...`, buckets named `coderhelm-<name>-*` (and the progress bucket `coderhelm-setup-*`), secrets under `coderhelm/<name>/`, parameters under `/coderhelm-<name>/`. So a role CoderHelm creates can't rewrite another function in the account or update a stack that runs with another role;
 - running commands or sessions on instances (Systems Manager Run Command, Session Manager, Automation, associations);
-- changing, deleting or retagging the boundary itself, or changing the auto-update role;
+- changing, deleting or retagging the boundary itself or the auto-update role's copy, creating any policy under either name, or changing the auto-update role;
 - changing a stack named `coderhelm-<name>-access` (where an install hardened from the command line keeps its boundary);
 - assuming any other role in this account, such as the CDK bootstrap roles, the auto-update role, CoderHelm's own roles or yours. Roles in other accounts can still be assumed by name and external id, which is how log reading works.
 
@@ -109,13 +109,17 @@ The helper's role carries the boundary and can only do this (`helperPolicy()` in
 - read, write, list and delete objects in the release bucket;
 - list and delete objects in buckets named `coderhelm-<name>-*` (to empty the data buckets on delete);
 - write the install guide's progress file and its read policy, in this install's own progress bucket, `coderhelm-setup-<progress id>`;
-- read and write the install's secret, `coderhelm/<name>/secrets`;
-- write items to, describe, update and delete tables named `coderhelm-<name>-*` (the allowlist at launch; the tables on delete), and use the KMS keys tagged `coderhelm:install = coderhelm-<name>` to encrypt and decrypt for them;
+- read and write the install's secret, `coderhelm/<name>/secrets`, and delete it (only on a stack delete with **KeepDataOnDelete** `false`);
+- write items to, describe, update and delete the tables named `coderhelm-<name>` and `coderhelm-<name>-*` (the allowlist at launch; the tables on delete), and use the KMS keys tagged `coderhelm:install = coderhelm-<name>` to encrypt and decrypt for them;
 - invoke `coderhelm-<name>-updater` (the domain);
 - describe the root stack and read its events;
-- list log groups, and read the tags of and delete those named `/aws/lambda/coderhelm-<name>-*` or `/aws/codebuild/coderhelm-<name>-*`. The code deletes only those tagged `coderhelm:install = coderhelm-<name>`;
+- list log groups, and read the tags of and delete those named `/aws/lambda/coderhelm-<name>-*` or `/aws/codebuild/coderhelm-<name>-*`. The code deletes the exact names the parts declare, and otherwise only those tagged `coderhelm:install = coderhelm-<name>`;
 - list and describe certificates in ACM in us-east-1, and delete only those tagged `coderhelm = coderhelm-<name>` (the ones the updater requested): IAM checks the tag;
 - list Route 53 zones, and delete only CNAME records whose names start with `_` (certificate validation records, removed with the certificate). It can't create or change any record.
+
+Delete work runs only while the root stack itself is being deleted and follows **KeepDataOnDelete** as the root stack itself has it, both read from CloudFormation in one call, never from what the request says. (It also ignores a request without a CloudFormation-shaped response address; that only filters out mistakes, it proves nothing.)
+
+Besides CloudFormation, only the updater calls it, for one thing: before a change set, copy a release's part templates into the release bucket (`stage`). It downloads that release's `coderhelm.json` itself, checks it against the sha256 from the signed `SHA256SUMS` that the updater passes, and copies only the part templates it lists, each checked like ReleaseAssets does. It trusts the sha256 its caller passes: a caller that may invoke it could stage the part templates of any release CoderHelm published (from the write-once release location, only under that release's own `releases/<version>/stacks/`), which changes nothing that runs.
 
 It answers only CloudFormation's own response address for a custom resource, and it keeps account numbers, ARNs and email addresses out of the public progress file.
 
@@ -123,22 +127,23 @@ It downloads release files over HTTPS from `coderhelm-public.s3.amazonaws.com/la
 
 ### Updates and the optional auto-update role
 
-An update is a stack update of `coderhelm-<name>` to the next release's `coderhelm.json`, prepared as a change set that includes each part's own change set. Creating a change set changes nothing. The updater creates it only after its release check verified the release's signature and reported the sha256 of `coderhelm.json` from the signed `SHA256SUMS`, and only when the template it downloads matches that sha256. A domain move is made the same way, from a verified template. Once CloudFormation has made the change set, the updater reads back the template CloudFormation itself fetched and compares it with the verified one; if they differ, it deletes the change set and nothing runs. It never proposes an older release as an update. See [Updates](./updates.md).
+An update is a stack update of `coderhelm-<name>` to the next release's `coderhelm.json`, prepared as a change set that includes each part's own change set. Creating a change set changes nothing. The updater creates it only after its release check verified the release's signature and reported the sha256 of `coderhelm.json` from the signed `SHA256SUMS`, and only when the template it downloads matches that sha256. A domain move is made the same way, from a verified template. Once CloudFormation has made the change set, the updater reads back the template CloudFormation itself fetched and compares it with the verified one; if they differ, it deletes the change set and nothing runs. It never proposes an older release as an update. The parent template has no transform (such as `AWS::LanguageExtensions`): CloudFormation keeps a template with a transform already resolved, so what it fetched could never be compared with what was verified, and an update with the current template would keep every old parameter value. The updater refuses a template with a transform. See [Updates](./updates.md).
 
 The updater's role may (`nativeUpdates()` in `infra/lib/updates-stack.ts`):
 
 - create a change set on this stack only, only with a template URL like `https://coderhelm-public.s3.amazonaws.com/launch/v*.*.*/coderhelm.json` (release files there are written once and never replaced), and with a service role only if it is `coderhelm-<name>-deploy-stack`;
 - describe, list, execute and delete change sets on this stack and its parts, read the template a change set was made from, and describe the stack and its events;
-- pass `coderhelm-<name>-deploy-stack`, and only to CloudFormation.
+- pass `coderhelm-<name>-deploy-stack`, and only to CloudFormation;
+- invoke the install helper, to stage a release's part templates before a change set, and read the staged files in the release bucket (CloudFormation reads the parts' templates with the caller's access while it prepares their change sets).
 
 It can't choose the code: only a published release's template. It does choose the parameter values it passes, which it keeps as they are except for the domain parameters when it moves your domain.
 
 **AutoUpdate off (the default).** There is no deploy role. The change set waits for you: Settings, System, Update shows its summary and a link to it in the CloudFormation console, where you review it and choose **Execute** with your own permissions. The updater never executes it.
 
-**AutoUpdate on.** The stack creates `coderhelm-<name>-deploy-stack`, a CloudFormation service role, and the updater executes the change set through it in your maintenance window. It never does so when the change set (or a part's) would replace or remove a table, bucket, key, user pool or secret: then it waits for you, and says which.
+**AutoUpdate on.** The stack creates `coderhelm-<name>-deploy-stack`, a CloudFormation service role, and the updater executes the change set through it in your maintenance window. It never does so when the change set (or a part's) would replace or remove a table, bucket, key, user pool or secret, or when it changes the auto-update role or either boundary (the role can't change those): then it waits for you, and says which.
 
 - Only CloudFormation can assume it, only for this account (`aws:SourceAccount`) and only for this stack and its parts (`aws:SourceArn`).
-- It carries the boundary.
+- It carries the boundary (its own copy, kept with it).
 - Its policy is the deploy policy from `infra/lib/access.ts`, plus every CloudFormation action on the parent stack and its parts, reading the release bucket, reading and updating (never deleting) the install's secret, and the install guide's progress bucket. `infra/test/fixtures/native-sim.json` holds AWS's IAM policy simulator verdict on every call CloudFormation makes through it. The deploy policy lets it:
   - create and change roles named `coderhelm-<name>-*`, and only with the boundary on them. It can pass only those roles;
   - create and change functions, tables, buckets, queues, topics, log groups, rules, schedules, alarms, build projects, parameters, email settings and key aliases whose names start with `coderhelm-<name>`. Every one of CoderHelm's resources is named that way, and a test checks it;
@@ -148,7 +153,7 @@ It can't choose the code: only a published release's template. It does choose th
 
 So whoever controls the updater can move the install only to a template CoderHelm published, and can use the role only through CloudFormation.
 
-**A known limit.** CloudFormation keeps using a stack's service role for later operations once a stack was updated through it, and a role can't delete itself. So the auto-update role is kept when you delete the stack (and when you turn auto-update off again). `coderhelm-selfhost leftovers` lists it after the stack is gone, and `--delete` removes it. The boundary stays with it (IAM refuses to delete a policy a role still carries), and the leftover check lists both. Because later operations run through the role, they are limited to what it may do: it may not schedule a KMS key for deletion, change the boundary, or change its own policy. So a release that changes the boundary or that role's policy waits for an admin, and a delete with **KeepDataOnDelete** `false` needs `aws cloudformation delete-stack --role-arn <a role of yours>`. Anyone who may update this stack in CloudFormation can use the role this way too, without needing to pass it: keep CloudFormation write access on `coderhelm-<name>` to the people who administer the account. With auto-update off (the default) none of this applies and nothing is left.
+**A known limit.** CloudFormation keeps using a stack's service role for later operations once a stack was updated through it, and a role can't delete itself. So the auto-update role is kept when you delete the stack (and when you turn auto-update off again). `coderhelm-selfhost leftovers` lists it after the stack is gone, and `--delete` removes it. Its own copy of the boundary, `coderhelm-<name>-deploy-boundary-stack`, stays with it (IAM refuses to delete a policy a role still carries), and the leftover check lists both, only once this region's stack is gone and only when the kept role trusts that stack. Because later operations run through the role, they are limited to what it may do: it may not schedule a KMS key for deletion, change or delete either boundary, or change its own policy or boundary. So once an update ran through it, deleting the stack stops at the boundary (`DELETE_FAILED` on `Boundary`): delete with a role of your own, `aws cloudformation delete-stack --role-arn <a role of yours>`, or delete again in the console keeping `Boundary`, and remove it afterwards with `leftovers --delete`. So a release that changes the boundary or that role's policy waits for an admin, and so does the first update of an install with auto-update on to a release that gives the role its own copy (v0.8.6), and a delete needs `--role-arn <a role of yours>` as above. Anyone who may update this stack in CloudFormation can use the role this way too, without needing to pass it: keep CloudFormation write access on `coderhelm-<name>` to the people who administer the account. To turn auto-update on again after turning it off, first delete the kept role and its copy of the boundary in IAM (`coderhelm-<name>-deploy-stack`, then `coderhelm-<name>-deploy-boundary-stack`), or the stack update fails because they already exist. With auto-update off (the default) none of this applies and nothing is left.
 
 Who can still act within the boundary:
 
