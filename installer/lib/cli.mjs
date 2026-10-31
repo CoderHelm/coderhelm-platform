@@ -34,7 +34,13 @@ Commands
                 [--channel stable|preview] [--majors ask|auto]
   health        The quick health check the updater runs (doctor checks more)
   backup        Take on-demand backups of every table
-  uninstall     Delete the stacks (tables, bucket and secret are kept)
+  uninstall     Remove CoderHelm from the account: its stacks, Launch Stack,
+                permissions boundary, deploy role, buckets, logs and
+                parameters. Keeps the data (tables, data bucket, KMS keys,
+                user pool, secret) unless --everything. Shows the list and
+                asks for the install name first. --verify lists what is left
+                (read-only). The guided uninstall does the same from the
+                browser: docs.coderhelm.com/self-host/uninstall/
   telemetry     on | off | status: anonymous install and upgrade pings (off by default)
   domain apply  Put your own domain on the install (--hostname, --certificate-arn
                 in us-east-1, and --zone/--zone-id for a Route 53 zone), or
@@ -54,6 +60,10 @@ Options
   --source <dir>      Deploy from a CoderHelm checkout instead of a release
   --dry-run           Print every command and change, run nothing
   --yes               Don't ask (upgrade across action-needed releases, uninstall)
+  --everything        uninstall: delete the data too (also --delete-data);
+                      KMS keys after AWS's 7-day minimum
+  --verify            uninstall: only list what is left of the install
+  --stage, --region   uninstall: the install, without a config file
   --org <name>        github-app: create the app in this GitHub organization
   --app-id, --client-id, --private-key-file
                       github-app: store an app you made by hand (GitHub
@@ -97,6 +107,8 @@ export async function main(argv, deps = {}) {
     manifestFlow: deps.manifestFlow,
     resolveSource: deps.resolveSource,
     open: deps.open,
+    aws: deps.aws,
+    sleep: deps.sleep,
   };
   try {
     switch (command) {
@@ -139,8 +151,7 @@ export async function main(argv, deps = {}) {
         await cmd.backup(ctx);
         return 0;
       case "uninstall":
-        await cmd.uninstall(ctx);
-        return 0;
+        return (await cmd.uninstall(ctx)) ?? 0;
       case "telemetry":
         await cmd.telemetry(ctx);
         return 0;

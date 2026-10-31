@@ -10,9 +10,10 @@ import { fileURLToPath } from "node:url";
 
 export const TAG_RE = /^v\d+\.\d+\.\d+(-[0-9A-Za-z.]+)?$/;
 
-/** The template with `Version`'s `Default: latest` replaced by the tag. */
+/** The template with `Version`'s `Default: latest` replaced by the tag (YAML, or the JSON the uninstall stack is written in). */
 export function stampTemplate(text, tag) {
   if (!TAG_RE.test(tag)) throw new Error(`not a release tag: ${tag}`);
+  if (/^\s*(#[^\n]*\n\s*)*\{/.test(text)) return stampJson(text, tag);
   const lines = text.split("\n");
   const start = lines.findIndex((l) => /^ {2}Version:\s*$/.test(l));
   if (start < 0) throw new Error("the template has no Version parameter");
@@ -23,6 +24,25 @@ export function stampTemplate(text, tag) {
     }
   }
   throw new Error("the Version parameter has no `Default: latest` to stamp");
+}
+
+function stampJson(text, tag) {
+  const lines = text.split("\n");
+  const start = lines.findIndex((l) => /^ {4}"Version": \{\s*$/.test(l));
+  if (start < 0) throw new Error("the template has no Version parameter");
+  for (let i = start + 1; i < lines.length && !/^ {4}\}/.test(lines[i]); i++) {
+    if (/^ {6}"Default": "latest",?$/.test(lines[i])) {
+      lines[i] = lines[i].replace('"latest"', JSON.stringify(tag));
+      return lines.join("\n");
+    }
+  }
+  throw new Error('the Version parameter has no `"Default": "latest"` to stamp');
+}
+
+/** Where a release's uninstall template is published (next to its Launch Stack). */
+export function uninstallTemplateUrl(tag, bucket = "coderhelm-public") {
+  if (!TAG_RE.test(tag)) throw new Error(`not a release tag: ${tag}`);
+  return `https://${bucket}.s3.amazonaws.com/launch/${tag}/coderhelm-uninstall.yaml`;
 }
 
 /** Where a release's template is published (the hosted deployment's public bucket). */

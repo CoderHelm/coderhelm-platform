@@ -26,6 +26,17 @@ Read-only in AWS (DescribeType, SimulateCustomPolicy); needs credentials
 for any account (AWS_PROFILE). Run from infra/ after `npx tsc`:
 
     python3 scripts/deploy-role-sim.py
+
+With --uninstall, it checks the guided uninstall instead
+(infra/lib/uninstall-access.ts): each call in infra/lib/uninstall-cases.ts,
+by the uninstall build's session inside its window (idle policy and window
+as identity policies, the uninstall boundary as boundary), in both modes,
+by another session and after the window's end; and every condition key the
+window's allows use is one AWS's service reference lists for that action
+(else AWS would never match it). It writes test/fixtures/uninstall-sim.json
+for infra/test/uninstall-sim.test.ts:
+
+    python3 scripts/deploy-role-sim.py --uninstall
 """
 import argparse, concurrent.futures as cf, collections, glob, hashlib, json, os, re, subprocess, sys, time, urllib.parse, urllib.request
 
@@ -628,13 +639,106 @@ def grouped(simulated):
     return [{**v, "actions": dict(sorted(v["actions"].items())), "calls": sorted(v["calls"])} for v in sorted(g.values(), key=lambda x: (x["resource"], json.dumps(x["context"], sort_keys=True)))]
 
 
+UNINSTALL_JS = r"""
+const c = require("./dist/lib/uninstall-cases");
+const u = require("./dist/lib/uninstall-access");
+const out = { cases: c.uninstallCases(), session: c.sessionCases(), keep: c.casePolicies("keep"), everything: c.casePolicies("everything"),
+  constants: { account: c.CASE_ACCOUNT, region: c.CASE_REGION, userId: c.CASE_USER_ID, now: c.CASE_NOW, expires: c.CASE_EXPIRES },
+  allows: u.uninstallWindowStatements(c.caseNames()).filter((s) => s.Effect === "Allow") };
+process.stdout.write(JSON.stringify(out));
+"""
+
+GLOBAL_KEYS = ("aws:",)
+
+
+def uninstall_main(session, out):
+    d = json.loads(subprocess.run(["node", "-e", UNINSTALL_JS], check=True, capture_output=True, text=True).stdout)
+    for svc in sorted({a.split(":")[0] for st in d["allows"] for a in ([st["Action"]] if isinstance(st["Action"], str) else st["Action"])} - {"tag", "sts"}):
+        with urllib.request.urlopen(f"https://servicereference.us-east-1.amazonaws.com/v1/{svc}/{svc}.json") as f:
+            j = json.load(f)
+        SVC[j["Name"]] = {"actions": {a["Name"].lower(): a for a in j["Actions"]}, "resources": {r["Name"]: r for r in j["Resources"]}}
+
+    def keys_of(action):
+        """The action's own condition keys and its resource types' (where AWS lists aws:ResourceTag/${TagKey})."""
+        s_, a = svc_action(action)
+        if not a:
+            return set()
+        out = set(a.get("ActionConditionKeys", []))
+        for r in a.get("Resources", []):
+            out |= set(SVC[s_]["resources"].get(r["Name"], {}).get("ConditionKeys", []))
+        return {x.lower() for x in out}
+    # Every condition key an allow uses must be one AWS evaluates for that action.
+    keys = []
+    for st in d["allows"]:
+        for op, kv in (st.get("Condition") or {}).items():
+            for k in kv:
+                for a in ([st["Action"]] if isinstance(st["Action"], str) else st["Action"]):
+                    if "*" in a:
+                        continue
+                    have = keys_of(a)
+                    base = k.lower().split("/")[0] + "/${tagkey}" if "/" in k else k.lower()
+                    # Global keys (aws:userid, aws:CurrentTime) apply to every action; a tag key must be listed.
+                    ok = k.lower() in have or base in have or (k.startswith("aws:") and "/" not in k)
+                    keys.append({"statement": st["Sid"], "action": a, "key": k, "listed": bool(ok)})
+    iam = session.client("iam")
+    C = d["constants"]
+
+    def sim(pols, case, extra):
+        ctx = {"aws:userid": C["userId"], "aws:CurrentTime": C["now"], **(case.get("context") or {}), **extra}
+        entries = []
+        for k, v in ctx.items():
+            t = "date" if k == "aws:CurrentTime" else ("stringList" if isinstance(v, list) else "string")
+            entries.append({"ContextKeyName": k, "ContextKeyValues": v if isinstance(v, list) else [v], "ContextKeyType": t})
+        for attempt in range(8):
+            try:
+                r = iam.simulate_custom_policy(PolicyInputList=[json.dumps(pols["idle"]), json.dumps(pols["window"])],
+                                               PermissionsBoundaryPolicyInputList=[json.dumps(pols["boundary"])],
+                                               ActionNames=[case["action"]], ResourceArns=[case["resource"]], ContextEntries=entries)
+                ev = r["EvaluationResults"][0]
+                rr = ev.get("ResourceSpecificResults") or []
+                return rr[0]["EvalResourceDecision"] if rr else ev["EvalDecision"]
+            except iam.exceptions.ClientError as e:
+                if "Throttl" in str(e) or "Rate" in str(e):
+                    time.sleep(2 ** attempt)
+                    continue
+                raise
+
+    rows = []
+    for case in d["cases"]:
+        rows.append({**case, "keep": sim(d["keep"], case, {}), "everything": sim(d["everything"], case, {})})
+    session_rows = []
+    for case in d["session"]:
+        session_rows.append({**case, "anotherSession": sim(d["everything"], case, {"aws:userid": "AROAEXAMPLEBUILDROLE1:AWSCodeBuild-another-build"}),
+                             "afterTheEnd": sim(d["everything"], case, {"aws:CurrentTime": "2026-10-30T13:41:00Z"})})
+    fixture = {
+        "about": "Generated by infra/scripts/deploy-role-sim.py --uninstall: AWS's IAM policy simulator verdict on each call in infra/lib/uninstall-cases.ts, by the uninstall build inside its window.",
+        **C, "policies": {"keep": d["keep"], "everything": d["everything"]}, "conditionKeys": keys,
+        "rows": rows, "session": session_rows,
+    }
+    with open(out, "w") as f:
+        head = {k: v for k, v in fixture.items() if k not in ("rows", "session", "conditionKeys")}
+        f.write(json.dumps(head, indent=1)[:-2] + ',\n "conditionKeys": [\n')
+        f.write(",\n".join("  " + json.dumps(r, sort_keys=True) for r in keys))
+        f.write('\n ],\n "rows": [\n')
+        f.write(",\n".join("  " + json.dumps(r, sort_keys=True) for r in rows))
+        f.write('\n ],\n "session": [\n')
+        f.write(",\n".join("  " + json.dumps(r, sort_keys=True) for r in session_rows))
+        f.write("\n ]\n}\n")
+    print(f"{len(rows)} calls x 2 modes, {len(session_rows)} x 2 session checks simulated: keep {dict(collections.Counter(r['keep'] for r in rows))}, "
+          f"everything {dict(collections.Counter(r['everything'] for r in rows))}; condition keys not listed: {[k for k in keys if not k['listed']]}")
+
+
 def main():
     global BOUNDARY
     ap = argparse.ArgumentParser()
-    ap.add_argument("--out", default="test/fixtures/deploy-role-sim.json")
+    ap.add_argument("--out", default=None)
+    ap.add_argument("--uninstall", action="store_true")
     args = ap.parse_args()
     import boto3
     session = boto3.Session()
+    if args.uninstall:
+        return uninstall_main(session, args.out or "test/fixtures/uninstall-sim.json")
+    args.out = args.out or "test/fixtures/deploy-role-sim.json"
     synth = json.loads(subprocess.run(["node", "-e", SYNTH_JS, ACCT, REG, LAUNCH_ID], check=True, capture_output=True, text=True).stdout)
     T = synth["templates"]
     BOUNDARY = synth["names"]["boundaryArn"]

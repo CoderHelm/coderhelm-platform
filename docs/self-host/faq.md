@@ -26,7 +26,7 @@ Yes, with different `stage` names. Every resource name starts with `coderhelm-<s
 AWS usage plus model calls. See [Requirements](./requirements.md#what-it-costs).
 
 **How do I uninstall?**
-`npx -y github:CoderHelm/coderhelm-platform uninstall` deletes the stacks. With `retainData` (the default), tables, the data bucket, KMS keys, the user pool and the secret stay until you delete them. Uninstall your GitHub App from GitHub too.
+With the [guided uninstall](https://docs.coderhelm.com/self-host/uninstall/) (admins open it from Settings, System, Uninstall), or `npx -y github:CoderHelm/coderhelm-platform uninstall` from a terminal. Either removes CoderHelm and keeps its data (tables, the data bucket, KMS keys, the user pool and the secret), or with **Delete everything** (`--everything`) deletes those too, KMS keys after AWS's 7-day minimum. Both end with a check of anything left. A hybrid install releases its address and hands GitHub and Jira back to CoderHelm first. Uninstall your GitHub App from GitHub too. See [Uninstall](./uninstall.md).
 
 **What license is the code under?**
 FSL-1.1-ALv2, the Functional Source License with Apache 2.0 as the future license. You can run, change and self-host CoderHelm for your own company; you can't offer it as a competing hosted product; each release becomes Apache 2.0 two years after it ships. There is no license key or license check in the code. The full terms are in [LICENSE.md](../../LICENSE.md).

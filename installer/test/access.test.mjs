@@ -109,15 +109,12 @@ test("hardened: deploy never bootstraps, deploys through the install's deploy ro
   assert.ok(dep.env.includes("CODERHELM_ACCESS_STACK"));
 });
 
-test("hardened: update and uninstall go through the deploy role too", async () => {
+// Uninstall deletes each stack through the install's deploy role (test/uninstall.test.mjs).
+test("hardened: updates go through the deploy role too", async () => {
   const { file, dir } = setup({ access: LAUNCH });
   const runner = new FakeRunner(answers());
   await run(["update", "--config", file, "--to", "v1.1.0", "--yes", "--result-file", path.join(dir, "r.json")], { runner, resolveSource: source([]) });
   for (const c of cdkCalls(runner).filter((x) => x.args.includes("deploy"))) assert.ok(c.args.includes(DEPLOY_ROLE));
-  const r2 = new FakeRunner(answers());
-  await run(["uninstall", "--config", file, "--yes"], { runner: r2, resolveSource: source([]) });
-  const destroy = cdkCalls(r2).find((c) => c.args.includes("destroy"));
-  assert.deepEqual(destroy.args.slice(-2), ["--role-arn", DEPLOY_ROLE]);
 });
 
 test("hardened: going to a release from before hardening needs an admin, and an auto-rollback to one stops instead", async () => {

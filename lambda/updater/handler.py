@@ -1124,6 +1124,14 @@ def begin(store, env, now, version, actor, mode, extra=None, note=None):
     return dict(entry, id=hid)
 
 
+def install_identity(env):
+    """The install's name and region (its resources are coderhelm-<name>-*), or None for a custom prefix."""
+    prefix = env.get("RESOURCE_PREFIX") or ""
+    region = env.get("AWS_REGION") or env.get("AWS_DEFAULT_REGION") or ""
+    m = re.fullmatch(r"coderhelm-([a-z][a-z0-9-]{0,19})", prefix)
+    return {"stage": m.group(1), "region": region} if m and region else None
+
+
 def handle(event, env, store, now, fetch=fetch_releases, probe=None):
     probe = probe or invoke_worker
     action = (event or {}).get("action", "tick")
@@ -1154,6 +1162,8 @@ def handle(event, env, store, now, fetch=fetch_releases, probe=None):
             # The model check for the latest release (Settings, System and Setup).
             "model_check": (lambda mc: mc if latest and mc and mc.get("version") == latest["version"] else None)(
                 store.get("MODEL_CHECK")),
+            # Which install this is, for Settings, System, Uninstall's link to the guided uninstall.
+            "install": install_identity(env),
         }
 
     if action == "settings":

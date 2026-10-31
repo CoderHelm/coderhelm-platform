@@ -250,7 +250,7 @@ jobs:
       - name: Upload the templates
         run: |
           d="$RUNNER_TEMP/published"
-          for pair in launch-stack.yaml:coderhelm-launch.yaml coderhelm-log-reader.yaml:coderhelm-log-reader.yaml coderhelm-log-reader-update.yaml:coderhelm-log-reader-update.yaml; do
+          for pair in launch-stack.yaml:coderhelm-launch.yaml uninstall-stack.yaml:coderhelm-uninstall.yaml coderhelm-log-reader.yaml:coderhelm-log-reader.yaml coderhelm-log-reader-update.yaml:coderhelm-log-reader-update.yaml; do
             src="$d/${pair%%:*}"
             k="launch/$TAG/${pair#*:}"
             if curl --proto =https -fsSL -o "$RUNNER_TEMP/existing" "https://$PUBLIC_BUCKET.s3.amazonaws.com/$k"; then

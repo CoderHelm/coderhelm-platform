@@ -266,6 +266,8 @@ jobs:
           # installer its CodeBuild project runs (checked against SHA256SUMS).
           # The publish job uploads this same launch-stack.yaml to S3.
           node selfhost/launch/stamp-template.mjs infra/cfn/coderhelm-selfhost-launch.yaml "$TAG" > dist/launch-stack.yaml
+          # The guided uninstall's stack, pinned to this release the same way.
+          node selfhost/launch/stamp-template.mjs infra/cfn/coderhelm-selfhost-uninstall.yaml "$TAG" > dist/uninstall-stack.yaml
           cp selfhost/launch/bootstrap.mjs dist/launch-bootstrap.mjs
           # The read-only role teams create in their own AWS accounts, and the
           # stack that brings an existing role up to date: byte for byte the
@@ -279,7 +281,7 @@ jobs:
           # SHA256SUMS: the updater reads it only through the update build,
           # after the signature check (lambda/updater, model_check).
           node selfhost/launch/release-models.mjs "$TAG" > dist/models.json
-          (cd dist && sha256sum gateway.zip worker.zip mcp-proxy.zip dashboard.tar.gz source.tar.gz coderhelm-selfhost.tgz install.sh launch-stack.yaml launch-bootstrap.mjs models.json coderhelm-log-reader.yaml coderhelm-log-reader-update.yaml > SHA256SUMS)
+          (cd dist && sha256sum gateway.zip worker.zip mcp-proxy.zip dashboard.tar.gz source.tar.gz coderhelm-selfhost.tgz install.sh launch-stack.yaml uninstall-stack.yaml launch-bootstrap.mjs models.json coderhelm-log-reader.yaml coderhelm-log-reader-update.yaml > SHA256SUMS)
           cat dist/SHA256SUMS
 
       # The release's own CDK app synthesizes for a fresh self-host config.
@@ -361,6 +363,7 @@ jobs:
             dist/install.sh
             dist/launch-bootstrap.mjs
             dist/launch-stack.yaml
+            dist/uninstall-stack.yaml
             dist/models.json
             dist/coderhelm-log-reader.yaml
             dist/coderhelm-log-reader-update.yaml
@@ -408,7 +411,7 @@ jobs:
         if: needs.check.outputs.path == 'maintainer'
         run: |
           # Written once: a template already there must be this one.
-          for pair in launch-stack.yaml:coderhelm-launch.yaml coderhelm-log-reader.yaml:coderhelm-log-reader.yaml coderhelm-log-reader-update.yaml:coderhelm-log-reader-update.yaml; do
+          for pair in launch-stack.yaml:coderhelm-launch.yaml uninstall-stack.yaml:coderhelm-uninstall.yaml coderhelm-log-reader.yaml:coderhelm-log-reader.yaml coderhelm-log-reader-update.yaml:coderhelm-log-reader-update.yaml; do
             src="dist/${pair%%:*}"
             k="launch/$TAG/${pair#*:}"
             if curl --proto =https -fsSL -o "$RUNNER_TEMP/existing" "https://$PUBLIC_BUCKET.s3.amazonaws.com/$k"; then
