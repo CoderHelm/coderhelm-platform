@@ -18,8 +18,8 @@
        "logs:PutLogEvents"
       ],
       "Resource": [
-       "arn:aws:logs:us-east-1:111122223333:log-group:/aws/codebuild/coderhelm-prod-uninstall-5e6f7a8b",
-       "arn:aws:logs:us-east-1:111122223333:log-group:/aws/codebuild/coderhelm-prod-uninstall-5e6f7a8b:*"
+       "arn:aws:logs:us-east-1:111122223333:log-group:/aws/codebuild/coderhelm--uninstall-prod-5e6f7a8b",
+       "arn:aws:logs:us-east-1:111122223333:log-group:/aws/codebuild/coderhelm--uninstall-prod-5e6f7a8b:*"
       ]
      },
      {
@@ -32,13 +32,13 @@
       "Sid": "AskForWindow",
       "Effect": "Allow",
       "Action": "lambda:InvokeFunction",
-      "Resource": "arn:aws:lambda:us-east-1:111122223333:function:coderhelm-prod-uninstall-window-5e6f7a8b"
+      "Resource": "arn:aws:lambda:us-east-1:111122223333:function:coderhelm--uninstall-prod-window-5e6f7a8b"
      },
      {
       "Sid": "CloseOwnWindow",
       "Effect": "Allow",
       "Action": "iam:DeleteRolePolicy",
-      "Resource": "arn:aws:iam::111122223333:role/coderhelm-prod-uninstall-build-5e6f7a8b"
+      "Resource": "arn:aws:iam::111122223333:role/coderhelm--uninstall-prod-build-5e6f7a8b"
      }
     ]
    },
@@ -118,7 +118,6 @@
       "Effect": "Allow",
       "Action": [
        "lambda:DeleteFunction",
-       "lambda:InvokeFunction",
        "codebuild:DeleteProject",
        "ssm:DeleteParameter",
        "ssm:DeleteParameters",
@@ -146,8 +145,6 @@
        "arn:aws:s3:::coderhelm-prod-assets-1a2b3c4d-111122223333/*",
        "arn:aws:s3:::coderhelm-prod-dashboard-111122223333",
        "arn:aws:s3:::coderhelm-prod-dashboard-111122223333/*",
-       "arn:aws:s3:::coderhelm-prod-sandbox-111122223333",
-       "arn:aws:s3:::coderhelm-prod-sandbox-111122223333/*",
        "arn:aws:s3:::coderhelm-setup-abcdefghijklmnop",
        "arn:aws:s3:::coderhelm-setup-abcdefghijklmnop/*",
        "arn:aws:logs:us-east-1:111122223333:log-group:/aws/lambda/coderhelm-prod-*",
@@ -157,11 +154,25 @@
       ]
      },
      {
-      "Sid": "InstallRolePolicies",
+      "Sid": "LaunchCustomResource",
+      "Effect": "Allow",
+      "Action": "lambda:InvokeFunction",
+      "Resource": [
+       "arn:aws:lambda:us-east-1:111122223333:function:coderhelm-prod-starter-1a2b3c4d"
+      ],
+      "Condition": {
+       "ForAnyValue:StringEquals": {
+        "aws:CalledVia": "cloudformation.amazonaws.com"
+       }
+      }
+     },
+     {
+      "Sid": "InstallRoles",
       "Effect": "Allow",
       "Action": [
        "iam:DeleteRolePolicy",
-       "iam:DetachRolePolicy"
+       "iam:DetachRolePolicy",
+       "iam:DeleteRole"
       ],
       "Resource": "arn:aws:iam::111122223333:role/coderhelm-prod-*",
       "Condition": {
@@ -169,28 +180,6 @@
         "iam:PermissionsBoundary": [
          "arn:aws:iam::111122223333:policy/coderhelm-prod-boundary-1a2b3c4d"
         ]
-       }
-      }
-     },
-     {
-      "Sid": "TaggedRoles",
-      "Effect": "Allow",
-      "Action": "iam:DeleteRole",
-      "Resource": "arn:aws:iam::111122223333:role/coderhelm-prod-*",
-      "Condition": {
-       "StringEquals": {
-        "iam:ResourceTag/coderhelm:install": "coderhelm-prod"
-       }
-      }
-     },
-     {
-      "Sid": "UpdaterCertificates",
-      "Effect": "Allow",
-      "Action": "acm:DeleteCertificate",
-      "Resource": "arn:aws:acm:*:111122223333:certificate/*",
-      "Condition": {
-       "StringEquals": {
-        "aws:ResourceTag/coderhelm": "coderhelm-prod"
        }
       }
      },
@@ -211,10 +200,10 @@
       "Effect": "Deny",
       "Action": "*",
       "NotResource": [
-       "arn:aws:logs:us-east-1:111122223333:log-group:/aws/codebuild/coderhelm-prod-uninstall-5e6f7a8b*",
+       "arn:aws:logs:us-east-1:111122223333:log-group:/aws/codebuild/coderhelm--uninstall-prod-5e6f7a8b*",
        "arn:aws:s3:::coderhelm-setup-uninstallprogres/status.json",
-       "arn:aws:lambda:us-east-1:111122223333:function:coderhelm-prod-uninstall-window-5e6f7a8b",
-       "arn:aws:iam::111122223333:role/coderhelm-prod-uninstall-build-5e6f7a8b"
+       "arn:aws:lambda:us-east-1:111122223333:function:coderhelm--uninstall-prod-window-5e6f7a8b",
+       "arn:aws:iam::111122223333:role/coderhelm--uninstall-prod-build-5e6f7a8b"
       ],
       "Condition": {
        "StringNotEquals": {
@@ -229,10 +218,10 @@
       "Effect": "Deny",
       "Action": "*",
       "NotResource": [
-       "arn:aws:logs:us-east-1:111122223333:log-group:/aws/codebuild/coderhelm-prod-uninstall-5e6f7a8b*",
+       "arn:aws:logs:us-east-1:111122223333:log-group:/aws/codebuild/coderhelm--uninstall-prod-5e6f7a8b*",
        "arn:aws:s3:::coderhelm-setup-uninstallprogres/status.json",
-       "arn:aws:lambda:us-east-1:111122223333:function:coderhelm-prod-uninstall-window-5e6f7a8b",
-       "arn:aws:iam::111122223333:role/coderhelm-prod-uninstall-build-5e6f7a8b"
+       "arn:aws:lambda:us-east-1:111122223333:function:coderhelm--uninstall-prod-window-5e6f7a8b",
+       "arn:aws:iam::111122223333:role/coderhelm--uninstall-prod-build-5e6f7a8b"
       ],
       "Condition": {
        "DateGreaterThan": {
@@ -246,7 +235,6 @@
       "Sid": "OtherInstallsInsideThisName",
       "Effect": "Deny",
       "Action": [
-       "acm:DeleteCertificate",
        "cloudformation:DeleteStack",
        "codebuild:DeleteProject",
        "cognito-idp:DeleteUserPool",
@@ -291,8 +279,8 @@
       "Effect": "Deny",
       "Action": "logs:DeleteLogGroup",
       "Resource": [
-       "arn:aws:logs:us-east-1:111122223333:log-group:/aws/codebuild/coderhelm-prod-uninstall-*",
-       "arn:aws:logs:us-east-1:111122223333:log-group:/aws/lambda/coderhelm-prod-uninstall-*"
+       "arn:aws:logs:us-east-1:111122223333:log-group:/aws/codebuild/coderhelm--uninstall-prod-*",
+       "arn:aws:logs:us-east-1:111122223333:log-group:/aws/lambda/coderhelm--uninstall-prod-*"
       ]
      },
      {
@@ -415,7 +403,8 @@
       ],
       "NotResource": [
        "arn:aws:iam::111122223333:role/coderhelm-prod-*",
-       "arn:aws:iam::111122223333:policy/coderhelm-prod-*"
+       "arn:aws:iam::111122223333:policy/coderhelm-prod-*",
+       "arn:aws:iam::111122223333:role/coderhelm--uninstall-prod-*"
       ]
      },
      {
@@ -468,9 +457,9 @@
        "iam:Upload*"
       ],
       "Resource": [
-       "arn:aws:iam::111122223333:role/coderhelm-prod-uninstall-window-5e6f7a8b",
-       "arn:aws:iam::111122223333:role/coderhelm-prod-uninstall-starter-5e6f7a8b",
-       "arn:aws:iam::111122223333:policy/coderhelm-prod-uninstall-*"
+       "arn:aws:iam::111122223333:role/coderhelm--uninstall-prod-window-5e6f7a8b",
+       "arn:aws:iam::111122223333:role/coderhelm--uninstall-prod-starter-5e6f7a8b",
+       "arn:aws:iam::111122223333:policy/coderhelm--uninstall-prod-*"
       ]
      },
      {
@@ -482,7 +471,7 @@
        "iam:Get*",
        "iam:List*"
       ],
-      "Resource": "arn:aws:iam::111122223333:role/coderhelm-prod-uninstall-*"
+      "Resource": "arn:aws:iam::111122223333:role/coderhelm--uninstall-prod-*"
      },
      {
       "Sid": "TheUninstallerStaysFunctions",
@@ -492,7 +481,7 @@
        "lambda:Get*",
        "lambda:List*"
       ],
-      "Resource": "arn:aws:lambda:us-east-1:111122223333:function:coderhelm-prod-uninstall-*"
+      "Resource": "arn:aws:lambda:us-east-1:111122223333:function:coderhelm--uninstall-prod-*"
      },
      {
       "Sid": "TheUninstallerStaysProject",
@@ -502,7 +491,7 @@
        "codebuild:BatchGet*",
        "codebuild:List*"
       ],
-      "Resource": "arn:aws:codebuild:us-east-1:111122223333:project/coderhelm-prod-uninstall-*"
+      "Resource": "arn:aws:codebuild:us-east-1:111122223333:project/coderhelm--uninstall-prod-*"
      },
      {
       "Sid": "TheUninstallerStaysParameters",
@@ -512,7 +501,7 @@
        "ssm:GetParameters",
        "ssm:Describe*"
       ],
-      "Resource": "arn:aws:ssm:us-east-1:111122223333:parameter/coderhelm-prod/uninstall-*"
+      "Resource": "arn:aws:ssm:us-east-1:111122223333:parameter/coderhelm--uninstall-prod-*"
      },
      {
       "Sid": "TheUninstallerStaysStack",
@@ -522,7 +511,7 @@
        "cloudformation:Get*",
        "cloudformation:List*"
       ],
-      "Resource": "arn:aws:cloudformation:us-east-1:111122223333:stack/coderhelm-prod-uninstall*/*"
+      "Resource": "arn:aws:cloudformation:us-east-1:111122223333:stack/coderhelm--uninstall-prod-*/*"
      },
      {
       "Sid": "TheUninstallerStaysLogs",
@@ -535,8 +524,8 @@
        "logs:List*"
       ],
       "Resource": [
-       "arn:aws:logs:us-east-1:111122223333:log-group:/aws/codebuild/coderhelm-prod-uninstall-*",
-       "arn:aws:logs:us-east-1:111122223333:log-group:/aws/lambda/coderhelm-prod-uninstall-*"
+       "arn:aws:logs:us-east-1:111122223333:log-group:/aws/codebuild/coderhelm--uninstall-prod-*",
+       "arn:aws:logs:us-east-1:111122223333:log-group:/aws/lambda/coderhelm--uninstall-prod-*"
       ]
      }
     ]
@@ -554,8 +543,8 @@
        "logs:PutLogEvents"
       ],
       "Resource": [
-       "arn:aws:logs:us-east-1:111122223333:log-group:/aws/codebuild/coderhelm-prod-uninstall-5e6f7a8b",
-       "arn:aws:logs:us-east-1:111122223333:log-group:/aws/codebuild/coderhelm-prod-uninstall-5e6f7a8b:*"
+       "arn:aws:logs:us-east-1:111122223333:log-group:/aws/codebuild/coderhelm--uninstall-prod-5e6f7a8b",
+       "arn:aws:logs:us-east-1:111122223333:log-group:/aws/codebuild/coderhelm--uninstall-prod-5e6f7a8b:*"
       ]
      },
      {
@@ -568,13 +557,13 @@
       "Sid": "AskForWindow",
       "Effect": "Allow",
       "Action": "lambda:InvokeFunction",
-      "Resource": "arn:aws:lambda:us-east-1:111122223333:function:coderhelm-prod-uninstall-window-5e6f7a8b"
+      "Resource": "arn:aws:lambda:us-east-1:111122223333:function:coderhelm--uninstall-prod-window-5e6f7a8b"
      },
      {
       "Sid": "CloseOwnWindow",
       "Effect": "Allow",
       "Action": "iam:DeleteRolePolicy",
-      "Resource": "arn:aws:iam::111122223333:role/coderhelm-prod-uninstall-build-5e6f7a8b"
+      "Resource": "arn:aws:iam::111122223333:role/coderhelm--uninstall-prod-build-5e6f7a8b"
      }
     ]
    },
@@ -654,7 +643,6 @@
       "Effect": "Allow",
       "Action": [
        "lambda:DeleteFunction",
-       "lambda:InvokeFunction",
        "codebuild:DeleteProject",
        "ssm:DeleteParameter",
        "ssm:DeleteParameters",
@@ -682,8 +670,6 @@
        "arn:aws:s3:::coderhelm-prod-assets-1a2b3c4d-111122223333/*",
        "arn:aws:s3:::coderhelm-prod-dashboard-111122223333",
        "arn:aws:s3:::coderhelm-prod-dashboard-111122223333/*",
-       "arn:aws:s3:::coderhelm-prod-sandbox-111122223333",
-       "arn:aws:s3:::coderhelm-prod-sandbox-111122223333/*",
        "arn:aws:s3:::coderhelm-setup-abcdefghijklmnop",
        "arn:aws:s3:::coderhelm-setup-abcdefghijklmnop/*",
        "arn:aws:logs:us-east-1:111122223333:log-group:/aws/lambda/coderhelm-prod-*",
@@ -693,11 +679,25 @@
       ]
      },
      {
-      "Sid": "InstallRolePolicies",
+      "Sid": "LaunchCustomResource",
+      "Effect": "Allow",
+      "Action": "lambda:InvokeFunction",
+      "Resource": [
+       "arn:aws:lambda:us-east-1:111122223333:function:coderhelm-prod-starter-1a2b3c4d"
+      ],
+      "Condition": {
+       "ForAnyValue:StringEquals": {
+        "aws:CalledVia": "cloudformation.amazonaws.com"
+       }
+      }
+     },
+     {
+      "Sid": "InstallRoles",
       "Effect": "Allow",
       "Action": [
        "iam:DeleteRolePolicy",
-       "iam:DetachRolePolicy"
+       "iam:DetachRolePolicy",
+       "iam:DeleteRole"
       ],
       "Resource": "arn:aws:iam::111122223333:role/coderhelm-prod-*",
       "Condition": {
@@ -705,28 +705,6 @@
         "iam:PermissionsBoundary": [
          "arn:aws:iam::111122223333:policy/coderhelm-prod-boundary-1a2b3c4d"
         ]
-       }
-      }
-     },
-     {
-      "Sid": "TaggedRoles",
-      "Effect": "Allow",
-      "Action": "iam:DeleteRole",
-      "Resource": "arn:aws:iam::111122223333:role/coderhelm-prod-*",
-      "Condition": {
-       "StringEquals": {
-        "iam:ResourceTag/coderhelm:install": "coderhelm-prod"
-       }
-      }
-     },
-     {
-      "Sid": "UpdaterCertificates",
-      "Effect": "Allow",
-      "Action": "acm:DeleteCertificate",
-      "Resource": "arn:aws:acm:*:111122223333:certificate/*",
-      "Condition": {
-       "StringEquals": {
-        "aws:ResourceTag/coderhelm": "coderhelm-prod"
        }
       }
      },
@@ -818,10 +796,10 @@
       "Effect": "Deny",
       "Action": "*",
       "NotResource": [
-       "arn:aws:logs:us-east-1:111122223333:log-group:/aws/codebuild/coderhelm-prod-uninstall-5e6f7a8b*",
+       "arn:aws:logs:us-east-1:111122223333:log-group:/aws/codebuild/coderhelm--uninstall-prod-5e6f7a8b*",
        "arn:aws:s3:::coderhelm-setup-uninstallprogres/status.json",
-       "arn:aws:lambda:us-east-1:111122223333:function:coderhelm-prod-uninstall-window-5e6f7a8b",
-       "arn:aws:iam::111122223333:role/coderhelm-prod-uninstall-build-5e6f7a8b"
+       "arn:aws:lambda:us-east-1:111122223333:function:coderhelm--uninstall-prod-window-5e6f7a8b",
+       "arn:aws:iam::111122223333:role/coderhelm--uninstall-prod-build-5e6f7a8b"
       ],
       "Condition": {
        "StringNotEquals": {
@@ -836,10 +814,10 @@
       "Effect": "Deny",
       "Action": "*",
       "NotResource": [
-       "arn:aws:logs:us-east-1:111122223333:log-group:/aws/codebuild/coderhelm-prod-uninstall-5e6f7a8b*",
+       "arn:aws:logs:us-east-1:111122223333:log-group:/aws/codebuild/coderhelm--uninstall-prod-5e6f7a8b*",
        "arn:aws:s3:::coderhelm-setup-uninstallprogres/status.json",
-       "arn:aws:lambda:us-east-1:111122223333:function:coderhelm-prod-uninstall-window-5e6f7a8b",
-       "arn:aws:iam::111122223333:role/coderhelm-prod-uninstall-build-5e6f7a8b"
+       "arn:aws:lambda:us-east-1:111122223333:function:coderhelm--uninstall-prod-window-5e6f7a8b",
+       "arn:aws:iam::111122223333:role/coderhelm--uninstall-prod-build-5e6f7a8b"
       ],
       "Condition": {
        "DateGreaterThan": {
@@ -853,7 +831,6 @@
       "Sid": "OtherInstallsInsideThisName",
       "Effect": "Deny",
       "Action": [
-       "acm:DeleteCertificate",
        "cloudformation:DeleteStack",
        "codebuild:DeleteProject",
        "cognito-idp:DeleteUserPool",
@@ -898,8 +875,8 @@
       "Effect": "Deny",
       "Action": "logs:DeleteLogGroup",
       "Resource": [
-       "arn:aws:logs:us-east-1:111122223333:log-group:/aws/codebuild/coderhelm-prod-uninstall-*",
-       "arn:aws:logs:us-east-1:111122223333:log-group:/aws/lambda/coderhelm-prod-uninstall-*"
+       "arn:aws:logs:us-east-1:111122223333:log-group:/aws/codebuild/coderhelm--uninstall-prod-*",
+       "arn:aws:logs:us-east-1:111122223333:log-group:/aws/lambda/coderhelm--uninstall-prod-*"
       ]
      },
      {
@@ -1022,7 +999,8 @@
       ],
       "NotResource": [
        "arn:aws:iam::111122223333:role/coderhelm-prod-*",
-       "arn:aws:iam::111122223333:policy/coderhelm-prod-*"
+       "arn:aws:iam::111122223333:policy/coderhelm-prod-*",
+       "arn:aws:iam::111122223333:role/coderhelm--uninstall-prod-*"
       ]
      },
      {
@@ -1075,9 +1053,9 @@
        "iam:Upload*"
       ],
       "Resource": [
-       "arn:aws:iam::111122223333:role/coderhelm-prod-uninstall-window-5e6f7a8b",
-       "arn:aws:iam::111122223333:role/coderhelm-prod-uninstall-starter-5e6f7a8b",
-       "arn:aws:iam::111122223333:policy/coderhelm-prod-uninstall-*"
+       "arn:aws:iam::111122223333:role/coderhelm--uninstall-prod-window-5e6f7a8b",
+       "arn:aws:iam::111122223333:role/coderhelm--uninstall-prod-starter-5e6f7a8b",
+       "arn:aws:iam::111122223333:policy/coderhelm--uninstall-prod-*"
       ]
      },
      {
@@ -1089,7 +1067,7 @@
        "iam:Get*",
        "iam:List*"
       ],
-      "Resource": "arn:aws:iam::111122223333:role/coderhelm-prod-uninstall-*"
+      "Resource": "arn:aws:iam::111122223333:role/coderhelm--uninstall-prod-*"
      },
      {
       "Sid": "TheUninstallerStaysFunctions",
@@ -1099,7 +1077,7 @@
        "lambda:Get*",
        "lambda:List*"
       ],
-      "Resource": "arn:aws:lambda:us-east-1:111122223333:function:coderhelm-prod-uninstall-*"
+      "Resource": "arn:aws:lambda:us-east-1:111122223333:function:coderhelm--uninstall-prod-*"
      },
      {
       "Sid": "TheUninstallerStaysProject",
@@ -1109,7 +1087,7 @@
        "codebuild:BatchGet*",
        "codebuild:List*"
       ],
-      "Resource": "arn:aws:codebuild:us-east-1:111122223333:project/coderhelm-prod-uninstall-*"
+      "Resource": "arn:aws:codebuild:us-east-1:111122223333:project/coderhelm--uninstall-prod-*"
      },
      {
       "Sid": "TheUninstallerStaysParameters",
@@ -1119,7 +1097,7 @@
        "ssm:GetParameters",
        "ssm:Describe*"
       ],
-      "Resource": "arn:aws:ssm:us-east-1:111122223333:parameter/coderhelm-prod/uninstall-*"
+      "Resource": "arn:aws:ssm:us-east-1:111122223333:parameter/coderhelm--uninstall-prod-*"
      },
      {
       "Sid": "TheUninstallerStaysStack",
@@ -1129,7 +1107,7 @@
        "cloudformation:Get*",
        "cloudformation:List*"
       ],
-      "Resource": "arn:aws:cloudformation:us-east-1:111122223333:stack/coderhelm-prod-uninstall*/*"
+      "Resource": "arn:aws:cloudformation:us-east-1:111122223333:stack/coderhelm--uninstall-prod-*/*"
      },
      {
       "Sid": "TheUninstallerStaysLogs",
@@ -1142,8 +1120,8 @@
        "logs:List*"
       ],
       "Resource": [
-       "arn:aws:logs:us-east-1:111122223333:log-group:/aws/codebuild/coderhelm-prod-uninstall-*",
-       "arn:aws:logs:us-east-1:111122223333:log-group:/aws/lambda/coderhelm-prod-uninstall-*"
+       "arn:aws:logs:us-east-1:111122223333:log-group:/aws/codebuild/coderhelm--uninstall-prod-*",
+       "arn:aws:logs:us-east-1:111122223333:log-group:/aws/lambda/coderhelm--uninstall-prod-*"
       ]
      }
     ]
@@ -1155,10 +1133,10 @@
   {"action": "cloudformation:DeleteStack", "key": "cloudformation:RoleArn", "listed": true, "statement": "InstallStacks"},
   {"action": "iam:PassRole", "key": "iam:PassedToService", "listed": true, "statement": "PassDeployRole"},
   {"action": "cloudformation:DeleteStack", "key": "cloudformation:RoleArn", "listed": true, "statement": "LaunchStacks"},
-  {"action": "iam:DeleteRolePolicy", "key": "iam:PermissionsBoundary", "listed": true, "statement": "InstallRolePolicies"},
-  {"action": "iam:DetachRolePolicy", "key": "iam:PermissionsBoundary", "listed": true, "statement": "InstallRolePolicies"},
-  {"action": "iam:DeleteRole", "key": "iam:ResourceTag/coderhelm:install", "listed": true, "statement": "TaggedRoles"},
-  {"action": "acm:DeleteCertificate", "key": "aws:ResourceTag/coderhelm", "listed": true, "statement": "UpdaterCertificates"},
+  {"action": "lambda:InvokeFunction", "key": "aws:CalledVia", "listed": true, "statement": "LaunchCustomResource"},
+  {"action": "iam:DeleteRolePolicy", "key": "iam:PermissionsBoundary", "listed": true, "statement": "InstallRoles"},
+  {"action": "iam:DetachRolePolicy", "key": "iam:PermissionsBoundary", "listed": true, "statement": "InstallRoles"},
+  {"action": "iam:DeleteRole", "key": "iam:PermissionsBoundary", "listed": true, "statement": "InstallRoles"},
   {"action": "kms:Decrypt", "key": "aws:ResourceTag/coderhelm:install", "listed": true, "statement": "ReadRegistrationKey"},
   {"action": "kms:Decrypt", "key": "kms:ViaService", "listed": true, "statement": "ReadRegistrationKey"},
   {"action": "dynamodb:DeleteTable", "key": "aws:ResourceTag/coderhelm:install", "listed": true, "statement": "DataTables"},
@@ -1176,38 +1154,42 @@
   {"action": "cloudformation:DeleteStack", "allowed": [], "context": {"aws:ResourceTag/coderhelm:install": "coderhelm-prod-eu", "cloudformation:RoleArn": "arn:aws:iam::111122223333:role/coderhelm-prod-deploy-1a2b3c4d"}, "everything": "implicitDeny", "keep": "implicitDeny", "resource": "arn:aws:cloudformation:us-east-1:111122223333:stack/coderhelm-prod-web/0a1b", "why": "a stack of the name tagged for another install"},
   {"action": "cloudformation:DeleteStack", "allowed": [], "context": {"aws:ResourceTag/coderhelm:install": "coderhelm-prod", "cloudformation:RoleArn": "arn:aws:iam::111122223333:role/coderhelm-prod-deploy-1a2b3c4d"}, "everything": "explicitDeny", "keep": "explicitDeny", "resource": "arn:aws:cloudformation:us-east-1:111122223333:stack/coderhelm-prod-eu-api/0a1b", "why": "the longer install's stack, even tagged for this one"},
   {"action": "cloudformation:DeleteStack", "allowed": ["keep", "everything"], "everything": "allowed", "keep": "allowed", "resource": "arn:aws:cloudformation:us-east-1:111122223333:stack/coderhelm-prod/1a2b3c4d-0000", "why": "the Launch Stack, by name, with the build's own credentials"},
-  {"action": "cloudformation:DeleteStack", "allowed": [], "everything": "explicitDeny", "keep": "explicitDeny", "resource": "arn:aws:cloudformation:us-east-1:111122223333:stack/coderhelm-prod-uninstall/5e6f", "why": "the uninstaller's own stack"},
+  {"action": "cloudformation:DeleteStack", "allowed": [], "everything": "explicitDeny", "keep": "explicitDeny", "resource": "arn:aws:cloudformation:us-east-1:111122223333:stack/coderhelm--uninstall-prod-abcd12/5e6f", "why": "the uninstaller's own stack"},
   {"action": "cloudformation:DeleteStack", "allowed": [], "everything": "implicitDeny", "keep": "implicitDeny", "resource": "arn:aws:cloudformation:us-east-1:111122223333:stack/CDKToolkit/0a1b", "why": "the CDK bootstrap stack"},
   {"action": "cloudformation:DeleteStack", "allowed": [], "everything": "implicitDeny", "keep": "implicitDeny", "resource": "arn:aws:cloudformation:us-east-1:111122223333:stack/my-app/0a1b", "why": "someone else's stack"},
   {"action": "iam:PassRole", "allowed": ["keep", "everything"], "context": {"iam:PassedToService": "cloudformation.amazonaws.com"}, "everything": "allowed", "keep": "allowed", "resource": "arn:aws:iam::111122223333:role/coderhelm-prod-deploy-1a2b3c4d", "why": "the deploy role, passed to CloudFormation"},
   {"action": "iam:PassRole", "allowed": [], "context": {"iam:PassedToService": "lambda.amazonaws.com"}, "everything": "explicitDeny", "keep": "explicitDeny", "resource": "arn:aws:iam::111122223333:role/coderhelm-prod-deploy-1a2b3c4d", "why": "the deploy role, passed to Lambda"},
   {"action": "iam:PassRole", "allowed": [], "context": {"iam:PassedToService": "cloudformation.amazonaws.com"}, "everything": "explicitDeny", "keep": "explicitDeny", "resource": "arn:aws:iam::111122223333:role/Admin", "why": "an admin role, passed to CloudFormation"},
   {"action": "lambda:DeleteFunction", "allowed": ["keep", "everything"], "everything": "allowed", "keep": "allowed", "resource": "arn:aws:lambda:us-east-1:111122223333:function:coderhelm-prod-starter-1a2b3c4d", "why": "the Launch Stack's starter function"},
+  {"action": "lambda:InvokeFunction", "allowed": ["keep", "everything"], "context": {"aws:CalledVia": ["cloudformation.amazonaws.com"]}, "everything": "allowed", "keep": "allowed", "resource": "arn:aws:lambda:us-east-1:111122223333:function:coderhelm-prod-starter-1a2b3c4d", "why": "the Launch Stack's custom resource, invoked by CloudFormation"},
+  {"action": "lambda:InvokeFunction", "allowed": [], "everything": "implicitDeny", "keep": "implicitDeny", "resource": "arn:aws:lambda:us-east-1:111122223333:function:coderhelm-prod-starter-1a2b3c4d", "why": "the Launch Stack's starter, invoked directly with a forged event"},
   {"action": "lambda:DeleteFunction", "allowed": [], "everything": "implicitDeny", "keep": "implicitDeny", "resource": "arn:aws:lambda:us-east-1:111122223333:function:coderhelm-prod-gateway-0f1e2d3c", "why": "an install function without the Launch Stack id"},
-  {"action": "lambda:DeleteFunction", "allowed": [], "everything": "explicitDeny", "keep": "explicitDeny", "resource": "arn:aws:lambda:us-east-1:111122223333:function:coderhelm-prod-uninstall-window-5e6f7a8b", "why": "the uninstaller's window function"},
-  {"action": "lambda:UpdateFunctionCode", "allowed": [], "everything": "explicitDeny", "keep": "explicitDeny", "resource": "arn:aws:lambda:us-east-1:111122223333:function:coderhelm-prod-uninstall-window-5e6f7a8b", "why": "the uninstaller's window function changed"},
+  {"action": "lambda:DeleteFunction", "allowed": [], "everything": "explicitDeny", "keep": "explicitDeny", "resource": "arn:aws:lambda:us-east-1:111122223333:function:coderhelm--uninstall-prod-window-5e6f7a8b", "why": "the uninstaller's window function"},
+  {"action": "lambda:UpdateFunctionCode", "allowed": [], "everything": "explicitDeny", "keep": "explicitDeny", "resource": "arn:aws:lambda:us-east-1:111122223333:function:coderhelm--uninstall-prod-window-5e6f7a8b", "why": "the uninstaller's window function changed"},
   {"action": "lambda:DeleteFunction", "allowed": [], "everything": "implicitDeny", "keep": "implicitDeny", "resource": "arn:aws:lambda:us-east-1:111122223333:function:my-app", "why": "someone else's function"},
   {"action": "codebuild:DeleteProject", "allowed": ["keep", "everything"], "everything": "allowed", "keep": "allowed", "resource": "arn:aws:codebuild:us-east-1:111122223333:project/coderhelm-prod-installer", "why": "the Launch Stack's installer project"},
-  {"action": "codebuild:DeleteProject", "allowed": [], "everything": "explicitDeny", "keep": "explicitDeny", "resource": "arn:aws:codebuild:us-east-1:111122223333:project/coderhelm-prod-uninstall-5e6f7a8b", "why": "the uninstaller's own project"},
+  {"action": "codebuild:DeleteProject", "allowed": [], "everything": "explicitDeny", "keep": "explicitDeny", "resource": "arn:aws:codebuild:us-east-1:111122223333:project/coderhelm--uninstall-prod-5e6f7a8b", "why": "the uninstaller's own project"},
   {"action": "codebuild:DeleteProject", "allowed": [], "everything": "implicitDeny", "keep": "implicitDeny", "resource": "arn:aws:codebuild:us-east-1:111122223333:project/coderhelm-prod-sandbox", "why": "the install's sandbox project (its stack deletes it)"},
   {"action": "iam:DeleteRole", "allowed": ["keep", "everything"], "everything": "allowed", "keep": "allowed", "resource": "arn:aws:iam::111122223333:role/coderhelm-prod-deploy-1a2b3c4d", "why": "the deploy role"},
   {"action": "iam:DeleteRole", "allowed": ["keep", "everything"], "everything": "allowed", "keep": "allowed", "resource": "arn:aws:iam::111122223333:role/coderhelm-prod-installer-1a2b3c4d", "why": "the Launch Stack's installer role"},
-  {"action": "iam:DeleteRole", "allowed": ["keep", "everything"], "context": {"iam:ResourceTag/coderhelm:install": "coderhelm-prod"}, "everything": "allowed", "keep": "allowed", "resource": "arn:aws:iam::111122223333:role/coderhelm-prod-provider-0f1e2d3c", "why": "a leftover role tagged for the install"},
+  {"action": "iam:DeleteRole", "allowed": ["keep", "everything"], "context": {"iam:PermissionsBoundary": "arn:aws:iam::111122223333:policy/coderhelm-prod-boundary-1a2b3c4d"}, "everything": "allowed", "keep": "allowed", "resource": "arn:aws:iam::111122223333:role/coderhelm-prod-provider-0f1e2d3c", "why": "a leftover role carrying the install's boundary"},
+  {"action": "iam:DeleteRole", "allowed": [], "context": {"iam:ResourceTag/coderhelm:install": "coderhelm-prod"}, "everything": "implicitDeny", "keep": "implicitDeny", "resource": "arn:aws:iam::111122223333:role/coderhelm-prod-provider-0f1e2d3c", "why": "a role tagged for the install alone (IAM is global: maybe another region's install)"},
+  {"action": "iam:DeleteRole", "allowed": [], "context": {"iam:PermissionsBoundary": "arn:aws:iam::111122223333:policy/coderhelm-prod-boundary-22223333"}, "everything": "implicitDeny", "keep": "implicitDeny", "resource": "arn:aws:iam::111122223333:role/coderhelm-prod-provider-0f1e2d3c", "why": "a role carrying another region's boundary of the same name"},
   {"action": "iam:DeleteRole", "allowed": [], "everything": "implicitDeny", "keep": "implicitDeny", "resource": "arn:aws:iam::111122223333:role/coderhelm-prod-someones", "why": "an untagged role of the name"},
   {"action": "iam:DeleteRole", "allowed": [], "context": {"iam:ResourceTag/coderhelm:install": "coderhelm-prod-eu"}, "everything": "explicitDeny", "keep": "explicitDeny", "resource": "arn:aws:iam::111122223333:role/coderhelm-prod-eu-deploy-77777777", "why": "the longer install's deploy role"},
-  {"action": "iam:DeleteRole", "allowed": [], "everything": "explicitDeny", "keep": "explicitDeny", "resource": "arn:aws:iam::111122223333:role/coderhelm-prod-uninstall-build-5e6f7a8b", "why": "the uninstaller's build role"},
+  {"action": "iam:DeleteRole", "allowed": [], "everything": "explicitDeny", "keep": "explicitDeny", "resource": "arn:aws:iam::111122223333:role/coderhelm--uninstall-prod-build-5e6f7a8b", "why": "the uninstaller's build role"},
   {"action": "iam:DeleteRole", "allowed": [], "everything": "explicitDeny", "keep": "explicitDeny", "resource": "arn:aws:iam::111122223333:role/Admin", "why": "an admin role"},
   {"action": "iam:DeleteRole", "allowed": [], "everything": "explicitDeny", "keep": "explicitDeny", "resource": "arn:aws:iam::111122223333:role/cdk-hnb659fds-cfn-exec-role-111122223333-us-east-1", "why": "the CDK bootstrap's role"},
   {"action": "iam:DeleteRolePolicy", "allowed": ["keep", "everything"], "context": {"iam:PermissionsBoundary": "arn:aws:iam::111122223333:policy/coderhelm-prod-boundary-1a2b3c4d"}, "everything": "allowed", "keep": "allowed", "resource": "arn:aws:iam::111122223333:role/coderhelm-prod-provider-0f1e2d3c", "why": "a role's policy, the role carrying the install's boundary"},
   {"action": "iam:DeleteRolePolicy", "allowed": [], "context": {"iam:PermissionsBoundary": "arn:aws:iam::111122223333:policy/coderhelm-prod-eu-boundary-77777777"}, "everything": "implicitDeny", "keep": "implicitDeny", "resource": "arn:aws:iam::111122223333:role/coderhelm-prod-provider-0f1e2d3c", "why": "a role's policy, the role carrying another boundary"},
   {"action": "iam:DetachRolePolicy", "allowed": [], "everything": "implicitDeny", "keep": "implicitDeny", "resource": "arn:aws:iam::111122223333:role/coderhelm-prod-someones", "why": "a role's policy, the role carrying no boundary"},
-  {"action": "iam:DeleteRolePolicy", "allowed": [], "context": {"iam:PermissionsBoundary": "arn:aws:iam::111122223333:policy/coderhelm-prod-uninstall-boundary-5e6f7a8b"}, "everything": "explicitDeny", "keep": "explicitDeny", "resource": "arn:aws:iam::111122223333:role/coderhelm-prod-uninstall-window-5e6f7a8b", "why": "the uninstaller's window role's policy"},
-  {"action": "iam:DeleteRolePolicy", "allowed": ["keep", "everything"], "context": {"iam:PermissionsBoundary": "arn:aws:iam::111122223333:policy/coderhelm-prod-uninstall-boundary-5e6f7a8b"}, "everything": "allowed", "keep": "allowed", "resource": "arn:aws:iam::111122223333:role/coderhelm-prod-uninstall-build-5e6f7a8b", "why": "its own window, closed when the build ends"},
-  {"action": "iam:PutRolePolicy", "allowed": [], "context": {"iam:PermissionsBoundary": "arn:aws:iam::111122223333:policy/coderhelm-prod-uninstall-boundary-5e6f7a8b"}, "everything": "implicitDeny", "keep": "implicitDeny", "resource": "arn:aws:iam::111122223333:role/coderhelm-prod-uninstall-build-5e6f7a8b", "why": "more rights for itself"},
+  {"action": "iam:DeleteRolePolicy", "allowed": [], "context": {"iam:PermissionsBoundary": "arn:aws:iam::111122223333:policy/coderhelm--uninstall-prod-boundary-5e6f7a8b"}, "everything": "explicitDeny", "keep": "explicitDeny", "resource": "arn:aws:iam::111122223333:role/coderhelm--uninstall-prod-window-5e6f7a8b", "why": "the uninstaller's window role's policy"},
+  {"action": "iam:DeleteRolePolicy", "allowed": ["keep", "everything"], "context": {"iam:PermissionsBoundary": "arn:aws:iam::111122223333:policy/coderhelm--uninstall-prod-boundary-5e6f7a8b"}, "everything": "allowed", "keep": "allowed", "resource": "arn:aws:iam::111122223333:role/coderhelm--uninstall-prod-build-5e6f7a8b", "why": "its own window, closed when the build ends"},
+  {"action": "iam:PutRolePolicy", "allowed": [], "context": {"iam:PermissionsBoundary": "arn:aws:iam::111122223333:policy/coderhelm--uninstall-prod-boundary-5e6f7a8b"}, "everything": "implicitDeny", "keep": "implicitDeny", "resource": "arn:aws:iam::111122223333:role/coderhelm--uninstall-prod-build-5e6f7a8b", "why": "more rights for itself"},
   {"action": "iam:AttachRolePolicy", "allowed": [], "context": {"iam:PermissionsBoundary": "arn:aws:iam::111122223333:policy/coderhelm-prod-boundary-1a2b3c4d", "iam:PolicyARN": "arn:aws:iam::aws:policy/AdministratorAccess"}, "everything": "explicitDeny", "keep": "explicitDeny", "resource": "arn:aws:iam::111122223333:role/coderhelm-prod-provider-0f1e2d3c", "why": "an admin policy on an install role"},
   {"action": "iam:DeletePolicy", "allowed": ["keep", "everything"], "everything": "allowed", "keep": "allowed", "resource": "arn:aws:iam::111122223333:policy/coderhelm-prod-boundary-1a2b3c4d", "why": "the install's permissions boundary"},
-  {"action": "iam:DeletePolicy", "allowed": [], "everything": "explicitDeny", "keep": "explicitDeny", "resource": "arn:aws:iam::111122223333:policy/coderhelm-prod-uninstall-boundary-5e6f7a8b", "why": "the uninstaller's boundary"},
-  {"action": "iam:CreatePolicyVersion", "allowed": [], "everything": "explicitDeny", "keep": "explicitDeny", "resource": "arn:aws:iam::111122223333:policy/coderhelm-prod-uninstall-boundary-5e6f7a8b", "why": "the uninstaller's boundary changed"},
+  {"action": "iam:DeletePolicy", "allowed": [], "everything": "explicitDeny", "keep": "explicitDeny", "resource": "arn:aws:iam::111122223333:policy/coderhelm--uninstall-prod-boundary-5e6f7a8b", "why": "the uninstaller's boundary"},
+  {"action": "iam:CreatePolicyVersion", "allowed": [], "everything": "explicitDeny", "keep": "explicitDeny", "resource": "arn:aws:iam::111122223333:policy/coderhelm--uninstall-prod-boundary-5e6f7a8b", "why": "the uninstaller's boundary changed"},
   {"action": "iam:DeletePolicy", "allowed": [], "everything": "implicitDeny", "keep": "implicitDeny", "resource": "arn:aws:iam::111122223333:policy/coderhelm-prod-eu-boundary-77777777", "why": "the longer install's boundary"},
   {"action": "iam:CreateUser", "allowed": [], "everything": "explicitDeny", "keep": "explicitDeny", "resource": "arn:aws:iam::111122223333:user/coderhelm-prod-x", "why": "an IAM user"},
   {"action": "iam:CreateAccessKey", "allowed": [], "everything": "explicitDeny", "keep": "explicitDeny", "resource": "arn:aws:iam::111122223333:user/admin", "why": "an access key"},
@@ -1217,6 +1199,8 @@
   {"action": "s3:DeleteBucket", "allowed": [], "everything": "explicitDeny", "keep": "explicitDeny", "resource": "arn:aws:s3:::coderhelm-setup-uninstallprogres", "why": "the uninstaller's own progress bucket"},
   {"action": "s3:PutObject", "allowed": ["keep", "everything"], "everything": "allowed", "keep": "allowed", "resource": "arn:aws:s3:::coderhelm-setup-uninstallprogres/status.json", "why": "the uninstaller's progress file, written"},
   {"action": "s3:DeleteBucket", "allowed": [], "everything": "implicitDeny", "keep": "implicitDeny", "resource": "arn:aws:s3:::coderhelm-setup-zzzzzzzzzzzzzzzz", "why": "another progress bucket"},
+  {"action": "s3:DeleteBucket", "allowed": ["keep", "everything"], "everything": "allowed", "keep": "allowed", "resource": "arn:aws:s3:::coderhelm-prod-dashboard-111122223333", "why": "the dashboard bucket, in this region"},
+  {"action": "s3:DeleteBucket", "allowed": [], "everything": "implicitDeny", "keep": "implicitDeny", "resource": "arn:aws:s3:::coderhelm-prod-sandbox-111122223333", "why": "a bucket of the install's name in another region (S3 names carry no region)"},
   {"action": "s3:DeleteBucket", "allowed": ["everything"], "everything": "allowed", "keep": "implicitDeny", "resource": "arn:aws:s3:::coderhelm-prod-data-111122223333", "why": "the data bucket"},
   {"action": "s3:DeleteObjectVersion", "allowed": ["everything"], "everything": "allowed", "keep": "implicitDeny", "resource": "arn:aws:s3:::coderhelm-prod-data-111122223333/kb/doc.pdf", "why": "the data bucket's old versions"},
   {"action": "s3:DeleteBucket", "allowed": [], "everything": "implicitDeny", "keep": "implicitDeny", "resource": "arn:aws:s3:::coderhelm-prod-eu-data-111122223333", "why": "the longer install's data bucket"},
@@ -1247,13 +1231,14 @@
   {"action": "logs:DeleteLogGroup", "allowed": ["keep", "everything"], "everything": "allowed", "keep": "allowed", "resource": "arn:aws:logs:us-east-1:111122223333:log-group:/aws/lambda/coderhelm-prod-gateway", "why": "an install log group"},
   {"action": "logs:DeleteLogGroup", "allowed": ["keep", "everything"], "everything": "allowed", "keep": "allowed", "resource": "arn:aws:logs:us-east-1:111122223333:log-group:/aws/codebuild/coderhelm-prod-installer", "why": "the installer's log group"},
   {"action": "logs:DeleteLogGroup", "allowed": [], "everything": "explicitDeny", "keep": "explicitDeny", "resource": "arn:aws:logs:us-east-1:111122223333:log-group:/aws/lambda/coderhelm-prod-eu-gateway", "why": "the longer install's log group"},
-  {"action": "logs:DeleteLogGroup", "allowed": [], "everything": "explicitDeny", "keep": "explicitDeny", "resource": "arn:aws:logs:us-east-1:111122223333:log-group:/aws/codebuild/coderhelm-prod-uninstall-5e6f7a8b", "why": "the uninstaller's own log group"},
+  {"action": "logs:DeleteLogGroup", "allowed": [], "everything": "explicitDeny", "keep": "explicitDeny", "resource": "arn:aws:logs:us-east-1:111122223333:log-group:/aws/codebuild/coderhelm--uninstall-prod-5e6f7a8b", "why": "the uninstaller's own log group"},
   {"action": "logs:DeleteLogGroup", "allowed": [], "everything": "implicitDeny", "keep": "implicitDeny", "resource": "arn:aws:logs:us-east-1:111122223333:log-group:/aws/lambda/my-app", "why": "someone else's log group"},
+  {"action": "ssm:PutParameter", "allowed": [], "everything": "implicitDeny", "keep": "implicitDeny", "resource": "arn:aws:ssm:us-east-1:111122223333:parameter/coderhelm-prod/public-url", "why": "the install's deploy role's parameters are not the uninstaller's"},
   {"action": "ssm:DeleteParameter", "allowed": ["keep", "everything"], "everything": "allowed", "keep": "allowed", "resource": "arn:aws:ssm:us-east-1:111122223333:parameter/coderhelm-prod/public-url", "why": "an install parameter"},
-  {"action": "ssm:DeleteParameter", "allowed": [], "everything": "explicitDeny", "keep": "explicitDeny", "resource": "arn:aws:ssm:us-east-1:111122223333:parameter/coderhelm-prod/uninstall-5e6f7a8b/window-policy/1", "why": "the uninstaller's window statements"},
-  {"action": "ssm:PutParameter", "allowed": [], "everything": "explicitDeny", "keep": "explicitDeny", "resource": "arn:aws:ssm:us-east-1:111122223333:parameter/coderhelm-prod/uninstall-5e6f7a8b/window-policy/1", "why": "the uninstaller's window statements changed"},
+  {"action": "ssm:DeleteParameter", "allowed": [], "everything": "explicitDeny", "keep": "explicitDeny", "resource": "arn:aws:ssm:us-east-1:111122223333:parameter/coderhelm--uninstall-prod-5e6f7a8b/window-policy/1", "why": "the uninstaller's window statements"},
+  {"action": "ssm:PutParameter", "allowed": [], "everything": "explicitDeny", "keep": "explicitDeny", "resource": "arn:aws:ssm:us-east-1:111122223333:parameter/coderhelm--uninstall-prod-5e6f7a8b/window-policy/1", "why": "the uninstaller's window statements changed"},
   {"action": "ssm:DeleteParameter", "allowed": [], "everything": "implicitDeny", "keep": "implicitDeny", "resource": "arn:aws:ssm:us-east-1:111122223333:parameter/coderhelm-prod-eu/public-url", "why": "the longer install's parameter"},
-  {"action": "acm:DeleteCertificate", "allowed": ["keep", "everything"], "context": {"aws:ResourceTag/coderhelm": "coderhelm-prod"}, "everything": "allowed", "keep": "allowed", "resource": "arn:aws:acm:us-east-1:111122223333:certificate/f1e2d3c4-b5a6-4789-a012-345678901234", "why": "the updater's certificate"},
+  {"action": "acm:DeleteCertificate", "allowed": [], "context": {"aws:ResourceTag/coderhelm": "coderhelm-prod"}, "everything": "implicitDeny", "keep": "implicitDeny", "resource": "arn:aws:acm:us-east-1:111122223333:certificate/f1e2d3c4-b5a6-4789-a012-345678901234", "why": "the updater's certificate (us-east-1 for any region: left for you, listed)"},
   {"action": "acm:DeleteCertificate", "allowed": [], "everything": "implicitDeny", "keep": "implicitDeny", "resource": "arn:aws:acm:us-east-1:111122223333:certificate/f1e2d3c4-b5a6-4789-a012-345678901234", "why": "someone else's certificate"},
   {"action": "cloudtrail:DeleteTrail", "allowed": [], "everything": "explicitDeny", "keep": "explicitDeny", "resource": "arn:aws:cloudtrail:us-east-1:111122223333:trail/org", "why": "a CloudTrail trail"},
   {"action": "organizations:LeaveOrganization", "allowed": [], "everything": "explicitDeny", "keep": "explicitDeny", "resource": "*", "why": "Organizations"},
@@ -1266,13 +1251,13 @@
   {"action": "cloudformation:DeleteStack", "afterTheEnd": "explicitDeny", "allowed": ["keep", "everything"], "anotherSession": "explicitDeny", "resource": "arn:aws:cloudformation:us-east-1:111122223333:stack/coderhelm-prod/1a2b3c4d-0000", "why": "the Launch Stack, by name, with the build's own credentials"},
   {"action": "iam:PassRole", "afterTheEnd": "explicitDeny", "allowed": ["keep", "everything"], "anotherSession": "explicitDeny", "context": {"iam:PassedToService": "cloudformation.amazonaws.com"}, "resource": "arn:aws:iam::111122223333:role/coderhelm-prod-deploy-1a2b3c4d", "why": "the deploy role, passed to CloudFormation"},
   {"action": "lambda:DeleteFunction", "afterTheEnd": "explicitDeny", "allowed": ["keep", "everything"], "anotherSession": "explicitDeny", "resource": "arn:aws:lambda:us-east-1:111122223333:function:coderhelm-prod-starter-1a2b3c4d", "why": "the Launch Stack's starter function"},
+  {"action": "lambda:InvokeFunction", "afterTheEnd": "explicitDeny", "allowed": ["keep", "everything"], "anotherSession": "explicitDeny", "context": {"aws:CalledVia": ["cloudformation.amazonaws.com"]}, "resource": "arn:aws:lambda:us-east-1:111122223333:function:coderhelm-prod-starter-1a2b3c4d", "why": "the Launch Stack's custom resource, invoked by CloudFormation"},
   {"action": "codebuild:DeleteProject", "afterTheEnd": "explicitDeny", "allowed": ["keep", "everything"], "anotherSession": "explicitDeny", "resource": "arn:aws:codebuild:us-east-1:111122223333:project/coderhelm-prod-installer", "why": "the Launch Stack's installer project"},
   {"action": "iam:DeleteRole", "afterTheEnd": "explicitDeny", "allowed": ["keep", "everything"], "anotherSession": "explicitDeny", "resource": "arn:aws:iam::111122223333:role/coderhelm-prod-deploy-1a2b3c4d", "why": "the deploy role"},
   {"action": "iam:DeleteRole", "afterTheEnd": "explicitDeny", "allowed": ["keep", "everything"], "anotherSession": "explicitDeny", "resource": "arn:aws:iam::111122223333:role/coderhelm-prod-installer-1a2b3c4d", "why": "the Launch Stack's installer role"},
-  {"action": "iam:DeleteRole", "afterTheEnd": "explicitDeny", "allowed": ["keep", "everything"], "anotherSession": "explicitDeny", "context": {"iam:ResourceTag/coderhelm:install": "coderhelm-prod"}, "resource": "arn:aws:iam::111122223333:role/coderhelm-prod-provider-0f1e2d3c", "why": "a leftover role tagged for the install"},
+  {"action": "iam:DeleteRole", "afterTheEnd": "explicitDeny", "allowed": ["keep", "everything"], "anotherSession": "explicitDeny", "context": {"iam:PermissionsBoundary": "arn:aws:iam::111122223333:policy/coderhelm-prod-boundary-1a2b3c4d"}, "resource": "arn:aws:iam::111122223333:role/coderhelm-prod-provider-0f1e2d3c", "why": "a leftover role carrying the install's boundary"},
   {"action": "iam:DeleteRolePolicy", "afterTheEnd": "explicitDeny", "allowed": ["keep", "everything"], "anotherSession": "explicitDeny", "context": {"iam:PermissionsBoundary": "arn:aws:iam::111122223333:policy/coderhelm-prod-boundary-1a2b3c4d"}, "resource": "arn:aws:iam::111122223333:role/coderhelm-prod-provider-0f1e2d3c", "why": "a role's policy, the role carrying the install's boundary"},
-  {"action": "iam:DeleteRolePolicy", "afterTheEnd": "allowed", "allowed": ["keep", "everything"], "anotherSession": "allowed", "context": {"iam:PermissionsBoundary": "arn:aws:iam::111122223333:policy/coderhelm-prod-uninstall-boundary-5e6f7a8b"}, "resource": "arn:aws:iam::111122223333:role/coderhelm-prod-uninstall-build-5e6f7a8b", "why": "its own window, closed when the build ends"},
-  {"action": "iam:DeletePolicy", "afterTheEnd": "explicitDeny", "allowed": ["keep", "everything"], "anotherSession": "explicitDeny", "resource": "arn:aws:iam::111122223333:policy/coderhelm-prod-boundary-1a2b3c4d", "why": "the install's permissions boundary"},
-  {"action": "s3:DeleteBucket", "afterTheEnd": "explicitDeny", "allowed": ["keep", "everything"], "anotherSession": "explicitDeny", "resource": "arn:aws:s3:::coderhelm-prod-assets-1a2b3c4d-111122223333", "why": "the Launch Stack's assets bucket"}
+  {"action": "iam:DeleteRolePolicy", "afterTheEnd": "allowed", "allowed": ["keep", "everything"], "anotherSession": "allowed", "context": {"iam:PermissionsBoundary": "arn:aws:iam::111122223333:policy/coderhelm--uninstall-prod-boundary-5e6f7a8b"}, "resource": "arn:aws:iam::111122223333:role/coderhelm--uninstall-prod-build-5e6f7a8b", "why": "its own window, closed when the build ends"},
+  {"action": "iam:DeletePolicy", "afterTheEnd": "explicitDeny", "allowed": ["keep", "everything"], "anotherSession": "explicitDeny", "resource": "arn:aws:iam::111122223333:policy/coderhelm-prod-boundary-1a2b3c4d", "why": "the install's permissions boundary"}
  ]
 }

@@ -37,6 +37,7 @@ export function conditionHolds(cond: Statement["Condition"], ctx: Record<string,
         // "true": the key is absent from the request; "false": it is there.
         case "Null": if ((have === undefined) !== (wants[0] === "true")) return false; break;
         case "ForAnyValue:StringEqualsIgnoreCase": if (!any((h, w) => h.toLowerCase() === w.toLowerCase())) return false; break;
+        case "ForAnyValue:StringEquals": if (!any((h, w) => h === w)) return false; break;
         case "ForAllValues:StringEquals": if (!haves.every((h) => wants.includes(h))) return false; break;
         case "ForAllValues:StringLike": if (!haves.every((h) => wants.some((w) => glob(w, h)))) return false; break;
         default: throw new Error(`the evaluator doesn't know ${op}`);

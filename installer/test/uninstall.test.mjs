@@ -29,7 +29,9 @@ function world({ hybrid = false } = {}) {
       "coderhelm-prod-database": { tags: tag("coderhelm-prod"), role: `arn:aws:iam::${A}:role/coderhelm-prod-deploy-${ID}`, exports: ["coderhelm-prod-TableArn"] },
       "coderhelm-prod-api": { tags: tag("coderhelm-prod"), role: `arn:aws:iam::${A}:role/coderhelm-prod-deploy-${ID}`, exports: [] },
       "coderhelm-prod-eu-api": { tags: tag("coderhelm-prod-eu"), role: `arn:aws:iam::${A}:role/coderhelm-prod-eu-deploy-77777777`, exports: [] },
-      "coderhelm-prod-uninstall": { tags: [], params: { Stage: "prod", ConfirmStage: "prod" } },
+      "coderhelm--uninstall-prod-abcd12": { tags: [], params: { Stage: "prod", ConfirmStage: "prod" } },
+      // Another install named prod-2: its Launch Stack looks like a numbered one of prod's.
+      "coderhelm-prod-2": { id: `arn:aws:cloudformation:${R}:${A}:stack/coderhelm-prod-2/77778888-0000-1111-2222-333344445555`, params: { Stage: "prod-2", SetupToken: "", AdminEmail: "b@example.org", StatusId: "" }, tags: [] },
       "my-app": { tags: [] },
       CDKToolkit: { tags: [] },
     },
@@ -42,6 +44,7 @@ function world({ hybrid = false } = {}) {
       [`coderhelm-prod-eu-data-${A}`]: { region: R, objects: 5 },
       "coderhelm-setup-abcdefghijklmnop": { region: R, objects: 1 },
       "coderhelm-setup-uninstallprogres": { region: R, objects: 1 },
+      [`coderhelm-prod-sandbox-${A}`]: { region: "eu-west-1", objects: 4 },
       [`cdk-hnb659fds-assets-${A}-${R}`]: { region: R, objects: 9 },
       "my-app-bucket": { region: R, objects: 9 },
     },
@@ -52,8 +55,8 @@ function world({ hybrid = false } = {}) {
     aliases: [{ AliasName: "alias/coderhelm-prod-dynamo", TargetKeyId: "k1" }, { AliasName: "alias/coderhelm-prod-eu-dynamo", TargetKeyId: "k2" }, { AliasName: "alias/my-key", TargetKeyId: "k3" }],
     pools: { "us-east-1_prod": { Name: "coderhelm-prod-users", tag: "coderhelm-prod", Domain: "coderhelm-prod-auth", DeletionProtection: "ACTIVE" }, "us-east-1_eu": { Name: "coderhelm-prod-eu-users", tag: "coderhelm-prod-eu" } },
     secrets: ["coderhelm/prod/secrets", "coderhelm/prod-eu/secrets", "my-app/secret"],
-    logGroups: ["/aws/lambda/coderhelm-prod-gateway", "/aws/codebuild/coderhelm-prod-installer", "/aws/lambda/coderhelm-prod-eu-gateway", "/aws/codebuild/coderhelm-prod-uninstall-5e6f7a8b", "/aws/lambda/my-app"],
-    params: ["/coderhelm-prod/public-url", "/coderhelm-prod/launch-1a2b3c4d/window-policy/1", "/coderhelm-prod/uninstall-5e6f7a8b/window-policy/1"],
+    logGroups: ["/aws/lambda/coderhelm-prod-gateway", "/aws/codebuild/coderhelm-prod-installer", "/aws/lambda/coderhelm-prod-eu-gateway", "/aws/codebuild/coderhelm--uninstall-prod-5e6f7a8b", "/aws/lambda/my-app"],
+    params: ["/coderhelm-prod/public-url", "/coderhelm-prod/launch-1a2b3c4d/window-policy/1", "/coderhelm--uninstall-prod-5e6f7a8b/window-policy/1"],
     roles: {
       [`coderhelm-prod-deploy-${ID}`]: { boundary: `arn:aws:iam::${A}:policy/coderhelm-prod-boundary-${ID}`, policies: ["deploy"] },
       [`coderhelm-prod-installer-${ID}`]: { boundary: `arn:aws:iam::${A}:policy/coderhelm-prod-boundary-${ID}`, policies: ["idle"], launch: true },
@@ -61,11 +64,12 @@ function world({ hybrid = false } = {}) {
       "coderhelm-prod-leftoverprovider-abcd1234": { boundary: `arn:aws:iam::${A}:policy/coderhelm-prod-boundary-${ID}`, tags: tag("coderhelm-prod"), policies: ["x"] },
       "coderhelm-prod-deploy-22223333": { boundary: `arn:aws:iam::${A}:policy/coderhelm-prod-boundary-22223333`, policies: ["deploy"] },
       "coderhelm-prod-eu-deploy-77777777": { boundary: `arn:aws:iam::${A}:policy/coderhelm-prod-eu-boundary-77777777`, policies: ["deploy"] },
-      "coderhelm-prod-uninstall-build-5e6f7a8b": { boundary: `arn:aws:iam::${A}:policy/coderhelm-prod-uninstall-boundary-5e6f7a8b`, policies: ["idle"] },
+      "coderhelm--uninstall-prod-build-5e6f7a8b": { boundary: `arn:aws:iam::${A}:policy/coderhelm--uninstall-prod-boundary-5e6f7a8b`, policies: ["idle"] },
+      "coderhelm-prod-otherregion-abcd9999": { boundary: `arn:aws:iam::${A}:policy/coderhelm-prod-boundary-22223333`, tags: tag("coderhelm-prod"), policies: ["x"] },
       "coderhelm-prod-someones": { boundary: null, policies: [] },
       Admin: { boundary: null, policies: ["all"] },
     },
-    policies: [`coderhelm-prod-boundary-${ID}`, `coderhelm-prod-boundary-${OLD}`, "coderhelm-prod-boundary-22223333", "coderhelm-prod-eu-boundary-77777777", "coderhelm-prod-uninstall-boundary-5e6f7a8b"],
+    policies: [`coderhelm-prod-boundary-${ID}`, `coderhelm-prod-boundary-${OLD}`, "coderhelm-prod-boundary-22223333", "coderhelm-prod-eu-boundary-77777777", "coderhelm--uninstall-prod-boundary-5e6f7a8b"],
     certs: [`arn:aws:acm:us-east-1:${A}:certificate/updater-cert`],
     secretValue: hybrid ? HYBRID : { github_app_id: "1" },
   };
@@ -181,8 +185,8 @@ const target = (c) => {
 
 function isThisInstalls(t0) {
   const t = t0.split(A).join("<account>");
-  if (/coderhelm-prod-eu|prod-eu|my-app|cdk-|CDKToolkit|Admin|uninstall|someone|imposter|22223333|my-key|k2|k3|us-east-1_eu|uninstallprogres/.test(t)) return false;
-  return /coderhelm-prod|coderhelm\/prod\/|coderhelm-setup-abcdefghijklmnop|k1|us-east-1_prod|updater-cert/.test(t) || false;
+  if (/coderhelm-prod-eu|prod-eu|my-app|cdk-|CDKToolkit|Admin|uninstall|someone|imposter|22223333|my-key|k2|k3|us-east-1_eu|uninstallprogres|coderhelm-prod-2$|sandbox|otherregion|updater-cert/.test(t)) return false;
+  return /coderhelm-prod|coderhelm\/prod\/|coderhelm-setup-abcdefghijklmnop|k1|us-east-1_prod/.test(t) || false;
 }
 
 const ctxFor = (w, extra = {}) => ({ aws: w, log: () => {}, sleep: async () => {}, runner: new FakeRunner(), fetchImpl: async () => ({ ok: false }), ...extra });
@@ -206,7 +210,11 @@ test("finds exactly this install's pieces in this region, and names what it leav
   const w = world();
   const ctx = ctxFor(w, { guided: true });
   const inv = await un.discover(ctx, un.scopeOf({ stage: "prod", region: R, account: A }), { strictTags: true, ownStatus: "uninstallprogres" });
-  assert.deepEqual(inv.scope.siblings, ["coderhelm-prod-eu"]);
+  assert.deepEqual(inv.scope.siblings, ["coderhelm-prod-2", "coderhelm-prod-eu"], "from tags, secrets, Launch Stacks and boundaries");
+  assert.ok(inv.anchored);
+  assert.ok(inv.skipped.some((x) => x.name === "coderhelm-prod-2" && /Launch Stack of prod-2/.test(x.why)), "another install's Launch Stack is never this one's");
+  assert.ok(inv.skipped.some((x) => x.name === `coderhelm-prod-sandbox-${A}` && /eu-west-1/.test(x.why)), "a bucket of the name in another region is not this install's");
+  assert.ok(inv.skipped.some((x) => x.name === "coderhelm-prod-otherregion-abcd9999"), "a role tagged for the name but with another region's boundary is not touched");
   assert.deepEqual(inv.launch.map((l) => l.name), ["coderhelm-prod"]);
   assert.deepEqual(inv.ids, [ID, OLD], "the Launch Stack's id and a kept assets bucket's id in this region; not eu-west-1's");
   assert.deepEqual(inv.stacks.map((s) => s.name).sort(), ["coderhelm-prod-api", "coderhelm-prod-database"]);
@@ -221,6 +229,7 @@ test("finds exactly this install's pieces in this region, and names what it leav
   assert.deepEqual(inv.params, ["/coderhelm-prod/public-url", "/coderhelm-prod/launch-1a2b3c4d/window-policy/1"]);
   assert.deepEqual(inv.boundaries.map((b) => b.name).sort(), [`coderhelm-prod-boundary-${ID}`, `coderhelm-prod-boundary-${OLD}`]);
   assert.deepEqual(inv.roles.map((r) => r.name).sort(), [`coderhelm-prod-deploy-${ID}`, `coderhelm-prod-deploy-${OLD}`, `coderhelm-prod-installer-${ID}`, "coderhelm-prod-leftoverprovider-abcd1234"].sort());
+  assert.deepEqual(un.plan(inv).notRemoved.map((x) => x.name), ["updater-cert"], "the updater's certificate is listed, not removed");
   assert.ok(inv.skipped.some((x) => x.name === "coderhelm-prod-imposter" && /someone-else/.test(x.why)));
   assert.ok(inv.skipped.some((x) => x.name === "coderhelm-prod-someones"), "an unbounded, untagged role of the name is not touched");
   assert.ok(inv.skipped.some((x) => x.name === "coderhelm-prod-deploy-22223333"), "another region's Launch Stack pieces are not touched");
@@ -238,9 +247,9 @@ test("keep my data: removes CoderHelm, keeps tables, data bucket, keys, user poo
   assert.ok(!w.stacks["coderhelm-prod-api"] && !w.stacks["coderhelm-prod"] && !w.roles[`coderhelm-prod-deploy-${ID}`] && !w.policies.includes(`coderhelm-prod-boundary-${ID}`));
   assert.ok(doc.kept.some((k) => k.kind === "table") && doc.kept.some((k) => k.kind === "data bucket"));
   // The rest of the account is as it was.
-  assert.ok(w.stacks["coderhelm-prod-eu-api"] && w.stacks["coderhelm-prod-uninstall"] && w.stacks.CDKToolkit && w.buckets["coderhelm-setup-uninstallprogres"]);
-  assert.ok(w.roles["coderhelm-prod-uninstall-build-5e6f7a8b"] && w.roles.Admin && w.roles["coderhelm-prod-someones"]);
-  assert.ok(w.logGroups.includes("/aws/codebuild/coderhelm-prod-uninstall-5e6f7a8b") && w.params.includes("/coderhelm-prod/uninstall-5e6f7a8b/window-policy/1"));
+  assert.ok(w.stacks["coderhelm-prod-eu-api"] && w.stacks["coderhelm--uninstall-prod-abcd12"] && w.stacks["coderhelm-prod-2"] && w.buckets[`coderhelm-prod-sandbox-${A}`] && w.roles["coderhelm-prod-otherregion-abcd9999"] && w.certs.length === 1 && w.stacks.CDKToolkit && w.buckets["coderhelm-setup-uninstallprogres"]);
+  assert.ok(w.roles["coderhelm--uninstall-prod-build-5e6f7a8b"] && w.roles.Admin && w.roles["coderhelm-prod-someones"]);
+  assert.ok(w.logGroups.includes("/aws/codebuild/coderhelm--uninstall-prod-5e6f7a8b") && w.params.includes("/coderhelm--uninstall-prod-5e6f7a8b/window-policy/1"));
 });
 
 test("delete everything: the data goes too, KMS keys on AWS's 7-day minimum, and the check finds nothing left", async () => {
@@ -267,6 +276,21 @@ test("delete everything: the data goes too, KMS keys on AWS's 7-day minimum, and
   const phases = [...new Set(docs.map((d) => d.phase))];
   assert.deepEqual(phases, ["preparing", "stacks", "data", "launch", "cleanup", "verifying", "done"]);
   assert.ok(!JSON.stringify(docs).includes(A), "no account number in the public file");
+});
+
+test("the wrong region: nothing of the install there, so nothing is deleted, even buckets of its name", async () => {
+  const w = world();
+  for (const k of Object.keys(w.stacks)) delete w.stacks[k];
+  w.tables = {};
+  w.keys = {};
+  w.pools = {};
+  w.secrets = ["coderhelm/prod-eu/secrets"];
+  for (const b of Object.values(w.buckets)) b.region = "us-east-1";
+  const ctx = ctxFor(w, { guided: false });
+  const doc = await un.runUninstall(ctx, { stage: "prod", region: "us-west-2", account: A, mode: "everything" });
+  assert.equal(doc.phase, "failed");
+  assert.match(doc.message, /Nothing of the install prod is in us-west-2.*Nothing was deleted/);
+  assert.equal(writes(w).length, 0);
 });
 
 test("stacks go dependents first, through the install's own deploy role", async () => {
@@ -343,7 +367,8 @@ test("terminal: lists what goes, asks for the install name, and refuses a wrong 
   assert.match(String(noYes.error), /--yes/);
   assert.match(noYes.out, /This removes CoderHelm prod/);
   assert.match(noYes.out, /Kept \(your data/);
-  assert.match(noYes.out, /Not touched: the other installs coderhelm-prod-eu/);
+  assert.match(noYes.out, /Not touched: the other installs coderhelm-prod-2, coderhelm-prod-eu/);
+  assert.match(noYes.out, /Not removed: certificate updater-cert, in us-east-1/);
   assert.equal(writes(w).length, 0);
   const wrong = await cli(["uninstall", "--config", file], { aws: w, interactive: true, ask: quietAsk({ "Type the install name": "prod-eu" }) });
   assert.match(String(wrong.error), /didn't match/);

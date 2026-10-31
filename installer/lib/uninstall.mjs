@@ -103,23 +103,39 @@ async function pages(aws, svc, op, args, key) {
 export async function discover(ctx, base, { mode = "keep", installStatus = "", ownStatus = "", strictTags = false, fetchImpl } = {}) {
   const aws = ctx.aws;
   const { prefix: P, account: A, region } = base;
-  // Other installs whose names start with this one's.
+  // Other installs whose names start with this one's: by their tag and secret here, their
+  // Launch Stacks (Stage) here and their permissions boundaries anywhere (IAM is global).
   const tagValues = await pages(aws, "resourcegroupstaggingapi", "get-tag-values", ["--key", INSTALL_TAG], "TagValues");
   const secretNames = (await pages(aws, "secretsmanager", "list-secrets", ["--filters", "Key=name,Values=coderhelm/"], "SecretList")).map((s) => s.Name);
-  const scope = { ...base, siblings: siblingsOf(P, [...tagValues, ...secretNames.map((n) => n.split("/")).filter((p) => p.length >= 3 && p[0] === "coderhelm").map((p) => `coderhelm-${p[1]}`)]) };
-  const inv = { scope, mode, launch: [], ids: [], stacks: [], tables: [], backups: [], buckets: [], keys: [], aliases: [], pools: [], secrets: [], logGroups: [], params: [], certs: [], roles: [], boundaries: [], skipped: [] };
+  const policies = await pages(aws, "iam", "list-policies", ["--scope", "Local"], "Policies");
+  const summaries = await pages(aws, "cloudformation", "list-stacks", ["--stack-status-filter", ...ALIVE], "StackSummaries");
+  const described = [];
+  for (const s of summaries) {
+    if (s.StackName !== P && !s.StackName.startsWith(`${P}-`)) continue;
+    const d = (await aws.read("cloudformation", "describe-stacks", ["--stack-name", s.StackId ?? s.StackName]))?.Stacks?.[0];
+    if (d) described.push({ d, params: Object.fromEntries((d.Parameters ?? []).map((p) => [p.ParameterKey, p.ParameterValue ?? ""])) });
+  }
+  const isLaunch = (params) => "SetupToken" in params && "AdminEmail" in params;
+  const names = [
+    ...tagValues,
+    ...secretNames.map((n) => n.split("/")).filter((p) => p.length >= 3 && p[0] === "coderhelm").map((p) => `coderhelm-${p[1]}`),
+    ...described.filter((x) => isLaunch(x.params) && x.params.Stage !== base.stage).map((x) => `coderhelm-${x.params.Stage}`),
+    ...policies.map((p) => String(p.PolicyName).match(/^(coderhelm-[a-z][a-z0-9-]{0,19})-boundary-[0-9a-f]{8}$/)?.[1]).filter(Boolean),
+  ];
+  const scope = { ...base, siblings: siblingsOf(P, names) };
+  const inv = { scope, mode, anchored: false, launch: [], ids: [], stacks: [], tables: [], backups: [], buckets: [], keys: [], aliases: [], pools: [], secrets: [], logGroups: [], params: [], certs: [], roles: [], boundaries: [], skipped: [] };
 
   // Stacks: the Launch Stack(s), and the install's own (tagged; untagged only for a terminal uninstall of an older install).
-  const summaries = await pages(aws, "cloudformation", "list-stacks", ["--stack-status-filter", ...ALIVE], "StackSummaries");
-  for (const s of summaries) {
-    if (!isOurName(scope, s.StackName) && !isLaunchName(scope, s.StackName)) continue;
-    const d = (await aws.read("cloudformation", "describe-stacks", ["--stack-name", s.StackId ?? s.StackName]))?.Stacks?.[0];
-    if (!d) continue;
-    const params = Object.fromEntries((d.Parameters ?? []).map((p) => [p.ParameterKey, p.ParameterValue ?? ""]));
-    if (isLaunchName(scope, d.StackName) && params.Stage === scope.stage && "SetupToken" in params && "AdminEmail" in params) {
-      inv.launch.push({ name: d.StackName, id: String(d.StackId).split("/")[2].slice(0, 8), statusId: /^[a-z0-9]{16}$/.test(params.StatusId ?? "") ? params.StatusId : "" });
+  for (const { d, params } of described) {
+    if (isLaunch(params)) {
+      // A Launch Stack is this install's only by its Stage; another install's is never touched, whatever its name.
+      if (params.Stage !== scope.stage) inv.skipped.push({ kind: "stack", name: d.StackName, why: `the Launch Stack of ${params.Stage}` });
+      else if (!isLaunchName(scope, d.StackName)) inv.skipped.push({ kind: "stack", name: d.StackName, why: "a Launch Stack under a name the install guide doesn't use: delete it in CloudFormation" });
+      else if (strictTags && d.RoleARN) inv.skipped.push({ kind: "stack", name: d.StackName, why: "a Launch Stack with a service role: delete it in CloudFormation" });
+      else inv.launch.push({ name: d.StackName, id: String(d.StackId).split("/")[2].slice(0, 8), statusId: /^[a-z0-9]{16}$/.test(params.StatusId ?? "") ? params.StatusId : "" });
       continue;
     }
+    if (!isOurName(scope, d.StackName)) continue;
     const tag = tagOf(d.Tags, INSTALL_TAG);
     if (tag === P || (tag === undefined && !strictTags)) {
       inv.stacks.push({ name: d.StackName, id: d.StackId, roleArn: d.RoleARN ?? null, status: d.StackStatus, tagged: tag === P, exports: (d.Outputs ?? []).map((o) => o.ExportName).filter(Boolean) });
@@ -137,13 +153,20 @@ export async function discover(ctx, base, { mode = "keep", installStatus = "", o
     if ((loc?.LocationConstraint || "us-east-1") === region) ids.add(m[1]);
   }
   inv.ids = [...ids].sort();
-  const names = new Set(buckets.map((b) => b.Name));
-  const want = [[`${P}-dashboard-${A}`, "bucket"], [`${P}-sandbox-${A}`, "bucket"], ...inv.ids.map((id) => [`${P}-assets-${id}-${A}`, "bucket"]), [`${P}-data-${A}`, "data bucket"]];
+  const bucketNames = new Set(buckets.map((b) => b.Name));
+  // S3 names carry no region: the stacks' own buckets only when they are in this region.
+  const want = [...inv.ids.map((id) => [`${P}-assets-${id}-${A}`, "bucket"])];
+  for (const [name, kind] of [[`${P}-dashboard-${A}`, "bucket"], [`${P}-sandbox-${A}`, "bucket"], [`${P}-data-${A}`, "data bucket"]]) {
+    if (!bucketNames.has(name)) continue;
+    const loc = await aws.read("s3api", "get-bucket-location", ["--bucket", name]);
+    if ((loc?.LocationConstraint || "us-east-1") === region) want.push([name, kind]);
+    else inv.skipped.push({ kind, name, why: `in ${loc?.LocationConstraint || "another region"}, not ${region}` });
+  }
   const setups = new Set(inv.launch.map((l) => l.statusId).filter(Boolean));
   if (/^[a-z0-9]{16}$/.test(installStatus) && (await progressIsOurs(fetchImpl, installStatus, scope))) setups.add(installStatus);
   setups.delete(ownStatus);
   for (const id of setups) want.push([`coderhelm-setup-${id}`, "progress bucket"]);
-  for (const [name, kind] of want) if (names.has(name)) inv.buckets.push({ name, kind });
+  for (const [name, kind] of want) if (bucketNames.has(name)) inv.buckets.push({ name, kind });
 
   // Everything tagged for the install in this region (and the updater's certificate in us-east-1).
   const tagged = await pages(aws, "resourcegroupstaggingapi", "get-resources", ["--tag-filters", `Key=${INSTALL_TAG},Values=${P}`], "ResourceTagMappingList");
@@ -203,7 +226,7 @@ export async function discover(ctx, base, { mode = "keep", installStatus = "", o
 
   // IAM (global): the boundaries and roles of this region's Launch Stacks, and roles tagged for the install.
   const boundaryRe = new RegExp(`^${P.replace(/-/g, "\\-")}-boundary-([0-9a-f]{8})$`);
-  for (const pol of await pages(aws, "iam", "list-policies", ["--scope", "Local"], "Policies")) {
+  for (const pol of policies) {
     const m = pol.PolicyName.match(boundaryRe);
     if (m && ids.has(m[1])) inv.boundaries.push({ name: pol.PolicyName, arn: pol.Arn, id: m[1] });
   }
@@ -215,10 +238,13 @@ export async function discover(ctx, base, { mode = "keep", installStatus = "", o
     const tag = tagOf(g.Tags, INSTALL_TAG);
     const boundary = g.PermissionsBoundary?.PermissionsBoundaryArn ?? null;
     const byId = inv.ids.some((id) => r.RoleName.endsWith(`-${id}`));
-    if (tag === P || (boundary && boundaryArns.has(boundary)) || byId) {
+    // IAM is global: a role is this install's only by a boundary or a Launch Stack id found in this region, never by its tag alone.
+    if ((boundary && boundaryArns.has(boundary)) || byId) {
       inv.roles.push({ name: r.RoleName, boundary, tagged: tag === P });
-    } else inv.skipped.push({ kind: "role", name: r.RoleName, why: tag ? `tagged for ${tag}` : "carries none of this install's boundaries" });
+    } else inv.skipped.push({ kind: "role", name: r.RoleName, why: tag && tag !== P ? `tagged for ${tag}` : "carries none of this region's install boundaries" });
   }
+  // Something of the install must be in this region (a Launch Stack, its tag or its secret) before anything is removed.
+  inv.anchored = inv.launch.length > 0 || inv.tagged.length > 0 || inv.secrets.length > 0 || (!strictTags && inv.stacks.length > 0);
   return inv;
 }
 
@@ -253,10 +279,11 @@ export function plan(inv) {
   for (const s of inv.secrets) add("secret", s, true);
   for (const g of inv.logGroups) add("log group", g);
   for (const p of inv.params) add("parameter", p);
-  for (const c of inv.certs) add("certificate", c.split("/").pop());
   for (const r of inv.roles) add("role", r.name);
   for (const b of inv.boundaries) add("permissions boundary", b.name);
-  return { remove, keep };
+  // A certificate the updater requested is in us-east-1 for any region's install: listed for you, not removed.
+  const notRemoved = inv.certs.map((c) => ({ kind: "certificate", name: c.split("/").pop(), why: "in us-east-1 (ACM), tagged coderhelm = " + inv.scope.prefix + "; delete it in ACM once no install of this name uses it" }));
+  return { remove, keep, notRemoved };
 }
 
 // ── Removing it ─────────────────────────────────────────────────────────
@@ -420,7 +447,6 @@ export async function remove(ctx, inv, { onStep = async () => {}, hybrid = null 
     const res = await aws.write("ssm", "delete-parameters", ["--names", ...names]);
     for (const n of names) (res.ok ? gone("parameter", n) : fail("parameter", n, res.error));
   }
-  for (const c of now.certs) await run("certificate", c.split("/").pop(), "acm", "delete-certificate", ["--certificate-arn", c], "us-east-1");
   for (const b of now.buckets.filter((x) => x.kind !== "data bucket")) {
     if (await emptyBucket(aws, b.name)) await run(b.kind, b.name, "s3api", "delete-bucket", ["--bucket", b.name]);
     else fail(b.kind, b.name, "could not empty it");
@@ -501,7 +527,7 @@ export function redact(text) {
     .slice(0, 300);
 }
 
-const list = (xs, n = 300) => (xs ?? []).slice(0, n).map((x) => ({ kind: x.kind, name: redact(x.name), ...(x.date ? { date: String(x.date) } : {}), ...(x.error ? { error: redact(x.error) } : {}) }));
+const list = (xs, n = 300) => (xs ?? []).slice(0, n).map((x) => ({ kind: x.kind, name: redact(x.name), ...(x.date ? { date: String(x.date) } : {}), ...(x.error ? { error: redact(x.error) } : {}), ...(x.why ? { why: redact(x.why) } : {}) }));
 
 export function statusDoc(f, now = new Date()) {
   if (!PHASES.includes(f.phase)) throw new Error(`unknown phase ${f.phase}`);
@@ -519,6 +545,7 @@ export function statusDoc(f, now = new Date()) {
     kept: list(f.kept),
     scheduled: list(f.scheduled),
     left: list(f.left),
+    notRemoved: list(f.notRemoved),
     problems: list(f.problems, 50),
     hybrid: f.hybrid ? { registered: !!f.hybrid.registered, released: !!f.hybrid.released, github: Number.isInteger(f.hybrid.github) ? f.hybrid.github : null, jira: !!f.hybrid.jira } : null,
     fix: f.fix ? redact(f.fix) : null,
@@ -556,8 +583,8 @@ export async function runUninstall(ctx, { stage, region, account, mode, installS
   await status({ phase: "preparing", message: "Finding the install's pieces" });
   const inv = await discover(ctx, scope, { mode, installStatus, ownStatus, strictTags: !!ctx.guided, fetchImpl: ctx.fetchImpl });
   const found = plan(inv);
-  if (!found.remove.length && !found.keep.length) {
-    return status({ phase: "failed", message: `Nothing named or tagged for the install ${stage} was found in ${region}.`, fix: "Check the install name and the region, then launch the uninstaller again." });
+  if (!inv.anchored || (!found.remove.length && !found.keep.length)) {
+    return status({ phase: "failed", message: `Nothing of the install ${stage} is in ${region}: no Launch Stack, no resource tagged for it and no secret. Nothing was deleted.`, fix: "Check the install name and the region, then launch the uninstaller again." });
   }
   const report = await remove(ctx, inv, {
     onStep: (s) => status({ ...s, removed: [] }),
@@ -579,6 +606,7 @@ export async function runUninstall(ctx, { stage, region, account, mode, installS
     kept: report.kept,
     scheduled: [...report.scheduled, ...scheduled.filter((s) => !report.scheduled.some((r) => r.name === s.name))],
     left: unexpected,
+    notRemoved: plan(after).notRemoved,
     problems: report.problems,
     hybrid: report.hybrid,
   });

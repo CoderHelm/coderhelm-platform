@@ -65,7 +65,8 @@ class Cfn:
 
     def describe_stacks(self, StackName):
         s = next(v for v in self.stacks.values() if v["id"] == StackName)
-        return {"Stacks": [{"StackId": s["id"], "Parameters": [{"ParameterKey": k, "ParameterValue": v} for k, v in s["params"].items()]}]}
+        return {"Stacks": [{"StackId": s["id"], "StackStatus": s.get("status", "CREATE_COMPLETE"), "RoleARN": s.get("role"),
+                            "Parameters": [{"ParameterKey": k, "ParameterValue": v} for k, v in s["params"].items()]}]}
 
 
 class S3:
@@ -101,16 +102,21 @@ class Tags:
         return {"TagValues": ["coderhelm-prod", "coderhelm-prod-eu", "coderhelm-production", "my-app"]}
 
 
+class Iam:
+    def get_paginator(self, op):
+        return Paginator([{"Policies": [{"PolicyName": "coderhelm-prod-boundary-1a2b3c4d"}, {"PolicyName": "coderhelm-prod-west-boundary-12345678"}, {"PolicyName": "Admin"}]}])
+
+
 class Secrets:
     def get_paginator(self, op):
-        return Paginator([{"SecretList": [{"Name": "coderhelm/prod/secrets"}, {"Name": "coderhelm/prod-staging/secrets"}, {"Name": "other/x"}]}])
+        return Paginator([{"SecretList": [{"Name": "coderhelm/prod/secrets"}, {"Name": "coderhelm/prod-staging/secrets"}, {"Name": "coderhelm/prod/secrets"}, {"Name": "other/x"}]}])
 
 
-def stack(id8, stage="prod", status="abcdefghijklmnop", launch=True):
+def stack(id8, stage="prod", status="abcdefghijklmnop", launch=True, **kw):
     p = {"Stage": stage, "StatusId": status}
     if launch:
         p.update({"SetupToken": "", "AdminEmail": "a@example.org"})
-    return {"id": f"arn:aws:cloudformation:us-east-1:{A}:stack/x/{id8}-1111-2222-3333-444455556666", "params": p}
+    return {"id": f"arn:aws:cloudformation:us-east-1:{A}:stack/x/{id8}-1111-2222-3333-444455556666", "params": p, **kw}
 
 
 def world():
@@ -119,13 +125,18 @@ def world():
         "coderhelm-prod-2": stack("5f5f5f5f", status=""),
         "coderhelm-prod-eu": stack("77777777", stage="prod-eu", status="zzzzzzzzzzzzzzzz"),
         "coderhelm-prod-api": stack("88888888", launch=False),
-        "coderhelm-prod-uninstall": stack("5e6f7a8b", launch=False),
+        "coderhelm--uninstall-prod-abcd12": stack("5e6f7a8b", launch=False, status_="x"),
         "my-launch-renamed": stack("99999999"),
+        "coderhelm-prod-3": stack("33333333", role="arn:aws:iam::111122223333:role/Admin"),
+        "coderhelm-prod-staging2": stack("44444444", stage="prod-staging2"),
     })
     s3 = S3({
         f"coderhelm-prod-assets-9f8e7d6c-{A}": "us-east-1",
         f"coderhelm-prod-assets-22223333-{A}": "eu-west-1",
         f"coderhelm-prod-eu-assets-77777777-{A}": "us-east-1",
+        f"coderhelm-prod-dashboard-{A}": "us-east-1",
+        f"coderhelm-prod-sandbox-{A}": "eu-west-1",
+        f"coderhelm-prod-data-{A}": "us-east-1",
     }, {("coderhelm-setup-installprogress1", "status.json"): {"stage": "prod", "region": "us-east-1"},
         ("coderhelm-setup-otherinstallxxxx", "status.json"): {"stage": "staging", "region": "us-east-1"}})
     return cfn, s3
@@ -134,15 +145,32 @@ def world():
 class Discover(unittest.TestCase):
     def test_finds_this_installs_launch_stacks_ids_and_progress_in_this_region(self):
         cfn, s3 = world()
-        f = W.discover("prod", A, "us-east-1", cfn, s3, Tags(), Secrets(), own_status="uninstallprogres", install_status="installprogress1")
-        self.assertEqual(f["launch"], ["coderhelm-prod", "coderhelm-prod-2"])
+        f = W.discover("prod", A, "us-east-1", cfn, s3, Tags(), Secrets(), Iam(), own_status="uninstallprogres", install_status="installprogress1")
+        self.assertEqual(f["launch"], ["coderhelm-prod", "coderhelm-prod-2"], "not one with a service role, not another install's")
         self.assertEqual(f["ids"], ["1a2b3c4d", "5f5f5f5f", "9f8e7d6c"], "not eu-west-1's kept pieces, not another install's")
         self.assertEqual(f["setup"], ["abcdefghijklmnop", "installprogress1"])
-        self.assertEqual(f["siblings"], ["coderhelm-prod-eu", "coderhelm-prod-staging"])
+        self.assertEqual(f["siblings"], ["coderhelm-prod-eu", "coderhelm-prod-staging", "coderhelm-prod-staging2", "coderhelm-prod-west"])
+        self.assertEqual(f["buckets"], [f"coderhelm-prod-dashboard-{A}"], "the sandbox bucket of the name is in eu-west-1")
+        self.assertEqual(f["data"], [f"coderhelm-prod-data-{A}"])
+        self.assertTrue(f["anchored"])
+
+    def test_nothing_of_the_install_in_this_region_is_no_anchor(self):
+        cfn, s3 = world()
+        f = W.discover("prod", A, "us-west-2", Cfn({}), s3, type("T", (), {"get_tag_values": lambda self, **k: {"TagValues": ["coderhelm-prod"]}})(), Secrets(), Iam())
+        self.assertTrue(f["anchored"], "its tag is here")
+        class NoTags:
+            def get_tag_values(self, **k):
+                return {"TagValues": []}
+        class NoSecrets:
+            def get_paginator(self, op):
+                return Paginator([{"SecretList": []}])
+        f = W.discover("prod", A, "us-west-2", Cfn({}), s3, NoTags(), NoSecrets(), Iam())
+        self.assertFalse(f["anchored"])
+        self.assertEqual((f["buckets"], f["data"]), ([], []), "us-east-1's buckets of the name are not us-west-2's")
 
     def test_never_its_own_progress_bucket_nor_another_installs(self):
         cfn, s3 = world()
-        f = W.discover("prod", A, "us-east-1", cfn, s3, Tags(), Secrets(), own_status="abcdefghijklmnop", install_status="otherinstallxxxx")
+        f = W.discover("prod", A, "us-east-1", cfn, s3, Tags(), Secrets(), Iam(), own_status="abcdefghijklmnop", install_status="otherinstallxxxx")
         self.assertEqual(f["setup"], [])
 
 
@@ -166,18 +194,26 @@ class Expand(unittest.TestCase):
 SPEC = "version: 0.2\nphases: {}\n"
 
 
+UUID = "0e5b7b1e-1b8a-4d2f-9a51-3c2d6e7f8a9b"
+VALUES = {"VERSION": "v0.9.0", "STAGE": "prod", "MODE": "keep", "STATUS_BUCKET": "coderhelm-setup-uninstallprogres", "INSTALL_STATUS_ID": "",
+          "UNINSTALL_ID": "5e6f7a8b", "BUILD_ROLE": "coderhelm--uninstall-prod-build-5e6f7a8b", "WINDOW_FUNCTION": "coderhelm--uninstall-prod-window-5e6f7a8b"}
+
+
 class Window(unittest.TestCase):
     def setUp(self):
         self.iam_puts = []
         cfn, s3 = world()
+        cfn.stacks["self"] = {"id": "arn:aws:cloudformation:us-east-1:111122223333:stack/coderhelm--uninstall-prod-abcd12/5e6f7a8b-0000", "params": {}, "status": "CREATE_IN_PROGRESS"}
+        self.cfn = cfn
         statements = [
-            {"Sid": "InstallPieces", "Effect": "Allow", "Action": "lambda:DeleteFunction", "Resource": "arn:aws:lambda:us-east-1:111122223333:function:coderhelm-prod-*-__ID__"},
+            {"Sid": "InstallPieces", "Effect": "Allow", "Action": ["lambda:DeleteFunction", "s3:DeleteBucket"], "Resource": ["arn:__PARTITION__:lambda:__REGION__:__ACCOUNT__:function:coderhelm-__STAGE__-*-__ID__", "arn:__PARTITION__:s3:::__BUCKET__"]},
             {"Sid": "DataKeys", "Effect": "Allow", "Action": "kms:ScheduleKeyDeletion", "Resource": "*"},
-            {"Sid": "OnlyThisBuild", "Effect": "Deny", "Action": "*", "NotResource": ["x"], "Condition": {"StringNotEquals": {"aws:userid": "__USER_ID__"}}},
+            {"Sid": "OnlyThisBuild", "Effect": "Deny", "Action": "*", "NotResource": ["arn:__PARTITION__:iam::__ACCOUNT__:role/coderhelm--uninstall-__STAGE__-build-__UID__"], "Condition": {"StringNotEquals": {"aws:userid": "__USER_ID__"}}},
         ]
+        self.raw = json.dumps(statements)
         test = self
 
-        class Iam:
+        class IamFake(Iam):
             def get_role(self, RoleName):
                 return {"Role": {"RoleId": "AROAEXAMPLEBUILDROLE1"}}
 
@@ -186,7 +222,7 @@ class Window(unittest.TestCase):
 
         class Ssm:
             def get_parameter(self, Name):
-                return {"Parameter": {"Value": json.dumps(statements)}}
+                return {"Parameter": {"Value": test.raw}}
 
         class Builds:
             def __init__(self, b):
@@ -195,18 +231,22 @@ class Window(unittest.TestCase):
             def batch_get_builds(self, ids):
                 return {"builds": [self.b]}
 
-        self.build = {"projectName": "coderhelm-prod-uninstall-5e6f7a8b", "buildStatus": "IN_PROGRESS", "source": {"type": "NO_SOURCE", "buildspec": SPEC},
-                      "environment": {"image": "aws/codebuild/standard:7.0", "environmentVariables": [{"name": "STAGE", "value": "prod"}, {"name": "MODE", "value": "everything"}]},
-                      "serviceRole": f"arn:aws:iam::{A}:role/coderhelm-prod-uninstall-build-5e6f7a8b"}
-        CLIENTS.update({"iam": Iam(), "ssm": Ssm(), "codebuild": Builds(self.build), "cloudformation": cfn, "s3": s3,
+        self.build = {"id": "coderhelm--uninstall-prod-5e6f7a8b:" + UUID, "projectName": "coderhelm--uninstall-prod-5e6f7a8b", "buildStatus": "IN_PROGRESS",
+                      "initiator": "coderhelm--uninstall-prod-starter-5e6f7a8b/coderhelm--uninstall-prod-starter-5e6f7a8b",
+                      "source": {"type": "NO_SOURCE", "buildspec": SPEC},
+                      "environment": {"type": "LINUX_CONTAINER", "image": "aws/codebuild/standard:7.0", "environmentVariables": [{"name": k, "value": v} for k, v in VALUES.items()] + [
+                          {"name": "WAIT_URL", "value": "https://cloudformation-waitcondition-us-east-1.s3.amazonaws.com/x"}]},
+                      "serviceRole": f"arn:aws:iam::{A}:role/coderhelm--uninstall-prod-build-5e6f7a8b"}
+        CLIENTS.update({"iam": IamFake(), "ssm": Ssm(), "codebuild": Builds(self.build), "cloudformation": cfn, "s3": s3,
                         "resourcegroupstaggingapi": Tags(), "secretsmanager": Secrets()})
-        os.environ.update({"PROJECT": "coderhelm-prod-uninstall-5e6f7a8b", "ROLE": "coderhelm-prod-uninstall-build-5e6f7a8b", "IMAGE": "aws/codebuild/standard:7.0",
-                           "PARAM": "/coderhelm-prod/uninstall-5e6f7a8b/window-policy", "PARTS": "1", "BUILDSPEC_SHA256": hashlib.sha256(W.norm(SPEC).encode()).hexdigest(),
-                           "VARIABLES": "VERSION,STAGE,MODE,STATUS_BUCKET,INSTALL_STATUS_ID,UNINSTALL_ID,BUILD_ROLE,WINDOW_FUNCTION,WAIT_URL",
+        os.environ.update({"PROJECT": "coderhelm--uninstall-prod-5e6f7a8b", "ROLE": "coderhelm--uninstall-prod-build-5e6f7a8b", "IMAGE": "aws/codebuild/standard:7.0",
+                           "PARAM": "/coderhelm--uninstall-prod-5e6f7a8b/window-policy", "PARTS": "1", "BUILDSPEC_SHA256": hashlib.sha256(W.norm(SPEC).encode()).hexdigest(),
+                           "WINDOW_SHA256": hashlib.sha256(self.raw.encode()).hexdigest(), "STARTER_ROLE": "coderhelm--uninstall-prod-starter-5e6f7a8b",
+                           "STACK_ID": cfn.stacks["self"]["id"], "ID": "5e6f7a8b", "PARTITION": "aws", "VALUES": json.dumps(VALUES),
                            "STAGE": "prod", "MODE": "keep", "ACCOUNT": A, "REGION": "us-east-1", "OWN_STATUS": "uninstallprogres", "INSTALL_STATUS": ""})
 
-    def ask(self):
-        return W.handler({"build_id": "b:1", "user_id": "AROAEXAMPLEBUILDROLE1:AWSCodeBuild-1"}, None)
+    def ask(self, user=None):
+        return W.handler({"build_id": self.build["id"], "user_id": user or "AROAEXAMPLEBUILDROLE1:AWSCodeBuild-" + UUID}, None)
 
     def test_this_stacks_build_gets_its_window_in_the_stacks_own_mode(self):
         r = self.ask()
@@ -214,27 +254,52 @@ class Window(unittest.TestCase):
         doc = json.loads(self.iam_puts[0]["PolicyDocument"])
         self.assertEqual(self.iam_puts[0]["PolicyName"], "uninstall-window")
         sids = [s["Sid"] for s in doc["Statement"]]
-        self.assertNotIn("DataKeys", sids, "MODE=keep in the stack: the build's own MODE=everything changes nothing")
-        self.assertEqual(doc["Statement"][0]["Resource"], [f"arn:aws:lambda:us-east-1:{A}:function:coderhelm-prod-*-{i}" for i in ["1a2b3c4d", "5f5f5f5f", "9f8e7d6c"]])
-        self.assertEqual(doc["Statement"][-1]["Condition"]["StringNotEquals"]["aws:userid"], ["AROAEXAMPLEBUILDROLE1:AWSCodeBuild-1"])
+        self.assertNotIn("DataKeys", sids, "MODE=keep in the stack")
+        self.assertEqual(doc["Statement"][0]["Resource"], [f"arn:aws:lambda:us-east-1:{A}:function:coderhelm-prod-*-{i}" for i in ["1a2b3c4d", "5f5f5f5f", "9f8e7d6c"]] + [f"arn:aws:s3:::coderhelm-prod-dashboard-{A}"])
+        self.assertEqual(doc["Statement"][-1]["NotResource"], [f"arn:aws:iam::{A}:role/coderhelm--uninstall-prod-build-5e6f7a8b"])
+        self.assertEqual(doc["Statement"][-1]["Condition"]["StringNotEquals"]["aws:userid"], ["AROAEXAMPLEBUILDROLE1:AWSCodeBuild-" + UUID])
         self.assertNotIn("__", self.iam_puts[0]["PolicyDocument"])
 
+    def refused(self, why, **change):
+        saved = json.loads(json.dumps(self.build))
+        self.build.update(change)
+        r = self.ask()
+        self.build.clear()
+        self.build.update(saved)
+        self.assertFalse(r["ok"], why)
+        self.assertIn(why, r["error"])
+
     def test_refused_for_anything_but_this_templates_running_build(self):
-        for change, why in [({"buildStatus": "SUCCEEDED"}, "not running"), ({"projectName": "other"}, "uninstall build"),
-                            ({"source": {"type": "NO_SOURCE", "buildspec": SPEC + "  - curl evil\n"}}, "buildspec"),
-                            ({"environment": {"image": "evil:latest"}}, "image"),
-                            ({"environment": {"image": "aws/codebuild/standard:7.0", "environmentVariables": [{"name": "AWS_CONFIG_FILE", "value": "x"}]}}, "AWS_CONFIG_FILE"),
-                            ({"serviceRole": f"arn:aws:iam::{A}:role/Admin"}, "another role")]:
-            saved = dict(self.build)
-            self.build.update(change)
-            r = self.ask()
-            self.build.clear()
-            self.build.update(saved)
-            self.assertFalse(r["ok"])
-            self.assertIn(why, r["error"])
+        env = self.build["environment"]
+        self.refused("not running", buildStatus="SUCCEEDED")
+        self.refused("uninstall build", projectName="other")
+        self.refused("buildspec", source={"type": "NO_SOURCE", "buildspec": SPEC + "  - curl evil\n"})
+        self.refused("image", environment={**env, "image": "evil:latest"})
+        self.refused("AWS_CONFIG_FILE", environment={**env, "environmentVariables": env["environmentVariables"] + [{"name": "AWS_CONFIG_FILE", "value": "x"}]})
+        self.refused("changes VERSION", environment={**env, "environmentVariables": [{"name": "VERSION", "value": "v0.1.0"}]})
+        self.refused("changes MODE", environment={**env, "environmentVariables": [{"name": "MODE", "value": "everything"}]})
+        self.refused("WAIT_URL", environment={**env, "environmentVariables": [{"name": "WAIT_URL", "value": "https://evil.example/x"}]})
+        self.refused("debug session", debugSession={"sessionEnabled": True})
+        self.refused("another fleet", fleet={"fleetArn": "x"})
+        self.refused("starter did not start it", initiator="someone/else")
+        self.refused("another role", serviceRole=f"arn:aws:iam::{A}:role/Admin")
         self.assertEqual(self.iam_puts, [])
-        r = W.handler({"build_id": "b:1", "user_id": "AROAOTHERROLE:x"}, None)
+        for user in ["AROAOTHERROLE:AWSCodeBuild-" + UUID, "AROAEXAMPLEBUILDROLE1:AWSCodeBuild-another-build", "AROAEXAMPLEBUILDROLE1:anything"]:
+            r = self.ask(user)
+            self.assertFalse(r["ok"])
+            self.assertIn("own session", r["error"])
+        self.assertEqual(self.iam_puts, [])
+
+    def test_refused_once_the_stack_has_ended_or_its_statements_were_changed(self):
+        self.cfn.stacks["self"]["status"] = "CREATE_FAILED"
+        r = self.ask()
         self.assertFalse(r["ok"])
+        self.assertIn("has ended", r["error"])
+        self.cfn.stacks["self"]["status"] = "CREATE_IN_PROGRESS"
+        self.raw = self.raw.replace("lambda:DeleteFunction", "iam:*")
+        r = self.ask()
+        self.assertFalse(r["ok"])
+        self.assertIn("not this template's", r["error"])
         self.assertEqual(self.iam_puts, [])
 
     def test_a_window_too_big_for_iam_is_refused_with_the_terminal_way(self):

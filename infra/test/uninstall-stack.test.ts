@@ -16,8 +16,9 @@ import { Template } from "aws-cdk-lib/assertions";
 import { CfnInclude } from "aws-cdk-lib/cloudformation-include";
 import { repoPath } from "../lib/paths";
 import { CHECK_VERSION, COSIGN_LINUX_AMD64_SHA256, installCosignCommands, VERIFY_SUMS, verifyTagCommands } from "../lib/release-verify";
-import { buildspec, buildspecSha256, stackNames, uninstallTemplateText, UNINSTALL_VARIABLES, UNINSTALL_WINDOW_PART_MAX } from "../lib/uninstall-stack";
-import { DATA_SID, expandWindow, TOKENS, uninstallWindowParts, uninstallWindowStatements, uninstallNames } from "../lib/uninstall-access";
+import { buildspec, buildspecSha256, stackNames, storedParts, uninstallTemplateText, UNINSTALL_VARIABLES, windowSha256 } from "../lib/uninstall-stack";
+import * as crypto from "node:crypto";
+import { DATA_SID, expandWindow, TOKENS, uninstallWindowStatements, uninstallNames } from "../lib/uninstall-access";
 import { casePolicies, CASE_NOW, CASE_USER_ID, CASE_EXPIRES, sessionCases, uninstallCases } from "../lib/uninstall-cases";
 import { decision } from "./iam-eval";
 
@@ -83,6 +84,13 @@ test("the window function checks this template's buildspec, image and variables,
   assert.match(code, /MAX_WINDOW = 9400/);
   const parts = Object.keys(t.Resources).filter((k) => k.startsWith("WindowPolicy"));
   assert.equal(v.PARTS, String(parts.length));
+  // The statements are pinned: the window function refuses parameters someone changed.
+  assert.equal(v.WINDOW_SHA256, windowSha256());
+  assert.deepEqual(parts.map((k) => t.Resources[k].Properties.Value), storedParts());
+  assert.deepEqual(v.STACK_ID, { Ref: "AWS::StackId" });
+  assert.match(code, /CREATE_IN_PROGRESS/);
+  assert.match(code, /debugSession/);
+  assert.match(code, /AWSCodeBuild-/);
 });
 
 test("every role carries the uninstall boundary; the build is idle until its window; nothing allows a wildcard action", () => {
@@ -121,14 +129,17 @@ test("the uninstaller removes itself by rolling back; only its log and progress 
 });
 
 test("each window part fits a standard parameter with the longest names substituted", () => {
-  const longest = (s: string) => s.split("${Stage}").join("a".repeat(20)).split("${Id}").join("12345678").split("${AWS::AccountId}").join("1".repeat(12))
-    .split("${AWS::Region}").join("ap-southeast-2").split("${AWS::Partition}").join("aws-us-gov").split("${StatusId}").join("a".repeat(16));
-  for (const p of uninstallWindowParts(stackNames(), UNINSTALL_WINDOW_PART_MAX)) assert.ok(longest(p).length <= 4096, `${longest(p).length}`);
+  // Stored as written (the window function fills in the names): each part fits as it is.
+  for (const p of storedParts()) {
+    assert.ok(p.length <= 4096, `${p.length}`);
+    assert.doesNotMatch(p, /\$\{/, "no ${...} for CloudFormation to read");
+  }
+  assert.equal(windowSha256(), crypto.createHash("sha256").update(storedParts().join("\n")).digest("hex"));
 });
 
 test("a common install's window fits a role's inline policies with the idle policy", () => {
   const n = uninstallNames({ account: "111122223333", region: "us-east-1", stage: "prod", uid: "12345678", statusId: "abcdefghijklmnop" });
-  const doc = expandWindow(uninstallWindowStatements(n), { userId: CASE_USER_ID, expires: CASE_EXPIRES, ids: ["11111111", "22222222"], launch: ["coderhelm-prod", "coderhelm-prod-2"], setup: ["s".repeat(16), "t".repeat(16)], siblings: ["coderhelm-prod-eu"] }, "everything");
+  const doc = expandWindow(uninstallWindowStatements(n), { userId: CASE_USER_ID, expires: CASE_EXPIRES, ids: ["11111111", "22222222"], launch: ["coderhelm-prod", "coderhelm-prod-2"], setup: ["s".repeat(16), "t".repeat(16)], siblings: ["coderhelm-prod-eu"], buckets: ["coderhelm-prod-dashboard-111122223333", "coderhelm-prod-sandbox-111122223333"], data: ["coderhelm-prod-data-111122223333"] }, "everything");
   assert.ok(JSON.stringify(doc).length <= 9400, `${JSON.stringify(doc).length}`);
   // No token left, and keep mode has no data statement.
   assert.doesNotMatch(JSON.stringify(doc), /__[A-Z_]+__/);

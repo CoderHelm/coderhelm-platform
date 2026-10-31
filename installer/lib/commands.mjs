@@ -749,13 +749,15 @@ export async function uninstall(ctx) {
     log(`\nCoderHelm ${stage} in ${region} (${account}): ${left.length ? `${left.length} piece${left.length === 1 ? "" : "s"} left` : "nothing left"}.`);
     for (const l of left) log(`  ${l.kind.padEnd(22)} ${l.name}`);
     for (const k of scheduled) log(`  KMS key ${k.name}: scheduled for deletion${k.date ? ` on ${k.date}` : ""} (AWS's 7-day minimum)`);
+    for (const x of un.plan(inv).notRemoved) log(`  not removed: ${x.kind} ${x.name}, ${x.why}`);
     for (const x of inv.skipped) log(`  not this install's: ${x.kind} ${x.name} (${x.why})`);
     return left.length ? 1 : 0;
   }
 
   const p = un.plan(inv);
-  if (!p.remove.length && !p.keep.length) {
-    log(`Nothing named or tagged for the install ${stage} is in ${region} (${account}).`);
+  if (!inv.anchored || (!p.remove.length && !p.keep.length)) {
+    log(`Nothing named or tagged for the install ${stage} is in ${region} (${account}): no Launch Stack, no resource tagged for it and no secret.`);
+    for (const x of inv.skipped) log(`  not this install's: ${x.kind} ${x.name} (${x.why})`);
     return 0;
   }
   log(`\nThis removes CoderHelm ${stage} from ${account} in ${region}:`);
@@ -766,6 +768,7 @@ export async function uninstall(ctx) {
   } else if (mode === "everything") {
     log(`\nNothing can be recovered afterwards. KMS keys are scheduled for deletion in ${un.KEY_DELETION_DAYS} days (AWS's minimum); until then they can be cancelled.`);
   }
+  for (const x of p.notRemoved) log(`\nNot removed: ${x.kind} ${x.name}, ${x.why}.`);
   if (inv.scope.siblings.length) log(`\nNot touched: the other installs ${inv.scope.siblings.join(", ")} (their names start with this one's).`);
   if (ctx.runner.dryRun) {
     log("\nDry run: nothing was deleted.");

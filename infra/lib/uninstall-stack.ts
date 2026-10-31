@@ -36,6 +36,16 @@ import { UNINSTALL_WINDOW_POLICY_NAME, uninstallBoundaryPolicy, uninstallNames, 
 
 export const UNINSTALL_IMAGE = "aws/codebuild/standard:7.0";
 export const UNINSTALL_VARIABLES = ["VERSION", "STAGE", "MODE", "STATUS_BUCKET", "INSTALL_STATUS_ID", "UNINSTALL_ID", "BUILD_ROLE", "WINDOW_FUNCTION", "WAIT_URL"];
+/** How the stored window names the stack's values (the window function fills them in; no ${...}, which CloudFormation would read). */
+export const STORED_NAMES: [string, string][] = [
+  ["${AWS::Partition}", "__PARTITION__"], ["${AWS::AccountId}", "__ACCOUNT__"], ["${AWS::Region}", "__REGION__"], ["${Stage}", "__STAGE__"], ["${Id}", "__UID__"], ["${StatusId}", "__OWN_STATUS__"],
+];
+export const stored = (v: string) => STORED_NAMES.reduce((t, [a, b]) => t.split(a).join(b), v);
+/** The window's statements as stored in its parameters. */
+export function storedParts(): string[] {
+  return uninstallWindowParts(stackNames(), UNINSTALL_WINDOW_PART_MAX).map(stored);
+}
+
 /** Each window part fits a standard parameter (4 KB) with the longest names substituted. */
 export const UNINSTALL_WINDOW_PART_MAX = 3000;
 
@@ -107,6 +117,11 @@ export function buildspec(): string {
   ].join("\n");
 }
 
+/** sha256 of the window's statements as stored, parts joined by newlines (infra/cfn/uninstall/window.py checks it). */
+export function windowSha256(parts = storedParts()): string {
+  return crypto.createHash("sha256").update(parts.join("\n")).digest("hex");
+}
+
 export function buildspecSha256(spec = buildspec()): string {
   return crypto.createHash("sha256").update(norm(spec)).digest("hex");
 }
@@ -117,7 +132,7 @@ const logArn = (group: string) => `arn:\${AWS::Partition}:logs:\${AWS::Region}:\
 
 export function uninstallTemplate(): Record<string, unknown> {
   const n = stackNames();
-  const parts = uninstallWindowParts(n, UNINSTALL_WINDOW_PART_MAX);
+  const parts = storedParts();
   const P = "arn:${AWS::Partition}";
   const fnArn = (f: string) => `${P}:lambda:\${AWS::Region}:\${AWS::AccountId}:function:${f}`;
   const roleArn = (r: string) => `${P}:iam::\${AWS::AccountId}:role/${r}`;
@@ -223,8 +238,8 @@ export function uninstallTemplate(): Record<string, unknown> {
               { Sid: "WriteTheWindow", Effect: "Allow", Action: ["iam:GetRole", "iam:PutRolePolicy"], Resource: roleArn(n.buildRole) },
               { Sid: "WindowStatements", Effect: "Allow", Action: "ssm:GetParameter", Resource: `${P}:ssm:\${AWS::Region}:\${AWS::AccountId}:parameter${n.paramPath}/*` },
               // Read-only: what it finds decides only which of this install's names go in the window.
-              { Sid: "FindTheInstall", Effect: "Allow", Action: ["cloudformation:ListStacks", "cloudformation:DescribeStacks", "s3:ListAllMyBuckets", "tag:GetTagValues", "secretsmanager:ListSecrets"], Resource: "*" },
-              { Sid: "AssetsBucketRegion", Effect: "Allow", Action: "s3:GetBucketLocation", Resource: `${P}:s3:::coderhelm-\${Stage}-assets-*` },
+              { Sid: "FindTheInstall", Effect: "Allow", Action: ["cloudformation:ListStacks", "cloudformation:DescribeStacks", "s3:ListAllMyBuckets", "tag:GetTagValues", "secretsmanager:ListSecrets", "iam:ListPolicies"], Resource: "*" },
+              { Sid: "BucketRegions", Effect: "Allow", Action: "s3:GetBucketLocation", Resource: `${P}:s3:::coderhelm-\${Stage}-*` },
               { Sid: "InstallProgress", Effect: "Allow", Action: "s3:GetObject", Resource: `${P}:s3:::coderhelm-setup-\${InstallStatusId}/status.json` },
             ],
           }),
@@ -248,6 +263,18 @@ export function uninstallTemplate(): Record<string, unknown> {
             IMAGE: UNINSTALL_IMAGE,
             PARAM: sub(n.paramPath),
             PARTS: String(parts.length),
+            WINDOW_SHA256: windowSha256(parts),
+            STARTER_ROLE: sub(n.starterRole),
+            STACK_ID: { Ref: "AWS::StackId" },
+            ID: LAUNCH_ID,
+            PARTITION: { Ref: "AWS::Partition" },
+            // The build's variables, each value as this stack sets it (WAIT_URL is the starter's).
+            VALUES: {
+              "Fn::Sub": [
+                JSON.stringify({ VERSION: "${Version}", STAGE: "${Stage}", MODE: "${Mode}", STATUS_BUCKET: "${Bucket}", INSTALL_STATUS_ID: "${InstallStatusId}", UNINSTALL_ID: "${Id}", BUILD_ROLE: "${Role}", WINDOW_FUNCTION: "${Fn}" }),
+                { Bucket: { "Fn::If": ["HasStatus", { Ref: "StatusBucket" }, ""] }, Id: LAUNCH_ID, Role: sub(n.buildRole), Fn: sub(n.windowFunction) },
+              ],
+            },
             // sha256 of the build's BuildSpec, each line's trailing spaces and the ends trimmed.
             BUILDSPEC_SHA256: buildspecSha256(),
             VARIABLES: UNINSTALL_VARIABLES.join(","),
@@ -303,6 +330,7 @@ export function uninstallTemplate(): Record<string, unknown> {
     },
     DoneHandle: { Type: "AWS::CloudFormation::WaitConditionHandle" },
   };
+  // Stored as written (the window function fills in ${Stage} and the rest), so their sha256 is pinned in the function.
   parts.forEach((value, i) => {
     resources[`WindowPolicy${i + 1}`] = {
       Type: "AWS::SSM::Parameter",
@@ -310,7 +338,7 @@ export function uninstallTemplate(): Record<string, unknown> {
         Name: sub(`${n.paramPath}/${i + 1}`),
         Description: "CoderHelm: the uninstall window's statements (infra/lib/uninstall-access.ts)",
         Type: "String",
-        Value: sub(value),
+        Value: value,
       },
     };
   });
@@ -342,7 +370,7 @@ export function uninstallTemplate(): Record<string, unknown> {
     Description:
       "Removes one CoderHelm install from this AWS account (10 to 40 minutes). It creates an uninstall build (CodeBuild) whose role can't delete " +
       "anything until a check gives this one verified build a window that ends with it, limited to resources named or tagged for the install you " +
-      "name (coderhelm-<name>-*) and denied for every other install. When it ends, the stack rolls itself back, which removes the uninstaller " +
+      "name (coderhelm-<name>-*) and denied for every other install. Its own pieces are named coderhelm--uninstall-<name>-*, outside every install's names. When it ends, the stack rolls itself back, which removes the uninstaller " +
       "with your own credentials. docs.coderhelm.com/self-host/uninstall",
     Metadata: {
       "cfn-lint": { config: { ignore_checks: ["E6101"] } },
@@ -390,7 +418,7 @@ export function uninstallTemplate(): Record<string, unknown> {
       },
       UninstallerLogs: {
         Description: "The uninstall build's log (kept after a failed uninstall).",
-        Value: { "Fn::Sub": ["https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#logsV2:log-groups/log-group/$252Faws$252Fcodebuild$252Fcoderhelm-${Stage}-uninstall-${Id}", { Id: LAUNCH_ID }] },
+        Value: { "Fn::Sub": ["https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#logsV2:log-groups/log-group/$252Faws$252Fcodebuild$252Fcoderhelm--uninstall-${Stage}-${Id}", { Id: LAUNCH_ID }] },
       },
     },
   };

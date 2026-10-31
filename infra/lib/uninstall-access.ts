@@ -8,7 +8,7 @@
  *
  * It follows the install's own shape (infra/lib/access.ts):
  *
- * - The uninstall boundary (`<prefix>-uninstall-boundary-<id>`) caps the
+ * - The uninstall boundary (`coderhelm--uninstall-<stage>-boundary-<id>`) caps the
  *   uninstall stack's three roles: no IAM users or keys, no Organizations,
  *   CloudTrail or GuardDuty, no IAM writes outside `<prefix>-*`, no role
  *   assumed at all, and none of the uninstaller's own pieces changed by
@@ -24,6 +24,9 @@
  *     __SETUP__   each install progress bucket id (coderhelm-setup-<id>)
  *     __SIB__     each other install whose name starts with this one's
  *                 plus a hyphen (coderhelm-prod-eu inside coderhelm-prod-*)
+ *     __BUCKET__  the stacks' own buckets that are in this region (S3 names
+ *                 carry no region: coderhelm-<name>-dashboard-<account>)
+ *     __DATA__    the data bucket, when it is in this region
  *   A string with a token becomes one string per value; a statement left
  *   with no resource or no condition value is dropped.
  *
@@ -36,11 +39,13 @@
 import { Statement, PolicyDocument, partitionOf } from "./access";
 
 export const INSTALL_TAG = "coderhelm:install";
+/** Every uninstaller piece starts with this: coderhelm--uninstall-<stage>-... (docs/self-host/uninstall.md). */
+export const UNINSTALL_NS = "coderhelm--uninstall-";
 /** The tag the updater puts on a certificate it requests for a domain (lambda/updater). */
 export const UPDATER_CERT_TAG = "coderhelm";
 export const UNINSTALL_WINDOW_POLICY_NAME = "uninstall-window";
 export const UNINSTALL_WINDOW_MINUTES = 100;
-export const TOKENS = { userId: "__USER_ID__", expires: "__EXPIRES__", id: "__ID__", launch: "__LAUNCH__", setup: "__SETUP__", sib: "__SIB__" } as const;
+export const TOKENS = { userId: "__USER_ID__", expires: "__EXPIRES__", id: "__ID__", launch: "__LAUNCH__", setup: "__SETUP__", sib: "__SIB__", bucket: "__BUCKET__", data: "__DATA__" } as const;
 /** Statements whose Sid starts with this are left out unless the uninstall deletes the data too. */
 export const DATA_SID = "Data";
 
@@ -73,7 +78,9 @@ export interface UninstallNames {
 export function uninstallNames(p: { partition?: string; account: string; region: string; stage: string; uid: string; statusId?: string }): UninstallNames {
   const partition = p.partition ?? partitionOf(p.region);
   const prefix = `coderhelm-${p.stage}`;
-  const u = `${prefix}-uninstall`;
+  // Outside every install's names: an install name starts with a letter, so
+  // no install's coderhelm-<name>-* (nor its deploy role) reaches coderhelm--*.
+  const u = `${UNINSTALL_NS}${p.stage}`;
   const boundaryName = `${u}-boundary-${p.uid}`;
   return {
     partition,
@@ -94,7 +101,7 @@ export function uninstallNames(p: { partition?: string; account: string; region:
     buildLogGroup: `/aws/codebuild/${u}-${p.uid}`,
     windowLogGroup: `/aws/lambda/${u}-window-${p.uid}`,
     starterLogGroup: `/aws/lambda/${u}-starter-${p.uid}`,
-    paramPath: `/${prefix}/uninstall-${p.uid}/window-policy`,
+    paramPath: `/${u}-${p.uid}/window-policy`,
     stackName: u,
   };
 }
@@ -107,15 +114,15 @@ function at(n: UninstallNames, svc: string, region = n.region): string {
 
 /** The uninstaller's own pieces, which nothing it runs may change. */
 function own(n: UninstallNames) {
-  const P = n.prefix;
+  const U = n.stackName;
   return {
-    roles: `arn:${n.partition}:iam::${n.account}:role/${P}-uninstall-*`,
-    policies: `arn:${n.partition}:iam::${n.account}:policy/${P}-uninstall-*`,
-    functions: `${at(n, "lambda")}:function:${P}-uninstall-*`,
-    projects: `${at(n, "codebuild")}:project/${P}-uninstall-*`,
-    params: `${at(n, "ssm")}:parameter/${P}/uninstall-*`,
-    stacks: `${at(n, "cloudformation")}:stack/${P}-uninstall*/*`,
-    logs: [`${at(n, "logs")}:log-group:/aws/codebuild/${P}-uninstall-*`, `${at(n, "logs")}:log-group:/aws/lambda/${P}-uninstall-*`],
+    roles: `arn:${n.partition}:iam::${n.account}:role/${U}-*`,
+    policies: `arn:${n.partition}:iam::${n.account}:policy/${U}-*`,
+    functions: `${at(n, "lambda")}:function:${U}-*`,
+    projects: `${at(n, "codebuild")}:project/${U}-*`,
+    params: `${at(n, "ssm")}:parameter/${U}-*`,
+    stacks: `${at(n, "cloudformation")}:stack/${U}-*/*`,
+    logs: [`${at(n, "logs")}:log-group:/aws/codebuild/${U}-*`, `${at(n, "logs")}:log-group:/aws/lambda/${U}-*`],
     statusBucket: [`arn:${n.partition}:s3:::coderhelm-setup-${n.statusId}`, `arn:${n.partition}:s3:::coderhelm-setup-${n.statusId}/*`],
   };
 }
@@ -149,7 +156,7 @@ export function uninstallBoundaryPolicy(n: UninstallNames): PolicyDocument {
     },
     { Sid: "NoAccountGuardrailChanges", Effect: "Deny", Action: ["organizations:*", "account:*", "cloudtrail:*", "guardduty:*"], Resource: "*" },
     { Sid: "NoRolesAssumed", Effect: "Deny", Action: ["sts:AssumeRole", "sts:AssumeRoleWithWebIdentity", "sts:AssumeRoleWithSAML", "sts:TagSession", "sts:SetSourceIdentity"], Resource: "*" },
-    { Sid: "NoIamWritesOutsideTheInstall", Effect: "Deny", Action: IAM_WRITES, NotResource: [`${iam}:role/${P}-*`, `${iam}:policy/${P}-*`] },
+    { Sid: "NoIamWritesOutsideTheInstall", Effect: "Deny", Action: IAM_WRITES, NotResource: [`${iam}:role/${P}-*`, `${iam}:policy/${P}-*`, o.roles] },
     { Sid: "NoNewRolesOrPolicies", Effect: "Deny", Action: ["iam:CreateRole", "iam:CreatePolicy", "iam:CreatePolicyVersion", "iam:SetDefaultPolicyVersion", "iam:AttachRolePolicy", "iam:PutRolePermissionsBoundary", "iam:DeleteRolePermissionsBoundary", "iam:UpdateAssumeRolePolicy"], Resource: "*" },
     // A role is passed only to CloudFormation (the install's deploy role, to delete its stacks).
     { Sid: "PassOnlyToCloudFormation", Effect: "Deny", Action: "iam:PassRole", Resource: "*", Condition: { StringNotEquals: { "iam:PassedToService": "cloudformation.amazonaws.com" } } },
@@ -212,23 +219,23 @@ export function uninstallWindowStatements(n: UninstallNames): Statement[] {
       Sid: "InstallPieces",
       Effect: "Allow",
       Action: [
-        "lambda:DeleteFunction", "lambda:InvokeFunction", "codebuild:DeleteProject", "ssm:DeleteParameter", "ssm:DeleteParameters", "ssm:GetParameter*",
+        "lambda:DeleteFunction", "codebuild:DeleteProject", "ssm:DeleteParameter", "ssm:DeleteParameters", "ssm:GetParameter*",
         "iam:DeleteRole", "iam:DeletePolicy", "iam:DeletePolicyVersion", "logs:DeleteLogGroup", "secretsmanager:GetSecretValue", ...BUCKET_EMPTYING,
       ],
       Resource: [
         `${at(n, "lambda")}:function:${P}-*-${T.id}`, `${at(n, "codebuild")}:project/${T.launch}-installer`, `${iam}:role/${P}-*-${T.id}`, boundaries,
-        ...bucket(`${P}-assets-${T.id}-${A}`), ...bucket(`${P}-dashboard-${A}`), ...bucket(`${P}-sandbox-${A}`), ...bucket(`coderhelm-setup-${T.setup}`),
+        ...bucket(`${P}-assets-${T.id}-${A}`), ...bucket(T.bucket), ...bucket(`coderhelm-setup-${T.setup}`),
         `${at(n, "logs")}:log-group:/aws/lambda/${P}-*`, `${at(n, "logs")}:log-group:/aws/codebuild/${P}-*`, `${at(n, "ssm")}:parameter/${P}/*`,
         // Hybrid: the registration, read to release the name and links before anything is deleted.
         `${at(n, "secretsmanager")}:secret:coderhelm/${n.stage}/secrets-*`,
       ],
     }),
-    // Roles: a role's policies come off only when it carries one of the install's boundaries;
-    // the role itself goes when it is the install's (its tag) or ends in a Launch Stack id (above).
-    s({ Sid: "InstallRolePolicies", Effect: "Allow", Action: ["iam:DeleteRolePolicy", "iam:DetachRolePolicy"], Resource: `${iam}:role/${P}-*` }, { StringEquals: { "iam:PermissionsBoundary": boundaries } }),
-    s({ Sid: "TaggedRoles", Effect: "Allow", Action: "iam:DeleteRole", Resource: `${iam}:role/${P}-*` }, { StringEquals: { [`iam:ResourceTag/${INSTALL_TAG}`]: P } }),
-    // A certificate the updater requested for the install's domain (us-east-1, tagged by it).
-    s({ Sid: "UpdaterCertificates", Effect: "Allow", Action: "acm:DeleteCertificate", Resource: `arn:${part}:acm:*:${A}:certificate/*` }, { StringEquals: { [`aws:ResourceTag/${UPDATER_CERT_TAG}`]: P } }),
+    // The Launch Stack's custom resource, invoked only by CloudFormation as it deletes the stack.
+    s({ Sid: "LaunchCustomResource", Effect: "Allow", Action: "lambda:InvokeFunction", Resource: `${at(n, "lambda")}:function:${P}-starter-${T.id}` },
+      { "ForAnyValue:StringEquals": { "aws:CalledVia": "cloudformation.amazonaws.com" } }),
+    // Roles (IAM is global): a role's policies come off, and the role goes, only when it carries
+    // one of the boundaries of this install's Launch Stacks in this region, or (above) ends in one of their ids.
+    s({ Sid: "InstallRoles", Effect: "Allow", Action: ["iam:DeleteRolePolicy", "iam:DetachRolePolicy", "iam:DeleteRole"], Resource: `${iam}:role/${P}-*` }, { StringEquals: { "iam:PermissionsBoundary": boundaries } }),
     s({ Sid: "ReadRegistrationKey", Effect: "Allow", Action: "kms:Decrypt", Resource: `${at(n, "kms")}:key/*` },
       { StringEquals: { ...tagged, "kms:ViaService": `secretsmanager.${n.region}.amazonaws.com` } }),
     // Delete everything only: the data.
@@ -240,7 +247,7 @@ export function uninstallWindowStatements(n: UninstallNames): Statement[] {
       Sid: `${DATA_SID}Pieces`,
       Effect: "Allow",
       Action: ["dynamodb:DeleteBackup", "kms:DeleteAlias", "secretsmanager:DeleteSecret", ...BUCKET_EMPTYING],
-      Resource: [`${at(n, "dynamodb")}:table/${P}/backup/*`, `${at(n, "dynamodb")}:table/${P}-*/backup/*`, `${at(n, "kms")}:alias/${P}-*`, `${at(n, "secretsmanager")}:secret:coderhelm/${n.stage}/*`, ...bucket(`${P}-data-${A}`)],
+      Resource: [`${at(n, "dynamodb")}:table/${P}/backup/*`, `${at(n, "dynamodb")}:table/${P}-*/backup/*`, `${at(n, "kms")}:alias/${P}-*`, `${at(n, "secretsmanager")}:secret:coderhelm/${n.stage}/*`, ...bucket(T.data)],
     }),
   ];
   return [...allows, ...uninstallWindowDenies(n, allows)];
@@ -299,6 +306,8 @@ export interface WindowValues {
   launch: string[];
   setup: string[];
   siblings: string[];
+  buckets?: string[];
+  data?: string[];
 }
 
 /**
@@ -307,7 +316,7 @@ export interface WindowValues {
  */
 export function expandWindow(statements: Statement[], v: WindowValues, mode: "keep" | "everything"): PolicyDocument {
   const subs: [string, string[]][] = [
-    [TOKENS.userId, [v.userId]], [TOKENS.expires, [v.expires]], [TOKENS.id, v.ids], [TOKENS.launch, v.launch], [TOKENS.setup, v.setup], [TOKENS.sib, v.siblings],
+    [TOKENS.userId, [v.userId]], [TOKENS.expires, [v.expires]], [TOKENS.id, v.ids], [TOKENS.launch, v.launch], [TOKENS.setup, v.setup], [TOKENS.sib, v.siblings], [TOKENS.bucket, v.buckets ?? []], [TOKENS.data, v.data ?? []],
   ];
   const many = (s: string): string[] => {
     for (const [t, vals] of subs) if (s.includes(t)) return vals.flatMap((x) => many(s.split(t).join(x)));
