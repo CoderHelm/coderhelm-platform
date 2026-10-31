@@ -106,6 +106,10 @@ The boundary, the deploy role and the assets bucket stay when you delete the sta
 
 There is no CDK bootstrap: deploys use the install's own assets bucket and the deploy role.
 
+### Uninstalling
+
+The guided uninstall gets its deletion rights the same way: an uninstall stack whose build can delete nothing at rest, a window function that checks the build and writes a window bound to its session and an end time, and a boundary on every one of its roles. The window reaches only resources named or tagged for this install, never another install whose name starts with this one's, and never the uninstaller's own pieces; AWS's IAM policy simulator checks it. When the build ends, the stack rolls itself back with the credentials of the person who launched it, which removes the uninstaller too. The boundary and the deploy role go last, after every role that carries the boundary. See [Uninstall](./uninstall.md#what-the-uninstaller-may-touch).
+
 ### Check it yourself
 
 From a machine with read access to the account (IAM, CloudFormation, CodeBuild, SSM):

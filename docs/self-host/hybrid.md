@@ -60,7 +60,7 @@ Then everything happens by itself:
 
 The provisioning API can only create records under your name (the name itself and `_<token>.<name>`), never overwrite a record it didn't write, and never touch a reserved name; its AWS permissions say the same. An address nobody has claimed shows CoderHelm's "There's no CoderHelm here yet" page (404). A claimed address that is still being set up shows "This CoderHelm is still being set up". Once live, the address goes straight to your install, so if your install is down, the page is your CloudFront's.
 
-A name can change five times a day. Uninstalling with `npx github:CoderHelm/coderhelm-platform uninstall` releases it; so does **Leave hybrid** in Settings.
+A name can change five times a day. [Uninstalling](./uninstall.md#hybrid-installs), from the guided uninstall or `npx github:CoderHelm/coderhelm-platform uninstall`, releases it first, unlinks the install's GitHub installations and Jira site so their events go back to CoderHelm hosted, and turns its registration off; so does **Leave hybrid** in Settings.
 
 ## CoderHelm's GitHub App
 
