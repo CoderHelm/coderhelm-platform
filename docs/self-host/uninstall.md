@@ -50,7 +50,7 @@ If CoderHelm forwards a team's GitHub or Jira events to this install today, the 
 
 ## The guided uninstall
 
-The guide opens the CloudFormation console on a quick-create page for the uninstall stack (`coderhelm--uninstall-<name>-<id>`) with everything filled in, including your choice. You type the install's name a second time on that page (the stack refuses to start if the two differ), tick the IAM box and press **Create stack**. It takes 10 to 40 minutes; the guide follows it through a small progress file and ends with the list of what went, what was kept and anything left.
+The guide opens the CloudFormation console on a quick-create page for the uninstall stack (`coderhelm--uninstall-<name>-<id>`) with everything filled in, including your choice and the name you typed to confirm (`ConfirmStage`; the stack refuses to start unless it equals `Stage`). Tick the IAM box and press **Create stack**. Launching the template by hand, you type the name in both fields. It takes 10 to 40 minutes; the guide follows it through a small progress file and ends with the list of what went, what was kept and anything left.
 
 When it ends, the stack rolls itself back. That is how the uninstaller removes itself: CloudFormation deletes its pieces with your credentials, because an IAM role can't delete itself. CloudFormation then lists the stack as `ROLLBACK_COMPLETE` with the reason "Done: CoderHelm is uninstalled". It holds nothing and costs nothing; delete it from the list if you like. After a finished uninstall the uninstaller's log group and progress bucket go too. After a failure they stay, so the reason stays readable; launch the uninstaller again and it picks up where it stopped.
 
