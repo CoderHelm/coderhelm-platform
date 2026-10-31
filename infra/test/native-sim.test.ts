@@ -15,7 +15,7 @@ import * as assert from "node:assert/strict";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { accessNames, boundaryPolicy, PolicyDocument } from "../lib/access";
-import { deployRolePolicy, helperPolicy } from "../lib/native/parent";
+import { deployRolePolicy, helperPolicy, nativeNames } from "../lib/native/parent";
 import { prodValues, resolveValue } from "../lib/native/resolve";
 import { decision } from "./iam-eval";
 
@@ -27,7 +27,7 @@ const REFUSED: Record<string, Verdict> = {
   "iam:DeleteRolePermissionsBoundary": "explicitDeny", // every role keeps the boundary
   "kms:DisableKey": "explicitDeny", // it never disables a key
   "kms:ScheduleKeyDeletion": "explicitDeny", // it never deletes data
-  "iam:CreateServiceLinkedRole": "explicitDeny", // no replicas in other regions, no SES email for Cognito
+  "iam:CreateServiceLinkedRole": "implicitDeny", // no replicas in other regions, no SES email for Cognito
   "secretsmanager:CreateSecret": "implicitDeny", // the secret is made at launch with the admin's permissions
   "secretsmanager:DeleteSecret": "implicitDeny", // it never deletes data
   "secretsmanager:ReplicateSecretToRegions": "implicitDeny",
@@ -46,12 +46,14 @@ const pairs = () => (F.rows as any[]).flatMap((r) => Object.entries(r.actions as
 
 /** Today's policies, for stage prod in the fixture's account and region. */
 function today(): { deploy: PolicyDocument; boundary: PolicyDocument; helper: PolicyDocument } {
-  const values = prodValues(F.account, F.region);
-  const subNames = accessNames({ partition: "${AWS::Partition}", account: "${AWS::AccountId}", region: "${AWS::Region}", prefix: "coderhelm-${Stage}", suffix: "-${AWS::AccountId}", secretName: "coderhelm/${Stage}/secrets", id: "stack" });
+  const values: Record<string, string> = { ...prodValues(F.account, F.region), DomainZoneId: "Z0123456789EXAMPLE" };
+  values.EmailIdentity = values.EmailFromResolved;
+  const subNames = nativeNames();
   const wrap = (v: any): any => (typeof v === "string" ? (v.includes("${") ? { "Fn::Sub": v } : v) : Array.isArray(v) ? v.map(wrap) : v && typeof v === "object" ? Object.fromEntries(Object.entries(v).map(([k, x]) => [k, wrap(x)])) : v);
   const deploy = resolveValue(wrap(deployRolePolicy(subNames)), { values });
   const helper = JSON.parse(JSON.stringify(helperPolicy()).replace(/\$\{Stage\}/g, "prod").replace(/\$\{StatusId\}/g, "0123456789abcdef").replace(/\$\{AWS::AccountId\}/g, F.account).replace(/\$\{AWS::Region\}/g, F.region).replace(/\$\{AWS::Partition\}/g, "aws").replace(/\$\{AWS::StackName\}/g, "coderhelm-prod"));
-  const boundary = boundaryPolicy(accessNames({ account: F.account, region: F.region, prefix: "coderhelm-prod", suffix: `-${F.account}`, secretName: "coderhelm/prod/secrets", id: "stack" }), [`arn:aws:iam::${F.account}:policy/coderhelm-prod-deploy-boundary-stack`]);
+  const names = { ...accessNames({ account: F.account, region: F.region, prefix: "coderhelm-prod", suffix: `-${F.account}`, secretName: "coderhelm/prod/secrets", id: "stack" }), emailIdentity: values.EmailIdentity, zoneId: values.DomainZoneId };
+  const boundary = boundaryPolicy(names, [`arn:aws:iam::${F.account}:policy/coderhelm-prod-deploy-boundary-stack`]);
   return { deploy, boundary, helper };
 }
 

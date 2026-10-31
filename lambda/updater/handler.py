@@ -43,17 +43,24 @@ Actions (the `action` field of the event):
             auto-update on). Nothing here accepts terms or subscribes to
             anything; a person does that in the AWS console.
 
-The build itself (CodeBuild, infra/lib/updates-stack.ts) runs
+A native install (one parent CloudFormation stack, NATIVE_STACK set) has no
+update build: an update is a change set on that stack, proposed only from
+a template whose sha256 the release check took from the signed SHA256SUMS
+(see "A native install" below). An install from before native releases
+has an update build (CodeBuild, infra/lib/updates-stack.ts) that runs
 `coderhelm-selfhost update`: health check, checksum and signature check,
 deploy, health check, and a rollback when the new version is unhealthy.
-The build checks the release itself (infra/lib/release-verify.ts: the tag
+That build checks the release itself (infra/lib/release-verify.ts: the tag
 is an annotated tag on a commit on main, signed with a maintainer key
 pinned in the running release's selfhost/maintainers.json or attested by
 auto-release.yml on main for that tag and commit; the signature was
 made by exactly this repository's release.yml on that tag, from that same
 commit), so the release list read here only decides what to offer, never
-what is trusted. The release check build (models_verified) runs the same
-checks first, so a release that fails them stays held and is never applied. The release list is still checked:
+what is trusted. The release check build runs the same checks first, so a
+release that fails them stays held and is never applied. Its report
+(models_verified) is believed only once the updater has read that build's
+own result from CodeBuild (confirm_check): the build it started, of its own
+release check project, succeeded, and exported the same checksums. The release list is still checked:
 it must come from api.github.com for CoderHelm/coderhelm-platform, and a list
 that no longer shows the newest version seen before is reported as stale in
 status (a stale copy can't quietly hold an install back).
@@ -1140,13 +1147,73 @@ def start_verify(store, env, now, version):
         except (KeyError, ValueError):
             pass
     try:
-        start_check(env, version)
+        build = start_check(env, version)
     except Exception as e:
         logger.warning(f"Release check not started: {e}")
         return False
-    state["verifying"] = {"version": version, "at": now.isoformat()}
+    state["verifying"] = {"version": version, "at": now.isoformat(), "build": build}
     store.put("UPDATE_STATE", state)
     return True
+
+
+def claim_problem(event, state, version):
+    """Why a models_verified report can't be the build this updater started
+    for this version ("" when it can)."""
+    v = state.get("verifying") or {}
+    if v.get("version") != version or not v.get("build"):
+        return f"no release check of {version} is running"
+    if event.get("build") != v.get("build"):
+        return "the report doesn't come from the release check build this updater started"
+    return ""
+
+
+def build_vars(build, key):
+    return {x.get("name"): x.get("value") for x in (build.get(key) or []) if isinstance(x, dict)}
+
+
+def confirm_check(store, env, now, probe=None, cb=None):
+    """Believes a release check's report only once CodeBuild says that build
+    (the one this updater started, of its release check project, for that
+    version) succeeded and exported the same checksums: the template's from
+    the signed SHA256SUMS, and models.json's. Whoever else can call the
+    updater can't make that true. Returns what happened."""
+    state = store.get("UPDATE_STATE", {})
+    v = state.get("verifying") or {}
+    claim = v.get("claim")
+    if not claim or not v.get("build"):
+        return None
+    try:
+        builds = (cb or client("codebuild")).batch_get_builds(ids=[v["build"]]).get("builds") or []
+    except Exception as e:
+        logger.warning(f"Release check not read: {e}")
+        return None
+    b = builds[0] if builds else {}
+    status = b.get("buildStatus")
+    if status == "IN_PROGRESS" or not b:
+        return "pending"
+    version = v.get("version")
+    exported = build_vars(b, "exportedEnvironmentVariables")
+    problem = ""
+    if status != "SUCCEEDED":
+        problem = f"the release check build ended {status}"
+    elif b.get("projectName") != env.get("RELEASE_CHECK_PROJECT_NAME"):
+        problem = "the build isn't this install's release check"
+    elif build_vars(b.get("environment") or {}, "environmentVariables").get("VERSION") != version:
+        problem = "the build checked another version"
+    elif (exported.get("TEMPLATE_SHA256") or "none") != (claim.get("template_sha256") or "none"):
+        problem = "the reported template checksum isn't the one the build exported"
+    elif (exported.get("MODELS_SHA256") or "none") != claim.get("models_sha256", "none"):
+        problem = "the reported models.json isn't the one the build exported"
+    state.pop("verifying", None)
+    store.put("UPDATE_STATE", state)
+    if problem:
+        logger.warning(f"Release check of {version} not believed: {problem}")
+        return "refused"
+    store.put(f"MANIFEST#{version}", {"verified": True, "manifest": claim.get("manifest"), "template_sha256": claim.get("template_sha256"),
+                                     "build": v["build"], "at": now.isoformat()})
+    mc = model_check(store, env, now, version, env.get("RELEASE_REPO", RELEASE_REPO), probe or invoke_worker)
+    notify_blocked(store, env, mc)
+    return "verified"
 
 
 def configured_models(env):
@@ -1474,8 +1541,17 @@ def native_propose(store, env, version, mode, extra=None, cfn=None, opener=None)
     if got != want:
         raise ValueError(f"{version}'s stack template doesn't match its signed checksum, so it was not proposed")
     current = env.get("CODERHELM_VERSION", "")
-    if mode == "update" and parse_version(current) and compare(version, current) < 0:
-        raise ValueError(f"{version} is older than {current}: going back is a rollback")
+    if mode not in ("update", "rollback", "domain"):
+        raise ValueError(f"unknown change: {mode}")
+    if parse_version(current):
+        # Every kind of change set, not only an update: a domain move keeps the
+        # running release, and going back only to one this install ran.
+        if mode == "update" and compare(version, current) < 0:
+            raise ValueError(f"{version} is older than {current}: going back is a rollback")
+        if mode == "domain" and version != current:
+            raise ValueError(f"a domain change keeps the running release ({current}), not {version}")
+        if mode == "rollback" and version not in ran_versions(store, store.get("UPDATE_STATE", {}), current):
+            raise ValueError(f"{version} is not a version this install ran before, so it can't be rolled back to")
     template = json.loads(body)
     if template.get("Transform"):
         # CloudFormation stores such a template already resolved, so what it
@@ -1553,6 +1629,105 @@ def admin_changes(cs):
         rc = ch.get("ResourceChange") or {}
         if rc.get("LogicalResourceId") in ADMIN_ONLY:
             out.append(f"{rc.get('LogicalResourceId')} ({rc.get('Action')})")
+    return out
+
+
+# What auto-update never applies by itself, in the parent or any part: a
+# change to who may do what. IAM resources, function permissions and URLs,
+# resource policies, and a principal other than an AWS service anywhere.
+POLICY_TYPES = (
+    "AWS::Lambda::Permission", "AWS::Lambda::Url", "AWS::Lambda::LayerVersionPermission",
+    "AWS::S3::BucketPolicy", "AWS::SQS::QueuePolicy", "AWS::SNS::TopicPolicy", "AWS::SecretsManager::ResourcePolicy",
+    "AWS::Logs::ResourcePolicy", "AWS::Events::EventBusPolicy", "AWS::OpenSearchService::Domain",
+)
+# Properties that are resource policies on other types (a key's, a table's, a secret's, a bus's).
+POLICY_PROPERTIES = ("KeyPolicy", "ResourcePolicy", "PolicyDocument", "Policy", "PolicyText", "AccessPolicies")
+
+
+def principals(value):
+    """Every principal a property names, as text ("Service:x" for services)."""
+    out = set()
+
+    def walk(v):
+        if isinstance(v, dict):
+            for k, x in v.items():
+                if k in ("Principal", "NotPrincipal"):
+                    if isinstance(x, dict):
+                        for kind, ids in x.items():
+                            for i in (ids if isinstance(ids, list) else [ids]):
+                                out.add(f"{kind}:{json.dumps(i, sort_keys=True) if not isinstance(i, str) else i}")
+                    else:
+                        out.add(f"*:{x}")
+                else:
+                    walk(x)
+        elif isinstance(v, list):
+            for x in v:
+                walk(x)
+    walk(value)
+    return out
+
+
+def context(raw):
+    if isinstance(raw, dict):
+        return raw
+    try:
+        v = json.loads(raw or "{}")
+    except ValueError:
+        return {"unreadable": raw}
+    return v if isinstance(v, dict) else {}
+
+
+def permission_change(rc):
+    """Why this resource change alters permissions ("" when it doesn't)."""
+    if rc.get("Action") not in ("Add", "Modify", "Import", "Dynamic"):
+        return ""
+    t = rc.get("ResourceType") or ""
+    if t.startswith("AWS::IAM::"):
+        return "an IAM change"
+    if t in POLICY_TYPES:
+        return "a resource policy"
+    before, after = context(rc.get("BeforeContext")), context(rc.get("AfterContext"))
+    before, after = before.get("Properties", before), after.get("Properties", after)
+    for k in POLICY_PROPERTIES:
+        if k in after and after.get(k) != before.get(k):
+            return f"its {k}"
+    new = {p for p in principals(after) - principals(before) if not p.startswith("Service:")}
+    if new:
+        return "a principal: " + ", ".join(sorted(new))[:200]
+    return ""
+
+
+def change_set_pages(cfn, cs_id, stack=None):
+    """Every change of a change set, its property values included."""
+    kw = {"ChangeSetName": cs_id, "IncludePropertyValues": True}
+    if stack:
+        kw["StackName"] = stack
+    while True:
+        page = cfn.describe_change_set(**kw)
+        for ch in page.get("Changes") or []:
+            yield ch
+        if not page.get("NextToken"):
+            return
+        kw["NextToken"] = page["NextToken"]
+
+
+def permission_changes(cfn, cs_id, stack):
+    """What the change set (and each part's nested change set) changes about
+    who may do what, read with property values (before and after)."""
+    out = []
+    seen = set()
+
+    def walk(cid, part, stack_name):
+        for ch in change_set_pages(cfn, cid, stack_name):
+            rc = ch.get("ResourceChange") or {}
+            why = permission_change(rc)
+            if why:
+                out.append(f"{part}.{rc.get('LogicalResourceId')} ({rc.get('ResourceType')} {rc.get('Action')}: {why})")
+            nested = rc.get("ChangeSetId")
+            if rc.get("ResourceType") == "AWS::CloudFormation::Stack" and nested and nested not in seen:
+                seen.add(nested)
+                walk(nested, rc.get("LogicalResourceId"), None)
+    walk(cs_id, "parent", stack)
     return out
 
 
@@ -1685,6 +1860,7 @@ def native_poll(store, env, now, cfn=None):
             return native_finish(store, env, now, hid, "failed", "the template CloudFormation fetched is not the verified one, so the change set was deleted")
         entry["data_changes"] = data_changes(cfn, cs)
         entry["admin_changes"] = admin_changes(cs)
+        entry["permission_changes"] = permission_changes(cfn, cs_id, env["NATIVE_STACK"])
         entry["checked"] = True
         summary["data_changes"] = entry["data_changes"]
         entry["change_set"] = summary
@@ -1697,6 +1873,10 @@ def native_poll(store, env, now, cfn=None):
             # The auto-update role can't change itself or a boundary: an admin executes it.
             entry["apply"] = False
             entry["reason"] = "auto-update held: it changes the auto-update role or a boundary (" + "; ".join(entry["admin_changes"])[:300] + "), which only an admin can apply"
+        elif entry.get("permission_changes") and entry.get("apply"):
+            # Never automatic when it changes who may do what: a person reads it first.
+            entry["apply"] = False
+            entry["reason"] = "auto-update held: it changes permissions (" + "; ".join(entry["permission_changes"])[:400] + "), which an admin reviews and applies"
         if entry.get("apply") and not entry.get("executed_at"):
             cfn.execute_change_set(ChangeSetName=cs_id, StackName=env["NATIVE_STACK"])
             entry.update({"executed_at": now.isoformat(), "status": "running"})
@@ -1799,6 +1979,8 @@ def handle(event, env, store, now, fetch=fetch_releases, probe=None):
     current = env.get("CODERHELM_VERSION", "")
     repo = env.get("RELEASE_REPO", "CoderHelm/coderhelm-platform")
     settings = validate_settings(store.get("AUTO_UPDATE", {}) or {}, defaults_from_env(env))
+    if action in ("tick", "status", "update_now", "model_check", "native_poll", "domain_status") and ((store.get("UPDATE_STATE", {}) or {}).get("verifying") or {}).get("claim"):
+        confirm_check(store, env, now, probe)
     state = store.get("UPDATE_STATE", {})
 
     if action == "status":
@@ -1863,10 +2045,14 @@ def handle(event, env, store, now, fetch=fetch_releases, probe=None):
         return begin(store, env, now, version, event.get("actor") or "unknown", "update", note=note)
 
     if action == "models_verified":
-        # From the release check build, after the signature check.
+        # From the release check build, after the signature check. Only a
+        # claim until confirm_check reads that build's own result.
         version = event.get("version")
         if not parse_version(version):
             raise ValueError("version must look like v1.2.3")
+        problem = claim_problem(event, state, version)
+        if problem:
+            raise ValueError(problem)
         if event.get("status") != "verified":
             logger.warning(f"Release check for {version} failed: {event.get('reason')}")
             state.pop("verifying", None)
@@ -1875,15 +2061,23 @@ def handle(event, env, store, now, fetch=fetch_releases, probe=None):
         sha = event.get("template_sha256")
         if sha is not None and not (isinstance(sha, str) and re.fullmatch(r"[0-9a-f]{64}", sha)):
             raise ValueError("template_sha256 must be a sha256")
-        m = event.get("manifest")
-        if m is not None and (not isinstance(m, dict) or not isinstance(m.get("calls"), list) or m.get("version") not in (None, version)):
-            raise ValueError("models.json isn't a model manifest for this release")
-        store.put(f"MANIFEST#{version}", {"verified": True, "manifest": m, "template_sha256": sha, "at": now.isoformat()})
-        state.pop("verifying", None)
+        text = event.get("manifest_text")
+        if text is not None and not isinstance(text, str):
+            raise ValueError("manifest_text must be models.json's text")
+        m = None
+        if text is not None:
+            try:
+                m = json.loads(text)
+            except ValueError:
+                raise ValueError("models.json isn't JSON")
+            if not isinstance(m, dict) or not isinstance(m.get("calls"), list) or m.get("version") not in (None, version):
+                raise ValueError("models.json isn't a model manifest for this release")
+        state["verifying"]["claim"] = {
+            "template_sha256": sha, "manifest": m,
+            "models_sha256": hashlib.sha256(text.encode()).hexdigest() if text is not None else "none",
+        }
         store.put("UPDATE_STATE", state)
-        mc = model_check(store, env, now, version, repo, probe)
-        notify_blocked(store, env, mc)
-        return {"verified": True, "model_check": mc}
+        return {"verified": confirm_check(store, env, now, probe) or "pending"}
 
     if action == "model_check":
         version = event.get("version")

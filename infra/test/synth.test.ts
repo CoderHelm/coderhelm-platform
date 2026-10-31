@@ -709,11 +709,14 @@ test("the release check reads models.json only after the signature check, and ca
   assert.ok(verifyAt > 0, "the same exact signature check as the update build");
   assert.ok(commands.indexOf(CHECK_VERSION) < verifyAt);
   for (const line of verifyTagCommands()) assert.ok(commands.indexOf(line) > 0 && commands.indexOf(line) < verifyAt, line);
-  const readAt = commands.findIndex((c) => c.includes("models.json"));
+  const readAt = commands.findIndex((c) => c.includes("-o models.json"));
   assert.ok(readAt > verifyAt, "models.json only after the signature check");
   assert.ok(commands[readAt].includes("grep ' models.json$' SHA256SUMS | sha256sum -c -"), "and only when its checksum matches");
   assert.ok(!commands.some((c) => /npm install|coderhelm-selfhost|cdk /.test(c)), "nothing installed or deployed");
   assert.ok(commands.some((c) => c.includes('action:"models_verified"')));
+  // The updater believes the report only from the build's own exported checksums (lambda/updater, confirm_check).
+  assert.deepEqual((releaseCheckBuildSpec(cfg) as any).spec.env["exported-variables"], ["TEMPLATE_SHA256", "MODELS_SHA256"]);
+  assert.ok(commands.some((c) => c.includes("build:process.env.CODEBUILD_BUILD_ID")));
   const t = synth(cfg);
   const u = t["coderhelm-prod-updates"];
   const roles = u.findResources("AWS::IAM::Role");

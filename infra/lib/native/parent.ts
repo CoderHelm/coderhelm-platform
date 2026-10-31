@@ -23,7 +23,7 @@ export const RELEASE_BUCKET_URL = "https://coderhelm-public.s3.amazonaws.com/lau
 
 /** The install's names, as CloudFormation substitutions (no launch id: one stack per install). */
 export function nativeNames(): AccessNames {
-  return accessNames({
+  return { ...accessNames({
     partition: "${AWS::Partition}",
     account: "${AWS::AccountId}",
     region: "${AWS::Region}",
@@ -33,7 +33,24 @@ export function nativeNames(): AccessNames {
     // "-stack": never the name of an install hardened from the CLI (its
     // coderhelm-<name>-access stack owns coderhelm-<name>-boundary).
     id: NATIVE_ID,
-  });
+  }), emailIdentity: "${EmailIdentity}", zoneId: "${DomainZoneId}" };
+}
+
+/**
+ * `sub`, with ${EmailIdentity} (not a parameter: the address the install
+ * sends from, EmailFrom or else AdminEmail) given as a Fn::Sub variable.
+ */
+export function subInstall(v: unknown): any {
+  const out = sub(v);
+  const walk = (x: any): any => {
+    if (Array.isArray(x)) return x.map(walk);
+    if (x && typeof x === "object") {
+      if (typeof x["Fn::Sub"] === "string" && x["Fn::Sub"].includes("${EmailIdentity}")) return { "Fn::Sub": [x["Fn::Sub"], { EmailIdentity: installValue("EmailFromResolved") }] };
+      return Object.fromEntries(Object.entries(x).map(([k, y]) => [k, walk(y)]));
+    }
+    return x;
+  };
+  return walk(out);
 }
 
 /** The suffix of a native install's boundary and auto-update role names. */
@@ -103,12 +120,12 @@ const EMAIL = "^[^\\s@]+@[^\\s@]+\\.[^\\s@]+$";
 
 export function parameters(): Json {
   return {
-    AdminEmail: { Type: "String", AllowedPattern: EMAIL, ConstraintDescription: "an email address", Description: "You become the first admin. Sign up with this address when the stack is complete." },
+    AdminEmail: { Type: "String", AllowedPattern: EMAIL, MaxLength: 128, ConstraintDescription: "an email address", Description: "You become the first admin. Sign up with this address when the stack is complete." },
     Stage: { Type: "String", Default: "prod", AllowedPattern: "^[a-z][a-z0-9]{0,19}$", ConstraintDescription: "lowercase letters and digits, starting with a letter, at most 20 (no hyphens: coderhelm-prod-* must never also name another install)", Description: "A short name for this install. Resource names start with coderhelm-<name>. Name the stack coderhelm-<name> too." },
     ModelProvider: { Type: "String", Default: "bedrock", AllowedValues: ["bedrock", "anthropic"], Description: "bedrock (Claude on Amazon Bedrock in this account, no API key) or anthropic (each team adds its own key). Change it later in Settings, System." },
     BedrockInferencePrefix: { Type: "String", Default: "auto", AllowedValues: ["auto", "us.", "eu.", "apac.", "global.", "none"], Description: "Bedrock only. auto picks the cross-region inference profile for this region; none uses in-region model ids." },
     EmailTransport: { Type: "String", Default: "ses", AllowedValues: ["ses", "coderhelm"], Description: "ses: this account's Amazon SES. coderhelm: CoderHelm's mail service (hybrid; CoderHelm sees each recipient's address)." },
-    EmailFrom: { Type: "String", Default: "", AllowedPattern: `^$|${EMAIL}`, Description: "The address CoderHelm sends email from. Empty uses your email (AWS emails it a link to confirm)." },
+    EmailFrom: { Type: "String", Default: "", MaxLength: 128, AllowedPattern: `^$|${EMAIL}`, Description: "The address CoderHelm sends email from. Empty uses your email (AWS emails it a link to confirm)." },
     Hostname: { Type: "String", Default: "", AllowedPattern: HOST, Description: "Your own domain, e.g. coderhelm.example.com. Empty for a free CloudFront address. CoderHelm requests the certificate; Settings, System shows any DNS records to add and proposes the stack update that moves CoderHelm to it." },
     SignupDomain: { Type: "String", Default: "", AllowedPattern: HOST, Description: "Empty: only people you invite. Or an email domain whose people may join." },
     RequireTwoFactor: { Type: "String", Default: "off", AllowedValues: ["off", "on"], Description: "on makes everyone set up an authenticator app, you included." },
@@ -197,7 +214,9 @@ export function deployRolePolicy(n: AccessNames): PolicyDocument {
     Version: "2012-10-17",
     Statement: [
       ...base.Statement,
-      { Sid: "ParentStack", Effect: "Allow", Action: ["cloudformation:*"], Resource: ["arn:${AWS::Partition}:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/${AWS::StackName}/*", "arn:${AWS::Partition}:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/${AWS::StackName}-*/*"] },
+      // The parent by the name the install must have (coderhelm-<name>), never the stack's own name: a
+      // root stack named "coderhelm" would otherwise cover every install's stacks.
+      { Sid: "ParentStack", Effect: "Allow", Action: ["cloudformation:*"], Resource: ["arn:${AWS::Partition}:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/coderhelm-${Stage}/*", "arn:${AWS::Partition}:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/coderhelm-${Stage}-*/*"] },
       { Sid: "ReleaseFiles", Effect: "Allow", Action: ["s3:GetObject"], Resource: "arn:${AWS::Partition}:s3:::coderhelm-${Stage}-release-${AWS::AccountId}/*" },
       // The install's secret: read and update its settings, never delete it (its value comes from the helper and the gateway).
       { Sid: "InstallSecret", Effect: "Allow", Action: ["secretsmanager:DescribeSecret", "secretsmanager:GetSecretValue", "secretsmanager:UpdateSecret", "secretsmanager:TagResource", "secretsmanager:UntagResource"], Resource: "arn:${AWS::Partition}:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:coderhelm/${Stage}/secrets-??????" },
@@ -243,7 +262,7 @@ export function buildParent(input: ParentInput): Json {
   // that transform already resolved, so a later "use the current template"
   // update would silently keep every old parameter value (KeepDataOnDelete
   // included). Every policy in this template is a literal.
-  const boundaryDoc = sub(boundaryPolicy(n, [DEPLOY_BOUNDARY_ARN]));
+  const boundaryDoc = subInstall(boundaryPolicy(n, [DEPLOY_BOUNDARY_ARN]));
   R.Boundary = {
     Type: "AWS::IAM::ManagedPolicy",
     // Only roles the stack deletes carry it (the kept auto-update role has its own copy).
@@ -397,12 +416,12 @@ export function buildParent(input: ParentInput): Json {
           Effect: "Allow", Principal: { Service: "cloudformation.amazonaws.com" }, Action: "sts:AssumeRole",
           Condition: {
             StringEquals: { "aws:SourceAccount": { Ref: "AWS::AccountId" } },
-            StringLike: { "aws:SourceArn": [{ "Fn::Sub": "arn:${AWS::Partition}:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/${AWS::StackName}/*" }, { "Fn::Sub": "arn:${AWS::Partition}:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/${AWS::StackName}-*/*" }] },
+            StringLike: { "aws:SourceArn": [{ "Fn::Sub": "arn:${AWS::Partition}:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/coderhelm-${Stage}/*" }, { "Fn::Sub": "arn:${AWS::Partition}:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/coderhelm-${Stage}-*/*" }] },
           },
         }],
       },
       PermissionsBoundary: { Ref: "DeployBoundary" },
-      Policies: [{ PolicyName: "deploy", PolicyDocument: sub(deployRolePolicy(n)) }],
+      Policies: [{ PolicyName: "deploy", PolicyDocument: subInstall(deployRolePolicy(n)) }],
       Tags: [{ Key: INSTALL_TAG, Value: sub("coderhelm-${Stage}") }],
     },
   };
