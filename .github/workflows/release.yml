@@ -381,21 +381,26 @@ jobs:
             dist/coderhelm-log-reader.yaml
             dist/coderhelm-log-reader-update.yaml
 
-      # A published release's files are never replaced: a re-run only fills in
-      # a release that has no SHA256SUMS yet (one made by hand, without
-      # assets), or confirms the files are already these.
+      # A published release's files are never replaced (and with immutable
+      # releases on, GitHub refuses any upload to one): a re-run confirms the
+      # published SHA256SUMS is this build's and changes nothing. Only a draft
+      # with no SHA256SUMS yet (one made by hand, without assets) is filled in.
       - name: Publish the release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           NOTES="Self-host release ${TAG}. Install: npx -y github:${GITHUB_REPOSITORY}#${TAG} init, then deploy. Update: npx -y github:${GITHUB_REPOSITORY}#${TAG} update --to ${TAG}. Check an install: npx -y github:${GITHUB_REPOSITORY} doctor. Verify it yourself: docs/self-host/updates-security.md."
-          if gh release view "$TAG" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+          if DRAFT=$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${TAG}" --jq .draft 2>/dev/null); then
             mkdir -p "$RUNNER_TEMP/old"
-            if gh release download "$TAG" -R "$GITHUB_REPOSITORY" -p SHA256SUMS -D "$RUNNER_TEMP/old" 2>/dev/null; then
+            if gh release download "$TAG" -R "$GITHUB_REPOSITORY" -p SHA256SUMS -D "$RUNNER_TEMP/old"; then
               cmp -s "$RUNNER_TEMP/old/SHA256SUMS" dist/SHA256SUMS || { echo "::error::$TAG is already published with other files; a release is never replaced"; exit 1; }
-              echo "$TAG is already published with these files."
-            else
+              echo "$TAG is already published with these files: nothing to upload."
+            elif [ "$DRAFT" = "true" ]; then
               gh release upload "$TAG" -R "$GITHUB_REPOSITORY" dist/*
+              gh release edit "$TAG" -R "$GITHUB_REPOSITORY" --draft=false
+            else
+              echo "::error::$TAG is published without a SHA256SUMS, and a published release can't take new files. Delete that release (or make it a draft) and run this again."
+              exit 1
             fi
           else
             gh release create "$TAG" -R "$GITHUB_REPOSITORY" dist/* --title "$TAG" --notes "$NOTES" --verify-tag

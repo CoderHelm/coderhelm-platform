@@ -58,12 +58,15 @@ export interface UpdatesStackProps extends cdk.StackProps {
  * signature exactly as the update build does, then reads models.json only
  * when the signed SHA256SUMS lists it and its checksum matches, and reports
  * it to the updater (models_verified). It installs and deploys nothing, and
- * its role can only report back.
+ * its role can only report back. The updater believes the report only once
+ * CodeBuild shows this build succeeded with the same checksums exported
+ * (TEMPLATE_SHA256, MODELS_SHA256): the function can be invoked by more than
+ * this build, a build's exported variables can't be faked.
  */
 export function releaseCheckBuildSpec(cfg: ResolvedConfig): codebuild.BuildSpec {
   return codebuild.BuildSpec.fromObject({
     version: "0.2",
-    env: { shell: "bash" },
+    env: { shell: "bash", "exported-variables": ["TEMPLATE_SHA256", "MODELS_SHA256"] },
     phases: {
       install: { "runtime-versions": { nodejs: 20 }, commands: ["set -euo pipefail", ...installCosignCommands()] },
       build: {
@@ -81,19 +84,21 @@ export function releaseCheckBuildSpec(cfg: ResolvedConfig): codebuild.BuildSpec 
           // SHA256SUMS lists it (the updater checks the downloaded template
           // against it before it proposes the stack update).
           "TEMPLATE_SHA256=$(awk '$2==\"coderhelm.json\"{print $1}' SHA256SUMS); export TEMPLATE_SHA256",
+          // models.json's sha256 as the signed SHA256SUMS lists it ("none" without one).
+          "MODELS_SHA256=$(awk '$2==\"models.json\"{print $1}' SHA256SUMS); MODELS_SHA256=${MODELS_SHA256:-none}; export MODELS_SHA256",
           // A signed release from before model manifests lists none.
           "if grep -q ' models.json$' SHA256SUMS; then " +
             `${CURL} -o models.json "$B/models.json"; ` +
             "grep ' models.json$' SHA256SUMS | sha256sum -c -; " +
-            'node -e \'process.stdout.write(JSON.stringify({status:"verified",manifest:JSON.parse(require("fs").readFileSync("models.json","utf8"))}))\' > /tmp/result.json; ' +
-            'else echo \'{"status":"verified","manifest":null}\' > /tmp/result.json; fi',
+            'node -e \'process.stdout.write(JSON.stringify({status:"verified",manifest_text:require("fs").readFileSync("models.json","utf8")}))\' > /tmp/result.json; ' +
+            'else echo \'{"status":"verified","manifest_text":null}\' > /tmp/result.json; fi',
         ],
       },
       post_build: {
         commands: [
           // Anything short of a verified result reports a failure (nothing is trusted).
           'if [ "${CODEBUILD_BUILD_SUCCEEDING:-0}" != "1" ] || [ ! -s /tmp/result.json ]; then echo \'{"status":"failed","reason":"the release check failed: see its log"}\' > /tmp/result.json; fi',
-          'node -e \'const r=require("/tmp/result.json");process.stdout.write(JSON.stringify({action:"models_verified",version:process.env.VERSION,status:r.status,reason:r.reason,manifest:r.manifest??null,template_sha256:r.status==="verified"&&/^[0-9a-f]{64}$/.test(process.env.TEMPLATE_SHA256||"")?process.env.TEMPLATE_SHA256:null}))\' > /tmp/payload.json',
+          'node -e \'const r=require("/tmp/result.json");process.stdout.write(JSON.stringify({action:"models_verified",version:process.env.VERSION,build:process.env.CODEBUILD_BUILD_ID,status:r.status,reason:r.reason,manifest_text:r.manifest_text??null,template_sha256:r.status==="verified"&&/^[0-9a-f]{64}$/.test(process.env.TEMPLATE_SHA256||"")?process.env.TEMPLATE_SHA256:null}))\' > /tmp/payload.json',
           `aws lambda invoke --function-name ${cfg.prefix}-updater --cli-binary-format raw-in-base64-out --payload file:///tmp/payload.json /tmp/out.json`,
         ],
       },
@@ -420,6 +425,11 @@ export class UpdatesStack extends cdk.Stack {
     this.updaterFunction.addToRolePolicy(new iam.PolicyStatement({
       actions: ["codebuild:StartBuild"],
       resources: [...(this.project ? [this.project.projectArn] : []), this.checkProject.projectArn],
+    }));
+    // The release check's own result (confirm_check): its status and the checksums it exported.
+    this.updaterFunction.addToRolePolicy(new iam.PolicyStatement({
+      actions: ["codebuild:BatchGetBuilds"],
+      resources: [this.checkProject.projectArn],
     }));
     this.updaterFunction.addToRolePolicy(new iam.PolicyStatement({
       sid: "ReadHybridRegistrationForMail",

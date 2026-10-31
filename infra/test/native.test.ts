@@ -202,7 +202,9 @@ test("no update build, no deploy window; auto-update is a role only with AutoUpd
   // The auto-update role: only this stack and its parts may use it.
   const trust = JSON.stringify(R.DeployRole.Properties.AssumeRolePolicyDocument);
   assert.match(trust, /aws:SourceArn/);
-  assert.match(trust, /stack\/\$\{AWS::StackName\}-\*\/\*/);
+  assert.match(trust, /stack\/coderhelm-\$\{Stage\}-\*\/\*/);
+  // By the install's name, never the stack's own (a root stack named "coderhelm" would cover every install).
+  assert.ok(!trust.includes("AWS::StackName"));
   // The kept role carries its own copy of the boundary, kept with it; the
   // boundary every other role carries goes with the stack.
   assert.equal(R.Boundary.DeletionPolicy, "Delete");

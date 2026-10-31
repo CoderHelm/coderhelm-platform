@@ -3,6 +3,7 @@
 Run: python3 -m unittest discover -s lambda/tests
 """
 
+import hashlib
 import importlib.util
 import json
 import pathlib
@@ -296,6 +297,24 @@ class FakeWorker:
         return {"provider": "bedrock", "region": "us-east-1", "inference_prefix": "us.", "results": out}
 
 
+class FakeCodeBuild:
+    """CodeBuild's own record of each release check build."""
+
+    def __init__(self):
+        self.builds = {}
+
+    def finish(self, build_id, status="SUCCEEDED", version="v1.1.0", template=None, models="none",
+               project="coderhelm-prod-release-check"):
+        self.builds[build_id] = {
+            "id": build_id, "buildStatus": status, "projectName": project,
+            "environment": {"environmentVariables": [{"name": "VERSION", "value": version}]},
+            "exportedEnvironmentVariables": [{"name": "TEMPLATE_SHA256", "value": template or ""}, {"name": "MODELS_SHA256", "value": models}],
+        }
+
+    def batch_get_builds(self, ids):
+        return {"builds": [self.builds[i] for i in ids if i in self.builds]}
+
+
 class ModelCheck(unittest.TestCase):
     """The check before an update: a refused model holds it, a pass lets it go."""
 
@@ -311,7 +330,7 @@ class ModelCheck(unittest.TestCase):
         real_check = u.start_check
         u.start_check = lambda env, version: self.builds.append((version, "check", "release-check")) or "c-1"
         self.addCleanup(setattr, u, "start_check", real_check)
-        self.env = {"CODERHELM_VERSION": "v1.0.0", "APP_URL": "https://helm.example.org", "UPDATE_PROJECT_NAME": "p",
+        self.env = {"CODERHELM_VERSION": "v1.0.0", "APP_URL": "https://helm.example.org", "UPDATE_PROJECT_NAME": "p", "RELEASE_CHECK_PROJECT_NAME": "coderhelm-prod-release-check",
                     "WORKER_FUNCTION_NAME": "coderhelm-prod-worker", "CONFIGURED_MODELS": "claude-opus-5-5,claude-sonnet-5-5"}
         self.worker = FakeWorker()
         # The update build checked v1.1.0's signature and models.json.
@@ -426,6 +445,9 @@ class ModelCheck(unittest.TestCase):
         # Nothing verified yet: the build is started in its read-only mode, and the update waits.
         self.db.items.pop(("SYSTEM", "MANIFEST#v1.1.0"))
         self.worker.refuse = set()
+        cb = FakeCodeBuild()
+        u._clients["codebuild"] = cb
+        self.addCleanup(u._clients.pop, "codebuild", None)
         d = self.tick(SUNDAY_3AM)
         self.assertEqual(self.builds, [("v1.1.0", "check", "release-check")])
         self.assertEqual(d["action"], "notify")
@@ -436,18 +458,64 @@ class ModelCheck(unittest.TestCase):
         self.assertIn("signature", str(e.exception))
         # Not started again within 30 minutes.
         self.assertEqual(self.builds, [("v1.1.0", "check", "release-check")])
+        # A report that isn't from the build the updater started is refused.
+        with self.assertRaisesRegex(ValueError, "doesn't come from the release check build"):
+            u.handle({"action": "models_verified", "version": "v1.1.0", "build": "other", "status": "failed", "reason": "x"},
+                     self.env, self.store, SUNDAY_3AM, self.releases, self.worker)
         # A failed signature check trusts nothing.
-        u.handle({"action": "models_verified", "version": "v1.1.0", "status": "failed", "reason": "bad signature"},
+        u.handle({"action": "models_verified", "version": "v1.1.0", "build": "c-1", "status": "failed", "reason": "bad signature"},
                  self.env, self.store, SUNDAY_3AM, self.releases, self.worker)
         self.assertIsNone(self.store.get("MANIFEST#v1.1.0"))
-        # The build reports the verified file: the check runs at once.
-        r = u.handle({"action": "models_verified", "version": "v1.1.0", "status": "verified", "manifest": MANIFEST},
+        # The next check starts at once; the build reports the verified file.
+        self.tick(SUNDAY_3AM)
+        text = json.dumps(MANIFEST)
+        r = u.handle({"action": "models_verified", "version": "v1.1.0", "build": "c-1", "status": "verified", "manifest_text": text},
                      self.env, self.store, SUNDAY_3AM, self.releases, self.worker)
-        self.assertTrue(r["model_check"]["ok"])
+        # Only a claim while CodeBuild hasn't finished that build.
+        self.assertEqual(r["verified"], "pending")
+        self.assertIsNone(self.store.get("MANIFEST#v1.1.0"))
+        self.assertEqual(self.worker.payloads, [])
+        # CodeBuild says it succeeded with the same models.json: the check runs.
+        cb.finish("c-1", models=hashlib.sha256(text.encode()).hexdigest())
+        u.handle({"action": "status"}, self.env, self.store, SUNDAY_3AM, self.releases, self.worker)
+        self.assertEqual(self.store.get("MANIFEST#v1.1.0")["manifest"], MANIFEST)
         self.assertEqual(len(self.worker.payloads), 1)
         # A manifest for another release is refused.
         with self.assertRaises(ValueError):
-            u.handle({"action": "models_verified", "version": "v1.2.0", "status": "verified", "manifest": MANIFEST},
+            u.handle({"action": "models_verified", "version": "v1.2.0", "build": "c-1", "status": "verified", "manifest_text": text},
+                     self.env, self.store, SUNDAY_3AM, self.releases, self.worker)
+
+    def test_a_claim_codebuild_doesnt_back_is_never_believed(self):
+        self.db.items.pop(("SYSTEM", "MANIFEST#v1.1.0"))
+        self.worker.refuse = set()
+        cb = FakeCodeBuild()
+        u._clients["codebuild"] = cb
+        self.addCleanup(u._clients.pop, "codebuild", None)
+        text = json.dumps(MANIFEST)
+        good = hashlib.sha256(text.encode()).hexdigest()
+        cases = [
+            ("build ended FAILED", dict(status="FAILED", models=good)),
+            ("isn't this install's release check", dict(project="coderhelm-prod-update", models=good)),
+            ("checked another version", dict(version="v1.2.0", models=good)),
+            ("models.json isn't the one", dict(models="0" * 64)),
+        ]
+        for why, build in cases:
+            with self.subTest(why):
+                self.store.put("UPDATE_STATE", {})
+                cb.builds.clear()
+                self.tick(SUNDAY_3AM)
+                u.handle({"action": "models_verified", "version": "v1.1.0", "build": "c-1", "status": "verified", "manifest_text": text},
+                         self.env, self.store, SUNDAY_3AM, self.releases, self.worker)
+                cb.finish("c-1", **build)
+                with self.assertLogs(u.logger, "WARNING") as logs:
+                    u.handle({"action": "status"}, self.env, self.store, SUNDAY_3AM, self.releases, self.worker)
+                self.assertIn(why, "\n".join(logs.output))
+                self.assertIsNone(self.store.get("MANIFEST#v1.1.0"))
+                self.assertNotIn("verifying", self.store.get("UPDATE_STATE"))
+        self.assertEqual(self.worker.payloads, [])
+        # With no check running, a report is refused outright.
+        with self.assertRaisesRegex(ValueError, "no release check of v1.1.0 is running"):
+            u.handle({"action": "models_verified", "version": "v1.1.0", "build": "c-1", "status": "verified", "manifest_text": text},
                      self.env, self.store, SUNDAY_3AM, self.releases, self.worker)
 
     def test_the_source_never_downloads_models_json_itself(self):

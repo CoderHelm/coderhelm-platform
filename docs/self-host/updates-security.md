@@ -110,10 +110,10 @@ Another workflow that names either environment gets neither role. What each role
 These settings make a bad tag hard to create in the first place. They are not stored in the code. An organization owner applies them by running `scripts/release-protection.sh`. Until then they are not in force. `bash scripts/release-protection.sh --check` prints what is applied and what isn't (read only).
 
 - **`main`, on both `CoderHelm/coderhelm-platform` and `CoderHelm/coderhelm`.** Changes go in only through a pull request with an approving review and passing checks. Commits must be signed, and force pushes and deletion are blocked. Admins may merge their own pull request after the checks pass, but never push to `main` directly. `--no-admin-merge-bypass` removes that too.
-- **`v*` tags.** Their commits must be signed, and nobody can update, move or delete a tag. There is no admin bypass unless you pass `--allow-admin-tag-bypass`. Only admins and GitHub Actions can create a `v*` tag. GitHub Actions is there for `auto-release.yml`. GitHub can't narrow that to one workflow, so the checks above, not this rule, are what stop a tag created by another workflow.
+- **`v*` tags.** Their commits must be signed, and nobody can update, move or delete a tag. There is no admin bypass unless you pass `--allow-admin-tag-bypass`. Who can create a `v*` tag is not limited. `auto-release.yml` creates its tag with the workflow token, and GitHub refuses GitHub Actions as an exception to an organization repository's tag creation rule. So the checks above are what stop a tag made any other way: an install accepts only a tag signed by a maintainer key or attested by `auto-release.yml` on `main`.
 - **The `release` environment.** A listed reviewer approves every publish of a tag cut by hand. Only `v*` tags may deploy to it, and admins can't skip the approval. So a pushed tag alone publishes nothing.
 - **The `release-auto` environment.** No reviewer, and only the `main` branch may deploy to it. `auto-release.yml` publishes the templates and `latest.json` from it.
-- **Immutable releases.** A published release's files can't be replaced.
+- **Immutable releases.** A published release's files can't be replaced or added to. A re-run of the release workflow on a published release checks its `SHA256SUMS` is this build's and uploads nothing.
 - **Actions.** Actions must be pinned by commit SHA, the default token is read-only, and workflows from outside contributors wait for approval.
 
 ### In the release workflow

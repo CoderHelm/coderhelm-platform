@@ -1,750 +1,765 @@
 {
- "function:Updater65AF1523": {
-  "Properties": {
-   "Architectures": [
-    "arm64"
-   ],
-   "Description": "CoderHelm updates: release checks, notices, auto-update, history",
-   "Environment": {
-    "Variables": {
-     "ADMIN_EMAILS": "o@example.org",
-     "APP_URL": {
-      "Fn::Join": [
-       "",
-       [
-        "https://",
+  "role:UpdateBuildRole067D9B2D": {
+    "Properties": {
+      "AssumeRolePolicyDocument": {
+        "Statement": [
+          {
+            "Action": "sts:AssumeRole",
+            "Effect": "Allow",
+            "Principal": {
+              "Service": "codebuild.amazonaws.com"
+            }
+          }
+        ],
+        "Version": "2012-10-17"
+      },
+      "Description": "CoderHelm update build: deploys a release through the CDK bootstrap roles, checks health",
+      "RoleName": "coderhelm-prod-update-build"
+    }
+  },
+  "policy:UpdateBuildRoleDefaultPolicyD36C6D67": {
+    "Properties": {
+      "PolicyDocument": {
+        "Statement": [
+          {
+            "Action": "sts:AssumeRole",
+            "Effect": "Allow",
+            "Resource": "arn:aws:iam::111122223333:role/cdk-*",
+            "Sid": "DeployThroughCdkBootstrapRoles"
+          },
+          {
+            "Action": [
+              "ssm:GetParameter",
+              "ssm:PutParameter"
+            ],
+            "Effect": "Allow",
+            "Resource": "arn:aws:ssm:us-west-2:111122223333:parameter/coderhelm-prod/installer/*",
+            "Sid": "ReadInstallState"
+          },
+          {
+            "Action": "ssm:GetParameter",
+            "Effect": "Allow",
+            "Resource": "arn:aws:ssm:*:111122223333:parameter/cdk-bootstrap/*",
+            "Sid": "CdkBootstrapVersion"
+          },
+          {
+            "Action": [
+              "cloudformation:ListStacks",
+              "cloudformation:DescribeStacks",
+              "sts:GetCallerIdentity",
+              "ses:GetAccount"
+            ],
+            "Effect": "Allow",
+            "Resource": "*",
+            "Sid": "HealthCheck"
+          },
+          {
+            "Action": [
+              "lambda:GetFunctionConfiguration",
+              "sqs:GetQueueUrl",
+              "sqs:GetQueueAttributes",
+              "secretsmanager:GetSecretValue"
+            ],
+            "Effect": "Allow",
+            "Resource": [
+              "arn:aws:lambda:us-west-2:111122223333:function:coderhelm-prod-*",
+              "arn:aws:sqs:us-west-2:111122223333:coderhelm-prod-*",
+              "arn:aws:secretsmanager:us-west-2:111122223333:secret:coderhelm/prod/secrets-??????"
+            ],
+            "Sid": "HealthCheckResources"
+          },
+          {
+            "Action": "lambda:InvokeFunction",
+            "Effect": "Allow",
+            "Resource": "arn:aws:lambda:us-west-2:111122223333:function:coderhelm-prod-worker",
+            "Sid": "InstallerModelCheck"
+          },
+          {
+            "Action": "dynamodb:GetItem",
+            "Condition": {
+              "ForAllValues:StringEquals": {
+                "dynamodb:LeadingKeys": [
+                  "SYSTEM"
+                ]
+              }
+            },
+            "Effect": "Allow",
+            "Resource": {
+              "Fn::ImportValue": "coderhelm-prod-database:ExportsOutputFnGetAttSettingsTable4DB0CCD0Arn1D1BE79B"
+            },
+            "Sid": "ModelCheckSetting"
+          },
+          {
+            "Action": "lambda:InvokeFunction",
+            "Effect": "Allow",
+            "Resource": "arn:aws:lambda:us-west-2:111122223333:function:coderhelm-prod-updater",
+            "Sid": "ReportResult"
+          },
+          {
+            "Action": [
+              "logs:CreateLogStream",
+              "logs:PutLogEvents"
+            ],
+            "Effect": "Allow",
+            "Resource": {
+              "Fn::GetAtt": [
+                "UpdateBuildLogsD800ACFF",
+                "Arn"
+              ]
+            }
+          },
+          {
+            "Action": [
+              "logs:CreateLogGroup",
+              "logs:CreateLogStream",
+              "logs:PutLogEvents"
+            ],
+            "Effect": "Allow",
+            "Resource": [
+              {
+                "Fn::Join": [
+                  "",
+                  [
+                    "arn:",
+                    {
+                      "Ref": "AWS::Partition"
+                    },
+                    ":logs:us-west-2:111122223333:log-group:/aws/codebuild/",
+                    {
+                      "Ref": "UpdateBuildEFAA12C3"
+                    }
+                  ]
+                ]
+              },
+              {
+                "Fn::Join": [
+                  "",
+                  [
+                    "arn:",
+                    {
+                      "Ref": "AWS::Partition"
+                    },
+                    ":logs:us-west-2:111122223333:log-group:/aws/codebuild/",
+                    {
+                      "Ref": "UpdateBuildEFAA12C3"
+                    },
+                    ":*"
+                  ]
+                ]
+              }
+            ]
+          },
+          {
+            "Action": [
+              "codebuild:CreateReportGroup",
+              "codebuild:CreateReport",
+              "codebuild:UpdateReport",
+              "codebuild:BatchPutTestCases",
+              "codebuild:BatchPutCodeCoverages"
+            ],
+            "Effect": "Allow",
+            "Resource": {
+              "Fn::Join": [
+                "",
+                [
+                  "arn:",
+                  {
+                    "Ref": "AWS::Partition"
+                  },
+                  ":codebuild:us-west-2:111122223333:report-group/",
+                  {
+                    "Ref": "UpdateBuildEFAA12C3"
+                  },
+                  "-*"
+                ]
+              ]
+            }
+          }
+        ],
+        "Version": "2012-10-17"
+      },
+      "PolicyName": "UpdateBuildRoleDefaultPolicyD36C6D67",
+      "Roles": [
         {
-         "Fn::ImportValue": "coderhelm-prod-web:ExportsOutputFnGetAttDistribution830FAC52DomainNameBEB09E30"
+          "Ref": "UpdateBuildRole067D9B2D"
         }
-       ]
       ]
-     },
-     "CODERHELM_CONFIG_FINGERPRINT": "36bad1a628cf",
-     "CONFIGURED_MODELS": "claude-opus-5-5,claude-sonnet-5-5",
-     "DISTRIBUTION_DOMAIN_PARAMETER": "/coderhelm-prod/distribution-domain",
-     "EMAIL_TRANSPORT_DEFAULT": "ses",
-     "REFRESH_FUNCTIONS": "coderhelm-prod-gateway,coderhelm-prod-streaming,coderhelm-prod-worker",
-     "RELEASE_CHECK_PROJECT_NAME": "coderhelm-prod-release-check",
-     "RELEASE_REPO": "CoderHelm/coderhelm-platform",
-     "RESOURCE_PREFIX": "coderhelm-prod",
-     "SECRETS_NAME": "coderhelm/prod/secrets",
-     "SES_FROM_ADDRESS": "a@example.org",
-     "EMAIL_FROM_NAME": "CoderHelm",
-     "ORGANIZATION_NAME": "",
-     "SETTINGS_TABLE_NAME": {
-      "Fn::ImportValue": "coderhelm-prod-database:ExportsOutputRefSettingsTable4DB0CCD0297D747B"
-     },
-     "UPDATE_DEFAULTS": "{\"auto\":false,\"channel\":\"stable\",\"day\":\"sun\",\"hour\":3,\"timezone\":\"UTC\",\"majors\":\"ask\"}",
-     "UPDATE_PROJECT_NAME": {
-      "Ref": "UpdateBuildEFAA12C3"
-     },
-     "WORKER_FUNCTION_NAME": "coderhelm-prod-worker"
     }
-   },
-   "FunctionName": "coderhelm-prod-updater",
-   "Handler": "handler.handler",
-   "LoggingConfig": {
-    "LogGroup": {
-     "Ref": "UpdaterLogs5E6223A3"
-    }
-   },
-   "MemorySize": 256,
-   "Role": {
-    "Fn::GetAtt": [
-     "UpdaterServiceRole325F096F",
-     "Arn"
-    ]
-   },
-   "Runtime": "python3.12",
-   "Timeout": 180
-  }
- },
- "policy:ReleaseCheckRoleDefaultPolicy7CC95676": {
-  "Properties": {
-   "PolicyDocument": {
-    "Statement": [
-     {
-      "Action": "lambda:InvokeFunction",
-      "Effect": "Allow",
-      "Resource": "arn:aws:lambda:us-west-2:111122223333:function:coderhelm-prod-updater",
-      "Sid": "ReportResult"
-     },
-     {
-      "Action": [
-       "logs:CreateLogStream",
-       "logs:PutLogEvents"
+  },
+  "project:coderhelm-prod-update": {
+    "BuildSpec": {
+      "version": "0.2",
+      "env": {
+        "shell": "bash"
+      },
+      "phases": {
+        "install": {
+          "runtime-versions": {
+            "nodejs": 20
+          },
+          "commands": [
+            "set -euo pipefail",
+            "curl --proto =https --proto-redir =https --tlsv1.2 -fsSL -o /tmp/cosign https://github.com/sigstore/cosign/releases/download/v2.4.1/cosign-linux-amd64",
+            "echo \"8b24b946dd5809c6bd93de08033bcf6bc0ed7d336b7785787c080f574b89249b  /tmp/cosign\" | sha256sum -c -",
+            "install -m 0755 /tmp/cosign /usr/local/bin/cosign"
+          ]
+        },
+        "build": {
+          "commands": [
+            "set -euo pipefail",
+            "[[ \"$VERSION\" =~ ^v[0-9]+\\.[0-9]+\\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]] || { echo \"VERSION=$VERSION is not a release tag\"; exit 1; }",
+            "mkdir -p /tmp/ch && cd /tmp/ch",
+            "B=\"https://github.com/CoderHelm/coderhelm-platform/releases/download/$VERSION\"",
+            "curl --proto =https --proto-redir =https --tlsv1.2 -fsSL -o SHA256SUMS \"$B/SHA256SUMS\"",
+            "curl --proto =https --proto-redir =https --tlsv1.2 -fsSL -o SHA256SUMS.sigstore.json \"$B/SHA256SUMS.sigstore.json\"",
+            "rm -rf /tmp/ch-tag && mkdir -p /tmp/ch-tag && printf '%s\\n' 'nambok namespaces=\"git\" ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIH6UjRCKMcz6OyGQkv2PCBbzqzKx+ngQQmavwp8UDASV' > /tmp/ch-tag.signers",
+            "env GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 GIT_TERMINAL_PROMPT=0 git -C /tmp/ch-tag init -q --bare",
+            "env GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 GIT_TERMINAL_PROMPT=0 git -C /tmp/ch-tag fetch -q --no-tags --filter=tree:0 https://github.com/CoderHelm/coderhelm-platform.git \"+refs/tags/$VERSION:refs/tags/$VERSION\" \"+refs/heads/main:refs/heads/main\"",
+            "[ \"$(env GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 GIT_TERMINAL_PROMPT=0 git -C /tmp/ch-tag cat-file -t \"refs/tags/$VERSION\")\" = tag ] || { echo \"$VERSION is not an annotated tag\"; exit 1; }",
+            "env GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 GIT_TERMINAL_PROMPT=0 git -C /tmp/ch-tag cat-file tag \"refs/tags/$VERSION\" > /tmp/ch-tag.tag",
+            "[ \"$(sed -n '/^$/q;s/^tag //p' /tmp/ch-tag.tag)\" = \"$VERSION\" ] || { echo \"the tag object under $VERSION is named for another version\"; exit 1; }",
+            "[ \"$(sed -n '/^$/q;s/^type //p' /tmp/ch-tag.tag)\" = commit ] || { echo \"$VERSION does not point to a commit\"; exit 1; }",
+            "COMMIT=$(env GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 GIT_TERMINAL_PROMPT=0 git -C /tmp/ch-tag rev-parse --verify \"refs/tags/$VERSION^{commit}\")",
+            "[[ \"$COMMIT\" =~ ^[0-9a-f]{40}$ ]] && env GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 GIT_TERMINAL_PROMPT=0 git -C /tmp/ch-tag merge-base --is-ancestor \"$COMMIT\" refs/heads/main || { echo \"$VERSION ($COMMIT) is not on main\"; exit 1; }",
+            "if grep -qxF -e '-----BEGIN SSH SIGNATURE-----' /tmp/ch-tag.tag; then [ \"$(grep -cxF -e '-----BEGIN SSH SIGNATURE-----' /tmp/ch-tag.tag)\" = 1 ] || { echo \"$VERSION has more than one SSH signature\"; exit 1; }; env GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 GIT_TERMINAL_PROMPT=0 git -C /tmp/ch-tag -c gpg.format=ssh -c gpg.ssh.allowedSignersFile=/tmp/ch-tag.signers -c gpg.ssh.program=ssh-keygen verify-tag \"refs/tags/$VERSION\" || { echo \"$VERSION is not signed by a CoderHelm maintainer key (selfhost/maintainers.json)\"; exit 1; }; echo \"$VERSION is signed by a maintainer key\"; else [ \"$(grep -cxF -e '-----BEGIN CODERHELM RELEASE ATTESTATION-----' /tmp/ch-tag.tag)\" = 1 ] && [ \"$(grep -cxF -e '-----END CODERHELM RELEASE ATTESTATION-----' /tmp/ch-tag.tag)\" = 1 ] || { echo \"$VERSION has no SSH signature and no release attestation\"; exit 1; }; sed -n '/^-----BEGIN CODERHELM RELEASE ATTESTATION-----$/,/^-----END CODERHELM RELEASE ATTESTATION-----$/p' /tmp/ch-tag.tag | sed '1d;$d' | base64 -d > /tmp/ch-tag.bundle || { echo \"$VERSION's release attestation is not base64\"; exit 1; }; printf 'coderhelm-release-tag v1\\nrepository %s\\ntag %s\\ncommit %s\\n' CoderHelm/coderhelm-platform \"$VERSION\" \"$COMMIT\" > /tmp/ch-tag.statement; cosign verify-blob --bundle /tmp/ch-tag.bundle --certificate-identity \"https://github.com/CoderHelm/coderhelm-platform/.github/workflows/auto-release.yml@refs/heads/main\" --certificate-oidc-issuer https://token.actions.githubusercontent.com --certificate-github-workflow-repository CoderHelm/coderhelm-platform --certificate-github-workflow-ref refs/heads/main --certificate-github-workflow-sha \"$COMMIT\" /tmp/ch-tag.statement || { echo \"$VERSION's release attestation is not from auto-release.yml on main for this tag and commit\"; exit 1; }; echo \"$VERSION was released by auto-release.yml on main\"; fi",
+            "cosign verify-blob --bundle SHA256SUMS.sigstore.json --certificate-identity \"https://github.com/CoderHelm/coderhelm-platform/.github/workflows/release.yml@refs/tags/$VERSION\" --certificate-oidc-issuer https://token.actions.githubusercontent.com --certificate-github-workflow-repository CoderHelm/coderhelm-platform --certificate-github-workflow-ref \"refs/tags/$VERSION\" --certificate-github-workflow-sha \"$COMMIT\" SHA256SUMS",
+            "curl --proto =https --proto-redir =https --tlsv1.2 -fsSL -o coderhelm-selfhost.tgz \"$B/coderhelm-selfhost.tgz\"",
+            "grep ' coderhelm-selfhost.tgz$' SHA256SUMS | sha256sum -c -",
+            "npm install -g --ignore-scripts ./coderhelm-selfhost.tgz",
+            "coderhelm-selfhost pull --stage prod --region \"$AWS_REGION\"",
+            "EXTRA=\"\"; if [ \"$MODE\" = \"rollback\" ]; then EXTRA=\"--rollback\"; fi",
+            "if [ \"$MODE\" = \"domain\" ]; then coderhelm-selfhost domain apply --yes --require-signature --version \"$VERSION\" --action \"${DOMAIN_ACTION:-attach}\" --hostname \"${DOMAIN_HOSTNAME:-}\" --certificate-arn \"${DOMAIN_CERT:-}\" --zone \"${DOMAIN_ZONE:-}\" --zone-id \"${DOMAIN_ZONE_ID:-}\" --result-file /tmp/result.json; else coderhelm-selfhost update --to \"$VERSION\" --yes --require-signature --auto-rollback --actor \"$ACTOR\" --result-file /tmp/result.json $EXTRA; fi"
+          ]
+        },
+        "post_build": {
+          "commands": [
+            "if [ ! -s /tmp/result.json ]; then echo \"{\\\"status\\\":\\\"failed\\\",\\\"reason\\\":\\\"the update build stopped before deploying: see its log\\\"}\" > /tmp/result.json; fi",
+            "node -e 'const r=require(\"/tmp/result.json\");process.stdout.write(JSON.stringify({action:\"finished\",history_id:process.env.HISTORY_ID,status:r.status,reason:r.reason,version:process.env.VERSION}))' > /tmp/payload.json",
+            "aws lambda invoke --function-name coderhelm-prod-updater --cli-binary-format raw-in-base64-out --payload file:///tmp/payload.json /tmp/out.json"
+          ]
+        }
+      }
+    },
+    "Environment": {
+      "ComputeType": "BUILD_GENERAL1_SMALL",
+      "EnvironmentVariables": [
+        {
+          "Name": "VERSION",
+          "Type": "PLAINTEXT",
+          "Value": ""
+        },
+        {
+          "Name": "ACTOR",
+          "Type": "PLAINTEXT",
+          "Value": "auto"
+        },
+        {
+          "Name": "MODE",
+          "Type": "PLAINTEXT",
+          "Value": "update"
+        },
+        {
+          "Name": "HISTORY_ID",
+          "Type": "PLAINTEXT",
+          "Value": ""
+        },
+        {
+          "Name": "DOMAIN_ACTION",
+          "Type": "PLAINTEXT",
+          "Value": ""
+        },
+        {
+          "Name": "DOMAIN_HOSTNAME",
+          "Type": "PLAINTEXT",
+          "Value": ""
+        },
+        {
+          "Name": "DOMAIN_CERT",
+          "Type": "PLAINTEXT",
+          "Value": ""
+        },
+        {
+          "Name": "DOMAIN_ZONE",
+          "Type": "PLAINTEXT",
+          "Value": ""
+        },
+        {
+          "Name": "DOMAIN_ZONE_ID",
+          "Type": "PLAINTEXT",
+          "Value": ""
+        }
       ],
-      "Effect": "Allow",
-      "Resource": {
-       "Fn::GetAtt": [
-        "ReleaseCheckLogs5F6A50E9",
+      "Image": "aws/codebuild/standard:7.0",
+      "ImagePullCredentialsType": "CODEBUILD",
+      "PrivilegedMode": false,
+      "Type": "LINUX_CONTAINER"
+    },
+    "ServiceRole": {
+      "Fn::GetAtt": [
+        "UpdateBuildRole067D9B2D",
         "Arn"
-       ]
-      }
-     },
-     {
-      "Action": [
-       "logs:CreateLogGroup",
-       "logs:CreateLogStream",
-       "logs:PutLogEvents"
-      ],
-      "Effect": "Allow",
-      "Resource": [
-       {
-        "Fn::Join": [
-         "",
-         [
-          "arn:",
-          {
-           "Ref": "AWS::Partition"
-          },
-          ":logs:us-west-2:111122223333:log-group:/aws/codebuild/",
-          {
-           "Ref": "ReleaseCheck8B2118C4"
-          }
-         ]
-        ]
-       },
-       {
-        "Fn::Join": [
-         "",
-         [
-          "arn:",
-          {
-           "Ref": "AWS::Partition"
-          },
-          ":logs:us-west-2:111122223333:log-group:/aws/codebuild/",
-          {
-           "Ref": "ReleaseCheck8B2118C4"
-          },
-          ":*"
-         ]
-        ]
-       }
       ]
-     },
-     {
-      "Action": [
-       "codebuild:CreateReportGroup",
-       "codebuild:CreateReport",
-       "codebuild:UpdateReport",
-       "codebuild:BatchPutTestCases",
-       "codebuild:BatchPutCodeCoverages"
-      ],
-      "Effect": "Allow",
-      "Resource": {
-       "Fn::Join": [
-        "",
-        [
-         "arn:",
-         {
-          "Ref": "AWS::Partition"
-         },
-         ":codebuild:us-west-2:111122223333:report-group/",
-         {
-          "Ref": "ReleaseCheck8B2118C4"
-         },
-         "-*"
-        ]
-       ]
-      }
-     }
-    ],
-    "Version": "2012-10-17"
-   },
-   "PolicyName": "ReleaseCheckRoleDefaultPolicy7CC95676",
-   "Roles": [
-    {
-     "Ref": "ReleaseCheckRole3A274ECC"
+    },
+    "TimeoutInMinutes": 90,
+    "ConcurrentBuildLimit": 1
+  },
+  "role:ReleaseCheckRole3A274ECC": {
+    "Properties": {
+      "AssumeRolePolicyDocument": {
+        "Statement": [
+          {
+            "Action": "sts:AssumeRole",
+            "Effect": "Allow",
+            "Principal": {
+              "Service": "codebuild.amazonaws.com"
+            }
+          }
+        ],
+        "Version": "2012-10-17"
+      },
+      "Description": "CoderHelm release check: verifies a release's signature and reads its model list; can only report to the updater",
+      "RoleName": "coderhelm-prod-release-check"
     }
-   ]
-  }
- },
- "policy:UpdateBuildRoleDefaultPolicyD36C6D67": {
-  "Properties": {
-   "PolicyDocument": {
-    "Statement": [
-     {
-      "Action": "sts:AssumeRole",
-      "Effect": "Allow",
-      "Resource": "arn:aws:iam::111122223333:role/cdk-*",
-      "Sid": "DeployThroughCdkBootstrapRoles"
-     },
-     {
-      "Action": [
-       "ssm:GetParameter",
-       "ssm:PutParameter"
-      ],
-      "Effect": "Allow",
-      "Resource": "arn:aws:ssm:us-west-2:111122223333:parameter/coderhelm-prod/installer/*",
-      "Sid": "ReadInstallState"
-     },
-     {
-      "Action": "ssm:GetParameter",
-      "Effect": "Allow",
-      "Resource": "arn:aws:ssm:*:111122223333:parameter/cdk-bootstrap/*",
-      "Sid": "CdkBootstrapVersion"
-     },
-     {
-      "Action": [
-       "cloudformation:ListStacks",
-       "cloudformation:DescribeStacks",
-       "sts:GetCallerIdentity",
-       "ses:GetAccount"
-      ],
-      "Effect": "Allow",
-      "Resource": "*",
-      "Sid": "HealthCheck"
-     },
-     {
-      "Action": [
-       "lambda:GetFunctionConfiguration",
-       "sqs:GetQueueUrl",
-       "sqs:GetQueueAttributes",
-       "secretsmanager:GetSecretValue"
-      ],
-      "Effect": "Allow",
-      "Resource": [
-       "arn:aws:lambda:us-west-2:111122223333:function:coderhelm-prod-*",
-       "arn:aws:sqs:us-west-2:111122223333:coderhelm-prod-*",
-       "arn:aws:secretsmanager:us-west-2:111122223333:secret:coderhelm/prod/secrets-??????"
-      ],
-      "Sid": "HealthCheckResources"
-     },
-     {
-      "Action": "lambda:InvokeFunction",
-      "Effect": "Allow",
-      "Resource": "arn:aws:lambda:us-west-2:111122223333:function:coderhelm-prod-worker",
-      "Sid": "InstallerModelCheck"
-     },
-     {
-      "Action": "dynamodb:GetItem",
-      "Condition": {
-       "ForAllValues:StringEquals": {
-        "dynamodb:LeadingKeys": [
-         "SYSTEM"
+  },
+  "policy:ReleaseCheckRoleDefaultPolicy7CC95676": {
+    "Properties": {
+      "PolicyDocument": {
+        "Statement": [
+          {
+            "Action": "lambda:InvokeFunction",
+            "Effect": "Allow",
+            "Resource": "arn:aws:lambda:us-west-2:111122223333:function:coderhelm-prod-updater",
+            "Sid": "ReportResult"
+          },
+          {
+            "Action": [
+              "logs:CreateLogStream",
+              "logs:PutLogEvents"
+            ],
+            "Effect": "Allow",
+            "Resource": {
+              "Fn::GetAtt": [
+                "ReleaseCheckLogs5F6A50E9",
+                "Arn"
+              ]
+            }
+          },
+          {
+            "Action": [
+              "logs:CreateLogGroup",
+              "logs:CreateLogStream",
+              "logs:PutLogEvents"
+            ],
+            "Effect": "Allow",
+            "Resource": [
+              {
+                "Fn::Join": [
+                  "",
+                  [
+                    "arn:",
+                    {
+                      "Ref": "AWS::Partition"
+                    },
+                    ":logs:us-west-2:111122223333:log-group:/aws/codebuild/",
+                    {
+                      "Ref": "ReleaseCheck8B2118C4"
+                    }
+                  ]
+                ]
+              },
+              {
+                "Fn::Join": [
+                  "",
+                  [
+                    "arn:",
+                    {
+                      "Ref": "AWS::Partition"
+                    },
+                    ":logs:us-west-2:111122223333:log-group:/aws/codebuild/",
+                    {
+                      "Ref": "ReleaseCheck8B2118C4"
+                    },
+                    ":*"
+                  ]
+                ]
+              }
+            ]
+          },
+          {
+            "Action": [
+              "codebuild:CreateReportGroup",
+              "codebuild:CreateReport",
+              "codebuild:UpdateReport",
+              "codebuild:BatchPutTestCases",
+              "codebuild:BatchPutCodeCoverages"
+            ],
+            "Effect": "Allow",
+            "Resource": {
+              "Fn::Join": [
+                "",
+                [
+                  "arn:",
+                  {
+                    "Ref": "AWS::Partition"
+                  },
+                  ":codebuild:us-west-2:111122223333:report-group/",
+                  {
+                    "Ref": "ReleaseCheck8B2118C4"
+                  },
+                  "-*"
+                ]
+              ]
+            }
+          }
+        ],
+        "Version": "2012-10-17"
+      },
+      "PolicyName": "ReleaseCheckRoleDefaultPolicy7CC95676",
+      "Roles": [
+        {
+          "Ref": "ReleaseCheckRole3A274ECC"
+        }
+      ]
+    }
+  },
+  "project:coderhelm-prod-release-check": {
+    "BuildSpec": {
+      "version": "0.2",
+      "env": {
+        "shell": "bash",
+        "exported-variables": [
+          "TEMPLATE_SHA256",
+          "MODELS_SHA256"
         ]
-       }
       },
-      "Effect": "Allow",
-      "Resource": {
-       "Fn::ImportValue": "coderhelm-prod-database:ExportsOutputFnGetAttSettingsTable4DB0CCD0Arn1D1BE79B"
-      },
-      "Sid": "ModelCheckSetting"
-     },
-     {
-      "Action": "lambda:InvokeFunction",
-      "Effect": "Allow",
-      "Resource": "arn:aws:lambda:us-west-2:111122223333:function:coderhelm-prod-updater",
-      "Sid": "ReportResult"
-     },
-     {
-      "Action": [
-       "logs:CreateLogStream",
-       "logs:PutLogEvents"
+      "phases": {
+        "install": {
+          "runtime-versions": {
+            "nodejs": 20
+          },
+          "commands": [
+            "set -euo pipefail",
+            "curl --proto =https --proto-redir =https --tlsv1.2 -fsSL -o /tmp/cosign https://github.com/sigstore/cosign/releases/download/v2.4.1/cosign-linux-amd64",
+            "echo \"8b24b946dd5809c6bd93de08033bcf6bc0ed7d336b7785787c080f574b89249b  /tmp/cosign\" | sha256sum -c -",
+            "install -m 0755 /tmp/cosign /usr/local/bin/cosign"
+          ]
+        },
+        "build": {
+          "commands": [
+            "set -euo pipefail",
+            "[[ \"$VERSION\" =~ ^v[0-9]+\\.[0-9]+\\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]] || { echo \"VERSION=$VERSION is not a release tag\"; exit 1; }",
+            "mkdir -p /tmp/ch && cd /tmp/ch",
+            "B=\"https://github.com/CoderHelm/coderhelm-platform/releases/download/$VERSION\"",
+            "curl --proto =https --proto-redir =https --tlsv1.2 -fsSL -o SHA256SUMS \"$B/SHA256SUMS\"",
+            "curl --proto =https --proto-redir =https --tlsv1.2 -fsSL -o SHA256SUMS.sigstore.json \"$B/SHA256SUMS.sigstore.json\"",
+            "rm -rf /tmp/ch-tag && mkdir -p /tmp/ch-tag && printf '%s\\n' 'nambok namespaces=\"git\" ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIH6UjRCKMcz6OyGQkv2PCBbzqzKx+ngQQmavwp8UDASV' > /tmp/ch-tag.signers",
+            "env GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 GIT_TERMINAL_PROMPT=0 git -C /tmp/ch-tag init -q --bare",
+            "env GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 GIT_TERMINAL_PROMPT=0 git -C /tmp/ch-tag fetch -q --no-tags --filter=tree:0 https://github.com/CoderHelm/coderhelm-platform.git \"+refs/tags/$VERSION:refs/tags/$VERSION\" \"+refs/heads/main:refs/heads/main\"",
+            "[ \"$(env GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 GIT_TERMINAL_PROMPT=0 git -C /tmp/ch-tag cat-file -t \"refs/tags/$VERSION\")\" = tag ] || { echo \"$VERSION is not an annotated tag\"; exit 1; }",
+            "env GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 GIT_TERMINAL_PROMPT=0 git -C /tmp/ch-tag cat-file tag \"refs/tags/$VERSION\" > /tmp/ch-tag.tag",
+            "[ \"$(sed -n '/^$/q;s/^tag //p' /tmp/ch-tag.tag)\" = \"$VERSION\" ] || { echo \"the tag object under $VERSION is named for another version\"; exit 1; }",
+            "[ \"$(sed -n '/^$/q;s/^type //p' /tmp/ch-tag.tag)\" = commit ] || { echo \"$VERSION does not point to a commit\"; exit 1; }",
+            "COMMIT=$(env GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 GIT_TERMINAL_PROMPT=0 git -C /tmp/ch-tag rev-parse --verify \"refs/tags/$VERSION^{commit}\")",
+            "[[ \"$COMMIT\" =~ ^[0-9a-f]{40}$ ]] && env GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 GIT_TERMINAL_PROMPT=0 git -C /tmp/ch-tag merge-base --is-ancestor \"$COMMIT\" refs/heads/main || { echo \"$VERSION ($COMMIT) is not on main\"; exit 1; }",
+            "if grep -qxF -e '-----BEGIN SSH SIGNATURE-----' /tmp/ch-tag.tag; then [ \"$(grep -cxF -e '-----BEGIN SSH SIGNATURE-----' /tmp/ch-tag.tag)\" = 1 ] || { echo \"$VERSION has more than one SSH signature\"; exit 1; }; env GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 GIT_TERMINAL_PROMPT=0 git -C /tmp/ch-tag -c gpg.format=ssh -c gpg.ssh.allowedSignersFile=/tmp/ch-tag.signers -c gpg.ssh.program=ssh-keygen verify-tag \"refs/tags/$VERSION\" || { echo \"$VERSION is not signed by a CoderHelm maintainer key (selfhost/maintainers.json)\"; exit 1; }; echo \"$VERSION is signed by a maintainer key\"; else [ \"$(grep -cxF -e '-----BEGIN CODERHELM RELEASE ATTESTATION-----' /tmp/ch-tag.tag)\" = 1 ] && [ \"$(grep -cxF -e '-----END CODERHELM RELEASE ATTESTATION-----' /tmp/ch-tag.tag)\" = 1 ] || { echo \"$VERSION has no SSH signature and no release attestation\"; exit 1; }; sed -n '/^-----BEGIN CODERHELM RELEASE ATTESTATION-----$/,/^-----END CODERHELM RELEASE ATTESTATION-----$/p' /tmp/ch-tag.tag | sed '1d;$d' | base64 -d > /tmp/ch-tag.bundle || { echo \"$VERSION's release attestation is not base64\"; exit 1; }; printf 'coderhelm-release-tag v1\\nrepository %s\\ntag %s\\ncommit %s\\n' CoderHelm/coderhelm-platform \"$VERSION\" \"$COMMIT\" > /tmp/ch-tag.statement; cosign verify-blob --bundle /tmp/ch-tag.bundle --certificate-identity \"https://github.com/CoderHelm/coderhelm-platform/.github/workflows/auto-release.yml@refs/heads/main\" --certificate-oidc-issuer https://token.actions.githubusercontent.com --certificate-github-workflow-repository CoderHelm/coderhelm-platform --certificate-github-workflow-ref refs/heads/main --certificate-github-workflow-sha \"$COMMIT\" /tmp/ch-tag.statement || { echo \"$VERSION's release attestation is not from auto-release.yml on main for this tag and commit\"; exit 1; }; echo \"$VERSION was released by auto-release.yml on main\"; fi",
+            "cosign verify-blob --bundle SHA256SUMS.sigstore.json --certificate-identity \"https://github.com/CoderHelm/coderhelm-platform/.github/workflows/release.yml@refs/tags/$VERSION\" --certificate-oidc-issuer https://token.actions.githubusercontent.com --certificate-github-workflow-repository CoderHelm/coderhelm-platform --certificate-github-workflow-ref \"refs/tags/$VERSION\" --certificate-github-workflow-sha \"$COMMIT\" SHA256SUMS",
+            "TEMPLATE_SHA256=$(awk '$2==\"coderhelm.json\"{print $1}' SHA256SUMS); export TEMPLATE_SHA256",
+            "MODELS_SHA256=$(awk '$2==\"models.json\"{print $1}' SHA256SUMS); MODELS_SHA256=${MODELS_SHA256:-none}; export MODELS_SHA256",
+            "if grep -q ' models.json$' SHA256SUMS; then curl --proto =https --proto-redir =https --tlsv1.2 -fsSL -o models.json \"$B/models.json\"; grep ' models.json$' SHA256SUMS | sha256sum -c -; node -e 'process.stdout.write(JSON.stringify({status:\"verified\",manifest_text:require(\"fs\").readFileSync(\"models.json\",\"utf8\")}))' > /tmp/result.json; else echo '{\"status\":\"verified\",\"manifest_text\":null}' > /tmp/result.json; fi"
+          ]
+        },
+        "post_build": {
+          "commands": [
+            "if [ \"${CODEBUILD_BUILD_SUCCEEDING:-0}\" != \"1\" ] || [ ! -s /tmp/result.json ]; then echo '{\"status\":\"failed\",\"reason\":\"the release check failed: see its log\"}' > /tmp/result.json; fi",
+            "node -e 'const r=require(\"/tmp/result.json\");process.stdout.write(JSON.stringify({action:\"models_verified\",version:process.env.VERSION,build:process.env.CODEBUILD_BUILD_ID,status:r.status,reason:r.reason,manifest_text:r.manifest_text??null,template_sha256:r.status===\"verified\"&&/^[0-9a-f]{64}$/.test(process.env.TEMPLATE_SHA256||\"\")?process.env.TEMPLATE_SHA256:null}))' > /tmp/payload.json",
+            "aws lambda invoke --function-name coderhelm-prod-updater --cli-binary-format raw-in-base64-out --payload file:///tmp/payload.json /tmp/out.json"
+          ]
+        }
+      }
+    },
+    "Environment": {
+      "ComputeType": "BUILD_GENERAL1_SMALL",
+      "EnvironmentVariables": [
+        {
+          "Name": "VERSION",
+          "Type": "PLAINTEXT",
+          "Value": ""
+        }
       ],
-      "Effect": "Allow",
-      "Resource": {
-       "Fn::GetAtt": [
-        "UpdateBuildLogsD800ACFF",
+      "Image": "aws/codebuild/standard:7.0",
+      "ImagePullCredentialsType": "CODEBUILD",
+      "PrivilegedMode": false,
+      "Type": "LINUX_CONTAINER"
+    },
+    "ServiceRole": {
+      "Fn::GetAtt": [
+        "ReleaseCheckRole3A274ECC",
         "Arn"
-       ]
-      }
-     },
-     {
-      "Action": [
-       "logs:CreateLogGroup",
-       "logs:CreateLogStream",
-       "logs:PutLogEvents"
-      ],
-      "Effect": "Allow",
-      "Resource": [
-       {
-        "Fn::Join": [
-         "",
-         [
-          "arn:",
+      ]
+    },
+    "TimeoutInMinutes": 15,
+    "ConcurrentBuildLimit": 1
+  },
+  "role:UpdaterServiceRole325F096F": {
+    "Properties": {
+      "AssumeRolePolicyDocument": {
+        "Statement": [
           {
-           "Ref": "AWS::Partition"
-          },
-          ":logs:us-west-2:111122223333:log-group:/aws/codebuild/",
-          {
-           "Ref": "UpdateBuildEFAA12C3"
+            "Action": "sts:AssumeRole",
+            "Effect": "Allow",
+            "Principal": {
+              "Service": "lambda.amazonaws.com"
+            }
           }
-         ]
-        ]
-       },
-       {
-        "Fn::Join": [
-         "",
-         [
-          "arn:",
+        ],
+        "Version": "2012-10-17"
+      },
+      "ManagedPolicyArns": [
+        {
+          "Fn::Join": [
+            "",
+            [
+              "arn:",
+              {
+                "Ref": "AWS::Partition"
+              },
+              ":iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+            ]
+          ]
+        }
+      ]
+    }
+  },
+  "policy:UpdaterServiceRoleDefaultPolicy797F2EE4": {
+    "Properties": {
+      "PolicyDocument": {
+        "Statement": [
           {
-           "Ref": "AWS::Partition"
+            "Action": [
+              "kms:Decrypt",
+              "kms:DescribeKey",
+              "kms:Encrypt",
+              "kms:ReEncrypt*",
+              "kms:GenerateDataKey*"
+            ],
+            "Effect": "Allow",
+            "Resource": {
+              "Fn::ImportValue": "coderhelm-prod-database:ExportsOutputFnGetAttTableKeyF581D96FArn9F1D043D"
+            }
           },
-          ":logs:us-west-2:111122223333:log-group:/aws/codebuild/",
           {
-           "Ref": "UpdateBuildEFAA12C3"
+            "Action": [
+              "dynamodb:BatchGetItem",
+              "dynamodb:Query",
+              "dynamodb:GetItem",
+              "dynamodb:Scan",
+              "dynamodb:ConditionCheckItem",
+              "dynamodb:BatchWriteItem",
+              "dynamodb:PutItem",
+              "dynamodb:UpdateItem",
+              "dynamodb:DeleteItem",
+              "dynamodb:DescribeTable"
+            ],
+            "Effect": "Allow",
+            "Resource": {
+              "Fn::ImportValue": "coderhelm-prod-database:ExportsOutputFnGetAttSettingsTable4DB0CCD0Arn1D1BE79B"
+            }
           },
-          ":*"
-         ]
-        ]
-       }
+          {
+            "Action": [
+              "dynamodb:GetRecords",
+              "dynamodb:GetShardIterator"
+            ],
+            "Effect": "Allow",
+            "Resource": {
+              "Fn::ImportValue": "coderhelm-prod-database:ExportsOutputFnGetAttSettingsTable4DB0CCD0Arn1D1BE79B"
+            }
+          },
+          {
+            "Action": "codebuild:StartBuild",
+            "Effect": "Allow",
+            "Resource": [
+              {
+                "Fn::GetAtt": [
+                  "UpdateBuildEFAA12C3",
+                  "Arn"
+                ]
+              },
+              {
+                "Fn::GetAtt": [
+                  "ReleaseCheck8B2118C4",
+                  "Arn"
+                ]
+              }
+            ]
+          },
+          {
+            "Action": "codebuild:BatchGetBuilds",
+            "Effect": "Allow",
+            "Resource": {
+              "Fn::GetAtt": [
+                "ReleaseCheck8B2118C4",
+                "Arn"
+              ]
+            }
+          },
+          {
+            "Action": "secretsmanager:GetSecretValue",
+            "Effect": "Allow",
+            "Resource": "arn:aws:secretsmanager:us-west-2:111122223333:secret:coderhelm/prod/secrets-??????",
+            "Sid": "ReadHybridRegistrationForMail"
+          },
+          {
+            "Action": "ses:SendEmail",
+            "Condition": {
+              "StringEquals": {
+                "ses:FromAddress": "a@example.org"
+              }
+            },
+            "Effect": "Allow",
+            "Resource": "*"
+          },
+          {
+            "Action": "lambda:InvokeFunction",
+            "Effect": "Allow",
+            "Resource": "arn:aws:lambda:us-west-2:111122223333:function:coderhelm-prod-worker",
+            "Sid": "ModelCheckThroughWorker"
+          },
+          {
+            "Action": [
+              "lambda:GetFunctionConfiguration",
+              "lambda:UpdateFunctionConfiguration"
+            ],
+            "Effect": "Allow",
+            "Resource": [
+              "arn:aws:lambda:us-west-2:111122223333:function:coderhelm-prod-gateway",
+              "arn:aws:lambda:us-west-2:111122223333:function:coderhelm-prod-streaming",
+              "arn:aws:lambda:us-west-2:111122223333:function:coderhelm-prod-worker"
+            ],
+            "Sid": "RestartSecretReaders"
+          },
+          {
+            "Action": [
+              "acm:DescribeCertificate",
+              "acm:AddTagsToCertificate"
+            ],
+            "Effect": "Allow",
+            "Resource": "arn:aws:acm:us-east-1:111122223333:certificate/*",
+            "Sid": "DomainCertificate"
+          },
+          {
+            "Action": "acm:RequestCertificate",
+            "Condition": {
+              "StringEquals": {
+                "aws:RequestedRegion": "us-east-1"
+              }
+            },
+            "Effect": "Allow",
+            "Resource": "*",
+            "Sid": "DomainCertificateRequest"
+          },
+          {
+            "Action": [
+              "route53:ListHostedZones",
+              "route53:GetHostedZone"
+            ],
+            "Effect": "Allow",
+            "Resource": "*",
+            "Sid": "DomainZoneLookup"
+          },
+          {
+            "Action": "route53:ChangeResourceRecordSets",
+            "Condition": {
+              "ForAllValues:StringEquals": {
+                "route53:ChangeResourceRecordSetsRecordTypes": [
+                  "CNAME"
+                ]
+              },
+              "ForAllValues:StringLike": {
+                "route53:ChangeResourceRecordSetsNormalizedRecordNames": [
+                  "_*"
+                ]
+              }
+            },
+            "Effect": "Allow",
+            "Resource": "arn:aws:route53:::hostedzone/*",
+            "Sid": "DomainValidationRecord"
+          },
+          {
+            "Action": "ssm:GetParameter",
+            "Effect": "Allow",
+            "Resource": "arn:aws:ssm:us-west-2:111122223333:parameter/coderhelm-prod/distribution-domain",
+            "Sid": "DomainTarget"
+          }
+        ],
+        "Version": "2012-10-17"
+      },
+      "PolicyName": "UpdaterServiceRoleDefaultPolicy797F2EE4",
+      "Roles": [
+        {
+          "Ref": "UpdaterServiceRole325F096F"
+        }
       ]
-     },
-     {
-      "Action": [
-       "codebuild:CreateReportGroup",
-       "codebuild:CreateReport",
-       "codebuild:UpdateReport",
-       "codebuild:BatchPutTestCases",
-       "codebuild:BatchPutCodeCoverages"
-      ],
-      "Effect": "Allow",
-      "Resource": {
-       "Fn::Join": [
-        "",
-        [
-         "arn:",
-         {
-          "Ref": "AWS::Partition"
-         },
-         ":codebuild:us-west-2:111122223333:report-group/",
-         {
-          "Ref": "UpdateBuildEFAA12C3"
-         },
-         "-*"
-        ]
-       ]
-      }
-     }
-    ],
-    "Version": "2012-10-17"
-   },
-   "PolicyName": "UpdateBuildRoleDefaultPolicyD36C6D67",
-   "Roles": [
-    {
-     "Ref": "UpdateBuildRole067D9B2D"
     }
-   ]
-  }
- },
- "policy:UpdaterServiceRoleDefaultPolicy797F2EE4": {
-  "Properties": {
-   "PolicyDocument": {
-    "Statement": [
-     {
-      "Action": [
-       "kms:Decrypt",
-       "kms:DescribeKey",
-       "kms:Encrypt",
-       "kms:ReEncrypt*",
-       "kms:GenerateDataKey*"
+  },
+  "function:Updater65AF1523": {
+    "Properties": {
+      "Architectures": [
+        "arm64"
       ],
-      "Effect": "Allow",
-      "Resource": {
-       "Fn::ImportValue": "coderhelm-prod-database:ExportsOutputFnGetAttTableKeyF581D96FArn9F1D043D"
-      }
-     },
-     {
-      "Action": [
-       "dynamodb:BatchGetItem",
-       "dynamodb:Query",
-       "dynamodb:GetItem",
-       "dynamodb:Scan",
-       "dynamodb:ConditionCheckItem",
-       "dynamodb:BatchWriteItem",
-       "dynamodb:PutItem",
-       "dynamodb:UpdateItem",
-       "dynamodb:DeleteItem",
-       "dynamodb:DescribeTable"
-      ],
-      "Effect": "Allow",
-      "Resource": {
-       "Fn::ImportValue": "coderhelm-prod-database:ExportsOutputFnGetAttSettingsTable4DB0CCD0Arn1D1BE79B"
-      }
-     },
-     {
-      "Action": [
-       "dynamodb:GetRecords",
-       "dynamodb:GetShardIterator"
-      ],
-      "Effect": "Allow",
-      "Resource": {
-       "Fn::ImportValue": "coderhelm-prod-database:ExportsOutputFnGetAttSettingsTable4DB0CCD0Arn1D1BE79B"
-      }
-     },
-     {
-      "Action": "codebuild:StartBuild",
-      "Effect": "Allow",
-      "Resource": [
-       {
+      "Description": "CoderHelm updates: release checks, notices, auto-update, history",
+      "Environment": {
+        "Variables": {
+          "SETTINGS_TABLE_NAME": {
+            "Fn::ImportValue": "coderhelm-prod-database:ExportsOutputRefSettingsTable4DB0CCD0297D747B"
+          },
+          "UPDATE_PROJECT_NAME": {
+            "Ref": "UpdateBuildEFAA12C3"
+          },
+          "UPDATE_DEFAULTS": "{\"auto\":false,\"channel\":\"stable\",\"day\":\"sun\",\"hour\":3,\"timezone\":\"UTC\",\"majors\":\"ask\"}",
+          "ADMIN_EMAILS": "o@example.org",
+          "SES_FROM_ADDRESS": "a@example.org",
+          "EMAIL_FROM_NAME": "CoderHelm",
+          "ORGANIZATION_NAME": "",
+          "APP_URL": {
+            "Fn::Join": [
+              "",
+              [
+                "https://",
+                {
+                  "Fn::ImportValue": "coderhelm-prod-web:ExportsOutputFnGetAttDistribution830FAC52DomainNameBEB09E30"
+                }
+              ]
+            ]
+          },
+          "RELEASE_REPO": "CoderHelm/coderhelm-platform",
+          "REFRESH_FUNCTIONS": "coderhelm-prod-gateway,coderhelm-prod-streaming,coderhelm-prod-worker",
+          "DISTRIBUTION_DOMAIN_PARAMETER": "/coderhelm-prod/distribution-domain",
+          "RESOURCE_PREFIX": "coderhelm-prod",
+          "WORKER_FUNCTION_NAME": "coderhelm-prod-worker",
+          "RELEASE_CHECK_PROJECT_NAME": "coderhelm-prod-release-check",
+          "CONFIGURED_MODELS": "claude-opus-5-5,claude-sonnet-5-5",
+          "EMAIL_TRANSPORT_DEFAULT": "ses",
+          "SECRETS_NAME": "coderhelm/prod/secrets",
+          "CODERHELM_CONFIG_FINGERPRINT": "36bad1a628cf"
+        }
+      },
+      "FunctionName": "coderhelm-prod-updater",
+      "Handler": "handler.handler",
+      "LoggingConfig": {
+        "LogGroup": {
+          "Ref": "UpdaterLogs5E6223A3"
+        }
+      },
+      "MemorySize": 256,
+      "Role": {
         "Fn::GetAtt": [
-         "UpdateBuildEFAA12C3",
-         "Arn"
+          "UpdaterServiceRole325F096F",
+          "Arn"
         ]
-       },
-       {
-        "Fn::GetAtt": [
-         "ReleaseCheck8B2118C4",
-         "Arn"
-        ]
-       }
-      ]
-     },
-     {
-      "Action": "secretsmanager:GetSecretValue",
-      "Effect": "Allow",
-      "Resource": "arn:aws:secretsmanager:us-west-2:111122223333:secret:coderhelm/prod/secrets-??????",
-      "Sid": "ReadHybridRegistrationForMail"
-     },
-     {
-      "Action": "ses:SendEmail",
-      "Condition": {
-       "StringEquals": {
-        "ses:FromAddress": "a@example.org"
-       }
       },
-      "Effect": "Allow",
-      "Resource": "*"
-     },
-     {
-      "Action": "lambda:InvokeFunction",
-      "Effect": "Allow",
-      "Resource": "arn:aws:lambda:us-west-2:111122223333:function:coderhelm-prod-worker",
-      "Sid": "ModelCheckThroughWorker"
-     },
-     {
-      "Action": [
-       "lambda:GetFunctionConfiguration",
-       "lambda:UpdateFunctionConfiguration"
-      ],
-      "Effect": "Allow",
-      "Resource": [
-       "arn:aws:lambda:us-west-2:111122223333:function:coderhelm-prod-gateway",
-       "arn:aws:lambda:us-west-2:111122223333:function:coderhelm-prod-streaming",
-       "arn:aws:lambda:us-west-2:111122223333:function:coderhelm-prod-worker"
-      ],
-      "Sid": "RestartSecretReaders"
-     },
-     {
-      "Action": [
-       "acm:DescribeCertificate",
-       "acm:AddTagsToCertificate"
-      ],
-      "Effect": "Allow",
-      "Resource": "arn:aws:acm:us-east-1:111122223333:certificate/*",
-      "Sid": "DomainCertificate"
-     },
-     {
-      "Action": "acm:RequestCertificate",
-      "Condition": {
-       "StringEquals": {
-        "aws:RequestedRegion": "us-east-1"
-       }
-      },
-      "Effect": "Allow",
-      "Resource": "*",
-      "Sid": "DomainCertificateRequest"
-     },
-     {
-      "Action": [
-       "route53:ListHostedZones",
-       "route53:GetHostedZone"
-      ],
-      "Effect": "Allow",
-      "Resource": "*",
-      "Sid": "DomainZoneLookup"
-     },
-     {
-      "Action": "route53:ChangeResourceRecordSets",
-      "Condition": {
-       "ForAllValues:StringEquals": {
-        "route53:ChangeResourceRecordSetsRecordTypes": [
-         "CNAME"
-        ]
-       },
-       "ForAllValues:StringLike": {
-        "route53:ChangeResourceRecordSetsNormalizedRecordNames": [
-         "_*"
-        ]
-       }
-      },
-      "Effect": "Allow",
-      "Resource": "arn:aws:route53:::hostedzone/*",
-      "Sid": "DomainValidationRecord"
-     },
-     {
-      "Action": "ssm:GetParameter",
-      "Effect": "Allow",
-      "Resource": "arn:aws:ssm:us-west-2:111122223333:parameter/coderhelm-prod/distribution-domain",
-      "Sid": "DomainTarget"
-     }
-    ],
-    "Version": "2012-10-17"
-   },
-   "PolicyName": "UpdaterServiceRoleDefaultPolicy797F2EE4",
-   "Roles": [
-    {
-     "Ref": "UpdaterServiceRole325F096F"
+      "Runtime": "python3.12",
+      "Timeout": 180
     }
-   ]
   }
- },
- "project:coderhelm-prod-release-check": {
-  "BuildSpec": {
-   "env": {
-    "shell": "bash"
-   },
-   "phases": {
-    "build": {
-     "commands": [
-      "set -euo pipefail",
-      "[[ \"$VERSION\" =~ ^v[0-9]+\\.[0-9]+\\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]] || { echo \"VERSION=$VERSION is not a release tag\"; exit 1; }",
-      "mkdir -p /tmp/ch && cd /tmp/ch",
-      "B=\"https://github.com/CoderHelm/coderhelm-platform/releases/download/$VERSION\"",
-      "curl --proto =https --proto-redir =https --tlsv1.2 -fsSL -o SHA256SUMS \"$B/SHA256SUMS\"",
-      "curl --proto =https --proto-redir =https --tlsv1.2 -fsSL -o SHA256SUMS.sigstore.json \"$B/SHA256SUMS.sigstore.json\"",
-      "rm -rf /tmp/ch-tag && mkdir -p /tmp/ch-tag && printf '%s\\n' 'nambok namespaces=\"git\" ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIH6UjRCKMcz6OyGQkv2PCBbzqzKx+ngQQmavwp8UDASV' > /tmp/ch-tag.signers",
-      "env GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 GIT_TERMINAL_PROMPT=0 git -C /tmp/ch-tag init -q --bare",
-      "env GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 GIT_TERMINAL_PROMPT=0 git -C /tmp/ch-tag fetch -q --no-tags --filter=tree:0 https://github.com/CoderHelm/coderhelm-platform.git \"+refs/tags/$VERSION:refs/tags/$VERSION\" \"+refs/heads/main:refs/heads/main\"",
-      "[ \"$(env GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 GIT_TERMINAL_PROMPT=0 git -C /tmp/ch-tag cat-file -t \"refs/tags/$VERSION\")\" = tag ] || { echo \"$VERSION is not an annotated tag\"; exit 1; }",
-      "env GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 GIT_TERMINAL_PROMPT=0 git -C /tmp/ch-tag cat-file tag \"refs/tags/$VERSION\" > /tmp/ch-tag.tag",
-      "[ \"$(sed -n '/^$/q;s/^tag //p' /tmp/ch-tag.tag)\" = \"$VERSION\" ] || { echo \"the tag object under $VERSION is named for another version\"; exit 1; }",
-      "[ \"$(sed -n '/^$/q;s/^type //p' /tmp/ch-tag.tag)\" = commit ] || { echo \"$VERSION does not point to a commit\"; exit 1; }",
-      "COMMIT=$(env GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 GIT_TERMINAL_PROMPT=0 git -C /tmp/ch-tag rev-parse --verify \"refs/tags/$VERSION^{commit}\")",
-      "[[ \"$COMMIT\" =~ ^[0-9a-f]{40}$ ]] && env GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 GIT_TERMINAL_PROMPT=0 git -C /tmp/ch-tag merge-base --is-ancestor \"$COMMIT\" refs/heads/main || { echo \"$VERSION ($COMMIT) is not on main\"; exit 1; }",
-      "if grep -qxF -e '-----BEGIN SSH SIGNATURE-----' /tmp/ch-tag.tag; then [ \"$(grep -cxF -e '-----BEGIN SSH SIGNATURE-----' /tmp/ch-tag.tag)\" = 1 ] || { echo \"$VERSION has more than one SSH signature\"; exit 1; }; env GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 GIT_TERMINAL_PROMPT=0 git -C /tmp/ch-tag -c gpg.format=ssh -c gpg.ssh.allowedSignersFile=/tmp/ch-tag.signers -c gpg.ssh.program=ssh-keygen verify-tag \"refs/tags/$VERSION\" || { echo \"$VERSION is not signed by a CoderHelm maintainer key (selfhost/maintainers.json)\"; exit 1; }; echo \"$VERSION is signed by a maintainer key\"; else [ \"$(grep -cxF -e '-----BEGIN CODERHELM RELEASE ATTESTATION-----' /tmp/ch-tag.tag)\" = 1 ] && [ \"$(grep -cxF -e '-----END CODERHELM RELEASE ATTESTATION-----' /tmp/ch-tag.tag)\" = 1 ] || { echo \"$VERSION has no SSH signature and no release attestation\"; exit 1; }; sed -n '/^-----BEGIN CODERHELM RELEASE ATTESTATION-----$/,/^-----END CODERHELM RELEASE ATTESTATION-----$/p' /tmp/ch-tag.tag | sed '1d;$d' | base64 -d > /tmp/ch-tag.bundle || { echo \"$VERSION's release attestation is not base64\"; exit 1; }; printf 'coderhelm-release-tag v1\\nrepository %s\\ntag %s\\ncommit %s\\n' CoderHelm/coderhelm-platform \"$VERSION\" \"$COMMIT\" > /tmp/ch-tag.statement; cosign verify-blob --bundle /tmp/ch-tag.bundle --certificate-identity \"https://github.com/CoderHelm/coderhelm-platform/.github/workflows/auto-release.yml@refs/heads/main\" --certificate-oidc-issuer https://token.actions.githubusercontent.com --certificate-github-workflow-repository CoderHelm/coderhelm-platform --certificate-github-workflow-ref refs/heads/main --certificate-github-workflow-sha \"$COMMIT\" /tmp/ch-tag.statement || { echo \"$VERSION's release attestation is not from auto-release.yml on main for this tag and commit\"; exit 1; }; echo \"$VERSION was released by auto-release.yml on main\"; fi",
-      "cosign verify-blob --bundle SHA256SUMS.sigstore.json --certificate-identity \"https://github.com/CoderHelm/coderhelm-platform/.github/workflows/release.yml@refs/tags/$VERSION\" --certificate-oidc-issuer https://token.actions.githubusercontent.com --certificate-github-workflow-repository CoderHelm/coderhelm-platform --certificate-github-workflow-ref \"refs/tags/$VERSION\" --certificate-github-workflow-sha \"$COMMIT\" SHA256SUMS",
-      "TEMPLATE_SHA256=$(awk '$2==\"coderhelm.json\"{print $1}' SHA256SUMS); export TEMPLATE_SHA256",
-      "if grep -q ' models.json$' SHA256SUMS; then curl --proto =https --proto-redir =https --tlsv1.2 -fsSL -o models.json \"$B/models.json\"; grep ' models.json$' SHA256SUMS | sha256sum -c -; node -e 'process.stdout.write(JSON.stringify({status:\"verified\",manifest:JSON.parse(require(\"fs\").readFileSync(\"models.json\",\"utf8\"))}))' > /tmp/result.json; else echo '{\"status\":\"verified\",\"manifest\":null}' > /tmp/result.json; fi"
-     ]
-    },
-    "install": {
-     "commands": [
-      "set -euo pipefail",
-      "curl --proto =https --proto-redir =https --tlsv1.2 -fsSL -o /tmp/cosign https://github.com/sigstore/cosign/releases/download/v2.4.1/cosign-linux-amd64",
-      "echo \"8b24b946dd5809c6bd93de08033bcf6bc0ed7d336b7785787c080f574b89249b  /tmp/cosign\" | sha256sum -c -",
-      "install -m 0755 /tmp/cosign /usr/local/bin/cosign"
-     ],
-     "runtime-versions": {
-      "nodejs": 20
-     }
-    },
-    "post_build": {
-     "commands": [
-      "if [ \"${CODEBUILD_BUILD_SUCCEEDING:-0}\" != \"1\" ] || [ ! -s /tmp/result.json ]; then echo '{\"status\":\"failed\",\"reason\":\"the release check failed: see its log\"}' > /tmp/result.json; fi",
-      "node -e 'const r=require(\"/tmp/result.json\");process.stdout.write(JSON.stringify({action:\"models_verified\",version:process.env.VERSION,status:r.status,reason:r.reason,manifest:r.manifest??null,template_sha256:r.status===\"verified\"&&/^[0-9a-f]{64}$/.test(process.env.TEMPLATE_SHA256||\"\")?process.env.TEMPLATE_SHA256:null}))' > /tmp/payload.json",
-      "aws lambda invoke --function-name coderhelm-prod-updater --cli-binary-format raw-in-base64-out --payload file:///tmp/payload.json /tmp/out.json"
-     ]
-    }
-   },
-   "version": "0.2"
-  },
-  "ConcurrentBuildLimit": 1,
-  "Environment": {
-   "ComputeType": "BUILD_GENERAL1_SMALL",
-   "EnvironmentVariables": [
-    {
-     "Name": "VERSION",
-     "Type": "PLAINTEXT",
-     "Value": ""
-    }
-   ],
-   "Image": "aws/codebuild/standard:7.0",
-   "ImagePullCredentialsType": "CODEBUILD",
-   "PrivilegedMode": false,
-   "Type": "LINUX_CONTAINER"
-  },
-  "ServiceRole": {
-   "Fn::GetAtt": [
-    "ReleaseCheckRole3A274ECC",
-    "Arn"
-   ]
-  },
-  "TimeoutInMinutes": 15
- },
- "project:coderhelm-prod-update": {
-  "BuildSpec": {
-   "env": {
-    "shell": "bash"
-   },
-   "phases": {
-    "build": {
-     "commands": [
-      "set -euo pipefail",
-      "[[ \"$VERSION\" =~ ^v[0-9]+\\.[0-9]+\\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]] || { echo \"VERSION=$VERSION is not a release tag\"; exit 1; }",
-      "mkdir -p /tmp/ch && cd /tmp/ch",
-      "B=\"https://github.com/CoderHelm/coderhelm-platform/releases/download/$VERSION\"",
-      "curl --proto =https --proto-redir =https --tlsv1.2 -fsSL -o SHA256SUMS \"$B/SHA256SUMS\"",
-      "curl --proto =https --proto-redir =https --tlsv1.2 -fsSL -o SHA256SUMS.sigstore.json \"$B/SHA256SUMS.sigstore.json\"",
-      "rm -rf /tmp/ch-tag && mkdir -p /tmp/ch-tag && printf '%s\\n' 'nambok namespaces=\"git\" ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIH6UjRCKMcz6OyGQkv2PCBbzqzKx+ngQQmavwp8UDASV' > /tmp/ch-tag.signers",
-      "env GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 GIT_TERMINAL_PROMPT=0 git -C /tmp/ch-tag init -q --bare",
-      "env GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 GIT_TERMINAL_PROMPT=0 git -C /tmp/ch-tag fetch -q --no-tags --filter=tree:0 https://github.com/CoderHelm/coderhelm-platform.git \"+refs/tags/$VERSION:refs/tags/$VERSION\" \"+refs/heads/main:refs/heads/main\"",
-      "[ \"$(env GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 GIT_TERMINAL_PROMPT=0 git -C /tmp/ch-tag cat-file -t \"refs/tags/$VERSION\")\" = tag ] || { echo \"$VERSION is not an annotated tag\"; exit 1; }",
-      "env GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 GIT_TERMINAL_PROMPT=0 git -C /tmp/ch-tag cat-file tag \"refs/tags/$VERSION\" > /tmp/ch-tag.tag",
-      "[ \"$(sed -n '/^$/q;s/^tag //p' /tmp/ch-tag.tag)\" = \"$VERSION\" ] || { echo \"the tag object under $VERSION is named for another version\"; exit 1; }",
-      "[ \"$(sed -n '/^$/q;s/^type //p' /tmp/ch-tag.tag)\" = commit ] || { echo \"$VERSION does not point to a commit\"; exit 1; }",
-      "COMMIT=$(env GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 GIT_TERMINAL_PROMPT=0 git -C /tmp/ch-tag rev-parse --verify \"refs/tags/$VERSION^{commit}\")",
-      "[[ \"$COMMIT\" =~ ^[0-9a-f]{40}$ ]] && env GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 GIT_TERMINAL_PROMPT=0 git -C /tmp/ch-tag merge-base --is-ancestor \"$COMMIT\" refs/heads/main || { echo \"$VERSION ($COMMIT) is not on main\"; exit 1; }",
-      "if grep -qxF -e '-----BEGIN SSH SIGNATURE-----' /tmp/ch-tag.tag; then [ \"$(grep -cxF -e '-----BEGIN SSH SIGNATURE-----' /tmp/ch-tag.tag)\" = 1 ] || { echo \"$VERSION has more than one SSH signature\"; exit 1; }; env GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 GIT_TERMINAL_PROMPT=0 git -C /tmp/ch-tag -c gpg.format=ssh -c gpg.ssh.allowedSignersFile=/tmp/ch-tag.signers -c gpg.ssh.program=ssh-keygen verify-tag \"refs/tags/$VERSION\" || { echo \"$VERSION is not signed by a CoderHelm maintainer key (selfhost/maintainers.json)\"; exit 1; }; echo \"$VERSION is signed by a maintainer key\"; else [ \"$(grep -cxF -e '-----BEGIN CODERHELM RELEASE ATTESTATION-----' /tmp/ch-tag.tag)\" = 1 ] && [ \"$(grep -cxF -e '-----END CODERHELM RELEASE ATTESTATION-----' /tmp/ch-tag.tag)\" = 1 ] || { echo \"$VERSION has no SSH signature and no release attestation\"; exit 1; }; sed -n '/^-----BEGIN CODERHELM RELEASE ATTESTATION-----$/,/^-----END CODERHELM RELEASE ATTESTATION-----$/p' /tmp/ch-tag.tag | sed '1d;$d' | base64 -d > /tmp/ch-tag.bundle || { echo \"$VERSION's release attestation is not base64\"; exit 1; }; printf 'coderhelm-release-tag v1\\nrepository %s\\ntag %s\\ncommit %s\\n' CoderHelm/coderhelm-platform \"$VERSION\" \"$COMMIT\" > /tmp/ch-tag.statement; cosign verify-blob --bundle /tmp/ch-tag.bundle --certificate-identity \"https://github.com/CoderHelm/coderhelm-platform/.github/workflows/auto-release.yml@refs/heads/main\" --certificate-oidc-issuer https://token.actions.githubusercontent.com --certificate-github-workflow-repository CoderHelm/coderhelm-platform --certificate-github-workflow-ref refs/heads/main --certificate-github-workflow-sha \"$COMMIT\" /tmp/ch-tag.statement || { echo \"$VERSION's release attestation is not from auto-release.yml on main for this tag and commit\"; exit 1; }; echo \"$VERSION was released by auto-release.yml on main\"; fi",
-      "cosign verify-blob --bundle SHA256SUMS.sigstore.json --certificate-identity \"https://github.com/CoderHelm/coderhelm-platform/.github/workflows/release.yml@refs/tags/$VERSION\" --certificate-oidc-issuer https://token.actions.githubusercontent.com --certificate-github-workflow-repository CoderHelm/coderhelm-platform --certificate-github-workflow-ref \"refs/tags/$VERSION\" --certificate-github-workflow-sha \"$COMMIT\" SHA256SUMS",
-      "curl --proto =https --proto-redir =https --tlsv1.2 -fsSL -o coderhelm-selfhost.tgz \"$B/coderhelm-selfhost.tgz\"",
-      "grep ' coderhelm-selfhost.tgz$' SHA256SUMS | sha256sum -c -",
-      "npm install -g --ignore-scripts ./coderhelm-selfhost.tgz",
-      "coderhelm-selfhost pull --stage prod --region \"$AWS_REGION\"",
-      "EXTRA=\"\"; if [ \"$MODE\" = \"rollback\" ]; then EXTRA=\"--rollback\"; fi",
-      "if [ \"$MODE\" = \"domain\" ]; then coderhelm-selfhost domain apply --yes --require-signature --version \"$VERSION\" --action \"${DOMAIN_ACTION:-attach}\" --hostname \"${DOMAIN_HOSTNAME:-}\" --certificate-arn \"${DOMAIN_CERT:-}\" --zone \"${DOMAIN_ZONE:-}\" --zone-id \"${DOMAIN_ZONE_ID:-}\" --result-file /tmp/result.json; else coderhelm-selfhost update --to \"$VERSION\" --yes --require-signature --auto-rollback --actor \"$ACTOR\" --result-file /tmp/result.json $EXTRA; fi"
-     ]
-    },
-    "install": {
-     "commands": [
-      "set -euo pipefail",
-      "curl --proto =https --proto-redir =https --tlsv1.2 -fsSL -o /tmp/cosign https://github.com/sigstore/cosign/releases/download/v2.4.1/cosign-linux-amd64",
-      "echo \"8b24b946dd5809c6bd93de08033bcf6bc0ed7d336b7785787c080f574b89249b  /tmp/cosign\" | sha256sum -c -",
-      "install -m 0755 /tmp/cosign /usr/local/bin/cosign"
-     ],
-     "runtime-versions": {
-      "nodejs": 20
-     }
-    },
-    "post_build": {
-     "commands": [
-      "if [ ! -s /tmp/result.json ]; then echo \"{\\\"status\\\":\\\"failed\\\",\\\"reason\\\":\\\"the update build stopped before deploying: see its log\\\"}\" > /tmp/result.json; fi",
-      "node -e 'const r=require(\"/tmp/result.json\");process.stdout.write(JSON.stringify({action:\"finished\",history_id:process.env.HISTORY_ID,status:r.status,reason:r.reason,version:process.env.VERSION}))' > /tmp/payload.json",
-      "aws lambda invoke --function-name coderhelm-prod-updater --cli-binary-format raw-in-base64-out --payload file:///tmp/payload.json /tmp/out.json"
-     ]
-    }
-   },
-   "version": "0.2"
-  },
-  "ConcurrentBuildLimit": 1,
-  "Environment": {
-   "ComputeType": "BUILD_GENERAL1_SMALL",
-   "EnvironmentVariables": [
-    {
-     "Name": "VERSION",
-     "Type": "PLAINTEXT",
-     "Value": ""
-    },
-    {
-     "Name": "ACTOR",
-     "Type": "PLAINTEXT",
-     "Value": "auto"
-    },
-    {
-     "Name": "MODE",
-     "Type": "PLAINTEXT",
-     "Value": "update"
-    },
-    {
-     "Name": "HISTORY_ID",
-     "Type": "PLAINTEXT",
-     "Value": ""
-    },
-    {
-     "Name": "DOMAIN_ACTION",
-     "Type": "PLAINTEXT",
-     "Value": ""
-    },
-    {
-     "Name": "DOMAIN_HOSTNAME",
-     "Type": "PLAINTEXT",
-     "Value": ""
-    },
-    {
-     "Name": "DOMAIN_CERT",
-     "Type": "PLAINTEXT",
-     "Value": ""
-    },
-    {
-     "Name": "DOMAIN_ZONE",
-     "Type": "PLAINTEXT",
-     "Value": ""
-    },
-    {
-     "Name": "DOMAIN_ZONE_ID",
-     "Type": "PLAINTEXT",
-     "Value": ""
-    }
-   ],
-   "Image": "aws/codebuild/standard:7.0",
-   "ImagePullCredentialsType": "CODEBUILD",
-   "PrivilegedMode": false,
-   "Type": "LINUX_CONTAINER"
-  },
-  "ServiceRole": {
-   "Fn::GetAtt": [
-    "UpdateBuildRole067D9B2D",
-    "Arn"
-   ]
-  },
-  "TimeoutInMinutes": 90
- },
- "role:ReleaseCheckRole3A274ECC": {
-  "Properties": {
-   "AssumeRolePolicyDocument": {
-    "Statement": [
-     {
-      "Action": "sts:AssumeRole",
-      "Effect": "Allow",
-      "Principal": {
-       "Service": "codebuild.amazonaws.com"
-      }
-     }
-    ],
-    "Version": "2012-10-17"
-   },
-   "Description": "CoderHelm release check: verifies a release's signature and reads its model list; can only report to the updater",
-   "RoleName": "coderhelm-prod-release-check"
-  }
- },
- "role:UpdateBuildRole067D9B2D": {
-  "Properties": {
-   "AssumeRolePolicyDocument": {
-    "Statement": [
-     {
-      "Action": "sts:AssumeRole",
-      "Effect": "Allow",
-      "Principal": {
-       "Service": "codebuild.amazonaws.com"
-      }
-     }
-    ],
-    "Version": "2012-10-17"
-   },
-   "Description": "CoderHelm update build: deploys a release through the CDK bootstrap roles, checks health",
-   "RoleName": "coderhelm-prod-update-build"
-  }
- },
- "role:UpdaterServiceRole325F096F": {
-  "Properties": {
-   "AssumeRolePolicyDocument": {
-    "Statement": [
-     {
-      "Action": "sts:AssumeRole",
-      "Effect": "Allow",
-      "Principal": {
-       "Service": "lambda.amazonaws.com"
-      }
-     }
-    ],
-    "Version": "2012-10-17"
-   },
-   "ManagedPolicyArns": [
-    {
-     "Fn::Join": [
-      "",
-      [
-       "arn:",
-       {
-        "Ref": "AWS::Partition"
-       },
-       ":iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
-      ]
-     ]
-    }
-   ]
-  }
- }
 }

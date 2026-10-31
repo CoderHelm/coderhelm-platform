@@ -54,6 +54,10 @@ export interface AccessNames {
   secretName: string;
   /** The access stack (owned by an admin; updates never change it). */
   accessStackName: string;
+  /** The SES identity the install sends from: the only identity it may change (any when unset). */
+  emailIdentity?: string;
+  /** The Route 53 zone of the install's own domain: the only zone where it may change records other than certificate checks (any when unset). */
+  zoneId?: string;
 }
 
 export function partitionOf(region: string): string {
@@ -176,154 +180,132 @@ const POLICY_MANAGE = [
 ];
 
 /**
- * The services the boundary allows: what the install's functions, builds
- * and its deploy use (infra/test/access.test.ts checks every action in
- * every synthesized policy is in here).
+ * What the boundary allows on the install's own resources, by name: every
+ * action of these services on the names `ownResources` lists (S3 has its
+ * own statement: an object key is part of its ARN).
  */
-export const BOUNDARY_SERVICES = [
-  "acm:*",
-  "apigateway:*",
-  "bedrock:InvokeModel",
-  "bedrock:InvokeModelWithResponseStream",
-  "bedrock:Get*",
-  "bedrock:List*",
-  "cloudformation:*",
-  "cloudfront:*",
-  "cloudwatch:*",
-  "codebuild:*",
-  "cognito-idp:*",
-  "dynamodb:*",
-  "events:*",
-  "kms:*",
-  "lambda:*",
-  "logs:*",
-  "route53:*",
-  "s3:*",
-  "scheduler:*",
-  "secretsmanager:*",
-  "ses:*",
-  "sns:*",
-  "sqs:*",
-  "ssm:*",
-  "sts:AssumeRole",
-  "sts:GetCallerIdentity",
+export const OWN_SERVICES = [
+  "apigateway:*", "cloudformation:*", "cloudfront:*", "cloudwatch:*", "codebuild:*", "dynamodb:*", "events:*", "kms:*", "lambda:*", "logs:*",
+  "scheduler:*", "secretsmanager:*", "ses:*", "sns:*", "sqs:*", "ssm:*",
 ];
 
-/** The guardrails every CoderHelm policy repeats (boundary, deploy role, window). */
+/** AWS's account that publishes the Lambda Web Adapter layer the gateway uses. */
+const LAMBDA_ADAPTER_ACCOUNT = "753240598075";
+
+/** Services whose resources AWS names by id: allowed only on those carrying the install's tag. */
+export const TAGGED_SERVICES = ["acm:*", "cloudfront:*", "cognito-idp:*", "kms:*"];
+
+/**
+ * What the boundary allows on any resource: calls that take no resource
+ * (creating something new, lookups), reads of names and settings (never of
+ * data: no item, object, parameter value, secret value or function code),
+ * sending email, using a key the caller's own policy names, and models.
+ * infra/test/access.test.ts checks every action every synthesized role is
+ * given is allowed on the resources it names.
+ */
+export const ANYWHERE = [
+  "bedrock:InvokeModel*", "sts:GetCallerIdentity", "kms:Decrypt", "kms:Encrypt", "kms:GenerateDataKey*", "kms:DescribeKey", "kms:List*",
+  "ses:Send*", "ses:Get*", "ses:Describe*", "ses:*Template",
+  "cloudformation:Describe*", "cloudformation:List*", "cloudformation:GetTemplateSummary", "cloudformation:ValidateTemplate",
+  "cloudfront:CreateDistribution*", "cloudfront:CreateFunction", "cloudfront:*OriginAccessControl", "cloudfront:*ResponseHeadersPolicy",
+  "cognito-idp:CreateUserPool", "cognito-idp:DescribeUserPoolDomain", "dynamodb:Describe*", "logs:Describe*",
+  "secretsmanager:GetRandomPassword", "lambda:CreateEventSourceMapping", "route53:Get*", "route53:List*",
+  "acm:RequestCertificate", "acm:AddTagsToCertificate", "acm:Describe*", "acm:List*",
+];
+
+/** Every action the boundary allows somewhere (tests and docs read it). */
+export const BOUNDARY_SERVICES = [...OWN_SERVICES, "s3:*", ...TAGGED_SERVICES, ...ANYWHERE, "acm:DeleteCertificate", "route53:ChangeResourceRecordSets", "sts:AssumeRole"];
+
+/**
+ * The install's own resources by name, any service. After `coderhelm-<name>`
+ * every pattern needs a hyphen, a slash or the end, and a name has no hyphen,
+ * so none also covers another install's (coderhelm-prod2-*).
+ */
+export function ownResources(n: AccessNames): string[] {
+  const p = n.prefix;
+  return [
+    // stack/, table/, rule/, schedule/, project/, report-group/, dashboard/, configuration-set/, template/, alias/, function/ (CloudFront), log-group:/aws/lambda/.
+    `arn:*:*:*:*:*/${p}-*`,
+    // stack/<install>/<id>, table/<install> and its indexes, parameter/<install>/, dashboard/<install>.
+    `arn:*:*:*:*:*/${p}`, `arn:*:*:*:*:*/${p}/*`,
+    // function:, layer:, alarm:.
+    `arn:*:*:*:*:*:${p}-*`,
+    // Queues and topics.
+    `arn:*:*:*:*:${p}-*`,
+    "arn:*:lambda:*:*:event-source-mapping:*", `arn:*:lambda:*:${LAMBDA_ADAPTER_ACCOUNT}:layer:*`, "arn:*:cloudformation:*:aws:transform/*",
+    `arn:*:secretsmanager:*:*:secret:${n.secretName.replace(/\/secrets$/, "")}/*`,
+    `arn:*:ses:*:*:identity/${n.emailIdentity ?? "*"}`,
+    "arn:*:apigateway:*::/apis*", "arn:*:apigateway:*::/domainnames*", "arn:*:apigateway:*::/tags*",
+  ];
+}
+
+/**
+ * What the boundary refuses although its allows would cover it: the
+ * boundaries and the deploy role (named like the install's own roles), the
+ * access stack, the install's tag on a key, user pool or distribution that
+ * isn't already the install's, and roles in this account other than
+ * CoderHelm's two read roles. Everything the allows don't name (IAM users
+ * and keys, Organizations, CloudTrail, GuardDuty, instance commands, other
+ * resources in the account) is refused because nothing allows it.
+ */
 export function guardrails(n: AccessNames, otherBoundaries: string[] = []): Statement[] {
   const a = arns(n);
   // A native install's two boundaries (its own and the auto-update role's copy) as one pattern, to stay
   // within IAM's 6,144 characters: coderhelm-<name>-boundary-stack and coderhelm-<name>-deploy-boundary-stack.
-  const boundaries = n.boundaryArn.replace(/-boundary(-[a-z0-9]+)$/, "-*boundary$1");
+  const boundaries = otherBoundaries.length ? n.boundaryArn.replace(/-boundary(-[a-z0-9]+)$/, "-*boundary$1") : n.boundaryArn;
   for (const o of otherBoundaries) if (!new RegExp(`^${boundaries.replace(/[.$^{}()|[\]\\+?]/g, "\\$&").replace(/\*/g, ".*")}$`).test(o)) throw new Error(`${o} is not covered by ${boundaries}`);
   return [
     {
-      Sid: "NoIamUsersOrKeys",
+      // No role's boundary comes off, the boundary (and a native install's
+      // auto-update role's own copy) can't be edited or deleted, and no role
+      // can create a policy under either name. The first launch, turning
+      // auto-update on and a delete run with an admin's own permissions.
+      Sid: "TheBoundaryStays",
       Effect: "Deny",
-      Action: [
-        "iam:*User*", "iam:*AccessKey*", "iam:*LoginProfile*", "iam:*Group*", "iam:*ServiceSpecificCredential*", "iam:*SSHPublicKey*",
-        "iam:Create*Provider", "iam:UpdateAccountPasswordPolicy", "iam:CreateAccountAlias",
-      ],
-      Resource: "*",
-    },
-    {
-      Sid: "NoAccountGuardrailChanges",
-      Effect: "Deny",
-      Action: ["organizations:*", "account:*", "cloudtrail:*", "guardduty:*"],
-      Resource: "*",
-    },
-    {
-      // Nothing about IAM outside the install's own roles and policies.
-      Sid: "NoIamOutsideTheInstall",
-      Effect: "Deny",
-      Action: "iam:*",
-      NotResource: [a.role, a.policy],
-    },
-    {
-      Sid: "RolesOnlyWithTheBoundary",
-      Effect: "Deny",
-      Action: ROLE_WRITES,
-      Resource: "*",
-      Condition: { StringNotEquals: { "iam:PermissionsBoundary": n.boundaryArn } },
-    },
-    ...(otherBoundaries.length === 0
-      ? [{
-          // No role's boundary comes off, and the boundary itself can't be edited.
-          Sid: "TheBoundaryStays",
-          Effect: "Deny" as const,
-          Action: ["iam:DeleteRolePermissionsBoundary", "iam:CreatePolicyVersion", "iam:DeletePolicy", "iam:DeletePolicyVersion", "iam:SetDefaultPolicyVersion", "iam:TagPolicy", "iam:UntagPolicy"],
-          Resource: [n.boundaryArn, a.anyRoleHere],
-        }]
-      : [
-          {
-            // A native install: no role's boundary comes off, neither the boundary nor the auto-update
-            // role's own copy can be edited or deleted, and no role can create a policy under either name.
-            // The first launch, turning auto-update on and a delete run with an admin's own permissions.
-            Sid: "TheBoundaryStays",
-            Effect: "Deny" as const,
-            // CreatePolicy*: CreatePolicy, CreatePolicyVersion; DeletePolicy*: DeletePolicy, DeletePolicyVersion;
-            // SetDefault*: SetDefaultPolicyVersion; *agPolicy: TagPolicy, UntagPolicy.
-            Action: ["iam:DeleteRolePermissionsBoundary", "iam:CreatePolicy*", "iam:DeletePolicy*", "iam:SetDefault*", "iam:*agPolicy"],
-            Resource: [boundaries, a.anyRoleHere],
-          },
-        ]),
-    {
-      // Changes only to the install's own functions, stacks, buckets, secret
-      // and parameters (another function's code or a stack with an admin
-      // role would be a way out of this boundary). Reads and tags aside.
-      Sid: "OnlyTheInstallsOwn",
-      Effect: "Deny",
-      Action: [
-        "lambda:CreateF*", "lambda:CreateAlias", "lambda:Delete*", "lambda:Update*", "lambda:Invoke*", "lambda:Put*", "lambda:*Permission", "lambda:Publish*",
-        "cloudformation:Create*", "cloudformation:Update*", "cloudformation:Delete*", "cloudformation:Execute*", "cloudformation:Set*", "cloudformation:Continue*",
-        "s3:Put*", "s3:Delete*",
-        "secretsmanager:GetSecretValue", "secretsmanager:Put*", "secretsmanager:Update*", "secretsmanager:Delete*",
-        "ssm:Put*", "ssm:Delete*",
-      ],
-      NotResource: [
-        `arn:*:lambda:*:*:function:${n.prefix}-*`, `arn:*:lambda:*:*:layer:${n.prefix}-*`, "arn:*:lambda:*:*:event-source-mapping:*",
-        `arn:*:cloudformation:*:*:stack/${n.prefix}*`, "arn:*:cloudformation:*:aws:transform/*",
-        `arn:*:s3:::${n.prefix}-*`, "arn:*:s3:::coderhelm-setup-*",
-        `arn:*:secretsmanager:*:*:secret:${n.secretName.replace(/\/secrets$/, "")}/*`,
-        `arn:*:ssm:*:*:parameter/${n.prefix}/*`,
-      ],
-    },
-    {
-      Sid: "NoCommandsOnInstances",
-      Effect: "Deny",
-      Action: ["ssm:SendCommand", "ssm:Start*", "ssm:*Association*"],
-      Resource: "*",
+      // CreatePolicy*: CreatePolicy, CreatePolicyVersion; DeletePolicy*: DeletePolicy, DeletePolicyVersion;
+      // SetDefault*: SetDefaultPolicyVersion; *agPolicy: TagPolicy, UntagPolicy.
+      Action: ["iam:DeleteRolePermissionsBoundary", "iam:CreatePolicy*", "iam:DeletePolicy*", "iam:SetDefault*", "iam:*agPolicy"],
+      Resource: [boundaries, a.anyRoleHere],
     },
     {
       // The deploy role is the admin's: no release changes it.
       Sid: "TheDeployRoleStays",
       Effect: "Deny",
-      Action: [...ROLE_WRITES, "iam:DeleteRole", "iam:UpdateRole", "iam:UpdateAssumeRolePolicy", "iam:TagRole", "iam:UntagRole"],
+      // Create*, Put*, Attach*, Detach*, Delete*, Update*: every change; *agRole: TagRole, UntagRole.
+      Action: ["iam:Create*", "iam:Put*", "iam:Attach*", "iam:Detach*", "iam:Delete*", "iam:Update*", "iam:*agRole"],
       Resource: n.deployRoleArn,
     },
+    ...(otherBoundaries.length
+      ? []
+      : [{
+          // The access stack (boundary and deploy role) changes only by an admin (a native install has none).
+          Sid: "TheAccessStackStays",
+          Effect: "Deny" as const,
+          Action: ["cloudformation:CreateChangeSet", "cloudformation:ExecuteChangeSet", "cloudformation:UpdateStack", "cloudformation:DeleteStack", "cloudformation:CreateStack", "cloudformation:SetStackPolicy"],
+          Resource: a.accessStack,
+        }]),
     {
-      // The access stack (boundary and deploy role) changes only by an admin.
-      Sid: "TheAccessStackStays",
+      // A key, user pool or distribution comes under the boundary only by
+      // the install's tag: no role may put that tag on (or take it off) one
+      // that isn't already the install's.
+      Sid: "OnlyTheInstallsTagged",
       Effect: "Deny",
-      Action: ["cloudformation:CreateChangeSet", "cloudformation:ExecuteChangeSet", "cloudformation:UpdateStack", "cloudformation:DeleteStack", "cloudformation:CreateStack", "cloudformation:SetStackPolicy"],
-      Resource: a.accessStack,
+      // *agResource: TagResource, UntagResource.
+      Action: ["kms:*agResource", "cognito-idp:*agResource", "cloudfront:*agResource"],
+      Resource: ["arn:*:kms:*:*:key/*", "arn:*:cognito-idp:*:*:userpool/*", "arn:*:cloudfront::*:distribution/*"],
+      Condition: { StringNotEquals: { [`aws:ResourceTag/${INSTALL_TAG}`]: n.prefix } },
     },
+    // CoderHelm never exports a certificate's private key.
+    { Sid: "NoCertificateExport", Effect: "Deny", Action: "acm:ExportCertificate", Resource: "*" },
     {
-      // Other roles in this account (the CDK bootstrap's, the deploy role,
-      // the install's own, yours) can't be assumed. The one exception is
-      // CoderHelm's two read roles, by exact name (the next two statements).
+      // Roles in this account (the CDK bootstrap's, the deploy role, the
+      // install's own, yours) can't be assumed. The one exception is
+      // CoderHelm's two read roles, by exact name.
       Sid: "NoOtherRolesHere",
       Effect: "Deny",
-      Action: ROLE_SESSION_ACTIONS,
+      Action: "sts:AssumeRole",
       NotResource: a.ownReadRoles,
       Condition: { StringEquals: { "aws:ResourceAccount": n.account } },
-    },
-    {
-      // On the read roles: sts:AssumeRole only, no other STS action.
-      Sid: "ReadRolesHereAssumeOnly",
-      Effect: "Deny",
-      Action: ROLE_SESSION_ACTIONS.filter((x) => x !== "sts:AssumeRole"),
-      Resource: a.ownReadRoles,
     },
     {
       // And only by the gateway's and the worker's roles (their tag; a role
@@ -354,12 +336,31 @@ export function guardrails(n: AccessNames, otherBoundaries: string[] = []): Stat
  */
 export function boundaryPolicy(n: AccessNames, otherBoundaries: string[] = []): PolicyDocument {
   const a = arns(n);
+  const p = n.prefix;
   return doc([
-    { Sid: "CoderHelmServices", Effect: "Allow", Action: BOUNDARY_SERVICES, Resource: "*" },
+    { Sid: "InstallResources", Effect: "Allow", Action: OWN_SERVICES, Resource: ownResources(n) },
+    { Sid: "InstallBuckets", Effect: "Allow", Action: "s3:*", Resource: [`arn:*:s3:::${p}-*`, "arn:*:s3:::coderhelm-setup-*"] },
+    { Sid: "InstallTagged", Effect: "Allow", Action: TAGGED_SERVICES, Resource: "*", Condition: { StringEquals: { [`aws:ResourceTag/${INSTALL_TAG}`]: p } } },
+    // Created with the install's tag (AWS checks the tag as it creates them).
+    { Sid: "CreateTagged", Effect: "Allow", Action: ["kms:CreateKey", "kms:TagResource", "cognito-idp:TagResource", "cloudfront:TagResource"], Resource: "*", Condition: { StringEquals: { [`aws:RequestTag/${INSTALL_TAG}`]: p } } },
+    // The certificates the updater requested for the install's own domain (tagged coderhelm=<install>).
+    { Sid: "Certificates", Effect: "Allow", Action: "acm:DeleteCertificate", Resource: "*", Condition: { StringEquals: { "aws:ResourceTag/coderhelm": p } } },
+    { Sid: "Anywhere", Effect: "Allow", Action: ANYWHERE, Resource: "*" },
+    // DNS: the install's own zone; elsewhere only the CNAME a certificate check uses (its name starts with an underscore).
+    { Sid: "InstallZone", Effect: "Allow", Action: "route53:ChangeResourceRecordSets", Resource: `arn:*:route53:::hostedzone/${n.zoneId ?? "*"}` },
+    {
+      Sid: "CertificateRecords",
+      Effect: "Allow",
+      Action: "route53:ChangeResourceRecordSets",
+      Resource: "*",
+      Condition: { "ForAllValues:StringLike": { "route53:ChangeResourceRecordSetsNormalizedRecordNames": ["_*"] }, "ForAllValues:StringEquals": { "route53:ChangeResourceRecordSetsRecordTypes": ["CNAME"] } },
+    },
+    // CoderHelm's two read roles, in any account (the guardrails narrow them in this one).
+    { Sid: "ReadRoles", Effect: "Allow", Action: "sts:AssumeRole", Resource: [`arn:*:iam::*:role/${OWN_READ_ROLES[0]}`, `arn:*:iam::*:role/${OWN_READ_ROLES[1]}*`] },
     { Sid: "InstallRoleWrites", Effect: "Allow", Action: ROLE_WRITES, Resource: a.role, Condition: { StringEquals: { "iam:PermissionsBoundary": n.boundaryArn } } },
     // The same calls as ROLE_MANAGE and POLICY_MANAGE, shorter (the boundary must fit IAM's 6,144 characters).
-    { Sid: "InstallRoles", Effect: "Allow", Action: ["iam:Get*", "iam:List*", "iam:DeleteRole", "iam:UpdateRole*", "iam:UpdateAssumeRolePolicy", "iam:TagRole", "iam:UntagRole", "iam:PassRole"], Resource: a.role },
-    { Sid: "InstallPolicies", Effect: "Allow", Action: ["iam:CreatePolicy*", "iam:DeletePolicy*", "iam:Get*", "iam:List*", "iam:TagPolicy", "iam:UntagPolicy"], Resource: a.policy },
+    { Sid: "InstallRoles", Effect: "Allow", Action: ["iam:Get*", "iam:List*", "iam:DeleteRole", "iam:Update*", "iam:*agRole", "iam:PassRole"], Resource: a.role },
+    { Sid: "InstallPolicies", Effect: "Allow", Action: ["iam:CreatePolicy*", "iam:DeletePolicy*", "iam:Get*", "iam:List*", "iam:*agPolicy"], Resource: a.policy },
     ...guardrails(n, otherBoundaries),
   ]);
 }
@@ -418,7 +419,7 @@ export function deployPolicy(n: AccessNames): PolicyDocument {
       Sid: "Email",
       Effect: "Allow",
       Action: "ses:*",
-      Resource: [`${a.at("ses")}:configuration-set/${p}-*`, `${a.at("ses")}:template/${p}-*`, `${a.at("ses")}:identity/*`],
+      Resource: [`${a.at("ses")}:configuration-set/${p}-*`, `${a.at("ses")}:template/${p}-*`, `${a.at("ses")}:identity/${n.emailIdentity ?? "*"}`],
     },
     // CloudFormation's email template handler may use SES's first API, whose
     // template calls take no resource ARN (AWS checks them against "*").
@@ -465,7 +466,8 @@ export function deployPolicy(n: AccessNames): PolicyDocument {
     },
     { Sid: "CertificatesRequest", Effect: "Allow", Action: ["acm:RequestCertificate", "acm:AddTagsToCertificate"], Resource: "*", Condition: { StringEquals: { [`aws:RequestTag/${INSTALL_TAG}`]: p } } },
     { Sid: "Certificates", Effect: "Allow", Action: "acm:*", Resource: `arn:${n.partition}:acm:*:${n.account}:certificate/*`, Condition: tagged },
-    { Sid: "DnsRecords", Effect: "Allow", Action: ["route53:ChangeResourceRecordSets", "route53:GetChange"], Resource: [`arn:${n.partition}:route53:::hostedzone/*`, `arn:${n.partition}:route53:::change/*`] },
+    // Records only in the install's own domain's zone (a native install's DomainZoneId).
+    { Sid: "DnsRecords", Effect: "Allow", Action: ["route53:ChangeResourceRecordSets", "route53:GetChange"], Resource: [`arn:${n.partition}:route53:::hostedzone/${n.zoneId ?? "*"}`, `arn:${n.partition}:route53:::change/*`] },
     // The deploy role carries the boundary too, whose guardrails deny the rest.
     { Sid: "NoIamUsersOrKeys", Effect: "Deny", Action: ["iam:CreateUser", "iam:CreateAccessKey", "iam:CreateLoginProfile"], Resource: "*" },
     { Sid: "NoKeyDestruction", Effect: "Deny", Action: ["kms:ScheduleKeyDeletion", "kms:DisableKey", "kms:DeleteImportedKeyMaterial"], Resource: "*" },

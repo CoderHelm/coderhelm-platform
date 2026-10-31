@@ -650,14 +650,16 @@ const fs = require("fs"), os = require("os"), path = require("path");
 const { buildNative } = require("./dist/lib/native/build");
 const { resolveValue, prodValues } = require("./dist/lib/native/resolve");
 const { accessNames, boundaryPolicy } = require("./dist/lib/access");
-const { deployRolePolicy, helperPolicy } = require("./dist/lib/native/parent");
+const { deployRolePolicy, helperPolicy, nativeNames } = require("./dist/lib/native/parent");
 const [ACCT, REG] = process.argv.slice(1);
 const STUBS = fs.mkdtempSync(path.join(os.tmpdir(), "chsimn-"));
 for (const d of ["gateway", "worker", "mcp"]) { fs.mkdirSync(path.join(STUBS, d), { recursive: true }); fs.writeFileSync(path.join(STUBS, d, d === "mcp" ? "handler.js" : "bootstrap"), "stub"); }
 fs.mkdirSync(path.join(STUBS, "dash"), { recursive: true }); fs.writeFileSync(path.join(STUBS, "dash", "index.html"), "x");
 process.env.GATEWAY_ZIP = path.join(STUBS, "gateway"); process.env.WORKER_ZIP = path.join(STUBS, "worker"); process.env.MCP_PROXY_DIR = path.join(STUBS, "mcp");
 const rel = buildNative("v0.0.0", fs.mkdtempSync(path.join(os.tmpdir(), "chsimrel-")), { dashboardDir: path.join(STUBS, "dash") });
-const values = prodValues(ACCT, REG);
+// The sender address and a domain zone, as the boundary and the auto-update role name them.
+const values = { ...prodValues(ACCT, REG), DomainZoneId: "Z0123456789EXAMPLE" };
+values.EmailIdentity = values.EmailFromResolved;
 const stackOf = (part) => "coderhelm-prod-" + part.replace(/([a-z])([A-Z])/g, "$1-$2").toLowerCase();
 const imports = {};
 for (const [part, t] of Object.entries(rel.children)) {
@@ -675,9 +677,9 @@ for (const [part, t] of Object.entries(rel.children)) {
 }
 // The parent's own roles and policies, as one more part.
 out.templates.native["coderhelm-prod"] = { template: resolveValue({ Resources: Object.fromEntries(Object.entries(rel.parent.Resources).filter(([, r]) => r.Type.startsWith("AWS::"))) }, { values }), tags: {} };
-const n = accessNames({ account: ACCT, region: REG, prefix: "coderhelm-prod", suffix: "-" + ACCT, secretName: "coderhelm/prod/secrets", id: "stack" });
+const n = { ...accessNames({ account: ACCT, region: REG, prefix: "coderhelm-prod", suffix: "-" + ACCT, secretName: "coderhelm/prod/secrets", id: "stack" }), emailIdentity: values.EmailIdentity, zoneId: values.DomainZoneId };
 out.names = n;
-out.deploy = resolveValue(deployRolePolicy(accessNames({ partition: "${AWS::Partition}", account: "${AWS::AccountId}", region: "${AWS::Region}", prefix: "coderhelm-${Stage}", suffix: "-${AWS::AccountId}", secretName: "coderhelm/${Stage}/secrets", id: "stack" })).Statement.map((s) => JSON.parse(JSON.stringify(s).replace(/"([^"]*\$\{[^"]*)"/g, (m, x) => JSON.stringify({ "Fn::Sub": x })))), { values });
+out.deploy = resolveValue(deployRolePolicy(nativeNames()).Statement.map((s) => JSON.parse(JSON.stringify(s).replace(/"([^"]*\$\{[^"]*)"/g, (m, x) => JSON.stringify({ "Fn::Sub": x })))), { values });
 out.deploy = { Version: "2012-10-17", Statement: out.deploy };
 out.boundary = boundaryPolicy(n, ["arn:aws:iam::" + ACCT + ":policy/coderhelm-prod-deploy-boundary-stack"]);
 const helper = helperPolicy();

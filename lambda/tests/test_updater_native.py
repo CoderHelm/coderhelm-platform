@@ -94,9 +94,15 @@ class FakeCfn:
     def delete_change_set(self, ChangeSetName, StackName):
         self.deleted.append(ChangeSetName)
 
-    def describe_change_set(self, ChangeSetName, StackName=None):
+    def describe_change_set(self, ChangeSetName, StackName=None, IncludePropertyValues=False, NextToken=None):
+        self.described = getattr(self, "described", []) + [(ChangeSetName, IncludePropertyValues, NextToken)]
         if ChangeSetName in self.nested:
-            return self.nested[ChangeSetName]
+            page = self.nested[ChangeSetName]
+            # A nested change set given as a list of pages: NextToken is the page's index.
+            if isinstance(page, list):
+                i = int(NextToken or 0)
+                return dict(page[i], **({"NextToken": str(i + 1)} if i + 1 < len(page) else {}))
+            return page
         return dict({"ChangeSetName": "cs", "ChangeSetId": ChangeSetName, "StackId": "arn:stack/coderhelm-prod/abc", "Changes": [
             {"ResourceChange": {"Action": "Modify", "LogicalResourceId": "Api", "ResourceType": "AWS::CloudFormation::Stack", "Replacement": "False", "ChangeSetId": "nested-api"}},
             {"ResourceChange": {"Action": "Add", "LogicalResourceId": "NewThing", "ResourceType": "AWS::SQS::Queue"}},
@@ -107,6 +113,23 @@ class FakeCfn:
 
     def describe_stack_events(self, StackName):
         return {"StackEvents": self.events}
+
+
+class FakeCodeBuild:
+    """CodeBuild's own record of each release check build."""
+
+    def __init__(self):
+        self.builds = {}
+
+    def finish(self, build_id, status="SUCCEEDED", version="v1.1.0", template=None, models="none", project="coderhelm-prod-release-check"):
+        self.builds[build_id] = {
+            "id": build_id, "buildStatus": status, "projectName": project,
+            "environment": {"environmentVariables": [{"name": "VERSION", "value": version}]},
+            "exportedEnvironmentVariables": [{"name": "TEMPLATE_SHA256", "value": template or ""}, {"name": "MODELS_SHA256", "value": models}],
+        }
+
+    def batch_get_builds(self, ids):
+        return {"builds": [self.builds[i] for i in ids if i in self.builds]}
 
 
 def opener_for(body):
@@ -269,17 +292,62 @@ class Native(unittest.TestCase):
         self.assertEqual(keys["DomainZoneId"]["ParameterValue"], "Z1")
 
     def test_models_verified_keeps_the_template_sha(self):
-        u._clients["lambda"] = None
-        self._mc = u.model_check
+        env = dict(ENV, RELEASE_CHECK_PROJECT_NAME="coderhelm-prod-release-check")
+        self._mc, self._nb = u.model_check, u.notify_blocked
         u.model_check = lambda *a, **k: {}
         u.notify_blocked = lambda *a, **k: None
+        cb = FakeCodeBuild()
+        u._clients["codebuild"] = cb
         try:
-            u.handle({"action": "models_verified", "version": "v1.1.0", "status": "verified", "manifest": None, "template_sha256": SHA}, ENV, self.store, NOW)
+            self.store.put("UPDATE_STATE", {"verifying": {"version": "v1.1.0", "at": NOW.isoformat(), "build": "c-1"}})
+            r = u.handle({"action": "models_verified", "version": "v1.1.0", "build": "c-1", "status": "verified", "manifest_text": None, "template_sha256": SHA}, env, self.store, NOW)
+            self.assertEqual(r["verified"], "pending")
+            self.assertIsNone(self.store.get("MANIFEST#v1.1.0"))
+            cb.finish("c-1", template=SHA)
+            u.handle({"action": "status"}, env, self.store, NOW, fetch=lambda repo: [])
+            self.assertEqual(self.store.get("MANIFEST#v1.1.0")["template_sha256"], SHA)
+            self.assertEqual(self.store.get("MANIFEST#v1.1.0")["build"], "c-1")
+            with self.assertRaises(ValueError):
+                u.handle({"action": "models_verified", "version": "v1.1.0", "build": "c-1", "status": "verified", "template_sha256": "nope"}, env, self.store, NOW)
         finally:
-            u.model_check = self._mc
-        self.assertEqual(self.store.get("MANIFEST#v1.1.0")["template_sha256"], SHA)
-        with self.assertRaises(ValueError):
-            u.handle({"action": "models_verified", "version": "v1.1.0", "status": "verified", "template_sha256": "nope"}, ENV, self.store, NOW)
+            u.model_check, u.notify_blocked = self._mc, self._nb
+            u._clients.pop("codebuild", None)
+
+    def test_a_template_checksum_the_build_didnt_export_is_never_believed(self):
+        # Whoever else may invoke the updater can send a report, but not CodeBuild's record of the build.
+        env = dict(ENV, RELEASE_CHECK_PROJECT_NAME="coderhelm-prod-release-check")
+        cb = FakeCodeBuild()
+        u._clients["codebuild"] = cb
+        try:
+            self.store.put("UPDATE_STATE", {"verifying": {"version": "v1.1.0", "at": NOW.isoformat(), "build": "c-1"}})
+            u.handle({"action": "models_verified", "version": "v1.1.0", "build": "c-1", "status": "verified", "manifest_text": None, "template_sha256": "a" * 64}, env, self.store, NOW)
+            cb.finish("c-1", template=SHA)
+            with self.assertLogs(u.logger, "WARNING") as logs:
+                u.handle({"action": "status"}, env, self.store, NOW, fetch=lambda repo: [])
+            self.assertIn("template checksum isn't the one the build exported", "\n".join(logs.output))
+            self.assertIsNone(self.store.get("MANIFEST#v1.1.0"))
+        finally:
+            u._clients.pop("codebuild", None)
+
+    def test_a_domain_change_keeps_the_running_release(self):
+        self.verified("v1.1.0")
+        with self.assertRaisesRegex(ValueError, "keeps the running release"):
+            u.native_propose(self.store, ENV, "v1.1.0", "domain", {"DOMAIN_ACTION": "attach", "DOMAIN_HOSTNAME": "x.example.com"})
+        self.assertEqual(self.cfn.created, [])
+
+    def test_a_rollback_only_goes_to_a_release_this_install_ran(self):
+        self.store.put("MANIFEST#v0.9.0", {"verified": True, "template_sha256": SHA})
+        with self.assertRaisesRegex(ValueError, "not a version this install ran"):
+            u.native_propose(self.store, ENV, "v0.9.0", "rollback")
+        self.assertEqual(self.cfn.created, [])
+        self.store.put("UPDATE_STATE", {"ran_versions": ["v0.9.0"]})
+        u.native_propose(self.store, ENV, "v0.9.0", "rollback")
+        self.assertEqual(len(self.cfn.created), 1)
+
+    def test_an_unknown_kind_of_change_is_refused(self):
+        self.verified()
+        with self.assertRaisesRegex(ValueError, "unknown change"):
+            u.native_propose(self.store, ENV, "v1.1.0", "sideways")
 
     def test_only_release_urls_are_fetched(self):
         with self.assertRaises(ValueError):
@@ -437,3 +505,83 @@ class AdminOnlyChanges(unittest.TestCase):
         cs = {"Changes": [{"ResourceChange": {"Action": "Modify", "LogicalResourceId": "Boundary"}},
                           {"ResourceChange": {"Action": "Modify", "LogicalResourceId": "Api"}}]}
         self.assertEqual(u.admin_changes(cs), ["Boundary (Modify)"])
+
+
+class PermissionChanges(unittest.TestCase):
+    """Auto-update never applies a change to who may do what, in the parent
+    or any part: an admin reads it first. Read with property values, every
+    page of every nested change set."""
+
+    def setUp(self):
+        self.store = u.Store(FakeDynamo(), "t")
+        self.cfn = FakeCfn()
+        u._clients["cloudformation"] = self.cfn
+        u._clients["lambda"] = FakeLambda()
+        self._fetch, self._notify = u.fetch_template, u.notify
+        u.fetch_template = lambda url, opener=None: TEMPLATE
+        u.notify = lambda *a, **k: None
+        self.env = dict(ENV, DEPLOY_ROLE_ARN="arn:aws:iam::1:role/coderhelm-prod-deploy-stack")
+        self.store.put("MANIFEST#v1.1.0", {"verified": True, "manifest": None, "template_sha256": SHA})
+
+    def tearDown(self):
+        u.fetch_template, u.notify = self._fetch, self._notify
+        u._clients.pop("cloudformation", None)
+        u._clients.pop("lambda", None)
+
+    def poll_with(self, *api_pages):
+        self.cfn.nested["nested-api"] = list(api_pages)
+        u.begin(self.store, self.env, NOW, "v1.1.0", "auto", "update")
+        self.cfn.cs = {"Status": "CREATE_COMPLETE", "ExecutionStatus": "AVAILABLE"}
+        return u.native_poll(self.store, self.env, NOW)
+
+    @staticmethod
+    def change(t, action="Modify", before=None, after=None, name="Thing"):
+        rc = {"Action": action, "ResourceType": t, "LogicalResourceId": name, "Replacement": "False"}
+        if before is not None:
+            rc["BeforeContext"] = json.dumps({"Properties": before})
+        if after is not None:
+            rc["AfterContext"] = json.dumps({"Properties": after})
+        return {"ResourceChange": rc}
+
+    def test_a_new_or_changed_role_in_a_part_is_held(self):
+        r = self.poll_with({"Changes": [self.change("AWS::IAM::Role", "Add", name="NewRole")]})
+        self.assertEqual(r["native"], "review")
+        self.assertEqual(self.cfn.executed, [])
+
+    def test_a_resource_policy_property_is_held(self):
+        r = self.poll_with({"Changes": [self.change("AWS::KMS::Key", before={"KeyPolicy": {"a": 1}}, after={"KeyPolicy": {"a": 2}})]})
+        self.assertEqual(r["native"], "review")
+        self.assertEqual(self.cfn.executed, [])
+
+    def test_a_function_permission_is_held(self):
+        r = self.poll_with({"Changes": [self.change("AWS::Lambda::Permission", "Add")]})
+        self.assertEqual(r["native"], "review")
+
+    def test_a_change_on_the_second_page_is_found(self):
+        r = self.poll_with({"Changes": [self.change("AWS::SQS::Queue")]}, {"Changes": [self.change("AWS::IAM::Policy", name="Late")]})
+        self.assertEqual(r["native"], "review")
+        self.assertIn(("nested-api", True, "1"), self.cfn.described)
+
+    def test_every_page_is_read_with_property_values(self):
+        self.poll_with({"Changes": []})
+        # The parent's change set and the part's, each read with its before and after values.
+        read = {cid for cid, include, _ in self.cfn.described if include}
+        self.assertEqual(read, {"arn:cs/1", "nested-api"})
+
+    def test_an_ordinary_change_still_applies_by_itself(self):
+        r = self.poll_with({"Changes": [self.change("AWS::Lambda::Function", before={"MemorySize": 512}, after={"MemorySize": 1024})]})
+        self.assertEqual(r["native"], "executing")
+        self.assertEqual(self.cfn.executed, ["arn:cs/1"])
+
+    def test_principals(self):
+        same = {"Principal": {"Service": "lambda.amazonaws.com"}}
+        self.assertEqual(u.permission_change({"Action": "Modify", "ResourceType": "AWS::X::Y",
+                                              "BeforeContext": json.dumps({"Properties": {}}),
+                                              "AfterContext": json.dumps({"Properties": {"Statement": [same]}})}), "")
+        why = u.permission_change({"Action": "Modify", "ResourceType": "AWS::X::Y",
+                                   "BeforeContext": json.dumps({"Properties": {}}),
+                                   "AfterContext": json.dumps({"Properties": {"Statement": [{"Principal": {"AWS": "arn:aws:iam::999:root"}}]}})})
+        self.assertIn("AWS:arn:aws:iam::999:root", why)
+        self.assertIn("*:*", u.permission_change({"Action": "Add", "ResourceType": "AWS::X::Y", "AfterContext": {"Properties": {"S": [{"Principal": "*"}]}}}))
+        # A removal never widens anything.
+        self.assertEqual(u.permission_change({"Action": "Remove", "ResourceType": "AWS::IAM::Role"}), "")

@@ -24,8 +24,14 @@
 #     main: changes only through a pull request with an approving review and
 #     passing checks, signed commits, no force pushes, no deletion.
 #   CoderHelm/coderhelm-platform also:
-#     v* tags: signed commits, never updated, moved or deleted; only admins
-#       and GitHub Actions (auto-release.yml) create one.
+#     v* tags: signed commits, never updated, moved or deleted. Who may
+#       create one is not limited here: GitHub refuses GitHub Actions as a
+#       bypass actor on an organization's repository ruleset (422, "Actor
+#       GitHub Actions integration must be part of the ruleset source or
+#       owner organization"), and auto-release.yml creates the tag with the
+#       workflow token. An install accepts only a tag signed by a maintainer
+#       or attested by auto-release.yml on main, so a tag made any other way
+#       installs nothing.
 #     the "release" environment: a listed reviewer approves every run, only v*
 #       tags may deploy to it, admins can't skip the approval (releases cut
 #       by hand).
@@ -70,7 +76,6 @@ api() { gh api -H "Accept: application/vnd.github+json" -H "X-GitHub-Api-Version
 
 RS_MAIN="main: pull requests, checks, signed"
 RS_TAGS="release tags: signed, never moved or deleted"
-RS_TAG_CREATE="release tags: only admins and auto-release create"
 
 admins() { # bypass mode
   jq -n --arg m "$1" '[{actor_type: "OrganizationAdmin", actor_id: 1, bypass_mode: $m}, {actor_type: "RepositoryRole", actor_id: 5, bypass_mode: $m}]'
@@ -110,28 +115,6 @@ tags_ruleset() {
     name: $name, target: "tag", enforcement: "active",
     conditions: {ref_name: {include: ["refs/tags/v*"], exclude: []}},
     rules: [{type: "update"}, {type: "deletion"}, {type: "non_fast_forward"}, {type: "required_signatures"}],
-    bypass_actors: $bypass
-  }'
-}
-
-# Creating a v* tag is blocked for everyone but admins and GitHub Actions
-# (the bypass), who are still held to the ruleset above: never moved
-# afterwards. GitHub Actions is there for auto-release.yml, which creates the
-# tag with the workflow token. GitHub can't narrow that to one workflow, so
-# any workflow given contents: write could create a v* tag; such a tag gets
-# nothing installed (installs require a maintainer's signature or
-# auto-release.yml's attestation from main), no approval-free publish of the
-# templates or latest.json (the AWS roles trust release.yml in "release" or
-# auto-release.yml on main in "release-auto"), and auto-release.yml ignores
-# tags that aren't on main. 15368 is the GitHub Actions app.
-GITHUB_ACTIONS_APP=15368
-tag_create_ruleset() {
-  local bypass
-  bypass=$(admins always | jq --argjson app "$GITHUB_ACTIONS_APP" '. + [{actor_type: "Integration", actor_id: $app, bypass_mode: "always"}]')
-  jq -n --arg name "$RS_TAG_CREATE" --argjson bypass "$bypass" '{
-    name: $name, target: "tag", enforcement: "active",
-    conditions: {ref_name: {include: ["refs/tags/v*"], exclude: []}},
-    rules: [{type: "creation"}],
     bypass_actors: $bypass
   }'
 }
@@ -231,7 +214,6 @@ if [ "$MODE" = check ]; then
   echo "$PLATFORM"
   check_ruleset "$PLATFORM" "$(main_ruleset "${PLATFORM_CHECKS[@]}")"
   check_ruleset "$PLATFORM" "$(tags_ruleset)"
-  check_ruleset "$PLATFORM" "$(tag_create_ruleset)"
   check_repo_basics "$PLATFORM"
   check_environment
   check_auto_environment
@@ -264,9 +246,9 @@ ruleset "$DASHBOARD" "$(main_ruleset "${DASHBOARD_CHECKS[@]}")"
 
 # 2. Release tags.
 ruleset "$PLATFORM" "$(tags_ruleset)"
-ruleset "$PLATFORM" "$(tag_create_ruleset)"
-# The rulesets the first version of this script made, replaced by the two above.
-for old in "release tags: never moved or deleted" "release tags: admins create, signed" "release tags: only admins create"; do
+# The rulesets earlier versions of this script made, replaced by the one above
+# (GitHub refuses the creation rule with GitHub Actions as its bypass, see the top).
+for old in "release tags: never moved or deleted" "release tags: admins create, signed" "release tags: only admins create" "release tags: only admins and auto-release create"; do
   id=$(api "repos/$PLATFORM/rulesets" --jq ".[] | select(.name == \"$old\") | .id")
   if [ -n "$id" ]; then
     api -X DELETE "repos/$PLATFORM/rulesets/$id" >/dev/null
