@@ -1394,6 +1394,295 @@ def close_window(env, iam=None):
         return False
 
 
+
+# ── Native releases: an update is a stack update ──────────────────────────
+#
+# A native install (NATIVE_STACK set) is one parent CloudFormation stack.
+# An update proposes a change set on it to the release's parent template:
+# only after the release check reported the template's sha256 from the
+# signed SHA256SUMS (models_verified), and only when the template downloaded
+# from the release's write-once URL matches it. Without DEPLOY_ROLE_ARN
+# (auto-update off) the change set waits for an admin to review and execute
+# it in the console; with it, the updater executes it through that role.
+# native_poll (every 5 minutes) follows it to the end and reports it like a
+# finished build. Every reason comes from CloudFormation's own words.
+
+NATIVE_CAPABILITIES = ["CAPABILITY_IAM", "CAPABILITY_NAMED_IAM", "CAPABILITY_AUTO_EXPAND"]
+NATIVE_HOST = "coderhelm-public.s3.amazonaws.com"
+
+
+def is_native(env):
+    return bool(env.get("NATIVE_STACK"))
+
+
+def native_template_url(env, version):
+    base = (env.get("NATIVE_TEMPLATE_BASE") or f"https://{NATIVE_HOST}/launch").rstrip("/")
+    return f"{base}/{version}/{env.get('NATIVE_TEMPLATE_FILE') or 'coderhelm.json'}"
+
+
+def fetch_template(url, opener=None):
+    if not url.startswith(f"https://{NATIVE_HOST}/launch/v"):
+        raise ValueError(f"not a CoderHelm release template: {url}")
+    req = urllib.request.Request(url, headers={"User-Agent": "coderhelm-updater"})
+    with (opener or urllib.request.urlopen)(req, timeout=20) as r:
+        return r.read()
+
+
+def native_parameters(stack, template, overrides=None):
+    """Every parameter the new template declares: an override, else the
+    stack's current value, else the new template's default."""
+    overrides = overrides or {}
+    have = {p["ParameterKey"] for p in stack.get("Parameters") or []}
+    out = []
+    for key in sorted((template.get("Parameters") or {}).keys()):
+        if key in overrides:
+            out.append({"ParameterKey": key, "ParameterValue": str(overrides[key])})
+        elif key in have:
+            out.append({"ParameterKey": key, "UsePreviousValue": True})
+    return out
+
+
+def native_propose(store, env, version, mode, extra=None, cfn=None, opener=None):
+    """Creates the change set. Returns {change_set_id, apply}."""
+    cfn = cfn or client("cloudformation")
+    url = native_template_url(env, version)
+    body = fetch_template(url, opener)
+    rec = store.get(f"MANIFEST#{version}") or {}
+    want = rec.get("template_sha256")
+    if not want:
+        # Every change set, a domain move included, is made only from a template the release check verified.
+        if mode == "domain":
+            start_verify(store, env, datetime.now(timezone.utc), version)
+        raise ValueError(f"{version}'s stack template isn't verified yet (its release check reports it); try again in a few minutes")
+    got = hashlib.sha256(body).hexdigest()
+    if got != want:
+        raise ValueError(f"{version}'s stack template doesn't match its signed checksum, so it was not proposed")
+    current = env.get("CODERHELM_VERSION", "")
+    if mode == "update" and parse_version(current) and compare(version, current) < 0:
+        raise ValueError(f"{version} is older than {current}: going back is a rollback")
+    template = json.loads(body)
+    stack = cfn.describe_stacks(StackName=env["NATIVE_STACK"])["Stacks"][0]
+    overrides = {}
+    if mode == "domain" and extra:
+        attach = extra.get("DOMAIN_ACTION") != "remove"
+        overrides = {
+            "Hostname": extra.get("DOMAIN_HOSTNAME", "") if attach else "",
+            "DomainCertificateArn": extra.get("DOMAIN_CERT", "") if attach else "",
+            "DomainZoneId": extra.get("DOMAIN_ZONE_ID", "") if attach else "",
+        }
+    name = f"coderhelm-{re.sub(r'[^A-Za-z0-9]', '-', version)}-{uuid.uuid4().hex[:6]}"
+    kwargs = {
+        "StackName": env["NATIVE_STACK"],
+        "ChangeSetName": name,
+        "ChangeSetType": "UPDATE",
+        "TemplateURL": url,
+        "Parameters": native_parameters(stack, template, overrides),
+        "Capabilities": NATIVE_CAPABILITIES,
+        "Description": f"CoderHelm {mode}: {version}"[:1024],
+        # The parts' own change sets too: every table, bucket, key, user pool
+        # and secret change is read before anything runs.
+        "IncludeNestedStacks": True,
+    }
+    role = env.get("DEPLOY_ROLE_ARN") or ""
+    if role:
+        kwargs["RoleARN"] = role
+    r = cfn.create_change_set(**kwargs)
+    return {"change_set_id": r["Id"], "apply": bool(role), "template_canonical": canonical_sha(template)}
+
+
+DATA_TYPES = ("AWS::DynamoDB::GlobalTable", "AWS::DynamoDB::Table", "AWS::S3::Bucket", "AWS::KMS::Key", "AWS::Cognito::UserPool", "AWS::SecretsManager::Secret")
+
+
+def canonical_sha(obj):
+    return hashlib.sha256(json.dumps(obj, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+
+
+def data_changes(cfn, cs):
+    """Tables, buckets, keys, user pools and secrets the change set (and its
+    parts' nested change sets) would replace or remove."""
+    out = []
+    seen = set()
+
+    def walk(c, part):
+        for ch in c.get("Changes") or []:
+            rc = ch.get("ResourceChange") or {}
+            if rc.get("ResourceType") in DATA_TYPES and (rc.get("Action") == "Remove" or rc.get("Replacement") in ("True", "Conditional")):
+                out.append(f"{part}.{rc.get('LogicalResourceId')} ({rc.get('ResourceType')}: {rc.get('Action')}, replacement {rc.get('Replacement', 'False')})")
+            nested = rc.get("ChangeSetId")
+            if rc.get("ResourceType") == "AWS::CloudFormation::Stack" and nested and nested not in seen:
+                seen.add(nested)
+                walk(cfn.describe_change_set(ChangeSetName=nested), rc.get("LogicalResourceId"))
+    walk(cs, "parent")
+    return out
+
+
+def fetched_template_matches(cfn, env, cs_id, want):
+    """The template CloudFormation fetched for the change set is the one verified (no swap after the check)."""
+    if not want:
+        return False
+    body = cfn.get_template(StackName=env["NATIVE_STACK"], ChangeSetName=cs_id, TemplateStage="Original").get("TemplateBody")
+    if isinstance(body, str):
+        try:
+            body = json.loads(body)
+        except ValueError:
+            return False
+    return canonical_sha(body) == want
+
+
+def native_status(store, env, state):
+    hid = state.get("running_id") or state.get("review_id")
+    entry = store.get(hid, {}) if hid else {}
+    return {
+        "stack": env.get("NATIVE_STACK"),
+        "auto_apply": bool(env.get("DEPLOY_ROLE_ARN")),
+        "pending": dict(entry.get("change_set") or {}, version=entry.get("version"), status=entry.get("status")) if entry.get("change_set_id") else None,
+    }
+
+
+def change_set_link(region, stack_id, cs_id):
+    from urllib.parse import quote
+    return (f"https://{region}.console.aws.amazon.com/cloudformation/home?region={region}"
+            f"#/stacks/changesets/changes?stackId={quote(stack_id, safe='')}&changeSetId={quote(cs_id, safe='')}")
+
+
+def change_set_summary(cs, region):
+    """What an admin reviews: counts, replacements, the parts it touches, the link."""
+    counts = {"add": 0, "modify": 0, "remove": 0}
+    replace = []
+    parts = []
+    for c in cs.get("Changes") or []:
+        rc = c.get("ResourceChange") or {}
+        action = (rc.get("Action") or "").lower()
+        if action in counts:
+            counts[action] += 1
+        if rc.get("Replacement") == "True":
+            replace.append(rc.get("LogicalResourceId"))
+        if rc.get("ResourceType") == "AWS::CloudFormation::Stack":
+            parts.append(rc.get("LogicalResourceId"))
+    return {
+        "name": cs.get("ChangeSetName"),
+        "status": cs.get("Status"),
+        "execution": cs.get("ExecutionStatus"),
+        "reason": cs.get("StatusReason") or "",
+        "counts": counts,
+        "replacements": sorted(x for x in replace if x),
+        "parts": sorted(x for x in parts if x),
+        "role": bool(cs.get("RoleARN")),
+        "data_changes": [],
+        "link": change_set_link(region, cs.get("StackId", ""), cs.get("ChangeSetId", "")),
+    }
+
+
+def first_failure(cfn, stack_name, since):
+    """CloudFormation's own reason for the first resource that failed since `since`."""
+    try:
+        events = cfn.describe_stack_events(StackName=stack_name).get("StackEvents") or []
+    except Exception as e:
+        return f"could not read the stack's events: {e}"
+    failed = [e for e in events if str(e.get("ResourceStatus", "")).endswith("_FAILED")
+              and (not since or str(e.get("Timestamp", "")) >= since)]
+    if not failed:
+        return ""
+    e = failed[-1]  # events are newest first: the last one is the first failure
+    return f"{e.get('LogicalResourceId')}: {e.get('ResourceStatusReason') or e.get('ResourceStatus')}"[:500]
+
+
+def native_poll(store, env, now, cfn=None):
+    """Moves a proposed or running stack update along; returns what happened."""
+    cfn = cfn or client("cloudformation")
+    state = store.get("UPDATE_STATE", {})
+    hid = state.get("running_id") or state.get("review_id")
+    if not hid:
+        return {"native": "idle"}
+    entry = store.get(hid, {})
+    cs_id = entry.get("change_set_id")
+    if not cs_id:
+        return {"native": "idle"}
+    region = env.get("AWS_REGION") or ""
+    try:
+        cs = cfn.describe_change_set(ChangeSetName=cs_id, StackName=env["NATIVE_STACK"])
+    except Exception as e:
+        if "does not exist" in str(e) or "ChangeSetNotFound" in type(e).__name__:
+            return native_finish(store, env, now, hid, "failed", "the proposed change set was deleted before it ran")
+        raise
+    summary = change_set_summary(cs, region)
+    entry["change_set"] = summary
+    status, execution = cs.get("Status"), cs.get("ExecutionStatus")
+    if status == "FAILED":
+        reason = cs.get("StatusReason") or "the change set could not be created"
+        if "didn't contain changes" in reason or "No updates" in reason:
+            return native_finish(store, env, now, hid, "succeeded", "already up to date: nothing to change")
+        return native_finish(store, env, now, hid, "failed", reason)
+    if status != "CREATE_COMPLETE":
+        store.put(hid, entry)
+        return {"native": "preparing"}
+    if execution == "AVAILABLE" and "checked" not in entry:
+        if not fetched_template_matches(cfn, env, cs_id, entry.get("template_canonical")):
+            try:
+                cfn.delete_change_set(ChangeSetName=cs_id, StackName=env["NATIVE_STACK"])
+            except Exception as e:
+                logger.warning(f"change set not deleted: {e}")
+            return native_finish(store, env, now, hid, "failed", "the template CloudFormation fetched is not the verified one, so the change set was deleted")
+        entry["data_changes"] = data_changes(cfn, cs)
+        entry["checked"] = True
+        summary["data_changes"] = entry["data_changes"]
+        entry["change_set"] = summary
+    if execution == "AVAILABLE":
+        if entry.get("data_changes") and entry.get("apply"):
+            # Never automatic when data would be replaced or removed: a person decides.
+            entry["apply"] = False
+            entry["reason"] = "auto-update held: it would replace or remove " + "; ".join(entry["data_changes"])[:400]
+        if entry.get("apply") and not entry.get("executed_at"):
+            cfn.execute_change_set(ChangeSetName=cs_id, StackName=env["NATIVE_STACK"])
+            entry.update({"executed_at": now.isoformat(), "status": "running"})
+            store.put(hid, entry)
+            return {"native": "executing"}
+        if entry.get("status") != "review":
+            # Waiting on an admin: not "running", so it never blocks or goes stale.
+            entry["status"] = "review"
+            store.put(hid, entry)
+            state.pop("running_since", None)
+            state.pop("running_id", None)
+            state["review_id"] = hid
+            store.put("UPDATE_STATE", state)
+            notify(f"CoderHelm {entry.get('version')} is ready to review",
+                   f"The stack update is prepared. Review it and choose Execute in the AWS console:\n{summary['link']}",
+                   env, what="review", version=entry.get("version"))
+        else:
+            store.put(hid, entry)
+        return {"native": "review"}
+    if execution in ("EXECUTE_IN_PROGRESS", "EXECUTE_COMPLETE", "EXECUTE_FAILED"):
+        if entry.get("status") == "review":
+            # The admin executed it in the console.
+            entry.update({"status": "running", "executed_at": entry.get("executed_at") or now.isoformat()})
+            state.pop("review_id", None)
+            state.update({"running_since": now.isoformat(), "running_id": hid})
+            store.put("UPDATE_STATE", state)
+        store.put(hid, entry)
+        st = cfn.describe_stacks(StackName=env["NATIVE_STACK"])["Stacks"][0]["StackStatus"]
+        if st.endswith("_IN_PROGRESS"):
+            return {"native": "running", "stack": st}
+        if st in ("UPDATE_COMPLETE",):
+            return native_finish(store, env, now, hid, "succeeded", "")
+        reason = first_failure(cfn, env["NATIVE_STACK"], entry.get("executed_at")) or f"the stack ended {st}"
+        result = "rolled_back" if "ROLLBACK_COMPLETE" in st else "failed"
+        return native_finish(store, env, now, hid, result, reason)
+    if execution in ("OBSOLETE", "UNAVAILABLE"):
+        return native_finish(store, env, now, hid, "failed",
+                             cs.get("StatusReason") or "the change set can no longer run (the stack changed since it was made)")
+    store.put(hid, entry)
+    return {"native": str(execution or status).lower()}
+
+
+def native_finish(store, env, now, hid, status, reason):
+    state = store.get("UPDATE_STATE", {})
+    if state.get("review_id") == hid:
+        state.pop("review_id", None)
+        state.update({"running_id": hid})
+        store.put("UPDATE_STATE", state)
+    return handle({"action": "finished", "history_id": hid, "status": status, "reason": reason}, env, store, now)
+
+
 # ── Actions ───────────────────────────────────────────────────────────────
 
 def app_url(env):
@@ -1414,8 +1703,17 @@ def begin(store, env, now, version, actor, mode, extra=None, note=None):
     if note:
         entry["note"] = note
     store.put(hid, entry)
-    build_id = start_build(env, version, actor, mode, hid, extra) if extra else start_build(env, version, actor, mode, hid)
-    entry["build_id"] = build_id
+    if is_native(env):
+        try:
+            entry.update(native_propose(store, env, version, mode, extra))
+        except ValueError as e:
+            entry.update({"status": "failed", "reason": str(e)[:500], "finished_at": now.isoformat()})
+            store.put(hid, entry)
+            raise
+        entry["status"] = "preparing"
+    else:
+        build_id = start_build(env, version, actor, mode, hid, extra) if extra else start_build(env, version, actor, mode, hid)
+        entry["build_id"] = build_id
     store.put(hid, entry)
     state.update({"running_since": now.isoformat(), "running_id": hid})
     store.put("UPDATE_STATE", state)
@@ -1462,6 +1760,8 @@ def handle(event, env, store, now, fetch=fetch_releases, probe=None):
                 store.get("MODEL_CHECK")),
             # Which install this is, for Settings, System, Uninstall's link to the guided uninstall.
             "install": install_identity(env),
+            # A native install: the stack, and the change set an admin reviews.
+            "native": native_status(store, env, state) if is_native(env) else None,
         }
 
     if action == "settings":
@@ -1507,10 +1807,13 @@ def handle(event, env, store, now, fetch=fetch_releases, probe=None):
             state.pop("verifying", None)
             store.put("UPDATE_STATE", state)
             return {"verified": False}
+        sha = event.get("template_sha256")
+        if sha is not None and not (isinstance(sha, str) and re.fullmatch(r"[0-9a-f]{64}", sha)):
+            raise ValueError("template_sha256 must be a sha256")
         m = event.get("manifest")
         if m is not None and (not isinstance(m, dict) or not isinstance(m.get("calls"), list) or m.get("version") not in (None, version)):
             raise ValueError("models.json isn't a model manifest for this release")
-        store.put(f"MANIFEST#{version}", {"verified": True, "manifest": m, "at": now.isoformat()})
+        store.put(f"MANIFEST#{version}", {"verified": True, "manifest": m, "template_sha256": sha, "at": now.isoformat()})
         state.pop("verifying", None)
         store.put("UPDATE_STATE", state)
         mc = model_check(store, env, now, version, repo, probe)
@@ -1591,6 +1894,11 @@ def handle(event, env, store, now, fetch=fetch_releases, probe=None):
 
     if action == "domain_status":
         return domain_status(store, env, now)
+
+    if action == "native_poll":
+        if not is_native(env):
+            raise ValueError("native_poll: not a native install")
+        return native_poll(store, env, now)
 
     if action == "domain_set":
         return domain_set(store, env, now, event.get("hostname"), event.get("actor") or "unknown")

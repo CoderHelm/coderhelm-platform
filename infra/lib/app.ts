@@ -105,7 +105,7 @@ export function buildApp(app: cdk.App, cfg: ResolvedConfig, opts: { accessStack?
       cfg,
       httpApi: api.httpApi,
       streamingFunctionUrl: streaming.functionUrl,
-      crossRegionReferences: cfg.region !== "us-east-1" && !!cfg.singleOrigin?.hostedZone && !cfg.singleOrigin.certificateArn,
+      crossRegionReferences: !cfg.native && cfg.region !== "us-east-1" && !!cfg.singleOrigin?.hostedZone && !cfg.singleOrigin.certificateArn,
     });
   }
 
@@ -169,7 +169,7 @@ export function buildApp(app: cdk.App, cfg: ResolvedConfig, opts: { accessStack?
     for (const s of app.node.children) if (s instanceof cdk.Stack) harden(s, cfg);
     // The admin's own stack (an install hardened from the CLI); updates skip it.
     const withAccess = opts.accessStack ?? process.env.CODERHELM_ACCESS_STACK !== "skip";
-    if (cfg.access.owner === "app" && withAccess) new AccessStack(app, cfg.access.accessStackName, { cfg });
+    if (cfg.access.owner === "app" && withAccess && !cfg.native) new AccessStack(app, cfg.access.accessStackName, { cfg });
   }
 
   return { database, storage, api, worker, streaming, web, updates };

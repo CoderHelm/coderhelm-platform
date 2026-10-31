@@ -250,17 +250,34 @@ jobs:
       - name: Upload the templates
         run: |
           d="$RUNNER_TEMP/published"
-          for pair in launch-stack.yaml:coderhelm-launch.yaml uninstall-stack.yaml:coderhelm-uninstall.yaml coderhelm-log-reader.yaml:coderhelm-log-reader.yaml coderhelm-log-reader-update.yaml:coderhelm-log-reader-update.yaml; do
-            src="$d/${pair%%:*}"
-            k="launch/$TAG/${pair#*:}"
-            if curl --proto =https -fsSL -o "$RUNNER_TEMP/existing" "https://$PUBLIC_BUCKET.s3.amazonaws.com/$k"; then
-              cmp -s "$RUNNER_TEMP/existing" "$src" || { echo "::error::$k already holds another template"; exit 1; }
+          # Written once: a file already there must be this one.
+          put() {
+            if curl --proto =https -fsSL -o "$RUNNER_TEMP/existing" "https://$PUBLIC_BUCKET.s3.amazonaws.com/$2"; then
+              cmp -s "$RUNNER_TEMP/existing" "$1" || { echo "::error::$2 already holds another file"; exit 1; }
             else
-              aws s3api put-object --bucket "$PUBLIC_BUCKET" --key "$k" --body "$src" --if-none-match '*' --content-type text/yaml --cache-control "public, max-age=31536000, immutable" >/dev/null
+              aws s3api put-object --bucket "$PUBLIC_BUCKET" --key "$2" --body "$1" --if-none-match '*' --content-type "$3" --cache-control "public, max-age=31536000, immutable" >/dev/null
             fi
-          done
-          curl --proto =https -fsSL "https://$PUBLIC_BUCKET.s3.amazonaws.com/launch/$TAG/coderhelm-launch.yaml" | cmp -s - "$d/launch-stack.yaml" \
-            || { echo "::error::the template in S3 is not the signed launch-stack.yaml"; exit 1; }
+          }
+          for f in coderhelm-log-reader.yaml coderhelm-log-reader-update.yaml; do put "$d/$f" "launch/$TAG/$f" text/yaml; done
+          # The native files (infra/lib/native), each checked against the
+          # sha256 the signed coderhelm.json pins, then the parent last.
+          mkdir -p "$RUNNER_TEMP/native" && tar -xzf "$d/coderhelm-native.tar.gz" -C "$RUNNER_TEMP/native"
+          # shellcheck disable=SC2016 # JavaScript, not shell
+          D="$d" node -e '
+            const fs = require("fs"), c = require("crypto");
+            const t = JSON.parse(fs.readFileSync(process.env.D + "/coderhelm.json", "utf8"));
+            for (const f of t.Resources.ReleaseAssets.Properties.Files) {
+              const got = c.createHash("sha256").update(fs.readFileSync(process.env.RUNNER_TEMP + "/native/" + f.Key)).digest("hex");
+              if (got !== f.Sha256) { console.error(`${f.Key} is not the file coderhelm.json pins`); process.exit(1); }
+              console.log(f.Key);
+            }' > "$RUNNER_TEMP/native-files"
+          while read -r k; do
+            case "$k" in *.json) ct=application/json ;; *) ct=application/zip ;; esac
+            put "$RUNNER_TEMP/native/$k" "launch/$TAG/$k" "$ct"
+          done < "$RUNNER_TEMP/native-files"
+          put "$d/coderhelm.json" "launch/$TAG/coderhelm.json" application/json
+          curl --proto =https -fsSL "https://$PUBLIC_BUCKET.s3.amazonaws.com/launch/$TAG/coderhelm.json" | cmp -s - "$d/coderhelm.json" \
+            || { echo "::error::the template in S3 is not the signed coderhelm.json"; exit 1; }
       - uses: aws-actions/configure-aws-credentials@7474bc4690e29a8392af63c5b98e7449536d5c3a # v4.3.1
         with:
           role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/coderhelm-prod-release-latest
@@ -272,7 +289,7 @@ jobs:
           current=$(curl --proto =https -fsSL -D "$headers" "https://$PUBLIC_BUCKET.s3.amazonaws.com/launch/latest.json" 2>/dev/null || echo '{}')
           etag=$(sed -n 's/^[Ee][Tt][Aa][Gg]: *//p' "$headers" 2>/dev/null | tr -d '\r' | head -n1)
           # shellcheck disable=SC2016 # JavaScript, not shell
-          CURRENT="$current" SHA=$(sha256sum "$RUNNER_TEMP/published/launch-stack.yaml" | cut -d' ' -f1) node -e '
+          CURRENT="$current" SHA=$(sha256sum "$RUNNER_TEMP/published/coderhelm.json" | cut -d' ' -f1) node -e '
             const tag = process.env.TAG;
             const n = (v) => String(v || "v0.0.0").replace(/^v/, "").split(/[.-]/).slice(0, 3).map(Number);
             let cur = {};
@@ -283,7 +300,7 @@ jobs:
             const bucket = process.env.PUBLIC_BUCKET;
             require("fs").writeFileSync("latest.json", JSON.stringify({
               version: tag,
-              templateUrl: `https://${bucket}.s3.amazonaws.com/launch/${tag}/coderhelm-launch.yaml`,
+              templateUrl: `https://${bucket}.s3.amazonaws.com/launch/${tag}/coderhelm.json`,
               templateSha256: process.env.SHA,
               publishedAt: new Date().toISOString(),
             }));

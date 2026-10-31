@@ -1,9 +1,8 @@
-// Removes one CoderHelm install from its AWS account: from a terminal
-// (`coderhelm-selfhost uninstall [--everything]`, the person's own
-// credentials) and in the uninstall stack's build (`uninstall --guided`,
-// infra/cfn/coderhelm-selfhost-uninstall.yaml, inside its window).
-//
-// Both ways find the install's pieces the same way and touch only what is
+// Finds, and on request removes, what is left of one CoderHelm install in
+// its AWS account, from a terminal with the person's own credentials:
+// `coderhelm-selfhost leftovers [--delete]` after Delete stack (a native
+// install), and `uninstall [--everything]` for an install from before
+// native releases. It finds the install's pieces the same way and touch only what is
 // the install's (docs/self-host/uninstall.md):
 //   - names: coderhelm-<stage>, coderhelm-<stage>-..., coderhelm/<stage>/...,
 //     /coderhelm-<stage>/..., never those of another install whose name
@@ -123,7 +122,7 @@ export async function discover(ctx, base, { mode = "keep", installStatus = "", o
     ...policies.map((p) => String(p.PolicyName).match(/^(coderhelm-[a-z][a-z0-9-]{0,19})-boundary-[0-9a-f]{8}$/)?.[1]).filter(Boolean),
   ];
   const scope = { ...base, siblings: siblingsOf(P, names) };
-  const inv = { scope, mode, anchored: false, launch: [], ids: [], stacks: [], tables: [], backups: [], buckets: [], keys: [], aliases: [], pools: [], secrets: [], logGroups: [], params: [], certs: [], roles: [], boundaries: [], skipped: [] };
+  const inv = { scope, mode, anchored: false, launch: [], ids: [], stacks: [], esms: [], tables: [], backups: [], buckets: [], keys: [], aliases: [], pools: [], secrets: [], logGroups: [], params: [], certs: [], roles: [], boundaries: [], skipped: [] };
 
   // Stacks: the Launch Stack(s), and the install's own (tagged; untagged only for a terminal uninstall of an older install).
   for (const { d, params } of described) {
@@ -173,6 +172,11 @@ export async function discover(ctx, base, { mode = "keep", installStatus = "", o
   inv.tagged = tagged.map((t) => t.ResourceARN);
   const certs = await aws.read("resourcegroupstaggingapi", "get-resources", ["--tag-filters", `Key=${UPDATER_CERT_TAG},Values=${P}`, "--resource-type-filters", "acm:certificate"], "us-east-1");
   inv.certs = (certs?.ResourceTagMappingList ?? []).map((t) => t.ResourceARN);
+  // Event source mappings of the install's functions (a failed delete can orphan them).
+  for (const m of await pages(aws, "lambda", "list-event-source-mappings", [], "EventSourceMappings")) {
+    const fn = String(m.FunctionArn ?? "").split(":function:")[1]?.split(":")[0] ?? "";
+    if (isOurName(scope, fn)) inv.esms.push({ uuid: m.UUID, name: `${fn} <- ${String(m.EventSourceArn ?? "").split(":").pop()}` });
+  }
 
   // Tables and their backups.
   for (const t of await pages(aws, "dynamodb", "list-tables", [], "TableNames")) {
@@ -283,6 +287,7 @@ export function plan(inv) {
   for (const g of inv.logGroups) add("log group", g);
   for (const p of inv.params) add("parameter", p);
   for (const r of inv.roles) add("role", r.name);
+  for (const m of inv.esms ?? []) add("event source mapping", m.name);
   for (const b of inv.boundaries) add("permissions boundary", b.name);
   // A certificate the updater requested is in us-east-1 for any region's install: listed for you, not removed.
   const notRemoved = inv.certs.map((c) => ({ kind: "certificate", name: c.split("/").pop(), why: "in us-east-1 (ACM), tagged coderhelm = " + inv.scope.prefix + "; delete it in ACM once no install of this name uses it" }));
@@ -334,6 +339,41 @@ async function waitGone(ctx, names, onTick) {
   }
   for (const n of left) failed[n] = "still deleting after an hour";
   return failed;
+}
+
+/** What AWS says is temporary: a table still settling, throttling, limits. */
+const TABLE_RETRYABLE = /ResourceInUse|LimitExceeded|Throttl|InternalServerError|being (updated|created)/i;
+
+/**
+ * Deletes a table and waits until it is gone. A GlobalTable delete can
+ * report a failure while the table is still going away (seen in a real
+ * uninstall: CheckpointsTable and TracesTable failed, then vanished a
+ * minute later), so a temporary refusal is retried with backoff and the
+ * table is only reported when it is still there at the end, with AWS's
+ * own reason.
+ */
+export async function deleteTable(ctx, name) {
+  const aws = ctx.aws;
+  if (aws.dryRun) return { ok: true };
+  let reason = "";
+  let delay = ctx.pollMs ?? 5_000;
+  for (let i = 0; i < (ctx.maxPolls ?? 120); i++) {
+    const d = (await aws.read("dynamodb", "describe-table", ["--table-name", name]))?.Table;
+    if (!d) return { ok: true };
+    if (d.TableStatus !== "DELETING") {
+      if (d.DeletionProtectionEnabled) await aws.write("dynamodb", "update-table", ["--table-name", name, "--no-deletion-protection-enabled"]);
+      const res = await aws.write("dynamodb", "delete-table", ["--table-name", name]);
+      if (!res.ok) {
+        if (/ResourceNotFound/.test(res.error)) return { ok: true };
+        reason = res.error;
+        if (!TABLE_RETRYABLE.test(res.error) && !d.DeletionProtectionEnabled) return { ok: false, error: res.error };
+        ctx.log?.(`  ${name}: ${res.error.split("\n")[0]} (trying again)`);
+      }
+    } else reason = "still deleting";
+    await (ctx.sleep ?? sleep)(delay);
+    delay = Math.min(delay * 2, 30_000);
+  }
+  return { ok: false, error: `still there after waiting: ${reason}` };
 }
 
 async function emptyBucket(aws, bucket) {
@@ -399,8 +439,9 @@ export async function remove(ctx, inv, { onStep = async () => {}, hybrid = null 
   if (everything) {
     await onStep({ phase: "data", message: "Deleting the tables, the data bucket, the user pool and the secret" });
     for (const t of inv.tables) {
-      await aws.write("dynamodb", "update-table", ["--table-name", t.name, "--no-deletion-protection-enabled"]);
-      await run("table", t.name, "dynamodb", "delete-table", ["--table-name", t.name]);
+      const r = await deleteTable(ctx, t.name);
+      if (r.ok) gone("table", t.name);
+      else fail("table", t.name, r.error);
     }
     for (const b of inv.backups) await run("backup", b.name, "dynamodb", "delete-backup", ["--backup-arn", b.arn]);
     for (const b of inv.buckets.filter((x) => x.kind === "data bucket")) {
@@ -445,6 +486,7 @@ export async function remove(ctx, inv, { onStep = async () => {}, hybrid = null 
   await onStep({ phase: "cleanup", message: "Removing the logs, parameters, buckets, roles and the permissions boundary" });
   const now = await discover(ctx, { ...scope, siblings: [] }, { mode: inv.mode, installStatus: ctx.installStatus ?? "", ownStatus: ctx.ownStatus ?? "", strictTags: !!ctx.guided, fetchImpl: ctx.fetchImpl });
   for (const g of now.logGroups) await run("log group", g, "logs", "delete-log-group", ["--log-group-name", g]);
+  for (const m of now.esms ?? []) await run("event source mapping", m.name, "lambda", "delete-event-source-mapping", ["--uuid", m.uuid]);
   for (let i = 0; i < now.params.length; i += 10) {
     const names = now.params.slice(i, i + 10);
     const res = await aws.write("ssm", "delete-parameters", ["--names", ...names]);

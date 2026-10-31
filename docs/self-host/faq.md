@@ -14,7 +14,7 @@ No. It is all serverless AWS: nothing to patch, nothing running when nobody uses
 Not today. CoderHelm is built on Lambda, DynamoDB, SQS, Cognito and the other services listed in [Requirements](./requirements.md).
 
 **Can I run it without internet access (air-gapped)?**
-Partly. CoderHelm needs GitHub and a model. With Bedrock as the provider and GitHub reachable, nothing else is required. The installer needs to reach GitHub releases once per version; you can download a release's files elsewhere, check them against `SHA256SUMS`, and deploy from the unpacked source with `deploy --source`. Teams' MCP servers fetch npm packages unless you mirror them. A fully offline install (GitHub Enterprise Server, no outbound access) is not supported yet.
+Partly. CoderHelm needs GitHub and a model. With Bedrock as the provider and GitHub reachable, nothing else is required. The command line installer needs to reach GitHub releases once per version (a Launch Stack install reads the release from `coderhelm-public.s3.amazonaws.com` instead); you can download a release's files elsewhere, check them against `SHA256SUMS`, and deploy from the unpacked source with `deploy --source`. Teams' MCP servers fetch npm packages unless you mirror them. A fully offline install (GitHub Enterprise Server, no outbound access) is not supported yet.
 
 **How do I give it to several teams?**
 One install serves many teams. People sign up (or are invited) and create or join teams; each team has its own repositories, settings, keys and usage limits.
@@ -26,7 +26,7 @@ Yes, with different `stage` names. Every resource name starts with `coderhelm-<s
 AWS usage plus model calls. See [Requirements](./requirements.md#what-it-costs).
 
 **How do I uninstall?**
-With the [guided uninstall](https://docs.coderhelm.com/self-host/uninstall/) (admins open it from Settings, System, Uninstall), or `npx -y github:CoderHelm/coderhelm-platform uninstall` from a terminal. Either removes CoderHelm and keeps its data (tables, the data bucket, KMS keys, the user pool and the secret), or with **Delete everything** (`--everything`) deletes those too, KMS keys after AWS's 7-day minimum. Both end with a check of anything left. A hybrid install releases its address and hands GitHub and Jira back to CoderHelm first. Uninstall your GitHub App from GitHub too. See [Uninstall](./uninstall.md).
+Delete the stack `coderhelm-<name>` in the CloudFormation console. With the stack parameter **KeepDataOnDelete** `true` (the default) it keeps the data (tables, data buckets, KMS keys, the user pool and the secret); set it to `false` first to delete those too, KMS keys after AWS's 7-day minimum. Then `npx -y github:CoderHelm/coderhelm-platform leftovers --stage <name> --region <region>` lists anything left, and `--delete` removes it. A hybrid install releases its address and links when the stack is deleted. Uninstall your GitHub App from GitHub too. An install from before native releases uses `uninstall` from a terminal instead. See [Uninstall](./uninstall.md).
 
 **What license is the code under?**
 FSL-1.1-ALv2, the Functional Source License with Apache 2.0 as the future license. You can run, change and self-host CoderHelm for your own company; you can't offer it as a competing hosted product; each release becomes Apache 2.0 two years after it ships. There is no license key or license check in the code. The full terms are in [LICENSE.md](../../LICENSE.md).

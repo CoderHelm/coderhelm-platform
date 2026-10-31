@@ -5,11 +5,12 @@ import path from "node:path";
 import crypto from "node:crypto";
 import os from "node:os";
 import { checkPrereqs } from "./prereqs.mjs";
-import { checkTag, fetchRelease, latestVersion, releasePaths, releasesDir, TAG_RE } from "./release.mjs";
+import { checkTag, fetchRelease, latestVersion, releasePaths, releasesDir, TAG_RE, verifiedTemplateSha } from "./release.mjs";
 import { openBrowser } from "./github-app.mjs";
 import { ensureSecret, hasGithubApp, mergeSecret, readSecret } from "./secrets.mjs";
 import { runManifestFlow, secretKeysFromApp } from "./github-app.mjs";
 import * as un from "./uninstall.mjs";
+import * as mig from "./migrate.mjs";
 import { accessOf, DEFAULT_TELEMETRY_ENDPOINT, derived, readJson, semverCompare, writeJson } from "./util.mjs";
 
 export const STATE_DIR = ".coderhelm";
@@ -714,6 +715,52 @@ export async function backup(ctx) {
   return tables;
 }
 
+// ── migrate ──────────────────────────────────────────────────────────────
+
+/**
+ * `migrate`: an install from before native releases becomes one stack,
+ * coderhelm-<stage> (installer/lib/migrate.mjs, docs/self-host/migrate.md).
+ * Without --yes it stops once the checked change set is ready.
+ */
+export async function migrate(ctx) {
+  const { flags, log, runner } = ctx;
+  const cfg = loadConfig(flags);
+  const version = flags.version ?? (await latestVersion(ctx.fetchImpl));
+  checkTag(version);
+  const templateUrl = `https://coderhelm-public.s3.amazonaws.com/launch/${version}/coderhelm.json`;
+  const putObject = async (bucket, key, text, region) => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "ch-migrate-"));
+    const file = path.join(dir, "o.json");
+    fs.writeFileSync(file, text);
+    try {
+      await runner.run("aws", ["s3api", "put-object", "--bucket", bucket, "--key", key, "--body", file, "--region", region], { capture: true });
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  };
+  log(`Checking ${version}'s signature`);
+  const templateSha = await (ctx.verifiedTemplateSha ?? verifiedTemplateSha)(version, { runner, fetchImpl: ctx.fetchImpl, log });
+  const r = await mig.migrate({ ...ctx, putObject }, { stage: cfg.stage, region: cfg.region, account: cfg.account, templateUrl, templateSha, cfg: cfg, yes: !!flags.yes });
+  if (r.ready) log(`\nThe update is prepared and checked (change set ${r.ready}). Review it in CloudFormation, then run migrate again with --yes: it carries on from here.`);
+  return 0;
+}
+
+// ── leftovers ────────────────────────────────────────────────────────────
+
+/**
+ * `leftovers`: after Delete stack, anything still named or tagged for the
+ * install in this region (read-only): what KeepDataOnDelete kept, what an
+ * earlier failed install left (two user pools of the same name are both
+ * listed), the auto-update role. `--delete` removes them, one by one, after
+ * the typed name, with every reason printed; never while the install's
+ * stack exists.
+ */
+export async function leftovers(ctx) {
+  const flags = ctx.flags;
+  if (!flags.delete) return uninstall({ ...ctx, flags: { ...flags, verify: true } });
+  return uninstall({ ...ctx, flags: { ...flags, everything: true, verify: false } });
+}
+
 // ── uninstall ────────────────────────────────────────────────────────────
 
 /**
@@ -725,7 +772,7 @@ export async function backup(ctx) {
  */
 export async function uninstall(ctx) {
   const { flags, log } = ctx;
-  if (flags.guided) return guidedUninstall(ctx);
+  if (flags.guided) throw new Error("The guided uninstall is now Delete stack in CloudFormation (docs.coderhelm.com/self-host/uninstall/).");
   let cfg = null;
   try {
     cfg = loadConfig(flags);
@@ -743,6 +790,11 @@ export async function uninstall(ctx) {
   const account = cfg?.account ?? (await ctx.aws.read("sts", "get-caller-identity", []))?.Account;
   const scope = un.scopeOf({ stage, region, account });
   const inv = await un.discover(ctx, scope, { mode, installStatus: typeof flags.installStatus === "string" ? flags.installStatus : "", fetchImpl: ctx.fetchImpl });
+  // A native install is one stack: Delete stack removes it; this never takes it apart by name.
+  const parent = inv.stacks.find((x) => x.name === scope.prefix);
+  if (parent && !flags.verify) {
+    throw new Error(`${scope.prefix} is a CloudFormation stack: delete it in CloudFormation (Delete stack). "leftovers" then lists, and with --delete removes, anything it left.`);
+  }
 
   if (flags.verify) {
     const { left, scheduled } = un.leftovers(inv);
@@ -807,52 +859,6 @@ function logByKind(log, items) {
   const by = new Map();
   for (const x of items) by.set(x.kind, [...(by.get(x.kind) ?? []), x.name]);
   for (const [kind, names] of by) log(`  ${String(names.length).padStart(3)} ${kind}${names.length === 1 ? "" : "s"}: ${names.slice(0, 6).join(", ")}${names.length > 6 ? ", ..." : ""}`);
-}
-
-/**
- * `uninstall --guided`: the uninstall stack's build (inside its window).
- * Environment: STAGE, MODE, STATUS_BUCKET, INSTALL_STATUS_ID, AWS_REGION.
- * Keeps the progress file the uninstall guide reads, and writes the last
- * one to /tmp/coderhelm-final.json for the stack's answer.
- */
-export async function guidedUninstall(ctx, env = process.env) {
-  const region = env.AWS_REGION || env.AWS_DEFAULT_REGION;
-  const bucket = env.STATUS_BUCKET || "";
-  const final = env.FINAL_FILE || "/tmp/coderhelm-final.json";
-  ctx.guided = true;
-  ctx.aws ??= un.awsClient(ctx, region);
-  const account = (await ctx.aws.read("sts", "get-caller-identity", []))?.Account;
-  const project = String(env.CODEBUILD_BUILD_ID || "").split(":")[0];
-  const logUrl = project ? `https://${region}.console.aws.amazon.com/cloudwatch/home?region=${region}#logsV2:log-groups/log-group/${`/aws/codebuild/${project}`.replace(/\//g, "$252F")}` : null;
-  const write = async (d) => {
-    const doc = { ...d, logUrl };
-    ctx.log(`[${doc.phase}] ${doc.message}`);
-    if (["done", "failed"].includes(doc.phase)) fs.writeFileSync(final, JSON.stringify(doc));
-    if (!bucket) return;
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "coderhelm-"));
-    const file = path.join(dir, "status.json");
-    fs.writeFileSync(file, JSON.stringify(doc));
-    try {
-      await ctx.runner.run("aws", ["s3", "cp", file, `s3://${bucket}/status.json`, "--region", region, "--content-type", "application/json", "--cache-control", "no-store", "--only-show-errors"], { capture: true, allowFail: true });
-    } finally {
-      fs.rmSync(dir, { recursive: true, force: true });
-    }
-  };
-  const doc = await un.runUninstall(ctx, {
-    stage: env.STAGE,
-    region,
-    account,
-    mode: env.MODE === "everything" ? "everything" : "keep",
-    installStatus: env.INSTALL_STATUS_ID || "",
-    ownStatus: bucket.replace(/^coderhelm-setup-/, ""),
-    write,
-  });
-  if (doc.phase !== "done") {
-    const e = new Error(doc.message);
-    e.plain = true;
-    throw e;
-  }
-  return 0;
 }
 
 // ── access (hardened installs) ───────────────────────────────────────────

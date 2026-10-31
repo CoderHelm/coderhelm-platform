@@ -49,11 +49,12 @@ BOUNDARY = ""
 SCHEMA = {}
 SVC = {}
 SERVICES = ["apigateway", "acm", "acm-pca", "cloudfront", "cloudwatch", "codebuild", "cognito-idp", "dynamodb", "events", "iam", "kms", "lambda", "logs",
-            "route53", "s3", "ses", "sns", "sqs", "ssm", "scheduler", "application-autoscaling", "kinesis", "ec2", "elasticfilesystem", "firehose", "s3tables", "s3files"]
+            "route53", "s3", "ses", "sns", "sqs", "ssm", "scheduler", "secretsmanager", "cloudformation", "application-autoscaling", "kinesis", "ec2", "elasticfilesystem", "firehose", "s3tables", "s3files"]
 
 SERVICE_OF = {"ApiGatewayV2": "apigateway", "CertificateManager": "acm", "CloudFront": "cloudfront", "CloudWatch": "cloudwatch", "CodeBuild": "codebuild",
               "Cognito": "cognito-idp", "DynamoDB": "dynamodb", "Events": "events", "IAM": "iam", "KMS": "kms", "Lambda": "lambda", "Logs": "logs",
-              "Route53": "route53", "S3": "s3", "SES": "ses", "SNS": "sns", "SQS": "sqs", "SSM": "ssm", "Scheduler": "scheduler"}
+              "Route53": "route53", "S3": "s3", "SES": "ses", "SNS": "sns", "SQS": "sqs", "SSM": "ssm", "Scheduler": "scheduler",
+              "SecretsManager": "secretsmanager", "CloudFormation": "cloudformation"}
 
 SYNTH_JS = r"""
 const fs = require("fs"), os = require("os"), path = require("path");
@@ -194,6 +195,11 @@ class Stack:
             n = nm("LayerName"); a = f"{at('lambda')}:layer:{n}:1"; return a, a
         if ty == "AWS::Cognito::UserPoolClient":
             return fake_id("client", lid), None
+        if ty == "AWS::SecretsManager::Secret":
+            n = nm("Name"); a = f"{at('secretsmanager')}:secret:{n}-AbCdEf"; return a, a
+        if ty == "AWS::CloudFormation::Stack":
+            # A nested stack: <parent>-<logical id>-<random>.
+            a = f"{at('cloudformation')}:stack/{P}-{lid}-1A2B3C4D5E6F/0f0f0f0f-1111-2222-3333-444455556666"; return a, a
         return lid, None
 
     def resolve(self, v):
@@ -639,107 +645,91 @@ def grouped(simulated):
     return [{**v, "actions": dict(sorted(v["actions"].items())), "calls": sorted(v["calls"])} for v in sorted(g.values(), key=lambda x: (x["resource"], json.dumps(x["context"], sort_keys=True)))]
 
 
-UNINSTALL_JS = r"""
-const c = require("./dist/lib/uninstall-cases");
-const u = require("./dist/lib/uninstall-access");
-const out = { cases: c.uninstallCases(), session: c.sessionCases(), keep: c.casePolicies("keep"), everything: c.casePolicies("everything"),
-  constants: { account: c.CASE_ACCOUNT, region: c.CASE_REGION, userId: c.CASE_USER_ID, now: c.CASE_NOW, expires: c.CASE_EXPIRES },
-  allows: u.uninstallWindowStatements(c.caseNames()).filter((s) => s.Effect === "Allow") };
+NATIVE_JS = r"""
+const fs = require("fs"), os = require("os"), path = require("path");
+const { buildNative } = require("./dist/lib/native/build");
+const { resolveValue, prodValues } = require("./dist/lib/native/resolve");
+const { accessNames, boundaryPolicy } = require("./dist/lib/access");
+const { deployRolePolicy, helperPolicy } = require("./dist/lib/native/parent");
+const [ACCT, REG] = process.argv.slice(1);
+const STUBS = fs.mkdtempSync(path.join(os.tmpdir(), "chsimn-"));
+for (const d of ["gateway", "worker", "mcp"]) { fs.mkdirSync(path.join(STUBS, d), { recursive: true }); fs.writeFileSync(path.join(STUBS, d, d === "mcp" ? "handler.js" : "bootstrap"), "stub"); }
+fs.mkdirSync(path.join(STUBS, "dash"), { recursive: true }); fs.writeFileSync(path.join(STUBS, "dash", "index.html"), "x");
+process.env.GATEWAY_ZIP = path.join(STUBS, "gateway"); process.env.WORKER_ZIP = path.join(STUBS, "worker"); process.env.MCP_PROXY_DIR = path.join(STUBS, "mcp");
+const rel = buildNative("v0.0.0", fs.mkdtempSync(path.join(os.tmpdir(), "chsimrel-")), { dashboardDir: path.join(STUBS, "dash") });
+const values = prodValues(ACCT, REG);
+const stackOf = (part) => "coderhelm-prod-" + part.replace(/([a-z])([A-Z])/g, "$1-$2").toLowerCase();
+const imports = {};
+for (const [part, t] of Object.entries(rel.children)) {
+  for (const [p, v] of Object.entries(rel.parent.Resources[part].Properties.Parameters)) {
+    const g = v["Fn::GetAtt"];
+    if (!g) continue;
+    const exp = rel.children[g[0]].Outputs[g[1].replace("Outputs.", "")].Export.Name;
+    imports[part + "/" + p] = resolveValue(exp, { values });
+  }
+}
+const out = { templates: { native: {} } };
+for (const [part, t] of Object.entries(rel.children)) {
+  const im = Object.fromEntries(Object.entries(imports).filter(([k]) => k.startsWith(part + "/")).map(([k, v]) => [k.split("/")[1], v]));
+  out.templates.native[stackOf(part)] = { template: resolveValue(t, { values, imports: im }), tags: { "coderhelm:install": "coderhelm-prod" } };
+}
+// The parent's own roles and policies, as one more part.
+out.templates.native["coderhelm-prod"] = { template: resolveValue({ Resources: Object.fromEntries(Object.entries(rel.parent.Resources).filter(([, r]) => r.Type.startsWith("AWS::"))) }, { values }), tags: {} };
+const n = accessNames({ account: ACCT, region: REG, prefix: "coderhelm-prod", suffix: "-" + ACCT, secretName: "coderhelm/prod/secrets", id: "stack" });
+out.names = n;
+out.deploy = resolveValue(deployRolePolicy(accessNames({ partition: "${AWS::Partition}", account: "${AWS::AccountId}", region: "${AWS::Region}", prefix: "coderhelm-${Stage}", suffix: "-${AWS::AccountId}", secretName: "coderhelm/${Stage}/secrets", id: "stack" })).Statement.map((s) => JSON.parse(JSON.stringify(s).replace(/"([^"]*\$\{[^"]*)"/g, (m, x) => JSON.stringify({ "Fn::Sub": x })))), { values });
+out.deploy = { Version: "2012-10-17", Statement: out.deploy };
+out.boundary = boundaryPolicy(n);
+const helper = helperPolicy();
+out.helper = JSON.parse(JSON.stringify(helper).replace(/\$\{Stage\}/g, "prod").replace(/\$\{StatusId\}/g, "0123456789abcdef").replace(/\$\{AWS::AccountId\}/g, ACCT).replace(/\$\{AWS::Region\}/g, REG).replace(/\$\{AWS::Partition\}/g, "aws").replace(/\$\{AWS::StackName\}/g, "coderhelm-prod"));
 process.stdout.write(JSON.stringify(out));
 """
 
-GLOBAL_KEYS = ("aws:",)
+
+def helper_rows():
+    """What the install helper may and may not do (infra/lib/native/parent.ts, helperPolicy)."""
+    s3 = "arn:aws:s3:::"
+    allowed = [
+        ("s3:PutObject", f"{s3}{P}-release-{ACCT}/assets/a.zip"), ("s3:DeleteObject", f"{s3}{P}-release-{ACCT}/assets/a.zip"),
+        ("s3:ListBucketVersions", f"{s3}{P}-data-{ACCT}"), ("s3:DeleteObjectVersion", f"{s3}{P}-data-{ACCT}/x"),
+        ("s3:PutObject", f"{s3}coderhelm-setup-0123456789abcdef/status.json"),
+        ("secretsmanager:PutSecretValue", f"{at('secretsmanager')}:secret:coderhelm/prod/secrets-AbCdEf"),
+        ("dynamodb:DeleteTable", f"{at('dynamodb')}:table/{P}-traces"), ("dynamodb:BatchWriteItem", f"{at('dynamodb')}:table/{P}-settings"),
+        ("lambda:InvokeFunction", f"{at('lambda')}:function:{P}-updater"),
+        ("logs:DeleteLogGroup", f"{at('logs')}:log-group:/aws/lambda/{P}-gateway"),
+        ("cloudformation:DescribeStacks", f"{at('cloudformation')}:stack/{P}/0f0f0f0f-1111-2222-3333-444455556666"),
+    ]
+    denied = [
+        ("s3:PutObject", f"{s3}{P}-data-{ACCT}/x"), ("s3:DeleteObject", f"{s3}someone-else/x"), ("s3:PutObject", f"{s3}coderhelm-other-release-{ACCT}/x"),
+        ("secretsmanager:PutSecretValue", f"{at('secretsmanager')}:secret:coderhelm/other/secrets-AbCdEf"),
+        ("dynamodb:DeleteTable", f"{at('dynamodb')}:table/orders"), ("dynamodb:DeleteTable", f"{at('dynamodb')}:table/coderhelm-other-traces"),
+        ("lambda:InvokeFunction", f"{at('lambda')}:function:{P}-gateway"), ("lambda:UpdateFunctionCode", f"{at('lambda')}:function:{P}-updater"),
+        ("logs:DeleteLogGroup", f"{at('logs')}:log-group:/aws/lambda/payments"), ("logs:CreateLogGroup", f"{at('logs')}:log-group:/aws/lambda/{P}-install-helper"),
+        ("iam:CreateRole", f"arn:aws:iam::{ACCT}:role/{P}-x"), ("cloudformation:DeleteStack", f"{at('cloudformation')}:stack/{P}/0f0f0f0f-1111-2222-3333-444455556666"),
+    ]
+    return [{"action": a, "resource": r, "want": "allowed"} for a, r in allowed] + [{"action": a, "resource": r, "want": "denied"} for a, r in denied]
 
 
-def uninstall_main(session, out):
-    d = json.loads(subprocess.run(["node", "-e", UNINSTALL_JS], check=True, capture_output=True, text=True).stdout)
-    for svc in sorted({a.split(":")[0] for st in d["allows"] for a in ([st["Action"]] if isinstance(st["Action"], str) else st["Action"])} - {"tag", "sts"}):
-        with urllib.request.urlopen(f"https://servicereference.us-east-1.amazonaws.com/v1/{svc}/{svc}.json") as f:
-            j = json.load(f)
-        SVC[j["Name"]] = {"actions": {a["Name"].lower(): a for a in j["Actions"]}, "resources": {r["Name"]: r for r in j["Resources"]}}
-
-    def keys_of(action):
-        """The action's own condition keys and its resource types' (where AWS lists aws:ResourceTag/${TagKey})."""
-        s_, a = svc_action(action)
-        if not a:
-            return set()
-        out = set(a.get("ActionConditionKeys", []))
-        for r in a.get("Resources", []):
-            out |= set(SVC[s_]["resources"].get(r["Name"], {}).get("ConditionKeys", []))
-        return {x.lower() for x in out}
-    # Every condition key an allow uses must be one AWS evaluates for that action.
-    keys = []
-    for st in d["allows"]:
-        for op, kv in (st.get("Condition") or {}).items():
-            for k in kv:
-                for a in ([st["Action"]] if isinstance(st["Action"], str) else st["Action"]):
-                    if "*" in a:
-                        continue
-                    have = keys_of(a)
-                    base = k.lower().split("/")[0] + "/${tagkey}" if "/" in k else k.lower()
-                    # Global keys (aws:userid, aws:CurrentTime) apply to every action; a tag key must be listed.
-                    ok = k.lower() in have or base in have or (k.startswith("aws:") and "/" not in k)
-                    keys.append({"statement": st["Sid"], "action": a, "key": k, "listed": bool(ok)})
+def simulate_helper(session, helper, boundary, rows):
     iam = session.client("iam")
-    C = d["constants"]
-
-    def sim(pols, case, extra):
-        ctx = {"aws:userid": C["userId"], "aws:CurrentTime": C["now"], **(case.get("context") or {}), **extra}
-        entries = []
-        for k, v in ctx.items():
-            t = "date" if k == "aws:CurrentTime" else ("stringList" if isinstance(v, list) else "string")
-            entries.append({"ContextKeyName": k, "ContextKeyValues": v if isinstance(v, list) else [v], "ContextKeyType": t})
-        for attempt in range(8):
-            try:
-                r = iam.simulate_custom_policy(PolicyInputList=[json.dumps(pols["idle"]), json.dumps(pols["window"])],
-                                               PermissionsBoundaryPolicyInputList=[json.dumps(pols["boundary"])],
-                                               ActionNames=[case["action"]], ResourceArns=[case["resource"]], ContextEntries=entries)
-                ev = r["EvaluationResults"][0]
-                rr = ev.get("ResourceSpecificResults") or []
-                return rr[0]["EvalResourceDecision"] if rr else ev["EvalDecision"]
-            except iam.exceptions.ClientError as e:
-                if "Throttl" in str(e) or "Rate" in str(e):
-                    time.sleep(2 ** attempt)
-                    continue
-                raise
-
-    rows = []
-    for case in d["cases"]:
-        rows.append({**case, "keep": sim(d["keep"], case, {}), "everything": sim(d["everything"], case, {})})
-    session_rows = []
-    for case in d["session"]:
-        session_rows.append({**case, "anotherSession": sim(d["everything"], case, {"aws:userid": "AROAEXAMPLEBUILDROLE1:AWSCodeBuild-another-build"}),
-                             "afterTheEnd": sim(d["everything"], case, {"aws:CurrentTime": "2026-10-30T13:41:00Z"})})
-    fixture = {
-        "about": "Generated by infra/scripts/deploy-role-sim.py --uninstall: AWS's IAM policy simulator verdict on each call in infra/lib/uninstall-cases.ts, by the uninstall build inside its window.",
-        **C, "policies": {"keep": d["keep"], "everything": d["everything"]}, "conditionKeys": keys,
-        "rows": rows, "session": session_rows,
-    }
-    with open(out, "w") as f:
-        head = {k: v for k, v in fixture.items() if k not in ("rows", "session", "conditionKeys")}
-        f.write(json.dumps(head, indent=1)[:-2] + ',\n "conditionKeys": [\n')
-        f.write(",\n".join("  " + json.dumps(r, sort_keys=True) for r in keys))
-        f.write('\n ],\n "rows": [\n')
-        f.write(",\n".join("  " + json.dumps(r, sort_keys=True) for r in rows))
-        f.write('\n ],\n "session": [\n')
-        f.write(",\n".join("  " + json.dumps(r, sort_keys=True) for r in session_rows))
-        f.write("\n ]\n}\n")
-    print(f"{len(rows)} calls x 2 modes, {len(session_rows)} x 2 session checks simulated: keep {dict(collections.Counter(r['keep'] for r in rows))}, "
-          f"everything {dict(collections.Counter(r['everything'] for r in rows))}; condition keys not listed: {[k for k in keys if not k['listed']]}")
+    for r in rows:
+        ev = iam.simulate_custom_policy(PolicyInputList=[json.dumps(helper)], PermissionsBoundaryPolicyInputList=[json.dumps(boundary)],
+                                        ActionNames=[r["action"]], ResourceArns=[r["resource"]])["EvaluationResults"][0]
+        rr = ev.get("ResourceSpecificResults") or []
+        r["simulator"] = rr[0]["EvalResourceDecision"] if rr else ev["EvalDecision"]
 
 
 def main():
     global BOUNDARY
     ap = argparse.ArgumentParser()
     ap.add_argument("--out", default=None)
-    ap.add_argument("--uninstall", action="store_true")
+    ap.add_argument("--native", action="store_true", help="the native release: its parts, the auto-update role, the helper")
     args = ap.parse_args()
     import boto3
     session = boto3.Session()
-    if args.uninstall:
-        return uninstall_main(session, args.out or "test/fixtures/uninstall-sim.json")
-    args.out = args.out or "test/fixtures/deploy-role-sim.json"
-    synth = json.loads(subprocess.run(["node", "-e", SYNTH_JS, ACCT, REG, LAUNCH_ID], check=True, capture_output=True, text=True).stdout)
+    args.out = args.out or ("test/fixtures/native-sim.json" if args.native else "test/fixtures/deploy-role-sim.json")
+    js = [NATIVE_JS, ACCT, REG] if args.native else [SYNTH_JS, ACCT, REG, LAUNCH_ID]
+    synth = json.loads(subprocess.run(["node", "-e", *js], check=True, capture_output=True, text=True).stdout)
     T = synth["templates"]
     BOUNDARY = synth["names"]["boundaryArn"]
     for stacks in T.values():
@@ -762,27 +752,38 @@ def main():
     simulate(session, synth["deploy"], synth["boundary"], simulated)
     runtime = runtime_rows(synth["names"])
     simulate_runtime(session, synth["boundary"], runtime)
+    helper = []
+    if args.native:
+        helper = helper_rows()
+        simulate_helper(session, synth["helper"], synth["boundary"], helper)
     collapsed = {}
     for u in unused:
         c = collapsed.setdefault((u["action"], u["reason"]), {"action": u["action"], "reason": u["reason"], "calls": set()})
         c["calls"].update(u["calls"])
     fixture = {
-        "about": "Generated by infra/scripts/deploy-role-sim.py: every IAM call CloudFormation's handlers make for a hardened self-host install, with AWS's IAM policy simulator verdict for the policies below.",
-        "account": ACCT, "region": REG, "prefix": P, "launchId": LAUNCH_ID,
+        "about": ("Generated by infra/scripts/deploy-role-sim.py --native: every IAM call CloudFormation's handlers make for a native install's parts and parent, by its auto-update role under the boundary, what the boundary leaves runtime roles, and what the install helper may and may not do, with AWS's IAM policy simulator verdicts."
+                  if args.native else "Generated by infra/scripts/deploy-role-sim.py: every IAM call CloudFormation's handlers make for a hardened self-host install, with AWS's IAM policy simulator verdict for the policies below."),
+        "account": ACCT, "region": REG, "prefix": P, "launchId": "" if args.native else LAUNCH_ID,
         "policies": {"deploy": synth["deploy"], "boundary": synth["boundary"]},
         "types": sorted(types),
         "rows": grouped(simulated),
         "runtime": {"identity": RUNTIME_IDENTITY, "rows": runtime},
+        **({"helper": {"policy": synth["helper"], "rows": helper}} if args.native else {}),
         "notSimulated": sorted(({**c, "calls": sorted(c["calls"])} for c in collapsed.values()), key=lambda x: (x["action"], x["reason"])),
     }
     with open(args.out, "w") as f:
         # One row per line: a resource, the context its calls carry, and each action's verdict.
-        head = {k: v for k, v in fixture.items() if k not in ("rows", "notSimulated", "runtime")}
+        head = {k: v for k, v in fixture.items() if k not in ("rows", "notSimulated", "runtime", "helper")}
         f.write(json.dumps(head, indent=1)[:-2] + ',\n "rows": [\n')
         f.write(",\n".join("  " + json.dumps(r, sort_keys=True) for r in fixture["rows"]))
         f.write('\n ],\n "runtime": {\n  "identity": ' + json.dumps(RUNTIME_IDENTITY, sort_keys=True) + ',\n  "rows": [\n')
         f.write(",\n".join("   " + json.dumps(r, sort_keys=True) for r in runtime))
-        f.write('\n  ]\n },\n "notSimulated": [\n')
+        f.write('\n  ]\n },\n')
+        if "helper" in fixture:
+            f.write(' "helper": {\n  "policy": ' + json.dumps(fixture["helper"]["policy"], sort_keys=True) + ',\n  "rows": [\n')
+            f.write(",\n".join("   " + json.dumps(r, sort_keys=True) for r in fixture["helper"]["rows"]))
+            f.write('\n  ]\n },\n')
+        f.write(' "notSimulated": [\n')
         f.write(",\n".join("  " + json.dumps(r, sort_keys=True) for r in fixture["notSimulated"]))
         f.write("\n ]\n}\n")
     c = collections.Counter(r["simulator"] for r in simulated)

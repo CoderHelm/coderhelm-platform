@@ -6,9 +6,11 @@ order: 2
 
 ## On your machine
 
+With Launch Stack and the [install guide](https://docs.coderhelm.com/self-host/install/) you need only a browser. The tools below are for the command line (`coderhelm-selfhost`), and for [verifying a release](./updates-security.md#verify-a-release-before-launching) (cosign).
+
 | Tool | Version | Why |
 |---|---|---|
-| Node.js | 20 or newer | Runs the installer and the CDK app |
+| Node.js | 20 or newer | Runs the command line installer and the CDK app |
 | AWS CLI | v2 | Credentials, secrets and checks |
 | tar | any | Unpacks the release |
 | git | 2.34 or newer | Checks that the release's tag is signed by a CoderHelm maintainer and is on `main` |
@@ -20,7 +22,7 @@ You do not need Rust, Docker or the CDK CLI: the release ships built code, and t
 
 ## In AWS
 
-- **An account you can administer.** The first install creates IAM roles, so use administrator credentials (an SSO admin role is fine). With the Launch Stack, CoderHelm then keeps nothing broader than its own permissions boundary: [What the installer can do in your account](./security.md#what-the-installer-can-do-in-your-account).
+- **An account you can administer.** The first install creates IAM roles, so use administrator credentials (an SSO admin role is fine). With Launch Stack, CloudFormation creates the stack with your permissions, and CoderHelm then keeps nothing broader than its own permissions boundary: [What an install can do in your account](./security.md#what-an-install-can-do-in-your-account).
 - **A region with Lambda on ARM64, Cognito, SES and Bedrock** (if you use Bedrock). All commercial regions with Bedrock work.
 - **Service quotas:** the defaults are enough. The worker uses up to 10 concurrent Lambda executions for tickets and 5 each for CI fixes and feedback.
 - **SES production access** to email people outside your verified addresses. New accounts start in the SES sandbox. See [Email](./email.md).
@@ -33,7 +35,7 @@ You do not need Rust, Docker or the CDK CLI: the release ships built code, and t
 
 ## Optional
 
-- **A domain** in a Route 53 public hosted zone, so certificates and DNS records are created for you. A domain elsewhere works with an ACM certificate you create. See [Domains](./domains.md).
+- **A domain** in a Route 53 public hosted zone, so the certificate's records are created for you. A domain at another DNS provider works too: you add two records. See [Domains](./domains.md).
 
 ## What it costs
 

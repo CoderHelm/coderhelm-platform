@@ -70,7 +70,10 @@ export class EmailStack extends cdk.Stack {
     if (identity) {
       const zoneName = cfg.singleOrigin?.hostedZone;
       let sesIdentity: ses.Identity;
-      if (identity.includes("@")) {
+      if (cfg.native) {
+        // A native release: the sender is a launch parameter (an address).
+        sesIdentity = ses.Identity.email(identity);
+      } else if (identity.includes("@")) {
         sesIdentity = ses.Identity.email(identity);
       } else if (zoneName && identity === zoneName) {
         const zone = cfg.singleOrigin?.hostedZoneId
@@ -83,10 +86,15 @@ export class EmailStack extends cdk.Stack {
       } else {
         sesIdentity = ses.Identity.domain(identity);
       }
-      new ses.EmailIdentity(this, "DomainIdentity", {
+      const made = new ses.EmailIdentity(this, "DomainIdentity", {
         identity: sesIdentity,
         configurationSet: this.configSet,
       });
+      if (cfg.native) {
+        // Only when the install sends through its own SES (EmailTransport=ses).
+        const usesSes = new cdk.CfnCondition(this, "UsesSes", { expression: cdk.Fn.conditionEquals(cdk.Fn.ref("EmailTransport"), "ses") });
+        (made.node.defaultChild as cdk.CfnResource).cfnOptions.condition = usesSes;
+      }
     }
 
     // Templated emails

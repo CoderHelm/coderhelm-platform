@@ -43,7 +43,7 @@ FEATURE_LABELS = {"enhancement", "feature"}
 # What a self-host release is built from (.github/workflows/release.yml, build
 # job): the Rust Lambdas (services/), the MCP proxy and the updater (lambda/),
 # the CDK app and the CloudFormation templates (infra/), the installer
-# (installer/), install.sh, the Launch Stack installer, the dashboard pin and
+# (installer/), install.sh, the dashboard pin and
 # migrations (selfhost/), the dashboard pin check, and the release workflow.
 SHIPPED = (
     "services/",

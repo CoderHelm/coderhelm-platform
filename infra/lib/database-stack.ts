@@ -620,6 +620,9 @@ export class DatabaseStack extends cdk.Stack {
     // comes from it, and when the organization is made its other addresses
     // become invites and its domains the allowed domains (changed after that
     // in Settings, Sign-in). `kind` tells an admin from an invite.
+    // A native release seeds it from the launch parameters instead (the
+    // parent's Allowlist custom resource, infra/lib/native/parent.ts).
+    if (props.cfg.native) return;
     const admins = new Set(props.cfg.admins.map((a) => a.toLowerCase()));
     const allow: { sk: string; kind: string }[] = [
       ...props.cfg.signup.emails.map((e) => ({ sk: `EMAIL#${e}`, kind: admins.has(e) ? "admin" : "invite" })),

@@ -54,14 +54,31 @@ const wildcard = (doc) => statements(doc).some((s) => s.Effect === "Allow" && [s
 
 const identity = aws("sts", "get-caller-identity");
 const account = identity.Account;
-let config = null;
+// A native install is one stack, coderhelm-<stage> (infra/lib/native): its
+// boundary and its optional auto-update role carry no launch id, and it has
+// no installer or update build at all.
+let parent = null;
 try {
-  config = JSON.parse(aws("ssm", "get-parameter", "--name", `/${prefix}/installer/config`).Parameter.Value);
-} catch (e) {
-  check("the install exists", false, `no /${prefix}/installer/config in ${region}: ${e.message}`);
+  parent = aws("cloudformation", "describe-stacks", "--stack-name", prefix).Stacks?.[0] ?? null;
+} catch {
+  parent = null;
 }
-const access = config?.access;
-check("the install is hardened (config access)", access?.mode === "hardened", access ? `${access.owner}${access.id ? ` ${access.id}` : ""}` : "not hardened: it deploys through the CDK bootstrap roles");
+const nativeParams = Object.fromEntries((parent?.Parameters ?? []).map((p) => [p.ParameterKey, p.ParameterValue]));
+const native = "KeepDataOnDelete" in nativeParams;
+const autoUpdate = native && nativeParams.AutoUpdate === "on";
+let config = null;
+let access = null;
+if (native) {
+  check("the install is one CloudFormation stack", true, `${prefix}: ${parent.StackStatus}, auto-update ${autoUpdate ? "on" : "off"}`);
+} else {
+  try {
+    config = JSON.parse(aws("ssm", "get-parameter", "--name", `/${prefix}/installer/config`).Parameter.Value);
+  } catch (e) {
+    check("the install exists", false, `no stack ${prefix} and no /${prefix}/installer/config in ${region}: ${e.message}`);
+  }
+  access = config?.access;
+  check("the install is hardened (config access)", access?.mode === "hardened", access ? `${access.owner}${access.id ? ` ${access.id}` : ""}` : "not hardened: it deploys through the CDK bootstrap roles");
+}
 const tail = access?.owner === "launch" && access.id ? `-${access.id}` : "";
 const boundaryArn = `arn:aws:iam::${account}:policy/${prefix}-boundary${tail}`;
 const deployRole = `${prefix}-deploy${tail}`;
@@ -103,7 +120,16 @@ check("no policy allows *:* on *", star.length === 0, star.join(", "));
 
 // ── The deploy role and the CDK bootstrap ────────────────────────────────
 
-try {
+let deployRoleExists = true;
+if (native && !autoUpdate) {
+  try {
+    aws("iam", "get-role", "--role-name", deployRole);
+    check("no standing deploy role (auto-update is off)", false, `${deployRole} exists: it is left from when auto-update was on (coderhelm-selfhost leftovers lists it)`);
+  } catch (e) {
+    check("no standing deploy role (auto-update is off)", e.code === "NoSuchEntity", e.code === "NoSuchEntity" ? "none" : e.message);
+  }
+  deployRoleExists = false;
+} else try {
   const d = aws("iam", "get-role", "--role-name", deployRole).Role;
   const trust = statements(d.AssumeRolePolicyDocument);
   const onlyCfn = trust.length === 1 && trust[0].Effect === "Allow" && JSON.stringify(trust[0].Principal) === JSON.stringify({ Service: "cloudformation.amazonaws.com" }) && [trust[0].Action].flat().join() === "sts:AssumeRole";
@@ -112,8 +138,14 @@ try {
   check("the deploy role's trust allows CloudFormation only", false, `${deployRole}: ${e.message}`);
 }
 const stacks = pages((m) => aws("cloudformation", "describe-stacks", ...(m ? ["--next-token", m] : []))).flatMap((p) => p.Stacks ?? []).filter((s) => s.StackName.startsWith(`${prefix}-`) && s.StackName !== `${prefix}-access`);
-const otherRole = stacks.filter((s) => s.RoleARN !== deployRoleArn).map((s) => `${s.StackName} (${s.RoleARN ?? "none"})`);
-check("every CoderHelm stack deploys through the deploy role", stacks.length > 0 && otherRole.length === 0, otherRole.join(", ") || `${stacks.length} stacks`);
+if (native) {
+  // With auto-update off a stack runs with the admin's own permissions (no role); with it on, only the deploy role.
+  const other = [parent, ...stacks].filter((s) => s.RoleARN && s.RoleARN !== deployRoleArn).map((s) => `${s.StackName} (${s.RoleARN})`);
+  check("no CoderHelm stack runs with any other role", other.length === 0, other.join(", ") || `${stacks.length + 1} stacks`);
+} else {
+  const otherRole = stacks.filter((s) => s.RoleARN !== deployRoleArn).map((s) => `${s.StackName} (${s.RoleARN ?? "none"})`);
+  check("every CoderHelm stack deploys through the deploy role", stacks.length > 0 && otherRole.length === 0, otherRole.join(", ") || `${stacks.length} stacks`);
+}
 const cdkRoles = pages((m) => aws("iam", "list-roles", ...(m ? ["--starting-token", m] : []))).flatMap((p) => p.Roles ?? []).filter((r) => /^cdk-[a-z0-9]+-(deploy|cfn-exec|file-publishing|image-publishing|lookup)-role-/.test(r.RoleName));
 const cdkUsed = stacks.filter((s) => /role\/cdk-/.test(s.RoleARN ?? "")).map((s) => s.StackName);
 check("the CDK bootstrap roles are not used by CoderHelm", cdkUsed.length === 0, cdkRoles.length ? `${cdkRoles.length} cdk-* roles exist in the account (not CoderHelm's); used by: ${cdkUsed.join(", ") || "no CoderHelm stack"}` : "no cdk-* roles in the account");
@@ -121,7 +153,8 @@ check("the CDK bootstrap roles are not used by CoderHelm", cdkUsed.length === 0,
 // ── Idle build roles: no deploy rights, no window ────────────────────────
 
 const builds = roles.filter((r) => r.RoleName === `${prefix}-update-build` || r.RoleName.startsWith(`${prefix}-installer-`));
-check("build roles found", builds.length > 0, builds.map((r) => r.RoleName).join(", "));
+if (native) check("no installer or update build (a native install updates as a stack update)", builds.length === 0, builds.map((r) => r.RoleName).join(", ") || "none");
+else check("build roles found", builds.length > 0, builds.map((r) => r.RoleName).join(", "));
 
 // The builds running as each build role right now. A build holds its window
 // from its first minute, while it downloads, checks and synthesizes the
@@ -207,7 +240,7 @@ const allow = [
 ];
 const sim = (action, resource, ctx) =>
   aws("iam", "simulate-principal-policy", "--policy-source-arn", deployRoleArn, "--action-names", action, "--resource-arns", resource, ...(ctx.length ? ["--context-entries", ...ctx] : [])).EvaluationResults?.[0]?.EvalDecision;
-try {
+if (deployRoleExists) try {
   const wrong = deny.filter(([a, r, c]) => sim(a, r, c) === "allowed").map(([a, r]) => `${a} on ${r}`);
   check("the deploy role is refused IAM users, roles without the boundary, the boundary, other roles, Organizations, CloudTrail, key deletion", wrong.length === 0, wrong.join(", ") || `${deny.length} denied`);
   const missing = allow.filter(([a, r, c]) => sim(a, r, c) !== "allowed").map(([a, r]) => `${a} on ${r}`);

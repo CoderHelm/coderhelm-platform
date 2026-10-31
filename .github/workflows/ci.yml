@@ -178,20 +178,30 @@ jobs:
       - run: npm test
       - run: sh -n ../selfhost/install.sh
 
-  launch:
-    name: Launch Stack (template and installer)
+  native:
+    name: Native release (templates, checker, lint)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: lts/*
-      # The installer the stack runs, and the release's template stamping.
+      # The read-only checker and the release's model list.
       - run: node --test selfhost/launch/*.test.mjs
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
         with:
           python-version: "3.12"
-      - name: cfn-lint the CloudFormation templates
+      # One release's parent and part templates from stub code, then cfn-lint
+      # on them and on the log reader templates (infra/lib/native).
+      - name: Build a native release and lint every template
+        working-directory: infra
         run: |
+          npm ci
+          npx tsc -p .
+          S="$RUNNER_TEMP/stubs" && mkdir -p "$S/gateway" "$S/worker" "$S/mcp" "$S/dash/_next"
+          echo stub > "$S/gateway/bootstrap" && echo stub > "$S/worker/bootstrap" && echo 'exports.handler = async () => {}' > "$S/mcp/handler.js"
+          echo '<html></html>' > "$S/dash/index.html" && echo x > "$S/dash/_next/a.js"
+          GATEWAY_ZIP="$S/gateway" WORKER_ZIP="$S/worker" MCP_PROXY_DIR="$S/mcp" CODERHELM_DASHBOARD_DIR="$S/dash" node dist/lib/native/build.js v0.0.0-ci "$RUNNER_TEMP/native"
           pip install --quiet cfn-lint==1.58.0
-          cfn-lint infra/cfn/*.yaml
+          cfn-lint ../infra/cfn/*.yaml
+          cfn-lint -i W3005 -i W2531 -- "$RUNNER_TEMP/native/coderhelm.json" "$RUNNER_TEMP/native"/stacks/*.json

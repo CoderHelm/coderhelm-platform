@@ -340,6 +340,11 @@ export interface ResolvedConfig {
   dataBucketName: string;
   sandboxBucketName: string;
   cognitoDomainPrefix: string;
+  /**
+   * A native release (infra/lib/native): one set of templates for every
+   * install, nested under the parent stack. Absent everywhere else.
+   */
+  native?: boolean;
 }
 
 export class ConfigError extends Error {

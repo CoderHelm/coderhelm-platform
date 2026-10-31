@@ -4,7 +4,7 @@ description: How a self-hosted install reports its own setup, and how the browse
 order: 13
 ---
 
-The [install guide](https://docs.coderhelm.com/self-host/install/) installs CoderHelm from your browser. It reads three things, all in your own account: the installer's progress file, your install's public `GET /api/setup/status`, and your install's GitHub App manifest landing. Nothing about your install passes through CoderHelm's servers. The hosted CoderHelm has neither route. The page counts anonymous page views with Google Analytics (origin and path only); nothing you type and nothing about your install is sent.
+The [install guide](https://docs.coderhelm.com/self-host/install/) installs CoderHelm from your browser. It reads three things, all in your own account: the install's progress file, your install's public `GET /api/setup/status`, and your install's GitHub App manifest landing. Nothing about your install passes through CoderHelm's servers. The hosted CoderHelm has neither route. The page counts anonymous page views with Google Analytics (origin and path only); nothing you type and nothing about your install is sent.
 
 ## How the install guide works
 
@@ -13,7 +13,7 @@ The [install guide](https://docs.coderhelm.com/self-host/install/) installs Code
    - a **setup key** (40 characters), kept in your browser's storage and in the stack's parameters.
 
    Quick-create links ignore hidden (NoEcho) parameters, so both values appear in the stack's Parameters tab. The setup key works only once, only on your install, and only until a GitHub App exists.
-2. **Progress.** The installer (CodeBuild, `selfhost/launch/bootstrap.mjs`) writes `status.json` to that bucket: the phase, a plain message, the step count, the part being deployed with its resources done so far (`part`: a label such as `API`, `done` and `total`, refreshed about every 15 seconds while it changes) and, at the end, your CoderHelm URL. With your own domain it also writes `domain`: the hostname, `mode` (`route53` when the deploy set it all up, `external` otherwise), `state`, and the DNS `records` to add (names and values, which are public in DNS anyway). Account numbers, ARNs and email addresses are removed before writing. The guide reads `https://coderhelm-setup-<id>.s3.<region>.amazonaws.com/status.json`. If your account blocks public bucket policies (S3 Block Public Access at account level), the file stays private and the guide asks you to paste the URL from the stack's Outputs instead. The install itself is unaffected.
+2. **Progress.** The stack's Status resource (run by the install helper) writes `status.json` to that bucket: the phase (`deploying` when the stack starts, `done` at the end, `failed` if the first launch rolls back), a plain message, the release, the install name and region, and at the end your CoderHelm URL. On a failure the message is CloudFormation's own reason for the first resource that failed. With your own domain, Settings, then System shows the DNS records to add. The guide reads `https://coderhelm-setup-<id>.s3.<region>.amazonaws.com/status.json`. If your account blocks public bucket policies (S3 Block Public Access at account level), the file stays private and the guide asks you to paste the URL from the stack's Outputs instead. The install itself is unaffected.
 3. **Checks.** Once the URL is known, the guide polls `GET <url>/api/setup/status` (below) and shows each check as waiting, passing or failing, with a fix.
 4. **GitHub App.** The guide posts a GitHub App manifest to github.com with `redirect_url` set to `<url>/api/setup/github/callback` and `state` set to the setup key. GitHub sends the browser to your install with a one-time code. Your install exchanges the code for the app's keys, stores them in its own secret, restarts its services to read them and sends you back to the guide. The keys never leave your account.
 
@@ -22,7 +22,7 @@ The [install guide](https://docs.coderhelm.com/self-host/install/) installs Code
 The guide's checks come from the install's public `GET /api/setup/status`, the same checks the CLI's `doctor` and the dashboard's setup checklist use. Its shape, codes, setup window and rate limit are documented in [Check your install](./check-your-install.md). The guide uses:
 
 - `checks[]` (`id`, `label`, `status`, `code`, `required`) for `api`, `github_app`, `github_installed`, `models`, `email`, `domain`, `updates`, `admin` and, on a hybrid install, the `hybrid_*` checks (`hybrid_registered`, `hybrid_name`, `hybrid_github`, `hybrid_jira`, `hybrid_access`, `hybrid_relay`), each code mapped to one sentence and a fix; an unknown check shows by its label.
-- `domain`: when you chose your own domain, the guide shows a Domain step between AWS and GitHub with the records from the progress file, checks until the code is `ok`, then follows the install to the domain (so the GitHub App gets the domain's URLs). You can skip it and add the domain later in Settings, then System.
+- `domain`: when you chose your own domain, the guide shows a Domain step between AWS and GitHub, checks until the code is `ok`, then follows the install to the domain (so the GitHub App gets the domain's URLs). The records to add are in Settings, then System. You can skip it and add the domain later there.
 - `github_manifest_ready`: one click when true; the terminal command (`pull`, then `github-app`) when false.
 - `setup_open: false` (someone has signed up): the install is shown as ready.
 
@@ -42,6 +42,6 @@ GitHub's manifest flow lands here with `code` and `state`. The install:
 
 - Manifest landing: `services/gateway/src/routes/setup.rs`
 - Setup checks: `services/gateway/src/routes/setup_checks.rs`
-- Launch Stack template: `infra/cfn/coderhelm-selfhost-launch.yaml`, pinned to each release by `selfhost/launch/stamp-template.mjs` and published to `s3://coderhelm-public/launch/<tag>/coderhelm-launch.yaml` by the release workflow
-- Installer run by the stack: `selfhost/launch/bootstrap.mjs`
+- Launch Stack template: `coderhelm.json`, built for each release by `infra/lib/native/` (the parent in `parent.ts`) and published to `s3://coderhelm-public/launch/<tag>/coderhelm.json` by the release workflow
+- The stack's custom resources (progress file, setup key, release copy): `lambda/native-helper/handler.py`
 - Install guide: `docs/app/self-host/install/` in the CoderHelm/coderhelm repository

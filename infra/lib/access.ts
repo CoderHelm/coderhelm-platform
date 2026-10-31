@@ -220,10 +220,8 @@ export function guardrails(n: AccessNames): Statement[] {
       Sid: "NoIamUsersOrKeys",
       Effect: "Deny",
       Action: [
-        "iam:CreateUser", "iam:CreateAccessKey", "iam:UpdateAccessKey", "iam:CreateLoginProfile", "iam:UpdateLoginProfile",
-        "iam:AttachUserPolicy", "iam:PutUserPolicy", "iam:AddUserToGroup", "iam:CreateGroup", "iam:PutGroupPolicy",
-        "iam:AttachGroupPolicy", "iam:CreateServiceSpecificCredential", "iam:UploadSSHPublicKey",
-        "iam:CreateOpenIDConnectProvider", "iam:CreateSAMLProvider", "iam:UpdateAccountPasswordPolicy", "iam:CreateAccountAlias",
+        "iam:*User*", "iam:*AccessKey*", "iam:*LoginProfile*", "iam:*Group*", "iam:*ServiceSpecificCredential*", "iam:*SSHPublicKey*",
+        "iam:Create*Provider", "iam:UpdateAccountPasswordPolicy", "iam:CreateAccountAlias",
       ],
       Resource: "*",
     },
@@ -253,6 +251,33 @@ export function guardrails(n: AccessNames): Statement[] {
       Effect: "Deny",
       Action: ["iam:DeleteRolePermissionsBoundary", "iam:CreatePolicyVersion", "iam:DeletePolicy", "iam:DeletePolicyVersion", "iam:SetDefaultPolicyVersion", "iam:TagPolicy", "iam:UntagPolicy"],
       Resource: [n.boundaryArn, a.anyRoleHere],
+    },
+    {
+      // Changes only to the install's own functions, stacks, buckets, secret
+      // and parameters (another function's code or a stack with an admin
+      // role would be a way out of this boundary). Reads and tags aside.
+      Sid: "OnlyTheInstallsOwn",
+      Effect: "Deny",
+      Action: [
+        "lambda:CreateF*", "lambda:CreateAlias", "lambda:Delete*", "lambda:Update*", "lambda:Invoke*", "lambda:Put*", "lambda:*Permission", "lambda:Publish*",
+        "cloudformation:Create*", "cloudformation:Update*", "cloudformation:Delete*", "cloudformation:Execute*", "cloudformation:Set*", "cloudformation:Continue*",
+        "s3:Put*", "s3:Delete*",
+        "secretsmanager:GetSecretValue", "secretsmanager:Put*", "secretsmanager:Update*", "secretsmanager:Delete*",
+        "ssm:Put*", "ssm:Delete*",
+      ],
+      NotResource: [
+        `arn:*:lambda:*:*:function:${n.prefix}-*`, `arn:*:lambda:*:*:layer:${n.prefix}-*`, "arn:*:lambda:*:*:event-source-mapping:*",
+        `arn:*:cloudformation:*:*:stack/${n.prefix}*`, "arn:*:cloudformation:*:aws:transform/*",
+        `arn:*:s3:::${n.prefix}-*`, "arn:*:s3:::coderhelm-setup-*",
+        `arn:*:secretsmanager:*:*:secret:${n.secretName.replace(/\/secrets$/, "")}/*`,
+        `arn:*:ssm:*:*:parameter/${n.prefix}/*`,
+      ],
+    },
+    {
+      Sid: "NoCommandsOnInstances",
+      Effect: "Deny",
+      Action: ["ssm:SendCommand", "ssm:Start*", "ssm:*Association*"],
+      Resource: "*",
     },
     {
       // The deploy role is the admin's: no release changes it.
@@ -313,8 +338,9 @@ export function boundaryPolicy(n: AccessNames): PolicyDocument {
   return doc([
     { Sid: "CoderHelmServices", Effect: "Allow", Action: BOUNDARY_SERVICES, Resource: "*" },
     { Sid: "InstallRoleWrites", Effect: "Allow", Action: ROLE_WRITES, Resource: a.role, Condition: { StringEquals: { "iam:PermissionsBoundary": n.boundaryArn } } },
-    { Sid: "InstallRoles", Effect: "Allow", Action: [...ROLE_MANAGE, "iam:PassRole"], Resource: a.role },
-    { Sid: "InstallPolicies", Effect: "Allow", Action: POLICY_MANAGE, Resource: a.policy },
+    // The same calls as ROLE_MANAGE and POLICY_MANAGE, shorter (the boundary must fit IAM's 6,144 characters).
+    { Sid: "InstallRoles", Effect: "Allow", Action: ["iam:Get*", "iam:List*", "iam:DeleteRole", "iam:UpdateRole*", "iam:UpdateAssumeRolePolicy", "iam:TagRole", "iam:UntagRole", "iam:PassRole"], Resource: a.role },
+    { Sid: "InstallPolicies", Effect: "Allow", Action: ["iam:CreatePolicy*", "iam:DeletePolicy*", "iam:Get*", "iam:List*", "iam:TagPolicy", "iam:UntagPolicy"], Resource: a.policy },
     ...guardrails(n),
   ]);
 }

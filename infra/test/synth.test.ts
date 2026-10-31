@@ -355,9 +355,10 @@ test("AWS connections: the role and update templates are released with each vers
     assert.ok(wf.includes(`cp infra/cfn/${f} dist/${f}`), `${f} is built into the release`);
     assert.ok(wf.includes(`dist/${f}`) && wf.includes(f + " "), `${f} is in SHA256SUMS`);
   }
-  assert.ok(wf.includes('k="launch/$TAG/${pair#*:}"'), "published under launch/<tag>/, which the publisher role may write");
-  for (const f of ["coderhelm-log-reader.yaml", "coderhelm-log-reader-update.yaml"]) assert.ok(wf.includes(`${f}:${f}`), `${f} is uploaded`);
-  assert.ok(wf.includes("launch-stack.yaml:coderhelm-launch.yaml"));
+  // Published write-once under launch/<tag>/, which the publisher role may write.
+  assert.ok(wf.includes('for f in coderhelm-log-reader.yaml coderhelm-log-reader-update.yaml; do put "dist/$f" "launch/$TAG/$f" text/yaml; done'));
+  assert.ok(wf.includes('put dist/coderhelm.json "launch/$TAG/coderhelm.json" application/json'), "the native parent template is published");
+  assert.ok(wf.includes("--if-none-match '*'"), "never replaced");
   const role = fs.readFileSync(path.join(INFRA, "cfn", "coderhelm-log-reader.yaml"), "utf8");
   assert.ok(role.includes('"sts:ExternalId": !Ref ExternalId'));
   assert.ok(role.includes('"aws:PrincipalArn": !Sub "arn:aws:iam::${CoderHelmAccountId}:role/${TrustedRolePrefix}*"'));

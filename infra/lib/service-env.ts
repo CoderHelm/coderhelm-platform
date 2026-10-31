@@ -101,7 +101,8 @@ export function emailEnvironment(cfg: ResolvedConfig): Record<string, string> {
   if (cfg.email.organization) env.ORGANIZATION_NAME = cfg.email.organization;
   if (cfg.layout !== "split") {
     env.OPTIONAL_EMAIL_DEFAULTS = cfg.integrations.weeklySummary ? "weekly_summary" : "";
-    env.EMAIL_TRANSPORT_DEFAULT = cfg.email.transport;
+    // A native release: the EmailTransport launch parameter.
+    env.EMAIL_TRANSPORT_DEFAULT = cfg.native ? cdk.Fn.ref("EmailTransport") : cfg.email.transport;
   }
   if (cfg.mailRelay) {
     env.HYBRID_EMAIL_FROM = cfg.mailRelay.from;
@@ -127,7 +128,8 @@ export function weeklySummaryScheduled(cfg: ResolvedConfig): boolean {
 export function modelProviderEnvironment(cfg: ResolvedConfig): Record<string, string> {
   if (cfg.models.provider !== "bedrock") return {};
   return {
-    MODEL_PROVIDER: "bedrock",
+    // A native release: the ModelProvider launch parameter (bedrock or anthropic).
+    MODEL_PROVIDER: cfg.native ? cdk.Fn.ref("ModelProvider") : "bedrock",
     BEDROCK_INFERENCE_PREFIX: cfg.models.bedrockInferencePrefix,
     BEDROCK_MODEL_IDS: JSON.stringify(cfg.models.bedrockModelIds),
   };

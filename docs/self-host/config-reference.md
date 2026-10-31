@@ -18,7 +18,7 @@ The smallest config:
 }
 ```
 
-[Everything you can set up](./options.md) lists every setting with where else to set it (the install guide, the Launch Stack, the dashboard). Two complete examples live in the repo: [`infra/config/selfhost.example.json`](../../infra/config/selfhost.example.json) (no domain, Anthropic) and [`infra/config/selfhost.domain.example.json`](../../infra/config/selfhost.domain.example.json) (your domain, Bedrock in eu-west-1). The hosted deployment's own config is [`infra/config/hosted.prod.json`](../../infra/config/hosted.prod.json).
+[Everything you can set up](./options.md) lists every setting with where else to set it (the install guide, the Launch Stack parameters, the dashboard). Two complete examples live in the repo: [`infra/config/selfhost.example.json`](../../infra/config/selfhost.example.json) (no domain, Anthropic) and [`infra/config/selfhost.domain.example.json`](../../infra/config/selfhost.domain.example.json) (your domain, Bedrock in eu-west-1). The hosted deployment's own config is [`infra/config/hosted.prod.json`](../../infra/config/hosted.prod.json).
 
 ## Where things go
 
@@ -33,7 +33,7 @@ The smallest config:
 - **`globalNameSuffix`** *string, default `-<account>`*\
   Added to S3 bucket names and the sign-in domain prefix, which must be unique across all of AWS. `""` for none.
 - **`retainData`** *boolean, default `true`*\
-  Keep tables, the data bucket, KMS keys and the user pool when stacks are deleted, and turn on table deletion protection.
+  Keep tables, the data bucket, KMS keys and the user pool when stacks are deleted, and turn on table deletion protection. An install made with Launch Stack uses the stack parameter `KeepDataOnDelete` instead ([Uninstall](./uninstall.md#keep-the-data-or-delete-it-too)).
 
 ## Domain
 

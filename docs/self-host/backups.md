@@ -8,21 +8,21 @@ order: 10
 
 - **DynamoDB tables** `coderhelm-<stage>-*`\
   *Holds:* Teams, runs, settings, plans, usage, memories' metadata.\
-  *Protection:* Point-in-time recovery (35 days) on every table; deletion protection and retention while `retainData` is true.
+  *Protection:* Point-in-time recovery (35 days) on every table; deletion protection and retention while **KeepDataOnDelete** is `true` (`retainData` on an install from before native releases).
 - **S3** `coderhelm-<stage>-data-<account>`\
   *Holds:* Run artifacts, memory snapshots, images from tickets.\
   *Protection:* Versioning (old versions kept 30 days); retained.
 - **Secrets Manager** `coderhelm/<stage>/secrets`\
   *Holds:* GitHub App keys, session signing key.\
-  *Protection:* Kept when stacks are deleted.
+  *Protection:* Kept when the stack is deleted while **KeepDataOnDelete** is `true`.
 - **KMS keys**\
   *Holds:* The keys that encrypt the tables, the bucket and sealed credentials.\
-  *Protection:* Retained, yearly rotation.
+  *Protection:* Retained while **KeepDataOnDelete** is `true`, yearly rotation.
 - **Cognito user pool**\
   *Holds:* Accounts and passwords.\
-  *Protection:* Retained while `retainData` is true.
+  *Protection:* Retained while **KeepDataOnDelete** is `true` (`retainData` on an install from before native releases).
 
-Everything else (functions, queues, the dashboard bucket, logs) is rebuilt by a deploy.
+Everything else (functions, queues, the dashboard bucket, logs) is rebuilt by a deploy. See [Uninstall](./uninstall.md#keep-the-data-or-delete-it-too) for what deleting the stack keeps.
 
 ## On-demand backups
 
