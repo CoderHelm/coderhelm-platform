@@ -311,4 +311,6 @@ It answers only while the setup window is open: until the first person has an ac
   "checks": [{ "id": "admin", "label": "First admin signed up", "status": "pass", "code": "ok" }] }
 ```
 
+On a hybrid install with **Link through CoderHelm** on (Settings, Integrations, Jira), the `hybrid_jira` check (`no_link`, `syncing` or `ok`, optional) stays in that list before `admin`, since linking a Jira site needs an install admin and so comes after sign-up.
+
 and the guide sends people to sign in, where the admin checklist (`/api/system/checks`) takes over.

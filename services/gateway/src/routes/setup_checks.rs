@@ -2262,9 +2262,17 @@ pub fn public_status(
     })
 }
 
-/// The answer once the setup window has closed: nothing to show the guide
-/// but "done, sign in".
-pub fn closed_status(version: Value) -> Value {
+/// The answer once the setup window has closed: "done, sign in", plus the
+/// hybrid checks that only start after sign-up (the Jira link), before the
+/// admin check. They're optional, so it's still ready.
+pub fn closed_status_with(version: Value, after_signup: Vec<Value>) -> Value {
+    let mut checks = after_signup;
+    checks.push(public_json(&PublicCheck::new(
+        "admin",
+        "First admin signed up",
+        "pass",
+        "ok",
+    )));
     json!({
         "schema": 1,
         "service": "coderhelm",
@@ -2273,7 +2281,7 @@ pub fn closed_status(version: Value) -> Value {
         "version": version,
         "ready": true,
         "github_manifest_ready": false,
-        "checks": [public_json(&PublicCheck::new("admin", "First admin signed up", "pass", "ok"))],
+        "checks": checks,
     })
 }
 
@@ -2510,7 +2518,15 @@ pub async fn status(
     }
     let version = super::system::stamp()["version"].clone();
     if !setup_open(&state).await {
-        return (cors, Json(closed_status(version))).into_response();
+        // Linking a Jira site through CoderHelm needs an install admin, so
+        // the guide follows it after sign-up: its check stays (codes only).
+        let jira =
+            super::hybrid_install::public_jira_check(&state, q.fresh.as_deref() == Some("1")).await;
+        return (
+            cors,
+            Json(closed_status_with(version, jira.into_iter().collect())),
+        )
+            .into_response();
     }
     let keep = if q.fresh.as_deref() == Some("1") {
         FRESH_FOR
@@ -3085,11 +3101,22 @@ mod tests {
 
     #[test]
     fn the_closed_window_says_only_done() {
-        let v = closed_status(json!("v0.7.0"));
+        let v = closed_status_with(json!("v0.7.0"), vec![]);
         assert_eq!(v["setup_open"], false);
         assert_eq!(v["ready"], true);
         assert_eq!(v["checks"].as_array().unwrap().len(), 1);
         assert_eq!(v["checks"][0]["id"], "admin");
+        // The Jira link, made after sign-up, stays visible to the guide.
+        let jira = json!({ "id": "hybrid_jira", "status": "wait", "code": "syncing", "label": "Jira through CoderHelm", "required": false });
+        let v = closed_status_with(json!("v0.8.1"), vec![jira]);
+        assert_eq!(v["ready"], true);
+        let ids: Vec<_> = v["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| c["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(ids, ["hybrid_jira", "admin"]);
     }
 
     // ── Your own domain ──

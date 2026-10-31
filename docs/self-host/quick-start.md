@@ -6,6 +6,8 @@ order: 1
 
 **No terminal?** The [install guide](https://docs.coderhelm.com/self-host/install/) installs CoderHelm from your browser: one click opens AWS with everything filled in, then it creates your GitHub App, checks model access and confirms every step against your own install. You only need to be signed in to AWS and GitHub.
 
+In the guide's **Hybrid** setup, CoderHelm sets up a `yourname.coderhelm.com` address, **CoderHelm's GitHub App** (install one app on your organization) and **CoderHelm's Jira app** (link your Jira site after you sign up: the guide opens your install's Settings, Integrations, Jira with the site filled in, you confirm a code on app.coderhelm.com, and it follows the link until it's live). Each is a toggle; see [Hybrid](./hybrid.md).
+
 The rest of this page is the terminal install. You need an AWS account you can administer, Node.js 20 or newer and the AWS CLI v2. The guided install checks both and tells you how to fix anything missing. See [Requirements](./requirements.md).
 
 ```sh
