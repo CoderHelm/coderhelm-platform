@@ -70,7 +70,9 @@ See [Model providers](./model-providers.md).
 - **`email.from`** *string, required*\
   The sender of every email.
 - **`email.fromName`** *string, default `CoderHelm`*\
-  Display name.
+  Display name for email sent through your own Amazon SES. Left at the default, the name is built from `email.organization` (`Acme CoderHelm`), else your install's own address, else plain `CoderHelm`; never the `*.cloudfront.net` address.
+- **`email.organization`** *string, optional*\
+  Your organization's name, such as `Acme`. Emails come from `Acme CoderHelm` and their subjects start with it (`Acme CoderHelm: update to v0.8.0 needs your OK`), by either route. Through CoderHelm's mail service the name must not read as CoderHelm itself (support, billing, security and similar words are refused); the install's own address is used instead.
 - **`email.supportInbox`** *string, default `email.from`*\
   Where support requests from the dashboard go.
 - **`email.identity`** *string or null, default the domain of `from`*\

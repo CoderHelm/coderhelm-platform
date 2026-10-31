@@ -258,7 +258,7 @@ async fn tell_admins(state: &WorkerState, install: &str, reason: &str) {
     ) else {
         return;
     };
-    let email = templates::render(t, &v, "your install", None);
+    let email = templates::render(t, &v, "your install", None, None);
     use common::mcp_credentials::Cipher;
     for i in items {
         let admin = i
@@ -381,7 +381,7 @@ mod tests {
         let params = json!({"reason": "bounces"});
         let (t, v) =
             templates::check("relay_paused", params.as_object().unwrap(), &[], false).unwrap();
-        let r = templates::render(t, &v, "your install", None);
+        let r = templates::render(t, &v, "your install", None, None);
         assert!(r.text.contains("bounces"));
         assert!(!r.text.contains("http"));
     }

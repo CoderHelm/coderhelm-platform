@@ -453,29 +453,302 @@ def relay_credentials(env):
     return None
 
 
-def update_params(what, version, env):
-    p = {"what": what if what in UPDATE_WHAT else "available", "link": f"{app_url(env)}/settings/system/"}
+# ── Update notices ────────────────────────────────────────────────────────
+#
+# One notice, two routes: CoderHelm's mail relay writes it from the
+# `update_notice` template (services/common/src/mail/templates.rs) with the
+# parameters below; the install's own SES gets the same parts written here.
+# Keep the two in step (the golden files under services/common/src/mail/golden
+# show the relay's).
+
+CLI = "npx -y github:CoderHelm/coderhelm-platform"
+CODERHELM_ZONE = "coderhelm.com"
+NOTICE_SUBJECTS = {
+    "available": "{version} is available",
+    "succeeded": "updated to {version}",
+    "failed": "update to {version} failed",
+    "rolled_back": "update to {version} rolled back",
+    "blocked": "update to {version} needs your OK",
+    "domain_live": "the new address is live",
+    "domain_failed": "the address change failed",
+    "domain_removed": "back on the AWS address",
+}
+# The relay refuses an email whose text reads as CoderHelm staff speaking
+# (templates::uses_reserved_wording): such a part is left out instead.
+RESERVED_PHRASES = ("coderhelm support", "coderhelm security", "coderhelm team", "coderhelm staff",
+                    "coderhelm billing", "coderhelm trust", "coderhelm admin", "from coderhelm", "coderhelm account")
+LIMITS = {"checked_at": 40, "reason": 1500, "action": 800, "waiting": 160, "notes": 1200}
+AWS_HOST_RE = re.compile(r"cloudfront\.net|amazonaws\.com|awsapps\.com", re.I)
+
+
+def checked_at(now):
+    return now.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+
+
+def fit(text, limit):
+    text = str(text or "").strip()
+    return text if len(text) <= limit else text[: limit - 1] + "…"
+
+
+def reserved(text):
+    squashed = re.sub(r"[^a-z0-9]+", " ", str(text).lower()).strip().replace("coder helm", "coderhelm")
+    return any(p in squashed for p in RESERVED_PHRASES)
+
+
+def org_name(env):
+    """email.organization, else email.fromName without a trailing "CoderHelm"."""
+    org = " ".join((env.get("ORGANIZATION_NAME") or "").split())
+    if org:
+        return org
+    name = " ".join((env.get("EMAIL_FROM_NAME") or "").split())
+    if not name or name.lower() == "coderhelm":
+        return None
+    if name.lower().endswith(" coderhelm"):
+        name = name[: -len(" coderhelm")].strip()
+    return name or None
+
+
+def host_label(host):
+    """The install's own address as a name: `acme` for acme.coderhelm.com, a
+    custom domain as written, never an AWS host."""
+    h = (host or "").strip().rstrip(".").lower()
+    if not h or AWS_HOST_RE.search(h) or not re.fullmatch(r"[a-z0-9.-]{1,80}", h):
+        return None
+    if h.endswith("." + CODERHELM_ZONE):
+        name = h[: -len(CODERHELM_ZONE) - 1]
+        return name if name and "." not in name else None
+    return h
+
+
+def install_host(env):
+    url = app_url(env)
+    return url.split("://", 1)[-1].split("/", 1)[0]
+
+
+def notice_label(env):
+    """The install's name for its own SES mail: its organization, else its address."""
+    org = org_name(env)
+    if org and not AWS_HOST_RE.search(org):
+        return org[:40]
+    return host_label(install_host(env))
+
+
+def subject_prefix(label):
+    return f"{label} CoderHelm: " if label else "Your CoderHelm install: "
+
+
+def sender_name(env):
+    """email.fromName when an admin set one, else `<label> CoderHelm`."""
+    name = " ".join((env.get("EMAIL_FROM_NAME") or "").split())
+    if name and name != "CoderHelm" and not AWS_HOST_RE.search(name):
+        return name
+    label = notice_label(env)
+    return f"{label} CoderHelm" if label else "CoderHelm"
+
+
+def from_header(name, address):
+    """RFC 5322 From: quoted ASCII name, or RFC 2047 encoded words."""
+    import base64
+    if "<" in address:
+        return address
+    name = " ".join(re.sub(r'["\\<>\x00-\x1f\x7f]', "", name or "").split())
+    if not name:
+        return address
+    if name.isascii():
+        return f'"{name}" <{address}>'
+    words, chunk = [], ""
+    for ch in name:
+        if len((chunk + ch).encode()) > 45:
+            words.append(chunk)
+            chunk = ""
+        chunk += ch
+    words.append(chunk)
+    enc = " ".join(f"=?UTF-8?B?{base64.b64encode(w.encode()).decode()}?=" for w in words if w)
+    return f"{enc} <{address}>"
+
+
+def notice_link(what, env):
+    anchor = {"blocked": "#readiness", "domain_live": "#domain", "domain_failed": "#domain",
+              "domain_removed": "#domain"}.get(what, "")
+    return f"{app_url(env)}/settings/system/{anchor}"
+
+
+def update_params(what, version, env, facts=None):
+    """The relay's `update_notice` parameters: typed, within the template's
+    limits, and only parts the relay will accept."""
+    what = what if what in UPDATE_WHAT else "available"
+    p = {"what": what, "link": notice_link(what, env)}
     if version and NOTICE_VERSION_RE.match(str(version)):
         p["version"] = str(version)
+        if not what.startswith("domain_"):
+            p["notes_link"] = f"{app_url(env)}/settings/system/#version"
+    facts = facts or {}
+    cur = facts.get("current")
+    if cur and NOTICE_VERSION_RE.match(str(cur)):
+        p["current"] = str(cur)
+    for k, limit in LIMITS.items():
+        v = facts.get(k)
+        if not v:
+            continue
+        v = fit(" ".join(str(v).split()) if k in ("checked_at", "waiting") else v, limit)
+        if not reserved(v):
+            p[k] = v
+    if facts.get("major"):
+        p["major"] = "yes"
     return p
 
 
-def notify(subject, text, env=None, what="available", version=None, opener=None):
+def notice(what, version, env, facts=None):
+    """The subject, text and HTML of an update notice for the install's own
+    SES, the same parts as the relay's template."""
+    p = update_params(what, version, env, facts)
+    v = dict(p, install=install_host(env))
+    for k in ("reason", "action", "notes"):
+        if (facts or {}).get(k):
+            v[k] = fit((facts or {})[k], 4000)
+    w = p["what"]
+    parts = {
+        "available": [
+            ("p", "CoderHelm {version} is out, and this install can move to it."),
+            ("facts", [("Install", "{install}"), ("Running now", "{current}"), ("New release", "{version}"),
+                       ("Not applied yet because", "{waiting}"), ("Checked", "{checked_at}")]),
+            ("p", "This is a major release. Read its notes before you update." if v.get("major") else ""),
+            ("quote", "What's new", "notes"),
+            ("p", "To update, open Settings, then System, and press Update now to {version}. Or run this where the install's AWS sign-in works:"),
+            ("cmd", CLI + " update --to {version}"),
+        ],
+        "blocked": [
+            ("p", "This install won't update to {version} until someone fixes what the update check found. Nothing has changed yet."),
+            ("facts", [("Install", "{install}"), ("Running now", "{current}"), ("Waiting to install", "{version}"),
+                       ("Checked", "{checked_at}")]),
+            ("quote", "Why it's blocked", "reason"),
+            ("quote", "What to do", "action"),
+            ("p", "Once it is fixed, open Settings, then System, then Update readiness, and press Check again. Once it passes, press Update now to {version}. The check also runs by itself every day, and with automatic updates on the update then goes ahead on its own."),
+            ("p", "From a terminal, see what fails and how to fix it, then update:"),
+            ("cmd", CLI + " doctor"),
+            ("cmd", CLI + " update --to {version}"),
+        ],
+        "succeeded": [
+            ("p", "This install finished updating to {version}."),
+            ("facts", [("Install", "{install}"), ("Updated from", "{current}"), ("Now running", "{version}"),
+                       ("Finished", "{checked_at}")]),
+            ("quote", "Notes from the update", "reason"),
+            ("p", "Nothing to do. The release notes say what changed."),
+        ],
+        "failed": [
+            ("p", "The update to {version} failed."),
+            ("facts", [("Install", "{install}"), ("Was running", "{current}"), ("Tried to install", "{version}"),
+                       ("Failed", "{checked_at}")]),
+            ("quote", "What went wrong", "reason"),
+            ("quote", "What to do", "action"),
+            ("p", "Open Settings, then System, then Update history for the full log. Fix what it shows, then press Update now to try again. From a terminal:"),
+            ("cmd", CLI + " doctor"),
+            ("cmd", CLI + " update --to {version}"),
+        ],
+        "rolled_back": [
+            ("p", "This install tried {version}, found it unhealthy, and went back to the release it ran before."),
+            ("facts", [("Install", "{install}"), ("Running now", "{current}"), ("Tried", "{version}"),
+                       ("Rolled back", "{checked_at}")]),
+            ("quote", "What went wrong", "reason"),
+            ("quote", "What to do", "action"),
+            ("p", "Open Settings, then System, then Update history for the full log. Fix what it shows, then press Update now to try again. From a terminal:"),
+            ("cmd", CLI + " doctor"),
+            ("cmd", CLI + " update --to {version}"),
+        ],
+        "domain_live": [
+            ("p", "This install now answers on its new address. Tell your team to sign in there from now on."),
+            ("facts", [("Install", "{install}"), ("Changed", "{checked_at}")]),
+        ],
+        "domain_failed": [
+            ("p", "This install couldn't change its address, so it still answers on the old one."),
+            ("facts", [("Install", "{install}"), ("Tried", "{checked_at}")]),
+            ("quote", "What went wrong", "reason"),
+            ("p", "Open Settings, then System, then Domain to see the DNS records and certificate it waits for. Fix them and try again."),
+        ],
+        "domain_removed": [
+            ("p", "This install is back on its AWS address. People sign in there from now on."),
+            ("facts", [("Install", "{install}"), ("Changed", "{checked_at}")]),
+        ],
+    }[w]
+    buttons = [("Open Update readiness" if w == "blocked" else "Open Settings, System", "link"),
+               ("Read the release notes", "notes_link")]
+
+    def slots(t):
+        return re.findall(r"\{(\w+)\}", t)
+
+    def complete(t):
+        return bool(t) and all(v.get(n) for n in slots(t))
+
+    def fill(t):
+        return re.sub(r"\{(\w+)\}", lambda m: str(v.get(m.group(1), "")), t)
+
+    def esc(t):
+        return (t.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+                .replace('"', "&quot;").replace("'", "&#39;"))
+
+    text, html = [], []
+    for part in parts:
+        kind = part[0]
+        if kind == "p" and complete(part[1]):
+            text.append(fill(part[1]))
+            html.append(f'<p style="color:#222;font-size:15px;line-height:1.5;margin:0 0 16px">{esc(fill(part[1]))}</p>')
+        elif kind == "facts":
+            rows = [(label, fill(val)) for label, val in part[1] if complete(val)]
+            if rows:
+                text.append("\n".join(f"{label}: {val}" for label, val in rows))
+                html.append('<table role="presentation" style="border-collapse:collapse;margin:0 0 16px">' + "".join(
+                    f'<tr><td style="color:#666;font-size:14px;padding:3px 16px 3px 0;vertical-align:top;white-space:nowrap">{esc(label)}</td>'
+                    f'<td style="color:#222;font-size:14px;padding:3px 0;vertical-align:top">{esc(val)}</td></tr>' for label, val in rows) + "</table>")
+        elif kind == "quote" and v.get(part[2]):
+            q = str(v[part[2]])
+            text.append(part[1] + ":\n" + "\n".join("> " + line for line in q.splitlines()))
+            html.append(f'<p style="color:#222;font-size:14px;font-weight:600;margin:0 0 6px">{esc(part[1])}</p>'
+                        f'<blockquote style="border-left:3px solid #ccc;margin:0 0 16px;padding:4px 12px;color:#444;white-space:pre-wrap">{esc(q)}</blockquote>')
+        elif kind == "cmd" and complete(part[1]):
+            text.append("    " + fill(part[1]))
+            html.append('<pre style="background:#f5f5f5;border:1px solid #e5e5e5;border-radius:6px;padding:10px 12px;margin:0 0 16px;'
+                        'font-family:SFMono-Regular,Menlo,Consolas,monospace;font-size:13px;color:#222;white-space:pre-wrap;word-break:break-all">'
+                        f"<code>{esc(fill(part[1]))}</code></pre>")
+    for label, key in buttons:
+        if v.get(key):
+            text.append(f"{label}: {v[key]}")
+            html.append(f'<p style="margin:0 0 16px"><a href="{esc(v[key])}" style="display:inline-block;background:#222;color:#fff;'
+                        f'padding:10px 16px;border-radius:6px;text-decoration:none">{esc(label)}</a></p>')
+    footer = f"Sent by the self-hosted CoderHelm install at {v['install']} to its admins."
+    text += ["", footer]
+    html.append(f'<p style="color:#777;font-size:12px;border-top:1px solid #ddd;padding-top:12px;margin-top:24px">{esc(footer)}</p>')
+    base = NOTICE_SUBJECTS[w]
+    subject = fill(base) if complete(base) else "an update notice"
+    return {
+        "subject": subject_prefix(notice_label(env)) + subject,
+        "base_subject": subject,
+        "text": "\n\n".join(text),
+        "html": "<!DOCTYPE html><html><head><meta charset=\"utf-8\"></head><body style=\"font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:#fff;padding:24px\">"
+                + "".join(html) + "</body></html>",
+        "params": p,
+    }
+
+
+def notify(subject, text, env=None, what="available", version=None, opener=None, facts=None):
     """Email every install admin by the install's route (its own SES, or
     CoderHelm's mail relay when an admin chose it, never both), and post to
-    the updates webhook if set. A CoderHelm address is never emailed."""
+    the updates webhook if set. A CoderHelm address is never emailed.
+    `subject` and `text` are what the webhook posts; the emails are written
+    from `what`, `version` and `facts` ([`notice`])."""
     env = os.environ if env is None else env
     admins = [a.strip() for a in (env.get("ADMIN_EMAILS") or "").split(",") if a.strip()]
     admins = [a for a in admins if not CODERHELM_ADDRESS.search(a)]
     sender = env.get("SES_FROM_ADDRESS")
     sent = 0
+    n = notice(what, version, env, facts)
     transport = email_transport(env) if admins else None
     if admins and transport == "ses" and sender:
         try:
             client("sesv2").send_email(
-                FromEmailAddress=sender,
+                FromEmailAddress=from_header(sender_name(env), sender),
                 Destination={"ToAddresses": admins},
-                Content={"Simple": {"Subject": {"Data": subject}, "Body": {"Text": {"Data": text}}}},
+                Content={"Simple": {"Subject": {"Data": n["subject"]},
+                                    "Body": {"Text": {"Data": n["text"]}, "Html": {"Data": n["html"]}}}},
             )
             sent += 1
         except Exception as e:
@@ -493,20 +766,24 @@ def notify(subject, text, env=None, what="available", version=None, opener=None)
                     "add": [{"email": a, "kind": "admin"} for a in admins],
                 }, opener)
                 for a in admins:
-                    relay_call(env, creds, "/hybrid/email", {
+                    body = {
                         "request_id": uuid.uuid4().hex,
                         "to": a,
                         "template": "update_notice",
-                        "params": update_params(what, version, env),
+                        "params": n["params"],
                         "contact": admins[0],
-                    }, opener)
+                    }
+                    org = org_name(env)
+                    if org:
+                        body["org"] = org
+                    relay_call(env, creds, "/hybrid/email", body, opener)
                 sent += 1
             except Exception as e:
                 logger.warning(f"Update email not sent through CoderHelm: {e}")
     hook = env.get("UPDATE_WEBHOOK_URL")
     if hook and hook.startswith("https://"):
         try:
-            body = json.dumps({"text": f"{subject}\n{text}"}).encode()
+            body = json.dumps({"text": f"{subject_prefix(notice_label(env))}{subject}\n{text}"}).encode()
             req = urllib.request.Request(hook, data=body, headers={"content-type": "application/json"}, method="POST")
             urllib.request.urlopen(req, timeout=10).close()
             sent += 1
@@ -781,17 +1058,18 @@ def domain_finished(store, env, now, entry, status):
     if status == "succeeded":
         if removing:
             store.put("DOMAIN", {})
-            subject = "CoderHelm is back on its AWS address"
+            subject = "back on the AWS address"
         else:
             dom = dict(dom, state="live", reason="")
             store.put("DOMAIN", dom)
-            subject = f"CoderHelm now answers on {dom.get('hostname')}"
+            subject = f"now answers on {dom.get('hostname')}"
     else:
         dom = dict(dom, state="failed", reason=entry.get("reason") or "the build failed: see its log")
         store.put("DOMAIN", dom)
-        subject = "CoderHelm could not change its address"
+        subject = "the address change failed"
     what = "domain_failed" if status != "succeeded" else ("domain_removed" if removing else "domain_live")
-    notify(subject, f"{entry.get('reason') or 'Done.'}\nActor: {entry.get('actor', 'auto')}\n{app_url(env)}/settings/system/#domain", env, what=what)
+    notify(subject, f"{entry.get('reason') or 'Done.'}\nActor: {entry.get('actor', 'auto')}\n{app_url(env)}/settings/system/#domain", env, what=what,
+           facts={"checked_at": checked_at(now), "reason": dom.get("reason") if status != "succeeded" else None})
     return {"status": status, "domain": dom.get("state") or "none"}
 
 
@@ -962,6 +1240,17 @@ def needs_check(record, version, now):
     return now - at >= MODEL_RETRY
 
 
+def blocked_reason(record):
+    """Why the update is held: each refused model and what it said."""
+    return "\n".join(f"- {f.get('model')}: {f.get('detail')}" for f in failures(record, required=True))
+
+
+def blocked_action(record):
+    """What a person does about it: each refused model's fix."""
+    fixes = [f"- {f.get('model')}: {f.get('fix')}" for f in failures(record, required=True) if f.get("fix")]
+    return "\n".join(fixes + ["Agreeing to model terms and the Bedrock use case form are done by a person in the AWS console; the install only checks."])
+
+
 def blocked_text(record, env):
     lines = []
     for f in failures(record, required=True):
@@ -976,10 +1265,19 @@ def blocked_text(record, env):
     )
 
 
+def checked(record):
+    try:
+        return datetime.fromisoformat(record["checked_at"])
+    except (KeyError, TypeError, ValueError):
+        return datetime.now(timezone.utc)
+
+
 def notify_blocked(store, env, record):
     if record.get("notified") or not failures(record, required=True):
         return
-    notify(f"Update to {record['version']} needs your action", blocked_text(record, env), env, what="blocked", version=record.get("version"))
+    notify(f"update to {record['version']} needs your OK", blocked_text(record, env), env, what="blocked", version=record.get("version"),
+           facts={"current": env.get("CODERHELM_VERSION"), "checked_at": checked_at(checked(record)),
+                  "reason": blocked_reason(record), "action": blocked_action(record)})
     record["notified"] = True
     store.put("MODEL_CHECK", record)
 
@@ -1270,13 +1568,19 @@ def handle(event, env, store, now, fetch=fetch_releases, probe=None):
         if status == "succeeded" and parse_version(version):
             state["ran_versions"] = sorted(set(state.get("ran_versions") or []) | {version})
         store.put("UPDATE_STATE", state)
-        words = {"succeeded": "is now on", "failed": "could not update to", "rolled_back": "rolled back after trying"}[status]
         notify(
-            f"CoderHelm {words} {version}",
+            NOTICE_SUBJECTS[status].format(version=version),
             f"{entry.get('reason') or 'Done.'}\nActor: {entry.get('actor', 'auto')}\n{app_url(env)}/settings/system/",
             env,
             what=status,
             version=version,
+            facts={
+                "current": entry.get("from_version"),
+                "checked_at": checked_at(now),
+                "reason": entry.get("reason"),
+                "action": None if status == "succeeded" else
+                "Open the update's log under Settings, System, Update history, fix what it names, then press Update now.",
+            },
         )
         return {"status": status, "version": version}
 
@@ -1309,13 +1613,15 @@ def handle(event, env, store, now, fetch=fetch_releases, probe=None):
         if d["action"] in ("notify", "update") and state.get("notified_version") != d.get("version"):
             latest = pick_latest(rel, settings["channel"], current) or {}
             notify(
-                f"CoderHelm {d['version']} is available",
+                f"{d['version']} is available",
                 f"You run {current or 'an unknown version'}. {d['reason'].capitalize()}.\n"
                 f"{'This is a major release. ' if latest.get('breaking') else ''}"
                 f"Release notes and Update now: {app_url(env)}/settings/system/",
                 env,
                 what="available",
                 version=d["version"],
+                facts={"current": current, "checked_at": checked_at(now), "waiting": d["reason"],
+                       "notes": latest.get("notes"), "major": latest.get("breaking")},
             )
             state = store.get("UPDATE_STATE", {})
             state["notified_version"] = d["version"]

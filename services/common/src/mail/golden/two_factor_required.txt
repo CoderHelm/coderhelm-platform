@@ -1,0 +1,12 @@
+From: "Acme CoderHelm" <notifications@notify.coderhelm.com>
+Subject: Acme CoderHelm: two-factor sign-in is now required
+
+An admin now requires two-factor sign-in for you.
+
+The next time you sign in, you'll set up an authenticator app on your phone first (it takes about a minute); nothing else works until then. You can do it now instead.
+
+Set it up now: https://helm.example.org/settings/security/
+
+
+
+Sent through CoderHelm's mail service for the self-hosted CoderHelm install at helm.example.org. Links in this email go only to that install. Questions about it go to the install's admin, admin@example.org. CoderHelm never asks for your password or sign-in codes by email.

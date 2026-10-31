@@ -127,8 +127,21 @@ async fn relay_status(state: &AppState) -> Option<Value> {
     let creds = common::hybrid::client::credentials()?;
     common::hybrid::client::call(&state.http, &creds, "GET", relay::PATH_STATUS, None)
         .await
+        .map(|v| with_org_name(v, mail::naming::org_from_env().as_deref()))
         .map_err(|e| json!({ "error": e.code, "message": e.message }))
         .map_or_else(Some, Some)
+}
+
+/// The relay's status names the install by its address; the organization
+/// this install's config names goes first when the relay would accept it
+/// (the same rule it applies to each email).
+fn with_org_name(mut status: Value, org: Option<&str>) -> Value {
+    if let Some(label) = org.and_then(mail::naming::org_label) {
+        if status.get("display_name").is_some() {
+            status["display_name"] = json!(mail::naming::display_name(Some(&label)));
+        }
+    }
+    status
 }
 
 /// GET /api/system/emails
@@ -329,5 +342,23 @@ mod tests {
         for w in ["address", "template id", "parameters", "metadata"] {
             assert!(TRUST_NOTE.contains(w), "{w}");
         }
+    }
+
+    #[test]
+    fn the_relay_status_shows_the_organizations_sender_name() {
+        let status = json!({"display_name": "acme CoderHelm", "sent_today": 1});
+        assert_eq!(
+            super::with_org_name(status.clone(), Some("Acme"))["display_name"],
+            "Acme CoderHelm"
+        );
+        // A name the relay would refuse isn't shown either.
+        assert_eq!(
+            super::with_org_name(status.clone(), Some("CoderHelm Support"))["display_name"],
+            "acme CoderHelm"
+        );
+        assert_eq!(
+            super::with_org_name(status, None)["display_name"],
+            "acme CoderHelm"
+        );
     }
 }

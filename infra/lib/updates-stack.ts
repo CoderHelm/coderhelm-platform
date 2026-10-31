@@ -364,6 +364,9 @@ export class UpdatesStack extends cdk.Stack {
         UPDATE_DEFAULTS: JSON.stringify(cfg.updates.defaults),
         ADMIN_EMAILS: cfg.admins.join(","),
         SES_FROM_ADDRESS: cfg.email.from,
+        // The sender name and subject prefix, as the services use them.
+        EMAIL_FROM_NAME: cfg.email.fromName,
+        ORGANIZATION_NAME: cfg.email.organization,
         APP_URL: props.appUrl,
         RELEASE_REPO,
         // Restarted after the gateway stores new keys (refresh_secrets).

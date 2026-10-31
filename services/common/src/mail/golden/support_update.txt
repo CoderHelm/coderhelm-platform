@@ -1,0 +1,15 @@
+From: "Acme CoderHelm" <notifications@notify.coderhelm.com>
+Subject: Acme CoderHelm: news on a support ticket
+
+There is news on the support ticket "Runs stop after the build step".
+
+The update:
+> Fixed in v0.8.1: update when you can.
+
+Reply or follow it from the ticket page.
+
+Open the ticket: https://helm.example.org/support/ticket/?id=7
+
+
+
+Sent through CoderHelm's mail service for the self-hosted CoderHelm install at helm.example.org. Links in this email go only to that install. Questions about it go to the install's admin, admin@example.org. CoderHelm never asks for your password or sign-in codes by email.

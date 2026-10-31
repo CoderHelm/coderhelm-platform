@@ -2345,7 +2345,7 @@ mod tests {
         let host = common::public_urls::host_of(EXAMPLE_SELF_HOST).to_string();
         let (t, v) =
             templates::check("weekly_summary", &params, std::slice::from_ref(&host), true).unwrap();
-        let r = templates::render(t, &v, &host, None);
+        let r = templates::render(t, &v, &host, None, None);
         common::public_urls::override_for_this_thread(None);
         for part in [&r.subject, &r.text, &r.html] {
             assert_eq!(hosted_mentions(part), Vec::<String>::new());

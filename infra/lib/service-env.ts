@@ -95,7 +95,10 @@ export function emailEnvironment(cfg: ResolvedConfig): Record<string, string> {
   const env: Record<string, string> = {
     DEPLOYMENT_KIND: cfg.layout === "split" ? "hosted" : "self-hosted",
     SUPPORT_INBOX: cfg.email.supportInbox,
+    // The sender name and subject prefix (common::mail::naming).
+    EMAIL_FROM_NAME: cfg.email.fromName,
   };
+  if (cfg.email.organization) env.ORGANIZATION_NAME = cfg.email.organization;
   if (cfg.layout !== "split") {
     env.OPTIONAL_EMAIL_DEFAULTS = cfg.integrations.weeklySummary ? "weekly_summary" : "";
     env.EMAIL_TRANSPORT_DEFAULT = cfg.email.transport;

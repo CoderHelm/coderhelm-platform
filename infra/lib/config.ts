@@ -129,6 +129,13 @@ export interface CoderhelmConfig {
     from: string;
     /** Display name. Default `CoderHelm`. */
     fromName?: string;
+    /**
+     * Your organization's name (`Acme`). Emails then come from
+     * `Acme CoderHelm` and their subjects start with it, so people can tell
+     * which install wrote. Default: none (the install's own address, then
+     * plain `CoderHelm`).
+     */
+    organization?: string;
     /** Where support requests from the dashboard go. Default: `from`. */
     supportInbox?: string;
     /**
@@ -294,6 +301,7 @@ export interface ResolvedConfig {
   email: {
     from: string;
     fromName: string;
+    organization: string;
     supportInbox: string;
     identity: string | null;
     sesRegion: string;
@@ -515,6 +523,12 @@ export function validateConfig(c: unknown): string[] {
         }
       }
     }
+    for (const k of ["fromName", "organization"] as const) {
+      const v = e[k];
+      if (v !== undefined && (typeof v !== "string" || v.trim().length > 60 || /[\r\n<>"\\]/.test(v))) {
+        p.push(`email.${k}: up to 60 characters, without line breaks, quotes, backslashes or angle brackets`);
+      }
+    }
     if (e.sesRegion !== undefined && !REGION_RE.test(String(e.sesRegion))) {
       p.push("email.sesRegion: an AWS region");
     }
@@ -675,6 +689,7 @@ export function resolveConfig(cfg: CoderhelmConfig, opts: { skipValidation?: boo
     email: {
       from: e.from,
       fromName: e.fromName ?? "CoderHelm",
+      organization: (e.organization ?? "").trim(),
       supportInbox: e.supportInbox ?? e.from,
       identity: e.identity === undefined ? fromDomain || null : e.identity,
       sesRegion: e.sesRegion ?? cfg.region,

@@ -1,0 +1,17 @@
+From: "Acme CoderHelm" <notifications@notify.coderhelm.com>
+Subject: Acme CoderHelm: you're invited to join a team
+
+Dana Lee invited you to the Platform workspace on your organization's CoderHelm.
+
+Team: Platform
+Your role: member
+Invited by: Dana Lee
+Install: helm.example.org
+
+Press the button to create your account (or sign in) and join. If you weren't expecting this, ignore it: nothing happens until you accept.
+
+Accept the invite: https://helm.example.org/invite/?code=abc
+
+
+
+Sent through CoderHelm's mail service for the self-hosted CoderHelm install at helm.example.org. Links in this email go only to that install. Questions about it go to the install's admin, admin@example.org. CoderHelm never asks for your password or sign-in codes by email.

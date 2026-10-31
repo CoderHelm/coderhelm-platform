@@ -1,0 +1,23 @@
+From: "Acme CoderHelm" <notifications@notify.coderhelm.com>
+Subject: Acme CoderHelm: your week: 14 merged, 22 runs
+
+Platform's week with CoderHelm, Oct 19 to Oct 25.
+
+Pull requests merged: 14
+Runs finished: 22
+Reviews written: 31
+Waiting on someone: 2
+
+Highlights:
+> Billing page shipped.
+> Flaky test in api fixed.
+
+Anything waiting on someone is on the Runs page, oldest first.
+
+Open CoderHelm: https://helm.example.org/
+
+Stop these emails: https://helm.example.org/unsubscribe/?t=SIGNED
+
+
+
+Sent through CoderHelm's mail service for the self-hosted CoderHelm install at helm.example.org. Links in this email go only to that install. Questions about it go to the install's admin, admin@example.org. CoderHelm never asks for your password or sign-in codes by email.

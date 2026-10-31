@@ -1,0 +1,14 @@
+From: "Acme CoderHelm" <notifications@notify.coderhelm.com>
+Subject: Acme CoderHelm: a webhook endpoint was turned off after 3 days of failures
+
+Every delivery to one of your team's webhook endpoints failed for 3 days, so CoderHelm stopped sending to it.
+
+Failing for: 3 days
+
+Open Settings, Webhooks to see the endpoint's last errors. Fix the receiving side, turn the endpoint back on, then replay what it missed.
+
+Open Webhooks: https://helm.example.org/settings/webhooks/
+
+
+
+Sent through CoderHelm's mail service for the self-hosted CoderHelm install at helm.example.org. Links in this email go only to that install. Questions about it go to the install's admin, admin@example.org. CoderHelm never asks for your password or sign-in codes by email.

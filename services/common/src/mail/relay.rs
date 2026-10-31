@@ -188,10 +188,15 @@ pub struct SendRequest {
     pub template: String,
     #[serde(default)]
     pub params: Map<String, Value>,
-    /// The install admin named in the footer. The relay names them only
-    /// when they are a listed admin.
+    /// The install admin named in the footer and set as Reply-To. The
+    /// relay uses them only when they are a listed admin.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub contact: Option<String>,
+    /// The organization the install's config names (`email.organization`),
+    /// for the From name and subjects. The relay uses it only when it
+    /// passes [`super::naming::org_label`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub org: Option<String>,
 }
 
 /// A request id: 16 to 64 letters, digits, `-` or `_`.
@@ -379,103 +384,39 @@ pub fn should_pause(window: Counts) -> Option<&'static str> {
     None
 }
 
-/// The From line: the install's verified address and "via CoderHelm",
-/// never words the install chose. A claimed name that reads as CoderHelm
-/// staff falls back to the CloudFront address.
-pub fn display_name(name_host: Option<&str>, cloudfront: &str) -> String {
-    let clean = |h: &str| -> String {
-        h.chars()
-            .filter(|c| c.is_ascii_alphanumeric() || *c == '.' || *c == '-')
-            .take(80)
-            .collect::<String>()
-            .to_ascii_lowercase()
-    };
-    let name_ok = |h: &str| {
-        let first = h.split('.').next().unwrap_or("");
-        // The same rule names follow (`names::looks_like_coderhelm`), and
-        // stricter: any staff word anywhere, both readings of `1`.
-        !first.is_empty()
-            && !crate::hybrid::names::looks_like_coderhelm(first)
-            && unconfuse(first).iter().all(|plain| {
-                !STAFF_WORDS
-                    .iter()
-                    .any(|w| plain.contains(w) || plain.replace('-', "").contains(w))
-                    && !super::templates::uses_reserved_wording(&plain.replace('-', " "))
-            })
-    };
-    let host = match name_host.map(clean) {
-        Some(h) if name_ok(&h) => h,
-        _ => clean(cloudfront),
-    };
-    format!("{host} via CoderHelm")
+pub use super::naming::{from_header, unconfuse};
+
+/// The install's name for its From line and subjects
+/// ([`super::naming::label`]): the organization it names, else its own
+/// domain while the relay's proof on it is fresh, else its CoderHelm name.
+/// Never its CloudFront address.
+pub fn sender_label(
+    org: Option<&str>,
+    domain: Option<&CustomDomain>,
+    name_host: Option<&str>,
+    now: i64,
+) -> Option<String> {
+    let domain = domain.and_then(|d| fresh_domain(d, now));
+    super::naming::label(
+        org,
+        domain.as_deref(),
+        name_host,
+        &super::naming::coderhelm_zone(),
+    )
 }
 
-/// A name with look-alike characters read as letters (`c0derhe1m`,
-/// `5upp0rt`), so a staff word can't hide behind digits. `1`, `!` and `|`
-/// read as either `l` or `i`, so both readings come back.
-pub fn unconfuse(s: &str) -> Vec<String> {
-    let read = |one: char| {
-        s.chars()
-            .map(|c| match c.to_ascii_lowercase() {
-                '0' => 'o',
-                '1' | '!' | '|' => one,
-                '3' => 'e',
-                '4' | '@' => 'a',
-                '5' | '$' => 's',
-                '7' => 't',
-                '8' => 'b',
-                '9' => 'g',
-                c => c,
-            })
-            .collect::<String>()
-            // "rn" reads as "m" and "vv" as "w" in many fonts.
-            .replace("rn", "m")
-            .replace("vv", "w")
-    };
-    vec![read('l'), read('i')]
+/// The relay's From display name for that label: `Acme CoderHelm`.
+pub fn display_name(label: Option<&str>) -> String {
+    super::naming::display_name(label)
 }
 
-/// Words a sender name may not carry: they would read as CoderHelm itself.
-const STAFF_WORDS: &[&str] = &[
-    "app",
-    "api",
-    "auth",
-    "mail",
-    "payment",
-    "invoice",
-    "status",
-    "support",
-    "security",
-    "secure",
-    "billing",
-    "admin",
-    "help",
-    "official",
-    "staff",
-    "team",
-    "verify",
-    "account",
-    "login",
-    "signin",
-    "password",
-    "noreply",
-    "no-reply",
-    "coderhelm",
-    "trust",
-    "abuse",
-    "postmaster",
-    "notify",
-    "notifications",
-    "service",
-];
-
-/// `"name" <address>` with the name quoted safely.
-pub fn from_header(display: &str, address: &str) -> String {
-    let d: String = display
-        .chars()
-        .filter(|c| !matches!(c, '"' | '\\' | '\r' | '\n' | '<' | '>'))
-        .collect();
-    format!("\"{d}\" <{address}>")
+/// The custom domain, while its proof is recent.
+pub fn fresh_domain(d: &CustomDomain, now: i64) -> Option<String> {
+    let fresh = d
+        .verified_at
+        .is_some_and(|at| at <= now && now - at <= DOMAIN_PROOF_SECS);
+    (fresh && custom_domain_ok(&d.hostname))
+        .then(|| d.hostname.trim_end_matches('.').to_ascii_lowercase())
 }
 
 pub const PATH_DOMAIN: &str = "/hybrid/email/domain";
@@ -552,13 +493,8 @@ pub fn reads_as_coderhelm(host: &str) -> bool {
 /// the relay's last HTTPS proof on it is recent.
 pub fn link_hosts(base: &[String], domain: Option<&CustomDomain>, now: i64) -> Vec<String> {
     let mut out = base.to_vec();
-    if let Some(d) = domain {
-        let fresh = d
-            .verified_at
-            .is_some_and(|at| at <= now && now - at <= DOMAIN_PROOF_SECS);
-        if fresh && custom_domain_ok(&d.hostname) {
-            out.push(d.hostname.trim_end_matches('.').to_ascii_lowercase());
-        }
+    if let Some(h) = domain.and_then(|d| fresh_domain(d, now)) {
+        out.push(h);
     }
     out
 }
@@ -844,38 +780,45 @@ mod tests {
     }
 
     #[test]
-    fn the_sender_name_is_the_verified_address_never_staff_wording() {
+    fn the_sender_name_names_the_install_never_its_cloudfront_address() {
+        let now = 1_800_000_000;
+        let fresh = CustomDomain {
+            hostname: "helm.example.org".into(),
+            verified_at: Some(now - 60),
+        };
+        let stale = CustomDomain {
+            verified_at: Some(now - DOMAIN_PROOF_SECS - 1),
+            ..fresh.clone()
+        };
+        let name = Some("acme.coderhelm.com");
+        let l = |org, d, n| sender_label(org, d, n, now);
+        assert_eq!(l(Some("Acme"), Some(&fresh), name).as_deref(), Some("Acme"));
         assert_eq!(
-            display_name(Some("acme.coderhelm.com"), "d1.cloudfront.net"),
-            "acme.coderhelm.com via CoderHelm"
+            l(None, Some(&fresh), name).as_deref(),
+            Some("helm.example.org")
         );
-        for bad in [
-            "support.coderhelm.com",
-            "coderhelm-security.coderhelm.com",
-            "billing-team.coderhelm.com",
-            "noreply.coderhelm.com",
-            "acme-help.coderhelm.com",
-            "c0derhe1m.coderhelm.com",
-            "5upp0rt.coderhelm.com",
-            "c0der-he1m-team.coderhelm.com",
-            "app.coderhelm.com",
-            "api-acme.coderhelm.com",
-            "acme-login.coderhelm.com",
-            "acme-b1lling.coderhelm.com",
-            "coderhelrn.coderhelm.com",
-        ] {
-            assert_eq!(
-                display_name(Some(bad), "d1.cloudfront.net"),
-                "d1.cloudfront.net via CoderHelm",
-                "{bad}"
-            );
+        assert_eq!(l(None, Some(&stale), name).as_deref(), Some("acme"));
+        assert_eq!(l(Some("Acme Support"), None, name).as_deref(), Some("acme"));
+        assert_eq!(l(None, None, None), None);
+        assert_eq!(display_name(Some("Acme")), "Acme CoderHelm");
+        assert_eq!(display_name(None), "CoderHelm");
+        // Whatever the install sends, a CloudFront host never reaches From.
+        for org in [None, Some("d1example.cloudfront.net"), Some("support")] {
+            for d in [None, Some(&stale)] {
+                for n in [
+                    None,
+                    Some("support.coderhelm.com"),
+                    Some("d1example.cloudfront.net"),
+                ] {
+                    let from = from_header(
+                        &display_name(l(org, d, n).as_deref()),
+                        "notifications@notify.coderhelm.com",
+                    );
+                    assert!(!from.contains("cloudfront"), "{from}");
+                    assert_eq!(from, "\"CoderHelm\" <notifications@notify.coderhelm.com>");
+                }
+            }
         }
-        assert_eq!(
-            display_name(None, "d1.cloudfront.net"),
-            "d1.cloudfront.net via CoderHelm"
-        );
-        // Nothing outside letters, digits, dots and dashes survives.
-        assert_eq!(display_name(Some("a\"<b>\r\nc"), "x"), "abc via CoderHelm");
         assert_eq!(
             from_header("a\"b", "notifications@notify.coderhelm.com"),
             "\"ab\" <notifications@notify.coderhelm.com>"

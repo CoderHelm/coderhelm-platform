@@ -1,0 +1,31 @@
+From: "Acme CoderHelm" <notifications@notify.coderhelm.com>
+Subject: Acme CoderHelm: update to v0.8.0 needs your OK
+
+This install won't update to v0.8.0 until someone fixes what the update check found. Nothing has changed yet.
+
+Install: helm.example.org
+Running now: v0.7.4
+Waiting to install: v0.8.0
+Checked: 2026-10-31 14:05 UTC
+
+Why it's blocked:
+> - claude-opus-5-5: Bedrock refused the call: the model's terms aren't accepted in this account.
+
+What to do:
+> In the AWS console, open Amazon Bedrock, then Model access, and request access to Claude Opus 5.5. A person has to do this; CoderHelm only checks.
+
+Once it is fixed, open Settings, then System, then Update readiness, and press Check again. Once it passes, press Update now to v0.8.0. The check also runs by itself every day, and with automatic updates on the update then goes ahead on its own.
+
+From a terminal, see what fails and how to fix it, then update:
+
+    npx -y github:CoderHelm/coderhelm-platform doctor
+
+    npx -y github:CoderHelm/coderhelm-platform update --to v0.8.0
+
+Open Update readiness: https://helm.example.org/settings/system/#readiness
+
+Read the release notes: https://helm.example.org/settings/system/#version
+
+
+
+Sent through CoderHelm's mail service for the self-hosted CoderHelm install at helm.example.org. Links in this email go only to that install. Questions about it go to the install's admin, admin@example.org. CoderHelm never asks for your password or sign-in codes by email.
