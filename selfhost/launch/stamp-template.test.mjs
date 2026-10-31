@@ -2,7 +2,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import { fileURLToPath } from "node:url";
-import { latestDoc, stampTemplate, templateUrl } from "./stamp-template.mjs";
+import { latestDoc, stampTemplate, templateUrl, uninstallTemplateUrl } from "./stamp-template.mjs";
 
 const TEMPLATE = fs.readFileSync(fileURLToPath(new URL("../../infra/cfn/coderhelm-selfhost-launch.yaml", import.meta.url)), "utf8");
 
@@ -26,4 +26,16 @@ test("published by version in the public bucket", () => {
     templateUrl: "https://coderhelm-public.s3.amazonaws.com/launch/v0.7.0/coderhelm-launch.yaml",
     publishedAt: "1970-01-01T00:00:00.000Z",
   });
+});
+
+const UNINSTALL = fs.readFileSync(fileURLToPath(new URL("../../infra/cfn/coderhelm-selfhost-uninstall.yaml", import.meta.url)), "utf8");
+
+test("the uninstall template (JSON) is stamped the same way, and only Version changes", () => {
+  const out = stampTemplate(UNINSTALL, "v0.9.0");
+  const json = (t) => JSON.parse(t.split("\n").filter((l) => !l.startsWith("#")).join("\n"));
+  assert.equal(json(out).Parameters.Version.Default, "v0.9.0");
+  const diff = UNINSTALL.split("\n").filter((l, i) => l !== out.split("\n")[i]);
+  assert.deepEqual(diff, ['      "Default": "latest",']);
+  assert.throws(() => stampTemplate(out, "v0.9.1"), /no `"Default": "latest"`/);
+  assert.equal(uninstallTemplateUrl("v0.9.0"), "https://coderhelm-public.s3.amazonaws.com/launch/v0.9.0/coderhelm-uninstall.yaml");
 });

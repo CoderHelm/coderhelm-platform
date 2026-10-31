@@ -132,6 +132,13 @@ class Handler(unittest.TestCase):
         self.assertTrue(s["latest"]["breaking"])
         self.assertTrue(s["update_available"])
         self.assertEqual(s["history"], [])
+        self.assertIsNone(s["install"], "no prefix or region: no install to name")
+
+    def test_status_names_the_install_for_the_guided_uninstall(self):
+        env = dict(self.env, RESOURCE_PREFIX="coderhelm-prod-eu", AWS_REGION="eu-west-1")
+        s = u.handle({"action": "status"}, env, self.store, SUNDAY_3AM, self.fetch)
+        self.assertEqual(s["install"], {"stage": "prod-eu", "region": "eu-west-1"})
+        self.assertIsNone(u.install_identity(dict(env, RESOURCE_PREFIX="acme-helm")), "a custom prefix is not a coderhelm-<name> install")
 
     def test_releases_are_cached_for_an_hour(self):
         calls = []

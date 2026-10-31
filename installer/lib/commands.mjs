@@ -9,7 +9,7 @@ import { checkTag, fetchRelease, latestVersion, releasePaths, releasesDir, TAG_R
 import { openBrowser } from "./github-app.mjs";
 import { ensureSecret, hasGithubApp, mergeSecret, readSecret } from "./secrets.mjs";
 import { runManifestFlow, secretKeysFromApp } from "./github-app.mjs";
-import { leaveHybrid } from "./hybrid.mjs";
+import * as un from "./uninstall.mjs";
 import { accessOf, DEFAULT_TELEMETRY_ENDPOINT, derived, readJson, semverCompare, writeJson } from "./util.mjs";
 
 export const STATE_DIR = ".coderhelm";
@@ -716,27 +716,140 @@ export async function backup(ctx) {
 
 // ── uninstall ────────────────────────────────────────────────────────────
 
+/**
+ * `uninstall`: removes CoderHelm and keeps its data (tables, data bucket,
+ * KMS keys, user pool, secret). `--everything` (or `--delete-data`) deletes
+ * those too; KMS keys after AWS's 7-day minimum. `--verify` only lists
+ * what is left. `--guided` is the uninstall stack's build
+ * (installer/lib/uninstall.mjs, docs/self-host/uninstall.md).
+ */
 export async function uninstall(ctx) {
-  const { flags, runner, log } = ctx;
-  const cfg = loadConfig(flags);
-  const d = derived(cfg);
+  const { flags, log } = ctx;
+  if (flags.guided) return guidedUninstall(ctx);
+  let cfg = null;
+  try {
+    cfg = loadConfig(flags);
+  } catch {
+    cfg = null;
+  }
+  const stage = typeof flags.stage === "string" ? flags.stage : cfg?.stage;
+  const region = typeof flags.region === "string" ? flags.region : cfg?.region;
+  if (!stage || !region) throw new Error("Pass --stage <install name> and --region, or run this where the install's coderhelm.config.json is.");
+  if (cfg && cfg.stage === stage && derived(cfg).prefix !== `coderhelm-${stage}`) {
+    throw new Error(`This install names its resources ${derived(cfg).prefix}-*, not coderhelm-${stage}-*: remove its stacks in CloudFormation.`);
+  }
+  const mode = flags.everything || flags.deleteData ? "everything" : "keep";
+  ctx.aws ??= un.awsClient(ctx, region);
+  const account = cfg?.account ?? (await ctx.aws.read("sts", "get-caller-identity", []))?.Account;
+  const scope = un.scopeOf({ stage, region, account });
+  const inv = await un.discover(ctx, scope, { mode, installStatus: typeof flags.installStatus === "string" ? flags.installStatus : "", fetchImpl: ctx.fetchImpl });
+
+  if (flags.verify) {
+    const { left, scheduled } = un.leftovers(inv);
+    log(`\nCoderHelm ${stage} in ${region} (${account}): ${left.length ? `${left.length} piece${left.length === 1 ? "" : "s"} left` : "nothing left"}.`);
+    for (const l of left) log(`  ${l.kind.padEnd(22)} ${l.name}`);
+    for (const k of scheduled) log(`  KMS key ${k.name}: scheduled for deletion${k.date ? ` on ${k.date}` : ""} (AWS's 7-day minimum)`);
+    for (const x of inv.skipped) log(`  not this install's: ${x.kind} ${x.name} (${x.why})`);
+    return left.length ? 1 : 0;
+  }
+
+  const p = un.plan(inv);
+  if (!p.remove.length && !p.keep.length) {
+    log(`Nothing named or tagged for the install ${stage} is in ${region} (${account}).`);
+    return 0;
+  }
+  log(`\nThis removes CoderHelm ${stage} from ${account} in ${region}:`);
+  logByKind(log, p.remove);
+  if (p.keep.length) {
+    log("\nKept (your data; uninstall --everything deletes it too):");
+    logByKind(log, p.keep);
+  } else if (mode === "everything") {
+    log(`\nNothing can be recovered afterwards. KMS keys are scheduled for deletion in ${un.KEY_DELETION_DAYS} days (AWS's minimum); until then they can be cancelled.`);
+  }
+  if (inv.scope.siblings.length) log(`\nNot touched: the other installs ${inv.scope.siblings.join(", ")} (their names start with this one's).`);
+  if (ctx.runner.dryRun) {
+    log("\nDry run: nothing was deleted.");
+    return 0;
+  }
   if (!flags.yes) {
     if (!ctx.interactive) throw new Error("Pass --yes to uninstall without a prompt.");
-    const typed = await ctx.ask.ask(`Type the install name (${cfg.stage}) to delete CoderHelm from ${cfg.account}`, "");
-    if (typed !== cfg.stage) throw new Error("Not uninstalled.");
+    const typed = await ctx.ask.ask(`\nType the install name (${stage}) to ${mode === "everything" ? "delete CoderHelm and all its data" : "remove CoderHelm"}`, "");
+    if (typed !== stage) throw new Error("Not uninstalled: the name didn't match.");
   }
-  const state = loadState(flags);
-  await telemetryPing(ctx, cfg, state, "uninstall");
-  // A hybrid install gives back its CoderHelm address and links first.
-  const secret = await readSecret(runner, d.secretName, cfg.region);
-  await leaveHybrid(ctx, secret, cfg.hybridUrl || undefined);
-  const src = await resolveSource(ctx, state.version);
-  await cdk(ctx, src, ["destroy", "--all", "--force"]);
-  log("\nThe stacks are deleted.");
-  if (cfg.retainData !== false) {
-    log(`Kept on purpose (retainData): the ${d.prefix}-* DynamoDB tables, the ${d.prefix}-data${d.suffix} bucket, their KMS keys, the Cognito user pool and the secret ${d.secretName}.`);
-    log("Delete them in the AWS console when you are sure, or set retainData to false before uninstalling.");
+  if (cfg) await telemetryPing(ctx, cfg, loadState(flags), "uninstall");
+  let last = "";
+  const doc = await un.runUninstall(ctx, {
+    stage, region, account, mode,
+    installStatus: typeof flags.installStatus === "string" ? flags.installStatus : "",
+    hostedUrl: cfg?.hybridUrl || undefined,
+    write: async (d) => {
+      if (d.message && d.message !== last) log(`  ${d.message}`);
+      last = d.message;
+    },
+  });
+  log("");
+  for (const k of doc.scheduled) log(`KMS key ${k.name}: scheduled for deletion${k.date ? ` on ${k.date}` : ""}.`);
+  if (doc.kept.length) log(`Kept on purpose: ${doc.kept.length} piece${doc.kept.length === 1 ? "" : "s"} of data (tables, data bucket, KMS keys, user pool, secret).`);
+  if (doc.hybrid?.registered) log(doc.hybrid.released ? "Released the CoderHelm address; GitHub and Jira events go back to CoderHelm." : "CoderHelm couldn't be reached to release the address; it is released when the install stops answering.");
+  if (doc.phase !== "done") {
+    const e = new Error(`${doc.message}\n${[...doc.problems, ...doc.left].map((x) => `  ${x.kind} ${x.name}${x.error ? `: ${x.error}` : ""}`).join("\n")}\n${doc.fix ?? ""}`);
+    e.plain = true;
+    throw e;
   }
+  log(doc.message);
+  return 0;
+}
+
+function logByKind(log, items) {
+  const by = new Map();
+  for (const x of items) by.set(x.kind, [...(by.get(x.kind) ?? []), x.name]);
+  for (const [kind, names] of by) log(`  ${String(names.length).padStart(3)} ${kind}${names.length === 1 ? "" : "s"}: ${names.slice(0, 6).join(", ")}${names.length > 6 ? ", ..." : ""}`);
+}
+
+/**
+ * `uninstall --guided`: the uninstall stack's build (inside its window).
+ * Environment: STAGE, MODE, STATUS_BUCKET, INSTALL_STATUS_ID, AWS_REGION.
+ * Keeps the progress file the uninstall guide reads, and writes the last
+ * one to /tmp/coderhelm-final.json for the stack's answer.
+ */
+export async function guidedUninstall(ctx, env = process.env) {
+  const region = env.AWS_REGION || env.AWS_DEFAULT_REGION;
+  const bucket = env.STATUS_BUCKET || "";
+  const final = env.FINAL_FILE || "/tmp/coderhelm-final.json";
+  ctx.guided = true;
+  ctx.aws ??= un.awsClient(ctx, region);
+  const account = (await ctx.aws.read("sts", "get-caller-identity", []))?.Account;
+  const project = String(env.CODEBUILD_BUILD_ID || "").split(":")[0];
+  const logUrl = project ? `https://${region}.console.aws.amazon.com/cloudwatch/home?region=${region}#logsV2:log-groups/log-group/${`/aws/codebuild/${project}`.replace(/\//g, "$252F")}` : null;
+  const write = async (d) => {
+    const doc = { ...d, logUrl };
+    ctx.log(`[${doc.phase}] ${doc.message}`);
+    if (["done", "failed"].includes(doc.phase)) fs.writeFileSync(final, JSON.stringify(doc));
+    if (!bucket) return;
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "coderhelm-"));
+    const file = path.join(dir, "status.json");
+    fs.writeFileSync(file, JSON.stringify(doc));
+    try {
+      await ctx.runner.run("aws", ["s3", "cp", file, `s3://${bucket}/status.json`, "--region", region, "--content-type", "application/json", "--cache-control", "no-store", "--only-show-errors"], { capture: true, allowFail: true });
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  };
+  const doc = await un.runUninstall(ctx, {
+    stage: env.STAGE,
+    region,
+    account,
+    mode: env.MODE === "everything" ? "everything" : "keep",
+    installStatus: env.INSTALL_STATUS_ID || "",
+    ownStatus: bucket.replace(/^coderhelm-setup-/, ""),
+    write,
+  });
+  if (doc.phase !== "done") {
+    const e = new Error(doc.message);
+    e.plain = true;
+    throw e;
+  }
+  return 0;
 }
 
 // ── access (hardened installs) ───────────────────────────────────────────

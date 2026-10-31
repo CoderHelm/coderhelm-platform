@@ -484,15 +484,13 @@ test("backup covers this install's tables only", async () => {
   assert.deepEqual(backed, ["coderhelm-prod", "coderhelm-prod-runs", "coderhelm-prod-settings"]);
 });
 
-test("uninstall needs --yes when not interactive, and destroys with cdk", async () => {
+test("uninstall with nothing of the install in the account deletes nothing (test/uninstall.test.mjs covers the rest)", async () => {
   const dir = tmpdir();
   const file = writeConfig(dir);
-  await assert.rejects(() => main(["uninstall", "--config", file], { runner: new FakeRunner(awsAnswers()), log: () => {}, interactive: false, ask: quietAsk() }), /--yes/);
-  const runner = new Runner({ dryRun: true, log: () => {} });
-  const src = path.resolve(path.dirname(new URL(import.meta.url).pathname), "..", "..");
-  const { out } = await run(["uninstall", "--dry-run", "--yes", "--config", file, "--source", src], { runner });
-  assert.ok(runner.commands.some((c) => c.args.join(" ").includes("cdk destroy --all --force")));
-  assert.match(out, /Kept on purpose/);
+  const runner = new FakeRunner(awsAnswers());
+  const { out } = await run(["uninstall", "--config", file], { runner });
+  assert.match(out, /Nothing named or tagged for the install prod/);
+  assert.ok(!runner.lines().some((l) => /delete-|destroy/.test(l)));
 });
 
 // ── telemetry ───────────────────────────────────────────────────────────
