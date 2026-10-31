@@ -1,34 +1,31 @@
 /**
- * What a hardened self-hosted install may do in its AWS account, written
- * once and used by both owners of it: the CDK app (`AccessStack`, for an
- * install an admin hardened with `coderhelm-selfhost access harden`) and
- * the Launch Stack (infra/cfn/coderhelm-selfhost-launch.yaml, for a new
- * install; infra/test/launch-stack.test.ts keeps the template equal to
- * these functions).
+ * What a self-hosted install may do in its AWS account, written once and
+ * used by every owner of it: a native release's parent stack
+ * (infra/lib/native/parent.ts: the boundary and the optional auto-update
+ * role, `-stack` names), the CDK app's `AccessStack` (an install an admin
+ * hardened with `coderhelm-selfhost access harden`), and installs from an
+ * earlier Launch Stack until they migrate.
  *
- * Three pieces (docs/self-host/security.md, "What the installer can do in
- * your account"):
+ * Three pieces (docs/self-host/security.md, "What an install can do in your
+ * account"):
  *
- * - The permissions boundary (`<prefix>-boundary`): the most any role
- *   CoderHelm creates can ever do, whatever its own policy says. It allows
- *   the services CoderHelm uses and denies IAM users and access keys,
- *   Organizations, account settings, CloudTrail and GuardDuty, IAM outside
- *   the install's prefix, a role without this boundary, assuming other
+ * - The permissions boundary: the most any role CoderHelm creates can ever
+ *   do, whatever its own policy says. It allows the services CoderHelm uses,
+ *   limits changes to the install's own functions, stacks, buckets, secrets
+ *   and parameters, and denies IAM users and access keys, Organizations,
+ *   account settings, CloudTrail and GuardDuty, IAM outside the install's
+ *   prefix, a role without this boundary, instance commands, assuming other
  *   roles in this account (all but CoderHelm's two read roles, which only
- *   the gateway and worker may assume), and any change to the boundary
- *   itself.
- * - The deploy role (`<prefix>-deploy`): CloudFormation's role for the
- *   install's stacks. Only CloudFormation may assume it; it may create roles
- *   only with the boundary, pass only the install's roles, and change only
- *   resources named for the install (or tagged for it where AWS names them
- *   by id).
- * - The deploy window (`deploy-window`, an inline policy): what an install
- *   or update build may do while it runs. Nothing else in the account holds
- *   it: the updater (or the Launch Stack's starter) writes it onto the build
- *   role only after checking the build is one it started with the expected
- *   buildspec, binds it to that build's own session (aws:userid) and an end
- *   time, and removes it when the build reports back. Between runs the
- *   build roles can only report to the updater.
+ *   the gateway and worker may assume), and any change to the boundary.
+ * - The deploy role: CloudFormation's role for the install's stacks (on a
+ *   native install, only with auto-update on). Only CloudFormation may
+ *   assume it; it may create roles only with the boundary, pass only the
+ *   install's roles, and change only resources named for the install (or
+ *   tagged for it where AWS names them by id).
+ * - The deploy window (`deploy-window`): installs from before native
+ *   releases only. What their update build may do while it runs, written
+ *   by the updater onto the build role after checking the build, bound to
+ *   its session and an end time, removed when the build reports back.
  *
  * Values may be CloudFormation substitutions (`${Stage}`): the template
  * passes them, and every string here is then used inside Fn::Sub.
