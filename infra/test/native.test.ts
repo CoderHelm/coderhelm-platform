@@ -23,7 +23,7 @@ import { resolveConfig } from "../lib/config";
 import { buildNative } from "../lib/native/build";
 import { ASSETS_BUCKET_SENTINEL, REGION_SENTINEL, STAGE_SENTINEL } from "../lib/native/config";
 import { DATA_TYPES, LIMITS, checkLimits, findSentinels, sha256File, transformChild } from "../lib/native/package";
-import { deployRolePolicy, helperPolicy, nativeNames } from "../lib/native/parent";
+import { DEPLOY_BOUNDARY_ARN, declaredLogGroups, deployRolePolicy, helperPolicy, nativeNames } from "../lib/native/parent";
 
 const STUBS = fs.mkdtempSync(path.join(os.tmpdir(), "chnat-"));
 for (const d of ["gateway", "worker", "mcp"]) {
@@ -81,7 +81,7 @@ test("the parent pins every published file by sha256, and the files on disk matc
   }
   // Children come from the install's own bucket, after the copy.
   for (const name of Object.keys(rel.children)) {
-    assert.match(JSON.stringify(R[name].Properties.TemplateURL), /\$\{AssetsBucket\}\.s3\.\$\{AWS::Region\}\.amazonaws\.com\/releases\/v9\.8\.7\/stacks\//);
+    assert.match(JSON.stringify(R[name].Properties.TemplateURL), /coderhelm-\$\{Stage\}-release-\$\{AWS::AccountId\}\.s3\.\$\{AWS::Region\}\.amazonaws\.com\/releases\/v9\.8\.7\/stacks\//);
     assert.ok(R[name].DependsOn.includes("ReleaseAssets"), name);
   }
 });
@@ -120,7 +120,14 @@ test("data follows KeepDataOnDelete, deletion protection too, keys wait 7 days",
   assert.deepEqual(R.Database.Properties.Parameters.DataDeletionPolicy, { "Fn::If": ["NativeKeepData", "RetainExceptOnCreate", "Delete"] });
   assert.deepEqual(R.Database.Properties.Parameters.DataReplacePolicy, { "Fn::If": ["NativeKeepData", "Retain", "Delete"] });
   assert.equal(P.Parameters.KeepDataOnDelete.Default, "true");
-  assert.deepEqual(R.InstallSecret.DeletionPolicy, { "Fn::If": ["NativeKeepData", "RetainExceptOnCreate", "Delete"] });
+  // Kept by CloudFormation; Final deletes it with KeepDataOnDelete=false.
+  assert.equal(R.InstallSecret.DeletionPolicy, "RetainExceptOnCreate");
+  assert.equal(R.InstallSecret.UpdateReplacePolicy, "Retain");
+  assert.deepEqual(R.Final.Properties.SecretId, { Ref: "InstallSecret" });
+  assert.deepEqual(R.Final.Properties.KeepData, { Ref: "KeepDataOnDelete" });
+  // HybridLeave and SetupKey read the secret on delete: deleted before Final.
+  assert.deepEqual(R.HybridLeave.DependsOn, ["Final"]);
+  assert.deepEqual(R.SetupKey.DependsOn, ["Final"]);
   // The secret's template never changes, so an update never regenerates it.
   assert.ok(!JSON.stringify(R.InstallSecret.Properties.GenerateSecretString).includes("Ref"));
   // The sweep reads every data table and bucket, so it is deleted before them.
@@ -196,8 +203,31 @@ test("no update build, no deploy window; auto-update is a role only with AutoUpd
   const trust = JSON.stringify(R.DeployRole.Properties.AssumeRolePolicyDocument);
   assert.match(trust, /aws:SourceArn/);
   assert.match(trust, /stack\/\$\{AWS::StackName\}-\*\/\*/);
-  // Kept with the role that still carries it.
-  assert.deepEqual(R.Boundary.DeletionPolicy, { "Fn::If": ["AutoUpdateOn", "Retain", "Delete"] });
+  // The kept role carries its own copy of the boundary, kept with it; the
+  // boundary every other role carries goes with the stack.
+  assert.equal(R.Boundary.DeletionPolicy, "Delete");
+  assert.deepEqual(R.DeployRole.Properties.PermissionsBoundary, { Ref: "DeployBoundary" });
+  assert.equal(R.DeployBoundary.Condition, "AutoUpdateOn");
+  assert.equal(R.DeployBoundary.DeletionPolicy, "Retain");
+  assert.deepEqual(R.DeployBoundary.Properties.PolicyDocument, R.Boundary.Properties.PolicyDocument);
+  // Neither copy can be edited by an install role.
+  const st = (sid: string) => R.Boundary.Properties.PolicyDocument.Statement.find((x: any) => x.Sid === sid);
+  // Neither boundary can be edited, and no role's boundary comes off ...
+  const stays = JSON.stringify(st("TheBoundaryStays").Resource);
+  // One pattern for both (IAM's 6,144 characters): coderhelm-<name>-boundary-stack and coderhelm-<name>-deploy-boundary-stack.
+  assert.ok(stays.includes(":policy/coderhelm-${Stage}-*boundary-stack"), stays);
+  // Neither can be edited, deleted or created again by any role (the deploy role included: a deleted
+  // boundary must never come back with another text under the same name).
+  assert.deepEqual(st("TheBoundaryStays").Action, ["iam:DeleteRolePermissionsBoundary", "iam:CreatePolicy*", "iam:DeletePolicy*", "iam:SetDefault*", "iam:*agPolicy"]);
+  assert.equal(st("DeletedByTheStack"), undefined, "no role may delete a boundary");
+  assert.match(DEPLOY_BOUNDARY_ARN, /policy\/coderhelm-\$\{Stage\}-deploy-boundary-stack$/);
+  // IAM's 6,144 characters, measured as IAM stores it: substitutions resolved
+  // with the longest names an install can have (a 20-character stage).
+  const unwrap = (v: any): any => (Array.isArray(v) ? v.map(unwrap) : v && typeof v === "object" ? ("Fn::Sub" in v ? unwrap(v["Fn::Sub"]) : Object.fromEntries(Object.entries(v).map(([k, x]) => [k, unwrap(x)]))) : typeof v === "string"
+    ? v.replace(/\$\{Stage\}/g, "abcdefghijklmnopqrst").replace(/\$\{AWS::AccountId\}/g, "111122223333").replace(/\$\{AWS::Region\}/g, "ap-southeast-4").replace(/\$\{AWS::Partition\}/g, "aws-us-gov")
+    : v);
+  const size = JSON.stringify(unwrap(R.Boundary.Properties.PolicyDocument)).length;
+  assert.ok(size < 6144, `the boundary is ${size} characters`);
   // The auto-update role: the deploy policy, the parent stack and its parts, the release files.
   const sids = deployRolePolicy(nativeNames()).Statement.map((s) => s.Sid);
   assert.ok(sids.includes("ParentStack") && sids.includes("ReleaseFiles"));
@@ -209,7 +239,122 @@ test("launch parameters: the install guide's, the keep-data choice, no installer
   const types = new Set(Object.values<any>(R).map((r) => r.Type));
   assert.ok(!types.has("AWS::CodeBuild::Project"));
   assert.ok(!types.has("AWS::CloudFormation::WaitCondition"));
-  assert.equal(P.Transform, "AWS::LanguageExtensions");
+});
+
+// ── The live test's findings (bugs 1 to 4) ────────────────────────────────
+
+/** What CloudFormation does with a template that has no transform: evaluates conditions and Fn::If with the stack's parameters. */
+function evaluate(v: any, params: Record<string, string>, conds: Record<string, any>): any {
+  const cond = (name: string): boolean => evaluate(conds[name], params, conds);
+  if (Array.isArray(v)) return v.map((x) => evaluate(x, params, conds));
+  if (v && typeof v === "object") {
+    if ("Ref" in v && v.Ref in params) return params[v.Ref];
+    if ("Fn::Equals" in v) { const [a, b] = v["Fn::Equals"].map((x: any) => evaluate(x, params, conds)); return a === b; }
+    if ("Fn::Not" in v) return !evaluate(v["Fn::Not"][0], params, conds);
+    if ("Fn::And" in v) return v["Fn::And"].every((x: any) => evaluate(x, params, conds));
+    if ("Fn::If" in v) { const [c, a, b] = v["Fn::If"]; return evaluate(cond(c) ? a : b, params, conds); }
+    return Object.fromEntries(Object.entries(v).map(([k, x]) => [k, evaluate(x, params, conds)]));
+  }
+  return v;
+}
+
+test("bug 2: the parent has no transform, so an update with the current template really changes the data policies", () => {
+  // CloudFormation stores a template with AWS::LanguageExtensions already
+  // resolved: v0.8.5's stored parent (a real one, from the live test) has the
+  // keep choice frozen in, so "use the current template" kept every old value.
+  const stored = JSON.parse(fs.readFileSync(path.join(__dirname, "..", "..", "test", "fixtures", "cfn-stored-v0.8.5-parent.json"), "utf8"));
+  assert.equal(stored.Transform, undefined, "the transform is gone from what CloudFormation keeps");
+  assert.equal(stored.Resources.Database.Properties.Parameters.DataDeletionPolicy, "RetainExceptOnCreate", "frozen: no parameter can change it");
+  assert.deepEqual(stored.Conditions.NativeKeepData, { "Fn::Equals": ["true", "true"] });
+
+  // Today's parent: no transform anywhere in it, every policy a literal.
+  assert.equal(P.Transform, undefined);
+  for (const [id, r] of Object.entries<any>(R)) {
+    for (const k of ["DeletionPolicy", "UpdateReplacePolicy"]) if (k in r) assert.equal(typeof r[k], "string", `${id}.${k} must be a literal (no transform)`);
+  }
+  // CloudFormation keeps exactly this template, so a parameter change with the
+  // current template re-evaluates it: KeepDataOnDelete reaches every part and
+  // Final and Sweep, which re-read it on delete.
+  const base = Object.fromEntries(Object.entries<any>(P.Parameters).map(([k, v]) => [k, String(v.Default ?? "")]));
+  for (const [keep, want] of [["true", "RetainExceptOnCreate"], ["false", "Delete"]]) {
+    const out = evaluate(R, { ...base, KeepDataOnDelete: keep }, P.Conditions);
+    for (const name of Object.keys(rel.children)) {
+      if (!("DataDeletionPolicy" in (R[name].Properties.Parameters ?? {}))) continue;
+      assert.equal(out[name].Properties.Parameters.DataDeletionPolicy, want, `${name} with KeepDataOnDelete=${keep}`);
+      assert.equal(out[name].Properties.Parameters.DataReplacePolicy, keep === "true" ? "Retain" : "Delete", name);
+    }
+    assert.equal(out.Final.Properties.KeepData, keep);
+    assert.equal(out.Sweep.Properties.KeepData, keep);
+    assert.equal(evaluate(P.Outputs.KeepDataOnDelete.Value, { ...base, KeepDataOnDelete: keep }, P.Conditions), keep);
+  }
+  // Each part reads its template from its URL on every update and applies
+  // its own transform there: the parameter is what the data's policy follows.
+  for (const [name, t] of Object.entries<any>(rel.children)) {
+    if (!t.Parameters?.DataDeletionPolicy) continue;
+    assert.equal(t.Transform, "AWS::LanguageExtensions", name);
+  }
+});
+
+test("bug 1: a change set with the nested stacks can be built (each child URL resolves from parameters, and the helper stages it)", () => {
+  const files = R.ReleaseAssets.Properties.Files as { Key: string; Dest: string; Sha256: string }[];
+  const declared = new Set([...Object.keys(P.Parameters), "AWS::Region", "AWS::AccountId", "AWS::Partition", "AWS::URLSuffix"]);
+  for (const name of Object.keys(rel.children)) {
+    const url = R[name].Properties.TemplateURL;
+    assert.deepEqual(Object.keys(url), ["Fn::Sub"], `${name}: one Fn::Sub string`);
+    const text: string = url["Fn::Sub"];
+    assert.equal(typeof text, "string", name);
+    // Only parameters and pseudo parameters: CloudFormation resolves them
+    // while it builds the change set; a resource (the old ${AssetsBucket})
+    // it doesn't, and refused with "must start with https://".
+    for (const m of text.matchAll(/\$\{([^}]+)\}/g)) assert.ok(declared.has(m[1]), `${name}: \${${m[1]}} is not a parameter`);
+    const resolved = text.replace(/\$\{Stage\}/g, "prod").replace(/\$\{AWS::AccountId\}/g, "111122223333").replace(/\$\{AWS::Region\}/g, "us-east-1");
+    assert.equal(resolved, `https://coderhelm-prod-release-111122223333.s3.us-east-1.amazonaws.com/releases/v9.8.7/stacks/${name}.json`);
+    // The same bucket the parent creates, and a file the helper copies (staged before the change set).
+    const dest = `releases/v9.8.7/stacks/${name}.json`;
+    assert.ok(files.some((f) => f.Dest === dest && /^[0-9a-f]{64}$/.test(f.Sha256)), `${name}: not in the release files`);
+  }
+  assert.deepEqual(R.AssetsBucket.Properties.BucketName, { "Fn::Sub": "coderhelm-${Stage}-release-${AWS::AccountId}" });
+  assert.deepEqual(R.Helper.Properties.Environment.Variables.ASSETS_BUCKET, { Ref: "AssetsBucket" });
+  assert.match(R.Helper.Properties.Code.ZipFile, /def stage_release/);
+  // The updater asks the helper to stage, and may read what it staged (CloudFormation reads with the caller's access).
+  const u = rel.children.Updates;
+  const updater = Object.values<any>(u.Resources).find((r) => r.Type === "AWS::Lambda::Function" && JSON.stringify(r.Properties.FunctionName ?? "").includes("updater"));
+  assert.deepEqual(updater.Properties.Environment.Variables.NATIVE_HELPER_FUNCTION, { "Fn::Sub": "coderhelm-${Stage}-install-helper" });
+  const pol = JSON.stringify(Object.values<any>(u.Resources).filter((r) => r.Type === "AWS::IAM::Policy"));
+  assert.ok(pol.includes('"Sid":"StageReleaseFiles"') && pol.includes("function:coderhelm-${Stage}-install-helper"), "invoke the helper");
+  const read = Object.values<any>(u.Resources).filter((r) => r.Type === "AWS::IAM::Policy").flatMap((r) => r.Properties.PolicyDocument.Statement).find((x: any) => x.Sid === "ReadStagedTemplates");
+  assert.deepEqual(read.Action, "s3:GetObject");
+  assert.ok(JSON.stringify(read.Resource).includes(":s3:::coderhelm-${Stage}-release-") && JSON.stringify(read.Resource).endsWith('"/releases/*"]]}'), JSON.stringify(read.Resource));
+});
+
+test("bug 3: the helper may delete the main table (coderhelm-<stage>, no suffix) as well as the others", () => {
+  const st = helperPolicy().Statement.find((x) => x.Sid === "AllowlistAndTablesOnDelete")!;
+  assert.deepEqual(st.Resource, ["arn:${AWS::Partition}:dynamodb:${AWS::Region}:${AWS::AccountId}:table/coderhelm-${Stage}", "arn:${AWS::Partition}:dynamodb:${AWS::Region}:${AWS::AccountId}:table/coderhelm-${Stage}-*"]);
+  // Every table the sweep deletes is covered.
+  const db = rel.children.Database;
+  const names = Object.values<any>(db.Resources).filter((r) => r.Type === "AWS::DynamoDB::GlobalTable").map((r) => r.Properties.TableName["Fn::Sub"] ?? r.Properties.TableName);
+  assert.ok(names.includes("coderhelm-${Stage}"), "the main table");
+  for (const n of names) assert.ok(n === "coderhelm-${Stage}" || n.startsWith("coderhelm-${Stage}-"), n);
+});
+
+test("bug 4: Final deletes every declared log group by its exact name (Lambda recreates one after the delete)", () => {
+  const names = declaredLogGroups(Object.entries<any>(rel.children).map(([name, template]) => ({ name, template } as any)));
+  // Every log group a part declares: each function's and build project's.
+  let declared = 0;
+  for (const t of Object.values<any>(rel.children)) for (const r of Object.values<any>(t.Resources)) if (r.Type === "AWS::Logs::LogGroup") declared++;
+  assert.equal(names.length, declared);
+  assert.ok(names.length >= 12, `only ${names.length}`);
+  assert.ok(names.includes("/aws/lambda/coderhelm-${Stage}-worker") && names.includes("/aws/codebuild/coderhelm-${Stage}-release-check"));
+  // The two the live test found left behind.
+  assert.ok(names.some((n) => /^\/aws\/lambda\/coderhelm-\$\{Stage\}-Handler-[0-9a-f]{8}$/.test(n)), "the S3 auto-delete provider");
+  assert.ok(names.some((n) => /^\/aws\/lambda\/coderhelm-\$\{Stage\}-LogRetention/.test(n)), "the log retention provider");
+  assert.deepEqual(R.Final.Properties.LogGroupNames, names.map((n) => ({ "Fn::Sub": n })));
+  // Within what the helper may delete.
+  const st = helperPolicy().Statement.find((x) => x.Sid === "InstallLogGroupsOnDelete")!;
+  assert.ok(JSON.stringify(st.Resource).includes("log-group:/aws/lambda/coderhelm-${Stage}-*"));
+  assert.ok(JSON.stringify(st.Resource).includes("log-group:/aws/codebuild/coderhelm-${Stage}-*"));
+  // A name that isn't this install's own is refused at build time.
+  assert.throws(() => declaredLogGroups([{ name: "X", template: { Resources: { L: { Type: "AWS::Logs::LogGroup", Metadata: { "coderhelm:native-log": true }, Properties: { LogGroupName: { Ref: "Something" } } } } } } as any]), /declared log group/);
 });
 
 test("the packager refuses a sentinel where intrinsics can't go, and unknown names", () => {
@@ -325,4 +470,18 @@ test("the bar: every piece the real uninstall left is owned and removed by the s
   // One stack: no Launch Stack, no boundary or bucket left on purpose.
   assert.notEqual(R.Boundary.DeletionPolicy, "Retain");
   assert.notEqual(R.AssetsBucket.DeletionPolicy, "Retain");
+});
+
+test("bug 2: no doc tells anyone to change a parameter with the current template", () => {
+  // On v0.8.4 and v0.8.5 that update reports UPDATE_COMPLETE and keeps every
+  // old value (KeepDataOnDelete included): the docs re-supply the release's template.
+  const dir = path.join(__dirname, "..", "..", "..", "docs", "self-host");
+  for (const f of fs.readdirSync(dir).filter((x) => x.endsWith(".md"))) {
+    const text = fs.readFileSync(path.join(dir, f), "utf8");
+    assert.ok(!/use-previous-template|UsePreviousTemplate/.test(text), `${f} uses the previous template`);
+    for (const m of text.matchAll(/[^.\n]*Use current template[^.\n]*/g)) assert.match(m[0], /[Dd]on't|not \*\*Use current/, `${f}: "${m[0].trim()}"`);
+  }
+  const un = fs.readFileSync(path.join(dir, "uninstall.md"), "utf8");
+  assert.match(un, /--template-url "https:\/\/coderhelm-public\.s3\.amazonaws\.com\/launch\/\$V\/coderhelm\.json"/);
+  assert.match(un, /OutputKey=='KeepDataOnDelete'/, "it checks the output before deleting");
 });

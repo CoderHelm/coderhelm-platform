@@ -556,6 +556,22 @@ function nativeUpdates(scope: Construct, cfg: ResolvedConfig, fn: lambda.Functio
   fn.addEnvironment("NATIVE_TEMPLATE_FILE", NATIVE_TEMPLATE_FILE);
   // "" while auto-update is off (the role exists only with AutoUpdate=on).
   fn.addEnvironment("DEPLOY_ROLE_ARN", cdk.Fn.ref("DeployRoleArn"));
+  // The parent's helper stages the release's child templates before a
+  // change set (lambda/native-helper, "stage").
+  const helper = `${cfg.prefix}-install-helper`;
+  fn.addEnvironment("NATIVE_HELPER_FUNCTION", helper);
+  fn.addToRolePolicy(new iam.PolicyStatement({
+    sid: "StageReleaseFiles",
+    actions: ["lambda:InvokeFunction"],
+    resources: [`arn:${stack.partition}:lambda:${stack.region}:${stack.account}:function:${helper}`],
+  }));
+  // CloudFormation reads the parts' templates with the caller's access while
+  // it builds the nested change sets (only the staged releases, read-only).
+  fn.addToRolePolicy(new iam.PolicyStatement({
+    sid: "ReadStagedTemplates",
+    actions: ["s3:GetObject"],
+    resources: [`arn:${stack.partition}:s3:::${cfg.prefix}-release-${stack.account}/releases/*`],
+  }));
   fn.addToRolePolicy(new iam.PolicyStatement({
     sid: "ProposeReleaseUpdate",
     actions: ["cloudformation:CreateChangeSet"],

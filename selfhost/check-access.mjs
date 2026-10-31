@@ -79,7 +79,8 @@ if (native) {
   access = config?.access;
   check("the install is hardened (config access)", access?.mode === "hardened", access ? `${access.owner}${access.id ? ` ${access.id}` : ""}` : "not hardened: it deploys through the CDK bootstrap roles");
 }
-const tail = access?.owner === "launch" && access.id ? `-${access.id}` : "";
+// A native install's names end in -stack (infra/lib/native/parent.ts, NATIVE_ID).
+const tail = native ? "-stack" : access?.owner === "launch" && access.id ? `-${access.id}` : "";
 const boundaryArn = `arn:aws:iam::${account}:policy/${prefix}-boundary${tail}`;
 const deployRole = `${prefix}-deploy${tail}`;
 const deployRoleArn = `arn:aws:iam::${account}:role/${deployRole}`;
@@ -99,7 +100,9 @@ for (const r of roles) {
   const full = aws("iam", "get-role", "--role-name", r.RoleName).Role;
   const tag = (full.Tags ?? []).find((t) => t.Key.toLowerCase() === RUNTIME_TAG);
   if (tag) runtimeTagged.set(r.RoleName, tag.Value);
-  if (full.PermissionsBoundary?.PermissionsBoundaryArn !== boundaryArn) noBoundary.push(`${r.RoleName} (${full.PermissionsBoundary?.PermissionsBoundaryArn ?? "none"})`);
+  // A native install's auto-update role carries its own copy (kept with it on delete).
+  const want = native && r.RoleName === deployRole ? `arn:aws:iam::${account}:policy/${prefix}-deploy-boundary-stack` : boundaryArn;
+  if (full.PermissionsBoundary?.PermissionsBoundaryArn !== want) noBoundary.push(`${r.RoleName} (${full.PermissionsBoundary?.PermissionsBoundaryArn ?? "none"})`);
   const attached = aws("iam", "list-attached-role-policies", "--role-name", r.RoleName).AttachedPolicies ?? [];
   for (const p of attached) {
     if (/AdministratorAccess|PowerUserAccess|IAMFullAccess/.test(p.PolicyArn)) admin.push(`${r.RoleName}: ${p.PolicyArn}`);
