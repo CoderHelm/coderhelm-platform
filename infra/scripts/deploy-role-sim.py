@@ -759,6 +759,10 @@ def main():
         else:
             simulated.append(v)
     simulated.sort(key=lambda x: (x["arn"], x["action"]))
+    if args.native:
+        # The caller is the auto-update role (CloudFormation uses it): conditions on aws:PrincipalArn see it.
+        for v in simulated:
+            v["context"] = {**v["context"], "aws:PrincipalArn": synth["names"]["deployRoleArn"]}
     simulate(session, synth["deploy"], synth["boundary"], simulated)
     runtime = runtime_rows(synth["names"])
     simulate_runtime(session, synth["boundary"], runtime)

@@ -401,3 +401,39 @@ class AnthropicKeysInstall(unittest.TestCase):
             return {"provider": "bedrock", "results": [{"model": "claude-opus-5-5", "status": "pass", "code": "ok"}]}
         rec = u.model_check(self.store, ENV, NOW, "v1.1.0", "r", probe=ok)
         self.assertNotIn("note", rec)
+
+
+class AdminOnlyChanges(unittest.TestCase):
+    """The auto-update role can't change itself or a boundary (the boundary
+    refuses it): such a change set waits for an admin instead of failing."""
+
+    def setUp(self):
+        self.store = u.Store(FakeDynamo(), "t")
+        self.cfn = FakeCfn()
+        u._clients["cloudformation"] = self.cfn
+        u._clients["lambda"] = FakeLambda()
+        self._fetch, self._notify = u.fetch_template, u.notify
+        u.fetch_template = lambda url, opener=None: TEMPLATE
+        u.notify = lambda *a, **k: None
+
+    def tearDown(self):
+        u.fetch_template, u.notify = self._fetch, self._notify
+        u._clients.pop("cloudformation", None)
+        u._clients.pop("lambda", None)
+
+    def test_a_change_to_the_deploy_role_or_a_boundary_is_held_for_an_admin(self):
+        env = dict(ENV, DEPLOY_ROLE_ARN="arn:aws:iam::1:role/coderhelm-prod-deploy-stack")
+        self.store.put("MANIFEST#v1.1.0", {"verified": True, "manifest": None, "template_sha256": SHA})
+        u.begin(self.store, env, NOW, "v1.1.0", "auto", "update")
+        self.cfn.cs = {"Status": "CREATE_COMPLETE", "ExecutionStatus": "AVAILABLE", "Changes": [
+            {"ResourceChange": {"Action": "Modify", "LogicalResourceId": "DeployRole", "ResourceType": "AWS::IAM::Role", "Replacement": "False"}},
+            {"ResourceChange": {"Action": "Add", "LogicalResourceId": "DeployBoundary", "ResourceType": "AWS::IAM::ManagedPolicy"}},
+        ]}
+        r = u.native_poll(self.store, env, NOW)
+        self.assertEqual(r["native"], "review")
+        self.assertEqual(self.cfn.executed, [])
+
+    def test_admin_changes_names_only_those(self):
+        cs = {"Changes": [{"ResourceChange": {"Action": "Modify", "LogicalResourceId": "Boundary"}},
+                          {"ResourceChange": {"Action": "Modify", "LogicalResourceId": "Api"}}]}
+        self.assertEqual(u.admin_changes(cs), ["Boundary (Modify)"])

@@ -81,6 +81,17 @@ test("the auto-update role may make every call CloudFormation makes, except the 
   const gaps = pairs().filter((p) => p.verdict !== "allowed" && REFUSED[p.action] !== p.verdict && !(ITS_OWN.includes(p.resource) && p.verdict === "explicitDeny")).map((p) => `${p.action} on ${p.resource}: ${p.verdict}`);
   assert.deepEqual(gaps, []);
   for (const a of Object.keys(REFUSED)) assert.ok(pairs().some((p) => p.action === a), `${a} is no longer a call`);
+  // Its delete of the stack (CloudFormation keeps using it once it applied an update) removes the
+  // boundary: it may delete it, never edit it (the security review's finding on this branch).
+  const verdict = (a: string, res: string) => pairs().find((p) => p.action === a && p.resource === res)?.verdict;
+  const main = "arn:aws:iam::111122223333:policy/coderhelm-prod-boundary-stack";
+  assert.equal(verdict("iam:DeletePolicy", main), "allowed");
+  assert.equal(verdict("iam:DeletePolicyVersion", main), "allowed");
+  assert.equal(verdict("iam:CreatePolicyVersion", main), "explicitDeny");
+  // ... and never create a policy under that name again (else: delete it, make an "Allow *" one of the same name, give it to a role).
+  assert.equal(verdict("iam:CreatePolicy", main), "explicitDeny");
+  assert.equal(verdict("iam:CreatePolicy", "arn:aws:iam::111122223333:policy/coderhelm-prod-deploy-boundary-stack"), "explicitDeny");
+  assert.ok(pairs().every((p) => p.context["aws:PrincipalArn"] === "arn:aws:iam::111122223333:role/coderhelm-prod-deploy-stack"), "the simulated caller is the auto-update role");
   // And it really can't change either of them.
   for (const r of ITS_OWN) assert.ok(pairs().some((p) => p.resource === r && p.verdict === "explicitDeny" && /^iam:(CreatePolicyVersion|PutRolePolicy)$/.test(p.action)), r);
 });

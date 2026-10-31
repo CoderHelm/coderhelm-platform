@@ -480,7 +480,7 @@ function nativeKept(region = R) {
     Condition: { StringLike: { "aws:SourceArn": [`arn:aws:cloudformation:${region}:${A}:stack/coderhelm-prod/*`, `arn:aws:cloudformation:${region}:${A}:stack/coderhelm-prod-*/*`] } } }] };
   w.roles["coderhelm-prod-deploy-stack"] = { boundary: `arn:aws:iam::${A}:policy/coderhelm-prod-deploy-boundary-stack`, trust, policies: ["deploy"] };
   w.policies.push("coderhelm-prod-deploy-boundary-stack", "coderhelm-prod-boundary-stack");
-  w.policyUse = { "coderhelm-prod-deploy-boundary-stack": { PermissionsBoundaryUsageCount: 1, AttachmentCount: 0 }, "coderhelm-prod-boundary-stack": { PermissionsBoundaryUsageCount: 0, AttachmentCount: 0 } };
+  w.policyUse = { "coderhelm-prod-deploy-boundary-stack": { PermissionsBoundaryUsageCount: 1, AttachmentCount: 0 }, "coderhelm-prod-boundary-stack": { PermissionsBoundaryUsageCount: 0, AttachmentCount: 0, CreateDate: "2026-01-01T00:00:00Z" } };
   return w;
 }
 
@@ -513,4 +513,12 @@ test("leftovers: a live native install's boundaries are never listed", async () 
   w.stacks["coderhelm-prod"] = { tags: tag("coderhelm-prod"), exports: [] };
   const r = await cli(["leftovers", "--config", file], { aws: w });
   assert.ok(!/^ {2}(role|permissions boundary) +coderhelm-prod-(deploy-boundary-stack|boundary-stack|deploy-stack)/m.test(r.out), r.out);
+});
+
+test("leftovers: an unused native boundary made in the last hour is left alone (an install may be starting)", async () => {
+  const file = cfgDir();
+  const w = nativeKept();
+  w.policyUse["coderhelm-prod-boundary-stack"].CreateDate = new Date(Date.now() - 60_000).toISOString();
+  const r = await cli(["leftovers", "--config", file], { aws: w });
+  assert.ok(!/^ {2}permissions boundary +coderhelm-prod-boundary-stack/m.test(r.out), r.out);
 });

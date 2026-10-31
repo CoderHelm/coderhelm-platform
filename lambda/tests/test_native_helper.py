@@ -71,12 +71,16 @@ class FakeS3:
 
 
 class FakeCfn:
-    def __init__(self, status):
+    def __init__(self, status, params=None):
         self.status = status
         self.events = []
+        self.params = params
 
     def describe_stacks(self, StackName):
-        return {"Stacks": [{"StackStatus": self.status}]}
+        stack = {"StackStatus": self.status}
+        if self.params is not None:
+            stack["Parameters"] = [{"ParameterKey": k, "ParameterValue": v} for k, v in self.params.items()]
+        return {"Stacks": [stack]}
 
     def describe_stack_events(self, StackName):
         return {"StackEvents": self.events}
@@ -511,3 +515,56 @@ class Stage(unittest.TestCase):
         finally:
             h.stage_release = saved
             os.environ.pop("ASSETS_BUCKET", None)
+
+
+class OnlyWhatTheStackSays(unittest.TestCase):
+    """Delete work follows the root stack's own KeepDataOnDelete, never only
+    the event's, and an event without CloudFormation's answer URL does nothing."""
+
+    def setUp(self):
+        self.saved = dict(h._clients)
+
+    def tearDown(self):
+        h._clients.clear()
+        h._clients.update(self.saved)
+
+    def test_an_event_saying_false_while_the_stack_says_true_keeps_everything(self):
+        h._clients["cloudformation@None"] = FakeCfn("DELETE_IN_PROGRESS", {"KeepDataOnDelete": "true"})
+        sm = FakeSecrets()
+        s3 = FakeS3(versions=[{"Key": "k", "VersionId": "1"}])
+        h._clients.update({"secretsmanager@None": sm, "s3@None": s3, "logs@None": FakeLogs([]), "acm@us-east-1": FakeAcm(), "route53@None": object()})
+        ev = lambda kind, props: {"ResourceType": kind, "RequestType": "Delete", "LogicalResourceId": "X", "ResourceProperties": dict(props, RootStackId="root")}
+        status, reason, _ = h.handle(ev("Custom::Sweep", {"KeepData": "false", "Buckets": ["data"], "Tables": []}))
+        self.assertEqual((status, reason), ("SUCCESS", "data kept"))
+        status, _, _ = h.handle(ev("Custom::Final", {"KeepData": "false", "Prefix": "coderhelm-prod", "SecretId": "s", "LogGroupNames": []}))
+        self.assertEqual(status, "SUCCESS")
+        self.assertEqual(sm.deleted, [])
+        self.assertEqual(s3.deleted, [])
+
+    def test_the_stack_saying_false_is_what_deletes(self):
+        h._clients["cloudformation@None"] = FakeCfn("DELETE_IN_PROGRESS", {"KeepDataOnDelete": "false"})
+        sm = FakeSecrets()
+        h._clients.update({"secretsmanager@None": sm, "logs@None": FakeLogs([]), "acm@us-east-1": FakeAcm(), "route53@None": object()})
+        h.handle({"ResourceType": "Custom::Final", "RequestType": "Delete", "LogicalResourceId": "Final",
+                  "ResourceProperties": {"RootStackId": "root", "KeepData": "true", "Prefix": "coderhelm-prod", "SecretId": "s", "LogGroupNames": []}})
+        self.assertEqual(sm.deleted, [("s", True)])
+
+    def test_an_event_without_cloudformations_answer_url_does_nothing(self):
+        called = []
+        saved = h.handle
+        h.handle = lambda *a, **k: called.append(1) or ("SUCCESS", "", {})
+        try:
+            self.assertIsNone(h.handler({"ResourceType": "Custom::Final", "RequestType": "Delete", "LogicalResourceId": "Final",
+                                         "ResponseURL": "https://attacker.example.com/x", "ResourceProperties": {}}, None))
+        finally:
+            h.handle = saved
+        self.assertEqual(called, [])
+
+    def test_stage_refuses_an_odd_part_template_name(self):
+        v = "v1.2.0"
+        base = f"https://coderhelm-public.s3.amazonaws.com/launch/{v}"
+        bad = json.dumps({"Resources": {"ReleaseAssets": {"Properties": {"BaseUrl": base, "Version": v, "Files": [
+            {"Key": "stacks/Database.json", "Dest": f"releases/{v}/stacks/../../other.json", "Sha256": "0" * 64}]}}}}).encode()
+        opener = lambda req, timeout=None: Resp(bad)
+        with self.assertRaisesRegex(ValueError, "odd part template"):
+            h.stage_release({"version": v, "template_sha256": hashlib.sha256(bad).hexdigest()}, "b", s3=FakeS3(), opener=opener)

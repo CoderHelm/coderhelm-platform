@@ -245,7 +245,9 @@ export async function discover(ctx, base, { mode = "keep", installStatus = "", o
     for (const pol of policies) {
       if (pol.PolicyName !== `${P}-boundary-stack` && pol.PolicyName !== `${P}-deploy-boundary-stack`) continue;
       const carried = nativeAnchored && nr?.PermissionsBoundary?.PermissionsBoundaryArn === pol.Arn;
-      const unused = Number(pol.PermissionsBoundaryUsageCount ?? 1) === 0 && Number(pol.AttachmentCount ?? 1) === 0;
+      // Unused for over an hour: not one another region's install is creating right now (its boundary comes before its roles).
+      const old = Date.now() - Date.parse(pol.CreateDate ?? "") > 3600_000;
+      const unused = old && Number(pol.PermissionsBoundaryUsageCount ?? 1) === 0 && Number(pol.AttachmentCount ?? 1) === 0;
       if (carried || unused) inv.boundaries.push({ name: pol.PolicyName, arn: pol.Arn, id: "stack" });
       else inv.skipped.push({ kind: "permissions boundary", name: pol.PolicyName, why: "a native install's boundary still in use, and not by this region's deleted stack" });
     }

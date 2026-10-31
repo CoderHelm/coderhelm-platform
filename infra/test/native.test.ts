@@ -211,9 +211,19 @@ test("no update build, no deploy window; auto-update is a role only with AutoUpd
   assert.equal(R.DeployBoundary.DeletionPolicy, "Retain");
   assert.deepEqual(R.DeployBoundary.Properties.PolicyDocument, R.Boundary.Properties.PolicyDocument);
   // Neither copy can be edited by an install role.
-  const stays = R.Boundary.Properties.PolicyDocument.Statement.find((x: any) => x.Sid === "TheBoundaryStays");
-  const res = JSON.stringify(stays.Resource);
-  assert.ok(res.includes(":policy/coderhelm-${Stage}-boundary-stack") && res.includes(":policy/coderhelm-${Stage}-deploy-boundary-stack"), res);
+  const st = (sid: string) => R.Boundary.Properties.PolicyDocument.Statement.find((x: any) => x.Sid === sid);
+  // Neither boundary can be edited, and no role's boundary comes off ...
+  const stays = JSON.stringify(st("TheBoundaryStays").Resource);
+  // One pattern for both (IAM's 6,144 characters): coderhelm-<name>-boundary-stack and coderhelm-<name>-deploy-boundary-stack.
+  assert.ok(stays.includes(":policy/coderhelm-${Stage}-*boundary-stack"), stays);
+  assert.deepEqual(st("TheBoundaryStays").Action, ["iam:DeleteRolePermissionsBoundary", "iam:CreatePolicy*", "iam:SetDefault*", "iam:*agPolicy"]);
+  // ... and only the auto-update role deletes them, so a delete through that role (once it applied an update) completes.
+  const del = st("DeletedByTheStack");
+  assert.equal(del.Action, "iam:DeletePolicy*");
+  // Never recreated by a role (CreatePolicy* on the same names, for every role): no "Allow *" boundary of the same name.
+  assert.ok(st("TheBoundaryStays").Action.includes("iam:CreatePolicy*"));
+  assert.ok(JSON.stringify(del.Resource).includes(":policy/coderhelm-${Stage}-*boundary-stack"));
+  assert.deepEqual(del.Condition, { ArnNotLike: { "aws:PrincipalArn": { "Fn::Sub": "arn:*:iam::*:role/coderhelm-${Stage}-deploy-stack" } } });
   assert.match(DEPLOY_BOUNDARY_ARN, /policy\/coderhelm-\$\{Stage\}-deploy-boundary-stack$/);
   // IAM's 6,144 characters, measured as IAM stores it: substitutions resolved
   // with the longest names an install can have (a 20-character stage).

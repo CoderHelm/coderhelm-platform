@@ -1540,6 +1540,22 @@ def data_changes(cfn, cs):
     return out
 
 
+# What the auto-update role may not change about itself (the boundary's
+# TheBoundaryStays and TheDeployRoleStays): a change set that touches one
+# would fail and roll back through that role, so an admin applies it.
+ADMIN_ONLY = ("DeployRole", "Boundary", "DeployBoundary")
+
+
+def admin_changes(cs):
+    """The parent's auto-update role and boundaries the change set changes."""
+    out = []
+    for ch in cs.get("Changes") or []:
+        rc = ch.get("ResourceChange") or {}
+        if rc.get("LogicalResourceId") in ADMIN_ONLY:
+            out.append(f"{rc.get('LogicalResourceId')} ({rc.get('Action')})")
+    return out
+
+
 def stage_release(env, version, template_sha256, lam=None):
     """Asks the install's helper (lambda/native-helper, "stage") to copy the
     release's child templates into the install's assets bucket."""
@@ -1668,6 +1684,7 @@ def native_poll(store, env, now, cfn=None):
                 logger.warning(f"change set not deleted: {e}")
             return native_finish(store, env, now, hid, "failed", "the template CloudFormation fetched is not the verified one, so the change set was deleted")
         entry["data_changes"] = data_changes(cfn, cs)
+        entry["admin_changes"] = admin_changes(cs)
         entry["checked"] = True
         summary["data_changes"] = entry["data_changes"]
         entry["change_set"] = summary
@@ -1676,6 +1693,10 @@ def native_poll(store, env, now, cfn=None):
             # Never automatic when data would be replaced or removed: a person decides.
             entry["apply"] = False
             entry["reason"] = "auto-update held: it would replace or remove " + "; ".join(entry["data_changes"])[:400]
+        elif entry.get("admin_changes") and entry.get("apply"):
+            # The auto-update role can't change itself or a boundary: an admin executes it.
+            entry["apply"] = False
+            entry["reason"] = "auto-update held: it changes the auto-update role or a boundary (" + "; ".join(entry["admin_changes"])[:300] + "), which only an admin can apply"
         if entry.get("apply") and not entry.get("executed_at"):
             cfn.execute_change_set(ChangeSetName=cs_id, StackName=env["NATIVE_STACK"])
             entry.update({"executed_at": now.isoformat(), "status": "running"})
