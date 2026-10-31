@@ -151,6 +151,7 @@ function conditions(): Json {
     AutoUpdateOn: { "Fn::Equals": [{ Ref: "AutoUpdate" }, "on"] },
     HasHostname: not("Hostname", ""),
     HasDomainCert: { "Fn::And": [not("Hostname", ""), not("DomainCertificateArn", "")] },
+    HasDomainZone: not("DomainZoneId", ""),
     HasStatus: not("StatusId", ""),
     HasSetupToken: not("SetupToken", ""),
   };
@@ -204,6 +205,18 @@ export function helperPolicy(): PolicyDocument {
       // Only deleting the CNAME a certificate check uses (its name starts with an underscore).
       { Sid: "ValidationRecordsOnDelete", Effect: "Allow", Action: "route53:ChangeResourceRecordSets", Resource: "arn:${AWS::Partition}:route53:::hostedzone/*", Condition: { "ForAllValues:StringLike": { "route53:ChangeResourceRecordSetsNormalizedRecordNames": ["_*"] }, "ForAllValues:StringEquals": { "route53:ChangeResourceRecordSetsActions": ["DELETE"], "route53:ChangeResourceRecordSetsRecordTypes": ["CNAME"] } } },
     ],
+  };
+}
+
+/**
+ * The DNS statement only when the install has a zone: with no custom domain
+ * DomainZoneId is empty and the statement would name `hostedzone/` (never
+ * widened to every zone instead).
+ */
+export function withZoneOnly(policy: any): any {
+  return {
+    ...policy,
+    Statement: policy.Statement.map((s: any) => (s.Sid === "DnsRecords" ? { "Fn::If": ["HasDomainZone", s, { Ref: "AWS::NoValue" }] } : s)),
   };
 }
 
@@ -421,7 +434,7 @@ export function buildParent(input: ParentInput): Json {
         }],
       },
       PermissionsBoundary: { Ref: "DeployBoundary" },
-      Policies: [{ PolicyName: "deploy", PolicyDocument: subInstall(deployRolePolicy(n)) }],
+      Policies: [{ PolicyName: "deploy", PolicyDocument: withZoneOnly(subInstall(deployRolePolicy(n))) }],
       Tags: [{ Key: INSTALL_TAG, Value: sub("coderhelm-${Stage}") }],
     },
   };

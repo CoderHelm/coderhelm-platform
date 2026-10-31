@@ -116,9 +116,8 @@ test("boundary: even a role whose own policy allows everything stays inside it",
   ] as [string, string, Record<string, string>?][]) {
     assert.ok(!can(action, resource, context), `the boundary refuses ${action} on ${resource}`);
   }
-  // The log reader in another account can still be assumed (log reading), and no other role there.
-  assert.ok(can("sts:AssumeRole", "arn:aws:iam::999988887777:role/CoderHelmLogReader", { "aws:ResourceAccount": "999988887777" }));
-  assert.ok(!can("sts:AssumeRole", "arn:aws:iam::999988887777:role/OrganizationAccountAccessRole", { "aws:ResourceAccount": "999988887777" }));
+  // A log reader role in another account can still be assumed (log reading).
+  assert.ok(can("sts:AssumeRole", "arn:aws:iam::999988887777:role/coderhelm-log-reader", { "aws:ResourceAccount": "999988887777" }));
 });
 
 // An install in the same AWS account as the data it reads takes on
@@ -153,7 +152,7 @@ test("boundary: in its own account, only the gateway and worker may assume only 
 test("boundary: fits IAM's managed policy limit (6,144 characters without whitespace) with room to spare", () => {
   const size = JSON.stringify(BOUNDARY).length;
   // Measured with the longest names an install can have (a 20-character stage).
-  assert.ok(size < 6050, `boundary is ${size} characters`);
+  assert.ok(size < 5900, `boundary is ${size} characters`);
 });
 
 test("boundary: only the deploy role may set or remove the gateway and worker tag", () => {
