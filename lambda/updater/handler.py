@@ -1758,7 +1758,7 @@ def handle(event, env, store, now, fetch=fetch_releases, probe=None):
             # The model check for the latest release (Settings, System and Setup).
             "model_check": (lambda mc: mc if latest and mc and mc.get("version") == latest["version"] else None)(
                 store.get("MODEL_CHECK")),
-            # Which install this is, for Settings, System, Uninstall's link to the guided uninstall.
+            # Which install this is, for Settings, System, Uninstall's link to the uninstall page.
             "install": install_identity(env),
             # A native install: the stack, and the change set an admin reviews.
             "native": native_status(store, env, state) if is_native(env) else None,
