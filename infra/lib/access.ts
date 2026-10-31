@@ -257,20 +257,15 @@ export function guardrails(n: AccessNames, otherBoundaries: string[] = []): Stat
       : [
           {
             // A native install: no role's boundary comes off, neither the boundary nor the auto-update
-            // role's own copy can be edited, and no role can create a policy under either name: once the
-            // stack deleted one, nothing in the install can make it again (with another text) and give it
-            // to a role. The first launch and turning auto-update on run with an admin's own permissions.
+            // role's own copy can be edited or deleted, and no role can create a policy under either name.
+            // The first launch, turning auto-update on and a delete run with an admin's own permissions.
             Sid: "TheBoundaryStays",
             Effect: "Deny" as const,
-            // CreatePolicy*: CreatePolicy, CreatePolicyVersion; SetDefault*: SetDefaultPolicyVersion; *agPolicy: TagPolicy, UntagPolicy.
-            Action: ["iam:DeleteRolePermissionsBoundary", "iam:CreatePolicy*", "iam:SetDefault*", "iam:*agPolicy"],
+            // CreatePolicy*: CreatePolicy, CreatePolicyVersion; DeletePolicy*: DeletePolicy, DeletePolicyVersion;
+            // SetDefault*: SetDefaultPolicyVersion; *agPolicy: TagPolicy, UntagPolicy.
+            Action: ["iam:DeleteRolePermissionsBoundary", "iam:CreatePolicy*", "iam:DeletePolicy*", "iam:SetDefault*", "iam:*agPolicy"],
             Resource: [boundaries, a.anyRoleHere],
           },
-          // Only the auto-update role deletes them, when it deletes the stack (CloudFormation keeps using the
-          // stack's role). IAM refuses to delete a policy any role still carries as its boundary, no boundary
-          // comes off a role, and the stack deletes the boundary after every role that carries it.
-          // (IAM policies can't be reached from another account or partition: the role's name is enough.)
-          { Sid: "DeletedByTheStack", Effect: "Deny" as const, Action: "iam:DeletePolicy*", Resource: boundaries, Condition: { ArnNotLike: { "aws:PrincipalArn": `arn:*:iam::*:role/${n.deployRoleName}` } } },
         ]),
     {
       // Changes only to the install's own functions, stacks, buckets, secret

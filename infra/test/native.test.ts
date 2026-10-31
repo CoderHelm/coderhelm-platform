@@ -216,14 +216,10 @@ test("no update build, no deploy window; auto-update is a role only with AutoUpd
   const stays = JSON.stringify(st("TheBoundaryStays").Resource);
   // One pattern for both (IAM's 6,144 characters): coderhelm-<name>-boundary-stack and coderhelm-<name>-deploy-boundary-stack.
   assert.ok(stays.includes(":policy/coderhelm-${Stage}-*boundary-stack"), stays);
-  assert.deepEqual(st("TheBoundaryStays").Action, ["iam:DeleteRolePermissionsBoundary", "iam:CreatePolicy*", "iam:SetDefault*", "iam:*agPolicy"]);
-  // ... and only the auto-update role deletes them, so a delete through that role (once it applied an update) completes.
-  const del = st("DeletedByTheStack");
-  assert.equal(del.Action, "iam:DeletePolicy*");
-  // Never recreated by a role (CreatePolicy* on the same names, for every role): no "Allow *" boundary of the same name.
-  assert.ok(st("TheBoundaryStays").Action.includes("iam:CreatePolicy*"));
-  assert.ok(JSON.stringify(del.Resource).includes(":policy/coderhelm-${Stage}-*boundary-stack"));
-  assert.deepEqual(del.Condition, { ArnNotLike: { "aws:PrincipalArn": { "Fn::Sub": "arn:*:iam::*:role/coderhelm-${Stage}-deploy-stack" } } });
+  // Neither can be edited, deleted or created again by any role (the deploy role included: a deleted
+  // boundary must never come back with another text under the same name).
+  assert.deepEqual(st("TheBoundaryStays").Action, ["iam:DeleteRolePermissionsBoundary", "iam:CreatePolicy*", "iam:DeletePolicy*", "iam:SetDefault*", "iam:*agPolicy"]);
+  assert.equal(st("DeletedByTheStack"), undefined, "no role may delete a boundary");
   assert.match(DEPLOY_BOUNDARY_ARN, /policy\/coderhelm-\$\{Stage\}-deploy-boundary-stack$/);
   // IAM's 6,144 characters, measured as IAM stores it: substitutions resolved
   // with the longest names an install can have (a 20-character stage).

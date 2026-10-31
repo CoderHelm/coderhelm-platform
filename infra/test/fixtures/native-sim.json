@@ -625,6 +625,7 @@
      "Action": [
       "iam:DeleteRolePermissionsBoundary",
       "iam:CreatePolicy*",
+      "iam:DeletePolicy*",
       "iam:SetDefault*",
       "iam:*agPolicy"
      ],
@@ -632,17 +633,6 @@
       "arn:aws:iam::111122223333:policy/coderhelm-prod-*boundary-stack",
       "arn:aws:iam::111122223333:role/*"
      ]
-    },
-    {
-     "Sid": "DeletedByTheStack",
-     "Effect": "Deny",
-     "Action": "iam:DeletePolicy*",
-     "Resource": "arn:aws:iam::111122223333:policy/coderhelm-prod-*boundary-stack",
-     "Condition": {
-      "ArnNotLike": {
-       "aws:PrincipalArn": "arn:*:iam::*:role/coderhelm-prod-deploy-stack"
-      }
-     }
     },
     {
      "Sid": "OnlyTheInstallsOwn",
@@ -1116,10 +1106,10 @@
   {"actions": {"iam:CreatePolicyVersion": "allowed", "iam:DeletePolicy": "allowed", "iam:DeletePolicyVersion": "allowed", "iam:GetPolicy": "allowed", "iam:GetPolicyVersion": "allowed", "iam:ListEntitiesForPolicy": "allowed", "iam:ListPolicyVersions": "allowed"}, "calls": ["AWS::IAM::ManagedPolicy delete", "AWS::IAM::ManagedPolicy read", "AWS::IAM::ManagedPolicy update"], "context": {"aws:PrincipalArn": "arn:aws:iam::111122223333:role/coderhelm-prod-deploy-stack", "aws:ResourceTag/coderhelm:install": "coderhelm-prod"}, "resource": "arn:aws:iam::111122223333:policy/coderhelm-prod-OverflowPolicy2-e68ee111"},
   {"actions": {"iam:TagPolicy": "explicitDeny"}, "calls": ["AWS::IAM::ManagedPolicy create"], "context": {"aws:PrincipalArn": "arn:aws:iam::111122223333:role/coderhelm-prod-deploy-stack", "aws:RequestTag/coderhelm:install": "coderhelm-prod", "aws:ResourceTag/coderhelm:install": "coderhelm-prod", "aws:TagKeys": ["coderhelm:install"]}, "resource": "arn:aws:iam::111122223333:policy/coderhelm-prod-boundary-stack"},
   {"actions": {"iam:CreatePolicy": "explicitDeny"}, "calls": ["AWS::IAM::ManagedPolicy create"], "context": {"aws:PrincipalArn": "arn:aws:iam::111122223333:role/coderhelm-prod-deploy-stack", "aws:RequestTag/coderhelm:install": "coderhelm-prod", "aws:TagKeys": ["coderhelm:install"]}, "resource": "arn:aws:iam::111122223333:policy/coderhelm-prod-boundary-stack"},
-  {"actions": {"iam:CreatePolicyVersion": "explicitDeny", "iam:DeletePolicy": "allowed", "iam:DeletePolicyVersion": "allowed", "iam:GetPolicy": "allowed", "iam:GetPolicyVersion": "allowed", "iam:ListEntitiesForPolicy": "allowed", "iam:ListPolicyVersions": "allowed"}, "calls": ["AWS::IAM::ManagedPolicy delete", "AWS::IAM::ManagedPolicy read", "AWS::IAM::ManagedPolicy update"], "context": {"aws:PrincipalArn": "arn:aws:iam::111122223333:role/coderhelm-prod-deploy-stack", "aws:ResourceTag/coderhelm:install": "coderhelm-prod"}, "resource": "arn:aws:iam::111122223333:policy/coderhelm-prod-boundary-stack"},
+  {"actions": {"iam:CreatePolicyVersion": "explicitDeny", "iam:DeletePolicy": "explicitDeny", "iam:DeletePolicyVersion": "explicitDeny", "iam:GetPolicy": "allowed", "iam:GetPolicyVersion": "allowed", "iam:ListEntitiesForPolicy": "allowed", "iam:ListPolicyVersions": "allowed"}, "calls": ["AWS::IAM::ManagedPolicy delete", "AWS::IAM::ManagedPolicy read", "AWS::IAM::ManagedPolicy update"], "context": {"aws:PrincipalArn": "arn:aws:iam::111122223333:role/coderhelm-prod-deploy-stack", "aws:ResourceTag/coderhelm:install": "coderhelm-prod"}, "resource": "arn:aws:iam::111122223333:policy/coderhelm-prod-boundary-stack"},
   {"actions": {"iam:TagPolicy": "explicitDeny"}, "calls": ["AWS::IAM::ManagedPolicy create"], "context": {"aws:PrincipalArn": "arn:aws:iam::111122223333:role/coderhelm-prod-deploy-stack", "aws:RequestTag/coderhelm:install": "coderhelm-prod", "aws:ResourceTag/coderhelm:install": "coderhelm-prod", "aws:TagKeys": ["coderhelm:install"]}, "resource": "arn:aws:iam::111122223333:policy/coderhelm-prod-deploy-boundary-stack"},
   {"actions": {"iam:CreatePolicy": "explicitDeny"}, "calls": ["AWS::IAM::ManagedPolicy create"], "context": {"aws:PrincipalArn": "arn:aws:iam::111122223333:role/coderhelm-prod-deploy-stack", "aws:RequestTag/coderhelm:install": "coderhelm-prod", "aws:TagKeys": ["coderhelm:install"]}, "resource": "arn:aws:iam::111122223333:policy/coderhelm-prod-deploy-boundary-stack"},
-  {"actions": {"iam:CreatePolicyVersion": "explicitDeny", "iam:DeletePolicy": "allowed", "iam:DeletePolicyVersion": "allowed", "iam:GetPolicy": "allowed", "iam:GetPolicyVersion": "allowed", "iam:ListEntitiesForPolicy": "allowed", "iam:ListPolicyVersions": "allowed"}, "calls": ["AWS::IAM::ManagedPolicy delete", "AWS::IAM::ManagedPolicy read", "AWS::IAM::ManagedPolicy update"], "context": {"aws:PrincipalArn": "arn:aws:iam::111122223333:role/coderhelm-prod-deploy-stack", "aws:ResourceTag/coderhelm:install": "coderhelm-prod"}, "resource": "arn:aws:iam::111122223333:policy/coderhelm-prod-deploy-boundary-stack"},
+  {"actions": {"iam:CreatePolicyVersion": "explicitDeny", "iam:DeletePolicy": "explicitDeny", "iam:DeletePolicyVersion": "explicitDeny", "iam:GetPolicy": "allowed", "iam:GetPolicyVersion": "allowed", "iam:ListEntitiesForPolicy": "allowed", "iam:ListPolicyVersions": "allowed"}, "calls": ["AWS::IAM::ManagedPolicy delete", "AWS::IAM::ManagedPolicy read", "AWS::IAM::ManagedPolicy update"], "context": {"aws:PrincipalArn": "arn:aws:iam::111122223333:role/coderhelm-prod-deploy-stack", "aws:ResourceTag/coderhelm:install": "coderhelm-prod"}, "resource": "arn:aws:iam::111122223333:policy/coderhelm-prod-deploy-boundary-stack"},
   {"actions": {"iam:CreateServiceLinkedRole": "explicitDeny"}, "calls": ["AWS::Cognito::UserPool create", "AWS::Cognito::UserPoolClient create"], "context": {"aws:PrincipalArn": "arn:aws:iam::111122223333:role/coderhelm-prod-deploy-stack", "iam:AWSServiceName": "email.cognito-idp.amazonaws.com"}, "resource": "arn:aws:iam::111122223333:role/aws-service-role/email.cognito-idp.amazonaws.com/AWSServiceRoleForAmazonCognitoIdpEmailService"},
   {"actions": {"iam:CreateServiceLinkedRole": "explicitDeny"}, "calls": ["AWS::DynamoDB::GlobalTable create"], "context": {"aws:PrincipalArn": "arn:aws:iam::111122223333:role/coderhelm-prod-deploy-stack", "iam:AWSServiceName": "replication.dynamodb.amazonaws.com"}, "resource": "arn:aws:iam::111122223333:role/aws-service-role/replication.dynamodb.amazonaws.com/AWSServiceRoleForDynamoDBReplication"},
   {"actions": {"iam:TagRole": "allowed"}, "calls": ["AWS::IAM::Role create", "AWS::IAM::Role delete", "AWS::IAM::Role tag", "AWS::IAM::Role update"], "context": {"aws:PrincipalArn": "arn:aws:iam::111122223333:role/coderhelm-prod-deploy-stack", "aws:RequestTag/coderhelm:install": "coderhelm-prod", "aws:ResourceTag/coderhelm:install": "coderhelm-prod", "aws:TagKeys": ["coderhelm:install"]}, "resource": "arn:aws:iam::111122223333:role/coderhelm-prod-Role-376182c6"},

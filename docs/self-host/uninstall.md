@@ -109,7 +109,7 @@ It shows the list and asks you to type the install's name. Then it removes each 
 
 The stack's **Events** tab names the resource and AWS's reason. Fix what it says, then choose **Delete** again; CloudFormation picks up where it stopped. If a resource still can't be deleted, the console offers to keep it and delete the rest. Keep it, then remove it with `leftovers --delete`.
 
-If the stack was ever updated through the auto-update role, CloudFormation deletes it through that role too, and some deletes are outside what the role may do (for example scheduling a KMS key for deletion). Use the same path: delete again, keep what failed, then `leftovers --delete`.
+If the stack was ever updated through the auto-update role, CloudFormation deletes it through that role too, and some deletes are outside what the role may do: scheduling a KMS key for deletion, and deleting the permissions boundary (no CoderHelm role may delete it). The simplest is to delete with a role of your own: `aws cloudformation delete-stack --region <region> --stack-name coderhelm-<name> --role-arn <a role of yours>`. Or use the same path: delete again, keep what failed, then `leftovers --delete`.
 
 ## Not removed
 
