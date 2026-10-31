@@ -1223,11 +1223,27 @@ def model_check(store, env, now, version, repo, probe=invoke_worker):
             "ok": not any(r.get("status") == "fail" for r in results),
             "results": results,
         }
+        note = provider_note(answer, results)
+        if note:
+            record["note"] = note
     old = store.get("MODEL_CHECK") or {}
     # Admins hear about a refused model once per release, not every day.
     record["notified"] = bool(old.get("version") == version and old.get("notified"))
     store.put("MODEL_CHECK", record)
     return record
+
+
+def provider_note(answer, results):
+    """Why nothing was called: an install on Anthropic API keys checks the
+    models through a team's key (the worker never calls Bedrock for it), and
+    each team adds its own key, so with none yet there is nothing to check
+    and nothing holds the update."""
+    if answer.get("provider") != "anthropic" or not results:
+        return ""
+    if all(r.get("code") == "no_key" for r in results):
+        return ("This install uses Anthropic API keys, added per team: no key to check the models with yet, "
+                "so nothing holds the update. Each team's key is checked when it's added (Settings, AI models).")
+    return "Checked with a team's Anthropic API key (this install doesn't use Bedrock)."
 
 
 def needs_check(record, version, now):
@@ -1461,6 +1477,10 @@ def native_propose(store, env, version, mode, extra=None, cfn=None, opener=None)
     if mode == "update" and parse_version(current) and compare(version, current) < 0:
         raise ValueError(f"{version} is older than {current}: going back is a rollback")
     template = json.loads(body)
+    if template.get("Transform"):
+        # CloudFormation stores such a template already resolved, so what it
+        # fetched could never be compared with what was verified.
+        raise ValueError(f"{version}'s stack template uses a transform, which the updater can't check after CloudFormation reads it; update it in the console with a change set")
     stack = cfn.describe_stacks(StackName=env["NATIVE_STACK"])["Stacks"][0]
     overrides = {}
     if mode == "domain" and extra:
@@ -1486,6 +1506,10 @@ def native_propose(store, env, version, mode, extra=None, cfn=None, opener=None)
     role = env.get("DEPLOY_ROLE_ARN") or ""
     if role:
         kwargs["RoleARN"] = role
+    # The parts' templates must be readable while CloudFormation builds the
+    # nested change sets: the helper copies them into the install's bucket
+    # first, each checked against this verified template.
+    stage_release(env, version, want)
     r = cfn.create_change_set(**kwargs)
     return {"change_set_id": r["Id"], "apply": bool(role), "template_canonical": canonical_sha(template)}
 
@@ -1514,6 +1538,26 @@ def data_changes(cfn, cs):
                 walk(cfn.describe_change_set(ChangeSetName=nested), rc.get("LogicalResourceId"))
     walk(cs, "parent")
     return out
+
+
+def stage_release(env, version, template_sha256, lam=None):
+    """Asks the install's helper (lambda/native-helper, "stage") to copy the
+    release's child templates into the install's assets bucket."""
+    fn = env.get("NATIVE_HELPER_FUNCTION") or ""
+    if not fn:
+        raise ValueError("this install has no helper to stage the release's files")
+    out = (lam or client("lambda")).invoke(
+        FunctionName=fn, InvocationType="RequestResponse",
+        Payload=json.dumps({"action": "stage", "version": version, "template_sha256": template_sha256}).encode(),
+    )
+    raw = out["Payload"].read() or b"{}"
+    try:
+        r = json.loads(raw)
+    except ValueError:
+        r = {}
+    if out.get("FunctionError") or not r.get("ok"):
+        raise ValueError(f"{version}'s files couldn't be staged for the change set: {r.get('error') or raw[:300]!r}")
+    return r
 
 
 def fetched_template_matches(cfn, env, cs_id, want):

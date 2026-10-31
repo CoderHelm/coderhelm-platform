@@ -118,11 +118,11 @@ function world({ hybrid = false } = {}) {
       }
       case "logs describe-log-groups": return { logGroups: w.logGroups.filter((g) => g.startsWith(arg("--log-group-name-prefix"))).map((logGroupName) => ({ logGroupName })) };
       case "ssm get-parameters-by-path": return { Parameters: w.params.filter((p) => p.startsWith(`${arg("--path")}/`)).map((Name) => ({ Name })) };
-      case "iam list-policies": return { Policies: w.policies.map((PolicyName) => ({ PolicyName, Arn: `arn:aws:iam::${A}:policy/${PolicyName}` })) };
+      case "iam list-policies": return { Policies: w.policies.map((PolicyName) => ({ PolicyName, Arn: `arn:aws:iam::${A}:policy/${PolicyName}`, ...(w.policyUse?.[PolicyName] ?? {}) })) };
       case "iam list-roles": return { Roles: Object.keys(w.roles).map((RoleName) => ({ RoleName })) };
       case "iam get-role": {
         const r = w.roles[arg("--role-name")];
-        return r ? { Role: { RoleName: arg("--role-name"), Tags: r.tags ?? [], ...(r.boundary ? { PermissionsBoundary: { PermissionsBoundaryArn: r.boundary } } : {}) } } : null;
+        return r ? { Role: { RoleName: arg("--role-name"), Tags: r.tags ?? [], ...(r.trust ? { AssumeRolePolicyDocument: r.trust } : {}), ...(r.boundary ? { PermissionsBoundary: { PermissionsBoundaryArn: r.boundary } } : {}) } } : null;
       }
       case "iam list-role-policies": return { PolicyNames: w.roles[arg("--role-name")]?.policies ?? [] };
       case "iam list-attached-role-policies": return { AttachedPolicies: [] };
@@ -471,4 +471,46 @@ test("leftovers --delete never takes a native install apart while its stack exis
   const r = await cli(["leftovers", "--delete", "--config", file], { aws: w, interactive: true, ask: quietAsk({ "Type the install name (prod)": "prod" }) });
   assert.match(String(r.error), /delete it in CloudFormation \(Delete stack\)/);
   assert.equal(writes(w).length, 0);
+});
+
+/** A native install deleted with auto-update on: its auto-update role and that role's boundary are kept. */
+function nativeKept(region = R) {
+  const w = leftoverWorld();
+  const trust = { Version: "2012-10-17", Statement: [{ Effect: "Allow", Principal: { Service: "cloudformation.amazonaws.com" }, Action: "sts:AssumeRole",
+    Condition: { StringLike: { "aws:SourceArn": [`arn:aws:cloudformation:${region}:${A}:stack/coderhelm-prod/*`, `arn:aws:cloudformation:${region}:${A}:stack/coderhelm-prod-*/*`] } } }] };
+  w.roles["coderhelm-prod-deploy-stack"] = { boundary: `arn:aws:iam::${A}:policy/coderhelm-prod-deploy-boundary-stack`, trust, policies: ["deploy"] };
+  w.policies.push("coderhelm-prod-deploy-boundary-stack", "coderhelm-prod-boundary-stack");
+  w.policyUse = { "coderhelm-prod-deploy-boundary-stack": { PermissionsBoundaryUsageCount: 1, AttachmentCount: 0 }, "coderhelm-prod-boundary-stack": { PermissionsBoundaryUsageCount: 0, AttachmentCount: 0 } };
+  return w;
+}
+
+test("leftovers: a native install's kept auto-update role and boundaries are listed and removed", async () => {
+  const file = cfgDir();
+  const w = nativeKept();
+  const r = await cli(["leftovers", "--config", file], { aws: w });
+  assert.match(r.out, /^ {2}role +coderhelm-prod-deploy-stack/m);
+  assert.match(r.out, /^ {2}permissions boundary +coderhelm-prod-deploy-boundary-stack/m);
+  assert.match(r.out, /^ {2}permissions boundary +coderhelm-prod-boundary-stack/m, "an unused one too");
+  const d = await cli(["leftovers", "--delete", "--config", file], { aws: w, interactive: true, ask: quietAsk({ "Type the install name (prod)": "prod" }) });
+  assert.equal(d.code, 0, d.out + String(d.error?.message));
+  assert.ok(!w.roles["coderhelm-prod-deploy-stack"]);
+  assert.ok(writes(w).some((c) => c.op === "delete-policy" && c.args.includes(`arn:aws:iam::${A}:policy/coderhelm-prod-deploy-boundary-stack`)));
+});
+
+test("leftovers: never another region's native install's role or a boundary still in use", async () => {
+  const file = cfgDir();
+  const w = nativeKept("eu-west-1");
+  w.policyUse["coderhelm-prod-boundary-stack"] = { PermissionsBoundaryUsageCount: 4, AttachmentCount: 0 };
+  const r = await cli(["leftovers", "--config", file], { aws: w });
+  assert.ok(!/^ {2}role +coderhelm-prod-deploy-stack/m.test(r.out), r.out);
+  assert.ok(!/^ {2}permissions boundary +coderhelm-prod-(deploy-)?boundary-stack/m.test(r.out), r.out);
+  assert.match(r.out, /not this install's: permissions boundary coderhelm-prod-boundary-stack \(a native install's boundary still in use/);
+});
+
+test("leftovers: a live native install's boundaries are never listed", async () => {
+  const file = cfgDir();
+  const w = nativeKept();
+  w.stacks["coderhelm-prod"] = { tags: tag("coderhelm-prod"), exports: [] };
+  const r = await cli(["leftovers", "--config", file], { aws: w });
+  assert.ok(!/^ {2}(role|permissions boundary) +coderhelm-prod-(deploy-boundary-stack|boundary-stack|deploy-stack)/m.test(r.out), r.out);
 });

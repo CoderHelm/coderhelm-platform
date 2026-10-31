@@ -679,7 +679,7 @@ const n = accessNames({ account: ACCT, region: REG, prefix: "coderhelm-prod", su
 out.names = n;
 out.deploy = resolveValue(deployRolePolicy(accessNames({ partition: "${AWS::Partition}", account: "${AWS::AccountId}", region: "${AWS::Region}", prefix: "coderhelm-${Stage}", suffix: "-${AWS::AccountId}", secretName: "coderhelm/${Stage}/secrets", id: "stack" })).Statement.map((s) => JSON.parse(JSON.stringify(s).replace(/"([^"]*\$\{[^"]*)"/g, (m, x) => JSON.stringify({ "Fn::Sub": x })))), { values });
 out.deploy = { Version: "2012-10-17", Statement: out.deploy };
-out.boundary = boundaryPolicy(n);
+out.boundary = boundaryPolicy(n, ["arn:aws:iam::" + ACCT + ":policy/coderhelm-prod-deploy-boundary-stack"]);
 const helper = helperPolicy();
 out.helper = JSON.parse(JSON.stringify(helper).replace(/\$\{Stage\}/g, "prod").replace(/\$\{StatusId\}/g, "0123456789abcdef").replace(/\$\{AWS::AccountId\}/g, ACCT).replace(/\$\{AWS::Region\}/g, REG).replace(/\$\{AWS::Partition\}/g, "aws").replace(/\$\{AWS::StackName\}/g, "coderhelm-prod"));
 process.stdout.write(JSON.stringify(out));
@@ -695,6 +695,13 @@ def helper_rows():
         ("s3:PutObject", f"{s3}coderhelm-setup-0123456789abcdef/status.json"),
         ("secretsmanager:PutSecretValue", f"{at('secretsmanager')}:secret:coderhelm/prod/secrets-AbCdEf"),
         ("dynamodb:DeleteTable", f"{at('dynamodb')}:table/{P}-traces"), ("dynamodb:BatchWriteItem", f"{at('dynamodb')}:table/{P}-settings"),
+        # The main table has no suffix (the live test's failed delete).
+        ("dynamodb:DescribeTable", f"{at('dynamodb')}:table/{P}"), ("dynamodb:DeleteTable", f"{at('dynamodb')}:table/{P}"),
+        ("dynamodb:UpdateTable", f"{at('dynamodb')}:table/{P}"),
+        # Final, with KeepDataOnDelete=false.
+        ("secretsmanager:DeleteSecret", f"{at('secretsmanager')}:secret:coderhelm/prod/secrets-AbCdEf"),
+        ("logs:DeleteLogGroup", f"{at('logs')}:log-group:/aws/lambda/{P}-Handler-cd8e80af"),
+        ("logs:DeleteLogGroup", f"{at('logs')}:log-group:/aws/codebuild/{P}-release-check"),
         ("lambda:InvokeFunction", f"{at('lambda')}:function:{P}-updater"),
         ("logs:DeleteLogGroup", f"{at('logs')}:log-group:/aws/lambda/{P}-gateway"),
         ("cloudformation:DescribeStacks", f"{at('cloudformation')}:stack/{P}/0f0f0f0f-1111-2222-3333-444455556666"),
@@ -703,6 +710,9 @@ def helper_rows():
         ("s3:PutObject", f"{s3}{P}-data-{ACCT}/x"), ("s3:DeleteObject", f"{s3}someone-else/x"), ("s3:PutObject", f"{s3}coderhelm-other-release-{ACCT}/x"),
         ("secretsmanager:PutSecretValue", f"{at('secretsmanager')}:secret:coderhelm/other/secrets-AbCdEf"),
         ("dynamodb:DeleteTable", f"{at('dynamodb')}:table/orders"), ("dynamodb:DeleteTable", f"{at('dynamodb')}:table/coderhelm-other-traces"),
+        ("dynamodb:DeleteTable", f"{at('dynamodb')}:table/{P}x"), ("dynamodb:DescribeTable", f"{at('dynamodb')}:table/coderhelm-other"),
+        ("secretsmanager:DeleteSecret", f"{at('secretsmanager')}:secret:coderhelm/other/secrets-AbCdEf"),
+        ("secretsmanager:DeleteSecret", f"{at('secretsmanager')}:secret:payments-AbCdEf"),
         ("lambda:InvokeFunction", f"{at('lambda')}:function:{P}-gateway"), ("lambda:UpdateFunctionCode", f"{at('lambda')}:function:{P}-updater"),
         ("logs:DeleteLogGroup", f"{at('logs')}:log-group:/aws/lambda/payments"), ("logs:CreateLogGroup", f"{at('logs')}:log-group:/aws/lambda/{P}-install-helper"),
         ("iam:CreateRole", f"arn:aws:iam::{ACCT}:role/{P}-x"), ("cloudformation:DeleteStack", f"{at('cloudformation')}:stack/{P}/0f0f0f0f-1111-2222-3333-444455556666"),

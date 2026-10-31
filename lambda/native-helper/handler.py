@@ -28,8 +28,20 @@ Resource types (event["ResourceType"]):
                          left to fail on.
   Custom::Final          deleted after every part: the certificates the updater
                          requested for this install (and their validation
-                         records), and, with KeepDataOnDelete=false, the log
-                         groups Lambda made by itself.
+                         records); the exact log groups the parts declare
+                         (Lambda recreates one when a function's last logs
+                         arrive after CloudFormation deleted it); with
+                         KeepDataOnDelete=false, the other log groups Lambda
+                         made by itself, and the install's secret (after
+                         HybridLeave and SetupKey, which read it).
+
+Called directly (not by CloudFormation), {"action": "stage", "version",
+"template_sha256"} from the updater: copies that release's child templates
+into the install's assets bucket before it proposes the update, so
+CloudFormation can read them while it builds the change set with the nested
+stacks. The helper reads the release's coderhelm.json itself from the
+release location, checks it against the sha256 (from the signed
+SHA256SUMS), and copies only the files that template lists, each checked.
 
 Delete-time work runs only when the ROOT stack is being deleted (or its first
 create is rolling back), never when an update removes or replaces one of
@@ -49,6 +61,9 @@ import time
 import urllib.request
 
 RELEASE_HOST = "coderhelm-public.s3.amazonaws.com"
+RELEASE_FILE = "coderhelm.json"
+VERSION_RE = re.compile(r"^v\d+\.\d+\.\d+(-[0-9A-Za-z.-]+)?$")
+SHA_RE = re.compile(r"^[0-9a-f]{64}$")
 SETUP_TOKEN_RE = re.compile(r"^[A-Za-z0-9]{32,64}$")
 INSTALL_ID_RE = re.compile(r"^ins_[a-z0-9]{24}$")
 
@@ -238,6 +253,49 @@ def prune_assets(props, old, s3=None):
     if gone:
         log("removed files no version in use lists:", len(gone))
     return gone
+
+
+def stage_release(event, bucket, s3=None, opener=None):
+    """The updater's step before a change set: the child templates of
+    `version` into the assets bucket, from its verified coderhelm.json."""
+    version = str(event.get("version") or "")
+    want = str(event.get("template_sha256") or "").lower()
+    if not VERSION_RE.match(version):
+        raise ValueError(f"not a release version: {version!r}")
+    if not SHA_RE.match(want):
+        raise ValueError("the template's sha256 is missing")
+    if not bucket:
+        raise ValueError("no assets bucket")
+    base = f"https://{RELEASE_HOST}/launch/{version}"
+    path = download_verified(release_url(base, RELEASE_FILE), want, opener)
+    try:
+        with open(path, "rb") as fh:
+            template = json.load(fh)
+    finally:
+        os.unlink(path)
+    props = ((template.get("Resources") or {}).get("ReleaseAssets") or {}).get("Properties") or {}
+    if props.get("Version") != version or str(props.get("BaseUrl", "")).rstrip("/") != base:
+        raise ValueError(f"{version}'s template lists another release's files: refused")
+    prefix = f"releases/{version}/stacks/"
+    files = [f for f in props.get("Files") or [] if str(f.get("Dest", "")).startswith(prefix)]
+    if not files:
+        raise ValueError(f"{version}'s template lists no child templates")
+    data = copy_assets({"Bucket": bucket, "BaseUrl": base, "Files": files}, s3=s3, opener=opener)
+    return {"ok": True, "version": version, "staged": int(data["Files"]), "copied": int(data["Copied"])}
+
+
+def delete_secret(secret_id, sm=None):
+    """The install's secret, without the recovery window (CloudFormation's
+    own delete does the same); one already gone is fine."""
+    sm = sm or client("secretsmanager")
+    try:
+        sm.delete_secret(SecretId=secret_id, ForceDeleteWithoutRecovery=True)
+        log("deleted the install's secret")
+        return True
+    except Exception as e:
+        if "ResourceNotFound" in type(e).__name__ + str(e):
+            return False
+        raise
 
 
 def list_keys(s3, bucket):
@@ -494,6 +552,26 @@ def remove_record(r53, rr):
             log("validation record left as it was:", name, e)
 
 
+def delete_named_log_groups(names, prefix, logs=None):
+    """The exact log groups the parts declare (CloudFormation already
+    deleted each once; anything there now Lambda recreated). Only names
+    under this install's own /aws/lambda/<prefix>- ."""
+    logs = logs or client("logs")
+    gone, problems = [], []
+    for name in names or []:
+        if not (str(name).startswith(f"/aws/lambda/{prefix}-") or str(name).startswith(f"/aws/codebuild/{prefix}-")):
+            problems.append(f"{name}: not this install's")
+            continue
+        try:
+            logs.delete_log_group(logGroupName=name)
+            gone.append(name)
+            log("deleted recreated log group", name)
+        except Exception as e:
+            if "ResourceNotFound" not in type(e).__name__ + str(e):
+                problems.append(f"{name}: {e}")
+    return gone, problems
+
+
 def delete_log_groups(prefixes, tag=None, logs=None):
     """Log groups under the prefixes, only those tagged coderhelm:install=<tag>
     (every log group the stack declares is): never another install's."""
@@ -606,11 +684,19 @@ def handle(event, context=None):
                 empty_bucket(props["StatusBucket"])
             except Exception as e:
                 problems.append(f"bucket {props['StatusBucket']}: {e}")
-        groups = []
+        groups, more = delete_named_log_groups(props.get("LogGroupNames") or [], props["Prefix"])
+        problems += more
         if mode == "rollback" or not keep_data(props):
-            groups, more = delete_log_groups(props.get("LogGroupPrefixes") or [], tag=props["Prefix"])
+            tagged, more = delete_log_groups(props.get("LogGroupPrefixes") or [], tag=props["Prefix"])
+            groups += tagged
             problems += more
-        msg = f"deleted {len(certs)} certificates and {len(groups)} log groups"
+        secret = ""
+        if mode == "delete" and not keep_data(props) and props.get("SecretId"):
+            try:
+                secret = " and the install's secret" if delete_secret(props["SecretId"]) else ""
+            except Exception as e:
+                problems.append(f"secret: {e}")
+        msg = f"deleted {len(certs)} certificates and {len(groups)} log groups{secret}"
         if problems:
             return "FAILED", msg + "; not removed: " + "; ".join(problems), {}
         return "SUCCESS", msg, {}
@@ -619,6 +705,15 @@ def handle(event, context=None):
 
 
 def handler(event, context):
+    if event.get("action") == "stage":
+        # The updater, directly (CloudFormation's events have no "action").
+        try:
+            r = stage_release(event, os.environ.get("ASSETS_BUCKET", ""))
+        except Exception as e:
+            log("stage FAILED:", type(e).__name__, e)
+            r = {"ok": False, "error": f"{type(e).__name__}: {e}"}
+        log("stage", json.dumps(r))
+        return r
     try:
         status, reason, data = handle(event, context)
     except Exception as e:

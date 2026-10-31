@@ -51,7 +51,7 @@ function today(): { deploy: PolicyDocument; boundary: PolicyDocument; helper: Po
   const wrap = (v: any): any => (typeof v === "string" ? (v.includes("${") ? { "Fn::Sub": v } : v) : Array.isArray(v) ? v.map(wrap) : v && typeof v === "object" ? Object.fromEntries(Object.entries(v).map(([k, x]) => [k, wrap(x)])) : v);
   const deploy = resolveValue(wrap(deployRolePolicy(subNames)), { values });
   const helper = JSON.parse(JSON.stringify(helperPolicy()).replace(/\$\{Stage\}/g, "prod").replace(/\$\{StatusId\}/g, "0123456789abcdef").replace(/\$\{AWS::AccountId\}/g, F.account).replace(/\$\{AWS::Region\}/g, F.region).replace(/\$\{AWS::Partition\}/g, "aws").replace(/\$\{AWS::StackName\}/g, "coderhelm-prod"));
-  const boundary = boundaryPolicy(accessNames({ account: F.account, region: F.region, prefix: "coderhelm-prod", suffix: `-${F.account}`, secretName: "coderhelm/prod/secrets", id: "stack" }));
+  const boundary = boundaryPolicy(accessNames({ account: F.account, region: F.region, prefix: "coderhelm-prod", suffix: `-${F.account}`, secretName: "coderhelm/prod/secrets", id: "stack" }), [`arn:aws:iam::${F.account}:policy/coderhelm-prod-deploy-boundary-stack`]);
   return { deploy, boundary, helper };
 }
 
@@ -75,7 +75,7 @@ test("the local evaluator gives the simulator's verdict on every call", () => {
  * TheBoundaryStays and TheDeployRoleStays): a release that changes either
  * waits for an admin (docs/self-host/security.md, "A known limit").
  */
-const ITS_OWN = ["arn:aws:iam::111122223333:policy/coderhelm-prod-boundary-stack", "arn:aws:iam::111122223333:role/coderhelm-prod-deploy-stack"];
+const ITS_OWN = ["arn:aws:iam::111122223333:policy/coderhelm-prod-boundary-stack", "arn:aws:iam::111122223333:policy/coderhelm-prod-deploy-boundary-stack", "arn:aws:iam::111122223333:role/coderhelm-prod-deploy-stack"];
 
 test("the auto-update role may make every call CloudFormation makes, except the refusals on purpose", () => {
   const gaps = pairs().filter((p) => p.verdict !== "allowed" && REFUSED[p.action] !== p.verdict && !(ITS_OWN.includes(p.resource) && p.verdict === "explicitDeny")).map((p) => `${p.action} on ${p.resource}: ${p.verdict}`);
@@ -89,6 +89,13 @@ test("the helper may do what it needs and nothing on another install's or anyone
   const bad = (F.helper.rows as any[]).filter((r) => (r.simulator === "allowed") !== (r.want === "allowed")).map((r) => `${r.action} on ${r.resource}: ${r.simulator}, want ${r.want}`);
   assert.deepEqual(bad, []);
   assert.ok(F.helper.rows.filter((r: any) => r.want === "denied").length >= 10);
+  // The live test's delete failed on the main table (coderhelm-prod, no suffix): now allowed, and only that one.
+  const row = (a: string, res: string) => (F.helper.rows as any[]).find((r) => r.action === a && r.resource.endsWith(res));
+  for (const a of ["dynamodb:DescribeTable", "dynamodb:DeleteTable", "dynamodb:UpdateTable"]) assert.equal(row(a, ":table/coderhelm-prod")?.simulator, "allowed", a);
+  assert.notEqual(row("dynamodb:DeleteTable", ":table/coderhelm-prodx")?.simulator, "allowed");
+  // Final deletes the install's secret (KeepDataOnDelete=false), never another.
+  assert.equal(row("secretsmanager:DeleteSecret", ":secret:coderhelm/prod/secrets-AbCdEf")?.simulator, "allowed");
+  assert.notEqual(row("secretsmanager:DeleteSecret", ":secret:coderhelm/other/secrets-AbCdEf")?.simulator, "allowed");
 });
 
 test("runtime roles: only the gateway and worker may take on the two read roles in the install's own account", () => {

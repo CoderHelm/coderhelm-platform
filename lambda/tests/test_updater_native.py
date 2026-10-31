@@ -30,7 +30,24 @@ ENV = {
     "AWS_REGION": "us-east-1",
     "CODERHELM_VERSION": "v1.0.0",
     "APP_URL": "https://x.example.com",
+    "NATIVE_HELPER_FUNCTION": "coderhelm-prod-install-helper",
 }
+FIXTURES = pathlib.Path(__file__).resolve().parents[2] / "infra" / "test" / "fixtures"
+
+
+class FakeLambda:
+    """The install helper's "stage": records each call, answers ok (or not)."""
+
+    def __init__(self, answer=None, log=None):
+        self.answer = answer or {"ok": True, "staged": 10, "copied": 10}
+        self.calls = []
+        self.log = log
+
+    def invoke(self, FunctionName, InvocationType, Payload):
+        self.calls.append((FunctionName, json.loads(Payload)))
+        if self.log is not None:
+            self.log.append("stage")
+        return {"Payload": io.BytesIO(json.dumps(self.answer).encode())}
 
 
 class FakeDynamo:
@@ -67,6 +84,8 @@ class FakeCfn:
 
     def create_change_set(self, **kw):
         self.created.append(kw)
+        if getattr(self, "log", None) is not None:
+            self.log.append("change set")
         return {"Id": "arn:cs/1"}
 
     def get_template(self, StackName, ChangeSetName, TemplateStage):
@@ -106,6 +125,8 @@ class Native(unittest.TestCase):
         self.store = u.Store(self.db, "t")
         self.cfn = FakeCfn()
         u._clients["cloudformation"] = self.cfn
+        self.lam = FakeLambda()
+        u._clients["lambda"] = self.lam
         self.sent = []
         self._notify = u.notify
         u.notify = lambda *a, **k: self.sent.append(a[0])
@@ -116,6 +137,7 @@ class Native(unittest.TestCase):
         u.notify = self._notify
         u.fetch_template = self._fetch
         u._clients.pop("cloudformation", None)
+        u._clients.pop("lambda", None)
 
     def verified(self, version="v1.1.0", sha=SHA):
         self.store.put(f"MANIFEST#{version}", {"verified": True, "manifest": None, "template_sha256": sha})
@@ -267,3 +289,115 @@ class Native(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class LiveTestFindings(unittest.TestCase):
+    """The live test's findings: the parts' templates are staged before the
+    change set (bug 1); a template CloudFormation stores resolved can't be
+    checked (bug 2's other half); an install on Anthropic API keys never
+    needs Bedrock to update."""
+
+    def setUp(self):
+        self.store = u.Store(FakeDynamo(), "t")
+        self.cfn = FakeCfn()
+        self.order = []
+        self.cfn.log = self.order
+        self.lam = FakeLambda(log=self.order)
+        u._clients["cloudformation"] = self.cfn
+        u._clients["lambda"] = self.lam
+        self._fetch = u.fetch_template
+        self._notify = u.notify
+        u.notify = lambda *a, **k: None
+
+    def tearDown(self):
+        u.fetch_template = self._fetch
+        u.notify = self._notify
+        u._clients.pop("cloudformation", None)
+        u._clients.pop("lambda", None)
+
+    def propose(self, body):
+        u.fetch_template = lambda url, opener=None: body
+        self.store.put("MANIFEST#v1.1.0", {"verified": True, "manifest": None, "template_sha256": hashlib.sha256(body).hexdigest()})
+        return u.native_propose(self.store, ENV, "v1.1.0", "update")
+
+    def test_the_parts_templates_are_staged_before_the_change_set_with_nested_stacks(self):
+        self.propose(TEMPLATE)
+        self.assertEqual(self.order, ["stage", "change set"])
+        fn, payload = self.lam.calls[0]
+        self.assertEqual(fn, "coderhelm-prod-install-helper")
+        self.assertEqual(payload, {"action": "stage", "version": "v1.1.0", "template_sha256": SHA})
+        self.assertTrue(self.cfn.created[0]["IncludeNestedStacks"])
+
+    def test_no_change_set_when_the_files_could_not_be_staged(self):
+        self.lam.answer = {"ok": False, "error": "ValueError: has sha256 x, not y as the signed template lists: refused"}
+        with self.assertRaisesRegex(ValueError, "couldn't be staged.*refused"):
+            self.propose(TEMPLATE)
+        self.assertEqual(self.cfn.created, [])
+
+    def test_a_template_with_a_transform_is_refused(self):
+        body = json.dumps({"Transform": "AWS::LanguageExtensions", "Parameters": {"Stage": {}}}).encode()
+        with self.assertRaisesRegex(ValueError, "uses a transform"):
+            self.propose(body)
+        self.assertEqual(self.cfn.created, [])
+        self.assertEqual(self.lam.calls, [])
+
+    def test_v085s_stored_template_never_matched_what_was_verified(self):
+        # A real one, from the live test: CloudFormation keeps a template with
+        # AWS::LanguageExtensions already resolved (every parameter and pseudo
+        # parameter put in, the Transform gone), so the check rejected every
+        # genuine update. That is why the parent has no transform now.
+        source = json.loads((FIXTURES / "release-v0.8.5-parent.json").read_text())
+        stored = json.loads((FIXTURES / "cfn-stored-v0.8.5-parent.json").read_text())
+        self.assertEqual(source["Transform"], "AWS::LanguageExtensions")
+        self.assertNotIn("Transform", stored)
+        self.cfn.fetched = stored
+        self.assertFalse(u.fetched_template_matches(self.cfn, ENV, "arn:cs/1", u.canonical_sha(source)))
+
+    def test_a_template_without_a_transform_matches_as_cloudformation_returns_it(self):
+        # Without a transform, CloudFormation keeps the template as it was
+        # sent; GetTemplate returns it parsed or as text, keys in any order.
+        source = json.loads((FIXTURES / "release-v0.8.5-parent.json").read_text())
+        source.pop("Transform")
+        want = u.canonical_sha(source)
+        for body in (source, json.dumps(source, indent=2), json.loads(json.dumps(source, sort_keys=True))):
+            self.cfn.fetched = body
+            self.assertTrue(u.fetched_template_matches(self.cfn, ENV, "arn:cs/1", want))
+        swapped = dict(source, Description="not the release")
+        self.cfn.fetched = swapped
+        self.assertFalse(u.fetched_template_matches(self.cfn, ENV, "arn:cs/1", want))
+
+
+class AnthropicKeysInstall(unittest.TestCase):
+    """ModelProvider=anthropic: the worker checks the models with a team's key,
+    never Bedrock; with no key yet nothing holds the update."""
+
+    def setUp(self):
+        self.store = u.Store(FakeDynamo(), "t")
+        self.store.put("MANIFEST#v1.1.0", {"verified": True, "manifest": {"calls": ["claude-opus-5-5"], "bedrock": {}}, "template_sha256": SHA})
+
+    def no_key(self, env, payload):
+        self.asked = payload
+        return {"provider": "anthropic", "region": "us-east-1", "inference_prefix": "",
+                "results": [{"model": t["model"], "id": t["model"], "status": "skip", "code": "no_key",
+                             "detail": f"No Anthropic API key to check {t['model']} with."} for t in payload["targets"]]}
+
+    def test_no_team_key_yet_skips_with_a_note_and_does_not_block(self):
+        rec = u.model_check(self.store, dict(ENV, CONFIGURED_MODELS="claude-opus-5-5"), NOW, "v1.1.0", "r", probe=self.no_key)
+        self.assertTrue(rec["ok"])
+        self.assertFalse(u.blocking(rec, "v1.1.0"))
+        self.assertEqual(rec["provider"], "anthropic")
+        self.assertIn("Anthropic API keys, added per team", rec["note"])
+        self.assertIn("nothing holds the update", rec["note"])
+
+    def test_with_a_team_key_a_refused_model_still_holds_the_update(self):
+        def refused(env, payload):
+            return {"provider": "anthropic", "results": [{"model": "claude-opus-5-5", "status": "fail", "code": "bad_key", "detail": "401"}]}
+        rec = u.model_check(self.store, ENV, NOW, "v1.1.0", "r", probe=refused)
+        self.assertTrue(u.blocking(rec, "v1.1.0"))
+        self.assertIn("doesn't use Bedrock", rec["note"])
+
+    def test_bedrock_installs_get_no_such_note(self):
+        def ok(env, payload):
+            return {"provider": "bedrock", "results": [{"model": "claude-opus-5-5", "status": "pass", "code": "ok"}]}
+        rec = u.model_check(self.store, ENV, NOW, "v1.1.0", "r", probe=ok)
+        self.assertNotIn("note", rec)

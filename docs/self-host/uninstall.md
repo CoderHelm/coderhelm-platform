@@ -32,6 +32,7 @@ The stack parameter **KeepDataOnDelete** decides. It is `true` unless you change
 | The secret `coderhelm/<name>/secrets` | kept | deleted at once, no recovery window |
 | The KMS keys | kept | scheduled for deletion in 7 days, AWS's shortest wait |
 | Log groups Lambda made by itself under `/aws/lambda/coderhelm-<name>-` or `/aws/codebuild/coderhelm-<name>-` | kept | deleted |
+| A log group the stack declares that Lambda made again after the delete (a function's last logs arriving late) | deleted | deleted |
 
 With `true`, deletion protection stays on for the tables and the user pool, and what is kept no longer belongs to any stack. `coderhelm-selfhost leftovers` lists it (below).
 
@@ -39,24 +40,39 @@ With `true`, deletion protection stays on for the tables and the user pool, and 
 
 ### Change it before you delete
 
-To delete the data too, set **KeepDataOnDelete** to `false` first:
+To delete the data too, set **KeepDataOnDelete** to `false` first. Give the stack its release's template again; don't choose **Use current template**. On an install from v0.8.4 or v0.8.5, CloudFormation keeps that template with every parameter already filled in, so "use current template" reports `UPDATE_COMPLETE` and changes nothing.
 
-1. Select the stack `coderhelm-<name>` and choose **Update**.
-2. Choose **Use current template**, then **Next**.
-3. Set **KeepDataOnDelete** to `false`. Leave every other parameter as it is.
+1. Select the stack `coderhelm-<name>` and open **Outputs**. Note **Version**, for example `v0.8.6`.
+2. Choose **Update**, then **Replace existing template**, **Amazon S3 URL**: `https://coderhelm-public.s3.amazonaws.com/launch/<Version>/coderhelm.json`, with the version from step 1. It is the release you run, so nothing else changes.
+3. Choose **Next**. Set **KeepDataOnDelete** to `false`. Leave every other parameter as it is.
 4. Go through the remaining pages, acknowledge the IAM and nested stack boxes, and choose **Submit**.
-5. Wait for `UPDATE_COMPLETE`, then delete the stack.
+5. Wait for `UPDATE_COMPLETE`. Then check **Outputs** again: **KeepDataOnDelete** must say `false`. If it still says `true`, the update didn't take; do it again with the template URL.
+6. Delete the stack.
 
-The update changes only the deletion settings: deletion protection comes off the tables and the user pool, and their deletion policy becomes Delete. Nothing is deleted until you delete the stack. Set it back to `true` the same way.
+From a terminal:
+
+```bash
+STACK=coderhelm-<name> REGION=<region>
+V=$(aws cloudformation describe-stacks --region $REGION --stack-name $STACK --query "Stacks[0].Outputs[?OutputKey=='Version'].OutputValue" --output text)
+aws cloudformation update-stack --region $REGION --stack-name $STACK \
+  --template-url "https://coderhelm-public.s3.amazonaws.com/launch/$V/coderhelm.json" \
+  --capabilities CAPABILITY_IAM CAPABILITY_NAMED_IAM CAPABILITY_AUTO_EXPAND \
+  --parameters ParameterKey=KeepDataOnDelete,ParameterValue=false \
+    $(for k in AdminEmail Stage ModelProvider BedrockInferencePrefix EmailTransport EmailFrom Hostname SignupDomain RequireTwoFactor AutoUpdate UpdateDay UpdateHour UpdateTimezone SetupToken StatusId DomainCertificateArn DomainZoneId; do echo "ParameterKey=$k,UsePreviousValue=true"; done)
+aws cloudformation wait stack-update-complete --region $REGION --stack-name $STACK
+aws cloudformation describe-stacks --region $REGION --stack-name $STACK --query "Stacks[0].Outputs[?OutputKey=='KeepDataOnDelete'].OutputValue" --output text
+```
+
+The last command must print `false`. The update changes only the deletion settings: deletion protection comes off the tables and the user pool, and their deletion policy becomes Delete. Nothing is deleted until you delete the stack. Set it back to `true` the same way.
 
 ### What happens with `false`
 
 When you delete the stack, two of its resources do the work CloudFormation can't do alone:
 
 - **Sweep** runs before the parts are deleted. It empties every data bucket (every object version and delete marker), so CloudFormation can delete them. It deletes each table itself: it turns deletion protection off if it is still on, retries what AWS reports as temporary (a table in use, throttling, a replica still settling) with growing waits, and waits until each table is gone. CloudFormation then finds nothing left to delete. If a table still won't go before the helper's time runs out, Sweep fails with the table's name and AWS's reason. Delete the stack again: it picks up where it stopped.
-- **Final** runs after every part is deleted. It deletes the certificates the updater requested (tagged `coderhelm = coderhelm-<name>`, in us-east-1) with their validation records, and the log groups Lambda made by itself under the install's name.
+- **Final** runs after every part is deleted. It deletes the certificates the updater requested (tagged `coderhelm = coderhelm-<name>`, in us-east-1) with their validation records, the log groups Lambda made by itself under the install's name, and the install's secret, without a recovery window (after **HybridLeave**, which reads it).
 
-CloudFormation itself schedules the KMS keys for deletion after 7 days, and deletes the secret without a recovery window.
+CloudFormation itself schedules the KMS keys for deletion after 7 days.
 
 These steps run only when the whole stack is being deleted, never during an update.
 

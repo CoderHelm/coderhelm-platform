@@ -25,7 +25,8 @@ lambda/mcp-proxy/mcp-proxy.zip
 node_modules/
 target/
 Thumbs.db
-lambda/log-analyzer/__pycache__/
+__pycache__/
+*.pyc
 
 # Copied from selfhost/maintainers.json by the release build (installer/lib/source-tag.mjs)
 installer/lib/maintainers.json
