@@ -139,7 +139,7 @@ It can't choose the code: only a published release's template. It does choose th
 
 - Only CloudFormation can assume it, only for this account (`aws:SourceAccount`) and only for this stack and its parts (`aws:SourceArn`).
 - It carries the boundary.
-- Its policy is the deploy policy from `infra/lib/access.ts`, plus every CloudFormation action on the parent stack and its parts and reading the release bucket. The deploy policy lets it:
+- Its policy is the deploy policy from `infra/lib/access.ts`, plus every CloudFormation action on the parent stack and its parts, reading the release bucket, reading and updating (never deleting) the install's secret, and the install guide's progress bucket. `infra/test/fixtures/native-sim.json` holds AWS's IAM policy simulator verdict on every call CloudFormation makes through it. The deploy policy lets it:
   - create and change roles named `coderhelm-<name>-*`, and only with the boundary on them. It can pass only those roles;
   - create and change functions, tables, buckets, queues, topics, log groups, rules, schedules, alarms, build projects, parameters, email settings and key aliases whose names start with `coderhelm-<name>`. Every one of CoderHelm's resources is named that way, and a test checks it;
   - create KMS keys, user pools, CloudFront distributions and certificates. AWS names these by id, not by name, so it can change them only while they carry the tag `coderhelm:install = coderhelm-<name>`. It can never delete or disable a KMS key;

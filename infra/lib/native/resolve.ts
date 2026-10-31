@@ -78,5 +78,6 @@ export function prodValues(account: string, region: string): Record<string, stri
     DomainName: "",
     DomainCertificateArn: "",
     DomainZoneId: "",
+    StatusId: "0123456789abcdef",
   };
 }

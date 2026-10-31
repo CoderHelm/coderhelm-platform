@@ -149,6 +149,11 @@ export function deployRolePolicy(n: AccessNames): PolicyDocument {
       ...base.Statement,
       { Sid: "ParentStack", Effect: "Allow", Action: ["cloudformation:*"], Resource: ["arn:${AWS::Partition}:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/${AWS::StackName}/*", "arn:${AWS::Partition}:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/${AWS::StackName}-*/*"] },
       { Sid: "ReleaseFiles", Effect: "Allow", Action: ["s3:GetObject"], Resource: "arn:${AWS::Partition}:s3:::coderhelm-${Stage}-release-${AWS::AccountId}/*" },
+      // The install's secret: read and update its settings, never delete it (its value comes from the helper and the gateway).
+      { Sid: "InstallSecret", Effect: "Allow", Action: ["secretsmanager:DescribeSecret", "secretsmanager:GetSecretValue", "secretsmanager:UpdateSecret", "secretsmanager:TagResource", "secretsmanager:UntagResource"], Resource: "arn:${AWS::Partition}:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:coderhelm/${Stage}/secrets-??????" },
+      { Sid: "SecretPassword", Effect: "Allow", Action: "secretsmanager:GetRandomPassword", Resource: "*" },
+      // The install guide's progress bucket.
+      { Sid: "ProgressBucket", Effect: "Allow", Action: "s3:*", Resource: ["arn:${AWS::Partition}:s3:::coderhelm-setup-${StatusId}", "arn:${AWS::Partition}:s3:::coderhelm-setup-${StatusId}/*"] },
     ],
   };
 }
