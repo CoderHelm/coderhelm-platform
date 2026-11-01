@@ -2461,7 +2461,28 @@ async fn run_once(
             .add_labels(&msg.repo_owner, &msg.repo_name, msg.pr_number, &names)
             .await
         {
-            Ok(_) => info!(pr = msg.pr_number, labels = ?names, "Reviewer added labels"),
+            Ok(_) => {
+                info!(pr = msg.pr_number, labels = ?names, "Reviewer added labels");
+                let cfg = super::review_actions::OnApproveConfig::load(
+                    state,
+                    &msg.team_id,
+                    &msg.repo_owner,
+                    &msg.repo_name,
+                )
+                .await;
+                super::deploy_stats::record(
+                    state,
+                    &msg.team_id,
+                    &msg.repo_owner,
+                    &msg.repo_name,
+                    msg.pr_number,
+                    &names,
+                    &head_sha,
+                    &common::deploy_stats::configured(&cfg.deploy_label),
+                    "review",
+                )
+                .await;
+            }
             Err(e) => warn!(pr = msg.pr_number, error = %e, "Failed to add reviewer labels"),
         }
     }

@@ -28,6 +28,7 @@ pub const WORKER_MESSAGE_TYPES: &[&str] = &[
     "webhook_send",
     "tool_proposals",
     "hidden_suggest",
+    "deploy_stats_backfill",
     "feedback",
     "onboard",
     "mark_ready",

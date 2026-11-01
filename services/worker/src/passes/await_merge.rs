@@ -1255,6 +1255,19 @@ async fn evaluate(
             record.labels_added_head = msg.head_sha.clone();
             record.labels_added_at = Some(now);
             info!(pr = msg.pr_number, labels = ?missing, "await-merge: added deploy label(s)");
+            // The gate only adds the repo's configured deploy labels.
+            super::deploy_stats::record(
+                state,
+                &msg.team_id,
+                owner,
+                repo,
+                msg.pr_number,
+                &missing,
+                &msg.head_sha,
+                &missing,
+                "merge_gate",
+            )
+            .await;
             set_state(state, msg, decision.state, "deploy labels added").await;
             publish_status(state, github, msg, record, &status).await;
             Ok(Next::Poll)
