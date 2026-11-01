@@ -122,6 +122,10 @@ pub enum WorkerMessage {
     /// unless WEEKLY_SUMMARY_ENABLED is true.
     #[serde(rename = "weekly_summary")]
     WeeklySummary,
+    /// Copy a team's earlier deploys from GitHub's label history into
+    /// deploy stats, once (asked for by the analytics page).
+    #[serde(rename = "deploy_stats_backfill")]
+    DeployStatsBackfill(DeployStatsBackfillMessage),
     /// One test weekly summary for a team, to one address only.
     #[serde(rename = "weekly_summary_test")]
     WeeklySummaryTest(WeeklySummaryTestMessage),
@@ -363,6 +367,7 @@ impl WorkerMessage {
             | WorkerMessage::WebhookSend(_)
             | WorkerMessage::GraphIndex(_)
             | WorkerMessage::WeeklySummary
+            | WorkerMessage::DeployStatsBackfill(_)
             | WorkerMessage::WeeklySummaryTest(_)
             | WorkerMessage::UsageReconcile(_)
             | WorkerMessage::UsageRecord(_)
@@ -927,6 +932,12 @@ pub struct OnboardRepo {
     pub owner: String,
     pub name: String,
     pub default_branch: String,
+}
+
+/// Copy one team's earlier deploys from GitHub (`common::deploy_stats`).
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+pub struct DeployStatsBackfillMessage {
+    pub team_id: String,
 }
 
 /// Work out suggested hidden fields for one database source from its table

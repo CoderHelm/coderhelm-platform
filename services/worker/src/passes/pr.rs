@@ -764,7 +764,19 @@ Return ONLY the markdown body text."#,
             .await
         {
             Ok(_) => {
-                info!(pr_number, labels = ?to_add, "Labeled own PR (review + deploy) at creation")
+                info!(pr_number, labels = ?to_add, "Labeled own PR (review + deploy) at creation");
+                super::deploy_stats::record(
+                    state,
+                    &msg.team_id,
+                    &msg.repo_owner,
+                    &msg.repo_name,
+                    pr_number,
+                    &to_add,
+                    "",
+                    &common::deploy_stats::configured(&cfg.deploy_label),
+                    "pr_open",
+                )
+                .await;
             }
             Err(e) => warn!(pr_number, error = %e, "Could not label own PR (non-fatal)"),
         }

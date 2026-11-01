@@ -2153,6 +2153,29 @@ impl GitHubClient {
             .await
     }
 
+    /// The labels this app added to an issue or PR, oldest first: (label,
+    /// when). Up to 500 events; enough for any PR's history.
+    pub async fn labels_added_by_app(
+        &self,
+        owner: &str,
+        repo: &str,
+        issue_number: u64,
+    ) -> Result<Vec<(String, String)>, Box<dyn std::error::Error + Send + Sync>> {
+        let mut out = Vec::new();
+        for page in 1..=5u32 {
+            let url = format!(
+                "{API_BASE}/repos/{owner}/{repo}/issues/{issue_number}/events?per_page=100&page={page}"
+            );
+            let batch: Vec<serde_json::Value> = serde_json::from_value(self.get(&url).await?)?;
+            let done = batch.len() < 100;
+            out.extend(labeled_by_app(&batch, &self.app_id));
+            if done {
+                break;
+            }
+        }
+        Ok(out)
+    }
+
     /// Every label defined in the repo (name + description), all pages.
     pub async fn list_repo_labels(
         &self,
@@ -4200,5 +4223,49 @@ mod reopen_tests {
         ));
         assert!(!closed_by_a_bot(&json!({"closed_by": null})));
         assert!(!closed_by_a_bot(&json!({})));
+    }
+}
+
+/// From a page of issue events: the labels the given GitHub App added.
+pub fn labeled_by_app(events: &[serde_json::Value], app_id: &str) -> Vec<(String, String)> {
+    events
+        .iter()
+        .filter(|e| e["event"] == "labeled")
+        .filter(|e| {
+            let id = &e["performed_via_github_app"]["id"];
+            !app_id.is_empty()
+                && (id.as_u64().map(|n| n.to_string()).as_deref() == Some(app_id)
+                    || id.as_str() == Some(app_id))
+        })
+        .filter_map(|e| {
+            Some((
+                e["label"]["name"].as_str()?.to_string(),
+                e["created_at"].as_str()?.to_string(),
+            ))
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod labeled_by_app_tests {
+    use super::labeled_by_app;
+    use serde_json::json;
+
+    #[test]
+    fn only_labels_this_app_added() {
+        let events = vec![
+            json!({"event":"labeled","label":{"name":"CI:DEPLOY_STAGING"},"created_at":"2026-10-01T00:00:00Z","performed_via_github_app":{"id":123}}),
+            json!({"event":"labeled","label":{"name":"CI:DEPLOY_STAGING"},"created_at":"2026-10-02T00:00:00Z","performed_via_github_app":{"id":999}}),
+            json!({"event":"labeled","label":{"name":"deploy"},"created_at":"2026-10-03T00:00:00Z","performed_via_github_app":null}),
+            json!({"event":"unlabeled","label":{"name":"CI:DEPLOY_STAGING"},"created_at":"2026-10-04T00:00:00Z","performed_via_github_app":{"id":123}}),
+        ];
+        assert_eq!(
+            labeled_by_app(&events, "123"),
+            vec![(
+                "CI:DEPLOY_STAGING".to_string(),
+                "2026-10-01T00:00:00Z".to_string()
+            )]
+        );
+        assert!(labeled_by_app(&events, "").is_empty());
     }
 }

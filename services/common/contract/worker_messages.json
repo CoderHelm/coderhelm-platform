@@ -3,6 +3,7 @@
     "ticket": {"type":"ticket","team_id":"TEAM#team-a","installation_id":1,"source":"github","ticket_id":"T-1","title":"t","body":"b","repo_owner":"acme","repo_name":"widgets","issue_number":1,"sender":"someone","requester":{"key":"github:someone","name":"Some One"},"image_attachments":[{"s3_key":"k","media_type":"image/png","filename":"a.png"}]},
     "tool_proposals": {"type":"tool_proposals","team_id":"TEAM#team-a","installation_id":1,"repo_owner":"acme","repo_name":"widgets","sha":"abc","paths":["tools/a.yaml"]},
     "hidden_suggest": {"type":"hidden_suggest","team_id":"TEAM#team-a","source_id":"s1","force":true},
+    "deploy_stats_backfill": {"type":"deploy_stats_backfill","team_id":"TEAM#team-a"},
     "feedback": {"type":"feedback","team_id":"TEAM#team-a","installation_id":1,"run_id":"r1","repo_owner":"acme","repo_name":"widgets","pr_number":2,"review_id":3,"review_body":"rb","comments":[{"path":"a.rs","line":4,"body":"c","comment_id":5}],"trigger_author":"someone"},
     "onboard": {"type":"onboard","team_id":"TEAM#team-a","installation_id":1,"repos":[{"owner":"acme","name":"widgets","default_branch":"main"}]},
     "mark_ready": {"type":"mark_ready","team_id":"TEAM#team-a","installation_id":1,"repo_owner":"acme","repo_name":"widgets","pr_number":2},

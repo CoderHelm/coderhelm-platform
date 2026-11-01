@@ -881,6 +881,184 @@ pub fn comparison(
     })
 }
 
+/// One deploy CoderHelm started (`common::deploy_stats`).
+#[derive(Debug, Clone, Default)]
+pub struct DeployRow {
+    pub sk: String,
+    pub created_at: String,
+    pub repo: String,
+    pub pr: u64,
+    pub label: String,
+    pub target: String,
+    pub head: String,
+    pub source: String,
+}
+
+impl DeployRow {
+    fn from_item(i: &Item) -> DeployRow {
+        DeployRow {
+            sk: s(i, "sk"),
+            created_at: s(i, "created_at"),
+            repo: s(i, "repo"),
+            pr: n(i, "pr_number") as u64,
+            label: s(i, "label"),
+            target: s(i, "target"),
+            head: s(i, "head_sha"),
+            source: s(i, "source"),
+        }
+    }
+    fn key(&self) -> String {
+        common::deploy_stats::dedupe_key(&self.repo, self.pr, &self.label, &self.head, &self.sk)
+    }
+}
+
+/// Each deploy once (a label added again on the same commit is one deploy),
+/// at its first time.
+fn distinct_deploys<'a>(rows: &[&'a DeployRow]) -> Vec<&'a DeployRow> {
+    let mut first: HashMap<String, &'a DeployRow> = HashMap::new();
+    for r in rows {
+        let e = first.entry(r.key()).or_insert(r);
+        if r.created_at < e.created_at {
+            *e = r;
+        }
+    }
+    let mut out: Vec<&DeployRow> = first.into_values().collect();
+    out.sort_by(|a, b| a.created_at.cmp(&b.created_at));
+    out
+}
+
+/// How many deploys, and where they went.
+pub fn deploy_counts(rows: &[&DeployRow]) -> Value {
+    let d = distinct_deploys(rows);
+    let to = |t: &str| d.iter().filter(|r| r.target == t).count();
+    json!({
+        "deploys": d.len(),
+        "deploys_preview": to("preview"),
+        "deploys_staging": to("staging"),
+        "deploys_prod": to("prod"),
+        "deploys_other": d.len() - to("preview") - to("staging") - to("prod"),
+    })
+}
+
+/// Since when deploys are known: the backfill's start once it finished,
+/// else the first deploy recorded live (none: nothing recorded yet).
+pub fn deploys_since(backfilled_since: Option<&str>, rows: &[DeployRow]) -> Option<String> {
+    if let Some(s) = backfilled_since.filter(|s| !s.is_empty()) {
+        return Some(s.to_string());
+    }
+    rows.iter()
+        .filter(|r| r.source != "backfill")
+        .map(|r| r.created_at.clone())
+        .min()
+}
+
+/// Adds deploys to the comparison: counts in each period, running totals by
+/// day, since when they are known, and whether the periods compare (both
+/// must start after deploys were known).
+#[allow(clippy::too_many_arguments)]
+pub fn add_deploys(
+    compared: &mut Value,
+    window: Window,
+    prev: Window,
+    previous_full: Option<Window>,
+    rows: &[DeployRow],
+    repo: Option<&str>,
+    since: Option<&str>,
+    backfill_done: bool,
+) {
+    let in_repo: Vec<&DeployRow> = rows
+        .iter()
+        .filter(|r| repo.is_none_or(|want| r.repo.eq_ignore_ascii_case(want)))
+        .collect();
+    let pick = |w: Window| -> Vec<&DeployRow> {
+        in_repo
+            .iter()
+            .copied()
+            .filter(|r| w.contains(&r.created_at))
+            .collect()
+    };
+    let merge = |target: &mut Value, add: Value| {
+        if let (Some(t), Some(a)) = (target.as_object_mut(), add.as_object()) {
+            for (k, v) in a {
+                t.insert(k.clone(), v.clone());
+            }
+        }
+    };
+    let (cur, old) = (pick(window), pick(prev));
+    merge(&mut compared["current"], deploy_counts(&cur));
+    merge(&mut compared["previous"], deploy_counts(&old));
+    if let Some(w) = previous_full {
+        if compared["previous_full"].is_object() {
+            merge(&mut compared["previous_full"], deploy_counts(&pick(w)));
+        }
+    }
+    let running = |w: Window, rows: &[&DeployRow]| -> Vec<usize> {
+        let mut out = vec![0usize; w.day_slots().max(0) as usize];
+        for r in distinct_deploys(rows) {
+            if let Some(slot) = w.at(&r.created_at).and_then(|x| out.get_mut(x as usize)) {
+                *slot += 1;
+            }
+        }
+        for i in 1..out.len() {
+            out[i] += out[i - 1];
+        }
+        out
+    };
+    let (c, p) = (running(window, &cur), running(prev, &old));
+    if let Some(days) = compared["daily"].as_array_mut() {
+        for (i, d) in days.iter_mut().enumerate() {
+            d["deploys"] = json!(c.get(i).copied().unwrap_or(0));
+            d["previous_deploys"] = if d["previous_day"].is_null() {
+                Value::Null
+            } else {
+                json!(p.get(i).copied().unwrap_or(0))
+            };
+        }
+    }
+    let known_from = since
+        .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+        .map(|t| t.with_timezone(&Utc));
+    let starts = [Some(prev.start), previous_full.map(|w| w.start)];
+    compared["deploys_since"] = json!(since);
+    compared["deploys_comparable"] =
+        json!(known_from.is_some_and(|k| starts.iter().flatten().all(|s| *s >= k)));
+    compared["deploys_backfill"] = json!(if backfill_done { "done" } else { "running" });
+}
+
+/// Asks the worker to copy the team's earlier deploys from GitHub, at most
+/// once an hour, until the copy is done. Never from a support view.
+async fn ask_for_deploy_backfill(state: &AppState, team: &str) {
+    let table = &state.config.settings_table_name;
+    let cutoff = (Utc::now() - Duration::hours(1)).to_rfc3339();
+    let claimed = state
+        .dynamo
+        .put_item()
+        .table_name(table)
+        .item("pk", av(team))
+        .item("sk", av(common::deploy_stats::BACKFILL_QUEUED_SK))
+        .item("at", av(&Utc::now().to_rfc3339()))
+        .condition_expression("attribute_not_exists(sk) OR #at < :cut")
+        .expression_attribute_names("#at", "at")
+        .expression_attribute_values(":cut", av(&cutoff))
+        .send()
+        .await
+        .is_ok();
+    if !claimed {
+        return;
+    }
+    let message = crate::models::WorkerMessage::DeployStatsBackfill(
+        crate::models::DeployStatsBackfillMessage {
+            team_id: team.to_string(),
+        },
+    );
+    if super::github_webhook::send_to_queue(state, &state.config.ticket_queue_url, &message)
+        .await
+        .is_err()
+    {
+        warn!("Could not queue the deploy stats backfill");
+    }
+}
+
 fn day(ts: &str) -> Option<String> {
     DateTime::parse_from_rfc3339(ts)
         .ok()
@@ -1679,13 +1857,53 @@ pub async fn get_analytics(
         hi(common::review_stats::PREFIX),
     );
     let (log_lo, log_hi) = (lo("DSLOG#"), hi("DSLOG#"));
-    let (runs, reviews, lookups, traces, known) = tokio::join!(
+    let deploy_window = Window {
+        start: previous_full.map_or(whole.start, |f| f.start.min(whole.start)),
+        end: whole.end,
+    };
+    let (dep_lo, dep_hi) = (
+        format!(
+            "{}{}",
+            common::deploy_stats::PREFIX,
+            deploy_window
+                .start
+                .to_rfc3339_opts(SecondsFormat::Secs, true)
+        ),
+        format!(
+            "{}{}~",
+            common::deploy_stats::PREFIX,
+            deploy_window.end.to_rfc3339_opts(SecondsFormat::Secs, true)
+        ),
+    );
+    let backfill_marker = async {
+        state
+            .dynamo
+            .get_item()
+            .table_name(&state.config.settings_table_name)
+            .key("pk", av(&team))
+            .key("sk", av(common::deploy_stats::BACKFILL_MARKER_SK))
+            .send()
+            .await
+            .ok()
+            .and_then(|r| r.item().map(|i| s(i, "since")))
+    };
+    let (runs, reviews, lookups, traces, known, deploys, backfilled) = tokio::join!(
         load_runs(&state, &team, whole),
         load_settings_range(&state, &team, &stat_lo, &stat_hi),
         load_settings_range(&state, &team, &log_lo, &log_hi),
         load_traces(&state, &team),
         load_known(&state, &team),
+        load_settings_range(&state, &team, &dep_lo, &dep_hi),
+        backfill_marker,
     );
+    if backfilled.is_none() && claims.support_view.is_none() {
+        ask_for_deploy_backfill(&state, &team).await;
+    }
+    let deploys: Vec<DeployRow> = deploys
+        .unwrap_or_default()
+        .iter()
+        .map(DeployRow::from_item)
+        .collect();
     let runs = runs.map_err(|e| {
         error!(error = %e, "Analytics: runs");
         StatusCode::INTERNAL_SERVER_ERROR
@@ -1714,6 +1932,17 @@ pub async fn get_analytics(
         &traces,
         &known,
         repo,
+    );
+    let since = deploys_since(backfilled.as_deref(), &deploys);
+    add_deploys(
+        &mut out["comparison"],
+        window,
+        prev,
+        previous_full,
+        &deploys,
+        repo,
+        since.as_deref(),
+        backfilled.is_some(),
     );
     out["days"] = json!(if month_to_date {
         window.day_slots()
@@ -1753,6 +1982,81 @@ mod tests {
 
     fn windows() -> (Window, Window) {
         Window::last_days(Utc::now(), 30)
+    }
+
+    fn dep(days_ago: i64, label: &str, head: &str, source: &str) -> DeployRow {
+        let created_at = at(days_ago);
+        DeployRow {
+            sk: format!("DSTAT#{created_at}#acme/web#000007#{label}"),
+            created_at,
+            repo: "acme/web".into(),
+            pr: 7,
+            label: label.into(),
+            target: common::deploy_stats::target(label).into(),
+            head: head.into(),
+            source: source.into(),
+        }
+    }
+
+    #[test]
+    fn deploys_are_counted_once_by_target_and_compared() {
+        let (w, p) = windows();
+        let rows = vec![
+            dep(2, "CI:DEPLOY_STAGING", "abc", "review"),
+            // The same label again on the same commit: one deploy.
+            dep(1, "CI:DEPLOY_STAGING", "abc", "merge_gate"),
+            dep(1, "CI:DEPLOY_STAGING", "def", "review"),
+            dep(3, "CI:DEPLOY_PRODUCTION", "def", "merge_gate"),
+            dep(5, "deploy:preview", "", "backfill"),
+            dep(40, "CI:DEPLOY_STAGING", "", "backfill"),
+        ];
+        let mut c = comparison(w, p, None, &[], &[], &[]);
+        add_deploys(&mut c, w, p, None, &rows, None, Some(&at(61)), true);
+        assert_eq!(c["current"]["deploys"], 4);
+        assert_eq!(c["current"]["deploys_staging"], 2);
+        assert_eq!(c["current"]["deploys_prod"], 1);
+        assert_eq!(c["current"]["deploys_preview"], 1);
+        assert_eq!(c["current"]["deploys_other"], 0);
+        assert_eq!(c["previous"]["deploys"], 1);
+        assert_eq!(c["deploys_comparable"], true);
+        assert_eq!(c["deploys_backfill"], "done");
+        let last = c["daily"].as_array().unwrap().last().unwrap().clone();
+        assert_eq!(last["deploys"], 4);
+        assert_eq!(last["previous_deploys"], 1);
+        // Another repo: nothing.
+        let mut other = comparison(w, p, None, &[], &[], &[]);
+        add_deploys(
+            &mut other,
+            w,
+            p,
+            None,
+            &rows,
+            Some("acme/api"),
+            Some(&at(61)),
+            true,
+        );
+        assert_eq!(other["current"]["deploys"], 0);
+    }
+
+    #[test]
+    fn deploys_known_only_after_the_previous_period_started_are_not_compared() {
+        let (w, p) = windows();
+        let rows = vec![dep(2, "CI:DEPLOY_STAGING", "abc", "review")];
+        let since = deploys_since(None, &rows);
+        assert_eq!(since.as_deref(), Some(rows[0].created_at.as_str()));
+        let mut c = comparison(w, p, None, &[], &[], &[]);
+        add_deploys(&mut c, w, p, None, &rows, None, since.as_deref(), false);
+        assert_eq!(c["deploys_comparable"], false);
+        assert_eq!(c["deploys_backfill"], "running");
+        let mut none = comparison(w, p, None, &[], &[], &[]);
+        add_deploys(&mut none, w, p, None, &[], None, None, false);
+        assert_eq!(none["deploys_comparable"], false);
+        assert_eq!(none["deploys_since"], Value::Null);
+        // A finished copy says when deploys are known from, whatever came after.
+        assert_eq!(
+            deploys_since(Some("2026-09-01T00:00:00Z"), &rows).as_deref(),
+            Some("2026-09-01T00:00:00Z")
+        );
     }
 
     #[test]

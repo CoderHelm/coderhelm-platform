@@ -782,6 +782,7 @@ mod branch_update;
 mod checks;
 pub mod code_graph;
 mod completeness;
+pub mod deploy_stats;
 pub mod dlq_cleanup;
 pub mod e2e;
 pub mod e2e_attribution;
