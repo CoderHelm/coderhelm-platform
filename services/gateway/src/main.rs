@@ -323,6 +323,7 @@ async fn main() -> Result<(), Error> {
             "/support/tickets",
             get(routes::support::list).post(routes::support::create_handler),
         )
+        .route("/support/move", post(routes::support::move_handler))
         .route("/support/tickets/:id", get(routes::support::get))
         .route("/support/tickets/:id/reply", post(routes::support::reply))
         .route(

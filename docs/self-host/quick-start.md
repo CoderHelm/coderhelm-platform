@@ -8,6 +8,8 @@ order: 1
 
 In the guide's **Hybrid** setup, CoderHelm sets up a `yourname.coderhelm.com` address, **CoderHelm's GitHub App** (install one app on your organization) and **CoderHelm's Jira app** (link your Jira site after you sign up: the guide opens your install's Settings, Integrations, Jira with the site filled in, you confirm a code on app.coderhelm.com, and it follows the link until it's live). Each is a toggle; see [Hybrid](./hybrid.md).
 
+Right after AWS, the guide's **Your data** step asks how to begin: **Start fresh** (the default, nothing to fill in) or **Move my team from CoderHelm (hosted)**, which opens a short request on app.coderhelm.com and a support ticket. The guide goes on either way; see [Moving from hosted](./moving-from-hosted.md).
+
 The rest of this page is the terminal install. You need an AWS account you can administer, Node.js 20 or newer and the AWS CLI v2. The guided install checks both and tells you how to fix anything missing. See [Requirements](./requirements.md).
 
 ```sh
