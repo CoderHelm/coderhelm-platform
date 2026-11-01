@@ -126,3 +126,16 @@ test("every policy of a hardened install, with and without its own domain", () =
   buildApp(app, resolveConfig({ account: "111122223333", region: "us-west-2", stage: "prod", email: { from: "a@example.org" }, admins: ["o@example.org"], access: { mode: "hardened", owner: "app" }, ...cfg }), { accessStack: true });
   assert.deepEqual(problems(app.synth().stacks.map((s) => [s.stackName, s.template])), []);
 });
+
+test("the updater may create the parts' nested change sets, only from the staged release", () => {
+  // CloudFormation creates a change set on every part as the caller; without
+  // this the updater's first update or domain move fails on the first part.
+  const updates: any = (rel.children as any).Updates;
+  const docs = Object.values<any>(updates.Resources).filter((r) => r.Type === "AWS::IAM::Policy").map((r) => r.Properties.PolicyDocument.Statement).flat();
+  const st = docs.find((s: any) => s.Sid === "ProposePartUpdates");
+  assert.ok(st, "ProposePartUpdates is on the updater");
+  assert.equal(st.Action, "cloudformation:CreateChangeSet");
+  assert.match(JSON.stringify(st.Resource), /stack\/.*-\*\/\*/);
+  assert.match(JSON.stringify(st.Condition.StringLikeIfExists["cloudformation:TemplateUrl"]), /-release-.*\/releases\/v\*\.\*\.\*\/stacks\/\*\.json/);
+  assert.ok(st.Condition.StringEqualsIfExists["cloudformation:RoleArn"], "only through the deploy role");
+});

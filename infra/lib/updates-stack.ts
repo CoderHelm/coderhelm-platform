@@ -592,6 +592,19 @@ function nativeUpdates(scope: Construct, cfg: ResolvedConfig, fn: lambda.Functio
       StringEqualsIfExists: { "cloudformation:RoleArn": deployRole },
     },
   }));
+  // A change set with nested stacks makes CloudFormation create one on each
+  // part as the caller, so the parts need CreateChangeSet too: only from the
+  // staged release's own templates (a part left unchanged comes without a
+  // template URL), and only through the deploy role when auto-update is on.
+  fn.addToRolePolicy(new iam.PolicyStatement({
+    sid: "ProposePartUpdates",
+    actions: ["cloudformation:CreateChangeSet"],
+    resources: [parts],
+    conditions: {
+      StringLikeIfExists: { "cloudformation:TemplateUrl": [`https://${cfg.prefix}-release-${stack.account}.s3.${stack.region}.${stack.urlSuffix}/releases/v*.*.*/stacks/*.json`] },
+      StringEqualsIfExists: { "cloudformation:RoleArn": deployRole },
+    },
+  }));
   fn.addToRolePolicy(new iam.PolicyStatement({
     sid: "ReviewAndApplyReleaseUpdate",
     actions: [
