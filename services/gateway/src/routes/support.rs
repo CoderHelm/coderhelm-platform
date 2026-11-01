@@ -2328,6 +2328,183 @@ pub async fn create_handler(
     team_detail(&state, ticket, thread).await
 }
 
+// ── Moving a team to a self-hosted install ──────────────────────────────
+
+/// What the install guide sends when a team asks to move to its own install.
+/// No credentials of any kind: the move is arranged on the ticket.
+#[derive(Debug, Deserialize, Default)]
+pub struct MoveRequest {
+    #[serde(default)]
+    pub region: String,
+    #[serde(default)]
+    pub stage: String,
+    /// The install's address, as the guide shows it.
+    #[serde(default)]
+    pub address: String,
+    /// When suits the team, in its own words.
+    #[serde(default)]
+    pub window: String,
+    #[serde(default)]
+    pub notes: String,
+}
+
+pub const MOVE_SUBJECT: &str = "Move our team to our self-hosted install";
+/// One move request per team per day, on top of the ticket limits.
+const MOVE_REQUESTS_PER_DAY: u32 = 1;
+
+static REGION_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^[a-z]{2}(-[a-z]+)+-[0-9]$").unwrap());
+static STAGE_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^[a-z][a-z0-9]{0,19}$").unwrap());
+
+/// The ticket a move request opens, or why it can't. Only a team admin or
+/// owner may ask (it moves the whole team), never from a support view, and
+/// any text that looks like a key, token or password is refused outright
+/// rather than hidden: the form says not to send them.
+pub fn move_ticket(caller: &Caller, req: &MoveRequest) -> Result<NewTicket, Fail> {
+    if caller.in_support_view {
+        return Err(Fail::Denied(
+            "A support view is read only; the team asks for the move itself.".into(),
+        ));
+    }
+    if crate::permissions::role_level(&caller.role) < 3 {
+        return Err(Fail::Denied(
+            "Only a team admin or owner can ask to move the team.".into(),
+        ));
+    }
+    let region = req.region.trim();
+    if !REGION_RE.is_match(region) {
+        return Err(Fail::BadRequest(
+            "Pick the AWS region of the install.".into(),
+        ));
+    }
+    let stage = req.stage.trim();
+    if !STAGE_RE.is_match(stage) {
+        return Err(Fail::BadRequest(
+            "The install name is lowercase letters and digits.".into(),
+        ));
+    }
+    let address = url::Url::parse(req.address.trim())
+        .ok()
+        .filter(|u| {
+            u.scheme() == "https"
+                && u.host_str().is_some()
+                && u.username().is_empty()
+                && u.password().is_none()
+        })
+        .map(|u| {
+            format!(
+                "https://{}",
+                u.host_str().unwrap_or("").to_ascii_lowercase()
+            )
+        })
+        .ok_or_else(|| Fail::BadRequest("Add the install's https address.".into()))?;
+    let window = clip(&one_line(req.window.trim()), 200);
+    let notes = clip(req.notes.trim(), 2000);
+    for text in [&window, &notes] {
+        if scrub(text) != *text {
+            return Err(Fail::BadRequest(
+                "Remove the key, token or password from the request. CoderHelm never needs them to move your team.".into(),
+            ));
+        }
+    }
+    let mut body = format!(
+        "Please move our team to our self-hosted install.\n\nInstall: {address}\nAWS region: {region}\nInstall name: {stage}\nAsked by: {}",
+        caller.email
+    );
+    if !window.is_empty() {
+        body.push_str(&format!("\nPreferred time: {window}"));
+    }
+    if !notes.is_empty() {
+        body.push_str(&format!("\n\nNotes:\n{notes}"));
+    }
+    Ok(NewTicket {
+        subject: MOVE_SUBJECT.into(),
+        body,
+        priority: Some("normal".into()),
+        page: Some("/support/".into()),
+        ..Default::default()
+    })
+}
+
+/// Opens the move ticket within the team's daily allowance.
+pub async fn request_move<S: Store, L: ItemLookup, M: Members>(
+    store: &S,
+    lookup: &L,
+    members: &M,
+    caller: &Caller,
+    req: &MoveRequest,
+    team_name: &str,
+    user_agent: &str,
+) -> Result<(Ticket, Message), Fail> {
+    let ticket = move_ticket(caller, req)?;
+    let now = chrono::Utc::now();
+    let day = now.format("%Y%m%d").to_string();
+    if !store
+        .take(
+            &caller.team_id,
+            &format!("move:{day}"),
+            MOVE_REQUESTS_PER_DAY,
+            now.timestamp() + 2 * 86_400,
+        )
+        .await
+        .map_err(Fail::Internal)?
+    {
+        return Err(Fail::TooMany(
+            "Your team already asked to move today. Reply on that ticket instead.".into(),
+        ));
+    }
+    create(
+        store, lookup, members, caller, &ticket, team_name, user_agent,
+    )
+    .await
+}
+
+/// POST /api/support/move — a team admin asks CoderHelm to move the team to
+/// its self-hosted install (the install guide's "Your data" step). Opens a
+/// support ticket and records it in the team's audit log.
+pub async fn move_handler(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<Claims>,
+    headers: HeaderMap,
+    Json(req): Json<MoveRequest>,
+) -> Reply {
+    let members = team_members(&state, &claims.team_id).await;
+    let caller = named(Caller::from_claims(&claims), &members);
+    let name = team_name(&state, &caller.team_id).await;
+    let ua = headers
+        .get("user-agent")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    let lookup = DynamoLookup { state: &state };
+    let roster = DynamoMembers { state: &state };
+    let st = store(&state);
+    let (ticket, first) = request_move(&st, &lookup, &roster, &caller, &req, &name, ua)
+        .await
+        .map_err(Fail::reply)?;
+    info!(team = %caller.team_id, ticket = %ticket.id, "support: move to self-hosted requested");
+    let kv = common::plugins::kv::Dynamo {
+        client: state.dynamo.clone(),
+        table: state.config.settings_table_name.clone(),
+    };
+    common::plugins::audit::record(
+        &kv,
+        &caller.team_id,
+        common::plugins::audit::Event::new(
+            &caller.email,
+            common::plugins::audit::ActorKind::Person,
+            "support.move_requested",
+            "ok",
+        )
+        .detail(format!("ticket {}", ticket.id)),
+    )
+    .await;
+    send(&state, mail_new_ticket(&inbox(), &ticket, &first.body)).await;
+    let (ticket, thread) = open_for_team(&st, &caller, &ticket.id)
+        .await
+        .map_err(Fail::reply)?;
+    team_detail(&state, ticket, thread).await
+}
+
 /// GET /api/support/tickets/:id — one of the team's tickets and its thread.
 pub async fn get(
     State(state): State<Arc<AppState>>,
@@ -2790,6 +2967,152 @@ mod tests {
         .await
         .unwrap()
         .0
+    }
+
+    fn move_req() -> MoveRequest {
+        MoveRequest {
+            region: "us-east-1".into(),
+            stage: "prod".into(),
+            address: "https://d111.cloudfront.net/settings/".into(),
+            window: "Weekday mornings".into(),
+            notes: "About 12 people.".into(),
+        }
+    }
+
+    fn with_role(role: &str) -> Caller {
+        Caller {
+            role: role.into(),
+            ..person("alpha", "alice")
+        }
+    }
+
+    #[tokio::test]
+    async fn only_a_team_admin_or_owner_can_ask_to_move_the_team() {
+        let store = Mem::default();
+        for role in ["member", "billing", ""] {
+            let err = request_move(
+                &store,
+                &none(),
+                &roster(),
+                &with_role(role),
+                &move_req(),
+                "acme",
+                "",
+            )
+            .await
+            .unwrap_err();
+            assert!(matches!(err, Fail::Denied(_)), "{role} was not refused");
+        }
+        let view = Caller {
+            in_support_view: true,
+            ..with_role("owner")
+        };
+        assert!(matches!(
+            move_ticket(&view, &move_req()),
+            Err(Fail::Denied(_))
+        ));
+        let (t, first) = request_move(
+            &store,
+            &none(),
+            &roster(),
+            &with_role("admin"),
+            &move_req(),
+            "acme",
+            "",
+        )
+        .await
+        .unwrap();
+        assert_eq!(t.subject, MOVE_SUBJECT);
+        assert_eq!(t.team_id, "TEAM#alpha");
+        // The address is kept to its host; the request's details are on the ticket.
+        assert!(
+            first
+                .body
+                .contains("Install: https://d111.cloudfront.net\n"),
+            "{}",
+            first.body
+        );
+        assert!(first.body.contains("AWS region: us-east-1"));
+        assert!(first.body.contains("Install name: prod"));
+        assert!(first.body.contains("Preferred time: Weekday mornings"));
+    }
+
+    #[tokio::test]
+    async fn a_move_request_with_a_key_or_token_is_refused_not_sent() {
+        for notes in [
+            "our key is AKIAABCDEFGHIJKLMNOP",
+            "token: ghp_0123456789abcdefghijklmnopqrstuvwxyzAB",
+            "password=hunter2hunter2",
+        ] {
+            let req = MoveRequest {
+                notes: notes.into(),
+                ..move_req()
+            };
+            match move_ticket(&with_role("owner"), &req) {
+                Err(Fail::BadRequest(m)) => assert!(m.contains("never needs"), "{m}"),
+                other => panic!("{notes:?} was not refused: {other:?}"),
+            }
+        }
+        let req = MoveRequest {
+            window: "secret=abc12345".into(),
+            ..move_req()
+        };
+        assert!(matches!(
+            move_ticket(&with_role("owner"), &req),
+            Err(Fail::BadRequest(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_move_request_checks_its_fields() {
+        let owner = with_role("owner");
+        for (region, stage, address) in [
+            ("us-east", "prod", "https://d1.cloudfront.net"),
+            ("us-east-1", "Prod", "https://d1.cloudfront.net"),
+            ("us-east-1", "prod-2", "https://d1.cloudfront.net"),
+            ("us-east-1", "prod", "http://d1.cloudfront.net"),
+            ("us-east-1", "prod", "https://user:pw@d1.cloudfront.net"),
+            ("us-east-1", "prod", "not a url"),
+        ] {
+            let req = MoveRequest {
+                region: region.into(),
+                stage: stage.into(),
+                address: address.into(),
+                ..move_req()
+            };
+            assert!(
+                matches!(move_ticket(&owner, &req), Err(Fail::BadRequest(_))),
+                "{region} {stage} {address}"
+            );
+        }
+        let req = MoveRequest {
+            window: String::new(),
+            notes: String::new(),
+            ..move_req()
+        };
+        let t = move_ticket(&owner, &req).unwrap();
+        assert!(!t.body.contains("Preferred time") && !t.body.contains("Notes"));
+    }
+
+    #[tokio::test]
+    async fn a_team_asks_to_move_once_a_day() {
+        let store = Mem::default();
+        let owner = with_role("owner");
+        request_move(&store, &none(), &roster(), &owner, &move_req(), "acme", "")
+            .await
+            .unwrap();
+        let err = request_move(&store, &none(), &roster(), &owner, &move_req(), "acme", "")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Fail::TooMany(_)));
+        // Another team has its own allowance.
+        let other = Caller {
+            role: "owner".into(),
+            ..person("beta", "bob")
+        };
+        request_move(&store, &none(), &roster(), &other, &move_req(), "beta", "")
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
