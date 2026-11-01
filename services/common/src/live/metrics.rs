@@ -27,6 +27,10 @@ pub const NAMESPACES: &[(&str, &str)] = &[
     ("AWS/DynamoDB", "DynamoDB: ConsumedReadCapacityUnits, ThrottledRequests, SuccessfulRequestLatency (TableName)"),
     ("AWS/ElastiCache", "ElastiCache: CPUUtilization, CurrConnections, Evictions (CacheClusterId)"),
     ("AWS/ApiGateway", "API Gateway: Count, Latency, 5XXError (ApiName)"),
+    ("AWS/EC2", "EC2 instances: CPUUtilization, NetworkIn, NetworkOut, StatusCheckFailed, CPUCreditBalance (InstanceId or AutoScalingGroupName)"),
+    ("AWS/EBS", "EBS volumes: VolumeReadOps, VolumeWriteOps, VolumeQueueLength, BurstBalance (VolumeId)"),
+    ("AWS/NetworkELB", "Network load balancers: ActiveFlowCount, ProcessedBytes, HealthyHostCount, UnHealthyHostCount (LoadBalancer, TargetGroup)"),
+    ("AWS/ES", "OpenSearch: CPUUtilization, JVMMemoryPressure, FreeStorageSpace, ClusterStatus.red, SearchLatency (DomainName, ClientId)"),
 ];
 const STATS: &[&str] = &[
     "Average",
@@ -498,6 +502,19 @@ mod tests {
         .unwrap();
         assert_eq!(ok.queries[0].namespace, "AWS/ECS");
         assert_eq!(ok.period, 60);
+        // An instance's CPU, as a reviewer checks before a resize.
+        let ec2 = check_query(
+            &[json!({"namespace":"AWS/EC2","metric":"CPUUtilization","dimensions":{"InstanceId":"i-0123456789abcdef0"},"stat":"Maximum"})],
+            Some(86_400),
+            Some("7d"),
+            None,
+            NOW,
+        )
+        .unwrap();
+        assert_eq!(ec2.queries[0].namespace, "AWS/EC2");
+        for ns in ["AWS/EBS", "AWS/NetworkELB", "AWS/ES"] {
+            assert!(check_namespace(ns).is_ok(), "{ns}");
+        }
         assert_eq!(ok.region, None);
         assert!(check_query(
             &[json!({"namespace":"AWS/Billing","metric":"EstimatedCharges"})],
