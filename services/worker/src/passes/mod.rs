@@ -796,6 +796,8 @@ pub(crate) mod generators;
 pub mod github_history;
 pub mod health_check;
 pub mod hidden_suggest;
+/// Hosted side of hybrid: forward a held event to a self-hosted install again.
+pub mod hybrid_name_check;
 mod implement;
 #[cfg(test)]
 mod incidents;
@@ -835,7 +837,6 @@ pub mod pr_outcomes;
 mod pr_risk;
 mod proof;
 pub mod quarantine;
-/// Hosted side of hybrid: forward a held event to a self-hosted install again.
 pub mod relay_retry;
 pub mod release_notes;
 pub mod release_plan;

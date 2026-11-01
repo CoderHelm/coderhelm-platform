@@ -455,6 +455,7 @@ pub async fn detail(
         "install": st,
         "trend": trend(&[(ds, days)], now),
         "audit": audit,
+        "name_check": super::hybrid::name_check_view(&state, &install.name).await,
     })))
 }
 

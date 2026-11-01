@@ -61,6 +61,15 @@ Then everything happens by itself:
 
 The provisioning API can only create records under your name (the name itself and `_<token>.<name>`), never overwrite a record it didn't write, and never touch a reserved name; its AWS permissions say the same. An address nobody has claimed shows CoderHelm's "There's no CoderHelm here yet" page (404). A claimed address that is still being set up shows "This CoderHelm is still being set up". Once live, the address goes straight to your install, so if your install is down, the page is your CloudFront's.
 
+### How a CoderHelm address stays yours
+
+- **Only your verified install gets one.** CoderHelm points a name at a CloudFront address only after that address answers an ownership challenge signed with your install's registration secret, and it checks again before every change.
+- **The certificate lives only in your AWS account.** CoderHelm writes the validation record for it; the private key never leaves your ACM. Every certificate for coderhelm.com and its names comes from Amazon.
+- **Records go when you leave.** Uninstalling or **Leave hybrid** releases the name and removes every record CoderHelm wrote for it.
+- **CoderHelm checks every name every 15 minutes.** It compares the records under your name with the ones it wrote, then asks your install to prove itself twice with a fresh challenge: once at its CloudFront address and once at the name. When the CloudFront address answers as anyone else (or as nobody) three times in a row, or doesn't answer at all for a whole day, or a record under the name wasn't written by CoderHelm, the name goes back to the "still being set up" page. The name stays reserved for your install: nobody else can claim it. **Settings, System, Domain** shows what happened; Try again there sets it up again. A network hiccup on its own never counts.
+- **Records CoderHelm didn't write are removed or reported.** A leftover record under a name nobody holds, in a shape CoderHelm writes, is removed; anything else is reported to CoderHelm's operators and left alone.
+- **Only Amazon may issue certificates.** For the coderhelm.com zone, CoderHelm's recommended CAA records allow only Amazon (`amazon.com`, `amazontrust.com`, `awstrust.com`, `amazonaws.com`), so no other certificate authority will issue one for a name, even if someone could answer its checks.
+
 A name can change five times a day. [Uninstalling](./uninstall.md#hybrid-installs), from the guided uninstall or `npx github:CoderHelm/coderhelm-platform uninstall`, releases it first, unlinks the install's GitHub installations and Jira site so their events go back to CoderHelm hosted, and turns its registration off; so does **Leave hybrid** in Settings.
 
 ## CoderHelm's GitHub App

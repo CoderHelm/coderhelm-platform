@@ -43,6 +43,7 @@
     "knowledge_sync_sweep": {"type":"knowledge_sync_sweep"},
     "knowledge_sync": {"type":"knowledge_sync","team_id":"TEAM#team-a","kb_id":"kb1","source_id":"src1"},
     "plugin_sweep": {"type":"plugin_sweep"},
+    "hybrid_name_check": {"type":"hybrid_name_check"},
     "plugin_trigger": {"type":"plugin_trigger","team_id":"TEAM#team-a","plugin_id":"marketing","trigger":1},
     "plugin_results": {"type":"plugin_results","team_id":"TEAM#team-a","artifact_id":"01hzzart"}
   }

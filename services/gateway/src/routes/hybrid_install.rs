@@ -770,6 +770,22 @@ async fn status_value(state: &AppState, deep: bool) -> Value {
     }
     let problem = recent_intake_problem();
     let mut list = checks(&l, creds.is_some(), hosted.as_ref(), Some(code), problem);
+    // CoderHelm's 15-minute name check parked the address (it pointed
+    // somewhere that no longer answered as this install, or a record under it
+    // wasn't CoderHelm's): say so with the reason, where the domain is set up.
+    let name_check = hosted
+        .as_ref()
+        .map(|h| h["name_check"].clone())
+        .unwrap_or(Value::Null);
+    if !l.name.is_empty() && name_check["parked"].as_bool() == Some(true) {
+        list.push(check(
+            "hybrid_name_parked",
+            "fail",
+            name_check["parked_code"].as_str().unwrap_or("parked"),
+            name_check["parked_reason"].as_str().unwrap_or("CoderHelm put this address back on its holding page."),
+            "Open Settings, System, Domain and press Try again. If the install moved to a new CloudFront address, set the name up again there.",
+        ));
+    }
     if deep && l.github_mode == "hosted" {
         if let Some(first) = hosted
             .as_ref()
@@ -813,7 +829,7 @@ async fn status_value(state: &AppState, deep: bool) -> Value {
         "install_id": creds.as_ref().map(|c| c.install_id.clone()),
         "cloudfront": l.cloudfront,
         "verified": hosted.as_ref().map(|h| h["verified"].as_bool() == Some(true)).unwrap_or(false),
-        "name": if l.name.is_empty() { Value::Null } else { json!({ "name": l.name, "hostname": names::hostname(&l.name), "code": code }) },
+        "name": if l.name.is_empty() { Value::Null } else { json!({ "name": l.name, "hostname": names::hostname(&l.name), "code": code, "check": name_check }) },
         "github": {
             "mode": if l.github_mode.is_empty() { "own" } else { l.github_mode.as_str() },
             "links": hosted.as_ref().map(|h| h["github"]["links"].clone()).unwrap_or(json!([])),

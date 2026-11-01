@@ -3,6 +3,8 @@
 //!
 //! - [`names`]: `{name}.coderhelm.com` addresses, the records the hosted side
 //!   may write for them.
+//! - [`name_check`]: the 15-minute check that every name still points only
+//!   where CoderHelm put it and still reaches its install.
 //! - [`sign`]: the signatures between an install and the hosted side (install
 //!   requests, relayed events, ownership proofs), with replay protection.
 //! - [`broker`]: what the hosted token broker may mint for an install.
@@ -21,6 +23,7 @@
 pub mod broker;
 pub mod client;
 pub mod integrations;
+pub mod name_check;
 pub mod names;
 pub mod relay;
 pub mod sign;

@@ -74,6 +74,9 @@ export function buildApp(app: cdk.App, cfg: ResolvedConfig, opts: { accessStack?
     mcpProxyFunction: api.mcpProxyFunction,
     encryptionKey: database.encryptionKey,
     secretsKey: database.secretsKey,
+    hybridNames: api.hybrid && cfg.hybrid
+      ? { zoneId: api.hybrid.zoneId, zoneArn: api.hybrid.zoneArn, zone: cfg.hybrid.zone, fallbackDomain: api.hybrid.fallback.distributionDomainName }
+      : undefined,
   });
 
   // --- Streaming (SSE via Lambda Function URL + Web Adapter) ---
