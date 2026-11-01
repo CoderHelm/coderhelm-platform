@@ -48,7 +48,7 @@ Deleting the data can't be undone. The one thing you can stop is the KMS keys: u
 
 ### Or change KeepDataOnDelete before you delete
 
-Without the switch, set **KeepDataOnDelete** to `false` first. Give the stack its release's template again rather than **Use current template**, so the new value is certain to apply.
+Without the switch, set **KeepDataOnDelete** to `false` first. Give the stack its release's template again; don't choose **Use current template**, so the new value is certain to apply.
 
 1. Select the stack `coderhelm-<name>` and open **Outputs**. Note **Version**, for example `v0.8.6`.
 2. Choose **Update**, then **Replace existing template**, **Amazon S3 URL**: `https://coderhelm-public.s3.amazonaws.com/launch/<Version>/coderhelm.json`, with the version from step 1. It is the release you run, so nothing else changes.

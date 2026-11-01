@@ -730,6 +730,7 @@ pub const CAPABILITIES: &[Capability] = &[
         handlers: &[
             "system::version",
             "system::set_auto_update",
+            "system::set_uninstall_mode",
             "system::update_now",
             "system::check_update",
             "system::rollback",
