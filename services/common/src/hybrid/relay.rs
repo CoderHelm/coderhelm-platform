@@ -12,7 +12,7 @@ use std::time::Instant;
 
 use crate::deliveries::{self, Attempt, Delivery, Status};
 
-use super::sign;
+use super::{hosted_sig, sign};
 
 /// The install's relay intake, from its origin (`https://…`).
 pub fn target(origin: &str) -> String {
@@ -112,6 +112,8 @@ pub async fn note_last(
 /// One forward to send.
 pub struct Forward<'a> {
     pub origin: &'a str,
+    /// The install the event is for (CoderHelm's signature names it).
+    pub install_id: &'a str,
     pub relay_key: &'a str,
     pub source: &'a str,
     pub event: &'a str,
@@ -180,7 +182,7 @@ pub async fn read_capped(mut resp: reqwest::Response) -> Vec<u8> {
 pub async fn send(f: &Forward<'_>) -> Attempt {
     let ts = chrono::Utc::now().timestamp();
     let started = Instant::now();
-    let r = install_client()
+    let mut req = install_client()
         .post(target(f.origin))
         .timeout(std::time::Duration::from_secs(8))
         .header("content-type", "application/json")
@@ -189,10 +191,33 @@ pub async fn send(f: &Forward<'_>) -> Attempt {
             sign::sign_relay_routed(f.relay_key, ts, f.delivery_id, f.source, f.event, f.body),
         )
         .header(sign::RELAY_SOURCE_HEADER, f.source)
-        .header(sign::RELAY_EVENT_HEADER, f.event)
-        .body(f.body.to_vec())
-        .send()
-        .await;
+        .header(sign::RELAY_EVENT_HEADER, f.event);
+    // CoderHelm's own signature: an install whose release pins CoderHelm's
+    // keys refuses the event without it, so a signing failure is a failed
+    // attempt the retries pick up, not a send without it.
+    if let Some(signer) = hosted_sig::signer() {
+        let m = hosted_sig::Message {
+            install_id: f.install_id,
+            ts,
+            delivery_id: f.delivery_id,
+            source: f.source,
+            event: f.event,
+            body: f.body,
+        };
+        match signer.sign(&m).await {
+            Ok(h) => req = req.header(hosted_sig::HOSTED_HEADER, h),
+            Err(e) => {
+                tracing::error!(error = %e, metric = "HybridSignError", "hybrid: CoderHelm's signature failed");
+                return Attempt {
+                    at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+                    code: None,
+                    duration_ms: started.elapsed().as_millis() as u64,
+                    error: "CoderHelm couldn't sign the event; it is retried".into(),
+                };
+            }
+        }
+    }
+    let r = req.body(f.body.to_vec()).send().await;
     let duration_ms = started.elapsed().as_millis() as u64;
     let at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
     match r {
@@ -468,6 +493,7 @@ mod redirect_tests {
             .await;
             let a = send(&Forward {
                 origin: &install,
+                install_id: "ins_abcdefghijklmnopqrstuvwx",
                 relay_key: "k",
                 source: "github",
                 event: "push",
@@ -492,6 +518,7 @@ mod redirect_tests {
         .await;
         let a = send(&Forward {
             origin: &install,
+            install_id: "ins_abcdefghijklmnopqrstuvwx",
             relay_key: "k",
             source: "github",
             event: "push",

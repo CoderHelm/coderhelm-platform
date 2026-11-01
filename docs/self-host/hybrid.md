@@ -48,6 +48,19 @@ How the pieces are protected:
 
 The full threat model, with each attack and what stops it, is in [Security model](./security.md#hybrid-threat-model).
 
+## How an install knows a message is from CoderHelm
+
+Everything CoderHelm's servers send a hybrid install carries CoderHelm's own signature: every relayed GitHub and Jira event, and every answer to the install's own calls (GitHub tokens, the CoderHelm address and its records, email, links, registration).
+
+- **CoderHelm signs with one Ed25519 key kept in AWS KMS.** The private key never leaves KMS, and only the two CoderHelm services that send to installs may use it.
+- **Your install checks with CoderHelm's public keys, which come inside the release it runs.** The release is signed, so the trust comes from that signature, not from anything sent over the network. Settings, System, Hybrid lists the key ids and fingerprints your release trusts, to compare with the ones on each GitHub release.
+- **The signature covers** the install the message is for, the time, the delivery or call id, where it came from, its type and a hash of its content. A message for another install, an older copy, an altered body or an answer to another call is refused.
+- **Once a release pins CoderHelm's keys, anything without CoderHelm's signature is refused**, and the Deliveries page shows "Refused: not signed by CoderHelm".
+
+**Changing keys.** A release may trust two keys at once. CoderHelm adds its next key in a release before it starts signing with it, and drops the old key in a later release.
+
+**Switching on.** The first releases with this work as before (the relay key is the check) while CoderHelm signs everything alongside it. The release that pins CoderHelm's first key turns the check on: from then on both the relay key's signature and CoderHelm's are required.
+
 ## A CoderHelm address
 
 Pick a name in the guide or in **Settings, System, Domain**. The page checks it as you type: lowercase letters, digits and hyphens, 3 to 40 characters, not reserved (CoderHelm's own hosts such as `app`, `api`, `docs` and `auth`, and names such as `admin`, `support` or `status`), not reading as CoderHelm's own (no `coderhelm` in it, even spelled with digits, and no part such as `app`, `login`, `billing` or `support`, as in `app2` or `acme-login`), and not taken.

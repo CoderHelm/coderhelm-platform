@@ -22,6 +22,7 @@ import * as acm from "aws-cdk-lib/aws-certificatemanager";
 import * as cloudfront from "aws-cdk-lib/aws-cloudfront";
 import * as origins from "aws-cdk-lib/aws-cloudfront-origins";
 import * as iam from "aws-cdk-lib/aws-iam";
+import * as kms from "aws-cdk-lib/aws-kms";
 import * as lambda from "aws-cdk-lib/aws-lambda";
 import * as route53 from "aws-cdk-lib/aws-route53";
 import * as targets from "aws-cdk-lib/aws-route53-targets";
@@ -131,11 +132,20 @@ export interface HybridProps {
   gatewayFunction: lambda.Function;
 }
 
+/** The role tag that lets a role use CoderHelm's signing key. */
+export const HYBRID_SIGNER_TAG = "coderhelm:hybrid-signer";
+
+/** The alias of CoderHelm's hybrid signing key. */
+export function hybridSigningAlias(prefix: string): string {
+  return `alias/${prefix}-hybrid-signing`;
+}
+
 export class Hybrid extends Construct {
   public readonly fallback: cloudfront.Distribution;
   /** The `{name}.<zone>` hosted zone (the worker's name check reads it). */
   public readonly zoneId: string;
   public readonly zoneArn: string;
+  public readonly signingKey: kms.Key;
 
   constructor(scope: Construct, id: string, props: HybridProps) {
     super(scope, id);
@@ -191,6 +201,40 @@ export class Hybrid extends Construct {
     grantNameRecords(fn_, zoneArn, h.zone);
     fn_.addEnvironment("HYBRID_ZONE_ID", zone.hostedZoneId);
     fn_.addEnvironment("HYBRID_FALLBACK_DOMAIN", this.fallback.distributionDomainName);
+
+    // --- CoderHelm's signing key (common::hybrid::hosted_sig) ---
+    // Everything the hosted side sends an install is signed with this
+    // Ed25519 key; the private key never leaves KMS. Installs check it with
+    // the public keys their release pins (lib/hosted-keys.ts). Only roles
+    // tagged as CoderHelm's signers (the gateway and the worker) may sign,
+    // whatever any IAM policy says.
+    this.signingKey = new kms.Key(this, "SigningKey", {
+      description: `${cfg.prefix}: CoderHelm's signature on what it sends hybrid installs`,
+      keySpec: kms.KeySpec.ECC_NIST_EDWARDS25519,
+      keyUsage: kms.KeyUsage.SIGN_VERIFY,
+      alias: hybridSigningAlias(cfg.prefix),
+      removalPolicy: cdk.RemovalPolicy.RETAIN,
+    });
+    this.signingKey.addToResourcePolicy(
+      new iam.PolicyStatement({
+        sid: "OnlyCoderHelmSignersSign",
+        effect: iam.Effect.DENY,
+        principals: [new iam.AnyPrincipal()],
+        actions: ["kms:Sign"],
+        resources: ["*"],
+        conditions: { StringNotEquals: { [`aws:PrincipalTag/${HYBRID_SIGNER_TAG}`]: "true" } },
+      }),
+    );
+    fn_.addEnvironment("HYBRID_SIGNING_KEY", hybridSigningAlias(cfg.prefix));
+    fn_.addToRolePolicy(
+      new iam.PolicyStatement({
+        sid: "HybridSign",
+        actions: ["kms:Sign", "kms:GetPublicKey"],
+        resources: [this.signingKey.keyArn],
+      }),
+    );
+    if (fn_.role) cdk.Tags.of(fn_.role).add(HYBRID_SIGNER_TAG, "true");
+    new cdk.CfnOutput(this, "SigningKeyArn", { value: this.signingKey.keyArn, description: "CoderHelm's hybrid signing key (its public key goes into lib/hosted-keys.ts)" });
 
     new cdk.CfnOutput(this, "FallbackDomain", { value: this.fallback.distributionDomainName, description: `The {name}.${h.zone} fallback site` });
   }

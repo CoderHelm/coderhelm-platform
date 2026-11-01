@@ -55,6 +55,9 @@ async fn main() -> Result<(), Error> {
     let cognito = aws_sdk_cognitoidentityprovider::Client::new(&aws_config);
     let lambda_client = aws_sdk_lambda::Client::new(&aws_config);
     let kms = aws_sdk_kms::Client::new(&aws_config);
+    // The hosted side of hybrid: CoderHelm's signing key in KMS (none on a
+    // self-hosted install).
+    common::hybrid::hosted_sig::init_signer(&kms);
     let sts = aws_sdk_sts::Client::new(&aws_config);
     let bedrock = aws_sdk_bedrockruntime::Client::new(&aws_config);
     // Claude through Bedrock: set on every install, so a switch to Bedrock
@@ -1479,6 +1482,9 @@ fn hybrid_routes() -> Router<Arc<AppState>> {
         .route("/oauth/callback", post(routes::hybrid::oauth_callback))
         .route("/oauth/token", post(routes::hybrid::oauth_token))
         .route("/oauth/revoke", post(routes::hybrid::oauth_revoke))
+        // CoderHelm's signature on every answer to an install's call
+        // (common::hybrid::hosted_sig).
+        .layer(axum::middleware::from_fn(routes::hybrid::sign_answer))
 }
 
 #[cfg(test)]

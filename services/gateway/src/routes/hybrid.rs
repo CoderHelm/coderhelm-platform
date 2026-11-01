@@ -33,7 +33,7 @@ use axum::{
     Extension, Json,
 };
 use common::deliveries::{self, Delivery, Direction, Status};
-use common::hybrid::{broker, names, relay, sign};
+use common::hybrid::{broker, hosted_sig, names, relay, sign};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use tracing::{info, warn};
@@ -735,6 +735,88 @@ fn zone_id() -> Option<String> {
 
 /// CloudFront's own hosted zone id, the one every CloudFront alias uses.
 const CLOUDFRONT_ALIAS_ZONE: &str = "Z2FDTNDATAQYW2";
+
+/// The most of an answer CoderHelm signs (larger answers go unsigned, and an
+/// install that pins CoderHelm's keys refuses them; none comes close).
+const MAX_SIGNED_ANSWER: usize = 1 << 20;
+
+/// Signs every answer to a call that carries an install's request id
+/// ([`hosted_sig::REQUEST_ID_HEADER`]) with CoderHelm's key, over the
+/// install, that id, the status, method and path, and the body, so the
+/// install can tell the answer came from CoderHelm and belongs to its call.
+/// Nothing changes where this deployment has no signing key.
+pub async fn sign_answer(
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let Some(signer) = hosted_sig::signer() else {
+        return next.run(req).await;
+    };
+    // Read before the first await (a closure over the request isn't Send).
+    let (request_id, install) = {
+        let header = |k: &str| {
+            req.headers()
+                .get(k)
+                .and_then(|v| v.to_str().ok())
+                .map(str::trim)
+                .unwrap_or("")
+                .to_string()
+        };
+        (
+            header(hosted_sig::REQUEST_ID_HEADER),
+            header(sign::INSTALL_HEADER),
+        )
+    };
+    if request_id.is_empty()
+        || request_id.len() > 100
+        || !request_id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
+        return next.run(req).await;
+    }
+    // The install the answer is for: its id when the call names one, "" for
+    // the calls made before it has one (registration, a name lookup).
+    let install = Some(install)
+        .filter(|i| sign::is_install_id(i))
+        .unwrap_or_default();
+    let method = req.method().as_str().to_string();
+    let path = req
+        .extensions()
+        .get::<axum::extract::OriginalUri>()
+        .map(|u| u.0.path().to_string())
+        .unwrap_or_else(|| req.uri().path().to_string());
+    let resp = next.run(req).await;
+    let (mut parts, body) = resp.into_parts();
+    let Ok(bytes) = axum::body::to_bytes(body, MAX_SIGNED_ANSWER).await else {
+        warn!(path, "hybrid: an answer too large to sign");
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": "The answer couldn't be signed.", "code": "answer_unsigned" })),
+        )
+            .into_response();
+    };
+    let event = hosted_sig::response_event(parts.status.as_u16(), &method, &path);
+    let m = hosted_sig::Message {
+        install_id: &install,
+        ts: chrono::Utc::now().timestamp(),
+        delivery_id: &request_id,
+        source: hosted_sig::RESPONSE_SOURCE,
+        event: &event,
+        body: &bytes,
+    };
+    match signer.sign(&m).await {
+        Ok(v) => {
+            if let Ok(v) = axum::http::HeaderValue::from_str(&v) {
+                parts.headers.insert(hosted_sig::HOSTED_HEADER, v);
+            }
+        }
+        Err(e) => {
+            warn!(error = %e, metric = "HybridSignError", path, "hybrid: CoderHelm's signature on an answer failed")
+        }
+    }
+    axum::response::Response::from_parts(parts, axum::body::Body::from(bytes))
+}
 
 /// Runs a planned batch in one Route 53 change (atomic). Refuses anything
 /// outside the name, whatever the plan says.
@@ -1995,6 +2077,7 @@ pub(crate) async fn forward_and_record(
     let origin = install.origin();
     let attempt = relay::send(&relay::Forward {
         origin: &origin,
+        install_id: &install.id,
         relay_key: &key,
         source,
         event,
@@ -2213,6 +2296,7 @@ pub async fn redeliver(
     let origin = install.origin();
     let a = relay::send(&relay::Forward {
         origin: &origin,
+        install_id: &install.id,
         relay_key: &key,
         source,
         event: &event,

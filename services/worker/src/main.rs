@@ -52,6 +52,8 @@ async fn main() -> Result<(), Error> {
     let codebuild = aws_sdk_codebuild::Client::new(&aws_config);
     let logs = aws_sdk_cloudwatchlogs::Client::new(&aws_config);
     let kms = aws_sdk_kms::Client::new(&aws_config);
+    // Relay retries carry CoderHelm's signature too (common::hybrid::hosted_sig).
+    common::hybrid::hosted_sig::init_signer(&kms);
     let sts = aws_sdk_sts::Client::new(&aws_config);
     let scheduler = common::plugins::schedule::aws_sdk_scheduler::Client::new(&aws_config);
     let route53 = aws_sdk_route53::Client::new(&aws_config);

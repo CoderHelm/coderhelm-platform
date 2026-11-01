@@ -7,6 +7,7 @@ import * as cdk from "aws-cdk-lib";
 import * as iam from "aws-cdk-lib/aws-iam";
 import { DEFAULT_LOG_READER_TEMPLATE_URL, ResolvedConfig, releaseLogReaderTemplateUrl } from "./config";
 import { releaseStamp, stampEnvironment } from "./release";
+import { hostedKeysEnv } from "./hosted-keys";
 
 /** Environment variables shared by gateway, streaming and worker. */
 export function serviceEnvironment(cfg: ResolvedConfig, account: string): Record<string, string> {
@@ -50,6 +51,10 @@ export function serviceEnvironment(cfg: ResolvedConfig, account: string): Record
   // config turns hybrid off.
   Object.assign(env, hybridUrlEnvironment(cfg));
   if (cfg.hybrid) env.HYBRID_ZONE_NAME = cfg.hybrid.zone;
+  // CoderHelm's public signing keys, pinned in this release (lib/hosted-keys.ts):
+  // a self-hosted install refuses what CoderHelm didn't sign once there are any.
+  const hostedKeys = hostedKeysEnv();
+  if (cfg.layout === "single-origin" && hostedKeys) env.HYBRID_HOSTED_KEYS = hostedKeys;
   // The services read the secret once at start. The installer sets this to
   // the secret's version after it stores new keys (the GitHub App), so the
   // functions restart and read them. Unset in normal deploys.

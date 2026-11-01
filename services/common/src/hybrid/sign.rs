@@ -137,6 +137,8 @@ pub enum SignatureProblem {
     Stale,
     Mismatch,
     Replayed,
+    /// Signed with a key this release doesn't trust as CoderHelm's (hosted_sig).
+    UnknownKey,
 }
 
 impl SignatureProblem {
@@ -147,6 +149,7 @@ impl SignatureProblem {
             Self::Stale => "signature_stale",
             Self::Mismatch => "signature_mismatch",
             Self::Replayed => "replayed",
+            Self::UnknownKey => "signature_unknown_key",
         }
     }
 
@@ -159,6 +162,7 @@ impl SignatureProblem {
             }
             Self::Mismatch => "The signature doesn't match: the keys on the two sides differ.",
             Self::Replayed => "This delivery was already received once; the copy was refused.",
+            Self::UnknownKey => "Not signed by CoderHelm: the key isn't one this release trusts.",
         }
     }
 
@@ -168,6 +172,7 @@ impl SignatureProblem {
             Self::Stale => "Check that your install's clock is right; AWS keeps Lambda clocks in sync, so this is usually a delayed retry and passes on its own.",
             Self::Mismatch => "Register the install again in Settings, System, Hybrid: that issues fresh keys to both sides.",
             Self::Replayed => "Nothing to do: the first copy was handled.",
+            Self::UnknownKey => "Update CoderHelm: each release pins CoderHelm's current keys, and a newer one trusts the key in use now.",
         }
     }
 }

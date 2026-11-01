@@ -88,3 +88,5 @@ tar = "0.4"
 rand08 = { package = "rand", version = "0.8" }
 # middleware tests drive a small router
 tower = { version = "0.5", features = ["util"] }
+# signs test messages the way CoderHelm's KMS key does (hosted_sig)
+ed25519-dalek = { version = "2", default-features = false, features = ["std"] }

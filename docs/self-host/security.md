@@ -270,6 +270,7 @@ CoderHelm **cannot** see: your code at rest, your runs, plans, reviews, memory, 
 
 - A link made before the **Link** confirmation and the push-permission limit existed gets no tokens (`broker_relink_needed`). Link it again to bring it under both.
 - Someone who controls CoderHelm's hosted side could mint tokens for linked installations, read relayed events and act as the relay. Choose your own GitHub App and apps (fully private) if that is outside what you accept.
+- Messages from CoderHelm carry CoderHelm's own signature (Ed25519, key in AWS KMS), checked with public keys pinned in your signed release once a release pins them: a leaked relay key alone can't make an install accept a message. See hybrid.md, "How an install knows a message is from CoderHelm". The answers of the OAuth sign-in broker (Notion and the other OAuth integrations) are not signed yet; HTTPS and the install's client secret protect them.
 - Install requests carry no one-time number, so someone who could break HTTPS could repeat one within its 5 minutes. They would already see the same traffic, tokens included.
 
 ## Reporting a problem
