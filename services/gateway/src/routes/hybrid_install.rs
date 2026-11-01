@@ -28,7 +28,7 @@ use axum::{
 };
 use common::deliveries::{self, Delivery, Direction, Status};
 use common::hybrid::client::{self, Credentials};
-use common::hybrid::{integrations, names, sign};
+use common::hybrid::{hosted_sig, integrations, names, sign};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tracing::{info, warn};
@@ -251,6 +251,44 @@ async fn cloudfront(state: &AppState) -> Option<String> {
     })
 }
 
+/// An answer to a call made before this install has an id (registration, a
+/// name lookup), refused unless CoderHelm signed it for this call once the
+/// release pins CoderHelm's keys.
+async fn signed_answer(
+    r: reqwest::Response,
+    request_id: &str,
+    method: &str,
+    path: &str,
+) -> Result<Vec<u8>, (StatusCode, Json<Value>)> {
+    let status = r.status().as_u16();
+    let headers = r.headers().clone();
+    let body = r.bytes().await.unwrap_or_default().to_vec();
+    client::check_answer(
+        hosted_sig::trusted(),
+        "",
+        request_id,
+        status,
+        method,
+        path,
+        &headers,
+        &body,
+        chrono::Utc::now().timestamp(),
+    )
+    .map_err(|e| fail(StatusCode::BAD_GATEWAY, &e.code, &e.message))?;
+    Ok(body)
+}
+
+/// The CoderHelm keys this release pins: each key id and fingerprint, and
+/// whether answers and events must carry CoderHelm's signature.
+fn coderhelm_keys() -> Value {
+    let keys = hosted_sig::trusted();
+    json!({
+        "required": !keys.is_empty(),
+        "source": "pinned in this signed release",
+        "keys": keys.describe().into_iter().map(|(kid, fp)| json!({ "kid": kid, "fingerprint": fp })).collect::<Vec<_>>(),
+    })
+}
+
 async fn do_register(state: &AppState) -> Result<Local, (StatusCode, Json<Value>)> {
     let mut l = local(state).await;
     if creds_now().await.is_some() && !l.install_id.is_empty() {
@@ -260,16 +298,21 @@ async fn do_register(state: &AppState) -> Result<Local, (StatusCode, Json<Value>
         fail(StatusCode::CONFLICT, "no_cloudfront", "This install's CloudFront address isn't known yet. Wait until it finishes deploying, then try again.")
     })?;
     let version = std::env::var("CODERHELM_VERSION").unwrap_or_default();
+    let request_id = hosted_sig::new_request_id();
     let r = state
         .http
         .post(format!("{}/hybrid/installs", common::hybrid::hosted_url()))
         .timeout(Duration::from_secs(10))
+        .header(hosted_sig::REQUEST_ID_HEADER, &request_id)
         .json(&json!({ "cloudfront": cf, "version": version }))
         .send()
         .await
         .map_err(|_| fail(StatusCode::BAD_GATEWAY, "hosted_unreachable", "CoderHelm's servers didn't answer. Check that your install can reach api.coderhelm.com, then try again."))?;
     let code = r.status();
-    let v: Value = r.json().await.unwrap_or_default();
+    // The keys this install will hold come in this answer: CoderHelm must
+    // have signed it (once the release pins CoderHelm's keys).
+    let answer = signed_answer(r, &request_id, "POST", "/hybrid/installs").await?;
+    let v: Value = serde_json::from_slice(&answer).unwrap_or_default();
     if !code.is_success() {
         return Err(fail(
             code,
@@ -825,6 +868,9 @@ async fn status_value(state: &AppState, deep: bool) -> Value {
     json!({
         "available": super::setup_checks::self_hosted(),
         "hosted_url": common::hybrid::hosted_url(),
+        // CoderHelm's public keys this release pins (Settings, System, Hybrid
+        // shows them to compare with the fingerprints CoderHelm publishes).
+        "coderhelm_keys": coderhelm_keys(),
         "registered": creds.is_some(),
         "install_id": creds.as_ref().map(|c| c.install_id.clone()),
         "cloudfront": l.cloudfront,
@@ -924,10 +970,13 @@ async fn available(state: &AppState, raw: &str) -> Reply {
         common::hybrid::hosted_url(),
         urlencoding::encode(raw.trim())
     );
+    let request_id = hosted_sig::new_request_id();
+    let path = format!("/hybrid/names/{}", urlencoding::encode(raw.trim()));
     let r = state
         .http
         .get(url)
         .timeout(Duration::from_secs(6))
+        .header(hosted_sig::REQUEST_ID_HEADER, &request_id)
         .send()
         .await
         .map_err(|_| {
@@ -937,7 +986,8 @@ async fn available(state: &AppState, raw: &str) -> Reply {
                 "CoderHelm's servers didn't answer.",
             )
         })?;
-    Ok(Json(r.json().await.unwrap_or_default()))
+    let answer = signed_answer(r, &request_id, "GET", &path).await?;
+    Ok(Json(serde_json::from_slice(&answer).unwrap_or_default()))
 }
 
 #[derive(Deserialize, Default)]
@@ -1461,6 +1511,61 @@ fn note_intake_problem(p: &'static str) {
 }
 
 /// POST /webhooks/relay: an event CoderHelm's relay forwarded.
+/// CoderHelm's own signature on a relayed event, once this release pins
+/// CoderHelm's keys (until then the relay key's signature is the check). It
+/// must name this install and carry the relay signature's delivery id and
+/// time, so the two can't be mixed from different events.
+pub(crate) fn hosted_signed(
+    headers: &HeaderMap,
+    install_id: &str,
+    source: &str,
+    event: &str,
+    body: &[u8],
+    stamp: &sign::RelayStamp,
+    now: i64,
+) -> Result<(), sign::SignatureProblem> {
+    hosted_signed_with(
+        hosted_sig::trusted(),
+        headers,
+        install_id,
+        source,
+        event,
+        body,
+        stamp,
+        now,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn hosted_signed_with(
+    keys: &hosted_sig::TrustedKeys,
+    headers: &HeaderMap,
+    install_id: &str,
+    source: &str,
+    event: &str,
+    body: &[u8],
+    stamp: &sign::RelayStamp,
+    now: i64,
+) -> Result<(), sign::SignatureProblem> {
+    if keys.is_empty() {
+        return Ok(());
+    }
+    let h = keys.verify(
+        headers
+            .get(hosted_sig::HOSTED_HEADER)
+            .and_then(|v| v.to_str().ok()),
+        install_id,
+        source,
+        event,
+        body,
+        now,
+    )?;
+    if h.delivery_id != stamp.delivery_id || h.ts != stamp.ts {
+        return Err(sign::SignatureProblem::Mismatch);
+    }
+    Ok(())
+}
+
 #[utoipa::path(
     post,
     path = "/webhooks/relay",
@@ -1512,7 +1617,8 @@ pub async fn intake(
     };
     let source = h(sign::RELAY_SOURCE_HEADER);
     let event = h(sign::RELAY_EVENT_HEADER);
-    let stamp = match sign::verify_relay(
+    let now = chrono::Utc::now().timestamp();
+    let checked = sign::verify_relay(
         &c.relay_key,
         headers
             .get(sign::RELAY_HEADER)
@@ -1520,10 +1626,17 @@ pub async fn intake(
         &source,
         &event,
         &body,
-        chrono::Utc::now().timestamp(),
-    ) {
+        now,
+    )
+    .map_err(|p| (p, "Refused: bad signature"))
+    .and_then(|stamp| {
+        hosted_signed(&headers, &c.install_id, &source, &event, &body, &stamp, now)
+            .map_err(|p| (p, "Refused: not signed by CoderHelm"))?;
+        Ok(stamp)
+    });
+    let stamp = match checked {
         Ok(s) => s,
-        Err(p) => {
+        Err((p, summary)) => {
             note_intake_problem(p.code());
             let mut d = Delivery::new(
                 Direction::Inbound,
@@ -1536,7 +1649,7 @@ pub async fn intake(
                     .iter()
                     .filter_map(|(k, v)| Some((k.as_str(), v.to_str().ok()?))),
             );
-            d.finish(Status::Failed, "Refused: bad signature", p.code());
+            d.finish(Status::Failed, summary, p.code());
             super::deliveries::save(&state, super::deliveries::UNROUTED, &d).await;
             return Err(fail(StatusCode::UNAUTHORIZED, p.code(), p.message()));
         }
@@ -1953,6 +2066,134 @@ mod tests {
     }
 
     use super::*;
+
+    mod coderhelm_signature {
+        use super::*;
+        use base64::Engine;
+        use ed25519_dalek::{Signer, SigningKey};
+
+        const INSTALL: &str = "ins_abcdefghijklmnopqrstuvwx";
+        const NOW: i64 = 1_761_436_800;
+
+        fn key() -> SigningKey {
+            SigningKey::from_bytes(&[7; 32])
+        }
+
+        fn pinned() -> hosted_sig::TrustedKeys {
+            let b = base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .encode(key().verifying_key().to_bytes());
+            hosted_sig::TrustedKeys::parse(&b).unwrap()
+        }
+
+        fn signed_headers(install: &str, d: &str, ts: i64) -> HeaderMap {
+            let kid = hosted_sig::kid_of(&key().verifying_key().to_bytes());
+            let m = hosted_sig::Message {
+                install_id: install,
+                ts,
+                delivery_id: d,
+                source: "github",
+                event: "push",
+                body: b"{}",
+            };
+            let sig = key().sign(&hosted_sig::canonical(&kid, &m).unwrap());
+            let mut h = HeaderMap::new();
+            h.insert(
+                hosted_sig::HOSTED_HEADER,
+                hosted_sig::header(&kid, &m, &sig.to_bytes())
+                    .parse()
+                    .unwrap(),
+            );
+            h
+        }
+
+        fn stamp() -> sign::RelayStamp {
+            sign::RelayStamp {
+                delivery_id: "d-1".into(),
+                ts: NOW,
+            }
+        }
+
+        #[test]
+        fn a_release_without_pinned_keys_keeps_the_relay_check() {
+            let none = hosted_sig::TrustedKeys::default();
+            assert!(hosted_signed_with(
+                &none,
+                &HeaderMap::new(),
+                INSTALL,
+                "github",
+                "push",
+                b"{}",
+                &stamp(),
+                NOW
+            )
+            .is_ok());
+        }
+
+        #[test]
+        fn once_keys_are_pinned_an_unsigned_event_is_refused() {
+            assert_eq!(
+                hosted_signed_with(
+                    &pinned(),
+                    &HeaderMap::new(),
+                    INSTALL,
+                    "github",
+                    "push",
+                    b"{}",
+                    &stamp(),
+                    NOW
+                ),
+                Err(sign::SignatureProblem::Missing)
+            );
+        }
+
+        #[test]
+        fn coderhelms_signature_for_this_install_and_delivery_passes() {
+            let h = signed_headers(INSTALL, "d-1", NOW);
+            assert!(hosted_signed_with(
+                &pinned(),
+                &h,
+                INSTALL,
+                "github",
+                "push",
+                b"{}",
+                &stamp(),
+                NOW
+            )
+            .is_ok());
+        }
+
+        #[test]
+        fn a_signature_for_another_install_or_delivery_is_refused() {
+            let other = signed_headers("ins_bbbbbbbbbbbbbbbbbbbbbbbb", "d-1", NOW);
+            assert_eq!(
+                hosted_signed_with(
+                    &pinned(),
+                    &other,
+                    INSTALL,
+                    "github",
+                    "push",
+                    b"{}",
+                    &stamp(),
+                    NOW
+                ),
+                Err(sign::SignatureProblem::Mismatch)
+            );
+            let moved = signed_headers(INSTALL, "d-2", NOW);
+            assert_eq!(
+                hosted_signed_with(
+                    &pinned(),
+                    &moved,
+                    INSTALL,
+                    "github",
+                    "push",
+                    b"{}",
+                    &stamp(),
+                    NOW
+                ),
+                Err(sign::SignatureProblem::Mismatch)
+            );
+        }
+    }
 
     fn registered() -> Local {
         Local {

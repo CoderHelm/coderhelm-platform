@@ -34,6 +34,7 @@ graphql-parser = "0.4"
 url = "2"
 aws-sdk-kms = "1"
 base64 = "0.22"
+ed25519-dalek = { version = "2", default-features = false, features = ["std", "zeroize"] }
 # mcp_remote: PKCE verifiers and OAuth state values
 rand = "0.9"
 serde = { version = "1", features = ["derive"] }

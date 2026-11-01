@@ -14,7 +14,7 @@ import * as eventsources from "aws-cdk-lib/aws-lambda-event-sources";
 import * as codebuild from "aws-cdk-lib/aws-codebuild";
 import { Construct } from "constructs";
 import { ResolvedConfig } from "./config";
-import { grantNameRecords } from "./hybrid";
+import { HYBRID_SIGNER_TAG, grantNameRecords, hybridSigningAlias } from "./hybrid";
 import { repoPath } from "./paths";
 import * as path from "path";
 import { relaySendStatement } from "./mail-relay";
@@ -322,6 +322,22 @@ export class WorkerStack extends cdk.Stack {
       "MCP_PROXY_FUNCTION_NAME",
       props.mcpProxyFunction.functionName
     );
+
+    // The hosted side of hybrid: relay retries carry CoderHelm's signature
+    // (lib/hybrid.ts owns the key; this role is tagged as a signer, which the
+    // key's policy requires, and may use only the key behind that alias).
+    if (cfg.hybrid) {
+      this.workerFunction.addEnvironment("HYBRID_SIGNING_KEY", hybridSigningAlias(cfg.prefix));
+      this.workerFunction.addToRolePolicy(
+        new iam.PolicyStatement({
+          sid: "HybridSign",
+          actions: ["kms:Sign", "kms:GetPublicKey"],
+          resources: [`arn:${this.partition}:kms:${this.region}:${this.account}:key/*`],
+          conditions: { "ForAnyValue:StringEquals": { "kms:ResourceAliases": [hybridSigningAlias(cfg.prefix)] } },
+        }),
+      );
+      if (this.workerFunction.role) cdk.Tags.of(this.workerFunction.role).add(HYBRID_SIGNER_TAG, "true");
+    }
 
     // --- Execution sandbox (CodeBuild), optional: integrations.sandbox ---
     // Without it the worker skips running a repo's checks (empty

@@ -5,6 +5,8 @@
 //!   may write for them.
 //! - [`name_check`]: the 15-minute check that every name still points only
 //!   where CoderHelm put it and still reaches its install.
+//! - [`hosted_sig`]: CoderHelm's own signature on what it sends an install
+//!   (Ed25519 in AWS KMS; the install checks it with keys its release pins).
 //! - [`sign`]: the signatures between an install and the hosted side (install
 //!   requests, relayed events, ownership proofs), with replay protection.
 //! - [`broker`]: what the hosted token broker may mint for an install.
@@ -22,6 +24,7 @@
 
 pub mod broker;
 pub mod client;
+pub mod hosted_sig;
 pub mod integrations;
 pub mod name_check;
 pub mod names;

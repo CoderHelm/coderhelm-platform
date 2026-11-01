@@ -100,6 +100,31 @@ export class MonitoringStack extends cdk.Stack {
       treatMissingData: cloudwatch.TreatMissingData.NOT_BREACHING,
     });
     reviewGaveUpAlarm.addAlarmAction(new actions.SnsAction(alertTopic));
+    // The hosted side of hybrid: CoderHelm couldn't sign a relayed event or
+    // an answer (KMS refused or failed). Installs that pin CoderHelm's keys
+    // refuse unsigned messages, so this stops hybrid traffic until fixed.
+    if (props.cfg.hybrid) {
+      const signFilter = (id: string, logGroup: logs.ILogGroup) =>
+        new logs.MetricFilter(this, id, {
+          logGroup,
+          filterPattern: logs.FilterPattern.literal('"HybridSignError"'),
+          metricNamespace: "CoderHelm/Hybrid",
+          metricName: "SignError",
+          metricValue: "1",
+        });
+      signFilter("HybridSignErrorWorker", workerLogs);
+      signFilter("HybridSignErrorGateway", logs.LogGroup.fromLogGroupName(this, "GatewayLogsForSigning", `/aws/lambda/${prefix}-gateway`));
+      const signAlarm = new cloudwatch.Alarm(this, "HybridSignErrorAlarm", {
+        alarmName: `${prefix}-hybrid-sign-error`,
+        alarmDescription: "CoderHelm couldn't sign what it sends hybrid installs (KMS Sign failed)",
+        metric: new cloudwatch.Metric({ namespace: "CoderHelm/Hybrid", metricName: "SignError", period: cdk.Duration.minutes(5), statistic: "Sum" }),
+        threshold: 1,
+        evaluationPeriods: 1,
+        comparisonOperator: cloudwatch.ComparisonOperator.GREATER_THAN_OR_EQUAL_TO_THRESHOLD,
+        treatMissingData: cloudwatch.TreatMissingData.NOT_BREACHING,
+      });
+      signAlarm.addAlarmAction(new actions.SnsAction(alertTopic));
+    }
     // Many failed attempts in a short window: the model API (or GitHub) is
     // failing for reviews broadly, even while retries are still running.
     const reviewFailedAlarm = new cloudwatch.Alarm(this, "ReviewFailedAlarm", {

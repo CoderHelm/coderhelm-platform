@@ -145,6 +145,7 @@ pub async fn run(state: &WorkerState, msg: RelayRetryMessage) -> Result<(), Erro
     let relay_key = sign::relay_key(master, &msg.install_id);
     let attempt = relay::send(&relay::Forward {
         origin: &origin,
+        install_id: &msg.install_id,
         relay_key: &relay_key,
         source: &msg.source,
         event: &msg.event,

@@ -235,3 +235,51 @@ test("a self-hosted install has no name check and no zone rights in its worker",
   const alarms = Object.values(t["coderhelm-prod-monitoring"].findResources("AWS::CloudWatch::Alarm")).map((r: any) => r.Properties.AlarmName);
   assert.ok(!alarms.some((a: string) => a.includes("hybrid-name")));
 });
+
+// ── CoderHelm's signing key (common::hybrid::hosted_sig) ──────────────────
+
+test("CoderHelm signs with an Ed25519 key in KMS that only its tagged signers may use", () => {
+  const api = hosted()["coderhelm-prod-api"];
+  const worker = hosted()["coderhelm-prod-worker"];
+  const keys = Object.values(api.findResources("AWS::KMS::Key")).filter((k: any) => k.Properties.KeySpec === "ECC_NIST_EDWARDS25519");
+  assert.equal(keys.length, 1, "one signing key");
+  const key: any = keys[0];
+  assert.equal(key.Properties.KeyUsage, "SIGN_VERIFY");
+  assert.equal(key.DeletionPolicy, "Retain");
+  const deny = key.Properties.KeyPolicy.Statement.find((s: any) => s.Sid === "OnlyCoderHelmSignersSign");
+  assert.equal(deny.Effect, "Deny");
+  assert.deepEqual(deny.Condition, { StringNotEquals: { "aws:PrincipalTag/coderhelm:hybrid-signer": "true" } });
+  assert.equal(str(api.findResources("AWS::KMS::Alias")).includes("alias/coderhelm-prod-hybrid-signing"), true);
+  // The gateway and the worker sign, each tagged, each told the alias.
+  for (const [t, fn] of [[api, "coderhelm-prod-gateway"], [worker, "coderhelm-prod-worker"]] as const) {
+    const f: any = Object.values(t.findResources("AWS::Lambda::Function")).find((r: any) => r.Properties.FunctionName === fn);
+    assert.equal(f.Properties.Environment.Variables.HYBRID_SIGNING_KEY, "alias/coderhelm-prod-hybrid-signing", fn);
+    const roleTags = str(t.findResources("AWS::IAM::Role"));
+    assert.ok(roleTags.includes("coderhelm:hybrid-signer"), `${fn}'s role is tagged`);
+    const sign = statements(t).find((s) => s.Sid === "HybridSign");
+    assert.deepEqual([...sign.Action].sort(), ["kms:GetPublicKey", "kms:Sign"], fn);
+  }
+  // The worker's grant is fenced to the key behind the alias.
+  const ws = statements(worker).find((s) => s.Sid === "HybridSign");
+  assert.deepEqual(ws.Condition, { "ForAnyValue:StringEquals": { "kms:ResourceAliases": ["alias/coderhelm-prod-hybrid-signing"] } });
+  // An alarm when signing fails.
+  assert.ok(str(hosted()["coderhelm-prod-monitoring"].findResources("AWS::CloudWatch::Alarm")).includes("coderhelm-prod-hybrid-sign-error"));
+});
+
+test("a self-hosted install never gets the signing key, only CoderHelm's pinned public keys", () => {
+  const cfg = resolveConfig({ account: "111122223333", region: "us-west-2", stage: "prod", email: { from: "a@example.org" }, admins: ["o@example.org"] });
+  const t = synth(cfg);
+  for (const s of Object.values(t)) {
+    assert.equal(Object.values(s.findResources("AWS::KMS::Key")).some((k: any) => k.Properties.KeySpec === "ECC_NIST_EDWARDS25519"), false);
+    assert.ok(!str(s.toJSON()).includes("HYBRID_SIGNING_KEY"));
+  }
+});
+
+test("pinned keys must be raw Ed25519 public keys in base64url", async () => {
+  const { hostedKeysEnv, HOSTED_SIGNING_KEYS } = await import("../lib/hosted-keys");
+  const good = Buffer.alloc(32, 7).toString("base64url");
+  assert.equal(hostedKeysEnv([good, good]), `${good},${good}`);
+  assert.throws(() => hostedKeysEnv([Buffer.alloc(16, 7).toString("base64url")]), /32-byte/);
+  assert.throws(() => hostedKeysEnv([Buffer.alloc(32, 7).toString("base64")+"="]), /base64url/);
+  assert.doesNotThrow(() => hostedKeysEnv(HOSTED_SIGNING_KEYS), "the pinned list itself is valid");
+});
