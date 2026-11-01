@@ -464,13 +464,157 @@ test("leftovers --delete removes only this install's pieces, with each reason wh
   assert.match(after.out, /nothing left/);
 });
 
-test("leftovers --delete never takes a native install apart while its stack exists", async () => {
-  const file = cfgDir();
+/**
+ * A native install, still running: its own stack coderhelm-prod (Launch Stack parameters plus
+ * KeepDataOnDelete), its parts as nested stacks (tagged), a data bucket with object versions,
+ * and its roles carrying coderhelm-prod-boundary-stack. `parts` lets a test start from a
+ * partial state; `storageFails` makes the Storage part refuse to go while the data bucket still
+ * has versions (what happened on a real install).
+ */
+function nativeWorld({ keepData = "false", status = "UPDATE_COMPLETE", parts = ["Database", "Storage", "Api"], partStatus = {} } = {}) {
   const w = leftoverWorld();
-  w.stacks["coderhelm-prod"] = { tags: tag("coderhelm-prod"), exports: [] };
+  const root = `arn:aws:cloudformation:${R}:${A}:stack/coderhelm-prod/aaaa0000-0000-1111-2222-333344445555`;
+  w.stacks["coderhelm-prod"] = { id: root, status, params: { Stage: "prod", SetupToken: "", AdminEmail: "a@example.org", StatusId: "abcdefghijklmnop", KeepDataOnDelete: keepData }, tags: [] };
+  for (const p of parts) w.stacks[`coderhelm-prod-${p}-ABC123`] = { tags: tag("coderhelm-prod"), exports: [], status: partStatus[p] ?? "UPDATE_COMPLETE", nested: true };
+  w.buckets[`coderhelm-prod-data-${A}`].objects = 5;
+  w.roles["coderhelm-prod-ServiceRole-1e19356c"] = { boundary: `arn:aws:iam::${A}:policy/coderhelm-prod-boundary-stack`, policies: ["x"], nested: true };
+  w.policies.push("coderhelm-prod-boundary-stack");
+  w.policyUse = { "coderhelm-prod-boundary-stack": { PermissionsBoundaryUsageCount: 1, AttachmentCount: 0 } };
+  const read = w.read;
+  w.read = async (svc, op, args = [], region) => {
+    if (svc === "cloudformation" && op === "describe-stack-events") {
+      const n = args[args.indexOf("--stack-name") + 1];
+      return { StackEvents: w.events?.[n] ?? [] };
+    }
+    return read(svc, op, args, region);
+  };
+  const write = w.write;
+  w.write = async (svc, op, args = [], region) => {
+    if (svc === "cloudformation" && op === "delete-stack" && args[1] === "coderhelm-prod") {
+      w.calls.push({ kind: "write", svc, op, args, region });
+      // CloudFormation deletes the parts in order; with KeepDataOnDelete=false Storage refuses while
+      // the data bucket has versions (with true the bucket is retained, so nothing refuses).
+      const storage = Object.keys(w.stacks).find((n) => n.startsWith("coderhelm-prod-Storage-"));
+      if (keepData === "false" && storage && w.buckets[`coderhelm-prod-data-${A}`]?.objects) {
+        w.stacks[storage].status = "DELETE_FAILED";
+        w.stacks["coderhelm-prod"].status = "DELETE_FAILED";
+        w.events = {
+          "coderhelm-prod": [{ LogicalResourceId: "Storage", ResourceType: "AWS::CloudFormation::Stack", PhysicalResourceId: storage, ResourceStatus: "DELETE_FAILED", ResourceStatusReason: "The following resource(s) failed to delete: [DataBucketE3889A50]." }],
+          [storage]: [{ LogicalResourceId: "DataBucketE3889A50", ResourceType: "AWS::S3::Bucket", ResourceStatus: "DELETE_FAILED", ResourceStatusReason: "The bucket you tried to delete is not empty. You must delete all versions in the bucket." }],
+        };
+        return { ok: true, error: "", out: "" };
+      }
+      for (const n of Object.keys(w.stacks)) if (w.stacks[n].nested || n === "coderhelm-prod") delete w.stacks[n];
+      for (const n of Object.keys(w.roles)) if (w.roles[n].nested) delete w.roles[n];
+      // KeepDataOnDelete=false: the stack takes its data too (its Sweep and Final).
+      if (keepData === "false") {
+        for (const t of Object.keys(w.tables)) if (w.tables[t][0]?.Value === "coderhelm-prod") delete w.tables[t];
+        delete w.buckets[`coderhelm-prod-data-${A}`];
+      }
+      return { ok: true, error: "", out: "" };
+    }
+    if (svc === "cloudformation" && op === "delete-stack" && w.stacks[args[1]]?.nested) throw new Error(`a part was deleted directly: ${args[1]}`);
+    return write(svc, op, args, region);
+  };
+  return w;
+}
+
+test("leftovers: a native install that still runs is said to be installed, nothing is listed", async () => {
+  const file = cfgDir();
+  const w = nativeWorld({ keepData: "true" });
+  const r = await cli(["leftovers", "--config", file], { aws: w });
+  assert.equal(r.code, 1);
+  assert.match(r.out, /CoderHelm prod in us-east-1 \(111122223333\) is still installed: its stack coderhelm-prod is UPDATE_COMPLETE/);
+  assert.match(r.out, /Delete the stack first/);
+  assert.match(r.out, /KeepDataOnDelete is true: Delete stack keeps the data/);
+  assert.ok(!/pieces? left|^ {2}(table|role|stack|data bucket) /m.test(r.out), r.out);
+  assert.equal(writes(w).length, 0, "read-only");
+});
+
+test("discover: a native install's roles (coderhelm-<stage>-boundary-stack) are this install's", async () => {
+  const w = nativeWorld();
+  const inv = await un.discover(ctxFor(w), un.scopeOf({ stage: "prod", region: R, account: A }));
+  assert.ok(inv.roles.some((r) => r.name === "coderhelm-prod-ServiceRole-1e19356c"), JSON.stringify(inv.skipped));
+  assert.ok(!inv.skipped.some((x) => x.name === "coderhelm-prod-ServiceRole-1e19356c"));
+  assert.equal(inv.root?.name, "coderhelm-prod");
+  assert.equal(inv.root.keepData, false);
+  assert.ok(!inv.stacks.some((s) => s.name === "coderhelm-prod") && !inv.launch.some((l) => l.name === "coderhelm-prod"), "the root is listed apart");
+});
+
+test("leftovers --delete on a running native install: empties the buckets, deletes the stack as one, never a part directly", async () => {
+  const file = cfgDir();
+  const w = nativeWorld({ keepData: "false" });
   const r = await cli(["leftovers", "--delete", "--config", file], { aws: w, interactive: true, ask: quietAsk({ "Type the install name (prod)": "prod" }) });
-  assert.match(String(r.error), /delete it in CloudFormation \(Delete stack\)/);
+  assert.equal(r.code, 0, r.out + String(r.error?.message));
+  const ws = writes(w);
+  const stackDeletes = ws.filter((c) => c.op === "delete-stack").map(target);
+  assert.equal(stackDeletes[0], "coderhelm-prod", "the root first");
+  const emptied = ws.findIndex((c) => c.op === "delete-objects" && target(c) === `coderhelm-prod-data-${A}`);
+  const rootAt = ws.findIndex((c) => c.op === "delete-stack" && target(c) === "coderhelm-prod");
+  assert.ok(emptied >= 0 && emptied < rootAt, "the data bucket's versions go before the stack delete");
+  assert.ok(!Object.keys(w.stacks).some((n) => n.startsWith("coderhelm-prod-") && n !== "coderhelm-prod-eu-api" && n !== "coderhelm-prod-2"), Object.keys(w.stacks).join(","));
+  for (const c of ws) assert.ok(isThisInstalls(target(c)) || c.op === "delete-event-source-mapping", `${c.svc} ${c.op} ${target(c)}`);
+  const after = await cli(["leftovers", "--config", file], { aws: w });
+  assert.match(after.out, /nothing left/, after.out);
+});
+
+test("leftovers --delete picks up a partial delete: root still there, a part DELETE_FAILED on a bucket with versions", async () => {
+  const file = cfgDir();
+  // What a real run left: Database and Api gone, Storage DELETE_FAILED, the root UPDATE_COMPLETE.
+  const w = nativeWorld({ keepData: "false", parts: ["Storage"], partStatus: { Storage: "DELETE_FAILED" } });
+  const r = await cli(["leftovers", "--delete", "--config", file], { aws: w, interactive: true, ask: quietAsk({ "Type the install name (prod)": "prod" }) });
+  assert.equal(r.code, 0, r.out + String(r.error?.message));
+  assert.ok(!w.stacks["coderhelm-prod"], "the root is gone");
+  assert.ok(!w.buckets[`coderhelm-prod-data-${A}`], "the data bucket is gone");
+});
+
+test("leftovers --delete: when the stack refuses, the part's own reason is shown and the data is left for the next run", async () => {
+  const file = cfgDir();
+  const w = nativeWorld({ keepData: "false" });
+  // Something refuses to empty the data bucket: the stack delete fails on Storage, as on a real install.
+  const write = w.write;
+  w.write = async (svc, op, args, region) => (svc === "s3api" && op === "delete-objects" ? (w.calls.push({ kind: "write", svc, op, args, region }), { ok: false, error: "AccessDenied" }) : write(svc, op, args, region));
+  const r = await cli(["leftovers", "--delete", "--config", file], { aws: w, interactive: true, ask: quietAsk({ "Type the install name (prod)": "prod" }) });
+  assert.equal(r.code, 1);
+  assert.match(String(r.error?.message), /Storage: DataBucketE3889A50: The bucket you tried to delete is not empty/);
+  assert.ok(!writes(w).some((c) => c.op === "delete-table"), "no data deleted by name while the stack is still there");
+  assert.match(String(r.error?.message), /picks up where it stopped/);
+});
+
+test("uninstall (keep my data) refuses a native stack whose KeepDataOnDelete=false would delete the data", async () => {
+  const file = cfgDir();
+  const w = nativeWorld({ keepData: "false" });
+  const r = await cli(["uninstall", "--config", file, "--yes"], { aws: w });
+  assert.match(String(r.error), /KeepDataOnDelete=false, so deleting it deletes the data too/);
   assert.equal(writes(w).length, 0);
+});
+
+test("uninstall --everything on a native stack that keeps its data: the stack goes, then the data by name", async () => {
+  const file = cfgDir();
+  const w = nativeWorld({ keepData: "true" });
+  const r = await cli(["uninstall", "--everything", "--config", file, "--yes"], { aws: w });
+  assert.equal(r.code, 0, r.out + String(r.error?.message));
+  assert.match(r.out, /It keeps the data \(KeepDataOnDelete=true\); that is then deleted by name/);
+  assert.ok(!Object.keys(w.tables).some((t) => w.tables[t][0]?.Value === "coderhelm-prod"), "tables deleted by name");
+  assert.ok(!w.buckets[`coderhelm-prod-data-${A}`]);
+  assert.ok(!w.secrets.includes("coderhelm/prod/secrets"));
+});
+
+test("uninstall (keep my data) on a native stack that keeps its data: the stack goes, the data stays", async () => {
+  const file = cfgDir();
+  const w = nativeWorld({ keepData: "true" });
+  const r = await cli(["uninstall", "--config", file, "--yes"], { aws: w });
+  assert.equal(r.code, 0, r.out + String(r.error?.message));
+  assert.ok(!w.stacks["coderhelm-prod"]);
+  assert.ok(w.tables["coderhelm-prod-runs"] && w.buckets[`coderhelm-prod-data-${A}`]?.objects === 5 && w.secrets.includes("coderhelm/prod/secrets"), "data kept, the data bucket not even emptied");
+});
+
+test("leftovers: a native stack that failed to delete is a leftover (listed), not an install", async () => {
+  const file = cfgDir();
+  const w = nativeWorld({ status: "DELETE_FAILED" });
+  const r = await cli(["leftovers", "--config", file], { aws: w });
+  assert.match(r.out, /^ {2}Launch Stack +coderhelm-prod$/m, r.out);
+  assert.ok(!/still installed/.test(r.out));
 });
 
 /** A native install deleted with auto-update on: its auto-update role and that role's boundary are kept. */

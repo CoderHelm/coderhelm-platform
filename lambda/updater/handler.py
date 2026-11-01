@@ -1498,6 +1498,65 @@ def is_native(env):
     return bool(env.get("NATIVE_STACK"))
 
 
+# ── Uninstall: keep the data, or delete everything ──────────────────────────
+#
+# The admin's choice for when the install's stack is deleted (Settings,
+# System, Uninstall). It lives in an SSM parameter the parent's helper reads
+# on a stack delete (lambda/native-helper: Sweep and Final), so it takes
+# effect without a stack update. Missing means keep.
+
+def uninstall_parameter(env):
+    prefix = env.get("RESOURCE_PREFIX") or ""
+    if not re.fullmatch(r"coderhelm-[a-z][a-z0-9-]{0,19}", prefix):
+        return None
+    return f"/{prefix}/uninstall/delete-data"
+
+
+def uninstall_status(store, env, ssm=None):
+    name = uninstall_parameter(env)
+    if not name or not is_native(env):
+        return None
+    try:
+        value = (ssm or client("ssm")).get_parameter(Name=name)["Parameter"]["Value"]
+    except Exception as e:
+        if "ParameterNotFound" not in type(e).__name__ + str(e):
+            logger.warning(f"Uninstall switch not read: {e}")
+        value = ""
+    rec = store.get("UNINSTALL", {}) or {}
+    return {"delete_data": value == "delete", "changed_by": rec.get("actor"), "changed_at": rec.get("at")}
+
+
+def set_uninstall_mode(store, env, now, event, ssm=None):
+    """Turns "delete everything when uninstalled" on or off. On needs the
+    install's name typed back (confirm). Every change is recorded with who
+    and when (UNINSTALL_LOG keeps the last 20)."""
+    name = uninstall_parameter(env)
+    if not name or not is_native(env):
+        return {"ok": False, "error": "only a one-stack install has this switch"}
+    delete = event.get("delete_data")
+    if not isinstance(delete, bool):
+        return {"ok": False, "error": "delete_data must be true or false"}
+    stage = name.split("/")[1][len("coderhelm-"):]
+    if delete and str(event.get("confirm") or "").strip() != stage:
+        return {"ok": False, "error": f"type the install's name ({stage}) to confirm"}
+    ssm = ssm or client("ssm")
+    if delete:
+        ssm.put_parameter(Name=name, Value="delete", Type="String", Overwrite=True,
+                          Description="CoderHelm: delete the install's data when its stack is deleted (Settings, System, Uninstall)")
+    else:
+        try:
+            ssm.delete_parameter(Name=name)
+        except Exception as e:
+            if "ParameterNotFound" not in type(e).__name__ + str(e):
+                raise
+    actor = event.get("actor") or "unknown"
+    rec = {"delete_data": delete, "actor": actor, "at": now.isoformat()}
+    store.put("UNINSTALL", rec)
+    store.put("UNINSTALL_LOG", ([rec] + (store.get("UNINSTALL_LOG", []) or []))[:20])
+    logger.info(f"Uninstall switch: delete_data={delete} by {actor}")
+    return {"ok": True, "uninstall": uninstall_status(store, env, ssm)}
+
+
 def native_template_url(env, version):
     base = (env.get("NATIVE_TEMPLATE_BASE") or f"https://{NATIVE_HOST}/launch").rstrip("/")
     return f"{base}/{version}/{env.get('NATIVE_TEMPLATE_FILE') or 'coderhelm.json'}"
@@ -2009,7 +2068,12 @@ def handle(event, env, store, now, fetch=fetch_releases, probe=None):
             "install": install_identity(env),
             # A native install: the stack, and the change set an admin reviews.
             "native": native_status(store, env, state) if is_native(env) else None,
+            # What happens to the data when the stack is deleted (Settings, System, Uninstall).
+            "uninstall": uninstall_status(store, env),
         }
+
+    if action == "uninstall_mode":
+        return set_uninstall_mode(store, env, now, event)
 
     if action == "settings":
         new = validate_settings(event.get("settings"), settings)

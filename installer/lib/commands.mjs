@@ -751,9 +751,10 @@ export async function migrate(ctx) {
  * `leftovers`: after Delete stack, anything still named or tagged for the
  * install in this region (read-only): what KeepDataOnDelete kept, what an
  * earlier failed install left (two user pools of the same name are both
- * listed), the auto-update role. `--delete` removes them, one by one, after
- * the typed name, with every reason printed; never while the install's
- * stack exists.
+ * listed), the auto-update role. While the install's stack still runs it
+ * says so and lists nothing. `--delete`, after the typed name, deletes the
+ * stack first if it is still there (as one, never part by part), then
+ * removes what is left one by one, with every reason printed.
  */
 export async function leftovers(ctx) {
   const flags = ctx.flags;
@@ -790,10 +791,17 @@ export async function uninstall(ctx) {
   const account = cfg?.account ?? (await ctx.aws.read("sts", "get-caller-identity", []))?.Account;
   const scope = un.scopeOf({ stage, region, account });
   const inv = await un.discover(ctx, scope, { mode, installStatus: typeof flags.installStatus === "string" ? flags.installStatus : "", fetchImpl: ctx.fetchImpl });
-  // A native install is one stack: Delete stack removes it; this never takes it apart by name.
-  const parent = inv.stacks.find((x) => x.name === scope.prefix);
-  if (parent && !flags.verify) {
-    throw new Error(`${scope.prefix} is a CloudFormation stack: delete it in CloudFormation (Delete stack). "leftovers" then lists, and with --delete removes, anything it left.`);
+  // A native install is one stack: while it runs, nothing of it is a leftover.
+  const running = un.runningRoot(inv);
+  if (running && flags.verify) {
+    log(`\nCoderHelm ${stage} in ${region} (${account}) is still installed: its stack ${running.name} is ${running.status}.`);
+    log(`Delete the stack first (CloudFormation, Delete stack), or run "leftovers --delete" to delete it and everything it leaves.`);
+    log(running.keepData ? "Its KeepDataOnDelete is true: Delete stack keeps the data (tables, data bucket, KMS keys, user pool, secret)." : "Its KeepDataOnDelete is false: Delete stack deletes the data too.");
+    return 1;
+  }
+  // Remove CoderHelm but keep the data, while the stack itself says to delete the data: never silently.
+  if (inv.root && mode === "keep" && !inv.root.keepData && !flags.verify) {
+    throw new Error(`${inv.root.name} has KeepDataOnDelete=false, so deleting it deletes the data too. Run "uninstall --everything" (or "leftovers --delete") to confirm, or set KeepDataOnDelete back to true first.`);
   }
 
   if (flags.verify) {
@@ -814,6 +822,9 @@ export async function uninstall(ctx) {
   }
   log(`\nThis removes CoderHelm ${stage} from ${account} in ${region}:`);
   logByKind(log, p.remove);
+  if (inv.root) {
+    log(`\nIts stack ${inv.root.name} is deleted first, as one: its parts go with it, in order.${mode === "everything" && inv.root.keepData ? " It keeps the data (KeepDataOnDelete=true); that is then deleted by name." : ""}`);
+  }
   if (p.keep.length) {
     log("\nKept (your data; uninstall --everything deletes it too):");
     logByKind(log, p.keep);

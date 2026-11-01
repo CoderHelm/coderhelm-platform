@@ -14,9 +14,12 @@
 //   - this region only (IAM pieces by their Launch Stack id, found here).
 //
 // Order: hybrid first (release the name, hand GitHub and Jira back), then
-// the stacks through the install's deploy role (dependents first), then
-// the data (delete everything only), then the Launch Stack, then what is
-// left by name, then a read-only check of anything still there.
+// a native install's own stack (coderhelm-<stage>: its custom resources
+// empty the buckets and take the data when KeepDataOnDelete=false, and it
+// deletes its parts in order), or an older install's stacks through its
+// deploy role (dependents first), then the data (delete everything only),
+// then the Launch Stack, then what is left by name, then a read-only check
+// of anything still there. Running it again picks up from any partial state.
 import { leaveHybrid, registration, DEFAULT_HOSTED_URL, signRequest } from "./hybrid.mjs";
 import { Runner } from "./runner.mjs";
 
@@ -253,6 +256,13 @@ export async function discover(ctx, base, { mode = "keep", installStatus = "", o
     }
   }
   const boundaryArns = new Set(inv.boundaries.map((b) => b.arn));
+  // A native install's roles carry coderhelm-<stage>-boundary-stack (or the auto-update role's
+  // -deploy-boundary-stack copy): this install's while its stack is in this region, or once it
+  // is deleted and the kept role trusts this region's stack.
+  const rootHere = described.find((x) => x.d.StackName === P && ("KeepDataOnDelete" in x.params || !isLaunch(x.params)));
+  const nativeBoundaryArns = new Set(rootHere || nativeAnchored
+    ? policies.filter((x) => x.PolicyName === `${P}-boundary-stack` || x.PolicyName === `${P}-deploy-boundary-stack`).map((x) => x.Arn)
+    : []);
   for (const r of await pages(aws, "iam", "list-roles", [], "Roles")) {
     if (!isOurName(scope, r.RoleName)) continue;
     const g = (await aws.read("iam", "get-role", ["--role-name", r.RoleName]))?.Role;
@@ -261,15 +271,29 @@ export async function discover(ctx, base, { mode = "keep", installStatus = "", o
     const boundary = g.PermissionsBoundary?.PermissionsBoundaryArn ?? null;
     const byId = inv.ids.some((id) => r.RoleName.endsWith(`-${id}`));
     // IAM is global: a role is this install's only by a boundary or a Launch Stack id found in this region, never by its tag alone.
-    if ((boundary && boundaryArns.has(boundary)) || byId) {
+    if ((boundary && (boundaryArns.has(boundary) || nativeBoundaryArns.has(boundary))) || byId) {
       inv.roles.push({ name: r.RoleName, boundary, tagged: tag === P });
     } else inv.skipped.push({ kind: "role", name: r.RoleName, why: tag && tag !== P ? `tagged for ${tag}` : "carries none of this region's install boundaries" });
   }
   // Something of the install must be in this region (a Launch Stack, its tag or its secret) before anything is removed.
   // CloudFront and Route 53 are global: in us-east-1 they show for any region's install, so they don't count.
   const regional = inv.tagged.some((a) => a.includes(`:${region}:`));
-  inv.anchored = inv.launch.length > 0 || regional || inv.secrets.length > 0 || nativeAnchored;
+  // A native install's own stack, coderhelm-<stage> (its parts are its nested stacks): removed
+  // as one, never taken apart, so it is listed apart from the Launch Stacks and the parts.
+  inv.root = rootHere
+    ? { name: P, status: rootHere.d.StackStatus, keepData: String(rootHere.params.KeepDataOnDelete ?? "true").toLowerCase() !== "false", roleArn: rootHere.d.RoleARN ?? null }
+    : null;
+  if (inv.root) {
+    inv.launch = inv.launch.filter((l) => l.name !== P);
+    inv.stacks = inv.stacks.filter((s) => s.name !== P);
+  }
+  inv.anchored = inv.launch.length > 0 || !!inv.root || regional || inv.secrets.length > 0 || nativeAnchored;
   return inv;
+}
+
+/** A native install's stack that still runs (not being deleted, not failed to delete): nothing of it is a leftover. */
+export function runningRoot(inv) {
+  return inv.root && !String(inv.root.status).startsWith("DELETE_") ? inv.root : null;
 }
 
 /** The install guide's progress file says it is this install's (it is public). */
@@ -292,6 +316,7 @@ export function plan(inv) {
   const keep = [];
   const data = inv.mode === "everything";
   const add = (kind, name, isData = false) => (isData && !data ? keep : remove).push({ kind, name });
+  if (inv.root) add("Launch Stack", inv.root.name);
   for (const s of inv.stacks) add("stack", s.name);
   for (const l of inv.launch) add("Launch Stack", l.name);
   for (const t of inv.tables) add("table", t.name, true);
@@ -335,6 +360,23 @@ export async function stackWaves(aws, stacks) {
   return waves.map((w) => w.map((n) => stacks.find((s) => s.name === n)));
 }
 
+/**
+ * Why a stack's delete failed: its first DELETE_FAILED with a reason, and
+ * for a nested part that failed, that part's own first failure (which
+ * names the resource and AWS's reason, like a bucket with versions left).
+ */
+async function deleteFailure(aws, events, name) {
+  const failedEv = events.find((e) => e.ResourceStatus === "DELETE_FAILED" && e.LogicalResourceId !== name && !/cancelled/i.test(e.ResourceStatusReason ?? ""))
+    ?? events.find((e) => e.ResourceStatus === "DELETE_FAILED");
+  const why = failedEv?.ResourceStatusReason ?? "DELETE_FAILED";
+  if (failedEv?.ResourceType === "AWS::CloudFormation::Stack" && failedEv.PhysicalResourceId) {
+    const inner = (await aws.read("cloudformation", "describe-stack-events", ["--stack-name", failedEv.PhysicalResourceId]))?.StackEvents ?? [];
+    const e = inner.find((x) => x.ResourceStatus === "DELETE_FAILED" && x.ResourceType !== "AWS::CloudFormation::Stack");
+    if (e) return `${failedEv.LogicalResourceId}: ${e.LogicalResourceId}: ${e.ResourceStatusReason ?? "DELETE_FAILED"}`;
+  }
+  return why;
+}
+
 async function waitGone(ctx, names, onTick) {
   if (ctx.aws.dryRun) return {};
   const failed = {};
@@ -345,7 +387,7 @@ async function waitGone(ctx, names, onTick) {
       if (!d || d.StackStatus === "DELETE_COMPLETE") left.delete(n);
       else if (d.StackStatus === "DELETE_FAILED") {
         const ev = (await ctx.aws.read("cloudformation", "describe-stack-events", ["--stack-name", n]))?.StackEvents ?? [];
-        failed[n] = ev.find((e) => e.ResourceStatus === "DELETE_FAILED")?.ResourceStatusReason ?? "DELETE_FAILED";
+        failed[n] = await deleteFailure(ctx.aws, ev, n);
         left.delete(n);
       }
     }
@@ -409,7 +451,8 @@ async function emptyBucket(aws, bucket) {
  * `onStep` gets each phase for the progress file. Never throws for one
  * resource: each refusal is listed and the rest goes on.
  */
-export async function remove(ctx, inv, { onStep = async () => {}, hybrid = null } = {}) {
+export async function remove(ctx, inv0, { onStep = async () => {}, hybrid = null } = {}) {
+  let inv = inv0;
   const aws = ctx.aws;
   const { scope } = inv;
   const everything = inv.mode === "everything";
@@ -427,7 +470,35 @@ export async function remove(ctx, inv, { onStep = async () => {}, hybrid = null 
   // 1. Hybrid: release the name, hand GitHub and Jira back to CoderHelm, revoke the broker key.
   if (hybrid) report.hybrid = await hybrid(onStep);
 
-  // 2. The stacks, through the install's deploy role, dependents first.
+  // 2a. A native install: its own stack, as one. With "everything", every bucket of the install is
+  //     emptied first (CloudFormation refuses a bucket with object versions left); the data bucket
+  //     only then, never when data is kept. The parts go with the stack, in its order.
+  if (inv.root) {
+    for (const b of inv.buckets) {
+      if (b.kind === "progress bucket" || (b.kind === "data bucket" && !everything)) continue;
+      if (!(await emptyBucket(aws, b.name))) fail(b.kind, b.name, "could not empty it");
+    }
+    const args = ["--stack-name", inv.root.name];
+    if (inv.root.roleArn) args.push("--role-arn", inv.root.roleArn);
+    await onStep({ phase: "stacks", message: `Deleting ${inv.root.name}`, step: 0, steps: 1 });
+    const res = await aws.write("cloudformation", "delete-stack", args);
+    if (!res.ok) {
+      fail("Launch Stack", inv.root.name, res.error);
+      return report;
+    }
+    const failed = await waitGone(ctx, [inv.root.name], () => onStep({ phase: "stacks", message: `Waiting for ${inv.root.name} and its parts`, step: 0, steps: 1 }));
+    if (failed[inv.root.name]) {
+      // Its first failure, with AWS's reason: deleting it again (running this again) picks up there.
+      fail("Launch Stack", inv.root.name, failed[inv.root.name]);
+      return report;
+    }
+    gone("Launch Stack", inv.root.name);
+    // What the stack kept (its data with KeepDataOnDelete=true) and anything it left, found again.
+    const after = await discover(ctx, { ...scope, siblings: inv.scope.siblings }, { mode: inv.mode, installStatus: ctx.installStatus ?? "", ownStatus: ctx.ownStatus ?? "", strictTags: !!ctx.guided, fetchImpl: ctx.fetchImpl });
+    inv = { ...after, launch: after.launch };
+  }
+
+  // 2b. An older install's stacks, through its deploy role, dependents first.
   const waves = await stackWaves(aws, inv.stacks);
   const total = inv.stacks.length;
   let done = 0;

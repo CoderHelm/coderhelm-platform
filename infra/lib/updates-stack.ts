@@ -562,6 +562,13 @@ function nativeUpdates(scope: Construct, cfg: ResolvedConfig, fn: lambda.Functio
   const parts = `arn:${stack.partition}:cloudformation:${stack.region}:${stack.account}:stack/${rootName}-*/*`;
   const deployRole = cfg.access!.deployRoleArn.replace(/^arn:aws:/, `arn:${stack.partition}:`);
   fn.addEnvironment("NATIVE_STACK", rootName);
+  // The admin's "delete everything when uninstalled" switch (Settings, System, Uninstall): the updater
+  // writes it, the parent's helper reads it on a stack delete (lambda/native-helper).
+  fn.addToRolePolicy(new iam.PolicyStatement({
+    sid: "UninstallSwitch",
+    actions: ["ssm:GetParameter", "ssm:PutParameter", "ssm:DeleteParameter"],
+    resources: [`arn:${stack.partition}:ssm:${stack.region}:${stack.account}:parameter/${cfg.prefix}/uninstall/delete-data`],
+  }));
   fn.addEnvironment("NATIVE_TEMPLATE_BASE", NATIVE_TEMPLATE_BASE);
   fn.addEnvironment("NATIVE_TEMPLATE_FILE", NATIVE_TEMPLATE_FILE);
   // "" while auto-update is off (the role exists only with AutoUpdate=on).

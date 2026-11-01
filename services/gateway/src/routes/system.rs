@@ -152,6 +152,49 @@ pub async fn set_auto_update(
     answer(body)
 }
 
+/// What a request may send to the uninstall switch: `delete_data` (true or
+/// false) and, to turn it on, `confirm` (the install's name typed back).
+pub fn uninstall_mode_from(body: &Value) -> Result<(bool, String), &'static str> {
+    let Some(delete) = body.get("delete_data").and_then(Value::as_bool) else {
+        return Err("send delete_data: true or false");
+    };
+    let confirm = body
+        .get("confirm")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim()
+        .chars()
+        .take(40)
+        .collect::<String>();
+    if delete && confirm.is_empty() {
+        return Err("type the install's name to confirm");
+    }
+    Ok((delete, confirm))
+}
+
+/// PUT /api/system/uninstall-mode: what happens to the data when the
+/// install's stack is deleted: kept (the default) or deleted with it. The
+/// updater checks the typed name, stores the switch where the stack's own
+/// delete reads it, and records who changed it and when.
+pub async fn set_uninstall_mode(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<Claims>,
+    Json(body): Json<Value>,
+) -> Reply {
+    claims.require_role(3).map_err(status_only)?;
+    allowed(&claims).map_err(status_only)?;
+    let (delete, confirm) = uninstall_mode_from(&body)
+        .map_err(|m| (StatusCode::BAD_REQUEST, Json(json!({ "error": m }))))?;
+    warn!(email = %claims.email, delete_data = delete, "Uninstall switch change requested");
+    let body = call(
+        &state,
+        json!({ "action": "uninstall_mode", "delete_data": delete, "confirm": confirm, "actor": claims.email }),
+    )
+    .await
+    .map_err(status_only)?;
+    answer(body)
+}
+
 /// POST /api/system/update: update to `version` (default: the latest).
 /// The updater checks every model the release calls first and refuses
 /// while one is refused; `skip_check` passes only a failure on a model the
@@ -361,6 +404,26 @@ pub fn short_reason(raw: &str) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn uninstall_switch_needs_a_bool_and_the_typed_name_to_turn_on() {
+        assert_eq!(
+            uninstall_mode_from(&json!({"delete_data": false})),
+            Ok((false, String::new()))
+        );
+        assert_eq!(
+            uninstall_mode_from(&json!({"delete_data": true, "confirm": " prod "})),
+            Ok((true, "prod".into()))
+        );
+        assert_eq!(
+            uninstall_mode_from(&json!({"delete_data": true})),
+            Err("type the install's name to confirm")
+        );
+        assert_eq!(
+            uninstall_mode_from(&json!({"delete_data": "yes"})),
+            Err("send delete_data: true or false")
+        );
+    }
 
     #[test]
     fn only_known_settings_pass() {

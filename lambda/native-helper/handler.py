@@ -21,11 +21,15 @@ Resource types (event["ResourceType"]):
                          URL); on a failed create, CloudFormation's own reason.
   Custom::HybridLeave    on stack delete, releases the CoderHelm address and
                          links of a registered install.
-  Custom::Sweep          on stack delete with KeepDataOnDelete=false (or a
-                         rolled-back first launch): empties the data buckets,
-                         and deletes the tables itself, retrying and waiting,
-                         so CloudFormation's GlobalTable delete finds nothing
-                         left to fail on.
+  Custom::Sweep          on stack delete with KeepDataOnDelete=false, or with
+                         the admin's "delete everything" switch on (Settings,
+                         System, Uninstall), or a rolled-back first launch:
+                         empties the data buckets, and deletes the tables
+                         itself, retrying and waiting, so CloudFormation's
+                         GlobalTable delete finds nothing left to fail on.
+                         With the switch on and KeepDataOnDelete=true the
+                         stack retains its data, so it also deletes the data
+                         bucket and the user pool itself.
   Custom::Final          deleted after every part: the certificates the updater
                          requested for this install (and their validation
                          records); the exact log groups the parts declare
@@ -33,7 +37,11 @@ Resource types (event["ResourceType"]):
                          arrive after CloudFormation deleted it); with
                          KeepDataOnDelete=false, the other log groups Lambda
                          made by itself, and the install's secret (after
-                         HybridLeave and SetupKey, which read it).
+                         HybridLeave and SetupKey, which read it). With the
+                         switch on and KeepDataOnDelete=true (the stack
+                         retains its keys), schedules the install's KMS keys
+                         for deletion (AWS's 7 days) and removes their
+                         aliases; on every stack delete, the switch itself.
 
 Called directly (not by CloudFormation), {"action": "stage", "version",
 "template_sha256"} from the updater: copies that release's child templates
@@ -136,15 +144,47 @@ def tearing_down(props, cfn=None, stack=None):
     return None
 
 
-def keep_data(props, cfn=None, stack=None):
+def stack_keeps_data(props, stack):
     """KeepDataOnDelete as the root stack itself has it (never only what the
-    event says): data and the secret go only when the stack says false."""
-    stack = stack if stack is not None else root_stack(props, cfn)
-    if not stack:
-        return True  # unreadable: keep
+    event says)."""
     params = {p.get("ParameterKey"): p.get("ParameterValue") for p in stack.get("Parameters") or []}
     value = params["KeepDataOnDelete"] if "KeepDataOnDelete" in params else props.get("KeepData", "true")
     return str(value).lower() != "false"
+
+
+def delete_switch(props, ssm=None):
+    """The admin's "delete everything when uninstalled" switch (Settings,
+    System, Uninstall; the updater writes it): True only when the
+    parameter says "delete". Missing or unreadable: keep."""
+    name = props.get("DeleteSwitch")
+    if not name:
+        return False
+    try:
+        value = (ssm or client("ssm")).get_parameter(Name=name)["Parameter"]["Value"]
+    except Exception as e:
+        if "ParameterNotFound" not in type(e).__name__ + str(e):
+            log("could not read the uninstall switch (data is kept):", e)
+        return False
+    return str(value).strip().lower() == "delete"
+
+
+def keep_data(props, cfn=None, stack=None, ssm=None):
+    """Whether the data stays: data and the secret go only when the stack
+    says KeepDataOnDelete=false or the admin turned the switch on."""
+    stack = stack if stack is not None else root_stack(props, cfn)
+    if not stack:
+        return True  # unreadable: keep
+    if not stack_keeps_data(props, stack):
+        return False
+    return not delete_switch(props, ssm)
+
+
+def retained_but_deleted(props, cfn=None, stack=None, ssm=None):
+    """The switch says delete while the stack keeps its data (its
+    DeletionPolicy retains the tables, buckets, keys and user pool): the
+    helper deletes what CloudFormation will leave."""
+    stack = stack if stack is not None else root_stack(props, cfn)
+    return bool(stack) and stack_keeps_data(props, stack) and delete_switch(props, ssm)
 
 
 def first_failure(root, cfn=None):
@@ -356,6 +396,77 @@ def empty_bucket(bucket, s3=None):
         raise
     log("emptied", bucket, f"({removed} objects)")
     return removed
+
+
+def delete_bucket(bucket, s3=None):
+    """Empties and deletes a bucket the stack retains; one already gone is fine."""
+    s3 = s3 or client("s3")
+    empty_bucket(bucket, s3=s3)
+    try:
+        s3.delete_bucket(Bucket=bucket)
+        log("deleted bucket", bucket)
+        return True
+    except Exception as e:
+        if "NoSuchBucket" in type(e).__name__ + str(e):
+            return False
+        raise
+
+
+def delete_user_pool(pool_id, cognito=None):
+    """The install's user pool the stack retains: deletion protection off,
+    its domains removed, then the pool. Only a pool tagged for this install
+    (the role's policy says so too); one already gone is fine."""
+    cognito = cognito or client("cognito-idp")
+    try:
+        p = cognito.describe_user_pool(UserPoolId=pool_id)["UserPool"]
+    except Exception as e:
+        if "ResourceNotFound" in type(e).__name__ + str(e):
+            return False
+        raise
+    if p.get("DeletionProtection") == "ACTIVE":
+        cognito.update_user_pool(UserPoolId=pool_id, DeletionProtection="INACTIVE")
+    for d in [p.get("Domain"), p.get("CustomDomain")]:
+        if d:
+            cognito.delete_user_pool_domain(Domain=d, UserPoolId=pool_id)
+    cognito.delete_user_pool(UserPoolId=pool_id)
+    log("deleted user pool", pool_id)
+    return True
+
+
+def schedule_keys(alias_prefix, kms=None, days=7):
+    """The install's KMS keys (behind its aliases alias/coderhelm-<stage>-...)
+    scheduled for deletion after AWS's shortest wait, and their aliases
+    removed. A key already pending deletion is left as it is."""
+    kms = kms or client("kms")
+    done, problems = [], []
+    if not str(alias_prefix).startswith("alias/coderhelm-"):
+        return done, [f"{alias_prefix}: not an install's aliases"]
+    for page in kms.get_paginator("list_aliases").paginate():
+        for a in page.get("Aliases") or []:
+            name = a.get("AliasName", "")
+            if not name.startswith(alias_prefix) or not a.get("TargetKeyId"):
+                continue
+            try:
+                kms.delete_alias(AliasName=name)
+                kms.schedule_key_deletion(KeyId=a["TargetKeyId"], PendingWindowInDays=days)
+                done.append(name)
+                log("scheduled for deletion:", name)
+            except Exception as e:
+                if "KMSInvalidState" in type(e).__name__ + str(e):
+                    continue
+                problems.append(f"key {name}: {e}")
+    return done, problems
+
+
+def delete_switch_parameter(name, ssm=None):
+    if not name:
+        return
+    try:
+        (ssm or client("ssm")).delete_parameter(Name=name)
+        log("removed the uninstall switch")
+    except Exception as e:
+        if "ParameterNotFound" not in type(e).__name__ + str(e):
+            log("uninstall switch left:", e)
 
 
 # ── Tables ─────────────────────────────────────────────────────────────────
@@ -691,6 +802,18 @@ def handle(event, context=None):
         remaining = (context.get_remaining_time_in_millis() / 1000.0 - 60) if context else 600
         left = delete_tables(props.get("Tables") or [], deadline=time.monotonic() + max(30, remaining))
         problems += [f"table {n}: {why}" for n, why in left.items()]
+        if mode == "delete" and retained_but_deleted(props, stack=stack):
+            # The stack retains these (KeepDataOnDelete=true): the switch says they go.
+            for b in props.get("Buckets") or []:
+                try:
+                    delete_bucket(b)
+                except Exception as e:
+                    problems.append(f"bucket {b}: {e}")
+            if props.get("UserPoolId"):
+                try:
+                    delete_user_pool(props["UserPoolId"])
+                except Exception as e:
+                    problems.append(f"user pool: {e}")
         if problems:
             # Delete the stack again to retry: CloudFormation picks up where it stopped.
             return "FAILED", "not removed yet: " + "; ".join(problems), {}
@@ -713,12 +836,17 @@ def handle(event, context=None):
             tagged, more = delete_log_groups(props.get("LogGroupPrefixes") or [], tag=props["Prefix"])
             groups += tagged
             problems += more
+        if mode == "delete" and props.get("KeyAliasPrefix") and retained_but_deleted(props, stack=stack):
+            keys, more = schedule_keys(props["KeyAliasPrefix"])
+            problems += more
         secret = ""
         if mode == "delete" and not keep_data(props, stack=stack) and props.get("SecretId"):
             try:
                 secret = " and the install's secret" if delete_secret(props["SecretId"]) else ""
             except Exception as e:
                 problems.append(f"secret: {e}")
+        if mode == "delete" and not problems:
+            delete_switch_parameter(props.get("DeleteSwitch"))
         msg = f"deleted {len(certs)} certificates and {len(groups)} log groups{secret}"
         if problems:
             return "FAILED", msg + "; not removed: " + "; ".join(problems), {}
