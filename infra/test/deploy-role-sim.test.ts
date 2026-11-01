@@ -48,7 +48,7 @@ const REFUSED: Record<string, { verdict: Verdict; why: string }> = {
   "iam:DeleteRolePermissionsBoundary": { verdict: "explicitDeny", why: "every role keeps the boundary; CloudFormation calls this only when a template drops a role's PermissionsBoundary, which the boundary forbids" },
   "kms:DisableKey": { verdict: "explicitDeny", why: "only for a key with Enabled: false; CoderHelm never disables its keys" },
   "kms:ScheduleKeyDeletion": { verdict: "explicitDeny", why: "every key is DeletionPolicy and UpdateReplacePolicy Retain, so CloudFormation never deletes one" },
-  "iam:CreateServiceLinkedRole": { verdict: "implicitDeny", why: "DynamoDB's replication role is for replicas in other regions (one region here); Cognito's email role is for SES email (the pools use Cognito's own email)" },
+  "iam:CreateServiceLinkedRole": { verdict: "explicitDeny", why: "DynamoDB's replication role is for replicas in other regions (one region here); Cognito's email role is for SES email (the pools use Cognito's own email)" },
   "cloudfront:CreateConnectionGroup": { verdict: "implicitDeny", why: "only for a distribution in a connection group (multi-tenant); CoderHelm's distribution is a plain one" },
   "cloudwatch:PutMetricData": { verdict: "implicitDeny", why: "the global table handler's own metrics; real installs created every table without it" },
   "logs:CreateLogDelivery": { verdict: "implicitDeny", why: "only for a log group delivery configuration; none is set" },

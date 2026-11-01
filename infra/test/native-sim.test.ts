@@ -27,7 +27,7 @@ const REFUSED: Record<string, Verdict> = {
   "iam:DeleteRolePermissionsBoundary": "explicitDeny", // every role keeps the boundary
   "kms:DisableKey": "explicitDeny", // it never disables a key
   "kms:ScheduleKeyDeletion": "explicitDeny", // it never deletes data
-  "iam:CreateServiceLinkedRole": "implicitDeny", // no replicas in other regions, no SES email for Cognito
+  "iam:CreateServiceLinkedRole": "explicitDeny", // no replicas in other regions, no SES email for Cognito
   "secretsmanager:CreateSecret": "implicitDeny", // the secret is made at launch with the admin's permissions
   "secretsmanager:DeleteSecret": "implicitDeny", // it never deletes data
   "secretsmanager:ReplicateSecretToRegions": "implicitDeny",
