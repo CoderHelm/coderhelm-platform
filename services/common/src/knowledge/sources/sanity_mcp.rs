@@ -692,6 +692,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn the_picker_reads_sanitys_own_xml_answers() {
+        use super::super::mcp::tests::{SANITY_DATASETS, SANITY_PROJECTS, SANITY_QUERY};
+        let raw = |t: &str| json!({"content": [{"type": "text", "text": t}]});
+        let f = server(move |name, _| {
+            Ok(match name {
+                "list_projects" => raw(SANITY_PROJECTS),
+                "list_datasets" => raw(SANITY_DATASETS),
+                "query_documents" => raw(SANITY_QUERY),
+                _ => unreachable!(),
+            })
+        });
+        let c = SanityMcp {
+            tools: f.clone(),
+            now: 0,
+        };
+        let top = c.browse(None, "").await.unwrap();
+        assert_eq!(
+            top.iter().map(|n| n.id.as_str()).collect::<Vec<_>>(),
+            ["project:abc123", "project:zp7mbokg"]
+        );
+        let searched = c.browse(None, "docs").await.unwrap();
+        assert_eq!(
+            searched.len(),
+            1,
+            "the picker's search reads the same answer"
+        );
+        let ds = c.browse(Some("project:abc123"), "").await.unwrap();
+        assert_eq!(
+            ds.iter().map(|n| n.title.as_str()).collect::<Vec<_>>(),
+            ["production", "staging"]
+        );
+        let types = c.browse(Some(&ds[0].id), "").await.unwrap();
+        assert_eq!(
+            types.iter().map(|n| n.title.as_str()).collect::<Vec<_>>(),
+            ["author", "post"]
+        );
+    }
+
+    #[tokio::test]
     async fn the_first_listing_is_complete_and_pages_by_id() {
         let f = server(|_, args| {
             let q = args["query"].as_str().unwrap();
