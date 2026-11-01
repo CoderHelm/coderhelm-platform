@@ -14,6 +14,7 @@ import * as eventsources from "aws-cdk-lib/aws-lambda-event-sources";
 import * as codebuild from "aws-cdk-lib/aws-codebuild";
 import { Construct } from "constructs";
 import { ResolvedConfig } from "./config";
+import { grantNameRecords } from "./hybrid";
 import { repoPath } from "./paths";
 import * as path from "path";
 import { relaySendStatement } from "./mail-relay";
@@ -46,6 +47,8 @@ interface WorkerStackProps extends cdk.StackProps {
   mcpProxyFunction: lambda.Function;
   encryptionKey: kms.Key;
   secretsKey: kms.Key;
+  /** The hosted side of hybrid: the `{name}.<zone>` zone the name check reads and parks names in. */
+  hybridNames?: { zoneId: string; zoneArn: string; zone: string; fallbackDomain: string };
 }
 
 
@@ -140,6 +143,21 @@ export class WorkerStack extends cdk.Stack {
     });
     for (const st of [...modelPolicyStatements(cfg, this), publicUrlReadStatement(cfg, this), relaySendStatement(cfg, this.account)]) {
       if (st) this.workerFunction.addToRolePolicy(st);
+    }
+
+    // Hosted side of hybrid: the 15-minute name check reads the zone, and
+    // parks a name (its address back to the holding page) with the same
+    // fences the provisioning API has (lib/hybrid.ts).
+    if (props.hybridNames) {
+      const h = props.hybridNames;
+      this.workerFunction.addToRolePolicy(new iam.PolicyStatement({
+        sid: "HybridNameCheckRead",
+        actions: ["route53:ListResourceRecordSets"],
+        resources: [h.zoneArn],
+      }));
+      grantNameRecords(this.workerFunction, h.zoneArn, h.zone);
+      this.workerFunction.addEnvironment("HYBRID_ZONE_ID", h.zoneId);
+      this.workerFunction.addEnvironment("HYBRID_FALLBACK_DOMAIN", h.fallbackDomain);
     }
 
     // DynamoDB: read/write all tables

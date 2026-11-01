@@ -75,6 +75,8 @@ pub const WORKER_MESSAGE_TYPES: &[&str] = &[
     "plugin_sweep",
     "plugin_trigger",
     "plugin_results",
+    // Hybrid names: the 15 minute check (hosted side only).
+    "hybrid_name_check",
 ];
 
 /// Scheduled jobs that act on every team (EventBridge puts them on the ticket
@@ -90,6 +92,7 @@ pub const GLOBAL_MESSAGE_TYPES: &[&str] = &[
     "agent_resume_sweep",
     "knowledge_sync_sweep",
     "plugin_sweep",
+    "hybrid_name_check",
 ];
 
 /// The DLQ keeps a message this long, counted from when it was first sent

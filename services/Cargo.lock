@@ -5577,6 +5577,7 @@ dependencies = [
  "aws-sdk-ecs",
  "aws-sdk-kms",
  "aws-sdk-lambda",
+ "aws-sdk-route53",
  "aws-sdk-s3",
  "aws-sdk-secretsmanager",
  "aws-sdk-sesv2",

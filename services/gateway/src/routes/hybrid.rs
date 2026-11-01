@@ -491,6 +491,7 @@ pub async fn status(
     v["github"] = json!({ "links": links, "app_slug": slug });
     v["jira"] = json!({ "link": super::hybrid_jira::jira_link(&state, &install.id).await });
     v["offered"] = json!(offered_ids(&state));
+    v["name_check"] = name_check_view(&state, &install.name).await;
     Ok(Json(v))
 }
 
@@ -838,6 +839,50 @@ async fn stored_name(state: &AppState, name: &str) -> (Vec<names::NameRecord>, b
         .copied()
         .unwrap_or(false);
     (recs, pending)
+}
+
+/// The 15-minute name check's last result for a name (worker
+/// hybrid_name_check): its state, and when parked, why and when, in plain
+/// words. Null when the name hasn't been checked yet.
+pub(crate) async fn name_check_view(state: &AppState, name: &str) -> Value {
+    if name.is_empty() {
+        return Value::Null;
+    }
+    let Some(i) = state
+        .dynamo
+        .get_item()
+        .table_name(&state.config.settings_table_name)
+        .key("pk", s(&format!("HYBRIDNAME#{name}")))
+        .key("sk", s("NAME"))
+        .send()
+        .await
+        .ok()
+        .and_then(|r| r.item().cloned())
+    else {
+        return Value::Null;
+    };
+    let g = |k: &str| {
+        i.get(k)
+            .and_then(|v| v.as_s().ok())
+            .cloned()
+            .unwrap_or_default()
+    };
+    if g("checked_at").is_empty() {
+        return Value::Null;
+    }
+    let parked = i
+        .get("parked")
+        .and_then(|v| v.as_bool().ok())
+        .copied()
+        .unwrap_or(false);
+    json!({
+        "state": g("check_state"),
+        "checked_at": g("checked_at"),
+        "parked": parked,
+        "parked_code": if parked { json!(g("parked_code")) } else { Value::Null },
+        "parked_reason": if parked { json!(g("parked_reason")) } else { Value::Null },
+        "parked_at": if parked { json!(g("parked_at")) } else { Value::Null },
+    })
 }
 
 /// PUT /hybrid/names/records (signed) `{records: [...]}`: write the

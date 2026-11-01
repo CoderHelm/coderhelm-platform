@@ -28,6 +28,7 @@ aws-sdk-sts = "1"
 aws-sdk-sqs = "1"
 aws-sdk-codebuild = "1"
 aws-sdk-cloudwatchlogs = "1"
+aws-sdk-route53 = "1"
 # log_evidence: the ECS service, task definition and tasks behind a log group (read only)
 aws-sdk-ecs = "1"
 aws-smithy-types = "1"

@@ -129,6 +129,41 @@ export class MonitoringStack extends cdk.Stack {
       metricValue: "1",
     }).metric({ period: cdk.Duration.minutes(15), statistic: "Sum" });
 
+    // Hosted side of hybrid: a CoderHelm address parked by the name check
+    // (it pointed somewhere that no longer answered as its install, or a
+    // record under it wasn't CoderHelm's), or a record in the zone CoderHelm
+    // didn't write and can't place.
+    if (props.cfg.hybrid) {
+      const parked = new logs.MetricFilter(this, "HybridNameParkedFilter", {
+        logGroup: workerLogs,
+        filterPattern: logs.FilterPattern.literal('"hybrid_name_parked"'),
+        metricNamespace: "CoderHelm/Hybrid",
+        metricName: "NameParked",
+        metricValue: "1",
+      }).metric({ period: cdk.Duration.minutes(15), statistic: "Sum" });
+      const unknown = new logs.MetricFilter(this, "HybridNameUnknownRecordFilter", {
+        logGroup: workerLogs,
+        filterPattern: logs.FilterPattern.literal('"hybrid_name_unknown_record"'),
+        metricNamespace: "CoderHelm/Hybrid",
+        metricName: "UnknownRecord",
+        metricValue: "1",
+      }).metric({ period: cdk.Duration.minutes(15), statistic: "Sum" });
+      for (const [id, name, description, metric] of [
+        ["HybridNameParkedAlarm", "hybrid-name-parked", "A CoderHelm address was parked by the name check", parked],
+        ["HybridNameUnknownRecordAlarm", "hybrid-name-unknown-record", "A record in the CoderHelm address zone that CoderHelm didn't write", unknown],
+      ] as const) {
+        new cloudwatch.Alarm(this, id, {
+          alarmName: `${prefix}-${name}`,
+          alarmDescription: description,
+          metric,
+          threshold: 1,
+          evaluationPeriods: 1,
+          comparisonOperator: cloudwatch.ComparisonOperator.GREATER_THAN_OR_EQUAL_TO_THRESHOLD,
+          treatMissingData: cloudwatch.TreatMissingData.NOT_BREACHING,
+        }).addAlarmAction(new actions.SnsAction(alertTopic));
+      }
+    }
+
     // Dashboard
     const dashboard = new cloudwatch.Dashboard(this, "Dashboard", {
       dashboardName: prefix,

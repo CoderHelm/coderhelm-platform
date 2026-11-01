@@ -25,6 +25,8 @@ pub struct WorkerState {
     pub logs: aws_sdk_cloudwatchlogs::Client,
     /// Plugin schedules (publish at a time, recurring triggers).
     pub scheduler: common::plugins::schedule::aws_sdk_scheduler::Client,
+    /// Hosted side of hybrid: the `{name}.coderhelm.com` zone (the name check).
+    pub route53: aws_sdk_route53::Client,
     pub http: reqwest::Client,
     pub config: models::Config,
     pub secrets: models::Secrets,
@@ -52,6 +54,7 @@ async fn main() -> Result<(), Error> {
     let kms = aws_sdk_kms::Client::new(&aws_config);
     let sts = aws_sdk_sts::Client::new(&aws_config);
     let scheduler = common::plugins::schedule::aws_sdk_scheduler::Client::new(&aws_config);
+    let route53 = aws_sdk_route53::Client::new(&aws_config);
     let sm = aws_sdk_secretsmanager::Client::new(&aws_config);
     // Where this deployment's dashboard and API are (config, or SSM).
     common::public_urls::init(common::public_urls::ssm::Client::new(&aws_config)).await;
@@ -88,6 +91,7 @@ async fn main() -> Result<(), Error> {
         codebuild,
         logs,
         scheduler,
+        route53,
         http: reqwest::Client::builder()
             .user_agent("coderhelm-worker/0.1")
             .build()?,
@@ -510,6 +514,12 @@ async fn handle_message(state: Arc<WorkerState>, message: models::WorkerMessage)
             info!(team_id = %msg.team_id, source = %msg.source_id, plugin = %msg.plugin_id, reason = %msg.reason, "Plugin sync");
             if let Err(e) = passes::plugins::sync(&state, msg).await {
                 error!("Plugin sync failed: {e:?}");
+            }
+        }
+        models::WorkerMessage::HybridNameCheck => {
+            info!("Hybrid name check");
+            if let Err(e) = passes::hybrid_name_check::run(&state).await {
+                error!("Hybrid name check failed: {e:?}");
             }
         }
         models::WorkerMessage::PluginSweep => {

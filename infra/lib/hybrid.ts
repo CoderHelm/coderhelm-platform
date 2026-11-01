@@ -52,6 +52,79 @@ export const FALLBACK_FUNCTION = `function handler(event) {
   return r;
 }`;
 
+/**
+ * What may change records for `{name}.<zone>` (the provisioning API and the
+ * name check): CNAME/A/AAAA one label under the zone or `_<token>.<name>`,
+ * never the apex, the wildcard, a reserved name or anything deeper.
+ */
+export function grantNameRecords(fn: lambda.IFunction, zoneArn: string, zone: string): void {
+  const reserved = reservedNames();
+  fn.addToRolePolicy(
+    new iam.PolicyStatement({
+      sid: "HybridNameRecords",
+      actions: ["route53:ChangeResourceRecordSets"],
+      resources: [zoneArn],
+      conditions: {
+        "ForAllValues:StringEquals": {
+          "route53:ChangeResourceRecordSetsRecordTypes": ["CNAME", "A", "AAAA"],
+          "route53:ChangeResourceRecordSetsActions": ["CREATE", "UPSERT", "DELETE"],
+        },
+        // Names one label under the zone, or `_<token>.<name>`.
+        "ForAllValues:StringLike": {
+          "route53:ChangeResourceRecordSetsNormalizedRecordNames": [`*.${zone}`],
+        },
+      },
+    }),
+  );
+  // Never the wildcard itself, the zone apex or a reserved name.
+  fn.addToRolePolicy(
+    new iam.PolicyStatement({
+      sid: "HybridNeverReserved",
+      effect: iam.Effect.DENY,
+      actions: ["route53:ChangeResourceRecordSets"],
+      resources: [zoneArn],
+      conditions: {
+        "ForAnyValue:StringEquals": {
+          "route53:ChangeResourceRecordSetsNormalizedRecordNames": [
+            zone,
+            `\\052.${zone}`,
+            `*.${zone}`,
+            ...[...reserved.zoneRecords, ...reserved.blocklist].map((n) => `${n}.${zone}`),
+          ],
+        },
+      },
+    }),
+  );
+  // IAM's `*` crosses dots, so the allow above also matches deeper names.
+  // A separate deny (conditions inside one statement would AND together)
+  // fences what the code never writes: anything under a host CoderHelm serves
+  // (such as `_acme-challenge.app.<zone>`, which could get a certificate
+  // for the dashboard), mail and certificate-authority records anywhere in
+  // the zone, and names three or more labels deep.
+  fn.addToRolePolicy(
+    new iam.PolicyStatement({
+      sid: "HybridNeverDeeper",
+      effect: iam.Effect.DENY,
+      actions: ["route53:ChangeResourceRecordSets"],
+      resources: [zoneArn],
+      conditions: {
+        "ForAnyValue:StringLike": {
+          "route53:ChangeResourceRecordSetsNormalizedRecordNames": [
+            `*.*.*.${zone}`,
+            "*_domainkey*",
+            "*_dmarc*",
+            "*_mta-sts*",
+            "*_smtp*",
+            "*_acme-challenge*",
+            "*_spf*",
+            ...reserved.zoneRecords.map((n) => `*.${n}.${zone}`),
+          ],
+        },
+      },
+    }),
+  );
+}
+
 export interface HybridProps {
   cfg: ResolvedConfig;
   httpApi: apigwv2.HttpApi;
@@ -60,6 +133,9 @@ export interface HybridProps {
 
 export class Hybrid extends Construct {
   public readonly fallback: cloudfront.Distribution;
+  /** The `{name}.<zone>` hosted zone (the worker's name check reads it). */
+  public readonly zoneId: string;
+  public readonly zoneArn: string;
 
   constructor(scope: Construct, id: string, props: HybridProps) {
     super(scope, id);
@@ -109,72 +185,10 @@ export class Hybrid extends Construct {
 
     // --- What the provisioning API may change in the zone ---
     const zoneArn = cdk.Stack.of(this).formatArn({ service: "route53", account: "", region: "", resource: "hostedzone", resourceName: zone.hostedZoneId });
-    const reserved = reservedNames();
+    this.zoneId = zone.hostedZoneId;
+    this.zoneArn = zoneArn;
     const fn_ = props.gatewayFunction;
-    fn_.addToRolePolicy(
-      new iam.PolicyStatement({
-        sid: "HybridNameRecords",
-        actions: ["route53:ChangeResourceRecordSets"],
-        resources: [zoneArn],
-        conditions: {
-          "ForAllValues:StringEquals": {
-            "route53:ChangeResourceRecordSetsRecordTypes": ["CNAME", "A", "AAAA"],
-            "route53:ChangeResourceRecordSetsActions": ["CREATE", "UPSERT", "DELETE"],
-          },
-          // Names one label under the zone, or `_<token>.<name>`.
-          "ForAllValues:StringLike": {
-            "route53:ChangeResourceRecordSetsNormalizedRecordNames": [`*.${h.zone}`],
-          },
-        },
-      }),
-    );
-    // Never the wildcard itself, the zone apex or a reserved name.
-    fn_.addToRolePolicy(
-      new iam.PolicyStatement({
-        sid: "HybridNeverReserved",
-        effect: iam.Effect.DENY,
-        actions: ["route53:ChangeResourceRecordSets"],
-        resources: [zoneArn],
-        conditions: {
-          "ForAnyValue:StringEquals": {
-            "route53:ChangeResourceRecordSetsNormalizedRecordNames": [
-              h.zone,
-              `\\052.${h.zone}`,
-              `*.${h.zone}`,
-              ...[...reserved.zoneRecords, ...reserved.blocklist].map((n) => `${n}.${h.zone}`),
-            ],
-          },
-        },
-      }),
-    );
-    // IAM's `*` crosses dots, so the allow above also matches deeper names.
-    // A separate deny (conditions inside one statement would AND together)
-    // fences what the code never writes: anything under a host CoderHelm serves
-    // (such as `_acme-challenge.app.<zone>`, which could get a certificate
-    // for the dashboard), mail and certificate-authority records anywhere in
-    // the zone, and names three or more labels deep.
-    fn_.addToRolePolicy(
-      new iam.PolicyStatement({
-        sid: "HybridNeverDeeper",
-        effect: iam.Effect.DENY,
-        actions: ["route53:ChangeResourceRecordSets"],
-        resources: [zoneArn],
-        conditions: {
-          "ForAnyValue:StringLike": {
-            "route53:ChangeResourceRecordSetsNormalizedRecordNames": [
-              `*.*.*.${h.zone}`,
-              "*_domainkey*",
-              "*_dmarc*",
-              "*_mta-sts*",
-              "*_smtp*",
-              "*_acme-challenge*",
-              "*_spf*",
-              ...reserved.zoneRecords.map((n) => `*.${n}.${h.zone}`),
-            ],
-          },
-        },
-      }),
-    );
+    grantNameRecords(fn_, zoneArn, h.zone);
     fn_.addEnvironment("HYBRID_ZONE_ID", zone.hostedZoneId);
     fn_.addEnvironment("HYBRID_FALLBACK_DOMAIN", this.fallback.distributionDomainName);
 

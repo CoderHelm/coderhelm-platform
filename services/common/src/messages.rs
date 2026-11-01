@@ -179,6 +179,11 @@ pub enum WorkerMessage {
     /// no webhook covers.
     #[serde(rename = "plugin_sweep")]
     PluginSweep,
+    /// Every 15 minutes (EventBridge → SQS), hosted side of hybrid only:
+    /// check every `{name}.coderhelm.com` still points only where CoderHelm
+    /// put it, and park the ones that don't (common::hybrid::name_check).
+    #[serde(rename = "hybrid_name_check")]
+    HybridNameCheck,
     /// A plugin's recurring `schedule` trigger fired.
     #[serde(rename = "plugin_trigger")]
     PluginTrigger(PluginTriggerMessage),
@@ -365,7 +370,8 @@ impl WorkerMessage {
             | WorkerMessage::KnowledgeSyncSweep
             | WorkerMessage::AgentResumeSweep
             | WorkerMessage::LogAutofix
-            | WorkerMessage::AwsPermissionsSweep => f::OTHER,
+            | WorkerMessage::AwsPermissionsSweep
+            | WorkerMessage::HybridNameCheck => f::OTHER,
             WorkerMessage::PluginRun(_)
             | WorkerMessage::PluginPublish(_)
             | WorkerMessage::PluginSync(_)

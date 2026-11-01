@@ -60,6 +60,8 @@ export class ApiStack extends cdk.Stack {
   public readonly dlq: sqs.Queue;
   /** The HTTP API (the single-origin web stack forwards to it). */
   public readonly httpApi: apigatewayv2.HttpApi;
+  /** The hosted side of hybrid (CoderHelm's own deployment only). */
+  public readonly hybrid?: Hybrid;
 
   constructor(scope: Construct, id: string, props: ApiStackProps) {
     super(scope, id, props);
@@ -942,7 +944,20 @@ export class ApiStack extends cdk.Stack {
     // The hosted side of hybrid: Route 53 rights for {name}.<zone> and the
     // fallback page for every unclaimed name (lib/hybrid.ts).
     if (cfg.hybrid) {
-      new Hybrid(this, "Hybrid", { cfg, httpApi, gatewayFunction: this.gatewayFunction });
+      this.hybrid = new Hybrid(this, "Hybrid", { cfg, httpApi, gatewayFunction: this.gatewayFunction });
+      // Every 15 min: each {name}.<zone> still points only where CoderHelm
+      // put it and still reaches its own install; the worker parks any that
+      // don't (common::hybrid::name_check).
+      new events.Rule(this, "HybridNameCheckSchedule", {
+        ruleName: `${prefix}-hybrid-name-check`,
+        description: "Check every CoderHelm address still points only at its own install",
+        schedule: events.Schedule.rate(cdk.Duration.minutes(15)),
+        targets: [
+          new targets.SqsQueue(this.ticketQueue, {
+            message: events.RuleTargetInput.fromObject({ type: "hybrid_name_check" }),
+          }),
+        ],
+      });
     }
 
     // Outputs

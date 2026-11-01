@@ -200,3 +200,38 @@ test("hybrid config is checked", () => {
   assert.equal(hostedCfg().hybrid!.zone, "coderhelm.com");
   assert.equal(hostedCfg().hybridUrl, null);
 });
+
+test("the name check: every 15 minutes, the worker reads the zone and parks with the API's own fences", () => {
+  const api = hosted()["coderhelm-prod-api"];
+  const rule = Object.values(api.findResources("AWS::Events::Rule")).find((r: any) => r.Properties.Name === "coderhelm-prod-hybrid-name-check") as any;
+  assert.ok(rule, "the schedule exists on the hosted side");
+  assert.equal(rule.Properties.ScheduleExpression, "rate(15 minutes)");
+  assert.match(str(rule.Properties.Targets), /hybrid_name_check/);
+
+  const worker = hosted()["coderhelm-prod-worker"];
+  const st = statements(worker);
+  const read = st.find((s) => s.Sid === "HybridNameCheckRead");
+  assert.equal(read.Action, "route53:ListResourceRecordSets");
+  assert.match(str(read.Resource), /hostedzone\/ZTEST000001/);
+  const change = st.filter((s) => ([] as string[]).concat(s.Action).includes("route53:ChangeResourceRecordSets"));
+  // The same three statements the provisioning API has: never the apex, the
+  // wildcard, a reserved name or anything deeper.
+  const apiChange = statements(api).filter((s) => ([] as string[]).concat(s.Action).includes("route53:ChangeResourceRecordSets"));
+  assert.deepEqual(change.map((s) => s.Sid).sort(), ["HybridNameRecords", "HybridNeverDeeper", "HybridNeverReserved"]);
+  assert.deepEqual(change.map((s) => str(s.Condition)).sort(), apiChange.map((s) => str(s.Condition)).sort());
+  const env = Object.values(worker.findResources("AWS::Lambda::Function")).map((r: any) => r.Properties).find((p) => p.FunctionName === "coderhelm-prod-worker").Environment.Variables;
+  assert.equal(env.HYBRID_ZONE_ID, "ZTEST000001");
+  assert.ok(env.HYBRID_FALLBACK_DOMAIN, "the fallback site's address");
+
+  const mon = hosted()["coderhelm-prod-monitoring"];
+  const alarms = Object.values(mon.findResources("AWS::CloudWatch::Alarm")).map((r: any) => r.Properties.AlarmName);
+  assert.ok(alarms.includes("coderhelm-prod-hybrid-name-parked") && alarms.includes("coderhelm-prod-hybrid-name-unknown-record"));
+});
+
+test("a self-hosted install has no name check and no zone rights in its worker", () => {
+  const t = synth(resolveConfig({ account: "111122223333", region: "us-west-2", stage: "prod", email: { from: "coderhelm@example.org" }, admins: ["owner@example.org"] }));
+  assert.ok(!Object.values(t["coderhelm-prod-api"].findResources("AWS::Events::Rule")).some((r: any) => r.Properties.Name === "coderhelm-prod-hybrid-name-check"));
+  for (const s of statements(t["coderhelm-prod-worker"])) assert.ok(![].concat(s.Action).some((a: string) => a.startsWith("route53:")), "no zone rights");
+  const alarms = Object.values(t["coderhelm-prod-monitoring"].findResources("AWS::CloudWatch::Alarm")).map((r: any) => r.Properties.AlarmName);
+  assert.ok(!alarms.some((a: string) => a.includes("hybrid-name")));
+});
