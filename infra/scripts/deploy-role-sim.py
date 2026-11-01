@@ -707,6 +707,9 @@ def helper_rows():
         ("lambda:InvokeFunction", f"{at('lambda')}:function:{P}-updater"),
         ("logs:DeleteLogGroup", f"{at('logs')}:log-group:/aws/lambda/{P}-gateway"),
         ("cloudformation:DescribeStacks", f"{at('cloudformation')}:stack/{P}/0f0f0f0f-1111-2222-3333-444455556666"),
+        # The admin's uninstall switch, and what it deletes when the stack retains its data.
+        ("ssm:GetParameter", f"{at('ssm')}:parameter/{P}/uninstall/delete-data"), ("ssm:DeleteParameter", f"{at('ssm')}:parameter/{P}/uninstall/delete-data"),
+        ("s3:DeleteBucket", f"{s3}{P}-data-{ACCT}"), ("kms:DeleteAlias", f"{at('kms')}:alias/{P}-dynamo"), ("kms:ListAliases", "*"),
     ]
     denied = [
         ("s3:PutObject", f"{s3}{P}-data-{ACCT}/x"), ("s3:DeleteObject", f"{s3}someone-else/x"), ("s3:PutObject", f"{s3}coderhelm-other-release-{ACCT}/x"),
@@ -718,6 +721,11 @@ def helper_rows():
         ("lambda:InvokeFunction", f"{at('lambda')}:function:{P}-gateway"), ("lambda:UpdateFunctionCode", f"{at('lambda')}:function:{P}-updater"),
         ("logs:DeleteLogGroup", f"{at('logs')}:log-group:/aws/lambda/payments"), ("logs:CreateLogGroup", f"{at('logs')}:log-group:/aws/lambda/{P}-install-helper"),
         ("iam:CreateRole", f"arn:aws:iam::{ACCT}:role/{P}-x"), ("cloudformation:DeleteStack", f"{at('cloudformation')}:stack/{P}/0f0f0f0f-1111-2222-3333-444455556666"),
+        # The switch is the updater's to write; nothing else of SSM, no other bucket, alias or untagged key or pool.
+        ("ssm:PutParameter", f"{at('ssm')}:parameter/{P}/uninstall/delete-data"), ("ssm:DeleteParameter", f"{at('ssm')}:parameter/{P}/public-url"),
+        ("s3:DeleteBucket", f"{s3}someone-else"), ("s3:DeleteBucket", f"{s3}{P}-dashboard-{ACCT}"), ("kms:DeleteAlias", f"{at('kms')}:alias/my-app"),
+        ("kms:ScheduleKeyDeletion", f"{at('kms')}:key/0f0f0f0f-1111-2222-3333-444455556666"),
+        ("cognito-idp:DeleteUserPool", f"{at('cognito-idp')}:userpool/us-east-1_someones"),
     ]
     return [{"action": a, "resource": r, "want": "allowed"} for a, r in allowed] + [{"action": a, "resource": r, "want": "denied"} for a, r in denied]
 

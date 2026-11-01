@@ -139,3 +139,23 @@ test("the updater may create the parts' nested change sets, only from the staged
   assert.match(JSON.stringify(st.Condition.StringLikeIfExists["cloudformation:TemplateUrl"]), /-release-.*\/releases\/v\*\.\*\.\*\/stacks\/\*\.json/);
   assert.ok(st.Condition.StringEqualsIfExists["cloudformation:RoleArn"], "only through the deploy role");
 });
+
+test("the uninstall switch: Sweep and Final read it; the helper may only read and remove it, and delete only the install's own data", () => {
+  const parent: any = rel.parent;
+  for (const r of ["Sweep", "Final"]) assert.deepEqual(parent.Resources[r].Properties.DeleteSwitch, { "Fn::Sub": "/coderhelm-${Stage}/uninstall/delete-data" }, r);
+  assert.deepEqual(parent.Resources.Sweep.Properties.UserPoolId, { "Fn::GetAtt": ["Api", "Outputs.UserPoolId"] });
+  assert.deepEqual(parent.Resources.Final.Properties.KeyAliasPrefix, { "Fn::Sub": "alias/coderhelm-${Stage}-" });
+  const st: any[] = parent.Resources.HelperRole.Properties.Policies[0].PolicyDocument.Statement;
+  const sid = (x: string) => st.find((s) => s.Sid === x);
+  assert.deepEqual(sid("UninstallSwitch").Action, ["ssm:GetParameter", "ssm:DeleteParameter"], "never PutParameter: the updater writes it");
+  assert.match(JSON.stringify(sid("UninstallSwitch").Resource), /parameter\/coderhelm-\$\{Stage\}\/uninstall\/delete-data/);
+  assert.match(JSON.stringify(sid("DataBucketOnSwitch").Resource), /s3:::coderhelm-\$\{Stage\}-data-\$\{AWS::AccountId\}/);
+  for (const x of ["UserPoolOnSwitch", "KeysOnSwitch"]) assert.ok(JSON.stringify(sid(x).Condition).includes("aws:ResourceTag/coderhelm:install"), `${x} only on what carries the install's tag`);
+  assert.match(JSON.stringify(sid("KeyAliasesOnSwitch").Resource), /alias\/coderhelm-\$\{Stage\}-\*/);
+  // The updater writes the switch, on that one parameter.
+  const updates: any = (rel.children as any).Updates;
+  const us = Object.values<any>(updates.Resources).filter((r) => r.Type === "AWS::IAM::Policy").map((r) => r.Properties.PolicyDocument.Statement).flat().find((s: any) => s.Sid === "UninstallSwitch");
+  assert.ok(us, "the updater's UninstallSwitch statement");
+  assert.deepEqual(us.Action, ["ssm:GetParameter", "ssm:PutParameter", "ssm:DeleteParameter"]);
+  assert.match(JSON.stringify(us.Resource), /uninstall\/delete-data/);
+});

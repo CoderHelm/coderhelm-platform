@@ -51,7 +51,7 @@ When it finishes, `coderhelm-<name>` is one stack. List what is left of the old 
 npx -y github:CoderHelm/coderhelm-platform leftovers --stage <name> --region <region>
 ```
 
-The pieces to remove are the earlier Launch Stack's permissions boundary (`coderhelm-<name>-boundary-<id>`), deploy role (`coderhelm-<name>-deploy-<id>`) and assets bucket (`coderhelm-<name>-assets-<id>-<account>`), if you had them, and the migration bucket `coderhelm-<name>-migrate-<account>`. `leftovers --delete` refuses while the stack exists, so remove these in the IAM and S3 consoles (empty a bucket before deleting it, and delete the role before the boundary). Everything else the listing names belongs to the new stack.
+The pieces to remove are the earlier Launch Stack's permissions boundary (`coderhelm-<name>-boundary-<id>`), deploy role (`coderhelm-<name>-deploy-<id>`) and assets bucket (`coderhelm-<name>-assets-<id>-<account>`), if you had them, and the migration bucket `coderhelm-<name>-migrate-<account>`. Don't use `leftovers --delete` here: it deletes the stack itself first, which is the new install. Remove these in the IAM and S3 consoles (empty a bucket before deleting it, and delete the role before the boundary). Everything else the listing names belongs to the new stack.
 
 Then check the install the usual way ([Check your install](./check-your-install.md)), and `selfhost/check-access.mjs` ([Security](./security.md#check-it-yourself)).
 

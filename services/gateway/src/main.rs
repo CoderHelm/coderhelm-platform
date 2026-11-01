@@ -150,6 +150,10 @@ async fn main() -> Result<(), Error> {
         // The install's version and updates (self-hosted installs).
         .route("/system/version", get(routes::system::version))
         .route("/system/auto-update", put(routes::system::set_auto_update))
+        .route(
+            "/system/uninstall-mode",
+            put(routes::system::set_uninstall_mode),
+        )
         .route("/system/update", post(routes::system::update_now))
         .route("/system/rollback", post(routes::system::rollback))
         .route("/system/test-email", post(routes::system::test_email))

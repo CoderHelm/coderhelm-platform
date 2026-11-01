@@ -585,3 +585,67 @@ class PermissionChanges(unittest.TestCase):
         self.assertIn("*:*", u.permission_change({"Action": "Add", "ResourceType": "AWS::X::Y", "AfterContext": {"Properties": {"S": [{"Principal": "*"}]}}}))
         # A removal never widens anything.
         self.assertEqual(u.permission_change({"Action": "Remove", "ResourceType": "AWS::IAM::Role"}), "")
+
+
+class FakeSsmParam:
+    def __init__(self):
+        self.value = None
+        self.puts = []
+
+    def get_parameter(self, Name):
+        if self.value is None:
+            raise type("ParameterNotFound", (Exception,), {})("not found")
+        return {"Parameter": {"Value": self.value}}
+
+    def put_parameter(self, Name, Value, Type, Overwrite, Description):
+        self.puts.append(Name)
+        self.value = Value
+
+    def delete_parameter(self, Name):
+        if self.value is None:
+            raise type("ParameterNotFound", (Exception,), {})("not found")
+        self.value = None
+
+
+class UninstallMode(unittest.TestCase):
+    """Settings, System, Uninstall: keep the data (default) or delete
+    everything when the stack is deleted. On needs the install's name typed
+    back; every change records who and when."""
+
+    def setUp(self):
+        self.env = dict(ENV, RESOURCE_PREFIX="coderhelm-prod")
+        self.store = u.Store(FakeDynamo(), "t")
+        self.ssm = FakeSsmParam()
+        self.now = datetime(2026, 11, 1, tzinfo=timezone.utc)
+
+    def test_on_needs_the_typed_name_then_writes_the_switch(self):
+        r = u.set_uninstall_mode(self.store, self.env, self.now, {"delete_data": True, "confirm": "staging", "actor": "a@x.org"}, ssm=self.ssm)
+        self.assertEqual(r["ok"], False)
+        self.assertIn("(prod)", r["error"])
+        self.assertIsNone(self.ssm.value)
+        r = u.set_uninstall_mode(self.store, self.env, self.now, {"delete_data": True, "confirm": "prod", "actor": "a@x.org"}, ssm=self.ssm)
+        self.assertTrue(r["ok"], r)
+        self.assertEqual(self.ssm.puts, ["/coderhelm-prod/uninstall/delete-data"])
+        self.assertEqual(self.ssm.value, "delete")
+        self.assertEqual(r["uninstall"], {"delete_data": True, "changed_by": "a@x.org", "changed_at": self.now.isoformat()})
+
+    def test_off_removes_it_and_both_changes_are_recorded(self):
+        u.set_uninstall_mode(self.store, self.env, self.now, {"delete_data": True, "confirm": "prod", "actor": "a@x.org"}, ssm=self.ssm)
+        r = u.set_uninstall_mode(self.store, self.env, self.now, {"delete_data": False, "actor": "b@x.org"}, ssm=self.ssm)
+        self.assertTrue(r["ok"])
+        self.assertIsNone(self.ssm.value)
+        self.assertEqual(r["uninstall"]["delete_data"], False)
+        log = self.store.get("UNINSTALL_LOG")
+        self.assertEqual([(x["delete_data"], x["actor"]) for x in log], [(False, "b@x.org"), (True, "a@x.org")])
+        # Off again when already off is fine.
+        self.assertTrue(u.set_uninstall_mode(self.store, self.env, self.now, {"delete_data": False, "actor": "b@x.org"}, ssm=self.ssm)["ok"])
+
+    def test_only_a_bool_and_only_on_a_one_stack_install(self):
+        self.assertFalse(u.set_uninstall_mode(self.store, self.env, self.now, {"delete_data": "yes", "confirm": "prod"}, ssm=self.ssm)["ok"])
+        env = dict(self.env)
+        env.pop("NATIVE_STACK")
+        self.assertFalse(u.set_uninstall_mode(self.store, env, self.now, {"delete_data": True, "confirm": "prod"}, ssm=self.ssm)["ok"])
+        self.assertIsNone(self.ssm.value)
+
+    def test_status_says_keep_by_default(self):
+        self.assertEqual(u.uninstall_status(self.store, self.env, ssm=self.ssm), {"delete_data": False, "changed_by": None, "changed_at": None})

@@ -568,3 +568,162 @@ class OnlyWhatTheStackSays(unittest.TestCase):
         opener = lambda req, timeout=None: Resp(bad)
         with self.assertRaisesRegex(ValueError, "odd part template"):
             h.stage_release({"version": v, "template_sha256": hashlib.sha256(bad).hexdigest()}, "b", s3=FakeS3(), opener=opener)
+
+
+class FakeSsm:
+    def __init__(self, value=None, error=None):
+        self.value = value
+        self.error = error
+        self.deleted = []
+
+    def get_parameter(self, Name):
+        if self.error:
+            raise type("AccessDeniedException", (Exception,), {})(self.error)
+        if self.value is None:
+            raise type("ParameterNotFound", (Exception,), {})("not found")
+        return {"Parameter": {"Value": self.value}}
+
+    def delete_parameter(self, Name):
+        self.deleted.append(Name)
+        self.value = None
+
+
+class FakeCognito:
+    def __init__(self):
+        self.calls = []
+        self.pools = {"us-east-1_prod": {"DeletionProtection": "ACTIVE", "Domain": "coderhelm-prod-auth"}}
+
+    def describe_user_pool(self, UserPoolId):
+        if UserPoolId not in self.pools:
+            raise type("ResourceNotFoundException", (Exception,), {})("gone")
+        return {"UserPool": self.pools[UserPoolId]}
+
+    def update_user_pool(self, UserPoolId, DeletionProtection):
+        self.calls.append(("protect", UserPoolId, DeletionProtection))
+
+    def delete_user_pool_domain(self, Domain, UserPoolId):
+        self.calls.append(("domain", Domain))
+
+    def delete_user_pool(self, UserPoolId):
+        self.calls.append(("delete", UserPoolId))
+        del self.pools[UserPoolId]
+
+
+class FakeS3Delete(FakeS3):
+    def __init__(self, **kw):
+        super().__init__(**kw)
+        self.buckets_deleted = []
+
+    def delete_bucket(self, Bucket):
+        self.buckets_deleted.append(Bucket)
+
+
+class FakeKms:
+    def __init__(self):
+        self.aliases = [{"AliasName": "alias/coderhelm-prod-dynamo", "TargetKeyId": "k1"}, {"AliasName": "alias/coderhelm-prod-s3", "TargetKeyId": "k2"},
+                        {"AliasName": "alias/coderhelm-prodx-dynamo", "TargetKeyId": "k9"}, {"AliasName": "alias/my-app", "TargetKeyId": "k8"}]
+        self.scheduled = []
+        self.alias_deleted = []
+
+    def get_paginator(self, name):
+        aliases = self.aliases
+
+        class P:
+            def paginate(self):
+                return [{"Aliases": list(aliases)}]
+        return P()
+
+    def delete_alias(self, AliasName):
+        self.alias_deleted.append(AliasName)
+
+    def schedule_key_deletion(self, KeyId, PendingWindowInDays):
+        self.scheduled.append((KeyId, PendingWindowInDays))
+
+
+class UninstallSwitch(unittest.TestCase):
+    """The admin's "delete everything when uninstalled" switch (Settings,
+    System, Uninstall): read from SSM on a real stack delete, it deletes the
+    data even while the stack says KeepDataOnDelete=true (which retains it),
+    and never on an update."""
+
+    SWITCH = "/coderhelm-prod/uninstall/delete-data"
+
+    def setUp(self):
+        self.saved = dict(h._clients)
+        self.s3 = FakeS3Delete(versions=[{"Key": "k", "VersionId": "1"}])
+        self.cognito = FakeCognito()
+        self.kms = FakeKms()
+        self.sm = FakeSecrets()
+        self.logs = FakeLogs(["/aws/lambda/coderhelm-prod-gateway"])
+        self.ddb = FakeDdb({"coderhelm-prod-runs": (True, 0)})
+        h._clients.update({"s3@None": self.s3, "cognito-idp@None": self.cognito, "kms@None": self.kms, "secretsmanager@None": self.sm,
+                           "logs@None": self.logs, "dynamodb@None": self.ddb, "acm@us-east-1": FakeAcm(), "route53@None": object()})
+        clock = Clock()
+        self.orig = h.delete_tables
+        h.delete_tables = lambda names, deadline=None: self.orig(names, self.ddb, deadline=clock.now() + 600, sleep=clock.sleep, now=clock.now)
+
+    def tearDown(self):
+        h.delete_tables = self.orig
+        h._clients.clear()
+        h._clients.update(self.saved)
+
+    def run_both(self, ssm, status="DELETE_IN_PROGRESS", keep="true"):
+        h._clients["ssm@None"] = ssm
+        h._clients["cloudformation@None"] = FakeCfn(status, {"KeepDataOnDelete": keep})
+        ev = lambda kind, props: {"ResourceType": kind, "RequestType": "Delete", "LogicalResourceId": "X", "ResourceProperties": dict(props, RootStackId="root", DeleteSwitch=self.SWITCH)}
+        sweep = h.handle(ev("Custom::Sweep", {"KeepData": keep, "Buckets": ["coderhelm-prod-data-1"], "Tables": ["coderhelm-prod-runs"], "UserPoolId": "us-east-1_prod"}))
+        final = h.handle(ev("Custom::Final", {"KeepData": keep, "Prefix": "coderhelm-prod", "SecretId": "s", "LogGroupNames": [],
+                                              "LogGroupPrefixes": ["/aws/lambda/coderhelm-prod-"], "KeyAliasPrefix": "alias/coderhelm-prod-"}))
+        return sweep, final
+
+    def test_switch_on_while_the_stack_keeps_data_deletes_everything(self):
+        ssm = FakeSsm("delete")
+        (s_status, s_reason, _), (f_status, f_reason, _) = self.run_both(ssm)
+        self.assertEqual(s_status, "SUCCESS", s_reason)
+        self.assertEqual(f_status, "SUCCESS", f_reason)
+        self.assertIn("k", self.s3.deleted)
+        self.assertEqual(self.s3.buckets_deleted, ["coderhelm-prod-data-1"])
+        self.assertEqual(self.ddb.tables, {})
+        self.assertEqual(self.cognito.calls, [("protect", "us-east-1_prod", "INACTIVE"), ("domain", "coderhelm-prod-auth"), ("delete", "us-east-1_prod")])
+        self.assertEqual(sorted(self.kms.scheduled), [("k1", 7), ("k2", 7)], "only this install's keys, after AWS's 7 days")
+        self.assertEqual(sorted(self.kms.alias_deleted), ["alias/coderhelm-prod-dynamo", "alias/coderhelm-prod-s3"])
+        self.assertEqual(self.sm.deleted, [("s", True)])
+        # Tagged log groups follow the same switch (FakeLogs' groups carry no tag, so none here).
+        self.assertEqual(ssm.deleted, [self.SWITCH], "the switch goes with the stack")
+
+    def test_switch_off_keeps_everything(self):
+        ssm = FakeSsm(None)
+        (s_status, s_reason, _), (f_status, _, _) = self.run_both(ssm)
+        self.assertEqual((s_status, s_reason), ("SUCCESS", "data kept"))
+        self.assertEqual(f_status, "SUCCESS")
+        self.assertEqual((self.s3.deleted, self.s3.buckets_deleted, self.cognito.calls, self.kms.scheduled, self.sm.deleted), ([], [], [], [], []))
+        self.assertIn("coderhelm-prod-runs", self.ddb.tables)
+
+    def test_an_unreadable_switch_keeps_the_data(self):
+        ssm = FakeSsm("delete", error="AccessDenied")
+        (s_status, s_reason, _), _ = self.run_both(ssm)
+        self.assertEqual((s_status, s_reason), ("SUCCESS", "data kept"))
+        self.assertEqual((self.s3.deleted, self.cognito.calls, self.kms.scheduled), ([], [], []))
+
+    def test_any_other_switch_value_keeps_the_data(self):
+        (s_status, s_reason, _), _ = self.run_both(FakeSsm("yes please"))
+        self.assertEqual((s_status, s_reason), ("SUCCESS", "data kept"))
+
+    def test_keep_data_false_lets_the_stack_delete_its_own_buckets_pool_and_keys(self):
+        # CloudFormation deletes those itself (DeletionPolicy Delete): the helper doesn't.
+        (s_status, _, _), (f_status, _, _) = self.run_both(FakeSsm(None), keep="false")
+        self.assertEqual((s_status, f_status), ("SUCCESS", "SUCCESS"))
+        self.assertIn("k", self.s3.deleted)
+        self.assertEqual((self.s3.buckets_deleted, self.cognito.calls, self.kms.scheduled), ([], [], []))
+        self.assertEqual(self.sm.deleted, [("s", True)])
+
+    def test_an_update_never_reads_or_acts_on_the_switch(self):
+        ssm = FakeSsm("delete")
+        (s_status, s_reason, _), (f_status, f_reason, _) = self.run_both(ssm, status="UPDATE_COMPLETE_CLEANUP_IN_PROGRESS")
+        self.assertEqual((s_status, s_reason, f_reason), ("SUCCESS", "nothing to do", "nothing to do"))
+        self.assertEqual((self.s3.deleted, self.cognito.calls, self.kms.scheduled, ssm.deleted), ([], [], [], []))
+
+    def test_keys_only_behind_an_installs_aliases(self):
+        done, problems = h.schedule_keys("alias/", kms=self.kms)
+        self.assertEqual(done, [])
+        self.assertTrue(problems)

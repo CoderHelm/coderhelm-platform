@@ -179,6 +179,9 @@ export function installValue(name: string): Json {
 }
 
 /** What the helper function may do (docs/self-host/security.md, "The install helper"). */
+/** The admin's "delete everything when uninstalled" switch: the updater writes it, the helper reads it on delete. */
+export const UNINSTALL_SWITCH = "/coderhelm-${Stage}/uninstall/delete-data";
+
 export function helperPolicy(): PolicyDocument {
   const p = "coderhelm-${Stage}";
   const at = (svc: string) => `arn:\${AWS::Partition}:${svc}:\${AWS::Region}:\${AWS::AccountId}`;
@@ -202,6 +205,16 @@ export function helperPolicy(): PolicyDocument {
       // Only the certificates the updater requested for this install (its tag).
       { Sid: "CertificatesOnDelete", Effect: "Allow", Action: "acm:DeleteCertificate", Resource: "*", Condition: { StringEquals: { "aws:RequestedRegion": "us-east-1", "aws:ResourceTag/coderhelm": p } } },
       { Sid: "FindZones", Effect: "Allow", Action: "route53:ListHostedZones", Resource: "*" },
+      // The admin's "delete everything when uninstalled" switch (Settings, System, Uninstall), read on a
+      // stack delete and removed with the stack.
+      { Sid: "UninstallSwitch", Effect: "Allow", Action: ["ssm:GetParameter", "ssm:DeleteParameter"], Resource: `${at("ssm")}:parameter/${p}/uninstall/delete-data` },
+      // With the switch on and KeepDataOnDelete=true the stack retains its data: on a stack delete the
+      // helper deletes the install's data bucket, its user pool and its keys (7 days) itself.
+      { Sid: "DataBucketOnSwitch", Effect: "Allow", Action: "s3:DeleteBucket", Resource: `arn:\${AWS::Partition}:s3:::${p}-data-\${AWS::AccountId}` },
+      { Sid: "UserPoolOnSwitch", Effect: "Allow", Action: ["cognito-idp:DescribeUserPool", "cognito-idp:UpdateUserPool", "cognito-idp:DeleteUserPool", "cognito-idp:DeleteUserPoolDomain"], Resource: `${at("cognito-idp")}:userpool/*`, Condition: { StringEquals: { [`aws:ResourceTag/${INSTALL_TAG}`]: p } } },
+      { Sid: "FindKeyAliases", Effect: "Allow", Action: "kms:ListAliases", Resource: "*" },
+      { Sid: "KeyAliasesOnSwitch", Effect: "Allow", Action: "kms:DeleteAlias", Resource: `${at("kms")}:alias/${p}-*` },
+      { Sid: "KeysOnSwitch", Effect: "Allow", Action: ["kms:ScheduleKeyDeletion", "kms:DeleteAlias"], Resource: `${at("kms")}:key/*`, Condition: { StringEquals: { [`aws:ResourceTag/${INSTALL_TAG}`]: p } } },
       // Only deleting the CNAME a certificate check uses (its name starts with an underscore).
       { Sid: "ValidationRecordsOnDelete", Effect: "Allow", Action: "route53:ChangeResourceRecordSets", Resource: "arn:${AWS::Partition}:route53:::hostedzone/*", Condition: { "ForAllValues:StringLike": { "route53:ChangeResourceRecordSetsNormalizedRecordNames": ["_*"] }, "ForAllValues:StringEquals": { "route53:ChangeResourceRecordSetsActions": ["DELETE"], "route53:ChangeResourceRecordSetsRecordTypes": ["CNAME"] } } },
     ],
@@ -410,6 +423,8 @@ export function buildParent(input: ParentInput): Json {
       LogGroupPrefixes: [sub("/aws/lambda/coderhelm-${Stage}-"), sub("/aws/codebuild/coderhelm-${Stage}-")],
       LogGroupNames: declaredLogGroups(children).map((x) => sub(x)),
       SecretId: { Ref: "InstallSecret" },
+      DeleteSwitch: sub(UNINSTALL_SWITCH),
+      KeyAliasPrefix: sub("alias/coderhelm-${Stage}-"),
     },
   };
   R.DeployRole = {
@@ -476,7 +491,17 @@ export function buildParent(input: ParentInput): Json {
   };
   // Deleted before the parts (it references their data): empties buckets
   // and deletes tables itself on a delete with KeepDataOnDelete=false.
-  R.Sweep = { Type: "Custom::Sweep", Properties: { ...helper, KeepData: { Ref: "KeepDataOnDelete" }, Tables: list("hasTables", "NativeDataTables"), Buckets: list("hasBuckets", "NativeDataBuckets") } };
+  R.Sweep = {
+    Type: "Custom::Sweep",
+    Properties: {
+      ...helper,
+      KeepData: { Ref: "KeepDataOnDelete" },
+      DeleteSwitch: sub(UNINSTALL_SWITCH),
+      Tables: list("hasTables", "NativeDataTables"),
+      Buckets: list("hasBuckets", "NativeDataBuckets"),
+      ...(names.has("Api") ? { UserPoolId: { "Fn::GetAtt": ["Api", "Outputs.UserPoolId"] } } : {}),
+    },
+  };
   if (names.has("Database")) {
     R.Allowlist = {
       Type: "Custom::Allowlist",
