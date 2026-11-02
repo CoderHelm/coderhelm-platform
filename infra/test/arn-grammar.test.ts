@@ -169,3 +169,14 @@ test("the updater may create change sets through the parts' LanguageExtensions t
   assert.equal(st.Action, "cloudformation:CreateChangeSet");
   assert.match(JSON.stringify(st.Resource), /:aws:transform\/LanguageExtensions/);
 });
+
+test("every template of a native release is plain ASCII", () => {
+  // CloudFormation stores a template with each non-ASCII character as "?",
+  // so a template carrying one never matches the signed release when the
+  // updater reads back what CloudFormation fetched, and email text shows "?".
+  for (const [name, t] of [["coderhelm.json", rel.parent], ...Object.entries(rel.children)] as [string, any][]) {
+    const s = JSON.stringify(t);
+    const bad = [...new Set([...s].filter((c) => c.charCodeAt(0) > 127))];
+    assert.deepEqual(bad, [], `${name} has non-ASCII characters`);
+  }
+});

@@ -32,7 +32,7 @@ export class EmailStack extends cdk.Stack {
         .split("__APP_URL__").join(props.appUrl)
         .split("__LOGO_URL__").join(cfg.email.logoUrl ?? `${props.appUrl}/favicon.svg`)
         .split("__PRIVACY_LINK__").join(
-          cfg.email.privacyUrl ? ` · <a href="${cfg.email.privacyUrl}" style="color:#888">Privacy</a>` : ""
+          cfg.email.privacyUrl ? ` &middot; <a href="${cfg.email.privacyUrl}" style="color:#888">Privacy</a>` : ""
         )
         .split("__SUPPORT_INBOX__").join(cfg.email.supportInbox);
 
@@ -101,7 +101,7 @@ export class EmailStack extends cdk.Stack {
     new ses.CfnTemplate(this, "WelcomeTemplate", {
       template: {
         templateName: `${prefix}-welcome`,
-        subjectPart: "Welcome to Coderhelm — your AI coding agent is ready",
+        subjectPart: "Welcome to Coderhelm: your AI coding agent is ready",
         htmlPart: fill(WELCOME_HTML),
         textPart: fill(WELCOME_TEXT),
       },
@@ -287,7 +287,7 @@ Connect GitHub: __APP_URL__/settings/github
 Manage notifications: __APP_URL__/settings`;
 
 const RUN_COMPLETE_HTML = EMAIL_WRAPPER(`
-  <h1 style="color:#4ade80;font-size:20px;margin:0 0 16px">✓ Run completed</h1>
+  <h1 style="color:#4ade80;font-size:20px;margin:0 0 16px">&#10003; Run completed</h1>
   <p style="color:#ccc;font-size:15px;line-height:1.6;margin:0 0 16px">
     <strong style="color:#fff">{{title}}</strong> on <code style="background:#1a1a1a;padding:2px 6px;border-radius:4px;color:#ccc">{{repo}}</code>
   </p>
@@ -310,7 +310,7 @@ Tokens: {{tokens}}
 View run: __APP_URL__`;
 
 const RUN_FAILED_HTML = EMAIL_WRAPPER(`
-  <h1 style="color:#ef4444;font-size:20px;margin:0 0 16px">✗ Run failed</h1>
+  <h1 style="color:#ef4444;font-size:20px;margin:0 0 16px">&#10007; Run failed</h1>
   <p style="color:#ccc;font-size:15px;line-height:1.6;margin:0 0 16px">
     <strong style="color:#fff">{{title}}</strong> on <code style="background:#1a1a1a;padding:2px 6px;border-radius:4px;color:#ccc">{{repo}}</code>
   </p>
@@ -348,7 +348,7 @@ Fix the endpoint, turn it back on in Settings, Webhooks, and replay the events i
 Open Webhooks: __APP_URL__/settings/webhooks`;
 
 const WEEKLY_SUMMARY_HTML = EMAIL_WRAPPER(`
-  <h1 style="color:#fff;font-size:20px;margin:0 0 16px">Weekly Summary — {{org}}</h1>
+  <h1 style="color:#fff;font-size:20px;margin:0 0 16px">Weekly Summary &mdash; {{org}}</h1>
   <p style="color:#888;font-size:14px;margin:0 0 20px">{{period}}</p>
   <table style="width:100%;border-collapse:collapse">
     <tr><td style="color:#888;padding:8px 0;font-size:14px;border-bottom:1px solid #222">Total runs</td><td style="color:#fff;padding:8px 0;font-size:14px;border-bottom:1px solid #222;text-align:right">{{total_runs}}</td></tr>
@@ -360,7 +360,7 @@ const WEEKLY_SUMMARY_HTML = EMAIL_WRAPPER(`
   <a href="__APP_URL__" style="display:inline-block;background:#fff;color:#000;padding:10px 20px;border-radius:6px;text-decoration:none;font-weight:600;margin-top:24px">Open Dashboard</a>
 `);
 
-const WEEKLY_SUMMARY_TEXT = `Weekly Summary — {{org}} ({{period}})
+const WEEKLY_SUMMARY_TEXT = `Weekly Summary - {{org}} ({{period}})
 
 Total runs: {{total_runs}}
 Completed: {{completed}}

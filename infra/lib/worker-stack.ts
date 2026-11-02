@@ -452,7 +452,7 @@ export class WorkerStack extends cdk.Stack {
                   '  # is irrelevant.',
                   '  export TURBO_ENV_MODE=loose',
                   '  # Snapshot pre-existing files so we commit ONLY tracked files that',
-                  '  # codegen modifies — never node_modules (nested workspaces included)',
+                  '  # codegen modifies: never node_modules (nested workspaces included)',
                   '  # or fresh intermediates (schema.json, caches) that pollute the PR.',
                   '  find . -type f -not -path "*/node_modules/*" -not -path "*/.git/*" | sort > /tmp/before.txt',
                   '  MARK=/tmp/mark; touch "$MARK"; sleep 1',
