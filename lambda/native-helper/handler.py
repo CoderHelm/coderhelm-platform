@@ -90,7 +90,7 @@ def log(*parts):
     print(" ".join(str(p) for p in parts), flush=True)
 
 
-# ── CloudFormation ─────────────────────────────────────────────────────────
+# -- CloudFormation ---------------------------------------------------------
 
 RESPONSE_URL_RE = re.compile(r"^https://cloudformation-custom-resource-response-[a-z0-9-]+\.s3(\.[a-z0-9-]+)?\.amazonaws\.com/")
 
@@ -200,7 +200,7 @@ def first_failure(root, cfn=None):
     return f"{e.get('LogicalResourceId')}: {e.get('ResourceStatusReason') or e.get('ResourceStatus')}"
 
 
-# ── Release assets ─────────────────────────────────────────────────────────
+# -- Release assets ---------------------------------------------------------
 
 def b64(sha_hex):
     return base64.b64encode(bytes.fromhex(sha_hex)).decode()
@@ -469,7 +469,7 @@ def delete_switch_parameter(name, ssm=None):
             log("uninstall switch left:", e)
 
 
-# ── Tables ─────────────────────────────────────────────────────────────────
+# -- Tables -----------------------------------------------------------------
 
 RETRYABLE = ("ResourceInUseException", "LimitExceededException", "ThrottlingException", "ProvisionedThroughputExceeded", "InternalServerError")
 
@@ -520,7 +520,7 @@ def delete_tables(names, ddb=None, deadline=None, sleep=time.sleep, now=time.mon
     return left
 
 
-# ── Secret, allowlist, hybrid ──────────────────────────────────────────────
+# -- Secret, allowlist, hybrid ----------------------------------------------
 
 def read_secret(secret_id, sm=None):
     sm = sm or client("secretsmanager")
@@ -596,7 +596,7 @@ def hybrid_leave(props, sm=None, opener=None):
         return f"CoderHelm could not be reached ({e}); the address is released when the install stops answering"
 
 
-# ── Domain, status, final sweep ────────────────────────────────────────────
+# -- Domain, status, final sweep --------------------------------------------
 
 def request_domain(props, lam=None):
     host = str(props.get("Hostname") or "").strip().lower()
@@ -730,7 +730,7 @@ def delete_log_groups(prefixes, tag=None, logs=None):
     return gone, problems
 
 
-# ── Dispatch ───────────────────────────────────────────────────────────────
+# -- Dispatch ---------------------------------------------------------------
 
 def handle(event, context=None):
     kind = event["ResourceType"]
