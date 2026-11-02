@@ -391,7 +391,8 @@ impl LiveSources {
                      lists, with their schema prefix when it shows one. Filter on ids or other \
                      indexed columns, name the columns you need, and keep results small (at most \
                      200 rows come back). At most {MAX_LOOKUPS} lookups in all; one with a wrong \
-                     name still counts."
+                     name still counts. {}",
+                    redshift::DIALECT
                 ),
                 input_schema: json!({
                     "type": "object",
@@ -1961,6 +1962,14 @@ mod tests {
         assert!(p.contains("- app logs (CloudWatch logs; 4 log groups)"));
         assert!(p.contains("`db_query` to read from a database"));
         assert!(p.contains("`logs_search` to search logs"));
+    }
+
+    #[test]
+    fn the_query_tool_carries_redshift_rules() {
+        // Redshift refuses LISTAGG next to another DISTINCT aggregate; the
+        // tool says so before the agent writes one.
+        assert!(common::live::redshift::DIALECT.contains("LISTAGG"));
+        assert!(common::live::redshift::DIALECT.contains("DISTINCT aggregate"));
     }
 
     #[test]
