@@ -159,3 +159,13 @@ test("the uninstall switch: Sweep and Final read it; the helper may only read an
   assert.deepEqual(us.Action, ["ssm:GetParameter", "ssm:PutParameter", "ssm:DeleteParameter"]);
   assert.match(JSON.stringify(us.Resource), /uninstall\/delete-data/);
 });
+
+test("the updater may create change sets through the parts' LanguageExtensions transform", () => {
+  // CloudFormation checks CreateChangeSet against aws:transform/LanguageExtensions
+  // for the three parts that use it; without it an update or domain move fails there.
+  const updates: any = (rel.children as any).Updates;
+  const st = Object.values<any>(updates.Resources).filter((r) => r.Type === "AWS::IAM::Policy").map((r) => r.Properties.PolicyDocument.Statement).flat().find((s: any) => s.Sid === "ProposeThroughTransform");
+  assert.ok(st, "ProposeThroughTransform is on the updater");
+  assert.equal(st.Action, "cloudformation:CreateChangeSet");
+  assert.match(JSON.stringify(st.Resource), /:aws:transform\/LanguageExtensions/);
+});
