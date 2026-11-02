@@ -87,6 +87,12 @@ export function awsClient(ctx, region) {
     async read(svc, op, args = [], r) {
       return reader.json("aws", [svc, op, ...at(args, r)], { allowFail: true });
     },
+    /** False only when AWS says the resource is gone; any other answer (a refusal, an outage) counts as there. */
+    async exists(svc, op, args = [], r) {
+      const res = await reader.run("aws", [svc, op, ...at(args, r)], { capture: true, allowFail: true });
+      if (res.code === 0) return true;
+      return !GONE.test(String(res.stderr ?? ""));
+    },
     async write(svc, op, args = [], r) {
       const res = await ctx.runner.run("aws", [svc, op, ...at(args, r)], { capture: true, allowFail: true });
       return { ok: res.code === 0, error: String(res.stderr ?? "").trim(), out: res.stdout };
@@ -95,6 +101,27 @@ export function awsClient(ctx, region) {
 }
 
 // ── Finding the install ─────────────────────────────────────────────────
+
+/** AWS's words for a resource that no longer exists. */
+const GONE = /ResourceNotFound|NotFoundException|NoSuchEntity|NoSuchDistribution|NotFound\b|does not exist/;
+
+/**
+ * The tag index keeps a deleted resource for a while, so a tagged ARN is
+ * kept only while its own service still finds it. Kinds without a check
+ * here stay listed.
+ */
+export async function stillThere(aws, arn) {
+  if (typeof aws.exists !== "function") return true;
+  const after = (s) => arn.split(s)[1] ?? "";
+  if (arn.includes(":cognito-idp:") && arn.includes(":userpool/")) return aws.exists("cognito-idp", "describe-user-pool", ["--user-pool-id", after(":userpool/")]);
+  if (arn.includes(":event-source-mapping:")) return aws.exists("lambda", "get-event-source-mapping", ["--uuid", after(":event-source-mapping:")]);
+  if (arn.includes(":lambda:") && arn.includes(":function:")) return aws.exists("lambda", "get-function-configuration", ["--function-name", after(":function:").split(":")[0]]);
+  if (/:apigateway:[^:]*::\/apis\/[^/]+$/.test(arn)) return aws.exists("apigatewayv2", "get-api", ["--api-id", after("/apis/")]);
+  if (/:apigateway:[^:]*::\/apis\/[^/]+\/stages\//.test(arn)) { const [api, , stage] = after("/apis/").split("/"); return aws.exists("apigatewayv2", "get-stage", ["--api-id", api, "--stage-name", stage]); }
+  if (arn.includes(":cloudfront::") && arn.includes(":distribution/")) return aws.exists("cloudfront", "get-distribution", ["--id", after(":distribution/")], "us-east-1");
+  if (arn.includes(":ses:") && arn.includes(":identity/")) return aws.exists("sesv2", "get-email-identity", ["--email-identity", after(":identity/")]);
+  return true;
+}
 
 async function pages(aws, svc, op, args, key) {
   const r = await aws.read(svc, op, args);
@@ -172,7 +199,8 @@ export async function discover(ctx, base, { mode = "keep", installStatus = "", o
 
   // Everything tagged for the install in this region (and the updater's certificate in us-east-1).
   const tagged = await pages(aws, "resourcegroupstaggingapi", "get-resources", ["--tag-filters", `Key=${INSTALL_TAG},Values=${P}`], "ResourceTagMappingList");
-  inv.tagged = tagged.map((t) => t.ResourceARN);
+  inv.tagged = [];
+  for (const t of tagged) if (await stillThere(aws, t.ResourceARN)) inv.tagged.push(t.ResourceARN);
   const certs = await aws.read("resourcegroupstaggingapi", "get-resources", ["--tag-filters", `Key=${UPDATER_CERT_TAG},Values=${P}`, "--resource-type-filters", "acm:certificate"], "us-east-1");
   inv.certs = (certs?.ResourceTagMappingList ?? []).map((t) => t.ResourceARN);
   // Event source mappings of the install's functions (a failed delete can orphan them).

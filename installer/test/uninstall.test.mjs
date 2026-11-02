@@ -666,3 +666,44 @@ test("leftovers: an unused native boundary made in the last hour is left alone (
   const r = await cli(["leftovers", "--config", file], { aws: w });
   assert.ok(!/^ {2}permissions boundary +coderhelm-prod-boundary-stack/m.test(r.out), r.out);
 });
+
+test("leftovers: a resource the tag index still lists but its service no longer has is not reported", async () => {
+  // AWS's tag index keeps a deleted user pool for a while; the pool's own
+  // service says it is gone, so it isn't a leftover. A refusal is not "gone".
+  const file = cfgDir();
+  const w = leftoverWorld();
+  const stale = `arn:aws:cognito-idp:${R}:${A}:userpool/us-east-1_gone`;
+  const denied = `arn:aws:cognito-idp:${R}:${A}:userpool/us-east-1_denied`;
+  const read = w.read;
+  w.read = async (svc, op, args = [], region) => {
+    const r = await read(svc, op, args, region);
+    if (svc === "resourcegroupstaggingapi" && op === "get-resources" && !args.join(" ").includes("Key=coderhelm,")) {
+      return { ResourceTagMappingList: [...(r?.ResourceTagMappingList ?? []), { ResourceARN: stale }, { ResourceARN: denied }] };
+    }
+    return r;
+  };
+  const asked = [];
+  w.exists = async (svc, op, args = []) => {
+    asked.push(`${svc} ${op} ${args.join(" ")}`);
+    if (args.includes("us-east-1_gone")) return false;
+    return true;
+  };
+  const r = await cli(["leftovers", "--config", file], { aws: w });
+  assert.ok(asked.some((a) => a.startsWith("cognito-idp describe-user-pool") && a.includes("us-east-1_gone")), "the pool's service is asked");
+  assert.doesNotMatch(r.out, /us-east-1_gone/, "a pool its service says is gone isn't listed");
+  assert.match(r.out, /us-east-1_denied/, "one its service doesn't say is gone stays listed");
+});
+
+test("stillThere: only AWS's not-found answer counts as gone", async () => {
+  const seen = [];
+  const aws = { exists: async (svc, op, args) => { seen.push([svc, op, ...args].join(" ")); return !args.includes("gone"); } };
+  assert.equal(await un.stillThere(aws, `arn:aws:cognito-idp:${R}:${A}:userpool/gone`), false);
+  assert.equal(await un.stillThere(aws, `arn:aws:lambda:${R}:${A}:event-source-mapping:gone`), false);
+  assert.equal(await un.stillThere(aws, `arn:aws:apigateway:${R}::/apis/gone`), false);
+  assert.equal(await un.stillThere(aws, `arn:aws:apigateway:${R}::/apis/abc/stages/$default`), true);
+  assert.equal(await un.stillThere(aws, `arn:aws:cloudfront::${A}:distribution/gone`), false);
+  assert.equal(await un.stillThere(aws, `arn:aws:ses:${R}:${A}:identity/gone`), false);
+  assert.equal(await un.stillThere(aws, `arn:aws:dynamodb:${R}:${A}:table/x`), true, "kinds without a check stay");
+  assert.equal(await un.stillThere({}, `arn:aws:cognito-idp:${R}:${A}:userpool/gone`), true, "no way to ask: stays");
+  assert.ok(seen.includes("apigatewayv2 get-stage --api-id abc --stage-name $default"));
+});

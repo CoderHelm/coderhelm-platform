@@ -206,7 +206,7 @@ pub fn explain(
                 ),
                 "marketplace_failed" => (
                     format!("Bedrock refused {id}: Anthropic's terms for this model haven't been accepted in AWS Marketplace."),
-                    format!("Have someone allowed to subscribe in AWS Marketplace accept the terms for {model} on the Bedrock console's Model access page, then check again."),
+                    format!("Have someone allowed to subscribe in AWS Marketplace accept the terms for {model} on the Bedrock console's Model access page, then check again. If your teams use their own Anthropic API keys, switch this install to Anthropic API keys in Settings, System instead: while it is on Bedrock every team's runs call Bedrock, keys or not."),
                     access,
                 ),
                 "iam_denied" => (
@@ -305,5 +305,24 @@ mod tests {
         assert_eq!(a(Answer::Unreachable("x".into())).code, "unreachable");
         assert!(all_pass(&[a(Answer::Ok), nokey]));
         assert!(!all_pass(&[a(Answer::Refused(401, String::new()))]));
+    }
+
+    #[test]
+    fn marketplace_refusal_names_the_anthropic_key_way_out() {
+        // An install on Bedrock runs every team there, keys or not: the
+        // refusal says so, and how to move to the teams' own keys instead.
+        let r = explain(
+            Provider::Bedrock,
+            "claude-opus-5-5",
+            "us.anthropic.claude-opus-5-5",
+            "us-east-1",
+            "us.",
+            &Answer::Refused(403, "Model access agreement not accepted".into()),
+        );
+        assert_eq!(r.code, "marketplace_failed");
+        assert!(r.fix.contains("accept the terms"));
+        assert!(r
+            .fix
+            .contains("switch this install to Anthropic API keys in Settings, System"));
     }
 }
