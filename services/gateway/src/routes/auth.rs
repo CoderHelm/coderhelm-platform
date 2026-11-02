@@ -152,6 +152,15 @@ pub struct ConfirmResetRequest {
     pub new_password: String,
 }
 
+/// A sign-in carried over from another CoderHelm whose account there has an
+/// authenticator app: the password again, with the app's code.
+#[derive(Deserialize)]
+pub struct CarryOverCodeRequest {
+    pub email: String,
+    pub password: String,
+    pub code: String,
+}
+
 #[derive(Deserialize)]
 pub struct MfaChallengeRequest {
     pub session: String,
@@ -415,6 +424,7 @@ pub async fn login_email(
     Json(body): Json<LoginRequest>,
 ) -> Result<Response, StatusCode> {
     let email = body.email.trim().to_lowercase();
+    let started = chrono::Utc::now().timestamp();
 
     let hash = cognito_secret_hash(
         &state.cognito_client_secret,
@@ -422,7 +432,7 @@ pub async fn login_email(
         &state.config.cognito_client_id,
     );
 
-    let auth_result = state
+    let auth_result = match state
         .cognito
         .initiate_auth()
         .client_id(&state.config.cognito_client_id)
@@ -432,18 +442,39 @@ pub async fn login_email(
         .auth_parameters("SECRET_HASH", &hash)
         .send()
         .await
-        .map_err(|e| {
-            let msg = format!("{e}");
-            if msg.contains("NotAuthorizedException") {
+    {
+        Ok(r) => r,
+        Err(e) => {
+            let msg = format!("{e:?}");
+            if carry_over_asks_code(&state, &email, &msg, started).await {
+                return Ok(Json(serde_json::json!({
+                    "status": "mfa_required",
+                    "carry_over": true,
+                }))
+                .into_response());
+            }
+            return Err(if msg.contains("NotAuthorizedException") {
                 StatusCode::UNAUTHORIZED
             } else if msg.contains("UserNotConfirmedException") {
                 StatusCode::FORBIDDEN
             } else {
                 error!("Cognito auth failed: {e}");
                 StatusCode::UNAUTHORIZED
-            }
-        })?;
+            });
+        }
+    };
 
+    finish_password_login(&state, &email, &auth_result, false).await
+}
+
+/// The answer to a password sign-in that Cognito accepted: its own
+/// authenticator challenge, or the session.
+async fn finish_password_login(
+    state: &Arc<AppState>,
+    email: &str,
+    auth_result: &aws_sdk_cognitoidentityprovider::operation::initiate_auth::InitiateAuthOutput,
+    second_factor_passed: bool,
+) -> Result<Response, StatusCode> {
     // Check if MFA challenge is required
     if let Some(challenge) = auth_result.challenge_name() {
         if *challenge == aws_sdk_cognitoidentityprovider::types::ChallengeNameType::SoftwareTokenMfa
@@ -467,12 +498,120 @@ pub async fn login_email(
         .ok_or(StatusCode::INTERNAL_SERVER_ERROR)?;
 
     issue_session_from_cognito(
-        &state,
-        &email,
+        state,
+        email,
         access_token,
-        &SignInProof::new(false, "password"),
+        &SignInProof::new(second_factor_passed, "password"),
     )
     .await
+}
+
+// ── Sign-ins carried over from another CoderHelm ─────────────────────
+//
+// When a team moves to its own install, its people's first password sign-in
+// can be checked against the CoderHelm they came from (a user-migration
+// trigger on this user pool). If their account there has an authenticator
+// app, the trigger answers SECOND_FACTOR_NEEDED once the password matched,
+// and, since Cognito may not pass a trigger's message through, also sets
+// `carry_over_code_until` (the time it asked plus CARRY_OVER_ASK_SECS) on
+// their member record. Sign-in then asks for the code and tries again with
+// it as ClientMetadata `second_factor_code`.
+
+/// The trigger's word for "the password matched; send the code".
+const CARRY_OVER_WORD: &str = "SECOND_FACTOR_NEEDED";
+/// How long the trigger's mark on a member record lasts.
+const CARRY_OVER_ASK_SECS: i64 = 300;
+
+/// Whether a refused password sign-in started at `started` is a carried-over
+/// one that needs its authenticator code: the trigger's word in the error, or
+/// a mark it set during this very sign-in (a mark from an earlier try says
+/// nothing about this password).
+async fn carry_over_asks_code(state: &AppState, email: &str, err: &str, started: i64) -> bool {
+    if err.contains(CARRY_OVER_WORD) {
+        return true;
+    }
+    if !(err.contains("NotAuthorizedException") || err.contains("UserNotFoundException")) {
+        return false;
+    }
+    let records = match sign_in::records_by_email(state, email).await {
+        Ok(r) => r,
+        Err(e) => {
+            warn!(error = %e, "Member records not read for a carried-over sign-in");
+            return false;
+        }
+    };
+    records.iter().any(|r| {
+        let until = r
+            .get("carry_over_code_until")
+            .and_then(|v| v.as_n().ok())
+            .and_then(|n| n.parse::<i64>().ok());
+        let theirs = r
+            .get("email")
+            .and_then(|v| v.as_s().ok())
+            .is_some_and(|e| e.trim().eq_ignore_ascii_case(email));
+        theirs && marked_during(until, started)
+    })
+}
+
+/// A mark set by a trigger run that began at or after `started` (one second
+/// of slack for clocks).
+fn marked_during(until: Option<i64>, started: i64) -> bool {
+    until.is_some_and(|u| u - CARRY_OVER_ASK_SECS >= started - 1)
+}
+
+/// A six-digit authenticator code.
+fn is_code(code: &str) -> bool {
+    code.len() == 6 && code.bytes().all(|b| b.is_ascii_digit())
+}
+
+/// POST /auth/login/code — a carried-over sign-in's second try: the same
+/// email and password, with the authenticator code of the account they came
+/// from. Counted and paused like any wrong second-factor code.
+pub async fn login_carry_over_code(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<CarryOverCodeRequest>,
+) -> Result<Response, StatusCode> {
+    let email = body.email.trim().to_lowercase();
+    let key = sign_in::person_key(&email, "", "");
+    if let Some(left) = sign_in::lockout_left(&state, &key).await {
+        return Ok(sign_in::locked_response(left));
+    }
+    if !is_code(body.code.trim()) {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+    let hash = cognito_secret_hash(
+        &state.cognito_client_secret,
+        &email,
+        &state.config.cognito_client_id,
+    );
+    let auth_result = match state
+        .cognito
+        .initiate_auth()
+        .client_id(&state.config.cognito_client_id)
+        .auth_flow(aws_sdk_cognitoidentityprovider::types::AuthFlowType::UserPasswordAuth)
+        .auth_parameters("USERNAME", &email)
+        .auth_parameters("PASSWORD", &body.password)
+        .auth_parameters("SECRET_HASH", &hash)
+        .client_metadata("second_factor_code", body.code.trim())
+        .send()
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            if format!("{e:?}").contains("NotAuthorizedException") {
+                if let Some(left) = sign_in::record_failure(&state, &key).await {
+                    sign_in::notify_lockout(&state, &email, left).await;
+                    return Ok(sign_in::locked_response(left));
+                }
+            } else {
+                error!("Carried-over sign-in failed: {e}");
+            }
+            return Err(StatusCode::UNAUTHORIZED);
+        }
+    };
+    sign_in::record_success(&state, &key).await;
+    // The code was checked by the CoderHelm they came from.
+    finish_password_login(&state, &email, &auth_result, true).await
 }
 
 // ── MFA verify ───────────────────────────────────────────────────────
@@ -2443,6 +2582,45 @@ async fn send_welcome_email(state: &AppState, email: &str) {
     match mail::send(&super::email_settings::sender(state), &m).await {
         Ok(_) => info!("Welcome email sent"),
         Err(e) => error!(code = %e.code, "Failed to send welcome email: {}", e.message),
+    }
+}
+
+#[cfg(test)]
+mod carry_over_tests {
+    use super::*;
+
+    #[test]
+    fn a_mark_counts_only_when_set_during_this_sign_in() {
+        let started = 1_800_000_000;
+        assert!(marked_during(Some(started + CARRY_OVER_ASK_SECS), started));
+        assert!(marked_during(
+            Some(started + 2 + CARRY_OVER_ASK_SECS),
+            started
+        ));
+        // one second of clock slack
+        assert!(marked_during(
+            Some(started - 1 + CARRY_OVER_ASK_SECS),
+            started
+        ));
+        // a mark from an earlier try says nothing about this password
+        assert!(!marked_during(
+            Some(started - 60 + CARRY_OVER_ASK_SECS),
+            started
+        ));
+        assert!(!marked_during(None, started));
+    }
+
+    #[test]
+    fn a_code_is_six_digits() {
+        assert!(is_code("123456"));
+        for bad in ["", "12345", "1234567", "12345a", "12 456", "١٢٣٤٥٦"] {
+            assert!(!is_code(bad), "{bad}");
+        }
+    }
+
+    #[test]
+    fn the_trigger_word_is_the_one_the_bridge_sends() {
+        assert_eq!(CARRY_OVER_WORD, "SECOND_FACTOR_NEEDED");
     }
 }
 
