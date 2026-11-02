@@ -612,6 +612,14 @@ function nativeUpdates(scope: Construct, cfg: ResolvedConfig, fn: lambda.Functio
       StringEqualsIfExists: { "cloudformation:RoleArn": deployRole },
     },
   }));
+  // Three parts use AWS's LanguageExtensions transform, and CloudFormation
+  // checks CreateChangeSet against the transform too (AWS's own, read-only).
+  fn.addToRolePolicy(new iam.PolicyStatement({
+    sid: "ProposeThroughTransform",
+    actions: ["cloudformation:CreateChangeSet"],
+    resources: [`arn:${stack.partition}:cloudformation:${stack.region}:aws:transform/LanguageExtensions`],
+    conditions: { StringEqualsIfExists: { "cloudformation:RoleArn": deployRole } },
+  }));
   fn.addToRolePolicy(new iam.PolicyStatement({
     sid: "ReviewAndApplyReleaseUpdate",
     actions: [
