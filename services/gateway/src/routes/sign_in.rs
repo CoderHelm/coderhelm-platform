@@ -131,6 +131,21 @@ pub struct Rule {
     pub require_2fa: bool,
     /// When the rule was last turned on.
     pub since: Option<String>,
+    /// Hosted only: the team moved to its own install, which it now signs
+    /// in at (an https address). Its sessions on hosted are refused.
+    pub moved_to: Option<String>,
+}
+
+/// An install address a moved team is sent to: https with a host, nothing
+/// else (a stored value never becomes a link to anywhere else).
+pub fn moved_url(v: &str) -> Option<String> {
+    let v = v.trim();
+    let u = url::Url::parse(v).ok()?;
+    (u.scheme() == "https"
+        && u.host_str().is_some_and(|h| !h.is_empty())
+        && u.username().is_empty()
+        && u.password().is_none())
+    .then(|| v.trim_end_matches('/').to_string())
 }
 
 impl Rule {
@@ -144,6 +159,7 @@ impl Rule {
             since: Some(s(item, "require_2fa_since"))
                 .filter(|v| !v.is_empty())
                 .map(str::to_string),
+            moved_to: moved_url(s(item, "moved_to")),
         }
     }
 }
@@ -159,6 +175,7 @@ pub async fn team_rule(state: &AppState, team_id: &str) -> Result<Rule, String> 
             .map(|o| Rule {
                 require_2fa: o.require_2fa,
                 since: o.require_2fa_since,
+                moved_to: None,
             })
             .unwrap_or_default());
     }
@@ -829,6 +846,13 @@ pub fn gate(require_2fa: bool, proof: &SignInProof, handler: Option<&str>) -> bo
     !require_2fa || proof.mfa || handler.is_some_and(|h| SETUP_HANDLERS.contains(&h))
 }
 
+/// Where a moved team's session is sent instead, unless the request is one
+/// it may still make. Self-hosted rules never carry `moved_to`.
+pub fn moved_refusal<'a>(rule: &'a Rule, handler: Option<&str>) -> Option<&'a str> {
+    let url = rule.moved_to.as_deref()?;
+    (!handler.is_some_and(|h| MOVED_HANDLERS.contains(&h))).then_some(url)
+}
+
 /// Who requires it, in the words a person reads.
 fn required_by() -> &'static str {
     if applies() {
@@ -850,26 +874,48 @@ pub fn two_factor_required() -> Response {
         .into_response()
 }
 
+/// What a session of a moved team may still reach on hosted: the list of
+/// its other teams and the switch to one (signing out is outside the API).
+pub const MOVED_HANDLERS: &[&str] = &["api::list_teams", "api::switch_team"];
+
+/// The answer to a session of a team that moved to its own install.
+pub fn team_moved(url: &str) -> Response {
+    (
+        StatusCode::FORBIDDEN,
+        Json(json!({
+            "error": format!("This team now signs in at {url}."),
+            "code": "team_moved",
+            "url": url,
+        })),
+    )
+        .into_response()
+}
+
 /// The middleware's check for one session request acting in `team_id`, on
 /// either deployment. The rule is read fresh each time; when it can't be
-/// read the request is refused (the safe answer).
+/// read the request is refused (the safe answer). On hosted the rule is read
+/// even for a session with a second factor: a team that moved to its own
+/// install is refused whatever the session.
 pub async fn check_session(
     state: &AppState,
     team_id: &str,
     proof: &SignInProof,
     handler: Option<&str>,
 ) -> Result<(), Response> {
-    if proof.mfa {
+    if proof.mfa && applies() {
         return Ok(());
     }
-    let require = match team_rule(state, team_id).await {
-        Ok(rule) => rule.require_2fa,
+    let rule = match team_rule(state, team_id).await {
+        Ok(rule) => rule,
         Err(e) => {
             error!(error = %e, "Two-factor rule not read; request refused");
             return Err(StatusCode::SERVICE_UNAVAILABLE.into_response());
         }
     };
-    if gate(require, proof, handler) {
+    if let Some(url) = moved_refusal(&rule, handler) {
+        return Err(team_moved(url));
+    }
+    if gate(rule.require_2fa, proof, handler) {
         Ok(())
     } else {
         Err(two_factor_required())
@@ -3681,11 +3727,79 @@ mod tests {
             Rule::from_item(&item),
             Rule {
                 require_2fa: true,
-                since: Some("2026-10-27T00:00:00Z".into())
+                since: Some("2026-10-27T00:00:00Z".into()),
+                moved_to: None,
             }
         );
         assert_eq!(Rule::from_item(&HashMap::new()), Rule::default());
         assert!(!Rule::default().require_2fa);
+    }
+
+    #[test]
+    fn a_moved_teams_address_is_https_only() {
+        assert_eq!(
+            moved_url("https://acme.example.com/"),
+            Some("https://acme.example.com".into())
+        );
+        assert_eq!(
+            moved_url(" https://acme.example.com/app "),
+            Some("https://acme.example.com/app".into())
+        );
+        for bad in [
+            "",
+            "http://acme.example.com",
+            "javascript:alert(1)",
+            "https://",
+            "https://u:p@acme.example.com",
+            "ftp://acme.example.com",
+            "acme.example.com",
+        ] {
+            assert_eq!(moved_url(bad), None, "{bad}");
+        }
+        let item = HashMap::from([("moved_to".to_string(), attr_s("https://acme.example.com"))]);
+        assert_eq!(
+            Rule::from_item(&item).moved_to.as_deref(),
+            Some("https://acme.example.com")
+        );
+        let item = HashMap::from([("moved_to".to_string(), attr_s("http://acme.example.com"))]);
+        assert_eq!(Rule::from_item(&item).moved_to, None);
+    }
+
+    #[test]
+    fn a_moved_team_reaches_only_its_team_list_and_switch() {
+        let moved = Rule {
+            moved_to: Some("https://acme.example.com".into()),
+            ..Rule::default()
+        };
+        for h in [
+            Some("api::me"),
+            Some("api::list_runs"),
+            Some("sign_in::my_status"),
+            Some("users::mfa_setup"),
+            None,
+        ] {
+            assert_eq!(
+                moved_refusal(&moved, h),
+                Some("https://acme.example.com"),
+                "{h:?}"
+            );
+        }
+        for h in MOVED_HANDLERS {
+            assert_eq!(moved_refusal(&moved, Some(h)), None, "{h}");
+        }
+        assert_eq!(moved_refusal(&Rule::default(), Some("api::me")), None);
+        let r = team_moved("https://acme.example.com");
+        assert_eq!(r.status(), StatusCode::FORBIDDEN);
+    }
+
+    /// The moved check runs before the second-factor shortcut on hosted.
+    #[test]
+    fn a_session_with_a_second_factor_is_still_refused_when_the_team_moved() {
+        let src = include_str!("sign_in.rs");
+        let body = &src[src.find("pub async fn check_session(").unwrap()..];
+        let body = &body[..body.find("\n}\n").unwrap()];
+        assert!(body.contains("if proof.mfa && applies()"));
+        assert!(body.find("moved_refusal(").unwrap() < body.find("gate(rule.require_2fa").unwrap());
     }
 
     /// Hosted Google, GitHub and password sign-ins ask for the person's
