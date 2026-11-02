@@ -413,7 +413,7 @@ async fn config_listing(state: &AppState, email: &str) -> (bool, bool) {
     (admin, exact.is_some() || domain)
 }
 
-async fn records_by_email(state: &AppState, email: &str) -> Result<Vec<Item>, String> {
+pub(crate) async fn records_by_email(state: &AppState, email: &str) -> Result<Vec<Item>, String> {
     state
         .dynamo
         .query()

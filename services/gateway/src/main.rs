@@ -1279,6 +1279,7 @@ async fn main() -> Result<(), Error> {
         .route("/signup", post(routes::auth::signup))
         .route("/waitlist", post(routes::auth::join_waitlist))
         .route("/login", post(routes::auth::login_email))
+        .route("/login/code", post(routes::auth::login_carry_over_code))
         .route("/verify-email", post(routes::auth::verify_email))
         .route("/forgot-password", post(routes::auth::forgot_password))
         .route("/confirm-reset", post(routes::auth::confirm_reset))
