@@ -116,6 +116,28 @@ struct Done {
     session: Option<String>,
 }
 
+/// What the agent needs to know about Redshift's SQL before writing a query
+/// (the db_query tool description carries it).
+pub const DIALECT: &str = "In a Redshift warehouse: LISTAGG, PERCENTILE_CONT and MEDIAN can't \
+share a SELECT with another DISTINCT aggregate (compute each in its own subquery and join them); \
+a LISTAGG result is at most 65535 bytes, so aggregate few rows or count instead; functions such as \
+generate_series run only without tables.";
+
+/// A rewrite for a Redshift error the agent can fix in its next query, by
+/// the error's own words; None for anything else.
+pub fn dialect_hint(why: &str) -> Option<&'static str> {
+    let w = why.to_ascii_lowercase();
+    if w.contains("with other distinct aggregate function not supported") {
+        Some("Redshift can't combine LISTAGG, PERCENTILE_CONT or MEDIAN with another DISTINCT aggregate in one SELECT: compute the LISTAGG in its own subquery grouped by the same columns, the COUNT(DISTINCT ...) in another, and join them.")
+    } else if w.contains("exceeds listagg limit") {
+        Some("A LISTAGG result is at most 65535 bytes: aggregate fewer rows (filter, or LEFT() each value), or count them instead of listing them.")
+    } else if w.contains("not supported on redshift tables") {
+        Some("That function (such as generate_series) runs only on Redshift's leader node, without tables: build the series another way, for example from a table's row numbers.")
+    } else {
+        None
+    }
+}
+
 fn failed(why: &str) -> StepError {
     StepError::new(
         "read",
@@ -123,7 +145,8 @@ fn failed(why: &str) -> StepError {
             "The warehouse couldn't run that: {}",
             crate::truncate_str(why, 300)
         ),
-        "Check table and column names with the description of this warehouse.",
+        dialect_hint(why)
+            .unwrap_or("Check table and column names with the description of this warehouse."),
     )
 }
 
@@ -660,6 +683,22 @@ pub async fn connect_checks(session: &Session, t: &AwsTarget) -> WarehouseReport
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn known_redshift_errors_come_with_a_rewrite() {
+        let e = failed("ERROR: Using LISTAGG/PERCENTILE_CONT/MEDIAN aggregate functions with other distinct aggregate function not supported");
+        assert!(e.message.contains("LISTAGG"));
+        assert!(e.fix.contains("own subquery"), "{}", e.fix);
+        assert!(failed("ERROR: Result size exceeds LISTAGG limit")
+            .fix
+            .contains("65535"));
+        assert!(failed("ERROR: Specified types or functions (one per INFO message) not supported on Redshift tables.").fix.contains("leader node"));
+        // Anything else keeps the usual advice.
+        assert!(failed("ERROR: column \"x\" does not exist")
+            .fix
+            .contains("column names"));
+        assert!(dialect_hint("syntax error at or near").is_none());
+    }
+
     use super::*;
     use serde_json::json;
 
