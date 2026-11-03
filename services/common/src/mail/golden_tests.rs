@@ -98,6 +98,12 @@ fn cases() -> Vec<(&'static str, &'static str, Value, Option<&'static str>)> {
             Some("Acme"),
         ),
         (
+            "two_factor_changed",
+            "two_factor_changed",
+            json!({"link": format!("{APP}/settings/security/")}),
+            Some("Acme"),
+        ),
+        (
             "two_factor_reset",
             "two_factor_reset",
             json!({"link": format!("{APP}/settings/security/")}),

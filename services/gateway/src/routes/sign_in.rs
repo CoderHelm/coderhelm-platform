@@ -1398,6 +1398,375 @@ pub async fn app_disable(
     Ok(with_cookie(json!({ "status": "disabled" }), &cookie))
 }
 
+// ── Two-factor: replacing the authenticator app ─────────────────────
+//
+// A new phone, or an app moved: the person proves the factor they have now
+// (a current code; for a code kept on the password account, the password
+// too), scans a new secret, enters a code from it, and only then is the new
+// secret swapped in, in one conditional write. The old app stops working at
+// that moment, never before. The new factor is always this CoderHelm's own
+// authenticator-app code, so a code that was on the password account moves
+// here too (its Cognito setting is turned off after the swap, and the swap
+// is undone if that fails). Lost the old phone: an admin resets it.
+
+/// How long a started replacement waits for the new app's code.
+pub const REPLACE_TICKET_SECS: i64 = 600;
+
+#[derive(Deserialize)]
+pub struct ReplaceStartBody {
+    pub code: String,
+    #[serde(default)]
+    pub password: Option<String>,
+}
+
+/// What proving the current factor needs, from the factor there is (`app`,
+/// `cognito` or none) and whether a password came. Pure.
+pub fn replace_needs(
+    factor: Option<&str>,
+    has_password: bool,
+) -> Result<&'static str, &'static str> {
+    match factor {
+        Some("app") => Ok("app"),
+        Some("cognito") if has_password => Ok("cognito"),
+        Some("cognito") => {
+            Err("Enter your password and a current code from your authenticator app.")
+        }
+        _ => Err("Two-factor sign-in isn't on, so there's nothing to replace. Turn it on instead."),
+    }
+}
+
+/// Whether a replacement started at `started` (unix seconds) may still be
+/// finished at `now`. Pure.
+pub fn replace_ticket_fresh(started: i64, now: i64) -> bool {
+    started > 0 && now >= started && now - started <= REPLACE_TICKET_SECS
+}
+
+/// Checks a code kept on the password account: the password and a current
+/// code, through Cognito's own sign-in. `Ok(false)`: either didn't match.
+async fn cognito_code_matches(
+    state: &AppState,
+    email: &str,
+    password: &str,
+    code: &str,
+) -> Result<bool, String> {
+    let hash = crate::routes::auth::cognito_secret_hash(
+        &state.cognito_client_secret,
+        email,
+        &state.config.cognito_client_id,
+    );
+    let first = match state
+        .cognito
+        .initiate_auth()
+        .client_id(&state.config.cognito_client_id)
+        .auth_flow(aws_sdk_cognitoidentityprovider::types::AuthFlowType::UserPasswordAuth)
+        .auth_parameters("USERNAME", email)
+        .auth_parameters("PASSWORD", password)
+        .auth_parameters("SECRET_HASH", &hash)
+        .send()
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            let msg = format!("{e:?}");
+            return if msg.contains("NotAuthorizedException") {
+                Ok(false)
+            } else {
+                Err(msg)
+            };
+        }
+    };
+    if first.challenge_name()
+        != Some(&aws_sdk_cognitoidentityprovider::types::ChallengeNameType::SoftwareTokenMfa)
+    {
+        // No code is asked on the password account: nothing to prove there.
+        return Ok(false);
+    }
+    match state
+        .cognito
+        .respond_to_auth_challenge()
+        .client_id(&state.config.cognito_client_id)
+        .challenge_name(aws_sdk_cognitoidentityprovider::types::ChallengeNameType::SoftwareTokenMfa)
+        .session(first.session().unwrap_or_default())
+        .challenge_responses("SOFTWARE_TOKEN_MFA_CODE", code)
+        .challenge_responses("USERNAME", email)
+        .challenge_responses("SECRET_HASH", &hash)
+        .send()
+        .await
+    {
+        Ok(r) => Ok(r.authentication_result().is_some()),
+        Err(e) => {
+            let msg = format!("{e:?}");
+            if msg.contains("CodeMismatch")
+                || msg.contains("NotAuthorizedException")
+                || msg.contains("ExpiredCode")
+            {
+                Ok(false)
+            } else {
+                Err(msg)
+            }
+        }
+    }
+}
+
+/// POST /api/users/2fa/replace/start — prove the current factor and get a
+/// new secret to scan. Nothing changes yet: the old app keeps working until
+/// a code from the new one is entered. Wrong codes count toward the pause.
+pub async fn replace_start(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<Claims>,
+    proof: Option<Extension<SignInProof>>,
+    Json(body): Json<ReplaceStartBody>,
+) -> Result<Response, ApiError> {
+    if !proof.as_ref().is_some_and(|p| p.mfa) {
+        return Err(fail_code(
+            StatusCode::FORBIDDEN,
+            "Sign out and sign in again with your current code, then replace the app.",
+            "second_factor_needed",
+        ));
+    }
+    let item = member(&state, &claims.team_id, &claims.sub)
+        .await
+        .map_err(|e| internal("Member not read", e))?
+        .ok_or_else(|| fail(StatusCode::NOT_FOUND, "You aren't on this team."))?;
+    let home = factor_home(&state, &item)
+        .await
+        .map_err(|e| internal("Two-factor sign-in not read", e))?;
+    let factor = enrolled_factor(&state, &home)
+        .await
+        .map_err(|e| internal("Two-factor sign-in not read", e))?;
+    let password = body.password.as_deref().unwrap_or("").to_string();
+    let kind = replace_needs(factor.as_deref(), !password.is_empty())
+        .map_err(|m| fail_code(StatusCode::BAD_REQUEST, m, "cannot_replace"))?;
+    let key = person_key(&claims.email, &claims.team_id, &claims.sub);
+    if let Some(left) = lockout_left(&state, &key).await {
+        return Ok(locked_response(left));
+    }
+    let code = body.code.trim();
+    let proved = if kind == "app" {
+        use_app_code(&state, &home, code)
+            .await
+            .map_err(|e| internal("Code not checked", e))?
+    } else {
+        cognito_code_matches(&state, &claims.email, &password, code)
+            .await
+            .map_err(|e| internal("Code not checked", e))?
+    };
+    if !proved {
+        if let Some(left) = record_failure(&state, &key).await {
+            notify_lockout(&state, &claims.display_name(), left).await;
+            return Ok(locked_response(left));
+        }
+        return Err(fail_code(
+            StatusCode::BAD_REQUEST,
+            if kind == "app" {
+                "That code didn't match. Enter the current 6-digit code from your authenticator app."
+            } else {
+                "Your password or that code didn't match. Enter both again."
+            },
+            "wrong_code",
+        ));
+    }
+    record_success(&state, &key).await;
+    let (pk, sk) = (s(&home, "pk"), s(&home, "sk"));
+    let mut secret = [0u8; 20];
+    rand::RngCore::fill_bytes(&mut rand::rng(), &mut secret);
+    let sealed = seal(&state, pk, sk, &secret)
+        .await
+        .map_err(|e| internal("Two-factor secret not sealed", e))?;
+    let now = chrono::Utc::now().timestamp();
+    let up = state
+        .dynamo
+        .update_item()
+        .table_name(&state.config.users_table_name)
+        .key("pk", attr_s(pk))
+        .key("sk", attr_s(sk))
+        .expression_attribute_values(":p", attr_s(&sealed))
+        .expression_attribute_values(":t", AttributeValue::N(now.to_string()))
+        .expression_attribute_values(":f", attr_s(kind));
+    let up = if applies() {
+        up.update_expression("SET totp_replace = :p, totp_replace_at = :t, totp_replace_from = :f")
+            .condition_expression("attribute_exists(pk)")
+    } else {
+        // Hosted: the person's own record, made when it is new.
+        up.update_expression(
+            "SET totp_replace = :p, totp_replace_at = :t, totp_replace_from = :f, email = :e",
+        )
+        .expression_attribute_values(":e", attr_s(s(&home, "email")))
+    };
+    up.send()
+        .await
+        .map_err(|e| internal("Replacement not started", e))?;
+    let b32 = base32(&secret);
+    let label = if claims.email.is_empty() {
+        claims.github_login.clone().unwrap_or_default()
+    } else {
+        claims.email.clone()
+    };
+    Ok(Json(json!({
+        "secret": b32,
+        "qr_uri": otpauth_uri(&label, &b32),
+        "expires_in": REPLACE_TICKET_SECS,
+    }))
+    .into_response())
+}
+
+/// POST /api/users/2fa/replace/verify — a code from the new app. On a match
+/// the new secret replaces the old one in one conditional write; the old
+/// app stops working, every other session ends, and this one keeps its
+/// second factor. The person gets an email saying so.
+pub async fn replace_verify(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<Claims>,
+    proof: Option<Extension<SignInProof>>,
+    Json(body): Json<CodeBody>,
+) -> Result<Response, ApiError> {
+    if !proof.as_ref().is_some_and(|p| p.mfa) {
+        return Err(fail_code(
+            StatusCode::FORBIDDEN,
+            "Sign out and sign in again with your current code, then replace the app.",
+            "second_factor_needed",
+        ));
+    }
+    let item = member(&state, &claims.team_id, &claims.sub)
+        .await
+        .map_err(|e| internal("Member not read", e))?
+        .ok_or_else(|| fail(StatusCode::NOT_FOUND, "You aren't on this team."))?;
+    let home = factor_home(&state, &item)
+        .await
+        .map_err(|e| internal("Two-factor sign-in not read", e))?;
+    let (pk, sk) = (s(&home, "pk"), s(&home, "sk"));
+    let pending = s(&home, "totp_replace").to_string();
+    let started = home
+        .get("totp_replace_at")
+        .and_then(|v| v.as_n().ok())
+        .and_then(|n| n.parse::<i64>().ok())
+        .unwrap_or(0);
+    let now = chrono::Utc::now();
+    if pending.is_empty() || !replace_ticket_fresh(started, now.timestamp()) {
+        return Err(fail_code(
+            StatusCode::BAD_REQUEST,
+            "Start again: enter a current code from your old app first.",
+            "replace_not_started",
+        ));
+    }
+    let key = person_key(&claims.email, &claims.team_id, &claims.sub);
+    if let Some(left) = lockout_left(&state, &key).await {
+        return Ok(locked_response(left));
+    }
+    let secret = unseal(&state, pk, sk, &pending)
+        .await
+        .map_err(|e| internal("Two-factor secret not read", e))?;
+    let Some(step) = totp_check(&secret, &body.code, now.timestamp().max(0) as u64, 0) else {
+        if let Some(left) = record_failure(&state, &key).await {
+            notify_lockout(&state, &claims.display_name(), left).await;
+            return Ok(locked_response(left));
+        }
+        return Err(fail_code(
+            StatusCode::BAD_REQUEST,
+            "That code didn't match. Enter the current 6-digit code from the new app.",
+            "wrong_code",
+        ));
+    };
+    record_success(&state, &key).await;
+    let from = s(&home, "totp_replace_from").to_string();
+    let up = state
+        .dynamo
+        .update_item()
+        .table_name(&state.config.users_table_name)
+        .key("pk", attr_s(pk))
+        .key("sk", attr_s(sk))
+        .update_expression(
+            "SET totp_sealed = :s, totp_enabled = :t, totp_last_step = :st, two_factor = :f, \
+             totp_enabled_at = :now REMOVE totp_replace, totp_replace_at, totp_replace_from, totp_pending",
+        )
+        // Only the replacement this person started, once.
+        .condition_expression("totp_replace = :s")
+        .expression_attribute_values(":s", attr_s(&pending))
+        .expression_attribute_values(":t", AttributeValue::Bool(true))
+        .expression_attribute_values(":st", AttributeValue::N(step.to_string()))
+        .expression_attribute_values(":f", attr_s("app"))
+        .expression_attribute_values(":now", attr_s(&now.to_rfc3339()));
+    up.send()
+        .await
+        .map_err(|e| internal("Authenticator app not replaced", e))?;
+    if from == "cognito" && !claims.email.is_empty() {
+        // The old code lived on the password account: it stops there now.
+        if let Err(e) = state
+            .cognito
+            .admin_set_user_mfa_preference()
+            .user_pool_id(&state.config.cognito_user_pool_id)
+            .username(&claims.email)
+            .software_token_mfa_settings(
+                aws_sdk_cognitoidentityprovider::types::SoftwareTokenMfaSettingsType::builder()
+                    .enabled(false)
+                    .preferred_mfa(false)
+                    .build(),
+            )
+            .send()
+            .await
+        {
+            // Undo the swap so the old code keeps working and nothing is half done.
+            let _ = state
+                .dynamo
+                .update_item()
+                .table_name(&state.config.users_table_name)
+                .key("pk", attr_s(pk))
+                .key("sk", attr_s(sk))
+                .update_expression(
+                    "SET two_factor = :c REMOVE totp_sealed, totp_enabled, totp_last_step, totp_enabled_at",
+                )
+                .expression_attribute_values(":c", attr_s("cognito"))
+                .send()
+                .await;
+            return Err(internal("Old code not turned off", format!("{e:?}")));
+        }
+    }
+    super::roles::record(
+        &state,
+        &claims,
+        super::roles::AuditEntry {
+            action: "two_factor_replaced",
+            role_id: "",
+            role_name: "",
+            detail: "Replaced their authenticator app.".to_string(),
+        },
+    )
+    .await?;
+    info!(team_id = %claims.team_id, "Authenticator app replaced");
+    if claims.email.contains('@') {
+        notify_replaced(&state, &claims.team_id, &claims.email).await;
+    }
+    // Every other session of theirs ends; this one carries on, with its
+    // second factor.
+    let proof = proof.map(|p| p.0).unwrap_or_default();
+    let cookie = end_other_sessions(&state, &claims, &proof).await?;
+    Ok(with_cookie(json!({ "status": "replaced" }), &cookie))
+}
+
+/// Tells a person their authenticator app was changed, so a change they
+/// didn't make doesn't go unnoticed.
+async fn notify_replaced(state: &AppState, team_id: &str, to: &str) {
+    let link = format!(
+        "{}/settings/security/",
+        common::public_urls::app_url_from_env()
+    );
+    let text = format!(
+        "The authenticator app for your two-factor sign-in was changed. Your old app no longer works.\n\nIf you didn't do this, tell your admins and change your password now: {link}\n"
+    );
+    let mut params = serde_json::Map::new();
+    params.insert("link".into(), Value::from(link));
+    send_mail(
+        state,
+        team_id,
+        "two_factor_changed",
+        to,
+        params,
+        "Your authenticator app was changed",
+        text,
+    )
+    .await;
+}
+
 /// Why a second factor can't be turned off.
 pub fn keep_it() -> &'static str {
     if applies() {
@@ -2981,6 +3350,69 @@ async fn notify_reset(state: &AppState, team_id: &str, to: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn replacing_needs_the_current_factor() {
+        assert_eq!(replace_needs(Some("app"), false), Ok("app"));
+        assert_eq!(replace_needs(Some("cognito"), true), Ok("cognito"));
+        assert!(replace_needs(Some("cognito"), false).is_err());
+        assert!(replace_needs(None, true).is_err());
+    }
+
+    #[test]
+    fn a_started_replacement_expires() {
+        assert!(replace_ticket_fresh(1_000, 1_000));
+        assert!(replace_ticket_fresh(1_000, 1_000 + REPLACE_TICKET_SECS));
+        assert!(!replace_ticket_fresh(1_000, 1_001 + REPLACE_TICKET_SECS));
+        assert!(!replace_ticket_fresh(0, 10));
+        assert!(!replace_ticket_fresh(1_000, 999));
+    }
+
+    fn handler_body(name: &str) -> &'static str {
+        let src = include_str!("sign_in.rs");
+        let start = src.find(&format!("pub async fn {name}(")).unwrap();
+        let end = start + src[start..].find("\n}\n").unwrap();
+        &src[start..end]
+    }
+
+    #[test]
+    fn the_old_app_is_proved_before_anything_changes() {
+        let b = handler_body("replace_start");
+        // The proof (and its counted failure) comes before the new secret is written.
+        let proof = b.find("use_app_code(&state, &home, code)").unwrap();
+        let fails = b.find("record_failure(&state, &key)").unwrap();
+        let write = b.find("SET totp_replace = :p").unwrap();
+        assert!(proof < write && fails < write);
+        // Starting never touches the secret in use.
+        assert!(!b.contains("totp_sealed"));
+    }
+
+    #[test]
+    fn the_swap_needs_the_new_code_and_is_one_conditional_write() {
+        let b = handler_body("replace_verify");
+        let check = b.find("totp_check(&secret, &body.code").unwrap();
+        let swap = b.find("SET totp_sealed = :s").unwrap();
+        assert!(check < swap);
+        assert!(b.contains(".condition_expression(\"totp_replace = :s\")"));
+        assert!(b.contains("REMOVE totp_replace, totp_replace_at, totp_replace_from"));
+        assert!(b.contains("replace_ticket_fresh("));
+        // A wrong new code counts toward the pause too.
+        assert!(b.find("record_failure(&state, &key)").unwrap() < swap);
+    }
+
+    #[test]
+    fn replacing_never_runs_on_a_session_without_its_second_factor() {
+        for h in ["replace_start", "replace_verify"] {
+            assert!(
+                handler_body(h).contains("proof.as_ref().is_some_and(|p| p.mfa)"),
+                "{h}"
+            );
+            assert!(
+                !SETUP_HANDLERS.contains(&format!("sign_in::{h}").as_str()),
+                "{h}"
+            );
+        }
+    }
 
     fn rec(pk: &str, sk: &str, status: Option<&str>, invited_at: Option<&str>) -> Item {
         let mut m = HashMap::from([
