@@ -14,8 +14,17 @@ Rules:
 - A resolved finding seen again is reopened (status back to pending,
   `reopened_at`, `reopen_count`, `last_resolved_at`), never duplicated.
 - An ignored finding stays ignored; its counts and history still grow.
-- An open finding is resolved only after QUIET_DAYS without a matching line,
-  never because one run missed it.
+- An open finding (New, Acknowledged or being fixed) is resolved once it has
+  been quiet for its quiet period, never because one run missed it.
+  Acknowledging never holds a finding open.
+
+The quiet period (quiet_days_for):
+- A burst that stopped (lines on one run of consecutive days, or no daily
+  history): DEFAULT_QUIET_DAYS.
+- An error that keeps coming back: twice the longest silence it has come back
+  from, counting gaps between days with lines and the time from a resolve to
+  the reopen, so it isn't resolved while it is likely to return.
+- Never less than MIN_QUIET_DAYS (24 hours), never more than MAX_QUIET_DAYS.
 
 Pure functions only; the handler does the reads and writes.
 """
@@ -26,8 +35,10 @@ from datetime import datetime, timedelta, timezone
 import attribution
 import fingerprint
 
-# A finding is resolved after this long without a matching line.
-QUIET_DAYS = 7
+# A burst that stopped is resolved after this long without a matching line.
+DEFAULT_QUIET_DAYS = 3
+MIN_QUIET_DAYS = 1
+MAX_QUIET_DAYS = 14
 # A resolved finding seen again within this long is reopened.
 REOPEN_DAYS = 30
 # Stored findings expire this long after their last sighting (DynamoDB TTL),
@@ -137,9 +148,33 @@ def find_match(sighting, existing, now=None):
     return None
 
 
-def stale(existing, seen_ids, now=None, quiet_days=QUIET_DAYS):
-    """Open findings to resolve: pending, not seen this run, and no matching
-    line for `quiet_days`. A finding with no time at all is left open."""
+def quiet_days_for(item):
+    """How long `item` must go without a matching line before it is
+    resolved (see the module notes)."""
+    days = sorted(
+        str(h["day"])
+        for h in item.get("daily_lines") or []
+        if isinstance(h, dict) and h.get("day") and attribution.as_int(h.get("lines")) > 0
+    )
+    gaps = []
+    for a, b in zip(days, days[1:]):
+        try:
+            gap = (datetime.fromisoformat(b) - datetime.fromisoformat(a)).days
+        except ValueError:
+            continue
+        if gap > 1:
+            gaps.append(gap)
+    resolved, back = _ts(item.get("last_resolved_at")), _ts(item.get("reopened_at"))
+    if resolved and back and back > resolved:
+        gaps.append(max(1, round((back - resolved).total_seconds() / 86400)))
+    quiet = 2 * max(gaps) if gaps else DEFAULT_QUIET_DAYS
+    return max(MIN_QUIET_DAYS, min(MAX_QUIET_DAYS, quiet))
+
+
+def stale(existing, seen_ids, now=None, quiet_days=None):
+    """Open findings to resolve: pending (New, Acknowledged or being fixed),
+    not seen this run, and quiet for their quiet period (`quiet_days` when
+    given). A finding with no time at all is left open."""
     now = now or datetime.now(timezone.utc)
     out = []
     for item in existing:
@@ -148,7 +183,8 @@ def stale(existing, seen_ids, now=None, quiet_days=QUIET_DAYS):
         if item.get("merged_into"):
             continue
         last = last_sighting(item)
-        if last is not None and now - last >= timedelta(days=quiet_days):
+        days = quiet_days if quiet_days is not None else quiet_days_for(item)
+        if last is not None and now - last >= timedelta(days=days):
             out.append(item)
     return out
 

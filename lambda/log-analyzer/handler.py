@@ -744,22 +744,30 @@ def list_recent_findings(team_id, account_id, now=None):
 
 def resolve_stale_recommendations(team_id, existing, seen_ids, now=None):
     """Mark open findings resolved when this complete run didn't see them and
-    no matching line came for lifecycle.QUIET_DAYS. One missed run never
-    resolves a finding: the next sighting would have to make a new one."""
+    they have been quiet for their quiet period (lifecycle.quiet_days_for).
+    One missed run never resolves a finding. Open findings also carry their
+    quiet period (`quiet_days`) so the page can say when one resolves."""
     now_dt = now or datetime.now(timezone.utc)
     now_iso = now_dt.isoformat()
     resolved_count = 0
-    for item in lifecycle.stale(existing, seen_ids, now_dt):
+    stale = lifecycle.stale(existing, seen_ids, now_dt)
+    stale_ids = {i.get("rec_id") for i in stale}
+    for item in stale:
+        days = lifecycle.quiet_days_for(item)
+        reason = f"Resolved: no new lines for {days} day{'s' if days != 1 else ''}"
         try:
             aws_insights_table.update_item(
                 Key={"pk": team_id, "sk": item["sk"]},
-                UpdateExpression="SET #s = :s, resolved_at = :t, updated_at = :t",
+                UpdateExpression="SET #s = :s, resolved_at = :t, updated_at = :t, resolved_reason = :r, quiet_days = :q",
                 ConditionExpression="#s = :pending",
                 ExpressionAttributeNames={"#s": "status"},
-                ExpressionAttributeValues={":s": "resolved", ":t": now_iso, ":pending": "pending"},
+                ExpressionAttributeValues={
+                    ":s": "resolved", ":t": now_iso, ":pending": "pending", ":r": reason, ":q": days,
+                },
             )
             resolved_count += 1
             item["status"], item["resolved_at"] = "resolved", now_iso
+            item["resolved_reason"], item["quiet_days"] = reason, days
             emit_event(
                 team_id,
                 "log_finding.resolved",
@@ -773,6 +781,27 @@ def resolve_stale_recommendations(team_id, existing, seen_ids, now=None):
         except ClientError as e:
             if e.response.get("Error", {}).get("Code") != "ConditionalCheckFailedException":
                 logger.warning(f"Failed to resolve {item['sk']}: {e}")
+    for item in existing:
+        # Seen this run: the sighting already wrote its quiet period.
+        if item.get("rec_id") in stale_ids or item.get("rec_id") in seen_ids:
+            continue
+        if item.get("status", "pending") != "pending" or item.get("merged_into"):
+            continue
+        days = lifecycle.quiet_days_for(item)
+        if attribution.as_int(item.get("quiet_days")) == days:
+            continue
+        try:
+            aws_insights_table.update_item(
+                Key={"pk": team_id, "sk": item["sk"]},
+                UpdateExpression="SET quiet_days = :q",
+                ConditionExpression="#s = :pending",
+                ExpressionAttributeNames={"#s": "status"},
+                ExpressionAttributeValues={":q": days, ":pending": "pending"},
+            )
+            item["quiet_days"] = days
+        except ClientError as e:
+            if e.response.get("Error", {}).get("Code") != "ConditionalCheckFailedException":
+                logger.warning(f"Failed to set quiet days on {item['sk']}: {e}")
     if resolved_count:
         logger.info(f"{team_id}: {resolved_count} recommendations resolved")
 
@@ -928,6 +957,12 @@ def store_finding(team_id, account_id, cand, existing, cw_logs=None, window=None
             sighting["signature_hashes"],
         )
         history = lifecycle.add_history(match.get("daily_lines"), today, added)
+        reopening = match.get("status") == "resolved"
+        quiet = lifecycle.quiet_days_for({
+            "daily_lines": history,
+            "last_resolved_at": (match.get("resolved_at") or now) if reopening else match.get("last_resolved_at"),
+            "reopened_at": now if reopening else match.get("reopened_at"),
+        })
         values = {
             ":t": now,
             ":ttl": ttl_epoch,
@@ -944,12 +979,13 @@ def store_finding(team_id, account_id, cand, existing, cw_logs=None, window=None
             ":hist": history,
             ":fp": sighting["fingerprint"],
             ":sig": sighting["signature"][:300],
+            ":quiet": quiet,
         }
         sets = (
             "last_seen_at = :l, first_seen_at = :f, updated_at = :t, error_count = :c, "
             "seen_count = :seen, count_basis = :basis, samples = :samples, log_account_id = :acct, "
             "signature_hashes = :sigs, log_streams = :streams, also_in = :others, daily_lines = :hist, "
-            "fingerprint = if_not_exists(fingerprint, :fp), #sig = if_not_exists(#sig, :sig)"
+            "fingerprint = if_not_exists(fingerprint, :fp), #sig = if_not_exists(#sig, :sig), quiet_days = :quiet"
         )
         names = {"#sig": "signature"}
         reopened = match.get("status") == "resolved"
@@ -992,7 +1028,7 @@ def store_finding(team_id, account_id, cand, existing, cw_logs=None, window=None
         match.update({
             "last_seen_at": values[":l"], "first_seen_at": values[":f"],
             "seen_count": seen, "count_basis": "events", "signature_hashes": hashes,
-            "daily_lines": history,
+            "daily_lines": history, "quiet_days": quiet,
         })
         if reopened:
             match.update({"status": "pending", "reopened_at": now})
@@ -1024,6 +1060,7 @@ def store_finding(team_id, account_id, cand, existing, cw_logs=None, window=None
         "log_streams": streams,
         "also_in": others,
         "daily_lines": lifecycle.add_history([], today, stats["count"]),
+        "quiet_days": lifecycle.DEFAULT_QUIET_DAYS,
         "created_at": now,
         "updated_at": now,
         "first_seen_at": attribution.iso(first) or now,
