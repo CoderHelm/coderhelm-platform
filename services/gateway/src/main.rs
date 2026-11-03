@@ -1247,6 +1247,10 @@ async fn main() -> Result<(), Error> {
         .layer(axum_middleware::from_fn_with_state(
             state.clone(),
             middleware::auth::require_auth,
+        ))
+        // Outside auth: a self-hosted install has no platform pages at all.
+        .layer(axum_middleware::from_fn(
+            middleware::hosted_only::hosted_only_on_self_host,
         ));
 
     // Webhook routes (public, verified by signature)
