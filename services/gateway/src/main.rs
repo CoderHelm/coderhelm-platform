@@ -178,6 +178,10 @@ async fn main() -> Result<(), Error> {
             "/system/emails",
             get(routes::email_settings::get).put(routes::email_settings::put),
         )
+        .route(
+            "/system/emails/sender",
+            get(routes::email_settings::get_sender).put(routes::email_settings::put_sender),
+        )
         // Your own domain: status and records, set, back to the AWS address.
         .route(
             "/system/domain",

@@ -899,6 +899,49 @@ class EmailRouteTest(unittest.TestCase):
         self.assertTrue(self.sent[0]["FromEmailAddress"].startswith("=?UTF-8?B?"))
         self.assertTrue(self.sent[0]["FromEmailAddress"].endswith(" <ch@example.org>"))
 
+    def test_the_sender_name_set_in_settings_wins_over_the_config(self):
+        class ByKey:
+            def __init__(self, items):
+                self.items = items
+
+            def get_item(self, **kw):
+                item = self.items.get(kw["Key"]["sk"]["S"])
+                return {"Item": item} if item else {}
+
+        def stored(transport, sender):
+            return ByKey({"SETTINGS#EMAIL_OPTIONAL": {"data": {"S": json.dumps({"transport": transport})}},
+                          "SETTINGS#EMAIL_SENDER": {"data": {"S": json.dumps(sender)}}})
+
+        env = dict(self.env, ORGANIZATION_NAME="Config Org", EMAIL_FROM_NAME="Config Name")
+        # Own SES: the stored sender name, as typed; subjects name the stored organization.
+        u._clients["dynamodb"] = stored("ses", {"sender_name": "Acme Robots", "organization": "Acme"})
+        u.notify("s", "t", env, what="blocked", version="v0.8.0", opener=self.opener, facts=self.BLOCKED)
+        msg = self.sent[0]
+        self.assertEqual(msg["FromEmailAddress"], '"Acme Robots" <ch@example.org>')
+        self.assertEqual(msg["Content"]["Simple"]["Subject"]["Data"], "Acme CoderHelm: update to v0.8.0 needs your OK")
+        # Only an organization: "<org> CoderHelm", over the config's name.
+        self.sent.clear()
+        u._clients["dynamodb"] = stored("ses", {"organization": "Acme"})
+        u.notify("s", "t", env, what="available", version="v0.8.0", opener=self.opener)
+        self.assertEqual(self.sent[0]["FromEmailAddress"], '"Acme CoderHelm" <ch@example.org>')
+        # Nothing stored: the config, as before.
+        self.sent.clear()
+        u._clients["dynamodb"] = stored("ses", {})
+        u.notify("s", "t", env, what="available", version="v0.8.0", opener=self.opener)
+        self.assertEqual(self.sent[0]["FromEmailAddress"], '"Config Name" <ch@example.org>')
+        # A stored name with a line break is not used.
+        self.sent.clear()
+        u._clients["dynamodb"] = stored("ses", {"sender_name": "Acme\r\nBcc: x@example.org"})
+        u.notify("s", "t", env, what="available", version="v0.8.0", opener=self.opener)
+        self.assertEqual(self.sent[0]["FromEmailAddress"], '"Config Name" <ch@example.org>')
+        # Through CoderHelm: the stored organization goes to the relay.
+        u._clients["dynamodb"] = stored("coderhelm", {"sender_name": "Acme Robots", "organization": "Acme"})
+        u.notify("s", "t", env, what="available", version="v0.8.0", opener=self.opener)
+        self.assertEqual(self.posts[-1][1]["org"], "Acme")
+        u._clients["dynamodb"] = stored("coderhelm", {"sender_name": "Acme Robots"})
+        u.notify("s", "t", env, what="available", version="v0.8.0", opener=self.opener)
+        self.assertEqual(self.posts[-1][1]["org"], "Acme Robots")
+
     def test_the_available_notice_links_the_release_notes_and_names_no_command(self):
         n = u.notice("available", "v0.8.0", dict(self.env, APP_URL="https://helm.example.org"),
                      {"current": "v0.7.4", "notes": "Faster reviews on large pull requests."})

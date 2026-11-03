@@ -772,13 +772,18 @@ pub const CAPABILITIES: &[Capability] = &[
     },
     Capability {
         key: "emails",
-        label: "Choose which optional emails this install sends and whether it sends through its own Amazon SES or CoderHelm (self-hosted installs; install admins only)",
+        label: "Choose which optional emails this install sends, the name they come from, and whether it sends through its own Amazon SES or CoderHelm (self-hosted installs; install admins only)",
 
         short_label: "Choose install emails",
         min_role: "admin",
         // Also checked inside each handler: the person must be an install
         // admin (PLATFORM_ADMIN_EMAILS).
-        handlers: &["email_settings::get", "email_settings::put"],
+        handlers: &[
+            "email_settings::get",
+            "email_settings::put",
+            "email_settings::get_sender",
+            "email_settings::put_sender",
+        ],
     },
     Capability {
         key: "platform_admin",
