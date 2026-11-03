@@ -582,7 +582,13 @@ pub async fn list_users(
     // On a self-hosted install, admins see who is on the team but has never signed in here (a
     // member copied from another CoderHelm): they get a set-up email instead of an invite.
     if show_invites && super::sign_in::applies() {
-        match pool_emails(&state).await {
+        let emails: Vec<String> = users
+            .iter()
+            .filter(|u| u["status"] != "invited")
+            .filter_map(|u| u["email"].as_str().map(normalize_email))
+            .filter(|e| !e.is_empty())
+            .collect();
+        match pool_emails(&state, emails).await {
             Ok(pool) => {
                 for u in users.iter_mut() {
                     let email = u["email"].as_str().map(normalize_email).unwrap_or_default();
@@ -600,35 +606,30 @@ pub async fn list_users(
     Ok(Json(json!({ "users": users })))
 }
 
-/// Everyone who can sign in on this install, by email.
-async fn pool_emails(state: &AppState) -> Result<std::collections::HashSet<String>, String> {
-    let mut out = std::collections::HashSet::new();
-    let mut token: Option<String> = None;
-    loop {
-        let mut req = state
+/// Which of these emails can sign in on this install (Cognito has them). An email whose lookup
+/// fails is counted as signed in, so no set-up email is offered on a guess.
+async fn pool_emails(
+    state: &AppState,
+    emails: Vec<String>,
+) -> Result<std::collections::HashSet<String>, String> {
+    let checks = emails.into_iter().map(|email| async move {
+        let r = state
             .cognito
-            .list_users()
+            .admin_get_user()
             .user_pool_id(&state.config.cognito_user_pool_id)
-            .attributes_to_get("email");
-        if let Some(t) = &token {
-            req = req.pagination_token(t);
+            .username(&email)
+            .send()
+            .await;
+        match r {
+            Err(e) if format!("{e:?}").contains("UserNotFound") => None,
+            _ => Some(email),
         }
-        let page = req.send().await.map_err(|e| format!("{e}"))?;
-        for u in page.users() {
-            for a in u.attributes() {
-                if a.name() == "email" {
-                    if let Some(v) = a.value() {
-                        out.insert(normalize_email(v));
-                    }
-                }
-            }
-        }
-        match page.pagination_token() {
-            Some(t) if !t.is_empty() => token = Some(t.to_string()),
-            _ => break,
-        }
-    }
-    Ok(out)
+    });
+    Ok(futures::future::join_all(checks)
+        .await
+        .into_iter()
+        .flatten()
+        .collect())
 }
 
 /// A member (not an invite) with an email who has no sign-in on this install.
