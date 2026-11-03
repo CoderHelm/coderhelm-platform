@@ -2155,12 +2155,12 @@ fn feedback_tools() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "restore_file".to_string(),
-            description: "Restore a file to its EXACT content at a git ref without loading the content into your context (byte-exact, any size). Use it to recover a file a bad merge corrupted, or to REMOVE an out-of-scope change by restoring the file to the PR's base. IMPORTANT: to remove out-of-scope changes, OMIT from_ref — it defaults to this PR's base branch. Do NOT pass \"main\": this PR's base may be a different branch (e.g. `develop`), and restoring to `main` leaves the out-of-scope change in the diff. Only pass from_ref for an unusual source (a specific commit SHA).".to_string(),
+            description: "Restore a file to its EXACT content at a git ref without loading the content into your context (byte-exact, any size). Use it to recover a file a bad merge corrupted, or to REMOVE an out-of-scope change by restoring the file to the PR's base. IMPORTANT: to remove out-of-scope changes, OMIT from_ref — it defaults to this PR's base branch. Do NOT pass \"main\": this PR's base may be a different branch (e.g. `develop`), and restoring to `main` leaves the out-of-scope change in the diff. Only pass from_ref for an unusual source (a specific commit SHA). Another branch is refused: never copy another pull request's files into this one.".to_string(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
                     "path": {"type": "string", "description": "File path relative to repo root"},
-                    "from_ref": {"type": "string", "description": "Optional git ref to restore from (a commit SHA). Omit to restore from this PR's base branch — that is what removes an out-of-scope change."},
+                    "from_ref": {"type": "string", "description": "Optional commit SHA to restore from (other branches are refused). Omit to restore from this PR's base branch — that is what removes an out-of-scope change."},
                     "message": {"type": "string", "description": "Commit message (optional)"}
                 },
                 "required": ["path"]
@@ -2663,6 +2663,9 @@ impl<'a> ToolExecutor for FeedbackToolExecutor<'a> {
                     .and_then(|v| v.as_str())
                     .filter(|s| !s.trim().is_empty())
                     .unwrap_or(self.base_branch);
+                if let Some(no) = super::stack::restore_refusal(from_ref, self.base_branch) {
+                    return Ok(json!(no));
+                }
                 let message = input
                     .get("message")
                     .and_then(|v| v.as_str())

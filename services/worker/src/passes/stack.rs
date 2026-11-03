@@ -10,6 +10,11 @@
 //!   blocked by or comes after it), or the ticket key of one, starts its
 //!   branch from that pull request's branch, and its pull request targets
 //!   that branch (stacked). It states the dependency and the merge order.
+//!   Two more signals need no dependency words: a ticket titled as part of a
+//!   series (`[Name 2/4]`) builds on the latest earlier part that still has
+//!   an open pull request ([`series`]), and a ticket that names a file the
+//!   base branch doesn't have yet builds on the one open pull request that
+//!   adds it ([`by_files`]).
 //! - [`copied`]: before the pull request opens, the branch's commits are
 //!   compared with every other open pull request's commits by patch id (the
 //!   change itself, whitespace and line numbers aside). A branch that
@@ -175,21 +180,190 @@ pub fn pick(
     None
 }
 
-/// The open pull request the ticket says it depends on, if any.
+/// A ticket title's place in a series: `[Name 2/4]` anywhere in it gives
+/// ("name", 2, 4), the name lowercased. None for part 0 or a part past the
+/// total.
+pub fn series(title: &str) -> Option<(String, u32, u32)> {
+    static SERIES: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+    let re = SERIES.get_or_init(|| {
+        Regex::new(r"\[\s*([A-Za-z][^\[\]/]*?)\s+(\d{1,3})\s*/\s*(\d{1,3})\s*\]").unwrap()
+    });
+    let c = re.captures(title)?;
+    let n: u32 = c[2].parse().ok()?;
+    let m: u32 = c[3].parse().ok()?;
+    (n >= 1 && n <= m).then(|| (c[1].trim().to_ascii_lowercase(), n, m))
+}
+
+/// The open pull request of the latest earlier part of the same series
+/// (same name and total, a lower part number), from this repository and
+/// never the run's own branch.
+pub fn pick_series(
+    open: &[Value],
+    title: &str,
+    owner: &str,
+    repo: &str,
+    own_branch: &str,
+) -> Option<Dependency> {
+    let (name, n, m) = series(title)?;
+    let full = format!("{owner}/{repo}").to_ascii_lowercase();
+    open.iter()
+        .filter(|p| {
+            p["head"]["repo"]["full_name"]
+                .as_str()
+                .is_some_and(|f| f.eq_ignore_ascii_case(&full))
+                && p["head"]["ref"].as_str().is_some_and(|b| b != own_branch)
+        })
+        .filter_map(|p| {
+            let (pn, k, pm) = series(p["title"].as_str()?)?;
+            (pn == name && pm == m && k < n).then_some((k, p))
+        })
+        .max_by_key(|(k, _)| *k)
+        .map(|(k, p)| Dependency {
+            number: p["number"].as_u64().unwrap_or(0),
+            branch: p["head"]["ref"].as_str().unwrap_or("").to_string(),
+            title: p["title"].as_str().unwrap_or("").to_string(),
+            why: format!("This ticket is part {n} of {m}; part {k}'s pull request is still open."),
+        })
+}
+
+/// Repository paths a ticket names (`apps/web/src/ui/heading.tsx`): a
+/// relative path with a directory and an extension, at most 10, in order.
+pub fn named_paths(text: &str) -> Vec<String> {
+    static PATH: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+    let re = PATH.get_or_init(|| {
+        Regex::new(
+            r"(?:^|[\s(`'\x22\[])((?:[A-Za-z0-9_@.\-]+/)+[A-Za-z0-9_.\-\[\]]+\.[A-Za-z0-9]{1,8})\b",
+        )
+        .unwrap()
+    });
+    let mut out: Vec<String> = Vec::new();
+    for c in re.captures_iter(text) {
+        let p = c[1].trim_start_matches("./").to_string();
+        if p.contains("://") || p.starts_with('.') || p.contains("..") || out.contains(&p) {
+            continue;
+        }
+        out.push(p);
+        if out.len() == 10 {
+            break;
+        }
+    }
+    out
+}
+
+/// The one open pull request that adds the files a ticket names and the
+/// base branch lacks: `changes` is each candidate (from this repository,
+/// never the run's own branch) with the paths it changes. The pull request
+/// covering the most missing paths wins; a tie is no dependency.
+pub fn by_files(missing: &[String], changes: &[(Value, Vec<String>)]) -> Option<Dependency> {
+    if missing.is_empty() {
+        return None;
+    }
+    let mut best: Option<(usize, &Value, &String)> = None;
+    let mut tie = false;
+    for (p, files) in changes {
+        let hit: Vec<&String> = missing.iter().filter(|m| files.contains(m)).collect();
+        if hit.is_empty() {
+            continue;
+        }
+        match best {
+            Some((n, _, _)) if hit.len() < n => {}
+            Some((n, _, _)) if hit.len() == n => tie = true,
+            _ => {
+                best = Some((hit.len(), p, hit[0]));
+                tie = false;
+            }
+        }
+    }
+    if tie {
+        return None;
+    }
+    best.map(|(_, p, path)| Dependency {
+        number: p["number"].as_u64().unwrap_or(0),
+        branch: p["head"]["ref"].as_str().unwrap_or("").to_string(),
+        title: p["title"].as_str().unwrap_or("").to_string(),
+        why: format!(
+            "The ticket names `{path}`, which the base branch doesn't have yet; this pull request adds it."
+        ),
+    })
+}
+
+/// The open pull request the ticket depends on, if any: one it names in a
+/// line that says so, else the latest open earlier part of its series,
+/// else the one open pull request that adds a file it names and `base`
+/// lacks.
+#[allow(clippy::too_many_arguments)]
 pub async fn dependency(
     github: &GitHubClient,
     owner: &str,
     repo: &str,
     ticket_id: &str,
+    title: &str,
     text: &str,
+    base: &str,
     own_branch: &str,
 ) -> Option<Dependency> {
     let (prs, keys) = named(text, owner, repo, ticket_id);
-    if prs.is_empty() && keys.is_empty() {
+    let paths = named_paths(text);
+    if prs.is_empty() && keys.is_empty() && series(title).is_none() && paths.is_empty() {
         return None;
     }
     let open = github.list_open_pulls(owner, repo).await.ok()?;
-    pick(open.as_array()?, &prs, &keys, owner, repo, own_branch)
+    let open = open.as_array()?;
+    if let Some(d) = pick(open, &prs, &keys, owner, repo, own_branch) {
+        return Some(d);
+    }
+    if let Some(d) = pick_series(open, title, owner, repo, own_branch) {
+        return Some(d);
+    }
+    let mut missing = Vec::new();
+    for p in &paths {
+        if !github.file_exists(owner, repo, p, base).await {
+            missing.push(p.clone());
+        }
+    }
+    if missing.is_empty() {
+        return None;
+    }
+    let full = format!("{owner}/{repo}").to_ascii_lowercase();
+    let mut changes = Vec::new();
+    for p in open
+        .iter()
+        .filter(|p| {
+            p["head"]["repo"]["full_name"]
+                .as_str()
+                .is_some_and(|f| f.eq_ignore_ascii_case(&full))
+                && p["head"]["ref"].as_str().is_some_and(|b| b != own_branch)
+        })
+        .take(MAX_PRS)
+    {
+        let Some(n) = p["number"].as_u64() else {
+            continue;
+        };
+        if let Ok(files) = github.list_pull_files(owner, repo, n).await {
+            changes.push((p.clone(), files.into_iter().map(|(f, _)| f).collect()));
+        }
+    }
+    by_files(&missing, &changes)
+}
+
+/// Why `restore_file` refuses a source: only the pull request's own base
+/// branch or a commit (a hex SHA) may be restored from. Restoring a file
+/// from another branch copies that branch's work under new commits, which
+/// is how a run once re-created another open pull request's commits; a
+/// ticket that needs another branch's work is stacked on it when the run
+/// starts ([`for_ticket`]).
+pub fn restore_refusal(from_ref: &str, base: &str) -> Option<String> {
+    let r = from_ref.trim();
+    let is_sha = (7..=40).contains(&r.len()) && r.chars().all(|c| c.is_ascii_hexdigit());
+    if r == base || is_sha {
+        return None;
+    }
+    Some(format!(
+        "Not restored: `{r}` isn't this pull request's base (`{base}`) or a commit. Copying files \
+         from another branch re-creates its work under new commits. Leave from_ref out to restore \
+         from the base; if this ticket needs another open pull request's changes, say so in the \
+         pull request (it should be stacked on that pull request's branch) instead of copying them."
+    ))
 }
 
 /// Why a run refuses to open its pull request: its branch copied another
@@ -219,7 +393,9 @@ pub async fn for_ticket(
         &msg.repo_owner,
         &msg.repo_name,
         &msg.ticket_id,
+        &msg.title,
         &text,
+        &msg.base_branch,
         "",
     )
     .await
@@ -524,6 +700,134 @@ mod tests {
         assert!(s.contains("Merge order: #42 first, then this one."));
         // The run's own branch is never its own dependency.
         assert!(pick(&open, &[43], &[], "acme", "web", "coderhelm/abc-99").is_none());
+    }
+
+    #[test]
+    fn a_series_title_gives_its_name_part_and_total() {
+        assert_eq!(
+            series("[Titles 2/4] Sections are too big"),
+            Some(("titles".into(), 2, 4))
+        );
+        assert_eq!(
+            series("ABC-12: [Nav polish 3 / 5] Menu"),
+            Some(("nav polish".into(), 3, 5))
+        );
+        assert_eq!(series("Fix [2/4] things"), None);
+        assert_eq!(series("[Titles 5/4] too far"), None);
+        assert_eq!(series("[Titles 0/4] zero"), None);
+        assert_eq!(series("No series here"), None);
+    }
+
+    #[test]
+    fn a_later_part_stacks_on_the_latest_open_earlier_part() {
+        let open = vec![
+            pr(
+                10,
+                "coderhelm/abc-1",
+                "[Titles 1/4] Shared heading",
+                "acme/web",
+            ),
+            pr(11, "coderhelm/abc-3", "[Titles 3/4] Body text", "acme/web"),
+            pr(12, "other", "[Buttons 1/4] Not this series", "acme/web"),
+            pr(
+                13,
+                "coderhelm/abc-0",
+                "[Titles 1/3] Different total",
+                "acme/web",
+            ),
+            pr(14, "fork", "[Titles 2/4] A fork", "someone/web"),
+        ];
+        let d = pick_series(
+            &open,
+            "[Titles 2/4] Sections",
+            "acme",
+            "web",
+            "coderhelm/abc-2",
+        )
+        .unwrap();
+        assert_eq!((d.number, d.branch.as_str()), (10, "coderhelm/abc-1"));
+        assert!(d.why.contains("part 2 of 4"));
+        // Part 4 builds on part 3, the latest earlier part still open.
+        let d = pick_series(
+            &open,
+            "[Titles 4/4] Footer",
+            "acme",
+            "web",
+            "coderhelm/abc-4",
+        )
+        .unwrap();
+        assert_eq!(d.number, 11);
+        // The first part, or a series whose earlier parts merged (no open pull
+        // request), starts from the default branch.
+        assert!(pick_series(&open, "[Titles 1/4] Shared heading", "acme", "web", "x").is_none());
+        let merged: Vec<Value> = open.iter().filter(|p| p["number"] != 10).cloned().collect();
+        assert!(pick_series(&merged, "[Titles 2/4] Sections", "acme", "web", "x").is_none());
+        // Never the run's own branch.
+        assert!(pick_series(&open, "[Titles 2/4] S", "acme", "web", "coderhelm/abc-1").is_none());
+    }
+
+    #[test]
+    fn a_ticket_names_repository_paths() {
+        let text = "Switch to the shared Heading (apps/web/src/components/ui/heading.tsx).\n\
+                    Don't change `apps/web/src/components/ui/heading.tsx` or e2e/test-map.json.\n\
+                    See https://example.com/docs/page.html and ../outside/x.ts and v1.2.";
+        assert_eq!(
+            named_paths(text),
+            vec![
+                "apps/web/src/components/ui/heading.tsx".to_string(),
+                "e2e/test-map.json".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn a_named_file_only_an_open_pr_adds_makes_that_pr_the_base() {
+        let missing = vec!["web/ui/heading.tsx".to_string()];
+        let a = (
+            pr(20, "coderhelm/abc-1", "Shared heading", "acme/web"),
+            vec![
+                "web/ui/heading.tsx".to_string(),
+                "web/ui/heading.test.tsx".to_string(),
+            ],
+        );
+        let b = (
+            pr(21, "unrelated", "Other work", "acme/web"),
+            vec!["web/x.ts".to_string()],
+        );
+        let d = by_files(&missing, &[a.clone(), b.clone()]).unwrap();
+        assert_eq!(d.number, 20);
+        assert!(d.why.contains("`web/ui/heading.tsx`"));
+        // Two pull requests adding the same file: no guess.
+        let c = (
+            pr(22, "another", "Also a heading", "acme/web"),
+            vec!["web/ui/heading.tsx".to_string()],
+        );
+        assert!(by_files(&missing, &[a.clone(), c]).is_none());
+        // Nothing missing on the base: no dependency.
+        assert!(by_files(&[], &[a, b]).is_none());
+    }
+
+    #[test]
+    fn restore_file_only_restores_from_the_base_or_a_commit() {
+        assert!(restore_refusal("main", "main").is_none());
+        assert!(restore_refusal("coderhelm/abc-1", "coderhelm/abc-1").is_none());
+        assert!(restore_refusal("4d17cbb", "main").is_none());
+        assert!(restore_refusal("86f5835aa1b2c3d4e5f60718293a4b5c6d7e8f90", "main").is_none());
+        let no = restore_refusal("coderhelm/abc-1", "main").unwrap();
+        assert!(no.contains("isn't this pull request's base"));
+        assert!(restore_refusal("develop", "main").is_some());
+    }
+
+    #[test]
+    fn a_correctly_stacked_branch_copies_nothing() {
+        // Stacked on the dependency, the branch's commits (compared against
+        // its base, the dependency's branch) are only its own changes.
+        let theirs = vec![("d1".to_string(), 1u64), ("d2".to_string(), 2u64)];
+        let ours = vec![("o1".to_string(), 3u64), ("o2".to_string(), 4u64)];
+        assert!(matches(&ours, &theirs).is_empty());
+        // Copied commits (same change, new hash) are what the guard catches.
+        let copied = vec![("c1".to_string(), 1u64), ("o1".to_string(), 3u64)];
+        assert_eq!(matches(&copied, &theirs), vec!["c1".to_string()]);
     }
 
     #[test]
