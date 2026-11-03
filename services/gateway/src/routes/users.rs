@@ -1373,6 +1373,13 @@ async fn get_team_name(state: Arc<AppState>, claims: &Claims) -> String {
         .unwrap_or_else(|| claims.email.clone())
 }
 
+/// Where an invite email sends someone: the sign-in page with the account form
+/// open. On a self-hosted install this link is the only way a new person makes
+/// an account (its sign-in page has no open sign-up).
+pub(crate) fn invite_link(app: &str) -> String {
+    format!("{}/?invite=1", app.trim_end_matches('/'))
+}
+
 async fn send_invite_email(
     state: &AppState,
     team: &str,
@@ -1405,7 +1412,7 @@ async fn send_invite_email(
                     "team": fit(org, 80),
                     "inviter": fit(inviter_name, 80),
                     "role": role,
-                    "link": common::public_urls::app_url_from_env(),
+                    "link": invite_link(common::public_urls::app_url_from_env()),
                 })
                 .as_object()
                 .cloned()
@@ -1427,6 +1434,18 @@ async fn send_invite_email(
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn an_invite_link_opens_the_account_form() {
+        assert_eq!(
+            invite_link("https://helm.example.org"),
+            "https://helm.example.org/?invite=1"
+        );
+        assert_eq!(
+            invite_link("https://helm.example.org/"),
+            "https://helm.example.org/?invite=1"
+        );
+    }
     use super::*;
 
     #[test]
