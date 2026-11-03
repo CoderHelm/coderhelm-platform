@@ -135,7 +135,8 @@ export function parameters(): Json {
     UpdateTimezone: { Type: "String", Default: "UTC", AllowedPattern: "^(UTC|[A-Za-z_]+(/[A-Za-z0-9_+-]+)+)$", Description: "The window's time zone, e.g. Europe/Berlin." },
     KeepDataOnDelete: { Type: "String", Default: "true", AllowedValues: ["true", "false"], Description: "true: deleting this stack keeps the tables, data buckets, keys, user pool and secret. false: deleting it removes them too (keys after AWS's 7-day minimum)." },
     SetupToken: { Type: "String", Default: "", NoEcho: true, AllowedPattern: "^$|^[A-Za-z0-9]{32,64}$", Description: "A one-time key from the install guide that lets it hand your new GitHub App's keys to this install. Empty to create the GitHub App later." },
-    StatusId: { Type: "String", Default: "", AllowedPattern: "^$|^[a-z0-9]{16}$", Description: "Lets the install guide show progress (a small public status file with the phase and your URL). Empty for none." },
+    StatusId: { Type: "String", Default: "", AllowedPattern: "^$|^[a-z0-9]{16}$", Description: "Lets the install guide show progress: each phase is reported to CoderHelm with StatusKey, and only the guide that made the key can read it. Nothing in your account is public. Empty for none." },
+    StatusKey: { Type: "String", Default: "", NoEcho: true, AllowedPattern: "^$|^[A-Za-z0-9]{32,64}$", Description: "The install guide's key for its progress (see StatusId). Empty for none." },
     DomainCertificateArn: { Type: "String", Default: "", Description: "Set by CoderHelm's stack update once your domain's certificate is issued. Leave empty." },
     DomainZoneId: { Type: "String", Default: "", Description: "No longer used: CoderHelm never changes DNS (kept so older stacks update). Leave empty." },
   };
@@ -190,7 +191,8 @@ export function helperPolicy(): PolicyDocument {
       { Sid: "OwnLog", Effect: "Allow", Action: ["logs:CreateLogStream", "logs:PutLogEvents"], Resource: `${at("logs")}:log-group:/aws/lambda/${p}-install-helper:*` },
       { Sid: "ReleaseFiles", Effect: "Allow", Action: ["s3:GetObject", "s3:PutObject", "s3:DeleteObject", "s3:ListBucket", "s3:ListBucketVersions", "s3:DeleteObjectVersion"], Resource: [`arn:\${AWS::Partition}:s3:::${p}-release-\${AWS::AccountId}`, `arn:\${AWS::Partition}:s3:::${p}-release-\${AWS::AccountId}/*`] },
       { Sid: "EmptyDataBucketsOnDelete", Effect: "Allow", Action: ["s3:ListBucket", "s3:ListBucketVersions", "s3:DeleteObject", "s3:DeleteObjectVersion"], Resource: [`arn:\${AWS::Partition}:s3:::${p}-*`, `arn:\${AWS::Partition}:s3:::${p}-*/*`] },
-      { Sid: "StatusFile", Effect: "Allow", Action: ["s3:PutObject", "s3:PutBucketPolicy", "s3:ListBucket", "s3:ListBucketVersions", "s3:DeleteObject", "s3:DeleteObjectVersion"], Resource: ["arn:${AWS::Partition}:s3:::coderhelm-setup-${StatusId}", "arn:${AWS::Partition}:s3:::coderhelm-setup-${StatusId}/*"] },
+      // An older release's public progress bucket: deleted, never written (progress goes to CoderHelm with the guide's key).
+      { Sid: "RetireProgressBucket", Effect: "Allow", Action: ["s3:DeleteBucketPolicy", "s3:DeleteBucket", "s3:ListBucket", "s3:ListBucketVersions", "s3:DeleteObject", "s3:DeleteObjectVersion"], Resource: ["arn:${AWS::Partition}:s3:::coderhelm-setup-${StatusId}", "arn:${AWS::Partition}:s3:::coderhelm-setup-${StatusId}/*"] },
       // DeleteSecret: only on a stack delete with KeepDataOnDelete=false (Final).
       { Sid: "Secret", Effect: "Allow", Action: ["secretsmanager:GetSecretValue", "secretsmanager:PutSecretValue", "secretsmanager:DeleteSecret"], Resource: `${at("secretsmanager")}:secret:coderhelm/\${Stage}/secrets-??????` },
       { Sid: "AllowlistAndTablesOnDelete", Effect: "Allow", Action: ["dynamodb:BatchWriteItem", "dynamodb:DescribeTable", "dynamodb:DeleteTable", "dynamodb:UpdateTable"], Resource: [`${at("dynamodb")}:table/${p}`, `${at("dynamodb")}:table/${p}-*`] },
@@ -231,7 +233,7 @@ export function deployRolePolicy(n: AccessNames): PolicyDocument {
       // The install's secret: read and update its settings, never delete it (its value comes from the helper and the gateway).
       { Sid: "InstallSecret", Effect: "Allow", Action: ["secretsmanager:DescribeSecret", "secretsmanager:GetSecretValue", "secretsmanager:UpdateSecret", "secretsmanager:TagResource", "secretsmanager:UntagResource"], Resource: "arn:${AWS::Partition}:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:coderhelm/${Stage}/secrets-??????" },
       { Sid: "SecretPassword", Effect: "Allow", Action: "secretsmanager:GetRandomPassword", Resource: "*" },
-      // The install guide's progress bucket.
+      // An older release's progress bucket, so CloudFormation can remove it on update.
       { Sid: "ProgressBucket", Effect: "Allow", Action: "s3:*", Resource: ["arn:${AWS::Partition}:s3:::coderhelm-setup-${StatusId}", "arn:${AWS::Partition}:s3:::coderhelm-setup-${StatusId}/*"] },
     ],
   };
@@ -377,24 +379,15 @@ export function buildParent(input: ParentInput): Json {
     Type: "Custom::ReleaseAssets",
     Properties: { ...helper, Bucket: { Ref: "AssetsBucket" }, BaseUrl: `${RELEASE_BUCKET_URL}/${version}`, Version: version, Files: files },
   };
-  R.StatusBucket = {
-    Type: "AWS::S3::Bucket",
-    Condition: "HasStatus",
-    Properties: {
-      BucketName: sub("coderhelm-setup-${StatusId}"),
-      OwnershipControls: { Rules: [{ ObjectOwnership: "BucketOwnerEnforced" }] },
-      PublicAccessBlockConfiguration: { BlockPublicAcls: true, IgnorePublicAcls: true, BlockPublicPolicy: false, RestrictPublicBuckets: false },
-      CorsConfiguration: { CorsRules: [{ AllowedMethods: ["GET", "HEAD"], AllowedOrigins: ["*"], MaxAge: 300 }] },
-      LifecycleConfiguration: { Rules: [{ Id: "expire-progress", Status: "Enabled", ExpirationInDays: 30 }] },
-    },
-  };
+  // Progress goes to CoderHelm with the guide's key; nothing in the account is public.
   const statusProps = {
-    StatusBucket: { "Fn::If": ["HasStatus", { Ref: "StatusBucket" }, ""] },
+    StatusId: { Ref: "StatusId" },
+    StatusKey: { Ref: "StatusKey" },
     Version: version,
     Stage: { Ref: "Stage" },
     Region: { Ref: "AWS::Region" },
   };
-  const statusOn = { ...statusProps, StatusBucket: { Ref: "StatusBucket" } };
+  const statusOn = statusProps;
   R.StatusStart = { Type: "Custom::Status", Condition: "HasStatus", Properties: { ...helper, ...statusOn, Phase: "start" } };
   // Deleted after every part (they depend on it): certificates, and logs Lambda made by itself.
   R.Final = {
@@ -403,7 +396,7 @@ export function buildParent(input: ParentInput): Json {
       ...helper,
       Prefix: sub("coderhelm-${Stage}"),
       KeepData: { Ref: "KeepDataOnDelete" },
-      StatusBucket: statusProps.StatusBucket,
+      StatusId: { Ref: "StatusId" },
       LogGroupPrefixes: [sub("/aws/lambda/coderhelm-${Stage}-"), sub("/aws/codebuild/coderhelm-${Stage}-")],
       LogGroupNames: declaredLogGroups(children).map((x) => sub(x)),
       SecretId: { Ref: "InstallSecret" },
@@ -540,7 +533,7 @@ export function buildParent(input: ParentInput): Json {
           { Label: { default: "Who may join" }, Parameters: ["SignupDomain", "RequireTwoFactor"] },
           { Label: { default: "Optional" }, Parameters: ["EmailTransport", "EmailFrom", "BedrockInferencePrefix"] },
           { Label: { default: "Optional: updates" }, Parameters: ["AutoUpdate", "UpdateDay", "UpdateHour", "UpdateTimezone"] },
-          { Label: { default: "Filled in by the install guide or by CoderHelm (leave as they are)" }, Parameters: ["StatusId", "SetupToken", "DomainCertificateArn", "DomainZoneId"] },
+          { Label: { default: "Filled in by the install guide or by CoderHelm (leave as they are)" }, Parameters: ["StatusId", "StatusKey", "SetupToken", "DomainCertificateArn", "DomainZoneId"] },
         ],
       },
       CoderHelm: { version, files: files.length },

@@ -162,7 +162,12 @@ test("only the helper writes release files; its deletes reach only this install'
   const by = (sid: string) => doc.Statement.find((x) => x.Sid === sid)!;
   assert.deepEqual(by("CertificatesOnDelete").Condition, { StringEquals: { "aws:RequestedRegion": "us-east-1", "aws:ResourceTag/coderhelm": "coderhelm-${Stage}" } });
   assert.ok(!JSON.stringify(doc).includes("route53:"), "the helper has no Route 53 access");
-  assert.deepEqual(by("StatusFile").Resource, ["arn:${AWS::Partition}:s3:::coderhelm-setup-${StatusId}", "arn:${AWS::Partition}:s3:::coderhelm-setup-${StatusId}/*"]);
+  // An older release's public progress bucket is only ever deleted: no write, no bucket policy.
+  assert.deepEqual(by("RetireProgressBucket").Resource, ["arn:${AWS::Partition}:s3:::coderhelm-setup-${StatusId}", "arn:${AWS::Partition}:s3:::coderhelm-setup-${StatusId}/*"]);
+  for (const s of doc.Statement) {
+    const acts = ([] as string[]).concat(s.Action as string | string[]);
+    assert.ok(!acts.some((a) => /^s3:(PutBucketPolicy|PutBucketAcl|PutObjectAcl|PutPublicAccessBlock|DeletePublicAccessBlock)$/.test(a)), `${s.Sid}: nothing may make a bucket public`);
+  }
 });
 
 test("the helper may only do what security.md lists", () => {
@@ -468,8 +473,9 @@ test("the bar: every piece the real uninstall left is owned and removed by the s
   assert.match(R.Helper.Properties.Code.ZipFile, /def delete_tables\(/);
   // The certificate the updater requested is deleted by Final, after the distribution is gone.
   assert.match(R.Helper.Properties.Code.ZipFile, /def delete_certificates\(/);
-  // The progress bucket is the stack's (emptied by Final), not retained.
-  assert.notEqual(R.StatusBucket.DeletionPolicy, "Retain");
+  // No progress bucket at all: progress goes to CoderHelm, and Final deletes an older release's.
+  assert.equal(R.StatusBucket, undefined);
+  assert.match(R.Helper.Properties.Code.ZipFile, /def retire_progress_bucket\(/);
   // One stack: no Launch Stack, no boundary or bucket left on purpose.
   assert.notEqual(R.Boundary.DeletionPolicy, "Retain");
   assert.notEqual(R.AssetsBucket.DeletionPolicy, "Retain");
@@ -493,3 +499,12 @@ test("a native install says so, so setup checks never point at a config file it 
   assert.equal(emailEnvironment(nativeConfig()).INSTALL_FORM, "native");
 });
 
+
+test("nothing in the account is public: no bucket policy, no public access block turned off, progress through CoderHelm", () => {
+  const t = JSON.stringify(P);
+  assert.doesNotMatch(t, /"BlockPublicPolicy":false|"RestrictPublicBuckets":false|"BlockPublicAcls":false|"IgnorePublicAcls":false/);
+  assert.doesNotMatch(t, /InstallGuideReadsProgress|"Principal":"\*","Action":"s3:GetObject"/);
+  assert.equal(P.Parameters.StatusKey.NoEcho, true);
+  assert.equal(R.StatusStart.Properties.StatusKey.Ref, "StatusKey");
+  assert.equal(R.StatusStart.Properties.StatusBucket, undefined);
+});

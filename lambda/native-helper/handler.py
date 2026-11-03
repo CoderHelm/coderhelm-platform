@@ -613,32 +613,60 @@ def request_domain(props, lam=None):
 
 
 def redact(text):
-    """Account numbers and ARNs out of anything in the public progress file."""
+    """Account numbers, ARNs and emails out of anything in a progress report."""
     t = re.sub(r"arn:aws[a-z-]*:[^\s\"']+", "<arn>", str(text or ""))
     t = re.sub(r"\b\d{12}\b", "<account>", t)
     return re.sub(r"[^\s@\"'<>]+@[^\s@\"'<>]+\.[a-z]{2,}", "<email>", t, flags=re.I)
 
 
-def write_status(props, phase, message, url=None, s3=None):
-    bucket = props.get("StatusBucket")
-    if not bucket:
+def progress_base(props):
+    """Hosted CoderHelm, where the install guide reads progress ("" for none)."""
+    url = (props.get("HybridUrl") or "https://api.coderhelm.com").rstrip("/")
+    return "" if url == "off" else url
+
+
+def write_status(props, phase, message, url=None, opener=None):
+    """Reports a phase to hosted CoderHelm with the guide's key (StatusKey):
+    only the guide that made the key can read it, and nothing in this
+    account is public. Never fails the install: the guide then asks for the
+    stack's Outputs instead."""
+    sid, key = str(props.get("StatusId") or ""), str(props.get("StatusKey") or "")
+    base = progress_base(props)
+    if not (re.fullmatch(r"[a-z0-9]{16}", sid) and re.fullmatch(r"[A-Za-z0-9]{32,64}", key) and base):
         return
-    s3 = s3 or client("s3")
-    if phase == "deploying":
-        # Lets anyone read status.json (only that file). Account-wide Block
-        # Public Access may refuse it: the guide then asks for the stack's
-        # Outputs instead, and the install goes on.
-        try:
-            s3.put_bucket_policy(Bucket=bucket, Policy=json.dumps({"Version": "2012-10-17", "Statement": [{
-                "Sid": "InstallGuideReadsProgress", "Effect": "Allow", "Principal": "*", "Action": "s3:GetObject",
-                "Resource": f"arn:aws:s3:::{bucket}/status.json"}]}))
-        except Exception as e:
-            log("progress file stays private:", e)
     doc = {"schema": 1, "phase": phase, "message": redact(message)[:300], "url": url, "version": props.get("Version"),
            "stage": props.get("Stage"), "region": props.get("Region"),
            "updatedAt": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
-    s3.put_object(Bucket=bucket, Key="status.json", Body=json.dumps(doc).encode(),
-                                    ContentType="application/json", CacheControl="no-store")
+    req = urllib.request.Request(f"{base}/api/install-progress/{sid}", method="PUT",
+                                 data=json.dumps({"key": key, "doc": doc}).encode(),
+                                 headers={"content-type": "application/json", "user-agent": "coderhelm-install"})
+    try:
+        with (opener or urllib.request.urlopen)(req, timeout=8) as r:
+            log("progress reported:", phase, getattr(r, "status", 200))
+    except Exception as e:
+        log("progress not reported:", e)
+
+
+def retire_progress_bucket(props, s3=None):
+    """Older releases kept the guide's progress in a public bucket,
+    coderhelm-setup-<StatusId>. Its policy, files and the bucket itself go;
+    a bucket that isn't there is fine. Returns a problem or ""."""
+    sid = str(props.get("StatusId") or "")
+    if not re.fullmatch(r"[a-z0-9]{16}", sid):
+        return ""
+    bucket = f"coderhelm-setup-{sid}"
+    s3 = s3 or client("s3")
+    try:
+        s3.delete_bucket_policy(Bucket=bucket)
+        empty_bucket(bucket, s3)
+        s3.delete_bucket(Bucket=bucket)
+        log("deleted the old progress bucket", bucket)
+    except Exception as e:
+        if "NoSuchBucket" in type(e).__name__ + str(e):
+            return ""
+        log("old progress bucket not deleted:", bucket, e)
+        return f"bucket {bucket}: {e}"
+    return ""
 
 
 def delete_certificates(prefix, acm=None):
@@ -760,6 +788,10 @@ def handle(event, context=None):
 
     if kind == "Custom::Status":
         phase = props.get("Phase", "done")
+        if rt in ("Create", "Update"):
+            # An older release's public progress bucket goes on the first
+            # update (CloudFormation then finds it gone), and after setup.
+            retire_progress_bucket(props)
         if rt == "Create":
             msg = "CoderHelm is running" if phase == "done" else "Creating your CoderHelm (about 20 minutes)"
             write_status(props, "done" if phase == "done" else "deploying", msg, props.get("Url") if phase == "done" else None)
@@ -815,11 +847,9 @@ def handle(event, context=None):
         if mode is None:
             return "SUCCESS", "nothing to do", {}
         certs, problems, records = delete_certificates(props["Prefix"])
-        if props.get("StatusBucket"):
-            try:
-                empty_bucket(props["StatusBucket"])
-            except Exception as e:
-                problems.append(f"bucket {props['StatusBucket']}: {e}")
+        gone = retire_progress_bucket(props)
+        if gone:
+            problems.append(gone)
         groups, more = delete_named_log_groups(props.get("LogGroupNames") or [], props["Prefix"])
         problems += more
         if mode == "rollback" or not keep_data(props, stack=stack):

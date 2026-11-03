@@ -693,7 +693,9 @@ def helper_rows():
     allowed = [
         ("s3:PutObject", f"{s3}{P}-release-{ACCT}/assets/a.zip"), ("s3:DeleteObject", f"{s3}{P}-release-{ACCT}/assets/a.zip"),
         ("s3:ListBucketVersions", f"{s3}{P}-data-{ACCT}"), ("s3:DeleteObjectVersion", f"{s3}{P}-data-{ACCT}/x"),
-        ("s3:PutObject", f"{s3}coderhelm-setup-0123456789abcdef/status.json"),
+        # An older release's public progress bucket: deleted, never written.
+        ("s3:DeleteBucketPolicy", f"{s3}coderhelm-setup-0123456789abcdef"), ("s3:DeleteBucket", f"{s3}coderhelm-setup-0123456789abcdef"),
+        ("s3:DeleteObjectVersion", f"{s3}coderhelm-setup-0123456789abcdef/status.json"),
         ("secretsmanager:PutSecretValue", f"{at('secretsmanager')}:secret:coderhelm/prod/secrets-AbCdEf"),
         ("dynamodb:DeleteTable", f"{at('dynamodb')}:table/{P}-traces"), ("dynamodb:BatchWriteItem", f"{at('dynamodb')}:table/{P}-settings"),
         # The main table has no suffix (the live test's failed delete).
@@ -725,6 +727,8 @@ def helper_rows():
         ("s3:DeleteBucket", f"{s3}someone-else"), ("s3:DeleteBucket", f"{s3}{P}-dashboard-{ACCT}"), ("kms:DeleteAlias", f"{at('kms')}:alias/my-app"),
         ("kms:ScheduleKeyDeletion", f"{at('kms')}:key/0f0f0f0f-1111-2222-3333-444455556666"),
         ("cognito-idp:DeleteUserPool", f"{at('cognito-idp')}:userpool/us-east-1_someones"),
+        # Nothing public: progress goes to CoderHelm with the guide's key.
+        ("s3:PutObject", f"{s3}coderhelm-setup-0123456789abcdef/status.json"), ("s3:PutBucketPolicy", f"{s3}coderhelm-setup-0123456789abcdef"),
     ]
     return [{"action": a, "resource": r, "want": "allowed"} for a, r in allowed] + [{"action": a, "resource": r, "want": "denied"} for a, r in denied]
 
