@@ -13,7 +13,9 @@ A **hybrid** install runs entirely in your AWS account, like any self-hosted Cod
 | **CoderHelm's Jira app**, through the event relay | setting up your own Jira app | link your Jira site once; its events arrive at your install, without the app's secret |
 | **CoderHelm's integration apps** (Notion, Confluence, Google Drive) | registering an app with each provider | sign in with one click, as on coderhelm.com |
 
-Each part is a separate choice, at install time (the [install guide](/self-host/install/)) or later in **Settings, System, Hybrid**. **Fully private** (your own domain or the AWS address, your own GitHub App and apps) stays the default and sends nothing to CoderHelm.
+Each part is a separate choice, at install time (the [install guide](/self-host/install/)) or later in **Settings, System, Hybrid**. **Fully private** (your own domain or the AWS address, your own GitHub App and apps) sends nothing to CoderHelm and needs no registration.
+
+On a hybrid install, every tool under **Other apps** (Jira, Notion, Confluence, Google Drive) uses CoderHelm's app unless you choose **Use my own app (fully private)** for it ([Other apps](#other-apps)). That only decides which app a sign-in goes through: nothing reaches your install or CoderHelm until someone connects the tool.
 
 ## Trust model
 
@@ -123,6 +125,15 @@ From then on CoderHelm checks each event of that site first, exactly as it does 
 The **Jira app relay** above is the other way round: a Jira site whose own Jira app is set up with your install's id, without a hosted team.
 
 The Setup checks show the link as `hybrid_jira` (in Settings, Setup and the install guide's `/api/setup/status`): `no_link` (todo) until it is linked, `syncing` (wait) while your install fetches the proxy settings, `ok` once linked. Linking needs an install admin, so `/api/setup/status` keeps reporting this one check (its code only) after someone has signed up, while Link through CoderHelm is on.
+
+## Other apps
+
+**Settings, System, Hybrid, Other apps** lists each tool with **Use Coderhelm's app (easiest)** or **Use my own app (fully private)**, and one line on what passes through CoderHelm for it. The install guide offers the same choices under **What CoderHelm sets up for you**, all on, and applies them when the install registers.
+
+- **CoderHelm's app is the default** for each tool nobody chose, on a new install and on an install that registered before these choices existed. A tool for which your install already has its own app set up (its own Notion, Atlassian or Google client in its secret) keeps using that until you pick CoderHelm's.
+- **A choice is kept.** Picking **Use my own app** for a tool, in Settings or the guide, stays until you change it. An install whose admin had already turned some tools on under Other apps keeps the others on its own app.
+- **Nothing starts by itself.** With CoderHelm's app chosen, **Connect** on that tool signs in through CoderHelm's app; until someone connects, no sign-in exists, no event is relayed and nothing is synced. Jira events come through only once CoderHelm's Jira app is installed on your site with your install id, or a site is linked.
+- **A tool CoderHelm can't offer yet** (its app for that provider isn't set up on the hosted side) shows **Coderhelm's app isn't set up yet** and uses your own app until it is.
 
 ## Integrations
 
