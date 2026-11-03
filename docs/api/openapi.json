@@ -1402,9 +1402,9 @@
             "type": "integer"
           },
           "from_ms": {
-            "description": "The bucket's lower bound, milliseconds (inclusive).",
+            "description": "The previous bucket's upper bound, milliseconds: this bucket holds\ndeliveries slower than this (0 for the first).",
             "examples": [
-              250
+              300
             ],
             "format": "int64",
             "minimum": 0,
@@ -1419,7 +1419,7 @@
             "type": "integer"
           },
           "to_ms": {
-            "description": "The bucket's upper bound, milliseconds (exclusive). Null for the\nlast, open bucket.",
+            "description": "The bucket's upper bound, milliseconds (inclusive). Null for the\nlast, open bucket.",
             "examples": [
               500
             ],

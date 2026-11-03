@@ -478,10 +478,11 @@ pub struct SourceRow {
 /// One bucket of the latency distribution.
 #[derive(Debug, Clone, PartialEq, Serialize, utoipa::ToSchema)]
 pub struct LatencyBucket {
-    /// The bucket's lower bound, milliseconds (inclusive).
-    #[schema(example = 250)]
+    /// The previous bucket's upper bound, milliseconds: this bucket holds
+    /// deliveries slower than this (0 for the first).
+    #[schema(example = 300)]
     pub from_ms: u64,
-    /// The bucket's upper bound, milliseconds (exclusive). Null for the
+    /// The bucket's upper bound, milliseconds (inclusive). Null for the
     /// last, open bucket.
     #[schema(example = 500)]
     pub to_ms: Option<u64>,
