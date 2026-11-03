@@ -422,6 +422,9 @@ pub struct Point {
     /// Handled or ignored, out of finished. Null with none.
     #[schema(example = 0.9789)]
     pub success_rate: Option<f64>,
+    /// Median latency, milliseconds.
+    #[schema(example = 210)]
+    pub p50_ms: Option<u64>,
     /// 95th percentile latency, milliseconds.
     #[schema(example = 1100)]
     pub p95_ms: Option<u64>,
@@ -451,15 +454,66 @@ pub struct SourceRow {
     /// Handled or ignored, out of finished. Null with none.
     #[schema(example = 0.9923)]
     pub success_rate: Option<f64>,
+    /// Median latency, milliseconds.
+    #[schema(example = 150)]
+    pub p50_ms: Option<u64>,
     /// 95th percentile latency, milliseconds.
     #[schema(example = 640)]
     pub p95_ms: Option<u64>,
+    /// Finished deliveries in each hour or day of the period, oldest first
+    /// (the same buckets as `series`), for a sparkline.
+    #[schema(example = json!([120, 131, 140, 128, 135, 129, 129]))]
+    pub series: Vec<i64>,
+    /// Failed deliveries in each bucket, as `series`.
+    #[schema(example = json!([1, 0, 2, 1, 0, 3, 0]))]
+    pub failed_series: Vec<i64>,
     /// Finished deliveries in the period before.
     #[schema(example = 870)]
     pub previous_deliveries: i64,
     /// The success rate in the period before.
     #[schema(example = 0.9897)]
     pub previous_success_rate: Option<f64>,
+}
+
+/// One bucket of the latency distribution.
+#[derive(Debug, Clone, PartialEq, Serialize, utoipa::ToSchema)]
+pub struct LatencyBucket {
+    /// The bucket's lower bound, milliseconds (inclusive).
+    #[schema(example = 250)]
+    pub from_ms: u64,
+    /// The bucket's upper bound, milliseconds (exclusive). Null for the
+    /// last, open bucket.
+    #[schema(example = 500)]
+    pub to_ms: Option<u64>,
+    /// Deliveries that went through, in this bucket.
+    #[schema(example = 412)]
+    pub ok: i64,
+    /// Deliveries that failed, in this bucket.
+    #[schema(example = 3)]
+    pub failed: i64,
+}
+
+/// The latency distribution of a tally, every bucket in order (zeros kept).
+pub fn latency_buckets(t: &Tally) -> Vec<LatencyBucket> {
+    let mut out = vec![];
+    let mut lo = 0u64;
+    for b in rollup::LATENCY_BOUNDS_MS {
+        let k = b.to_string();
+        out.push(LatencyBucket {
+            from_ms: lo,
+            to_ms: Some(*b),
+            ok: t.lat_ok.get(&k).copied().unwrap_or(0).max(0),
+            failed: t.lat_failed.get(&k).copied().unwrap_or(0).max(0),
+        });
+        lo = *b;
+    }
+    out.push(LatencyBucket {
+        from_ms: lo,
+        to_ms: None,
+        ok: t.lat_ok.get("inf").copied().unwrap_or(0).max(0),
+        failed: t.lat_failed.get("inf").copied().unwrap_or(0).max(0),
+    });
+    out
 }
 
 /// Failures with one reason.
@@ -612,6 +666,9 @@ pub struct DeliveryAnalytics {
     pub previous: Totals,
     /// One point per hour (24h) or day, oldest first.
     pub series: Vec<Point>,
+    /// How long the period's deliveries took, by latency bucket, every
+    /// bucket in order (zeros kept).
+    pub latency: Vec<LatencyBucket>,
     /// By source and direction, most deliveries first.
     pub sources: Vec<SourceRow>,
     /// Failures by reason, most first.
@@ -815,6 +872,7 @@ pub fn build(
                 ok: tt.handled + tt.ignored,
                 failed: tt.failed,
                 success_rate: tt.success_rate,
+                p50_ms: tt.p50_ms,
                 p95_ms: tt.p95_ms,
                 previous_deliveries: prev.get(i).map(|b| pick(b).total()).unwrap_or(0),
             }
@@ -841,10 +899,34 @@ pub fn build(
             }
         }
     }
+    // Per bucket, by source and direction (for each row's sparkline).
+    let per_bucket: Vec<BTreeMap<(String, String), Tally>> = cur
+        .iter()
+        .map(|b| {
+            let mut m: BTreeMap<(String, String), Tally> = BTreeMap::new();
+            for (scope, x) in b {
+                if let Some((src, dir)) = sel.source_of(scope) {
+                    m.entry((src.to_string(), dir.to_string()))
+                        .or_default()
+                        .add(&x.only(st));
+                }
+            }
+            m
+        })
+        .collect();
     let mut sources: Vec<SourceRow> = src_now
         .iter()
         .filter(|(_, t)| t.total() != 0)
         .map(|((src, dir), t)| {
+            let key = (src.clone(), dir.clone());
+            let series: Vec<i64> = per_bucket
+                .iter()
+                .map(|m| m.get(&key).map(|x| x.total()).unwrap_or(0))
+                .collect();
+            let failed_series: Vec<i64> = per_bucket
+                .iter()
+                .map(|m| m.get(&key).map(|x| x.failed).unwrap_or(0))
+                .collect();
             let tt = totals(t, st);
             let pt = src_prev
                 .get(&(src.clone(), dir.clone()))
@@ -857,7 +939,10 @@ pub fn build(
                 ok: tt.handled + tt.ignored,
                 failed: tt.failed,
                 success_rate: tt.success_rate,
+                p50_ms: tt.p50_ms,
                 p95_ms: tt.p95_ms,
+                series,
+                failed_series,
                 previous_deliveries: pt.deliveries,
                 previous_success_rate: pt.success_rate,
             }
@@ -1011,6 +1096,7 @@ pub fn build(
         summary: totals(&now_t, st),
         previous: totals(&prev_t, st),
         series,
+        latency: latency_buckets(&now_t),
         sources,
         reasons,
         events,
@@ -1550,6 +1636,25 @@ mod tests {
         );
         assert_eq!(r[1].success_rate, Some(0.5));
         assert!(r[1].p95_ms.unwrap() >= 300);
+        // Each source's sparkline: one value per bucket, adding up to its counts.
+        for src in &out.sources {
+            assert_eq!(src.series.len(), out.series.len());
+            assert_eq!(src.series.iter().sum::<i64>(), src.deliveries);
+            assert_eq!(src.failed_series.iter().sum::<i64>(), src.failed);
+        }
+        // The distribution: every bucket in order, the last one open, each
+        // finished delivery once.
+        assert_eq!(out.latency.len(), rollup::LATENCY_BOUNDS_MS.len() + 1);
+        assert_eq!(out.latency[0].from_ms, 0);
+        assert!(out.latency.last().unwrap().to_ms.is_none());
+        assert_eq!(
+            out.latency.iter().map(|b| b.ok + b.failed).sum::<i64>(),
+            out.summary.deliveries
+        );
+        assert_eq!(out.latency.iter().map(|b| b.failed).sum::<i64>(), 1);
+        // The day with deliveries has a median and a slowest 5%.
+        let busy = out.series.iter().find(|pt| pt.deliveries > 0).unwrap();
+        assert!(busy.p50_ms.is_some() && busy.p95_ms >= busy.p50_ms);
         assert_eq!(
             r[1].last_delivered_at.as_deref(),
             Some("2026-10-27T09:00:00Z")

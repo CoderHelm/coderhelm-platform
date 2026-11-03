@@ -504,6 +504,15 @@ pub fn native_install(v: Option<&str>) -> bool {
     v.map(str::trim) == Some("native")
 }
 
+/// `INSTALL_FORM` as the overview reports it: `native`, `config`, or None.
+pub fn install_form(v: Option<&str>) -> Option<String> {
+    match v.map(str::trim) {
+        Some("native") => Some("native".into()),
+        Some("config") => Some("config".into()),
+        _ => None,
+    }
+}
+
 /// Who sends Amazon Cognito's sign-up codes and password resets.
 pub fn cognito_check(f: &Facts) -> Check {
     let label = "Sign-up and password emails";
@@ -634,6 +643,11 @@ pub struct EmailOverview {
     /// Cognito's own sender's daily limit, when it is the sender.
     #[schema(example = 50)]
     pub cognito_daily_limit: Option<u64>,
+    /// How the install was made: `native` (one stack from the launch page,
+    /// no config file) or `config` (coderhelm.config.json). Null when the
+    /// install didn't say (installs from before this field).
+    #[schema(example = "native")]
+    pub install_form: Option<String>,
 }
 
 /// The overview's email part from the counts (pure; tested).
@@ -665,6 +679,7 @@ pub fn overview_of(
         }),
         cognito_daily_limit: (cognito == Some(stats::CognitoSender::CognitoDefault))
             .then_some(stats::COGNITO_DEFAULT_DAILY),
+        install_form: install_form(std::env::var("INSTALL_FORM").ok().as_deref()),
     }
 }
 
@@ -908,5 +923,13 @@ mod tests {
             ),
             ("ses", Some("ses"), None)
         );
+    }
+
+    #[test]
+    fn the_overview_says_how_the_install_was_made() {
+        assert_eq!(install_form(Some("native")).as_deref(), Some("native"));
+        assert_eq!(install_form(Some(" config ")).as_deref(), Some("config"));
+        assert_eq!(install_form(None), None);
+        assert_eq!(install_form(Some("other")), None);
     }
 }
