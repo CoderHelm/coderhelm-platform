@@ -71,7 +71,7 @@ If the first launch fails, CloudFormation rolls the stack back and deletes what 
 | SetupKey | Stores the install guide's one-time setup key in the secret, only while no GitHub App is stored there. |
 | Allowlist | Puts the first admin, the sign-up domain and the two-factor rule on the sign-in allowlist. It adds entries and never removes them. |
 | Domain | With **Hostname** set: asks the updater to request the certificate (see [Your own domain](./domains.md)). |
-| Status | With the install guide's progress id: writes a small public progress file (the phase, and your URL when done). On a failed first launch it writes CloudFormation's own reason. |
+| Status | With the install guide's progress id and key: reports the phase (and your URL when done) to CoderHelm with the key; nothing in your account is public. Deletes an older release's public progress bucket. On a failed first launch it writes CloudFormation's own reason. |
 | HybridLeave | When the stack is deleted: releases the CoderHelm address and links of a [hybrid](./hybrid.md) install. |
 | Sweep | When the stack is deleted with **KeepDataOnDelete** `false`: empties the data buckets and deletes the tables. See [Uninstall](./uninstall.md). |
 | Final | When the stack is deleted, after every part and after HybridLeave and SetupKey: deletes the certificates the updater requested for this install and their validation records, and every log group the parts declare, by its exact name (Lambda makes one again when a function's last logs arrive after CloudFormation deleted it). With **KeepDataOnDelete** `false`, it also deletes the install's other log groups that are still there, only those tagged `coderhelm:install = coderhelm-<name>`, and the install's secret, without a recovery window. |
@@ -111,7 +111,7 @@ The helper's role carries the boundary and can only do this (`helperPolicy()` in
 - write its own log group, `/aws/lambda/coderhelm-<name>-install-helper`;
 - read, write, list and delete objects in the release bucket;
 - list and delete objects in buckets named `coderhelm-<name>-*` (to empty the data buckets on delete);
-- write the install guide's progress file and its read policy, in this install's own progress bucket, `coderhelm-setup-<progress id>`;
+- delete an older release's progress bucket, `coderhelm-setup-<progress id>`: its policy, its files and the bucket (never write to it or make anything public);
 - read and write the install's secret, `coderhelm/<name>/secrets`, and delete it (only on a stack delete with **KeepDataOnDelete** `false`);
 - write items to, describe, update and delete the tables named `coderhelm-<name>` and `coderhelm-<name>-*` (the allowlist at launch; the tables on delete), and use the KMS keys tagged `coderhelm:install = coderhelm-<name>` to encrypt and decrypt for them;
 - invoke `coderhelm-<name>-updater` (the domain);
@@ -124,7 +124,7 @@ Delete work runs only while the root stack itself is being deleted and follows *
 
 Besides CloudFormation, only the updater calls it, for one thing: before a change set, copy a release's part templates into the release bucket (`stage`). It downloads that release's `coderhelm.json` itself, checks it against the sha256 from the signed `SHA256SUMS` that the updater passes, and copies only the part templates it lists, each checked like ReleaseAssets does. It trusts the sha256 its caller passes: a caller that may invoke it could stage the part templates of any release CoderHelm published (from the write-once release location, only under that release's own `releases/<version>/stacks/`), which changes nothing that runs.
 
-It answers only CloudFormation's own response address for a custom resource, and it keeps account numbers, ARNs and email addresses out of the public progress file.
+It answers only CloudFormation's own response address for a custom resource, and it keeps account numbers, ARNs and email addresses out of the progress reports it sends to CoderHelm.
 
 It downloads release files over HTTPS from `coderhelm-public.s3.amazonaws.com/launch/v...` only, and refuses any other address. It can't create or change roles, policies, functions or stacks.
 

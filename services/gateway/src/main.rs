@@ -1376,6 +1376,22 @@ async fn main() -> Result<(), Error> {
         // Opt-in pings from self-host installers: public, no session, a
         // fixed set of non-identifying fields (routes::telemetry).
         .route("/api/telemetry/ping", post(routes::telemetry::ping))
+        // The install guide's progress on hosted CoderHelm, read and written
+        // with a key only the guide and the stack have, so nothing in the
+        // install's account is public (routes::install_progress). 404 on a
+        // self-hosted install.
+        .route(
+            "/api/install-progress",
+            post(routes::install_progress::create),
+        )
+        .route(
+            "/api/install-progress/:id",
+            put(routes::install_progress::report),
+        )
+        .route(
+            "/api/install-progress/:id/read",
+            post(routes::install_progress::read),
+        )
         // Where GitHub's app manifest flow lands on a self-hosted install
         // (routes::setup). 404 on hosted.
         .route(

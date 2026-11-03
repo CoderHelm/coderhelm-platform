@@ -56,6 +56,15 @@ pub fn public_methods(path: &str) -> Option<&'static str> {
     if path == "/api/setup/hybrid" || path.starts_with("/api/setup/hybrid/") {
         return Some("GET, POST");
     }
+    // The install guide's progress (routes::install_progress): the key goes
+    // in the body, so Content-Type is the only header it needs.
+    if path == "/api/install-progress"
+        || path
+            .strip_prefix("/api/install-progress/")
+            .is_some_and(|r| !r.is_empty())
+    {
+        return Some("POST, PUT");
+    }
     None
 }
 
@@ -444,6 +453,12 @@ mod tests {
             Some("GET, POST")
         );
         assert_eq!(public_methods("/api/teams"), None);
+        assert_eq!(public_methods("/api/install-progress"), Some("POST, PUT"));
+        assert_eq!(
+            public_methods("/api/install-progress/abcd1234efgh5678/read"),
+            Some("POST, PUT")
+        );
+        assert_eq!(public_methods("/api/install-progress/"), None);
         assert_eq!(
             parse_origins(" https://a.example/, ,https://b.example"),
             vec!["https://a.example", "https://b.example"]

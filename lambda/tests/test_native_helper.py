@@ -328,7 +328,22 @@ class SecretAndAllowlist(unittest.TestCase):
 
 
 class Status(unittest.TestCase):
-    def test_failed_create_reports_cloudformations_reason(self):
+    KEY = "K" * 40
+    PROPS = {"StatusId": "abcd1234efgh5678", "StatusKey": KEY, "Version": "v1.2.3", "Stage": "prod", "Region": "eu-west-1"}
+
+    def opener(self, sent):
+        class R:
+            status = 204
+            def __enter__(self):
+                return self
+            def __exit__(self, *a):
+                return False
+        def go(req, timeout=None):
+            sent.append(req)
+            return R()
+        return go
+
+    def test_failed_create_reports_cloudformations_reason_to_coderhelm_never_to_a_bucket(self):
         cfn = FakeCfn("ROLLBACK_IN_PROGRESS")
         cfn.events = [
             {"LogicalResourceId": "Web", "ResourceStatus": "CREATE_FAILED", "ResourceStatusReason": "Resource creation cancelled"},
@@ -337,19 +352,56 @@ class Status(unittest.TestCase):
         h._clients["cloudformation@None"] = cfn
         s3 = FakeS3()
         h._clients["s3@None"] = s3
+        sent = []
+        real = h.urllib.request.urlopen
+        h.urllib.request.urlopen = self.opener(sent)
         try:
             status, reason, _ = h.handle({"ResourceType": "Custom::Status", "RequestType": "Delete", "LogicalResourceId": "S",
-                                          "ResourceProperties": {"Phase": "start", "RootStackId": "r", "StatusBucket": "b"}})
+                                          "ResourceProperties": dict(self.PROPS, Phase="start", RootStackId="r")})
         finally:
+            h.urllib.request.urlopen = real
             h._clients.clear()
-        doc = json.loads(s3.objects["status.json"]["data"])
-        self.assertEqual(doc["phase"], "failed")
-        self.assertIn("Api: Embedded stack failed: Role is invalid", doc["message"])
-        self.assertNotIn("download", doc["message"])
+        self.assertEqual(status, "SUCCESS")
+        self.assertEqual(s3.objects, {}, "nothing is written to a bucket")
+        self.assertEqual(len(sent), 1)
+        req = sent[0]
+        self.assertEqual((req.get_method(), req.full_url), ("PUT", "https://api.coderhelm.com/api/install-progress/abcd1234efgh5678"))
+        body = json.loads(req.data)
+        self.assertEqual(body["key"], self.KEY)
+        self.assertNotIn(self.KEY, req.full_url, "the key never goes in a URL")
+        self.assertEqual(body["doc"]["phase"], "failed")
+        self.assertIn("Api: Embedded stack failed: Role is invalid", body["doc"]["message"])
 
+    def test_no_key_or_hybrid_off_reports_nothing(self):
+        for props in ({**self.PROPS, "StatusKey": ""}, {**self.PROPS, "StatusId": ""}, {**self.PROPS, "HybridUrl": "off"}, {**self.PROPS, "StatusKey": "short"}):
+            sent = []
+            h.write_status(props, "deploying", "x", opener=self.opener(sent))
+            self.assertEqual(sent, [], props)
 
-if __name__ == "__main__":
-    unittest.main()
+    def test_an_unreachable_coderhelm_never_fails_the_install(self):
+        def down(req, timeout=None):
+            raise OSError("connection refused")
+        h.write_status(self.PROPS, "deploying", "x", opener=down)
+
+    def test_an_older_releases_public_bucket_is_deleted_policy_first(self):
+        calls = []
+        class S3(FakeS3):
+            def delete_bucket_policy(self, Bucket):
+                calls.append(("policy", Bucket))
+            def delete_bucket(self, Bucket):
+                calls.append(("bucket", Bucket))
+        s3 = S3(versions=[{"Key": "status.json", "VersionId": "null"}])
+        self.assertEqual(h.retire_progress_bucket(self.PROPS, s3=s3), "")
+        self.assertEqual(calls, [("policy", "coderhelm-setup-abcd1234efgh5678"), ("bucket", "coderhelm-setup-abcd1234efgh5678")])
+        self.assertEqual(s3.deleted, ["status.json"])
+
+    def test_no_bucket_is_fine_and_a_bad_id_touches_nothing(self):
+        class Gone(FakeS3):
+            def delete_bucket_policy(self, Bucket):
+                raise RuntimeError("NoSuchBucket: The specified bucket does not exist")
+        self.assertEqual(h.retire_progress_bucket(self.PROPS, s3=Gone()), "")
+        self.assertEqual(h.retire_progress_bucket({"StatusId": "../other"}, s3=None), "")
+
 
 
 class FakeLogs:

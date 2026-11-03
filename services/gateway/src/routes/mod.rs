@@ -31,6 +31,7 @@ pub mod hybrid_install;
 pub mod hybrid_jira;
 pub mod hybrid_support;
 pub mod infrastructure;
+pub mod install_progress;
 pub mod installation_owner;
 pub mod integrations;
 pub mod jira_webhook;
