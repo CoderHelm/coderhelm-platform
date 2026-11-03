@@ -11,11 +11,21 @@
 //!    folder (`blocks/Quote/index.tsx`), the other folders beside it;
 //! 2. the places that register them are the files that name most of the
 //!    siblings (a registry names all of them; a page that uses two of them
-//!    is not a registration), found by code search on the default branch;
-//! 3. every such place must name the new item on the run's branch.
+//!    is not a registration), found by code search on the default branch.
+//!    Comments never count. Docs, migrations, fixtures and tests are never
+//!    places. A manifest (`package.json` and other data files) counts only
+//!    where it names the siblings as paths or keys (`"./accordion"`), never
+//!    inside other names such as a dependency (`@radix-ui/react-accordion`);
+//! 3. a place is a registry when it names the siblings by path or as a
+//!    whole string (an import, an `exports` key, a list of ids); a code file
+//!    that only mentions them as words is a maybe;
+//! 4. an item that isn't of the siblings' kind (the siblings all import a
+//!    package the new file doesn't) has no places;
+//! 5. every place must name the new item on the run's branch.
 //!
-//! What is missing goes back to the coder once with the list; what is still
-//! missing blocks the pull request with the list.
+//! What a registry is missing goes back to the coder once with the list, and
+//! blocks the pull request if still missing. A maybe never blocks: it is
+//! noted in the pull request for a person to check.
 
 use std::collections::BTreeSet;
 
@@ -230,6 +240,210 @@ pub fn names_item(text: &str, id: &str) -> bool {
     variants(id).iter().any(|v| names_word(text, v))
 }
 
+/// Extensions of files that are data, not code: they register by path or
+/// key, never by a word inside a longer name.
+const DATA_EXTS: &[&str] = &["json", "jsonc", "yaml", "yml", "toml"];
+
+/// Paths that are never registration places: docs, migrations, fixtures.
+fn never_a_place(p: &str) -> bool {
+    let l = p.to_lowercase();
+    let (_, f) = split_path(&l);
+    let ext = f.rsplit_once('.').map(|(_, e)| e).unwrap_or("");
+    matches!(ext, "md" | "mdx" | "rst" | "txt")
+        || l.starts_with("migrations/")
+        || l.contains("/migrations/")
+        || l.contains("/migration/")
+        || l.contains("/fixtures/")
+        || l.contains("/__fixtures__/")
+        || l.contains("/__mocks__/")
+        || l.starts_with("docs/")
+        || l.contains("/docs/")
+}
+
+fn is_data_file(p: &str) -> bool {
+    let (_, f) = split_path(p);
+    f.rsplit_once('.')
+        .is_some_and(|(_, e)| DATA_EXTS.contains(&e.to_lowercase().as_str()))
+}
+
+/// The text without comments: `//` and `/* */` in code, `#` lines in
+/// scripts and YAML. Approximate (strings that look like comments are kept
+/// when `//` follows a `:`, as in a URL).
+pub fn without_comments(path: &str, text: &str) -> String {
+    let (_, f) = split_path(path);
+    let ext = f
+        .rsplit_once('.')
+        .map(|(_, e)| e.to_lowercase())
+        .unwrap_or_default();
+    let hash = matches!(ext.as_str(), "py" | "rb" | "sh" | "yaml" | "yml" | "toml");
+    let mut out = String::with_capacity(text.len());
+    let b = text.as_bytes();
+    let mut i = 0;
+    let mut quote: Option<u8> = None;
+    while i < b.len() {
+        let c = b[i];
+        if let Some(q) = quote {
+            out.push(c as char);
+            if c == b'\\' && i + 1 < b.len() {
+                out.push(b[i + 1] as char);
+                i += 2;
+                continue;
+            }
+            if c == q || c == b'\n' {
+                quote = None;
+            }
+            i += 1;
+            continue;
+        }
+        if !hash && c == b'/' && b.get(i + 1) == Some(&b'*') {
+            match text[i + 2..].find("*/") {
+                Some(end) => i += end + 4,
+                None => break,
+            }
+            continue;
+        }
+        let line_comment = if hash {
+            c == b'#' && (i == 0 || b[i - 1].is_ascii_whitespace())
+        } else {
+            c == b'/' && b.get(i + 1) == Some(&b'/') && (i == 0 || b[i - 1] != b':')
+        };
+        if line_comment {
+            while i < b.len() && b[i] != b'\n' {
+                i += 1;
+            }
+            continue;
+        }
+        if c == b'"' || c == b'\'' || c == b'`' {
+            quote = Some(c);
+        }
+        out.push(c as char);
+        i += 1;
+    }
+    out
+}
+
+/// The quoted strings in `text` (one line each).
+fn quoted(text: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let b = text.as_bytes();
+    let mut i = 0;
+    while i < b.len() {
+        let c = b[i];
+        if c == b'"' || c == b'\'' || c == b'`' {
+            let start = i + 1;
+            let mut j = start;
+            while j < b.len() && b[j] != c && b[j] != b'\n' {
+                j += 1;
+            }
+            if j < b.len() && b[j] == c {
+                out.push(&text[start..j]);
+                i = j + 1;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    out
+}
+
+/// Whether `text` names the item as a path or a whole string: a quoted value
+/// with a path segment that is the item (`"./accordion"`,
+/// `"@/components/ui/accordion"`, `"accordion"`, `"./Hero.tsx"`), not a
+/// longer name that contains it (`"@radix-ui/react-accordion"`).
+pub fn names_as_path(text: &str, id: &str) -> bool {
+    let forms = variants(id);
+    quoted(text).into_iter().any(|q| {
+        q.split('/').any(|seg| {
+            let stem = seg.split('.').next().unwrap_or(seg);
+            !stem.is_empty() && forms.iter().any(|f| f == stem)
+        })
+    })
+}
+
+/// The bare packages a file imports (`from 'sanity'`, `require("x")`), not
+/// relative or aliased paths: what marks a kind of item.
+pub fn imported_packages(text: &str) -> BTreeSet<String> {
+    let mut out = BTreeSet::new();
+    for key in ["from ", "require(", "import "] {
+        let mut from = 0;
+        while let Some(i) = text[from..].find(key) {
+            let at = from + i + key.len();
+            from = at;
+            let rest = text[at..].trim_start();
+            let Some(q) = rest.chars().next().filter(|c| *c == '"' || *c == '\'') else {
+                continue;
+            };
+            let Some(end) = rest[1..].find(q) else {
+                continue;
+            };
+            let spec = &rest[1..1 + end];
+            if spec.is_empty()
+                || spec.starts_with('.')
+                || spec.starts_with("@/")
+                || spec.starts_with("~/")
+                || spec.starts_with('/')
+            {
+                continue;
+            }
+            // The package, without a subpath (`@scope/name`, or `name`).
+            let mut parts = spec.split('/');
+            let first = parts.next().unwrap_or("");
+            let pkg = if first.starts_with('@') {
+                format!("{first}/{}", parts.next().unwrap_or(""))
+            } else {
+                first.to_string()
+            };
+            out.insert(pkg);
+        }
+    }
+    out
+}
+
+/// Whether the new item is of another kind than its siblings: every read
+/// sibling (at least two) imports a package the new file imports none of.
+pub fn other_kind(new_text: &str, sibling_texts: &[String]) -> bool {
+    if sibling_texts.len() < 2 {
+        return false;
+    }
+    let mut common: Option<BTreeSet<String>> = None;
+    for t in sibling_texts {
+        let pk = imported_packages(t);
+        common = Some(match common {
+            None => pk,
+            Some(c) => c.intersection(&pk).cloned().collect(),
+        });
+    }
+    let common = common.unwrap_or_default();
+    if common.is_empty() {
+        return false;
+    }
+    let mine = imported_packages(new_text);
+    common.is_disjoint(&mine)
+}
+
+/// A sibling's own file on the default branch: `parent/<sib>.<ext>`, or its
+/// folder's index-like file.
+fn sibling_file(item: &NewItem, sib: &str, tree: &[String]) -> Option<String> {
+    let base = if item.parent.is_empty() {
+        sib.to_string()
+    } else {
+        format!("{}/{sib}", item.parent)
+    };
+    if item.folder {
+        let prefix = format!("{base}/");
+        tree.iter()
+            .find(|t| {
+                t.strip_prefix(&prefix).is_some_and(|rest| {
+                    !rest.contains('/') && FOLDER_FILES.contains(&stem_ext(rest).0)
+                })
+            })
+            .cloned()
+    } else {
+        let want = format!("{base}.{}", item.ext);
+        tree.iter().find(|t| **t == want).cloned()
+    }
+}
+
 /// Whether a file is one of a sibling's own files (its folder, or its file).
 fn sibling_own(path: &str, item: &NewItem, sibs: &[String]) -> bool {
     let prefix = if item.parent.is_empty() {
@@ -246,12 +460,14 @@ fn sibling_own(path: &str, item: &NewItem, sibs: &[String]) -> bool {
 
 /// The files that register items of this kind: those naming most sampled
 /// siblings (all of them when there are three or fewer; otherwise at least
-/// three and 60% of them). `files` are (path, default-branch text).
+/// three and 60% of them), with comments left out. A place is a registry
+/// (`true`) when it names them as paths or whole strings, else a maybe
+/// (`false`, code files only). `files` are (path, default-branch text).
 pub fn registration_places(
     item: &NewItem,
     sibs: &[String],
     files: &[(String, String)],
-) -> Vec<String> {
+) -> Vec<(String, bool)> {
     if sibs.is_empty() {
         return Vec::new();
     }
@@ -263,9 +479,25 @@ pub fn registration_places(
     };
     files
         .iter()
-        .filter(|(p, _)| !skipped(p) && !sibling_own(p, item, sibs) && *p != item.path)
-        .filter(|(_, text)| sibs.iter().filter(|s| names_item(text, s)).count() >= need)
-        .map(|(p, _)| p.clone())
+        .filter(|(p, _)| {
+            !skipped(p)
+                && !is_test(p)
+                && !never_a_place(p)
+                && !sibling_own(p, item, sibs)
+                && *p != item.path
+        })
+        .filter_map(|(p, raw)| {
+            let text = without_comments(p, raw);
+            let as_paths = sibs.iter().filter(|s| names_as_path(&text, s)).count();
+            if as_paths >= need {
+                return Some((p.clone(), true));
+            }
+            if is_data_file(p) {
+                return None;
+            }
+            let as_words = sibs.iter().filter(|s| names_item(&text, s)).count();
+            (as_words >= need).then(|| (p.clone(), false))
+        })
         .collect()
 }
 
@@ -276,60 +508,79 @@ pub struct Missing {
     pub path: String,
     /// The siblings that place names, for the message.
     pub siblings: Vec<String>,
+    /// A registry (names the siblings as paths or whole strings): missing
+    /// from it blocks. Else a maybe, only noted.
+    pub registry: bool,
 }
 
 impl Missing {
     pub fn line(&self) -> String {
-        format!(
-            "`{}` isn't registered in `{}` (it names {})",
-            self.item,
-            self.path,
-            self.siblings
-                .iter()
-                .take(3)
-                .map(|s| format!("`{s}`"))
-                .collect::<Vec<_>>()
-                .join(", ")
-        )
+        let names = self
+            .siblings
+            .iter()
+            .take(3)
+            .map(|s| format!("`{s}`"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        if self.registry {
+            format!(
+                "`{}` isn't registered in `{}` (it names {names})",
+                self.item, self.path
+            )
+        } else {
+            format!(
+                "`{}` may belong in `{}`: it mentions {names}, but not as a list of them; check by hand",
+                self.item, self.path
+            )
+        }
     }
 }
 
-/// The places that don't name the item on the branch. `on_branch`: path to
+/// The places that don't name the item on the branch (comments left out).
+/// `places` are (path, default-branch text, registry); `on_branch`: path to
 /// the place's text on the run's branch (`None`: removed on the branch).
 pub fn missing(
     item: &NewItem,
     sibs: &[String],
-    places: &[(String, String)],
+    places: &[(String, String, bool)],
     on_branch: &dyn Fn(&str) -> Option<String>,
 ) -> Vec<Missing> {
     let mut out = Vec::new();
-    for (path, base_text) in places {
+    for (path, base_text, registry) in places {
         let Some(text) = on_branch(path) else {
             continue;
         };
-        if !names_item(&text, &item.id) {
+        if !names_item(&without_comments(path, &text), &item.id) {
+            let base = without_comments(path, base_text);
             out.push(Missing {
                 item: item.id.clone(),
                 path: path.clone(),
                 siblings: sibs
                     .iter()
-                    .filter(|s| names_item(base_text, s))
+                    .filter(|s| names_item(&base, s))
                     .cloned()
                     .collect(),
+                registry: *registry,
             });
         }
     }
     out
 }
 
+/// Registries the item is missing from: these go back to the coder and block.
+pub fn blocking(missing: &[Missing]) -> Vec<Missing> {
+    missing.iter().filter(|m| m.registry).cloned().collect()
+}
+
 /// What the coder is told.
 pub fn feedback(missing: &[Missing]) -> String {
     let mut s = String::from(
         "\nThe change adds items of a kind that already exists, but doesn't register them \
-         everywhere their siblings are registered. Add each one to these places, following how \
-         the siblings appear there, then regenerate any generated files that list them:\n",
+         everywhere their siblings are registered. Add the entry yourself in each of these \
+         places, following how the siblings appear there (don't stop to ask), then regenerate \
+         any generated files that list them:\n",
     );
-    for m in missing {
+    for m in missing.iter().filter(|m| m.registry) {
         s.push_str(&format!("- {}\n", m.line()));
     }
     s
@@ -356,6 +607,35 @@ pub async fn check(
         if sibs.is_empty() {
             continue;
         }
+        // Of the siblings' kind? Compare what the files import.
+        let own_path = if item.folder {
+            added
+                .iter()
+                .find(|p| {
+                    p.strip_prefix(&format!("{}/", item.path))
+                        .is_some_and(|rest| {
+                            !rest.contains('/') && FOLDER_FILES.contains(&stem_ext(rest).0)
+                        })
+                })
+                .cloned()
+        } else {
+            Some(item.path.clone())
+        };
+        if let Some(own) = own_path {
+            if let Ok(own_text) = github.read_file(owner, repo, &own, branch).await {
+                let mut sib_texts = Vec::new();
+                for s in sibs.iter().take(3) {
+                    if let Some(f) = sibling_file(&item, s, tree) {
+                        if let Ok(t) = github.read_file(owner, repo, &f, base).await {
+                            sib_texts.push(t);
+                        }
+                    }
+                }
+                if other_kind(&own_text, &sib_texts) {
+                    continue;
+                }
+            }
+        }
         let mut candidates: Vec<String> = Vec::new();
         for s in sibs.iter().take(3) {
             if let Ok(hits) = github.search_code(owner, repo, base, s).await {
@@ -374,16 +654,18 @@ pub async fn check(
                 files.push((p, t));
             }
         }
-        let places: Vec<(String, String)> = {
-            let keep = registration_places(&item, &sibs, &files);
-            files
-                .into_iter()
-                .filter(|(p, _)| keep.contains(p))
-                .collect()
-        };
+        let keep = registration_places(&item, &sibs, &files);
+        let places: Vec<(String, String, bool)> = files
+            .into_iter()
+            .filter_map(|(p, t)| {
+                keep.iter()
+                    .find(|(k, _)| *k == p)
+                    .map(|(_, registry)| (p, t, *registry))
+            })
+            .collect();
         checked += places.len();
         let mut on_branch: Vec<(String, Option<String>)> = Vec::new();
-        for (p, _) in &places {
+        for (p, _, _) in &places {
             on_branch.push((
                 p.clone(),
                 github.read_file(owner, repo, p, branch).await.ok(),
@@ -484,11 +766,22 @@ mod tests {
             ),
         ];
         let places = registration_places(item, &sibs, &files);
-        assert_eq!(places, vec!["src/blocks/index.ts", "e2e/test-map.json"]);
+        assert_eq!(
+            places,
+            vec![
+                ("src/blocks/index.ts".to_string(), true),
+                ("e2e/test-map.json".to_string(), true)
+            ]
+        );
 
-        let placed: Vec<(String, String)> = files
+        let placed: Vec<(String, String, bool)> = files
             .into_iter()
-            .filter(|(p, _)| places.contains(p))
+            .filter_map(|(p, t)| {
+                places
+                    .iter()
+                    .find(|(k, _)| *k == p)
+                    .map(|(_, r)| (p, t, *r))
+            })
             .collect();
         // The branch registered it in the index but not in the test map.
         let branch = |p: &str| -> Option<String> {
@@ -506,5 +799,142 @@ mod tests {
             .line()
             .contains("`Quote` isn't registered in `e2e/test-map.json`"));
         assert!(feedback(&m).contains("regenerate"));
+    }
+
+    fn ui_tree() -> Vec<String> {
+        [
+            "apps/web/src/components/ui/accordion.tsx",
+            "apps/web/src/components/ui/alert.tsx",
+            "apps/web/src/components/ui/card.tsx",
+            "apps/web/package.json",
+            "apps/web/src/components/ui/index.ts",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect()
+    }
+
+    #[test]
+    fn dependency_names_in_a_manifest_are_not_a_registration() {
+        let item = &new_items(
+            &["apps/web/src/components/ui/heading.tsx".to_string()],
+            &ui_tree(),
+        )[0];
+        let sibs = siblings(item, &ui_tree(), None);
+        assert_eq!(sibs, vec!["accordion", "alert", "card"]);
+        let pkg = r#"{"name": "web", "dependencies": {
+            "@radix-ui/react-accordion": "1.2.0",
+            "@radix-ui/react-alert-dialog": "1.1.0",
+            "react-card-flip": "1.0.0"
+        }}"#;
+        let files = vec![("apps/web/package.json".to_string(), pkg.to_string())];
+        assert!(registration_places(item, &sibs, &files).is_empty());
+    }
+
+    #[test]
+    fn an_exports_map_and_a_barrel_are_registries() {
+        let item = &new_items(
+            &["apps/web/src/components/ui/heading.tsx".to_string()],
+            &ui_tree(),
+        )[0];
+        let sibs = siblings(item, &ui_tree(), None);
+        let pkg = r#"{"exports": {
+            "./accordion": "./src/components/ui/accordion.tsx",
+            "./alert": "./src/components/ui/alert.tsx",
+            "./card": "./src/components/ui/card.tsx"
+        }}"#;
+        let barrel =
+            "export * from './accordion'\nexport * from './alert'\nexport * from './card'\n";
+        let files = vec![
+            ("apps/web/package.json".to_string(), pkg.to_string()),
+            (
+                "apps/web/src/components/ui/index.ts".to_string(),
+                barrel.to_string(),
+            ),
+        ];
+        let places = registration_places(item, &sibs, &files);
+        assert_eq!(places.len(), 2);
+        assert!(places.iter().all(|(_, registry)| *registry));
+    }
+
+    #[test]
+    fn comments_docs_and_migrations_never_make_a_place() {
+        let item = &new_items(
+            &["apps/web/src/components/ui/heading.tsx".to_string()],
+            &ui_tree(),
+        )[0];
+        let sibs = siblings(item, &ui_tree(), None);
+        let commented = "// see './accordion', './alert' and './card'\n/* './accordion' './alert' './card' */\nexport const x = 1\n";
+        let files = vec![
+            (
+                "apps/web/src/lib/notes.ts".to_string(),
+                commented.to_string(),
+            ),
+            (
+                "docs/components.md".to_string(),
+                "`./accordion` `./alert` `./card`".to_string(),
+            ),
+            (
+                "apps/web/migrations/rename-cards/index.ts".to_string(),
+                "const types = ['accordion', 'alert', 'card']".to_string(),
+            ),
+        ];
+        assert!(registration_places(item, &sibs, &files).is_empty());
+    }
+
+    #[test]
+    fn a_code_file_that_only_mentions_siblings_is_a_maybe_that_never_blocks() {
+        let item = &new_items(&["src/blocks/Quote.tsx".to_string()], &tree())[0];
+        let sibs = siblings(item, &tree(), None);
+        let files = vec![(
+            "src/pages/all.tsx".to_string(),
+            "<Hero /> <Cards /> <Banner />".to_string(),
+        )];
+        let places = registration_places(item, &sibs, &files);
+        assert_eq!(places, vec![("src/pages/all.tsx".to_string(), false)]);
+        let placed = vec![(
+            "src/pages/all.tsx".to_string(),
+            "<Hero /> <Cards /> <Banner />".to_string(),
+            false,
+        )];
+        let m = missing(item, &sibs, &placed, &|_| Some("<Hero />".to_string()));
+        assert_eq!(m.len(), 1);
+        assert!(blocking(&m).is_empty());
+        assert!(m[0].line().contains("check by hand"));
+        assert!(!feedback(&m).contains("src/pages/all.tsx"));
+    }
+
+    #[test]
+    fn an_item_of_another_kind_than_its_siblings_is_skipped() {
+        let sib = |n: &str| {
+            format!("import {{ defineType }} from 'sanity'\nexport default defineType({{ name: '{n}' }})\n")
+        };
+        let sibs = vec![sib("author"), sib("blog"), sib("class")];
+        let helper = "export function validatePromotion(v: string) { return v.length > 0 }\n";
+        assert!(other_kind(helper, &sibs));
+        let doc =
+            "import { defineType } from 'sanity'\nexport default defineType({ name: 'promo' })\n";
+        assert!(!other_kind(doc, &sibs));
+        // Too little to judge: never skips.
+        assert!(!other_kind(helper, &sibs[..1]));
+        assert_eq!(
+            imported_packages("import x from '@scope/pkg/sub'\nconst y = require(\"lodash/get\")\nimport z from './local'"),
+            ["@scope/pkg", "lodash"].iter().map(|s| s.to_string()).collect()
+        );
+    }
+
+    #[test]
+    fn path_names_match_whole_segments_only() {
+        assert!(names_as_path(
+            "import A from '@/components/ui/accordion'",
+            "accordion"
+        ));
+        assert!(names_as_path("\"./Hero.tsx\"", "Hero"));
+        assert!(names_as_path(
+            "S.documentTypeListItem('blog-index')",
+            "blog-index"
+        ));
+        assert!(!names_as_path("\"@radix-ui/react-accordion\"", "accordion"));
+        assert!(!names_as_path("accordion without quotes", "accordion"));
     }
 }

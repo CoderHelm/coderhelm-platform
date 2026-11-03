@@ -923,7 +923,7 @@ pub async fn gate(
             &found.keys,
             &found.words,
         );
-        let (missing, places) = if added.is_empty() {
+        let (all_missing, places) = if added.is_empty() {
             (Vec::new(), 0)
         } else {
             registration::check(
@@ -938,6 +938,8 @@ pub async fn gate(
             )
             .await
         };
+        // Only registries block and go back to the coder; maybes are noted.
+        let missing = registration::blocking(&all_missing);
         let dups = if feature {
             duplicates(w, &files, usage).await
         } else {
@@ -1042,7 +1044,10 @@ pub async fn gate(
                 ));
             }
             facts.registrations_checked = places;
-            facts.unregistered = missing.iter().map(registration::Missing::line).collect();
+            facts.unregistered = all_missing
+                .iter()
+                .map(registration::Missing::line)
+                .collect();
             facts.duplicates = dups.iter().map(reuse::Duplicate::line).collect();
             facts.content = content;
             facts.checklist = static_items.into_iter().chain(sandbox).collect();
