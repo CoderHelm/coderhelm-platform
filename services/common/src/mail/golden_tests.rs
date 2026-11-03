@@ -314,11 +314,11 @@ fn the_update_notice_says_which_versions_why_and_what_to_do() {
         "What to do:",
         "Update readiness",
         "Check again",
-        "npx -y github:CoderHelm/coderhelm-platform update --to v0.8.0",
         "Read the release notes: https://helm.example.org/settings/system/#version",
     ] {
         assert!(r.text.contains(want), "missing {want:?} in\n{}", r.text);
     }
+    assert!(!r.text.contains("update --to"), "{}", r.text);
 }
 
 #[test]

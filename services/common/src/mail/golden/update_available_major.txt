@@ -11,9 +11,7 @@ Checked: 2026-10-31 14:05 UTC
 
 This is a major release. Read its notes before you update.
 
-To update, open Settings, then System, and press Update now to v1.0.0. Or run this where the install's AWS sign-in works:
-
-    npx -y github:CoderHelm/coderhelm-platform update --to v1.0.0
+To update, open Settings, then System, and press Update now. The release notes say what changed.
 
 Open Settings, System: https://helm.example.org/settings/system/
 
