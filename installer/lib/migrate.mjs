@@ -83,7 +83,7 @@ export function nativeParameters(cfg, { keepData = true } = {}) {
     v("BedrockInferencePrefix", cfg.models?.bedrockInferencePrefix === undefined ? "auto" : cfg.models.bedrockInferencePrefix || "none"),
     v("Hostname", cfg.domain?.hostname ?? ""),
     v("DomainCertificateArn", cfg.domain?.certificateArn ?? ""),
-    v("DomainZoneId", cfg.domain?.hostedZoneId ?? ""),
+    v("DomainZoneId", ""),
     v("SignupDomain", (cfg.signup?.domains ?? [])[0] ?? ""),
     v("RequireTwoFactor", cfg.signup?.requireTwoFactor ? "on" : "off"),
     v("AutoUpdate", u.auto ? "on" : "off"),

@@ -108,7 +108,7 @@ export function buildApp(app: cdk.App, cfg: ResolvedConfig, opts: { accessStack?
       cfg,
       httpApi: api.httpApi,
       streamingFunctionUrl: streaming.functionUrl,
-      crossRegionReferences: !cfg.native && cfg.region !== "us-east-1" && !!cfg.singleOrigin?.hostedZone && !cfg.singleOrigin.certificateArn,
+      crossRegionReferences: false,
     });
   }
 

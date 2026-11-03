@@ -35,10 +35,6 @@ export async function collect(ctx, cfg, state) {
 
   const publicUrl = state.publicUrl ?? (cfg.domain?.hostname ? `https://${cfg.domain.hostname}` : null);
   const dns = [];
-  if (cfg.domain?.hostedZone) {
-    const z = await C.checkHostedZone(ctx, cfg.domain.hostedZone);
-    dns.push(z.result, await C.checkDelegation(ctx, cfg.domain.hostedZone, z.zoneId));
-  }
   if (cfg.domain?.certificateArn) dns.push(await C.checkCertificate(ctx, cfg.domain.certificateArn, cfg.domain.hostname));
   dns.push(...(await C.checkUrls(ctx, publicUrl, cfg)));
   add("Web address", dns);
@@ -54,7 +50,7 @@ export async function collect(ctx, cfg, state) {
   add("GitHub", [secretCheck, ...(ctx.runner.dryRun ? [] : await C.checkGithubApp(ctx, secret, publicUrl, hybrid))]);
 
   add("Email", [
-    await C.checkSesIdentity(ctx, cfg.email?.from ?? "", cfg.region, { zone: cfg.domain?.hostedZone }),
+    await C.checkSesIdentity(ctx, cfg.email?.from ?? "", cfg.region, {}),
     await C.checkSesSandbox(ctx, cfg.region),
   ]);
 

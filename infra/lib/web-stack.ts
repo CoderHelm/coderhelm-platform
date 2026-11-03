@@ -23,13 +23,11 @@ import * as cloudfront from "aws-cdk-lib/aws-cloudfront";
 import * as origins from "aws-cdk-lib/aws-cloudfront-origins";
 import * as lambda from "aws-cdk-lib/aws-lambda";
 import * as route53 from "aws-cdk-lib/aws-route53";
-import * as route53Targets from "aws-cdk-lib/aws-route53-targets";
 import * as s3 from "aws-cdk-lib/aws-s3";
 import * as s3deploy from "aws-cdk-lib/aws-s3-deployment";
 import * as ssm from "aws-cdk-lib/aws-ssm";
 import { Construct } from "constructs";
 import { ResolvedConfig } from "./config";
-import { recordNameIn } from "./service-env";
 import { releaseStamp } from "./release";
 
 /**
@@ -136,42 +134,10 @@ export class WebStack extends cdk.Stack {
 
     // --- Certificate and DNS (custom domain only) ---
     let certificate: acm.ICertificate | undefined;
-    let zone: route53.IHostedZone | undefined;
-    if (domain) {
-      if (domain.hostedZone) {
-        zone = domain.hostedZoneId
-          ? route53.HostedZone.fromHostedZoneAttributes(this, "Zone", {
-              zoneName: domain.hostedZone,
-              hostedZoneId: domain.hostedZoneId,
-            })
-          : route53.HostedZone.fromLookup(this, "Zone", { domainName: domain.hostedZone });
-      }
-      if (domain.certificateArn) {
-        certificate = acm.Certificate.fromCertificateArn(this, "Certificate", domain.certificateArn);
-      } else if (cdk.Stack.of(this).region === "us-east-1") {
-        certificate = new acm.Certificate(this, "Certificate", {
-          domainName: domain.hostname,
-          validation: acm.CertificateValidation.fromDns(zone),
-        });
-      } else {
-        // CloudFront only uses certificates from us-east-1.
-        const certStack = new cdk.Stack(scope, `${id}-certificate`, {
-          env: { account: cfg.account, region: "us-east-1" },
-          crossRegionReferences: true,
-        });
-        const certZone = domain.hostedZoneId
-          ? route53.HostedZone.fromHostedZoneAttributes(certStack, "Zone", {
-              zoneName: domain.hostedZone!,
-              hostedZoneId: domain.hostedZoneId,
-            })
-          : route53.HostedZone.fromLookup(certStack, "Zone", { domainName: domain.hostedZone! });
-        const cert = new acm.Certificate(certStack, "Certificate", {
-          domainName: domain.hostname,
-          validation: acm.CertificateValidation.fromDns(certZone),
-        });
-        this.addDependency(certStack);
-        certificate = acm.Certificate.fromCertificateArn(this, "Certificate", cert.certificateArn);
-      }
+    // CoderHelm never changes DNS: the certificate is the admin's (config
+    // requires certificateArn with a domain) and the records are printed.
+    if (domain?.certificateArn) {
+      certificate = acm.Certificate.fromCertificateArn(this, "Certificate", domain.certificateArn);
     }
 
     // --- Origins ---
@@ -262,13 +228,6 @@ export class WebStack extends cdk.Stack {
     if (cfg.native) hostname = this.nativeDomain(this.distribution);
     this.publicUrl = `https://${hostname}`;
 
-    if (domain && zone) {
-      const recordName = recordNameIn(domain.hostname, domain.hostedZone!);
-      const target = route53.RecordTarget.fromAlias(new route53Targets.CloudFrontTarget(this.distribution));
-      new route53.ARecord(this, "AliasRecord", { zone, recordName, target });
-      new route53.AaaaRecord(this, "AliasRecordV6", { zone, recordName, target });
-    }
-
     // Read by gateway, streaming and worker at start when the URL wasn't
     // known at synth (no custom domain).
     const publicUrlParameter = new ssm.StringParameter(this, "PublicUrlParameter", {
@@ -334,7 +293,7 @@ export class WebStack extends cdk.Stack {
     new cdk.CfnOutput(this, "GithubWebhookUrl", { value: `${this.publicUrl}/webhooks/github` });
     new cdk.CfnOutput(this, "DistributionId", { value: this.distribution.distributionId });
     new cdk.CfnOutput(this, "DashboardBucketName", { value: bucket.bucketName });
-    if (domain && !zone && !cfg.native) {
+    if (domain && !cfg.native) {
       new cdk.CfnOutput(this, "DnsRecord", {
         value: `${domain.hostname} CNAME ${this.distribution.distributionDomainName}`,
         description: "Create this DNS record at your DNS provider",
@@ -347,8 +306,8 @@ export class WebStack extends cdk.Stack {
    * updater requests the certificate (Settings, System, or the Hostname
    * launch parameter through the parent's Domain custom resource), then
    * proposes a stack update that sets DomainName and DomainCertificateArn
-   * (and DomainZoneId when the zone is in Route 53 here, for the alias
-   * records). Empty values: CloudFront's own address.
+   * (DomainZoneId is legacy and left empty: CoderHelm never changes DNS).
+   * Empty values: CloudFront's own address.
    */
   private nativeDomain(distribution: cloudfront.Distribution): string {
     const name = new cdk.CfnParameter(this, "DomainName", { type: "String", default: "" });
@@ -373,6 +332,10 @@ export class WebStack extends cdk.Stack {
         cdk.Aws.NO_VALUE,
       ),
     );
+    // Legacy only. CoderHelm no longer changes DNS (the install's roles may not:
+    // see access.ts NoDnsChanges), so nothing sets DomainZoneId and new installs
+    // never get these. An older install that already has them keeps them as
+    // they are; retained, so a later update never tries to delete DNS records.
     for (const type of ["A", "AAAA"]) {
       const r = new route53.CfnRecordSet(this, `NativeAlias${type}`, {
         hostedZoneId: zoneId.valueAsString,
@@ -381,6 +344,8 @@ export class WebStack extends cdk.Stack {
         aliasTarget: { dnsName: distribution.distributionDomainName, hostedZoneId: "Z2FDTNDATAQYW2" },
       });
       r.cfnOptions.condition = inZone;
+      r.cfnOptions.deletionPolicy = cdk.CfnDeletionPolicy.RETAIN;
+      r.cfnOptions.updateReplacePolicy = cdk.CfnDeletionPolicy.RETAIN;
     }
     return cdk.Token.asString(cdk.Fn.conditionIf(has.logicalId, name.valueAsString, distribution.distributionDomainName));
   }

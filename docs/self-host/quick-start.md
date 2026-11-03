@@ -73,12 +73,11 @@ Then it checks:
 ```
 Step 3 of 8 [██████░░░░░░░░░░] Web address
 CoderHelm needs one web address. Without a domain it uses CloudFront's own (https://dxxxx.cloudfront.net), ...
-  Route 53 zones in this account: example.com
-Hostname (empty for the CloudFront address) [coderhelm.example.com]:
-  example.com is in Route 53: the certificate and DNS records are created for you.
+Hostname (empty for the CloudFront address): coderhelm.example.com
+  CoderHelm never changes your DNS. Create an ACM certificate for it in us-east-1 (CloudFront only uses us-east-1), and you'll add one CNAME after the deploy.
 ```
 
-Leave it empty to use CloudFront's address. With a Route 53 zone it checks the zone exists and that **your domain's name servers point at it**: when they don't, it prints the four NS records to set at your registrar and what public DNS answers now. A hostname outside Route 53 asks for an ACM certificate in us-east-1 and checks it covers the hostname and is issued (or prints the validation records to add); see [Domains](./domains.md).
+Leave it empty to use CloudFront's address. A hostname asks for an ACM certificate in us-east-1 and checks it covers the hostname and is issued (or prints the validation records to add); after the deploy you add the hostname's CNAME yourself. See [Domains](./domains.md).
 
 ## Step 4: Claude access
 
@@ -104,7 +103,6 @@ With `anthropic`, you can paste a key to check it with a real one-token call to 
 Step 5 of 8 [██████████░░░░░░] You and email
 Your email: you@example.com
 Emails come from [coderhelm@example.com]:
-  example.com is your Route 53 zone: the deploy adds its DKIM records and SES verifies it in minutes.
   This account is in the SES sandbox: email only reaches verified addresses, 200 a day. ...
 This install is for one organization. Let people from your company join: an email domain such as example.com (empty: only people you invite) []:
 ```

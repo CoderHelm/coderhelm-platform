@@ -436,7 +436,7 @@ test("hardened: assets go to the install's own bucket, with the CLI's credential
 
 test("hardened: config refuses what it can't deploy", () => {
   assert.throws(() => resolveConfig({ ...BASE, access: { mode: "hardened", owner: "launch" } as any }), /access.id/);
-  assert.throws(() => resolveConfig({ ...BASE, region: "eu-west-1", domain: { hostname: "ch.example.org", hostedZone: "example.org" }, access: { mode: "hardened", owner: "app" } }), /outside us-east-1 needs domain.certificateArn/);
+  assert.throws(() => resolveConfig({ ...BASE, region: "eu-west-1", domain: { hostname: "ch.example.org", hostedZone: "example.org" }, access: { mode: "hardened", owner: "app" } }), /CoderHelm never changes DNS/);
   assert.throws(() => resolveConfig({ ...BASE, updates: { enabled: false }, access: { mode: "hardened", owner: "app" } }), /needs the updater/);
   assert.equal(installName("coderhelm-abcdefghijklmnopqrst", "coderhelm-abcdefghijklmnopqrst-web", "a/b/CustomCDKBucketDeployment8693BB64968944B69AAFB0CC9EB8756C/ServiceRole/Resource", 64).length <= 64, true);
 });
@@ -483,29 +483,46 @@ test("the boundary's services list has no wildcard service and no IAM", () => {
   for (const a of BOUNDARY_SERVICES) assert.ok(!a.startsWith("iam:") && a !== "*" && a !== "*:*", a);
 });
 
-test("a native install's zone: the deploy role only creates or deletes its A/AAAA alias, never UPSERTs", () => {
+test("no install role and no boundary may change DNS: no Route 53 write anywhere, and the boundary denies it", () => {
   // eslint-disable-next-line @typescript-eslint/no-var-requires
-  const { deployPolicy } = require("../lib/access");
+  const access = require("../lib/access");
   // eslint-disable-next-line @typescript-eslint/no-var-requires
-  const { nativeNames } = require("../lib/native/parent");
-  const dns = deployPolicy(nativeNames()).Statement.find((s: any) => s.Sid === "DnsRecords");
-  assert.equal(dns.Action, "route53:ChangeResourceRecordSets");
-  assert.equal(dns.Resource, "arn:${AWS::Partition}:route53:::hostedzone/${DomainZoneId}");
-  assert.deepEqual(dns.Condition["ForAllValues:StringEquals"], {
-    "route53:ChangeResourceRecordSetsRecordTypes": ["A", "AAAA"],
-    "route53:ChangeResourceRecordSetsActions": ["CREATE", "DELETE"],
-  });
-});
-
-test("the updater only creates the certificate's validation CNAME, after an admin confirms the zone", () => {
-  const R = synth()["coderhelm-prod-updates"].Resources;
-  const statements = Object.values<any>(R)
-    .filter((r) => r.Type === "AWS::IAM::Policy")
-    .flatMap((r) => r.Properties.PolicyDocument.Statement);
-  const v = statements.find((s: any) => s.Sid === "DomainValidationRecord");
-  assert.deepEqual(v.Condition["ForAllValues:StringEquals"]["route53:ChangeResourceRecordSetsActions"], ["CREATE"]);
-  assert.deepEqual(v.Condition["ForAllValues:StringEquals"]["route53:ChangeResourceRecordSetsRecordTypes"], ["CNAME"]);
-  assert.deepEqual(v.Condition["ForAllValues:StringLike"]["route53:ChangeResourceRecordSetsNormalizedRecordNames"], ["_*"]);
-  // No other statement of the updater may change records.
-  assert.equal(statements.filter((s: any) => ([] as string[]).concat(s.Action).includes("route53:ChangeResourceRecordSets")).length, 1);
+  const native = require("../lib/native/parent");
+  const WRITES = /^route53:(\*|Change|Create|Delete|Update|Associate|Disassociate|Activate|Deactivate|Enable|Disable)/i;
+  const allows = (doc: any) => (doc?.Statement ?? []).flat(Infinity)
+    .filter((st: any) => st && st.Effect === "Allow")
+    .flatMap((st: any) => [st.Action ?? []].flat());
+  const n = access.accessNames({ account: "111122223333", region: "eu-west-1", prefix: "coderhelm-prod", suffix: "-111122223333", secretName: "coderhelm-prod" });
+  const docs: Record<string, any> = {
+    "boundary": access.boundaryPolicy(n),
+    "deploy role": access.deployPolicy(n),
+    "native boundary": access.boundaryPolicy(native.nativeNames()),
+    "native deploy role": access.deployPolicy(native.nativeNames()),
+    "native auto-update role": native.deployRolePolicy(native.nativeNames()),
+    "native install helper": native.helperPolicy(),
+    "update window": access.windowPolicy(n),
+  };
+  for (const [name, d] of Object.entries(docs)) {
+    const bad = allows(d).filter((a: string) => WRITES.test(a) || a === "route53:*" || a === "*");
+    assert.deepEqual(bad, [], `${name} allows ${bad.join(", ")}`);
+  }
+  assert.ok(!access.BOUNDARY_SERVICES.some((a: string) => a.startsWith("route53:")), "the boundary allows no route53 action");
+  for (const name of ["boundary", "native boundary"]) {
+    const deny = docs[name].Statement.find((st: any) => st.Sid === "NoDnsChanges");
+    assert.equal(deny?.Effect, "Deny", `${name} denies DNS changes`);
+    assert.deepEqual(deny.Action, ["route53:ChangeResourceRecordSets", "route53:CreateHostedZone", "route53:DeleteHostedZone"]);
+    assert.equal(deny.Resource, "*");
+  }
+  // Every synthesized self-host stack: no IAM policy statement allows a Route 53 write.
+  for (const [stack, t] of Object.entries<any>(synth())) {
+    for (const r of Object.values<any>(t.Resources ?? {})) {
+      const docsIn = r.Type === "AWS::IAM::Policy" ? [r.Properties.PolicyDocument]
+        : r.Type === "AWS::IAM::Role" ? (r.Properties.Policies ?? []).map((p: any) => p.PolicyDocument)
+        : r.Type === "AWS::IAM::ManagedPolicy" ? [r.Properties.PolicyDocument] : [];
+      for (const d of docsIn) {
+        const bad = allows(d).filter((a: any) => typeof a === "string" && (WRITES.test(a) || a === "route53:*"));
+        assert.deepEqual(bad, [], `${stack} ${r.Type} allows ${bad.join(", ")}`);
+      }
+    }
+  }
 });

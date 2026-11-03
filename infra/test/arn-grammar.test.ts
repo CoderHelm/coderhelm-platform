@@ -70,7 +70,7 @@ test("the grammar check refuses what IAM refuses", () => {
 });
 
 test("the boundary and deploy policy, with the longest names and with none of the optional ones", () => {
-  for (const over of [{}, { emailIdentity: "helm@example.org", zoneId: "Z0123456789EXAMPLE" }]) {
+  for (const over of [{}, { emailIdentity: "helm@example.org" }]) {
     const n = { ...accessNames({ account: "111122223333", region: "ap-southeast-2", prefix: "coderhelm-abcdefghijklmnopqrst", suffix: "-111122223333", secretName: "coderhelm/abcdefghijklmnopqrst/secrets", id: "stack" }), ...over };
     const t = { Resources: { B: { Type: "AWS::IAM::ManagedPolicy", Properties: { PolicyDocument: boundaryPolicy(n) } }, D: { Type: "AWS::IAM::ManagedPolicy", Properties: { PolicyDocument: deployPolicy(n) } } } };
     assert.deepEqual(problems([["access", t]]), []);
@@ -99,9 +99,9 @@ test("every policy of a native release, auto-update on, with and without a domai
     const values = { ...prodValues("111122223333", "us-east-1"), DomainZoneId: zone, AutoUpdate: "on", Hostname: zone ? "helm.example.org" : "", DomainCertificateArn: zone ? "arn:aws:acm:us-east-1:111122223333:certificate/abc" : "" };
     const conditions = { AutoUpdateOn: true, HasDomainZone: zone !== "", HasHostname: zone !== "", HasDomainCert: zone !== "", HasEmailFrom: false };
     const all: [string, any][] = [["coderhelm.json", rel.parent], ...Object.entries(rel.children)].map(([name, t]) => [`${name} (zone ${zone || "none"})`, resolveValue(t, { values, conditions })]);
-    // The auto-update role is there, with or without its DNS statement.
+    // The auto-update role never gets a DNS statement, even for an older install's zone id.
     const deploy = (all[0][1].Resources.DeployRole.Properties.Policies[0].PolicyDocument.Statement as any[]).filter((s) => s.Ref !== "AWS::NoValue");
-    assert.equal(deploy.some((s) => s.Sid === "DnsRecords"), zone !== "", `DnsRecords with zone ${zone || "none"}`);
+    assert.equal(deploy.some((s) => s.Sid === "DnsRecords"), false, `no DnsRecords with zone ${zone || "none"}`);
     assert.ok(policyResources(all[0][1]).length > 50);
     assert.deepEqual(problems(all), []);
   }
@@ -121,7 +121,7 @@ test("every policy of a hardened install, with and without its own domain", () =
   const plain = synth({});
   assert.ok(plain.some(([, t]) => policyResources(t).length > 0));
   assert.deepEqual(problems(plain), []);
-  const cfg = { domain: { hostname: "helm.example.org", hostedZone: "example.org", certificateArn: "arn:aws:acm:us-east-1:111122223333:certificate/abc" } } as Partial<CoderhelmConfig>;
+  const cfg = { domain: { hostname: "helm.example.org", certificateArn: "arn:aws:acm:us-east-1:111122223333:certificate/abc" } } as Partial<CoderhelmConfig>;
   const app = new cdk.App({ outdir: fs.mkdtempSync(path.join(os.tmpdir(), "charnout-")), context: { ...ctx("us-west-2"), ...ctx("us-east-1") } });
   buildApp(app, resolveConfig({ account: "111122223333", region: "us-west-2", stage: "prod", email: { from: "a@example.org" }, admins: ["o@example.org"], access: { mode: "hardened", owner: "app" }, ...cfg }), { accessStack: true });
   assert.deepEqual(problems(app.synth().stacks.map((s) => [s.stackName, s.template])), []);

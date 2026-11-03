@@ -35,7 +35,7 @@ You do not need Rust, Docker or the CDK CLI: the release ships built code, and t
 
 ## Optional
 
-- **A domain** in a Route 53 public hosted zone, so the certificate's records are created for you. A domain at another DNS provider works too: you add two records. See [Domains](./domains.md).
+- **A domain** at any DNS provider (Route 53 included): you add two records. CoderHelm never changes your DNS. See [Domains](./domains.md).
 
 ## What it costs
 

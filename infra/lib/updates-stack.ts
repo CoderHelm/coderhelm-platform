@@ -460,8 +460,7 @@ export class UpdatesStack extends cdk.Stack {
     }));
 
     // Your own domain: request its certificate in us-east-1 (CloudFront's
-    // region), add the validation record when the zone is in Route 53 here,
-    // and read the CloudFront hostname for the record people add elsewhere.
+    // region) and read the CloudFront hostname for the record people add elsewhere.
     this.updaterFunction.addToRolePolicy(new iam.PolicyStatement({
       sid: "DomainCertificate",
       actions: ["acm:DescribeCertificate", "acm:AddTagsToCertificate"],
@@ -472,25 +471,6 @@ export class UpdatesStack extends cdk.Stack {
       actions: ["acm:RequestCertificate"],
       resources: ["*"],
       conditions: { StringEquals: { "aws:RequestedRegion": "us-east-1" } },
-    }));
-    this.updaterFunction.addToRolePolicy(new iam.PolicyStatement({
-      sid: "DomainZoneLookup",
-      actions: ["route53:ListHostedZones", "route53:GetHostedZone", "route53:ListResourceRecordSets"],
-      resources: ["*"],
-    }));
-    this.updaterFunction.addToRolePolicy(new iam.PolicyStatement({
-      sid: "DomainValidationRecord",
-      actions: ["route53:ChangeResourceRecordSets"],
-      resources: ["arn:aws:route53:::hostedzone/*"],
-      conditions: {
-        // Only creating the CNAME ACM checks (its name always starts with an
-        // underscore), after an admin confirmed the zone: never UPSERT or DELETE.
-        "ForAllValues:StringEquals": {
-          "route53:ChangeResourceRecordSetsRecordTypes": ["CNAME"],
-          "route53:ChangeResourceRecordSetsActions": ["CREATE"],
-        },
-        "ForAllValues:StringLike": { "route53:ChangeResourceRecordSetsNormalizedRecordNames": ["_*"] },
-      },
     }));
     this.updaterFunction.addToRolePolicy(new iam.PolicyStatement({
       sid: "DomainTarget",

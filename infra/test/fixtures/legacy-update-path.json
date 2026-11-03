@@ -659,37 +659,6 @@
             "Sid": "DomainCertificateRequest"
           },
           {
-            "Action": [
-              "route53:ListHostedZones",
-              "route53:GetHostedZone",
-              "route53:ListResourceRecordSets"
-            ],
-            "Effect": "Allow",
-            "Resource": "*",
-            "Sid": "DomainZoneLookup"
-          },
-          {
-            "Action": "route53:ChangeResourceRecordSets",
-            "Condition": {
-              "ForAllValues:StringEquals": {
-                "route53:ChangeResourceRecordSetsActions": [
-                  "CREATE"
-                ],
-                "route53:ChangeResourceRecordSetsRecordTypes": [
-                  "CNAME"
-                ]
-              },
-              "ForAllValues:StringLike": {
-                "route53:ChangeResourceRecordSetsNormalizedRecordNames": [
-                  "_*"
-                ]
-              }
-            },
-            "Effect": "Allow",
-            "Resource": "arn:aws:route53:::hostedzone/*",
-            "Sid": "DomainValidationRecord"
-          },
-          {
             "Action": "ssm:GetParameter",
             "Effect": "Allow",
             "Resource": "arn:aws:ssm:us-west-2:111122223333:parameter/coderhelm-prod/distribution-domain",

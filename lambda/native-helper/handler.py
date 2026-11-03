@@ -641,12 +641,13 @@ def write_status(props, phase, message, url=None, s3=None):
                                     ContentType="application/json", CacheControl="no-store")
 
 
-def delete_certificates(prefix, acm=None, r53=None):
+def delete_certificates(prefix, acm=None):
     """The certificates the updater requested for this install (tag
-    coderhelm=<prefix>, us-east-1), with their validation records."""
+    coderhelm=<prefix>, us-east-1). CoderHelm never changes DNS, so their
+    validation records are left where the admin added them and listed as
+    records they can now remove."""
     acm = acm or client("acm", "us-east-1")
-    r53 = r53 or client("route53")
-    done, problems = [], []
+    done, problems, records = [], [], []
     for page in acm.get_paginator("list_certificates").paginate():
         for c in page.get("CertificateSummaryList") or []:
             arn = c["CertificateArn"]
@@ -658,29 +659,18 @@ def delete_certificates(prefix, acm=None, r53=None):
                 for o in cert.get("DomainValidationOptions") or []:
                     rr = o.get("ResourceRecord")
                     if rr:
-                        remove_record(r53, rr)
+                        records.append(f"{rr['Name'].rstrip('.')} {rr.get('Type') or 'CNAME'} {rr['Value'].rstrip('.')}")
+                    if o.get("DomainName"):
+                        records.append(f"{o['DomainName']} CNAME (CoderHelm's address)")
                 acm.delete_certificate(CertificateArn=arn)
                 done.append(arn.split("/")[-1])
                 log("deleted certificate", arn)
             except Exception as e:
                 problems.append(f"certificate {arn.split('/')[-1]}: {e}")
                 log("certificate not deleted:", arn, e)
-    return done, problems
-
-
-def remove_record(r53, rr):
-    name = rr["Name"].rstrip(".")
-    for z in r53.list_hosted_zones().get("HostedZones") or []:
-        zn = z["Name"].rstrip(".")
-        if z.get("Config", {}).get("PrivateZone") or not (name == zn or name.endswith("." + zn)):
-            continue
-        try:
-            r53.change_resource_record_sets(HostedZoneId=z["Id"].split("/")[-1], ChangeBatch={"Changes": [{
-                "Action": "DELETE", "ResourceRecordSet": {"Name": rr["Name"], "Type": rr["Type"], "TTL": 300,
-                                                          "ResourceRecords": [{"Value": rr["Value"]}]}}]})
-            log("removed validation record", name)
-        except Exception as e:
-            log("validation record left as it was:", name, e)
+    if records:
+        log("DNS records you can remove where your domain's DNS is hosted:", "; ".join(records))
+    return done, problems, records
 
 
 def delete_named_log_groups(names, prefix, logs=None):
@@ -824,7 +814,7 @@ def handle(event, context=None):
         mode = tearing_down(props, stack=stack) if rt == "Delete" else None
         if mode is None:
             return "SUCCESS", "nothing to do", {}
-        certs, problems = delete_certificates(props["Prefix"])
+        certs, problems, records = delete_certificates(props["Prefix"])
         if props.get("StatusBucket"):
             try:
                 empty_bucket(props["StatusBucket"])
@@ -848,6 +838,8 @@ def handle(event, context=None):
         if mode == "delete" and not problems:
             delete_switch_parameter(props.get("DeleteSwitch"))
         msg = f"deleted {len(certs)} certificates and {len(groups)} log groups{secret}"
+        if records:
+            msg += "; DNS records you can remove: " + "; ".join(records)
         if problems:
             return "FAILED", msg + "; not removed: " + "; ".join(problems), {}
         return "SUCCESS", msg, {}

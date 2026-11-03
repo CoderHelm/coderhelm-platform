@@ -83,6 +83,7 @@ Delete work happens only while the root stack itself is being deleted, or while 
 `coderhelm-<name>-boundary-stack` is the most any CoderHelm role can ever do, whatever its own policy says. Every role CoderHelm creates carries it: the functions, the updater and the install helper. The auto-update role carries an identical copy, `coderhelm-<name>-deploy-boundary-stack`: that role is kept when the stack is deleted, and IAM refuses to delete a policy a role still carries, so its copy is kept with it while the boundary every other role carries goes with the stack. Its text is written once, in `infra/lib/access.ts`. It allows only the services CoderHelm uses: Lambda, DynamoDB, S3, SQS, SNS, EventBridge, CloudWatch and its logs, Secrets Manager, KMS, SES, Cognito, CloudFront, API Gateway, CodeBuild, Systems Manager parameters, ACM, Route 53, CloudFormation, and calls to Bedrock models. Even within those, it refuses:
 
 - creating IAM users, access keys, sign-in profiles, groups or identity providers;
+- changing DNS: no Route 53 record change, and no hosted zone created or deleted. CoderHelm shows the records for your domain; you add them;
 - anything in Organizations, account settings, CloudTrail or GuardDuty;
 - any IAM action on a role or policy whose name doesn't start with `coderhelm-<name>-`;
 - creating or changing a role without this boundary on it, and removing a boundary from any role;
@@ -117,7 +118,7 @@ The helper's role carries the boundary and can only do this (`helperPolicy()` in
 - describe the root stack and read its events;
 - list log groups, and read the tags of and delete those named `/aws/lambda/coderhelm-<name>-*` or `/aws/codebuild/coderhelm-<name>-*`. The code deletes the exact names the parts declare, and otherwise only those tagged `coderhelm:install = coderhelm-<name>`;
 - list and describe certificates in ACM in us-east-1, and delete only those tagged `coderhelm = coderhelm-<name>` (the ones the updater requested): IAM checks the tag;
-- list Route 53 zones, and delete only CNAME records whose names start with `_` (certificate validation records, removed with the certificate). It can't create or change any record.
+- nothing in Route 53: CoderHelm never changes your DNS. The uninstall names the records you can remove.
 
 Delete work runs only while the root stack itself is being deleted and follows **KeepDataOnDelete** as the root stack itself has it, both read from CloudFormation in one call, never from what the request says. (It also ignores a request without a CloudFormation-shaped response address; that only filters out mistakes, it proves nothing.)
 

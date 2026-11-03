@@ -26,10 +26,6 @@ Each step checks what you did before it moves on. When a check fails, fix it and
   Pick a region the check doesn't flag (us-east-1, us-west-2, eu-west-1 and eu-central-1 have everything).
 - **CDK set up**\
   `npx -y cdk bootstrap aws://<account>/<region>` (the installer offers to run it; with a domain outside us-east-1, us-east-1 too). If the `CDKToolkit` stack is in a failed state, delete it first.
-- **Route 53 zone**\
-  Create the zone (`aws route53 create-hosted-zone --name <zone> --caller-reference <anything>`), or leave the hostname empty.
-- **Points at Route 53**\
-  Set the NS records at your registrar to the four the check prints; it also shows what public DNS answers now. Changes can take up to an hour.
 - **TLS certificate issued**\
   Add the validation records the check prints, or request a certificate in us-east-1 for the exact hostname.
 - **Claude models enabled in Bedrock**\
@@ -55,7 +51,7 @@ Each step checks what you did before it moves on. When a check fails, fix it and
 
 **The deploy fails on the user pool with an SES error.** `email.cognitoUsesSes` is true but the SES identity isn't verified yet. Set it to false, deploy, verify the identity, then turn it on. See [Email](./email.md).
 
-**Certificate validation never finishes.** With `hostedZone`, the zone must be the public zone your domain's registrar points to. With `certificateArn`, the certificate must be in us-east-1 and issued.
+**Certificate validation never finishes.** The validation record must be in the zone public DNS uses for your domain (the one your registrar points to), and the certificate must be in us-east-1.
 
 **The first deploy seems stuck on the web stack.** Creating a CloudFront distribution takes 5 to 15 minutes.
 

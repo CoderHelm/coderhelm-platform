@@ -185,10 +185,6 @@ async fn main() -> Result<(), Error> {
                 .put(routes::system::set_domain)
                 .delete(routes::system::remove_domain),
         )
-        .route(
-            "/system/domain/route53",
-            post(routes::system::use_route53_domain),
-        )
         // Hybrid: CoderHelm's address, GitHub App relay, integrations and
         // delivery sharing (install admins; routes::hybrid_install).
         .route(

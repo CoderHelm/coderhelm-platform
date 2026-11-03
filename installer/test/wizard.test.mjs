@@ -12,6 +12,7 @@ import { bedrockPrefixFor, checkAnthropicKey, configFromAnswers, estimateMonthly
 import { FakeRunner } from "./fake.mjs";
 
 const ACCOUNT = "111122223333";
+const CERT = `arn:aws:acm:us-east-1:${ACCOUNT}:certificate/0f0e0d0c-1111-2222-3333-444455556666`;
 
 function aws(extra = {}) {
   return new FakeRunner({
@@ -19,7 +20,7 @@ function aws(extra = {}) {
     "sts get-caller-identity": { Account: ACCOUNT, Arn: `arn:aws:iam::${ACCOUNT}:user/me` },
     "tar --version": "bsdtar",
     "configure get region": "eu-west-1",
-    "route53 list-hosted-zones": { HostedZones: [{ Name: "example.org.", Config: { PrivateZone: false } }, { Name: "internal.", Config: { PrivateZone: true } }] },
+    "acm describe-certificate": { Certificate: { DomainName: "helm.example.org", Status: "ISSUED" } },
     "sesv2 get-email-identity": { code: 254 },
     "sesv2 get-account": { ProductionAccessEnabled: false },
     "get-foundation-model-availability": { authorizationStatus: "AUTHORIZED", agreementAvailability: { status: "AVAILABLE" } },
@@ -56,7 +57,7 @@ async function run(argv, deps) {
   return { code, out: logs.join("\n") };
 }
 
-test("happy path: every step, a domain from Route 53, Bedrock, auto-update, a cost summary, saved", async () => {
+test("happy path: every step, a domain with its certificate, Bedrock, auto-update, a cost summary, saved", async () => {
   const dir = tmp();
   const file = path.join(dir, "coderhelm.config.json");
   const s = script([
@@ -64,6 +65,7 @@ test("happy path: every step, a domain from Route 53, Bedrock, auto-update, a co
     ["AWS region", "eu-west-1"],
     ["short name", "prod"],
     ["Hostname", "helm.example.org"],
+    ["ACM certificate ARN", CERT],
     ["anthropic or bedrock", "bedrock"],
     ["prefix", "eu."],
     ["Your email", "owner@example.org"],
@@ -79,13 +81,13 @@ test("happy path: every step, a domain from Route 53, Bedrock, auto-update, a co
   const { out } = await run(["init", "--config", file], { runner: aws(), ask: s, interactive: true });
   assert.deepEqual(s.left, [], "every scripted question was asked");
   const cfg = JSON.parse(fs.readFileSync(file, "utf8"));
-  assert.deepEqual(cfg.domain, { hostname: "helm.example.org", hostedZone: "example.org" });
+  assert.deepEqual(cfg.domain, { hostname: "helm.example.org", certificateArn: CERT });
   assert.deepEqual(cfg.models, { provider: "bedrock", bedrockInferencePrefix: "eu." });
   assert.deepEqual(cfg.updates, { auto: true, window: "Sat 22:00", timezone: "Europe/Berlin", majors: "ask" });
   assert.equal(cfg.telemetry.enabled, false, "telemetry stays off unless asked for");
   for (let i = 0; i < STEPS.length; i++) assert.ok(out.includes(`Step ${i + 1} of ${STEPS.length}`), `progress for step ${i + 1}`);
-  assert.match(out, /Route 53 zones in this account: example\.org/);
-  assert.doesNotMatch(out, /internal/, "private zones are not offered");
+  assert.match(out, /CoderHelm never changes your DNS/);
+  assert.doesNotMatch(out, /Route 53 zones/);
   assert.match(out, /SES sandbox/);
   assert.match(out, /Estimated AWS cost per month/);
   assert.match(out, /Deploy when you are ready/);

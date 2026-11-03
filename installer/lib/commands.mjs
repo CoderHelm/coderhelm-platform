@@ -49,7 +49,7 @@ export function buildConfig(a) {
     region: a.region,
     stage: a.stage,
     domain: a.hostname
-      ? { hostname: a.hostname, ...(a.zone ? { hostedZone: a.zone } : {}), ...(a.certificateArn ? { certificateArn: a.certificateArn } : {}) }
+      ? { hostname: a.hostname, ...(a.certificateArn ? { certificateArn: a.certificateArn } : {}) }
       : null,
     models: { provider: a.provider, ...(a.provider === "bedrock" && a.bedrockPrefix !== undefined ? { bedrockInferencePrefix: a.bedrockPrefix } : {}) },
     email: { from: a.emailFrom },

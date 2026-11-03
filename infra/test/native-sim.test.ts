@@ -24,6 +24,13 @@ const F = JSON.parse(fs.readFileSync(path.join(__dirname, "..", "..", "test", "f
 
 /** Calls the registry lists that the auto-update role refuses on purpose. */
 const REFUSED: Record<string, Verdict> = {
+  // CoderHelm never changes DNS: an older install's retained alias records are
+  // never touched (access.ts NoDnsChanges denies the write outright).
+  "route53:ChangeResourceRecordSets": "explicitDeny",
+  "route53:GetChange": "implicitDeny",
+  "route53:GetHostedZone": "implicitDeny",
+  "route53:ListHostedZones": "implicitDeny",
+  "route53:ListResourceRecordSets": "implicitDeny",
   "iam:DeleteRolePermissionsBoundary": "explicitDeny", // every role keeps the boundary
   "kms:DisableKey": "explicitDeny", // it never disables a key
   "kms:ScheduleKeyDeletion": "explicitDeny", // it never deletes data

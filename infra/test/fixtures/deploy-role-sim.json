@@ -365,18 +365,6 @@
      }
     },
     {
-     "Sid": "DnsRecords",
-     "Effect": "Allow",
-     "Action": [
-      "route53:ChangeResourceRecordSets",
-      "route53:GetChange"
-     ],
-     "Resource": [
-      "arn:aws:route53:::hostedzone/*",
-      "arn:aws:route53:::change/*"
-     ]
-    },
-    {
      "Sid": "NoIamUsersOrKeys",
      "Effect": "Deny",
      "Action": [
@@ -419,8 +407,6 @@
       "lambda:List*",
       "logs:Describe*",
       "logs:List*",
-      "route53:Get*",
-      "route53:List*",
       "ses:Get*",
       "ses:List*",
       "ses:DescribeConfigurationSet",
@@ -460,7 +446,6 @@
       "kms:*",
       "lambda:*",
       "logs:*",
-      "route53:*",
       "s3:*",
       "scheduler:*",
       "secretsmanager:*",
@@ -518,6 +503,16 @@
       "iam:UntagPolicy"
      ],
      "Resource": "arn:aws:iam::111122223333:policy/coderhelm-prod-*"
+    },
+    {
+     "Sid": "NoDnsChanges",
+     "Effect": "Deny",
+     "Action": [
+      "route53:ChangeResourceRecordSets",
+      "route53:CreateHostedZone",
+      "route53:DeleteHostedZone"
+     ],
+     "Resource": "*"
     },
     {
      "Sid": "NoIamUsersOrKeys",
@@ -749,7 +744,6 @@
   "AWS::ApiGatewayV2::Integration",
   "AWS::ApiGatewayV2::Route",
   "AWS::ApiGatewayV2::Stage",
-  "AWS::CertificateManager::Certificate",
   "AWS::CloudFront::Distribution",
   "AWS::CloudFront::Function",
   "AWS::CloudFront::OriginAccessControl",
@@ -774,7 +768,6 @@
   "AWS::Lambda::Url",
   "AWS::Logs::LogGroup",
   "AWS::Logs::MetricFilter",
-  "AWS::Route53::RecordSet",
   "AWS::S3::Bucket",
   "AWS::S3::BucketPolicy",
   "AWS::SES::ConfigurationSet",
@@ -789,10 +782,8 @@
  ],
  "rows": [
   {"actions": {"lambda:CreateEventSourceMapping": "allowed"}, "calls": ["AWS::Lambda::EventSourceMapping create"], "context": {"aws:RequestTag/coderhelm:install": "coderhelm-prod", "aws:TagKeys": ["coderhelm:install"], "lambda:FunctionArn": "arn:aws:lambda:us-east-1:111122223333:function:coderhelm-prod-worker"}, "resource": "*"},
-  {"actions": {"acm:RequestCertificate": "allowed", "cloudfront:CreateConnectionGroup": "implicitDeny", "cloudfront:CreateDistribution": "allowed", "cloudfront:CreateFunction": "allowed", "cognito-idp:CreateUserPool": "allowed", "kms:CreateKey": "allowed"}, "calls": ["AWS::CertificateManager::Certificate create", "AWS::CloudFront::Distribution create", "AWS::CloudFront::Distribution update", "AWS::CloudFront::Function create", "AWS::Cognito::UserPool create", "AWS::KMS::Key create"], "context": {"aws:RequestTag/coderhelm:install": "coderhelm-prod", "aws:TagKeys": ["coderhelm:install"]}, "resource": "*"},
-  {"actions": {"cloudfront:CreateOriginAccessControl": "allowed", "cloudfront:CreateResponseHeadersPolicy": "allowed", "cloudwatch:PutMetricData": "implicitDeny", "cognito-idp:DescribeUserPoolDomain": "allowed", "dynamodb:DescribeEndpoints": "allowed", "dynamodb:DescribeLimits": "allowed", "dynamodb:DescribeReservedCapacity": "allowed", "dynamodb:DescribeReservedCapacityOfferings": "allowed", "kms:ListAliases": "allowed", "logs:CreateLogDelivery": "implicitDeny", "logs:DeleteIndexPolicy": "implicitDeny", "logs:DeleteResourcePolicy": "implicitDeny", "logs:DescribeIndexPolicies": "allowed", "logs:DescribeLogGroups": "allowed", "logs:DescribeResourcePolicies": "allowed", "logs:PutBearerTokenAuthentication": "implicitDeny", "logs:PutIndexPolicy": "implicitDeny", "logs:PutResourcePolicy": "implicitDeny", "route53:ListHostedZones": "allowed", "ses:CreateTemplate": "allowed", "ses:DeleteTemplate": "allowed", "ses:DescribeConfigurationSet": "allowed", "ses:GetTemplate": "allowed", "ses:UpdateTemplate": "allowed"}, "calls": ["AWS::CloudFront::OriginAccessControl create", "AWS::CloudFront::ResponseHeadersPolicy create", "AWS::Cognito::UserPoolDomain create", "AWS::Cognito::UserPoolDomain delete", "AWS::Cognito::UserPoolDomain read", "AWS::Cognito::UserPoolDomain update", "AWS::DynamoDB::GlobalTable create", "AWS::DynamoDB::GlobalTable delete", "AWS::DynamoDB::GlobalTable read", "AWS::DynamoDB::GlobalTable update", "AWS::KMS::Alias read", "AWS::Logs::LogGroup create", "AWS::Logs::LogGroup delete", "AWS::Logs::LogGroup read", "AWS::Logs::LogGroup update", "AWS::Route53::RecordSet create", "AWS::Route53::RecordSet delete", "AWS::Route53::RecordSet read", "AWS::Route53::RecordSet update", "AWS::SES::ConfigurationSet create", "AWS::SES::ConfigurationSet read", "AWS::SES::ConfigurationSet update", "AWS::SES::ConfigurationSetEventDestination create", "AWS::SES::ConfigurationSetEventDestination read", "AWS::SES::Template create", "AWS::SES::Template delete", "AWS::SES::Template read", "AWS::SES::Template update"], "context": {}, "resource": "*"},
-  {"actions": {"acm:AddTagsToCertificate": "allowed", "acm:RemoveTagsFromCertificate": "allowed"}, "calls": ["AWS::CertificateManager::Certificate create", "AWS::CertificateManager::Certificate delete", "AWS::CertificateManager::Certificate tag", "AWS::CertificateManager::Certificate update"], "context": {"aws:RequestTag/coderhelm:install": "coderhelm-prod", "aws:ResourceTag/coderhelm:install": "coderhelm-prod", "aws:TagKeys": ["coderhelm:install"]}, "resource": "arn:aws:acm:us-east-1:111122223333:certificate/f1e2d3c4-b5a6-4789-a012-345678901234"},
-  {"actions": {"acm:DeleteCertificate": "allowed", "acm:DescribeCertificate": "allowed", "acm:ListTagsForCertificate": "allowed", "acm:UpdateCertificateOptions": "allowed"}, "calls": ["AWS::CertificateManager::Certificate create", "AWS::CertificateManager::Certificate delete", "AWS::CertificateManager::Certificate read", "AWS::CertificateManager::Certificate update"], "context": {"aws:ResourceTag/coderhelm:install": "coderhelm-prod"}, "resource": "arn:aws:acm:us-east-1:111122223333:certificate/f1e2d3c4-b5a6-4789-a012-345678901234"},
+  {"actions": {"cloudfront:CreateConnectionGroup": "implicitDeny", "cloudfront:CreateDistribution": "allowed", "cloudfront:CreateFunction": "allowed", "cognito-idp:CreateUserPool": "allowed", "kms:CreateKey": "allowed"}, "calls": ["AWS::CloudFront::Distribution create", "AWS::CloudFront::Distribution update", "AWS::CloudFront::Function create", "AWS::Cognito::UserPool create", "AWS::KMS::Key create"], "context": {"aws:RequestTag/coderhelm:install": "coderhelm-prod", "aws:TagKeys": ["coderhelm:install"]}, "resource": "*"},
+  {"actions": {"cloudfront:CreateOriginAccessControl": "allowed", "cloudfront:CreateResponseHeadersPolicy": "allowed", "cloudwatch:PutMetricData": "implicitDeny", "cognito-idp:DescribeUserPoolDomain": "allowed", "dynamodb:DescribeEndpoints": "allowed", "dynamodb:DescribeLimits": "allowed", "dynamodb:DescribeReservedCapacity": "allowed", "dynamodb:DescribeReservedCapacityOfferings": "allowed", "kms:ListAliases": "allowed", "logs:CreateLogDelivery": "implicitDeny", "logs:DeleteIndexPolicy": "implicitDeny", "logs:DeleteResourcePolicy": "implicitDeny", "logs:DescribeIndexPolicies": "allowed", "logs:DescribeLogGroups": "allowed", "logs:DescribeResourcePolicies": "allowed", "logs:PutBearerTokenAuthentication": "implicitDeny", "logs:PutIndexPolicy": "implicitDeny", "logs:PutResourcePolicy": "implicitDeny", "ses:CreateTemplate": "allowed", "ses:DeleteTemplate": "allowed", "ses:DescribeConfigurationSet": "allowed", "ses:GetTemplate": "allowed", "ses:UpdateTemplate": "allowed"}, "calls": ["AWS::CloudFront::OriginAccessControl create", "AWS::CloudFront::ResponseHeadersPolicy create", "AWS::Cognito::UserPoolDomain create", "AWS::Cognito::UserPoolDomain delete", "AWS::Cognito::UserPoolDomain read", "AWS::Cognito::UserPoolDomain update", "AWS::DynamoDB::GlobalTable create", "AWS::DynamoDB::GlobalTable delete", "AWS::DynamoDB::GlobalTable read", "AWS::DynamoDB::GlobalTable update", "AWS::KMS::Alias read", "AWS::Logs::LogGroup create", "AWS::Logs::LogGroup delete", "AWS::Logs::LogGroup read", "AWS::Logs::LogGroup update", "AWS::SES::ConfigurationSet create", "AWS::SES::ConfigurationSet read", "AWS::SES::ConfigurationSet update", "AWS::SES::ConfigurationSetEventDestination create", "AWS::SES::ConfigurationSetEventDestination read", "AWS::SES::Template create", "AWS::SES::Template delete", "AWS::SES::Template read", "AWS::SES::Template update"], "context": {}, "resource": "*"},
   {"actions": {"apigateway:POST": "allowed"}, "calls": ["AWS::ApiGatewayV2::Api create", "AWS::ApiGatewayV2::Api update"], "context": {"aws:RequestTag/coderhelm:install": "coderhelm-prod", "aws:ResourceTag/coderhelm:install": "coderhelm-prod", "aws:TagKeys": ["coderhelm:install"]}, "resource": "arn:aws:apigateway:us-east-1::/apis"},
   {"actions": {"apigateway:DELETE": "allowed", "apigateway:PATCH": "allowed", "apigateway:POST": "allowed", "apigateway:PUT": "allowed"}, "calls": ["AWS::ApiGatewayV2::Api create", "AWS::ApiGatewayV2::Api delete", "AWS::ApiGatewayV2::Api tag", "AWS::ApiGatewayV2::Api update"], "context": {"aws:RequestTag/coderhelm:install": "coderhelm-prod", "aws:ResourceTag/coderhelm:install": "coderhelm-prod", "aws:TagKeys": ["coderhelm:install"]}, "resource": "arn:aws:apigateway:us-east-1::/apis/a1b2c3d4e5"},
   {"actions": {"apigateway:PUT": "allowed"}, "calls": ["AWS::ApiGatewayV2::Api create"], "context": {"aws:RequestTag/coderhelm:install": "coderhelm-prod", "aws:TagKeys": ["coderhelm:install"]}, "resource": "arn:aws:apigateway:us-east-1::/apis/a1b2c3d4e5"},
@@ -1007,6 +998,10 @@
   {"actions": {"events:PutRule": "allowed"}, "calls": ["AWS::Events::Rule create"], "context": {"aws:RequestTag/coderhelm:install": "coderhelm-prod", "aws:TagKeys": ["coderhelm:install"]}, "resource": "arn:aws:events:us-east-1:111122223333:rule/coderhelm-prod-stuck-run-cleanup"},
   {"actions": {"events:DeleteRule": "allowed", "events:DescribeRule": "allowed", "events:ListTagsForResource": "allowed", "events:ListTargetsByRule": "allowed", "events:PutTargets": "allowed", "events:RemoveTargets": "allowed", "events:UntagResource": "allowed"}, "calls": ["AWS::Events::Rule create", "AWS::Events::Rule delete", "AWS::Events::Rule read", "AWS::Events::Rule tag", "AWS::Events::Rule update"], "context": {"aws:ResourceTag/coderhelm:install": "coderhelm-prod"}, "resource": "arn:aws:events:us-east-1:111122223333:rule/coderhelm-prod-stuck-run-cleanup"},
   {"actions": {"events:PutTargets": "allowed"}, "calls": ["AWS::Events::Rule create"], "context": {}, "resource": "arn:aws:events:us-east-1:111122223333:rule/coderhelm-prod-stuck-run-cleanup"},
+  {"actions": {"events:PutRule": "allowed", "events:TagResource": "allowed"}, "calls": ["AWS::Events::Rule create", "AWS::Events::Rule tag", "AWS::Events::Rule update"], "context": {"aws:RequestTag/coderhelm:install": "coderhelm-prod", "aws:ResourceTag/coderhelm:install": "coderhelm-prod", "aws:TagKeys": ["coderhelm:install"]}, "resource": "arn:aws:events:us-east-1:111122223333:rule/coderhelm-prod-support-sync"},
+  {"actions": {"events:PutRule": "allowed"}, "calls": ["AWS::Events::Rule create"], "context": {"aws:RequestTag/coderhelm:install": "coderhelm-prod", "aws:TagKeys": ["coderhelm:install"]}, "resource": "arn:aws:events:us-east-1:111122223333:rule/coderhelm-prod-support-sync"},
+  {"actions": {"events:DeleteRule": "allowed", "events:DescribeRule": "allowed", "events:ListTagsForResource": "allowed", "events:ListTargetsByRule": "allowed", "events:PutTargets": "allowed", "events:RemoveTargets": "allowed", "events:UntagResource": "allowed"}, "calls": ["AWS::Events::Rule create", "AWS::Events::Rule delete", "AWS::Events::Rule read", "AWS::Events::Rule tag", "AWS::Events::Rule update"], "context": {"aws:ResourceTag/coderhelm:install": "coderhelm-prod"}, "resource": "arn:aws:events:us-east-1:111122223333:rule/coderhelm-prod-support-sync"},
+  {"actions": {"events:PutTargets": "allowed"}, "calls": ["AWS::Events::Rule create"], "context": {}, "resource": "arn:aws:events:us-east-1:111122223333:rule/coderhelm-prod-support-sync"},
   {"actions": {"events:PutRule": "allowed", "events:TagResource": "allowed"}, "calls": ["AWS::Events::Rule create", "AWS::Events::Rule tag", "AWS::Events::Rule update"], "context": {"aws:RequestTag/coderhelm:install": "coderhelm-prod", "aws:ResourceTag/coderhelm:install": "coderhelm-prod", "aws:TagKeys": ["coderhelm:install"]}, "resource": "arn:aws:events:us-east-1:111122223333:rule/coderhelm-prod-update-check"},
   {"actions": {"events:PutRule": "allowed"}, "calls": ["AWS::Events::Rule create"], "context": {"aws:RequestTag/coderhelm:install": "coderhelm-prod", "aws:TagKeys": ["coderhelm:install"]}, "resource": "arn:aws:events:us-east-1:111122223333:rule/coderhelm-prod-update-check"},
   {"actions": {"events:DeleteRule": "allowed", "events:DescribeRule": "allowed", "events:ListTagsForResource": "allowed", "events:ListTargetsByRule": "allowed", "events:PutTargets": "allowed", "events:RemoveTargets": "allowed", "events:UntagResource": "allowed"}, "calls": ["AWS::Events::Rule create", "AWS::Events::Rule delete", "AWS::Events::Rule read", "AWS::Events::Rule tag", "AWS::Events::Rule update"], "context": {"aws:ResourceTag/coderhelm:install": "coderhelm-prod"}, "resource": "arn:aws:events:us-east-1:111122223333:rule/coderhelm-prod-update-check"},
@@ -1241,19 +1236,17 @@
   {"actions": {"logs:CreateLogGroup": "allowed"}, "calls": ["AWS::Logs::LogGroup create"], "context": {"aws:RequestTag/coderhelm:install": "coderhelm-prod", "aws:TagKeys": ["coderhelm:install"]}, "resource": "arn:aws:logs:us-east-1:111122223333:log-group:/aws/lambda/coderhelm-prod-worker"},
   {"actions": {"logs:AssociateKmsKey": "allowed", "logs:DeleteDataProtectionPolicy": "allowed", "logs:DeleteLogGroup": "allowed", "logs:DeleteMetricFilter": "allowed", "logs:DeleteRetentionPolicy": "allowed", "logs:DescribeMetricFilters": "allowed", "logs:DisassociateKmsKey": "allowed", "logs:GetDataProtectionPolicy": "allowed", "logs:ListTagsForResource": "allowed", "logs:PutDataProtectionPolicy": "allowed", "logs:PutLogGroupDeletionProtection": "allowed", "logs:PutMetricFilter": "allowed", "logs:PutRetentionPolicy": "allowed", "logs:UntagResource": "allowed"}, "calls": ["AWS::Logs::LogGroup create", "AWS::Logs::LogGroup delete", "AWS::Logs::LogGroup read", "AWS::Logs::LogGroup tag", "AWS::Logs::LogGroup update", "AWS::Logs::MetricFilter create", "AWS::Logs::MetricFilter delete", "AWS::Logs::MetricFilter read", "AWS::Logs::MetricFilter update"], "context": {"aws:ResourceTag/coderhelm:install": "coderhelm-prod"}, "resource": "arn:aws:logs:us-east-1:111122223333:log-group:/aws/lambda/coderhelm-prod-worker"},
   {"actions": {"logs:PutDataProtectionPolicy": "allowed", "logs:PutMetricFilter": "allowed", "logs:PutRetentionPolicy": "allowed"}, "calls": ["AWS::Logs::LogGroup create", "AWS::Logs::MetricFilter create"], "context": {}, "resource": "arn:aws:logs:us-east-1:111122223333:log-group:/aws/lambda/coderhelm-prod-worker"},
-  {"actions": {"route53:GetChange": "allowed"}, "calls": ["AWS::Route53::RecordSet create", "AWS::Route53::RecordSet delete", "AWS::Route53::RecordSet update"], "context": {"aws:ResourceTag/coderhelm:install": "coderhelm-prod"}, "resource": "arn:aws:route53:::change/C0123456789EXAMPLE"},
-  {"actions": {"route53:ChangeResourceRecordSets": "allowed", "route53:GetHostedZone": "allowed", "route53:ListResourceRecordSets": "allowed"}, "calls": ["AWS::CertificateManager::Certificate create", "AWS::Route53::RecordSet create", "AWS::Route53::RecordSet delete", "AWS::Route53::RecordSet read", "AWS::Route53::RecordSet update"], "context": {"aws:ResourceTag/coderhelm:install": "coderhelm-prod"}, "resource": "arn:aws:route53:::hostedzone/ZTEST000001"},
   {"actions": {"s3:GetObject": "allowed", "s3:GetObjectVersion": "allowed"}, "calls": ["AWS::Lambda::Function create", "AWS::Lambda::Function update"], "context": {"aws:ResourceTag/coderhelm:install": "coderhelm-prod"}, "resource": "arn:aws:s3:::coderhelm-prod-assets-1a2b3c4d-111122223333/2819175352ad1ce0dae768e83fc328fb70fb5f10b4a8ff0ccbcb791f02b0716d.zip"},
   {"actions": {"s3:GetObject": "allowed", "s3:GetObjectVersion": "allowed"}, "calls": ["AWS::Lambda::Function create", "AWS::Lambda::Function update"], "context": {"aws:ResourceTag/coderhelm:install": "coderhelm-prod"}, "resource": "arn:aws:s3:::coderhelm-prod-assets-1a2b3c4d-111122223333/3423a042b818e31c1e34a19d6689ab2e5f9b70fcbe9e71df66f241b20a200bd9.zip"},
   {"actions": {"s3:GetObject": "allowed", "s3:GetObjectVersion": "allowed"}, "calls": ["AWS::Lambda::Function create", "AWS::Lambda::Function update"], "context": {"aws:ResourceTag/coderhelm:install": "coderhelm-prod"}, "resource": "arn:aws:s3:::coderhelm-prod-assets-1a2b3c4d-111122223333/53eada20248e9d1494fc00c7310a9df9f3647025d008c2562adb60bf7ac88f2d.zip"},
   {"actions": {"s3:GetObject": "allowed", "s3:GetObjectVersion": "allowed"}, "calls": ["AWS::Lambda::Function create", "AWS::Lambda::Function update"], "context": {"aws:ResourceTag/coderhelm:install": "coderhelm-prod"}, "resource": "arn:aws:s3:::coderhelm-prod-assets-1a2b3c4d-111122223333/56f7467bbde8a5efebcf57ae9e460027607099bab9f844669dcf5d800172ee5a.zip"},
-  {"actions": {"s3:GetObject": "allowed", "s3:GetObjectVersion": "allowed"}, "calls": ["AWS::Lambda::Function create", "AWS::Lambda::Function update"], "context": {"aws:ResourceTag/coderhelm:install": "coderhelm-prod"}, "resource": "arn:aws:s3:::coderhelm-prod-assets-1a2b3c4d-111122223333/7f7c80edb04010249719b9df9dfa36c2b4fd1a2eec3c135fd6453ce84392c30e.zip"},
+  {"actions": {"s3:GetObject": "allowed", "s3:GetObjectVersion": "allowed"}, "calls": ["AWS::Lambda::Function create", "AWS::Lambda::Function update"], "context": {"aws:ResourceTag/coderhelm:install": "coderhelm-prod"}, "resource": "arn:aws:s3:::coderhelm-prod-assets-1a2b3c4d-111122223333/7b44faf39d25c239c5790797d2c0d87dd014ad0528a2c94467b3975a17a54c0a.zip"},
   {"actions": {"s3:GetObject": "allowed", "s3:GetObjectVersion": "allowed"}, "calls": ["AWS::Lambda::Function create", "AWS::Lambda::Function update"], "context": {"aws:ResourceTag/coderhelm:install": "coderhelm-prod"}, "resource": "arn:aws:s3:::coderhelm-prod-assets-1a2b3c4d-111122223333/a77bb41544bf739e532a3faedb5ecda0bba5d9e19ab56eaa0fc6ec92f1bf5827.zip"},
+  {"actions": {"s3:GetObject": "allowed", "s3:GetObjectVersion": "allowed"}, "calls": ["AWS::Lambda::Function create", "AWS::Lambda::Function update"], "context": {"aws:ResourceTag/coderhelm:install": "coderhelm-prod"}, "resource": "arn:aws:s3:::coderhelm-prod-assets-1a2b3c4d-111122223333/ae46d59f832d7b7e8ed231a7a3af7955b7585bf1cef81350968eb356db6a79e0.zip"},
   {"actions": {"s3:GetObject": "allowed", "s3:GetObjectVersion": "allowed"}, "calls": ["AWS::Lambda::Function create", "AWS::Lambda::Function update"], "context": {"aws:ResourceTag/coderhelm:install": "coderhelm-prod"}, "resource": "arn:aws:s3:::coderhelm-prod-assets-1a2b3c4d-111122223333/bc4e026165204dddfc22a4d9b0dd1cc9b8f53c37b8575a9c4638b289303f2da4.zip"},
   {"actions": {"s3:GetObject": "allowed", "s3:GetObjectVersion": "allowed"}, "calls": ["AWS::Lambda::Function create", "AWS::Lambda::Function update"], "context": {"aws:ResourceTag/coderhelm:install": "coderhelm-prod"}, "resource": "arn:aws:s3:::coderhelm-prod-assets-1a2b3c4d-111122223333/c6a0d267ee8fc5537ab8911079af833d5135b8ba2dada7bb2046cb9b7cab6902.zip"},
   {"actions": {"s3:GetObject": "allowed", "s3:GetObjectVersion": "allowed"}, "calls": ["AWS::Lambda::Function create", "AWS::Lambda::Function update"], "context": {"aws:ResourceTag/coderhelm:install": "coderhelm-prod"}, "resource": "arn:aws:s3:::coderhelm-prod-assets-1a2b3c4d-111122223333/e2323f040b88a4c0ffdb662a75b62cad20b096cc1a873043f7b71c3927548590.zip"},
   {"actions": {"s3:GetObject": "allowed", "s3:GetObjectVersion": "allowed"}, "calls": ["AWS::Lambda::LayerVersion create"], "context": {"aws:ResourceTag/coderhelm:install": "coderhelm-prod"}, "resource": "arn:aws:s3:::coderhelm-prod-assets-1a2b3c4d-111122223333/e2659170a0721541efa761a8d5d04d5e36cbbf691c4b15a9053002b7c825055d.zip"},
-  {"actions": {"s3:GetObject": "allowed", "s3:GetObjectVersion": "allowed"}, "calls": ["AWS::Lambda::Function create", "AWS::Lambda::Function update"], "context": {"aws:ResourceTag/coderhelm:install": "coderhelm-prod"}, "resource": "arn:aws:s3:::coderhelm-prod-assets-1a2b3c4d-111122223333/f42e11e48d9d99efc68eb6c796d61d3e561d872371c8626ae29722d18cc18ded.zip"},
   {"actions": {"s3:GetObject": "allowed", "s3:GetObjectVersion": "allowed"}, "calls": ["AWS::Lambda::Function create", "AWS::Lambda::Function update"], "context": {"aws:ResourceTag/coderhelm:install": "coderhelm-prod"}, "resource": "arn:aws:s3:::coderhelm-prod-assets-1a2b3c4d-111122223333/faa95a81ae7d7373f3e1f242268f904eb748d8d0fdd306e8a6fe515a1905a7d6.zip"},
   {"actions": {"s3:PutBucketTagging": "allowed", "s3:TagResource": "allowed"}, "calls": ["AWS::S3::Bucket create", "AWS::S3::Bucket tag", "AWS::S3::Bucket update"], "context": {"aws:RequestTag/coderhelm:install": "coderhelm-prod", "aws:ResourceTag/coderhelm:install": "coderhelm-prod", "aws:TagKeys": ["coderhelm:install"]}, "resource": "arn:aws:s3:::coderhelm-prod-dashboard-111122223333"},
   {"actions": {"s3:CreateBucket": "allowed", "s3:PutBucketTagging": "allowed"}, "calls": ["AWS::S3::Bucket create"], "context": {"aws:RequestTag/coderhelm:install": "coderhelm-prod", "aws:TagKeys": ["coderhelm:install"]}, "resource": "arn:aws:s3:::coderhelm-prod-dashboard-111122223333"},
@@ -1413,8 +1406,6 @@
   ]
  },
  "notSimulated": [
-  {"action": "acm-pca:GetCertificate", "calls": ["AWS::CertificateManager::Certificate create"], "reason": "no private CA"},
-  {"action": "acm-pca:IssueCertificate", "calls": ["AWS::CertificateManager::Certificate create"], "reason": "no private CA"},
   {"action": "application-autoscaling:DeleteScalingPolicy", "calls": ["AWS::DynamoDB::GlobalTable create", "AWS::DynamoDB::GlobalTable delete", "AWS::DynamoDB::GlobalTable update"], "reason": "application-autoscaling"},
   {"action": "application-autoscaling:DeleteScheduledAction", "calls": ["AWS::DynamoDB::GlobalTable create", "AWS::DynamoDB::GlobalTable delete", "AWS::DynamoDB::GlobalTable update"], "reason": "application-autoscaling"},
   {"action": "application-autoscaling:DeregisterScalableTarget", "calls": ["AWS::DynamoDB::GlobalTable create", "AWS::DynamoDB::GlobalTable delete", "AWS::DynamoDB::GlobalTable update"], "reason": "application-autoscaling"},

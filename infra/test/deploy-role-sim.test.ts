@@ -138,10 +138,9 @@ test("the fixture covers every resource type a hardened install synthesizes", ()
   process.env.WORKER_ZIP = path.join(stubs, "worker");
   process.env.MCP_PROXY_DIR = path.join(stubs, "mcp");
   const base = { access: { mode: "hardened" as const, owner: "launch" as const, id: FIXTURE.launchId }, account: FIXTURE.account, region: FIXTURE.region, stage: "prod", email: { from: "coderhelm@example.org" }, admins: ["owner@example.org"] };
-  const zone = { [`hosted-zone:account=${FIXTURE.account}:domainName=example.org:region=${FIXTURE.region}`]: { Id: "/hostedzone/ZTEST000001", Name: "example.org." } };
   const configs: [any, Record<string, unknown>][] = [
     [base, {}],
-    [{ ...base, domain: { hostname: "helm.example.org", hostedZone: "example.org" }, models: { provider: "bedrock" }, email: { from: "helm@example.org" }, integrations: { googleSignIn: true } }, zone],
+    [{ ...base, domain: { hostname: "helm.example.org", certificateArn: `arn:aws:acm:us-east-1:${FIXTURE.account}:certificate/0f0e0d0c-1111-2222-3333-444455556666` }, models: { provider: "bedrock" }, email: { from: "helm@example.org" }, integrations: { googleSignIn: true } }, {}],
   ];
   const missing = new Set<string>();
   for (const [c, context] of configs) {

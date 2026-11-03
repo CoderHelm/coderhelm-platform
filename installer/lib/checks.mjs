@@ -11,7 +11,6 @@
 // anything; a few offer an action (such as running `cdk bootstrap`) that the
 // guided install asks about first.
 import crypto from "node:crypto";
-import dnsPromises from "node:dns/promises";
 import { PERMISSIONS, EVENTS } from "./github-app.mjs";
 import { readSecret } from "./secrets.mjs";
 import { derived } from "./util.mjs";
@@ -152,7 +151,6 @@ export const NEEDED_ACTIONS = [
   "secretsmanager:PutSecretValue",
   "secretsmanager:GetSecretValue",
   "ecr:CreateRepository",
-  "route53:ListHostedZones",
   "ses:GetAccount",
   "sts:AssumeRole",
 ];
@@ -292,52 +290,6 @@ export async function checkBootstrap(ctx, account, region, { missing = FAIL } = 
 
 const norm = (s) => String(s).toLowerCase().replace(/\.$/, "");
 
-export async function checkHostedZone(ctx, zone) {
-  const title = `Route 53 zone ${zone}`;
-  if (ctx.runner.dryRun) return { result: pass("dns_zone", title, "dry run"), zoneId: null };
-  const out = await aws(ctx, ["route53", "list-hosted-zones-by-name", "--dns-name", zone, "--max-items", "5"]);
-  const z = (out?.HostedZones ?? []).find((h) => norm(h.Name) === norm(zone) && !h.Config?.PrivateZone);
-  if (z) return { result: pass("dns_zone", title, String(z.Id ?? "").replace("/hostedzone/", "")), zoneId: z.Id ?? null };
-  return {
-    zoneId: null,
-    result: problem(FAIL, "dns_zone", title, {
-      what: `There's no public Route 53 zone named ${zone} in this account.`,
-      why: "The certificate and the DNS record for your address are created in that zone.",
-      fix: {
-        text: `Create the zone, then point ${zone}'s name servers at it (the next check shows them). Or leave the hostname empty to use CloudFront's address.`,
-        command: `aws route53 create-hosted-zone --name ${zone} --caller-reference coderhelm-${Date.now()}`,
-      },
-    }),
-  };
-}
-
-/** The zone's name servers against what the public DNS answers. */
-export async function checkDelegation(ctx, zone, zoneId) {
-  const title = `${zone} points at Route 53`;
-  if (!zoneId || ctx.runner.dryRun) return null;
-  const z = await aws(ctx, ["route53", "get-hosted-zone", "--id", zoneId]);
-  const expected = (z?.DelegationSet?.NameServers ?? []).map(norm).sort();
-  if (!expected.length) return null;
-  let current = [];
-  try {
-    current = (await (ctx.dns ?? dnsPromises).resolveNs(zone)).map(norm).sort();
-  } catch {
-    current = [];
-  }
-  const same = current.length === expected.length && current.every((n, i) => n === expected[i]);
-  if (same) return pass("dns_delegation", title, expected.join(", "));
-  return problem(FAIL, "dns_delegation", title, {
-    what: current.length
-      ? `${zone} uses other name servers: ${current.join(", ")}.`
-      : `${zone} has no name servers in public DNS yet.`,
-    why: "Until the name servers match, the certificate can't validate and nobody can reach your address.",
-    fix: {
-      text: `At your domain registrar (or the parent zone), set the NS records for ${zone} to exactly these, then check again (changes can take up to an hour):`,
-      command: expected.map((n) => `${zone}. NS ${n}.`).join("\n"),
-    },
-  });
-}
-
 /** An ACM certificate (us-east-1, for CloudFront) that is issued. */
 export async function checkCertificate(ctx, arn, hostname) {
   const title = "TLS certificate issued";
@@ -383,14 +335,13 @@ export async function checkCertificate(ctx, arn, hostname) {
 
 // ── Email ─────────────────────────────────────────────────────────────────
 
-export async function checkSesIdentity(ctx, from, region, { zone } = {}) {
+export async function checkSesIdentity(ctx, from, region) {
   const title = "Email sender verified";
   const domain = String(from).split("@")[1] ?? from;
   if (ctx.runner.dryRun) return pass("ses_identity", title, "dry run");
   const id = await aws(ctx, ["sesv2", "get-email-identity", "--email-identity", domain], region);
   const console = `https://console.aws.amazon.com/ses/home?region=${region}#/identities/${domain}`;
   if (!id) {
-    if (zone && norm(zone) === norm(domain)) return pass("ses_identity", title, `${domain} is your Route 53 zone: the deploy adds its DKIM records`);
     return problem(WARN, "ses_identity", title, {
       what: `${domain} isn't set up in Amazon SES yet.`,
       why: "SES refuses to send from a domain until its DKIM records are in DNS.",
