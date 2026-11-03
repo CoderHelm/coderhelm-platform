@@ -628,6 +628,10 @@ async fn main() -> Result<(), Error> {
         .route("/users/:user_id/role", put(routes::users::update_role))
         .route("/users/:user_id/resend", post(routes::users::resend_invite))
         .route(
+            "/users/:user_id/setup-email",
+            post(routes::users::send_setup_email),
+        )
+        .route(
             "/users/:user_id/link-github",
             post(routes::users::link_github),
         )

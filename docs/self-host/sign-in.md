@@ -18,6 +18,10 @@ Everyone else is refused, on every way in: email sign-up, GitHub, and the Cognit
 
 The first admin is the address you gave the install (the Launch Stack's **Your email**, or `admins` in the config). Their first sign-in makes the organization; until then, only they can sign up.
 
+### People moved from another CoderHelm
+
+A team moved from CoderHelm's hosted service arrives with its people already on it. Someone who hasn't signed in on the install yet shows **Hasn't set up an account here yet** in **Settings, Team**. An admin opens the row's menu and picks **Send set-up email**: it's the invite email, with the link to set up their account (at most once an hour and five times a week per person). The row then shows when it went. Once they've signed in, it's gone.
+
 ### At install time
 
 The install guide's **Let people from your company join** starts as **Only people I invite**. Pick **Anyone with an email at** and type your company's domain to allow it from the start. The config's `signup.domains` and `signup.emails` do the same: on first boot the domains become the allowed domains and the addresses become invites. After that, admins invite people in **Settings, Team** and can remove listed domains in **Settings, Sign-in** (the config is not read again).

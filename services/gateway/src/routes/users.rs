@@ -198,6 +198,7 @@ fn member_view(item: &Item, self_id: &str, now: chrono::DateTime<chrono::Utc>) -
         "invited_at": stamp(if invited { invite_sent_at(item) } else { None }),
         "invite_expires_at": stamp(invite_expires_at(item)),
         "invite_expired": invite_expired(item, now),
+        "setup_email_sent_at": opt(s(item, "setup_email_sent_at")),
         "is_self": !user_id.is_empty() && user_id == bare_id(self_id),
     })
 }
@@ -578,8 +579,62 @@ pub async fn list_users(
         .filter(|i| show_invites || status_of(i) != "invited")
         .map(|i| member_view(i, &claims.sub, now))
         .collect();
+    // On a self-hosted install, admins see who is on the team but has never signed in here (a
+    // member copied from another CoderHelm): they get a set-up email instead of an invite.
+    if show_invites && super::sign_in::applies() {
+        let emails: Vec<String> = users
+            .iter()
+            .filter(|u| u["status"] != "invited")
+            .filter_map(|u| u["email"].as_str().map(normalize_email))
+            .filter(|e| !e.is_empty())
+            .collect();
+        match pool_emails(&state, emails).await {
+            Ok(pool) => {
+                for u in users.iter_mut() {
+                    let email = u["email"].as_str().map(normalize_email).unwrap_or_default();
+                    u["needs_setup"] = json!(needs_setup(
+                        u["status"].as_str().unwrap_or(""),
+                        &email,
+                        &pool
+                    ));
+                }
+            }
+            Err(e) => error!(error = %e, "Sign-ins not listed; set-up emails hidden"),
+        }
+    }
     sort_members(&mut users);
     Ok(Json(json!({ "users": users })))
+}
+
+/// Which of these emails can sign in on this install (Cognito has them). An email whose lookup
+/// fails is counted as signed in, so no set-up email is offered on a guess.
+async fn pool_emails(
+    state: &AppState,
+    emails: Vec<String>,
+) -> Result<std::collections::HashSet<String>, String> {
+    let checks = emails.into_iter().map(|email| async move {
+        let r = state
+            .cognito
+            .admin_get_user()
+            .user_pool_id(&state.config.cognito_user_pool_id)
+            .username(&email)
+            .send()
+            .await;
+        match r {
+            Err(e) if format!("{e:?}").contains("UserNotFound") => None,
+            _ => Some(email),
+        }
+    });
+    Ok(futures::future::join_all(checks)
+        .await
+        .into_iter()
+        .flatten()
+        .collect())
+}
+
+/// A member (not an invite) with an email who has no sign-in on this install.
+fn needs_setup(status: &str, email: &str, pool: &std::collections::HashSet<String>) -> bool {
+    status != "invited" && !email.is_empty() && !pool.contains(email)
 }
 
 // ── Invite user ──────────────────────────────────────────────────────
@@ -787,6 +842,137 @@ pub async fn resend_invite(
         "invited_at": now.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
         "invite_expires_at": expires.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
     })))
+}
+
+// ── Set-up email (self-hosted) ───────────────────────────────────────
+
+/// At most one set-up email an hour, and five a week, per person.
+const SETUP_EMAIL_GAP_SECS: i64 = 3600;
+const SETUP_EMAIL_PER_WEEK: usize = 5;
+
+/// Whether another set-up email may go now, given the ones sent before.
+fn setup_email_allowed(
+    sent: &[chrono::DateTime<chrono::Utc>],
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<(), &'static str> {
+    if sent
+        .iter()
+        .any(|t| (now - *t).num_seconds() < SETUP_EMAIL_GAP_SECS)
+    {
+        return Err("A set-up email went to them less than an hour ago. Try again later.");
+    }
+    let week = sent.iter().filter(|t| (now - **t).num_days() < 7).count();
+    if week >= SETUP_EMAIL_PER_WEEK {
+        return Err("Five set-up emails went to them this week. Try again next week.");
+    }
+    Ok(())
+}
+
+fn setup_email_log(item: &Item) -> Vec<chrono::DateTime<chrono::Utc>> {
+    item.get("setup_email_log")
+        .and_then(|v| v.as_l().ok())
+        .map(|l| {
+            l.iter()
+                .filter_map(|x| x.as_s().ok())
+                .filter_map(|t| chrono::DateTime::parse_from_rfc3339(t).ok())
+                .map(|t| t.with_timezone(&chrono::Utc))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// What a set-up email needs from the record: a member, not an invite, with an email.
+fn check_setup_email(item: &Item) -> Result<&str, ApiError> {
+    if status_of(item) == "invited" {
+        return Err(fail(
+            StatusCode::BAD_REQUEST,
+            "They haven't joined yet: resend their invite instead.",
+        ));
+    }
+    match s(item, "email") {
+        "" => Err(fail(
+            StatusCode::BAD_REQUEST,
+            "They have no email to send to.",
+        )),
+        email => Ok(email),
+    }
+}
+
+/// POST /api/users/:user_id/setup-email — on a self-hosted install, email a member who is on
+/// the team but has never signed in here (copied from another CoderHelm) the link to set up
+/// their account. The same email and link as an invite; sign-up admits them as a member.
+pub async fn send_setup_email(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<Claims>,
+    Path(user_id): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    require_admin(&claims)?;
+    if !super::sign_in::applies() {
+        return Err(fail(
+            StatusCode::NOT_FOUND,
+            "Set-up emails are for self-hosted installs.",
+        ));
+    }
+    let item = get_member(&state, &claims.team_id, &user_id).await?;
+    let email = check_setup_email(&item)?.to_string();
+    match state
+        .cognito
+        .admin_get_user()
+        .user_pool_id(&state.config.cognito_user_pool_id)
+        .username(&email)
+        .send()
+        .await
+    {
+        Ok(_) => {
+            return Err(fail(
+                StatusCode::CONFLICT,
+                "They've already signed in on this install.",
+            ))
+        }
+        Err(e) if format!("{e:?}").contains("UserNotFound") => {}
+        Err(e) => return Err(internal("Sign-in not checked", e)),
+    }
+    let now = chrono::Utc::now();
+    let log = setup_email_log(&item);
+    setup_email_allowed(&log, now).map_err(|m| fail(StatusCode::TOO_MANY_REQUESTS, m))?;
+
+    let team_name = get_team_name(state.clone(), &claims).await;
+    send_invite_email(
+        &state,
+        &claims.team_id,
+        &email,
+        &claims.email,
+        &team_name,
+        role_of(&item),
+    )
+    .await
+    .map_err(|_| internal("Failed to send the set-up email", "email send failed"))?;
+
+    let stamp = now.to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    let mut kept: Vec<AttributeValue> = log
+        .iter()
+        .filter(|t| (now - **t).num_days() < 7)
+        .map(|t| attr_s(&t.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)))
+        .collect();
+    kept.push(attr_s(&stamp));
+    state
+        .dynamo
+        .update_item()
+        .table_name(&state.config.users_table_name)
+        .key("pk", attr_s(&claims.team_id))
+        .key("sk", attr_s(s(&item, "sk")))
+        .update_expression("SET setup_email_sent_at = :now, setup_email_log = :log")
+        .condition_expression("attribute_exists(pk)")
+        .expression_attribute_values(":now", attr_s(&stamp))
+        .expression_attribute_values(":log", AttributeValue::L(kept))
+        .send()
+        .await
+        .map_err(|e| internal("Failed to record the set-up email", e))?;
+
+    info!(team_id = %claims.team_id, "Set-up email sent");
+    Ok(Json(
+        json!({ "status": "sent", "setup_email_sent_at": stamp }),
+    ))
 }
 
 /// What resending needs from the record: still an invite, with an email.
@@ -1434,6 +1620,44 @@ async fn send_invite_email(
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_setup_email_waits_an_hour_and_five_a_week() {
+        let now = chrono::DateTime::parse_from_rfc3339("2026-11-10T12:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let ago = |h: i64| now - chrono::Duration::hours(h);
+        assert!(setup_email_allowed(&[], now).is_ok());
+        assert!(setup_email_allowed(&[now - chrono::Duration::minutes(30)], now).is_err());
+        assert!(setup_email_allowed(&[ago(2)], now).is_ok());
+        let five = [ago(2), ago(30), ago(60), ago(90), ago(120)];
+        assert!(setup_email_allowed(&five, now).is_err());
+        let old = [ago(2), ago(30), ago(60), ago(90), ago(24 * 8)];
+        assert!(setup_email_allowed(&old, now).is_ok());
+    }
+
+    #[test]
+    fn a_setup_email_is_for_members_with_an_email_only() {
+        let mut m: Item = HashMap::new();
+        m.insert("sk".into(), attr_s("USER#a"));
+        m.insert("email".into(), attr_s("a@example.com"));
+        assert_eq!(check_setup_email(&m).ok(), Some("a@example.com"));
+        let mut inv = m.clone();
+        inv.insert("status".into(), attr_s("invited"));
+        assert!(check_setup_email(&inv).is_err());
+        let mut none = m.clone();
+        none.insert("email".into(), attr_s(""));
+        assert!(check_setup_email(&none).is_err());
+    }
+
+    #[test]
+    fn needs_setup_means_a_member_with_no_sign_in_here() {
+        let pool: std::collections::HashSet<String> = ["in@example.com".to_string()].into();
+        assert!(needs_setup("active", "out@example.com", &pool));
+        assert!(!needs_setup("active", "in@example.com", &pool));
+        assert!(!needs_setup("invited", "out@example.com", &pool));
+        assert!(!needs_setup("active", "", &pool));
+    }
 
     #[test]
     fn an_invite_link_opens_the_account_form() {
