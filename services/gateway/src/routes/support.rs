@@ -169,6 +169,10 @@ pub struct Ticket {
     /// Who wrote the latest message.
     #[serde(default)]
     pub last_author_name: String,
+    /// On a self-hosted install: whether the ticket reached CoderHelm's
+    /// support (common::support_relay). None on the hosted side.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub coderhelm: Option<common::support_relay::Delivery>,
 }
 
 /// Someone on a ticket besides the person who filed it.
@@ -472,7 +476,7 @@ impl ItemRef {
     }
 }
 
-fn priority(p: Option<&str>) -> &'static str {
+pub(crate) fn priority(p: Option<&str>) -> &'static str {
     match p {
         Some("urgent") => "urgent",
         Some("high") => "high",
@@ -967,7 +971,7 @@ pub fn avatars(t: &Ticket, thread: &[Message], members: &[Member]) -> HashMap<St
 }
 
 /// The latest message, kept on the ticket for the lists.
-fn note_latest(t: &mut Ticket, m: &Message) {
+pub(crate) fn note_latest(t: &mut Ticket, m: &Message) {
     t.last_snippet = clip(&one_line(&m.body), 160);
     t.last_author_name = if m.author_name.is_empty() {
         m.author_email.clone()
@@ -1189,7 +1193,7 @@ fn new_id() -> String {
         .to_string()
 }
 
-fn now_iso() -> String {
+pub(crate) fn now_iso() -> String {
     chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
 }
 
@@ -1312,6 +1316,7 @@ pub async fn create<S: Store, L: ItemLookup, M: Members>(
         participants: people,
         last_snippet: String::new(),
         last_author_name: String::new(),
+        coderhelm: None,
     };
     let first = Message {
         id: new_id(),
@@ -2014,14 +2019,14 @@ pub fn mail_team_resolved(inbox: &str, t: &Ticket, by: &str) -> Mail {
     }
 }
 
-fn inbox() -> String {
+pub(crate) fn inbox() -> String {
     common::public_urls::support_inbox()
 }
 
 /// Send through the install's email route (SES, or CoderHelm's relay on a
 /// self-hosted install that chose it). A failed email is logged, never a
 /// failed request: the ticket is already saved.
-async fn send(state: &AppState, mail: Mail) {
+pub(crate) async fn send(state: &AppState, mail: Mail) {
     use common::mail::{self as m, templates::fit};
     let out = m::Mail {
         kind: "support".into(),
@@ -2045,6 +2050,21 @@ async fn send(state: &AppState, mail: Mail) {
     if let Err(e) = m::send(&super::email_settings::sender(state), &out).await {
         warn!(code = %e.code, error = %e.message, "support email not sent");
     }
+}
+
+/// Send an email already built (support's answers on a self-hosted install).
+pub(crate) async fn send_mail(state: &AppState, mail: common::mail::Mail) {
+    if let Err(e) = common::mail::send(&super::email_settings::sender(state), &mail).await {
+        warn!(code = %e.code, error = %e.message, "support email not sent");
+    }
+}
+
+/// Whether this install's own support inbox gets a copy of each ticket. A
+/// self-hosted install's tickets go to CoderHelm's support; its own inbox
+/// only when one is set (`SUPPORT_INBOX`).
+fn copy_to_inbox() -> bool {
+    !common::public_urls::self_hosted()
+        || std::env::var("SUPPORT_INBOX").is_ok_and(|v| !v.trim().is_empty())
 }
 
 // ── Lookups the handlers need ────────────────────────────────────────────
@@ -2293,6 +2313,9 @@ pub async fn list(
     Extension(claims): Extension<Claims>,
 ) -> Reply {
     let caller = Caller::from_claims(&claims);
+    if common::public_urls::self_hosted() {
+        super::hybrid_support::catch_up(&state).await;
+    }
     let v = list_for_team(&store(&state), &caller)
         .await
         .map_err(Fail::reply)?;
@@ -2321,7 +2344,12 @@ pub async fn create_handler(
         .await
         .map_err(Fail::reply)?;
     info!(team = %caller.team_id, ticket = %ticket.id, people = ticket.participants.len(), "support ticket opened");
-    send(&state, mail_new_ticket(&inbox(), &ticket, &first.body)).await;
+    if copy_to_inbox() {
+        send(&state, mail_new_ticket(&inbox(), &ticket, &first.body)).await;
+    }
+    if common::public_urls::self_hosted() {
+        super::hybrid_support::ticket_opened(&state, &ticket, &first).await;
+    }
     let (ticket, thread) = open_for_team(&st, &caller, &ticket.id)
         .await
         .map_err(Fail::reply)?;
@@ -2512,6 +2540,9 @@ pub async fn get(
     Path(id): Path<String>,
 ) -> Reply {
     let caller = Caller::from_claims(&claims);
+    if common::public_urls::self_hosted() {
+        super::hybrid_support::catch_up(&state).await;
+    }
     let (t, thread) = open_for_team(&store(&state), &caller, &id)
         .await
         .map_err(Fail::reply)?;
@@ -2545,7 +2576,12 @@ pub async fn reply(
     let (t, m) = reply_as_customer(&st, &lookup, &caller, &id, &req.body, &req.items)
         .await
         .map_err(Fail::reply)?;
-    send(&state, mail_customer_reply(&inbox(), &t, &m)).await;
+    if copy_to_inbox() {
+        send(&state, mail_customer_reply(&inbox(), &t, &m)).await;
+    }
+    if common::public_urls::self_hosted() {
+        super::hybrid_support::reply_added(&state, &t, &m).await;
+    }
     let (t, thread) = open_for_team(&st, &caller, &id)
         .await
         .map_err(Fail::reply)?;
@@ -2739,8 +2775,11 @@ pub async fn admin_reply_handler(
     let (t, m) = admin_reply(&st, &caller, &id, &req.body, status)
         .await
         .map_err(Fail::reply)?;
-    for mail in mail_support_reply(&t, &m) {
-        send(&state, mail).await;
+    // An install's people hear it from their install (it fetches answers).
+    if !from_install(&t) {
+        for mail in mail_support_reply(&t, &m) {
+            send(&state, mail).await;
+        }
     }
     let (t, thread) = admin_open(&st, &caller, &id).await.map_err(Fail::reply)?;
     admin_detail(&state, t, thread).await
@@ -2765,13 +2804,284 @@ pub async fn admin_status(
     let (t, changed) = admin_set(&st, &caller, &id, status, req.priority.as_deref())
         .await
         .map_err(Fail::reply)?;
-    if let Some(action) = changed {
+    if let Some(action) = changed.filter(|_| !from_install(&t)) {
         for mail in mail_status(&t, &action, "Coderhelm support") {
             send(&state, mail).await;
         }
     }
     let (t, thread) = admin_open(&st, &caller, &id).await.map_err(Fail::reply)?;
     admin_detail(&state, t, thread).await
+}
+
+// ── Tickets from self-hosted installs (common::support_relay) ─────────────
+
+use common::support_relay::{
+    self as install_relay, ItemOut, MessageOut, TicketOut, Update, Updates,
+};
+
+/// An install's attached item, as support's queue lists it.
+fn install_item(i: &ItemOut) -> RelatedItem {
+    RelatedItem {
+        kind: i.kind.clone(),
+        id: i.id.clone(),
+        label: i.label.clone(),
+        repo: String::new(),
+        status: i.status.clone(),
+    }
+}
+
+/// What support reads: the person's words, then the details they attached
+/// (a run's error and step).
+fn install_body(body: &str, items: &[ItemOut]) -> String {
+    let body = scrub(body.trim());
+    let details = install_relay::items_text(items);
+    match (body.is_empty(), details.is_empty()) {
+        (_, true) => body,
+        (true, false) => format!("Attached:\n{details}"),
+        (false, false) => format!("{body}\n\nAttached:\n{details}"),
+    }
+}
+
+/// Hosted side: a ticket a self-hosted install sent (signed as that
+/// install). It joins the support queue under the install's own team key.
+/// None when it arrived before: the install sends again until it hears back.
+pub async fn intake_ticket<S: Store>(
+    store: &S,
+    install_id: &str,
+    install_label: &str,
+    t: &TicketOut,
+) -> Result<Option<(Ticket, Message)>, Fail> {
+    t.check().map_err(|e| Fail::BadRequest(e.into()))?;
+    let team = install_relay::install_team(install_id);
+    if let Some(q) = store
+        .queue_entry(&t.ticket_id)
+        .await
+        .map_err(Fail::Internal)?
+    {
+        return if q.team_id == team {
+            Ok(None)
+        } else {
+            Err(Fail::Denied("That ticket id is taken.".into()))
+        };
+    }
+    let (hour, ttl) = hour_bucket(chrono::Utc::now());
+    if !store
+        .take(&team, &format!("create:{hour}"), TEAM_TICKETS_PER_HOUR, ttl)
+        .await
+        .map_err(Fail::Internal)?
+    {
+        return Err(Fail::TooMany(
+            "This install has opened a lot of tickets in the last hour. Try again later.".into(),
+        ));
+    }
+    let now = now_iso();
+    let items: Vec<RelatedItem> = t.items.iter().map(install_item).collect();
+    let email = t.email.trim().to_lowercase();
+    let name = clip(&one_line(&t.name), install_relay::MAX_NAME);
+    let mut ticket = Ticket {
+        id: t.ticket_id.clone(),
+        team_id: team,
+        team_name: format!("Self-hosted: {install_label}"),
+        subject: scrub(&one_line(t.subject.trim())),
+        status: Status::Open,
+        priority: priority(Some(&t.priority)).to_string(),
+        opened_by_id: String::new(),
+        opened_by_email: email.clone(),
+        opened_by_name: name.clone(),
+        role: "self-hosted".into(),
+        context: TicketContext {
+            page: clean_page(&t.page),
+            item: items.first().cloned(),
+            items,
+            user_agent: clip(&format!("CoderHelm {}", one_line(&t.version)), 60),
+        },
+        created_at: now.clone(),
+        updated_at: now.clone(),
+        last_actor: "customer".into(),
+        message_count: 1,
+        participants: Vec::new(),
+        last_snippet: String::new(),
+        last_author_name: String::new(),
+        coderhelm: None,
+    };
+    let first = Message {
+        id: t.message_id.clone(),
+        kind: "message".into(),
+        author: "customer".into(),
+        author_email: email,
+        author_name: name,
+        body: install_body(&t.body, &t.items),
+        created_at: now,
+        attachments: Vec::new(),
+    };
+    note_latest(&mut ticket, &first);
+    store.save(&ticket).await.map_err(Fail::Internal)?;
+    store
+        .append(&ticket.team_id, &ticket.id, &first)
+        .await
+        .map_err(Fail::Internal)?;
+    Ok(Some((ticket, first)))
+}
+
+/// Hosted side: a person's reply on an install's ticket. Only that install's
+/// own tickets; None when this reply arrived before.
+pub async fn intake_message<S: Store>(
+    store: &S,
+    install_id: &str,
+    m: &MessageOut,
+) -> Result<Option<(Ticket, Message)>, Fail> {
+    m.check().map_err(|e| Fail::BadRequest(e.into()))?;
+    let team = install_relay::install_team(install_id);
+    let mut ticket = store
+        .load(&team, &m.ticket_id)
+        .await
+        .map_err(Fail::Internal)?
+        .ok_or(Fail::NotFound)?;
+    let thread = store
+        .thread(&team, &ticket.id)
+        .await
+        .map_err(Fail::Internal)?;
+    if thread.iter().any(|x| x.id == m.message_id) {
+        return Ok(None);
+    }
+    let (hour, ttl) = hour_bucket(chrono::Utc::now());
+    if !store
+        .take(&team, &format!("reply:{hour}"), TEAM_REPLIES_PER_HOUR, ttl)
+        .await
+        .map_err(Fail::Internal)?
+    {
+        return Err(Fail::TooMany(
+            "This install has sent a lot of replies in the last hour. Try again later.".into(),
+        ));
+    }
+    let now = now_iso();
+    let name = clip(&one_line(&m.name), install_relay::MAX_NAME);
+    if ticket.status == Status::Resolved {
+        let mut reopened = event_by("customer", &m.email, &name, "reopened", &now);
+        reopened.id = format!("{}-reopened", m.message_id);
+        store
+            .append(&team, &ticket.id, &reopened)
+            .await
+            .map_err(Fail::Internal)?;
+    }
+    let msg = Message {
+        id: m.message_id.clone(),
+        kind: "message".into(),
+        author: "customer".into(),
+        author_email: m.email.trim().to_lowercase(),
+        author_name: name,
+        body: install_body(&m.body, &m.items),
+        created_at: now.clone(),
+        attachments: Vec::new(),
+    };
+    store
+        .append(&team, &ticket.id, &msg)
+        .await
+        .map_err(Fail::Internal)?;
+    ticket.status = Status::Open;
+    ticket.last_actor = "customer".into();
+    ticket.updated_at = now;
+    ticket.message_count += 1;
+    note_latest(&mut ticket, &msg);
+    store.save(&ticket).await.map_err(Fail::Internal)?;
+    Ok(Some((ticket, msg)))
+}
+
+fn event_by(author: &str, email: &str, name: &str, action: &str, at: &str) -> Message {
+    Message {
+        id: new_id(),
+        kind: "event".into(),
+        author: author.into(),
+        author_email: email.into(),
+        author_name: name.into(),
+        body: action.into(),
+        created_at: at.into(),
+        attachments: Vec::new(),
+    }
+}
+
+/// The status an event leaves a ticket in.
+fn status_of_event(action: &str) -> Option<&'static str> {
+    match action {
+        "resolved" => Some("resolved"),
+        "reopened" | "status:open" => Some("open"),
+        "status:waiting" => Some("waiting"),
+        _ => None,
+    }
+}
+
+/// Hosted side: what support did on an install's tickets from `since` on,
+/// for the install to add and email (answers, and status changes). The
+/// cursor's own moment comes back again, so nothing made in the same
+/// millisecond is lost: the install adds each answer once. An answer and a
+/// status change made in the same step travel as one answer carrying the
+/// new status, the way the hosted side emails them.
+pub async fn updates_for<S: Store>(
+    store: &S,
+    install_id: &str,
+    since: &str,
+) -> Result<Updates, Fail> {
+    let team = install_relay::install_team(install_id);
+    let mut out: Vec<Update> = Vec::new();
+    for t in store.list_team(&team).await.map_err(Fail::Internal)? {
+        if t.updated_at.as_str() < since {
+            continue;
+        }
+        let mut thread = sorted(store.thread(&team, &t.id).await.map_err(Fail::Internal)?);
+        thread.retain(|m| m.author == "support" && m.created_at.as_str() >= since);
+        let mut mine: Vec<Update> = Vec::new();
+        for m in thread {
+            if m.kind == "message" {
+                mine.push(Update {
+                    ticket_id: t.id.clone(),
+                    message_id: m.id,
+                    kind: m.kind,
+                    body: m.body,
+                    created_at: m.created_at,
+                    status: "waiting".into(),
+                });
+                continue;
+            }
+            let Some(status) = status_of_event(&m.body) else {
+                continue;
+            };
+            // A reply that resolves records "resolved" in the same step (the
+            // same moment): it travels as that answer, resolved.
+            if let Some(last) = mine.last_mut() {
+                if m.body == "resolved" && last.kind == "message" && last.created_at == m.created_at
+                {
+                    last.status = status.into();
+                    continue;
+                }
+            }
+            mine.push(Update {
+                ticket_id: t.id.clone(),
+                message_id: m.id,
+                kind: m.kind,
+                body: m.body,
+                created_at: m.created_at,
+                status: status.into(),
+            });
+        }
+        // The newest one carries where the ticket stands now.
+        if let Some(last) = mine.last_mut() {
+            last.status = t.status.as_str().into();
+        }
+        out.extend(mine);
+    }
+    out.sort_by(|a, b| a.created_at.cmp(&b.created_at));
+    out.truncate(install_relay::MAX_UPDATES);
+    let now = out
+        .last()
+        .map(|u| u.created_at.clone())
+        .unwrap_or_else(|| since.to_string());
+    Ok(Updates { updates: out, now })
+}
+
+/// A ticket an install sent: its people get CoderHelm's answers from their
+/// own install, never from here.
+pub fn from_install(t: &Ticket) -> bool {
+    install_relay::install_of_team(&t.team_id).is_some()
 }
 
 #[cfg(test)]
@@ -4463,5 +4773,205 @@ mod tests {
             Err(Fail::TooMany(_))
         ));
         assert_eq!(store.list_team("TEAM#alpha").await.unwrap().len(), 1);
+    }
+
+    // ── Tickets from self-hosted installs ──────────────────────────────
+
+    fn install_ticket(id: &str) -> install_relay::TicketOut {
+        install_relay::TicketOut {
+            ticket_id: id.into(),
+            message_id: format!("{id}m"),
+            subject: "Run stopped before the PR".into(),
+            body: "It stopped. token=abc123secret".into(),
+            name: "Ann".into(),
+            email: "Ann@Acme.dev".into(),
+            page: "/runs/detail?id=r1".into(),
+            priority: "high".into(),
+            items: vec![install_relay::ItemOut {
+                kind: "run".into(),
+                id: "r1".into(),
+                label: "Fix titles".into(),
+                status: "failed".into(),
+                error: "Stopped before opening a pull request".into(),
+                step: "pr".into(),
+            }],
+            version: "v0.8.20".into(),
+            created_at: "2026-11-03T09:00:00.000Z".into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn an_install_ticket_joins_the_queue_once_under_its_install() {
+        let store = Mem::default();
+        let t = install_ticket("01TA");
+        let (ticket, first) = intake_ticket(&store, "ins_a", "acme.coderhelm.com", &t)
+            .await
+            .unwrap()
+            .expect("new ticket");
+        assert_eq!(ticket.team_id, "SUPPORT_INSTALL#ins_a");
+        assert_eq!(ticket.team_name, "Self-hosted: acme.coderhelm.com");
+        assert_eq!(ticket.opened_by_email, "ann@acme.dev");
+        assert_eq!(ticket.context.page, "/runs/detail");
+        assert_eq!(ticket.context.items[0].kind, "run");
+        assert!(from_install(&ticket));
+        // Secrets replaced; the run's error and step are in what support reads.
+        assert!(!first.body.contains("abc123secret"));
+        assert!(first
+            .body
+            .contains("Error: Stopped before opening a pull request"));
+        assert!(first.body.contains("step: pr"));
+        assert_eq!(store.list_queue().await.unwrap().len(), 1);
+
+        // The install sends again (it didn't hear back): nothing new.
+        assert!(intake_ticket(&store, "ins_a", "acme.coderhelm.com", &t)
+            .await
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            store.thread(&ticket.team_id, "01TA").await.unwrap().len(),
+            1
+        );
+
+        // Another install can't take that ticket id.
+        assert!(matches!(
+            intake_ticket(&store, "ins_b", "other", &t).await,
+            Err(Fail::Denied(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn an_install_reply_is_added_once_and_only_on_its_own_tickets() {
+        let store = Mem::default();
+        intake_ticket(&store, "ins_a", "acme", &install_ticket("01TB"))
+            .await
+            .unwrap();
+        let reply = install_relay::MessageOut {
+            ticket_id: "01TB".into(),
+            message_id: "01RB".into(),
+            body: "Any news?".into(),
+            name: "Ann".into(),
+            email: "ann@acme.dev".into(),
+            items: vec![],
+            created_at: "2026-11-03T09:05:00.000Z".into(),
+        };
+        let (t, _) = intake_message(&store, "ins_a", &reply)
+            .await
+            .unwrap()
+            .expect("added");
+        assert_eq!(t.message_count, 2);
+        assert!(intake_message(&store, "ins_a", &reply)
+            .await
+            .unwrap()
+            .is_none());
+        // Another install's reply to it finds nothing.
+        assert_eq!(
+            intake_message(&store, "ins_b", &reply).await,
+            Err(Fail::NotFound)
+        );
+    }
+
+    #[tokio::test]
+    async fn support_answers_go_back_to_the_install_after_its_cursor() {
+        let store = Mem::default();
+        intake_ticket(&store, "ins_a", "acme", &install_ticket("01TC"))
+            .await
+            .unwrap();
+        let none = updates_for(&store, "ins_a", "").await.unwrap();
+        assert!(
+            none.updates.is_empty(),
+            "the person's own message isn't an answer"
+        );
+
+        let (_, answer) = admin_reply(
+            &store,
+            &admin(),
+            "01TC",
+            "Fixed in v0.8.21.",
+            Some(Status::Resolved),
+        )
+        .await
+        .unwrap();
+        let got = updates_for(&store, "ins_a", "").await.unwrap();
+        // The answer and its "resolved" travel as one answer, resolved.
+        assert_eq!(got.updates.len(), 1);
+        assert_eq!(got.updates[0].message_id, answer.id);
+        assert_eq!(got.updates[0].status, "resolved");
+        assert_eq!(got.now, answer.created_at);
+
+        // From the cursor on: only the cursor's own moment again (the install
+        // adds each answer once). Another install sees none of it.
+        let again = updates_for(&store, "ins_a", &got.now).await.unwrap();
+        assert!(again.updates.iter().all(|u| u.created_at == got.now));
+        assert!(updates_for(&store, "ins_b", "")
+            .await
+            .unwrap()
+            .updates
+            .is_empty());
+
+        // A status change alone is an update; a priority change isn't.
+        admin_set(&store, &admin(), "01TC", Some(Status::Open), Some("urgent"))
+            .await
+            .unwrap();
+        let later = updates_for(&store, "ins_a", &got.now).await.unwrap();
+        let reopened: Vec<_> = later.updates.iter().filter(|u| u.kind == "event").collect();
+        assert_eq!(reopened.len(), 1);
+        assert_eq!(reopened[0].body, "reopened");
+        assert_eq!(reopened[0].status, "open");
+        assert!(!later
+            .updates
+            .iter()
+            .any(|u| u.body.starts_with("priority:")));
+    }
+
+    #[test]
+    fn signed_support_requests_verify_only_for_their_install_and_path() {
+        use common::hybrid::sign;
+        let master = "test-master-key-0123456789abcdef";
+        let secret = sign::install_secret(master, "ins_a");
+        let body = br#"{"ticket_id":"01T"}"#;
+        let now = 1_800_000_000;
+        let sig = sign::sign_request(&secret, now, "POST", install_relay::TICKETS_PATH, body);
+        assert!(sign::verify_request(
+            &secret,
+            Some(&now.to_string()),
+            Some(&sig),
+            "POST",
+            install_relay::TICKETS_PATH,
+            body,
+            now
+        )
+        .is_ok());
+        // Another install's secret, another path, or a changed body: refused.
+        let other = sign::install_secret(master, "ins_b");
+        assert!(sign::verify_request(
+            &other,
+            Some(&now.to_string()),
+            Some(&sig),
+            "POST",
+            install_relay::TICKETS_PATH,
+            body,
+            now
+        )
+        .is_err());
+        assert!(sign::verify_request(
+            &secret,
+            Some(&now.to_string()),
+            Some(&sig),
+            "POST",
+            install_relay::UPDATES_PATH,
+            body,
+            now
+        )
+        .is_err());
+        assert!(sign::verify_request(
+            &secret,
+            Some(&now.to_string()),
+            Some(&sig),
+            "POST",
+            install_relay::TICKETS_PATH,
+            br#"{"ticket_id":"02T"}"#,
+            now
+        )
+        .is_err());
     }
 }

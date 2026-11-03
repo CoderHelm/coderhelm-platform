@@ -29,8 +29,18 @@ Your code, runs, plans, reviews, memory, knowledge and secrets stay in your AWS 
 | Notion, Confluence, Google Drive | the sign-in, once | the provider sign-in, encrypted with a key only CoderHelm's services can use, so it can hand your install access tokens. Disconnecting revokes it. Notion's tokens don't expire by themselves: a copy your install holds stays valid until Notion's own integration page removes it |
 | Email through CoderHelm (opt-in, [Email](./email.md#send-through-coderhelm)) | each email's recipient address, template id and parameters (names, PR titles and run links in the weekly summary), in transit; CoderHelm writes the email from its own templates | delivery metadata only: template id, a shortened address and the status, for 3 days. Salted hashes of the addresses your install listed, and your install admins' addresses sealed with a key only CoderHelm's services can use, to tell them if email pauses |
 | Sharing with support (opt-in) | metadata of failed deliveries, and payload previews only if you also choose that | for 14 days, so support can see what failed |
+| Support tickets (every self-hosted install, hybrid or not; only when someone opens a ticket) | the subject and each message the person writes, their name and email, the dashboard page it was filed from, your install's id and version, and for each item attached its kind, name and status, and a run's error text and step. Never code, diffs, files or anything from a repository. Likely secrets are replaced before it leaves | the ticket and its thread in CoderHelm's support queue, so support can answer. See [Support tickets](#support-tickets) |
 
 CoderHelm never stores your code, never sees your model calls or your AWS credentials, and can't sign in to your install.
+
+### Support tickets
+
+Help and **Get help with this run** on a self-hosted install open a ticket with CoderHelm's support, the same as on the hosted service. The form says what leaves your install: the person's message, their name and email (so support can answer), your install's version and, for each item attached, its name and status and a run's error and step. Nothing else: never code, diffs, files or anything read from a repository.
+
+- **How it gets there.** Your install sends the ticket signed with its registration secret, the same registration hybrid uses. An install that isn't registered registers when its first ticket is opened; registering turns no hybrid part on. CoderHelm checks the signature and keeps the ticket under your install, limited per install and per address.
+- **When it can't.** If your install can't reach CoderHelm (outbound internet blocked, or `api.coderhelm.com` not allowed), the ticket stays on your install and says **Not sent to CoderHelm yet**, with the reason and the support address. Your install tries again every few minutes and on each visit to Help.
+- **Answers.** Your install asks CoderHelm for support's answers every few minutes (an outbound call; nothing needs to reach your install), adds them to the ticket and emails the people on it from your install, with links to your install.
+- **Your own inbox.** A copy goes to your own support address too when `SUPPORT_INBOX` is set.
 
 The install guide page itself (docs.coderhelm.com) counts anonymous page views with Google Analytics: the page's address without anything after `?` or `#`, the step reached by name, and the host of a link you open. Nothing you type, including the name you check, and nothing about your install is sent to Google. Your install sends nothing to Google Analytics.
 

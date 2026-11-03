@@ -880,6 +880,7 @@ pub mod stack;
 pub(crate) mod steps;
 pub(crate) mod stop_gate;
 pub mod stop_pr;
+pub mod support_sync;
 pub mod syntax_check;
 pub(crate) mod terraform;
 #[allow(dead_code)]

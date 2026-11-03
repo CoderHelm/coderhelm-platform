@@ -289,7 +289,7 @@ fn coderhelm_keys() -> Value {
     })
 }
 
-async fn do_register(state: &AppState) -> Result<Local, (StatusCode, Json<Value>)> {
+pub(crate) async fn do_register(state: &AppState) -> Result<Local, (StatusCode, Json<Value>)> {
     let mut l = local(state).await;
     if creds_now().await.is_some() && !l.install_id.is_empty() {
         return Ok(l);
