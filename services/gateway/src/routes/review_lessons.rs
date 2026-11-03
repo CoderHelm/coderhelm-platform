@@ -244,7 +244,16 @@ pub async fn on_webhook(
         return;
     };
     if let Some(author) = pushback_author(event_type, payload) {
-        if !super::github_webhook::may_start_work(state, team_id, author, "review pushback").await {
+        if !super::github_webhook::may_start_work(
+            state,
+            team_id,
+            installation_id,
+            payload,
+            author,
+            "review pushback",
+        )
+        .await
+        {
             info!(owner = %t.owner, name = %t.name, pr = t.pr_number, trigger = t.trigger, reason = "the author has no standing", "Pushback on a review not judged");
             return;
         }
