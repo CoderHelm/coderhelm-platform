@@ -77,12 +77,6 @@ The last result is kept in `.coderhelm/doctor.json`.
 
 ### Web address
 
-- **Route 53 zone**\
-  *If it fails:* No public zone with that name in the account.\
-  *Fix:* `aws route53 create-hosted-zone ...`.
-- **Name servers point at Route 53**\
-  *If it fails:* Public DNS answers other name servers than the zone's.\
-  *Fix:* The exact NS records to set at your registrar, and what is there now.
 - **TLS certificate issued**\
   *If it fails:* Wrong region, wrong name, or still validating.\
   *Fix:* The validation records to add, or the ACM request page.
@@ -170,7 +164,7 @@ Each step of `init` runs its checks before it moves on:
 |---|---|
 | Your machine and AWS sign-in | Node.js, AWS CLI, tar, sign-in |
 | Where to install | The region's services, your permissions, CDK |
-| Web address | The Route 53 zone and its name servers, or your certificate |
+| Web address | Your certificate, and the records you added |
 | Claude access | A real call with the Anthropic key you paste, or Bedrock model access |
 | You and email | The SES identity and DKIM, the sandbox |
 | Optional extras | The Slack or Teams webhook answers |

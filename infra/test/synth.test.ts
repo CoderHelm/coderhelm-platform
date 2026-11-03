@@ -178,19 +178,15 @@ test("fresh self-host config without a domain: nothing hosted-specific, one Clou
 test("self-host with a domain in another region and Bedrock", () => {
   const cfg = selfHost({
     region: "eu-west-1",
-    domain: { hostname: "helm.example.org", hostedZone: "example.org" },
+    domain: { hostname: "helm.example.org", certificateArn: CERT },
     models: { provider: "bedrock", bedrockInferencePrefix: "eu." },
     email: { from: "helm@example.org" },
     integrations: { googleSignIn: true },
   });
-  const t = synth(cfg, {
-    ...zoneContext("111122223333", "eu-west-1", "example.org"),
-    ...zoneContext("111122223333", "us-east-1", "example.org"),
-  });
-  // CloudFront's certificate lives in us-east-1.
-  assert.ok(t["coderhelm-prod-web-certificate"], "certificate stack");
-  t["coderhelm-prod-web-certificate"].hasResourceProperties("AWS::CertificateManager::Certificate", { DomainName: "helm.example.org" });
-  t["coderhelm-prod-web"].resourceCountIs("AWS::Route53::RecordSet", 2);
+  const t = synth(cfg);
+  // The certificate is the admin's (us-east-1); CoderHelm never changes DNS.
+  assert.equal(t["coderhelm-prod-web-certificate"], undefined, "no certificate stack");
+  t["coderhelm-prod-web"].resourceCountIs("AWS::Route53::RecordSet", 0);
 
   // Google sign-in on in an old config: a self-hosted install never gets it,
   // and the update removes the provider it had.
@@ -204,8 +200,8 @@ test("self-host with a domain in another region and Bedrock", () => {
   assert.ok(worker.includes("bedrock:InvokeModelWithResponseStream"));
   assert.ok(worker.includes("foundation-model/anthropic.*"));
 
-  // The sender's domain is the zone: SES gets its DKIM records there.
-  t["coderhelm-prod-email"].resourceCountIs("AWS::Route53::RecordSet", 3);
+  // No DNS records for the sender either: SES shows its DKIM records to add.
+  t["coderhelm-prod-email"].resourceCountIs("AWS::Route53::RecordSet", 0);
 });
 
 test("optional parts can be turned off", () => {
@@ -565,15 +561,15 @@ test("domain: none, the CloudFront address, and its hostname kept for a domain a
   assert.equal(envOf(t["coderhelm-prod-api"], "coderhelm-prod-gateway").GOOGLE_SIGN_IN, "false");
 });
 
-test("domain: Route 53 in us-east-1, certificate and records made by the deploy", () => {
-  const cfg = selfHost({ region: "us-east-1", domain: { hostname: "helm.example.org", hostedZone: "example.org" } });
-  const t = synth(cfg, zoneContext("111122223333", "us-east-1", "example.org"));
+test("domain: your own certificate, and CoderHelm writes no DNS records (it never changes DNS)", () => {
+  const cfg = selfHost({ region: "us-east-1", domain: { hostname: "helm.example.org", certificateArn: CERT } });
+  const t = synth(cfg);
   const web = t["coderhelm-prod-web"];
-  web.hasResourceProperties("AWS::CertificateManager::Certificate", { DomainName: "helm.example.org", ValidationMethod: "DNS" });
-  web.resourceCountIs("AWS::Route53::RecordSet", 2); // A and AAAA aliases
+  web.resourceCountIs("AWS::CertificateManager::Certificate", 0);
+  web.resourceCountIs("AWS::Route53::RecordSet", 0);
   web.hasResourceProperties("AWS::CloudFront::Distribution", { DistributionConfig: { Aliases: ["helm.example.org"] } });
   assert.equal(t["coderhelm-prod-web-certificate"], undefined, "no separate certificate stack in us-east-1");
-  assert.equal(outputs(web).DnsRecord, undefined);
+  assert.ok(outputs(web).DnsRecord, "the record to add is printed");
 });
 
 test("domain: another DNS provider, the certificate given, no records, the record to add as an output", () => {
@@ -591,22 +587,7 @@ test("domain: another DNS provider, the certificate given, no records, the recor
   assert.equal(envOf(t["coderhelm-prod-api"], "coderhelm-prod-gateway").APP_URL, "https://helm.example.org");
 });
 
-test("domain: added later in Route 53 (the updater's certificate and the zone id): records, no lookup, no certificate stack", () => {
-  const cfg = selfHost({
-    region: "eu-west-1",
-    domain: { hostname: "helm.example.org", hostedZone: "example.org", hostedZoneId: "Z0123456789ABC", certificateArn: CERT },
-  });
-  // No zone context: the zone id skips the lookup.
-  const t = synth(cfg);
-  const web = t["coderhelm-prod-web"];
-  web.resourceCountIs("AWS::CertificateManager::Certificate", 0);
-  web.resourceCountIs("AWS::Route53::RecordSet", 2);
-  web.hasResourceProperties("AWS::Route53::RecordSet", { HostedZoneId: "Z0123456789ABC", Name: "helm.example.org.", Type: "A" });
-  assert.equal(t["coderhelm-prod-web-certificate"], undefined);
-  assert.equal(outputs(web).DnsRecord, undefined);
-});
-
-test("domain: the updater may request the certificate, add only the validation CNAME, and checks every 5 minutes", () => {
+test("domain: the updater may request the certificate, never touches DNS, and checks every 5 minutes", () => {
   const t = synth(selfHost({ integrations: { googleSignIn: false } }));
   const u = t["coderhelm-prod-updates"];
   u.hasResourceProperties("AWS::Events::Rule", { Name: "coderhelm-prod-domain-check", ScheduleExpression: "rate(5 minutes)" });
@@ -615,8 +596,7 @@ test("domain: the updater may request the certificate, add only the validation C
   const policies = JSON.stringify(u.findResources("AWS::IAM::Policy"));
   assert.ok(policies.includes("acm:RequestCertificate"));
   assert.ok(policies.includes('"aws:RequestedRegion":"us-east-1"'));
-  assert.ok(policies.includes("route53:ChangeResourceRecordSetsRecordTypes"));
-  assert.ok(policies.includes('"_*"'));
+  assert.ok(!policies.includes("route53:"), "no Route 53 at all");
   assert.ok(policies.includes("parameter/coderhelm-prod/distribution-domain"));
   // The build applies a domain change with the release that runs.
   const spec = JSON.stringify(u.findResources("AWS::CodeBuild::Project"));
@@ -1015,10 +995,7 @@ test("the deploy role may create and tag every resource a self-host install crea
     [st.Resource ?? []].flat().some((r) => r === "*" || r.includes(kind)));
   const templates = [
     synth(selfHost()),
-    synth(selfHost({ region: "eu-west-1", domain: { hostname: "helm.example.org", hostedZone: "example.org" }, email: { from: "helm@example.org" } }), {
-      ...zoneContext("111122223333", "eu-west-1", "example.org"),
-      ...zoneContext("111122223333", "us-east-1", "example.org"),
-    }),
+    synth(selfHost({ region: "eu-west-1", domain: { hostname: "helm.example.org", certificateArn: CERT }, email: { from: "helm@example.org" } })),
   ].flatMap((t) => Object.values(t));
   const gaps = new Set<string>();
   for (const t of templates) {

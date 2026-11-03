@@ -33,13 +33,11 @@ export interface SingleOriginDomain {
   /** The hostname people open, e.g. `coderhelm.example.com`. */
   hostname: string;
   /**
-   * The Route 53 public hosted zone the hostname is in, e.g. `example.com`.
-   * With it, certificates are validated and DNS records are created for you.
-   * Without it, give `certificateArn` and create the DNS record yourself
-   * (the deploy prints it).
+   * No longer accepted: CoderHelm never changes DNS. Kept in the type so the
+   * config check can refuse it with a clear message.
    */
   hostedZone?: string;
-  /** The zone's id, to skip the lookup (and the lookup role) at synth. */
+  /** No longer accepted (see hostedZone). */
   hostedZoneId?: string;
   /** An ACM certificate in us-east-1 covering `hostname` (CloudFront needs us-east-1). */
   certificateArn?: string;
@@ -419,35 +417,23 @@ export function validateConfig(c: unknown): string[] {
     const d = cfg.domain;
     if (d !== undefined && d !== null) {
       if (typeof d !== "object") {
-        p.push("domain: an object with hostname (and hostedZone or certificateArn), or null");
+        p.push("domain: an object with hostname and certificateArn, or null");
       } else {
         if (typeof d.hostname !== "string" || !HOST_RE.test(d.hostname)) {
           p.push("domain.hostname: a hostname such as coderhelm.example.com (lowercase)");
         }
-        if (d.hostedZone !== undefined) {
-          if (typeof d.hostedZone !== "string" || !HOST_RE.test(d.hostedZone)) {
-            p.push("domain.hostedZone: a zone name such as example.com");
-          } else if (
-            typeof d.hostname === "string" &&
-            d.hostname !== d.hostedZone &&
-            !d.hostname.endsWith(`.${d.hostedZone}`)
-          ) {
-            p.push(`domain.hostname: ${d.hostname} is not inside the zone ${d.hostedZone}`);
-          }
-        }
-        if (d.hostedZoneId !== undefined && !/^Z[A-Z0-9]{1,32}$/.test(String(d.hostedZoneId))) {
-          p.push("domain.hostedZoneId: a Route 53 zone id such as Z0123456789ABC");
-        }
-        if (d.hostedZoneId !== undefined && d.hostedZone === undefined) {
-          p.push("domain.hostedZoneId: also set domain.hostedZone");
+        // A self-hosted install never changes DNS (its roles may not: access.ts
+        // NoDnsChanges): the admin adds the records, so no Route 53 zone here.
+        if (d.hostedZone !== undefined || d.hostedZoneId !== undefined) {
+          p.push("domain.hostedZone: CoderHelm never changes DNS in your account. Remove hostedZone/hostedZoneId, set domain.certificateArn (an ACM certificate in us-east-1), and add the hostname's CNAME to CloudFront's address yourself");
         }
         if (d.certificateArn !== undefined) {
           if (!/^arn:aws[a-z-]*:acm:us-east-1:\d{12}:certificate\/[0-9a-f-]+$/.test(String(d.certificateArn))) {
             p.push("domain.certificateArn: an ACM certificate ARN in us-east-1 (CloudFront only uses us-east-1 certificates)");
           }
         }
-        if (d.hostedZone === undefined && d.certificateArn === undefined) {
-          p.push("domain: set hostedZone (Route 53 manages the certificate and DNS) or certificateArn (you manage DNS)");
+        if (d.certificateArn === undefined) {
+          p.push("domain: set certificateArn (an ACM certificate in us-east-1; you add the DNS records)");
         }
       }
     }
@@ -605,10 +591,6 @@ export function validateConfig(c: unknown): string[] {
       if (a.owner === "app" && a.id !== undefined) p.push('access.id: only with owner "launch"');
       if (layout !== "single-origin") p.push('access: only for layout "single-origin" (self-hosted installs)');
       if (cfg.updates?.enabled === false) p.push("access: needs the updater (updates.enabled)");
-      const d = cfg.domain as { hostedZone?: string; certificateArn?: string } | null | undefined;
-      if (d && d.hostedZone && !d.certificateArn && cfg.region !== "us-east-1") {
-        p.push("access: a domain with a Route 53 zone outside us-east-1 needs domain.certificateArn (a hardened install has no certificate stack in us-east-1; Settings, System requests one)");
-      }
     }
   }
   if (cfg.logReaderTemplateUrl !== undefined && !/^https:\/\/[^\s]+\.ya?ml$/.test(String(cfg.logReaderTemplateUrl))) {

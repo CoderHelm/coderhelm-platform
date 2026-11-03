@@ -153,31 +153,17 @@ async function stepAccount(ctx, answers) {
 async function stepDomain(ctx, answers) {
   const { flags, runner, log } = ctx;
   log("CoderHelm needs one web address. Without a domain it uses CloudFront's own (https://dxxxx.cloudfront.net), and everything works.");
-  const zones = ((await runner.json("aws", ["route53", "list-hosted-zones", "--output", "json"], { allowFail: true, dryRunAnswer: '{"HostedZones":[]}' }))?.HostedZones ?? [])
-    .filter((z) => !z.Config?.PrivateZone)
-    .map((z) => z.Name.replace(/\.$/, ""));
-  if (zones.length) log(`  Route 53 zones in this account: ${zones.join(", ")}`);
-  const hostname = await answer(ctx, pick(flags, answers, "domain"), "Hostname (empty for the CloudFront address)", zones.length && ctx.interactive ? `coderhelm.${zones[0]}` : "",
+  const hostname = await answer(ctx, pick(flags, answers, "domain"), "Hostname (empty for the CloudFront address)", "",
     (v) => (!v || HOST_RE.test(v) ? null : "A lowercase hostname such as coderhelm.example.com, or empty."));
   if (hostname === BACK) return BACK;
-  if (!hostname) return { ...answers, domain: "", hostedZone: undefined, certificateArn: undefined };
-  const zone = zones.find((z) => hostname === z || hostname.endsWith(`.${z}`));
-  if (zone) {
-    log(`  ${zone} is in Route 53: the certificate and DNS records are created for you.`);
-    const checked = await gate(ctx, async () => {
-      const z = await C.checkHostedZone(ctx, zone);
-      return [z.result, await C.checkDelegation(ctx, zone, z.zoneId), ...(await usEast1Bootstrap(ctx, answers, false))];
-    }, { heading: `Checking ${zone}'s DNS` });
-    if (checked === BACK) return BACK;
-    return { ...answers, domain: hostname, hostedZone: zone, certificateArn: undefined };
-  }
-  log("  That hostname isn't in a Route 53 zone here. Create an ACM certificate for it in us-east-1 (CloudFront only uses us-east-1), and you'll add one CNAME after the deploy.");
+  if (!hostname) return { ...answers, domain: "", certificateArn: undefined };
+  log("  CoderHelm never changes your DNS. Create an ACM certificate for it in us-east-1 (CloudFront only uses us-east-1), and you'll add one CNAME after the deploy.");
   const certificateArn = await answer(ctx, pick(flags, answers, "certificateArn"), "ACM certificate ARN (us-east-1)", "",
     (v) => (/^arn:aws[a-z-]*:acm:us-east-1:\d{12}:certificate\/[0-9a-f-]+$/.test(v) ? null : "An ACM certificate ARN in us-east-1."));
   if (certificateArn === BACK) return BACK;
   const checked = await gate(ctx, async () => [await C.checkCertificate(ctx, certificateArn, hostname)], { heading: "Checking the certificate" });
   if (checked === BACK) return BACK;
-  return { ...answers, domain: hostname, hostedZone: undefined, certificateArn };
+  return { ...answers, domain: hostname, certificateArn };
 }
 
 /** CloudFront's certificate is made in us-east-1: CDK must be set up there too. */
@@ -245,12 +231,12 @@ async function stepEmail(ctx, answers) {
   log("You become the first admin. CoderHelm emails run results, invites and update notices through Amazon SES in this account.");
   const admin = await answer(ctx, pick(flags, answers, "admin"), "Your email", "", (v) => (EMAIL_RE.test(v) ? null : "An email address."));
   if (admin === BACK) return BACK;
-  const defDomain = answers.hostedZone ?? admin.split("@")[1];
+  const defDomain = admin.split("@")[1];
   const emailFrom = await answer(ctx, pick(flags, answers, "emailFrom"), "Emails come from", `coderhelm@${defDomain}`, (v) => (EMAIL_RE.test(v) ? null : "An email address."));
   if (emailFrom === BACK) return BACK;
   let sandbox;
   const checked = await gate(ctx, async () => {
-    const results = [await C.checkSesIdentity(ctx, emailFrom, answers.region, { zone: answers.hostedZone }), await C.checkSesSandbox(ctx, answers.region)];
+    const results = [await C.checkSesIdentity(ctx, emailFrom, answers.region), await C.checkSesSandbox(ctx, answers.region)];
     sandbox = results[1].status !== C.PASS;
     return results;
   }, { heading: "Checking Amazon SES" });
@@ -360,7 +346,7 @@ export function configFromAnswers(a) {
     region: a.region,
     stage: a.stage,
     domain: a.domain
-      ? { hostname: a.domain, ...(a.hostedZone ? { hostedZone: a.hostedZone } : {}), ...(a.certificateArn ? { certificateArn: a.certificateArn } : {}) }
+      ? { hostname: a.domain, ...(a.certificateArn ? { certificateArn: a.certificateArn } : {}) }
       : null,
     models: { provider: a.provider, ...(a.provider === "bedrock" && a.bedrockPrefix !== undefined ? { bedrockInferencePrefix: a.bedrockPrefix } : {}) },
     email: { from: a.emailFrom },

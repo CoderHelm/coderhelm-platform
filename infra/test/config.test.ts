@@ -85,7 +85,7 @@ test("self-host defaults: single origin, no domain, Anthropic, retained data, ac
 });
 
 test("a custom domain makes the URL known at synth", () => {
-  const r = resolveConfig(base({ domain: { hostname: "ch.example.com", hostedZone: "example.com" } }));
+  const r = resolveConfig(base({ domain: { hostname: "ch.example.com", certificateArn: "arn:aws:acm:us-east-1:123456789012:certificate/0a1b-2c" } }));
   assert.equal(r.appUrl, "https://ch.example.com");
   assert.equal(r.apiUrl, "https://ch.example.com");
 });
@@ -138,19 +138,23 @@ test("single-origin needs an admin", () => {
 });
 
 test("domain checks", () => {
-  hasProblem(base({ domain: { hostname: "ch.example.com" } }), /set hostedZone .* or certificateArn/);
-  hasProblem(base({ domain: { hostname: "ch.other.com", hostedZone: "example.com" } }), /is not inside the zone/);
-  hasProblem(base({ domain: { hostname: "CH.example.com", hostedZone: "example.com" } }), /domain.hostname/);
+  hasProblem(base({ domain: { hostname: "ch.example.com" } }), /set certificateArn/);
+  hasProblem(base({ domain: { hostname: "CH.example.com", certificateArn: "arn:aws:acm:us-east-1:123456789012:certificate/0a1b-2c" } }), /domain.hostname/);
   hasProblem(
     base({ domain: { hostname: "ch.example.com", certificateArn: "arn:aws:acm:eu-west-1:123456789012:certificate/abc" } }),
     /us-east-1/
   );
-  hasProblem(base({ domain: { hostname: "ch.example.com", hostedZone: "example.com", hostedZoneId: "nope" } }), /hostedZoneId/);
-  assert.deepEqual(
-    problems(base({ domain: { hostname: "ch.example.com", certificateArn: "arn:aws:acm:us-east-1:123456789012:certificate/0a1b-2c" } })),
-    []
-  );
-  assert.deepEqual(problems(base({ domain: { hostname: "example.com", hostedZone: "example.com" } })), []);
+  assert.deepEqual(problems(base({ domain: { hostname: "ch.example.com", certificateArn: "arn:aws:acm:us-east-1:123456789012:certificate/0a1b-2c" } })), []);
+});
+
+test("a self-hosted install never changes DNS: a Route 53 zone in the config is refused", () => {
+  for (const domain of [
+    { hostname: "ch.example.com", hostedZone: "example.com" },
+    { hostname: "ch.example.com", hostedZone: "example.com", hostedZoneId: "Z0123456789ABC", certificateArn: "arn:aws:acm:us-east-1:123456789012:certificate/0a1b-2c" },
+    { hostname: "ch.example.com", hostedZoneId: "Z0123456789ABC", certificateArn: "arn:aws:acm:us-east-1:123456789012:certificate/0a1b-2c" },
+  ]) {
+    hasProblem(base({ domain } as never), /CoderHelm never changes DNS/);
+  }
 });
 
 test("layout checks", () => {
@@ -167,7 +171,7 @@ test("layout checks", () => {
   hasProblem(
     base({
       layout: "split",
-      domain: { hostname: "a.b.com", hostedZone: "b.com" },
+      domain: { hostname: "a.b.com", certificateArn: "arn:aws:acm:us-east-1:123456789012:certificate/0a1b-2c" },
       split: { zone: null, appUrl: "https://a", apiUrl: "https://b", corsOrigins: [], streamCorsOrigins: [] },
     }),
     /^domain: only used with layout "single-origin"/
@@ -180,7 +184,7 @@ test("Google sign-in is the hosted deployment's only: a self-hosted install neve
   assert.deepEqual(problems(base({ integrations: { googleSignIn: true } })), []);
   assert.equal(resolveConfig(base({ integrations: { googleSignIn: true } })).integrations.googleSignIn, false);
   assert.equal(
-    resolveConfig(base({ domain: { hostname: "ch.example.com", hostedZone: "example.com" }, integrations: { googleSignIn: true } })).integrations.googleSignIn,
+    resolveConfig(base({ domain: { hostname: "ch.example.com", certificateArn: "arn:aws:acm:us-east-1:123456789012:certificate/0a1b-2c" }, integrations: { googleSignIn: true } })).integrations.googleSignIn,
     false
   );
 });

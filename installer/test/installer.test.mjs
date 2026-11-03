@@ -125,12 +125,13 @@ test("init --dry-run writes nothing", async () => {
   assert.match(out, /\[dry run\] write/);
 });
 
-test("init with a domain asks for the zone", async () => {
+test("init with a domain takes a certificate and never a Route 53 zone", async () => {
   const cfg = cmd.buildConfig({
     account: ACCOUNT, region: "us-east-1", stage: "prod", hostname: "helm.example.org", zone: "example.org",
+    certificateArn: `arn:aws:acm:us-east-1:${ACCOUNT}:certificate/0f0e0d0c-1111-2222-3333-444455556666`,
     provider: "anthropic", admin: "me@example.org", emailFrom: "helm@example.org",
   });
-  assert.deepEqual(cfg.domain, { hostname: "helm.example.org", hostedZone: "example.org" });
+  assert.deepEqual(cfg.domain, { hostname: "helm.example.org", certificateArn: `arn:aws:acm:us-east-1:${ACCOUNT}:certificate/0f0e0d0c-1111-2222-3333-444455556666` });
   assert.deepEqual(cmd.quickCheck(cfg), []);
   assert.ok(cmd.quickCheck({ ...cfg, layout: "split" }).some((p) => /split/.test(p)));
 });
@@ -577,15 +578,14 @@ import { withDomain, describeChange } from "../lib/domain.mjs";
 
 const CERT = `arn:aws:acm:us-east-1:${ACCOUNT}:certificate/0f0e0d0c-1111-2222-3333-444455556666`;
 
-test("withDomain: another DNS provider, a Route 53 zone, removal, and plain refusals", () => {
+test("withDomain: a certificate, zones ignored (CoderHelm never changes DNS), removal, and plain refusals", () => {
   const cfg = { account: ACCOUNT, domain: null, integrations: {} };
   assert.deepEqual(withDomain(cfg, { hostname: "Helm.Example.org.", certificateArn: CERT }).domain, { hostname: "helm.example.org", certificateArn: CERT });
   assert.deepEqual(withDomain(cfg, { hostname: "helm.example.org", certificateArn: CERT, zone: "example.org", zoneId: "ZTEST000001" }).domain,
-    { hostname: "helm.example.org", certificateArn: CERT, hostedZone: "example.org", hostedZoneId: "ZTEST000001" });
+    { hostname: "helm.example.org", certificateArn: CERT });
   assert.equal(withDomain({ ...cfg, domain: { hostname: "a.example.org", hostedZone: "example.org" } }, { action: "remove" }).domain, null);
   assert.throws(() => withDomain(cfg, { hostname: "helm", certificateArn: CERT }), /--hostname must be a hostname/);
   assert.throws(() => withDomain(cfg, { hostname: "helm.example.org", certificateArn: CERT.replace("us-east-1", "eu-west-1") }), /us-east-1/);
-  assert.throws(() => withDomain(cfg, { hostname: "helm.example.org", certificateArn: CERT, zone: "example.net" }), /not inside the zone/);
   // No Google sign-in on self-host: an old config with it on still moves back to the AWS address.
   assert.equal(withDomain({ ...cfg, integrations: { googleSignIn: true } }, { action: "remove" }).domain, null);
   assert.equal(describeChange(null, { hostname: "helm.example.org" }), "the AWS address to https://helm.example.org");

@@ -33,7 +33,7 @@ export function nativeNames(): AccessNames {
     // "-stack": never the name of an install hardened from the CLI (its
     // coderhelm-<name>-access stack owns coderhelm-<name>-boundary).
     id: NATIVE_ID,
-  }), emailIdentity: "${EmailIdentity}", zoneId: "${DomainZoneId}", dnsAliasOnly: true };
+  }), emailIdentity: "${EmailIdentity}" };
 }
 
 /**
@@ -137,7 +137,7 @@ export function parameters(): Json {
     SetupToken: { Type: "String", Default: "", NoEcho: true, AllowedPattern: "^$|^[A-Za-z0-9]{32,64}$", Description: "A one-time key from the install guide that lets it hand your new GitHub App's keys to this install. Empty to create the GitHub App later." },
     StatusId: { Type: "String", Default: "", AllowedPattern: "^$|^[a-z0-9]{16}$", Description: "Lets the install guide show progress (a small public status file with the phase and your URL). Empty for none." },
     DomainCertificateArn: { Type: "String", Default: "", Description: "Set by CoderHelm's stack update once your domain's certificate is issued. Leave empty." },
-    DomainZoneId: { Type: "String", Default: "", Description: "Set by CoderHelm's stack update when your domain's zone is in Route 53 here. Leave empty." },
+    DomainZoneId: { Type: "String", Default: "", Description: "No longer used: CoderHelm never changes DNS (kept so older stacks update). Leave empty." },
   };
 }
 
@@ -204,7 +204,6 @@ export function helperPolicy(): PolicyDocument {
       { Sid: "FindCertificates", Effect: "Allow", Action: ["acm:ListCertificates", "acm:ListTagsForCertificate", "acm:DescribeCertificate"], Resource: "*", Condition: { StringEquals: { "aws:RequestedRegion": "us-east-1" } } },
       // Only the certificates the updater requested for this install (its tag).
       { Sid: "CertificatesOnDelete", Effect: "Allow", Action: "acm:DeleteCertificate", Resource: "*", Condition: { StringEquals: { "aws:RequestedRegion": "us-east-1", "aws:ResourceTag/coderhelm": p } } },
-      { Sid: "FindZones", Effect: "Allow", Action: "route53:ListHostedZones", Resource: "*" },
       // The admin's "delete everything when uninstalled" switch (Settings, System, Uninstall), read on a
       // stack delete and removed with the stack.
       { Sid: "UninstallSwitch", Effect: "Allow", Action: ["ssm:GetParameter", "ssm:DeleteParameter"], Resource: `${at("ssm")}:parameter/${p}/uninstall/delete-data` },
@@ -215,21 +214,7 @@ export function helperPolicy(): PolicyDocument {
       { Sid: "FindKeyAliases", Effect: "Allow", Action: "kms:ListAliases", Resource: "*" },
       { Sid: "KeyAliasesOnSwitch", Effect: "Allow", Action: "kms:DeleteAlias", Resource: `${at("kms")}:alias/${p}-*` },
       { Sid: "KeysOnSwitch", Effect: "Allow", Action: ["kms:ScheduleKeyDeletion", "kms:DeleteAlias"], Resource: `${at("kms")}:key/*`, Condition: { StringEquals: { [`aws:ResourceTag/${INSTALL_TAG}`]: p } } },
-      // Only deleting the CNAME a certificate check uses (its name starts with an underscore).
-      { Sid: "ValidationRecordsOnDelete", Effect: "Allow", Action: "route53:ChangeResourceRecordSets", Resource: "arn:${AWS::Partition}:route53:::hostedzone/*", Condition: { "ForAllValues:StringLike": { "route53:ChangeResourceRecordSetsNormalizedRecordNames": ["_*"] }, "ForAllValues:StringEquals": { "route53:ChangeResourceRecordSetsActions": ["DELETE"], "route53:ChangeResourceRecordSetsRecordTypes": ["CNAME"] } } },
     ],
-  };
-}
-
-/**
- * The DNS statement only when the install has a zone: with no custom domain
- * DomainZoneId is empty and the statement would name `hostedzone/` (never
- * widened to every zone instead).
- */
-export function withZoneOnly(policy: any): any {
-  return {
-    ...policy,
-    Statement: policy.Statement.map((s: any) => (s.Sid === "DnsRecords" ? { "Fn::If": ["HasDomainZone", s, { Ref: "AWS::NoValue" }] } : s)),
   };
 }
 
@@ -449,7 +434,7 @@ export function buildParent(input: ParentInput): Json {
         }],
       },
       PermissionsBoundary: { Ref: "DeployBoundary" },
-      Policies: [{ PolicyName: "deploy", PolicyDocument: withZoneOnly(subInstall(deployRolePolicy(n))) }],
+      Policies: [{ PolicyName: "deploy", PolicyDocument: subInstall(deployRolePolicy(n)) }],
       Tags: [{ Key: INSTALL_TAG, Value: sub("coderhelm-${Stage}") }],
     },
   };

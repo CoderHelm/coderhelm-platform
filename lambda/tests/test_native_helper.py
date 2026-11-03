@@ -395,6 +395,48 @@ class FakeAcm:
         return P()
 
 
+class OneCertAcm:
+    """One certificate this install requested, with its validation record."""
+    def __init__(self):
+        self.deleted = []
+
+    def get_paginator(self, name):
+        class P:
+            def paginate(self):
+                return [{"CertificateSummaryList": [{"CertificateArn": "arn:aws:acm:us-east-1:111122223333:certificate/abc"}]}]
+        return P()
+
+    def list_tags_for_certificate(self, CertificateArn):
+        return {"Tags": [{"Key": "coderhelm", "Value": "coderhelm-prod"}]}
+
+    def describe_certificate(self, CertificateArn):
+        return {"Certificate": {"DomainValidationOptions": [{"DomainName": "helm.example.org", "ResourceRecord": {
+            "Name": "_a1b2.helm.example.org.", "Type": "CNAME", "Value": "_c3d4.xyz.acm-validations.aws."}}]}}
+
+    def delete_certificate(self, CertificateArn):
+        self.deleted.append(CertificateArn)
+
+
+class UninstallNeverTouchesDns(unittest.TestCase):
+    def test_the_certificate_goes_and_its_dns_records_are_only_listed_for_the_admin(self):
+        class NoRoute53:
+            def __getattr__(self, name):
+                raise AssertionError(f"route53.{name} called: CoderHelm never touches DNS")
+        saved = dict(h._clients)
+        try:
+            acm = OneCertAcm()
+            h._clients["acm@us-east-1"] = acm
+            h._clients["route53@None"] = NoRoute53()
+            done, problems, records = h.delete_certificates("coderhelm-prod")
+            self.assertEqual((done, problems), (["abc"], []))
+            self.assertEqual(acm.deleted, ["arn:aws:acm:us-east-1:111122223333:certificate/abc"])
+            self.assertIn("_a1b2.helm.example.org CNAME _c3d4.xyz.acm-validations.aws", records)
+            self.assertTrue(any(r.startswith("helm.example.org CNAME") for r in records))
+        finally:
+            h._clients.clear()
+            h._clients.update(saved)
+
+
 class Final(unittest.TestCase):
     """Deleted after every part: the log groups Lambda recreated (the live
     test left two), and with KeepDataOnDelete=false the install's secret."""
@@ -408,7 +450,6 @@ class Final(unittest.TestCase):
         h._clients["logs@None"] = self.logs
         h._clients["secretsmanager@None"] = self.sm
         h._clients["acm@us-east-1"] = FakeAcm()
-        h._clients["route53@None"] = object()
 
     def tearDown(self):
         h._clients.clear()

@@ -41,12 +41,8 @@ The smallest config:
   null: CloudFront's own `*.cloudfront.net` URL.
 - **`domain.hostname`** *string*\
   The hostname people open, e.g. `coderhelm.example.com`.
-- **`domain.hostedZone`** *string*\
-  Its Route 53 public hosted zone. The certificate and DNS records are created for you.
-- **`domain.hostedZoneId`** *string*\
-  Skips the zone lookup at synth.
-- **`domain.certificateArn`** *string*\
-  An ACM certificate **in us-east-1** for the hostname, when your DNS is not in Route 53. The deploy prints the CNAME to create.
+- **`domain.certificateArn`** *string, required with a domain*\
+  An ACM certificate **in us-east-1** for the hostname. The deploy prints the CNAME to create. CoderHelm never changes your DNS, so `domain.hostedZone` and `domain.hostedZoneId` are refused on a self-hosted install.
 
 See [Domains](./domains.md).
 

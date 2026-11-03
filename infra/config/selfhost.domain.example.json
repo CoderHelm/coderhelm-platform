@@ -4,7 +4,7 @@
   "stage": "prod",
   "domain": {
     "hostname": "coderhelm.example.com",
-    "hostedZone": "example.com"
+    "certificateArn": "arn:aws:acm:us-east-1:123456789012:certificate/00000000-0000-0000-0000-000000000000"
   },
   "models": {
     "provider": "bedrock",
@@ -14,9 +14,13 @@
     "from": "coderhelm@example.com",
     "identity": "example.com"
   },
-  "admins": ["you@example.com"],
+  "admins": [
+    "you@example.com"
+  ],
   "signup": {
-    "domains": ["example.com"]
+    "domains": [
+      "example.com"
+    ]
   },
   "integrations": {
     "googleSignIn": true

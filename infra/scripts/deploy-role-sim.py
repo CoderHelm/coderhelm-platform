@@ -67,11 +67,10 @@ const STUBS = fs.mkdtempSync(path.join(os.tmpdir(), "chsim-"));
 for (const d of ["gateway", "worker", "mcp"]) { fs.mkdirSync(path.join(STUBS, d), { recursive: true }); fs.writeFileSync(path.join(STUBS, d, d === "mcp" ? "handler.js" : "bootstrap"), "stub"); }
 process.env.GATEWAY_ZIP = path.join(STUBS, "gateway"); process.env.WORKER_ZIP = path.join(STUBS, "worker"); process.env.MCP_PROXY_DIR = path.join(STUBS, "mcp");
 delete process.env.MODEL_ID; delete process.env.LIGHT_MODEL_ID;
-const zone = { [`hosted-zone:account=${ACCT}:domainName=example.org:region=${REG}`]: { Id: "/hostedzone/ZTEST000001", Name: "example.org." } };
 const base = { access: { mode: "hardened", owner: "launch", id: ID }, account: ACCT, region: REG, stage: "prod", email: { from: "coderhelm@example.org" }, admins: ["owner@example.org"] };
 const cfgs = {
   "no domain": [base, {}],
-  "domain and Bedrock": [{ ...base, domain: { hostname: "helm.example.org", hostedZone: "example.org" }, models: { provider: "bedrock" }, email: { from: "helm@example.org" }, integrations: { googleSignIn: true } }, zone],
+  "domain and Bedrock": [{ ...base, domain: { hostname: "helm.example.org", certificateArn: `arn:aws:acm:us-east-1:${ACCT}:certificate/0f0e0d0c-1111-2222-3333-444455556666` }, models: { provider: "bedrock" }, email: { from: "helm@example.org" }, integrations: { googleSignIn: true } }, {}],
 };
 const out = { templates: {} };
 for (const [k, [c, ctx]] of Object.entries(cfgs)) {
@@ -657,8 +656,8 @@ for (const d of ["gateway", "worker", "mcp"]) { fs.mkdirSync(path.join(STUBS, d)
 fs.mkdirSync(path.join(STUBS, "dash"), { recursive: true }); fs.writeFileSync(path.join(STUBS, "dash", "index.html"), "x");
 process.env.GATEWAY_ZIP = path.join(STUBS, "gateway"); process.env.WORKER_ZIP = path.join(STUBS, "worker"); process.env.MCP_PROXY_DIR = path.join(STUBS, "mcp");
 const rel = buildNative("v0.0.0", fs.mkdtempSync(path.join(os.tmpdir(), "chsimrel-")), { dashboardDir: path.join(STUBS, "dash") });
-// The sender address and a domain zone, as the boundary and the auto-update role name them.
-const values = { ...prodValues(ACCT, REG), DomainZoneId: "Z0123456789EXAMPLE" };
+// The sender address, as the boundary and the auto-update role name it. No zone id: CoderHelm never changes DNS.
+const values = { ...prodValues(ACCT, REG), DomainZoneId: "" };
 values.EmailIdentity = values.EmailFromResolved;
 const stackOf = (part) => "coderhelm-prod-" + part.replace(/([a-z])([A-Z])/g, "$1-$2").toLowerCase();
 const imports = {};
@@ -677,7 +676,7 @@ for (const [part, t] of Object.entries(rel.children)) {
 }
 // The parent's own roles and policies, as one more part.
 out.templates.native["coderhelm-prod"] = { template: resolveValue({ Resources: Object.fromEntries(Object.entries(rel.parent.Resources).filter(([, r]) => r.Type.startsWith("AWS::"))) }, { values }), tags: {} };
-const n = { ...accessNames({ account: ACCT, region: REG, prefix: "coderhelm-prod", suffix: "-" + ACCT, secretName: "coderhelm/prod/secrets", id: "stack" }), emailIdentity: values.EmailIdentity, zoneId: values.DomainZoneId };
+const n = { ...accessNames({ account: ACCT, region: REG, prefix: "coderhelm-prod", suffix: "-" + ACCT, secretName: "coderhelm/prod/secrets", id: "stack" }), emailIdentity: values.EmailIdentity };
 out.names = n;
 out.deploy = resolveValue(deployRolePolicy(nativeNames()).Statement.map((s) => JSON.parse(JSON.stringify(s).replace(/"([^"]*\$\{[^"]*)"/g, (m, x) => JSON.stringify({ "Fn::Sub": x })))), { values });
 out.deploy = { Version: "2012-10-17", Statement: out.deploy };

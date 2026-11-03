@@ -33,8 +33,7 @@ Optional emails stay off until an install admin turns them on in **Settings, Ema
 
 The deploy creates an SES identity for `email.identity` (by default the domain of `email.from`):
 
-- **A domain in the same Route 53 zone as your CoderHelm domain:** its DKIM records are created for you, and it verifies in a few minutes.
-- **Any other domain:** SES shows three DKIM CNAME records in the console (**SES, Identities, your domain**). Add them at your DNS provider.
+- **A domain:** SES shows three DKIM CNAME records in the console (**SES, Identities, your domain**). Add them where its DNS is hosted (Route 53 included): CoderHelm never changes your DNS.
 - **One address** (`"identity": "coderhelm@example.com"`): SES emails it a confirmation link. Good for trying CoderHelm out.
 - **null:** you manage the identity yourself.
 

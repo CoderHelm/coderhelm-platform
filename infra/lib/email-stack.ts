@@ -3,7 +3,6 @@ import * as ses from "aws-cdk-lib/aws-ses";
 import * as events from "aws-cdk-lib/aws-events";
 import * as iam from "aws-cdk-lib/aws-iam";
 import * as lambda from "aws-cdk-lib/aws-lambda";
-import * as route53 from "aws-cdk-lib/aws-route53";
 import { Construct } from "constructs";
 import { ResolvedConfig } from "./config";
 
@@ -71,27 +70,17 @@ export class EmailStack extends cdk.Stack {
       });
     }
 
-    // SES email identity: a domain (its DKIM records are created for you
-    // when it is the single-origin domain's Route 53 zone; otherwise add the
-    // three CNAMEs SES shows) or one address (SES emails it a confirmation
+    // SES email identity: a domain (add the three DKIM CNAMEs SES shows;
+    // CoderHelm never changes DNS) or one address (SES emails it a confirmation
     // link). null: the identity is managed elsewhere.
     const identity = cfg.email.identity;
     if (identity) {
-      const zoneName = cfg.singleOrigin?.hostedZone;
       let sesIdentity: ses.Identity;
       if (cfg.native) {
         // A native release: the sender is a launch parameter (an address).
         sesIdentity = ses.Identity.email(identity);
       } else if (identity.includes("@")) {
         sesIdentity = ses.Identity.email(identity);
-      } else if (zoneName && identity === zoneName) {
-        const zone = cfg.singleOrigin?.hostedZoneId
-          ? route53.PublicHostedZone.fromPublicHostedZoneAttributes(this, "EmailZone", {
-              zoneName,
-              hostedZoneId: cfg.singleOrigin.hostedZoneId,
-            })
-          : route53.PublicHostedZone.fromLookup(this, "EmailZone", { domainName: zoneName });
-        sesIdentity = ses.Identity.publicHostedZone(zone as route53.IPublicHostedZone);
       } else {
         sesIdentity = ses.Identity.domain(identity);
       }

@@ -48,9 +48,9 @@ Commands
                 Without --yes it stops at the checked change set
   telemetry     on | off | status: anonymous install and upgrade pings (off by default)
   domain apply  Put your own domain on the install (--hostname, --certificate-arn
-                in us-east-1, and --zone/--zone-id for a Route 53 zone), or
-                --action remove for the AWS address. Settings, then System
-                does all of it with checks and the DNS records to add
+                in us-east-1), or --action remove for the AWS address.
+                CoderHelm never changes DNS: Settings, then System shows the
+                records to add, with checks
   access        status | harden: how this install deploys. "harden" (an
                 admin, once) moves it onto its own permissions boundary and
                 deploy role, so updates get deploy rights only while they run

@@ -19,11 +19,8 @@ Actions (the `action` field of the event):
             GitHub App, from the install guide): restart the services that
             read it at start, by stamping SECRETS_REVISION on each.
 - domain_set     use your own domain: requests its certificate (ACM, us-east-1,
-            DNS validation). Writes nothing to DNS: the records to add are
-            shown, and a matching Route 53 zone in this account is offered.
-- domain_use_route53  an admin's confirmation, naming the zone: adds the
-            validation CNAME there (CREATE only; a record already there
-            stops it) and lets the move add the domain's A/AAAA alias.
+            DNS validation). CoderHelm never changes DNS: the page shows the
+            two records for the admin to add wherever the domain's DNS is.
 - domain_status  the domain's state, its certificate and the DNS records to
             add, and moves it along: once the certificate is issued it starts
             the build that puts the domain on CloudFront (mode "domain").
@@ -862,7 +859,7 @@ def refresh_functions(lam, names, revision, sleep=time.sleep, tries=5):
 # ── Your own domain ───────────────────────────────────────────────────────
 #
 # One record on the settings table (pk SYSTEM, sk DOMAIN):
-#   {hostname, zone, zone_id, certificate_arn, state, reason, requested_at,
+#   {hostname, certificate_arn, state, reason, requested_at,
 #    actor, history_id}
 # state: validating (the certificate waits for its DNS record), attaching
 # (the build puts the domain on CloudFront), live, failed, removing.
@@ -882,30 +879,6 @@ def clean_hostname(raw):
     if h.endswith(".cloudfront.net") or h.endswith(".amazonaws.com"):
         raise ValueError("enter a domain you own, not an AWS address")
     return h
-
-
-def find_zone(zones, hostname):
-    """The public Route 53 zone in this account the hostname belongs to (longest match), or None."""
-    best = None
-    for z in zones or []:
-        name = str(z.get("Name") or "").rstrip(".").lower()
-        if not name or (z.get("Config") or {}).get("PrivateZone"):
-            continue
-        if hostname == name or hostname.endswith("." + name):
-            if best is None or len(name) > len(best["name"]):
-                best = {"name": name, "id": str(z.get("Id") or "").replace("/hostedzone/", "")}
-    return best
-
-
-def list_zones(r53):
-    zones, marker = [], None
-    while True:
-        kw = {"Marker": marker} if marker else {}
-        r = r53.list_hosted_zones(**kw)
-        zones.extend(r.get("HostedZones") or [])
-        if not r.get("IsTruncated"):
-            return zones
-        marker = r.get("NextMarker")
 
 
 def validation_record(cert):
@@ -939,39 +912,28 @@ def distribution_domain(env, ssm=None):
         return None
 
 
-def zone_name_servers(zone_id, r53=None):
-    if not zone_id:
-        return []
-    try:
-        ds = (r53 or client("route53")).get_hosted_zone(Id=zone_id).get("DelegationSet") or {}
-        return [n.rstrip(".").lower() for n in ds.get("NameServers") or []]
-    except Exception as e:
-        logger.warning(f"Could not read the zone's name servers: {e}")
-        return []
-
-
 def current_hostname(env):
     """The hostname the install answers on now (APP_URL), and whether it is CloudFront's own."""
     host = re.sub(r"^https?://", "", app_url(env)).split("/")[0].lower()
     return host, host.endswith(".cloudfront.net") or not host
 
 
-def domain_view(dom, cert, target, name_servers, env):
-    """What the dashboard, the guide and the gateway's checks see. No account ids."""
+def domain_view(dom, cert, target, env):
+    """What the dashboard, the guide and the gateway's checks see. No account ids.
+    CoderHelm never changes DNS: until the domain is live the view carries the
+    two records for the admin to add, wherever the domain's DNS is hosted."""
     host, on_aws = current_hostname(env)
     if not dom or not dom.get("hostname"):
         if on_aws:
             return {"hostname": None, "state": "none", "mode": None, "current": host or None, "target": target, "records": []}
-        # A domain from the config (the Launch Stack with a Route 53 zone, or the CLI).
+        # A domain from the config (the Launch Stack's hostname with its certificate, or the CLI).
         return {"hostname": host, "state": "live", "mode": "config", "current": host, "target": target, "records": []}
-    route53 = bool(dom.get("zone"))
     v = validation_record(cert)
     records = []
-    if not route53:
-        if v:
-            records.append({"purpose": "certificate", **v})
-        if target:
-            records.append({"purpose": "address", "name": dom["hostname"], "type": "CNAME", "value": target})
+    if v:
+        records.append({"purpose": "certificate", **v})
+    if target:
+        records.append({"purpose": "address", "name": dom["hostname"], "type": "CNAME", "value": target})
     c = None
     if cert:
         c = {"status": cert.get("Status"), "failure_reason": cert.get("FailureReason"), "validation": v,
@@ -980,16 +942,7 @@ def domain_view(dom, cert, target, name_servers, env):
         "hostname": dom["hostname"],
         "state": dom.get("state") or "validating",
         "reason": dom.get("reason") or "",
-        "mode": "route53" if route53 else "external",
-        "zone": dom.get("zone"),
-        # A public zone here that could hold the records, added only on an
-        # admin's confirmation (domain_use_route53).
-        "route53_offer": None if route53 or dom.get("state") != "validating" else (
-            {"zone": dom["offer_zone"], "records": [
-                *([{"purpose": "certificate", **v}] if v else []),
-                {"purpose": "address", "name": dom["hostname"], "type": "A and AAAA (alias)", "value": target},
-            ]} if dom.get("offer_zone") else None),
-        "name_servers": name_servers,
+        "mode": "external",
         "current": host or None,
         "target": target,
         "certificate": c,
@@ -1003,8 +956,9 @@ def domain_build_env(dom, action):
         "DOMAIN_ACTION": action,
         "DOMAIN_HOSTNAME": dom.get("hostname") or "",
         "DOMAIN_CERT": dom.get("certificate_arn") or "",
-        "DOMAIN_ZONE": dom.get("zone") or "",
-        "DOMAIN_ZONE_ID": dom.get("zone_id") or "",
+        # CoderHelm never changes DNS: the move adds no records (kept empty for the build's flags).
+        "DOMAIN_ZONE": "",
+        "DOMAIN_ZONE_ID": "",
     }
 
 
@@ -1030,8 +984,7 @@ def domain_status(store, env, now):
     dom = store.get("DOMAIN") or None
     cert = describe_certificate(dom.get("certificate_arn")) if dom else None
     dom = advance(store, env, now, dom, cert)
-    ns = zone_name_servers(dom.get("zone_id")) if dom and dom.get("zone") else []
-    return domain_view(dom, cert, distribution_domain(env), ns, env)
+    return domain_view(dom, cert, distribution_domain(env), env)
 
 
 def domain_set(store, env, now, raw, actor, sleep=time.sleep):
@@ -1042,10 +995,7 @@ def domain_set(store, env, now, raw, actor, sleep=time.sleep):
     host, _ = current_hostname(env)
     if hostname == host:
         raise ValueError(f"CoderHelm already answers on {hostname}")
-    # Nothing is written to DNS here. A matching public Route 53 zone in this
-    # account is only offered: an admin adds the records there by confirming
-    # the zone and the exact records (domain_use_route53).
-    zone = find_zone(list_zones(client("route53")), hostname)
+    # CoderHelm never changes DNS: the admin adds the two records the page shows.
     acm = client("acm", ACM_REGION)
     token = re.sub(r"[^a-z0-9]", "", hostname)[:24] or "coderhelm"
     if dom.get("hostname") == hostname and dom.get("state") == "failed":
@@ -1062,62 +1012,12 @@ def domain_set(store, env, now, raw, actor, sleep=time.sleep):
             break
         sleep(2)
     dom = {
-        "hostname": hostname, "zone": None, "zone_id": None, "offer_zone": zone["name"] if zone else None,
+        "hostname": hostname,
         "certificate_arn": arn, "state": "validating", "reason": "", "requested_at": now.isoformat(), "actor": actor,
     }
     store.put("DOMAIN", dom)
     dom = advance(store, env, now, dom, cert)
-    return domain_view(dom, cert, distribution_domain(env), [], env)
-
-
-def zone_records(r53, zone_id, name):
-    """The record sets named exactly `name` in the zone (any type)."""
-    want = name.rstrip(".").lower() + "."
-    r = r53.list_resource_record_sets(HostedZoneId=zone_id, StartRecordName=want, MaxItems="10")
-    return [x for x in r.get("ResourceRecordSets") or [] if str(x.get("Name") or "").lower() == want]
-
-
-def domain_use_route53(store, env, now, zone_name, actor):
-    """An admin's explicit go-ahead to add this domain's records to the Route 53
-    zone named here: the certificate's validation CNAME now, and the domain's
-    A/AAAA alias at the move (CloudFormation, CREATE). Only CREATE: a record
-    already there under either name stops it, so nothing anyone added is ever
-    overwritten or deleted."""
-    dom = store.get("DOMAIN") or {}
-    if dom.get("state") != "validating" or not dom.get("hostname"):
-        raise ValueError("start with the domain's address, then add its records")
-    if dom.get("zone"):
-        raise ValueError(f"the records are already being added to {dom['zone']}")
-    hostname = dom["hostname"]
-    zone = find_zone(list_zones(client("route53")), hostname)
-    named = str(zone_name or "").strip().lower().rstrip(".")
-    if not zone or zone["name"] != named or dom.get("offer_zone") != named:
-        raise ValueError("that zone isn't the one this domain's records belong in; add the records yourself instead")
-    cert = describe_certificate(dom.get("certificate_arn"))
-    v = validation_record(cert)
-    if not v:
-        raise ValueError("AWS hasn't made the certificate's record yet; try again in a minute")
-    r53 = client("route53")
-    for existing in zone_records(r53, zone["id"], hostname):
-        raise ValueError(f"{hostname} already has a {existing.get('Type')} record in {zone['name']}: "
-                         "remove it, or add the records yourself")
-    have = zone_records(r53, zone["id"], v["name"])
-    same = [x for x in have if x.get("Type") == "CNAME"
-            and [str(r.get("Value") or "").rstrip(".").lower() for r in x.get("ResourceRecords") or []] == [v["value"]]]
-    if have and not same:
-        raise ValueError(f"{v['name']} already holds another record in {zone['name']}: remove it, or add the records yourself")
-    if not same:
-        r53.change_resource_record_sets(
-            HostedZoneId=zone["id"],
-            ChangeBatch={"Comment": f"CoderHelm certificate validation, added by {actor}", "Changes": [{
-                "Action": "CREATE",
-                "ResourceRecordSet": {"Name": v["name"] + ".", "Type": "CNAME", "TTL": 300, "ResourceRecords": [{"Value": v["value"] + "."}]},
-            }]},
-        )
-    dom = dict(dom, zone=zone["name"], zone_id=zone["id"], records_by=actor, records_at=now.isoformat())
-    store.put("DOMAIN", dom)
-    dom = advance(store, env, now, dom, cert)
-    return domain_view(dom, cert, distribution_domain(env), zone_name_servers(zone["id"]), env)
+    return domain_view(dom, cert, distribution_domain(env), env)
 
 
 def domain_remove(store, env, now, actor):
@@ -1130,12 +1030,12 @@ def domain_remove(store, env, now, actor):
             raise ValueError("CoderHelm already uses its AWS address")
         # Never attached: forget it (the certificate stays in ACM, unused and free).
         store.put("DOMAIN", {})
-        return domain_view(None, None, distribution_domain(env), [], env)
+        return domain_view(None, None, distribution_domain(env), env)
     entry = begin(store, env, now, env.get("CODERHELM_VERSION", ""), actor, "domain",
                   domain_build_env({"hostname": host}, "remove"), note="use the AWS address")
     dom = dict(dom or {"hostname": host}, state="removing", reason="", history_id=entry["id"])
     store.put("DOMAIN", dom)
-    return domain_view(dom, None, distribution_domain(env), [], env)
+    return domain_view(dom, None, distribution_domain(env), env)
 
 
 def domain_finished(store, env, now, entry, status):
@@ -2361,9 +2261,6 @@ def handle(event, env, store, now, fetch=fetch_releases, probe=None):
 
     if action == "domain_set":
         return domain_set(store, env, now, event.get("hostname"), event.get("actor") or DIRECT_ACTOR)
-
-    if action == "domain_use_route53":
-        return domain_use_route53(store, env, now, event.get("zone"), event.get("actor") or DIRECT_ACTOR)
 
     if action == "domain_remove":
         return domain_remove(store, env, now, event.get("actor") or DIRECT_ACTOR)

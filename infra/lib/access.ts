@@ -56,10 +56,6 @@ export interface AccessNames {
   accessStackName: string;
   /** The SES identity the install sends from: the only identity the deploy role may change (any when unset). */
   emailIdentity?: string;
-  /** The Route 53 zone of the install's own domain: the only zone where the deploy role may change records (any when unset). */
-  zoneId?: string;
-  /** A native install: its zone holds only its domain's A/AAAA alias, created and deleted by the stack. */
-  dnsAliasOnly?: boolean;
 }
 
 export function partitionOf(region: string): string {
@@ -203,7 +199,6 @@ export const BOUNDARY_SERVICES = [
   "kms:*",
   "lambda:*",
   "logs:*",
-  "route53:*",
   "s3:*",
   "scheduler:*",
   "secretsmanager:*",
@@ -223,6 +218,10 @@ export function guardrails(n: AccessNames, otherBoundaries: string[] = []): Stat
   const boundaries = n.boundaryArn.replace(/-boundary(-[a-z0-9]+)$/, "-*boundary$1");
   for (const o of otherBoundaries) if (!new RegExp(`^${boundaries.replace(/[.$^{}()|[\]\\+?]/g, "\\$&").replace(/\*/g, ".*")}$`).test(o)) throw new Error(`${o} is not covered by ${boundaries}`);
   return [
+    // CoderHelm never changes DNS in a customer's account: the records for a
+    // domain are shown for the admin to add. Denied here so no future grant
+    // can turn it back on.
+    { Sid: "NoDnsChanges", Effect: "Deny", Action: ["route53:ChangeResourceRecordSets", "route53:CreateHostedZone", "route53:DeleteHostedZone"], Resource: "*" },
     {
       Sid: "NoIamUsersOrKeys",
       Effect: "Deny",
@@ -471,15 +470,6 @@ export function deployPolicy(n: AccessNames): PolicyDocument {
     },
     { Sid: "CertificatesRequest", Effect: "Allow", Action: ["acm:RequestCertificate", "acm:AddTagsToCertificate"], Resource: "*", Condition: { StringEquals: { [`aws:RequestTag/${INSTALL_TAG}`]: p } } },
     { Sid: "Certificates", Effect: "Allow", Action: "acm:*", Resource: `arn:${n.partition}:acm:*:${n.account}:certificate/*`, Condition: tagged },
-    // Records only in the install's own domain's zone (a native install's DomainZoneId).
-    // A native install only ever creates or deletes its domain's A/AAAA alias
-    // (CloudFormation, CREATE fails on a record already there): nothing else in
-    // that zone, and never an UPSERT over a record someone added.
-    n.dnsAliasOnly
-      ? { Sid: "DnsRecords", Effect: "Allow", Action: "route53:ChangeResourceRecordSets", Resource: `arn:${n.partition}:route53:::hostedzone/${n.zoneId}`,
-          Condition: { "ForAllValues:StringEquals": { "route53:ChangeResourceRecordSetsRecordTypes": ["A", "AAAA"], "route53:ChangeResourceRecordSetsActions": ["CREATE", "DELETE"] } } }
-      : { Sid: "DnsRecords", Effect: "Allow", Action: ["route53:ChangeResourceRecordSets", "route53:GetChange"], Resource: [`arn:${n.partition}:route53:::hostedzone/${n.zoneId ?? "*"}`, `arn:${n.partition}:route53:::change/*`] },
-    ...(n.dnsAliasOnly ? [{ Sid: "DnsChanges", Effect: "Allow" as const, Action: "route53:GetChange", Resource: `arn:${n.partition}:route53:::change/*` }] : []),
     // The deploy role carries the boundary too, whose guardrails deny the rest.
     { Sid: "NoIamUsersOrKeys", Effect: "Deny", Action: ["iam:CreateUser", "iam:CreateAccessKey", "iam:CreateLoginProfile"], Resource: "*" },
     { Sid: "NoKeyDestruction", Effect: "Deny", Action: ["kms:ScheduleKeyDeletion", "kms:DisableKey", "kms:DeleteImportedKeyMaterial"], Resource: "*" },
@@ -490,7 +480,7 @@ export function deployPolicy(n: AccessNames): PolicyDocument {
         "cloudformation:Describe*", "cloudformation:Get*", "cloudformation:List*",
         "cloudfront:Get*", "cloudfront:List*", "cloudwatch:Describe*", "cloudwatch:Get*", "cloudwatch:List*",
         "cognito-idp:Describe*", "cognito-idp:List*", "dynamodb:Describe*", "dynamodb:List*", "events:Describe*", "events:List*",
-        "kms:List*", "lambda:Get*", "lambda:List*", "logs:Describe*", "logs:List*", "route53:Get*", "route53:List*",
+        "kms:List*", "lambda:Get*", "lambda:List*", "logs:Describe*", "logs:List*",
         "ses:Get*", "ses:List*", "ses:DescribeConfigurationSet", "sqs:List*", "sns:List*", "ssm:Describe*", "acm:Describe*", "acm:List*", "codebuild:List*",
         "scheduler:List*", "sts:GetCallerIdentity",
       ],
@@ -582,7 +572,7 @@ function windowStatements(n: AccessNames): Statement[] {
     s({
       Sid: "WindowLookups",
       Effect: "Allow",
-      Action: ["ses:GetAccount", "route53:ListHostedZones", "route53:ListHostedZonesByName", "route53:GetHostedZone"],
+      Action: "ses:GetAccount",
       Resource: "*",
     }),
     // The build role carries the boundary, whose guardrails deny the rest.

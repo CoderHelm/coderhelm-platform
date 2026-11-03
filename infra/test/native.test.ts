@@ -113,8 +113,9 @@ test("data follows KeepDataOnDelete, deletion protection too, keys wait 7 days",
         tables++;
         for (const rep of r.Properties.Replicas) if ("DeletionProtectionEnabled" in rep) assert.deepEqual(rep.DeletionProtectionEnabled, { "Fn::If": ["NativeKeepData", true, false] });
       }
-      // Nothing is plainly retained (every kept thing follows the switch).
-      assert.notEqual(r.DeletionPolicy, "Retain", `${name}.${id} is always retained`);
+      // Nothing is plainly retained (every kept thing follows the switch),
+      // except an older install's DNS alias records: CoderHelm never deletes DNS.
+      if (r.Type !== "AWS::Route53::RecordSet") assert.notEqual(r.DeletionPolicy, "Retain", `${name}.${id} is always retained`);
     }
   }
   assert.ok(tables >= 15, `only ${tables} tables`);
@@ -153,15 +154,14 @@ test("every role carries the boundary; the boundary is the parent's own", () => 
   assert.equal(P.Parameters.Stage.AllowedPattern, "^[a-z][a-z0-9]{0,19}$");
 });
 
-test("only the helper writes release files; its deletes reach only this install's certificate and check records", () => {
+test("only the helper writes release files; its deletes reach only this install's certificates, never DNS", () => {
   const bp = R.AssetsBucketPolicy.Properties.PolicyDocument.Statement[0];
   assert.equal(bp.Effect, "Deny");
   assert.deepEqual(bp.Condition, { ArnNotEquals: { "aws:PrincipalArn": { "Fn::GetAtt": ["HelperRole", "Arn"] } } });
   const doc = helperPolicy();
   const by = (sid: string) => doc.Statement.find((x) => x.Sid === sid)!;
   assert.deepEqual(by("CertificatesOnDelete").Condition, { StringEquals: { "aws:RequestedRegion": "us-east-1", "aws:ResourceTag/coderhelm": "coderhelm-${Stage}" } });
-  const r53 = by("ValidationRecordsOnDelete").Condition!;
-  assert.deepEqual(r53["ForAllValues:StringEquals"], { "route53:ChangeResourceRecordSetsActions": ["DELETE"], "route53:ChangeResourceRecordSetsRecordTypes": ["CNAME"] });
+  assert.ok(!JSON.stringify(doc).includes("route53:"), "the helper has no Route 53 access");
   assert.deepEqual(by("StatusFile").Resource, ["arn:${AWS::Partition}:s3:::coderhelm-setup-${StatusId}", "arn:${AWS::Partition}:s3:::coderhelm-setup-${StatusId}/*"]);
 });
 

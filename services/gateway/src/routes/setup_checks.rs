@@ -861,8 +861,6 @@ pub struct DnsAnswers {
     pub apex: bool,
     /// The closest CAA record set above the hostname (None: none found).
     pub caa: Option<Vec<String>>,
-    /// The zone's name servers, as public DNS answers (Route 53 zones).
-    pub zone_ns: Option<Vec<String>>,
 }
 
 /// Everything the domain checks decide from.
@@ -873,7 +871,7 @@ pub struct DomainFacts {
     pub hostname: Option<String>,
     /// none, validating, attaching, live, failed, removing.
     pub state: String,
-    /// route53, external or config.
+    /// external (the admin adds the records) or config.
     pub mode: String,
     pub reason: String,
     /// CloudFront's own hostname, the value of the address record.
@@ -883,9 +881,6 @@ pub struct DomainFacts {
     pub cert_status: Option<String>,
     pub cert_failure: Option<String>,
     pub validation: Option<DnsRecord>,
-    /// The Route 53 zone's own name servers.
-    pub name_servers: Vec<String>,
-    pub zone: Option<String>,
     pub records: Vec<DnsRecord>,
     pub dns: DnsAnswers,
     /// GET https://<hostname>/ answered this.
@@ -924,11 +919,6 @@ pub fn domain_facts_from(v: Option<&Value>) -> DomainFacts {
         validation: cert["validation"]
             .is_object()
             .then(|| rec(&cert["validation"])),
-        name_servers: v["name_servers"]
-            .as_array()
-            .map(|a| a.iter().filter_map(Value::as_str).map(norm).collect())
-            .unwrap_or_default(),
-        zone: s("zone"),
         records: v["records"]
             .as_array()
             .map(|a| a.iter().map(rec).collect())
@@ -959,16 +949,6 @@ pub fn caa_allows_amazon(records: &[String]) -> bool {
         })
         .collect();
     issuers.is_empty() || issuers.iter().any(|i| AMAZON_CAA.contains(&i.as_str()))
-}
-
-fn same_set(a: &[String], b: &[String]) -> bool {
-    let mut x: Vec<String> = a.iter().map(|s| norm(s)).collect();
-    let mut y: Vec<String> = b.iter().map(|s| norm(s)).collect();
-    x.sort();
-    x.dedup();
-    y.sort();
-    y.dedup();
-    !x.is_empty() && x == y
 }
 
 /// The decision: (status, code). The guide, the dashboard and the doctor
@@ -1004,14 +984,6 @@ pub fn domain_code(f: &DomainFacts) -> (&'static str, &'static str) {
             if caa_blocks {
                 return ("fail", "caa_blocked");
             }
-            if f.mode == "route53" {
-                if let Some(public) = dns.zone_ns.as_deref() {
-                    if !f.name_servers.is_empty() && !same_set(public, &f.name_servers) {
-                        return ("fail", "zone_not_delegated");
-                    }
-                }
-                return ("wait", "validating");
-            }
             if let (Some(found), Some(want)) =
                 (dns.validation_cname.as_deref(), f.validation.as_ref())
             {
@@ -1032,7 +1004,7 @@ pub fn domain_code(f: &DomainFacts) -> (&'static str, &'static str) {
         .and_then(|c| c.first())
         .map(|c| norm(c));
     if let (Some(c), Some(t)) = (cname.as_deref(), f.target.as_deref()) {
-        if c != t && f.mode != "route53" {
+        if c != t {
             return ("fail", "dns_wrong_value");
         }
     }
@@ -1041,7 +1013,7 @@ pub fn domain_code(f: &DomainFacts) -> (&'static str, &'static str) {
     match f.https {
         Some(200..=399) => {}
         _ if asked && !resolves => {
-            return if dns.apex && f.mode != "route53" {
+            return if dns.apex {
                 ("fail", "cname_at_apex")
             } else {
                 ("wait", "dns_missing")
@@ -1106,13 +1078,8 @@ pub fn domain(f: &DomainFacts) -> Check {
                 f.current.as_deref().map(|c| format!(" {c}")).unwrap_or_default()
             ),
             "A domain of your own is easier to remember and share, and Google sign-in needs one.",
-            Fix::text("Add it in Settings, then System. With Route 53 in this account it is set up for you; otherwise you add two DNS records.")
+            Fix::text("Add it in Settings, then System, then add the two DNS records it shows where your domain's DNS is hosted.")
                 .href(page),
-        ),
-        "validating" if f.mode == "route53" => check(
-            format!("The certificate for {host} is waiting for its DNS check; the record is in your Route 53 zone."),
-            "CloudFront needs the certificate before it can answer on your domain.",
-            Fix::text("Nothing to do: AWS usually issues it within 30 minutes, then CoderHelm moves to the domain by itself.").href(page),
         ),
         "validating" => {
             let mut fix = Fix::text("Add these DNS records where your domain's DNS is hosted. AWS checks every few minutes; new records can take up to an hour to show up.")
@@ -1121,19 +1088,6 @@ pub fn domain(f: &DomainFacts) -> Check {
             check(
                 format!("The certificate for {host} is waiting for its DNS record."),
                 "CloudFront needs the certificate before it can answer on your domain.",
-                fix,
-            )
-        }
-        "zone_not_delegated" => {
-            let mut fix = Fix::text(format!(
-                "At the registrar where you bought {}, set the name servers to the ones below. The change can take up to a day.",
-                f.zone.as_deref().unwrap_or(&host)
-            ))
-            .href(page);
-            fix.command = Some(f.name_servers.join("\n"));
-            check(
-                format!("Public DNS doesn't use the Route 53 zone {} yet.", f.zone.as_deref().unwrap_or("")),
-                "Nothing in the zone is seen until the registrar points at it, so the certificate can't be checked.",
                 fix,
             )
         }
@@ -1153,7 +1107,7 @@ pub fn domain(f: &DomainFacts) -> Check {
             "Without a certificate CloudFront can't answer on your domain.",
             {
                 let mut fix = Fix::text("Add this CAA record next to the ones you have, then press Try again in Settings, then System.").href(page);
-                fix.command = Some(format!("{}  CAA  0 issue \"amazon.com\"", f.zone.as_deref().unwrap_or(&host)));
+                fix.command = Some(format!("{host}  CAA  0 issue \"amazon.com\""));
                 fix
             },
         ),
@@ -1908,8 +1862,7 @@ pub async fn domain_facts_now(state: &AppState) -> (DomainFacts, Option<Value>) 
     match f.state.as_str() {
         "validating" => {
             let v_name = f.validation.as_ref().map(|v| v.name.clone());
-            let zone = f.zone.clone();
-            let (vc, caa, ns) = tokio::join!(
+            let (vc, caa) = tokio::join!(
                 async {
                     match v_name {
                         Some(n) => doh(state, &n, 5).await.map(|(d, _)| d),
@@ -1917,16 +1870,9 @@ pub async fn domain_facts_now(state: &AppState) -> (DomainFacts, Option<Value>) 
                     }
                 },
                 closest_caa(state, &host),
-                async {
-                    match zone {
-                        Some(z) => doh(state, &z, 2).await.map(|(d, _)| d),
-                        None => None,
-                    }
-                },
             );
             f.dns.validation_cname = vc;
             f.dns.caa = caa;
-            f.dns.zone_ns = ns;
         }
         "failed" => {
             f.dns.caa = closest_caa(state, &host).await;
@@ -3219,27 +3165,6 @@ mod tests {
     }
 
     #[test]
-    fn a_route53_zone_public_dns_does_not_use_says_so() {
-        let mut f = ext("validating");
-        f.mode = "route53".into();
-        f.zone = Some("example.org".into());
-        f.name_servers = vec!["ns-1.awsdns-01.org".into(), "ns-2.awsdns-02.com".into()];
-        f.dns.zone_ns = Some(vec![
-            "ns-2.awsdns-02.com.".into(),
-            "NS-1.awsdns-01.org.".into(),
-        ]);
-        assert_eq!(domain_code(&f), ("wait", "validating"));
-        f.dns.zone_ns = Some(vec!["dns1.registrar.example".into()]);
-        assert_eq!(domain_code(&f), ("fail", "zone_not_delegated"));
-        assert!(domain(&f)
-            .fix
-            .unwrap()
-            .command
-            .unwrap()
-            .contains("ns-1.awsdns-01.org"));
-    }
-
-    #[test]
     fn failures_name_their_cause() {
         let mut f = ext("failed");
         f.cert_status = Some("FAILED".into());
@@ -3289,7 +3214,7 @@ mod tests {
         f.dns.host_a = Some(vec!["198.51.100.7".into()]);
         assert_eq!(domain_code(&f), ("fail", "https_failed"));
         assert!(domain(&f).fix.unwrap().text.contains("DNS only"));
-        // A domain from the config (Route 53 aliases, no CNAME) only needs HTTPS and the API.
+        // A domain from the config (an older install's alias records, no CNAME) only needs HTTPS and the API.
         let mut cfg = ext("live");
         cfg.mode = "config".into();
         cfg.dns.host_a = Some(vec!["192.0.2.1".into()]);

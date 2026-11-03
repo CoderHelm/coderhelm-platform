@@ -113,32 +113,6 @@ test("CDK bootstrap: present passes, missing offers to run it, a failed stack sa
 
 // ── Domain and DNS ──────────────────────────────────────────────────────
 
-test("hosted zone and NS delegation: expected and current name servers are both shown", async () => {
-  const ns = ["ns-1.awsdns-01.org", "ns-2.awsdns-02.co.uk", "ns-3.awsdns-03.com", "ns-4.awsdns-04.net"];
-  const answers = {
-    "list-hosted-zones-by-name": { HostedZones: [{ Name: "example.org.", Id: "/hostedzone/Z123", Config: { PrivateZone: false } }] },
-    "get-hosted-zone": { DelegationSet: { NameServers: ns } },
-  };
-  const c = ctx(answers, { dns: { resolveNs: async () => ns.map((n) => n.toUpperCase() + ".") } });
-  const z = await C.checkHostedZone(c, "example.org");
-  assert.equal(z.result.status, C.PASS);
-  assert.equal((await C.checkDelegation(c, "example.org", z.zoneId)).status, C.PASS, "case and trailing dots don't matter");
-
-  const wrong = ctx(answers, { dns: { resolveNs: async () => ["dns1.registrar.example", "dns2.registrar.example"] } });
-  const r = await C.checkDelegation(wrong, "example.org", "/hostedzone/Z123");
-  assertExplained(r);
-  assert.match(r.what, /dns1\.registrar\.example/);
-  assert.match(r.fix.command, /example\.org\. NS ns-1\.awsdns-01\.org\./);
-  assert.equal(r.fix.command.split("\n").length, 4);
-
-  const none = ctx(answers, { dns: { resolveNs: async () => { throw Object.assign(new Error("queryNs ENOTFOUND"), { code: "ENOTFOUND" }); } } });
-  assert.match((await C.checkDelegation(none, "example.org", "/hostedzone/Z123")).what, /no name servers/);
-
-  const missing = await C.checkHostedZone(ctx({ "list-hosted-zones-by-name": { HostedZones: [{ Name: "other.org.", Id: "/hostedzone/Z9" }] } }), "example.org");
-  assertExplained(missing.result);
-  assert.match(missing.result.fix.command, /create-hosted-zone --name example\.org/);
-});
-
 test("certificate: region, name, pending validation with its records, issued", async () => {
   const arn = `arn:aws:acm:us-east-1:${ACCOUNT}:certificate/abc-123`;
   assertExplained(await C.checkCertificate(ctx(), `arn:aws:acm:eu-west-1:${ACCOUNT}:certificate/x`, "helm.example.org"));
@@ -162,7 +136,7 @@ test("SES: unverified domain shows the DKIM records; the sandbox is a warning wi
   assert.equal(r.fix.command, ["t1", "t2", "t3"].map((t) => `${t}._domainkey.example.org CNAME ${t}.dkim.amazonses.com`).join("\n"));
   const good = ctx({ "get-email-identity": { VerifiedForSendingStatus: true, DkimAttributes: { Status: "SUCCESS" } } });
   assert.equal((await C.checkSesIdentity(good, "helm@example.org", "eu-west-1")).status, C.PASS);
-  assert.equal((await C.checkSesIdentity(ctx(), "helm@example.org", "eu-west-1", { zone: "example.org" })).status, C.PASS, "the deploy verifies a Route 53 zone");
+  assert.equal((await C.checkSesIdentity(ctx(), "helm@example.org", "eu-west-1")).status, C.WARN, "never verified for you: CoderHelm doesn't add DNS records");
   assert.equal((await C.checkSesIdentity(ctx(), "helm@other.org", "eu-west-1")).status, C.WARN);
   const sandbox = await C.checkSesSandbox(ctx({ "sesv2 get-account": { ProductionAccessEnabled: false } }), "eu-west-1");
   assertExplained(sandbox, C.WARN);

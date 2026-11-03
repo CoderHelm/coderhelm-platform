@@ -641,23 +641,10 @@ class FakeAcm:
         return {"Certificate": c}
 
 
-class FakeRoute53:
-    def __init__(self, zones):
-        self.zones = zones
-        self.changes = []
-        self.records = []
-
-    def list_resource_record_sets(self, HostedZoneId, StartRecordName, MaxItems):
-        return {"ResourceRecordSets": [r for r in self.records if r["Name"] >= StartRecordName]}
-
-    def list_hosted_zones(self, **kw):
-        return {"HostedZones": self.zones, "IsTruncated": False}
-
-    def change_resource_record_sets(self, HostedZoneId, ChangeBatch):
-        self.changes.append((HostedZoneId, ChangeBatch))
-
-    def get_hosted_zone(self, Id):
-        return {"DelegationSet": {"NameServers": ["ns-1.awsdns-01.org.", "ns-2.awsdns-02.com."]}}
+class NoRoute53:
+    """CoderHelm never changes DNS: any Route 53 call fails the test."""
+    def __getattr__(self, name):
+        raise AssertionError(f"route53.{name} called: CoderHelm never touches DNS")
 
 
 class FakeSsm:
@@ -674,8 +661,7 @@ class Domain(unittest.TestCase):
         u.start_build = lambda env, version, actor, mode, hid, extra=None: self.builds.append((version, actor, mode, extra)) or "b-1"
         u.notify = lambda subject, text, env=None, **kw: self.notices.append(subject) or 1
         self.acm = FakeAcm()
-        self.r53 = FakeRoute53([])
-        u._clients.update({"acm@us-east-1": self.acm, "route53": self.r53, "ssm": FakeSsm()})
+        u._clients.update({"acm@us-east-1": self.acm, "route53": NoRoute53(), "ssm": FakeSsm()})
         self.env = {"CODERHELM_VERSION": "v1.2.0", "APP_URL": "https://d111test.cloudfront.net", "UPDATE_PROJECT_NAME": "p",
                     "DISTRIBUTION_DOMAIN_PARAMETER": "/coderhelm-prod/distribution-domain", "RESOURCE_PREFIX": "coderhelm-prod"}
 
@@ -692,17 +678,6 @@ class Domain(unittest.TestCase):
         for bad in ("", "localhost", "helm", "-x.example.org", "d111.cloudfront.net", "a b.example.org"):
             with self.assertRaises(ValueError, msg=bad):
                 u.clean_hostname(bad)
-
-    def test_the_longest_public_zone_wins_and_private_zones_never_do(self):
-        zones = [
-            {"Id": "/hostedzone/ZROOT", "Name": "example.org.", "Config": {"PrivateZone": False}},
-            {"Id": "/hostedzone/ZSUB", "Name": "dev.example.org.", "Config": {"PrivateZone": False}},
-            {"Id": "/hostedzone/ZPRIV", "Name": "helm.dev.example.org.", "Config": {"PrivateZone": True}},
-        ]
-        self.assertEqual(u.find_zone(zones, "helm.dev.example.org"), {"name": "dev.example.org", "id": "ZSUB"})
-        self.assertEqual(u.find_zone(zones, "example.org")["id"], "ZROOT")
-        self.assertIsNone(u.find_zone(zones, "helm.example.net"))
-        self.assertIsNone(u.find_zone(zones, "badexample.org"))
 
     def test_no_domain_reports_the_aws_address(self):
         v = self.h({"action": "domain_status"})
@@ -738,64 +713,18 @@ class Domain(unittest.TestCase):
         self.assertEqual(self.notices[-1], "now answers on helm.example.org")
         self.assertNotIn("failed_versions", self.store.get("UPDATE_STATE"))
 
-    def route53_zone(self):
-        self.r53.zones = [{"Id": "/hostedzone/ZTEST1", "Name": "example.org.", "Config": {"PrivateZone": False}}]
-
-    def test_a_route53_zone_is_only_offered_nothing_is_written_until_an_admin_confirms(self):
-        self.route53_zone()
-        self.acm.ready_after = 2
+    def test_dns_is_never_touched_and_the_two_records_are_always_shown(self):
+        # Route 53 is a tripwire here: setting the domain, checking it and the
+        # move after the certificate is issued never call it.
         v = u.domain_set(self.store, self.env, SUNDAY_3AM, "helm.example.org", "a", sleep=lambda s: None)
-        self.assertEqual(self.r53.changes, [])
-        self.assertEqual((v["mode"], v["zone"]), ("external", None))
-        self.assertEqual(v["route53_offer"]["zone"], "example.org")
-        self.assertEqual([r["name"] for r in v["route53_offer"]["records"]], ["_a1b2.helm.example.org", "helm.example.org"])
+        self.assertEqual(v["mode"], "external")
+        self.assertNotIn("route53_offer", v)
+        self.assertEqual([r["purpose"] for r in v["records"]], ["certificate", "address"])
         self.acm.status = "ISSUED"
         self.h({"action": "domain_status"})
-        self.assertEqual(self.builds[0][3]["DOMAIN_ZONE_ID"], "")
-
-    def test_confirming_the_zone_creates_only_the_validation_record_and_the_move_adds_the_alias(self):
-        self.route53_zone()
-        self.h({"action": "domain_set", "hostname": "helm.example.org"})
-        v = self.h({"action": "domain_use_route53", "zone": "example.org", "actor": "owner@example.org"})
-        self.assertEqual((v["mode"], v["zone"], v["route53_offer"]), ("route53", "example.org", None))
-        zone_id, batch = self.r53.changes[0]
-        rr = batch["Changes"][0]["ResourceRecordSet"]
-        self.assertEqual((zone_id, batch["Changes"][0]["Action"], rr["Name"], rr["Type"]),
-                         ("ZTEST1", "CREATE", "_a1b2.helm.example.org.", "CNAME"))
-        self.assertEqual(len(batch["Changes"]), 1)
-        self.acm.status = "ISSUED"
-        self.h({"action": "domain_status"})
-        self.assertEqual(self.builds[0][3]["DOMAIN_ZONE_ID"], "ZTEST1")
-
-    def test_a_record_already_on_the_domain_or_another_validation_value_stops_it_untouched(self):
-        self.route53_zone()
-        self.h({"action": "domain_set", "hostname": "helm.example.org"})
-        self.r53.records = [{"Name": "helm.example.org.", "Type": "CNAME", "ResourceRecords": [{"Value": "elsewhere.example.net"}]}]
-        with self.assertRaises(ValueError) as e:
-            self.h({"action": "domain_use_route53", "zone": "example.org"})
-        self.assertIn("already has a CNAME record", str(e.exception))
-        self.r53.records = [{"Name": "_a1b2.helm.example.org.", "Type": "CNAME", "ResourceRecords": [{"Value": "other.acm-validations.aws."}]}]
+        self.assertEqual((self.builds[0][3]["DOMAIN_ZONE"], self.builds[0][3]["DOMAIN_ZONE_ID"]), ("", ""))
         with self.assertRaises(ValueError):
             self.h({"action": "domain_use_route53", "zone": "example.org"})
-        self.assertEqual(self.r53.changes, [])
-        self.assertIsNone(self.store.get("DOMAIN")["zone"])
-
-    def test_the_same_validation_record_already_there_is_kept_not_written_again(self):
-        self.route53_zone()
-        self.h({"action": "domain_set", "hostname": "helm.example.org"})
-        self.r53.records = [{"Name": "_a1b2.helm.example.org.", "Type": "CNAME", "ResourceRecords": [{"Value": "_c3d4.xyz.acm-validations.aws."}]}]
-        v = self.h({"action": "domain_use_route53", "zone": "example.org"})
-        self.assertEqual((v["mode"], self.r53.changes), ("route53", []))
-
-    def test_a_zone_other_than_the_offered_one_or_no_domain_is_refused(self):
-        with self.assertRaises(ValueError):
-            self.h({"action": "domain_use_route53", "zone": "example.org"})
-        self.route53_zone()
-        self.h({"action": "domain_set", "hostname": "helm.example.org"})
-        for z in ("org", "evil.example.org", "", None):
-            with self.assertRaises(ValueError, msg=z):
-                self.h({"action": "domain_use_route53", "zone": z})
-        self.assertEqual(self.r53.changes, [])
 
     def test_a_failed_certificate_stops_with_its_reason_and_try_again_asks_for_a_new_one(self):
         self.h({"action": "domain_set", "hostname": "helm.example.org"})
