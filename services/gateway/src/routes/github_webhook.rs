@@ -891,7 +891,16 @@ async fn handle_review_comment(
             fingerprint,
         } => (comment_id, ask, Some((root, fingerprint))),
     };
-    if !may_start_work(state, team_id, &payload["comment"], "review thread reply").await {
+    if !may_start_work(
+        state,
+        team_id,
+        installation_id,
+        payload,
+        &payload["comment"],
+        "review thread reply",
+    )
+    .await
+    {
         return ignored("the author has no standing in the repository or on the team");
     }
     if let Some(control) = ask
@@ -1032,6 +1041,8 @@ fn is_bot_comment(payload: &serde_json::Value) -> bool {
 pub(crate) async fn may_start_work(
     state: &AppState,
     team_id: &str,
+    installation_id: u64,
+    payload: &Value,
     item: &Value,
     surface: &str,
 ) -> bool {
@@ -1045,6 +1056,14 @@ pub(crate) async fn may_start_work(
             return true;
         }
     }
+    // GitHub labels a member who keeps their organization membership private
+    // as a CONTRIBUTOR, so ask for the person's own permission on the repo.
+    let repo = &payload["repository"];
+    let owner = repo["owner"]["login"].as_str().unwrap_or("");
+    let name = repo["name"].as_str().unwrap_or("");
+    if has_repo_write_access(state, installation_id, owner, name, login).await {
+        return true;
+    }
     info!(
         team_id,
         login,
@@ -1053,6 +1072,54 @@ pub(crate) async fn may_start_work(
         "Ignoring request from a person without standing in the repository"
     );
     false
+}
+
+/// A GitHub repository name: letters, digits, `-`, `_` and `.`, never `.` or
+/// `..` alone, so it is safe in an API path.
+fn valid_repo_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 100
+        && name != "."
+        && name != ".."
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+}
+
+/// Does `login` have write, maintain or admin access to `owner/name`? Any
+/// failure counts as no (fail closed).
+async fn has_repo_write_access(
+    state: &AppState,
+    installation_id: u64,
+    owner: &str,
+    name: &str,
+    login: &str,
+) -> bool {
+    use super::merge_control::{gh_get, valid_login};
+    if !valid_login(login) || !valid_login(owner) || !valid_repo_name(name) {
+        return false;
+    }
+    let token = match crate::auth::github_app::get_installation_token(state, installation_id).await
+    {
+        Ok(t) => t,
+        Err(e) => {
+            warn!(owner, name, error = %e, "Standing: no installation token");
+            return false;
+        }
+    };
+    let url =
+        format!("https://api.github.com/repos/{owner}/{name}/collaborators/{login}/permission");
+    match gh_get(state, &token, &url).await {
+        Ok((code, body)) if code < 300 => common::merge_gate::has_write_access(&body),
+        Ok((code, _)) => {
+            info!(owner, name, login, code, "Standing: no permission answer");
+            false
+        }
+        Err(e) => {
+            warn!(owner, name, login, error = %e, "Standing: permission read failed");
+            false
+        }
+    }
 }
 
 /// Is this GitHub account linked to a user of `team_id`? A failed read counts
@@ -1116,7 +1183,16 @@ async fn handle_quote_reply(
     if !super::review_lessons::reviewed_by_coderhelm(state, team_id, owner, name, pr_number).await {
         return ignored("CoderHelm hasn't reviewed this PR");
     }
-    if !may_start_work(state, team_id, &payload["comment"], "quote reply").await {
+    if !may_start_work(
+        state,
+        team_id,
+        installation_id,
+        payload,
+        &payload["comment"],
+        "quote reply",
+    )
+    .await
+    {
         return ignored("the author has no standing in the repository or on the team");
     }
     let cfg = load_review_config(state, team_id, owner, name).await?;
@@ -1250,7 +1326,16 @@ async fn handle_issue_comment(
         );
         return Ok(StatusCode::OK);
     }
-    if !may_start_work(state, team_id, &payload["comment"], "comment").await {
+    if !may_start_work(
+        state,
+        team_id,
+        installation_id,
+        payload,
+        &payload["comment"],
+        "comment",
+    )
+    .await
+    {
         return Ok(StatusCode::OK);
     }
 
@@ -2288,7 +2373,16 @@ async fn handle_pr_review(
         let body = payload["review"]["body"].as_str().unwrap_or("");
         let review_id = payload["review"]["id"].as_u64().unwrap_or(0);
         if let Some(ask) = parse_reviewer_ask(body) {
-            if !may_start_work(state, team_id, &payload["review"], "review").await {
+            if !may_start_work(
+                state,
+                team_id,
+                installation_id,
+                payload,
+                &payload["review"],
+                "review",
+            )
+            .await
+            {
                 return Ok(StatusCode::OK);
             }
             let cfg = load_review_config(state, team_id, owner, name).await?;
@@ -2338,7 +2432,16 @@ async fn handle_pr_review(
     }
 
     // A review on CoderHelm's own PR starts a fix pass.
-    if !may_start_work(state, team_id, &payload["review"], "review").await {
+    if !may_start_work(
+        state,
+        team_id,
+        installation_id,
+        payload,
+        &payload["review"],
+        "review",
+    )
+    .await
+    {
         return Ok(StatusCode::OK);
     }
     if let Some(reason) = check_run_budget(state, team_id).await {
@@ -4458,6 +4561,17 @@ mod reviewer_ask_tests {
 #[cfg(test)]
 mod merge_control_command_tests {
     use super::*;
+
+    #[test]
+    fn only_safe_repo_names_reach_the_permission_path() {
+        for ok in ["web", "terraform_devops", "my.repo", "a-b"] {
+            assert!(valid_repo_name(ok), "{ok}");
+        }
+        let long = "x".repeat(101);
+        for bad in ["", ".", "..", "a/b", "a b", "a?x=1", long.as_str()] {
+            assert!(!valid_repo_name(bad), "{bad}");
+        }
+    }
     use common::merge_gate::{parse_control, Control};
 
     fn control(body: &str) -> Option<Control> {
