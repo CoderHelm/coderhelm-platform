@@ -276,4 +276,4 @@ CoderHelm **cannot** see: your code at rest, your runs, plans, reviews, memory, 
 
 ## Reporting a problem
 
-Report security issues privately to the support address in the CoderHelm repository rather than in a public issue.
+Report security issues privately, never in a public issue: email [support@coderhelm.com](mailto:support@coderhelm.com?subject=Security%20report) with "Security report" in the subject. The [Security](https://docs.coderhelm.com/security/) page says what to include.
