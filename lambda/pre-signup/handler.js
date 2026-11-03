@@ -111,7 +111,15 @@ function dynamo() {
   return real;
 }
 
-async function handler(event, _context, db = dynamo()) {
+/** Lambda's entry point. The runtime calls it with (event, context,
+ * callback), so nothing past `event` may be read as an argument: the
+ * DynamoDB client is chosen here, never passed in. */
+async function handler(event) {
+  return run(event, dynamo());
+}
+
+/** The check itself, with DynamoDB given (tests pass a fake). */
+async function run(event, db) {
   const email = (event.request && event.request.userAttributes && event.request.userAttributes.email) || "";
   const facts = await gather(db, email);
   const outcome = decide(facts, new Date());
@@ -120,4 +128,4 @@ async function handler(event, _context, db = dynamo()) {
   return event;
 }
 
-module.exports = { handler, decide, gather, normalizeEmail, emailDomain };
+module.exports = { handler, run, decide, gather, normalizeEmail, emailDomain };
