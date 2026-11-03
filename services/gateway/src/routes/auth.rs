@@ -1234,8 +1234,36 @@ async fn google_callback_inner(
 
 // ── GitHub OAuth (connect GitHub, not identity) ──────────────────────
 
+/// GET /auth/methods: the sign-in methods that work on this deployment
+/// (public, no session). The sign-in page shows these and no others.
+pub async fn methods(State(state): State<Arc<AppState>>) -> Response {
+    let m = oauth_signin::sign_in_methods(super::setup_checks::self_hosted(), github_ready(&state));
+    Json(m).into_response()
+}
+
+fn github_ready(state: &AppState) -> bool {
+    oauth_signin::github_sign_in_ready(
+        &state.secrets.github_client_id,
+        &state.secrets.github_client_secret,
+    )
+}
+
+/// Without an OAuth client of the install's own, the trip to GitHub would
+/// end on GitHub's 404: back to the sign-in screen with a plain sentence.
+fn github_not_set_up(state: &AppState, step: &'static str) -> Option<Response> {
+    oauth_signin::github_not_set_up(
+        &state.secrets.github_client_id,
+        &state.secrets.github_client_secret,
+        common::public_urls::app_url(&state.config.stage),
+        step,
+    )
+}
+
 /// GET /auth/github — Redirect to GitHub OAuth (for connecting GitHub account).
 pub async fn github_login(State(state): State<Arc<AppState>>) -> Response {
+    if let Some(r) = github_not_set_up(&state, "start") {
+        return r;
+    }
     let client_id = &state.secrets.github_client_id;
     let redirect_uri = format!(
         "{}/auth/github/callback",
@@ -1267,6 +1295,9 @@ pub async fn github_callback(
     headers: HeaderMap,
     Query(params): Query<CallbackQuery>,
 ) -> Response {
+    if let Some(r) = github_not_set_up(&state, "callback") {
+        return r;
+    }
     let app = common::public_urls::app_url(&state.config.stage);
     match github_callback_inner(&state, &ip.0, &headers, &params).await {
         Ok(resp) => resp,

@@ -1433,6 +1433,9 @@ async fn main() -> Result<(), Error> {
             "/integrations/jira/forge-register",
             post(routes::api::forge_register_urls),
         )
+        // The sign-in methods that work here: the sign-in page reads it on
+        // every load, so it stays out of the sign-in attempts' rate limit.
+        .route("/auth/methods", get(routes::auth::methods))
         .nest("/auth", auth_routes)
         .nest("/email", email_routes)
         .nest("/agent-approvals", approval_link_routes)
