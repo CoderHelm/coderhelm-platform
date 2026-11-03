@@ -359,6 +359,115 @@ if __name__ == "__main__":
     unittest.main()
 
 
+class HonestHistory(unittest.TestCase):
+    """History lists updates that started. A wait leaves no row, a refusal
+    before anything changed is not_started (never failed), no row stays
+    running after a crash, and a call with no actor names the AWS CLI."""
+
+    def setUp(self):
+        self.store = u.Store(FakeDynamo(), "t")
+        self.cfn = FakeCfn()
+        u._clients["cloudformation"] = self.cfn
+        u._clients["lambda"] = FakeLambda()
+        self._fetch, self._notify = u.fetch_template, u.notify
+        u.notify = lambda *a, **k: None
+        u.fetch_template = lambda url, opener=None: TEMPLATE
+
+    def tearDown(self):
+        u.fetch_template, u.notify = self._fetch, self._notify
+        u._clients.pop("cloudformation", None)
+        u._clients.pop("lambda", None)
+
+    def verified(self, sha=SHA):
+        self.store.put("MANIFEST#v1.1.0", {"verified": True, "manifest": None, "template_sha256": sha})
+
+    def test_a_release_still_publishing_is_a_wait_with_no_row(self):
+        def not_there_yet(url, opener=None):
+            raise u.urllib.error.HTTPError(url, 403, "Forbidden", {}, None)
+        u.fetch_template = not_there_yet
+        self.verified()
+        with self.assertRaisesRegex(u.ReleaseNotReady, r"v1\.1\.0 is still publishing; try again in a minute"):
+            u.begin(self.store, ENV, NOW, "v1.1.0", "admin@example.org", "update")
+        self.assertEqual(self.store.history(), [])
+        self.assertNotIn("running_id", self.store.get("UPDATE_STATE", {}))
+        self.assertEqual(self.cfn.created, [])
+
+    def test_the_handler_answers_a_wait_and_never_crashes(self):
+        def not_there_yet(url, opener=None):
+            raise u.urllib.error.HTTPError(url, 404, "Not Found", {}, None)
+        u.fetch_template = not_there_yet
+        self.verified()
+        try:
+            u.begin(self.store, ENV, NOW, "v1.1.0", "admin@example.org", "update")
+        except u.ReleaseNotReady as e:
+            self.assertIsInstance(e, ValueError)
+
+    def test_not_verified_yet_is_a_wait_too(self):
+        with self.assertRaisesRegex(u.ReleaseNotReady, "isn't verified yet"):
+            u.begin(self.store, ENV, NOW, "v1.1.0", "install guide", "update")
+        self.assertEqual(self.store.history(), [])
+
+    def test_a_refusal_before_anything_changed_is_not_started(self):
+        self.verified(sha="0" * 64)
+        with self.assertRaisesRegex(ValueError, "doesn't match its signed checksum"):
+            u.begin(self.store, ENV, NOW, "v1.1.0", "admin@example.org", "update")
+        [h] = self.store.history()
+        self.assertEqual(h["status"], "not_started")
+        self.assertIn("doesn't match its signed checksum", h["reason"])
+        self.assertNotIn("running_id", self.store.get("UPDATE_STATE", {}))
+
+    def test_an_unexpected_error_never_leaves_a_row_running(self):
+        def broken(url, opener=None):
+            raise ConnectionResetError("reset by peer")
+        u.fetch_template = broken
+        self.verified()
+        with self.assertRaisesRegex(ValueError, "couldn't prepare the update.*nothing was changed"):
+            u.begin(self.store, ENV, NOW, "v1.1.0", "admin@example.org", "update")
+        [h] = self.store.history()
+        self.assertEqual(h["status"], "not_started")
+        self.assertEqual(self.cfn.created, [])
+
+    def test_one_row_per_update_after_a_wait_then_the_retry(self):
+        calls = []
+        def first_403(url, opener=None):
+            calls.append(url)
+            if len(calls) == 1:
+                raise u.urllib.error.HTTPError(url, 403, "Forbidden", {}, None)
+            return TEMPLATE
+        u.fetch_template = first_403
+        self.verified()
+        with self.assertRaises(u.ReleaseNotReady):
+            u.begin(self.store, ENV, NOW, "v1.1.0", "admin@example.org", "update")
+        e = u.begin(self.store, ENV, NOW, "v1.1.0", "admin@example.org", "update")
+        rows = self.store.history()
+        self.assertEqual([(r["id"], r["status"]) for r in rows], [(e["id"], "preparing")])
+
+    def test_a_row_left_running_without_a_change_set_reads_as_not_started(self):
+        self.store.put("UPDATE#2026-11-03T02:04:00Z#aaaa", {"version": "v1.1.0", "from_version": "v1.0.0", "actor": "unknown",
+                                                           "mode": "update", "status": "running", "started_at": NOW.isoformat()})
+        [h] = u.history_view(self.store.history(), {}, NOW)
+        self.assertEqual(h["status"], "not_started")
+        self.assertIn("stopped before it changed anything", h["reason"])
+
+    def test_the_update_in_progress_still_reads_as_running(self):
+        self.store.put("UPDATE#x", {"version": "v1.1.0", "status": "preparing", "change_set_id": "cs", "started_at": NOW.isoformat()})
+        [h] = u.history_view(self.store.history(), {"running_id": "UPDATE#x"}, NOW)
+        self.assertEqual(h["status"], "preparing")
+
+    def test_a_started_update_past_the_running_limit_ended_without_a_result(self):
+        old = (NOW - u.RUNNING_STALE - u.timedelta(minutes=1)).isoformat()
+        self.store.put("UPDATE#y", {"version": "v1.1.0", "status": "running", "change_set_id": "cs", "started_at": old})
+        [h] = u.history_view(self.store.history(), {}, NOW)
+        self.assertEqual(h["status"], "failed")
+        self.assertIn("ended without a result", h["reason"])
+
+    def test_a_call_with_no_actor_names_the_aws_cli(self):
+        self.verified()
+        e = u.handle({"action": "update_now", "version": "v1.1.0"}, dict(ENV, CODERHELM_VERSION="v1.0.0"), self.store, NOW,
+                     lambda repo: [], probe=lambda env, payload: {"ok": True, "results": []})
+        self.assertEqual(e["actor"], "AWS CLI")
+
+
 class LiveTestFindings(unittest.TestCase):
     """The live test's findings: the parts' templates are staged before the
     change set (bug 1); a template CloudFormation stores resolved can't be
