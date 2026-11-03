@@ -1,7 +1,7 @@
 // node --test lambda/pre-signup/handler.test.js
 const test = require("node:test");
 const assert = require("node:assert/strict");
-const { decide, handler, normalizeEmail } = require("./handler.js");
+const { decide, handler, run, normalizeEmail } = require("./handler.js");
 const cases = require("./cases.json");
 
 test("every shared join case decides as the gateway does", () => {
@@ -40,13 +40,13 @@ const event = (email, triggerSource = "PreSignUp_SignUp") => ({
 
 test("a direct Cognito sign-up from a stranger is refused", async () => {
   const db = fakeDb({ org: { team_id: { S: "TEAM#org" }, domains: { L: [{ S: "example.com" }] } }, anyone: true });
-  await assert.rejects(handler(event("x@elsewhere.io"), {}, db), /private to one organization/);
+  await assert.rejects(run(event("x@elsewhere.io"), db), /private to one organization/);
 });
 
 test("Google sign-ups are held to the same rules", async () => {
   const db = fakeDb({ org: { team_id: { S: "TEAM#org" }, domains: { L: [{ S: "example.com" }] } }, anyone: true });
-  await assert.rejects(handler(event("x@gmail.com", "PreSignUp_ExternalProvider"), {}, db));
-  const ok = await handler(event("ann@example.com", "PreSignUp_ExternalProvider"), {}, db);
+  await assert.rejects(run(event("x@gmail.com", "PreSignUp_ExternalProvider"), db));
+  const ok = await run(event("ann@example.com", "PreSignUp_ExternalProvider"), db);
   assert.equal(ok.triggerSource, "PreSignUp_ExternalProvider");
 });
 
@@ -56,14 +56,21 @@ test("an invited person and the first admin get through", async () => {
     anyone: true,
     records: [{ pk: { S: "TEAM#org" }, sk: { S: "USER#invite_1" }, status: { S: "invited" }, invited_at: { S: new Date().toISOString() } }],
   });
-  await handler(event("bo@other.io"), {}, invited);
+  await run(event("bo@other.io"), invited);
   const first = fakeDb({ allow: { "EMAIL#admin@example.com": { pk: { S: "ALLOWLIST" } } } });
-  await handler(event("admin@example.com"), {}, first);
+  await run(event("admin@example.com"), first);
   const asInvite = fakeDb({ allow: { "EMAIL#b@example.com": { kind: { S: "invite" } } } });
-  await assert.rejects(handler(event("b@example.com"), {}, asInvite));
+  await assert.rejects(run(event("b@example.com"), asInvite));
 });
 
 test("a table it can't read refuses (fails closed)", async () => {
   const broken = { async send() { throw new Error("throttled"); } };
-  await assert.rejects(handler(event("admin@example.com"), {}, broken), /throttled/);
+  await assert.rejects(run(event("admin@example.com"), broken), /throttled/);
 });
+
+test("the entry point reads only the event: Lambda passes a callback third", () => {
+  // Node's runtime calls handler(event, context, callback). A DynamoDB client
+  // taken from the arguments would be that callback (db.send is not a function).
+  assert.equal(handler.length, 1);
+});
+
