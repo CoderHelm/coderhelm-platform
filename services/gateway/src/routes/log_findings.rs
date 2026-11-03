@@ -144,6 +144,12 @@ pub fn finding_json(
         "also_in": f.also_in.iter().map(|c| json!({ "log_group": c.name, "lines": c.lines })).collect::<Vec<_>>(),
         "reopened_at": (!f.reopened_at.is_empty()).then_some(&f.reopened_at),
         "reopen_count": f.reopen_count,
+        // Open: when it resolves on its own unless seen again. Resolved: when
+        // and why the analyzer resolved it.
+        "quiet_days": f.quiet_days(),
+        "resolves_at": f.resolves_at(),
+        "resolved_at": (!f.resolved_at.is_empty()).then_some(&f.resolved_at),
+        "resolved_reason": (!f.resolved_reason.is_empty()).then_some(&f.resolved_reason),
     })
 }
 

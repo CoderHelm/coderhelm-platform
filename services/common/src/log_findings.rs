@@ -133,13 +133,17 @@ impl Severity {
 
 // ─── Findings ───────────────────────────────────────────────────────────────
 
+/// The analyzer's quiet period for a burst that stopped
+/// (lambda/log-analyzer/lifecycle.py DEFAULT_QUIET_DAYS).
+pub const DEFAULT_QUIET_DAYS: u64 = 3;
+
 /// One finding as stored.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Finding {
     pub rec_id: String,
     /// `pending`, `approved` (a plan was made), `dismissed` or `resolved`
-    /// (the analyzer saw no matching line for a week; seen again, it is
-    /// reopened as `pending` with `reopened_at`).
+    /// (the analyzer saw no matching line for its quiet period; seen again,
+    /// it is reopened as `pending` with `reopened_at`).
     pub status: String,
     pub severity: Severity,
     pub title: String,
@@ -184,6 +188,13 @@ pub struct Finding {
     /// The finding this duplicate was folded into (merge_duplicates.py);
     /// a merged finding is not listed.
     pub merged_into: String,
+    /// When the analyzer resolved it, and why ("Resolved: no new lines for
+    /// N days"); empty while open.
+    pub resolved_at: String,
+    pub resolved_reason: String,
+    /// Days without a matching line before the analyzer resolves it
+    /// (lifecycle.quiet_days_for); missing on older items.
+    pub quiet_days: Option<u64>,
 }
 
 impl Finding {
@@ -240,6 +251,9 @@ impl Finding {
             reopened_at: s(item, "reopened_at"),
             reopen_count: n(item, "reopen_count").unwrap_or(0),
             merged_into: s(item, "merged_into"),
+            resolved_at: s(item, "resolved_at"),
+            resolved_reason: s(item, "resolved_reason"),
+            quiet_days: n(item, "quiet_days"),
         })
     }
 
@@ -257,6 +271,27 @@ impl Finding {
         };
         crate::sha256_hex(&[&self.source_account_id, &self.source_log_group, what])[..16]
             .to_string()
+    }
+
+    /// The quiet period this finding resolves after: its own, or the
+    /// analyzer's default for a burst that stopped.
+    pub fn quiet_days(&self) -> u64 {
+        self.quiet_days
+            .filter(|d| *d > 0)
+            .unwrap_or(DEFAULT_QUIET_DAYS)
+    }
+
+    /// When an open finding resolves on its own if no new line comes
+    /// (its last line plus its quiet period); None once it isn't open or
+    /// has no last time.
+    pub fn resolves_at(&self) -> Option<String> {
+        if self.status != "pending" || !self.merged_into.is_empty() {
+            return None;
+        }
+        let last = chrono::DateTime::parse_from_rfc3339(&self.last_seen_at).ok()?;
+        let at =
+            last.with_timezone(&chrono::Utc) + chrono::Duration::days(self.quiet_days() as i64);
+        Some(at.to_rfc3339_opts(chrono::SecondsFormat::Secs, true))
     }
 
     /// The ticket every fix run for this finding's error shares.
@@ -1627,6 +1662,25 @@ pub fn console_url(region: &str, log_group: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn an_open_finding_says_when_it_resolves_on_its_own() {
+        let mut f = Finding {
+            status: "pending".into(),
+            last_seen_at: "2026-10-31T03:38:10Z".into(),
+            ..Default::default()
+        };
+        // An older item without a quiet period gets the analyzer's default.
+        assert_eq!(f.quiet_days(), DEFAULT_QUIET_DAYS);
+        assert_eq!(f.resolves_at().as_deref(), Some("2026-11-03T03:38:10Z"));
+        f.quiet_days = Some(8);
+        assert_eq!(f.resolves_at().as_deref(), Some("2026-11-08T03:38:10Z"));
+        f.status = "resolved".into();
+        assert_eq!(f.resolves_at(), None);
+        f.status = "dismissed".into();
+        assert_eq!(f.resolves_at(), None);
+    }
+
     use super::*;
     use std::sync::Mutex;
 

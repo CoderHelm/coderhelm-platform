@@ -243,7 +243,52 @@ class Lifecycle(unittest.TestCase):
         t = Table()
         with Patch(aws_insights_table=t, emit_event=lambda *_a, **_k: None):
             h.resolve_stale_recommendations("TEAM#t", [seen_yesterday, quiet, ignored], set())
-        self.assertEqual([u["Key"]["sk"] for u in t.updates], ["REC#r2"])
+        resolves = [u for u in t.updates if ":s" in u["ExpressionAttributeValues"]]
+        self.assertEqual([u["Key"]["sk"] for u in resolves], ["REC#r2"])
+
+    def test_an_acknowledged_finding_resolves_once_quiet(self):
+        # Acknowledged is still pending: it never holds a finding open.
+        ack = {"rec_id": "a1", "sk": "REC#a1", "status": "pending", "acknowledged_at": iso_ago(days=1),
+               "last_seen_at": iso_ago(days=L.DEFAULT_QUIET_DAYS, hours=1),
+               "daily_lines": [{"day": "2026-10-26", "lines": 900}]}
+        fresh = dict(ack, rec_id="a2", sk="REC#a2", last_seen_at=iso_ago(days=L.DEFAULT_QUIET_DAYS - 1))
+        self.assertEqual([i["rec_id"] for i in L.stale([ack, fresh], set())], ["a1"])
+        t = Table()
+        with Patch(aws_insights_table=t, emit_event=lambda *_a, **_k: None):
+            h.resolve_stale_recommendations("TEAM#t", [ack, fresh], set())
+        resolved = [u for u in t.updates if u["Key"]["sk"] == "REC#a1"][0]
+        vals = resolved["ExpressionAttributeValues"]
+        self.assertEqual(vals[":s"], "resolved")
+        self.assertEqual(vals[":r"], f"Resolved: no new lines for {L.DEFAULT_QUIET_DAYS} days")
+        # The open one carries its quiet period, so the page can say when.
+        stamped = [u for u in t.updates if u["Key"]["sk"] == "REC#a2"][0]
+        self.assertEqual(stamped["ExpressionAttributeValues"][":q"], L.DEFAULT_QUIET_DAYS)
+
+    def test_a_burst_that_stopped_waits_the_default_quiet_period(self):
+        burst = {"daily_lines": [{"day": "2026-10-25", "lines": 40}, {"day": "2026-10-26", "lines": 6000},
+                                 {"day": "2026-10-27", "lines": 0}]}
+        self.assertEqual(L.quiet_days_for(burst), L.DEFAULT_QUIET_DAYS)
+        self.assertEqual(L.quiet_days_for({}), L.DEFAULT_QUIET_DAYS)
+
+    def test_an_error_that_keeps_coming_back_needs_a_longer_quiet_period(self):
+        every_4_days = {"daily_lines": [{"day": d, "lines": 5} for d in ("2026-10-01", "2026-10-05", "2026-10-09")]}
+        self.assertEqual(L.quiet_days_for(every_4_days), 8)
+        returned = {"last_resolved_at": iso_ago(days=9), "reopened_at": iso_ago(days=5)}
+        self.assertEqual(L.quiet_days_for(returned), 8)
+        rare = {"daily_lines": [{"day": "2026-09-01", "lines": 1}, {"day": "2026-09-29", "lines": 1}]}
+        self.assertEqual(L.quiet_days_for(rare), L.MAX_QUIET_DAYS)
+        # Quiet for 5 days is not enough for the every-4-days error.
+        item = dict(every_4_days, rec_id="r", sk="REC#r", status="pending", last_seen_at=iso_ago(days=5))
+        self.assertEqual(L.stale([item], set()), [])
+        self.assertGreaterEqual(L.MIN_QUIET_DAYS, 1)
+
+    def test_seen_again_after_an_auto_resolve_reopens(self):
+        # Covered for the write by the reopen tests; here the quiet period
+        # grows with the silence it came back from.
+        item = {"rec_id": "x", "status": "pending", "last_resolved_at": iso_ago(days=6),
+                "reopened_at": iso_ago(days=3), "last_seen_at": iso_ago(days=3)}
+        self.assertEqual(L.quiet_days_for(item), 6)
+        self.assertEqual(L.stale([item], set()), [])
 
     def test_history_adds_new_lines_per_day(self):
         hist = L.add_history([], "2026-10-25", 5)
