@@ -3488,13 +3488,14 @@ async fn run_passes(
                 )
                 .await?;
             info!(run_id, branch = %branch_name, ?started, "Working branch ready");
-            add_progress_note(
-                state,
-                &msg.team_id,
-                run_id,
-                &started.note(&branch_name, &msg.base_branch),
-            )
-            .await;
+            let mut note = started.note(&branch_name, &msg.base_branch);
+            if let Some(d) = stacked_on.as_ref().filter(|d| d.branch == msg.base_branch) {
+                note.push_str(&format!(
+                    " (#{}'s branch: the open pull request this ticket builds on)",
+                    d.number
+                ));
+            }
+            add_progress_note(state, &msg.team_id, run_id, &note).await;
 
             // The reset wiped any commits from a previous partial run, so a
             // reused plan's `- [x]` checkmarks no longer reflect reality —
@@ -11048,9 +11049,10 @@ mod branch_keep_tests {
             BranchStart::Created.note("feature/a", "main"),
             "Created branch feature/a from main"
         );
-        assert!(BranchStart::Reset
-            .note("feature/a", "main")
-            .contains("no open pull request"));
+        let reset = BranchStart::Reset.note("feature/a", "main");
+        assert!(reset.starts_with("Restarted branch feature/a from main"));
+        assert!(reset.contains("no open pull request"));
+        assert!(reset.contains("its commits were dropped"));
         let kept = BranchStart::KeptOpenPr.note("feature/a", "main");
         assert!(kept.contains("continuing from its head, nothing reset"));
         assert!(!kept.contains("Created"));
