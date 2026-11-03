@@ -655,6 +655,22 @@ pub async fn invite_user(
         ));
     }
     let role = body.role.as_deref().unwrap_or("member");
+    let now_ts = chrono::Utc::now();
+    if !take_counter(
+        &state,
+        &claims.team_id,
+        &format!("INVITE_RATE#{}", now_ts.format("%Y%m%d")),
+        INVITES_PER_TEAM_PER_DAY,
+        now_ts.timestamp() + 2 * 86_400,
+    )
+    .await
+    .map_err(|e| internal("Failed to count invites", e))?
+    {
+        return Err(fail(
+            StatusCode::TOO_MANY_REQUESTS,
+            "Your team sent a lot of invites today. Try again tomorrow.",
+        ));
+    }
     if role == "owner" {
         return Err(fail(
             StatusCode::BAD_REQUEST,
@@ -791,6 +807,32 @@ pub async fn resend_invite(
     let item = get_member(&state, &claims.team_id, &user_id).await?;
     let email = check_resend(&item)?;
     let role = role_of(&item);
+    let now_ts = chrono::Utc::now();
+    if resent_too_soon(&item, now_ts) {
+        return Err(fail(
+            StatusCode::TOO_MANY_REQUESTS,
+            "This invite was sent less than an hour ago. Try again later.",
+        ));
+    }
+    if !take_counter(
+        &state,
+        &claims.team_id,
+        &format!(
+            "INVITE_RESEND#{}#{}",
+            s(&item, "sk"),
+            now_ts.format("%G-W%V")
+        ),
+        RESENDS_PER_INVITE_PER_WEEK,
+        now_ts.timestamp() + 8 * 86_400,
+    )
+    .await
+    .map_err(|e| internal("Failed to count resends", e))?
+    {
+        return Err(fail(
+            StatusCode::TOO_MANY_REQUESTS,
+            "This invite was resent 5 times this week. Try again next week.",
+        ));
+    }
 
     let team_name = get_team_name(state.clone(), &claims).await;
     send_invite_email(
@@ -1553,10 +1595,61 @@ async fn get_team_name(state: Arc<AppState>, claims: &Claims) -> String {
         .and_then(|i| {
             i.get("github_org")
                 .and_then(|v| v.as_s().ok())
-                .filter(|s| !s.is_empty())
-                .cloned()
+                .and_then(|s| common::mail::naming::org_label(s))
         })
-        .unwrap_or_else(|| claims.email.clone())
+        // Never the inviter's address: it would put any address in the
+        // subject of a genuine invite.
+        .unwrap_or_else(|| UNNAMED_TEAM.to_string())
+}
+
+/// The team name an invite uses when the team has no safe one.
+const UNNAMED_TEAM: &str = "a team";
+/// Invites one team may send in a day.
+pub const INVITES_PER_TEAM_PER_DAY: u32 = 50;
+/// Times one invite may be resent in a week (and at most once an hour).
+pub const RESENDS_PER_INVITE_PER_WEEK: u32 = 5;
+
+/// Whether the invite was last sent less than an hour before `now`.
+fn resent_too_soon(item: &Item, now: chrono::DateTime<chrono::Utc>) -> bool {
+    invite_sent_at(item).is_some_and(|at| now - at < chrono::Duration::hours(1))
+}
+
+/// Counts one use of `sk` under `pk` on the settings table; false once
+/// `limit` is reached. The count expires at `ttl`.
+async fn take_counter(
+    state: &AppState,
+    pk: &str,
+    sk: &str,
+    limit: u32,
+    ttl: i64,
+) -> Result<bool, String> {
+    let r = state
+        .dynamo
+        .update_item()
+        .table_name(&state.config.settings_table_name)
+        .key("pk", attr_s(pk))
+        .key("sk", attr_s(sk))
+        .update_expression("ADD n :one SET #ttl = if_not_exists(#ttl, :ttl)")
+        .condition_expression("attribute_not_exists(n) OR n < :limit")
+        .expression_attribute_names("#ttl", "ttl")
+        .expression_attribute_values(":one", AttributeValue::N("1".into()))
+        .expression_attribute_values(":limit", AttributeValue::N(limit.to_string()))
+        .expression_attribute_values(":ttl", AttributeValue::N(ttl.to_string()))
+        .send()
+        .await;
+    match r {
+        Ok(_) => Ok(true),
+        Err(e)
+            if e.as_service_error()
+                .is_some_and(|se| se.is_conditional_check_failed_exception()) =>
+        {
+            Ok(false)
+        }
+        Err(e) => Err(format!(
+            "{}",
+            aws_sdk_dynamodb::error::DisplayErrorContext(&e)
+        )),
+    }
 }
 
 /// Where an invite email sends someone: the sign-in page with the account form
@@ -1657,6 +1750,20 @@ mod tests {
         assert!(!needs_setup("active", "in@example.com", &pool));
         assert!(!needs_setup("invited", "out@example.com", &pool));
         assert!(!needs_setup("active", "", &pool));
+    }
+
+    #[test]
+    fn an_invite_resends_at_most_once_an_hour() {
+        let now = chrono::DateTime::parse_from_rfc3339("2026-03-01T12:00:00+00:00")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let mut item = Item::new();
+        item.insert("invited_at".into(), attr_s("2026-03-01T11:30:00+00:00"));
+        assert!(resent_too_soon(&item, now));
+        item.insert("invited_at".into(), attr_s("2026-03-01T10:59:00+00:00"));
+        assert!(!resent_too_soon(&item, now));
+        assert_eq!(UNNAMED_TEAM, "a team");
+        const { assert!(INVITES_PER_TEAM_PER_DAY <= 50 && RESENDS_PER_INVITE_PER_WEEK <= 5) };
     }
 
     #[test]

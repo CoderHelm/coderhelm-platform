@@ -37,8 +37,9 @@
 
 use aws_sdk_dynamodb::types::{AttributeValue, Put, TransactWriteItem};
 use axum::{
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::{HeaderMap, StatusCode},
+    response::{IntoResponse, Response},
     Extension, Json,
 };
 use regex::Regex;
@@ -189,6 +190,10 @@ pub struct Participant {
     /// Copied by email only: not on the team, cannot sign in.
     #[serde(default)]
     pub outside: bool,
+    /// When an outside address confirmed it wants this ticket's emails
+    /// (empty until then: it gets only the one confirmation email).
+    #[serde(default)]
+    pub confirmed_at: String,
     /// Who added them (a name or address), and when.
     #[serde(default)]
     pub added_by: String,
@@ -675,6 +680,7 @@ async fn person_for<M: Members>(
         email: m.email.to_lowercase(),
         name: clip(&one_line(&m.name), 120),
         outside: false,
+        confirmed_at: String::new(),
         added_by: String::new(),
         added_at: String::new(),
     };
@@ -700,6 +706,7 @@ async fn person_for<M: Members>(
         email,
         name: String::new(),
         outside: true,
+        confirmed_at: String::new(),
         added_by: String::new(),
         added_at: String::new(),
     })
@@ -1689,6 +1696,27 @@ pub struct Mail {
     pub subject: String,
     pub text: String,
     pub html: String,
+    /// To an outside address: counted against its daily cap.
+    pub outside: bool,
+}
+
+/// The most ticket emails one outside address gets in a day.
+pub const OUTSIDE_MAILS_PER_DAY: u32 = 10;
+/// How long a confirmation link for an outside address works.
+pub const COPY_CONFIRM_SECS: i64 = 7 * 86_400;
+/// The purpose a confirmation token is signed for.
+const COPY_PURPOSE: &str = "support_copy";
+
+/// A subject safe to put in an email: one line, no link-looking words, and
+/// never wording that reads as CoderHelm's own account mail.
+pub fn safe_subject(subject: &str) -> String {
+    use common::mail::templates::{plain, uses_reserved_wording};
+    let s = plain(subject, true);
+    if s.is_empty() || uses_reserved_wording(&s) {
+        "Support ticket".to_string()
+    } else {
+        s
+    }
 }
 
 fn esc(v: &str) -> String {
@@ -1745,6 +1773,7 @@ fn html_page(
     lines: &[(String, String)],
     quote: &str,
     button: Option<(&str, &str)>,
+    signed: bool,
 ) -> String {
     let rows: String = lines
         .iter()
@@ -1763,7 +1792,7 @@ fn html_page(
 <table style=\"font-size:13px;margin:0 0 16px\">{rows}</table>\
 <div style=\"white-space:pre-wrap;font-size:14px;line-height:20px;border-left:3px solid #3f3f46;padding:4px 0 4px 12px;margin:0 0 20px\">{}</div>\
 {}\
-<p style=\"font-size:12px;color:#71717a;margin:24px 0 0\">Coderhelm support</p>\
+{}\
 </div></body></html>",
         esc(heading),
         esc(quote),
@@ -1772,6 +1801,11 @@ fn html_page(
             esc(href),
             esc(label)
         )).unwrap_or_default(),
+        if signed {
+            "<p style=\"font-size:12px;color:#71717a;margin:24px 0 0\">Coderhelm support</p>"
+        } else {
+            ""
+        },
     )
 }
 
@@ -1829,8 +1863,10 @@ pub fn mail_new_ticket(inbox: &str, t: &Ticket, body: &str) -> Mail {
             &lines,
             body,
             Some(("Open the ticket", &link)),
+            false,
         ),
         text,
+        outside: false,
     }
 }
 
@@ -1871,7 +1907,9 @@ pub fn mail_customer_reply(inbox: &str, t: &Ticket, m: &Message) -> Mail {
             &lines,
             &m.body,
             Some(("Open the ticket", &link)),
+            false,
         ),
+        outside: false,
     }
 }
 
@@ -1890,6 +1928,7 @@ pub fn recipients(t: &Ticket) -> Vec<Recipient> {
     let people = std::iter::once((t.opened_by_email.as_str(), true)).chain(
         t.participants
             .iter()
+            .filter(|p| !p.outside || !p.confirmed_at.is_empty())
             .map(|p| (p.email.as_str(), !p.outside)),
     );
     for (email, member) in people {
@@ -1933,31 +1972,76 @@ fn footer(r: &Recipient) -> &'static str {
     }
 }
 
-fn mail_to_people(t: &Ticket, subject: &str, heading: &str, quote: &str) -> Vec<Mail> {
+/// What an outside address is sent instead of the team's own words: the
+/// subject and anything a customer wrote never go to an address that only
+/// confirmed it wants this ticket's emails.
+const OUTSIDE_SUBJECT: &str = "An update on a support ticket you're copied on";
+
+/// `staff_written`: `quote` is CoderHelm support's own answer (sent to
+/// outside addresses too); otherwise outside addresses get a fixed line.
+/// `signed`: support's answer carries "Coderhelm support" under it; nothing a
+/// customer set off does.
+fn mail_to_people(
+    t: &Ticket,
+    subject: &str,
+    heading: &str,
+    quote: &str,
+    staff_written: bool,
+    signed: bool,
+) -> Vec<Mail> {
     let link = customer_link(&t.id);
     let people = people_words(t);
+    let subject = safe_subject(subject);
+    let heading = safe_subject(heading);
     recipients(t)
         .into_iter()
         .map(|r| {
             let note = footer(&r);
-            let mut text =
-                format!("{heading}\n\n{quote}\n\nPeople on this ticket: {people}\n\n{note}\n");
+            let (subject, heading, quote, people) = if r.member {
+                (
+                    subject.clone(),
+                    heading.clone(),
+                    quote.to_string(),
+                    people.clone(),
+                )
+            } else {
+                let q = if staff_written {
+                    quote.to_string()
+                } else {
+                    "The ticket changed. Ask someone on the team for details.".to_string()
+                };
+                (
+                    OUTSIDE_SUBJECT.to_string(),
+                    OUTSIDE_SUBJECT.to_string(),
+                    q,
+                    String::new(),
+                )
+            };
+            let mut text = format!("{heading}\n\n{quote}\n\n");
+            if !people.is_empty() {
+                text.push_str(&format!("People on this ticket: {people}\n\n"));
+            }
+            text.push_str(&format!("{note}\n"));
             if r.member {
                 text.push_str(&format!("{link}\n"));
             }
+            let mut lines = Vec::new();
+            if !people.is_empty() {
+                lines.push(("People".to_string(), people.clone()));
+            }
+            lines.push(("".to_string(), note.to_string()));
             Mail {
                 to: r.email.clone(),
-                subject: subject.to_string(),
+                subject,
                 html: html_page(
-                    heading,
-                    &[
-                        ("People".to_string(), people.clone()),
-                        ("".to_string(), note.to_string()),
-                    ],
-                    quote,
+                    &heading,
+                    &lines,
+                    &quote,
                     r.member.then_some(("See the ticket", link.as_str())),
+                    signed && staff_written,
                 ),
                 text,
+                outside: !r.member,
             }
         })
         .collect()
@@ -1970,7 +2054,14 @@ pub fn mail_support_reply(t: &Ticket, m: &Message) -> Vec<Mail> {
     } else {
         format!("Coderhelm support replied: {}", t.subject)
     };
-    mail_to_people(t, &format!("Re: {}", t.subject), &heading, &m.body)
+    mail_to_people(
+        t,
+        &format!("Re: {}", t.subject),
+        &heading,
+        &m.body,
+        true,
+        true,
+    )
 }
 
 /// To everyone on the ticket: its status changed. `action` is the event
@@ -1994,7 +2085,74 @@ pub fn mail_status(t: &Ticket, action: &str, by: &str) -> Vec<Mail> {
             format!("{by} marked this ticket open; it is support's turn."),
         ),
     };
-    mail_to_people(t, &heading, &heading, &note)
+    mail_to_people(t, &heading, &heading, &note, false, false)
+}
+
+/// To an outside address just copied on a ticket: one fixed email asking it
+/// to confirm. Nothing the team wrote is in it (not the subject, not a name),
+/// and until it confirms it gets no other email from this ticket.
+pub fn mail_copy_confirm(email: &str, link: &str) -> Mail {
+    let heading = "Confirm emails for a support ticket";
+    let body = "Someone on a team that uses Coderhelm copied this address on a support ticket. To get that ticket's emails, confirm below. If you don't, you won't get any more email about it.";
+    Mail {
+        to: email.to_string(),
+        subject: heading.to_string(),
+        text: format!("{heading}\n\n{body}\n\nConfirm: {link}\n"),
+        html: html_page(heading, &[], body, Some(("Confirm", link)), false),
+        outside: true,
+    }
+}
+
+/// The confirmation link for `email` on ticket `ticket_id` of `team_id`.
+pub fn copy_confirm_link(
+    secret: &str,
+    team_id: &str,
+    ticket_id: &str,
+    email: &str,
+    now: i64,
+) -> String {
+    let token = common::unsubscribe::sign(
+        secret,
+        team_id,
+        &format!("{ticket_id}|{}", email.trim().to_lowercase()),
+        COPY_PURPOSE,
+        now + COPY_CONFIRM_SECS,
+    );
+    format!(
+        "{}/email/support-copy?t={token}",
+        common::public_urls::api_url_from_env()
+    )
+}
+
+/// Marks an outside address's copy confirmed, from its token. Ok(false):
+/// the token is genuine but the address is no longer on the ticket.
+pub async fn confirm_copy<S: Store>(
+    store: &S,
+    secret: &str,
+    token: &str,
+    now: i64,
+) -> Result<bool, String> {
+    let who = common::unsubscribe::verify(secret, token, COPY_PURPOSE, now)
+        .map_err(|e| format!("{e:?}"))?;
+    let (ticket_id, email) = who
+        .user_id
+        .split_once('|')
+        .ok_or_else(|| "Malformed".to_string())?;
+    let Some(mut t) = store.load(&who.team_id, ticket_id).await? else {
+        return Ok(false);
+    };
+    let Some(p) = t
+        .participants
+        .iter_mut()
+        .find(|p| p.outside && p.email.eq_ignore_ascii_case(email))
+    else {
+        return Ok(false);
+    };
+    if p.confirmed_at.is_empty() {
+        p.confirmed_at = now_iso();
+        store.save(&t).await?;
+    }
+    Ok(true)
 }
 
 /// To the support inbox: the team marked its ticket resolved.
@@ -2015,7 +2173,9 @@ pub fn mail_team_resolved(inbox: &str, t: &Ticket, by: &str) -> Mail {
             &[("Team".to_string(), team.to_string())],
             &note,
             Some(("Open the ticket", &link)),
+            false,
         ),
+        outside: false,
     }
 }
 
@@ -2023,11 +2183,116 @@ pub(crate) fn inbox() -> String {
     common::public_urls::support_inbox()
 }
 
+/// Whether one more ticket email may go to the outside address `email`
+/// today ([`OUTSIDE_MAILS_PER_DAY`]). Counted by a hash of the address under
+/// one shared key, across every team. Refused when the count can't be read.
+async fn outside_allowed(state: &AppState, email: &str) -> bool {
+    use sha2::{Digest, Sha256};
+    let now = chrono::Utc::now();
+    let day = now.format("%Y%m%d").to_string();
+    let who = hex::encode(Sha256::digest(email.trim().to_lowercase().as_bytes()));
+    store(state)
+        .take(
+            "SUPPORT_OUTSIDE",
+            &format!("addr:{}:{day}", &who[..32]),
+            OUTSIDE_MAILS_PER_DAY,
+            now.timestamp() + 2 * 86_400,
+        )
+        .await
+        .unwrap_or(false)
+}
+
+/// The one confirmation email to each outside address on `t` that hasn't
+/// confirmed, among `emails` (the addresses just added).
+async fn ask_outside_to_confirm(state: &AppState, t: &Ticket, emails: &[String]) {
+    let now = chrono::Utc::now().timestamp();
+    for p in t.participants.iter().filter(|p| {
+        p.outside
+            && p.confirmed_at.is_empty()
+            && emails.iter().any(|e| e.eq_ignore_ascii_case(&p.email))
+    }) {
+        let link = copy_confirm_link(&state.secrets.jwt_secret, &t.team_id, &t.id, &p.email, now);
+        send(state, mail_copy_confirm(&p.email, &link)).await;
+    }
+}
+
+/// GET /email/support-copy?t= — the link in the confirmation email. Asks;
+/// changes nothing.
+pub async fn copy_confirm_page(Query(q): Query<CopyQuery>) -> Response {
+    copy_page(
+        StatusCode::OK,
+        "Get this ticket's emails?",
+        "<p>Confirm and you'll get emails about the support ticket you were copied on. Ignore this page and you won't.</p><form method=\"post\"><button type=\"submit\">Confirm</button></form>",
+        &q.t,
+    )
+}
+
+/// POST /email/support-copy?t= — the Confirm button.
+pub async fn copy_confirm(
+    State(state): State<Arc<AppState>>,
+    Query(q): Query<CopyQuery>,
+) -> Response {
+    let now = chrono::Utc::now().timestamp();
+    match confirm_copy(&store(&state), &state.secrets.jwt_secret, &q.t, now).await {
+        Ok(true) => copy_page(
+            StatusCode::OK,
+            "Confirmed",
+            "<p>You'll get this ticket's emails.</p>",
+            "",
+        ),
+        Ok(false) => copy_page(
+            StatusCode::OK,
+            "Nothing to confirm",
+            "<p>This address is no longer on that ticket.</p>",
+            "",
+        ),
+        Err(_) => copy_page(
+            StatusCode::BAD_REQUEST,
+            "This link doesn't work",
+            "<p>It may be incomplete or too old.</p>",
+            "",
+        ),
+    }
+}
+
+#[derive(Deserialize)]
+pub struct CopyQuery {
+    #[serde(default)]
+    pub t: String,
+}
+
+fn copy_page(status: StatusCode, title: &str, body: &str, _token: &str) -> Response {
+    let html = format!(
+        "<!DOCTYPE html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><meta name=\"referrer\" content=\"no-referrer\"><meta name=\"robots\" content=\"noindex\"><title>{} · Coderhelm</title></head><body style=\"font-family:-apple-system,Segoe UI,Helvetica,Arial,sans-serif;max-width:480px;margin:48px auto;padding:0 16px\"><h1>{}</h1>{body}</body></html>",
+        esc(title),
+        esc(title)
+    );
+    let mut resp = (status, html).into_response();
+    let h = resp.headers_mut();
+    h.insert(
+        axum::http::header::CONTENT_TYPE,
+        axum::http::HeaderValue::from_static("text/html; charset=utf-8"),
+    );
+    h.insert(
+        axum::http::header::REFERRER_POLICY,
+        axum::http::HeaderValue::from_static("no-referrer"),
+    );
+    h.insert(
+        axum::http::header::CACHE_CONTROL,
+        axum::http::HeaderValue::from_static("no-store"),
+    );
+    resp
+}
+
 /// Send through the install's email route (SES, or CoderHelm's relay on a
 /// self-hosted install that chose it). A failed email is logged, never a
 /// failed request: the ticket is already saved.
 pub(crate) async fn send(state: &AppState, mail: Mail) {
     use common::mail::{self as m, templates::fit};
+    if mail.outside && !outside_allowed(state, &mail.to).await {
+        warn!("support email to an outside address skipped: its daily cap is reached");
+        return;
+    }
     let out = m::Mail {
         kind: "support".into(),
         to: mail.to.clone(),
@@ -2048,7 +2313,9 @@ pub(crate) async fn send(state: &AppState, mail: Mail) {
         },
     };
     if let Err(e) = m::send(&super::email_settings::sender(state), &out).await {
-        warn!(code = %e.code, error = %e.message, "support email not sent");
+        // The message can name the recipient (SES names identities): log the
+        // code only.
+        warn!(code = %e.code, "support email not sent");
     }
 }
 
@@ -2350,6 +2617,13 @@ pub async fn create_handler(
     if common::public_urls::self_hosted() {
         super::hybrid_support::ticket_opened(&state, &ticket, &first).await;
     }
+    let outside: Vec<String> = ticket
+        .participants
+        .iter()
+        .filter(|p| p.outside)
+        .map(|p| p.email.clone())
+        .collect();
+    ask_outside_to_confirm(&state, &ticket, &outside).await;
     let (ticket, thread) = open_for_team(&st, &caller, &ticket.id)
         .await
         .map_err(Fail::reply)?;
@@ -2527,6 +2801,13 @@ pub async fn move_handler(
     )
     .await;
     send(&state, mail_new_ticket(&inbox(), &ticket, &first.body)).await;
+    let outside: Vec<String> = ticket
+        .participants
+        .iter()
+        .filter(|p| p.outside)
+        .map(|p| p.email.clone())
+        .collect();
+    ask_outside_to_confirm(&state, &ticket, &outside).await;
     let (ticket, thread) = open_for_team(&st, &caller, &ticket.id)
         .await
         .map_err(Fail::reply)?;
@@ -2644,12 +2925,17 @@ async fn people_change(
     if side == Side::Team {
         caller = named(caller, &team_members(state, &claims.team_id).await);
     }
-    if add {
+    let changed = if add {
         add_participant(&st, &members, &caller, side, id, who).await
     } else {
         remove_participant(&st, &caller, side, id, who).await
     }
     .map_err(Fail::reply)?;
+    if add {
+        if let Some(e) = who.email() {
+            ask_outside_to_confirm(state, &changed, &[e.to_string()]).await;
+        }
+    }
     match side {
         Side::Team => {
             let (t, thread) = open_for_team(&st, &caller, id).await.map_err(Fail::reply)?;
@@ -3086,6 +3372,84 @@ pub fn from_install(t: &Ticket) -> bool {
 
 #[cfg(test)]
 mod tests {
+
+    #[tokio::test]
+    async fn an_outside_address_gets_ticket_mail_only_after_it_confirms_and_never_the_subject() {
+        let store = Mem::default();
+        let alice = person("alpha", "alice");
+        let t = file(
+            &store,
+            &alice,
+            "Your workspace is suspended, verify at evil-verify.vip",
+        )
+        .await;
+        let t = add_participant(
+            &store,
+            &none_roster(),
+            &alice,
+            Side::Team,
+            &t.id,
+            &addr("guest@example.org"),
+        )
+        .await
+        .unwrap();
+        // Before it confirms: no ticket mail at all.
+        assert!(mail_status(&t, "resolved", "Alice")
+            .iter()
+            .all(|m| m.to != "guest@example.org"));
+        // The one confirmation email carries nothing the team wrote.
+        let link = copy_confirm_link(
+            "secret",
+            &t.team_id,
+            &t.id,
+            "guest@example.org",
+            1_800_000_000,
+        );
+        let ask = mail_copy_confirm("guest@example.org", &link);
+        assert!(
+            ask.outside && !ask.subject.contains("suspended") && !ask.text.contains("suspended")
+        );
+        // A forged or other-purpose token confirms nothing.
+        assert!(confirm_copy(&store, "secret", "x.y", 1_800_000_000)
+            .await
+            .is_err());
+        let token = link.split("t=").nth(1).unwrap();
+        assert!(confirm_copy(&store, "other-secret", token, 1_800_000_000)
+            .await
+            .is_err());
+        assert!(
+            confirm_copy(&store, "secret", token, 1_800_000_000 + COPY_CONFIRM_SECS)
+                .await
+                .is_err()
+        );
+        assert!(confirm_copy(&store, "secret", token, 1_800_000_001)
+            .await
+            .unwrap());
+        let t = store.load(&t.team_id, &t.id).await.unwrap().unwrap();
+        let mails = mail_status(&t, "resolved", "Alice");
+        let guest = mails
+            .iter()
+            .find(|m| m.to == "guest@example.org")
+            .expect("confirmed: mailed");
+        assert!(guest.outside);
+        assert_eq!(guest.subject, OUTSIDE_SUBJECT);
+        assert!(!guest.text.contains("suspended") && !guest.html.contains("suspended"));
+        // Customer-set-off mail is never signed as support.
+        assert!(mails
+            .iter()
+            .all(|m| !m.html.contains("Coderhelm support</p>")));
+    }
+
+    #[test]
+    fn subjects_lose_links_and_account_wording() {
+        assert_eq!(safe_subject("Help with deploys"), "Help with deploys");
+        assert!(!safe_subject("Login at evil-reset.vip now").contains("evil-reset"));
+        assert_eq!(
+            safe_subject("Your Coderhelm account will be closed"),
+            "Support ticket"
+        );
+    }
+
     #[test]
     fn an_empty_prefix_never_reaches_begins_with() {
         // DynamoDB refuses begins_with(sk, ""): the admin queue reads every
@@ -4401,6 +4765,12 @@ mod tests {
         .await
         .unwrap();
 
+        // The outside address gets ticket mail once it confirmed.
+        let mut confirmed = store.load(&t.team_id, &t.id).await.unwrap().unwrap();
+        for p in confirmed.participants.iter_mut().filter(|p| p.outside) {
+            p.confirmed_at = "2026-01-01T00:00:00Z".into();
+        }
+        store.save(&confirmed).await.unwrap();
         let (t, m) = admin_reply(&store, &staff, &t.id, "Fixed in the runner.", None)
             .await
             .unwrap();
@@ -4410,7 +4780,7 @@ mod tests {
             to,
             ["alice@example.com", "bob@example.com", "guest@example.org"]
         );
-        for mail in &mails {
+        for mail in mails.iter().filter(|m| !m.outside) {
             assert!(mail.text.contains(
                 "People on this ticket: alice (filed), bob name, guest@example.org (copied)"
             ));
@@ -4440,7 +4810,14 @@ mod tests {
             .unwrap();
         let mails = mail_status(&t, action.as_deref().unwrap(), "Coderhelm support");
         assert_eq!(mails.len(), 3);
-        assert!(mails.iter().all(|m| m.subject.starts_with("Resolved: ")));
+        assert!(mails
+            .iter()
+            .filter(|m| !m.outside)
+            .all(|m| m.subject.starts_with("Resolved: ")));
+        assert!(mails
+            .iter()
+            .filter(|m| m.outside)
+            .all(|m| m.subject == OUTSIDE_SUBJECT));
 
         // A teammate's reply goes to support's inbox, naming who is on it.
         let (t, m) = reply_as_customer(&store, &none(), &alice, &t.id, "Back again", &[])
@@ -4588,15 +4965,11 @@ mod tests {
 
         // They get the same emails as people added later, and support sees
         // who is on it from the first email.
+        // An outside address gets them only once it confirms.
         let to: Vec<String> = recipients(&t).into_iter().map(|r| r.email).collect();
         assert_eq!(
             to,
-            [
-                "alice@example.com",
-                "bob@example.com",
-                "carol@example.com",
-                "guest@example.org"
-            ]
+            ["alice@example.com", "bob@example.com", "carol@example.com"]
         );
         let new = mail_new_ticket("inbox@example.com", &t, &first.body);
         assert!(new

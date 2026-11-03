@@ -1035,3 +1035,18 @@ test("the deploy role may create and tag every resource a self-host install crea
   }
   assert.deepEqual([...gaps].sort(), []);
 });
+
+test("hosted SES templates escape every value (double braces, never triple)", () => {
+  // Handlebars HTML-escapes {{x}}; {{{x}}} would put an org name or a title
+  // into the email as raw HTML.
+  // From source (test/) or compiled (dist/test/): the stack's source file.
+  const file = [
+    path.join(__dirname, "..", "lib", "email-stack.ts"),
+    path.join(__dirname, "..", "..", "lib", "email-stack.ts"),
+  ].find((f) => fs.existsSync(f));
+  assert.ok(file, "email-stack.ts not found");
+  const src = fs.readFileSync(file, "utf8");
+  assert.ok(src.includes("{{org}}") && src.includes("{{title}}"));
+  assert.equal(src.includes("{{{"), false);
+  assert.equal(src.includes("{{&"), false);
+});

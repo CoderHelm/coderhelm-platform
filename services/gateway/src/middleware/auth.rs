@@ -491,6 +491,29 @@ async fn current_role(state: &AppState, claims: &crate::models::Claims) -> Optio
     )
 }
 
+/// Whether the request carries a valid session for `email` on `team_id`
+/// (the session cookie only; never an API key or a support view). Email
+/// links that answer something ask for this, so a forwarded email can't act
+/// as the person it was sent to.
+pub fn signed_in_as(
+    headers: &axum::http::HeaderMap,
+    secret: &str,
+    team_id: &str,
+    email: &str,
+) -> bool {
+    let cookie_header = headers
+        .get("cookie")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    let Some(token) = extract_cookie(cookie_header, "__Host-coderhelm_session") else {
+        return false;
+    };
+    let Ok(claims) = jwt::validate_token(token, secret) else {
+        return false;
+    };
+    claims.team_id == team_id && claims.email.trim().eq_ignore_ascii_case(email.trim())
+}
+
 fn extract_cookie<'a>(cookie_header: &'a str, name: &str) -> Option<&'a str> {
     cookie_header
         .split(';')
@@ -502,6 +525,31 @@ fn extract_cookie<'a>(cookie_header: &'a str, name: &str) -> Option<&'a str> {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn an_email_link_answers_only_for_its_recipient_signed_in() {
+        let token = crate::auth::jwt::create_token(
+            "USER#a",
+            "TEAM#t",
+            "ann@example.org",
+            "member",
+            None,
+            "s3cret",
+            3600,
+        )
+        .unwrap();
+        let mut h = axum::http::HeaderMap::new();
+        assert!(!signed_in_as(&h, "s3cret", "TEAM#t", "ann@example.org"));
+        h.insert(
+            "cookie",
+            format!("__Host-coderhelm_session={token}").parse().unwrap(),
+        );
+        assert!(signed_in_as(&h, "s3cret", "TEAM#t", "Ann@Example.org"));
+        assert!(!signed_in_as(&h, "s3cret", "TEAM#t", "bob@example.org"));
+        assert!(!signed_in_as(&h, "s3cret", "TEAM#other", "ann@example.org"));
+        assert!(!signed_in_as(&h, "wrong", "TEAM#t", "ann@example.org"));
+    }
+
     use super::*;
 
     #[test]

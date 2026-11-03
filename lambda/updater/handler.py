@@ -73,6 +73,7 @@ checks are documented in docs/self-host/domains.md.
 """
 
 import json
+import urllib.parse
 import logging
 import os
 import re
@@ -593,6 +594,19 @@ def from_header(name, address):
     return f"{enc} <{address}>"
 
 
+def safe_link(raw):
+    """A button's link as it is sent: an https:// link with no space or control
+    character (a parser drops line breaks, so the raw text could carry other
+    words past a host check), written back from its parsed parts. Anything
+    else: None, and the button is left out."""
+    if not isinstance(raw, str) or not raw or any(c.isspace() or ord(c) < 32 or ord(c) == 127 for c in raw):
+        return None
+    u = urllib.parse.urlsplit(raw)
+    if u.scheme != "https" or not u.hostname or u.username or u.password or u.port:
+        return None
+    return urllib.parse.urlunsplit(u)
+
+
 def notice_link(what, env):
     anchor = {"blocked": "#readiness", "domain_live": "#domain", "domain_failed": "#domain",
               "domain_removed": "#domain"}.get(what, "")
@@ -731,9 +745,10 @@ def notice(what, version, env, facts=None):
                         'font-family:SFMono-Regular,Menlo,Consolas,monospace;font-size:13px;color:#222;white-space:pre-wrap;word-break:break-all">'
                         f"<code>{esc(fill(part[1]))}</code></pre>")
     for label, key in buttons:
-        if v.get(key):
-            text.append(f"{label}: {v[key]}")
-            html.append(f'<p style="margin:0 0 16px"><a href="{esc(v[key])}" style="display:inline-block;background:#222;color:#fff;'
+        link = safe_link(v.get(key))
+        if link:
+            text.append(f"{label}: {link}")
+            html.append(f'<p style="margin:0 0 16px"><a href="{esc(link)}" style="display:inline-block;background:#222;color:#fff;'
                         f'padding:10px 16px;border-radius:6px;text-decoration:none">{esc(label)}</a></p>')
     footer = f"Sent by the self-hosted CoderHelm install at {v['install']} to its admins."
     text += ["", footer]
