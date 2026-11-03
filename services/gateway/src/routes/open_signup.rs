@@ -212,7 +212,10 @@ mod tests {
         // the only domain rule is the self-hosted one in sign_in.rs. An
         // email at a team's domain therefore never lands on that team.
         let code = hosted_part(AUTH);
-        assert!(!code.contains("EMAIL#*@"), "no domain wildcard on hosted sign-in");
+        assert!(
+            !code.contains("EMAIL#*@"),
+            "no domain wildcard on hosted sign-in"
+        );
         assert!(!code.contains("is_email_allowed"), "no allowlist gate left");
         assert!(code.contains(r#"format!("EMAIL#{}", normalize_email("#));
     }
