@@ -29,6 +29,7 @@ import * as targets from "aws-cdk-lib/aws-route53-targets";
 import * as apigwv2 from "aws-cdk-lib/aws-apigatewayv2";
 import { Construct } from "constructs";
 import { ResolvedConfig } from "./config";
+import { hostedKeyPolicy, KEY_PENDING_WINDOW } from "./key-policy";
 
 /** contract/reserved_names.json, shared with the gateway (common::hybrid::names). */
 export const RESERVED_NAMES_FILE = path.join(__dirname, "..", "..", "services", "common", "contract", "reserved_names.json");
@@ -214,7 +215,14 @@ export class Hybrid extends Construct {
       keyUsage: kms.KeyUsage.SIGN_VERIFY,
       alias: hybridSigningAlias(cfg.prefix),
       removalPolicy: cdk.RemovalPolicy.RETAIN,
+      pendingWindow: KEY_PENDING_WINDOW,
+      policy: hostedKeyPolicy(cdk.Stack.of(this), cfg, "signing"),
     });
+    // The policy denies CloudFormation itself any later policy change, which
+    // KMS's lockout check would refuse; people keep it through the SSO
+    // administrator role. A later change to this key's policy is applied by
+    // hand (docs/hosted-operations.md, "Signing key policy").
+    (this.signingKey.node.defaultChild as kms.CfnKey).bypassPolicyLockoutSafetyCheck = true;
     this.signingKey.addToResourcePolicy(
       new iam.PolicyStatement({
         sid: "OnlyCoderHelmSignersSign",
@@ -226,6 +234,7 @@ export class Hybrid extends Construct {
       }),
     );
     fn_.addEnvironment("HYBRID_SIGNING_KEY", hybridSigningAlias(cfg.prefix));
+    grantHybridMaster(fn_, cdk.Stack.of(this), cfg.hybridMasterSecretName);
     fn_.addToRolePolicy(
       new iam.PolicyStatement({
         sid: "HybridSign",
@@ -238,4 +247,16 @@ export class Hybrid extends Construct {
 
     new cdk.CfnOutput(this, "FallbackDomain", { value: this.fallback.distributionDomainName, description: `The {name}.${h.zone} fallback site` });
   }
+}
+
+/** Read access to the hybrid master key's own secret, and its name in the environment. */
+export function grantHybridMaster(fn: lambda.Function, stack: cdk.Stack, name: string): void {
+  fn.addEnvironment("HYBRID_MASTER_SECRET", name);
+  fn.addToRolePolicy(
+    new iam.PolicyStatement({
+      sid: "ReadHybridMasterSecret",
+      actions: ["secretsmanager:GetSecretValue"],
+      resources: [`arn:${stack.partition}:secretsmanager:${stack.region}:${stack.account}:secret:${name}-??????`],
+    }),
+  );
 }

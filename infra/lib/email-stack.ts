@@ -60,6 +60,15 @@ export class EmailStack extends cdk.Stack {
           ses.EmailSendingEvent.REJECT,
         ],
       });
+    } else {
+      // Without the worker counting them: bounces, complaints and rejections
+      // still show as CloudWatch metrics for this set (SES namespace).
+      this.configSet.addEventDestination("Problems", {
+        destination: ses.EventDestination.cloudWatchDimensions([
+          { name: "ses:configuration-set", source: ses.CloudWatchDimensionSource.MESSAGE_TAG, defaultValue: `${prefix}-emails` },
+        ]),
+        events: [ses.EmailSendingEvent.BOUNCE, ses.EmailSendingEvent.COMPLAINT, ses.EmailSendingEvent.REJECT],
+      });
     }
 
     // SES email identity: a domain (its DKIM records are created for you
@@ -220,10 +229,22 @@ export class EmailStack extends cdk.Stack {
       },
     });
 
-    // Grant SES send permissions to both lambdas
+    // Grant SES send permissions to both lambdas. CoderHelm's own deployment
+    // shares its AWS account (and SES) with other products and with the mail
+    // relay: its sends are limited to its identity, this configuration set
+    // and its templates, so noreply mail can't go out through anything else.
+    // (The set's name is written out: a reference would make the api and
+    // worker stacks import from this one, which already depends on them.)
+    const sesResources = cfg.hybrid && cfg.email.identity
+      ? [
+          `arn:${this.partition}:ses:${this.region}:${this.account}:identity/${cfg.email.identity}`,
+          `arn:${this.partition}:ses:${this.region}:${this.account}:configuration-set/${prefix}-emails`,
+          `arn:${this.partition}:ses:${this.region}:${this.account}:template/${prefix}-*`,
+        ]
+      : ["*"];
     const sesPolicy = new iam.PolicyStatement({
       actions: ["ses:SendEmail", "ses:SendTemplatedEmail"],
-      resources: ["*"],
+      resources: sesResources,
       conditions: {
         StringEquals: {
           "ses:FromAddress": cfg.email.from,

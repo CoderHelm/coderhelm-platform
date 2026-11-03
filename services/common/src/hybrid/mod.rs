@@ -55,9 +55,41 @@ pub fn is_hosted_side(master_key: Option<&str>) -> bool {
     master_key.is_some_and(|k| k.trim().len() >= 32)
 }
 
+/// The master key from its own secret's value: the key itself, or a JSON
+/// object holding it as `hybrid_master_key`. None when neither is a real key.
+pub fn master_key_from_secret(raw: &str) -> Option<String> {
+    let raw = raw.trim();
+    let key = if raw.starts_with('{') {
+        serde_json::from_str::<serde_json::Value>(raw)
+            .ok()?
+            .get("hybrid_master_key")?
+            .as_str()?
+            .trim()
+            .to_string()
+    } else {
+        raw.to_string()
+    };
+    is_hosted_side(Some(&key)).then_some(key)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_master_key_reads_from_its_own_secret_plain_or_json() {
+        let k = "k".repeat(40);
+        assert_eq!(master_key_from_secret(&k).as_deref(), Some(k.as_str()));
+        assert_eq!(
+            master_key_from_secret(&format!("  {k}\n")).as_deref(),
+            Some(k.as_str())
+        );
+        let j = format!("{{\"hybrid_master_key\":\"{k}\"}}");
+        assert_eq!(master_key_from_secret(&j).as_deref(), Some(k.as_str()));
+        assert_eq!(master_key_from_secret("short"), None);
+        assert_eq!(master_key_from_secret("{\"other\":\"x\"}"), None);
+        assert_eq!(master_key_from_secret("{not json"), None);
+    }
 
     #[test]
     fn the_hosted_side_needs_a_real_master_key() {

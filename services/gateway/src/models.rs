@@ -194,7 +194,33 @@ impl Secrets {
         let secret_string = response
             .secret_string()
             .ok_or("Secret has no string value")?;
-        let secrets: Secrets = serde_json::from_str(secret_string)?;
+        let mut secrets: Secrets = serde_json::from_str(secret_string)?;
+        // The hosted side keeps the hybrid master key in a secret of its own
+        // (HYBRID_MASTER_SECRET). Until that secret exists, or when it can't
+        // be read, the field in the main secret is used.
+        if let Ok(name) = std::env::var("HYBRID_MASTER_SECRET") {
+            if !name.trim().is_empty() {
+                match client
+                    .get_secret_value()
+                    .secret_id(name.trim())
+                    .send()
+                    .await
+                {
+                    Ok(r) => match r
+                        .secret_string()
+                        .and_then(common::hybrid::master_key_from_secret)
+                    {
+                        Some(k) => secrets.hybrid_master_key = Some(k),
+                        None => tracing::warn!(
+                            "Hybrid master secret has no usable key; using the main secret's"
+                        ),
+                    },
+                    Err(e) => {
+                        tracing::warn!(error = %e, "Hybrid master secret not read; using the main secret's")
+                    }
+                }
+            }
+        }
         Ok(secrets)
     }
 }

@@ -5,6 +5,7 @@ import * as cr from "aws-cdk-lib/custom-resources";
 import * as iam from "aws-cdk-lib/aws-iam";
 import { Construct } from "constructs";
 import { ResolvedConfig } from "./config";
+import { hostedKeyPolicy, KEY_PENDING_WINDOW } from "./key-policy";
 
 interface DatabaseStackProps extends cdk.StackProps {
   stage: string;
@@ -47,6 +48,8 @@ export class DatabaseStack extends cdk.Stack {
       description: "Coderhelm DynamoDB encryption key",
       enableKeyRotation: true,
       removalPolicy: cdk.RemovalPolicy.RETAIN,
+      pendingWindow: KEY_PENDING_WINDOW,
+      policy: hostedKeyPolicy(this, props.cfg, "symmetric"),
     });
 
     // KMS key that seals the keys teams give Coderhelm for their own systems
@@ -57,6 +60,8 @@ export class DatabaseStack extends cdk.Stack {
       description: "Coderhelm: seals team-provided keys for data sources",
       enableKeyRotation: true,
       removalPolicy: cdk.RemovalPolicy.RETAIN,
+      pendingWindow: KEY_PENDING_WINDOW,
+      policy: hostedKeyPolicy(this, props.cfg, "symmetric"),
     });
 
     // ──────────────────────────────────────────────
