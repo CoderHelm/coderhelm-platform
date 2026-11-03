@@ -15,7 +15,7 @@ import * as cdk from "aws-cdk-lib";
 import { Match, Template } from "aws-cdk-lib/assertions";
 import { buildApp } from "../lib/app";
 import { CoderhelmConfig, loadConfigFile, resolveConfig, ResolvedConfig } from "../lib/config";
-import { API_PATHS, STREAM_PATH, runtimeConfigScript } from "../lib/web-stack";
+import { API_PATHS, BRAIN_STREAM_PATH, STREAM_PATH, runtimeConfigScript } from "../lib/web-stack";
 import { releaseCheckBuildSpec, updateBuildSpec } from "../lib/updates-stack";
 import { CHECK_VERSION, COSIGN_LINUX_AMD64_SHA256, VERIFY_SUMS, verifyTagCommands } from "../lib/release-verify";
 import { accessNames, deployPolicy } from "../lib/access";
@@ -149,10 +149,11 @@ test("fresh self-host config without a domain: nothing hosted-specific, one Clou
   }
   t["coderhelm-prod-web"].hasResourceProperties("AWS::SSM::Parameter", { Name: "/coderhelm-prod/public-url" });
 
-  // One distribution: the stream first, then the API paths, then the dashboard.
+  // One distribution: the streams first (Chat's answers outlast the HTTP API's
+  // 30 seconds), then the API paths, then the dashboard.
   const dist = Object.values(t["coderhelm-prod-web"].findResources("AWS::CloudFront::Distribution"))[0] as any;
   const paths = dist.Properties.DistributionConfig.CacheBehaviors.map((b: any) => b.PathPattern);
-  assert.deepEqual(paths, [STREAM_PATH, ...API_PATHS]);
+  assert.deepEqual(paths, [STREAM_PATH, BRAIN_STREAM_PATH, ...API_PATHS]);
   assert.equal(dist.Properties.DistributionConfig.Aliases, undefined);
 
   // No Google sign-in, no OAuth client, Cognito's own email.
@@ -626,7 +627,7 @@ test("CORS: the gateway answers browsers, not API Gateway; the docs origin never
   assert.equal(envOf(t["coderhelm-prod-api"], "coderhelm-prod-gateway").CORS_ORIGINS, undefined);
   const dist = Object.values(t["coderhelm-prod-web"].findResources("AWS::CloudFront::Distribution"))[0] as any;
   for (const b of dist.Properties.DistributionConfig.CacheBehaviors) {
-    if (b.PathPattern === STREAM_PATH) continue;
+    if (b.PathPattern === STREAM_PATH || b.PathPattern === BRAIN_STREAM_PATH) continue;
     assert.equal(b.ResponseHeadersPolicyId, undefined, `${b.PathPattern} rewrites the API's headers`);
   }
   assert.ok(API_PATHS.includes("/api/*"), "the setup routes go through the API behavior");
