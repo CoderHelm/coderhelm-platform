@@ -353,8 +353,9 @@ pub fn hostname_from(body: &Value) -> Result<String, &'static str> {
 }
 
 /// PUT /api/system/domain `{hostname}`: use your own domain. The updater
-/// requests its certificate (and adds the validation record when the zone
-/// is in Route 53 in this account); the domain goes live once it is issued.
+/// requests its certificate and writes nothing to DNS: the records are shown,
+/// and a Route 53 zone here is only offered (POST /api/system/domain/route53).
+/// The domain goes live once the certificate is issued.
 pub async fn set_domain(
     State(state): State<Arc<AppState>>,
     Extension(claims): Extension<Claims>,
@@ -367,6 +368,37 @@ pub async fn set_domain(
     let body = call(
         &state,
         json!({ "action": "domain_set", "hostname": hostname, "actor": claims.email }),
+    )
+    .await
+    .map_err(status_only)?;
+    answer(body)
+}
+
+/// POST /api/system/domain/route53 `{zone}`: an admin's go-ahead to add the
+/// domain's records to the Route 53 zone the page named. Nothing is written to
+/// DNS without it; the updater creates only the two records and stops if
+/// either name already holds one.
+pub async fn use_route53_domain(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<Claims>,
+    Json(body): Json<Value>,
+) -> Reply {
+    claims.require_role(3).map_err(status_only)?;
+    allowed(&claims).map_err(status_only)?;
+    let zone = body
+        .get("zone")
+        .and_then(Value::as_str)
+        .map(|z| z.trim().trim_end_matches('.').to_ascii_lowercase())
+        .unwrap_or_default();
+    if zone.is_empty() || zone.len() > 253 || zone.contains(char::is_whitespace) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "name the zone the records go in" })),
+        ));
+    }
+    let body = call(
+        &state,
+        json!({ "action": "domain_use_route53", "zone": zone, "actor": claims.email }),
     )
     .await
     .map_err(status_only)?;

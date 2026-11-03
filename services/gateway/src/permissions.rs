@@ -738,6 +738,7 @@ pub const CAPABILITIES: &[Capability] = &[
             "system::domain",
             "system::set_domain",
             "system::remove_domain",
+            "system::use_route53_domain",
             "setup_checks::checks",
             "setup_checks::preflight_route",
             "hybrid_install::get_status",

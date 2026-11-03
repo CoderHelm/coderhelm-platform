@@ -482,3 +482,30 @@ test("without access: no boundary, no names or tags added, the CDK bootstrap as 
 test("the boundary's services list has no wildcard service and no IAM", () => {
   for (const a of BOUNDARY_SERVICES) assert.ok(!a.startsWith("iam:") && a !== "*" && a !== "*:*", a);
 });
+
+test("a native install's zone: the deploy role only creates or deletes its A/AAAA alias, never UPSERTs", () => {
+  // eslint-disable-next-line @typescript-eslint/no-var-requires
+  const { deployPolicy } = require("../lib/access");
+  // eslint-disable-next-line @typescript-eslint/no-var-requires
+  const { nativeNames } = require("../lib/native/parent");
+  const dns = deployPolicy(nativeNames()).Statement.find((s: any) => s.Sid === "DnsRecords");
+  assert.equal(dns.Action, "route53:ChangeResourceRecordSets");
+  assert.equal(dns.Resource, "arn:${AWS::Partition}:route53:::hostedzone/${DomainZoneId}");
+  assert.deepEqual(dns.Condition["ForAllValues:StringEquals"], {
+    "route53:ChangeResourceRecordSetsRecordTypes": ["A", "AAAA"],
+    "route53:ChangeResourceRecordSetsActions": ["CREATE", "DELETE"],
+  });
+});
+
+test("the updater only creates the certificate's validation CNAME, after an admin confirms the zone", () => {
+  const R = synth()["coderhelm-prod-updates"].Resources;
+  const statements = Object.values<any>(R)
+    .filter((r) => r.Type === "AWS::IAM::Policy")
+    .flatMap((r) => r.Properties.PolicyDocument.Statement);
+  const v = statements.find((s: any) => s.Sid === "DomainValidationRecord");
+  assert.deepEqual(v.Condition["ForAllValues:StringEquals"]["route53:ChangeResourceRecordSetsActions"], ["CREATE"]);
+  assert.deepEqual(v.Condition["ForAllValues:StringEquals"]["route53:ChangeResourceRecordSetsRecordTypes"], ["CNAME"]);
+  assert.deepEqual(v.Condition["ForAllValues:StringLike"]["route53:ChangeResourceRecordSetsNormalizedRecordNames"], ["_*"]);
+  // No other statement of the updater may change records.
+  assert.equal(statements.filter((s: any) => ([] as string[]).concat(s.Action).includes("route53:ChangeResourceRecordSets")).length, 1);
+});
