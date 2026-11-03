@@ -483,6 +483,7 @@ async fn main() -> Result<(), Error> {
         .route("/alerts/event", get(routes::alerts::get_event))
         .route("/reviewer/reviews", get(routes::reviewer::list_reviews))
         .route("/reviewer/review", get(routes::reviewer::get_review))
+        .route("/reviewer/session", get(routes::reviewer::get_session))
         .route("/reviewer/live", get(routes::reviewer::live_prs))
         .route("/reviewer/open-prs", get(routes::reviewer::open_prs))
         .route(

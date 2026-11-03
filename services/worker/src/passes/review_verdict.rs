@@ -173,7 +173,8 @@ pub fn decide(input: Input, ctx: &Context) -> Decision {
 
 /// Posts the formal review `decision` asked for: one batched review with
 /// inline comments, falling back to body-only when GitHub rejects an anchor.
-/// The only caller of the GitHub review endpoints.
+/// The only caller of the GitHub review endpoints. Returns the posted
+/// review's GitHub link (empty when GitHub sent none).
 pub async fn post(
     github: &GitHubClient,
     msg: &ReviewMessage,
@@ -182,7 +183,7 @@ pub async fn post(
     dismiss_stale: bool,
     body: &str,
     inline: &[InlineComment],
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
     let posted = github
         .create_pr_review_inline(
             &msg.repo_owner,
@@ -194,23 +195,26 @@ pub async fn post(
             inline,
         )
         .await;
-    if let Err(e) = posted {
-        warn!(pr = msg.pr_number, error = %e, "Inline review post failed — retrying body-only");
-        let body_only = super::review_agent::fold_inline_into_body(body, inline);
-        github
-            .create_pr_review(
-                &msg.repo_owner,
-                &msg.repo_name,
-                msg.pr_number,
-                event,
-                &body_only,
-            )
-            .await?;
-    }
+    let review = match posted {
+        Ok(r) => r,
+        Err(e) => {
+            warn!(pr = msg.pr_number, error = %e, "Inline review post failed — retrying body-only");
+            let body_only = super::review_agent::fold_inline_into_body(body, inline);
+            github
+                .create_pr_review(
+                    &msg.repo_owner,
+                    &msg.repo_name,
+                    msg.pr_number,
+                    event,
+                    &body_only,
+                )
+                .await?
+        }
+    };
     if dismiss_stale {
         dismiss_stale_change_requests(github, msg, head).await;
     }
-    Ok(())
+    Ok(review["html_url"].as_str().unwrap_or_default().to_string())
 }
 
 /// Dismisses CoderHelm's own "changes requested" reviews on the PR, after a

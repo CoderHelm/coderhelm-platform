@@ -3014,6 +3014,170 @@
         ],
         "type": "object"
       },
+      "ReviewSession": {
+        "description": "One review job, step by step: what CoderHelm's \"CoderHelm review\" check\nlinks to. Each job has its own session, so an older check keeps showing\nits own review.",
+        "properties": {
+          "attempt": {
+            "description": "Which try this job is, from 0.",
+            "examples": [
+              0
+            ],
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "check_run_id": {
+            "description": "The GitHub check run that links here, when GitHub allowed one.",
+            "examples": [
+              31337000
+            ],
+            "format": "int64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "findings": {
+            "description": "How many findings the review kept, once there is a verdict.",
+            "examples": [
+              2
+            ],
+            "format": "int64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "finished_at": {
+            "description": "When it ended (RFC 3339); empty while it runs.",
+            "examples": [
+              "2026-10-22T14:20:05+00:00"
+            ],
+            "type": "string"
+          },
+          "head_sha": {
+            "description": "The commit reviewed.",
+            "examples": [
+              "9fceb02d0ae598e95dc970b74767f19372d61af8"
+            ],
+            "type": "string"
+          },
+          "id": {
+            "description": "The session's id (the review job's id).",
+            "examples": [
+              "3f2c9a1e-5b7d-4c8e-9a0b-1c2d3e4f5a6b"
+            ],
+            "type": "string"
+          },
+          "in_flight": {
+            "description": "True while the review is still running.",
+            "examples": [
+              false
+            ],
+            "type": "boolean"
+          },
+          "kind": {
+            "description": "`review`, or `question` for an answer to a comment.",
+            "examples": [
+              "review"
+            ],
+            "type": "string"
+          },
+          "pr_number": {
+            "description": "The pull request number.",
+            "examples": [
+              318
+            ],
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "pr_title": {
+            "description": "The pull request's title.",
+            "examples": [
+              "Rate-limit the login form"
+            ],
+            "type": "string"
+          },
+          "reason": {
+            "description": "Why it ended without a review, when it did. Empty otherwise.",
+            "examples": [
+              ""
+            ],
+            "type": "string"
+          },
+          "repo": {
+            "description": "The repository, `owner/name`.",
+            "examples": [
+              "acme/web"
+            ],
+            "type": "string"
+          },
+          "review_url": {
+            "description": "The review posted on GitHub; empty when nothing new was posted.",
+            "examples": [
+              "https://github.com/acme/web/pull/318#pullrequestreview-2201"
+            ],
+            "type": "string"
+          },
+          "started_at": {
+            "description": "When it started (RFC 3339).",
+            "examples": [
+              "2026-10-22T14:18:00+00:00"
+            ],
+            "type": "string"
+          },
+          "status": {
+            "description": "`reviewing`, `done`, `skipped`, `retrying` (didn't finish and was\nsent again; the retry has its own session), `failed`, or `stalled`\n(the job stopped without saying how it ended).",
+            "examples": [
+              "done"
+            ],
+            "type": "string"
+          },
+          "steps": {
+            "description": "The steps so far, oldest first.",
+            "items": {
+              "$ref": "#/components/schemas/SessionStep"
+            },
+            "type": "array"
+          },
+          "trigger": {
+            "description": "What asked for it, such as `label`, `push`, `rerequest` or `reply`.",
+            "examples": [
+              "push"
+            ],
+            "type": "string"
+          },
+          "verdict": {
+            "description": "The verdict, `APPROVE` or `REQUEST_CHANGES`; empty until there is one.",
+            "examples": [
+              "REQUEST_CHANGES"
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "repo",
+          "pr_number",
+          "pr_title",
+          "head_sha",
+          "trigger",
+          "kind",
+          "status",
+          "in_flight",
+          "attempt",
+          "started_at",
+          "finished_at",
+          "reason",
+          "verdict",
+          "review_url",
+          "steps"
+        ],
+        "type": "object"
+      },
       "ReviewsPage": {
         "description": "A page of reviews.",
         "properties": {
@@ -4276,6 +4440,38 @@
         },
         "required": [
           "secret"
+        ],
+        "type": "object"
+      },
+      "SessionStep": {
+        "description": "One step a review went through.",
+        "properties": {
+          "at": {
+            "description": "When (RFC 3339).",
+            "examples": [
+              "2026-10-22T14:18:02+00:00"
+            ],
+            "type": "string"
+          },
+          "detail": {
+            "description": "More about it, when there is more. Empty otherwise.",
+            "examples": [
+              "src/auth/login.ts\nsrc/auth/limits.ts"
+            ],
+            "type": "string"
+          },
+          "text": {
+            "description": "What happened, in one line.",
+            "examples": [
+              "Read the change: 4 files changed"
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "at",
+          "text",
+          "detail"
         ],
         "type": "object"
       },
@@ -6535,6 +6731,153 @@
           }
         ],
         "summary": "List reviews",
+        "tags": [
+          "Reviews"
+        ]
+      }
+    },
+    "/api/reviewer/session": {
+      "get": {
+        "description": "Returns one review job step by step: the pull request, what asked for the review, its status (live while it runs), when it started and ended, the steps so far, and once it is done the verdict with a link to the review posted on GitHub. The \"CoderHelm review\" check on a pull request links to the session of its review.",
+        "operationId": "getReviewSession",
+        "parameters": [
+          {
+            "description": "The session's id: the review job's id, from the PR's \"CoderHelm\nreview\" check (its Details link) or a PR's status.",
+            "example": "3f2c9a1e-5b7d-4c8e-9a0b-1c2d3e4f5a6b",
+            "in": "query",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ReviewSession"
+                }
+              }
+            },
+            "description": "The session.",
+            "headers": {
+              "RateLimit-Limit": {
+                "description": "Requests this key may make in a minute.",
+                "schema": {
+                  "type": "integer"
+                }
+              },
+              "RateLimit-Remaining": {
+                "description": "Requests left in the current minute.",
+                "schema": {
+                  "type": "integer"
+                }
+              },
+              "RateLimit-Reset": {
+                "description": "Seconds until the current minute ends and the count starts over.",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            }
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "`id` is not a session id."
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "The key is missing, malformed, revoked or expired, or the person who made it left the team."
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "The key lacks the scope this endpoint needs (`missing_scope`)."
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "No such session in the team."
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "Over the key's rate limit (`rate_limited`), or, for endpoints that start work, over the team's monthly token limit (`token_limit_reached`).",
+            "headers": {
+              "RateLimit-Limit": {
+                "description": "Requests this key may make in a minute.",
+                "schema": {
+                  "type": "integer"
+                }
+              },
+              "RateLimit-Remaining": {
+                "description": "Requests left in the current minute.",
+                "schema": {
+                  "type": "integer"
+                }
+              },
+              "RateLimit-Reset": {
+                "description": "Seconds until the current minute ends and the count starts over.",
+                "schema": {
+                  "type": "integer"
+                }
+              },
+              "Retry-After": {
+                "description": "With `rate_limited`: seconds to wait before trying again.",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            }
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "Something failed on CoderHelm's side. Safe to retry reads."
+          }
+        },
+        "security": [
+          {
+            "api_key": [
+              "view"
+            ]
+          }
+        ],
+        "summary": "Get a review session",
         "tags": [
           "Reviews"
         ]

@@ -1044,6 +1044,9 @@ fn gate_detail(
         "repo": repo,
         "pr_number": pr,
         "pr_title": live.map(|l| item_str(l, "pr_title", "")).unwrap_or_default(),
+        // The latest job that started real work: its session page
+        // (`/api/reviewer/session`). Empty before any.
+        "session_id": live.map(|l| item_str(l, "job", "")).unwrap_or_default(),
         "auto_merge": auto_merge,
         "status": st.status,
         "group": st.group,
@@ -1211,6 +1214,188 @@ pub async fn get_review(
         })?;
     let item = result.item().ok_or(StatusCode::NOT_FOUND)?;
     Ok(Json(review_of(item, false)))
+}
+
+#[derive(serde::Deserialize, utoipa::IntoParams)]
+#[into_params(parameter_in = Query)]
+pub struct SessionQuery {
+    /// The session's id: the review job's id, from the PR's "CoderHelm
+    /// review" check (its Details link) or a PR's status.
+    #[param(example = "3f2c9a1e-5b7d-4c8e-9a0b-1c2d3e4f5a6b")]
+    id: String,
+}
+
+/// One step a review went through.
+#[derive(serde::Serialize, utoipa::ToSchema)]
+pub struct SessionStep {
+    /// When (RFC 3339).
+    #[schema(example = "2026-10-22T14:18:02+00:00")]
+    pub at: String,
+    /// What happened, in one line.
+    #[schema(example = "Read the change: 4 files changed")]
+    pub text: String,
+    /// More about it, when there is more. Empty otherwise.
+    #[schema(example = "src/auth/login.ts\nsrc/auth/limits.ts")]
+    pub detail: String,
+}
+
+/// One review job, step by step: what CoderHelm's "CoderHelm review" check
+/// links to. Each job has its own session, so an older check keeps showing
+/// its own review.
+#[derive(serde::Serialize, utoipa::ToSchema)]
+pub struct ReviewSession {
+    /// The session's id (the review job's id).
+    #[schema(example = "3f2c9a1e-5b7d-4c8e-9a0b-1c2d3e4f5a6b")]
+    pub id: String,
+    /// The repository, `owner/name`.
+    #[schema(example = "acme/web")]
+    pub repo: String,
+    /// The pull request number.
+    #[schema(example = 318)]
+    pub pr_number: u64,
+    /// The pull request's title.
+    #[schema(example = "Rate-limit the login form")]
+    pub pr_title: String,
+    /// The commit reviewed.
+    #[schema(example = "9fceb02d0ae598e95dc970b74767f19372d61af8")]
+    pub head_sha: String,
+    /// What asked for it, such as `label`, `push`, `rerequest` or `reply`.
+    #[schema(example = "push")]
+    pub trigger: String,
+    /// `review`, or `question` for an answer to a comment.
+    #[schema(example = "review")]
+    pub kind: String,
+    /// `reviewing`, `done`, `skipped`, `retrying` (didn't finish and was
+    /// sent again; the retry has its own session), `failed`, or `stalled`
+    /// (the job stopped without saying how it ended).
+    #[schema(example = "done")]
+    pub status: String,
+    /// True while the review is still running.
+    #[schema(example = false)]
+    pub in_flight: bool,
+    /// Which try this job is, from 0.
+    #[schema(example = 0)]
+    pub attempt: u64,
+    /// When it started (RFC 3339).
+    #[schema(example = "2026-10-22T14:18:00+00:00")]
+    pub started_at: String,
+    /// When it ended (RFC 3339); empty while it runs.
+    #[schema(example = "2026-10-22T14:20:05+00:00")]
+    pub finished_at: String,
+    /// Why it ended without a review, when it did. Empty otherwise.
+    #[schema(example = "")]
+    pub reason: String,
+    /// The verdict, `APPROVE` or `REQUEST_CHANGES`; empty until there is one.
+    #[schema(example = "REQUEST_CHANGES")]
+    pub verdict: String,
+    /// How many findings the review kept, once there is a verdict.
+    #[schema(example = 2)]
+    pub findings: Option<u64>,
+    /// The review posted on GitHub; empty when nothing new was posted.
+    #[schema(example = "https://github.com/acme/web/pull/318#pullrequestreview-2201")]
+    pub review_url: String,
+    /// The GitHub check run that links here, when GitHub allowed one.
+    #[schema(example = 31_337_000)]
+    pub check_run_id: Option<u64>,
+    /// The steps so far, oldest first.
+    pub steps: Vec<SessionStep>,
+}
+
+/// Pure: the session in `item` as `team_id` sees it. `None` for a record
+/// that isn't a session of that team: a team never reads another's.
+fn session_of(
+    item: &HashMap<String, AttributeValue>,
+    team_id: &str,
+    now: i64,
+) -> Option<ReviewSession> {
+    use common::review_session as rs;
+    let sk = item_str(item, "sk", "");
+    if item_str(item, "pk", "") != team_id || !sk.starts_with(rs::SK_PREFIX) {
+        return None;
+    }
+    let status = rs::effective_status(
+        &item_str(item, "status", ""),
+        item_i64(item, "expires_at"),
+        now,
+    )
+    .to_string();
+    Some(ReviewSession {
+        id: sk[rs::SK_PREFIX.len()..].to_string(),
+        repo: item_str(item, "repo", ""),
+        pr_number: item_num(item, "pr_number", 0),
+        pr_title: item_str(item, "pr_title", ""),
+        head_sha: item_str(item, "head_sha", ""),
+        trigger: item_str(item, "trigger", ""),
+        kind: item_str(item, "kind", "review"),
+        in_flight: status == rs::STATUS_REVIEWING,
+        status,
+        attempt: item_num(item, "attempt", 0),
+        started_at: rfc3339(item_i64(item, "started_at")),
+        finished_at: rfc3339(item_i64(item, "finished_at")),
+        reason: item_str(item, "reason", ""),
+        verdict: item_str(item, "verdict", ""),
+        findings: item
+            .contains_key("findings")
+            .then(|| item_num(item, "findings", 0)),
+        review_url: item_str(item, "review_url", ""),
+        check_run_id: item
+            .contains_key("check_run_id")
+            .then(|| item_num(item, "check_run_id", 0)),
+        steps: rs::steps_of(item)
+            .into_iter()
+            .map(|s| SessionStep {
+                at: rfc3339(Some(s.at)),
+                text: s.text,
+                detail: s.detail,
+            })
+            .collect(),
+    })
+}
+
+/// GET /api/reviewer/session?id= — one review session, step by step.
+#[utoipa::path(
+    get,
+    path = "/api/reviewer/session",
+    tag = "Reviews",
+    operation_id = "getReviewSession",
+    summary = "Get a review session",
+    description = "Returns one review job step by step: the pull request, what asked for the \
+        review, its status (live while it runs), when it started and ended, the steps so far, \
+        and once it is done the verdict with a link to the review posted on GitHub. The \
+        \"CoderHelm review\" check on a pull request links to the session of its review.",
+    params(SessionQuery),
+    responses(
+        (status = 200, description = "The session.", body = ReviewSession),
+        (status = 400, description = "`id` is not a session id.", body = crate::openapi::ErrorBody),
+        (status = 404, description = "No such session in the team.", body = crate::openapi::ErrorBody),
+    ),
+    security(("api_key" = ["view"])),
+)]
+pub async fn get_session(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<Claims>,
+    Query(q): Query<SessionQuery>,
+) -> Result<Json<ReviewSession>, StatusCode> {
+    if !common::review_session::valid_id(&q.id) {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    let result = state
+        .dynamo
+        .get_item()
+        .table_name(&state.config.settings_table_name)
+        .key("pk", attr_s(&claims.team_id))
+        .key("sk", attr_s(&common::review_session::record_sk(&q.id)))
+        .consistent_read(true)
+        .send()
+        .await
+        .map_err(|e| {
+            error!("Failed to fetch review session: {e}");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+    let item = result.item().ok_or(StatusCode::NOT_FOUND)?;
+    session_of(item, &claims.team_id, chrono::Utc::now().timestamp())
+        .map(Json)
+        .ok_or(StatusCode::NOT_FOUND)
 }
 
 #[derive(serde::Deserialize)]
@@ -1428,6 +1613,11 @@ mod tests {
         // No gate yet: still a page, nothing stopped.
         let d = gate_detail("your-team/web", 8, true, None, None, now);
         assert_eq!(d["gate"], Value::Null);
+        assert_eq!(d["session_id"], "");
+        // The latest job's session, for the page's link.
+        let live = item(&[("job", attr_s("j-1")), ("phase", attr_s("done"))]);
+        let d = gate_detail("your-team/web", 8, true, None, Some(&live), now);
+        assert_eq!(d["session_id"], "j-1");
     }
 
     #[test]
@@ -1506,6 +1696,65 @@ mod tests {
             .iter()
             .map(|(k, v)| (k.to_string(), v.clone()))
             .collect()
+    }
+
+    fn session_item(team: &str, status: &str, expires_at: i64) -> HashMap<String, AttributeValue> {
+        use common::review_session as rs;
+        item(&[
+            ("pk", attr_s(team)),
+            (
+                "sk",
+                attr_s(&rs::record_sk("3f2c9a1e-5b7d-4c8e-9a0b-1c2d3e4f5a6b")),
+            ),
+            ("repo", attr_s("acme/web")),
+            ("pr_number", attr_n(318)),
+            ("status", attr_s(status)),
+            ("expires_at", attr_n(expires_at)),
+            ("started_at", attr_n(1_000)),
+            (
+                "steps",
+                AttributeValue::L(vec![
+                    rs::step_value(1_000, "Started reviewing `9fceb02`", ""),
+                    rs::step_value(1_010, "Read the change: 2 files changed", "a\nb"),
+                ]),
+            ),
+        ])
+    }
+
+    #[test]
+    fn a_team_never_reads_another_teams_session() {
+        let theirs = session_item("team-b", "reviewing", 2_000);
+        assert!(session_of(&theirs, "team-a", 1_500).is_none());
+        // A record that isn't a session is refused too.
+        let mut review = session_item("team-a", "done", 0);
+        review.insert("sk".into(), attr_s("REVIEW#acme/web#000318#x"));
+        assert!(session_of(&review, "team-a", 1_500).is_none());
+        // Ids are UUIDs: nothing else reaches a key.
+        assert!(!common::review_session::valid_id("../REVIEW#acme/web"));
+        let ours = session_of(&theirs, "team-b", 1_500).unwrap();
+        assert_eq!(ours.id, "3f2c9a1e-5b7d-4c8e-9a0b-1c2d3e4f5a6b");
+    }
+
+    #[test]
+    fn a_session_reads_its_steps_and_goes_stale_when_its_job_died() {
+        let live = session_of(&session_item("t", "reviewing", 2_000), "t", 1_500).unwrap();
+        assert_eq!(live.status, "reviewing");
+        assert!(live.in_flight);
+        assert_eq!(live.steps.len(), 2);
+        assert_eq!(live.steps[1].text, "Read the change: 2 files changed");
+        assert_eq!(live.steps[1].detail, "a\nb");
+        assert_eq!(live.findings, None);
+        assert_eq!(live.check_run_id, None);
+        assert!(live.finished_at.is_empty());
+        let stalled = session_of(&session_item("t", "reviewing", 2_000), "t", 2_001).unwrap();
+        assert_eq!(stalled.status, "stalled");
+        assert!(!stalled.in_flight);
+        let mut done = session_item("t", "done", 2_000);
+        done.insert("findings".into(), attr_n(0));
+        done.insert("check_run_id".into(), attr_n(77));
+        let done = session_of(&done, "t", 9_999).unwrap();
+        assert_eq!((done.status.as_str(), done.findings), ("done", Some(0)));
+        assert_eq!(done.check_run_id, Some(77));
     }
 
     #[test]

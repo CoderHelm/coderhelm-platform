@@ -11,7 +11,7 @@
 // anything; a few offer an action (such as running `cdk bootstrap`) that the
 // guided install asks about first.
 import crypto from "node:crypto";
-import { PERMISSIONS, EVENTS } from "./github-app.mjs";
+import { PERMISSIONS, REQUIRED_PERMISSIONS, EVENTS } from "./github-app.mjs";
 import { readSecret } from "./secrets.mjs";
 import { derived } from "./util.mjs";
 
@@ -466,14 +466,21 @@ export function appSettingsUrl(app) {
   return org ? `https://github.com/organizations/${org}/settings/apps/${app.slug}` : `https://github.com/settings/apps/${app?.slug}`;
 }
 
-/** The permissions and events that are missing or too weak. */
+/**
+ * The permissions and events that are missing or too weak. `optional`: what
+ * a new app asks for that CoderHelm works without (an older app is warned).
+ */
 export function permissionGaps(app) {
   const have = app?.permissions ?? {};
-  const perms = Object.entries(PERMISSIONS)
-    .filter(([k, need]) => (LEVEL[have[k] ?? "none"] ?? 0) < LEVEL[need])
+  const weak = ([k, need]) => (LEVEL[have[k] ?? "none"] ?? 0) < LEVEL[need];
+  const perms = Object.entries(REQUIRED_PERMISSIONS)
+    .filter(weak)
     .map(([k, need]) => `${PERMISSION_NAMES[k] ?? k}: ${need} (${have[k] ? `now ${have[k]}` : "missing"})`);
+  const optional = Object.entries(PERMISSIONS)
+    .filter((p) => weak(p) && !weak([p[0], REQUIRED_PERMISSIONS[p[0]]]))
+    .map(([k, need]) => `${PERMISSION_NAMES[k] ?? k}: ${need}`);
   const events = EVENTS.filter((e) => !(app?.events ?? []).includes(e));
-  return { perms, events };
+  return { perms, events, optional };
 }
 
 async function gh(ctx, jwt, p) {
@@ -540,12 +547,18 @@ export async function checkGithubApp(ctx, secret, publicUrl, hybrid = null) {
   out.push(pass("github_app", "GitHub accepts the app's keys", `${app.body.slug ?? app.body.name}`));
   const settings = appSettingsUrl(app.body);
 
-  const { perms, events } = permissionGaps(app.body);
+  const { perms, events, optional } = permissionGaps(app.body);
   if (perms.length || events.length) {
     out.push(problem(FAIL, "github_permissions", "GitHub App permissions and events", {
       what: [perms.length && `Permissions to change: ${perms.join(", ")}.`, events.length && `Events to subscribe to: ${events.join(", ")}.`].filter(Boolean).join(" "),
       why: "Without them CoderHelm can't push some changes or misses the events that start work.",
       fix: { text: "Set them on the app's Permissions and events page, save, then accept the new permissions on each installation.", url: `${settings}/permissions` },
+    }));
+  } else if (optional.length) {
+    out.push(problem(WARN, "github_permissions", "GitHub App permissions and events", {
+      what: `Not granted yet: ${optional.join(", ")}.`,
+      why: "Reviews work without it, but pull requests don't show the \"CoderHelm review\" check that links to each review's session.",
+      fix: { text: "Set it on the app's Permissions and events page, save, then accept the new permissions on each installation.", url: `${settings}/permissions` },
     }));
   } else out.push(pass("github_permissions", "GitHub App permissions and events", "all granted"));
 
