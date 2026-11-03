@@ -1570,13 +1570,15 @@ mod tests {
         let id = sign::new_install_id();
         let secret = sign::install_secret(MASTER, &id);
         let ts = chrono::Utc::now().timestamp();
-        let sig = sign::sign_request(&secret, ts, method, signed_path, body);
+        let rid = common::hybrid::hosted_sig::new_request_id();
+        let sig = sign::sign_request_v2(&secret, ts, &rid, method, signed_path, body);
         Request::builder()
             .method(method)
             .uri(sent_to)
             .header(sign::INSTALL_HEADER, id)
             .header(sign::TIMESTAMP_HEADER, ts.to_string())
             .header(sign::SIGNATURE_HEADER, sig)
+            .header(sign::REQUEST_ID_HEADER, rid)
             .header("content-type", "application/json")
             .body(Body::from(body.to_vec()))
             .unwrap()

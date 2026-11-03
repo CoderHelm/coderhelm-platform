@@ -36,6 +36,17 @@ pub const NEW_RECIPIENTS_PER_DAY: u64 = 50;
 /// The first listing (turning the relay on) may bring the install's
 /// current people at once, up to this many.
 pub const BOOTSTRAP_RECIPIENTS: usize = 200;
+/// The first listing while an install is new (its first
+/// [`NEW_INSTALL_DAYS`]): only a handful, so a just-registered install can't
+/// list a crowd and mail it at once.
+pub const NEW_INSTALL_BOOTSTRAP: usize = 10;
+/// Emails one install may send one address per UTC day.
+pub const PER_RECIPIENT_PER_DAY: u64 = 20;
+/// Emails the relay sends one address per UTC day, from every install
+/// together.
+pub const PER_RECIPIENT_ALL_PER_DAY: u64 = 40;
+/// Emails the relay sends per UTC day, from every install together.
+pub const ALL_PER_DAY: u64 = 5_000;
 /// Most addresses one request may list.
 pub const MAX_PER_REQUEST: usize = 200;
 /// How long a request id is remembered.
@@ -226,6 +237,11 @@ pub enum Refusal {
     RateLimited,
     QuotaReached,
     Paused,
+    /// The install isn't linked to a GitHub organization through CoderHelm
+    /// and wasn't approved by CoderHelm.
+    NotApproved,
+    /// That address got all the email it may get today.
+    RecipientLimit,
 }
 
 impl Refusal {
@@ -243,6 +259,8 @@ impl Refusal {
             Self::RateLimited => "email_rate_limited",
             Self::QuotaReached => "email_quota_reached",
             Self::Paused => "email_paused",
+            Self::NotApproved => "relay_not_approved",
+            Self::RecipientLimit => "recipient_daily_limit",
         }
     }
 
@@ -260,6 +278,8 @@ impl Refusal {
             Self::RateLimited => "Too many emails this minute.",
             Self::QuotaReached => "The install reached today's email quota.",
             Self::Paused => "Email through CoderHelm is paused for this install after bounces or complaints.",
+            Self::NotApproved => "CoderHelm's mail service sends for installs linked to a GitHub organization through CoderHelm, or approved by CoderHelm. Until then, send with your own Amazon SES (Settings, Email).",
+            Self::RecipientLimit => "That address already got today's share of email from CoderHelm.",
         }
     }
 
@@ -267,7 +287,7 @@ impl Refusal {
         match self {
             Self::BadRequest | Self::BadAddress => 400,
             Self::Replayed => 409,
-            Self::RateLimited | Self::QuotaReached | Self::TooManyNew => 429,
+            Self::RateLimited | Self::QuotaReached | Self::TooManyNew | Self::RecipientLimit => 429,
             _ => 403,
         }
     }
@@ -313,12 +333,16 @@ pub fn bootstrap_request(req: &RecipientsRequest) -> bool {
 /// May this listing request change the list? `by_kind` is what `by` is on
 /// the list now; `bootstrap_spent` whether the install ever had its first
 /// listing (kept for good: removing every admin never opens it again).
-/// `new_today` is how many addresses were added today before this request.
+/// `new_today` is how many addresses were added today before this request;
+/// `new_install` whether the install proved its address under
+/// [`NEW_INSTALL_DAYS`] ago (its first listing is then
+/// [`NEW_INSTALL_BOOTSTRAP`] at most).
 pub fn may_list(
     req: &RecipientsRequest,
     by_kind: Option<RecipientKind>,
     bootstrap_spent: bool,
     new_today: u64,
+    new_install: bool,
 ) -> Result<(), Refusal> {
     if req.add.len() + req.remove.len() > MAX_PER_REQUEST || !valid_address(&req.by) {
         return Err(Refusal::BadRequest);
@@ -337,7 +361,9 @@ pub fn may_list(
     if !by_is_admin && !bootstrap {
         return Err(Refusal::NotAdmin);
     }
-    let limit = if bootstrap {
+    let limit = if bootstrap && new_install {
+        NEW_INSTALL_BOOTSTRAP as u64
+    } else if bootstrap {
         BOOTSTRAP_RECIPIENTS as u64
     } else {
         NEW_RECIPIENTS_PER_DAY
@@ -346,6 +372,12 @@ pub fn may_list(
         return Err(Refusal::TooManyNew);
     }
     Ok(())
+}
+
+/// Whether an install that proved its address at `verified_at` (epoch
+/// seconds) is still new. Unknown counts as new.
+pub fn is_new_install(verified_at: Option<i64>, now: i64) -> bool {
+    !matches!(verified_at, Some(at) if now - at >= NEW_INSTALL_DAYS * 86_400)
 }
 
 /// The daily quota for an install that proved its address at `verified_at`
@@ -580,6 +612,39 @@ pub fn is_ses_event(v: &Value) -> bool {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_new_installs_first_listing_is_a_handful() {
+        let by = "admin@acme.dev";
+        let mut first = RecipientsRequest {
+            request_id: "01JABCDEFGHJKMNPQRSTVWXYZ0".into(),
+            by: by.into(),
+            add: vec![NewRecipient {
+                email: by.into(),
+                kind: RecipientKind::Admin,
+            }],
+            remove: vec![],
+        };
+        for i in 0..NEW_INSTALL_BOOTSTRAP {
+            first.add.push(NewRecipient {
+                email: format!("p{i}@acme.dev"),
+                kind: RecipientKind::Member,
+            });
+        }
+        // One over the handful while new: refused; the same list once the
+        // install is past its first weeks: allowed.
+        assert_eq!(
+            may_list(&first, None, false, 0, true),
+            Err(Refusal::TooManyNew)
+        );
+        assert_eq!(may_list(&first, None, false, 0, false), Ok(()));
+        first.add.pop();
+        assert_eq!(may_list(&first, None, false, 0, true), Ok(()));
+        assert!(is_new_install(None, 0));
+        assert!(is_new_install(Some(0), (NEW_INSTALL_DAYS * 86_400) - 1));
+        assert!(!is_new_install(Some(0), NEW_INSTALL_DAYS * 86_400));
+    }
+
     use super::*;
     use serde_json::json;
 
@@ -662,27 +727,36 @@ mod tests {
             "admin@acme.test",
             &[("admin@acme.test", Admin), ("dev@acme.test", Member)],
         );
-        assert_eq!(may_list(&first, None, false, 0), Ok(()));
+        assert_eq!(may_list(&first, None, false, 0, false), Ok(()));
         assert!(bootstrap_request(&first));
         // Not a bootstrap once the install had one (even if every admin was
         // removed since): `by` must be a listed admin.
-        assert_eq!(may_list(&first, None, true, 0), Err(Refusal::NotAdmin));
+        assert_eq!(
+            may_list(&first, None, true, 0, false),
+            Err(Refusal::NotAdmin)
+        );
         let invite = req("dev@acme.test", &[("new@acme.test", Invite)]);
         assert!(!bootstrap_request(&invite));
         assert_eq!(
-            may_list(&invite, Some(Member), true, 0),
+            may_list(&invite, Some(Member), true, 0, false),
             Err(Refusal::NotAdmin)
         );
-        assert_eq!(may_list(&invite, None, true, 0), Err(Refusal::NotAdmin));
+        assert_eq!(
+            may_list(&invite, None, true, 0, false),
+            Err(Refusal::NotAdmin)
+        );
         let invite = req("admin@acme.test", &[("new@acme.test", Invite)]);
-        assert_eq!(may_list(&invite, Some(Admin), true, 0), Ok(()));
+        assert_eq!(may_list(&invite, Some(Admin), true, 0, false), Ok(()));
         // A bootstrap can't name someone else as the admin behind it.
         let sneaky = req("admin@acme.test", &[("other@acme.test", Admin)]);
-        assert_eq!(may_list(&sneaky, None, false, 0), Err(Refusal::NotAdmin));
+        assert_eq!(
+            may_list(&sneaky, None, false, 0, false),
+            Err(Refusal::NotAdmin)
+        );
         // Never CoderHelm's own addresses.
         let ch = req("admin@acme.test", &[("security@coderhelm.com", Invite)]);
         assert_eq!(
-            may_list(&ch, Some(Admin), true, 0),
+            may_list(&ch, Some(Admin), true, 0, false),
             Err(Refusal::CoderhelmAddress)
         );
     }
@@ -707,11 +781,11 @@ mod tests {
         use RecipientKind::*;
         let one = req("admin@acme.test", &[("n@acme.test", Invite)]);
         assert_eq!(
-            may_list(&one, Some(Admin), true, NEW_RECIPIENTS_PER_DAY - 1),
+            may_list(&one, Some(Admin), true, NEW_RECIPIENTS_PER_DAY - 1, false),
             Ok(())
         );
         assert_eq!(
-            may_list(&one, Some(Admin), true, NEW_RECIPIENTS_PER_DAY),
+            may_list(&one, Some(Admin), true, NEW_RECIPIENTS_PER_DAY, false),
             Err(Refusal::TooManyNew)
         );
         let many: Vec<(String, RecipientKind)> = (0..BOOTSTRAP_RECIPIENTS)
@@ -722,9 +796,12 @@ mod tests {
             email: e.clone(),
             kind: *k,
         }));
-        assert_eq!(may_list(&boot, None, false, 0), Err(Refusal::BadRequest));
+        assert_eq!(
+            may_list(&boot, None, false, 0, false),
+            Err(Refusal::BadRequest)
+        );
         boot.add.truncate(BOOTSTRAP_RECIPIENTS);
-        assert_eq!(may_list(&boot, None, false, 0), Ok(()));
+        assert_eq!(may_list(&boot, None, false, 0, false), Ok(()));
     }
 
     #[test]

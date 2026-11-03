@@ -864,9 +864,12 @@ mod adversarial {
             }],
             remove: vec![],
         };
-        assert_eq!(relay::may_list(&req, None, true, 0), Err(Refusal::NotAdmin));
         assert_eq!(
-            relay::may_list(&req, Some(RecipientKind::Member), true, 0),
+            relay::may_list(&req, None, true, 0, false),
+            Err(Refusal::NotAdmin)
+        );
+        assert_eq!(
+            relay::may_list(&req, Some(RecipientKind::Member), true, 0, false),
             Err(Refusal::NotAdmin)
         );
         // ...and even an admin lists only a few new addresses a day.
@@ -879,7 +882,7 @@ mod adversarial {
             })
             .collect();
         assert_eq!(
-            relay::may_list(&many, Some(RecipientKind::Admin), true, 0),
+            relay::may_list(&many, Some(RecipientKind::Admin), true, 0, false),
             Err(Refusal::TooManyNew)
         );
         // CoderHelm's own mailboxes are never a recipient.

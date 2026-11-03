@@ -931,6 +931,22 @@ test("hosted: the weekly summary stays on for everyone, and the mail relay sends
   const gw = envOf(api, "coderhelm-prod-gateway");
   assert.equal(gw.HYBRID_EMAIL_FROM, "notifications@notify.coderhelm.com");
   assert.equal(gw.HYBRID_EMAIL_CONFIG_SET, "coderhelm-prod-relay");
+  // The brake: an alarm on the relay's own bounce and on its complaint rate,
+  // below SES's review levels, turns sending off for its configuration set only.
+  for (const [metric, threshold] of [["Reputation.BounceRate", 0.04], ["Reputation.ComplaintRate", 0.0008]] as const) {
+    api.hasResourceProperties("AWS::CloudWatch::Alarm", {
+      MetricName: metric,
+      Namespace: "AWS/SES",
+      Threshold: threshold,
+      Dimensions: [{ Name: "ses:configuration-set", Value: "coderhelm-prod-relay" }],
+      AlarmActions: Match.anyValue(),
+    });
+  }
+  const brake = Object.values(api.findResources("AWS::IAM::Policy"))
+    .flatMap((p: any) => p.Properties.PolicyDocument.Statement)
+    .filter((st: any) => [st.Action].flat().includes("ses:PutConfigurationSetSendingOptions"));
+  assert.equal(brake.length, 1, "only the brake may turn relay sending off");
+  assert.ok(JSON.stringify(brake[0].Resource).includes("configuration-set/coderhelm-prod-relay"), "and only the relay's set");
   // Its own identity with Easy DKIM and a custom MAIL FROM.
   api.hasResourceProperties("AWS::SES::EmailIdentity", {
     EmailIdentity: "notify.coderhelm.com",

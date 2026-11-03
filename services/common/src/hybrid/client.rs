@@ -84,10 +84,10 @@ pub async fn call(
         .map(|b| serde_json::to_vec(b).unwrap_or_default())
         .unwrap_or_default();
     let ts = chrono::Utc::now().timestamp();
-    let sig = sign::sign_request(&creds.secret, ts, method, path, &bytes);
+    let request_id = hosted_sig::new_request_id();
+    let sig = sign::sign_request_v2(&creds.secret, ts, &request_id, method, path, &bytes);
     let url = format!("{}{path}", super::hosted_url());
     let m = reqwest::Method::from_bytes(method.as_bytes()).unwrap_or(reqwest::Method::GET);
-    let request_id = hosted_sig::new_request_id();
     let mut req = http
         .request(m, &url)
         .timeout(std::time::Duration::from_secs(8))

@@ -9,9 +9,19 @@
  * complaints, rejections) to a topic that reaches the worker raw on the
  * ticket queue. Only the gateway (sending) and the
  * worker (pause notices) may send as the relay, and only from its address.
+ *
+ * A brake keeps relayed mail from ever costing the account its sending (and
+ * with it Cognito's sign-up codes and password resets): when the relay's own
+ * bounce or complaint rate nears SES's review levels, an alarm turns sending
+ * off for the relay's configuration set only. An operator turns it back on
+ * after looking (docs/self-host/hybrid.md, "Relay brake"). The full split, the
+ * relay in its own AWS account, is the next step written there.
  */
 import * as cdk from "aws-cdk-lib";
+import * as cloudwatch from "aws-cdk-lib/aws-cloudwatch";
+import * as cwActions from "aws-cdk-lib/aws-cloudwatch-actions";
 import * as iam from "aws-cdk-lib/aws-iam";
+import * as lambda from "aws-cdk-lib/aws-lambda";
 import * as route53 from "aws-cdk-lib/aws-route53";
 import * as ses from "aws-cdk-lib/aws-ses";
 import * as sns from "aws-cdk-lib/aws-sns";
@@ -24,6 +34,12 @@ import { ResolvedConfig } from "./config";
 export function relayConfigSetName(cfg: ResolvedConfig): string {
   return `${cfg.prefix}-relay`;
 }
+
+/**
+ * The relay brake's levels, below SES's own: SES reviews an account at a 5%
+ * bounce rate or a 0.1% complaint rate and may pause it at 10% and 0.5%.
+ */
+export const RELAY_BRAKE = { bounceRate: 0.04, complaintRate: 0.0008 } as const;
 
 /** Sending as the relay: its identity, through its configuration set, from its address only. */
 export function relaySendStatement(cfg: ResolvedConfig, account: string): iam.PolicyStatement | undefined {
@@ -85,6 +101,61 @@ export class MailRelay extends Construct {
         ses.EmailSendingEvent.REJECT,
       ],
     });
+
+    // The brake: the relay's reputation (its configuration set only), and a
+    // function that turns its sending off when either alarm fires.
+    const brakeFn = new lambda.Function(this, "BrakeFn", {
+      functionName: `${cfg.prefix}-relay-brake`,
+      runtime: lambda.Runtime.PYTHON_3_12,
+      handler: "index.handler",
+      timeout: cdk.Duration.seconds(30),
+      memorySize: 128,
+      environment: { CONFIG_SET: relayConfigSetName(cfg) },
+      code: lambda.Code.fromInline(
+        [
+          "import os, boto3",
+          "def handler(event, _ctx):",
+          "    # An alarm went off: stop relayed mail only (Cognito and the app keep sending).",
+          "    boto3.client('sesv2').put_configuration_set_sending_options(",
+          "        ConfigurationSetName=os.environ['CONFIG_SET'], SendingEnabled=False)",
+          "    print('relay sending turned off by the brake')",
+        ].join("\n"),
+      ),
+    });
+    brakeFn.addToRolePolicy(
+      new iam.PolicyStatement({
+        actions: ["ses:PutConfigurationSetSendingOptions"],
+        resources: [
+          `arn:${cdk.Aws.PARTITION}:ses:${cdk.Aws.REGION}:${cdk.Aws.ACCOUNT_ID}:configuration-set/${relayConfigSetName(cfg)}`,
+        ],
+      }),
+    );
+    const brakeTopic = new sns.Topic(this, "Brake", {
+      topicName: `${cfg.prefix}-relay-brake`,
+      displayName: "CoderHelm mail relay brake",
+    });
+    brakeTopic.addSubscription(new subs.LambdaSubscription(brakeFn));
+    const rate = (metric: string, threshold: number, id: string) => {
+      const alarm = new cloudwatch.Alarm(this, id, {
+        alarmName: `${cfg.prefix}-relay-${id.toLowerCase()}`,
+        alarmDescription: `Relayed mail's ${metric} is near SES's review level: relay sending is turned off.`,
+        metric: new cloudwatch.Metric({
+          namespace: "AWS/SES",
+          metricName: metric,
+          dimensionsMap: { "ses:configuration-set": relayConfigSetName(cfg) },
+          statistic: "Maximum",
+          period: cdk.Duration.minutes(15),
+        }),
+        threshold,
+        evaluationPeriods: 1,
+        comparisonOperator: cloudwatch.ComparisonOperator.GREATER_THAN_OR_EQUAL_TO_THRESHOLD,
+        treatMissingData: cloudwatch.TreatMissingData.NOT_BREACHING,
+      });
+      alarm.addAlarmAction(new cwActions.SnsAction(brakeTopic));
+      return alarm;
+    };
+    rate("Reputation.BounceRate", RELAY_BRAKE.bounceRate, "BounceBrake");
+    rate("Reputation.ComplaintRate", RELAY_BRAKE.complaintRate, "ComplaintBrake");
 
     const identity = new ses.EmailIdentity(this, "Identity", {
       identity: ses.Identity.domain(relay.domain),
