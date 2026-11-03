@@ -164,6 +164,12 @@ pub const REQUIRED_PERMISSIONS: &[(&str, &str, &str)] = &[
     ("email_addresses", "read", "Email addresses"),
 ];
 
+/// What a new app asks for beyond [`REQUIRED_PERMISSIONS`]
+/// (installer/lib/github-app.mjs PERMISSIONS): CoderHelm works without it,
+/// so an app created before it was asked for is warned, never failed.
+/// Checks: write lets a review show its "CoderHelm review" check run.
+pub const OPTIONAL_PERMISSIONS: &[(&str, &str, &str)] = &[("checks", "write", "Checks")];
+
 /// The webhook events the gateway handles.
 pub const REQUIRED_EVENTS: &[&str] = &[
     "issues",
@@ -283,6 +289,24 @@ pub fn github_permissions(app: &Value) -> Check {
         .filter(|e| !events.contains(e))
         .collect();
     if problems.is_empty() && missing_events.is_empty() {
+        let optional: Vec<String> = OPTIONAL_PERMISSIONS
+            .iter()
+            .filter(|(key, need, _)| level(have[*key].as_str().unwrap_or("none")) < level(need))
+            .map(|(_, need, name)| format!("{name}: {need}"))
+            .collect();
+        if !optional.is_empty() {
+            return Check::not_ok(
+                Status::Warn,
+                "github_permissions",
+                G,
+                "GitHub App permissions and events",
+                format!("Not granted yet: {}.", optional.join(", ")),
+                "Reviews work without it, but pull requests don't show the \"CoderHelm review\" \
+                 check that links to each review's session.",
+                Fix::text("Open the app's Permissions and events page, set the values listed, save, then accept the new permissions on each installation.")
+                    .url(format!("{}/permissions", app_settings_url(app))),
+            );
+        }
         return Check::pass(
             "github_permissions",
             G,
@@ -2565,10 +2589,24 @@ mod tests {
 
     fn full() -> Value {
         let mut p = serde_json::Map::new();
-        for (k, v, _) in REQUIRED_PERMISSIONS {
+        for (k, v, _) in REQUIRED_PERMISSIONS.iter().chain(OPTIONAL_PERMISSIONS) {
             p.insert((*k).into(), json!(v));
         }
         app(Value::Object(p), json!(REQUIRED_EVENTS))
+    }
+
+    #[test]
+    fn an_app_without_checks_write_is_warned_never_failed() {
+        // An app created before the "CoderHelm review" check asked for it.
+        let mut a = full();
+        a["permissions"]["checks"] = json!("read");
+        let c = github_permissions(&a);
+        assert_eq!(c.status, Status::Warn);
+        assert!(c.detail.contains("Checks: write"), "{}", c.detail);
+        assert!(c.fix.unwrap().url.unwrap().ends_with("/permissions"));
+        // A required gap still fails, whatever the optional ones.
+        a["permissions"]["contents"] = json!("read");
+        assert_eq!(github_permissions(&a).status, Status::Fail);
     }
 
     #[test]

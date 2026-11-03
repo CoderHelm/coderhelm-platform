@@ -325,10 +325,25 @@ pub(crate) async fn enqueue_review(
 }
 
 /// A review job as the dashboard sees it (`common::review_live`): its id, and
-/// when it started. Only this job may end the status it set.
+/// when it started. Only this job may end the status it set. It also keeps
+/// the job's session (`common::review_session`) and the PR's "CoderHelm
+/// review" check run (`review_session`), which it completes when it ends.
 pub(crate) struct LiveJob {
     pub id: String,
     pub started_at: i64,
+    /// What this job showed and decided so far.
+    session: std::sync::Mutex<Session>,
+}
+
+/// What a job's session knows besides the stored record.
+#[derive(Default)]
+struct Session {
+    /// The check run it opened, and the commit it is on.
+    check: Option<(u64, String)>,
+    /// The verdict, its finding count and the posted review's link.
+    verdict: Option<(&'static str, usize, String)>,
+    /// Why the job ended without a verdict, when it said so.
+    not_posted: Option<String>,
 }
 
 impl LiveJob {
@@ -336,10 +351,16 @@ impl LiveJob {
         Self {
             id: uuid::Uuid::new_v4().to_string(),
             started_at: chrono::Utc::now().timestamp(),
+            session: Default::default(),
         }
     }
 
-    /// The PR is being reviewed by this job now.
+    fn session(&self) -> std::sync::MutexGuard<'_, Session> {
+        self.session.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// The PR is being reviewed by this job now: its status, and its session
+    /// with the first step.
     async fn reviewing(&self, state: &WorkerState, msg: &ReviewMessage, head: &str, title: &str) {
         common::review_live::mark_reviewing(
             &state.dynamo,
@@ -359,14 +380,224 @@ impl LiveJob {
             },
         )
         .await;
+        let short = &head[..head.len().min(7)];
+        let first = if msg.question.is_some() {
+            format!("Started reading a comment on the pull request at `{short}`")
+        } else {
+            format!("Started reviewing `{short}`")
+        };
+        common::review_session::open(
+            &state.dynamo,
+            &state.config.settings_table_name,
+            &msg.team_id,
+            &common::review_session::Open {
+                job: &self.id,
+                owner: &msg.repo_owner,
+                repo: &msg.repo_name,
+                pr: msg.pr_number,
+                head_sha: head,
+                title,
+                trigger: &msg.trigger,
+                is_question: msg.question.is_some(),
+                attempt: msg.attempt,
+                budget_secs: REVIEW_LEASE_SECS as i64,
+            },
+            &first,
+        )
+        .await;
     }
 
+    /// One more step in the session. `detail` may be empty.
+    async fn step(&self, state: &WorkerState, msg: &ReviewMessage, text: &str, detail: &str) {
+        common::review_session::step(
+            &state.dynamo,
+            &state.config.settings_table_name,
+            &msg.team_id,
+            &self.id,
+            text,
+            detail,
+        )
+        .await;
+    }
+
+    /// A formal review starts: open the "CoderHelm review" check on `head`,
+    /// in progress, linking to this session. Once per job; a refusal (no
+    /// checks:write) leaves the review exactly as it was.
+    async fn open_check(
+        &self,
+        state: &WorkerState,
+        github: &GitHubClient,
+        msg: &ReviewMessage,
+        head: &str,
+        files: &[String],
+    ) {
+        if self.session().check.is_some() {
+            return;
+        }
+        let details = super::review_session::session_url(
+            common::public_urls::app_url(&state.config.stage),
+            &self.id,
+        );
+        let target = super::review_session::CheckTarget {
+            installation: msg.installation_id,
+            owner: &msg.repo_owner,
+            repo: &msg.repo_name,
+            pr: msg.pr_number,
+            head,
+        };
+        let title = super::review_session::reading_title(files, head);
+        let Some(id) =
+            super::review_session::open_check(github, &target, &self.id, &title, &details).await
+        else {
+            return;
+        };
+        self.session().check = Some((id, head.to_string()));
+        common::review_session::set_check_run(
+            &state.dynamo,
+            &state.config.settings_table_name,
+            &msg.team_id,
+            &self.id,
+            id,
+        )
+        .await;
+    }
+
+    /// The review's verdict, and the posted review (empty when nothing new
+    /// was posted).
+    async fn verdict(
+        &self,
+        state: &WorkerState,
+        msg: &ReviewMessage,
+        verdict: &'static str,
+        findings: usize,
+        review_url: &str,
+    ) {
+        self.session().verdict = Some((verdict, findings, review_url.to_string()));
+        common::review_session::note_verdict(
+            &state.dynamo,
+            &state.config.settings_table_name,
+            &msg.team_id,
+            &self.id,
+            &common::review_session::Verdict {
+                verdict,
+                findings,
+                review_url,
+            },
+        )
+        .await;
+    }
+
+    /// The job ends without a verdict on purpose: why, for its check and
+    /// session.
+    fn not_posted(&self, reason: &str) {
+        self.session().not_posted = Some(reason.to_string());
+    }
+
+    /// Record how the job ended: its session, its check (never left in
+    /// progress), and the PR's status.
     async fn finished(
         &self,
         state: &WorkerState,
         msg: &ReviewMessage,
         how: common::review_live::Finished<'_>,
     ) {
+        use super::review_session::CheckEnd;
+        use common::review_live::Finished;
+        use common::review_session as rs;
+        let (check, verdict, not_posted) = {
+            let s = self.session();
+            (s.check.clone(), s.verdict.clone(), s.not_posted.clone())
+        };
+        // The session's status and last step, and the check's ending.
+        let (status, reason, last, end) = match &how {
+            Finished::Done => match (&verdict, &not_posted) {
+                (Some((v, findings, url)), _) => (
+                    rs::STATUS_DONE,
+                    None,
+                    "Finished".to_string(),
+                    CheckEnd::Reviewed {
+                        verdict: v,
+                        findings: *findings,
+                        review_url: url,
+                    },
+                ),
+                (None, Some(why)) => (
+                    rs::STATUS_SKIPPED,
+                    Some(why.as_str()),
+                    format!("Finished without a verdict: {why}"),
+                    CheckEnd::Skipped { reason: why },
+                ),
+                (None, None) => (
+                    rs::STATUS_DONE,
+                    None,
+                    "Finished".to_string(),
+                    CheckEnd::Skipped {
+                        reason: "Finished without a verdict for this commit.",
+                    },
+                ),
+            },
+            Finished::Skipped { reason } => (
+                rs::STATUS_SKIPPED,
+                Some(*reason),
+                format!("Not reviewed: {reason}"),
+                CheckEnd::Skipped { reason },
+            ),
+            Finished::Retrying { reason, .. } => (
+                rs::STATUS_RETRYING,
+                Some(*reason),
+                "Didn't finish because of a service error; sent again".to_string(),
+                CheckEnd::Retrying { reason },
+            ),
+            Finished::Failed { reason } => (
+                rs::STATUS_FAILED,
+                Some(*reason),
+                "Didn't finish: every try hit a service error".to_string(),
+                CheckEnd::Failed { reason },
+            ),
+        };
+        rs::close(
+            &state.dynamo,
+            &state.config.settings_table_name,
+            &msg.team_id,
+            &self.id,
+            status,
+            reason,
+            &last,
+        )
+        .await;
+        if let Some((id, head)) = check {
+            let close = super::review_session::check_close(
+                end,
+                &format!(
+                    "https://github.com/{}/{}/pull/{}",
+                    msg.repo_owner, msg.repo_name, msg.pr_number
+                ),
+                &super::review_session::session_url(
+                    common::public_urls::app_url(&state.config.stage),
+                    &self.id,
+                ),
+            );
+            let target = super::review_session::CheckTarget {
+                installation: msg.installation_id,
+                owner: &msg.repo_owner,
+                repo: &msg.repo_name,
+                pr: msg.pr_number,
+                head: &head,
+            };
+            match GitHubClient::new(
+                &state.secrets.github_app_id,
+                &state.secrets.github_private_key,
+                msg.installation_id,
+                &state.http,
+            ) {
+                Ok(github) => {
+                    super::review_session::close_check(&github, &target, id, &close).await
+                }
+                Err(e) => {
+                    warn!(pr = msg.pr_number, error = %e, "Could not complete the CoderHelm review check")
+                }
+            }
+        }
         common::review_live::mark_finished(
             &state.dynamo,
             &state.config.settings_table_name,
@@ -843,6 +1074,32 @@ async fn run_once(
         .get_diff(&msg.repo_owner, &msg.repo_name, base, &head_sha)
         .await?;
     let diff = review_agent::format_diff(&compare, 40_000);
+    // The changed files in the order GitHub lists them, for the session.
+    let files_read: Vec<String> = compare["files"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|f| f["filename"].as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
+    live_job
+        .step(
+            state,
+            &msg,
+            &format!(
+                "Read the change: {} file{} changed",
+                files_read.len(),
+                if files_read.len() == 1 { "" } else { "s" }
+            ),
+            &files_read
+                .iter()
+                .take(20)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+        .await;
 
     // Read AGENTS.md/etc. at the PR head so a PR that edits them is reviewed
     // against its own new rules.
@@ -930,6 +1187,14 @@ async fn run_once(
             review_agent::AskRoute::FormalReview => {
                 msg.question = None;
                 msg.reply_to_comment_id = None;
+                live_job
+                    .step(
+                        state,
+                        &msg,
+                        "Read the comment: it asks for a review, so a full review runs",
+                        "",
+                    )
+                    .await;
             }
             review_agent::AskRoute::FixLoop => {
                 // CoderHelm's own PR: the fix loop changes the code and answers
@@ -1259,10 +1524,18 @@ async fn run_once(
             state, &github, &msg, &head_sha, &answer, &consulted, &applied, &usage,
         )
         .await?;
+        live_job
+            .step(state, &msg, "Answered on the pull request", "")
+            .await;
         return Ok(DONE);
     }
 
     // ── Verdict mode (agentic: walk the repo, structured findings, self-critique) ──
+
+    // The PR shows the review in progress, linked to this session.
+    live_job
+        .open_check(state, &github, &msg, &head_sha, &files_read)
+        .await;
 
     // A person's re-review ask and a push review of the same commit used to
     // run together and post opposite verdicts seconds apart. The ask takes
@@ -1784,6 +2057,14 @@ async fn run_once(
     // Knowledge bases the team attached to the reviewer.
     let knowledge = super::knowledge::KnowledgeTools::load(state, &msg.team_id, "reviewer").await;
     // 1) High-recall generation with repo-walking tools.
+    live_job
+        .step(
+            state,
+            &msg,
+            "Reviewing the code",
+            "Against the repository's rules, the team's standards and what earlier reviews taught.",
+        )
+        .await;
     let output = review_agent::generate_review(
         state,
         &provider,
@@ -1878,6 +2159,7 @@ async fn run_once(
     // 2) Critic pass drops weak/false findings.
     let live_evidence =
         live.as_ref().map(|l| l.evidence()).unwrap_or_default() + &web.evidence() + &plan_context;
+    let drafted = output.findings.len();
     let mut findings = review_agent::critique_findings(
         state,
         &provider,
@@ -1893,6 +2175,14 @@ async fn run_once(
         &mut usage,
     )
     .await;
+    live_job
+        .step(
+            state,
+            &msg,
+            &format!("Checked the findings: kept {} of {drafted}", findings.len()),
+            "A second pass drops findings it can't back up.",
+        )
+        .await;
     // Categories this repo keeps dismissing are quieted; security and
     // correctness never are.
     // A repo that requires tests keeps its tests findings whatever the counts.
@@ -2326,6 +2616,9 @@ async fn run_once(
                 current = latest_head,
                 "Not posting superseded review — the PR moved on while reviewing"
             );
+            live_job.not_posted(
+                "a newer commit was pushed while reviewing; its own review covers the latest code.",
+            );
             // The tokens were still spent: count them against the team.
             record_review_usage(state, &msg.team_id, None, &usage).await;
             return Ok(DONE);
@@ -2411,12 +2704,14 @@ async fn run_once(
     };
     let should_comment = matches!(decision, super::review_verdict::Decision::Post { .. });
     let mut posted_event: Option<&'static str> = None;
+    // The posted review's link, for the session and the check.
+    let mut review_url = String::new();
     if let super::review_verdict::Decision::Post {
         event,
         dismiss_stale,
     } = decision
     {
-        if let Err(e) = super::review_verdict::post(
+        match super::review_verdict::post(
             &github,
             &msg,
             &head_sha,
@@ -2427,15 +2722,18 @@ async fn run_once(
         )
         .await
         {
-            // Not posted: a retry of this job may post it.
-            common::claim::release(
-                &state.dynamo,
-                &state.config.settings_table_name,
-                &msg.team_id,
-                &verdict_sk,
-            )
-            .await;
-            return Err(e);
+            Ok(url) => review_url = url,
+            Err(e) => {
+                // Not posted: a retry of this job may post it.
+                common::claim::release(
+                    &state.dynamo,
+                    &state.config.settings_table_name,
+                    &msg.team_id,
+                    &verdict_sk,
+                )
+                .await;
+                return Err(e);
+            }
         }
         posted_event = Some(event);
     } else if !already_answered && !head_sha.is_empty() {
@@ -2522,6 +2820,17 @@ async fn run_once(
         note_review_standards(state, &msg.team_id, &record_sk, &s.applied_names()).await;
     }
     note_review_details(state, &msg.team_id, &record_sk, title, &findings).await;
+    live_job
+        .verdict(state, &msg, verdict, findings.len(), &review_url)
+        .await;
+    let posted_step = if should_comment {
+        "Posted the review on GitHub"
+    } else if already_answered {
+        "Not posted: another review of this commit was just posted"
+    } else {
+        "Nothing new to post: the standing review was brought up to date"
+    };
+    live_job.step(state, &msg, posted_step, &review_url).await;
     super::rewards::note_review_variant(
         state,
         &msg.team_id,

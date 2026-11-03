@@ -234,6 +234,14 @@ test("GitHub: no app, refused keys, missing permissions, wrong webhook, bad secr
   assert.match(perms.what, /workflow_run/);
   assert.equal(perms.fix.url, "https://github.com/organizations/acme/settings/apps/coderhelm-prod/permissions");
 
+  // An app created before new installs asked for Checks: write is warned,
+  // never failed: reviews work without the "CoderHelm review" check.
+  assert.equal(PERMISSIONS.checks, "write");
+  const older = { ...APP, permissions: { ...PERMISSIONS, checks: "read" } };
+  const warned = (await C.checkGithubApp({ fetchImpl: github({ "/app": json(200, older) }).fetchImpl }, SECRET, "https://helm.example.org")).find((r) => r.id === "github_permissions");
+  assertExplained(warned, C.WARN);
+  assert.match(warned.what, /Checks: write/);
+
   const hook = (await C.checkGithubApp({ fetchImpl: github({ "/app/hook/config": json(200, { url: "https://old.example.org/webhooks/github" }) }).fetchImpl }, SECRET, "https://helm.example.org")).find((r) => r.id === "github_webhook");
   assertExplained(hook);
   assert.match(hook.fix.text, /https:\/\/helm\.example\.org\/webhooks\/github/);

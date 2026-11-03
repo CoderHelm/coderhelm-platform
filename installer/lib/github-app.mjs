@@ -18,8 +18,10 @@ export const PERMISSIONS = {
   pull_requests: "write",
   // Read issues it is assigned, comment progress.
   issues: "write",
-  // Read check results to fix failing CI.
-  checks: "read",
+  // Read check results to fix failing CI, and show the "CoderHelm review"
+  // check on a pull request while it is reviewed. Only read is required
+  // (REQUIRED_PERMISSIONS): reviews work without the check.
+  checks: "write",
   // Read workflow runs and their logs (CI fixes).
   actions: "read",
   // Read commit statuses (CI that reports statuses, not checks).
@@ -31,6 +33,13 @@ export const PERMISSIONS = {
   // The email of the person who connects their GitHub account.
   email_addresses: "read",
 };
+
+/**
+ * What an app must have for CoderHelm to work: an app created before a
+ * permission was added to PERMISSIONS is warned about that one, not failed
+ * (services/gateway/src/routes/setup_checks.rs REQUIRED_PERMISSIONS).
+ */
+export const REQUIRED_PERMISSIONS = { ...PERMISSIONS, checks: "read" };
 
 /** The webhook events the gateway handles (services/gateway/src/routes/github_webhook.rs). */
 export const EVENTS = [

@@ -111,6 +111,7 @@ pub mod review_lessons;
 /// Where the reviewer is with each PR right now (queued, reviewing, retrying,
 /// done), and the one status a PR shows on the dashboard.
 pub mod review_live;
+pub mod review_session;
 pub mod review_stats;
 /// Learning from outcomes: reward events, scores, calibration, variants,
 /// examples and evidence-backed lessons, per team.

@@ -30,7 +30,7 @@ It uses GitHub's [manifest flow](https://docs.github.com/en/apps/sharing-github-
 | Contents | write | Read code; push the branch with its changes |
 | Pull requests | write | Open and update pull requests; post reviews |
 | Issues | write | Read assigned issues; post progress |
-| Checks | read | Read CI results to fix failures |
+| Checks | write | Read CI results to fix failures; show the "CoderHelm review" check on a pull request while it is reviewed, linking to the review's session page |
 | Actions | read | Read workflow runs and logs |
 | Commit statuses | read | CI that reports statuses instead of checks |
 | Workflows | write | Change workflow files when a task asks for it |
@@ -40,6 +40,8 @@ It uses GitHub's [manifest flow](https://docs.github.com/en/apps/sharing-github-
 Events: issues, issue comments, pull requests, reviews, review comments, review threads, pushes, check runs, check suites, workflow runs and repositories.
 
 You can remove **Workflows: write** in the app's settings if CoderHelm should never touch workflow files; pushes that change them will then fail.
+
+An app created before CoderHelm asked for **Checks: write** keeps working with **Checks: read**: reviews are posted as before, but pull requests don't show the "CoderHelm review" check. Setup checks warns about it until you set Checks to write on the app's Permissions and events page and accept the new permission on each installation.
 
 ## URLs it uses
 

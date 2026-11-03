@@ -82,6 +82,14 @@ pub fn is_not_found(e: &(dyn std::error::Error + Send + Sync)) -> bool {
     e.to_string().contains("(404 Not Found)")
 }
 
+/// Did GitHub refuse this request because the app lacks the permission
+/// (an installation that hasn't granted it)? Matches the 403 status line
+/// `status_error_message` writes, and GitHub's own wording.
+pub fn is_not_permitted(e: &(dyn std::error::Error + Send + Sync)) -> bool {
+    let m = e.to_string();
+    m.contains("(403 Forbidden)") || m.contains("Resource not accessible by integration")
+}
+
 /// What a contents-API response says about a file's body.
 #[derive(Debug, PartialEq)]
 enum ContentsBody {
@@ -3189,6 +3197,34 @@ impl GitHubClient {
         let url =
             format!("{API_BASE}/repos/{owner}/{repo}/commits/{git_ref}/check-runs?per_page=100");
         self.get(&url).await
+    }
+
+    /// Create a check run on `head_sha` (needs the app's checks:write
+    /// permission; without it GitHub answers 403, see [`is_not_permitted`]).
+    /// `body` is the API's request body; returns the new check run's id.
+    pub async fn create_check_run(
+        &self,
+        owner: &str,
+        repo: &str,
+        body: &serde_json::Value,
+    ) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
+        let url = format!("{API_BASE}/repos/{owner}/{repo}/check-runs");
+        let out = self.post(&url, body).await?;
+        out["id"]
+            .as_u64()
+            .ok_or_else(|| "check run created without an id".into())
+    }
+
+    /// Update a check run this app created (status, conclusion, output).
+    pub async fn update_check_run(
+        &self,
+        owner: &str,
+        repo: &str,
+        check_run_id: u64,
+        body: &serde_json::Value,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let url = format!("{API_BASE}/repos/{owner}/{repo}/check-runs/{check_run_id}");
+        self.patch(&url, body).await.map(|_| ())
     }
 
     /// Combined legacy commit-status (external CI that posts statuses rather than
