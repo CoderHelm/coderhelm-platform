@@ -110,6 +110,68 @@ fn day_quota(i: &Install) -> u64 {
     relay::day_quota(verified, epoch())
 }
 
+/// Whether an install may send through the relay: a CoderHelm operator
+/// approved it, or a hosted team linked a GitHub organization to it (a team
+/// that installed CoderHelm's GitHub App and chose this install). A bare
+/// registration (anyone with a CloudFront address can make one) never can.
+async fn relay_allowed<F, Fut>(install: &Install, links: F) -> bool
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Vec<common::hybrid::broker::GithubLink>>,
+{
+    install.relay_approved || !links().await.is_empty()
+}
+
+/// A day's counter shared by every install (`RELAY#ALL`), atomically capped.
+async fn count_all(
+    state: &AppState,
+    sk: &str,
+    max: u64,
+) -> Result<bool, (StatusCode, Json<Value>)> {
+    let u = state
+        .dynamo
+        .update_item()
+        .table_name(&state.config.settings_table_name)
+        .key("pk", s("RELAY#ALL"))
+        .key("sk", s(sk))
+        .update_expression("ADD #f :one SET #t = if_not_exists(#t, :ttl)")
+        .expression_attribute_names("#f", "sent")
+        .expression_attribute_names("#t", "ttl")
+        .expression_attribute_values(":one", AttributeValue::N("1".into()))
+        .expression_attribute_values(":ttl", n(epoch() + 2 * 86_400))
+        .condition_expression("attribute_not_exists(#f) OR #f <= :room")
+        .expression_attribute_values(
+            ":room",
+            AttributeValue::N(max.saturating_sub(1).to_string()),
+        )
+        .send()
+        .await;
+    match u {
+        Ok(_) => Ok(true),
+        Err(e) => {
+            let text = aws_sdk_dynamodb::error::DisplayErrorContext(&e).to_string();
+            if text.contains("ConditionalCheckFailed") {
+                Ok(false)
+            } else {
+                warn!(error = %text, "email relay: shared counter failed");
+                Err(unavailable())
+            }
+        }
+    }
+}
+
+/// An address's key for the relay-wide per-address counter: keyed with the
+/// hosted master secret (never a plain hash anyone could reverse with a
+/// list of addresses), and only the first 32 hex characters.
+fn address_key(state: &AppState, to: &str) -> Option<String> {
+    use hmac::Mac;
+    let master = super::hybrid::master(state)?;
+    let mut m = hmac::Hmac::<sha2::Sha256>::new_from_slice(master.as_bytes()).ok()?;
+    m.update(b"relay-recipient:");
+    m.update(relay::normalize(to).as_bytes());
+    Some(hex::encode(m.finalize().into_bytes())[..32].to_string())
+}
+
 /// A verified, active install that signed the request, and its relay sender.
 async fn verified(
     state: &AppState,
@@ -122,6 +184,9 @@ async fn verified(
     let from = relay_from().ok_or_else(not_here)?;
     if !install.verified() {
         return Err(refuse(relay::Refusal::NotVerified));
+    }
+    if !relay_allowed(&install, || super::hybrid::github_links(state, &install.id)).await {
+        return Err(refuse(relay::Refusal::NotApproved));
     }
     Ok((install, from))
 }
@@ -344,6 +409,48 @@ pub async fn send(
         .await;
         return Err(refuse(relay::Refusal::QuotaReached));
     }
+    // Per address: from this install, and from every install together; and
+    // the relay's own day across every install.
+    let per_address = count_up(
+        &state,
+        &install.id,
+        &format!("EMAILRCPT#{}#{}", today(), &hash[..32]),
+        "sent",
+        1,
+        Some(relay::PER_RECIPIENT_PER_DAY),
+        2 * 86_400,
+    )
+    .await?;
+    let all_address = match address_key(&state, &req.to) {
+        Some(k) => {
+            count_all(
+                &state,
+                &format!("RCPT#{}#{k}", today()),
+                relay::PER_RECIPIENT_ALL_PER_DAY,
+            )
+            .await?
+        }
+        None => false,
+    };
+    if !per_address || !all_address {
+        record(
+            &state,
+            &install.id,
+            &fail_with(relay::Refusal::RecipientLimit.code()),
+        )
+        .await;
+        return Err(refuse(relay::Refusal::RecipientLimit));
+    }
+    if !count_all(&state, &format!("DAY#{}", today()), relay::ALL_PER_DAY).await? {
+        warn!("email relay: the relay-wide daily cap was reached");
+        record(
+            &state,
+            &install.id,
+            &fail_with(relay::Refusal::QuotaReached.code()),
+        )
+        .await;
+        return Err(refuse(relay::Refusal::QuotaReached));
+    }
     // The footer names an install admin only when they are a listed admin.
     let contact = match req.contact.as_deref().filter(|c| relay::valid_address(c)) {
         Some(c) => {
@@ -495,11 +602,54 @@ pub async fn recipients(
         .and_then(|v| v.as_n().ok())
         .and_then(|v| v.parse::<u64>().ok())
         .unwrap_or(0);
-    relay::may_list(&req, by_kind, spent, new_today).map_err(refuse)?;
-    if !spent && relay::bootstrap_request(&req) && !claim_bootstrap(&state, &install.id).await? {
+    let verified_at = chrono::DateTime::parse_from_rfc3339(&install.verified_at)
+        .ok()
+        .map(|t| t.timestamp());
+    let new_install = relay::is_new_install(verified_at, epoch());
+    relay::may_list(&req, by_kind, spent, new_today, new_install).map_err(refuse)?;
+    let mut bootstrap = !spent && relay::bootstrap_request(&req);
+    if bootstrap && !claim_bootstrap(&state, &install.id).await? {
         // Another request took the first listing meanwhile: this one is an
         // ordinary listing.
-        relay::may_list(&req, by_kind, true, new_today).map_err(refuse)?;
+        relay::may_list(&req, by_kind, true, new_today, new_install).map_err(refuse)?;
+        bootstrap = false;
+    }
+    // How many of these addresses are new, counted against today's limit in
+    // one conditional write before anything is listed: parallel requests
+    // can't each slip under it (the check above read the count earlier).
+    let mut fresh = 0u64;
+    for r in &req.add {
+        let hash = relay::recipient_hash(&install.id, &r.email);
+        if get(&state, &install.id, &relay::recipient_sk(&hash))
+            .await?
+            .is_none()
+        {
+            fresh += 1;
+        }
+    }
+    if fresh > 0 {
+        let limit = if bootstrap {
+            if new_install {
+                relay::NEW_INSTALL_BOOTSTRAP as u64
+            } else {
+                relay::BOOTSTRAP_RECIPIENTS as u64
+            }
+        } else {
+            relay::NEW_RECIPIENTS_PER_DAY
+        };
+        if !count_up(
+            &state,
+            &install.id,
+            &relay::day_sk(&today()),
+            "new_recipients",
+            fresh,
+            Some(limit),
+            40 * 86_400,
+        )
+        .await?
+        {
+            return Err(refuse(relay::Refusal::TooManyNew));
+        }
     }
 
     let cipher = common::mcp_credentials::Kms {
@@ -565,18 +715,6 @@ pub async fn recipients(
             .send()
             .await;
         removed += 1;
-    }
-    if added > 0 {
-        count_up(
-            &state,
-            &install.id,
-            &relay::day_sk(&today()),
-            "new_recipients",
-            added,
-            None,
-            40 * 86_400,
-        )
-        .await?;
     }
     if admins != 0 {
         let _ = state
@@ -1025,6 +1163,35 @@ mod tests {
             verified_at: "2026-10-25T00:00:00Z".into(),
             name: name.into(),
             ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn a_bare_registration_may_not_use_the_relay() {
+        use common::hybrid::broker::GithubLink;
+        let bare = install("acme");
+        // Registered and verified, but no GitHub link and not approved.
+        assert!(!relay_allowed(&bare, || async { Vec::<GithubLink>::new() }).await);
+        // A hosted team linked a GitHub organization to it.
+        let link: GithubLink = serde_json::from_value(serde_json::json!({
+            "installation_id": 42, "account": "acme"
+        }))
+        .unwrap();
+        assert!(relay_allowed(&bare, || async move { vec![link] }).await);
+        // Or an operator approved it.
+        let mut approved = install("acme");
+        approved.relay_approved = true;
+        assert!(relay_allowed(&approved, || async { Vec::<GithubLink>::new() }).await);
+    }
+
+    #[test]
+    fn the_relay_wide_caps_sit_above_one_install_and_below_abuse() {
+        // One address can't be mailed past the per-install limit, and every
+        // install together can't exceed the relay-wide one.
+        const {
+            assert!(relay::PER_RECIPIENT_PER_DAY < relay::PER_RECIPIENT_ALL_PER_DAY);
+            assert!(relay::PER_DAY < relay::ALL_PER_DAY);
+            assert!(relay::NEW_INSTALL_BOOTSTRAP <= 10);
         }
     }
 

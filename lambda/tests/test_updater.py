@@ -866,14 +866,21 @@ class EmailRouteTest(unittest.TestCase):
         self.assertEqual(body["params"]["link"], "https://d1.cloudfront.net/settings/system/")
         self.assertEqual(body["to"], "admin@example.org")
         headers = {k.lower(): v for k, v in self.posts[1][2].items()}
-        self.assertTrue(headers["x-coderhelm-signature"].startswith("v1="))
+        self.assertTrue(headers["x-coderhelm-signature"].startswith("v2="))
+        self.assertRegex(headers["x-coderhelm-request-id"], r"^req_[a-z0-9]{32}$")
 
     def test_the_signature_matches_the_services(self):
         # services/common/src/hybrid/sign.rs, the_signature_matches_the_installer_and_a_fixed_vector
         self.assertEqual(
-            u.sign_request("s3cret", 1_800_000_000, "delete", "/hybrid/installs", b""),
-            "v1=ae93880dea04941037494d54f0116ec78c7f934c8a4fceed86d64fa41d24a769",
+            u.sign_request(
+                "s3cret", 1_800_000_000, "delete", "/hybrid/installs?x=1", b"",
+                "req_abcdefghijklmnopqrstuvwxyz012345",
+            ),
+            "v2=4769ebe0b0e6f0a907f4db72095eb65f2729f7763d2793b8ea4a18965508d0f8",
         )
+
+    def test_each_call_gets_its_own_request_id(self):
+        self.assertNotEqual(u.new_request_id(), u.new_request_id())
 
     def test_hybrid_turned_off_sends_nothing_through_coderhelm(self):
         u._clients["dynamodb"] = self.Dyn({"data": {"S": json.dumps({"transport": "coderhelm"})}})

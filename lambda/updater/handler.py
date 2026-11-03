@@ -425,12 +425,21 @@ def email_transport(env):
     return t if t in ("ses", "coderhelm") else "ses"
 
 
-def sign_request(secret, ts, method, path, body):
-    """The hybrid request signature (services/common/src/hybrid/sign.rs)."""
+def sign_request(secret, ts, method, path, body, request_id):
+    """The hybrid request signature, v2 (services/common/src/hybrid/sign.rs
+    sign_request_v2): the time, the request's single-use id, the method, the
+    path with its query, and the body's hash."""
     import hashlib
     import hmac
-    msg = f"{ts}.{method.upper()}.{path}.{hashlib.sha256(body).hexdigest()}"
-    return "v1=" + hmac.new(secret.encode(), msg.encode(), hashlib.sha256).hexdigest()
+    msg = f"v2.{ts}.{request_id}.{method.upper()}.{path}.{hashlib.sha256(body).hexdigest()}"
+    return "v2=" + hmac.new(secret.encode(), msg.encode(), hashlib.sha256).hexdigest()
+
+
+def new_request_id():
+    """A fresh single-use id for one signed call (req_ and 32 characters)."""
+    import secrets
+    alphabet = "abcdefghijklmnopqrstuvwxyz0123456789"
+    return "req_" + "".join(secrets.choice(alphabet) for _ in range(32))
 
 
 def relay_call(env, creds, path, payload, opener=None):
@@ -439,6 +448,7 @@ def relay_call(env, creds, path, payload, opener=None):
         raise RuntimeError("no hosted address for CoderHelm's mail service")
     body = json.dumps(payload).encode()
     ts = int(time.time())
+    rid = new_request_id()
     req = urllib.request.Request(
         url_base + path,
         data=body,
@@ -448,7 +458,8 @@ def relay_call(env, creds, path, payload, opener=None):
             "user-agent": "coderhelm-selfhost",
             "x-coderhelm-install": creds["id"],
             "x-coderhelm-timestamp": str(ts),
-            "x-coderhelm-signature": sign_request(creds["secret"], ts, "POST", path, body),
+            "x-coderhelm-signature": sign_request(creds["secret"], ts, "POST", path, body, rid),
+            "x-coderhelm-request-id": rid,
         },
     )
     (opener or urllib.request.urlopen)(req, timeout=10).close()

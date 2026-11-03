@@ -749,6 +749,21 @@ pub fn plain(s: &str, one_line: bool) -> String {
 
 /// Whether `link` is an `https://` link to one of `own_hosts`, with no
 /// user, password or port.
+/// A link parameter as it may go out: on the install's own hosts, with no
+/// whitespace or control character (the URL parser drops tabs and newlines
+/// silently, so such a link would pass the host check yet put free text,
+/// with a link of its own, in the plain-text part), and in its parsed form,
+/// never the input as written.
+fn link_value(link: &str, own_hosts: &[String]) -> Option<String> {
+    if link.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        return None;
+    }
+    if !link_on_own_host(link, own_hosts) {
+        return None;
+    }
+    url::Url::parse(link).ok().map(|u| u.to_string())
+}
+
 pub fn link_on_own_host(link: &str, own_hosts: &[String]) -> bool {
     let Ok(u) = url::Url::parse(link) else {
         return false;
@@ -847,10 +862,7 @@ pub fn check(
                 if s.len() > 2048 {
                     return Err(Refusal::TooLong(spec.name.into()));
                 }
-                if !link_on_own_host(s, own_hosts) {
-                    return Err(Refusal::LinkNotOwnHost(spec.name.into()));
-                }
-                s.to_string()
+                link_value(s, own_hosts).ok_or_else(|| Refusal::LinkNotOwnHost(spec.name.into()))?
             }
         };
         out.insert(spec.name.to_string(), value);
@@ -1083,6 +1095,23 @@ pub fn footer(install_host: &str, contact: Option<&str>) -> String {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_link_with_a_newline_or_tab_is_refused() {
+        let hosts = vec!["acme.coderhelm.com".to_string()];
+        for bad in [
+            "https://acme.coderhelm.com/a\n\nReset at evil-reset.com now",
+            "https://acme.coderhelm.com/a\tb",
+            "https://acme.coderhelm.com/a\rb",
+        ] {
+            assert_eq!(link_value(bad, &hosts), None, "{bad:?}");
+        }
+        assert_eq!(
+            link_value("https://acme.coderhelm.com/settings/", &hosts).as_deref(),
+            Some("https://acme.coderhelm.com/settings/")
+        );
+    }
+
     use super::*;
     use serde_json::json;
 

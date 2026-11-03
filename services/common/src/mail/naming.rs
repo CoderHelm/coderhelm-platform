@@ -111,6 +111,35 @@ pub fn is_aws_host(host: &str) -> bool {
     h.contains("cloudfront.net") || h.contains("amazonaws.com") || h.contains("awsapps.com")
 }
 
+/// Whether a letter or digit is Latin (ASCII, or the Latin-1 and Latin
+/// Extended blocks). Cyrillic, Greek, full-width and other scripts with
+/// Latin look-alikes are not.
+fn latin(c: char) -> bool {
+    c.is_ascii() || ('\u{00C0}'..='\u{024F}').contains(&c) && c != '\u{00D7}' && c != '\u{00F7}'
+}
+
+/// An accented Latin letter as its plain letter, for the word checks.
+fn fold_accent(c: char) -> char {
+    match c {
+        '\u{00C0}'..='\u{00C5}' | '\u{00E0}'..='\u{00E5}' | '\u{0100}'..='\u{0105}' => 'a',
+        '\u{00C7}' | '\u{00E7}' | '\u{0106}'..='\u{010D}' => 'c',
+        '\u{00C8}'..='\u{00CB}' | '\u{00E8}'..='\u{00EB}' | '\u{0112}'..='\u{011B}' => 'e',
+        '\u{00CC}'..='\u{00CF}' | '\u{00EC}'..='\u{00EF}' | '\u{0128}'..='\u{0131}' => 'i',
+        '\u{00D1}' | '\u{00F1}' | '\u{0143}'..='\u{0148}' => 'n',
+        '\u{00D2}'..='\u{00D6}'
+        | '\u{00D8}'
+        | '\u{00F2}'..='\u{00F6}'
+        | '\u{00F8}'
+        | '\u{014C}'..='\u{0151}' => 'o',
+        '\u{00D9}'..='\u{00DC}' | '\u{00F9}'..='\u{00FC}' | '\u{0168}'..='\u{0173}' => 'u',
+        '\u{00DD}' | '\u{00FD}' | '\u{00FF}' => 'y',
+        '\u{015A}'..='\u{0161}' => 's',
+        '\u{0179}'..='\u{017E}' => 'z',
+        c if c.is_ascii() => c,
+        _ => 'x',
+    }
+}
+
 /// The organization name as a label, when it is safe to put in front of
 /// "CoderHelm" on mail CoderHelm's relay sends: one line of letters, digits,
 /// spaces and `-` `.` `&` `'`, at most [`ORG_MAX`] characters, nothing that
@@ -121,12 +150,16 @@ pub fn org_label(raw: &str) -> Option<String> {
     if s.is_empty() || s.chars().count() > ORG_MAX {
         return None;
     }
+    // Letters from scripts with Latin look-alikes (a Cyrillic "\u{0405}" for S)
+    // would slip past every word check below, so only Latin letters pass;
+    // accented ones ("Soci\u{e9}t\u{e9}") are checked as their plain letter.
     if !s
         .chars()
-        .all(|c| c.is_alphanumeric() || matches!(c, ' ' | '-' | '.' | '&' | '\''))
+        .all(|c| (c.is_alphanumeric() && latin(c)) || matches!(c, ' ' | '-' | '.' | '&' | '\''))
     {
         return None;
     }
+    let s_plain: String = s.chars().map(fold_accent).collect();
     if !s.chars().any(char::is_alphanumeric) || is_aws_host(&s) {
         return None;
     }
@@ -137,8 +170,14 @@ pub fn org_label(raw: &str) -> Option<String> {
     if names_coderhelm(&s) || super::templates::uses_reserved_wording(&s) {
         return None;
     }
-    let words = s.split(|c: char| !c.is_alphanumeric() && c != '-');
-    if words.filter(|w| !w.is_empty()).any(is_staff_word) {
+    // Each word, each hyphen-separated part of one, and each run of two
+    // neighbouring words joined ("Account-Security", "Account Security").
+    let words: Vec<&str> = s_plain
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .filter(|w| !w.is_empty())
+        .collect();
+    let joined = words.windows(2).map(|w| format!("{}{}", w[0], w[1]));
+    if words.iter().any(|w| is_staff_word(w)) || joined.into_iter().any(|w| is_staff_word(&w)) {
         return None;
     }
     Some(s)
@@ -318,6 +357,29 @@ pub fn coderhelm_zone() -> String {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn hyphens_and_look_alike_letters_dont_hide_a_staff_word() {
+        assert_eq!(org_label("Account-Security"), None);
+        assert_eq!(org_label("\u{0405}ecurity"), None, "Cyrillic S");
+        assert_eq!(
+            org_label("S\u{e9}curity"),
+            None,
+            "an accent doesn't hide it"
+        );
+        assert_eq!(org_label("Acme Supp\u{f6}rt"), None);
+        assert_eq!(
+            org_label("\u{0421}od\u{0435}rh\u{0435}lm"),
+            None,
+            "Cyrillic C and e"
+        );
+        assert_eq!(org_label("Acme Labs").as_deref(), Some("Acme Labs"));
+        assert_eq!(
+            org_label("North-Pier & Co").as_deref(),
+            Some("North-Pier & Co")
+        );
+    }
+
     use super::*;
 
     const ZONE: &str = "coderhelm.com";

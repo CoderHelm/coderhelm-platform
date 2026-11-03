@@ -115,7 +115,8 @@ pub fn validate_name(raw: &str) -> Result<String, NameProblem> {
     if name.contains("--") {
         return Err(NameProblem::DoubleHyphen);
     }
-    if reserved().iter().any(|r| r == &name) || looks_like_coderhelm(&name) {
+    if reserved().iter().any(|r| r == &name) || looks_like_coderhelm(&name) || names_a_brand(&name)
+    {
         return Err(NameProblem::Reserved);
     }
     Ok(name)
@@ -169,6 +170,69 @@ pub const LOOKALIKE_WORDS: &[&str] = &[
     "portal",
     "trust",
 ];
+
+/// Other companies' names, mostly sign-in, mail and payment brands. A name is
+/// a real coderhelm.com address with a valid certificate that CoderHelm's
+/// mail could link, so "okta-acme" or "microsoft-sso" would make a
+/// convincing phishing page. Refused as a part; the longer ones anywhere.
+pub const BRAND_WORDS: &[&str] = &[
+    "okta",
+    "onelogin",
+    "auth0",
+    "duo",
+    "microsoft",
+    "office",
+    "outlook",
+    "azure",
+    "entra",
+    "google",
+    "gmail",
+    "github",
+    "gitlab",
+    "bitbucket",
+    "atlassian",
+    "jira",
+    "confluence",
+    "slack",
+    "apple",
+    "icloud",
+    "aws",
+    "amazon",
+    "bank",
+    "paypal",
+    "stripe",
+    "docusign",
+    "dropbox",
+    "zoom",
+    "linkedin",
+    "facebook",
+];
+
+/// Whether a name uses another company's name: one of [`BRAND_WORDS`] as a
+/// hyphen-separated part (trailing digits ignored), or a brand of six
+/// letters or more anywhere, with digits read as the letters they stand for.
+pub fn names_a_brand(name: &str) -> bool {
+    let letters: String = name
+        .chars()
+        .filter(|c| *c != '-')
+        .map(|c| match c {
+            '0' => 'o',
+            '1' => 'l',
+            '3' => 'e',
+            '4' => 'a',
+            '5' => 's',
+            '7' => 't',
+            c => c,
+        })
+        .collect();
+    name.split('-').any(|part| {
+        let word = part.trim_end_matches(|c: char| c.is_ascii_digit());
+        BRAND_WORDS.contains(&word)
+    }) || BRAND_WORDS
+        .iter()
+        .filter(|b| b.len() >= 6)
+        .any(|b| letters.contains(b))
+}
 
 /// Whether a (well-formed) name could pass for CoderHelm's own address:
 /// "coderhelm" anywhere, digits standing in for letters included ("c0derhe1m"),
@@ -419,6 +483,26 @@ pub const CHECKS_PER_MINUTE: u32 = 30;
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn other_companies_names_are_refused() {
+        for n in [
+            "okta-acme",
+            "acme-microsoft",
+            "microsoftsso",
+            "g00gle-acme",
+            "acme-aws",
+            "github-team",
+            "paypal2",
+            "apple",
+        ] {
+            assert_eq!(validate_name(n), Err(NameProblem::Reserved), "{n}");
+        }
+        for n in ["acme", "acme-labs", "north-pier", "duomo-labs"] {
+            assert!(validate_name(n).is_ok(), "{n}");
+        }
+    }
+
     use super::*;
 
     const CF: &str = "d1abcdef234567.cloudfront.net";
@@ -513,7 +597,6 @@ mod tests {
             "example-co",
             "acme",
             "my-team",
-            "apple",
             "application-lab",
             "mapbox",
             "rapid7",

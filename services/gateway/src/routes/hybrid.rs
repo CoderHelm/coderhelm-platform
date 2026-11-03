@@ -92,6 +92,9 @@ pub struct Install {
     pub integrations: Vec<String>,
     /// Name claims and releases in the last day (epoch seconds), for the limit.
     pub name_changes: Vec<i64>,
+    /// Set by a CoderHelm operator: this install may send through the mail
+    /// relay without a linked GitHub organization.
+    pub relay_approved: bool,
 }
 
 impl Install {
@@ -129,6 +132,7 @@ impl Install {
                 .split(',')
                 .filter_map(|t| t.parse().ok())
                 .collect(),
+            relay_approved: b("relay_approved"),
         })
     }
 
@@ -137,6 +141,9 @@ impl Install {
         m.insert("pk".into(), s(&relay::install_pk(&self.id)));
         m.insert("sk".into(), s("INSTALL"));
         m.insert("install_id".into(), s(&self.id));
+        if self.relay_approved {
+            m.insert("relay_approved".into(), AttributeValue::Bool(true));
+        }
         m.insert("status".into(), s(&self.status));
         m.insert("cloudfront".into(), s(&self.cloudfront));
         m.insert("verified_at".into(), s(&self.verified_at));
@@ -303,16 +310,26 @@ pub(crate) async fn signed(
         ));
     }
     let secret = sign::install_secret(master, id);
-    sign::verify_request(
+    let claim = sign::verify_install_request(
         &secret,
         h(sign::TIMESTAMP_HEADER),
         h(sign::SIGNATURE_HEADER),
+        h(sign::REQUEST_ID_HEADER),
         method.as_str(),
         uri.path(),
+        uri.query(),
         body,
         epoch(),
     )
     .map_err(|p| fail(StatusCode::UNAUTHORIZED, p.code(), p.message()))?;
+    if matches!(claim, sign::Claim::LegacySignature(_)) {
+        warn!(
+            install = id,
+            path = uri.path(),
+            "hybrid: v1-signed request (accepted until the legacy window ends)"
+        );
+    }
+    claim_once(state, id, &claim).await?;
     let install = load_install(state, id).await?.ok_or_else(|| {
         fail(
             StatusCode::UNAUTHORIZED,
@@ -328,6 +345,46 @@ pub(crate) async fn signed(
         ));
     }
     Ok(install)
+}
+
+/// Remembers a verified request once (by its signed request id, or a `v1`
+/// request's own signature), so a copy of it is refused: captured bytes
+/// can't be sent again, even within the 5-minute window.
+async fn claim_once(
+    state: &AppState,
+    install: &str,
+    claim: &sign::Claim,
+) -> Result<(), (StatusCode, Json<Value>)> {
+    let put = state
+        .dynamo
+        .put_item()
+        .table_name(&state.config.settings_table_name)
+        .item("pk", s(&relay::install_pk(install)))
+        .item("sk", s(&claim.key()))
+        .item(
+            "ttl",
+            AttributeValue::N((epoch() + sign::REPLAY_TTL_SECS).to_string()),
+        )
+        .condition_expression("attribute_not_exists(pk)")
+        .send()
+        .await;
+    match put {
+        Ok(_) => Ok(()),
+        Err(e) => {
+            let text = aws_sdk_dynamodb::error::DisplayErrorContext(&e).to_string();
+            if text.contains("ConditionalCheckFailed") {
+                let p = sign::SignatureProblem::Replayed;
+                Err(fail(StatusCode::UNAUTHORIZED, p.code(), p.message()))
+            } else {
+                warn!(error = %text, "hybrid: request claim failed; refused");
+                Err(fail(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "store_unavailable",
+                    "CoderHelm couldn't record the request. Try again in a minute.",
+                ))
+            }
+        }
+    }
 }
 
 pub(crate) fn body_json(body: &[u8]) -> Value {
@@ -3026,7 +3083,9 @@ mod tests {
             share_payloads: false,
             integrations: vec!["github".into(), "notion".into()],
             name_changes: vec![1, 2],
+            relay_approved: true,
         };
+        // Every field survives a save, the relay approval included.
         assert_eq!(Install::from_item(&i.to_item()).unwrap(), i);
         assert!(i.verified());
         assert_eq!(

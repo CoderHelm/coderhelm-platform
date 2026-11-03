@@ -129,6 +129,125 @@ pub fn sign_request(secret: &str, ts: i64, method: &str, path: &str, body: &[u8]
     )
 }
 
+/// The header carrying a signed request's single-use id (the same header the
+/// hosted answer's signature is bound to).
+pub const REQUEST_ID_HEADER: &str = "x-coderhelm-request-id";
+
+/// Until this time (2026-11-17T00:00:00Z) a `v1` request, which signs neither
+/// a request id nor the query, is still accepted, so installs on releases
+/// before `v2` keep working until they update. Each one is counted and
+/// claimed once by its own signature, so even a `v1` request can't be
+/// replayed. After it, only `v2` is accepted.
+pub const LEGACY_V1_UNTIL: i64 = 1_794_873_600;
+
+/// A request id an install may sign: 16 to 64 of `[A-Za-z0-9_-]`.
+pub fn valid_request_id(id: &str) -> bool {
+    (16..=64).contains(&id.len())
+        && id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+}
+
+/// The `v2=<hex>` signature of an install request: the time, the request's
+/// single-use id, the method, the path with its query (`?a=b`, or nothing),
+/// and the body's hash. Nothing of the request is left unsigned that a
+/// handler reads, and the id makes every request different.
+pub fn sign_request_v2(
+    secret: &str,
+    ts: i64,
+    request_id: &str,
+    method: &str,
+    path_and_query: &str,
+    body: &[u8],
+) -> String {
+    let msg = format!(
+        "v2.{ts}.{request_id}.{}.{path_and_query}.{}",
+        method.to_ascii_uppercase(),
+        body_hash(body)
+    );
+    format!(
+        "v2={}",
+        hex::encode(mac(secret.as_bytes(), &[msg.as_bytes()]))
+    )
+}
+
+/// What a verified install request is claimed by, so it can be used once.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Claim {
+    /// A `v2` request: its signed request id.
+    RequestId(String),
+    /// A `v1` request (before [`LEGACY_V1_UNTIL`]): its own signature, which
+    /// covers the time, method, path and body, so an exact copy is the only
+    /// thing that could repeat it.
+    LegacySignature(String),
+}
+
+impl Claim {
+    /// The key it is remembered under (one install's records).
+    pub fn key(&self) -> String {
+        match self {
+            Self::RequestId(id) => format!("REQ#{id}"),
+            Self::LegacySignature(sig) => format!("REQV1#{}", &body_hash(sig.as_bytes())[..32]),
+        }
+    }
+}
+
+/// Checks an install request: a `v2` signature (with its request id and the
+/// query), or until [`LEGACY_V1_UNTIL`] a `v1` one on a request with no
+/// query. Answers what to claim so the request is used once.
+#[allow(clippy::too_many_arguments)]
+pub fn verify_install_request(
+    secret: &str,
+    ts_header: Option<&str>,
+    sig_header: Option<&str>,
+    request_id: Option<&str>,
+    method: &str,
+    path: &str,
+    query: Option<&str>,
+    body: &[u8],
+    now: i64,
+) -> Result<Claim, SignatureProblem> {
+    let (Some(ts_raw), Some(sig)) = (ts_header, sig_header) else {
+        return Err(SignatureProblem::Missing);
+    };
+    let sig = sig.trim();
+    let query = query.filter(|q| !q.is_empty());
+    if let Some(hexsig) = sig.strip_prefix("v2=") {
+        let ts: i64 = ts_raw
+            .trim()
+            .parse()
+            .map_err(|_| SignatureProblem::Malformed)?;
+        let got = hex::decode(hexsig).map_err(|_| SignatureProblem::Malformed)?;
+        let rid = request_id.map(str::trim).unwrap_or_default();
+        if !valid_request_id(rid) {
+            return Err(SignatureProblem::Malformed);
+        }
+        if !fresh(ts, now) {
+            return Err(SignatureProblem::Stale);
+        }
+        let pq = match query {
+            Some(q) => format!("{path}?{q}"),
+            None => path.to_string(),
+        };
+        let want = sign_request_v2(secret, ts, rid, method, &pq, body);
+        let want = hex::decode(&want[3..]).unwrap_or_default();
+        if !ct_eq(&got, &want) {
+            return Err(SignatureProblem::Mismatch);
+        }
+        return Ok(Claim::RequestId(rid.to_string()));
+    }
+    if now >= LEGACY_V1_UNTIL || query.is_some() {
+        // v1 signs no query, so a request with one could have it swapped.
+        return Err(if sig.starts_with("v1=") {
+            SignatureProblem::Outdated
+        } else {
+            SignatureProblem::Malformed
+        });
+    }
+    verify_request(secret, ts_header, Some(sig), method, path, body, now)?;
+    Ok(Claim::LegacySignature(sig.to_string()))
+}
+
 /// Why a signed request or relayed event was refused, in plain words with the fix.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SignatureProblem {
@@ -139,6 +258,8 @@ pub enum SignatureProblem {
     Replayed,
     /// Signed with a key this release doesn't trust as CoderHelm's (hosted_sig).
     UnknownKey,
+    /// A `v1` request after [`LEGACY_V1_UNTIL`], or one with a query.
+    Outdated,
 }
 
 impl SignatureProblem {
@@ -150,6 +271,7 @@ impl SignatureProblem {
             Self::Mismatch => "signature_mismatch",
             Self::Replayed => "replayed",
             Self::UnknownKey => "signature_unknown_key",
+            Self::Outdated => "signature_outdated",
         }
     }
 
@@ -163,6 +285,9 @@ impl SignatureProblem {
             Self::Mismatch => "The signature doesn't match: the keys on the two sides differ.",
             Self::Replayed => "This delivery was already received once; the copy was refused.",
             Self::UnknownKey => "Not signed by CoderHelm: the key isn't one this release trusts.",
+            Self::Outdated => {
+                "This install signs requests the old way, which CoderHelm no longer accepts."
+            }
         }
     }
 
@@ -173,6 +298,7 @@ impl SignatureProblem {
             Self::Mismatch => "Register the install again in Settings, System, Hybrid: that issues fresh keys to both sides.",
             Self::Replayed => "Nothing to do: the first copy was handled.",
             Self::UnknownKey => "Update CoderHelm: each release pins CoderHelm's current keys, and a newer one trusts the key in use now.",
+            Self::Outdated => "Update CoderHelm in Settings, System: newer releases sign every request with a single-use id.",
         }
     }
 }
@@ -354,6 +480,182 @@ pub fn check_proof(secret: &str, challenge: &str, answer: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+
+    const RID: &str = "req_abcdefghijklmnopqrstuvwxyz012345";
+
+    #[test]
+    fn the_v2_signature_matches_the_updater_and_a_fixed_vector() {
+        // lambda/tests/test_updater.py, test_the_signature_matches_the_services
+        assert_eq!(
+            sign_request_v2(
+                "s3cret",
+                1_800_000_000,
+                RID,
+                "delete",
+                "/hybrid/installs?x=1",
+                b""
+            ),
+            "v2=4769ebe0b0e6f0a907f4db72095eb65f2729f7763d2793b8ea4a18965508d0f8"
+        );
+    }
+
+    fn v2(s: &str, rid: &str, path_q: &str, body: &[u8]) -> (String, String) {
+        (
+            NOW.to_string(),
+            sign_request_v2(s, NOW, rid, "POST", path_q, body),
+        )
+    }
+
+    #[test]
+    fn a_v2_request_is_claimed_by_its_signed_request_id() {
+        let s = install_secret("master", "ins_abcdefghijklmnopqrstuvwx");
+        let (ts, sig) = v2(&s, RID, "/hybrid/github/token", b"{}");
+        let ok = verify_install_request(
+            &s,
+            Some(&ts),
+            Some(&sig),
+            Some(RID),
+            "POST",
+            "/hybrid/github/token",
+            None,
+            b"{}",
+            NOW,
+        );
+        assert_eq!(ok, Ok(Claim::RequestId(RID.into())));
+        assert_eq!(ok.unwrap().key(), format!("REQ#{RID}"));
+    }
+
+    #[test]
+    fn a_v2_request_with_another_id_or_query_does_not_verify() {
+        let s = install_secret("master", "ins_abcdefghijklmnopqrstuvwx");
+        let (ts, sig) = v2(&s, RID, "/hybrid/names?name=acme", b"");
+        let other = "req_zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz";
+        // Swapping the (unsigned before) request id header: refused.
+        assert_eq!(
+            verify_install_request(
+                &s,
+                Some(&ts),
+                Some(&sig),
+                Some(other),
+                "POST",
+                "/hybrid/names",
+                Some("name=acme"),
+                b"",
+                NOW
+            ),
+            Err(SignatureProblem::Mismatch)
+        );
+        // Changing the query: refused.
+        assert_eq!(
+            verify_install_request(
+                &s,
+                Some(&ts),
+                Some(&sig),
+                Some(RID),
+                "POST",
+                "/hybrid/names",
+                Some("name=evil"),
+                b"",
+                NOW
+            ),
+            Err(SignatureProblem::Mismatch)
+        );
+        // Dropping the query: refused.
+        assert_eq!(
+            verify_install_request(
+                &s,
+                Some(&ts),
+                Some(&sig),
+                Some(RID),
+                "POST",
+                "/hybrid/names",
+                None,
+                b"",
+                NOW
+            ),
+            Err(SignatureProblem::Mismatch)
+        );
+        // No request id at all: malformed.
+        assert_eq!(
+            verify_install_request(
+                &s,
+                Some(&ts),
+                Some(&sig),
+                None,
+                "POST",
+                "/hybrid/names",
+                Some("name=acme"),
+                b"",
+                NOW
+            ),
+            Err(SignatureProblem::Malformed)
+        );
+    }
+
+    #[test]
+    fn a_v1_request_is_accepted_only_until_the_window_ends_and_never_with_a_query() {
+        let s = install_secret("master", "ins_abcdefghijklmnopqrstuvwx");
+        let before = LEGACY_V1_UNTIL - 3600;
+        let sig = sign_request(&s, before, "POST", "/hybrid/github/token", b"{}");
+        let ts = before.to_string();
+        let got = verify_install_request(
+            &s,
+            Some(&ts),
+            Some(&sig),
+            None,
+            "POST",
+            "/hybrid/github/token",
+            None,
+            b"{}",
+            before,
+        );
+        assert_eq!(got, Ok(Claim::LegacySignature(sig.clone())));
+        // The same bytes are claimed by the same key, so a copy collides.
+        assert_eq!(
+            got.clone().unwrap().key(),
+            Claim::LegacySignature(sig.clone()).key()
+        );
+        // With a query (v1 doesn't sign it): refused.
+        assert_eq!(
+            verify_install_request(
+                &s,
+                Some(&ts),
+                Some(&sig),
+                None,
+                "POST",
+                "/hybrid/github/token",
+                Some("a=b"),
+                b"{}",
+                before
+            ),
+            Err(SignatureProblem::Outdated)
+        );
+        // After the window: refused.
+        let after = LEGACY_V1_UNTIL + 10;
+        let sig = sign_request(&s, after, "POST", "/hybrid/github/token", b"{}");
+        assert_eq!(
+            verify_install_request(
+                &s,
+                Some(&after.to_string()),
+                Some(&sig),
+                None,
+                "POST",
+                "/hybrid/github/token",
+                None,
+                b"{}",
+                after
+            ),
+            Err(SignatureProblem::Outdated)
+        );
+    }
+
+    #[test]
+    fn request_ids_are_checked_for_shape() {
+        assert!(valid_request_id(RID));
+        assert!(!valid_request_id("short"));
+        assert!(!valid_request_id("req_has space inside it 12345678"));
+    }
+
     use super::*;
 
     const MASTER: &str = "hosted-master-key-for-tests";
