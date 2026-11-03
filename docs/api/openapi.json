@@ -487,6 +487,13 @@
             "format": "int64",
             "type": "integer"
           },
+          "latency": {
+            "description": "How long the period's deliveries took, by latency bucket, every\nbucket in order (zeros kept).",
+            "items": {
+              "$ref": "#/components/schemas/LatencyBucket"
+            },
+            "type": "array"
+          },
           "period": {
             "description": "`24h`, `7d` or `30d`.",
             "examples": [
@@ -583,6 +590,7 @@
           "summary",
           "previous",
           "series",
+          "latency",
           "sources",
           "reasons",
           "events",
@@ -746,6 +754,16 @@
               "2026-10-24"
             ],
             "type": "string"
+          },
+          "install_form": {
+            "description": "How the install was made: `native` (one stack from the launch page,\nno config file) or `config` (coderhelm.config.json). Null when the\ninstall didn't say (installs from before this field).",
+            "examples": [
+              "native"
+            ],
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "kinds": {
             "description": "Every kind, in a fixed order, zeros included.",
@@ -1370,6 +1388,54 @@
             ]
           }
         },
+        "type": "object"
+      },
+      "LatencyBucket": {
+        "description": "One bucket of the latency distribution.",
+        "properties": {
+          "failed": {
+            "description": "Deliveries that failed, in this bucket.",
+            "examples": [
+              3
+            ],
+            "format": "int64",
+            "type": "integer"
+          },
+          "from_ms": {
+            "description": "The previous bucket's upper bound, milliseconds: this bucket holds\ndeliveries slower than this (0 for the first).",
+            "examples": [
+              300
+            ],
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "ok": {
+            "description": "Deliveries that went through, in this bucket.",
+            "examples": [
+              412
+            ],
+            "format": "int64",
+            "type": "integer"
+          },
+          "to_ms": {
+            "description": "The bucket's upper bound, milliseconds (inclusive). Null for the\nlast, open bucket.",
+            "examples": [
+              500
+            ],
+            "format": "int64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "from_ms",
+          "ok",
+          "failed"
+        ],
         "type": "object"
       },
       "Me": {
@@ -2165,6 +2231,18 @@
             ],
             "format": "int64",
             "type": "integer"
+          },
+          "p50_ms": {
+            "description": "Median latency, milliseconds.",
+            "examples": [
+              210
+            ],
+            "format": "int64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
           },
           "p95_ms": {
             "description": "95th percentile latency, milliseconds.",
@@ -4332,6 +4410,25 @@
             "format": "int64",
             "type": "integer"
           },
+          "failed_series": {
+            "description": "Failed deliveries in each bucket, as `series`.",
+            "examples": [
+              [
+                1,
+                0,
+                2,
+                1,
+                0,
+                3,
+                0
+              ]
+            ],
+            "items": {
+              "format": "int64",
+              "type": "integer"
+            },
+            "type": "array"
+          },
           "ok": {
             "description": "Handled or ignored.",
             "examples": [
@@ -4339,6 +4436,18 @@
             ],
             "format": "int64",
             "type": "integer"
+          },
+          "p50_ms": {
+            "description": "Median latency, milliseconds.",
+            "examples": [
+              150
+            ],
+            "format": "int64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
           },
           "p95_ms": {
             "description": "95th percentile latency, milliseconds.",
@@ -4371,6 +4480,25 @@
               "null"
             ]
           },
+          "series": {
+            "description": "Finished deliveries in each hour or day of the period, oldest first\n(the same buckets as `series`), for a sparkline.",
+            "examples": [
+              [
+                120,
+                131,
+                140,
+                128,
+                135,
+                129,
+                129
+              ]
+            ],
+            "items": {
+              "format": "int64",
+              "type": "integer"
+            },
+            "type": "array"
+          },
           "source": {
             "description": "`github`, `relay`, `webhook`, `alerts`, `jira`, `slack`, `teams`, `email`, `broker`, `knowledge`.",
             "examples": [
@@ -4396,6 +4524,8 @@
           "deliveries",
           "ok",
           "failed",
+          "series",
+          "failed_series",
           "previous_deliveries"
         ],
         "type": "object"
