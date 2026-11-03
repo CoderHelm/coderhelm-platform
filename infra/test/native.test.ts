@@ -21,7 +21,8 @@ import * as path from "node:path";
 import { buildApp } from "../lib/app";
 import { resolveConfig } from "../lib/config";
 import { buildNative } from "../lib/native/build";
-import { ASSETS_BUCKET_SENTINEL, REGION_SENTINEL, STAGE_SENTINEL } from "../lib/native/config";
+import { ASSETS_BUCKET_SENTINEL, REGION_SENTINEL, STAGE_SENTINEL, nativeConfig } from "../lib/native/config";
+import { emailEnvironment } from "../lib/service-env";
 import { DATA_TYPES, LIMITS, checkLimits, findSentinels, sha256File, transformChild } from "../lib/native/package";
 import { DEPLOY_BOUNDARY_ARN, declaredLogGroups, deployRolePolicy, helperPolicy, nativeNames } from "../lib/native/parent";
 
@@ -487,3 +488,8 @@ test("bug 2: no doc tells anyone to change a parameter with the current template
   assert.match(un, /--template-url "https:\/\/coderhelm-public\.s3\.amazonaws\.com\/launch\/\$V\/coderhelm\.json"/);
   assert.match(un, /OutputKey=='KeepDataOnDelete'/, "it checks the output before deleting");
 });
+
+test("a native install says so, so setup checks never point at a config file it doesn't have", () => {
+  assert.equal(emailEnvironment(nativeConfig()).INSTALL_FORM, "native");
+});
+
