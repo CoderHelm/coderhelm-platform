@@ -620,9 +620,7 @@ def notice(what, version, env, facts=None):
             ("facts", [("Install", "{install}"), ("Running now", "{current}"), ("New release", "{version}"),
                        ("Not applied yet because", "{waiting}"), ("Checked", "{checked_at}")]),
             ("p", "This is a major release. Read its notes before you update." if v.get("major") else ""),
-            ("quote", "What's new", "notes"),
-            ("p", "To update, open Settings, then System, and press Update now to {version}. Or run this where the install's AWS sign-in works:"),
-            ("cmd", CLI + " update --to {version}"),
+            ("p", "To update, open Settings, then System, and press Update now. The release notes say what changed."),
         ],
         "blocked": [
             ("p", "This install won't update to {version} until someone fixes what the update check found. Nothing has changed yet."),
@@ -631,9 +629,8 @@ def notice(what, version, env, facts=None):
             ("quote", "Why it's blocked", "reason"),
             ("quote", "What to do", "action"),
             ("p", "Once it is fixed, open Settings, then System, then Update readiness, and press Check again. Once it passes, press Update now to {version}. The check also runs by itself every day, and with automatic updates on the update then goes ahead on its own."),
-            ("p", "From a terminal, see what fails and how to fix it, then update:"),
+            ("p", "From a terminal, see what fails and how to fix it:"),
             ("cmd", CLI + " doctor"),
-            ("cmd", CLI + " update --to {version}"),
         ],
         "succeeded": [
             ("p", "This install finished updating to {version}."),
@@ -650,7 +647,6 @@ def notice(what, version, env, facts=None):
             ("quote", "What to do", "action"),
             ("p", "Open Settings, then System, then Update history for the full log. Fix what it shows, then press Update now to try again. From a terminal:"),
             ("cmd", CLI + " doctor"),
-            ("cmd", CLI + " update --to {version}"),
         ],
         "rolled_back": [
             ("p", "This install tried {version}, found it unhealthy, and went back to the release it ran before."),
@@ -660,7 +656,6 @@ def notice(what, version, env, facts=None):
             ("quote", "What to do", "action"),
             ("p", "Open Settings, then System, then Update history for the full log. Fix what it shows, then press Update now to try again. From a terminal:"),
             ("cmd", CLI + " doctor"),
-            ("cmd", CLI + " update --to {version}"),
         ],
         "domain_live": [
             ("p", "This install now answers on its new address. Tell your team to sign in there from now on."),

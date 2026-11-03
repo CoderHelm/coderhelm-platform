@@ -916,13 +916,23 @@ class EmailRouteTest(unittest.TestCase):
         self.assertTrue(self.sent[0]["FromEmailAddress"].startswith("=?UTF-8?B?"))
         self.assertTrue(self.sent[0]["FromEmailAddress"].endswith(" <ch@example.org>"))
 
+    def test_the_available_notice_links_the_release_notes_and_names_no_command(self):
+        n = u.notice("available", "v0.8.0", dict(self.env, APP_URL="https://helm.example.org"),
+                     {"current": "v0.7.4", "notes": "Faster reviews on large pull requests."})
+        self.assertIn("press Update now. The release notes say what changed.", n["text"])
+        self.assertIn("https://helm.example.org/settings/system/#version", n["text"])
+        for gone in ["What's new", "Faster reviews", "update --to", "npx"]:
+            self.assertNotIn(gone, n["text"])
+            self.assertNotIn(gone, n["html"])
+
     def test_the_blocked_notice_says_which_install_versions_why_and_what_to_do(self):
         n = u.notice("blocked", "v0.8.0", dict(self.env, APP_URL="https://helm.example.org"), self.BLOCKED)
         for want in ["Install: helm.example.org", "Running now: v0.7.4", "Waiting to install: v0.8.0",
                      "Checked: 2026-10-31 14:05 UTC", "Why it's blocked:", "Bedrock refused the call", "What to do:",
-                     "Update readiness", "Check again", "update --to v0.8.0", "doctor",
+                     "Update readiness", "Check again", "doctor",
                      "https://helm.example.org/settings/system/#readiness", "https://helm.example.org/settings/system/#version"]:
             self.assertIn(want, n["text"])
+        self.assertNotIn("update --to", n["text"])
         self.assertIn("<table", n["html"])
         self.assertEqual(n["subject"], "helm.example.org CoderHelm: update to v0.8.0 needs your OK")
         # An older shape: no facts, nothing blank.

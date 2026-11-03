@@ -327,9 +327,7 @@ pub const TEMPLATES: &[Template] = &[
                             ("Checked", "{checked_at}"),
                         ]),
                         Part::Case("major", &[("yes", &[Part::Para("This is a major release. Read its notes before you update.")])]),
-                        Part::Quote("What's new", "notes"),
-                        Part::Para("To update, open Settings, then System, and press Update now to {version}. Or run this where the install's AWS sign-in works:"),
-                        Part::Command(cli!("update --to {version}")),
+                        Part::Para("To update, open Settings, then System, and press Update now. The release notes say what changed."),
                         Part::Button("Open Settings, System", "link"),
                         Part::Button("Read the release notes", "notes_link"),
                     ],
@@ -347,9 +345,8 @@ pub const TEMPLATES: &[Template] = &[
                         Part::Quote("Why it's blocked", "reason"),
                         Part::Quote("What to do", "action"),
                         Part::Para("Once it is fixed, open Settings, then System, then Update readiness, and press Check again. Once it passes, press Update now to {version}. The check also runs by itself every day, and with automatic updates on the update then goes ahead on its own."),
-                        Part::Para("From a terminal, see what fails and how to fix it, then update:"),
+                        Part::Para("From a terminal, see what fails and how to fix it:"),
                         Part::Command(cli!("doctor")),
-                        Part::Command(cli!("update --to {version}")),
                         Part::Button("Open Update readiness", "link"),
                         Part::Button("Read the release notes", "notes_link"),
                     ],
@@ -384,7 +381,6 @@ pub const TEMPLATES: &[Template] = &[
                         Part::Quote("What to do", "action"),
                         Part::Para("Open Settings, then System, then Update history for the full log. Fix what it shows, then press Update now to try again. From a terminal:"),
                         Part::Command(cli!("doctor")),
-                        Part::Command(cli!("update --to {version}")),
                         Part::Button("Open Settings, System", "link"),
                         Part::Button("Read the release notes", "notes_link"),
                     ],
@@ -403,7 +399,6 @@ pub const TEMPLATES: &[Template] = &[
                         Part::Quote("What to do", "action"),
                         Part::Para("Open Settings, then System, then Update history for the full log. Fix what it shows, then press Update now to try again. From a terminal:"),
                         Part::Command(cli!("doctor")),
-                        Part::Command(cli!("update --to {version}")),
                         Part::Button("Open Settings, System", "link"),
                         Part::Button("Read the release notes", "notes_link"),
                     ],
@@ -1279,7 +1274,11 @@ mod tests {
             "{}",
             r.text
         );
-        assert!(r.text.contains("update --to v0.8.0"));
+        assert!(!r.text.contains("update --to"), "{}", r.text);
+        assert!(!r.text.contains("npx"), "{}", r.text);
+        assert!(r
+            .text
+            .contains("press Update now. The release notes say what changed."));
     }
 
     #[test]
