@@ -14,6 +14,10 @@ Actions (the `action` field of the event):
             rollback.
 - rollback  starts the build for the version before the last update, or an
             admin's pick, which must be a version this install ran before.
+- apply_update  a native install: an admin applies the prepared update that
+            waits for them (review), from Settings, System. When it would
+            replace or remove data or change permissions, only with
+            `confirm`, the token of exactly those changes (native_status).
 - finished  the update build reports its result; history and notices.
 - refresh_secrets  the gateway stored new keys in the install's secret (the
             GitHub App, from the install guide): restart the services that
@@ -79,6 +83,7 @@ import urllib.error
 import urllib.request
 import uuid
 import hashlib
+import hmac
 from datetime import datetime, timedelta, timezone
 
 logger = logging.getLogger()
@@ -1500,11 +1505,17 @@ def close_window(env, iam=None):
 # An update proposes a change set on it to the release's parent template:
 # only after the release check reported the template's sha256 from the
 # signed SHA256SUMS (models_verified), and only when the template downloaded
-# from the release's write-once URL matches it. Without DEPLOY_ROLE_ARN
-# (auto-update off) the change set waits for an admin to review and execute
-# it in the console; with it, the updater executes it through that role.
-# native_poll (every 5 minutes) follows it to the end and reports it like a
-# finished build. Every reason comes from CloudFormation's own words.
+# from the release's write-once URL matches it. Every native install has the
+# parent's deploy role (DEPLOY_ROLE_ARN), and the updater executes the change
+# set through it: when an admin pressed Update (or Roll back, or a domain
+# move), and on a schedule only with auto-update on (`scheduled`). A change
+# set that would replace or remove data or change permissions waits for an
+# admin to confirm exactly those changes in Settings, System (apply_update).
+# One that changes the deploy role or a boundary the role can't apply, so it
+# waits for an AWS admin; so does every change set of an older parent
+# without the role. native_poll (every 5 minutes) follows it to the end and
+# reports it like a finished build. Every reason comes from CloudFormation's
+# own words.
 
 NATIVE_CAPABILITIES = ["CAPABILITY_IAM", "CAPABILITY_NAMED_IAM", "CAPABILITY_AUTO_EXPAND"]
 NATIVE_HOST = "coderhelm-public.s3.amazonaws.com"
@@ -1849,11 +1860,46 @@ def fetched_template_matches(cfn, env, cs_id, want):
 def native_status(store, env, state):
     hid = state.get("running_id") or state.get("review_id")
     entry = store.get(hid, {}) if hid else {}
+    pending = None
+    if entry.get("change_set_id"):
+        pending = dict(entry.get("change_set") or {}, version=entry.get("version"), status=entry.get("status"), id=hid)
+        if entry.get("status") == "review":
+            # What an admin confirms in Settings, System before it applies.
+            pending.update({
+                "hold": entry.get("reason") or "",
+                "data_changes": entry.get("data_changes") or [],
+                "permission_changes": entry.get("permission_changes") or [],
+                "admin_changes": entry.get("admin_changes") or [],
+                "can_apply": can_apply_here(env, entry),
+                "confirm": confirm_token(hid, entry),
+            })
+    role = bool(env.get("DEPLOY_ROLE_ARN"))
     return {
         "stack": env.get("NATIVE_STACK"),
-        "auto_apply": bool(env.get("DEPLOY_ROLE_ARN")),
-        "pending": dict(entry.get("change_set") or {}, version=entry.get("version"), status=entry.get("status")) if entry.get("change_set_id") else None,
+        # The install has the deploy role: an admin's Update applies (older name: auto_apply).
+        "can_apply": role,
+        "auto_apply": role,
+        "pending": pending,
     }
+
+
+def confirm_token(hid, entry):
+    """What an admin's confirmation names: this prepared update and exactly
+    the data and permission changes it would make ("" when there are none)."""
+    held = {"data": entry.get("data_changes") or [], "permissions": entry.get("permission_changes") or []}
+    if not held["data"] and not held["permissions"]:
+        return ""
+    return canonical_sha({"id": hid, "change_set": entry.get("change_set_id"), **held})
+
+
+def can_apply_here(env, entry):
+    """Whether the updater can apply this prepared update through the deploy
+    role: it was made with the role, and changes neither the role nor a boundary."""
+    return bool(env.get("DEPLOY_ROLE_ARN")) and bool(entry.get("apply")) and not entry.get("admin_changes")
+
+
+def auto_on(store, env):
+    return validate_settings(store.get("AUTO_UPDATE", {}) or {}, defaults_from_env(env))["auto"]
 
 
 def change_set_link(region, stack_id, cs_id):
@@ -1947,19 +1993,12 @@ def native_poll(store, env, now, cfn=None):
         summary["data_changes"] = entry["data_changes"]
         entry["change_set"] = summary
     if execution == "AVAILABLE":
-        if entry.get("data_changes") and entry.get("apply"):
-            # Never automatic when data would be replaced or removed: a person decides.
-            entry["apply"] = False
-            entry["reason"] = "auto-update held: it would replace or remove " + "; ".join(entry["data_changes"])[:400]
-        elif entry.get("admin_changes") and entry.get("apply"):
-            # The auto-update role can't change itself or a boundary: an admin executes it.
-            entry["apply"] = False
-            entry["reason"] = "auto-update held: it changes the auto-update role or a boundary (" + "; ".join(entry["admin_changes"])[:300] + "), which only an admin can apply"
-        elif entry.get("permission_changes") and entry.get("apply"):
-            # Never automatic when it changes who may do what: a person reads it first.
-            entry["apply"] = False
-            entry["reason"] = "auto-update held: it changes permissions (" + "; ".join(entry["permission_changes"])[:400] + "), which an admin reviews and applies"
-        if entry.get("apply") and not entry.get("executed_at"):
+        # An admin's Update applies at once; a scheduled one only while auto-update is on.
+        # Neither applies by itself what a person must decide.
+        hold = native_hold(store, env, entry)
+        if hold:
+            entry["reason"] = hold
+        if entry.get("apply") and not hold and not entry.get("executed_at"):
             cfn.execute_change_set(ChangeSetName=cs_id, StackName=env["NATIVE_STACK"])
             entry.update({"executed_at": now.isoformat(), "status": "running"})
             store.put(hid, entry)
@@ -1972,8 +2011,12 @@ def native_poll(store, env, now, cfn=None):
             state.pop("running_id", None)
             state["review_id"] = hid
             store.put("UPDATE_STATE", state)
-            notify(f"CoderHelm {entry.get('version')} is ready to review",
-                   f"The stack update is prepared. Review it and choose Execute in the AWS console:\n{summary['link']}",
+            if can_apply_here(env, entry):
+                how = f"Open Settings, then System, check what it changes and press Apply:\n{app_url(env)}/settings/system/#version"
+            else:
+                how = f"CoderHelm can't apply this one for you. Review it and choose Execute in the AWS console:\n{summary['link']}"
+            notify(f"CoderHelm {entry.get('version')} is ready to apply",
+                   f"The stack update is prepared. {entry.get('reason') or ''}\n{how}".replace(". \n", ".\n"),
                    env, what="review", version=entry.get("version"))
         else:
             store.put(hid, entry)
@@ -2001,6 +2044,86 @@ def native_poll(store, env, now, cfn=None):
     return {"native": str(execution or status).lower()}
 
 
+def native_hold(store, env, entry):
+    """Why this prepared update waits for an admin ("" when it may run now)."""
+    if not entry.get("apply"):
+        return "this install's stack has no deploy role yet, so an AWS admin executes this update once in the AWS console (it adds the role)"
+    if entry.get("admin_changes"):
+        # The deploy role can't change itself or a boundary (TheBoundaryStays, TheDeployRoleStays).
+        return ("it changes the deploy role or a permissions boundary (" + "; ".join(entry["admin_changes"])[:300]
+                + "), which CoderHelm can't apply for you: an AWS admin executes it in the AWS console")
+    who = "auto-update held" if entry.get("scheduled") else "waiting for you to confirm"
+    if entry.get("data_changes"):
+        # Never without a person: data would be replaced or removed.
+        return f"{who}: it would replace or remove " + "; ".join(entry["data_changes"])[:400]
+    if entry.get("permission_changes"):
+        # Never without a person: it changes who may do what.
+        return f"{who}: it changes permissions (" + "; ".join(entry["permission_changes"])[:400] + ")"
+    if entry.get("scheduled") and not auto_on(store, env):
+        return "auto-update was turned off before it ran: press Apply to apply it"
+    return ""
+
+
+def native_apply(store, env, now, event, cfn=None):
+    """An admin applies the prepared update that waits for them. Only through
+    the deploy role, only a change set still as it was checked, and, when it
+    would replace or remove data or change permissions, only with `confirm`
+    naming exactly those changes. A change to the role or a boundary is never
+    applied here: the role can't, and nothing else here may."""
+    if not is_native(env):
+        raise ValueError("only a one-stack install applies a prepared update")
+    state = store.get("UPDATE_STATE", {})
+    hid = state.get("review_id")
+    if not hid or (event.get("history_id") and event.get("history_id") != hid):
+        raise ValueError("no prepared update is waiting for you (reload the page)")
+    entry = store.get(hid, {})
+    cs_id = entry.get("change_set_id")
+    if entry.get("status") != "review" or not cs_id or not entry.get("checked"):
+        raise ValueError("no prepared update is waiting for you (reload the page)")
+    if not can_apply_here(env, entry):
+        raise ValueError(native_hold(store, env, entry) or "CoderHelm can't apply this update")
+    want = confirm_token(hid, entry)
+    if want and not hmac.compare_digest(str(event.get("confirm") or ""), want):
+        raise ValueError("confirm the changes it would make first (if the page was open a while, reload it: the list may have changed)")
+    cfn = cfn or client("cloudformation")
+    role = env["DEPLOY_ROLE_ARN"]
+    cs = cfn.describe_change_set(ChangeSetName=cs_id, StackName=env["NATIVE_STACK"])
+    if cs.get("RoleARN") != role:
+        raise ValueError("this update was prepared without the deploy role; press Update to prepare it again")
+    if cs.get("Status") != "CREATE_COMPLETE" or cs.get("ExecutionStatus") != "AVAILABLE":
+        raise ValueError("this prepared update can no longer run (the stack changed since); press Update to prepare it again")
+    actor = event.get("actor") or DIRECT_ACTOR
+    cfn.execute_change_set(ChangeSetName=cs_id, StackName=env["NATIVE_STACK"])
+    entry.update({"status": "running", "executed_at": now.isoformat(), "applied_by": actor, "reason": ""})
+    if want:
+        entry["confirmed"] = {"by": actor, "at": now.isoformat(), "data_changes": entry.get("data_changes") or [],
+                              "permission_changes": entry.get("permission_changes") or []}
+    store.put(hid, entry)
+    state.pop("review_id", None)
+    state.update({"running_since": now.isoformat(), "running_id": hid})
+    store.put("UPDATE_STATE", state)
+    logger.info(f"Prepared update {hid} applied by {actor}{' (confirmed)' if want else ''}")
+    return dict(entry, id=hid)
+
+
+def supersede_review(store, env, state, now, cfn=None):
+    """A new update replaces the one waiting for review: its change set is
+    deleted and it is recorded as never started (nothing was changed)."""
+    hid = state.pop("review_id", None)
+    if not hid:
+        return
+    entry = store.get(hid, {}) or {}
+    if entry.get("change_set_id") and is_native(env):
+        try:
+            (cfn or client("cloudformation")).delete_change_set(ChangeSetName=entry["change_set_id"], StackName=env["NATIVE_STACK"])
+        except Exception as e:
+            logger.warning(f"replaced change set not deleted: {e}")
+    if entry.get("status") == "review":
+        entry.update({"status": "not_started", "reason": "replaced by a newer update before it was applied; nothing was changed",
+                      "finished_at": now.isoformat()})
+        store.put(hid, entry)
+
+
 def native_finish(store, env, now, hid, status, reason):
     state = store.get("UPDATE_STATE", {})
     if state.get("review_id") == hid:
@@ -2023,7 +2146,7 @@ def not_started_reason(e):
     return f"couldn't prepare the update ({type(e).__name__}: {str(e)[:200]}); nothing was changed, try again"
 
 
-def begin(store, env, now, version, actor, mode, extra=None, note=None):
+def begin(store, env, now, version, actor, mode, extra=None, note=None, scheduled=False):
     """Starts the update and records it in history.
 
     History holds updates that started: the row is written once the change
@@ -2041,6 +2164,9 @@ def begin(store, env, now, version, actor, mode, extra=None, note=None):
              "status": "running", "started_at": now.isoformat(), "reason": ""}
     if note:
         entry["note"] = note
+    if scheduled:
+        # The maintenance window started it: it applies only while auto-update is on.
+        entry["scheduled"] = True
 
     def refused(e):
         entry.update({"status": "not_started", "reason": not_started_reason(e), "finished_at": now.isoformat()})
@@ -2057,6 +2183,7 @@ def begin(store, env, now, version, actor, mode, extra=None, note=None):
         except Exception as e:  # noqa: BLE001  nothing changed: say so, never leave it running
             refused(e)
         entry["status"] = "preparing"
+        supersede_review(store, env, state, now)
     else:
         store.put(hid, entry)
         try:
@@ -2236,6 +2363,9 @@ def handle(event, env, store, now, fetch=fetch_releases, probe=None):
             raise ValueError(f"{target} is not a version this install ran before, so it can't be rolled back to")
         return begin(store, env, now, target, event.get("actor") or DIRECT_ACTOR, "rollback")
 
+    if action == "apply_update":
+        return native_apply(store, env, now, event)
+
     if action == "open_window":
         return open_window(store, env, now, event)
 
@@ -2333,7 +2463,7 @@ def handle(event, env, store, now, fetch=fetch_releases, probe=None):
                 d = {"action": "none", "version": d["version"],
                      "reason": "a model this release calls was refused; checking again daily"}
             else:
-                begin(store, env, now, d["version"], "auto", "update")
+                begin(store, env, now, d["version"], "auto", "update", scheduled=True)
         logger.info(json.dumps(d))
         return d
 

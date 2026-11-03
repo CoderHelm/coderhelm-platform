@@ -23,7 +23,7 @@ One hostname keeps the session cookie first-party and removes the need for CORS.
 
 **CoderHelm never changes your DNS.** Its roles may not write Route 53 at all: the permissions boundary every CoderHelm role carries denies `route53:ChangeResourceRecordSets`, `CreateHostedZone` and `DeleteHostedZone` ([Security](./security.md)). You add the records, and you remove them when you stop using the domain.
 
-On an install made with Launch Stack, the move to the domain is a stack update, prepared as a change set like a release update: with auto-update off you review and execute it ([Updates](./updates.md#what-an-update-does)).
+On an install made with Launch Stack, the move to the domain is a stack update, prepared as a change set and applied like a release update you start ([Updates](./updates.md#what-an-update-does)).
 
 Everything works on the AWS address.
 
@@ -33,7 +33,7 @@ In the [install guide](https://docs.coderhelm.com/self-host/install/), open **Mo
 
 - The guide and **Settings, then System** show the two records to add, with copy buttons. CoderHelm never changes your DNS.
 
-Once the records are in place and the certificate is issued, CoderHelm prepares the stack update that moves it to the domain: it sets the stack parameter `DomainCertificateArn`. With auto-update on it runs by itself (about 10 minutes); with auto-update off, **Settings, then System** links to the change set for you to execute. The guide carries on at the domain, so the GitHub App is created with the domain's URLs. Leave `DomainCertificateArn` empty yourself: CoderHelm fills it in. `DomainZoneId` is no longer used.
+Once the records are in place and the certificate is issued, CoderHelm prepares the stack update that moves it to the domain: it sets the stack parameter `DomainCertificateArn`. It runs by itself (about 10 minutes); if it would change permissions, **Settings, then System** lists them for an admin to confirm first. The guide carries on at the domain, so the GitHub App is created with the domain's URLs. Leave `DomainCertificateArn` empty yourself: CoderHelm fills it in. `DomainZoneId` is no longer used.
 
 You can skip the domain step in the guide and add the domain later.
 
@@ -43,7 +43,7 @@ You can skip the domain step in the guide and add the domain later.
 
 1. Type the hostname and press **Use this domain**.
 2. The page shows the two records with copy buttons, and where to add them at common providers (Route 53 included). Add them there yourself.
-3. The page checks by itself, through public DNS and the certificate's status in ACM. When AWS issues the certificate, CoderHelm moves to the new address with the release it runs (about 10 minutes; the update history shows it). On an install made with Launch Stack that is a stack update setting `Hostname` and `DomainCertificateArn`, prepared as a change set; with auto-update off, execute it from the link on the page. CoderHelm keeps answering on the AWS address meanwhile.
+3. The page checks by itself, through public DNS and the certificate's status in ACM. When AWS issues the certificate, CoderHelm moves to the new address with the release it runs (about 10 minutes; the update history shows it). On an install made with Launch Stack that is a stack update setting `Hostname` and `DomainCertificateArn`, prepared as a change set and applied like an update you start (if it would change permissions, the page asks you to confirm them). CoderHelm keeps answering on the AWS address meanwhile.
 4. The page then checks until the address record resolves and CoderHelm answers there over HTTPS.
 
 **Use the AWS address** removes the domain again.

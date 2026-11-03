@@ -1,6 +1,8 @@
 """A native install's updates: a verified release becomes a change set on the
-parent stack; it waits for an admin, or runs through the deploy role with
-auto-update on, and its end is reported in CloudFormation's own words.
+parent stack and runs through the install's deploy role (an admin's Update,
+or the maintenance window with auto-update on); what a person must decide
+waits for an admin's confirmation, and its end is reported in
+CloudFormation's own words.
 
 Run: python3 -m unittest discover -s lambda/tests
 """
@@ -614,6 +616,194 @@ class AdminOnlyChanges(unittest.TestCase):
         cs = {"Changes": [{"ResourceChange": {"Action": "Modify", "LogicalResourceId": "Boundary"}},
                           {"ResourceChange": {"Action": "Modify", "LogicalResourceId": "Api"}}]}
         self.assertEqual(u.admin_changes(cs), ["Boundary (Modify)"])
+
+
+ROLE = "arn:aws:iam::1:role/coderhelm-prod-deploy-stack"
+
+
+class AdminApplies(unittest.TestCase):
+    """Every install has the deploy role: an admin's Update applies at once,
+    a scheduled one only with auto-update on, and what a person must decide
+    (data, permissions) applies only once an admin confirms exactly that in
+    Settings, System. A change to the role or a boundary never applies here."""
+
+    def setUp(self):
+        self.store = u.Store(FakeDynamo(), "t")
+        self.cfn = FakeCfn()
+        u._clients["cloudformation"] = self.cfn
+        u._clients["lambda"] = FakeLambda()
+        self._fetch, self._notify = u.fetch_template, u.notify
+        u.fetch_template = lambda url, opener=None: TEMPLATE
+        self.sent = []
+        u.notify = lambda *a, **k: self.sent.append(a[1])
+        self.env = dict(ENV, DEPLOY_ROLE_ARN=ROLE)
+        self.store.put("MANIFEST#v1.1.0", {"verified": True, "manifest": None, "template_sha256": SHA})
+
+    def tearDown(self):
+        u.fetch_template, u.notify = self._fetch, self._notify
+        u._clients.pop("cloudformation", None)
+        u._clients.pop("lambda", None)
+
+    def prepare(self, actor="owner@example.org", scheduled=False, api=None, parent=None):
+        if api is not None:
+            self.cfn.nested["nested-api"] = {"Changes": api}
+        u.begin(self.store, self.env, NOW, "v1.1.0", actor, "update", scheduled=scheduled)
+        self.cfn.cs = {"Status": "CREATE_COMPLETE", "ExecutionStatus": "AVAILABLE", "RoleARN": ROLE}
+        if parent is not None:
+            self.cfn.cs["Changes"] = parent
+        return u.native_poll(self.store, self.env, NOW)
+
+    def pending(self):
+        return u.handle({"action": "status"}, self.env, self.store, NOW, fetch=lambda repo: [])["native"]["pending"]
+
+    def apply(self, **kw):
+        return u.handle(dict({"action": "apply_update", "actor": "owner@example.org"}, **kw), self.env, self.store, NOW)
+
+    def test_an_admins_update_applies_through_the_role_with_auto_update_off(self):
+        self.assertFalse(u.auto_on(self.store, self.env))
+        self.assertEqual(self.prepare()["native"], "executing")
+        self.assertEqual(self.cfn.created[0]["RoleARN"], ROLE)
+        self.assertEqual(self.cfn.executed, ["arn:cs/1"])
+        status = u.handle({"action": "status"}, self.env, self.store, NOW, fetch=lambda repo: [])
+        self.assertTrue(status["native"]["can_apply"])
+        self.assertEqual(status["native"]["pending"]["status"], "running")
+
+    def test_a_scheduled_update_applies_only_while_auto_update_is_on(self):
+        self.store.put("AUTO_UPDATE", {"auto": True})
+        self.assertEqual(self.prepare(actor="auto", scheduled=True)["native"], "executing")
+
+    def test_a_scheduled_update_waits_when_auto_update_was_turned_off(self):
+        self.store.put("AUTO_UPDATE", {"auto": False})
+        self.assertEqual(self.prepare(actor="auto", scheduled=True)["native"], "review")
+        self.assertEqual(self.cfn.executed, [])
+        p = self.pending()
+        self.assertIn("auto-update was turned off", p["hold"])
+        self.assertTrue(p["can_apply"])
+        self.assertEqual(p["confirm"], "")
+        # Nothing to confirm: Apply runs it.
+        self.assertEqual(self.apply()["status"], "running")
+        self.assertEqual(self.cfn.executed, ["arn:cs/1"])
+
+    def test_the_tick_marks_its_update_as_scheduled(self):
+        calls = []
+        orig = u.begin
+        u.begin = lambda *a, **k: calls.append(k)
+        try:
+            self.store.put("AUTO_UPDATE", {"auto": True, "day": "daily", "hour": NOW.hour})
+            self.store.put("MODEL_CHECK", {"version": "v1.1.0", "results": [], "checked_at": NOW.isoformat()})
+            orig_mc = u.model_check
+            u.model_check = lambda *a, **k: {"version": "v1.1.0", "results": []}
+            try:
+                u.handle({"action": "tick"}, self.env, self.store, NOW,
+                         fetch=lambda repo: [{"tag_name": "v1.1.0", "body": "", "html_url": "", "published_at": "2026-10-01T00:00:00Z"}])
+            finally:
+                u.model_check = orig_mc
+        finally:
+            u.begin = orig
+        self.assertEqual(calls, [{"scheduled": True}])
+
+    def test_scheduled_data_changes_are_held_as_today(self):
+        self.store.put("AUTO_UPDATE", {"auto": True})
+        r = self.prepare(actor="auto", scheduled=True, api=[{"ResourceChange": {"Action": "Remove", "ResourceType": "AWS::S3::Bucket", "LogicalResourceId": "Data"}}])
+        self.assertEqual(r["native"], "review")
+        self.assertEqual(self.cfn.executed, [])
+        self.assertIn("auto-update held: it would replace or remove", self.pending()["hold"])
+
+    def test_data_changes_apply_only_with_the_admins_confirmation_of_exactly_them(self):
+        r = self.prepare(api=[{"ResourceChange": {"Action": "Modify", "ResourceType": "AWS::DynamoDB::GlobalTable", "Replacement": "True", "LogicalResourceId": "Table"}}])
+        self.assertEqual(r["native"], "review")
+        self.assertEqual(self.cfn.executed, [])
+        p = self.pending()
+        self.assertIn("waiting for you to confirm", p["hold"])
+        self.assertIn("Api.Table", p["data_changes"][0])
+        self.assertTrue(p["can_apply"])
+        self.assertRegex(p["confirm"], r"^[0-9a-f]{64}$")
+        self.assertIn("Settings, then System", self.sent[-1])
+        self.assertNotIn("AWS console", self.sent[-1])
+        for wrong in (None, "", "0" * 64):
+            with self.assertRaisesRegex(ValueError, "confirm the changes"):
+                self.apply(**({} if wrong is None else {"confirm": wrong}))
+        self.assertEqual(self.cfn.executed, [])
+        e = self.apply(confirm=p["confirm"], history_id=p["id"])
+        self.assertEqual(e["status"], "running")
+        self.assertEqual(self.cfn.executed, ["arn:cs/1"])
+        self.assertEqual(e["confirmed"]["by"], "owner@example.org")
+        self.assertIn("Api.Table", e["confirmed"]["data_changes"][0])
+        state = self.store.get("UPDATE_STATE")
+        self.assertEqual(state["running_id"], p["id"])
+        self.assertNotIn("review_id", state)
+        # The poll follows it from there; it is never executed twice.
+        self.cfn.cs = {"Status": "CREATE_COMPLETE", "ExecutionStatus": "EXECUTE_COMPLETE", "RoleARN": ROLE}
+        self.assertEqual(u.native_poll(self.store, self.env, NOW)["status"], "succeeded")
+        self.assertEqual(self.cfn.executed, ["arn:cs/1"])
+
+    def test_permission_changes_need_the_confirmation_too(self):
+        r = self.prepare(api=[{"ResourceChange": {"Action": "Add", "ResourceType": "AWS::IAM::Role", "LogicalResourceId": "NewRole"}}])
+        self.assertEqual(r["native"], "review")
+        p = self.pending()
+        self.assertIn("Api.NewRole", p["permission_changes"][0])
+        with self.assertRaisesRegex(ValueError, "confirm the changes"):
+            self.apply()
+        self.assertEqual(self.apply(confirm=p["confirm"])["status"], "running")
+
+    def test_a_confirmation_for_another_prepared_update_is_refused(self):
+        self.prepare(api=[{"ResourceChange": {"Action": "Add", "ResourceType": "AWS::IAM::Role", "LogicalResourceId": "NewRole"}}])
+        p = self.pending()
+        with self.assertRaisesRegex(ValueError, "no prepared update"):
+            self.apply(confirm=p["confirm"], history_id="UPDATE#other")
+        other = u.confirm_token("UPDATE#other", self.store.get(p["id"]))
+        with self.assertRaisesRegex(ValueError, "confirm the changes"):
+            self.apply(confirm=other)
+        self.assertEqual(self.cfn.executed, [])
+
+    def test_a_change_to_the_role_or_a_boundary_is_never_applied_here(self):
+        r = self.prepare(parent=[{"ResourceChange": {"Action": "Modify", "LogicalResourceId": "DeployBoundary", "ResourceType": "AWS::IAM::ManagedPolicy"}}])
+        self.assertEqual(r["native"], "review")
+        p = self.pending()
+        self.assertFalse(p["can_apply"])
+        self.assertIn("DeployBoundary", p["admin_changes"][0])
+        self.assertIn("AWS console", self.sent[-1])
+        with self.assertRaisesRegex(ValueError, "can't apply for you"):
+            self.apply(confirm=p["confirm"])
+        self.assertEqual(self.cfn.executed, [])
+
+    def test_a_change_set_made_without_the_role_is_never_applied_here(self):
+        self.prepare(api=[{"ResourceChange": {"Action": "Add", "ResourceType": "AWS::IAM::Role", "LogicalResourceId": "NewRole"}}])
+        p = self.pending()
+        self.cfn.cs = {"Status": "CREATE_COMPLETE", "ExecutionStatus": "AVAILABLE"}
+        with self.assertRaisesRegex(ValueError, "without the deploy role"):
+            self.apply(confirm=p["confirm"])
+        self.cfn.cs = {"Status": "CREATE_COMPLETE", "ExecutionStatus": "OBSOLETE", "RoleARN": ROLE}
+        with self.assertRaisesRegex(ValueError, "can no longer run"):
+            self.apply(confirm=p["confirm"])
+        self.assertEqual(self.cfn.executed, [])
+
+    def test_an_older_stack_without_the_role_waits_for_one_execute_in_aws(self):
+        env = dict(ENV)
+        u.begin(self.store, env, NOW, "v1.1.0", "owner@example.org", "update")
+        self.assertNotIn("RoleARN", self.cfn.created[0])
+        self.cfn.cs = {"Status": "CREATE_COMPLETE", "ExecutionStatus": "AVAILABLE"}
+        self.assertEqual(u.native_poll(self.store, env, NOW)["native"], "review")
+        p = u.handle({"action": "status"}, env, self.store, NOW, fetch=lambda repo: [])["native"]["pending"]
+        self.assertFalse(p["can_apply"])
+        self.assertIn("no deploy role yet", p["hold"])
+        with self.assertRaisesRegex(ValueError, "no deploy role yet"):
+            u.handle({"action": "apply_update", "actor": "a"}, env, self.store, NOW)
+        self.assertEqual(self.cfn.executed, [])
+
+    def test_nothing_waiting_is_refused(self):
+        with self.assertRaisesRegex(ValueError, "no prepared update"):
+            self.apply()
+
+    def test_a_new_update_replaces_the_one_waiting(self):
+        self.prepare(api=[{"ResourceChange": {"Action": "Add", "ResourceType": "AWS::IAM::Role", "LogicalResourceId": "NewRole"}}])
+        old = self.pending()["id"]
+        self.cfn.nested = {}
+        later = NOW.replace(minute=30)
+        u.begin(self.store, self.env, later, "v1.1.0", "owner@example.org", "update")
+        self.assertEqual(self.cfn.deleted, ["arn:cs/1"])
+        self.assertEqual(self.store.get(old)["status"], "not_started")
+        self.assertNotIn("review_id", self.store.get("UPDATE_STATE"))
 
 
 class PermissionChanges(unittest.TestCase):

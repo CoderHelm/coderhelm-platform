@@ -26,11 +26,11 @@ The updater (a Lambda in your account) checks GitHub for releases every hour, ke
 
 ## Automatic updates
 
-Automatic updates are off by default. With them off, CoderHelm still prepares each new release for you to review (see [What an update does](#what-an-update-does)).
+Automatic updates are off by default. With them off, nothing installs by itself: an admin presses **Update** in **Settings, then System** and the update applies (see [What an update does](#what-an-update-does)).
 
-On an install made with Launch Stack, set the stack parameter **AutoUpdate** to `on`, with **UpdateDay**, **UpdateHour** and **UpdateTimezone** for the maintenance window. You can set them at launch, or later: select the stack `coderhelm-<name>`, choose **Update**, **Replace existing template** with your release's template (`https://coderhelm-public.s3.amazonaws.com/launch/<Version>/coderhelm.json`, the **Version** from the stack's **Outputs**), and change only those parameters. Don't choose **Use current template**: on an install from v0.8.4 or v0.8.5 it keeps the old values ([why](./uninstall.md#change-it-before-you-delete)). **AutoUpdate** `on` adds the auto-update role, `coderhelm-<name>-deploy-stack`, which is what lets the updater apply a release without you ([what it may do](./security.md#updates-and-the-optional-auto-update-role)). Without it, an update waits for your review even when the setting in **Settings, then System** is on.
+Turn them on in **Settings, then System, then Automatic updates**, with the maintenance window. On an install made with Launch Stack, the stack parameters **AutoUpdate**, **UpdateDay**, **UpdateHour** and **UpdateTimezone** are only the starting values of those settings: change them in **Settings, then System** afterwards, never in the stack. Every install made with Launch Stack has the deploy role, `coderhelm-<name>-deploy-stack`, that applies an update, whether you press **Update** or the maintenance window starts it ([what it may do](./security.md#updates-and-the-deploy-role)).
 
-On an install from before native releases, turn them on in **Settings, then System**, or:
+On an install from before native releases, turn them on in **Settings, then System** too, or:
 
 ```sh
 npx -y github:CoderHelm/coderhelm-platform auto-update on --window "Sun 03:00" --timezone Europe/Berlin --channel stable --majors ask
@@ -66,7 +66,7 @@ Before you update, **Settings, then System** shows **Update readiness**: the sam
 - **Blocks the update:** a check that fails (the update's health check would stop it), a model the release calls that was refused, or an update already running. **Update now** stays off until it is fixed.
 - **Read first:** a major release whose notes ask you to do something, or a release whose last try failed or rolled back (with the reason).
 
-Each item says what is wrong and how to fix it: a command to copy, a link, or a page in CoderHelm. **Check again** reruns them. The same list is `GET /api/system/preflight`; see [Check your install](./check-your-install.md).
+Each item says what is wrong and how to fix it: a link or a page in CoderHelm, or a command to copy for an install from before native releases. **Check again** reruns them. The same list is `GET /api/system/preflight`; see [Check your install](./check-your-install.md).
 
 From the terminal, `update` runs a preflight first and stops before anything changes when:
 
@@ -77,7 +77,9 @@ From the terminal, `update` runs a preflight first and stops before anything cha
 
 ## Update now
 
-**Settings, then System, then Update now** starts the same update as the automatic one, and records who started it. With auto-update off, it prepares the change set for you to review.
+**Settings, then System, then Update to vX** starts the same update as the automatic one, and records who started it. On an install made with Launch Stack it applies, whether auto-update is on or off: the page shows it preparing, then running, then the result in the update history (10 to 20 minutes). You never need the AWS console or a terminal for it.
+
+Some releases need you to say yes first. When the prepared update would replace or remove data (a table, bucket, key, user pool or secret) or change permissions (an IAM role or policy, a function permission, a resource policy, or a new principal), the page lists exactly those changes and asks you to confirm them. It applies only once you confirm that list; if the list changes before you do, you confirm again.
 
 ## What an update does
 
@@ -86,13 +88,18 @@ On an install made with Launch Stack, an update is a stack update of `coderhelm-
 1. **Checks the release.** A read-only build in your account checks the release's tag: it must be on a commit on `main`, and be signed with a maintainer key pinned in the release your install runs or attested by CoderHelm's automatic release workflow on `main` for that tag and commit. It then downloads the release's `SHA256SUMS` and checks its signature with cosign. It must be signed, keyless, by exactly `CoderHelm/coderhelm-platform`'s `release.yml`, on that release's own tag and from the tag's commit, and be in the Rekor transparency log. It reports the sha256 of `coderhelm.json` from the signed `SHA256SUMS`. A release that fails is refused. See [How updates are kept safe](./updates-security.md).
 2. **Checks the models** the release calls ([the model check](#the-model-check)).
 3. **Prepares the change set.** The updater downloads `coderhelm.json` from `https://coderhelm-public.s3.amazonaws.com/launch/<version>/`, where release files are written once and never replaced, and proposes it only if its sha256 matches the signed one. First the install helper copies the release's part templates into the install's own release bucket, each checked against the sha256 that verified `coderhelm.json` lists, so CloudFormation can read them while it prepares the parts' own change sets. Every parameter keeps its current value. After CloudFormation reads the template, the updater compares what it read with the verified one, and runs nothing if they differ.
-4. **Waits for you, or applies it.**
-   - **Auto-update off (the default):** **Settings, then System, then Update** shows the change set's summary (how many resources are added, changed and removed, which ones are replaced, and which parts it touches) and a link to it in the CloudFormation console. Admins get an email with the same link. Review it there and choose **Execute**; it runs with your own permissions.
-   - **Auto-update on:** the updater executes it in your maintenance window, through the auto-update role.
+4. **Applies it, through the deploy role.** **Settings, then System** shows the change set's summary while it runs: how many resources are added, changed and removed, which ones are replaced, which parts it touches, and a link to it in the CloudFormation console if you want to look.
+   - **You pressed Update:** it applies as soon as it is prepared. When it would replace or remove data or change permissions, it waits for you to confirm exactly those changes on the page, then applies.
+   - **The maintenance window started it (auto-update on):** it applies by itself, except when it would replace or remove data or change permissions: then it waits, admins get an email, and you confirm it on the page the same way. If auto-update was turned off before it ran, it waits for you to press **Apply**.
+   - **It changes the deploy role or a permissions boundary:** the deploy role can't change those (that is what keeps it from giving itself more), so CoderHelm can't apply it for you. The page says so and links to the change set: someone with administrator rights in the AWS account reviews it and chooses **Execute**. Releases do this rarely, and their notes say so.
 5. **Follows it.** Every 5 minutes the updater reads the change set and the stack until the update ends. When the stack update starts, the install's own copy step checks every file of the release against the sha256 that `coderhelm.json` lists before any part changes. If a part fails, CloudFormation rolls the whole stack back to the previous release by itself.
 6. **Reports.** The history in **Settings, then System** shows the version, when, who (or "auto") and the result: succeeded, failed, or rolled back, with CloudFormation's own reason for the first resource that failed. Admins get an email either way.
 
-A change set that waits too long can go stale (the stack changed since it was made); the history then says so, and **Update now** prepares a new one.
+A change set that waits too long can go stale (the stack changed since it was made); the history then says so, and **Update** prepares a new one. Pressing **Update** while an older prepared update waits replaces it (nothing was changed by the older one).
+
+### The first update onto a release with the deploy role on every install
+
+Up to v0.8.26 the deploy role existed only with **AutoUpdate** `on`. An install launched with it off on one of those releases gets the role from its next update, and that one update can't apply through a role it doesn't have yet: the page says so and links to the change set, and someone with administrator rights in the AWS account executes it once in the CloudFormation console. Every update after that applies from the page. An install that had **AutoUpdate** `on` from the start already has the role and needs nothing. If you once turned the stack parameter **AutoUpdate** on and then off, the role it made was kept and that one update fails with "already exists": delete the kept role and its boundary first (`coderhelm-selfhost leftovers --delete` lists and removes them), then press **Update** again.
 
 ### Installs from before native releases
 

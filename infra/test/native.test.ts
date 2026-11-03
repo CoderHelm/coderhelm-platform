@@ -24,7 +24,7 @@ import { buildNative } from "../lib/native/build";
 import { ASSETS_BUCKET_SENTINEL, REGION_SENTINEL, STAGE_SENTINEL, nativeConfig } from "../lib/native/config";
 import { emailEnvironment } from "../lib/service-env";
 import { DATA_TYPES, LIMITS, checkLimits, findSentinels, sha256File, transformChild } from "../lib/native/package";
-import { DEPLOY_BOUNDARY_ARN, declaredLogGroups, deployRolePolicy, helperPolicy, nativeNames } from "../lib/native/parent";
+import { DEPLOY_BOUNDARY_ARN, declaredLogGroups, deployRolePolicy, helperPolicy, installValue, nativeNames, subInstall } from "../lib/native/parent";
 
 const STUBS = fs.mkdtempSync(path.join(os.tmpdir(), "chnat-"));
 for (const d of ["gateway", "worker", "mcp"]) {
@@ -186,13 +186,25 @@ test("the helper may only do what security.md lists", () => {
   assert.match(R.Helper.Properties.Code.ZipFile, /Custom::ReleaseAssets/);
 });
 
-test("no update build, no deploy window; auto-update is a role only with AutoUpdate=on", () => {
+test("no update build, no deploy window; every install has the deploy role, AutoUpdate only schedules", () => {
   const u = rel.children.Updates;
   const types = Object.values<any>(u.Resources).map((r) => r.Type);
   assert.equal(types.filter((t) => t === "AWS::CodeBuild::Project").length, 1, "only the read-only release check");
   assert.ok(!JSON.stringify(u).includes("window-policy"));
   assert.ok(!JSON.stringify(P).includes("deploy-window"));
-  assert.equal(R.DeployRole.Condition, "AutoUpdateOn");
+  // The role and its boundary exist whatever AutoUpdate says (an admin's Update applies through it).
+  assert.equal(R.DeployRole.Condition, undefined);
+  assert.equal(R.DeployBoundary.Condition, undefined);
+  assert.deepEqual(installValue("DeployRoleArn"), { "Fn::GetAtt": ["DeployRole", "Arn"] });
+  // AutoUpdate is only the schedule's default; nothing else hangs on it.
+  const onAuto = Object.entries<any>(R).filter(([, r]) => r.Condition === "AutoUpdateOn").map(([k]) => k);
+  assert.deepEqual(onAuto, []);
+  assert.ok(JSON.stringify(installValue("UpdateDefaultsJson")).includes("AutoUpdateOn"));
+  // Its policy is the scoped deploy policy, unchanged: the deploy policy, the parent stack, the release files.
+  assert.deepEqual(R.DeployRole.Properties.Policies, [{ PolicyName: "deploy", PolicyDocument: subInstall(deployRolePolicy(nativeNames())) }]);
+  assert.deepEqual(deployRolePolicy(nativeNames()).Statement.slice(-5).map((x: any) => x.Sid), ["ParentStack", "ReleaseFiles", "InstallSecret", "SecretPassword", "ProgressBucket"]);
+  // Its Description is what installs that had it carry: a change would hold their next update.
+  assert.equal(R.DeployRole.Properties.Description, "CoderHelm: applies a reviewed release's stack update when auto-update is on (docs/self-host/security.md)");
   assert.equal(P.Parameters.AutoUpdate.Default, "off");
   assert.equal(R.DeployRole.Properties.AssumeRolePolicyDocument.Statement[0].Principal.Service, "cloudformation.amazonaws.com");
   const updater = Object.values<any>(u.Resources).find((r) => r.Type === "AWS::Lambda::Function" && JSON.stringify(r.Properties.FunctionName ?? "").includes("updater"));
@@ -215,7 +227,6 @@ test("no update build, no deploy window; auto-update is a role only with AutoUpd
   // boundary every other role carries goes with the stack.
   assert.equal(R.Boundary.DeletionPolicy, "Delete");
   assert.deepEqual(R.DeployRole.Properties.PermissionsBoundary, { Ref: "DeployBoundary" });
-  assert.equal(R.DeployBoundary.Condition, "AutoUpdateOn");
   assert.equal(R.DeployBoundary.DeletionPolicy, "Retain");
   assert.deepEqual(R.DeployBoundary.Properties.PolicyDocument, R.Boundary.Properties.PolicyDocument);
   // Neither copy can be edited by an install role.

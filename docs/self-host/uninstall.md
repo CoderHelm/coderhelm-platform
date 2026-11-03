@@ -103,7 +103,7 @@ Expect to see:
 
 - what **KeepDataOnDelete** `true` kept: the tables, data buckets, keys, user pool and secret;
 - with `false`, the tables' on-demand backups, which outlive their tables;
-- the auto-update role `coderhelm-<name>-deploy-stack`, if auto-update was ever on. CloudFormation keeps using a stack's role once a stack was updated through it, and a role can't delete itself, so the stack keeps it on delete (see [Security](./security.md#updates-and-the-optional-auto-update-role));
+- the deploy role `coderhelm-<name>-deploy-stack`, if the stack was ever updated through it. CloudFormation keeps using a stack's role once a stack was updated through it, and a role can't delete itself, so the stack keeps it on delete (see [Security](./security.md#updates-and-the-deploy-role));
 - pieces an earlier, failed install left behind.
 
 To remove them:
@@ -120,7 +120,7 @@ While the stack still runs, the read-only `leftovers` says the install is still 
 
 The stack's **Events** tab names the resource and AWS's reason. Fix what it says, then choose **Delete** again; CloudFormation picks up where it stopped. If a resource still can't be deleted, the console offers to keep it and delete the rest. Keep it, then remove it with `leftovers --delete`.
 
-If the stack was ever updated through the auto-update role, CloudFormation deletes it through that role too, and some deletes are outside what the role may do: scheduling a KMS key for deletion, and deleting the permissions boundary (no CoderHelm role may delete it). The simplest is to delete with a role of your own: `aws cloudformation delete-stack --region <region> --stack-name coderhelm-<name> --role-arn <a role of yours>`. Or use the same path: delete again, keep what failed, then `leftovers --delete`.
+If the stack was ever updated through the deploy role, CloudFormation deletes it through that role too, and some deletes are outside what the role may do: scheduling a KMS key for deletion, and deleting the permissions boundary (no CoderHelm role may delete it). The simplest is to delete with a role of your own: `aws cloudformation delete-stack --region <region> --stack-name coderhelm-<name> --role-arn <a role of yours>`. Or use the same path: delete again, keep what failed, then `leftovers --delete`.
 
 ## Not removed
 

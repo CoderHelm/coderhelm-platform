@@ -158,6 +158,8 @@ async fn main() -> Result<(), Error> {
             put(routes::system::set_uninstall_mode),
         )
         .route("/system/update", post(routes::system::update_now))
+        // Apply the prepared update waiting for an admin (a native install).
+        .route("/system/update/apply", post(routes::system::apply_update))
         .route("/system/rollback", post(routes::system::rollback))
         .route("/system/test-email", post(routes::system::test_email))
         // The model check before an update, run again now ("Check again").
