@@ -91,7 +91,8 @@ pub const MAX_PERMISSIONS: &[(&str, &str)] = &[
     ("contents", "write"),
     ("pull_requests", "write"),
     ("issues", "write"),
-    ("checks", "read"),
+    // Write only to post its own "CoderHelm review" check run.
+    ("checks", "write"),
     ("actions", "read"),
     ("statuses", "read"),
     ("workflows", "write"),
@@ -482,7 +483,7 @@ mod tests {
         assert_eq!(narrow.permissions.len(), 1);
         for (k, v) in [
             ("administration", "write"),
-            ("checks", "write"),
+            ("checks", "admin"),
             ("contents", "admin"),
         ] {
             let mut p = std::collections::BTreeMap::new();
