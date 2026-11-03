@@ -151,7 +151,6 @@ function conditions(): Json {
     AutoUpdateOn: { "Fn::Equals": [{ Ref: "AutoUpdate" }, "on"] },
     HasHostname: not("Hostname", ""),
     HasDomainCert: { "Fn::And": [not("Hostname", ""), not("DomainCertificateArn", "")] },
-    HasDomainZone: not("DomainZoneId", ""),
     HasStatus: not("StatusId", ""),
     HasSetupToken: not("SetupToken", ""),
   };
