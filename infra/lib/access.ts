@@ -58,6 +58,8 @@ export interface AccessNames {
   emailIdentity?: string;
   /** The Route 53 zone of the install's own domain: the only zone where the deploy role may change records (any when unset). */
   zoneId?: string;
+  /** A native install: its zone holds only its domain's A/AAAA alias, created and deleted by the stack. */
+  dnsAliasOnly?: boolean;
 }
 
 export function partitionOf(region: string): string {
@@ -470,7 +472,14 @@ export function deployPolicy(n: AccessNames): PolicyDocument {
     { Sid: "CertificatesRequest", Effect: "Allow", Action: ["acm:RequestCertificate", "acm:AddTagsToCertificate"], Resource: "*", Condition: { StringEquals: { [`aws:RequestTag/${INSTALL_TAG}`]: p } } },
     { Sid: "Certificates", Effect: "Allow", Action: "acm:*", Resource: `arn:${n.partition}:acm:*:${n.account}:certificate/*`, Condition: tagged },
     // Records only in the install's own domain's zone (a native install's DomainZoneId).
-    { Sid: "DnsRecords", Effect: "Allow", Action: ["route53:ChangeResourceRecordSets", "route53:GetChange"], Resource: [`arn:${n.partition}:route53:::hostedzone/${n.zoneId ?? "*"}`, `arn:${n.partition}:route53:::change/*`] },
+    // A native install only ever creates or deletes its domain's A/AAAA alias
+    // (CloudFormation, CREATE fails on a record already there): nothing else in
+    // that zone, and never an UPSERT over a record someone added.
+    n.dnsAliasOnly
+      ? { Sid: "DnsRecords", Effect: "Allow", Action: "route53:ChangeResourceRecordSets", Resource: `arn:${n.partition}:route53:::hostedzone/${n.zoneId}`,
+          Condition: { "ForAllValues:StringEquals": { "route53:ChangeResourceRecordSetsRecordTypes": ["A", "AAAA"], "route53:ChangeResourceRecordSetsActions": ["CREATE", "DELETE"] } } }
+      : { Sid: "DnsRecords", Effect: "Allow", Action: ["route53:ChangeResourceRecordSets", "route53:GetChange"], Resource: [`arn:${n.partition}:route53:::hostedzone/${n.zoneId ?? "*"}`, `arn:${n.partition}:route53:::change/*`] },
+    ...(n.dnsAliasOnly ? [{ Sid: "DnsChanges", Effect: "Allow" as const, Action: "route53:GetChange", Resource: `arn:${n.partition}:route53:::change/*` }] : []),
     // The deploy role carries the boundary too, whose guardrails deny the rest.
     { Sid: "NoIamUsersOrKeys", Effect: "Deny", Action: ["iam:CreateUser", "iam:CreateAccessKey", "iam:CreateLoginProfile"], Resource: "*" },
     { Sid: "NoKeyDestruction", Effect: "Deny", Action: ["kms:ScheduleKeyDeletion", "kms:DisableKey", "kms:DeleteImportedKeyMaterial"], Resource: "*" },

@@ -19,7 +19,7 @@ One hostname keeps the session cookie first-party and removes the need for CORS.
 | | What you do | What CoderHelm does |
 |---|---|---|
 | **The AWS address** (default) | Nothing | Answers on `https://dxxxx.cloudfront.net` |
-| **A domain in Route 53 in the same account** | Type the hostname | Finds the zone, requests the certificate and adds its validation record, then moves to the domain with the `A` and `AAAA` records |
+| **A domain in Route 53 in the same account** | Type the hostname, then press **Add these 2 records to <zone>** (or add them yourself) | Requests the certificate and shows the records. Only on your go-ahead, names the zone, creates the validation record there, then moves to the domain with the `A` and `AAAA` alias records |
 | **A domain at any other DNS provider** | Type the hostname, then add two `CNAME` records | Requests the certificate, checks your records until they show up, then moves to the domain |
 
 On an install made with Launch Stack, the move to the domain is a stack update, prepared as a change set like a release update: with auto-update off you review and execute it ([Updates](./updates.md#what-an-update-does)).
@@ -30,8 +30,8 @@ Everything works on the AWS address.
 
 In the [install guide](https://docs.coderhelm.com/self-host/install/), open **More options**, choose **My own domain** and type the hostname, for example `coderhelm.example.com`. The Launch Stack's `Hostname` parameter carries it. The install comes up on its AWS address, and at the end of the launch CoderHelm requests the certificate:
 
-- When a public Route 53 zone in the account contains the hostname, the validation record is added for you.
-- Otherwise **Settings, then System** shows the records to add.
+- **Settings, then System** shows the records to add. CoderHelm never changes DNS on its own.
+- When a public Route 53 zone in the account contains the hostname, the page also offers to add them there: press **Add these 2 records to <zone>** to let it.
 
 Once the certificate is issued, CoderHelm prepares the stack update that moves it to the domain: it sets the stack parameters `DomainCertificateArn` (and `DomainZoneId`, when the zone is in Route 53 here). With auto-update on it runs by itself (about 10 minutes); with auto-update off, **Settings, then System** links to the change set for you to execute. The guide carries on at the domain, so the GitHub App is created with the domain's URLs. Leave `DomainCertificateArn` and `DomainZoneId` empty yourself: CoderHelm fills them in.
 
@@ -42,11 +42,20 @@ You can skip the domain step in the guide and add the domain later.
 **Settings, then System, then Domain** (install admins) adds, changes or removes the domain without a terminal:
 
 1. Type the hostname and press **Use this domain**.
-2. With a Route 53 zone in the account, the validation record is added for you; otherwise the page shows the records with copy buttons and where to add them for common providers.
+2. The page shows the records with copy buttons and where to add them for common providers. With a public Route 53 zone in the account that contains the hostname, it also offers **Add these 2 records to <zone>**: nothing is written to DNS until you press it.
 3. The page checks by itself. When AWS issues the certificate, CoderHelm moves to the new address with the release it runs (about 10 minutes; the update history shows it). On an install made with Launch Stack that is a stack update setting `Hostname`, `DomainCertificateArn` and `DomainZoneId`, prepared as a change set; with auto-update off, execute it from the link on the page. CoderHelm keeps answering on the AWS address meanwhile.
 4. With another DNS provider, the page then asks for the address record and checks until it resolves and CoderHelm answers there over HTTPS.
 
 **Use the AWS address** removes the domain again.
+
+### What CoderHelm may change in your Route 53 zone
+
+Only after you press **Add these 2 records to <zone>**, and only:
+
+- the certificate's validation `CNAME` (its name starts with an underscore), created by the updater. If a record with that name already holds another value, or the hostname already has a record, it stops and changes nothing.
+- the hostname's `A` and `AAAA` alias records to CloudFront, created and deleted by the stack.
+
+Both use `CREATE` (and the stack's `DELETE` of its own alias when you remove the domain), never `UPSERT`, and the roles' permissions say so: the updater may only create `CNAME` records whose names start with an underscore, and the stack's role may only create or delete `A`/`AAAA` records in the zone you confirmed. Uninstalling deletes the validation record of certificates the install requested.
 
 Behind the page: the updater function requests the certificate in us-east-1 (CloudFront only uses certificates there), tagged `coderhelm = coderhelm-<name>`, adds only the validation `CNAME` to a Route 53 zone in the account, and every 5 minutes checks whether the certificate is issued. On an install made with Launch Stack it then proposes the stack update with the domain parameters. On an install from before native releases the update build runs `coderhelm-selfhost domain apply` with the release that runs, which writes `domain` into the config and deploys. Deleting the stack deletes the certificates the updater requested ([Uninstall](./uninstall.md)).
 

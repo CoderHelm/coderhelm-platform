@@ -33,7 +33,7 @@ export function nativeNames(): AccessNames {
     // "-stack": never the name of an install hardened from the CLI (its
     // coderhelm-<name>-access stack owns coderhelm-<name>-boundary).
     id: NATIVE_ID,
-  }), emailIdentity: "${EmailIdentity}", zoneId: "${DomainZoneId}" };
+  }), emailIdentity: "${EmailIdentity}", zoneId: "${DomainZoneId}", dnsAliasOnly: true };
 }
 
 /**

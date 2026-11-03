@@ -475,7 +475,7 @@ export class UpdatesStack extends cdk.Stack {
     }));
     this.updaterFunction.addToRolePolicy(new iam.PolicyStatement({
       sid: "DomainZoneLookup",
-      actions: ["route53:ListHostedZones", "route53:GetHostedZone"],
+      actions: ["route53:ListHostedZones", "route53:GetHostedZone", "route53:ListResourceRecordSets"],
       resources: ["*"],
     }));
     this.updaterFunction.addToRolePolicy(new iam.PolicyStatement({
@@ -483,8 +483,12 @@ export class UpdatesStack extends cdk.Stack {
       actions: ["route53:ChangeResourceRecordSets"],
       resources: ["arn:aws:route53:::hostedzone/*"],
       conditions: {
-        // Only the CNAME ACM checks (its name always starts with an underscore).
-        "ForAllValues:StringEquals": { "route53:ChangeResourceRecordSetsRecordTypes": ["CNAME"] },
+        // Only creating the CNAME ACM checks (its name always starts with an
+        // underscore), after an admin confirmed the zone: never UPSERT or DELETE.
+        "ForAllValues:StringEquals": {
+          "route53:ChangeResourceRecordSetsRecordTypes": ["CNAME"],
+          "route53:ChangeResourceRecordSetsActions": ["CREATE"],
+        },
         "ForAllValues:StringLike": { "route53:ChangeResourceRecordSetsNormalizedRecordNames": ["_*"] },
       },
     }));
