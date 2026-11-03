@@ -1033,67 +1033,6 @@ pub async fn beta_signups(
     Ok(Json(json!({ "signups": rows, "counts": counts })))
 }
 
-/// POST /api/admin/beta-signups/invite — mark a sign-up invited and add the
-/// email to the sign-up allowlist, so the person can create an account. No
-/// email is sent. Platform admin only.
-pub async fn invite_beta_signup(
-    State(state): State<Arc<AppState>>,
-    Extension(claims): Extension<Claims>,
-    Json(body): Json<Value>,
-) -> Result<Json<Value>, StatusCode> {
-    if !is_platform_admin(&claims) {
-        warn!(email = %claims.email, "Beta invite refused: not a platform admin");
-        return Err(StatusCode::FORBIDDEN);
-    }
-    let email = body["email"]
-        .as_str()
-        .map(normalize_email)
-        .filter(|e| e.contains('@') && e.len() <= 320)
-        .ok_or(StatusCode::BAD_REQUEST)?;
-    let now = chrono::Utc::now().to_rfc3339();
-    state
-        .dynamo
-        .update_item()
-        .table_name(&state.config.waitlist_table_name)
-        .key("email", attr_s(&email))
-        .update_expression("SET #st = :invited, invited_at = :now, invited_by = :by")
-        .condition_expression("attribute_exists(email)")
-        .expression_attribute_names("#st", "status")
-        .expression_attribute_values(":invited", attr_s("invited"))
-        .expression_attribute_values(":now", attr_s(&now))
-        .expression_attribute_values(":by", attr_s(&claims.email))
-        .send()
-        .await
-        .map_err(|e| {
-            let e = aws_sdk_dynamodb::error::DisplayErrorContext(e).to_string();
-            if e.contains("ConditionalCheckFailed") {
-                StatusCode::NOT_FOUND
-            } else {
-                error!("Beta invite: waitlist update failed: {e}");
-                StatusCode::INTERNAL_SERVER_ERROR
-            }
-        })?;
-    state
-        .dynamo
-        .put_item()
-        .table_name(&state.config.settings_table_name)
-        .item("pk", attr_s("ALLOWLIST"))
-        .item("sk", attr_s(&format!("EMAIL#{email}")))
-        .item("email", attr_s(&email))
-        .item("added_by", attr_s(&claims.email))
-        .item("created_at", attr_s(&now))
-        .send()
-        .await
-        .map_err(|e| {
-            error!("Beta invite: allowlist add failed: {e}");
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
-    info!(by = %claims.email, "Beta sign-up invited and allowlisted");
-    Ok(Json(
-        json!({ "status": "invited", "email": email, "invited_at": now }),
-    ))
-}
-
 /// GET /api/admin/dlq — the shared dead-letter queue: every team's failed
 /// messages, the global jobs', and the ones nobody can read. Platform admin
 /// only; teams see only their own on the health page.
@@ -1395,6 +1334,6 @@ mod tests {
             );
             checked += 1;
         }
-        assert_eq!(checked, 8);
+        assert_eq!(checked, 7);
     }
 }

@@ -321,10 +321,6 @@ async fn main() -> Result<(), Error> {
             post(routes::admin::release_stale_installation_links),
         )
         .route("/admin/beta-signups", get(routes::admin::beta_signups))
-        .route(
-            "/admin/beta-signups/invite",
-            post(routes::admin::invite_beta_signup),
-        )
         // Support tickets: the team's own, and the platform admin's queue
         .route(
             "/support/tickets",
@@ -1293,7 +1289,6 @@ async fn main() -> Result<(), Error> {
     // Auth routes (public, rate-limited)
     let auth_routes = Router::new()
         .route("/signup", post(routes::auth::signup))
-        .route("/waitlist", post(routes::auth::join_waitlist))
         .route("/login", post(routes::auth::login_email))
         .route("/login/code", post(routes::auth::login_carry_over_code))
         .route("/verify-email", post(routes::auth::verify_email))

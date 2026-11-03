@@ -44,6 +44,7 @@ pub mod mcp_servers;
 pub mod memory;
 pub mod merge_control;
 pub mod oauth_signin;
+pub mod open_signup;
 pub mod paging;
 pub mod plan_chat_tools;
 pub mod plans;
