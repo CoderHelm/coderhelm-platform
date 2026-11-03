@@ -44,7 +44,9 @@ FEATURE_LABELS = {"enhancement", "feature"}
 # job): the Rust Lambdas (services/), the MCP proxy and the updater (lambda/),
 # the CDK app and the CloudFormation templates (infra/), the installer
 # (installer/), install.sh, the dashboard pin and
-# migrations (selfhost/), the dashboard pin check, and the release workflow.
+# migrations (selfhost/), the dashboard pin check, the Rust build and its
+# inputs digest and reuse check (scripts/rust-build.sh, scripts/rust-inputs.mjs,
+# .github/scripts/rust-build-reuse.sh), and the release workflow.
 SHIPPED = (
     "services/",
     "lambda/",
@@ -52,6 +54,9 @@ SHIPPED = (
     "installer/",
     "selfhost/",
     "scripts/check-dashboard-ref.mjs",
+    "scripts/rust-build.sh",
+    "scripts/rust-inputs.mjs",
+    ".github/scripts/rust-build-reuse.sh",
     ".github/workflows/release.yml",
 )
 
