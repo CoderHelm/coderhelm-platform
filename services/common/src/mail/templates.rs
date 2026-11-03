@@ -522,6 +522,19 @@ pub const TEMPLATES: &[Template] = &[
         ],
         install_may_send: true,
     },
+    Template {
+        id: "two_factor_changed",
+        subject: "your authenticator app was changed",
+        subject_by: "",
+        subjects: &[],
+        params: &[p("link", Kind::Link)],
+        body: &[
+            Part::Para("The authenticator app for your two-factor sign-in was changed. Your old app no longer works."),
+            Part::Para("If you didn't do this, tell your admins and change your password now."),
+            Part::Button("Open Security settings", "link"),
+        ],
+        install_may_send: true,
+    },
     // The relay's own notice to an install's admins. Installs can't ask for it.
     Template {
         id: "relay_paused",

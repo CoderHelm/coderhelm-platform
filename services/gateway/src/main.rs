@@ -641,6 +641,14 @@ async fn main() -> Result<(), Error> {
         .route("/users/2fa/app/verify", post(routes::sign_in::app_verify))
         .route("/users/2fa/app", delete(routes::sign_in::app_disable))
         .route(
+            "/users/2fa/replace/start",
+            post(routes::sign_in::replace_start),
+        )
+        .route(
+            "/users/2fa/replace/verify",
+            post(routes::sign_in::replace_verify),
+        )
+        .route(
             "/users/:user_id/2fa/reset",
             post(routes::sign_in::reset_two_factor),
         )
