@@ -334,6 +334,8 @@ export interface ResolvedConfig {
   /** Secrets Manager names. */
   secretName: string;
   anthropicAdminSecretName: string;
+  /** Hosted side of hybrid: the master key's own secret (read with a fallback to `secretName`'s field). */
+  hybridMasterSecretName: string;
   /** Hardened installs: the boundary, deploy role and assets bucket; null otherwise. */
   access: (AccessNames & { owner: "launch" | "app" }) | null;
   /** Data bucket name. */
@@ -748,6 +750,7 @@ export function resolveConfig(cfg: CoderhelmConfig, opts: { skipValidation?: boo
     reviewerEvalsRepo: cfg.ci?.reviewerEvalsRepo ?? null,
     secretName: `${secretPath(cfg.stage, prefix)}/secrets`,
     anthropicAdminSecretName: `${secretPath(cfg.stage, prefix)}/anthropic-admin-keys`,
+    hybridMasterSecretName: `${secretPath(cfg.stage, prefix)}/hybrid-master`,
     access: cfg.access
       ? {
           owner: cfg.access.owner,

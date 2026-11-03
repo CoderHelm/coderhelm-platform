@@ -3,6 +3,7 @@ import * as s3 from "aws-cdk-lib/aws-s3";
 import * as kms from "aws-cdk-lib/aws-kms";
 import { Construct } from "constructs";
 import { ResolvedConfig } from "./config";
+import { hostedKeyPolicy, KEY_PENDING_WINDOW } from "./key-policy";
 
 interface StorageStackProps extends cdk.StackProps {
   stage: string;
@@ -20,6 +21,8 @@ export class StorageStack extends cdk.Stack {
       description: "Coderhelm S3 encryption key",
       enableKeyRotation: true,
       removalPolicy: cdk.RemovalPolicy.RETAIN,
+      pendingWindow: KEY_PENDING_WINDOW,
+      policy: hostedKeyPolicy(this, props.cfg, "symmetric"),
     });
 
     this.bucket = new s3.Bucket(this, "DataBucket", {

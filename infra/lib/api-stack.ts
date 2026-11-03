@@ -714,6 +714,20 @@ export class ApiStack extends cdk.Stack {
       new iam.PolicyStatement({
         actions: ["sts:AssumeRole"],
         resources: ["arn:aws:iam::*:role/CoderHelmLogReader", "arn:aws:iam::*:role/CoderhelmReadOnly*"],
+        // Always with the team's private ID, so a role ARN someone else
+        // types can't make CoderHelm read their account for them.
+        conditions: { Null: { "sts:ExternalId": "false" } },
+      })
+    );
+    // Except connecting's one check that a team's role refuses CoderHelm
+    // without the private ID (common::live::aws::opens_without_private_id):
+    // that try has none, under its own session name, and keeps nothing.
+    this.gatewayFunction.addToRolePolicy(
+      new iam.PolicyStatement({
+        sid: "CheckRoleNeedsPrivateId",
+        actions: ["sts:AssumeRole"],
+        resources: ["arn:aws:iam::*:role/CoderhelmReadOnly*"],
+        conditions: { Null: { "sts:ExternalId": "true" }, StringEquals: { "sts:RoleSessionName": "coderhelm-check" } },
       })
     );
     // On a hardened install the boundary lets only the gateway's and the

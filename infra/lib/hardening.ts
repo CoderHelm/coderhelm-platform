@@ -23,7 +23,7 @@ import { boundaryPolicy, deployPolicy, INSTALL_TAG } from "./access";
 import { ResolvedConfig } from "./config";
 
 /** The stack properties every stack of the app gets: its environment, and for a hardened install its synthesizer. */
-export function stackBase(cfg: ResolvedConfig): { env: cdk.Environment; synthesizer?: cdk.IStackSynthesizer } {
+export function stackBase(cfg: ResolvedConfig): { env: cdk.Environment; synthesizer?: cdk.IStackSynthesizer; terminationProtection?: boolean } {
   if (cfg.native) {
     // One template for every account and region; assets from the install's
     // own bucket (the packager makes the sentinel a Ref).
@@ -33,6 +33,9 @@ export function stackBase(cfg: ResolvedConfig): { env: cdk.Environment; synthesi
     };
   }
   const env = { account: cfg.account, region: cfg.region };
+  // CoderHelm's own deployment: deleting a stack takes a person turning
+  // this off first. Self-hosted installs uninstall by deleting the stack.
+  if (cfg.hybrid) return { env, terminationProtection: true };
   if (!cfg.access) return { env };
   return {
     env,

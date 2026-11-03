@@ -14,7 +14,7 @@ import * as eventsources from "aws-cdk-lib/aws-lambda-event-sources";
 import * as codebuild from "aws-cdk-lib/aws-codebuild";
 import { Construct } from "constructs";
 import { ResolvedConfig } from "./config";
-import { HYBRID_SIGNER_TAG, grantNameRecords, hybridSigningAlias } from "./hybrid";
+import { HYBRID_SIGNER_TAG, grantHybridMaster, grantNameRecords, hybridSigningAlias } from "./hybrid";
 import { repoPath } from "./paths";
 import * as path from "path";
 import { relaySendStatement } from "./mail-relay";
@@ -149,6 +149,7 @@ export class WorkerStack extends cdk.Stack {
     // parks a name (its address back to the holding page) with the same
     // fences the provisioning API has (lib/hybrid.ts).
     if (props.hybridNames) {
+      grantHybridMaster(this.workerFunction, this, props.cfg.hybridMasterSecretName);
       const h = props.hybridNames;
       this.workerFunction.addToRolePolicy(new iam.PolicyStatement({
         sid: "HybridNameCheckRead",
@@ -202,6 +203,9 @@ export class WorkerStack extends cdk.Stack {
       new iam.PolicyStatement({
         actions: ["sts:AssumeRole"],
         resources: ["arn:aws:iam::*:role/CoderHelmLogReader", "arn:aws:iam::*:role/CoderhelmReadOnly*"],
+        // Always with the team's private ID, so a role ARN someone else
+        // types can't make CoderHelm read their account for them.
+        conditions: { Null: { "sts:ExternalId": "false" } },
       }),
     );
     // On a hardened install the boundary lets only the gateway's and the
@@ -234,14 +238,9 @@ export class WorkerStack extends cdk.Stack {
     // Usage reconciliation reads Anthropic Admin API keys from this secret
     // (optional: reconciliation is off until it exists). Secrets Manager adds
     // a 6-character suffix to secret ARNs, hence the wildcard.
-    this.workerFunction.addToRolePolicy(
-      new iam.PolicyStatement({
-        actions: ["secretsmanager:GetSecretValue"],
-        resources: [
-          `arn:aws:secretsmanager:${this.region}:${this.account}:secret:${props.cfg.anthropicAdminSecretName}-??????`,
-        ],
-      })
-    );
+    // The Anthropic admin key secret (usage reconciliation) has no grant
+    // until it exists: whoever creates that name then adds the grant on
+    // purpose, instead of the worker silently reading it.
 
     // Bedrock: Titan embeddings only (agent memory, metered in
     // common::embed). Claude is called through the Anthropic API with the
