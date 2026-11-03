@@ -12,7 +12,7 @@ set -euo pipefail
 out=$(mkdir -p "${1:?usage: rust-build.sh <out>}" && cd "$1" && pwd)
 root=$(cd "$(dirname "$0")/.." && pwd)
 
-v=$(cargo zigbuild --version 2>/dev/null | awk '{print $2}')
+v=$(cargo-zigbuild --version 2>/dev/null | awk '{print $2}' || true)
 [ "$v" = "0.24.0" ] || { echo "cargo-zigbuild 0.24.0 is needed (found ${v:-none})" >&2; exit 1; }
 
 (cd "$root/services" && cargo zigbuild --locked --workspace --release --target aarch64-unknown-linux-musl)
