@@ -11,7 +11,8 @@
 //!   branch from that pull request's branch, and its pull request targets
 //!   that branch (stacked). It states the dependency and the merge order.
 //!   Two more signals need no dependency words: a ticket titled as part of a
-//!   series (`[Name 2/4]`) builds on the latest earlier part that still has
+//!   series (`[Name 2/4]`, `(2/4) …`, `Name (2/4)`, `Part 2 of 4: …`) builds
+//!   on the latest earlier part that still has
 //!   an open pull request ([`series`]), and a ticket that names a file the
 //!   base branch doesn't have yet builds on the one open pull request that
 //!   adds it ([`by_files`]).
@@ -180,23 +181,127 @@ pub fn pick(
     None
 }
 
-/// A ticket title's place in a series: `[Name 2/4]` anywhere in it gives
-/// ("name", 2, 4), the name lowercased. None for part 0 or a part past the
-/// total.
-pub fn series(title: &str) -> Option<(String, u32, u32)> {
-    static SERIES: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
-    let re = SERIES.get_or_init(|| {
-        Regex::new(r"\[\s*([A-Za-z][^\[\]/]*?)\s+(\d{1,3})\s*/\s*(\d{1,3})\s*\]").unwrap()
+/// A ticket title's place in a series.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Series {
+    /// The series' name, lowercased: written inside the marker
+    /// (`[Titles 2/4]`) or as a label before it (`Titles (2/4): …`).
+    /// None when the marker carries no name (`(2/4) Section titles`).
+    pub name: Option<String>,
+    pub part: u32,
+    pub total: u32,
+    /// The title's other words (lowercase, four letters or more, common
+    /// words left out): how nameless parts are matched.
+    pub words: Vec<String>,
+}
+
+/// Common words that never tie two titles together.
+const COMMON: &[&str] = &[
+    "this", "that", "with", "from", "into", "have", "will", "make", "should", "when", "then",
+    "than", "more", "less", "also", "only", "each", "them", "they", "their", "there", "page",
+    "pages", "part", "about", "after", "before", "where", "which", "what", "your", "some",
+    "update", "change", "changes", "add", "adds", "fix", "fixes", "use", "uses",
+];
+
+fn title_words(text: &str) -> Vec<String> {
+    let mut out: Vec<String> = text
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .map(|w| w.to_ascii_lowercase())
+        .filter(|w| w.len() >= 4 && !w.chars().all(|c| c.is_ascii_digit()))
+        .filter(|w| !COMMON.contains(&w.as_str()))
+        .collect();
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// A label before a marker is the series' name only when a separator
+/// follows the marker (`Titles (2/4): …`, `Titles [2/4] - …`); a ticket
+/// key prefix (`ABC-12:`) is left out.
+fn label_name(before: &str, after: &str) -> Option<String> {
+    let sep = after
+        .trim_start()
+        .starts_with([':', '-', '\u{2013}', '\u{2014}', '|']);
+    if !sep {
+        return None;
+    }
+    static KEY: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+    let key = KEY.get_or_init(|| Regex::new(r"^\s*[A-Z][A-Z0-9]+-\d+\s*[:\-]?\s*").unwrap());
+    let label = key.replace(before, "");
+    let label = label.trim().trim_end_matches([',', ':', '-']).trim();
+    (!label.is_empty() && label.len() <= 40 && label.chars().any(|c| c.is_ascii_alphabetic()))
+        .then(|| label.to_ascii_lowercase())
+}
+
+/// A ticket title's place in a series, from any of these shapes:
+/// `[Name 2/4]` or `(Name 2/4)`; `[2/4]` or `(2/4)`, with the name from a
+/// label before it when a separator follows (`Titles (2/4): …`); `Part 2
+/// of 4`. None for part 0 or a part past the total.
+pub fn series(title: &str) -> Option<Series> {
+    static NAMED: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+    static BARE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+    static PART: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+    let named = NAMED.get_or_init(|| {
+        Regex::new(r"[\[(]\s*([A-Za-z][^\[\]()/]*?)\s+(\d{1,3})\s*/\s*(\d{1,3})\s*[\])]").unwrap()
     });
-    let c = re.captures(title)?;
-    let n: u32 = c[2].parse().ok()?;
-    let m: u32 = c[3].parse().ok()?;
-    (n >= 1 && n <= m).then(|| (c[1].trim().to_ascii_lowercase(), n, m))
+    let bare =
+        BARE.get_or_init(|| Regex::new(r"[\[(]\s*(\d{1,3})\s*/\s*(\d{1,3})\s*[\])]").unwrap());
+    let part =
+        PART.get_or_init(|| Regex::new(r"(?i)\bpart\s+(\d{1,3})\s+of\s+(\d{1,3})\b").unwrap());
+    let (name, n, m, range) = if let Some(c) = named.captures(title) {
+        let r = c.get(0)?.range();
+        (
+            Some(c[1].trim().to_ascii_lowercase()),
+            c[2].parse().ok()?,
+            c[3].parse().ok()?,
+            r,
+        )
+    } else if let Some(c) = bare.captures(title) {
+        let r = c.get(0)?.range();
+        let name = label_name(&title[..r.start], &title[r.end..]);
+        (name, c[1].parse().ok()?, c[2].parse().ok()?, r)
+    } else {
+        let c = part.captures(title)?;
+        let r = c.get(0)?.range();
+        let name = label_name(&title[..r.start], &title[r.end..]);
+        (name, c[1].parse().ok()?, c[2].parse().ok()?, r)
+    };
+    let (n, m): (u32, u32) = (n, m);
+    if !(n >= 1 && n <= m && m >= 2) {
+        return None;
+    }
+    let rest = format!("{} {}", &title[..range.start], &title[range.end..]);
+    Some(Series {
+        name,
+        part: n,
+        total: m,
+        words: title_words(&rest),
+    })
+}
+
+/// Whether two titles' series are the same series: same total, and the same
+/// name; a nameless one matches a named one whose name is among its words,
+/// and two nameless ones match when their titles share a word.
+fn same_series(a: &Series, b: &Series) -> bool {
+    if a.total != b.total {
+        return false;
+    }
+    let in_words = |name: &str, words: &[String]| {
+        let w = title_words(name);
+        !w.is_empty() && w.iter().all(|x| words.contains(x))
+    };
+    match (&a.name, &b.name) {
+        (Some(x), Some(y)) => x == y,
+        (Some(x), None) => in_words(x, &b.words),
+        (None, Some(y)) => in_words(y, &a.words),
+        (None, None) => a.words.iter().any(|w| b.words.contains(w)),
+    }
 }
 
 /// The open pull request of the latest earlier part of the same series
-/// (same name and total, a lower part number), from this repository and
-/// never the run's own branch.
+/// (see [`same_series`]; a lower part number), from this repository and
+/// never the run's own branch. Two open pull requests for that part: no
+/// guess.
 pub fn pick_series(
     open: &[Value],
     title: &str,
@@ -204,9 +309,11 @@ pub fn pick_series(
     repo: &str,
     own_branch: &str,
 ) -> Option<Dependency> {
-    let (name, n, m) = series(title)?;
+    let mine = series(title)?;
+    let (n, m) = (mine.part, mine.total);
     let full = format!("{owner}/{repo}").to_ascii_lowercase();
-    open.iter()
+    let parts: Vec<(u32, &Value)> = open
+        .iter()
         .filter(|p| {
             p["head"]["repo"]["full_name"]
                 .as_str()
@@ -214,16 +321,26 @@ pub fn pick_series(
                 && p["head"]["ref"].as_str().is_some_and(|b| b != own_branch)
         })
         .filter_map(|p| {
-            let (pn, k, pm) = series(p["title"].as_str()?)?;
-            (pn == name && pm == m && k < n).then_some((k, p))
+            let theirs = series(p["title"].as_str()?)?;
+            (theirs.part < n && same_series(&mine, &theirs)).then_some((theirs.part, p))
         })
-        .max_by_key(|(k, _)| *k)
-        .map(|(k, p)| Dependency {
-            number: p["number"].as_u64().unwrap_or(0),
-            branch: p["head"]["ref"].as_str().unwrap_or("").to_string(),
-            title: p["title"].as_str().unwrap_or("").to_string(),
-            why: format!("This ticket is part {n} of {m}; part {k}'s pull request is still open."),
-        })
+        .collect();
+    let k = parts.iter().map(|(k, _)| *k).max()?;
+    let latest: Vec<&Value> = parts
+        .iter()
+        .filter(|(x, _)| *x == k)
+        .map(|(_, p)| *p)
+        .collect();
+    if latest.len() != 1 {
+        return None;
+    }
+    let p = latest[0];
+    Some(Dependency {
+        number: p["number"].as_u64().unwrap_or(0),
+        branch: p["head"]["ref"].as_str().unwrap_or("").to_string(),
+        title: p["title"].as_str().unwrap_or("").to_string(),
+        why: format!("This ticket is part {n} of {m}; part {k}'s pull request is still open."),
+    })
 }
 
 /// Repository paths a ticket names (`apps/web/src/ui/heading.tsx`): a
@@ -704,18 +821,99 @@ mod tests {
 
     #[test]
     fn a_series_title_gives_its_name_part_and_total() {
+        let nm = |t: &str| series(t).map(|s| (s.name, s.part, s.total));
         assert_eq!(
-            series("[Titles 2/4] Sections are too big"),
-            Some(("titles".into(), 2, 4))
+            nm("[Titles 2/4] Sections are too big"),
+            Some((Some("titles".into()), 2, 4))
         );
         assert_eq!(
-            series("ABC-12: [Nav polish 3 / 5] Menu"),
-            Some(("nav polish".into(), 3, 5))
+            nm("ABC-12: [Nav polish 3 / 5] Menu"),
+            Some((Some("nav polish".into()), 3, 5))
         );
-        assert_eq!(series("Fix [2/4] things"), None);
-        assert_eq!(series("[Titles 5/4] too far"), None);
-        assert_eq!(series("[Titles 0/4] zero"), None);
-        assert_eq!(series("No series here"), None);
+        assert_eq!(
+            nm("(Titles 2/4) Sections"),
+            Some((Some("titles".into()), 2, 4))
+        );
+        assert_eq!(nm("(2/4) Section titles can be bigger"), Some((None, 2, 4)));
+        assert_eq!(nm("[2/4] Section titles"), Some((None, 2, 4)));
+        assert_eq!(
+            nm("Titles (2/4): Sections"),
+            Some((Some("titles".into()), 2, 4))
+        );
+        assert_eq!(
+            nm("ABC-7: Titles [3/4] - Body"),
+            Some((Some("titles".into()), 3, 4))
+        );
+        assert_eq!(nm("Section titles (2/4)"), Some((None, 2, 4)));
+        assert_eq!(nm("Part 2 of 4: Section titles"), Some((None, 2, 4)));
+        assert_eq!(
+            nm("Titles, part 2 of 4: Sections"),
+            Some((Some("titles".into()), 2, 4))
+        );
+        assert_eq!(nm("[Titles 5/4] too far"), None);
+        assert_eq!(nm("[Titles 0/4] zero"), None);
+        assert_eq!(nm("Ratio 1/1 (1/1)"), None);
+        assert_eq!(nm("No series here"), None);
+        assert_eq!(nm("Support 24/7 chat"), None);
+    }
+
+    #[test]
+    fn other_title_shapes_stack_on_the_same_series() {
+        let open = vec![
+            pr(
+                20,
+                "coderhelm/abc-1",
+                "[Titles 1/4] Add a shared Heading component",
+                "acme/web",
+            ),
+            pr(21, "other", "(1/4) Button colors use tokens", "acme/web"),
+            pr(
+                22,
+                "coderhelm/abc-9",
+                "Part 1 of 3: Section titles",
+                "acme/web",
+            ),
+        ];
+        // A nameless part matches the named series whose name is in its title.
+        let d = pick_series(
+            &open,
+            "(2/4) Section titles can be bigger",
+            "acme",
+            "web",
+            "x",
+        )
+        .unwrap();
+        assert_eq!(d.number, 20);
+        // Two nameless parts match on a shared word and the same total.
+        let d = pick_series(&open, "(2/4) Button borders use tokens", "acme", "web", "x").unwrap();
+        assert_eq!(d.number, 21);
+        let d = pick_series(
+            &open,
+            "Part 2 of 3: Section titles on venues",
+            "acme",
+            "web",
+            "x",
+        )
+        .unwrap();
+        assert_eq!(d.number, 22);
+        // A label before the marker names the series.
+        let d = pick_series(&open, "Titles (2/4): Sections", "acme", "web", "x").unwrap();
+        assert_eq!(d.number, 20);
+        // Nothing in common: no stacking.
+        assert!(pick_series(
+            &open,
+            "(2/4) Footer links open in a new tab",
+            "acme",
+            "web",
+            "x"
+        )
+        .is_none());
+        // Two open pull requests for the same earlier part: no guess.
+        let tie = vec![
+            pr(30, "a", "(1/2) Menu spacing", "acme/web"),
+            pr(31, "b", "(1/2) Menu colors", "acme/web"),
+        ];
+        assert!(pick_series(&tie, "(2/2) Menu fonts", "acme", "web", "x").is_none());
     }
 
     #[test]
