@@ -227,14 +227,27 @@ fn secret_name(name: &str) -> bool {
     SECRET_WORDS.iter().any(|w| n.contains(w))
 }
 
-/// Headers with every secret-looking one replaced by `[redacted]`, names lowercased.
+/// Headers a delivery record never keeps: where the sender is (CloudFront's
+/// viewer location and address headers) and the client IPs proxies add.
+/// They are location data with no troubleshooting value.
+fn location_header(name: &str) -> bool {
+    name.starts_with("cloudfront-viewer-")
+        || matches!(
+            name,
+            "x-forwarded-for" | "x-real-ip" | "true-client-ip" | "forwarded" | "x-client-ip"
+        )
+}
+
+/// Headers with every secret-looking one replaced by `[redacted]` and the
+/// sender's location and IP headers left out, names lowercased.
 pub fn redact_headers<'a>(
     headers: impl IntoIterator<Item = (&'a str, &'a str)>,
 ) -> BTreeMap<String, String> {
     headers
         .into_iter()
+        .map(|(k, v)| (k.to_ascii_lowercase(), v))
+        .filter(|(k, _)| !location_header(k))
         .map(|(k, v)| {
-            let k = k.to_ascii_lowercase();
             let v = if secret_name(&k) {
                 "[redacted]".to_string()
             } else {
@@ -827,6 +840,28 @@ mod tests {
         assert_eq!(h["x-coderhelm-relay-signature"], "[redacted]");
         assert_eq!(h["cookie"], "[redacted]");
         assert_eq!(h["x-github-event"], "push");
+    }
+
+    #[test]
+    fn headers_never_keep_where_the_sender_is() {
+        let h = redact_headers([
+            ("CloudFront-Viewer-Latitude", "40.71"),
+            ("CloudFront-Viewer-Longitude", "-74.00"),
+            ("CloudFront-Viewer-Postal-Code", "10001"),
+            ("CloudFront-Viewer-City", "New York"),
+            ("CloudFront-Viewer-Metro-Code", "501"),
+            ("CloudFront-Viewer-Country-Region-Name", "New York"),
+            ("CloudFront-Viewer-Address", "192.0.2.1:443"),
+            ("X-Forwarded-For", "192.0.2.1, 198.51.100.2"),
+            ("X-Real-IP", "192.0.2.1"),
+            ("True-Client-IP", "192.0.2.1"),
+            ("Forwarded", "for=192.0.2.1"),
+            ("X-GitHub-Delivery", "d-1"),
+            ("X-Amz-Cf-Id", "cf-1"),
+            ("User-Agent", "GitHub-Hookshot/abc"),
+        ]);
+        let kept: Vec<&str> = h.keys().map(String::as_str).collect();
+        assert_eq!(kept, ["user-agent", "x-amz-cf-id", "x-github-delivery"]);
     }
 
     #[test]
