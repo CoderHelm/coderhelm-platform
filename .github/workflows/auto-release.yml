@@ -26,11 +26,25 @@ name: Auto release
 #             (infra/lib/worker-stack.ts); like release.yml's publish job, it
 #             runs no code from the repository.
 #
-# Started by deploy.yml's last job, after the CDK deploy succeeded (a
-# workflow_dispatch: the one event a workflow's token can start another
-# workflow with). Starting it by hand does the same and nothing more: main's
-# code, main's ref, and only for a commit main's deploy shipped.
+# Called by deploy.yml's last job, after the CDK deploy succeeded, as part of
+# that deploy run (workflow_call). The run is then the deploy's own run: its
+# ref is refs/heads/main and its commit is exactly the commit the deploy
+# shipped, even when main has moved on since, so the certificate names that
+# commit and installs accept it. A called workflow is read from the caller's
+# own commit, so this file and release.yml are still that commit's reviewed
+# copies, and the certificate still names this file (job_workflow_ref).
+# Starting it by hand does the same and nothing more: main's code, main's ref,
+# and only for main's current commit, once main's deploy shipped it.
 on:
+  workflow_call:
+    inputs:
+      commit:
+        description: The main commit the hosted deploy shipped (full SHA)
+        required: true
+        type: string
+    secrets:
+      AWS_ACCOUNT_ID:
+        required: true
   workflow_dispatch:
     inputs:
       commit:
@@ -61,7 +75,9 @@ jobs:
     steps:
       # The signature names this run's ref and commit, and installs require
       # refs/heads/main and the tag's commit: the run must be on main, on the
-      # commit that was deployed.
+      # commit that was deployed. Called from deploy.yml, the run's commit is
+      # the deployed commit by construction. Started by hand, it is main's
+      # head, so only that commit can be released by hand.
       - id: guard
         name: On main, for the commit main's deploy shipped
         env:
@@ -69,10 +85,14 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           [ "$GITHUB_REF" = refs/heads/main ] || { echo "::error::Run this on main, not $GITHUB_REF"; exit 1; }
+          case "$GITHUB_WORKFLOW_REF" in
+            "$GITHUB_REPOSITORY/.github/workflows/deploy.yml@refs/heads/main" | "$GITHUB_REPOSITORY/.github/workflows/auto-release.yml@refs/heads/main") ;;
+            *) echo "::error::Only deploy.yml or a run by hand on main may start this, not $GITHUB_WORKFLOW_REF"; exit 1 ;;
+          esac
           [[ "$COMMIT" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::commit must be a full commit SHA"; exit 1; }
           if [ "$GITHUB_SHA" != "$COMMIT" ]; then
-            echo "main is at $GITHUB_SHA, not the deployed $COMMIT: the next deploy releases main. Nothing to do."
-            exit 0
+            echo "::error::This run is on $GITHUB_SHA, not $COMMIT: a release is cut only from the run of the commit it releases (the deploy of $COMMIT releases it)"
+            exit 1
           fi
           ok=""
           for run in $(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/deploy.yml/runs?branch=main&head_sha=$COMMIT&per_page=20" --jq '.workflow_runs[] | select(.event == "schedule" or .event == "workflow_dispatch") | .id'); do
@@ -126,6 +146,10 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           if [ "$GITHUB_REF" != refs/heads/main ] || [ "$GITHUB_SHA" != "$COMMIT" ]; then echo "::error::not main's deployed commit"; exit 1; fi
+          case "$GITHUB_WORKFLOW_REF" in
+            "$GITHUB_REPOSITORY/.github/workflows/deploy.yml@refs/heads/main" | "$GITHUB_REPOSITORY/.github/workflows/auto-release.yml@refs/heads/main") ;;
+            *) echo "::error::not started by deploy.yml or by hand on main"; exit 1 ;;
+          esac
           [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "::error::$TAG is not vX.Y.Z"; exit 1; }
           if gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$TAG" >/dev/null 2>&1; then
             echo "::error::$TAG exists already; a release tag is never re-cut or moved"; exit 1

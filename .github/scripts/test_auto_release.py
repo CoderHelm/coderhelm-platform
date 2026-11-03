@@ -70,6 +70,18 @@ class Plan(unittest.TestCase):
         self.assertTrue(r["skip"])
         self.assertIn("v0.7.1 is newer", r["reason"])
 
+    def test_deployed_commit_behind_main_is_released(self):
+        # main moved on during the deploy (its new commits are untagged): the deployed commit is still released.
+        r = plan(tags=("v0.7.0",), ancestors=("v0.7.0",), on_main=lambda t: True)
+        self.assertEqual((r["skip"], r["tag"], r["previous"]), (False, "v0.7.1", "v0.7.0"))
+
+    def test_an_older_deploy_never_releases_after_a_newer_one(self):
+        # A later commit's release exists: the older commit is never released, so latest never goes back.
+        for newer in ("v0.7.1", "v0.8.0", "v1.0.0"):
+            r = plan(tags=("v0.7.0", newer), ancestors=("v0.7.0",), on_main=lambda t: True)
+            self.assertTrue(r["skip"], newer)
+            self.assertNotIn("tag", r)
+
     def test_pre_releases_are_ignored_for_the_base(self):
         r = plan(tags=("v0.7.0", "v0.8.0-rc.1"), ancestors=("v0.7.0", "v0.8.0-rc.1"))
         self.assertEqual(r["tag"], "v0.7.1")
@@ -100,6 +112,39 @@ class Notes(unittest.TestCase):
         self.assertIn("- Fix a thing (#150)", many)
         self.assertNotIn("(#50)", many)
         self.assertIn("And 50 earlier pull request(s).", many)
+
+
+class Wiring(unittest.TestCase):
+    """deploy.yml releases its own commit, in its own run, and auto-release.yml refuses any other."""
+
+    @staticmethod
+    def load(name):
+        import yaml
+        with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "workflows", name)) as f:
+            text = f.read()
+        return text, yaml.safe_load(text)
+
+    def test_deploy_calls_auto_release_with_its_own_commit(self):
+        _, deploy = self.load("deploy.yml")
+        job = deploy["jobs"]["release"]
+        self.assertEqual(job["uses"], "./.github/workflows/auto-release.yml")
+        self.assertEqual(job["with"]["commit"], "${{ github.sha }}")
+        self.assertIn("deploy", job["needs"])
+        self.assertEqual(job["permissions"]["id-token"], "write")
+
+    def test_auto_release_runs_only_on_the_released_commit(self):
+        text, doc = self.load("auto-release.yml")
+        on = doc.get("on", doc.get(True))
+        self.assertEqual(set(on), {"workflow_call", "workflow_dispatch"})
+        guard = next(s for s in doc["jobs"]["plan"]["steps"] if s.get("id") == "guard")["run"]
+        tag = doc["jobs"]["tag"]["steps"][0]["run"]
+        for run in (guard, tag):
+            self.assertIn('"$GITHUB_SHA" != "$COMMIT"', run)
+            self.assertIn("refs/heads/main", run)
+            self.assertIn("deploy.yml@refs/heads/main", run)
+        # The run's commit differing from the asked commit is an error, never a quiet release of another commit.
+        self.assertIn("exit 1", guard.split('"$GITHUB_SHA" != "$COMMIT"')[1].split("fi")[0])
+        self.assertIn("--certificate-github-workflow-sha \"$COMMIT\"", text)
 
 
 class WithGit(unittest.TestCase):
