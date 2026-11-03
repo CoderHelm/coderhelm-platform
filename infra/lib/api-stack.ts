@@ -429,6 +429,22 @@ export class ApiStack extends cdk.Stack {
       ],
     });
 
+    // Self-hosted support: tickets that didn't reach CoderHelm yet are sent
+    // again, and support's answers come back (the worker does nothing on the
+    // hosted deployment).
+    new events.Rule(this, "SupportSyncSchedule", {
+      ruleName: `${prefix}-support-sync`,
+      description: "Send support tickets to CoderHelm and bring its answers back",
+      schedule: events.Schedule.rate(cdk.Duration.minutes(5)),
+      targets: [
+        new targets.SqsQueue(this.ticketQueue, {
+          message: events.RuleTargetInput.fromObject({
+            type: "support_sync",
+          }),
+        }),
+      ],
+    });
+
     // Weekly summary email: Mondays 13:00 UTC, one constant message on the
     // ticket queue; the worker sends each team's summary to members who have
     // it on. Ships disabled (see flags.ts) until a test email is approved.

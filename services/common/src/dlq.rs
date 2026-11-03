@@ -78,6 +78,8 @@ pub const WORKER_MESSAGE_TYPES: &[&str] = &[
     "plugin_results",
     // Hybrid names: the 15 minute check (hosted side only).
     "hybrid_name_check",
+    // Self-hosted support tickets to CoderHelm, and answers back.
+    "support_sync",
 ];
 
 /// Scheduled jobs that act on every team (EventBridge puts them on the ticket
@@ -94,6 +96,7 @@ pub const GLOBAL_MESSAGE_TYPES: &[&str] = &[
     "knowledge_sync_sweep",
     "plugin_sweep",
     "hybrid_name_check",
+    "support_sync",
 ];
 
 /// The DLQ keeps a message this long, counted from when it was first sent

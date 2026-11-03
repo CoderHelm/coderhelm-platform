@@ -32,6 +32,9 @@ pub mod hybrid;
 /// Which emails an install sends, and how: its own SES or CoderHelm's mail
 /// relay (templates only, listed recipients, never CoderHelm's addresses).
 pub mod mail;
+/// Support tickets from self-hosted installs: sent to CoderHelm's support
+/// queue, and support's answers fetched back (install and hosted sides).
+pub mod support_relay;
 /// Outbound webhooks: the event catalog, endpoints, signing and delivery.
 pub mod webhooks;
 

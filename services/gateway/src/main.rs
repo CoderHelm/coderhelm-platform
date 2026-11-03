@@ -1476,6 +1476,10 @@ fn hybrid_routes() -> Router<Arc<AppState>> {
             "/jira/trigger/:install_id/:trigger/:token",
             post(routes::hybrid_jira::trigger),
         )
+        // Support tickets from installs (routes::hybrid_support).
+        .route("/support/tickets", post(routes::hybrid_support::tickets))
+        .route("/support/messages", post(routes::hybrid_support::messages))
+        .route("/support/updates", post(routes::hybrid_support::updates))
         .route("/deliveries", get(routes::hybrid::list_deliveries))
         .route("/deliveries/shared", post(routes::hybrid::share))
         .route("/deliveries/rollups", post(routes::hybrid::rollups))
@@ -1589,6 +1593,10 @@ mod tests {
                 "/hybrid/github/links/42",
                 &br#"{"repositories":[]}"#[..],
             ),
+            // Support tickets from installs.
+            ("POST", "/hybrid/support/tickets", &br#"{}"#[..]),
+            ("POST", "/hybrid/support/messages", &br#"{}"#[..]),
+            ("POST", "/hybrid/support/updates", &br#"{"since":""}"#[..]),
         ] {
             let res = app
                 .clone()

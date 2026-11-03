@@ -518,6 +518,11 @@ async fn handle_message(state: Arc<WorkerState>, message: models::WorkerMessage)
                 error!("Plugin sync failed: {e:?}");
             }
         }
+        models::WorkerMessage::SupportSync => {
+            if let Err(e) = passes::support_sync::run(&state).await {
+                error!("Support sync failed: {e}");
+            }
+        }
         models::WorkerMessage::HybridNameCheck => {
             info!("Hybrid name check");
             if let Err(e) = passes::hybrid_name_check::run(&state).await {

@@ -188,6 +188,11 @@ pub enum WorkerMessage {
     /// put it, and park the ones that don't (common::hybrid::name_check).
     #[serde(rename = "hybrid_name_check")]
     HybridNameCheck,
+    /// Every few minutes on a self-hosted install (EventBridge, through SQS): send
+    /// support tickets that didn't reach CoderHelm yet, and bring support's
+    /// answers back (common::support_relay).
+    #[serde(rename = "support_sync")]
+    SupportSync,
     /// A plugin's recurring `schedule` trigger fired.
     #[serde(rename = "plugin_trigger")]
     PluginTrigger(PluginTriggerMessage),
@@ -376,7 +381,8 @@ impl WorkerMessage {
             | WorkerMessage::AgentResumeSweep
             | WorkerMessage::LogAutofix
             | WorkerMessage::AwsPermissionsSweep
-            | WorkerMessage::HybridNameCheck => f::OTHER,
+            | WorkerMessage::HybridNameCheck
+            | WorkerMessage::SupportSync => f::OTHER,
             WorkerMessage::PluginRun(_)
             | WorkerMessage::PluginPublish(_)
             | WorkerMessage::PluginSync(_)
