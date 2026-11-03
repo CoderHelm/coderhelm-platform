@@ -74,50 +74,6 @@ pub fn cognito_secret_hash(client_secret: &str, username: &str, client_id: &str)
     STANDARD.encode(mac.finalize().into_bytes())
 }
 
-// ── Closed beta allowlist ───────────────────────────────────────────
-
-/// Check if an email is on the closed beta allowlist.
-/// Returns true if the allowlist is empty (open access) or if the email is listed.
-pub async fn is_email_allowed(state: &AppState, email: &str) -> bool {
-    let email = normalize_email(email);
-
-    // Check for exact email match
-    let result = state
-        .dynamo
-        .get_item()
-        .table_name(&state.config.settings_table_name)
-        .key("pk", attr_s("ALLOWLIST"))
-        .key("sk", attr_s(&format!("EMAIL#{email}")))
-        .send()
-        .await
-        .ok()
-        .and_then(|r| r.item().cloned());
-
-    if result.is_some() {
-        return true;
-    }
-
-    // Check for domain wildcard (e.g. EMAIL#*@company.com)
-    if let Some(domain) = email.split('@').nth(1) {
-        let domain_result = state
-            .dynamo
-            .get_item()
-            .table_name(&state.config.settings_table_name)
-            .key("pk", attr_s("ALLOWLIST"))
-            .key("sk", attr_s(&format!("EMAIL#*@{domain}")))
-            .send()
-            .await
-            .ok()
-            .and_then(|r| r.item().cloned());
-
-        if domain_result.is_some() {
-            return true;
-        }
-    }
-
-    false
-}
-
 // ── Request bodies ──────────────────────────────────────────────────
 
 #[derive(Deserialize)]
@@ -173,6 +129,7 @@ pub struct MfaChallengeRequest {
 /// POST /auth/signup — Create account with email + password via Cognito.
 pub async fn signup(
     State(state): State<Arc<AppState>>,
+    ip: crate::middleware::rate_limit::ClientIp,
     Json(body): Json<SignupRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
     let email = body.email.trim().to_lowercase();
@@ -199,12 +156,15 @@ pub async fn signup(
             info!(outcome = join.key(), "Self-hosted sign-up refused");
             return Err(not_invited_json());
         }
-    } else if !is_email_allowed(&state, &email).await {
-        // Closed beta: check allowlist
+    } else if super::open_signup::allow_new_team(&state, &ip.0)
+        .await
+        .is_err()
+    {
+        // Open beta: anyone may sign up, a few times an hour per address.
         return Err((
-            StatusCode::FORBIDDEN,
+            StatusCode::TOO_MANY_REQUESTS,
             Json(serde_json::json!({
-                "error": "Coderhelm is in closed beta. Join the waitlist to get notified when we open up."
+                "error": "Too many sign-ups from here just now. Try again in an hour."
             })),
         ));
     }
@@ -347,6 +307,7 @@ pub async fn verify_email(
         .await
         .map(|r| r.items().to_vec())
         .unwrap_or_default();
+    let records = super::open_signup::drop_moved_invites(&state, records).await;
     if !needs_personal_team(&records, chrono::Utc::now()) {
         info!(email = %email, "Email verified; invited or already on a team, so no personal team");
         send_welcome_email(&state, &email).await;
@@ -358,6 +319,7 @@ pub async fn verify_email(
 
     // Create a personal team for the new user
     let team_id = format!("TEAM#{cognito_sub}");
+    super::open_signup::set_default_limits(&state, &team_id).await;
     let user_id = format!("USER#{cognito_sub}");
     let now = chrono::Utc::now().to_rfc3339();
 
@@ -1003,6 +965,7 @@ pub async fn google_login(State(state): State<Arc<AppState>>, headers: HeaderMap
 /// failure lands on the dashboard's sign-in screen with a short reason.
 pub async fn google_callback(
     State(state): State<Arc<AppState>>,
+    ip: crate::middleware::rate_limit::ClientIp,
     headers: HeaderMap,
     Query(params): Query<CallbackQuery>,
 ) -> Response {
@@ -1010,7 +973,7 @@ pub async fn google_callback(
         return r;
     }
     let app = common::public_urls::app_url(&state.config.stage);
-    match google_callback_inner(&state, &headers, &params).await {
+    match google_callback_inner(&state, &ip.0, &headers, &params).await {
         Ok(resp) => resp,
         Err(f) => f.into_redirect(app),
     }
@@ -1018,6 +981,7 @@ pub async fn google_callback(
 
 async fn google_callback_inner(
     state: &Arc<AppState>,
+    ip: &str,
     headers: &HeaderMap,
     params: &CallbackQuery,
 ) -> Result<Response, SignInFailure> {
@@ -1156,12 +1120,13 @@ async fn google_callback_inner(
         return Ok(session_redirect(P, &token, dash));
     }
 
-    // Closed beta: only allow new users on the allowlist (existing users can always log in)
-    if existing.is_empty() && !is_email_allowed(state, &email).await {
+    // Open beta: a first sign-in starts a team, a few times an hour per address.
+    if existing.is_empty() && super::open_signup::allow_new_team(state, ip).await.is_err() {
         let dash = common::public_urls::app_url(&state.config.stage);
-        let redirect = format!("{dash}?error=closed_beta");
-        return Ok(Redirect::temporary(&redirect).into_response());
+        return Ok(Redirect::temporary(&format!("{dash}?error=signup_limit")).into_response());
     }
+    // An invite from a team that moved to its own install is never accepted here.
+    let existing = super::open_signup::drop_moved_invites(state, existing).await;
 
     // Accept pending invites first: Google sign-ins never accepted them, so an
     // invited teammate got a personal team and the invite stayed pending.
@@ -1193,6 +1158,7 @@ async fn google_callback_inner(
     } else {
         // New user — create personal team
         let tid = format!("TEAM#{}", ulid::Ulid::new().to_string().to_lowercase());
+        super::open_signup::set_default_limits(state, &tid).await;
         let uid = format!("USER#{cognito_sub}");
         let now = chrono::Utc::now().to_rfc3339();
 
@@ -1297,11 +1263,12 @@ pub async fn github_login(State(state): State<Arc<AppState>>) -> Response {
 /// Any failure lands on the dashboard's sign-in screen with a short reason.
 pub async fn github_callback(
     State(state): State<Arc<AppState>>,
+    ip: crate::middleware::rate_limit::ClientIp,
     headers: HeaderMap,
     Query(params): Query<CallbackQuery>,
 ) -> Response {
     let app = common::public_urls::app_url(&state.config.stage);
-    match github_callback_inner(&state, &headers, &params).await {
+    match github_callback_inner(&state, &ip.0, &headers, &params).await {
         Ok(resp) => resp,
         Err(f) => f.into_redirect(app),
     }
@@ -1309,6 +1276,7 @@ pub async fn github_callback(
 
 async fn github_callback_inner(
     state: &Arc<AppState>,
+    ip: &str,
     headers: &HeaderMap,
     params: &CallbackQuery,
 ) -> Result<Response, SignInFailure> {
@@ -1609,11 +1577,10 @@ async fn github_callback_inner(
 
     let has_existing_record = existing_user.is_some();
 
-    // Closed beta: check allowlist for new GitHub users
-    if !has_existing_record && !email.is_empty() && !is_email_allowed(state, email).await {
+    // Open beta: a first sign-in starts a team, a few times an hour per address.
+    if !has_existing_record && super::open_signup::allow_new_team(state, ip).await.is_err() {
         let dash = common::public_urls::app_url(&state.config.stage);
-        let redirect = format!("{dash}?error=closed_beta");
-        return Ok(Redirect::temporary(&redirect).into_response());
+        return Ok(Redirect::temporary(&format!("{dash}?error=signup_limit")).into_response());
     }
 
     // A first-time sign-in with no invite, from an org whose installation a
@@ -1660,6 +1627,7 @@ async fn github_callback_inner(
     } else {
         // Brand new user — create a new team with ULID
         let new_team_id = format!("TEAM#{}", ulid::Ulid::new().to_string().to_lowercase());
+        super::open_signup::set_default_limits(state, &new_team_id).await;
         let uid = github_user_id.clone();
 
         // Create team META in main table
@@ -2121,7 +2089,8 @@ async fn issue_session_from_cognito(
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
 
-    let items = existing.items().to_vec();
+    // An invite from a team that moved to its own install is never accepted here.
+    let items = super::open_signup::drop_moved_invites(state, existing.items().to_vec()).await;
 
     // Accept pending invites FIRST, so a teammate's first sign-in lands on the
     // team that invited them instead of minting a personal team that then
@@ -2424,125 +2393,6 @@ pub(crate) fn normalize_email(email: &str) -> String {
     } else {
         email
     }
-}
-
-// ── Waitlist ─────────────────────────────────────────────────────────
-
-#[derive(Deserialize)]
-pub struct WaitlistRequest {
-    pub email: String,
-    pub reason: Option<String>,
-    /// Where they work, if they said.
-    pub company: Option<String>,
-}
-
-/// An optional free-text field, trimmed and cut to `max` characters.
-fn short_text(v: Option<&str>, max: usize) -> String {
-    v.unwrap_or("").trim().chars().take(max).collect()
-}
-
-/// The waitlist record for one sign-up: keyed by the normalised email, with
-/// what they typed, when, and the optional company and message.
-fn waitlist_item(
-    normalized: &str,
-    email: &str,
-    body: &WaitlistRequest,
-    now: &str,
-) -> HashMap<String, aws_sdk_dynamodb::types::AttributeValue> {
-    let mut item = HashMap::from([
-        ("email".to_string(), attr_s(normalized)),
-        ("original_email".to_string(), attr_s(email)),
-        ("created_at".to_string(), attr_s(now)),
-        ("status".to_string(), attr_s("new")),
-    ]);
-    for (key, value) in [
-        ("reason", short_text(body.reason.as_deref(), 500)),
-        ("company", short_text(body.company.as_deref(), 120)),
-    ] {
-        if !value.is_empty() {
-            item.insert(key.to_string(), attr_s(&value));
-        }
-    }
-    item
-}
-
-/// POST /auth/waitlist — join the closed beta waitlist.
-pub async fn join_waitlist(
-    State(state): State<Arc<AppState>>,
-    Json(body): Json<WaitlistRequest>,
-) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
-    let email = body.email.trim().to_lowercase();
-    if email.is_empty() || !email.contains('@') {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({ "error": "Invalid email address" })),
-        ));
-    }
-
-    // Basic email regex validation
-    static EMAIL_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
-        regex::Regex::new(r"^[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}$").unwrap()
-    });
-    if !EMAIL_RE.is_match(&email) {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({ "error": "Invalid email format" })),
-        ));
-    }
-
-    // Normalize: strip plus-alias (user+tag@domain.com → user@domain.com) for dedup
-    let normalized = normalize_email(&email);
-
-    // Check if normalized email already exists
-    let existing = state
-        .dynamo
-        .get_item()
-        .table_name(&state.config.waitlist_table_name)
-        .key("email", attr_s(&normalized))
-        .send()
-        .await
-        .ok()
-        .and_then(|r| r.item().cloned());
-
-    if existing.is_some() {
-        return Ok(Json(serde_json::json!({
-            "status": "already_joined",
-            "message": "You're already on the list! We'll notify you when Coderhelm opens up."
-        })));
-    }
-
-    let now = chrono::Utc::now().to_rfc3339();
-    let put = state
-        .dynamo
-        .put_item()
-        .table_name(&state.config.waitlist_table_name)
-        .set_item(Some(waitlist_item(&normalized, &email, &body, &now)))
-        // Two quick submits must not reset a sign-up an admin already invited.
-        .condition_expression("attribute_not_exists(email)");
-
-    put.send().await.map_err(|e| {
-        let e = aws_sdk_dynamodb::error::DisplayErrorContext(e).to_string();
-        if e.contains("ConditionalCheckFailed") {
-            return (
-                StatusCode::OK,
-                Json(serde_json::json!({
-                    "status": "already_joined",
-                    "message": "You're already on the list! We'll notify you when Coderhelm opens up."
-                })),
-            );
-        }
-        error!("Failed to save waitlist entry: {e}");
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({ "error": "Internal error" })),
-        )
-    })?;
-
-    info!(email = %email, normalized = %normalized, "Waitlist signup");
-    Ok(Json(serde_json::json!({
-        "status": "joined",
-        "message": "You're on the list! We'll notify you when Coderhelm opens up."
-    })))
 }
 
 fn attr_s(val: &str) -> aws_sdk_dynamodb::types::AttributeValue {
@@ -2993,40 +2843,5 @@ mod first_sign_in_tests {
             chosen.get("pk").and_then(|v| v.as_s().ok()).unwrap(),
             "TEAM#co"
         );
-    }
-
-    #[test]
-    fn waitlist_records_keep_what_was_typed_and_cut_long_text() {
-        let body = WaitlistRequest {
-            email: "Dee+beta@Beta.test".into(),
-            reason: Some(format!("  {}  ", "x".repeat(600))),
-            company: Some("  Beta Co  ".into()),
-        };
-        let item = waitlist_item(
-            "dee@beta.test",
-            "dee+beta@beta.test",
-            &body,
-            "2026-10-22T00:00:00Z",
-        );
-        let s = |k: &str| {
-            item.get(k)
-                .and_then(|v| v.as_s().ok())
-                .cloned()
-                .unwrap_or_default()
-        };
-        assert_eq!(s("email"), "dee@beta.test");
-        assert_eq!(s("original_email"), "dee+beta@beta.test");
-        assert_eq!(s("company"), "Beta Co");
-        assert_eq!(s("reason").chars().count(), 500);
-        assert_eq!(s("status"), "new");
-        assert_eq!(s("created_at"), "2026-10-22T00:00:00Z");
-
-        let bare = WaitlistRequest {
-            email: "a@b.test".into(),
-            reason: None,
-            company: Some("   ".into()),
-        };
-        let item = waitlist_item("a@b.test", "a@b.test", &bare, "t");
-        assert!(!item.contains_key("reason") && !item.contains_key("company"));
     }
 }
