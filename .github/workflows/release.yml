@@ -218,6 +218,10 @@ jobs:
           targets: aarch64-unknown-linux-musl
       - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
         if: steps.reuse.outputs.hit != 'true'
+        # A fixed version: "latest" reads ziglang.org's version index on every
+        # run, and a bad copy of that index fails the build.
+        with:
+          version: 0.17.0
       - if: steps.reuse.outputs.hit != 'true'
         run: pip3 install --retries 3 --timeout 60 cargo-zigbuild==0.24.0
       - name: Build gateway and worker (no build cache)
