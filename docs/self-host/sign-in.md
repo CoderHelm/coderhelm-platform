@@ -97,11 +97,11 @@ An install that had Google sign-in on loses it at its next update, which removes
 
 ## GitHub accounts
 
-People connect their GitHub account in their own settings, so pull requests and reviews are credited to them. Signing in with GitHub follows the same rules as everything else: it lands on the organization only for someone already in it, invited, or at an allowed domain (by the email on their GitHub account). It uses the GitHub App's own OAuth client, which the GitHub App step stores; nothing to set up.
+People connect their GitHub account in their own settings, so pull requests and reviews are credited to them. Signing in with GitHub follows the same rules as everything else: it lands on the organization only for someone already in it, invited, or at an allowed domain (by the email on their GitHub account). It uses the GitHub App's own OAuth client, which the GitHub App step stores; nothing to set up. The sign-in page offers **Continue with GitHub** only while that client's id and secret are both stored (it asks the API, `GET /auth/methods`). An install on CoderHelm's GitHub App (hybrid) has no client of its own, so its sign-in page shows email and password only: signing in through CoderHelm would hand your people's identities to CoderHelm. The `github_sign_in` check in **Settings, Setup** says which applies.
 
 ## Single sign-on (SAML, OIDC)
 
-Not available yet: CoderHelm's sign-in page offers email and password, and GitHub. The Cognito user pool is in your account, so an identity provider added there by hand is not shown on the sign-in page and isn't supported.
+Not available yet: CoderHelm's sign-in page offers email and password, and GitHub when the install has its own GitHub App. The Cognito user pool is in your account, so an identity provider added there by hand is not shown on the sign-in page and isn't supported.
 
 ## Install admins and team roles
 

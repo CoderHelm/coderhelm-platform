@@ -56,6 +56,9 @@ pub enum Reason {
     Provider,
     /// Something on our side failed.
     Server,
+    /// This install has no sign-in client for the provider, so the trip to
+    /// the provider would only end on its error page.
+    NotSetUp,
 }
 
 impl Reason {
@@ -66,6 +69,7 @@ impl Reason {
             Reason::Cancelled => "cancelled",
             Reason::Provider => "provider",
             Reason::Server => "server",
+            Reason::NotSetUp => "not_set_up",
         }
     }
 }
@@ -212,6 +216,51 @@ fn cookie_value<'a>(cookie_header: &'a str, name: &str) -> Option<&'a str> {
         .filter(|v| !v.is_empty())
 }
 
+/// GitHub sign-in works only with an OAuth client of the install's own: its
+/// client id and secret. A hybrid install on CoderHelm's GitHub App has
+/// neither, and CoderHelm's client can't sign anyone in to it (the hosted
+/// side never vouches for a person on an install).
+pub fn github_sign_in_ready(client_id: &str, client_secret: &str) -> bool {
+    !client_id.trim().is_empty() && !client_secret.trim().is_empty()
+}
+
+/// `GET /auth/github` (and its callback) with no client: back to the sign-in
+/// screen with `not_set_up`, never to GitHub with an empty `client_id`.
+pub fn github_not_set_up(
+    client_id: &str,
+    client_secret: &str,
+    app_url: &str,
+    step: &'static str,
+) -> Option<Response> {
+    (!github_sign_in_ready(client_id, client_secret)).then(|| {
+        SignInFailure::new(
+            Provider::Github,
+            Reason::NotSetUp,
+            step,
+            "no GitHub OAuth client id and secret stored for this install",
+        )
+        .into_redirect(app_url)
+    })
+}
+
+/// The sign-in methods that work here, which the sign-in page shows and
+/// nothing else: email and password always, Google only on the hosted
+/// deployment, GitHub only with the install's own OAuth client.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub struct SignInMethods {
+    pub password: bool,
+    pub google: bool,
+    pub github: bool,
+}
+
+pub fn sign_in_methods(self_hosted: bool, github_ready: bool) -> SignInMethods {
+    SignInMethods {
+        password: true,
+        google: !self_hosted,
+        github: github_ready,
+    }
+}
+
 /// An app's built-in browser (a web view inside another app), where Google
 /// shows "This browser or app may not be secure" instead of a sign-in page.
 ///
@@ -257,6 +306,47 @@ mod tests {
             state: state.map(Into::into),
             error: error.map(Into::into),
         }
+    }
+
+    #[test]
+    fn github_sign_in_needs_both_halves_of_the_client() {
+        assert!(github_sign_in_ready("Iv1.abc", "secret"));
+        // A hybrid install on CoderHelm's app: no client of its own.
+        assert!(!github_sign_in_ready("", ""));
+        assert!(!github_sign_in_ready("Iv1.abc", ""));
+        assert!(!github_sign_in_ready("", "secret"));
+        assert!(!github_sign_in_ready("  ", " \n"));
+    }
+
+    #[test]
+    fn the_methods_list_has_only_what_works() {
+        let m = sign_in_methods(true, false);
+        assert_eq!((m.password, m.google, m.github), (true, false, false));
+        let m = sign_in_methods(true, true);
+        assert_eq!((m.password, m.google, m.github), (true, false, true));
+        let m = sign_in_methods(false, true);
+        assert_eq!((m.password, m.google, m.github), (true, true, true));
+        assert_eq!(
+            serde_json::to_value(sign_in_methods(true, false)).unwrap(),
+            serde_json::json!({ "password": true, "google": false, "github": false })
+        );
+    }
+
+    #[test]
+    fn github_with_no_client_goes_back_to_sign_in_not_to_github() {
+        let app = "https://coderhelm.acme.example";
+        for (id, secret) in [("", ""), ("Iv1.abc", ""), ("", "secret")] {
+            let r = github_not_set_up(id, secret, app, "start").expect("refused");
+            assert_eq!(r.status(), StatusCode::FOUND);
+            let to = r.headers()[header::LOCATION].to_str().unwrap();
+            assert_eq!(
+                to,
+                "https://coderhelm.acme.example/?signin_error=not_set_up&provider=github"
+            );
+            assert!(!to.contains("github.com"), "{to}");
+        }
+        // With the install's own client, sign-in goes on to GitHub.
+        assert!(github_not_set_up("Iv1.abc", "secret", app, "start").is_none());
     }
 
     #[test]
