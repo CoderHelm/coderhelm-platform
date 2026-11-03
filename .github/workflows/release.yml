@@ -25,6 +25,9 @@ name: Release
 #             attested by auto-release.yml on main for this tag and commit.
 #   build     builds everything with a read-only token and no secrets; the
 #             dashboard from the full commit SHA in selfhost/versions.json.
+#             The Rust Lambdas come from the hosted deploy of the tag's commit
+#             when that build checks out (same Rust inputs, sha256 as
+#             recorded), and are built from scratch otherwise.
 #   publish   signs, attests and publishes. On a maintainer's tag it runs in
 #             the "release" environment, so a maintainer must approve it, and
 #             only then can it assume the AWS roles (whose trust names this
@@ -180,6 +183,7 @@ jobs:
     # Read-only token, no secrets, no OIDC: this job runs the build scripts.
     permissions:
       contents: read
+      actions: read # the deploy's build of this commit
     env:
       TAG: ${{ needs.check.outputs.tag }}
     steps:
@@ -189,24 +193,48 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
-      # ── Rust Lambdas (no build cache: a release builds from scratch) ──
+      # ── Rust Lambdas ───────────────────────────────────────────────
+      # The hosted deploy of this exact commit on main already built them with
+      # scripts/rust-build.sh (deploy.yml, "rust-build"). They're reused only
+      # when that run is deploy.yml on main of this repository and succeeded,
+      # its build is for this commit, its Rust inputs digest
+      # (scripts/rust-inputs.mjs) is this tag's, and both zips match the
+      # sha256 it recorded (.github/scripts/rust-build-reuse.sh). Anything
+      # else, a tag cut by hand on a commit that wasn't deployed included,
+      # builds from scratch here with no build cache.
+      - id: inputs
+        name: What the Lambdas are built from
+        run: echo "digest=$(node scripts/rust-inputs.mjs)" >> "$GITHUB_OUTPUT"
+      - id: reuse
+        name: The deploy of this commit built them
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INPUTS: ${{ steps.inputs.outputs.digest }}
+        run: bash .github/scripts/rust-build-reuse.sh release dist "$INPUTS" "$(git rev-parse "refs/tags/$TAG^{commit}")" >> "$GITHUB_OUTPUT"
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        if: steps.reuse.outputs.hit != 'true'
         with:
           toolchain: stable
           targets: aarch64-unknown-linux-musl
       - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
-      - run: pip3 install --retries 3 --timeout 60 cargo-zigbuild==0.24.0
-      - name: Build gateway and worker
-        working-directory: services
-        run: cargo zigbuild --locked --workspace --release --target aarch64-unknown-linux-musl
-      - name: Package Lambdas
+        if: steps.reuse.outputs.hit != 'true'
+      - if: steps.reuse.outputs.hit != 'true'
+        run: pip3 install --retries 3 --timeout 60 cargo-zigbuild==0.24.0
+      - name: Build gateway and worker (no build cache)
+        if: steps.reuse.outputs.hit != 'true'
+        run: bash scripts/rust-build.sh dist
+      - name: Where the Lambdas come from
+        env:
+          HIT: ${{ steps.reuse.outputs.hit }}
+          BUILD_RUN: ${{ steps.reuse.outputs.build_run }}
+          BUILT_AT: ${{ steps.reuse.outputs.built_at }}
         run: |
-          mkdir -p dist
-          for b in gateway worker; do
-            cp services/target/aarch64-unknown-linux-musl/release/$b bootstrap
-            zip -q -X dist/$b.zip bootstrap
-            rm bootstrap
-          done
+          if [ "$HIT" = true ]; then
+            echo "Lambdas: reused, compiled in deploy run $BUILD_RUN at $BUILT_AT (same Rust inputs as $TAG)"
+          else
+            echo "Lambdas: built in this run"
+          fi
+          sha256sum dist/gateway.zip dist/worker.zip
 
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:

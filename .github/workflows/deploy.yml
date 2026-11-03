@@ -54,6 +54,12 @@ jobs:
             echo "changed=true" >> "$GITHUB_OUTPUT"
           fi
 
+  # The Rust Lambdas, built once per change to what they're built from: a
+  # deploy whose Rust inputs (scripts/rust-inputs.mjs) match an earlier
+  # successful deploy of main reuses that build after checking its sha256
+  # (.github/scripts/rust-build-reuse.sh); anything else builds. Either way
+  # the run uploads "rust-build" (the zips and rust-build.json), which the
+  # self-host release of this commit reuses the same way (release.yml).
   build:
     name: Build Rust (workspace)
     needs: [gate]
@@ -61,38 +67,56 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
+      actions: read # an earlier deploy's build
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - id: inputs
+        name: What the Lambdas are built from
+        run: echo "digest=$(node scripts/rust-inputs.mjs)" >> "$GITHUB_OUTPUT"
+      - id: reuse
+        name: An earlier deploy built the same inputs
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INPUTS: ${{ steps.inputs.outputs.digest }}
+        run: bash .github/scripts/rust-build-reuse.sh deploy rust-build "$INPUTS" >> "$GITHUB_OUTPUT"
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        if: steps.reuse.outputs.hit != 'true'
         with:
           targets: aarch64-unknown-linux-musl
       # Cache ~/.cargo/registry + services/target in one hit for both crates
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        if: steps.reuse.outputs.hit != 'true'
         with:
           workspaces: services
           cache-on-failure: true
       - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        if: steps.reuse.outputs.hit != 'true'
       - name: Install cargo-zigbuild
-        run: pip3 install --retries 3 --timeout 60 cargo-zigbuild
-      # Build both gateway + worker in one invocation — shared deps compiled once
+        if: steps.reuse.outputs.hit != 'true'
+        run: pip3 install --retries 3 --timeout 60 cargo-zigbuild==0.24.0
+      # The same build the release runs: gateway + worker in one invocation.
       - name: Build workspace
-        working-directory: services
-        run: cargo zigbuild --workspace --release --target aarch64-unknown-linux-musl
-      - name: Package artifacts
+        if: steps.reuse.outputs.hit != 'true'
+        run: bash scripts/rust-build.sh rust-build
+      - name: The build's manifest
+        env:
+          INPUTS: ${{ steps.inputs.outputs.digest }}
+          HIT: ${{ steps.reuse.outputs.hit }}
+          BUILT_AT: ${{ steps.reuse.outputs.built_at }}
+          BUILD_RUN: ${{ steps.reuse.outputs.build_run }}
         run: |
-          cp services/target/aarch64-unknown-linux-musl/release/gateway bootstrap
-          zip gateway.zip bootstrap
-          rm bootstrap
-          cp services/target/aarch64-unknown-linux-musl/release/worker bootstrap
-          zip worker.zip bootstrap
+          if [ "$HIT" != true ]; then BUILT_AT=$GITHUB_SHA; BUILD_RUN=$GITHUB_RUN_ID; fi
+          jq -n --arg inputs "$INPUTS" --arg commit "$GITHUB_SHA" --arg built_at "$BUILT_AT" --arg build_run "$BUILD_RUN" \
+            --arg gw "$(sha256sum rust-build/gateway.zip | cut -d' ' -f1)" --arg wk "$(sha256sum rust-build/worker.zip | cut -d' ' -f1)" \
+            '{inputs: $inputs, commit: $commit, built_at: $built_at, build_run: $build_run, files: {"gateway.zip": $gw, "worker.zip": $wk}}' > rust-build/rust-build.json
+          cat rust-build/rust-build.json
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: gateway
-          path: gateway.zip
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
-        with:
-          name: worker
-          path: worker.zip
+          name: rust-build
+          path: rust-build/
+          if-no-files-found: error
 
   deploy:
     name: CDK Deploy
@@ -113,12 +137,14 @@ jobs:
 
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
-          name: gateway
+          name: rust-build
           path: artifacts/
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
-        with:
-          name: worker
-          path: artifacts/
+      - name: The build is the one its manifest lists
+        working-directory: artifacts
+        run: |
+          for f in gateway.zip worker.zip; do
+            echo "$(jq -r --arg f "$f" '.files[$f]' rust-build.json)  $f"
+          done | sha256sum -c -
 
       - uses: aws-actions/configure-aws-credentials@7474bc4690e29a8392af63c5b98e7449536d5c3a # v4.3.1
         with:
