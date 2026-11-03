@@ -1,6 +1,6 @@
 ---
 title: Sign-in and people
-description: One organization per install, who may join (invites and allowed email domains), required two-factor sign-in, GitHub accounts, install admins and team roles.
+description: One organization per install, how people join (an admin's invite), required two-factor sign-in, GitHub accounts, install admins and team roles.
 order: 6.5
 ---
 
@@ -8,10 +8,11 @@ Accounts live in a Cognito user pool in your AWS account. A self-hosted install 
 
 ## Who may join
 
-People join in one of two ways:
+Admins add people. An admin invites someone by email in **Settings, Team**; the invite email has a link that opens the account form, where they set their password. The invite works for 30 days; resend it from **Pending invites**.
 
-- **An invite.** An admin invites them by email in **Settings, Team**. The invite works for 30 days; resend it from **Pending invites**.
-- **An allowed email domain.** Admins can let anyone with an email at a domain join, such as `example.com`, in **Settings, Sign-in**. They join as members. Public email services (Gmail, Outlook and the like) can't be allowed: that would let anyone in.
+The sign-in page has no open sign-up: it shows **Sign in** only, and says new people come in through an invite. The account form opens only from an invite email's link (`/?invite=1`) or, for the first admin, the installer's link (`/?signup=1`).
+
+An install whose setup listed email domains (`signup.domains`, or **Anyone with an email at** in the install guide) also lets people at those domains join; they appear in **Settings, Sign-in**, where an admin can remove them. New domains can't be added there.
 
 Everyone else is refused, on every way in: email sign-up, GitHub, and the Cognito API itself. A pre-sign-up trigger in the user pool checks the same rules as CoderHelm, so even a direct Cognito `SignUp` call with the app's client id is refused.
 
@@ -19,12 +20,12 @@ The first admin is the address you gave the install (the Launch Stack's **Your e
 
 ### At install time
 
-The install guide's **Let people from your company join** starts as **Only people I invite**. Pick **Anyone with an email at** and type your company's domain to allow it from the start. The config's `signup.domains` and `signup.emails` do the same: on first boot the domains become the allowed domains and the addresses become invites. After that, admins change both in **Settings** (the config is not read again).
+The install guide's **Let people from your company join** starts as **Only people I invite**. Pick **Anyone with an email at** and type your company's domain to allow it from the start. The config's `signup.domains` and `signup.emails` do the same: on first boot the domains become the allowed domains and the addresses become invites. After that, admins invite people in **Settings, Team** and can remove listed domains in **Settings, Sign-in** (the config is not read again).
 
 | Setting | First boot | After |
 |---|---|---|
 | `admins` | The first admin (the first one to sign in makes the organization); the others are invited as admins | Install admins (see below) |
-| `signup.domains` | Allowed email domains | **Settings, Sign-in** |
+| `signup.domains` | Allowed email domains | Shown in **Settings, Sign-in**, where they can be removed |
 | `signup.emails` | Invited as members | **Settings, Team** |
 | `signup.requireTwoFactor` | Two-factor sign-in required | **Settings, Sign-in** |
 
