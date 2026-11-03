@@ -177,12 +177,75 @@ impl BranchStart {
         match self {
             BranchStart::Created => format!("Created branch {branch} from {base}"),
             BranchStart::Reset => format!(
-                "Reset branch {branch} to {base} (a leftover branch with no open pull request)"
+                "Restarted branch {branch} from {base}: an earlier attempt left it with no open \
+                 pull request, so its commits were dropped and the work starts over there"
             ),
             BranchStart::KeptOpenPr => format!(
                 "Branch {branch} has an open pull request: continuing from its head, nothing reset"
             ),
         }
+    }
+}
+
+/// What a run may do with its existing branch before it starts work.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ResetDecision {
+    /// Only CoderHelm's own commits and no open pull request: restart it.
+    Reset,
+    /// An open pull request: keep its head, never reset.
+    KeepOpenPr,
+    /// Commits someone else made (their names): leave the branch alone.
+    NotOurs(Vec<String>),
+}
+
+/// A commit CoderHelm made: its GitHub author is a bot (an app's
+/// `name[bot]`), or, with no linked account, its author email is a bot's
+/// noreply address.
+pub fn is_bot_commit(c: &serde_json::Value) -> bool {
+    let a = &c["author"];
+    if a["type"].as_str() == Some("Bot")
+        || a["login"].as_str().is_some_and(|l| l.ends_with("[bot]"))
+    {
+        return true;
+    }
+    a.is_null()
+        && c["commit"]["author"]["email"]
+            .as_str()
+            .is_some_and(|e| e.ends_with("[bot]@users.noreply.github.com"))
+}
+
+/// Whether a run's existing branch may be restarted from its base: never
+/// with an open pull request, never when any commit ahead of the base
+/// (`ahead`, from a compare) was made by someone other than CoderHelm, and
+/// never when the list may be cut short (`complete` false).
+pub fn reset_decision(
+    has_open_pr: bool,
+    ahead: &[serde_json::Value],
+    complete: bool,
+) -> ResetDecision {
+    if has_open_pr {
+        return ResetDecision::KeepOpenPr;
+    }
+    let mut who: Vec<String> = ahead
+        .iter()
+        .filter(|c| !is_bot_commit(c))
+        .map(|c| {
+            c["author"]["login"]
+                .as_str()
+                .or_else(|| c["commit"]["author"]["name"].as_str())
+                .unwrap_or("someone")
+                .to_string()
+        })
+        .collect();
+    who.sort();
+    who.dedup();
+    if !complete && who.is_empty() {
+        who.push("commits past the 250 GitHub lists".to_string());
+    }
+    if who.is_empty() {
+        ResetDecision::Reset
+    } else {
+        ResetDecision::NotOurs(who)
     }
 }
 
@@ -1329,6 +1392,28 @@ impl GitHubClient {
                     "Branch has an open PR — continuing from its head, NOT resetting to base"
                 );
                 return Ok((head, BranchStart::KeptOpenPr));
+            }
+            // Only CoderHelm's own branch is restarted: every commit it holds
+            // past the base must be CoderHelm's. A person's commits on it are
+            // never thrown away.
+            let ahead = self
+                .compare_commits(owner, repo, from_ref, branch, 250)
+                .await
+                .map_err(|e| {
+                    format!(
+                        "branch {branch} already exists and its commits couldn't be read ({e}); \
+                         it was left as it is"
+                    )
+                })?;
+            let complete = ahead.len() < 250;
+            if let ResetDecision::NotOurs(who) = reset_decision(false, &ahead, complete) {
+                return Err(format!(
+                    "branch {branch} already exists with commits CoderHelm didn't make ({}) and no \
+                     open pull request, so it wasn't restarted. Open a pull request from it to \
+                     continue there, or rename or delete it to start over",
+                    who.join(", ")
+                )
+                .into());
             }
             let update_url = format!("{API_BASE}/repos/{owner}/{repo}/git/refs/heads/{branch}");
             let data = self
@@ -3873,6 +3958,41 @@ pub fn commits_all_by(compare: &serde_json::Value, login: &str) -> bool {
 
 #[cfg(test)]
 mod rebase_tests {
+    #[test]
+    fn a_leftover_branch_restarts_only_when_it_is_coderhelms_and_has_no_pr() {
+        let bot = serde_json::json!({"author": {"login": "acme-coderhelm[bot]", "type": "Bot"}});
+        let bot_email = serde_json::json!({
+            "author": null,
+            "commit": {"author": {"name": "x", "email": "123+acme-coderhelm[bot]@users.noreply.github.com"}}
+        });
+        let person = serde_json::json!({"author": {"login": "pat", "type": "User"}});
+        let unlinked = serde_json::json!({
+            "author": null,
+            "commit": {"author": {"name": "Sam Doe", "email": "sam@example.com"}}
+        });
+        // CoderHelm's commits only, no pull request: restart.
+        assert_eq!(
+            reset_decision(false, &[bot.clone(), bot_email.clone()], true),
+            ResetDecision::Reset
+        );
+        assert_eq!(reset_decision(false, &[], true), ResetDecision::Reset);
+        // An open pull request: never reset.
+        assert_eq!(
+            reset_decision(true, std::slice::from_ref(&bot), true),
+            ResetDecision::KeepOpenPr
+        );
+        // A person's commit on it: left alone, and the note names them.
+        assert_eq!(
+            reset_decision(false, &[bot.clone(), person, unlinked], true),
+            ResetDecision::NotOurs(vec!["Sam Doe".to_string(), "pat".to_string()])
+        );
+        // A list GitHub may have cut short: not restarted.
+        assert!(matches!(
+            reset_decision(false, &[bot], false),
+            ResetDecision::NotOurs(_)
+        ));
+    }
+
     use super::*;
     use serde_json::json;
 
