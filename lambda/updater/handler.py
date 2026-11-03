@@ -74,6 +74,7 @@ import logging
 import os
 import re
 import time
+import urllib.error
 import urllib.request
 import uuid
 import hashlib
@@ -91,6 +92,10 @@ STALE_SECONDS = 3 * 24 * 3600
 RELEASE_REPO = "CoderHelm/coderhelm-platform"
 RELEASES_URL = f"https://api.github.com/repos/{RELEASE_REPO}/releases?per_page=30"
 RUNNING_STALE = timedelta(hours=3)
+# Who started an update when the call names no one: the dashboard always
+# sends the signed-in admin, the install guide and the auto-update window name
+# themselves, so a call without an actor is a direct invoke of this Lambda.
+DIRECT_ACTOR = "AWS CLI"
 # A refused model is checked again this often (and a pass re-proven before applying).
 MODEL_RETRY = timedelta(days=1)
 PK = "SYSTEM"
@@ -1097,6 +1102,11 @@ def domain_finished(store, env, now, entry, status):
 # submits a form for anyone: those stay a person's action in the console.
 
 
+class ReleaseNotReady(ValueError):
+    """The release isn't ready to apply yet (still publishing, or its release
+    check hasn't verified it): a wait. Nothing is recorded in history."""
+
+
 class ModelsBlocked(ValueError):
     """Update now refused by the model check (the record goes with it)."""
 
@@ -1544,7 +1554,7 @@ def set_uninstall_mode(store, env, now, event, ssm=None):
         except Exception as e:
             if "ParameterNotFound" not in type(e).__name__ + str(e):
                 raise
-    actor = event.get("actor") or "unknown"
+    actor = event.get("actor") or DIRECT_ACTOR
     rec = {"delete_data": delete, "actor": actor, "at": now.isoformat()}
     store.put("UNINSTALL", rec)
     store.put("UNINSTALL_LOG", ([rec] + (store.get("UNINSTALL_LOG", []) or []))[:20])
@@ -1583,14 +1593,21 @@ def native_propose(store, env, version, mode, extra=None, cfn=None, opener=None)
     """Creates the change set. Returns {change_set_id, apply}."""
     cfn = cfn or client("cloudformation")
     url = native_template_url(env, version)
-    body = fetch_template(url, opener)
+    try:
+        body = fetch_template(url, opener)
+    except urllib.error.HTTPError as e:
+        # The release publishes its stack template last, and S3 answers a
+        # key that isn't there yet with 403 (listing isn't public) or 404.
+        if e.code in (403, 404):
+            raise ReleaseNotReady(f"{version} is still publishing; try again in a minute") from e
+        raise
     rec = store.get(f"MANIFEST#{version}") or {}
     want = rec.get("template_sha256")
     if not want:
         # Every change set, a domain move included, is made only from a template the release check verified.
         if mode == "domain":
             start_verify(store, env, datetime.now(timezone.utc), version)
-        raise ValueError(f"{version}'s stack template isn't verified yet (its release check reports it); try again in a few minutes")
+        raise ReleaseNotReady(f"{version}'s stack template isn't verified yet (its release check reports it); try again in a few minutes")
     got = hashlib.sha256(body).hexdigest()
     if got != want:
         raise ValueError(f"{version}'s stack template doesn't match its signed checksum, so it was not proposed")
@@ -1988,8 +2005,20 @@ def app_url(env):
     return (env.get("APP_URL") or "").rstrip("/")
 
 
+def not_started_reason(e):
+    """Plain words for why an update didn't start (nothing was changed)."""
+    if isinstance(e, ValueError):
+        return str(e)[:500]
+    return f"couldn't prepare the update ({type(e).__name__}: {str(e)[:200]}); nothing was changed, try again"
+
+
 def begin(store, env, now, version, actor, mode, extra=None, note=None):
-    """Records the update in history and starts the build."""
+    """Starts the update and records it in history.
+
+    History holds updates that started: the row is written once the change
+    set (or the build) exists. A wait (the release still publishing or not
+    verified yet) writes nothing; any other refusal before anything changed
+    is recorded as not_started with its reason, never as failed."""
     state = store.get("UPDATE_STATE", {})
     if running(state, now):
         raise ValueError("an update is already running")
@@ -2001,22 +2030,55 @@ def begin(store, env, now, version, actor, mode, extra=None, note=None):
              "status": "running", "started_at": now.isoformat(), "reason": ""}
     if note:
         entry["note"] = note
-    store.put(hid, entry)
+
+    def refused(e):
+        entry.update({"status": "not_started", "reason": not_started_reason(e), "finished_at": now.isoformat()})
+        store.put(hid, entry)
+        if isinstance(e, ValueError):
+            raise e
+        raise ValueError(entry["reason"]) from e
+
     if is_native(env):
         try:
             entry.update(native_propose(store, env, version, mode, extra))
-        except ValueError as e:
-            entry.update({"status": "failed", "reason": str(e)[:500], "finished_at": now.isoformat()})
-            store.put(hid, entry)
+        except ReleaseNotReady:
             raise
+        except Exception as e:  # noqa: BLE001  nothing changed: say so, never leave it running
+            refused(e)
         entry["status"] = "preparing"
     else:
-        build_id = start_build(env, version, actor, mode, hid, extra) if extra else start_build(env, version, actor, mode, hid)
-        entry["build_id"] = build_id
+        store.put(hid, entry)
+        try:
+            entry["build_id"] = start_build(env, version, actor, mode, hid, extra) if extra else start_build(env, version, actor, mode, hid)
+        except Exception as e:  # noqa: BLE001
+            refused(e)
     store.put(hid, entry)
     state.update({"running_since": now.isoformat(), "running_id": hid})
     store.put("UPDATE_STATE", state)
     return dict(entry, id=hid)
+
+
+def history_view(entries, state, now):
+    """History as people read it. A row left running or preparing that isn't
+    the update in progress has ended: one that never made a change set or a
+    build stopped before it changed anything (not_started); one past the
+    running limit ended without a result."""
+    live = {state.get("running_id"), state.get("review_id")} - {None}
+    out = []
+    for h in entries:
+        if h.get("status") in ("running", "preparing") and h.get("id") not in live:
+            if not h.get("change_set_id") and not h.get("build_id"):
+                h = dict(h, status="not_started",
+                         reason=h.get("reason") or "stopped before it changed anything; a later try is the one that counts")
+            else:
+                try:
+                    old = now - datetime.fromisoformat(h.get("started_at") or "") > RUNNING_STALE
+                except ValueError:
+                    old = True
+                if old:
+                    h = dict(h, status="failed", reason=h.get("reason") or "ended without a result; check the stack in AWS")
+        out.append(h)
+    return out
 
 
 def install_identity(env):
@@ -2055,7 +2117,7 @@ def handle(event, env, store, now, fetch=fetch_releases, probe=None):
             # Releases whose last try failed or rolled back: the dashboard's
             # update preflight shows them with the reason from history.
             "failed_versions": sorted(state.get("failed_versions") or []),
-            "history": store.history(),
+            "history": history_view(store.history(), state, now),
             # The model check for the latest release (Settings, System and Setup).
             "model_check": (lambda mc: mc if latest and mc and mc.get("version") == latest["version"] else None)(
                 store.get("MODEL_CHECK")),
@@ -2101,7 +2163,7 @@ def handle(event, env, store, now, fetch=fetch_releases, probe=None):
                 raise ModelsBlocked(blocked_message(mc) + " This release doesn't call it, so you can skip this check.",
                                     dict(mc, skippable=True))
             note = "model check skipped for " + ", ".join(f.get("model", "?") for f in failures(mc))
-        return begin(store, env, now, version, event.get("actor") or "unknown", "update", note=note)
+        return begin(store, env, now, version, event.get("actor") or DIRECT_ACTOR, "update", note=note)
 
     if action == "models_verified":
         # From the release check build, after the signature check. Only a
@@ -2161,7 +2223,7 @@ def handle(event, env, store, now, fetch=fetch_releases, probe=None):
         ran = ran_versions(store, state, current) - {current}
         if target not in ran:
             raise ValueError(f"{target} is not a version this install ran before, so it can't be rolled back to")
-        return begin(store, env, now, target, event.get("actor") or "unknown", "rollback")
+        return begin(store, env, now, target, event.get("actor") or DIRECT_ACTOR, "rollback")
 
     if action == "open_window":
         return open_window(store, env, now, event)
@@ -2219,10 +2281,10 @@ def handle(event, env, store, now, fetch=fetch_releases, probe=None):
         return native_poll(store, env, now)
 
     if action == "domain_set":
-        return domain_set(store, env, now, event.get("hostname"), event.get("actor") or "unknown")
+        return domain_set(store, env, now, event.get("hostname"), event.get("actor") or DIRECT_ACTOR)
 
     if action == "domain_remove":
-        return domain_remove(store, env, now, event.get("actor") or "unknown")
+        return domain_remove(store, env, now, event.get("actor") or DIRECT_ACTOR)
 
     if action == "tick":
         # No update running: no deploy window either.
@@ -2275,5 +2337,7 @@ def handler(event, context):
         return {"ok": True, **handle(event, env, store, now)}
     except ModelsBlocked as e:
         return {"ok": False, "error": str(e), "model_check": e.record}
+    except ReleaseNotReady as e:
+        return {"ok": False, "error": str(e), "waiting": True}
     except ValueError as e:
         return {"ok": False, "error": str(e)}
