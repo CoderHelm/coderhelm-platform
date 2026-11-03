@@ -124,6 +124,13 @@ pub fn hosted_ids() -> impl Iterator<Item = &'static str> {
         .map(|e| e.id)
 }
 
+/// The tools an install picks an app for, one by one (Settings, System,
+/// Hybrid, Other apps, and the install guide): every hosted one but GitHub,
+/// which has its own choice.
+pub fn app_choice_ids() -> impl Iterator<Item = &'static str> {
+    hosted_ids().filter(|id| *id != "github")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -152,6 +159,10 @@ mod tests {
         assert_eq!(
             ids,
             vec!["github", "jira", "notion", "confluence", "google_drive"]
+        );
+        assert_eq!(
+            app_choice_ids().collect::<Vec<_>>(),
+            vec!["jira", "notion", "confluence", "google_drive"]
         );
         assert!(entry("github").is_some() && entry("nope").is_none());
         let j = serde_json::to_value(entry("slack_commands").unwrap()).unwrap();
