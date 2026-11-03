@@ -857,6 +857,7 @@ test("self-host: optional email starts off, own SES, and nothing that mails Code
     assert.equal(env.DEPLOYMENT_KIND, "self-hosted", fn);
     assert.equal(env.OPTIONAL_EMAIL_DEFAULTS, "", fn);
     assert.equal(env.EMAIL_TRANSPORT_DEFAULT, "ses", fn);
+    assert.equal(env.INSTALL_FORM, "config", fn);
     assert.equal(env.HYBRID_EMAIL_FROM, undefined, fn);
     // No CoderHelm address anywhere a service could send to.
     for (const [k, v] of Object.entries(env)) {

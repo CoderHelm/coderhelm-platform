@@ -108,6 +108,10 @@ export function emailEnvironment(cfg: ResolvedConfig): Record<string, string> {
     env.OPTIONAL_EMAIL_DEFAULTS = cfg.integrations.weeklySummary ? "weekly_summary" : "";
     // A native release: the EmailTransport launch parameter.
     env.EMAIL_TRANSPORT_DEFAULT = cfg.native ? cdk.Fn.ref("EmailTransport") : cfg.email.transport;
+    // How this install is set up: one stack from the launch page ("native",
+    // no coderhelm.config.json) or from a config file ("config"). Setup
+    // checks word their fixes for the one this install has.
+    env.INSTALL_FORM = cfg.native ? "native" : "config";
   }
   if (cfg.mailRelay) {
     env.HYBRID_EMAIL_FROM = cfg.mailRelay.from;

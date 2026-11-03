@@ -72,6 +72,9 @@ pub struct Facts {
     /// when the domain has no DMARC record.
     pub dmarc: Option<Option<String>>,
     pub cognito: Option<stats::CognitoSender>,
+    /// One stack from the launch page (`INSTALL_FORM=native`): no
+    /// coderhelm.config.json to edit.
+    pub native: bool,
     pub last_send_at: Option<String>,
     pub last_delivery_at: Option<String>,
 }
@@ -88,6 +91,7 @@ impl Default for Facts {
             production: None,
             dmarc: None,
             cognito: None,
+            native: false,
             last_send_at: None,
             last_delivery_at: None,
         }
@@ -146,6 +150,7 @@ pub async fn facts_now(state: &AppState) -> Facts {
         from: state.config.ses_from_address.clone(),
         region: std::env::var("AWS_REGION").unwrap_or_else(|_| "us-east-1".into()),
         cognito: stats::cognito_sender(),
+        native: native_install(std::env::var("INSTALL_FORM").ok().as_deref()),
         ..Default::default()
     };
     let (own_last, relay) = tokio::join!(
@@ -494,6 +499,11 @@ pub fn sandbox_check(f: &Facts) -> Option<Check> {
     })
 }
 
+/// Whether this install came from the launch page (one stack, no config file).
+pub fn native_install(v: Option<&str>) -> bool {
+    v.map(str::trim) == Some("native")
+}
+
 /// Who sends Amazon Cognito's sign-up codes and password resets.
 pub fn cognito_check(f: &Facts) -> Check {
     let label = "Sign-up and password emails";
@@ -503,6 +513,17 @@ pub fn cognito_check(f: &Facts) -> Check {
             E,
             label,
             format!("Amazon Cognito sends sign-up codes and password resets through this install's SES, from {}.", f.from),
+        ),
+        // A launch-page install has no switch for this yet: Cognito's own
+        // sender is what it has, and it is enough for a small team.
+        Some(stats::CognitoSender::CognitoDefault) if f.native => Check::pass(
+            "email_cognito",
+            E,
+            label,
+            format!(
+                "Amazon Cognito sends sign-up codes and password resets from its own address, about {} a day: enough for a small team. Past that, people wait until the next day to verify an address or reset a password.",
+                stats::COGNITO_DEFAULT_DAILY
+            ),
         ),
         Some(stats::CognitoSender::CognitoDefault) => Check::not_ok(
             Status::Warn,
@@ -808,6 +829,18 @@ mod tests {
         assert_eq!(c[3].status, Status::Warn);
         assert!(c[3].detail.contains("50"));
         assert!(c[3].fix.as_ref().unwrap().text.contains("cognitoUsesSes"));
+        // A launch-page install has no config file: it isn't told to edit one.
+        f.native = true;
+        let c = cognito_check(&f);
+        assert_eq!(c.status, Status::Pass);
+        assert!(c.detail.contains("50") && c.detail.contains("small team"));
+        assert!(c.fix.is_none());
+        assert!(!format!("{c:?}").contains("coderhelm.config.json"));
+        assert!(
+            native_install(Some("native"))
+                && !native_install(Some("config"))
+                && !native_install(None)
+        );
         // Every problem has a fix line.
         for f in [
             ses(Some(IdentityRead::Missing), Some(false)),
