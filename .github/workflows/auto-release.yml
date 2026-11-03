@@ -240,6 +240,14 @@ jobs:
             "$d/SHA256SUMS"
           (cd "$d" && sha256sum -c SHA256SUMS)
 
+      # Only the publish script, at this workflow's own commit: the job runs
+      # nothing from the repository but that file.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+          sparse-checkout: .github/scripts/publish-once.sh
+          sparse-checkout-cone-mode: false
       # Same roles and same writes as release.yml's maintainer path: templates
       # are created once and never replaced, latest.json only moves forward.
       - uses: aws-actions/configure-aws-credentials@7474bc4690e29a8392af63c5b98e7449536d5c3a # v4.3.1
@@ -250,15 +258,11 @@ jobs:
       - name: Upload the templates
         run: |
           d="$RUNNER_TEMP/published"
-          # Written once: a file already there must be this one.
-          put() {
-            if curl --proto =https -fsSL -o "$RUNNER_TEMP/existing" "https://$PUBLIC_BUCKET.s3.amazonaws.com/$2"; then
-              cmp -s "$RUNNER_TEMP/existing" "$1" || { echo "::error::$2 already holds another file"; exit 1; }
-            else
-              aws s3api put-object --bucket "$PUBLIC_BUCKET" --key "$2" --body "$1" --if-none-match '*' --content-type "$3" --cache-control "public, max-age=31536000, immutable" >/dev/null
-            fi
-          }
-          for f in coderhelm-log-reader.yaml coderhelm-log-reader-update.yaml; do put "$d/$f" "launch/$TAG/$f" text/yaml; done
+          # Written once: a key already there must hold this same file
+          # (.github/scripts/publish-once.sh: one conditional PutObject per
+          # file, in parallel, the parent coderhelm.json last).
+          L="$RUNNER_TEMP/publish-list" && : > "$L"
+          for f in coderhelm-log-reader.yaml coderhelm-log-reader-update.yaml; do printf '%s\t%s\t%s\n' "$d/$f" "launch/$TAG/$f" text/yaml >> "$L"; done
           # The native files (infra/lib/native), each checked against the
           # sha256 the signed coderhelm.json pins, then the parent last.
           mkdir -p "$RUNNER_TEMP/native" && tar -xzf "$d/coderhelm-native.tar.gz" -C "$RUNNER_TEMP/native"
@@ -273,9 +277,11 @@ jobs:
             }' > "$RUNNER_TEMP/native-files"
           while read -r k; do
             case "$k" in *.json) ct=application/json ;; *) ct=application/zip ;; esac
-            put "$RUNNER_TEMP/native/$k" "launch/$TAG/$k" "$ct"
+            printf '%s\t%s\t%s\n' "$RUNNER_TEMP/native/$k" "launch/$TAG/$k" "$ct" >> "$L"
           done < "$RUNNER_TEMP/native-files"
-          put "$d/coderhelm.json" "launch/$TAG/coderhelm.json" application/json
+          # The parent last: publish-once.sh uploads it after every other line.
+          printf '%s\t%s\t%s\n' "$d/coderhelm.json" "launch/$TAG/coderhelm.json" application/json >> "$L"
+          bash .github/scripts/publish-once.sh "$L"
           curl --proto =https -fsSL "https://$PUBLIC_BUCKET.s3.amazonaws.com/launch/$TAG/coderhelm.json" | cmp -s - "$d/coderhelm.json" \
             || { echo "::error::the template in S3 is not the signed coderhelm.json"; exit 1; }
       - uses: aws-actions/configure-aws-credentials@7474bc4690e29a8392af63c5b98e7449536d5c3a # v4.3.1

@@ -356,9 +356,10 @@ test("AWS connections: the role and update templates are released with each vers
     assert.ok(wf.includes(`dist/${f}`) && wf.includes(f + " "), `${f} is in SHA256SUMS`);
   }
   // Published write-once under launch/<tag>/, which the publisher role may write.
-  assert.ok(wf.includes('for f in coderhelm-log-reader.yaml coderhelm-log-reader-update.yaml; do put "dist/$f" "launch/$TAG/$f" text/yaml; done'));
-  assert.ok(wf.includes('put dist/coderhelm.json "launch/$TAG/coderhelm.json" application/json'), "the native parent template is published");
-  assert.ok(wf.includes("--if-none-match '*'"), "never replaced");
+  assert.ok(wf.includes(`for f in coderhelm-log-reader.yaml coderhelm-log-reader-update.yaml; do printf '%s\\t%s\\t%s\\n' "dist/$f" "launch/$TAG/$f" text/yaml >> "$L"; done`));
+  assert.ok(wf.includes(`printf '%s\\t%s\\t%s\\n' dist/coderhelm.json "launch/$TAG/coderhelm.json" application/json >> "$L"\n          bash .github/scripts/publish-once.sh "$L"`), "the native parent template is published, last");
+  const publish = fs.readFileSync(path.join(INFRA, "..", ".github", "scripts", "publish-once.sh"), "utf8");
+  assert.ok(publish.includes("--if-none-match '*'"), "never replaced");
   const role = fs.readFileSync(path.join(INFRA, "cfn", "coderhelm-log-reader.yaml"), "utf8");
   assert.ok(role.includes('"sts:ExternalId": !Ref ExternalId'));
   assert.ok(role.includes('"aws:PrincipalArn": !Sub "arn:aws:iam::${CoderHelmAccountId}:role/${TrustedRolePrefix}*"'));
@@ -517,15 +518,23 @@ test("the release roles: only release.yml on a v* tag in the approved release en
   w.hasOutput("ReleaseLatestRoleArn", {});
   // The workflow writes templates only with If-None-Match, and latest.json only with the second role.
   const wf = fs.readFileSync(path.join(INFRA, "..", ".github", "workflows", "release.yml"), "utf8");
+  // Templates go up through .github/scripts/publish-once.sh; latest.json in the workflow.
+  const script = fs.readFileSync(path.join(INFRA, "..", ".github", "scripts", "publish-once.sh"), "utf8");
+  const scriptPuts = script.split("\n").filter((l) => /s3api put-object|aws s3 cp/.test(l));
+  assert.equal(scriptPuts.length, 1, "one write in the publish script");
+  for (const l of scriptPuts) assert.match(l, /--if-none-match '\*'/, l);
+  assert.ok(!/aws s3 cp/.test(script), "no unconditional writes in the publish script");
+  assert.ok(wf.includes("bash .github/scripts/publish-once.sh"), "release.yml publishes through it");
   const puts = wf.split("\n").filter((l) => /s3api put-object|aws s3 cp/.test(l));
-  assert.ok(puts.length >= 3);
+  assert.ok(puts.length >= 1);
   for (const l of puts) assert.match(l, /--if-none-match '\*'|--if-match "\$etag"/, l);
   assert.ok(!/aws s3 cp/.test(wf), "no unconditional writes");
   assert.ok(wf.indexOf("role/coderhelm-prod-release-latest") > wf.indexOf("role/coderhelm-prod-release-publisher"));
   // auto-release.yml: the same conditional writes, in release-auto, after it checked the published release.
   const auto = fs.readFileSync(path.join(INFRA, "..", ".github", "workflows", "auto-release.yml"), "utf8");
   const autoPuts = auto.split("\n").filter((l) => /s3api put-object|aws s3 cp/.test(l));
-  assert.ok(autoPuts.length >= 3);
+  assert.ok(autoPuts.length >= 1);
+  assert.ok(auto.includes("bash .github/scripts/publish-once.sh"), "auto-release.yml publishes through it");
   for (const l of autoPuts) assert.match(l, /--if-none-match '\*'|--if-match "\$etag"/, l);
   assert.ok(!/aws s3 cp/.test(auto));
   assert.ok(auto.includes("environment: release-auto"));

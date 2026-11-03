@@ -46,14 +46,18 @@ jobs:
       - name: The dashboard is pinned by commit
         run: node scripts/check-dashboard-ref.mjs
 
-  rust:
-    name: Rust (workspace)
+  # Lint and tests run side by side; "Rust (workspace)", the required check,
+  # passes only when both did.
+  rust-lint:
+    name: Rust (clippy)
     runs-on: ubuntu-latest
     defaults:
       run:
         working-directory: services
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
           components: rustfmt, clippy
@@ -63,26 +67,48 @@ jobs:
           cache-on-failure: true
       - run: cargo fmt --check --all
       - run: cargo clippy --workspace -- -D warnings
-      # Includes the reviewer evals (worker passes::review_eval): recorded
-      # review histories replayed through the real decision code, no model.
-      - run: cargo test --workspace
 
-  # Every run failure that reached a person, replayed through the pipeline's
-  # decision code with fakes only at the edges (docs/incidents.md).
-  incidents:
-    name: Incident regressions
+  rust-test:
+    name: Rust (tests)
     runs-on: ubuntu-latest
     defaults:
       run:
         working-directory: services
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           workspaces: services
           cache-on-failure: true
-      - run: cargo test -p worker 'incidents::'
+      # Every run failure that reached a person, replayed through the
+      # pipeline's decision code with fakes only at the edges
+      # (docs/incidents.md). Its own step, so a regression names itself.
+      # --workspace on both steps: one feature set, so one build (`-p worker`
+      # alone resolves features differently and compiles everything again).
+      - name: Incident regressions
+        run: cargo test --workspace -- 'incidents::'
+      # Includes the reviewer evals (worker passes::review_eval): recorded
+      # review histories replayed through the real decision code, no model.
+      # The incident suite already ran above, on the same build.
+      - name: Workspace tests
+        run: cargo test --workspace -- --skip 'incidents::'
+
+  rust:
+    name: Rust (workspace)
+    needs: [rust-lint, rust-test]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Clippy and tests passed
+        env:
+          LINT: ${{ needs.rust-lint.result }}
+          TEST: ${{ needs.rust-test.result }}
+        run: |
+          echo "clippy: $LINT, tests: $TEST"
+          [ "$LINT" = success ] && [ "$TEST" = success ]
 
   lambda-tests:
     name: Lambda (Python)

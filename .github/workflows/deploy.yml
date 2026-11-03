@@ -157,8 +157,10 @@ jobs:
 
       - working-directory: infra
         run: npm ci
+      # Stacks with no dependency between them deploy side by side; CDK still
+      # waits for each stack's dependencies, and skips one with no changes.
       - working-directory: infra
-        run: npx cdk deploy --all --require-approval never
+        run: npx cdk deploy --all --require-approval never --concurrency 4
         env:
           GATEWAY_ZIP: ${{ github.workspace }}/artifacts/gateway.zip
           WORKER_ZIP: ${{ github.workspace }}/artifacts/worker.zip
