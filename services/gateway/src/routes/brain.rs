@@ -152,9 +152,10 @@ pub struct Picks {
 /// Something the asker mentioned with @ to narrow a question.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Mention {
-    /// `repo` or `knowledge`.
+    /// `repo`, `knowledge`, or `run` (context only: the run's state goes
+    /// with the question; it doesn't narrow what Chat reads).
     pub kind: String,
-    /// The repository (`owner/name`) or knowledge base id.
+    /// The repository (`owner/name`), knowledge base id or run id.
     pub id: String,
 }
 
@@ -259,6 +260,9 @@ pub struct Thread {
     pub title: String,
     #[serde(default)]
     pub shared: bool,
+    /// Pinned to the top of its owner's chat list.
+    #[serde(default)]
+    pub pinned: bool,
     pub created_at: String,
     pub updated_at: String,
     #[serde(default)]
@@ -398,6 +402,8 @@ fn thread_json(t: &Thread, user_id: &str) -> Value {
         "id": t.id,
         "title": t.title,
         "shared": t.shared,
+        // Pins are the owner's own; a shared chat is never pinned for others.
+        "pinned": t.pinned && t.owner == user_id,
         "mine": t.owner == user_id,
         "owner_email": t.owner_email,
         "created_at": t.created_at,
@@ -451,9 +457,23 @@ pub struct ThreadUpdate {
     pub title: Option<String>,
     #[serde(default)]
     pub shared: Option<bool>,
+    #[serde(default)]
+    pub pinned: Option<bool>,
 }
 
-/// PUT /api/brain/threads/:id — rename, or share with the team.
+/// How many chats one person may pin.
+pub const MAX_PINNED: usize = 5;
+
+/// Whether one more chat may be pinned, given the owner's chats.
+pub fn may_pin(threads: &[Thread], owner: &str, id: &str) -> bool {
+    threads
+        .iter()
+        .filter(|t| t.owner == owner && t.pinned && t.id != id)
+        .count()
+        < MAX_PINNED
+}
+
+/// PUT /api/brain/threads/:id — rename, share with the team, or pin.
 pub async fn update_thread(
     State(state): State<Arc<AppState>>,
     Extension(claims): Extension<Claims>,
@@ -486,6 +506,20 @@ pub async fn update_thread(
     }
     if let Some(shared) = body.shared {
         t.shared = shared;
+    }
+    if let Some(pinned) = body.pinned {
+        if pinned && !t.pinned {
+            let all: Vec<Thread> = query(&state, &claims.team_id, "BRAIN#T#")
+                .await
+                .map_err(|e| internal("chat threads", e))?;
+            if !may_pin(&all, &claims.sub, &t.id) {
+                return Err(fail(
+                    StatusCode::BAD_REQUEST,
+                    &format!("You can pin up to {MAX_PINNED} chats. Unpin one first."),
+                ));
+            }
+        }
+        t.pinned = pinned;
     }
     put(&state, &claims.team_id, &thread_sk(&t.id), &t)
         .await
@@ -668,6 +702,8 @@ pub async fn sources(
 pub struct RecentRun {
     pub title: String,
     pub repo: String,
+    pub id: String,
+    pub status: String,
 }
 
 /// A question the empty chat offers: the words, where they come from, and
@@ -677,6 +713,9 @@ pub struct Starter {
     pub question: String,
     pub why: String,
     pub sources: Picks,
+    /// Runs the question is about (as `run` mentions), sent back with it.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub mentions: Vec<Mention>,
 }
 
 /// How many starter questions the empty chat shows.
@@ -720,6 +759,7 @@ pub fn starter_questions(
             knowledge: vec![id.clone()],
             ..Default::default()
         },
+        mentions: Vec::new(),
     };
     let code = |repo: &str| Picks {
         code: true,
@@ -733,6 +773,7 @@ pub fn starter_questions(
             question: format!("What's the latest on “{}”?", clip(&r.title, 70)),
             why: format!("From recent work in {}", short_repo(&r.repo)),
             sources: code(&r.repo),
+            mentions: Vec::new(),
         })
         .collect();
     // The repository people work in most lately leads.
@@ -742,6 +783,33 @@ pub fn starter_questions(
         .find(|r| repos.contains(r))
         .or(repos.first());
 
+    // Runs waiting on an answer lead: they are what someone has to act on.
+    let waiting: Vec<&RecentRun> = runs
+        .iter()
+        .filter(|r| r.status == common::run_status::NEEDS_INPUT && valid_run_id(&r.id))
+        .take(MAX_RUN_CONTEXT)
+        .collect();
+    if !waiting.is_empty() {
+        push(
+            Starter {
+                question: "What needs my answer?".into(),
+                why: if waiting.len() == 1 {
+                    "1 run is waiting on an answer".into()
+                } else {
+                    format!("{} runs are waiting on an answer", waiting.len())
+                },
+                sources: Picks::default(),
+                mentions: waiting
+                    .iter()
+                    .map(|r| Mention {
+                        kind: "run".into(),
+                        id: r.id.clone(),
+                    })
+                    .collect(),
+            },
+            &mut out,
+        );
+    }
     if let Some(b) = bases.first() {
         push(base_q(b), &mut out);
     }
@@ -754,6 +822,7 @@ pub fn starter_questions(
                 question: format!("How is {} put together?", short_repo(repo)),
                 why: format!("From the {} code", short_repo(repo)),
                 sources: code(repo),
+                mentions: Vec::new(),
             },
             &mut out,
         );
@@ -769,6 +838,7 @@ pub fn starter_questions(
                     repo: Some(repo.clone()),
                     ..Default::default()
                 },
+                mentions: Vec::new(),
             },
             &mut out,
         );
@@ -791,9 +861,10 @@ async fn recent_runs(state: &AppState, team_id: &str) -> Vec<RecentRun> {
         .table_name(&state.config.runs_table_name)
         .key_condition_expression("team_id = :tid")
         .expression_attribute_values(":tid", AttributeValue::S(team_id.to_string()))
-        .projection_expression("#t, #r")
+        .projection_expression("#t, #r, run_id, #s")
         .expression_attribute_names("#t", "title")
         .expression_attribute_names("#r", "repo")
+        .expression_attribute_names("#s", "status")
         .scan_index_forward(false)
         .limit(25)
         .send()
@@ -812,6 +883,8 @@ async fn recent_runs(state: &AppState, team_id: &str) -> Vec<RecentRun> {
                 RecentRun {
                     title: s("title"),
                     repo: s("repo"),
+                    id: s("run_id"),
+                    status: s("status"),
                 }
             })
             .collect(),
@@ -1112,6 +1185,97 @@ struct Run {
     /// Connections the asker can't use yet (offered as a sign-in card).
     missing: Vec<super::chat_policy::Missing>,
     is_admin: bool,
+    /// What the runs the question is about are doing (from `run` mentions).
+    run_note: String,
+}
+
+/// Most runs one question carries as context.
+pub const MAX_RUN_CONTEXT: usize = 5;
+
+/// A run id as the runs table writes them.
+pub fn valid_run_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 64
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+}
+
+/// The run ids a question mentions, checked and at most a few.
+pub fn mentioned_runs(mentions: &[Mention]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for m in mentions.iter().filter(|m| m.kind == "run") {
+        if valid_run_id(&m.id) && !out.contains(&m.id) && out.len() < MAX_RUN_CONTEXT {
+            out.push(m.id.clone());
+        }
+    }
+    out
+}
+
+/// One run, as a question's context: what it is, where it stands, and what
+/// it asked when it waits on an answer.
+pub fn run_context_line(item: &HashMap<String, AttributeValue>) -> String {
+    let s = |k: &str| {
+        item.get(k)
+            .and_then(|v| v.as_s().ok())
+            .cloned()
+            .unwrap_or_default()
+    };
+    let mut line = format!(
+        "- Run {}: \"{}\" in {}, status {}",
+        s("run_id"),
+        clip(&s("title"), 160),
+        s("repo"),
+        s("status")
+    );
+    let pr = s("pr_url");
+    if !pr.is_empty() {
+        line.push_str(&format!(", pull request {pr}"));
+    }
+    let err = s("error");
+    if !err.is_empty() {
+        line.push_str(&format!(". It stopped with: {}", clip(&err, 400)));
+    }
+    let asked: Option<common::run_questions::Asked> = item
+        .get(common::run_questions::FIELD_QUESTIONS)
+        .and_then(|v| v.as_s().ok())
+        .and_then(|j| serde_json::from_str(j).ok());
+    if let Some(a) = asked.filter(|a| !a.questions.is_empty()) {
+        line.push_str(&format!(
+            ". It is waiting on answers to:\n{}",
+            common::run_questions::plain(&a.questions)
+        ));
+    }
+    line.push('\n');
+    line
+}
+
+/// The context note for the runs a question is about, read from this team's
+/// runs only (another team's id finds nothing).
+async fn run_note(state: &AppState, team_id: &str, ids: &[String]) -> String {
+    let mut lines = String::new();
+    for id in ids {
+        let r = state
+            .dynamo
+            .get_item()
+            .table_name(&state.config.runs_table_name)
+            .key("team_id", AttributeValue::S(team_id.to_string()))
+            .key("run_id", AttributeValue::S(id.clone()))
+            .send()
+            .await;
+        match r {
+            Ok(r) => {
+                if let Some(item) = r.item() {
+                    lines.push_str(&run_context_line(item));
+                }
+            }
+            Err(e) => warn!(error = %e, "Chat: couldn't read a run for context"),
+        }
+    }
+    if lines.is_empty() {
+        return String::new();
+    }
+    format!("\nThe question is about these runs of the team (their current state):\n{lines}")
 }
 
 /// The tools this question may call.
@@ -1792,6 +1956,7 @@ pub async fn brain_stream(
                 owner_email: claims.email.clone(),
                 title: common::truncate_str(&question.replace('\n', " "), 80).to_string(),
                 shared: false,
+                pinned: false,
                 created_at: now(),
                 updated_at: now(),
                 messages: 0,
@@ -1902,6 +2067,7 @@ pub async fn brain_stream(
         missing: super::chat_policy::missing_connections(&state, &claims.team_id, &claims.email)
             .await,
         is_admin: claims.holder().holds("integrations"),
+        run_note: run_note(&state, &claims.team_id, &mentioned_runs(&body.mentions)).await,
     };
 
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<Event, std::convert::Infallible>>(256);
@@ -2138,6 +2304,7 @@ async fn answer(
     }
 
     let mut notes = mention_note(&run.code_repos, question);
+    notes.push_str(&run.run_note);
     if !problems.is_empty() {
         notes.push_str(&format!(
             "\nAttached files that couldn't be read: {}\n",
@@ -2264,7 +2431,104 @@ mod tests {
         RecentRun {
             title: title.into(),
             repo: repo.into(),
+            id: String::new(),
+            status: "completed".into(),
         }
+    }
+
+    fn thread_of(owner: &str, id: &str, pinned: bool) -> Thread {
+        Thread {
+            id: id.into(),
+            owner: owner.into(),
+            pinned,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn up_to_five_chats_are_pinned_per_person() {
+        let mut ts: Vec<Thread> = (0..4)
+            .map(|i| thread_of("u1", &format!("t{i}"), true))
+            .collect();
+        ts.push(thread_of("u2", "x", true));
+        assert!(may_pin(&ts, "u1", "t9"), "4 pinned: a fifth is allowed");
+        ts.push(thread_of("u1", "t4", true));
+        assert!(!may_pin(&ts, "u1", "t9"), "5 pinned: a sixth is refused");
+        assert!(
+            may_pin(&ts, "u1", "t4"),
+            "re-pinning one already pinned isn't counted twice"
+        );
+        assert!(may_pin(&ts, "u2", "y"), "another person's pins don't count");
+        // A shared chat shows unpinned to everyone but its owner.
+        let t = thread_of("u1", "t0", true);
+        assert_eq!(thread_json(&t, "u2")["pinned"], false);
+        assert_eq!(thread_json(&t, "u1")["pinned"], true);
+    }
+
+    #[test]
+    fn waiting_runs_lead_the_starters_and_carry_their_ids() {
+        let mut waiting = run("Add a Heading component", "acme/web");
+        waiting.id = "01RUNWAITING".into();
+        waiting.status = "needs_input".into();
+        let repos = vec!["acme/web".to_string()];
+        let s = starter_questions(&[], &repos, &[waiting, run("Fix login", "acme/web")]);
+        assert_eq!(s[0].question, "What needs my answer?");
+        assert_eq!(s[0].why, "1 run is waiting on an answer");
+        assert_eq!(
+            s[0].mentions,
+            vec![Mention {
+                kind: "run".into(),
+                id: "01RUNWAITING".into()
+            }]
+        );
+        // Without waiting runs there is no such starter.
+        let s = starter_questions(&[], &repos, &[run("Fix login", "acme/web")]);
+        assert!(s.iter().all(|x| x.question != "What needs my answer?"));
+    }
+
+    #[test]
+    fn run_mentions_are_checked_capped_and_never_narrow_sources() {
+        let m = |kind: &str, id: &str| Mention {
+            kind: kind.into(),
+            id: id.into(),
+        };
+        let ms = vec![
+            m("run", "01A"),
+            m("run", "01A"),
+            m("run", "bad id;drop"),
+            m("run", "01B"),
+            m("repo", "acme/web"),
+        ];
+        assert_eq!(
+            mentioned_runs(&ms),
+            vec!["01A".to_string(), "01B".to_string()]
+        );
+        let many: Vec<Mention> = (0..9).map(|i| m("run", &format!("01R{i}"))).collect();
+        assert_eq!(mentioned_runs(&many).len(), MAX_RUN_CONTEXT);
+        // A run mention alone leaves Chat reading everything it may.
+        let p = resolve_picks(None, &[m("run", "01A")], &[], &["acme/web".to_string()]);
+        assert!(p.auto);
+    }
+
+    #[test]
+    fn a_run_context_line_says_what_it_waits_on() {
+        let mut item = HashMap::new();
+        let put = |item: &mut HashMap<String, AttributeValue>, k: &str, v: &str| {
+            item.insert(k.to_string(), AttributeValue::S(v.to_string()));
+        };
+        put(&mut item, "run_id", "01RUN");
+        put(&mut item, "title", "Add a Heading component");
+        put(&mut item, "repo", "acme/web");
+        put(&mut item, "status", "needs_input");
+        put(
+            &mut item,
+            "questions",
+            r#"{"questions":[{"id":"q1","question":"Should h2 be the default?"}],"asked_at":""}"#,
+        );
+        let line = run_context_line(&item);
+        assert!(line.contains("Run 01RUN"), "{line}");
+        assert!(line.contains("status needs_input"), "{line}");
+        assert!(line.contains("Should h2 be the default?"), "{line}");
     }
 
     #[test]
