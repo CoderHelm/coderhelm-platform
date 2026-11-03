@@ -86,8 +86,10 @@ jobs:
       # Every run failure that reached a person, replayed through the
       # pipeline's decision code with fakes only at the edges
       # (docs/incidents.md). Its own step, so a regression names itself.
+      # --workspace on both steps: one feature set, so one build (`-p worker`
+      # alone resolves features differently and compiles everything again).
       - name: Incident regressions
-        run: cargo test -p worker 'incidents::'
+        run: cargo test --workspace -- 'incidents::'
       # Includes the reviewer evals (worker passes::review_eval): recorded
       # review histories replayed through the real decision code, no model.
       # The incident suite already ran above, on the same build.
