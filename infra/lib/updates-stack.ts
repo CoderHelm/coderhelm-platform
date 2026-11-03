@@ -533,8 +533,8 @@ export const NATIVE_TEMPLATE_FILE = "coderhelm.json";
 /**
  * A native release's updates (docs DESIGN, "3. Update"): the updater proposes
  * a stack update to a verified release as a change set on the parent stack
- * (`coderhelm-<stage>`) and, only with auto-update on, executes it through the
- * parent's DeployRole. It may pass that role only to CloudFormation, and
+ * (`coderhelm-<stage>`) and executes it through the parent's DeployRole: when an
+ * admin presses Update, or in the maintenance window with auto-update on. It may pass that role only to CloudFormation, and
  * CloudFormation accepts the change set only for this stack, with that role,
  * from a published release template.
  */
@@ -555,7 +555,7 @@ function nativeUpdates(scope: Construct, cfg: ResolvedConfig, fn: lambda.Functio
   }));
   fn.addEnvironment("NATIVE_TEMPLATE_BASE", NATIVE_TEMPLATE_BASE);
   fn.addEnvironment("NATIVE_TEMPLATE_FILE", NATIVE_TEMPLATE_FILE);
-  // "" while auto-update is off (the role exists only with AutoUpdate=on).
+  // The parent's deploy role (every native install has it; "" only on an older parent).
   fn.addEnvironment("DEPLOY_ROLE_ARN", cdk.Fn.ref("DeployRoleArn"));
   // The parent's helper stages the release's child templates before a
   // change set (lambda/native-helper, "stage").
@@ -579,14 +579,14 @@ function nativeUpdates(scope: Construct, cfg: ResolvedConfig, fn: lambda.Functio
     resources: [root],
     conditions: {
       StringLike: { "cloudformation:TemplateUrl": [`${NATIVE_TEMPLATE_BASE}/v*.*.*/${NATIVE_TEMPLATE_FILE}`] },
-      // With auto-update on, only through the stack's own deploy role.
+      // A role only the stack's own deploy role (none only on an older parent without it).
       StringEqualsIfExists: { "cloudformation:RoleArn": deployRole },
     },
   }));
   // A change set with nested stacks makes CloudFormation create one on each
   // part as the caller, so the parts need CreateChangeSet too: only from the
   // staged release's own templates (a part left unchanged comes without a
-  // template URL), and only through the deploy role when auto-update is on.
+  // template URL), and with a role only the deploy role.
   fn.addToRolePolicy(new iam.PolicyStatement({
     sid: "ProposePartUpdates",
     actions: ["cloudformation:CreateChangeSet"],

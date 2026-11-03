@@ -55,7 +55,7 @@ const wildcard = (doc) => statements(doc).some((s) => s.Effect === "Allow" && [s
 const identity = aws("sts", "get-caller-identity");
 const account = identity.Account;
 // A native install is one stack, coderhelm-<stage> (infra/lib/native): its
-// boundary and its optional auto-update role carry no launch id, and it has
+// boundary and its deploy role carry no launch id, and it has
 // no installer or update build at all.
 let parent = null;
 try {
@@ -124,25 +124,20 @@ check("no policy allows *:* on *", star.length === 0, star.join(", "));
 // ── The deploy role and the CDK bootstrap ────────────────────────────────
 
 let deployRoleExists = true;
-if (native && !autoUpdate) {
-  try {
-    aws("iam", "get-role", "--role-name", deployRole);
-    check("no standing deploy role (auto-update is off)", false, `${deployRole} exists: it is left from when auto-update was on (coderhelm-selfhost leftovers lists it)`);
-  } catch (e) {
-    check("no standing deploy role (auto-update is off)", e.code === "NoSuchEntity", e.code === "NoSuchEntity" ? "none" : e.message);
-  }
-  deployRoleExists = false;
-} else try {
+try {
   const d = aws("iam", "get-role", "--role-name", deployRole).Role;
   const trust = statements(d.AssumeRolePolicyDocument);
   const onlyCfn = trust.length === 1 && trust[0].Effect === "Allow" && JSON.stringify(trust[0].Principal) === JSON.stringify({ Service: "cloudformation.amazonaws.com" }) && [trust[0].Action].flat().join() === "sts:AssumeRole";
   check("the deploy role's trust allows CloudFormation only", onlyCfn, JSON.stringify(trust));
 } catch (e) {
-  check("the deploy role's trust allows CloudFormation only", false, `${deployRole}: ${e.message}`);
+  deployRoleExists = false;
+  // A native stack from before every install had the role: its next update adds it.
+  const older = native && e.code === "NoSuchEntity";
+  check("the deploy role's trust allows CloudFormation only", older, older ? `${deployRole}: none yet (an older stack; its next update adds it)` : `${deployRole}: ${e.message}`);
 }
 const stacks = pages((m) => aws("cloudformation", "describe-stacks", ...(m ? ["--next-token", m] : []))).flatMap((p) => p.Stacks ?? []).filter((s) => s.StackName.startsWith(`${prefix}-`) && s.StackName !== `${prefix}-access`);
 if (native) {
-  // With auto-update off a stack runs with the admin's own permissions (no role); with it on, only the deploy role.
+  // A stack updated through the deploy role keeps it; one an admin updated in the console may run with no role.
   const other = [parent, ...stacks].filter((s) => s.RoleARN && s.RoleARN !== deployRoleArn).map((s) => `${s.StackName} (${s.RoleARN})`);
   check("no CoderHelm stack runs with any other role", other.length === 0, other.join(", ") || `${stacks.length + 1} stacks`);
 } else {

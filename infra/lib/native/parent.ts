@@ -4,7 +4,7 @@
  * One stack per install, `coderhelm-<stage>`: the permissions boundary, the
  * install's own assets bucket, the secret, the custom resources' helper
  * (inline code, lambda/native-helper/handler.py), the parts as nested
- * stacks, and the optional auto-update role. Launch Stack creates it, a
+ * stacks, and the deploy role updates apply through. Launch Stack creates it, a
  * stack update to the next release's coderhelm.json updates it, Delete
  * stack removes it.
  */
@@ -129,7 +129,7 @@ export function parameters(): Json {
     Hostname: { Type: "String", Default: "", AllowedPattern: HOST, Description: "Your own domain, e.g. coderhelm.example.com. Empty for a free CloudFront address. CoderHelm requests the certificate; Settings, System shows any DNS records to add and proposes the stack update that moves CoderHelm to it." },
     SignupDomain: { Type: "String", Default: "", AllowedPattern: HOST, Description: "Empty: only people you invite. Or an email domain whose people may join." },
     RequireTwoFactor: { Type: "String", Default: "off", AllowedValues: ["off", "on"], Description: "on makes everyone set up an authenticator app, you included." },
-    AutoUpdate: { Type: "String", Default: "off", AllowedValues: ["off", "on"], Description: "off (the default): CoderHelm prepares each new release as a change set for you to review and execute. on: adds a CloudFormation service role (coderhelm-<name>-deploy) that applies releases in the maintenance window (docs/self-host/security.md)." },
+    AutoUpdate: { Type: "String", Default: "off", AllowedValues: ["off", "on"], Description: "off (the default): an admin applies each new release from Settings, System (Update). on: CoderHelm also applies releases by itself in the maintenance window. Change it later in Settings, System. Either way the CloudFormation service role coderhelm-<name>-deploy applies them (docs/self-host/security.md)." },
     UpdateDay: { Type: "String", Default: "sun", AllowedValues: ["daily", "mon", "tue", "wed", "thu", "fri", "sat", "sun"], Description: "Auto-update's maintenance window: the day." },
     UpdateHour: { Type: "String", Default: "3", AllowedValues: Array.from({ length: 24 }, (_, i) => String(i)), Description: "The window's hour (0 to 23)." },
     UpdateTimezone: { Type: "String", Default: "UTC", AllowedPattern: "^(UTC|[A-Za-z_]+(/[A-Za-z0-9_+-]+)+)$", Description: "The window's time zone, e.g. Europe/Berlin." },
@@ -169,7 +169,9 @@ export function installValue(name: string): Json {
     case "UpdateDefaultsJson":
       return { "Fn::Sub": ['{"auto":${Auto},"channel":"stable","day":"${UpdateDay}","hour":${UpdateHour},"timezone":"${UpdateTimezone}","majors":"ask"}', { Auto: { "Fn::If": ["AutoUpdateOn", "true", "false"] } }] };
     case "RootStackName": return { Ref: "AWS::StackName" };
-    case "DeployRoleArn": return { "Fn::If": ["AutoUpdateOn", { "Fn::GetAtt": ["DeployRole", "Arn"] }, ""] };
+    // Every install has the role: an admin's Update applies through it, and
+    // auto-update (UpdateDefaultsJson) only decides whether it also runs on a schedule.
+    case "DeployRoleArn": return { "Fn::GetAtt": ["DeployRole", "Arn"] };
     // The web part's own parameters (infra/lib/web-stack.ts, nativeDomain).
     case "DomainName": return { "Fn::If": ["HasDomainCert", { Ref: "Hostname" }, ""] };
     case "DomainCertificateArn": return { "Fn::If": ["HasDomainCert", { Ref: "DomainCertificateArn" }, ""] };
@@ -291,7 +293,6 @@ export function buildParent(input: ParentInput): Json {
   // and both listed by the leftover check.
   R.DeployBoundary = {
     Type: "AWS::IAM::ManagedPolicy",
-    Condition: "AutoUpdateOn",
     DeletionPolicy: "Retain",
     UpdateReplacePolicy: "Retain",
     Metadata: { "cfn-lint": { config: { ignore_checks: ["W3011"] } } },
@@ -404,9 +405,11 @@ export function buildParent(input: ParentInput): Json {
       KeyAliasPrefix: sub("alias/coderhelm-${Stage}-"),
     },
   };
+  // On every install, whatever AutoUpdate says: an admin's Update in Settings,
+  // System applies through it too (AutoUpdate only schedules). Its
+  // Description stays as it was so an install that had it sees no change.
   R.DeployRole = {
     Type: "AWS::IAM::Role",
-    Condition: "AutoUpdateOn",
     // A role can't delete itself, and CloudFormation keeps using a stack's
     // role for later operations: kept on delete (the leftover check lists it).
     DeletionPolicy: "Retain",

@@ -220,6 +220,51 @@ pub async fn update_now(
     answer(body)
 }
 
+/// What a request may send to apply a prepared update: the update's id and,
+/// when it would replace or remove data or change permissions, `confirm`:
+/// the token the version route lists with exactly those changes (the
+/// dashboard's confirmation dialog). The updater compares both with the
+/// update it prepared.
+pub fn apply_from(body: &Value) -> Result<(String, String), &'static str> {
+    let id = body.get("id").and_then(Value::as_str).unwrap_or("").trim();
+    if id.is_empty() || id.len() > 80 || !id.starts_with("UPDATE#") {
+        return Err("send the prepared update's id");
+    }
+    let confirm = match body.get("confirm") {
+        None | Some(Value::Null) => "",
+        Some(Value::String(c)) => c.trim(),
+        Some(_) => return Err("confirm must be the token of the changes you confirmed"),
+    };
+    if !(confirm.is_empty()
+        || (confirm.len() == 64 && confirm.bytes().all(|b| b.is_ascii_hexdigit())))
+    {
+        return Err("confirm must be the token of the changes you confirmed");
+    }
+    Ok((id.to_string(), confirm.to_string()))
+}
+
+/// POST /api/system/update/apply: apply the prepared update that waits for
+/// an admin (a native install), through the install's deploy role. Install
+/// admins only; the updater records who applied and what they confirmed.
+pub async fn apply_update(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<Claims>,
+    Json(body): Json<Value>,
+) -> Reply {
+    claims.require_role(3).map_err(status_only)?;
+    allowed(&claims).map_err(status_only)?;
+    let (id, confirm) =
+        apply_from(&body).map_err(|m| (StatusCode::BAD_REQUEST, Json(json!({ "error": m }))))?;
+    warn!(email = %claims.email, id = %id, confirmed = !confirm.is_empty(), "Prepared update apply requested");
+    let body = call(
+        &state,
+        json!({ "action": "apply_update", "history_id": id, "confirm": confirm, "actor": claims.email }),
+    )
+    .await
+    .map_err(status_only)?;
+    answer(body)
+}
+
 /// POST /api/system/update-check: check the next release's models again
 /// now (the update banner's "Check again").
 pub async fn check_update(
@@ -424,6 +469,30 @@ mod tests {
             uninstall_mode_from(&json!({"delete_data": "yes"})),
             Err("send delete_data: true or false")
         );
+    }
+
+    #[test]
+    fn apply_needs_the_updates_id_and_at_most_a_token() {
+        let tok = "a".repeat(64);
+        assert_eq!(
+            apply_from(&json!({"id": "UPDATE#2026-11-03T10:00:00Z#abcd1234"})),
+            Ok(("UPDATE#2026-11-03T10:00:00Z#abcd1234".into(), String::new()))
+        );
+        assert_eq!(
+            apply_from(&json!({"id": "UPDATE#x", "confirm": tok})),
+            Ok(("UPDATE#x".into(), "a".repeat(64)))
+        );
+        assert_eq!(apply_from(&json!({})), Err("send the prepared update's id"));
+        assert_eq!(
+            apply_from(&json!({"id": "MANIFEST#v1.0.0"})),
+            Err("send the prepared update's id")
+        );
+        for bad in [json!(true), json!("yes"), json!("z".repeat(64))] {
+            assert_eq!(
+                apply_from(&json!({"id": "UPDATE#x", "confirm": bad})),
+                Err("confirm must be the token of the changes you confirmed")
+            );
+        }
     }
 
     #[test]
