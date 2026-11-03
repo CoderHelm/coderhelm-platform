@@ -610,8 +610,12 @@ pub async fn login_carry_over_code(
         }
     };
     sign_in::record_success(&state, &key).await;
-    // The code was checked by the CoderHelm they came from.
-    finish_password_login(&state, &email, &auth_result, true).await
+    // Never counted as this CoderHelm's second factor. The code only lets the
+    // CoderHelm they came from release the account (and nothing here can tell
+    // that it was checked, or that this sign-in carried an account over at
+    // all), so the session goes through the same second-factor step as any
+    // password sign-in: asked for its code, or held until one is set up.
+    finish_password_login(&state, &email, &auth_result, false).await
 }
 
 // ── MFA verify ───────────────────────────────────────────────────────
@@ -2900,6 +2904,19 @@ mod github_signin_update_tests {
 
 #[cfg(test)]
 mod first_sign_in_tests {
+
+    #[test]
+    fn a_carried_over_code_never_counts_as_the_second_factor() {
+        // A password and any six digits must not make a session that passed
+        // two-factor: the handler finishes as a plain password sign-in.
+        let src = include_str!("auth.rs");
+        let start = src.find("pub async fn login_carry_over_code").unwrap();
+        let end = start + src[start..].find("\n}\n").unwrap();
+        let body = &src[start..end];
+        assert!(body.contains("finish_password_login(&state, &email, &auth_result, false)"));
+        assert!(!body.contains("auth_result, true)"));
+    }
+
     use super::*;
 
     fn rec(
