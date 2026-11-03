@@ -656,30 +656,50 @@ pub fn uses_reserved_wording(s: &str) -> bool {
     RESERVED_PHRASES.iter().any(|p| joined.contains(p))
 }
 
-/// Top-level domains that turn a word into a link in mail apps. File
-/// extensions that are also country domains (`.md`, `.rs`, `.py`, `.sh`) are
-/// left out so PR titles keep their file names.
-const TLDS: &[&str] = &[
-    "com", "net", "org", "io", "co", "ai", "app", "dev", "xyz", "info", "biz", "me", "us", "uk",
-    "ru", "cn", "link", "click", "top", "site", "online", "live", "support", "help", "security",
-    "page", "cc", "tk", "ly", "gl", "gg", "de", "fr", "nl", "eu", "in", "jp", "br", "au", "ca",
-    "tv", "ws", "su", "ml", "ga", "cf", "gq", "icu", "buzz", "shop", "store", "email", "mail",
-    "login", "account", "cloud", "tech", "zip", "mov", "work", "today", "run", "website", "space",
-    "fun", "pw", "ink", "bank", "pro", "es", "it", "ch", "se", "no", "fi", "pl", "kr", "tw", "hk",
-    "sg", "nz", "za", "mx", "ar", "cl", "id", "vn", "th", "my", "ph", "tr", "ir", "ua", "ro",
-];
+/// Every top-level domain (IANA's list, `tlds.txt`, refreshed with the
+/// version line at its top): any of them turns a word into a link in mail
+/// apps.
+const IANA_TLDS: &str = include_str!("tlds.txt");
+
+/// File extensions that are also country domains, left out so PR titles keep
+/// their file names.
+const FILE_EXTENSION_TLDS: &[&str] = &["md", "rs", "py", "sh"];
+
+fn is_tld(tld: &str) -> bool {
+    !FILE_EXTENSION_TLDS.contains(&tld)
+        && IANA_TLDS
+            .lines()
+            .filter(|l| !l.starts_with('#'))
+            .any(|l| l.trim() == tld)
+}
+
+/// Dots mail apps also read as dots: ideographic (U+3002), full-width
+/// (U+FF0E) and half-width ideographic (U+FF61).
+fn ascii_dots(s: &str) -> String {
+    s.chars()
+        .map(|c| match c {
+            '\u{3002}' | '\u{FF0E}' | '\u{FF61}' => '.',
+            c => c,
+        })
+        .collect()
+}
 
 const LINK_REMOVED: &str = "[link removed]";
 
 fn looks_like_link(token: &str) -> bool {
     let t = token.trim_matches(|c: char| {
-        !c.is_alphanumeric() && c != '/' && c != ':' && c != '@' && c != '.' && c != '-'
+        !c.is_alphanumeric()
+            && !matches!(
+                c,
+                '/' | ':' | '@' | '.' | '-' | '\u{3002}' | '\u{FF0E}' | '\u{FF61}'
+            )
     });
     if t.is_empty() {
         return false;
     }
-    let lower = t.to_lowercase();
-    if lower.contains("://") || lower.starts_with("www.") {
+    let lower = ascii_dots(&t.to_lowercase());
+    // `hxxp://`, `hxxps[:]//`: a defanged link a reader puts back together.
+    if lower.contains("://") || lower.starts_with("www.") || lower.contains("hxxp") {
         return true;
     }
     for scheme in [
@@ -721,7 +741,7 @@ fn looks_like_link(token: &str) -> bool {
     let labels_ok = host
         .split('.')
         .all(|l| !l.is_empty() && l.chars().all(|c| c.is_ascii_alphanumeric() || c == '-'));
-    labels_ok && TLDS.contains(&tld)
+    labels_ok && is_tld(tld)
 }
 
 /// Plain text with every link-looking word taken out, and no control
@@ -1123,6 +1143,46 @@ mod tests {
             link_value("https://acme.coderhelm.com/settings/", &hosts).as_deref(),
             Some("https://acme.coderhelm.com/settings/")
         );
+    }
+
+    #[test]
+    fn every_top_level_domain_and_wide_dots_read_as_links() {
+        for t in [
+            "acme-reset.vip/login",
+            "x.bond",
+            "x.sbs",
+            "x.cfd",
+            "x.lol",
+            "x.cx",
+            "x.club",
+            "x.monster",
+        ] {
+            assert!(looks_like_link(t), "{t}");
+        }
+        assert!(looks_like_link("evil\u{3002}com"));
+        assert!(looks_like_link("evil\u{FF0E}com/reset"));
+        assert!(looks_like_link("evil\u{FF61}com"));
+        assert!(looks_like_link("hxxps://evil[.]com"));
+        // File names in PR titles stay.
+        for t in ["README.md", "main.rs", "setup.py", "build.sh"] {
+            assert!(!looks_like_link(t), "{t}");
+        }
+        assert!(plain("see acme-reset.vip now", true).contains("[link removed]"));
+    }
+
+    #[test]
+    fn the_vendored_tld_list_is_complete_enough() {
+        let n = IANA_TLDS
+            .lines()
+            .filter(|l| !l.starts_with('#') && !l.trim().is_empty())
+            .count();
+        assert!(n > 1000, "{n}");
+        assert!(IANA_TLDS.lines().filter(|l| !l.starts_with('#')).all(|l| l
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')));
+        for t in ["com", "net", "org", "io", "vip", "xn--p1ai"] {
+            assert!(is_tld(t), "{t}");
+        }
     }
 
     use super::*;

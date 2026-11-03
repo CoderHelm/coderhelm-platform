@@ -1328,6 +1328,11 @@ async fn main() -> Result<(), Error> {
             "/unsubscribe",
             get(routes::email::unsubscribe_link).post(routes::email::unsubscribe_one_click),
         )
+        // An outside address confirming it wants a support ticket's emails.
+        .route(
+            "/support-copy",
+            get(routes::support::copy_confirm_page).post(routes::support::copy_confirm),
+        )
         .layer(axum_middleware::from_fn_with_state(
             state.clone(),
             middleware::rate_limit::rate_limit_email,

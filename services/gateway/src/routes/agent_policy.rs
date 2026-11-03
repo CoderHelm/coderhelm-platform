@@ -1164,7 +1164,11 @@ async fn email_approver(state: &AppState, team_id: &str, email: &str) -> Option<
 
 /// POST /agent-approvals/link: the Approve or Deny button on an email
 /// link's page.
-pub async fn link_answer(State(state): State<Arc<AppState>>, Form(f): Form<LinkForm>) -> Response {
+pub async fn link_answer(
+    State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+    Form(f): Form<LinkForm>,
+) -> Response {
     let now_s = chrono::Utc::now().timestamp();
     let c = match links::verify(&state.secrets.jwt_secret, f.t.trim(), now_s) {
         Ok(c) if c.channel == Channel::Email && !c.recipient.is_empty() => c,
@@ -1183,6 +1187,24 @@ pub async fn link_answer(State(state): State<Arc<AppState>>, Form(f): Form<LinkF
             )
         }
     };
+    // The link names who it was sent to; only that person, signed in in this
+    // browser, may answer with it.
+    if !crate::middleware::auth::signed_in_as(
+        &headers,
+        &state.secrets.jwt_secret,
+        &c.team_id,
+        &c.recipient,
+    ) {
+        return page(
+            StatusCode::FORBIDDEN,
+            "Approval link",
+            &format!(
+                "<h1>Sign in to CoderHelm as {} in this browser, then press the button again.</h1><p><a href=\"{}\">Sign in</a></p>",
+                esc(&c.recipient),
+                esc(common::public_urls::app_url_from_env())
+            ),
+        );
+    }
     let approve = match f.action.as_str() {
         "approve" => true,
         "deny" => false,

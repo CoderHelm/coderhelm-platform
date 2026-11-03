@@ -1530,6 +1530,7 @@ pub async fn member_removed(state: &AppState, team: &str, email: &str, by: &str)
 /// the version the link names, as the approver it names.
 pub async fn email_approve(
     State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
     axum::Form(f): axum::Form<EmailDecision>,
 ) -> Response {
     let (link, a, kv) = match link_draft(&state, &f.t).await {
@@ -1543,6 +1544,26 @@ pub async fn email_approve(
         }
     };
     let team = link.team_id.as_str();
+    // Only the approver the link names, signed in in this browser, may answer.
+    if !crate::middleware::auth::signed_in_as(
+        &headers,
+        &state.secrets.jwt_secret,
+        team,
+        &link.email,
+    ) {
+        return (
+            StatusCode::FORBIDDEN,
+            page(
+                "Sign in first",
+                &format!(
+                    "<p>Sign in to CoderHelm as {} in this browser, then press the button again.</p><p><a href=\"{}\">Sign in</a></p>",
+                    esc(&link.email),
+                    esc(common::public_urls::app_url_from_env())
+                ),
+            ),
+        )
+            .into_response();
+    }
     let who = match email_actor(&state, team, &link.email).await {
         Ok(w) => w,
         Err(e) => {

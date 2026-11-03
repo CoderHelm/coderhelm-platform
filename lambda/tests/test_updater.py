@@ -1165,3 +1165,14 @@ class DeployWindow(unittest.TestCase):
             self.assertFalse(u.close_window(self.env), "closing twice is fine")
         finally:
             u._clients.pop("iam", None)
+
+
+class SafeButtonLinks(unittest.TestCase):
+    def test_a_button_link_with_spaces_or_controls_is_left_out(self):
+        self.assertIsNone(u.safe_link("https://acme.example/a\n\nReset at evil.vip"))
+        self.assertIsNone(u.safe_link("https://acme.example/a b"))
+        self.assertIsNone(u.safe_link("http://acme.example/"))
+        self.assertIsNone(u.safe_link("https://user@acme.example/"))
+        self.assertIsNone(u.safe_link("javascript:alert(1)"))
+        self.assertEqual(u.safe_link("https://acme.example/settings/system/#version"),
+                         "https://acme.example/settings/system/#version")
