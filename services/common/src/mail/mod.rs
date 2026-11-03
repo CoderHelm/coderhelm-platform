@@ -13,6 +13,8 @@
 //!   "Through CoderHelm" and the install is registered for hybrid. Nothing
 //!   falls back to another sender: a relay that can't be reached is a failed
 //!   send, shown in Deliveries.
+//! - The From name and subjects follow the sender name an admin set in
+//!   Settings, Emails ([`sender_name`]), else the config's.
 //! - A self-hosted install never emails a CoderHelm address
 //!   ([`relay::is_coderhelm_address`]), by either route.
 //!
@@ -22,6 +24,7 @@
 
 pub mod naming;
 pub mod relay;
+pub mod sender_name;
 pub mod stats;
 pub mod templates;
 
@@ -377,7 +380,11 @@ pub async fn send(s: &Sender<'_>, mail: &Mail) -> Result<Route, SendError> {
         Ok(Route::Ses) => send_ses(s, mail).await.map(|_| Route::Ses),
         Ok(Route::Relay) => {
             let creds = creds.ok_or_else(|| err("relay_not_registered", "Not registered."))?;
-            send_relay(s.http, &creds, mail).await.map(|_| Route::Relay)
+            let stored = sender_name::load_for_send(s.dynamo, s.settings_table).await;
+            let org = sender_name::relay_org(stored.as_ref(), naming::org_from_env());
+            send_relay(s.http, &creds, mail, org)
+                .await
+                .map(|_| Route::Relay)
         }
         Err(code) => Err(err(
             code,
@@ -441,6 +448,11 @@ async fn send_ses(s: &Sender<'_>, mail: &Mail) -> Result<(), SendError> {
     } else {
         mail.template
     });
+    let stored = if deployment() == Deployment::Hosted {
+        None
+    } else {
+        sender_name::load_for_send(s.dynamo, s.settings_table).await
+    };
     let tag = aws_sdk_sesv2::types::MessageTag::builder()
         .name(stats::KIND_TAG)
         .value(kind)
@@ -448,7 +460,7 @@ async fn send_ses(s: &Sender<'_>, mail: &Mail) -> Result<(), SendError> {
         .map_err(|e| err("email_failed", e.to_string()))?;
     s.ses
         .send_email()
-        .from_email_address(ses_from(s.from))
+        .from_email_address(ses_from(s.from, stored.as_ref()))
         .destination(Destination::builder().to_addresses(&mail.to).build())
         .content(content)
         .email_tags(tag)
@@ -470,14 +482,16 @@ async fn send_ses(s: &Sender<'_>, mail: &Mail) -> Result<(), SendError> {
 }
 
 /// The install's own SES From line: its address with a name
-/// ([`naming::ses_display_name`]) on a self-hosted install. A sender that
-/// already carries a name, and the hosted deployment's, stay as they are.
-pub fn ses_from(from: &str) -> String {
+/// ([`sender_name::ses_name`]: the admin's setting, else the config's, else
+/// the install's address) on a self-hosted install. A sender that already
+/// carries a name, and the hosted deployment's, stay as they are.
+pub fn ses_from(from: &str, stored: Option<&sender_name::SenderName>) -> String {
     if deployment() == Deployment::Hosted || from.contains('<') {
         return from.to_string();
     }
     let app = crate::public_urls::app_url_from_env();
-    let name = naming::ses_display_name(
+    let name = sender_name::ses_name(
+        stored,
         std::env::var("EMAIL_FROM_NAME").ok().as_deref(),
         std::env::var("ORGANIZATION_NAME").ok().as_deref(),
         crate::public_urls::host_of(app),
@@ -489,10 +503,13 @@ pub fn ses_from(from: &str) -> String {
 /// Sends through CoderHelm's relay. An address the relay doesn't know yet is
 /// listed once (as a member, vouched for by an install admin) and the send
 /// tried again; invites are listed by the invite handler before sending.
+/// `org` names the install in the From name and subjects
+/// ([`sender_name::relay_org`]); the relay checks it.
 async fn send_relay(
     http: &reqwest::Client,
     creds: &crate::hybrid::client::Credentials,
     mail: &Mail,
+    org: Option<String>,
 ) -> Result<(), SendError> {
     // Checked here too, so a mistake shows on the install with the reason.
     let t = templates::get(mail.template)
@@ -503,7 +520,7 @@ async fn send_relay(
         template: t.id.to_string(),
         params: mail.params.clone(),
         contact: install_admin(),
-        org: naming::org_from_env(),
+        org: org.clone(),
     };
     let call = |r: relay::SendRequest| async move {
         let body = serde_json::to_value(&r).unwrap_or(Value::Null);

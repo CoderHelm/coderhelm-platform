@@ -68,6 +68,15 @@ The install guide (`GET /api/setup/status`) shows one `email` check, never block
 
 It used to answer `unknown` whenever any read failed. Three things led there on a working install: it asked SES for the sender's domain even when the identity is one address, it judged an install that sends through CoderHelm (no SES sender at all) on SES, and an account it couldn't read looked like everything else. Each now has its own code and fix.
 
+## Sender name
+
+An install admin sets who email says it is from in **Settings, Emails, Sender name**, without an update:
+
+- **Sender name** is the whole name on mail sent through your own Amazon SES, as typed (`Acme Robots`): one line, at most 64 characters, no quotes or angle brackets.
+- **Organization name** names your install on mail sent through CoderHelm: the From name is `Acme CoderHelm` and subjects start with `Acme CoderHelm: `. It follows the rules in [Send through CoderHelm](#send-through-coderhelm), and CoderHelm checks it again on every email. Left empty, the sender name is used without a trailing "CoderHelm".
+
+Both win over `email.fromName` and `email.organization` in the config; cleared, those apply again. The page previews the From line and a subject for the route in use. Sign-up codes and password resets come from Amazon Cognito, which keeps the config's sender.
+
 ## What was sent
 
 **Deliveries** counts email by kind (sign-in and invites, password resets, run and review notices, the weekly summary, alerts): sent, delivered, bounced, complaints and rejected, from Amazon SES's own events, for either sender. See [Deliveries](./deliveries.md#email).

@@ -426,6 +426,36 @@ def email_transport(env):
     return t if t in ("ses", "coderhelm") else "ses"
 
 
+def with_sender_name(env):
+    """env with the sender name an admin set in Settings, Emails
+    (services/common/src/mail/sender_name.rs) in place of the config's
+    EMAIL_FROM_NAME and ORGANIZATION_NAME. Nothing set, or unreadable: env
+    as it is."""
+    try:
+        r = client("dynamodb").get_item(
+            TableName=env["SETTINGS_TABLE_NAME"],
+            Key={"pk": {"S": "SYSTEM"}, "sk": {"S": "SETTINGS#EMAIL_SENDER"}},
+            ConsistentRead=True,
+        )
+        data = json.loads((r.get("Item") or {}).get("data", {}).get("S") or "{}")
+    except Exception as e:
+        logger.warning(f"Email sender name unreadable: {e}")
+        return env
+    one_line = lambda v: " ".join(v.split()) if isinstance(v, str) and not re.search(r"[\x00-\x1f\x7f]", v) else ""
+    name, org = one_line(data.get("sender_name")), one_line(data.get("organization"))
+    if not name and not org:
+        return env
+    env = dict(env)
+    # The same order as sender_name::ses_name and relay_org: the stored
+    # sender name, then the stored organization, then the config.
+    env["EMAIL_FROM_NAME"] = name
+    if org:
+        env["ORGANIZATION_NAME"] = org
+    elif org_name({"EMAIL_FROM_NAME": name}):
+        env["ORGANIZATION_NAME"] = ""
+    return env
+
+
 def sign_request(secret, ts, method, path, body, request_id):
     """The hybrid request signature, v2 (services/common/src/hybrid/sign.rs
     sign_request_v2): the time, the request's single-use id, the method, the
@@ -773,8 +803,10 @@ def notify(subject, text, env=None, what="available", version=None, opener=None,
     admins = [a for a in admins if not CODERHELM_ADDRESS.search(a)]
     sender = env.get("SES_FROM_ADDRESS")
     sent = 0
-    n = notice(what, version, env, facts)
     transport = email_transport(env) if admins else None
+    if admins and transport:
+        env = with_sender_name(env)
+    n = notice(what, version, env, facts)
     if admins and transport == "ses" and sender:
         try:
             client("sesv2").send_email(
