@@ -2,7 +2,7 @@
 
 Every run failure that reached a person is a case in
 `services/worker/src/passes/incidents/`, so it can't come back without a
-failing test. CI runs the suite as its own job, **Incident regressions**
+failing test. CI runs the suite as its own step, **Incident regressions** in **Rust (tests)**
 (`cargo test -p worker incidents::`), on every pull request.
 
 Each case replays the failure on one invented monorepo:
