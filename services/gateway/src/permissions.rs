@@ -366,13 +366,14 @@ pub const CAPABILITIES: &[Capability] = &[
     },
     Capability {
         key: "people",
-        label: "Invite people, resend or revoke any pending invite, link GitHub accounts, and change or remove members and viewers",
+        label: "Invite people, resend or revoke any pending invite, send set-up emails, link GitHub accounts, and change or remove members and viewers",
 
         short_label: "Invite and manage people",
         min_role: "admin",
         handlers: &[
             "users::invite_user",
             "users::resend_invite",
+            "users::send_setup_email",
             "users::update_role",
             "users::remove_user",
             "users::link_github",
