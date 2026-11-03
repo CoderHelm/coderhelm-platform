@@ -4,7 +4,7 @@
  * One CloudFront distribution serves the dashboard from S3 and forwards the
  * service paths to their backends, all on one hostname:
  *
- *   /api/plans/chat/stream   → the streaming function URL (SSE)
+ *   /api/plans/chat/stream /api/brain/stream   → the streaming function URL (SSE)
  *   /api/* /auth/* /webhooks/* /email/* /integrations/*   → the HTTP API
  *   everything else          → the dashboard (static export in S3)
  *
@@ -48,6 +48,8 @@ export const API_PATHS = [
 ];
 /** The chat stream (SSE, served by the streaming function). */
 export const STREAM_PATH = "/api/plans/chat/stream";
+/** Chat's answer stream: answers that read code run past the HTTP API's 30-second limit. */
+export const BRAIN_STREAM_PATH = "/api/brain/stream";
 
 /** Hashed build files: cached for a year. */
 const ASSET_CACHE_CONTROL = "public, max-age=31536000, immutable";
@@ -188,6 +190,7 @@ export class WebStack extends cdk.Stack {
     const additionalBehaviors: Record<string, cloudfront.BehaviorOptions> = {
       // Most specific first: CloudFront matches behaviors in order.
       [STREAM_PATH]: { origin: streamOrigin, ...passThrough },
+      [BRAIN_STREAM_PATH]: { origin: streamOrigin, ...passThrough },
     };
     for (const p of API_PATHS) {
       additionalBehaviors[p] = { origin: apiOrigin, ...passThrough };
