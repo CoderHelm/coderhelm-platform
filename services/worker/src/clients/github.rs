@@ -1706,6 +1706,139 @@ impl GitHubClient {
         Ok(RebaseResult::Rebased(tip))
     }
 
+    /// `git rebase --onto`: moves `branch` onto `onto` replaying only its
+    /// own commits, leaving out `drop` (copies of `onto`'s commits under
+    /// other hashes, which `onto` already has) and merge commits. The result
+    /// must hold the code the branch would have with `onto` merged in
+    /// ([`onto_holds`]), and the branch moves with a lease, as in
+    /// [`Self::rebase_branch`].
+    pub async fn rebase_onto(
+        &self,
+        owner: &str,
+        repo: &str,
+        branch: &str,
+        onto: &str,
+        drop: &[String],
+        lease: &str,
+    ) -> Result<RebaseResult, Box<dyn std::error::Error + Send + Sync>> {
+        let onto_sha = self.get_ref(owner, repo, onto).await?;
+        let cmp = self
+            .get(&format!(
+                "{API_BASE}/repos/{owner}/{repo}/compare/{onto_sha}...{lease}"
+            ))
+            .await?;
+        let onto_in_branch = cmp["behind_by"].as_u64() == Some(0);
+        if onto_in_branch && drop.is_empty() {
+            return Ok(RebaseResult::UpToDate);
+        }
+        let Some((steps, merges_dropped)) = onto_steps(&cmp, drop) else {
+            return Ok(RebaseResult::NotClean(
+                "too many commits to replay".to_string(),
+            ));
+        };
+        if steps.is_empty() {
+            return Ok(RebaseResult::NotClean(
+                "the branch has no commits of its own".to_string(),
+            ));
+        }
+        let scratch = format!(
+            "coderhelm-rebase/{branch}-{}",
+            chrono::Utc::now().timestamp_millis()
+        );
+        self.create_branch(owner, repo, &scratch, &onto_sha).await?;
+        let result = self
+            .replay(owner, repo, &scratch, &onto_sha, lease, &steps)
+            .await;
+        let _ = self.delete_branch(owner, repo, &scratch).await;
+        let (tip, tip_tree) = match result? {
+            Ok(t) => t,
+            Err(why) => return Ok(RebaseResult::NotClean(why)),
+        };
+        let branch_tree = self.git_commit(owner, repo, lease).await?["tree"]["sha"]
+            .as_str()
+            .unwrap_or("")
+            .to_string();
+        let merged_tree = if onto_in_branch {
+            None
+        } else {
+            let check = format!("{scratch}-check");
+            self.create_branch(owner, repo, &check, lease).await?;
+            let merged = self
+                .merge_returning(owner, repo, &check, &onto_sha, "rebase check")
+                .await;
+            let _ = self.delete_branch(owner, repo, &check).await;
+            merged?.and_then(|c| {
+                c.pointer("/commit/tree/sha")
+                    .and_then(|v| v.as_str())
+                    .map(String::from)
+            })
+        };
+        if let Err(why) = onto_holds(
+            onto_in_branch,
+            &branch_tree,
+            merged_tree.as_deref(),
+            merges_dropped,
+            &tip_tree,
+        ) {
+            return Ok(RebaseResult::NotClean(why));
+        }
+        if self.get_ref(owner, repo, branch).await? != lease {
+            return Ok(RebaseResult::Moved);
+        }
+        self.move_scratch_ref(owner, repo, branch, &tip).await?;
+        self.invalidate_snapshot(owner, repo, branch).await;
+        Ok(RebaseResult::Rebased(tip))
+    }
+
+    /// Moves `branch`, which already has `onto` merged in, to one new commit
+    /// on `onto` holding exactly the branch's code: what a rebase that drops
+    /// copies of `onto`'s commits gives when its own commits don't replay
+    /// one by one. Nothing of the code changes (same tree); the branch moves
+    /// with a lease.
+    pub async fn flatten_onto(
+        &self,
+        owner: &str,
+        repo: &str,
+        branch: &str,
+        onto: &str,
+        message: &str,
+        lease: &str,
+    ) -> Result<RebaseResult, Box<dyn std::error::Error + Send + Sync>> {
+        let onto_sha = self.get_ref(owner, repo, onto).await?;
+        let status = self.compare_status(owner, repo, &onto_sha, lease).await?;
+        if status != "ahead" && status != "identical" {
+            return Ok(RebaseResult::NotClean(format!(
+                "`{onto}` isn't merged into the branch yet"
+            )));
+        }
+        let tree = self.git_commit(owner, repo, lease).await?["tree"]["sha"]
+            .as_str()
+            .ok_or("Missing tree sha in branch commit")?
+            .to_string();
+        let onto_tree = self.git_commit(owner, repo, &onto_sha).await?["tree"]["sha"]
+            .as_str()
+            .unwrap_or("")
+            .to_string();
+        if tree == onto_tree {
+            return Ok(RebaseResult::NotClean(
+                "the branch has no change of its own".to_string(),
+            ));
+        }
+        let tip = self
+            .new_commit(
+                owner,
+                repo,
+                serde_json::json!({"message": message, "tree": tree, "parents": [onto_sha]}),
+            )
+            .await?;
+        if self.get_ref(owner, repo, branch).await? != lease {
+            return Ok(RebaseResult::Moved);
+        }
+        self.move_scratch_ref(owner, repo, branch, &tip).await?;
+        self.invalidate_snapshot(owner, repo, branch).await;
+        Ok(RebaseResult::Rebased(tip))
+    }
+
     /// Replays `steps` on the scratch ref starting at `base_sha`. The new
     /// tip and its tree, or why it couldn't (a step conflicted).
     #[allow(clippy::type_complexity)]
@@ -3976,6 +4109,48 @@ pub fn replay_steps(compare: &serde_json::Value) -> Option<Vec<ReplayStep>> {
     (steps.len() <= MAX_REPLAY).then_some(steps)
 }
 
+/// The branch's own commits for `git rebase --onto`: [`replay_steps`]
+/// without the commits in `drop`, and whether merge commits were left out
+/// (their conflict resolutions aren't replayed).
+pub fn onto_steps(compare: &serde_json::Value, drop: &[String]) -> Option<(Vec<ReplayStep>, bool)> {
+    let steps = replay_steps(compare)?;
+    let merges = compare["commits"].as_array().is_some_and(|c| {
+        c.iter()
+            .any(|c| c["parents"].as_array().is_some_and(|p| p.len() > 1))
+    });
+    let own = steps
+        .into_iter()
+        .filter(|s| !drop.contains(&s.sha))
+        .collect();
+    Some((own, merges))
+}
+
+/// Whether a rebase onto another branch kept the branch's code. With that
+/// branch already merged in, the result must hold the branch's code
+/// exactly. Otherwise it must hold what merging it in gives; when that
+/// merge conflicts (the copies are older versions of its commits) the
+/// replayed commits are trusted only if no merge commit was left out.
+pub fn onto_holds(
+    onto_in_branch: bool,
+    branch_tree: &str,
+    merged_tree: Option<&str>,
+    merges_dropped: bool,
+    tip_tree: &str,
+) -> Result<(), String> {
+    let same = if onto_in_branch {
+        tip_tree == branch_tree
+    } else if let Some(m) = merged_tree {
+        tip_tree == m
+    } else {
+        !merges_dropped
+    };
+    if same {
+        Ok(())
+    } else {
+        Err("the rebased code differs from the branch with that branch merged in".to_string())
+    }
+}
+
 /// Whether a compare's commits (merge commits aside) were all committed by
 /// `login`. A truncated list is `false`: an unseen commit may be someone's.
 pub fn commits_all_by(compare: &serde_json::Value, login: &str) -> bool {
@@ -4078,6 +4253,41 @@ mod rebase_tests {
         });
         assert!(!commits_all_by(&truncated, "app[bot]"));
         assert!(replay_steps(&truncated).is_none());
+    }
+
+    #[test]
+    fn a_rebase_onto_replays_only_the_branch_s_own_commits() {
+        // acme/web: c1 and c2 copy the dependency's commits, o1 is the run's.
+        let cmp = json!({
+            "total_commits": 4,
+            "commits": [
+                commit("c1", &["b0"], "app[bot]"),
+                commit("c2", &["c1"], "app[bot]"),
+                commit("m1", &["c2", "d9"], "app[bot]"),
+                commit("o1", &["m1"], "app[bot]"),
+            ],
+        });
+        let (steps, merges) = onto_steps(&cmp, &["c1".into(), "c2".into()]).unwrap();
+        assert_eq!(
+            steps.iter().map(|s| s.sha.as_str()).collect::<Vec<_>>(),
+            vec!["o1"]
+        );
+        assert!(merges);
+        let plain = json!({"total_commits": 1, "commits": [commit("o1", &["b0"], "x")]});
+        assert!(!onto_steps(&plain, &[]).unwrap().1);
+    }
+
+    #[test]
+    fn a_rebase_onto_keeps_the_branch_s_code_or_is_refused() {
+        // Already merged in: exactly the branch's code.
+        assert!(onto_holds(true, "t1", None, true, "t1").is_ok());
+        assert!(onto_holds(true, "t1", None, false, "t2").is_err());
+        // Not merged in: what merging it in gives.
+        assert!(onto_holds(false, "t1", Some("t3"), false, "t3").is_ok());
+        assert!(onto_holds(false, "t1", Some("t3"), false, "t2").is_err());
+        // The merge conflicts (older copies): trusted without dropped merges.
+        assert!(onto_holds(false, "t1", None, false, "t2").is_ok());
+        assert!(onto_holds(false, "t1", None, true, "t2").is_err());
     }
 }
 

@@ -2053,7 +2053,7 @@ async fn run_passes(
     }
     // A ticket that depends on another open pull request builds on its
     // branch (stacked), on every attempt, never copying its commits.
-    let stacked_on = if is_internal_ticket(&msg.ticket_id) {
+    let mut stacked_on = if is_internal_ticket(&msg.ticket_id) {
         None
     } else {
         let own: Vec<String> = history
@@ -3533,6 +3533,26 @@ async fn run_passes(
                     run_id,
                     "Branch reset — reused plan's task checkmarks cleared"
                 );
+            }
+        }
+
+        // A branch kept from an earlier attempt can carry copies of another
+        // open pull request's commits (that branch was rebased since): they
+        // are dropped now, before any implementation, and the run stacks on
+        // it. A branch with its own open pull request keeps its history.
+        if existing_pr.is_none() && !pr_lookup_failed && !is_internal_ticket(&msg.ticket_id) {
+            if let Some(d) = stack::at_start(&github, msg, &branch_name).await {
+                add_progress_note(
+                    state,
+                    &msg.team_id,
+                    run_id,
+                    &format!(
+                        "Dropped this branch's copies of #{}'s commits; it now builds on `{}`",
+                        d.number, d.branch
+                    ),
+                )
+                .await;
+                stacked_on = Some(d);
             }
         }
 
@@ -5238,9 +5258,18 @@ async fn run_passes(
         ev.start = Some(log_evidence::resolve_start(&files, ev).await);
         log_evidence::save(state, &msg.team_id, run_id, ev).await;
     }
-    // Never another open pull request's commits under new hashes: stacked on
-    // it instead, or refused.
-    let stacked_on = stack::before_pr(&github, msg, &branch_name, stacked_on).await?;
+    // Never another open pull request's commits under new hashes: the
+    // copies are dropped and the pull request stacks on it.
+    let stacked_on = stack::before_pr(
+        state,
+        &github,
+        msg,
+        &branch_name,
+        stacked_on,
+        &provider,
+        usage,
+    )
+    .await?;
     let pass_start = std::time::Instant::now();
     let usage_before = usage.clone();
     let pr_result = pr::run(
