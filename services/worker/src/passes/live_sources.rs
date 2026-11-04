@@ -16,6 +16,7 @@ use std::sync::{Arc, Mutex};
 use common::live::api::{self as live_api, run_lookup, ApiSource};
 use common::live::aws::{self as live_aws, AwsTarget};
 use common::live::catalog::{self, Catalog};
+use common::live::dialect::{self, Engine};
 use common::live::http::Https;
 use common::live::opensearch::OpenSearch;
 use common::live::rest::Rest;
@@ -319,6 +320,26 @@ impl LiveSources {
         self.loaded.iter().any(|l| l.source.kind == kind)
     }
 
+    /// Each database source's engine, then the common mistakes in each engine
+    /// connected (once per engine), for the db_query description.
+    fn engines_text(&self) -> String {
+        let mut names = Vec::new();
+        let mut engines: Vec<Engine> = Vec::new();
+        for l in self
+            .loaded
+            .iter()
+            .filter(|l| l.source.kind == Kind::Database)
+        {
+            let e = l.aws().map(Engine::of).unwrap_or(Engine::Postgres);
+            names.push(format!("{} is {}", l.source.name, e.label()));
+            if !engines.contains(&e) {
+                engines.push(e);
+            }
+        }
+        let pitfalls: Vec<&str> = engines.iter().map(|e| e.pitfalls()).collect();
+        format!("Engines: {}. {}", names.join("; "), pitfalls.join(" "))
+    }
+
     /// Lookups this agent made so far.
     pub fn lookups_made(&self) -> usize {
         self.lookups.load(Ordering::SeqCst)
@@ -391,8 +412,8 @@ impl LiveSources {
                      lists, with their schema prefix when it shows one. Filter on ids or other \
                      indexed columns, name the columns you need, and keep results small (at most \
                      200 rows come back). At most {MAX_LOOKUPS} lookups in all; one with a wrong \
-                     name still counts. {}",
-                    redshift::DIALECT
+                     name still counts. Write SQL for the engine the source runs. {}",
+                    self.engines_text()
                 ),
                 input_schema: json!({
                     "type": "object",
@@ -1385,7 +1406,12 @@ impl LiveSources {
                     &format!("Asked {}: {asked_text}", l.source.name),
                     &e.message,
                 );
-                format!("Lookup {id}. {}", with_hints(describe_failure(&e), &hints))
+                let mut text = with_hints(describe_failure(&e), &hints);
+                if let Some(note) = dialect_note(l, &e, &asked_text) {
+                    text.push('\n');
+                    text.push_str(&note);
+                }
+                format!("Lookup {id}. {text}")
             }
         }
     }
@@ -1517,6 +1543,18 @@ fn describe_text(l: &Loaded, input: &Value) -> String {
         return format!("{root}\n\n{list}");
     }
     d.catalog.list(DESCRIBE_CHARS)
+}
+
+/// For a database query the engine rejected: that it was a syntax error in
+/// this engine's SQL and the rewrite for the construct when it can be told,
+/// or a known engine limit's rewrite. `None` for anything else, including a
+/// refusal (nothing was sent) and a failure to reach the database.
+fn dialect_note(l: &Loaded, e: &StepError, sql: &str) -> Option<String> {
+    if l.source.kind != Kind::Database || e.step != "read" {
+        return None;
+    }
+    let engine = l.aws().map(Engine::of).unwrap_or(Engine::Postgres);
+    dialect::failure_note(engine, &e.message, sql)
 }
 
 fn describe_failure(e: &StepError) -> String {
@@ -1964,12 +2002,79 @@ mod tests {
         assert!(p.contains("`logs_search` to search logs"));
     }
 
+    fn db_tool_text(l: &LiveSources) -> String {
+        l.tools()
+            .into_iter()
+            .find(|t| t.name == "db_query")
+            .unwrap()
+            .description
+    }
+
+    fn warehouse(name: &str) -> Loaded {
+        let mut wh = aws_source(name, Kind::Database);
+        if let Some(a) = wh.source.aws.as_mut() {
+            a.engine = "redshift".into();
+        }
+        wh
+    }
+
     #[test]
-    fn the_query_tool_carries_redshift_rules() {
-        // Redshift refuses LISTAGG next to another DISTINCT aggregate; the
-        // tool says so before the agent writes one.
-        assert!(common::live::redshift::DIALECT.contains("LISTAGG"));
-        assert!(common::live::redshift::DIALECT.contains("DISTINCT aggregate"));
+    fn the_query_tool_names_each_engine_and_its_pitfalls() {
+        // PostgreSQL only: no Redshift rules.
+        let pg = db_tool_text(&mixed());
+        assert!(pg.contains("app database is PostgreSQL"), "{pg}");
+        assert!(pg.contains("FILTER (WHERE ...) work"), "{pg}");
+        assert!(!pg.contains("Amazon Redshift"), "{pg}");
+        // Both: each source with its engine, each engine's rules once.
+        let mut l = mixed();
+        l.loaded.push(warehouse("dw"));
+        l.loaded.push(warehouse("dw2"));
+        let both = db_tool_text(&l);
+        assert!(
+            both.contains(
+                "app database is PostgreSQL; dw is Amazon Redshift; dw2 is Amazon Redshift"
+            ),
+            "{both}"
+        );
+        assert!(
+            both.contains("no aggregate FILTER clause (write SUM(CASE WHEN"),
+            "{both}"
+        );
+        assert!(both.contains("json_extract_path_text"), "{both}");
+        assert!(both.contains("LISTAGG"), "{both}");
+        assert_eq!(both.matches("older PostgreSQL").count(), 1, "{both}");
+    }
+
+    #[test]
+    fn a_syntax_error_names_the_engine_and_the_fix() {
+        let wh = warehouse("dw");
+        let sql = "SELECT count(*) FILTER (WHERE favorite_color IS NOT NULL) FROM public.contacts";
+        let e = StepError::new(
+            "read",
+            "The warehouse couldn't run that: ERROR: syntax error at or near \"(\" in context \"*) FILTER (\", at line 1, Position: 16",
+            "x",
+        );
+        let note = dialect_note(&wh, &e, sql).unwrap();
+        assert!(
+            note.contains("syntax error: the SQL isn't valid Amazon Redshift"),
+            "{note}"
+        );
+        assert!(note.contains("SUM(CASE WHEN"), "{note}");
+        // The same error from PostgreSQL gets no Redshift advice.
+        let pg = aws_source("app database", Kind::Database);
+        let note = dialect_note(&pg, &e, sql).unwrap();
+        assert!(
+            note.contains("valid PostgreSQL") && !note.contains("SUM(CASE"),
+            "{note}"
+        );
+        // Other failures are reported as before.
+        let missing = StepError::new("read", "ERROR: column \"x\" does not exist", "x");
+        assert!(dialect_note(&wh, &missing, sql).is_none());
+        let refused = StepError::new("read_only", "syntax error", "x");
+        assert!(dialect_note(&wh, &refused, sql).is_none());
+        let api = source("api.example.com");
+        let api = Loaded::new(api, "k".into(), None, None);
+        assert!(dialect_note(&api, &e, sql).is_none());
     }
 
     #[test]
