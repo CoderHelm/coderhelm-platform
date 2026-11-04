@@ -1,6 +1,6 @@
 //! When a run may stop, and how it says why, for every team.
 //!
-//! A run stops for a person only when a person is what it needs. Four rules,
+//! A run stops for a person only when a person is what it needs. Five rules,
 //! each enforced here and called where a run would stop:
 //!
 //! 1. [`tooling`]: the run's own tools failing (a missing dependency, a
@@ -20,6 +20,12 @@
 //!    the same failing test or ticket ends the run as covered by it, linked
 //!    in the run summary and on the ticket, unless the ticket asks for a
 //!    separate change.
+//! 5. [`screen::asking_rule`]: a question to a person says what the run
+//!    already checked and how the answer changes the fix, can't be answered
+//!    by the run's own tools, data sources or code, rests on no field whose
+//!    writer the run never read, and waits until conflicting findings about
+//!    the same record are settled. Asked too early twice, the run reports
+//!    its findings and the one next step a person takes instead.
 
 pub mod environment;
 pub mod existing_work;
