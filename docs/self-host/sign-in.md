@@ -20,7 +20,37 @@ The first admin is the address you gave the install (the Launch Stack's **Your e
 
 ### People moved from another CoderHelm
 
-A team moved from CoderHelm's hosted service arrives with its people already on it. Someone who hasn't signed in on the install yet shows **Hasn't set up an account here yet** in **Settings, Team**. An admin opens the row's menu and picks **Send set-up email**: it's the invite email, with the link to set up their account (at most once an hour and five times a week per person). The row then shows when it went. Once they've signed in, it's gone.
+A team moved from CoderHelm's hosted service arrives with its people already on it, but not their passwords: each person sets one up here. Until they do, **Settings, Members and roles** shows them as **Hasn't signed in here yet** (any activity time on their row is from the previous CoderHelm, and says so). The counts at the top of the page include how many haven't signed in here yet. Someone with a linked GitHub account, on an install where GitHub sign-in works, also shows **Can sign in with GitHub**.
+
+There are three ways for them to get the set-up email, the invite email with the link to set up their account:
+
+- **An admin sends it to one person:** the row's **Send set-up email** button.
+- **An admin sends it to everyone at once:** the banner **N people haven't set up an account here yet**, **Send set-up emails to all**. Anyone sent one in the last hour is skipped. An admin can press it three times an hour.
+- **The person asks for it themselves:** **Forgot password** on the sign-in page, with their email (see below).
+
+Each person gets at most one set-up email an hour and five a week, however it was asked for. The row shows when the last one went. Once they've signed in, it's gone.
+
+### Forgot password
+
+**Forgot password** on the sign-in page says plainly what happened for the email typed in:
+
+| The email | What happens | What the page says |
+|---|---|---|
+| Has an account here | Amazon Cognito sends a reset code | We sent a reset code to the email. |
+| On the team, no account here yet (moved from another CoderHelm) | The set-up email goes instead | You don't have an account here yet. We sent you a set-up link instead. |
+| Invited, not signed up yet | Nothing is sent | Use the link in the invite email, or ask an admin to send it again. |
+| Not on this install | Nothing is sent | There's no account for the email on this CoderHelm. Ask an admin to add you. |
+
+Because the page says whether an email has an account, it's limited so it can't be used to check addresses quickly: ten asks an hour from one network address, and five an hour for one email.
+
+### Where these emails come from
+
+The emails come from two different senders. After sending, the sign-in page names the one to look for, so a person can ask IT to let it through a mail filter (Mimecast, Proofpoint, Microsoft Defender and so on):
+
+- **Reset codes** come from Amazon Cognito: `no-reply@verificationemail.com` while the user pool sends its own email (the default), or the install's own address once `email.cognitoUsesSes` is on (see [Email](./email.md#sign-up-and-password-emails)). CoderHelm reads this from the user pool's email settings.
+- **Set-up and invite emails** come from the install's own email: its Amazon SES address, or the address of CoderHelm's mail relay when the install sends through it (**Settings, Email**).
+
+If someone says the email never came, check **Settings, Deliveries** for set-up emails, then ask IT to search for, and allow, the sender above.
 
 ### At install time
 

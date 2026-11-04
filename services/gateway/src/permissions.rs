@@ -375,6 +375,7 @@ pub const CAPABILITIES: &[Capability] = &[
             "users::invite_user",
             "users::resend_invite",
             "users::send_setup_email",
+            "users::send_setup_emails_all",
             "users::update_role",
             "users::remove_user",
             "users::link_github",

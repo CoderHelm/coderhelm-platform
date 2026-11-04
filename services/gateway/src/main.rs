@@ -629,6 +629,10 @@ async fn main() -> Result<(), Error> {
             put(routes::roles::update_role).delete(routes::roles::delete_role),
         )
         .route("/users/invite", post(routes::users::invite_user))
+        .route(
+            "/users/setup-emails",
+            post(routes::users::send_setup_emails_all),
+        )
         .route("/users/:user_id/role", put(routes::users::update_role))
         .route("/users/:user_id/resend", post(routes::users::resend_invite))
         .route(

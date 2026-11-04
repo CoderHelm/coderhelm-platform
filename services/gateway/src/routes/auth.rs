@@ -792,32 +792,256 @@ fn landing_parts(
 
 // ── Forgot password ──────────────────────────────────────────────────
 
-/// POST /auth/forgot-password — Send password reset code.
+/// Forgot-password asks from one address: ten an hour (on top of the sign-in routes' limit).
+const FORGOT_PER_IP_PER_HOUR: u64 = 10;
+/// Forgot-password asks for one email: five an hour, from anywhere.
+const FORGOT_PER_EMAIL_PER_HOUR: u64 = 5;
+
+/// What forgot-password does for an email on a self-hosted install, which says plainly what
+/// happened (an install is one organization; its admins add people).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Forgot {
+    /// They have an account here: Cognito sends a reset code.
+    ResetCode,
+    /// On the team (copied from another CoderHelm) but with no account here: the set-up email
+    /// goes instead, from this team record (`pk`, `sk`).
+    SetUp { team_id: String, sk: String },
+    /// As [`Forgot::SetUp`], but one went less than an hour ago (or five this week).
+    SetUpRecent,
+    /// Invited and not signed up yet: their invite email has the link.
+    Invited,
+    /// Not on this install.
+    NoAccount,
+}
+
+impl Forgot {
+    /// Whether this case sends an email (only these two ever do).
+    pub fn sends(&self) -> bool {
+        matches!(self, Forgot::ResetCode | Forgot::SetUp { .. })
+    }
+}
+
+/// The one place the case is decided. Pure: `in_pool` is whether the user pool has the email,
+/// `join` the install's word on it, `member` that member's record when `join` is one.
+pub fn plan_forgot(
+    in_pool: bool,
+    join: &Join,
+    member: Option<&HashMap<String, AttributeValue>>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Forgot {
+    if in_pool {
+        return Forgot::ResetCode;
+    }
+    match (join, member) {
+        (Join::Member { team_id, user_id }, Some(item))
+            if item
+                .get("email")
+                .and_then(|v| v.as_s().ok())
+                .is_some_and(|e| !e.is_empty()) =>
+        {
+            if super::users::setup_email_due(item, now) {
+                Forgot::SetUp {
+                    team_id: team_id.clone(),
+                    sk: user_id.clone(),
+                }
+            } else {
+                Forgot::SetUpRecent
+            }
+        }
+        (Join::Invite, _) => Forgot::Invited,
+        _ => Forgot::NoAccount,
+    }
+}
+
+/// What the sign-in page shows for each case: `status` and a plain sentence.
+pub fn forgot_reply(case: &Forgot, email: &str) -> serde_json::Value {
+    let (status, message) = match case {
+        Forgot::ResetCode => ("code_sent", format!("We sent a reset code to {email}.")),
+        Forgot::SetUp { .. } => (
+            "setup_sent",
+            "You don't have an account here yet. We sent you a set-up link instead.".to_string(),
+        ),
+        Forgot::SetUpRecent => (
+            "setup_recent",
+            "You don't have an account here yet. We sent you a set-up link less than an hour ago: look for that email, or try again later.".to_string(),
+        ),
+        Forgot::Invited => (
+            "invited",
+            format!("{email} has an invite here but no account yet. Use the link in the invite email, or ask an admin to send it again."),
+        ),
+        Forgot::NoAccount => (
+            "no_account",
+            format!("There's no account for {email} on this CoderHelm. Ask an admin to add you."),
+        ),
+    };
+    serde_json::json!({ "status": status, "message": message, "email": email })
+}
+
+fn too_many_forgot() -> (StatusCode, Json<serde_json::Value>) {
+    (
+        StatusCode::TOO_MANY_REQUESTS,
+        Json(serde_json::json!({
+            "error": "Too many password resets asked for just now. Try again in an hour."
+        })),
+    )
+}
+
+/// The key a per-email count is kept under: a hash, so the counter table holds no addresses.
+fn email_key(email: &str) -> String {
+    use sha2::Digest;
+    let d = Sha256::digest(email.as_bytes());
+    d.iter().take(16).map(|b| format!("{b:02x}")).collect()
+}
+
+/// POST /auth/forgot-password — a reset code, or on a self-hosted install for someone on the
+/// team with no account here, the set-up email. A self-hosted install says which (or that the
+/// email has no account there); the hosted service answers the same for every email.
 pub async fn forgot_password(
     State(state): State<Arc<AppState>>,
+    ip: crate::middleware::rate_limit::ClientIp,
     Json(body): Json<ForgotPasswordRequest>,
-) -> Result<Json<serde_json::Value>, StatusCode> {
-    let email = body.email.trim().to_lowercase();
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    use crate::middleware::rate_limit::allow_shared;
+    let email = normalize_email(&body.email);
+    if sign_in::email_domain(&email).is_none() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "Enter the email you sign in with." })),
+        ));
+    }
+    allow_shared(&state, "forgot_ip", &ip.0, FORGOT_PER_IP_PER_HOUR, 3600)
+        .await
+        .map_err(|_| too_many_forgot())?;
+    allow_shared(
+        &state,
+        "forgot_email",
+        &email_key(&email),
+        FORGOT_PER_EMAIL_PER_HOUR,
+        3600,
+    )
+    .await
+    .map_err(|_| too_many_forgot())?;
+
+    if !sign_in::applies() {
+        // The hosted service: the same answer for every email.
+        let _ = send_reset_code(&state, &email).await;
+        return Ok(Json(serde_json::json!({
+            "status": "sent",
+            "message": "If an account exists, a reset code was sent"
+        })));
+    }
+
+    let unavailable = |what: &str, e: String| {
+        error!(error = %e, "{what}");
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(
+                serde_json::json!({ "error": "Password reset is unavailable just now. Try again shortly." }),
+            ),
+        )
+    };
+    let in_pool = match state
+        .cognito
+        .admin_get_user()
+        .user_pool_id(&state.config.cognito_user_pool_id)
+        .username(&email)
+        .send()
+        .await
+    {
+        Ok(_) => true,
+        Err(e) if format!("{e:?}").contains("UserNotFound") => false,
+        Err(e) => {
+            return Err(unavailable(
+                "Forgot password: sign-in not checked",
+                format!("{e}"),
+            ))
+        }
+    };
+    let (join, member) = if in_pool {
+        (Join::Refused, None)
+    } else {
+        let facts = sign_in::facts_for(&state, &email)
+            .await
+            .map_err(|e| unavailable("Forgot password: join not checked", e))?;
+        let join = sign_in::decide_join(&facts, chrono::Utc::now());
+        let member = match &join {
+            Join::Member { team_id, user_id } => facts.records.iter().find(|i| {
+                let g = |k: &str| i.get(k).and_then(|v| v.as_s().ok()).map(String::as_str);
+                g("pk") == Some(team_id.as_str()) && g("sk") == Some(user_id.as_str())
+            }),
+            _ => None,
+        }
+        .cloned();
+        (join, member)
+    };
+    let case = plan_forgot(in_pool, &join, member.as_ref(), chrono::Utc::now());
+    match &case {
+        Forgot::ResetCode => {
+            if let Err(e) = send_reset_code(&state, &email).await {
+                warn!(error = %e, "Reset code not sent");
+                let limited = e.contains("LimitExceeded") || e.contains("TooManyRequests");
+                return Err((
+                    if limited {
+                        StatusCode::TOO_MANY_REQUESTS
+                    } else {
+                        StatusCode::BAD_GATEWAY
+                    },
+                    Json(serde_json::json!({
+                        "error": if limited {
+                            "Too many reset codes for this email just now. Try again in a few minutes."
+                        } else {
+                            "We couldn't send a reset code just now. Try again shortly."
+                        }
+                    })),
+                ));
+            }
+        }
+        Forgot::SetUp { team_id, .. } => {
+            let Some(item) = member.as_ref() else {
+                return Err(unavailable("Forgot password: no record", String::new()));
+            };
+            let team = super::users::team_items(&state, team_id)
+                .await
+                .map_err(|_| unavailable("Forgot password: team not read", String::new()))?;
+            let by = super::users::standing_admin(&team).unwrap_or_else(|| email.clone());
+            match super::users::deliver_setup_email(&state, team_id, item, &by).await {
+                Ok(_) => info!(%team_id, "Set-up email sent from the sign-in page"),
+                Err(super::users::SetupSend::Wait(_)) => {
+                    return Ok(Json(forgot_reply(&Forgot::SetUpRecent, &email)));
+                }
+                Err(super::users::SetupSend::Failed(e)) => {
+                    return Err((
+                        StatusCode::BAD_GATEWAY,
+                        Json(serde_json::json!({
+                            "error": format!("You don't have an account here yet, and we couldn't send you a set-up link just now ({e}). Ask an admin to send it from Settings, Members and roles.")
+                        })),
+                    ));
+                }
+            }
+        }
+        _ => {}
+    }
+    info!(outcome = ?std::mem::discriminant(&case), sends = case.sends(), "Forgot password");
+    Ok(Json(forgot_reply(&case, &email)))
+}
+
+/// Asks Cognito to send `email` a reset code.
+async fn send_reset_code(state: &AppState, email: &str) -> Result<(), String> {
     let hash = cognito_secret_hash(
         &state.cognito_client_secret,
-        &email,
+        email,
         &state.config.cognito_client_id,
     );
-
-    // Always return success to prevent email enumeration
-    let _ = state
+    state
         .cognito
         .forgot_password()
         .client_id(&state.config.cognito_client_id)
         .secret_hash(&hash)
-        .username(&email)
+        .username(email)
         .send()
-        .await;
-
-    Ok(Json(serde_json::json!({
-        "status": "sent",
-        "message": "If an account exists, a reset code was sent"
-    })))
+        .await
+        .map(|_| ())
+        .map_err(|e| format!("{e:?}"))
 }
 
 /// POST /auth/confirm-reset — Reset password with code.
@@ -1238,8 +1462,111 @@ async fn google_callback_inner(
 /// (public, no session). The sign-in page shows these and no others.
 pub async fn methods(State(state): State<Arc<AppState>>) -> Response {
     let github = own_github_client(&state) || super::github_hybrid::available();
-    let m = oauth_signin::sign_in_methods(super::setup_checks::self_hosted(), github);
-    Json(m).into_response()
+    let self_hosted = super::setup_checks::self_hosted();
+    let m = oauth_signin::sign_in_methods(self_hosted, github);
+    let mut v = serde_json::to_value(m).unwrap_or_default();
+    if self_hosted {
+        // Where the sign-in page's emails come from, so a person can ask IT to let them in.
+        v["senders"] = senders(&state).await;
+    }
+    Json(v).into_response()
+}
+
+/// Amazon Cognito's own sender, when the pool sends its emails itself.
+pub const COGNITO_DEFAULT_SENDER: &str = "no-reply@verificationemail.com";
+
+/// The address in a From line ("Acme <noreply@acme.dev>" or a bare address).
+pub fn address_of(from: &str) -> Option<String> {
+    let from = from.trim();
+    let addr = match (from.rfind('<'), from.rfind('>')) {
+        (Some(a), Some(b)) if a < b => &from[a + 1..b],
+        _ => from,
+    };
+    let addr = addr.trim().to_lowercase();
+    (addr.contains('@') && !addr.contains(char::is_whitespace)).then_some(addr)
+}
+
+/// Who sends the pool's reset codes, from its EmailConfiguration: Cognito's own address
+/// (COGNITO_DEFAULT, or none set), else the pool's From address, else its SES identity when
+/// that is an address.
+pub fn cognito_sender(
+    account: Option<&str>,
+    from: Option<&str>,
+    source_arn: Option<&str>,
+) -> Option<String> {
+    if account.is_none_or(|a| a == "COGNITO_DEFAULT") {
+        return Some(COGNITO_DEFAULT_SENDER.to_string());
+    }
+    from.and_then(address_of).or_else(|| {
+        source_arn
+            .and_then(|a| a.rsplit_once("identity/"))
+            .and_then(|(_, id)| address_of(id))
+    })
+}
+
+/// `{setup, reset_codes}`: the install's own sender (the set-up email) and Cognito's (reset
+/// codes). Either is null when it can't be read just now. Kept five minutes per instance.
+async fn senders(state: &AppState) -> serde_json::Value {
+    use std::sync::Mutex;
+    static CACHE: Mutex<Option<(i64, serde_json::Value)>> = Mutex::new(None);
+    let now = chrono::Utc::now().timestamp();
+    if let Some((at, v)) = CACHE.lock().ok().and_then(|c| c.clone()) {
+        if now - at < 300 {
+            return v;
+        }
+    }
+    let (setup, reset) = tokio::join!(install_sender(state), pool_sender(state));
+    let v = serde_json::json!({ "setup": setup, "reset_codes": reset });
+    if let Ok(mut c) = CACHE.lock() {
+        *c = Some((now, v.clone()));
+    }
+    v
+}
+
+/// The address the install's own email goes out from: its SES address, or the relay's.
+async fn install_sender(state: &AppState) -> Option<String> {
+    use common::mail::{self, Transport};
+    let settings = mail::load(&state.dynamo, &state.config.settings_table_name)
+        .await
+        .ok()?;
+    match mail::transport_of(settings.as_ref(), mail::transport_default()) {
+        Transport::Coderhelm => {
+            let creds = common::hybrid::client::credentials()?;
+            let status = common::hybrid::client::call(
+                &state.http,
+                &creds,
+                "GET",
+                mail::relay::PATH_STATUS,
+                None,
+            )
+            .await
+            .ok()?;
+            status
+                .get("from")
+                .and_then(serde_json::Value::as_str)
+                .and_then(address_of)
+        }
+        _ => address_of(&state.config.ses_from_address),
+    }
+}
+
+/// Who sends the pool's reset codes, read from the pool.
+async fn pool_sender(state: &AppState) -> Option<String> {
+    let out = state
+        .cognito
+        .describe_user_pool()
+        .user_pool_id(&state.config.cognito_user_pool_id)
+        .send()
+        .await
+        .map_err(|e| warn!(error = %e, "User pool not described"))
+        .ok()?;
+    let cfg = out.user_pool().and_then(|p| p.email_configuration());
+    cognito_sender(
+        cfg.and_then(|c| c.email_sending_account())
+            .map(|a| a.as_str()),
+        cfg.and_then(|c| c.from()),
+        cfg.and_then(|c| c.source_arn()),
+    )
 }
 
 /// This deployment's own GitHub OAuth client (id and secret both stored).
@@ -2913,5 +3240,199 @@ mod first_sign_in_tests {
             chosen.get("pk").and_then(|v| v.as_s().ok()).unwrap(),
             "TEAM#co"
         );
+    }
+}
+
+#[cfg(test)]
+mod forgot_tests {
+    use super::*;
+
+    fn now() -> chrono::DateTime<chrono::Utc> {
+        chrono::DateTime::parse_from_rfc3339("2026-11-04T12:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc)
+    }
+
+    fn member(email: &str, sent: &[&str]) -> HashMap<String, AttributeValue> {
+        let mut m = HashMap::new();
+        m.insert("pk".into(), AttributeValue::S("TEAM#acme".into()));
+        m.insert("sk".into(), AttributeValue::S("USER#u1".into()));
+        m.insert("email".into(), AttributeValue::S(email.into()));
+        m.insert("status".into(), AttributeValue::S("active".into()));
+        if !sent.is_empty() {
+            m.insert(
+                "setup_email_log".into(),
+                AttributeValue::L(
+                    sent.iter()
+                        .map(|t| AttributeValue::S(t.to_string()))
+                        .collect(),
+                ),
+            );
+        }
+        m
+    }
+
+    fn joined() -> Join {
+        Join::Member {
+            team_id: "TEAM#acme".into(),
+            user_id: "USER#u1".into(),
+        }
+    }
+
+    #[test]
+    fn a_member_with_no_account_here_gets_the_set_up_email() {
+        let m = member("jo@acme.dev", &[]);
+        let case = plan_forgot(false, &joined(), Some(&m), now());
+        assert_eq!(
+            case,
+            Forgot::SetUp {
+                team_id: "TEAM#acme".into(),
+                sk: "USER#u1".into()
+            }
+        );
+        assert!(case.sends());
+        let r = forgot_reply(&case, "jo@acme.dev");
+        assert_eq!(r["status"], "setup_sent");
+        assert_eq!(
+            r["message"],
+            "You don't have an account here yet. We sent you a set-up link instead."
+        );
+    }
+
+    #[test]
+    fn a_set_up_email_waits_an_hour_even_from_the_sign_in_page() {
+        let m = member("jo@acme.dev", &["2026-11-04T11:30:00Z"]);
+        let case = plan_forgot(false, &joined(), Some(&m), now());
+        assert_eq!(case, Forgot::SetUpRecent);
+        assert!(!case.sends());
+        let m = member("jo@acme.dev", &["2026-11-04T10:30:00Z"]);
+        assert!(plan_forgot(false, &joined(), Some(&m), now()).sends());
+    }
+
+    #[test]
+    fn an_email_not_on_the_install_sends_nothing() {
+        for join in [Join::Refused, Join::Domain, Join::Listed, Join::FirstAdmin] {
+            let case = plan_forgot(false, &join, None, now());
+            assert_eq!(case, Forgot::NoAccount, "{join:?}");
+            assert!(!case.sends());
+        }
+        let r = forgot_reply(&Forgot::NoAccount, "who@else.dev");
+        assert_eq!(r["status"], "no_account");
+        assert_eq!(
+            r["message"],
+            "There's no account for who@else.dev on this CoderHelm. Ask an admin to add you."
+        );
+    }
+
+    #[test]
+    fn an_account_here_gets_a_reset_code_whatever_the_team_says() {
+        let m = member("jo@acme.dev", &[]);
+        for join in [joined(), Join::Refused, Join::Invite] {
+            assert_eq!(plan_forgot(true, &join, Some(&m), now()), Forgot::ResetCode);
+        }
+        let r = forgot_reply(&Forgot::ResetCode, "jo@acme.dev");
+        assert_eq!(r["status"], "code_sent");
+        assert_eq!(r["message"], "We sent a reset code to jo@acme.dev.");
+    }
+
+    #[test]
+    fn an_invite_points_at_the_invite_email_and_sends_nothing() {
+        let case = plan_forgot(false, &Join::Invite, None, now());
+        assert_eq!(case, Forgot::Invited);
+        assert!(!case.sends());
+    }
+
+    #[test]
+    fn a_member_record_with_no_email_is_no_account() {
+        let m = member("", &[]);
+        assert_eq!(
+            plan_forgot(false, &joined(), Some(&m), now()),
+            Forgot::NoAccount
+        );
+    }
+
+    #[test]
+    fn each_case_reads_differently() {
+        let cases = [
+            Forgot::ResetCode,
+            Forgot::SetUp {
+                team_id: "t".into(),
+                sk: "s".into(),
+            },
+            Forgot::SetUpRecent,
+            Forgot::Invited,
+            Forgot::NoAccount,
+        ];
+        let statuses: std::collections::HashSet<String> = cases
+            .iter()
+            .map(|c| {
+                forgot_reply(c, "a@acme.dev")["status"]
+                    .as_str()
+                    .unwrap()
+                    .to_string()
+            })
+            .collect();
+        assert_eq!(statuses.len(), cases.len());
+    }
+
+    #[test]
+    fn the_per_email_counter_holds_no_address() {
+        let k = email_key("jo@acme.dev");
+        assert_eq!(k.len(), 32);
+        assert!(!k.contains("acme"));
+        assert_eq!(k, email_key("jo@acme.dev"));
+        assert_ne!(k, email_key("al@acme.dev"));
+    }
+
+    #[test]
+    fn reset_codes_come_from_cognito_or_the_pools_own_address() {
+        assert_eq!(
+            cognito_sender(Some("COGNITO_DEFAULT"), None, None).as_deref(),
+            Some("no-reply@verificationemail.com")
+        );
+        assert_eq!(
+            cognito_sender(None, None, None).as_deref(),
+            Some(COGNITO_DEFAULT_SENDER)
+        );
+        assert_eq!(
+            cognito_sender(
+                Some("DEVELOPER"),
+                Some("Acme CoderHelm <noreply@acme.dev>"),
+                Some("arn:aws:ses:us-east-1:111122223333:identity/acme.dev")
+            )
+            .as_deref(),
+            Some("noreply@acme.dev")
+        );
+        assert_eq!(
+            cognito_sender(
+                Some("DEVELOPER"),
+                None,
+                Some("arn:aws:ses:us-east-1:111122223333:identity/coderhelm@acme.dev")
+            )
+            .as_deref(),
+            Some("coderhelm@acme.dev")
+        );
+        assert_eq!(
+            cognito_sender(
+                Some("DEVELOPER"),
+                None,
+                Some("arn:aws:ses:us-east-1:111122223333:identity/acme.dev")
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn from_lines_give_their_address() {
+        assert_eq!(
+            address_of("noreply@acme.dev").as_deref(),
+            Some("noreply@acme.dev")
+        );
+        assert_eq!(
+            address_of("Acme <NoReply@Acme.dev>").as_deref(),
+            Some("noreply@acme.dev")
+        );
+        assert_eq!(address_of("acme.dev"), None);
+        assert_eq!(address_of(""), None);
     }
 }
