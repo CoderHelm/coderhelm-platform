@@ -22,7 +22,9 @@ The first self-host release is **v0.7.0**. Older `v0.2.x` to `v0.6.0` tags in th
 
 ## How updates are found
 
-The updater (a Lambda in your account) checks GitHub for releases every hour, keeping the list for an hour. When a newer release appears it emails every install admin once, and posts to your Slack or Teams webhook if you set `updates.webhookUrl`. The notice links to **Settings, then System**, where the release notes are.
+The updater (a Lambda in your account) checks GitHub for releases every hour. Opening **Settings, then System** reads the list again when it is more than two minutes old, and **Check for updates** in the Version section reads it right away; at most one read every 30 seconds per install, each one conditional (an unchanged list costs no GitHub API quota). Pressing **Update** reads the list first too, so it always installs the newest release at that moment. When `launch/latest.json` names a release that GitHub's list doesn't show yet, no older release is offered meanwhile.
+
+When a newer release appears it emails every install admin once, and posts to your Slack or Teams webhook if you set `updates.webhookUrl`. The notice links to **Settings, then System**, where the release notes are.
 
 ## Automatic updates
 
