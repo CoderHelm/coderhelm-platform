@@ -867,7 +867,7 @@ fn user_agent(headers: &HeaderMap) -> &str {
         .unwrap_or("")
 }
 
-fn cookie_header(headers: &HeaderMap) -> &str {
+pub(crate) fn cookie_header(headers: &HeaderMap) -> &str {
     headers
         .get(header::COOKIE)
         .and_then(|v| v.to_str().ok())
@@ -1237,11 +1237,13 @@ async fn google_callback_inner(
 /// GET /auth/methods: the sign-in methods that work on this deployment
 /// (public, no session). The sign-in page shows these and no others.
 pub async fn methods(State(state): State<Arc<AppState>>) -> Response {
-    let m = oauth_signin::sign_in_methods(super::setup_checks::self_hosted(), github_ready(&state));
+    let github = own_github_client(&state) || super::github_hybrid::available();
+    let m = oauth_signin::sign_in_methods(super::setup_checks::self_hosted(), github);
     Json(m).into_response()
 }
 
-fn github_ready(state: &AppState) -> bool {
+/// This deployment's own GitHub OAuth client (id and secret both stored).
+pub(crate) fn own_github_client(state: &AppState) -> bool {
     oauth_signin::github_sign_in_ready(
         &state.secrets.github_client_id,
         &state.secrets.github_client_secret,
@@ -1259,8 +1261,13 @@ fn github_not_set_up(state: &AppState, step: &'static str) -> Option<Response> {
     )
 }
 
-/// GET /auth/github — Redirect to GitHub OAuth (for connecting GitHub account).
+/// GET /auth/github — Redirect to GitHub OAuth (sign in, or connect a GitHub
+/// account). Without an OAuth client of its own, a hybrid install goes
+/// through CoderHelm's GitHub App (routes::github_hybrid).
 pub async fn github_login(State(state): State<Arc<AppState>>) -> Response {
+    if !own_github_client(&state) && super::github_hybrid::available() {
+        return super::github_hybrid::start(&state).await;
+    }
     if let Some(r) = github_not_set_up(&state, "start") {
         return r;
     }
@@ -1340,6 +1347,35 @@ async fn github_callback_inner(
         SignInFailure::new(P, Reason::Provider, "token_exchange", err)
     })?;
 
+    github_sign_in_with_token(state, ip, headers, access_token, TokenFrom::OwnClient).await
+}
+
+/// Where a GitHub user token came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TokenFrom {
+    /// This deployment's own OAuth client exchanged the code.
+    OwnClient,
+    /// CoderHelm's hosted side exchanged it for this install (hybrid,
+    /// routes::github_hybrid). It signs the person in and nothing more: an
+    /// installation joins a hybrid install only through the hosted link
+    /// flow, never through a sign-in.
+    Coderhelm,
+}
+
+/// The rest of every GitHub sign-in, from the person's own GitHub token: who
+/// they are is read from GitHub with it here, never taken from anyone else,
+/// and then this deployment's own rules apply (team and invites, sign-up,
+/// two-factor). The token is used for these calls only and then dropped.
+pub(crate) async fn github_sign_in_with_token(
+    state: &Arc<AppState>,
+    ip: &str,
+    headers: &HeaderMap,
+    access_token: &str,
+    from: TokenFrom,
+) -> Result<Response, SignInFailure> {
+    const P: Provider = Provider::Github;
+    let client = &state.http;
+
     // Fetch user profile
     let user_resp = client
         .get("https://api.github.com/user")
@@ -1372,9 +1408,12 @@ async fn github_callback_inner(
 
     // The installations of our app this GitHub user can access, as GitHub
     // reports them for the user's own token.
-    let all_installations = user_app_installations(state, access_token)
-        .await
-        .map_err(|e| SignInFailure::new(P, Reason::Provider, "installations", e))?;
+    let all_installations = match from {
+        TokenFrom::OwnClient => user_app_installations(state, access_token)
+            .await
+            .map_err(|e| SignInFailure::new(P, Reason::Provider, "installations", e))?,
+        TokenFrom::Coderhelm => Vec::new(),
+    };
 
     // Check if user already has a session (connecting GitHub to existing account)
     let session_token = extract_cookie(cookie_header(headers), "__Host-coderhelm_session");

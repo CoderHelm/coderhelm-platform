@@ -1517,16 +1517,22 @@ pub async fn github_setup(
 pub struct OAuthReturn {
     code: Option<String>,
     state: Option<String>,
+    error: Option<String>,
 }
 
-/// GET /auth/github/callback/hybrid?code=&state=<state>.<installation>: the
-/// GitHub sign-in that proves the installation is the person's.
+/// GET /auth/github/callback/hybrid?code=&state=: GitHub's return to
+/// CoderHelm's app for a hybrid install. `state=<state>.<installation>` is
+/// the GitHub sign-in that proves an installation is the person's (linking);
+/// `state=hsi_…` is an install's own GitHub sign-in ([`sign_in_return`]).
 pub async fn github_signin_return(
     State(state): State<Arc<AppState>>,
     Query(q): Query<OAuthReturn>,
 ) -> Response {
     if master(&state).is_none() {
         return StatusCode::NOT_FOUND.into_response();
+    }
+    if let Some(flow) = q.state.as_deref().filter(|s| s.starts_with("hsi_")) {
+        return sign_in_return(&state, flow, q.code.as_deref(), q.error.as_deref()).await;
     }
     let (Some(code), Some(pending)) = (q.code, q.state) else {
         return (StatusCode::BAD_REQUEST, "Missing code or state.").into_response();
@@ -1538,6 +1544,313 @@ pub async fn github_signin_return(
         return (StatusCode::BAD_REQUEST, "Unknown state.").into_response();
     };
     link_with_code(&state, &st, iid, &code).await
+}
+
+// ── GitHub sign-in on an install (common::hybrid::github_sign_in) ───────
+
+fn sign_in_pk(flow: &str) -> String {
+    format!("HYBRIDSIGNIN#{flow}")
+}
+
+fn sign_in_code_pk(flow: &str) -> String {
+    format!("HYBRIDSIGNINCODE#{flow}")
+}
+
+/// Whether CoderHelm's GitHub App has the OAuth client sign-in needs.
+pub fn github_client_set(state: &AppState) -> bool {
+    !state.secrets.github_client_id.trim().is_empty()
+        && !state.secrets.github_client_secret.trim().is_empty()
+}
+
+/// POST /hybrid/github/sign-in/start (signed) `{redirect_uri, state,
+/// code_challenge}`: start GitHub sign-in for a person on the install. The
+/// return address must be the install's sign-in callback on one of its
+/// verified hosts; the state and the PKCE challenge are the install's own
+/// and come back to it unchanged. Answers the flow id and GitHub's page.
+pub async fn sign_in_start(
+    State(state): State<Arc<AppState>>,
+    method: Method,
+    uri: OriginalUri,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Reply {
+    use common::hybrid::github_sign_in as gs;
+    let install = signed(&state, &headers, &method, &uri, &body).await?;
+    if !install.verified() {
+        return Err(fail(
+            StatusCode::CONFLICT,
+            "not_verified",
+            "Verify the install first.",
+        ));
+    }
+    if !github_client_set(&state) {
+        return Err(fail(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "sign_in_unavailable",
+            "CoderHelm's GitHub App can't sign people in right now.",
+        ));
+    }
+    let b = body_json(&body);
+    let redirect = b["redirect_uri"].as_str().unwrap_or("");
+    if !gs::redirect_allowed(redirect, &install.origins()) {
+        return Err(fail(
+            StatusCode::BAD_REQUEST,
+            "redirect_not_allowed",
+            "The return address isn't this install's sign-in callback.",
+        ));
+    }
+    let (install_state, challenge) = (
+        b["state"].as_str().unwrap_or(""),
+        b["code_challenge"].as_str().unwrap_or(""),
+    );
+    if !gs::is_state(install_state) || !gs::is_challenge(challenge) {
+        return Err(fail(
+            StatusCode::BAD_REQUEST,
+            "bad_request",
+            "Send a state and an S256 code challenge.",
+        ));
+    }
+    let flow = broker::new_handle(gs::FLOW_PREFIX);
+    put_state(
+        &state,
+        &sign_in_pk(&flow),
+        &[
+            ("install_id", &install.id),
+            ("redirect_uri", redirect),
+            ("install_state", install_state),
+            ("code_challenge", challenge),
+        ],
+        gs::START_TTL_SECS,
+    )
+    .await?;
+    let hosted_api = common::public_urls::api_url(&state.config.stage);
+    Ok(Json(json!({
+        "flow": flow,
+        "authorize_url": gs::authorize_url(
+            state.secrets.github_client_id.trim(),
+            hosted_api,
+            &flow,
+            challenge,
+        ),
+    })))
+}
+
+/// GitHub's return for an install's sign-in: the flow is taken once, the
+/// install and its return address are checked again, and the browser goes
+/// on to the install with GitHub's code. Only the code's hash is kept, for
+/// the install's own exchange ([`sign_in_exchange`]); nothing is exchanged here.
+async fn sign_in_return(
+    state: &AppState,
+    flow: &str,
+    code: Option<&str>,
+    error: Option<&str>,
+) -> Response {
+    use common::hybrid::github_sign_in as gs;
+    let gone = || {
+        (
+            StatusCode::BAD_REQUEST,
+            "That sign-in expired or was already used. Start it again from your CoderHelm.",
+        )
+            .into_response()
+    };
+    if !gs::is_flow(flow) {
+        return gone();
+    }
+    let Some(p) = take_state(state, &sign_in_pk(flow)).await else {
+        return gone();
+    };
+    let g = |k: &str| {
+        p.get(k)
+            .and_then(|v| v.as_s().ok())
+            .cloned()
+            .unwrap_or_default()
+    };
+    let (install_id, redirect, install_state, challenge) = (
+        g("install_id"),
+        g("redirect_uri"),
+        g("install_state"),
+        g("code_challenge"),
+    );
+    // The install may have been turned off, or its name released, since.
+    match load_install(state, &install_id).await {
+        Ok(Some(i)) if i.verified() && gs::redirect_allowed(&redirect, &i.origins()) => {}
+        _ => return gone(),
+    }
+    let code = code.filter(|c| !c.is_empty() && c.len() <= 256);
+    let Some(code) = code else {
+        let why = error.unwrap_or("access_denied");
+        return Redirect::to(&gs::return_url(&redirect, Err(why), &install_state, flow))
+            .into_response();
+    };
+    if put_state(
+        state,
+        &sign_in_code_pk(flow),
+        &[
+            ("install_id", &install_id),
+            ("code_challenge", &challenge),
+            ("code_hash", &gs::code_hash(code)),
+        ],
+        gs::RETURN_TTL_SECS,
+    )
+    .await
+    .is_err()
+    {
+        return Redirect::to(&gs::return_url(
+            &redirect,
+            Err("temporarily_unavailable"),
+            &install_state,
+            flow,
+        ))
+        .into_response();
+    }
+    let mut r =
+        Redirect::to(&gs::return_url(&redirect, Ok(code), &install_state, flow)).into_response();
+    r.headers_mut().insert(
+        axum::http::header::REFERRER_POLICY,
+        axum::http::HeaderValue::from_static("no-referrer"),
+    );
+    r
+}
+
+/// POST /hybrid/github/sign-in/exchange (signed) `{flow, code, code_verifier}`:
+/// the install trades GitHub's code for the person's token. Only the install
+/// that started the flow, once, with the same code, and with the verifier
+/// matching its challenge (GitHub checks it too). The token is answered to
+/// the install and not kept or logged here.
+pub async fn sign_in_exchange(
+    State(state): State<Arc<AppState>>,
+    method: Method,
+    uri: OriginalUri,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Reply {
+    use common::hybrid::github_sign_in as gs;
+    let install = signed(&state, &headers, &method, &uri, &body).await?;
+    let b = body_json(&body);
+    let (flow, code, verifier) = (
+        b["flow"].as_str().unwrap_or(""),
+        b["code"].as_str().unwrap_or(""),
+        b["code_verifier"].as_str().unwrap_or(""),
+    );
+    let refused = |why: &str| fail(StatusCode::BAD_REQUEST, "invalid_grant", why);
+    if !gs::is_flow(flow) || code.is_empty() {
+        return Err(refused("Send the flow, the code and the verifier."));
+    }
+    let p = take_state(&state, &sign_in_code_pk(flow))
+        .await
+        .ok_or_else(|| refused("That sign-in was used or expired. Start it again."))?;
+    let g = |k: &str| {
+        p.get(k)
+            .and_then(|v| v.as_s().ok())
+            .cloned()
+            .unwrap_or_default()
+    };
+    if g("install_id") != install.id {
+        audit(
+            &state,
+            &install.id,
+            "github_sign_in_refused",
+            json!({ "why": "another install's flow" }),
+        )
+        .await;
+        return Err(fail(
+            StatusCode::FORBIDDEN,
+            "wrong_install",
+            "That sign-in belongs to another install.",
+        ));
+    }
+    if !gs::same(&g("code_hash"), &gs::code_hash(code)) {
+        return Err(refused(
+            "The code isn't the one GitHub sent for this sign-in.",
+        ));
+    }
+    if !broker::pkce_matches(&g("code_challenge"), verifier) {
+        return Err(refused("The code verifier doesn't match."));
+    }
+    let redirect = format!(
+        "{}{}",
+        common::public_urls::api_url(&state.config.stage),
+        gs::HOSTED_CALLBACK_PATH
+    );
+    let tok: Value = state
+        .http
+        .post("https://github.com/login/oauth/access_token")
+        .header("Accept", "application/json")
+        .json(&json!({
+            "client_id": state.secrets.github_client_id.trim(),
+            "client_secret": state.secrets.github_client_secret.trim(),
+            "code": code,
+            "code_verifier": verifier,
+            "redirect_uri": redirect,
+        }))
+        .send()
+        .await
+        .map_err(|_| {
+            fail(
+                StatusCode::BAD_GATEWAY,
+                "github_unreachable",
+                "CoderHelm couldn't reach GitHub. Try again.",
+            )
+        })?
+        .json()
+        .await
+        .unwrap_or_default();
+    let Some(token) = tok["access_token"].as_str().filter(|t| !t.is_empty()) else {
+        // GitHub's error name only (bad_verification_code and the like).
+        let err: String = tok["error"]
+            .as_str()
+            .unwrap_or("no_token")
+            .chars()
+            .filter(|c| c.is_ascii_alphanumeric() || *c == '_')
+            .take(64)
+            .collect();
+        warn!(install = %install.id, error = %err, "hybrid: GitHub sign-in code refused");
+        return Err(fail(
+            StatusCode::BAD_GATEWAY,
+            "github_refused",
+            "GitHub didn't accept the sign-in. Start it again.",
+        ));
+    };
+    audit(&state, &install.id, "github_sign_in", json!({})).await;
+    Ok(Json(
+        json!({ "access_token": token, "token_type": "bearer" }),
+    ))
+}
+
+/// POST /hybrid/github/sign-in/revoke (signed) `{access_token}`: the install
+/// is done with a sign-in token; revoke it at GitHub (only CoderHelm's
+/// client may). Answers whether GitHub took it back.
+pub async fn sign_in_revoke(
+    State(state): State<Arc<AppState>>,
+    method: Method,
+    uri: OriginalUri,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Reply {
+    let install = signed(&state, &headers, &method, &uri, &body).await?;
+    let b = body_json(&body);
+    let token = b["access_token"]
+        .as_str()
+        .filter(|t| !t.is_empty() && t.len() <= 512)
+        .ok_or_else(|| fail(StatusCode::BAD_REQUEST, "bad_request", "Send the token."))?;
+    if !github_client_set(&state) {
+        return Ok(Json(json!({ "revoked": false })));
+    }
+    let id = state.secrets.github_client_id.trim();
+    let revoked = state
+        .http
+        .delete(format!("https://api.github.com/applications/{id}/token"))
+        .basic_auth(id, Some(state.secrets.github_client_secret.trim()))
+        .header("Accept", "application/vnd.github+json")
+        .header("User-Agent", "Coderhelm")
+        .json(&json!({ "access_token": token }))
+        .send()
+        .await
+        .is_ok_and(|r| r.status() == StatusCode::NO_CONTENT);
+    if !revoked {
+        warn!(install = %install.id, "hybrid: GitHub sign-in token not revoked");
+    }
+    Ok(Json(json!({ "revoked": revoked })))
 }
 
 /// Does this GitHub user see the installation of CoderHelm's own app

@@ -3774,8 +3774,17 @@ mod tests {
             "sign_in::second_step",
             "Google user created"
         ));
-        // GitHub: the organization's records or the landing, never a new team.
-        let github = body(auth, "github_callback_inner");
+        // GitHub (own client, or through CoderHelm on a hybrid install: both
+        // reach the same function with the person's own token): the
+        // organization's records or the landing, never a new team.
+        assert!(body(auth, "github_callback_inner").contains("github_sign_in_with_token("));
+        let hybrid = include_str!("github_hybrid.rs");
+        let hybrid_cb = body(hybrid, "callback_inner");
+        assert!(hybrid_cb.contains("github_sign_in_with_token("));
+        assert!(before(hybrid_cb, "check_return(", "client::call("));
+        // The hosted side can't hand the install a session: none is made there.
+        assert!(!hybrid.contains("create_session_token"));
+        let github = body(auth, "github_sign_in_with_token");
         assert!(before(github, "selfhost_landing", "Brand new user"));
         assert!(before(
             github,
@@ -4031,7 +4040,7 @@ mod tests {
             "sign_in::second_step",
             "SignInProof::new(false, \"google\")"
         ));
-        let github = body(auth, "github_callback_inner");
+        let github = body(auth, "github_sign_in_with_token");
         assert!(before(
             github,
             "sign_in::second_step",
@@ -4250,7 +4259,7 @@ mod tests {
         ));
         // No session without its proof.
         assert!(!google.contains("jwt::create_token("));
-        let github = body(auth, "github_callback_inner");
+        let github = body(auth, "github_sign_in_with_token");
         let tail = &github[github.find("\"User authenticated via GitHub\"").unwrap()..];
         assert!(tail.contains("\n    if let Some(resp) = sign_in::second_step("));
         assert!(before(

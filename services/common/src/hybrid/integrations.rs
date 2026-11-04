@@ -16,6 +16,9 @@ pub enum Mode {
     Hosted,
     /// Works from the install directly with no app from anyone.
     Direct,
+    /// On for every registered install, with nothing to choose: it works
+    /// through CoderHelm's app until the install has its own.
+    Included,
     /// Not offered through CoderHelm's apps.
     Unavailable,
 }
@@ -104,10 +107,10 @@ pub const CATALOG: &[Entry] = &[
     Entry {
         id: "github_sign_in",
         name: "Sign in with GitHub",
-        mode: Mode::Unavailable,
-        through_coderhelm: "",
-        stays_with_you: "",
-        reason: "Signing people in to your install with GitHub needs your own GitHub App: a hosted app's sign-in would hand CoderHelm your people's identities. Use email sign-in, or Google with your own domain.",
+        mode: Mode::Included,
+        through_coderhelm: "Without a GitHub OAuth client of your own, GitHub's sign-in page is CoderHelm's GitHub App: CoderHelm passes GitHub's one-time code to your install, exchanges it when your install asks (with a secret only your install holds), and revokes the token at GitHub seconds later. It stores neither and doesn't ask GitHub who signed in.",
+        stays_with_you: "Who signs in: your install asks GitHub itself whose account it is, then applies its own rules (team members and invites, two-factor). CoderHelm can't start a session on your install or choose who signs in.",
+        reason: "",
     },
 ];
 

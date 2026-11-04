@@ -10,6 +10,8 @@
 //! - [`sign`]: the signatures between an install and the hosted side (install
 //!   requests, relayed events, ownership proofs), with replay protection.
 //! - [`broker`]: what the hosted token broker may mint for an install.
+//! - [`github_sign_in`]: GitHub sign-in on an install through CoderHelm's
+//!   GitHub App (the hosted side carries the trip; the install decides).
 //! - [`client`]: the install's registration and its signed calls to the hosted side.
 //! - [`relay`]: forwarding one event to an install, with retries.
 //! - [`integrations`]: which integrations work through CoderHelm's apps, and
@@ -24,6 +26,7 @@
 
 pub mod broker;
 pub mod client;
+pub mod github_sign_in;
 pub mod hosted_sig;
 pub mod integrations;
 pub mod name_check;

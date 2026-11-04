@@ -216,16 +216,17 @@ fn cookie_value<'a>(cookie_header: &'a str, name: &str) -> Option<&'a str> {
         .filter(|v| !v.is_empty())
 }
 
-/// GitHub sign-in works only with an OAuth client of the install's own: its
-/// client id and secret. A hybrid install on CoderHelm's GitHub App has
-/// neither, and CoderHelm's client can't sign anyone in to it (the hosted
-/// side never vouches for a person on an install).
+/// This deployment's own GitHub OAuth client: its id and secret. A hybrid
+/// install on CoderHelm's GitHub App has neither and signs people in with
+/// GitHub through CoderHelm instead (routes::github_hybrid), where the
+/// install itself, not the hosted side, decides who signs in.
 pub fn github_sign_in_ready(client_id: &str, client_secret: &str) -> bool {
     !client_id.trim().is_empty() && !client_secret.trim().is_empty()
 }
 
-/// `GET /auth/github` (and its callback) with no client: back to the sign-in
-/// screen with `not_set_up`, never to GitHub with an empty `client_id`.
+/// `GET /auth/github` (and its callback) with no client and no way through
+/// CoderHelm: back to the sign-in screen with `not_set_up`, never to GitHub
+/// with an empty `client_id`.
 pub fn github_not_set_up(
     client_id: &str,
     client_secret: &str,
@@ -245,7 +246,8 @@ pub fn github_not_set_up(
 
 /// The sign-in methods that work here, which the sign-in page shows and
 /// nothing else: email and password always, Google only on the hosted
-/// deployment, GitHub only with the install's own OAuth client.
+/// deployment, GitHub with the install's own OAuth client or, on a hybrid
+/// install, through CoderHelm's GitHub App.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub struct SignInMethods {
     pub password: bool,
@@ -311,7 +313,7 @@ mod tests {
     #[test]
     fn github_sign_in_needs_both_halves_of_the_client() {
         assert!(github_sign_in_ready("Iv1.abc", "secret"));
-        // A hybrid install on CoderHelm's app: no client of its own.
+        // No client of its own (a hybrid install signs in through CoderHelm).
         assert!(!github_sign_in_ready("", ""));
         assert!(!github_sign_in_ready("Iv1.abc", ""));
         assert!(!github_sign_in_ready("", "secret"));
