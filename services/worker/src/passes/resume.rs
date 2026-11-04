@@ -4547,6 +4547,9 @@ pub(crate) fn draft_hold(body: &str, title: &str, proven: bool) -> Option<&'stat
     if super::own_review::hold(body).is_some() {
         return Some("CoderHelm's own review findings are open in the description");
     }
+    if super::stack::hold(body).is_some() {
+        return Some("the stacked change asks for a look first");
+    }
     if !proven && is_e2e_proof_pr(title) {
         return Some("an end-to-end proof PR waits for its repeat runs");
     }

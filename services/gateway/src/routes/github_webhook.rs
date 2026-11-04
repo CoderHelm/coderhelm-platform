@@ -3623,6 +3623,38 @@ fn tool_definition_paths(payload: &Value) -> Vec<String> {
     paths
 }
 
+/// The rebuild a push asks for: a force push (not a deletion or a new
+/// branch) to a branch other than the default one.
+fn restack_message(
+    payload: &Value,
+    installation_id: u64,
+    team_id: &str,
+    owner: &str,
+    name: &str,
+) -> Option<crate::models::RestackMessage> {
+    let flag = |k: &str| payload[k].as_bool().unwrap_or(false);
+    if !flag("forced") || flag("deleted") || flag("created") {
+        return None;
+    }
+    let branch = payload["ref"].as_str()?.strip_prefix("refs/heads/")?;
+    let default_branch = payload["repository"]["default_branch"]
+        .as_str()
+        .unwrap_or("main");
+    let before = payload["before"].as_str().unwrap_or("");
+    if branch == default_branch || before.is_empty() || before.chars().all(|c| c == '0') {
+        return None;
+    }
+    Some(crate::models::RestackMessage {
+        team_id: team_id.to_string(),
+        installation_id,
+        repo_owner: owner.to_string(),
+        repo_name: name.to_string(),
+        branch: branch.to_string(),
+        before: before.to_string(),
+        after: payload["after"].as_str().unwrap_or("").to_string(),
+    })
+}
+
 async fn handle_push(
     state: &AppState,
     payload: &Value,
@@ -3647,6 +3679,16 @@ async fn handle_push(
     // A new tag → release notes (for tags CoderHelm didn't cut itself).
     if let Some(tag) = git_ref.strip_prefix("refs/tags/") {
         return handle_tag_push(state, payload, installation_id, team_id, owner, name, tag).await;
+    }
+    // A force push (a rebase) to a branch other pull requests may stack on:
+    // CoderHelm's stacked pull requests get rebuilt on its new head.
+    if let Some(m) = restack_message(payload, installation_id, team_id, owner, name) {
+        let _ = send_to_queue(
+            state,
+            &state.config.ticket_queue_url,
+            &WorkerMessage::Restack(m),
+        )
+        .await;
     }
     // Only the branch the graph tracks.
     if git_ref != format!("refs/heads/{default_branch}") {
@@ -5010,5 +5052,49 @@ mod close_reason_tests {
         ));
         assert!(!is_own_actor(&serde_json::json!({"login": "pat"})));
         assert!(!is_own_actor(&serde_json::json!({})));
+    }
+}
+
+#[cfg(test)]
+mod restack_tests {
+    use super::*;
+
+    #[test]
+    fn only_a_force_push_to_another_branch_rebuilds_its_stack() {
+        let push = |forced: bool, r: &str, before: &str| {
+            serde_json::json!({
+                "ref": r,
+                "forced": forced,
+                "before": before,
+                "after": "b2",
+                "repository": {"default_branch": "main"},
+            })
+        };
+        let m = restack_message(
+            &push(true, "refs/heads/coderhelm/feature-a", "a1"),
+            7,
+            "t1",
+            "acme",
+            "web",
+        )
+        .unwrap();
+        assert_eq!(
+            (m.branch.as_str(), m.before.as_str(), m.after.as_str()),
+            ("coderhelm/feature-a", "a1", "b2")
+        );
+        assert_eq!((m.installation_id, m.repo_owner.as_str()), (7, "acme"));
+        // A plain push, the default branch, a tag, a new branch: nothing.
+        for p in [
+            push(false, "refs/heads/coderhelm/feature-a", "a1"),
+            push(true, "refs/heads/main", "a1"),
+            push(true, "refs/tags/v1", "a1"),
+            push(
+                true,
+                "refs/heads/x",
+                "0000000000000000000000000000000000000000",
+            ),
+        ] {
+            assert!(restack_message(&p, 7, "t1", "acme", "web").is_none());
+        }
     }
 }

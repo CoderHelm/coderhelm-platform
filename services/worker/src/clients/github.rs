@@ -1706,137 +1706,222 @@ impl GitHubClient {
         Ok(RebaseResult::Rebased(tip))
     }
 
-    /// `git rebase --onto`: moves `branch` onto `onto` replaying only its
-    /// own commits, leaving out `drop` (copies of `onto`'s commits under
-    /// other hashes, which `onto` already has) and merge commits. The result
-    /// must hold the code the branch would have with `onto` merged in
-    /// ([`onto_holds`]), and the branch moves with a lease, as in
-    /// [`Self::rebase_branch`].
-    pub async fn rebase_onto(
+    // ─── Building a change on another branch, file by file ─────
+
+    /// Every commit in `base...head`, oldest first, following GitHub's
+    /// pages until the compare's `total_commits` are all listed. An error
+    /// when they can't all be read: a partial list would leave work out.
+    pub async fn compare_all_commits(
         &self,
         owner: &str,
         repo: &str,
-        branch: &str,
-        onto: &str,
-        drop: &[String],
-        lease: &str,
-    ) -> Result<RebaseResult, Box<dyn std::error::Error + Send + Sync>> {
-        let onto_sha = self.get_ref(owner, repo, onto).await?;
-        let cmp = self
-            .get(&format!(
-                "{API_BASE}/repos/{owner}/{repo}/compare/{onto_sha}...{lease}"
-            ))
-            .await?;
-        let onto_in_branch = cmp["behind_by"].as_u64() == Some(0);
-        if onto_in_branch && drop.is_empty() {
-            return Ok(RebaseResult::UpToDate);
+        base: &str,
+        head: &str,
+    ) -> Result<Vec<serde_json::Value>, Box<dyn std::error::Error + Send + Sync>> {
+        let mut out = Vec::new();
+        let mut total = 0usize;
+        for page in 1..=200u32 {
+            let data = self
+                .get(&format!(
+                    "{API_BASE}/repos/{owner}/{repo}/compare/{base}...{head}?per_page=100&page={page}"
+                ))
+                .await?;
+            total = data["total_commits"].as_u64().unwrap_or(0) as usize;
+            let batch = data["commits"].as_array().cloned().unwrap_or_default();
+            let empty = batch.is_empty();
+            out.extend(batch);
+            if out.len() >= total || empty {
+                break;
+            }
         }
-        let Some((steps, merges_dropped)) = onto_steps(&cmp, drop) else {
-            return Ok(RebaseResult::NotClean(
-                "too many commits to replay".to_string(),
-            ));
-        };
-        if steps.is_empty() {
-            return Ok(RebaseResult::NotClean(
-                "the branch has no commits of its own".to_string(),
-            ));
+        if out.len() < total {
+            return Err(format!(
+                "GitHub listed {} of the {total} commits in {base}...{head}",
+                out.len()
+            )
+            .into());
         }
-        let scratch = format!(
-            "coderhelm-rebase/{branch}-{}",
-            chrono::Utc::now().timestamp_millis()
-        );
-        self.create_branch(owner, repo, &scratch, &onto_sha).await?;
-        let result = self
-            .replay(owner, repo, &scratch, &onto_sha, lease, &steps)
-            .await;
-        let _ = self.delete_branch(owner, repo, &scratch).await;
-        let (tip, tip_tree) = match result? {
-            Ok(t) => t,
-            Err(why) => return Ok(RebaseResult::NotClean(why)),
-        };
-        let branch_tree = self.git_commit(owner, repo, lease).await?["tree"]["sha"]
-            .as_str()
-            .unwrap_or("")
-            .to_string();
-        let merged_tree = if onto_in_branch {
-            None
-        } else {
-            let check = format!("{scratch}-check");
-            self.create_branch(owner, repo, &check, lease).await?;
-            let merged = self
-                .merge_returning(owner, repo, &check, &onto_sha, "rebase check")
-                .await;
-            let _ = self.delete_branch(owner, repo, &check).await;
-            merged?.and_then(|c| {
-                c.pointer("/commit/tree/sha")
-                    .and_then(|v| v.as_str())
-                    .map(String::from)
-            })
-        };
-        if let Err(why) = onto_holds(
-            onto_in_branch,
-            &branch_tree,
-            merged_tree.as_deref(),
-            merges_dropped,
-            &tip_tree,
-        ) {
-            return Ok(RebaseResult::NotClean(why));
-        }
-        if self.get_ref(owner, repo, branch).await? != lease {
-            return Ok(RebaseResult::Moved);
-        }
-        self.move_scratch_ref(owner, repo, branch, &tip).await?;
-        self.invalidate_snapshot(owner, repo, branch).await;
-        Ok(RebaseResult::Rebased(tip))
+        Ok(out)
     }
 
-    /// Moves `branch`, which already has `onto` merged in, to one new commit
-    /// on `onto` holding exactly the branch's code: what a rebase that drops
-    /// copies of `onto`'s commits gives when its own commits don't replay
-    /// one by one. Nothing of the code changes (same tree); the branch moves
-    /// with a lease.
-    pub async fn flatten_onto(
+    /// A commit's tree and parents (the git data API).
+    pub async fn commit_tree_parents(
+        &self,
+        owner: &str,
+        repo: &str,
+        sha: &str,
+    ) -> Result<(String, Vec<String>), Box<dyn std::error::Error + Send + Sync>> {
+        let c = self.git_commit(owner, repo, sha).await?;
+        let tree = c["tree"]["sha"]
+            .as_str()
+            .ok_or("Missing tree sha in commit")?
+            .to_string();
+        let parents = c["parents"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|p| p["sha"].as_str().map(String::from))
+            .collect();
+        Ok((tree, parents))
+    }
+
+    /// A tree's entries by path: the whole tree in one read when GitHub
+    /// returns it complete, else `None` (the caller walks it level by level
+    /// with [`Self::tree_level`]).
+    pub async fn tree_all(
+        &self,
+        owner: &str,
+        repo: &str,
+        tree: &str,
+    ) -> Result<Option<HashMap<String, GitEntry>>, Box<dyn std::error::Error + Send + Sync>> {
+        let data = self
+            .get(&format!(
+                "{API_BASE}/repos/{owner}/{repo}/git/trees/{tree}?recursive=1"
+            ))
+            .await?;
+        if data["truncated"].as_bool().unwrap_or(false) {
+            return Ok(None);
+        }
+        Ok(Some(
+            data["tree"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|e| Some((e["path"].as_str()?.to_string(), GitEntry::from_json(e)?)))
+                .collect(),
+        ))
+    }
+
+    /// One level of a tree: each name and its entry, directories (`tree`)
+    /// included.
+    pub async fn tree_level(
+        &self,
+        owner: &str,
+        repo: &str,
+        tree: &str,
+    ) -> Result<Vec<(String, GitEntry)>, Box<dyn std::error::Error + Send + Sync>> {
+        let data = self
+            .get(&format!("{API_BASE}/repos/{owner}/{repo}/git/trees/{tree}"))
+            .await?;
+        Ok(data["tree"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|e| {
+                Some((
+                    e["path"].as_str()?.to_string(),
+                    GitEntry {
+                        mode: e["mode"].as_str().unwrap_or("").to_string(),
+                        kind: e["type"].as_str()?.to_string(),
+                        sha: e["sha"].as_str()?.to_string(),
+                    },
+                ))
+            })
+            .collect())
+    }
+
+    /// A blob's bytes.
+    pub async fn blob_bytes(
+        &self,
+        owner: &str,
+        repo: &str,
+        sha: &str,
+    ) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
+        let b = self
+            .get(&format!("{API_BASE}/repos/{owner}/{repo}/git/blobs/{sha}"))
+            .await?;
+        let content = b["content"].as_str().ok_or("Missing blob content")?;
+        if b["encoding"].as_str() == Some("utf-8") {
+            return Ok(content.as_bytes().to_vec());
+        }
+        let clean: String = content.chars().filter(|c| !c.is_whitespace()).collect();
+        Ok(B64.decode(clean)?)
+    }
+
+    /// Writes a blob and returns its sha.
+    pub async fn put_blob(
+        &self,
+        owner: &str,
+        repo: &str,
+        bytes: &[u8],
+    ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+        let b = self
+            .post(
+                &format!("{API_BASE}/repos/{owner}/{repo}/git/blobs"),
+                &serde_json::json!({"content": B64.encode(bytes), "encoding": "base64"}),
+            )
+            .await?;
+        b["sha"]
+            .as_str()
+            .map(String::from)
+            .ok_or_else(|| "Missing blob sha".into())
+    }
+
+    /// Writes the tree `base_tree` with `changes` laid over it (`None`
+    /// removes the path) and returns its sha.
+    pub async fn put_tree(
+        &self,
+        owner: &str,
+        repo: &str,
+        base_tree: &str,
+        changes: &[(String, Option<GitEntry>)],
+    ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+        let entries: Vec<serde_json::Value> = changes
+            .iter()
+            .map(|(path, e)| match e {
+                Some(e) => serde_json::json!({
+                    "path": path, "mode": e.mode, "type": e.kind, "sha": e.sha,
+                }),
+                None => serde_json::json!({
+                    "path": path, "mode": "100644", "type": "blob", "sha": null,
+                }),
+            })
+            .collect();
+        let t = self
+            .post(
+                &format!("{API_BASE}/repos/{owner}/{repo}/git/trees"),
+                &serde_json::json!({"base_tree": base_tree, "tree": entries}),
+            )
+            .await?;
+        t["sha"]
+            .as_str()
+            .map(String::from)
+            .ok_or_else(|| "Missing tree sha".into())
+    }
+
+    /// Writes a commit of `tree` on `parents` and returns its sha.
+    pub async fn put_commit(
+        &self,
+        owner: &str,
+        repo: &str,
+        message: &str,
+        tree: &str,
+        parents: &[String],
+    ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+        self.new_commit(
+            owner,
+            repo,
+            serde_json::json!({"message": message, "tree": tree, "parents": parents}),
+        )
+        .await
+    }
+
+    /// Moves `branch` to `to` only if it still points at `lease`: `false`
+    /// (nothing moved) when someone pushed since.
+    pub async fn move_with_lease(
         &self,
         owner: &str,
         repo: &str,
         branch: &str,
-        onto: &str,
-        message: &str,
         lease: &str,
-    ) -> Result<RebaseResult, Box<dyn std::error::Error + Send + Sync>> {
-        let onto_sha = self.get_ref(owner, repo, onto).await?;
-        let status = self.compare_status(owner, repo, &onto_sha, lease).await?;
-        if status != "ahead" && status != "identical" {
-            return Ok(RebaseResult::NotClean(format!(
-                "`{onto}` isn't merged into the branch yet"
-            )));
-        }
-        let tree = self.git_commit(owner, repo, lease).await?["tree"]["sha"]
-            .as_str()
-            .ok_or("Missing tree sha in branch commit")?
-            .to_string();
-        let onto_tree = self.git_commit(owner, repo, &onto_sha).await?["tree"]["sha"]
-            .as_str()
-            .unwrap_or("")
-            .to_string();
-        if tree == onto_tree {
-            return Ok(RebaseResult::NotClean(
-                "the branch has no change of its own".to_string(),
-            ));
-        }
-        let tip = self
-            .new_commit(
-                owner,
-                repo,
-                serde_json::json!({"message": message, "tree": tree, "parents": [onto_sha]}),
-            )
-            .await?;
+        to: &str,
+    ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
         if self.get_ref(owner, repo, branch).await? != lease {
-            return Ok(RebaseResult::Moved);
+            return Ok(false);
         }
-        self.move_scratch_ref(owner, repo, branch, &tip).await?;
+        self.move_scratch_ref(owner, repo, branch, to).await?;
         self.invalidate_snapshot(owner, repo, branch).await;
-        Ok(RebaseResult::Rebased(tip))
+        Ok(true)
     }
 
     /// Replays `steps` on the scratch ref starting at `base_sha`. The new
@@ -2509,27 +2594,33 @@ impl GitHubClient {
         Ok(v.as_array().cloned().unwrap_or_default())
     }
 
-    /// The files one commit changes, as (path, patch), first 300.
-    pub async fn commit_patches(
+    /// A commit's changed files, every page of them (GitHub lists 300 a
+    /// page, up to 3000): each path, the path it was renamed from, its patch.
+    pub async fn commit_changes(
         &self,
         owner: &str,
         repo: &str,
         sha: &str,
-    ) -> Result<Vec<(String, String)>, Box<dyn std::error::Error + Send + Sync>> {
-        let v = self
-            .get(&format!("{API_BASE}/repos/{owner}/{repo}/commits/{sha}"))
-            .await?;
-        Ok(v["files"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .map(|f| {
-                (
-                    f["filename"].as_str().unwrap_or("").to_string(),
-                    f["patch"].as_str().unwrap_or("").to_string(),
-                )
-            })
-            .collect())
+    ) -> Result<Vec<CommitFile>, Box<dyn std::error::Error + Send + Sync>> {
+        let mut out = Vec::new();
+        for page in 1..=10u32 {
+            let v = self
+                .get(&format!(
+                    "{API_BASE}/repos/{owner}/{repo}/commits/{sha}?page={page}"
+                ))
+                .await?;
+            let files = v["files"].as_array().cloned().unwrap_or_default();
+            let n = files.len();
+            out.extend(files.iter().map(|f| CommitFile {
+                path: f["filename"].as_str().unwrap_or("").to_string(),
+                previous: f["previous_filename"].as_str().map(String::from),
+                patch: f["patch"].as_str().unwrap_or("").to_string(),
+            }));
+            if n < 300 {
+                break;
+            }
+        }
+        Ok(out)
     }
 
     /// An issue (title, body, author), as the issues endpoint returns it.
@@ -4042,6 +4133,36 @@ pub struct DirEntry {
     pub path: String,
 }
 
+/// A path's entry in a git tree: its mode, type (`blob`, `commit` for a
+/// submodule) and object sha.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GitEntry {
+    pub mode: String,
+    pub kind: String,
+    pub sha: String,
+}
+
+impl GitEntry {
+    /// A tree listing's entry; `None` for a directory (a `tree`).
+    pub fn from_json(e: &serde_json::Value) -> Option<GitEntry> {
+        let kind = e["type"].as_str()?;
+        (kind != "tree").then(|| GitEntry {
+            mode: e["mode"].as_str().unwrap_or("100644").to_string(),
+            kind: kind.to_string(),
+            sha: e["sha"].as_str().unwrap_or("").to_string(),
+        })
+    }
+}
+
+/// One file a commit changed: its path, the path it was renamed from, its
+/// patch (empty for a binary or very large file).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct CommitFile {
+    pub path: String,
+    pub previous: Option<String>,
+    pub patch: String,
+}
+
 /// File operation for batch_write.
 pub enum FileOp {
     Write { path: String, content: String },
@@ -4107,48 +4228,6 @@ pub fn replay_steps(compare: &serde_json::Value) -> Option<Vec<ReplayStep>> {
         })
         .collect();
     (steps.len() <= MAX_REPLAY).then_some(steps)
-}
-
-/// The branch's own commits for `git rebase --onto`: [`replay_steps`]
-/// without the commits in `drop`, and whether merge commits were left out
-/// (their conflict resolutions aren't replayed).
-pub fn onto_steps(compare: &serde_json::Value, drop: &[String]) -> Option<(Vec<ReplayStep>, bool)> {
-    let steps = replay_steps(compare)?;
-    let merges = compare["commits"].as_array().is_some_and(|c| {
-        c.iter()
-            .any(|c| c["parents"].as_array().is_some_and(|p| p.len() > 1))
-    });
-    let own = steps
-        .into_iter()
-        .filter(|s| !drop.contains(&s.sha))
-        .collect();
-    Some((own, merges))
-}
-
-/// Whether a rebase onto another branch kept the branch's code. With that
-/// branch already merged in, the result must hold the branch's code
-/// exactly. Otherwise it must hold what merging it in gives; when that
-/// merge conflicts (the copies are older versions of its commits) the
-/// replayed commits are trusted only if no merge commit was left out.
-pub fn onto_holds(
-    onto_in_branch: bool,
-    branch_tree: &str,
-    merged_tree: Option<&str>,
-    merges_dropped: bool,
-    tip_tree: &str,
-) -> Result<(), String> {
-    let same = if onto_in_branch {
-        tip_tree == branch_tree
-    } else if let Some(m) = merged_tree {
-        tip_tree == m
-    } else {
-        !merges_dropped
-    };
-    if same {
-        Ok(())
-    } else {
-        Err("the rebased code differs from the branch with that branch merged in".to_string())
-    }
 }
 
 /// Whether a compare's commits (merge commits aside) were all committed by
@@ -4253,41 +4332,6 @@ mod rebase_tests {
         });
         assert!(!commits_all_by(&truncated, "app[bot]"));
         assert!(replay_steps(&truncated).is_none());
-    }
-
-    #[test]
-    fn a_rebase_onto_replays_only_the_branch_s_own_commits() {
-        // acme/web: c1 and c2 copy the dependency's commits, o1 is the run's.
-        let cmp = json!({
-            "total_commits": 4,
-            "commits": [
-                commit("c1", &["b0"], "app[bot]"),
-                commit("c2", &["c1"], "app[bot]"),
-                commit("m1", &["c2", "d9"], "app[bot]"),
-                commit("o1", &["m1"], "app[bot]"),
-            ],
-        });
-        let (steps, merges) = onto_steps(&cmp, &["c1".into(), "c2".into()]).unwrap();
-        assert_eq!(
-            steps.iter().map(|s| s.sha.as_str()).collect::<Vec<_>>(),
-            vec!["o1"]
-        );
-        assert!(merges);
-        let plain = json!({"total_commits": 1, "commits": [commit("o1", &["b0"], "x")]});
-        assert!(!onto_steps(&plain, &[]).unwrap().1);
-    }
-
-    #[test]
-    fn a_rebase_onto_keeps_the_branch_s_code_or_is_refused() {
-        // Already merged in: exactly the branch's code.
-        assert!(onto_holds(true, "t1", None, true, "t1").is_ok());
-        assert!(onto_holds(true, "t1", None, false, "t2").is_err());
-        // Not merged in: what merging it in gives.
-        assert!(onto_holds(false, "t1", Some("t3"), false, "t3").is_ok());
-        assert!(onto_holds(false, "t1", Some("t3"), false, "t2").is_err());
-        // The merge conflicts (older copies): trusted without dropped merges.
-        assert!(onto_holds(false, "t1", None, false, "t2").is_ok());
-        assert!(onto_holds(false, "t1", None, true, "t2").is_err());
     }
 }
 

@@ -85,6 +85,11 @@ pub enum WorkerMessage {
     /// branch's current HEAD — skipping if that commit is already tagged.
     #[serde(rename = "tag_sweep")]
     TagSweep(TagSweepMessage),
+    /// A branch was force-pushed (rebased): CoderHelm's open pull requests
+    /// stacked on it get their own change rebuilt on its new head, one at
+    /// a time (`worker::passes::restack`).
+    #[serde(rename = "restack")]
+    Restack(RestackMessage),
     /// Release notes for a release tag CoderHelm just cut (or a re-send from the
     /// dashboard): GitHub Release + Confluence changelog entry + IT email.
     #[serde(rename = "release_notes")]
@@ -345,9 +350,10 @@ impl WorkerMessage {
         use crate::usage::feature as f;
         match self {
             WorkerMessage::Ticket(t) if matches!(t.source, TicketSource::Alert) => f::ALERT,
-            WorkerMessage::Ticket(_) | WorkerMessage::Resume(_) | WorkerMessage::MarkReady(_) => {
-                f::RUN
-            }
+            WorkerMessage::Ticket(_)
+            | WorkerMessage::Resume(_)
+            | WorkerMessage::MarkReady(_)
+            | WorkerMessage::Restack(_) => f::RUN,
             WorkerMessage::Feedback(_) | WorkerMessage::JiraComment(_) => f::FEEDBACK,
             WorkerMessage::Lesson(_) | WorkerMessage::RewardOutcome(_) => f::MEMORY,
             WorkerMessage::Onboard(_) => f::ONBOARD,
@@ -725,6 +731,20 @@ pub struct MarkReadyMessage {
     pub repo_owner: String,
     pub repo_name: String,
     pub pr_number: u64,
+}
+
+/// A force push to `branch` (from `before` to `after`).
+#[derive(Serialize, Deserialize, Debug, Default, Clone)]
+pub struct RestackMessage {
+    pub team_id: String,
+    pub installation_id: u64,
+    pub repo_owner: String,
+    pub repo_name: String,
+    pub branch: String,
+    /// The branch's head before the push: where the stacked branches'
+    /// own work starts.
+    pub before: String,
+    pub after: String,
 }
 
 #[derive(Serialize, Deserialize, Debug, Default)]

@@ -22,14 +22,16 @@
 //!   re-created another pull request's commits (any open pull request of
 //!   the repository, CoderHelm's or a person's) is moved onto that pull
 //!   request's branch without the copies and stacks on it ([`before_pr`]):
-//!   its own commits are replayed with the copies left out, or, when they
-//!   don't replay cleanly, that branch is merged in (the model resolves
-//!   conflicts) and the change becomes one commit on top of it. Copies
-//!   usually come from the dependency's branch being rebased after the run
-//!   started on it: its commits got new hashes and the run's branch still
-//!   holds the old ones. A branch kept from an earlier attempt is checked
-//!   before any implementation ([`at_start`]). The run stops only when
-//!   neither way works, saying what the person can do.
+//!   its own change is rebuilt there file by file as one commit
+//!   ([`super::restack`]), however many commits it has and without merging
+//!   anything first. Copies usually come from the dependency's branch being
+//!   rebased after the run started on it: its commits got new hashes and
+//!   the run's branch still holds the old ones. A branch kept from an
+//!   earlier attempt is rebuilt the same way before any implementation
+//!   ([`at_start`]), and a force push to a branch CoderHelm's open pull
+//!   requests stack on rebuilds them ([`super::restack::after_forced_push`]).
+//!   The pull request always opens; only a missing GitHub App permission
+//!   stops the run, naming it.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::hash::{Hash, Hasher};
@@ -37,7 +39,9 @@ use std::hash::{Hash, Hasher};
 use regex::Regex;
 use serde_json::Value;
 
-use crate::clients::github::{GitHubClient, RebaseResult};
+use crate::clients::github::{CommitFile, GitHubClient};
+
+use super::restack;
 
 /// The open pull request a branch builds on.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -47,26 +51,70 @@ pub struct Dependency {
     pub title: String,
     /// How it was found (the ticket's line, or the commits it copied).
     pub why: String,
+    /// Files both changed whose two versions couldn't be merged: the
+    /// rebuilt commit keeps the dependency's, a labelled follow-up commit
+    /// puts this change's back. The pull request stays a draft.
+    pub unresolved: Vec<String>,
+    /// The branch repeats the dependency's commits and couldn't be rebuilt
+    /// on it: the pull request targets the original base, as a draft.
+    pub not_stacked: bool,
 }
 
 impl Dependency {
     /// The pull request section: what it builds on and the merge order.
     pub fn section(&self) -> String {
-        format!(
-            "{SECTION_START}\n## Builds on #{n}\n\nThis pull request is stacked on #{n} (`{b}`, \
-             \"{t}\"): its base is that branch, so its diff shows only this ticket's change. {why}\n\n\
-             Merge order: #{n} first, then this one. When #{n} merges, GitHub moves this pull \
-             request's base to #{n}'s base; CoderHelm rebases it if needed.\n{SECTION_END}",
-            n = self.number,
-            b = self.branch,
-            t = self.title.replace('"', "'"),
-            why = self.why.trim(),
-        )
+        let (n, b) = (self.number, &self.branch);
+        let t = self.title.replace('"', "'");
+        let why = self.why.trim();
+        let mut out = if self.not_stacked {
+            format!(
+                "## Repeats #{n}\n\nThis pull request carries commits of #{n} (`{b}`, \"{t}\") \
+                 under other hashes, so its diff shows them too. {why}\n\n\
+                 Merge order: #{n} first, then this one. It stays a draft until it is rebuilt on \
+                 `{b}`: running the ticket again does that."
+            )
+        } else {
+            format!(
+                "## Builds on #{n}\n\nThis pull request is stacked on #{n} (`{b}`, \"{t}\"): its \
+                 base is that branch, so its diff shows only this ticket's change. {why}\n\n\
+                 Merge order: #{n} first, then this one. When #{n} merges, GitHub moves this pull \
+                 request's base to #{n}'s base; CoderHelm rebases it if needed."
+            )
+        };
+        if !self.unresolved.is_empty() {
+            out.push_str(&format!(
+                "\n\n### Needs a look\n\n#{n} also changed these files, and the two versions \
+                 couldn't be merged. The rebuilt commit keeps #{n}'s version; the commit after it, \
+                 labelled \"Follow-up\", puts this change's back. Check that each keeps #{n}'s \
+                 work before merging; the pull request stays a draft until then.\n"
+            ));
+            for p in &self.unresolved {
+                out.push_str(&format!("\n- `{p}`"));
+            }
+        }
+        let hold = if self.not_stacked || !self.unresolved.is_empty() {
+            format!("\n{HOLD}")
+        } else {
+            String::new()
+        };
+        format!("{SECTION_START}\n{out}{hold}\n{SECTION_END}")
     }
 }
 
 pub const SECTION_START: &str = "<!-- coderhelm:stack -->";
 pub const SECTION_END: &str = "<!-- /coderhelm:stack -->";
+/// In the stack section when a person has to look before it merges.
+const HOLD: &str = "<!-- coderhelm:stack-hold -->";
+
+/// Why a pull request stays a draft: its stack section asks a person to
+/// look first (files both pull requests changed, or a branch that still
+/// repeats the other pull request's commits).
+pub fn hold(body: &str) -> Option<String> {
+    let (a, b) = (body.find(SECTION_START)?, body.find(SECTION_END)?);
+    (b > a && body[a..b].contains(HOLD)).then(|| {
+        "the stacked change asks for a look first (see its \"Builds on\" section)".to_string()
+    })
+}
 
 /// Words that make a line say the ticket depends on what it names.
 const DEPENDS: &[&str] = &[
@@ -160,6 +208,7 @@ pub fn pick(
         branch: p["head"]["ref"].as_str().unwrap_or("").to_string(),
         title: p["title"].as_str().unwrap_or("").to_string(),
         why,
+        ..Default::default()
     };
     for n in prs {
         if let Some(p) = open
@@ -348,6 +397,7 @@ pub fn pick_series(
         branch: p["head"]["ref"].as_str().unwrap_or("").to_string(),
         title: p["title"].as_str().unwrap_or("").to_string(),
         why: format!("This ticket is part {n} of {m}; part {k}'s pull request is still open."),
+        ..Default::default()
     })
 }
 
@@ -409,6 +459,7 @@ pub fn by_files(missing: &[String], changes: &[(Value, Vec<String>)]) -> Option<
         why: format!(
             "The ticket names `{path}`, which the base branch doesn't have yet; this pull request adds it."
         ),
+        ..Default::default()
     })
 }
 
@@ -530,37 +581,51 @@ pub async fn for_ticket(
 }
 
 /// Right after the run's branch is ready, before any implementation: a
-/// branch kept from an earlier attempt may carry copies of another open
-/// pull request's commits (that pull request's branch was rebased since).
-/// When the branch's own commits replay cleanly onto that pull request's
-/// branch, the copies are dropped now and the run stacks on it; otherwise
-/// the pull request step deals with them.
+/// branch kept from an earlier attempt (or retried) may carry copies of
+/// another open pull request's commits (that pull request's branch was
+/// rebased since). Its own change is rebuilt on that branch file by file
+/// now, so the run builds on it; when that can't be done the pull request
+/// step tries again.
 pub async fn at_start(
+    state: &crate::WorkerState,
     github: &GitHubClient,
     msg: &mut crate::models::TicketMessage,
     branch: &str,
+    provider: &crate::agent::provider::ModelProvider,
+    usage: &mut crate::models::TokenUsage,
 ) -> Option<Dependency> {
-    let c = copied(
+    let (owner, repo) = (msg.repo_owner.clone(), msg.repo_name.clone());
+    let c = copied(github, &owner, &repo, &msg.base_branch, branch).await?;
+    let mut merger = restack::ModelMerger {
+        state,
+        provider,
+        usage,
+        theirs: format!("pull request #{}'s branch", c.dep.number),
+    };
+    match rebuild_on(
         github,
-        &msg.repo_owner,
-        &msg.repo_name,
+        &owner,
+        &repo,
         &msg.base_branch,
         branch,
+        &c,
+        &mut merger,
     )
-    .await?;
-    match drop_copies(github, &msg.repo_owner, &msg.repo_name, branch, &c).await {
-        Ok(()) => {
+    .await
+    {
+        Ok(r) => {
             msg.base_branch = c.dep.branch.clone();
             Some(Dependency {
-                why: dropped_why(&c),
+                why: rebuilt_why(&c, &r),
+                unresolved: r.unresolved,
                 ..c.dep
             })
         }
-        Err(why) => {
+        Err(h) => {
             tracing::info!(
                 branch,
                 dep = c.dep.number,
-                why,
+                why = %h.say(&format!("{owner}/{repo}")),
                 "Copies of an open pull request's commits stay until the pull request step"
             );
             None
@@ -569,15 +634,16 @@ pub async fn at_start(
 }
 
 /// Right before the pull request opens: a branch that copied another open
-/// pull request's commits is moved onto that pull request's branch without
-/// the copies, and the pull request is stacked on it. First the branch's
-/// own commits are replayed onto it (`git rebase --onto`, copies left
-/// out); when they don't replay cleanly, that branch is merged into the
-/// run's branch (conflicts are resolved by the model, the head is never
-/// reset) and the merged code becomes one commit on top of it. Only when
-/// both fail does the run stop, saying what the person can do. Returns the
-/// dependency the pull request states (the ticket's, or the one found by
-/// its commits).
+/// pull request's commits gets its own change rebuilt on that pull
+/// request's branch, file by file, as one commit (`restack`): no commit is
+/// replayed and nothing has to be merged first, so neither the number of
+/// commits nor a merge can stop it. Files both changed are merged by the
+/// model; one it can't merge keeps the other pull request's version plus a
+/// labelled follow-up commit with this change's, and the pull request
+/// opens as a draft naming it. When the rebuild fails anyway (GitHub kept
+/// failing), the pull request still opens against the original base, as a
+/// draft that says so. Only a missing permission stops the run. Returns the
+/// dependency the pull request states.
 pub async fn before_pr(
     state: &crate::WorkerState,
     github: &GitHubClient,
@@ -591,146 +657,120 @@ pub async fn before_pr(
     let Some(c) = copied(github, &owner, &repo, &msg.base_branch, branch).await else {
         return Ok(from_ticket.filter(|d| d.branch == msg.base_branch));
     };
-    // Both ways build on the dependency's branch: the merge resolves
-    // conflicts against it.
-    let base = std::mem::replace(&mut msg.base_branch, c.dep.branch.clone());
-    let msg_ref: &crate::models::TicketMessage = msg;
-    let outcome = recover(drop_copies(github, &owner, &repo, branch, &c), || {
-        tracing::info!(
-            branch,
-            dep = c.dep.number,
-            "Own commits don't replay onto the open pull request's branch; merging it in"
-        );
-        merge_and_flatten(state, github, msg_ref, branch, &c, provider, usage)
-    })
-    .await;
-    match outcome {
-        Ok(how) => Ok(Some(Dependency {
-            why: how.why(&c),
-            ..c.dep
-        })),
-        Err((replayed, merged)) => {
-            msg.base_branch = base;
-            Err(Refused(refusal(&c, branch, &replayed, &merged)))
-        }
-    }
-}
-
-/// How a branch's copies of another pull request's commits were dropped.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Recovered {
-    /// Its own commits replayed onto that pull request's branch.
-    Replayed,
-    /// That branch merged in, the change rebuilt as one commit on it.
-    Rebuilt,
-}
-
-impl Recovered {
-    fn why(self, c: &Copy) -> String {
-        match self {
-            Recovered::Replayed => dropped_why(c),
-            Recovered::Rebuilt => format!(
-                "The branch had re-created {} of its commits; #{n}'s branch was merged in and \
-                 this change rebuilt as one commit on top of it, so those commits come from #{n} \
-                 itself.",
-                c.commits.len(),
-                n = c.dep.number
-            ),
-        }
-    }
-}
-
-/// The order of the recovery: replaying the branch's own commits first;
-/// merging the dependency in (the model resolves conflicts) only when that
-/// fails. Both reasons when neither works.
-pub async fn recover<M, F>(
-    replay: impl std::future::Future<Output = Result<(), String>>,
-    merge: M,
-) -> Result<Recovered, (String, String)>
-where
-    M: FnOnce() -> F,
-    F: std::future::Future<Output = Result<(), String>>,
-{
-    let replayed = match replay.await {
-        Ok(()) => return Ok(Recovered::Replayed),
-        Err(why) => why,
+    let mut merger = restack::ModelMerger {
+        state,
+        provider,
+        usage,
+        theirs: format!("pull request #{}'s branch", c.dep.number),
     };
-    match merge().await {
-        Ok(()) => Ok(Recovered::Rebuilt),
-        Err(merged) => Err((replayed, merged)),
+    match rebuild_on(
+        github,
+        &owner,
+        &repo,
+        &msg.base_branch,
+        branch,
+        &c,
+        &mut merger,
+    )
+    .await
+    {
+        Ok(r) => {
+            msg.base_branch = c.dep.branch.clone();
+            Ok(Some(Dependency {
+                why: rebuilt_why(&c, &r),
+                unresolved: r.unresolved,
+                ..c.dep
+            }))
+        }
+        Err(h @ restack::Halt::Permission { .. }) => Err(Refused(format!(
+            "{} The work is kept on branch `{branch}`.",
+            h.say(&format!("{owner}/{repo}"))
+        ))),
+        Err(restack::Halt::Failed(why)) => {
+            tracing::warn!(
+                branch,
+                dep = c.dep.number,
+                why,
+                "Couldn't rebuild the change on the open pull request's branch; opening it as a draft"
+            );
+            Ok(Some(Dependency {
+                why: not_rebuilt_why(&c, &why),
+                not_stacked: true,
+                ..c.dep
+            }))
+        }
     }
 }
 
-fn dropped_why(c: &Copy) -> String {
-    format!(
-        "The branch had re-created {} of its commits; they were dropped and its own commits \
-         replayed onto `{}`, so those commits come from #{} itself.",
-        c.commits.len(),
-        c.dep.branch,
-        c.dep.number
-    )
-}
-
-/// The branch's own commits replayed onto the dependency's branch, the
-/// copies left out; why not when that can't be done.
-async fn drop_copies(
+/// The branch's own change rebuilt on the dependency's head ([`restack`]).
+async fn rebuild_on<M: restack::Merger>(
     github: &GitHubClient,
     owner: &str,
     repo: &str,
+    base: &str,
     branch: &str,
     c: &Copy,
-) -> Result<(), String> {
-    let lease = github
-        .get_ref(owner, repo, branch)
-        .await
-        .map_err(|e| format!("its head couldn't be read ({e})"))?;
-    match github
-        .rebase_onto(owner, repo, branch, &c.dep.branch, &c.commits, &lease)
-        .await
-    {
-        Ok(RebaseResult::Rebased(_)) | Ok(RebaseResult::UpToDate) => Ok(()),
-        Ok(RebaseResult::NotClean(why)) => Err(why),
-        Ok(RebaseResult::Moved) => Err("the branch moved while it was being rebased".to_string()),
-        Err(e) => Err(format!("the rebase failed ({e})")),
-    }
+    merger: &mut M,
+) -> Result<restack::Rebuilt, restack::Halt> {
+    let gh = restack::Gh {
+        github,
+        owner,
+        repo,
+        known: &c.files,
+    };
+    let message = flat_message(c);
+    restack::rebuild(
+        &gh,
+        merger,
+        &restack::Job {
+            branch,
+            onto: &c.dep.branch,
+            own: restack::Own::NotCopies {
+                base,
+                copies: &c.commits,
+            },
+            message: &message,
+            onto_pr: c.dep.number,
+        },
+    )
+    .await
 }
 
-/// The dependency's branch (`msg.base_branch` by now) merged into the
-/// run's branch, conflicts resolved by the model, then the merged code as
-/// one commit on top of the dependency's branch.
-async fn merge_and_flatten(
-    state: &crate::WorkerState,
-    github: &GitHubClient,
-    msg: &crate::models::TicketMessage,
-    branch: &str,
-    c: &Copy,
-    provider: &crate::agent::provider::ModelProvider,
-    usage: &mut crate::models::TokenUsage,
-) -> Result<(), String> {
-    if let Err(e) = super::pr::resolve_conflicts(state, msg, github, branch, provider, usage).await
-    {
-        return Err(format!("merging it in failed ({e})"));
+/// What happened, for the stack section: the copies dropped, the change
+/// rebuilt on the dependency, the files merged.
+pub fn rebuilt_why(c: &Copy, r: &restack::Rebuilt) -> String {
+    let n = c.dep.number;
+    let mut out = format!(
+        "The branch had re-created {} of #{n}'s commits under other hashes; its own change \
+         ({} commit(s), {} file(s)) was rebuilt as one commit on `{}`, so those commits come from \
+         #{n} itself.",
+        c.commits.len(),
+        r.own_commits,
+        r.paths,
+        c.dep.branch,
+    );
+    if !r.merged.is_empty() {
+        let list: Vec<String> = r.merged.iter().map(|p| format!("`{p}`")).collect();
+        out.push_str(&format!(
+            " #{n} had also changed {}; the two versions were merged, keeping both.",
+            list.join(", ")
+        ));
     }
-    let lease = github
-        .get_ref(&msg.repo_owner, &msg.repo_name, branch)
-        .await
-        .map_err(|e| format!("its head couldn't be read ({e})"))?;
-    match github
-        .flatten_onto(
-            &msg.repo_owner,
-            &msg.repo_name,
-            branch,
-            &c.dep.branch,
-            &flat_message(c),
-            &lease,
-        )
-        .await
-    {
-        Ok(RebaseResult::Rebased(_)) | Ok(RebaseResult::UpToDate) => Ok(()),
-        Ok(RebaseResult::NotClean(why)) => Err(why),
-        Ok(RebaseResult::Moved) => Err("the branch moved while it was being rebuilt".to_string()),
-        Err(e) => Err(format!("rebuilding it failed ({e})")),
-    }
+    out
+}
+
+/// Why the pull request isn't stacked, for its section: the copies, and
+/// why rebuilding failed.
+pub fn not_rebuilt_why(c: &Copy, why: &str) -> String {
+    let short: Vec<&str> = c.commits.iter().map(|s| &s[..7.min(s.len())]).collect();
+    format!(
+        "The branch repeats {} of #{}'s commits ({}); rebuilding its own change on `{}` didn't \
+         work this time ({why}).",
+        c.commits.len(),
+        c.dep.number,
+        short.join(", "),
+        c.dep.branch,
+    )
 }
 
 /// The messages of `listed`'s commits (a compare's, oldest first) that
@@ -761,7 +801,7 @@ pub fn flat_message(c: &Copy) -> String {
         .unwrap_or("Rebuild this change")
         .to_string();
     let mut out = format!(
-        "{head}\n\nRebuilt on #{} (`{}`) without the {} commit(s) copied from it.",
+        "{head}\n\nRebuilt on #{} (`{}`) file by file, without the {} commit(s) copied from it.",
         c.dep.number,
         c.dep.branch,
         c.commits.len()
@@ -773,24 +813,6 @@ pub fn flat_message(c: &Copy) -> String {
         }
     }
     out.trim_end().to_string()
-}
-
-/// Why the run stops, in plain words with what the person can do: both
-/// ways of building on the dependency failed.
-pub fn refusal(c: &Copy, branch: &str, replayed: &str, merged: &str) -> String {
-    let short: Vec<&str> = c.commits.iter().map(|s| &s[..7.min(s.len())]).collect();
-    format!(
-        "the branch repeats {k} commit(s) of open pull request #{n} (`{b}`) under other hashes \
-         ({shas}). Dropping them didn't work ({replayed}), and neither did merging #{n}'s branch \
-         in and rebuilding this change on it ({merged}). The work is kept on branch `{branch}`. \
-         To finish it: merge or close #{n} and run the ticket again, or move `{branch}` onto \
-         `{b}` yourself (`git rebase --onto {b}`, keeping only this change's commits) and open \
-         the pull request against `{b}`.",
-        k = c.commits.len(),
-        n = c.dep.number,
-        b = c.dep.branch,
-        shas = short.join(", "),
-    )
 }
 
 // ── Patch ids ───────────────────────────────────────────────────────────────
@@ -836,6 +858,8 @@ pub struct Copy {
     /// The messages of the branch's other commits (merge commits aside):
     /// its own work.
     pub own: Vec<String>,
+    /// The files of the branch's commits, as read for their patch ids.
+    pub files: BTreeMap<String, Vec<CommitFile>>,
 }
 
 /// The branch's commits that match another pull request's, by patch id:
@@ -848,24 +872,30 @@ pub fn matches(ours: &[(String, u64)], theirs: &[(String, u64)]) -> Vec<String> 
         .collect()
 }
 
-const MAX_COMMITS: usize = 60;
 const MAX_PRS: usize = 40;
 
+/// Each commit's patch id, and its files as read.
 async fn ids(
     github: &GitHubClient,
     owner: &str,
     repo: &str,
     shas: &[String],
-) -> Vec<(String, u64)> {
+) -> (Vec<(String, u64)>, BTreeMap<String, Vec<CommitFile>>) {
     let mut out = Vec::new();
-    for sha in shas.iter().take(MAX_COMMITS) {
-        if let Ok(files) = github.commit_patches(owner, repo, sha).await {
-            if let Some(id) = patch_id(&files) {
+    let mut read = BTreeMap::new();
+    for sha in shas {
+        if let Ok(files) = github.commit_changes(owner, repo, sha).await {
+            let patches: Vec<(String, String)> = files
+                .iter()
+                .map(|f| (f.path.clone(), f.patch.clone()))
+                .collect();
+            if let Some(id) = patch_id(&patches) {
                 out.push((sha.clone(), id));
             }
+            read.insert(sha.clone(), files);
         }
     }
-    out
+    (out, read)
 }
 
 /// The open pull request whose commits the branch re-created the most of,
@@ -878,8 +908,10 @@ pub async fn copied(
     base: &str,
     branch: &str,
 ) -> Option<Copy> {
+    // Every commit, however many: a copy past a cut-off would read as the
+    // branch's own work.
     let listed = github
-        .compare_commits(owner, repo, base, branch, MAX_COMMITS)
+        .compare_all_commits(owner, repo, base, branch)
         .await
         .ok()?;
     let ours_shas: Vec<String> = listed
@@ -889,7 +921,7 @@ pub async fn copied(
     if ours_shas.is_empty() {
         return None;
     }
-    let ours = ids(github, owner, repo, &ours_shas).await;
+    let (ours, files) = ids(github, owner, repo, &ours_shas).await;
     let our_files: BTreeSet<String> = github
         .compare_changed_files(owner, repo, base, branch)
         .await
@@ -923,7 +955,7 @@ pub async fn copied(
             .iter()
             .filter_map(|c| c["sha"].as_str().map(String::from))
             .collect();
-        let theirs = ids(github, owner, repo, &their_shas).await;
+        let (theirs, _) = ids(github, owner, repo, &their_shas).await;
         let m = matches(&ours, &theirs);
         if !m.is_empty() && best.as_ref().is_none_or(|b| m.len() > b.commits.len()) {
             best = Some(Copy {
@@ -931,14 +963,15 @@ pub async fn copied(
                     number: n,
                     branch: head.to_string(),
                     title: p["title"].as_str().unwrap_or("").to_string(),
-                    why: String::new(),
+                    ..Default::default()
                 },
                 own: own_messages(&listed, &m),
                 commits: m,
+                files: BTreeMap::new(),
             });
         }
     }
-    best
+    best.map(|c| Copy { files, ..c })
 }
 
 /// The body with the stack section replaced (or added after the first
@@ -1284,10 +1317,11 @@ mod tests {
                 number: 42,
                 branch: "abc-12-schema".into(),
                 title: "ABC-12 schema work".into(),
-                why: String::new(),
+                ..Default::default()
             },
             own: own_messages(&listed, &commits),
             commits,
+            files: BTreeMap::new(),
         }
     }
 
@@ -1304,7 +1338,9 @@ mod tests {
         // Rebuilt as one commit: the first own subject, then each one's.
         let m = flat_message(&c);
         assert!(m.starts_with("ABC-99: one field for the two flags\n\n"));
-        assert!(m.contains("Rebuilt on #42 (`abc-12-schema`) without the 2 commit(s)"));
+        assert!(
+            m.contains("Rebuilt on #42 (`abc-12-schema`) file by file, without the 2 commit(s)")
+        );
         assert!(m.contains("- ABC-99: tests"));
         assert!(!m.contains("Body."));
         // One own commit: no list.
@@ -1314,61 +1350,74 @@ mod tests {
     }
 
     #[test]
-    fn a_stacked_dependency_says_its_copies_were_dropped() {
+    fn a_rebuilt_branch_says_what_happened_and_stacks() {
         let c = copy_of_42();
-        let why = dropped_why(&c);
-        assert!(why.contains("re-created 2 of its commits"));
-        assert!(why.contains("replayed onto `abc-12-schema`"));
+        let r = restack::Rebuilt {
+            own_commits: 140,
+            paths: 9,
+            merged: vec!["web/rows.ts".into()],
+            ..Default::default()
+        };
+        let why = rebuilt_why(&c, &r);
+        assert!(why.contains("re-created 2 of #42's commits"));
+        assert!(
+            why.contains("(140 commit(s), 9 file(s)) was rebuilt as one commit on `abc-12-schema`")
+        );
+        assert!(why.contains("#42 had also changed `web/rows.ts`; the two versions were merged"));
         let d = Dependency { why, ..c.dep };
-        assert!(d.section().contains("stacked on #42 (`abc-12-schema`"));
-    }
-
-    #[tokio::test]
-    async fn copies_are_dropped_by_replaying_first_and_merging_only_on_a_conflict() {
-        // The own commits replay onto the dependency: no merge, no model.
-        let merged = std::cell::Cell::new(false);
-        let how = recover(async { Ok(()) }, || async {
-            merged.set(true);
-            Ok(())
-        })
-        .await;
-        assert_eq!(how, Ok(Recovered::Replayed));
-        assert!(!merged.get());
-        // A commit conflicts with the dependency's head: merged in instead.
-        let how = recover(
-            async { Err("commit o1 conflicts with the base".to_string()) },
-            || async { Ok(()) },
-        )
-        .await;
-        assert_eq!(how, Ok(Recovered::Rebuilt));
-        let c = copy_of_42();
-        assert!(Recovered::Rebuilt
-            .why(&c)
-            .contains("#42's branch was merged in"));
-        // Neither works: both reasons, for the message.
-        let how = recover(async { Err("a".to_string()) }, || async {
-            Err("b".to_string())
-        })
-        .await;
-        assert_eq!(how, Err(("a".to_string(), "b".to_string())));
+        let s = d.section();
+        assert!(s.contains("stacked on #42 (`abc-12-schema`"));
+        assert!(!s.contains("Needs a look"));
+        // Nothing to look at: it may leave draft.
+        assert_eq!(hold(&put_section("Body", &s)), None);
     }
 
     #[test]
-    fn stopping_says_what_the_person_can_do() {
+    fn files_that_couldn_t_be_merged_keep_the_pull_request_a_draft() {
         let c = copy_of_42();
-        let r = Refused(refusal(
-            &c,
-            "coderhelm/abc-99",
-            "commit o1 conflicts with the base",
-            "`abc-12-schema` isn't merged into the branch yet",
+        let d = Dependency {
+            why: "w".into(),
+            unresolved: vec!["web/rows.ts".into()],
+            ..c.dep.clone()
+        };
+        let s = d.section();
+        assert!(s.contains("### Needs a look"));
+        assert!(s.contains("- `web/rows.ts`"));
+        assert!(s.contains("labelled \"Follow-up\""));
+        let body = put_section("## Summary\n\nOne field.", &s);
+        assert!(hold(&body).is_some());
+        // A branch that couldn't be rebuilt opens anyway, as a draft that
+        // says why, against the original base.
+        let d = Dependency {
+            why: not_rebuilt_why(&c, "reading the branch's head kept failing on GitHub (502)"),
+            not_stacked: true,
+            ..c.dep
+        };
+        let s = d.section();
+        assert!(s.starts_with(&format!("{SECTION_START}\n## Repeats #42")));
+        assert!(s.contains("repeats 2 of #42's commits (c1aaaaa, c2bbbbb)"));
+        assert!(s.contains("running the ticket again does that"));
+        assert!(hold(&put_section("Body", &s)).is_some());
+        // A hold marker outside the section is no hold.
+        assert_eq!(hold("Body <!-- coderhelm:stack-hold -->"), None);
+    }
+
+    #[test]
+    fn stopping_names_the_missing_permission_and_where_the_work_is() {
+        let h = restack::Halt::Permission {
+            permission: "Contents: read and write".into(),
+            doing: "moving the branch".into(),
+        };
+        let r = Refused(format!(
+            "{} The work is kept on branch `coderhelm/feature-b`.",
+            h.say("acme/web")
         ))
         .to_string();
-        assert!(r.starts_with("Stopped before opening a pull request: the branch repeats 2"));
-        assert!(r.contains("(c1aaaaa, c2bbbbb)"));
-        assert!(r.contains("commit o1 conflicts with the base"));
-        assert!(r.contains("The work is kept on branch `coderhelm/abc-99`."));
-        assert!(r.contains("merge or close #42 and run the ticket again"));
-        assert!(r.contains("open the pull request against `abc-12-schema`"));
+        assert!(r.starts_with(
+            "Stopped before opening a pull request: CoderHelm's GitHub App needs the \"Contents: \
+             read and write\" permission on acme/web for moving the branch."
+        ));
+        assert!(r.ends_with("The work is kept on branch `coderhelm/feature-b`."));
     }
 
     #[test]
@@ -1378,6 +1427,7 @@ mod tests {
             branch: "b".into(),
             title: "t".into(),
             why: "w".into(),
+            ..Default::default()
         };
         let once = put_section("Body", &d.section());
         let twice = put_section(&once, &d.section());

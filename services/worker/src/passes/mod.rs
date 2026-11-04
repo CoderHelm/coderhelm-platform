@@ -847,6 +847,7 @@ pub mod remote_mcp;
 pub(crate) mod repo_pick;
 mod resolve;
 mod resolved;
+pub mod restack;
 pub mod resume;
 mod review;
 pub mod review_actions;
@@ -3537,19 +3538,21 @@ async fn run_passes(
             }
         }
 
-        // A branch kept from an earlier attempt can carry copies of another
-        // open pull request's commits (that branch was rebased since): they
-        // are dropped now, before any implementation, and the run stacks on
-        // it. A branch with its own open pull request keeps its history.
-        if existing_pr.is_none() && !pr_lookup_failed && !is_internal_ticket(&msg.ticket_id) {
-            if let Some(d) = stack::at_start(&github, msg, &branch_name).await {
+        // A branch kept from an earlier attempt (or a retry) can carry
+        // copies of another open pull request's commits (that branch was
+        // rebased since): its own change is rebuilt on that branch now,
+        // file by file, before any implementation, and the run stacks on it.
+        if !pr_lookup_failed && !is_internal_ticket(&msg.ticket_id) {
+            if let Some(d) =
+                stack::at_start(state, &github, msg, &branch_name, &provider, usage).await
+            {
                 add_progress_note(
                     state,
                     &msg.team_id,
                     run_id,
                     &format!(
-                        "Dropped this branch's copies of #{}'s commits; it now builds on `{}`",
-                        d.number, d.branch
+                        "Rebuilt this branch's own change on #{}'s branch `{}` without its copies of #{}'s commits",
+                        d.number, d.branch, d.number
                     ),
                 )
                 .await;
@@ -5291,6 +5294,9 @@ async fn run_passes(
             links: &links,
             test_fix: test_pr.as_ref(),
             feature: feature_pr.as_ref(),
+            keep_commits: stacked_on
+                .as_ref()
+                .is_some_and(|d| !d.unresolved.is_empty()),
         },
         &provider,
         usage,
@@ -6217,6 +6223,7 @@ async fn run_repo_pipeline(
             test_fix: test_pr.as_ref(),
             // Multi-repo runs: the new-feature rules check single-repo runs.
             feature: None,
+            keep_commits: false,
         },
         provider,
         usage,
