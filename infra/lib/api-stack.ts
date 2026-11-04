@@ -198,6 +198,9 @@ export class ApiStack extends cdk.Stack {
     const userPoolClient = new cognito.UserPoolClient(this, "UserPoolClient", {
       userPool,
       userPoolClientName: `${prefix}-dashboard`,
+      // Cognito answers an email it doesn't have the same as a wrong password
+      // or a sent code, so its own errors can't tell who has an account.
+      preventUserExistenceErrors: true,
       authFlows: {
         userPassword: true,
         userSrp: true,
