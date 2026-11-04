@@ -502,6 +502,7 @@ pub async fn decide(
         },
         rule: a.rule_id.clone(),
         thread_id: a.thread_id.clone(),
+        ..Default::default()
     });
     if ev.run_id.is_empty() {
         ev.run_id = String::new();

@@ -80,6 +80,10 @@ pub struct PolicyFields {
     pub rule: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub thread_id: String,
+    /// The name people know the tool by, when its definition gives one (a
+    /// team tool's "Find order" for `tool_find_order`).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub tool_label: String,
 }
 
 impl Event {

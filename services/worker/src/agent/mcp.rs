@@ -98,6 +98,8 @@ pub async fn load_remote_plugins(
         if tools::agent_tools(&server, scope.read_only).is_empty() {
             continue;
         }
+        // Each tool's risk comes from what the server says it does.
+        common::agent_policy::registry::register(team_id, tools::registrations(&server));
         out.push(McpPlugin {
             server_id: server.id.clone(),
             npx_package: String::new(),

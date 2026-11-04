@@ -186,14 +186,53 @@ fn cap(mut v: Verdict, autonomy: Autonomy) -> Verdict {
     v
 }
 
+/// What the tool registry knows about the tool a call names.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Known {
+    /// Its risk.
+    Risk(Risk),
+    /// Nothing knows what it does.
+    Unknown,
+    /// It is registered, but no version of it may run (not approved, changed
+    /// since it was approved, switched off), and this says why.
+    Refused(String),
+}
+
+impl From<Option<Risk>> for Known {
+    fn from(r: Option<Risk>) -> Self {
+        r.map_or(Known::Unknown, Known::Risk)
+    }
+}
+
+impl From<Risk> for Known {
+    fn from(r: Risk) -> Self {
+        Known::Risk(r)
+    }
+}
+
+impl Known {
+    pub fn risk(&self) -> Option<Risk> {
+        match self {
+            Known::Risk(r) => Some(*r),
+            _ => None,
+        }
+    }
+}
+
 /// Decides one call. `risk` is the call's risk from the tool registry, or
 /// `None` when nothing knows the tool. `now` is RFC 3339.
-pub fn decide(policy: &TeamPolicy, call: &Call, risk: Option<Risk>, now: &str) -> Verdict {
+pub fn decide(policy: &TeamPolicy, call: &Call, risk: impl Into<Known>, now: &str) -> Verdict {
     explain(policy, call, risk, now).verdict
 }
 
 /// [`decide`], with every rule it looked at.
-pub fn explain(policy: &TeamPolicy, call: &Call, risk: Option<Risk>, now: &str) -> Explanation {
+pub fn explain(policy: &TeamPolicy, call: &Call, risk: impl Into<Known>, now: &str) -> Explanation {
+    let known = risk.into();
+    let refused = match &known {
+        Known::Refused(why) => Some(why.clone()),
+        _ => None,
+    };
+    let risk = known.risk();
     // Commands and network requests are changes by definition.
     let risk = match call.kind {
         CallKind::Command | CallKind::Egress => Some(risk.unwrap_or(Risk::Write)),
@@ -253,10 +292,12 @@ pub fn explain(policy: &TeamPolicy, call: &Call, risk: Option<Risk>, now: &str) 
                 decision: Decision::Deny,
                 risk: None,
                 decided_by: DecidedBy::Unknown,
-                reason: format!(
-                    "Nothing says what {} does, so it doesn't run. Unknown tools are always denied.",
-                    call.tool
-                ),
+                reason: refused.unwrap_or_else(|| {
+                    format!(
+                        "Nothing says what {} does, so it doesn't run. Unknown tools are always denied.",
+                        call.tool
+                    )
+                }),
                 capped: false,
             },
             considered,
@@ -498,6 +539,31 @@ mod tests {
         let v = decide(&p, &Call::tool(Agent::Coder, "mystery"), None, NOW);
         assert_eq!(v.decision, Decision::Deny);
         assert_eq!(v.decided_by, DecidedBy::Unknown);
+    }
+
+    #[test]
+    fn a_team_tool_decides_by_its_registered_risk() {
+        let p = TeamPolicy::starting();
+        let call = Call::tool(Agent::Planner, "tool_find_order");
+        let read = crate::live::tools::ToolKind::Sql.risk();
+        let v = decide(&p, &call, read, NOW);
+        assert_eq!(v.decision, Decision::Allow);
+        assert_eq!(v.decided_by, DecidedBy::Default { risk: Risk::Read });
+        // One that may not run is denied with its own reason, whatever the
+        // rules say.
+        let mut allow_all = rule("a", Scope::Team, Decision::Allow);
+        allow_all.tool = Some("*".into());
+        let why = "tool_find_order changed since it was approved, so it doesn't run. Approve \
+                   the new version in Settings, Tools.";
+        let v = decide(
+            &with_rules(vec![allow_all]),
+            &call,
+            Known::Refused(why.into()),
+            NOW,
+        );
+        assert_eq!(v.decision, Decision::Deny);
+        assert_eq!(v.decided_by, DecidedBy::Unknown);
+        assert_eq!(v.reason, why);
     }
 
     #[test]

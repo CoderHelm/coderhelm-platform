@@ -71,6 +71,21 @@ pub fn gate_for(
     )
 }
 
+/// Drops from `tools` the ones the policy denies whatever the call says
+/// (see `Gate::offerable`), and tells the gate what is left, so the model
+/// never spends a turn on a tool that can't run.
+pub async fn offer(gate: &mut Gate, tools: &mut Vec<Value>) {
+    let keep = gate
+        .offerable(tools.iter().filter_map(|t| t["name"].as_str()))
+        .await;
+    tools.retain(|t| t["name"].as_str().is_some_and(|n| keep.contains(n)));
+    gate.set_offered(
+        tools
+            .iter()
+            .filter_map(|t| t["name"].as_str().map(str::to_string)),
+    );
+}
+
 /// What the chat does with one call.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Checked {
@@ -284,6 +299,29 @@ mod tests {
             "the definition and the gated call"
         );
         assert!(!chat.contains("execute_github_tool("));
+    }
+
+    #[tokio::test]
+    async fn a_chat_is_never_offered_a_tool_it_cant_use() {
+        use common::agent_policy::store::{MemStore, PolicyStore};
+        use common::agent_policy::TeamPolicy;
+        let store = Arc::new(MemStore::new());
+        let mut p = TeamPolicy::starting();
+        p.version = 1;
+        store.save("T", &p, 0).await.unwrap();
+        let mut tools: Vec<Value> = ["read_file", "made_up", "linear__get_issue"]
+            .iter()
+            .map(|n| json!({ "name": n, "description": "", "input_schema": {} }))
+            .collect();
+        let mut g = Gate::new(
+            store.clone(),
+            GateCtx::new("T", Agent::BrainChat).thread("c1"),
+        )
+        .with_wait(Wait::Return);
+        offer(&mut g, &mut tools).await;
+        let names: Vec<&str> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
+        assert_eq!(names, ["read_file", "linear__get_issue"]);
+        assert_eq!(check(&g, "read_file", &json!({})).await, Checked::Run);
     }
 
     #[tokio::test]

@@ -6,6 +6,15 @@
 //! the same three risks, the same built-in list and the same naming rules for
 //! connection tools. When it lands, `impl ToolRisk for` the real registry and
 //! [`default_registry`] returns it; nothing else changes.
+//!
+//! Tools a team sets up (its own approved tools, its connections' tools)
+//! can't be listed here. Each such [`Family`] registers its tools where it
+//! offers them, with the risk its definition gives ([`register`]), and
+//! [`known`] reads built-ins, then registrations, then a connection tool's
+//! name. A test fails when a runtime tool name belongs to no family.
+
+use std::collections::HashMap;
+use std::sync::{LazyLock, RwLock};
 
 use super::model::{CallKind, Risk};
 
@@ -36,6 +45,119 @@ impl ToolRisk for Builtin {
             _ => None,
         }
     }
+}
+
+/// A family of tools that exist only once a team sets them up: their names
+/// and what they do come from the team's own records, so no list here can
+/// name them. Each tool is registered by the code that offers it, with the
+/// risk its registration says it has (see [`Registration`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Family {
+    /// A team's own tools (`tool_<name>`, `common::live::tools`): a reviewed
+    /// read a person approved, by exact version.
+    TeamTool,
+    /// A connection's tools (`<server>__<tool>`, `common::mcp_remote`): the
+    /// server's own hints, else the tool's name.
+    Connection,
+}
+
+impl Family {
+    /// Every family. A test fails when one has no way to give its tools a
+    /// risk.
+    pub const ALL: &'static [Family] = &[Family::TeamTool, Family::Connection];
+
+    /// The family a tool name belongs to, by its naming rule.
+    pub fn of(tool: &str) -> Option<Family> {
+        if builtin(tool).is_some() {
+            return None;
+        }
+        if tool
+            .strip_prefix(TEAM_TOOL_PREFIX)
+            .is_some_and(|n| !n.is_empty())
+        {
+            return Some(Family::TeamTool);
+        }
+        match tool.split_once("__") {
+            Some((server, name)) if !server.is_empty() && !name.is_empty() => {
+                Some(Family::Connection)
+            }
+            _ => None,
+        }
+    }
+
+    /// What people call a tool of this family.
+    pub fn noun(self) -> &'static str {
+        match self {
+            Family::TeamTool => "team tool",
+            Family::Connection => "connection tool",
+        }
+    }
+}
+
+/// What a team tool's agent-facing name starts with.
+pub const TEAM_TOOL_PREFIX: &str = "tool_";
+
+/// One tool a family offers, as the code that offers it describes it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Registration {
+    /// The agent-facing name (`tool_find_order`, `linear__get_issue`).
+    pub tool: String,
+    pub family: Family,
+    /// The name people know it by, from its definition ("Find order").
+    pub label: String,
+    /// Its risk, from what its definition allows it to do; or, when no
+    /// version of it may run, why (the agent and the decision log say so).
+    pub standing: Result<Risk, String>,
+}
+
+/// Registered tools, by team, then agent-facing name. A tool's standing is
+/// a fact about the team's records (approved, switched on, what it does),
+/// never about one run, so every loop for the team reads the same entry.
+static REGISTERED: LazyLock<RwLock<HashMap<String, HashMap<String, Registration>>>> =
+    LazyLock::new(Default::default);
+
+/// Registers tools a family offers for `team`, replacing what was registered
+/// under the same names.
+pub fn register<I: IntoIterator<Item = Registration>>(team: &str, regs: I) {
+    let mut all = REGISTERED.write().unwrap_or_else(|e| e.into_inner());
+    let entry = all.entry(team.to_string()).or_default();
+    for r in regs {
+        entry.insert(r.tool.clone(), r);
+    }
+}
+
+/// What was registered for `tool` in `team`.
+pub fn registration(team: &str, tool: &str) -> Option<Registration> {
+    REGISTERED
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(team)
+        .and_then(|t| t.get(tool))
+        .cloned()
+}
+
+/// What the engine knows about `tool` for `team`: a built-in's risk, a
+/// registered tool's standing, a connection tool's risk from its name, or
+/// nothing.
+pub fn known(team: &str, tool: &str, reg: &dyn ToolRisk) -> super::engine::Known {
+    use super::engine::Known;
+    if let Some(r) = builtin(tool) {
+        return Known::Risk(r);
+    }
+    if let Some(r) = registration(team, tool) {
+        return match r.standing {
+            Ok(risk) => Known::Risk(risk),
+            Err(why) => Known::Refused(why),
+        };
+    }
+    reg.risk(tool).into()
+}
+
+/// The name people know a tool by, when it was registered with one.
+pub fn label(team: &str, tool: &str) -> Option<String> {
+    registration(team, tool)
+        .map(|r| r.label)
+        .filter(|l| !l.is_empty())
 }
 
 /// Every built-in tool CoderHelm's agents can be given, with its risk. A test
@@ -334,6 +456,107 @@ mod tests {
             missing.is_empty(),
             "tools with no risk in agent_policy::registry::BUILTIN: {missing:?}"
         );
+    }
+
+    /// A tool of each family, made the way the code that offers it makes
+    /// one. A new family fails to compile here until it says how its tools
+    /// get a risk.
+    fn sample(f: Family) -> Registration {
+        match f {
+            Family::TeamTool => {
+                let def = crate::live::tools::parse_def(
+                    "name: find_order\nuse_when: an order number is named\nsource: db\nkind: sql\nread: SELECT id FROM orders WHERE id = :n\ninputs:\n  n: { type: integer, example: 1 }\n",
+                )
+                .unwrap();
+                crate::live::tools::registration(&def.name, &Ok(def.clone()))
+            }
+            Family::Connection => {
+                let server = crate::mcp_remote::store::ServerRecord::new(
+                    "acme",
+                    "Acme Docs",
+                    "https://mcp.acme.example",
+                );
+                let t: crate::mcp_remote::client::RemoteTool = serde_json::from_value(
+                    serde_json::json!({ "name": "get_page", "read_only": true }),
+                )
+                .unwrap();
+                crate::mcp_remote::tools::registration(&server, &t).unwrap()
+            }
+        }
+    }
+
+    /// Every family gives its tools a risk from their registration, and the
+    /// engine reads it: no family's tools are denied as unknown.
+    #[test]
+    fn every_tool_family_has_a_risk_mapping() {
+        for (i, f) in Family::ALL.iter().enumerate() {
+            let r = sample(*f);
+            assert_eq!(r.family, *f);
+            assert_eq!(Family::of(&r.tool), Some(*f), "{} names no family", r.tool);
+            assert!(r.standing.is_ok(), "{f:?} gave {} no risk", r.tool);
+            assert!(!r.label.is_empty(), "{f:?} gave {} no name", r.tool);
+            let team = format!("TEAM#family-{i}");
+            register(&team, [r.clone()]);
+            assert_eq!(
+                known(&team, &r.tool, &Builtin).risk(),
+                r.standing.clone().ok(),
+                "{f:?}: the registry doesn't read the registered risk"
+            );
+            assert_eq!(label(&team, &r.tool), Some(r.label.clone()));
+        }
+    }
+
+    /// Every tool name the services build at run time (`tool_{name}`,
+    /// `{server}__{tool}`) belongs to a family, and every family is built
+    /// somewhere. A new kind of runtime tool needs a family, and so a risk,
+    /// before it can be offered.
+    #[test]
+    fn every_runtime_tool_name_belongs_to_a_family() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+        let mut files = Vec::new();
+        for dir in ["worker/src", "gateway/src", "common/src"] {
+            collect(&root.join(dir), &mut files);
+        }
+        let built = regex::Regex::new(
+            r#"(?:name:\s*|let name = |let n = |name = |fn \w*name\([^)]*\) -> String \{\s*)format!\(\s*"([^"]*\{[^"]*)""#,
+        )
+        .unwrap();
+        let slot = regex::Regex::new(r"\{[^}]*\}").unwrap();
+        let mut seen = BTreeSet::new();
+        let mut orphans = Vec::new();
+        for f in &files {
+            let src = std::fs::read_to_string(f).unwrap_or_default();
+            for c in built.captures_iter(&src) {
+                let template = &c[1];
+                let literal = slot.replace_all(template, "");
+                // Only names a model could be given: letters and `_` around
+                // the slots (not paths, labels or email templates).
+                if literal.is_empty()
+                    || !literal
+                        .chars()
+                        .all(|ch| ch.is_ascii_lowercase() || ch == '_')
+                {
+                    continue;
+                }
+                let example = slot.replace_all(template, "x");
+                match Family::of(&example) {
+                    Some(fam) => {
+                        seen.insert(format!("{fam:?}"));
+                    }
+                    None => orphans.push(format!("{}: {template}", f.display())),
+                }
+            }
+        }
+        assert!(
+            orphans.is_empty(),
+            "tool names built at run time with no family (and so no risk): {orphans:?}"
+        );
+        for f in Family::ALL {
+            assert!(
+                seen.contains(&format!("{f:?}")),
+                "no code builds {f:?} tool names: is the family still used?"
+            );
+        }
     }
 
     fn collect(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {

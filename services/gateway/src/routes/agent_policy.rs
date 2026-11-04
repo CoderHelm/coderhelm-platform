@@ -764,10 +764,58 @@ pub async fn test_call(
         .load(&claims.team_id)
         .await
         .map_err(|e| internal("Couldn't read agent permissions", e))?;
-    let e = engine::explain(&p, &call, risk, &now());
+    let known = match call.kind {
+        CallKind::Command | CallKind::Egress => engine::Known::from(risk),
+        _ if registry::Family::of(&call.tool) == Some(registry::Family::TeamTool) => {
+            team_tool_standing(&state, &claims.team_id, &call.tool).await
+        }
+        _ => engine::Known::from(risk),
+    };
+    let risk = known.risk();
+    let e = engine::explain(&p, &call, known, &now());
     Ok(Json(
         json!({ "call": call, "risk": risk, "verdict": e.verdict, "considered": e.considered }),
     ))
+}
+
+/// A team tool's standing, as a run registers it: its risk from the
+/// approved definition, or why no version of it runs.
+async fn team_tool_standing(state: &AppState, team: &str, tool: &str) -> engine::Known {
+    let st = common::live::tools_store::ToolStore {
+        dynamo: &state.dynamo,
+        table: &state.config.settings_table_name,
+        team,
+    };
+    match st.registrations().await {
+        Ok(regs) => match regs.into_iter().find(|r| r.tool == tool) {
+            Some(r) => match r.standing {
+                Ok(risk) => engine::Known::Risk(risk),
+                Err(why) => engine::Known::Refused(why),
+            },
+            None => engine::Known::Unknown,
+        },
+        Err(e) => {
+            error!(team = %team, error = %e, "Couldn't read the team's tools");
+            engine::Known::Unknown
+        }
+    }
+}
+
+/// Names people know tools by, for events written without one (approvals,
+/// and decisions logged before tools carried their names): a team tool's
+/// name from its definition.
+pub fn label_events(events: &mut [Event]) {
+    for e in events {
+        let Some(p) = e.policy.as_mut() else { continue };
+        if !p.tool_label.is_empty() {
+            continue;
+        }
+        if registry::Family::of(&e.tool) == Some(registry::Family::TeamTool) {
+            if let Some(name) = e.tool.strip_prefix(registry::TEAM_TOOL_PREFIX) {
+                p.tool_label = common::live::tools::label(name);
+            }
+        }
+    }
 }
 
 // ─── Approvals ─────────────────────────────────────────────────────────────
@@ -897,10 +945,11 @@ pub async fn activity(
         .and_then(|l| l.parse::<usize>().ok())
         .unwrap_or(50)
         .clamp(1, 200);
-    let events = store(&state)
+    let mut events = store(&state)
         .recent_audit(&claims.team_id, limit)
         .await
         .map_err(|e| internal("Couldn't read the agent log", e))?;
+    label_events(&mut events);
     Ok(Json(json!({ "events": events })))
 }
 
@@ -1280,6 +1329,48 @@ mod tests {
             ..input
         };
         assert!(rule_from(&bad, "a", "").is_err());
+    }
+
+    #[test]
+    fn the_log_names_team_tools_for_people() {
+        // Names kept apart from the calls, which the tool scan would read
+        // as defined tools.
+        let (team_tool, connection_tool) = ("tool_find_order", "linear__get_issue");
+        let mut events = vec![
+            Event::new(
+                "agent:planner",
+                ActorKind::Agent,
+                audit::action::TOOL_REFUSED,
+                "refused",
+            )
+            .tool(team_tool, "read")
+            .policy(audit::PolicyFields::default()),
+            Event::new(
+                "agent:coder",
+                ActorKind::Agent,
+                audit::action::TOOL_CALLED,
+                "ok",
+            )
+            .tool("write_file", "write")
+            .policy(audit::PolicyFields::default()),
+            Event::new(
+                "agent:planner",
+                ActorKind::Agent,
+                audit::action::TOOL_CALLED,
+                "ok",
+            )
+            .tool(connection_tool, "read")
+            .policy(audit::PolicyFields {
+                tool_label: "Linear: Get issue".into(),
+                ..Default::default()
+            }),
+        ];
+        label_events(&mut events);
+        let labels: Vec<&str> = events
+            .iter()
+            .map(|e| e.policy.as_ref().unwrap().tool_label.as_str())
+            .collect();
+        assert_eq!(labels, ["Find order", "", "Linear: Get issue"]);
     }
 
     #[test]

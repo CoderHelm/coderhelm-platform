@@ -2867,7 +2867,7 @@ pub async fn plan_chat(
     if let Some(t) = super::chat_policy::sign_in_tool(&missing) {
         ctx_tools.insert(0, t);
     }
-    let gate = super::chat_policy::gate(
+    let mut gate = super::chat_policy::gate(
         &state,
         &claims.team_id,
         &claims.email,
@@ -2875,6 +2875,7 @@ pub async fn plan_chat(
         &ctx.scope.repo,
         &ctx_tools,
     );
+    super::chat_policy::offer(&mut gate, &mut ctx_tools).await;
     let thread = gate.ctx.thread_id.clone();
     super::chat_policy::settle_connected(&state, &claims.team_id, &thread, &claims.email).await;
     let is_admin = claims.holder().holds("integrations");

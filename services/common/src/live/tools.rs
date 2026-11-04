@@ -76,6 +76,16 @@ impl ToolKind {
             ToolKind::Http => "http",
         }
     }
+    /// How much a tool of this kind can change: what the agent permissions
+    /// decide it by. Every kind is one checked read (lock 1), so all four
+    /// are reads; a kind that could change anything would have to say so
+    /// here before it could be offered.
+    pub fn risk(self) -> crate::agent_policy::Risk {
+        use crate::agent_policy::Risk;
+        match self {
+            ToolKind::Sql | ToolKind::Graphql | ToolKind::Logs | ToolKind::Http => Risk::Read,
+        }
+    }
     /// The kind of connected source this tool reads.
     pub fn source_kind(self) -> Kind {
         match self {
@@ -162,7 +172,44 @@ impl ToolDef {
     }
     /// The agent-facing function name.
     pub fn function_name(&self) -> String {
-        format!("tool_{}", self.name)
+        function_name(&self.name)
+    }
+    /// The name people know it by: `find_order` reads "Find order".
+    pub fn label(&self) -> String {
+        label(&self.name)
+    }
+}
+
+/// The agent-facing function name of the tool called `name`.
+pub fn function_name(name: &str) -> String {
+    format!("tool_{name}")
+}
+
+/// A tool's name as people read it: `find_order` is "Find order".
+pub fn label(name: &str) -> String {
+    let words = name.replace('_', " ");
+    let mut c = words.trim().chars();
+    match c.next() {
+        Some(f) => f.to_uppercase().collect::<String>() + c.as_str(),
+        None => String::new(),
+    }
+}
+
+/// How a tool stands with the agent permissions: its risk from the approved
+/// definition, or why no version of it may run.
+pub fn registration(
+    name: &str,
+    approved: &Result<ToolDef, String>,
+) -> crate::agent_policy::registry::Registration {
+    use crate::agent_policy::registry::{Family, Registration};
+    Registration {
+        tool: function_name(name),
+        family: Family::TeamTool,
+        label: label(name),
+        standing: approved
+            .as_ref()
+            .map(|d| d.kind.risk())
+            .map_err(Clone::clone),
     }
 }
 
