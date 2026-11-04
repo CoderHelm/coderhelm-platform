@@ -802,3 +802,199 @@ async fn sandbox_commands_go_through_the_gate() {
         Outcome::Refused { .. }
     ));
 }
+
+/// A team tool at the given approval, with its two versions on record: the
+/// approved one and an edit.
+mod team_tools {
+    use std::collections::HashMap;
+
+    use crate::live::tools::{content_hash, parse_def, registration, ToolDef};
+    use crate::live::tools_store::{standing, ToolRecord, VersionRecord};
+
+    pub fn def(read: &str) -> ToolDef {
+        parse_def(&format!(
+            "name: find_order\nuse_when: an order number is named\nsource: db\nkind: sql\nread: {read}\ninputs:\n  n: {{ type: integer, min: 1, max: 9, example: 1 }}\n"
+        ))
+        .unwrap()
+    }
+
+    /// Registers `find_order` for `team` the way a run does, approved at
+    /// `approved` (a hash, or empty), with `stored` as what is kept under
+    /// that hash.
+    pub fn register(team: &str, approved: &str, stored: &ToolDef) {
+        let rec = ToolRecord {
+            name: "find_order".into(),
+            enabled: true,
+            approved: approved.into(),
+            approved_by: "lee@acme.example".into(),
+            approved_at: String::new(),
+            latest: approved.into(),
+            created_by: "dana@acme.example".into(),
+            created_at: String::new(),
+        };
+        let versions = HashMap::from([(
+            ("find_order".to_string(), approved.to_string()),
+            VersionRecord {
+                hash: approved.into(),
+                def: stored.clone(),
+                author: "dana@acme.example".into(),
+                origin: "dashboard".into(),
+                created_at: String::new(),
+                example: String::new(),
+                example_ok: true,
+            },
+        )]);
+        crate::agent_policy::registry::register(
+            team,
+            [registration(&rec.name, &standing(&rec, &versions))],
+        );
+    }
+
+    pub fn approved_hash(d: &ToolDef) -> String {
+        content_hash(d)
+    }
+}
+
+/// A team's approved read tool runs under the starting policy like any
+/// other read, and its decision log line carries the name people know it by.
+#[tokio::test]
+async fn an_approved_team_tool_is_a_read_under_the_default_policy() {
+    let store = Arc::new(MemStore::new());
+    let team = "TEAM#team-tool-read";
+    let mut p = TeamPolicy::starting();
+    p.version = 1;
+    store.save(team, &p, 0).await.unwrap();
+    let d = team_tools::def("SELECT id FROM orders WHERE id = :n");
+    team_tools::register(team, &team_tools::approved_hash(&d), &d);
+
+    let g = Gate::new(store.clone(), GateCtx::new(team, Agent::Planner).run("r"))
+        .offering(["tool_find_order"]);
+    match g
+        .check(Request {
+            tool: "tool_find_order",
+            args: &json!({ "n": 4 }),
+            why: "",
+        })
+        .await
+    {
+        Outcome::Run { verdict } => {
+            assert_eq!(verdict.risk, Some(Risk::Read));
+            assert_eq!(verdict.decided_by, DecidedBy::Default { risk: Risk::Read });
+        }
+        other => panic!("expected it to run, got {other:?}"),
+    }
+    assert_eq!(
+        super::registry::label("TEAM#team-tool-read", "tool_find_order").as_deref(),
+        Some("Find order")
+    );
+    // Offered up front, too.
+    assert!(g
+        .offerable(["tool_find_order"])
+        .await
+        .contains("tool_find_order"));
+}
+
+/// A tool whose approved version no longer matches what is stored stays
+/// denied, says why in plain words, and isn't offered.
+#[tokio::test]
+async fn a_team_tool_changed_since_approval_is_denied_with_the_reason() {
+    let store = Arc::new(MemStore::new());
+    let team = "TEAM#team-tool-changed";
+    let approved = team_tools::def("SELECT id FROM orders WHERE id = :n");
+    let edited = team_tools::def("SELECT id, email FROM orders WHERE id = :n");
+    team_tools::register(team, &team_tools::approved_hash(&approved), &edited);
+
+    let g = Gate::new(store.clone(), GateCtx::new(team, Agent::Planner).run("r"))
+        .offering(["tool_find_order"]);
+    match g
+        .check(Request {
+            tool: "tool_find_order",
+            args: &json!({ "n": 4 }),
+            why: "",
+        })
+        .await
+    {
+        Outcome::Refused { verdict, message } => {
+            assert_eq!(verdict.decided_by, DecidedBy::Unknown);
+            assert_eq!(
+                verdict.reason,
+                "tool_find_order changed since it was approved, so it doesn't run. Approve the \
+                 new version in Settings, Tools."
+            );
+            assert!(message.contains("changed since it was approved"));
+        }
+        other => panic!("expected refused, got {other:?}"),
+    }
+    let logged = store.events_for(team);
+    assert_eq!(logged.len(), 1);
+    assert!(logged[0].detail.contains("changed since it was approved"));
+    assert_eq!(
+        logged[0].policy.as_ref().map(|p| p.tool_label.as_str()),
+        Some("Find order")
+    );
+    assert!(g.offerable(["tool_find_order"]).await.is_empty());
+
+    // Never approved: the same, with its own reason.
+    let team = "TEAM#team-tool-unapproved";
+    team_tools::register(team, "", &approved);
+    let g = Gate::new(store.clone(), GateCtx::new(team, Agent::Planner).run("r"));
+    match g
+        .check(Request {
+            tool: "tool_find_order",
+            args: &json!({}),
+            why: "",
+        })
+        .await
+    {
+        Outcome::Refused { verdict, .. } => {
+            assert!(verdict.reason.contains("has no approved version"))
+        }
+        other => panic!("expected refused, got {other:?}"),
+    }
+}
+
+/// What a loop offers: no unknown tool, no tool a rule denies for this
+/// agent, nothing for a switched-off agent; reads and asks stay.
+#[tokio::test]
+async fn tools_the_policy_always_denies_are_not_offered() {
+    let store = Arc::new(MemStore::new());
+    let mut p = TeamPolicy::starting();
+    p.version = 1;
+    p.rules.push(Rule {
+        id: "no-linear-writes".into(),
+        scope: Scope::Agent,
+        repo: None,
+        agent: Some(Agent::Planner),
+        kind: None,
+        server: None,
+        tool: Some("linear__create_*".into()),
+        risk: None,
+        command: None,
+        decision: Decision::Deny,
+        locked: false,
+        note: String::new(),
+        source: RuleSource::Manual,
+        created_by: String::new(),
+        created_at: String::new(),
+    });
+    store.save(TEAM, &p, 0).await.unwrap();
+    let names = [
+        "read_file",
+        "write_file",
+        "made_up",
+        "linear__create_issue",
+        "linear__get_issue",
+    ];
+    let g = Gate::new(store.clone(), GateCtx::new(TEAM, Agent::Planner).run("r"));
+    let mut kept: Vec<String> = g.offerable(names).await.into_iter().collect();
+    kept.sort();
+    assert_eq!(kept, ["linear__get_issue", "read_file", "write_file"]);
+    // Working out the offer logs nothing: no call was made.
+    assert!(store.events_for(TEAM).is_empty());
+
+    p.switches.team_off.insert(Agent::Planner);
+    p.version = 2;
+    store.save(OTHER, &p, 0).await.unwrap();
+    let g = Gate::new(store.clone(), GateCtx::new(OTHER, Agent::Planner).run("r"));
+    assert!(g.offerable(names).await.is_empty());
+}

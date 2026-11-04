@@ -269,16 +269,53 @@ impl Gate {
         }
     }
 
-    fn risk_for(&self, call: &Call) -> Option<Risk> {
+    /// What the registry knows about a call's tool, whether or not it was
+    /// offered.
+    fn standing(&self, call: &Call) -> engine::Known {
         if matches!(call.kind, CallKind::Command | CallKind::Egress) {
-            return Some(Risk::Write);
+            return engine::Known::Risk(Risk::Write);
+        }
+        registry::known(&self.ctx.team, &call.tool, self.registry)
+    }
+
+    fn risk_for(&self, call: &Call) -> engine::Known {
+        let known = self.standing(call);
+        // A registered tool that can't run says why, offered or not.
+        if matches!(known, engine::Known::Refused(_)) {
+            return known;
         }
         if let Some(o) = &self.offered {
-            if !o.contains(&call.tool) {
-                return None;
+            if !matches!(call.kind, CallKind::Command | CallKind::Egress) && !o.contains(&call.tool)
+            {
+                return engine::Known::Unknown;
             }
         }
-        self.registry.risk(&call.tool)
+        known
+    }
+
+    /// The tools worth offering this agent: every one except those the
+    /// policy denies whatever the call says (nothing knows the tool, no
+    /// version of it may run, the agent is off here, a rule denies it). A
+    /// call never depends on its arguments for these, so offering them
+    /// would only spend turns on refusals. A pause keeps every tool: it
+    /// stops the loop instead. Nothing is recorded: no call was made.
+    pub async fn offerable<'n, I: IntoIterator<Item = &'n str>>(
+        &self,
+        names: I,
+    ) -> HashSet<String> {
+        let policy = self.policy().await;
+        let now = super::now();
+        let mut keep = HashSet::new();
+        for name in names {
+            let call = self.call_for(name);
+            let v = engine::decide(&policy, &call, self.standing(&call), &now);
+            if v.decision != Decision::Deny || v.paused() {
+                keep.insert(name.to_string());
+            } else {
+                tracing::debug!(tool = %name, reason = %v.reason, "Not offering a tool the policy denies");
+            }
+        }
+        keep
     }
 
     /// Checks one tool call.
@@ -592,6 +629,7 @@ impl Gate {
                 decision: v.decision.as_str().into(),
                 rule: rule_ref(&v.decided_by),
                 thread_id: self.ctx.thread_id.clone(),
+                tool_label: registry::label(&self.ctx.team, &call.tool).unwrap_or_default(),
             });
         if !approval_id.is_empty() {
             e = e.approval(approval_id);

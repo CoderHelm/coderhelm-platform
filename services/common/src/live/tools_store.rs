@@ -136,13 +136,38 @@ pub fn pick_usable(
 ) -> Vec<(ToolRecord, ToolDef)> {
     tools
         .iter()
-        .filter(|t| t.enabled && !t.approved.is_empty())
         .filter_map(|t| {
-            let v = versions.get(&(t.name.clone(), t.approved.clone()))?;
-            (v.hash == t.approved && content_hash(&v.def) == v.hash && v.def.usable_for(repo))
-                .then(|| (t.clone(), v.def.clone()))
+            let def = standing(t, versions).ok()?;
+            def.usable_for(repo).then(|| (t.clone(), def))
         })
         .collect()
+}
+
+/// Where one tool stands for the whole team: the approved definition agents
+/// run, or, in plain words, why none runs. Repository scope is left to
+/// [`pick_usable`]: it decides where a tool is offered, not what it is.
+pub fn standing(
+    t: &ToolRecord,
+    versions: &HashMap<(String, String), VersionRecord>,
+) -> Result<ToolDef, String> {
+    let f = super::tools::function_name(&t.name);
+    if t.approved.is_empty() {
+        return Err(format!(
+            "{f} has no approved version yet, so it doesn't run. Approve it in Settings, Tools."
+        ));
+    }
+    if !t.enabled {
+        return Err(format!(
+            "{f} is switched off, so it doesn't run. Switch it on in Settings, Tools."
+        ));
+    }
+    match versions.get(&(t.name.clone(), t.approved.clone())) {
+        Some(v) if v.hash == t.approved && content_hash(&v.def) == v.hash => Ok(v.def.clone()),
+        _ => Err(format!(
+            "{f} changed since it was approved, so it doesn't run. Approve the new version in \
+             Settings, Tools."
+        )),
+    }
 }
 
 /// An ask-me-first call to record.
@@ -366,7 +391,25 @@ impl ToolStore<'_> {
     }
 
     /// The tools agents on `repo` may use. See [`pick_usable`].
+    /// Every tool is registered with the agent permissions on the way, by
+    /// its approved definition, so the policy decides it like any other
+    /// tool (see [`super::tools::registration`]).
     pub async fn usable(&self, repo: &str) -> Result<Vec<(ToolRecord, ToolDef)>, String> {
+        let (tools, versions) = self.approved_versions().await?;
+        crate::agent_policy::registry::register(
+            self.team,
+            tools
+                .iter()
+                .map(|t| super::tools::registration(&t.name, &standing(t, &versions))),
+        );
+        Ok(pick_usable(&tools, &versions, repo))
+    }
+
+    /// Every tool, and the approved version of each that has one.
+    #[allow(clippy::type_complexity)]
+    async fn approved_versions(
+        &self,
+    ) -> Result<(Vec<ToolRecord>, HashMap<(String, String), VersionRecord>), String> {
         let tools = self.list().await?;
         let mut versions = HashMap::new();
         for t in tools.iter().filter(|t| t.enabled && !t.approved.is_empty()) {
@@ -374,7 +417,20 @@ impl ToolStore<'_> {
                 versions.insert((t.name.clone(), t.approved.clone()), v);
             }
         }
-        Ok(pick_usable(&tools, &versions, repo))
+        Ok((tools, versions))
+    }
+
+    /// Every tool's standing with the agent permissions, the same as a run
+    /// registers it (the settings page's "test a call" box, the decision
+    /// log's names).
+    pub async fn registrations(
+        &self,
+    ) -> Result<Vec<crate::agent_policy::registry::Registration>, String> {
+        let (tools, versions) = self.approved_versions().await?;
+        Ok(tools
+            .iter()
+            .map(|t| super::tools::registration(&t.name, &standing(t, &versions)))
+            .collect())
     }
 
     /// Counts one run this hour and says whether it fits the limit.
@@ -537,6 +593,36 @@ mod tests {
             example: String::new(),
             example_ok: true,
         }
+    }
+
+    #[test]
+    fn a_tool_that_cant_run_says_why() {
+        let v1 = def("SELECT id FROM orders WHERE id = :n");
+        let h1 = content_hash(&v1);
+        let versions = HashMap::from([(("find_order".to_string(), h1.clone()), ver(&v1))]);
+        assert_eq!(standing(&rec(true, &h1, &h1), &versions).unwrap(), v1);
+        assert!(standing(&rec(true, "", &h1), &versions)
+            .unwrap_err()
+            .starts_with("tool_find_order has no approved version yet"));
+        assert!(standing(&rec(false, &h1, &h1), &versions)
+            .unwrap_err()
+            .contains("switched off"));
+        // What is kept under the approved hash isn't what was approved.
+        let mut tampered = versions.clone();
+        tampered
+            .get_mut(&("find_order".to_string(), h1.clone()))
+            .unwrap()
+            .def = def("SELECT id, email FROM orders WHERE id = :n");
+        assert_eq!(
+            standing(&rec(true, &h1, &h1), &tampered).unwrap_err(),
+            "tool_find_order changed since it was approved, so it doesn't run. Approve the new \
+             version in Settings, Tools."
+        );
+        // Its registration: a read by its kind, named for people.
+        let r = crate::live::tools::registration("find_order", &Ok(v1));
+        assert_eq!(r.tool, "tool_find_order");
+        assert_eq!(r.label, "Find order");
+        assert_eq!(r.standing, Ok(crate::agent_policy::Risk::Read));
     }
 
     #[test]

@@ -2287,7 +2287,7 @@ async fn answer(
     if let Some(t) = super::chat_policy::sign_in_tool(&run.missing) {
         tools.insert(0, t);
     }
-    let gate = super::chat_policy::gate_for(
+    let mut gate = super::chat_policy::gate_for(
         state,
         common::agent_policy::Agent::BrainChat,
         &run.team_id,
@@ -2296,6 +2296,7 @@ async fn answer(
         &run.scope.repo,
         &tools,
     );
+    super::chat_policy::offer(&mut gate, &mut tools).await;
     super::chat_policy::settle_connected(state, &run.team_id, &gate.ctx.thread_id, &run.user_email)
         .await;
     // Nothing found and nothing to look up: say so without a model call.

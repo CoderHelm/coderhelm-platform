@@ -116,6 +116,42 @@ pub fn effective(s: &ServerRecord) -> Vec<&RemoteTool> {
         .collect()
 }
 
+/// How a usable tool stands with the agent permissions: its risk from the
+/// server's own hints (reads only, destructive), else from its name.
+pub fn registration(
+    s: &ServerRecord,
+    t: &RemoteTool,
+) -> Option<crate::agent_policy::registry::Registration> {
+    use crate::agent_policy::registry::{classify_external, Family, Registration};
+    use crate::agent_policy::Risk;
+    let by_name = classify_external(&t.name);
+    let risk = match (access(t), t.destructive) {
+        (Access::Read, _) => Risk::Read,
+        (_, Some(true)) => Risk::Consequential,
+        (Access::Write, _) => by_name.max(Risk::Write),
+        (Access::Unknown, _) => by_name,
+    };
+    let title = t
+        .title
+        .clone()
+        .filter(|x| !x.trim().is_empty())
+        .unwrap_or_else(|| t.name.clone());
+    Some(Registration {
+        tool: agent_tool_name(&s.id, &t.name)?,
+        family: Family::Connection,
+        label: format!("{}: {title}", s.name),
+        standing: Ok(risk),
+    })
+}
+
+/// [`registration`] for every tool agents get from the server.
+pub fn registrations(s: &ServerRecord) -> Vec<crate::agent_policy::registry::Registration> {
+    effective(s)
+        .into_iter()
+        .filter_map(|t| registration(s, t))
+        .collect()
+}
+
 /// The model tool definitions for a server's usable tools: (name,
 /// description, input schema). `read_only` keeps only tools a read-only agent
 /// may use (the planner, the reviewer).

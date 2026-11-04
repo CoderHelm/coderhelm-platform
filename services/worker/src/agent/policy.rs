@@ -17,6 +17,7 @@ use common::agent_policy::links::Channel;
 use common::agent_policy::store::{DynamoStore, PolicyStore};
 use common::agent_policy::{Agent, Gate, GateCtx, Stop};
 
+use super::llm::ToolDefinition;
 use crate::WorkerState;
 
 /// What a model provider is working on: the team, and the run, repository
@@ -201,6 +202,31 @@ impl Notifier for ChannelNotifier {
             common::notify::deliver(&poster, &one, &msg, "agent approval").await;
         }
     }
+}
+
+/// The tools to give the model: `tools` without the ones the policy denies
+/// whatever the call says (see [`Gate::offerable`]). The gate is told what
+/// was offered, so a call to anything else is refused as unknown.
+pub async fn offerable(gate: &mut Gate, tools: &[ToolDefinition]) -> Vec<ToolDefinition> {
+    let keep = gate.offerable(tools.iter().map(|t| t.name.as_str())).await;
+    let offered: Vec<ToolDefinition> = tools
+        .iter()
+        .filter(|t| keep.contains(&t.name))
+        .map(|t| ToolDefinition {
+            name: t.name.clone(),
+            description: t.description.clone(),
+            input_schema: t.input_schema.clone(),
+        })
+        .collect();
+    if offered.len() < tools.len() {
+        tracing::info!(
+            agent = %gate.ctx.agent.map(|a| a.key()).unwrap_or_default(),
+            withheld = ?tools.iter().filter(|t| !keep.contains(&t.name)).map(|t| t.name.as_str()).collect::<Vec<_>>(),
+            "Not offering tools the agent permissions deny"
+        );
+    }
+    gate.set_offered(offered.iter().map(|t| t.name.clone()));
+    offered
 }
 
 /// What happened to one tool call.
@@ -675,6 +701,107 @@ mod tests {
         assert!(out);
         assert!(stop.is_some());
         assert_eq!(ex.0.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    fn tool(name: &str) -> ToolDefinition {
+        ToolDefinition {
+            name: name.into(),
+            description: String::new(),
+            input_schema: serde_json::json!({ "type": "object" }),
+        }
+    }
+
+    /// The model is never given a tool the policy would refuse whatever the
+    /// call: unknown, a team tool with no runnable version, one a rule
+    /// denies. An approved team tool and the ordinary reads are offered, and
+    /// a call to a withheld tool is still refused (and logged) if the model
+    /// names it anyway.
+    #[tokio::test]
+    async fn tools_denied_up_front_are_not_offered() {
+        use common::agent_policy::model::{Decision, Rule, RuleSource, Scope, TeamPolicy};
+        use common::agent_policy::registry::{register, Family, Registration};
+        use common::agent_policy::store::MemStore;
+        let team = "TEAM#offer";
+        let store = Arc::new(MemStore::new());
+        let mut p = TeamPolicy::starting();
+        p.version = 1;
+        p.rules.push(Rule {
+            id: "planner-no-writes".into(),
+            scope: Scope::Agent,
+            repo: None,
+            agent: Some(Agent::Planner),
+            kind: None,
+            server: None,
+            tool: Some("write_file".into()),
+            risk: None,
+            command: None,
+            decision: Decision::Deny,
+            locked: false,
+            note: String::new(),
+            source: RuleSource::Manual,
+            created_by: String::new(),
+            created_at: String::new(),
+        });
+        store.save(team, &p, 0).await.unwrap();
+        let reg = |name: &str, standing| Registration {
+            tool: format!("tool_{name}"),
+            family: Family::TeamTool,
+            label: common::live::tools::label(name),
+            standing,
+        };
+        register(
+            team,
+            [
+                reg("find_order", Ok(common::agent_policy::Risk::Read)),
+                reg(
+                    "order_history",
+                    Err(
+                        "tool_order_history changed since it was approved, so it doesn't run. \
+                         Approve the new version in Settings, Tools."
+                            .into(),
+                    ),
+                ),
+            ],
+        );
+        let tools: Vec<ToolDefinition> = [
+            "read_file",
+            "write_file",
+            "tool_find_order",
+            "tool_order_history",
+            "made_up",
+        ]
+        .into_iter()
+        .map(tool)
+        .collect();
+        let ctx = PolicyScope {
+            team: team.into(),
+            run_id: "r1".into(),
+            ..Default::default()
+        }
+        .ctx(Agent::Planner);
+        let mut gate = Gate::new(store.clone(), ctx);
+        let offered = offerable(&mut gate, &tools).await;
+        let names: Vec<&str> = offered.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(names, ["read_file", "tool_find_order"]);
+        assert!(store.events_for(team).is_empty(), "no call, no log line");
+
+        let ex = Counting(Default::default());
+        let input = serde_json::json!({});
+        assert!(matches!(
+            gated_execute(&gate, &ex, "tool_find_order", &input, "").await,
+            Gated::Ran(Ok(_))
+        ));
+        match gated_execute(&gate, &ex, "tool_order_history", &input, "").await {
+            Gated::Refused(m) => assert!(m.contains("changed since it was approved")),
+            _ => panic!("expected refused"),
+        }
+        assert!(matches!(
+            gated_execute(&gate, &ex, "write_file", &input, "").await,
+            Gated::Refused(_)
+        ));
+        assert_eq!(ex.0.load(std::sync::atomic::Ordering::SeqCst), 1);
+        // The attempted calls that were refused are on the log.
+        assert_eq!(store.events_for(team).len(), 2);
     }
 
     fn collect(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {

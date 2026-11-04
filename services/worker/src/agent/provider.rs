@@ -242,15 +242,16 @@ pub async fn converse(
     // A switch in Settings, System, Models reaches the next loop.
     common::model_provider::refresh(&state.dynamo, &state.config.settings_table_name).await;
     let client = provider.client();
-    // Every call this loop makes is asked of the policy gate first.
-    let gate = super::policy::gate(state, provider.scope.ctx(agent), opts.deadline)
-        .offering(tools.iter().map(|t| t.name.clone()));
+    // Every call this loop makes is asked of the policy gate first, and a
+    // tool the policy would refuse whatever the call is never offered.
+    let mut gate = super::policy::gate(state, provider.scope.ctx(agent), opts.deadline);
+    let tools = super::policy::offerable(&mut gate, tools).await;
     anthropic::converse_tool_loop(
         &client,
         model_id,
         system_prompt,
         messages,
-        tools,
+        &tools,
         tool_executor,
         &gate,
         usage,
