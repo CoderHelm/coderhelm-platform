@@ -20,7 +20,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { buildApp } from "../lib/app";
 import { resolveConfig } from "../lib/config";
-import { buildNative } from "../lib/native/build";
+import { buildNative, nativeStamp } from "../lib/native/build";
 import { ASSETS_BUCKET_SENTINEL, REGION_SENTINEL, STAGE_SENTINEL, nativeConfig } from "../lib/native/config";
 import { emailEnvironment } from "../lib/service-env";
 import { decision } from "./iam-eval";
@@ -41,11 +41,42 @@ process.env.WORKER_ZIP = path.join(STUBS, "worker");
 process.env.MCP_PROXY_DIR = path.join(STUBS, "mcp");
 
 const OUT = fs.mkdtempSync(path.join(os.tmpdir(), "chnatrel-"));
-const rel = buildNative("v9.8.7", OUT, { dashboardDir: DASH });
+const rel = buildNative("v9.8.7", OUT, { dashboardDir: DASH, commit: "0123456789abcdef0123456789abcdef01234567", releasedAt: "2026-11-01T12:00:00Z" });
 const P = rel.parent;
 const R = P.Resources;
 
 const all = (): [string, any][] => [["coderhelm.json", P], ...Object.entries(rel.children)];
+
+test("every service of a native install carries the whole release stamp: version, commit and release date", () => {
+  const stamped: string[] = [];
+  for (const [name, t] of Object.entries<any>(rel.children)) {
+    for (const r of Object.values<any>(t.Resources)) {
+      const vars = r.Type === "AWS::Lambda::Function" ? r.Properties?.Environment?.Variables : undefined;
+      if (!vars?.CODERHELM_VERSION) continue;
+      stamped.push(`${name}:${r.Properties.FunctionName ? JSON.stringify(r.Properties.FunctionName) : "?"}`);
+      assert.equal(vars.CODERHELM_VERSION, "v9.8.7", name);
+      assert.equal(vars.CODERHELM_COMMIT, "0123456789abcdef0123456789abcdef01234567", name);
+      assert.equal(vars.CODERHELM_RELEASED_AT, "2026-11-01T12:00:00Z", name);
+    }
+  }
+  assert.ok(stamped.length >= 2, `the gateway and the updater are stamped (${stamped.join(", ")})`);
+  // The build leaves the environment as it found it.
+  assert.equal(process.env.CODERHELM_COMMIT, undefined);
+  assert.equal(process.env.CODERHELM_RELEASED_AT, undefined);
+});
+
+test("the native stamp: from the options, else the environment, else this checkout's commit and now", () => {
+  const now = new Date("2026-11-02T08:30:00.123Z");
+  assert.deepEqual(nativeStamp("v1.0.0", { commit: "a".repeat(40), releasedAt: "2026-01-01T00:00:00Z" }, {}, now), {
+    CODERHELM_VERSION: "v1.0.0", CODERHELM_COMMIT: "a".repeat(40), CODERHELM_RELEASED_AT: "2026-01-01T00:00:00Z",
+  });
+  assert.deepEqual(nativeStamp("v1.0.0", {}, { CODERHELM_COMMIT: "b".repeat(40), CODERHELM_RELEASED_AT: "2026-02-02T00:00:00Z" }, now), {
+    CODERHELM_VERSION: "v1.0.0", CODERHELM_COMMIT: "b".repeat(40), CODERHELM_RELEASED_AT: "2026-02-02T00:00:00Z",
+  });
+  const local = nativeStamp("v0.0.0-none", {}, {}, now);
+  assert.equal(local.CODERHELM_RELEASED_AT, "2026-11-02T08:30:00Z");
+  if (local.CODERHELM_COMMIT) assert.match(local.CODERHELM_COMMIT, /^[0-9a-f]{40}$/, "this checkout's HEAD");
+});
 
 test("no sentinel survives anywhere, and the package reports no problem", () => {
   assert.deepEqual(rel.problems, []);
