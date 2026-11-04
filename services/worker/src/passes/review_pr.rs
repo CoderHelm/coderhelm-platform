@@ -1046,6 +1046,36 @@ async fn run_once(
     };
     *reviewed_head = head_sha.clone();
 
+    // A review started by a description edit reads the description as it is
+    // now. When later edits left text this commit was already reviewed with
+    // (an edit after the queued review read it queues its own), it doesn't
+    // run again; the text it reviews is marked so the same text isn't.
+    if msg.trigger == common::review_description::TRIGGER {
+        if let Some(fresh) = description_to_mark(&msg, pr_body) {
+            let sk = common::review_description::seen_sk(
+                &msg.repo_owner,
+                &msg.repo_name,
+                msg.pr_number,
+                &head_sha,
+                &fresh,
+            );
+            let claim = common::claim::claim(
+                &state.dynamo,
+                &state.config.settings_table_name,
+                &msg.team_id,
+                &sk,
+                common::review_description::SEEN_TTL_SECS,
+            )
+            .await;
+            if claim == common::claim::Claim::Held {
+                info!(pr = msg.pr_number, head = %head_sha, "Description already reviewed at this commit — not reviewed again");
+                return Ok(Outcome::Skipped {
+                    reason: "This description was already reviewed at this commit.".into(),
+                });
+            }
+        }
+    }
+
     // One review per head commit: a push, label or ready event for a commit
     // CoderHelm already reviewed returns that verdict, with no model work.
     let repo_slug = format!("{}/{}", msg.repo_owner, msg.repo_name);
@@ -2417,7 +2447,9 @@ async fn run_once(
         review_agent::decide_verdict(&findings, still_open_holding, &unconfirmed, verify_failed);
     // Rule 2: on a commit already reviewed, the verdict changes only on new
     // information, and says what it was.
-    let new_info: Option<String> = if msg.trigger == "reconcile" {
+    let new_info: Option<String> = if msg.trigger == common::review_description::TRIGGER {
+        Some("the description updated since my last review".to_string())
+    } else if msg.trigger == "reconcile" {
         Some(
             msg.reconcile_note
                 .clone()
@@ -2534,6 +2566,15 @@ async fn run_once(
         "Automated review complete.".to_string()
     } else {
         short_overview(&output.summary)
+    };
+    // A review the description edit started says so first.
+    let verdict_line = if msg.trigger == common::review_description::TRIGGER {
+        format!(
+            "{verdict_line}\n\n_{}_",
+            common::review_description::SUMMARY_NOTE
+        )
+    } else {
+        verdict_line
     };
     let mut full_body = match &stable.note {
         Some(n) => format!(
@@ -3135,6 +3176,7 @@ pub async fn review_for_run(
         wait_secs: 0,
         reconcile_note: None,
         outstanding_work: None,
+        description_hash: None,
     };
     let mut reviewed_head = head_sha.to_string();
     let job = LiveJob::start();
@@ -4227,6 +4269,17 @@ fn moved_on(msg: &ReviewMessage, reviewed_head: &str, latest_head: &str) -> bool
 /// was enqueued for; that commit's own review covers the latest code. Reviews
 /// that answer a question, or that resolve the head themselves (empty
 /// head_sha), always speak.
+/// For a review started by a description edit: the hash of the description
+/// the review reads, when it isn't the one the edit's webhook carried (that
+/// one the gateway already marked). `None` for every other trigger.
+fn description_to_mark(msg: &ReviewMessage, pr_body: &str) -> Option<String> {
+    if msg.trigger != common::review_description::TRIGGER {
+        return None;
+    }
+    let fresh = common::review_description::body_hash(pr_body);
+    (msg.description_hash.as_deref() != Some(fresh.as_str())).then_some(fresh)
+}
+
 fn superseded(msg: &ReviewMessage, current_head: &str) -> bool {
     msg.question.is_none()
         && !msg.head_sha.is_empty()
@@ -4236,7 +4289,7 @@ fn superseded(msg: &ReviewMessage, current_head: &str) -> bool {
 
 #[cfg(test)]
 mod superseded_tests {
-    use super::{moved_on, superseded};
+    use super::{description_to_mark, moved_on, superseded};
     use crate::models::ReviewMessage;
 
     fn msg(head: &str, question: Option<&str>) -> ReviewMessage {
@@ -4259,7 +4312,29 @@ mod superseded_tests {
             wait_secs: 0,
             reconcile_note: None,
             outstanding_work: None,
+            description_hash: None,
         }
+    }
+
+    #[test]
+    fn a_description_review_marks_the_text_it_reads_when_it_is_newer() {
+        use common::review_description::{body_hash, TRIGGER};
+        let mut m = msg("cc15ab8", None);
+        m.trigger = TRIGGER.into();
+        m.description_hash = Some(body_hash("ran it on a restore: 4,210 rows"));
+        // The text the webhook carried: the gateway already marked it.
+        assert_eq!(
+            description_to_mark(&m, "ran it on a restore:  4,210 rows"),
+            None
+        );
+        // A later edit: the review reads and marks that text.
+        assert_eq!(
+            description_to_mark(&m, "ran it on a restore: 4,210 rows, 0 errors"),
+            Some(body_hash("ran it on a restore: 4,210 rows, 0 errors"))
+        );
+        // Other triggers never mark a description.
+        m.trigger = "synchronize".into();
+        assert_eq!(description_to_mark(&m, "anything"), None);
     }
 
     #[test]
@@ -4596,6 +4671,7 @@ mod failure_tests {
             wait_secs: 0,
             reconcile_note: None,
             outstanding_work: None,
+            description_hash: None,
         }
     }
 

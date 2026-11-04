@@ -11,6 +11,9 @@ pub mod model_ids;
 /// Expiring once-only claims (dedup markers, leases) on the settings table.
 /// Shared so every claim compares its expiry the same way.
 pub mod claim;
+/// A re-review started by an edit of a pull request's description: what
+/// counts as a change, and the keys that queue one review per edit burst.
+pub mod review_description;
 
 /// The code graph's per-repo switch and build status (gateway and worker).
 pub mod code_graph;
