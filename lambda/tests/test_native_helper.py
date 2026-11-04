@@ -230,7 +230,7 @@ class OnlyOnARealDelete(unittest.TestCase):
 
     def test_delete_without_keep_data_empties_and_deletes_tables(self):
         h._clients["cloudformation@None"] = FakeCfn("DELETE_IN_PROGRESS")
-        s3 = FakeS3(versions=[{"Key": "k", "VersionId": "1"}])
+        s3 = FakeS3Delete(versions=[{"Key": "k", "VersionId": "1"}])
         h._clients["s3@None"] = s3
         ddb = FakeDdb({"coderhelm-prod-traces": (True, 2), "coderhelm-prod-checkpoints": (False, 1)})
         h._clients["dynamodb@None"] = ddb
@@ -245,6 +245,8 @@ class OnlyOnARealDelete(unittest.TestCase):
         self.assertEqual(ddb.tables, {})
         self.assertIn(("protect-off", "coderhelm-prod-traces"), ddb.calls)
         self.assertIn("k", s3.deleted)
+        # The parts retain their buckets (literal DeletionPolicy): the helper deletes them.
+        self.assertEqual(s3.buckets_deleted, ["data", "gone"])
 
     def test_a_rolled_back_first_launch_cleans_even_with_keep_data(self):
         h._clients["cloudformation@None"] = FakeCfn("ROLLBACK_IN_PROGRESS")
@@ -802,13 +804,23 @@ class UninstallSwitch(unittest.TestCase):
         (s_status, s_reason, _), _ = self.run_both(FakeSsm("yes please"))
         self.assertEqual((s_status, s_reason), ("SUCCESS", "data kept"))
 
-    def test_keep_data_false_lets_the_stack_delete_its_own_buckets_pool_and_keys(self):
-        # CloudFormation deletes those itself (DeletionPolicy Delete): the helper doesn't.
-        (s_status, _, _), (f_status, _, _) = self.run_both(FakeSsm(None), keep="false")
-        self.assertEqual((s_status, f_status), ("SUCCESS", "SUCCESS"))
+    def test_keep_data_false_deletes_the_buckets_pool_and_keys_the_parts_retain(self):
+        # The parts always retain their data (literal DeletionPolicy, no
+        # transform): with KeepDataOnDelete=false the helper deletes it all.
+        (s_status, s_reason, _), (f_status, f_reason, _) = self.run_both(FakeSsm(None), keep="false")
+        self.assertEqual((s_status, f_status), ("SUCCESS", "SUCCESS"), (s_reason, f_reason))
         self.assertIn("k", self.s3.deleted)
-        self.assertEqual((self.s3.buckets_deleted, self.cognito.calls, self.kms.scheduled), ([], [], []))
+        self.assertEqual(self.s3.buckets_deleted, ["coderhelm-prod-data-1"])
+        self.assertEqual(self.ddb.tables, {})
+        self.assertEqual(self.cognito.calls, [("protect", "us-east-1_prod", "INACTIVE"), ("domain", "coderhelm-prod-auth"), ("delete", "us-east-1_prod")])
+        self.assertEqual(sorted(self.kms.scheduled), [("k1", 7), ("k2", 7)])
         self.assertEqual(self.sm.deleted, [("s", True)])
+
+    def test_a_rolled_back_first_launch_leaves_the_data_to_cloudformation(self):
+        # RetainExceptOnCreate removes what the failed create made.
+        (s_status, _, _), (f_status, _, _) = self.run_both(FakeSsm(None), status="ROLLBACK_IN_PROGRESS", keep="false")
+        self.assertEqual((s_status, f_status), ("SUCCESS", "SUCCESS"))
+        self.assertEqual((self.s3.buckets_deleted, self.cognito.calls, self.kms.scheduled), ([], [], []))
 
     def test_an_update_never_reads_or_acts_on_the_switch(self):
         ssm = FakeSsm("delete")

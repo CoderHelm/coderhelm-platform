@@ -1445,6 +1445,50 @@ pub struct Blocker {
     pub severity: &'static str,
     pub detail: String,
     pub fix: Fix,
+    /// AWS's own words, for Technical details (never in `detail`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub technical: Option<String>,
+}
+
+/// The last try at `ver` didn't succeed: the updater's plain words (what
+/// happened, the next step) when it wrote them, AWS's own text apart.
+fn failed_before(ver: &str, history: Option<&Vec<Value>>) -> Blocker {
+    let entry = history.and_then(|h| {
+        h.iter()
+            .find(|e| e["version"].as_str() == Some(ver) && e["status"] != "succeeded")
+    });
+    let text = |k: &str| {
+        entry
+            .and_then(|e| e[k].as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+    };
+    let auto = "Auto-update skips this release; a newer one goes ahead as usual.";
+    let (detail, fix) = match (text("summary"), text("fix")) {
+        (Some(summary), Some(fix)) => (
+            format!("The last try to update to {ver} didn't succeed. {summary}"),
+            format!("{fix} {auto}"),
+        ),
+        // An older updater: its reason only.
+        _ => (
+            format!(
+                "The last try to update to {ver} didn't succeed: {}.",
+                text("reason")
+                    .unwrap_or("see the update history")
+                    .trim_end_matches('.')
+            ),
+            format!("Fix what the history says, then try again. {auto}"),
+        ),
+    };
+    Blocker {
+        key: "failed_before".into(),
+        severity: "warn",
+        detail,
+        fix: Fix::text(fix)
+            .href("/settings/system#history")
+            .command(format!("{CLI} doctor")),
+        technical: text("technical").map(str::to_string),
+    }
 }
 
 /// What would block an update now, from the checks and the updater's status.
@@ -1457,6 +1501,7 @@ pub fn preflight(checks: &[Check], status: Option<&Value>) -> Vec<Blocker> {
                 && c.key != "update_models"
         })
         .map(|c| Blocker {
+            technical: None,
             key: c.key.to_string(),
             severity: "block",
             detail: format!(
@@ -1468,6 +1513,7 @@ pub fn preflight(checks: &[Check], status: Option<&Value>) -> Vec<Blocker> {
         .collect();
     let Some(v) = status else {
         out.push(Blocker {
+            technical: None,
             key: "updater".into(),
             severity: "block",
             detail: "The updater didn't answer, so an update can't start from here.".into(),
@@ -1480,6 +1526,7 @@ pub fn preflight(checks: &[Check], status: Option<&Value>) -> Vec<Blocker> {
     if let Some(mc) = v.get("model_check").filter(|m| m["pending"] == true) {
         let ver = mc["version"].as_str().unwrap_or("the next release");
         out.push(Blocker {
+            technical: None,
             key: "model_check_pending".into(),
             severity: "block",
             detail: format!("Checking {ver}'s signature before reading the models it calls."),
@@ -1508,6 +1555,7 @@ pub fn preflight(checks: &[Check], status: Option<&Value>) -> Vec<Blocker> {
                 fix = fix.href(h);
             }
             out.push(Blocker {
+                technical: None,
                 key: format!("model:{}", f["model"].as_str().unwrap_or("?")),
                 // Only a model the release calls blocks; another can be skipped.
                 severity: if f["required"] == false {
@@ -1525,6 +1573,7 @@ pub fn preflight(checks: &[Check], status: Option<&Value>) -> Vec<Blocker> {
     }
     if v["running"].as_bool() == Some(true) {
         out.push(Blocker {
+            technical: None,
             key: "running".into(),
             severity: "block",
             detail: "An update is already running.".into(),
@@ -1536,6 +1585,7 @@ pub fn preflight(checks: &[Check], status: Option<&Value>) -> Vec<Blocker> {
     if latest["breaking"].as_bool() == Some(true) {
         let ver = latest["version"].as_str().unwrap_or("the next release");
         out.push(Blocker {
+            technical: None,
             key: "migration".into(),
             severity: "warn",
             detail: format!("{ver} is a major release whose notes ask you to do something before or after updating."),
@@ -1547,22 +1597,7 @@ pub fn preflight(checks: &[Check], status: Option<&Value>) -> Vec<Blocker> {
     if let (Some(ver), Some(failed)) = (latest["version"].as_str(), v["failed_versions"].as_array())
     {
         if failed.iter().any(|f| f.as_str() == Some(ver)) {
-            let reason = v["history"]
-                .as_array()
-                .and_then(|h| {
-                    h.iter()
-                        .find(|e| e["version"].as_str() == Some(ver) && e["status"] != "succeeded")
-                })
-                .and_then(|e| e["reason"].as_str())
-                .unwrap_or("see the update history");
-            out.push(Blocker {
-                key: "failed_before".into(),
-                severity: "warn",
-                detail: format!("The last try to update to {ver} didn't succeed: {reason}."),
-                fix: Fix::text("Fix what the history says, then try again. Auto-update skips this release until then.")
-                    .href("/settings/system#history")
-                    .command(format!("{CLI} doctor")),
-            });
+            out.push(failed_before(ver, v["history"].as_array()));
         }
     }
     out
@@ -2986,6 +3021,30 @@ mod tests {
         assert_eq!(b[0].severity, "block");
         assert_eq!(b[2].severity, "warn");
         assert!(b[3].detail.contains("health check failed"));
+        assert_eq!(b[3].technical, None);
+        // The updater's plain words, with AWS's own text apart.
+        let plain = json!({
+            "latest": {"version": "v0.8.31"},
+            "failed_versions": ["v0.8.31"],
+            "history": [{"version": "v0.8.31", "status": "failed",
+                "summary": "The update couldn't start: CoderHelm's update role isn't allowed to use an AWS template feature this release needs. Nothing changed: your install stayed on v0.8.29.",
+                "fix": "Update again once a newer release is out (CoderHelm checks for one every hour).",
+                "technical": "User: arn:aws:sts::1:assumed-role/r/AWSCloudFormation is not authorized to perform: cloudformation:CreateChangeSet on resource: arn:aws:cloudformation:us-east-1:aws:transform/LanguageExtensions",
+                "reason": "raw"}],
+        });
+        let f = &preflight(&[], Some(&plain))[0];
+        assert_eq!(f.key, "failed_before");
+        assert_eq!(f.detail, "The last try to update to v0.8.31 didn't succeed. The update couldn't start: CoderHelm's update role isn't allowed to use an AWS template feature this release needs. Nothing changed: your install stayed on v0.8.29.");
+        assert_eq!(f.fix.text, "Update again once a newer release is out (CoderHelm checks for one every hour). Auto-update skips this release; a newer one goes ahead as usual.");
+        assert!(!f.detail.contains("arn:") && !f.fix.text.contains("arn:"));
+        assert!(f
+            .technical
+            .as_deref()
+            .unwrap()
+            .contains("transform/LanguageExtensions"));
+        // A newer release than the one that failed: nothing to warn about.
+        let newer = json!({"latest": {"version": "v0.8.32"}, "failed_versions": ["v0.8.31"], "history": plain["history"]});
+        assert!(preflight(&[], Some(&newer)).is_empty());
         // Nothing wrong: nothing blocks.
         assert!(preflight(
             &[dlq(Some(0))],

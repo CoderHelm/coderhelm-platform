@@ -93,7 +93,7 @@ On an install made with Launch Stack, an update is a stack update of `coderhelm-
    - **The maintenance window started it (auto-update on):** it applies by itself, except when it would replace or remove data or change permissions: then it waits, admins get an email, and you confirm it on the page the same way. If auto-update was turned off before it ran, it waits for you to press **Apply**.
    - **It changes the deploy role or a permissions boundary:** the deploy role can't change those (that is what keeps it from giving itself more), so CoderHelm can't apply it for you. The page says so and links to the change set: someone with administrator rights in the AWS account reviews it and chooses **Execute**. Releases do this rarely, and their notes say so.
 5. **Follows it.** Every 5 minutes the updater reads the change set and the stack until the update ends. When the stack update starts, the install's own copy step checks every file of the release against the sha256 that `coderhelm.json` lists before any part changes. If a part fails, CloudFormation rolls the whole stack back to the previous release by itself.
-6. **Reports.** The history in **Settings, then System** shows the version, when, who (or "auto") and the result: succeeded, failed, or rolled back, with CloudFormation's own reason for the first resource that failed. Admins get an email either way.
+6. **Reports.** The history in **Settings, then System** shows the version, when, who (or "auto") and the result: succeeded, failed, or rolled back. A try that didn't succeed says in plain words what happened, where your install is now and what to do next; CloudFormation's own text (for the first resource that failed) is under **Technical details**. Admins get an email either way.
 
 A change set that waits too long can go stale (the stack changed since it was made); the history then says so, and **Update** prepares a new one. Pressing **Update** while an older prepared update waits replaces it (nothing was changed by the older one).
 
@@ -111,6 +111,13 @@ The history entry says what happened and what to do next:
 
 - **Rolled back:** the update didn't finish, so CloudFormation (or, on an install from before, the update job) put the previous release back. Your data is untouched. Fix what the reason and **Settings, then Setup** (or `doctor`) list, then update again. Automatic updates skip that release until an admin updates to it by hand.
 - **Failed:** the update stopped before or during the deploy. Check **Setup** for what fails and how to fix it. If the install isn't working, roll back.
+- **Couldn't start:** AWS refused to prepare the change, so nothing changed and your install stays on the release it runs.
+
+A try that didn't succeed never holds up the next release: automatic updates skip only that one version, and **Update** works for a newer release (or the same one again) as soon as it is out.
+
+### The update couldn't start: the update role isn't allowed to use an AWS template feature
+
+Up to v0.8.31, three part templates used an AWS template feature (the `AWS::LanguageExtensions` transform) that the install's deploy role isn't allowed to use. Since every update from the page goes through that role, an **Update** to one of those releases failed before anything changed, for example: "The update couldn't start: CoderHelm's update role isn't allowed to use an AWS template feature this release needs. Nothing changed: your install stayed on v0.8.29." The releases after v0.8.31 use no transform, and CoderHelm's tests fail a release whenever a template uses one the deploy role can't. Press **Update** again once a newer release is out: it applies from the page as usual, with no step in the AWS console. Your data and the **KeepDataOnDelete** choice are unchanged.
 
 On an install made with Launch Stack, the stack's **Events** tab in the CloudFormation console shows every step and the first error.
 

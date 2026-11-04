@@ -9,7 +9,7 @@
  * stack removes it.
  */
 import { accessNames, AccessNames, boundaryPolicy, deployPolicy, INSTALL_TAG, PolicyDocument } from "../access";
-import { Asset, Child, Json, KEEP_CONDITION } from "./package";
+import { Asset, Child, Json, KEEP_PARAM } from "./package";
 
 /** A string with substitutions becomes Fn::Sub; objects and arrays recursively. */
 export function sub(v: unknown): any {
@@ -145,7 +145,6 @@ export function parameters(): Json {
 function conditions(): Json {
   const not = (p: string, v: string) => ({ "Fn::Not": [{ "Fn::Equals": [{ Ref: p }, v] }] });
   return {
-    [KEEP_CONDITION]: { "Fn::Equals": [{ Ref: "KeepDataOnDelete" }, "true"] },
     HasEmailFrom: not("EmailFrom", ""),
     AutoPrefix: { "Fn::Equals": [{ Ref: "BedrockInferencePrefix" }, "auto"] },
     NoPrefix: { "Fn::Equals": [{ Ref: "BedrockInferencePrefix" }, "none"] },
@@ -434,16 +433,13 @@ export function buildParent(input: ParentInput): Json {
     },
   };
 
-  const dataPolicy = { "Fn::If": [KEEP_CONDITION, "RetainExceptOnCreate", "Delete"] };
-  const replacePolicy = { "Fn::If": [KEEP_CONDITION, "Retain", "Delete"] };
   for (const c of children) {
     const params: Json = {};
     const declared = Object.keys(c.template.Parameters ?? {});
     for (const p of declared) {
       if (p === "Stage") params.Stage = { Ref: "Stage" };
       else if (p === "AssetsBucket") params.AssetsBucket = { Ref: "AssetsBucket" };
-      else if (p === "DataDeletionPolicy") params.DataDeletionPolicy = dataPolicy;
-      else if (p === "DataReplacePolicy") params.DataReplacePolicy = replacePolicy;
+      else if (p === KEEP_PARAM) params[KEEP_PARAM] = { Ref: "KeepDataOnDelete" };
       else if (c.imports[p]) {
         const src = c.imports[p];
         if (!names.has(src.part)) throw new Error(`${c.name} imports from unknown part ${src.part}`);

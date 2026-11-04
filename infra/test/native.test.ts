@@ -23,6 +23,7 @@ import { resolveConfig } from "../lib/config";
 import { buildNative } from "../lib/native/build";
 import { ASSETS_BUCKET_SENTINEL, REGION_SENTINEL, STAGE_SENTINEL, nativeConfig } from "../lib/native/config";
 import { emailEnvironment } from "../lib/service-env";
+import { decision } from "./iam-eval";
 import { DATA_TYPES, LIMITS, checkLimits, findSentinels, sha256File, transformChild } from "../lib/native/package";
 import { DEPLOY_BOUNDARY_ARN, declaredLogGroups, deployRolePolicy, helperPolicy, installValue, nativeNames, subInstall } from "../lib/native/parent";
 
@@ -99,15 +100,17 @@ test("every parameter a child declares is fed by the parent", () => {
   assert.ok(Object.values<any>(rel.children.Database.Outputs).some((o) => o.Export), "producers keep their exports (migration)");
 });
 
-test("data follows KeepDataOnDelete, deletion protection too, keys wait 7 days", () => {
+test("data is always kept by CloudFormation (literal policies), deletion protection follows KeepDataOnDelete, keys wait 7 days", () => {
   let tables = 0;
   for (const [name, t] of Object.entries<any>(rel.children)) {
     for (const [id, r] of Object.entries<any>(t.Resources)) {
       if (r.Type === "AWS::KMS::Key") assert.equal(r.Properties.PendingWindowInDays, 7, `${name}.${id}`);
       if (r.Type.startsWith("AWS::DynamoDB::") || r.Type === "AWS::Cognito::UserPool" || r.Type === "AWS::KMS::Key") {
-        assert.deepEqual(r.DeletionPolicy, { Ref: "DataDeletionPolicy" }, `${name}.${id}`);
-        assert.deepEqual(r.UpdateReplacePolicy, { Ref: "DataReplacePolicy" }, `${name}.${id}`);
-        assert.equal(t.Transform, "AWS::LanguageExtensions", name);
+        // Literals (no transform): a failed first launch still removes it, and
+        // with KeepDataOnDelete=false the parent's Sweep and Final delete it.
+        assert.equal(r.DeletionPolicy, "RetainExceptOnCreate", `${name}.${id}`);
+        assert.equal(r.UpdateReplacePolicy, "Retain", `${name}.${id}`);
+        assert.equal(t.Transform, undefined, name);
       }
       if (r.Type === "AWS::DynamoDB::GlobalTable") {
         tables++;
@@ -119,8 +122,16 @@ test("data follows KeepDataOnDelete, deletion protection too, keys wait 7 days",
     }
   }
   assert.ok(tables >= 15, `only ${tables} tables`);
-  assert.deepEqual(R.Database.Properties.Parameters.DataDeletionPolicy, { "Fn::If": ["NativeKeepData", "RetainExceptOnCreate", "Delete"] });
-  assert.deepEqual(R.Database.Properties.Parameters.DataReplacePolicy, { "Fn::If": ["NativeKeepData", "Retain", "Delete"] });
+  // Deletion protection (the tables) follows KeepData, fed by the parent.
+  assert.deepEqual(R.Database.Properties.Parameters.KeepData, { Ref: "KeepDataOnDelete" });
+  assert.deepEqual(rel.children.Database.Conditions.NativeKeepData, { "Fn::Equals": [{ Ref: "KeepData" }, "true"] });
+  for (const [name, t] of Object.entries<any>(rel.children)) {
+    for (const p of ["DataDeletionPolicy", "DataReplacePolicy"]) assert.equal(t.Parameters?.[p], undefined, `${name}.${p}`);
+    // Declared only where used.
+    assert.equal("KeepData" in (t.Parameters ?? {}), JSON.stringify(t.Resources).includes('"NativeKeepData"'), name);
+  }
+  // Sweep and Final delete what the parts retain when the data goes.
+  assert.match(R.Helper.Properties.Code.ZipFile, /if mode == "delete":\n\s+# The data goes/);
   assert.equal(P.Parameters.KeepDataOnDelete.Default, "true");
   // Kept by CloudFormation; Final deletes it with KeepDataOnDelete=false.
   assert.equal(R.InstallSecret.DeletionPolicy, "RetainExceptOnCreate");
@@ -298,20 +309,23 @@ test("bug 2: the parent has no transform, so an update with the current template
   for (const [keep, want] of [["true", "RetainExceptOnCreate"], ["false", "Delete"]]) {
     const out = evaluate(R, { ...base, KeepDataOnDelete: keep }, P.Conditions);
     for (const name of Object.keys(rel.children)) {
-      if (!("DataDeletionPolicy" in (R[name].Properties.Parameters ?? {}))) continue;
-      assert.equal(out[name].Properties.Parameters.DataDeletionPolicy, want, `${name} with KeepDataOnDelete=${keep}`);
-      assert.equal(out[name].Properties.Parameters.DataReplacePolicy, keep === "true" ? "Retain" : "Delete", name);
+      if (!("KeepData" in (R[name].Properties.Parameters ?? {}))) continue;
+      assert.equal(out[name].Properties.Parameters.KeepData, keep, `${name} with KeepDataOnDelete=${keep}`);
+      // The part's deletion protection follows it (a plain condition, no transform).
+      const c = rel.children[name];
+      const parts = evaluate(c.Resources, { ...Object.fromEntries(Object.keys(c.Parameters).map((k) => [k, ""])), KeepData: keep }, c.Conditions);
+      for (const [id, r] of Object.entries<any>(parts)) {
+        if (r.Type === "AWS::DynamoDB::GlobalTable") for (const rep of r.Properties.Replicas) if ("DeletionProtectionEnabled" in rep) assert.equal(rep.DeletionProtectionEnabled, keep === "true", `${name}.${id}`);
+        if (r.Type === "AWS::Cognito::UserPool" && r.Properties.DeletionProtection) assert.equal(r.Properties.DeletionProtection, keep === "true" ? "ACTIVE" : "INACTIVE", `${name}.${id}`);
+      }
     }
     assert.equal(out.Final.Properties.KeepData, keep);
     assert.equal(out.Sweep.Properties.KeepData, keep);
     assert.equal(evaluate(P.Outputs.KeepDataOnDelete.Value, { ...base, KeepDataOnDelete: keep }, P.Conditions), keep);
   }
-  // Each part reads its template from its URL on every update and applies
-  // its own transform there: the parameter is what the data's policy follows.
-  for (const [name, t] of Object.entries<any>(rel.children)) {
-    if (!t.Parameters?.DataDeletionPolicy) continue;
-    assert.equal(t.Transform, "AWS::LanguageExtensions", name);
-  }
+  // No part uses a transform either (the auto-update role may not, see
+  // "every template's transforms ..." below).
+  for (const [name, t] of Object.entries<any>(rel.children)) assert.equal(t.Transform, undefined, name);
 });
 
 test("bug 1: a change set with the nested stacks can be built (each child URL resolves from parameters, and the helper stages it)", () => {
@@ -476,7 +490,7 @@ test("the bar: every piece the real uninstall left is owned and removed by the s
   // Data: deleted on a failed first launch (RetainExceptOnCreate), so earlier failed installs leave nothing.
   for (const [name, t] of Object.entries<any>(rel.children)) {
     for (const r of Object.values<any>(t.Resources)) {
-      if (["AWS::KMS::Key", "AWS::Cognito::UserPool", "AWS::DynamoDB::GlobalTable"].includes(r.Type)) assert.deepEqual(r.DeletionPolicy, { Ref: "DataDeletionPolicy" }, name);
+      if (["AWS::KMS::Key", "AWS::Cognito::UserPool", "AWS::DynamoDB::GlobalTable"].includes(r.Type)) assert.equal(r.DeletionPolicy, "RetainExceptOnCreate", name);
     }
   }
   // GlobalTables: the Sweep deletes them itself, with retries and waits, before CloudFormation does.
@@ -518,4 +532,67 @@ test("nothing in the account is public: no bucket policy, no public access block
   assert.equal(P.Parameters.StatusKey.NoEcho, true);
   assert.equal(R.StatusStart.Properties.StatusKey.Ref, "StatusKey");
   assert.equal(R.StatusStart.Properties.StatusBucket, undefined);
+});
+
+// ── Every change set the auto-update role builds ─────────────────────────
+//
+// An admin's Update (and auto-update) creates the change set with RoleARN =
+// the install's auto-update role, and CloudFormation then needs that role,
+// under its boundary, to be allowed cloudformation:CreateChangeSet on every
+// transform a template (or a nested part) declares. v0.8.31's parts used
+// AWS::LanguageExtensions, which the role may not use: every update from the
+// Update button failed before anything changed. The role is the one thing a
+// release can't change for itself (an admin applies that), so a template
+// must only use what today's role already allows.
+
+const SIM = JSON.parse(fs.readFileSync(path.join(__dirname, "..", "..", "test", "fixtures", "native-sim.json"), "utf8"));
+
+/** Every transform a template declares (Transform and Fn::Transform). */
+function transformsOf(t: any): string[] {
+  const out = new Set<string>();
+  for (const x of t.Transform === undefined ? [] : Array.isArray(t.Transform) ? t.Transform : [t.Transform]) out.add(typeof x === "string" ? x : x.Name);
+  const walk = (v: any): void => {
+    if (Array.isArray(v)) v.forEach(walk);
+    else if (v && typeof v === "object") {
+      if (v["Fn::Transform"]) out.add(v["Fn::Transform"].Name);
+      Object.values(v).forEach(walk);
+    }
+  };
+  walk(t.Resources);
+  walk(t.Outputs);
+  return [...out].sort();
+}
+
+/** The transforms the auto-update role, under its boundary, can't create change sets through. */
+function transformGaps(templates: [string, any][]): string[] {
+  const ctx = SIM.rows[0].context;
+  const gaps: string[] = [];
+  for (const [name, t] of templates) {
+    for (const tr of transformsOf(t)) {
+      const arn = `arn:aws:cloudformation:${SIM.region}:aws:transform/${tr.replace(/^AWS::/, "")}`;
+      const v = decision([SIM.policies.deploy], SIM.policies.boundary, { action: "cloudformation:CreateChangeSet", resource: arn, context: ctx });
+      if (v !== "allowed") gaps.push(`${name} uses ${tr}: the auto-update role gets ${v} on ${arn}`);
+    }
+  }
+  return gaps;
+}
+
+test("every template's transforms are ones the auto-update role may create change sets through", () => {
+  assert.deepEqual(transformGaps(all()), []);
+  // Today that means none at all: the role allows no transform.
+  for (const [name, t] of all()) assert.deepEqual(transformsOf(t), [], name);
+  // The check catches v0.8.31's parts (the failure an admin saw).
+  const broken = { ...rel.children.Storage, Transform: "AWS::LanguageExtensions" };
+  assert.deepEqual(transformGaps([["Storage", broken]]), [`Storage uses AWS::LanguageExtensions: the auto-update role gets implicitDeny on arn:aws:cloudformation:${SIM.region}:aws:transform/LanguageExtensions`]);
+  assert.equal(transformGaps([["X", { Resources: { A: { "Fn::Transform": { Name: "AWS::Include" } } } }]]).length, 1);
+});
+
+test("every resource type in the release is one the simulator checked the auto-update role against", () => {
+  // A new type means new calls: run infra/scripts/deploy-role-sim.py --native.
+  const checked = new Set<string>(SIM.types);
+  const missing = new Set<string>();
+  for (const [name, t] of all()) {
+    for (const r of Object.values<any>(t.Resources)) if (r.Type.startsWith("AWS::") && !checked.has(r.Type)) missing.add(`${name}: ${r.Type}`);
+  }
+  assert.deepEqual([...missing], []);
 });

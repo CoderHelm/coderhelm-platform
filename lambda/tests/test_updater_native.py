@@ -234,7 +234,9 @@ class Native(unittest.TestCase):
         r = u.native_poll(self.store, env, NOW)
         self.assertEqual(r["status"], "rolled_back")
         hist = self.store.history()
-        self.assertIn("Api: Embedded stack", hist[0]["reason"])
+        # Plain words first (the part's name), CloudFormation's own text under technical.
+        self.assertIn("The update to v1.1.0 stopped: the Api part of the install could not be updated. AWS put everything back", hist[0]["reason"])
+        self.assertIn("Api: Embedded stack", hist[0]["technical"])
 
     def test_no_changes_is_success_not_failure(self):
         self.verified()
@@ -252,7 +254,8 @@ class Native(unittest.TestCase):
         self.assertEqual(r["status"], "failed")
         self.assertEqual(self.cfn.executed, [])
         self.assertEqual(self.cfn.deleted, ["arn:cs/1"])
-        self.assertIn("not the verified one", self.store.history()[0]["reason"])
+        self.assertIn("didn't match the signed release", self.store.history()[0]["reason"])
+        self.assertIn("not the verified one", self.store.history()[0]["technical"])
 
     def test_auto_update_holds_when_a_part_would_replace_data(self):
         env = dict(ENV, DEPLOY_ROLE_ARN="arn:role")
@@ -359,6 +362,114 @@ class Native(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+TRANSFORM_DENIED = ("User: arn:aws:sts::111122223333:assumed-role/coderhelm-prod-deploy-stack/AWSCloudFormation is not authorized to perform: "
+                    "cloudformation:CreateChangeSet on resource: arn:aws:cloudformation:us-east-1:aws:transform/LanguageExtensions because no "
+                    "identity-based policy allows the cloudformation:CreateChangeSet action")
+
+
+class PlainFailures(unittest.TestCase):
+    """Why an update didn't succeed, in plain words: what happened and where
+    the install is, the next step, and CloudFormation's own text apart (under
+    Technical details). A failed try never blocks the next release."""
+
+    setUp = Native.setUp
+    tearDown = Native.tearDown
+    verified = Native.verified
+    ENV = dict(ENV, DEPLOY_ROLE_ARN="arn:aws:iam::111122223333:role/coderhelm-prod-deploy-stack")
+
+    def fail_prepare(self, reason, version="v1.1.0"):
+        self.verified(version)
+        u.begin(self.store, self.ENV, NOW, version, "admin@example.com", "update")
+        self.cfn.cs = {"Status": "FAILED", "StatusReason": reason, "ExecutionStatus": "UNAVAILABLE"}
+        return u.native_poll(self.store, self.ENV, NOW)
+
+    def test_the_transform_refusal_reads_plainly_with_aws_text_apart(self):
+        self.assertEqual(self.fail_prepare("Nested change set arn:aws:cloudformation:us-east-1:111122223333:changeSet/x for Storage FAILED: " + TRANSFORM_DENIED)["status"], "failed")
+        h = self.store.history()[0]
+        self.assertEqual(h["summary"], "The update couldn't start: CoderHelm's update role isn't allowed to use an AWS template feature this release needs. "
+                                       "Nothing changed: your install stayed on v1.0.0.")
+        self.assertEqual(h["fix"], "Update again once a newer release is out (CoderHelm checks for one every hour).")
+        self.assertEqual(h["reason"], h["summary"] + " " + h["fix"])
+        self.assertIn("transform/LanguageExtensions", h["technical"])
+        for k in ("summary", "fix", "reason"):
+            self.assertNotIn("arn:", h[k], k)
+            self.assertNotIn("cloudformation:", h[k], k)
+        # The status the dashboard reads carries all four.
+        row = u.handle({"action": "status"}, self.ENV, self.store, NOW, fetch=lambda repo: [])["history"][0]
+        self.assertEqual((row["summary"], row["technical"]), (h["summary"], h["technical"]))
+
+    def test_a_failed_try_never_blocks_the_next_release_or_a_retry(self):
+        self.fail_prepare(TRANSFORM_DENIED)
+        state = self.store.get("UPDATE_STATE")
+        self.assertEqual(state["failed_versions"], ["v1.1.0"])
+        self.assertFalse(u.running(state, NOW), "nothing is left running")
+        self.assertNotIn("review_id", state)
+        rel = [{"tag_name": "v1.1.0"}, {"tag_name": "v1.1.1"}]
+        settings = dict(u.validate_settings({}, u.defaults_from_env({})), auto=True)
+        # Auto-update skips only the release that failed; the fixed one goes ahead.
+        d = u.decide(NOW, settings, "v1.0.0", rel, state)
+        self.assertEqual(d["version"], "v1.1.1")
+        self.assertNotIn("failed before", d["reason"])
+        self.assertIn("failed before", u.decide(NOW, settings, "v1.0.0", rel[:1], state)["reason"])
+        # The Update button prepares the fixed release at once...
+        self.verified("v1.1.1")
+        e = u.begin(self.store, self.ENV, NOW, "v1.1.1", "admin@example.com", "update")
+        self.assertEqual(e["status"], "preparing")
+        self.assertEqual(self.cfn.created[-1]["RoleARN"], self.ENV["DEPLOY_ROLE_ARN"])
+        self.cfn.cs = {"Status": "CREATE_COMPLETE", "ExecutionStatus": "AVAILABLE"}
+        u.native_poll(self.store, self.ENV, NOW)
+        self.cfn.cs = {"Status": "CREATE_COMPLETE", "ExecutionStatus": "EXECUTE_COMPLETE"}
+        self.assertEqual(u.native_poll(self.store, self.ENV, NOW)["status"], "succeeded")
+        # ...and the failed one may be tried again by an admin.
+        self.assertEqual(u.begin(self.store, self.ENV, NOW, "v1.1.0", "admin@example.com", "update")["status"], "preparing")
+
+    def test_generic_and_other_known_causes_still_read_as_plain_words(self):
+        cases = {
+            "Something AWS never said before": ("AWS could not prepare the change this release needs", "Press Update again."),
+            "Rate exceeded": ("AWS was busy", "in a few minutes"),
+            "Resource limit exceeded for log groups": ("reached one of its limits", "Service Quotas"),
+            "coderhelm-prod-x already exists in stack arn:aws:cloudformation:us-east-1:1:stack/other/1": ("same name is already in your AWS account", "leftover"),
+            "User: arn:aws:sts::1:assumed-role/r/AWSCloudFormation is not authorized to perform: iam:CreateRole on resource: arn:aws:iam::1:role/x": ("update role isn't allowed to do something", "newer release"),
+        }
+        for raw, (what, fix) in cases.items():
+            d = u.explain_failure(raw, "v1.1.0", "v1.0.0", u.PREPARE)
+            self.assertTrue(d["summary"].startswith("The update couldn't start: "), raw)
+            self.assertIn(what, d["summary"], raw)
+            self.assertIn("Nothing changed: your install stayed on v1.0.0.", d["summary"], raw)
+            self.assertIn(fix, d["fix"], raw)
+            self.assertEqual(d["technical"], raw)
+            self.assertNotIn("arn:", d["summary"] + d["fix"], raw)
+        rb = u.explain_failure("Worker: Resource handler returned message: boom", "v1.1.0", "v1.0.0", u.ROLLED_BACK)
+        self.assertEqual(rb["summary"], "The update to v1.1.0 stopped: the Worker part of the install could not be updated. AWS put everything back: your install stayed on v1.0.0.")
+        mid = u.explain_failure("the stack ended UPDATE_ROLLBACK_FAILED", "v1.1.0", "v1.0.0", u.STOPPED)
+        self.assertIn("may be between v1.0.0 and v1.1.0", mid["summary"])
+        self.assertIn("AWS console", mid["fix"])
+
+    def test_an_older_rows_aws_text_reads_plainly_in_history(self):
+        # Written by an updater before this change: CloudFormation's text as the reason.
+        self.store.put("UPDATE#2026-10-30T10:00:00Z#aaaa", {"version": "v1.1.0", "from_version": "v1.0.0", "status": "failed", "change_set_id": "arn:cs/0",
+                                                           "started_at": "2026-10-30T10:00:00+00:00", "finished_at": "2026-10-30T10:01:00+00:00", "reason": TRANSFORM_DENIED[:500]})
+        row = [h for h in u.handle({"action": "status"}, self.ENV, self.store, NOW, fetch=lambda repo: [])["history"] if h.get("version") == "v1.1.0"][0]
+        self.assertTrue(row["reason"].startswith("The update couldn't start: CoderHelm's update role isn't allowed to use an AWS template feature"))
+        self.assertIn("transform/LanguageExtensions", row["technical"])
+
+    def test_an_aws_refusal_before_the_change_set_reads_plainly(self):
+        self.verified()
+
+        class Denied(Exception):
+            pass
+
+        def refuse(**kw):
+            raise Denied("An error occurred (AccessDenied) when calling the CreateChangeSet operation: " + TRANSFORM_DENIED)
+        self.cfn.create_change_set = refuse
+        with self.assertRaises(ValueError):
+            u.begin(self.store, self.ENV, NOW, "v1.1.0", "admin@example.com", "update")
+        h = self.store.history()[0]
+        self.assertEqual(h["status"], "not_started")
+        self.assertIn("update role isn't allowed to use an AWS template feature", h["summary"])
+        self.assertIn("AccessDenied", h["technical"])
 
 
 class HonestHistory(unittest.TestCase):
