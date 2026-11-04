@@ -11,13 +11,14 @@
  *   feeds with `Fn::GetAtt <Part>.Outputs.<Id>`; the producer keeps its
  *   export, so a migrated install never removes an export still in use;
  * - every Ref to a launch parameter becomes a declared parameter;
- * - data (tables, retained buckets, keys, the user pool) follows
- *   KeepDataOnDelete through DataDeletionPolicy / DataReplacePolicy, with
- *   the AWS::LanguageExtensions transform that allows Refs there (only in
- *   the children: the parent passes the values on every update, and
- *   CloudFormation reads a nested stack's template from its URL each time,
- *   while the parent itself stays free of transforms, see parent.ts);
- *   deletion protection follows the same switch; keys wait 7 days;
+ * - data (tables, retained buckets, keys, the user pool) is always kept by
+ *   CloudFormation (RetainExceptOnCreate: a failed first launch still
+ *   removes it), and with KeepDataOnDelete=false the parent's Sweep and
+ *   Final delete it themselves. Every DeletionPolicy is a literal, so no
+ *   template uses a transform: the install's auto-update role can create
+ *   every change set (docs/self-host/security.md), and an update from the
+ *   Update button never needs a console step. Deletion protection follows
+ *   the KeepData parameter (a plain condition); keys wait 7 days;
  * - the data tables' and buckets' names are outputs, for the parent's Sweep.
  */
 import * as childProcess from "child_process";
@@ -39,6 +40,11 @@ const PSEUDO = new Set(["AWS::AccountId", "AWS::Region", "AWS::Partition", "AWS:
 export const DATA_TYPES = ["AWS::DynamoDB::GlobalTable", "AWS::DynamoDB::Table", "AWS::S3::Bucket", "AWS::KMS::Key", "AWS::Cognito::UserPool"];
 
 export const KEEP_CONDITION = "NativeKeepData";
+/** A child's KeepDataOnDelete ("true" | "false"), fed by the parent. */
+export const KEEP_PARAM = "KeepData";
+/** What every data resource's policies are: literals (no transform needed). */
+export const DATA_DELETION_POLICY = "RetainExceptOnCreate";
+export const DATA_REPLACE_POLICY = "Retain";
 
 export interface Child {
   /** The part's logical id in the parent, e.g. `LogAnalyzer`. */
@@ -158,7 +164,7 @@ export function transformChild(name: string, input: Json, known: Record<string, 
   const t: Json = JSON.parse(JSON.stringify(input));
   renameLogicalIds(t);
   // The packager's own parameters count as declared (added below when used).
-  const declared = new Set<string>([...Object.keys(t.Parameters ?? {}), ...Object.keys(t.Resources ?? {}), "DataDeletionPolicy", "DataReplacePolicy"]);
+  const declared = new Set<string>([...Object.keys(t.Parameters ?? {}), ...Object.keys(t.Resources ?? {}), KEEP_PARAM]);
   const ownParams = Object.keys(t.Parameters ?? {});
   const used = new Set<string>();
   const install = new Set<string>();
@@ -224,7 +230,6 @@ export function transformChild(name: string, input: Json, known: Record<string, 
   // Data follows KeepDataOnDelete.
   const tables: Json[] = [];
   const buckets: Json[] = [];
-  let usesPolicy = false;
   for (const [id, r] of Object.entries((t.Resources ?? {}) as Record<string, Json>)) {
     if (r.Metadata?.["coderhelm:native-log"]) r.Metadata = { "coderhelm:native-log": true };
     else delete r.Metadata;
@@ -232,9 +237,10 @@ export function transformChild(name: string, input: Json, known: Record<string, 
     const retained = r.DeletionPolicy === "Retain" || r.DeletionPolicy === "RetainExceptOnCreate";
     const isData = DATA_TYPES.includes(r.Type) && (retained || r.Type.startsWith("AWS::DynamoDB::") || r.Type === "AWS::Cognito::UserPool" || r.Type === "AWS::KMS::Key");
     if (!isData) continue;
-    usesPolicy = true;
-    r.DeletionPolicy = { Ref: "DataDeletionPolicy" };
-    r.UpdateReplacePolicy = { Ref: "DataReplacePolicy" };
+    // Literals: a Ref here needs AWS::LanguageExtensions, which the
+    // auto-update role may not use (a v0.8.31 update failed on it).
+    r.DeletionPolicy = DATA_DELETION_POLICY;
+    r.UpdateReplacePolicy = DATA_REPLACE_POLICY;
     const keep = (a: Json, b: Json) => ({ "Fn::If": [KEEP_CONDITION, a, b] });
     if (r.Type === "AWS::DynamoDB::GlobalTable") {
       tables.push({ Ref: id });
@@ -249,7 +255,6 @@ export function transformChild(name: string, input: Json, known: Record<string, 
   }
 
   const out: Json = { AWSTemplateFormatVersion: "2010-09-09" };
-  if (usesPolicy) out.Transform = "AWS::LanguageExtensions";
   out.Description = String(t.Description ?? `CoderHelm: the ${name} part`).split(STAGE_SENTINEL).join("the install");
   const conditions = t.Conditions ? JSON.parse(JSON.stringify(t.Conditions)) : {};
   for (const p of findSentinels(conditions, "Conditions")) problems.push(`the install's name in a condition: ${p}`);
@@ -269,14 +274,12 @@ export function transformChild(name: string, input: Json, known: Record<string, 
   const outputs = rewrite(t.Outputs ?? {});
   if (tables.length) outputs.NativeDataTables = { Value: { "Fn::Join": [",", tables] } };
   if (buckets.length) outputs.NativeDataBuckets = { Value: { "Fn::Join": [",", buckets] } };
-  if (JSON.stringify(resources).includes(`"${KEEP_CONDITION}"`)) conditions[KEEP_CONDITION] = { "Fn::Equals": [{ Ref: "DataReplacePolicy" }, "Retain"] };
+  const keepUsed = JSON.stringify(resources).includes(`"${KEEP_CONDITION}"`);
+  if (keepUsed) conditions[KEEP_CONDITION] = { "Fn::Equals": [{ Ref: KEEP_PARAM }, "true"] };
   const params: Json = { ...(t.Parameters ?? {}) };
   if (used.has("Stage")) params.Stage = { Type: "String" };
   if (used.has("AssetsBucket")) params.AssetsBucket = { Type: "String" };
-  if (usesPolicy) {
-    params.DataDeletionPolicy = { Type: "String", AllowedValues: ["RetainExceptOnCreate", "Delete"] };
-    params.DataReplacePolicy = { Type: "String", AllowedValues: ["Retain", "Delete"] };
-  }
+  if (keepUsed) params[KEEP_PARAM] = { Type: "String", AllowedValues: ["true", "false"] };
   for (const p of [...install].sort()) params[p] = { Type: "String" };
   for (const p of Object.keys(imports).sort()) params[p] = { Type: "String" };
   out.Parameters = params;

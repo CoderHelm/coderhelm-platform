@@ -1966,7 +1966,7 @@ def native_poll(store, env, now, cfn=None):
         cs = cfn.describe_change_set(ChangeSetName=cs_id, StackName=env["NATIVE_STACK"])
     except Exception as e:
         if "does not exist" in str(e) or "ChangeSetNotFound" in type(e).__name__:
-            return native_finish(store, env, now, hid, "failed", "the proposed change set was deleted before it ran")
+            return native_finish(store, env, now, hid, "failed", "the proposed change set was deleted before it ran", PREPARE)
         raise
     summary = change_set_summary(cs, region)
     entry["change_set"] = summary
@@ -1975,7 +1975,7 @@ def native_poll(store, env, now, cfn=None):
         reason = cs.get("StatusReason") or "the change set could not be created"
         if "didn't contain changes" in reason or "No updates" in reason:
             return native_finish(store, env, now, hid, "succeeded", "already up to date: nothing to change")
-        return native_finish(store, env, now, hid, "failed", reason)
+        return native_finish(store, env, now, hid, "failed", reason, PREPARE)
     if status != "CREATE_COMPLETE":
         store.put(hid, entry)
         return {"native": "preparing"}
@@ -1985,7 +1985,7 @@ def native_poll(store, env, now, cfn=None):
                 cfn.delete_change_set(ChangeSetName=cs_id, StackName=env["NATIVE_STACK"])
             except Exception as e:
                 logger.warning(f"change set not deleted: {e}")
-            return native_finish(store, env, now, hid, "failed", "the template CloudFormation fetched is not the verified one, so the change set was deleted")
+            return native_finish(store, env, now, hid, "failed", "the template CloudFormation fetched is not the verified one, so the change set was deleted", PREPARE)
         entry["data_changes"] = data_changes(cfn, cs)
         entry["admin_changes"] = admin_changes(cs)
         entry["permission_changes"] = permission_changes(cfn, cs_id, env["NATIVE_STACK"])
@@ -2039,7 +2039,7 @@ def native_poll(store, env, now, cfn=None):
         return native_finish(store, env, now, hid, result, reason)
     if execution in ("OBSOLETE", "UNAVAILABLE"):
         return native_finish(store, env, now, hid, "failed",
-                             cs.get("StatusReason") or "the change set can no longer run (the stack changed since it was made)")
+                             cs.get("StatusReason") or "the change set can no longer run (the stack changed since it was made)", PREPARE)
     store.put(hid, entry)
     return {"native": str(execution or status).lower()}
 
@@ -2124,13 +2124,84 @@ def supersede_review(store, env, state, now, cfn=None):
         store.put(hid, entry)
 
 
-def native_finish(store, env, now, hid, status, reason):
+# ── Why an update didn't succeed, in plain words ──────────────────────────
+#
+# CloudFormation's own text (ARNs, API names) goes to `technical`, which
+# Settings, System shows under Technical details. `summary` says what
+# happened and where the install is; `fix` is the next step; `reason` is
+# both, for the history, the email and dashboards that read only `reason`.
+
+PREPARE = "prepare"      # the change set: nothing ran
+ROLLED_BACK = "rolled_back"
+STOPPED = "stopped"      # ran, and didn't end cleanly
+
+_NOT_ALLOWED = re.compile(r"is not authorized to perform:?\s*([\w-]+:[\w*]+)", re.I)
+_TRANSFORM = re.compile(r":transform/[\w-]+", re.I)
+_NEXT_RELEASE = "Update again once a newer release is out (CoderHelm checks for one every hour)."
+_SAME_AGAIN = "If the next try fails the same way, wait for a newer release (CoderHelm checks every hour)."
+
+
+def _cause(raw):
+    """(what went wrong, the next step) for CloudFormation's text, or (None, None)."""
+    text = raw or ""
+    low = text.lower()
+    m = _NOT_ALLOWED.search(text)
+    if m and m.group(1).lower() == "cloudformation:createchangeset" and _TRANSFORM.search(text):
+        return ("CoderHelm's update role isn't allowed to use an AWS template feature this release needs", _NEXT_RELEASE)
+    if m or "accessdenied" in low or "access denied" in low:
+        return ("CoderHelm's update role isn't allowed to do something this release needs",
+                _NEXT_RELEASE + " If that one fails the same way, send the technical details to CoderHelm support.")
+    if "rate exceeded" in low or "throttl" in low or "too many requests" in low:
+        return ("AWS was busy and turned some calls away", "Press Update again in a few minutes.")
+    if "limitexceeded" in low or "limit exceeded" in low or "quota" in low:
+        return ("your AWS account reached one of its limits",
+                "Raise the limit the technical details name (AWS console, Service Quotas) or remove what you don't use, then press Update again.")
+    if "already exists" in low:
+        return ("something with the same name is already in your AWS account",
+                "Remove or rename the leftover the technical details name, then press Update again.")
+    if "not the verified one" in low or "doesn't match its signed checksum" in low:
+        return ("what AWS read didn't match the signed release, so CoderHelm stopped it",
+                "Press Update again. If it happens again, send the technical details to CoderHelm support.")
+    if ("does not exist" in low and "change set" in low) or "change set was deleted" in low:
+        return ("the prepared change was deleted in AWS before it ran", "Press Update again.")
+    if "can no longer run" in low or "stack changed since" in low:
+        return ("the install changed after the update was prepared", "Press Update again.")
+    return (None, None)
+
+
+def explain_failure(raw, version, from_version, phase):
+    """{summary, fix, technical, reason} for an update that didn't succeed."""
+    raw = str(raw or "").strip()
+    v = version or "the new release"
+    was = from_version or "the release it ran before"
+    what, fix = _cause(raw)
+    part = re.match(r"([A-Za-z][A-Za-z0-9]{0,63}): ", raw)
+    broken = f"the {part.group(1)} part of the install could not be updated" if part else "a part of the install could not be updated"
+    if phase == PREPARE:
+        summary = f"The update couldn't start: {what or 'AWS could not prepare the change this release needs'}. Nothing changed: your install stayed on {was}."
+        fix = fix or "Press Update again. " + _SAME_AGAIN
+    elif phase == ROLLED_BACK:
+        summary = f"The update to {v} stopped: {what or broken}. AWS put everything back: your install stayed on {was}."
+        fix = fix or "Press Update again. " + _SAME_AGAIN
+    else:
+        summary = (f"The update to {v} stopped partway: {what or broken}. "
+                   f"AWS couldn't put everything back by itself, so the install may be between {was} and {v}.")
+        fix = "Open the stack in the AWS console to see what it says, then press Update again."
+    return {"summary": summary, "fix": fix, "technical": raw, "reason": f"{summary} {fix}"}
+
+
+def native_finish(store, env, now, hid, status, reason, phase=None):
     state = store.get("UPDATE_STATE", {})
     if state.get("review_id") == hid:
         state.pop("review_id", None)
         state.update({"running_id": hid})
         store.put("UPDATE_STATE", state)
-    return handle({"action": "finished", "history_id": hid, "status": status, "reason": reason}, env, store, now)
+    event = {"action": "finished", "history_id": hid, "status": status, "reason": reason}
+    if status != "succeeded":
+        entry = store.get(hid, {}) or {}
+        phase = phase or (ROLLED_BACK if status == "rolled_back" else STOPPED)
+        event.update(explain_failure(reason, entry.get("version"), entry.get("from_version"), phase))
+    return handle(event, env, store, now)
 
 
 # ── Actions ───────────────────────────────────────────────────────────────
@@ -2144,6 +2215,14 @@ def not_started_reason(e):
     if isinstance(e, ValueError):
         return str(e)[:500]
     return f"couldn't prepare the update ({type(e).__name__}: {str(e)[:200]}); nothing was changed, try again"
+
+
+def not_started_details(e, version, from_version):
+    """{summary, fix, technical} for an AWS refusal before anything changed, or {}."""
+    if isinstance(e, ValueError):
+        return {}
+    d = explain_failure(f"{type(e).__name__}: {e}", version, from_version, PREPARE)
+    return {k: d[k][:1000] for k in ("summary", "fix", "technical")}
 
 
 def begin(store, env, now, version, actor, mode, extra=None, note=None, scheduled=False):
@@ -2170,6 +2249,7 @@ def begin(store, env, now, version, actor, mode, extra=None, note=None, schedule
 
     def refused(e):
         entry.update({"status": "not_started", "reason": not_started_reason(e), "finished_at": now.isoformat()})
+        entry.update(not_started_details(e, version, current))
         store.put(hid, entry)
         if isinstance(e, ValueError):
             raise e
@@ -2215,6 +2295,13 @@ def history_view(entries, state, now):
                     old = True
                 if old:
                     h = dict(h, status="failed", reason=h.get("reason") or "ended without a result; check the stack in AWS")
+        if h.get("status") in ("failed", "rolled_back") and h.get("finished_at") and h.get("change_set_id") and h.get("reason") and not h.get("summary"):
+            # Written by an older updater with CloudFormation's own text: plain words, the text under technical.
+            raw = h["reason"]
+            ran = bool(h.get("executed_at"))
+            phase = ROLLED_BACK if h["status"] == "rolled_back" else (STOPPED if ran else PREPARE)
+            d = explain_failure(raw, h.get("version"), h.get("from_version"), phase)
+            h = dict(h, reason=d["reason"], summary=d["summary"], fix=d["fix"], technical=d["technical"])
         out.append(h)
     return out
 
@@ -2375,6 +2462,10 @@ def handle(event, env, store, now, fetch=fetch_releases, probe=None):
         entry = store.get(hid, {}) if hid else {}
         status = event.get("status") if event.get("status") in ("succeeded", "failed", "rolled_back") else "failed"
         entry.update({"status": status, "reason": str(event.get("reason") or "")[:500], "finished_at": now.isoformat()})
+        for k in ("summary", "fix", "technical"):
+            # Plain words (summary, fix) and AWS's own text (technical) apart.
+            if event.get(k):
+                entry[k] = str(event[k])[:1000]
         if hid:
             store.put(hid, entry)
         state.pop("running_since", None)

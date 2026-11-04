@@ -72,7 +72,7 @@ aws cloudformation wait stack-update-complete --region $REGION --stack-name $STA
 aws cloudformation describe-stacks --region $REGION --stack-name $STACK --query "Stacks[0].Outputs[?OutputKey=='KeepDataOnDelete'].OutputValue" --output text
 ```
 
-The last command must print `false`. The update changes only the deletion settings: deletion protection comes off the tables and the user pool, and their deletion policy becomes Delete. Nothing is deleted until you delete the stack. Set it back to `true` the same way.
+The last command must print `false`. The update changes only the deletion settings: deletion protection comes off the tables, and the stack records that the data goes. Nothing is deleted until you delete the stack. Set it back to `true` the same way.
 
 ### What happens when the data is deleted
 
@@ -81,7 +81,7 @@ When you delete the stack, two of its resources do the work CloudFormation can't
 - **Sweep** runs before the parts are deleted. It empties every data bucket (every object version and delete marker), so CloudFormation can delete them. It deletes each table itself: it turns deletion protection off if it is still on, retries what AWS reports as temporary (a table in use, throttling, a replica still settling) with growing waits, and waits until each table is gone. CloudFormation then finds nothing left to delete. If a table still won't go before the helper's time runs out, Sweep fails with the table's name and AWS's reason. Delete the stack again: it picks up where it stopped.
 - **Final** runs after every part is deleted. It deletes the certificates the updater requested (tagged `coderhelm = coderhelm-<name>`, in us-east-1) with their validation records, the log groups Lambda made by itself under the install's name, and the install's secret, without a recovery window (after **HybridLeave**, which reads it).
 
-With **KeepDataOnDelete** `false`, CloudFormation itself deletes the data buckets and the user pool and schedules the KMS keys for deletion after 7 days. With the switch on and **KeepDataOnDelete** `true`, the stack keeps those, so the helper deletes them itself: Sweep deletes the data buckets (after emptying them) and the user pool (its deletion protection off first), and Final schedules the install's KMS keys for deletion after 7 days and removes their aliases. Final also removes the switch.
+The parts always keep their data buckets, user pool and KMS keys when CloudFormation deletes them (only a first launch that fails removes them, since it made them). So whenever the data goes, with **KeepDataOnDelete** `false` or with the switch on, the helper deletes them itself: Sweep deletes the data buckets (after emptying them) and the user pool (its deletion protection off first), and Final schedules the install's KMS keys for deletion after 7 days and removes their aliases. Final also removes the switch. (In releases after v0.8.31. Before, CloudFormation deleted them itself with **KeepDataOnDelete** `false`, which needed an AWS template feature the deploy role may not use; see [Updates](./updates.md#the-update-couldnt-start-the-update-role-isnt-allowed-to-use-an-aws-template-feature).)
 
 These steps run only when the whole stack is being deleted, never during an update.
 

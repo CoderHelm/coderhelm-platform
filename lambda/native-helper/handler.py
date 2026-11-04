@@ -27,9 +27,10 @@ Resource types (event["ResourceType"]):
                          empties the data buckets, and deletes the tables
                          itself, retrying and waiting, so CloudFormation's
                          GlobalTable delete finds nothing left to fail on.
-                         With the switch on and KeepDataOnDelete=true the
-                         stack retains its data, so it also deletes the data
-                         bucket and the user pool itself.
+                         The parts always retain their data (literal
+                         DeletionPolicy, so no template needs a transform),
+                         so on a delete it also deletes the data bucket and
+                         the user pool itself.
   Custom::Final          deleted after every part: the certificates the updater
                          requested for this install (and their validation
                          records); the exact log groups the parts declare
@@ -37,11 +38,11 @@ Resource types (event["ResourceType"]):
                          arrive after CloudFormation deleted it); with
                          KeepDataOnDelete=false, the other log groups Lambda
                          made by itself, and the install's secret (after
-                         HybridLeave and SetupKey, which read it). With the
-                         switch on and KeepDataOnDelete=true (the stack
-                         retains its keys), schedules the install's KMS keys
-                         for deletion (AWS's 7 days) and removes their
-                         aliases; on every stack delete, the switch itself.
+                         HybridLeave and SetupKey, which read it). When the
+                         data goes (the parts retain their keys), schedules
+                         the install's KMS keys for deletion (AWS's 7 days)
+                         and removes their aliases; on every stack delete,
+                         the switch itself.
 
 Called directly (not by CloudFormation), {"action": "stage", "version",
 "template_sha256"} from the updater: copies that release's child templates
@@ -177,14 +178,6 @@ def keep_data(props, cfn=None, stack=None, ssm=None):
     if not stack_keeps_data(props, stack):
         return False
     return not delete_switch(props, ssm)
-
-
-def retained_but_deleted(props, cfn=None, stack=None, ssm=None):
-    """The switch says delete while the stack keeps its data (its
-    DeletionPolicy retains the tables, buckets, keys and user pool): the
-    helper deletes what CloudFormation will leave."""
-    stack = stack if stack is not None else root_stack(props, cfn)
-    return bool(stack) and stack_keeps_data(props, stack) and delete_switch(props, ssm)
 
 
 def first_failure(root, cfn=None):
@@ -824,8 +817,10 @@ def handle(event, context=None):
         remaining = (context.get_remaining_time_in_millis() / 1000.0 - 60) if context else 600
         left = delete_tables(props.get("Tables") or [], deadline=time.monotonic() + max(30, remaining))
         problems += [f"table {n}: {why}" for n, why in left.items()]
-        if mode == "delete" and retained_but_deleted(props, stack=stack):
-            # The stack retains these (KeepDataOnDelete=true): the switch says they go.
+        if mode == "delete":
+            # The data goes (KeepDataOnDelete=false or the switch) and the parts
+            # retain it (literal DeletionPolicy): the helper deletes it. A failed
+            # first launch needs nothing here (RetainExceptOnCreate removes it).
             for b in props.get("Buckets") or []:
                 try:
                     delete_bucket(b)
@@ -856,7 +851,7 @@ def handle(event, context=None):
             tagged, more = delete_log_groups(props.get("LogGroupPrefixes") or [], tag=props["Prefix"])
             groups += tagged
             problems += more
-        if mode == "delete" and props.get("KeyAliasPrefix") and retained_but_deleted(props, stack=stack):
+        if mode == "delete" and props.get("KeyAliasPrefix") and not keep_data(props, stack=stack):
             keys, more = schedule_keys(props["KeyAliasPrefix"])
             problems += more
         secret = ""

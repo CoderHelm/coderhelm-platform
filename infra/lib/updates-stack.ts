@@ -596,8 +596,10 @@ function nativeUpdates(scope: Construct, cfg: ResolvedConfig, fn: lambda.Functio
       StringEqualsIfExists: { "cloudformation:RoleArn": deployRole },
     },
   }));
-  // Three parts use AWS's LanguageExtensions transform, and CloudFormation
-  // checks CreateChangeSet against the transform too (AWS's own, read-only).
+  // Releases up to v0.8.31 had three parts on AWS's LanguageExtensions
+  // transform, and CloudFormation checks CreateChangeSet against the
+  // transform too (AWS's own, read-only). No part uses one now: the
+  // auto-update role may not (test/native.test.ts checks every template).
   fn.addToRolePolicy(new iam.PolicyStatement({
     sid: "ProposeThroughTransform",
     actions: ["cloudformation:CreateChangeSet"],
