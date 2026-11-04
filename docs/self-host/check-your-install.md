@@ -179,9 +179,9 @@ A check that comes with an action, such as running the CDK bootstrap, asks first
 
 ## In the dashboard
 
-**Settings, then Setup** shows every server-side check with its status and its fix: a link, a page in CoderHelm, or a command to copy. **Check again** reruns them. The checks: the web address, your own domain (records, certificate, HTTPS and the API on it), the GitHub App (keys, permissions and events, installations, webhook URL and the latest deliveries), email (the sender in use and its last send, the sender's verification with DKIM, SPF and DMARC, the SES sandbox, and who sends sign-up and password emails), a real one-token model call with your team's key or through Bedrock, the dead-letter queue, the updater, and Slack, Teams and Jira when you use them.
+**Settings, then Setup** shows every server-side check with its status and its fix: a link, a page in CoderHelm, or a command to copy. **Re-run checks** runs them again. The checks: the web address, your own domain (records, certificate, HTTPS and the API on it), the GitHub App (keys, permissions and events, installations, webhook URL and the latest deliveries), email (the sender in use and its last send, the sender's verification with DKIM, SPF and DMARC, the SES sandbox, and who sends sign-up and password emails), a real one-token model call with your team's key or through Bedrock, the dead-letter queue, the updater, and Slack, Teams and Jira when you use them.
 
-**Settings, then System** shows **Update readiness**: what would stop an update right now (a failing check, an update already running) and what to read first (a major release's notes, a release whose last try failed), each with its fix.
+**Settings, then System** shows the same checks as **Install health**, apart from its update status: **All N checks pass**, or each check that fails or needs a look with its fix. A failing check marked **Stops updates** holds an update until it passes ([the page, state by state](./updates.md#the-page-state-by-state)).
 
 ## The checks API
 

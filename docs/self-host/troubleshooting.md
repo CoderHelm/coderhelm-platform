@@ -85,7 +85,7 @@ Each step checks what you did before it moves on. When a check fails, fix it and
 
 ## Updates
 
-**Update now is greyed out.** **Update readiness** on **Settings, then System** lists what blocks it, each with its fix. Press **Check again** after fixing it.
+**The update says it can't install yet.** **Install health** on **Settings, then System** lists the check that stops it (marked **Stops updates**), with its fix. Press **Re-run checks** after fixing it. **Update to vX needs your action** is the model check instead: fix the model access, then **Re-run the model check**.
 
 **An update rolled back.** The history says why. Your data is untouched. Run the doctor, fix what fails, then update again: automatic updates skip that release until an admin updates to it by hand. See [Updates](./updates.md#when-an-update-fails).
 

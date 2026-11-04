@@ -22,7 +22,7 @@ The first self-host release is **v0.7.0**. Older `v0.2.x` to `v0.6.0` tags in th
 
 ## How updates are found
 
-The updater (a Lambda in your account) checks GitHub for releases every hour. Opening **Settings, then System** reads the list again when it is more than two minutes old, and **Check for updates** in the Version section reads it right away; at most one read every 30 seconds per install, each one conditional (an unchanged list costs no GitHub API quota). Pressing **Update** reads the list first too, so it always installs the newest release at that moment. When `launch/latest.json` names a release that GitHub's list doesn't show yet, no older release is offered meanwhile.
+The updater (a Lambda in your account) checks GitHub for releases every hour. Opening **Settings, then System** reads the list again when it is more than two minutes old, and **Check for updates** under the Version status reads it right away; at most one read every 30 seconds per install, each one conditional (an unchanged list costs no GitHub API quota). Pressing **Update** reads the list first too, so it always installs the newest release at that moment. When `launch/latest.json` names a release that GitHub's list doesn't show yet, no older release is offered meanwhile.
 
 When a newer release appears it emails every install admin once, and posts to your Slack or Teams webhook if you set `updates.webhookUrl`. The notice links to **Settings, then System**, where the release notes are.
 
@@ -55,20 +55,37 @@ An automatic update starts only when all of these hold: auto-update is on, the h
 
 ## The model check
 
-Each release lists the models it calls (`models.json`, made from the code and covered by the signed `SHA256SUMS`). The updater reads it only after a read-only build has checked the release's signature and the file's checksum; until then the update waits. Before an update, automatic or **Update now**, the updater asks the worker to make one test call to each, through your current provider (Bedrock or Anthropic keys). If one is refused, the update waits: **Settings, System** and **Setup** say **Update to vX needs your action** with the model, the fix and the AWS console link, and admins get one email. The check runs again daily and the update applies by itself once it passes (with auto-update on). **Check again** reruns it now. CoderHelm never accepts model terms or submits forms for you; see [Model providers](./model-providers.md#bedrock-model-access).
+Each release lists the models it calls (`models.json`, made from the code and covered by the signed `SHA256SUMS`). The updater reads it only after a read-only build has checked the release's signature and the file's checksum; until then the update waits. Before an update, automatic or from **Update**, the updater asks the worker to make one test call to each, through your current provider (Bedrock or Anthropic keys). If one is refused, the update waits: **Settings, System** and **Setup** say **Update to vX needs your action** with the model, the fix and the AWS console link, and admins get one email. The check runs again daily and the update applies by itself once it passes (with auto-update on). **Re-run the model check** runs it now. CoderHelm never accepts model terms or submits forms for you; see [Model providers](./model-providers.md#bedrock-model-access).
 
 An install on Anthropic API keys (the launch parameter **ModelProvider** `anthropic`) never needs Bedrock: the worker makes the test calls with a team's key, never through Bedrock. Each team adds its own key, so until one exists there is nothing to check with: the check notes it, and nothing holds the update. Once a team adds its key, a model refused with that key holds the update like any other.
 
 `update` from your machine runs the same check after the release's signature passes, through your install's worker, before anything is deployed. A refused model stops it with the fix and the console link. `--skip-model-check` goes on only when the refused model is one the release doesn't call; a model it calls can't be skipped. A rollback skips the check (you go back to models you already used).
 
-## Update readiness
+## The page, state by state
 
-Before you update, **Settings, then System** shows **Update readiness**: the same checks an update makes, run now, each with its fix.
+The **Version** section of **Settings, then System** says one thing at a time about updates, with the one thing to do:
 
-- **Blocks the update:** a check that fails (the update's health check would stop it), a model the release calls that was refused, or an update already running. **Update now** stays off until it is fixed.
-- **Read first:** a major release whose notes ask you to do something, or a release whose last try failed or rolled back (with the reason).
+| What it says | What it means | What to do |
+|---|---|---|
+| **You're up to date** | No newer release on your channel. With automatic updates on, it says when the next one would install. | Nothing. **Check for updates** reads GitHub now. |
+| **Updated to vX** | An update finished in the last day. | Nothing. |
+| **vX is available** | A newer release is out; its notes are below. A major release says **Major release** and asks you to read the notes first. | **Update to vX**. |
+| **vX is available, but can't install yet** | An install check that stops updates fails. | **See what to fix** opens **Install health**. |
+| **Update to vX needs your action** | A model the release calls doesn't answer here yet ([the model check](#the-model-check)). | Fix it in the AWS console, then **Re-run the model check**. |
+| **Preparing the update to vX…** / **Updating to vX…** | The update runs (10 to 20 minutes). Coderhelm keeps running your current version until it finishes. | Nothing. The page follows it. |
+| **vX needs your OK** / **vX is ready to apply** / **vX needs an AWS admin** | The prepared update waits for you ([Update now](#update-now)). | **Review and apply**, **Apply vX**, or **Open it in the AWS console**. |
+| **The update to vX didn't finish** / **couldn't start** / **stopped partway** | The last try didn't work ([When an update fails](#when-an-update-fails)). | **Try again**, after fixing what **Install health** lists. |
+| **vX is out, but can't install yet** | A release was published but GitHub's list doesn't show it yet. | **Check for updates** again in a few minutes. |
+| **Couldn't check for updates** | GitHub didn't answer, so it isn't known whether a newer release is out. | **Check for updates** later. |
+| **Development build** | The install was deployed from source, not a release. | Nothing to compare. |
 
-Each item says what is wrong and how to fix it: a link or a page in CoderHelm, or a command to copy for an install from before native releases. **Check again** reruns them. The same list is `GET /api/system/preflight`; see [Check your install](./check-your-install.md).
+Under the status, **Check for updates** sits next to when GitHub last answered ("Checked 2 min ago").
+
+## Install health
+
+**Install health**, its own section under **Version**, is the install's own checks: its address, GitHub, email, Claude and its queues. It says **All N checks pass**, or lists each check that fails or needs a look with its fix. A failing check marked **Stops updates** holds an update until it passes (the update's own health check would stop it otherwise); a failing integration such as Slack doesn't. **Re-run checks** runs them again; **See every check** opens **Settings, then Setup**. The same list is `GET /api/system/preflight`; see [Check your install](./check-your-install.md).
+
+Install health is not an update state: "All checks pass" says nothing about whether a newer release is out.
 
 From the terminal, `update` runs a preflight first and stops before anything changes when:
 
