@@ -116,13 +116,6 @@ struct Done {
     session: Option<String>,
 }
 
-/// What the agent needs to know about Redshift's SQL before writing a query
-/// (the db_query tool description carries it).
-pub const DIALECT: &str = "In a Redshift warehouse: LISTAGG, PERCENTILE_CONT and MEDIAN can't \
-share a SELECT with another DISTINCT aggregate (compute each in its own subquery and join them); \
-a LISTAGG result is at most 65535 bytes, so aggregate few rows or count instead; functions such as \
-generate_series run only without tables.";
-
 /// A rewrite for a Redshift error the agent can fix in its next query, by
 /// the error's own words; None for anything else.
 pub fn dialect_hint(why: &str) -> Option<&'static str> {
