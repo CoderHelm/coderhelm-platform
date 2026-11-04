@@ -43,6 +43,8 @@ pub const WORKER_MESSAGE_TYPES: &[&str] = &[
     "await_merge",
     "release_steps",
     "tag_sweep",
+    // A force push: the pull requests stacked on that branch are rebuilt.
+    "restack",
     "release_notes",
     "graph_index",
     "test_ingest",

@@ -49,6 +49,10 @@ pub struct Proof<'a> {
     /// content, the verification checklist and open product questions (see
     /// `feature`).
     pub feature: Option<&'a super::feature::PrFacts>,
+    /// The branch's commits stay as they are (no squash): a stacked change
+    /// was rebuilt with a labelled follow-up commit people should see (see
+    /// `stack`).
+    pub keep_commits: bool,
 }
 
 /// What the writer is told about the checks CI runs on the PR: never a
@@ -657,7 +661,12 @@ Return ONLY the markdown body text."#,
         // the noisier history. Skipped for existing/reopened PRs above to avoid
         // rewriting a PR a human may already be reviewing.
         let squash_msg = squash_message(&conventions, &tokens, msg);
-        if let Err(e) = github
+        if proof.keep_commits {
+            info!(
+                branch,
+                "Keeping the branch's commits: it carries a labelled follow-up commit"
+            );
+        } else if let Err(e) = github
             .squash_branch(
                 &msg.repo_owner,
                 &msg.repo_name,
@@ -1087,109 +1096,20 @@ pub async fn resolve_conflicts(
             (None, None) => continue,
         };
 
-        let cap = |s: &str, limit: usize| -> String {
-            if s.len() > limit {
-                let head = common::truncate_str(s, limit);
-                let cut = head.rfind('\n').unwrap_or(head.len());
-                format!("{}... (truncated, {} bytes total)", &head[..cut], s.len())
-            } else {
-                s.to_string()
-            }
-        };
-
-        // Build a 3-way merge prompt
-        let system = "You are a precise merge conflict resolver. You will be given three versions of a file: the common ancestor, the main branch version, and the feature branch version. Produce the correctly merged file that incorporates changes from BOTH sides. When changes conflict directly, prefer the feature branch version. Return ONLY the file content — no explanations, no markdown fences, no commentary.".to_string();
-
-        let mut prompt = format!("Merge these versions of `{path}`.\n\n");
-
-        if let Some(ref anc) = ancestor {
-            prompt.push_str(&format!(
-                "## Common ancestor\n```\n{}\n```\n\n",
-                cap(anc, 12_000)
-            ));
-        }
-
-        prompt.push_str(&format!(
-            "## main branch version (their changes)\n```\n{}\n```\n\n",
-            cap(&main_content, 16_000)
-        ));
-        prompt.push_str(&format!(
-            "## feature branch version (our changes — prefer when conflicting)\n```\n{}\n```\n\n",
-            cap(&branch_content, 16_000)
-        ));
-
-        if ancestor.is_some() {
-            prompt.push_str(
-                "Use the common ancestor to understand what each side changed. \
-                 Include changes from BOTH sides. Only prefer the feature branch \
-                 when both sides modified the exact same lines.",
-            );
-        } else {
-            prompt.push_str(
-                "Include changes from BOTH sides. Only prefer the feature branch \
-                 when both sides modified the exact same lines.",
-            );
-        }
-
-        let mut messages = vec![(
-            "user".to_string(),
-            vec![serde_json::json!({"type": "text", "text": prompt})],
-        )];
-
-        let model_id = provider.primary_model_id();
-        let merged_content = provider::converse(
+        let Some(merged_content) = merge_file(
             state,
             provider,
-            common::agent_policy::Agent::Coder,
-            model_id,
-            &system,
-            &mut messages,
-            &[],
-            &super::triage::NoOpExecutor,
             usage,
-            llm::ConverseOptions {
-                max_turns: 40,
-                max_tokens: 16384,
-                deadline: None,
-                effort: None,
-            },
-            None,
-            None,
+            path,
+            ancestor.as_deref(),
+            "main branch",
+            &main_content,
+            &branch_content,
         )
-        .await?;
-
-        // Validate the model's merge before it becomes a commit — the output
-        // used to be committed verbatim (dropped hunks, stray fences,
-        // truncation all landed as file corruption). Any invalid file aborts
-        // the whole resolution: an unresolved conflict GitHub can display is
-        // strictly safer than a silently corrupted merge.
-        let merged_content = strip_code_fences(&merged_content);
-        let min_side = branch_content.len().min(main_content.len());
-        if merged_content.trim().is_empty() && min_side > 0 {
-            warn!(
-                path,
-                "LLM merge produced empty output — aborting conflict resolution"
-            );
+        .await?
+        else {
             return Ok(false);
-        }
-        if min_side > 200 && merged_content.len() < min_side * 3 / 10 {
-            warn!(
-                path,
-                merged = merged_content.len(),
-                min_side,
-                "LLM merge dropped most of the file — aborting conflict resolution"
-            );
-            return Ok(false);
-        }
-        if let Err(problem) =
-            syntax_check::validate_change(path, Some(&branch_content), &merged_content)
-        {
-            warn!(
-                path,
-                problem, "LLM merge is syntactically broken — aborting conflict resolution"
-            );
-            return Ok(false);
-        }
+        };
 
         resolved_files.push(FileOp::Write {
             path: path.to_string(),
@@ -1237,6 +1157,128 @@ pub async fn resolve_conflicts(
         .await?;
 
     Ok(true)
+}
+
+/// Merges two versions of `path` with the model, keeping both sides' work:
+/// `main_content` (the `their_label` version) and `branch_content` (the
+/// change's, preferred only where both changed the same lines), read from
+/// `ancestor` when known. `None` when the model's file fails the checks
+/// (empty, most of the file dropped, broken syntax): an unresolved conflict
+/// is safer than a corrupted file.
+#[allow(clippy::too_many_arguments)]
+pub async fn merge_file(
+    state: &WorkerState,
+    provider: &ModelProvider,
+    usage: &mut TokenUsage,
+    path: &str,
+    ancestor: Option<&str>,
+    their_label: &str,
+    main_content: &str,
+    branch_content: &str,
+) -> Result<Option<String>, Box<dyn std::error::Error + Send + Sync>> {
+    let cap = |s: &str, limit: usize| -> String {
+        if s.len() > limit {
+            let head = common::truncate_str(s, limit);
+            let cut = head.rfind('\n').unwrap_or(head.len());
+            format!("{}... (truncated, {} bytes total)", &head[..cut], s.len())
+        } else {
+            s.to_string()
+        }
+    };
+
+    // Build a 3-way merge prompt
+    let system = format!("You are a precise merge conflict resolver. You will be given three versions of a file: the common ancestor, the {their_label} version, and the feature branch version. Produce the correctly merged file that incorporates changes from BOTH sides. When changes conflict directly, prefer the feature branch version. Return ONLY the file content — no explanations, no markdown fences, no commentary.");
+
+    let mut prompt = format!("Merge these versions of `{path}`.\n\n");
+
+    if let Some(anc) = ancestor {
+        prompt.push_str(&format!(
+            "## Common ancestor\n```\n{}\n```\n\n",
+            cap(anc, 12_000)
+        ));
+    }
+
+    prompt.push_str(&format!(
+        "## {their_label} version (their changes)\n```\n{}\n```\n\n",
+        cap(main_content, 16_000)
+    ));
+    prompt.push_str(&format!(
+        "## feature branch version (our changes — prefer when conflicting)\n```\n{}\n```\n\n",
+        cap(branch_content, 16_000)
+    ));
+
+    if ancestor.is_some() {
+        prompt.push_str(
+            "Use the common ancestor to understand what each side changed. \
+             Include changes from BOTH sides. Only prefer the feature branch \
+             when both sides modified the exact same lines.",
+        );
+    } else {
+        prompt.push_str(
+            "Include changes from BOTH sides. Only prefer the feature branch \
+             when both sides modified the exact same lines.",
+        );
+    }
+
+    let mut messages = vec![(
+        "user".to_string(),
+        vec![serde_json::json!({"type": "text", "text": prompt})],
+    )];
+
+    let model_id = provider.primary_model_id();
+    let merged_content = provider::converse(
+        state,
+        provider,
+        common::agent_policy::Agent::Coder,
+        model_id,
+        &system,
+        &mut messages,
+        &[],
+        &super::triage::NoOpExecutor,
+        usage,
+        llm::ConverseOptions {
+            max_turns: 40,
+            max_tokens: 16384,
+            deadline: None,
+            effort: None,
+        },
+        None,
+        None,
+    )
+    .await?;
+
+    // Validate the model's merge before it becomes a commit — the output
+    // used to be committed verbatim (dropped hunks, stray fences,
+    // truncation all landed as file corruption). Any invalid file aborts
+    // the whole resolution: an unresolved conflict GitHub can display is
+    // strictly safer than a silently corrupted merge.
+    let merged_content = strip_code_fences(&merged_content);
+    let min_side = branch_content.len().min(main_content.len());
+    if merged_content.trim().is_empty() && min_side > 0 {
+        warn!(
+            path,
+            "LLM merge produced empty output — aborting conflict resolution"
+        );
+        return Ok(None);
+    }
+    if min_side > 200 && merged_content.len() < min_side * 3 / 10 {
+        warn!(
+            path,
+            merged = merged_content.len(),
+            min_side,
+            "LLM merge dropped most of the file — aborting conflict resolution"
+        );
+        return Ok(None);
+    }
+    if let Err(problem) = syntax_check::validate_change(path, Some(branch_content), &merged_content)
+    {
+        warn!(
+            path,
+            problem, "LLM merge is syntactically broken — aborting conflict resolution"
+        );
+        return Ok(None);
+    }
+    Ok(Some(merged_content))
 }
 
 /// Strip a wrapping markdown code fence the model may have added despite
@@ -2024,6 +2066,7 @@ mod refresh_tests {
             links: "",
             test_fix: None,
             feature: None,
+            keep_commits: false,
         };
         let owned = super::owned_sections(&plan, &proof, "acme/infra");
         let body = assemble(

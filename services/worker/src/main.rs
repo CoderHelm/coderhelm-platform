@@ -559,6 +559,12 @@ async fn handle_message(state: Arc<WorkerState>, message: models::WorkerMessage)
                 error!("Team agent try failed: {e:?}");
             }
         }
+        models::WorkerMessage::Restack(msg) => {
+            info!(team_id = %msg.team_id, repo = %format!("{}/{}", msg.repo_owner, msg.repo_name), branch = %msg.branch, "Force push: rebuilding the pull requests stacked on it");
+            if let Err(e) = passes::restack::after_forced_push(&state, msg).await {
+                error!("Rebuilding stacked pull requests failed: {e:?}");
+            }
+        }
         models::WorkerMessage::HealthCheck(msg) => {
             info!(team_id = %msg.team_id, pr = msg.pr_number, attempt = msg.attempts, "Post-merge health check");
             if let Err(e) = passes::health_check::run(&state, msg).await {
@@ -729,6 +735,10 @@ async fn mark_pr_ready(
     }
     // CoderHelm's own review still lists findings it hasn't fixed: the PR
     // stays a draft until its fix rounds clear them (`own_review`).
+    if let Some(why) = pr["body"].as_str().and_then(passes::stack::hold) {
+        info!(pr_number = msg.pr_number, why = %why, "PR stays a draft");
+        return Ok(());
+    }
     if let Some(why) = pr["body"].as_str().and_then(passes::own_review::hold) {
         info!(pr_number = msg.pr_number, why = %why, "PR stays a draft");
         return Ok(());
