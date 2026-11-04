@@ -4,7 +4,10 @@
  *   node dist/lib/native/build.js <version> <outDir>
  *
  * with GATEWAY_ZIP, WORKER_ZIP, MCP_PROXY_DIR and CODERHELM_DASHBOARD_DIR
- * set as for any synth. Writes, under outDir (the layout of
+ * set as for any synth, and CODERHELM_COMMIT / CODERHELM_RELEASED_AT for the
+ * release's stamp (the release workflow sets them from selfhost/release.json;
+ * without them, the commit is the version's tag in this checkout, or HEAD,
+ * and the release date is now). Writes, under outDir (the layout of
  * coderhelm-public/launch/<version>/):
  *
  *   coderhelm.json          the parent template (Launch Stack opens it)
@@ -16,6 +19,7 @@ import * as cdk from "aws-cdk-lib";
 import * as fs from "fs";
 import * as os from "os";
 import * as path from "path";
+import { execFileSync } from "child_process";
 import { buildApp } from "../app";
 import { repoPath } from "../paths";
 import { nativeConfig } from "./config";
@@ -29,18 +33,51 @@ export interface NativeRelease {
   problems: string[];
 }
 
-export function buildNative(version: string, outDir: string, opts: { dashboardDir?: string; assemblyDir?: string } = {}): NativeRelease {
+/** The commit a release is built from: its tag in this checkout, else HEAD, else unknown. */
+function gitCommit(version: string): string | null {
+  for (const ref of [`${version}^{commit}`, "HEAD"]) {
+    try {
+      const out = execFileSync("git", ["-C", repoPath(), "rev-parse", "--verify", "--quiet", ref], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }).trim();
+      if (/^[0-9a-f]{40}$/.test(out)) return out;
+    } catch {
+      // not a git checkout, or no such ref
+    }
+  }
+  return null;
+}
+
+/**
+ * The stamp every service of a native install carries (infra/lib/release.ts):
+ * the version, the commit and the release date. A native release has no
+ * selfhost/release.json in its checkout (the workflow writes that file into
+ * the source archive), so all three are set here, or an install would report
+ * its version alone.
+ */
+export function nativeStamp(version: string, opts: { commit?: string; releasedAt?: string } = {}, env: NodeJS.ProcessEnv = process.env, now = new Date()): Record<string, string> {
+  const commit = opts.commit || env.CODERHELM_COMMIT || gitCommit(version);
+  const releasedAt = opts.releasedAt || env.CODERHELM_RELEASED_AT || now.toISOString().replace(/\.\d{3}Z$/, "Z");
+  return { CODERHELM_VERSION: version, ...(commit ? { CODERHELM_COMMIT: commit } : {}), CODERHELM_RELEASED_AT: releasedAt };
+}
+
+export function buildNative(version: string, outDir: string, opts: { dashboardDir?: string; assemblyDir?: string; commit?: string; releasedAt?: string } = {}): NativeRelease {
   if (!/^v\d+\.\d+\.\d+(-[0-9A-Za-z.-]+)?$/.test(version)) throw new Error(`${version} is not a release version`);
   const assemblyDir = opts.assemblyDir ?? fs.mkdtempSync(path.join(os.tmpdir(), "chnative-"));
-  const prev = process.env.CODERHELM_VERSION;
-  process.env.CODERHELM_VERSION = version;
+  const stamp = nativeStamp(version, opts);
+  const keys = ["CODERHELM_VERSION", "CODERHELM_COMMIT", "CODERHELM_RELEASED_AT"];
+  const prev = Object.fromEntries(keys.map((k) => [k, process.env[k]]));
+  for (const k of keys) {
+    if (stamp[k]) process.env[k] = stamp[k];
+    else delete process.env[k];
+  }
   try {
     const app = new cdk.App({ outdir: assemblyDir, analyticsReporting: false });
     buildApp(app, nativeConfig({ dashboardDir: opts.dashboardDir ?? process.env.CODERHELM_DASHBOARD_DIR }));
     app.synth();
   } finally {
-    if (prev === undefined) delete process.env.CODERHELM_VERSION;
-    else process.env.CODERHELM_VERSION = prev;
+    for (const k of keys) {
+      if (prev[k] === undefined) delete process.env[k];
+      else process.env[k] = prev[k];
+    }
   }
   fs.rmSync(outDir, { recursive: true, force: true });
   fs.mkdirSync(path.join(outDir, "stacks"), { recursive: true });

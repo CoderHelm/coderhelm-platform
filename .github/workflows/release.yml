@@ -332,6 +332,12 @@ jobs:
           MCP_PROXY_DIR: ${{ github.workspace }}/dist/mcp-proxy.zip
         run: |
           npx tsc -p .
+          # The same commit and release date the source's release.json carries,
+          # so a native install reports all three in Settings, then System.
+          REL="$RUNNER_TEMP/src/coderhelm-platform-${TAG#v}/selfhost/release.json"
+          CODERHELM_COMMIT="$(jq -er .commit "$REL")"
+          CODERHELM_RELEASED_AT="$(jq -er .releasedAt "$REL")"
+          export CODERHELM_COMMIT CODERHELM_RELEASED_AT
           CODERHELM_DASHBOARD_DIR="$RUNNER_TEMP/dash" node dist/lib/native/build.js "$TAG" "$RUNNER_TEMP/native"
           pip install --quiet cfn-lint==1.58.0
           cfn-lint -i W3005 -i W2531 -- "$RUNNER_TEMP/native/coderhelm.json" "$RUNNER_TEMP/native"/stacks/*.json
