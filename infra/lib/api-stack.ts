@@ -776,6 +776,8 @@ export class ApiStack extends cdk.Stack {
           "cognito-idp:AssociateSoftwareToken",
           "cognito-idp:VerifySoftwareToken",
           "cognito-idp:DescribeUserPoolClient",
+          // Who sends reset codes (EmailConfiguration), shown on the sign-in page.
+          "cognito-idp:DescribeUserPool",
         ],
         resources: [userPool.userPoolArn],
       })

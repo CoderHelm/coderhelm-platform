@@ -96,7 +96,7 @@ fn role_of(item: &Item) -> &str {
     }
 }
 
-fn status_of(item: &Item) -> &'static str {
+pub(crate) fn status_of(item: &Item) -> &'static str {
     if s(item, "status") == "invited" {
         "invited"
     } else {
@@ -465,7 +465,7 @@ fn valid_email(email: &str) -> bool {
         && email.len() <= 254
 }
 
-async fn team_items(state: &AppState, team_id: &str) -> Result<Vec<Item>, ApiError> {
+pub(crate) async fn team_items(state: &AppState, team_id: &str) -> Result<Vec<Item>, ApiError> {
     let mut items = Vec::new();
     let mut start: Option<Item> = None;
     loop {
@@ -579,9 +579,10 @@ pub async fn list_users(
         .filter(|i| show_invites || status_of(i) != "invited")
         .map(|i| member_view(i, &claims.sub, now))
         .collect();
-    // On a self-hosted install, admins see who is on the team but has never signed in here (a
-    // member copied from another CoderHelm): they get a set-up email instead of an invite.
-    if show_invites && super::sign_in::applies() {
+    // On a self-hosted install, everyone sees who is on the team but has never signed in here
+    // (a member copied from another CoderHelm), so their activity there doesn't read as use of
+    // this install. Admins can send them a set-up email instead of an invite.
+    if super::sign_in::applies() {
         let emails: Vec<String> = users
             .iter()
             .filter(|u| u["status"] != "invited")
@@ -608,7 +609,7 @@ pub async fn list_users(
 
 /// Which of these emails can sign in on this install (Cognito has them). An email whose lookup
 /// fails is counted as signed in, so no set-up email is offered on a guess.
-async fn pool_emails(
+pub(crate) async fn pool_emails(
     state: &AppState,
     emails: Vec<String>,
 ) -> Result<std::collections::HashSet<String>, String> {
@@ -633,7 +634,11 @@ async fn pool_emails(
 }
 
 /// A member (not an invite) with an email who has no sign-in on this install.
-fn needs_setup(status: &str, email: &str, pool: &std::collections::HashSet<String>) -> bool {
+pub(crate) fn needs_setup(
+    status: &str,
+    email: &str,
+    pool: &std::collections::HashSet<String>,
+) -> bool {
     status != "invited" && !email.is_empty() && !pool.contains(email)
 }
 
@@ -974,21 +979,45 @@ pub async fn send_setup_email(
         Err(e) if format!("{e:?}").contains("UserNotFound") => {}
         Err(e) => return Err(internal("Sign-in not checked", e)),
     }
-    let now = chrono::Utc::now();
-    let log = setup_email_log(&item);
-    setup_email_allowed(&log, now).map_err(|m| fail(StatusCode::TOO_MANY_REQUESTS, m))?;
+    let stamp = deliver_setup_email(&state, &claims.team_id, &item, &claims.email)
+        .await
+        .map_err(|e| match e {
+            SetupSend::Wait(m) => fail(StatusCode::TOO_MANY_REQUESTS, m),
+            SetupSend::Failed(e) => internal("Failed to send the set-up email", e),
+        })?;
+    info!(team_id = %claims.team_id, "Set-up email sent");
+    Ok(Json(
+        json!({ "status": "sent", "setup_email_sent_at": stamp }),
+    ))
+}
 
-    let team_name = get_team_name(state.clone(), &claims).await;
-    send_invite_email(
-        &state,
-        &claims.team_id,
-        &email,
-        &claims.email,
-        &team_name,
-        role_of(&item),
-    )
-    .await
-    .map_err(|_| internal("Failed to send the set-up email", "email send failed"))?;
+/// Why a set-up email didn't go.
+#[derive(Debug)]
+pub(crate) enum SetupSend {
+    /// One went less than an hour ago, or five this week: the sentence says which.
+    Wait(&'static str),
+    Failed(String),
+}
+
+/// Sends `item` (a member with an email, checked by the caller) the set-up email, at most
+/// once an hour and five times a week, and records it on their record. `by` is the admin who
+/// stands behind it: the one who pressed the button, or for a person who asked from the
+/// sign-in page, one of the team's owners or admins. Returns when it went.
+pub(crate) async fn deliver_setup_email(
+    state: &AppState,
+    team_id: &str,
+    item: &Item,
+    by: &str,
+) -> Result<String, SetupSend> {
+    let email = s(item, "email");
+    let now = chrono::Utc::now();
+    let log = setup_email_log(item);
+    setup_email_allowed(&log, now).map_err(SetupSend::Wait)?;
+
+    let team_name = team_name(state, team_id).await;
+    send_invite_email(state, team_id, email, by, &team_name, role_of(item))
+        .await
+        .map_err(|_| SetupSend::Failed("email send failed".into()))?;
 
     let stamp = now.to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
     let mut kept: Vec<AttributeValue> = log
@@ -1001,20 +1030,126 @@ pub async fn send_setup_email(
         .dynamo
         .update_item()
         .table_name(&state.config.users_table_name)
-        .key("pk", attr_s(&claims.team_id))
-        .key("sk", attr_s(s(&item, "sk")))
+        .key("pk", attr_s(team_id))
+        .key("sk", attr_s(s(item, "sk")))
         .update_expression("SET setup_email_sent_at = :now, setup_email_log = :log")
         .condition_expression("attribute_exists(pk)")
         .expression_attribute_values(":now", attr_s(&stamp))
         .expression_attribute_values(":log", AttributeValue::L(kept))
         .send()
         .await
-        .map_err(|e| internal("Failed to record the set-up email", e))?;
+        .map_err(|e| SetupSend::Failed(format!("record: {e}")))?;
+    Ok(stamp)
+}
 
-    info!(team_id = %claims.team_id, "Set-up email sent");
-    Ok(Json(
-        json!({ "status": "sent", "setup_email_sent_at": stamp }),
-    ))
+/// Whether a set-up email may go to this record now (an hour since the last one, five a week).
+pub(crate) fn setup_email_due(item: &Item, now: chrono::DateTime<chrono::Utc>) -> bool {
+    setup_email_allowed(&setup_email_log(item), now).is_ok()
+}
+
+/// The admin a self-service set-up email is sent in the name of: an owner, else an admin,
+/// with an email and an account on the team (the relay lists recipients only on an admin's word).
+pub(crate) fn standing_admin(items: &[Item]) -> Option<String> {
+    let pick = |role: &str| {
+        items
+            .iter()
+            .filter(|i| status_of(i) == "active" && role_of(i) == role)
+            .map(|i| s(i, "email"))
+            .filter(|e| !e.is_empty())
+            .min()
+            .map(str::to_string)
+    };
+    pick("owner").or_else(|| pick("admin"))
+}
+
+/// Set-up emails for the whole team at once: three presses an hour per team.
+const BULK_SETUP_PER_HOUR: u32 = 3;
+
+/// What the bulk send did for one person.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BulkStep {
+    Send,
+    /// A set-up email went less than an hour ago (or five this week).
+    SkipRecent,
+}
+
+pub(crate) fn bulk_step(item: &Item, now: chrono::DateTime<chrono::Utc>) -> BulkStep {
+    if setup_email_due(item, now) {
+        BulkStep::Send
+    } else {
+        BulkStep::SkipRecent
+    }
+}
+
+/// POST /api/users/setup-emails — on a self-hosted install, send the set-up email to everyone
+/// on the team who hasn't set up an account here yet, skipping anyone who got one in the last
+/// hour (or five this week).
+pub async fn send_setup_emails_all(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<Claims>,
+) -> Result<Json<Value>, ApiError> {
+    require_admin(&claims)?;
+    if !super::sign_in::applies() {
+        return Err(fail(
+            StatusCode::NOT_FOUND,
+            "Set-up emails are for self-hosted installs.",
+        ));
+    }
+    let now = chrono::Utc::now();
+    if !take_counter(
+        &state,
+        &claims.team_id,
+        &format!("SETUP_BULK#{}", now.format("%Y-%m-%dT%H")),
+        BULK_SETUP_PER_HOUR,
+        now.timestamp() + 2 * 3600,
+    )
+    .await
+    .map_err(|e| internal("Failed to count bulk set-up emails", e))?
+    {
+        return Err(fail(
+            StatusCode::TOO_MANY_REQUESTS,
+            "Set-up emails went to everyone three times this hour. Try again later.",
+        ));
+    }
+    let items = team_items(&state, &claims.team_id).await?;
+    let emails: Vec<String> = items
+        .iter()
+        .filter(|i| status_of(i) == "active")
+        .map(|i| normalize_email(s(i, "email")))
+        .filter(|e| !e.is_empty())
+        .collect();
+    let pool = pool_emails(&state, emails)
+        .await
+        .map_err(|e| internal("Sign-ins not checked", e))?;
+    let mut sent = serde_json::Map::new();
+    let (mut skipped, mut failed) = (0usize, 0usize);
+    for item in &items {
+        let email = normalize_email(s(item, "email"));
+        if !needs_setup(status_of(item), &email, &pool) {
+            continue;
+        }
+        if bulk_step(item, now) == BulkStep::SkipRecent {
+            skipped += 1;
+            continue;
+        }
+        match deliver_setup_email(&state, &claims.team_id, item, &claims.email).await {
+            Ok(stamp) => {
+                sent.insert(bare_id(s(item, "sk")).to_string(), Value::String(stamp));
+            }
+            Err(SetupSend::Wait(_)) => skipped += 1,
+            Err(SetupSend::Failed(e)) => {
+                error!(error = %e, "Set-up email not sent");
+                failed += 1;
+            }
+        }
+    }
+    info!(team_id = %claims.team_id, sent = sent.len(), skipped, failed, "Set-up emails sent to all");
+    Ok(Json(json!({
+        "sent": sent.len(),
+        "skipped_recent": skipped,
+        "failed": failed,
+        "sent_at": sent,
+    })))
 }
 
 /// What resending needs from the record: still an invite, with an email.
@@ -1582,11 +1717,16 @@ fn attr_s(val: &str) -> AttributeValue {
 }
 
 async fn get_team_name(state: Arc<AppState>, claims: &Claims) -> String {
+    team_name(&state, &claims.team_id).await
+}
+
+/// The team's name for an email, never anything a person typed freely.
+pub(crate) async fn team_name(state: &AppState, team_id: &str) -> String {
     state
         .dynamo
         .get_item()
         .table_name(&state.config.table_name)
-        .key("pk", attr_s(&claims.team_id))
+        .key("pk", attr_s(team_id))
         .key("sk", attr_s("META"))
         .send()
         .await
@@ -1741,6 +1881,52 @@ mod tests {
         let mut none = m.clone();
         none.insert("email".into(), attr_s(""));
         assert!(check_setup_email(&none).is_err());
+    }
+
+    #[test]
+    fn send_to_all_skips_anyone_sent_one_in_the_last_hour() {
+        let now = chrono::DateTime::parse_from_rfc3339("2026-11-10T12:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let with_log = |sent: &[&str]| {
+            let mut m: Item = HashMap::new();
+            m.insert("email".into(), attr_s("a@acme.dev"));
+            m.insert(
+                "setup_email_log".into(),
+                AttributeValue::L(sent.iter().map(|t| attr_s(t)).collect()),
+            );
+            m
+        };
+        assert_eq!(bulk_step(&with_log(&[]), now), BulkStep::Send);
+        assert_eq!(
+            bulk_step(&with_log(&["2026-11-10T11:15:00Z"]), now),
+            BulkStep::SkipRecent
+        );
+        assert_eq!(
+            bulk_step(&with_log(&["2026-11-10T10:59:00Z"]), now),
+            BulkStep::Send
+        );
+    }
+
+    #[test]
+    fn a_self_service_set_up_email_stands_on_an_owner_else_an_admin() {
+        let person = |sk: &str, role: &str, email: &str, status: &str| {
+            let mut m: Item = HashMap::new();
+            m.insert("sk".into(), attr_s(sk));
+            m.insert("role".into(), attr_s(role));
+            m.insert("email".into(), attr_s(email));
+            m.insert("status".into(), attr_s(status));
+            m
+        };
+        let team = vec![
+            person("USER#1", "member", "m@acme.dev", "active"),
+            person("USER#2", "admin", "ad@acme.dev", "active"),
+            person("USER#3", "owner", "own@acme.dev", "active"),
+            person("USER#4", "owner", "inv@acme.dev", "invited"),
+        ];
+        assert_eq!(standing_admin(&team).as_deref(), Some("own@acme.dev"));
+        assert_eq!(standing_admin(&team[..2]).as_deref(), Some("ad@acme.dev"));
+        assert_eq!(standing_admin(&team[..1]), None);
     }
 
     #[test]
