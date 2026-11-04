@@ -1009,10 +1009,34 @@ async fn prepare(
     Ok((p, snap, cap))
 }
 
-/// The runs table, so plugin runs list with the team's other runs.
+/// The runs table, so plugin runs list with the team's other runs, and the
+/// analytics table, so they count with them (empty: not counted).
 pub struct RunsTable {
     pub client: aws_sdk_dynamodb::Client,
     pub table: String,
+    pub analytics_table: String,
+}
+
+/// Counts a plugin run on its team's run counts: started the first time its
+/// record is written, and how it ended once it has. Every write may call
+/// this; each count is added once.
+pub async fn count_run(
+    store: &dyn crate::team_counts::CountStore,
+    team: &str,
+    r: &RunRecord,
+) -> Result<(), String> {
+    use crate::team_counts::{count_run_ended, count_run_started, RunEnd};
+    count_run_started(store, team, &r.run_id, &r.created_at).await?;
+    let end = match r.status {
+        RunStatus::Completed => Some(RunEnd::Completed),
+        RunStatus::Failed | RunStatus::Refused => Some(RunEnd::Failed),
+        RunStatus::Queued | RunStatus::Running => None,
+    };
+    if let Some(end) = end {
+        let at = r.finished_at.clone().unwrap_or_else(super::now_rfc3339);
+        count_run_ended(store, team, &r.run_id, end, &at).await?;
+    }
+    Ok(())
 }
 
 #[async_trait::async_trait]
@@ -1060,6 +1084,17 @@ impl RunLog for RunsTable {
         }
         if let Err(e) = req.send().await {
             tracing::warn!(team, run = %r.run_id, error = %e, "Couldn't list the plugin run with the team's runs");
+            return;
+        }
+        if self.analytics_table.is_empty() {
+            return;
+        }
+        let counts = crate::team_counts::DynamoCounts {
+            dynamo: self.client.clone(),
+            table: self.analytics_table.clone(),
+        };
+        if let Err(e) = count_run(&counts, team, r).await {
+            tracing::warn!(team, run = %r.run_id, error = %e, "Couldn't count the plugin run");
         }
     }
 }
@@ -1083,6 +1118,40 @@ impl RunLog for MemoryRuns {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn a_plugin_run_counts_once_as_a_run_and_once_by_how_it_ended() {
+        use crate::team_counts::{MemoryCounts, ALL_TIME, COMPLETED, FAILED, RUNS};
+        let s = MemoryCounts::default();
+        let mut r = RunRecord {
+            run_id: "01JPLUGIN".into(),
+            plugin_id: "acme-notes".into(),
+            created_at: "2026-11-03T10:00:00Z".into(),
+            ..Default::default()
+        };
+        // Every write of the record (queued, running, finished) calls it.
+        for status in [RunStatus::Queued, RunStatus::Running, RunStatus::Completed] {
+            r.status = status;
+            if status == RunStatus::Completed {
+                r.finished_at = Some("2026-11-03T10:05:00Z".into());
+            }
+            count_run(&s, "TEAM#acme", &r).await.unwrap();
+            count_run(&s, "TEAM#acme", &r).await.unwrap();
+        }
+        assert_eq!(s.get("TEAM#acme", "2026-11", RUNS), 1);
+        assert_eq!(s.get("TEAM#acme", ALL_TIME, RUNS), 1);
+        assert_eq!(s.get("TEAM#acme", ALL_TIME, COMPLETED), 1);
+
+        let refused = RunRecord {
+            run_id: "01JREFUSED".into(),
+            status: RunStatus::Refused,
+            created_at: "2026-11-03T11:00:00Z".into(),
+            ..Default::default()
+        };
+        count_run(&s, "TEAM#acme", &refused).await.unwrap();
+        assert_eq!(s.get("TEAM#acme", ALL_TIME, RUNS), 2);
+        assert_eq!(s.get("TEAM#acme", ALL_TIME, FAILED), 1);
+    }
 
     #[test]
     fn briefs_are_checked_against_the_form() {

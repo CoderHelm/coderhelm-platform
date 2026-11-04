@@ -189,7 +189,9 @@ export class DatabaseStack extends cdk.Stack {
         pointInTimeRecoveryEnabled: true,
       },
       // Only the once-only markers of model calls (`USAGE_CALL#<id>`) carry
-      // `expires_at` (35 days); team counters never expire.
+      // `expires_at` (35 days); team counters never expire, and neither do
+      // the once-only markers of runs and reviewed PRs (`COUNTED#<team>`,
+      // common::team_counts), so a replay or backfill never counts twice.
       timeToLiveAttribute: "expires_at",
       deletionProtection: isProd,
       removalPolicy: isProd

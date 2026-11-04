@@ -511,7 +511,7 @@ pub fn review_stats(rows: &[Item]) -> ReviewStats {
     let mut prs = std::collections::HashSet::new();
     for r in rows {
         let verdict = s(r, "verdict");
-        if !b(r, "posted").unwrap_or(true) || verdict == "QUESTION" {
+        if !common::team_counts::counts_as_review(&verdict, b(r, "posted").unwrap_or(true)) {
             continue;
         }
         out.posted += 1;

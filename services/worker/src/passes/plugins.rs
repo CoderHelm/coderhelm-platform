@@ -93,6 +93,7 @@ fn runs_table(state: &WorkerState) -> run::RunsTable {
     run::RunsTable {
         client: state.dynamo.clone(),
         table: state.config.runs_table_name.clone(),
+        analytics_table: state.config.analytics_table_name.clone(),
     }
 }
 
