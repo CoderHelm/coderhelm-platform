@@ -410,6 +410,7 @@ fn sweep_message(
         wait_secs: 0,
         reconcile_note: None,
         outstanding_work: None,
+        description_hash: None,
     }
 }
 

@@ -1841,6 +1841,12 @@ async fn handle_pull_request(
         return handle_review_trigger(state, payload, installation_id, team_id, action).await;
     }
 
+    // The description edited to answer CoderHelm's review (facts confirmed
+    // from the real system, a requested change explained): review again.
+    if action == "edited" {
+        return super::description_review::handle(state, payload, installation_id, team_id).await;
+    }
+
     let merged = payload["pull_request"]["merged"].as_bool().unwrap_or(false);
     if action != "closed" {
         return Ok(StatusCode::OK);
@@ -4327,7 +4333,7 @@ mod limit_reason_tests {
 }
 
 /// Post a comment on a GitHub issue explaining why the run was skipped.
-async fn post_limit_comment(
+pub(crate) async fn post_limit_comment(
     state: &AppState,
     installation_id: u64,
     owner: &str,

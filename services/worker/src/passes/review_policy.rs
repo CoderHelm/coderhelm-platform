@@ -30,7 +30,8 @@ pub enum TriggerKind {
     /// A webhook (push, label, ready for review), a schedule, or a run's own
     /// review of its PR.
     Automatic,
-    /// A person asked (a reply, the re-request button, the dashboard), the
+    /// A person asked (a reply, the re-request button, the dashboard, an
+    /// edit of the description that answers the review), the
     /// stuck-review sweep, or a reply whose conclusion the formal review must
     /// follow.
     Explicit,
@@ -39,7 +40,9 @@ pub enum TriggerKind {
 /// The kind of a review trigger.
 pub fn trigger_kind(trigger: &str) -> TriggerKind {
     match trigger {
-        "reply" | "rerequest" | "sweep" | "reconcile" => TriggerKind::Explicit,
+        "reply" | "rerequest" | "sweep" | "reconcile" | common::review_description::TRIGGER => {
+            TriggerKind::Explicit
+        }
         _ => TriggerKind::Automatic,
     }
 }
@@ -48,7 +51,10 @@ pub fn trigger_kind(trigger: &str) -> TriggerKind {
 /// push reviews, so a push review and a re-review ask of the same commit
 /// never both run.
 pub fn takes_head_claim(trigger: &str) -> bool {
-    matches!(trigger, "reply" | "rerequest")
+    matches!(
+        trigger,
+        "reply" | "rerequest" | common::review_description::TRIGGER
+    )
 }
 
 /// The per-commit review claim (`common::claim`), shared by the gateway's
@@ -609,6 +615,9 @@ mod tests {
         // A person asked, or a run needs the verdict: it runs.
         assert_eq!(start("reply", "h1", &records), Start::Review);
         assert_eq!(start("rerequest", "h1", &records), Start::Review);
+        // A description edit that answers the review is a person's ask: the
+        // same commit is reviewed again with the new description.
+        assert_eq!(start("description", "h1", &records), Start::Review);
         assert_eq!(start("run", "h1", &records), Start::Review);
         // A review that didn't finish isn't a verdict.
         let mut failed = rec("h1", "REQUEST_CHANGES", "2026-10-01T00:00:00Z");
@@ -640,6 +649,7 @@ mod tests {
             "REVIEWCLAIM#o/r#000007#abc"
         );
         assert!(takes_head_claim("reply") && takes_head_claim("rerequest"));
+        assert!(takes_head_claim("description"));
         assert!(!takes_head_claim("synchronize") && !takes_head_claim("reconcile"));
     }
 

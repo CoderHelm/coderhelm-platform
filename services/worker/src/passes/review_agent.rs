@@ -786,7 +786,9 @@ pub fn unconfirmed_markdown(unconfirmed: &[UnconfirmedFact]) -> String {
         s.push_str(
             "\n\n#### Confirm before merge\nThe change relies on these facts about another \
              system, and the PR's evidence says they weren't confirmed. Confirm each from the \
-             real system (a payload or a row) and add what came back to the description:\n",
+             real system (a payload or a row) and add what came back to the description. \
+             Updating the description starts a re-review on its own, so there's no need to \
+             push a commit or ask for one:\n",
         );
         for f in blocking {
             s.push_str(&line(f));

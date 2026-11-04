@@ -663,7 +663,8 @@ pub struct ReviewMessage {
     /// of posting a verdict. Empty/None → normal verdict review.
     #[serde(default)]
     pub question: Option<String>,
-    /// What triggered the review: "label" | "synchronize" | "reply". Audit only.
+    /// What triggered the review: "label" | "synchronize" | "reply" |
+    /// "description" (an edited description) and others. Audit only.
     #[serde(default)]
     pub trigger: String,
     /// Stable idempotency key for the TRIGGER (comment id for a reply, head sha
@@ -709,6 +710,12 @@ pub struct ReviewMessage {
     /// instead of starting a review.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub outstanding_work: Option<String>,
+    /// For a review started by a description edit
+    /// (`review_description::TRIGGER`): the hash of the description that
+    /// edit left. The review reads the description fresh; when that text
+    /// differs and was already reviewed at this commit, it doesn't run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description_hash: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Default)]
