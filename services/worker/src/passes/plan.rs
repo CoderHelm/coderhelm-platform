@@ -12,7 +12,8 @@ use crate::WorkerState;
 /// The planner's logic version. Part of every cached plan's key: bump it on
 /// any change to how plans are made or what a plan must carry, so a plan
 /// written by an older planner is never reused.
-pub const PLANNER_VERSION: &str = "2026-10-29.intent-history-env-near-match-stop-rules-data-rules";
+pub const PLANNER_VERSION: &str =
+    "2026-11-04.intent-history-env-near-match-stop-rules-data-rules-cross-repo-asking";
 
 /// The openspec file holding the plan's end-to-end checklist, readable.
 pub const END_TO_END_FILE: &str = "end_to_end.md";
@@ -206,10 +207,15 @@ pub async fn run(
          Research the codebase using the provided tools, then generate an implementation plan.\n\n\
          You have access to these repos:\n{repos_list}\n\n\
          All tools default to {owner}/{repo} when the `repo` parameter is omitted. \
-         To explore another repo, pass `repo` as `owner/name` (e.g. `\"{default_repo}\"`).{instructions_block}{team_block}{tests_block}{feature_block}",
+         To explore another repo, pass `repo` as `owner/name` (e.g. `\"{default_repo}\"`).{cross_repo}{instructions_block}{team_block}{tests_block}{feature_block}",
         owner = msg.repo_owner,
         repo = msg.repo_name,
         feature_block = super::feature::planner_block(intent),
+        cross_repo = if team_repos.len() > 1 {
+            super::cross_repo::PLANNER_LINE
+        } else {
+            ""
+        },
     );
 
     let complexity_guidance = match triage.complexity.as_str() {
@@ -289,7 +295,10 @@ set tasks.md to EXACTLY `NO_CHANGES_NEEDED: <reason>`.
      why: config/limits.yml holds one value per environment.
      options: production only | every environment
      evidence: config/limits.yml:12
+     checked: config/limits.yml:12 has one value per environment | the ticket names no environment
+     changes: production only edits one value; every environment edits all three
    ```
+{asking_rules}
    Ask only what blocks the change, at most a few questions, and never a question the ticket or
    the resolved decisions below already settle. Never ask a person to decide what is CoderHelm's
    own call: closing or replacing a pull request someone else opened is never asked; when told to
@@ -352,6 +361,7 @@ After researching, output the four files using this exact format:
 
 Then the ```fix_location.json block described above."#,
         fix_guidance = super::fix_location::planner_guidance(intent),
+        asking_rules = ASKING_GUIDANCE,
         task_format = super::feature::plan_files::PLANNER_FORMAT,
         intent = intent.as_str(),
         title = msg.title,
@@ -661,6 +671,9 @@ Then the ```fix_location.json block described above."#,
             base_branch: &msg.base_branch,
             allowed_repos: &team_repos,
             read_paths: std::sync::Mutex::new(Vec::new()),
+            consulted: Default::default(),
+            branches: Default::default(),
+            team: Some((state, &msg.team_id)),
         },
         mcp_plugins: &loaded_mcp_plugins,
         lambda: &state.lambda,
@@ -732,6 +745,11 @@ Then the ```fix_location.json block described above."#,
             .unwrap_or_default()
     };
     let draft = parse_openspec_files(&response, intent);
+    info!(
+        ticket_id = %msg.ticket_id,
+        consulted = ?executor.read_only.consulted.repos(),
+        "Planner's first pass done"
+    );
     let gaps = super::fix_location::gaps(draft.fix.as_ref(), can_look_up, lookups(), &read());
     // The plan's own check (see plan_judge): its history, the environments
     // its lookups hit, and anything close to what the ticket names.
@@ -773,6 +791,8 @@ Then the ```fix_location.json block described above."#,
     // reuse and the closest sibling.
     let feature_gaps = super::feature::plan_gaps(&draft, intent, &ticket_history.prior);
     back.extend(feature_gaps.iter().cloned());
+    // A decision that stops without a fix names the one step a person takes.
+    back.extend(super::fix_location::next_step_gaps(draft.fix.as_ref()));
     // The outside steps: decided in order (the change, CoderHelm, a person
     // with a reason), looked up before claimed, ordered, valued, confirmable.
     let note_gaps = super::outside_work::plan_gaps(&draft, &abilities);
@@ -879,6 +899,7 @@ Then the ```fix_location.json block described above."#,
             .map(|l| l.lookups().into_iter().map(|x| x.line).collect::<Vec<_>>())
             .unwrap_or_default()
     };
+    let reads = can_read(&team_repos, &tools);
     let asked = clarification_of(&files.tasks);
     if !asked.is_empty() {
         let s = super::stop_gate::screen_questions(
@@ -890,6 +911,8 @@ Then the ```fix_location.json block described above."#,
             run_id,
             &asked,
             &lookup_lines(),
+            &reads,
+            common::stop_rules::screen::Form::Stop,
         )
         .await;
         if s.changed() {
@@ -928,6 +951,8 @@ Then the ```fix_location.json block described above."#,
                     run_id,
                     &again,
                     &lookup_lines(),
+                    &reads,
+                    common::stop_rules::screen::Form::Stop,
                 )
                 .await;
                 if s.changed() {
@@ -935,14 +960,28 @@ Then the ```fix_location.json block described above."#,
                         if let Some(f) = s.tooling_failure() {
                             return Err(f.reason().into());
                         }
-                        return Err(format!(
-                            "The planner stopped only on questions the stop rules refuse, even \
-                             after it was sent back to plan: {}",
-                            s.notes().join(" ")
+                        // Asked too early, twice: report the findings and
+                        // the next step instead of asking or failing.
+                        if !stop_on_findings(&mut files, &s) {
+                            return Err(format!(
+                                "The planner stopped only on questions the stop rules refuse, \
+                                 even after it was sent back to plan: {}",
+                                s.notes().join(" ")
+                            )
+                            .into());
+                        }
+                        super::add_progress_note(
+                            state,
+                            &msg.team_id,
+                            run_id,
+                            "Plan check (asking): the plan's questions could be answered without \
+                             a person, or didn't say what was checked, even after it was sent \
+                             back. Reporting what it found and the next step instead of asking.",
                         )
-                        .into());
+                        .await;
+                    } else {
+                        files.tasks = common::stop_rules::screen::clarification(&s.ask);
                     }
-                    files.tasks = common::stop_rules::screen::clarification(&s.ask);
                 }
             }
         }
@@ -960,6 +999,8 @@ Then the ```fix_location.json block described above."#,
             run_id,
             &qs,
             &lookup_lines(),
+            &reads,
+            common::stop_rules::screen::Form::Line,
         )
         .await;
         if s.changed() {
@@ -1372,6 +1413,64 @@ fn unjustified_stop(files: &PlanResult) -> Option<Vec<common::run_questions::Que
     (!ask.is_empty()).then_some(ask)
 }
 
+/// What a question to a person must carry, in the planner's prompt (held
+/// to `stop_rules::screen::asking_rule` before anyone is asked).
+const ASKING_GUIDANCE: &str =
+    "   A question to a person is one only a person can answer: your tools, the team's \
+repositories, data sources and the team's own tools can't answer it, and the fix differs depending \
+on the answer. Every question lists what you already checked (`checked:`, the facts and the \
+lookups or files behind them) and how each answer changes the fix (`changes:`). A question that \
+rests on what a field means also says where that field is written (`written_at:`, the \
+`owner/repo:path:line` of the code that writes it, or the lookup id), read in this run: a field's \
+name is not its meaning. When your findings disagree about the same record (the same record under \
+two ids, two values for one field), settle that first; never ask while they do. When the next step \
+is one only a person can take (run a job, grant access), don't ask: decide `unknown` and fill \
+`next_step` (see below).";
+
+/// What the run can read itself, for the question reader: the team's
+/// repositories and every tool the planner has beyond code reads.
+fn can_read(team_repos: &[String], tools: &[ToolDefinition]) -> super::stop_gate::CanRead {
+    super::stop_gate::CanRead {
+        repos: team_repos.to_vec(),
+        sources: tools
+            .iter()
+            .filter(|t| {
+                !matches!(
+                    t.name.as_str(),
+                    "search_code" | "read_file_lines" | "list_directory"
+                )
+            })
+            .map(|t| {
+                let first = t.description.split(". ").next().unwrap_or("").trim();
+                format!("tool {}: {}", t.name, common::truncate_str(first, 160))
+            })
+            .collect(),
+    }
+}
+
+/// When every question the plan stopped on broke the asking rules even
+/// after it was sent back, the plan stops without a fix: the run reports
+/// what it found and the next step (`unknown`) instead of failing or asking.
+/// False, changing nothing, when the questions were held back for another
+/// reason or the plan has no decision to report.
+fn stop_on_findings(files: &mut PlanResult, s: &common::stop_rules::screen::Screened) -> bool {
+    let asking = s
+        .dropped
+        .iter()
+        .any(|(_, why)| common::stop_rules::screen::is_asking_rule(why));
+    let Some(d) = files.fix.as_mut().filter(|_| asking && s.ask.is_empty()) else {
+        return false;
+    };
+    d.fix_location = super::fix_location::FixLocation::Unknown;
+    d.questions.clear();
+    files.tasks = format!(
+        "{} {}",
+        super::fix_location::NO_CODE_CHANGE,
+        s.notes().join(" ")
+    );
+    true
+}
+
 /// The questions in a `CLARIFICATION_NEEDED:` tasks file; none otherwise.
 fn clarification_of(tasks: &str) -> Vec<common::run_questions::Question> {
     tasks
@@ -1531,6 +1630,13 @@ struct ReadOnlyToolExecutor<'a> {
     /// `owner/repo:path` of every file read, to check a decision cites code
     /// the planner actually opened.
     read_paths: std::sync::Mutex<Vec<String>>,
+    /// The team's other repositories read so far: the first read of each
+    /// brings its own instructions (see `cross_repo`).
+    consulted: super::cross_repo::Consulted,
+    /// Each other repository's default branch, looked up once.
+    branches: std::sync::Mutex<std::collections::HashMap<String, String>>,
+    /// For the team's instructions for a consulted repository.
+    team: Option<(&'a WorkerState, &'a str)>,
 }
 
 impl<'a> ReadOnlyToolExecutor<'a> {
@@ -1559,6 +1665,88 @@ impl<'a> ReadOnlyToolExecutor<'a> {
             )),
         }
     }
+
+    fn own(&self) -> String {
+        format!("{}/{}", self.default_owner, self.default_repo)
+    }
+
+    /// The branch to read a repository at: the run's base branch for its own
+    /// repository, each other repository's default branch (the run's branch
+    /// name may not exist there).
+    async fn branch_of(&self, owner: &str, repo: &str) -> String {
+        let full = format!("{owner}/{repo}");
+        if full.eq_ignore_ascii_case(&self.own()) {
+            return self.base_branch.to_string();
+        }
+        if let Some(b) = self
+            .branches
+            .lock()
+            .ok()
+            .and_then(|m| m.get(&full).cloned())
+        {
+            return b;
+        }
+        let b = self
+            .github
+            .get_default_branch(owner, repo)
+            .await
+            .unwrap_or_else(|_| "main".to_string());
+        if let Ok(mut m) = self.branches.lock() {
+            m.insert(full, b.clone());
+        }
+        b
+    }
+
+    /// The instructions of each repository in `repos` read for the first
+    /// time in this run (never the run's own: the planner has those).
+    async fn first_read_notes(&self, repos: &[String]) -> String {
+        let mut out = String::new();
+        for full in repos {
+            if full.eq_ignore_ascii_case(&self.own()) || !self.consulted.first(full) {
+                continue;
+            }
+            let Some((owner, name)) = full.split_once('/') else {
+                continue;
+            };
+            let files = super::load_repo_instructions(self.github, owner, name).await;
+            let team = match self.team {
+                Some((state, team_id)) => {
+                    super::load_content(state, team_id, &format!("INSTRUCTIONS#REPO#{full}")).await
+                }
+                None => String::new(),
+            };
+            info!(repo = %full, files = files.len(), team = team.len(), "Planner consulted another repository");
+            out.push_str(&super::cross_repo::instructions_note(full, &files, &team));
+        }
+        out
+    }
+}
+
+/// Each search hit as the planner reads it: the path, then its lines.
+fn hit_lines(results: &[crate::clients::github::SearchResult]) -> Vec<String> {
+    results
+        .iter()
+        .map(|r| {
+            if r.matches.is_empty() {
+                r.path.clone()
+            } else {
+                format!("{}\n{}", r.path, r.matches.join("\n"))
+            }
+        })
+        .collect()
+}
+
+#[async_trait::async_trait]
+impl<'a> super::cross_repo::RepoSearch for ReadOnlyToolExecutor<'a> {
+    async fn search(&self, repo: &str, query: &str) -> Result<Vec<String>, String> {
+        let (owner, name) = repo.split_once('/').ok_or("not owner/name")?;
+        let branch = self.branch_of(owner, name).await;
+        self.github
+            .search_code(owner, name, &branch, query)
+            .await
+            .map(|r| hit_lines(&r))
+            .map_err(|e| e.to_string())
+    }
 }
 
 #[async_trait::async_trait]
@@ -1569,8 +1757,9 @@ impl<'a> ToolExecutor for ReadOnlyToolExecutor<'a> {
         input: &serde_json::Value,
     ) -> Result<serde_json::Value, Box<dyn std::error::Error + Send + Sync>> {
         let (owner, repo) = self.resolve_repo(input)?;
-        let branch = &self.base_branch;
-        match name {
+        let branch = self.branch_of(&owner, &repo).await;
+        let mut consulted = vec![format!("{owner}/{repo}")];
+        let out = match name {
             "read_file_lines" => {
                 let path = input
                     .get("path")
@@ -1588,12 +1777,12 @@ impl<'a> ToolExecutor for ReadOnlyToolExecutor<'a> {
                 let end = end.min(start + 100);
                 let content = self
                     .github
-                    .read_file_lines(&owner, &repo, path, branch, start, end)
+                    .read_file_lines(&owner, &repo, path, &branch, start, end)
                     .await?;
                 if let Ok(mut r) = self.read_paths.lock() {
                     r.push(format!("{owner}/{repo}:{}", path.trim_start_matches('/')));
                 }
-                Ok(json!(content))
+                content
             }
             "search_code" => {
                 let query = input
@@ -1602,19 +1791,26 @@ impl<'a> ToolExecutor for ReadOnlyToolExecutor<'a> {
                     .ok_or("Missing query")?;
                 let results = self
                     .github
-                    .search_code(&owner, &repo, branch, query)
+                    .search_code(&owner, &repo, &branch, query)
                     .await?;
-                let lines: Vec<String> = results
-                    .iter()
-                    .map(|r| {
-                        if r.matches.is_empty() {
-                            r.path.clone()
-                        } else {
-                            format!("{}\n{}", r.path, r.matches.join("\n"))
-                        }
-                    })
-                    .collect();
-                Ok(json!(lines.join("\n---\n")))
+                let here = format!("{owner}/{repo}");
+                // Nothing in the run's own repository: the code that
+                // produces the data is often in another of the team's.
+                let fallback = if results.is_empty()
+                    && input.get("repo").is_none()
+                    && here.eq_ignore_ascii_case(&self.own())
+                {
+                    super::cross_repo::search_others(self, &here, self.allowed_repos, query).await
+                } else {
+                    None
+                };
+                match fallback {
+                    Some((text, hit_repos)) => {
+                        consulted = hit_repos;
+                        text
+                    }
+                    None => hit_lines(&results).join("\n---\n"),
+                }
             }
             "list_directory" => {
                 let path = input
@@ -1623,16 +1819,18 @@ impl<'a> ToolExecutor for ReadOnlyToolExecutor<'a> {
                     .ok_or("Missing path")?;
                 let entries = self
                     .github
-                    .list_directory(&owner, &repo, path, branch)
+                    .list_directory(&owner, &repo, path, &branch)
                     .await?;
                 let lines: Vec<String> = entries
                     .iter()
                     .map(|e| format!("{}: {}", e.entry_type, e.name))
                     .collect();
-                Ok(json!(lines.join("\n")))
+                lines.join("\n")
             }
-            _ => Err(format!("Unknown tool: {name}").into()),
-        }
+            _ => return Err(format!("Unknown tool: {name}").into()),
+        };
+        let notes = self.first_read_notes(&consulted).await;
+        Ok(json!(format!("{notes}{out}")))
     }
 }
 
@@ -1991,6 +2189,84 @@ mod questions_tests {
     #[test]
     fn the_planner_is_versioned_for_intent_and_history() {
         assert!(PLANNER_VERSION.contains("intent-history"));
+        assert!(PLANNER_VERSION.contains("cross-repo-asking"));
+    }
+
+    #[test]
+    fn a_question_for_a_person_must_say_what_was_checked_and_what_it_changes() {
+        for want in [
+            "`checked:`",
+            "`changes:`",
+            "`written_at:`",
+            "`next_step`",
+            "settle that first",
+        ] {
+            assert!(ASKING_GUIDANCE.contains(want), "{want}");
+        }
+    }
+
+    #[test]
+    fn the_question_reader_knows_every_tool_the_planner_has() {
+        let mut tools = read_only_tools();
+        tools.push(ToolDefinition {
+            name: "check_url".into(),
+            description: "Find a record by its id. Returns every copy.".into(),
+            input_schema: json!({}),
+        });
+        let r = can_read(&["acme/web".into(), "acme/pipelines".into()], &tools);
+        assert_eq!(r.repos, vec!["acme/web", "acme/pipelines"]);
+        assert_eq!(r.sources, vec!["tool check_url: Find a record by its id"]);
+    }
+
+    #[test]
+    fn questions_asked_too_early_twice_end_on_the_findings_not_a_failure() {
+        use common::stop_rules::screen::{Screened, WHY_ENVIRONMENT, WHY_NOT_CHECKED};
+        let q = common::run_questions::Question {
+            question: "Is published_at the go-live date?".into(),
+            ..Default::default()
+        };
+        let mut files = plan("CLARIFICATION_NEEDED:\n- question: q");
+        files.fix = Some(crate::passes::fix_location::FixDecision {
+            fix_location: crate::passes::fix_location::FixLocation::Code,
+            questions: vec!["q".into()],
+            ..Default::default()
+        });
+        let early = Screened {
+            dropped: vec![(q.clone(), WHY_NOT_CHECKED.to_string())],
+            ..Default::default()
+        };
+        assert!(stop_on_findings(&mut files, &early));
+        let d = files.fix.as_ref().unwrap();
+        assert_eq!(
+            d.fix_location,
+            crate::passes::fix_location::FixLocation::Unknown
+        );
+        assert!(d.questions.is_empty());
+        assert!(
+            files.tasks.starts_with("NO_CODE_CHANGE:"),
+            "{}",
+            files.tasks
+        );
+        // Another stop rule still fails the run, as before.
+        let mut other = plan("CLARIFICATION_NEEDED:\n- question: q");
+        other.fix = Some(Default::default());
+        let env = Screened {
+            dropped: vec![(q, WHY_ENVIRONMENT.to_string())],
+            ..Default::default()
+        };
+        assert!(!stop_on_findings(&mut other, &env));
+        assert!(other.tasks.starts_with("CLARIFICATION_NEEDED:"));
+    }
+
+    fn plan(tasks: &str) -> PlanResult {
+        PlanResult {
+            proposal: String::new(),
+            design: String::new(),
+            tasks: tasks.into(),
+            spec: String::new(),
+            repo_tasks: vec![],
+            fix: None,
+        }
     }
 }
 

@@ -145,6 +145,40 @@ fn lookup_made(cited: &str, lookups: &[String]) -> bool {
         .any(|l| l.contains(&id) || (c.len() >= 8 && l.to_lowercase().contains(&c.to_lowercase())))
 }
 
+/// What the run could read itself when it asks: the team's repositories
+/// (a citation `owner/repo:path:line` in one of them is checked there) and
+/// its data sources and tools, by name, so a question one of them answers is
+/// never asked.
+#[derive(Debug, Clone, Default)]
+pub struct CanRead {
+    pub repos: Vec<String>,
+    pub sources: Vec<String>,
+}
+
+impl CanRead {
+    /// One line per thing, for the question reader.
+    pub fn lines(&self) -> Vec<String> {
+        self.repos
+            .iter()
+            .map(|r| format!("repository {r} (code search and file reads)"))
+            .chain(self.sources.iter().cloned())
+            .collect()
+    }
+}
+
+/// Where a cited file lives: `owner/repo:path` in one of the team's
+/// repositories, else the run's own repository.
+fn cited_file<'a>(path: &'a str, own: (&str, &str), repos: &[String]) -> (String, String, &'a str) {
+    if let Some((repo, file)) = path.split_once(':') {
+        if let Some((owner, name)) = repo.split_once('/') {
+            if repos.iter().any(|r| r.eq_ignore_ascii_case(repo)) {
+                return (owner.to_string(), name.to_string(), file);
+            }
+        }
+    }
+    (own.0.to_string(), own.1.to_string(), path)
+}
+
 /// The planner's questions held to the stop rules. A model reads what
 /// kind of stop each one is; citations are checked against the repository
 /// (the file exists and has that line) and the lookups the planner made.
@@ -158,6 +192,8 @@ pub async fn screen_questions(
     run_id: &str,
     questions: &[Question],
     lookups: &[String],
+    can_read: &CanRead,
+    form: screen::Form,
 ) -> Screened {
     if questions.is_empty() {
         return Screened::default();
@@ -168,7 +204,7 @@ pub async fn screen_questions(
         &provider.client(),
         &state.config.light_model_id,
         screen::QUESTIONS_SYSTEM,
-        &screen::questions_prompt(Some(&d), &env, questions),
+        &screen::questions_prompt(Some(&d), &env, &can_read.lines(), questions),
         &screen::questions_schema(),
         true,
         "low",
@@ -187,7 +223,7 @@ pub async fn screen_questions(
     let mut files: HashMap<String, usize> = HashMap::new();
     let cited: Vec<Citation> = questions
         .iter()
-        .flat_map(|q| q.evidence.iter())
+        .flat_map(|q| q.evidence.iter().chain(q.written_at.iter()))
         .chain(reads.iter().flat_map(|r| r.evidence.iter()))
         .filter_map(|e| screen::citation(e))
         .collect();
@@ -196,8 +232,19 @@ pub async fn screen_questions(
             if files.contains_key(path) || files.len() >= 10 {
                 continue;
             }
+            let (owner, name, file) =
+                cited_file(path, (&msg.repo_owner, &msg.repo_name), &can_read.repos);
+            // Another repository is read at its own default branch.
+            let git_ref = if owner == msg.repo_owner && name == msg.repo_name {
+                msg.base_branch.clone()
+            } else {
+                github
+                    .get_default_branch(&owner, &name)
+                    .await
+                    .unwrap_or_else(|_| "main".to_string())
+            };
             let lines = github
-                .read_file(&msg.repo_owner, &msg.repo_name, path, &msg.base_branch)
+                .read_file(&owner, &name, file, &git_ref)
                 .await
                 .map(|t| t.lines().count())
                 .unwrap_or(0);
@@ -212,7 +259,7 @@ pub async fn screen_questions(
         })
         .map(|c| format!("{c:?}"))
         .collect();
-    let s = screen::screen(questions, &reads, d.complete(), &|c| {
+    let s = screen::screen(questions, &reads, d.complete(), form, &|c| {
         real.contains(&format!("{c:?}"))
     });
     if s.changed() {
@@ -560,6 +607,35 @@ pub async fn finish_covered(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_citation_in_another_team_repository_is_read_there() {
+        let repos = vec!["acme/web".to_string(), "acme/pipelines".to_string()];
+        assert_eq!(
+            cited_file("acme/pipelines:indexer/build.py", ("acme", "web"), &repos),
+            ("acme".into(), "pipelines".into(), "indexer/build.py")
+        );
+        // A repository the team didn't connect is never read: the path
+        // stays the run repository's own.
+        assert_eq!(
+            cited_file("other/repo:a.py", ("acme", "web"), &repos),
+            ("acme".into(), "web".into(), "other/repo:a.py")
+        );
+        assert_eq!(
+            cited_file("src/list.ts", ("acme", "web"), &repos),
+            ("acme".into(), "web".into(), "src/list.ts")
+        );
+        let lines = CanRead {
+            repos: vec!["acme/pipelines".into()],
+            sources: vec!["data source: app database".into()],
+        }
+        .lines();
+        assert_eq!(
+            lines[0],
+            "repository acme/pipelines (code search and file reads)"
+        );
+        assert_eq!(lines[1], "data source: app database");
+    }
 
     fn complete() -> TicketDiagnosis {
         TicketDiagnosis {

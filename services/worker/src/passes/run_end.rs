@@ -191,6 +191,7 @@ pub fn questions_from(qs: &[String]) -> Vec<common::run_questions::Question> {
             suggestions: Vec::new(),
             decision: String::new(),
             evidence: Vec::new(),
+            ..Default::default()
         })
         .collect()
 }

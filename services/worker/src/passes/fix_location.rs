@@ -101,6 +101,71 @@ pub struct FixEvidence {
     /// Existing objects close to what the ticket names, followed to the end.
     #[serde(default)]
     pub near_matches: Vec<NearMatch>,
+    /// For missing or wrong data: each layer the record passes through
+    /// (source, store, index or cache, page), where that layer lives and what
+    /// the record looks like there. The first wrong layer is the fault.
+    #[serde(default)]
+    pub layers: Vec<Layer>,
+}
+
+/// One layer a record passes through, as the trace found it.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Layer {
+    /// What the layer is (`source warehouse`, `app database`, `search
+    /// index`, `site`).
+    #[serde(default)]
+    pub layer: String,
+    /// Where it lives: the repository that produces it (`owner/repo:path`)
+    /// or the system that holds it.
+    #[serde(default, rename = "where")]
+    pub where_: String,
+    /// What the record looks like there, from a lookup (by its id), or why
+    /// it couldn't be looked up.
+    #[serde(default)]
+    pub shows: String,
+    /// `ok`, `wrong`, `missing` or `unchecked`.
+    #[serde(default)]
+    pub state: String,
+}
+
+/// The one action a person takes when the run can't take the next step
+/// itself, and what each outcome would mean.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NextStep {
+    /// The action, exactly (`run the full rebuild of the search index`).
+    #[serde(default)]
+    pub action: String,
+    /// Why the run can't take it itself (the access or tool it lacks).
+    #[serde(default)]
+    pub why_person: String,
+    /// Each outcome and what it means for the fix.
+    #[serde(default)]
+    pub outcomes: Vec<Outcome>,
+}
+
+/// One outcome of a [`NextStep`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Outcome {
+    /// What the person sees (`the record appears`).
+    #[serde(default, rename = "if")]
+    pub if_: String,
+    /// What it means (`the incremental sync skipped it`).
+    #[serde(default)]
+    pub means: String,
+}
+
+impl NextStep {
+    /// An action and at least two outcomes, each with its meaning: a step
+    /// whose result would change nothing is not worth a person's time.
+    pub fn is_usable(&self) -> bool {
+        !self.action.trim().is_empty()
+            && self
+                .outcomes
+                .iter()
+                .filter(|o| !o.if_.trim().is_empty() && !o.means.trim().is_empty())
+                .count()
+                >= 2
+    }
 }
 
 /// One environment the evidence concerns, and how the planner proved a
@@ -302,6 +367,10 @@ pub struct FixDecision {
     /// counts per environment (see `release_plan`).
     #[serde(default)]
     pub release: Option<super::release_plan::Release>,
+    /// When the run stops without a fix because the next step is one it
+    /// can't take: that one action and what each outcome would mean.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_step: Option<NextStep>,
 }
 
 /// One step of the whole job, and who does it.
@@ -491,6 +560,19 @@ fn basis_of(d: &FixDecision) -> &'static str {
     }
 }
 
+/// What a decision that stops without a fix still lacks: the one action a
+/// person takes next and what each outcome means. Only a bug or a question
+/// that ends `unknown` needs one; new work asks its questions instead.
+pub fn next_step_gaps(d: Option<&FixDecision>) -> Vec<String> {
+    let Some(d) = d else { return Vec::new() };
+    let stops = d.effective_location() == FixLocation::Unknown
+        && matches!(d.intent, TicketIntent::Bug | TicketIntent::Question);
+    if !stops || d.next_step.as_ref().is_some_and(NextStep::is_usable) {
+        return Vec::new();
+    }
+    vec!["Your decision stops without a fix. First take every next step you can yourself (look it up, read the other repositories, query the data). Then fill `next_step`: the ONE action a person must take that you can't (say why in `why_person`), and at least two `outcomes`, each with what it would mean for the fix (for example: \"run the full rebuild\"; if the record appears, the incremental sync skipped it; if not, the inclusion rule drops it).".to_string()]
+}
+
 /// The message that sends a planner back with what its decision lacks.
 pub fn send_back(gaps: &[String]) -> String {
     format!(
@@ -617,12 +699,27 @@ pub fn parse(response: &str) -> Option<FixDecision> {
 /// matches, and the end-to-end checklist with the block.
 pub fn planner_guidance(intent: TicketIntent) -> String {
     let framing = match intent {
-        TicketIntent::Bug => BUG_GUIDANCE,
-        TicketIntent::Feature | TicketIntent::Chore => NEW_WORK_GUIDANCE,
-        TicketIntent::Question => QUESTION_GUIDANCE,
+        TicketIntent::Bug => format!("{BUG_GUIDANCE}\n\n{MISSING_DATA_GUIDANCE}"),
+        TicketIntent::Feature | TicketIntent::Chore => NEW_WORK_GUIDANCE.to_string(),
+        TicketIntent::Question => format!("{QUESTION_GUIDANCE}\n\n{MISSING_DATA_GUIDANCE}"),
     };
     format!("{framing}\n\n{EVERY_PLAN_GUIDANCE}\n\n{CHECKLIST_GUIDANCE}")
 }
+
+/// For a ticket about data that is missing or wrong (a record that should
+/// show and doesn't, a value that is off): how to find the first layer
+/// where it goes wrong, across every repository and source the team has.
+pub const MISSING_DATA_GUIDANCE: &str = r#"## Missing or wrong data (a record that should show and doesn't, a wrong value)
+
+Trace the record through every layer it passes, in order, and find the FIRST layer where it is wrong or missing. That layer is where the fault is.
+- Name the layers first: where the record starts (a source system or warehouse), where it is stored (the app database), where it is copied for reading (a search index, a cache), and where it is shown (the page or API). Record each one in `evidence.layers`: the repository or system that holds it, and what the record looks like there.
+- The code that produces a layer is often in another of the team's repositories (a sync, an indexer or a pipeline job in a data or pipelines repository). When a search in this repository finds nothing, search the team's other repositories by the same names before you call a step unknown; pass `repo` to `search_code`, `read_file_lines` and `list_directory`. Read only; the fix still goes where the fault is.
+- Look records up by their stable ids, never by display names: names can be hidden, renamed or shared by several records. When two findings disagree about one record (the same record under two ids, two values for one field), settle which is right before you build on either.
+- Before reading a field's meaning from its name, read the code that writes it. A field can be copied from another field or filled by a default, and then its name says nothing.
+- For an incremental sync, compare the record's change time (`updated_at` or the like) with the sync's cursor or last run mark, and read the sync's recent runs and warnings, before you suspect a business rule. A record changed before the cursor moved past it, or a run that failed or warned, explains a missing record without any rule being wrong.
+- When the ticket is about production, check production data directly with the connected sources.
+- Use the team's own tools and data sources first (the tools named for this team, its saved lookups, its knowledge bases); they were built for exactly these questions. Never guess what a lookup can show.
+- When the next step is one you can't take (a job only a person can run, access you don't have), don't ask an open question: set `fix_location` to `unknown` and fill `next_step` with that one action and what each outcome would mean."#;
 
 /// For a ticket that asks for something new (or upkeep): what to build, not
 /// where a fault is.
@@ -747,6 +844,7 @@ After the four openspec files, output this block (JSON, all fields required; `ou
     "producer": {"kind": "code | source", "where": "for code: owner/repo:path:line and the function that writes the wrong value (a file you opened); for source: the system, the record and the wrong value it holds"},
     "scope": "how many records (from a query) or places in the code have the same defect",
     "environments": [{"env": "each environment the evidence concerns", "proof": "the data a lookup returned that only exists there; or the missing access when unproven", "proven": true}],
+    "layers": [{"layer": "for missing or wrong data: each layer the record passes through, in order (source, store, index or cache, page)", "where": "the repository that produces it (owner/repo:path) or the system holding it", "shows": "what the record looks like there, by its id, from a lookup", "state": "ok | wrong | missing | unchecked"}],
     "near_matches": [{"name": "an existing object close to what the ticket names", "asked_for": "what the ticket names", "owner": "who owns it", "grants": "who can use it", "contents": "what is in it", "origin": "what created it (repository and file, or job), or where you searched", "question": "the one decisive question for a person"}]
   },
   "outside_change": {
@@ -763,6 +861,7 @@ After the four openspec files, output this block (JSON, all fields required; `ou
   },
   "history_check": "only when the prompt has a ticket history: each earlier pull request by number, what you reuse from it, what changes this time and why (and for one closed without a reason in its comments: who closed it and when); otherwise empty",
   "questions": ["each question only a person can answer, one decision each; [] when there are none"],
+  "next_step": {"action": "only when `fix_location` is `unknown` because the next step is one you can't take: that ONE action for a person", "why_person": "the access or tool you lack", "outcomes": [{"if": "what the person sees", "means": "what that means for the fix"}]},
   "end_to_end": [
     {"step": "each step the ticket needs to work in production", "by": "this_pr | other_repo | person | vendor", "owner": "who does it (a team, a role, the vendor); empty for this_pr", "repo": "owner/repo for this_pr and other_repo steps"}
   ]
@@ -806,6 +905,13 @@ fn push_evidence(out: &mut String, d: &FixDecision) {
         }
         out.push('\n');
     }
+    if !ev.layers.is_empty() {
+        out.push_str("**Layer by layer**\n");
+        for l in &ev.layers {
+            out.push_str(&format!("- {}\n", layer_line(l)));
+        }
+        out.push('\n');
+    }
     if !ev.near_matches.is_empty() {
         out.push_str("**Close to what the ticket names**\n");
         for m in &ev.near_matches {
@@ -813,6 +919,48 @@ fn push_evidence(out: &mut String, d: &FixDecision) {
         }
         out.push('\n');
     }
+}
+
+fn layer_line(l: &Layer) -> String {
+    let mut out = one_line(&l.layer);
+    if !l.where_.trim().is_empty() {
+        out.push_str(&format!(" ({})", one_line(&l.where_)));
+    }
+    if !l.state.trim().is_empty() {
+        out.push_str(&format!(": {}", one_line(&l.state)));
+    }
+    if !l.shows.trim().is_empty() {
+        out.push_str(&format!(", {}", one_line(&l.shows)));
+    }
+    out
+}
+
+/// The next step a person takes, and what each outcome means. Empty when
+/// the decision has none that is usable.
+pub fn next_step_markdown(d: &FixDecision) -> String {
+    let Some(n) = d.next_step.as_ref().filter(|n| n.is_usable()) else {
+        return String::new();
+    };
+    let mut out = format!(
+        "**The one step I need from you:** {}\n",
+        one_line(&n.action)
+    );
+    if !n.why_person.trim().is_empty() {
+        out.push_str(&format!("_Why I can't: {}_\n", one_line(&n.why_person)));
+    }
+    for o in &n.outcomes {
+        if !o.if_.trim().is_empty() && !o.means.trim().is_empty() {
+            out.push_str(&format!(
+                "- If {}: {}\n",
+                one_line(&o.if_)
+                    .trim_start_matches("if ")
+                    .trim_start_matches("If "),
+                one_line(&o.means)
+            ));
+        }
+    }
+    out.push('\n');
+    out
 }
 
 fn env_line(e: &EnvCheck) -> String {
@@ -1016,6 +1164,14 @@ pub fn unknown_report(d: &FixDecision, heading: bool) -> String {
     }
     out.push_str(&questions_markdown(d));
     out.push_str(&open_gaps_markdown(d));
+    let next = next_step_markdown(d);
+    if !next.is_empty() {
+        out.push_str(&next);
+        out.push_str(
+            "I didn't change any code. Reply here with what you see, and I'll pick it up from there.",
+        );
+        return out;
+    }
     out.push_str(match d.intent {
         TicketIntent::Bug => {
             "I didn't change any code. Please confirm whether the code or the data is at fault \
@@ -1228,6 +1384,136 @@ Given the term is available on web, when the sync runs, then the class shows on 
   }
 }
 ```"#;
+}
+
+#[cfg(test)]
+mod investigation_tests {
+    use super::*;
+
+    #[test]
+    fn the_planner_is_told_how_to_trace_missing_or_wrong_data() {
+        for intent in [TicketIntent::Bug, TicketIntent::Question] {
+            let g = planner_guidance(intent);
+            assert!(g.contains("## Missing or wrong data"), "{intent:?}");
+        }
+        assert!(!planner_guidance(TicketIntent::Feature).contains("## Missing or wrong data"));
+        for want in [
+            "FIRST layer where it is wrong or missing",
+            "search the team's other repositories",
+            "stable ids, never by display names",
+            "settle which is right",
+            "read the code that writes it",
+            "sync's cursor",
+            "warnings, before you suspect a business rule",
+            "check production data directly",
+            "the team's own tools and data sources first",
+            "`next_step`",
+        ] {
+            assert!(MISSING_DATA_GUIDANCE.contains(want), "{want}");
+        }
+        let g = planner_guidance(TicketIntent::Bug);
+        assert!(g.contains("\"layers\""), "the block asks for the layers");
+        assert!(
+            g.contains("\"next_step\""),
+            "the block asks for the next step"
+        );
+    }
+
+    fn stopped(intent: TicketIntent) -> FixDecision {
+        FixDecision {
+            fix_location: FixLocation::Unknown,
+            intent,
+            cause: "Two active items are missing from the site's search index.".into(),
+            ..Default::default()
+        }
+    }
+
+    fn rebuild() -> NextStep {
+        NextStep {
+            action: "Run the full rebuild of the search index".into(),
+            why_person: "no connection can start the rebuild job".into(),
+            outcomes: vec![
+                Outcome {
+                    if_: "the items appear".into(),
+                    means: "the incremental sync skipped them; fix its cursor".into(),
+                },
+                Outcome {
+                    if_: "they still don't".into(),
+                    means: "the inclusion rule drops them; fix the rule".into(),
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn a_stop_without_a_fix_names_the_one_step_a_person_takes() {
+        assert!(next_step_gaps(None).is_empty());
+        let gaps = next_step_gaps(Some(&stopped(TicketIntent::Bug)));
+        assert_eq!(gaps.len(), 1);
+        assert!(gaps[0].contains("`next_step`"), "{}", gaps[0]);
+        assert_eq!(
+            next_step_gaps(Some(&stopped(TicketIntent::Question))).len(),
+            1
+        );
+        // New work asks its questions instead; a settled decision needs none.
+        assert!(next_step_gaps(Some(&stopped(TicketIntent::Feature))).is_empty());
+        let code = FixDecision {
+            fix_location: FixLocation::Code,
+            ..stopped(TicketIntent::Bug)
+        };
+        assert!(next_step_gaps(Some(&code)).is_empty());
+        // One outcome is not a step worth a person's time.
+        let mut one = rebuild();
+        one.outcomes.truncate(1);
+        let d = FixDecision {
+            next_step: Some(one),
+            ..stopped(TicketIntent::Bug)
+        };
+        assert_eq!(next_step_gaps(Some(&d)).len(), 1);
+        let d = FixDecision {
+            next_step: Some(rebuild()),
+            ..stopped(TicketIntent::Bug)
+        };
+        assert!(next_step_gaps(Some(&d)).is_empty());
+    }
+
+    #[test]
+    fn the_report_ends_with_the_step_and_what_each_outcome_means() {
+        let reply = r#"```fix_location.json
+{"fix_location":"unknown","cause":"Two active items are missing from the index.",
+ "evidence":{"basis":"data","layers":[
+   {"layer":"app database","where":"acme/api","shows":"both rows active, updated after the last sync","state":"ok"},
+   {"layer":"search index","where":"acme/pipelines:indexer/build.py","shows":"neither id","state":"missing"}]},
+ "next_step":{"action":"Run the full rebuild of the search index","why_person":"no connection can start the rebuild job",
+   "outcomes":[{"if":"the items appear","means":"the incremental sync skipped them"},{"if":"they still don't","means":"the inclusion rule drops them"}]}}
+```"#;
+        let d = parse_for(reply, TicketIntent::Bug).expect("reads");
+        assert_eq!(d.evidence.layers.len(), 2);
+        assert_eq!(
+            d.evidence.layers[1].where_,
+            "acme/pipelines:indexer/build.py"
+        );
+        let report = unknown_report(&d, true);
+        assert!(report.contains("**Layer by layer**"), "{report}");
+        assert!(
+            report
+                .contains("- search index (acme/pipelines:indexer/build.py): missing, neither id"),
+            "{report}"
+        );
+        assert!(
+            report.contains("**The one step I need from you:** Run the full rebuild"),
+            "{report}"
+        );
+        assert!(report.contains("- If the items appear: the incremental sync skipped them"));
+        assert!(report.contains("- If they still don't: the inclusion rule drops them"));
+        assert!(
+            !report.contains("Please confirm whether the code or the data is at fault"),
+            "the step replaces the open question"
+        );
+        // Without a usable step, the report ends as before.
+        assert!(unknown_report(&stopped(TicketIntent::Bug), true)
+            .contains("Please confirm whether the code or the data is at fault"));
+    }
 }
 
 #[cfg(test)]

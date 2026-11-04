@@ -25,6 +25,7 @@ const MAX_QUESTION_CHARS: usize = 600;
 const MAX_WHY_CHARS: usize = 600;
 const MAX_SUGGESTIONS: usize = 4;
 const MAX_SUGGESTION_CHARS: usize = 200;
+const MAX_CHECKED: usize = 8;
 
 /// One thing a run needs a person to tell it.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -48,6 +49,20 @@ pub struct Question {
     /// the code or the data makes it a question (see `stop_rules::screen`).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub evidence: Vec<String>,
+    /// The facts the run already checked before asking (each lookup, file
+    /// or tool result, in plain words): a person is never asked to repeat
+    /// what the run could see (see `stop_rules::screen`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub checked: Vec<String>,
+    /// How the fix differs depending on the answer. A question whose answer
+    /// changes nothing is never asked.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub changes: String,
+    /// For a question that rests on what a field means: where that field's
+    /// value is written (`owner/repo:path:line`, or a lookup id), read in
+    /// this run. A field's meaning is read from its writer, not its name.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub written_at: Vec<String>,
 }
 
 /// What a run asked when it stopped, and where it asked it.
@@ -160,6 +175,8 @@ pub fn validate(
 /// - question: Which environments get the new limit?
 ///   why: Each environment has its own value in config/limits.yml.
 ///   options: Production only | Every environment
+///   checked: config/limits.yml holds one value per environment
+///   changes: production only edits one line; every environment edits three
 /// ```
 ///
 /// Older or looser answers still read: bullet or numbered lines become one
@@ -189,6 +206,12 @@ pub fn parse(detail: &str) -> Vec<Question> {
                 .filter(|s| !s.is_empty())
                 .map(str::to_string)
                 .collect();
+        } else if let (Some(c), Some(last)) = (field(item, "checked"), out.last_mut()) {
+            last.checked = split_list(c);
+        } else if let (Some(c), Some(last)) = (field(item, "changes"), out.last_mut()) {
+            last.changes = c.to_string();
+        } else if let (Some(w), Some(last)) = (field(item, "written_at"), out.last_mut()) {
+            last.written_at = split_list(w);
         } else if let (Some(opts), Some(last)) = (
             field(item, "options").or_else(|| field(item, "suggestions")),
             out.last_mut(),
@@ -268,7 +291,31 @@ fn tidy(questions: Vec<Question>) -> Vec<Question> {
                 .filter(|s| !s.is_empty())
                 .take(MAX_SUGGESTIONS)
                 .collect(),
+            checked: q
+                .checked
+                .iter()
+                .map(|s| clip(s.trim(), MAX_SUGGESTION_CHARS))
+                .filter(|s| !s.is_empty())
+                .take(MAX_CHECKED)
+                .collect(),
+            changes: clip(q.changes.trim(), MAX_WHY_CHARS),
+            written_at: q
+                .written_at
+                .iter()
+                .map(|s| clip(s.trim(), MAX_SUGGESTION_CHARS))
+                .filter(|s| !s.is_empty())
+                .take(MAX_SUGGESTIONS)
+                .collect(),
         })
+        .collect()
+}
+
+/// A `|`-separated list, trimmed, blanks dropped.
+fn split_list(s: &str) -> Vec<String> {
+    s.split('|')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
         .collect()
 }
 
@@ -289,6 +336,12 @@ pub fn markdown(questions: &[Question]) -> String {
                     .collect::<Vec<_>>()
                     .join(", ")
             ));
+        }
+        if !q.checked.is_empty() {
+            out.push_str(&format!("   Already checked: {}\n", q.checked.join("; ")));
+        }
+        if !q.changes.is_empty() {
+            out.push_str(&format!("   What the answer changes: {}\n", q.changes));
         }
         if !q.evidence.is_empty() {
             out.push_str(&format!(
@@ -316,6 +369,12 @@ pub fn plain(questions: &[Question]) -> String {
             }
             if !q.suggestions.is_empty() {
                 s.push_str(&format!(" Possible answers: {}.", q.suggestions.join("; ")));
+            }
+            if !q.checked.is_empty() {
+                s.push_str(&format!(" Already checked: {}.", q.checked.join("; ")));
+            }
+            if !q.changes.is_empty() {
+                s.push_str(&format!(" What the answer changes: {}", q.changes));
             }
             if !q.evidence.is_empty() {
                 s.push_str(&format!(" Evidence: {}.", q.evidence.join("; ")));
@@ -552,6 +611,51 @@ fn clip(s: &str, max_chars: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_question_carries_what_was_checked_and_what_its_answer_changes() {
+        let qs = parse(
+            "- question: Should records missing from the index be rebuilt in full?\n  \
+             why: the incremental sync skipped them\n  \
+             checked: L1 the record is active in the app database | L2 it is missing from the index\n  \
+             changes: yes: run the rebuild; no: change the inclusion rule\n  \
+             written_at: acme/pipelines:indexer/build.py:88 | L3",
+        );
+        assert_eq!(qs.len(), 1);
+        assert_eq!(
+            qs[0].checked,
+            vec![
+                "L1 the record is active in the app database",
+                "L2 it is missing from the index"
+            ]
+        );
+        assert_eq!(
+            qs[0].changes,
+            "yes: run the rebuild; no: change the inclusion rule"
+        );
+        assert_eq!(
+            qs[0].written_at,
+            vec!["acme/pipelines:indexer/build.py:88", "L3"]
+        );
+        let md = markdown(&qs);
+        assert!(
+            md.contains("Already checked: L1 the record is active"),
+            "{md}"
+        );
+        assert!(
+            md.contains("What the answer changes: yes: run the rebuild"),
+            "{md}"
+        );
+        let text = plain(&qs);
+        assert!(text.contains("Already checked: L1"), "{text}");
+        // Stored and read back with them.
+        let json = serde_json::to_string(&qs[0]).unwrap();
+        let back: Question = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, qs[0]);
+        // An older stored question reads without them.
+        let old: Question = serde_json::from_str(r#"{"id":"q1","question":"A?"}"#).unwrap();
+        assert!(old.checked.is_empty() && old.changes.is_empty());
+    }
 
     fn answer(q: &str, a: &str) -> Answer {
         Answer {

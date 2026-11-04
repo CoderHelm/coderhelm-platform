@@ -1549,6 +1549,7 @@ pub fn unjustified_questions(c: &OutsideChange) -> Vec<common::run_questions::Qu
             ],
             decision: String::new(),
             evidence: Vec::new(),
+            ..Default::default()
         })
         .collect()
 }

@@ -782,6 +782,7 @@ mod branch_update;
 mod checks;
 pub mod code_graph;
 mod completeness;
+mod cross_repo;
 pub mod deploy_stats;
 pub mod dlq_cleanup;
 pub mod e2e;
@@ -8362,6 +8363,7 @@ fn empty_change_questions() -> Vec<common::run_questions::Question> {
             suggestions: Vec::new(),
             decision: String::new(),
             evidence: Vec::new(),
+            ..Default::default()
         },
         common::run_questions::Question {
             id: "q2".to_string(),
@@ -8372,6 +8374,7 @@ fn empty_change_questions() -> Vec<common::run_questions::Question> {
             suggestions: Vec::new(),
             decision: String::new(),
             evidence: Vec::new(),
+            ..Default::default()
         },
     ]
 }
@@ -8412,6 +8415,7 @@ fn unknown_fix_questions(
         suggestions: Vec::new(),
         decision: String::new(),
         evidence: Vec::new(),
+        ..Default::default()
     }]
 }
 
@@ -8475,6 +8479,7 @@ fn clarification_questions(
         suggestions: Vec::new(),
         decision: String::new(),
         evidence: Vec::new(),
+        ..Default::default()
     }]
 }
 

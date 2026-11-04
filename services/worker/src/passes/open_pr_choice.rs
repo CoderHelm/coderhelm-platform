@@ -110,6 +110,7 @@ pub fn notice_question(pr: &OtherPr) -> Question {
         ],
         decision: pr.key(),
         evidence: Vec::new(),
+        ..Default::default()
     }
 }
 
