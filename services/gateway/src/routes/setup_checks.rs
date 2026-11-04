@@ -229,12 +229,17 @@ pub fn github_keys(app_id: &str, private_key: &str) -> Check {
     )
 }
 
-/// GitHub sign-in: the sign-in page offers "Continue with GitHub" only with
-/// an OAuth client of the install's own (its id and secret). `hosted_app` is
-/// a hybrid install on CoderHelm's GitHub App, which has no client to store:
-/// CoderHelm's can't sign anyone in to the install, so sign-in there is
-/// email and password, and that's expected.
-pub fn github_sign_in(client_id: &str, client_secret: &str, hosted_app: bool) -> Check {
+/// GitHub sign-in: the sign-in page offers "Continue with GitHub" with an
+/// OAuth client of the install's own (its id and secret), or, on a hybrid
+/// install with neither, through CoderHelm's GitHub App once the install is
+/// registered with CoderHelm (`registered`). `hosted_app` is an install on
+/// CoderHelm's GitHub App.
+pub fn github_sign_in(
+    client_id: &str,
+    client_secret: &str,
+    hosted_app: bool,
+    registered: bool,
+) -> Check {
     const KEY: &str = "github_sign_in";
     const LABEL: &str = "GitHub sign-in";
     let (id, secret) = (
@@ -249,16 +254,24 @@ pub fn github_sign_in(client_id: &str, client_secret: &str, hosted_app: bool) ->
             "The OAuth client is stored, so the sign-in page offers Continue with GitHub.",
         );
     }
-    if hosted_app && !id && !secret {
-        return Check::not_ok(
-            Status::Skip,
+    if !id && !secret && registered {
+        return Check::pass(
             KEY,
             G,
             LABEL,
-            "Off: this install uses CoderHelm's GitHub App, which can't sign people in to this install.",
-            "People sign in with email and password; the sign-in page doesn't offer GitHub.",
-            Fix::text("Nothing to do. To offer GitHub sign-in, create a GitHub App of this install's own.")
-                .command(format!("{CLI} github-app")),
+            "Through CoderHelm's GitHub App: the sign-in page offers Continue with GitHub, and this install checks who signed in with GitHub itself.",
+        );
+    }
+    if hosted_app && !id && !secret {
+        return Check::not_ok(
+            Status::Warn,
+            KEY,
+            G,
+            LABEL,
+            "Off until this install is registered with CoderHelm.",
+            "GitHub sign-in on CoderHelm's GitHub App goes through CoderHelm, which needs the registration; until then the sign-in page shows email and password only.",
+            Fix::text("Register this install in Settings, System, Hybrid.")
+                .href("/settings/system/#hybrid"),
         );
     }
     let detail = if id || secret {
@@ -1992,6 +2005,7 @@ pub async fn run_all(state: &AppState, team_id: &str) -> (Vec<Check>, Option<Val
                 &s.github_client_id,
                 &s.github_client_secret,
                 hosted,
+                super::github_hybrid::available(),
             ));
             out
         },
@@ -2602,10 +2616,10 @@ mod tests {
     #[test]
     fn github_sign_in_flags_a_missing_client_and_never_blocks_an_update() {
         use super::{github_sign_in, preflight, Status};
-        let ok = github_sign_in("Iv1.abc", "secret", false);
+        let ok = github_sign_in("Iv1.abc", "secret", false, false);
         assert_eq!((ok.key, ok.status), ("github_sign_in", Status::Pass));
         // An install's own app with no client stored: GitHub sign-in can't work.
-        let none = github_sign_in("", "", false);
+        let none = github_sign_in("", "", false, false);
         assert_eq!(none.status, Status::Warn);
         assert!(none.detail.contains("aren't stored"), "{}", none.detail);
         assert!(none
@@ -2617,27 +2631,34 @@ mod tests {
             .unwrap()
             .ends_with("github-app --force"));
         // Half a client is as broken as none, on either kind of install.
-        for hosted in [false, true] {
-            let half = github_sign_in("Iv1.abc", " ", hosted);
+        for (hosted, registered) in [(false, false), (true, false), (true, true)] {
+            let half = github_sign_in("Iv1.abc", " ", hosted, registered);
             assert_eq!(half.status, Status::Warn);
             assert!(
                 half.detail.contains("the secret is missing"),
                 "{}",
                 half.detail
             );
-            let half = github_sign_in("", "secret", hosted);
+            let half = github_sign_in("", "secret", hosted, registered);
             assert!(half.detail.contains("the id is missing"), "{}", half.detail);
         }
-        // Hybrid on CoderHelm's app: no client is expected, sign-in is email and password.
-        let hybrid = github_sign_in("", "", true);
-        assert_eq!(hybrid.status, Status::Skip);
+        // Hybrid on CoderHelm's app, registered: sign-in goes through CoderHelm.
+        let hybrid = github_sign_in("", "", true, true);
+        assert_eq!(hybrid.status, Status::Pass);
         assert!(
             hybrid.detail.contains("CoderHelm's GitHub App"),
             "{}",
             hybrid.detail
         );
+        // Not registered yet: off, with where to register.
+        let unregistered = github_sign_in("", "", true, false);
+        assert_eq!(unregistered.status, Status::Warn);
+        assert_eq!(
+            unregistered.fix.as_ref().unwrap().href.as_deref(),
+            Some("/settings/system/#hybrid")
+        );
         // A sign-in method is never a reason to hold back an update.
-        let blockers = preflight(&[none, hybrid], Some(&serde_json::json!({})));
+        let blockers = preflight(&[none, hybrid, unregistered], Some(&serde_json::json!({})));
         assert!(blockers.iter().all(|b| b.key != "github_sign_in"));
     }
 

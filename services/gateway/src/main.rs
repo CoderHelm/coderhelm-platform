@@ -1307,6 +1307,12 @@ async fn main() -> Result<(), Error> {
         .route("/google/callback", get(routes::auth::google_callback))
         .route("/github", get(routes::auth::github_login))
         .route("/github/callback", get(routes::auth::github_callback))
+        // An install's GitHub sign-in through CoderHelm's GitHub App comes
+        // back here (routes::github_hybrid).
+        .route(
+            "/github/hybrid-callback",
+            get(routes::github_hybrid::callback),
+        )
         // This deployment's GitHub App on GitHub (install, or configure).
         .route("/github/app", get(routes::github::app_install))
         // Hybrid linking: GitHub sign-in that proves an installation is yours.
@@ -1511,6 +1517,18 @@ fn hybrid_routes() -> Router<Arc<AppState>> {
             put(routes::hybrid::set_link_repos).delete(routes::hybrid::delete_link),
         )
         .route("/github/token", post(routes::hybrid::github_token))
+        // GitHub sign-in on an install through CoderHelm's GitHub App: this
+        // side carries the trip, the install decides who signs in
+        // (common::hybrid::github_sign_in).
+        .route("/github/sign-in/start", post(routes::hybrid::sign_in_start))
+        .route(
+            "/github/sign-in/exchange",
+            post(routes::hybrid::sign_in_exchange),
+        )
+        .route(
+            "/github/sign-in/revoke",
+            post(routes::hybrid::sign_in_revoke),
+        )
         .route("/jira/link-start", post(routes::hybrid_jira::link_start))
         .route("/jira/link", delete(routes::hybrid_jira::delete_link))
         .route("/jira/config", post(routes::hybrid_jira::config))
@@ -1669,6 +1687,108 @@ mod tests {
                 (StatusCode::UNAUTHORIZED, "signature_mismatch".into()),
                 "signed {signed_path}, sent to {sent_to}"
             );
+        }
+    }
+
+    /// An install's GitHub sign-in: only a request the install signed, for
+    /// that exact route, starts or finishes one at the hosted side.
+    #[tokio::test]
+    async fn only_a_signed_install_request_starts_or_finishes_a_github_sign_in() {
+        let app = Router::new()
+            .nest("/hybrid", hybrid_routes())
+            .with_state(hosted_state());
+        let body = br#"{"redirect_uri":"https://d1234.cloudfront.net/auth/github/hybrid-callback","state":"SSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSS","code_challenge":"cccccccccccccccccccccccccccccccccccccccccccc"}"#;
+        for path in [
+            "/hybrid/github/sign-in/start",
+            "/hybrid/github/sign-in/exchange",
+            "/hybrid/github/sign-in/revoke",
+        ] {
+            // Not signed at all (a browser, or anyone on the internet).
+            let req = Request::builder()
+                .method("POST")
+                .uri(path)
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_vec()))
+                .unwrap();
+            assert_eq!(
+                code_of(app.clone().oneshot(req).await.unwrap()).await,
+                (StatusCode::UNAUTHORIZED, "signature_missing".into()),
+                "{path}"
+            );
+            // Signed with a secret that isn't this install's.
+            let id = sign::new_install_id();
+            let other = sign::install_secret(MASTER, &sign::new_install_id());
+            let ts = chrono::Utc::now().timestamp();
+            let rid = common::hybrid::hosted_sig::new_request_id();
+            let req = Request::builder()
+                .method("POST")
+                .uri(path)
+                .header(sign::INSTALL_HEADER, id)
+                .header(sign::TIMESTAMP_HEADER, ts.to_string())
+                .header(
+                    sign::SIGNATURE_HEADER,
+                    sign::sign_request_v2(&other, ts, &rid, "POST", path, body),
+                )
+                .header(sign::REQUEST_ID_HEADER, rid)
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_vec()))
+                .unwrap();
+            assert_eq!(
+                code_of(app.clone().oneshot(req).await.unwrap()).await,
+                (StatusCode::UNAUTHORIZED, "signature_mismatch".into()),
+                "{path}"
+            );
+            // Signed for the other sign-in route.
+            let elsewhere = if path.ends_with("start") || path.ends_with("revoke") {
+                "/hybrid/github/sign-in/exchange"
+            } else {
+                "/hybrid/github/sign-in/start"
+            };
+            let res = app
+                .clone()
+                .oneshot(install_request("POST", elsewhere, path, body))
+                .await
+                .unwrap();
+            assert_eq!(
+                code_of(res).await,
+                (StatusCode::UNAUTHORIZED, "signature_mismatch".into()),
+                "{path}"
+            );
+            // Signed by the install: past the signature, at the store.
+            let res = app
+                .clone()
+                .oneshot(install_request("POST", path, path, body))
+                .await
+                .unwrap();
+            assert_eq!(
+                code_of(res).await,
+                (StatusCode::SERVICE_UNAVAILABLE, "store_unavailable".into()),
+                "{path}"
+            );
+        }
+    }
+
+    /// GitHub's return for an unknown or malformed sign-in flow goes nowhere:
+    /// no redirect to any install.
+    #[tokio::test]
+    async fn a_github_return_for_an_unknown_sign_in_flow_is_refused() {
+        let app = Router::new()
+            .route(
+                "/auth/github/callback/hybrid",
+                get(routes::hybrid::github_signin_return),
+            )
+            .with_state(hosted_state());
+        let known_shape = format!("hsi_{}", "a".repeat(40));
+        for state in ["hsi_short", "hsi_", known_shape.as_str()] {
+            let req = Request::builder()
+                .uri(format!(
+                    "/auth/github/callback/hybrid?code=c0de&state={state}"
+                ))
+                .body(Body::empty())
+                .unwrap();
+            let res = app.clone().oneshot(req).await.unwrap();
+            assert_eq!(res.status(), StatusCode::BAD_REQUEST, "{state}");
+            assert!(res.headers().get("location").is_none(), "{state}");
         }
     }
 }

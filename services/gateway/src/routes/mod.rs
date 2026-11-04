@@ -22,6 +22,7 @@ pub mod email;
 pub mod email_metrics;
 pub mod email_settings;
 pub mod github;
+pub mod github_hybrid;
 pub mod github_webhook;
 pub mod graph;
 pub mod hybrid;
