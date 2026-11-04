@@ -1023,7 +1023,7 @@ max_rows: 20
     fn threat_a_tool_that_reads_personal_data_is_refused() {
         let mut t = order_tool();
         t.read = "SELECT email FROM members WHERE number = :order_number".into();
-        assert!(validate(&t, &db_source()).unwrap_err()[0].contains("hidden column"));
+        assert!(validate(&t, &db_source()).unwrap_err()[0].contains("which is hidden"));
         t.read = "SELECT ip FROM members WHERE number = :order_number".into();
         assert!(validate(&t, &db_source()).is_err());
         // exact-name hiding doesn't catch unrelated columns

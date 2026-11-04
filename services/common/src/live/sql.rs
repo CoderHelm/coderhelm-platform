@@ -11,8 +11,9 @@ use std::collections::HashSet;
 use std::ops::ControlFlow;
 
 use sqlparser::ast::{
-    visit_expressions_mut, CastKind, Expr, FunctionArg, FunctionArgExpr, FunctionArguments,
-    ObjectName, Query, SetExpr, Statement, TableAlias, TableFactor, Visit, Visitor,
+    visit_expressions_mut, BinaryOperator, CastKind, Expr, FunctionArg, FunctionArgExpr,
+    FunctionArguments, ObjectName, Query, SetExpr, Statement, TableAlias, TableFactor,
+    UnaryOperator, Value, Visit, VisitMut, Visitor, VisitorMut,
 };
 use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser::parser::Parser;
@@ -323,6 +324,141 @@ impl Visitor for Scan {
     }
 }
 
+/// Takes out of a copy of the statement every check of whether a column has
+/// a value (`IS NULL`, `IS NOT NULL`, `= ''`, `<> ''`, `IN ('')`, also through
+/// `COALESCE(col, '')` / `NULLIF(col, '')`), where it only decides which rows
+/// count: in WHERE and HAVING, an aggregate's FILTER, and a CASE WHEN
+/// condition, through AND, OR, NOT and brackets only. What is left is checked
+/// for hidden columns as usual; the text sent is never changed.
+struct Presence;
+
+impl VisitorMut for Presence {
+    type Break = ();
+
+    fn pre_visit_query(&mut self, q: &mut Query) -> ControlFlow<()> {
+        scrub_body(&mut q.body);
+        ControlFlow::Continue(())
+    }
+
+    fn pre_visit_expr(&mut self, e: &mut Expr) -> ControlFlow<()> {
+        match e {
+            Expr::Function(f) => {
+                if let Some(filter) = f.filter.as_mut() {
+                    scrub(filter);
+                }
+            }
+            // `CASE col WHEN ...` compares the value itself.
+            Expr::Case {
+                operand: None,
+                conditions,
+                ..
+            } => {
+                for c in conditions {
+                    scrub(&mut c.condition);
+                }
+            }
+            _ => {}
+        }
+        ControlFlow::Continue(())
+    }
+}
+
+fn scrub_body(body: &mut SetExpr) {
+    match body {
+        SetExpr::Select(s) => {
+            if let Some(w) = s.selection.as_mut() {
+                scrub(w);
+            }
+            if let Some(h) = s.having.as_mut() {
+                scrub(h);
+            }
+        }
+        SetExpr::SetOperation { left, right, .. } => {
+            scrub_body(left);
+            scrub_body(right);
+        }
+        _ => {}
+    }
+}
+
+/// Replaces each presence check reachable through AND / OR / NOT / brackets
+/// with `TRUE`.
+fn scrub(e: &mut Expr) {
+    match e {
+        Expr::BinaryOp {
+            left,
+            op: BinaryOperator::And | BinaryOperator::Or,
+            right,
+        } => {
+            scrub(left);
+            scrub(right);
+        }
+        Expr::UnaryOp {
+            op: UnaryOperator::Not,
+            expr,
+        } => scrub(expr),
+        Expr::Nested(x) => scrub(x),
+        _ if is_presence(e) => *e = Expr::value(Value::Boolean(true)),
+        _ => {}
+    }
+}
+
+/// `col IS [NOT] NULL`, `col = ''`, `col <> ''`, `col [NOT] IN ('', ...)`.
+fn is_presence(e: &Expr) -> bool {
+    match e {
+        Expr::IsNull(x) | Expr::IsNotNull(x) => is_subject(x),
+        Expr::BinaryOp {
+            left,
+            op: BinaryOperator::Eq | BinaryOperator::NotEq,
+            right,
+        } => (is_subject(left) && is_empty(right)) || (is_empty(left) && is_subject(right)),
+        Expr::InList { expr, list, .. } => {
+            is_subject(expr) && !list.is_empty() && list.iter().all(is_empty)
+        }
+        _ => false,
+    }
+}
+
+/// A plain column, or `COALESCE(col, '')` / `NULLIF(col, '')`.
+fn is_subject(e: &Expr) -> bool {
+    match e {
+        Expr::Identifier(_) | Expr::CompoundIdentifier(_) => true,
+        Expr::Nested(x) => is_subject(x),
+        Expr::Function(f) => {
+            let n = last_name(&f.name);
+            if n != "coalesce" && n != "nullif" {
+                return false;
+            }
+            if f.filter.is_some() || f.over.is_some() {
+                return false;
+            }
+            let FunctionArguments::List(list) = &f.args else {
+                return false;
+            };
+            if list.duplicate_treatment.is_some() || !list.clauses.is_empty() {
+                return false;
+            }
+            let args: Vec<&Expr> = list
+                .args
+                .iter()
+                .filter_map(|a| match a {
+                    FunctionArg::Unnamed(FunctionArgExpr::Expr(x)) => Some(x),
+                    _ => None,
+                })
+                .collect();
+            args.len() == 2
+                && args.len() == list.args.len()
+                && matches!(args[0], Expr::Identifier(_) | Expr::CompoundIdentifier(_))
+                && is_empty(args[1])
+        }
+        _ => false,
+    }
+}
+
+fn is_empty(e: &Expr) -> bool {
+    matches!(e, Expr::Value(v) if v.value == Value::SingleQuotedString(String::new()))
+}
+
 /// Accepts one plain SELECT (WITH, joins, subqueries and aggregates are fine)
 /// that names no hidden column. Anything else is refused before it is sent.
 pub fn check_read_only_sql(sql: &str, hidden: &[String]) -> Result<CheckedSql, StepError> {
@@ -354,16 +490,24 @@ pub fn check_read_only_sql(sql: &str, hidden: &[String]) -> Result<CheckedSql, S
     }
 
     // A hidden column is refused wherever it appears (selected, filtered on,
-    // sorted by), so neither its value nor a guess at it comes back.
+    // sorted by, joined on), so neither its value nor a guess at it comes
+    // back. The one exception is asking whether it has a value at all
+    // ([`Presence`]): that says nothing about what the value is.
     // A column hidden in one table only (`person.name`) counts when the
     // lookup reads that table, wherever the column name appears in it: the
     // rows that come back carry column names, not tables.
     let terms = hidden_terms_for(hidden, &scan.refs);
-    if let Some(col) = scan.idents.iter().find(|i| is_hidden(i, &terms)) {
+    let mut scrubbed = stmt.clone();
+    let _ = VisitMut::visit(&mut scrubbed, &mut Presence);
+    let mut uses = Scan::default();
+    let _ = scrubbed.visit(&mut uses);
+    if let Some(col) = uses.idents.iter().find(|i| is_hidden(i, &terms)) {
         return Err(StepError::new(
             "read_only",
-            format!("That lookup uses a hidden column ({col})."),
-            "Hidden columns can't be read or filtered on. Remove it from the lookup. Nothing was sent.",
+            format!(
+                "That lookup uses {col}, which is hidden. You can check whether it has a value (IS NULL / IS NOT NULL / = ''), not what it is."
+            ),
+            "Hidden columns can't be read, compared, joined, grouped or sorted on; only whether they have a value can be checked. Nothing was sent.",
         ));
     }
     // `SELECT u FROM users u` returns the whole row as one value, which would
@@ -771,9 +915,64 @@ mod tests {
             "SELECT lower(email) AS x FROM users",
             "SELECT id FROM users WHERE email LIKE 'a%'",
             "SELECT id FROM users ORDER BY contact_email",
-            "SELECT id FROM users WHERE id IN (SELECT id FROM users WHERE work_email IS NOT NULL)",
+            "SELECT id FROM users WHERE id IN (SELECT work_email FROM users)",
         ] {
-            assert!(no(sql).contains("hidden column"), "{sql}");
+            assert!(no(sql).contains("which is hidden"), "{sql}");
+        }
+    }
+
+    #[test]
+    fn whether_a_hidden_column_has_a_value_may_be_checked() {
+        for sql in [
+            "SELECT count(*) FILTER (WHERE email IS NOT NULL AND email <> '') AS with_email FROM member_profile WHERE zoho_contact_id IS NULL OR zoho_contact_id = ''",
+            "SELECT count(*) FROM users WHERE email IS NULL",
+            "SELECT count(*) FROM users WHERE NOT (email IS NULL OR email = '')",
+            "SELECT count(*) FROM users WHERE '' <> email",
+            "SELECT count(*) FROM users WHERE email != ''",
+            "SELECT count(*) FROM users WHERE email NOT IN ('')",
+            "SELECT count(*) FROM users WHERE COALESCE(email, '') <> ''",
+            "SELECT count(*) FROM users WHERE NULLIF(email, '') IS NULL",
+            "SELECT count(*) FROM users u WHERE u.email IS NOT NULL",
+            "SELECT count(*) FROM users WHERE \"email\" IS NOT NULL",
+            "SELECT id FROM users WHERE id IN (SELECT id FROM users WHERE work_email IS NOT NULL)",
+            "SELECT id FROM users u WHERE EXISTS (SELECT 1 FROM users v WHERE v.id = u.id AND v.email IS NULL)",
+            "SELECT status, count(*) FROM users GROUP BY status HAVING count(*) FILTER (WHERE email IS NULL) > 0",
+            "SELECT sum(CASE WHEN email IS NOT NULL AND email <> '' THEN 1 ELSE 0 END) FROM users",
+            "SELECT count(*) FROM users WHERE email IS NULL UNION ALL SELECT count(*) FROM users WHERE email = ''",
+        ] {
+            ok(sql);
+        }
+    }
+
+    #[test]
+    fn anything_beyond_whether_it_has_a_value_stays_refused() {
+        for sql in [
+            "SELECT email FROM users",
+            "SELECT email IS NULL FROM users",
+            "SELECT CASE email WHEN '' THEN 1 END FROM users",
+            "SELECT count(*) FROM users WHERE email = 'a@example.com'",
+            "SELECT count(*) FROM users WHERE email > 'm'",
+            "SELECT count(*) FROM users WHERE email IN ('', 'a@example.com')",
+            "SELECT count(*) FROM users WHERE email LIKE 'a%'",
+            "SELECT count(*) FROM users WHERE email ILIKE '%@example.com'",
+            "SELECT count(*) FROM users WHERE email IS NOT NULL AND email LIKE 'a%'",
+            "SELECT count(*) FILTER (WHERE email IS NOT NULL AND email LIKE 'a%') FROM users",
+            "SELECT count(*) FROM users WHERE length(email) > 10",
+            "SELECT count(*) FROM users WHERE lower(email) = ''",
+            "SELECT count(*) FROM users WHERE md5(email) = ''",
+            "SELECT count(*) FROM users WHERE substring(email, 1, 1) = ''",
+            "SELECT count(*) FROM users WHERE CAST(email AS TEXT) = ''",
+            "SELECT count(*) FROM users WHERE COALESCE(email, 'x') = ''",
+            "SELECT count(*) FROM users a JOIN users b ON a.email = b.email",
+            "SELECT count(*) FROM users a JOIN users b ON a.id = b.id AND a.email IS NULL",
+            "SELECT count(*) FROM users GROUP BY email",
+            "SELECT id FROM users WHERE email IS NOT NULL ORDER BY email",
+            "SELECT DISTINCT email FROM users",
+            "SELECT count(DISTINCT email) FROM users",
+            "SELECT row_number() OVER (PARTITION BY email) FROM users",
+            "SELECT id FROM users WHERE id IN (SELECT id FROM users WHERE email LIKE 'a%')",
+        ] {
+            assert!(no(sql).contains("which is hidden"), "{sql}");
         }
     }
 
@@ -862,7 +1061,7 @@ mod tests {
         ] {
             let e = check_read_only_sql(sql, &hidden).unwrap_err();
             assert!(
-                e.message.contains("hidden column (name)"),
+                e.message.contains("uses name, which is hidden"),
                 "{sql}: {}",
                 e.message
             );
