@@ -6467,23 +6467,17 @@ async fn create_run_record(
     put.send().await?;
     self::webhooks::emit_run(state, &msg.team_id, run_id, "running").await;
 
-    // Increment analytics counters (current month + all-time). A counter is
-    // best effort: it must never stop a run whose record is already written.
-    let month = chrono::Utc::now().format("%Y-%m").to_string();
-    for period in &[month.as_str(), "ALL_TIME"] {
-        if let Err(e) = state
-            .dynamo
-            .update_item()
-            .table_name(&state.config.analytics_table_name)
-            .key("team_id", attr_s(&msg.team_id))
-            .key("period", attr_s(period))
-            .update_expression("ADD total_runs :one")
-            .expression_attribute_values(":one", attr_n(1))
-            .send()
-            .await
-        {
-            warn!(run_id, period, error = %common::run_fail::error_text(&e), "Could not count the run");
-        }
+    // Count the run on the team's month and all-time items, once per run id
+    // (a redelivered message writes the record again but is not a new run).
+    // Best effort: a counter must never stop a run whose record is written.
+    let counts = common::team_counts::DynamoCounts {
+        dynamo: state.dynamo.clone(),
+        table: state.config.analytics_table_name.clone(),
+    };
+    if let Err(e) =
+        common::team_counts::count_run_started(&counts, &msg.team_id, run_id, &now).await
+    {
+        warn!(run_id, error = %e, "Could not count the run");
     }
 
     Ok(())

@@ -825,7 +825,7 @@ async fn send_reply(
         },
     )
     .await;
-    record_review_usage(state, &msg.team_id, Some(&record_sk), usage).await;
+    record_review_usage(state, &msg.team_id, &record_sk, usage).await;
     note_review_standards(state, &msg.team_id, &record_sk, applied_standards).await;
     info!(pr = msg.pr_number, "Reviewer answered a question");
     Ok(())
@@ -1231,7 +1231,6 @@ async fn run_once(
                 // the person on the PR. With no run to hand it to, the reviewer
                 // answers instead, so the person is never left unanswered.
                 if forward_ask_to_fix_loop(state, &msg, &comment).await {
-                    record_review_usage(state, &msg.team_id, None, &usage).await;
                     return Ok(DONE);
                 }
             }
@@ -1457,7 +1456,6 @@ async fn run_once(
         let mut answer = match answer {
             Ok(a) => a,
             Err(e) => {
-                record_review_usage(state, &msg.team_id, None, &usage).await;
                 return Err(format!("the model call failed: {e}").into());
             }
         };
@@ -1539,7 +1537,6 @@ async fn run_once(
                 standing = ?standing,
                 "Reply conclusion differs from the standing verdict; formal review runs first"
             );
-            record_review_usage(state, &msg.team_id, None, &usage).await;
             return Ok(Outcome::ReviewThenReply {
                 review: Box::new(reconcile_message(&msg, &head_sha, &reason)),
                 reply: Box::new(PendingReply {
@@ -2124,7 +2121,6 @@ async fn run_once(
     let output = match output {
         Ok(o) => o,
         Err(reason) => {
-            record_review_usage(state, &msg.team_id, None, &usage).await;
             return Err(reason.into());
         }
     };
@@ -2660,8 +2656,6 @@ async fn run_once(
             live_job.not_posted(
                 "a newer commit was pushed while reviewing; its own review covers the latest code.",
             );
-            // The tokens were still spent: count them against the team.
-            record_review_usage(state, &msg.team_id, None, &usage).await;
             return Ok(DONE);
         }
     }
@@ -2856,7 +2850,7 @@ async fn run_once(
         },
     )
     .await;
-    record_review_usage(state, &msg.team_id, Some(&record_sk), &usage).await;
+    record_review_usage(state, &msg.team_id, &record_sk, &usage).await;
     if let Some(s) = &skills {
         note_review_standards(state, &msg.team_id, &record_sk, &s.applied_names()).await;
     }
@@ -3714,6 +3708,25 @@ async fn store_review_record(
     {
         warn!(pr = msg.pr_number, error = %e, "Failed to persist review stats (non-fatal)");
     }
+    // The PR on the team's "PRs reviewed" count (once per month and once in
+    // all time). Every stored review passes here, so every path counts.
+    let team_counts = common::team_counts::DynamoCounts {
+        dynamo: state.dynamo.clone(),
+        table: state.config.analytics_table_name.clone(),
+    };
+    if let Err(e) = common::team_counts::count_review(
+        &team_counts,
+        &msg.team_id,
+        &repo,
+        msg.pr_number,
+        verdict,
+        counts.posted,
+        &created_at,
+    )
+    .await
+    {
+        warn!(pr = msg.pr_number, error = %e, "Failed to count the reviewed PR (non-fatal)");
+    }
     sk
 }
 
@@ -3816,60 +3829,41 @@ fn has_usage(usage: &TokenUsage) -> bool {
     usage.total_tokens() > 0
 }
 
-/// Persist what a review used on its REVIEW# record and count the review on the
-/// team's analytics item. Its tokens and cost reach the team's counters per
-/// model call (common::usage), so they are not added again here.
+/// Persist what a review used on its REVIEW# record. Its tokens and cost
+/// reach the team's counters per model call (common::usage), and the PR is
+/// counted where the review is stored (`store_review_record`), so nothing is
+/// added to the team's analytics items here.
 async fn record_review_usage(
     state: &WorkerState,
     team_id: &str,
-    record_sk: Option<&str>,
+    record_sk: &str,
     usage: &TokenUsage,
 ) {
     if !has_usage(usage) {
         return;
     }
     let cost = review_cost_str(usage);
-    if let Some(sk) = record_sk {
-        if let Err(e) = state
-            .dynamo
-            .update_item()
-            .table_name(&state.config.settings_table_name)
-            .key("pk", attr_s(team_id))
-            .key("sk", attr_s(sk))
-            // Never create a partial record if the put above failed.
-            .condition_expression("attribute_exists(sk)")
-            .update_expression(
-                "SET tokens_in = :ti, tokens_out = :to, cache_read_tokens = :crt, \
-                 cache_write_tokens = :cwt, cost_usd = :c",
-            )
-            .expression_attribute_values(":ti", attr_n(usage.input_tokens))
-            .expression_attribute_values(":to", attr_n(usage.output_tokens))
-            .expression_attribute_values(":crt", attr_n(usage.cache_read_tokens))
-            .expression_attribute_values(":cwt", attr_n(usage.cache_write_tokens))
-            .expression_attribute_values(":c", attr_n(&cost))
-            .send()
-            .await
-        {
-            warn!(error = %aws_sdk_dynamodb::error::DisplayErrorContext(&e), "Failed to store review cost (non-fatal)");
-        }
-    }
-    let month = chrono::Utc::now().format("%Y-%m").to_string();
-    for period in [month.as_str(), "ALL_TIME"] {
-        if let Err(e) = state
-            .dynamo
-            .update_item()
-            .table_name(&state.config.analytics_table_name)
-            .key("team_id", attr_s(team_id))
-            .key("period", attr_s(period))
-            // Tokens and cost are already counted per model call
-            // (common::usage, feature "review"); only the review count here.
-            .update_expression("ADD reviews :one")
-            .expression_attribute_values(":one", attr_n(1))
-            .send()
-            .await
-        {
-            warn!(error = %aws_sdk_dynamodb::error::DisplayErrorContext(&e), "Failed to add review cost to team usage (non-fatal)");
-        }
+    if let Err(e) = state
+        .dynamo
+        .update_item()
+        .table_name(&state.config.settings_table_name)
+        .key("pk", attr_s(team_id))
+        .key("sk", attr_s(record_sk))
+        // Never create a partial record if the put above failed.
+        .condition_expression("attribute_exists(sk)")
+        .update_expression(
+            "SET tokens_in = :ti, tokens_out = :to, cache_read_tokens = :crt, \
+             cache_write_tokens = :cwt, cost_usd = :c",
+        )
+        .expression_attribute_values(":ti", attr_n(usage.input_tokens))
+        .expression_attribute_values(":to", attr_n(usage.output_tokens))
+        .expression_attribute_values(":crt", attr_n(usage.cache_read_tokens))
+        .expression_attribute_values(":cwt", attr_n(usage.cache_write_tokens))
+        .expression_attribute_values(":c", attr_n(&cost))
+        .send()
+        .await
+    {
+        warn!(error = %aws_sdk_dynamodb::error::DisplayErrorContext(&e), "Failed to store review cost (non-fatal)");
     }
 }
 

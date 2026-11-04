@@ -238,7 +238,7 @@ impl ReviewRow {
     /// A review someone saw on the PR: not an answer to a question, and not
     /// a re-review that found nothing new and so posted nothing.
     fn is_posted_review(&self) -> bool {
-        self.posted && self.verdict != "QUESTION"
+        common::team_counts::counts_as_review(&self.verdict, self.posted)
     }
     /// What GitHub shows: the verdict can be an approval posted as a plain
     /// comment. Records from before `posted_as` was kept fall back to it.

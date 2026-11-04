@@ -103,8 +103,11 @@ pub struct TeamFacts {
     pub members: Vec<MemberFact>,
     pub invites: u64,
     pub repos: Vec<String>,
+    /// Runs started (agent and plugin runs), ever and this month.
     pub runs_total: u64,
     pub runs_month: u64,
+    /// Pull requests the reviewer posted a review on, ever and this month
+    /// (each PR once; answers to questions are not reviews).
     pub reviews_total: u64,
     pub reviews_month: u64,
     pub cost_month_usd: f64,
@@ -607,6 +610,29 @@ fn is_invite(i: &Item) -> bool {
     text(i, "status") == "invited"
 }
 
+/// A team's run and review counts, read from its analytics items (the
+/// `ALL_TIME` item and this month's). `common::team_counts` adds to them,
+/// once per run and once per reviewed pull request and period.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Activity {
+    pub runs_total: u64,
+    pub runs_month: u64,
+    pub prs_reviewed_total: u64,
+    pub prs_reviewed_month: u64,
+}
+
+impl Activity {
+    pub fn from_items(all: &Option<Item>, this_month: &Option<Item>) -> Self {
+        use common::team_counts::{PRS_REVIEWED, RUNS};
+        Self {
+            runs_total: num(all, RUNS) as u64,
+            runs_month: num(this_month, RUNS) as u64,
+            prs_reviewed_total: num(all, PRS_REVIEWED) as u64,
+            prs_reviewed_month: num(this_month, PRS_REVIEWED) as u64,
+        }
+    }
+}
+
 /// One team's facts from its records.
 async fn team_facts(
     state: &AppState,
@@ -683,6 +709,7 @@ async fn team_facts(
         ),
         repos,
     );
+    let activity = Activity::from_items(&all, &this_month);
     let m = |k: &str| meta.as_ref().map(|i| text(i, k)).unwrap_or_default();
     let tm = |k: &str| teams_meta.map(|i| text(i, k)).unwrap_or_default();
     let or = |a: String, b: String| if a.is_empty() { b } else { a };
@@ -716,10 +743,10 @@ async fn team_facts(
             .collect(),
         invites: members.iter().filter(|i| is_invite(i)).count() as u64,
         repos,
-        runs_total: num(&all, "total_runs") as u64,
-        runs_month: num(&this_month, "total_runs") as u64,
-        reviews_total: num(&all, "reviews") as u64,
-        reviews_month: num(&this_month, "reviews") as u64,
+        runs_total: activity.runs_total,
+        runs_month: activity.runs_month,
+        reviews_total: activity.prs_reviewed_total,
+        reviews_month: activity.prs_reviewed_month,
         cost_month_usd: num(&this_month, "total_cost_usd"),
         tokens_month: num(&this_month, "total_tokens") as u64,
     }
@@ -1090,6 +1117,95 @@ pub async fn admin_dlq_delete(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A fixture team's records go through the same counting the worker and
+    /// the plugin runner do, and the page then shows what the records say:
+    /// every run once, and every pull request with a posted review once per
+    /// month and once in all.
+    #[tokio::test]
+    async fn the_counts_match_the_team_s_runs_and_reviews() {
+        use common::team_counts::{self as tc, MemoryCounts, ALL_TIME};
+        const T: &str = "TEAM#acme";
+        let store = MemoryCounts::default();
+
+        // Runs: an agent run whose message was delivered twice, one from last
+        // month, and a plugin run written at each status.
+        let runs = [
+            ("01JRUNA", "2026-11-02T09:00:00Z"),
+            ("01JRUNA", "2026-11-02T09:00:00Z"),
+            ("01JRUNB", "2026-10-28T09:00:00Z"),
+            ("01JPLUG", "2026-11-03T09:00:00Z"),
+            ("01JPLUG", "2026-11-03T09:00:00Z"),
+            ("01JPLUG", "2026-11-03T09:00:00Z"),
+        ];
+        for (id, at) in runs {
+            tc::count_run_started(&store, T, id, at).await.unwrap();
+        }
+
+        // Review records: (repo, pr, verdict, posted, created_at).
+        let reviews = [
+            (
+                "acme/web",
+                7,
+                "REQUEST_CHANGES",
+                true,
+                "2026-10-20T10:00:00Z",
+            ),
+            ("acme/web", 7, "APPROVE", true, "2026-11-01T10:00:00Z"),
+            ("acme/web", 7, "APPROVE", true, "2026-11-02T10:00:00Z"),
+            ("acme/web", 8, "QUESTION", true, "2026-11-02T11:00:00Z"),
+            ("acme/web", 9, "COMMENT", false, "2026-11-02T12:00:00Z"),
+            ("acme/api", 7, "COMMENT", true, "2026-11-03T12:00:00Z"),
+            ("acme/api", 12, "APPROVE", true, "2026-09-03T12:00:00Z"),
+        ];
+        for (repo, pr, verdict, posted, at) in reviews {
+            tc::count_review(&store, T, repo, pr, verdict, posted, at)
+                .await
+                .unwrap();
+        }
+
+        let got = Activity::from_items(&store.item(T, ALL_TIME), &store.item(T, "2026-11"));
+
+        // What the records say, counted directly.
+        let distinct_runs = |month: Option<&str>| {
+            runs.iter()
+                .filter(|(_, at)| month.is_none_or(|m| at.starts_with(m)))
+                .map(|(id, _)| *id)
+                .collect::<HashSet<_>>()
+                .len() as u64
+        };
+        let prs = |month: Option<&str>| {
+            reviews
+                .iter()
+                .filter(|(_, _, v, p, at)| {
+                    tc::counts_as_review(v, *p) && month.is_none_or(|m| at.starts_with(m))
+                })
+                .map(|(r, n, ..)| (*r, *n))
+                .collect::<HashSet<_>>()
+                .len() as u64
+        };
+        let want = Activity {
+            runs_total: distinct_runs(None),
+            runs_month: distinct_runs(Some("2026-11")),
+            prs_reviewed_total: prs(None),
+            prs_reviewed_month: prs(Some("2026-11")),
+        };
+        assert_eq!(got, want);
+        assert_eq!(
+            want,
+            Activity {
+                runs_total: 3,
+                runs_month: 2,
+                prs_reviewed_total: 3,
+                prs_reviewed_month: 2,
+            }
+        );
+    }
+
+    #[test]
+    fn a_team_with_no_analytics_items_has_no_activity() {
+        assert_eq!(Activity::from_items(&None, &None), Activity::default());
+    }
 
     fn member(id: &str, email: &str) -> MemberFact {
         MemberFact {

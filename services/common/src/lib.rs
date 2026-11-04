@@ -137,6 +137,8 @@ pub mod skills;
 /// Who may ask CoderHelm for work from a GitHub comment or review.
 pub mod standing;
 pub mod stop_rules;
+/// A team's run and PR-reviewed counts, each added exactly once.
+pub mod team_counts;
 /// A ticket's comments as CoderHelm read them, and whether its work is done.
 pub mod ticket_state;
 /// A team's monthly token limits: new tokens, cache read, cache write.
