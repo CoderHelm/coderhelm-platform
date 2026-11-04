@@ -32,25 +32,31 @@ Each person gets at most one set-up email an hour and five a week, however it wa
 
 ### Forgot password
 
-**Forgot password** on the sign-in page says plainly what happened for the email typed in:
+**Forgot password** on the sign-in page gives everyone the same answer, whatever the email typed in: "If the email can sign in here, we've sent a reset code or a set-up link." The page then asks for the reset code, with a note that a set-up link may have come instead. It never says whether the email has an account, is on the team, is invited, or isn't on the install, so it can't be used to find out who is.
 
-| The email | What happens | What the page says |
-|---|---|---|
-| Has an account here | Amazon Cognito sends a reset code | We sent a reset code to the email. |
-| On the team, no account here yet (moved from another CoderHelm) | The set-up email goes instead | You don't have an account here yet. We sent you a set-up link instead. |
-| Invited, not signed up yet | Nothing is sent | Use the link in the invite email, or ask an admin to send it again. |
-| Not on this install | Nothing is sent | There's no account for the email on this CoderHelm. Ask an admin to add you. |
+What is sent depends on the email:
 
-Because the page says whether an email has an account, it's limited so it can't be used to check addresses quickly: ten asks an hour from one network address, and five an hour for one email.
+| The email | What is sent |
+|---|---|
+| Has an account here | Amazon Cognito sends a reset code |
+| On the team, no account here yet (moved from another CoderHelm) | The set-up email (at most one an hour and five a week, as above) |
+| Invited, not signed up yet | Nothing (their invite email has the link; an admin can send it again) |
+| Not on this install | Nothing |
+
+The answer takes the same time for every email too: the work happens while the page waits a fixed couple of seconds, so a slow send can't be told apart from no send. If a send fails, the page still gives the same answer; the failure is in the gateway's log, and set-up emails show in **Settings, Deliveries**.
+
+Forgot password is limited to ten asks an hour from one network address and five an hour for one email, for every email alike.
+
+The account form behaves the same way on a self-hosted install: whether the email is invited, already has an account, or isn't let in, it says "If that email can join here, we've sent a verification code." A code goes only to an invited email, one at an allowed domain, or one that signed up before and never entered its code. Someone who already has an account gets nothing new: they sign in, or use **Forgot password**. The password rules (at least 8 characters, with an upper-case letter, a lower-case letter and a number) are checked for every email alike.
 
 ### Where these emails come from
 
-The emails come from two different senders. After sending, the sign-in page names the one to look for, so a person can ask IT to let it through a mail filter (Mimecast, Proofpoint, Microsoft Defender and so on):
+The emails come from two different senders. The sign-in page names both after **Forgot password**, so a person can ask IT to let them through a mail filter (Mimecast, Proofpoint, Microsoft Defender and so on):
 
 - **Reset codes** come from Amazon Cognito: `no-reply@verificationemail.com` while the user pool sends its own email (the default), or the install's own address once `email.cognitoUsesSes` is on (see [Email](./email.md#sign-up-and-password-emails)). CoderHelm reads this from the user pool's email settings.
 - **Set-up and invite emails** come from the install's own email: its Amazon SES address, or the address of CoderHelm's mail relay when the install sends through it (**Settings, Email**).
 
-If someone says the email never came, check **Settings, Deliveries** for set-up emails, then ask IT to search for, and allow, the sender above.
+If someone says the email never came, check **Settings, Deliveries** for set-up emails, then ask IT to search for, and allow, the senders above.
 
 ### At install time
 

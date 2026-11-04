@@ -3753,7 +3753,8 @@ mod tests {
         let auth = include_str!("auth.rs");
         // Email sign-up: refused before Cognito is asked.
         let signup = body(auth, "signup");
-        assert!(before(signup, "sign_in::may_sign_up", ".sign_up()"));
+        assert!(before(signup, "sign_in::may_sign_up", "cognito_sign_up("));
+        assert!(body(auth, "cognito_sign_up").contains(".sign_up()"));
         assert!(signup.contains("UserLambdaValidationException"));
         // Email confirmation makes no personal team.
         let verify = body(auth, "verify_email");
