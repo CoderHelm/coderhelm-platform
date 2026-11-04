@@ -7,9 +7,15 @@ Actions (the `action` field of the event):
             build when auto-update allows it (on, in the maintenance window,
             and not a major release while majors need an admin).
 - status    for the dashboard and the CLI: current and latest version,
-            release notes, settings, history.
+            release notes, settings, history. Reads GitHub's release list
+            again when the copy is over FRESH_SECONDS old (opening Settings,
+            System), or now with `refresh` (Check for updates); at most one
+            read per FETCH_GAP_SECONDS, conditional on the ETag. A release
+            latest.json names that the list lacks is never undercut: no
+            older one is offered meanwhile.
 - settings  saves auto-update settings (validated).
-- update_now  starts the update build for a version (default: the latest).
+- update_now  starts the update build for a version (default: the latest,
+            read from GitHub at that moment).
             Only a version newer than the one running: going back is a
             rollback.
 - rollback  starts the build for the version before the last update, or an
@@ -92,11 +98,21 @@ logger.setLevel(logging.INFO)
 DAYS = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
 CHANNELS = ("stable", "preview")
 MAJORS = ("ask", "auto")
+# The hourly check reads GitHub's release list when its copy is this old.
 CACHE_SECONDS = 3600
+# Settings, System reads it again when its copy is older than this.
+FRESH_SECONDS = 120
+# At most one read of GitHub (or latest.json) per this many seconds per
+# install, whoever asks: page reloads and Check for updates can't hammer it.
+FETCH_GAP_SECONDS = 30
+# A release the install knows of (latest.json, or seen before) that the list
+# lacks for this long is taken as withdrawn.
+BEHIND_SECONDS = 24 * 3600
 # A release list not refreshed for this long is shown as stale.
 STALE_SECONDS = 3 * 24 * 3600
 RELEASE_REPO = "CoderHelm/coderhelm-platform"
 RELEASES_URL = f"https://api.github.com/repos/{RELEASE_REPO}/releases?per_page=30"
+LATEST_URL = "https://coderhelm-public.s3.amazonaws.com/launch/latest.json"
 RUNNING_STALE = timedelta(hours=3)
 # Who started an update when the call names no one: the dashboard always
 # sends the signed-in admin, the install guide and the auto-update window name
@@ -324,17 +340,49 @@ def check_repo(repo):
     return repo
 
 
-def fetch_releases(repo):
+class NotModified(Exception):
+    """The copy this install holds is still current (HTTP 304 to If-None-Match)."""
+
+
+class Fetched(list):
+    """A release list with the ETag GitHub sent for it."""
+    etag = None
+
+
+def read_json(url, etag=None, opener=None):
+    """GET `url` as JSON, conditionally when `etag` is known: (body, etag),
+    or NotModified. A 304 costs no GitHub API quota."""
+    headers = {"accept": "application/vnd.github+json", "user-agent": "coderhelm-updater"}
+    if etag:
+        headers["if-none-match"] = etag
+    req = urllib.request.Request(url, headers=headers)
+    try:
+        with (opener or urllib.request.urlopen)(req, timeout=10) as r:
+            return json.loads(r.read()), r.headers.get("etag"), r.geturl()
+    except urllib.error.HTTPError as e:
+        if e.code == 304:
+            raise NotModified() from None
+        raise
+
+
+def fetch_releases(repo, etag=None, opener=None):
     check_repo(repo)
-    req = urllib.request.Request(
-        RELEASES_URL,
-        headers={"accept": "application/vnd.github+json", "user-agent": "coderhelm-updater"},
-    )
-    with urllib.request.urlopen(req, timeout=10) as r:
-        # A redirect anywhere but GitHub's API over HTTPS is refused.
-        if not r.geturl().startswith("https://api.github.com/"):
-            raise ValueError(f"the release list came from {r.geturl()}")
-        return json.loads(r.read())
+    body, tag, at = read_json(RELEASES_URL, etag, opener)
+    # A redirect anywhere but GitHub's API over HTTPS is refused.
+    if not at.startswith("https://api.github.com/"):
+        raise ValueError(f"the release list came from {at}")
+    out = Fetched(body)
+    out.etag = tag
+    return out
+
+
+def fetch_latest(etag=None, opener=None):
+    """launch/latest.json: the newest stable release, moved only after the
+    release workflow checked it. A hint of what exists, never what is trusted."""
+    body, tag, at = read_json(LATEST_URL, etag, opener)
+    if not at.startswith(f"https://{NATIVE_HOST}/launch/"):
+        raise ValueError(f"latest.json came from {at}")
+    return {"version": (body or {}).get("version"), "etag": tag}
 
 
 def newest(releases):
@@ -349,18 +397,64 @@ def newest(releases):
     return best
 
 
-def releases_cached(store, repo, now_ts, fetch=fetch_releases):
-    cached = store.get("RELEASES_CACHE", {})
-    if cached and now_ts - cached.get("fetched_at", 0) < CACHE_SECONDS:
+def due(doc, now_ts, max_age):
+    """Whether a cached read should be made again: older than `max_age`, and
+    no read (or failed try) in the last FETCH_GAP_SECONDS, whoever asked."""
+    if not doc:
+        return True
+    last = max(doc.get("fetched_at") or 0, doc.get("attempted_at") or 0)
+    if now_ts - last < FETCH_GAP_SECONDS:
+        return False
+    return now_ts - (doc.get("fetched_at") or 0) >= max_age
+
+
+def latest_hint(store, now_ts, max_age, read=None):
+    """The version latest.json names (cached like the release list), or None."""
+    doc = store.get("RELEASE_HINT", {}) or {}
+    if read is None or not due(doc, now_ts, max_age):
+        return doc.get("version")
+    try:
+        got = read(etag=doc.get("etag")) if doc.get("etag") else read()
+        v = got.get("version")
+        if parse_version(v) and not (doc.get("version") and compare(v, doc["version"]) < 0):
+            doc.update(version=v, etag=got.get("etag"))
+        doc["fetched_at"] = now_ts
+    except NotModified:
+        doc["fetched_at"] = now_ts
+    except Exception as e:  # a hint only: the release list still decides
+        logger.warning(f"Could not read latest.json: {e}")
+    doc["attempted_at"] = now_ts
+    store.put("RELEASE_HINT", doc)
+    return doc.get("version")
+
+
+def releases_cached(store, repo, now_ts, fetch=fetch_releases, max_age=CACHE_SECONDS, newer=None):
+    """The release list, read again when older than `max_age` (the hourly
+    check: an hour; Settings, System: FRESH_SECONDS; Check for updates and
+    Update now: 0), or when `newer` (latest.json) names a version the copy
+    doesn't have. At most one read per FETCH_GAP_SECONDS per install, and
+    each one conditional on the ETag, so page loads can't use up GitHub's quota."""
+    cached = store.get("RELEASES_CACHE", {}) or {}
+    wait = due(cached, now_ts, max_age)
+    if not wait and newer and cached and parse_version(newer):
+        top = newest(cached.get("releases"))
+        wait = (top is None or compare(newer, top) > 0) and due(cached, now_ts, 0)
+    if not wait:
         return cached.get("releases", [])
+    etag = cached.get("etag") if cached.get("releases") is not None else None
     try:
         check_repo(repo)
+        got = fetch(repo, etag=etag) if etag else fetch(repo)
         rel = [
             {k: r.get(k) for k in ("tag_name", "prerelease", "draft", "body", "published_at", "html_url")}
-            for r in fetch(repo)
+            for r in got
         ]
+    except NotModified:
+        store.put("RELEASES_CACHE", dict(cached, fetched_at=now_ts, attempted_at=now_ts, error=None))
+        return cached.get("releases", [])
     except Exception as e:  # GitHub down: keep the old list
         logger.warning(f"Could not read releases: {e}")
+        store.put("RELEASES_CACHE", dict(cached, attempted_at=now_ts, error=fit(str(e), 200)))
         return cached.get("releases", [])
     # Freshness: a list without the newest version seen before is either a
     # stale copy or a release that was withdrawn. Either way it can only hold
@@ -368,7 +462,8 @@ def releases_cached(store, repo, now_ts, fetch=fetch_releases):
     # the list is used as it is, and admins see why it looks older.
     seen = cached.get("newest_seen") if cached else None
     top = newest(rel)
-    doc = {"fetched_at": now_ts, "releases": rel, "newest_seen": top or seen}
+    doc = {"fetched_at": now_ts, "attempted_at": now_ts, "releases": rel, "newest_seen": top or seen,
+           "etag": getattr(got, "etag", None), "behind_since": cached.get("behind_since")}
     if seen and (top is None or compare(top, seen) < 0):
         logger.warning(f"Release list looks stale: newest is {top}, {seen} was seen before")
         doc.update(newest_seen=seen, stale_reason=f"GitHub's release list no longer shows {seen} (withdrawn, or a stale copy)")
@@ -376,14 +471,50 @@ def releases_cached(store, repo, now_ts, fetch=fetch_releases):
     return rel
 
 
-def releases_freshness(store, now_ts):
-    """Whether the release list is current: {fetched_at, stale, reason}."""
+def known_newest(store, hint, channel):
+    """The newest release this install knows exists for its channel: what
+    latest.json names (stable) or the newest the release list ever showed."""
+    seen = (store.get("RELEASES_CACHE", {}) or {}).get("newest_seen")
+    best = hint if parse_version(hint) else None
+    p = parse_version(seen)
+    if p and (channel == "preview" or not p[3]) and (best is None or compare(seen, best) > 0):
+        best = seen
+    return best
+
+
+def offer(store, rel, settings, current, now_ts, hint=None):
+    """The release to offer, or None, and `behind` when the list lacks a
+    newer release the install knows of. Then nothing is offered: never vN
+    while vN+1 is out. A newer one missing for over BEHIND_SECONDS is taken
+    as withdrawn, and the list is used as it is (its staleness shown)."""
+    latest = pick_latest(rel, settings["channel"], current)
+    known = known_newest(store, hint, settings["channel"])
+    lagging = bool(known and parse_version(current) and compare(known, current) > 0
+                   and (latest is None or compare(latest["version"], known) < 0))
+    cached = store.get("RELEASES_CACHE", {}) or {}
+    since = cached.get("behind_since") if lagging else None
+    if lagging and not since:
+        since = now_ts
+    if (cached.get("behind_since") or None) != since and cached:
+        store.put("RELEASES_CACHE", dict(cached, behind_since=since))
+    if lagging and now_ts - since < BEHIND_SECONDS:
+        behind = {"version": known,
+                  "reason": f"{known} is out, but GitHub's release list doesn't show it yet; it shows here once it does"}
+        return None, behind
+    return latest, None
+
+
+def releases_freshness(store, now_ts, behind=None):
+    """Whether the release list is current: {fetched_at, stale, reason,
+    error, behind}. `fetched_at` is when GitHub last answered (a 304 counts)."""
     cached = store.get("RELEASES_CACHE", {}) or {}
     at = cached.get("fetched_at")
     reason = cached.get("stale_reason")
     if not reason and (not at or now_ts - at > STALE_SECONDS):
         reason = "the release list has not been read from GitHub for over 3 days"
-    return {"fetched_at": at, "stale": bool(reason), "reason": reason}
+    tried = cached.get("attempted_at")
+    error = cached.get("error") if tried and (not at or tried > at) else None
+    return {"fetched_at": at, "stale": bool(reason), "reason": reason, "error": error, "behind": behind}
 
 
 def ran_versions(store, state, current):
@@ -2314,19 +2445,30 @@ def install_identity(env):
     return {"stage": m.group(1), "region": region} if m and region else None
 
 
-def handle(event, env, store, now, fetch=fetch_releases, probe=None):
+def handle(event, env, store, now, fetch=fetch_releases, probe=None, hint=None):
+    """`hint` reads latest.json (fetch_latest in the Lambda; none in tests unless given)."""
     probe = probe or invoke_worker
     action = (event or {}).get("action", "tick")
     current = env.get("CODERHELM_VERSION", "")
     repo = env.get("RELEASE_REPO", "CoderHelm/coderhelm-platform")
     settings = validate_settings(store.get("AUTO_UPDATE", {}) or {}, defaults_from_env(env))
+
+    def releases(max_age):
+        """The release list no older than `max_age` (rate limited), what to
+        offer from it, and `behind` when a newer release isn't listed yet."""
+        ts = now.timestamp()
+        known = latest_hint(store, ts, max_age, hint)
+        rel = releases_cached(store, repo, ts, fetch, max_age, newer=known)
+        latest, behind = offer(store, rel, settings, current, ts, known)
+        return rel, latest, behind
     if action in ("tick", "status", "update_now", "model_check", "native_poll", "domain_status") and ((store.get("UPDATE_STATE", {}) or {}).get("verifying") or {}).get("claim"):
         confirm_check(store, env, now, probe)
     state = store.get("UPDATE_STATE", {})
 
     if action == "status":
-        rel = releases_cached(store, repo, now.timestamp(), fetch)
-        latest = pick_latest(rel, settings["channel"], current)
+        # Opening Settings, System reads the list again when it is a couple
+        # of minutes old; Check for updates (refresh) reads it now.
+        _, latest, behind = releases(0 if event.get("refresh") else FRESH_SECONDS)
         return {
             "current": {
                 "version": current or None,
@@ -2336,7 +2478,7 @@ def handle(event, env, store, now, fetch=fetch_releases, probe=None):
             },
             "latest": latest,
             "update_available": latest is not None,
-            "releases": releases_freshness(store, now.timestamp()),
+            "releases": releases_freshness(store, now.timestamp(), behind),
             "settings": settings,
             "running": running(state, now),
             # Releases whose last try failed or rolled back: the dashboard's
@@ -2365,7 +2507,10 @@ def handle(event, env, store, now, fetch=fetch_releases, probe=None):
     if action == "update_now":
         version = event.get("version")
         if not version:
-            latest = pick_latest(releases_cached(store, repo, now.timestamp(), fetch), settings["channel"], current)
+            # The newest release right now, never the copy the page showed.
+            _, latest, behind = releases(0)
+            if behind:
+                raise ValueError(behind["reason"] + ". Try again in a minute.")
             if not latest:
                 raise ValueError("already on the latest release")
             version = latest["version"]
@@ -2428,7 +2573,7 @@ def handle(event, env, store, now, fetch=fetch_releases, probe=None):
     if action == "model_check":
         version = event.get("version")
         if not version:
-            latest = pick_latest(releases_cached(store, repo, now.timestamp(), fetch), settings["channel"], current)
+            _, latest, _ = releases(FRESH_SECONDS)
             if not latest:
                 return {"model_check": None}
             version = latest["version"]
@@ -2522,14 +2667,17 @@ def handle(event, env, store, now, fetch=fetch_releases, probe=None):
         # No update running: no deploy window either.
         if not running(state, now):
             close_window(env)
-        rel = releases_cached(store, repo, now.timestamp(), fetch)
-        latest = pick_latest(rel, settings["channel"], current)
+        rel, latest, behind = releases(CACHE_SECONDS)
         mc = store.get("MODEL_CHECK")
         # First sight of a release, and daily while a model is refused.
         if latest and not running(state, now) and needs_check(mc, latest["version"], now):
             mc = model_check(store, env, now, latest["version"], repo, probe)
             notify_blocked(store, env, mc)
-        d = decide(now, settings, current, rel, state, mc)
+        if behind:
+            # Never an older release while a newer one is out.
+            d = {"action": "none", "version": behind["version"], "reason": behind["reason"]}
+        else:
+            d = decide(now, settings, current, rel, state, mc)
         if d["action"] in ("notify", "update") and state.get("notified_version") != d.get("version"):
             latest = pick_latest(rel, settings["channel"], current) or {}
             notify(
@@ -2566,7 +2714,7 @@ def handler(event, context):
     store = Store(client("dynamodb"), env["SETTINGS_TABLE_NAME"])
     now = datetime.now(timezone.utc)
     try:
-        return {"ok": True, **handle(event, env, store, now)}
+        return {"ok": True, **handle(event, env, store, now, hint=fetch_latest)}
     except ModelsBlocked as e:
         return {"ok": False, "error": str(e), "model_check": e.record}
     except ReleaseNotReady as e:

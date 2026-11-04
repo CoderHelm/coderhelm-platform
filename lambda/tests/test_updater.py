@@ -141,14 +141,169 @@ class Handler(unittest.TestCase):
         self.assertEqual(s["install"], {"stage": "prod-eu", "region": "eu-west-1"})
         self.assertIsNone(u.install_identity(dict(env, RESOURCE_PREFIX="acme-helm")), "a custom prefix is not a coderhelm-<name> install")
 
-    def test_releases_are_cached_for_an_hour(self):
+    def test_the_hourly_check_keeps_its_copy_for_an_hour(self):
+        calls = []
+        fetch = lambda r: calls.append(r) or [rel("v1.1.0")]
+        u.handle({"action": "tick"}, self.env, self.store, SUNDAY_3AM, fetch)
+        u.handle({"action": "tick"}, self.env, self.store, SUNDAY_3AM + timedelta(minutes=30), fetch)
+        self.assertEqual(len(calls), 1)
+        u.handle({"action": "tick"}, self.env, self.store, SUNDAY_3AM + timedelta(minutes=61), fetch)
+        self.assertEqual(len(calls), 2)
+
+    def test_opening_settings_reads_a_copy_older_than_two_minutes_again(self):
+        # 16:51 the hourly check read v1.1.0; 17:22 v1.2.0 is out.
+        out = [rel("v1.1.0")]
+        calls = []
+        fetch = lambda r: calls.append(r) or list(out)
+        u.handle({"action": "tick"}, self.env, self.store, SUNDAY_3AM, fetch)
+        out.append(rel("v1.2.0"))
+        later = SUNDAY_3AM + timedelta(minutes=31)
+        s = u.handle({"action": "status"}, self.env, self.store, later, fetch)
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(s["latest"]["version"], "v1.2.0")
+        self.assertEqual(s["releases"]["fetched_at"], later.timestamp())
+        # Reloads within two minutes use the copy just read.
+        u.handle({"action": "status"}, self.env, self.store, later + timedelta(seconds=90), fetch)
+        self.assertEqual(len(calls), 2)
+        u.handle({"action": "status"}, self.env, self.store, later + timedelta(minutes=3), fetch)
+        self.assertEqual(len(calls), 3)
+
+    def test_check_for_updates_reads_now_but_at_most_once_per_gap(self):
         calls = []
         fetch = lambda r: calls.append(r) or [rel("v1.1.0")]
         u.handle({"action": "status"}, self.env, self.store, SUNDAY_3AM, fetch)
-        u.handle({"action": "status"}, self.env, self.store, SUNDAY_3AM + timedelta(minutes=30), fetch)
-        self.assertEqual(len(calls), 1)
-        u.handle({"action": "status"}, self.env, self.store, SUNDAY_3AM + timedelta(minutes=61), fetch)
+        for sec in (5, 10, 29):
+            s = u.handle({"action": "status", "refresh": True}, self.env, self.store, SUNDAY_3AM + timedelta(seconds=sec), fetch)
+        self.assertEqual(len(calls), 1, "presses within 30 seconds share one read")
+        self.assertEqual(s["releases"]["fetched_at"], SUNDAY_3AM.timestamp())
+        u.handle({"action": "status", "refresh": True}, self.env, self.store, SUNDAY_3AM + timedelta(seconds=31), fetch)
         self.assertEqual(len(calls), 2)
+
+    def test_a_failed_read_counts_toward_the_gap_and_is_reported(self):
+        calls = []
+        def down(r):
+            calls.append(r)
+            raise OSError("GitHub is down")
+        u.handle({"action": "status"}, self.env, self.store, SUNDAY_3AM, lambda r: [rel("v1.1.0")])
+        later = SUNDAY_3AM + timedelta(minutes=5)
+        s = u.handle({"action": "status"}, self.env, self.store, later, down)
+        u.handle({"action": "status", "refresh": True}, self.env, self.store, later + timedelta(seconds=10), down)
+        self.assertEqual(len(calls), 1, "a failed try is not retried on every reload")
+        self.assertEqual(s["latest"]["version"], "v1.1.0", "the old list is kept")
+        self.assertEqual(s["releases"]["error"], "GitHub is down")
+        self.assertEqual(s["releases"]["fetched_at"], SUNDAY_3AM.timestamp())
+
+    def test_the_etag_is_sent_and_a_304_keeps_the_list(self):
+        seen = []
+        def fetch(r, etag=None):
+            seen.append(etag)
+            if etag == '"abc"':
+                raise u.NotModified()
+            got = u.Fetched([rel("v1.1.0")])
+            got.etag = '"abc"'
+            return got
+        u.handle({"action": "status"}, self.env, self.store, SUNDAY_3AM, fetch)
+        later = SUNDAY_3AM + timedelta(minutes=5)
+        s = u.handle({"action": "status"}, self.env, self.store, later, fetch)
+        self.assertEqual(seen, [None, '"abc"'])
+        self.assertEqual(s["latest"]["version"], "v1.1.0")
+        self.assertEqual(s["releases"]["fetched_at"], later.timestamp(), "a 304 is a check")
+
+    def test_fetch_releases_sends_if_none_match_and_reads_a_304(self):
+        import urllib.error
+        sent = []
+        class Resp:
+            headers = {"etag": '"new"'}
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+            def read(self): return b'[{"tag_name": "v1.1.0"}]'
+            def geturl(self): return u.RELEASES_URL
+        def opener(req, timeout=None):
+            sent.append(req.get_header("If-none-match"))
+            if req.get_header("If-none-match") == '"new"':
+                raise urllib.error.HTTPError(req.full_url, 304, "Not Modified", {}, None)
+            return Resp()
+        got = u.fetch_releases(u.RELEASE_REPO, opener=opener)
+        self.assertEqual(got.etag, '"new"')
+        self.assertEqual(got[0]["tag_name"], "v1.1.0")
+        with self.assertRaises(u.NotModified):
+            u.fetch_releases(u.RELEASE_REPO, etag='"new"', opener=opener)
+        self.assertEqual(sent, [None, '"new"'])
+
+    def test_latest_json_naming_a_newer_release_reads_the_list_again(self):
+        out = [rel("v1.1.0")]
+        calls = []
+        fetch = lambda r: calls.append(r) or list(out)
+        hint = {"version": "v1.1.0"}
+        read = lambda etag=None: dict(hint)
+        u.handle({"action": "status"}, self.env, self.store, SUNDAY_3AM, fetch, hint=read)
+        hint["version"] = "v1.2.0"
+        out.append(rel("v1.2.0"))
+        # Within the two minutes, but latest.json names a release the copy lacks.
+        s = u.handle({"action": "status", "refresh": True}, self.env, self.store, SUNDAY_3AM + timedelta(seconds=40), fetch, hint=read)
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(s["latest"]["version"], "v1.2.0")
+
+    def test_never_offers_an_older_release_while_a_newer_one_is_out(self):
+        # latest.json names v1.2.0; GitHub's list (a lagging copy) still ends at v1.1.0.
+        read = lambda etag=None: {"version": "v1.2.0"}
+        fetch = lambda r: [rel("v1.1.0")]
+        s = u.handle({"action": "status"}, self.env, self.store, SUNDAY_3AM, fetch, hint=read)
+        self.assertIsNone(s["latest"], "v1.1.0 is never offered while v1.2.0 is out")
+        self.assertFalse(s["update_available"])
+        self.assertEqual(s["releases"]["behind"]["version"], "v1.2.0")
+        with self.assertRaisesRegex(ValueError, "v1.2.0 is out"):
+            u.handle({"action": "update_now", "actor": "a"}, self.env, self.store, SUNDAY_3AM + timedelta(minutes=1), fetch, hint=read)
+        self.assertEqual(self.builds, [])
+        u.handle({"action": "settings", "settings": {"auto": True, "majors": "auto", "day": "daily"}}, self.env, self.store, SUNDAY_3AM, fetch)
+        d = u.handle({"action": "tick"}, self.env, self.store, SUNDAY_3AM + timedelta(minutes=2), fetch, hint=read)
+        self.assertEqual(d["action"], "none")
+        self.assertEqual(self.builds, [], "nor applied by the hourly check")
+        # Once listed, it is the one offered.
+        listed = lambda r: [rel("v1.1.0"), rel("v1.2.0")]
+        s = u.handle({"action": "status", "refresh": True}, self.env, self.store, SUNDAY_3AM + timedelta(minutes=3), listed, hint=read)
+        self.assertEqual(s["latest"]["version"], "v1.2.0")
+        self.assertIsNone(s["releases"]["behind"])
+
+    def test_a_release_missing_for_a_day_is_taken_as_withdrawn(self):
+        read = lambda etag=None: {"version": "v1.2.0"}
+        fetch = lambda r: [rel("v1.1.0")]
+        s = u.handle({"action": "status"}, self.env, self.store, SUNDAY_3AM, fetch, hint=read)
+        self.assertIsNone(s["latest"])
+        s = u.handle({"action": "status"}, self.env, self.store, SUNDAY_3AM + timedelta(hours=25), fetch, hint=read)
+        self.assertEqual(s["latest"]["version"], "v1.1.0")
+
+    def test_a_newer_preview_seen_before_never_holds_back_stable(self):
+        fetch = lambda r: [rel("v1.1.0"), rel("v1.2.0-rc.1", pre=True)]
+        s = u.handle({"action": "status"}, self.env, self.store, SUNDAY_3AM, fetch)
+        self.assertEqual(s["latest"]["version"], "v1.1.0")
+
+    def test_update_now_reads_the_newest_release_first(self):
+        out = [rel("v1.1.0")]
+        calls = []
+        fetch = lambda r: calls.append(r) or list(out)
+        u.handle({"action": "status"}, self.env, self.store, SUNDAY_3AM, fetch)
+        out.append(rel("v1.2.0"))
+        # The page showed v1.1.0 a minute ago; pressing Update installs v1.2.0.
+        e = u.handle({"action": "update_now", "actor": "a"}, self.env, self.store, SUNDAY_3AM + timedelta(minutes=1), fetch)
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(e["version"], "v1.2.0")
+        self.assertEqual(self.builds[0][0], "v1.2.0")
+
+    def test_the_lambda_reads_latest_json(self):
+        real = u.handle
+        got = {}
+        u.handle = lambda event, env, store, now, **k: got.update(k) or {}
+        self.addCleanup(setattr, u, "handle", real)
+        real_client = u.client
+        u.client = lambda name, region=None: self.db
+        self.addCleanup(setattr, u, "client", real_client)
+        import os
+        old = dict(os.environ)
+        os.environ.update(SETTINGS_TABLE_NAME="t")
+        self.addCleanup(lambda: (os.environ.clear(), os.environ.update(old)))
+        u.handler({"action": "status"}, None)
+        self.assertIs(got["hint"], u.fetch_latest)
 
     def test_tick_with_auto_update_on_starts_the_build_and_notifies_once(self):
         u.handle({"action": "settings", "settings": {"auto": True, "majors": "ask"}}, self.env, self.store, SUNDAY_3AM, self.fetch)
@@ -532,7 +687,7 @@ class ModelCheck(unittest.TestCase):
 
     def test_the_handler_returns_the_check_with_a_refusal(self):
         real_handle = u.handle
-        u.handle = lambda event, env, store, now: real_handle(event, env, store, now, self.releases, self.worker)
+        u.handle = lambda event, env, store, now, **k: real_handle(event, env, store, now, self.releases, self.worker)
         self.addCleanup(setattr, u, "handle", real_handle)
         real_client = u.client
         u.client = lambda name, region=None: self.db

@@ -265,6 +265,39 @@ pub async fn apply_update(
     answer(body)
 }
 
+/// Who may make the updater read GitHub's release list now: a team admin
+/// (role 3) who is also an install admin.
+pub(crate) fn may_check_releases(claims: &Claims, install_admin: bool) -> Result<(), StatusCode> {
+    claims.require_role(3)?;
+    if !install_admin {
+        warn!(email = %claims.email, "Release check refused: not an install admin");
+        return Err(StatusCode::FORBIDDEN);
+    }
+    Ok(())
+}
+
+/// What the updater gets for Check for updates: the status, read fresh.
+pub(crate) fn check_releases_payload(claims: &Claims) -> Value {
+    json!({ "action": "status", "refresh": true, "actor": claims.email })
+}
+
+/// POST /api/system/releases/check: read GitHub's release list now (Check
+/// for updates), at most once per 30 seconds per install; answers with the
+/// same status as the version route.
+pub async fn check_releases(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<Claims>,
+) -> Reply {
+    claims.require_role(3).map_err(status_only)?;
+    may_check_releases(&claims, is_platform_admin(&claims)).map_err(status_only)?;
+    let body = call(&state, check_releases_payload(&claims))
+        .await
+        .map_err(status_only)?;
+    let mut out = answer(body)?.0;
+    out["self_hosted"] = json!(true);
+    Ok(Json(out))
+}
+
 /// POST /api/system/update-check: check the next release's models again
 /// now (the update banner's "Check again").
 pub async fn check_update(
@@ -522,6 +555,41 @@ mod tests {
         let (_, body) = r.unwrap_err();
         assert_eq!(body.0["model_check"]["version"], "v1.3.0");
         assert!(answer(json!({"ok": true, "version": "v1.2.0"})).is_ok());
+    }
+
+    fn claims(role: &str) -> Claims {
+        Claims {
+            sub: "USER#acme-admin".into(),
+            team_id: "TEAM#1".into(),
+            email: "admin@acme.example".into(),
+            role: role.into(),
+            github_login: None,
+            aud: "coderhelm-dashboard".into(),
+            exp: 9999999999,
+            iat: 1000000000,
+            support_view: None,
+            custom: None,
+            api_key: None,
+        }
+    }
+
+    #[test]
+    fn only_install_admins_may_check_for_releases() {
+        assert_eq!(may_check_releases(&claims("admin"), true), Ok(()));
+        assert_eq!(may_check_releases(&claims("owner"), true), Ok(()));
+        // A team admin who isn't an install admin, and a member who is listed.
+        assert_eq!(
+            may_check_releases(&claims("admin"), false),
+            Err(StatusCode::FORBIDDEN)
+        );
+        assert_eq!(
+            may_check_releases(&claims("member"), true),
+            Err(StatusCode::FORBIDDEN)
+        );
+        let p = check_releases_payload(&claims("admin"));
+        assert_eq!(p["action"], "status");
+        assert_eq!(p["refresh"], true);
+        assert_eq!(p["actor"], "admin@acme.example");
     }
 
     #[test]

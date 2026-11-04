@@ -164,6 +164,11 @@ async fn main() -> Result<(), Error> {
         .route("/system/test-email", post(routes::system::test_email))
         // The model check before an update, run again now ("Check again").
         .route("/system/update-check", post(routes::system::check_update))
+        // Check for updates: GitHub's release list, read now.
+        .route(
+            "/system/releases/check",
+            post(routes::system::check_releases),
+        )
         // How the install calls Claude: Bedrock or Anthropic API keys,
         // switched at any time once every model answers.
         .route(

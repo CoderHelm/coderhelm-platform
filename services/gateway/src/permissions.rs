@@ -736,6 +736,7 @@ pub const CAPABILITIES: &[Capability] = &[
             "system::update_now",
             "system::apply_update",
             "system::check_update",
+            "system::check_releases",
             "system::rollback",
             "system::test_email",
             "system::domain",
