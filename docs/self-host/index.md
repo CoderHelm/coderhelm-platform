@@ -27,7 +27,7 @@ CoderHelm runs entirely on AWS serverless services: Lambda, API Gateway, SQS, Dy
 |---|---|---|
 | Installer | Most people | `npx -y github:CoderHelm/coderhelm-platform init`, then `deploy` |
 | Install script | A fresh machine | `curl -fsSL https://github.com/CoderHelm/coderhelm-platform/releases/latest/download/install.sh \| sh` |
-| Launch Stack | Clicking through the AWS console | One CloudFormation stack, from the template in [Quick start](./quick-start.md#launch-stack). Update with a stack update, remove with **Delete stack** |
+| Launch Stack | Clicking through the AWS console | One CloudFormation stack, from the template in [Quick start](./quick-start.md#launch-stack). Update from **Settings, then System** with one click (or automatically), remove with **Delete stack** |
 | From source | Changing CoderHelm itself | `coderhelm-selfhost deploy --source .` in a checkout |
 
 ## The guides

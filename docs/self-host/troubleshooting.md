@@ -87,6 +87,14 @@ Each step checks what you did before it moves on. When a check fails, fix it and
 
 **The update says it can't install yet.** **Install health** on **Settings, then System** lists the check that stops it (marked **Stops updates**), with its fix. Press **Re-run checks** after fixing it. **Update to vX needs your action** is the model check instead: fix the model access, then **Re-run the model check**.
 
+**The update waits: "needs your OK", "ready to apply" or "needs an AWS admin".** It is prepared and waits for a person. **Review and apply** lists the data or permission changes to confirm; **Apply vX** applies it; **needs an AWS admin** means it changes the deploy role or a permissions boundary, so someone with administrator rights executes it in the AWS console. Admins get one email when it starts waiting, and one reminder after 7 days. See [The page, state by state](./updates.md#the-page-state-by-state).
+
+**"This update was prepared without the deploy role".** The install runs v0.8.28 to v0.8.38, whose apply check was wrong. Execute that one change set in the CloudFormation console; from v0.8.39 on, updates apply from the page. See [Installs on v0.8.28 to v0.8.38](./updates.md#installs-on-v0828-to-v0838).
+
+**"Checking vX didn't finish".** The release check stopped without an answer, or had none for 30 minutes. Nothing changed. Press **Check again**; if it stalls again, the reason it shows names the step.
+
+**No email about a new release.** That is expected: a new release and a finished update show only in **Settings, then System**. Emails go out when a person must act or something went wrong, plus a weekly **What's new** digest. See [Emails about updates](./updates.md#emails-about-updates).
+
 **An update rolled back.** The history says why. Your data is untouched. Run the doctor, fix what fails, then update again: automatic updates skip that release until an admin updates to it by hand. See [Updates](./updates.md#when-an-update-fails).
 
 **`update` says there isn't enough space.** Releases are kept in `~/.coderhelm/releases`. Delete old ones (keep the one you run), or set `CODERHELM_HOME` to a bigger disk.

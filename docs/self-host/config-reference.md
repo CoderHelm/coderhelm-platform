@@ -131,7 +131,7 @@ See [Integrations](./integrations.md).
 - **`updates.majors`** *`ask` or `auto`, default `ask`*\
   `ask`: major releases wait for an admin.
 - **`updates.webhookUrl`** *string*\
-  A Slack or Teams incoming webhook for update notices (admins are emailed either way).
+  A Slack or Teams incoming webhook that gets the same update notices admins are emailed ([which](./updates.md#emails-about-updates)).
 
 These are the starting point; admins change them in **Settings, then System** without a deploy. See [Updates](./updates.md).
 
