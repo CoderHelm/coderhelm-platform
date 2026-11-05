@@ -1,6 +1,6 @@
 ---
 title: Updates
-description: See which version you run, turn on automatic updates with a maintenance window, update with one click, and roll back.
+description: See which version you run, choose the Stable or Beta (nightly) channel, update from the app with one click or automatically in a maintenance window, which emails you get, and roll back.
 order: 9
 ---
 
@@ -29,7 +29,7 @@ Each install follows one channel, chosen in **Settings, then System, then Automa
 
 How a release moves from one to the other:
 
-1. **Every night**, when `main` changed since the last beta, CoderHelm cuts a beta from the commit the hosted service runs. It is signed and checked exactly like a stable release, and published on GitHub as a prerelease. Each beta gets its own version number, one above the one before.
+1. **Every night** (at 06:17 UTC), when anything in a self-host release changed on `main` since the last release, CoderHelm cuts a beta from the commit the hosted service runs. It is signed and checked exactly like a stable release, and published on GitHub as a prerelease. Each beta gets its own version number, one above the last release of either kind.
 2. **A day later** (each day at 10:17 UTC), the newest beta that has been out for at least 24 hours becomes stable: the same commit, released again as the same number without the suffix (`v0.8.38-beta.20261105` becomes `v0.8.38`). It has its own tag, signature and files, checked the same way as every release.
 3. **A reported problem holds it.** A beta stays on the beta channel while an open issue with the `release-blocker` label in [the repository](https://github.com/CoderHelm/coderhelm-platform/issues) names it (or the stable version it would become). The next clean beta is promoted instead. Installs don't send update results to CoderHelm, so this label is the only signal: if an update to a beta fails or rolls back for you, open an issue that names the version.
 4. **An urgent fix** can go out the same day: a maintainer promotes a beta right away, or releases the commit the hosted service runs straight to stable.
@@ -44,13 +44,23 @@ The updater (a Lambda in your account) checks GitHub for releases every hour. Op
 
 Each channel also has a small pointer file, written when a release is published: `launch/latest.json` for stable and `launch/beta.json` for beta. The updater reads your channel's file at least every five minutes while the page is open and on every hourly check, and reads GitHub's list again as soon as the file names a release the list doesn't have. So a new release shows within minutes of being published. When the file names a release that GitHub's list doesn't show yet, no older release is offered meanwhile.
 
-A new release doesn't email anyone: **Settings, then System** shows it with its release notes (a major release too). Admins get an email only when a person must act or something went wrong, each at most once per version:
+## Emails about updates
 
-- an update failed, or rolled back;
-- an update waits for an admin's OK: a prepared update to confirm or apply, or a model check that refuses it (and one reminder if it still waits after 7 days);
-- the install's address changed, or the change failed.
+A new release doesn't email anyone, and neither does an update that finished: **Settings, then System** shows both, with the release notes (a major release too). Every install admin gets an email only when a person must act or something went wrong, each at most once per version and reason:
 
-Besides those, a **What's new** email sums up the releases on your channel since the last one: their versions, each one's headline and whether this install runs the newest. It goes weekly by default, only when something new came out; set `digest` to `biweekly` or `off` with `PUT /api/system/auto-update`. Every notice is also posted to your Slack or Teams webhook if you set `updates.webhookUrl`.
+| Email | When |
+|---|---|
+| **update to vX needs your OK** | A prepared update waits for an admin: to confirm the data or permission changes it lists, to press **Apply**, or for someone with administrator rights in the AWS account. Also when [the model check](#the-model-check) refuses a model the release calls. |
+| **update to vX still needs your OK** | The same update still waits 7 days later. Sent once. |
+| **update to vX failed** / **rolled back** | The update stopped, or CloudFormation put the previous release back. The email says where the install is now and what to do. |
+| **the new address is live** / **the address change failed** / **back on the AWS address** | A [domain](./domains.md) change finished, failed, or was undone. |
+| **what's new, up to vX** | The digest, below. |
+
+**The digest.** A **What's new** email sums up the releases on your channel since the last one: each version, its date and the headline of its notes (up to 10), and whether this install runs the newest. It is sent weekly by default, and only when something new came out; the first period only starts the clock. The `digest` setting takes `weekly`, `biweekly` or `off`. **Settings, then System** has no control for it yet: an install admin sets it with `PUT /api/system/auto-update` and a body of `{"digest": "biweekly"}` (or `"off"`), and `GET /api/system/version` returns it.
+
+Every email is also posted to your Slack or Teams webhook if you set `updates.webhookUrl`.
+
+These are the emails from the release after v0.8.40. An install that runs v0.8.40 or older still emails once about each new release and each finished update, until it updates.
 
 ## Automatic updates
 
@@ -89,23 +99,32 @@ An install on Anthropic API keys (the launch parameter **ModelProvider** `anthro
 
 ## The page, state by state
 
-The **Version** section of **Settings, then System** says one thing at a time about updates, with the one thing to do:
+The **Version** section of **Settings, then System** shows one state at a time, with the one thing to do. It reads the state from CloudFormation and the release check each time it answers, not from a stored copy, so an update applied in the AWS console shows here too. While something runs, the page follows it by itself: every 10 seconds while a release is checked or an update is prepared, every 15 seconds while it applies, and every 30 seconds while it waits for an OK.
 
 | What it says | What it means | What to do |
 |---|---|---|
 | **You're up to date** | No newer release on your channel. With automatic updates on, it says when the next one would install. | Nothing. **Check for updates** reads GitHub now. |
 | **Updated to vX** | An update finished in the last day. | Nothing. |
-| **vX is available** | A newer release is out; its notes are below. A major release says **Major release** and asks you to read the notes first. | **Update to vX**. |
-| **vX is available, but can't install yet** | An install check that stops updates fails. | **See what to fix** opens **Install health**. |
+| **vX is available** | A newer release is out; its notes are below. **Major release** means its notes ask you to do something first; **Beta** means a nightly build on the Beta channel. | **Update to vX**. |
+| **Checking vX before it can be applied** | The release check runs: the signature, the checksums, then a test call to each model the release calls. It usually takes about 5 minutes. | Nothing. The page moves on by itself. |
+| **Checking vX didn't finish** | The release check stopped without an answer, or has had none for 30 minutes. It says why. Nothing changed. | **Check again**. |
 | **Update to vX needs your action** | A model the release calls doesn't answer here yet ([the model check](#the-model-check)). | Fix it in the AWS console, then **Re-run the model check**. |
-| **Preparing the update to vX…** / **Updating to vX…** | The update runs (10 to 20 minutes). Coderhelm keeps running your current version until it finishes. | Nothing. The page follows it. |
-| **vX needs your OK** / **vX is ready to apply** / **vX needs an AWS admin** | The prepared update waits for you ([Update now](#update-now)). | **Review and apply**, **Apply vX**, or **Open it in the AWS console**. |
-| **The update to vX didn't finish** / **couldn't start** / **stopped partway** | The last try didn't work ([When an update fails](#when-an-update-fails)). | **Try again**, after fixing what **Install health** lists. |
+| **Preparing the update to vX…** | AWS prepares the change to your stack, which takes a minute or two. | Nothing. If it would change data or permissions, it asks you first. |
+| **vX needs your OK** | The prepared update would replace or remove data or change permissions, and waits for you ([Update now](#update-now)). | **Review and apply**: check the listed changes, then confirm. |
+| **vX is ready to apply** | The prepared update waits for an admin, for example because automatic updates were turned off before it ran. | **Apply vX**. |
+| **vX needs an AWS admin** | The update changes the deploy role or a permissions boundary, which CoderHelm can't apply for itself ([why](#what-an-update-does)). | **Open it in the AWS console**: someone with administrator rights reviews it and chooses **Execute**. |
+| **Applying vX…** / **Updating to vX…** | The update runs (10 to 20 minutes), with who started it and when. When someone executed it in the AWS console, it says so. Coderhelm keeps running your current version until it finishes. | Nothing. The page follows it. |
+| **The update to vX couldn't start** / **didn't finish** / **stopped partway** | The last try didn't work ([When an update fails](#when-an-update-fails)). | **Try again**, after fixing what **Install health** lists. After **stopped partway**, **Roll back** is offered too. |
+| **vX is available, but can't install yet** | An install check that stops updates fails. | **See what to fix** opens **Install health**. |
+| **vX is available, but can't install from here** | The updater in your AWS account didn't answer. | Run the update command the page shows, from your machine. |
 | **vX is out, but can't install yet** | A release was published but GitHub's list doesn't show it yet. | **Check for updates** again in a few minutes. |
 | **Couldn't check for updates** | GitHub didn't answer, so it isn't known whether a newer release is out. | **Check for updates** later. |
+| **Not checked for updates yet** | The updater hasn't read the release list yet. | **Check for updates**. |
 | **Development build** | The install was deployed from source, not a release. | Nothing to compare. |
 
-Under the status, **Check for updates** sits next to when GitHub last answered ("Checked 2 min ago").
+Under the status, **Check for updates** sits next to when GitHub last answered ("Checked 2 min ago"). The steps of a running update read **Check the release**, **Prepare the change** and **Apply it**, with the current one marked; there is no percentage, because AWS doesn't give a reliable one.
+
+There is only ever one update waiting. A newer prepared update replaces an older one that hasn't run, and the history lists the older one as **Replaced**. An update that AWS is still preparing or already applying is never replaced.
 
 ## Install health
 
@@ -122,9 +141,18 @@ From the terminal, `update` runs a preflight first and stops before anything cha
 
 ## Update now
 
-**Settings, then System, then Update to vX** starts the same update as the automatic one, and records who started it. On an install made with Launch Stack it applies, whether auto-update is on or off: the page shows it preparing, then running, then the result in the update history (10 to 20 minutes). You never need the AWS console or a terminal for it.
+**Settings, then System, then Update to vX** starts the same update as the automatic one, and records who started it. On an install made with Launch Stack it applies, whether auto-update is on or off: the page shows it being checked, prepared and applied, then the result in the update history (10 to 20 minutes). From v0.8.39 on, you never need the AWS console or a terminal for it, apart from the rare release that changes the deploy role itself (below).
 
 Some releases need you to say yes first. When the prepared update would replace or remove data (a table, bucket, key, user pool or secret) or change permissions (an IAM role or policy, a function permission, a resource policy, or a new principal), the page lists exactly those changes and asks you to confirm them. It applies only once you confirm that list; if the list changes before you do, you confirm again.
+
+### Installs on v0.8.28 to v0.8.38
+
+On these releases, **Review and apply** and **Apply vX** refuse every prepared update with "this update was prepared without the deploy role", even though the change set was made with it: the check read a field AWS never returns. v0.8.39 fixed it. To get onto v0.8.39 or newer once, when the page refuses:
+
+1. Open the link next to the update (**See the change in the AWS console**), or the stack `coderhelm-<name>` in the [CloudFormation console](https://console.aws.amazon.com/cloudformation/home), then **Change sets**, then the newest one.
+2. Check what it changes, and choose **Execute change set**. It runs through the deploy role it was made with.
+
+The page follows it like any other update. Every update after that applies from the page.
 
 ## What an update does
 
@@ -137,10 +165,10 @@ On an install made with Launch Stack, an update is a stack update of `coderhelm-
    - **You pressed Update:** it applies as soon as it is prepared. When it would replace or remove data or change permissions, it waits for you to confirm exactly those changes on the page, then applies.
    - **The maintenance window started it (auto-update on):** it applies by itself, except when it would replace or remove data or change permissions: then it waits, admins get an email, and you confirm it on the page the same way. If auto-update was turned off before it ran, it waits for you to press **Apply**.
    - **It changes the deploy role or a permissions boundary:** the deploy role can't change those (that is what keeps it from giving itself more), so CoderHelm can't apply it for you. The page says so and links to the change set: someone with administrator rights in the AWS account reviews it and chooses **Execute**. Releases do this rarely, and their notes say so.
-5. **Follows it.** Every 5 minutes the updater reads the change set and the stack until the update ends. When the stack update starts, the install's own copy step checks every file of the release against the sha256 that `coderhelm.json` lists before any part changes. If a part fails, CloudFormation rolls the whole stack back to the previous release by itself.
+5. **Follows it.** The updater reads the change set and the stack every 5 minutes until the update ends, and again each time **Settings, then System** asks, so the page never shows an older state than CloudFormation's. An update executed outside the app (in the AWS console or the AWS CLI) is followed the same way, and the history records it as applied in the AWS console. Before it calls the update a success, it checks that the stack reports the new release. When the stack update starts, the install's own copy step checks every file of the release against the sha256 that `coderhelm.json` lists before any part changes. If a part fails, CloudFormation rolls the whole stack back to the previous release by itself.
 6. **Reports.** The history in **Settings, then System** shows the version, when, who (or "auto") and the result: succeeded, failed, or rolled back. A try that didn't succeed says in plain words what happened, where your install is now and what to do next; CloudFormation's own text (for the first resource that failed) is under **Technical details**. Admins get an email when it failed or rolled back; a finished update is only in the history.
 
-A change set that waits too long can go stale (the stack changed since it was made); the history then says so, and **Update** prepares a new one. Pressing **Update** while an older prepared update waits replaces it (nothing was changed by the older one).
+A change set that waits too long can go stale (the stack changed since it was made); the history then says so, and **Update** prepares a new one. Pressing **Update** while an older prepared update waits replaces it (nothing was changed by the older one), and the history lists the older one as **Replaced**. Pressing it while AWS still prepares or already applies an update is refused, with the reason.
 
 ### The first update onto a release with the deploy role on every install
 

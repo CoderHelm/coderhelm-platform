@@ -24,6 +24,8 @@ The data is kept unless you choose otherwise. The simplest way to delete it too:
 2. Turn on **Delete everything when CoderHelm is uninstalled**, and type the install's name to confirm. It takes effect at once; nothing is deleted yet. Who changed it and when is recorded.
 3. Delete the stack.
 
+Nothing is deleted from **Settings**, **System**: its **Uninstall** section holds this switch and **Open the uninstall guide**, which opens this page in a new tab.
+
 When the stack is deleted, it reads the switch and deletes the data too. Turn the switch off again to go back to keeping the data. If **Settings**, **System** has no such switch, the install is older than it: update, or use the stack parameter instead (below).
 
 The stack parameter **KeepDataOnDelete** does the same from AWS. It is `true` unless you changed it, and you can see it in the stack's **Parameters** or **Outputs** tab. The data is deleted when either says so: the switch on, or **KeepDataOnDelete** `false`.
