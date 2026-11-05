@@ -10,9 +10,11 @@ Actions (the `action` field of the event):
             release notes, settings, history. Reads GitHub's release list
             again when the copy is over FRESH_SECONDS old (opening Settings,
             System), or now with `refresh` (Check for updates); at most one
-            read per FETCH_GAP_SECONDS, conditional on the ETag. A release
-            latest.json names that the list lacks is never undercut: no
-            older one is offered meanwhile.
+            read per FETCH_GAP_SECONDS (REFRESH_GAP_SECONDS for Check for
+            updates), conditional on the ETag. A release the channel's hint
+            (launch/latest.json for stable, launch/beta.json for beta) names
+            that the list lacks is never undercut: no older one is offered
+            meanwhile.
 - settings  saves auto-update settings (validated).
 - update_now  starts the update build for a version (default: the latest,
             read from GitHub at that moment).
@@ -96,15 +98,26 @@ logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 
 DAYS = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
-CHANNELS = ("stable", "preview")
+# stable: releases only. beta: the nightly prereleases too (and every
+# release). "preview" is the old name of beta, still accepted in stored
+# settings, configs and calls.
+CHANNELS = ("stable", "beta")
+CHANNEL_ALIASES = {"preview": "beta"}
 MAJORS = ("ask", "auto")
 # The hourly check reads GitHub's release list when its copy is this old.
 CACHE_SECONDS = 3600
 # Settings, System reads it again when its copy is older than this.
 FRESH_SECONDS = 120
 # At most one read of GitHub (or latest.json) per this many seconds per
-# install, whoever asks: page reloads and Check for updates can't hammer it.
+# install, whoever asks: page reloads can't hammer it.
 FETCH_GAP_SECONDS = 30
+# Check for updates reads again unless the last read was this recent: it is
+# conditional on the ETag, and an unchanged answer (304) costs no quota.
+REFRESH_GAP_SECONDS = 5
+# The channel's hint (a small file in S3, written when a release is
+# published) is read this often even when the release list is read hourly,
+# so a new release shows within minutes of being published.
+HINT_SECONDS = 300
 # A release the install knows of (latest.json, or seen before) that the list
 # lacks for this long is taken as withdrawn.
 BEHIND_SECONDS = 24 * 3600
@@ -113,6 +126,9 @@ STALE_SECONDS = 3 * 24 * 3600
 RELEASE_REPO = "CoderHelm/coderhelm-platform"
 RELEASES_URL = f"https://api.github.com/repos/{RELEASE_REPO}/releases?per_page=30"
 LATEST_URL = "https://coderhelm-public.s3.amazonaws.com/launch/latest.json"
+BETA_URL = "https://coderhelm-public.s3.amazonaws.com/launch/beta.json"
+# Each channel's hint: the newest release published for it.
+HINT_URLS = {"stable": LATEST_URL, "beta": BETA_URL}
 RUNNING_STALE = timedelta(hours=3)
 # Who started an update when the call names no one: the dashboard always
 # sends the signed-in admin, the install guide and the auto-update window name
@@ -166,6 +182,18 @@ def is_major(current, target):
 
 # ── Settings ──────────────────────────────────────────────────────────────
 
+def channel_of(name):
+    """The channel a stored or sent name means ("preview" is beta), or None."""
+    if not isinstance(name, str):
+        return None
+    name = CHANNEL_ALIASES.get(name, name)
+    return name if name in CHANNELS else None
+
+
+def takes_prereleases(channel):
+    return channel_of(channel) == "beta"
+
+
 def defaults_from_env(env=None):
     env = os.environ if env is None else env
     out = dict(DEFAULT_SETTINGS)
@@ -173,6 +201,7 @@ def defaults_from_env(env=None):
         out.update(json.loads(env.get("UPDATE_DEFAULTS") or "{}"))
     except ValueError:
         pass
+    out["channel"] = channel_of(out.get("channel")) or "stable"
     return out
 
 
@@ -188,9 +217,10 @@ def validate_settings(raw, base=None):
             raise ValueError("auto: true or false")
         s["auto"] = raw["auto"]
     if "channel" in raw:
-        if raw["channel"] not in CHANNELS:
-            raise ValueError("channel: stable or preview")
-        s["channel"] = raw["channel"]
+        ch = channel_of(raw["channel"])
+        if ch is None:
+            raise ValueError("channel: stable or beta")
+        s["channel"] = ch
     if "day" in raw:
         d = str(raw["day"]).lower()[:3] if raw["day"] != "daily" else "daily"
         if d not in DAYS and d != "daily":
@@ -233,7 +263,9 @@ def in_window(now_utc, settings):
 # ── The decision ──────────────────────────────────────────────────────────
 
 def pick_latest(releases, channel, current):
-    """The newest release above `current` that the channel allows."""
+    """The newest release above `current` that the channel allows: never one
+    at or below it, so an install that moves from beta to stable stays on its
+    beta until a newer stable release is out."""
     best = None
     for r in releases or []:
         tag = r.get("tag_name") or r.get("version")
@@ -241,7 +273,7 @@ def pick_latest(releases, channel, current):
         if not p or r.get("draft"):
             continue
         pre = bool(r.get("prerelease")) or bool(p[3])
-        if pre and channel != "preview":
+        if pre and not takes_prereleases(channel):
             continue
         if current and parse_version(current) and compare(tag, current) <= 0:
             continue
@@ -376,12 +408,15 @@ def fetch_releases(repo, etag=None, opener=None):
     return out
 
 
-def fetch_latest(etag=None, opener=None):
-    """launch/latest.json: the newest stable release, moved only after the
-    release workflow checked it. A hint of what exists, never what is trusted."""
-    body, tag, at = read_json(LATEST_URL, etag, opener)
+def fetch_latest(channel="stable", etag=None, opener=None):
+    """The channel's hint: launch/latest.json (the newest stable release) or
+    launch/beta.json (the newest release of any kind), each moved only after
+    the release workflow checked the published release. A hint of what
+    exists, never what is trusted."""
+    url = HINT_URLS[channel_of(channel) or "stable"]
+    body, tag, at = read_json(url, etag, opener)
     if not at.startswith(f"https://{NATIVE_HOST}/launch/"):
-        raise ValueError(f"latest.json came from {at}")
+        raise ValueError(f"{url.rsplit('/', 1)[-1]} came from {at}")
     return {"version": (body or {}).get("version"), "etag": tag}
 
 
@@ -397,24 +432,32 @@ def newest(releases):
     return best
 
 
-def due(doc, now_ts, max_age):
+def due(doc, now_ts, max_age, gap=FETCH_GAP_SECONDS):
     """Whether a cached read should be made again: older than `max_age`, and
-    no read (or failed try) in the last FETCH_GAP_SECONDS, whoever asked."""
+    no read (or failed try) in the last `gap` seconds, whoever asked."""
     if not doc:
         return True
     last = max(doc.get("fetched_at") or 0, doc.get("attempted_at") or 0)
-    if now_ts - last < FETCH_GAP_SECONDS:
+    if now_ts - last < gap:
         return False
     return now_ts - (doc.get("fetched_at") or 0) >= max_age
 
 
-def latest_hint(store, now_ts, max_age, read=None):
-    """The version latest.json names (cached like the release list), or None."""
-    doc = store.get("RELEASE_HINT", {}) or {}
-    if read is None or not due(doc, now_ts, max_age):
+def hint_key(channel):
+    """Where the channel's hint is cached (stable keeps the key it always had)."""
+    return "RELEASE_HINT#beta" if channel_of(channel) == "beta" else "RELEASE_HINT"
+
+
+def latest_hint(store, now_ts, max_age, read=None, channel="stable", gap=FETCH_GAP_SECONDS):
+    """The version the channel's hint names (latest.json or beta.json, cached
+    like the release list), or None. `read(channel, etag=...)` reads it."""
+    key = hint_key(channel)
+    doc = store.get(key, {}) or {}
+    if read is None or not due(doc, now_ts, max_age, gap):
         return doc.get("version")
+    channel = channel_of(channel) or "stable"
     try:
-        got = read(etag=doc.get("etag")) if doc.get("etag") else read()
+        got = read(channel, etag=doc.get("etag")) if doc.get("etag") else read(channel)
         v = got.get("version")
         if parse_version(v) and not (doc.get("version") and compare(v, doc["version"]) < 0):
             doc.update(version=v, etag=got.get("etag"))
@@ -422,23 +465,24 @@ def latest_hint(store, now_ts, max_age, read=None):
     except NotModified:
         doc["fetched_at"] = now_ts
     except Exception as e:  # a hint only: the release list still decides
-        logger.warning(f"Could not read latest.json: {e}")
+        logger.warning(f"Could not read the {channel} hint: {e}")
     doc["attempted_at"] = now_ts
-    store.put("RELEASE_HINT", doc)
+    store.put(key, doc)
     return doc.get("version")
 
 
-def releases_cached(store, repo, now_ts, fetch=fetch_releases, max_age=CACHE_SECONDS, newer=None):
+def releases_cached(store, repo, now_ts, fetch=fetch_releases, max_age=CACHE_SECONDS, newer=None, gap=FETCH_GAP_SECONDS):
     """The release list, read again when older than `max_age` (the hourly
     check: an hour; Settings, System: FRESH_SECONDS; Check for updates and
-    Update now: 0), or when `newer` (latest.json) names a version the copy
-    doesn't have. At most one read per FETCH_GAP_SECONDS per install, and
-    each one conditional on the ETag, so page loads can't use up GitHub's quota."""
+    Update now: 0), or when `newer` (the channel's hint) names a version the
+    copy doesn't have. At most one read per `gap` seconds per install
+    (FETCH_GAP_SECONDS; REFRESH_GAP_SECONDS for Check for updates), and each
+    one conditional on the ETag, so page loads can't use up GitHub's quota."""
     cached = store.get("RELEASES_CACHE", {}) or {}
-    wait = due(cached, now_ts, max_age)
+    wait = due(cached, now_ts, max_age, gap)
     if not wait and newer and cached and parse_version(newer):
         top = newest(cached.get("releases"))
-        wait = (top is None or compare(newer, top) > 0) and due(cached, now_ts, 0)
+        wait = (top is None or compare(newer, top) > 0) and due(cached, now_ts, 0, gap)
     if not wait:
         return cached.get("releases", [])
     etag = cached.get("etag") if cached.get("releases") is not None else None
@@ -473,11 +517,14 @@ def releases_cached(store, repo, now_ts, fetch=fetch_releases, max_age=CACHE_SEC
 
 def known_newest(store, hint, channel):
     """The newest release this install knows exists for its channel: what
-    latest.json names (stable) or the newest the release list ever showed."""
+    the channel's hint names, or the newest the release list ever showed
+    (a prerelease only on beta)."""
     seen = (store.get("RELEASES_CACHE", {}) or {}).get("newest_seen")
     best = hint if parse_version(hint) else None
+    if best and parse_version(best)[3] and not takes_prereleases(channel):
+        best = None
     p = parse_version(seen)
-    if p and (channel == "preview" or not p[3]) and (best is None or compare(seen, best) > 0):
+    if p and (takes_prereleases(channel) or not p[3]) and (best is None or compare(seen, best) > 0):
         best = seen
     return best
 
@@ -2463,19 +2510,24 @@ def install_identity(env):
 
 
 def handle(event, env, store, now, fetch=fetch_releases, probe=None, hint=None):
-    """`hint` reads latest.json (fetch_latest in the Lambda; none in tests unless given)."""
+    """`hint(channel, etag=...)` reads the channel's hint, latest.json or
+    beta.json (fetch_latest in the Lambda; none in tests unless given)."""
     probe = probe or invoke_worker
     action = (event or {}).get("action", "tick")
     current = env.get("CODERHELM_VERSION", "")
     repo = env.get("RELEASE_REPO", "CoderHelm/coderhelm-platform")
     settings = validate_settings(store.get("AUTO_UPDATE", {}) or {}, defaults_from_env(env))
 
-    def releases(max_age):
+    def releases(max_age, refresh=False):
         """The release list no older than `max_age` (rate limited), what to
-        offer from it, and `behind` when a newer release isn't listed yet."""
+        offer from it, and `behind` when a newer release isn't listed yet.
+        The channel's hint is read at least every HINT_SECONDS, so a release
+        published since the list was read shows within minutes; `refresh`
+        (Check for updates) reads both again unless just read."""
         ts = now.timestamp()
-        known = latest_hint(store, ts, max_age, hint)
-        rel = releases_cached(store, repo, ts, fetch, max_age, newer=known)
+        gap = REFRESH_GAP_SECONDS if refresh else FETCH_GAP_SECONDS
+        known = latest_hint(store, ts, min(max_age, HINT_SECONDS), hint, settings["channel"], gap)
+        rel = releases_cached(store, repo, ts, fetch, max_age, newer=known, gap=gap)
         latest, behind = offer(store, rel, settings, current, ts, known)
         return rel, latest, behind
     if action in ("tick", "status", "update_now", "model_check", "native_poll", "domain_status") and ((store.get("UPDATE_STATE", {}) or {}).get("verifying") or {}).get("claim"):
@@ -2485,7 +2537,7 @@ def handle(event, env, store, now, fetch=fetch_releases, probe=None, hint=None):
     if action == "status":
         # Opening Settings, System reads the list again when it is a couple
         # of minutes old; Check for updates (refresh) reads it now.
-        _, latest, behind = releases(0 if event.get("refresh") else FRESH_SECONDS)
+        _, latest, behind = releases(0, refresh=True) if event.get("refresh") else releases(FRESH_SECONDS)
         return {
             "current": {
                 "version": current or None,

@@ -51,16 +51,22 @@ The installer verifies the signature with `cosign` when it is installed, or else
 
 ## Who can publish a release
 
-A release is a `vX.Y.Z` tag on `CoderHelm/coderhelm-platform`, built by `.github/workflows/release.yml`. A tag comes one of two ways.
+A release is a `vX.Y.Z` tag (or a nightly beta, `vX.Y.Z-beta.YYYYMMDD`) on `CoderHelm/coderhelm-platform`, built by `.github/workflows/release.yml`. A tag comes one of two ways.
 
-**Automatic (the usual way).** When the hosted deploy of `main` succeeds, `deploy.yml` runs `.github/workflows/auto-release.yml` as the last part of that same deploy run. So the release is always exactly the commit the deploy shipped, even when more pull requests merged into `main` while it deployed. Those get their own release after their own deploy. `auto-release.yml` is read from the deployed commit, like the rest of the run. It:
+**Automatic (the usual way).** `.github/workflows/auto-release.yml` on `main` cuts three kinds of release ([Channels](./updates.md#channels)):
 
-1. checks it runs on `refs/heads/main`, started by `deploy.yml` (or by hand) on `main`, on the commit that was deployed, and that the deploy of that commit succeeded. A run on any other commit stops with an error;
-2. plans the release (`.github/scripts/auto_release.py`). Releases are cut one at a time. It skips when that commit already has a release, and when a later commit of `main` already has one, so an older deploy never releases an older commit as the latest. It also skips when nothing that ships in a self-host release changed since the last release (`services/`, `lambda/`, `infra/`, `installer/`, `selfhost/`, the dashboard pin check and `release.yml`). The version is the last release plus a patch, or plus a minor when a merged pull request is labelled `enhancement` or `feature` or titled `feat:`. It is never below the version in `installer/package.json`, which is how a reviewed pull request asks for a minor or major release. The notes list the merged pull requests;
-3. signs the four lines above with Sigstore keyless signing. No key is stored anywhere: GitHub's OIDC token names the workflow file, the ref and the commit, and the certificate carries exactly those. GitHub also records an attestation of the same lines;
+- **The nightly beta**, on its schedule (06:17 UTC): the commit `main`'s hosted deploy shipped, once that deploy succeeded (the run waits for it).
+- **A promotion**, on its own schedule (10:17 UTC) or by hand: a beta that has been out for a day with no open `release-blocker` issue naming it becomes `vX.Y.Z` on the same commit.
+- **An urgent stable release**, when a maintainer runs `deploy.yml` by hand with "stable release": the commit that deploy shipped, in that same deploy run, so it is exactly that commit even when more pull requests merged into `main` meanwhile.
+
+The workflow is read from `main` (or, run from `deploy.yml`, from the deployed commit). It:
+
+1. checks it runs on `refs/heads/main`, started by its schedule, by `deploy.yml` or by hand on `main`, and, for a new release, on the commit that was deployed, and that the deploy of that commit succeeded. A run on any other commit stops with an error;
+2. plans the releases (`.github/scripts/auto_release.py`). Releases are cut one at a time. It skips when that commit already has a release, and when a later commit of `main` already has one, so an older commit never becomes the latest. It also skips when nothing that ships in a self-host release changed since the last release (`services/`, `lambda/`, `infra/`, `installer/`, `selfhost/`, the dashboard pin check and `release.yml`). The version is the last release of either kind plus a patch, or plus a minor when a merged pull request is labelled `enhancement` or `feature` or titled `feat:`, so every beta has its own number. It is never below the version in `installer/package.json`, which is how a reviewed pull request asks for a minor or major release. The notes list the merged pull requests;
+3. for a new release, signs the four lines above with Sigstore keyless signing. No key is stored anywhere: GitHub's OIDC token names the workflow file, the ref and the commit, and the certificate carries exactly those. GitHub also records an attestation of the same lines. A beta's run also signs the four lines for its stable tag (`vX.Y.Z`, same commit) and keeps that signature in the beta's tag message, in a block marked `CODERHELM STABLE ATTESTATION`. A promotion signs nothing: it checks that signature as an install would and puts it in the stable tag. So a promoted tag is vouched for by exactly what installs already check: `auto-release.yml` on `main`, run on the tag's commit;
 4. creates the annotated tag with that signature in its message. GitHub refuses to create a tag that exists, so a tag is never re-cut or moved;
-5. starts `release.yml` on the tag. That builds and signs the release exactly as for a tag cut by hand, with no approval step;
-6. downloads the published release and checks it as an install does. Only then does it upload the Launch Stack templates and move `launch/latest.json`. It then writes the release notes on the GitHub release, where installs read them.
+5. starts `release.yml` on the tag. That builds and signs the release exactly as for a tag cut by hand, with no approval step. A promoted release is built again on its own tag: its files carry its own version, and its signature names its own tag;
+6. downloads the published release and checks it as an install does. Only then does it upload the Launch Stack templates and move the channel's pointer: `launch/beta.json` for a beta, `launch/latest.json` and `launch/beta.json` for a stable release. It then writes the release notes on the GitHub release, where installs read them.
 
 **By hand.** A maintainer signs a tag with their SSH key and pushes it. `release.yml` runs, and a maintainer approves the `release` environment before it publishes.
 
@@ -103,7 +109,7 @@ An automatic release (`auto-release.yml`):
 Another workflow that names either environment gets neither role. What each role may do:
 
 - **`release-publisher`** may only create objects under `launch/v*/`. Its policy requires the `If-None-Match` header (S3 conditional writes), so it can't overwrite a template already there.
-- **`release-latest`** may only write `launch/latest.json`, and only as a conditional write: a create, or a replace of the exact copy it read. Both workflows use it only after they have downloaded the published release and checked it as an install would.
+- **`release-latest`** may only write `launch/latest.json` and `launch/beta.json`, and only as a conditional write: a create, or a replace of the exact copy it read. Both workflows use it only after they have downloaded the published release and checked it as an install would.
 
 ### In GitHub's settings (applied with `scripts/release-protection.sh`)
 
@@ -112,7 +118,7 @@ These settings make a bad tag hard to create in the first place. They are not st
 - **`main`, on both `CoderHelm/coderhelm-platform` and `CoderHelm/coderhelm`.** Changes go in only through a pull request with an approving review and passing checks. Commits must be signed, and force pushes and deletion are blocked. Admins may merge their own pull request after the checks pass, but never push to `main` directly. `--no-admin-merge-bypass` removes that too.
 - **`v*` tags.** Their commits must be signed, and nobody can update, move or delete a tag. There is no admin bypass unless you pass `--allow-admin-tag-bypass`. Who can create a `v*` tag is not limited. `auto-release.yml` creates its tag with the workflow token, and GitHub refuses GitHub Actions as an exception to an organization repository's tag creation rule. So the checks above are what stop a tag made any other way: an install accepts only a tag signed by a maintainer key or attested by `auto-release.yml` on `main`.
 - **The `release` environment.** A listed reviewer approves every publish of a tag cut by hand. Only `v*` tags may deploy to it, and admins can't skip the approval. So a pushed tag alone publishes nothing.
-- **The `release-auto` environment.** No reviewer, and only the `main` branch may deploy to it. `auto-release.yml` publishes the templates and `latest.json` from it.
+- **The `release-auto` environment.** No reviewer, and only the `main` branch may deploy to it. `auto-release.yml` publishes the templates, `latest.json` and `beta.json` from it.
 - **Immutable releases.** A published release's files can't be replaced or added to. A re-run of the release workflow on a published release checks its `SHA256SUMS` is this build's and uploads nothing.
 - **Actions.** Actions must be pinned by commit SHA, the default token is read-only, and workflows from outside contributors wait for approval.
 

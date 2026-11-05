@@ -251,7 +251,10 @@ test("updates settings", () => {
   assert.equal(parseWindow("Sun 3pm"), null);
   assert.equal(parseWindow("Sun 24:00"), null);
   hasProblem(base({ updates: { window: "whenever" } }), /updates.window/);
-  hasProblem(base({ updates: { channel: "beta" as never } }), /updates.channel/);
+  hasProblem(base({ updates: { channel: "nightly" as never } }), /updates.channel/);
+  assert.equal(resolveConfig(base({ updates: { channel: "beta" } })).updates.defaults.channel, "beta");
+  // The old name of beta, in configs written before it was renamed.
+  assert.equal(resolveConfig(base({ updates: { channel: "preview" } })).updates.defaults.channel, "beta");
   hasProblem(base({ updates: { majors: "never" as never } }), /updates.majors/);
   hasProblem(base({ updates: { webhookUrl: "http://x" } }), /updates.webhookUrl/);
   const r = resolveConfig(base());

@@ -5,10 +5,22 @@ name: Deploy
 # merges in the window into ONE deploy. The gate job skips the run when main hasn't
 # changed since the last successful deploy, so idle windows cost nothing.
 # `workflow_dispatch` is the on-demand escape hatch (always deploys).
+#
+# The hosted deploy never waits on self-host releases, and cuts none by
+# itself: the nightly beta and its promotion to stable run on their own
+# schedule (.github/workflows/auto-release.yml). Run this by hand with
+# "stable release" for an urgent fix: after the deploy, the deployed commit
+# is released to the stable channel right away.
 on:
   schedule:
     - cron: "*/10 * * * *"
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      stable_release:
+        description: "Also release this commit to self-hosted installs on the stable channel right away (an urgent fix)"
+        required: false
+        type: boolean
+        default: false
 
 # Serialize deploys and NEVER abort a live one (cancel-in-progress: false) — a
 # cancelled CDK deploy can leave a half-applied stack. A run that fires mid-deploy
@@ -172,16 +184,16 @@ jobs:
           CDK_DEFAULT_REGION: ${{ env.AWS_REGION }}
           MODEL_ID: claude-opus-4-8
 
-  # A deploy of main that went through releases exactly the commit it
-  # deployed (.github/workflows/auto-release.yml), in this same run, so a
-  # merge to main during the deploy never skips or changes the release. That
-  # workflow plans, skips when nothing self-hosted installs run changed or a
-  # later commit is already released, and checks again that it runs on main
-  # for a commit this workflow deployed.
+  # Run by hand with "stable release": a stable self-host release of exactly
+  # the commit it deployed (.github/workflows/auto-release.yml), in this same
+  # run, so a merge to main during the deploy never skips or changes the
+  # release. That workflow plans, skips when nothing self-hosted installs run
+  # changed or a later commit is already released, and checks again that it
+  # runs on main for a commit this workflow deployed.
   release:
     name: Self-host release
     needs: [gate, deploy]
-    if: needs.gate.outputs.changed == 'true' && github.ref == 'refs/heads/main'
+    if: needs.gate.outputs.changed == 'true' && github.ref == 'refs/heads/main' && github.event_name == 'workflow_dispatch' && inputs.stable_release
     uses: ./.github/workflows/auto-release.yml
     permissions:
       contents: write # the tag and the release notes
@@ -189,6 +201,7 @@ jobs:
       attestations: write # GitHub's attestation of the tag statement
       actions: write # the deploy's job results; start release.yml on the tag
       pull-requests: read # the notes
+      issues: read # the plan job asks for it (open release-blocker issues hold a promotion)
     with:
       commit: ${{ github.sha }}
     secrets:

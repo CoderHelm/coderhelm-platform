@@ -126,8 +126,8 @@ See [Integrations](./integrations.md).
   Maintenance window: a day (or `daily`) and an hour.
 - **`updates.timezone`** *string, default `UTC`*\
   IANA time zone of the window.
-- **`updates.channel`** *`stable` or `preview`, default `stable`*\
-  `preview` includes release candidates.
+- **`updates.channel`** *`stable` or `beta`, default `stable`*\
+  `beta` includes the nightly builds ([Channels](./updates.md#channels)). `preview`, the old name, means `beta`.
 - **`updates.majors`** *`ask` or `auto`, default `ask`*\
   `ask`: major releases wait for an admin.
 - **`updates.webhookUrl`** *string*\

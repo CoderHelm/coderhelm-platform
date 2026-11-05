@@ -20,9 +20,29 @@ Each deploy stamps the release version, commit, release date and a short fingerp
 
 The first self-host release is **v0.7.0**. Older `v0.2.x` to `v0.6.0` tags in the repository are from before self-hosting and have no releases; every self-host release sorts above them, so the updater's version comparison always moves forward. Updates only ever go to a published GitHub release, never to a bare tag.
 
+## Channels
+
+Each install follows one channel, chosen in **Settings, then System, then Automatic updates**:
+
+- **Stable** *(the default)*: releases that have run as a beta for a day with no reported problem. Version numbers look like `v0.8.38`.
+- **Beta (nightly)**: a new build of `main` each night that anything in a self-host release changed, the morning after it merged. Version numbers look like `v0.8.38-beta.20261105`. Beta installs get stable releases too.
+
+How a release moves from one to the other:
+
+1. **Every night**, when `main` changed since the last beta, CoderHelm cuts a beta from the commit the hosted service runs. It is signed and checked exactly like a stable release, and published on GitHub as a prerelease. Each beta gets its own version number, one above the one before.
+2. **A day later** (each day at 10:17 UTC), the newest beta that has been out for at least 24 hours becomes stable: the same commit, released again as the same number without the suffix (`v0.8.38-beta.20261105` becomes `v0.8.38`). It has its own tag, signature and files, checked the same way as every release.
+3. **A reported problem holds it.** A beta stays on the beta channel while an open issue with the `release-blocker` label in [the repository](https://github.com/CoderHelm/coderhelm-platform/issues) names it (or the stable version it would become). The next clean beta is promoted instead. Installs don't send update results to CoderHelm, so this label is the only signal: if an update to a beta fails or rolls back for you, open an issue that names the version.
+4. **An urgent fix** can go out the same day: a maintainer promotes a beta right away, or releases the commit the hosted service runs straight to stable.
+
+Switching from Beta to Stable never goes back to an older version: the install stays on its beta until a newer stable release is out. The stable release of the same number counts as newer (`v0.8.38` comes after `v0.8.38-beta.20261105`), so that is usually the next day.
+
+The setting was called `preview` before; an install or a config that still says `preview` follows the beta channel.
+
 ## How updates are found
 
-The updater (a Lambda in your account) checks GitHub for releases every hour. Opening **Settings, then System** reads the list again when it is more than two minutes old, and **Check for updates** under the Version status reads it right away; at most one read every 30 seconds per install, each one conditional (an unchanged list costs no GitHub API quota). Pressing **Update** reads the list first too, so it always installs the newest release at that moment. When `launch/latest.json` names a release that GitHub's list doesn't show yet, no older release is offered meanwhile.
+The updater (a Lambda in your account) checks GitHub for releases every hour. Opening **Settings, then System** reads the list again when it is more than two minutes old, and **Check for updates** under the Version status reads it right away (at most one read every few seconds per install for the button, every 30 seconds otherwise); each read is conditional, so an unchanged list costs no GitHub API quota. Pressing **Update** reads the list first too, so it always installs the newest release at that moment.
+
+Each channel also has a small pointer file, written when a release is published: `launch/latest.json` for stable and `launch/beta.json` for beta. The updater reads your channel's file at least every five minutes while the page is open and on every hourly check, and reads GitHub's list again as soon as the file names a release the list doesn't have. So a new release shows within minutes of being published. When the file names a release that GitHub's list doesn't show yet, no older release is offered meanwhile.
 
 When a newer release appears it emails every install admin once, and posts to your Slack or Teams webhook if you set `updates.webhookUrl`. The notice links to **Settings, then System**, where the release notes are.
 
@@ -45,7 +65,7 @@ npx -y github:CoderHelm/coderhelm-platform auto-update on --window "Sun 03:00" -
 - **Time zone** *default UTC*\
   Any IANA name.
 - **Channel** *default stable*\
-  `stable`, or `preview` for release candidates too.
+  `stable`, or `beta` for the nightly builds too ([Channels](#channels)).
 - **Majors** *default ask*\
   `ask`: a new major version waits for an admin; `auto`: it installs too.
 
@@ -197,6 +217,6 @@ Each release (a `vX.Y.Z` tag) has, on its GitHub release page:
 | `coderhelm-log-reader.yaml`, `coderhelm-log-reader-update.yaml` | The log reader role template, and its update |
 | `SHA256SUMS`, `SHA256SUMS.sigstore.json` | Checksums, and their keyless signature |
 
-The Launch Stack files are also in S3, written once by version: `https://coderhelm-public.s3.amazonaws.com/launch/<version>/coderhelm.json`, with `stacks/<Part>.json` and `assets/<hash>.zip` next to it. `https://coderhelm-public.s3.amazonaws.com/launch/latest.json` names the newest stable release, its `templateUrl` and the `templateSha256` of its `coderhelm.json`.
+The Launch Stack files are also in S3, written once by version: `https://coderhelm-public.s3.amazonaws.com/launch/<version>/coderhelm.json`, with `stacks/<Part>.json` and `assets/<hash>.zip` next to it. `https://coderhelm-public.s3.amazonaws.com/launch/latest.json` names the newest stable release, its `templateUrl` and the `templateSha256` of its `coderhelm.json`; `launch/beta.json` has the same shape and names the newest release of either channel.
 
 Every artifact also has a GitHub build provenance attestation. To check a release yourself, see [Verify a release before launching](./updates-security.md#verify-a-release-before-launching) and [How updates are kept safe](./updates-security.md#check-a-release-yourself).

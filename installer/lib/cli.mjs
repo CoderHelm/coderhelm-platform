@@ -31,7 +31,7 @@ Commands
                 (--auto-rollback goes back if the new release is unhealthy)
   rollback      Go back to the previous release (or --to vX.Y.Z)
   auto-update   on | off | status [--window "Sun 03:00"] [--timezone UTC]
-                [--channel stable|preview] [--majors ask|auto]
+                [--channel stable|beta] [--majors ask|auto]
   health        The quick health check the updater runs (doctor checks more)
   backup        Take on-demand backups of every table
   uninstall     A native install (one stack, coderhelm-<name>): Delete stack in

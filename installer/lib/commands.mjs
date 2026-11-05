@@ -1045,7 +1045,7 @@ export function parseWindow(w) {
 
 /**
  * auto-update on|off [--window "Sun 03:00"] [--timezone Europe/Berlin]
- * [--channel stable|preview] [--majors ask|auto]: saved in the config (the
+ * [--channel stable|beta] [--majors ask|auto]: saved in the config (the
  * starting point of a deploy) and applied to the running updater at once.
  */
 export async function autoUpdate(ctx) {
@@ -1064,8 +1064,9 @@ export async function autoUpdate(ctx) {
     u.window = flags.window;
   }
   if (flags.channel !== undefined) {
-    if (!["stable", "preview"].includes(flags.channel)) throw new Error("--channel: stable or preview");
-    u.channel = flags.channel;
+    // "preview" is the old name of beta.
+    if (!["stable", "beta", "preview"].includes(flags.channel)) throw new Error("--channel: stable or beta");
+    u.channel = flags.channel === "preview" ? "beta" : flags.channel;
   }
   if (flags.majors !== undefined) {
     if (!["ask", "auto"].includes(flags.majors)) throw new Error("--majors: ask or auto");
