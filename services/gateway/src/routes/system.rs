@@ -125,7 +125,9 @@ pub fn settings_from(body: &Value) -> Result<Value, &'static str> {
     let Some(obj) = body.as_object() else {
         return Err("send an object of settings");
     };
-    const KEYS: &[&str] = &["auto", "channel", "day", "hour", "timezone", "majors"];
+    const KEYS: &[&str] = &[
+        "auto", "channel", "day", "hour", "timezone", "majors", "digest",
+    ];
     if let Some(k) = obj.keys().find(|k| !KEYS.contains(&k.as_str())) {
         let _ = k;
         return Err("unknown setting");
@@ -133,7 +135,7 @@ pub fn settings_from(body: &Value) -> Result<Value, &'static str> {
     Ok(Value::Object(obj.clone()))
 }
 
-/// PUT /api/system/auto-update: on or off, channel, window, majors.
+/// PUT /api/system/auto-update: on or off, channel, window, majors, digest.
 pub async fn set_auto_update(
     State(state): State<Arc<AppState>>,
     Extension(claims): Extension<Claims>,

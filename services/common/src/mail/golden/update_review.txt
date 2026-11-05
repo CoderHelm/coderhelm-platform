@@ -1,0 +1,24 @@
+From: "Acme CoderHelm" <notifications@notify.coderhelm.com>
+Subject: Acme CoderHelm: update to v0.8.0 needs your OK
+
+An update to v0.8.0 is prepared and waits for an admin's OK. Nothing has changed yet.
+
+Install: helm.example.org
+Running now: v0.7.4
+Waiting to install: v0.8.0
+Waiting since: 2026-10-24 03:10 UTC
+Checked: 2026-10-31 14:05 UTC
+
+Why it waits:
+> auto-update held: it changes permissions (the api role gains s3:GetObject)
+
+What to do:
+> Open Settings, then System, check what it changes and press Apply.
+
+Open Settings, System: https://helm.example.org/settings/system/
+
+Read the release notes: https://helm.example.org/settings/system/#version
+
+
+
+Sent through CoderHelm's mail service for the self-hosted CoderHelm install at helm.example.org. Links in this email go only to that install. Questions about it go to the install's admin, admin@example.org. CoderHelm never asks for your password or sign-in codes by email.

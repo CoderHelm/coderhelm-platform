@@ -170,6 +170,28 @@ fn cases() -> Vec<(&'static str, &'static str, Value, Option<&'static str>)> {
             Some("Acme"),
         ),
         (
+            "update_review",
+            "update_notice",
+            json!({
+                "what": "review", "version": "v0.8.0", "current": "v0.7.4", "link": sys,
+                "checked_at": "2026-10-31 14:05 UTC", "waiting": "2026-10-24 03:10 UTC",
+                "reason": "auto-update held: it changes permissions (the api role gains s3:GetObject)",
+                "action": "Open Settings, then System, check what it changes and press Apply.",
+                "notes_link": notes,
+            }),
+            Some("Acme"),
+        ),
+        (
+            "update_digest",
+            "update_notice",
+            json!({
+                "what": "digest", "version": "v0.9.0", "current": "v0.8.2", "link": sys,
+                "checked_at": "2026-11-01 03:00 UTC", "on_latest": "no",
+                "notes": "v0.9.0 (2026-10-30): A guided uninstall.\nv0.8.3 (2026-10-27): Faster reviews on large pull requests.",
+            }),
+            Some("Acme"),
+        ),
+        (
             "domain_live",
             "update_notice",
             json!({"what": "domain_live", "link": format!("{APP}/settings/system/#domain"), "checked_at": "2026-10-31 15:00 UTC"}),

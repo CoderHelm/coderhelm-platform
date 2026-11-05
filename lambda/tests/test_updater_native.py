@@ -14,7 +14,7 @@ import json
 import pathlib
 import sys
 import unittest
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 PATH = pathlib.Path(__file__).resolve().parents[1] / "updater" / "handler.py"
 spec = importlib.util.spec_from_file_location("updater_native", PATH)
@@ -815,6 +815,21 @@ class AdminApplies(unittest.TestCase):
         finally:
             u.begin = orig
         self.assertEqual(calls, [{"scheduled": True}])
+
+    def test_a_held_update_emails_needs_your_ok_once_per_version(self):
+        subjects = []
+        u.notify = lambda subject, text, env=None, **kw: subjects.append((subject, kw.get("what"))) or 1
+        self.store.put("AUTO_UPDATE", {"auto": True})
+        api = [{"ResourceChange": {"Action": "Remove", "ResourceType": "AWS::S3::Bucket", "LogicalResourceId": "Data"}}]
+        self.assertEqual(self.prepare(actor="auto", scheduled=True, api=api)["native"], "review")
+        u.native_poll(self.store, self.env, NOW)
+        # Prepared again for the same version (the new prepare replaces the old one): still one email.
+        self.assertEqual(self.prepare(actor="auto", scheduled=True, api=api)["native"], "review")
+        self.assertEqual(subjects, [("update to v1.1.0 needs your OK", "review")])
+        # Still waiting a week later: one reminder, never another.
+        for days in (3, 6.9, 7, 8, 30):
+            u.remind_waiting(self.store, self.env, NOW + timedelta(days=days), "v1.0.0")
+        self.assertEqual(subjects, [("update to v1.1.0 needs your OK", "review"), ("update to v1.1.0 still needs your OK", "review")])
 
     def test_scheduled_data_changes_are_held_as_today(self):
         self.store.put("AUTO_UPDATE", {"auto": True})

@@ -393,12 +393,12 @@ class Handler(unittest.TestCase):
         u.handler({"action": "status"}, None)
         self.assertIs(got["hint"], u.fetch_latest)
 
-    def test_tick_with_auto_update_on_starts_the_build_and_notifies_once(self):
+    def test_tick_with_auto_update_on_starts_the_build_without_an_email(self):
         u.handle({"action": "settings", "settings": {"auto": True, "majors": "ask"}}, self.env, self.store, SUNDAY_3AM, self.fetch)
         d = u.handle({"action": "tick"}, self.env, self.store, SUNDAY_3AM, lambda r: [rel("v1.1.0")])
         self.assertEqual(d["action"], "update")
         self.assertEqual(self.builds[0][:3], ("v1.1.0", "auto", "update"))
-        self.assertEqual(self.notices, ["v1.1.0 is available"])
+        self.assertEqual(self.notices, [], "a new release never emails: the page shows it")
         again = u.handle({"action": "tick"}, self.env, self.store, SUNDAY_3AM + timedelta(minutes=1), lambda r: [rel("v1.1.0")])
         self.assertEqual(again["reason"], "an update is running")
         self.assertEqual(len(self.builds), 1)
@@ -432,6 +432,155 @@ class Handler(unittest.TestCase):
         with self.assertRaises(ValueError):
             u.handle({"action": "settings", "settings": {"hour": 99}}, self.env, self.store, SUNDAY_3AM, self.fetch)
         self.assertIsNone(self.store.get("AUTO_UPDATE"))
+
+
+def released(tag, at, pre=False, body="## What's changed\n- Faster reviews on large pull requests.\n- A guided uninstall."):
+    return {"tag_name": tag, "prerelease": pre, "draft": False, "body": body,
+            "published_at": at.strftime("%Y-%m-%dT%H:%M:%SZ"), "html_url": f"https://x/{tag}"}
+
+
+class NoticePolicy(unittest.TestCase):
+    """Admins are emailed only when a person must act or something went
+    wrong, each at most once per version and reason; plus the digest."""
+
+    def setUp(self):
+        self.store = u.Store(FakeDynamo(), "t")
+        self.builds, self.sent = [], []
+        real_build, real_notify, real_manifest = u.start_build, u.notify, u.verified_manifest
+        u.start_build = lambda env, version, actor, mode, hid, extra=None: self.builds.append((version, actor, mode, hid)) or "b-1"
+        u.notify = lambda subject, text, env=None, **kw: self.sent.append(dict(kw, subject=subject, text=text)) or 1
+        u.verified_manifest = lambda store, version: (True, None)
+        self.addCleanup(setattr, u, "start_build", real_build)
+        self.addCleanup(setattr, u, "notify", real_notify)
+        self.addCleanup(setattr, u, "verified_manifest", real_manifest)
+        self.env = {"CODERHELM_VERSION": "v1.0.0", "APP_URL": "https://helm.example.org", "UPDATE_PROJECT_NAME": "p"}
+        self.out = []
+
+    def fetch(self, _repo):
+        return list(self.out)
+
+    def settings(self, **kw):
+        u.handle({"action": "settings", "settings": kw}, self.env, self.store, SUNDAY_3AM, self.fetch)
+
+    def tick(self, at):
+        return u.handle({"action": "tick"}, self.env, self.store, at, self.fetch)
+
+    def ticks(self, start, days, every=timedelta(hours=6)):
+        at = start
+        while at <= start + timedelta(days=days):
+            self.tick(at)
+            at += every
+
+    def whats(self):
+        return [n.get("what") for n in self.sent]
+
+    def finish(self, status, version="v1.1.0"):
+        e = u.handle({"action": "update_now", "actor": "a@example.org", "version": version}, self.env, self.store, SUNDAY_3AM, self.fetch)
+        u.handle({"action": "finished", "status": status, "reason": "the api stack failed", "history_id": e["id"]},
+                 self.env, self.store, SUNDAY_3AM, self.fetch)
+
+    def test_new_releases_and_majors_never_email(self):
+        self.settings(digest="off")
+        self.out = [released("v1.1.0", SUNDAY_3AM - timedelta(days=1))]
+        self.ticks(SUNDAY_3AM, 2)
+        self.out.append(released("v2.0.0", SUNDAY_3AM + timedelta(days=2)))
+        self.ticks(SUNDAY_3AM + timedelta(days=2), 2)
+        self.assertEqual(self.sent, [])
+
+    def test_success_never_emails_failure_and_rollback_once_each(self):
+        self.out = [released("v1.1.0", SUNDAY_3AM - timedelta(days=1))]
+        self.finish("succeeded")
+        self.assertEqual(self.sent, [], "a finished update is in the history")
+        self.finish("failed")
+        self.finish("failed")
+        self.assertEqual(self.whats(), ["failed"])
+        self.assertEqual(self.sent[0]["subject"], "update to v1.1.0 failed")
+        self.finish("rolled_back")
+        self.finish("rolled_back")
+        self.assertEqual(self.whats(), ["failed", "rolled_back"])
+
+    def test_beta_prereleases_never_email_unless_they_fail(self):
+        self.settings(channel="preview", digest="off")
+        self.out = [released("v1.1.0-rc.1", SUNDAY_3AM - timedelta(hours=1), pre=True)]
+        self.ticks(SUNDAY_3AM, 3)
+        self.assertEqual(self.sent, [])
+        self.finish("failed", "v1.1.0-rc.1")
+        self.assertEqual(self.whats(), ["failed"])
+
+    def test_digest_off_sends_nothing(self):
+        self.settings(digest="off")
+        self.ticks(SUNDAY_3AM, 1)
+        self.out = [released("v1.1.0", SUNDAY_3AM + timedelta(days=2))]
+        self.ticks(SUNDAY_3AM + timedelta(days=1), 30)
+        self.assertEqual(self.sent, [])
+
+    def test_no_digest_when_nothing_is_new(self):
+        self.out = [released("v1.1.0", SUNDAY_3AM - timedelta(days=2))]
+        self.ticks(SUNDAY_3AM, 20)
+        self.assertEqual(self.sent, [], "the first tick starts the clock; nothing came out since")
+
+    def test_one_digest_per_week_across_many_ticks(self):
+        self.assertEqual(u.handle({"action": "status"}, self.env, self.store, SUNDAY_3AM, self.fetch)["settings"]["digest"], "weekly")
+        self.tick(SUNDAY_3AM)
+        self.out = [released("v1.1.0", SUNDAY_3AM + timedelta(days=1), body="## Changes\n- **Faster** reviews, see [notes](https://x).")]
+        self.ticks(SUNDAY_3AM + timedelta(hours=1), 6.9, timedelta(hours=1))
+        self.assertEqual(self.sent, [], "never before a week has passed")
+        self.ticks(SUNDAY_3AM + timedelta(days=7), 2, timedelta(hours=1))
+        self.assertEqual(self.whats(), ["digest"])
+        d = self.sent[0]
+        self.assertEqual((d["subject"], d["version"]), ("what's new, up to v1.1.0", "v1.1.0"))
+        self.assertIn("v1.1.0 (2026-10-26): Faster reviews, see notes.", d["facts"]["notes"])
+        self.assertEqual(d["facts"]["on_latest"], "no")
+        # A release three days later waits for the next week.
+        self.out.append(released("v1.2.0", SUNDAY_3AM + timedelta(days=10)))
+        self.ticks(SUNDAY_3AM + timedelta(days=9), 4.9, timedelta(hours=1))
+        self.assertEqual(self.whats(), ["digest"])
+        self.ticks(SUNDAY_3AM + timedelta(days=14), 6)
+        self.assertEqual(self.whats(), ["digest", "digest"])
+        self.assertIn("v1.2.0", self.sent[1]["facts"]["notes"])
+        self.assertNotIn("v1.1.0", self.sent[1]["facts"]["notes"], "only what came out since the last one")
+
+    def test_biweekly_waits_two_weeks(self):
+        self.settings(digest="biweekly")
+        self.tick(SUNDAY_3AM)
+        self.out = [released("v1.1.0", SUNDAY_3AM + timedelta(days=1))]
+        self.ticks(SUNDAY_3AM + timedelta(hours=6), 13.5)
+        self.assertEqual(self.sent, [])
+        self.ticks(SUNDAY_3AM + timedelta(days=14), 5)
+        self.assertEqual(self.whats(), ["digest"])
+
+    def test_digest_folds_in_prereleases_only_for_preview_installs(self):
+        self.env["CODERHELM_VERSION"] = "v1.1.0"
+        self.tick(SUNDAY_3AM)
+        self.out = [released("v1.1.0", SUNDAY_3AM - timedelta(days=3)),
+                    released("v1.2.0-rc.1", SUNDAY_3AM + timedelta(days=2), pre=True)]
+        self.ticks(SUNDAY_3AM + timedelta(days=7), 1)
+        self.assertEqual(self.sent, [], "a stable install never hears of a prerelease")
+        self.settings(channel="preview")
+        self.ticks(SUNDAY_3AM + timedelta(days=8), 1)
+        self.assertEqual(self.whats(), ["digest"])
+        self.assertIn("v1.2.0-rc.1", self.sent[0]["facts"]["notes"])
+
+    def test_digest_says_when_the_install_is_on_the_newest_release(self):
+        self.env["CODERHELM_VERSION"] = "v1.1.0"
+        self.tick(SUNDAY_3AM)
+        self.out = [released("v1.1.0", SUNDAY_3AM + timedelta(days=1))]
+        self.ticks(SUNDAY_3AM + timedelta(days=7), 1)
+        self.assertEqual(self.sent[0]["facts"]["on_latest"], "yes")
+
+    def test_digest_setting_is_checked(self):
+        with self.assertRaisesRegex(ValueError, "digest: weekly, biweekly or off"):
+            self.settings(digest="daily")
+
+    def test_digest_renders_for_the_install_ses(self):
+        n = u.notice("digest", "v1.2.0", self.env, {"current": "v1.1.0", "notes": "v1.2.0 (2026-11-01): Faster.", "on_latest": "no"})
+        self.assertEqual(n["base_subject"], "what's new, up to v1.2.0")
+        self.assertIn("isn't on the newest release yet", n["text"])
+        self.assertNotIn("notes_link", n["params"], "one link: Settings, System")
+        self.assertEqual(n["params"]["on_latest"], "no")
+        r = u.notice("review", "v1.2.0", self.env, {"reason": "it changes permissions", "waiting": "2026-10-24 03:10 UTC"})
+        self.assertEqual(r["base_subject"], "update to v1.2.0 needs your OK")
+        self.assertIn("Waiting since: 2026-10-24 03:10 UTC", r["text"])
 
 
 class NoDowngrade(unittest.TestCase):
@@ -787,6 +936,14 @@ class ModelCheck(unittest.TestCase):
         out = u.handler({"action": "update_now", "actor": "a"}, None)
         self.assertFalse(out["ok"])
         self.assertEqual(out["model_check"]["version"], "v1.1.0")
+
+
+    def test_one_reminder_after_a_week_of_waiting_and_no_more(self):
+        self.tick(SUNDAY_3AM)
+        self.assertEqual(self.notices, ["update to v1.1.0 needs your OK"])
+        for h in range(6, 24 * 12, 6):
+            self.tick(SUNDAY_3AM + timedelta(hours=h))
+        self.assertEqual(self.notices, ["update to v1.1.0 needs your OK", "update to v1.1.0 still needs your OK"])
 
 
 class NeverAcceptsTerms(unittest.TestCase):

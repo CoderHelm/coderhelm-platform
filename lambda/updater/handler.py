@@ -81,6 +81,7 @@ State lives on the settings table under pk SYSTEM. The domain's states and
 checks are documented in docs/self-host/domains.md.
 """
 
+import functools
 import json
 import urllib.parse
 import logging
@@ -145,7 +146,10 @@ DEFAULT_SETTINGS = {
     "hour": 3,
     "timezone": "UTC",
     "majors": "ask",
+    # The "What's new" email: weekly, biweekly or off.
+    "digest": "weekly",
 }
+DIGESTS = {"weekly": timedelta(days=7), "biweekly": timedelta(days=14), "off": None}
 
 VERSION_RE = re.compile(r"^v?(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?$")
 
@@ -239,6 +243,10 @@ def validate_settings(raw, base=None):
         if raw["majors"] not in MAJORS:
             raise ValueError("majors: ask or auto")
         s["majors"] = raw["majors"]
+    if "digest" in raw:
+        if raw["digest"] not in DIGESTS:
+            raise ValueError("digest: weekly, biweekly or off")
+        s["digest"] = raw["digest"]
     return s
 
 
@@ -584,7 +592,8 @@ def ran_versions(store, state, current):
 # or is "off" when the config turned hybrid off.
 DEFAULT_HOSTED_URL = "https://api.coderhelm.com"
 CODERHELM_ADDRESS = re.compile(r"@(?:[a-z0-9-]+\.)*coderhelm\.com$", re.I)
-UPDATE_WHAT = ("available", "succeeded", "failed", "rolled_back", "blocked", "domain_live", "domain_failed", "domain_removed")
+UPDATE_WHAT = ("available", "succeeded", "failed", "rolled_back", "blocked", "domain_live", "domain_failed", "domain_removed",
+               "review", "digest")
 NOTICE_VERSION_RE = re.compile(r"^[A-Za-z0-9.+-]{1,40}$")
 
 
@@ -697,6 +706,15 @@ def relay_credentials(env):
 # parameters below; the install's own SES gets the same parts written here.
 # Keep the two in step (the golden files under services/common/src/mail/golden
 # show the relay's).
+#
+# Admins are emailed only when a person must act or something went wrong:
+# an update failed or rolled back, an update waits for their OK (a prepared
+# update to review, or a model check refusing it; one reminder after
+# REMIND_AFTER), and address changes. Each at most once per version and reason
+# (`notify_once`). A new release and a finished update never email: Settings,
+# System shows both. Besides these, the optional "What's new" digest
+# (settings `digest`: weekly, biweekly or off) sums up new releases.
+# "available" and "succeeded" stay renderable for the relay's older installs.
 
 CLI = "npx -y github:CoderHelm/coderhelm-platform"
 CODERHELM_ZONE = "coderhelm.com"
@@ -709,6 +727,8 @@ NOTICE_SUBJECTS = {
     "domain_live": "the new address is live",
     "domain_failed": "the address change failed",
     "domain_removed": "back on the AWS address",
+    "review": "update to {version} needs your OK",
+    "digest": "what's new, up to {version}",
 }
 # The relay refuses an email whose text reads as CoderHelm staff speaking
 # (templates::uses_reserved_wording): such a part is left out instead.
@@ -830,7 +850,7 @@ def update_params(what, version, env, facts=None):
     p = {"what": what, "link": notice_link(what, env)}
     if version and NOTICE_VERSION_RE.match(str(version)):
         p["version"] = str(version)
-        if not what.startswith("domain_"):
+        if not what.startswith("domain_") and what != "digest":
             p["notes_link"] = f"{app_url(env)}/settings/system/#version"
     facts = facts or {}
     cur = facts.get("current")
@@ -845,6 +865,8 @@ def update_params(what, version, env, facts=None):
             p[k] = v
     if facts.get("major"):
         p["major"] = "yes"
+    if what == "digest" and facts.get("on_latest") in ("yes", "no"):
+        p["on_latest"] = facts["on_latest"]
     return p
 
 
@@ -913,6 +935,22 @@ def notice(what, version, env, facts=None):
         "domain_removed": [
             ("p", "This install is back on its AWS address. People sign in there from now on."),
             ("facts", [("Install", "{install}"), ("Changed", "{checked_at}")]),
+        ],
+        "review": [
+            ("p", "An update to {version} is prepared and waits for an admin's OK. Nothing has changed yet."),
+            ("facts", [("Install", "{install}"), ("Running now", "{current}"), ("Waiting to install", "{version}"),
+                       ("Waiting since", "{waiting}"), ("Checked", "{checked_at}")]),
+            ("quote", "Why it waits", "reason"),
+            ("quote", "What to do", "action"),
+        ],
+        "digest": [
+            ("p", "What's new in CoderHelm since the last summary."),
+            ("facts", [("Install", "{install}"), ("Running now", "{current}"), ("Newest release", "{version}"),
+                       ("Checked", "{checked_at}")]),
+            ("quote", "Releases", "notes"),
+            ("p", {"yes": "This install runs the newest release. Nothing to do.",
+                   "no": "This install isn't on the newest release yet. Settings, System shows the release notes and Update now."}
+             .get(v.get("on_latest"), "")),
         ],
     }[w]
     buttons = [("Open Update readiness" if w == "blocked" else "Open Settings, System", "link"),
@@ -1038,6 +1076,126 @@ def notify(subject, text, env=None, what="available", version=None, opener=None,
         except Exception as e:
             logger.warning(f"Update webhook not posted: {e}")
     return sent
+
+
+NOTICES = "NOTICES"
+# An update waiting this long for an admin gets one reminder.
+REMIND_AFTER = timedelta(days=7)
+DIGEST_LINES = 10
+
+
+def notify_once(store, key, now, subject, text, env=None, **kw):
+    """notify(), at most once per `key` ("<reason>:<version>") whatever the
+    ticks: the keys sent are kept on the settings table (sk NOTICES)."""
+    rec = store.get(NOTICES, {}) or {}
+    sent = dict(rec.get("sent") or {})
+    if key in sent:
+        return 0
+    n = notify(subject, text, env, **kw)
+    sent[key] = now.isoformat()
+    # Keep the newest keys only: an old version's never come back.
+    sent = dict(sorted(sent.items(), key=lambda kv: kv[1])[-200:])
+    store.put(NOTICES, dict(store.get(NOTICES, {}) or {}, sent=sent))
+    return n
+
+
+def when(iso):
+    try:
+        at = datetime.fromisoformat(str(iso))
+    except (TypeError, ValueError):
+        return None
+    return at if at.tzinfo else at.replace(tzinfo=timezone.utc)
+
+
+def remind_waiting(store, env, now, current):
+    """One reminder when an update has waited REMIND_AFTER for an admin: a
+    prepared update to review, or a model check that refuses it."""
+    state = store.get("UPDATE_STATE", {}) or {}
+    hid = state.get("review_id")
+    entry = (store.get(hid, {}) or {}) if hid else {}
+    if entry.get("status") == "review" and entry.get("version"):
+        version = entry["version"]
+        since = when(entry.get("review_at") or entry.get("started_at"))
+        how = (f"Open Settings, then System, check what it changes and press Apply: {app_url(env)}/settings/system/#version"
+               if can_apply_here(env, entry) else
+               "CoderHelm can't apply this one for you: someone with AWS admin rights reviews it and chooses Execute in the AWS console.")
+        what, facts = "review", {"reason": entry.get("reason"), "action": how}
+    else:
+        mc = store.get("MODEL_CHECK") or {}
+        version = mc.get("version")
+        if not version or not failures(mc, required=True) or not parse_version(version):
+            return 0
+        if current and parse_version(current) and compare(version, current) <= 0:
+            return 0
+        since = when(((store.get(NOTICES, {}) or {}).get("sent") or {}).get(f"blocked:{version}"))
+        what, facts = "blocked", {"reason": blocked_reason(mc), "action": blocked_action(mc)}
+    if not since or now - since < REMIND_AFTER:
+        return 0
+    facts.update({"current": current, "checked_at": checked_at(now), "waiting": checked_at(since)})
+    return notify_once(store, f"reminder:{version}", now, f"update to {version} still needs your OK",
+                       f"The update to {version} has waited since {checked_at(since)}.\n{app_url(env)}/settings/system/",
+                       env, what=what, version=version, facts=facts)
+
+
+def headline(body):
+    """A release's first line of notes that isn't a heading, as plain words."""
+    for line in str(body or "").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        line = re.sub(r"\[([^\]]*)\]\([^)]*\)", r"\1", line.lstrip("-*+ ").strip())
+        line = line.replace("**", "").replace("`", "")
+        if line:
+            return fit(line, 140)
+    return ""
+
+
+def digest_releases(releases, channel, since):
+    """The releases published after `since` on `channel` (prereleases only on
+    a channel other than stable), newest first."""
+    out = []
+    for r in releases or []:
+        tag = r.get("tag_name") or r.get("version")
+        p = parse_version(tag)
+        if not p or r.get("draft"):
+            continue
+        if (bool(r.get("prerelease")) or bool(p[3])) and channel == "stable":
+            continue
+        at = when((r.get("published_at") or "").replace("Z", "+00:00"))
+        if at and at > since:
+            out.append({"version": tag, "at": at, "headline": headline(r.get("body"))})
+    out.sort(key=functools.cmp_to_key(lambda a, b: compare(a["version"], b["version"])), reverse=True)
+    return out
+
+
+def send_digest(store, env, now, settings, releases, current):
+    """The "What's new" email: at most once per period, only with a new
+    release on the install's channel since the last one. The first tick only
+    starts the clock."""
+    period = DIGESTS.get(settings.get("digest"))
+    if not period:
+        return 0
+    rec = store.get(NOTICES, {}) or {}
+    last = when(rec.get("digest_at"))
+    if not last:
+        store.put(NOTICES, dict(rec, digest_at=now.isoformat()))
+        return 0
+    if now - last < period:
+        return 0
+    new = digest_releases(releases, settings["channel"], last)
+    if not new:
+        return 0
+    # Recorded before sending: a failed send waits for the next period, never repeats.
+    store.put(NOTICES, dict(rec, digest_at=now.isoformat()))
+    top = new[0]["version"]
+    lines = [f"{r['version']} ({r['at'].strftime('%Y-%m-%d')})" + (f": {r['headline']}" if r["headline"] else "")
+             for r in new[:DIGEST_LINES]]
+    if len(new) > DIGEST_LINES:
+        lines.append(f"and {len(new) - DIGEST_LINES} more")
+    on_latest = "yes" if pick_latest(releases, settings["channel"], current) is None else "no"
+    return notify(f"what's new, up to {top}", "\n".join(lines) + f"\n{app_url(env)}/settings/system/", env,
+                  what="digest", version=top,
+                  facts={"current": current, "checked_at": checked_at(now), "notes": "\n".join(lines), "on_latest": on_latest})
 
 
 def start_build(env, version, actor, mode, history_id, extra=None):
@@ -1619,9 +1777,10 @@ def checked(record):
 def notify_blocked(store, env, record):
     if record.get("notified") or not failures(record, required=True):
         return
-    notify(f"update to {record['version']} needs your OK", blocked_text(record, env), env, what="blocked", version=record.get("version"),
-           facts={"current": env.get("CODERHELM_VERSION"), "checked_at": checked_at(checked(record)),
-                  "reason": blocked_reason(record), "action": blocked_action(record)})
+    notify_once(store, f"blocked:{record.get('version')}", checked(record),
+                f"update to {record['version']} needs your OK", blocked_text(record, env), env, what="blocked", version=record.get("version"),
+                facts={"current": env.get("CODERHELM_VERSION"), "checked_at": checked_at(checked(record)),
+                       "reason": blocked_reason(record), "action": blocked_action(record)})
     record["notified"] = True
     store.put("MODEL_CHECK", record)
 
@@ -2277,6 +2436,7 @@ def native_poll(store, env, now, cfn=None):
         if entry.get("status") != "review":
             # Waiting on an admin: not "running", so it never blocks or goes stale.
             entry["status"] = "review"
+            entry["review_at"] = now.isoformat()
             if not keep(entry):
                 return {"native": "moved on"}
             state.pop("running_since", None)
@@ -2287,9 +2447,11 @@ def native_poll(store, env, now, cfn=None):
                 how = f"Open Settings, then System, check what it changes and press Apply:\n{app_url(env)}/settings/system/#version"
             else:
                 how = f"CoderHelm can't apply this one for you. Review it and choose Execute in the AWS console:\n{summary['link']}"
-            notify(f"CoderHelm {entry.get('version')} is ready to apply",
-                   f"The stack update is prepared. {entry.get('reason') or ''}\n{how}".replace(". \n", ".\n"),
-                   env, what="review", version=entry.get("version"))
+            notify_once(store, f"review:{entry.get('version')}", now, f"update to {entry.get('version')} needs your OK",
+                        f"The stack update is prepared. {entry.get('reason') or ''}\n{how}".replace(". \n", ".\n"),
+                        env, what="review", version=entry.get("version"),
+                        facts={"current": entry.get("from_version"), "checked_at": checked_at(now),
+                               "reason": entry.get("reason"), "action": how})
         else:
             keep(entry)
         return {"native": "review"}
@@ -2946,20 +3108,22 @@ def handle(event, env, store, now, fetch=fetch_releases, probe=None, hint=None):
         if status == "succeeded" and parse_version(version):
             state["ran_versions"] = sorted(set(state.get("ran_versions") or []) | {version})
         store.put("UPDATE_STATE", state)
-        notify(
-            NOTICE_SUBJECTS[status].format(version=version),
-            f"{entry.get('reason') or 'Done.'}\nActor: {entry.get('actor', 'auto')}\n{app_url(env)}/settings/system/",
-            env,
-            what=status,
-            version=version,
-            facts={
-                "current": entry.get("from_version"),
-                "checked_at": checked_at(now),
-                "reason": entry.get("reason"),
-                "action": None if status == "succeeded" else
-                "Open the update's log under Settings, System, Update history, fix what it names, then press Update now.",
-            },
-        )
+        if status != "succeeded":
+            # A finished update is in the history; only a failure emails.
+            notify_once(
+                store, f"{status}:{version}", now,
+                NOTICE_SUBJECTS[status].format(version=version),
+                f"{entry.get('reason') or 'Done.'}\nActor: {entry.get('actor', 'auto')}\n{app_url(env)}/settings/system/",
+                env,
+                what=status,
+                version=version,
+                facts={
+                    "current": entry.get("from_version"),
+                    "checked_at": checked_at(now),
+                    "reason": entry.get("reason"),
+                    "action": "Open the update's log under Settings, System, Update history, fix what it names, then press Update now.",
+                },
+            )
         return {"status": status, "version": version}
 
     if action == "refresh_secrets":
@@ -2997,18 +3161,8 @@ def handle(event, env, store, now, fetch=fetch_releases, probe=None, hint=None):
         else:
             d = decide(now, settings, current, rel, state, mc)
         if d["action"] in ("notify", "update") and state.get("notified_version") != d.get("version"):
-            latest = pick_latest(rel, settings["channel"], current) or {}
-            notify(
-                f"{d['version']} is available",
-                f"You run {current or 'an unknown version'}. {d['reason'].capitalize()}.\n"
-                f"{'This is a major release. ' if latest.get('breaking') else ''}"
-                f"Release notes and Update now: {app_url(env)}/settings/system/",
-                env,
-                what="available",
-                version=d["version"],
-                facts={"current": current, "checked_at": checked_at(now), "waiting": d["reason"],
-                       "notes": latest.get("notes"), "major": latest.get("breaking")},
-            )
+            # Seen once. No email: Settings, System shows a new release
+            # (a major one too), and the digest sums them up.
             state = store.get("UPDATE_STATE", {})
             state["notified_version"] = d["version"]
             store.put("UPDATE_STATE", state)
@@ -3021,6 +3175,8 @@ def handle(event, env, store, now, fetch=fetch_releases, probe=None, hint=None):
                      "reason": "a model this release calls was refused; checking again daily"}
             else:
                 begin(store, env, now, d["version"], "auto", "update", scheduled=True)
+        remind_waiting(store, env, now, current)
+        send_digest(store, env, now, settings, rel, current)
         logger.info(json.dumps(d))
         return d
 
