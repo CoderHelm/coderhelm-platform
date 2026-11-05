@@ -174,16 +174,6 @@ pub fn optional(f: &Finding) -> bool {
     matches!(classify(f), Class::Note(r) if r == PREFERENCE || r == OPTIONAL)
 }
 
-/// The verdict as posted: never APPROVE while a finding holds the merge,
-/// whatever decided it upstream.
-pub fn consistent_verdict(verdict: &'static str, findings: &[Finding]) -> &'static str {
-    if verdict == "APPROVE" && findings.iter().any(Finding::holds_merge) {
-        "REQUEST_CHANGES"
-    } else {
-        verdict
-    }
-}
-
 /// The rubric. Pure over the finding's fields.
 pub fn classify(f: &Finding) -> Class {
     if f.note_only.is_some() {

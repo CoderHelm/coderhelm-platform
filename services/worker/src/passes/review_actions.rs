@@ -227,6 +227,8 @@ pub struct ActionReport {
 pub struct Approvals {
     /// People whose latest verdict is APPROVED.
     pub approved_by: Vec<String>,
+    /// Of those, the ones whose approval is of the head commit.
+    pub approved_at_head: Vec<String>,
     /// Reviewers (people or other bots) whose latest verdict is
     /// CHANGES_REQUESTED.
     pub blocking_by: Vec<String>,
@@ -235,10 +237,12 @@ pub struct Approvals {
 }
 
 impl Approvals {
-    /// The person key of the two-key rule: someone approved and nobody's
-    /// standing request for changes outvotes it.
-    pub fn human_key(&self) -> bool {
-        !self.approved_by.is_empty() && self.blocking_by.is_empty()
+    /// The person key for merging on its own: a person approved this very
+    /// commit, and nobody's standing request for changes outvotes it. A merge
+    /// may reach production, so an approval of an earlier commit doesn't count
+    /// even where GitHub's own rules would keep it.
+    pub fn human_key_at_head(&self) -> bool {
+        !self.approved_at_head.is_empty() && self.blocking_by.is_empty()
     }
 }
 
@@ -250,7 +254,8 @@ impl Approvals {
 /// clears one. CoderHelm's own reviews are never the person key, and a
 /// dismissal of its review of the head withdraws its key (fail closed).
 pub fn approval_state(reviews: &serde_json::Value, head_sha: &str) -> Approvals {
-    let mut latest: std::collections::BTreeMap<String, &str> = std::collections::BTreeMap::new();
+    let mut latest: std::collections::BTreeMap<String, (&str, &str)> =
+        std::collections::BTreeMap::new();
     let mut bot_at_head: Option<&str> = None;
     for r in reviews.as_array().map(|a| a.as_slice()).unwrap_or(&[]) {
         let login = r["user"]["login"].as_str().unwrap_or("");
@@ -267,18 +272,27 @@ pub fn approval_state(reviews: &serde_json::Value, head_sha: &str) -> Approvals 
             continue;
         }
         if matches!(state, "APPROVED" | "CHANGES_REQUESTED" | "DISMISSED") {
-            latest.insert(login.to_string(), state);
+            latest.insert(
+                login.to_string(),
+                (state, r["commit_id"].as_str().unwrap_or("")),
+            );
         }
     }
     let with = |want: &str| -> Vec<String> {
         latest
             .iter()
-            .filter(|(_, s)| **s == want)
+            .filter(|(_, (s, _))| *s == want)
             .map(|(l, _)| l.clone())
             .collect()
     };
+    let approved_at_head = latest
+        .iter()
+        .filter(|(_, (s, c))| *s == "APPROVED" && *c == head_sha)
+        .map(|(l, _)| l.clone())
+        .collect();
     Approvals {
         approved_by: with("APPROVED"),
+        approved_at_head,
         blocking_by: with("CHANGES_REQUESTED"),
         bot_dismissed_at_head: bot_at_head == Some("DISMISSED"),
     }
@@ -848,7 +862,7 @@ mod tests {
         let a = approval_state(&reviews, "h1");
         assert_eq!(a.approved_by, vec!["alice".to_string()]);
         assert_eq!(a.blocking_by, vec!["bob".to_string()]);
-        assert!(!a.human_key());
+        assert!(!a.human_key_at_head());
     }
 
     #[test]
@@ -860,20 +874,20 @@ mod tests {
         ]);
         let a = approval_state(&reviews, "h2");
         assert!(a.blocking_by.is_empty());
-        assert!(a.human_key());
+        assert!(a.human_key_at_head());
         // A dismissed approval is no key either.
         let dismissed = serde_json::json!([
             rv("alice", "APPROVED", "h1"),
             rv("alice", "DISMISSED", "h1"),
         ]);
-        assert!(!approval_state(&dismissed, "h1").human_key());
+        assert!(!approval_state(&dismissed, "h1").human_key_at_head());
     }
 
     #[test]
     fn coderhelm_s_review_is_never_the_person_key() {
         let reviews = serde_json::json!([rv("coderhelm[bot]", "APPROVED", "h1")]);
         let a = approval_state(&reviews, "h1");
-        assert!(!a.human_key());
+        assert!(!a.human_key_at_head());
         assert!(!a.bot_dismissed_at_head);
     }
 

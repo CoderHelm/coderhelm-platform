@@ -186,7 +186,7 @@ impl Sim {
     fn begin(&mut self, step: &ReviewStep, group: usize) -> Option<Job> {
         let head = self.head.clone();
         if let policy::Start::ReturnExisting { .. } =
-            policy::start(&step.trigger, &head, &self.records)
+            policy::start(&step.trigger, &head, "", &self.records)
         {
             self.skipped += 1;
             return None;
@@ -283,22 +283,23 @@ impl Sim {
         let unconfirmed = review_agent::unconfirmed_external_facts("", &out.unconfirmed_facts);
         let verdict = review_agent::decide_verdict(&findings, holding, &unconfirmed, false);
         let same_head = policy::review_of_head(&job.records, &job.head).cloned();
-        let new_info = same_head.as_ref().and_then(|prev| {
-            policy::person_spoke_since(&self.comments, &prev.created_at)
-                .map(|who| format!("what {who} wrote since my last review"))
-        });
+        let changed: Vec<super::review_fingerprint::Changed> = same_head
+            .as_ref()
+            .and_then(|prev| policy::person_spoke_since(&self.comments, &prev.created_at))
+            .map(|_| vec![super::review_fingerprint::Changed::People])
+            .unwrap_or_default();
         let stable = policy::stabilize(
             same_head.as_ref(),
             verdict,
             &mut findings,
-            new_info.as_deref(),
+            &changed,
             &out.change_of_mind,
             policy::trigger_kind(&job.step.trigger) == policy::TriggerKind::Explicit,
         );
         // Invariant (b).
         if let Some(prev) = &same_head {
             let before = super::review_verdict::binary(&prev.verdict);
-            if before != stable.verdict && new_info.is_none() {
+            if before != stable.verdict && changed.is_empty() {
                 self.violations.push(format!(
                     "the verdict on {} flipped from {before} to {} with nothing new",
                     job.head, stable.verdict
@@ -418,6 +419,8 @@ impl Sim {
                 head_sha: job.head.clone(),
                 created_at: at,
                 body: "review".into(),
+                fingerprint: None,
+                holding: Vec::new(),
             },
         );
     }

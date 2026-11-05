@@ -13,6 +13,7 @@ pub mod model_ids;
 pub mod claim;
 /// A re-review started by an edit of a pull request's description: what
 /// counts as a change, and the keys that queue one review per edit burst.
+pub mod prose;
 pub mod review_description;
 
 /// The code graph's per-repo switch and build status (gateway and worker).

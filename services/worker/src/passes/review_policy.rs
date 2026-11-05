@@ -7,10 +7,12 @@
 //!    for a commit CoderHelm already reviewed returns the existing verdict
 //!    ([`start`]); posting takes a conditional claim per (PR, head, trigger
 //!    kind) so two jobs can't both post ([`verdict_claim_sk`]).
-//! 2. Verdict stability: on an unchanged head the verdict never flips
-//!    between approve and request-changes without new information (a
-//!    person's comment, a reply the formal review must follow); a flip says
-//!    why ([`stabilize`]).
+//! 2. Verdict stability: a repeat review on an identical fingerprint (see
+//!    `review_fingerprint`: everything the verdict rests on, never the commit
+//!    alone) doesn't flip on model noise, and a person's re-review ask there
+//!    gets the standing verdict without a model review ([`answers_from_standing`]).
+//!    When the fingerprint differs the verdict follows what holds the merge
+//!    now, and says what changed ([`stabilize`]).
 //! 3. Blocking policy: which findings hold the merge is
 //!    [`super::review_severity`]'s decision (blocking by default). On top of
 //!    it, follow-ups the PR already tracks, problems the PR didn't cause and
@@ -21,7 +23,9 @@
 //!    on it is also a lesson for the reviewer ([`hold_late_blockers`]).
 
 use super::review_agent::{Evidence, Finding};
+use super::review_fingerprint::{in_words, Changed};
 use super::review_sweep::ReviewRecord;
+use super::review_verdict::{HoldKind, Holding};
 use std::collections::{HashMap, HashSet};
 
 /// Who asked for a review.
@@ -126,22 +130,73 @@ pub enum Start {
     ReturnExisting {
         verdict: String,
     },
+    /// The commit was reviewed, but its description has changed since (a
+    /// draft's edit is not reviewed until it is marked ready, say): reviewed
+    /// as a description edit.
+    DescriptionChanged,
 }
 
 /// Rule 1: an automatic trigger for an already-reviewed commit returns the
-/// existing verdict. A person's ask runs (and must explain a change of
-/// mind, see [`stabilize`]); a run's own review of its PR always runs, the
-/// run needs its verdict.
-pub fn start(trigger: &str, head: &str, records: &[ReviewRecord]) -> Start {
+/// existing verdict, unless its description moved on since. A person's ask
+/// goes on (and may be answered from the verdict, see
+/// [`answers_from_standing`]); a run's own review of its PR always runs, the
+/// run needs its verdict. An older record with no fingerprint keeps returning
+/// its verdict here: a burst of events for one commit must not start paid
+/// reviews, and a person's ask reviews it afresh.
+pub fn start(trigger: &str, head: &str, description: &str, records: &[ReviewRecord]) -> Start {
     if trigger_kind(trigger) == TriggerKind::Explicit || trigger == super::review_pr::TRIGGER_RUN {
         return Start::Review;
     }
     match review_of_head(records, head) {
-        Some(r) => Start::ReturnExisting {
-            verdict: r.verdict.clone(),
+        Some(r) => match &r.fingerprint {
+            Some(f) if f.description != description => Start::DescriptionChanged,
+            _ => Start::ReturnExisting {
+                verdict: r.verdict.clone(),
+            },
         },
         None => Start::Review,
     }
+}
+
+/// A person asked for another look and nothing the verdict rests on changed:
+/// no model review, the standing verdict is the answer ([`standing_answer`]).
+/// Only for a person's ask: the sweep, a run's own review, a description edit
+/// and a reconciliation after a settled finding have their own reasons to run.
+pub fn answers_from_standing(trigger: &str, changed: &[Changed], reviewed: bool) -> bool {
+    matches!(trigger, "reply" | "rerequest") && reviewed && changed.is_empty()
+}
+
+/// The answer to a re-review ask with nothing changed. Fixed words from
+/// structured facts; the threads stay as they are.
+pub fn standing_answer(head: &str, verdict: &str, holding: &[String]) -> String {
+    let short = &head[..head.len().min(7)];
+    let verdict = super::review_verdict::binary(verdict);
+    let mut s = format!(
+        "**Unchanged since my last review of `{short}`: {}.** The code, the description, the \
+         review threads, the CI results and what people wrote are the same, so I didn't review \
+         it again.",
+        human(verdict)
+    );
+    if !holding.is_empty() {
+        s.push_str("\n\n**Still holding the merge:**");
+        for h in holding {
+            s.push_str(&format!("\n- {h}"));
+        }
+        s.push_str("\n\nPush a fix, edit the description, or answer a finding in its thread.");
+    }
+    s
+}
+
+/// The line after an answer whose reading disagrees with the verdict when
+/// nothing the verdict rests on changed: a reading of a comment can't clear or
+/// add a block, and the answer must not stand as if it had.
+pub fn verdict_stands_note(head: &str, verdict: &str) -> String {
+    let short = &head[..head.len().min(7)];
+    format!(
+        "My formal verdict on `{short}` stays: {}. A comment doesn't change it; a push, an edit \
+         of the description, or an answer in a finding's thread does.",
+        human(super::review_verdict::binary(verdict))
+    )
 }
 
 /// Which review round this head is, and the head reviewed before it.
@@ -448,7 +503,7 @@ pub fn is_bare_command(text: &str) -> bool {
     words.len() <= 8 && words.iter().all(|w| FILLER.contains(&w.as_str()))
 }
 
-fn is_person(user: &serde_json::Value) -> bool {
+pub(crate) fn is_person(user: &serde_json::Value) -> bool {
     user["type"].as_str() != Some("Bot")
         && user["login"]
             .as_str()
@@ -471,30 +526,94 @@ pub fn person_spoke_since(comments: &[serde_json::Value], since: &str) -> Option
     })
 }
 
+/// Everything holding the merge, by name, on every route: findings that hold
+/// it, earlier threads still open (path, line, body), unconfirmed facts that
+/// block, a failed verification, findings CoderHelm fixes on its own PR, and
+/// items a held earlier verdict keeps. What `Verdict` is made from.
+pub fn named_holding(
+    findings: &[Finding],
+    open_threads: &[(String, u64, String)],
+    unconfirmed: &[super::review_agent::UnconfirmedFact],
+    verify_failed: bool,
+    own_open: &[String],
+    kept: &[String],
+) -> Vec<Holding> {
+    let mut out: Vec<Holding> = Vec::new();
+    for f in findings.iter().filter(|f| f.holds_merge()) {
+        let kind = if f.evidence() == Evidence::Question {
+            HoldKind::Question
+        } else {
+            HoldKind::Defect
+        };
+        let name = if f.line > 0 {
+            format!("`{}:{}` {}", f.file, f.line, f.title)
+        } else if f.file.is_empty() {
+            f.title.clone()
+        } else {
+            format!("`{}` {}", f.file, f.title)
+        };
+        out.push(Holding::new(kind, name));
+    }
+    for (path, line, body) in open_threads {
+        out.push(Holding::new(
+            HoldKind::EarlierThread,
+            super::own_review::thread_line(path, *line, body),
+        ));
+    }
+    for fact in unconfirmed.iter().filter(|f| f.blocks) {
+        out.push(Holding::new(HoldKind::Fact, fact.fact.clone()));
+    }
+    if verify_failed {
+        out.push(Holding::new(
+            HoldKind::Verification,
+            "The verification run failed",
+        ));
+    }
+    for line in own_open {
+        let listed = out.iter().any(|h| h.name == *line)
+            || findings
+                .iter()
+                .any(|f| f.holds_merge() && line.contains(&f.title));
+        if !listed {
+            out.push(Holding::new(HoldKind::OwnFinding, line.clone()));
+        }
+    }
+    for name in kept {
+        if !out.iter().any(|h| h.name == *name) {
+            out.push(Holding::new(HoldKind::KeptFromEarlier, name.clone()));
+        }
+    }
+    out
+}
+
 /// The verdict after rule 2, and what the review says about it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Stable {
     pub verdict: &'static str,
     /// A line for the review body: why the verdict changed on this commit,
-    /// or why it didn't.
+    /// or why it didn't. Fixed words from structured facts; a model's reason
+    /// only ever as its own sentence in its own paragraph.
     pub note: Option<String>,
     /// The verdict this one replaced on the same commit.
     pub flipped_from: Option<String>,
-    /// The new verdict differed and was refused (no new information).
+    /// The new verdict differed and was refused (an identical fingerprint).
     pub held: bool,
+    /// What holds the merge from the earlier review when its block was held.
+    pub kept: Vec<String>,
 }
 
 /// Rule 2. `previous` is CoderHelm's finished review of this same head, if
-/// any. `explicit`: a person asked; a verdict that didn't change then says so
-/// (a person's ask always gets a visible answer). `new_info` names what is new since it (a person's comment, a reply
-/// the formal review must follow); without it the earlier verdict stands and
-/// new blockers become notes. With it, the change is explained with
-/// `change_of_mind` (the reviewer's own sentence) or `new_info`.
+/// any; `changed` is what differs from its fingerprint (empty: identical).
+/// `explicit`: a person asked, so a verdict that didn't change says so.
+///
+/// Only an identical fingerprint holds an earlier verdict, and only a block
+/// that still names what holds it can be held: nothing named left means no
+/// block. With anything changed the verdict is what holds the merge now.
 pub fn stabilize(
     previous: Option<&ReviewRecord>,
     verdict: &'static str,
     findings: &mut [Finding],
-    new_info: Option<&str>,
+    changed: &[Changed],
     change_of_mind: &str,
     explicit: bool,
 ) -> Stable {
@@ -503,6 +622,7 @@ pub fn stabilize(
         note: None,
         flipped_from: None,
         held: false,
+        kept: Vec::new(),
     };
     let Some(prev) = previous else {
         return unchanged;
@@ -513,34 +633,42 @@ pub fn stabilize(
         if !explicit {
             return unchanged;
         }
-        let because = match new_info {
-            Some(info) => format!("{} doesn't change it", info.trim()),
-            None => "the code is the same and nothing new came up since".to_string(),
+        let what = if changed.is_empty() {
+            "The code and description are the same.".to_string()
+        } else {
+            format!(
+                "Since then {} changed; the verdict didn't.",
+                in_words(changed)
+            )
         };
         return Stable {
             note: Some(format!(
-                "**Unchanged since my last review of `{short}`: {}**, because {because}.",
+                "**Unchanged since my last review of `{short}`: {}.** {what}",
                 human(verdict)
             )),
             ..unchanged
         };
     }
-    if let Some(info) = new_info {
-        let why = if change_of_mind.trim().is_empty() {
-            info.trim().to_string()
-        } else {
-            change_of_mind.trim().to_string()
-        };
-        return Stable {
-            verdict,
-            note: Some(format!(
-                "**Changed my verdict on `{short}`** from {} to {}: {why}",
+    let flip = |what: String| Stable {
+        verdict,
+        note: Some(match common::prose::one_whole_sentence(change_of_mind) {
+            Some(reason) => format!(
+                "**Changed my verdict on `{short}`** from {} to {}. {what}\n\n{reason}",
                 human(before),
                 human(verdict)
-            )),
-            flipped_from: Some(before.to_string()),
-            held: false,
-        };
+            ),
+            None => format!(
+                "**Changed my verdict on `{short}`** from {} to {}. {what}",
+                human(before),
+                human(verdict)
+            ),
+        }),
+        flipped_from: Some(before.to_string()),
+        held: false,
+        kept: Vec::new(),
+    };
+    if !changed.is_empty() {
+        return flip(format!("What changed: {}.", in_words(changed)));
     }
     if before == "APPROVE" {
         for f in findings.iter_mut().filter(|f| f.holds_merge()) {
@@ -549,21 +677,30 @@ pub fn stabilize(
                 "Raised on a second look at a commit I already approved, with nothing new since: a note, not a block.",
             );
         }
+        return Stable {
+            verdict: before,
+            note: Some(format!(
+                "Same commit as my last review (`{short}`) and nothing it rests on changed, so \
+                 my earlier verdict (approve) stands. Anything new below is a note."
+            )),
+            flipped_from: None,
+            held: true,
+            kept: Vec::new(),
+        };
+    }
+    // A held block names what holds it, or it isn't a block.
+    if prev.holding.is_empty() {
+        return flip("Nothing named holds the merge.".to_string());
     }
     Stable {
         verdict: before,
         note: Some(format!(
-            "Same commit as my last review (`{short}`) and nothing new since, so my earlier verdict \
-             ({}) stands.{}",
-            human(before),
-            if before == "APPROVE" {
-                " Anything new below is a note."
-            } else {
-                " Reply with what changed, or push a fix."
-            }
+            "Same commit as my last review (`{short}`) and nothing it rests on changed, so my \
+             earlier verdict (request changes) stands. Reply with what changed, or push a fix."
         )),
         flipped_from: None,
         held: true,
+        kept: prev.holding.clone(),
     }
 }
 
@@ -577,6 +714,8 @@ fn human(verdict: &str) -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    use super::super::review_fingerprint::{self as fp, Fingerprint};
+    use super::super::review_verdict::Verdict;
     use super::*;
 
     fn rec(head: &str, verdict: &str, at: &str) -> ReviewRecord {
@@ -586,6 +725,8 @@ mod tests {
             head_sha: head.into(),
             created_at: at.into(),
             body: "review".into(),
+            fingerprint: None,
+            holding: Vec::new(),
         }
     }
 
@@ -606,23 +747,23 @@ mod tests {
     fn an_automatic_trigger_on_a_reviewed_head_returns_the_verdict() {
         let records = vec![rec("h1", "APPROVE", "2026-10-01T00:00:00Z")];
         assert_eq!(
-            start("synchronize", "h1", &records),
+            start("synchronize", "h1", "", &records),
             Start::ReturnExisting {
                 verdict: "APPROVE".into()
             }
         );
-        assert_eq!(start("labeled", "h2", &records), Start::Review);
+        assert_eq!(start("labeled", "h2", "", &records), Start::Review);
         // A person asked, or a run needs the verdict: it runs.
-        assert_eq!(start("reply", "h1", &records), Start::Review);
-        assert_eq!(start("rerequest", "h1", &records), Start::Review);
+        assert_eq!(start("reply", "h1", "", &records), Start::Review);
+        assert_eq!(start("rerequest", "h1", "", &records), Start::Review);
         // A description edit that answers the review is a person's ask: the
         // same commit is reviewed again with the new description.
-        assert_eq!(start("description", "h1", &records), Start::Review);
-        assert_eq!(start("run", "h1", &records), Start::Review);
+        assert_eq!(start("description", "h1", "", &records), Start::Review);
+        assert_eq!(start("run", "h1", "", &records), Start::Review);
         // A review that didn't finish isn't a verdict.
         let mut failed = rec("h1", "REQUEST_CHANGES", "2026-10-01T00:00:00Z");
         failed.body = format!("{} (x)", super::super::review_sweep::LEGACY_FAILED_PREFIX);
-        assert_eq!(start("synchronize", "h1", &[failed]), Start::Review);
+        assert_eq!(start("synchronize", "h1", "", &[failed]), Start::Review);
     }
 
     #[test]
@@ -654,27 +795,28 @@ mod tests {
     }
 
     /// A person's re-review ask always gets a visible answer: an unchanged
-    /// verdict says it is unchanged, and why.
+    /// verdict says it is unchanged, from structured facts.
     #[test]
     fn an_explicit_ask_with_the_same_verdict_says_it_is_unchanged() {
         let prev = rec("h1aaaaaaa", "APPROVE", "2026-10-01T00:00:00Z");
-        let s = stabilize(Some(&prev), "APPROVE", &mut [], None, "", true);
+        let s = stabilize(Some(&prev), "APPROVE", &mut [], &[], "", true);
         assert_eq!(s.verdict, "APPROVE");
-        let note = s.note.unwrap();
-        assert!(note.contains("Unchanged since my last review of `h1aaaaa`: approve"));
-        assert!(note.contains("because the code is the same"));
+        assert_eq!(
+            s.note.unwrap(),
+            "**Unchanged since my last review of `h1aaaaa`: approve.** The code and description are the same."
+        );
         let s = stabilize(
             Some(&prev),
             "APPROVE",
             &mut [],
-            Some("what dev wrote since my last review"),
+            &[Changed::People],
             "",
             true,
         );
-        assert!(s
-            .note
-            .unwrap()
-            .contains("what dev wrote since my last review doesn't change it"));
+        assert_eq!(
+            s.note.unwrap(),
+            "**Unchanged since my last review of `h1aaaaa`: approve.** Since then what people wrote changed; the verdict didn't."
+        );
     }
 
     #[test]
@@ -930,40 +1072,587 @@ mod tests {
     }
 
     #[test]
-    fn a_verdict_never_flips_on_an_unchanged_head_without_news() {
+    fn a_verdict_never_flips_on_an_identical_fingerprint() {
         let prev = rec("h1aaaaaaa", "APPROVE", "2026-10-01T00:00:00Z");
         let mut fs = vec![defect("a.rs", 1, "high", "bug")];
-        let s = stabilize(Some(&prev), "REQUEST_CHANGES", &mut fs, None, "", true);
+        let s = stabilize(Some(&prev), "REQUEST_CHANGES", &mut fs, &[], "", true);
         assert_eq!(s.verdict, "APPROVE");
-        assert!(s.held && s.flipped_from.is_none());
-        assert!(!fs[0].holds_merge());
-        assert!(s.note.unwrap().contains("stands"));
-
-        let prev_rc = rec("h1aaaaaaa", "REQUEST_CHANGES", "2026-10-01T00:00:00Z");
-        let s = stabilize(Some(&prev_rc), "APPROVE", &mut [], None, "", false);
+        assert!(s.held);
+        assert!(!fs[0].holds_merge(), "the new blocker became a note");
+        assert!(s.note.unwrap().contains("earlier verdict (approve) stands"));
+        // A block held this way still names what holds it.
+        let mut prev_rc = rec("h1aaaaaaa", "REQUEST_CHANGES", "2026-10-01T00:00:00Z");
+        prev_rc.holding = vec!["`a.rs:3` Null deref".to_string()];
+        let s = stabilize(Some(&prev_rc), "APPROVE", &mut [], &[], "noise.", false);
         assert_eq!(s.verdict, "REQUEST_CHANGES");
         assert!(s.held);
+        assert_eq!(s.kept, prev_rc.holding);
+        assert!(!s.note.unwrap().contains("noise"));
+    }
 
-        // New information: the flip happens and says why.
-        let mut fs = vec![defect("a.rs", 1, "high", "bug")];
-        let s = stabilize(
+    /// The live failure: a block with nothing named holding it can't be held.
+    #[test]
+    fn a_block_with_nothing_named_clears_even_on_an_identical_fingerprint() {
+        let prev = rec("a1b2c3daaa", "REQUEST_CHANGES", "2026-10-01T00:00:00Z");
+        let s = stabilize(Some(&prev), "APPROVE", &mut [], &[], "", true);
+        assert_eq!(s.verdict, "APPROVE");
+        assert!(s.note.unwrap().contains("Nothing named holds the merge"));
+    }
+
+    #[test]
+    fn with_anything_changed_the_verdict_follows_what_holds_the_merge() {
+        let mut prev = rec("h1aaaaaaa", "REQUEST_CHANGES", "2026-10-01T00:00:00Z");
+        prev.holding = vec!["x".to_string()];
+        for changed in [
+            vec![Changed::Description],
+            vec![Changed::Threads],
+            vec![Changed::Results],
+            vec![Changed::People],
+            vec![Changed::NoRecord],
+        ] {
+            let s = stabilize(Some(&prev), "APPROVE", &mut [], &changed, "", false);
+            assert_eq!(s.verdict, "APPROVE", "{changed:?}");
+            assert_eq!(s.flipped_from.as_deref(), Some("REQUEST_CHANGES"));
+        }
+        // No earlier review of this commit: nothing to compare.
+        let s = stabilize(None, "REQUEST_CHANGES", &mut [], &[], "", true);
+        assert_eq!(s.note, None);
+    }
+
+    /// Whatever a model writes, it is never inside a template sentence: a
+    /// finished sentence of it stands in its own paragraph, or it isn't shown.
+    #[test]
+    fn model_text_is_never_spliced_into_a_sentence() {
+        let mut prev = rec("h1aaaaaaa", "APPROVE", "2026-10-01T00:00:00Z");
+        prev.holding = vec![];
+        let model = "The reply concludes nothing blocks merge.";
+        for (verdict, explicit) in [("REQUEST_CHANGES", true), ("APPROVE", true)] {
+            let note = stabilize(
+                Some(&prev),
+                verdict,
+                &mut [],
+                &[Changed::People],
+                model,
+                explicit,
+            )
+            .note
+            .unwrap();
+            assert!(!note.contains("because"), "{note}");
+            assert!(!note.contains("doesn't change it"), "{note}");
+            if note.contains(model) {
+                assert!(note.ends_with(&format!("\n\n{model}")), "{note}");
+            }
+        }
+        // An unfinished thought isn't shown at all.
+        let note = stabilize(
             Some(&prev),
             "REQUEST_CHANGES",
-            &mut fs,
-            Some("dev's reply"),
-            "dev confirmed the field is null for refunds, which this code dereferences",
+            &mut [],
+            &[Changed::People],
+            "because the reply",
             true,
-        );
-        assert_eq!(s.verdict, "REQUEST_CHANGES");
-        assert_eq!(s.flipped_from.as_deref(), Some("APPROVE"));
-        assert!(s.note.unwrap().contains("null for refunds"));
-        assert!(fs[0].holds_merge());
+        )
+        .note
+        .unwrap();
+        assert!(!note.contains("because the reply"), "{note}");
+    }
 
-        // Same verdict on an automatic trigger, or no earlier review of this
-        // head: nothing to say.
-        let s = stabilize(Some(&prev), "APPROVE", &mut [], None, "", false);
-        assert_eq!(s.note, None);
-        let s = stabilize(None, "REQUEST_CHANGES", &mut [], None, "", true);
-        assert_eq!((s.verdict, s.held), ("REQUEST_CHANGES", false));
+    /// The source shape behind the garbled note: no format string in the code
+    /// that writes posted review text puts a value in the middle of words when
+    /// that value is a model's free text.
+    #[test]
+    fn no_template_embeds_a_models_reason() {
+        let spliced = [
+            "{because}",
+            "{} doesn't change it",
+            concat!("info.trim", "()"),
+            concat!(": {", "why}"),
+        ];
+        for (name, src) in [
+            ("review_policy.rs", include_str!("review_policy.rs")),
+            ("review_verdict.rs", include_str!("review_verdict.rs")),
+        ] {
+            let code = src.split("#[cfg(test)]").next().unwrap();
+            for shape in spliced {
+                assert!(!code.contains(shape), "{name} still has {shape}");
+            }
+        }
+        // The model's reason for a changed mind reaches posted text one way:
+        // as a whole sentence on its own.
+        let policy = include_str!("review_policy.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .unwrap();
+        assert!(policy.contains(concat!("one_whole_sentence(change", "_of_mind)")));
+        // A reply's reason is prompt context for the review it starts, never
+        // what a posted note says changed: stabilize gets structured facts.
+        let pr = include_str!("review_pr.rs");
+        assert!(pr.contains(concat!(
+            "&changed_since,\n        &output.change",
+            "_of_mind"
+        )));
+        assert!(!pr.contains(concat!("a reply on this PR changed", " the facts")));
+    }
+
+    /// run_once needs GitHub and the database to run, so its order is read
+    /// from its source: the answer comes before any review work, and the
+    /// posted verdict comes from what holds the merge.
+    #[test]
+    fn run_once_answers_before_reviewing_and_posts_only_the_named_verdict() {
+        let src = include_str!("review_pr.rs");
+        let at = |needle: &str| src.find(needle).unwrap_or_else(|| panic!("{needle}"));
+        let answer = at(concat!("review_policy::answers_from", "_standing("));
+        assert!(answer < at(concat!(".open_check(state, &github", ", &msg, &head_sha")));
+        assert!(answer < at(concat!("review_lessons::settle_before", "_review(")));
+        assert!(at(concat!("live_job.follow", "_head(")) < answer);
+        let named = at(concat!("review_policy::named", "_holding("));
+        assert!(named < at(concat!("&final", "_verdict,\n        ")));
+        assert!(src.contains(concat!("let verdict = final", "_verdict.event();")));
+        assert!(named < at(concat!("note_review", "_state(\n        state")));
+    }
+
+    #[test]
+    fn a_reask_on_an_identical_fingerprint_is_answered_from_the_verdict() {
+        assert!(answers_from_standing("reply", &[], true));
+        assert!(answers_from_standing("rerequest", &[], true));
+        // Anything changed, or no review of this commit: reviewed.
+        assert!(!answers_from_standing("reply", &[Changed::People], true));
+        assert!(!answers_from_standing(
+            "rerequest",
+            &[Changed::NoRecord],
+            true
+        ));
+        assert!(!answers_from_standing("reply", &[], false));
+        // The routes with their own reason to run.
+        for t in ["description", "reconcile", "sweep", "run", "synchronize"] {
+            assert!(!answers_from_standing(t, &[], true), "{t}");
+        }
+        let text = standing_answer(
+            "a1b2c3daaa",
+            "REQUEST_CHANGES",
+            &["`a.rs:3` Null deref".to_string()],
+        );
+        assert!(
+            text.starts_with("**Unchanged since my last review of `a1b2c3d`: request changes.**")
+        );
+        assert!(text.contains("- `a.rs:3` Null deref"));
+        assert!(!standing_answer("a1b2c3daaa", "APPROVE", &[]).contains("Still holding"));
+    }
+
+    #[test]
+    fn an_automatic_trigger_reviews_again_only_for_a_changed_description() {
+        let mut r = rec("h1", "REQUEST_CHANGES", "2026-10-01T00:00:00Z");
+        r.fingerprint = Some(super::super::review_fingerprint::Fingerprint {
+            head: "h1".into(),
+            description: "d1".into(),
+            ..Default::default()
+        });
+        let records = vec![r];
+        assert_eq!(
+            start("ready_for_review", "h1", "d1", &records),
+            Start::ReturnExisting {
+                verdict: "REQUEST_CHANGES".into()
+            }
+        );
+        assert_eq!(
+            start("ready_for_review", "h1", "d2", &records),
+            Start::DescriptionChanged
+        );
+    }
+
+    // ── Replays of what a person saw, through the same functions run_once uses ──
+
+    /// A review record of `head`, its fingerprint as it was, naming `holding`.
+    fn stored(verdict: &str, holding: &[&str], fp: &Fingerprint) -> ReviewRecord {
+        let mut r = rec(&fp.head, verdict, "2026-11-04T00:00:00Z");
+        r.fingerprint = Some(fp.clone());
+        r.holding = holding.iter().map(|h| h.to_string()).collect();
+        r
+    }
+
+    fn state_of(open: bool) -> Fingerprint {
+        Fingerprint {
+            head: "a1b2c3d0000".into(),
+            description: fp::description_part("Applies with the deploy note below."),
+            threads: Some(fp::threads_part([
+                ("T_1".to_string(), !open),
+                ("T_2".to_string(), !open),
+            ])),
+            results: Some(fp::results_part(
+                &serde_json::json!({"check_runs": [{"name": "plan", "conclusion": "success"}]}),
+                &[],
+                "",
+            )),
+            people: Some(fp::people_part(&[])),
+        }
+    }
+
+    /// What run_once does from the model's verdict to the posted heading.
+    fn review(
+        prev: &ReviewRecord,
+        now: &Fingerprint,
+        findings: &mut [Finding],
+        open: &[(String, u64, String)],
+    ) -> (Verdict, Stable, String) {
+        let proposed = super::super::review_agent::decide_verdict(findings, open.len(), &[], false);
+        let changed = fp::changes(prev.fingerprint.as_ref(), now);
+        let stable = stabilize(Some(prev), proposed, findings, &changed, "", false);
+        let verdict =
+            Verdict::from_holding(named_holding(findings, open, &[], false, &[], &stable.kept));
+        let heading = super::super::review_agent::verdict_heading(&verdict, 0);
+        (verdict, stable, heading)
+    }
+
+    /// The live PR: description edited, both threads settled, no new findings,
+    /// same commit. It posted "something holds the merge" and stayed stuck.
+    #[test]
+    fn replay_description_edited_and_both_threads_settled_clears() {
+        let before = state_of(true);
+        let prev = stored(
+            "REQUEST_CHANGES",
+            &["`deploy.tf:3` State key is shared", "`deploy.tf:9` No lock"],
+            &before,
+        );
+        let mut now = state_of(false);
+        now.description = fp::description_part("Applies on merge; the workflow shows no step.");
+        let (verdict, stable, heading) = review(&prev, &now, &mut [], &[]);
+        assert_eq!(verdict.event(), "APPROVE");
+        assert_eq!(stable.flipped_from.as_deref(), Some("REQUEST_CHANGES"));
+        let note = stable.note.unwrap();
+        assert!(note.contains("What changed: the description and the review threads."));
+        assert!(heading.starts_with("✅ **Approved**"));
+        assert!(!heading.contains("Changes requested"));
+        // An APPROVE replaces the standing request for changes on GitHub, and
+        // it always posts when it clears a block.
+        let d = super::super::review_verdict::decide(
+            super::super::review_verdict::Input::Review {
+                verdict: verdict.event(),
+                has_news: false,
+                explicit: false,
+                already_answered: false,
+            },
+            &super::super::review_verdict::Context {
+                standing: Some(super::super::review_verdict::StandingReview {
+                    verdict: "REQUEST_CHANGES".into(),
+                    failed: false,
+                    head_sha: before.head.clone(),
+                }),
+                self_authored: false,
+            },
+        );
+        assert_eq!(
+            d,
+            super::super::review_verdict::Decision::Post {
+                event: "APPROVE",
+                dismiss_stale: false
+            }
+        );
+    }
+
+    #[test]
+    fn replay_a_settled_thread_with_another_holding_finding_still_blocks_and_names_it() {
+        let before = state_of(true);
+        let prev = stored("REQUEST_CHANGES", &["old"], &before);
+        let mut now = state_of(true);
+        now.threads = Some(fp::threads_part([
+            ("T_1".to_string(), true),
+            ("T_2".to_string(), false),
+        ]));
+        let open = vec![(
+            "deploy.tf".to_string(),
+            9,
+            "**No lock on the state** (bug)".to_string(),
+        )];
+        let (verdict, _, heading) = review(&prev, &now, &mut [], &open);
+        assert_eq!(verdict.event(), "REQUEST_CHANGES");
+        assert!(heading.contains("1 earlier requested change still open"));
+        assert!(heading.contains("No lock on the state"), "{heading}");
+        assert!(heading.contains("deploy.tf:9"), "{heading}");
+    }
+
+    #[test]
+    fn replay_an_identical_fingerprint_keeps_a_real_block_named_against_model_noise() {
+        let state = state_of(true);
+        let prev = stored(
+            "REQUEST_CHANGES",
+            &["`deploy.tf:3` State key is shared"],
+            &state,
+        );
+        // The model now finds nothing: noise. The block stands, named.
+        let (verdict, stable, heading) = review(&prev, &state, &mut [], &[]);
+        assert_eq!(verdict.event(), "REQUEST_CHANGES");
+        assert!(stable.held);
+        assert!(
+            heading.contains("`deploy.tf:3` State key is shared"),
+            "{heading}"
+        );
+    }
+
+    /// An older record has no fingerprint: changed, reviewed afresh, and it
+    /// clears when nothing holds.
+    #[test]
+    fn replay_an_old_record_without_a_fingerprint_counts_as_changed() {
+        let mut prev = rec("a1b2c3d0000", "REQUEST_CHANGES", "2026-11-04T00:00:00Z");
+        prev.fingerprint = None;
+        let now = state_of(false);
+        let changed = fp::changes(prev.fingerprint.as_ref(), &now);
+        assert_eq!(changed, vec![Changed::NoRecord]);
+        assert!(!answers_from_standing("reply", &changed, true));
+        let (verdict, _, _) = review(&prev, &now, &mut [], &[]);
+        assert_eq!(verdict.event(), "APPROVE");
+    }
+
+    /// A re-review ask on an identical fingerprint: no model review, the same
+    /// verdict in the reply, the threads as they are.
+    #[test]
+    fn replay_a_rereview_ask_with_nothing_changed_stays_as_it_was() {
+        let state = state_of(true);
+        let prev = stored(
+            "REQUEST_CHANGES",
+            &["`deploy.tf:3` State key is shared"],
+            &state,
+        );
+        let changed = fp::changes(prev.fingerprint.as_ref(), &state);
+        assert!(answers_from_standing("rerequest", &changed, true));
+        let text = standing_answer(&prev.head_sha, &prev.verdict, &prev.holding);
+        assert!(text.contains("`a1b2c3d`: request changes"));
+        assert!(text.contains("`deploy.tf:3` State key is shared"));
+        // A bare ask is no new words either.
+        let mut with_ask = state.clone();
+        with_ask.people = Some(fp::people_part(&[serde_json::json!({
+            "user": {"login": "dev", "type": "User"},
+            "body": "@coderhelm re-review",
+        })]));
+        assert!(fp::changes(prev.fingerprint.as_ref(), &with_ask).is_empty());
+    }
+
+    /// The reported comment: same head, same description, a person's comment
+    /// naming a blocker, a reading that says the opposite. One answer, no
+    /// formal review, nothing garbled, and the check keeps its verdict.
+    #[tokio::test]
+    async fn replay_a_comment_naming_a_blocker_gets_one_answer_and_the_verdict_stands() {
+        use super::super::review_agent::VerdictChange;
+        use super::super::review_verdict::{decide, Context, Decision, Input, StandingReview};
+        use common::review_check as rc;
+        let state = state_of(true);
+        let prev = stored(
+            "REQUEST_CHANGES",
+            &["`deploy.tf:3` State key is shared"],
+            &state,
+        );
+        let mut now = state.clone();
+        now.people = Some(fp::people_part(&[serde_json::json!({
+            "user": {"login": "dev", "type": "User"},
+            "body": "The deploy note in the description is the blocker.",
+        })]));
+        let changed = fp::changes(prev.fingerprint.as_ref(), &now);
+        assert_eq!(changed, vec![Changed::People]);
+        let standing = StandingReview {
+            verdict: "REQUEST_CHANGES".into(),
+            failed: false,
+            head_sha: state.head.clone(),
+        };
+        let ctx = Context {
+            standing: Some(standing.clone()),
+            self_authored: false,
+        };
+        // The model read "nothing blocks": a reading can't clear a block.
+        let d = decide(
+            Input::Reply {
+                change: VerdictChange::Clear,
+                more_than_words: fp::more_than_words(&changed),
+            },
+            &ctx,
+        );
+        assert_eq!(d, Decision::Nothing);
+        assert!(super::super::review_verdict::reply_disagrees(
+            VerdictChange::Clear,
+            &standing
+        ));
+        let note = verdict_stands_note(&state.head, &standing.verdict);
+        assert_eq!(
+            note,
+            "My formal verdict on `a1b2c3d` stays: request changes. A comment doesn't change it; a push, an edit of the description, or an answer in a finding's thread does."
+        );
+        // Same reading over an approval can't add a block either.
+        let approved = Context {
+            standing: Some(StandingReview {
+                verdict: "APPROVE".into(),
+                ..standing.clone()
+            }),
+            self_authored: false,
+        };
+        assert_eq!(
+            decide(
+                Input::Reply {
+                    change: VerdictChange::Block,
+                    more_than_words: false
+                },
+                &approved
+            ),
+            Decision::Nothing
+        );
+        // The check: finished verdict, reply shown, back to the verdict.
+        let gh = rc::fake::FakeChecks::default();
+        let t = rc::Target {
+            installation: 1,
+            owner: "o",
+            repo: "r",
+            pr: 7,
+            head: &state.head,
+        };
+        let v = rc::take_over_or_open(&gh, &t, "head#x", "Reading", "u")
+            .await
+            .unwrap();
+        rc::close(
+            &gh,
+            &t,
+            v,
+            &rc::Close {
+                conclusion: "neutral",
+                title: "Changes requested: 1 finding".into(),
+                summary: "s".into(),
+                details_url: None,
+            },
+        )
+        .await;
+        rc::queue_work(&gh, &t, rc::Work::Reply, "reply#9", 0, "u").await;
+        assert_eq!(
+            gh.shown(&state.head)["output"]["title"],
+            "Reading your reply on a1b2c3d"
+        );
+        let id = rc::start(&gh, &t, "reply#9", "Reading your reply", "session")
+            .await
+            .unwrap();
+        rc::close_restoring(
+            &gh,
+            &t,
+            id,
+            &rc::Close {
+                conclusion: "neutral",
+                title: "Answered".into(),
+                summary: "Answered.".into(),
+                details_url: Some("session".into()),
+            },
+        )
+        .await;
+        let shown = gh.shown(&state.head);
+        assert_eq!(shown["output"]["title"], "Changes requested: 1 finding");
+        assert_eq!(shown["conclusion"], "neutral");
+        assert_eq!(shown["details_url"], "session");
+    }
+
+    /// What still starts a review: a person's words that settle a thread change
+    /// the threads; an edited description; a new push.
+    #[test]
+    fn replay_the_cases_that_still_review() {
+        use super::super::review_agent::VerdictChange;
+        use super::super::review_verdict::{decide, Context, Decision, Input, StandingReview};
+        let state = state_of(true);
+        let ctx = Context {
+            standing: Some(StandingReview {
+                verdict: "REQUEST_CHANGES".into(),
+                failed: false,
+                head_sha: state.head.clone(),
+            }),
+            self_authored: false,
+        };
+        let starts = |now: &Fingerprint| {
+            decide(
+                Input::Reply {
+                    change: VerdictChange::Clear,
+                    more_than_words: fp::more_than_words(&fp::changes(Some(&state), now)),
+                },
+                &ctx,
+            )
+        };
+        let mut thread = state.clone();
+        thread.threads = Some(fp::threads_part([
+            ("T_1".to_string(), true),
+            ("T_2".to_string(), false),
+        ]));
+        assert_eq!(starts(&thread), Decision::Review);
+        let mut edited = state.clone();
+        edited.description = fp::description_part("A new description.");
+        assert_eq!(starts(&edited), Decision::Review);
+        let mut push = state.clone();
+        push.head = "abc".into();
+        assert_eq!(starts(&push), Decision::Review);
+        assert!(!answers_from_standing("description", &[], true));
+        assert_eq!(
+            start("synchronize", "another-head", "d", &[]),
+            Start::Review
+        );
+        // An error review on the PR isn't a verdict: a reply replaces it.
+        let failed = Context {
+            standing: Some(StandingReview {
+                verdict: "REQUEST_CHANGES".into(),
+                failed: true,
+                head_sha: state.head.clone(),
+            }),
+            self_authored: false,
+        };
+        assert_eq!(
+            decide(
+                Input::Reply {
+                    change: VerdictChange::None,
+                    more_than_words: false
+                },
+                &failed
+            ),
+            Decision::Review
+        );
+    }
+
+    /// Every route to a verdict: nothing named is an approval, anything named
+    /// is changes requested and the heading names it.
+    #[test]
+    fn every_route_through_the_chokepoint_names_what_holds_or_approves() {
+        use super::super::review_agent::{verdict_heading, UnconfirmedFact};
+        let finding = [defect("a.rs", 3, "high", "bug")];
+        let thread = [("b.rs".to_string(), 9, "**Open thing** (bug)".to_string())];
+        let fact = [UnconfirmedFact {
+            fact: "The vendor returns cents".into(),
+            blocks: true,
+            why: String::new(),
+        }];
+        let note_fact = [UnconfirmedFact {
+            fact: "Staging has no data".into(),
+            blocks: false,
+            why: String::new(),
+        }];
+        let own = ["Own item (`c.rs:1`)".to_string()];
+        let kept = ["Kept item".to_string()];
+        for f in [&[][..], &finding[..]] {
+            for t in [&[][..], &thread[..]] {
+                for u in [&[][..], &fact[..], &note_fact[..]] {
+                    for v in [false, true] {
+                        for o in [&[][..], &own[..]] {
+                            for k in [&[][..], &kept[..]] {
+                                let holding = named_holding(f, t, u, v, o, k);
+                                let verdict = Verdict::from_holding(holding.clone());
+                                let heading = verdict_heading(&verdict, 0);
+                                if holding.is_empty() {
+                                    assert_eq!(verdict.event(), "APPROVE");
+                                    assert!(heading.starts_with("✅"));
+                                } else {
+                                    assert_eq!(verdict.event(), "REQUEST_CHANGES");
+                                    for h in &holding {
+                                        assert!(heading.contains(&h.name), "{heading}");
+                                    }
+                                }
+                                let empty = !f.is_empty()
+                                    || !t.is_empty()
+                                    || u.iter().any(|x| x.blocks)
+                                    || v
+                                    || !o.is_empty()
+                                    || !k.is_empty();
+                                assert_eq!(!holding.is_empty(), empty);
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 }

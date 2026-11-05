@@ -835,78 +835,75 @@ pub fn decide_verdict(
     }
 }
 
-/// What a review's heading says. The counts are of what holds the merge,
-/// except `notes`: everything posted with an approval that doesn't.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct HeadingCounts {
-    pub defects: usize,
-    /// On CoderHelm's own PR: findings it fixes itself before ready.
-    pub own_open: usize,
-    pub blocking_questions: usize,
-    pub blocking_facts: usize,
-    pub prior_open: usize,
-    pub verify_failed: bool,
-    pub notes: usize,
-}
-
-fn plural(n: usize, one: &str, many: &str) -> String {
-    format!("{n} {}", if n == 1 { one } else { many })
-}
-
-/// The first line of a formal review: the verdict, and why in one sentence.
-pub fn verdict_heading(verdict: &str, c: &HeadingCounts) -> String {
-    if verdict == "APPROVE" {
-        return if c.notes == 0 {
+/// Pure: the review's first lines: the verdict and why, then each named thing
+/// holding the merge. `notes` counts what is posted with an approval.
+pub fn verdict_heading(verdict: &super::review_verdict::Verdict, notes: usize) -> String {
+    use super::review_verdict::HoldKind as K;
+    let plural = |n: usize, one: &str, many: &str| {
+        if n == 1 {
+            format!("1 {one}")
+        } else {
+            format!("{n} {many}")
+        }
+    };
+    if verdict.holding().is_empty() {
+        return if notes == 0 {
             "✅ **Approved**: nothing in the change needs fixing.".to_string()
         } else {
             format!(
                 "✅ **Approved with notes**: nothing blocks the merge; {} below {} for a look.",
-                plural(c.notes, "note", "notes"),
-                if c.notes == 1 { "is" } else { "are" }
+                plural(notes, "note", "notes"),
+                if notes == 1 { "is" } else { "are" }
             )
         };
     }
+    let count = |k: K| verdict.holding().iter().filter(|h| h.kind == k).count();
     let mut why: Vec<String> = Vec::new();
-    if c.defects > 0 {
-        why.push(plural(c.defects, "defect to fix", "defects to fix"));
-    }
-    if c.defects == 0 && c.own_open > 0 {
-        why.push(plural(
-            c.own_open,
+    for (kind, one, many) in [
+        (K::Defect, "defect to fix", "defects to fix"),
+        (
+            K::OwnFinding,
             "finding CoderHelm fixes before this PR is ready",
             "findings CoderHelm fixes before this PR is ready",
-        ));
-    }
-    if c.blocking_questions > 0 {
-        why.push(plural(
-            c.blocking_questions,
+        ),
+        (
+            K::Question,
             "question the change rests on",
             "questions the change rests on",
-        ));
-    }
-    if c.blocking_facts > 0 {
-        why.push(plural(
-            c.blocking_facts,
+        ),
+        (
+            K::Fact,
             "unconfirmed fact the change relies on",
             "unconfirmed facts the change relies on",
-        ));
-    }
-    if c.prior_open > 0 {
-        why.push(plural(
-            c.prior_open,
+        ),
+        (
+            K::EarlierThread,
             "earlier requested change still open",
             "earlier requested changes still open",
-        ));
+        ),
+        (
+            K::KeptFromEarlier,
+            "item from my last review still holding",
+            "items from my last review still holding",
+        ),
+    ] {
+        if count(kind) > 0 {
+            why.push(plural(count(kind), one, many));
+        }
     }
-    if c.verify_failed {
+    if count(K::Verification) > 0 {
         why.push("the verification run failed".to_string());
     }
-    let reason = match why.len() {
-        0 => "something holds the merge.".to_string(),
-        1 => format!("{}.", why[0]),
-        n => format!("{} and {}.", why[..n - 1].join(", "), why[n - 1]),
+    let reason = match why.as_slice() {
+        [one] => one.clone(),
+        [rest @ .., last] => format!("{} and {last}", rest.join(", ")),
+        [] => plural(verdict.holding().len(), "item holds", "items hold"),
     };
-    format!("❌ **Changes requested**: {reason}")
+    let mut out = format!("❌ **Changes requested**: {reason}.\n\n**Holding the merge:**");
+    for h in verdict.holding() {
+        out.push_str(&format!("\n- {}", h.name));
+    }
+    out
 }
 
 pub fn review_tools() -> Vec<ToolDefinition> {
@@ -1403,7 +1400,11 @@ pub fn fold_inline_into_body(body: &str, inline: &[InlineComment]) -> String {
         ));
     }
     // GitHub caps a review body at 65,536 characters.
-    common::truncate_str(&out, 60_000).to_string()
+    common::prose::cap_on_sentence(
+        &out,
+        60_000,
+        "The rest of the findings didn't fit in this review; the session page lists them all.",
+    )
 }
 
 /// Build a bounded diff string for the prompt (per-file patch, head+tail capped).
@@ -3129,12 +3130,10 @@ mod evidence_tests {
         assert_eq!(facts.len(), 2, "{facts:?}");
         let verdict = decide_verdict(&[], 0, &facts, false);
         assert_eq!(verdict, "APPROVE");
+        assert_eq!(verdict, "APPROVE");
         let heading = verdict_heading(
-            verdict,
-            &HeadingCounts {
-                notes: facts.iter().filter(|f| !f.blocks).count(),
-                ..Default::default()
-            },
+            &crate::passes::review_verdict::Verdict::approve(),
+            facts.iter().filter(|f| !f.blocks).count(),
         );
         assert!(
             heading.starts_with("✅ **Approved with notes**"),
@@ -3231,52 +3230,60 @@ mod evidence_tests {
     }
 
     #[test]
-    fn the_heading_names_the_verdict_and_why_in_one_line() {
-        let approved = verdict_heading("APPROVE", &HeadingCounts::default());
+    fn the_heading_names_the_verdict_and_what_holds_it() {
+        use crate::passes::review_verdict::{HoldKind as K, Holding, Verdict};
+        let approved = verdict_heading(&Verdict::approve(), 0);
         assert_eq!(
             approved,
             "✅ **Approved**: nothing in the change needs fixing."
         );
-        let notes = verdict_heading(
-            "APPROVE",
-            &HeadingCounts {
-                notes: 2,
-                ..Default::default()
-            },
-        );
+        let notes = verdict_heading(&Verdict::approve(), 2);
         assert_eq!(
             notes,
             "✅ **Approved with notes**: nothing blocks the merge; 2 notes below are for a look."
         );
         let blocked = verdict_heading(
-            "REQUEST_CHANGES",
-            &HeadingCounts {
-                defects: 1,
-                blocking_facts: 2,
-                notes: 3,
-                ..Default::default()
-            },
+            &Verdict::from_holding(vec![
+                Holding::new(K::Defect, "`a.rs:3` Null deref"),
+                Holding::new(K::Fact, "The vendor returns cents"),
+                Holding::new(K::Fact, "The table has an index"),
+            ]),
+            3,
         );
         assert_eq!(
             blocked,
-            "❌ **Changes requested**: 1 defect to fix and 2 unconfirmed facts the change relies on."
+            "❌ **Changes requested**: 1 defect to fix and 2 unconfirmed facts the change relies on.\n\n\
+             **Holding the merge:**\n- `a.rs:3` Null deref\n- The vendor returns cents\n- The table has an index"
         );
         let prior = verdict_heading(
-            "REQUEST_CHANGES",
-            &HeadingCounts {
-                prior_open: 1,
-                blocking_questions: 1,
-                verify_failed: true,
-                ..Default::default()
-            },
+            &Verdict::from_holding(vec![
+                Holding::new(K::Question, "`a.rs:9` Is it idempotent?"),
+                Holding::new(K::EarlierThread, "Missing test (`b.rs:2`)"),
+                Holding::new(K::Verification, "The verification run failed"),
+            ]),
+            0,
         );
-        assert_eq!(
-            prior,
+        assert!(prior.starts_with(
             "❌ **Changes requested**: 1 question the change rests on, 1 earlier requested change still open and the verification run failed."
-        );
-        for h in [approved, notes, blocked, prior] {
-            assert_eq!(h.lines().count(), 1);
-            assert!(!h.contains("Questions, nothing blocking"));
-        }
+        ));
+    }
+
+    /// The zero case can't be written: nothing named is an approval, whatever
+    /// was proposed, on every route to the heading.
+    #[test]
+    fn changes_requested_with_nothing_named_cannot_be_written() {
+        use crate::passes::review_verdict::{may_post, HoldKind as K, Holding, Verdict};
+        let nothing = Verdict::from_holding(vec![]);
+        assert_eq!(nothing.event(), "APPROVE");
+        assert!(!may_post("REQUEST_CHANGES", &nothing));
+        assert!(may_post("APPROVE", &nothing));
+        assert!(may_post("COMMENT", &nothing));
+        // A blank name names nothing.
+        let blank = Verdict::from_holding(vec![Holding::new(K::Defect, "  ")]);
+        assert_eq!(blank.event(), "APPROVE");
+        assert!(!verdict_heading(&blank, 0).contains("Changes requested"));
+        let src = include_str!("review_agent.rs");
+        let needle = concat!("something holds", " the merge");
+        assert!(!src.contains(needle));
     }
 }

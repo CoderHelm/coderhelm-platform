@@ -324,6 +324,8 @@ impl Sim {
                         head_sha: f.head.clone(),
                         created_at: ts(f.at),
                         body: "review".into(),
+                        fingerprint: None,
+                        holding: Vec::new(),
                     },
                 )
             })
@@ -340,6 +342,8 @@ impl Sim {
                         "{} ({error}). Requesting a human look.",
                         super::review_sweep::LEGACY_FAILED_PREFIX
                     ),
+                    fingerprint: None,
+                    holding: Vec::new(),
                 },
             ));
         }
@@ -370,6 +374,7 @@ impl Sim {
             thread_root_id: None,
             mentioned: false,
             requested_by: String::new(),
+            check_head: String::new(),
             attempt: 0,
             wait_secs: 0,
             reconcile_note: None,
@@ -494,6 +499,7 @@ impl Sim {
         let mut view = GateView {
             draft: self.draft,
             require_human: cfg.require_human || self.self_authored,
+            bot_holding: vec![],
             bot_verdict: self.bot_verdicts.get(&self.head).cloned(),
             approvals: approval_state(&Value::Array(self.gh_reviews.clone()), &self.head),
             want_labels: vec![],
@@ -736,6 +742,7 @@ impl Sim {
         let decision = decide(
             Input::Reply {
                 change: conclusion.verdict_change,
+                more_than_words: true,
             },
             &self.ctx(),
         );

@@ -327,6 +327,8 @@ mod tests {
             head_sha: head.into(),
             created_at: String::new(),
             body: "Looks good.".into(),
+            fingerprint: None,
+            holding: Vec::new(),
         }
     }
 

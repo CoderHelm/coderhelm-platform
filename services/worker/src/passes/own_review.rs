@@ -75,8 +75,8 @@ pub fn thread_line(path: &str, line: u64, body: &str) -> String {
         })
         .find(|l| !l.is_empty())
         .unwrap_or("Earlier finding");
+    // Whole: a title is one line, and posted text is never cut mid-sentence.
     let title = title.split_whitespace().collect::<Vec<_>>().join(" ");
-    let title = common::truncate_str(&title, 160);
     if line > 0 {
         format!("{title} (`{path}:{line}`)")
     } else {

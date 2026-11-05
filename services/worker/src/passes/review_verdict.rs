@@ -6,8 +6,13 @@
 //! and the stuck-review sweep (which runs a review). The invariants it keeps:
 //!
 //! - A review that didn't finish never posts a formal verdict.
-//! - A reply that concludes nothing blocks never stands next to CoderHelm's
-//!   own "changes requested": the formal review is re-run in the same job.
+//! - A reply's reading of a comment can't clear or add a block: the formal
+//!   review re-runs only when something the verdict rests on changed, more than
+//!   people's words (`review_fingerprint`). Otherwise the verdict stands and the
+//!   reply says so.
+//! - Changes are requested only with at least one named thing holding the
+//!   merge ([`Verdict`]): nothing holding means approve, whatever the earlier
+//!   verdict was, and [`post`] refuses anything else.
 //! - A finished review's formal verdict is APPROVE or REQUEST_CHANGES, never
 //!   a bare COMMENT ([`binary`]). Only GitHub's rule against verdicts on the
 //!   bot's own PR makes it a COMMENT there; answers to a person's question
@@ -41,6 +46,83 @@ impl StandingReview {
     }
 }
 
+/// What kind of thing holds the merge.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HoldKind {
+    Defect,
+    /// On CoderHelm's own PR: a finding it fixes itself before ready.
+    OwnFinding,
+    Question,
+    Fact,
+    /// An earlier thread of CoderHelm's still open.
+    EarlierThread,
+    Verification,
+    /// An item of the earlier review, held on an identical fingerprint.
+    KeptFromEarlier,
+}
+
+/// One named thing holding the merge.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Holding {
+    pub kind: HoldKind,
+    pub name: String,
+}
+
+impl Holding {
+    pub fn new(kind: HoldKind, name: impl Into<String>) -> Self {
+        Self {
+            kind,
+            name: name.into(),
+        }
+    }
+}
+
+/// The verdict a review may post. The one way to get one is from what holds
+/// the merge, so "changes requested" with nothing named can't be written.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Verdict {
+    holding: Vec<Holding>,
+}
+
+impl Verdict {
+    /// Nothing named holds the merge: approve. Anything named: changes
+    /// requested, naming it.
+    pub fn from_holding(holding: Vec<Holding>) -> Self {
+        let holding = holding
+            .into_iter()
+            .filter(|h| !h.name.trim().is_empty())
+            .collect();
+        Self { holding }
+    }
+
+    pub fn approve() -> Self {
+        Self::from_holding(Vec::new())
+    }
+
+    /// The formal event: `REQUEST_CHANGES` exactly when something is named.
+    pub fn event(&self) -> &'static str {
+        if self.holding.is_empty() {
+            "APPROVE"
+        } else {
+            "REQUEST_CHANGES"
+        }
+    }
+
+    pub fn holding(&self) -> &[Holding] {
+        &self.holding
+    }
+
+    /// The names, for the record and the auto-merge panel.
+    pub fn names(&self) -> Vec<String> {
+        self.holding.iter().map(|h| h.name.clone()).collect()
+    }
+}
+
+/// The chokepoint's rule: request changes only with something named.
+pub fn may_post(event: &str, verdict: &Verdict) -> bool {
+    event != "REQUEST_CHANGES" || verdict.event() == "REQUEST_CHANGES"
+}
+
 /// What happened that may change the formal review.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Input {
@@ -65,7 +147,12 @@ pub enum Input {
     /// when commits are pushed.
     Carried,
     /// A reply CoderHelm is about to post, and what it concludes.
-    Reply { change: VerdictChange },
+    /// `more_than_words`: something the verdict rests on changed, more than
+    /// what people wrote (`review_fingerprint::more_than_words`).
+    Reply {
+        change: VerdictChange,
+        more_than_words: bool,
+    },
 }
 
 /// What CoderHelm's PR looks like for the decision.
@@ -119,20 +206,21 @@ pub fn decide(input: Input, ctx: &Context) -> Decision {
             },
             dismiss_stale: false,
         },
-        Input::Reply { change } => {
+        Input::Reply {
+            change,
+            more_than_words,
+        } => {
             if ctx.self_authored {
                 return Decision::Nothing;
             }
             let Some(st) = ctx.standing.as_ref() else {
                 return Decision::Nothing;
             };
-            let disagrees = match change {
-                VerdictChange::Clear => st.blocks(),
-                VerdictChange::Block => st.verdict == "APPROVE" && !st.failed,
-                // An error review stands on the PR: replace it.
-                VerdictChange::None => st.failed,
-            };
-            if disagrees {
+            // An error review stands on the PR: replace it, it isn't a verdict.
+            if st.failed && change != VerdictChange::Block {
+                return Decision::Review;
+            }
+            if reply_disagrees(change, st) && more_than_words {
                 Decision::Review
             } else {
                 Decision::Nothing
@@ -171,10 +259,20 @@ pub fn decide(input: Input, ctx: &Context) -> Decision {
     }
 }
 
+/// Pure: a reply's conclusion says something other than the standing verdict.
+pub fn reply_disagrees(change: VerdictChange, standing: &StandingReview) -> bool {
+    match change {
+        VerdictChange::Clear => standing.blocks(),
+        VerdictChange::Block => standing.verdict == "APPROVE" && !standing.failed,
+        VerdictChange::None => false,
+    }
+}
+
 /// Posts the formal review `decision` asked for: one batched review with
 /// inline comments, falling back to body-only when GitHub rejects an anchor.
 /// The only caller of the GitHub review endpoints. Returns the posted
 /// review's GitHub link (empty when GitHub sent none).
+#[allow(clippy::too_many_arguments)]
 pub async fn post(
     github: &GitHubClient,
     msg: &ReviewMessage,
@@ -183,7 +281,11 @@ pub async fn post(
     dismiss_stale: bool,
     body: &str,
     inline: &[InlineComment],
+    verdict: &Verdict,
 ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    if !may_post(event, verdict) {
+        return Err("refused to request changes with nothing named holding the merge".into());
+    }
     let posted = github
         .create_pr_review_inline(
             &msg.repo_owner,
@@ -400,6 +502,7 @@ mod tests {
     fn a_reply_that_disagrees_with_the_standing_verdict_reruns_the_review() {
         let clear = Input::Reply {
             change: VerdictChange::Clear,
+            more_than_words: true,
         };
         let ctx = |s| Context {
             standing: s,
@@ -420,6 +523,7 @@ mod tests {
         assert_eq!(decide(clear, &ctx(None)), Decision::Nothing);
         let block = Input::Reply {
             change: VerdictChange::Block,
+            more_than_words: true,
         };
         assert_eq!(
             decide(block, &ctx(standing("APPROVE", false))),
@@ -431,6 +535,7 @@ mod tests {
         );
         let none = Input::Reply {
             change: VerdictChange::None,
+            more_than_words: true,
         };
         assert_eq!(
             decide(none, &ctx(standing("REQUEST_CHANGES", true))),

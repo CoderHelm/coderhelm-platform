@@ -258,6 +258,8 @@ pub(crate) struct GateView {
     pub require_human: bool,
     /// CoderHelm's own latest verdict recorded for this head.
     pub bot_verdict: Option<String>,
+    /// What holds that verdict, by name, as the review named it.
+    pub bot_holding: Vec<String>,
     pub approvals: Approvals,
     /// Deploy labels the repo wants on a PR cleared to merge.
     pub want_labels: Vec<String>,
@@ -306,25 +308,28 @@ fn short(sha: &str) -> &str {
 pub(crate) fn decide_gate(v: &GateView) -> GateDecision {
     let bot_dismissed = v.approvals.bot_dismissed_at_head;
     let bot_approved = v.bot_verdict.as_deref() == Some("APPROVE") && !bot_dismissed;
-    let human_present = v.approvals.human_key();
+    let human_present = v.approvals.human_key_at_head();
 
     let mut lines: Vec<(Mark, String)> = Vec::new();
-    lines.push(match (v.bot_verdict.as_deref(), bot_dismissed) {
-        (Some("APPROVE"), false) => (Mark::Done, "CoderHelm approved".to_string()),
-        (Some("APPROVE"), true) => (
+    match (v.bot_verdict.as_deref(), bot_dismissed) {
+        (Some("APPROVE"), false) => lines.push((Mark::Done, "CoderHelm approved".to_string())),
+        (Some("APPROVE"), true) => lines.push((
             Mark::Blocked,
             "CoderHelm's approval was dismissed. Comment `@coderhelm re-review` to review \
              again"
                 .to_string(),
-        ),
-        (Some(_), _) => (Mark::Blocked, "CoderHelm requested changes".to_string()),
-        (None, _) => (Mark::Waiting, "Waiting for CoderHelm's review".to_string()),
-    });
+        )),
+        (Some(_), _) => lines.extend(holding_lines(&v.bot_holding)),
+        (None, _) => lines.push((Mark::Waiting, "Waiting for CoderHelm's review".to_string())),
+    }
     if v.require_human {
         lines.push(if human_present {
             (
                 Mark::Done,
-                format!("Approved by {}", mention_list(&v.approvals.approved_by)),
+                format!(
+                    "Approved by {}",
+                    mention_list(&v.approvals.approved_at_head)
+                ),
             )
         } else if !v.approvals.blocking_by.is_empty() {
             (
@@ -332,6 +337,15 @@ pub(crate) fn decide_gate(v: &GateView) -> GateDecision {
                 format!(
                     "Changes requested by {}",
                     mention_list(&v.approvals.blocking_by)
+                ),
+            )
+        } else if !v.approvals.approved_by.is_empty() {
+            (
+                Mark::Waiting,
+                format!(
+                    "Approved by {} on an earlier commit; waiting for a person's approval of \
+                     this one",
+                    mention_list(&v.approvals.approved_by)
                 ),
             )
         } else {
@@ -434,6 +448,34 @@ pub(crate) fn decide_gate(v: &GateView) -> GateDecision {
             }
         }
     }
+}
+
+/// Pure: the panel's lines for CoderHelm's block: what holds it, as the review
+/// named it. A review older than named items points at the review.
+fn holding_lines(holding: &[String]) -> Vec<(Mark, String)> {
+    const SHOW: usize = 5;
+    if holding.is_empty() {
+        return vec![(
+            Mark::Blocked,
+            "CoderHelm requested changes: its review of this commit says what holds the merge"
+                .to_string(),
+        )];
+    }
+    let mut lines: Vec<(Mark, String)> = holding
+        .iter()
+        .take(SHOW)
+        .map(|h| (Mark::Blocked, format!("CoderHelm requested changes: {h}")))
+        .collect();
+    if holding.len() > SHOW {
+        lines.push((
+            Mark::Blocked,
+            format!(
+                "CoderHelm requested changes: {} more in its review",
+                holding.len() - SHOW
+            ),
+        ));
+    }
+    lines
 }
 
 fn mention_list(logins: &[String]) -> String {
@@ -820,8 +862,8 @@ async fn publish_status(
 async fn bot_verdict_at_head(
     state: &WorkerState,
     msg: &AwaitMergeMessage,
-) -> Result<Option<String>, BoxError> {
-    common::merge_gate::bot_verdict_at_head(
+) -> Result<Option<common::merge_gate::BotVerdict>, BoxError> {
+    common::merge_gate::bot_review_at_head(
         &state.dynamo,
         &state.config.settings_table_name,
         &msg.team_id,
@@ -1167,11 +1209,16 @@ async fn evaluate(
     }
 
     let approvals = fetch_approvals(github, owner, repo, msg.pr_number, &msg.head_sha).await?;
-    let bot_verdict = bot_verdict_at_head(state, msg).await?;
+    let bot = bot_verdict_at_head(state, msg).await?;
+    let (bot_verdict, bot_holding) = match bot {
+        Some(b) => (Some(b.verdict), b.holding),
+        None => (None, Vec::new()),
+    };
     let mut view = GateView {
         draft: pr["draft"].as_bool().unwrap_or(false),
         require_human: cfg.require_human_approval || msg.self_authored,
         bot_verdict,
+        bot_holding,
         approvals,
         want_labels: cfg
             .deploy_label
@@ -1564,6 +1611,44 @@ pub async fn arm(
     send(state, &msg, 0, SETTLE_DELAY_SECS).await
 }
 
+/// A review of the head still requests changes: a gate that already shows its
+/// panel on the PR reads it again, so the panel names what holds the merge now.
+/// It can't merge on this verdict (see [`decide_gate`]). A PR without a panel,
+/// or stopped by a person, is left alone.
+#[allow(clippy::too_many_arguments)]
+pub async fn refresh_panel(
+    state: &WorkerState,
+    team_id: &str,
+    installation_id: u64,
+    owner: &str,
+    repo: &str,
+    pr_number: u64,
+    head_sha: &str,
+    base_branch: &str,
+    self_authored: bool,
+) {
+    let msg = AwaitMergeMessage {
+        team_id: team_id.to_string(),
+        installation_id,
+        repo_owner: owner.to_string(),
+        repo_name: repo.to_string(),
+        pr_number,
+        head_sha: head_sha.to_string(),
+        base_branch: base_branch.to_string(),
+        self_authored,
+        attempts: 0,
+        chain_id: String::new(),
+        error_retries: 0,
+    };
+    match load_record(state, &msg).await {
+        Ok(r) if !r.status_body.is_empty() && r.stopped.is_none() => {
+            send(state, &msg, 0, 0).await;
+        }
+        Ok(_) => {}
+        Err(e) => warn!(pr = pr_number, error = %e, "Could not read the merge gate to refresh it"),
+    }
+}
+
 /// Enqueue an AwaitMerge tick with `attempts` and an SQS delay.
 async fn send(state: &WorkerState, msg: &AwaitMergeMessage, attempts: u32, delay: i32) -> bool {
     if state.config.ticket_queue_url.is_empty() {
@@ -1754,8 +1839,10 @@ mod ci_tests {
             draft: false,
             require_human: true,
             bot_verdict: Some("APPROVE".into()),
+            bot_holding: vec![],
             approvals: Approvals {
                 approved_by: vec!["alice".into()],
+                approved_at_head: vec!["alice".into()],
                 ..Default::default()
             },
             want_labels: vec![],
@@ -1811,6 +1898,72 @@ mod ci_tests {
             .lines
             .iter()
             .any(|(m, l)| *m == Mark::Blocked && l.contains("dismissed")));
+    }
+
+    /// Person approved, auto-merge armed, CoderHelm's block named on the panel;
+    /// the description is edited and the threads settle; the verdict clears.
+    /// What happens next, exactly: the approval re-arms the gate, which merges
+    /// only with a person's approval of this very commit and green CI.
+    #[test]
+    fn a_verdict_that_clears_merges_only_with_a_persons_approval_of_this_commit_and_green_ci() {
+        // Blocked, naming what holds it, not merged, CI not even read.
+        let mut v = view();
+        v.bot_verdict = Some("REQUEST_CHANGES".into());
+        v.bot_holding = vec!["`deploy.tf:3` State key is shared".into()];
+        v.ci = Some(green());
+        let d = decide_gate(&v);
+        assert_eq!(d.action, Action::WaitForPeople);
+        assert_eq!(
+            d.lines[0],
+            (
+                Mark::Blocked,
+                "CoderHelm requested changes: `deploy.tf:3` State key is shared".to_string()
+            )
+        );
+        assert!(!d
+            .lines
+            .iter()
+            .any(|(_, l)| l == "CoderHelm requested changes"));
+        // The verdict clears: with the approval and green CI, the merge fires.
+        v.bot_verdict = Some("APPROVE".into());
+        v.bot_holding = vec![];
+        let d = decide_gate(&v);
+        assert_eq!(d.action, Action::Merge);
+        assert!(d.lines.iter().any(|(_, l)| l == "CoderHelm approved"));
+        // CI not green yet: it waits.
+        v.ci = None;
+        assert_eq!(decide_gate(&v).action, Action::ReadCi);
+        // The person's approval is of an earlier commit: it waits for a person.
+        let mut stale = view();
+        stale.approvals.approved_at_head = vec![];
+        stale.ci = Some(green());
+        let d = decide_gate(&stale);
+        assert_eq!(d.action, Action::WaitForPeople);
+        assert!(d
+            .lines
+            .iter()
+            .any(|(m, l)| *m == Mark::Waiting && l.contains("on an earlier commit")));
+        // A repo that turned off requiring a person merges on CoderHelm's
+        // approval and green CI alone; CoderHelm's own PRs never do (see
+        // `evaluate`: `require_human` is forced on for them).
+        let mut no_human = view();
+        no_human.require_human = false;
+        no_human.approvals = Approvals::default();
+        no_human.ci = Some(green());
+        assert_eq!(decide_gate(&no_human).action, Action::Merge);
+        let src = include_str!("await_merge.rs");
+        assert!(src.contains("require_human: cfg.require_human_approval || msg.self_authored"));
+    }
+
+    #[test]
+    fn a_long_list_of_holds_points_at_the_review_and_an_old_record_does_too() {
+        let many: Vec<String> = (1..=7).map(|i| format!("item {i}")).collect();
+        let lines = holding_lines(&many);
+        assert_eq!(lines.len(), 6);
+        assert!(lines[5].1.contains("2 more in its review"));
+        assert!(holding_lines(&[])[0]
+            .1
+            .contains("its review of this commit"));
     }
 
     #[test]

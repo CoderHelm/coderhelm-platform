@@ -56,7 +56,10 @@ fn the_own_review_requests_changes_and_lists_every_non_optional_finding() {
     let verdict = review_agent::decide_verdict(&findings, 0, &[], false);
     assert_eq!(verdict, "REQUEST_CHANGES");
     assert_eq!(
-        review_severity::consistent_verdict("APPROVE", &findings),
+        crate::passes::review_verdict::Verdict::from_holding(
+            crate::passes::review_policy::named_holding(&findings, &[], &[], false, &[], &[])
+        )
+        .event(),
         "REQUEST_CHANGES"
     );
     // On its own PR they are the run's to fix, listed at the top.
@@ -70,12 +73,18 @@ fn the_own_review_requests_changes_and_lists_every_non_optional_finding() {
     assert!(body.starts_with(own_review::START));
     end.said(body.clone());
     end.said(review_agent::verdict_heading(
-        verdict,
-        &review_agent::HeadingCounts {
-            defects: 3,
-            own_open: 3,
-            ..Default::default()
-        },
+        &crate::passes::review_verdict::Verdict::from_holding(
+            findings
+                .iter()
+                .map(|f| {
+                    crate::passes::review_verdict::Holding::new(
+                        crate::passes::review_verdict::HoldKind::Defect,
+                        f.title.clone(),
+                    )
+                })
+                .collect(),
+        ),
+        0,
     ));
     // While they are listed the PR stays a draft: neither mark-ready path
     // goes on.
@@ -103,8 +112,8 @@ fn the_review_posts_never_approve_with_a_blocker_and_arms_nothing_on_open_findin
     let src = include_str!("../review_pr.rs");
     let run = fn_src(src, "\nasync fn run_once(");
     let consistent = run
-        .find("review_severity::consistent_verdict(")
-        .expect("run_once makes the verdict consistent with its findings");
+        .find("review_policy::named_holding(")
+        .expect("run_once makes the verdict from what holds the merge");
     let own = run
         .find("own_review::required(")
         .expect("run_once lists the own PR's open findings");

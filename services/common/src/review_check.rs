@@ -8,6 +8,15 @@
 //! completes it however the job ends; a job that hands its review to a later
 //! one (a retry, a full review) hands the check over with it, queued again.
 //!
+//! Every way CoderHelm accepts work on a PR shows here within seconds: a push,
+//! a label, a reply, a re-review, an edited description. A job on a commit
+//! whose check already finished opens a new run of the same name, which GitHub
+//! shows in place of the finished one, so the commit keeps one check. A job
+//! that ends without a new verdict (a reply that was only answered, a re-review
+//! with nothing changed) completes its run with the conclusion and title of
+//! the run before it ([`close_restoring`]), so the commit always shows the
+//! verdict that stands.
+//!
 //! Each check carries an `external_id` naming the job it waits for and when
 //! that job is due ([`external_id`]). A job finds its own check by that key,
 //! and a check still open long after its job was due is completed by the
@@ -78,6 +87,83 @@ pub fn queued_title(head: &str, due: i64, now: i64) -> String {
     }
 }
 
+/// Whether the gateway may show a job on the commit when it sends it. A reply
+/// that didn't address CoderHelm may not be for it at all: only the worker can
+/// tell, by reading whose thread or text it answers. It leaves the check alone
+/// until then and opens it if the reply turns out to answer CoderHelm.
+pub fn shows_when_sent(trigger: &str, mentioned: bool) -> bool {
+    match trigger {
+        "thread_reply" => mentioned,
+        "quote_reply" => false,
+        _ => true,
+    }
+}
+
+/// What a job does, in the words of a check's title.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Work {
+    /// A person's comment to read and answer.
+    Reply,
+    /// A person asked for another look.
+    ReReview,
+    /// The description was edited to answer the review.
+    Description,
+    /// A push, a label, the PR opening or leaving draft, a run's own review.
+    Review,
+}
+
+impl Work {
+    /// The work of a job from its trigger and whether it carries a comment.
+    pub fn of(trigger: &str, has_question: bool) -> Self {
+        if has_question {
+            return Work::Reply;
+        }
+        match trigger {
+            "reply" | "rerequest" => Work::ReReview,
+            crate::review_description::TRIGGER => Work::Description,
+            _ => Work::Review,
+        }
+    }
+}
+
+/// Pure: the title of a check waiting for job `work`, due at `due`.
+pub fn waiting_title(work: Work, head: &str, due: i64, now: i64) -> String {
+    let short = short(head);
+    match work {
+        Work::Reply => format!("Reading your reply on {short}"),
+        Work::ReReview => format!("Re-reviewing {short}"),
+        Work::Description => format!("Re-reviewing {short} with the edited description"),
+        Work::Review => queued_title(head, due, now),
+    }
+}
+
+/// Pure: the title of a check whose job has started.
+pub fn started_title(work: Work, head: &str) -> String {
+    let short = short(head);
+    match work {
+        Work::Reply => format!("Reading your reply on {short}"),
+        Work::ReReview => format!("Re-reviewing {short}"),
+        Work::Description => format!("Re-reviewing {short} with the edited description"),
+        Work::Review => format!("Reviewing {short}"),
+    }
+}
+
+/// Pure: the summary of a check waiting for job `work`.
+pub fn waiting_summary(work: Work, due: i64, now: i64, details_url: &str) -> String {
+    match work {
+        Work::Review => queued_summary(due, now, details_url),
+        Work::Reply => format!(
+            "CoderHelm got your reply and is reading it. The verdict on this commit stays as it \
+             is unless something it rests on changed.\n\n[See the pull request's \
+             reviews]({details_url}) on CoderHelm."
+        ),
+        Work::ReReview | Work::Description => format!(
+            "CoderHelm got the request and starts on it shortly.\n\n[See the pull request's \
+             reviews]({details_url}) on CoderHelm."
+        ),
+    }
+}
+
 /// Pure: the summary of a check waiting for its review.
 pub fn queued_summary(due: i64, now: i64, details_url: &str) -> String {
     let wait = if due - now >= 30 {
@@ -100,6 +186,8 @@ pub struct OpenCheck {
     pub key: Option<String>,
     /// When that job was due, or when the check started.
     pub since: Option<i64>,
+    /// Waiting for its job (not yet taken over).
+    pub queued: bool,
 }
 
 impl OpenCheck {
@@ -133,11 +221,47 @@ pub fn open_checks(list: &Value) -> Vec<OpenCheck> {
                 id,
                 key: parsed.map(|(_, k)| k.to_string()),
                 since: parsed.map(|(d, _)| d).or(started),
+                queued: c["status"].as_str() == Some("queued"),
             })
         })
         .collect();
     out.sort_by_key(|c| c.id);
     out
+}
+
+/// The finished result a commit's check shows: the newest completed CoderHelm
+/// run that isn't `except`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Standing {
+    pub conclusion: &'static str,
+    pub title: String,
+    pub summary: String,
+}
+
+/// A conclusion this code writes, or neutral.
+fn known_conclusion(c: &str) -> &'static str {
+    match c {
+        "success" => "success",
+        "failure" => "failure",
+        "skipped" => "skipped",
+        _ => "neutral",
+    }
+}
+
+/// Pure: [`Standing`] from a `check-runs` listing.
+pub fn standing_in(list: &Value, except: u64) -> Option<Standing> {
+    list["check_runs"]
+        .as_array()?
+        .iter()
+        .filter(|c| c["name"].as_str() == Some(CHECK_NAME))
+        .filter(|c| c["status"].as_str() == Some("completed"))
+        .filter(|c| c["id"].as_u64() != Some(except))
+        .max_by_key(|c| c["id"].as_u64().unwrap_or(0))
+        .map(|c| Standing {
+            conclusion: known_conclusion(c["conclusion"].as_str().unwrap_or("")),
+            title: c["output"]["title"].as_str().unwrap_or("").to_string(),
+            summary: c["output"]["summary"].as_str().unwrap_or("").to_string(),
+        })
 }
 
 /// The three check-run calls, so every path can be tested without GitHub.
@@ -201,10 +325,11 @@ impl CheckCalls for TokenCalls<'_> {
     }
 }
 
-/// The listing of CoderHelm's checks on `head`.
+/// The listing of CoderHelm's checks on `head`: every run, not only the newest
+/// of the name, so a job can read what the commit showed before it.
 pub fn list_url(owner: &str, repo: &str, head: &str) -> String {
     format!(
-        "{API}/repos/{owner}/{repo}/commits/{head}/check-runs?check_name={}&per_page=100",
+        "{API}/repos/{owner}/{repo}/commits/{head}/check-runs?check_name={}&filter=all&per_page=100",
         urlencoding::encode(CHECK_NAME)
     )
 }
@@ -287,6 +412,21 @@ pub async fn queue<C: CheckCalls + ?Sized>(
     due: i64,
     details_url: &str,
 ) -> Queued {
+    queue_work(api, t, Work::Review, key, due, details_url).await
+}
+
+/// CoderHelm accepted `work` on `t.head` for job `key`, due at `due`: the
+/// commit shows it right away. A commit already showing an open check keeps
+/// it (the job running there speaks for the commit); a finished one is shown
+/// over by this new run until the job ends.
+pub async fn queue_work<C: CheckCalls + ?Sized>(
+    api: &C,
+    t: &Target<'_>,
+    work: Work,
+    key: &str,
+    due: i64,
+    details_url: &str,
+) -> Queued {
     if t.head.is_empty() {
         return Queued::Nothing;
     }
@@ -304,8 +444,8 @@ pub async fn queue<C: CheckCalls + ?Sized>(
         "external_id": external_id(key, due),
         "details_url": details_url,
         "output": {
-            "title": crate::truncate_str(&queued_title(t.head, due, now), 250),
-            "summary": queued_summary(due, now, details_url),
+            "title": crate::truncate_str(&waiting_title(work, t.head, due, now), 250),
+            "summary": waiting_summary(work, due, now, details_url),
         },
     });
     let id = match api.create(t.owner, t.repo, &body).await {
@@ -317,7 +457,7 @@ pub async fn queue<C: CheckCalls + ?Sized>(
     };
     // A stale one left open on the same commit is given up on now.
     for c in open {
-        close(api, t, c.id, &stopped_close(details_url)).await;
+        close_restoring(api, t, c.id, &stopped_close(details_url)).await;
     }
     Queued::Created(id)
 }
@@ -501,6 +641,32 @@ pub async fn close<C: CheckCalls + ?Sized>(api: &C, t: &Target<'_>, id: u64, c: 
     }
 }
 
+/// Complete check `id` for a job that ended without a new verdict: the commit
+/// goes back to showing the run before it, the same conclusion and title, with
+/// what this job did added to the summary. With no finished run before it,
+/// `c` as it is.
+pub async fn close_restoring<C: CheckCalls + ?Sized>(api: &C, t: &Target<'_>, id: u64, c: &Close) {
+    let standing = match api.list(t.owner, t.repo, t.head).await {
+        Ok(list) => standing_in(&list, id),
+        Err(e) => {
+            log_failure(t.installation, t.pr, "read the standing check", &e);
+            None
+        }
+    };
+    match standing {
+        Some(s) => {
+            let restored = Close {
+                conclusion: s.conclusion,
+                title: s.title,
+                summary: format!("{}\n\n{}", s.summary.trim_end(), c.summary),
+                details_url: c.details_url.clone(),
+            };
+            close(api, t, id, &restored).await;
+        }
+        None => close(api, t, id, c).await,
+    }
+}
+
 /// Complete the check waiting for job `key` on `t.head`, if there is one:
 /// for a job that ends before it takes its check over.
 pub async fn close_waiting<C: CheckCalls + ?Sized>(
@@ -515,10 +681,15 @@ pub async fn close_waiting<C: CheckCalls + ?Sized>(
     let Some(open) = open_on_head(api, t).await else {
         return false;
     };
-    let Some(mine) = open.iter().find(|o| o.key.as_deref() == Some(key)) else {
+    // Still waiting: a job already running under this key (a redelivered copy
+    // is what ends early) holds its check itself.
+    let Some(mine) = open
+        .iter()
+        .find(|o| o.queued && o.key.as_deref() == Some(key))
+    else {
         return false;
     };
-    close(api, t, mine.id, c).await;
+    close_restoring(api, t, mine.id, c).await;
     true
 }
 
@@ -535,7 +706,7 @@ pub async fn close_stale<C: CheckCalls + ?Sized>(
     };
     let mut n = 0;
     for c in open.iter().filter(|c| c.stale(now)) {
-        close(api, t, c.id, &stopped_close(details_url)).await;
+        close_restoring(api, t, c.id, &stopped_close(details_url)).await;
         n += 1;
     }
     n
@@ -593,6 +764,17 @@ pub mod fake {
         }
         pub fn count(&self) -> usize {
             self.runs.lock().unwrap().len()
+        }
+        /// What GitHub shows for the commit: its newest run of the name.
+        pub fn shown(&self, head: &str) -> Value {
+            self.runs
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|r| r["head_sha"].as_str() == Some(head))
+                .max_by_key(|r| r["id"].as_u64().unwrap_or(0))
+                .cloned()
+                .unwrap_or(Value::Null)
         }
         fn refused(&self, what: &str) -> Result<(), String> {
             self.calls.lock().unwrap().push(what.to_string());
@@ -863,6 +1045,155 @@ mod tests {
         // A server error is not a refusal.
         assert!(!is_refusal("GitHub answered 502 Bad Gateway: x"));
         assert!(is_refusal("GitHub answered 403 Forbidden: x"));
+    }
+
+    #[tokio::test]
+    async fn a_reply_answered_only_leaves_the_standing_verdict_showing() {
+        let gh = FakeChecks::default();
+        let t = target(1);
+        let v = take_over_or_open(&gh, &t, "head#x", "Reading", "s")
+            .await
+            .unwrap();
+        close(
+            &gh,
+            &t,
+            v,
+            &Close {
+                conclusion: "neutral",
+                title: "Changes requested: 2 findings".into(),
+                summary: "[Read the review](https://x/r) on the pull request.".into(),
+                details_url: None,
+            },
+        )
+        .await;
+        // The reply shows at once, in plain words, over the finished check.
+        let q = queue_work(&gh, &t, Work::Reply, "reply#9", now(), "https://app/pr").await;
+        let id = match q {
+            Queued::Created(id) => id,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(gh.shown(HEAD)["status"], "queued");
+        assert_eq!(
+            gh.shown(HEAD)["output"]["title"],
+            "Reading your reply on 9fceb02"
+        );
+        // Then in progress with the session link.
+        let title = started_title(Work::Reply, HEAD);
+        assert_eq!(
+            start(&gh, &t, "reply#9", &title, "https://app/session?id=j").await,
+            Some(id)
+        );
+        assert_eq!(gh.shown(HEAD)["status"], "in_progress");
+        assert_eq!(gh.shown(HEAD)["details_url"], "https://app/session?id=j");
+        // Answered, nothing changed: the commit shows the verdict again.
+        close_restoring(
+            &gh,
+            &t,
+            id,
+            &Close {
+                conclusion: "neutral",
+                title: "Answered".into(),
+                summary: "Answered on the pull request.".into(),
+                details_url: Some("https://app/session?id=j".into()),
+            },
+        )
+        .await;
+        let shown = gh.shown(HEAD);
+        assert_eq!(shown["conclusion"], "neutral");
+        assert_eq!(shown["output"]["title"], "Changes requested: 2 findings");
+        let summary = shown["output"]["summary"].as_str().unwrap();
+        assert!(summary.contains("[Read the review](https://x/r)"));
+        assert!(summary.contains("Answered on the pull request."));
+        assert_eq!(shown["details_url"], "https://app/session?id=j");
+        // An approval stays a pass.
+        let gh = FakeChecks::default();
+        let v = take_over_or_open(&gh, &t, "head#x", "Reading", "s")
+            .await
+            .unwrap();
+        close(
+            &gh,
+            &t,
+            v,
+            &Close {
+                conclusion: "success",
+                title: "Approved, no findings".into(),
+                summary: "s".into(),
+                details_url: None,
+            },
+        )
+        .await;
+        let id = take_over_or_open(&gh, &t, "reply#1", "Reading", "s")
+            .await
+            .unwrap();
+        close_restoring(&gh, &t, id, &stopped_close("u")).await;
+        assert_eq!(gh.shown(HEAD)["conclusion"], "success");
+        assert_eq!(gh.shown(HEAD)["output"]["title"], "Approved, no findings");
+    }
+
+    #[tokio::test]
+    async fn a_stale_reply_check_goes_back_to_the_verdict_and_a_running_job_keeps_its_own() {
+        let gh = FakeChecks::default();
+        let t = target(1);
+        let v = take_over_or_open(&gh, &t, "head#x", "Reading", "s")
+            .await
+            .unwrap();
+        close(
+            &gh,
+            &t,
+            v,
+            &Close {
+                conclusion: "success",
+                title: "Approved, no findings".into(),
+                summary: "s".into(),
+                details_url: None,
+            },
+        )
+        .await;
+        queue_work(
+            &gh,
+            &t,
+            Work::ReReview,
+            "reply#2",
+            now() - STALE_AFTER_SECS - 60,
+            "u",
+        )
+        .await;
+        assert_eq!(close_stale(&gh, &t, now(), "u").await, 1);
+        assert_eq!(gh.shown(HEAD)["output"]["title"], "Approved, no findings");
+        assert_eq!(gh.shown(HEAD)["conclusion"], "success");
+        // A redelivered copy of a job that is running doesn't end its check.
+        let gh = FakeChecks::default();
+        queue_work(&gh, &t, Work::Reply, "reply#3", now(), "u").await;
+        start(&gh, &t, "reply#3", "R", "s").await;
+        assert!(!close_waiting(&gh, &t, "reply#3", &stopped_close("u")).await);
+        assert_eq!(gh.run(1)["status"], "in_progress");
+    }
+
+    #[test]
+    fn titles_say_what_is_happening_and_ignored_replies_show_nothing() {
+        let t0 = 1_793_896_153;
+        for (trigger, question, title) in [
+            ("reply", true, "Reading your reply on 9fceb02"),
+            ("thread_reply", true, "Reading your reply on 9fceb02"),
+            ("reply", false, "Re-reviewing 9fceb02"),
+            ("rerequest", false, "Re-reviewing 9fceb02"),
+            (
+                "description",
+                false,
+                "Re-reviewing 9fceb02 with the edited description",
+            ),
+            ("labeled", false, "Reviewing 9fceb02 shortly"),
+        ] {
+            assert_eq!(
+                waiting_title(Work::of(trigger, question), HEAD, t0, t0),
+                title
+            );
+        }
+        assert!(shows_when_sent("reply", true));
+        assert!(shows_when_sent("rerequest", false));
+        assert!(shows_when_sent("thread_reply", true));
+        assert!(!shows_when_sent("thread_reply", false));
+        assert!(!shows_when_sent("quote_reply", false));
     }
 
     #[test]

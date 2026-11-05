@@ -351,6 +351,10 @@ struct Session {
     /// How its check ends when the job ends without a new review: the
     /// conclusion and title (the summary is the job's reason).
     settled: Option<(&'static str, String)>,
+    /// Ending without a new verdict gives the commit back the check it showed
+    /// before this job: a person's comment, or a re-review with nothing
+    /// changed, says nothing about the verdict.
+    restore: bool,
 }
 
 /// The key a job's check is held under: the job's dedup key (what the
@@ -376,6 +380,21 @@ fn check_target<'a>(
     }
 }
 
+/// The commit carrying the job's check: the one it is pinned to, or the one the
+/// gateway queued its check on.
+fn check_head(msg: &ReviewMessage) -> &str {
+    if msg.head_sha.is_empty() {
+        &msg.check_head
+    } else {
+        &msg.head_sha
+    }
+}
+
+/// What the job does, in the words of its check.
+fn check_work(msg: &ReviewMessage) -> common::review_check::Work {
+    common::review_check::Work::of(&msg.trigger, msg.question.is_some())
+}
+
 fn pr_page(state: &WorkerState, msg: &ReviewMessage) -> String {
     common::review_check::pr_page(
         common::public_urls::app_url(&state.config.stage),
@@ -394,7 +413,7 @@ async fn close_waiting_check(
     title: &str,
     summary: &str,
 ) {
-    if msg.question.is_some() || msg.dedup_key.is_empty() {
+    if msg.dedup_key.is_empty() {
         return;
     }
     let close = common::review_check::Close {
@@ -405,7 +424,7 @@ async fn close_waiting_check(
     };
     common::review_check::close_waiting(
         github,
-        &check_target(msg, &msg.head_sha),
+        &check_target(msg, check_head(msg)),
         &msg.dedup_key,
         &close,
     )
@@ -488,30 +507,143 @@ impl LiveJob {
     }
 
     /// The job starts: take over the check the gateway queued for it on its
-    /// commit (a push, label, opened or ready event), in progress at once.
-    /// Nothing when no check waits for this job.
+    /// commit, in progress at once. Nothing when no check waits for this job,
+    /// or a reply the worker hasn't yet found is for CoderHelm.
     async fn start_check(&self, state: &WorkerState, github: &GitHubClient, msg: &ReviewMessage) {
-        if msg.question.is_some() || msg.head_sha.is_empty() || self.session().check.is_some() {
+        let head = check_head(msg);
+        if head.is_empty() || self.session().check.is_some() {
             return;
         }
         let Some(id) = common::review_check::start(
             github,
-            &check_target(msg, &msg.head_sha),
+            &check_target(msg, head),
             &msg.dedup_key,
-            &super::review_session::started_title(&msg.head_sha),
+            &common::review_check::started_title(check_work(msg), head),
             &pr_page(state, msg),
         )
         .await
         else {
             return;
         };
-        self.session().check = Some((id, msg.head_sha.clone()));
+        let mut s = self.session();
+        s.check = Some((id, head.to_string()));
+        s.restore = msg.question.is_some();
+        if msg.question.is_some() {
+            s.settled = Some(super::review_session::not_reviewed(NotReviewed::Answered {
+                head,
+            }));
+        }
+    }
+
+    /// The job knows the PR's head now. A check queued on a commit the PR has
+    /// left goes back to what it showed. A person's ask with no check on the
+    /// head (a reply only the worker could tell was for CoderHelm, a head that
+    /// moved, a gateway that couldn't reach GitHub) shows it now.
+    async fn follow_head(
+        &self,
+        state: &WorkerState,
+        github: &GitHubClient,
+        msg: &ReviewMessage,
+        head: &str,
+    ) {
+        let held = self.session().check.clone();
+        if let Some((id, old)) = held {
+            if old == head {
+                return;
+            }
+            let close = common::review_check::Close {
+                conclusion: "neutral",
+                title: format!(
+                    "Replaced by the review of {}",
+                    common::review_check::short(head)
+                ),
+                summary: format!(
+                    "The pull request moved on to {} before this finished.",
+                    common::review_check::short(head)
+                ),
+                details_url: Some(pr_page(state, msg)),
+            };
+            common::review_check::close_restoring(github, &check_target(msg, &old), id, &close)
+                .await;
+            self.session().check = None;
+        }
+        if msg.head_sha.is_empty() && !msg.dedup_key.is_empty() && !head.is_empty() {
+            let work = check_work(msg);
+            let target = check_target(msg, head);
+            let details = pr_page(state, msg);
+            let now = chrono::Utc::now().timestamp();
+            common::review_check::queue_work(github, &target, work, &msg.dedup_key, now, &details)
+                .await;
+            let mut with_head = msg.clone();
+            with_head.check_head = head.to_string();
+            self.start_check(state, github, &with_head).await;
+        }
+    }
+
+    /// The session page exists now: the check links it, so the person can
+    /// watch what CoderHelm is doing.
+    async fn link_session(&self, state: &WorkerState, github: &GitHubClient, msg: &ReviewMessage) {
+        let held = self.session().check.clone();
+        let Some((id, head)) = held else {
+            return;
+        };
+        let title = common::review_check::started_title(check_work(msg), &head);
+        let key = check_key(msg, &self.id).to_string();
+        self.say_on_check(state, github, msg, id, &head, &key, &title)
+            .await;
+    }
+
+    /// The check says what the job does now, linking its session.
+    #[allow(clippy::too_many_arguments)]
+    async fn say_on_check(
+        &self,
+        state: &WorkerState,
+        github: &GitHubClient,
+        msg: &ReviewMessage,
+        id: u64,
+        head: &str,
+        key: &str,
+        title: &str,
+    ) {
+        let details = super::review_session::session_url(
+            common::public_urls::app_url(&state.config.stage),
+            &self.id,
+        );
+        common::review_check::progress(github, &check_target(msg, head), id, key, title, &details)
+            .await;
+    }
+
+    /// The reply is being answered.
+    async fn answering(&self, state: &WorkerState, github: &GitHubClient, msg: &ReviewMessage) {
+        let held = self.session().check.clone();
+        if let Some((id, head)) = held {
+            let title = format!(
+                "Answering your reply on {}",
+                common::review_check::short(&head)
+            );
+            let key = check_key(msg, &self.id).to_string();
+            self.say_on_check(state, github, msg, id, &head, &key, &title)
+                .await;
+        }
+    }
+
+    /// The job answered a person and the verdict stands: its check goes back
+    /// to the verdict the commit showed.
+    fn answered(&self, head: &str, why: &str) {
+        let mut s = self.session();
+        s.settled = Some(super::review_session::not_reviewed(NotReviewed::Answered {
+            head,
+        }));
+        s.not_posted = Some(why.to_string());
+        s.restore = true;
     }
 
     /// How the check ends if the job ends without a new review: `conclusion`
     /// and `title`, the job's reason as its summary.
     fn settle(&self, why: super::review_session::NotReviewed<'_>) {
-        self.session().settled = Some(super::review_session::not_reviewed(why));
+        let mut s = self.session();
+        s.settled = Some(super::review_session::not_reviewed(why));
+        s.restore = false;
     }
 
     /// The job hands its review to job `next_key`, due at `due`: its check
@@ -642,7 +774,7 @@ impl LiveJob {
         use super::review_session::CheckEnd;
         use common::review_live::Finished;
         use common::review_session as rs;
-        let (check, verdict, not_posted, settled, opened) = {
+        let (check, verdict, not_posted, settled, opened, restore) = {
             let s = self.session();
             (
                 s.check.clone(),
@@ -650,6 +782,7 @@ impl LiveJob {
                 s.not_posted.clone(),
                 s.settled.clone(),
                 s.opened,
+                s.restore,
             )
         };
         // The session's status and last step, and the check's ending.
@@ -748,6 +881,11 @@ impl LiveJob {
                 msg.installation_id,
                 &state.http,
             ) {
+                // No new verdict from a job that only answered: the commit
+                // shows the one that stands, and the job's link.
+                Ok(github) if restore && verdict.is_none() => {
+                    common::review_check::close_restoring(&github, &target, id, &close).await
+                }
                 Ok(github) => common::review_check::close(&github, &target, id, &close).await,
                 Err(e) => {
                     warn!(pr = msg.pr_number, error = %e, "Could not complete the CoderHelm review check")
@@ -1185,6 +1323,16 @@ async fn run_once(
                 dedup_key = %msg.dedup_key,
                 "Skipping duplicate review job — this trigger was already processed"
             );
+            // A redelivered webhook may have queued a check for it again; the
+            // copy that is running keeps its own.
+            close_waiting_check(
+                state,
+                &github,
+                &msg,
+                "Already handled",
+                "A repeat delivery of something CoderHelm already handled.",
+            )
+            .await;
             return Ok(DONE);
         }
     }
@@ -1235,6 +1383,7 @@ async fn run_once(
         msg.head_sha.clone()
     };
     *reviewed_head = head_sha.clone();
+    live_job.follow_head(state, &github, &msg, &head_sha).await;
 
     // CoderHelm's own push while its run is still fixing the PR: the run
     // asks for the verdict itself when CI is green, and hands the PR over
@@ -1285,9 +1434,12 @@ async fn run_once(
         super::review_sweep::review_records(state, &msg.team_id, &repo_slug, msg.pr_number, 10)
             .await;
     if msg.question.is_none() {
-        if let super::review_policy::Start::ReturnExisting { verdict } =
-            super::review_policy::start(&msg.trigger, &head_sha, &records)
-        {
+        if let super::review_policy::Start::ReturnExisting { verdict } = super::review_policy::start(
+            &msg.trigger,
+            &head_sha,
+            &super::review_fingerprint::description_part(pr_body),
+            &records,
+        ) {
             info!(pr = msg.pr_number, head = %head_sha, trigger = %msg.trigger, verdict = %verdict, "Commit already reviewed — its verdict stands, not reviewed again");
             live_job.settle(NotReviewed::AlreadyReviewed {
                 head: &head_sha,
@@ -1299,6 +1451,16 @@ async fn run_once(
                     verdict.to_lowercase().replace('_', " ")
                 ),
             });
+        }
+        if super::review_policy::start(
+            &msg.trigger,
+            &head_sha,
+            &super::review_fingerprint::description_part(pr_body),
+            &records,
+        ) == super::review_policy::Start::DescriptionChanged
+        {
+            info!(pr = msg.pr_number, head = %head_sha, trigger = %msg.trigger, "Commit already reviewed, but its description changed — reviewed as a description edit");
+            msg.trigger = common::review_description::TRIGGER.to_string();
         }
     }
 
@@ -1339,6 +1501,7 @@ async fn run_once(
 
     // Real work starts here: the dashboard shows the PR as being reviewed.
     live_job.reviewing(state, &msg, &head_sha, title).await;
+    live_job.link_session(state, &github, &msg).await;
 
     // Build the diff (base...head compare gives per-file patches), bounded.
     let compare = github
@@ -1435,6 +1598,9 @@ async fn run_once(
 
     let self_authored = pr_author.contains("coderhelm");
     let standing = super::review_sweep::standing_review(&records);
+    // Where a re-review ask made in a thread is answered, if it is answered
+    // from the standing verdict.
+    let asked_in = msg.reply_to_comment_id;
 
     // What the person's comment asks for, read by a model in context: an
     // ask for another look or for the approval gets a formal review of the
@@ -1486,6 +1652,7 @@ async fn run_once(
 
     // ── Reply-with-a-question mode: answer, don't vote. ──
     if let Some(question) = msg.question.as_ref().filter(|q| !q.trim().is_empty()) {
+        live_job.answering(state, &github, &msg).await;
         let system = reply_system_prompt(
             &msg.repo_owner,
             &msg.repo_name,
@@ -1705,6 +1872,8 @@ async fn run_once(
                 return Err(format!("the model call failed: {e}").into());
             }
         };
+        // An answer that hit its token limit ends on its last whole sentence.
+        answer = common::prose::end_on_sentence(&answer).to_string();
         // What the answer concludes, judged by the model: whether CoderHelm's
         // formal verdict must follow it, and whether it drip-feeds new
         // non-blocking items after an earlier reply said the code was fine.
@@ -1715,7 +1884,7 @@ async fn run_once(
                 pr = msg.pr_number,
                 "Reply dropped new non-blocking items raised after the code was called fine"
             );
-            answer = c.revised_reply.clone();
+            answer = common::prose::end_on_sentence(&c.revised_reply).to_string();
         }
         let consulted = skills
             .as_ref()
@@ -1727,10 +1896,25 @@ async fn run_once(
             .unwrap_or_default();
         // The one verdict function decides whether the formal review must
         // follow this reply; if so it runs first, in this job.
+        // A reading of a comment can't clear or add a block: only something
+        // the verdict rests on, more than people's words, starts a formal
+        // review from a reply.
+        let more_than_words = match conclusion.as_ref().map(|c| c.verdict_change) {
+            Some(review_agent::VerdictChange::Clear | review_agent::VerdictChange::Block) => {
+                let now = read_fingerprint(state, &github, &msg, &head_sha, pr_body, base).await;
+                let stored = super::review_policy::review_of_head(&records, &head_sha)
+                    .and_then(|r| r.fingerprint.as_ref());
+                super::review_fingerprint::more_than_words(&super::review_fingerprint::changes(
+                    stored, &now,
+                ))
+            }
+            _ => false,
+        };
         let decision = conclusion.as_ref().map(|c| {
             super::review_verdict::decide(
                 super::review_verdict::Input::Reply {
                     change: c.verdict_change,
+                    more_than_words,
                 },
                 &super::review_verdict::Context {
                     standing: standing.clone(),
@@ -1783,6 +1967,7 @@ async fn run_once(
                 standing = ?standing,
                 "Reply conclusion differs from the standing verdict; formal review runs first"
             );
+            live_job.not_posted("Re-reviewing because what the verdict rests on changed.");
             return Ok(Outcome::ReviewThenReply {
                 review: Box::new(reconcile_message(&msg, &head_sha, &reason)),
                 reply: Box::new(PendingReply {
@@ -1793,6 +1978,18 @@ async fn run_once(
                 }),
             });
         }
+        // The answer reads otherwise than the verdict, and nothing it rests on
+        // changed: the verdict stands, and the answer says so.
+        if let (Some(c), Some(st)) = (&conclusion, &standing) {
+            if !self_authored && super::review_verdict::reply_disagrees(c.verdict_change, st) {
+                info!(pr = msg.pr_number, head = %head_sha, change = ?c.verdict_change, standing = %st.verdict, "Reply reads otherwise than the verdict; nothing it rests on changed, the verdict stands");
+                answer = format!(
+                    "{}\n\n{}",
+                    answer.trim_end(),
+                    super::review_policy::verdict_stands_note(&head_sha, &st.verdict)
+                );
+            }
+        }
         send_reply(
             state, &github, &msg, &head_sha, &answer, &consulted, &applied, &usage,
         )
@@ -1800,10 +1997,54 @@ async fn run_once(
         live_job
             .step(state, &msg, "Answered on the pull request", "")
             .await;
+        live_job.answered(
+            &head_sha,
+            "CoderHelm answered on the pull request; the verdict on this commit is unchanged.",
+        );
         return Ok(DONE);
     }
 
     // ── Verdict mode (agentic: walk the repo, structured findings, self-critique) ──
+
+    // What the verdict rests on, read before anything else: compared with what
+    // the last review of this commit rested on (never the commit alone), and
+    // the base of what this review stores.
+    let read_now = read_fingerprint(state, &github, &msg, &head_sha, pr_body, base).await;
+    let review_before = super::review_policy::review_of_head(&records, &head_sha).cloned();
+    let changed_since = super::review_fingerprint::changes(
+        review_before.as_ref().and_then(|r| r.fingerprint.as_ref()),
+        &read_now,
+    );
+    // A person asked again and nothing changed: the standing verdict is the
+    // answer, with no model review, and the threads stay as they are.
+    if super::review_policy::answers_from_standing(
+        &msg.trigger,
+        &changed_since,
+        review_before.is_some(),
+    ) {
+        if let Some(prev) = &review_before {
+            info!(pr = msg.pr_number, head = %head_sha, trigger = %msg.trigger, verdict = %prev.verdict, "Re-review ask with nothing changed — answered from the standing verdict, no model review");
+            let answer =
+                super::review_policy::standing_answer(&head_sha, &prev.verdict, &prev.holding);
+            let mut asked = msg.clone();
+            asked.reply_to_comment_id = asked_in;
+            send_reply(state, &github, &asked, &head_sha, &answer, "", &[], &usage).await?;
+            live_job
+                .step(
+                    state,
+                    &msg,
+                    "Nothing changed: answered from the standing verdict",
+                    "",
+                )
+                .await;
+            live_job.answered(
+                &head_sha,
+                "Nothing the verdict rests on changed since CoderHelm's last review of this \
+                 commit, so it answered from that verdict without reviewing again.",
+            );
+            return Ok(DONE);
+        }
+    }
 
     // A person's re-review ask and a push review of the same commit used to
     // run together and post opposite verdicts seconds apart. The ask takes
@@ -2772,28 +3013,13 @@ async fn run_once(
     let unconfirmed = review_agent::unconfirmed_external_facts(pr_body, &output.unconfirmed_facts);
     let verdict: &'static str =
         review_agent::decide_verdict(&findings, still_open_holding, &unconfirmed, verify_failed);
-    // Rule 2: on a commit already reviewed, the verdict changes only on new
-    // information, and says what it was.
-    let new_info: Option<String> = if msg.trigger == common::review_description::TRIGGER {
-        Some("the description updated since my last review".to_string())
-    } else if msg.trigger == "reconcile" {
-        Some(
-            msg.reconcile_note
-                .clone()
-                .filter(|n| !n.trim().is_empty())
-                .unwrap_or_else(|| "a reply on this PR changed the facts".to_string()),
-        )
-    } else {
-        same_head_before.as_ref().and_then(|prev| {
-            super::review_policy::person_spoke_since(&people_wrote, &prev.created_at)
-                .map(|who| format!("what {who} wrote since my last review"))
-        })
-    };
+    // Rule 2: a repeat review on an identical fingerprint doesn't flip on model
+    // noise; anything changed, the verdict follows what holds the merge now.
     let stable = super::review_policy::stabilize(
         same_head_before.as_ref(),
         verdict,
         &mut findings,
-        new_info.as_deref(),
+        &changed_since,
         &output.change_of_mind,
         super::review_policy::trigger_kind(&msg.trigger)
             == super::review_policy::TriggerKind::Explicit,
@@ -2827,12 +3053,24 @@ async fn run_once(
             }
         }
     }
-    let verdict = super::review_severity::consistent_verdict(stable.verdict, &findings);
-    let verdict = if own_open.is_empty() {
-        verdict
-    } else {
-        "REQUEST_CHANGES"
-    };
+    // The one verdict the rest of this review may use: what holds the merge,
+    // by name. Nothing named holding means approve, whatever came before.
+    let open_holding: Vec<(String, u64, String)> = prior_threads
+        .iter()
+        .filter(|t| !fixed_threads.iter().any(|f| f.id == t.id))
+        .filter(|t| review_agent::thread_holds_merge(&t.body))
+        .map(|t| (t.path.clone(), t.line, t.body.clone()))
+        .collect();
+    let final_verdict =
+        super::review_verdict::Verdict::from_holding(super::review_policy::named_holding(
+            &findings,
+            &open_holding,
+            &unconfirmed,
+            verify_failed,
+            &own_open,
+            &stable.kept,
+        ));
+    let verdict = final_verdict.event();
     // A hunks-only re-review never approves: the whole PR is reviewed first.
     if super::review_scope::needs_full_before_approval(since_review.is_some(), verdict) {
         let mut full = msg.clone();
@@ -2867,6 +3105,9 @@ async fn run_once(
             "Could not queue the full review — posting this one"
         );
     }
+    // The description this review leaves: CoderHelm's own PR gets its open
+    // findings written into it.
+    let mut description_after = pr_body.to_string();
     if self_authored {
         let section = super::own_review::section(&own_open);
         let updated = super::completeness::with_section(
@@ -2880,6 +3121,8 @@ async fn run_once(
                 .await
             {
                 warn!(pr = msg.pr_number, error = %e, "Could not update the own PR's open review findings");
+            } else {
+                description_after = updated;
             }
         }
         if !own_open.is_empty() {
@@ -2918,24 +3161,10 @@ async fn run_once(
     // GitHub forbids APPROVE / REQUEST_CHANGES on your OWN PR → downgrade to COMMENT.
     let effective_event = if self_authored { "COMMENT" } else { verdict };
     let verdict_line = review_agent::verdict_heading(
-        verdict,
-        &review_agent::HeadingCounts {
-            defects: findings
-                .iter()
-                .filter(|f| f.evidence() != review_agent::Evidence::Question && f.holds_merge())
-                .count(),
-            own_open: own_open.len(),
-            blocking_questions: findings
-                .iter()
-                .filter(|f| f.evidence() == review_agent::Evidence::Question && f.holds_merge())
-                .count(),
-            blocking_facts,
-            prior_open: still_open_holding,
-            verify_failed,
-            notes: findings.iter().filter(|f| !f.holds_merge()).count()
-                + (unconfirmed.len() - blocking_facts)
-                + held_late.len(),
-        },
+        &final_verdict,
+        findings.iter().filter(|f| !f.holds_merge()).count()
+            + (unconfirmed.len() - blocking_facts)
+            + held_late.len(),
     );
     let summary = if output.summary.trim().is_empty() {
         "Automated review complete.".to_string()
@@ -3134,6 +3363,7 @@ async fn run_once(
             dismiss_stale,
             &full_body,
             &postable.inline,
+            &final_verdict,
         )
         .await
         {
@@ -3235,6 +3465,29 @@ async fn run_once(
         note_review_standards(state, &msg.team_id, &record_sk, &s.applied_names()).await;
     }
     note_review_details(state, &msg.team_id, &record_sk, title, &findings).await;
+    // What this verdict rests on, for the next ask: what it read, with its own
+    // threads as this review left them.
+    let rests_on = super::review_fingerprint::Fingerprint {
+        description: super::review_fingerprint::description_part(&description_after),
+        threads: match github
+            .list_bot_review_threads(&msg.repo_owner, &msg.repo_name, msg.pr_number)
+            .await
+        {
+            Ok(t) => Some(super::review_fingerprint::threads_part(
+                t.iter().map(|t| (t.id.clone(), t.resolved)),
+            )),
+            Err(_) => None,
+        },
+        ..read_now.clone()
+    };
+    note_review_state(
+        state,
+        &msg.team_id,
+        &record_sk,
+        &rests_on,
+        &final_verdict.names(),
+    )
+    .await;
     live_job
         .verdict(state, &msg, verdict, findings.len(), &review_url)
         .await;
@@ -3275,6 +3528,21 @@ async fn run_once(
         }
     );
 
+    // A block changes what the auto-merge panel must name; it can't merge on it.
+    if verdict == "REQUEST_CHANGES" {
+        super::await_merge::refresh_panel(
+            state,
+            &msg.team_id,
+            msg.installation_id,
+            &msg.repo_owner,
+            &msg.repo_name,
+            msg.pr_number,
+            &head_sha,
+            base_branch,
+            self_authored,
+        )
+        .await;
+    }
     // ── Post-approval actions (opt-in, off by default) ──
     if verdict == "APPROVE" {
         // Self-authored (CoderHelm's own) PRs CAN auto-merge, but run_on_approve
@@ -3460,8 +3728,17 @@ async fn carry_approval(
             msg.pr_number
         )
     );
-    if let Err(e) =
-        super::review_verdict::post(github, msg, head, event, dismiss_stale, &body, &[]).await
+    if let Err(e) = super::review_verdict::post(
+        github,
+        msg,
+        head,
+        event,
+        dismiss_stale,
+        &body,
+        &[],
+        &super::review_verdict::Verdict::approve(),
+    )
+    .await
     {
         warn!(pr = msg.pr_number, head = %head, error = %e, "Could not post the carried approval");
         return;
@@ -3546,6 +3823,7 @@ pub async fn review_for_run(
         thread_root_id: None,
         mentioned: false,
         requested_by: String::new(),
+        check_head: String::new(),
         attempt: 0,
         wait_secs: 0,
         reconcile_note: None,
@@ -4267,6 +4545,83 @@ fn findings_record(findings: &[review_agent::Finding]) -> String {
 
 /// Puts the PR's title and the structured findings on the review record, for
 /// its page. Best-effort, like the record itself.
+/// What the verdict on this record rests on, and what holds it by name.
+async fn note_review_state(
+    state: &WorkerState,
+    team_id: &str,
+    record_sk: &str,
+    rests_on: &super::review_fingerprint::Fingerprint,
+    holding: &[String],
+) {
+    let as_json = |r: serde_json::Result<String>| r.unwrap_or_default();
+    let upd = state
+        .dynamo
+        .update_item()
+        .table_name(&state.config.settings_table_name)
+        .key("pk", attr_s(team_id))
+        .key("sk", attr_s(record_sk))
+        .update_expression("SET fingerprint = :f, holding = :h")
+        .expression_attribute_values(":f", attr_s(&as_json(serde_json::to_string(rests_on))))
+        .expression_attribute_values(":h", attr_s(&as_json(serde_json::to_string(holding))))
+        .send()
+        .await;
+    if let Err(e) = upd {
+        warn!(error = %aws_sdk_dynamodb::error::DisplayErrorContext(&e), "Could not store what the verdict rests on (the next ask reviews afresh)");
+    }
+}
+
+/// Reads everything a verdict rests on (`review_fingerprint`). A part that
+/// can't be read is `None`, which counts as changed.
+async fn read_fingerprint(
+    state: &WorkerState,
+    github: &GitHubClient,
+    msg: &ReviewMessage,
+    head: &str,
+    pr_body: &str,
+    base: &str,
+) -> super::review_fingerprint::Fingerprint {
+    use super::review_fingerprint as fp;
+    let (owner, repo, pr) = (&msg.repo_owner, &msg.repo_name, msg.pr_number);
+    let threads = github
+        .list_bot_review_threads(owner, repo, pr)
+        .await
+        .ok()
+        .map(|t| fp::threads_part(t.iter().map(|t| (t.id.clone(), t.resolved))));
+    let head_runs = github.list_check_runs_for_ref(owner, repo, head).await.ok();
+    let base_failing = if base.is_empty() {
+        Some(Vec::new())
+    } else {
+        github
+            .list_check_runs_for_ref(owner, repo, base)
+            .await
+            .ok()
+            .map(|v| super::review_policy::failing_checks(&v))
+    };
+    let plan = plan_evidence_for_pr(state, msg).await;
+    let results = match (head_runs, base_failing) {
+        (Some(h), Some(b)) => Some(fp::results_part(&h, &b, &plan)),
+        _ => None,
+    };
+    let comments = github.list_issue_comments(owner, repo, pr).await.ok();
+    let inline = github.get_review_comments(owner, repo, pr).await.ok();
+    let reviews = github.list_pr_reviews(owner, repo, pr).await.ok();
+    let people = match (comments, inline, reviews) {
+        (Some(mut all), Some(inline), Some(reviews)) => {
+            all.extend(inline);
+            all.extend(reviews.as_array().cloned().unwrap_or_default());
+            Some(fp::people_part(&all))
+        }
+        _ => None,
+    };
+    fp::Fingerprint {
+        head: head.to_string(),
+        description: fp::description_part(pr_body),
+        threads,
+        results,
+        people,
+    }
+}
+
 async fn note_review_details(
     state: &WorkerState,
     team_id: &str,
@@ -4695,7 +5050,7 @@ fn changed_files(compare: &serde_json::Value) -> std::collections::HashSet<Strin
 /// the findings, which are posted on the lines they are about.
 fn short_overview(text: &str) -> String {
     const MAX_SENTENCES: usize = 4;
-    const MAX_CHARS: usize = 700;
+    const MAX_BYTES: usize = 700;
     let prose: String = text
         .lines()
         .map(str::trim)
@@ -4704,19 +5059,7 @@ fn short_overview(text: &str) -> String {
         })
         .collect::<Vec<_>>()
         .join(" ");
-    let mut out = String::new();
-    for piece in prose.split_inclusive(['.', '!', '?']).take(MAX_SENTENCES) {
-        if out.len() + piece.len() > MAX_CHARS {
-            break;
-        }
-        out.push_str(piece);
-    }
-    let out = out.trim().to_string();
-    if out.is_empty() {
-        common::truncate_str(&prose, MAX_CHARS).trim().to_string()
-    } else {
-        out
-    }
+    common::prose::first_sentences(&prose, MAX_SENTENCES, MAX_BYTES).to_string()
 }
 
 /// Whether the PR moved past the commit this review looked at. Unlike
@@ -4754,6 +5097,30 @@ fn superseded(msg: &ReviewMessage, current_head: &str) -> bool {
 }
 
 #[cfg(test)]
+mod overview_tests {
+    use super::short_overview;
+
+    /// The reported cut: every dot counted as a sentence end, so the fourth
+    /// "sentence" could stop inside a path.
+    #[test]
+    fn the_overview_never_stops_inside_a_path() {
+        let text = "This moves the upload into services/worker/src/main.rs and reads \
+                    lambda/handler.py from the source paths listed in deploy/config.yaml and \
+                    infra/lib/stack.ts. Nothing else changes.";
+        assert_eq!(short_overview(text), text);
+    }
+
+    #[test]
+    fn the_overview_keeps_four_whole_sentences() {
+        let out = short_overview("One. Two. Three. Four. Five.");
+        assert_eq!(out, "One. Two. Three. Four.");
+        // Too long for the cap: whole sentences, or the one sentence whole.
+        let s = format!("{} end.", "word ".repeat(200));
+        assert_eq!(short_overview(&s), s);
+    }
+}
+
+#[cfg(test)]
 mod superseded_tests {
     use super::{description_to_mark, moved_on, superseded};
     use crate::models::ReviewMessage;
@@ -4774,6 +5141,7 @@ mod superseded_tests {
             thread_root_id: None,
             mentioned: false,
             requested_by: String::new(),
+            check_head: String::new(),
             attempt: 0,
             wait_secs: 0,
             reconcile_note: None,
@@ -4822,8 +5190,9 @@ mod superseded_tests {
         let s = super::short_overview(essay);
         assert_eq!(s, "The description now matches. But the change isn't only copy. It hardcodes a price. It adds policy claims.");
         assert_eq!(super::short_overview("Looks good."), "Looks good.");
+        // No sentence end to cut on: kept, never cut mid-sentence.
         let long = "word ".repeat(400);
-        assert!(super::short_overview(&long).len() <= 700);
+        assert_eq!(super::short_overview(&long), long.trim_end());
     }
 
     #[test]
@@ -5134,6 +5503,7 @@ mod failure_tests {
             thread_root_id: None,
             mentioned: false,
             requested_by: String::new(),
+            check_head: String::new(),
             attempt: 0,
             wait_secs: 0,
             reconcile_note: None,
@@ -5210,7 +5580,8 @@ mod failure_tests {
         assert_eq!(
             decide(
                 Input::Reply {
-                    change: c.verdict_change
+                    change: c.verdict_change,
+                    more_than_words: true,
                 },
                 &ctx
             ),
