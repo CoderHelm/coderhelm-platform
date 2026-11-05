@@ -223,7 +223,9 @@ impl TokenUsage {
         self.cache_read_tokens += call.cache_read;
         self.cache_write_tokens += call.cache_write();
         self.cache_write_1h_tokens += call.cache_write_1h;
-        self.cost_usd += call.cost_usd(model_id);
+        let cost = call.cost_usd(model_id);
+        self.cost_usd += cost;
+        common::usage::note_run_spend(cost);
     }
 
     /// Add another usage's tokens and cost (tool calls are not merged).

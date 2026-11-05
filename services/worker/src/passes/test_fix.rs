@@ -73,7 +73,7 @@ const MAX_BYTES: usize = 150 * 1024 * 1024;
 /// Keys listed from a report location.
 const MAX_KEYS: usize = 10_000;
 /// Fix rounds the pre-PR check may send back.
-const MAX_FIX_ROUNDS: u32 = 2;
+const MAX_FIX_ROUNDS: u32 = super::run_guard::MAX_TEST_FIX_ROUNDS;
 /// The ready check runs again this often while it waits.
 const RECHECK_SECS: i32 = 600;
 /// And at most this many times (about 12 hours).
@@ -1739,6 +1739,33 @@ pub async fn gate(
     usage: &mut TokenUsage,
     has_time: impl Fn() -> bool,
 ) -> Result<Option<PrFacts>, String> {
+    let head = w.head().await;
+    let standing = w.ledger.update(|l| {
+        if !l.test_fix.unchanged(&head) {
+            return None;
+        }
+        l.test_fix.reused();
+        l.test_outcome.clone()
+    });
+    if let Some(standing) = standing {
+        return standing;
+    }
+    let outcome = check_and_fix(w, evidence, usage, has_time).await;
+    let head = w.head().await;
+    w.ledger.update(|l| {
+        l.test_fix.head = head;
+        l.test_outcome = Some(outcome.clone());
+    });
+    w.save_ledger().await;
+    outcome
+}
+
+async fn check_and_fix(
+    w: &super::proof::Work<'_>,
+    evidence: &mut super::proof::RunEvidence,
+    usage: &mut TokenUsage,
+    has_time: impl Fn() -> bool,
+) -> Result<Option<PrFacts>, String> {
     let Some(mut ev) = load(w.state, &w.msg.team_id, w.run_id).await else {
         return Ok(None);
     };
@@ -1753,7 +1780,6 @@ pub async fn gate(
         provider: w.provider,
     };
     let target = test_target(w.state, &w.msg.team_id, &format!("{owner}/{repo}"), None).await;
-    let mut rounds = 0;
     let mut integrity_rounds = 0;
     let mut base_tried = ev.base_repeat.is_some();
     let mut unit_seen: Option<(String, Result<Option<String>, String>)> = None;
@@ -1920,8 +1946,8 @@ pub async fn gate(
             bug_problems = bug_problems.len(),
             views_missing = views_missing.len(),
             repeat = ?repeat,
-            rounds,
-            "Failing-test rules checked before the pull request"
+            rounds = w.ledger.update(|l| l.test_fix.rounds),
+            "Failing-test rules checked on the pull request"
         );
         let blocking: Vec<String> = refused
             .iter()
@@ -1994,7 +2020,10 @@ pub async fn gate(
                 blocking.join("; ")
             ));
         }
-        if rounds >= MAX_FIX_ROUNDS || !has_time() {
+        let open = blocking.len() + usize::from(repeat_red);
+        w.report_findings("test_fix", open).await;
+        w.ledger.update(|l| l.test_fix.checked(&head, open));
+        if !w.ledger.update(|l| l.test_fix.may_fix(MAX_FIX_ROUNDS)) || !has_time() {
             if !blocking.is_empty() {
                 return Err(blocking.join("; "));
             }
@@ -2013,7 +2042,8 @@ pub async fn gate(
                 wrong,
             )));
         }
-        rounds += 1;
+        w.ledger.update(|l| l.test_fix.start_fix());
+        w.save_ledger().await;
         if !weak.is_empty() {
             integrity_rounds += 1;
         }
@@ -2060,7 +2090,7 @@ pub async fn gate(
         let _ = super::update_pass(w.state, &w.msg.team_id, w.run_id, "implement").await;
         // A bug moved into the app needs files the branch doesn't touch yet.
         let scoped = bug_problems.is_empty();
-        match super::implement::run(
+        let fixed = super::implement::run(
             w.state,
             w.msg,
             w.github,
@@ -2074,25 +2104,19 @@ pub async fn gate(
             usage,
             w.file_cache,
             Some(w.run_id),
-            None,
+            // A round stops at the step's deadline: left open-ended, it ran
+            // until the time limit cut the whole step off.
+            w.deadline,
             scoped,
         )
-        .await
-        {
+        .await;
+        w.ledger.update(|l| l.test_fix.end_fix());
+        w.save_ledger().await;
+        match fixed {
             Ok(r) => evidence.merge(r.evidence),
             Err(e) => return Err(format!("the fix round failed: {e}")),
         }
-        let _ = super::update_pass(w.state, &w.msg.team_id, w.run_id, "review").await;
-    }
-}
-
-/// The run's failure when the gate blocks the pull request. A tooling
-/// failure keeps its own words, so the run records it as one.
-pub fn blocked_reason(why: String) -> String {
-    if why.starts_with(tooling::PREFIX) {
-        why
-    } else {
-        format!("The failing-test rules blocked the pull request: {why}")
+        let _ = super::update_pass(w.state, &w.msg.team_id, w.run_id, super::PASS_CHECKS).await;
     }
 }
 

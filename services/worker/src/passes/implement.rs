@@ -155,6 +155,11 @@ pub async fn run(
     // parameter also carries human review comments).
     scope_to_pr: bool,
 ) -> Result<ImplementResult, Box<dyn std::error::Error + Send + Sync>> {
+    // Every code-writing round goes through here, so a run the guard stopped
+    // writes nothing more, whoever asked.
+    if let Some(run_id) = run_id {
+        super::run_guard::check(state, &msg.team_id, run_id).await?;
+    }
     let rules_block = super::format_rules_block(rules);
     // Trim repo instructions for simple issues to reduce per-turn token cost
     let trimmed_instructions = if complexity == "simple" && repo_instructions.len() > 2000 {

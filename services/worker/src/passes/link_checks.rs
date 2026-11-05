@@ -52,7 +52,7 @@ pub const STALE_AFTER_HOURS: i64 = 24;
 /// URLs one check of a change may request (sources, targets, old targets).
 pub const MAX_URLS: usize = 60;
 /// Fix rounds a blocked check gets before the run stops.
-const MAX_FIX_ROUNDS: u32 = 1;
+const MAX_FIX_ROUNDS: u32 = super::run_guard::MAX_LINK_FIX_ROUNDS;
 
 /// What the coder is told about redirect and link changes.
 pub const CODER_NOTE: &str = "\n## Redirect and link changes\nWhen the change adds or changes a redirect or a link target, check every new target with `check_url` before you finish: it must answer 200 with a page title that is the page the ticket means. Never copy a target from the ticket unchecked; tickets get slugs wrong. Check each redirect source as it is now too. CoderHelm checks them all again before the PR opens and blocks it when a target fails. When a redirect map uses paths without a host, add a fenced ```sites.json block to your closing notes naming the site each map serves: `[{\"file\": \"the map's file\", \"map\": \"the map's name, when the file has several\", \"sources\": [\"https://the host the sources are requested on\", \"https://its staging host, if any\"], \"targets\": \"https://the host relative targets are on, when it differs\"}]`.\n";
@@ -1234,7 +1234,33 @@ pub async fn gate(
     usage: &mut crate::models::TokenUsage,
     has_time: impl Fn() -> bool,
 ) -> Result<String, String> {
-    let mut rounds = 0;
+    let head = w.head().await;
+    let standing = w.ledger.update(|l| {
+        if !l.links.unchanged(&head) {
+            return None;
+        }
+        l.links.reused();
+        l.links_outcome.clone()
+    });
+    if let Some(standing) = standing {
+        return standing;
+    }
+    let outcome = check_and_fix(w, evidence, usage, has_time).await;
+    let head = w.head().await;
+    w.ledger.update(|l| {
+        l.links.head = head;
+        l.links_outcome = Some(outcome.clone());
+    });
+    w.save_ledger().await;
+    outcome
+}
+
+async fn check_and_fix(
+    w: &super::proof::Work<'_>,
+    evidence: &mut super::proof::RunEvidence,
+    usage: &mut crate::models::TokenUsage,
+    has_time: impl Fn() -> bool,
+) -> Result<String, String> {
     loop {
         let diff = w
             .github
@@ -1276,7 +1302,7 @@ pub async fn gate(
             run_id = w.run_id,
             entries = found.len(),
             blocking = blocking.len(),
-            rounds,
+            rounds = w.ledger.update(|l| l.links.rounds),
             "Link and redirect check complete"
         );
         if blocking.is_empty() {
@@ -1293,10 +1319,15 @@ pub async fn gate(
             .await;
             return Ok(report.section());
         }
-        if rounds >= MAX_FIX_ROUNDS || !has_time() {
+        w.report_findings("links", blocking.len()).await;
+        let head = w.head().await;
+        w.ledger.update(|l| l.links.checked(&head, blocking.len()));
+        if !w.ledger.update(|l| l.links.may_fix(MAX_FIX_ROUNDS)) || !has_time() {
+            w.save_ledger().await;
             return Err(blocking.join("; "));
         }
-        rounds += 1;
+        w.ledger.update(|l| l.links.start_fix());
+        w.save_ledger().await;
         super::add_progress_note(
             w.state,
             &w.msg.team_id,
@@ -1326,6 +1357,8 @@ pub async fn gate(
             true, // bot-driven link fix — scoped to the PR
         )
         .await;
+        w.ledger.update(|l| l.links.end_fix());
+        w.save_ledger().await;
         match fixed {
             Ok(r) => evidence.merge(r.evidence),
             Err(e) => {
@@ -1335,7 +1368,7 @@ pub async fn gate(
                 ))
             }
         }
-        let _ = super::update_pass(w.state, &w.msg.team_id, w.run_id, "review").await;
+        let _ = super::update_pass(w.state, &w.msg.team_id, w.run_id, super::PASS_CHECKS).await;
     }
 }
 

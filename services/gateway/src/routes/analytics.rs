@@ -115,6 +115,9 @@ pub struct RunRow {
     pub last_pass: String,
     /// Why Coderhelm left a red PR to a person (worker `GaveUp`).
     pub ci_end: String,
+    /// Why the run guard ended this run (worker `run_guard::Trip`), empty
+    /// when it never did.
+    pub loop_stop_reason: String,
     /// Failing checks that also failed on the base branch.
     pub ci_red_on_base: Vec<String>,
     /// Times the failed jobs of a head were re-run instead of fixed.
@@ -163,6 +166,7 @@ impl RunRow {
             current_pass: s(i, "current_pass"),
             last_pass: last_history_pass(i),
             ci_end: s(i, "ci_end"),
+            loop_stop_reason: s(i, "loop_stop_reason"),
             ci_red_on_base: list_s(i, "ci_red_on_base"),
             ci_reruns: n(i, "ci_reruns") as u64,
             ci_flaky: b(i, "ci_flaky").unwrap_or(false),
@@ -599,6 +603,38 @@ pub fn ci_outcomes(runs: &[&RunRow]) -> Value {
         },
         "gave_up_reasons": gave_up_reasons,
     })
+}
+
+/// What a stored `loop_stop_reason` means, for a person.
+fn loop_stop_label(code: &str) -> String {
+    match code {
+        "continuations_after_work" => "Kept continuing after its tasks were done".into(),
+        "continuations" => "Kept continuing without finishing a task".into(),
+        "pass_transitions" => "Kept moving between steps without progress".into(),
+        "spend" => "Spent too much without progress".into(),
+        "ceiling_passes" => "Reached a run's limit of steps".into(),
+        "ceiling_continuations" => "Reached a run's limit of continuations".into(),
+        "ceiling_worked_time" => "Reached a run's limit of time".into(),
+        "ceiling_spend" => "Reached a run's limit of spend".into(),
+        other => other.replace('_', " "),
+    }
+}
+
+/// The runs the run guard ended, by why, most common first.
+pub fn loops_stopped(runs: &[&RunRow]) -> Value {
+    let mut reasons: BTreeMap<String, usize> = BTreeMap::new();
+    for r in runs.iter().filter(|r| !r.loop_stop_reason.is_empty()) {
+        *reasons
+            .entry(loop_stop_label(&r.loop_stop_reason))
+            .or_default() += 1;
+    }
+    let total: usize = reasons.values().sum();
+    let mut reasons: Vec<Value> = reasons
+        .into_iter()
+        .map(|(reason, count)| json!({"reason": reason, "count": count}))
+        .collect();
+    reasons.sort_by(|a, b| b["count"].as_u64().cmp(&a["count"].as_u64()));
+    json!({"total": total, "reasons": reasons})
 }
 
 /// One row per pull request among `runs`: a rerun that pushed to the same PR
@@ -1408,6 +1444,7 @@ pub fn build(
         "people": people,
         "failures": failures,
         "ci": ci,
+        "loops_stopped": loops_stopped(&cur_runs),
         "reviews": reviews_json,
         "lookups": lookups_json,
         "steps": steps,
@@ -1446,7 +1483,7 @@ async fn load_runs(state: &AppState, team: &str, w: Window) -> Result<Vec<RunRow
                  cache_read_tokens, cache_write_tokens, \
                  duration_s, pr_number, pr_url, error_message, ci_fix_attempts, ci_fix_commits, ci_last, \
                  pr_outcome, merged_at, pr_opened_at, human_commits, #err, failed_pass, current_pass, \
-                 pass_history, ci_end, ci_red_on_base, ci_reruns, ci_flaky",
+                 pass_history, ci_end, loop_stop_reason, ci_red_on_base, ci_reruns, ci_flaky",
             )
             .expression_attribute_names("#s", "status")
             .expression_attribute_names("#err", "error")
@@ -2618,6 +2655,33 @@ mod tests {
             ..old_failed("5")
         };
         assert_eq!(run_failure_reason(&r, None), "Feedback pass failed: boom");
+    }
+
+    #[test]
+    fn loops_stopped_counts_each_guard_stop_by_why() {
+        let stopped = |code: &str| RunRow {
+            loop_stop_reason: code.into(),
+            ..Default::default()
+        };
+        let runs = [
+            stopped("spend"),
+            stopped("continuations_after_work"),
+            stopped("continuations_after_work"),
+            stopped(""),
+        ];
+        let refs: Vec<&RunRow> = runs.iter().collect();
+        let out = loops_stopped(&refs);
+        assert_eq!(out["total"], 3);
+        assert_eq!(
+            out["reasons"][0]["reason"],
+            "Kept continuing after its tasks were done"
+        );
+        assert_eq!(out["reasons"][0]["count"], 2);
+        assert_eq!(
+            out["reasons"][1]["reason"],
+            "Spent too much without progress"
+        );
+        assert_eq!(loops_stopped(&[])["total"], 0);
     }
 
     #[test]

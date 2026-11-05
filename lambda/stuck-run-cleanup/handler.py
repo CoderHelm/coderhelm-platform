@@ -57,6 +57,15 @@ ROUND_BUDGET_SECONDS = 750
 STEP_QUEUED_FIELD = "step_queued_at"
 MAX_STEP_QUEUED_HOURS = int(os.environ.get("MAX_STEP_QUEUED_HOURS", "6"))
 ROUND_SWEEP_GRACE_SECONDS = 300
+
+# The absolute ceiling of a run. Mirrors services/worker/src/passes/run_ceiling.rs
+# (a test there reads these lines). The worker refuses a run over it at its one
+# entry point and at every model call; this reads the same counts from outside
+# the worker, so a run still stops if the worker's own checks are broken.
+MAX_RUN_PASSES = 300
+MAX_RUN_CONTINUATIONS = 50
+MAX_RUN_WORKED_SECS = 57600
+MAX_RUN_SPEND_USD = 200.0
 ROUND_LABELS = {
     "ci_fix": "CI fix round",
     "review_fix": "review fix round",
@@ -148,6 +157,59 @@ def step_queued(run, now):
     return now < queued + timedelta(hours=MAX_STEP_QUEUED_HOURS)
 
 
+def over_ceiling(run):
+    """(code, what) when the run is over its ceiling, else None."""
+    def num(name):
+        try:
+            return float(run.get(name) or 0)
+        except (TypeError, ValueError):
+            return 0.0
+
+    if num("ceil_spend_usd") > MAX_RUN_SPEND_USD:
+        return ("ceiling_spend", f"the limit of ${MAX_RUN_SPEND_USD:.0f} of model use")
+    if num("ceil_worked_secs") > MAX_RUN_WORKED_SECS:
+        return ("ceiling_worked_time", f"the limit of {MAX_RUN_WORKED_SECS // 3600} hours of work")
+    if num("ceil_passes") > MAX_RUN_PASSES:
+        return ("ceiling_passes", f"the limit of {MAX_RUN_PASSES} steps of work")
+    if num("ceil_continuations") > MAX_RUN_CONTINUATIONS:
+        return ("ceiling_continuations", f"the limit of {MAX_RUN_CONTINUATIONS} continuations")
+    return None
+
+
+def over_ceiling_reason(what, run, branch=""):
+    """The reason on the run page. The sweep has no GitHub access, so it says
+    where the work is; pressing Retry starts a new run from it."""
+    if has_pull_request(run):
+        where = f"Everything it did is on its draft pull request ({run.get('pr_url') or run.get('pr_number')})."
+    elif branch:
+        where = (
+            f"Everything it did is on branch `{branch}`; no pull request opened, so open one "
+            "from there or press Retry."
+        )
+    else:
+        where = "No pull request opened."
+    return f"CoderHelm ended this run: it reached {what}, and nothing further runs on it. {where} Retry starts a new run from there."
+
+
+def over_ceiling_update(run_id, code, reason, now_iso):
+    """The update that hands a run over its ceiling to a person. `guard_open`
+    keeps any queued step of it from starting again."""
+    return (
+        "SET #s = :new, status_run_id = :sri, error_message = :err, current_pass = :cp, "
+        "updated_at = :now, guard_open = :yes, loop_stop_reason = :code, "
+        "loop_stop_detail = :err, loop_stopped_at = :now",
+        {
+            ":new": "needs_input",
+            ":sri": f"needs_input#{run_id}",
+            ":err": reason,
+            ":cp": "done",
+            ":now": now_iso,
+            ":yes": True,
+            ":code": code,
+        },
+    )
+
+
 def has_pull_request(run):
     try:
         number = int(run.get("pr_number") or 0)
@@ -221,6 +283,47 @@ def _checkpoint_pass(team_id, run_id):
         return ""
 
 
+def _checkpoint_branch(team_id, run_id):
+    if not CHECKPOINTS_TABLE:
+        return ""
+    try:
+        item = (
+            _db()
+            .Table(CHECKPOINTS_TABLE)
+            .get_item(Key={"team_id": team_id, "sk": f"RUN#{run_id}"})
+            .get("Item")
+            or {}
+        )
+        return item.get("branch", "")
+    except Exception as e:  # best effort: the reason still says what happened
+        logger.warning(f"Could not read checkpoint for {run_id}: {e}")
+        return ""
+
+
+def _hand_off_over_ceiling(runs_table, run, code, what, now):
+    team_id = run["team_id"]
+    run_id = run["run_id"]
+    reason = over_ceiling_reason(what, run, _checkpoint_branch(team_id, run_id))
+    update, values = over_ceiling_update(run_id, code, reason, now.isoformat())
+    values[":orig"] = run.get("status", "running")
+    # The metric filter in the monitoring stack counts this text.
+    logger.warning(f"run_loop_stopped: {run_id} over its ceiling ({code})")
+    try:
+        runs_table.update_item(
+            Key={"team_id": team_id, "run_id": run_id},
+            UpdateExpression=update,
+            ExpressionAttributeNames={"#s": "status"},
+            ExpressionAttributeValues=values,
+            ConditionExpression="#s = :orig",
+        )
+        return True
+    except _db().meta.client.exceptions.ConditionalCheckFailedException:
+        logger.info(f"Run {run_id} already resolved (race condition)")
+    except Exception as e:
+        logger.error(f"Failed to end {run_id} over its ceiling: {e}")
+    return False
+
+
 def _trace_pass(team_id, run_id):
     if not TRACES_TABLE:
         return ""
@@ -257,6 +360,7 @@ def handler(event, context):
     #    webhook + lost safety-net resume). The reaper only scanned "running"
     #    before, so awaiting_ci runs sat forever.
     stuck_runs = []
+    over_count = 0
     scan_kwargs = {
         "FilterExpression": "#s = :running OR #s = :awaiting",
         "ExpressionAttributeNames": {"#s": "status"},
@@ -266,7 +370,7 @@ def handler(event, context):
         },
         "ProjectionExpression": (
             "team_id, run_id, created_at, updated_at, title, current_pass, pass_history, #s, "
-            "step_queued_at, "
+            "step_queued_at, ceil_passes, ceil_continuations, ceil_worked_secs, ceil_spend_usd, "
             "#round, pr_number, pr_url"
         ),
     }
@@ -278,6 +382,13 @@ def handler(event, context):
             updated = item.get("updated_at", item.get("created_at", ""))
             status = item.get("status", "")
             cutoff = running_cutoff if status == "running" else awaiting_cutoff
+            # First, whatever else is true of the run: its ceiling isn't a
+            # question of how long ago it last moved.
+            over = over_ceiling(item)
+            if over:
+                if _hand_off_over_ceiling(runs_table, item, over[0], over[1], now):
+                    over_count += 1
+                continue
             if status == "running" and round_in_budget(item, now):
                 # Its fix round is still inside its own budget.
                 continue
@@ -293,7 +404,7 @@ def handler(event, context):
 
     if not stuck_runs:
         logger.info("No stuck runs found")
-        return {"stuck_count": 0}
+        return {"stuck_count": 0, "over_ceiling": over_count}
 
     logger.info(f"Found {len(stuck_runs)} stuck runs")
 
@@ -378,4 +489,8 @@ def handler(event, context):
             logger.error(f"Failed to unstick {run_id}: {e}")
 
     logger.info(f"Unstuck {failed_count}/{len(stuck_runs)} runs")
-    return {"stuck_count": len(stuck_runs), "unstuck_count": failed_count}
+    return {
+        "stuck_count": len(stuck_runs),
+        "unstuck_count": failed_count,
+        "over_ceiling": over_count,
+    }

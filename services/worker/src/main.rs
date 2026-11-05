@@ -198,6 +198,13 @@ async fn handle_sqs(state: Arc<WorkerState>, event: LambdaEvent<SqsEvent>) -> Re
             info!(call_id = %rec.call_id, team_id = %rec.team_id, ?added, "Recovered model usage");
             continue;
         }
+        // The one entry point: a run over its absolute ceiling doesn't run,
+        // whatever sent this. Before the pause hold and any dispatch.
+        if !passes::run_ceiling::admit(&passes::run_ceiling::DynamoGate { state: &state }, &message)
+            .await
+        {
+            continue;
+        }
         // "Pause all agents": agent work for a paused team is kept exactly as
         // it came and sent again when the pause ends. Nothing is dropped.
         let work = message
@@ -216,9 +223,14 @@ async fn handle_sqs(state: Arc<WorkerState>, event: LambdaEvent<SqsEvent>) -> Re
         // Every model call made while handling this message is counted under
         // the message's feature (spawned tasks fall back to "other").
         let feature = message.usage_feature();
+        let ceiling_ref = serde_json::from_value::<models::WorkerMessage>(raw.clone())?;
         let (_, stopped) = agent::policy::watch_stops(common::usage::with_feature(
             feature,
-            handle_message(Arc::clone(&state), message),
+            passes::run_ceiling::worked(
+                &state,
+                &ceiling_ref,
+                handle_message(Arc::clone(&state), message),
+            ),
         ))
         .await;
         // A loop stopped because agents were paused mid-run: keep the work
@@ -312,6 +324,10 @@ async fn handle_message(state: Arc<WorkerState>, message: models::WorkerMessage)
             let run_id = msg.run_id.clone();
             let retry_msg = msg.clone();
             if let Err(e) = passes::feedback::run(&state, msg).await {
+                // The run guard fired: it waits on a person, one way.
+                if passes::run_guard::settle_open_pr(&state, &team_id, &run_id).await {
+                    return;
+                }
                 // A transient model failure is sent again later by the one
                 // requeue policy; only a real failure marks the run failed.
                 let err: &(dyn std::error::Error + 'static) = &*e;
@@ -454,6 +470,10 @@ async fn handle_message(state: Arc<WorkerState>, message: models::WorkerMessage)
             let (team_id, run_id) = (msg.team_id.clone(), msg.run_id.clone());
             if let Err(e) = passes::resume::run(&state, msg).await {
                 error!("Resume failed: {e:?}");
+                // The run guard fired: it waits on a person, one way.
+                if passes::run_guard::settle_open_pr(&state, &team_id, &run_id).await {
+                    return;
+                }
                 // A round this resume claimed (the run is "running") ends
                 // here: with its pull request open, the run says the round
                 // didn't finish instead of waiting for the sweep to fail it.

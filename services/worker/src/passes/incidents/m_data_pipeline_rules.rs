@@ -207,7 +207,10 @@ fn the_proof_check_holds_a_data_change_until_it_is_shown_on_real_data() {
 fn every_stage_carries_the_data_rules() {
     // The gate reads them for every ticket kind, before the feature-only
     // checks.
-    let gate = fn_src(include_str!("../feature/mod.rs"), "\npub async fn gate(");
+    let gate = fn_src(
+        include_str!("../feature/mod.rs"),
+        "\nasync fn check_and_fix(",
+    );
     let at = gate
         .find("data_facts(w, &files, &tree)")
         .expect("gate reads the data rules");

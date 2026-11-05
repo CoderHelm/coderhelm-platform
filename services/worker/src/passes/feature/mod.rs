@@ -56,8 +56,8 @@ use crate::passes::plan::PlanResult;
 use crate::passes::triage::TicketIntent;
 use crate::WorkerState;
 
-/// Fix rounds the gate gives before it blocks or reports.
-const MAX_FIX_ROUNDS: u32 = 1;
+/// Fix rounds the gate gives a run before it reports what is left.
+const MAX_FIX_ROUNDS: u32 = super::run_guard::MAX_RULES_FIX_ROUNDS;
 
 /// What the planner is told, by the ticket's kind.
 pub fn planner_block(intent: TicketIntent) -> String {
@@ -145,7 +145,7 @@ pub async fn find_attempts(
 }
 
 /// What the gate found, for the description and the ready check.
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct PrFacts {
     pub attempts: Vec<String>,
     pub sibling: Option<String>,
@@ -861,13 +861,73 @@ pub(crate) async fn load_connection(
     }
 }
 
-/// The check before the pull request opens. Problems get one fix round:
-/// carried-over commits and missing registrations that survive it block the
-/// pull request, and so does staging content that must change and can't be
-/// changed here; duplicates and checklist failures go in the description
-/// (the checklist keeps the pull request a draft). `Ok(None)` when nothing
-/// here applies to the run.
+/// What the rules left failing, as Open items. The checklist already keeps
+/// the pull request a draft until it passes (`ready_hold`), so these only say
+/// what is open.
+pub fn open_findings(f: &PrFacts) -> Vec<super::proof::Finding> {
+    checklist::failing(&f.checklist)
+        .into_iter()
+        .chain(
+            f.sandbox_failed
+                .iter()
+                .filter(|l| !l.starts_with("Output:"))
+                .cloned(),
+        )
+        .map(|detail| super::proof::Finding {
+            point: "rule_failing".to_string(),
+            detail,
+            settle: "Fix it on this branch; the pull request stays a draft until the rules pass."
+                .to_string(),
+            ..Default::default()
+        })
+        .collect()
+}
+
+/// The check on the open pull request. Problems get up to two fix rounds in a
+/// run, and a round with no fewer problems ends them. What survives comes back
+/// as an error (carried-over commits, missing registrations, staging content
+/// that must change and can't be changed here) or in the facts (duplicates,
+/// checklist failures), and the run lists it under Open items: the pull request
+/// is already open, and stays a draft. It runs once on a head: when the code
+/// hasn't changed since, its result stands. `Ok(None)` when nothing here applies
+/// to the run.
 pub async fn gate(
+    w: &super::proof::Work<'_>,
+    evidence: &mut super::proof::RunEvidence,
+    usage: &mut TokenUsage,
+    intent: TicketIntent,
+    found: &prior::Found,
+    has_time: impl Fn() -> bool,
+) -> Result<Option<PrFacts>, String> {
+    let head = w.head().await;
+    let standing = w.ledger.update(|l| {
+        if !l.rules.unchanged(&head) {
+            return None;
+        }
+        l.rules.reused();
+        l.rules_outcome.clone()
+    });
+    if let Some(standing) = standing {
+        super::add_progress_note(
+            w.state,
+            &w.msg.team_id,
+            w.run_id,
+            "New-feature rules: the code hasn't changed since the last check, so that result stands",
+        )
+        .await;
+        return standing;
+    }
+    let outcome = check_and_fix(w, evidence, usage, intent, found, has_time).await;
+    let head = w.head().await;
+    w.ledger.update(|l| {
+        l.rules.head = head;
+        l.rules_outcome = Some(outcome.clone());
+    });
+    w.save_ledger().await;
+    outcome
+}
+
+async fn check_and_fix(
     w: &super::proof::Work<'_>,
     evidence: &mut super::proof::RunEvidence,
     usage: &mut TokenUsage,
@@ -893,7 +953,6 @@ pub async fn gate(
         .map(|f| f.path)
         .collect();
     let sibling = reuse::recorded_sibling(&w.plan.design);
-    let mut rounds = 0;
     let mut facts = PrFacts {
         attempts: found.pr_lines(),
         sibling: sibling.clone().filter(|_| feature),
@@ -989,8 +1048,8 @@ pub async fn gate(
             duplicates = dups.len(),
             checklist_fails = static_fails.len(),
             sandbox_fails = sandbox_failed.len(),
-            rounds,
-            "New-feature rules checked before the pull request"
+            rounds = w.ledger.update(|l| l.rules.rounds),
+            "New-feature rules checked on the pull request"
         );
         // A data migration released expand then contract, with a fallback
         // and its test (every ticket kind).
@@ -1001,7 +1060,15 @@ pub async fn gate(
             && dups.is_empty()
             && static_fails.is_empty()
             && sandbox_failed.is_empty();
-        if clean || rounds >= MAX_FIX_ROUNDS || !has_time() {
+        let open = release_gaps.len()
+            + carried.len()
+            + missing.len()
+            + dups.len()
+            + static_fails.len()
+            + sandbox_failed.len();
+        w.report_findings("rules", open).await;
+        w.ledger.update(|l| l.rules.checked(&head, open));
+        if clean || !w.ledger.update(|l| l.rules.may_fix(MAX_FIX_ROUNDS)) || !has_time() {
             if !release_gaps.is_empty() {
                 return Err(format!(
                     "the migration can't be released safely yet: {}",
@@ -1074,7 +1141,8 @@ pub async fn gate(
             .await;
             return Ok((!facts.is_empty()).then_some(facts));
         }
-        rounds += 1;
+        w.ledger.update(|l| l.rules.start_fix());
+        w.save_ledger().await;
         let mut feedback = String::new();
         if !release_gaps.is_empty() {
             feedback.push_str("\nThe migration must be released expand then contract:\n");
@@ -1117,7 +1185,7 @@ pub async fn gate(
         )
         .await;
         let _ = super::update_pass(w.state, &w.msg.team_id, w.run_id, "implement").await;
-        match super::implement::run(
+        let fixed = super::implement::run(
             w.state,
             w.msg,
             w.github,
@@ -1131,16 +1199,20 @@ pub async fn gate(
             usage,
             w.file_cache,
             Some(w.run_id),
-            None,
+            // A round stops at the step's deadline: left open-ended, it ran
+            // until the time limit cut the whole step off.
+            w.deadline,
             // Registrations and test maps live outside the diff.
             false,
         )
-        .await
-        {
+        .await;
+        w.ledger.update(|l| l.rules.end_fix());
+        w.save_ledger().await;
+        match fixed {
             Ok(r) => evidence.merge(r.evidence),
             Err(e) => return Err(format!("the fix round failed: {e}")),
         }
-        let _ = super::update_pass(w.state, &w.msg.team_id, w.run_id, "review").await;
+        let _ = super::update_pass(w.state, &w.msg.team_id, w.run_id, super::PASS_CHECKS).await;
     }
 }
 

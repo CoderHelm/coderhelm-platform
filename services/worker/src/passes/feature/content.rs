@@ -572,7 +572,7 @@ pub fn mutations(n: &Need, ids: &[String]) -> Vec<Value> {
 
 /// Content CoderHelm couldn't change itself: what, why, and how to grant
 /// it the access so it can next time.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Blocked {
     pub what: String,
     pub why_person: String,
@@ -622,7 +622,7 @@ fn editors_choice(n: &Need) -> (String, String) {
 }
 
 /// What happened to the staging content, for the description.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Outcome {
     /// What was changed on staging, one line each.
     pub changed: Vec<String>,

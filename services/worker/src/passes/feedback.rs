@@ -463,6 +463,13 @@ pub async fn run(
         hand_off_to_human(state, &github, &msg).await;
         return Ok(());
     }
+    // A person asked for this: the run guard's counts start over. A cycle only
+    // CI asked for is a pass like any other, and the guard can stop it.
+    if comments.is_empty() && msg.review_body.trim().is_empty() {
+        super::run_guard::on_pass(state, &msg.team_id, &msg.run_id).await?;
+    } else {
+        super::run_guard::person_acted(state, &msg.team_id, &msg.run_id).await;
+    }
 
     let formatted = format_review_comments(&msg.review_body, &comments);
 
