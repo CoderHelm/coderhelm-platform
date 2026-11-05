@@ -248,7 +248,7 @@ jobs:
               # The beta's tag, read back from GitHub: on main, on this commit,
               # and carrying the signed statement for this stable tag.
               [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "::error::$TAG is not vX.Y.Z"; exit 1; }
-              [[ "$BETA" =~ ^v[0-9]+\.[0-9]+\.[0-9]+-beta\.[0-9]{8}$ ]] && [ "${BETA%-beta.*}" = "$TAG" ] || { echo "::error::$BETA doesn't become $TAG"; exit 1; }
+              if ! [[ "$BETA" =~ ^v[0-9]+\.[0-9]+\.[0-9]+-beta\.[0-9]{8}$ ]] || [ "${BETA%-beta.*}" != "$TAG" ]; then echo "::error::$BETA doesn't become $TAG"; exit 1; fi
               [[ "$COMMIT" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::no commit"; exit 1; }
               ref=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$BETA" --jq '.object.type + " " + .object.sha')
               read -r type sha <<< "$ref"
@@ -416,7 +416,9 @@ jobs:
             "$d/SHA256SUMS"
           (cd "$d" && sha256sum -c SHA256SUMS)
           pre=$(gh release view "$TAG" -R "$GITHUB_REPOSITORY" --json isPrerelease --jq .isPrerelease)
-          [ "$pre" = "$([ "$CHANNEL" = beta ] && echo true || echo false)" ] || { echo "::error::$TAG's GitHub release has prerelease=$pre"; exit 1; }
+          want=false
+          if [ "$CHANNEL" = beta ]; then want=true; fi
+          [ "$pre" = "$want" ] || { echo "::error::$TAG's GitHub release has prerelease=$pre"; exit 1; }
 
       # Only the publish script, at this workflow's own commit: the job runs
       # nothing from the repository but that file.
