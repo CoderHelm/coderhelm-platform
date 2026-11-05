@@ -360,6 +360,29 @@ async fn sweep_repo(
             continue;
         }
         report.open_prs += 1;
+        // A "CoderHelm review" check left open long after its job was due
+        // (the job stopped without ending it) never holds the PR.
+        let stale = common::review_check::close_stale(
+            &github,
+            &common::review_check::Target {
+                installation: installation_id,
+                owner,
+                repo: name,
+                pr: number,
+                head,
+            },
+            now.timestamp(),
+            &common::review_check::pr_page(
+                common::public_urls::app_url(&state.config.stage),
+                owner,
+                name,
+                number,
+            ),
+        )
+        .await;
+        if stale > 0 {
+            info!(repo = %r.repo, pr = number, head, stale, "review_sweep: completed stale CoderHelm review checks");
+        }
         let records = review_records(state, &r.team_id, &r.repo, number, 10).await;
         let note = failure_note(state, &r.team_id, &r.repo, number).await;
         let Some(why) = stuck(&records, note.as_ref(), head, now) else {

@@ -3897,28 +3897,119 @@ async fn handle_review_trigger(
         name, pr_number, is_bot_pr, action, "Reviewer: trigger matched — enqueuing review job"
     );
     let dedup_key = format!("head#{head_sha}");
+    let delay = review_delay_secs(action);
+    // The commit shows the review at once, queued, saying when it starts:
+    // GitHub shows checks per commit, and a push's review waits for the PR
+    // to go quiet. The worker takes this check over when the job starts.
+    let check = ReviewCheckSpot {
+        installation_id,
+        owner,
+        name,
+        pr_number,
+        head_sha: &head_sha,
+        key: &dedup_key,
+    };
+    let calls = review_check_calls(state, installation_id).await;
+    if let Some(calls) = &calls {
+        check.queue(calls, i64::from(delay)).await;
+    }
     let message = WorkerMessage::Review(ReviewMessage {
         team_id: team_id.to_string(),
         installation_id,
         repo_owner: owner.to_string(),
         repo_name: name.to_string(),
         pr_number,
-        head_sha,
+        head_sha: head_sha.clone(),
         label: cfg.label,
         question: None,
         trigger: action.to_string(),
-        dedup_key,
+        dedup_key: dedup_key.clone(),
         reply_to_comment_id: None,
         requested_by: String::new(),
         ..Default::default()
     });
-    send_to_queue_after(
-        state,
-        &state.config.ticket_queue_url,
-        &message,
-        review_delay_secs(action),
-    )
-    .await
+    let sent = send_to_queue_after(state, &state.config.ticket_queue_url, &message, delay).await;
+    if sent.is_err() {
+        if let Some(calls) = &calls {
+            check.not_queued(calls).await;
+        }
+    }
+    sent
+}
+
+/// Where a scheduled review's queued check goes, and the job it waits for.
+struct ReviewCheckSpot<'a> {
+    installation_id: u64,
+    owner: &'a str,
+    name: &'a str,
+    pr_number: u64,
+    head_sha: &'a str,
+    key: &'a str,
+}
+
+impl ReviewCheckSpot<'_> {
+    fn target(&self) -> common::review_check::Target<'_> {
+        common::review_check::Target {
+            installation: self.installation_id,
+            owner: self.owner,
+            repo: self.name,
+            pr: self.pr_number,
+            head: self.head_sha,
+        }
+    }
+
+    fn details_url(&self) -> String {
+        common::review_check::pr_page(
+            common::public_urls::app_url_from_env(),
+            self.owner,
+            self.name,
+            self.pr_number,
+        )
+    }
+
+    /// Put the queued check on the commit, the review due in `delay_secs`.
+    /// A refusal (no checks:write) is logged once and changes nothing.
+    async fn queue<C: common::review_check::CheckCalls + ?Sized>(
+        &self,
+        calls: &C,
+        delay_secs: i64,
+    ) -> common::review_check::Queued {
+        let due = chrono::Utc::now().timestamp() + delay_secs;
+        common::review_check::queue(calls, &self.target(), self.key, due, &self.details_url()).await
+    }
+
+    /// The review job couldn't be sent: the check says so instead of waiting.
+    async fn not_queued<C: common::review_check::CheckCalls + ?Sized>(&self, calls: &C) {
+        let close = common::review_check::Close {
+            conclusion: "neutral",
+            title: "Review didn't start: it couldn't be queued".into(),
+            summary: "CoderHelm couldn't queue the review of this commit, so there is no new \
+                      verdict; any earlier verdict stands. Push again, or comment \
+                      **@coderhelm re-review** to run it."
+                .into(),
+            details_url: None,
+        };
+        common::review_check::close_waiting(calls, &self.target(), self.key, &close).await;
+    }
+}
+
+/// The check-run calls with the installation's token (a hybrid install's
+/// comes from CoderHelm's broker, as every other GitHub call's does). `None`
+/// when no token could be had: the review goes on without its check.
+async fn review_check_calls(
+    state: &AppState,
+    installation_id: u64,
+) -> Option<common::review_check::TokenCalls<'_>> {
+    match crate::auth::github_app::get_installation_token(state, installation_id).await {
+        Ok(token) => Some(common::review_check::TokenCalls {
+            http: &state.http,
+            token,
+        }),
+        Err(e) => {
+            warn!(installation_id, error = %e, "No installation token for the CoderHelm review check");
+            None
+        }
+    }
 }
 
 /// How long a review started by a pull_request event waits in the queue. A push
@@ -4446,6 +4537,64 @@ mod review_delay_tests {
         }
         // Within SQS's 900s per-message cap.
         assert!((1..=900).contains(&REVIEW_PUSH_SETTLE_SECS));
+    }
+
+    fn spot(installation_id: u64) -> super::ReviewCheckSpot<'static> {
+        super::ReviewCheckSpot {
+            installation_id,
+            owner: "acme",
+            name: "web",
+            pr_number: 7,
+            head_sha: "9fceb02d0ae598e95dc970b74767f19372d61af8",
+            key: "head#9fceb02d0ae598e95dc970b74767f19372d61af8",
+        }
+    }
+
+    #[tokio::test]
+    async fn a_push_puts_a_queued_check_on_its_commit_at_once() {
+        use common::review_check::{fake::FakeChecks, Queued};
+        let gh = FakeChecks::default();
+        let s = spot(1);
+        let q = s
+            .queue(&gh, i64::from(review_delay_secs("synchronize")))
+            .await;
+        assert_eq!(q, Queued::Created(1));
+        let run = gh.run(1);
+        assert_eq!(run["status"], "queued");
+        assert_eq!(run["name"], "CoderHelm review");
+        assert_eq!(run["head_sha"], s.head_sha);
+        assert!(run["output"]["title"]
+            .as_str()
+            .unwrap()
+            .starts_with("Waiting for more pushes, then reviewing 9fceb02 at "));
+        assert!(run["details_url"]
+            .as_str()
+            .unwrap()
+            .ends_with("/reviewer/pr?repo=acme/web&pr=7"));
+        let (_, key) =
+            common::review_check::parse_external_id(run["external_id"].as_str().unwrap()).unwrap();
+        assert_eq!(key, s.key);
+        // A sibling event for the same commit adds no second check.
+        assert_eq!(s.queue(&gh, 0).await, Queued::Exists(1));
+        assert_eq!(gh.count(), 1);
+        // A job that couldn't be sent leaves no check waiting.
+        s.not_queued(&gh).await;
+        assert_eq!(gh.run(1)["status"], "completed");
+        assert_eq!(gh.run(1)["conclusion"], "neutral");
+        assert_eq!(
+            gh.run(1)["output"]["title"],
+            "Review didn't start: it couldn't be queued"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_install_without_checks_write_is_left_alone() {
+        use common::review_check::{fake::FakeChecks, Queued};
+        let gh = FakeChecks::refusing();
+        assert_eq!(spot(88_001).queue(&gh, 180).await, Queued::Nothing);
+        spot(88_001).not_queued(&gh).await;
+        assert!(gh.calls.lock().unwrap().iter().all(|c| c == "list"));
+        assert_eq!(gh.count(), 0);
     }
 }
 

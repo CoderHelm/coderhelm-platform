@@ -30,7 +30,7 @@ It uses GitHub's [manifest flow](https://docs.github.com/en/apps/sharing-github-
 | Contents | write | Read code; push the branch with its changes |
 | Pull requests | write | Open and update pull requests; post reviews |
 | Issues | write | Read assigned issues; post progress |
-| Checks | write | Read CI results to fix failures; show the "CoderHelm review" check on a pull request while it is reviewed, linking to the review's session page |
+| Checks | write | Read CI results to fix failures; show the "CoderHelm review" check on a pull request's commit from the moment its review is scheduled (queued, saying when it starts) until it ends, linking to the review's session page |
 | Actions | read | Read workflow runs and logs |
 | Commit statuses | read | CI that reports statuses instead of checks |
 | Workflows | write | Change workflow files when a task asks for it |
