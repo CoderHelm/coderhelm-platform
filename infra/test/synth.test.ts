@@ -457,7 +457,7 @@ test("the manifest landing: self-host only, may write only this install's secret
   });
 });
 
-test("the release roles: only release.yml on a v* tag in the approved release environment, or auto-release.yml on main in release-auto; templates never replaced; latest.json alone", () => {
+test("the release roles: only release.yml on a v* tag in the approved release environment, or auto-release.yml on main in release-auto; templates never replaced; latest.json and beta.json alone", () => {
   const cfg = loadConfigFile(path.join(INFRA, "config", "hosted.prod.json"), { CDK_DEFAULT_ACCOUNT: "654654210434" });
   const t = synth(cfg, zoneContext("654654210434", "us-east-1", "coderhelm.com"));
   const w = t["coderhelm-prod-worker"];
@@ -507,9 +507,10 @@ test("the release roles: only release.yml on a v* tag in the approved release en
       Condition: { Null: { "s3:if-none-match": "false" } },
     },
   ]);
+  const pointers = ["arn:aws:s3:::coderhelm-public/launch/latest.json", "arn:aws:s3:::coderhelm-public/launch/beta.json"];
   assert.deepEqual(statementsOf("coderhelm-prod-release-latest", "ReleaseLatestRole"), [
-    { Action: "s3:PutObject", Effect: "Allow", Resource: "arn:aws:s3:::coderhelm-public/launch/latest.json", Condition: { Null: { "s3:if-none-match": "false" } } },
-    { Action: "s3:PutObject", Effect: "Allow", Resource: "arn:aws:s3:::coderhelm-public/launch/latest.json", Condition: { Null: { "s3:if-match": "false" } } },
+    { Action: "s3:PutObject", Effect: "Allow", Resource: pointers, Condition: { Null: { "s3:if-none-match": "false" } } },
+    { Action: "s3:PutObject", Effect: "Allow", Resource: pointers, Condition: { Null: { "s3:if-match": "false" } } },
   ]);
   w.hasOutput("ReleasePublisherRoleArn", {});
   w.hasOutput("ReleaseLatestRoleArn", {});

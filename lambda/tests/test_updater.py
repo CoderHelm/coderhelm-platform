@@ -56,7 +56,8 @@ class Versions(unittest.TestCase):
     def test_channel_picks(self):
         rs = [rel("v1.1.0"), rel("v1.2.0-rc.1", pre=True), rel("v0.9.0"), {"tag_name": "nightly"}]
         self.assertEqual(u.pick_latest(rs, "stable", "v1.0.0")["version"], "v1.1.0")
-        self.assertEqual(u.pick_latest(rs, "preview", "v1.0.0")["version"], "v1.2.0-rc.1")
+        self.assertEqual(u.pick_latest(rs, "beta", "v1.0.0")["version"], "v1.2.0-rc.1")
+        self.assertEqual(u.pick_latest(rs, "preview", "v1.0.0")["version"], "v1.2.0-rc.1", "preview is the old name of beta")
         self.assertIsNone(u.pick_latest(rs, "stable", "v1.1.0"))
         self.assertTrue(u.pick_latest([rel("v2.0.0")], "stable", "v1.1.0")["breaking"])
 
@@ -74,7 +75,12 @@ class Window(unittest.TestCase):
 
     def test_settings_validation(self):
         self.assertEqual(u.validate_settings({"day": "Saturday", "hour": 22})["day"], "sat")
-        for bad in ({"hour": 24}, {"hour": True}, {"channel": "beta"}, {"majors": "never"}, {"timezone": "Mars/Base"}, {"auto": "yes"}, {"colour": 1}):
+        self.assertEqual(u.validate_settings({"channel": "beta"})["channel"], "beta")
+        self.assertEqual(u.validate_settings({"channel": "preview"})["channel"], "beta", "stored settings from before keep working")
+        self.assertEqual(u.validate_settings({}, {**u.DEFAULT_SETTINGS, "channel": "preview"})["channel"], "preview", "a base is kept as given")
+        self.assertEqual(u.defaults_from_env({"UPDATE_DEFAULTS": '{"channel": "preview"}'})["channel"], "beta")
+        self.assertEqual(u.defaults_from_env({"UPDATE_DEFAULTS": '{"channel": "nightly"}'})["channel"], "stable")
+        for bad in ({"hour": 24}, {"hour": True}, {"channel": "nightly"}, {"channel": ["beta"]}, {"majors": "never"}, {"timezone": "Mars/Base"}, {"auto": "yes"}, {"colour": 1}):
             with self.assertRaises(ValueError, msg=bad):
                 u.validate_settings(bad)
 
@@ -96,9 +102,22 @@ class Decide(unittest.TestCase):
         self.assertEqual((d["action"], d["reason"]), ("notify", "a major release waits for an admin"))
         self.assertEqual(u.decide(SUNDAY_3AM, dict(ON, majors="auto"), "v1.4.0", [rel("v2.0.0")], {})["action"], "update")
 
-    def test_preview_channel(self):
-        self.assertEqual(u.decide(SUNDAY_3AM, ON, "v1.0.0", [rel("v1.1.0-rc.1", pre=True)], {})["action"], "none")
-        self.assertEqual(u.decide(SUNDAY_3AM, dict(ON, channel="preview"), "v1.0.0", [rel("v1.1.0-rc.1", pre=True)], {})["action"], "update")
+    def test_beta_channel(self):
+        nightly = [rel("v1.1.0-beta.20261105", pre=True)]
+        self.assertEqual(u.decide(SUNDAY_3AM, ON, "v1.0.0", nightly, {})["action"], "none")
+        self.assertEqual(u.decide(SUNDAY_3AM, dict(ON, channel="beta"), "v1.0.0", nightly, {})["action"], "update")
+        self.assertEqual(u.decide(SUNDAY_3AM, dict(ON, channel="preview"), "v1.0.0", nightly, {})["action"], "update")
+
+    def test_beta_to_stable_never_goes_back(self):
+        # On a nightly, then switched to stable: the older stable release is never offered...
+        rs = [rel("v1.0.0"), rel("v1.1.0-beta.20261105", pre=True), rel("v1.1.0-beta.20261106", pre=True)]
+        self.assertIsNone(u.pick_latest(rs, "stable", "v1.1.0-beta.20261106"))
+        self.assertEqual(u.decide(SUNDAY_3AM, ON, "v1.1.0-beta.20261106", rs, {})["action"], "none")
+        # ...and the install moves on at the next stable release: the same version, promoted, sorts above its nightly.
+        got = u.pick_latest(rs + [rel("v1.1.0")], "stable", "v1.1.0-beta.20261106")
+        self.assertEqual((got["version"], got["prerelease"]), ("v1.1.0", False))
+        self.assertEqual(u.compare("v1.1.0-beta.20261106", "v1.1.0-beta.20261105"), 1)
+        self.assertEqual(u.compare("v1.1.1-beta.20261101", "v1.1.0"), 1)
 
     def test_running_and_failed_versions(self):
         st = {"running_since": (SUNDAY_3AM - timedelta(minutes=20)).isoformat()}
@@ -172,12 +191,16 @@ class Handler(unittest.TestCase):
         calls = []
         fetch = lambda r: calls.append(r) or [rel("v1.1.0")]
         u.handle({"action": "status"}, self.env, self.store, SUNDAY_3AM, fetch)
-        for sec in (5, 10, 29):
+        for sec in (1, 2, 4):
             s = u.handle({"action": "status", "refresh": True}, self.env, self.store, SUNDAY_3AM + timedelta(seconds=sec), fetch)
-        self.assertEqual(len(calls), 1, "presses within 30 seconds share one read")
+        self.assertEqual(len(calls), 1, "presses within a few seconds share one read")
         self.assertEqual(s["releases"]["fetched_at"], SUNDAY_3AM.timestamp())
-        u.handle({"action": "status", "refresh": True}, self.env, self.store, SUNDAY_3AM + timedelta(seconds=31), fetch)
+        # Check for updates right after opening the page reads again (a page reload would not).
+        u.handle({"action": "status"}, self.env, self.store, SUNDAY_3AM + timedelta(seconds=10), fetch)
+        self.assertEqual(len(calls), 1)
+        s = u.handle({"action": "status", "refresh": True}, self.env, self.store, SUNDAY_3AM + timedelta(seconds=10), fetch)
         self.assertEqual(len(calls), 2)
+        self.assertEqual(s["releases"]["fetched_at"], (SUNDAY_3AM + timedelta(seconds=10)).timestamp())
 
     def test_a_failed_read_counts_toward_the_gap_and_is_reported(self):
         calls = []
@@ -187,7 +210,8 @@ class Handler(unittest.TestCase):
         u.handle({"action": "status"}, self.env, self.store, SUNDAY_3AM, lambda r: [rel("v1.1.0")])
         later = SUNDAY_3AM + timedelta(minutes=5)
         s = u.handle({"action": "status"}, self.env, self.store, later, down)
-        u.handle({"action": "status", "refresh": True}, self.env, self.store, later + timedelta(seconds=10), down)
+        u.handle({"action": "status", "refresh": True}, self.env, self.store, later + timedelta(seconds=3), down)
+        u.handle({"action": "status"}, self.env, self.store, later + timedelta(seconds=20), down)
         self.assertEqual(len(calls), 1, "a failed try is not retried on every reload")
         self.assertEqual(s["latest"]["version"], "v1.1.0", "the old list is kept")
         self.assertEqual(s["releases"]["error"], "GitHub is down")
@@ -235,7 +259,7 @@ class Handler(unittest.TestCase):
         calls = []
         fetch = lambda r: calls.append(r) or list(out)
         hint = {"version": "v1.1.0"}
-        read = lambda etag=None: dict(hint)
+        read = lambda channel, etag=None: dict(hint)
         u.handle({"action": "status"}, self.env, self.store, SUNDAY_3AM, fetch, hint=read)
         hint["version"] = "v1.2.0"
         out.append(rel("v1.2.0"))
@@ -246,7 +270,7 @@ class Handler(unittest.TestCase):
 
     def test_never_offers_an_older_release_while_a_newer_one_is_out(self):
         # latest.json names v1.2.0; GitHub's list (a lagging copy) still ends at v1.1.0.
-        read = lambda etag=None: {"version": "v1.2.0"}
+        read = lambda channel, etag=None: {"version": "v1.2.0"}
         fetch = lambda r: [rel("v1.1.0")]
         s = u.handle({"action": "status"}, self.env, self.store, SUNDAY_3AM, fetch, hint=read)
         self.assertIsNone(s["latest"], "v1.1.0 is never offered while v1.2.0 is out")
@@ -266,12 +290,76 @@ class Handler(unittest.TestCase):
         self.assertIsNone(s["releases"]["behind"])
 
     def test_a_release_missing_for_a_day_is_taken_as_withdrawn(self):
-        read = lambda etag=None: {"version": "v1.2.0"}
+        read = lambda channel, etag=None: {"version": "v1.2.0"}
         fetch = lambda r: [rel("v1.1.0")]
         s = u.handle({"action": "status"}, self.env, self.store, SUNDAY_3AM, fetch, hint=read)
         self.assertIsNone(s["latest"])
         s = u.handle({"action": "status"}, self.env, self.store, SUNDAY_3AM + timedelta(hours=25), fetch, hint=read)
         self.assertEqual(s["latest"]["version"], "v1.1.0")
+
+    def test_each_channel_reads_its_own_hint(self):
+        asked = []
+        hints = {"stable": "v1.1.0", "beta": "v1.2.0-beta.20261105"}
+        read = lambda channel, etag=None: asked.append(channel) or {"version": hints[channel]}
+        fetch = lambda r: [rel("v1.1.0"), rel("v1.2.0-beta.20261105", pre=True)]
+        s = u.handle({"action": "status"}, self.env, self.store, SUNDAY_3AM, fetch, hint=read)
+        self.assertEqual((asked, s["latest"]["version"]), (["stable"], "v1.1.0"))
+        u.handle({"action": "settings", "settings": {"channel": "beta"}}, self.env, self.store, SUNDAY_3AM, fetch)
+        s = u.handle({"action": "status", "refresh": True}, self.env, self.store, SUNDAY_3AM + timedelta(minutes=1), fetch, hint=read)
+        self.assertEqual((asked[-1], s["latest"]["version"], s["settings"]["channel"]), ("beta", "v1.2.0-beta.20261105", "beta"))
+        # Cached apart: the stable hint is never moved by the beta one.
+        self.assertEqual(self.store.get("RELEASE_HINT")["version"], "v1.1.0")
+        self.assertEqual(self.store.get("RELEASE_HINT#beta")["version"], "v1.2.0-beta.20261105")
+
+    def test_a_stored_preview_setting_reads_as_beta(self):
+        self.store.put("AUTO_UPDATE", dict(u.DEFAULT_SETTINGS, channel="preview"))
+        fetch = lambda r: [rel("v1.1.0"), rel("v1.2.0-beta.20261105", pre=True)]
+        s = u.handle({"action": "status"}, self.env, self.store, SUNDAY_3AM, fetch)
+        self.assertEqual((s["settings"]["channel"], s["latest"]["version"]), ("beta", "v1.2.0-beta.20261105"))
+
+    def test_a_nightly_published_since_the_hourly_read_shows_within_minutes(self):
+        # The hourly check read the list at 03:15; a nightly is published at 03:20.
+        out = [rel("v1.1.0")]
+        calls = []
+        fetch = lambda r: calls.append(r) or list(out)
+        hint = {"version": "v1.1.0"}
+        read = lambda channel, etag=None: dict(hint)
+        u.handle({"action": "settings", "settings": {"channel": "beta"}}, self.env, self.store, SUNDAY_3AM, fetch)
+        u.handle({"action": "tick"}, self.env, self.store, SUNDAY_3AM, fetch, hint=read)
+        out.append(rel("v1.2.0-beta.20261025", pre=True))
+        hint["version"] = "v1.2.0-beta.20261025"
+        # The next hourly check would be at 04:15; the hint (read every few minutes) brings it at 03:25.
+        d = u.handle({"action": "tick"}, self.env, self.store, SUNDAY_3AM + timedelta(minutes=10), fetch, hint=read)
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(d["version"], "v1.2.0-beta.20261025")
+
+    def test_a_beta_hint_never_holds_back_a_stable_install(self):
+        # A stable install somehow holding a prerelease hint: it is not a stable release, so nothing is behind.
+        self.store.put("RELEASE_HINT", {"version": "v1.2.0-beta.20261105", "fetched_at": SUNDAY_3AM.timestamp()})
+        s = u.handle({"action": "status"}, self.env, self.store, SUNDAY_3AM, lambda r: [rel("v1.1.0")])
+        self.assertEqual(s["latest"]["version"], "v1.1.0")
+        self.assertIsNone(s["releases"]["behind"])
+
+    def test_the_hint_urls(self):
+        self.assertEqual(u.HINT_URLS, {"stable": "https://coderhelm-public.s3.amazonaws.com/launch/latest.json",
+                                       "beta": "https://coderhelm-public.s3.amazonaws.com/launch/beta.json"})
+        asked = []
+
+        class Resp:
+            headers = {"etag": '"e"'}
+            def __init__(self, url): self.url = url
+            def read(self): return b'{"version": "v1.2.0-beta.20261105"}'
+            def geturl(self): return self.url
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+
+        def opener(req, timeout=None):
+            asked.append(req.full_url)
+            return Resp(req.full_url)
+        self.assertEqual(u.fetch_latest("beta", opener=opener)["version"], "v1.2.0-beta.20261105")
+        u.fetch_latest("preview", opener=opener)
+        u.fetch_latest(opener=opener)
+        self.assertEqual(asked, [u.BETA_URL, u.BETA_URL, u.LATEST_URL])
 
     def test_a_newer_preview_seen_before_never_holds_back_stable(self):
         fetch = lambda r: [rel("v1.1.0"), rel("v1.2.0-rc.1", pre=True)]

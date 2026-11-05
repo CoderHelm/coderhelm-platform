@@ -216,8 +216,8 @@ export interface CoderhelmConfig {
     enabled?: boolean;
     /** Apply new releases on their own. Default false (admins are told and update with one click). */
     auto?: boolean;
-    /** `stable`, or `preview` for release candidates too. Default `stable`. */
-    channel?: "stable" | "preview";
+    /** `stable`, or `beta` for the nightly prereleases too (`preview` is its old name). Default `stable`. */
+    channel?: "stable" | "beta" | "preview";
     /** Maintenance window: `"Sun 03:00"`, `"daily 02:00"`. Default `"Sun 03:00"`. */
     window?: string;
     /** IANA time zone of the window. Default `UTC`. */
@@ -322,7 +322,7 @@ export interface ResolvedConfig {
     enabled: boolean;
     webhookUrl: string | null;
     /** The updater's starting settings (lambda/updater/handler.py). */
-    defaults: { auto: boolean; channel: "stable" | "preview"; day: string; hour: number; timezone: string; majors: "ask" | "auto" };
+    defaults: { auto: boolean; channel: "stable" | "beta"; day: string; hour: number; timezone: string; majors: "ask" | "auto" };
   };
   /** The config's own template URL; null for the default (see service-env.ts, logReaderTemplateUrlFor). */
   logReaderTemplateUrl: string | null;
@@ -573,7 +573,7 @@ export function validateConfig(c: unknown): string[] {
       for (const k of ["enabled", "auto"] as const) {
         if (u[k] !== undefined && typeof u[k] !== "boolean") p.push(`updates.${k}: true or false`);
       }
-      if (u.channel !== undefined && u.channel !== "stable" && u.channel !== "preview") p.push('updates.channel: "stable" or "preview"');
+      if (u.channel !== undefined && !["stable", "beta", "preview"].includes(u.channel)) p.push('updates.channel: "stable" or "beta"');
       if (u.majors !== undefined && u.majors !== "ask" && u.majors !== "auto") p.push('updates.majors: "ask" or "auto"');
       if (u.window !== undefined && !parseWindow(String(u.window))) p.push('updates.window: a day and time such as "Sun 03:00" or "daily 02:00"');
       if (u.timezone !== undefined && !/^(UTC|[A-Za-z_]+(\/[A-Za-z0-9_+-]+)+)$/.test(String(u.timezone))) p.push("updates.timezone: an IANA time zone such as Europe/Berlin");
@@ -718,7 +718,8 @@ export function resolveConfig(cfg: CoderhelmConfig, opts: { skipValidation?: boo
         webhookUrl: u.webhookUrl ?? null,
         defaults: {
           auto: u.auto ?? false,
-          channel: u.channel ?? "stable",
+          // "preview" is the old name of beta.
+          channel: u.channel === "beta" || u.channel === "preview" ? "beta" : "stable",
           day: w.day,
           hour: w.hour,
           timezone: u.timezone ?? "UTC",

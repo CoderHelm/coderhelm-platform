@@ -1,40 +1,65 @@
 name: Auto release
 
-# Cuts and publishes a self-host release after main's hosted deploy, with no
-# person in the loop and no stored signing key
-# (docs/self-host/updates-security.md, "Automatic releases").
+# Cuts, promotes and publishes self-host releases with no person in the loop
+# and no stored signing key (docs/self-host/updates-security.md, "Automatic
+# releases"). Two update channels (docs/self-host/updates.md, "Channels"):
 #
-#   plan      on refs/heads/main only, for the commit main's deploy shipped:
-#             the version, the notes, or a skip when nothing that ships in a
-#             self-host release changed (.github/scripts/auto_release.py).
+#   beta     nightly: vX.Y.Z-beta.YYYYMMDD of main's deployed head, when
+#            anything that ships changed since the last release. A GitHub
+#            prerelease; launch/beta.json names it.
+#   stable   vX.Y.Z: the newest beta, promoted once it has been out for a day
+#            with no open "release-blocker" issue naming it (same commit,
+#            same number without the suffix); or, for an urgent fix, cut
+#            straight from the deployed commit (deploy.yml run by hand with
+#            "stable release", or this file by hand with mode stable).
+#            launch/latest.json names it (and beta.json, when newer).
+#
+# What starts it:
+#   schedule 06:17     nightly: tonight's beta (once main's head is deployed).
+#   schedule 10:17     the promotion: the newest beta out for a day becomes
+#                      stable. Hours after the nightly run, so last night's
+#                      beta (published by about 08:00) is a full day old.
+#   deploy.yml         after its CDK deploy, by hand with "stable release":
+#                      a stable release of exactly the commit it deployed.
+#   by hand            mode promote (the newest ready beta, or the one in
+#                      "version", whatever its age), beta or stable (main's
+#                      head, once deployed).
+#
+#   plan      on refs/heads/main only: what to release
+#             (.github/scripts/auto_release.py), or a skip.
 #   tag       in the "release-auto" environment, which admits refs/heads/main
-#             alone. Signs the statement "this repository, tag vX.Y.Z, commit
-#             C" keylessly: the Sigstore certificate names this file on
-#             refs/heads/main, run on C, and the signature is logged in Rekor.
-#             GitHub also attests the same statement (for installs that check
-#             with gh). The signature goes into the annotated tag's message;
-#             installs and updates accept a tag without a maintainer's SSH
-#             signature only with it (installer/lib/source-tag.mjs,
-#             infra/lib/release-verify.ts, selfhost/install.sh, release.yml).
-#             A tag is created, never moved: GitHub refuses a ref that exists.
-#             Then Release (release.yml) is started on the tag.
+#             alone. A new release (beta or stable) signs the statement "this
+#             repository, tag vX.Y.Z, commit C" keylessly: the Sigstore
+#             certificate names this file on refs/heads/main, run on C, and
+#             the signature is logged in Rekor. GitHub also attests the same
+#             statement (for installs that check with gh). The signature goes
+#             into the annotated tag's message; installs and updates accept a
+#             tag without a maintainer's SSH signature only with it
+#             (installer/lib/source-tag.mjs, infra/lib/release-verify.ts,
+#             selfhost/install.sh, release.yml). A beta's run signs a second
+#             statement, for the stable tag vX.Y.Z on the same commit, kept in
+#             the beta's tag message; a promotion later checks that signature
+#             and creates the stable tag with it, so the stable tag is
+#             vouched for by exactly what installs already check (this file,
+#             on main, run on the tag's commit). A tag is created, never
+#             moved: GitHub refuses a ref that exists. Then Release
+#             (release.yml) is started on the tag, which builds and signs
+#             that tag's own files.
 #   publish   in "release-auto" too. Waits for that Release run, checks the
 #             published release as an install does, uploads the Launch Stack
-#             and role templates, moves launch/latest.json, checks the install
-#             link opens, and writes the release notes. Its two AWS roles trust
-#             only this file on refs/heads/main in "release-auto"
-#             (infra/lib/worker-stack.ts); like release.yml's publish job, it
-#             runs no code from the repository.
+#             and role templates, moves the channel's pointer (latest.json,
+#             beta.json), checks the install link opens, and writes the
+#             release notes. Its two AWS roles trust only this file on
+#             refs/heads/main in "release-auto" (infra/lib/worker-stack.ts);
+#             like release.yml's publish job, it runs no code from the
+#             repository.
 #
-# Called by deploy.yml's last job, after the CDK deploy succeeded, as part of
-# that deploy run (workflow_call). The run is then the deploy's own run: its
+# Called by deploy.yml (workflow_call), the run is the deploy's own run: its
 # ref is refs/heads/main and its commit is exactly the commit the deploy
 # shipped, even when main has moved on since, so the certificate names that
 # commit and installs accept it. A called workflow is read from the caller's
 # own commit, so this file and release.yml are still that commit's reviewed
 # copies, and the certificate still names this file (job_workflow_ref).
-# Starting it by hand does the same and nothing more: main's code, main's ref,
-# and only for main's current commit, once main's deploy shipped it.
 on:
   workflow_call:
     inputs:
@@ -47,153 +72,265 @@ on:
         required: true
   workflow_dispatch:
     inputs:
-      commit:
-        description: The main commit the hosted deploy shipped (full SHA)
+      mode:
+        description: "promote: a beta becomes stable now. beta or stable: a release of main's head now (once deployed)."
         required: true
+        type: choice
+        options: [promote, beta, stable]
+        default: promote
+      version:
+        description: "promote only: the beta (vX.Y.Z-beta.YYYYMMDD) or the stable vX.Y.Z it becomes. Empty: the newest beta out for a day."
+        required: false
         type: string
+  schedule:
+    # Nightly, 06:17 UTC: tonight's beta.
+    - cron: "17 6 * * *"
+    # 10:17 UTC: promote the newest beta that has been out for a day.
+    - cron: "17 10 * * *"
 
 permissions: {}
 
-# One release at a time; a queued run plans again and finds the new tag.
+# One release at a time; a queued run plans again and finds the new tags.
 concurrency:
   group: auto-release
   cancel-in-progress: false
 
 jobs:
   plan:
-    name: Plan the release
+    name: Plan the releases
     runs-on: ubuntu-latest
     permissions:
       contents: read
       actions: read # the deploy's job results
       pull-requests: read # the notes
+      issues: read # open release-blocker issues hold a promotion
     outputs:
-      skip: ${{ steps.plan.outputs.skip || 'true' }}
-      tag: ${{ steps.plan.outputs.tag }}
-      previous: ${{ steps.plan.outputs.previous }}
-      commit: ${{ steps.guard.outputs.commit }}
+      releases: ${{ steps.plan.outputs.releases || '[]' }}
+      count: ${{ steps.plan.outputs.count || '0' }}
+      mode: ${{ steps.guard.outputs.mode }}
     steps:
-      # The signature names this run's ref and commit, and installs require
-      # refs/heads/main and the tag's commit: the run must be on main, on the
-      # commit that was deployed. Called from deploy.yml, the run's commit is
-      # the deployed commit by construction. Started by hand, it is main's
-      # head, so only that commit can be released by hand.
+      # A new release's signature names this run's ref and commit, and installs
+      # require refs/heads/main and the tag's commit: the run must be on main,
+      # on the commit that was deployed. Called from deploy.yml, the run's
+      # commit is the deployed commit by construction. On the schedule or by
+      # hand, it is main's head, released once main's deploy shipped it (the
+      # nightly run waits for that deploy). A promotion signs nothing: the
+      # beta's run signed its stable tag already.
       - id: guard
         name: On main, for the commit main's deploy shipped
         env:
-          COMMIT: ${{ inputs.commit }}
+          COMMIT_IN: ${{ inputs.commit }}
+          ASKED: ${{ inputs.mode }}
+          EVENT: ${{ github.event_name }}
+          SCHEDULE: ${{ github.event.schedule }}
           GH_TOKEN: ${{ github.token }}
         run: |
           [ "$GITHUB_REF" = refs/heads/main ] || { echo "::error::Run this on main, not $GITHUB_REF"; exit 1; }
           case "$GITHUB_WORKFLOW_REF" in
-            "$GITHUB_REPOSITORY/.github/workflows/deploy.yml@refs/heads/main" | "$GITHUB_REPOSITORY/.github/workflows/auto-release.yml@refs/heads/main") ;;
-            *) echo "::error::Only deploy.yml or a run by hand on main may start this, not $GITHUB_WORKFLOW_REF"; exit 1 ;;
+            "$GITHUB_REPOSITORY/.github/workflows/deploy.yml@refs/heads/main") mode=stable ;;
+            "$GITHUB_REPOSITORY/.github/workflows/auto-release.yml@refs/heads/main")
+              if [ "$EVENT" != schedule ]; then mode="$ASKED"
+              elif [ "$SCHEDULE" = "17 10 * * *" ]; then mode=promote
+              else mode=nightly; fi ;;
+            *) echo "::error::Only deploy.yml, the schedule or a run by hand on main may start this, not $GITHUB_WORKFLOW_REF"; exit 1 ;;
           esac
+          case "$mode" in promote | beta | stable | nightly) ;; *) echo "::error::unknown mode \"$mode\""; exit 1 ;; esac
+          echo "mode=$mode" >> "$GITHUB_OUTPUT"
+          echo "Mode: $mode"
+          [ "$mode" = promote ] && exit 0
+          COMMIT="${COMMIT_IN:-$GITHUB_SHA}"
           [[ "$COMMIT" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::commit must be a full commit SHA"; exit 1; }
           if [ "$GITHUB_SHA" != "$COMMIT" ]; then
             echo "::error::This run is on $GITHUB_SHA, not $COMMIT: a release is cut only from the run of the commit it releases (the deploy of $COMMIT releases it)"
             exit 1
           fi
-          ok=""
-          for run in $(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/deploy.yml/runs?branch=main&head_sha=$COMMIT&per_page=20" --jq '.workflow_runs[] | select(.event == "schedule" or .event == "workflow_dispatch") | .id'); do
-            if [ "$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$run/jobs" --jq '[.jobs[] | select(.name == "CDK Deploy" and .conclusion == "success")] | length')" -gt 0 ]; then ok=$run; break; fi
+          deployed() {
+            for run in $(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/deploy.yml/runs?branch=main&head_sha=$COMMIT&per_page=20" --jq '.workflow_runs[] | select(.event == "schedule" or .event == "workflow_dispatch") | .id'); do
+              if [ "$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$run/jobs" --jq '[.jobs[] | select(.name == "CDK Deploy" and .conclusion == "success")] | length')" -gt 0 ]; then echo "$run"; return 0; fi
+            done
+            return 1
+          }
+          # The nightly run waits for the deploy of main's head (the deploy
+          # runs every 10 minutes); by hand, it must be deployed already.
+          tries=1
+          [ "$mode" = nightly ] && tries=45
+          for i in $(seq 1 "$tries"); do
+            if ok=$(deployed); then
+              echo "Deployed by run $ok"
+              echo "commit=$COMMIT" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            [ "$i" -lt "$tries" ] && sleep 60
           done
-          [ -n "$ok" ] || { echo "::error::No successful CDK deploy of $COMMIT on main"; exit 1; }
-          echo "Deployed by run $ok"
-          echo "commit=$COMMIT" >> "$GITHUB_OUTPUT"
+          if [ "$mode" = nightly ]; then
+            echo "::warning::No successful CDK deploy of $COMMIT on main yet: no beta tonight"
+            exit 0
+          fi
+          echo "::error::No successful CDK deploy of $COMMIT on main"
+          exit 1
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
-        if: steps.guard.outputs.commit != ''
         with:
-          ref: ${{ steps.guard.outputs.commit }}
+          ref: ${{ github.sha }}
           fetch-depth: 0
           persist-credentials: false
       - id: plan
-        if: steps.guard.outputs.commit != ''
-        name: Version, notes, or skip
+        name: Versions, notes, or skip
         env:
+          MODE: ${{ steps.guard.outputs.mode }}
           COMMIT: ${{ steps.guard.outputs.commit }}
+          VERSION: ${{ inputs.version }}
           GH_TOKEN: ${{ github.token }}
         run: |
-          git fetch --no-tags origin '+refs/tags/v*:refs/tags/v*'
-          python3 .github/scripts/auto_release.py plan --repo "$GITHUB_REPOSITORY" --commit "$COMMIT" \
-            --notes-out "$RUNNER_TEMP/notes.md" --github-output "$GITHUB_OUTPUT"
-          touch "$RUNNER_TEMP/notes.md"
+          if [ "$MODE" = nightly ]; then
+            # Tonight's beta, once main's head is deployed (the guard waited).
+            if [ -z "$COMMIT" ]; then echo "count=0" >> "$GITHUB_OUTPUT"; exit 0; fi
+            MODE=beta
+          fi
+          git fetch --no-tags origin '+refs/tags/v*:refs/tags/v*' '+refs/heads/main:refs/remotes/origin/main'
+          args=(--repo "$GITHUB_REPOSITORY" --mode "$MODE" --notes-dir "$RUNNER_TEMP/notes" --github-output "$GITHUB_OUTPUT")
+          [ -n "$COMMIT" ] && args+=(--commit "$COMMIT")
+          [ "$MODE" = promote ] && [ -n "$VERSION" ] && args+=(--version "$VERSION")
+          python3 .github/scripts/auto_release.py plan "${args[@]}"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
-        if: steps.plan.outputs.skip == 'false'
+        if: steps.plan.outputs.count != '0'
         with:
           name: release-notes
-          path: ${{ runner.temp }}/notes.md
+          path: ${{ runner.temp }}/notes/
           if-no-files-found: error
           retention-days: 3
 
   tag:
-    name: Attest and tag
+    name: Attest and tag ${{ matrix.tag }}
     needs: plan
-    if: needs.plan.outputs.skip == 'false'
+    if: needs.plan.outputs.count != '0'
     runs-on: ubuntu-latest
     environment: release-auto
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.plan.outputs.releases) }}
     permissions:
       contents: write # the tag
       id-token: write # the keyless signature
       attestations: write # GitHub's attestation of the same statement
       actions: write # start release.yml on the tag
     env:
-      TAG: ${{ needs.plan.outputs.tag }}
-      COMMIT: ${{ needs.plan.outputs.commit }}
+      KIND: ${{ matrix.kind }}
+      TAG: ${{ matrix.tag }}
+      COMMIT: ${{ matrix.commit }}
+      STABLE_TAG: ${{ matrix.stable_tag }}
+      BETA: ${{ matrix.beta }}
     steps:
       - name: The run, the tag and the commit
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          if [ "$GITHUB_REF" != refs/heads/main ] || [ "$GITHUB_SHA" != "$COMMIT" ]; then echo "::error::not main's deployed commit"; exit 1; fi
+          [ "$GITHUB_REF" = refs/heads/main ] || { echo "::error::not main"; exit 1; }
           case "$GITHUB_WORKFLOW_REF" in
             "$GITHUB_REPOSITORY/.github/workflows/deploy.yml@refs/heads/main" | "$GITHUB_REPOSITORY/.github/workflows/auto-release.yml@refs/heads/main") ;;
-            *) echo "::error::not started by deploy.yml or by hand on main"; exit 1 ;;
+            *) echo "::error::not started by deploy.yml, the schedule or by hand on main"; exit 1 ;;
           esac
-          [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "::error::$TAG is not vX.Y.Z"; exit 1; }
-          if gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$TAG" >/dev/null 2>&1; then
-            echo "::error::$TAG exists already; a release tag is never re-cut or moved"; exit 1
-          fi
+          exists() { gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$1" >/dev/null 2>&1; }
+          case "$KIND" in
+            stable | beta)
+              # A new release is signed by this run: only for its own commit.
+              if [ "$GITHUB_SHA" != "$COMMIT" ]; then echo "::error::not main's deployed commit"; exit 1; fi
+              if [ "$KIND" = stable ]; then
+                [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "::error::$TAG is not vX.Y.Z"; exit 1; }
+              else
+                [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+-beta\.[0-9]{8}$ ]] || { echo "::error::$TAG is not vX.Y.Z-beta.YYYYMMDD"; exit 1; }
+                [ "$STABLE_TAG" = "${TAG%-beta.*}" ] || { echo "::error::$TAG would become $STABLE_TAG"; exit 1; }
+                if exists "$STABLE_TAG"; then echo "::error::$STABLE_TAG exists already"; exit 1; fi
+                printf 'coderhelm-release-tag v1\nrepository %s\ntag %s\ncommit %s\n' "$GITHUB_REPOSITORY" "$STABLE_TAG" "$COMMIT" > "$RUNNER_TEMP/$STABLE_TAG.release-tag"
+              fi
+              ;;
+            promote)
+              # The beta's tag, read back from GitHub: on main, on this commit,
+              # and carrying the signed statement for this stable tag.
+              [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "::error::$TAG is not vX.Y.Z"; exit 1; }
+              [[ "$BETA" =~ ^v[0-9]+\.[0-9]+\.[0-9]+-beta\.[0-9]{8}$ ]] && [ "${BETA%-beta.*}" = "$TAG" ] || { echo "::error::$BETA doesn't become $TAG"; exit 1; }
+              [[ "$COMMIT" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::no commit"; exit 1; }
+              ref=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$BETA" --jq '.object.type + " " + .object.sha')
+              read -r type sha <<< "$ref"
+              [ "$type" = tag ] || { echo "::error::$BETA is not an annotated tag"; exit 1; }
+              [ "$(gh api "repos/$GITHUB_REPOSITORY/git/tags/$sha" --jq .object.sha)" = "$COMMIT" ] || { echo "::error::$BETA is not on $COMMIT"; exit 1; }
+              gh api "repos/$GITHUB_REPOSITORY/git/tags/$sha" --jq .message > "$RUNNER_TEMP/beta-message"
+              status=$(gh api "repos/$GITHUB_REPOSITORY/compare/$COMMIT...main" --jq .status)
+              case "$status" in ahead | identical) ;; *) echo "::error::$COMMIT is not on main ($status)"; exit 1 ;; esac
+              B='-----BEGIN CODERHELM STABLE ATTESTATION-----'
+              E='-----END CODERHELM STABLE ATTESTATION-----'
+              { [ "$(grep -cxF -e "$B" "$RUNNER_TEMP/beta-message")" = 1 ] && [ "$(grep -cxF -e "$E" "$RUNNER_TEMP/beta-message")" = 1 ]; } \
+                || { echo "::error::$BETA carries no signed statement for $TAG"; exit 1; }
+              sed -n "/^$B\$/,/^$E\$/p" "$RUNNER_TEMP/beta-message" | sed '1d;$d' | base64 -d > "$RUNNER_TEMP/tag.sigstore.json"
+              ;;
+            *) echo "::error::unknown kind $KIND"; exit 1 ;;
+          esac
+          if exists "$TAG"; then echo "::error::$TAG exists already; a release tag is never re-cut or moved"; exit 1; fi
           printf 'coderhelm-release-tag v1\nrepository %s\ntag %s\ncommit %s\n' "$GITHUB_REPOSITORY" "$TAG" "$COMMIT" > "$RUNNER_TEMP/$TAG.release-tag"
-          cat "$RUNNER_TEMP/$TAG.release-tag"
+          cat "$RUNNER_TEMP"/*.release-tag
       - uses: sigstore/cosign-installer@7e8b541eb2e61bf99390e1afd4be13a184e9ebc5 # v3.10.1
         with:
           cosign-release: v2.4.1
-      - name: Sign the statement
-        run: cosign sign-blob --yes --bundle "$RUNNER_TEMP/tag.sigstore.json" "$RUNNER_TEMP/$TAG.release-tag"
-      - name: Verify the signature as installs will
+      - name: Sign the statements
+        if: matrix.kind != 'promote'
         run: |
-          cosign verify-blob --bundle "$RUNNER_TEMP/tag.sigstore.json" \
-            --certificate-identity "https://github.com/$GITHUB_REPOSITORY/.github/workflows/auto-release.yml@refs/heads/main" \
-            --certificate-oidc-issuer https://token.actions.githubusercontent.com \
-            --certificate-github-workflow-repository "$GITHUB_REPOSITORY" \
-            --certificate-github-workflow-ref refs/heads/main \
-            --certificate-github-workflow-sha "$COMMIT" \
-            "$RUNNER_TEMP/$TAG.release-tag"
+          cosign sign-blob --yes --bundle "$RUNNER_TEMP/tag.sigstore.json" "$RUNNER_TEMP/$TAG.release-tag"
+          if [ "$KIND" = beta ]; then
+            cosign sign-blob --yes --bundle "$RUNNER_TEMP/stable.sigstore.json" "$RUNNER_TEMP/$STABLE_TAG.release-tag"
+          fi
+      # A promotion checks the signature the beta's run made, for this tag
+      # and the beta's commit, exactly as installs will.
+      - name: Verify the signatures as installs will
+        run: |
+          verify() {
+            cosign verify-blob --bundle "$1" \
+              --certificate-identity "https://github.com/$GITHUB_REPOSITORY/.github/workflows/auto-release.yml@refs/heads/main" \
+              --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+              --certificate-github-workflow-repository "$GITHUB_REPOSITORY" \
+              --certificate-github-workflow-ref refs/heads/main \
+              --certificate-github-workflow-sha "$COMMIT" \
+              "$2"
+          }
+          verify "$RUNNER_TEMP/tag.sigstore.json" "$RUNNER_TEMP/$TAG.release-tag"
+          if [ "$KIND" = beta ]; then verify "$RUNNER_TEMP/stable.sigstore.json" "$RUNNER_TEMP/$STABLE_TAG.release-tag"; fi
       - uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
+        if: matrix.kind != 'promote'
         with:
-          subject-path: ${{ runner.temp }}/${{ needs.plan.outputs.tag }}.release-tag
+          subject-path: ${{ runner.temp }}/*.release-tag
       # The annotated tag carries the signature (base64 of the bundle) in its
-      # message. Creating the ref fails when it exists, so nothing is moved.
+      # message; a beta's also carries its stable tag's. Creating the ref
+      # fails when it exists, so nothing is moved.
       - name: Create the tag
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           msg="$RUNNER_TEMP/tag-message"
           {
-            printf '%s\n\nReleased automatically by .github/workflows/auto-release.yml after the deploy of main at %s.\nHow to check it: docs/self-host/updates-security.md\n\n' "$TAG" "$COMMIT"
+            case "$KIND" in
+              stable) printf '%s\n\nReleased automatically by .github/workflows/auto-release.yml after the deploy of main at %s.\n' "$TAG" "$COMMIT" ;;
+              beta) printf '%s\n\nBeta (nightly) release, cut automatically by .github/workflows/auto-release.yml from main at %s.\nIt becomes %s on the stable channel after a day with no reported problem.\n' "$TAG" "$COMMIT" "$STABLE_TAG" ;;
+              promote) printf '%s\n\nStable release: the beta %s (main at %s), promoted by .github/workflows/auto-release.yml.\n' "$TAG" "$BETA" "$COMMIT" ;;
+            esac
+            printf 'How to check it: docs/self-host/updates-security.md\n\n'
             echo "-----BEGIN CODERHELM RELEASE ATTESTATION-----"
             base64 -w 76 "$RUNNER_TEMP/tag.sigstore.json"
             echo "-----END CODERHELM RELEASE ATTESTATION-----"
+            if [ "$KIND" = beta ]; then
+              printf '\nThe signed statement for %s, used when this beta is promoted:\n' "$STABLE_TAG"
+              echo "-----BEGIN CODERHELM STABLE ATTESTATION-----"
+              base64 -w 76 "$RUNNER_TEMP/stable.sigstore.json"
+              echo "-----END CODERHELM STABLE ATTESTATION-----"
+            fi
           } > "$msg"
           obj=$(jq -n --rawfile m "$msg" --arg t "$TAG" --arg o "$COMMIT" '{tag: $t, message: $m, object: $o, type: "commit"}' \
             | gh api "repos/$GITHUB_REPOSITORY/git/tags" --input - --jq .sha)
           gh api "repos/$GITHUB_REPOSITORY/git/refs" -f ref="refs/tags/$TAG" -f sha="$obj" >/dev/null
           echo "Created $TAG ($obj) on $COMMIT"
-      # The tag, fetched back from GitHub, checks out as installs check it.
+      # The tag, fetched back from GitHub, checks out as installs check it
+      # (main's installer code).
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
-          ref: ${{ needs.plan.outputs.commit }}
+          ref: ${{ github.sha }}
           persist-credentials: false
       - name: Check the tag as an install will
         run: |
@@ -210,27 +347,42 @@ jobs:
         run: gh workflow run release.yml -R "$GITHUB_REPOSITORY" --ref "$TAG"
 
   publish:
-    name: Publish the Launch Stack and notes
+    name: Publish ${{ matrix.tag }}
     needs: [plan, tag]
+    # Each release on its own: a failed one never holds the other back.
+    if: ${{ !cancelled() && needs.plan.result == 'success' && needs.plan.outputs.count != '0' }}
     runs-on: ubuntu-latest
     environment: release-auto
     timeout-minutes: 150
+    strategy:
+      fail-fast: false
+      # One at a time: both may move beta.json.
+      max-parallel: 1
+      matrix:
+        include: ${{ fromJSON(needs.plan.outputs.releases) }}
     permissions:
       contents: write # the release notes
       id-token: write # the AWS roles
       actions: read # the Release run
     env:
-      TAG: ${{ needs.plan.outputs.tag }}
-      COMMIT: ${{ needs.plan.outputs.commit }}
+      KIND: ${{ matrix.kind }}
+      CHANNEL: ${{ matrix.channel }}
+      TAG: ${{ matrix.tag }}
+      COMMIT: ${{ matrix.commit }}
+      STABLE_TAG: ${{ matrix.stable_tag }}
+      BETA: ${{ matrix.beta }}
+      MODE: ${{ needs.plan.outputs.mode }}
       PUBLIC_BUCKET: coderhelm-public
     steps:
       - name: Wait for the Release run on the tag
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$TAG" >/dev/null 2>&1 || { echo "::error::$TAG was not created (see its Attest and tag job)"; exit 1; }
           id=""
           for _ in $(seq 1 60); do
-            id=$(gh run list -R "$GITHUB_REPOSITORY" --workflow release.yml --event workflow_dispatch --commit "$COMMIT" --limit 1 --json databaseId --jq '.[0].databaseId // empty')
+            id=$(gh run list -R "$GITHUB_REPOSITORY" --workflow release.yml --event workflow_dispatch --branch "$TAG" --limit 5 --json databaseId,headBranch,headSha \
+              --jq "[.[] | select(.headBranch == \"$TAG\" and .headSha == \"$COMMIT\")][0].databaseId // empty")
             [ -n "$id" ] && break
             sleep 10
           done
@@ -263,6 +415,8 @@ jobs:
             --certificate-github-workflow-sha "$COMMIT" \
             "$d/SHA256SUMS"
           (cd "$d" && sha256sum -c SHA256SUMS)
+          pre=$(gh release view "$TAG" -R "$GITHUB_REPOSITORY" --json isPrerelease --jq .isPrerelease)
+          [ "$pre" = "$([ "$CHANNEL" = beta ] && echo true || echo false)" ] || { echo "::error::$TAG's GitHub release has prerelease=$pre"; exit 1; }
 
       # Only the publish script, at this workflow's own commit: the job runs
       # nothing from the repository but that file.
@@ -273,7 +427,7 @@ jobs:
           sparse-checkout: .github/scripts/publish-once.sh
           sparse-checkout-cone-mode: false
       # Same roles and same writes as release.yml's maintainer path: templates
-      # are created once and never replaced, latest.json only moves forward.
+      # are created once and never replaced, the pointers only move forward.
       - uses: aws-actions/configure-aws-credentials@7474bc4690e29a8392af63c5b98e7449536d5c3a # v4.3.1
         with:
           role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/coderhelm-prod-release-publisher
@@ -313,40 +467,58 @@ jobs:
           role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/coderhelm-prod-release-latest
           role-duration-seconds: 900
           aws-region: us-east-1
-      - name: Move latest.json
+      # Each channel's pointer names its newest release: latest.json the
+      # newest stable one, beta.json the newest of either kind (so a stable
+      # release moves both). A pointer only moves forward (a prerelease sorts
+      # before its release, as in the updater), and the write is
+      # conditional: a create, or a replace of the exact copy read (ETag).
+      - name: Move the channel pointers
         run: |
-          headers="$RUNNER_TEMP/latest.headers"
-          current=$(curl --proto =https -fsSL -D "$headers" "https://$PUBLIC_BUCKET.s3.amazonaws.com/launch/latest.json" 2>/dev/null || echo '{}')
-          etag=$(sed -n 's/^[Ee][Tt][Aa][Gg]: *//p' "$headers" 2>/dev/null | tr -d '\r' | head -n1)
-          # shellcheck disable=SC2016 # JavaScript, not shell
-          CURRENT="$current" SHA=$(sha256sum "$RUNNER_TEMP/published/coderhelm.json" | cut -d' ' -f1) node -e '
-            const tag = process.env.TAG;
-            const n = (v) => String(v || "v0.0.0").replace(/^v/, "").split(/[.-]/).slice(0, 3).map(Number);
-            let cur = {};
-            try { cur = JSON.parse(process.env.CURRENT); } catch {}
-            const [a, b] = [n(tag), n(cur.version)];
-            const newer = a[0] !== b[0] ? a[0] > b[0] : a[1] !== b[1] ? a[1] > b[1] : a[2] > b[2];
-            if (!newer && cur.version !== tag) { console.error(`latest.json names ${cur.version}, newer than ${tag}: left as it is`); process.exit(0); }
-            const bucket = process.env.PUBLIC_BUCKET;
-            require("fs").writeFileSync("latest.json", JSON.stringify({
-              version: tag,
-              templateUrl: `https://${bucket}.s3.amazonaws.com/launch/${tag}/coderhelm.json`,
-              templateSha256: process.env.SHA,
-              publishedAt: new Date().toISOString(),
-            }));
-          '
-          [ -f latest.json ] || exit 0
-          if [ -n "$etag" ]; then
-            aws s3api put-object --bucket "$PUBLIC_BUCKET" --key launch/latest.json --body latest.json --if-match "$etag" --content-type application/json --cache-control "public, max-age=300" >/dev/null
-          else
-            aws s3api put-object --bucket "$PUBLIC_BUCKET" --key launch/latest.json --body latest.json --if-none-match '*' --content-type application/json --cache-control "public, max-age=300" >/dev/null
-          fi
-      # The install guide's link: latest.json names a template that opens.
+          keys="beta.json"
+          [ "$CHANNEL" = stable ] && keys="latest.json beta.json"
+          SHA=$(sha256sum "$RUNNER_TEMP/published/coderhelm.json" | cut -d' ' -f1)
+          export SHA
+          for key in $keys; do
+            headers="$RUNNER_TEMP/$key.headers"
+            current=$(curl --proto =https -fsSL -D "$headers" "https://$PUBLIC_BUCKET.s3.amazonaws.com/launch/$key" 2>/dev/null || echo '{}')
+            etag=$(sed -n 's/^[Ee][Tt][Aa][Gg]: *//p' "$headers" 2>/dev/null | tr -d '\r' | head -n1)
+            rm -f "$key"
+            # shellcheck disable=SC2016 # JavaScript, not shell
+            CURRENT="$current" KEY="$key" node -e '
+              const tag = process.env.TAG;
+              const p = (v) => { const m = /^v(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?$/.exec(String(v || "")); return m ? [+m[1], +m[2], +m[3], m[4] || ""] : null; };
+              const cmp = (a, b) => { for (let i = 0; i < 3; i++) if (a[i] !== b[i]) return a[i] - b[i]; return a[3] === b[3] ? 0 : !a[3] ? 1 : !b[3] ? -1 : a[3] < b[3] ? -1 : 1; };
+              let cur = {};
+              try { cur = JSON.parse(process.env.CURRENT); } catch {}
+              const [a, b] = [p(tag), p(cur.version)];
+              if (b && cmp(a, b) < 0) { console.error(`${process.env.KEY} names ${cur.version}, newer than ${tag}: left as it is`); process.exit(0); }
+              const bucket = process.env.PUBLIC_BUCKET;
+              require("fs").writeFileSync(process.env.KEY, JSON.stringify({
+                version: tag,
+                templateUrl: `https://${bucket}.s3.amazonaws.com/launch/${tag}/coderhelm.json`,
+                templateSha256: process.env.SHA,
+                publishedAt: new Date().toISOString(),
+              }));
+            '
+            [ -f "$key" ] || continue
+            if [ -n "$etag" ]; then
+              aws s3api put-object --bucket "$PUBLIC_BUCKET" --key "launch/$key" --body "$key" --if-match "$etag" --content-type application/json --cache-control "public, max-age=300" >/dev/null
+            else
+              aws s3api put-object --bucket "$PUBLIC_BUCKET" --key "launch/$key" --body "$key" --if-none-match '*' --content-type application/json --cache-control "public, max-age=300" >/dev/null
+            fi
+            echo "launch/$key: $TAG"
+          done
+      # The install guide's link (latest.json), and the beta channel's: each
+      # names a template that opens.
       - name: The install link opens
         run: |
-          url=$(curl --proto =https -fsSL "https://$PUBLIC_BUCKET.s3.amazonaws.com/launch/latest.json" | jq -r .templateUrl)
-          curl --proto =https -fsSI "$url" >/dev/null || { echo "::error::latest.json names $url, which does not open"; exit 1; }
-          echo "latest.json: $url"
+          keys="beta.json"
+          [ "$CHANNEL" = stable ] && keys="latest.json beta.json"
+          for key in $keys; do
+            url=$(curl --proto =https -fsSL "https://$PUBLIC_BUCKET.s3.amazonaws.com/launch/$key" | jq -r .templateUrl)
+            curl --proto =https -fsSI "$url" >/dev/null || { echo "::error::$key names $url, which does not open"; exit 1; }
+            echo "$key: $url"
+          done
 
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
@@ -360,11 +532,17 @@ jobs:
         run: |
           f="$RUNNER_TEMP/release-notes.md"
           {
-            echo "Self-host release ${TAG}, cut automatically after the deploy of main at ${COMMIT}."
+            case "$KIND" in
+              stable) echo "Self-host release ${TAG}, cut right away after the deploy of main at ${COMMIT}." ;;
+              beta) echo "Beta (nightly) self-host release ${TAG}, from main at ${COMMIT}. Installs on the Beta channel get it. It becomes ${STABLE_TAG} on the Stable channel after a day with no reported problem." ;;
+              promote)
+                if [ "$MODE" = promote ]; then how="promoted by a maintainer"; else how="promoted after a day on the Beta channel with no reported problem"; fi
+                echo "Self-host release ${TAG}: the beta ${BETA} (main at ${COMMIT}), ${how}." ;;
+            esac
             echo
             echo "Install: \`npx -y github:${GITHUB_REPOSITORY}#${TAG} init\`, then deploy. Update: \`npx -y github:${GITHUB_REPOSITORY}#${TAG} update --to ${TAG}\`. Check an install: \`npx -y github:${GITHUB_REPOSITORY} doctor\`. Verify it yourself: docs/self-host/updates-security.md."
             echo
-            cat "$RUNNER_TEMP/notes/notes.md"
+            cat "$RUNNER_TEMP/notes/$TAG.md"
           } > "$f"
           gh release edit "$TAG" -R "$GITHUB_REPOSITORY" --notes-file "$f"
           url=$(gh release view "$TAG" -R "$GITHUB_REPOSITORY" --json url --jq .url)

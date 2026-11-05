@@ -12,10 +12,11 @@ name: Release
 #               selfhost/maintainers.json); the publish job then waits for a
 #               maintainer's approval of the "release" environment and also
 #               uploads the Launch Stack templates and moves latest.json.
-#   automatic   .github/workflows/auto-release.yml creates it after main's
-#               deploy, with a keyless signature of "this repository, this
-#               tag, this commit" in its message, and starts this workflow on
-#               it. The publish job signs and publishes the GitHub release
+#   automatic   .github/workflows/auto-release.yml creates it (the nightly
+#               beta vX.Y.Z-beta.YYYYMMDD, a promoted beta's vX.Y.Z on the
+#               same commit, or an urgent vX.Y.Z after main's deploy), with a
+#               keyless signature of "this repository, this tag, this commit"
+#               in its message, and starts this workflow on it. The publish job signs and publishes the GitHub release
 #               with no approval; auto-release.yml then checks it and uploads
 #               the templates and latest.json itself, from main, in the
 #               "release-auto" environment (main only).
@@ -423,10 +424,14 @@ jobs:
       # releases on, GitHub refuses any upload to one): a re-run confirms the
       # published SHA256SUMS is this build's and changes nothing. Only a draft
       # with no SHA256SUMS yet (one made by hand, without assets) is filled in.
+      # A tag with a suffix (the nightly vX.Y.Z-beta.YYYYMMDD) is a GitHub
+      # prerelease: only installs on the beta channel take it.
       - name: Publish the release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          pre=false
+          case "$TAG" in *-*) pre=true ;; esac
           NOTES="Self-host release ${TAG}. Install: npx -y github:${GITHUB_REPOSITORY}#${TAG} init, then deploy. Update: npx -y github:${GITHUB_REPOSITORY}#${TAG} update --to ${TAG}. Check an install: npx -y github:${GITHUB_REPOSITORY} doctor. Verify it yourself: docs/self-host/updates-security.md."
           if DRAFT=$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${TAG}" --jq .draft 2>/dev/null); then
             mkdir -p "$RUNNER_TEMP/old"
@@ -435,13 +440,13 @@ jobs:
               echo "$TAG is already published with these files: nothing to upload."
             elif [ "$DRAFT" = "true" ]; then
               gh release upload "$TAG" -R "$GITHUB_REPOSITORY" dist/*
-              gh release edit "$TAG" -R "$GITHUB_REPOSITORY" --draft=false
+              gh release edit "$TAG" -R "$GITHUB_REPOSITORY" --draft=false --prerelease="$pre"
             else
               echo "::error::$TAG is published without a SHA256SUMS, and a published release can't take new files. Delete that release (or make it a draft) and run this again."
               exit 1
             fi
           else
-            gh release create "$TAG" -R "$GITHUB_REPOSITORY" dist/* --title "$TAG" --notes "$NOTES" --verify-tag
+            gh release create "$TAG" -R "$GITHUB_REPOSITORY" dist/* --title "$TAG" --notes "$NOTES" --verify-tag --prerelease="$pre"
           fi
 
       # CloudFormation's Launch Stack links only open templates stored in S3,

@@ -669,15 +669,16 @@ export class WorkerStack extends cdk.Stack {
 
         const latest = new iam.Role(this, "ReleaseLatestRole", {
           roleName: `${prefix}-release-latest`,
-          description: "release.yml on a v* tag (release environment) or auto-release.yml on main (release-auto), after it checked the published release: writes launch/latest.json only",
+          description: "release.yml on a v* tag (release environment) or auto-release.yml on main (release-auto), after it checked the published release: writes launch/latest.json and launch/beta.json only",
           maxSessionDuration: cdk.Duration.hours(1),
           assumedBy: releaseTrust(),
         });
         latest.assumeRolePolicy?.addStatements(autoReleaseTrust());
-        const latestKey = `arn:aws:s3:::${cfg.publicBucketName}/launch/latest.json`;
+        // Each update channel's pointer: latest.json (stable) and beta.json (beta, the nightly prereleases).
+        const latestKeys = ["latest.json", "beta.json"].map((k) => `arn:aws:s3:::${cfg.publicBucketName}/launch/${k}`);
         // A create (If-None-Match) or a replace of the exact copy read (If-Match: its ETag).
-        latest.addToPolicy(new iam.PolicyStatement({ actions: ["s3:PutObject"], resources: [latestKey], conditions: { Null: { "s3:if-none-match": "false" } } }));
-        latest.addToPolicy(new iam.PolicyStatement({ actions: ["s3:PutObject"], resources: [latestKey], conditions: { Null: { "s3:if-match": "false" } } }));
+        latest.addToPolicy(new iam.PolicyStatement({ actions: ["s3:PutObject"], resources: latestKeys, conditions: { Null: { "s3:if-none-match": "false" } } }));
+        latest.addToPolicy(new iam.PolicyStatement({ actions: ["s3:PutObject"], resources: latestKeys, conditions: { Null: { "s3:if-match": "false" } } }));
         new cdk.CfnOutput(this, "ReleaseLatestRoleArn", { value: latest.roleArn });
       }
     }
