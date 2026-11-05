@@ -65,6 +65,24 @@ pub fn ended_by_person(status: &str) -> bool {
     ENDED_BY_PERSON.contains(&status)
 }
 
+/// Whether a person's Retry of an ended run takes up its plan and branch
+/// instead of starting over. Superseded runs cost $63 in 17 days, most of it
+/// planning and implementing again what the earlier run had already
+/// written. It starts over when the plan was what failed: the run stopped in
+/// triage or planning (`current_pass`), or its error is about the plan.
+/// Start over (`reset`) always starts over. A run that kept no plan of its
+/// own has nothing to take up: the new run plans as usual.
+pub fn retry_resumes(current_pass: &str, error: &str) -> bool {
+    let pass = current_pass.trim().to_ascii_lowercase();
+    if pass.starts_with("triage") || pass.starts_with("plan") {
+        return false;
+    }
+    let error = error.to_ascii_lowercase();
+    !error
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .any(|w| matches!(w, "plan" | "planning" | "planner"))
+}
+
 /// The lesson trigger for a person's answer to "why was this closed?" on
 /// CoderHelm's PR (the gateway sends it, the worker's lessons read it).
 pub const CLOSE_REASON_TRIGGER: &str = "close_reason";
@@ -388,5 +406,39 @@ mod tests {
             offenders.is_empty(),
             "use run_status::not_ended / ended_by_person: {offenders:#?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod retry_resumes_tests {
+    use super::retry_resumes;
+
+    #[test]
+    fn a_retry_takes_up_the_plan_and_branch_unless_the_plan_failed() {
+        assert!(retry_resumes(
+            "implement",
+            "Reached the maximum number of steps"
+        ));
+        assert!(retry_resumes(
+            "review",
+            "the model call failed: 529 overloaded"
+        ));
+        assert!(retry_resumes("pr", ""));
+        // The plan was what failed: plan again.
+        assert!(!retry_resumes("plan", "out of time"));
+        assert!(!retry_resumes("plan_review", ""));
+        assert!(!retry_resumes("triage", ""));
+        assert!(!retry_resumes(
+            "implement",
+            "The plan names a file that doesn't exist"
+        ));
+        assert!(!retry_resumes(
+            "implement",
+            "planning gap: no task for the migration"
+        ));
+        // A finished pass name says nothing about the plan.
+        assert!(retry_resumes("done", "Reached the maximum number of steps"));
+        // A word that only contains "plan" isn't about the plan.
+        assert!(retry_resumes("implement", "the explanation was cut off"));
     }
 }

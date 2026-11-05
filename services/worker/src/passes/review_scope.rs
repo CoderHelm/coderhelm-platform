@@ -33,6 +33,88 @@ pub fn approved_base(
         .then(|| latest.head_sha.clone())
 }
 
+/// The commit a push's re-review starts from when CoderHelm's latest review
+/// of an earlier commit did not approve (it asked for changes, or left
+/// questions): that review's head. The push is then reviewed from there,
+/// only the hunks changed since plus the status of the earlier findings,
+/// instead of the whole PR again. `None` for anything but a push, for a
+/// person's question, a forced full review, the same head, or no earlier
+/// review. An approved latest review is [`approved_base`]'s.
+pub fn reviewed_base(
+    trigger: &str,
+    is_question: bool,
+    full_review: bool,
+    records_newest_first: &[ReviewRecord],
+    head: &str,
+) -> Option<String> {
+    if trigger != TRIGGER_PUSH || is_question || full_review {
+        return None;
+    }
+    let latest = records_newest_first
+        .iter()
+        .find(|r| r.is_review() && !r.failed())?;
+    (latest.verdict != "APPROVE" && !latest.head_sha.is_empty() && latest.head_sha != head)
+        .then(|| latest.head_sha.clone())
+}
+
+/// The note a hunks-only re-review's diff starts with.
+pub fn since_review_note(reviewed: &str) -> String {
+    let short = &reviewed[..reviewed.len().min(7)];
+    format!(
+        "(CoderHelm reviewed {short} earlier and did not approve it. This review covers only \
+         what changed since {short}, plus the status of each earlier finding listed under \
+         \"Earlier review threads\"; the rest of the PR was reviewed at {short}. A full review \
+         of the whole PR runs before any approval.)"
+    )
+}
+
+/// A hunks-only re-review that would approve doesn't post: the whole PR is
+/// reviewed first, so an approval always rests on a full review.
+pub fn needs_full_before_approval(since_review: bool, verdict: &str) -> bool {
+    since_review && verdict == "APPROVE"
+}
+
+/// CoderHelm's own PR, a push made by CoderHelm, while the run that owns
+/// the PR is still in its own review and fix loop (`running` or
+/// `awaiting_ci`): the run asks the PR reviewer for its verdict itself once
+/// CI is green (`review_pr::review_for_run`), and a run that ends without
+/// it hands the PR over for review ([`HANDOFF_TRIGGER`]). Reviewing each of
+/// its intermediate pushes as well paid twice for the same code. A person's
+/// push, or a run that has ended, is reviewed as always.
+pub fn own_loop_holds_push(
+    trigger: &str,
+    self_authored: bool,
+    head_by_coderhelm: bool,
+    run_status: Option<&str>,
+) -> bool {
+    trigger == TRIGGER_PUSH
+        && self_authored
+        && head_by_coderhelm
+        && matches!(
+            run_status,
+            Some(common::run_status::RUNNING) | Some(common::run_status::AWAITING_CI)
+        )
+}
+
+/// The trigger of the review a run asks for when it hands its PR over
+/// without the PR reviewer's verdict on the last head.
+pub const HANDOFF_TRIGGER: &str = "handoff";
+
+/// The author login of `head` in a PR's commit list (oldest first), when the
+/// list holds it.
+pub fn head_commit_login<'a>(commits: &'a [Value], head: &str) -> Option<&'a str> {
+    commits
+        .iter()
+        .rev()
+        .find(|c| c["sha"].as_str() == Some(head))
+        .map(|c| {
+            c["author"]["login"]
+                .as_str()
+                .or_else(|| c["committer"]["login"].as_str())
+                .unwrap_or("")
+        })
+}
+
 /// The approved commit is an ancestor of the head (the compare is `ahead`).
 /// After a force-push or rebase it isn't, and the diff since it means
 /// nothing: review the whole PR.
@@ -447,5 +529,158 @@ mod tests {
         let no_patch = since(vec![file("src/orders.rs", "modified", None)]);
         assert!(!same_own_change(&no_patch, &no_patch));
         assert!(!same_own_change(&json!({}), &json!({})));
+    }
+
+    #[test]
+    fn a_push_after_a_change_request_is_reviewed_from_the_reviewed_commit() {
+        let requested = [
+            record("REQUEST_CHANGES", "REQUEST_CHANGES", "ccc"),
+            record("APPROVE", "APPROVE", "aaa"),
+        ];
+        assert_eq!(
+            reviewed_base(TRIGGER_PUSH, false, false, &requested, "ddd"),
+            Some("ccc".into())
+        );
+        // Questions left: the same.
+        let questions = [record("COMMENT", "COMMENT", "ccc")];
+        assert_eq!(
+            reviewed_base(TRIGGER_PUSH, false, false, &questions, "ddd"),
+            Some("ccc".into())
+        );
+        // An approval is approved_base's; a forced full review, a question,
+        // another trigger, the same head or no review: none.
+        let approved = [record("APPROVE", "APPROVE", "aaa")];
+        assert_eq!(
+            reviewed_base(TRIGGER_PUSH, false, false, &approved, "bbb"),
+            None
+        );
+        assert_eq!(
+            reviewed_base(TRIGGER_PUSH, false, true, &requested, "ddd"),
+            None
+        );
+        assert_eq!(
+            reviewed_base(TRIGGER_PUSH, true, false, &requested, "ddd"),
+            None
+        );
+        assert_eq!(
+            reviewed_base("ready_for_review", false, false, &requested, "ddd"),
+            None
+        );
+        assert_eq!(
+            reviewed_base(TRIGGER_PUSH, false, false, &requested, "ccc"),
+            None
+        );
+        assert_eq!(reviewed_base(TRIGGER_PUSH, false, false, &[], "ddd"), None);
+        assert!(since_review_note("ccc1234567").contains("only what changed since ccc1234"));
+    }
+
+    #[test]
+    fn an_approval_always_rests_on_a_full_review() {
+        assert!(needs_full_before_approval(true, "APPROVE"));
+        assert!(!needs_full_before_approval(true, "REQUEST_CHANGES"));
+        assert!(!needs_full_before_approval(false, "APPROVE"));
+    }
+
+    #[test]
+    fn coderhelms_own_pushes_wait_while_its_run_is_in_its_loop() {
+        use common::run_status::*;
+        // Its own push while the run fixes and waits on CI: not reviewed.
+        assert!(own_loop_holds_push(TRIGGER_PUSH, true, true, Some(RUNNING)));
+        assert!(own_loop_holds_push(
+            TRIGGER_PUSH,
+            true,
+            true,
+            Some(AWAITING_CI)
+        ));
+        // A person's push to the same PR is reviewed.
+        assert!(!own_loop_holds_push(
+            TRIGGER_PUSH,
+            true,
+            false,
+            Some(RUNNING)
+        ));
+        // The run ended (handed over, waiting on a person) or no run: reviewed.
+        for s in [COMPLETED, NEEDS_INPUT, FAILED, CANCELLED, CLOSED] {
+            assert!(!own_loop_holds_push(TRIGGER_PUSH, true, true, Some(s)));
+        }
+        assert!(!own_loop_holds_push(TRIGGER_PUSH, true, true, None));
+        // A person's PR, or another trigger (marked ready, a handoff): reviewed.
+        assert!(!own_loop_holds_push(
+            TRIGGER_PUSH,
+            false,
+            true,
+            Some(RUNNING)
+        ));
+        assert!(!own_loop_holds_push(
+            "ready_for_review",
+            true,
+            true,
+            Some(RUNNING)
+        ));
+        assert!(!own_loop_holds_push(
+            HANDOFF_TRIGGER,
+            true,
+            true,
+            Some(RUNNING)
+        ));
+    }
+
+    #[test]
+    fn the_head_commits_author_is_read_from_the_commit_list() {
+        let commits = vec![
+            json!({"sha": "a", "author": {"login": "acme-dev"}}),
+            json!({"sha": "b", "author": null, "committer": {"login": "coderhelm[bot]"}}),
+        ];
+        assert_eq!(head_commit_login(&commits, "a"), Some("acme-dev"));
+        assert_eq!(head_commit_login(&commits, "b"), Some("coderhelm[bot]"));
+        assert_eq!(head_commit_login(&commits, "zzz"), None);
+    }
+
+    /// Cost budget: a re-review after a request for changes reads only the
+    /// hunks changed since, so what it sends is a small part of a full
+    /// review's diff. A typical fix push touches one hunk of a 12-file PR.
+    #[test]
+    fn a_hunks_only_re_review_sends_a_fraction_of_the_full_diff() {
+        let hunk = |i: usize| {
+            let mut p = format!("@@ -1,40 +1,40 @@ fn handler_{i}()\n");
+            for l in 0..40 {
+                p.push_str(&format!("-    let value_{l} = old_call_{i}({l});\n"));
+                p.push_str(&format!("+    let value_{l} = new_call_{i}({l}, &ctx);\n"));
+            }
+            p
+        };
+        let full = json!({"status": "ahead", "files": (0..12)
+            .map(|i| file(&format!("src/h{i}.rs"), "modified", Some(&hunk(i))))
+            .collect::<Vec<_>>()});
+        let fix = json!({"status": "ahead", "files": [file(
+            "src/h3.rs",
+            "modified",
+            Some("@@ -7,1 +7,1 @@ fn handler_3()\n-    let value_6 = new_call_3(6, &ctx);\n+    let value_6 = new_call_3(6, &ctx)?;"),
+        )]});
+        let format = crate::passes::review_agent::format_diff;
+        let full_diff = format(&full, 40_000);
+        let since = format!("{}\n{}", since_review_note("ccc1234"), format(&fix, 40_000));
+        // Under a tenth of the full review's diff.
+        assert!(
+            since.len() * 10 < full_diff.len(),
+            "hunks-only {} vs full {}",
+            since.len(),
+            full_diff.len()
+        );
+    }
+
+    /// The reviewer uses all of it: its own pushes wait during the run's
+    /// loop, a push after a non-approving review is reviewed from that
+    /// review, and that review never approves without a full one.
+    #[test]
+    fn the_reviewer_wires_the_scopes_in() {
+        let src = include_str!("review_pr.rs");
+        assert!(src.contains("own_loop_hold(state, &github, &msg, &head_sha).await"));
+        assert!(src.contains("super::review_scope::reviewed_base("));
+        assert!(src.contains(
+            "super::review_scope::needs_full_before_approval(since_review.is_some(), verdict)"
+        ));
+        assert!(src.contains("full.full_review = true;"));
+        assert!(include_str!("resume.rs").contains("super::review_pr::review_on_handoff("));
     }
 }

@@ -160,9 +160,15 @@ const BETA_FALLBACK_DEFAULT: &str = "server-side-fallback-2026-07-01";
 /// with no minimum (the API default) every turn past the trigger cleared one
 /// old result near the START of the history and re-wrote nearly the whole
 /// context to the cache (1.25x input) instead of reading it (0.05x-0.1x).
-const CLEAR_AT_LEAST_TOKENS: u64 = 50_000;
+///
+/// Clears are rare and large: each one re-writes everything after the first
+/// cleared result (16% of all cache writes in measured implement loops came
+/// from clears at 120k), while a cleared token saves only a cache read (0.05x
+/// of input) on each later turn. A clear of 100k pays for itself within a few
+/// turns; one of 50k at 120k often never did.
+const CLEAR_AT_LEAST_TOKENS: u64 = 100_000;
 /// Input size at which old tool results start being cleared.
-const CLEAR_TRIGGER_TOKENS: u64 = 120_000;
+const CLEAR_TRIGGER_TOKENS: u64 = 200_000;
 /// Most recent tool results always kept.
 const CLEAR_KEEP_TOOL_USES: u64 = 4;
 
@@ -179,11 +185,68 @@ fn clear_tool_uses_edit() -> Value {
 }
 
 /// The top-level (automatic) breakpoint for a tool loop turn: only when
-/// another turn may read it back.
+/// another turn may read it back. Five minutes: turns follow each other
+/// within seconds, and a 1-hour entry may never come after a 5-minute one.
 fn tail_cache(another_turn_may_follow: bool) -> Option<CacheControl> {
-    another_turn_may_follow.then(|| CacheControl {
-        r#type: "ephemeral".to_string(),
-    })
+    another_turn_may_follow.then(CacheControl::five_minutes)
+}
+
+/// Where a system prompt's shared prefix ends. A caller that builds the
+/// same opening for every pass of a run (the coder's rules, the repository's
+/// and the team's instructions) puts this between it and what is particular
+/// to the pass. The marker never reaches the model: the prompt is sent as
+/// two blocks, the shared one cached for an hour, so a pass that starts
+/// after a CI wait (often longer than five minutes) reads it instead of
+/// writing it again (each pass wrote its own 30k-67k token opener).
+pub const SHARED_PREFIX_END: &str = "\u{1f}";
+
+/// The system blocks of a request: with [`SHARED_PREFIX_END`], the shared
+/// prefix (1-hour cache) and the rest (5-minute cache); without it, one
+/// block cached for five minutes, as before.
+fn system_blocks(system: &str) -> Vec<SystemBlock> {
+    match system.split_once(SHARED_PREFIX_END) {
+        Some((shared, rest)) => {
+            let rest = rest.replace(SHARED_PREFIX_END, "");
+            let mut blocks = vec![SystemBlock::Text {
+                text: shared.to_string(),
+                cache_control: Some(CacheControl::one_hour()),
+            }];
+            if !rest.trim().is_empty() {
+                blocks.push(SystemBlock::Text {
+                    text: rest,
+                    cache_control: Some(CacheControl::five_minutes()),
+                });
+            }
+            blocks
+        }
+        None => vec![SystemBlock::Text {
+            text: system.to_string(),
+            cache_control: Some(CacheControl::five_minutes()),
+        }],
+    }
+}
+
+/// The tool definitions of a tool loop, the breakpoint on the last one. It
+/// is cached for an hour when the system prompt has a shared prefix (tools
+/// render before the system prompt, so the shared prefix is tools plus that
+/// block), else for five minutes.
+fn api_tools(tools: &[ToolDefinition], shared_prefix: bool) -> Vec<ApiTool> {
+    tools
+        .iter()
+        .enumerate()
+        .map(|(i, t)| ApiTool {
+            name: t.name.clone(),
+            description: t.description.clone(),
+            input_schema: t.input_schema.clone(),
+            cache_control: (i == tools.len() - 1).then(|| {
+                if shared_prefix {
+                    CacheControl::one_hour()
+                } else {
+                    CacheControl::five_minutes()
+                }
+            }),
+        })
+        .collect()
 }
 
 /// Fill the model-family fields of a request. `effort` None → "high".
@@ -234,6 +297,26 @@ enum SystemBlock {
 #[derive(Serialize, Clone)]
 struct CacheControl {
     r#type: String,
+    /// `"1h"` for the 1-hour cache (written at 2x input instead of 1.25x);
+    /// absent for the default five minutes.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ttl: Option<String>,
+}
+
+impl CacheControl {
+    fn five_minutes() -> Self {
+        CacheControl {
+            r#type: "ephemeral".to_string(),
+            ttl: None,
+        }
+    }
+
+    fn one_hour() -> Self {
+        CacheControl {
+            r#type: "ephemeral".to_string(),
+            ttl: Some("1h".to_string()),
+        }
+    }
 }
 
 #[derive(Serialize, Clone)]
@@ -352,9 +435,7 @@ pub async fn converse_simple(
         max_tokens: 16384,
         system: vec![SystemBlock::Text {
             text: system.to_string(),
-            cache_control: Some(CacheControl {
-                r#type: "ephemeral".to_string(),
-            }),
+            cache_control: Some(CacheControl::five_minutes()),
         }],
         messages: vec![ApiMessage {
             role: "user".to_string(),
@@ -542,9 +623,7 @@ fn json_request(
         max_tokens,
         system: vec![SystemBlock::Text {
             text: system,
-            cache_control: Some(CacheControl {
-                r#type: "ephemeral".to_string(),
-            }),
+            cache_control: Some(CacheControl::five_minutes()),
         }],
         messages: vec![ApiMessage {
             role: "user".to_string(),
@@ -632,23 +711,9 @@ pub async fn converse_tool_loop(
     mut conversation_log: Option<&mut Vec<Value>>,
 ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
     let family = ModelFamily::of(model_id);
-    let api_tools: Vec<ApiTool> = tools
-        .iter()
-        .enumerate()
-        .map(|(i, t)| ApiTool {
-            name: t.name.clone(),
-            description: t.description.clone(),
-            input_schema: t.input_schema.clone(),
-            // Cache breakpoint on the last tool — caches system + all tool defs
-            cache_control: if i == tools.len() - 1 {
-                Some(CacheControl {
-                    r#type: "ephemeral".to_string(),
-                })
-            } else {
-                None
-            },
-        })
-        .collect();
+    // Cache breakpoint on the last tool: caches the tool definitions, which
+    // render before the system prompt.
+    let api_tools = api_tools(tools, system_prompt.contains(SHARED_PREFIX_END));
 
     let mut turns: usize = 0;
     let mut deadline_warned = false;
@@ -718,45 +783,15 @@ pub async fn converse_tool_loop(
             ));
         }
 
-        // Build API messages from our internal format
-        let api_messages: Vec<ApiMessage> = messages
-            .iter()
-            .map(|(role, content)| ApiMessage {
-                role: role.clone(),
-                content: content.clone(),
-            })
-            .collect();
-
-        let mut request = MessagesRequest {
-            model: model_id.to_string(),
+        let request = tool_loop_request(
+            model_id,
             max_tokens,
-            system: vec![SystemBlock::Text {
-                text: system_prompt.to_string(),
-                cache_control: Some(CacheControl {
-                    r#type: "ephemeral".to_string(),
-                }),
-            }],
-            messages: api_messages,
-            tools: if api_tools.is_empty() {
-                None
-            } else {
-                Some(api_tools.clone())
-            },
-            // Auto-cache: caches the entire prefix (tools + system + messages)
-            // up to the last cacheable block, so turn N+1 reads turns 1..N.
-            // Only when a turn N+1 can follow: on a call that is the last
-            // (no tools, or the answer-now turn) the tail would be written
-            // at 1.25x input and never read. The system and tool breakpoints
-            // still cache what other calls share.
-            cache_control: tail_cache(!api_tools.is_empty() && !answer_now),
-            thinking: None,
-            output_config: None,
-            context_management: None,
-            fallbacks: None,
-            tool_choice: answer_now.then(|| json!({"type": "none"})),
-            temperature: None,
-        };
-        apply_model_family(&mut request, effort, true);
+            system_prompt,
+            messages,
+            &api_tools,
+            answer_now,
+            effort,
+        );
 
         let response = send_request(client, &request, usage).await?;
 
@@ -949,6 +984,85 @@ pub async fn converse_tool_loop(
 
         messages.push(("user".to_string(), tool_results));
     }
+}
+
+/// One turn's request of the tool loop. Rendered in the order tools,
+/// system, messages: the tools and the system prompt's shared prefix are the
+/// same bytes on every turn and every pass that shares them; what changes
+/// (the conversation) comes after the last of their breakpoints. History is
+/// only ever appended to here.
+fn tool_loop_request(
+    model_id: &str,
+    max_tokens: i32,
+    system_prompt: &str,
+    messages: &[(String, Vec<Value>)],
+    api_tools: &[ApiTool],
+    answer_now: bool,
+    effort: Option<&str>,
+) -> MessagesRequest {
+    let api_messages: Vec<ApiMessage> = messages
+        .iter()
+        .map(|(role, content)| ApiMessage {
+            role: role.clone(),
+            content: content.clone(),
+        })
+        .collect();
+    let mut request = MessagesRequest {
+        model: model_id.to_string(),
+        max_tokens,
+        system: system_blocks(system_prompt),
+        messages: api_messages,
+        tools: if api_tools.is_empty() {
+            None
+        } else {
+            Some(api_tools.to_vec())
+        },
+        // Auto-cache: caches the entire prefix (tools + system + messages)
+        // up to the last cacheable block, so turn N+1 reads turns 1..N.
+        // Only when a turn N+1 can follow: on a call that is the last
+        // (no tools, or the answer-now turn) the tail would be written
+        // at 1.25x input and never read. The system and tool breakpoints
+        // still cache what other calls share.
+        cache_control: tail_cache(!api_tools.is_empty() && !answer_now),
+        thinking: None,
+        output_config: None,
+        context_management: None,
+        fallbacks: None,
+        tool_choice: answer_now.then(|| json!({"type": "none"})),
+        temperature: None,
+    };
+    apply_model_family(&mut request, effort, true);
+    request
+}
+
+/// The serialized bytes of a tool loop request's shared prefix: the tool
+/// definitions and the system prompt's first block. Two passes that share
+/// a prefix send these identically.
+#[cfg(test)]
+pub(crate) fn shared_prefix_bytes(
+    model_id: &str,
+    system_prompt: &str,
+    first_user_message: &str,
+    tools: &[ToolDefinition],
+) -> (String, String) {
+    let messages = vec![(
+        "user".to_string(),
+        vec![json!({"type": "text", "text": first_user_message})],
+    )];
+    let request = tool_loop_request(
+        model_id,
+        16384,
+        system_prompt,
+        &messages,
+        &api_tools(tools, system_prompt.contains(SHARED_PREFIX_END)),
+        false,
+        None,
+    );
+    let v = serde_json::to_value(&request).expect("a request serializes");
+    (
+        serde_json::to_string(&v["tools"]).unwrap(),
+        serde_json::to_string(&v["system"][0]).unwrap(),
+    )
 }
 
 // --- Internal helpers ---
@@ -1831,5 +1945,122 @@ mod accounting_tests {
         assert_eq!(b.len(), 1);
         assert!(b[0].get("cache_control").is_none(), "{}", b[0]);
         assert_eq!(b[0]["system"][0]["cache_control"]["type"], "ephemeral");
+    }
+}
+
+#[cfg(test)]
+mod shared_prefix_tests {
+    use super::*;
+
+    fn tool(name: &str) -> ToolDefinition {
+        ToolDefinition {
+            name: name.into(),
+            description: format!("{name} a file"),
+            input_schema: json!({"type": "object", "properties": {"path": {"type": "string"}}}),
+        }
+    }
+
+    /// Every pass of a run (first implement, a review fix, a CI fix) opens
+    /// with the same tools and the same coder prompt; only the pass's own
+    /// sections and its first message differ. The bytes up to the shared
+    /// prefix's breakpoint must be identical, or each pass writes its
+    /// opener to the cache again.
+    #[test]
+    fn the_shared_prefix_is_the_same_bytes_in_every_pass() {
+        let core = crate::passes::implement::coder_system(
+            "acme",
+            "shop",
+            "## Rules\n- Keep handlers small",
+            "Use the acme style guide.",
+            "",
+        );
+        let tools = vec![tool("read_file"), tool("write_file"), tool("run_checks")];
+        let first = format!("{core}{SHARED_PREFIX_END}\n## Web\nhosts: shop.acme.test");
+        let fix = format!("{core}{SHARED_PREFIX_END}\n## Web\nhosts: api.acme.test");
+        let a = shared_prefix_bytes("claude-opus-5-5", &first, "Implement the plan.", &tools);
+        let b = shared_prefix_bytes(
+            "claude-opus-5-5",
+            &fix,
+            "Fix the review findings: the cursor skips rows.",
+            &tools,
+        );
+        assert_eq!(a, b);
+        // The marker never reaches the model.
+        assert!(!a.1.contains(SHARED_PREFIX_END));
+    }
+
+    #[test]
+    fn the_shared_prefix_is_cached_for_an_hour_and_the_rest_for_five_minutes() {
+        let tools = vec![tool("read_file"), tool("write_file")];
+        let system = format!("core rules{SHARED_PREFIX_END}pass sections");
+        let messages = vec![(
+            "user".to_string(),
+            vec![json!({"type": "text", "text": "go"})],
+        )];
+        let r = tool_loop_request(
+            "claude-opus-5-5",
+            1024,
+            &system,
+            &messages,
+            &api_tools(&tools, true),
+            false,
+            None,
+        );
+        let v = serde_json::to_value(&r).unwrap();
+        // Tools render first, then the system blocks, then the messages:
+        // 1-hour entries come before every 5-minute one.
+        assert!(v["tools"][0].get("cache_control").is_none());
+        assert_eq!(
+            v["tools"][1]["cache_control"],
+            json!({"type": "ephemeral", "ttl": "1h"})
+        );
+        assert_eq!(v["system"][0]["text"], "core rules");
+        assert_eq!(
+            v["system"][0]["cache_control"],
+            json!({"type": "ephemeral", "ttl": "1h"})
+        );
+        assert_eq!(v["system"][1]["text"], "pass sections");
+        assert_eq!(
+            v["system"][1]["cache_control"],
+            json!({"type": "ephemeral"})
+        );
+        assert_eq!(v["cache_control"], json!({"type": "ephemeral"}));
+        // At most four breakpoints.
+        let s = v.to_string();
+        assert!(s.matches("\"cache_control\"").count() <= 4);
+
+        // A caller without a shared prefix keeps one five-minute block.
+        let plain = tool_loop_request(
+            "claude-opus-5-5",
+            1024,
+            "one prompt",
+            &messages,
+            &api_tools(&tools, false),
+            false,
+            None,
+        );
+        let v = serde_json::to_value(&plain).unwrap();
+        assert_eq!(v["system"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            v["system"][0]["cache_control"],
+            json!({"type": "ephemeral"})
+        );
+        assert_eq!(v["tools"][1]["cache_control"], json!({"type": "ephemeral"}));
+    }
+
+    #[test]
+    fn server_side_clearing_is_rare_and_large() {
+        let edit = clear_tool_uses_edit();
+        let e = &edit["edits"][0];
+        assert_eq!(e["trigger"]["value"], 200_000);
+        assert_eq!(e["clear_at_least"]["value"], 100_000);
+    }
+
+    #[test]
+    fn the_coder_marks_its_shared_prefix() {
+        let src = include_str!("../passes/implement.rs");
+        assert!(src.contains(
+            "let mut full_system = format!(\"{system}{}\", crate::agent::anthropic::SHARED_PREFIX_END);"
+        ));
     }
 }

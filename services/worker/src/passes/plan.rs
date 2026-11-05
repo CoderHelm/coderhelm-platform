@@ -1155,8 +1155,11 @@ Then the ```fix_location.json block described above."#,
                     "user".to_string(),
                     vec![serde_json::json!({"type": "text", "text": revision_prompt(&advice)})],
                 ));
+                // The revision answers the advice; it doesn't plan again
+                // from scratch, so it runs at the plan review's low effort.
                 let one_turn = llm::ConverseOptions {
                     max_turns: 1,
+                    effort: Some(super::skills::review_effort("plan")),
                     ..plan_opts
                 };
                 match provider::converse(

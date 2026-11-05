@@ -17,10 +17,14 @@
 //!   and the next review of the new head resolves the threads the commit
 //!   settled and rewrites the section, or removes it when nothing is left.
 //! - It goes on while the rounds make progress (fewer open findings, or a
-//!   round that pushed changes). Two rounds in a row without progress stop
-//!   it ([`next`]), with the progress rule ticket runs use between steps:
-//!   the findings stay listed, the PR stays a draft, and the run waits on a
-//!   person (`needs_input`).
+//!   round that pushed changes), for at most [`MAX_FIX_ROUNDS`] rounds. Two
+//!   rounds in a row without progress, or the cap, stop it ([`next`]): the
+//!   findings stay listed, the PR stays a draft, and the run waits on a
+//!   person (`needs_input`). Uncapped, two runs spent $29 in 17 rounds
+//!   where the count of open findings went down by one and back up.
+//! - Each round is told what the rounds before it found and looked up
+//!   ([`round_note`], [`fix_feedback`]), so it doesn't repeat the same
+//!   database and live-data lookups from scratch.
 //!
 //! People's PRs are unchanged: the findings are posted for the author.
 
@@ -56,6 +60,28 @@ pub fn required(findings: &[Finding], held_late: &[Finding]) -> Vec<String> {
         .chain(held_late.iter())
         .map(line)
         .collect()
+}
+
+/// One line for an earlier review thread still open: its title (the first
+/// line of the comment, without markdown emphasis) and where it is, as
+/// [`required`] writes a finding.
+pub fn thread_line(path: &str, line: u64, body: &str) -> String {
+    let title = body
+        .lines()
+        .map(|l| {
+            l.trim()
+                .trim_matches(|c| c == '*' || c == '#' || c == '_')
+                .trim()
+        })
+        .find(|l| !l.is_empty())
+        .unwrap_or("Earlier finding");
+    let title = title.split_whitespace().collect::<Vec<_>>().join(" ");
+    let title = common::truncate_str(&title, 160);
+    if line > 0 {
+        format!("{title} (`{path}:{line}`)")
+    } else {
+        format!("{title} (`{path}`)")
+    }
 }
 
 /// The description section listing them. Empty when nothing is open (the
@@ -99,6 +125,10 @@ pub fn hold(body: &str) -> Option<String> {
     })
 }
 
+/// Fix rounds a run takes on its own review's findings before it hands the
+/// PR to a person with the findings still listed.
+pub const MAX_FIX_ROUNDS: u32 = 2;
+
 /// What follows a review of CoderHelm's own PR.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Next {
@@ -106,18 +136,28 @@ pub enum Next {
     Ready,
     /// Another fix round, with this many rounds without progress before it.
     Fix { stalled: u32 },
-    /// Two rounds in a row made no progress: the run stops, the findings
-    /// stay listed and the PR stays a draft.
+    /// Two rounds in a row made no progress, or [`MAX_FIX_ROUNDS`] rounds
+    /// ran: the run stops, the findings stay listed and the PR stays a
+    /// draft.
     Stop(String),
 }
 
 /// What follows. `before`: the findings open at the previous review of
 /// this run (`None` at the first); `after`: those open now;
 /// `pushed_files`: what the last fix round changed; `stalled`: rounds
-/// without progress so far.
-pub fn next(before: Option<usize>, after: &[String], pushed_files: usize, stalled: u32) -> Next {
+/// without progress so far; `rounds`: fix rounds this run already took.
+pub fn next(
+    before: Option<usize>,
+    after: &[String],
+    pushed_files: usize,
+    stalled: u32,
+    rounds: u32,
+) -> Next {
     if after.is_empty() {
         return Next::Ready;
+    }
+    if rounds >= MAX_FIX_ROUNDS {
+        return Next::Stop(cap_reason(after));
     }
     let progress = before.is_none_or(|b| after.len() < b) || pushed_files > 0;
     if progress {
@@ -142,15 +182,90 @@ pub fn stop_reason(items: &[String]) -> String {
     )
 }
 
-/// What a fix round is told: every open finding, fixed now.
-pub fn fix_feedback(items: &[String], review_body: &str) -> String {
+/// Why the fix rounds stopped at the cap, with the findings still open.
+pub fn cap_reason(items: &[String]) -> String {
+    let list: Vec<String> = items.iter().map(|i| format!("- [ ] {i}")).collect();
+    format!(
+        "Handed to a person: CoderHelm took {MAX_FIX_ROUNDS} fix rounds on its own review's \
+         findings and these are still open:\n{}\nThe pull request stays a draft with them listed \
+         under \"Open review findings\". Fix them, or say on the pull request why one doesn't \
+         apply, then mark it ready.",
+        list.join("\n")
+    )
+}
+
+/// What a fix round is told: every open finding, fixed now, and what the
+/// earlier rounds of this run found and looked up (`earlier`, from
+/// [`round_note`]; empty on the first round).
+pub fn fix_feedback(items: &[String], review_body: &str, earlier: &str) -> String {
     let todo: Vec<String> = items.iter().map(|i| format!("- [ ] {i}")).collect();
+    let earlier = earlier.trim();
+    let carried = if earlier.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "\n\n## Earlier fix rounds on this pull request\nWhat the rounds before this one \
+             were asked to fix and what their lookups already returned. Build on it: don't run \
+             a lookup again unless its answer may have changed.\n\n{earlier}"
+        )
+    };
     format!(
         "CoderHelm's own review of this pull request found the issues below. Fix every one \
          now on this branch; none of them is optional. Where a finding can't be fixed in the \
-         code, say why in the pull request description.\n\n{}\n\nThe review:\n\n{review_body}",
+         code, say why in the pull request description.\n\n{}\n\nThe review:\n\n{review_body}{carried}",
         todo.join("\n")
     )
+}
+
+/// The most a run carries from its earlier rounds, in bytes.
+pub const MAX_CARRIED_BYTES: usize = 12_000;
+
+/// One fix round's record for the rounds after it: the findings it was
+/// given, each lookup it made with what came back, and the coder's own
+/// closing account. Appended to `earlier` and kept to the newest
+/// [`MAX_CARRIED_BYTES`].
+pub fn round_note(
+    earlier: &str,
+    round: u32,
+    items: &[String],
+    lookups: &[super::proof::Lookup],
+    notes: &str,
+) -> String {
+    let mut out = format!("### Round {round}\nAsked to fix:\n");
+    for i in items {
+        out.push_str(&format!("- {i}\n"));
+    }
+    if !lookups.is_empty() {
+        out.push_str("Lookups and what came back:\n");
+        for l in lookups {
+            out.push_str(&format!("{}\n", l.line.trim()));
+        }
+    }
+    let notes = notes.trim();
+    if !notes.is_empty() {
+        out.push_str(&format!(
+            "The round's own account:\n{}\n",
+            common::truncate_str(notes, 2_000)
+        ));
+    }
+    let all = if earlier.trim().is_empty() {
+        out
+    } else {
+        format!("{}\n\n{out}", earlier.trim())
+    };
+    if all.len() <= MAX_CARRIED_BYTES {
+        return all;
+    }
+    // Keep the newest: drop from the front at a line boundary.
+    let mut cut = all.len() - MAX_CARRIED_BYTES;
+    while !all.is_char_boundary(cut) {
+        cut += 1;
+    }
+    let tail = &all[cut..];
+    match tail.find('\n') {
+        Some(i) => tail[i + 1..].to_string(),
+        None => tail.to_string(),
+    }
 }
 
 #[cfg(test)]
@@ -209,17 +324,91 @@ mod tests {
     #[test]
     fn rounds_go_on_while_they_make_progress_and_stop_after_two_without() {
         let two = vec!["a".to_string(), "b".to_string()];
-        assert_eq!(next(Some(2), &[], 0, 1), Next::Ready);
-        assert_eq!(next(None, &two, 0, 0), Next::Fix { stalled: 0 });
-        assert_eq!(next(Some(3), &two, 0, 1), Next::Fix { stalled: 0 });
-        assert_eq!(next(Some(2), &two, 4, 1), Next::Fix { stalled: 0 });
-        assert_eq!(next(Some(2), &two, 0, 0), Next::Fix { stalled: 1 });
-        match next(Some(2), &two, 0, 1) {
+        assert_eq!(next(Some(2), &[], 0, 1, 1), Next::Ready);
+        assert_eq!(next(None, &two, 0, 0, 0), Next::Fix { stalled: 0 });
+        assert_eq!(next(Some(3), &two, 0, 1, 1), Next::Fix { stalled: 0 });
+        assert_eq!(next(Some(2), &two, 4, 1, 1), Next::Fix { stalled: 0 });
+        assert_eq!(next(Some(2), &two, 0, 0, 1), Next::Fix { stalled: 1 });
+        match next(Some(2), &two, 0, 1, 1) {
             Next::Stop(why) => {
                 assert!(why.contains("- a\n- b"));
                 assert!(why.contains("stays a draft"));
             }
             other => panic!("{other:?}"),
         }
+    }
+
+    #[test]
+    fn two_fix_rounds_at_most_then_a_person() {
+        let open = vec!["a (`x.rs:1`)".to_string(), "b (`y.rs:2`)".to_string()];
+        // Progress every round still stops at the cap: one fewer open each
+        // time, or a round that pushed changes.
+        assert_eq!(next(Some(3), &open, 2, 0, 1), Next::Fix { stalled: 0 });
+        match next(Some(3), &open, 2, 0, MAX_FIX_ROUNDS) {
+            Next::Stop(why) => {
+                assert!(why.contains("2 fix rounds"));
+                assert!(why.contains("- [ ] a (`x.rs:1`)\n- [ ] b (`y.rs:2`)"));
+                assert!(why.contains("stays a draft"));
+            }
+            other => panic!("{other:?}"),
+        }
+        // Nothing open is ready whatever the count.
+        assert_eq!(next(Some(1), &[], 0, 0, 9), Next::Ready);
+    }
+
+    #[test]
+    fn each_round_carries_what_the_earlier_rounds_found_and_looked_up() {
+        use crate::passes::proof::{Lookup, LookupOutcome};
+        let lookups = vec![Lookup::new(
+            "L1".into(),
+            "warehouse",
+            LookupOutcome::Answered,
+            "select count(*) from orders where status = 'open'",
+            "412",
+        )];
+        let first = round_note(
+            "",
+            1,
+            &["Watermark skips rows (`a.rs:3`)".into()],
+            &lookups,
+            "Fixed the cursor.",
+        );
+        assert!(first.starts_with("### Round 1\nAsked to fix:\n- Watermark skips rows"));
+        assert!(first.contains("[L1]") && first.contains("412"));
+        assert!(first.contains("Fixed the cursor."));
+        let second = round_note(&first, 2, &["Late bug (`b.rs`)".into()], &[], "");
+        assert!(second.starts_with("### Round 1"));
+        assert!(second.contains("### Round 2\nAsked to fix:\n- Late bug"));
+        // The fix round's prompt carries them, after the review.
+        let fb = fix_feedback(&["Late bug (`b.rs`)".into()], "review body", &second);
+        let review_at = fb.find("review body").unwrap();
+        let carried_at = fb.find("## Earlier fix rounds").unwrap();
+        assert!(review_at < carried_at);
+        assert!(fb.contains("don't run a lookup again"));
+        // Nothing carried on the first round.
+        assert!(!fix_feedback(&["x".into()], "r", "").contains("Earlier fix rounds"));
+        // Bounded: the newest rounds are kept.
+        let mut big = String::new();
+        for r in 1..200 {
+            big = round_note(
+                &big,
+                r,
+                &["same finding (`a.rs:1`)".into()],
+                &lookups,
+                "notes",
+            );
+        }
+        assert!(big.len() <= MAX_CARRIED_BYTES);
+        assert!(big.contains("### Round 199"));
+        assert!(!big.contains("### Round 1\n"));
+    }
+
+    #[test]
+    fn an_open_earlier_thread_is_listed_like_a_finding() {
+        assert_eq!(
+            thread_line("src/a.rs", 3, "**Watermark skips rows**\n\nThe cursor..."),
+            "Watermark skips rows (`src/a.rs:3`)"
+        );
+        assert_eq!(thread_line("b.rs", 0, ""), "Earlier finding (`b.rs`)");
     }
 }

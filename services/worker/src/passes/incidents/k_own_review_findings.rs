@@ -11,8 +11,9 @@
 //! the merge armed. The review lists them at the top of the description and
 //! requests changes; the run takes them in review-fix rounds; the next
 //! review resolves the threads the new commit settled. It goes on while the
-//! rounds make progress, and two rounds without progress stop it with the
-//! PR still a draft, the findings listed, and the run `needs_input`. A
+//! rounds make progress, for at most two fix rounds; two rounds without
+//! progress, or the cap, stop it with the PR still a draft, the findings
+//! listed, and the run `needs_input`. A
 //! verdict is never APPROVE while a finding holds the merge.
 
 use super::fixture::*;
@@ -121,20 +122,21 @@ fn the_run_fixes_them_in_rounds_and_stops_after_two_without_progress() {
     let resume = include_str!("../resume.rs");
     // A review with open own findings fails the run's review: a fix round
     // follows, never ready_or_prove.
-    assert!(resume.contains("own_review::fix_feedback(&rr.open_findings"));
+    assert!(resume.contains("own_review::fix_feedback(\n"));
+    assert!(resume.contains("&rr.open_findings,"));
     let open = vec!["A (`a.py:1`)".to_string(), "B (`b.py:2`)".to_string()];
     let mut end = Ending::default();
     // Round 1 fixed one of three: progress, another round.
     assert_eq!(
-        own_review::next(Some(3), &open, 0, 0),
+        own_review::next(Some(3), &open, 0, 0, 0),
         Next::Fix { stalled: 0 }
     );
     // Two rounds in a row with the same two open: stop.
     assert_eq!(
-        own_review::next(Some(2), &open, 0, 0),
+        own_review::next(Some(2), &open, 0, 0, 1),
         Next::Fix { stalled: 1 }
     );
-    match own_review::next(Some(2), &open, 0, 1) {
+    match own_review::next(Some(2), &open, 0, 1, 1) {
         Next::Stop(reason) => {
             end.status = common::run_status::NEEDS_INPUT.into();
             end.draft = true;
@@ -147,6 +149,6 @@ fn the_run_fixes_them_in_rounds_and_stops_after_two_without_progress() {
     assert!(end.says("- A (`a.py:1`)"));
     assert!(end.says("stays a draft"));
     // Nothing open: ready.
-    assert_eq!(own_review::next(Some(2), &[], 1, 1), Next::Ready);
+    assert_eq!(own_review::next(Some(2), &[], 1, 1, 2), Next::Ready);
     end.never_says(OLD);
 }

@@ -1463,6 +1463,165 @@ async fn load_runs(state: &AppState, team: &str, w: Window) -> Result<Vec<RunRow
     Ok(out)
 }
 
+// ── Metered cost ───────────────────────────────────────────────────────────
+
+/// One day of the per-call usage meter (`common::usage`, its `DAY#` items):
+/// every model call the team made that day, whatever it was for (runs,
+/// reviews, follow-ups, chat), on the day the call was made. Run records
+/// carry what each run spent, counted on the day the run started, and leave
+/// out reviews, so their sum is not what the team spent (one day showed
+/// $78 from run records against $168 metered).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct MeteredDay {
+    /// `YYYY-MM-DD` (UTC).
+    pub day: String,
+    pub cost_usd: f64,
+    /// All four token kinds.
+    pub tokens: f64,
+    /// Cost by what the calls were for (`review`, `run`, `feedback`, ...).
+    pub features: BTreeMap<String, f64>,
+}
+
+impl MeteredDay {
+    fn from_item(i: &Item) -> Option<MeteredDay> {
+        let day = s(i, "period").strip_prefix("DAY#")?.to_string();
+        let mut features = BTreeMap::new();
+        for k in i.keys() {
+            if let Some(f) = k
+                .strip_prefix("feature#")
+                .and_then(|r| r.strip_suffix("#cost_usd"))
+            {
+                features.insert(f.to_string(), n(i, k));
+            }
+        }
+        Some(MeteredDay {
+            day,
+            cost_usd: n(i, "total_cost_usd"),
+            tokens: n(i, "total_tokens"),
+            features,
+        })
+    }
+}
+
+/// The meter's days in `w` (UTC dates from its start to its end).
+async fn load_metered(state: &AppState, team: &str, w: Window) -> Vec<MeteredDay> {
+    if state.config.analytics_table_name.is_empty() {
+        return Vec::new();
+    }
+    let lo = format!("DAY#{}", w.start.format("%Y-%m-%d"));
+    let hi = format!("DAY#{}", w.end.format("%Y-%m-%d"));
+    let mut out = Vec::new();
+    let mut start: Option<Item> = None;
+    for _ in 0..MAX_PAGES {
+        let resp = match state
+            .dynamo
+            .query()
+            .table_name(&state.config.analytics_table_name)
+            .key_condition_expression("team_id = :t AND period BETWEEN :lo AND :hi")
+            .expression_attribute_values(":t", av(team))
+            .expression_attribute_values(":lo", av(&lo))
+            .expression_attribute_values(":hi", av(&hi))
+            .set_exclusive_start_key(start.take())
+            .send()
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                warn!(error = %e, "Analytics: metered usage");
+                return out;
+            }
+        };
+        out.extend(resp.items().iter().filter_map(MeteredDay::from_item));
+        match resp.last_evaluated_key() {
+            Some(k) => start = Some(k.clone()),
+            None => break,
+        }
+    }
+    out
+}
+
+/// The UTC days a window covers, as the daily series keys them.
+fn window_days(w: Window) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut d = w.start;
+    while d < w.end {
+        out.push(d.format("%Y-%m-%d").to_string());
+        d += Duration::days(1);
+    }
+    out
+}
+
+/// Puts the metered cost on the page: each period's `cost_usd` is what the
+/// meter counted (runs, reviews of people's and CoderHelm's PRs, follow-ups,
+/// everything, including work on runs started before the period), with
+/// `cost_by_feature` saying what it was for. What the run records add up to
+/// stays as `run_cost_usd`, and the cost per run and per merged PR stay on
+/// it. Each day's `tokens` is likewise the metered total (`run_tokens` the
+/// run records'). `cost_basis` says which one `cost_usd` is: `metered`, or `runs` when
+/// one repository is picked (the meter isn't kept per repository) or the
+/// meter has nothing for the period.
+pub fn apply_metered(
+    out: &mut Value,
+    metered: &[MeteredDay],
+    window: Window,
+    prev: Window,
+    repo: Option<&str>,
+) {
+    let by_day: HashMap<&str, &MeteredDay> = metered.iter().map(|m| (m.day.as_str(), m)).collect();
+    let period = |w: Window| -> Option<(f64, BTreeMap<String, f64>)> {
+        let days: Vec<&MeteredDay> = window_days(w)
+            .iter()
+            .filter_map(|d| by_day.get(d.as_str()).copied())
+            .collect();
+        if days.is_empty() {
+            return None;
+        }
+        let mut features: BTreeMap<String, f64> = BTreeMap::new();
+        for d in &days {
+            for (f, c) in &d.features {
+                *features.entry(f.clone()).or_default() += c;
+            }
+        }
+        Some((days.iter().map(|d| d.cost_usd).sum(), features))
+    };
+    for (key, w) in [("summary", window), ("previous", prev)] {
+        let s = &mut out[key];
+        let runs = s["cost_usd"].as_f64().unwrap_or(0.0);
+        s["run_cost_usd"] = json!(round2(runs));
+        match period(w).filter(|_| repo.is_none()) {
+            Some((total, features)) => {
+                let mut list: Vec<(String, f64)> = features.into_iter().collect();
+                list.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+                s["cost_usd"] = json!(round2(total));
+                s["cost_basis"] = json!("metered");
+                s["cost_by_feature"] = json!(list
+                    .into_iter()
+                    .filter(|(_, c)| *c > 0.0)
+                    .map(|(feature, c)| json!({"feature": feature, "cost_usd": round2(c)}))
+                    .collect::<Vec<_>>());
+            }
+            None => {
+                s["cost_basis"] = json!("runs");
+                s["cost_by_feature"] = json!([]);
+            }
+        }
+    }
+    let metered_days = out["summary"]["cost_basis"] == "metered";
+    if let Some(days) = out["daily"].as_array_mut() {
+        for d in days {
+            let runs = d["cost_usd"].as_f64().unwrap_or(0.0);
+            d["run_cost_usd"] = json!(round2(runs));
+            d["run_tokens"] = d["tokens"].clone();
+            if metered_days {
+                let day = d["day"].as_str().unwrap_or("");
+                let m = by_day.get(day);
+                d["cost_usd"] = json!(round2(m.map_or(0.0, |m| m.cost_usd)));
+                d["tokens"] = json!(m.map_or(0.0, |m| m.tokens));
+            }
+        }
+    }
+}
+
 /// Every item in the settings table under `team` with `lo <= sk <= hi`.
 async fn load_settings_range(
     state: &AppState,
@@ -1887,7 +2046,7 @@ pub async fn get_analytics(
             .ok()
             .and_then(|r| r.item().map(|i| s(i, "since")))
     };
-    let (runs, reviews, lookups, traces, known, deploys, backfilled) = tokio::join!(
+    let (runs, reviews, lookups, traces, known, deploys, backfilled, metered) = tokio::join!(
         load_runs(&state, &team, whole),
         load_settings_range(&state, &team, &stat_lo, &stat_hi),
         load_settings_range(&state, &team, &log_lo, &log_hi),
@@ -1895,6 +2054,7 @@ pub async fn get_analytics(
         load_known(&state, &team),
         load_settings_range(&state, &team, &dep_lo, &dep_hi),
         backfill_marker,
+        load_metered(&state, &team, whole),
     );
     if backfilled.is_none() && claims.support_view.is_none() {
         ask_for_deploy_backfill(&state, &team).await;
@@ -1933,6 +2093,7 @@ pub async fn get_analytics(
         &known,
         repo,
     );
+    apply_metered(&mut out, &metered, window, prev, repo);
     let since = deploys_since(backfilled.as_deref(), &deploys);
     add_deploys(
         &mut out["comparison"],
@@ -1955,6 +2116,118 @@ pub async fn get_analytics(
         "days"
     });
     Ok(Json(out))
+}
+
+#[cfg(test)]
+mod metered_tests {
+    use super::*;
+
+    fn day(day: &str, cost: f64, features: &[(&str, f64)]) -> MeteredDay {
+        MeteredDay {
+            day: day.into(),
+            cost_usd: cost,
+            tokens: cost * 1000.0,
+            features: features.iter().map(|(f, c)| (f.to_string(), *c)).collect(),
+        }
+    }
+
+    fn page() -> (Value, Window, Window) {
+        let end = Utc.with_ymd_and_hms(2026, 10, 31, 0, 0, 0).unwrap();
+        let (w, p) = Window::last_days(end, 2);
+        let out = json!({
+            "summary": {"cost_usd": 78.08},
+            "previous": {"cost_usd": 10.0},
+            "daily": [
+                {"day": "2026-10-29", "cost_usd": 78.08, "tokens": 5.0},
+                {"day": "2026-10-30", "cost_usd": 0.0, "tokens": 0.0},
+            ],
+        });
+        (out, w, p)
+    }
+
+    /// The day a dashboard showed $78 (the run records of runs started that
+    /// day) metered $168: run work on older runs and reviews included.
+    #[test]
+    fn the_cost_shown_is_the_metered_total_not_the_run_records() {
+        let (mut out, w, p) = page();
+        let metered = vec![
+            day(
+                "2026-10-29",
+                168.48,
+                &[
+                    ("run", 126.20),
+                    ("review", 35.65),
+                    ("feedback", 3.90),
+                    ("other", 2.73),
+                ],
+            ),
+            day("2026-10-30", 20.0, &[("review", 20.0)]),
+            day("2026-10-27", 5.0, &[("run", 5.0)]),
+        ];
+        apply_metered(&mut out, &metered, w, p, None);
+        assert_eq!(out["summary"]["cost_usd"], json!(188.48));
+        assert_eq!(out["summary"]["run_cost_usd"], json!(78.08));
+        assert_eq!(out["summary"]["cost_basis"], "metered");
+        assert_eq!(
+            out["summary"]["cost_by_feature"],
+            json!([
+                {"feature": "run", "cost_usd": 126.2},
+                {"feature": "review", "cost_usd": 55.65},
+                {"feature": "feedback", "cost_usd": 3.9},
+                {"feature": "other", "cost_usd": 2.73},
+            ])
+        );
+        assert_eq!(
+            out["daily"],
+            json!([
+                {"day": "2026-10-29", "cost_usd": 168.48, "run_cost_usd": 78.08, "tokens": 168480.0, "run_tokens": 5.0},
+                {"day": "2026-10-30", "cost_usd": 20.0, "run_cost_usd": 0.0, "tokens": 20000.0, "run_tokens": 0.0},
+            ])
+        );
+        assert_eq!(out["previous"]["cost_usd"], json!(5.0));
+        assert_eq!(out["previous"]["cost_basis"], "metered");
+    }
+
+    #[test]
+    fn one_repository_or_no_meter_keeps_the_run_records() {
+        let (mut out, w, p) = page();
+        apply_metered(
+            &mut out,
+            &[day("2026-10-29", 168.48, &[])],
+            w,
+            p,
+            Some("acme/shop"),
+        );
+        assert_eq!(out["summary"]["cost_usd"], json!(78.08));
+        assert_eq!(out["summary"]["cost_basis"], "runs");
+        assert_eq!(out["daily"][0]["cost_usd"], json!(78.08));
+        let (mut out, w, p) = page();
+        apply_metered(&mut out, &[], w, p, None);
+        assert_eq!(out["summary"]["cost_basis"], "runs");
+        assert_eq!(out["previous"]["cost_basis"], "runs");
+    }
+
+    #[test]
+    fn a_meter_item_reads_its_day_total_and_features() {
+        let mut i: Item = HashMap::new();
+        i.insert("period".into(), av("DAY#2026-10-29"));
+        i.insert("total_cost_usd".into(), AttributeValue::N("168.48".into()));
+        i.insert("total_tokens".into(), AttributeValue::N("168480".into()));
+        i.insert(
+            "feature#review#cost_usd".into(),
+            AttributeValue::N("35.65".into()),
+        );
+        i.insert(
+            "feature#review#tokens_out".into(),
+            AttributeValue::N("9".into()),
+        );
+        assert_eq!(
+            MeteredDay::from_item(&i),
+            Some(day("2026-10-29", 168.48, &[("review", 35.65)]))
+        );
+        i.insert("period".into(), av("2026-10"));
+        assert_eq!(MeteredDay::from_item(&i), None);
+    }
 }
 
 #[cfg(test)]

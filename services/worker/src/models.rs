@@ -309,6 +309,8 @@ mod tests {
             continuation: 0,
             continuation_run_id: None,
             first_attempt_ms: 0,
+            resume_from: None,
+            retry_of_run: false,
             model_retries: 0,
             ticket_update_note: None,
             ticket_history_note: None,

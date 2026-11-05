@@ -260,6 +260,8 @@ pub async fn run(
                     continuation: 0,
                     continuation_run_id: None,
                     first_attempt_ms: 0,
+                    resume_from: None,
+                    retry_of_run: false,
                     model_retries: 0,
                     ticket_update_note: None,
                     ticket_history_note: None,
@@ -1530,7 +1532,7 @@ Rules:
             aws_sdk_dynamodb::types::AttributeValue::S(msg.run_id.clone()),
         )
         .update_expression(format!(
-            "SET tokens_in = tokens_in + :ti, tokens_out = tokens_out + :to, \
+            "SET tokens_in = if_not_exists(tokens_in, :zero) + :ti, tokens_out = if_not_exists(tokens_out, :zero) + :to, \
              cache_read_tokens = if_not_exists(cache_read_tokens, :zero) + :crt, \
              cache_write_tokens = if_not_exists(cache_write_tokens, :zero) + :cwt, \
              cost_usd = if_not_exists(cost_usd, :zero) + :c, \
@@ -2896,6 +2898,8 @@ async fn handle_wrong_repo(
         continuation: 0,
         continuation_run_id: None,
         first_attempt_ms: 0,
+        resume_from: None,
+        retry_of_run: false,
         model_retries: 0,
         ticket_update_note: None,
         ticket_history_note: None,

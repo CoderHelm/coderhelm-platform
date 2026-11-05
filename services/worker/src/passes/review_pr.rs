@@ -1046,6 +1046,16 @@ async fn run_once(
     };
     *reviewed_head = head_sha.clone();
 
+    // CoderHelm's own push while its run is still fixing the PR: the run
+    // asks for the verdict itself when CI is green, and hands the PR over
+    // for review if it ends without one. A person's push is reviewed.
+    if msg.trigger == super::review_scope::TRIGGER_PUSH && super::is_own_login(pr_author) {
+        if let Some(reason) = own_loop_hold(state, &github, &msg, &head_sha).await {
+            info!(pr = msg.pr_number, head = %head_sha, "CoderHelm's own push during its run's fix loop — not reviewed now");
+            return Ok(Outcome::Skipped { reason });
+        }
+    }
+
     // A review started by a description edit reads the description as it is
     // now. When later edits left text this commit was already reviewed with
     // (an edit after the queued review read it queues its own), it doesn't
@@ -1092,6 +1102,39 @@ async fn run_once(
                     "Already reviewed this commit: the verdict ({}) stands.",
                     verdict.to_lowercase().replace('_', " ")
                 ),
+            });
+        }
+    }
+
+    // A run's handoff and the PR's ready-for-review event can ask for the
+    // same commit together: the handoff takes the per-commit claim the
+    // gateway's push and ready reviews take, so only one of them runs.
+    if msg.trigger == super::review_scope::HANDOFF_TRIGGER && pr["draft"].as_bool() == Some(true) {
+        // Still a draft (a proof running, a check holding it): the review
+        // runs when it is marked ready, as every PR's does.
+        return Ok(Outcome::Skipped {
+            reason: "Still a draft: reviewed when it is marked ready.".into(),
+        });
+    }
+    if msg.trigger == super::review_scope::HANDOFF_TRIGGER && !head_sha.is_empty() {
+        let sk = super::review_policy::head_claim_sk(
+            &msg.repo_owner,
+            &msg.repo_name,
+            msg.pr_number,
+            &head_sha,
+        );
+        if common::claim::claim(
+            &state.dynamo,
+            &state.config.settings_table_name,
+            &msg.team_id,
+            &sk,
+            REVIEW_HEAD_CLAIM_SECS,
+        )
+        .await
+            == common::claim::Claim::Held
+        {
+            return Ok(Outcome::Skipped {
+                reason: "This commit is already being reviewed.".into(),
             });
         }
     }
@@ -1613,13 +1656,20 @@ async fn run_once(
     }
 
     // A push after CoderHelm approved an earlier commit is reviewed from that
-    // commit: only what changed since. One that changed no code or data is
-    // not reviewed at all and the approval stands. A push after a request
-    // for changes (or questions) gets a full review.
+    // commit: only what changed since. One that changed no code or data, or
+    // left the PR's own change as approved (merges of the base branch, or a
+    // rebase onto it), is not reviewed at all and the approval stands. A
+    // push after a review that didn't approve is reviewed from that review's
+    // commit too: only the hunks changed since, with the earlier findings'
+    // status; it never approves without a full review first.
     let mut review_diff = diff.clone();
-    // The PR's own change is the one CoderHelm approved: every commit since
-    // brought in only the base branch (merges of work already merged there).
+    // The PR's own change is the one CoderHelm reviewed: every commit since
+    // brought in only the base branch (merges of work already merged there,
+    // or a rebase onto it).
     let mut own_change_unchanged = false;
+    // The commit a hunks-only re-review starts from.
+    let mut since_review: Option<String> = None;
+    let unconfirmed_in_body = review_agent::unconfirmed_external_facts(pr_body, &[]);
     if let Some(approved) = super::review_scope::approved_base(
         &msg.trigger,
         msg.question.is_some(),
@@ -1630,11 +1680,13 @@ async fn run_once(
             .get_diff(&msg.repo_owner, &msg.repo_name, &approved, &head_sha)
             .await
         {
-            Ok(since) if super::review_scope::builds_on(&since) => {
+            Ok(since) => {
                 let short = &approved[..approved.len().min(7)];
-                let unconfirmed = review_agent::unconfirmed_external_facts(pr_body, &[]);
-                // Merges of the base branch change code, but not the PR's:
-                // compare the PR's own change now with the one approved.
+                let ahead = super::review_scope::builds_on(&since);
+                // Merges of the base branch change code, but not the PR's,
+                // and a rebase onto it leaves the approved commit off the
+                // branch: compare the PR's own change now with the one
+                // approved, whichever happened.
                 own_change_unchanged = match github
                     .get_diff(&msg.repo_owner, &msg.repo_name, base, &approved)
                     .await
@@ -1646,8 +1698,8 @@ async fn run_once(
                     }
                 };
                 let nothing_new =
-                    !super::review_scope::touches_code(&since) || own_change_unchanged;
-                if nothing_new && unconfirmed.is_empty() {
+                    (ahead && !super::review_scope::touches_code(&since)) || own_change_unchanged;
+                if nothing_new && unconfirmed_in_body.is_empty() {
                     info!(pr = msg.pr_number, approved = %approved, head = %head_sha, own_change_unchanged, "Push changed none of the PR's code or data since the approval — review skipped, approval carried");
                     // Many repos dismiss approvals when commits are pushed:
                     // post the approval again on this head, so the PR never
@@ -1697,25 +1749,76 @@ async fn run_once(
                     // marks unconfirmed: the change itself is the approved one.
                     info!(pr = msg.pr_number, approved = %approved, head = %head_sha, "Only the base branch came in since the approval — re-checking the PR's unconfirmed facts");
                     review_diff = format!(
-                        "(CoderHelm approved {short} earlier. Every commit since only merges the \
-                         base branch: the PR's own change below is the one approved. Review \
+                        "(CoderHelm approved {short} earlier. Every commit since only brings in \
+                         the base branch: the PR's own change below is the one approved. Review \
                          nothing new in it; triage the facts the description marks \
                          unconfirmed.)\n{diff}"
                     );
-                } else {
+                } else if ahead {
                     info!(pr = msg.pr_number, approved = %approved, head = %head_sha, files = ?super::review_scope::code_files(&since), "Reviewing only what changed since the approval");
                     review_diff = format!(
                         "(CoderHelm approved {short} earlier. This review covers only what \
                          changed since then; the rest of the PR was reviewed and approved.)\n{}",
                         review_agent::format_diff(&since, 40_000)
                     );
+                } else {
+                    info!(pr = msg.pr_number, approved = %approved, "Approved commit isn't an ancestor of the head (rebased) and the change differs — full review");
                 }
-            }
-            Ok(_) => {
-                info!(pr = msg.pr_number, approved = %approved, "Approved commit isn't an ancestor of the head (rebased) — full review");
             }
             Err(e) => {
                 warn!(pr = msg.pr_number, error = %e, "Could not read the diff since the approval — full review");
+            }
+        }
+    } else if let Some(reviewed) = super::review_scope::reviewed_base(
+        &msg.trigger,
+        msg.question.is_some(),
+        msg.full_review,
+        &records,
+        &head_sha,
+    ) {
+        let short = reviewed[..reviewed.len().min(7)].to_string();
+        own_change_unchanged = match github
+            .get_diff(&msg.repo_owner, &msg.repo_name, base, &reviewed)
+            .await
+        {
+            Ok(at_review) => super::review_scope::same_own_change(&at_review, &compare),
+            Err(_) => false,
+        };
+        if own_change_unchanged && unconfirmed_in_body.is_empty() {
+            let verdict = records
+                .iter()
+                .find(|r| r.is_review() && !r.failed())
+                .map(|r| r.verdict.to_lowercase().replace('_', " "))
+                .unwrap_or_default();
+            info!(pr = msg.pr_number, reviewed = %reviewed, head = %head_sha, "Push left the PR's own change as reviewed — review skipped, verdict stands");
+            return Ok(Outcome::Skipped {
+                reason: format!(
+                    "Not reviewed: the commits since CoderHelm reviewed {short} only bring in \
+                     the base branch, and the PR's own change is the one reviewed, so that \
+                     review's verdict ({verdict}) stands."
+                ),
+            });
+        }
+        if !own_change_unchanged {
+            match github
+                .get_diff(&msg.repo_owner, &msg.repo_name, &reviewed, &head_sha)
+                .await
+            {
+                Ok(since) if super::review_scope::builds_on(&since) => {
+                    info!(pr = msg.pr_number, reviewed = %reviewed, head = %head_sha, files = ?super::review_scope::code_files(&since), "Reviewing only the hunks changed since the previous review");
+                    review_diff = format!(
+                        "{}\n{}",
+                        super::review_scope::since_review_note(&reviewed),
+                        review_agent::format_diff(&since, 40_000)
+                    );
+                    since_review = Some(reviewed.clone());
+                }
+                Ok(_) => {
+                    info!(pr = msg.pr_number, reviewed = %reviewed, "Reviewed commit isn't an ancestor of the head (rebased) — full review");
+                }
+                Err(e) => {
+                    warn!(pr = msg.pr_number, error = %e, "Could not read the diff since the previous review — full review");
+                }
             }
         }
     }
@@ -2477,17 +2580,50 @@ async fn run_once(
     // every finding that isn't strictly optional is its own to fix before
     // the PR is marked ready or the merge armed: the review requests changes
     // and lists them at the top of the description (`own_review`).
-    let own_open = if self_authored {
+    let mut own_open = if self_authored {
         super::own_review::required(&findings, &held_late)
     } else {
         Vec::new()
     };
+    // A hunks-only re-review reports the earlier findings by status, not as
+    // findings again: those still open that hold the merge stay listed.
+    if self_authored && since_review.is_some() {
+        for t in prior_threads
+            .iter()
+            .filter(|t| !fixed_threads.iter().any(|f| f.id == t.id))
+            .filter(|t| review_agent::thread_holds_merge(&t.body))
+        {
+            let line = super::own_review::thread_line(&t.path, t.line, &t.body);
+            if !own_open.contains(&line) {
+                own_open.push(line);
+            }
+        }
+    }
     let verdict = super::review_severity::consistent_verdict(stable.verdict, &findings);
     let verdict = if own_open.is_empty() {
         verdict
     } else {
         "REQUEST_CHANGES"
     };
+    // A hunks-only re-review never approves: the whole PR is reviewed first.
+    if super::review_scope::needs_full_before_approval(since_review.is_some(), verdict) {
+        let mut full = msg.clone();
+        full.full_review = true;
+        full.dedup_key = format!("full#{head_sha}");
+        // Its model calls are already on the team's counters (per call).
+        if enqueue_review(state, &full, 0).await {
+            info!(pr = msg.pr_number, head = %head_sha, "Hunks-only re-review found nothing holding the merge — full review queued before approving");
+            return Ok(Outcome::Skipped {
+                reason: "The changes since the previous review settle what it found; the whole \
+                         pull request is reviewed again before it is approved."
+                    .into(),
+            });
+        }
+        warn!(
+            pr = msg.pr_number,
+            "Could not queue the full review — posting this one"
+        );
+    }
     if self_authored {
         let section = super::own_review::section(&own_open);
         let updated = super::completeness::with_section(
@@ -3171,6 +3307,7 @@ pub async fn review_for_run(
         reconcile_note: None,
         outstanding_work: None,
         description_hash: None,
+        full_review: false,
     };
     let mut reviewed_head = head_sha.to_string();
     let job = LiveJob::start();
@@ -3218,8 +3355,9 @@ pub async fn review_for_run(
 /// How many self-review → self-fix rounds CoderHelm runs on its OWN PR before it
 /// gives up and hands to a human. Bounds the review↔fix loop so a flip-flopping
 /// verdict can't churn commits/reviews forever (one PR hit 67 commits / 44 reviews
-/// oscillating APPROVE↔REQUEST_CHANGES).
-const MAX_SELF_REVIEW_FIX_ROUNDS: u32 = 3;
+/// oscillating APPROVE↔REQUEST_CHANGES). The same cap as the run's own fix
+/// rounds (`own_review::MAX_FIX_ROUNDS`).
+const MAX_SELF_REVIEW_FIX_ROUNDS: u32 = super::own_review::MAX_FIX_ROUNDS;
 
 /// Claim one self-review→fix round for this PR (atomic conditional increment).
 /// True while under MAX_SELF_REVIEW_FIX_ROUNDS (proceed with the fix); false once
@@ -3563,6 +3701,96 @@ pub(crate) async fn lookup_run_by_pr(
         .await
         .ok()
         .flatten()
+}
+
+/// Why a push to CoderHelm's own PR isn't reviewed now, when it isn't: the
+/// push is CoderHelm's and the run that owns the PR is still in its review
+/// and fix loop (`review_scope::own_loop_holds_push`). Any lookup that fails
+/// reviews the push.
+async fn own_loop_hold(
+    state: &WorkerState,
+    github: &GitHubClient,
+    msg: &ReviewMessage,
+    head: &str,
+) -> Option<String> {
+    let commits = github
+        .list_pr_commits(&msg.repo_owner, &msg.repo_name, msg.pr_number)
+        .await
+        .ok()?;
+    let by_coderhelm =
+        super::review_scope::head_commit_login(&commits, head).is_some_and(super::is_own_login);
+    if !by_coderhelm {
+        return None;
+    }
+    let run_id = lookup_run_by_pr(
+        state,
+        &msg.team_id,
+        &msg.repo_owner,
+        &msg.repo_name,
+        msg.pr_number,
+    )
+    .await?;
+    let item = state
+        .dynamo
+        .get_item()
+        .table_name(&state.config.runs_table_name)
+        .key("team_id", attr_s(&msg.team_id))
+        .key("run_id", attr_s(&run_id))
+        .projection_expression("#s")
+        .expression_attribute_names("#s", "status")
+        .send()
+        .await
+        .ok()?;
+    let status = item
+        .item()
+        .and_then(|i| i.get("status"))
+        .and_then(|v| v.as_s().ok())
+        .cloned();
+    super::review_scope::own_loop_holds_push(&msg.trigger, true, true, status.as_deref()).then(
+        || {
+            "Not reviewed now: CoderHelm pushed this while its run is still fixing the pull \
+             request. The run asks for the review itself when its checks pass, and the pull \
+             request is reviewed when the run hands it over."
+                .to_string()
+        },
+    )
+}
+
+/// The review a run asks for when it hands its PR over without the PR
+/// reviewer's verdict on its last head: CoderHelm's own pushes during the
+/// run weren't reviewed (`own_loop_hold`). The job reads the PR's head when
+/// it runs, and a head already reviewed returns its verdict with no model
+/// work (`review_policy::start`). Best-effort.
+pub(crate) async fn review_on_handoff(
+    state: &WorkerState,
+    team_id: &str,
+    installation_id: u64,
+    (owner, repo, pr_number): (&str, &str, u64),
+    run_id: &str,
+) {
+    if pr_number == 0 || owner.is_empty() || repo.is_empty() {
+        return;
+    }
+    let Some(label) = enabled_trigger_label(state, team_id, owner, repo).await else {
+        return;
+    };
+    let msg = ReviewMessage {
+        team_id: team_id.to_string(),
+        installation_id,
+        repo_owner: owner.to_string(),
+        repo_name: repo.to_string(),
+        pr_number,
+        label,
+        trigger: super::review_scope::HANDOFF_TRIGGER.to_string(),
+        dedup_key: format!("handoff#{run_id}"),
+        ..Default::default()
+    };
+    if enqueue_review(state, &msg, 0).await {
+        info!(
+            pr = pr_number,
+            run_id, "Run handed its PR over — review queued"
+        );
+    }
 }
 
 /// CoderHelm's most recent review of a PR.
@@ -4307,6 +4535,7 @@ mod superseded_tests {
             reconcile_note: None,
             outstanding_work: None,
             description_hash: None,
+            full_review: false,
         }
     }
 
@@ -4666,6 +4895,7 @@ mod failure_tests {
             reconcile_note: None,
             outstanding_work: None,
             description_hash: None,
+            full_review: false,
         }
     }
 
