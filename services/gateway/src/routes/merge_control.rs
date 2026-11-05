@@ -283,7 +283,7 @@ pub(crate) async fn apply(
             .map_err(db_err)?;
             let next = merge_gate::rearm_next(verdict.as_deref(), cfg.enabled && !cfg.killed);
             if next == RearmNext::QueueReview {
-                let review = WorkerMessage::Review(ReviewMessage {
+                let review = ReviewMessage {
                     team_id: team_id.to_string(),
                     installation_id,
                     repo_owner: owner.to_string(),
@@ -301,13 +301,8 @@ pub(crate) async fn apply(
                         String::new()
                     },
                     ..Default::default()
-                });
-                super::github_webhook::send_to_queue(
-                    state,
-                    &state.config.ticket_queue_url,
-                    &review,
-                )
-                .await?;
+                };
+                super::github_webhook::send_review_job(state, review, &head, 0).await?;
             }
             // The gate checks every condition again on the current head.
             super::github_webhook::send_to_queue(state, &state.config.ticket_queue_url, &gate_msg)

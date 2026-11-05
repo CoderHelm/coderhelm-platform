@@ -185,7 +185,9 @@ was checked and shows it. A matching filter or a passing test is not that; other
 `{}` or empty backticks.
 - When the change touches more than one environment, the Evidence list has one bullet per \
 environment: what confirmed it, or exactly which environment couldn't be checked and what access \
-is missing.";
+is missing.
+- Deploy claims come only from what was read in the repo's CI workflows and module wiring, since \
+docs go stale. Name a manual deploy step only if a workflow or the wiring shows one is needed.";
 
 /// What the writer is told about the checks only a person can do: each one
 /// a numbered Verification step, and nowhere else. Empty when there are none.
@@ -2121,6 +2123,10 @@ mod refresh_tests {
         assert!(rules.contains("real output (the real API response or page)"));
         assert!(rules.contains("A matching filter or a passing test is not that"));
         assert!(rules.contains("**Unproven** and the exact check a person should run"));
+        assert!(rules.contains("Deploy claims come only from what was read"));
+        assert!(rules.contains("CI workflows and module wiring"));
+        assert!(rules.contains("docs go stale"));
+        assert!(rules.contains("manual deploy step only if a workflow or the wiring shows"));
     }
 
     #[test]

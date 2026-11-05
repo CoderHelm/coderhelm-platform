@@ -762,6 +762,12 @@ pub struct ReviewMessage {
     /// goes on to the fix loop, which answers this person on the PR.
     #[serde(default)]
     pub requested_by: String,
+    /// The commit whose "CoderHelm review" check shows this job, when the job
+    /// itself resolves the head when it starts (`head_sha` empty): the gateway
+    /// queued the check there. A head that moves before the job starts gets
+    /// its own check.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub check_head: String,
     /// How many times this review already failed for a service error and
     /// was sent again (0 on the first run).
     #[serde(default)]

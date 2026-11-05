@@ -1896,7 +1896,7 @@ pub async fn re_review(
     let installation_id = super::api::get_team_installation_id(&state, &claims.team_id).await?;
 
     let window = chrono::Utc::now().timestamp() / RE_REVIEW_DEDUP_SECS;
-    let message = WorkerMessage::Review(ReviewMessage {
+    let message = ReviewMessage {
         team_id: claims.team_id.clone(),
         installation_id,
         repo_owner: owner.to_string(),
@@ -1910,8 +1910,8 @@ pub async fn re_review(
         reply_to_comment_id: None,
         requested_by: String::new(),
         ..Default::default()
-    });
-    super::github_webhook::send_to_queue(&state, &state.config.ticket_queue_url, &message).await?;
+    };
+    super::github_webhook::send_review_job(&state, message, "", 0).await?;
     super::github_webhook::record_rereview(
         &state,
         &claims.team_id,

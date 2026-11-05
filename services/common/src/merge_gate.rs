@@ -571,6 +571,31 @@ pub async fn bot_verdict_at_head(
     pr: u64,
     head_sha: &str,
 ) -> Result<Option<String>, BoxError> {
+    Ok(
+        bot_review_at_head(dynamo, table, team_id, owner, repo, pr, head_sha)
+            .await?
+            .map(|b| b.verdict),
+    )
+}
+
+/// CoderHelm's latest verdict for a head, and what holds it by name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BotVerdict {
+    pub verdict: String,
+    /// Empty on a review older than named items, and on an approval.
+    pub holding: Vec<String>,
+}
+
+/// [`bot_verdict_at_head`] with what holds the verdict.
+pub async fn bot_review_at_head(
+    dynamo: &DynamoClient,
+    table: &str,
+    team_id: &str,
+    owner: &str,
+    repo: &str,
+    pr: u64,
+    head_sha: &str,
+) -> Result<Option<BotVerdict>, BoxError> {
     let prefix = format!("REVIEW#{owner}/{repo}#{pr:0>6}#");
     let mut start: Option<HashMap<String, AttributeValue>> = None;
     // Page through the newest records until one for this head is found; the
@@ -594,7 +619,12 @@ pub async fn bot_verdict_at_head(
                 continue;
             }
             if get("head_sha") == Some(head_sha) {
-                return Ok(Some(verdict.to_string()));
+                return Ok(Some(BotVerdict {
+                    verdict: verdict.to_string(),
+                    holding: get("holding")
+                        .and_then(|h| serde_json::from_str(h).ok())
+                        .unwrap_or_default(),
+                }));
             }
         }
         match resp.last_evaluated_key() {

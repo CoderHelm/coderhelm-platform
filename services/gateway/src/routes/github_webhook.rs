@@ -1018,12 +1018,8 @@ async fn handle_review_comment(
             }
         }
     };
-    send_to_queue(
-        state,
-        &state.config.ticket_queue_url,
-        &WorkerMessage::Review(message),
-    )
-    .await
+    let head = pr["head"]["sha"].as_str().unwrap_or("");
+    send_review_job(state, message, head, 0).await
 }
 
 /// True when the comment's author is a bot account, read from GitHub's
@@ -1207,7 +1203,7 @@ async fn handle_quote_reply(
         owner,
         name, pr_number, comment_id, "Reviewer: quote reply → review job"
     );
-    let message = WorkerMessage::Review(ReviewMessage {
+    let message = ReviewMessage {
         team_id: team_id.to_string(),
         installation_id,
         repo_owner: owner.to_string(),
@@ -1220,8 +1216,8 @@ async fn handle_quote_reply(
         dedup_key: format!("quote#{comment_id}#{}", reply_fingerprint(body)),
         requested_by: commenter.to_string(),
         ..Default::default()
-    });
-    send_to_queue(state, &state.config.ticket_queue_url, &message).await
+    };
+    send_review_job(state, message, "", 0).await
 }
 
 async fn handle_issue_comment(
@@ -1522,7 +1518,7 @@ async fn handle_issue_comment(
                     )
                     .await;
                 }
-                let message = WorkerMessage::Review(ReviewMessage {
+                let message = ReviewMessage {
                     team_id: team_id.to_string(),
                     installation_id,
                     repo_owner: owner.to_string(),
@@ -1537,8 +1533,8 @@ async fn handle_issue_comment(
                     requested_by: commenter.to_string(),
                     outstanding_work: outstanding.as_ref().map(|(_, w)| w.note()),
                     ..Default::default()
-                });
-                return send_to_queue(state, &state.config.ticket_queue_url, &message).await;
+                };
+                return send_review_job(state, message, "", 0).await;
             } else {
                 info!(
                     owner,
@@ -1797,7 +1793,7 @@ async fn handle_pull_request(
         // redelivery of the same event is the same job.
         let key = rerequest_key(delivery_id, payload);
         record_rereview(state, team_id, owner, name, pr_number, &key).await;
-        let message = WorkerMessage::Review(ReviewMessage {
+        let message = ReviewMessage {
             team_id: team_id.to_string(),
             installation_id,
             repo_owner: owner.to_string(),
@@ -1811,8 +1807,11 @@ async fn handle_pull_request(
             reply_to_comment_id: None,
             requested_by: String::new(),
             ..Default::default()
-        });
-        return send_to_queue(state, &state.config.ticket_queue_url, &message).await;
+        };
+        let head = payload["pull_request"]["head"]["sha"]
+            .as_str()
+            .unwrap_or("");
+        return send_review_job(state, message, head, 0).await;
     }
 
     if action == "labeled"
@@ -2416,7 +2415,7 @@ async fn handle_pr_review(
                     )
                     .await;
                 }
-                let message = WorkerMessage::Review(ReviewMessage {
+                let message = ReviewMessage {
                     team_id: team_id.to_string(),
                     installation_id,
                     repo_owner: owner.to_string(),
@@ -2430,8 +2429,11 @@ async fn handle_pr_review(
                     reply_to_comment_id: None,
                     requested_by: reviewer.to_string(),
                     ..Default::default()
-                });
-                return send_to_queue(state, &state.config.ticket_queue_url, &message).await;
+                };
+                let head = payload["pull_request"]["head"]["sha"]
+                    .as_str()
+                    .unwrap_or("");
+                return send_review_job(state, message, head, 0).await;
             }
         }
         return Ok(StatusCode::OK);
@@ -3896,24 +3898,7 @@ async fn handle_review_trigger(
         owner,
         name, pr_number, is_bot_pr, action, "Reviewer: trigger matched — enqueuing review job"
     );
-    let dedup_key = format!("head#{head_sha}");
-    let delay = review_delay_secs(action);
-    // The commit shows the review at once, queued, saying when it starts:
-    // GitHub shows checks per commit, and a push's review waits for the PR
-    // to go quiet. The worker takes this check over when the job starts.
-    let check = ReviewCheckSpot {
-        installation_id,
-        owner,
-        name,
-        pr_number,
-        head_sha: &head_sha,
-        key: &dedup_key,
-    };
-    let calls = review_check_calls(state, installation_id).await;
-    if let Some(calls) = &calls {
-        check.queue(calls, i64::from(delay)).await;
-    }
-    let message = WorkerMessage::Review(ReviewMessage {
+    let message = ReviewMessage {
         team_id: team_id.to_string(),
         installation_id,
         repo_owner: owner.to_string(),
@@ -3923,18 +3908,89 @@ async fn handle_review_trigger(
         label: cfg.label,
         question: None,
         trigger: action.to_string(),
-        dedup_key: dedup_key.clone(),
+        dedup_key: format!("head#{head_sha}"),
         reply_to_comment_id: None,
         requested_by: String::new(),
         ..Default::default()
-    });
-    let sent = send_to_queue_after(state, &state.config.ticket_queue_url, &message, delay).await;
+    };
+    send_review_job(state, message, &head_sha, review_delay_secs(action)).await
+}
+
+/// The ONE way a review job leaves the gateway: the job is sent and the commit
+/// shows it, together, so no trigger can start work the owner can't see. A
+/// source test fails if anything else sends a review job.
+///
+/// `head` is the commit the event names, when it names one; otherwise the PR's
+/// head is read. The job's own `head_sha` is left as the trigger set it (empty
+/// means the worker resolves the head when it starts). A reply that may not be
+/// for CoderHelm shows nothing here: see `review_check::shows_when_sent`.
+pub(crate) async fn send_review_job(
+    state: &AppState,
+    mut message: ReviewMessage,
+    head: &str,
+    delay_secs: i32,
+) -> Result<StatusCode, StatusCode> {
+    let mut shown: Option<(common::review_check::TokenCalls<'_>, String)> = None;
+    if common::review_check::shows_when_sent(&message.trigger, message.mentioned) {
+        if let Some(calls) = review_check_calls(state, message.installation_id).await {
+            let head = if head.is_empty() {
+                pr_head(state, &calls.token, &message).await
+            } else {
+                head.to_string()
+            };
+            // Never holds the job up: the worker opens the check if this
+            // didn't get through.
+            let spot = ReviewCheckSpot::of(&message, &head);
+            let _ = tokio::time::timeout(
+                std::time::Duration::from_secs(REVIEW_CHECK_BUDGET_SECS),
+                spot.show(&calls, &message, i64::from(delay_secs)),
+            )
+            .await;
+            shown = Some((calls, head));
+        }
+    }
+    if let Some((_, head)) = &shown {
+        message.check_head = head.clone();
+    }
+    let sent = send_to_queue_after(
+        state,
+        &state.config.ticket_queue_url,
+        &WorkerMessage::Review(message.clone()),
+        delay_secs,
+    )
+    .await;
     if sent.is_err() {
-        if let Some(calls) = &calls {
-            check.not_queued(calls).await;
+        if let Some((calls, head)) = &shown {
+            ReviewCheckSpot::of(&message, head).not_queued(calls).await;
         }
     }
     sent
+}
+
+/// How long showing a job's check may hold its webhook up.
+const REVIEW_CHECK_BUDGET_SECS: u64 = 6;
+
+/// The head of the job's PR; empty when it can't be read (no check then, the
+/// worker opens one when it has the head).
+async fn pr_head(state: &AppState, token: &str, m: &ReviewMessage) -> String {
+    let url = format!(
+        "https://api.github.com/repos/{}/{}/pulls/{}",
+        m.repo_owner, m.repo_name, m.pr_number
+    );
+    match super::merge_control::gh_get(state, token, &url).await {
+        Ok((code, body)) if code < 300 => body["head"]["sha"].as_str().unwrap_or("").to_string(),
+        Ok((code, _)) => {
+            warn!(
+                pr = m.pr_number,
+                code, "Could not read the PR's head for its check"
+            );
+            String::new()
+        }
+        Err(e) => {
+            warn!(pr = m.pr_number, error = %e, "Could not read the PR's head for its check");
+            String::new()
+        }
+    }
 }
 
 /// Where a scheduled review's queued check goes, and the job it waits for.
@@ -3947,7 +4003,39 @@ struct ReviewCheckSpot<'a> {
     key: &'a str,
 }
 
-impl ReviewCheckSpot<'_> {
+impl<'a> ReviewCheckSpot<'a> {
+    fn of(m: &'a ReviewMessage, head: &'a str) -> Self {
+        ReviewCheckSpot {
+            installation_id: m.installation_id,
+            owner: &m.repo_owner,
+            name: &m.repo_name,
+            pr_number: m.pr_number,
+            head_sha: head,
+            key: &m.dedup_key,
+        }
+    }
+
+    /// Put job `m`, due in `delay_secs`, on the commit in plain words. A
+    /// refusal (no checks:write) is logged once and changes nothing.
+    async fn show<C: common::review_check::CheckCalls + ?Sized>(
+        &self,
+        calls: &C,
+        m: &ReviewMessage,
+        delay_secs: i64,
+    ) -> common::review_check::Queued {
+        let work = common::review_check::Work::of(&m.trigger, m.question.is_some());
+        let due = chrono::Utc::now().timestamp() + delay_secs;
+        common::review_check::queue_work(
+            calls,
+            &self.target(),
+            work,
+            self.key,
+            due,
+            &self.details_url(),
+        )
+        .await
+    }
+
     fn target(&self) -> common::review_check::Target<'_> {
         common::review_check::Target {
             installation: self.installation_id,
@@ -3965,17 +4053,6 @@ impl ReviewCheckSpot<'_> {
             self.name,
             self.pr_number,
         )
-    }
-
-    /// Put the queued check on the commit, the review due in `delay_secs`.
-    /// A refusal (no checks:write) is logged once and changes nothing.
-    async fn queue<C: common::review_check::CheckCalls + ?Sized>(
-        &self,
-        calls: &C,
-        delay_secs: i64,
-    ) -> common::review_check::Queued {
-        let due = chrono::Utc::now().timestamp() + delay_secs;
-        common::review_check::queue(calls, &self.target(), self.key, due, &self.details_url()).await
     }
 
     /// The review job couldn't be sent: the check says so instead of waiting.
@@ -4555,8 +4632,9 @@ mod review_delay_tests {
         use common::review_check::{fake::FakeChecks, Queued};
         let gh = FakeChecks::default();
         let s = spot(1);
+        let m = job("synchronize", s.key, None, false);
         let q = s
-            .queue(&gh, i64::from(review_delay_secs("synchronize")))
+            .show(&gh, &m, i64::from(review_delay_secs("synchronize")))
             .await;
         assert_eq!(q, Queued::Created(1));
         let run = gh.run(1);
@@ -4575,7 +4653,7 @@ mod review_delay_tests {
             common::review_check::parse_external_id(run["external_id"].as_str().unwrap()).unwrap();
         assert_eq!(key, s.key);
         // A sibling event for the same commit adds no second check.
-        assert_eq!(s.queue(&gh, 0).await, Queued::Exists(1));
+        assert_eq!(s.show(&gh, &m, 0).await, Queued::Exists(1));
         assert_eq!(gh.count(), 1);
         // A job that couldn't be sent leaves no check waiting.
         s.not_queued(&gh).await;
@@ -4587,11 +4665,172 @@ mod review_delay_tests {
         );
     }
 
+    fn job(
+        trigger: &str,
+        key: &str,
+        question: Option<&str>,
+        mentioned: bool,
+    ) -> crate::models::ReviewMessage {
+        crate::models::ReviewMessage {
+            installation_id: 1,
+            repo_owner: "acme".into(),
+            repo_name: "web".into(),
+            pr_number: 7,
+            trigger: trigger.into(),
+            dedup_key: key.into(),
+            question: question.map(String::from),
+            mentioned,
+            ..Default::default()
+        }
+    }
+
+    const HEAD: &str = "9fceb02d0ae598e95dc970b74767f19372d61af8";
+
+    /// Each trigger as the handlers build it, and what the commit shows as
+    /// soon as the job is sent.
+    #[tokio::test]
+    async fn every_trigger_shows_on_the_commit_with_a_plain_title() {
+        use common::review_check::fake::FakeChecks;
+        for (m, title) in [
+            (
+                job("thread_reply", "thread#1", Some("why?"), true),
+                "Reading your reply on 9fceb02",
+            ),
+            (
+                job("reply", "reply#2", Some("why?"), true),
+                "Reading your reply on 9fceb02",
+            ),
+            (job("reply", "reply#3", None, true), "Re-reviewing 9fceb02"),
+            (
+                job("reply", "review#4", None, false),
+                "Re-reviewing 9fceb02",
+            ),
+            (
+                job("rerequest", "rereq#5", None, false),
+                "Re-reviewing 9fceb02",
+            ),
+            (
+                job("rerequest", "dashboard#pr7#6", None, false),
+                "Re-reviewing 9fceb02",
+            ),
+            (
+                job("rerequest", "rearm#h", None, false),
+                "Re-reviewing 9fceb02",
+            ),
+            (
+                job("description", "desc#h#x", None, false),
+                "Re-reviewing 9fceb02 with the edited description",
+            ),
+            (
+                job("labeled", "head#h", None, false),
+                "Reviewing 9fceb02 shortly",
+            ),
+        ] {
+            assert!(common::review_check::shows_when_sent(
+                &m.trigger,
+                m.mentioned
+            ));
+            let gh = FakeChecks::default();
+            super::ReviewCheckSpot::of(&m, HEAD).show(&gh, &m, 0).await;
+            let run = gh.shown(HEAD);
+            assert_eq!(run["status"], "queued");
+            assert_eq!(run["output"]["title"], title);
+            assert!(run["details_url"]
+                .as_str()
+                .unwrap()
+                .contains("/reviewer/pr?repo=acme/web&pr=7"));
+            let (_, key) =
+                common::review_check::parse_external_id(run["external_id"].as_str().unwrap())
+                    .unwrap();
+            assert_eq!(key, m.dedup_key);
+        }
+    }
+
+    /// A reply that may not be for CoderHelm isn't shown when it is sent: only
+    /// the worker can tell, and it leaves the check alone when it isn't.
+    #[test]
+    fn a_reply_that_may_not_be_for_coderhelm_shows_nothing_when_sent() {
+        assert!(!common::review_check::shows_when_sent(
+            "thread_reply",
+            false
+        ));
+        assert!(!common::review_check::shows_when_sent("quote_reply", false));
+    }
+
+    #[tokio::test]
+    async fn a_job_that_cannot_be_sent_gives_the_commit_its_verdict_back() {
+        use common::review_check::{close, fake::FakeChecks, take_over_or_open, Close};
+        let gh = FakeChecks::default();
+        let m = job("reply", "reply#2", Some("why?"), true);
+        let spot = super::ReviewCheckSpot::of(&m, HEAD);
+        let id = take_over_or_open(&gh, &spot.target(), "head#h", "Reading", "s")
+            .await
+            .unwrap();
+        close(
+            &gh,
+            &spot.target(),
+            id,
+            &Close {
+                conclusion: "neutral",
+                title: "Changes requested: 1 finding".into(),
+                summary: "s".into(),
+                details_url: None,
+            },
+        )
+        .await;
+        spot.show(&gh, &m, 0).await;
+        spot.not_queued(&gh).await;
+        assert_eq!(
+            gh.shown(HEAD)["output"]["title"],
+            "Changes requested: 1 finding"
+        );
+    }
+
+    /// Whole-class guard: nothing in the gateway sends a review job except
+    /// `send_review_job`, so a new trigger can't forget the check.
+    #[test]
+    fn nothing_sends_a_review_job_around_the_helper() {
+        let mut offenders = Vec::new();
+        let root = concat!(env!("CARGO_MANIFEST_DIR"), "/src");
+        let mut stack = vec![std::path::PathBuf::from(root)];
+        while let Some(dir) = stack.pop() {
+            for e in std::fs::read_dir(&dir).unwrap() {
+                let path = e.unwrap().path();
+                if path.is_dir() {
+                    stack.push(path);
+                    continue;
+                }
+                if path.extension().and_then(|x| x.to_str()) != Some("rs") {
+                    continue;
+                }
+                let src = std::fs::read_to_string(&path).unwrap();
+                // The whole file: a module may have code after its tests.
+                let helper = src.find("pub(crate) async fn send_review_job");
+                let needle = concat!("WorkerMessage::", "Review(");
+                for (at, _) in src.match_indices(needle) {
+                    let in_helper =
+                        helper.is_some_and(|h| at > h && src[h..at].find("\n}\n").is_none());
+                    // `send_to_queue_after` reads the message to show it as
+                    // queued on the dashboard; it doesn't build one.
+                    let reads = src[at..].starts_with(concat!("WorkerMessage::", "Review(r)"));
+                    if !in_helper && !reads {
+                        offenders.push(path.display().to_string());
+                    }
+                }
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "review jobs sent around send_review_job: {offenders:?}"
+        );
+    }
+
     #[tokio::test]
     async fn an_install_without_checks_write_is_left_alone() {
         use common::review_check::{fake::FakeChecks, Queued};
         let gh = FakeChecks::refusing();
-        assert_eq!(spot(88_001).queue(&gh, 180).await, Queued::Nothing);
+        let m = job("synchronize", "head#x", None, false);
+        assert_eq!(spot(88_001).show(&gh, &m, 180).await, Queued::Nothing);
         spot(88_001).not_queued(&gh).await;
         assert!(gh.calls.lock().unwrap().iter().all(|c| c == "list"));
         assert_eq!(gh.count(), 0);

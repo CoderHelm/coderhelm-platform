@@ -16,9 +16,9 @@ use serde_json::Value;
 use tracing::{info, warn};
 
 use super::github_webhook::{
-    check_run_budget, load_review_config, may_start_work, post_limit_comment, send_to_queue_after,
+    check_run_budget, load_review_config, may_start_work, post_limit_comment, send_review_job,
 };
-use crate::models::{ReviewMessage, WorkerMessage};
+use crate::models::ReviewMessage;
 use crate::AppState;
 
 /// A description edit that may answer the review.
@@ -284,13 +284,7 @@ pub(crate) async fn handle(
         "Description edited to answer the review — re-review queued"
     );
     let message = review_message(payload, team_id, installation_id, &cfg.label, &edit);
-    let sent = send_to_queue_after(
-        state,
-        &state.config.ticket_queue_url,
-        &WorkerMessage::Review(message),
-        desc::SETTLE_SECS,
-    )
-    .await;
+    let sent = send_review_job(state, message, head_sha, desc::SETTLE_SECS).await;
     if sent.is_err() {
         // Not queued: the next edit (or GitHub's redelivery) may try again.
         common::claim::release(&state.dynamo, table, team_id, &settle_sk).await;

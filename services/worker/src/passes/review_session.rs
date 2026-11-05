@@ -64,11 +64,6 @@ pub(crate) fn reading_title(files: &[String], head: &str) -> String {
     }
 }
 
-/// Pure: the title of a check its job has just taken over.
-pub(crate) fn started_title(head: &str) -> String {
-    format!("Reviewing {}", rc::short(head))
-}
-
 /// Why a job ended without a new review, for its check.
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum NotReviewed<'a> {
@@ -93,6 +88,9 @@ pub(crate) enum NotReviewed<'a> {
     /// A hunks-only re-review settled its findings; the full review
     /// follows (the check goes to it when it can).
     FullReviewFollows { head: &'a str },
+    /// A person's comment was answered and the commit has no verdict to show
+    /// again (with one, the check goes back to it, see `close_restoring`).
+    Answered { head: &'a str },
 }
 
 /// Pure: the conclusion and title of a check whose job ended without a new
@@ -157,6 +155,13 @@ pub(crate) fn not_reviewed(why: NotReviewed<'_>) -> (&'static str, String) {
             "neutral",
             format!(
                 "Changes since the last review settle its findings; a full review of {} follows",
+                rc::short(head)
+            ),
+        ),
+        NotReviewed::Answered { head } => (
+            "neutral",
+            format!(
+                "Answered your reply on {}; no verdict on this commit yet",
                 rc::short(head)
             ),
         ),
@@ -401,7 +406,10 @@ mod tests {
             reading_title(&["src/a.ts".into(), "src/b.ts".into(), "c".into()], head),
             "Reading 3 changed files at 9fceb02: src/a.ts and 2 more"
         );
-        assert_eq!(started_title(head), "Reviewing 9fceb02");
+        assert_eq!(
+            rc::started_title(rc::Work::Review, head),
+            "Reviewing 9fceb02"
+        );
         assert_eq!(
             session_url("https://app.example", "j"),
             "https://app.example/reviewer/session?id=j"
@@ -529,7 +537,14 @@ mod tests {
         let key = format!("head#{HEAD}");
         // Job start: in progress at once, the same check.
         assert_eq!(
-            rc::start(&gh, &target(), &key, &started_title(HEAD), "pr-page").await,
+            rc::start(
+                &gh,
+                &target(),
+                &key,
+                &rc::started_title(rc::Work::Review, HEAD),
+                "pr-page"
+            )
+            .await,
             Some(id)
         );
         assert_eq!(gh.run(id)["status"], "in_progress");
@@ -574,7 +589,14 @@ mod tests {
             let gh = FakeChecks::default();
             let id = queued(&gh).await;
             let key = format!("head#{HEAD}");
-            rc::start(&gh, &target(), &key, &started_title(HEAD), "pr-page").await;
+            rc::start(
+                &gh,
+                &target(),
+                &key,
+                &rc::started_title(rc::Work::Review, HEAD),
+                "pr-page",
+            )
+            .await;
             let (conclusion, title) = not_reviewed(why);
             let close = check_close(
                 CheckEnd::Settled {
@@ -599,7 +621,14 @@ mod tests {
         let gh = FakeChecks::default();
         let id = queued(&gh).await;
         let key = format!("head#{HEAD}");
-        rc::start(&gh, &target(), &key, &started_title(HEAD), "pr-page").await;
+        rc::start(
+            &gh,
+            &target(),
+            &key,
+            &rc::started_title(rc::Work::Review, HEAD),
+            "pr-page",
+        )
+        .await;
         // A service error: the check waits for the retry, queued.
         let retry_key = format!("retry#1#head#{HEAD}");
         let due = now() + 60;

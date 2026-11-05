@@ -38,6 +38,11 @@ pub struct ReviewRecord {
     pub head_sha: String,
     pub created_at: String,
     pub body: String,
+    /// What the verdict rested on; `None` on a record older than fingerprints
+    /// (it counts as changed).
+    pub fingerprint: Option<super::review_fingerprint::Fingerprint>,
+    /// What held the merge, by name.
+    pub holding: Vec<String>,
 }
 
 impl ReviewRecord {
@@ -121,6 +126,8 @@ fn record_from_item(i: &HashMap<String, AttributeValue>) -> ReviewRecord {
         head_sha: s_of(i, "head_sha"),
         created_at: s_of(i, "created_at"),
         body: s_of(i, "body"),
+        fingerprint: serde_json::from_str(&s_of(i, "fingerprint")).ok(),
+        holding: serde_json::from_str(&s_of(i, "holding")).unwrap_or_default(),
     }
 }
 
@@ -429,6 +436,7 @@ fn sweep_message(
         thread_root_id: None,
         mentioned: false,
         requested_by: String::new(),
+        check_head: String::new(),
         attempt: 0,
         wait_secs: 0,
         reconcile_note: None,
@@ -454,6 +462,8 @@ mod tests {
             head_sha: "a1b2c3d".into(),
             created_at: at.into(),
             body: body.into(),
+            fingerprint: None,
+            holding: Vec::new(),
         }
     }
 
