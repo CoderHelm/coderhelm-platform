@@ -1408,6 +1408,23 @@ pub fn update_models(status: Option<&Value>) -> Option<Check> {
             Fix::text("Wait a few minutes, then check again.").href("/settings/system#readiness"),
         ));
     }
+    if mc["stalled"].as_bool() == Some(true) {
+        // The release check stopped reporting (or couldn't verify the
+        // release): it holds the update, and says so, never "Checking".
+        return Some(Check::not_ok(
+            Status::Warn,
+            "update_models",
+            M,
+            label,
+            mc["note"]
+                .as_str()
+                .map(str::to_string)
+                .unwrap_or_else(|| format!("Checking {version} didn't finish.")),
+            "The update waits until the release is verified and every model it calls answers.",
+            Fix::text("Check again to start the release check over.")
+                .href("/settings/system#version"),
+        ));
+    }
     if mc["ok"].as_bool() == Some(true) || failing.is_empty() {
         return Some(Check::pass(
             "update_models",
@@ -1545,6 +1562,20 @@ pub fn preflight(checks: &[Check], status: Option<&Value>) -> Vec<Blocker> {
             detail: format!("Checking {ver}'s signature before reading the models it calls."),
             fix: Fix::text("Wait a few minutes, then check again.")
                 .href("/settings/system#readiness"),
+        });
+    }
+    if let Some(mc) = v.get("model_check").filter(|m| m["stalled"] == true) {
+        let ver = mc["version"].as_str().unwrap_or("the next release");
+        out.push(Blocker {
+            technical: None,
+            key: "model_check_stalled".into(),
+            severity: "block",
+            detail: mc["note"]
+                .as_str()
+                .map(str::to_string)
+                .unwrap_or_else(|| format!("Checking {ver} didn't finish.")),
+            fix: Fix::text("Check again to start the release check over.")
+                .href("/settings/system#version"),
         });
     }
     if let Some(mc) = v
@@ -3022,6 +3053,19 @@ mod tests {
             ("model_check_pending", "block")
         );
         assert!(preflight(&[], Some(&ok)).is_empty());
+        // A release check that stopped reporting: held, with its reason, never "Checking".
+        let stalled = json!({"model_check": {"version": "v1.3.0", "ok": false, "pending": false, "stalled": true, "results": [],
+            "note": "Checking v1.3.0 didn't finish: the release check build ended FAILED without reporting back. Check again to start it over."}});
+        let c = update_models(Some(&stalled)).unwrap();
+        assert_eq!(c.status, Status::Warn);
+        assert!(c.detail.contains("ended FAILED"));
+        assert!(!c.detail.contains("signature"));
+        let b = preflight(&[], Some(&stalled));
+        assert_eq!(b.len(), 1);
+        assert_eq!(
+            (b[0].key.as_str(), b[0].severity),
+            ("model_check_stalled", "block")
+        );
     }
 
     #[test]

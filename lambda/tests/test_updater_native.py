@@ -940,7 +940,8 @@ class AdminApplies(unittest.TestCase):
         later = NOW.replace(minute=30)
         u.begin(self.store, self.env, later, "v1.1.0", "owner@example.org", "update")
         self.assertEqual(self.cfn.deleted, ["arn:cs/1"])
-        self.assertEqual(self.store.get(old)["status"], "not_started")
+        self.assertEqual(self.store.get(old)["status"], "superseded")
+        self.assertIn("nothing was changed", self.store.get(old)["reason"])
         self.assertNotIn("review_id", self.store.get("UPDATE_STATE"))
 
 
@@ -1086,3 +1087,282 @@ class UninstallMode(unittest.TestCase):
 
     def test_status_says_keep_by_default(self):
         self.assertEqual(u.uninstall_status(self.store, self.env, ssm=self.ssm), {"delete_data": False, "changed_by": None, "changed_at": None})
+
+
+class ManyChangeSets(FakeCfn):
+    """CloudFormation with one record per change set: each create gets its
+    own id, and each id its own Status and ExecutionStatus."""
+
+    def __init__(self):
+        super().__init__()
+        self.made = 0
+        self.per = {}
+        self.outputs = []
+
+    def create_change_set(self, **kw):
+        self.created.append(kw)
+        self.made += 1
+        cs_id = f"arn:cs/{self.made}"
+        self.per[cs_id] = {"Status": "CREATE_PENDING", "ExecutionStatus": "UNAVAILABLE"}
+        return {"Id": cs_id}
+
+    def describe_change_set(self, ChangeSetName, StackName=None, IncludePropertyValues=False, NextToken=None):
+        if ChangeSetName in self.per:
+            if self.per[ChangeSetName] is None:
+                raise Exception(f"ChangeSet [{ChangeSetName}] does not exist")
+            self.cs = self.per[ChangeSetName]
+        return super().describe_change_set(ChangeSetName, StackName, IncludePropertyValues, NextToken)
+
+    def delete_change_set(self, ChangeSetName, StackName):
+        super().delete_change_set(ChangeSetName, StackName)
+        self.per[ChangeSetName] = None
+
+    def execute_change_set(self, ChangeSetName, StackName):
+        super().execute_change_set(ChangeSetName, StackName)
+        self.per[ChangeSetName] = {"Status": "CREATE_COMPLETE", "ExecutionStatus": "EXECUTE_IN_PROGRESS"}
+
+    def describe_stacks(self, StackName):
+        out = super().describe_stacks(StackName)
+        out["Stacks"][0]["Outputs"] = self.outputs
+        return out
+
+
+IAM_CHANGE = [{"ResourceChange": {"Action": "Add", "ResourceType": "AWS::IAM::Role", "LogicalResourceId": "NewRole"}}]
+
+
+class OnePendingUpdate(unittest.TestCase):
+    """Only one update is ever pending: preparing a newer one supersedes an
+    older prepared-but-unapplied one (its change set deleted, history keeps
+    it as superseded), and the version route returns that one. What
+    CloudFormation says decides what the route reports."""
+
+    def setUp(self):
+        self.store = u.Store(FakeDynamo(), "t")
+        self.cfn = ManyChangeSets()
+        self.cfn.nested["nested-api"] = {"Changes": IAM_CHANGE}
+        u._clients["cloudformation"] = self.cfn
+        u._clients["lambda"] = FakeLambda()
+        self._fetch, self._notify = u.fetch_template, u.notify
+        u.fetch_template = lambda url, opener=None: TEMPLATE
+        self.sent = []
+        u.notify = lambda *a, **k: self.sent.append(a[0])
+        self.env = dict(ENV, DEPLOY_ROLE_ARN=ROLE, CODERHELM_VERSION="v0.8.32")
+        for v in ("v0.8.37", "v0.8.39"):
+            self.store.put(f"MANIFEST#{v}", {"verified": True, "manifest": None, "template_sha256": SHA})
+
+    def tearDown(self):
+        u.fetch_template, u.notify = self._fetch, self._notify
+        u._clients.pop("cloudformation", None)
+        u._clients.pop("lambda", None)
+
+    def status(self, at=NOW):
+        return u.handle({"action": "status"}, self.env, self.store, at, fetch=lambda repo: [
+            {"tag_name": "v0.8.37"}, {"tag_name": "v0.8.39"}])
+
+    def prepared(self, version, at):
+        """An admin's Update to `version`, prepared: it waits for the OK (it changes IAM)."""
+        e = u.begin(self.store, self.env, at, version, "owner@example.org", "update")
+        self.cfn.per[e["change_set_id"]] = {"Status": "CREATE_COMPLETE", "ExecutionStatus": "AVAILABLE"}
+        self.assertEqual(u.native_poll(self.store, self.env, at)["native"], "review")
+        return e
+
+    def test_a_newer_prepared_update_supersedes_the_older_one(self):
+        old = self.prepared("v0.8.37", NOW)
+        new = self.prepared("v0.8.39", NOW.replace(minute=20))
+        # The older change set never ran: deleted, and kept in history as superseded.
+        self.assertEqual(self.cfn.deleted, [old["change_set_id"]])
+        row = self.store.get(old["id"])
+        self.assertEqual(row["status"], "superseded")
+        self.assertEqual(row["superseded_by"], new["id"])
+        self.assertIn("replaced by the update to v0.8.39", row["reason"])
+        s = self.status(NOW.replace(minute=21))
+        p = s["native"]["pending"]
+        self.assertEqual((p["version"], p["status"], p["id"]), ("v0.8.39", "review", new["id"]))
+        self.assertTrue(p["permission_changes"])
+        self.assertEqual([h["status"] for h in s["history"]], ["review", "superseded"])
+
+    def test_an_older_prepared_update_left_open_is_superseded_by_the_newest(self):
+        # What an older updater left: the state points at v0.8.37 waiting for
+        # an OK, while a newer v0.8.39 change set was prepared and sits open.
+        old = self.prepared("v0.8.37", NOW)
+        self.cfn.per["arn:cs/2"] = {"Status": "CREATE_COMPLETE", "ExecutionStatus": "AVAILABLE"}
+        newer = "UPDATE#2026-10-31T12:20:00Z#bbbbbbbb"
+        self.store.put(newer, {"version": "v0.8.39", "from_version": "v0.8.32", "actor": "owner@example.org", "mode": "update",
+                               "status": "review", "started_at": NOW.replace(minute=20).isoformat(), "change_set_id": "arn:cs/2",
+                               "apply": True, "role_arn": ROLE, "template_canonical": u.canonical_sha(json.loads(TEMPLATE))})
+        s = self.status(NOW.replace(minute=25))
+        self.assertEqual(s["native"]["pending"]["version"], "v0.8.39")
+        self.assertEqual(s["native"]["pending"]["id"], newer)
+        self.assertEqual(self.store.get(old["id"])["status"], "superseded")
+        self.assertEqual(self.store.get("UPDATE_STATE")["review_id"], newer)
+        self.assertIn(old["change_set_id"], self.cfn.deleted)
+        statuses = {h["id"]: h["status"] for h in s["history"]}
+        self.assertEqual(statuses, {newer: "review", old["id"]: "superseded"})
+
+    def test_history_never_shows_two_updates_waiting(self):
+        old = self.prepared("v0.8.37", NOW)
+        stray = dict(self.store.get(old["id"]))
+        self.prepared("v0.8.39", NOW.replace(minute=20))
+        # A lost race wrote the older row back as it was.
+        self.store.put(old["id"], stray)
+        rows = u.history_view(self.store.history(), self.store.get("UPDATE_STATE"), NOW)
+        self.assertEqual([r["status"] for r in rows], ["review", "superseded"])
+
+    def test_one_still_being_prepared_is_not_replaced_mid_way(self):
+        u.begin(self.store, self.env, NOW, "v0.8.37", "owner@example.org", "update")
+        with self.assertRaisesRegex(ValueError, "still being prepared"):
+            u.begin(self.store, self.env, NOW.replace(minute=1), "v0.8.39", "owner@example.org", "update")
+        self.assertEqual(self.cfn.deleted, [])
+
+    def test_a_change_set_executed_in_aws_is_never_replaced(self):
+        old = self.prepared("v0.8.37", NOW)
+        self.cfn.per[old["change_set_id"]] = {"Status": "CREATE_COMPLETE", "ExecutionStatus": "EXECUTE_IN_PROGRESS"}
+        with self.assertRaisesRegex(ValueError, "already being applied"):
+            u.begin(self.store, self.env, NOW.replace(minute=20), "v0.8.39", "owner@example.org", "update")
+        self.assertEqual(self.cfn.deleted, [])
+
+    def test_preparing_then_review_without_waiting_for_the_poll(self):
+        e = u.begin(self.store, self.env, NOW, "v0.8.39", "owner@example.org", "update")
+        self.assertEqual(self.status()["native"]["pending"]["status"], "preparing")
+        # The change set is ready and holds an IAM change: the route says so at once.
+        self.cfn.per[e["change_set_id"]] = {"Status": "CREATE_COMPLETE", "ExecutionStatus": "AVAILABLE"}
+        p = self.status(NOW.replace(minute=2))["native"]["pending"]
+        self.assertEqual(p["status"], "review")
+        self.assertTrue(p["can_apply"])
+        self.assertTrue(p["confirm"])
+        self.assertEqual(p["actor"], "owner@example.org")
+        self.assertEqual(self.cfn.executed, [])
+
+    def test_executed_in_the_console_reads_as_applying_then_updated(self):
+        e = self.prepared("v0.8.39", NOW)
+        # Someone executed the change set in the AWS console.
+        self.cfn.per[e["change_set_id"]] = {"Status": "CREATE_COMPLETE", "ExecutionStatus": "EXECUTE_IN_PROGRESS"}
+        self.cfn.stack_status = "UPDATE_IN_PROGRESS"
+        s = self.status(NOW.replace(minute=10))
+        p = s["native"]["pending"]
+        self.assertEqual(p["status"], "running")
+        self.assertEqual(p["applied_by"], u.CONSOLE_ACTOR)
+        self.assertNotIn("confirm", p)
+        self.assertTrue(s["running"])
+        self.assertNotIn("review_id", self.store.get("UPDATE_STATE"))
+        # Done: the stack reports the new release.
+        self.cfn.per[e["change_set_id"]] = {"Status": "CREATE_COMPLETE", "ExecutionStatus": "EXECUTE_COMPLETE"}
+        self.cfn.stack_status = "UPDATE_COMPLETE"
+        self.cfn.outputs = [{"OutputKey": "Version", "OutputValue": "v0.8.39"}]
+        s = self.status(NOW.replace(minute=25))
+        self.assertIsNone(s["native"]["pending"])
+        self.assertFalse(s["running"])
+        self.assertEqual(s["history"][0]["status"], "succeeded")
+
+    def test_executed_in_the_console_and_rolled_back_says_why(self):
+        e = self.prepared("v0.8.39", NOW)
+        self.cfn.per[e["change_set_id"]] = {"Status": "CREATE_COMPLETE", "ExecutionStatus": "EXECUTE_FAILED"}
+        self.cfn.stack_status = "UPDATE_ROLLBACK_COMPLETE"
+        self.cfn.events = [{"LogicalResourceId": "Worker", "ResourceStatus": "UPDATE_FAILED", "ResourceStatusReason": "Resource limit exceeded",
+                            "Timestamp": NOW.replace(minute=11).isoformat()}]
+        s = self.status(NOW.replace(minute=15))
+        self.assertIsNone(s["native"]["pending"])
+        h = s["history"][0]
+        self.assertEqual(h["status"], "rolled_back")
+        self.assertIn("stayed on v0.8.32", h["summary"])
+        self.assertIn("Resource limit exceeded", h["technical"])
+
+    def test_a_stack_that_reports_another_release_is_not_a_success(self):
+        e = self.prepared("v0.8.39", NOW)
+        self.cfn.per[e["change_set_id"]] = {"Status": "CREATE_COMPLETE", "ExecutionStatus": "EXECUTE_COMPLETE"}
+        self.cfn.outputs = [{"OutputKey": "Version", "OutputValue": "v0.8.37"}]
+        self.assertEqual(self.status()["history"][0]["status"], "failed")
+
+    def test_just_applied_never_goes_back_to_waiting_for_an_ok(self):
+        e = self.prepared("v0.8.39", NOW)
+        token = self.status()["native"]["pending"]["confirm"]
+        self.assertEqual(u.handle({"action": "apply_update", "actor": "owner@example.org", "confirm": token},
+                                  self.env, self.store, NOW)["status"], "running")
+        # CloudFormation still answers AVAILABLE for a moment.
+        self.cfn.per[e["change_set_id"]] = {"Status": "CREATE_COMPLETE", "ExecutionStatus": "AVAILABLE"}
+        self.assertEqual(self.status()["native"]["pending"]["status"], "running")
+
+    def test_a_poll_never_writes_over_a_newer_state(self):
+        e = u.begin(self.store, self.env, NOW, "v0.8.39", "owner@example.org", "update")
+        self.cfn.per[e["change_set_id"]] = {"Status": "CREATE_IN_PROGRESS", "ExecutionStatus": "UNAVAILABLE"}
+        real = self.cfn.describe_change_set
+
+        def meanwhile(*a, **k):
+            # A newer update replaced this one while the poll read CloudFormation.
+            row = self.store.get(e["id"])
+            self.store.put(e["id"], dict(row, status="superseded"))
+            return real(*a, **k)
+        self.cfn.describe_change_set = meanwhile
+        u.native_poll(self.store, self.env, NOW)
+        self.assertEqual(self.store.get(e["id"])["status"], "superseded")
+
+
+class ModelCheckTruth(unittest.TestCase):
+    """The version route's model check is pending only while the release
+    check really runs: it clears once the release is verified, and a check
+    that stopped reporting shows as stalled, never as Checking forever."""
+
+    def setUp(self):
+        self.store = u.Store(FakeDynamo(), "t")
+        self.cb = FakeCodeBuild()
+        u._clients["codebuild"] = self.cb
+        self.env = dict(ENV, CODERHELM_VERSION="v0.8.32", RELEASE_CHECK_PROJECT_NAME="coderhelm-prod-release-check")
+        self.started = []
+        self._check, self._notify = u.start_check, u.notify
+        u.start_check = lambda env, version: self.started.append(version) or f"c-{len(self.started)}"
+        u.notify = lambda *a, **k: None
+
+    def tearDown(self):
+        u.start_check, u.notify = self._check, self._notify
+        u._clients.pop("codebuild", None)
+
+    def status(self, at):
+        return u.handle({"action": "status"}, self.env, self.store, at, fetch=lambda repo: [{"tag_name": "v0.8.39"}])
+
+    def pending(self, at=NOW):
+        return u.model_check(self.store, self.env, at, "v0.8.39", u.RELEASE_REPO)
+
+    def test_pending_while_the_release_check_runs_with_its_progress(self):
+        self.pending()
+        self.cb.builds["c-1"] = {"id": "c-1", "buildStatus": "IN_PROGRESS"}
+        mc = self.status(NOW.replace(minute=4))["model_check"]
+        self.assertTrue(mc["pending"])
+        self.assertEqual(mc["progress"], {"step": "signature", "started_at": NOW.isoformat(), "build": "IN_PROGRESS"})
+
+    def test_a_verified_release_is_never_still_checking(self):
+        self.pending()
+        # The release was verified (and an update prepared from it), the record left behind.
+        self.store.put("MANIFEST#v0.8.39", {"verified": True, "manifest": None, "template_sha256": SHA})
+        mc = self.status(NOW.replace(minute=6))["model_check"]
+        self.assertFalse(mc.get("pending"))
+        self.assertTrue(mc["ok"])
+        self.assertFalse(self.store.get("MODEL_CHECK").get("pending"))
+
+    def test_a_build_that_ended_without_reporting_is_stalled_and_restarts(self):
+        self.pending()
+        self.cb.builds["c-1"] = {"id": "c-1", "buildStatus": "FAILED"}
+        mc = self.status(NOW.replace(minute=5))["model_check"]
+        self.assertFalse(mc["pending"])
+        self.assertTrue(mc["stalled"])
+        self.assertIn("ended FAILED", mc["note"])
+        # It still holds the update.
+        self.assertTrue(u.blocking(self.store.get("MODEL_CHECK"), "v0.8.39"))
+        # Check again starts it over at once, not 30 minutes later.
+        u.handle({"action": "model_check", "version": "v0.8.39"}, self.env, self.store, NOW.replace(minute=6))
+        self.assertEqual(self.started, ["v0.8.39", "v0.8.39"])
+
+    def test_a_check_past_its_time_bound_is_stalled(self):
+        self.pending()
+        mc = self.status(NOW + u.CHECK_LIMIT + u.timedelta(minutes=1))["model_check"]
+        self.assertTrue(mc["stalled"])
+        self.assertIn("within 30 minutes", mc["note"])
+
+    def test_a_failed_release_check_says_so_and_holds(self):
+        self.pending()
+        u.handle({"action": "models_verified", "version": "v0.8.39", "build": "c-1", "status": "failed", "reason": "bad signature"},
+                 self.env, self.store, NOW.replace(minute=3))
+        rec = self.store.get("MODEL_CHECK")
+        self.assertFalse(rec["pending"])
+        self.assertTrue(rec["stalled"])
+        self.assertIn("bad signature", rec["note"])
+        self.assertTrue(u.blocking(rec, "v0.8.39"))
