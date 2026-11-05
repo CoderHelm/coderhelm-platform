@@ -712,11 +712,17 @@ pub fn planner_guidance(intent: TicketIntent) -> String {
 pub const MISSING_DATA_GUIDANCE: &str = r#"## Missing or wrong data (a record that should show and doesn't, a wrong value)
 
 Trace the record through every layer it passes, in order, and find the FIRST layer where it is wrong or missing. That layer is where the fault is.
+- Reproduce first, past every cache: add a cache-busting query parameter to the page or API URL and confirm the response was a cache miss.
 - Name the layers first: where the record starts (a source system or warehouse), where it is stored (the app database), where it is copied for reading (a search index, a cache), and where it is shown (the page or API). Record each one in `evidence.layers`: the repository or system that holds it, and what the record looks like there.
 - The code that produces a layer is often in another of the team's repositories (a sync, an indexer or a pipeline job in a data or pipelines repository). When a search in this repository finds nothing, search the team's other repositories by the same names before you call a step unknown; pass `repo` to `search_code`, `read_file_lines` and `list_directory`. Read only; the fix still goes where the fault is.
 - Look records up by their stable ids, never by display names: names can be hidden, renamed or shared by several records. When two findings disagree about one record (the same record under two ids, two values for one field), settle which is right before you build on either.
 - Before reading a field's meaning from its name, read the code that writes it. A field can be copied from another field or filled by a default, and then its name says nothing.
 - For an incremental sync, compare the record's change time (`updated_at` or the like) with the sync's cursor or last run mark, and read the sync's recent runs and warnings, before you suspect a business rule. A record changed before the cursor moved past it, or a run that failed or warned, explains a missing record without any rule being wrong.
+- Every layer looking healthy while the person still can't see the record means the trace is incomplete, not done. Find the exact query the client sends (its filters, sort, page size), run it, and remove one filter at a time until the record comes back. Diff its fields against a similar record that does show.
+- In every date comparison, check the time zone of each side: a stored wall-clock time compared with a UTC instant shifts records across the boundary.
+- Measure the blast radius: how many records share the defect, and which other pages, queries or paths use the same filter. The fix covers every one of them.
+- A fix is proven only when the real API response or page shows the record. A matching filter or a passing test is not that proof: until that check runs, call the fix unproven and name the exact check.
+- Never print or fetch credentials to answer a question (production secrets, API keys, tokens). If one reaches a tool's output, stop using it and put "rotate this credential" first in what you report.
 - When the ticket is about production, check production data directly with the connected sources.
 - Use the team's own tools and data sources first (the tools named for this team, its saved lookups, its knowledge bases); they were built for exactly these questions. Never guess what a lookup can show.
 - When the next step is one you can't take (a job only a person can run, access you don't have), don't ask an open question: set `fix_location` to `unknown` and fill `next_step` with that one action and what each outcome would mean."#;
@@ -1408,6 +1414,19 @@ mod investigation_tests {
             "check production data directly",
             "the team's own tools and data sources first",
             "`next_step`",
+            "cache-busting query parameter",
+            "cache miss",
+            "the trace is incomplete, not done",
+            "exact query the client sends",
+            "remove one filter at a time",
+            "similar record that does show",
+            "time zone of each side",
+            "blast radius",
+            "covers every one of them",
+            "real API response or page",
+            "call the fix unproven and name the exact check",
+            "Never print or fetch credentials",
+            "rotate this credential",
         ] {
             assert!(MISSING_DATA_GUIDANCE.contains(want), "{want}");
         }

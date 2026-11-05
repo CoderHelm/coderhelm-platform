@@ -177,6 +177,9 @@ const SHAPE_RULES: &str = "\
 - CoderHelm adds these sections itself, from the plan and the coder's notes: the existing block \
 the change copies, the merge order of a multi-repo change, **Not in this PR** and **Open items**. \
 Don't write them, and don't add a warning or note banner anywhere.
+- Verification says the change works only where its real output (the real API response or page) \
+was checked and shows it. A matching filter or a passing test is not that; otherwise write \
+**Unproven** and the exact check a person should run.
 - Write real values: every path, name and id in full, with its environment filled in \
 (`/app/prod/db-password`, never `/app//db-password`), never a template left as `${env}`, `<env>`, \
 `{}` or empty backticks.
@@ -1489,6 +1492,7 @@ fn owned_sections(plan: &PlanResult, proof: &Proof<'_>, repo: &str) -> super::co
         ),
         review_fixes: String::new(),
         open_findings: String::new(),
+        objections: String::new(),
         // A small failing-test fix carries no open items or questions.
         open_items: if small_test_fix {
             String::new()
@@ -1711,6 +1715,27 @@ Return ONLY the markdown body text, then a line `{CHANGES_MARK}` and one bullet 
         super::completeness::assemble(&rest, &kept)
     };
     let body = super::release_plan::put_section(&body, &release_section);
+    // A reviewer's standing request for changes is stated at the top. An
+    // unreadable review list keeps whatever the description said before.
+    let body = match super::review_actions::fetch_approvals(
+        github,
+        owner,
+        repo,
+        pr_number,
+        pr["head"]["sha"].as_str().unwrap_or(""),
+    )
+    .await
+    {
+        Ok(a) => super::completeness::with_section(
+            &body,
+            super::completeness::Section::Objections,
+            super::completeness::objections_section(&a.blocking_by),
+        ),
+        Err(e) => {
+            warn!(pr_number, error = %e, "Could not read the PR's reviews; objections left as they were");
+            body
+        }
+    };
     if body == current {
         return None;
     }
@@ -1936,6 +1961,14 @@ mod refresh_tests {
         evidence_instructions, keeps_ticket_line, manual_instructions, pr_title, squash_message,
         writer_system,
     };
+
+    #[test]
+    fn verification_claims_only_what_the_real_output_showed() {
+        let rules = super::SHAPE_RULES;
+        assert!(rules.contains("real output (the real API response or page)"));
+        assert!(rules.contains("A matching filter or a passing test is not that"));
+        assert!(rules.contains("**Unproven** and the exact check a person should run"));
+    }
 
     #[test]
     fn checks_only_a_person_can_do_become_verification_steps() {

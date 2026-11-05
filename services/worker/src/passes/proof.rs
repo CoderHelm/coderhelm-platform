@@ -32,6 +32,8 @@ pub const CODER_RULES: &str = "
 - Logging: INFO only for actual changes and decisions; diagnostics go to DEBUG. Never add an INFO log that fires for every record or on every scheduled run.
 - Never leave \"unconfirmed\", \"not verified\" or \"not measured\" for something a connected source could answer: look it up. When no connected source can reach it, say exactly which source is missing.
 - A lookup that failed or came back empty (an empty list, no rows) confirms nothing about the system: it is not a payload. Find out why (a wrong path, a parent id from another record, a wrong table) and read again until a real record comes back.
+- \"Fixed\" means seen fixed in the real output (the real API response or page). A matching filter or a passing unit test is not that. When you can't run that check, write `- Unconfirmed [external:<the page or API>]:` saying the fix is unproven and the exact check a person should run.
+- Never run a command that prints credentials, and never fetch production secrets or API keys to answer a question. If a secret reaches a tool's output, stop using it and start your summary with \"Rotate this credential\" and where it appeared.
 
 ## Reading another system's data (every change that does)
 - Actual data first, always: before deciding how to read another system's records, read real ones (a payload, a row) for the ticket's records and a broad sample of others, and list every field on them. Decide from what you saw, never from names in the code, a schema or a guess.
@@ -2054,6 +2056,12 @@ mod tests {
         assert!(CODER_RULES.contains("fixtures from real payloads"));
         assert!(CODER_RULES.contains("No manual backfills or one-off scripts"));
         assert!(CODER_RULES.contains("no hard-coded ids, names, seasons or prices"));
+        // Fixed means seen fixed; secrets never printed or fetched.
+        assert!(CODER_RULES.contains("seen fixed in the real output"));
+        assert!(CODER_RULES.contains("A matching filter or a passing unit test is not that"));
+        assert!(CODER_RULES.contains("the fix is unproven and the exact check a person should run"));
+        assert!(CODER_RULES.contains("Never run a command that prints credentials"));
+        assert!(CODER_RULES.contains("Rotate this credential"));
         assert!(EVIDENCE_OUTPUT.contains("`Evidence:`"));
     }
 

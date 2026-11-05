@@ -128,10 +128,14 @@ pub enum Section {
     /// yet, at the very top: the PR stays a draft while any is listed (see
     /// `own_review`).
     OpenFindings,
+    /// Reviewers whose standing request for changes is still open, above
+    /// everything: a reader never ships over an objection without seeing it
+    /// (see [`objections_section`]).
+    Objections,
 }
 
 impl Section {
-    const ALL: [Section; 8] = [
+    const ALL: [Section; 9] = [
         Section::Links,
         Section::Mirrors,
         Section::MergeOrder,
@@ -140,6 +144,7 @@ impl Section {
         Section::OpenItems,
         Section::Unfinished,
         Section::OpenFindings,
+        Section::Objections,
     ];
 
     /// Its start and end markers.
@@ -162,6 +167,7 @@ impl Section {
             Section::OpenItems => (super::proof::UNVERIFIED_START, super::proof::UNVERIFIED_END),
             Section::Unfinished => (super::proof::UNFINISHED_START, super::proof::UNFINISHED_END),
             Section::OpenFindings => (super::own_review::START, super::own_review::END),
+            Section::Objections => (OBJECTIONS_START, OBJECTIONS_END),
         }
     }
 }
@@ -197,6 +203,7 @@ pub struct Owned {
     pub open_items: String,
     pub unfinished: String,
     pub open_findings: String,
+    pub objections: String,
 }
 
 impl Owned {
@@ -210,6 +217,7 @@ impl Owned {
             Section::OpenItems => &mut self.open_items,
             Section::Unfinished => &mut self.unfinished,
             Section::OpenFindings => &mut self.open_findings,
+            Section::Objections => &mut self.objections,
         }
     }
 
@@ -381,7 +389,37 @@ pub fn assemble(rest: &str, owned: &Owned) -> String {
             format!("{open_findings}\n\n{body}")
         };
     }
+    // Open reviewer objections go above even those.
+    let objections = owned.objections.trim();
+    if !objections.is_empty() {
+        body = if body.is_empty() {
+            objections.to_string()
+        } else {
+            format!("{objections}\n\n{body}")
+        };
+    }
     format!("{body}{footer}")
+}
+
+pub const OBJECTIONS_START: &str = "<!-- coderhelm:objections -->";
+pub const OBJECTIONS_END: &str = "<!-- /coderhelm:objections -->";
+
+/// The reviewers whose latest verdict still requests changes, for the top of
+/// the description. Logins are written in backticks so nobody is notified.
+/// Empty when nobody objects.
+pub fn objections_section(blocking_by: &[String]) -> String {
+    if blocking_by.is_empty() {
+        return String::new();
+    }
+    let who = blocking_by
+        .iter()
+        .map(|l| format!("`{}`", plain(l)))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "{OBJECTIONS_START}\n**Open reviewer objection:** {who} requested changes and has not \
+         approved since. Settle it before merging.\n{OBJECTIONS_END}"
+    )
 }
 
 /// `body` with one of CoderHelm's sections set to `text` (empty removes it),
@@ -931,6 +969,32 @@ mod tests {
     use super::*;
     use crate::passes::fix_location::{EndToEndStep, FixLocation};
 
+    #[test]
+    fn an_open_reviewer_objection_goes_first_and_leaves_when_settled() {
+        assert_eq!(objections_section(&[]), "");
+        let s = objections_section(&["alice".into(), "bob".into()]);
+        assert!(s.contains("`alice`, `bob` requested changes"), "{s}");
+        assert!(!s.contains('@'), "nobody is notified: {s}");
+        let rest = "Source ticket: OPS-1\n\n**Summary** x";
+        let owned = Owned {
+            open_findings: format!(
+                "{}\nfinding\n{}",
+                crate::passes::own_review::START,
+                crate::passes::own_review::END
+            ),
+            objections: s.clone(),
+            ..Default::default()
+        };
+        let body = assemble(rest, &owned);
+        assert!(body.starts_with(OBJECTIONS_START), "{body}");
+        // Kept through a rewrite, and gone once nobody objects.
+        let (kept, _) = take_owned(&body);
+        assert_eq!(kept.objections, s);
+        let settled = with_section(&body, Section::Objections, objections_section(&[]));
+        assert!(!settled.contains("coderhelm:objections"), "{settled}");
+        assert!(settled.contains("**Summary** x"));
+    }
+
     fn step(step: &str, by: &str, owner: &str, repo: &str) -> EndToEndStep {
         EndToEndStep {
             step: step.into(),
@@ -1117,6 +1181,7 @@ mod tests {
         let owned = Owned {
             unfinished: String::new(),
             open_findings: String::new(),
+            objections: String::new(),
             links: String::new(),
             mirrors: mirrors_section(&[Mirror {
                 path: "envs/prod/users.tf".into(),
