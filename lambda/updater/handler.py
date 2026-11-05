@@ -1341,10 +1341,14 @@ def start_verify(store, env, now, version):
     v = state.get("verifying") or {}
     if v.get("version") == version:
         try:
-            if now - datetime.fromisoformat(v["at"]) < VERIFY_RETRY:
-                return False
+            recent = now - datetime.fromisoformat(v["at"]) < VERIFY_RETRY
         except (KeyError, ValueError):
-            pass
+            recent = False
+        # A build that ended without reporting back (it crashed, or was
+        # stopped) is started again at once: waiting 30 minutes for it would
+        # only keep the page saying "Checking".
+        if recent and (v.get("claim") or build_state(v.get("build")) in (None, "IN_PROGRESS")):
+            return False
     try:
         build = start_check(env, version)
     except Exception as e:
@@ -1353,6 +1357,19 @@ def start_verify(store, env, now, version):
     state["verifying"] = {"version": version, "at": now.isoformat(), "build": build}
     store.put("UPDATE_STATE", state)
     return True
+
+
+def build_state(build_id, cb=None):
+    """CodeBuild's status for a release check build (IN_PROGRESS, SUCCEEDED,
+    FAILED, ...), or None when it can't be read."""
+    if not build_id:
+        return None
+    try:
+        builds = (cb or client("codebuild")).batch_get_builds(ids=[build_id]).get("builds") or []
+    except Exception as e:  # noqa: BLE001  unknown is not a result
+        logger.warning(f"Release check build not read: {e}")
+        return None
+    return (builds[0].get("buildStatus") if builds else None) or None
 
 
 def claim_problem(event, state, version):
@@ -1446,7 +1463,7 @@ def blocking(record, version):
     """True when the check for `version` found a model the release calls
     refused, or hasn't run yet because the release's signature is being checked."""
     return bool(record and record.get("version") == version
-                and (record.get("pending") or failures(record, required=True)))
+                and (record.get("pending") or record.get("stalled") or failures(record, required=True)))
 
 
 def failures(record, required=None):
@@ -1462,7 +1479,9 @@ def model_check(store, env, now, version, repo, probe=invoke_worker):
     known, manifest = verified_manifest(store, version)
     if not known:
         start_verify(store, env, now, version)
+        v = (store.get("UPDATE_STATE", {}) or {}).get("verifying") or {}
         record = {"version": version, "checked_at": now.isoformat(), "ok": False, "pending": True, "results": [],
+                  "started_at": v.get("at") if v.get("version") == version else now.isoformat(),
                   "note": "checking the release's signature before reading the models it calls"}
         store.put("MODEL_CHECK", dict(record, notified=False))
         return record
@@ -1499,6 +1518,49 @@ def model_check(store, env, now, version, repo, probe=invoke_worker):
     return record
 
 
+# A release check normally reports back within a few minutes. Past this, a
+# check still "pending" is shown as stalled (with Check again), never as
+# "Checking" forever.
+CHECK_LIMIT = timedelta(minutes=30)
+
+
+def model_check_view(store, env, now, version, probe=None, cb=None):
+    """The model check for `version` as it really stands, for the version
+    route: a pending record whose release was verified since is checked now
+    (the record was left behind); one whose release check build ended
+    without reporting back, or that is older than CHECK_LIMIT, is stalled.
+    Pending carries its progress: the step and when it started."""
+    mc = store.get("MODEL_CHECK")
+    if not version or not mc or mc.get("version") != version:
+        return None
+    if not mc.get("pending"):
+        return mc
+    known, _ = verified_manifest(store, version)
+    if known:
+        try:
+            return model_check(store, env, now, version, env.get("RELEASE_REPO", RELEASE_REPO), probe or invoke_worker)
+        except Exception as e:  # noqa: BLE001  the stored record still stands
+            logger.warning(f"Model check not run: {e}")
+    v = (store.get("UPDATE_STATE", {}) or {}).get("verifying") or {}
+    mine = v.get("version") == version
+    started = (v.get("at") if mine else None) or mc.get("started_at") or mc.get("checked_at")
+    build = build_state(v.get("build"), cb) if mine else None
+    view = dict(mc, progress={"step": "signature", "started_at": started, "build": build})
+    reason = ""
+    if build and build != "IN_PROGRESS" and not v.get("claim"):
+        reason = f"the release check build ended {build} without reporting back"
+    else:
+        try:
+            if now - datetime.fromisoformat(started) > CHECK_LIMIT:
+                reason = "the release check didn't report back within 30 minutes"
+        except (TypeError, ValueError):
+            pass
+    if reason:
+        view.update(pending=False, stalled=True, ok=False,
+                    note=f"Checking {version} didn't finish: {reason}. Check again to start it over.")
+    return view
+
+
 def provider_note(answer, results):
     """Why nothing was called: an install on Anthropic API keys checks the
     models through a team's key (the worker never calls Bedrock for it), and
@@ -1513,7 +1575,7 @@ def provider_note(answer, results):
 
 
 def needs_check(record, version, now):
-    if not record or record.get("version") != version or record.get("pending"):
+    if not record or record.get("version") != version or record.get("pending") or record.get("stalled"):
         return True
     try:
         at = datetime.fromisoformat(record["checked_at"])
@@ -2042,7 +2104,10 @@ def native_status(store, env, state):
     entry = store.get(hid, {}) if hid else {}
     pending = None
     if entry.get("change_set_id"):
-        pending = dict(entry.get("change_set") or {}, version=entry.get("version"), status=entry.get("status"), id=hid)
+        pending = dict(entry.get("change_set") or {}, version=entry.get("version"), status=entry.get("status"), id=hid,
+                       # Who started it, and who applied it (an admin here, or someone in the AWS console).
+                       actor=entry.get("actor"), started_at=entry.get("started_at"),
+                       applied_by=entry.get("applied_by"), executed_at=entry.get("executed_at"))
         if entry.get("status") == "review":
             # What an admin confirms in Settings, System before it applies.
             pending.update({
@@ -2131,7 +2196,9 @@ def first_failure(cfn, stack_name, since):
 
 
 def native_poll(store, env, now, cfn=None):
-    """Moves a proposed or running stack update along; returns what happened."""
+    """Moves a proposed or running stack update along; returns what happened.
+    What CloudFormation says decides, the stored entry only follows it: a
+    change set executed in the AWS console is followed like one applied here."""
     cfn = cfn or client("cloudformation")
     state = store.get("UPDATE_STATE", {})
     hid = state.get("running_id") or state.get("review_id")
@@ -2139,8 +2206,26 @@ def native_poll(store, env, now, cfn=None):
         return {"native": "idle"}
     entry = store.get(hid, {})
     cs_id = entry.get("change_set_id")
+    if entry.get("status") in ENDED:
+        # Ended (or replaced) while this pointer was left behind.
+        for k in ("running_id", "review_id"):
+            if state.get(k) == hid:
+                state.pop(k, None)
+                if k == "running_id":
+                    state.pop("running_since", None)
+        store.put("UPDATE_STATE", state)
+        return {"native": "idle"}
     if not cs_id:
         return {"native": "idle"}
+    was = entry.get("status")
+
+    def keep(e):
+        """Writes the entry unless someone else moved it on meanwhile (an
+        admin's Apply, a newer update replacing it): theirs stands."""
+        if (store.get(hid, {}) or {}).get("status") != was:
+            return False
+        store.put(hid, e)
+        return True
     region = env.get("AWS_REGION") or ""
     try:
         cs = cfn.describe_change_set(ChangeSetName=cs_id, StackName=env["NATIVE_STACK"])
@@ -2157,7 +2242,7 @@ def native_poll(store, env, now, cfn=None):
             return native_finish(store, env, now, hid, "succeeded", "already up to date: nothing to change")
         return native_finish(store, env, now, hid, "failed", reason, PREPARE)
     if status != "CREATE_COMPLETE":
-        store.put(hid, entry)
+        keep(entry)
         return {"native": "preparing"}
     if execution == "AVAILABLE" and "checked" not in entry:
         if not fetched_template_matches(cfn, env, cs_id, entry.get("template_canonical")):
@@ -2172,6 +2257,10 @@ def native_poll(store, env, now, cfn=None):
         entry["checked"] = True
         summary["data_changes"] = entry["data_changes"]
         entry["change_set"] = summary
+    if execution == "AVAILABLE" and entry.get("executed_at"):
+        # Executed a moment ago: CloudFormation can still answer AVAILABLE
+        # for a few seconds. It runs; it never goes back to waiting for an OK.
+        return {"native": "running"}
     if execution == "AVAILABLE":
         # An admin's Update applies at once; a scheduled one only while auto-update is on.
         # Neither applies by itself what a person must decide.
@@ -2179,6 +2268,8 @@ def native_poll(store, env, now, cfn=None):
         if hold:
             entry["reason"] = hold
         if entry.get("apply") and not hold and not entry.get("executed_at"):
+            if (store.get(hid, {}) or {}).get("status") != was:
+                return {"native": "moved on"}
             cfn.execute_change_set(ChangeSetName=cs_id, StackName=env["NATIVE_STACK"])
             entry.update({"executed_at": now.isoformat(), "status": "running"})
             store.put(hid, entry)
@@ -2186,7 +2277,8 @@ def native_poll(store, env, now, cfn=None):
         if entry.get("status") != "review":
             # Waiting on an admin: not "running", so it never blocks or goes stale.
             entry["status"] = "review"
-            store.put(hid, entry)
+            if not keep(entry):
+                return {"native": "moved on"}
             state.pop("running_since", None)
             state.pop("running_id", None)
             state["review_id"] = hid
@@ -2199,20 +2291,33 @@ def native_poll(store, env, now, cfn=None):
                    f"The stack update is prepared. {entry.get('reason') or ''}\n{how}".replace(". \n", ".\n"),
                    env, what="review", version=entry.get("version"))
         else:
-            store.put(hid, entry)
+            keep(entry)
         return {"native": "review"}
-    if execution in ("EXECUTE_IN_PROGRESS", "EXECUTE_COMPLETE", "EXECUTE_FAILED"):
-        if entry.get("status") == "review":
-            # The admin executed it in the console.
-            entry.update({"status": "running", "executed_at": entry.get("executed_at") or now.isoformat()})
+    if execution in EXECUTED:
+        if entry.get("status") != "running":
+            # Executed outside the app (the AWS console or CLI), whatever the
+            # entry said: it runs now, and the page says so.
+            if not entry.get("executed_at"):
+                # When exactly isn't known, only that it was after the change set
+                # was made: its failures are read from then on.
+                entry.update({"executed_at": entry.get("started_at") or now.isoformat(), "seen_running_at": now.isoformat(),
+                              "applied_by": entry.get("applied_by") or CONSOLE_ACTOR})
+            entry["status"] = "running"
+            entry["reason"] = ""
             state.pop("review_id", None)
-            state.update({"running_since": now.isoformat(), "running_id": hid})
+            since = state.get("running_since") if state.get("running_id") == hid else None
+            state.update({"running_since": since or now.isoformat(), "running_id": hid})
             store.put("UPDATE_STATE", state)
         store.put(hid, entry)
-        st = cfn.describe_stacks(StackName=env["NATIVE_STACK"])["Stacks"][0]["StackStatus"]
+        stack = cfn.describe_stacks(StackName=env["NATIVE_STACK"])["Stacks"][0]
+        st = stack["StackStatus"]
         if st.endswith("_IN_PROGRESS"):
             return {"native": "running", "stack": st}
         if st in ("UPDATE_COMPLETE",):
+            ran = stack_version(stack)
+            if ran and entry.get("version") and ran != entry.get("version"):
+                return native_finish(store, env, now, hid, "failed",
+                                     f"the stack finished, but it reports {ran}, not {entry.get('version')}")
             return native_finish(store, env, now, hid, "succeeded", "")
         reason = first_failure(cfn, env["NATIVE_STACK"], entry.get("executed_at")) or f"the stack ended {st}"
         result = "rolled_back" if "ROLLBACK_COMPLETE" in st else "failed"
@@ -2220,8 +2325,16 @@ def native_poll(store, env, now, cfn=None):
     if execution in ("OBSOLETE", "UNAVAILABLE"):
         return native_finish(store, env, now, hid, "failed",
                              cs.get("StatusReason") or "the change set can no longer run (the stack changed since it was made)", PREPARE)
-    store.put(hid, entry)
+    keep(entry)
     return {"native": str(execution or status).lower()}
+
+
+def stack_version(stack):
+    """The release the parent stack says it runs (its Version output), or None."""
+    for o in stack.get("Outputs") or []:
+        if o.get("OutputKey") == "Version" and parse_version(o.get("OutputValue")):
+            return o["OutputValue"]
+    return None
 
 
 def native_hold(store, env, entry):
@@ -2301,22 +2414,132 @@ def native_apply(store, env, now, event, cfn=None):
     return dict(entry, id=hid)
 
 
-def supersede_review(store, env, state, now, cfn=None):
-    """A new update replaces the one waiting for review: its change set is
-    deleted and it is recorded as never started (nothing was changed)."""
-    hid = state.pop("review_id", None)
-    if not hid:
+# ── One pending update at a time ──────────────────────────────────────────
+#
+# A prepared update that never ran (a change set, not executed) is replaced
+# by the next one an admin or the window starts: its change set is deleted
+# and history keeps it as superseded. Only one update is ever pending, and
+# the version route returns that one. A change set CloudFormation says is
+# executing or executed is never replaced: that one is the update running.
+
+ENDED = ("succeeded", "failed", "rolled_back", "not_started", "superseded")
+UNAPPLIED = ("preparing", "review")
+EXECUTED = ("EXECUTE_IN_PROGRESS", "EXECUTE_COMPLETE", "EXECUTE_FAILED")
+CONSOLE_ACTOR = "someone in the AWS console"
+
+
+def unapplied(entry):
+    """A native update prepared (or being prepared) that hasn't run."""
+    return bool(entry.get("change_set_id")) and entry.get("status") in UNAPPLIED and not entry.get("executed_at")
+
+
+def change_set_state(cfn, env, cs_id):
+    """(Status, ExecutionStatus) of a change set, or (None, None) when it no longer exists."""
+    try:
+        cs = cfn.describe_change_set(ChangeSetName=cs_id, StackName=env["NATIVE_STACK"])
+    except Exception as e:
+        if "does not exist" in str(e) or "ChangeSetNotFound" in type(e).__name__:
+            return None, None
+        raise
+    return cs.get("Status"), cs.get("ExecutionStatus")
+
+
+def open_updates(store, state, skip=None):
+    """Every prepared-but-unapplied update: the live ones (state) and any a
+    lost race or an older updater left open in history, newest first."""
+    out, seen = [], {skip}
+    for hid in (state.get("review_id"), state.get("running_id")):
+        if hid and hid not in seen:
+            seen.add(hid)
+            e = store.get(hid, {}) or {}
+            if unapplied(e):
+                out.append((hid, e))
+    for h in store.history(50):
+        hid = h.get("id")
+        if hid not in seen and h.get("mode") != "domain" and unapplied(h):
+            seen.add(hid)
+            out.append((hid, {k: v for k, v in h.items() if k != "id"}))
+    return sorted(out, key=lambda x: x[0], reverse=True)
+
+
+def check_replaceable(store, env, state, cfn=None):
+    """Refuses (ValueError) when an open update can't be replaced: its change
+    set runs (executed in the console) or is still being made."""
+    found = open_updates(store, state)
+    if not found:
         return
-    entry = store.get(hid, {}) or {}
-    if entry.get("change_set_id") and is_native(env):
+    cfn = cfn or client("cloudformation")
+    for hid, e in found:
+        status, execution = change_set_state(cfn, env, e["change_set_id"])
+        if execution in EXECUTED:
+            raise ValueError(f"the update to {e.get('version')} is already being applied (it was executed in AWS); wait for it to finish")
+        if status in ("CREATE_PENDING", "CREATE_IN_PROGRESS"):
+            raise ValueError(f"the update to {e.get('version')} is still being prepared; try again in a minute")
+
+
+def supersede_open(store, env, state, now, by_id, by_version, cfn=None):
+    """Marks every other prepared-but-unapplied update superseded by
+    `by_id` and deletes its change set while it never ran. `state` loses
+    its pointers to them. Returns the ids replaced."""
+    found = open_updates(store, state, skip=by_id)
+    if not found:
+        return []
+    cfn = cfn or client("cloudformation")
+    done = []
+    for hid, e in found:
         try:
-            (cfn or client("cloudformation")).delete_change_set(ChangeSetName=entry["change_set_id"], StackName=env["NATIVE_STACK"])
-        except Exception as e:
-            logger.warning(f"replaced change set not deleted: {e}")
-    if entry.get("status") == "review":
-        entry.update({"status": "not_started", "reason": "replaced by a newer update before it was applied; nothing was changed",
-                      "finished_at": now.isoformat()})
-        store.put(hid, entry)
+            _, execution = change_set_state(cfn, env, e["change_set_id"])
+        except Exception as ex:  # noqa: BLE001  unreadable: leave it as it is
+            logger.warning(f"open update {hid} not read: {ex}")
+            continue
+        if execution in EXECUTED:
+            continue  # it runs: native_poll follows it
+        if execution is not None:
+            try:
+                cfn.delete_change_set(ChangeSetName=e["change_set_id"], StackName=env["NATIVE_STACK"])
+            except Exception as ex:  # noqa: BLE001
+                logger.warning(f"replaced change set not deleted: {ex}")
+        e.update({"status": "superseded", "superseded_by": by_id, "finished_at": now.isoformat(),
+                  "reason": f"replaced by the update to {by_version} before it was applied; nothing was changed"})
+        store.put(hid, e)
+        for k in ("review_id", "running_id"):
+            if state.get(k) == hid:
+                state.pop(k, None)
+                if k == "running_id":
+                    state.pop("running_since", None)
+        done.append(hid)
+    return done
+
+
+def reconcile(store, env, now, cfn=None):
+    """Before the version route answers: the pending update as CloudFormation
+    has it now (prepared, waiting, executed in the console, finished), and
+    any older prepared update left open marked superseded. Never fails the
+    route: what can't be read stays as stored, and the scheduled poll retries."""
+    try:
+        state = store.get("UPDATE_STATE", {})
+        hid = state.get("running_id") or state.get("review_id")
+        opened = open_updates(store, state)
+        if not hid and not opened:
+            return
+        cfn = cfn or client("cloudformation")
+        entry = (store.get(hid, {}) or {}) if hid else {}
+        if opened and (not hid or unapplied(entry)) and opened[0][0] != hid:
+            # The newest prepared update is the one an admin pressed last: it
+            # is the pending one, whatever pointer an older updater left.
+            hid, entry = opened[0]
+            for k in ("review_id", "running_id", "running_since"):
+                state.pop(k, None)
+            if entry.get("status") == "review":
+                state["review_id"] = hid
+            else:
+                state.update({"running_id": hid, "running_since": entry.get("started_at") or now.isoformat()})
+            store.put("UPDATE_STATE", state)
+        if supersede_open(store, env, state, now, hid, entry.get("version") or "a newer release", cfn):
+            store.put("UPDATE_STATE", state)
+        native_poll(store, env, now, cfn)
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"pending update not reconciled: {e}")
 
 
 # ── Why an update didn't succeed, in plain words ──────────────────────────
@@ -2428,8 +2651,13 @@ def begin(store, env, now, version, actor, mode, extra=None, note=None, schedule
     verified yet) writes nothing; any other refusal before anything changed
     is recorded as not_started with its reason, never as failed."""
     state = store.get("UPDATE_STATE", {})
-    if running(state, now):
+    native = is_native(env)
+    live = (store.get(state["running_id"], {}) or {}) if native and state.get("running_id") else {}
+    # A prepared update that hasn't run doesn't block the next one: it is replaced.
+    if running(state, now) and not (native and unapplied(live)):
         raise ValueError("an update is already running")
+    if native:
+        check_replaceable(store, env, state)
     current = env.get("CODERHELM_VERSION", "")
     if parse_version(current):
         state["ran_versions"] = sorted(set(state.get("ran_versions") or []) | {current})
@@ -2458,7 +2686,8 @@ def begin(store, env, now, version, actor, mode, extra=None, note=None, schedule
         except Exception as e:  # noqa: BLE001  nothing changed: say so, never leave it running
             refused(e)
         entry["status"] = "preparing"
-        supersede_review(store, env, state, now)
+        store.put(hid, entry)
+        supersede_open(store, env, state, now, hid, version)
     else:
         store.put(hid, entry)
         try:
@@ -2479,6 +2708,11 @@ def history_view(entries, state, now):
     live = {state.get("running_id"), state.get("review_id")} - {None}
     out = []
     for h in entries:
+        if unapplied(h) and h.get("id") not in live:
+            # Prepared and never run, and no longer the update pending: a
+            # newer one replaced it (an older updater left it open).
+            h = dict(h, status="superseded",
+                     reason=h.get("reason") or "replaced by a newer update before it was applied; nothing was changed")
         if h.get("status") in ("running", "preparing") and h.get("id") not in live:
             if not h.get("change_set_id") and not h.get("build_id"):
                 h = dict(h, status="not_started",
@@ -2538,6 +2772,10 @@ def handle(event, env, store, now, fetch=fetch_releases, probe=None, hint=None):
         # Opening Settings, System reads the list again when it is a couple
         # of minutes old; Check for updates (refresh) reads it now.
         _, latest, behind = releases(0, refresh=True) if event.get("refresh") else releases(FRESH_SECONDS)
+        if is_native(env):
+            # The pending update as CloudFormation has it now, not as last stored.
+            reconcile(store, env, now)
+        state = store.get("UPDATE_STATE", {})
         return {
             "current": {
                 "version": current or None,
@@ -2555,8 +2793,7 @@ def handle(event, env, store, now, fetch=fetch_releases, probe=None, hint=None):
             "failed_versions": sorted(state.get("failed_versions") or []),
             "history": history_view(store.history(), state, now),
             # The model check for the latest release (Settings, System and Setup).
-            "model_check": (lambda mc: mc if latest and mc and mc.get("version") == latest["version"] else None)(
-                store.get("MODEL_CHECK")),
+            "model_check": model_check_view(store, env, now, latest["version"], probe) if latest else None,
             # Which install this is, for Settings, System, Uninstall's link to the uninstall page.
             "install": install_identity(env),
             # A native install: the stack, and the change set an admin reviews.
@@ -2602,7 +2839,12 @@ def handle(event, env, store, now, fetch=fetch_releases, probe=None, hint=None):
                 raise ModelsBlocked(blocked_message(mc) + " This release doesn't call it, so you can skip this check.",
                                     dict(mc, skippable=True))
             note = "model check skipped for " + ", ".join(f.get("model", "?") for f in failures(mc))
-        return begin(store, env, now, version, event.get("actor") or DIRECT_ACTOR, "update", note=note)
+        started = begin(store, env, now, version, event.get("actor") or DIRECT_ACTOR, "update", note=note)
+        stored = store.get("MODEL_CHECK") or {}
+        if stored.get("version") == version and (stored.get("pending") or stored.get("stalled")):
+            # Written meanwhile by an older check: the one that just passed stands.
+            store.put("MODEL_CHECK", mc)
+        return started
 
     if action == "models_verified":
         # From the release check build, after the signature check. Only a
@@ -2617,6 +2859,13 @@ def handle(event, env, store, now, fetch=fetch_releases, probe=None, hint=None):
             logger.warning(f"Release check for {version} failed: {event.get('reason')}")
             state.pop("verifying", None)
             store.put("UPDATE_STATE", state)
+            mc = store.get("MODEL_CHECK") or {}
+            if mc.get("version") == version and mc.get("pending"):
+                # Never "Checking" for a check that ended: it holds the update, with its reason.
+                why = fit(event.get("reason") or "its signature or checksums didn't verify", 300)
+                mc.update(pending=False, stalled=True, ok=False, checked_at=now.isoformat(),
+                          note=f"The release check couldn't verify {version}: {why}. Check again to start it over.")
+                store.put("MODEL_CHECK", mc)
             return {"verified": False}
         sha = event.get("template_sha256")
         if sha is not None and not (isinstance(sha, str) and re.fullmatch(r"[0-9a-f]{64}", sha)):
