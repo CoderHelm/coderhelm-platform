@@ -110,6 +110,8 @@ pub struct Template {
 }
 
 pub const UPDATE_WHAT: &[&str] = &[
+    // Installs from before 2026-11 still send these two; newer ones never do
+    // (Settings, System shows a new release and the update history).
     "available",
     "succeeded",
     "failed",
@@ -118,6 +120,10 @@ pub const UPDATE_WHAT: &[&str] = &[
     "domain_live",
     "domain_failed",
     "domain_removed",
+    // A prepared update waiting for an admin's OK (and its one reminder).
+    "review",
+    // The optional weekly or biweekly summary of new releases.
+    "digest",
 ];
 
 /// How to update from a terminal (docs/self-host/updates.md).
@@ -147,6 +153,8 @@ const UPDATE_PARAMS: &[Param] = &[
     optional("notes", Kind::Text(1200)),
     optional("major", Kind::OneOf(&["yes"])),
     optional("notes_link", Kind::Link),
+    // The digest: whether the install already runs the newest release.
+    optional("on_latest", Kind::OneOf(&["yes", "no"])),
 ];
 
 pub const TEMPLATES: &[Template] = &[
@@ -310,6 +318,8 @@ pub const TEMPLATES: &[Template] = &[
             ("domain_live", "the new address is live"),
             ("domain_failed", "the address change failed"),
             ("domain_removed", "back on the AWS address"),
+            ("review", "update to {version} needs your OK"),
+            ("digest", "what's new, up to {version}"),
         ],
         params: UPDATE_PARAMS,
         body: &[Part::Case(
@@ -401,6 +411,44 @@ pub const TEMPLATES: &[Template] = &[
                         Part::Command(cli!("doctor")),
                         Part::Button("Open Settings, System", "link"),
                         Part::Button("Read the release notes", "notes_link"),
+                    ],
+                ),
+                (
+                    "review",
+                    &[
+                        Part::Para("An update to {version} is prepared and waits for an admin's OK. Nothing has changed yet."),
+                        Part::Facts(&[
+                            ("Install", "{install}"),
+                            ("Running now", "{current}"),
+                            ("Waiting to install", "{version}"),
+                            ("Waiting since", "{waiting}"),
+                            ("Checked", "{checked_at}"),
+                        ]),
+                        Part::Quote("Why it waits", "reason"),
+                        Part::Quote("What to do", "action"),
+                        Part::Button("Open Settings, System", "link"),
+                        Part::Button("Read the release notes", "notes_link"),
+                    ],
+                ),
+                (
+                    "digest",
+                    &[
+                        Part::Para("What's new in CoderHelm since the last summary."),
+                        Part::Facts(&[
+                            ("Install", "{install}"),
+                            ("Running now", "{current}"),
+                            ("Newest release", "{version}"),
+                            ("Checked", "{checked_at}"),
+                        ]),
+                        Part::Quote("Releases", "notes"),
+                        Part::Case(
+                            "on_latest",
+                            &[
+                                ("yes", &[Part::Para("This install runs the newest release. Nothing to do.")]),
+                                ("no", &[Part::Para("This install isn't on the newest release yet. Settings, System shows the release notes and Update now.")]),
+                            ],
+                        ),
+                        Part::Button("Open Settings, System", "link"),
                     ],
                 ),
                 (

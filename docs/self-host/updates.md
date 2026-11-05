@@ -44,7 +44,13 @@ The updater (a Lambda in your account) checks GitHub for releases every hour. Op
 
 Each channel also has a small pointer file, written when a release is published: `launch/latest.json` for stable and `launch/beta.json` for beta. The updater reads your channel's file at least every five minutes while the page is open and on every hourly check, and reads GitHub's list again as soon as the file names a release the list doesn't have. So a new release shows within minutes of being published. When the file names a release that GitHub's list doesn't show yet, no older release is offered meanwhile.
 
-When a newer release appears it emails every install admin once, and posts to your Slack or Teams webhook if you set `updates.webhookUrl`. The notice links to **Settings, then System**, where the release notes are.
+A new release doesn't email anyone: **Settings, then System** shows it with its release notes (a major release too). Admins get an email only when a person must act or something went wrong, each at most once per version:
+
+- an update failed, or rolled back;
+- an update waits for an admin's OK: a prepared update to confirm or apply, or a model check that refuses it (and one reminder if it still waits after 7 days);
+- the install's address changed, or the change failed.
+
+Besides those, a **What's new** email sums up the releases on your channel since the last one: their versions, each one's headline and whether this install runs the newest. It goes weekly by default, only when something new came out; set `digest` to `biweekly` or `off` with `PUT /api/system/auto-update`. Every notice is also posted to your Slack or Teams webhook if you set `updates.webhookUrl`.
 
 ## Automatic updates
 
@@ -132,7 +138,7 @@ On an install made with Launch Stack, an update is a stack update of `coderhelm-
    - **The maintenance window started it (auto-update on):** it applies by itself, except when it would replace or remove data or change permissions: then it waits, admins get an email, and you confirm it on the page the same way. If auto-update was turned off before it ran, it waits for you to press **Apply**.
    - **It changes the deploy role or a permissions boundary:** the deploy role can't change those (that is what keeps it from giving itself more), so CoderHelm can't apply it for you. The page says so and links to the change set: someone with administrator rights in the AWS account reviews it and chooses **Execute**. Releases do this rarely, and their notes say so.
 5. **Follows it.** Every 5 minutes the updater reads the change set and the stack until the update ends. When the stack update starts, the install's own copy step checks every file of the release against the sha256 that `coderhelm.json` lists before any part changes. If a part fails, CloudFormation rolls the whole stack back to the previous release by itself.
-6. **Reports.** The history in **Settings, then System** shows the version, when, who (or "auto") and the result: succeeded, failed, or rolled back. A try that didn't succeed says in plain words what happened, where your install is now and what to do next; CloudFormation's own text (for the first resource that failed) is under **Technical details**. Admins get an email either way.
+6. **Reports.** The history in **Settings, then System** shows the version, when, who (or "auto") and the result: succeeded, failed, or rolled back. A try that didn't succeed says in plain words what happened, where your install is now and what to do next; CloudFormation's own text (for the first resource that failed) is under **Technical details**. Admins get an email when it failed or rolled back; a finished update is only in the history.
 
 A change set that waits too long can go stale (the stack changed since it was made); the history then says so, and **Update** prepares a new one. Pressing **Update** while an older prepared update waits replaces it (nothing was changed by the older one).
 
