@@ -1811,7 +1811,9 @@ def native_propose(store, env, version, mode, extra=None, cfn=None, opener=None)
     # first, each checked against this verified template.
     stage_release(env, version, want)
     r = cfn.create_change_set(**kwargs)
-    return {"change_set_id": r["Id"], "apply": bool(role), "template_canonical": canonical_sha(template)}
+    # DescribeChangeSet never returns the role a change set was made with, so
+    # the entry records it: apply checks it against the deploy role.
+    return {"change_set_id": r["Id"], "apply": bool(role), "role_arn": role, "template_canonical": canonical_sha(template)}
 
 
 DATA_TYPES = ("AWS::DynamoDB::GlobalTable", "AWS::DynamoDB::Table", "AWS::S3::Bucket", "AWS::KMS::Key", "AWS::Cognito::UserPool", "AWS::SecretsManager::Secret")
@@ -2039,7 +2041,7 @@ def change_set_link(region, stack_id, cs_id):
             f"#/stacks/changesets/changes?stackId={quote(stack_id, safe='')}&changeSetId={quote(cs_id, safe='')}")
 
 
-def change_set_summary(cs, region):
+def change_set_summary(cs, region, role=False):
     """What an admin reviews: counts, replacements, the parts it touches, the link."""
     counts = {"add": 0, "modify": 0, "remove": 0}
     replace = []
@@ -2061,7 +2063,7 @@ def change_set_summary(cs, region):
         "counts": counts,
         "replacements": sorted(x for x in replace if x),
         "parts": sorted(x for x in parts if x),
-        "role": bool(cs.get("RoleARN")),
+        "role": bool(role),
         "data_changes": [],
         "link": change_set_link(region, cs.get("StackId", ""), cs.get("ChangeSetId", "")),
     }
@@ -2099,7 +2101,7 @@ def native_poll(store, env, now, cfn=None):
         if "does not exist" in str(e) or "ChangeSetNotFound" in type(e).__name__:
             return native_finish(store, env, now, hid, "failed", "the proposed change set was deleted before it ran", PREPARE)
         raise
-    summary = change_set_summary(cs, region)
+    summary = change_set_summary(cs, region, role=prepared_role(entry))
     entry["change_set"] = summary
     status, execution = cs.get("Status"), cs.get("ExecutionStatus")
     if status == "FAILED":
@@ -2195,6 +2197,16 @@ def native_hold(store, env, entry):
     return ""
 
 
+def prepared_role(entry):
+    """The deploy role this update's change set was made with ("" when none).
+    DescribeChangeSet doesn't return it, so prepare records it on the entry.
+    An entry from an older updater has no record; its change set was made with
+    the deploy role whenever `apply` is set (only the role makes `apply` true)."""
+    if "role_arn" in entry:
+        return entry.get("role_arn") or ""
+    return None if entry.get("apply") else ""
+
+
 def native_apply(store, env, now, event, cfn=None):
     """An admin applies the prepared update that waits for them. Only through
     the deploy role, only a change set still as it was checked, and, when it
@@ -2218,9 +2230,14 @@ def native_apply(store, env, now, event, cfn=None):
         raise ValueError("confirm the changes it would make first (if the page was open a while, reload it: the list may have changed)")
     cfn = cfn or client("cloudformation")
     role = env["DEPLOY_ROLE_ARN"]
-    cs = cfn.describe_change_set(ChangeSetName=cs_id, StackName=env["NATIVE_STACK"])
-    if cs.get("RoleARN") != role:
+    made_with = prepared_role(entry)
+    if made_with is None:
+        made_with = role  # older entry: `apply` means it was made with the deploy role
+    if not entry.get("apply") or made_with != role:
         raise ValueError("this update was prepared without the deploy role; press Update to prepare it again")
+    cs = cfn.describe_change_set(ChangeSetName=cs_id, StackName=env["NATIVE_STACK"])
+    if cs.get("ChangeSetId") and cs["ChangeSetId"] != cs_id:
+        raise ValueError("the change set found is not the one this update prepared; press Update to prepare it again")
     if cs.get("Status") != "CREATE_COMPLETE" or cs.get("ExecutionStatus") != "AVAILABLE":
         raise ValueError("this prepared update can no longer run (the stack changed since); press Update to prepare it again")
     actor = event.get("actor") or DIRECT_ACTOR

@@ -98,6 +98,9 @@ class FakeCfn:
 
     def describe_change_set(self, ChangeSetName, StackName=None, IncludePropertyValues=False, NextToken=None):
         self.described = getattr(self, "described", []) + [(ChangeSetName, IncludePropertyValues, NextToken)]
+        # The real DescribeChangeSet output has no RoleARN (botocore's model): a fake that
+        # returned it hid an apply that could never pass.
+        assert "RoleARN" not in self.cs, "DescribeChangeSet never returns RoleARN"
         if ChangeSetName in self.nested:
             page = self.nested[ChangeSetName]
             # A nested change set given as a list of pages: NextToken is the page's index.
@@ -759,7 +762,7 @@ class AdminApplies(unittest.TestCase):
         if api is not None:
             self.cfn.nested["nested-api"] = {"Changes": api}
         u.begin(self.store, self.env, NOW, "v1.1.0", actor, "update", scheduled=scheduled)
-        self.cfn.cs = {"Status": "CREATE_COMPLETE", "ExecutionStatus": "AVAILABLE", "RoleARN": ROLE}
+        self.cfn.cs = {"Status": "CREATE_COMPLETE", "ExecutionStatus": "AVAILABLE"}
         if parent is not None:
             self.cfn.cs["Changes"] = parent
         return u.native_poll(self.store, self.env, NOW)
@@ -844,7 +847,7 @@ class AdminApplies(unittest.TestCase):
         self.assertEqual(state["running_id"], p["id"])
         self.assertNotIn("review_id", state)
         # The poll follows it from there; it is never executed twice.
-        self.cfn.cs = {"Status": "CREATE_COMPLETE", "ExecutionStatus": "EXECUTE_COMPLETE", "RoleARN": ROLE}
+        self.cfn.cs = {"Status": "CREATE_COMPLETE", "ExecutionStatus": "EXECUTE_COMPLETE"}
         self.assertEqual(u.native_poll(self.store, self.env, NOW)["status"], "succeeded")
         self.assertEqual(self.cfn.executed, ["arn:cs/1"])
 
@@ -878,13 +881,37 @@ class AdminApplies(unittest.TestCase):
             self.apply(confirm=p["confirm"])
         self.assertEqual(self.cfn.executed, [])
 
+    def test_a_change_set_prepared_with_the_role_applies(self):
+        # DescribeChangeSet returns no RoleARN: the role recorded at prepare is what counts.
+        self.prepare(api=[{"ResourceChange": {"Action": "Add", "ResourceType": "AWS::IAM::Role", "LogicalResourceId": "NewRole"}}])
+        p = self.pending()
+        self.assertEqual(self.store.get(p["id"])["role_arn"], ROLE)
+        self.assertTrue(p["role"])
+        self.assertEqual(self.apply(confirm=p["confirm"])["status"], "running")
+        self.assertEqual(self.cfn.executed, ["arn:cs/1"])
+
+    def test_an_entry_from_an_older_updater_with_apply_set_applies(self):
+        self.prepare(api=[{"ResourceChange": {"Action": "Add", "ResourceType": "AWS::IAM::Role", "LogicalResourceId": "NewRole"}}])
+        p = self.pending()
+        entry = self.store.get(p["id"])
+        entry.pop("role_arn")
+        self.store.put(p["id"], entry)
+        self.assertEqual(self.apply(confirm=p["confirm"])["status"], "running")
+        self.assertEqual(self.cfn.executed, ["arn:cs/1"])
+
     def test_a_change_set_made_without_the_role_is_never_applied_here(self):
         self.prepare(api=[{"ResourceChange": {"Action": "Add", "ResourceType": "AWS::IAM::Role", "LogicalResourceId": "NewRole"}}])
         p = self.pending()
-        self.cfn.cs = {"Status": "CREATE_COMPLETE", "ExecutionStatus": "AVAILABLE"}
-        with self.assertRaisesRegex(ValueError, "without the deploy role"):
+        entry = self.store.get(p["id"])
+        for recorded in ("", "arn:aws:iam::111122223333:role/another-role"):
+            self.store.put(p["id"], dict(entry, role_arn=recorded))
+            with self.assertRaisesRegex(ValueError, "without the deploy role"):
+                self.apply(confirm=p["confirm"])
+        self.store.put(p["id"], entry)
+        self.cfn.cs = {"Status": "CREATE_COMPLETE", "ExecutionStatus": "AVAILABLE", "ChangeSetId": "arn:cs/other"}
+        with self.assertRaisesRegex(ValueError, "not the one this update prepared"):
             self.apply(confirm=p["confirm"])
-        self.cfn.cs = {"Status": "CREATE_COMPLETE", "ExecutionStatus": "OBSOLETE", "RoleARN": ROLE}
+        self.cfn.cs = {"Status": "CREATE_COMPLETE", "ExecutionStatus": "OBSOLETE"}
         with self.assertRaisesRegex(ValueError, "can no longer run"):
             self.apply(confirm=p["confirm"])
         self.assertEqual(self.cfn.executed, [])
