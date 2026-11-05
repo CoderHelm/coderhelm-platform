@@ -56,7 +56,7 @@ A new release doesn't email anyone, and neither does an update that finished: **
 | **the new address is live** / **the address change failed** / **back on the AWS address** | A [domain](./domains.md) change finished, failed, or was undone. |
 | **what's new, up to vX** | The digest, below. |
 
-**The digest.** A **What's new** email sums up the releases on your channel since the last one: each version, its date and the headline of its notes (up to 10), and whether this install runs the newest. It is sent weekly by default, and only when something new came out; the first period only starts the clock. The `digest` setting takes `weekly`, `biweekly` or `off`. **Settings, then System** has no control for it yet: an install admin sets it with `PUT /api/system/auto-update` and a body of `{"digest": "biweekly"}` (or `"off"`), and `GET /api/system/version` returns it.
+**The digest.** A **What's new** email sums up the releases on your channel since the last one: each version, its date and the headline of its notes (up to 10), and whether this install runs the newest. It is sent weekly by default, and only when something new came out; the first period only starts the clock. An install admin picks how often under **Settings, then System**, **What's new email**: **Weekly**, **Every two weeks** or **Off**, then **Save changes**. Turning it off stops only this email: the ones about updates that need you are always sent. (The same setting is `digest` in the API: `PUT /api/system/auto-update` takes `weekly`, `biweekly` or `off`, and `GET /api/system/version` returns it.)
 
 Every email is also posted to your Slack or Teams webhook if you set `updates.webhookUrl`.
 
