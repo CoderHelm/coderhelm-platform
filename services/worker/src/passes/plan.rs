@@ -13,7 +13,7 @@ use crate::WorkerState;
 /// any change to how plans are made or what a plan must carry, so a plan
 /// written by an older planner is never reused.
 pub const PLANNER_VERSION: &str =
-    "2026-11-04.intent-history-env-near-match-stop-rules-data-rules-cross-repo-asking";
+    "2026-11-04.intent-history-env-near-match-stop-rules-data-rules-cross-repo-asking-reproduce";
 
 /// The openspec file holding the plan's end-to-end checklist, readable.
 pub const END_TO_END_FILE: &str = "end_to_end.md";
