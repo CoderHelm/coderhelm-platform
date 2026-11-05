@@ -123,7 +123,7 @@ fn every_gate_that_lacks_time_hands_off_at_that_gate() {
     let pr = rp
         .find("opening the pull request needs more time than this step has left")
         .unwrap();
-    assert!(rp[pr - 400..pr].contains("steps::Gate::Checks"));
+    assert!(rp[pr - 400..pr].contains("steps::Gate::Pr"));
     assert!(!rp.contains(OLD));
     // A hand-off is a new message on the queue, never a retry of this one.
     let src = include_str!("../mod.rs");

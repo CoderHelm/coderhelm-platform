@@ -12,8 +12,11 @@ const MIN_TIME_FOR_REMEDIATION_SECS: u64 = 240; // 4 minutes
 
 /// Before opening the pull request, at least this much of the step must be
 /// left (conflict resolution and the description are model calls); with
-/// less, the run continues in a fresh step at the checks before the PR.
+/// less, the run continues in a fresh step at the pull request.
 const MIN_TIME_FOR_PR_SECS: u64 = 150;
+
+/// The pass the checks on the open pull request run under.
+pub(crate) const PASS_CHECKS: &str = "review";
 
 /// Other repos of the same owner that an agent tried to read or edit, by the
 /// paths it passed (`owner/other-repo/path/to/file`): a sign the ticket's
@@ -166,6 +169,9 @@ async fn try_auto_continue(
             "the run reached the safety ceiling of {} steps",
             steps::MAX_RUN_STEPS
         ));
+    }
+    if let Some(reason) = run_guard::on_continuation(state, &msg.team_id, run_id).await {
+        return Handoff::Stopped(reason);
     }
     let now_ms = chrono::Utc::now().timestamp_millis().max(0) as u64;
     let first_ms = if msg.first_attempt_ms > 0 {
@@ -415,17 +421,18 @@ mod continuation_tests {
         assert!(after.contains("hand_off_at("));
         assert!(after.contains("steps::Gate::Generators"));
         for why in [
-            "The proof check found planned work not done",
-            "The link and redirect check needs a fix round",
-            "The test-fix check needs a fix round",
-            "The new-feature check needs a fix round",
-            "opening the pull request needs more time",
+            "The proof check needs more time",
+            "The link and redirect check needs more time",
+            "The failing-test rules need more time",
+            "The new-feature rules need more time",
         ] {
-            let at = rp
-                .find(why)
-                .unwrap_or_else(|| panic!("no hand-off for: {why}"));
-            assert!(rp[at - 400..at].contains("steps::Gate::Checks"), "{why}");
+            assert!(rp.contains(why), "no hand-off for: {why}");
         }
+        // The checks' hand-offs resume at the checks; the pull request's at it.
+        let m = rp.find("macro_rules! hand_off_unless_time_for").unwrap();
+        assert!(rp[m..m + 700].contains("steps::Gate::Checks"));
+        let at = rp.find("opening the pull request needs more time").unwrap();
+        assert!(rp[at - 400..at].contains("steps::Gate::Pr"));
         assert!(!rp.contains("not enough time left"));
         // A hand-off that can't continue says why, never a bare timeout.
         let src = include_str!("mod.rs");
@@ -444,7 +451,8 @@ mod continuation_tests {
         let rp = run_passes_src();
         let skip = rp.find("let can_skip_implement").unwrap();
         assert!(rp[skip..skip + 300].contains("\"implement\""));
-        assert!(rp.contains("let resume_gate = if can_skip_implement {\n        step_state.gate"));
+        assert!(rp.contains("let resume_gate = if can_skip_implement {"));
+        assert!(rp.contains("step_state.gate.map(|g| match g {"));
         assert!(rp.contains("let coverage = if resume_gate.is_some() {"));
         assert!(rp.contains("let run_verify = steps::Gate::Verify.runs_from(resume_gate);"));
         assert!(rp.contains("if steps::Gate::Generators.runs_from(resume_gate) {"));
@@ -472,6 +480,8 @@ mod continuation_tests {
             2
         );
         assert_eq!(count("unfinished: ", "&unfinished,"), 2);
+        // On the description of the pull request already open, not a new one.
+        assert_eq!(count("pr::apply_", "checks("), 2);
         assert_eq!(count("generated: ", "&settled_generated,"), 2);
         let rp = run_passes_src();
         assert!(rp.contains(concat!("plan_coverage::", "settle_generated(")));
@@ -871,7 +881,9 @@ pub mod review_thread_reply;
 pub mod review_verdict;
 pub mod rewards;
 pub(crate) mod round;
+pub mod run_ceiling;
 mod run_end;
+pub mod run_guard;
 pub(crate) mod run_lists;
 mod security;
 #[cfg(test)]
@@ -1032,6 +1044,14 @@ pub async fn orchestrate_ticket(
             } else {
                 error!(run_id, error = %e, "Orchestration failed");
                 let checkpoint = load_checkpoint(state, &msg.team_id, &run_id).await;
+                // The run guard fired: one ending, always (see `run_guard`).
+                let guard_ended = run_guard::end_if_stopped(
+                    state,
+                    &msg,
+                    &run_id,
+                    checkpoint.as_ref().map(|c| c.1.as_str()),
+                )
+                .await;
                 // Budget exhausted (hit the step limit) with committed partial
                 // work is "needs more turns", not a real failure — auto-continue
                 // (bounded) from the branch instead of salvaging a half-finished
@@ -1042,7 +1062,8 @@ pub async fn orchestrate_ticket(
                 // salvage arm below uses the same "implement_started" signal). This
                 // stays correct even if a future non-implement pass propagates the
                 // same step-limit message — it won't match this checkpoint.
-                let continued = is_budget_exhausted(&err_msg)
+                let continued = !guard_ended
+                    && is_budget_exhausted(&err_msg)
                     && try_auto_continue(
                         state,
                         &msg,
@@ -1059,17 +1080,18 @@ pub async fn orchestrate_ticket(
                 // ticket's fault: the run is sent again later (same run_id), by
                 // the one requeue policy every pass uses. Decided from the
                 // error's kind, never its text.
-                let continued = continued || {
-                    let err: &(dyn std::error::Error + 'static) = &*e;
-                    common::model_retry::is_transient_model_error(err)
-                        && requeue_after_model_error(state, &msg, &run_id).await
-                };
+                let continued = continued
+                    || !guard_ended && {
+                        let err: &(dyn std::error::Error + 'static) = &*e;
+                        common::model_retry::is_transient_model_error(err)
+                            && requeue_after_model_error(state, &msg, &run_id).await
+                    };
                 // Salvage before failing: an implement that burned its turn
                 // budget mid-task has already pushed real commits to the branch.
                 // Only mid-implement deaths salvage: for later-pass errors a
                 // salvage would mark the run completed and hide the real error
                 // behind a misleading "partial work" message.
-                let salvaged = if continued {
+                let salvaged = if continued || guard_ended {
                     false
                 } else if let Some((ref last_pass, ref branch, _)) = checkpoint {
                     if !branch.is_empty() && last_pass.as_str() == "implement_started" {
@@ -1118,7 +1140,7 @@ pub async fn orchestrate_ticket(
                 } else {
                     false
                 };
-                if !continued && !salvaged {
+                if !continued && !salvaged && !guard_ended {
                     let sanitized = sanitize_error(&err_msg);
                     fail_run(state, &msg, &run_id, &sanitized, &usage, duration).await;
                 }
@@ -1174,7 +1196,16 @@ pub async fn orchestrate_ticket(
             // enqueue failed): salvage the partial work as a draft PR, else
             // fail with why.
             if let Handoff::Stopped(why) = handoff {
-                let salvaged = if let Some((ref last_pass, ref branch, _)) = checkpoint {
+                let guard_ended = run_guard::end_if_stopped(
+                    state,
+                    &msg,
+                    &run_id,
+                    checkpoint.as_ref().map(|c| c.1.as_str()),
+                )
+                .await;
+                let salvaged = if guard_ended {
+                    true
+                } else if let Some((ref last_pass, ref branch, _)) = checkpoint {
                     if !branch.is_empty()
                         && matches!(
                             last_pass.as_str(),
@@ -2029,12 +2060,15 @@ async fn run_passes(
 
     // --- Pass 2: Plan ---
     check_cancelled(state, &msg.team_id, run_id).await?;
-    update_pass(state, &msg.team_id, run_id, "plan").await?;
     // How far planning got: saved from here on, so a step that runs out of
     // time while planning continues in a fresh step (see `steps::Gate::Plan`)
     // instead of failing with nothing committed. A continuation past
-    // planning (its own plan, no planning state) has a final plan.
+    // planning (its own plan, no planning state) has a final plan, and plans
+    // nothing: the run page shows the pass the run is really on.
     let plan_final = resumed_plan && plan_resume.as_ref().is_none_or(|p| p.checked);
+    if !plan_final {
+        update_pass(state, &msg.team_id, run_id, "plan").await?;
+    }
     let mut ps = plan_resume.clone().unwrap_or_else(|| {
         steps::PlanState::new(&msg.repo_owner, &msg.repo_name, &msg.base_branch)
     });
@@ -2895,8 +2929,23 @@ async fn run_passes(
     } else {
         steps::StepState::default()
     };
+    // What the checks found and the pull request the run opened, from the
+    // steps before this one.
+    let checks_scope = format!("{}/{}", msg.repo_owner, msg.repo_name);
+    let ledger = if same_run {
+        run_guard::LedgerCell::load(state, &msg.team_id, run_id, &checks_scope).await
+    } else {
+        run_guard::LedgerCell::new(&checks_scope, Default::default())
+    };
+    ledger.update(|l| l.on_step_start());
+    let pr_is_open = ledger.update(|l| l.opened.is_some());
     let resume_gate = if can_skip_implement {
-        step_state.gate
+        // A run that stopped at the checks when they came first has no pull
+        // request yet: that comes first now.
+        step_state.gate.map(|g| match g {
+            steps::Gate::Checks if !pr_is_open => steps::Gate::Pr,
+            g => g,
+        })
     } else {
         None
     };
@@ -2926,8 +2975,9 @@ async fn run_passes(
     }
     let impl_result = if can_skip_implement {
         // Resume: reconstruct impl_result from the existing branch diff
+        // Nothing is implemented in this step, so the run page keeps the pass
+        // the run is really on.
         info!(run_id, branch = %branch_name, "Checkpoint resume: skipping implement pass");
-        update_pass(state, &msg.team_id, run_id, "implement").await?;
 
         let diff_json = github
             .get_diff(
@@ -4089,7 +4139,7 @@ async fn run_passes(
         .await;
         // A continuation picks up the planned tasks the branch doesn't do yet.
         let still_to_do = if msg.continuation > 0 {
-            continuation_feedback(&github, msg, &plan_result, &branch_name).await
+            continuation_feedback(state, run_id, &github, msg, &plan_result, &branch_name).await
         } else {
             None
         };
@@ -4537,6 +4587,13 @@ async fn run_passes(
         .await
     };
     if let Some(cov) = coverage {
+        run_guard::progress(
+            state,
+            &msg.team_id,
+            run_id,
+            run_guard::Progress::TasksDone(cov.done.len()),
+        )
+        .await;
         // Only the tasks the branch did are checked off, so the run page and
         // a later attempt see the truth.
         save_checked_tasks(
@@ -4571,8 +4628,13 @@ async fn run_passes(
             .await;
         }
         match plan_coverage::next(&cov, plan_coverage::MAX_ROUNDS, false) {
-            plan_coverage::Next::Complete => {}
+            plan_coverage::Next::Complete => {
+                run_guard::progress(state, &msg.team_id, run_id, run_guard::Progress::WorkDone)
+                    .await;
+            }
             plan_coverage::Next::OpenWithOptional => {
+                run_guard::progress(state, &msg.team_id, run_id, run_guard::Progress::WorkDone)
+                    .await;
                 plan_optional = plan_coverage::optional_findings(&cov);
             }
             plan_coverage::Next::Round | plan_coverage::Next::Unfinished => {
@@ -4699,7 +4761,12 @@ async fn run_passes(
 
     // --- Adversarial Test (multi-repo path) ---
     check_cancelled(state, &msg.team_id, run_id).await?;
-    if run_verify && has_time_for_remediation(start) {
+    let tested_at = github
+        .get_ref(&msg.repo_owner, &msg.repo_name, &branch_name)
+        .await
+        .unwrap_or_default();
+    let already_tested = !tested_at.is_empty() && ledger.update(|l| l.tested_head == tested_at);
+    if run_verify && !already_tested && has_time_for_remediation(start) {
         update_pass(state, &msg.team_id, run_id, "test").await?;
         let pass_start = std::time::Instant::now();
         let usage_before = usage.clone();
@@ -4774,6 +4841,8 @@ async fn run_passes(
                 warn!(run_id, error = %e, "Test auto-fix failed, proceeding anyway");
             }
         }
+        ledger.update(|l| l.tested_head = tested_at.clone());
+        ledger.save(state, &msg.team_id, run_id).await;
     }
 
     // A step resuming at a later gate has the audit's verdict from the
@@ -4955,9 +5024,7 @@ async fn run_passes(
     // Open items, marked so it stays a draft; the full audit text is not
     // copied into long-term memory.
 
-    // --- Proof check (before PR — what the change rests on is proven) ---
     check_cancelled(state, &msg.team_id, run_id).await?;
-    update_pass(state, &msg.team_id, run_id, "review").await?;
     // --- Generated files: regenerated with the change, or the PR waits ---
     if steps::Gate::Generators.runs_from(resume_gate) {
         // A redelivery of this step, or the next one, resumes here.
@@ -5051,17 +5118,270 @@ async fn run_passes(
             }
         }
     }
-    steps::save_gate(
-        state,
-        &msg.team_id,
-        run_id,
-        steps::Gate::Checks,
-        Some(&carry),
-    )
-    .await;
-    // The checks' "time for a fix round?" answers: one refused for time
-    // hands the run to a fresh step here instead of blocking the PR.
-    let budget = steps::step_budget(*start);
+    // What is open whatever the checks find: tasks the plan marks optional and
+    // the change left out, what the ticket needs that this run didn't do (a
+    // person's step, with why and how to grant it, or one handed out with no
+    // reason), and security issues not fixed yet or a check that didn't run.
+    let outside_open = plan_coverage::outside_findings(plan_result.fix.as_ref());
+    let mut known_open: Vec<proof::Finding> = plan_optional;
+    known_open.extend(outside_open.iter().cloned());
+    known_open.extend(security_items);
+
+    // --- The draft pull request, as soon as the work is built ---
+    // It opens before the proof check, the rules and the review: they work on
+    // it, and can't hold it back. A step resuming after this never comes here.
+    let opened = ledger.update(|l| l.opened.clone());
+    let pr_result = if let Some(o) = opened {
+        info!(
+            run_id,
+            pr_number = o.number,
+            "The pull request is open: on to its checks"
+        );
+        pr::PrResult {
+            pr_number: o.number,
+            pr_url: o.url,
+            branch: branch_name.clone(),
+            draft: true,
+            node_id: o.node_id,
+        }
+    } else {
+        steps::save_gate(state, &msg.team_id, run_id, steps::Gate::Pr, Some(&carry)).await;
+        if !outside_open.is_empty() {
+            add_progress_note(
+                state,
+                &msg.team_id,
+                run_id,
+                &plan_coverage::outside_note(plan_result.fix.as_ref()),
+            )
+            .await;
+        }
+        // --- Existing work: now that the change's own files are known, an open
+        // pull request (anyone's, opened while this run worked or touching the
+        // same files) that already does this ends the run as covered by it; the
+        // work stays on a branch. Once a head: a step that comes back here on
+        // the same code has its answer ---
+        let at_head = github
+            .get_ref(&msg.repo_owner, &msg.repo_name, &branch_name)
+            .await
+            .unwrap_or_default();
+        if at_head.is_empty() || ledger.update(|l| l.existing_work_head != at_head) {
+            let (tests, specs, failure) = existing_work_inputs(test_ev.as_ref());
+            if let Some(covered) = stop_gate::existing_work(
+                state,
+                &provider,
+                usage,
+                msg,
+                &github,
+                run_id,
+                &branch_name,
+                &own_pr_numbers(&history, &msg.repo_owner, &msg.repo_name),
+                &decided_prs(&history),
+                &tests,
+                &specs,
+                &impl_result.files_modified,
+                &failure,
+            )
+            .await
+            {
+                let kept =
+                    keep_wip_branch(&github, &msg.repo_owner, &msg.repo_name, &branch_name).await;
+                add_progress_note(
+                    state,
+                    &msg.team_id,
+                    run_id,
+                    &format!("No second pull request; the work so far is kept on branch `{kept}`."),
+                )
+                .await;
+                stop_gate::finish_covered(state, msg, run_id, &github, &covered, usage, start)
+                    .await;
+                close_memory(state, agent_memory.take()).await;
+                return Ok(());
+            }
+            ledger.update(|l| l.existing_work_head = at_head.clone());
+            ledger.save(state, &msg.team_id, run_id).await;
+        }
+
+        check_cancelled(state, &msg.team_id, run_id).await?;
+        if remaining_secs(start) < MIN_TIME_FOR_PR_SECS {
+            close_memory(state, agent_memory.take()).await;
+            return hand_off_at(
+                state,
+                msg,
+                &github,
+                run_id,
+                &branch_name,
+                steps::Gate::Pr,
+                Some(&carry),
+                "The work is built; opening the pull request needs more time than this step has left",
+                usage,
+            )
+            .await;
+        }
+        update_pass(state, &msg.team_id, run_id, "pr").await?;
+
+        // Resolve conflicts with main before PR
+        match pr::resolve_conflicts(state, msg, &github, &branch_name, &provider, usage).await {
+            Ok(true) => info!(run_id, "Resolved merge conflicts with main"),
+            Ok(false) => {}
+            Err(e) => warn!(run_id, error = %e, "Conflict resolution failed, proceeding"),
+        }
+
+        // How production starts the container, read from this branch, for the
+        // description's start-path check.
+        if let Some(ev) = log_ev.as_mut() {
+            let files = log_evidence::GithubFiles {
+                github: &github,
+                owner: &msg.repo_owner,
+                repo: &msg.repo_name,
+                git_ref: &branch_name,
+            };
+            ev.start = Some(log_evidence::resolve_start(&files, ev).await);
+            log_evidence::save(state, &msg.team_id, run_id, ev).await;
+        }
+        // Never another open pull request's commits under new hashes: the
+        // copies are dropped and the pull request stacks on it.
+        let stacked_on = stack::before_pr(
+            state,
+            &github,
+            msg,
+            &branch_name,
+            stacked_on,
+            &provider,
+            usage,
+        )
+        .await?;
+        let pass_start = std::time::Instant::now();
+        let usage_before = usage.clone();
+        let opening_evidence = impl_result.evidence.clone();
+        let pr_result = pr::run(
+            state,
+            msg,
+            &github,
+            &branch_name,
+            &plan_result,
+            &voice,
+            &pr::Proof {
+                evidence: &opening_evidence.for_pr(),
+                gaps: &proof::gaps_section(&known_open),
+                unfinished: "",
+                manual: "",
+                ci: &opening_evidence.ci_commands,
+                mirrors: &completeness::parse_mirrors(&opening_evidence.notes),
+                log: log_ev.as_ref(),
+                links: "",
+                test_fix: None,
+                feature: None,
+                keep_commits: stacked_on
+                    .as_ref()
+                    .is_some_and(|d| !d.unresolved.is_empty()),
+            },
+            &provider,
+            usage,
+            run_id,
+        )
+        .await?;
+        write_pass_trace(
+            state,
+            &msg.team_id,
+            run_id,
+            "pr",
+            pass_start,
+            &usage_before,
+            usage,
+            None,
+        )
+        .await;
+        info!(run_id, pr_url = %pr_result.pr_url, "Draft PR created");
+        // From here a continuation resumes at the checks, on this pull request.
+        ledger.update(|l| {
+            l.opened = Some(run_guard::OpenedPr {
+                number: pr_result.pr_number,
+                url: pr_result.pr_url.clone(),
+                node_id: pr_result.node_id.clone(),
+            });
+        });
+        ledger.save(state, &msg.team_id, run_id).await;
+        steps::save_gate(
+            state,
+            &msg.team_id,
+            run_id,
+            steps::Gate::Checks,
+            Some(&carry),
+        )
+        .await;
+        record_open_pr(state, msg, run_id, &branch_name, &pr_result).await;
+        run_guard::progress(state, &msg.team_id, run_id, run_guard::Progress::PrOpen).await;
+        // The outside steps CoderHelm does itself (a deploy, the end-to-end
+        // run, the confirm query) run now; the ticket and the PR report results.
+        if fix_route == fix_location::Route::CodeAndOutside {
+            if let Some(decision) = plan_result.fix.as_mut() {
+                after_pr_outside_work(
+                    state,
+                    msg,
+                    run_id,
+                    &github,
+                    decision,
+                    &branch_name,
+                    pr_result.pr_number,
+                    outside_until(start),
+                )
+                .await;
+            }
+        }
+        if let Some(d) = &stacked_on {
+            stack::note_pr(
+                &github,
+                &msg.repo_owner,
+                &msg.repo_name,
+                pr_result.pr_number,
+                d,
+            )
+            .await;
+        }
+        // A data migration's release steps: CoderHelm runs them from here on.
+        release_run::after_pr(
+            state,
+            msg,
+            run_id,
+            &github,
+            &plan_result,
+            &branch_name,
+            pr_result.pr_number,
+        )
+        .await;
+        // The plan moved the change out of a repo an earlier run of this ticket
+        // opened a PR in: that PR is closed with a note naming this one.
+        supersede_moved_prs(
+            &github,
+            &history,
+            &[format!("{}/{}", msg.repo_owner, msg.repo_name)],
+            &pr_result.pr_url,
+        )
+        .await;
+        self::webhooks::emit_pr_opened(
+            state,
+            msg,
+            run_id,
+            &format!("{}/{}", msg.repo_owner, msg.repo_name),
+            &pr_result,
+        )
+        .await;
+        add_progress_note(
+            state,
+            &msg.team_id,
+            run_id,
+            &format!("Draft PR created: #{}", pr_result.pr_number),
+        )
+        .await;
+        pr_result
+    };
+
+    // --- The checks, on the open pull request ---
+    // Each runs once on a head and keeps its result and its fix rounds in the
+    // run's ledger, so a fresh step takes up what the last one didn't reach and
+    // repeats nothing. What they leave goes under Open items: nothing here can
+    // stop the pull request, which is already there.
+    update_pass(state, &msg.team_id, run_id, PASS_CHECKS).await?;
     let mut evidence = impl_result.evidence.clone();
     let work = proof::Work {
         state,
@@ -5076,235 +5396,110 @@ async fn run_passes(
         run_id,
         deadline: implement_deadline,
         generated: &settled_generated,
+        ledger: &ledger,
     };
-    let mut gaps = proof::prove(&work, &mut evidence, usage, || budget.has_time()).await;
-    // Planned work the check found not done is never an Open item: it goes
-    // at the top of the pull request, which stays a draft until it's done.
+    let has_time = || has_time_for_remediation(start);
+    // A check not yet run on this head needs time for its fix round: without
+    // it, a fresh step takes it from there.
+    macro_rules! hand_off_unless_time_for {
+        ($record:ident, $why:expr) => {
+            let head = work.head().await;
+            if !has_time() && !ledger.update(|l| l.$record.unchanged(&head)) {
+                close_memory(state, agent_memory.take()).await;
+                return hand_off_at(
+                    state,
+                    msg,
+                    &github,
+                    run_id,
+                    &branch_name,
+                    steps::Gate::Checks,
+                    Some(&carry),
+                    $why,
+                    usage,
+                )
+                .await;
+            }
+        };
+    }
+    hand_off_unless_time_for!(
+        proof,
+        "The proof check needs more time than this step has left"
+    );
+    let mut gaps = proof::prove(&work, &mut evidence, usage, has_time).await;
+    // Planned work the check found not done is never an Open item: it goes at
+    // the top of the pull request, which stays a draft until it's done.
     if !proof::planned_work(&gaps).is_empty() {
-        if budget.take_denied() {
-            close_memory(state, agent_memory.take()).await;
-            return hand_off_at(
-                state,
-                msg,
-                &github,
-                run_id,
-                &branch_name,
-                steps::Gate::Checks,
-                Some(&carry),
-                "The proof check found planned work not done and this step has too little time left for its fix round",
-                usage,
-            )
-            .await;
-        }
-        // A finished run always ends with a pull request: the planned work
-        // still not done after the fix round is listed at its top and it
-        // stays a draft.
         add_progress_note(
             state,
             &msg.team_id,
             run_id,
             &format!(
-                "{} planned task(s) still not done after the fix round: the pull request opens as a draft with them listed at the top",
+                "{} planned task(s) still not done after the fix rounds: they are listed at the top of the pull request, which stays a draft",
                 proof::planned_work(&gaps).len()
             ),
         )
         .await;
     }
     let unfinished = proof::unfinished_section(&gaps);
-    // Tasks the plan marks optional and the change left out, named.
-    gaps.extend(plan_optional);
-    // What the ticket needs that this run didn't do: a person's step (with
-    // why and how to grant it), or one handed out with no reason (not
-    // covered).
-    let outside_open = plan_coverage::outside_findings(plan_result.fix.as_ref());
-    if !outside_open.is_empty() {
-        add_progress_note(
-            state,
-            &msg.team_id,
-            run_id,
-            &plan_coverage::outside_note(plan_result.fix.as_ref()),
-        )
-        .await;
-    }
-    gaps.extend(outside_open);
-    // Security issues not fixed yet, or a check that didn't run.
-    gaps.extend(security_items);
-    // Every redirect and link the change adds or changes, checked live; a
-    // failure that survives its fix round stops the run before the PR.
-    budget.take_denied();
-    let links = match link_checks::gate(&work, &mut evidence, usage, || budget.has_time()).await {
+    gaps.extend(known_open);
+    // Every redirect and link the change adds or changes, checked live.
+    hand_off_unless_time_for!(
+        links,
+        "The link and redirect check needs more time than this step has left"
+    );
+    let links = match link_checks::gate(&work, &mut evidence, usage, has_time).await {
         Ok(l) => l,
-        Err(_) if budget.take_denied() => {
-            close_memory(state, agent_memory.take()).await;
-            return hand_off_at(
-                state,
-                msg,
-                &github,
-                run_id,
-                &branch_name,
-                steps::Gate::Checks,
-                Some(&carry),
-                "The link and redirect check needs a fix round and this step has too little time left for it",
-                usage,
-            )
-            .await;
-        }
         Err(why) => {
-            return Err(format!("Link and redirect check blocked the pull request: {why}").into())
+            gaps.push(proof::blocked_item("The link and redirect check", &why));
+            String::new()
         }
     };
     // A failing- or flaky-test fix: no waits without evidence, no helper
     // that walks every row, test packages checked where they live.
-    let test_pr = match test_fix::gate(&work, &mut evidence, usage, || budget.has_time()).await {
+    hand_off_unless_time_for!(
+        test_fix,
+        "The failing-test rules need more time than this step has left"
+    );
+    let test_pr = match test_fix::gate(&work, &mut evidence, usage, has_time).await {
         Ok(t) => t,
-        Err(_) if budget.take_denied() => {
-            close_memory(state, agent_memory.take()).await;
-            return hand_off_at(
-                state,
-                msg,
-                &github,
-                run_id,
-                &branch_name,
-                steps::Gate::Checks,
-                Some(&carry),
-                "The test-fix check needs a fix round and this step has too little time left for it",
-                usage,
-            )
-            .await;
+        Err(why) => {
+            gaps.push(proof::blocked_item("The failing-test rules", &why));
+            None
         }
-        Err(e) => return Err(test_fix::blocked_reason(e).into()),
     };
     // New-feature rules: nothing carried over from an earlier attempt,
     // every registration, reuse, staging content, the verification
     // checklist and open product questions (see feature).
+    hand_off_unless_time_for!(
+        rules,
+        "The new-feature rules need more time than this step has left"
+    );
     let feature_pr = match feature::gate(
         &work,
         &mut evidence,
         usage,
         triage_result.intent,
         &history.prior,
-        || budget.has_time(),
+        has_time,
     )
     .await
     {
         Ok(f) => f,
-        Err(_) if budget.take_denied() => {
-            close_memory(state, agent_memory.take()).await;
-            return hand_off_at(
-                state,
-                msg,
-                &github,
-                run_id,
-                &branch_name,
-                steps::Gate::Checks,
-                Some(&carry),
-                "The new-feature check needs a fix round and this step has too little time left for it",
-                usage,
-            )
-            .await;
-        }
         Err(why) => {
-            return Err(format!("The new-feature rules blocked the pull request: {why}").into())
+            gaps.push(proof::blocked_item("The new-feature rules", &why));
+            None
         }
     };
-
-    // --- Existing work, again before the PR opens: now that the change's
-    // own files are known, an open pull request (anyone's, opened while
-    // this run worked or touching the same files) that already does this
-    // ends the run as covered by it; the work stays on a branch ---
-    {
-        let (tests, specs, failure) = existing_work_inputs(test_ev.as_ref());
-        if let Some(covered) = stop_gate::existing_work(
-            state,
-            &provider,
-            usage,
-            msg,
-            &github,
-            run_id,
-            &branch_name,
-            &own_pr_numbers(&history, &msg.repo_owner, &msg.repo_name),
-            &decided_prs(&history),
-            &tests,
-            &specs,
-            &impl_result.files_modified,
-            &failure,
-        )
-        .await
-        {
-            let kept =
-                keep_wip_branch(&github, &msg.repo_owner, &msg.repo_name, &branch_name).await;
-            add_progress_note(
-                state,
-                &msg.team_id,
-                run_id,
-                &format!("No second pull request; the work so far is kept on branch `{kept}`."),
-            )
-            .await;
-            stop_gate::finish_covered(state, msg, run_id, &github, &covered, usage, start).await;
-            close_memory(state, agent_memory.take()).await;
-            return Ok(());
-        }
+    if let Some(f) = &feature_pr {
+        gaps.extend(feature::open_findings(f));
     }
-
-    // --- Create Draft PR (triggers CI) ---
-    check_cancelled(state, &msg.team_id, run_id).await?;
-    if remaining_secs(start) < MIN_TIME_FOR_PR_SECS {
-        close_memory(state, agent_memory.take()).await;
-        return hand_off_at(
-            state,
-            msg,
-            &github,
-            run_id,
-            &branch_name,
-            steps::Gate::Checks,
-            Some(&carry),
-            "The checks passed; opening the pull request needs more time than this step has left",
-            usage,
-        )
-        .await;
-    }
-    update_pass(state, &msg.team_id, run_id, "pr").await?;
-
-    // Resolve conflicts with main before PR
-    match pr::resolve_conflicts(state, msg, &github, &branch_name, &provider, usage).await {
-        Ok(true) => info!(run_id, "Resolved merge conflicts with main"),
-        Ok(false) => {}
-        Err(e) => warn!(run_id, error = %e, "Conflict resolution failed, proceeding"),
-    }
-
-    // How production starts the container, read from this branch, for the
-    // description's start-path check.
-    if let Some(ev) = log_ev.as_mut() {
-        let files = log_evidence::GithubFiles {
-            github: &github,
-            owner: &msg.repo_owner,
-            repo: &msg.repo_name,
-            git_ref: &branch_name,
-        };
-        ev.start = Some(log_evidence::resolve_start(&files, ev).await);
-        log_evidence::save(state, &msg.team_id, run_id, ev).await;
-    }
-    // Never another open pull request's commits under new hashes: the
-    // copies are dropped and the pull request stacks on it.
-    let stacked_on = stack::before_pr(
-        state,
-        &github,
-        msg,
-        &branch_name,
-        stacked_on,
-        &provider,
-        usage,
-    )
-    .await?;
-    let pass_start = std::time::Instant::now();
-    let usage_before = usage.clone();
-    let pr_result = pr::run(
+    pr::apply_checks(
         state,
         msg,
         &github,
-        &branch_name,
+        run_id,
         &plan_result,
-        &voice,
+        pr_result.pr_number,
         &pr::Proof {
             evidence: &evidence.for_pr(),
             gaps: &proof::gaps_section(&gaps),
@@ -5316,89 +5511,12 @@ async fn run_passes(
             links: &links,
             test_fix: test_pr.as_ref(),
             feature: feature_pr.as_ref(),
-            keep_commits: stacked_on
-                .as_ref()
-                .is_some_and(|d| !d.unresolved.is_empty()),
+            keep_commits: false,
         },
-        &provider,
-        usage,
-        run_id,
-    )
-    .await?;
-    write_pass_trace(
-        state,
-        &msg.team_id,
-        run_id,
-        "pr",
-        pass_start,
-        &usage_before,
-        usage,
-        None,
     )
     .await;
-    info!(run_id, pr_url = %pr_result.pr_url, "Draft PR created");
-    // The outside steps CoderHelm does itself (a deploy, the end-to-end
-    // run, the confirm query) run now; the ticket and the PR report results.
-    if fix_route == fix_location::Route::CodeAndOutside {
-        if let Some(decision) = plan_result.fix.as_mut() {
-            after_pr_outside_work(
-                state,
-                msg,
-                run_id,
-                &github,
-                decision,
-                &branch_name,
-                pr_result.pr_number,
-                outside_until(start),
-            )
-            .await;
-        }
-    }
-    if let Some(d) = &stacked_on {
-        stack::note_pr(
-            &github,
-            &msg.repo_owner,
-            &msg.repo_name,
-            pr_result.pr_number,
-            d,
-        )
-        .await;
-    }
-    // A data migration's release steps: CoderHelm runs them from here on.
-    release_run::after_pr(
-        state,
-        msg,
-        run_id,
-        &github,
-        &plan_result,
-        &branch_name,
-        pr_result.pr_number,
-    )
-    .await;
-    // The plan moved the change out of a repo an earlier run of this ticket
-    // opened a PR in: that PR is closed with a note naming this one.
-    supersede_moved_prs(
-        &github,
-        &history,
-        &[format!("{}/{}", msg.repo_owner, msg.repo_name)],
-        &pr_result.pr_url,
-    )
-    .await;
-    self::webhooks::emit_pr_opened(
-        state,
-        msg,
-        run_id,
-        &format!("{}/{}", msg.repo_owner, msg.repo_name),
-        &pr_result,
-    )
-    .await;
-    add_progress_note(
-        state,
-        &msg.team_id,
-        run_id,
-        &format!("Draft PR created: #{}", pr_result.pr_number),
-    )
-    .await;
+    // A round the guard refused shows up only as that round's failure.
+    run_guard::check(state, &msg.team_id, run_id).await?;
 
     // Planned work still not done is finished by CoderHelm, in rounds of its
     // own on the pull request (`finish_planned`): the first is parked for
@@ -5559,6 +5677,34 @@ async fn run_passes(
     Ok(())
 }
 
+/// The pull request on the run record as soon as it exists: the run page shows
+/// it while the checks run, and the run still is `running`.
+async fn record_open_pr(
+    state: &WorkerState,
+    msg: &TicketMessage,
+    run_id: &str,
+    branch: &str,
+    pr: &pr::PrResult,
+) {
+    if let Err(e) = state
+        .dynamo
+        .update_item()
+        .table_name(&state.config.runs_table_name)
+        .key("team_id", attr_s(&msg.team_id))
+        .key("run_id", attr_s(run_id))
+        .update_expression("SET pr_url = :pr, pr_number = :pn, branch = :b, updated_at = :t")
+        .condition_expression("attribute_exists(run_id)")
+        .expression_attribute_values(":pr", attr_s(&pr.pr_url))
+        .expression_attribute_values(":pn", attr_n(pr.pr_number))
+        .expression_attribute_values(":b", attr_s(branch))
+        .expression_attribute_values(":t", attr_s(&chrono::Utc::now().to_rfc3339()))
+        .send()
+        .await
+    {
+        warn!(run_id, error = %e, "Could not record the pull request on the run");
+    }
+}
+
 /// The run's error when a gate stops it (a tooling failure, a value only a
 /// person can set): the gate's own reason, and where the work is kept.
 fn stopped_keeping(why: &str, kept: &str) -> String {
@@ -5688,6 +5834,8 @@ async fn save_checked_tasks(state: &WorkerState, msg: &TicketMessage, run_id: &s
 /// For a continuation: the planned tasks its branch doesn't do yet, as the
 /// implement pass's instructions. `None` when all are done or it can't tell.
 async fn continuation_feedback(
+    state: &WorkerState,
+    run_id: &str,
     github: &GitHubClient,
     msg: &TicketMessage,
     plan: &plan::PlanResult,
@@ -5708,6 +5856,13 @@ async fn continuation_feedback(
     )
     .await?;
     let cov = plan_coverage::coverage(&tasks, &changed);
+    run_guard::progress(
+        state,
+        &msg.team_id,
+        run_id,
+        run_guard::Progress::TasksDone(cov.done.len()),
+    )
+    .await;
     (!cov.required_missing().is_empty()).then(|| plan_coverage::round_feedback(&cov))
 }
 
@@ -6143,33 +6298,10 @@ async fn run_repo_pipeline(
             .into());
         }
     };
-    update_pass(state, &msg.team_id, run_id, "review").await?;
-    let mut evidence = impl_result.evidence.clone();
-    let work = proof::Work {
-        state,
-        msg,
-        github,
-        plan: &repo_plan,
-        branch: branch_name,
-        rules,
-        repo_instructions,
-        provider,
-        file_cache,
-        run_id,
-        deadline: implement_deadline,
-        generated: &settled_generated,
-    };
-    let mut gaps = proof::prove(&work, &mut evidence, usage, || {
-        has_time_for_remediation(start)
-    })
-    .await;
-    // Planned work still not done after the fix round: this repository's
-    // pull request opens as a draft with it listed at the top.
-    let unfinished = proof::unfinished_section(&gaps);
-    gaps.extend(plan_optional);
-    // What the ticket needs outside the code, counted once: in the pull
-    // request of the repository its steps act on (the same plan check the
-    // single-repository path makes).
+    // What is open whatever the checks find. What the ticket needs outside the
+    // code is counted once: in the pull request of the repository its steps act
+    // on (the same plan check the single-repository path makes).
+    let mut known_open: Vec<proof::Finding> = plan_optional;
     let owns_outside = outside_owner(plan_result, repo_owner, repo_name);
     if owns_outside {
         let outside_open = plan_coverage::outside_findings(plan_result.fix.as_ref());
@@ -6182,25 +6314,25 @@ async fn run_repo_pipeline(
             )
             .await;
         }
-        gaps.extend(outside_open);
+        known_open.extend(outside_open);
     }
-    gaps.extend(security_items);
-    let links = link_checks::gate(&work, &mut evidence, usage, || {
-        has_time_for_remediation(start)
-    })
-    .await
-    .map_err(|why| format!("Link and redirect check blocked the pull request: {why}"))?;
-    // A failing- or flaky-test fix: no waits without evidence, no helper
-    // that walks every row, test packages checked where they live.
-    let test_pr = test_fix::gate(&work, &mut evidence, usage, || {
-        has_time_for_remediation(start)
-    })
-    .await
-    .map_err(test_fix::blocked_reason)?;
+    known_open.extend(security_items);
+    let ledger = run_guard::LedgerCell::load(
+        state,
+        &msg.team_id,
+        run_id,
+        &format!("{repo_owner}/{repo_name}"),
+    )
+    .await;
+    ledger.update(|l| l.on_step_start());
+    let already_open = ledger.update(|l| l.opened.clone());
 
-    // --- Create Draft PR ---
+    // --- The draft pull request, before the checks (see the single-repository
+    // path) ---
     check_cancelled(state, &msg.team_id, run_id).await?;
-    update_pass(state, &msg.team_id, run_id, "pr").await?;
+    if already_open.is_none() {
+        update_pass(state, &msg.team_id, run_id, "pr").await?;
+    }
 
     match pr::resolve_conflicts(state, msg, github, branch_name, provider, usage).await {
         Ok(true) => info!(run_id, "Resolved merge conflicts"),
@@ -6226,13 +6358,142 @@ async fn run_repo_pipeline(
         }
         None => None,
     };
-    let pr_result = pr::run(
+    let pr_result = if let Some(o) = already_open {
+        pr::PrResult {
+            pr_number: o.number,
+            pr_url: o.url,
+            branch: branch_name.to_string(),
+            draft: true,
+            node_id: o.node_id,
+        }
+    } else {
+        let opening_evidence = impl_result.evidence.clone();
+        let pr_result = pr::run(
+            state,
+            msg,
+            github,
+            branch_name,
+            &repo_plan,
+            voice,
+            &pr::Proof {
+                evidence: &opening_evidence.for_pr(),
+                gaps: &proof::gaps_section(&known_open),
+                unfinished: "",
+                manual: "",
+                ci: &opening_evidence.ci_commands,
+                mirrors: &completeness::parse_mirrors(&opening_evidence.notes),
+                log: repo_ev.as_ref(),
+                links: "",
+                test_fix: None,
+                // Multi-repo runs: the new-feature rules check single-repo runs.
+                feature: None,
+                keep_commits: false,
+            },
+            provider,
+            usage,
+            run_id,
+        )
+        .await?;
+        write_pass_trace(
+            state,
+            &msg.team_id,
+            run_id,
+            "pr",
+            pass_start,
+            &usage_before,
+            usage,
+            None,
+        )
+        .await;
+        info!(run_id, repo = %format!("{repo_owner}/{repo_name}"), pr_url = %pr_result.pr_url, "Draft PR created");
+        ledger.update(|l| {
+            l.opened = Some(run_guard::OpenedPr {
+                number: pr_result.pr_number,
+                url: pr_result.pr_url.clone(),
+                node_id: pr_result.node_id.clone(),
+            });
+        });
+        ledger.save(state, &msg.team_id, run_id).await;
+        run_guard::progress(state, &msg.team_id, run_id, run_guard::Progress::PrOpen).await;
+        self::webhooks::emit_pr_opened(
+            state,
+            msg,
+            run_id,
+            &format!("{repo_owner}/{repo_name}"),
+            &pr_result,
+        )
+        .await;
+        add_progress_note(
+            state,
+            &msg.team_id,
+            run_id,
+            &format!(
+                "Draft PR #{} created for {}/{}",
+                pr_result.pr_number, repo_owner, repo_name
+            ),
+        )
+        .await;
+        pr_result
+    };
+
+    // --- The checks, on the open pull request. What they leave goes under
+    // Open items: nothing here can stop it ---
+    update_pass(state, &msg.team_id, run_id, PASS_CHECKS).await?;
+    let mut evidence = impl_result.evidence.clone();
+    let work = proof::Work {
         state,
         msg,
         github,
-        branch_name,
+        plan: &repo_plan,
+        branch: branch_name,
+        rules,
+        repo_instructions,
+        provider,
+        file_cache,
+        run_id,
+        deadline: implement_deadline,
+        generated: &settled_generated,
+        ledger: &ledger,
+    };
+    let mut gaps = proof::prove(&work, &mut evidence, usage, || {
+        has_time_for_remediation(start)
+    })
+    .await;
+    // Planned work still not done after the fix rounds: this repository's
+    // pull request stays a draft with it listed at the top.
+    let unfinished = proof::unfinished_section(&gaps);
+    gaps.extend(known_open);
+    let links = match link_checks::gate(&work, &mut evidence, usage, || {
+        has_time_for_remediation(start)
+    })
+    .await
+    {
+        Ok(l) => l,
+        Err(why) => {
+            gaps.push(proof::blocked_item("The link and redirect check", &why));
+            String::new()
+        }
+    };
+    // A failing- or flaky-test fix: no waits without evidence, no helper
+    // that walks every row, test packages checked where they live.
+    let test_pr = match test_fix::gate(&work, &mut evidence, usage, || {
+        has_time_for_remediation(start)
+    })
+    .await
+    {
+        Ok(t) => t,
+        Err(why) => {
+            gaps.push(proof::blocked_item("The failing-test rules", &why));
+            None
+        }
+    };
+    pr::apply_checks(
+        state,
+        msg,
+        github,
+        run_id,
         &repo_plan,
-        voice,
+        pr_result.pr_number,
         &pr::Proof {
             evidence: &evidence.for_pr(),
             gaps: &proof::gaps_section(&gaps),
@@ -6243,44 +6504,9 @@ async fn run_repo_pipeline(
             log: repo_ev.as_ref(),
             links: &links,
             test_fix: test_pr.as_ref(),
-            // Multi-repo runs: the new-feature rules check single-repo runs.
             feature: None,
             keep_commits: false,
         },
-        provider,
-        usage,
-        run_id,
-    )
-    .await?;
-    write_pass_trace(
-        state,
-        &msg.team_id,
-        run_id,
-        "pr",
-        pass_start,
-        &usage_before,
-        usage,
-        None,
-    )
-    .await;
-
-    info!(run_id, repo = %format!("{repo_owner}/{repo_name}"), pr_url = %pr_result.pr_url, "Draft PR created");
-    self::webhooks::emit_pr_opened(
-        state,
-        msg,
-        run_id,
-        &format!("{repo_owner}/{repo_name}"),
-        &pr_result,
-    )
-    .await;
-    add_progress_note(
-        state,
-        &msg.team_id,
-        run_id,
-        &format!(
-            "Draft PR #{} created for {}/{}",
-            pr_result.pr_number, repo_owner, repo_name
-        ),
     )
     .await;
     // The outside steps CoderHelm does itself, on this repository's pull
@@ -6327,8 +6553,9 @@ async fn resume_run_to_running(state: &WorkerState, team_id: &str, run_id: &str)
         .key("team_id", attr_s(team_id))
         .key("run_id", attr_s(run_id))
         .update_expression("SET #s = :r, status_run_id = :sri, updated_at = :t")
+        // Nor a run the guard stopped: a step already queued doesn't undo it.
         .condition_expression(format!(
-            "attribute_exists(run_id) AND {}",
+            "attribute_exists(run_id) AND attribute_not_exists(guard_open) AND {}",
             common::run_status::not_ended("#s")
         ))
         .expression_attribute_names("#s", "status")
@@ -6541,7 +6768,8 @@ pub(crate) async fn update_pass(
         Some(("current_pass = :p", ":p", attr_s(pass))),
     )
     .await?;
-    Ok(())
+    // Every pass goes through here, so a pass added later is counted too.
+    run_guard::on_pass(state, team_id, run_id).await
 }
 
 /// Why Coderhelm stopped trying to get CI green and left the PR to a person.
@@ -6630,6 +6858,9 @@ pub(crate) async fn record_ci_outcome(
     run_id: &str,
     outcome: CiOutcome,
 ) {
+    if matches!(outcome, CiOutcome::Passed | CiOutcome::PassedAfterRerun) {
+        run_guard::progress(state, team_id, run_id, run_guard::Progress::CiGreen).await;
+    }
     let mut req = state
         .dynamo
         .update_item()
@@ -7269,6 +7500,39 @@ async fn mark_run_needs_input(
             .send()
             .await;
     }
+}
+
+/// A run the guard stopped with nothing to open a pull request from: it still
+/// waits on a person, with the reason on the run page.
+pub(crate) async fn mark_run_stopped_by_guard(
+    state: &WorkerState,
+    msg: &TicketMessage,
+    run_id: &str,
+    reason: &str,
+) {
+    if let Err(e) = state
+        .dynamo
+        .update_item()
+        .table_name(&state.config.runs_table_name)
+        .key("team_id", attr_s(&msg.team_id))
+        .key("run_id", attr_s(run_id))
+        .update_expression(
+            "SET #s = :s, status_run_id = :sri, error_message = :em, updated_at = :t, current_pass = :cp",
+        )
+        .condition_expression(common::run_status::not_ended("#s"))
+        .ended_values()
+        .expression_attribute_names("#s", "status")
+        .expression_attribute_values(":s", attr_s(common::run_status::NEEDS_INPUT))
+        .expression_attribute_values(":sri", attr_s(&format!("needs_input#{run_id}")))
+        .expression_attribute_values(":em", attr_s(reason))
+        .expression_attribute_values(":t", attr_s(&chrono::Utc::now().to_rfc3339()))
+        .expression_attribute_values(":cp", attr_s("done"))
+        .send()
+        .await
+    {
+        warn!(run_id, error = %e, "Could not hand the stopped run to a person");
+    }
+    self::webhooks::emit_run(state, &msg.team_id, run_id, "needs_input").await;
 }
 
 /// Stop a Jira run whose ticket belongs in a repo that isn't connected or

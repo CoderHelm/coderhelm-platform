@@ -4569,6 +4569,9 @@ pub(crate) fn draft_hold(body: &str, title: &str, proven: bool) -> Option<&'stat
     if super::proof::holds_unfinished(body) {
         return Some("planned work not done is listed in the description");
     }
+    if super::proof::holds_blocked(body) {
+        return Some("a check the change didn't pass is listed in the description");
+    }
     if super::own_review::hold(body).is_some() {
         return Some("CoderHelm's own review findings are open in the description");
     }
@@ -4783,6 +4786,13 @@ async fn record_own_review_progress(
     {
         warn!(run_id, error = %e, "Could not record own review progress (non-fatal)");
     }
+    super::run_guard::progress(
+        state,
+        team_id,
+        run_id,
+        super::run_guard::Progress::Findings("own_review", open),
+    )
+    .await;
 }
 
 /// The findings a review-fix round was asked to fix: the `- [ ]` lines

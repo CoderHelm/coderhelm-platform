@@ -400,6 +400,70 @@ impl WorkerMessage {
 
     /// Work that runs an agent for one team, as (team, what it is, run id):
     /// what "Pause all agents" holds back. Sweeps and bookkeeping aren't.
+    /// The run a message belongs to, for the entry guard (`run_ceiling`): a
+    /// continuation or retry of a ticket run, a resume, a feedback round. A
+    /// ticket's first message has no run yet, and a person's Retry starts a new
+    /// one. No catch-all on purpose: a new message kind doesn't compile until it
+    /// says which it is.
+    pub fn run_ref(&self) -> Option<(&str, &str)> {
+        match self {
+            WorkerMessage::Ticket(t) => t
+                .continuation_run_id
+                .as_deref()
+                .filter(|r| !r.is_empty() && (t.continuation > 0 || t.model_retries > 0))
+                .map(|r| (t.team_id.as_str(), r)),
+            WorkerMessage::Feedback(m) => Some((m.team_id.as_str(), m.run_id.as_str())),
+            WorkerMessage::Resume(m) => Some((m.team_id.as_str(), m.run_id.as_str())),
+            WorkerMessage::ToolProposals(_)
+            | WorkerMessage::HiddenSuggest(_)
+            | WorkerMessage::Onboard(_)
+            | WorkerMessage::MarkReady(_)
+            | WorkerMessage::PlanExecute(_)
+            | WorkerMessage::PlanTaskContinue(_)
+            | WorkerMessage::InfraAnalyze(_)
+            | WorkerMessage::Review(_)
+            | WorkerMessage::ReviewReminder
+            | WorkerMessage::ReviewSweep
+            | WorkerMessage::HealthCheck(_)
+            | WorkerMessage::AwaitMerge(_)
+            | WorkerMessage::ReleaseSteps(_)
+            | WorkerMessage::RelayRetry(_)
+            | WorkerMessage::WebhookEmit(_)
+            | WorkerMessage::WebhookSend(_)
+            | WorkerMessage::TagSweep(_)
+            | WorkerMessage::Restack(_)
+            | WorkerMessage::ReleaseNotes(_)
+            | WorkerMessage::GraphIndex(_)
+            | WorkerMessage::TestIngest(_)
+            | WorkerMessage::TestAction(_)
+            | WorkerMessage::SkillSync(_)
+            | WorkerMessage::SkillAsk(_)
+            | WorkerMessage::DlqCleanup
+            | WorkerMessage::KnowledgeSyncSweep
+            | WorkerMessage::KnowledgeSync(_)
+            | WorkerMessage::WeeklySummary
+            | WorkerMessage::DeployStatsBackfill(_)
+            | WorkerMessage::WeeklySummaryTest(_)
+            | WorkerMessage::UsageReconcile(_)
+            | WorkerMessage::UsageRecord(_)
+            | WorkerMessage::Lesson(_)
+            | WorkerMessage::LogAutofix
+            | WorkerMessage::AwsPermissionsSweep
+            | WorkerMessage::ReviewLesson(_)
+            | WorkerMessage::RewardOutcome(_)
+            | WorkerMessage::JiraComment(_)
+            | WorkerMessage::AgentResumeSweep
+            | WorkerMessage::PluginRun(_)
+            | WorkerMessage::PluginPublish(_)
+            | WorkerMessage::PluginSync(_)
+            | WorkerMessage::PluginSweep
+            | WorkerMessage::HybridNameCheck
+            | WorkerMessage::SupportSync
+            | WorkerMessage::PluginTrigger(_)
+            | WorkerMessage::PluginResults(_) => None,
+        }
+    }
+
     pub fn agent_work(&self) -> Option<(&str, String, String)> {
         match self {
             WorkerMessage::Ticket(t) => Some((

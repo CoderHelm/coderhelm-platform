@@ -17,7 +17,9 @@
 use serde_yaml::Value;
 
 /// A kind of check a repository's CI runs on a pull request.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
 pub enum CheckKind {
     /// A type-check, or a validation of the same role (`terraform validate`).
     Typecheck,
@@ -612,7 +614,7 @@ pub struct Workflow {
 }
 
 /// One check command CI runs on a pull request, as the workflow writes it.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct CiCommand {
     /// Its id in this run (`C1`): the judge names it, code checks it exists.
     pub id: String,

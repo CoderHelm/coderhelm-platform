@@ -13,6 +13,83 @@ sweep = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(sweep)
 
 
+class OverCeiling(unittest.TestCase):
+    def test_under_every_ceiling_is_left_alone(self):
+        self.assertIsNone(sweep.over_ceiling({}))
+        self.assertIsNone(
+            sweep.over_ceiling(
+                {
+                    "ceil_passes": sweep.MAX_RUN_PASSES,
+                    "ceil_continuations": sweep.MAX_RUN_CONTINUATIONS,
+                    "ceil_worked_secs": sweep.MAX_RUN_WORKED_SECS,
+                    "ceil_spend_usd": sweep.MAX_RUN_SPEND_USD,
+                }
+            )
+        )
+
+    def test_each_ceiling_has_its_own_code(self):
+        for field, value, code in [
+            ("ceil_passes", sweep.MAX_RUN_PASSES + 1, "ceiling_passes"),
+            ("ceil_continuations", sweep.MAX_RUN_CONTINUATIONS + 1, "ceiling_continuations"),
+            ("ceil_worked_secs", sweep.MAX_RUN_WORKED_SECS + 1, "ceiling_worked_time"),
+            ("ceil_spend_usd", sweep.MAX_RUN_SPEND_USD + 1, "ceiling_spend"),
+        ]:
+            self.assertEqual(sweep.over_ceiling({field: value})[0], code)
+
+    def test_the_reason_notes_the_pull_request_or_the_branch(self):
+        with_pr = sweep.over_ceiling_reason("the limit", {"pr_url": "https://x/1", "pr_number": 1})
+        self.assertIn("https://x/1", with_pr)
+        no_pr = sweep.over_ceiling_reason("the limit", {}, "coderhelm/x")
+        self.assertIn("`coderhelm/x`", no_pr)
+        self.assertIn("Retry", no_pr)
+
+    def test_the_handoff_waits_on_a_person_and_keeps_steps_from_restarting(self):
+        update, values = sweep.over_ceiling_update("R1", "ceiling_spend", "why", "now")
+        self.assertEqual(values[":new"], "needs_input")
+        self.assertEqual(values[":sri"], "needs_input#R1")
+        self.assertIs(values[":yes"], True)
+        self.assertIn("guard_open = :yes", update)
+        self.assertIn("loop_stop_reason = :code", update)
+
+    def test_a_run_over_it_is_ended_whatever_its_last_update_says(self):
+        import datetime as dt
+
+        now = dt.datetime.now(dt.timezone.utc).isoformat()
+        run = {
+            "team_id": "T",
+            "run_id": "R",
+            "status": "running",
+            "updated_at": now,
+            "ceil_spend_usd": sweep.MAX_RUN_SPEND_USD + 1,
+        }
+        updates = []
+
+        class Table:
+            def scan(self, **kw):
+                return {"Items": [run]}
+
+            def update_item(self, **kw):
+                updates.append(kw)
+
+        class Db:
+            class meta:
+                class client:
+                    class exceptions:
+                        ConditionalCheckFailedException = KeyError
+
+            def Table(self, _name):
+                return Table()
+
+        sweep._dynamodb = Db()
+        try:
+            out = sweep.handler({}, None)
+        finally:
+            sweep._dynamodb = None
+        self.assertEqual(out["over_ceiling"], 1)
+        self.assertEqual(len(updates), 1)
+        self.assertEqual(updates[0]["ExpressionAttributeValues"][":new"], "needs_input")
+
+
 class LastKnownPass(unittest.TestCase):
     def test_current_pass_wins(self):
         self.assertEqual(sweep.last_known_pass({"current_pass": "implement"}), "implement")

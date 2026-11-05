@@ -146,6 +146,15 @@ export class MonitoringStack extends cdk.Stack {
       metricName: "ReviewSweepRequeued",
       metricValue: "1",
     }).metric({ period: cdk.Duration.minutes(15), statistic: "Sum" });
+    // Each run the run guard ended for making no progress (see `run_guard`):
+    // a run that loops, stopped before it spent more.
+    new logs.MetricFilter(this, "RunLoopStoppedFilter", {
+      logGroup: workerLogs,
+      filterPattern: logs.FilterPattern.literal('"run_loop_stopped"'),
+      metricNamespace: "CoderHelm/Runs",
+      metricName: "RunLoopStopped",
+      metricValue: "1",
+    });
     const modelRequeuedMetric = new logs.MetricFilter(this, "ModelErrorRequeuedFilter", {
       logGroup: workerLogs,
       filterPattern: logs.FilterPattern.literal('"model_error_requeued"'),

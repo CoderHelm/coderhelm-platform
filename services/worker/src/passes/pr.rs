@@ -1476,6 +1476,106 @@ fn is_lockfile(path: &str) -> bool {
 /// copied, every step outside this PR with its owner, and Open items. The
 /// merge order is added once every PR of a multi-repo run exists
 /// ([`link_siblings`]).
+/// Puts `items` under the Open items of a pull request that is already open.
+/// The rest of the description stays as it is.
+pub async fn put_open_items(
+    github: &GitHubClient,
+    owner: &str,
+    repo: &str,
+    number: u64,
+    body: &str,
+    items: &[super::proof::Finding],
+) {
+    let (mut owned, rest) = super::completeness::take_owned(body);
+    owned.open_items = super::proof::gaps_section(items);
+    let unfinished = super::proof::unfinished_section(items);
+    if !unfinished.is_empty() {
+        owned.unfinished = unfinished;
+    }
+    let out = super::completeness::assemble(&rest, &owned);
+    if out != body {
+        if let Err(e) = github.update_pr_body(owner, repo, number, &out).await {
+            warn!(pr_number = number, error = %e, "Could not list the open items on the PR");
+        }
+    }
+}
+
+/// The description once the checks have run on the open pull request: what
+/// they found goes in CoderHelm's own sections, from what they checked and not
+/// through the writer, so this costs no model call. The holds that keep it a
+/// draft are registered here.
+pub async fn apply_checks(
+    state: &WorkerState,
+    msg: &TicketMessage,
+    github: &GitHubClient,
+    run_id: &str,
+    plan: &PlanResult,
+    number: u64,
+    proof: &Proof<'_>,
+) {
+    let repo = format!("{}/{}", msg.repo_owner, msg.repo_name);
+    if let Some(t) = proof.test_fix {
+        super::test_fix::register_pr(state, msg, run_id, number, t).await;
+    }
+    if let Some(f) = proof.feature {
+        super::feature::register_pr(state, msg, run_id, number, f).await;
+    }
+    let body = match github
+        .get_pull_request(&msg.repo_owner, &msg.repo_name, number)
+        .await
+    {
+        Ok(p) => p["body"].as_str().unwrap_or("").to_string(),
+        Err(e) => {
+            warn!(pr_number = number, error = %e, "Could not read the PR to add the checks' results");
+            return;
+        }
+    };
+    let out = with_checks(&body, plan, proof, &repo);
+    if out != body {
+        if let Err(e) = github
+            .update_pr_body(&msg.repo_owner, &msg.repo_name, number, &out)
+            .await
+        {
+            warn!(pr_number = number, error = %e, "Could not add the checks' results to the PR");
+        }
+    }
+}
+
+/// Heading over what only a person can check, when the checks found some.
+const MANUAL_HEADING: &str = "**Check by hand**";
+
+/// [`apply_checks`]'s description. Running it twice gives the same text.
+fn with_checks(body: &str, plan: &PlanResult, proof: &Proof<'_>, repo: &str) -> String {
+    let (owned, rest) = super::completeness::take_owned(body);
+    let rest = match proof.test_fix {
+        Some(t) => super::test_fix::shape_body(rest, t),
+        None => rest,
+    };
+    let rest = match proof.feature {
+        Some(f) => super::feature::shape_body(rest, f),
+        None => rest,
+    };
+    let rest = if !proof.manual.trim().is_empty() && !rest.contains(MANUAL_HEADING) {
+        format!(
+            "{}\n\n{MANUAL_HEADING}\n{}",
+            rest.trim_end(),
+            proof.manual.trim()
+        )
+    } else {
+        rest
+    };
+    let mut new = owned_sections(plan, proof, repo);
+    // What the run put there since the pull request opened stays.
+    new.review_fixes = owned.review_fixes;
+    new.open_findings = owned.open_findings;
+    new.objections = owned.objections;
+    new.merge_order = owned.merge_order;
+    if new.mirrors.is_empty() {
+        new.mirrors = owned.mirrors;
+    }
+    super::completeness::assemble(&rest, &new)
+}
+
 fn owned_sections(plan: &PlanResult, proof: &Proof<'_>, repo: &str) -> super::completeness::Owned {
     let small_test_fix = proof.test_fix.is_some_and(|t| t.small);
     super::completeness::Owned {
@@ -1953,6 +2053,59 @@ async fn fetch_pr_template(
         }
     }
     None
+}
+
+#[cfg(test)]
+mod check_results_tests {
+    use super::{with_checks, PlanResult, Proof};
+    use crate::passes::proof;
+
+    fn empty_plan() -> PlanResult {
+        PlanResult {
+            proposal: String::new(),
+            tasks: String::new(),
+            spec: String::new(),
+            design: String::new(),
+            repo_tasks: vec![],
+            fix: None,
+        }
+    }
+
+    fn proof_of<'a>(gaps: &'a str, manual: &'a str) -> Proof<'a> {
+        Proof {
+            evidence: "",
+            gaps,
+            unfinished: "",
+            manual,
+            ci: &[],
+            mirrors: &[],
+            log: None,
+            links: "",
+            test_fix: None,
+            feature: None,
+            keep_commits: false,
+        }
+    }
+
+    /// The checks run on the open pull request: their results reach its
+    /// description without the writer, and a fresh step doing it again changes
+    /// nothing.
+    #[test]
+    fn the_checks_results_reach_the_open_descriptions_sections() {
+        let item = proof::blocked_item("The new-feature rules", "new items aren't registered");
+        let gaps = proof::gaps_section(&[item]);
+        let body = "Closes #4\n\n**Summary** The change.\n\n**Verification**\n1. Open it.";
+        let plan = empty_plan();
+        let manual = "1. Try it on a phone.";
+        let once = with_checks(body, &plan, &proof_of(&gaps, manual), "a/b");
+        assert!(once.contains("**Summary** The change."), "{once}");
+        assert!(once.contains("## Open items"), "{once}");
+        assert!(once.contains("new items aren't registered"), "{once}");
+        assert!(once.contains("Try it on a phone."), "{once}");
+        assert!(proof::holds_blocked(&once));
+        let twice = with_checks(&once, &plan, &proof_of(&gaps, manual), "a/b");
+        assert_eq!(once, twice);
+    }
 }
 
 #[cfg(test)]

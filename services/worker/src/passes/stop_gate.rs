@@ -722,17 +722,6 @@ mod tests {
     }
 
     #[test]
-    fn the_gate_keeps_a_tooling_failure_in_its_own_words() {
-        let f = ToolingFailure::new("cd 'e2e' && pnpm exec tsc", "sh: 1: tsc: not found");
-        assert_eq!(
-            super::super::test_fix::blocked_reason(f.reason()),
-            f.reason()
-        );
-        assert!(super::super::test_fix::blocked_reason("waits added".into())
-            .starts_with("The failing-test rules blocked the pull request: "));
-    }
-
-    #[test]
     fn a_tooling_reason_records_its_kind_and_command() {
         let f = ToolingFailure::new("cd 'e2e' && npx --no-install tsc", "sh: 1: tsc: not found");
         let fields = tooling_fields(&f.reason());

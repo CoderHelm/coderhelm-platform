@@ -20,8 +20,9 @@ use crate::passes::plan::PlanResult;
 use crate::passes::FileCache;
 use crate::WorkerState;
 
-/// How many fix rounds a gap gets before the PR opens with it named.
-pub const MAX_FIX_ROUNDS: u32 = 1;
+/// How many fix rounds a run's gaps get before the PR opens with them named,
+/// across all the run's steps.
+pub const MAX_FIX_ROUNDS: u32 = super::run_guard::MAX_PROOF_FIX_ROUNDS;
 
 /// What every change must do, whatever it touches. Each rule is a way a
 /// change shipped resting on a guess.
@@ -341,7 +342,7 @@ impl RunEvidence {
 }
 
 /// One of the things the gate judges.
-#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, Deserialize)]
 pub struct Finding {
     /// One of the judge's points: `external_fact`, `impact`, `logging`,
     /// `assumption`, `structured_field`, `survey`, `silent_fallback`,
@@ -402,7 +403,7 @@ impl Finding {
         match self.point.trim() {
             "ci_pending" => Settler::Ci,
             "manual_check" => Settler::Person,
-            "end_to_end" | "optional_task" => Settler::Owner,
+            "end_to_end" | "optional_task" | "check_blocked" | "rule_failing" => Settler::Owner,
             _ => Settler::Proof,
         }
     }
@@ -410,6 +411,8 @@ impl Finding {
     fn label(&self) -> &str {
         match self.point.trim() {
             "ci_pending" => "Waiting on CI",
+            "check_blocked" => "Check not passed",
+            "rule_failing" => "New-feature rule failing",
             "manual_check" => "Check by hand",
             "unrun_check" => "Check not run",
             "external_fact" => "Unconfirmed external field or behaviour",
@@ -1244,16 +1247,40 @@ const CI_MARK: &str = "<!-- coderhelm:ci -->";
 /// The mark on each security item: while one is in the description the pull
 /// request stays a draft (see `resume::mark_pr_ready`).
 pub const SECURITY_MARK: &str = "<!-- coderhelm:security -->";
+/// On an Open item for a check that would once have stopped the pull request:
+/// the pull request is open, and stays a draft while this line is there.
+pub const BLOCKED_MARK: &str = "<!-- coderhelm:blocked -->";
 
 /// Whether a finding is a security issue or a security check that didn't run.
 fn is_security(f: &Finding) -> bool {
     matches!(f.point.trim(), "security" | "security_unchecked")
 }
 
+/// An Open item for a check the change didn't pass. The pull request is
+/// already open, so a check can't stop it: it holds the draft instead, until a
+/// person deals with it.
+pub fn blocked_item(check: &str, why: &str) -> Finding {
+    Finding {
+        point: "check_blocked".to_string(),
+        detail: format!("{check}: {}", why.trim()),
+        settle: "Fix it on this branch; the pull request stays a draft while this line is here \
+                 (delete it once it's dealt with)."
+            .to_string(),
+        ..Default::default()
+    }
+}
+
+/// Whether the description lists a check the change didn't pass.
+pub fn holds_blocked(body: &str) -> bool {
+    body.contains(BLOCKED_MARK)
+}
+
 /// One Open items line, with the mark its settler needs.
 fn item_line(f: &Finding) -> String {
     if is_security(f) {
         format!("{} {SECURITY_MARK}", f.line())
+    } else if f.point.trim() == "check_blocked" {
+        format!("{} {BLOCKED_MARK}", f.line())
     } else {
         f.line()
     }
@@ -1566,62 +1593,134 @@ pub struct Work<'a> {
     /// Generated files their generator settled (`generators::GateOk`):
     /// never planned work left for the coder.
     pub generated: &'a [String],
+    /// What the checks found and how many fix rounds they took in this run:
+    /// a new step goes on from here, it doesn't start over.
+    pub ledger: &'a super::run_guard::LedgerCell,
 }
 
-/// Judges the change, runs the fix round a gap earns, and judges again.
+impl Work<'_> {
+    /// Saves the ledger: before a round starts and after it ends, so the count
+    /// survives the step being cut off in the middle.
+    pub async fn save_ledger(&self) {
+        self.ledger
+            .save(self.state, &self.msg.team_id, self.run_id)
+            .await;
+    }
+
+    /// The branch head as it is now, empty when it can't be read.
+    pub async fn head(&self) -> String {
+        self.github
+            .get_ref(&self.msg.repo_owner, &self.msg.repo_name, self.branch)
+            .await
+            .unwrap_or_default()
+    }
+
+    /// Tells the run's guard what a check reports.
+    pub async fn report_findings(&self, check: &'static str, open: usize) {
+        use super::run_guard::{progress, Progress};
+        progress(
+            self.state,
+            &self.msg.team_id,
+            self.run_id,
+            Progress::Findings(check, open),
+        )
+        .await;
+    }
+}
+
+/// Judges the change, runs the fix rounds a gap earns, and judges again.
 /// Returns what is still open when the PR is about to open: proof gaps,
 /// checks the PR's CI will settle, and checks only a person can do (empty
 /// when everything is proven or the judge couldn't answer). `evidence` gains
 /// what the fix round looked up.
+///
+/// The rounds and the last result are the run's, not this step's
+/// ([`Work::ledger`]): the judge runs again only when the code changed since
+/// the last time, and a round with no fewer gaps ends the fixing.
 pub async fn prove(
     w: &Work<'_>,
     evidence: &mut RunEvidence,
     usage: &mut TokenUsage,
     has_time: impl Fn() -> bool,
 ) -> Vec<Finding> {
-    let mut rounds = 0;
     loop {
-        let pass_start = std::time::Instant::now();
-        let usage_before = usage.clone();
-        let judged = judge(
-            w.state,
-            w.msg,
-            w.github,
-            w.branch,
-            w.plan,
-            w.generated,
-            evidence,
-            w.provider,
-            usage,
-        )
-        .await
-        .map(|f| drop_settled_generated(f, w.generated));
-        let recorded = recorded_gaps(evidence).len();
-        let findings = with_checklist(
-            with_recorded(judged, evidence),
-            w.plan.fix.as_ref(),
-            &format!("{}/{}", w.msg.repo_owner, w.msg.repo_name),
-        );
-        super::write_pass_trace(
-            w.state,
-            &w.msg.team_id,
-            w.run_id,
-            "proof",
-            pass_start,
-            &usage_before,
-            usage,
-            None,
-        )
-        .await;
-        info!(
-            run_id = w.run_id,
-            judged = findings.is_some(),
-            gaps = findings.as_ref().map_or(0, Vec::len),
-            recorded,
-            rounds,
-            "Proof check complete"
-        );
-        match next(findings.as_deref(), rounds, has_time()) {
+        let head = w.head().await;
+        let standing = w.ledger.update(|l| {
+            l.proof.unchanged(&head).then(|| {
+                l.proof.reused();
+                l.proof_findings.clone()
+            })
+        });
+        let findings = if let Some(standing) = standing {
+            info!(run_id = w.run_id, %head, "Proof check: the code didn't change, its result stands");
+            super::add_progress_note(
+                w.state,
+                &w.msg.team_id,
+                w.run_id,
+                "Proof check: the code hasn't changed since the last check, so that result stands",
+            )
+            .await;
+            // What only code sets (which CI command settles a finding) isn't
+            // stored: it is worked out again from this run's CI.
+            standing.map(|f| classify(f, evidence))
+        } else {
+            let pass_start = std::time::Instant::now();
+            let usage_before = usage.clone();
+            let judged = judge(
+                w.state,
+                w.msg,
+                w.github,
+                w.branch,
+                w.plan,
+                w.generated,
+                evidence,
+                w.provider,
+                usage,
+            )
+            .await
+            .map(|f| drop_settled_generated(f, w.generated));
+            let recorded = recorded_gaps(evidence).len();
+            let findings = with_checklist(
+                with_recorded(judged, evidence),
+                w.plan.fix.as_ref(),
+                &format!("{}/{}", w.msg.repo_owner, w.msg.repo_name),
+            );
+            super::write_pass_trace(
+                w.state,
+                &w.msg.team_id,
+                w.run_id,
+                "proof",
+                pass_start,
+                &usage_before,
+                usage,
+                None,
+            )
+            .await;
+            info!(
+                run_id = w.run_id,
+                judged = findings.is_some(),
+                gaps = findings.as_ref().map_or(0, Vec::len),
+                recorded,
+                rounds = w.ledger.update(|l| l.proof.rounds),
+                "Proof check complete"
+            );
+            let open = findings.as_deref().map_or(0, proof_gaps);
+            w.ledger.update(|l| {
+                l.proof.checked(&head, open);
+                l.proof_findings = findings.clone();
+            });
+            w.save_ledger().await;
+            findings
+        };
+        w.report_findings("proof", findings.as_deref().map_or(0, proof_gaps))
+            .await;
+        let (rounds, may_fix) = w
+            .ledger
+            .update(|l| (l.proof.rounds, l.proof.may_fix(MAX_FIX_ROUNDS)));
+        // Only a round that could run asks about time: a "no" for one that
+        // couldn't would send the run to a fresh step for nothing.
+        let fix_ok = may_fix && has_time();
+        match next(findings.as_deref(), rounds, fix_ok) {
             Next::Open => {
                 if findings.is_some() {
                     super::add_progress_note(
@@ -1665,7 +1764,8 @@ pub async fn prove(
             }
             Next::FixRound => {
                 let gaps = findings.unwrap_or_default();
-                rounds += 1;
+                w.ledger.update(|l| l.proof.start_fix());
+                w.save_ledger().await;
                 super::add_progress_note(
                     w.state,
                     &w.msg.team_id,
@@ -1713,6 +1813,8 @@ pub async fn prove(
                     None,
                 )
                 .await;
+                w.ledger.update(|l| l.proof.end_fix());
+                w.save_ledger().await;
                 match fixed {
                     Ok(r) => evidence.merge(r.evidence),
                     Err(e) => {
@@ -1720,7 +1822,8 @@ pub async fn prove(
                         return gaps;
                     }
                 }
-                let _ = super::update_pass(w.state, &w.msg.team_id, w.run_id, "review").await;
+                let _ =
+                    super::update_pass(w.state, &w.msg.team_id, w.run_id, super::PASS_CHECKS).await;
             }
         }
     }
@@ -1896,7 +1999,8 @@ mod tests {
     fn a_gap_earns_one_fix_round_then_opens_with_it_named() {
         let gaps = [finding("impact", "affected records not counted")];
         assert_eq!(next(Some(&gaps), 0, true), Next::FixRound);
-        assert_eq!(next(Some(&gaps), 1, true), Next::OpenWithGaps);
+        assert_eq!(next(Some(&gaps), 1, true), Next::FixRound);
+        assert_eq!(next(Some(&gaps), MAX_FIX_ROUNDS, true), Next::OpenWithGaps);
         assert_eq!(next(Some(&gaps), 0, false), Next::OpenWithGaps);
         assert_eq!(next(Some(&[]), 0, true), Next::Open);
         // A judge that couldn't answer never holds the PR.
@@ -2745,10 +2849,13 @@ mod planned_work_tests {
         assert_eq!(next(Some(&gaps), 0, true), Next::FixRound);
         // No round left: unfinished (the PR opens as a draft with it at
         // the top, never without a PR).
-        assert_eq!(next(Some(&gaps), 1, true), Next::Unfinished);
+        assert_eq!(next(Some(&gaps), MAX_FIX_ROUNDS, true), Next::Unfinished);
         assert_eq!(next(Some(&gaps), 0, false), Next::Unfinished);
         // Other gaps alone still open with Open items.
-        assert_eq!(next(Some(&gaps[1..]), 1, true), Next::OpenWithGaps);
+        assert_eq!(
+            next(Some(&gaps[1..]), MAX_FIX_ROUNDS, true),
+            Next::OpenWithGaps
+        );
         let top = unfinished_section(&gaps);
         assert!(top.starts_with(UNFINISHED_START));
         assert!(top.contains("## Not finished"));

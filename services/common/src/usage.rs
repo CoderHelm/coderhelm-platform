@@ -77,6 +77,81 @@ tokio::task_local! {
 }
 
 /// Run `fut` with every model call inside it attributed to `feature`.
+/// What one message of a run may still spend on model calls. Every call asks
+/// it in [`UsageMeter::admit`], so nothing in a run spends past it.
+pub struct RunAllowance {
+    /// Millionths of a dollar left.
+    left: std::sync::atomic::AtomicI64,
+    /// Spent since the run guard last looked.
+    unreported: std::sync::atomic::AtomicU64,
+    /// Why nothing more may be spent, once something said so.
+    closed: std::sync::Mutex<Option<String>>,
+}
+
+impl RunAllowance {
+    pub fn new(left_usd: f64) -> Self {
+        Self {
+            left: std::sync::atomic::AtomicI64::new((left_usd.max(0.0) * 1e6).min(9e18) as i64),
+            unreported: std::sync::atomic::AtomicU64::new(0),
+            closed: std::sync::Mutex::new(None),
+        }
+    }
+
+    fn refused(&self) -> Option<String> {
+        if let Some(why) = self
+            .closed
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+        {
+            return Some(why);
+        }
+        (self.left.load(std::sync::atomic::Ordering::Relaxed) <= 0)
+            .then(|| "This run has used all the model spend one run may".to_string())
+    }
+}
+
+tokio::task_local! {
+    static RUN_ALLOWANCE: std::sync::Arc<RunAllowance>;
+}
+
+/// Runs `fut` with its model calls held to `allowance`.
+pub async fn with_run_allowance<F: std::future::Future>(
+    allowance: std::sync::Arc<RunAllowance>,
+    fut: F,
+) -> F::Output {
+    RUN_ALLOWANCE.scope(allowance, fut).await
+}
+
+/// A model call's cost, against the current allowance.
+pub fn note_run_spend(cost_usd: f64) {
+    let _ = RUN_ALLOWANCE.try_with(|a| {
+        let micro = (cost_usd.max(0.0) * 1e6) as u64;
+        a.left
+            .fetch_sub(micro as i64, std::sync::atomic::Ordering::Relaxed);
+        a.unreported
+            .fetch_add(micro, std::sync::atomic::Ordering::Relaxed);
+    });
+}
+
+/// What was spent since this was last asked, in USD.
+pub fn take_run_spend() -> f64 {
+    RUN_ALLOWANCE
+        .try_with(|a| a.unreported.swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / 1e6)
+        .unwrap_or(0.0)
+}
+
+/// No more model calls in this message, and why.
+pub fn close_run_allowance(why: &str) {
+    let _ = RUN_ALLOWANCE.try_with(|a| {
+        *a.closed.lock().unwrap_or_else(|e| e.into_inner()) = Some(why.to_string());
+    });
+}
+
+fn run_allowance_refused() -> Option<String> {
+    RUN_ALLOWANCE.try_with(|a| a.refused()).ok().flatten()
+}
+
 pub async fn with_feature<F: std::future::Future>(feature: &'static str, fut: F) -> F::Output {
     FEATURE.scope(feature, fut).await
 }
@@ -973,6 +1048,15 @@ impl UsageMeter {
     /// flight when the limit was crossed. A meter with no team (setup
     /// probes, tests) and a process with no check set are never limited.
     pub async fn admit(&self) -> Result<(), crate::model_retry::ModelCallError> {
+        // A run over its ceiling makes no more calls, whatever the team's
+        // limit says and whoever is calling (see worker `run_ceiling`).
+        if let Some(reason) = run_allowance_refused() {
+            warn!(%reason, "Model call refused: the run is over its ceiling");
+            return Err(crate::model_retry::ModelCallError::new(
+                crate::model_retry::ModelErrorKind::LimitReached,
+                reason,
+            ));
+        }
         if self.team_id.is_empty() {
             return Ok(());
         }

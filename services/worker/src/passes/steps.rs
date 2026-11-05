@@ -10,7 +10,7 @@
 //! fresh step (a NEW queue message with its own receive count and its own 15
 //! minutes) that resumes exactly where this one stopped: planning
 //! ([`Gate::Plan`]), the implement work, the generator check
-//! ([`Gate::Generators`]) or the checks before the pull request
+//! ([`Gate::Generators`]), the pull request ([`Gate::Pr`]) or the checks on it
 //! ([`Gate::Checks`]), with the branch as it is.
 //!
 //! Planning commits nothing to a branch, so it keeps its own state on the
@@ -27,10 +27,9 @@
 //! the branch head moved, or the run reached a later gate. It stops when two
 //! steps in a row make none (with what was stuck), when the team's usage
 //! limit stops it, or when a person cancels it. [`MAX_RUN_STEPS`] is only a
-//! runaway ceiling, never reached by real work.
-
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Instant;
+//! runaway ceiling, never reached by real work. A moving branch is not enough
+//! on its own: `run_guard` ends a run that keeps committing with nothing to show
+//! for it.
 
 use aws_sdk_dynamodb::types::AttributeValue;
 use tracing::{error, warn};
@@ -122,6 +121,7 @@ fn where_label(at: &str) -> &str {
         "verify" => "the test and security audit after the implement work",
         "generators" => "the generator check (regenerating generated files)",
         "checks" => "the checks before the pull request",
+        "pr" => "opening the pull request",
         "implement_started" | "implement" => "the implement work (planned tasks)",
         "security" => "the security audit",
         "plan" => "planning (the plan and its repository and file checks)",
@@ -144,8 +144,10 @@ pub enum Gate {
     Verify,
     /// The generator check: regenerate, verify, one fix round.
     Generators,
-    /// The proof, link, test-fix and new-feature checks, then the pull
-    /// request.
+    /// The draft pull request, as soon as the work is built.
+    Pr,
+    /// The proof, link, test-fix and new-feature checks, on the open pull
+    /// request. What they found so far is in the run's ledger (see `run_guard`).
     Checks,
 }
 
@@ -156,6 +158,7 @@ impl Gate {
             Gate::Verify => "verify",
             Gate::Generators => "generators",
             Gate::Checks => "checks",
+            Gate::Pr => "pr",
         }
     }
 
@@ -165,6 +168,7 @@ impl Gate {
             "verify" => Some(Gate::Verify),
             "generators" => Some(Gate::Generators),
             "checks" => Some(Gate::Checks),
+            "pr" => Some(Gate::Pr),
             _ => None,
         }
     }
@@ -507,43 +511,6 @@ pub async fn mark_queued(state: &WorkerState, team_id: &str, run_id: &str, step:
     }
 }
 
-// ── Time ─────────────────────────────────────────────────────────────────
-
-/// The "is there time for a fix round" answer the checks get, remembering
-/// when it said no: a check that then blocks the pull request blocked it
-/// for want of time, and the run continues in a fresh step instead.
-pub struct TimeBudget<F: Fn() -> bool> {
-    has_time: F,
-    denied: AtomicBool,
-}
-
-impl<F: Fn() -> bool> TimeBudget<F> {
-    pub fn new(has_time: F) -> Self {
-        Self {
-            has_time,
-            denied: AtomicBool::new(false),
-        }
-    }
-
-    pub fn has_time(&self) -> bool {
-        let ok = (self.has_time)();
-        if !ok {
-            self.denied.store(true, Ordering::SeqCst);
-        }
-        ok
-    }
-
-    /// Whether a round was refused for time since the last call.
-    pub fn take_denied(&self) -> bool {
-        self.denied.swap(false, Ordering::SeqCst)
-    }
-}
-
-/// A time budget over this step's start.
-pub fn step_budget(start: Instant) -> TimeBudget<impl Fn() -> bool> {
-    TimeBudget::new(move || super::has_time_for_remediation(&start))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -665,7 +632,17 @@ mod tests {
         assert!(!Gate::Generators.runs_from(Some(Gate::Checks)));
         assert!(Gate::Verify.runs_from(Some(Gate::Verify)));
         assert!(!Gate::Verify.runs_from(Some(Gate::Generators)));
-        for g in [Gate::Plan, Gate::Verify, Gate::Generators, Gate::Checks] {
+        assert!(
+            !Gate::Pr.runs_from(Some(Gate::Checks)),
+            "the PR is never opened again"
+        );
+        for g in [
+            Gate::Plan,
+            Gate::Verify,
+            Gate::Generators,
+            Gate::Checks,
+            Gate::Pr,
+        ] {
             assert_eq!(Gate::parse(g.as_str()), Some(g));
         }
     }
@@ -691,18 +668,6 @@ mod tests {
         ] {
             assert_eq!(Carry::from_json(&c.to_json()), Some(c));
         }
-    }
-
-    #[test]
-    fn a_denied_round_is_remembered_once() {
-        let b = TimeBudget::new(|| false);
-        assert!(!b.take_denied());
-        assert!(!b.has_time());
-        assert!(b.take_denied());
-        assert!(!b.take_denied());
-        let ok = TimeBudget::new(|| true);
-        assert!(ok.has_time());
-        assert!(!ok.take_denied());
     }
 
     /// SQS: visibility 960 s, maxReceiveCount 3 to the DLQ. A run of ten
