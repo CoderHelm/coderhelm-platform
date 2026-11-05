@@ -776,7 +776,7 @@ impl TeamSkills {
                 question,
                 context,
                 host,
-                (ASK_TIMEOUT, ASK_CONTEXT_CHARS),
+                (ASK_TIMEOUT, ASK_CONTEXT_CHARS, ASK_EFFORT),
             )
             .await;
         let Some(answer) = c.answer else {
@@ -825,7 +825,7 @@ impl TeamSkills {
         question: &str,
         context: &str,
         host: &super::agent_tools::Host<'_>,
-        (limit, context_chars): (std::time::Duration, usize),
+        (limit, context_chars, effort): (std::time::Duration, usize, &'static str),
     ) -> Consult {
         let st = self.store(state);
         let mut out = Consult {
@@ -895,6 +895,7 @@ impl TeamSkills {
             common::truncate_str(context, context_chars),
             &tools,
             &bounded,
+            effort,
         );
         let reply = match tokio::time::timeout(limit, call).await {
             Ok(r) => r,
@@ -993,7 +994,7 @@ impl TeamSkills {
                         &question,
                         draft,
                         host,
-                        (REVIEW_TIMEOUT, REVIEW_CONTEXT_CHARS),
+                        (REVIEW_TIMEOUT, REVIEW_CONTEXT_CHARS, review_effort(step)),
                     )
                     .await;
                 Review {
@@ -1455,6 +1456,20 @@ struct AgentReply {
     ms: i64,
 }
 
+/// How hard a team agent thinks on a question a run or a person asks it.
+const ASK_EFFORT: &str = "medium";
+
+/// How hard a team agent thinks when it reviews a step's draft. A plan is
+/// read at low effort: plan reviews cost about 13k output tokens each at
+/// high effort for advice the planner weighs, not a verdict. The diff and
+/// other steps keep medium.
+pub fn review_effort(step: &str) -> &'static str {
+    match step {
+        "plan" => "low",
+        _ => ASK_EFFORT,
+    }
+}
+
 /// Puts one question to a team agent: its brief as instructions, the team's
 /// own model, only `tools` (the read-only ones its file lists that this ask
 /// can run, through `executor`), capped in calls, length and time. Used by a
@@ -1470,6 +1485,7 @@ async fn answer_as_agent(
     context: &str,
     tools: &[ToolDefinition],
     executor: &dyn crate::agent::llm::ToolExecutor,
+    effort: &'static str,
 ) -> AgentReply {
     let started = std::time::Instant::now();
     let mut reply = AgentReply {
@@ -1531,7 +1547,7 @@ async fn answer_as_agent(
             },
             max_tokens: ASK_MAX_TOKENS,
             deadline: None,
-            effort: Some("medium"),
+            effort: Some(effort),
         },
         None,
         None,
@@ -1585,6 +1601,7 @@ pub async fn try_ask(
                 // it's sent, as an agent that lists no tools always does.
                 &[],
                 &NoTools,
+                ASK_EFFORT,
             )
             .await
         }
@@ -2369,5 +2386,20 @@ mod tests {
         let q = review_question("draft plan");
         assert!(q.contains("Apply only the parts of your rubric that fit a change of this size"));
         assert!(q.contains("'none'"));
+    }
+}
+
+#[cfg(test)]
+mod review_effort_tests {
+    use super::*;
+
+    #[test]
+    fn a_plan_is_reviewed_at_low_effort_and_everything_else_as_before() {
+        assert_eq!(review_effort("plan"), "low");
+        assert_eq!(review_effort("code"), "medium");
+        assert_eq!(review_effort("pr_description"), "medium");
+        // The plan's revision turn after the review runs at the same effort.
+        let src = include_str!("plan.rs");
+        assert!(src.contains("effort: Some(super::skills::review_effort(\"plan\"))"));
     }
 }

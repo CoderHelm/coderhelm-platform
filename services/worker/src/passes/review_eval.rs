@@ -375,6 +375,7 @@ impl Sim {
             reconcile_note: None,
             outstanding_work: None,
             description_hash: None,
+            full_review: false,
         }
     }
 

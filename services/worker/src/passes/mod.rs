@@ -800,7 +800,7 @@ pub mod health_check;
 pub mod hidden_suggest;
 /// Hosted side of hybrid: forward a held event to a self-hosted install again.
 pub mod hybrid_name_check;
-mod implement;
+pub(crate) mod implement;
 #[cfg(test)]
 mod incidents;
 pub mod infra_analyze;
@@ -1836,12 +1836,34 @@ async fn run_passes(
     // gave a different plan (memory and history read differently a few
     // minutes later) for a branch built on the first one.
     let same_run = msg.continuation > 0 || msg.model_retries > 0;
+    // A person's Retry of an earlier run (`resume_from`) takes up that
+    // run's plan the same way, and keeps the commits on its branch (below);
+    // the plan becomes this run's own, so a continuation of this run reuses
+    // it too.
+    let retried_from = msg
+        .resume_from
+        .clone()
+        .filter(|r| !same_run && !r.is_empty() && r != run_id);
     let own_plan = if same_run {
         load_run_plan(state, msg, run_id).await
+    } else if let Some(prev) = &retried_from {
+        let taken = load_run_plan(state, msg, prev).await;
+        if let Some(p) = &taken {
+            plan::mark_plan_run(state, msg, run_id).await;
+            save_run_triage(state, msg, run_id, &p.triage, &p.used_mcp_ids).await;
+            info!(run_id, retried = %prev, "Retry: taking up the earlier run's plan");
+        }
+        taken
     } else {
         None
     };
     let resumed_plan = own_plan.is_some();
+    // The retry takes up the earlier run's branch only with its plan: the
+    // commits there were made against it.
+    let retry_keeps_branch = retried_from.is_some() && resumed_plan;
+    if retry_keeps_branch {
+        msg.retry_of_run = true;
+    }
     // Planning that ran out of time before its first plan keeps this run's
     // own triage (and what it resolved and recalled).
     let own_triage = if own_plan.is_none() && plan_resume.is_some() {
@@ -3448,7 +3470,7 @@ async fn run_passes(
         // on it. That holds with an open pull request on the branch too: the
         // continuation used to go through create_branch there, which kept the
         // head but said "Created branch" in every step.
-        let keep_own_branch = same_run
+        let keep_own_branch = (same_run || retry_keeps_branch)
             && !skip_branch_reset
             && ticket_update_pr.is_none()
             && github
@@ -11556,5 +11578,29 @@ mod start_failure_tests {
             !body.contains(".await?"),
             "a `?` in orchestrate_ticket skips the failure"
         );
+    }
+}
+
+#[cfg(test)]
+mod retry_resume_tests {
+    /// A person's Retry takes up the earlier run's plan and the commits on
+    /// its branch: the plan is loaded from that run and made this run's own,
+    /// the branch isn't reset, and the coder is told it continues.
+    #[test]
+    fn a_retry_takes_up_the_earlier_runs_plan_and_branch() {
+        let src = include_str!("mod.rs");
+        assert!(src.contains("let taken = load_run_plan(state, msg, prev).await;"));
+        assert!(src.contains("plan::mark_plan_run(state, msg, run_id).await;"));
+        assert!(src.contains("let keep_own_branch = (same_run || retry_keeps_branch)"));
+        assert!(include_str!("implement.rs")
+            .contains("} else if msg.continuation > 0 || msg.retry_of_run {"));
+        // The message carries it and serializes only when set.
+        let mut m = crate::models::TicketMessage::default();
+        assert!(!serde_json::to_string(&m).unwrap().contains("resume_from"));
+        m.resume_from = Some("01RUN".into());
+        let back: crate::models::TicketMessage =
+            serde_json::from_str(&serde_json::to_string(&m).unwrap()).unwrap();
+        assert_eq!(back.resume_from.as_deref(), Some("01RUN"));
+        assert!(!back.retry_of_run);
     }
 }

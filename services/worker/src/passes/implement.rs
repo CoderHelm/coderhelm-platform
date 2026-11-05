@@ -219,7 +219,7 @@ pub async fn run(
     // holds work, and the agent must change it to match the new ticket.
     let continuation_note = if let Some(note) = msg.ticket_update_note.as_deref() {
         note
-    } else if msg.continuation > 0 {
+    } else if msg.continuation > 0 || msg.retry_of_run {
         "\n## CONTINUATION — a PRIOR attempt already committed partial work to THIS branch. \
          Do NOT start over. Read the files you intend to touch to see what is already done, then \
          complete ONLY the remaining work. Reuse existing correct code; never rewrite or restore it. \
@@ -482,8 +482,13 @@ pub async fn run(
         }
     }
 
+    // The coder's rules and the repository's and team's instructions are the
+    // same for every pass of the run (first implement, plan rounds, review,
+    // proof and CI fixes): they are the shared prefix, cached for an hour.
+    // Everything after it (the tools' sections, which read the plan) is the
+    // pass's own; the pass's task and feedback are in its first message.
+    let mut full_system = format!("{system}{}", crate::agent::anthropic::SHARED_PREFIX_END);
     // Add MCP context to system prompt
-    let mut full_system = system.clone();
     if !loaded_mcp_plugins.is_empty() {
         let plugin_lines: Vec<String> = loaded_mcp_plugins
             .iter()
@@ -1112,7 +1117,7 @@ pub(super) const VERIFY_NOTE: &str =
 /// The coder's system prompt, the same for every task prompt (simple or
 /// not) and every round of the run, so it stays cached: the rules and repo
 /// instruction files, the team's instructions, then the test rule.
-pub(super) fn coder_system(
+pub(crate) fn coder_system(
     owner: &str,
     repo: &str,
     repo_context: &str,

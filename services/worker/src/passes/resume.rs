@@ -2549,7 +2549,11 @@ pub async fn run(
                     let summary = if rr.open_findings.is_empty() {
                         format!("The PR reviewer requested changes:\n\n{}", rr.body)
                     } else {
-                        super::own_review::fix_feedback(&rr.open_findings, &rr.body)
+                        super::own_review::fix_feedback(
+                            &rr.open_findings,
+                            &rr.body,
+                            &own_review_progress(&run_record).notes,
+                        )
                     };
                     review_result = review::ReviewResult {
                         passed: false,
@@ -2588,8 +2592,14 @@ pub async fn run(
             // progress; two rounds in a row without it stop the run with the
             // PR still a draft and the findings listed at its top.
             if !own_open.is_empty() {
-                let (before, stalled) = own_review_progress(&run_record);
-                match super::own_review::next(before, &own_open, 0, stalled) {
+                let progress = own_review_progress(&run_record);
+                match super::own_review::next(
+                    progress.open_before,
+                    &own_open,
+                    0,
+                    progress.stalled,
+                    progress.rounds,
+                ) {
                     super::own_review::Next::Stop(reason) => {
                         stop_on_own_findings(
                             state,
@@ -2613,6 +2623,7 @@ pub async fn run(
                             &msg.run_id,
                             own_open.len(),
                             stalled,
+                            progress.rounds.saturating_add(1),
                         )
                         .await;
                     }
@@ -2751,13 +2762,14 @@ pub async fn run(
                         open = own_open.len(),
                         "Review fix produced no changes with own review findings open — reviewing again"
                     );
-                    let (_, stalled) = own_review_progress(&run_record);
+                    let progress = own_review_progress(&run_record);
                     record_own_review_progress(
                         state,
                         &msg.team_id,
                         &msg.run_id,
                         own_open.len(),
-                        stalled,
+                        progress.stalled,
+                        progress.rounds.saturating_add(1),
                     )
                     .await;
                     if set_run_awaiting_ci(
@@ -2927,6 +2939,8 @@ async fn fix_context(
         continuation: 0,
         continuation_run_id: None,
         first_attempt_ms: 0,
+        resume_from: None,
+        retry_of_run: false,
         model_retries: 0,
         ticket_update_note: None,
         ticket_history_note: None,
@@ -3164,7 +3178,18 @@ async fn run_fix_round(
                 Ok(RoundEnd::Incomplete)
             }
         }
-        Ok(_) => {
+        Ok(r) => {
+            // What this round was asked and looked up reaches the next one.
+            if round.kind == run_round::Kind::ReviewFix {
+                record_own_round_note(
+                    state,
+                    &msg.team_id,
+                    &msg.run_id,
+                    &round.feedback,
+                    &r.evidence,
+                )
+                .await;
+            }
             // Done: the round's changes land on the pull request as one
             // commit, one push.
             let message =
@@ -4697,21 +4722,39 @@ async fn mark_ready(
     error!(pr_number, "Failed to mark PR ready after 2 attempts");
 }
 
-/// The own-review progress the run recorded: findings open at the previous
-/// review (`None` before the first) and rounds without progress so far.
+/// The own-review progress a run recorded.
+#[derive(Debug, Default, PartialEq)]
+struct OwnReviewProgress {
+    /// Findings open at the previous review (`None` before the first).
+    open_before: Option<usize>,
+    /// Rounds without progress so far.
+    stalled: u32,
+    /// Fix rounds taken on the own review's findings.
+    rounds: u32,
+    /// What the earlier rounds were asked and looked up
+    /// (`own_review::round_note`).
+    notes: String,
+}
+
 fn own_review_progress(
     run_record: &std::collections::HashMap<String, AttributeValue>,
-) -> (Option<usize>, u32) {
+) -> OwnReviewProgress {
     let n = |k: &str| {
         run_record
             .get(k)
             .and_then(|v| v.as_n().ok())
             .and_then(|v| v.parse::<u64>().ok())
     };
-    (
-        n("own_review_open").map(|v| v as usize),
-        n("own_review_stalled").unwrap_or(0) as u32,
-    )
+    OwnReviewProgress {
+        open_before: n("own_review_open").map(|v| v as usize),
+        stalled: n("own_review_stalled").unwrap_or(0) as u32,
+        rounds: n("own_review_rounds").unwrap_or(0) as u32,
+        notes: run_record
+            .get("own_review_notes")
+            .and_then(|v| v.as_s().ok())
+            .cloned()
+            .unwrap_or_default(),
+    }
 }
 
 /// Records the own-review progress on the run. Best-effort.
@@ -4721,6 +4764,7 @@ async fn record_own_review_progress(
     run_id: &str,
     open: usize,
     stalled: u32,
+    rounds: u32,
 ) {
     if let Err(e) = state
         .dynamo
@@ -4728,13 +4772,81 @@ async fn record_own_review_progress(
         .table_name(&state.config.runs_table_name)
         .key("team_id", attr_s(team_id))
         .key("run_id", attr_s(run_id))
-        .update_expression("SET own_review_open = :o, own_review_stalled = :s")
+        .update_expression(
+            "SET own_review_open = :o, own_review_stalled = :s, own_review_rounds = :r",
+        )
         .expression_attribute_values(":o", attr_n(open as u64))
         .expression_attribute_values(":s", attr_n(stalled as u64))
+        .expression_attribute_values(":r", attr_n(rounds as u64))
         .send()
         .await
     {
         warn!(run_id, error = %e, "Could not record own review progress (non-fatal)");
+    }
+}
+
+/// The findings a review-fix round was asked to fix: the `- [ ]` lines
+/// `own_review::fix_feedback` writes before the review itself.
+fn own_round_items(feedback: &str) -> Vec<String> {
+    let head = feedback.split("\n\nThe review:\n\n").next().unwrap_or("");
+    head.lines()
+        .filter_map(|l| l.trim().strip_prefix("- [ ] "))
+        .map(|l| l.trim().to_string())
+        .filter(|l| !l.is_empty())
+        .collect()
+}
+
+/// Adds a finished review-fix round to what the run's next round is told
+/// (`own_review::round_note`): the findings, its lookups and its account.
+/// Best-effort.
+async fn record_own_round_note(
+    state: &WorkerState,
+    team_id: &str,
+    run_id: &str,
+    feedback: &str,
+    evidence: &super::proof::RunEvidence,
+) {
+    let items = own_round_items(feedback);
+    if items.is_empty() {
+        return;
+    }
+    let earlier = state
+        .dynamo
+        .get_item()
+        .table_name(&state.config.runs_table_name)
+        .key("team_id", attr_s(team_id))
+        .key("run_id", attr_s(run_id))
+        .projection_expression("own_review_notes")
+        .send()
+        .await
+        .ok()
+        .and_then(|o| {
+            o.item()
+                .and_then(|i| i.get("own_review_notes"))
+                .and_then(|v| v.as_s().ok())
+                .cloned()
+        })
+        .unwrap_or_default();
+    let round = earlier.matches("### Round ").count() as u32 + 1;
+    let notes = super::own_review::round_note(
+        &earlier,
+        round,
+        &items,
+        &evidence.lookups,
+        evidence.latest_notes(),
+    );
+    if let Err(e) = state
+        .dynamo
+        .update_item()
+        .table_name(&state.config.runs_table_name)
+        .key("team_id", attr_s(team_id))
+        .key("run_id", attr_s(run_id))
+        .update_expression("SET own_review_notes = :n")
+        .expression_attribute_values(":n", attr_s(&notes))
+        .send()
+        .await
+    {
+        warn!(run_id, error = %e, "Could not record the fix round's notes (non-fatal)");
     }
 }
 
@@ -4832,6 +4944,22 @@ async fn complete_run_with_status(
     // The team's counters already have these tokens: each model call is
     // counted as it happens (common::usage).
     info!(run_id, status, "Run completed");
+    // CoderHelm's own pushes during the run weren't reviewed by the PR
+    // reviewer (`review_scope::own_loop_holds_push`): a run that hands its
+    // PR over asks for the review of its head now. A head the run's own ask
+    // already reviewed costs nothing (its verdict stands).
+    if status == common::run_status::COMPLETED {
+        if let Some((owner, repo, number)) = common::pr_outcome::parse_pr_url(pr_url) {
+            super::review_pr::review_on_handoff(
+                state,
+                &msg.team_id,
+                msg.installation_id,
+                (&owner, &repo, number),
+                run_id,
+            )
+            .await;
+        }
+    }
     Ok(())
 }
 
@@ -5149,6 +5277,47 @@ mod end_status_tests {
         assert_eq!(
             end_status(&["1. Replace the hero on production".to_string()]),
             crate::passes::fix_location::STATUS_OUTSIDE
+        );
+    }
+}
+
+#[cfg(test)]
+mod own_round_tests {
+    use super::*;
+
+    #[test]
+    fn a_round_records_what_it_was_asked_and_the_next_reads_it_back() {
+        let feedback = super::super::own_review::fix_feedback(
+            &["A (`a.rs:1`)".into(), "B (`b.rs`)".into()],
+            "- [ ] a checklist in the review body is not a finding",
+            "### Round 1\nAsked to fix:\n- A (`a.rs:1`)\n",
+        );
+        assert_eq!(
+            own_round_items(&feedback),
+            vec!["A (`a.rs:1`)".to_string(), "B (`b.rs`)".to_string()]
+        );
+        let mut record = std::collections::HashMap::new();
+        record.insert("own_review_open".to_string(), AttributeValue::N("2".into()));
+        record.insert(
+            "own_review_rounds".to_string(),
+            AttributeValue::N("1".into()),
+        );
+        record.insert(
+            "own_review_notes".to_string(),
+            AttributeValue::S("### Round 1".into()),
+        );
+        assert_eq!(
+            own_review_progress(&record),
+            OwnReviewProgress {
+                open_before: Some(2),
+                stalled: 0,
+                rounds: 1,
+                notes: "### Round 1".into(),
+            }
+        );
+        assert_eq!(
+            own_review_progress(&std::collections::HashMap::new()),
+            OwnReviewProgress::default()
         );
     }
 }

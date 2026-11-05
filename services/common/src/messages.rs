@@ -722,6 +722,11 @@ pub struct ReviewMessage {
     /// differs and was already reviewed at this commit, it doesn't run.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description_hash: Option<String>,
+    /// Review the whole PR even after an earlier review of it: set on the
+    /// review a hunks-only re-review sends before it would approve, so an
+    /// approval always rests on a full review.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub full_review: bool,
 }
 
 #[derive(Serialize, Deserialize, Debug, Default)]
@@ -816,6 +821,17 @@ pub struct TicketMessage {
     /// Epoch ms of the first attempt — the wall-clock runaway backstop.
     #[serde(default)]
     pub first_attempt_ms: u64,
+    /// A person retried this earlier run (`run_status::retry_resumes`): the
+    /// new run takes up its plan and the commits on its branch instead of
+    /// planning and implementing from scratch. Absent when the plan was what
+    /// failed, and on Start over.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resume_from: Option<String>,
+    /// Set in-process when the run took up `resume_from`'s plan and branch:
+    /// the coder is told the branch already holds that run's work and
+    /// finishes what is left. Never serialized.
+    #[serde(skip)]
+    pub retry_of_run: bool,
     /// Times this run was sent again after a transient model error (a 5xx,
     /// 429, 529 or network failure that outlasted the client's own retries).
     /// The run keeps its run_id across these, like a continuation.
@@ -882,6 +898,8 @@ impl Default for TicketMessage {
             continuation: 0,
             continuation_run_id: None,
             first_attempt_ms: 0,
+            resume_from: None,
+            retry_of_run: false,
             model_retries: 0,
             ticket_update_note: None,
             ticket_history_note: None,

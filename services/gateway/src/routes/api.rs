@@ -1942,7 +1942,19 @@ pub async fn retry_run(
         return Err(StatusCode::BAD_REQUEST);
     }
 
-    let ticket = retry_message(&state, &claims, item).await?;
+    let mut ticket = retry_message(&state, &claims, item).await?;
+    // The new run takes up this run's plan and the commits on its branch,
+    // unless the plan was what failed (Start over always starts over).
+    let text = |k: &str| {
+        item.get(k)
+            .and_then(|v| v.as_s().ok())
+            .map(|s| s.as_str())
+            .unwrap_or("")
+    };
+    let error = format!("{} {}", text("error_message"), text("error"));
+    if common::run_status::retry_resumes(text("current_pass"), &error) {
+        ticket.resume_from = Some(run_id.clone());
+    }
     // Dashboard retry: force-delete existing lock so re-enqueue always succeeds
     delete_ticket_lock(&state, &claims.team_id, &ticket.ticket_id).await;
     let message = WorkerMessage::Ticket(ticket);

@@ -3937,7 +3937,11 @@ fn review_delay_secs(action: &str) -> i32 {
     }
 }
 
-const REVIEW_PUSH_SETTLE_SECS: i32 = 60;
+/// Three minutes: a push is reviewed only after its PR has been quiet that
+/// long (every later push's review supersedes it). At one minute, a person or
+/// a fix loop pushing a few commits in a row still paid for a review of each
+/// (226 re-reviews in 17 days came within 30 minutes of the previous one).
+const REVIEW_PUSH_SETTLE_SECS: i32 = 180;
 
 /// How long a review claim blocks re-review of the SAME head. Sized to comfortably
 /// outlast the burst of webhook events GitHub fires for one commit (seconds), while
