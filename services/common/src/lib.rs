@@ -109,6 +109,8 @@ pub mod plugins;
 pub mod public_urls;
 /// Who asked for a run: one identity per person, for per-person analytics.
 pub mod requester;
+/// The PR's "CoderHelm review" check run, from scheduled to finished.
+pub mod review_check;
 /// Lessons the reviewer learns from people's pushback on its findings.
 pub mod review_lessons;
 /// Where the reviewer is with each PR right now (queued, reviewing, retrying,

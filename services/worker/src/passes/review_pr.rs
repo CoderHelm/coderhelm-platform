@@ -324,6 +324,8 @@ pub(crate) async fn enqueue_review(
     }
 }
 
+use super::review_session::NotReviewed;
+
 /// A review job as the dashboard sees it (`common::review_live`): its id, and
 /// when it started. Only this job may end the status it set. It also keeps
 /// the job's session (`common::review_session`) and the PR's "CoderHelm
@@ -338,12 +340,76 @@ pub(crate) struct LiveJob {
 /// What a job's session knows besides the stored record.
 #[derive(Default)]
 struct Session {
-    /// The check run it opened, and the commit it is on.
+    /// The check run it holds, and the commit it is on.
     check: Option<(u64, String)>,
+    /// The session record is open (its page exists).
+    opened: bool,
     /// The verdict, its finding count and the posted review's link.
     verdict: Option<(&'static str, usize, String)>,
     /// Why the job ended without a verdict, when it said so.
     not_posted: Option<String>,
+    /// How its check ends when the job ends without a new review: the
+    /// conclusion and title (the summary is the job's reason).
+    settled: Option<(&'static str, String)>,
+}
+
+/// The key a job's check is held under: the job's dedup key (what the
+/// gateway queued the check for), or the job's own id.
+fn check_key<'a>(msg: &'a ReviewMessage, job: &'a str) -> &'a str {
+    if msg.dedup_key.is_empty() {
+        job
+    } else {
+        &msg.dedup_key
+    }
+}
+
+fn check_target<'a>(
+    msg: &'a ReviewMessage,
+    head: &'a str,
+) -> super::review_session::CheckTarget<'a> {
+    super::review_session::CheckTarget {
+        installation: msg.installation_id,
+        owner: &msg.repo_owner,
+        repo: &msg.repo_name,
+        pr: msg.pr_number,
+        head,
+    }
+}
+
+fn pr_page(state: &WorkerState, msg: &ReviewMessage) -> String {
+    common::review_check::pr_page(
+        common::public_urls::app_url(&state.config.stage),
+        &msg.repo_owner,
+        &msg.repo_name,
+        msg.pr_number,
+    )
+}
+
+/// The check waiting for job `msg` ends before the job took it over (the
+/// reviewer is off, say). Nothing when no check waits for it.
+async fn close_waiting_check(
+    state: &WorkerState,
+    github: &GitHubClient,
+    msg: &ReviewMessage,
+    title: &str,
+    summary: &str,
+) {
+    if msg.question.is_some() || msg.dedup_key.is_empty() {
+        return;
+    }
+    let close = common::review_check::Close {
+        conclusion: "neutral",
+        title: title.to_string(),
+        summary: summary.to_string(),
+        details_url: Some(pr_page(state, msg)),
+    };
+    common::review_check::close_waiting(
+        github,
+        &check_target(msg, &msg.head_sha),
+        &msg.dedup_key,
+        &close,
+    )
+    .await;
 }
 
 impl LiveJob {
@@ -405,6 +471,7 @@ impl LiveJob {
             &first,
         )
         .await;
+        self.session().opened = true;
     }
 
     /// One more step in the session. `detail` may be empty.
@@ -420,9 +487,81 @@ impl LiveJob {
         .await;
     }
 
-    /// A formal review starts: open the "CoderHelm review" check on `head`,
-    /// in progress, linking to this session. Once per job; a refusal (no
-    /// checks:write) leaves the review exactly as it was.
+    /// The job starts: take over the check the gateway queued for it on its
+    /// commit (a push, label, opened or ready event), in progress at once.
+    /// Nothing when no check waits for this job.
+    async fn start_check(&self, state: &WorkerState, github: &GitHubClient, msg: &ReviewMessage) {
+        if msg.question.is_some() || msg.head_sha.is_empty() || self.session().check.is_some() {
+            return;
+        }
+        let Some(id) = common::review_check::start(
+            github,
+            &check_target(msg, &msg.head_sha),
+            &msg.dedup_key,
+            &super::review_session::started_title(&msg.head_sha),
+            &pr_page(state, msg),
+        )
+        .await
+        else {
+            return;
+        };
+        self.session().check = Some((id, msg.head_sha.clone()));
+    }
+
+    /// How the check ends if the job ends without a new review: `conclusion`
+    /// and `title`, the job's reason as its summary.
+    fn settle(&self, why: super::review_session::NotReviewed<'_>) {
+        self.session().settled = Some(super::review_session::not_reviewed(why));
+    }
+
+    /// The job hands its review to job `next_key`, due at `due`: its check
+    /// goes with it, queued again and saying why. False when it holds none
+    /// or GitHub refused (the check is then completed when this job ends).
+    async fn hand_off_check(
+        &self,
+        state: &WorkerState,
+        msg: &ReviewMessage,
+        next_key: &str,
+        due: i64,
+        title: &str,
+        summary: &str,
+    ) -> bool {
+        let Some((id, head)) = self.session().check.clone() else {
+            return false;
+        };
+        let github = match GitHubClient::new(
+            &state.secrets.github_app_id,
+            &state.secrets.github_private_key,
+            msg.installation_id,
+            &state.http,
+        ) {
+            Ok(g) => g,
+            Err(e) => {
+                warn!(pr = msg.pr_number, error = %e, "Could not hand the CoderHelm review check on");
+                return false;
+            }
+        };
+        let handed = common::review_check::hand_off(
+            &github,
+            &check_target(msg, &head),
+            id,
+            next_key,
+            due,
+            title,
+            summary,
+        )
+        .await;
+        if handed {
+            self.session().check = None;
+        }
+        handed
+    }
+
+    /// A formal review starts: the "CoderHelm review" check on `head` shows
+    /// it in progress, linking to this session: the check this job already
+    /// holds, the one open on the commit, or a new one. One check per
+    /// commit; a refusal (no checks:write) leaves the review exactly as it
+    /// was.
     async fn open_check(
         &self,
         state: &WorkerState,
@@ -431,23 +570,22 @@ impl LiveJob {
         head: &str,
         files: &[String],
     ) {
-        if self.session().check.is_some() {
-            return;
-        }
         let details = super::review_session::session_url(
             common::public_urls::app_url(&state.config.stage),
             &self.id,
         );
-        let target = super::review_session::CheckTarget {
-            installation: msg.installation_id,
-            owner: &msg.repo_owner,
-            repo: &msg.repo_name,
-            pr: msg.pr_number,
-            head,
-        };
+        let target = check_target(msg, head);
+        let key = check_key(msg, &self.id);
         let title = super::review_session::reading_title(files, head);
+        let held = self.session().check.clone();
+        if let Some((id, held_head)) = held {
+            if held_head == head {
+                common::review_check::progress(github, &target, id, key, &title, &details).await;
+                return;
+            }
+        }
         let Some(id) =
-            super::review_session::open_check(github, &target, &self.id, &title, &details).await
+            common::review_check::take_over_or_open(github, &target, key, &title, &details).await
         else {
             return;
         };
@@ -504,12 +642,18 @@ impl LiveJob {
         use super::review_session::CheckEnd;
         use common::review_live::Finished;
         use common::review_session as rs;
-        let (check, verdict, not_posted) = {
+        let (check, verdict, not_posted, settled, opened) = {
             let s = self.session();
-            (s.check.clone(), s.verdict.clone(), s.not_posted.clone())
+            (
+                s.check.clone(),
+                s.verdict.clone(),
+                s.not_posted.clone(),
+                s.settled.clone(),
+                s.opened,
+            )
         };
         // The session's status and last step, and the check's ending.
-        let (status, reason, last, end) = match &how {
+        let (status, reason, last, mut end) = match &how {
             Finished::Done => match (&verdict, &not_posted) {
                 (Some((v, findings, url)), _) => (
                     rs::STATUS_DONE,
@@ -555,6 +699,15 @@ impl LiveJob {
                 CheckEnd::Failed { reason },
             ),
         };
+        // An ending without a new review that the job named itself (a
+        // standing verdict carried, a newer commit's review).
+        if let (CheckEnd::Skipped { reason }, Some((conclusion, title))) = (end, &settled) {
+            end = CheckEnd::Settled {
+                conclusion,
+                title,
+                reason,
+            };
+        }
         rs::close(
             &state.dynamo,
             &state.config.settings_table_name,
@@ -566,33 +719,36 @@ impl LiveJob {
         )
         .await;
         if let Some((id, head)) = check {
-            let close = super::review_session::check_close(
+            // A job that stopped before its session opened links the PR's
+            // reviews page instead of a session page that doesn't exist.
+            let pr_reviews = pr_page(state, msg);
+            let details = if opened {
+                super::review_session::session_url(
+                    common::public_urls::app_url(&state.config.stage),
+                    &self.id,
+                )
+            } else {
+                pr_reviews.clone()
+            };
+            let mut close = super::review_session::check_close(
                 end,
                 &format!(
                     "https://github.com/{}/{}/pull/{}",
                     msg.repo_owner, msg.repo_name, msg.pr_number
                 ),
-                &super::review_session::session_url(
-                    common::public_urls::app_url(&state.config.stage),
-                    &self.id,
-                ),
+                &details,
             );
-            let target = super::review_session::CheckTarget {
-                installation: msg.installation_id,
-                owner: &msg.repo_owner,
-                repo: &msg.repo_name,
-                pr: msg.pr_number,
-                head: &head,
-            };
+            if !opened {
+                close.details_url = Some(pr_reviews);
+            }
+            let target = check_target(msg, &head);
             match GitHubClient::new(
                 &state.secrets.github_app_id,
                 &state.secrets.github_private_key,
                 msg.installation_id,
                 &state.http,
             ) {
-                Ok(github) => {
-                    super::review_session::close_check(&github, &target, id, &close).await
-                }
+                Ok(github) => common::review_check::close(&github, &target, id, &close).await,
                 Err(e) => {
                     warn!(pr = msg.pr_number, error = %e, "Could not complete the CoderHelm review check")
                 }
@@ -863,6 +1019,11 @@ async fn review_failed(
     if let FailurePlan::Retry { delay_secs } = plan {
         let (next, hop) = retry_message(msg, head, delay_secs);
         if enqueue_review(state, &next, hop).await {
+            // The commit's check waits for the retry instead of ending.
+            let due = chrono::Utc::now().timestamp() + delay_secs as i64;
+            let (title, summary) = super::review_session::retry_wait(reason, due);
+            job.hand_off_check(state, msg, &next.dedup_key, due, &title, &summary)
+                .await;
             super::review_sweep::note_failure(state, msg, head, reason, false).await;
             job.finished(
                 state,
@@ -952,6 +1113,23 @@ async fn run_once(
             pr = msg.pr_number,
             "Reviewer disabled/killed for repo — skipping"
         );
+        // A check queued before the reviewer was turned off doesn't wait on.
+        if let Ok(github) = GitHubClient::new(
+            &state.secrets.github_app_id,
+            &state.secrets.github_private_key,
+            msg.installation_id,
+            &state.http,
+        ) {
+            close_waiting_check(
+                state,
+                &github,
+                &msg,
+                "Not reviewed: the reviewer is off for this repository",
+                "The reviewer was turned off for this repository before this review started, \
+                 so there is no new verdict for this commit.",
+            )
+            .await;
+        }
         return Ok(DONE);
     }
 
@@ -1011,6 +1189,10 @@ async fn run_once(
         }
     }
 
+    // The commit's check, queued when the review was scheduled, shows the
+    // job in progress from its first step; every ending below completes it.
+    live_job.start_check(state, &github, &msg).await;
+
     // PR metadata. head_sha may be empty on reply-triggered reviews — resolve it
     // from the PR so a reply always targets the latest commit.
     let pr = github
@@ -1031,6 +1213,14 @@ async fn run_once(
             current = current_head,
             "Skipping superseded review — a newer commit exists"
         );
+        let newer = common::review_check::short(current_head);
+        live_job.not_posted(&format!(
+            "A newer commit ({newer}) was pushed before this review started; the review of \
+             {newer} covers the latest code."
+        ));
+        live_job.settle(NotReviewed::Superseded {
+            newer: current_head,
+        });
         return Ok(DONE);
     }
 
@@ -1052,6 +1242,7 @@ async fn run_once(
     if msg.trigger == super::review_scope::TRIGGER_PUSH && super::is_own_login(pr_author) {
         if let Some(reason) = own_loop_hold(state, &github, &msg, &head_sha).await {
             info!(pr = msg.pr_number, head = %head_sha, "CoderHelm's own push during its run's fix loop — not reviewed now");
+            live_job.settle(NotReviewed::OwnPushDuringRun);
             return Ok(Outcome::Skipped { reason });
         }
     }
@@ -1079,6 +1270,7 @@ async fn run_once(
             .await;
             if claim == common::claim::Claim::Held {
                 info!(pr = msg.pr_number, head = %head_sha, "Description already reviewed at this commit — not reviewed again");
+                live_job.settle(NotReviewed::DescriptionSeen { head: &head_sha });
                 return Ok(Outcome::Skipped {
                     reason: "This description was already reviewed at this commit.".into(),
                 });
@@ -1097,6 +1289,10 @@ async fn run_once(
             super::review_policy::start(&msg.trigger, &head_sha, &records)
         {
             info!(pr = msg.pr_number, head = %head_sha, trigger = %msg.trigger, verdict = %verdict, "Commit already reviewed — its verdict stands, not reviewed again");
+            live_job.settle(NotReviewed::AlreadyReviewed {
+                head: &head_sha,
+                verdict: &verdict,
+            });
             return Ok(Outcome::Skipped {
                 reason: format!(
                     "Already reviewed this commit: the verdict ({}) stands.",
@@ -1112,6 +1308,7 @@ async fn run_once(
     if msg.trigger == super::review_scope::HANDOFF_TRIGGER && pr["draft"].as_bool() == Some(true) {
         // Still a draft (a proof running, a check holding it): the review
         // runs when it is marked ready, as every PR's does.
+        live_job.settle(NotReviewed::Draft);
         return Ok(Outcome::Skipped {
             reason: "Still a draft: reviewed when it is marked ready.".into(),
         });
@@ -1133,6 +1330,7 @@ async fn run_once(
         .await
             == common::claim::Claim::Held
         {
+            live_job.settle(NotReviewed::HeldByAnotherReview { head: &head_sha });
             return Ok(Outcome::Skipped {
                 reason: "This commit is already being reviewed.".into(),
             });
@@ -1225,6 +1423,11 @@ async fn run_once(
             )),
         Err(e) => {
             tracing::error!(team_id = %msg.team_id, pr = msg.pr_number, error = %e, "Review skipped: no usable model provider");
+            live_job.not_posted(
+                "No model provider is set up for this team (Settings), so the review couldn't \
+                 run; any earlier verdict stands.",
+            );
+            live_job.settle(NotReviewed::NoModelProvider);
             return Ok(DONE);
         }
     };
@@ -1602,11 +1805,6 @@ async fn run_once(
 
     // ── Verdict mode (agentic: walk the repo, structured findings, self-critique) ──
 
-    // The PR shows the review in progress, linked to this session.
-    live_job
-        .open_check(state, &github, &msg, &head_sha, &files_read)
-        .await;
-
     // A person's re-review ask and a push review of the same commit used to
     // run together and post opposite verdicts seconds apart. The ask takes
     // the per-commit claim the gateway takes for push reviews: while another
@@ -1636,6 +1834,19 @@ async fn run_once(
                 if let Some(later) = super::review_policy::deferred_ask(&msg) {
                     if enqueue_review(state, &later, super::review_policy::ASK_WAIT_SECS).await {
                         info!(pr = msg.pr_number, head = %head_sha, trigger = %msg.trigger, dedup_key = %later.dedup_key, "Re-review ask waits for the running review of this commit, then answers");
+                        let short = common::review_check::short(&head_sha);
+                        live_job
+                            .hand_off_check(
+                                state,
+                                &msg,
+                                &later.dedup_key,
+                                chrono::Utc::now().timestamp()
+                                    + super::review_policy::ASK_WAIT_SECS as i64,
+                                &format!("Waiting for the running review of {short}, then answering the ask"),
+                                "Another review of this commit is running; the ask is answered \
+                                 right after it, in this check.",
+                            )
+                            .await;
                         return Ok(Outcome::Skipped {
                             reason: "This commit is already being reviewed; your ask is answered \
                                      right after that review."
@@ -1654,6 +1865,11 @@ async fn run_once(
             _ => {}
         }
     }
+
+    // The PR shows the review in progress, linked to this session.
+    live_job
+        .open_check(state, &github, &msg, &head_sha, &files_read)
+        .await;
 
     // A push after CoderHelm approved an earlier commit is reviewed from that
     // commit: only what changed since. One that changed no code or data, or
@@ -1701,6 +1917,9 @@ async fn run_once(
                     (ahead && !super::review_scope::touches_code(&since)) || own_change_unchanged;
                 if nothing_new && unconfirmed_in_body.is_empty() {
                     info!(pr = msg.pr_number, approved = %approved, head = %head_sha, own_change_unchanged, "Push changed none of the PR's code or data since the approval — review skipped, approval carried");
+                    live_job.settle(NotReviewed::UnchangedSinceApproval {
+                        approved: &approved,
+                    });
                     // Many repos dismiss approvals when commits are pushed:
                     // post the approval again on this head, so the PR never
                     // sits without a visible verdict.
@@ -1791,6 +2010,15 @@ async fn run_once(
                 .map(|r| r.verdict.to_lowercase().replace('_', " "))
                 .unwrap_or_default();
             info!(pr = msg.pr_number, reviewed = %reviewed, head = %head_sha, "Push left the PR's own change as reviewed — review skipped, verdict stands");
+            let standing_verdict = records
+                .iter()
+                .find(|r| r.is_review() && !r.failed())
+                .map(|r| r.verdict.clone())
+                .unwrap_or_default();
+            live_job.settle(NotReviewed::UnchangedSinceReview {
+                reviewed: &reviewed,
+                verdict: &standing_verdict,
+            });
             return Ok(Outcome::Skipped {
                 reason: format!(
                     "Not reviewed: the commits since CoderHelm reviewed {short} only bring in \
@@ -2613,6 +2841,21 @@ async fn run_once(
         // Its model calls are already on the team's counters (per call).
         if enqueue_review(state, &full, 0).await {
             info!(pr = msg.pr_number, head = %head_sha, "Hunks-only re-review found nothing holding the merge — full review queued before approving");
+            live_job
+                .hand_off_check(
+                    state,
+                    &msg,
+                    &full.dedup_key,
+                    chrono::Utc::now().timestamp(),
+                    &format!(
+                        "Reviewing the whole pull request at {} before approving",
+                        common::review_check::short(&head_sha)
+                    ),
+                    "The changes since the previous review settle what it found; the whole \
+                     pull request is reviewed again before it is approved, in this check.",
+                )
+                .await;
+            live_job.settle(NotReviewed::FullReviewFollows { head: &head_sha });
             return Ok(Outcome::Skipped {
                 reason: "The changes since the previous review settle what it found; the whole \
                          pull request is reviewed again before it is approved."
@@ -2792,6 +3035,7 @@ async fn run_once(
             live_job.not_posted(
                 "a newer commit was pushed while reviewing; its own review covers the latest code.",
             );
+            live_job.settle(NotReviewed::Superseded { newer: latest_head });
             return Ok(DONE);
         }
     }

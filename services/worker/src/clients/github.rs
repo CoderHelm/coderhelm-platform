@@ -82,14 +82,6 @@ pub fn is_not_found(e: &(dyn std::error::Error + Send + Sync)) -> bool {
     e.to_string().contains("(404 Not Found)")
 }
 
-/// Did GitHub refuse this request because the app lacks the permission
-/// (an installation that hasn't granted it)? Matches the 403 status line
-/// `status_error_message` writes, and GitHub's own wording.
-pub fn is_not_permitted(e: &(dyn std::error::Error + Send + Sync)) -> bool {
-    let m = e.to_string();
-    m.contains("(403 Forbidden)") || m.contains("Resource not accessible by integration")
-}
-
 /// What a contents-API response says about a file's body.
 #[derive(Debug, PartialEq)]
 enum ContentsBody {
@@ -3424,7 +3416,7 @@ impl GitHubClient {
     }
 
     /// Create a check run on `head_sha` (needs the app's checks:write
-    /// permission; without it GitHub answers 403, see [`is_not_permitted`]).
+    /// permission; without it GitHub answers 403, see `common::review_check::is_refusal`).
     /// `body` is the API's request body; returns the new check run's id.
     pub async fn create_check_run(
         &self,
@@ -3437,6 +3429,17 @@ impl GitHubClient {
         out["id"]
             .as_u64()
             .ok_or_else(|| "check run created without an id".into())
+    }
+
+    /// The "CoderHelm review" check runs on commit `head`.
+    pub async fn list_review_checks(
+        &self,
+        owner: &str,
+        repo: &str,
+        head: &str,
+    ) -> Result<serde_json::Value, Box<dyn std::error::Error + Send + Sync>> {
+        self.get(&common::review_check::list_url(owner, repo, head))
+            .await
     }
 
     /// Update a check run this app created (status, conclusion, output).

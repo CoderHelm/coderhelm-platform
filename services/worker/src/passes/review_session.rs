@@ -1,53 +1,36 @@
-//! The PR's "CoderHelm review" check run: opened in progress when a formal
-//! review starts, its Details link the review's session page on this
-//! install's dashboard (`common::review_session` keeps the record), and
-//! completed when the job ends, whatever the ending.
+//! The PR's "CoderHelm review" check run as a review job sees it: the gateway
+//! queues it when it schedules a push review (`common::review_check`), the
+//! job takes it over in progress when it starts, its Details link the
+//! review's session page on this install's dashboard (`common::review_session`
+//! keeps the record), and it is completed when the job ends, whatever the
+//! ending; a job that hands its review on hands the check on with it.
 //!
 //! A check run needs the app's checks:write permission, which an
 //! installation may not have granted. GitHub then refuses (403) and the
 //! review goes on exactly as without it: the refusal is logged once per
 //! installation at info, and nothing else changes.
 
-use std::collections::HashSet;
-use std::sync::Mutex;
+use crate::clients::github::GitHubClient;
+use common::review_check::{self as rc, CheckCalls, Close};
 
-use crate::clients::github::{is_not_permitted, GitHubClient};
-use tracing::{info, warn};
-
-type Error = Box<dyn std::error::Error + Send + Sync>;
-
-/// The check's name on the PR.
-pub(crate) const CHECK_NAME: &str = "CoderHelm review";
+pub(crate) use common::review_check::Target as CheckTarget;
 
 /// The session page of job `job` on the dashboard at `app`.
 pub(crate) fn session_url(app: &str, job: &str) -> String {
     format!("{app}/reviewer/session?id={job}")
 }
 
-/// The two check-run calls, so the silent degrade can be tested without
-/// GitHub.
 #[async_trait::async_trait]
-pub(crate) trait CheckApi: Sync {
-    async fn create(&self, owner: &str, repo: &str, body: &serde_json::Value)
-        -> Result<u64, Error>;
-    async fn update(
-        &self,
-        owner: &str,
-        repo: &str,
-        id: u64,
-        body: &serde_json::Value,
-    ) -> Result<(), Error>;
-}
-
-#[async_trait::async_trait]
-impl CheckApi for GitHubClient {
+impl CheckCalls for GitHubClient {
     async fn create(
         &self,
         owner: &str,
         repo: &str,
         body: &serde_json::Value,
-    ) -> Result<u64, Error> {
-        self.create_check_run(owner, repo, body).await
+    ) -> Result<u64, String> {
+        self.create_check_run(owner, repo, body)
+            .await
+            .map_err(|e| e.to_string())
     }
     async fn update(
         &self,
@@ -55,42 +38,21 @@ impl CheckApi for GitHubClient {
         repo: &str,
         id: u64,
         body: &serde_json::Value,
-    ) -> Result<(), Error> {
-        self.update_check_run(owner, repo, id, body).await
+    ) -> Result<(), String> {
+        self.update_check_run(owner, repo, id, body)
+            .await
+            .map_err(|e| e.to_string())
     }
-}
-
-/// Installations that refused a check run in this process: their refusal
-/// was logged once.
-static REFUSED: Mutex<Option<HashSet<u64>>> = Mutex::new(None);
-
-/// True the first time `installation` refuses in this process.
-fn first_refusal(installation: u64) -> bool {
-    let mut set = REFUSED.lock().unwrap_or_else(|p| p.into_inner());
-    set.get_or_insert_with(HashSet::new).insert(installation)
-}
-
-/// Log a failed check-run call. A refusal for want of permission is the
-/// expected state of an installation that hasn't granted checks:write: one
-/// info line, then silence.
-fn log_failure(installation: u64, pr: u64, what: &str, e: &Error) {
-    if is_not_permitted(&**e) {
-        if first_refusal(installation) {
-            info!(
-                installation,
-                pr,
-                "GitHub refused the CoderHelm review check (the app has no checks:write \
-                 permission on this installation); reviews go on without it"
-            );
-        }
-        return;
+    async fn list(&self, owner: &str, repo: &str, head: &str) -> Result<serde_json::Value, String> {
+        self.list_review_checks(owner, repo, head)
+            .await
+            .map_err(|e| e.to_string())
     }
-    warn!(installation, pr, what, error = %e, "CoderHelm review check: GitHub call failed");
 }
 
 /// Pure: the one-line title of a check in progress: what the review reads.
 pub(crate) fn reading_title(files: &[String], head: &str) -> String {
-    let short = &head[..head.len().min(7)];
+    let short = rc::short(head);
     match files {
         [] => format!("Reading the change at {short}"),
         [one] => format!("Reading 1 changed file at {short}: {one}"),
@@ -102,48 +64,102 @@ pub(crate) fn reading_title(files: &[String], head: &str) -> String {
     }
 }
 
-/// Where a review is: the check's place on the PR.
-pub(crate) struct CheckTarget<'a> {
-    pub installation: u64,
-    pub owner: &'a str,
-    pub repo: &'a str,
-    pub pr: u64,
-    pub head: &'a str,
+/// Pure: the title of a check its job has just taken over.
+pub(crate) fn started_title(head: &str) -> String {
+    format!("Reviewing {}", rc::short(head))
 }
 
-/// Open the check in progress on `t.head`, its Details link `details_url`.
-/// `None` when GitHub refused or failed: the review goes on without it.
-pub(crate) async fn open_check<C: CheckApi + ?Sized>(
-    api: &C,
-    t: &CheckTarget<'_>,
-    job: &str,
-    title: &str,
-    details_url: &str,
-) -> Option<u64> {
-    if t.head.is_empty() {
-        return None;
-    }
-    let body = serde_json::json!({
-        "name": CHECK_NAME,
-        "head_sha": t.head,
-        "status": "in_progress",
-        "external_id": job,
-        "details_url": details_url,
-        "started_at": chrono::Utc::now().to_rfc3339(),
-        "output": {
-            "title": common::truncate_str(title, 250),
-            "summary": format!(
-                "CoderHelm is reviewing this pull request. [Follow the review]({details_url}) \
-                 step by step."
+/// Why a job ended without a new review, for its check.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum NotReviewed<'a> {
+    /// A newer commit was pushed (before or during the review).
+    Superseded { newer: &'a str },
+    /// CoderHelm's own push while its run is still fixing the PR.
+    OwnPushDuringRun,
+    /// A description edit this commit was already reviewed with.
+    DescriptionSeen { head: &'a str },
+    /// The commit already has CoderHelm's verdict.
+    AlreadyReviewed { head: &'a str, verdict: &'a str },
+    /// The PR is still a draft.
+    Draft,
+    /// Another review of the same commit holds it.
+    HeldByAnotherReview { head: &'a str },
+    /// The team has no model provider set up.
+    NoModelProvider,
+    /// Nothing of the PR's own change moved since CoderHelm approved.
+    UnchangedSinceApproval { approved: &'a str },
+    /// Nothing of the PR's own change moved since CoderHelm's last review.
+    UnchangedSinceReview { reviewed: &'a str, verdict: &'a str },
+    /// A hunks-only re-review settled its findings; the full review
+    /// follows (the check goes to it when it can).
+    FullReviewFollows { head: &'a str },
+}
+
+/// Pure: the conclusion and title of a check whose job ended without a new
+/// review. A verdict that stands keeps its conclusion (an approval passes);
+/// every other ending is neutral, never a failure.
+pub(crate) fn not_reviewed(why: NotReviewed<'_>) -> (&'static str, String) {
+    use common::review_check::{standing_conclusion, verdict_words};
+    match why {
+        NotReviewed::Superseded { newer } => (
+            "neutral",
+            format!("Replaced by the review of {}", rc::short(newer)),
+        ),
+        NotReviewed::OwnPushDuringRun => (
+            "neutral",
+            "CoderHelm's own push during its run: reviewed when the run finishes".into(),
+        ),
+        NotReviewed::DescriptionSeen { head } => (
+            "neutral",
+            format!(
+                "Already reviewed with this description at {}",
+                rc::short(head)
             ),
-        },
-    });
-    match api.create(t.owner, t.repo, &body).await {
-        Ok(id) => Some(id),
-        Err(e) => {
-            log_failure(t.installation, t.pr, "open", &e);
-            None
-        }
+        ),
+        NotReviewed::AlreadyReviewed { head, verdict } => (
+            standing_conclusion(verdict),
+            format!(
+                "Already reviewed {}: {} stands",
+                rc::short(head),
+                verdict_words(verdict)
+            ),
+        ),
+        NotReviewed::Draft => (
+            "neutral",
+            "Still a draft: reviewed when it is marked ready".into(),
+        ),
+        NotReviewed::HeldByAnotherReview { head } => (
+            "neutral",
+            format!(
+                "Held by another review of {}: its verdict is the one that counts",
+                rc::short(head)
+            ),
+        ),
+        NotReviewed::NoModelProvider => (
+            "neutral",
+            "Review didn't finish: no model provider is set up".into(),
+        ),
+        NotReviewed::UnchangedSinceApproval { approved } => (
+            "success",
+            format!(
+                "No change to review since the approval at {}; the approval stands",
+                rc::short(approved)
+            ),
+        ),
+        NotReviewed::UnchangedSinceReview { reviewed, verdict } => (
+            standing_conclusion(verdict),
+            format!(
+                "No change to review since the last review at {}; earlier verdict stands",
+                rc::short(reviewed)
+            ),
+        ),
+        NotReviewed::FullReviewFollows { head } => (
+            "neutral",
+            format!(
+                "Changes since the last review settle its findings; a full review of {} follows",
+                rc::short(head)
+            ),
+        ),
     }
 }
 
@@ -159,18 +175,18 @@ pub(crate) enum CheckEnd<'a> {
     },
     /// Finished without a verdict on purpose: `reason` says why.
     Skipped { reason: &'a str },
-    /// Didn't finish; sent again (the retry opens its own check).
+    /// Finished without a new review on purpose, with its own conclusion
+    /// and title (a standing verdict carried, a newer commit's review).
+    Settled {
+        conclusion: &'static str,
+        title: &'a str,
+        reason: &'a str,
+    },
+    /// Didn't finish; sent again (when the check couldn't be handed to the
+    /// retry, it is completed with this).
     Retrying { reason: &'a str },
     /// Didn't finish, and every retry failed.
     Failed { reason: &'a str },
-}
-
-/// A completed check: its conclusion and output.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct CheckClose {
-    pub conclusion: &'static str,
-    pub title: String,
-    pub summary: String,
 }
 
 fn plural(n: usize, one: &str, many: &str) -> String {
@@ -181,12 +197,24 @@ fn plural(n: usize, one: &str, many: &str) -> String {
     }
 }
 
+/// Pure: the first line of an error, short enough for a title.
+fn short_reason(reason: &str) -> String {
+    let line = reason.lines().next().unwrap_or("").trim();
+    let line = line.trim_end_matches('.');
+    if line.chars().count() > 120 {
+        format!("{}...", line.chars().take(117).collect::<String>())
+    } else {
+        line.to_string()
+    }
+}
+
 /// Pure: the conclusion and output of a check. Findings make it `neutral`
 /// (they are in the review, the check never blocks a merge by itself); a
-/// clean review is `success`; a review skipped on purpose is `skipped`; one
-/// that didn't finish is `cancelled` (a service error says nothing about the
-/// code, so it is never a red `failure`).
-pub(crate) fn check_close(end: CheckEnd<'_>, pr_url: &str, session_url: &str) -> CheckClose {
+/// clean review is `success`; a standing verdict keeps its conclusion; any
+/// ending without a review is `neutral` (a service error says nothing about
+/// the code, so it is never a red `failure`). `session_url` is where the
+/// summary sends the reader for every step.
+pub(crate) fn check_close(end: CheckEnd<'_>, pr_url: &str, session_url: &str) -> Close {
     let session = format!("[See the session]({session_url}) for every step.");
     let (conclusion, title, body) = match end {
         CheckEnd::Reviewed {
@@ -216,19 +244,23 @@ pub(crate) fn check_close(end: CheckEnd<'_>, pr_url: &str, session_url: &str) ->
             };
             (conclusion, title, link)
         }
-        CheckEnd::Skipped { reason } => ("skipped", "Not reviewed".to_string(), reason.to_string()),
+        CheckEnd::Skipped { reason } => ("neutral", "Not reviewed".to_string(), reason.to_string()),
+        CheckEnd::Settled {
+            conclusion,
+            title,
+            reason,
+        } => (conclusion, title.to_string(), reason.to_string()),
         CheckEnd::Retrying { reason } => (
-            "cancelled",
-            "Didn't finish, trying again".to_string(),
+            "neutral",
+            format!("Review didn't finish: {}", short_reason(reason)),
             format!(
-                "The review hit a service error and runs again shortly; the next try has its \
-                 own check. Error: {}",
+                "The review hit a service error and runs again shortly. Error: {}",
                 common::truncate_str(reason, 300)
             ),
         ),
         CheckEnd::Failed { reason } => (
-            "cancelled",
-            "Didn't finish".to_string(),
+            "neutral",
+            format!("Review didn't finish: {}", short_reason(reason)),
             format!(
                 "Every try of this review hit a service error, so there is no verdict for this \
                  commit; any earlier verdict stands. Error: {}",
@@ -236,149 +268,35 @@ pub(crate) fn check_close(end: CheckEnd<'_>, pr_url: &str, session_url: &str) ->
             ),
         ),
     };
-    CheckClose {
+    Close {
         conclusion,
         title,
         summary: format!("{body}\n\n{session}"),
+        details_url: None,
     }
 }
 
-/// Complete check `id`. Never fails the review: an error is logged.
-pub(crate) async fn close_check<C: CheckApi + ?Sized>(
-    api: &C,
-    t: &CheckTarget<'_>,
-    id: u64,
-    close: &CheckClose,
-) {
-    let body = serde_json::json!({
-        "status": "completed",
-        "conclusion": close.conclusion,
-        "completed_at": chrono::Utc::now().to_rfc3339(),
-        "output": {
-            "title": common::truncate_str(&close.title, 250),
-            "summary": common::truncate_str(&close.summary, 60_000),
-        },
-    });
-    if let Err(e) = api.update(t.owner, t.repo, id, &body).await {
-        log_failure(t.installation, t.pr, "close", &e);
-    }
+/// Pure: how a check handed to a retry reads while the retry waits.
+pub(crate) fn retry_wait(reason: &str, due: i64) -> (String, String) {
+    let at = chrono::DateTime::from_timestamp(due, 0)
+        .map(|t| t.format("%H:%M UTC").to_string())
+        .unwrap_or_default();
+    (
+        format!(
+            "Review didn't finish: {}; trying again at {at}",
+            short_reason(reason)
+        ),
+        format!(
+            "The review hit a service error and runs again at {at}, in this check. Error: {}",
+            common::truncate_str(reason, 300)
+        ),
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex as StdMutex;
-
-    /// GitHub as the test wants it: refusing, failing, or working, with the
-    /// calls it got.
-    struct FakeGitHub {
-        answer: fn() -> Result<u64, Error>,
-        calls: StdMutex<Vec<String>>,
-    }
-
-    #[async_trait::async_trait]
-    impl CheckApi for FakeGitHub {
-        async fn create(
-            &self,
-            _owner: &str,
-            _repo: &str,
-            body: &serde_json::Value,
-        ) -> Result<u64, Error> {
-            self.calls
-                .lock()
-                .unwrap()
-                .push(format!("create {}", body["status"]));
-            (self.answer)()
-        }
-        async fn update(
-            &self,
-            _owner: &str,
-            _repo: &str,
-            id: u64,
-            body: &serde_json::Value,
-        ) -> Result<(), Error> {
-            self.calls
-                .lock()
-                .unwrap()
-                .push(format!("update {id} {}", body["conclusion"]));
-            (self.answer)().map(|_| ())
-        }
-    }
-
-    /// The error GitHub's client returns for an installation without
-    /// checks:write.
-    fn forbidden() -> Result<u64, Error> {
-        Err("HTTP status client error (403 Forbidden) for url \
-             (https://api.github.com/repos/acme/web/check-runs): \
-             {\"message\":\"Resource not accessible by integration\"}"
-            .into())
-    }
-
-    fn target(installation: u64) -> CheckTarget<'static> {
-        CheckTarget {
-            installation,
-            owner: "acme",
-            repo: "web",
-            pr: 7,
-            head: "9fceb02d0ae598e95dc970b74767f19372d61af8",
-        }
-    }
-
-    #[tokio::test]
-    async fn a_refused_check_degrades_silently() {
-        let gh = FakeGitHub {
-            answer: forbidden,
-            calls: StdMutex::new(vec![]),
-        };
-        let t = target(9_001);
-        let id = open_check(
-            &gh,
-            &t,
-            "job",
-            "Reading",
-            "https://app.example/reviewer/session?id=job",
-        )
-        .await;
-        // No check, no error, and the review carries on.
-        assert_eq!(id, None);
-        // Closing a check GitHub refuses is logged and dropped too.
-        let close = check_close(
-            CheckEnd::Skipped { reason: "x" },
-            "https://github.com/acme/web/pull/7",
-            "s",
-        );
-        close_check(&gh, &t, 1, &close).await;
-        assert_eq!(gh.calls.lock().unwrap().len(), 2);
-        // The refusal is logged once per installation.
-        assert!(!first_refusal(9_001));
-        assert!(first_refusal(9_002));
-        assert!(!first_refusal(9_002));
-    }
-
-    #[tokio::test]
-    async fn an_open_check_carries_its_session_link() {
-        let gh = FakeGitHub {
-            answer: || Ok(42),
-            calls: StdMutex::new(vec![]),
-        };
-        let t = target(1);
-        let id = open_check(&gh, &t, "job", "Reading", "u").await;
-        assert_eq!(id, Some(42));
-        assert_eq!(gh.calls.lock().unwrap()[0], "create \"in_progress\"");
-        // No head, no check (a check run needs the commit).
-        let mut no_head = target(1);
-        no_head.head = "";
-        assert_eq!(open_check(&gh, &no_head, "job", "Reading", "u").await, None);
-        assert_eq!(gh.calls.lock().unwrap().len(), 1);
-    }
-
-    #[test]
-    fn only_a_refusal_reads_as_not_permitted() {
-        let e = forbidden().unwrap_err();
-        assert!(is_not_permitted(&*e));
-        let other: Error = "HTTP status server error (502 Bad Gateway) for url (u)".into();
-        assert!(!is_not_permitted(&*other));
-    }
+    use common::review_check::fake::FakeChecks;
 
     #[test]
     fn conclusions_follow_the_review() {
@@ -392,9 +310,39 @@ mod tests {
         assert_eq!(c(reviewed("APPROVE", 2, "r")), "neutral");
         assert_eq!(c(reviewed("REQUEST_CHANGES", 3, "r")), "neutral");
         assert_eq!(c(reviewed("REQUEST_CHANGES", 0, "r")), "neutral");
-        assert_eq!(c(CheckEnd::Skipped { reason: "x" }), "skipped");
-        assert_eq!(c(CheckEnd::Retrying { reason: "x" }), "cancelled");
-        assert_eq!(c(CheckEnd::Failed { reason: "x" }), "cancelled");
+        assert_eq!(c(CheckEnd::Skipped { reason: "x" }), "neutral");
+        assert_eq!(c(CheckEnd::Retrying { reason: "x" }), "neutral");
+        assert_eq!(c(CheckEnd::Failed { reason: "x" }), "neutral");
+        assert_eq!(
+            c(CheckEnd::Settled {
+                conclusion: "success",
+                title: "t",
+                reason: "r"
+            }),
+            "success"
+        );
+    }
+
+    #[test]
+    fn an_unfinished_review_says_why_in_its_title() {
+        let failed = check_close(
+            CheckEnd::Failed {
+                reason: "the review ran past its 780s budget\nmore detail",
+            },
+            "pr",
+            "s",
+        );
+        assert_eq!(
+            failed.title,
+            "Review didn't finish: the review ran past its 780s budget"
+        );
+        let (title, summary) = retry_wait("model API 529 overloaded", 1_793_896_153);
+        assert_eq!(
+            title,
+            "Review didn't finish: model API 529 overloaded; trying again at 16:29 UTC"
+        );
+        assert!(summary.contains("in this check"));
+        assert!(short_reason(&"x".repeat(300)).ends_with("..."));
     }
 
     #[test]
@@ -453,9 +401,291 @@ mod tests {
             reading_title(&["src/a.ts".into(), "src/b.ts".into(), "c".into()], head),
             "Reading 3 changed files at 9fceb02: src/a.ts and 2 more"
         );
+        assert_eq!(started_title(head), "Reviewing 9fceb02");
         assert_eq!(
             session_url("https://app.example", "j"),
             "https://app.example/reviewer/session?id=j"
         );
+    }
+
+    const HEAD: &str = "9fceb02d0ae598e95dc970b74767f19372d61af8";
+    const NEWER: &str = "b75b65a0054151e44f8015042f1607e67c31dbdc";
+    const EARLIER: &str = "56458a8bcd1d9b24463b378233880cfd05195b39";
+
+    #[test]
+    fn every_ending_without_a_review_says_so() {
+        use NotReviewed::*;
+        let cases: Vec<(NotReviewed, &str, &str)> = vec![
+            (
+                Superseded { newer: NEWER },
+                "neutral",
+                "Replaced by the review of b75b65a",
+            ),
+            (
+                OwnPushDuringRun,
+                "neutral",
+                "CoderHelm's own push during its run: reviewed when the run finishes",
+            ),
+            (
+                DescriptionSeen { head: HEAD },
+                "neutral",
+                "Already reviewed with this description at 9fceb02",
+            ),
+            (
+                AlreadyReviewed {
+                    head: HEAD,
+                    verdict: "APPROVE",
+                },
+                "success",
+                "Already reviewed 9fceb02: approved stands",
+            ),
+            (
+                AlreadyReviewed {
+                    head: HEAD,
+                    verdict: "REQUEST_CHANGES",
+                },
+                "neutral",
+                "Already reviewed 9fceb02: changes requested stands",
+            ),
+            (
+                Draft,
+                "neutral",
+                "Still a draft: reviewed when it is marked ready",
+            ),
+            (
+                HeldByAnotherReview { head: HEAD },
+                "neutral",
+                "Held by another review of 9fceb02: its verdict is the one that counts",
+            ),
+            (
+                NoModelProvider,
+                "neutral",
+                "Review didn't finish: no model provider is set up",
+            ),
+            (
+                UnchangedSinceApproval { approved: EARLIER },
+                "success",
+                "No change to review since the approval at 56458a8; the approval stands",
+            ),
+            (
+                UnchangedSinceReview {
+                    reviewed: EARLIER,
+                    verdict: "REQUEST_CHANGES",
+                },
+                "neutral",
+                "No change to review since the last review at 56458a8; earlier verdict stands",
+            ),
+            (
+                UnchangedSinceReview {
+                    reviewed: EARLIER,
+                    verdict: "APPROVE",
+                },
+                "success",
+                "No change to review since the last review at 56458a8; earlier verdict stands",
+            ),
+            (
+                FullReviewFollows { head: HEAD },
+                "neutral",
+                "Changes since the last review settle its findings; a full review of 9fceb02 \
+                 follows",
+            ),
+        ];
+        for (why, conclusion, title) in cases {
+            let (c, t) = not_reviewed(why);
+            assert_eq!((c, t.as_str()), (conclusion, title), "{why:?}");
+            // Never a red check for an ending without a review.
+            assert_ne!(c, "failure");
+        }
+    }
+
+    fn target() -> CheckTarget<'static> {
+        CheckTarget {
+            installation: 1,
+            owner: "acme",
+            repo: "web",
+            pr: 7,
+            head: HEAD,
+        }
+    }
+
+    fn now() -> i64 {
+        chrono::Utc::now().timestamp()
+    }
+
+    /// The gateway queues the check for the push job (`head#…`), as
+    /// `routes::github_webhook` does.
+    async fn queued(gh: &FakeChecks) -> u64 {
+        let key = format!("head#{HEAD}");
+        match rc::queue(gh, &target(), &key, now() + 180, "pr-page").await {
+            rc::Queued::Created(id) => id,
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn the_job_reuses_the_queued_check_through_to_its_verdict() {
+        let gh = FakeChecks::default();
+        let id = queued(&gh).await;
+        let key = format!("head#{HEAD}");
+        // Job start: in progress at once, the same check.
+        assert_eq!(
+            rc::start(&gh, &target(), &key, &started_title(HEAD), "pr-page").await,
+            Some(id)
+        );
+        assert_eq!(gh.run(id)["status"], "in_progress");
+        assert_eq!(gh.run(id)["output"]["title"], "Reviewing 9fceb02");
+        // Verdict mode: what it reads, linking the session.
+        rc::progress(
+            &gh,
+            &target(),
+            id,
+            &key,
+            &reading_title(&["src/a.ts".into()], HEAD),
+            "session",
+        )
+        .await;
+        assert_eq!(gh.run(id)["details_url"], "session");
+        let close = check_close(
+            CheckEnd::Reviewed {
+                verdict: "APPROVE",
+                findings: 0,
+                review_url: "r",
+            },
+            "pr",
+            "session",
+        );
+        rc::close(&gh, &target(), id, &close).await;
+        assert_eq!(gh.run(id)["conclusion"], "success");
+        assert_eq!(gh.count(), 1, "one check on the commit");
+    }
+
+    #[tokio::test]
+    async fn each_skip_completes_the_queued_check() {
+        for why in [
+            NotReviewed::Superseded { newer: NEWER },
+            NotReviewed::OwnPushDuringRun,
+            NotReviewed::AlreadyReviewed {
+                head: HEAD,
+                verdict: "APPROVE",
+            },
+            NotReviewed::UnchangedSinceApproval { approved: EARLIER },
+            NotReviewed::HeldByAnotherReview { head: HEAD },
+        ] {
+            let gh = FakeChecks::default();
+            let id = queued(&gh).await;
+            let key = format!("head#{HEAD}");
+            rc::start(&gh, &target(), &key, &started_title(HEAD), "pr-page").await;
+            let (conclusion, title) = not_reviewed(why);
+            let close = check_close(
+                CheckEnd::Settled {
+                    conclusion,
+                    title: &title,
+                    reason: "why",
+                },
+                "pr",
+                "pr-page",
+            );
+            rc::close(&gh, &target(), id, &close).await;
+            let run = gh.run(id);
+            assert_eq!(run["status"], "completed", "{why:?}");
+            assert_eq!(run["conclusion"], conclusion, "{why:?}");
+            assert_eq!(run["output"]["title"], title.as_str(), "{why:?}");
+            assert_eq!(gh.count(), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_retry_and_a_full_review_carry_the_check_on() {
+        let gh = FakeChecks::default();
+        let id = queued(&gh).await;
+        let key = format!("head#{HEAD}");
+        rc::start(&gh, &target(), &key, &started_title(HEAD), "pr-page").await;
+        // A service error: the check waits for the retry, queued.
+        let retry_key = format!("retry#1#head#{HEAD}");
+        let due = now() + 60;
+        let (title, summary) = retry_wait("model API 529 overloaded", due);
+        assert!(rc::hand_off(&gh, &target(), id, &retry_key, due, &title, &summary).await);
+        assert_eq!(gh.run(id)["status"], "queued");
+        assert!(gh.run(id)["output"]["title"]
+            .as_str()
+            .unwrap()
+            .starts_with("Review didn't finish: model API 529 overloaded; trying again at "));
+        // The retry takes it; its hunks-only review hands it to the full one.
+        assert_eq!(
+            rc::start(&gh, &target(), &retry_key, "Reviewing", "pr-page").await,
+            Some(id)
+        );
+        let full_key = format!("full#{HEAD}");
+        assert!(rc::hand_off(&gh, &target(), id, &full_key, now(), "Full", "s").await);
+        assert_eq!(
+            rc::start(&gh, &target(), &full_key, "Reviewing", "pr-page").await,
+            Some(id)
+        );
+        // Every try failed: neutral, saying why.
+        let close = check_close(
+            CheckEnd::Failed {
+                reason: "the review ran past its 780s budget",
+            },
+            "pr",
+            "s",
+        );
+        rc::close(&gh, &target(), id, &close).await;
+        assert_eq!(gh.run(id)["conclusion"], "neutral");
+        assert_eq!(
+            gh.run(id)["output"]["title"],
+            "Review didn't finish: the review ran past its 780s budget"
+        );
+        assert_eq!(gh.count(), 1, "one check on the commit throughout");
+    }
+
+    #[tokio::test]
+    async fn an_ask_and_a_push_on_one_commit_share_one_check() {
+        let gh = FakeChecks::default();
+        let id = queued(&gh).await;
+        // An ask's job doesn't take the push's check at its start...
+        assert_eq!(
+            rc::start(&gh, &target(), "desc#x", "Reviewing", "pr-page").await,
+            None
+        );
+        // ...but when it runs the formal review, it takes over the open
+        // check instead of adding a second one.
+        assert_eq!(
+            rc::take_over_or_open(&gh, &target(), "desc#x", "Reading", "s").await,
+            Some(id)
+        );
+        assert_eq!(gh.count(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_refused_check_degrades_silently() {
+        let gh = FakeChecks::refusing();
+        let key = format!("head#{HEAD}");
+        assert_eq!(
+            rc::queue(&gh, &target(), &key, now(), "u").await,
+            rc::Queued::Nothing
+        );
+        assert_eq!(rc::start(&gh, &target(), &key, "R", "u").await, None);
+        assert_eq!(
+            rc::take_over_or_open(&gh, &target(), &key, "R", "u").await,
+            None
+        );
+        // Only listings were tried, and nothing was created.
+        assert!(gh.calls.lock().unwrap().iter().all(|c| c == "list"));
+        assert_eq!(gh.count(), 0);
+    }
+
+    #[tokio::test]
+    async fn no_head_no_check() {
+        let gh = FakeChecks::default();
+        let t = CheckTarget {
+            installation: 1,
+            owner: "acme",
+            repo: "web",
+            pr: 7,
+            head: "",
+        };
+        assert_eq!(rc::take_over_or_open(&gh, &t, "k", "R", "u").await, None);
+        assert_eq!(rc::start(&gh, &t, "k", "R", "u").await, None);
+        assert!(gh.calls.lock().unwrap().is_empty());
     }
 }
