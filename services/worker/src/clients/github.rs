@@ -58,8 +58,162 @@ async fn ok_or_body(
         return Ok(resp);
     }
     let url = resp.url().clone();
+    let header = |name: &str| {
+        resp.headers()
+            .get(name)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string)
+    };
+    let (retry_after, remaining, reset) = (
+        header("retry-after"),
+        header("x-ratelimit-remaining"),
+        header("x-ratelimit-reset"),
+    );
     let body = resp.text().await.unwrap_or_default();
-    Err(status_error_message(status, url.as_str(), &body).into())
+    let message = status_error_message(status, url.as_str(), &body);
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    match rate_limit_wait(
+        status.as_u16(),
+        retry_after.as_deref(),
+        remaining.as_deref(),
+        reset.as_deref(),
+        &body,
+        now,
+    ) {
+        Some(wait_secs) => Err(Box::new(RateLimited { wait_secs, message })),
+        None => Err(message.into()),
+    }
+}
+
+/// GitHub refused a request for its rate limit (primary or secondary). The
+/// message is the usual status line, so string checks still match; the wait
+/// is how long GitHub asked for.
+#[derive(Debug)]
+pub struct RateLimited {
+    pub wait_secs: u64,
+    message: String,
+}
+
+impl std::fmt::Display for RateLimited {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for RateLimited {}
+
+/// When a response is a rate limit, how long to wait before asking again:
+/// a 429, or a 403 with no requests left or a body that says rate limit.
+/// `retry-after` wins, then the primary limit's reset time, else a minute.
+fn rate_limit_wait(
+    status: u16,
+    retry_after: Option<&str>,
+    remaining: Option<&str>,
+    reset: Option<&str>,
+    body: &str,
+    now: u64,
+) -> Option<u64> {
+    let spent = remaining.map(str::trim) == Some("0");
+    let limited = status == 429
+        || (status == 403 && (spent || body.to_ascii_lowercase().contains("rate limit")));
+    if !limited {
+        return None;
+    }
+    let after = retry_after.and_then(|s| s.trim().parse::<u64>().ok());
+    let until_reset = reset
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .filter(|_| spent)
+        .map(|r| r.saturating_sub(now) + 1);
+    Some(after.or(until_reset).unwrap_or(60).max(1))
+}
+
+/// GitHub's hourly REST budget for one installation, as its last response
+/// said: requests left, of how many, and when it refills (epoch seconds).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Budget {
+    pub remaining: u64,
+    pub limit: u64,
+    pub reset: u64,
+}
+
+/// The last budget each installation's responses reported, in this process.
+static BUDGETS: std::sync::LazyLock<Mutex<HashMap<u64, Budget>>> =
+    std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// The budget a response's headers report. Only the core REST budget:
+/// search and GraphQL have budgets of their own.
+fn budget_from(
+    resource: Option<&str>,
+    remaining: Option<&str>,
+    limit: Option<&str>,
+    reset: Option<&str>,
+) -> Option<Budget> {
+    if resource.is_some_and(|r| r.trim() != "core") {
+        return None;
+    }
+    let n = |s: Option<&str>| s.and_then(|v| v.trim().parse::<u64>().ok());
+    Some(Budget {
+        remaining: n(remaining)?,
+        limit: n(limit).filter(|l| *l > 0)?,
+        reset: n(reset).unwrap_or(0),
+    })
+}
+
+/// Records the budget an installation's response reported, success or not.
+pub fn observe_budget(installation_id: u64, headers: &reqwest::header::HeaderMap) {
+    let h = |name: &str| headers.get(name).and_then(|v| v.to_str().ok());
+    if let Some(b) = budget_from(
+        h("x-ratelimit-resource"),
+        h("x-ratelimit-remaining"),
+        h("x-ratelimit-limit"),
+        h("x-ratelimit-reset"),
+    ) {
+        record_budget(installation_id, b);
+    }
+}
+
+pub fn record_budget(installation_id: u64, b: Budget) {
+    if let Ok(mut m) = BUDGETS.lock() {
+        m.insert(installation_id, b);
+    }
+}
+
+pub fn budget_of(installation_id: u64) -> Option<Budget> {
+    BUDGETS.lock().ok()?.get(&installation_id).copied()
+}
+
+/// Background work spends only while at least half the hourly budget is
+/// left, so live work (reviews, runs) always has the rest.
+pub const BACKGROUND_SHARE_PCT: u64 = 50;
+
+/// How long background work waits before spending again: None while the
+/// budget has headroom (or none was seen yet), else the seconds until the
+/// reset (at least a minute). `now`: epoch seconds.
+pub fn background_wait(b: Option<Budget>, now: u64) -> Option<u64> {
+    let b = b?;
+    if b.remaining * 100 >= b.limit * BACKGROUND_SHARE_PCT {
+        return None;
+    }
+    if b.reset > 0 && b.reset <= now {
+        // Past the reset: the next response tells the new budget.
+        return None;
+    }
+    Some(b.reset.saturating_sub(now).max(60))
+}
+
+/// How long GitHub asked to wait, when this error is its rate limit. Reads
+/// the typed error, and the status line for errors that lost their type.
+pub fn rate_limited(e: &(dyn std::error::Error + Send + Sync + 'static)) -> Option<u64> {
+    if let Some(r) = e.downcast_ref::<RateLimited>() {
+        return Some(r.wait_secs);
+    }
+    let m = e.to_string();
+    (m.contains("(429 Too Many Requests)")
+        || (m.contains("(403 Forbidden)") && m.to_ascii_lowercase().contains("rate limit")))
+    .then_some(60)
 }
 
 fn status_error_message(status: reqwest::StatusCode, url: &str, body: &str) -> String {
@@ -421,6 +575,23 @@ impl GitHubClient {
         ])
     }
 
+    /// Sends a request made with the installation's token, recording the
+    /// budget its response reports.
+    async fn send_tracked(
+        &self,
+        req: reqwest::RequestBuilder,
+    ) -> Result<reqwest::Response, reqwest::Error> {
+        let resp = req.send().await?;
+        observe_budget(self.installation_id, resp.headers());
+        Ok(resp)
+    }
+
+    /// How long background reads should wait for the installation's budget
+    /// to refill (see [`background_wait`]); None while there is headroom.
+    pub fn background_wait(&self) -> Option<u64> {
+        background_wait(budget_of(self.installation_id), Self::now_epoch())
+    }
+
     async fn get(
         &self,
         url: &str,
@@ -430,7 +601,7 @@ impl GitHubClient {
         for (k, v) in headers {
             req = req.header(k, v);
         }
-        let resp = ok_or_body(req.send().await?).await?;
+        let resp = ok_or_body(self.send_tracked(req).await?).await?;
         Ok(resp.json().await?)
     }
 
@@ -444,7 +615,7 @@ impl GitHubClient {
         for (k, v) in headers {
             req = req.header(k, v);
         }
-        let resp = ok_or_body(req.send().await?).await?;
+        let resp = ok_or_body(self.send_tracked(req).await?).await?;
         Ok(resp.json().await?)
     }
 
@@ -458,7 +629,7 @@ impl GitHubClient {
         for (k, v) in headers {
             req = req.header(k, v);
         }
-        let resp = ok_or_body(req.send().await?).await?;
+        let resp = ok_or_body(self.send_tracked(req).await?).await?;
         Ok(resp.json().await?)
     }
 
@@ -478,7 +649,7 @@ impl GitHubClient {
         for (k, v) in headers {
             req = req.header(k, v);
         }
-        let resp = req.send().await?.error_for_status()?;
+        let resp = self.send_tracked(req).await?.error_for_status()?;
         let bytes = resp.bytes().await?;
         if bytes.len() > MAX_TARBALL_BYTES {
             return Err(format!(
@@ -983,7 +1154,7 @@ impl GitHubClient {
         for (k, v) in &headers {
             req = req.header(k, v);
         }
-        let resp = req.send().await?.error_for_status()?;
+        let resp = self.send_tracked(req).await?.error_for_status()?;
         let data: serde_json::Value = resp.json().await?;
         let items = data
             .get("items")
@@ -1024,7 +1195,7 @@ impl GitHubClient {
                 req = req.header(k, v);
             }
         }
-        let resp = req.send().await?.error_for_status()?;
+        let resp = self.send_tracked(req).await?.error_for_status()?;
         let data: serde_json::Value = resp.json().await?;
         let items = data
             .get("items")
@@ -1195,7 +1366,7 @@ impl GitHubClient {
         for (k, v) in headers {
             req = req.header(k, v);
         }
-        let resp = req.send().await?;
+        let resp = self.send_tracked(req).await?;
         match resp.status().as_u16() {
             200 => Ok(true),
             409 | 422 => Ok(false), // non-fast-forward — someone advanced the ref
@@ -1367,7 +1538,7 @@ impl GitHubClient {
         for (k, v) in &headers {
             req = req.header(k.clone(), v.clone());
         }
-        let resp = req.send().await?;
+        let resp = self.send_tracked(req).await?;
 
         if resp.status() == reqwest::StatusCode::UNPROCESSABLE_ENTITY {
             // Branch already exists. INVARIANT: a branch with an OPEN PR is
@@ -1466,7 +1637,7 @@ impl GitHubClient {
         for (k, v) in &headers {
             req = req.header(k.clone(), v.clone());
         }
-        let resp = req.send().await?;
+        let resp = self.send_tracked(req).await?;
         match resp.status().as_u16() {
             201 => {
                 self.invalidate_snapshot(owner, repo, base).await;
@@ -1505,7 +1676,7 @@ impl GitHubClient {
         for (k, v) in &headers {
             req = req.header(k.clone(), v.clone());
         }
-        let resp = req.send().await?;
+        let resp = self.send_tracked(req).await?;
         match resp.status().as_u16() {
             201 => Ok(Some(resp.json().await?)),
             204 => Ok(Some(serde_json::Value::Null)),
@@ -2086,7 +2257,7 @@ impl GitHubClient {
             for (k, v) in headers {
                 req = req.header(k, v);
             }
-            let resp = req.send().await?;
+            let resp = self.send_tracked(req).await?;
             let status = resp.status().as_u16();
             if (200..300).contains(&status) {
                 let result: serde_json::Value = resp.json().await?;
@@ -2777,7 +2948,7 @@ impl GitHubClient {
         for (k, v) in headers {
             req = req.header(k, v);
         }
-        let resp = req.send().await?;
+        let resp = self.send_tracked(req).await?;
         let status = resp.status().as_u16();
         if status == 200 {
             return Ok(MergeOutcome::Merged);
@@ -2919,7 +3090,7 @@ impl GitHubClient {
         for (k, v) in headers {
             req = req.header(k, v);
         }
-        ok_or_body(req.send().await?).await?;
+        ok_or_body(self.send_tracked(req).await?).await?;
         Ok(())
     }
 
@@ -2941,7 +3112,7 @@ impl GitHubClient {
         for (k, v) in headers {
             req = req.header(k, v);
         }
-        ok_or_body(req.send().await?).await?;
+        ok_or_body(self.send_tracked(req).await?).await?;
         Ok(())
     }
 
@@ -3363,7 +3534,7 @@ impl GitHubClient {
         for (k, v) in headers {
             req = req.header(k, v);
         }
-        let resp = req.send().await?.error_for_status()?;
+        let resp = self.send_tracked(req).await?.error_for_status()?;
         Ok(resp.text().await?)
     }
 
@@ -3744,7 +3915,7 @@ impl GitHubClient {
         for (k, v) in headers {
             req = req.header(k, v);
         }
-        ok_or_body(req.send().await?).await?;
+        ok_or_body(self.send_tracked(req).await?).await?;
         Ok(())
     }
 
@@ -3788,7 +3959,7 @@ impl GitHubClient {
         for (k, v) in headers {
             req = req.header(k, v);
         }
-        let mut resp = req.send().await?.error_for_status()?;
+        let mut resp = self.send_tracked(req).await?.error_for_status()?;
         let mut buf = Vec::new();
         while let Some(chunk) = resp.chunk().await? {
             if buf.len() + chunk.len() > max_bytes {
@@ -3827,7 +3998,7 @@ impl GitHubClient {
         for (k, v) in headers {
             req = req.header(k, v);
         }
-        ok_or_body(req.send().await?).await?;
+        ok_or_body(self.send_tracked(req).await?).await?;
         Ok(())
     }
 
@@ -3930,7 +4101,7 @@ impl GitHubClient {
         for (k, v) in &headers {
             req = req.header(k, v);
         }
-        let resp = req.send().await?;
+        let resp = self.send_tracked(req).await?;
         if resp.status().is_success() {
             return Ok(());
         }
@@ -4533,6 +4704,94 @@ mod status_error_tests {
         let forbidden: Box<dyn std::error::Error + Send + Sync> =
             status_error_message(reqwest::StatusCode::FORBIDDEN, "u", "too_large").into();
         assert!(!is_not_found(&*forbidden));
+    }
+
+    #[test]
+    fn background_reads_keep_half_the_budget_for_live_work() {
+        let now = 1_000;
+        let b = budget_from(Some("core"), Some("2600"), Some("5000"), Some("4000")).unwrap();
+        assert_eq!(background_wait(Some(b), now), None);
+        // Below half: wait for the reset.
+        let low = budget_from(None, Some("2499"), Some("5000"), Some("4000")).unwrap();
+        assert_eq!(background_wait(Some(low), now), Some(3000));
+        // Past the reset, or never seen: spend, the next response tells.
+        assert_eq!(background_wait(Some(low), 5000), None);
+        assert_eq!(background_wait(None, now), None);
+        // Search and GraphQL budgets are their own, never the core one.
+        assert_eq!(
+            budget_from(Some("search"), Some("1"), Some("30"), Some("4000")),
+            None
+        );
+        // Every response is recorded per installation.
+        let mut h = reqwest::header::HeaderMap::new();
+        h.insert("x-ratelimit-remaining", "10".parse().unwrap());
+        h.insert("x-ratelimit-limit", "5000".parse().unwrap());
+        h.insert("x-ratelimit-reset", "4000".parse().unwrap());
+        observe_budget(987_654_321, &h);
+        assert_eq!(
+            budget_of(987_654_321),
+            Some(Budget {
+                remaining: 10,
+                limit: 5000,
+                reset: 4000
+            })
+        );
+        assert_eq!(budget_of(987_654_322), None);
+    }
+
+    #[test]
+    fn rate_limits_are_told_apart_with_their_wait() {
+        let now = 1_000;
+        // Primary limit spent: wait until the reset.
+        assert_eq!(
+            rate_limit_wait(403, None, Some("0"), Some("1300"), "", now),
+            Some(301)
+        );
+        // Secondary limit: retry-after wins.
+        assert_eq!(
+            rate_limit_wait(
+                403,
+                Some("45"),
+                Some("12"),
+                None,
+                "You have exceeded a secondary rate limit",
+                now
+            ),
+            Some(45)
+        );
+        assert_eq!(rate_limit_wait(429, None, None, None, "", now), Some(60));
+        // Other refusals are not rate limits.
+        assert_eq!(
+            rate_limit_wait(
+                403,
+                None,
+                Some("4000"),
+                None,
+                "Resource not accessible by integration",
+                now
+            ),
+            None
+        );
+        assert_eq!(rate_limit_wait(404, None, Some("0"), None, "", now), None);
+
+        let typed: Box<dyn std::error::Error + Send + Sync> = Box::new(RateLimited {
+            wait_secs: 120,
+            message: status_error_message(reqwest::StatusCode::FORBIDDEN, "u", "x"),
+        });
+        assert_eq!(rate_limited(&*typed), Some(120));
+        // Still reads as the status line it carries.
+        assert!(typed.to_string().contains("(403 Forbidden)"));
+        assert!(!is_not_found(&*typed));
+        let text: Box<dyn std::error::Error + Send + Sync> = status_error_message(
+            reqwest::StatusCode::FORBIDDEN,
+            "u",
+            "API rate limit exceeded",
+        )
+        .into();
+        assert_eq!(rate_limited(&*text), Some(60));
+        let other: Box<dyn std::error::Error + Send + Sync> =
+            status_error_message(reqwest::StatusCode::FORBIDDEN, "u", "too_large").into();
+        assert_eq!(rate_limited(&*other), None);
     }
 }
 
