@@ -1,158 +1,441 @@
-//! Deploy stats: one record per deploy CoderHelm starts by adding a label
-//! (`common::deploy_stats`), and the one-time copy of earlier deploys from
-//! GitHub's label history.
+//! Deploys CoderHelm started (`common::deploy_stats`): a completed workflow
+//! run, from its webhook or read back from GitHub's run history, recorded
+//! when CoderHelm's app triggered it and it deployed somewhere.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
+use std::time::Instant;
 
 use aws_sdk_dynamodb::types::AttributeValue;
 use chrono::{Duration, Utc};
-use common::deploy_stats::{self as ds, BACKFILL_DAYS, BACKFILL_MARKER_SK, PREFIX};
+use common::deploy_stats::{self as ds, Cause, JobDef};
+use serde_json::{json, Value};
 use tracing::{info, warn};
 
+use crate::clients::github::GitHubClient;
 use crate::WorkerState;
 
-/// Deploys recorded live on one PR: (label, when).
-type LiveDeploys = Vec<(String, chrono::DateTime<Utc>)>;
+type GhError = Box<dyn std::error::Error + Send + Sync>;
 
 fn av(v: &str) -> AttributeValue {
     AttributeValue::S(v.to_string())
 }
 
-/// Records each deploy label in `labels` CoderHelm just added to a PR.
-/// Best effort: a failed write is logged, never fails the caller.
-#[allow(clippy::too_many_arguments)]
-pub async fn record(
-    state: &WorkerState,
-    team_id: &str,
-    owner: &str,
-    repo: &str,
-    pr: u64,
-    labels: &[String],
-    head: &str,
-    configured: &[String],
-    source: &str,
-) {
-    let now = Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
-    let full = format!("{owner}/{repo}");
-    for label in labels.iter().filter(|l| ds::is_deploy_label(l, configured)) {
-        let item = ds::stat_item(team_id, &now, &full, pr, label, head, source);
-        if let Err(e) = state
-            .dynamo
-            .put_item()
-            .table_name(&state.config.settings_table_name)
-            .set_item(Some(item))
-            .send()
+/// A workflow file's jobs are read again after this long.
+const WORKFLOW_CACHE_SECS: i64 = 3600;
+/// A backfill pass stops here and queues the next one, well inside the
+/// worker's 15 minutes.
+const PASS_BUDGET_SECS: u64 = 600;
+/// Run history is read a week at a time: GitHub returns at most 1,000 runs
+/// for one filtered query.
+const CHUNK_DAYS: i64 = 7;
+
+/// GitHub refused because the app has no access to Actions here.
+fn is_no_access(e: &(dyn std::error::Error + Send + Sync)) -> bool {
+    let m = e.to_string();
+    m.contains("(403 Forbidden)") && m.contains("not accessible by integration")
+}
+
+/// The `created` filters that cover `since` to `now`, a week each.
+pub fn created_ranges(since: chrono::DateTime<Utc>, now: chrono::DateTime<Utc>) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut from = since;
+    while from < now {
+        let to = (from + Duration::days(CHUNK_DAYS)).min(now);
+        out.push(format!(
+            "{}..{}",
+            from.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+            to.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+        ));
+        from = to;
+    }
+    out
+}
+
+/// What the worker knows about one repository while it reads its deploys.
+struct RepoReads<'a> {
+    github: &'a GitHubClient,
+    owner: String,
+    name: String,
+    bot: String,
+    default_branch: String,
+    setting: HashMap<String, String>,
+    /// Workflow jobs by path, read once per pass.
+    workflows: HashMap<String, Option<Vec<JobDef>>>,
+}
+
+impl RepoReads<'_> {
+    fn full(&self) -> String {
+        format!("{}/{}", self.owner, self.name)
+    }
+
+    async fn jobs_of(
+        &mut self,
+        state: &WorkerState,
+        team_id: &str,
+        path: &str,
+    ) -> Option<Vec<JobDef>> {
+        if path.is_empty() {
+            return None;
+        }
+        if let Some(j) = self.workflows.get(path) {
+            return j.clone();
+        }
+        let j = workflow_jobs(state, team_id, self.github, &self.owner, &self.name, path).await;
+        self.workflows.insert(path.to_string(), j.clone());
+        j
+    }
+
+    /// Whether CoderHelm caused this run, and how.
+    async fn cause(&self, run: &Value) -> Option<Cause> {
+        let branch = run["head_branch"].as_str().unwrap_or("");
+        let event = run["event"].as_str().unwrap_or("");
+        let ours = if ds::started_by_coderhelm(run, &self.bot) {
+            true
+        } else {
+            // A merge queue's push of a PR CoderHelm merged.
+            let (_, kind) = ds::trigger(run);
+            kind == "Bot"
+                && event == "push"
+                && branch == self.default_branch
+                && self.merged_by_us(run).await
+        };
+        if !ours {
+            return None;
+        }
+        let is_tag = event == "push"
+            && branch != self.default_branch
+            && self
+                .github
+                .get_repo_path(
+                    &self.owner,
+                    &self.name,
+                    &format!("git/ref/tags/{}", urlencoding::encode(branch)),
+                )
+                .await
+                .is_ok();
+        Some(ds::cause_of(run, &self.default_branch, is_tag))
+    }
+
+    async fn merged_by_us(&self, run: &Value) -> bool {
+        let sha = run["head_sha"].as_str().unwrap_or("");
+        if sha.is_empty() {
+            return false;
+        }
+        match self
+            .github
+            .get_repo_path(&self.owner, &self.name, &format!("commits/{sha}/pulls"))
             .await
         {
-            warn!(pr, label = %label, error = %e, "Could not record a deploy");
+            Ok(v) => ds::merged_by_coderhelm(
+                v.as_array().map(|a| a.as_slice()).unwrap_or(&[]),
+                &self.bot,
+            ),
+            Err(_) => false,
         }
+    }
+
+    /// Records a completed run when CoderHelm started it and it deployed.
+    /// Returns how many deploys it wrote.
+    async fn record(&mut self, state: &WorkerState, team_id: &str, run: &Value) -> usize {
+        if run["status"].as_str().is_some_and(|s| s != "completed") {
+            return 0;
+        }
+        let Some(cause) = self.cause(run).await else {
+            return 0;
+        };
+        let path = run["path"].as_str().unwrap_or("").to_string();
+        let jobs = self.jobs_of(state, team_id, &path).await;
+        let file = path.rsplit('/').next().unwrap_or("").to_ascii_lowercase();
+        let maybe = self.setting.contains_key(&file)
+            || ds::says_deploy(run["name"].as_str().unwrap_or(""))
+            || ds::says_deploy(&file)
+            || jobs
+                .as_deref()
+                .unwrap_or(&[])
+                .iter()
+                .any(|j| !j.environment.is_empty() || ds::says_deploy(&j.name));
+        if !maybe {
+            return 0;
+        }
+        let run_id = run["id"].as_u64().unwrap_or(0);
+        let ran: Option<Vec<Value>> = match self
+            .github
+            .get_repo_path(
+                &self.owner,
+                &self.name,
+                &format!("actions/runs/{run_id}/jobs?per_page=100"),
+            )
+            .await
+        {
+            Ok(v) => v["jobs"].as_array().cloned(),
+            Err(e) => {
+                warn!(run_id, error = %e, "Deploys: could not read a run's jobs");
+                None
+            }
+        };
+        let targets = ds::run_targets(run, jobs.as_deref(), ran.as_deref(), &self.setting);
+        let repo = self.full();
+        let mut written = 0;
+        for t in &targets {
+            let item = ds::stat_item(team_id, &repo, run, cause, t);
+            match state
+                .dynamo
+                .put_item()
+                .table_name(&state.config.settings_table_name)
+                .set_item(Some(item))
+                .send()
+                .await
+            {
+                Ok(_) => written += 1,
+                Err(e) => warn!(run_id, error = %e, "Deploys: could not record a deploy"),
+            }
+        }
+        written
     }
 }
 
-/// The PRs a team touched in the backfill window: reviewed (review stats)
-/// or opened by a run.
-async fn recent_prs(
+/// A workflow file's jobs, cached in settings for an hour.
+async fn workflow_jobs(
     state: &WorkerState,
     team_id: &str,
-    since: chrono::DateTime<Utc>,
-) -> Result<Vec<(String, u64)>, String> {
-    let mut prs: HashSet<(String, u64)> = HashSet::new();
-    let lo = format!(
-        "{}{}",
-        common::review_stats::PREFIX,
-        since.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
-    );
-    let hi = format!("{}~", common::review_stats::PREFIX);
-    let mut start: Option<HashMap<String, AttributeValue>> = None;
-    loop {
-        let r = state
-            .dynamo
-            .query()
-            .table_name(&state.config.settings_table_name)
-            .key_condition_expression("pk = :pk AND sk BETWEEN :lo AND :hi")
-            .expression_attribute_values(":pk", av(team_id))
-            .expression_attribute_values(":lo", av(&lo))
-            .expression_attribute_values(":hi", av(&hi))
-            .projection_expression("repo, pr_number")
-            .set_exclusive_start_key(start.take())
-            .send()
-            .await
-            .map_err(|e| format!("read review stats: {e}"))?;
-        prs.extend(r.items().iter().filter_map(repo_pr));
-        match r.last_evaluated_key() {
-            Some(k) => start = Some(k.clone()),
-            None => break,
+    github: &GitHubClient,
+    owner: &str,
+    repo: &str,
+    path: &str,
+) -> Option<Vec<JobDef>> {
+    let table = &state.config.settings_table_name;
+    let sk = format!("DWF#{owner}/{repo}#{path}").to_ascii_lowercase();
+    let now = Utc::now().timestamp();
+    if let Ok(r) = state
+        .dynamo
+        .get_item()
+        .table_name(table)
+        .key("pk", av(team_id))
+        .key("sk", av(&sk))
+        .send()
+        .await
+    {
+        if let Some(i) = r.item() {
+            let at: i64 = i
+                .get("checked_at")
+                .and_then(|v| v.as_n().ok())
+                .and_then(|n| n.parse().ok())
+                .unwrap_or(0);
+            if now - at < WORKFLOW_CACHE_SECS {
+                let jobs: Vec<Value> = i
+                    .get("jobs")
+                    .and_then(|v| v.as_s().ok())
+                    .and_then(|s| serde_json::from_str(s).ok())
+                    .unwrap_or_default();
+                return Some(
+                    jobs.iter()
+                        .map(|j| JobDef {
+                            key: j["key"].as_str().unwrap_or("").into(),
+                            name: j["name"].as_str().unwrap_or("").into(),
+                            environment: j["environment"].as_str().unwrap_or("").into(),
+                        })
+                        .collect(),
+                );
+            }
         }
     }
-    let lo = ulid::Ulid::from_parts(since.timestamp_millis().max(0) as u64, 0).to_string();
-    let mut start: Option<HashMap<String, AttributeValue>> = None;
-    loop {
-        let r = state
-            .dynamo
-            .query()
-            .table_name(&state.config.runs_table_name)
-            .key_condition_expression("team_id = :t AND run_id >= :lo")
-            .expression_attribute_values(":t", av(team_id))
-            .expression_attribute_values(":lo", av(&lo))
-            .projection_expression("repo, pr_number")
-            .set_exclusive_start_key(start.take())
-            .send()
-            .await
-            .map_err(|e| format!("read runs: {e}"))?;
-        prs.extend(r.items().iter().filter_map(repo_pr));
-        match r.last_evaluated_key() {
-            Some(k) => start = Some(k.clone()),
-            None => break,
+    let text = match github.read_file_live(owner, repo, path, "HEAD").await {
+        Ok(t) => t,
+        Err(e) => {
+            warn!(path, error = %e, "Deploys: could not read a workflow file");
+            return None;
         }
-    }
-    let mut out: Vec<(String, u64)> = prs.into_iter().collect();
-    out.sort();
-    Ok(out)
-}
-
-fn repo_pr(i: &HashMap<String, AttributeValue>) -> Option<(String, u64)> {
-    let repo = i.get("repo")?.as_s().ok()?.to_string();
-    let pr: u64 = i.get("pr_number")?.as_n().ok()?.parse().ok()?;
-    (repo.contains('/') && pr > 0).then_some((repo, pr))
-}
-
-/// Which copied events are new: in the window, a deploy label, and not
-/// already recorded live (same PR and label within five minutes).
-pub fn new_deploys(
-    added: &[(String, String)],
-    since: chrono::DateTime<Utc>,
-    configured: &[String],
-    live: &[(String, chrono::DateTime<Utc>)],
-) -> Vec<(String, String)> {
-    added
+    };
+    let jobs = ds::parse_workflow(&text)?;
+    let stored: Vec<Value> = jobs
         .iter()
-        .filter(|(label, _)| ds::is_deploy_label(label, configured))
-        .filter_map(|(label, at)| {
-            let t = chrono::DateTime::parse_from_rfc3339(at)
-                .ok()?
-                .with_timezone(&Utc);
-            (t >= since).then_some((label, at, t))
-        })
-        .filter(|(label, _, t)| {
-            !live.iter().any(|(l, lt)| {
-                l.eq_ignore_ascii_case(label) && (*lt - *t).num_seconds().abs() <= 300
-            })
-        })
-        .map(|(l, at, _)| (l.clone(), at.clone()))
-        .collect()
+        .map(|j| json!({"key": j.key, "name": j.name, "environment": j.environment}))
+        .collect();
+    let _ = state
+        .dynamo
+        .put_item()
+        .table_name(table)
+        .item("pk", av(team_id))
+        .item("sk", av(&sk))
+        .item("jobs", av(&Value::Array(stored).to_string()))
+        .item("checked_at", AttributeValue::N(now.to_string()))
+        .item("ttl", AttributeValue::N((now + 86_400).to_string()))
+        .send()
+        .await;
+    Some(jobs)
 }
 
-/// Copies a team's deploys of the last `BACKFILL_DAYS` from GitHub, once.
-/// Re-running is safe: each copy is written only when missing, and the
-/// marker is written only when every PR was read.
+/// The repository's deploy workflows setting, from its review config.
+async fn deploy_workflows_setting(
+    state: &WorkerState,
+    team_id: &str,
+    repo: &str,
+) -> HashMap<String, String> {
+    let item = state
+        .dynamo
+        .get_item()
+        .table_name(&state.config.settings_table_name)
+        .key("pk", av(team_id))
+        .key("sk", av(&format!("REVIEW_CONFIG#REPO#{repo}")))
+        .send()
+        .await
+        .ok()
+        .and_then(|r| r.item().cloned());
+    ds::parse_deploy_workflows(
+        item.as_ref()
+            .and_then(|i| i.get("deploy_workflows"))
+            .and_then(|v| v.as_s().ok())
+            .map(String::as_str)
+            .unwrap_or(""),
+    )
+}
+
+async fn repo_reads<'a>(
+    state: &WorkerState,
+    team_id: &str,
+    github: &'a GitHubClient,
+    owner: &str,
+    name: &str,
+    bot: &str,
+) -> Result<RepoReads<'a>, GhError> {
+    let default_branch = github.get_default_branch(owner, name).await?;
+    Ok(RepoReads {
+        github,
+        owner: owner.to_string(),
+        name: name.to_string(),
+        bot: bot.to_string(),
+        default_branch,
+        setting: deploy_workflows_setting(state, team_id, &format!("{owner}/{name}")).await,
+        workflows: HashMap::new(),
+    })
+}
+
+/// Records one completed workflow run from its webhook.
+pub async fn record_run(
+    state: &WorkerState,
+    msg: &common::messages::DeployRunMessage,
+) -> Result<(), String> {
+    let Some(github) = super::plan_chat::github_for(state, &msg.team_id).await else {
+        return Err("no GitHub installation for the team".into());
+    };
+    let bot = github
+        .app_bot_login()
+        .await
+        .map_err(|e| format!("bot login: {e}"))?;
+    let mut reads = repo_reads(
+        state,
+        &msg.team_id,
+        &github,
+        &msg.repo_owner,
+        &msg.repo_name,
+        &bot,
+    )
+    .await
+    .map_err(|e| format!("read repository: {e}"))?;
+    let n = reads.record(state, &msg.team_id, &msg.run).await;
+    if n > 0 {
+        info!(
+            run_id = msg.run["id"].as_u64().unwrap_or(0),
+            deploys = n,
+            "Deploy recorded"
+        );
+    }
+    Ok(())
+}
+
+/// How one repository's backfill ended.
+enum RepoBackfill {
+    Done,
+    NoAccess,
+    OutOfTime,
+}
+
+async fn backfill_repo(
+    state: &WorkerState,
+    team_id: &str,
+    reads: &mut RepoReads<'_>,
+    since: chrono::DateTime<Utc>,
+    started: Instant,
+) -> Result<RepoBackfill, GhError> {
+    let mut written = 0usize;
+    for range in created_ranges(since, Utc::now()) {
+        for page in 1..=10u32 {
+            if started.elapsed().as_secs() > PASS_BUDGET_SECS {
+                return Ok(RepoBackfill::OutOfTime);
+            }
+            let rest = format!(
+                "actions/runs?actor={}&status=completed&created={}&per_page=100&page={page}",
+                urlencoding::encode(&reads.bot),
+                urlencoding::encode(&range)
+            );
+            let v = match reads
+                .github
+                .get_repo_path(&reads.owner, &reads.name, &rest)
+                .await
+            {
+                Ok(v) => v,
+                Err(e) if is_no_access(&*e) => return Ok(RepoBackfill::NoAccess),
+                Err(e) => return Err(e),
+            };
+            let runs = v["workflow_runs"].as_array().cloned().unwrap_or_default();
+            for run in &runs {
+                written += reads.record(state, team_id, run).await;
+            }
+            if runs.len() < 100 {
+                break;
+            }
+        }
+    }
+    info!(repo = %reads.full(), written, "Deploys backfill: repository read");
+    Ok(RepoBackfill::Done)
+}
+
+async fn mark(state: &WorkerState, team_id: &str, sk: &str, extra: &[(&str, AttributeValue)]) {
+    let mut req = state
+        .dynamo
+        .put_item()
+        .table_name(&state.config.settings_table_name)
+        .item("pk", av(team_id))
+        .item("sk", av(sk))
+        .item("at", av(&Utc::now().to_rfc3339()));
+    for (k, v) in extra {
+        req = req.item(*k, v.clone());
+    }
+    if let Err(e) = req.send().await {
+        warn!(sk, error = %e, "Deploys backfill: could not write a marker");
+    }
+}
+
+async fn queue_next_pass(state: &WorkerState, team_id: &str) {
+    if state.config.ticket_queue_url.is_empty() {
+        return;
+    }
+    let body = json!({"type": "deploy_stats_backfill", "team_id": team_id}).to_string();
+    if let Err(e) = state
+        .sqs
+        .send_message()
+        .queue_url(&state.config.ticket_queue_url)
+        .message_body(body)
+        .send()
+        .await
+    {
+        warn!(error = %e, "Deploys backfill: could not queue the next pass");
+    }
+}
+
+/// Reads a team's deploys of the last `BACKFILL_DAYS` from GitHub's run
+/// history. Safe to repeat: a record is keyed by its run, each repository is
+/// marked when read, and a pass that runs out of time queues the next one.
+/// The team is marked done only when every repository was read.
 pub async fn backfill(state: &WorkerState, team_id: &str) -> Result<(), String> {
     let table = &state.config.settings_table_name;
+    let started = Instant::now();
     let done = state
         .dynamo
         .get_item()
         .table_name(table)
         .key("pk", av(team_id))
-        .key("sk", av(BACKFILL_MARKER_SK))
+        .key("sk", av(ds::BACKFILL_MARKER_SK))
         .send()
         .await
         .map_err(|e| format!("read backfill marker: {e}"))?;
@@ -162,122 +445,100 @@ pub async fn backfill(state: &WorkerState, team_id: &str) -> Result<(), String> 
     let Some(github) = super::plan_chat::github_for(state, team_id).await else {
         return Err("no GitHub installation for the team".into());
     };
-    let since = Utc::now() - Duration::days(BACKFILL_DAYS);
-    let prs = recent_prs(state, team_id, since).await?;
-    // Deploys already recorded live, by PR, to skip their copies.
-    let mut live: HashMap<(String, u64), LiveDeploys> = HashMap::new();
-    let mut start: Option<HashMap<String, AttributeValue>> = None;
-    loop {
-        let r = state
-            .dynamo
-            .query()
-            .table_name(table)
-            .key_condition_expression("pk = :pk AND begins_with(sk, :p)")
-            .expression_attribute_values(":pk", av(team_id))
-            .expression_attribute_values(":p", av(PREFIX))
-            .set_exclusive_start_key(start.take())
-            .send()
-            .await
-            .map_err(|e| format!("read deploy stats: {e}"))?;
-        for i in r.items() {
-            let g = |k: &str| {
-                i.get(k)
-                    .and_then(|v| v.as_s().ok())
-                    .cloned()
-                    .unwrap_or_default()
-            };
-            if g("source") == "backfill" {
-                continue;
-            }
-            if let (Some(k), Ok(t)) = (
-                repo_pr(i),
-                chrono::DateTime::parse_from_rfc3339(&g("created_at")),
-            ) {
-                live.entry(k)
-                    .or_default()
-                    .push((g("label"), t.with_timezone(&Utc)));
-            }
-        }
-        match r.last_evaluated_key() {
-            Some(k) => start = Some(k.clone()),
-            None => break,
-        }
-    }
-    let mut configured: HashMap<String, Vec<String>> = HashMap::new();
-    let (mut copied, mut failed) = (0usize, 0usize);
-    for (repo, pr) in &prs {
-        let Some((owner, name)) = repo.split_once('/') else {
+    let bot = github
+        .app_bot_login()
+        .await
+        .map_err(|e| format!("bot login: {e}"))?;
+    let since = Utc::now() - Duration::days(ds::BACKFILL_DAYS);
+    let repos = super::plan::fetch_team_repo_list(state, team_id).await;
+    let (mut no_access, mut failed) = (Vec::<String>::new(), 0usize);
+    for repo in &repos {
+        let Some((owner, name)) = repo.full_name.split_once('/') else {
             continue;
         };
-        if !configured.contains_key(repo) {
-            let cfg =
-                super::review_actions::OnApproveConfig::load(state, team_id, owner, name).await;
-            configured.insert(repo.clone(), ds::configured(&cfg.deploy_label));
+        let repo_sk = format!(
+            "{}{}",
+            ds::BACKFILL_REPO_PREFIX,
+            repo.full_name.to_ascii_lowercase()
+        );
+        let prior = state
+            .dynamo
+            .get_item()
+            .table_name(table)
+            .key("pk", av(team_id))
+            .key("sk", av(&repo_sk))
+            .send()
+            .await
+            .ok()
+            .and_then(|r| r.item().cloned());
+        if let Some(p) = prior {
+            if p.get("no_access").and_then(|v| v.as_bool().ok()) == Some(&true) {
+                no_access.push(repo.full_name.clone());
+            }
+            continue;
         }
-        let added = match github.labels_added_by_app(owner, name, *pr).await {
-            Ok(a) => a,
+        let mut reads = match repo_reads(state, team_id, &github, owner, name, &bot).await {
+            Ok(r) => r,
+            Err(e) if crate::clients::github::is_not_found(&*e) => {
+                // Gone or no longer installed: nothing to read.
+                mark(
+                    state,
+                    team_id,
+                    &repo_sk,
+                    &[("gone", AttributeValue::Bool(true))],
+                )
+                .await;
+                continue;
+            }
             Err(e) => {
-                warn!(repo = %repo, pr, error = %e, "Deploy backfill: could not read label history");
+                warn!(repo = %repo.full_name, error = %e, "Deploys backfill: could not read the repository");
                 failed += 1;
                 continue;
             }
         };
-        let empty = Vec::new();
-        for (label, at) in new_deploys(
-            &added,
-            since,
-            &configured[repo],
-            live.get(&(repo.clone(), *pr)).unwrap_or(&empty),
-        ) {
-            let item = ds::stat_item(team_id, &at, repo, *pr, &label, "", "backfill");
-            match state
-                .dynamo
-                .put_item()
-                .table_name(table)
-                .set_item(Some(item))
-                .condition_expression("attribute_not_exists(sk)")
-                .send()
-                .await
-            {
-                Ok(_) => copied += 1,
-                Err(e)
-                    if e.as_service_error()
-                        .is_some_and(|e| e.is_conditional_check_failed_exception()) => {}
-                Err(e) => {
-                    warn!(error = %e, "Deploy backfill: write failed");
-                    failed += 1;
-                }
+        match backfill_repo(state, team_id, &mut reads, since, started).await {
+            Ok(RepoBackfill::Done) => mark(state, team_id, &repo_sk, &[]).await,
+            Ok(RepoBackfill::NoAccess) => {
+                no_access.push(repo.full_name.clone());
+                mark(
+                    state,
+                    team_id,
+                    &repo_sk,
+                    &[("no_access", AttributeValue::Bool(true))],
+                )
+                .await;
+            }
+            Ok(RepoBackfill::OutOfTime) => {
+                info!(
+                    team_id,
+                    "Deploys backfill: out of time, continuing in the next pass"
+                );
+                queue_next_pass(state, team_id).await;
+                return Ok(());
+            }
+            Err(e) => {
+                warn!(repo = %repo.full_name, error = %e, "Deploys backfill: could not read run history");
+                failed += 1;
             }
         }
     }
-    info!(
-        team_id,
-        prs = prs.len(),
-        copied,
-        failed,
-        "Deploy stats backfill pass"
-    );
     if failed > 0 {
         return Err(format!(
-            "{failed} PRs or writes failed; the next request continues"
+            "{failed} repositories could not be read; the next request continues"
         ));
     }
-    state
-        .dynamo
-        .put_item()
-        .table_name(table)
-        .item("pk", av(team_id))
-        .item("sk", av(BACKFILL_MARKER_SK))
-        .item(
+    let mut extra = vec![
+        (
             "since",
             av(&since.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)),
-        )
-        .item("prs", AttributeValue::N(prs.len().to_string()))
-        .item("copied", AttributeValue::N(copied.to_string()))
-        .item("at", av(&Utc::now().to_rfc3339()))
-        .send()
-        .await
-        .map_err(|e| format!("write backfill marker: {e}"))?;
+        ),
+        ("repos", AttributeValue::N(repos.len().to_string())),
+    ];
+    if !no_access.is_empty() {
+        extra.push(("no_access", AttributeValue::Ss(no_access)));
+    }
+    mark(state, team_id, ds::BACKFILL_MARKER_SK, &extra).await;
+    info!(team_id, repos = repos.len(), "Deploys backfill done");
     Ok(())
 }
 
@@ -286,45 +547,30 @@ mod tests {
     use super::*;
 
     #[test]
-    fn copies_only_deploy_labels_in_the_window_not_recorded_live() {
-        let since = chrono::DateTime::parse_from_rfc3339("2026-09-01T00:00:00Z")
+    fn the_backfill_reads_the_whole_window_a_week_at_a_time() {
+        let now = chrono::DateTime::parse_from_rfc3339("2026-11-05T12:00:00Z")
             .unwrap()
             .with_timezone(&Utc);
-        let added = vec![
-            (
-                "CI:DEPLOY_STAGING".to_string(),
-                "2026-08-01T00:00:00Z".to_string(),
-            ),
-            (
-                "CI:DEPLOY_STAGING".to_string(),
-                "2026-09-10T10:00:00Z".to_string(),
-            ),
-            (
-                "coderhelm-review".to_string(),
-                "2026-09-10T10:00:00Z".to_string(),
-            ),
-            ("ship-it".to_string(), "2026-09-11T00:00:00Z".to_string()),
-            (
-                "CI:DEPLOY_STAGING".to_string(),
-                "2026-10-01T12:00:00Z".to_string(),
-            ),
-        ];
-        let live = vec![(
-            "ci:deploy_staging".to_string(),
-            chrono::DateTime::parse_from_rfc3339("2026-10-01T12:02:00Z")
-                .unwrap()
-                .with_timezone(&Utc),
-        )];
-        let got = new_deploys(&added, since, &["ship-it".to_string()], &live);
-        assert_eq!(
-            got,
-            vec![
-                (
-                    "CI:DEPLOY_STAGING".to_string(),
-                    "2026-09-10T10:00:00Z".to_string()
-                ),
-                ("ship-it".to_string(), "2026-09-11T00:00:00Z".to_string()),
-            ]
-        );
+        let since = now - Duration::days(ds::BACKFILL_DAYS);
+        let r = created_ranges(since, now);
+        assert_eq!(r.len(), 26);
+        assert_eq!(r[0], "2026-05-07T12:00:00Z..2026-05-14T12:00:00Z");
+        assert!(r.last().unwrap().ends_with("..2026-11-05T12:00:00Z"));
+        // Each range starts where the last ended: nothing skipped.
+        for w in r.windows(2) {
+            assert_eq!(w[0].split("..").nth(1), w[1].split("..").next());
+        }
+        assert!(created_ranges(now, now).is_empty());
+    }
+
+    #[test]
+    fn missing_actions_access_is_told_apart_from_other_refusals() {
+        let no: GhError = "HTTP status client error (403 Forbidden) for url (u): {\"message\":\"Resource not accessible by integration\"}".into();
+        assert!(is_no_access(&*no));
+        let limited: GhError =
+            "HTTP status client error (403 Forbidden) for url (u): API rate limit exceeded".into();
+        assert!(!is_no_access(&*limited));
+        let gone: GhError = "HTTP status client error (404 Not Found) for url (u)".into();
+        assert!(!is_no_access(&*gone));
     }
 }
