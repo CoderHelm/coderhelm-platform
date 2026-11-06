@@ -745,21 +745,47 @@ fn upload_step(runner: Runner, matrix: bool, dash: usize, key: usize) -> Vec<Str
     out
 }
 
-fn quarantine_step(dash: usize, key: usize) -> Vec<String> {
+/// The step that asks Coderhelm which tests are quarantined. It says in the
+/// run's log and summary which tests it skips, or that every test runs
+/// because Coderhelm couldn't be reached, so a green run never hides what was
+/// left out. `guard`: the test step's own `if:`, copied so the step is
+/// skipped whenever the tests are.
+fn quarantine_step(dash: usize, key: usize, guard: Option<&str>) -> Vec<String> {
     let url = quarantine_url();
     let d = " ".repeat(dash);
     let k = " ".repeat(key);
-    vec![
+    let mut out = vec![
         format!("{d}- name: {QUARANTINE_STEP_NAME}"),
-        format!("{k}# Asks Coderhelm which tests are quarantined, signed with this run's GitHub token."),
+        format!(
+            "{k}# Asks Coderhelm which tests are quarantined, signed with this run's GitHub token."
+        ),
         format!("{k}# If Coderhelm can't be reached, every test runs as before."),
         format!("{k}id: {QUARANTINE_STEP_ID}"),
+    ];
+    if let Some(g) = guard {
+        out.push(format!("{k}if: {}", if_value(g)));
+    }
+    out.extend([
         format!("{k}continue-on-error: true"),
         format!("{k}run: |"),
         format!("{k}  TOKEN=$(curl -sf -H \"Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN\" \"$ACTIONS_ID_TOKEN_REQUEST_URL&audience=coderhelm\" | jq -r .value) || TOKEN=\"\""),
-        format!("{k}  GREP=$(curl -sf -H \"Authorization: Bearer $TOKEN\" {url} | jq -r '.playwright_grep_invert // \"\"') || GREP=\"\""),
+        format!("{k}  if ! GREP=$(curl -sf -H \"Authorization: Bearer $TOKEN\" {url} | jq -er '.playwright_grep_invert // \"\"'); then"),
+        format!("{k}    GREP=\"\""),
+        format!("{k}    echo \"::notice::Coderhelm quarantine list unavailable; running every test\""),
+        format!("{k}    echo \"**Quarantined (skipped):** none, Coderhelm could not be reached so every test ran\" >> \"$GITHUB_STEP_SUMMARY\""),
+        format!("{k}  elif [ -n \"$GREP\" ]; then"),
+        format!("{k}    echo \"::notice::Skipping quarantined tests: $GREP\""),
+        format!("{k}    echo \"**Quarantined (skipped):** \\`$GREP\\`\" >> \"$GITHUB_STEP_SUMMARY\""),
+        format!("{k}  fi"),
         format!("{k}  echo \"grep=$GREP\" >> \"$GITHUB_OUTPUT\""),
-    ]
+    ]);
+    out
+}
+
+/// An `if:` value written so YAML reads it back unchanged: single-quoted,
+/// with quotes doubled.
+fn if_value(cond: &str) -> String {
+    format!("'{}'", cond.trim().replace('\'', "''"))
 }
 
 /// What goes after the test command so it skips quarantined tests. Empty
@@ -908,7 +934,13 @@ pub fn plan(yaml: &str, scripts: &Map<String, Json>, opts: Options) -> Result<Pl
         )?;
         // The step that asks Coderhelm, right before the test step.
         let first = item_first_line(&lines, step, dash);
-        lines.inserts.push((first, quarantine_step(dash, key)));
+        let guard = match step.get("if") {
+            Some(Node::Scalar { value, .. }) if !value.trim().is_empty() => Some(value.as_str()),
+            _ => None,
+        };
+        lines
+            .inserts
+            .push((first, quarantine_step(dash, key, guard)));
         // The flag on the test command.
         lines
             .splices
@@ -1455,7 +1487,7 @@ pub fn upload_snippet(runner: Runner, matrix: bool) -> String {
 /// The quarantine step and the changed test command, for people who add
 /// them by hand.
 pub fn quarantine_snippet(test_command: Option<&str>) -> String {
-    let mut s = quarantine_step(0, 2).join("\n");
+    let mut s = quarantine_step(0, 2, None).join("\n");
     let cmd = test_command.unwrap_or("npx playwright test");
     s.push_str(&format!(
         "\n# then, on your test step:\n- env:\n    QUARANTINED: ${{{{ steps.{QUARANTINE_STEP_ID}.outputs.grep }}}}\n  run: {cmd}{}",

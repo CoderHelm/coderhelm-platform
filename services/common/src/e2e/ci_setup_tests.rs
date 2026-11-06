@@ -181,6 +181,50 @@ fn the_quarantine_step_goes_before_the_test_step_and_wires_the_command() {
     assert_eq!(step["name"].as_str(), Some("Run E2E tests"));
     assert!(step["env"]["QUARANTINED"].as_str().is_some());
     assert!(inspect(out, &scripts()).unwrap().quarantine);
+    // The run says what it skipped, or that every test ran.
+    assert!(
+        out.contains("::notice::Skipping quarantined tests: $GREP"),
+        "{out}"
+    );
+    assert!(
+        out.contains("**Quarantined (skipped):** \\`$GREP\\`"),
+        "{out}"
+    );
+    assert!(
+        out.contains("::notice::Coderhelm quarantine list unavailable; running every test"),
+        "{out}"
+    );
+    // The test step has no if:, so neither does the quarantine step.
+    assert!(doc["jobs"]["e2e"]["steps"][2]["if"].is_null(), "{out}");
+}
+
+#[test]
+fn the_quarantine_step_is_skipped_whenever_the_test_step_is() {
+    let yaml = r#"on: push
+jobs:
+  e2e:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - id: current
+        run: echo "current=true" >> "$GITHUB_OUTPUT"
+      - name: Run E2E tests
+        if: ${{ steps.current.outputs.current != 'false' }}
+        run: npx playwright test
+"#;
+    let p = plan(yaml, &scripts(), both()).unwrap();
+    let doc: Yaml = serde_yaml::from_str(&p.yaml).unwrap();
+    let steps = doc["jobs"]["e2e"]["steps"].as_sequence().unwrap();
+    let q = steps
+        .iter()
+        .find(|s| s["name"].as_str() == Some(QUARANTINE_STEP_NAME))
+        .unwrap();
+    assert_eq!(
+        q["if"].as_str(),
+        Some("${{ steps.current.outputs.current != 'false' }}"),
+        "{}",
+        p.yaml
+    );
 }
 
 #[test]
