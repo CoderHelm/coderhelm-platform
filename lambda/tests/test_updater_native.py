@@ -758,10 +758,10 @@ class AdminApplies(unittest.TestCase):
         u._clients.pop("cloudformation", None)
         u._clients.pop("lambda", None)
 
-    def prepare(self, actor="owner@example.org", scheduled=False, api=None, parent=None):
+    def prepare(self, actor="owner@example.org", scheduled=False, api=None, parent=None, consent=False):
         if api is not None:
             self.cfn.nested["nested-api"] = {"Changes": api}
-        u.begin(self.store, self.env, NOW, "v1.1.0", actor, "update", scheduled=scheduled)
+        u.begin(self.store, self.env, NOW, "v1.1.0", actor, "update", scheduled=scheduled, consent=consent)
         self.cfn.cs = {"Status": "CREATE_COMPLETE", "ExecutionStatus": "AVAILABLE"}
         if parent is not None:
             self.cfn.cs["Changes"] = parent
@@ -874,6 +874,57 @@ class AdminApplies(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "confirm the changes"):
             self.apply()
         self.assertEqual(self.apply(confirm=p["confirm"])["status"], "running")
+
+    def test_an_update_press_that_agreed_to_permission_changes_applies_them_in_one_go(self):
+        role = [{"ResourceChange": {"Action": "Modify", "ResourceType": "AWS::IAM::Policy", "LogicalResourceId": "ServiceRoleDefaultPolicy"}}]
+        r = self.prepare(api=role, consent=True)
+        self.assertEqual(r["native"], "executing")
+        self.assertEqual(self.cfn.executed, ["arn:cs/1"])
+        e = self.store.get(self.store.get("UPDATE_STATE")["running_id"])
+        self.assertEqual(e["confirmed"]["by"], "owner@example.org")
+        self.assertEqual(e["confirmed"]["on"], "update")
+        self.assertIn("Api.ServiceRoleDefaultPolicy", e["confirmed"]["permission_changes"][0])
+
+    def test_the_press_never_agrees_to_data_changes(self):
+        data = [{"ResourceChange": {"Action": "Modify", "ResourceType": "AWS::DynamoDB::GlobalTable", "Replacement": "True", "LogicalResourceId": "Table"}},
+                {"ResourceChange": {"Action": "Add", "ResourceType": "AWS::IAM::Role", "LogicalResourceId": "NewRole"}}]
+        r = self.prepare(api=data, consent=True)
+        self.assertEqual(r["native"], "review")
+        self.assertEqual(self.cfn.executed, [])
+        p = self.pending()
+        self.assertIn("would replace or remove", p["hold"])
+        with self.assertRaisesRegex(ValueError, "confirm the changes"):
+            self.apply()
+        self.assertEqual(self.apply(confirm=p["confirm"])["status"], "running")
+
+    def test_the_press_never_agrees_to_a_role_or_boundary_change(self):
+        r = self.prepare(parent=[{"ResourceChange": {"Action": "Modify", "LogicalResourceId": "DeployBoundary", "ResourceType": "AWS::IAM::ManagedPolicy"}}], consent=True)
+        self.assertEqual(r["native"], "review")
+        self.assertEqual(self.cfn.executed, [])
+        self.assertFalse(self.pending()["can_apply"])
+
+    def test_the_window_never_carries_a_press_consent(self):
+        self.store.put("AUTO_UPDATE", {"auto": True})
+        r = self.prepare(actor="auto", scheduled=True, consent=True,
+                         api=[{"ResourceChange": {"Action": "Add", "ResourceType": "AWS::IAM::Role", "LogicalResourceId": "NewRole"}}])
+        self.assertEqual(r["native"], "review")
+        self.assertEqual(self.cfn.executed, [])
+        self.assertIn("auto-update held: it changes permissions", self.pending()["hold"])
+
+    def test_update_now_passes_the_press_consent_on(self):
+        calls = []
+        orig = u.begin
+        u.begin = lambda *a, **k: calls.append(k) or {"id": "UPDATE#x", "version": "v1.1.0"}
+        orig_mc = u.model_check
+        u.model_check = lambda *a, **k: {"version": "v1.1.0", "ok": True, "results": []}
+        try:
+            u.handle({"action": "update_now", "version": "v1.1.0", "actor": "owner@example.org", "accept_permissions": True},
+                     self.env, self.store, NOW, fetch=lambda repo: [])
+            u.handle({"action": "update_now", "version": "v1.1.0", "actor": "owner@example.org"},
+                     self.env, self.store, NOW, fetch=lambda repo: [])
+        finally:
+            u.begin, u.model_check = orig, orig_mc
+        self.assertEqual([c.get("consent") for c in calls], [True, False])
 
     def test_a_confirmation_for_another_prepared_update_is_refused(self):
         self.prepare(api=[{"ResourceChange": {"Action": "Add", "ResourceType": "AWS::IAM::Role", "LogicalResourceId": "NewRole"}}])

@@ -77,16 +77,27 @@ pub(crate) async fn call(state: &AppState, payload: Value) -> Result<Value, Stat
     Ok(body)
 }
 
-/// The updater's `{ok, error}` as an HTTP answer: a refused request is a
-/// 400, with the model check when that is what refused it.
+/// The updater's `{ok, error}` as an HTTP answer. An answer the updater
+/// marks ok is a 200, whatever state it names (an Update pressed while the
+/// release check runs answers `state: "checking"`: recorded, not refused).
+/// A refusal that is the install's state rather than a bad request is a 409
+/// with that state: the release check holds the update (`model_check`), or
+/// the release isn't ready yet (`waiting`). The dashboard shows those in the
+/// update card, never as an error. Any other refusal is a 400.
 fn answer(body: Value) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     if body.get("ok").and_then(Value::as_bool) == Some(false) {
         let msg = body.get("error").cloned().unwrap_or(json!("refused"));
         let mut out = json!({ "error": msg });
+        let mut code = StatusCode::BAD_REQUEST;
         if let Some(m) = body.get("model_check").filter(|m| !m.is_null()) {
             out["model_check"] = m.clone();
+            code = StatusCode::CONFLICT;
         }
-        return Err((StatusCode::BAD_REQUEST, Json(out)));
+        if body.get("waiting").and_then(Value::as_bool) == Some(true) {
+            out["waiting"] = json!(true);
+            code = StatusCode::CONFLICT;
+        }
+        return Err((code, Json(out)));
     }
     Ok(Json(body))
 }
@@ -198,9 +209,11 @@ pub async fn set_uninstall_mode(
 }
 
 /// POST /api/system/update: update to `version` (default: the latest).
-/// The updater checks every model the release calls first and refuses
-/// while one is refused; `skip_check` passes only a failure on a model the
-/// release doesn't call.
+/// The updater checks every model the release calls first. Pressed while
+/// that check runs, the press is recorded (`state: "checking"`) and the
+/// update starts by itself once the check passes; a model the release calls
+/// that is refused answers 409 with the check. `skip_check` passes only a
+/// failure on a model the release doesn't call.
 pub async fn update_now(
     State(state): State<Arc<AppState>>,
     Extension(claims): Extension<Claims>,
@@ -213,9 +226,13 @@ pub async fn update_now(
         .and_then(Value::as_str)
         .map(str::to_string);
     let skip = body.get("skip_check").and_then(Value::as_bool) == Some(true);
+    // The admin pressed Update next to "it may change what Coderhelm's own
+    // roles may do": their OK for permission changes inside the boundary,
+    // never for data (lambda/updater, consented).
+    let accept = body.get("accept_permissions").and_then(Value::as_bool) == Some(true);
     let body = call(
         &state,
-        json!({ "action": "update_now", "version": version, "actor": claims.email, "skip_check": skip }),
+        json!({ "action": "update_now", "version": version, "actor": claims.email, "skip_check": skip, "accept_permissions": accept }),
     )
     .await
     .map_err(status_only)?;
@@ -554,9 +571,29 @@ mod tests {
         let r = answer(
             json!({"ok": false, "error": "Update to v1.3.0 needs your action", "model_check": {"version": "v1.3.0", "ok": false}}),
         );
-        let (_, body) = r.unwrap_err();
+        let (code, body) = r.unwrap_err();
+        assert_eq!(code, StatusCode::CONFLICT);
         assert_eq!(body.0["model_check"]["version"], "v1.3.0");
         assert!(answer(json!({"ok": true, "version": "v1.2.0"})).is_ok());
+    }
+
+    #[test]
+    fn update_pressed_while_the_check_runs_is_a_200_with_its_state() {
+        let r = answer(json!({
+            "ok": true, "state": "checking", "version": "v1.3.0",
+            "request": {"version": "v1.3.0", "actor": "admin@acme.example", "status": "waiting"},
+            "model_check": {"version": "v1.3.0", "pending": true, "ok": false, "results": []}
+        }))
+        .expect("a recorded press is not an error");
+        assert_eq!(r.0["state"], "checking");
+        assert_eq!(r.0["request"]["status"], "waiting");
+        // A release still publishing: the state, as a 409 the card shows.
+        let (code, body) = answer(
+            json!({"ok": false, "error": "v1.3.0 is still publishing; try again in a minute", "waiting": true}),
+        )
+        .unwrap_err();
+        assert_eq!(code, StatusCode::CONFLICT);
+        assert_eq!(body.0["waiting"], true);
     }
 
     fn claims(role: &str) -> Claims {
