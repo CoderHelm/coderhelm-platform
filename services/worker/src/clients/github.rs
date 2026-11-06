@@ -58,8 +58,88 @@ async fn ok_or_body(
         return Ok(resp);
     }
     let url = resp.url().clone();
+    let header = |name: &str| {
+        resp.headers()
+            .get(name)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string)
+    };
+    let (retry_after, remaining, reset) = (
+        header("retry-after"),
+        header("x-ratelimit-remaining"),
+        header("x-ratelimit-reset"),
+    );
     let body = resp.text().await.unwrap_or_default();
-    Err(status_error_message(status, url.as_str(), &body).into())
+    let message = status_error_message(status, url.as_str(), &body);
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    match rate_limit_wait(
+        status.as_u16(),
+        retry_after.as_deref(),
+        remaining.as_deref(),
+        reset.as_deref(),
+        &body,
+        now,
+    ) {
+        Some(wait_secs) => Err(Box::new(RateLimited { wait_secs, message })),
+        None => Err(message.into()),
+    }
+}
+
+/// GitHub refused a request for its rate limit (primary or secondary). The
+/// message is the usual status line, so string checks still match; the wait
+/// is how long GitHub asked for.
+#[derive(Debug)]
+pub struct RateLimited {
+    pub wait_secs: u64,
+    message: String,
+}
+
+impl std::fmt::Display for RateLimited {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for RateLimited {}
+
+/// When a response is a rate limit, how long to wait before asking again:
+/// a 429, or a 403 with no requests left or a body that says rate limit.
+/// `retry-after` wins, then the primary limit's reset time, else a minute.
+fn rate_limit_wait(
+    status: u16,
+    retry_after: Option<&str>,
+    remaining: Option<&str>,
+    reset: Option<&str>,
+    body: &str,
+    now: u64,
+) -> Option<u64> {
+    let spent = remaining.map(str::trim) == Some("0");
+    let limited = status == 429
+        || (status == 403 && (spent || body.to_ascii_lowercase().contains("rate limit")));
+    if !limited {
+        return None;
+    }
+    let after = retry_after.and_then(|s| s.trim().parse::<u64>().ok());
+    let until_reset = reset
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .filter(|_| spent)
+        .map(|r| r.saturating_sub(now) + 1);
+    Some(after.or(until_reset).unwrap_or(60).max(1))
+}
+
+/// How long GitHub asked to wait, when this error is its rate limit. Reads
+/// the typed error, and the status line for errors that lost their type.
+pub fn rate_limited(e: &(dyn std::error::Error + Send + Sync + 'static)) -> Option<u64> {
+    if let Some(r) = e.downcast_ref::<RateLimited>() {
+        return Some(r.wait_secs);
+    }
+    let m = e.to_string();
+    (m.contains("(429 Too Many Requests)")
+        || (m.contains("(403 Forbidden)") && m.to_ascii_lowercase().contains("rate limit")))
+    .then_some(60)
 }
 
 fn status_error_message(status: reqwest::StatusCode, url: &str, body: &str) -> String {
@@ -4533,6 +4613,61 @@ mod status_error_tests {
         let forbidden: Box<dyn std::error::Error + Send + Sync> =
             status_error_message(reqwest::StatusCode::FORBIDDEN, "u", "too_large").into();
         assert!(!is_not_found(&*forbidden));
+    }
+
+    #[test]
+    fn rate_limits_are_told_apart_with_their_wait() {
+        let now = 1_000;
+        // Primary limit spent: wait until the reset.
+        assert_eq!(
+            rate_limit_wait(403, None, Some("0"), Some("1300"), "", now),
+            Some(301)
+        );
+        // Secondary limit: retry-after wins.
+        assert_eq!(
+            rate_limit_wait(
+                403,
+                Some("45"),
+                Some("12"),
+                None,
+                "You have exceeded a secondary rate limit",
+                now
+            ),
+            Some(45)
+        );
+        assert_eq!(rate_limit_wait(429, None, None, None, "", now), Some(60));
+        // Other refusals are not rate limits.
+        assert_eq!(
+            rate_limit_wait(
+                403,
+                None,
+                Some("4000"),
+                None,
+                "Resource not accessible by integration",
+                now
+            ),
+            None
+        );
+        assert_eq!(rate_limit_wait(404, None, Some("0"), None, "", now), None);
+
+        let typed: Box<dyn std::error::Error + Send + Sync> = Box::new(RateLimited {
+            wait_secs: 120,
+            message: status_error_message(reqwest::StatusCode::FORBIDDEN, "u", "x"),
+        });
+        assert_eq!(rate_limited(&*typed), Some(120));
+        // Still reads as the status line it carries.
+        assert!(typed.to_string().contains("(403 Forbidden)"));
+        assert!(!is_not_found(&*typed));
+        let text: Box<dyn std::error::Error + Send + Sync> = status_error_message(
+            reqwest::StatusCode::FORBIDDEN,
+            "u",
+            "API rate limit exceeded",
+        )
+        .into();
+        assert_eq!(rate_limited(&*text), Some(60));
+        let other: Box<dyn std::error::Error + Send + Sync> =
+            status_error_message(reqwest::StatusCode::FORBIDDEN, "u", "too_large").into();
+        assert_eq!(rate_limited(&*other), None);
     }
 }
 

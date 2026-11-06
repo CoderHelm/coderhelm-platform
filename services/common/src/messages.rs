@@ -1169,6 +1169,10 @@ pub struct OnboardRepo {
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
 pub struct DeployStatsBackfillMessage {
     pub team_id: String,
+    /// Set on a pass the backfill queued for itself: the lease that pass
+    /// holds, so it continues while any other ask waits its turn.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lease: Option<String>,
 }
 
 /// One completed workflow run, from its webhook: the run's own fields
@@ -1180,6 +1184,9 @@ pub struct DeployRunMessage {
     pub repo_owner: String,
     pub repo_name: String,
     pub run: serde_json::Value,
+    /// How many times GitHub's rate limit sent this run back.
+    #[serde(default)]
+    pub attempts: u32,
 }
 
 /// Work out suggested hidden fields for one database source from its table

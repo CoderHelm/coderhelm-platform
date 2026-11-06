@@ -668,7 +668,7 @@ async fn handle_message(state: Arc<WorkerState>, message: models::WorkerMessage)
         }
         models::WorkerMessage::DeployStatsBackfill(msg) => {
             info!(team_id = %msg.team_id, "Deploy stats backfill");
-            if let Err(e) = passes::deploy_stats::backfill(&state, &msg.team_id).await {
+            if let Err(e) = passes::deploy_stats::backfill(&state, &msg).await {
                 error!("Deploy stats backfill failed: {e:?}");
             }
         }

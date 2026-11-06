@@ -27,6 +27,10 @@ pub const BACKFILL_MARKER_SK: &str = "ANALYTICS#deploy-runs-backfilled#v1";
 pub const BACKFILL_REPO_PREFIX: &str = "ANALYTICS#deploy-runs-backfilled#v1#repo#";
 /// Set when the backfill was last asked for, so a page load asks at most hourly.
 pub const BACKFILL_QUEUED_SK: &str = "ANALYTICS#deploy-runs-backfill-queued";
+/// While the backfill runs: how many repositories it has read of how many
+/// (`repos_read`, `repos_total`), and the lease of the one pass reading
+/// (`lease`, `lease_until`), so a page load never starts a second chain.
+pub const BACKFILL_PROGRESS_SK: &str = "ANALYTICS#deploy-runs-backfill-progress";
 /// How far back the backfill reads: the longest period the page shows (90
 /// days) and the one before it.
 pub const BACKFILL_DAYS: i64 = 182;

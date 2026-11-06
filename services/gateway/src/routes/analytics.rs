@@ -1000,6 +1000,42 @@ pub struct DeployBackfill {
     pub since: Option<String>,
     /// Repositories whose workflow runs CoderHelm can't read.
     pub no_access: Vec<String>,
+    /// Repositories the backfill gave up on, with why, by name.
+    pub not_read: Vec<(String, String)>,
+    /// While it runs: repositories read, of how many.
+    pub progress: Option<(u64, u64)>,
+}
+
+impl DeployBackfill {
+    /// From the backfill's marker (set once done) and its progress item
+    /// (written while it runs).
+    pub fn from_items(marker: Option<&Item>, progress: Option<&Item>) -> DeployBackfill {
+        let n = |i: &Item, k: &str| {
+            i.get(k)
+                .and_then(|v| v.as_n().ok())
+                .and_then(|x| x.parse::<u64>().ok())
+        };
+        let mut not_read: Vec<(String, String)> = marker
+            .and_then(|i| i.get("not_read"))
+            .and_then(|v| v.as_m().ok())
+            .map(|m| {
+                m.iter()
+                    .map(|(repo, why)| (repo.clone(), why.as_s().cloned().unwrap_or_default()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        not_read.sort();
+        DeployBackfill {
+            since: marker.map(|i| s(i, "since")).filter(|x| !x.is_empty()),
+            no_access: marker
+                .and_then(|i| i.get("no_access"))
+                .and_then(|v| v.as_ss().ok())
+                .cloned()
+                .unwrap_or_default(),
+            not_read,
+            progress: progress.and_then(|p| Some((n(p, "repos_read")?, n(p, "repos_total")?))),
+        }
+    }
 }
 
 /// Adds deploys to the comparison: counts in each period, running totals by
@@ -1098,6 +1134,18 @@ pub fn add_deploys(
         "running"
     });
     compared["deploys_no_access"] = json!(backfill.no_access);
+    compared["deploys_not_read"] = json!(backfill
+        .not_read
+        .iter()
+        .map(|(repo, reason)| json!({"repo": repo, "reason": reason}))
+        .collect::<Vec<_>>());
+    // Real progress while earlier deploys are read: repositories read of all.
+    compared["deploys_backfill_progress"] = match backfill.progress {
+        Some((read, total)) if backfill.since.is_none() && total > 0 => {
+            json!({"read": read.min(total), "total": total})
+        }
+        _ => Value::Null,
+    };
 }
 
 /// Asks the worker to read the team's earlier deploys from GitHub, at most
@@ -1124,6 +1172,7 @@ async fn ask_for_deploy_backfill(state: &AppState, team: &str) {
     let message = crate::models::WorkerMessage::DeployStatsBackfill(
         crate::models::DeployStatsBackfillMessage {
             team_id: team.to_string(),
+            lease: None,
         },
     );
     if super::github_webhook::send_to_queue(state, &state.config.ticket_queue_url, &message)
@@ -1189,6 +1238,7 @@ pub async fn queue_deploy_run(state: &AppState, payload: &Value, team_id: &str) 
         repo_owner: repo["owner"]["login"].as_str().unwrap_or("").to_string(),
         repo_name: repo["name"].as_str().unwrap_or("").to_string(),
         run: deploy_run_fields(run),
+        attempts: 0,
     });
     if super::github_webhook::send_to_queue(state, &state.config.ticket_queue_url, &message)
         .await
@@ -2175,25 +2225,27 @@ pub async fn get_analytics(
         ),
     );
     let backfill_marker = async {
-        state
-            .dynamo
-            .get_item()
-            .table_name(&state.config.settings_table_name)
-            .key("pk", av(&team))
-            .key("sk", av(common::deploy_stats::BACKFILL_MARKER_SK))
-            .send()
-            .await
-            .ok()
-            .and_then(|r| {
-                r.item().map(|i| DeployBackfill {
-                    since: Some(s(i, "since")).filter(|x| !x.is_empty()),
-                    no_access: i
-                        .get("no_access")
-                        .and_then(|v| v.as_ss().ok())
-                        .cloned()
-                        .unwrap_or_default(),
-                })
-            })
+        let item = |sk: &'static str| {
+            let state = &state;
+            let team = &team;
+            async move {
+                state
+                    .dynamo
+                    .get_item()
+                    .table_name(&state.config.settings_table_name)
+                    .key("pk", av(team))
+                    .key("sk", av(sk))
+                    .send()
+                    .await
+                    .ok()
+                    .and_then(|r| r.item().cloned())
+            }
+        };
+        let (marker, progress) = tokio::join!(
+            item(common::deploy_stats::BACKFILL_MARKER_SK),
+            item(common::deploy_stats::BACKFILL_PROGRESS_SK),
+        );
+        DeployBackfill::from_items(marker.as_ref(), progress.as_ref())
     };
     let (runs, reviews, lookups, traces, known, deploys, backfilled, metered) = tokio::join!(
         load_runs(&state, &team, whole),
@@ -2205,7 +2257,7 @@ pub async fn get_analytics(
         backfill_marker,
         load_metered(&state, &team, whole),
     );
-    if backfilled.as_ref().is_none_or(|b| b.since.is_none()) && claims.support_view.is_none() {
+    if backfilled.since.is_none() && claims.support_view.is_none() {
         ask_for_deploy_backfill(&state, &team).await;
     }
     let deploys: Vec<DeployRow> = deploys
@@ -2250,7 +2302,7 @@ pub async fn get_analytics(
         previous_full,
         &deploys,
         repo,
-        &backfilled.unwrap_or_default(),
+        &backfilled,
     );
     out["days"] = json!(if month_to_date {
         window.day_slots()
@@ -2418,7 +2470,7 @@ mod tests {
     fn known(days_ago: i64) -> DeployBackfill {
         DeployBackfill {
             since: Some(at(days_ago)),
-            no_access: vec![],
+            ..Default::default()
         }
     }
 
@@ -2494,10 +2546,57 @@ mod tests {
         let b = DeployBackfill {
             since: Some(at(182)),
             no_access: vec!["acme/infra".into()],
+            ..Default::default()
         };
         add_deploys(&mut c, w, p, None, &[], None, &b);
         assert_eq!(c["deploys_no_access"], json!(["acme/infra"]));
         assert_eq!(c["deploys_comparable"], true);
+    }
+
+    /// The page showed "Counting earlier deploys" for hours: while the
+    /// backfill runs it says how far it got, and once done it names the
+    /// repositories it gave up on instead of counting forever.
+    #[test]
+    fn the_backfill_says_how_far_it_got_and_names_what_it_could_not_read() {
+        let (w, p) = windows();
+        let progress: Item = HashMap::from([
+            ("repos_read".to_string(), AttributeValue::N("12".into())),
+            ("repos_total".to_string(), AttributeValue::N("40".into())),
+            ("lease".to_string(), AttributeValue::S("x".into())),
+        ]);
+        let running = DeployBackfill::from_items(None, Some(&progress));
+        assert_eq!(running.progress, Some((12, 40)));
+        let rows = vec![dep(2, 1, "staging", "succeeded")];
+        let mut c = comparison(w, p, None, &[], &[], &[]);
+        add_deploys(&mut c, w, p, None, &rows, None, &running);
+        assert_eq!(c["deploys_backfill"], "running");
+        assert_eq!(
+            c["deploys_backfill_progress"],
+            json!({"read": 12, "total": 40})
+        );
+        // The current period counts whatever the backfill's state.
+        assert_eq!(c["current"]["deploys"], 1);
+
+        let marker: Item = HashMap::from([
+            ("since".to_string(), AttributeValue::S(at(182))),
+            (
+                "not_read".to_string(),
+                AttributeValue::M(HashMap::from([(
+                    "acme/big".to_string(),
+                    AttributeValue::S("GitHub answered 502 Bad Gateway".into()),
+                )])),
+            ),
+        ]);
+        let done = DeployBackfill::from_items(Some(&marker), Some(&progress));
+        let mut d = comparison(w, p, None, &[], &[], &[]);
+        add_deploys(&mut d, w, p, None, &rows, None, &done);
+        assert_eq!(d["deploys_backfill"], "done");
+        assert_eq!(d["deploys_backfill_progress"], Value::Null);
+        assert_eq!(
+            d["deploys_not_read"],
+            json!([{"repo": "acme/big", "reason": "GitHub answered 502 Bad Gateway"}])
+        );
+        assert_eq!(d["deploys_previous_state"], "known");
     }
 
     #[test]
