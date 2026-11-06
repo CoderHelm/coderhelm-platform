@@ -672,6 +672,11 @@ async fn handle_message(state: Arc<WorkerState>, message: models::WorkerMessage)
                 error!("Deploy stats backfill failed: {e:?}");
             }
         }
+        models::WorkerMessage::DeployRun(msg) => {
+            if let Err(e) = passes::deploy_stats::record_run(&state, &msg).await {
+                warn!("Deploy run not recorded: {e}");
+            }
+        }
         models::WorkerMessage::WeeklySummaryTest(msg) => {
             info!(team_id = %msg.team_id, "Weekly summary test email");
             if let Err(e) = passes::weekly_summary::run_test(&state, msg).await {

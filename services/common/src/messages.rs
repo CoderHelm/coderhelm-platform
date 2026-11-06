@@ -127,10 +127,14 @@ pub enum WorkerMessage {
     /// unless WEEKLY_SUMMARY_ENABLED is true.
     #[serde(rename = "weekly_summary")]
     WeeklySummary,
-    /// Copy a team's earlier deploys from GitHub's label history into
-    /// deploy stats, once (asked for by the analytics page).
+    /// Read a team's earlier deploys CoderHelm started from GitHub's run
+    /// history (asked for by the analytics page, continued until done).
     #[serde(rename = "deploy_stats_backfill")]
     DeployStatsBackfill(DeployStatsBackfillMessage),
+    /// Record one completed workflow run CoderHelm may have started, when it
+    /// deployed (`common::deploy_stats`).
+    #[serde(rename = "deploy_run")]
+    DeployRun(DeployRunMessage),
     /// One test weekly summary for a team, to one address only.
     #[serde(rename = "weekly_summary_test")]
     WeeklySummaryTest(WeeklySummaryTestMessage),
@@ -402,6 +406,7 @@ impl WorkerMessage {
             | WorkerMessage::GraphIndex(_)
             | WorkerMessage::WeeklySummary
             | WorkerMessage::DeployStatsBackfill(_)
+            | WorkerMessage::DeployRun(_)
             | WorkerMessage::WeeklySummaryTest(_)
             | WorkerMessage::UsageReconcile(_)
             | WorkerMessage::UsageRecord(_)
@@ -467,6 +472,7 @@ impl WorkerMessage {
             | WorkerMessage::KnowledgeSync(_)
             | WorkerMessage::WeeklySummary
             | WorkerMessage::DeployStatsBackfill(_)
+            | WorkerMessage::DeployRun(_)
             | WorkerMessage::WeeklySummaryTest(_)
             | WorkerMessage::UsageReconcile(_)
             | WorkerMessage::UsageRecord(_)
@@ -1080,10 +1086,21 @@ pub struct OnboardRepo {
     pub default_branch: String,
 }
 
-/// Copy one team's earlier deploys from GitHub (`common::deploy_stats`).
+/// Read one team's earlier deploys from GitHub (`common::deploy_stats`).
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
 pub struct DeployStatsBackfillMessage {
     pub team_id: String,
+}
+
+/// One completed workflow run, from its webhook: the run's own fields
+/// (`id`, `name`, `path`, `event`, `head_branch`, `head_sha`, `status`,
+/// `conclusion`, `created_at`, `actor`, `triggering_actor`).
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+pub struct DeployRunMessage {
+    pub team_id: String,
+    pub repo_owner: String,
+    pub repo_name: String,
+    pub run: serde_json::Value,
 }
 
 /// Work out suggested hidden fields for one database source from its table

@@ -224,6 +224,7 @@ pub async fn get_config(
         "release_notes_guide": item_str(&item, "release_notes_guide", ""),
         "release_notes_instructions": item_str(&item, "release_notes_instructions", ""),
         "deploy_label": item_str(&item, "deploy_label", ""),
+        "deploy_workflows": item_str(&item, "deploy_workflows", ""),
         "health_log_groups": log_groups,
         "reminders_enabled": item_bool(&item, "reminders_enabled", false),
         // Where reminders and release notes failures post. Shown only as a
@@ -286,6 +287,16 @@ pub async fn update_config(
         .trim()
         .chars()
         .take(200)
+        .collect();
+    // Workflows that deploy though their names and jobs don't say where
+    // (`file.yml=production`, comma separated): read by deploy stats.
+    let deploy_workflows: String = body["deploy_workflows"]
+        .as_str()
+        .unwrap_or("")
+        .trim()
+        .chars()
+        .filter(|c| !c.is_control())
+        .take(500)
         .collect();
     // Reminder channels (Teams, Slack): each kept unless the body sets or
     // clears it, and only on its channel's webhook hosts, so the worker never
@@ -383,6 +394,7 @@ pub async fn update_config(
             attr_bool(body["verify_tests"].as_bool().unwrap_or(false)),
         )
         .item("deploy_label", attr_s(&deploy_label))
+        .item("deploy_workflows", attr_s(&deploy_workflows))
         .item(
             "require_tests",
             attr_bool(body["require_tests"].as_bool().unwrap_or(false)),

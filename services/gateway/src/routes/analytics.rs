@@ -917,80 +917,96 @@ pub fn comparison(
     })
 }
 
-/// One deploy CoderHelm started (`common::deploy_stats`).
+/// One deploy CoderHelm started (`common::deploy_stats`): one run, one
+/// environment.
 #[derive(Debug, Clone, Default)]
 pub struct DeployRow {
-    pub sk: String,
     pub created_at: String,
     pub repo: String,
-    pub pr: u64,
-    pub label: String,
-    pub target: String,
-    pub head: String,
-    pub source: String,
+    pub run_id: u64,
+    /// `preview`, `staging`, `production` or `other`.
+    pub environment: String,
+    pub environment_name: String,
+    /// `succeeded` or `failed`.
+    pub outcome: String,
 }
 
 impl DeployRow {
     fn from_item(i: &Item) -> DeployRow {
         DeployRow {
-            sk: s(i, "sk"),
             created_at: s(i, "created_at"),
             repo: s(i, "repo"),
-            pr: n(i, "pr_number") as u64,
-            label: s(i, "label"),
-            target: s(i, "target"),
-            head: s(i, "head_sha"),
-            source: s(i, "source"),
+            run_id: n(i, "run_id") as u64,
+            environment: s(i, "environment"),
+            environment_name: s(i, "environment_name"),
+            outcome: s(i, "outcome"),
         }
     }
     fn key(&self) -> String {
-        common::deploy_stats::dedupe_key(&self.repo, self.pr, &self.label, &self.head, &self.sk)
+        format!(
+            "{}#{}#{}",
+            self.repo.to_lowercase(),
+            self.run_id,
+            self.environment_name.to_lowercase()
+        )
     }
 }
 
-/// Each deploy once (a label added again on the same commit is one deploy),
-/// at its first time.
+/// Each deploy once (one run's deploy to one environment).
 fn distinct_deploys<'a>(rows: &[&'a DeployRow]) -> Vec<&'a DeployRow> {
-    let mut first: HashMap<String, &'a DeployRow> = HashMap::new();
-    for r in rows {
-        let e = first.entry(r.key()).or_insert(r);
-        if r.created_at < e.created_at {
-            *e = r;
-        }
-    }
-    let mut out: Vec<&DeployRow> = first.into_values().collect();
+    let mut seen = std::collections::HashSet::new();
+    let mut out: Vec<&DeployRow> = rows
+        .iter()
+        .copied()
+        .filter(|r| seen.insert(r.key()))
+        .collect();
     out.sort_by(|a, b| a.created_at.cmp(&b.created_at));
     out
 }
 
-/// How many deploys, and where they went.
+/// How many deploys, where they went, and how many failed.
 pub fn deploy_counts(rows: &[&DeployRow]) -> Value {
     let d = distinct_deploys(rows);
-    let to = |t: &str| d.iter().filter(|r| r.target == t).count();
+    let to = |t: &str| d.iter().filter(|r| r.environment == t).count();
+    let failed = |t: Option<&str>| {
+        d.iter()
+            .filter(|r| r.outcome == "failed" && t.is_none_or(|t| r.environment == t))
+            .count()
+    };
+    let other = d.len() - to("preview") - to("staging") - to("production");
     json!({
         "deploys": d.len(),
         "deploys_preview": to("preview"),
         "deploys_staging": to("staging"),
-        "deploys_prod": to("prod"),
-        "deploys_other": d.len() - to("preview") - to("staging") - to("prod"),
+        "deploys_prod": to("production"),
+        "deploys_other": other,
+        "deploys_succeeded": d.len() - failed(None),
+        "deploys_failed": failed(None),
+        "deploys_preview_failed": failed(Some("preview")),
+        "deploys_staging_failed": failed(Some("staging")),
+        "deploys_prod_failed": failed(Some("production")),
+        "deploys_other_failed": d
+            .iter()
+            .filter(|r| r.outcome == "failed")
+            .filter(|r| !matches!(r.environment.as_str(), "preview" | "staging" | "production"))
+            .count(),
     })
 }
 
-/// Since when deploys are known: the backfill's start once it finished,
-/// else the first deploy recorded live (none: nothing recorded yet).
-pub fn deploys_since(backfilled_since: Option<&str>, rows: &[DeployRow]) -> Option<String> {
-    if let Some(s) = backfilled_since.filter(|s| !s.is_empty()) {
-        return Some(s.to_string());
-    }
-    rows.iter()
-        .filter(|r| r.source != "backfill")
-        .map(|r| r.created_at.clone())
-        .min()
+/// Where the backfill of earlier deploys stands, from its marker.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct DeployBackfill {
+    /// From when deploys are known: set once every repository was read.
+    pub since: Option<String>,
+    /// Repositories whose workflow runs CoderHelm can't read.
+    pub no_access: Vec<String>,
 }
 
 /// Adds deploys to the comparison: counts in each period, running totals by
-/// day, since when they are known, and whether the periods compare (both
-/// must start after deploys were known).
+/// day, and the state of each period. A period is `counting` while earlier
+/// deploys are still being read, `known` once they were (a real 0 then
+/// compares like any number), and `before_records` when it starts before
+/// the earliest deploys GitHub's history was read for.
 #[allow(clippy::too_many_arguments)]
 pub fn add_deploys(
     compared: &mut Value,
@@ -999,8 +1015,7 @@ pub fn add_deploys(
     previous_full: Option<Window>,
     rows: &[DeployRow],
     repo: Option<&str>,
-    since: Option<&str>,
-    backfill_done: bool,
+    backfill: &DeployBackfill,
 ) {
     let in_repo: Vec<&DeployRow> = rows
         .iter()
@@ -1020,12 +1035,26 @@ pub fn add_deploys(
             }
         }
     };
+    let known_from = backfill
+        .since
+        .as_deref()
+        .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+        .map(|t| t.with_timezone(&Utc));
+    // Webhooks record every deploy from now on; a period is complete once
+    // the backfill read back to its start.
+    let state = |w: Window| match known_from {
+        None => "counting",
+        Some(k) if k > w.start => "before_records",
+        Some(_) => "known",
+    };
     let (cur, old) = (pick(window), pick(prev));
     merge(&mut compared["current"], deploy_counts(&cur));
     merge(&mut compared["previous"], deploy_counts(&old));
+    let mut states = vec![state(prev)];
     if let Some(w) = previous_full {
         if compared["previous_full"].is_object() {
             merge(&mut compared["previous_full"], deploy_counts(&pick(w)));
+            states.push(state(w));
         }
     }
     let running = |w: Window, rows: &[&DeployRow]| -> Vec<usize> {
@@ -1040,29 +1069,39 @@ pub fn add_deploys(
         }
         out
     };
+    let prev_known = state(prev) == "known";
     let (c, p) = (running(window, &cur), running(prev, &old));
     if let Some(days) = compared["daily"].as_array_mut() {
         for (i, d) in days.iter_mut().enumerate() {
             d["deploys"] = json!(c.get(i).copied().unwrap_or(0));
-            d["previous_deploys"] = if d["previous_day"].is_null() {
+            d["previous_deploys"] = if d["previous_day"].is_null() || !prev_known {
                 Value::Null
             } else {
                 json!(p.get(i).copied().unwrap_or(0))
             };
         }
     }
-    let known_from = since
-        .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
-        .map(|t| t.with_timezone(&Utc));
-    let starts = [Some(prev.start), previous_full.map(|w| w.start)];
-    compared["deploys_since"] = json!(since);
-    compared["deploys_comparable"] =
-        json!(known_from.is_some_and(|k| starts.iter().flatten().all(|s| *s >= k)));
-    compared["deploys_backfill"] = json!(if backfill_done { "done" } else { "running" });
+    // The worst state of the earlier periods decides the comparison.
+    let previous_state = if states.contains(&"counting") {
+        "counting"
+    } else if states.contains(&"before_records") {
+        "before_records"
+    } else {
+        "known"
+    };
+    compared["deploys_since"] = json!(backfill.since);
+    compared["deploys_previous_state"] = json!(previous_state);
+    compared["deploys_comparable"] = json!(previous_state == "known");
+    compared["deploys_backfill"] = json!(if backfill.since.is_some() {
+        "done"
+    } else {
+        "running"
+    });
+    compared["deploys_no_access"] = json!(backfill.no_access);
 }
 
-/// Asks the worker to copy the team's earlier deploys from GitHub, at most
-/// once an hour, until the copy is done. Never from a support view.
+/// Asks the worker to read the team's earlier deploys from GitHub, at most
+/// once an hour, until it is done. Never from a support view.
 async fn ask_for_deploy_backfill(state: &AppState, team: &str) {
     let table = &state.config.settings_table_name;
     let cutoff = (Utc::now() - Duration::hours(1)).to_rfc3339();
@@ -1092,6 +1131,70 @@ async fn ask_for_deploy_backfill(state: &AppState, team: &str) {
         .is_err()
     {
         warn!("Could not queue the deploy stats backfill");
+    }
+}
+
+/// Whether a completed workflow run from a webhook may be a deploy
+/// CoderHelm started: its app triggered it, or another bot pushed (a merge
+/// queue merging a PR CoderHelm merged). A person's run never is.
+pub fn deploy_run_worth_reading(run: &Value, bot_login: &str) -> bool {
+    let concluded = matches!(
+        run["conclusion"].as_str(),
+        Some("success" | "failure" | "timed_out" | "startup_failure" | "action_required")
+    );
+    let (_, kind) = common::deploy_stats::trigger(run);
+    concluded
+        && (common::deploy_stats::started_by_coderhelm(run, bot_login)
+            || (kind == "Bot" && run["event"] == "push"))
+}
+
+/// The run fields the worker reads, so the message stays small.
+pub fn deploy_run_fields(run: &Value) -> Value {
+    let mut out = serde_json::Map::new();
+    for k in [
+        "id",
+        "name",
+        "path",
+        "event",
+        "head_branch",
+        "head_sha",
+        "status",
+        "conclusion",
+        "created_at",
+    ] {
+        out.insert(k.to_string(), run[k].clone());
+    }
+    for k in ["actor", "triggering_actor"] {
+        out.insert(
+            k.to_string(),
+            json!({"login": run[k]["login"], "type": run[k]["type"]}),
+        );
+    }
+    Value::Object(out)
+}
+
+/// From a `workflow_run` webhook: queue the run for the worker when it may be
+/// a deploy CoderHelm started (`common::deploy_stats`).
+pub async fn queue_deploy_run(state: &AppState, payload: &Value, team_id: &str) {
+    let run = &payload["workflow_run"];
+    let Some(slug) = crate::auth::github_app::app_slug(state).await else {
+        return;
+    };
+    if !deploy_run_worth_reading(run, &format!("{slug}[bot]")) {
+        return;
+    }
+    let repo = &payload["repository"];
+    let message = crate::models::WorkerMessage::DeployRun(crate::models::DeployRunMessage {
+        team_id: team_id.to_string(),
+        repo_owner: repo["owner"]["login"].as_str().unwrap_or("").to_string(),
+        repo_name: repo["name"].as_str().unwrap_or("").to_string(),
+        run: deploy_run_fields(run),
+    });
+    if super::github_webhook::send_to_queue(state, &state.config.ticket_queue_url, &message)
+        .await
+        .is_err()
+    {
+        warn!("Could not queue a workflow run for deploy stats");
     }
 }
 
@@ -2081,7 +2184,16 @@ pub async fn get_analytics(
             .send()
             .await
             .ok()
-            .and_then(|r| r.item().map(|i| s(i, "since")))
+            .and_then(|r| {
+                r.item().map(|i| DeployBackfill {
+                    since: Some(s(i, "since")).filter(|x| !x.is_empty()),
+                    no_access: i
+                        .get("no_access")
+                        .and_then(|v| v.as_ss().ok())
+                        .cloned()
+                        .unwrap_or_default(),
+                })
+            })
     };
     let (runs, reviews, lookups, traces, known, deploys, backfilled, metered) = tokio::join!(
         load_runs(&state, &team, whole),
@@ -2093,7 +2205,7 @@ pub async fn get_analytics(
         backfill_marker,
         load_metered(&state, &team, whole),
     );
-    if backfilled.is_none() && claims.support_view.is_none() {
+    if backfilled.as_ref().is_none_or(|b| b.since.is_none()) && claims.support_view.is_none() {
         ask_for_deploy_backfill(&state, &team).await;
     }
     let deploys: Vec<DeployRow> = deploys
@@ -2131,7 +2243,6 @@ pub async fn get_analytics(
         repo,
     );
     apply_metered(&mut out, &metered, window, prev, repo);
-    let since = deploys_since(backfilled.as_deref(), &deploys);
     add_deploys(
         &mut out["comparison"],
         window,
@@ -2139,8 +2250,7 @@ pub async fn get_analytics(
         previous_full,
         &deploys,
         repo,
-        since.as_deref(),
-        backfilled.is_some(),
+        &backfilled.unwrap_or_default(),
     );
     out["days"] = json!(if month_to_date {
         window.day_slots()
@@ -2294,79 +2404,147 @@ mod tests {
         Window::last_days(Utc::now(), 30)
     }
 
-    fn dep(days_ago: i64, label: &str, head: &str, source: &str) -> DeployRow {
-        let created_at = at(days_ago);
+    fn dep(days_ago: i64, run_id: u64, env: &str, outcome: &str) -> DeployRow {
         DeployRow {
-            sk: format!("DSTAT#{created_at}#acme/web#000007#{label}"),
-            created_at,
+            created_at: at(days_ago),
             repo: "acme/web".into(),
-            pr: 7,
-            label: label.into(),
-            target: common::deploy_stats::target(label).into(),
-            head: head.into(),
-            source: source.into(),
+            run_id,
+            environment: env.into(),
+            environment_name: env.into(),
+            outcome: outcome.into(),
+        }
+    }
+
+    fn known(days_ago: i64) -> DeployBackfill {
+        DeployBackfill {
+            since: Some(at(days_ago)),
+            no_access: vec![],
         }
     }
 
     #[test]
-    fn deploys_are_counted_once_by_target_and_compared() {
+    fn deploys_are_counted_once_by_environment_with_failures() {
         let (w, p) = windows();
         let rows = vec![
-            dep(2, "CI:DEPLOY_STAGING", "abc", "review"),
-            // The same label again on the same commit: one deploy.
-            dep(1, "CI:DEPLOY_STAGING", "abc", "merge_gate"),
-            dep(1, "CI:DEPLOY_STAGING", "def", "review"),
-            dep(3, "CI:DEPLOY_PRODUCTION", "def", "merge_gate"),
-            dep(5, "deploy:preview", "", "backfill"),
-            dep(40, "CI:DEPLOY_STAGING", "", "backfill"),
+            dep(2, 1, "staging", "succeeded"),
+            // The same run written by the webhook and the backfill: one.
+            dep(2, 1, "staging", "succeeded"),
+            dep(1, 2, "preview", "succeeded"),
+            dep(3, 3, "production", "failed"),
+            dep(5, 4, "other", "succeeded"),
+            dep(40, 5, "production", "succeeded"),
         ];
         let mut c = comparison(w, p, None, &[], &[], &[]);
-        add_deploys(&mut c, w, p, None, &rows, None, Some(&at(61)), true);
+        add_deploys(&mut c, w, p, None, &rows, None, &known(182));
         assert_eq!(c["current"]["deploys"], 4);
-        assert_eq!(c["current"]["deploys_staging"], 2);
+        assert_eq!(c["current"]["deploys_staging"], 1);
         assert_eq!(c["current"]["deploys_prod"], 1);
         assert_eq!(c["current"]["deploys_preview"], 1);
-        assert_eq!(c["current"]["deploys_other"], 0);
+        assert_eq!(c["current"]["deploys_other"], 1);
+        assert_eq!(c["current"]["deploys_failed"], 1);
+        assert_eq!(c["current"]["deploys_prod_failed"], 1);
+        assert_eq!(c["current"]["deploys_succeeded"], 3);
         assert_eq!(c["previous"]["deploys"], 1);
         assert_eq!(c["deploys_comparable"], true);
+        assert_eq!(c["deploys_previous_state"], "known");
         assert_eq!(c["deploys_backfill"], "done");
         let last = c["daily"].as_array().unwrap().last().unwrap().clone();
         assert_eq!(last["deploys"], 4);
         assert_eq!(last["previous_deploys"], 1);
-        // Another repo: nothing.
         let mut other = comparison(w, p, None, &[], &[], &[]);
-        add_deploys(
-            &mut other,
-            w,
-            p,
-            None,
-            &rows,
-            Some("acme/api"),
-            Some(&at(61)),
-            true,
-        );
+        add_deploys(&mut other, w, p, None, &rows, Some("acme/api"), &known(182));
         assert_eq!(other["current"]["deploys"], 0);
     }
 
+    /// The page showed "0 then 12, Not comparable": a real 0 before is a
+    /// number to compare, not a missing one.
     #[test]
-    fn deploys_known_only_after_the_previous_period_started_are_not_compared() {
+    fn a_real_zero_compares() {
         let (w, p) = windows();
-        let rows = vec![dep(2, "CI:DEPLOY_STAGING", "abc", "review")];
-        let since = deploys_since(None, &rows);
-        assert_eq!(since.as_deref(), Some(rows[0].created_at.as_str()));
+        let rows: Vec<DeployRow> = (0..12).map(|i| dep(3, i, "staging", "succeeded")).collect();
         let mut c = comparison(w, p, None, &[], &[], &[]);
-        add_deploys(&mut c, w, p, None, &rows, None, since.as_deref(), false);
+        add_deploys(&mut c, w, p, None, &rows, None, &known(182));
+        assert_eq!(c["previous"]["deploys"], 0);
+        assert_eq!(c["current"]["deploys"], 12);
+        assert_eq!(c["deploys_comparable"], true);
+        assert_eq!(c["daily"][0]["previous_deploys"], 0);
+    }
+
+    #[test]
+    fn earlier_deploys_still_being_read_are_counting_not_zero() {
+        let (w, p) = windows();
+        let rows = vec![dep(2, 1, "staging", "succeeded")];
+        let mut c = comparison(w, p, None, &[], &[], &[]);
+        add_deploys(&mut c, w, p, None, &rows, None, &DeployBackfill::default());
         assert_eq!(c["deploys_comparable"], false);
+        assert_eq!(c["deploys_previous_state"], "counting");
         assert_eq!(c["deploys_backfill"], "running");
-        let mut none = comparison(w, p, None, &[], &[], &[]);
-        add_deploys(&mut none, w, p, None, &[], None, None, false);
-        assert_eq!(none["deploys_comparable"], false);
-        assert_eq!(none["deploys_since"], Value::Null);
-        // A finished copy says when deploys are known from, whatever came after.
-        assert_eq!(
-            deploys_since(Some("2026-09-01T00:00:00Z"), &rows).as_deref(),
-            Some("2026-09-01T00:00:00Z")
-        );
+        assert_eq!(c["daily"][0]["previous_deploys"], Value::Null);
+        // Read, but not back to the start of the earlier period.
+        let mut short = comparison(w, p, None, &[], &[], &[]);
+        add_deploys(&mut short, w, p, None, &rows, None, &known(45));
+        assert_eq!(short["deploys_previous_state"], "before_records");
+        assert_eq!(short["deploys_comparable"], false);
+    }
+
+    #[test]
+    fn repositories_without_actions_access_are_named() {
+        let (w, p) = windows();
+        let mut c = comparison(w, p, None, &[], &[], &[]);
+        let b = DeployBackfill {
+            since: Some(at(182)),
+            no_access: vec!["acme/infra".into()],
+        };
+        add_deploys(&mut c, w, p, None, &[], None, &b);
+        assert_eq!(c["deploys_no_access"], json!(["acme/infra"]));
+        assert_eq!(c["deploys_comparable"], true);
+    }
+
+    #[test]
+    fn only_runs_coderhelm_may_have_started_go_to_the_worker() {
+        let bot = "coderhelm[bot]";
+        let r = |login: &str, kind: &str, event: &str, conclusion: &str| {
+            json!({
+                "id": 1, "event": event, "conclusion": conclusion, "status": "completed",
+                "triggering_actor": {"login": login, "type": kind},
+                "actor": {"login": login, "type": kind},
+                "repository": {"full_name": "acme/web"},
+            })
+        };
+        assert!(deploy_run_worth_reading(
+            &r(bot, "Bot", "pull_request", "success"),
+            bot
+        ));
+        assert!(deploy_run_worth_reading(
+            &r(bot, "Bot", "push", "failure"),
+            bot
+        ));
+        // A merge queue's push: the worker checks who merged.
+        assert!(deploy_run_worth_reading(
+            &r("github-merge-queue[bot]", "Bot", "push", "success"),
+            bot
+        ));
+        // A person's deploy never counts.
+        assert!(!deploy_run_worth_reading(
+            &r("someone", "User", "push", "success"),
+            bot
+        ));
+        assert!(!deploy_run_worth_reading(
+            &r("someone", "User", "workflow_dispatch", "success"),
+            bot
+        ));
+        // Another bot's PR run, and a cancelled run.
+        assert!(!deploy_run_worth_reading(
+            &r("dependabot[bot]", "Bot", "pull_request", "success"),
+            bot
+        ));
+        assert!(!deploy_run_worth_reading(
+            &r(bot, "Bot", "push", "cancelled"),
+            bot
+        ));
+        let f = deploy_run_fields(&r(bot, "Bot", "push", "success"));
+        assert!(f.get("repository").is_none());
+        assert_eq!(f["triggering_actor"]["login"], bot);
     }
 
     #[test]

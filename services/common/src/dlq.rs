@@ -29,6 +29,7 @@ pub const WORKER_MESSAGE_TYPES: &[&str] = &[
     "tool_proposals",
     "hidden_suggest",
     "deploy_stats_backfill",
+    "deploy_run",
     "feedback",
     "onboard",
     "mark_ready",
