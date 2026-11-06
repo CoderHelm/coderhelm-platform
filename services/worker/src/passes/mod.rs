@@ -793,6 +793,7 @@ mod branch_update;
 mod checks;
 pub mod code_graph;
 mod completeness;
+mod covering;
 mod cross_repo;
 pub mod deploy_stats;
 pub mod dlq_cleanup;
@@ -2034,7 +2035,10 @@ async fn run_passes(
         .await;
     }
     // --- Existing work: an open pull request (anyone's) that already fixes
-    // this ends the run as covered by it, before any work starts ---
+    // this ends the run as covered by it, before any work starts. CoderHelm's
+    // own one that lacks part of the ticket doesn't: the run builds what it
+    // lacks on its branch and carries it there (see `covering`) ---
+    let mut continue_in: Option<(covering::Remembered, stack::Dependency)> = None;
     if !resumed_plan && plan_resume.is_none() {
         let (tests, specs, failure) = existing_work_inputs(test_ev.as_ref());
         if let Some(covered) = stop_gate::existing_work(
@@ -2054,9 +2058,39 @@ async fn run_passes(
         )
         .await
         {
-            stop_gate::finish_covered(state, msg, run_id, &github, &covered, usage, start).await;
-            close_memory(state, agent_memory.take()).await;
-            return Ok(());
+            match covering::builds_on(state, msg, &github, &covered).await {
+                Some(dep) => {
+                    add_progress_note(
+                        state,
+                        &msg.team_id,
+                        run_id,
+                        &covering::builds_on_note(&covered, &dep),
+                    )
+                    .await;
+                    continue_in = Some((covering::Remembered::of(&covered), dep));
+                }
+                None => {
+                    let repo_full = format!("{}/{}", msg.repo_owner, msg.repo_name);
+                    let inputs = covering::Inputs {
+                        ticket: msg.ticket_id.clone(),
+                        ticket_line: covering::ticket_line(msg),
+                        run_branch: None,
+                        unfinished: Vec::new(),
+                        earlier: history.own_open_pr(&repo_full).map(|p| p.number),
+                    };
+                    match covering::run(
+                        state, msg, &github, &provider, usage, run_id, start, &covered, &inputs,
+                    )
+                    .await?
+                    {
+                        covering::Next::Ended => {
+                            close_memory(state, agent_memory.take()).await;
+                            return Ok(());
+                        }
+                        covering::Next::Normal => {}
+                    }
+                }
+            }
         }
     }
 
@@ -2124,6 +2158,12 @@ async fn run_passes(
             .collect();
         stack::for_ticket(&github, msg, &own).await
     };
+    // Building what CoderHelm's own covering pull request lacks: on its
+    // branch, so the work goes onto it without copying anything.
+    if let Some((_, dep)) = &continue_in {
+        msg.base_branch = dep.branch.clone();
+        stacked_on = Some(dep.clone());
+    }
 
     // The ticket's history (read before the repo was chosen) goes to the
     // planner.
@@ -2940,6 +2980,9 @@ async fn run_passes(
         run_guard::LedgerCell::new(&checks_scope, Default::default())
     };
     ledger.update(|l| l.on_step_start());
+    if let Some((remembered, _)) = &continue_in {
+        ledger.update(|l| l.covering = Some(remembered.clone()));
+    }
     let pr_is_open = ledger.update(|l| l.opened.is_some());
     let resume_gate = if can_skip_implement {
         // A run that stopped at the checks when they came first has no pull
@@ -5166,38 +5209,73 @@ async fn run_passes(
             .get_ref(&msg.repo_owner, &msg.repo_name, &branch_name)
             .await
             .unwrap_or_default();
-        if at_head.is_empty() || ledger.update(|l| l.existing_work_head != at_head) {
-            let (tests, specs, failure) = existing_work_inputs(test_ev.as_ref());
-            if let Some(covered) = stop_gate::existing_work(
-                state,
-                &provider,
-                usage,
-                msg,
-                &github,
-                run_id,
-                &branch_name,
-                &own_pr_numbers(&history, &msg.repo_owner, &msg.repo_name),
-                &decided_prs(&history),
-                &tests,
-                &specs,
-                &impl_result.files_modified,
-                &failure,
-            )
-            .await
-            {
-                let kept =
-                    keep_wip_branch(&github, &msg.repo_owner, &msg.repo_name, &branch_name).await;
-                add_progress_note(
-                    state,
-                    &msg.team_id,
-                    run_id,
-                    &format!("No second pull request; the work so far is kept on branch `{kept}`."),
+        // CoderHelm's own covering pull request the run chose to build on
+        // before it started: carried there now, without asking again.
+        let remembered = ledger.update(|l| l.covering.clone());
+        if remembered.is_some()
+            || at_head.is_empty()
+            || ledger.update(|l| l.existing_work_head != at_head)
+        {
+            let repo_full = format!("{}/{}", msg.repo_owner, msg.repo_name);
+            let found = match &remembered {
+                Some(r) => Some(r.covered(&repo_full)),
+                None => {
+                    let (tests, specs, failure) = existing_work_inputs(test_ev.as_ref());
+                    stop_gate::existing_work(
+                        state,
+                        &provider,
+                        usage,
+                        msg,
+                        &github,
+                        run_id,
+                        &branch_name,
+                        &own_pr_numbers(&history, &msg.repo_owner, &msg.repo_name),
+                        &decided_prs(&history),
+                        &tests,
+                        &specs,
+                        &impl_result.files_modified,
+                        &failure,
+                    )
+                    .await
+                }
+            };
+            if let Some(covered) = found {
+                let unfinished =
+                    covering::unfinished_tasks(&github, msg, &branch_name, &plan_result.tasks)
+                        .await;
+                let inputs = covering::Inputs {
+                    ticket: msg.ticket_id.clone(),
+                    ticket_line: covering::ticket_line(msg),
+                    run_branch: Some((branch_name.clone(), msg.base_branch.clone())),
+                    unfinished,
+                    earlier: history
+                        .own_open_pr(&repo_full)
+                        .map(|p| p.number)
+                        .or(claimed_pr),
+                };
+                match covering::run(
+                    state, msg, &github, &provider, usage, run_id, start, &covered, &inputs,
                 )
-                .await;
-                stop_gate::finish_covered(state, msg, run_id, &github, &covered, usage, start)
-                    .await;
-                close_memory(state, agent_memory.take()).await;
-                return Ok(());
+                .await?
+                {
+                    covering::Next::Ended => {
+                        let kept =
+                            keep_wip_branch(&github, &msg.repo_owner, &msg.repo_name, &branch_name)
+                                .await;
+                        add_progress_note(
+                            state,
+                            &msg.team_id,
+                            run_id,
+                            &format!("No second pull request; this run's branch `{kept}` is kept."),
+                        )
+                        .await;
+                        close_memory(state, agent_memory.take()).await;
+                        return Ok(());
+                    }
+                    covering::Next::Normal => {
+                        ledger.update(|l| l.covering = None);
+                    }
+                }
             }
             ledger.update(|l| l.existing_work_head = at_head.clone());
             ledger.save(state, &msg.team_id, run_id).await;

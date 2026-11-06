@@ -772,6 +772,11 @@ pub struct Ledger {
     /// Set once the pull request is open.
     #[serde(default)]
     pub opened: Option<OpenedPr>,
+    /// CoderHelm's own open pull request that covers the ticket and lacks
+    /// part of it: the run builds on it and carries its work there
+    /// (`covering`).
+    #[serde(default)]
+    pub covering: Option<super::covering::Remembered>,
 }
 
 /// A record larger than this drops its longest text: DynamoDB's item limit is

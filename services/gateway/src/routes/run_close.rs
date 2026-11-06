@@ -703,6 +703,204 @@ pub async fn close_run(
     Ok((status_of(result.outcome), Json(json!(result))))
 }
 
+/// What closing a covered run's superseded pull request does, decided from
+/// the run's record: the pull request to close, or why not.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SupersededPlan {
+    NotFound,
+    /// Nothing to close, with why (said as is).
+    Nothing(String),
+    AlreadyClosed,
+    Close {
+        record: Box<common::stop_rules::covering::Record>,
+        pr: PrRef,
+        installation_id: u64,
+    },
+}
+
+pub fn plan_close_superseded(item: Option<&Item>) -> SupersededPlan {
+    use common::stop_rules::covering::Record;
+    let Some(item) = item else {
+        return SupersededPlan::NotFound;
+    };
+    if s(item, "status") != run_status::COVERED_BY_PR {
+        return SupersededPlan::Nothing("This run isn't covered by another pull request.".into());
+    }
+    let Ok(record) = serde_json::from_str::<Record>(&s(item, "covered_by")) else {
+        return SupersededPlan::Nothing("This run names no pull request it superseded.".into());
+    };
+    let Some(sup) = record.superseded.clone() else {
+        return SupersededPlan::Nothing("This run names no pull request it superseded.".into());
+    };
+    if sup.closed {
+        return SupersededPlan::AlreadyClosed;
+    }
+    // Only when the covering pull request carries the ticket's change.
+    if !record.own || !matches!(record.outcome.as_str(), "continued" | "complete") {
+        return SupersededPlan::Nothing(format!(
+            "#{} doesn't carry this ticket's change, so #{} stays open.",
+            record.number, sup.number
+        ));
+    }
+    let Some((owner, repo)) = sup.repo.split_once('/') else {
+        return SupersededPlan::Nothing("The pull request's repository isn't known.".into());
+    };
+    SupersededPlan::Close {
+        pr: PrRef {
+            owner: owner.to_string(),
+            repo: repo.to_string(),
+            number: sup.number,
+        },
+        record: Box::new(record),
+        installation_id: n(item, "installation_id"),
+    }
+}
+
+/// Whether one of the team's runs recorded `owner/repo#number`.
+async fn run_recorded_pr(state: &AppState, team_id: &str, pr: &PrRef) -> bool {
+    let repo_full = format!("{}/{}", pr.owner, pr.repo);
+    let url = format!("https://github.com/{repo_full}/pull/{}", pr.number);
+    let query = state
+        .dynamo
+        .query()
+        .table_name(&state.config.runs_table_name)
+        .index_name("repo-index")
+        .key_condition_expression("team_repo = :tr")
+        .filter_expression("pr_number = :n OR contains(pr_urls, :u)")
+        .expression_attribute_values(":tr", attr_s(&format!("{team_id}#{repo_full}")))
+        .expression_attribute_values(":n", AttributeValue::N(pr.number.to_string()))
+        .expression_attribute_values(":u", attr_s(&url));
+    matches!(
+        common::paged::query_first_match(query, |_| Some(())).await,
+        Ok(Some(()))
+    )
+}
+
+/// POST /api/runs/:run_id/close-superseded — a person closes the ticket's
+/// earlier pull request a covered run superseded (CoderHelm never closes it
+/// by itself: no team setting allows that). Only CoderHelm's own pull
+/// request is closed, judged on GitHub's answer now
+/// (`common::own_pr::judge`); a person's is refused, whatever the record
+/// says.
+pub async fn close_superseded(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<Claims>,
+    axum::extract::Path(run_id): axum::extract::Path<String>,
+) -> Result<(StatusCode, Json<Value>), StatusCode> {
+    claims.require_role(1)?; // member+
+    let item = load_run(&state, &claims.team_id, &run_id)
+        .await
+        .map_err(|e| {
+            warn!(run_id, error = %e, "close superseded: could not read the run");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+    let (mut record, pr, installation_id) = match plan_close_superseded(item.as_ref()) {
+        SupersededPlan::NotFound => return Err(StatusCode::NOT_FOUND),
+        SupersededPlan::Nothing(why) => {
+            return Ok((StatusCode::CONFLICT, Json(json!({ "message": why }))))
+        }
+        SupersededPlan::AlreadyClosed => {
+            return Ok((
+                StatusCode::OK,
+                Json(json!({ "closed": true, "message": "It is closed already." })),
+            ))
+        }
+        SupersededPlan::Close {
+            record,
+            pr,
+            installation_id,
+        } => (record, pr, installation_id),
+    };
+    let installation_id = if installation_id > 0 {
+        installation_id
+    } else {
+        super::api::get_team_installation_id(&state, &claims.team_id)
+            .await
+            .unwrap_or(0)
+    };
+    let token = match crate::auth::github_app::get_installation_token(&state, installation_id).await
+    {
+        Ok(t) if installation_id > 0 => t,
+        _ => {
+            return Ok((
+                StatusCode::BAD_GATEWAY,
+                Json(json!({ "message": "GitHub couldn't be reached; close it there." })),
+            ))
+        }
+    };
+    let read = state
+        .http
+        .get(format!(
+            "https://api.github.com/repos/{}/{}/pulls/{}",
+            pr.owner, pr.repo, pr.number
+        ))
+        .header("Authorization", format!("Bearer {token}"))
+        .header("Accept", "application/vnd.github+json")
+        .header("User-Agent", "Coderhelm-bot")
+        .send()
+        .await;
+    let facts = match read {
+        Ok(r) if r.status().is_success() => r
+            .json::<Value>()
+            .await
+            .ok()
+            .and_then(|v| common::own_pr::PrFacts::from_github(&v)),
+        _ => None,
+    };
+    let Some(facts) = facts else {
+        return Ok((
+            StatusCode::BAD_GATEWAY,
+            Json(json!({ "message": "GitHub couldn't be read; close it there." })),
+        ));
+    };
+    let bot = crate::auth::github_app::app_slug(&state)
+        .await
+        .map(|s| format!("{s}[bot]"));
+    let recorded = run_recorded_pr(&state, &claims.team_id, &pr).await;
+    if let Err(e) = common::own_pr::judge(&facts, bot.as_deref(), recorded) {
+        info!(run_id, pr = pr.number, why = %e.say(pr.number), "close superseded: refused");
+        return Ok((
+            StatusCode::CONFLICT,
+            Json(json!({ "message": format!("Not closed: {}.", e.say(pr.number)) })),
+        ));
+    }
+    let name = profile_name(&state, &claims).await;
+    let who = closer(&claims, name.as_deref());
+    let comment = common::stop_rules::covering::close_comment(record.number, &who.public);
+    if !close_pr_on_github(&state, &token, &pr, &comment).await {
+        return Ok((
+            StatusCode::BAD_GATEWAY,
+            Json(json!({ "message": "GitHub didn't close the pull request; close it there." })),
+        ));
+    }
+    if let Some(sup) = record.superseded.as_mut() {
+        sup.closed = true;
+        sup.closed_by = who.name.clone();
+    }
+    if let Err(e) = state
+        .dynamo
+        .update_item()
+        .table_name(&state.config.runs_table_name)
+        .set_key(Some(run_key(&claims.team_id, &run_id)))
+        .update_expression("SET covered_by = :cb, updated_at = :t")
+        .condition_expression("attribute_exists(run_id)")
+        .expression_attribute_values(
+            ":cb",
+            attr_s(&serde_json::to_string(&record).unwrap_or_default()),
+        )
+        .expression_attribute_values(":t", attr_s(&chrono::Utc::now().to_rfc3339()))
+        .send()
+        .await
+    {
+        warn!(run_id, error = %e, "close superseded: closed on GitHub, but the run record wasn't updated");
+    }
+    info!(run_id, pr = pr.number, "close superseded: closed");
+    Ok((
+        StatusCode::OK,
+        Json(json!({ "closed": true, "message": format!("Closed #{}.", pr.number) })),
+    ))
+}
+
 /// POST /api/runs/close — close up to [`MAX_BULK`] runs. Always 200 with one
 /// result per run (in the order asked), so some can close while others
 /// can't.
@@ -798,6 +996,78 @@ pub async fn reopen_run(
 
 #[cfg(test)]
 mod tests {
+
+    fn covered_item(record: serde_json::Value, status: &str) -> Item {
+        HashMap::from([
+            ("status".to_string(), attr_s(status)),
+            ("covered_by".to_string(), attr_s(&record.to_string())),
+            ("installation_id".to_string(), AttributeValue::N("7".into())),
+        ])
+    }
+
+    #[test]
+    fn a_superseded_pull_request_closes_only_when_the_own_covering_one_carries_the_change() {
+        let rec = json!({
+            "repo": "acme/web", "number": 52, "own": true, "outcome": "continued",
+            "superseded": {"repo": "acme/web", "number": 41}
+        });
+        match plan_close_superseded(Some(&covered_item(rec.clone(), "covered_by_pr"))) {
+            SupersededPlan::Close {
+                pr,
+                installation_id,
+                ..
+            } => {
+                assert_eq!(
+                    (pr.owner.as_str(), pr.repo.as_str(), pr.number),
+                    ("acme", "web", 41)
+                );
+                assert_eq!(installation_id, 7);
+            }
+            other => panic!("{other:?}"),
+        }
+        let mut complete = rec.clone();
+        complete["outcome"] = json!("complete");
+        assert!(matches!(
+            plan_close_superseded(Some(&covered_item(complete, "covered_by_pr"))),
+            SupersededPlan::Close { .. }
+        ));
+        // A person's covering pull request: the earlier one stays open.
+        let mut person = rec.clone();
+        person["own"] = json!(false);
+        person["outcome"] = json!("person");
+        assert!(matches!(
+            plan_close_superseded(Some(&covered_item(person, "covered_by_pr"))),
+            SupersededPlan::Nothing(_)
+        ));
+        let mut closed = rec.clone();
+        closed["superseded"]["closed"] = json!(true);
+        assert_eq!(
+            plan_close_superseded(Some(&covered_item(closed, "covered_by_pr"))),
+            SupersededPlan::AlreadyClosed
+        );
+        let mut none = rec.clone();
+        none.as_object_mut().unwrap().remove("superseded");
+        assert!(matches!(
+            plan_close_superseded(Some(&covered_item(none, "covered_by_pr"))),
+            SupersededPlan::Nothing(_)
+        ));
+        assert!(matches!(
+            plan_close_superseded(Some(&covered_item(rec, "completed"))),
+            SupersededPlan::Nothing(_)
+        ));
+        assert_eq!(plan_close_superseded(None), SupersededPlan::NotFound);
+    }
+
+    /// The handler closes nothing until the pull request, read from GitHub
+    /// at that moment, is CoderHelm's own: the record alone never decides.
+    #[test]
+    fn closing_a_superseded_pull_request_judges_it_on_github_first() {
+        let src = include_str!("run_close.rs");
+        let f = &src[src.find("pub async fn close_superseded(").unwrap()..];
+        let judge = f.find("common::own_pr::judge(&facts").unwrap();
+        let close = f.find("close_pr_on_github(&state").unwrap();
+        assert!(judge < close);
+    }
     use super::*;
 
     fn item(pairs: &[(&str, &str)]) -> Item {

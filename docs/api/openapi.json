@@ -3966,6 +3966,24 @@
             ],
             "type": "string"
           },
+          "carried": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/RunCoveredCarried",
+                "description": "What the run put on its branch, when it continued in it."
+              }
+            ]
+          },
+          "note": {
+            "description": "What the run page says, in one paragraph.",
+            "examples": [
+              "Continued in #52, CoderHelm's own open pull request that already covered this ticket."
+            ],
+            "type": "string"
+          },
           "number": {
             "description": "Its number.",
             "examples": [
@@ -3974,6 +3992,32 @@
             "format": "int64",
             "minimum": 0,
             "type": "integer"
+          },
+          "open_items": {
+            "description": "What is still open for this ticket in it.",
+            "examples": [
+              [
+                "Register the two helper files"
+              ]
+            ],
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "outcome": {
+            "description": "What the run did about it: `continued` (it carried its work over and\nended linked to it), `complete` (it already had everything), `person`\n(a person's pull request: untouched), `busy` (its run was working on\nit: nothing written) or `not_carried` (the work couldn't be carried\nover and stays on the run's branch). Empty on older runs.",
+            "examples": [
+              "continued"
+            ],
+            "type": "string"
+          },
+          "own": {
+            "description": "It is CoderHelm's own pull request (opened by its app, on a branch in\nthe repository, recorded by one of the team's runs). Only then does a\nrun continue in it or mark and close the ticket's earlier one; a\nperson's pull request is never changed.",
+            "examples": [
+              true
+            ],
+            "type": "boolean"
           },
           "reason": {
             "description": "Why it does the run's work, in one sentence.",
@@ -3988,6 +4032,17 @@
               "acme/web"
             ],
             "type": "string"
+          },
+          "superseded": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/RunSupersededPr",
+                "description": "The ticket's earlier pull request CoderHelm opened, now redundant."
+              }
+            ]
           },
           "title": {
             "description": "Its title.",
@@ -4007,6 +4062,57 @@
         "required": [
           "repo",
           "number"
+        ],
+        "type": "object"
+      },
+      "RunCoveredCarried": {
+        "description": "What a covered run carried over to CoderHelm's own covering pull request.",
+        "properties": {
+          "branch": {
+            "description": "The branch it went onto (the covering pull request's).",
+            "examples": [
+              "coderhelm/abc-2"
+            ],
+            "type": "string"
+          },
+          "commits": {
+            "description": "The run's commits it brought.",
+            "examples": [
+              3
+            ],
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "files": {
+            "description": "The files they change.",
+            "examples": [
+              [
+                "src/register.ts"
+              ]
+            ],
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "head": {
+            "description": "The branch's head after.",
+            "examples": [
+              "9f2c1e0"
+            ],
+            "type": "string"
+          },
+          "rebuilt": {
+            "description": "The two branches had diverged: the run's change was rebuilt on it.",
+            "examples": [
+              false
+            ],
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "branch"
         ],
         "type": "object"
       },
@@ -4292,6 +4398,60 @@
         },
         "required": [
           "trigger"
+        ],
+        "type": "object"
+      },
+      "RunSupersededPr": {
+        "description": "The ticket's earlier pull request CoderHelm opened, superseded by the\ncovering one.",
+        "properties": {
+          "closed": {
+            "description": "A person closed it from the run page.",
+            "examples": [
+              false
+            ],
+            "type": "boolean"
+          },
+          "closed_by": {
+            "description": "Who closed it.",
+            "examples": [
+              ""
+            ],
+            "type": "string"
+          },
+          "number": {
+            "description": "Its number.",
+            "examples": [
+              41
+            ],
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "repo": {
+            "description": "Its repository, `owner/name`.",
+            "examples": [
+              "acme/web"
+            ],
+            "type": "string"
+          },
+          "title": {
+            "description": "Its title.",
+            "examples": [
+              "Add the card block"
+            ],
+            "type": "string"
+          },
+          "url": {
+            "description": "Its address on GitHub.",
+            "examples": [
+              "https://github.com/acme/web/pull/41"
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "repo",
+          "number"
         ],
         "type": "object"
       },

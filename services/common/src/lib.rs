@@ -92,6 +92,8 @@ pub mod repo_read;
 // The test that every model call site is a metered helper
 #[cfg(test)]
 mod model_call_sites;
+/// Which pull requests CoderHelm may push to, edit or close: its own.
+pub mod own_pr;
 /// Paginated DynamoDB lookups (follow LastEvaluatedKey to a match).
 pub mod paged;
 /// What happened to a PR Coderhelm opened, read from GitHub.
