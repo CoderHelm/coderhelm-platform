@@ -82,6 +82,8 @@ pub const WORKER_MESSAGE_TYPES: &[&str] = &[
     "hybrid_name_check",
     // Self-hosted support tickets to CoderHelm, and answers back.
     "support_sync",
+    // An alert episode's quiet window or daily reminder, checked later.
+    "alert_episode_check",
 ];
 
 /// Scheduled jobs that act on every team (EventBridge puts them on the ticket

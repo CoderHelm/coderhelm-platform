@@ -204,6 +204,29 @@ pub enum WorkerMessage {
     /// Read a published draft's numbers back, as a lesson for later runs.
     #[serde(rename = "plugin_results")]
     PluginResults(PluginResultsMessage),
+    /// An alert episode's later check (self-scheduled with SQS delay): did
+    /// the alarm stay clear through its quiet window, or is a daily reminder
+    /// due (`crate::alert_episodes`).
+    #[serde(rename = "alert_episode_check")]
+    AlertEpisodeCheck(AlertEpisodeCheckMessage),
+}
+
+/// One later check of an alert episode. A wait longer than SQS allows chains:
+/// each hop waits up to 900s and lowers `delay_remaining_secs`.
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+pub struct AlertEpisodeCheckMessage {
+    pub team_id: String,
+    pub topic_arn: String,
+    /// The alert's identity on the topic (a CloudWatch alarm's ARN).
+    pub fingerprint: String,
+    /// `clear` or `remind`.
+    pub check: String,
+    /// What the check is about: the OK's alert id (`clear`), or when the
+    /// episode last posted, in epoch seconds (`remind`). A check whose
+    /// episode moved on does nothing.
+    pub token: String,
+    #[serde(default)]
+    pub delay_remaining_secs: u64,
 }
 
 /// One plugin run. `hash` is the plugin version it was asked against; the
@@ -388,7 +411,8 @@ impl WorkerMessage {
             | WorkerMessage::LogAutofix
             | WorkerMessage::AwsPermissionsSweep
             | WorkerMessage::HybridNameCheck
-            | WorkerMessage::SupportSync => f::OTHER,
+            | WorkerMessage::SupportSync
+            | WorkerMessage::AlertEpisodeCheck(_) => f::OTHER,
             WorkerMessage::PluginRun(_)
             | WorkerMessage::PluginPublish(_)
             | WorkerMessage::PluginSync(_)
@@ -459,6 +483,7 @@ impl WorkerMessage {
             | WorkerMessage::PluginSweep
             | WorkerMessage::HybridNameCheck
             | WorkerMessage::SupportSync
+            | WorkerMessage::AlertEpisodeCheck(_)
             | WorkerMessage::PluginTrigger(_)
             | WorkerMessage::PluginResults(_) => None,
         }

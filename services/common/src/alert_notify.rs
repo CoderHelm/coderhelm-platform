@@ -367,6 +367,113 @@ pub fn fix_message(
     }
 }
 
+/// Pure: a card's context line, "us-east-1 · 123456789012 · 2026-10-10 04:00
+/// UTC", from the topic and when the alert was sent.
+pub fn card_context(topic_arn: &str, at_rfc3339: &str) -> String {
+    let parts: Vec<&str> = topic_arn.split(':').collect();
+    let region = parts.get(3).copied().unwrap_or("");
+    let account = parts
+        .get(4)
+        .copied()
+        .filter(|a| a.len() == 12 && a.chars().all(|c| c.is_ascii_digit()))
+        .unwrap_or("");
+    let when = chrono::DateTime::parse_from_rfc3339(at_rfc3339)
+        .map(|t| {
+            t.with_timezone(&chrono::Utc)
+                .format("%Y-%m-%d %H:%M UTC")
+                .to_string()
+        })
+        .unwrap_or_default();
+    [region, account, when.as_str()]
+        .iter()
+        .filter(|s| !s.is_empty())
+        .copied()
+        .collect::<Vec<_>>()
+        .join(" · ")
+}
+
+// ─── Open alerts ────────────────────────────────────────────────────────────
+//
+// Chat webhooks (Teams Workflows, Slack incoming webhooks) can't reply in a
+// thread, so a recovery is its own card that links the alert it resolves. To
+// keep recoveries from spamming the channel, a posted alert card is "open"
+// until one recovery closes it: the first recovery posts (on a route that
+// posts recoveries), later ones (SNS retries, a job that keeps succeeding, an
+// alarm flapping back to OK) don't, until a new alert card opens it again.
+
+/// Settings-table sort key of an alert's open card.
+pub fn open_alert_sk(fingerprint: &str) -> String {
+    format!("ALERT_OPEN#{}", crate::content_hash(fingerprint))
+}
+
+/// The first card of an open alert, linked from its recovery card.
+#[derive(Debug, PartialEq, Eq)]
+pub struct OpenAlert {
+    pub id: String,
+    pub posted_at: String,
+}
+
+/// Pure: the recovery card's line, linking the alert card it resolves.
+pub fn recovered_line(o: &OpenAlert, base: &str) -> String {
+    let when = chrono::DateTime::parse_from_rfc3339(&o.posted_at)
+        .map(|t| {
+            t.with_timezone(&chrono::Utc)
+                .format("%Y-%m-%d %H:%M UTC")
+                .to_string()
+        })
+        .unwrap_or_else(|_| "earlier".to_string());
+    if ulid::Ulid::from_string(&o.id).is_ok() {
+        format!(
+            "Recovered. Resolves [the alert posted {when}]({base}/alerts/detail?id={}).",
+            o.id
+        )
+    } else {
+        format!("Recovered. Resolves the alert posted {when}.")
+    }
+}
+
+/// Close an open alert, returning its first card. Only one caller can close
+/// it, so concurrent or repeated recoveries post at most one card. `None` when
+/// nothing was open, or on an error (no card beats a duplicate).
+pub async fn close_open_alert(
+    dynamo: &DynamoClient,
+    table: &str,
+    team_id: &str,
+    fingerprint: &str,
+) -> Option<OpenAlert> {
+    let out = dynamo
+        .delete_item()
+        .table_name(table)
+        .key("pk", AttributeValue::S(team_id.to_string()))
+        .key("sk", AttributeValue::S(open_alert_sk(fingerprint)))
+        .condition_expression("attribute_exists(pk)")
+        .return_values(aws_sdk_dynamodb::types::ReturnValue::AllOld)
+        .send()
+        .await;
+    let old = match out {
+        Ok(o) => o.attributes,
+        Err(e) => {
+            let missing = e
+                .as_service_error()
+                .is_some_and(|se| se.is_conditional_check_failed_exception());
+            if !missing {
+                tracing::warn!(team_id, error = %e, "Could not close the open alert; not posting its recovery");
+            }
+            return None;
+        }
+    }?;
+    let s = |k: &str| {
+        old.get(k)
+            .and_then(|v| v.as_s().ok())
+            .cloned()
+            .unwrap_or_default()
+    };
+    Some(OpenAlert {
+        id: s("alert_id"),
+        posted_at: s("posted_at"),
+    })
+}
+
 /// Pure: the alarm's page in the CloudWatch console.
 pub fn cloudwatch_console_url(region: &str, alarm_name: &str) -> Option<String> {
     let ok_region = !region.is_empty()

@@ -16,6 +16,8 @@
 //!   for it), so nobody can route someone else's alerts into their runs.
 //! - Alert text is treated as data, never as instructions: alerts often quote
 //!   attacker-controlled values (user agents, request paths).
+//! - A route's repeat setting (`common::alert_episodes`) can post a firing
+//!   alarm once until it really clears; a repeat inside it never starts a run.
 //! - Repeats of the same alert are collapsed, each rule has a daily run cap,
 //!   and alert runs stop for the day once their tokens reach the team's daily
 //!   alert token budget.
@@ -29,14 +31,17 @@ use axum::{
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use tracing::{error, info, warn};
 
 use super::sns::{self, SnsMessage};
 use crate::models::{Claims, TicketMessage, TicketSource, WorkerMessage};
 use crate::AppState;
-use common::alert_notify;
+use common::alert_episodes::{self as episodes, Decision, Episode, Repeat};
+#[cfg(test)]
+use common::alert_notify::OpenAlert;
+use common::alert_notify::{self, recovered_line};
 use common::notify::{self, store, ChannelKind, Channels};
 
 /// Same alert (same fingerprint) within this window is one alert.
@@ -421,6 +426,11 @@ struct Route {
     /// Post recoveries and other non-alarm state changes to chat. Off by
     /// default: they are still recorded on the alert's page.
     post_recoveries: bool,
+    /// How often a firing alert posts (`common::alert_episodes`). Routes
+    /// saved before the setting post every time.
+    repeat: Repeat,
+    /// Alarms with their own setting, by exact alarm name.
+    alarm_repeat: BTreeMap<String, Repeat>,
 }
 
 fn strings(v: Option<&AttributeValue>) -> Vec<String> {
@@ -493,9 +503,12 @@ fn route_from_item(item: &HashMap<String, AttributeValue>) -> Option<Route> {
         }],
         None => vec![],
     };
+    let (repeat, alarm_repeat) = episodes::route_setting(item);
     Some(Route {
         team_id,
         rules,
+        repeat,
+        alarm_repeat,
         enabled: item
             .get("enabled")
             .and_then(|v| v.as_bool().ok())
@@ -694,6 +707,14 @@ pub enum Outcome {
     InFlight,
     Misconfigured,
     Error,
+    /// The alarm is still firing in an episode that already posted: recorded,
+    /// not posted, no run (the route's repeat setting).
+    Suppressed,
+    /// Still firing a day after the last post: one reminder posted.
+    Reminded,
+    /// An OK started the quiet window: the recovery posts once the alarm has
+    /// stayed clear through it.
+    Clearing,
 }
 
 impl Outcome {
@@ -713,6 +734,9 @@ impl Outcome {
             Outcome::InFlight => "in_flight",
             Outcome::Misconfigured => "misconfigured",
             Outcome::Error => "error",
+            Outcome::Suppressed => "suppressed",
+            Outcome::Reminded => "reminded",
+            Outcome::Clearing => "clearing",
         }
     }
 }
@@ -749,30 +773,290 @@ async fn handle_notification(
     let alert = normalize(msg.subject.as_deref(), &msg.message);
     let tid = ticket_id(&alert.fingerprint);
     let rule = pick_rule(&route.rules, &alert);
-    let (result, opened) = match &alert.recovers {
-        Some(fp) if route.enabled => {
-            let opened = close_open_alert(state, &route.team_id, fp).await;
+    let id = event_id(&msg.timestamp, &msg.message_id);
+    let mode = episodes::effective(route.repeat, &route.alarm_repeat, alert.kind, &alert.title);
+    let tracked = if route.enabled && mode != Repeat::EveryTime {
+        track_episode(state, msg, route, &alert, &id, mode).await
+    } else {
+        if route.enabled {
+            if let Some(fp) = &alert.recovers {
+                // It cleared on a route that posts every time: an episode
+                // left from another setting must not hold the next alarm.
+                forget_episode(state, &route.team_id, &msg.topic_arn, fp, None).await;
+            }
+        }
+        None
+    };
+    let mut line_override: Option<String> = None;
+    let decision = tracked.as_ref().map(|t| &t.decision);
+    let result = match plan(decision, alert.recovers.is_some(), route.enabled) {
+        Plan::Hold => {
+            info!(topic = %msg.topic_arn, ticket = %tid, "Alert still firing — recorded, not posted");
+            Ok(Outcome::Suppressed)
+        }
+        Plan::WaitForClear => {
+            info!(topic = %msg.topic_arn, ticket = %tid, "Alert OK — waiting out the quiet window");
+            Ok(Outcome::Clearing)
+        }
+        Plan::Remind => {
+            let ep = &tracked
+                .as_ref()
+                .expect("a reminder has its episode")
+                .episode;
+            line_override = Some(episodes::reminder_line(ep, ep.last_notified_at));
+            Ok(Outcome::Reminded)
+        }
+        Plan::Decide => {
+            if let Some(Decision::Reopened(old)) = decision {
+                // Its quiet window passed before this ALARM: the previous
+                // episode ended, so its recovery goes first.
+                let kms = cipher(state);
+                let http = notify::Http(&state.http);
+                let posting = episodes::Posting {
+                    dynamo: &state.dynamo,
+                    table: &state.config.settings_table_name,
+                    cipher: &kms,
+                    poster: &http,
+                    base: dashboard_base(state),
+                };
+                episodes::post_cleared(&posting, &route.team_id, old).await;
+            }
+            let opens_episode = matches!(decision, Some(Decision::Opened | Decision::Reopened(_)));
+            let decided = decide(state, msg, route, rule, &alert, &tid).await;
+            match &decided {
+                Err(_) if opens_episode => {
+                    // SNS retries this delivery: let it open the episode again.
+                    forget_episode(
+                        state,
+                        &route.team_id,
+                        &msg.topic_arn,
+                        &alert.fingerprint,
+                        Some(&id),
+                    )
+                    .await;
+                }
+                Ok(Outcome::Duplicate) if opens_episode => {
+                    line_override = Some(episodes::reopened_without_run_line().to_string());
+                }
+                _ => {}
+            }
+            decided
+        }
+        Plan::Recover => {
+            let fp = alert.recovers.as_deref().unwrap_or_default();
+            let opened = alert_notify::close_open_alert(
+                &state.dynamo,
+                &state.config.settings_table_name,
+                &route.team_id,
+                fp,
+            )
+            .await;
             let outcome = if opened.is_some() {
                 Outcome::Recovered
             } else {
                 Outcome::NoOpenAlert
             };
             info!(topic = %msg.topic_arn, ticket = %tid, outcome = outcome.as_str(), "Alert recovery");
-            (Ok(outcome), opened)
+            line_override = opened.map(|o| recovered_line(&o, dashboard_base(state)));
+            Ok(outcome)
         }
-        _ => (decide(state, msg, route, rule, &alert, &tid).await, None),
     };
     let outcome = match &result {
         Ok(o) => *o,
         Err(_) => Outcome::Error,
     };
     let repo = rule.map(|r| r.repo.as_str()).unwrap_or("");
-    record_event(state, msg, route, repo, &alert, &tid, outcome).await;
-    if alert.actionable && alert.recovers.is_none() && !repo.is_empty() {
+    let tag = tracked.as_ref().map(|t| EpisodeTag {
+        id: t.episode.first_alert_id.clone(),
+        fires: t.episode.fires,
+        suppressed: outcome == Outcome::Suppressed,
+    });
+    record_event(state, msg, route, repo, &alert, outcome, tag.as_ref()).await;
+    if alert.actionable
+        && alert.recovers.is_none()
+        && !repo.is_empty()
+        && outcome != Outcome::Suppressed
+    {
         link_incident(state, &route.team_id, repo, &alert).await;
     }
-    notify_channels(state, msg, route, repo, &alert, outcome, opened.as_ref()).await;
+    notify_channels(state, msg, route, repo, &alert, outcome, line_override).await;
+    if let Some(t) = &tracked {
+        schedule_episode_checks(state, route, t, outcome, mode).await;
+    }
     result.map(|_| StatusCode::OK)
+}
+
+/// What a delivery leads to, before any run or post.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Plan {
+    /// Still firing in an episode that already posted: record it only. No
+    /// card, and no run (so a fix route never starts a second run for it).
+    Hold,
+    /// An OK on a route that posts once: the quiet window decides later.
+    WaitForClear,
+    /// The daily reminder: a card, no run.
+    Remind,
+    /// As before the repeat setting: a run for a rule that takes it, or a
+    /// card (repeat runs stay deduplicated by `decide`).
+    Decide,
+    /// A recovery posting at once (routes that post every time, or nothing
+    /// open on a route that posts once).
+    Recover,
+}
+
+/// Pure: the plan for a delivery, from its episode's decision (None = the
+/// route posts every time, or the episode couldn't be tracked).
+pub fn plan(decision: Option<&Decision>, recovers: bool, route_enabled: bool) -> Plan {
+    match decision {
+        Some(Decision::Suppressed | Decision::Redelivered) => Plan::Hold,
+        Some(Decision::Clearing { .. }) => Plan::WaitForClear,
+        Some(Decision::Remind) => Plan::Remind,
+        _ if recovers && route_enabled => Plan::Recover,
+        _ => Plan::Decide,
+    }
+}
+
+/// An alert's episode after this delivery, and what it decided.
+struct Tracked {
+    decision: Decision,
+    episode: Episode,
+}
+
+/// What an alert's record says about its episode, so the alerts page can
+/// group a firing alarm's deliveries under the one that posted.
+struct EpisodeTag {
+    /// The alert record that opened the episode.
+    id: String,
+    fires: u64,
+    suppressed: bool,
+}
+
+fn sns_epoch(timestamp: &str) -> i64 {
+    chrono::DateTime::parse_from_rfc3339(timestamp)
+        .map(|t| t.timestamp())
+        .unwrap_or_else(|_| chrono::Utc::now().timestamp())
+}
+
+/// Count this delivery in its alert's episode. `None` (post as if the route
+/// posted every time) when the alert isn't a fire or a clear, or the episode
+/// couldn't be read or written: a duplicate card beats a lost alert.
+async fn track_episode(
+    state: &AppState,
+    msg: &SnsMessage,
+    route: &Route,
+    alert: &Alert,
+    id: &str,
+    mode: Repeat,
+) -> Option<Tracked> {
+    let at = sns_epoch(&msg.timestamp);
+    let (fingerprint, input) = match &alert.recovers {
+        Some(fp) => (
+            fp.as_str(),
+            episodes::Input::Clear {
+                event_id: id,
+                at,
+                quiet_secs: episodes::quiet_window_secs(&msg.message),
+                kind: alert.kind,
+                title: &alert.title,
+                body: &alert.body,
+            },
+        ),
+        None if alert.actionable => (
+            alert.fingerprint.as_str(),
+            episodes::Input::Fire {
+                event_id: id,
+                at,
+                kind: alert.kind,
+                title: &alert.title,
+                body: &alert.body,
+            },
+        ),
+        None => return None,
+    };
+    let store = episodes::DynamoStore {
+        client: &state.dynamo,
+        table: &state.config.settings_table_name,
+    };
+    match episodes::apply(
+        &store,
+        &route.team_id,
+        &msg.topic_arn,
+        fingerprint,
+        input,
+        mode,
+    )
+    .await
+    {
+        Ok(a) => {
+            info!(topic = %msg.topic_arn, decision = a.decision.name(), "Alert episode");
+            Some(Tracked {
+                decision: a.decision,
+                episode: a.episode?,
+            })
+        }
+        Err(e) => {
+            warn!(topic = %msg.topic_arn, error = %e, "Could not track the alert's episode; posting it as every time");
+            None
+        }
+    }
+}
+
+/// Drop an alert's episode (only while `first_alert_id` opened it, when
+/// given). Best effort.
+async fn forget_episode(
+    state: &AppState,
+    team_id: &str,
+    topic_arn: &str,
+    fingerprint: &str,
+    first_alert_id: Option<&str>,
+) {
+    use episodes::EpisodeStore;
+    let store = episodes::DynamoStore {
+        client: &state.dynamo,
+        table: &state.config.settings_table_name,
+    };
+    let sk = episodes::episode_sk(topic_arn, fingerprint);
+    if let Err(e) = store.delete(team_id, &sk, first_alert_id).await {
+        warn!(team_id, error = %e, "Could not drop the alert's episode");
+    }
+}
+
+/// Queue what this delivery leaves for later: the check of the quiet window
+/// an OK started, or the next daily reminder of an episode that just posted.
+async fn schedule_episode_checks(
+    state: &AppState,
+    route: &Route,
+    t: &Tracked,
+    outcome: Outcome,
+    mode: Repeat,
+) {
+    let ep = &t.episode;
+    let check = |check: &str, token: String| common::messages::AlertEpisodeCheckMessage {
+        team_id: route.team_id.clone(),
+        topic_arn: ep.topic_arn.clone(),
+        fingerprint: ep.fingerprint.clone(),
+        check: check.to_string(),
+        token,
+        delay_remaining_secs: 0,
+    };
+    let (msg, secs) = match &t.decision {
+        Decision::Clearing { schedule: true } => (
+            check(episodes::CHECK_CLEAR, ep.clear_event_id.clone()),
+            ep.quiet_secs,
+        ),
+        Decision::Opened | Decision::Reopened(_) | Decision::Remind
+            if mode == Repeat::Daily && outcome != Outcome::Error =>
+        {
+            (
+                check(episodes::CHECK_REMIND, ep.last_notified_at.to_string()),
+                episodes::REMINDER_EVERY_SECS,
+            )
+        }
+        _ => return,
+    };
+    if !episodes::schedule_check(&state.sqs, &state.config.ticket_queue_url, msg, secs).await {
+        warn!(team_id = %route.team_id, "Alert episode check not queued; the next alarm decides instead");
+    }
 }
 
 /// When an alert names a merged CoderHelm pull request of `repo` (its URL
@@ -866,7 +1150,13 @@ pub fn notify_line(outcome: Outcome, repo: &str, post_recoveries: bool) -> Optio
         }
         Outcome::DailyCap => "No fix started: this rule reached its daily limit.".to_string(),
         Outcome::Misconfigured => "No fix started: the rule's repo is invalid.".to_string(),
-        Outcome::Duplicate | Outcome::RoutePaused | Outcome::Error => return None,
+        // The reminder's line is built from its episode.
+        Outcome::Reminded => String::new(),
+        Outcome::Duplicate
+        | Outcome::RoutePaused
+        | Outcome::Error
+        | Outcome::Suppressed
+        | Outcome::Clearing => return None,
     })
 }
 
@@ -899,6 +1189,8 @@ async fn route_channels(state: &AppState, route: &Route) -> Channels {
 }
 
 /// Post the alert to the route's channels (Teams, Slack). Best effort.
+/// `line_override` replaces the card's line on what CoderHelm did (a
+/// recovery's link to its alert, a reminder, a new episode with no new run).
 async fn notify_channels(
     state: &AppState,
     msg: &SnsMessage,
@@ -906,9 +1198,13 @@ async fn notify_channels(
     repo: &str,
     alert: &Alert,
     outcome: Outcome,
-    opened: Option<&OpenAlert>,
+    line_override: Option<String>,
 ) {
-    let Some(mut line) = notify_line(outcome, repo, route.post_recoveries) else {
+    let new_episode = outcome == Outcome::Duplicate && line_override.is_some();
+    let Some(line) = notify_line(outcome, repo, route.post_recoveries)
+        .or_else(|| new_episode.then(String::new))
+        .map(|l| line_override.unwrap_or(l))
+    else {
         return;
     };
     let channels = route_channels(state, route).await;
@@ -916,28 +1212,10 @@ async fn notify_channels(
         return;
     }
     let region = msg.topic_arn.split(':').nth(3).unwrap_or("");
-    let account = topic_account(&msg.topic_arn).unwrap_or("");
-    let when = chrono::DateTime::parse_from_rfc3339(&msg.timestamp)
-        .map(|t| {
-            t.with_timezone(&chrono::Utc)
-                .format("%Y-%m-%d %H:%M UTC")
-                .to_string()
-        })
-        .unwrap_or_default();
-    let context = [region, account, when.as_str()]
-        .iter()
-        .filter(|s| !s.is_empty())
-        .copied()
-        .collect::<Vec<_>>()
-        .join(" · ");
+    let context = alert_notify::card_context(&msg.topic_arn, &msg.timestamp);
     let id = event_id(&msg.timestamp, &msg.message_id);
     let alert_url = format!("{}/alerts/detail?id={id}", dashboard_base(state));
-    if let Some(o) = opened {
-        line = recovered_line(o, dashboard_base(state));
-    }
-    let console = (alert.kind == "cloudwatch_alarm")
-        .then(|| alert.title.split_once(": ").map(|(_, name)| name))
-        .flatten()
+    let console = episodes::alarm_name(alert.kind, &alert.title)
         .and_then(|name| alert_notify::cloudwatch_console_url(region, name));
     let card = alert_notify::alert_message(&alert_notify::AlertCard {
         kind: alert.kind,
@@ -967,45 +1245,11 @@ async fn notify_channels(
 
 // ─── Open alerts ────────────────────────────────────────────────────────────
 //
-// Chat webhooks (Teams Workflows, Slack incoming webhooks) can't reply in a thread, so a recovery is its own
-// card that links the alert it resolves. To keep recoveries from spamming the
-// channel, a posted alert card is "open" until one recovery closes it: the
-// first recovery posts (on a route that posts recoveries), later ones (SNS
-// retries, a DAG that keeps succeeding, an alarm flapping back to OK) don't,
-// until a new alert card opens it again.
+// A posted alert card stays "open" until one recovery closes it, so a
+// recovery posts once (see `common::alert_notify::close_open_alert`).
 
 /// Days an unrecovered alert stays open; each repeat of the alert renews it.
 const OPEN_ALERT_SECS: u64 = 30 * DAY_SECS;
-
-fn open_alert_sk(fingerprint: &str) -> String {
-    format!("ALERT_OPEN#{}", common::content_hash(fingerprint))
-}
-
-/// The first card of an open alert, linked from its recovery card.
-#[derive(Debug, PartialEq, Eq)]
-pub struct OpenAlert {
-    pub id: String,
-    pub posted_at: String,
-}
-
-/// Pure: the recovery card's line, linking the alert card it resolves.
-pub fn recovered_line(o: &OpenAlert, base: &str) -> String {
-    let when = chrono::DateTime::parse_from_rfc3339(&o.posted_at)
-        .map(|t| {
-            t.with_timezone(&chrono::Utc)
-                .format("%Y-%m-%d %H:%M UTC")
-                .to_string()
-        })
-        .unwrap_or_else(|_| "earlier".to_string());
-    if is_event_id(&o.id) {
-        format!(
-            "Recovered. Resolves [the alert posted {when}]({base}/alerts/detail?id={}).",
-            o.id
-        )
-    } else {
-        format!("Recovered. Resolves the alert posted {when}.")
-    }
-}
 
 /// Mark an alert's card open. A repeat keeps the first card's link and renews
 /// how long it stays open. Best effort.
@@ -1016,7 +1260,7 @@ async fn open_alert(state: &AppState, team_id: &str, alert: &Alert, id: &str, po
         .update_item()
         .table_name(&state.config.settings_table_name)
         .key("pk", attr_s(team_id))
-        .key("sk", attr_s(&open_alert_sk(&alert.fingerprint)))
+        .key("sk", attr_s(&alert_notify::open_alert_sk(&alert.fingerprint)))
         .update_expression(
             "SET alert_id = if_not_exists(alert_id, :id), posted_at = if_not_exists(posted_at, :at), \
              title = :title, #ttl = :ttl",
@@ -1031,44 +1275,6 @@ async fn open_alert(state: &AppState, team_id: &str, alert: &Alert, id: &str, po
     if let Err(e) = written {
         warn!(team_id, error = %e, "Could not mark the alert open; its recovery won't post");
     }
-}
-
-/// Close an open alert, returning its first card. Only one caller can close
-/// it, so concurrent or repeated recoveries post at most one card. `None` when
-/// nothing was open, or on an error (no card beats a duplicate).
-async fn close_open_alert(state: &AppState, team_id: &str, fingerprint: &str) -> Option<OpenAlert> {
-    let out = state
-        .dynamo
-        .delete_item()
-        .table_name(&state.config.settings_table_name)
-        .key("pk", attr_s(team_id))
-        .key("sk", attr_s(&open_alert_sk(fingerprint)))
-        .condition_expression("attribute_exists(pk)")
-        .return_values(aws_sdk_dynamodb::types::ReturnValue::AllOld)
-        .send()
-        .await;
-    let old = match out {
-        Ok(o) => o.attributes,
-        Err(e) => {
-            let missing = e
-                .as_service_error()
-                .is_some_and(|se| se.is_conditional_check_failed_exception());
-            if !missing {
-                warn!(team_id, error = %e, "Could not close the open alert; not posting its recovery");
-            }
-            return None;
-        }
-    }?;
-    let s = |k: &str| {
-        old.get(k)
-            .and_then(|v| v.as_s().ok())
-            .cloned()
-            .unwrap_or_default()
-    };
-    Some(OpenAlert {
-        id: s("alert_id"),
-        posted_at: s("posted_at"),
-    })
 }
 
 /// The team's alert channel setting: whether it is on, and the raw item
@@ -1274,9 +1480,11 @@ async fn record_event(
     route: &Route,
     repo: &str,
     alert: &Alert,
-    tid: &str,
     outcome: Outcome,
+    episode: Option<&EpisodeTag>,
 ) {
+    let tid = ticket_id(&alert.fingerprint);
+    let tid = tid.as_str();
     let id = event_id(&msg.timestamp, &msg.message_id);
     let now = chrono::Utc::now();
     let received_at = chrono::DateTime::parse_from_rfc3339(&msg.timestamp)
@@ -1305,18 +1513,28 @@ async fn record_event(
     // A recovery names the ticket of the alert it resolves, so the dashboard
     // can show the two together (a plain `Recovers:` message has a ticket of
     // its own).
-    let written = match &alert.recovers {
+    let put = match &alert.recovers {
         Some(fp) => put.item("recovers_ticket", attr_s(&ticket_id(fp))),
         None => put,
-    }
-    .item("ttl", AttributeValue::N(ttl.to_string()))
-    .item(
-        common::deliveries_rollup::ROLLED,
-        AttributeValue::N("1".into()),
-    )
-    .return_values(aws_sdk_dynamodb::types::ReturnValue::AllOld)
-    .send()
-    .await;
+    };
+    // Every delivery is recorded, held ones too: they carry the episode they
+    // belong to, so history shows a firing alarm as one group with a count.
+    let put = match episode {
+        Some(e) => put
+            .item("episode", attr_s(&e.id))
+            .item("episode_fires", AttributeValue::N(e.fires.to_string()))
+            .item("suppressed", AttributeValue::Bool(e.suppressed)),
+        None => put,
+    };
+    let written = put
+        .item("ttl", AttributeValue::N(ttl.to_string()))
+        .item(
+            common::deliveries_rollup::ROLLED,
+            AttributeValue::N("1".into()),
+        )
+        .return_values(aws_sdk_dynamodb::types::ReturnValue::AllOld)
+        .send()
+        .await;
     match written {
         Ok(r) => {
             // The Deliveries overview counts alerts too. An SNS redelivery
@@ -1548,6 +1766,8 @@ pub async fn list_routes(
                 "notify_mode": r.notify_mode,
                 "webhooks": store::view(&r.webhooks),
                 "post_recoveries": r.post_recoveries,
+                "repeat": r.repeat.as_str(),
+                "alarm_repeat": r.alarm_repeat.iter().map(|(k, v)| (k.clone(), json!(v.as_str()))).collect::<serde_json::Map<_, _>>(),
                 "updated_at": it.get("updated_at").and_then(|v| v.as_s().ok()),
             }))
         })
@@ -1599,6 +1819,36 @@ pub struct PutRouteRequest {
     /// Post recoveries (default off).
     #[serde(default)]
     post_recoveries: bool,
+    /// How often a firing alert posts: "every_time" (default), "until_clear"
+    /// or "daily".
+    #[serde(default)]
+    repeat: String,
+    /// Alarms with their own repeat setting, by exact alarm name.
+    #[serde(default)]
+    alarm_repeat: BTreeMap<String, String>,
+}
+
+/// Pure: the repeat setting a request saves, and its per-alarm overrides,
+/// checked. Err = bad request.
+pub fn repeat_from_request(
+    req: &PutRouteRequest,
+) -> Result<(Repeat, BTreeMap<String, Repeat>), StatusCode> {
+    let route = Repeat::parse(&req.repeat).ok_or(StatusCode::BAD_REQUEST)?;
+    if req.alarm_repeat.len() > episodes::MAX_ALARM_OVERRIDES {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    let mut out = BTreeMap::new();
+    for (name, v) in &req.alarm_repeat {
+        let name = name.trim();
+        if name.is_empty() || name.len() > 255 {
+            return Err(StatusCode::BAD_REQUEST);
+        }
+        out.insert(
+            name.to_string(),
+            Repeat::parse(v).ok_or(StatusCode::BAD_REQUEST)?,
+        );
+    }
+    Ok((route, out))
 }
 
 fn notify_mode_of(req: &PutRouteRequest) -> Option<&'static str> {
@@ -1697,6 +1947,7 @@ pub async fn put_route(
     let topic = req.topic_arn.trim();
     let account = topic_account(topic).ok_or(StatusCode::BAD_REQUEST)?;
     let rules = rules_from_request(&req)?;
+    let (repeat, alarm_repeat) = repeat_from_request(&req)?;
     if rules.is_empty() && notify_mode_of(&req) == Some(alert_notify::MODE_OFF) {
         // A route that neither fixes nor notifies would do nothing.
         return Err(StatusCode::BAD_REQUEST);
@@ -1747,6 +1998,12 @@ pub async fn put_route(
         vec![]
     };
     let rules_attr = AttributeValue::L(rules.iter().map(rule_to_attr).collect());
+    let alarm_repeat_attr = AttributeValue::M(
+        alarm_repeat
+            .iter()
+            .map(|(k, v)| (k.clone(), attr_s(v.as_str())))
+            .collect(),
+    );
     let now = chrono::Utc::now().to_rfc3339();
     let fields = |pk: &str, sk: &str| {
         let mut b = Put::builder()
@@ -1759,6 +2016,8 @@ pub async fn put_route(
             .item("enabled", AttributeValue::Bool(req.enabled))
             .item("notify_mode", attr_s(notify_mode))
             .item("post_recoveries", AttributeValue::Bool(req.post_recoveries))
+            .item("repeat", attr_s(repeat.as_str()))
+            .item("alarm_repeat", alarm_repeat_attr.clone())
             .item("updated_at", attr_s(&now))
             .item("updated_by", attr_s(&claims.email));
         for (k, v) in &webhooks {
@@ -2285,6 +2544,11 @@ fn event_summary(it: &HashMap<String, AttributeValue>) -> Value {
         "outcome": s("outcome"),
         "ticket_id": s("ticket_id"),
         "recovers_ticket": s("recovers_ticket"),
+        // The alert record that opened this alert's episode, on routes that
+        // post once (absent when the route posts every time).
+        "episode": s("episode"),
+        "episode_fires": it.get("episode_fires").and_then(|v| v.as_n().ok()).and_then(|n| n.parse::<u64>().ok()),
+        "suppressed": it.get("suppressed").and_then(|v| v.as_bool().ok()).copied().unwrap_or(false),
     })
 }
 
@@ -2309,7 +2573,7 @@ pub async fn list_events(
         .expression_attribute_values(":pk", attr_s(&claims.team_id))
         .expression_attribute_values(":p", attr_s("ALERT_EVENT#"))
         .projection_expression(
-            "id, received_at, topic_arn, repo, kind, title, outcome, ticket_id, recovers_ticket",
+            "id, received_at, topic_arn, repo, kind, title, outcome, ticket_id, recovers_ticket, episode, episode_fires, suppressed",
         )
         .scan_index_forward(false)
         .limit(50);
@@ -2927,5 +3191,137 @@ mod tests {
         assert_eq!(v["recovers_ticket"], json!(ticket_id(&alert.fingerprint)));
         assert_eq!(v["outcome"], "recovered");
         assert!(event_summary(&HashMap::new())["recovers_ticket"].is_null());
+    }
+
+    #[test]
+    fn a_held_repeat_never_starts_a_run_or_posts() {
+        // Still firing in an open episode: recorded only, so a fix rule
+        // can't start a second run for it.
+        assert_eq!(plan(Some(&Decision::Suppressed), false, true), Plan::Hold);
+        assert_eq!(plan(Some(&Decision::Redelivered), false, true), Plan::Hold);
+        assert_eq!(plan(Some(&Decision::Remind), false, true), Plan::Remind);
+        // A new episode goes through the run decision as before, where the
+        // existing repeat window still folds repeated runs into one.
+        assert_eq!(plan(Some(&Decision::Opened), false, true), Plan::Decide);
+        assert_eq!(
+            plan(Some(&Decision::Reopened(Box::default())), false, true),
+            Plan::Decide
+        );
+        // An OK on a route that posts once waits out the quiet window;
+        // with nothing open it recovers as before.
+        assert_eq!(
+            plan(Some(&Decision::Clearing { schedule: true }), true, true),
+            Plan::WaitForClear
+        );
+        assert_eq!(plan(Some(&Decision::Nothing), true, true), Plan::Recover);
+        // Routes that post every time track nothing: unchanged.
+        assert_eq!(plan(None, false, true), Plan::Decide);
+        assert_eq!(plan(None, true, true), Plan::Recover);
+        assert_eq!(
+            plan(None, true, false),
+            Plan::Decide,
+            "paused: recorded as paused"
+        );
+    }
+
+    #[test]
+    fn routes_saved_before_the_repeat_setting_post_every_time() {
+        for item in [route_item(None, "o/r"), route_item(Some(ACTION_NOTIFY), "")] {
+            let r = route_from_item(&item).unwrap();
+            assert_eq!(r.repeat, Repeat::EveryTime);
+            assert!(r.alarm_repeat.is_empty());
+            assert_eq!(
+                episodes::effective(
+                    r.repeat,
+                    &r.alarm_repeat,
+                    "cloudwatch_alarm",
+                    "ALARM: example-cpu"
+                ),
+                Repeat::EveryTime
+            );
+        }
+        // A saved setting and its per-alarm override read back.
+        let mut item = route_item(Some(ACTION_NOTIFY), "");
+        item.insert("repeat".into(), attr_s("until_clear"));
+        item.insert(
+            "alarm_repeat".into(),
+            AttributeValue::M(HashMap::from([(
+                "example-queue-depth".to_string(),
+                attr_s("daily"),
+            )])),
+        );
+        let r = route_from_item(&item).unwrap();
+        assert_eq!(
+            episodes::effective(
+                r.repeat,
+                &r.alarm_repeat,
+                "cloudwatch_alarm",
+                "ALARM: example-queue-depth"
+            ),
+            Repeat::Daily,
+            "the alarm's own setting beats the route's"
+        );
+        assert_eq!(
+            episodes::effective(
+                r.repeat,
+                &r.alarm_repeat,
+                "cloudwatch_alarm",
+                "ALARM: example-cpu"
+            ),
+            Repeat::UntilClear
+        );
+    }
+
+    #[test]
+    fn the_repeat_setting_and_alarm_overrides_are_checked() {
+        let req = |repeat: &str, alarms: &[(&str, &str)]| PutRouteRequest {
+            repeat: repeat.into(),
+            alarm_repeat: alarms
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+            ..Default::default()
+        };
+        let (r, o) = repeat_from_request(&req("", &[])).unwrap();
+        assert_eq!(r, Repeat::EveryTime, "absent = every time");
+        assert!(o.is_empty());
+        let (r, o) =
+            repeat_from_request(&req("daily", &[(" example-cpu ", "every_time")])).unwrap();
+        assert_eq!(r, Repeat::Daily);
+        assert_eq!(o.get("example-cpu"), Some(&Repeat::EveryTime));
+        assert!(repeat_from_request(&req("weekly", &[])).is_err());
+        assert!(repeat_from_request(&req("daily", &[("x", "hourly")])).is_err());
+        assert!(repeat_from_request(&req("daily", &[("  ", "daily")])).is_err());
+        let many: Vec<(String, String)> = (0..=episodes::MAX_ALARM_OVERRIDES)
+            .map(|i| (format!("a{i}"), "daily".to_string()))
+            .collect();
+        let too_many = PutRouteRequest {
+            alarm_repeat: many.into_iter().collect(),
+            ..Default::default()
+        };
+        assert!(repeat_from_request(&too_many).is_err());
+    }
+
+    #[test]
+    fn held_and_waiting_alerts_post_nothing_and_reminders_post() {
+        assert!(notify_line(Outcome::Suppressed, "o/r", true).is_none());
+        assert!(notify_line(Outcome::Clearing, "", true).is_none());
+        assert_eq!(
+            notify_line(Outcome::Reminded, "", false).as_deref(),
+            Some("")
+        );
+        assert_eq!(Outcome::Suppressed.as_str(), "suppressed");
+        let mut item = HashMap::new();
+        item.insert("id".to_string(), attr_s("01J0000000000000000000000B"));
+        item.insert("episode".to_string(), attr_s("01J0000000000000000000000A"));
+        item.insert("episode_fires".to_string(), AttributeValue::N("7".into()));
+        item.insert("suppressed".to_string(), AttributeValue::Bool(true));
+        let v = event_summary(&item);
+        assert_eq!(v["episode"], "01J0000000000000000000000A");
+        assert_eq!(v["episode_fires"], 7);
+        assert_eq!(v["suppressed"], true);
+        let plain = event_summary(&HashMap::new());
+        assert!(plain["episode"].is_null());
+        assert_eq!(plain["suppressed"], false);
     }
 }
