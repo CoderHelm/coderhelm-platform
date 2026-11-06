@@ -331,6 +331,10 @@ async fn handle_message(state: Arc<WorkerState>, message: models::WorkerMessage)
                 // A transient model failure is sent again later by the one
                 // requeue policy; only a real failure marks the run failed.
                 let err: &(dyn std::error::Error + 'static) = &*e;
+                // GitHub refusing for a while: wait for its reset.
+                if passes::feedback::wait_for_github(&state, &retry_msg, err).await {
+                    return;
+                }
                 if common::model_retry::is_transient_model_error(err)
                     && passes::feedback::requeue_after_model_error(&state, &retry_msg).await
                 {

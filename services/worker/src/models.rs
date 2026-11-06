@@ -295,6 +295,7 @@ mod tests {
     #[test]
     fn ticket_message_roundtrip() {
         let msg = WorkerMessage::Ticket(TicketMessage {
+            github_wait: Default::default(),
             team_id: "TEAM#1".into(),
             installation_id: 1,
             source: TicketSource::Github,
@@ -331,6 +332,7 @@ mod tests {
     #[test]
     fn feedback_message_roundtrip() {
         let msg = WorkerMessage::Feedback(FeedbackMessage {
+            github_wait: Default::default(),
             team_id: "TEAM#1".into(),
             installation_id: 1,
             run_id: "run1".into(),

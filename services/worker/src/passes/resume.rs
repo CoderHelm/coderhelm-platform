@@ -919,6 +919,14 @@ pub async fn run(
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let start = std::time::Instant::now();
 
+    // A round waiting for GitHub is sent on in hops until its reset.
+    let now = chrono::Utc::now().timestamp().max(0) as u64;
+    if let Some(hop) = common::github_wait::hop(msg.github_wait.until, now) {
+        if send_resume_message(state, &msg, hop).await {
+            return Ok(());
+        }
+    }
+
     // Load run record
     info!(run_id = %msg.run_id, table = %state.config.runs_table_name, "Loading run record");
     let run_record = match state
@@ -2165,7 +2173,9 @@ pub async fn run(
                 .await;
             }
             Err(e) => {
-                if requeue_after_model_error(state, &msg, &*e).await {
+                if wait_for_github(state, &msg, &*e).await
+                    || requeue_after_model_error(state, &msg, &*e).await
+                {
                     return Ok(());
                 }
                 error!(run_id = msg.run_id, error = %e, "CI fix implementation failed — the PR stays open, the round is named as not finished");
@@ -2958,6 +2968,7 @@ async fn fix_context(
 
     // Build a minimal TicketMessage for the implement/review passes
     let ticket_msg = TicketMessage {
+        github_wait: Default::default(),
         team_id: msg.team_id.clone(),
         installation_id: msg.installation_id,
         source: TicketSource::Github,
@@ -5111,6 +5122,62 @@ async fn end_run(
         }
     }
     Ok(())
+}
+
+/// A fix round GitHub refused for a while (its rate limit, a 5xx, no
+/// answer) is sent again once GitHub's reset passes, in hops, without
+/// spending a model retry or a CI poll (`common::github_wait`). False when
+/// the error isn't GitHub's or every wait is taken.
+async fn wait_for_github(
+    state: &WorkerState,
+    msg: &ResumeMessage,
+    e: &(dyn std::error::Error + 'static),
+) -> bool {
+    let Some((cause, wait)) = crate::clients::github::outside_wait(e) else {
+        return false;
+    };
+    if msg.github_wait.waits >= common::github_wait::MAX_WAITS {
+        return false;
+    }
+    let now = chrono::Utc::now().timestamp().max(0) as u64;
+    let until = common::github_wait::until(now, wait);
+    let mut next = msg.clone();
+    next.github_wait = common::github_wait::GitHubWait {
+        until,
+        waits: msg.github_wait.waits + 1,
+        pass: String::new(),
+        cause,
+    };
+    let first =
+        common::github_wait::hop(until, now).unwrap_or(common::github_wait::RESET_SLACK_SECS + 1);
+    if !send_resume_message(state, &next, first).await {
+        return false;
+    }
+    let text = common::github_wait::waiting_text(cause, until);
+    warn!(run_id = %msg.run_id, until, "github_wait: the fix round waits for GitHub");
+    super::add_progress_note(state, &msg.team_id, &msg.run_id, &text).await;
+    true
+}
+
+/// Sends this resume message, as it is, to the CI fix queue after `delay`
+/// seconds (at most one SQS delay).
+async fn send_resume_message(state: &WorkerState, msg: &ResumeMessage, delay: u64) -> bool {
+    if state.config.ci_fix_queue_url.is_empty() {
+        return false;
+    }
+    let Ok(body) = serde_json::to_string(&crate::models::WorkerMessage::Resume(msg.clone())) else {
+        return false;
+    };
+    state
+        .sqs
+        .send_message()
+        .queue_url(&state.config.ci_fix_queue_url)
+        .message_body(body)
+        .delay_seconds(delay.min(common::github_wait::MAX_HOP_SECS) as i32)
+        .send()
+        .await
+        .map_err(|e| warn!(run_id = %msg.run_id, error = %e, "Could not send the resume on"))
+        .is_ok()
 }
 
 /// A fix that failed on a transient model error is sent again later (the

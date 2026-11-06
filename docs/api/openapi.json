@@ -3559,6 +3559,16 @@
               "null"
             ]
           },
+          "github_wait": {
+            "description": "While the run waits for GitHub (its hourly limit, or a moment GitHub\nfailed to answer): when it goes on, in plain words. The run continues\nby itself; nothing is needed from anyone.",
+            "examples": [
+              "Waiting for GitHub's hourly limit to reset at 21:05 UTC; continues by itself"
+            ],
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "lesson": {
             "description": "A lesson recorded for the repository when the fix was elsewhere.",
             "examples": [

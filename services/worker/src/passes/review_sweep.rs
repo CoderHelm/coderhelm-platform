@@ -422,6 +422,7 @@ fn sweep_message(
     head: &str,
 ) -> ReviewMessage {
     ReviewMessage {
+        limit_waits: 0,
         team_id: r.team_id.clone(),
         installation_id,
         repo_owner: owner.to_string(),

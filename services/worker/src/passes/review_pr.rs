@@ -237,7 +237,18 @@ pub(crate) enum FailurePlan {
     Retry { delay_secs: u64 },
     /// Every retry failed: tell the PR, keep the previous verdict.
     GiveUp,
+    /// GitHub's rate limit: send the job again once it resets, in this many
+    /// seconds. Spends no attempt.
+    WaitForLimit { delay_secs: u64 },
+    /// GitHub's limit held through every wait: the job ends without a note
+    /// on the PR (nothing failed on CoderHelm's side); the next push or a
+    /// re-review asks again.
+    LimitOutlasted,
 }
+
+/// Waits for GitHub's rate limit one review job takes (a day of hourly
+/// limits) before it ends quietly.
+pub(crate) const MAX_LIMIT_WAITS: u32 = 24;
 
 /// The plan for a review that failed on run `attempt` (0 = the first run).
 pub(crate) fn failure_plan(attempt: u32) -> FailurePlan {
@@ -245,6 +256,78 @@ pub(crate) fn failure_plan(attempt: u32) -> FailurePlan {
         Some(delay_secs) => FailurePlan::Retry { delay_secs },
         None => FailurePlan::GiveUp,
     }
+}
+
+/// The plan for a review that failed, given whether GitHub's rate limit was
+/// the cause (`limit_wait`: seconds until it resets). A rate limit waits for
+/// the reset and never spends an attempt; anything else follows
+/// [`failure_plan`].
+pub(crate) fn failure_plan_for(msg: &ReviewMessage, limit_wait: Option<u64>) -> FailurePlan {
+    match limit_wait {
+        Some(_) if msg.limit_waits >= MAX_LIMIT_WAITS => FailurePlan::LimitOutlasted,
+        Some(wait) => FailurePlan::WaitForLimit {
+            delay_secs: wait.max(1) + common::github_wait::RESET_SLACK_SECS,
+        },
+        None => failure_plan(msg.attempt),
+    }
+}
+
+/// How long GitHub's rate limit holds for this failed review, when it was
+/// the cause: the error says so, or the installation is limited right now.
+pub(crate) fn limit_wait_of(
+    e: &(dyn std::error::Error + Send + Sync + 'static),
+    installation_id: u64,
+) -> Option<u64> {
+    use crate::clients::github;
+    use common::github_wait::Cause;
+    match github::outside_wait(e) {
+        Some((Cause::RateLimit, wait)) => Some(wait),
+        Some((Cause::Outage, _)) => None,
+        None => github::outside_for(installation_id)
+            .filter(|(c, _)| *c == Cause::RateLimit)
+            .map(|(_, secs)| secs),
+    }
+}
+
+/// The trigger's own dedup key, without any retry's or wait's prefix.
+fn base_dedup_key(msg: &ReviewMessage, reviewed_head: &str) -> String {
+    let mut key = msg.dedup_key.as_str();
+    loop {
+        let rest = key
+            .strip_prefix("retry#")
+            .or_else(|| key.strip_prefix("limit#"));
+        match rest {
+            Some(rest) => key = rest.split_once('#').map(|(_, k)| k).unwrap_or(rest),
+            None => break,
+        }
+    }
+    if key.is_empty() {
+        format!("head#{reviewed_head}")
+    } else {
+        key.to_string()
+    }
+}
+
+/// The job that waits for GitHub's rate limit to reset, and the delay of its
+/// first SQS hop. It keeps its attempt count, and has its own dedup key.
+pub(crate) fn limit_wait_message(
+    msg: &ReviewMessage,
+    reviewed_head: &str,
+    delay_secs: u64,
+) -> (ReviewMessage, u64) {
+    let mut next = msg.clone();
+    next.limit_waits = msg.limit_waits + 1;
+    if next.question.is_none() && !reviewed_head.is_empty() {
+        next.head_sha = reviewed_head.to_string();
+    }
+    next.dedup_key = format!(
+        "limit#{}#{}",
+        next.limit_waits,
+        base_dedup_key(msg, reviewed_head)
+    );
+    let hop = delay_secs.min(SQS_MAX_DELAY_SECS);
+    next.wait_secs = delay_secs - hop;
+    (next, hop)
 }
 
 /// The job that retries `msg` after `delay_secs`, and the delay of its first
@@ -262,15 +345,7 @@ pub(crate) fn retry_message(
         next.head_sha = reviewed_head.to_string();
     }
     // The original trigger's key, without an earlier retry's prefix.
-    let base = match msg.dedup_key.strip_prefix("retry#") {
-        Some(rest) => rest
-            .split_once('#')
-            .map(|(_, k)| k)
-            .unwrap_or(rest)
-            .to_string(),
-        None if msg.dedup_key.is_empty() => format!("head#{reviewed_head}"),
-        None => msg.dedup_key.clone(),
-    };
+    let base = base_dedup_key(msg, reviewed_head);
     next.dedup_key = format!("retry#{}#{base}", next.attempt);
     let hop = delay_secs.min(SQS_MAX_DELAY_SECS);
     next.wait_secs = delay_secs - hop;
@@ -968,7 +1043,8 @@ pub async fn run(
                     FormalResult::Posted(None)
                 }
                 Err(e) => {
-                    review_failed(state, &review, &head, &e.to_string(), &job).await;
+                    let limit = limit_wait_of(&*e, review.installation_id);
+                    review_failed(state, &review, &head, &e.to_string(), limit, &job).await;
                     FormalResult::Failed
                 }
             };
@@ -981,7 +1057,8 @@ pub async fn run(
             out
         }
         Err(e) => {
-            review_failed(state, &msg, &reviewed_head, &e.to_string(), &job).await;
+            let limit = limit_wait_of(&*e, msg.installation_id);
+            review_failed(state, &msg, &reviewed_head, &e.to_string(), limit, &job).await;
             Ok(())
         }
     }
@@ -1127,8 +1204,78 @@ async fn send_reply(
 
 /// A review didn't finish: log it (for the failed-review metric), then send
 /// it again or, once every retry failed, leave a note on the PR. Never a
-/// REQUEST_CHANGES, and never touches an earlier verdict.
+/// REQUEST_CHANGES, and never touches an earlier verdict. GitHub's rate
+/// limit (`limit_wait`: seconds until it resets) is not a failure of the
+/// review: the job waits for the reset, spends no attempt, and never ends in
+/// the gave-up note.
 async fn review_failed(
+    state: &WorkerState,
+    msg: &ReviewMessage,
+    head: &str,
+    reason: &str,
+    limit_wait: Option<u64>,
+    job: &LiveJob,
+) {
+    match failure_plan_for(msg, limit_wait) {
+        FailurePlan::WaitForLimit { delay_secs } => {
+            let (next, hop) = limit_wait_message(msg, head, delay_secs);
+            if enqueue_review(state, &next, hop).await {
+                let due = chrono::Utc::now().timestamp() + delay_secs as i64;
+                let text = common::github_wait::waiting_text(
+                    common::github_wait::Cause::RateLimit,
+                    due.max(0) as u64,
+                );
+                let (title, summary) = super::review_session::limit_wait(&text);
+                job.hand_off_check(state, msg, &next.dedup_key, due, &title, &summary)
+                    .await;
+                job.finished(
+                    state,
+                    msg,
+                    common::review_live::Finished::Retrying {
+                        reason: &text,
+                        retry_in_secs: delay_secs as i64,
+                        budget_secs: REVIEW_LEASE_SECS as i64,
+                    },
+                )
+                .await;
+                info!(
+                    pr = msg.pr_number,
+                    waits = next.limit_waits,
+                    delay_secs,
+                    "review_limit_wait: the review waits for GitHub's rate limit to reset"
+                );
+                return;
+            }
+            // The queue refused: end like an outlasted limit, quietly.
+        }
+        FailurePlan::LimitOutlasted => {}
+        FailurePlan::Retry { .. } | FailurePlan::GiveUp => {
+            return review_failed_for_service(state, msg, head, reason, job).await;
+        }
+    }
+    // GitHub's limit: no note on the PR, and the failed-review metric is not
+    // counted (nothing failed on CoderHelm's side).
+    warn!(
+        pr = msg.pr_number,
+        waits = msg.limit_waits,
+        "review_limit_outlasted: GitHub's rate limit held; the review ends without a note"
+    );
+    let text = format!(
+        "GitHub's rate limit for this installation held through {} waits; the review runs again \
+         on the next push, or comment @coderhelm re-review",
+        msg.limit_waits
+    );
+    job.finished(
+        state,
+        msg,
+        common::review_live::Finished::Failed { reason: &text },
+    )
+    .await;
+}
+
+/// A review that didn't finish for a service error (not GitHub's rate
+/// limit): sent again by [`failure_plan`], then the gave-up note.
+async fn review_failed_for_service(
     state: &WorkerState,
     msg: &ReviewMessage,
     head: &str,
@@ -3835,6 +3982,7 @@ pub async fn review_for_run(
         return None;
     }
     let msg = ReviewMessage {
+        limit_waits: 0,
         team_id: team_id.to_string(),
         installation_id,
         repo_owner: owner.to_string(),
@@ -5242,6 +5390,7 @@ mod superseded_tests {
 
     fn msg(head: &str, question: Option<&str>) -> ReviewMessage {
         ReviewMessage {
+            limit_waits: 0,
             team_id: "T".into(),
             installation_id: 1,
             repo_owner: "o".into(),
@@ -5603,6 +5752,7 @@ mod failure_tests {
 
     fn msg() -> ReviewMessage {
         ReviewMessage {
+            limit_waits: 0,
             team_id: "T".into(),
             installation_id: 1,
             repo_owner: "o".into(),
@@ -5668,6 +5818,90 @@ mod failure_tests {
         assert!(next.head_sha.is_empty());
         assert_eq!(next.dedup_key, "retry#1#reply#9");
         assert!(gave_up_note(&q, "").contains("Ask again"));
+    }
+
+    /// The incident: a review failed on GitHub's rate limit at 20:07, was
+    /// retried at 20:17 and 20:32 into the same limit, and gave up with a
+    /// "service error" note. A rate limit now waits for the reset, spends no
+    /// attempt, and never ends in the gave-up note.
+    #[test]
+    fn a_rate_limited_review_waits_for_the_reset_and_never_gives_up_noisily() {
+        let mut m = msg();
+        // Two attempts already spent on real service errors.
+        m.attempt = 2;
+        let reset_in = 1_700;
+        let plan = failure_plan_for(&m, Some(reset_in));
+        let FailurePlan::WaitForLimit { delay_secs } = plan else {
+            panic!("{plan:?}");
+        };
+        assert!(delay_secs > reset_in, "after the reset, not before");
+        assert!(delay_secs <= reset_in + 10);
+        let (next, hop) = limit_wait_message(&m, "a1b2c3d4", delay_secs);
+        assert_eq!(next.attempt, 2, "a rate limit spends no attempt");
+        assert_eq!(next.limit_waits, 1);
+        assert_eq!(hop, SQS_MAX_DELAY_SECS, "one SQS delay at a time");
+        assert_eq!(hop + next.wait_secs, delay_secs);
+        assert_eq!(next.dedup_key, "limit#1#head#a1b2c3d4");
+        // Waiting again keeps the trigger's key, never stacks prefixes.
+        let (again, _) = limit_wait_message(&next, "a1b2c3d4", 60);
+        assert_eq!(again.dedup_key, "limit#2#head#a1b2c3d4");
+        // A service error after a wait is still one of the 3 retries.
+        let (retry, _) = retry_message(&again, "a1b2c3d4", 120);
+        assert_eq!(retry.dedup_key, "retry#3#head#a1b2c3d4");
+        assert_eq!(failure_plan_for(&retry, None), FailurePlan::GiveUp);
+        // The limit holding through every wait ends quietly: never GiveUp,
+        // the only plan that posts the gave-up note.
+        let mut long = msg();
+        long.limit_waits = MAX_LIMIT_WAITS;
+        assert_eq!(
+            failure_plan_for(&long, Some(60)),
+            FailurePlan::LimitOutlasted
+        );
+        for waits in 0..=MAX_LIMIT_WAITS {
+            for attempt in 0..5 {
+                let mut x = msg();
+                x.limit_waits = waits;
+                x.attempt = attempt;
+                assert_ne!(failure_plan_for(&x, Some(30)), FailurePlan::GiveUp);
+            }
+        }
+        // The gave-up note is only sent from the service-error path.
+        let src = include_str!("review_pr.rs");
+        let f = src.find("\nasync fn review_failed(").unwrap();
+        let body = &src[f..f + src[f..]
+            .find("\nasync fn review_failed_for_service(")
+            .unwrap()];
+        assert!(!body.contains("gave_up_note("));
+        assert!(body.contains("review_failed_for_service("));
+    }
+
+    #[test]
+    fn a_rate_limit_is_read_from_the_error_or_the_installation() {
+        let limited: Box<dyn std::error::Error + Send + Sync> = Box::new(
+            crate::clients::github::GitHubPaused::after(common::github_wait::Cause::RateLimit, 900),
+        );
+        assert!(limit_wait_of(&*limited, 1).is_some_and(|w| w >= 900));
+        let outage: Box<dyn std::error::Error + Send + Sync> = Box::new(
+            crate::clients::github::GitHubPaused::after(common::github_wait::Cause::Outage, 60),
+        );
+        assert_eq!(limit_wait_of(&*outage, 777_000_001), None);
+        let other: Box<dyn std::error::Error + Send + Sync> = "model overloaded".into();
+        assert_eq!(limit_wait_of(&*other, 777_000_002), None);
+        crate::clients::github::mark_limited(
+            777_000_003,
+            chrono::Utc::now().timestamp() as u64 + 400,
+        );
+        assert!(limit_wait_of(&*other, 777_000_003).is_some_and(|w| w <= 400));
+        let (title, summary) =
+            crate::passes::review_session::limit_wait(&common::github_wait::waiting_text(
+                common::github_wait::Cause::RateLimit,
+                1_793_999_100,
+            ));
+        assert_eq!(
+            title,
+            "Review paused: Waiting for GitHub's hourly limit to reset at 21:05 UTC; continues by itself"
+        );
+        assert!(summary.contains("nothing failed"));
     }
 
     /// The incident: the reply says nothing in the diff needs changing while

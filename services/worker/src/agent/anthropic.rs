@@ -888,7 +888,20 @@ pub async fn converse_tool_loop(
 
         // Execute tools, each only after the policy gate allows it.
         let mut tool_results: Vec<Value> = Vec::new();
+        // Set once GitHub refused a call for a while (its rate limit, a
+        // 5xx): the calls after it in this turn aren't run, and the loop
+        // ends after this turn so the run can wait (`common::github_wait`).
+        let mut paused: Option<crate::clients::github::GitHubPaused> = None;
         for (tool_id, tool_name, tool_input) in &tool_uses {
+            if let Some(p) = &paused {
+                tool_results.push(json!({
+                    "type": "tool_result",
+                    "tool_use_id": tool_id,
+                    "content": common::github_wait::not_run(p.cause, p.until),
+                    "is_error": true
+                }));
+                continue;
+            }
             let tool_start = std::time::Instant::now();
             info!(tool = %tool_name, "Executing tool");
 
@@ -943,10 +956,27 @@ pub async fn converse_tool_loop(
                         cb(tool_name, duration_ms, &input_summary, true);
                     }
                     warn!(tool = %tool_name, error = %e, duration_ms, "Tool execution failed");
+                    // GitHub refusing for a while is not an answer to retry:
+                    // the model is told the run pauses, and the loop ends.
+                    let content = match crate::clients::github::outside_wait(&*e) {
+                        Some((cause, wait)) => {
+                            let p = crate::clients::github::GitHubPaused::after(cause, wait);
+                            warn!(
+                                tool = %tool_name,
+                                until = p.until,
+                                ?cause,
+                                "github_paused: GitHub refused a tool call; the pass ends and the run waits"
+                            );
+                            let text = common::github_wait::tool_result(p.cause, p.until);
+                            paused = Some(p);
+                            text
+                        }
+                        None => format!("Error: {e}"),
+                    };
                     tool_results.push(json!({
                         "type": "tool_result",
                         "tool_use_id": tool_id,
-                        "content": format!("Error: {e}"),
+                        "content": content,
                         "is_error": true
                     }));
                 }
@@ -992,6 +1022,9 @@ pub async fn converse_tool_loop(
         }
 
         messages.push(("user".to_string(), tool_results));
+        if let Some(p) = paused {
+            return Err(Box::new(p));
+        }
     }
 }
 
@@ -1666,6 +1699,78 @@ mod accounting_tests {
         ) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
             Ok(json!("fn main() {}"))
         }
+    }
+
+    /// Every call is refused the way GitHub refused the incident's writes.
+    struct Limited(std::sync::atomic::AtomicUsize);
+
+    #[async_trait::async_trait]
+    impl super::super::llm::ToolExecutor for Limited {
+        async fn execute(
+            &self,
+            _name: &str,
+            _input: &Value,
+        ) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Err("HTTP status client error (403 Forbidden) for url \
+                 (https://api.github.com/repos/o/r/git/trees): API rate limit exceeded for \
+                 installation ID 1."
+                .into())
+        }
+    }
+
+    /// A tool call GitHub refused for its limit ends the loop with a pause
+    /// (no more model turns, no more calls), and the model's last tool
+    /// result says the run continues at the reset, not the raw 403.
+    #[tokio::test]
+    async fn a_rate_limited_tool_call_ends_the_loop_with_a_pause() {
+        let (url, bodies) = server(vec![tool_turn(0, 100), answer_turn(0, 0)]).await;
+        let (meter, _) = UsageMeter::memory("team-1");
+        let client = AnthropicClient::new("k".into(), meter).at(&url);
+        let tools = crate::passes::review_agent::review_tools();
+        let gate = common::agent_policy::Gate::new(
+            Arc::new(common::agent_policy::store::MemStore::new()),
+            common::agent_policy::GateCtx::new("t", common::agent_policy::Agent::Reviewer),
+        )
+        .offering(tools.iter().map(|t| t.name.clone()));
+        let mut messages = vec![(
+            "user".to_string(),
+            vec![json!({"type":"text","text":"fix it"})],
+        )];
+        let ex = Limited(Default::default());
+        let mut usage = TokenUsage::default();
+        let out = converse_tool_loop(
+            &client,
+            "claude-opus-5-5",
+            "You write code.",
+            &mut messages,
+            &tools,
+            &ex,
+            &gate,
+            &mut usage,
+            10,
+            1024,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await;
+        let err = out.expect_err("the loop pauses");
+        let paused = err
+            .downcast_ref::<crate::clients::github::GitHubPaused>()
+            .expect("a typed pause");
+        assert_eq!(paused.cause, common::github_wait::Cause::RateLimit);
+        assert_eq!(ex.0.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(bodies.lock().unwrap().len(), 1, "no model turn after it");
+        let last = &messages.last().unwrap().1[0];
+        let said = last["content"].as_str().unwrap();
+        assert!(
+            said.starts_with("GitHub's rate limit is reached; the run will pause and continue at"),
+            "{said}"
+        );
+        assert!(said.contains("Do not retry"));
+        assert!(!said.contains("403"));
     }
 
     async fn run_loop(

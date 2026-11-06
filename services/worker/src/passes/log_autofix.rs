@@ -97,6 +97,7 @@ impl StartEnv for WorkerEnv<'_> {
         )
         .await?;
         let msg = WorkerMessage::Ticket(TicketMessage {
+            github_wait: Default::default(),
             team_id: team_id.to_string(),
             installation_id,
             source: TicketSource::Alert,

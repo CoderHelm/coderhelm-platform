@@ -298,6 +298,18 @@ pub(crate) fn retry_wait(reason: &str, due: i64) -> (String, String) {
     )
 }
 
+/// The check's title and summary while the review waits for GitHub's rate
+/// limit to reset (`text`: `common::github_wait::waiting_text`).
+pub(crate) fn limit_wait(text: &str) -> (String, String) {
+    (
+        format!("Review paused: {text}"),
+        format!(
+            "{text}. GitHub's hourly request limit for this installation is used up; nothing \
+             failed on the review's side, and it runs in this check once the limit resets."
+        ),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

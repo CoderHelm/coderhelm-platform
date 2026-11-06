@@ -112,6 +112,187 @@ async fn requeue_after_model_error(state: &WorkerState, msg: &TicketMessage, run
     }
 }
 
+/// Sends this ticket message again after `delay` seconds (at most one SQS
+/// delay).
+async fn send_ticket_after(state: &WorkerState, msg: &TicketMessage, delay: u64) -> bool {
+    if state.config.ticket_queue_url.is_empty() {
+        return false;
+    }
+    let Ok(body) = serde_json::to_string(&crate::models::WorkerMessage::Ticket(msg.clone())) else {
+        return false;
+    };
+    match state
+        .sqs
+        .send_message()
+        .queue_url(&state.config.ticket_queue_url)
+        .message_body(body)
+        .delay_seconds(delay.min(common::github_wait::MAX_HOP_SECS) as i32)
+        .send()
+        .await
+    {
+        Ok(_) => true,
+        Err(e) => {
+            warn!(error = %e, "Could not send the ticket message on");
+            false
+        }
+    }
+}
+
+/// The GitHub wait a run's error calls for, if any: the error is GitHub
+/// refusing for a while (its rate limit, a 5xx, no answer), or GitHub is
+/// refusing this installation right now and the error came from a read or
+/// write that failed under it. A stop by a person, the policy or the run
+/// guard is never a wait.
+fn github_pause_of(
+    e: &(dyn std::error::Error + Send + Sync + 'static),
+    installation_id: u64,
+) -> Option<crate::clients::github::GitHubPaused> {
+    use crate::clients::github::{outside_for, outside_wait, GitHubPaused};
+    if let Some((cause, wait)) = outside_wait(e) {
+        return Some(GitHubPaused::after(cause, wait));
+    }
+    let stopped = e
+        .downcast_ref::<common::agent_policy::AgentStopped>()
+        .is_some()
+        || e.downcast_ref::<run_guard::LoopStopped>().is_some()
+        || e.downcast_ref::<stack::Refused>().is_some()
+        || is_budget_exhausted(&e.to_string())
+        || e.to_string().contains("cancelled by user");
+    if stopped {
+        return None;
+    }
+    outside_for(installation_id).map(|(cause, secs)| GitHubPaused::after(cause, secs))
+}
+
+/// The message that carries a run's wait for GitHub, and its first SQS
+/// delay: the same run (its run_id and step), one more wait, the pass it was
+/// in. None once the run has waited `MAX_WAITS` times.
+pub(crate) fn github_wait_message(
+    msg: &TicketMessage,
+    run_id: &str,
+    paused: &crate::clients::github::GitHubPaused,
+    pass: &str,
+    now: u64,
+) -> Option<(TicketMessage, u64)> {
+    if msg.github_wait.waits >= common::github_wait::MAX_WAITS {
+        return None;
+    }
+    let mut next = msg.clone();
+    next.continuation_run_id = Some(run_id.to_string());
+    next.github_wait = Box::new(common::github_wait::GitHubWait {
+        until: paused.until,
+        waits: msg.github_wait.waits + 1,
+        pass: pass.to_string(),
+        cause: paused.cause,
+    });
+    // At least a moment, even for a reset that already passed.
+    let first = common::github_wait::hop(paused.until, now)
+        .unwrap_or(common::github_wait::RESET_SLACK_SECS + 1);
+    Some((next, first))
+}
+
+/// What a run's wait for GitHub came to.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum GitHubWaited {
+    /// No wait: the error wasn't GitHub's.
+    No,
+    /// The run waits; its next message is queued.
+    Queued,
+    /// GitHub's, but the run can't wait (every wait taken, or the queue
+    /// refused): it stops with this reason, which names GitHub.
+    Stopped(String),
+}
+
+/// The run waits for GitHub: its next message is queued for GitHub's reset,
+/// the run page says so, and this step's tokens are recorded. The wait adds
+/// no step, no pass and no worked time; the step's checkpoint, the plan and
+/// the branch are what the run goes on from.
+async fn wait_for_github(
+    state: &WorkerState,
+    msg: &TicketMessage,
+    run_id: &str,
+    paused: &crate::clients::github::GitHubPaused,
+    usage: &mut TokenUsage,
+) -> GitHubWaited {
+    let current = state
+        .dynamo
+        .get_item()
+        .table_name(&state.config.runs_table_name)
+        .key("team_id", attr_s(&msg.team_id))
+        .key("run_id", attr_s(run_id))
+        .projection_expression("current_pass")
+        .send()
+        .await
+        .ok()
+        .and_then(|o| {
+            o.item()
+                .and_then(|i| i.get("current_pass").and_then(|v| v.as_s().ok()).cloned())
+        })
+        .unwrap_or_default();
+    let now = chrono::Utc::now().timestamp().max(0) as u64;
+    let Some((next, first)) = github_wait_message(msg, run_id, paused, &current, now) else {
+        return GitHubWaited::Stopped(common::github_wait::gave_up_reason(
+            paused.cause,
+            msg.github_wait.waits,
+        ));
+    };
+    if !send_ticket_after(state, &next, first).await {
+        return GitHubWaited::Stopped(format!(
+            "{}, but the run couldn't be queued to wait. Nothing was wrong with the work, which \
+             is kept on the branch: Retry goes on from it.",
+            common::github_wait::waiting_text(paused.cause, paused.until)
+                .split(';')
+                .next()
+                .unwrap_or("Waiting for GitHub")
+        ));
+    }
+    let text = common::github_wait::waiting_text(paused.cause, paused.until);
+    warn!(
+        run_id,
+        until = paused.until,
+        waits = next.github_wait.waits,
+        cause = ?paused.cause,
+        "github_wait: the run waits for GitHub and goes on by itself"
+    );
+    let delta = usage.unrecorded();
+    let wrote = state
+        .dynamo
+        .update_item()
+        .table_name(&state.config.runs_table_name)
+        .key("team_id", attr_s(&msg.team_id))
+        .key("run_id", attr_s(run_id))
+        .update_expression(
+            "SET github_wait = :w, updated_at = :t, \
+             tokens_in = if_not_exists(tokens_in, :uzero) + :ti, tokens_out = if_not_exists(tokens_out, :uzero) + :to, \
+             cache_read_tokens = if_not_exists(cache_read_tokens, :uzero) + :crt, cache_write_tokens = if_not_exists(cache_write_tokens, :uzero) + :cwt, \
+             cost_usd = if_not_exists(cost_usd, :uzero) + :c",
+        )
+        .expression_attribute_names("#s", "status")
+        .condition_expression(common::run_status::not_ended("#s"))
+        .ended_values()
+        .usage_values(&delta)
+        .expression_attribute_values(":w", attr_s(&text))
+        .expression_attribute_values(":t", attr_s(&chrono::Utc::now().to_rfc3339()))
+        .send()
+        .await
+        .is_ok();
+    if wrote {
+        usage.mark_recorded(&delta);
+    }
+    add_progress_note(state, &msg.team_id, run_id, &text).await;
+    // Last write: the stuck-run sweep reads a queued time after the last
+    // update as "a step is waiting", not stuck. The step number is the same:
+    // a wait is not a step.
+    steps::mark_queued(
+        state,
+        &msg.team_id,
+        run_id,
+        steps::step_number(msg.continuation),
+    )
+    .await;
+    GitHubWaited::Queued
+}
+
 /// What asking for the next step came to.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum Handoff {
@@ -401,6 +582,61 @@ mod continuation_tests {
         ));
         assert!(!is_budget_exhausted("cancelled by user"));
         assert!(!is_budget_exhausted("GitHub API 404: issue not found"));
+    }
+
+    /// A run's error is a wait for GitHub when GitHub refused it for a
+    /// while, or when GitHub refuses the installation right now; a stop by
+    /// the guard, a person or the step budget never is.
+    #[test]
+    fn a_run_error_is_a_wait_for_github_only_when_github_refused() {
+        use super::{github_pause_of, github_wait_message, GitHubWaited};
+        use crate::clients::github::{mark_limited, GitHubPaused};
+        use common::github_wait::{Cause, MAX_WAITS};
+        let limited: Box<dyn std::error::Error + Send + Sync> =
+            "HTTP status client error (403 Forbidden) for url \
+             (https://api.github.com/repos/o/r/compare/main...x): API rate limit exceeded"
+                .into();
+        let p = github_pause_of(&*limited, 888_000_001).expect("a wait");
+        assert_eq!(p.cause, Cause::RateLimit);
+        let real: Box<dyn std::error::Error + Send + Sync> =
+            "No files modified in o/r, and its plan names no file to change.".into();
+        assert_eq!(github_pause_of(&*real, 888_000_002), None);
+        // Any failure while GitHub refuses this installation is read as that.
+        let now = chrono::Utc::now().timestamp() as u64;
+        mark_limited(888_000_003, now + 1_200);
+        let under = github_pause_of(&*real, 888_000_003).expect("GitHub is refusing");
+        assert!(under.until >= now + 1_200);
+        // Never a stop that isn't GitHub's.
+        let stopped: Box<dyn std::error::Error + Send + Sync> =
+            Box::new(super::run_guard::LoopStopped("handed to you".into()));
+        assert_eq!(github_pause_of(&*stopped, 888_000_003), None);
+        let steps: Box<dyn std::error::Error + Send + Sync> =
+            "Reached the maximum number of steps (60) without finishing.".into();
+        assert_eq!(github_pause_of(&*steps, 888_000_003), None);
+
+        // The wait's message is the same run and step; the waits are bounded.
+        let mut msg = crate::models::TicketMessage {
+            team_id: "T".into(),
+            ..Default::default()
+        };
+        let paused = GitHubPaused {
+            cause: Cause::RateLimit,
+            until: 10_000,
+        };
+        let (next, hop) = github_wait_message(&msg, "R", &paused, "implement", 9_000).unwrap();
+        assert_eq!(hop, 900);
+        assert_eq!(next.continuation, 0);
+        assert_eq!(next.continuation_run_id.as_deref(), Some("R"));
+        assert!(
+            next.same_run(),
+            "the first wait of a first step is the same run"
+        );
+        // A reset already past still goes on after a moment, never at once.
+        let (_, hop) = github_wait_message(&msg, "R", &paused, "implement", 10_500).unwrap();
+        assert!(hop > 0);
+        msg.github_wait.waits = MAX_WAITS;
+        assert!(github_wait_message(&msg, "R", &paused, "implement", 9_000).is_none());
+        assert_ne!(GitHubWaited::Queued, GitHubWaited::No);
     }
 
     fn run_passes_src() -> &'static str {
@@ -935,7 +1171,7 @@ pub async fn orchestrate_ticket(
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // A continuation reuses its original run_id (so it's ONE run, not a
     // duplicate); a fresh ticket mints a new one.
-    let is_continuation = (msg.continuation > 0 || msg.model_retries > 0)
+    let is_continuation = msg.same_run()
         && msg
             .continuation_run_id
             .as_deref()
@@ -955,6 +1191,31 @@ pub async fn orchestrate_ticket(
         .unwrap_or_else(|| ulid::Ulid::new().to_string());
     let mut usage = TokenUsage::default();
     let start = std::time::Instant::now();
+
+    // A run waiting for GitHub longer than one SQS delay is sent on in hops;
+    // a hop touches nothing on the run (see `common::github_wait`).
+    if is_continuation {
+        let now = chrono::Utc::now().timestamp().max(0) as u64;
+        if let Some(hop) = common::github_wait::hop(msg.github_wait.until, now) {
+            if send_ticket_after(state, &msg, hop).await {
+                info!(
+                    run_id,
+                    hop,
+                    until = msg.github_wait.until,
+                    "Still waiting for GitHub"
+                );
+                return Ok(());
+            }
+            warn!(
+                run_id,
+                "Could not send the GitHub wait on; the run goes on now"
+            );
+        }
+        // Going on with the pass the wait interrupted is not a new pass.
+        if msg.github_wait.waits > 0 && !msg.github_wait.pass.is_empty() {
+            run_guard::forgive_reentry(&run_id, &msg.github_wait.pass);
+        }
+    }
 
     info!(run_id, ticket_id = %msg.ticket_id, continuation = msg.continuation, "Orchestration started");
 
@@ -1050,7 +1311,6 @@ pub async fn orchestrate_ticket(
                 // The team's counters already have these tokens: each model
                 // call is counted as it happens (common::usage).
             } else {
-                error!(run_id, error = %e, "Orchestration failed");
                 let checkpoint = load_checkpoint(state, &msg.team_id, &run_id).await;
                 // The run guard fired: one ending, always (see `run_guard`).
                 let guard_ended = run_guard::end_if_stopped(
@@ -1060,6 +1320,22 @@ pub async fn orchestrate_ticket(
                     checkpoint.as_ref().map(|c| c.1.as_str()),
                 )
                 .await;
+                // GitHub refused the run for a while (its rate limit, a 5xx,
+                // no answer): never a failure and never the coder's. The run
+                // waits until GitHub's reset and goes on by itself, from its
+                // checkpoint, plan and branch (`common::github_wait`).
+                let paused = (!guard_ended)
+                    .then(|| github_pause_of(&*e, msg.installation_id))
+                    .flatten();
+                let waited = match &paused {
+                    Some(p) => wait_for_github(state, &msg, &run_id, p, &mut usage).await,
+                    None => GitHubWaited::No,
+                };
+                if let GitHubWaited::No = waited {
+                    error!(run_id, error = %e, "Orchestration failed");
+                } else {
+                    info!(run_id, error = %e, waited = ?waited, "Orchestration paused for GitHub");
+                }
                 // Budget exhausted (hit the step limit) with committed partial
                 // work is "needs more turns", not a real failure — auto-continue
                 // (bounded) from the branch instead of salvaging a half-finished
@@ -1071,6 +1347,7 @@ pub async fn orchestrate_ticket(
                 // stays correct even if a future non-implement pass propagates the
                 // same step-limit message — it won't match this checkpoint.
                 let continued = !guard_ended
+                    && paused.is_none()
                     && is_budget_exhausted(&err_msg)
                     && try_auto_continue(
                         state,
@@ -1089,6 +1366,7 @@ pub async fn orchestrate_ticket(
                 // the one requeue policy every pass uses. Decided from the
                 // error's kind, never its text.
                 let continued = continued
+                    || paused.is_some()
                     || !guard_ended && {
                         let err: &(dyn std::error::Error + 'static) = &*e;
                         common::model_retry::is_transient_model_error(err)
@@ -1151,6 +1429,11 @@ pub async fn orchestrate_ticket(
                 if !continued && !salvaged && !guard_ended {
                     let sanitized = sanitize_error(&err_msg);
                     fail_run(state, &msg, &run_id, &sanitized, &usage, duration).await;
+                }
+                // A wait that couldn't be taken still names GitHub, never the
+                // coder.
+                if let GitHubWaited::Stopped(reason) = &waited {
+                    fail_run(state, &msg, &run_id, reason, &usage, duration).await;
                 }
                 // `?` failure paths inside run_passes bypass close_memory —
                 // release the repo's memory lock so the next run isn't
@@ -1327,7 +1610,7 @@ async fn run_passes(
     // resumes in the repository planning settled on, from its last plan. It
     // first checks that the step before made progress: a new plan revision
     // or fewer open gaps; two steps in a row without stop the run.
-    let plan_resume = if msg.continuation > 0 || msg.model_retries > 0 {
+    let plan_resume = if msg.same_run() {
         let st = steps::load(state, &msg.team_id, run_id).await;
         let resume = st.planning();
         let step = steps::step_number(msg.continuation);
@@ -1784,7 +2067,7 @@ async fn run_passes(
                     return Ok(());
                 }
                 pr_holder::Claim::Free(guards) => {
-                    if msg.continuation == 0 && msg.model_retries == 0 {
+                    if !msg.same_run() {
                         add_progress_note(
                             state,
                             &msg.team_id,
@@ -1874,7 +2157,7 @@ async fn run_passes(
     // work on the branch was made against them. Triaging and planning again
     // gave a different plan (memory and history read differently a few
     // minutes later) for a branch built on the first one.
-    let same_run = msg.continuation > 0 || msg.model_retries > 0;
+    let same_run = msg.same_run();
     // A person's Retry of an earlier run (`resume_from`) takes up that
     // run's plan the same way, and keeps the commits on its branch (below);
     // the plan becomes this run's own, so a continuation of this run reuses
@@ -3259,6 +3542,7 @@ async fn run_passes(
             files_modified,
             timed_out: false,
             conversation_log: vec![],
+            writes: Default::default(),
             // The first attempt's lookups weren't kept; the proof check's
             // fix round can make them again.
             evidence: proof::RunEvidence {
@@ -3335,7 +3619,7 @@ async fn run_passes(
                         return Ok(());
                     }
                     pr_holder::Claim::Free(guards) => {
-                        if msg.continuation == 0 && msg.model_retries == 0 {
+                        if !msg.same_run() {
                             add_progress_note(
                                 state,
                                 &msg.team_id,
@@ -4629,11 +4913,16 @@ async fn run_passes(
             .await;
             let ticket_names_files =
                 run_end::ticket_names_files(&format!("{}\n{}", msg.title, msg.body));
+            // Writes GitHub refused for a while, or GitHub refusing right
+            // now, are a wait: never "the coder wrote no file".
+            let outside = github.outside().map(|p| (p.cause, p.until));
             let mut verdict = run_end::judge(
                 work.as_deref(),
                 &tasks,
                 &run_end::coder_questions(&result.evidence.notes),
                 ticket_names_files,
+                &result.writes,
+                outside,
             );
             // Nothing on the branch, and the plan says what to build: one
             // more build, told every task, before anything is asked.
@@ -4669,11 +4958,14 @@ async fn run_passes(
                 if again.files_modified.is_empty() {
                     let mut evidence = std::mem::take(&mut result.evidence);
                     evidence.merge(again.evidence);
+                    result.writes.merge(again.writes);
                     verdict = run_end::judge(
                         work.as_deref(),
                         &tasks,
                         &run_end::coder_questions(&evidence.notes),
                         ticket_names_files,
+                        &result.writes,
+                        github.outside().map(|p| (p.cause, p.until)),
                     );
                     result.evidence = evidence;
                 } else {
@@ -4763,9 +5055,18 @@ async fn run_passes(
                     close_memory(state, agent_memory.take()).await;
                     return Ok(());
                 }
-                run_end::Empty::Unbuilt(reason) => {
+                run_end::Empty::Unbuilt(reason) | run_end::Empty::Rejected(reason) => {
                     close_memory(state, agent_memory.take()).await;
                     return Err(reason.into());
+                }
+                // GitHub refused the writes (or the diff) for a while: the
+                // run waits and goes on by itself (`orchestrate_ticket`).
+                run_end::Empty::Wait(cause, until) => {
+                    close_memory(state, agent_memory.take()).await;
+                    return Err(Box::new(crate::clients::github::GitHubPaused {
+                        cause,
+                        until,
+                    }));
                 }
                 run_end::Empty::Generic => {}
             }
@@ -6374,10 +6675,24 @@ async fn run_repo_pipeline(
         let tasks =
             plan_coverage::tasks_for(github, repo_owner, repo_name, branch_name, &repo_plan.tasks)
                 .await;
-        match run_end::judge(work.as_deref(), &tasks, &[], false) {
+        let outside = github.outside().map(|p| (p.cause, p.until));
+        match run_end::judge(
+            work.as_deref(),
+            &tasks,
+            &[],
+            false,
+            &impl_result.writes,
+            outside,
+        ) {
             run_end::Empty::Carry(files) => impl_result.files_modified = files,
-            run_end::Empty::Unbuilt(reason) => {
+            run_end::Empty::Unbuilt(reason) | run_end::Empty::Rejected(reason) => {
                 return Err(format!("{repo_owner}/{repo_name}: {reason}").into())
+            }
+            run_end::Empty::Wait(cause, until) => {
+                return Err(Box::new(crate::clients::github::GitHubPaused {
+                    cause,
+                    until,
+                }))
             }
             _ => {
                 return Err(format!(
@@ -6921,7 +7236,7 @@ async fn resume_run_to_running(state: &WorkerState, team_id: &str, run_id: &str)
         .table_name(&state.config.runs_table_name)
         .key("team_id", attr_s(team_id))
         .key("run_id", attr_s(run_id))
-        .update_expression("SET #s = :r, status_run_id = :sri, updated_at = :t")
+        .update_expression("SET #s = :r, status_run_id = :sri, updated_at = :t REMOVE github_wait")
         // Nor a run the guard stopped: a step already queued doesn't undo it.
         .condition_expression(format!(
             "attribute_exists(run_id) AND attribute_not_exists(guard_open) AND {}",
@@ -7137,6 +7452,11 @@ pub(crate) async fn update_pass(
         Some(("current_pass = :p", ":p", attr_s(pass))),
     )
     .await?;
+    // Going on with the pass a wait for GitHub interrupted is not a new pass
+    // (the wait is GitHub's, not the run's): only the guard's stop holds.
+    if run_guard::take_reentry(run_id, pass) {
+        return run_guard::check(state, team_id, run_id).await;
+    }
     // Every pass goes through here, so a pass added later is counted too.
     run_guard::on_pass(state, team_id, run_id).await
 }

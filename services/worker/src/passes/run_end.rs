@@ -23,8 +23,61 @@
 //!   questions then.
 //! - The generic questions ([`Empty::Generic`]) are only for a ticket that
 //!   names no file and a plan with no file tasks.
+//! - "Wrote no file" means the coder made no write. Writes GitHub refused
+//!   for a while (its rate limit, a 5xx), or a diff it couldn't show for
+//!   that reason, are a wait ([`Empty::Wait`]): the run pauses and goes on
+//!   by itself (`common::github_wait`). Writes GitHub rejected for a real
+//!   reason are reported with that reason ([`Empty::Rejected`]). Neither is
+//!   ever called CoderHelm's miss.
 
 use super::plan_coverage::PlanTask;
+use common::github_wait::Cause;
+
+/// What became of the writes a pass tried, beyond the files it wrote.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Writes {
+    /// Write calls GitHub refused for a while: how many, why, and until
+    /// when (epoch seconds) the last one said to wait.
+    pub refused: usize,
+    pub refused_for: Option<(Cause, u64)>,
+    /// Write calls GitHub rejected for a real reason, as `path: reason`.
+    pub rejected: Vec<String>,
+}
+
+impl Writes {
+    /// One write call GitHub refused for a while.
+    pub fn refuse(&mut self, cause: Cause, until: u64) {
+        self.refused += 1;
+        let later = self.refused_for.map_or(until, |(_, u)| u.max(until));
+        self.refused_for = Some((cause, later));
+    }
+
+    /// One write call GitHub rejected: `what` names the file(s), `why` is
+    /// GitHub's answer.
+    pub fn reject(&mut self, what: &str, why: &str) {
+        if self.rejected.len() < 5 {
+            self.rejected
+                .push(format!("{what}: {}", common::truncate_str(why.trim(), 300)));
+        }
+    }
+
+    pub fn merge(&mut self, other: Writes) {
+        self.refused += other.refused;
+        if let Some((c, u)) = other.refused_for {
+            let later = self.refused_for.map_or(u, |(_, x)| x.max(u));
+            self.refused_for = Some((c, later));
+        }
+        for r in other.rejected {
+            if self.rejected.len() < 5 {
+                self.rejected.push(r);
+            }
+        }
+    }
+}
+
+/// Why GitHub couldn't be read or written just now, when it was for a
+/// while: the cause and until when (epoch seconds).
+pub type Outside = Option<(Cause, u64)>;
 
 /// What a step that changed no file leads to.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -39,6 +92,11 @@ pub enum Empty {
     /// The ticket names no file and the plan has no file tasks: ask what
     /// should change.
     Generic,
+    /// GitHub refused the writes (or the branch's diff) for a while: the run
+    /// waits until then (epoch seconds) and goes on by itself.
+    Wait(Cause, u64),
+    /// GitHub rejected the writes for a real reason: stop, saying it.
+    Rejected(String),
 }
 
 /// The files the branch changes that are the run's work: everything but the
@@ -104,15 +162,26 @@ pub fn ticket_names_files(text: &str) -> bool {
 /// files (`None` when GitHub couldn't say: then nothing is claimed either
 /// way and the plan decides); `tasks`: the plan's file tasks;
 /// `questions`: the coder's own; `ticket_names_files`: the ticket's text
-/// names a file.
+/// names a file; `writes`: the writes GitHub refused or rejected;
+/// `outside`: GitHub is refusing requests for a while right now.
 pub fn judge(
     work: Option<&[String]>,
     tasks: &[PlanTask],
     questions: &[String],
     ticket_names_files: bool,
+    writes: &Writes,
+    outside: Outside,
 ) -> Empty {
     if let Some(w) = work.filter(|w| !w.is_empty()) {
         return Empty::Carry(w.to_vec());
+    }
+    // Writes GitHub refused for a while, or a branch GitHub couldn't show
+    // while it refuses: wait for it, never "wrote no file".
+    if let Some((cause, until)) = writes.refused_for.or(outside.filter(|_| work.is_none())) {
+        return Empty::Wait(cause, until);
+    }
+    if !writes.rejected.is_empty() {
+        return Empty::Rejected(rejected_reason(&writes.rejected));
     }
     if !questions.is_empty() {
         return Empty::Ask(questions.to_vec());
@@ -125,6 +194,14 @@ pub fn judge(
         return Empty::Unbuilt(unbuilt_reason(&required, work.is_none()));
     }
     Empty::Generic
+}
+
+fn rejected_reason(rejected: &[String]) -> String {
+    format!(
+        "Stopped without a pull request: GitHub rejected the coder's writes to the branch: {}. \
+         The change was written but couldn't be saved; once that is fixed, Retry saves it.",
+        rejected.join("; ")
+    )
 }
 
 fn unbuilt_reason(required: &[&PlanTask], unread: bool) -> String {
@@ -145,15 +222,18 @@ fn unbuilt_reason(required: &[&PlanTask], unread: bool) -> String {
     } else {
         format!("{} planned task(s): {list}", required.len())
     };
+    if unread {
+        // Whether the work is there is unknown: never blame anyone for it.
+        return format!(
+            "Stopped without a pull request: the coder made no write in this step and GitHub \
+             couldn't show the branch's diff, so whether the earlier work is there is unknown \
+             ({what}). Retry checks the branch again and builds what is missing."
+        );
+    }
     format!(
-        "Stopped without a pull request: the coder wrote no file{}, although the ticket and plan \
-         say what to build ({what}). That is CoderHelm's miss, not missing detail: Retry builds it \
-         from the same plan.",
-        if unread {
-            " (and GitHub couldn't show the branch's diff)"
-        } else {
-            " on the branch"
-        }
+        "Stopped without a pull request: the coder made no write to the branch, although the \
+         ticket and plan say what to build ({what}). That is CoderHelm's miss, not missing \
+         detail: Retry builds it from the same plan."
     )
 }
 
@@ -206,6 +286,10 @@ mod tests {
         - [ ] `e2e/test-map.json`: Register the new spec\n\
         - [ ] `studio/schema.json`: Regenerate with schema extract\n";
 
+    fn none() -> Writes {
+        Writes::default()
+    }
+
     fn files(p: &[&str]) -> Vec<String> {
         p.iter().map(|s| s.to_string()).collect()
     }
@@ -222,7 +306,7 @@ mod tests {
         ]);
         let work = work_files(&branch, "ABC-12");
         assert_eq!(work.len(), 3, "the plan files are not the work");
-        let out = judge(Some(&work), &plan_tasks(PLAN), &[], true);
+        let out = judge(Some(&work), &plan_tasks(PLAN), &[], true, &none(), None);
         assert_eq!(out, Empty::Carry(work));
     }
 
@@ -231,7 +315,7 @@ mod tests {
         let work = work_files(&files(&["openspec/specs/abc-12/proposal.md"]), "ABC-12");
         assert!(work.is_empty());
         // The ticket and plan name the files: never the generic questions.
-        match judge(Some(&work), &plan_tasks(PLAN), &[], true) {
+        match judge(Some(&work), &plan_tasks(PLAN), &[], true, &none(), None) {
             Empty::Unbuilt(r) => {
                 assert!(r.contains("3 planned task(s)"), "{r}");
                 assert!(r.contains("`web/src/blocks/hero.tsx`"));
@@ -260,7 +344,7 @@ mod tests {
             "a bare 'ok?' is not a question worth asking"
         );
         assert_eq!(
-            judge(Some(&[]), &plan_tasks(PLAN), &qs, true),
+            judge(Some(&[]), &plan_tasks(PLAN), &qs, true, &none(), None),
             Empty::Ask(qs.clone())
         );
         let asked = questions_from(&qs);
@@ -270,15 +354,72 @@ mod tests {
 
     #[test]
     fn generic_questions_only_when_nothing_names_a_file() {
-        assert_eq!(judge(Some(&[]), &[], &[], false), Empty::Generic);
+        assert_eq!(
+            judge(Some(&[]), &[], &[], false, &none(), None),
+            Empty::Generic
+        );
         assert!(matches!(
-            judge(Some(&[]), &[], &[], true),
+            judge(Some(&[]), &[], &[], true, &none(), None),
             Empty::Unbuilt(_)
         ));
         // An unreadable diff never claims "no changes" for a planned ticket.
         assert!(matches!(
-            judge(None, &plan_tasks(PLAN), &[], false),
-            Empty::Unbuilt(r) if r.contains("couldn't show")
+            judge(None, &plan_tasks(PLAN), &[], false, &none(), None),
+            Empty::Unbuilt(r) if r.contains("couldn't show") && !r.contains("CoderHelm's miss")
+        ));
+    }
+
+    /// The incident: every write was refused with GitHub's rate limit and
+    /// the diff couldn't be read either. That is a wait, never "the coder
+    /// wrote no file", never CoderHelm's miss.
+    #[test]
+    fn writes_github_refused_for_a_while_are_a_wait_not_no_file() {
+        let mut writes = Writes::default();
+        for _ in 0..29 {
+            writes.refuse(Cause::RateLimit, 1_793_999_100);
+        }
+        assert_eq!(writes.refused, 29);
+        let out = judge(None, &plan_tasks(PLAN), &[], true, &writes, None);
+        assert_eq!(out, Empty::Wait(Cause::RateLimit, 1_793_999_100));
+        // No write was refused, but GitHub is refusing while the diff is
+        // unread: also a wait.
+        let out = judge(
+            None,
+            &plan_tasks(PLAN),
+            &[],
+            true,
+            &none(),
+            Some((Cause::Outage, 7)),
+        );
+        assert_eq!(out, Empty::Wait(Cause::Outage, 7));
+        // With the work readable on the branch, the run carries on.
+        let work = files(&["web/src/blocks/hero.tsx"]);
+        assert_eq!(
+            judge(Some(&work), &plan_tasks(PLAN), &[], true, &writes, None),
+            Empty::Carry(work)
+        );
+    }
+
+    #[test]
+    fn writes_github_rejected_for_a_real_reason_say_that_reason() {
+        let mut writes = Writes::default();
+        writes.reject(
+            "web/src/blocks/hero.tsx",
+            "HTTP status client error (403 Forbidden) for url (...): Resource not accessible by integration",
+        );
+        match judge(Some(&[]), &plan_tasks(PLAN), &[], true, &writes, None) {
+            Empty::Rejected(r) => {
+                assert!(r.contains("GitHub rejected the coder's writes"), "{r}");
+                assert!(r.contains("Resource not accessible by integration"));
+                assert!(!r.contains("CoderHelm's miss"));
+                assert!(!r.contains("wrote no file"));
+            }
+            other => panic!("{other:?}"),
+        }
+        // Only a step with no write at all is "no write".
+        assert!(matches!(
+            judge(Some(&[]), &plan_tasks(PLAN), &[], true, &none(), None),
+            Empty::Unbuilt(r) if r.contains("made no write")
         ));
     }
 
