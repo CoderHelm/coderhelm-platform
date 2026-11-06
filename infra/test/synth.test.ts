@@ -15,7 +15,7 @@ import * as cdk from "aws-cdk-lib";
 import { Match, Template } from "aws-cdk-lib/assertions";
 import { buildApp } from "../lib/app";
 import { CoderhelmConfig, loadConfigFile, resolveConfig, ResolvedConfig } from "../lib/config";
-import { API_PATHS, BRAIN_STREAM_PATH, STREAM_PATH, runtimeConfigScript } from "../lib/web-stack";
+import { API_PATHS, BRAIN_STREAM_PATH, DASHBOARD_URL_PLACEHOLDER, STREAM_PATH, runtimeConfigScript } from "../lib/web-stack";
 import { releaseCheckBuildSpec, updateBuildSpec } from "../lib/updates-stack";
 import { CHECK_VERSION, COSIGN_LINUX_AMD64_SHA256, VERIFY_SUMS, verifyTagCommands } from "../lib/release-verify";
 import { accessNames, deployPolicy } from "../lib/access";
@@ -244,6 +244,15 @@ test("a dashboard build is uploaded with the runtime config", () => {
   const t = synth(selfHost({ dashboard: { assetDir: dir } }));
   const deployments = t["coderhelm-prod-web"].findResources("Custom::CDKBucketDeployment");
   assert.equal(Object.keys(deployments).length, 2);
+  // The pages' link previews get the install's own address (the dashboard
+  // writes DASHBOARD_URL_PLACEHOLDER); the hashed scripts are left alone.
+  const pages = Object.entries<any>(deployments).find(([id]) => id.startsWith("DashboardPages"))![1];
+  const assets = Object.entries<any>(deployments).find(([id]) => id.startsWith("DashboardAssets"))![1];
+  const markers = JSON.stringify(pages.Properties.SourceMarkers);
+  assert.ok(markers.includes(`"${DASHBOARD_URL_PLACEHOLDER}":`), markers);
+  assert.match(markers, /DistributionDomainName|https:\/\//, "replaced by the public URL");
+  assert.equal(pages.Properties.SourceMarkers[0][DASHBOARD_URL_PLACEHOLDER].toString().includes("invalid"), false);
+  assert.ok(!JSON.stringify(assets.Properties.SourceMarkers ?? []).includes(DASHBOARD_URL_PLACEHOLDER));
   assert.throws(() => synth(selfHost({ dashboard: { assetDir: STUBS } })), /has no index.html/);
 });
 
