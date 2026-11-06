@@ -728,6 +728,7 @@ async fn process_jira_payload(
         sender,
         requester,
         image_attachments,
+        ticket_type: common::messages::ticket_type_of_jira(issue),
         ..Default::default()
     });
 
@@ -1133,6 +1134,7 @@ async fn handle_jira_comment(
                     .and_then(|s| serde_json::from_str(s).ok())
                     .unwrap_or_default()
             },
+            ticket_type: common::messages::ticket_type_of_jira(issue),
             ..Default::default()
         })
     };

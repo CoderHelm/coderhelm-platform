@@ -608,6 +608,80 @@ fn clip(s: &str, max_chars: usize) -> String {
     format!("{}…", kept.trim_end())
 }
 
+/// Openings of a question that hands a person the run's own search: where
+/// the work goes, or what else it needs, with nothing to choose from.
+const OPEN_FORMS: &[&str] = &[
+    "where does the fix belong",
+    "where does this belong",
+    "where does it belong",
+    "where should the fix go",
+    "where should this go",
+    "where should the change go",
+    "which system or part",
+    "which system is",
+    "which part of the system",
+    "what else does this need",
+    "what else is needed",
+    "what should happen next",
+    "how should i proceed",
+    "how should this be fixed",
+    "what should i do",
+    "can you clarify",
+    "please clarify",
+    "please provide more",
+    "any other details",
+    "anything else i should know",
+];
+
+/// Why a question is too open to put to a person, or `None` when it is fit
+/// to ask. A person is asked only what they can answer better than the
+/// code: a specific question, with the options the run considered (at least
+/// two) or its own recommendation in the question ("I plan to ...; anything
+/// else?"). An open "where does it belong" with no options never is.
+/// CoderHelm's own choice cards (`decision`) are always fit.
+pub fn too_open(q: &Question) -> Option<&'static str> {
+    if !q.decision.is_empty()
+        || q.suggestions
+            .iter()
+            .filter(|s| !s.trim().is_empty())
+            .count()
+            >= 2
+    {
+        return None;
+    }
+    let text = q
+        .question
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_ascii_lowercase();
+    if text.is_empty() {
+        return Some(WHY_EMPTY);
+    }
+    let recommends = [
+        "i plan to",
+        "i will",
+        "i'll",
+        "i recommend",
+        "i propose",
+        "my plan is",
+    ]
+    .iter()
+    .any(|p| text.contains(p));
+    if recommends {
+        return None;
+    }
+    if OPEN_FORMS.iter().any(|f| text.contains(f)) {
+        return Some(WHY_OPEN);
+    }
+    None
+}
+
+/// [`too_open`]'s reason for an empty question.
+pub const WHY_EMPTY: &str = "it is empty";
+/// [`too_open`]'s reason for an open question.
+pub const WHY_OPEN: &str = "it hands a person the run's own search (where the work goes, what else it needs) with no options and no recommendation: name the options considered and the one recommended";
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -857,5 +931,52 @@ mod tests {
     fn the_digest_changes_with_the_answers() {
         assert!(digest(&[]).is_empty());
         assert_ne!(digest(&[answer("A?", "1")]), digest(&[answer("A?", "2")]));
+    }
+
+    #[test]
+    fn an_open_question_with_no_options_is_not_asked() {
+        use super::{too_open, Question, WHY_OPEN};
+        let open = Question {
+            question: "Where does the fix belong: which system or part of it?".into(),
+            why: "The plan didn't say.".into(),
+            ..Default::default()
+        };
+        assert_eq!(too_open(&open), Some(WHY_OPEN));
+        let open = Question {
+            question: "What else does this need before I build it?".into(),
+            ..Default::default()
+        };
+        assert_eq!(too_open(&open), Some(WHY_OPEN));
+        // The same doubt with the options considered is fit to ask.
+        let with_options = Question {
+            question: "Where does the fix belong?".into(),
+            suggestions: vec![
+                "In the block schemas (code)".into(),
+                "In the CMS entries (content)".into(),
+            ],
+            ..Default::default()
+        };
+        assert_eq!(too_open(&with_options), None);
+        // So is a plan with a recommendation.
+        let plan = Question {
+            question: "I plan to put the setting on these 3 block schemas and read it in these \
+                       components; anything else?"
+                .into(),
+            ..Default::default()
+        };
+        assert_eq!(too_open(&plan), None);
+        // A specific yes/no question is fit too.
+        let specific = Question {
+            question: "Use the existing `title_size` field instead of creating a new one?".into(),
+            ..Default::default()
+        };
+        assert_eq!(too_open(&specific), None);
+        // CoderHelm's own choice cards always are.
+        let card = Question {
+            question: "Where should this go?".into(),
+            decision: "open_pr:acme/web#1".into(),
+            ..Default::default()
+        };
+        assert_eq!(too_open(&card), None);
     }
 }

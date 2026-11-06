@@ -13,7 +13,7 @@ use crate::WorkerState;
 /// any change to how plans are made or what a plan must carry, so a plan
 /// written by an older planner is never reused.
 pub const PLANNER_VERSION: &str =
-    "2026-11-04.intent-history-env-near-match-stop-rules-data-rules-cross-repo-asking-reproduce";
+    "2026-11-06.intent-history-env-near-match-stop-rules-data-rules-cross-repo-asking-reproduce-decision-reask-series";
 
 /// The openspec file holding the plan's end-to-end checklist, readable.
 pub const END_TO_END_FILE: &str = "end_to_end.md";
@@ -378,6 +378,26 @@ Then the ```fix_location.json block described above."#,
     let prompt = format!(
         "{prompt}{}",
         common::run_questions::answers_note(&msg.answers)
+    );
+    // One part of a numbered series: the other parts' pull requests, so
+    // the plan builds on them (see `series`).
+    let series_part = super::series::of_ticket(&msg.title, &msg.body);
+    let siblings = if series_part.is_some() {
+        super::series::find(
+            github,
+            &msg.repo_owner,
+            &msg.repo_name,
+            &msg.ticket_id,
+            &msg.title,
+            &msg.body,
+        )
+        .await
+    } else {
+        Vec::new()
+    };
+    let prompt = format!(
+        "{prompt}{}",
+        super::series::planner_note(series_part, &default_repo, &siblings)
     );
 
     let mut tools = read_only_tools();
@@ -986,6 +1006,47 @@ Then the ```fix_location.json block described above."#,
             }
         }
     }
+    // A plan whose answer carried no decision that reads is a format
+    // failure, never a question for a person: the planner is asked once
+    // more for only the block (one small call, no tools), and when that
+    // still gives none, the plan itself decides (see `fix_location::fallback`).
+    let mut block_failure: Option<String> = None;
+    if files.fix.is_none() && needs_decision(&files.tasks) {
+        let problem = match super::fix_location::parse_detailed(&response) {
+            Err(p) => p,
+            Ok(_) => super::fix_location::BlockProblem::Missing,
+        };
+        let spent = usage.input_tokens
+            + usage.output_tokens
+            + usage.cache_read_tokens
+            + usage.cache_write_tokens;
+        warn!(
+            ticket_id = %msg.ticket_id,
+            problem = %problem.describe(),
+            tokens_so_far = spent,
+            "Planner gave no readable decision — asking again for the block only"
+        );
+        let again = reask_decision(state, provider, usage, msg, intent, &problem, &files).await;
+        let outcome = if again.is_some() {
+            "asked the planner again for the block: got it"
+        } else {
+            "asked the planner again for the block: still none"
+        };
+        let line = format!("{}; {outcome}", problem.describe());
+        record_planner_failure(state, msg, run_id, problem.kind(), &line, spent).await;
+        super::add_progress_note(
+            state,
+            &msg.team_id,
+            run_id,
+            &format!("Plan check (format): {line}."),
+        )
+        .await;
+        files.fix = again.map(|mut d| {
+            d.planner_failure = line.clone();
+            d
+        });
+        block_failure = Some(line);
+    }
     // The decision's own questions (where the fix belongs) are held to the
     // same rules: what may not stop the run is left out.
     if let Some(d) = files.fix.as_mut().filter(|d| !d.questions.is_empty()) {
@@ -1032,6 +1093,38 @@ Then the ```fix_location.json block described above."#,
                 super::fix_location::mark_untraced(d, &gaps)
             }
         });
+    }
+    // Still no decision after asking again: the plan itself decides. A plan
+    // with nothing to decide from is a planner failure, reported as one.
+    if let Some(line) = block_failure.as_deref().filter(|_| files.fix.is_none()) {
+        match super::fix_location::fallback(intent, &files.tasks, line) {
+            Some(d) => {
+                info!(
+                    ticket_id = %msg.ticket_id,
+                    fix_location = d.fix_location.as_str(),
+                    "Planner's decision settled from the plan itself"
+                );
+                super::add_progress_note(
+                    state,
+                    &msg.team_id,
+                    run_id,
+                    &format!(
+                        "Plan check (format): decided from the plan itself: the fix is `{}` ({}).",
+                        d.fix_location.as_str(),
+                        d.cause
+                    ),
+                )
+                .await;
+                files.fix = Some(d);
+            }
+            None => {
+                return Err(format!(
+                    "Planner failure: {line}, and the plan has no tasks to decide from. \
+                     Nothing was asked of a person; retry the run."
+                )
+                .into());
+            }
+        }
     }
     // Every check sent its gaps back in the one send-back above; what each
     // still finds goes on the decision's open gaps (never another plan), and
@@ -1392,6 +1485,111 @@ Then the ```fix_location.json block described above."#,
         .await;
 
     Ok(files)
+}
+
+/// Whether a plan needs a decision on where the fix belongs: everything
+/// but a plan that says the work is done or stops on a question.
+fn needs_decision(tasks: &str) -> bool {
+    let t = tasks.trim_start();
+    !t.starts_with("NO_CHANGES_NEEDED:") && !t.starts_with("CLARIFICATION_NEEDED:")
+}
+
+/// Asks the planner once more for only its decision block: a fresh, small
+/// call with the plan it wrote, no tools, low effort. `None` when the reply
+/// still has no block that reads or the call fails.
+async fn reask_decision(
+    state: &WorkerState,
+    provider: &ModelProvider,
+    usage: &mut TokenUsage,
+    msg: &TicketMessage,
+    intent: super::triage::TicketIntent,
+    problem: &super::fix_location::BlockProblem,
+    files: &PlanResult,
+) -> Option<super::fix_location::FixDecision> {
+    let prompt = super::fix_location::reask_prompt(
+        &msg.title,
+        intent,
+        problem,
+        &files.proposal,
+        &files.design,
+        &files.tasks,
+    );
+    let mut messages = vec![(
+        "user".to_string(),
+        vec![json!({"type": "text", "text": prompt})],
+    )];
+    let reply = provider::converse(
+        state,
+        provider,
+        common::agent_policy::Agent::Planner,
+        provider.primary_model_id(),
+        "You write one JSON block for a plan that already exists. Return only the block.",
+        &mut messages,
+        &[],
+        &super::triage::NoOpExecutor,
+        usage,
+        llm::ConverseOptions {
+            max_turns: 1,
+            max_tokens: 4096,
+            deadline: None,
+            effort: Some("low"),
+        },
+        None,
+        None,
+    )
+    .await;
+    match reply {
+        Ok(text) => super::fix_location::parse_for(&text, intent),
+        Err(e) => {
+            warn!(ticket_id = %msg.ticket_id, error = %e, "Asking the planner again for its decision failed");
+            None
+        }
+    }
+}
+
+/// Records a planner format failure on the run and in the team's analytics
+/// (`planner_format_failures`), so a model that spent its budget and then
+/// left out its decision shows as a planner failure, not as a question.
+async fn record_planner_failure(
+    state: &WorkerState,
+    msg: &TicketMessage,
+    run_id: &str,
+    kind: &str,
+    line: &str,
+    tokens_before: u64,
+) {
+    use aws_sdk_dynamodb::types::AttributeValue;
+    let s = |v: &str| AttributeValue::S(v.to_string());
+    if let Err(e) = state
+        .dynamo
+        .update_item()
+        .table_name(&state.config.runs_table_name)
+        .key("team_id", s(&msg.team_id))
+        .key("run_id", s(run_id))
+        .update_expression(
+            "SET planner_failure = :pf, planner_failure_kind = :k, planner_failure_tokens = :t",
+        )
+        .expression_attribute_values(":pf", s(line))
+        .expression_attribute_values(":k", s(kind))
+        .expression_attribute_values(":t", AttributeValue::N(tokens_before.to_string()))
+        .send()
+        .await
+    {
+        warn!(run_id, error = %e, "Could not record the planner failure on the run");
+    }
+    let month = chrono::Utc::now().format("%Y-%m").to_string();
+    for period in [month.as_str(), "ALL_TIME"] {
+        let _ = state
+            .dynamo
+            .update_item()
+            .table_name(&state.config.analytics_table_name)
+            .key("team_id", s(&msg.team_id))
+            .key("period", s(period))
+            .update_expression("ADD planner_format_failures :one")
+            .expression_attribute_values(":one", AttributeValue::N("1".to_string()))
+            .send()
+            .await;
+    }
 }
 
 /// The questions a plan stops on when its outside note (fix `both` or

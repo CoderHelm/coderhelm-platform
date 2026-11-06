@@ -538,6 +538,7 @@ async fn handle_issue_event(
             payload["sender"]["login"].as_str().unwrap_or(""),
         ),
         image_attachments: vec![],
+        ticket_type: common::messages::ticket_type_of_github(issue),
         ..Default::default()
     });
 
@@ -1576,6 +1577,7 @@ async fn handle_issue_comment(
             payload["sender"]["login"].as_str().unwrap_or(""),
         ),
         image_attachments: vec![],
+        ticket_type: common::messages::ticket_type_of_github(issue),
         ..Default::default()
     });
 

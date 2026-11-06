@@ -892,6 +892,7 @@ pub(crate) mod run_lists;
 mod security;
 #[cfg(test)]
 mod selfhost_links;
+mod series;
 pub mod skill_compat;
 pub mod skill_suggest;
 pub mod skills;
@@ -2312,6 +2313,17 @@ async fn run_passes(
     )
     .await;
 
+    // A plan with no decision (one saved before the planner settled every
+    // missing decision itself) decides from its own tasks; never by asking
+    // a person where the fix belongs.
+    if plan_result.fix.is_none() {
+        plan_result.fix = fix_location::fallback(
+            triage_result.intent,
+            &plan_result.tasks,
+            "the plan carried no fix_location decision; decided from its tasks",
+        );
+    }
+
     // --- Repo check, before anything is decided on this plan ---
     // A plan written against the wrong repo (its files live in another
     // one) is planned again in the right repo before its decision counts or
@@ -2530,6 +2542,7 @@ async fn run_passes(
                 &github,
                 &decision,
                 fix_location::Route::Ask,
+                &plan_result.tasks,
                 usage,
                 start,
                 &used_mcp_ids,
@@ -2577,12 +2590,15 @@ async fn run_passes(
             fix_route = route;
         }
     }
+    // A missing decision is not a directive: a plan with no decision and
+    // no tasks is a malformed plan (a planner failure), never a question.
     let plan_is_directive = plan_result.tasks.starts_with("NO_CHANGES_NEEDED:")
         || plan_result.tasks.starts_with("CLARIFICATION_NEEDED:")
-        || matches!(
-            fix_route,
-            fix_location::Route::OutsideOnly | fix_location::Route::Ask
-        );
+        || (plan_result.fix.is_some()
+            && matches!(
+                fix_route,
+                fix_location::Route::OutsideOnly | fix_location::Route::Ask
+            ));
     if !plan_is_directive
         && (plan_result.tasks.trim().is_empty() || plan_result.design.trim().is_empty())
     {
@@ -2609,10 +2625,21 @@ async fn run_passes(
             fix_location::Route::OutsideOnly | fix_location::Route::Ask
         )
     {
-        let mut decision = plan_result
-            .fix
-            .clone()
-            .unwrap_or_else(fix_location::undecided);
+        // A plan with no decision even after the planner was asked again
+        // and the plan's own tasks gave nothing to decide from is a planner
+        // failure: never a question to a person about where the fix goes.
+        let Some(mut decision) = plan_result.fix.clone() else {
+            warn!(
+                run_id,
+                "Plan has no decision and nothing to decide from — planner failure"
+            );
+            close_memory(state, agent_memory.take()).await;
+            return Err(
+                "Planner failure: the plan carried no fix_location decision and its tasks name \
+                 no files to decide from. Nothing was asked of a person; retry the run."
+                    .into(),
+            );
+        };
         if decision.cause.trim().is_empty() {
             // A plan that codes nothing but wrote no decision: its one line
             // is what it found.
@@ -2631,6 +2658,7 @@ async fn run_passes(
             &github,
             &decision,
             fix_route,
+            &plan_result.tasks,
             usage,
             start,
             &used_mcp_ids,
@@ -7005,6 +7033,7 @@ async fn finish_without_code(
     github: &GitHubClient,
     decision: &fix_location::FixDecision,
     route: fix_location::Route,
+    tasks: &str,
     usage: &TokenUsage,
     start: &std::time::Instant,
     mcp_ids: &[String],
@@ -7063,7 +7092,7 @@ async fn finish_without_code(
     } else {
         // Not knowing where the fix belongs is a question for a person: the
         // run page lists the decision's questions and takes the answers.
-        let questions = unknown_fix_questions(decision, &msg.answers);
+        let questions = unknown_fix_questions(decision, &msg.answers, tasks);
         ask_on_ticket(
             state,
             msg,
@@ -8788,44 +8817,16 @@ fn empty_change_questions() -> Vec<common::run_questions::Question> {
     ]
 }
 
-/// What a run asks when it doesn't know where the fix belongs: the plan's
-/// own questions not answered already, else one question by the kind of
-/// ticket, with the cause as its reason.
+/// What a run asks when it stops without a fix: the plan's own questions
+/// not answered already and fit to ask, else one concrete question with the
+/// options the run considered (see `fix_location::person_questions`). Never
+/// an open "where does the fix belong".
 fn unknown_fix_questions(
     decision: &fix_location::FixDecision,
     answers: &[common::run_questions::Answer],
+    tasks: &str,
 ) -> Vec<common::run_questions::Question> {
-    let own = common::run_questions::unanswered(
-        common::run_questions::from_lines(&decision.questions),
-        answers,
-    );
-    if !own.is_empty() {
-        return own;
-    }
-    let question = match decision.intent {
-        fix_location::TicketIntent::Bug => "Where does the fix belong: which system or part of it?",
-        fix_location::TicketIntent::Feature | fix_location::TicketIntent::Chore => {
-            "What else does this need before I build it?"
-        }
-        fix_location::TicketIntent::Question => "Does this answer it, or what should happen next?",
-    };
-    vec![common::run_questions::Question {
-        id: "q1".to_string(),
-        question: question.to_string(),
-        why: common::truncate_str(
-            &decision
-                .cause
-                .split_whitespace()
-                .collect::<Vec<_>>()
-                .join(" "),
-            600,
-        )
-        .to_string(),
-        suggestions: Vec::new(),
-        decision: String::new(),
-        evidence: Vec::new(),
-        ..Default::default()
-    }]
+    fix_location::person_questions(decision, answers, tasks)
 }
 
 /// Keeps what a run asked on its record (see `common::run_questions`).
@@ -11835,17 +11836,22 @@ mod asking_tests {
                 "Which job should own the table?",
                 "The hourly one",
             )],
+            "",
         );
         assert_eq!(qs.len(), 1);
         assert_eq!(qs[0].question, "Is the nightly job still needed?");
-        // No questions of its own: one by the kind of ticket, the cause as why.
+        // No questions of its own: one concrete question with options and
+        // a recommendation, the cause as why; never an open "where does
+        // the fix belong".
         let bare = FixDecision {
             questions: vec![],
             ..d
         };
-        let qs = unknown_fix_questions(&bare, &[]);
+        let qs = unknown_fix_questions(&bare, &[], "");
         assert_eq!(qs.len(), 1);
-        assert!(qs[0].question.starts_with("Where does the fix belong"));
+        assert!(!qs[0].question.contains("Where does the fix belong"));
+        assert_eq!(common::run_questions::too_open(&qs[0]), None);
+        assert!(qs[0].suggestions.len() >= 2);
         assert_eq!(qs[0].why, "Two jobs write the same table.");
     }
 

@@ -958,6 +958,12 @@ pub struct TicketMessage {
     /// The run keeps its run_id across these, like a continuation.
     #[serde(default)]
     pub model_retries: u32,
+    /// What the tracker calls the ticket (a Jira issue type such as `Story`
+    /// or `Bug`, a GitHub issue type or its `bug`/`enhancement` label), when
+    /// it says. Triage weighs it with the ticket's text (see
+    /// [`ticket_type_of_jira`], [`ticket_type_of_github`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ticket_type: Option<String>,
     /// Set in-process when the ticket changed under an open PR: the implement
     /// agent gets this note (old→new ticket diff + PR diff) and updates the
     /// existing PR instead of starting over. Never serialized.
@@ -999,6 +1005,56 @@ fn default_branch() -> String {
     "main".to_string()
 }
 
+/// The issue type a Jira issue carries (`fields.issuetype.name`), when the
+/// event has it.
+pub fn ticket_type_of_jira(issue: &serde_json::Value) -> Option<String> {
+    issue
+        .pointer("/fields/issuetype/name")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
+/// Labels that say what kind of work a GitHub issue is.
+const KIND_LABELS: &[&str] = &[
+    "bug",
+    "defect",
+    "regression",
+    "enhancement",
+    "feature",
+    "feature request",
+    "new feature",
+    "improvement",
+    "chore",
+    "question",
+];
+
+/// What a GitHub issue says it is: its issue type (`type.name`), else the
+/// first label that names a kind of work.
+pub fn ticket_type_of_github(issue: &serde_json::Value) -> Option<String> {
+    if let Some(t) = issue
+        .pointer("/type/name")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        return Some(t.to_string());
+    }
+    issue["labels"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|l| l["name"].as_str().or_else(|| l.as_str()))
+        .map(str::trim)
+        .find(|l| {
+            let low = l.to_ascii_lowercase();
+            let low = low.trim_start_matches("type:").trim_start_matches("kind/");
+            KIND_LABELS.contains(&low.trim())
+        })
+        .map(str::to_string)
+}
+
 impl Default for TicketMessage {
     /// An empty ticket on `main`, as a message without `base_branch` reads.
     fn default() -> Self {
@@ -1022,6 +1078,7 @@ impl Default for TicketMessage {
             resume_from: None,
             retry_of_run: false,
             model_retries: 0,
+            ticket_type: None,
             ticket_update_note: None,
             ticket_history_note: None,
             plan_cache_key: None,
@@ -1234,5 +1291,45 @@ mod worker_contract_tests {
         .unwrap_err()
         .to_string();
         assert!(e.contains("unknown variant `SkillSync`"), "{e}");
+    }
+}
+
+#[cfg(test)]
+mod ticket_type_tests {
+    use super::{ticket_type_of_github, ticket_type_of_jira};
+    use serde_json::json;
+
+    #[test]
+    fn a_jira_issue_type_is_read() {
+        let issue = json!({"fields": {"issuetype": {"name": "Story"}, "summary": "s"}});
+        assert_eq!(ticket_type_of_jira(&issue).as_deref(), Some("Story"));
+        assert_eq!(ticket_type_of_jira(&json!({"fields": {}})), None);
+        assert_eq!(
+            ticket_type_of_jira(&json!({"fields": {"issuetype": {"name": " "}}})),
+            None
+        );
+    }
+
+    #[test]
+    fn a_github_issue_type_or_kind_label_is_read() {
+        assert_eq!(
+            ticket_type_of_github(&json!({"type": {"name": "Feature"}, "labels": []})).as_deref(),
+            Some("Feature")
+        );
+        assert_eq!(
+            ticket_type_of_github(
+                &json!({"labels": [{"name": "coderhelm"}, {"name": "enhancement"}]})
+            )
+            .as_deref(),
+            Some("enhancement")
+        );
+        assert_eq!(
+            ticket_type_of_github(&json!({"labels": [{"name": "type: bug"}]})).as_deref(),
+            Some("type: bug")
+        );
+        assert_eq!(
+            ticket_type_of_github(&json!({"labels": [{"name": "coderhelm"}]})),
+            None
+        );
     }
 }

@@ -372,6 +372,9 @@ pub fn asking_rule(
     if !q.decision.is_empty() {
         return None;
     }
+    if let Some(why) = crate::run_questions::too_open(q) {
+        return Some(why);
+    }
     if read.conflicting_findings {
         return Some(WHY_CONFLICT);
     }
@@ -408,6 +411,8 @@ pub fn is_asking_rule(why: &str) -> bool {
         WHY_ANSWERABLE,
         WHY_FIELD_UNREAD,
         WHY_CONFLICT,
+        crate::run_questions::WHY_OPEN,
+        crate::run_questions::WHY_EMPTY,
     ]
     .contains(&why)
 }
