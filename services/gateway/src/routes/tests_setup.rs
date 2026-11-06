@@ -114,23 +114,46 @@ impl Gh<'_> {
             .await
             .map_err(|e| e.to_string())?;
         let status = resp.status().as_u16();
-        Ok((status, resp.json::<Value>().await.unwrap_or(Value::Null)))
+        let header = |name: &str| {
+            resp.headers()
+                .get(name)
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_string)
+        };
+        let limits = RateHeaders {
+            remaining: header("x-ratelimit-remaining"),
+            reset: header("x-ratelimit-reset"),
+            retry_after: header("retry-after"),
+        };
+        let body = resp.json::<Value>().await.unwrap_or(Value::Null);
+        // GitHub's rate limit stops every read alike: say so, never "not found".
+        if let Some(m) = rate_limit_message(status, &limits, &body, chrono::Utc::now().timestamp())
+        {
+            return Err(m);
+        }
+        Ok((status, body))
     }
 
-    async fn file(&self, repo: &str, path: &str, git_ref: &str) -> Option<String> {
+    /// A file's text, None when it isn't there. An error when GitHub refused
+    /// for its rate limit, so a check never reads "no workflow" from a limit.
+    async fn file(&self, repo: &str, path: &str, git_ref: &str) -> Result<Option<String>, String> {
         let (status, v) = self
             .get(&format!(
                 "/repos/{repo}/contents/{path}?ref={}",
                 urlencoding::encode(git_ref)
             ))
-            .await
-            .ok()?;
+            .await?;
         if status != 200 {
-            return None;
+            return Ok(None);
         }
-        let b64: String = v["content"].as_str()?.split_whitespace().collect();
-        let bytes = base64::engine::general_purpose::STANDARD.decode(b64).ok()?;
-        String::from_utf8(bytes).ok()
+        let Some(content) = v["content"].as_str() else {
+            return Ok(None);
+        };
+        let b64: String = content.split_whitespace().collect();
+        Ok(base64::engine::general_purpose::STANDARD
+            .decode(b64)
+            .ok()
+            .and_then(|b| String::from_utf8(b).ok()))
     }
 
     async fn first_file(
@@ -138,13 +161,74 @@ impl Gh<'_> {
         repo: &str,
         paths: &[&str],
         git_ref: &str,
-    ) -> Option<(String, String)> {
+    ) -> Result<Option<(String, String)>, String> {
         for p in paths {
-            if let Some(t) = self.file(repo, p, git_ref).await {
-                return Some((p.to_string(), t));
+            if let Some(t) = self.file(repo, p, git_ref).await? {
+                return Ok(Some((p.to_string(), t)));
             }
         }
-        None
+        Ok(None)
+    }
+}
+
+/// GitHub's rate limit headers on one response.
+#[derive(Debug, Default)]
+struct RateHeaders {
+    remaining: Option<String>,
+    reset: Option<String>,
+    retry_after: Option<String>,
+}
+
+/// When a response is GitHub's rate limit (a 429, or a 403 with no requests
+/// left or a body that says rate limit): what to tell the person, with when
+/// it resets. `now`: epoch seconds.
+fn rate_limit_message(status: u16, h: &RateHeaders, body: &Value, now: i64) -> Option<String> {
+    let spent = h.remaining.as_deref().map(str::trim) == Some("0");
+    let says = body["message"]
+        .as_str()
+        .is_some_and(|m| m.to_ascii_lowercase().contains("rate limit"));
+    if !(status == 429 || (status == 403 && (spent || says))) {
+        return None;
+    }
+    let at = h
+        .retry_after
+        .as_deref()
+        .and_then(|s| s.trim().parse::<i64>().ok())
+        .map(|secs| now + secs)
+        .or_else(|| {
+            h.reset
+                .as_deref()
+                .and_then(|s| s.trim().parse::<i64>().ok())
+        })
+        .filter(|t| *t > now);
+    Some(
+        match at.and_then(|t| chrono::DateTime::from_timestamp(t, 0)) {
+            Some(t) => {
+                let minutes = ((t.timestamp() - now) + 59) / 60;
+                format!(
+                "GitHub's hourly limit for Coderhelm is used up. It resets at {} UTC, in about {} {}; try again then.",
+                t.format("%H:%M"),
+                minutes,
+                if minutes == 1 { "minute" } else { "minutes" }
+            )
+            }
+            None => {
+                "GitHub's hourly limit for Coderhelm is used up. Try again in a few minutes.".into()
+            }
+        },
+    )
+}
+
+/// What a refused read of the repository itself says: only a 404 means the
+/// app can't see it; anything else is what GitHub answered.
+fn repo_refusal(status: u16, body: &Value) -> String {
+    let said = body["message"].as_str().unwrap_or("").trim();
+    match status {
+        404 => "Coderhelm's GitHub app can't see this repository.".into(),
+        401 => "GitHub didn't accept Coderhelm's sign in. Try again.".into(),
+        403 if !said.is_empty() => format!("GitHub refused to read this repository: {said}"),
+        _ if !said.is_empty() => format!("GitHub answered {status}: {said}"),
+        _ => format!("GitHub answered {status} when reading this repository. Try again."),
     }
 }
 
@@ -222,7 +306,7 @@ struct Files {
 async fn read_repo(gh: &Gh<'_>, repo: &str) -> Result<(Check, Files), String> {
     let (status, info) = gh.get(&format!("/repos/{repo}")).await?;
     if status != 200 {
-        return Err("Coderhelm's GitHub app can't see this repository.".into());
+        return Err(repo_refusal(status, &info));
     }
     let branch = info["default_branch"]
         .as_str()
@@ -247,12 +331,12 @@ async fn read_repo(gh: &Gh<'_>, repo: &str) -> Result<(Check, Files), String> {
             if !(path.ends_with(".yml") || path.ends_with(".yaml")) {
                 continue;
             }
-            if let Some(text) = gh.file(repo, path, &branch).await {
+            if let Some(text) = gh.file(repo, path, &branch).await? {
                 files.push((path.to_string(), text));
             }
         }
     }
-    let pkg = gh.file(repo, "package.json", &branch).await;
+    let pkg = gh.file(repo, "package.json", &branch).await?;
     let scripts = package_scripts(pkg.as_deref());
     let picked = pick_workflow(&files, &scripts);
     let runner = picked
@@ -268,7 +352,7 @@ async fn read_repo(gh: &Gh<'_>, repo: &str) -> Result<(Check, Files), String> {
             Runner::Cypress => &["cypress.config.ts", "cypress.config.js"],
             Runner::Junit => &[],
         };
-        let config = gh.first_file(repo, configs, &branch).await;
+        let config = gh.first_file(repo, configs, &branch).await?;
         check.reporter_file = config.as_ref().map(|(p, _)| p.clone());
         check.reporter_ok =
             reporter_writes_results(r, config.as_ref().map(|(_, t)| t.as_str()), pkg.as_deref());
@@ -848,6 +932,62 @@ pub async fn on_pr_closed(
 #[cfg(test)]
 mod unit {
     use super::*;
+
+    /// "Create setup PR" said the app couldn't see a repository it could:
+    /// GitHub's hourly limit was used up. A limit says so, with when it
+    /// resets; only a 404 means the app can't see the repository.
+    #[test]
+    fn a_rate_limit_is_never_read_as_cant_see_the_repository() {
+        let now = 1_000_000;
+        let spent = RateHeaders {
+            remaining: Some("0".into()),
+            reset: Some((now + 1_500).to_string()),
+            retry_after: None,
+        };
+        let body = json!({"message": "API rate limit exceeded for installation ID 1."});
+        let m = rate_limit_message(403, &spent, &body, now).unwrap();
+        assert_eq!(
+            m,
+            "GitHub's hourly limit for Coderhelm is used up. It resets at 14:11 UTC, in about 25 minutes; try again then."
+        );
+        // A secondary limit: retry-after, no headers spent.
+        let secondary = RateHeaders {
+            retry_after: Some("60".into()),
+            ..Default::default()
+        };
+        let m = rate_limit_message(
+            403,
+            &secondary,
+            &json!({"message": "You have exceeded a secondary rate limit"}),
+            now,
+        )
+        .unwrap();
+        assert!(m.contains("in about 1 minute;"), "{m}");
+        assert!(
+            rate_limit_message(429, &RateHeaders::default(), &Value::Null, now)
+                .unwrap()
+                .contains("Try again in a few minutes")
+        );
+        // Other refusals are not limits, and say what they are.
+        let plain = RateHeaders {
+            remaining: Some("4000".into()),
+            ..Default::default()
+        };
+        let forbidden = json!({"message": "Resource not accessible by integration"});
+        assert_eq!(rate_limit_message(403, &plain, &forbidden, now), None);
+        assert_eq!(
+            repo_refusal(403, &forbidden),
+            "GitHub refused to read this repository: Resource not accessible by integration"
+        );
+        assert_eq!(
+            repo_refusal(404, &json!({"message": "Not Found"})),
+            "Coderhelm's GitHub app can't see this repository."
+        );
+        assert_eq!(
+            repo_refusal(502, &Value::Null),
+            "GitHub answered 502 when reading this repository. Try again."
+        );
+    }
 
     #[test]
     fn repo_names_are_checked_before_any_github_path() {

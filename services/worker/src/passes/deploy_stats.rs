@@ -10,6 +10,7 @@
 //! named. One pass reads at a time per team (a lease on the progress item).
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
 use aws_sdk_dynamodb::types::AttributeValue;
@@ -59,6 +60,10 @@ const RETRY_DELAY_SECS: u64 = 120;
 /// How many times a webhook's run waits out a rate limit before it is
 /// dropped.
 const MAX_RUN_ATTEMPTS: u32 = 5;
+/// The most GitHub requests one backfill pass makes, whatever the budget.
+const MAX_PASS_REQUESTS: usize = 1000;
+/// The wait before the pass after one that used its requests.
+const CAP_DELAY_SECS: u64 = 300;
 
 /// GitHub refused because the app has no access to Actions here.
 fn is_no_access(e: &(dyn std::error::Error + Send + Sync)) -> bool {
@@ -272,6 +277,11 @@ pub trait Source: Send + Sync {
     async fn save_deploy(&self, item: Item) -> bool;
     /// Saves where the repository's backfill stands.
     async fn save_cursor(&self, cursor: &Cursor);
+    /// While GitHub's budget for the installation is below the share
+    /// background reads may spend: the seconds until it refills.
+    fn headroom_wait(&self) -> Option<u64>;
+    /// GitHub requests this pass has made so far.
+    fn requests(&self) -> usize;
 }
 
 /// What the worker knows about one repository while it reads its deploys.
@@ -433,6 +443,11 @@ pub enum RepoBackfill {
     Done,
     NoAccess,
     OutOfTime,
+    /// The installation's budget is below the background share: wait this
+    /// long for it to refill.
+    Headroom(u64),
+    /// The pass made its most requests.
+    Capped,
 }
 
 /// Reads a repository's run history from `start` to `now`, saving the
@@ -449,6 +464,14 @@ pub async fn backfill_repo<S: Source>(
     while let Some(c) = cur.take() {
         if out_of_time() {
             return Ok(RepoBackfill::OutOfTime);
+        }
+        // Live work keeps its share of the budget: background reads yield
+        // before every page, and stop at the pass's most requests.
+        if let Some(wait) = reads.src.headroom_wait() {
+            return Ok(RepoBackfill::Headroom(wait));
+        }
+        if reads.src.requests() >= MAX_PASS_REQUESTS {
+            return Ok(RepoBackfill::Capped);
         }
         let rest = format!(
             "actions/runs?actor={}&status=completed&created={}&per_page=100&page={}",
@@ -499,11 +522,22 @@ struct Live<'a> {
     owner: String,
     name: String,
     mark_sk: String,
+    /// GitHub requests made by the pass, shared by its repositories.
+    requests: &'a AtomicUsize,
 }
 
 #[async_trait::async_trait]
 impl Source for Live<'_> {
+    fn headroom_wait(&self) -> Option<u64> {
+        self.github.background_wait()
+    }
+
+    fn requests(&self) -> usize {
+        self.requests.load(Ordering::Relaxed)
+    }
+
     async fn get(&self, rest: &str) -> Result<Value, GhError> {
+        self.requests.fetch_add(1, Ordering::Relaxed);
         self.github
             .get_repo_path(&self.owner, &self.name, rest)
             .await
@@ -511,6 +545,7 @@ impl Source for Live<'_> {
 
     async fn workflow_jobs(&self, path: &str) -> Result<Option<Vec<JobDef>>, GhError> {
         workflow_jobs(
+            self.requests,
             self.state,
             &self.team_id,
             self.github,
@@ -559,6 +594,7 @@ impl Source for Live<'_> {
 /// A workflow file's jobs, cached in settings for an hour. An error only for
 /// GitHub's rate limit.
 async fn workflow_jobs(
+    requests: &AtomicUsize,
     state: &WorkerState,
     team_id: &str,
     github: &GitHubClient,
@@ -602,6 +638,7 @@ async fn workflow_jobs(
             }
         }
     }
+    requests.fetch_add(1, Ordering::Relaxed);
     let text = match github.read_file_live(owner, repo, path, "HEAD").await {
         Ok(t) => t,
         Err(e) => {
@@ -662,10 +699,12 @@ async fn live_reads<'a>(
     state: &'a WorkerState,
     team_id: &str,
     github: &'a GitHubClient,
+    requests: &'a AtomicUsize,
     owner: &str,
     name: &str,
     bot: &str,
 ) -> Result<RepoReads<Live<'a>>, GhError> {
+    requests.fetch_add(1, Ordering::Relaxed);
     let default_branch = github.get_default_branch(owner, name).await?;
     let full = format!("{owner}/{name}");
     Ok(RepoReads::new(
@@ -676,6 +715,7 @@ async fn live_reads<'a>(
             owner: owner.to_string(),
             name: name.to_string(),
             mark_sk: repo_sk(&full),
+            requests,
         },
         team_id.to_string(),
         full.clone(),
@@ -721,12 +761,14 @@ pub async fn record_run(state: &WorkerState, msg: &DeployRunMessage) -> Result<(
     let Some(github) = super::plan_chat::github_for(state, &msg.team_id).await else {
         return Err("no GitHub installation for the team".into());
     };
+    let requests = AtomicUsize::new(0);
     let outcome: Result<usize, GhError> = async {
         let bot = github.app_bot_login().await?;
         let mut reads = live_reads(
             state,
             &msg.team_id,
             &github,
+            &requests,
             &msg.repo_owner,
             &msg.repo_name,
             &bot,
@@ -960,6 +1002,22 @@ async fn backfill_pass(state: &WorkerState, team_id: &str) -> Result<PassEnd, St
             }
         }
     };
+    // Below the background share of the budget: wait for the reset before
+    // spending anything.
+    if let Some(wait) = github.background_wait() {
+        info!(
+            team_id,
+            wait, "Deploys backfill: leaving GitHub's budget to live work"
+        );
+        progress(
+            state,
+            team_id,
+            &[("resume_at", num(Utc::now().timestamp() + wait as i64))],
+        )
+        .await;
+        return Ok(PassEnd::Again(wait));
+    }
+    let requests = AtomicUsize::new(0);
     let now = Utc::now();
     let since = now - Duration::days(ds::BACKFILL_DAYS);
     let repos = super::plan::fetch_team_repo_list(state, team_id).await;
@@ -1010,7 +1068,8 @@ async fn backfill_pass(state: &WorkerState, team_id: &str) -> Result<PassEnd, St
             return Ok(PassEnd::Again(0));
         }
         let mut progressed = false;
-        let outcome = match live_reads(state, team_id, &github, owner, name, &bot).await {
+        let outcome = match live_reads(state, team_id, &github, &requests, owner, name, &bot).await
+        {
             Ok(mut reads) => {
                 backfill_repo(
                     &mut reads,
@@ -1040,6 +1099,25 @@ async fn backfill_pass(state: &WorkerState, team_id: &str) -> Result<PassEnd, St
                 );
                 progress(state, team_id, &counts(read)).await;
                 return Ok(PassEnd::Again(0));
+            }
+            Ok(RepoBackfill::Headroom(wait)) => {
+                info!(
+                    team_id,
+                    wait, "Deploys backfill: leaving GitHub's budget to live work"
+                );
+                let mut sets = counts(read).to_vec();
+                sets.push(("resume_at", num(Utc::now().timestamp() + wait as i64)));
+                progress(state, team_id, &sets).await;
+                return Ok(PassEnd::Again(wait));
+            }
+            Ok(RepoBackfill::Capped) => {
+                info!(
+                    team_id,
+                    requests = requests.load(Ordering::Relaxed),
+                    "Deploys backfill: the pass made its most requests"
+                );
+                progress(state, team_id, &counts(read)).await;
+                return Ok(PassEnd::Again(CAP_DELAY_SECS));
             }
             // Gone or no longer installed: nothing to read.
             Err(e) if is_not_found(&*e) => {
@@ -1284,6 +1362,11 @@ mod tests {
         deploys: AtomicUsize,
         /// Requests containing this answer with GitHub's rate limit.
         limit_on: Option<String>,
+        /// The installation's budget as GitHub's last response said (the
+        /// clock reads 1,000).
+        budget: Mutex<Option<crate::clients::github::Budget>>,
+        /// Requests the pass made before this repository.
+        extra_requests: usize,
     }
 
     fn limited() -> GhError {
@@ -1329,6 +1412,14 @@ mod tests {
 
         async fn save_cursor(&self, cursor: &Cursor) {
             self.saved.lock().unwrap().push(cursor.clone());
+        }
+
+        fn headroom_wait(&self) -> Option<u64> {
+            crate::clients::github::background_wait(*self.budget.lock().unwrap(), 1_000)
+        }
+
+        fn requests(&self) -> usize {
+            self.asked.lock().unwrap().len() + self.extra_requests
         }
     }
 
@@ -1464,6 +1555,61 @@ mod tests {
         assert!(asked[0].contains(&urlencoding::encode(&start.created()).into_owned()));
         // Then the weeks after it, up to now.
         assert!(asked.len() >= 2);
+    }
+
+    /// The backfill took an installation's whole hourly budget and every
+    /// live job failed for an hour. Background reads yield at half.
+    #[tokio::test]
+    async fn a_pass_yields_when_the_budget_is_down_to_half() {
+        use crate::clients::github::Budget;
+        let now = t("2026-11-05T12:00:00Z");
+        let start = Cursor::first(now - Duration::days(30), now).unwrap();
+        let f = Fake::default();
+        *f.budget.lock().unwrap() = Some(Budget {
+            remaining: 2_400,
+            limit: 5_000,
+            reset: 1_000 + 1_800,
+        });
+        let mut r = reads(&f);
+        let mut progressed = false;
+        let end = backfill_repo(&mut r, Some(start.clone()), now, &|| false, &mut progressed)
+            .await
+            .unwrap();
+        // Not a request spent: wait for the reset.
+        assert_eq!(end, RepoBackfill::Headroom(1_800));
+        assert!(f.asked.lock().unwrap().is_empty());
+        assert!(!progressed);
+        // With headroom it reads.
+        *f.budget.lock().unwrap() = Some(Budget {
+            remaining: 2_500,
+            limit: 5_000,
+            reset: 2_800,
+        });
+        let end = backfill_repo(&mut r, Some(start), now, &|| false, &mut progressed)
+            .await
+            .unwrap();
+        assert_eq!(end, RepoBackfill::Done);
+        assert!(!f.asked.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_pass_stops_at_its_most_requests() {
+        let now = t("2026-11-05T12:00:00Z");
+        let start = Cursor::first(now - Duration::days(30), now).unwrap();
+        let f = Fake {
+            extra_requests: MAX_PASS_REQUESTS - 2,
+            ..Default::default()
+        };
+        let mut r = reads(&f);
+        let mut progressed = false;
+        let end = backfill_repo(&mut r, Some(start.clone()), now, &|| false, &mut progressed)
+            .await
+            .unwrap();
+        assert_eq!(end, RepoBackfill::Capped);
+        // Two pages read, then it stops with the next one saved.
+        assert_eq!(f.asked.lock().unwrap().len(), 2);
+        let next = start.next(now).and_then(|c| c.next(now)).unwrap();
+        assert_eq!(f.saved.lock().unwrap().last(), Some(&next));
     }
 
     #[tokio::test]
