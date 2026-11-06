@@ -46,6 +46,7 @@ pub mod webhooks;
 /// asks before every call, approval cards, sign-in prompts and the pause.
 pub mod agent_policy;
 /// Alert notifications: which channels an alert posts to, and its messages.
+pub mod alert_episodes;
 pub mod alert_notify;
 /// Chat notifications (Teams and Slack): one message model, a renderer per
 /// channel, sealed webhook URLs.

@@ -549,6 +549,9 @@ async fn handle_message(state: Arc<WorkerState>, message: models::WorkerMessage)
                 error!("Hybrid name check failed: {e:?}");
             }
         }
+        models::WorkerMessage::AlertEpisodeCheck(msg) => {
+            passes::alert_episodes::run(&state, msg).await;
+        }
         models::WorkerMessage::PluginSweep => {
             info!("Plugin source poll");
             if let Err(e) = passes::plugins::sweep(&state).await {

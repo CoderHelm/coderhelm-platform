@@ -88,7 +88,7 @@ pub fn alert_to_delivery(
     let outcome = g("outcome");
     d.status = match outcome.as_str() {
         "error" => Status::Failed,
-        "duplicate" | "ignored" | "muted" => Status::Ignored,
+        "duplicate" | "ignored" | "muted" | "suppressed" => Status::Ignored,
         _ => Status::Handled,
     };
     if d.status == Status::Failed {
