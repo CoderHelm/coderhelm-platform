@@ -9,8 +9,8 @@
 //! - [`repair`]: a tooling failure gets the package's dependencies
 //!   installed with its own manager and the command run again, in the
 //!   sandbox; [`tooling_fields`] is what a tooling failure records on the run.
-//! - [`existing_work`] and [`finish_covered`]: an open pull request that
-//!   already does the work ends the run as `covered_by_pr`.
+//! - [`existing_work`]: an open pull request that already does the work;
+//!   `covering` decides what the run does about it.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{LazyLock, Mutex};
@@ -18,7 +18,6 @@ use std::sync::{LazyLock, Mutex};
 use aws_sdk_dynamodb::types::AttributeValue;
 use common::e2e::test_package;
 use common::run_questions::Question;
-use common::run_status::EndedValues;
 use common::stop_rules::existing_work::{self, Covered, OpenPr};
 use common::stop_rules::screen::{self, Citation, Screened, TicketDiagnosis};
 use common::stop_rules::tooling::{self, Repair, ToolingFailure};
@@ -26,10 +25,10 @@ use tracing::{info, warn};
 
 use crate::agent::provider::ModelProvider;
 use crate::clients::github::GitHubClient;
-use crate::models::{TicketMessage, TicketSource, TokenUsage};
+use crate::models::{TicketMessage, TokenUsage};
 use crate::WorkerState;
 
-use super::{attr_n, attr_s, RunUsageValues};
+use super::attr_s;
 
 /// Diagnoses read this process, by run.
 static DIAGNOSES: LazyLock<Mutex<HashMap<String, TicketDiagnosis>>> =
@@ -510,98 +509,6 @@ pub async fn existing_work(
         read.push((pr, signals, v));
     }
     existing_work::decide(&read, false, &|p| decided.contains(&p.subject()))
-}
-
-/// Ends the run as covered by an open pull request: the summary on the
-/// run, "Already being fixed in #N" on the ticket, status `covered_by_pr`.
-#[allow(clippy::too_many_arguments)]
-pub async fn finish_covered(
-    state: &WorkerState,
-    msg: &TicketMessage,
-    run_id: &str,
-    github: &GitHubClient,
-    covered: &Covered,
-    usage: &TokenUsage,
-    start: &std::time::Instant,
-) {
-    let summary = covered.summary();
-    info!(
-        run_id,
-        pr = covered.pr.number,
-        "Run covered by an open pull request"
-    );
-    super::add_progress_note(state, &msg.team_id, run_id, &summary).await;
-    match msg.source {
-        TicketSource::Github if msg.issue_number > 0 => {
-            if let Err(e) = github
-                .create_issue_comment(
-                    &msg.repo_owner,
-                    &msg.repo_name,
-                    msg.issue_number,
-                    &covered.ticket_note(true),
-                )
-                .await
-            {
-                warn!(run_id, error = %e, "Could not note the covering PR on the issue");
-            }
-        }
-        TicketSource::Jira if !msg.ticket_id.is_empty() => {
-            if let Err(e) = super::post_jira_comment(
-                state,
-                &msg.team_id,
-                &msg.ticket_id,
-                &covered.ticket_note(false),
-                "covered",
-                "Already being fixed",
-            )
-            .await
-            {
-                warn!(run_id, error = %e, "Could not note the covering PR on the ticket");
-            }
-        }
-        _ => {}
-    }
-    let record = serde_json::json!({
-        "repo": covered.pr.repo,
-        "number": covered.pr.number,
-        "url": covered.pr.url,
-        "title": covered.pr.title,
-        "author": covered.pr.author,
-        "reason": covered.reason,
-        "signals": covered.signals.lines(),
-    });
-    let status = common::run_status::COVERED_BY_PR;
-    let delta = usage.unrecorded();
-    let written = state
-        .dynamo
-        .update_item()
-        .table_name(&state.config.runs_table_name)
-        .key("team_id", attr_s(&msg.team_id))
-        .key("run_id", attr_s(run_id))
-        .update_expression(
-            "SET #s = :s, status_run_id = :sri, covered_by = :cb, error_message = :em, \
-             tokens_in = if_not_exists(tokens_in, :uzero) + :ti, tokens_out = if_not_exists(tokens_out, :uzero) + :to, \
-             cache_read_tokens = if_not_exists(cache_read_tokens, :uzero) + :crt, \
-             cache_write_tokens = if_not_exists(cache_write_tokens, :uzero) + :cwt, \
-             cost_usd = if_not_exists(cost_usd, :uzero) + :c, duration_s = :d, updated_at = :t, current_pass = :cp",
-        )
-        .condition_expression(common::run_status::not_ended("#s"))
-        .ended_values()
-        .expression_attribute_names("#s", "status")
-        .expression_attribute_values(":s", attr_s(status))
-        .expression_attribute_values(":sri", attr_s(&format!("{status}#{run_id}")))
-        .expression_attribute_values(":cb", attr_s(&record.to_string()))
-        .expression_attribute_values(":em", attr_s(&summary))
-        .usage_values(&delta)
-        .expression_attribute_values(":d", attr_n(start.elapsed().as_secs()))
-        .expression_attribute_values(":t", attr_s(&chrono::Utc::now().to_rfc3339()))
-        .expression_attribute_values(":cp", attr_s("done"))
-        .send()
-        .await;
-    if written.is_ok() {
-        usage.mark_recorded(&delta);
-    }
-    super::webhooks::emit_run(state, &msg.team_id, run_id, status).await;
 }
 
 #[cfg(test)]

@@ -368,6 +368,12 @@ impl GitHubClient {
         Ok(resp.token)
     }
 
+    /// This app's bot login ("{slug}[bot]"), when it can be read: who
+    /// CoderHelm's own pull requests are opened by.
+    pub async fn bot_login(&self) -> Option<String> {
+        self.app_bot_login().await.ok()
+    }
+
     /// The GitHub login of this app's bot user ("{slug}[bot]") — the identity
     /// stamped as committer on every commit the platform creates via the API.
     /// Used to distinguish our own commits from foreign (user) commits.
@@ -1896,6 +1902,30 @@ impl GitHubClient {
             serde_json::json!({"message": message, "tree": tree, "parents": parents}),
         )
         .await
+    }
+
+    /// Moves `branch` forward to `to` only if it still points at `lease` and
+    /// `to` contains it: never a force push, so nothing on the branch is
+    /// rewritten. `false` (nothing moved) when someone pushed since; an error
+    /// when GitHub refuses the move (not a fast forward).
+    pub async fn fast_forward(
+        &self,
+        owner: &str,
+        repo: &str,
+        branch: &str,
+        lease: &str,
+        to: &str,
+    ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+        if self.get_ref(owner, repo, branch).await? != lease {
+            return Ok(false);
+        }
+        self.patch(
+            &format!("{API_BASE}/repos/{owner}/{repo}/git/refs/heads/{branch}"),
+            &serde_json::json!({"sha": to, "force": false}),
+        )
+        .await?;
+        self.invalidate_snapshot(owner, repo, branch).await;
+        Ok(true)
     }
 
     /// Moves `branch` to `to` only if it still points at `lease`: `false`

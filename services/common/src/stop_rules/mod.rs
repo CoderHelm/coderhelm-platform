@@ -27,6 +27,7 @@
 //!    the same record are settled. Asked too early twice, the run reports
 //!    its findings and the one next step a person takes instead.
 
+pub mod covering;
 pub mod environment;
 pub mod existing_work;
 pub mod screen;

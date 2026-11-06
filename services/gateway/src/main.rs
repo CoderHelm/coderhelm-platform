@@ -406,6 +406,10 @@ async fn main() -> Result<(), Error> {
         .route("/runs/:run_id/cancel", post(routes::api::cancel_run))
         .route("/runs/:run_id/close", post(routes::run_close::close_run))
         .route("/runs/:run_id/reopen", post(routes::run_close::reopen_run))
+        .route(
+            "/runs/:run_id/close-superseded",
+            post(routes::run_close::close_superseded),
+        )
         .route("/runs/close", post(routes::run_close::close_runs))
         .route("/repos", get(routes::api::list_repos))
         .route(

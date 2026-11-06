@@ -1272,6 +1272,89 @@ pub struct RunCoveredBy {
     #[serde(default)]
     #[schema(example = "It selects the card by its name, which is the ticket's fix.")]
     pub reason: String,
+    /// It is CoderHelm's own pull request (opened by its app, on a branch in
+    /// the repository, recorded by one of the team's runs). Only then does a
+    /// run continue in it or mark and close the ticket's earlier one; a
+    /// person's pull request is never changed.
+    #[serde(default)]
+    #[schema(example = true)]
+    pub own: bool,
+    /// What the run did about it: `continued` (it carried its work over and
+    /// ended linked to it), `complete` (it already had everything), `person`
+    /// (a person's pull request: untouched), `busy` (its run was working on
+    /// it: nothing written) or `not_carried` (the work couldn't be carried
+    /// over and stays on the run's branch). Empty on older runs.
+    #[serde(default)]
+    #[schema(example = "continued")]
+    pub outcome: String,
+    /// What the run put on its branch, when it continued in it.
+    #[serde(default)]
+    pub carried: Option<RunCoveredCarried>,
+    /// What is still open for this ticket in it.
+    #[serde(default)]
+    #[schema(example = json!(["Register the two helper files"]))]
+    pub open_items: Vec<String>,
+    /// The ticket's earlier pull request CoderHelm opened, now redundant.
+    #[serde(default)]
+    pub superseded: Option<RunSupersededPr>,
+    /// What the run page says, in one paragraph.
+    #[serde(default)]
+    #[schema(
+        example = "Continued in #52, CoderHelm's own open pull request that already covered this ticket."
+    )]
+    pub note: String,
+}
+
+/// What a covered run carried over to CoderHelm's own covering pull request.
+#[derive(serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
+pub struct RunCoveredCarried {
+    /// The branch it went onto (the covering pull request's).
+    #[schema(example = "coderhelm/abc-2")]
+    pub branch: String,
+    /// The branch's head after.
+    #[serde(default)]
+    #[schema(example = "9f2c1e0")]
+    pub head: String,
+    /// The run's commits it brought.
+    #[serde(default)]
+    #[schema(example = 3)]
+    pub commits: u64,
+    /// The files they change.
+    #[serde(default)]
+    #[schema(example = json!(["src/register.ts"]))]
+    pub files: Vec<String>,
+    /// The two branches had diverged: the run's change was rebuilt on it.
+    #[serde(default)]
+    #[schema(example = false)]
+    pub rebuilt: bool,
+}
+
+/// The ticket's earlier pull request CoderHelm opened, superseded by the
+/// covering one.
+#[derive(serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
+pub struct RunSupersededPr {
+    /// Its repository, `owner/name`.
+    #[schema(example = "acme/web")]
+    pub repo: String,
+    /// Its number.
+    #[schema(example = 41)]
+    pub number: u64,
+    /// Its address on GitHub.
+    #[serde(default)]
+    #[schema(example = "https://github.com/acme/web/pull/41")]
+    pub url: String,
+    /// Its title.
+    #[serde(default)]
+    #[schema(example = "Add the card block")]
+    pub title: String,
+    /// A person closed it from the run page.
+    #[serde(default)]
+    #[schema(example = false)]
+    pub closed: bool,
+    /// Who closed it.
+    #[serde(default)]
+    #[schema(example = "")]
+    pub closed_by: String,
 }
 
 /// A question a run asked a person.
