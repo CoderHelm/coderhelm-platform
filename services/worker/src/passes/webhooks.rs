@@ -64,7 +64,14 @@ pub fn run_data(item: &HashMap<String, AttributeValue>, status: &str, app: &str)
         "pr_number": pr,
         "pr_url": if pr.is_some() { opt("pr_url") } else { None },
         "branch": opt("branch"),
-        "error": if matches!(status, "failed" | "needs_input") { error } else { None },
+        // Waiting on a person: what for, by name (its question or action).
+        "error": match status {
+            "failed" => error,
+            "needs_input" => common::run_wait::WaitingOn::of_item(item)
+                .map(|w| w.line())
+                .or(error),
+            _ => None,
+        },
         "url": format!("{}/runs/detail/?id={}", app.trim_end_matches('/'), urlencoding::encode(&run_id)),
         "created_at": created.clone(),
         "updated_at": opt("updated_at").unwrap_or(created),
@@ -118,6 +125,47 @@ pub async fn emit_run(state: &WorkerState, team_id: &str, run_id: &str, status: 
         team_id,
         event_type,
         run_data(&item, shown, app_url(state)),
+    )
+    .await;
+}
+
+/// A run waiting on a person, from the stuck-run sweep (`run_waiting`): the
+/// team hears again what it waits for, through the usual `run.needs_input`
+/// event, and the run page notes it. Nothing is sent once the run moved on.
+pub async fn run_waiting(state: &WorkerState, msg: &common::messages::RunWaitingMessage) {
+    let item = state
+        .dynamo
+        .get_item()
+        .table_name(&state.config.runs_table_name)
+        .key("team_id", AttributeValue::S(msg.team_id.clone()))
+        .key("run_id", AttributeValue::S(msg.run_id.clone()))
+        .send()
+        .await
+        .ok()
+        .and_then(|r| r.item)
+        .unwrap_or_default();
+    let status = item.get("status").and_then(|v| v.as_s().ok());
+    if status.map(String::as_str) != Some(common::run_status::NEEDS_INPUT) {
+        info!(run_id = %msg.run_id, "Run no longer waits on a person; no reminder");
+        return;
+    }
+    let what = common::run_wait::WaitingOn::of_item(&item)
+        .map(|w| w.line())
+        .unwrap_or_else(|| "its questions on the run page".to_string());
+    let note = if msg.why == "named" {
+        format!("This run was waiting with nothing asked; it now waits for: {what}")
+    } else {
+        format!(
+            "Reminder: still waiting after {} hours for: {what}",
+            common::run_wait::REMIND_AFTER_HOURS
+        )
+    };
+    super::add_progress_note(state, &msg.team_id, &msg.run_id, &note).await;
+    emit_run(
+        state,
+        &msg.team_id,
+        &msg.run_id,
+        common::run_status::NEEDS_INPUT,
     )
     .await;
 }
@@ -578,6 +626,21 @@ mod tests {
         assert_eq!(done["pr_number"], 318);
         let failed = run_data(&rec, "failed", "https://app.example.com");
         assert_eq!(failed["error"], "boom");
+        // Waiting on a person: the event says what for.
+        let wait = common::run_wait::WaitingOn::review_pr(
+            318,
+            "https://github.com/example-org/api/pull/318",
+            "a check is open",
+        )
+        .unwrap();
+        let mut waiting = rec.clone();
+        waiting.insert(common::run_wait::FIELD_WAITING_ON.into(), wait.to_attr());
+        let d = run_data(&waiting, "needs_input", "https://app.example.com");
+        assert!(conforms(&schema("run.needs_input"), &d), "{d}");
+        assert!(d["error"]
+            .as_str()
+            .unwrap()
+            .starts_with("Review pull request #318: Open on the pull request: a check is open"));
         // A fresh run: no PR yet, nothing optional set.
         let fresh = run_data(
             &item(&[("run_id", "r"), ("created_at", "t")]),

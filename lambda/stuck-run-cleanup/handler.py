@@ -21,8 +21,21 @@ has existed. And a stuck run whose pull request is open is never marked
 failed: it is completed with `round_incomplete` saying the last round didn't
 finish, so the person sees "Pull request open; the last fix round didn't
 finish" and can resume it.
+
+Runs waiting on a person (services/common/src/run_wait.rs): a `needs_input`
+run always names what it waits for (`waiting_on`: its questions, or one
+action such as reviewing its pull request). The sweep reads every
+`needs_input` run too:
+- one that names nothing (written before that rule, or by hand) is reported
+  (`run_waiting_unasked` in the log, counted by the monitoring stack) and
+  given a named wait: the review of its pull request when it has one, else
+  a Retry with the reason it stopped. The worker then sends the usual
+  `run.needs_input` notification for it;
+- one still waiting WAIT_REMIND_AFTER_HOURS after its wait started gets one
+  reminder through the same notification.
 """
 
+import json
 import logging
 import os
 from datetime import datetime, timezone, timedelta
@@ -41,6 +54,17 @@ MAX_AWAITING_CI_HOURS = int(os.environ.get("MAX_AWAITING_CI_HOURS", "26"))
 # The only statuses the sweep touches. A run a person ended (cancelled or
 # closed) is never swept, and neither is any other finished run.
 SWEPT_STATUSES = ("running", "awaiting_ci")
+
+# Runs waiting on a person. Mirrors services/common/src/run_wait.rs (a test
+# there reads these lines).
+NEEDS_INPUT = "needs_input"
+WAITING_ON_FIELD = "waiting_on"
+REMINDED_FIELD = "wait_reminded_at"
+WAIT_REMIND_AFTER_HOURS = 24
+QUESTIONS_FIELD = "questions"
+# The worker's queue: the reminder and the notice for a named wait go out as
+# a `run_waiting` message (services/common/contract/worker_messages.json).
+TICKET_QUEUE_URL = os.environ.get("TICKET_QUEUE_URL", "")
 
 # Values of current_pass that name a state, not a pass the run was doing.
 NOT_A_PASS = {"", "unknown", "cancelled", "closed", "done", "awaiting_ci"}
@@ -76,6 +100,7 @@ ROUND_LABELS = {
 }
 
 _dynamodb = None
+_sqs = None
 
 
 def _db():
@@ -85,6 +110,151 @@ def _db():
 
         _dynamodb = boto3.resource("dynamodb")
     return _dynamodb
+
+
+def _queue():
+    global _sqs
+    if _sqs is None:
+        import boto3
+
+        _sqs = boto3.client("sqs")
+    return _sqs
+
+
+def _json(value):
+    try:
+        return json.loads(value) if isinstance(value, str) and value else None
+    except ValueError:
+        return None
+
+
+def asks_something(run):
+    """True when a run record names what it waits for: questions to answer
+    or a named action (the same test as run_wait::asks_something)."""
+    asked = _json(run.get(QUESTIONS_FIELD)) or {}
+    questions = asked.get("questions") if isinstance(asked, dict) else None
+    if any(
+        isinstance(q, dict) and str(q.get("question") or "").strip()
+        for q in (questions or [])
+    ):
+        return True
+    wait = _json(run.get(WAITING_ON_FIELD))
+    return isinstance(wait, dict) and bool(str(wait.get("action") or "").strip())
+
+
+def named_wait(run, now_iso):
+    """The wait for a needs_input run that named none: its pull request's
+    review when it has one (it did its work), else a Retry with its reason.
+    The words mirror WaitingOn::review_pr and mark_run_stopped_by_guard."""
+    reason = " ".join(str(run.get("error_message") or "").split())
+    if has_pull_request(run):
+        try:
+            number = int(run.get("pr_number") or 0)
+        except (TypeError, ValueError):
+            number = 0
+        action = f"Review pull request #{number}" if number > 0 else "Review the pull request"
+        if reason:
+            detail = (
+                f"Open on the pull request: {reason.rstrip('.')}. Mark it ready once that is dealt "
+                "with, push a fix or comment on it, and CoderHelm picks it up from there."
+            )
+        else:
+            detail = (
+                "The work is on the pull request. Review it, push a fix or comment on it, and "
+                "CoderHelm picks it up from there."
+            )
+        return {
+            "action": action,
+            "detail": detail,
+            "url": str(run.get("pr_url") or ""),
+            "since": now_iso,
+        }
+    return {
+        "action": "Read why CoderHelm stopped this run, then press Retry or close it",
+        "detail": reason or "It stopped waiting on a person without saying what for.",
+        "since": now_iso,
+    }
+
+
+def wait_since(run):
+    """When the current wait started: its waiting_on, else the last update."""
+    wait = _json(run.get(WAITING_ON_FIELD)) or {}
+    since = _parse_time(wait.get("since")) if isinstance(wait, dict) else None
+    return since or _parse_time(run.get("updated_at") or run.get("created_at"))
+
+
+def reminder_due(run, now):
+    """One reminder, WAIT_REMIND_AFTER_HOURS into the wait (run_wait::reminder_due)."""
+    since = wait_since(run)
+    if since is None or now - since < timedelta(hours=WAIT_REMIND_AFTER_HOURS):
+        return False
+    reminded = _parse_time(run.get(REMINDED_FIELD))
+    return not (reminded is not None and reminded >= since)
+
+
+def waiting_message(run, why):
+    """The worker message that sends the notification (contract: run_waiting)."""
+    return {"type": "run_waiting", "team_id": run["team_id"], "run_id": run["run_id"], "why": why}
+
+
+def _send_waiting(run, why):
+    if not TICKET_QUEUE_URL:
+        logger.warning(f"No TICKET_QUEUE_URL: the {why} notice for {run['run_id']} isn't sent")
+        return False
+    try:
+        _queue().send_message(
+            QueueUrl=TICKET_QUEUE_URL, MessageBody=json.dumps(waiting_message(run, why))
+        )
+        return True
+    except Exception as e:
+        logger.error(f"Could not queue the {why} notice for {run['run_id']}: {e}")
+        return False
+
+
+def settle_waiting(runs_table, run, now):
+    """A needs_input run: name its wait when it names none, or remind once.
+    Returns "named", "reminded" or ""."""
+    run_id = run["run_id"]
+    key = {"team_id": run["team_id"], "run_id": run_id}
+    now_iso = now.isoformat()
+    try:
+        if not asks_something(run):
+            wait = named_wait(run, now_iso)
+            # The metric filter in the monitoring stack counts this text.
+            logger.warning(
+                f"run_waiting_unasked: {run_id} waited on a person with nothing asked "
+                f"(since {run.get('updated_at', 'N/A')}); now waits for: {wait['action']}"
+            )
+            runs_table.update_item(
+                Key=key,
+                UpdateExpression="SET #w = :w",
+                ExpressionAttributeNames={"#s": "status", "#w": WAITING_ON_FIELD},
+                ExpressionAttributeValues={":w": json.dumps(wait), ":ni": NEEDS_INPUT},
+                ConditionExpression="#s = :ni",
+            )
+            _send_waiting(run, "named")
+            return "named"
+        if reminder_due(run, now):
+            since = wait_since(run)
+            runs_table.update_item(
+                Key=key,
+                UpdateExpression="SET #r = :now",
+                ExpressionAttributeNames={"#s": "status", "#r": REMINDED_FIELD},
+                ExpressionAttributeValues={
+                    ":now": now_iso,
+                    ":ni": NEEDS_INPUT,
+                    ":since": since.isoformat(),
+                },
+                # Once per wait, even when two sweeps overlap.
+                ConditionExpression="#s = :ni AND (attribute_not_exists(#r) OR #r < :since)",
+            )
+            _send_waiting(run, "reminder")
+            return "reminded"
+    except _db().meta.client.exceptions.ConditionalCheckFailedException:
+        logger.info(f"Run {run_id} moved on or was reminded already")
+    except Exception as e:
+        logger.error(f"Could not settle the waiting run {run_id}: {e}")
+    return ""
 
 
 def last_known_pass(run, checkpoint_pass="", trace_pass=""):
@@ -197,15 +367,23 @@ def over_ceiling_update(run_id, code, reason, now_iso):
     return (
         "SET #s = :new, status_run_id = :sri, error_message = :err, current_pass = :cp, "
         "updated_at = :now, guard_open = :yes, loop_stop_reason = :code, "
-        "loop_stop_detail = :err, loop_stopped_at = :now",
+        "loop_stop_detail = :err, loop_stopped_at = :now, waiting_on = :wo",
         {
-            ":new": "needs_input",
-            ":sri": f"needs_input#{run_id}",
+            ":new": NEEDS_INPUT,
+            ":sri": f"{NEEDS_INPUT}#{run_id}",
             ":err": reason,
             ":cp": "done",
             ":now": now_iso,
             ":yes": True,
             ":code": code,
+            # Waiting on a person, by name: never for nothing.
+            ":wo": json.dumps(
+                {
+                    "action": "Read why CoderHelm ended this run, then press Retry or close it",
+                    "detail": reason,
+                    "since": now_iso,
+                }
+            ),
         },
     )
 
@@ -361,26 +539,38 @@ def handler(event, context):
     #    before, so awaiting_ci runs sat forever.
     stuck_runs = []
     over_count = 0
+    waiting = {"named": 0, "reminded": 0}
     scan_kwargs = {
-        "FilterExpression": "#s = :running OR #s = :awaiting",
+        "FilterExpression": "#s = :running OR #s = :awaiting OR #s = :ni",
         "ExpressionAttributeNames": {"#s": "status"},
         "ExpressionAttributeValues": {
             ":running": SWEPT_STATUSES[0],
             ":awaiting": SWEPT_STATUSES[1],
+            ":ni": NEEDS_INPUT,
         },
         "ProjectionExpression": (
             "team_id, run_id, created_at, updated_at, title, current_pass, pass_history, #s, "
             "step_queued_at, ceil_passes, ceil_continuations, ceil_worked_secs, ceil_spend_usd, "
-            "#round, pr_number, pr_url"
+            "#round, pr_number, pr_url, error_message, #q, #w, #r"
         ),
     }
     scan_kwargs["ExpressionAttributeNames"]["#round"] = ROUND_FIELD
+    scan_kwargs["ExpressionAttributeNames"]["#q"] = QUESTIONS_FIELD
+    scan_kwargs["ExpressionAttributeNames"]["#w"] = WAITING_ON_FIELD
+    scan_kwargs["ExpressionAttributeNames"]["#r"] = REMINDED_FIELD
 
     while True:
         resp = runs_table.scan(**scan_kwargs)
         for item in resp.get("Items", []):
             updated = item.get("updated_at", item.get("created_at", ""))
             status = item.get("status", "")
+            if status == NEEDS_INPUT:
+                # Waiting on a person: never failed or completed here, only
+                # named when it names nothing, and reminded once.
+                done = settle_waiting(runs_table, item, now)
+                if done:
+                    waiting[done] += 1
+                continue
             cutoff = running_cutoff if status == "running" else awaiting_cutoff
             # First, whatever else is true of the run: its ceiling isn't a
             # question of how long ago it last moved.
@@ -404,7 +594,12 @@ def handler(event, context):
 
     if not stuck_runs:
         logger.info("No stuck runs found")
-        return {"stuck_count": 0, "over_ceiling": over_count}
+        return {
+            "stuck_count": 0,
+            "over_ceiling": over_count,
+            "waiting_named": waiting["named"],
+            "waiting_reminded": waiting["reminded"],
+        }
 
     logger.info(f"Found {len(stuck_runs)} stuck runs")
 
@@ -493,4 +688,6 @@ def handler(event, context):
         "stuck_count": len(stuck_runs),
         "unstuck_count": failed_count,
         "over_ceiling": over_count,
+        "waiting_named": waiting["named"],
+        "waiting_reminded": waiting["reminded"],
     }

@@ -909,6 +909,36 @@ pub struct RunNote {
     pub timestamp: Option<String>,
 }
 
+/// What a run waiting on a person (`needs_input`) is waiting for: the
+/// questions to answer, or one named action.
+#[derive(serde::Serialize, utoipa::ToSchema)]
+pub struct RunWaitingOn {
+    /// What to do, in plain words.
+    #[schema(example = "Review pull request #318")]
+    pub action: String,
+    /// Why, or what is still open. May be empty.
+    #[schema(
+        example = "Open on the pull request: the link check couldn't reach /pricing. Mark it ready once that is dealt with, push a fix or comment on it, and CoderHelm picks it up from there."
+    )]
+    pub detail: String,
+    /// Where to do it (the pull request, the ticket), when known.
+    #[schema(example = "https://github.com/acme/web/pull/318")]
+    pub url: Option<String>,
+    /// When the wait started (RFC 3339).
+    #[schema(example = "2026-10-22T14:15:25Z")]
+    pub since: Option<String>,
+}
+
+fn waiting_on_of(item: &run_search::Item) -> Option<RunWaitingOn> {
+    let w = common::run_wait::WaitingOn::of_item(item)?;
+    Some(RunWaitingOn {
+        action: w.action,
+        detail: w.detail,
+        url: Some(w.url).filter(|u| !u.is_empty()),
+        since: Some(w.since).filter(|s| !s.is_empty()),
+    })
+}
+
 /// The run stopped before its pull request because a code generator needed
 /// public values the repository's codegen environment doesn't set.
 #[derive(serde::Serialize, utoipa::ToSchema)]
@@ -1139,6 +1169,11 @@ pub struct Run {
     /// otherwise.
     #[schema(example = json!(null))]
     pub codegen_env_missing: Option<CodegenEnvMissing>,
+    /// Set while the run is `needs_input`: what it waits for from a person
+    /// (its questions, or a named action such as reviewing its pull
+    /// request). A run never waits on a person for nothing.
+    #[schema(example = json!(null))]
+    pub waiting_on: Option<RunWaitingOn>,
 }
 
 /// The public values a run's code generator was missing, as the API shows them.
@@ -1590,6 +1625,11 @@ fn run_of(
         continued_run_id: st("continued_run_id"),
         round_incomplete: round_incomplete_of(item),
         codegen_env_missing: codegen_env_missing_of(item),
+        waiting_on: if st("status").as_deref() == Some(common::run_status::NEEDS_INPUT) {
+            waiting_on_of(item)
+        } else {
+            None
+        },
     }
 }
 

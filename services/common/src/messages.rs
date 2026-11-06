@@ -176,6 +176,12 @@ pub enum WorkerMessage {
     /// passing needs nobody to click anything).
     #[serde(rename = "agent_resume_sweep")]
     AgentResumeSweep,
+    /// A run waiting on a person, from the stuck-run sweep: its one
+    /// reminder, or the notice for a wait the sweep just named (a run left
+    /// `needs_input` with nothing asked). Sent as the usual
+    /// `run.needs_input` event (`common::run_wait`).
+    #[serde(rename = "run_waiting")]
+    RunWaiting(RunWaitingMessage),
     /// One plugin run: a brief, a schedule or a release (see
     /// `plugins::run`).
     #[serde(rename = "plugin_run")]
@@ -413,6 +419,7 @@ impl WorkerMessage {
             | WorkerMessage::DlqCleanup
             | WorkerMessage::KnowledgeSyncSweep
             | WorkerMessage::AgentResumeSweep
+            | WorkerMessage::RunWaiting(_)
             | WorkerMessage::LogAutofix
             | WorkerMessage::AwsPermissionsSweep
             | WorkerMessage::HybridNameCheck
@@ -483,6 +490,7 @@ impl WorkerMessage {
             | WorkerMessage::RewardOutcome(_)
             | WorkerMessage::JiraComment(_)
             | WorkerMessage::AgentResumeSweep
+            | WorkerMessage::RunWaiting(_)
             | WorkerMessage::PluginRun(_)
             | WorkerMessage::PluginPublish(_)
             | WorkerMessage::PluginSync(_)
@@ -670,6 +678,18 @@ pub struct WebhookEmitMessage {
     #[serde(default)]
     pub team_id: String,
     pub event: crate::webhooks::Event,
+}
+
+/// A run waiting on a person that the stuck-run sweep found: tell the team
+/// again what it waits for.
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
+pub struct RunWaitingMessage {
+    pub team_id: String,
+    pub run_id: String,
+    /// `reminder`: still waiting after `run_wait::REMIND_AFTER_HOURS`.
+    /// `named`: it waited for nothing, and the sweep just named what for.
+    #[serde(default)]
+    pub why: String,
 }
 
 /// One webhook delivery to try (again).

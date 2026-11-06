@@ -155,6 +155,32 @@ export class MonitoringStack extends cdk.Stack {
       metricName: "RunLoopStopped",
       metricValue: "1",
     });
+    // Each run the stuck-run sweep found waiting on a person with nothing
+    // asked (services/common/src/run_wait.rs): the worker can no longer
+    // write one, so any is a bug, and an alarm says so.
+    const cleanupLogs = logs.LogGroup.fromLogGroupName(
+      this,
+      "StuckRunCleanupLogs",
+      `/aws/lambda/${prefix}-stuck-run-cleanup`
+    );
+    const unaskedMetric = new logs.MetricFilter(this, "RunWaitingUnaskedFilter", {
+      logGroup: cleanupLogs,
+      filterPattern: logs.FilterPattern.literal('"run_waiting_unasked"'),
+      metricNamespace: "CoderHelm/Runs",
+      metricName: "RunWaitingUnasked",
+      metricValue: "1",
+    }).metric({ period: cdk.Duration.hours(1), statistic: "Sum" });
+    const unaskedAlarm = new cloudwatch.Alarm(this, "RunWaitingUnaskedAlarm", {
+      alarmName: `${prefix}-run-waiting-unasked`,
+      alarmDescription:
+        "A run waited on a person with nothing asked. The stuck-run sweep named its wait and notified the team; find the write that set needs_input without one.",
+      metric: unaskedMetric,
+      threshold: 1,
+      evaluationPeriods: 1,
+      comparisonOperator: cloudwatch.ComparisonOperator.GREATER_THAN_OR_EQUAL_TO_THRESHOLD,
+      treatMissingData: cloudwatch.TreatMissingData.NOT_BREACHING,
+    });
+    unaskedAlarm.addAlarmAction(new actions.SnsAction(alertTopic));
     const modelRequeuedMetric = new logs.MetricFilter(this, "ModelErrorRequeuedFilter", {
       logGroup: workerLogs,
       filterPattern: logs.FilterPattern.literal('"model_error_requeued"'),

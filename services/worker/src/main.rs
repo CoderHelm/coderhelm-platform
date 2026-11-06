@@ -735,6 +735,9 @@ async fn handle_message(state: Arc<WorkerState>, message: models::WorkerMessage)
             let sent = common::agent_policy::pause::sweep(&*store, &SqsResender(&state)).await;
             info!(sent, "Paused agent work sweep done");
         }
+        models::WorkerMessage::RunWaiting(msg) => {
+            passes::webhooks::run_waiting(&state, &msg).await;
+        }
         // Handled in `handle_sqs`, where a failure fails the message.
         models::WorkerMessage::UsageRecord(_) => {}
     }

@@ -40,6 +40,7 @@ use std::sync::Mutex;
 
 use aws_sdk_dynamodb::types::{AttributeValue, ReturnValue};
 use common::run_status::{self, EndedValues};
+use common::run_wait::NeedsInput;
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
@@ -633,6 +634,9 @@ pub async fn settle_open_pr(state: &WorkerState, team_id: &str, run_id: &str) ->
         return false;
     };
     let now = chrono::Utc::now().to_rfc3339();
+    // It has its pull request: it waits for that pull request's review.
+    let (number, url) = run_pr(state, team_id, run_id).await;
+    let wait = super::stop_pr::review_wait(number, &url, &reason);
     if let Err(e) = state
         .dynamo
         .update_item()
@@ -640,17 +644,13 @@ pub async fn settle_open_pr(state: &WorkerState, team_id: &str, run_id: &str) ->
         .key("team_id", attr_s(team_id))
         .key("run_id", attr_s(run_id))
         .update_expression(
-            "SET #s = :s, status_run_id = :sri, error_message = :em, updated_at = :t, \
-             current_pass = :cp",
+            "SET #s = :s, status_run_id = :sri, waiting_on = :wo, error_message = :em, \
+             updated_at = :t, current_pass = :cp",
         )
         .condition_expression(run_status::not_ended("#s"))
         .ended_values()
         .expression_attribute_names("#s", "status")
-        .expression_attribute_values(":s", attr_s(run_status::NEEDS_INPUT))
-        .expression_attribute_values(
-            ":sri",
-            attr_s(&format!("{}#{run_id}", run_status::NEEDS_INPUT)),
-        )
+        .needs_input(run_id, &wait)
         .expression_attribute_values(":em", attr_s(&reason))
         .expression_attribute_values(":t", attr_s(&now))
         .expression_attribute_values(":cp", attr_s("done"))
@@ -663,6 +663,33 @@ pub async fn settle_open_pr(state: &WorkerState, team_id: &str, run_id: &str) ->
         super::webhooks::emit_run(state, team_id, run_id, run_status::NEEDS_INPUT).await;
     }
     true
+}
+
+/// The run's pull request (number, address), from its record.
+async fn run_pr(state: &WorkerState, team_id: &str, run_id: &str) -> (u64, String) {
+    let item = state
+        .dynamo
+        .get_item()
+        .table_name(&state.config.runs_table_name)
+        .key("team_id", attr_s(team_id))
+        .key("run_id", attr_s(run_id))
+        .projection_expression("pr_number, pr_url")
+        .send()
+        .await
+        .ok()
+        .and_then(|r| r.item)
+        .unwrap_or_default();
+    let number = item
+        .get("pr_number")
+        .and_then(|v| v.as_n().ok())
+        .and_then(|n| n.parse::<u64>().ok())
+        .unwrap_or(0);
+    let url = item
+        .get("pr_url")
+        .and_then(|v| v.as_s().ok())
+        .cloned()
+        .unwrap_or_default();
+    (number, url)
 }
 
 // ── What the checks found, across steps ────────────────────────────────────

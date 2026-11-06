@@ -1,4 +1,5 @@
 use common::run_status::EndedValues;
+use common::run_wait::{NeedsInput, WaitingOn};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
@@ -2818,7 +2819,8 @@ async fn run_passes(
         .await;
 
         // Mark the run as needs_input so a comment can re-trigger it
-        mark_run_needs_input(state, msg, run_id, usage, start, &used_mcp_ids).await;
+        let wait = wait_on_ticket(msg, &questions, detail);
+        mark_run_needs_input(state, msg, run_id, usage, start, &used_mcp_ids, &wait).await;
 
         close_memory(state, agent_memory.take()).await;
         return Ok(());
@@ -4451,18 +4453,21 @@ async fn run_passes(
                             .collect::<Vec<_>>()
                             .join("\n")
                     );
+                    let asked = run_end::questions_from(&qs);
                     ask_on_ticket(
                         state,
                         msg,
                         run_id,
                         &github,
-                        &run_end::questions_from(&qs),
+                        &asked,
                         &text,
                         &text,
                         "A decision is needed",
                     )
                     .await;
-                    mark_run_needs_input(state, msg, run_id, usage, start, &used_mcp_ids).await;
+                    let wait = wait_on_ticket(msg, &asked, &text);
+                    mark_run_needs_input(state, msg, run_id, usage, start, &used_mcp_ids, &wait)
+                        .await;
                     close_memory(state, agent_memory.take()).await;
                     return Ok(());
                 }
@@ -4523,6 +4528,7 @@ async fn run_passes(
             let duration = start.elapsed().as_secs();
             let delta = usage.unrecorded();
             let now = chrono::Utc::now().to_rfc3339();
+            let wait = wait_on_ticket(msg, &questions, raw_clarification);
             let usage_res = state
                 .dynamo
                 .update_item()
@@ -4530,14 +4536,13 @@ async fn run_passes(
                 .key("team_id", attr_s(&msg.team_id))
                 .key("run_id", attr_s(run_id))
                 .update_expression(
-                    "SET #status = :s, status_run_id = :sri, error_message = :em, \
+                    "SET #status = :s, status_run_id = :sri, waiting_on = :wo, error_message = :em, \
                      tokens_in = if_not_exists(tokens_in, :uzero) + :ti, tokens_out = if_not_exists(tokens_out, :uzero) + :to, \
              cache_read_tokens = if_not_exists(cache_read_tokens, :uzero) + :crt, cache_write_tokens = if_not_exists(cache_write_tokens, :uzero) + :cwt, \
              cost_usd = if_not_exists(cost_usd, :uzero) + :c, duration_s = :d, updated_at = :t, current_pass = :cp",
                 )
                 .expression_attribute_names("#status", "status")
-                .expression_attribute_values(":s", attr_s("needs_input"))
-                .expression_attribute_values(":sri", attr_s(&format!("needs_input#{run_id}")))
+                .needs_input(run_id, &wait)
                 .expression_attribute_values(":em", attr_s(raw_clarification))
                 .usage_values(&delta)
                 .expression_attribute_values(":d", attr_n(duration))
@@ -6992,10 +6997,8 @@ async fn finish_without_code(
             jira_title,
         )
         .await;
-    }
-
-    if !outside {
-        mark_run_needs_input(state, msg, run_id, usage, start, mcp_ids).await;
+        let wait = wait_on_ticket(msg, &questions, &report);
+        mark_run_needs_input(state, msg, run_id, usage, start, mcp_ids, &wait).await;
     }
     let status = if outside {
         fix_location::STATUS_OUTSIDE
@@ -7444,6 +7447,32 @@ async fn report_questions(
     }
 }
 
+/// What a run that asked on its ticket waits for: the questions it asked,
+/// else the missing detail on the ticket (`what`: what it said there).
+fn wait_on_ticket(
+    msg: &TicketMessage,
+    questions: &[common::run_questions::Question],
+    what: &str,
+) -> WaitingOn {
+    let ticket = if matches!(msg.source, TicketSource::Github) && msg.issue_number > 0 {
+        format!(
+            "https://github.com/{}/{}/issues/{}",
+            msg.repo_owner, msg.repo_name, msg.issue_number
+        )
+    } else {
+        String::new()
+    };
+    WaitingOn::answer_or(
+        questions,
+        None,
+        WaitingOn::fixed(
+            "Add the missing detail to the ticket, then press Retry",
+            what,
+            &ticket,
+        ),
+    )
+}
+
 /// Mark a run `needs_input` (a comment or re-run can pick it up again) and
 /// count it in the analytics, the way every needs_input stop is recorded.
 async fn mark_run_needs_input(
@@ -7453,6 +7482,7 @@ async fn mark_run_needs_input(
     usage: &TokenUsage,
     start: &std::time::Instant,
     mcp_ids: &[String],
+    wait: &WaitingOn,
 ) {
     let duration = start.elapsed().as_secs();
     let delta = usage.unrecorded();
@@ -7464,19 +7494,18 @@ async fn mark_run_needs_input(
         .key("team_id", attr_s(&msg.team_id))
         .key("run_id", attr_s(run_id))
         .update_expression(
-            "SET #status = :s, tokens_in = if_not_exists(tokens_in, :uzero) + :ti, tokens_out = if_not_exists(tokens_out, :uzero) + :to, \
+            "SET #status = :s, waiting_on = :wo, tokens_in = if_not_exists(tokens_in, :uzero) + :ti, tokens_out = if_not_exists(tokens_out, :uzero) + :to, \
              cache_read_tokens = if_not_exists(cache_read_tokens, :uzero) + :crt, cache_write_tokens = if_not_exists(cache_write_tokens, :uzero) + :cwt, \
              cost_usd = if_not_exists(cost_usd, :uzero) + :c, \
              duration_s = :d, updated_at = :t, current_pass = :cp, \
              status_run_id = :sri, mcp_servers = :mcp",
         )
         .expression_attribute_names("#status", "status")
-        .expression_attribute_values(":s", attr_s("needs_input"))
+        .needs_input(run_id, wait)
         .usage_values(&delta)
         .expression_attribute_values(":d", attr_n(duration))
         .expression_attribute_values(":t", attr_s(&now))
         .expression_attribute_values(":cp", attr_s("done"))
-        .expression_attribute_values(":sri", attr_s(&format!("needs_input#{run_id}")))
         .expression_attribute_values(
             ":mcp",
             AttributeValue::L(mcp_ids.iter().map(|s| attr_s(s)).collect()),
@@ -7519,13 +7548,20 @@ pub(crate) async fn mark_run_stopped_by_guard(
         .key("team_id", attr_s(&msg.team_id))
         .key("run_id", attr_s(run_id))
         .update_expression(
-            "SET #s = :s, status_run_id = :sri, error_message = :em, updated_at = :t, current_pass = :cp",
+            "SET #s = :s, status_run_id = :sri, waiting_on = :wo, error_message = :em, \
+             updated_at = :t, current_pass = :cp",
         )
         .condition_expression(common::run_status::not_ended("#s"))
         .ended_values()
         .expression_attribute_names("#s", "status")
-        .expression_attribute_values(":s", attr_s(common::run_status::NEEDS_INPUT))
-        .expression_attribute_values(":sri", attr_s(&format!("needs_input#{run_id}")))
+        .needs_input(
+            run_id,
+            &WaitingOn::fixed(
+                "Read why CoderHelm stopped this run, then press Retry or close it",
+                reason,
+                "",
+            ),
+        )
         .expression_attribute_values(":em", attr_s(reason))
         .expression_attribute_values(":t", attr_s(&chrono::Utc::now().to_rfc3339()))
         .expression_attribute_values(":cp", attr_s("done"))
@@ -7567,7 +7603,12 @@ async fn stop_run_repo_not_enabled(
             warn!(run_id, error = %e, "Could not post the repo-not-turned-on Jira comment");
         }
     }
-    mark_run_needs_input(state, msg, run_id, usage, start, &[]).await;
+    let wait = WaitingOn::fixed(
+        "Turn the repository on for runs in CoderHelm, then press Retry",
+        message,
+        "",
+    );
+    mark_run_needs_input(state, msg, run_id, usage, start, &[], &wait).await;
 }
 
 /// Append a timestamped progress note to the run record for live activity display.
@@ -8406,7 +8447,8 @@ async fn stop_for_open_pr(
         &pr.key(),
     )
     .await;
-    mark_run_needs_input(state, msg, run_id, usage, start, &[]).await;
+    let wait = wait_on_ticket(msg, std::slice::from_ref(&question), &note);
+    mark_run_needs_input(state, msg, run_id, usage, start, &[], &wait).await;
 }
 
 async fn post_jira_comment(

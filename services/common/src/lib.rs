@@ -133,6 +133,8 @@ pub mod run_questions;
 pub mod run_round;
 /// Run statuses; which ones a person set; closing and reopening a run.
 pub mod run_status;
+/// What a run waiting on a person is waiting for: never nothing.
+pub mod run_wait;
 #[cfg(test)]
 mod selfhost_links;
 pub mod skill_apply;

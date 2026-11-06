@@ -11,13 +11,15 @@
 //! Now any error after implementation started, with work on the branch
 //! (beyond the plan files CoderHelm commits beside it), opens a draft pull
 //! request that says why the run stopped, as its open item; the run waits
-//! for input instead of failing. A stop for agent permissions (paused, an
+//! for that pull request's review instead of failing, and says so by name
+//! (`common::run_wait`): "Review pull request #n", with the open item. A stop for agent permissions (paused, an
 //! approval nobody answered) still ends the run as it did.
 
 use crate::clients::github::GitHubClient;
 use crate::models::{TicketMessage, TicketSource};
 use crate::WorkerState;
 use common::run_status::EndedValues;
+use common::run_wait::{NeedsInput, WaitingOn};
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
@@ -153,6 +155,9 @@ pub async fn open_with(
         }
     };
     let now = chrono::Utc::now().to_rfc3339();
+    // The work is done and on the pull request: the run waits for its
+    // review, named, never for "more detail" nobody was asked for.
+    let wait = review_wait(number, &url, reason);
     let _ = state
         .dynamo
         .update_item()
@@ -160,16 +165,15 @@ pub async fn open_with(
         .key("team_id", super::attr_s(&msg.team_id))
         .key("run_id", super::attr_s(run_id))
         .update_expression(
-            "SET #s = :s, status_run_id = :sri, pr_url = :pu, pr_number = :pn, branch = :b, \
-             error_message = :em, updated_at = :t, current_pass = :cp",
+            "SET #s = :s, status_run_id = :sri, waiting_on = :wo, pr_url = :pu, pr_number = :pn, \
+             branch = :b, error_message = :em, updated_at = :t, current_pass = :cp",
         )
         // Never over a run a person ended.
         .condition_expression(common::run_status::not_ended("#s"))
         .ended_values()
         .expression_attribute_names("#s", "status")
         .expression_attribute_values(":cp", super::attr_s("done"))
-        .expression_attribute_values(":s", super::attr_s("needs_input"))
-        .expression_attribute_values(":sri", super::attr_s(&format!("needs_input#{run_id}")))
+        .needs_input(run_id, &wait)
         .expression_attribute_values(":pu", super::attr_s(&url))
         .expression_attribute_values(":pn", super::attr_n(number))
         .expression_attribute_values(":b", super::attr_s(branch))
@@ -195,6 +199,14 @@ pub async fn open_with(
         super::webhooks::emit_run(state, &msg.team_id, run_id, "needs_input").await;
     }
     Ok(url)
+}
+
+/// What a stopped run with a pull request waits for: its review, with the
+/// reason as what is open on it.
+pub fn review_wait(number: u64, url: &str, reason: &str) -> WaitingOn {
+    WaitingOn::review_pr(number, url, reason)
+        .or_else(|| WaitingOn::action("Review the work on the run's branch", reason, ""))
+        .unwrap_or_default()
 }
 
 #[cfg(test)]

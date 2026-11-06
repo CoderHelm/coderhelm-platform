@@ -531,10 +531,14 @@ export class WorkerStack extends cdk.Stack {
         // The last pass a stuck run reached when its record names none.
         TRACES_TABLE_NAME: props.tracesTable.tableName,
         CHECKPOINTS_TABLE_NAME: props.checkpointsTable.tableName,
+        // A run waiting on a person: its reminder, and the notice for a
+        // wait the sweep named, go to the worker as `run_waiting`.
+        TICKET_QUEUE_URL: props.ticketQueue.queueUrl,
       },
     });
 
     runsTable.grantReadWriteData(cleanupFunction);
+    props.ticketQueue.grantSendMessages(cleanupFunction);
     props.tracesTable.grantReadData(cleanupFunction);
     props.checkpointsTable.grantReadData(cleanupFunction);
     // The runs table is CMK-encrypted; grantReadWriteData on a fromTableName

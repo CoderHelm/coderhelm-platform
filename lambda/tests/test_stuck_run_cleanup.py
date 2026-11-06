@@ -218,3 +218,112 @@ class StepQueued(unittest.TestCase):
 
     def test_no_step_queued(self):
         self.assertFalse(sweep.step_queued({"updated_at": self.at(30)}, self.NOW))
+
+
+class WaitingOnAPerson(unittest.TestCase):
+    """A needs_input run never waits for nothing (services/common/src/run_wait.rs)."""
+
+    NOW = sweep.datetime(2026, 11, 5, 15, 0, tzinfo=sweep.timezone.utc)
+
+    def _sweep(self, runs):
+        updates, sent = [], []
+
+        class Table:
+            def scan(self, **kw):
+                return {"Items": runs}
+
+            def update_item(self, **kw):
+                updates.append(kw)
+
+        class Db:
+            class meta:
+                class client:
+                    class exceptions:
+                        ConditionalCheckFailedException = KeyError
+
+            def Table(self, _name):
+                return Table()
+
+        class Sqs:
+            def send_message(self, **kw):
+                sent.append(sweep.json.loads(kw["MessageBody"]))
+
+        sweep._dynamodb, sweep._sqs = Db(), Sqs()
+        old_url, sweep.TICKET_QUEUE_URL = sweep.TICKET_QUEUE_URL, "https://sqs/q"
+        try:
+            out = sweep.handler({}, None)
+        finally:
+            sweep._dynamodb, sweep._sqs, sweep.TICKET_QUEUE_URL = None, None, old_url
+        return out, updates, sent
+
+    def test_a_stalled_run_with_its_pull_request_is_found_and_handed_to_review(self):
+        # It did its work, opened a draft pull request with a check's finding
+        # as its open item, and waited with no question for three days.
+        run = {
+            "team_id": "T",
+            "run_id": "R",
+            "status": "needs_input",
+            "updated_at": "2026-11-02T10:00:00+00:00",
+            "pr_number": 7,
+            "pr_url": "https://github.com/o/r/pull/7",
+            "error_message": "The new-feature rules blocked the pull request: new items aren't registered",
+            "questions": '{"questions":[],"asked_at":""}',
+        }
+        self.assertFalse(sweep.asks_something(run))
+        out, updates, sent = self._sweep([run])
+        self.assertEqual(out["waiting_named"], 1)
+        self.assertEqual(out["stuck_count"], 0)
+        self.assertEqual(len(updates), 1)
+        wait = sweep.json.loads(updates[0]["ExpressionAttributeValues"][":w"])
+        self.assertEqual(wait["action"], "Review pull request #7")
+        self.assertIn("new items aren't registered", wait["detail"])
+        self.assertEqual(wait["url"], "https://github.com/o/r/pull/7")
+        self.assertEqual(updates[0]["ConditionExpression"], "#s = :ni")
+        self.assertEqual(sent, [{"type": "run_waiting", "team_id": "T", "run_id": "R", "why": "named"}])
+        # Never failed or completed: still waiting, now for something named.
+        self.assertNotIn(":new", updates[0]["ExpressionAttributeValues"])
+
+    def test_without_a_pull_request_it_waits_for_a_retry(self):
+        wait = sweep.named_wait({"error_message": "stopped"}, "now")
+        self.assertIn("Retry", wait["action"])
+        self.assertEqual(wait["detail"], "stopped")
+
+    def test_one_reminder_after_the_wait(self):
+        wait = sweep.json.dumps({"action": "Review pull request #7", "since": "2026-11-04T16:00:00+00:00"})
+        run = {"team_id": "T", "run_id": "R", "status": "needs_input", "waiting_on": wait}
+        self.assertTrue(sweep.asks_something(run))
+        self.assertFalse(sweep.reminder_due(run, self.NOW))
+        later = self.NOW + sweep.timedelta(hours=2)
+        self.assertTrue(sweep.reminder_due(run, later))
+        reminded = dict(run, wait_reminded_at="2026-11-05T16:30:00+00:00")
+        self.assertFalse(sweep.reminder_due(reminded, later + sweep.timedelta(days=3)))
+
+        old = dict(run, waiting_on=sweep.json.dumps({"action": "Answer", "since": "2026-11-01T00:00:00+00:00"}))
+        out, updates, sent = self._sweep([old])
+        self.assertEqual(out["waiting_reminded"], 1)
+        self.assertIn("attribute_not_exists(#r)", updates[0]["ConditionExpression"])
+        self.assertEqual(sent[0]["why"], "reminder")
+
+    def test_a_run_with_questions_and_a_fresh_wait_is_left_alone(self):
+        run = {
+            "team_id": "T",
+            "run_id": "R",
+            "status": "needs_input",
+            "updated_at": self.NOW.isoformat(),
+            "questions": '{"questions":[{"id":"q1","question":"Which one?"}]}',
+        }
+        self.assertTrue(sweep.asks_something(run))
+        self.assertFalse(sweep.reminder_due(run, self.NOW))
+
+    def test_the_message_is_one_the_worker_reads(self):
+        contract = sweep.json.loads(
+            (HANDLER.parents[2] / "services/common/contract/worker_messages.json").read_text()
+        )
+        sample = contract["scheduled"]["run_waiting"]
+        msg = sweep.waiting_message({"team_id": "T", "run_id": "R"}, "reminder")
+        self.assertEqual(set(msg), set(sample))
+        self.assertEqual(msg["type"], sample["type"])
+
+    def test_over_its_ceiling_it_waits_for_something_named(self):
+        _, values = sweep.over_ceiling_update("R1", "ceiling_spend", "why", "now")
+        self.assertIn("Retry", sweep.json.loads(values[":wo"])["action"])

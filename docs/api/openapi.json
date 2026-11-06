@@ -3874,6 +3874,17 @@
               "string",
               "null"
             ]
+          },
+          "waiting_on": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/RunWaitingOn",
+                "description": "Set while the run is `needs_input`: what it waits for from a person\n(its questions, or a named action such as reviewing its pull\nrequest). A run never waits on a person for nothing."
+              }
+            ]
           }
         },
         "required": [
@@ -4379,6 +4390,50 @@
         "required": [
           "kind",
           "label"
+        ],
+        "type": "object"
+      },
+      "RunWaitingOn": {
+        "description": "What a run waiting on a person (`needs_input`) is waiting for: the\nquestions to answer, or one named action.",
+        "properties": {
+          "action": {
+            "description": "What to do, in plain words.",
+            "examples": [
+              "Review pull request #318"
+            ],
+            "type": "string"
+          },
+          "detail": {
+            "description": "Why, or what is still open. May be empty.",
+            "examples": [
+              "Open on the pull request: the link check couldn't reach /pricing. Mark it ready once that is dealt with, push a fix or comment on it, and CoderHelm picks it up from there."
+            ],
+            "type": "string"
+          },
+          "since": {
+            "description": "When the wait started (RFC 3339).",
+            "examples": [
+              "2026-10-22T14:15:25Z"
+            ],
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "url": {
+            "description": "Where to do it (the pull request, the ticket), when known.",
+            "examples": [
+              "https://github.com/acme/web/pull/318"
+            ],
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "action",
+          "detail"
         ],
         "type": "object"
       },
