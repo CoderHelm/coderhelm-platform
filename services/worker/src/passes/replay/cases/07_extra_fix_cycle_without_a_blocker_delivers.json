@@ -1,0 +1,68 @@
+{
+  "name": "a second fix cycle with no named blocker worth it delivers the draft instead",
+  "about": "The proof check's gaps shrank after the first round (3, then 2), so the old rule started a second round. The stop judge sees the whole run and finds no named blocker worth another cycle: the draft goes out with the gaps under Open items.",
+  "case": "run_loop",
+  "input": {
+    "gaps": [
+      3,
+      2,
+      2
+    ],
+    "continuations": 3,
+    "usd_per_step": 4.0
+  },
+  "replies": [
+    [
+      {
+        "verdict": "proceed",
+        "assumption": "the remaining 2 gaps are unproven details a reviewer can confirm; deliver the draft with them listed",
+        "question": "",
+        "person_only": "",
+        "tried": [],
+        "options": [],
+        "default": "",
+        "deadline_hours": 0,
+        "blocker": "",
+        "evidence": [],
+        "category": "",
+        "location": ""
+      }
+    ],
+    [
+      {
+        "verdict": "proceed",
+        "assumption": "deliver the draft; the gaps are listed under Open items for a person to confirm",
+        "question": "",
+        "person_only": "",
+        "tried": [],
+        "options": [],
+        "default": "",
+        "deadline_hours": 0,
+        "blocker": "",
+        "evidence": [],
+        "category": "",
+        "location": ""
+      }
+    ],
+    [
+      {
+        "verdict": "proceed",
+        "assumption": "no gap names a defect; the draft goes out with the gaps as open items",
+        "question": "",
+        "person_only": "",
+        "tried": [],
+        "options": [],
+        "default": "",
+        "deadline_hours": 0,
+        "blocker": "",
+        "evidence": [],
+        "category": "",
+        "location": ""
+      }
+    ]
+  ],
+  "expect": {
+    "draft_pr": true,
+    "max_fix_rounds": 1
+  }
+}

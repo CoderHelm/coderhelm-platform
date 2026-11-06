@@ -212,7 +212,7 @@ pub fn prompt(notice: &str, reply: &Reply) -> String {
 
 /// The model's reading of one reply; `Unclear` when it couldn't be read.
 async fn classify(
-    state: &WorkerState,
+    _state: &WorkerState,
     provider: &ModelProvider,
     notice: &str,
     reply: &Reply,
@@ -220,13 +220,13 @@ async fn classify(
 ) -> Choice {
     match crate::agent::anthropic::converse_json(
         &provider.client(),
-        &state.config.light_model_id,
+        provider.judgment_model_id(),
         SYSTEM,
         &prompt(notice, reply),
         &schema(),
         true,
-        "low",
-        512,
+        common::stop_judge::JUDGMENT_EFFORT,
+        4096,
         usage,
     )
     .await

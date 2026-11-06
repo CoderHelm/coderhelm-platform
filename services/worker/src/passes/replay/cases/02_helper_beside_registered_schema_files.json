@@ -1,0 +1,26 @@
+{
+  "name": "a validation helper beside registered schema documents is not a new item",
+  "about": "The new-feature rule counted any new file in a folder of registered schema documents as a sibling that must be registered, so a module of validation helpers blocked the pull request. Judged by structure (no default export, no schema), it is another kind of file and nothing blocks.",
+  "case": "registration",
+  "input": {
+    "tree": [
+      "studio/schemaTypes/documents/author.ts",
+      "studio/schemaTypes/documents/blog.ts",
+      "studio/schemaTypes/documents/blog-index.ts",
+      "studio/schemaTypes/documents/index.ts",
+      "studio/structure.ts"
+    ],
+    "files": {
+      "studio/schemaTypes/documents/author.ts": "import {defineField, defineType} from 'cms-kit'\n\nexport default defineType({\n  name: 'author',\n  type: 'document',\n  fields: [defineField({name: 'title', type: 'string'})],\n})\n",
+      "studio/schemaTypes/documents/blog.ts": "import {defineField, defineType} from 'cms-kit'\n\nexport default defineType({\n  name: 'blog',\n  type: 'document',\n  fields: [defineField({name: 'title', type: 'string'})],\n})\n",
+      "studio/schemaTypes/documents/blog-index.ts": "import {defineField, defineType} from 'cms-kit'\n\nexport default defineType({\n  name: 'blog-index',\n  type: 'document',\n  fields: [defineField({name: 'title', type: 'string'})],\n})\n",
+      "studio/schemaTypes/documents/index.ts": "import author from './author'\nimport blog from './blog'\nimport blogIndex from './blog-index'\n\nexport const documents = [author, blog, blogIndex]\n",
+      "studio/structure.ts": "export const structure = (S) =>\n  S.list().items([\n    S.documentTypeListItem('author'),\n    S.documentTypeListItem('blog'),\n    S.documentTypeListItem('blog-index'),\n  ])\n"
+    },
+    "added": "studio/schemaTypes/documents/promotion-validation.ts",
+    "added_text": "import type {ValidationContext} from 'cms-kit'\n\nexport function endsAfterStart(value: unknown, context: ValidationContext) {\n  return true\n}\n\nexport const requireCode = (rule: any) => rule.custom((v: string) => !!v)\n"
+  },
+  "expect": {
+    "blocking": 0
+  }
+}

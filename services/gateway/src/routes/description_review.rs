@@ -99,6 +99,9 @@ pub(crate) fn standing_review_awaits_answer(records: &[StoredReview]) -> bool {
     standing.verdict == "REQUEST_CHANGES"
         || standing.posted_as == "REQUEST_CHANGES"
         || standing.body.contains("Confirm before merge")
+        // The reviewer's FYI list of facts worth confirming (its wording
+        // since changes are requested only for named problems).
+        || standing.body.contains("FYI: facts worth confirming")
 }
 
 /// What the two claims say about queueing a review for this edit.
@@ -430,6 +433,12 @@ mod tests {
     #[test]
     fn only_a_review_that_waits_on_an_answer_is_rerun() {
         let confirm = "Changes requested\n\n#### Confirm before merge\n- Not run against a restore of real data.";
+        // The approval's FYI list asks the same, without holding the merge.
+        assert!(standing_review_awaits_answer(&[review(
+            "COMMENT",
+            "COMMENT",
+            "Approved with notes\n\n#### FYI: facts worth confirming\n- The vendor's field."
+        )]));
         assert!(standing_review_awaits_answer(&[review(
             "REQUEST_CHANGES",
             "REQUEST_CHANGES",

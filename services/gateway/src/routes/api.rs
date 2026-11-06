@@ -2116,6 +2116,15 @@ pub async fn retry_run(
         .await;
 
     info!(run_id, "Run retried — dispatched to SQS");
+    // A retry as it was says the stop wasn't needed (the outcome log).
+    common::decision_log::on_run_acted(
+        &state.dynamo,
+        &state.config.settings_table_name,
+        &claims.team_id,
+        &run_id,
+        common::decision_log::Outcome::Retried,
+    )
+    .await;
 
     Ok(Json(RunActionResult {
         status: "retrying".into(),
@@ -2804,6 +2813,14 @@ pub async fn cancel_run(
         })?;
 
     info!(run_id, "Run cancelled by user");
+    common::decision_log::on_run_acted(
+        &state.dynamo,
+        &state.config.settings_table_name,
+        &claims.team_id,
+        &run_id,
+        common::decision_log::Outcome::CancelledRun,
+    )
+    .await;
     Ok(Json(RunActionResult {
         status: "cancelled".into(),
     }))

@@ -211,12 +211,47 @@ def _send_waiting(run, why):
         return False
 
 
+def deadline_passed(run, now):
+    """A question the stop judge let the run ask carries a default and a
+    deadline (worker passes::stop_judge::keep_ask_deadline). Once it passes
+    with no answer, reversible work goes ahead with the default."""
+    if not str(run.get("ask_default", "")).strip():
+        return False
+    due = _parse_time(run.get("ask_deadline"))
+    return due is not None and now >= due
+
+
+def take_default(runs_table, run, now):
+    """Claims the deadline once (the worker restarts the ticket with the
+    default as its answer). Returns True when this sweep claimed it."""
+    key = {"team_id": run["team_id"], "run_id": run["run_id"]}
+    try:
+        runs_table.update_item(
+            Key=key,
+            UpdateExpression="SET ask_default_taken_at = :now",
+            ExpressionAttributeNames={"#s": "status"},
+            ExpressionAttributeValues={":now": now.isoformat(), ":ni": NEEDS_INPUT},
+            ConditionExpression="#s = :ni AND attribute_not_exists(ask_default_taken_at)",
+        )
+    except _db().meta.client.exceptions.ConditionalCheckFailedException:
+        return False
+    except Exception as e:
+        logger.error(f"Could not claim the deadline of {run['run_id']}: {e}")
+        return False
+    return _send_waiting(run, "deadline")
+
+
 def settle_waiting(runs_table, run, now):
-    """A needs_input run: name its wait when it names none, or remind once.
-    Returns "named", "reminded" or ""."""
+    """A needs_input run: take a passed question deadline's default, name
+    its wait when it names none, or remind once. Returns "defaulted",
+    "named", "reminded" or ""."""
     run_id = run["run_id"]
     key = {"team_id": run["team_id"], "run_id": run_id}
     now_iso = now.isoformat()
+    if deadline_passed(run, now) and not run.get("ask_default_taken_at"):
+        if take_default(runs_table, run, now):
+            logger.info(f"Run {run_id}: question deadline passed, going ahead with the default")
+            return "defaulted"
     try:
         if not asks_something(run):
             wait = named_wait(run, now_iso)
@@ -539,7 +574,7 @@ def handler(event, context):
     #    before, so awaiting_ci runs sat forever.
     stuck_runs = []
     over_count = 0
-    waiting = {"named": 0, "reminded": 0}
+    waiting = {"named": 0, "reminded": 0, "defaulted": 0}
     scan_kwargs = {
         "FilterExpression": "#s = :running OR #s = :awaiting OR #s = :ni",
         "ExpressionAttributeNames": {"#s": "status"},
@@ -599,6 +634,7 @@ def handler(event, context):
             "over_ceiling": over_count,
             "waiting_named": waiting["named"],
             "waiting_reminded": waiting["reminded"],
+            "waiting_defaulted": waiting["defaulted"],
         }
 
     logger.info(f"Found {len(stuck_runs)} stuck runs")
@@ -690,4 +726,5 @@ def handler(event, context):
         "over_ceiling": over_count,
         "waiting_named": waiting["named"],
         "waiting_reminded": waiting["reminded"],
+        "waiting_defaulted": waiting["defaulted"],
     }

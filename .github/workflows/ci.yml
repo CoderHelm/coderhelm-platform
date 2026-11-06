@@ -90,11 +90,17 @@ jobs:
       # alone resolves features differently and compiles everything again).
       - name: Incident regressions
         run: cargo test --workspace -- 'incidents::'
+      # Stops, asks, blocks and loops replayed through the real decision
+      # functions and graded on the decision, with the stop judge's recorded
+      # answers k = 3 times each (pass^k; passes/replay/README.md). It gates
+      # any prompt, model or effort change to a judgment step.
+      - name: Replay suite
+        run: cargo test --workspace -- 'replay::'
       # Includes the reviewer evals (worker passes::review_eval): recorded
       # review histories replayed through the real decision code, no model.
-      # The incident suite already ran above, on the same build.
+      # The incident and replay suites already ran above, on the same build.
       - name: Workspace tests
-        run: cargo test --workspace -- --skip 'incidents::'
+        run: cargo test --workspace -- --skip 'incidents::' --skip 'replay::'
 
   rust:
     name: Rust (workspace)

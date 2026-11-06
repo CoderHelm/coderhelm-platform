@@ -403,7 +403,8 @@ impl Finding {
         match self.point.trim() {
             "ci_pending" => Settler::Ci,
             "manual_check" => Settler::Person,
-            "end_to_end" | "optional_task" | "check_blocked" | "rule_failing" => Settler::Owner,
+            "end_to_end" | "optional_task" | "check_blocked" | "rule_failing"
+            | JUDGE_ASSUMPTION => Settler::Owner,
             _ => Settler::Proof,
         }
     }
@@ -412,6 +413,7 @@ impl Finding {
         match self.point.trim() {
             "ci_pending" => "Waiting on CI",
             "check_blocked" => "Check not passed",
+            JUDGE_ASSUMPTION => "Assumed instead of asking",
             "rule_failing" => "New-feature rule failing",
             "manual_check" => "Check by hand",
             "unrun_check" => "Check not run",
@@ -1259,6 +1261,10 @@ fn is_security(f: &Finding) -> bool {
 /// An Open item for a check the change didn't pass. The pull request is
 /// already open, so a check can't stop it: it holds the draft instead, until a
 /// person deals with it.
+/// The point of an Open item the stop judge proceeded on
+/// (`passes::stop_judge::assumptions`): a person corrects it if it's wrong.
+pub const JUDGE_ASSUMPTION: &str = "judge_assumption";
+
 pub fn blocked_item(check: &str, why: &str) -> Finding {
     Finding {
         point: "check_blocked".to_string(),
@@ -1718,8 +1724,32 @@ pub async fn prove(
             .ledger
             .update(|l| (l.proof.rounds, l.proof.may_fix(MAX_FIX_ROUNDS)));
         // Only a round that could run asks about time: a "no" for one that
-        // couldn't would send the run to a fresh step for nothing.
-        let fix_ok = may_fix && has_time();
+        // couldn't would send the run to a fresh step for nothing. A round
+        // beyond the first is the stop judge's call.
+        let wants_round = may_fix
+            && has_time()
+            && matches!(next(findings.as_deref(), rounds, true), Next::FixRound);
+        let mut licence = if wants_round {
+            let open: Vec<String> = findings
+                .as_deref()
+                .unwrap_or_default()
+                .iter()
+                .map(|f| f.detail.clone())
+                .collect();
+            super::stop_judge::cycle_licence(
+                w.state,
+                w.msg,
+                w.run_id,
+                "proof_check",
+                rounds,
+                MAX_FIX_ROUNDS,
+                &super::stop_judge::evidence_lines("proof check", &open),
+            )
+            .await
+        } else {
+            None
+        };
+        let fix_ok = licence.is_some();
         match next(findings.as_deref(), rounds, fix_ok) {
             Next::Open => {
                 if findings.is_some() {
@@ -1764,7 +1794,10 @@ pub async fn prove(
             }
             Next::FixRound => {
                 let gaps = findings.unwrap_or_default();
-                w.ledger.update(|l| l.proof.start_fix());
+                let Some(lic) = licence.take() else {
+                    return gaps;
+                };
+                w.ledger.update(|l| l.proof.start_fix(lic));
                 w.save_ledger().await;
                 super::add_progress_note(
                     w.state,

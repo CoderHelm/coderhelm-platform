@@ -283,6 +283,29 @@ class WaitingOnAPerson(unittest.TestCase):
         # Never failed or completed: still waiting, now for something named.
         self.assertNotIn(":new", updates[0]["ExpressionAttributeValues"])
 
+    def test_a_passed_question_deadline_goes_ahead_with_the_default_once(self):
+        run = {
+            "team_id": "T",
+            "run_id": "R",
+            "status": "needs_input",
+            "updated_at": self.NOW.isoformat(),
+            "questions": '{"questions":[{"id":"q1","question":"Monthly or yearly?"}]}',
+            "ask_default": "Monthly",
+            "ask_deadline": (self.NOW - sweep.timedelta(hours=1)).isoformat(),
+        }
+        self.assertTrue(sweep.deadline_passed(run, self.NOW))
+        out, updates, sent = self._sweep([run])
+        self.assertEqual(out["waiting_defaulted"], 1)
+        self.assertIn("attribute_not_exists(ask_default_taken_at)", updates[0]["ConditionExpression"])
+        self.assertEqual(sent, [{"type": "run_waiting", "team_id": "T", "run_id": "R", "why": "deadline"}])
+        # Before the deadline, or already taken, or with no default: nothing.
+        early = dict(run, ask_deadline=(self.NOW + sweep.timedelta(hours=1)).isoformat())
+        self.assertFalse(sweep.deadline_passed(early, self.NOW))
+        self.assertFalse(sweep.deadline_passed(dict(run, ask_default=""), self.NOW))
+        out, _, sent = self._sweep([dict(run, ask_default_taken_at=self.NOW.isoformat())])
+        self.assertEqual(out["waiting_defaulted"], 0)
+        self.assertNotIn("deadline", [m["why"] for m in sent])
+
     def test_without_a_pull_request_it_waits_for_a_retry(self):
         wait = sweep.named_wait({"error_message": "stopped"}, "now")
         self.assertIn("Retry", wait["action"])

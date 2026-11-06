@@ -3061,7 +3061,7 @@ async fn run_once(
         .filter(|t| review_agent::thread_holds_merge(&t.body))
         .map(|t| (t.path.clone(), t.line, t.body.clone()))
         .collect();
-    let final_verdict =
+    let mut final_verdict =
         super::review_verdict::Verdict::from_holding(super::review_policy::named_holding(
             &findings,
             &open_holding,
@@ -3070,6 +3070,51 @@ async fn run_once(
             &own_open,
             &stable.kept,
         ));
+    // A request for changes on someone's PR is a costly decision: the stop
+    // judge sees the whole picture and either holds on a named correctness,
+    // security or data-loss problem, or the review approves with the
+    // holdings as notes and its assumption written down.
+    let mut review_judged: Option<super::stop_judge::Judged> = None;
+    let mut judge_note = String::new();
+    if !self_authored && final_verdict.event() == "REQUEST_CHANGES" {
+        let picture = block_picture(
+            title,
+            pr_body,
+            &compare,
+            &findings,
+            &final_verdict,
+            &prior_threads,
+            &fixed_threads,
+            verify_failed,
+            &verify_md,
+        );
+        let judged = super::stop_judge::decide(
+            state,
+            &provider,
+            &mut usage,
+            &msg.team_id,
+            &super::stop_judge::pr_subject(&msg.repo_owner, &msg.repo_name, msg.pr_number),
+            &head_sha,
+            picture,
+        )
+        .await;
+        if let Some(a) = judged.assumption() {
+            info!(pr = msg.pr_number, head = %head_sha, "Stop judge: approve with notes instead of requesting changes");
+            for f in findings.iter_mut().filter(|f| f.holds_merge()) {
+                super::review_policy::demote(
+                    f,
+                    "FYI, not a block: on the whole picture this is not a named correctness, \
+                     security or data-loss problem to hold the merge on.",
+                );
+            }
+            judge_note = format!(
+                "\n\n**FYI:** on the whole picture nothing here holds the merge. Assumed: {}",
+                a.trim()
+            );
+            final_verdict = super::review_verdict::Verdict::approve();
+        }
+        review_judged = Some(judged);
+    }
     let verdict = final_verdict.event();
     // A hunks-only re-review never approves: the whole PR is reviewed first.
     if super::review_scope::needs_full_before_approval(since_review.is_some(), verdict) {
@@ -3187,6 +3232,7 @@ async fn run_once(
         ),
         None => format!("{verdict_line}\n\n{summary}\n\n{}", risk_report.markdown()),
     };
+    full_body.push_str(&judge_note);
     full_body.push_str(&review_agent::unconfirmed_markdown(&unconfirmed));
     if !verify_md.is_empty() {
         full_body.push_str(&format!("\n\n{verify_md}"));
@@ -3364,6 +3410,7 @@ async fn run_once(
             &full_body,
             &postable.inline,
             &final_verdict,
+            review_judged.as_ref(),
         )
         .await
         {
@@ -3716,6 +3763,7 @@ async fn carry_approval(
         &body,
         &[],
         &super::review_verdict::Verdict::approve(),
+        None,
     )
     .await
     {
@@ -4746,7 +4794,7 @@ pub(crate) fn reconcile_message(msg: &ReviewMessage, head: &str, reason: &str) -
 /// check is read as a question: the person gets an answer, and nothing about
 /// the formal review changes.
 async fn classify_ask(
-    state: &WorkerState,
+    _state: &WorkerState,
     provider: &ModelProvider,
     comment: &str,
     standing: Option<&super::review_verdict::StandingReview>,
@@ -4768,13 +4816,13 @@ async fn classify_ask(
     };
     match crate::agent::anthropic::converse_json(
         &provider.client(),
-        &state.config.light_model_id,
+        provider.judgment_model_id(),
         review_agent::ASK_SYSTEM,
         &review_agent::ask_prompt(comment, &standing_line, last_reply, outstanding),
         &review_agent::ask_schema(),
         true,
-        "low",
-        512,
+        common::stop_judge::JUDGMENT_EFFORT,
+        4096,
         usage,
     )
     .await
@@ -4799,13 +4847,13 @@ async fn reply_conclusion(
 ) -> Option<review_agent::ReplyConclusion> {
     match crate::agent::anthropic::converse_json(
         &provider.client(),
-        provider.primary_model_id(),
+        provider.judgment_model_id(),
         review_agent::REPLY_CONCLUSION_SYSTEM,
         &review_agent::reply_conclusion_prompt(earlier_replies, question, answer),
         &review_agent::reply_conclusion_schema(),
         true,
-        "low",
-        4096,
+        common::stop_judge::JUDGMENT_EFFORT,
+        8192,
         usage,
     )
     .await
@@ -4854,6 +4902,94 @@ fn settled_prior_threads<'a>(
         .filter(|s| s.is_settled() && s.index < prior.len() && seen.insert(s.index))
         .map(|s| prior[s.index])
         .collect()
+}
+
+/// What the stop judge sees for a proposed request for changes: the PR's
+/// title and description, the files it changes, every finding as evidence
+/// (checked when it blocks and traces its mechanism), the verification run,
+/// and the earlier threads with where each stands.
+#[allow(clippy::too_many_arguments)]
+fn block_picture(
+    title: &str,
+    pr_body: &str,
+    compare: &serde_json::Value,
+    findings: &[review_agent::Finding],
+    verdict: &super::review_verdict::Verdict,
+    prior_threads: &[&crate::clients::github::BotReviewThread],
+    fixed_threads: &[&crate::clients::github::BotReviewThread],
+    verify_failed: bool,
+    verify_md: &str,
+) -> super::stop_judge::Picture {
+    use super::stop_judge::{Evidence, Kind, Picture, Thread};
+    let mut p = Picture::new(
+        Kind::Block,
+        "review",
+        &format!(
+            "the review would request changes on: {}",
+            verdict.names().join("; ")
+        ),
+    );
+    p.ticket_title = title.to_string();
+    p.ticket_body = pr_body.to_string();
+    p.acceptance = super::stop_judge::acceptance(pr_body);
+    p.diff_summary = compare["files"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|f| {
+                    Some(format!(
+                        "{} ({}, +{} -{})",
+                        f["filename"].as_str()?,
+                        f["status"].as_str().unwrap_or(""),
+                        f["additions"].as_u64().unwrap_or(0),
+                        f["deletions"].as_u64().unwrap_or(0)
+                    ))
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
+        .unwrap_or_default();
+    for f in findings {
+        let class = super::review_severity::classify(f);
+        p.evidence.push(Evidence {
+            source: format!("review finding ({})", class.reason()),
+            finding: format!("{}: {}", f.title, common::truncate_str(&f.body, 1_500)),
+            location: if f.line > 0 {
+                format!("{}:{}", f.file, f.line)
+            } else {
+                f.file.clone()
+            },
+            checked: class.blocks() && super::review_severity::traces_mechanism(f),
+            ..Default::default()
+        });
+    }
+    if verify_failed {
+        p.evidence.push(Evidence {
+            source: "verification run".into(),
+            finding: format!(
+                "the change's affected tests or build failed in the sandbox: {}",
+                common::truncate_str(verify_md, 1_500)
+            ),
+            location: "the verification run".into(),
+            checked: true,
+            ..Default::default()
+        });
+    }
+    for t in prior_threads {
+        let fixed = fixed_threads.iter().any(|f| f.id == t.id);
+        p.threads.push(Thread {
+            summary: format!(
+                "{}:{} {}",
+                t.path,
+                t.line,
+                common::truncate_str(&t.body, 600)
+            ),
+            open: !fixed && !t.resolved,
+            person_last: t.replies.last().is_some_and(|r| !r.by_bot),
+            ..Default::default()
+        });
+    }
+    p
 }
 
 #[cfg(test)]
@@ -5244,7 +5380,8 @@ mod verdict_tests {
         assert_eq!(a[1]["kind"], "concern");
         assert_eq!(a[1]["blocks"], false);
         assert_eq!(a[2]["kind"], "question");
-        assert_eq!(a[2]["blocks"], true);
+        // A question is an FYI note, even one the change rests on.
+        assert_eq!(a[2]["blocks"], false);
         assert_eq!(super::findings_record(&[]), "[]");
     }
 
@@ -5348,16 +5485,14 @@ mod verdict_tests {
             decide_verdict(std::slice::from_ref(&nit), 0, &[], false),
             "APPROVE"
         );
-        // A required test or a failed check still blocks.
+        // A required test is a Suggestion on the approval; a failed
+        // verification run (the change's own tests failing) still blocks.
         let mut tests = Finding {
             category: "tests".into(),
             ..Default::default()
         };
         super::review_agent::enforce_required_tests(std::slice::from_mut(&mut tests));
-        assert_eq!(
-            decide_verdict(&[nit, tests], 0, &[], false),
-            "REQUEST_CHANGES"
-        );
+        assert_eq!(decide_verdict(&[nit, tests], 0, &[], false), "APPROVE");
         assert_eq!(decide_verdict(&[], 0, &[], true), "REQUEST_CHANGES");
     }
 

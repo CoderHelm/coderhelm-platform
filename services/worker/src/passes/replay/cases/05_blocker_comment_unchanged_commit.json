@@ -1,0 +1,20 @@
+{
+  "name": "a comment that names a blocker on an unchanged commit gets an answer, no second review and no spliced text",
+  "about": "A person commented that a finding still blocked, on a commit nothing had changed since the review. CoderHelm ran a second paid review and posted a reply that spliced the comment into a template. The standing verdict is the answer, in its own whole words.",
+  "case": "blocker_comment",
+  "input": {
+    "trigger": "reply",
+    "head": "a1b2c3d4e5f6",
+    "standing": "REQUEST_CHANGES",
+    "comment": "This still blocks: the retry loop never ends when the queue is empty.",
+    "reply_reads": "block",
+    "holding": [
+      "`src/queue.rs:40` Retry loop never ends"
+    ]
+  },
+  "expect": {
+    "answered": true,
+    "second_review": false,
+    "no_spliced_text": true
+  }
+}

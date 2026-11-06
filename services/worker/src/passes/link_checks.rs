@@ -1322,11 +1322,25 @@ async fn check_and_fix(
         w.report_findings("links", blocking.len()).await;
         let head = w.head().await;
         w.ledger.update(|l| l.links.checked(&head, blocking.len()));
-        if !w.ledger.update(|l| l.links.may_fix(MAX_FIX_ROUNDS)) || !has_time() {
+        let licence = if w.ledger.update(|l| l.links.may_fix(MAX_FIX_ROUNDS)) && has_time() {
+            super::stop_judge::cycle_licence(
+                w.state,
+                w.msg,
+                w.run_id,
+                "link_check",
+                w.ledger.update(|l| l.links.rounds),
+                MAX_FIX_ROUNDS,
+                &super::stop_judge::evidence_lines("link and redirect check", &blocking),
+            )
+            .await
+        } else {
+            None
+        };
+        let Some(licence) = licence else {
             w.save_ledger().await;
             return Err(blocking.join("; "));
-        }
-        w.ledger.update(|l| l.links.start_fix());
+        };
+        w.ledger.update(|l| l.links.start_fix(licence));
         w.save_ledger().await;
         super::add_progress_note(
             w.state,

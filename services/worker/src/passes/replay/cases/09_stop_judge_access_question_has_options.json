@@ -1,0 +1,93 @@
+{
+  "name": "a question for access only a person has is asked with options, a default and a deadline",
+  "about": "The run needed read access to a vendor's sandbox to confirm a payload shape. That is a fact only a person can give, so the judge asks, with what was tried, options and a recommended default.",
+  "case": "stop_judge",
+  "input": {
+    "picture": {
+      "kind": "ask",
+      "step": "plan",
+      "reason": "the planner asks for sandbox credentials to read a real payload",
+      "reversible": true,
+      "ticket_title": "Sync refunds from the payments vendor",
+      "ticket_body": "Refunds should appear in the daily totals.",
+      "question": {
+        "question": "Can CoderHelm get read access to the vendor sandbox?",
+        "tried": [
+          "searched the repository for fixtures",
+          "read the vendor's public docs"
+        ],
+        "options": []
+      }
+    }
+  },
+  "replies": [
+    [
+      {
+        "verdict": "ask",
+        "assumption": "",
+        "question": "How should the refund payload shape be confirmed?",
+        "person_only": "access",
+        "tried": [
+          "searched the repository for fixtures",
+          "read the vendor's public docs"
+        ],
+        "options": [
+          "Add a sandbox API key to the team's secrets",
+          "Build from the public docs and confirm on review"
+        ],
+        "default": "Build from the public docs and confirm on review",
+        "deadline_hours": 24,
+        "blocker": "",
+        "evidence": [],
+        "category": "",
+        "location": ""
+      }
+    ],
+    [
+      {
+        "verdict": "ask",
+        "assumption": "",
+        "question": "Can the run get read access to the vendor sandbox?",
+        "person_only": "access",
+        "tried": [
+          "read the public docs",
+          "searched for fixtures"
+        ],
+        "options": [
+          "Add read-only sandbox credentials",
+          "Proceed from the public docs"
+        ],
+        "default": "Proceed from the public docs",
+        "deadline_hours": 24,
+        "blocker": "",
+        "evidence": [],
+        "category": "",
+        "location": ""
+      }
+    ],
+    [
+      {
+        "verdict": "ask",
+        "assumption": "",
+        "question": "Confirm the refund payload: sandbox access, or the docs?",
+        "person_only": "access",
+        "tried": [
+          "read the docs"
+        ],
+        "options": [
+          "Sandbox access",
+          "The docs"
+        ],
+        "default": "The docs",
+        "deadline_hours": 24,
+        "blocker": "",
+        "evidence": [],
+        "category": "",
+        "location": ""
+      }
+    ]
+  ],
+  "expect": {
+    "verdict": "ask"
+  }
+}

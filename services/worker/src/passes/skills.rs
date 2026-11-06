@@ -1459,15 +1459,13 @@ struct AgentReply {
 /// How hard a team agent thinks on a question a run or a person asks it.
 const ASK_EFFORT: &str = "medium";
 
-/// How hard a team agent thinks when it reviews a step's draft. A plan is
-/// read at low effort: plan reviews cost about 13k output tokens each at
-/// high effort for advice the planner weighs, not a verdict. The diff and
-/// other steps keep medium.
-pub fn review_effort(step: &str) -> &'static str {
-    match step {
-        "plan" => "low",
-        _ => ASK_EFFORT,
-    }
+/// How hard a team agent thinks when it reviews a step's draft: a review
+/// is a judgment step, so high (not max) for every step, the plan included.
+/// The plan review ran at low effort for a while to save about 13k output
+/// tokens a review; at low effort models skip checks and stop early, and the
+/// plan is where a wrong call costs the most.
+pub fn review_effort(_step: &str) -> &'static str {
+    common::stop_judge::JUDGMENT_EFFORT
 }
 
 /// Puts one question to a team agent: its brief as instructions, the team's
@@ -2394,10 +2392,10 @@ mod review_effort_tests {
     use super::*;
 
     #[test]
-    fn a_plan_is_reviewed_at_low_effort_and_everything_else_as_before() {
-        assert_eq!(review_effort("plan"), "low");
-        assert_eq!(review_effort("code"), "medium");
-        assert_eq!(review_effort("pr_description"), "medium");
+    fn every_review_runs_at_high_effort_the_plan_included() {
+        assert_eq!(review_effort("plan"), "high");
+        assert_eq!(review_effort("code"), "high");
+        assert_eq!(review_effort("pr_description"), "high");
         // The plan's revision turn after the review runs at the same effort.
         let src = include_str!("plan.rs");
         assert!(src.contains("effort: Some(super::skills::review_effort(\"plan\"))"));

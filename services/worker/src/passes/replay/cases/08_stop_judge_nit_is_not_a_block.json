@@ -1,0 +1,110 @@
+{
+  "name": "a naming nit never requests changes, even when the model first answers hold",
+  "about": "Exported from the decision log shape: the step proposed requesting changes over a helper's name. A hold on a block needs a correctness, security or data-loss category and a location; the first answer gave neither and is asked again; the second proceeds.",
+  "case": "stop_judge",
+  "input": {
+    "picture": {
+      "kind": "block",
+      "step": "review",
+      "reason": "the review would request changes on: `src/util.ts:3` Rename parse to parse_rows",
+      "reversible": true,
+      "ticket_title": "Parse the import rows",
+      "ticket_body": "Reads the CSV rows into records.",
+      "evidence": [
+        {
+          "id": "E1",
+          "source": "review finding (a preference the reviewer inferred)",
+          "finding": "Rename parse to parse_rows: helper names start with a verb",
+          "location": "src/util.ts:3",
+          "checked": false
+        }
+      ]
+    }
+  },
+  "replies": [
+    [
+      {
+        "verdict": "hold",
+        "assumption": "",
+        "question": "",
+        "person_only": "",
+        "tried": [],
+        "options": [],
+        "default": "",
+        "deadline_hours": 0,
+        "blocker": "helper name",
+        "evidence": [
+          "E1"
+        ],
+        "category": "other",
+        "location": "src/util.ts:3"
+      },
+      {
+        "verdict": "proceed",
+        "assumption": "the name is a preference; approve with a Nit",
+        "question": "",
+        "person_only": "",
+        "tried": [],
+        "options": [],
+        "default": "",
+        "deadline_hours": 0,
+        "blocker": "",
+        "evidence": [],
+        "category": "",
+        "location": ""
+      }
+    ],
+    [
+      {
+        "verdict": "proceed",
+        "assumption": "a naming preference is a Nit on the approval",
+        "question": "",
+        "person_only": "",
+        "tried": [],
+        "options": [],
+        "default": "",
+        "deadline_hours": 0,
+        "blocker": "",
+        "evidence": [],
+        "category": "",
+        "location": ""
+      }
+    ],
+    [
+      {
+        "verdict": "hold",
+        "assumption": "",
+        "question": "",
+        "person_only": "",
+        "tried": [],
+        "options": [],
+        "default": "",
+        "deadline_hours": 0,
+        "blocker": "rename the helper",
+        "evidence": [
+          "E1"
+        ],
+        "category": "",
+        "location": ""
+      },
+      {
+        "verdict": "proceed",
+        "assumption": "approve; the rename is a Nit",
+        "question": "",
+        "person_only": "",
+        "tried": [],
+        "options": [],
+        "default": "",
+        "deadline_hours": 0,
+        "blocker": "",
+        "evidence": [],
+        "category": "",
+        "location": ""
+      }
+    ]
+  ],
+  "expect": {
+    "verdict": "proceed",
+    "never_ask": true
+  }
+}

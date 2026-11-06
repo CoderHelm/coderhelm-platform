@@ -108,6 +108,7 @@ pub const CAPABILITIES: &[Capability] = &[
             "api::list_repos",
             "api::get_stats",
             "analytics::get_analytics",
+            "decisions::get_decisions",
             "plans::list_plans",
             "plans::get_plan",
             "reviewer::list_reviews",
@@ -245,6 +246,7 @@ pub const CAPABILITIES: &[Capability] = &[
         min_role: "member",
         handlers: &[
             "api::retry_run",
+            "decisions::export_decisions",
             "run_answer::answer_run",
             "api::reset_and_rerun",
             "api::re_review_run",

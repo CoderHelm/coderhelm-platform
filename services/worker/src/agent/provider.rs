@@ -140,10 +140,20 @@ impl ModelProvider {
     }
 
     /// The reviewer's reading and writing of a review (`generate_review`).
-    /// The critic, which decides which findings are kept and so what blocks,
-    /// stays on [`Self::heavy_model_id`].
+    /// It decides what the findings are and so what a review holds the merge
+    /// on: a judgment step, on [`Self::judgment_model_id`].
     pub fn review_model_id(&self) -> &str {
-        self.heavy_route(Route::ReviewWriting)
+        self.judgment_model_id()
+    }
+
+    /// Every judgment step: the stop judge, planner decisions, the reviewer's
+    /// verdicts and its severity check, done checks and question screening.
+    /// The strongest configured model, always (run at
+    /// `common::stop_judge::JUDGMENT_EFFORT`). Extraction, formatting and
+    /// edits stay on the cheaper models. The replay suite
+    /// (`passes::replay`) gates any change here.
+    pub fn judgment_model_id(&self) -> &str {
+        self.heavy_model_id()
     }
 
     /// The coder's model for a ticket of this complexity: simple tickets on
@@ -163,7 +173,7 @@ impl ModelProvider {
             return self.heavy_model_id();
         }
         match route {
-            Route::ReviewWriting | Route::MediumImplement => MEASURED_LIGHT_MODEL,
+            Route::MediumImplement => MEASURED_LIGHT_MODEL,
         }
     }
 
@@ -193,17 +203,16 @@ impl ModelProvider {
     }
 }
 
-/// The model the routes below were measured on and held their quality
-/// (`passes/model_route_eval.rs`, `reviewer-evals.yml` route suites):
-/// review writing with the heavy critic kept 40/40 planted defects and
-/// blocked 55/56 cases right against 40/40 and 53/56 on the heavy model;
-/// medium tickets passed 20/20 on both.
+/// The model the route below was measured on and held its quality
+/// (`passes/model_route_eval.rs`): medium tickets passed 20/20 on both. Review
+/// writing ran here too until it was counted a judgment step (it decides what
+/// a review holds the merge on); it is back on the strongest model.
 pub const MEASURED_LIGHT_MODEL: &str = "claude-sonnet-5-5";
 
-/// A heavy route that may run on [`MEASURED_LIGHT_MODEL`].
+/// A heavy route that may run on [`MEASURED_LIGHT_MODEL`]: writing code for
+/// a medium ticket (an edit, not a judgment).
 #[derive(Debug, Clone, Copy)]
 enum Route {
-    ReviewWriting,
     MediumImplement,
 }
 
@@ -309,7 +318,9 @@ mod client_tests {
     #[test]
     fn measured_routes_run_light_unless_the_team_chose_its_heavy_model() {
         let default = provider("claude-opus-5-5", false);
-        assert_eq!(default.review_model_id(), MEASURED_LIGHT_MODEL);
+        // Judgment steps are on the strongest configured model always.
+        assert_eq!(default.review_model_id(), "claude-opus-5-5");
+        assert_eq!(default.judgment_model_id(), "claude-opus-5-5");
         assert_eq!(default.implement_model_id("medium"), MEASURED_LIGHT_MODEL);
         // Unmeasured routes keep their models: the critic and complex
         // tickets on heavy, simple tickets on primary.

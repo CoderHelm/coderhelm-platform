@@ -2023,7 +2023,25 @@ async fn check_and_fix(
         let open = blocking.len() + usize::from(repeat_red);
         w.report_findings("test_fix", open).await;
         w.ledger.update(|l| l.test_fix.checked(&head, open));
-        if !w.ledger.update(|l| l.test_fix.may_fix(MAX_FIX_ROUNDS)) || !has_time() {
+        let licence = if w.ledger.update(|l| l.test_fix.may_fix(MAX_FIX_ROUNDS)) && has_time() {
+            let mut open_items = blocking.clone();
+            if repeat_red {
+                open_items.push("the repeat run of the failing tests is still red".into());
+            }
+            super::stop_judge::cycle_licence(
+                w.state,
+                w.msg,
+                w.run_id,
+                "failing_test_fix",
+                w.ledger.update(|l| l.test_fix.rounds),
+                MAX_FIX_ROUNDS,
+                &super::stop_judge::evidence_lines("failing-test rules", &open_items),
+            )
+            .await
+        } else {
+            None
+        };
+        let Some(licence) = licence else {
             if !blocking.is_empty() {
                 return Err(blocking.join("; "));
             }
@@ -2041,8 +2059,8 @@ async fn check_and_fix(
                 Vec::new(),
                 wrong,
             )));
-        }
-        w.ledger.update(|l| l.test_fix.start_fix());
+        };
+        w.ledger.update(|l| l.test_fix.start_fix(licence));
         w.save_ledger().await;
         if !weak.is_empty() {
             integrity_rounds += 1;
