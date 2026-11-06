@@ -1,33 +1,29 @@
-//! Whether a review finding holds the merge.
+//! Whether a review finding holds the merge, and how a note is labeled.
 //!
-//! Blocking is the default. A finding is a note only when it is one of:
+//! The owner's policy: changes are requested only for a named correctness,
+//! security or data-loss problem, with its location and evidence. Every
+//! other finding is posted on an approval as a labeled note ([`Label`]):
 //!
-//! 1. a style or naming preference the reviewer inferred itself (not a
-//!    written team or repository rule);
-//! 2. an optional suggestion or improvement where the current code is
-//!    correct;
-//! 3. a concern that rests on unknown external state the reviewer couldn't
-//!    check, on a path that doesn't run once in production.
-//!
-//! Everything else blocks: defects verified by the code, tests or CI, a data
-//! query or documentation; correctness and data issues; a PR that misses its
-//! own stated goal; a broken team rule; security issues. Policies on top
-//! (a follow-up the PR tracks, a problem it didn't cause, a late blocker)
-//! still make a finding a note ([`super::review_policy`]).
+//! - **Nit**: a style, naming or layout preference;
+//! - **Suggestion**: an optional improvement, hardening, a refactor, or a
+//!   written team rule the change doesn't follow (no defect shown);
+//! - **FYI**: a question, a concern resting on state nobody could check, an
+//!   unconfirmed fact, or a problem without a location or evidence.
 //!
 //! [`classify`] decides from the finding's structured fields (basis,
-//! category, path kind, stated-goal miss, cited rule); the model's own
-//! severity is only an input. [`ground`] fills those fields from what the
-//! finding shows (a code path it traces, a documented exit or status code
-//! the code gets backwards, a team rule it quotes), and [`second_pass`]
-//! has an independent judge check every note against the same rubric.
+//! category, location, stated-goal miss); the model's own severity is only
+//! an input. [`ground`] fills those fields from what the finding shows (a
+//! code path it traces, a documented exit or status code the code gets
+//! backwards, a team rule it quotes), and [`second_pass`] has an independent
+//! judge check every note against the same rubric. A finding that blocks is
+//! still put to the stop judge before "changes requested" is posted
+//! (`passes::stop_judge`).
 //!
-//! The miss behind it: a provisioning script that threw on an installer's
-//! documented "success, reboot required" code, a write that hid rows from
-//! two incremental cursors (traced line by line, posted "not verified"), a
-//! sort-key tie the PR set out to remove that a data query confirmed
-//! (posted as a note because "the impact is likely small"), and a silent
-//! skip the team's written rules forbid, all posted as non-blocking.
+//! The misses behind the evidence rules: a provisioning script that threw on
+//! an installer's documented "success, reboot required" code, a write that
+//! hid rows from two incremental cursors (traced line by line), and a
+//! sort-key tie a data query confirmed: each a correctness or data-loss
+//! problem shown by evidence, so each blocks.
 
 use super::review_agent::{Basis, Evidence, Finding};
 use crate::agent::provider::{self, ModelProvider};
@@ -165,6 +161,46 @@ fn category_in(category: &str, list: &[&str]) -> bool {
 pub const PREFERENCE: &str = "a preference the reviewer inferred";
 /// Why a note is an optional improvement.
 pub const OPTIONAL: &str = "an optional suggestion; the current code is correct";
+/// Why a question is a note.
+pub const QUESTION: &str = "a question; reviews ask in notes and never hold the merge on one";
+/// Why a team-rule finding with no defect shown is a note.
+pub const TEAM_RULE: &str = "a written team rule the change doesn't follow, with no defect shown";
+/// Why a finding outside the three blocking kinds is a note.
+pub const NOT_BLOCKING_KIND: &str = "not a correctness, security or data-loss problem";
+/// Why a finding with no file is a note.
+pub const NO_LOCATION: &str = "no location in the change";
+/// Why an unshown concern is a note.
+pub const UNSHOWN: &str = "a concern the review couldn't show with evidence";
+
+/// How a note is labeled on the approval.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Label {
+    Nit,
+    Suggestion,
+    Fyi,
+}
+
+impl Label {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Label::Nit => "Nit",
+            Label::Suggestion => "Suggestion",
+            Label::Fyi => "FYI",
+        }
+    }
+}
+
+/// The label a note carries (`None`: it blocks).
+pub fn label(f: &Finding) -> Option<Label> {
+    match classify(f) {
+        Class::Blocks(_) => None,
+        Class::Note(r) if r == PREFERENCE => Some(Label::Nit),
+        Class::Note(r) if r == OPTIONAL || r == TEAM_RULE || r == NOT_BLOCKING_KIND => {
+            Some(Label::Suggestion)
+        }
+        Class::Note(_) => Some(Label::Fyi),
+    }
+}
 
 /// Strictly optional: a preference the reviewer inferred or an optional
 /// improvement where the code is correct. On CoderHelm's own pull requests
@@ -174,58 +210,145 @@ pub fn optional(f: &Finding) -> bool {
     matches!(classify(f), Class::Note(r) if r == PREFERENCE || r == OPTIONAL)
 }
 
+/// Categories that name a data-loss problem.
+const DATA_CATEGORIES: &[&str] = &[
+    "data",
+    "data-loss",
+    "dataloss",
+    "data-integrity",
+    "integrity",
+    "durability",
+    "persistence",
+    "migration",
+];
+
+/// Categories of findings about tests.
+const TEST_CATEGORIES: &[&str] = &["tests", "test", "test-coverage", "coverage"];
+
+/// Phrases of a finding that asks for a test rather than showing one fails.
+const MISSING_TEST_PHRASES: &[&str] = &[
+    "no test",
+    "missing test",
+    "add a test",
+    "needs a test",
+    "need a test",
+    "not tested",
+    "untested",
+    "without tests",
+    "without a test",
+    "lacks test",
+    "lacks a test",
+    "no coverage",
+    "isn't covered",
+    "is not covered",
+    "add tests",
+    "add coverage",
+];
+
+/// A tests finding that asks for a test (a Suggestion), not one that shows
+/// a test fails or proves nothing (a correctness problem).
+fn asks_for_a_test(f: &Finding) -> bool {
+    let text = format!("{} {}", f.title, f.body).to_ascii_lowercase();
+    MISSING_TEST_PHRASES.iter().any(|p| text.contains(p))
+}
+
+/// The blocking kind a finding is, if it is one: security by its category,
+/// data loss by its category, and correctness for any other defect: a PR
+/// that misses its own stated goal, a test that fails or proves nothing, or
+/// a hardening or maintainability finding that traces a concrete defect. A
+/// preference, a question, a request for a test, and an improvement with no
+/// defect shown are no blocking kind.
+pub fn blocking_kind(f: &Finding) -> Option<common::stop_judge::BlockCategory> {
+    use common::stop_judge::BlockCategory as K;
+    if category_in(&f.category, &["security"]) {
+        return Some(K::Security);
+    }
+    if category_in(&f.category, DATA_CATEGORIES) {
+        return Some(K::DataLoss);
+    }
+    if f.defeats_goal == Some(true) {
+        return Some(K::Correctness);
+    }
+    if category_in(&f.category, PREFERENCE_CATEGORIES) || category_in(&f.category, &["question"]) {
+        return None;
+    }
+    if category_in(&f.category, TEST_CATEGORIES) && asks_for_a_test(f) {
+        return None;
+    }
+    // A category alone (hardening, maintainability, observability) never
+    // makes a finding optional when it traces a concrete defect.
+    if category_in(&f.category, SUGGESTION_CATEGORIES)
+        && !(traces_mechanism(f) && f.optional != Some(true))
+    {
+        return None;
+    }
+    Some(K::Correctness)
+}
+
 /// The rubric. Pure over the finding's fields.
 pub fn classify(f: &Finding) -> Class {
     if f.note_only.is_some() {
         return Class::Note("a policy made it a note");
     }
-    if f.severity_check.as_ref().is_some_and(|c| c.blocking) {
-        return Class::Blocks("the severity check found it blocking");
-    }
     if f.evidence() == Evidence::Question {
-        return if f.blocks == Some(true) {
-            Class::Blocks("the change rests on the answer")
-        } else {
-            Class::Note("a question the change doesn't rest on")
-        };
+        return Class::Note(QUESTION);
     }
-    if f.team_rule.as_deref().is_some_and(|r| !r.trim().is_empty()) {
-        return Class::Blocks("it breaks a written team rule");
-    }
-    if f.defeats_goal == Some(true) {
-        return Class::Blocks("the PR doesn't achieve its stated goal");
-    }
-    if category_in(&f.category, &["security"]) {
-        return Class::Blocks("a security issue");
+    let team_rule = f.team_rule.as_deref().is_some_and(|r| !r.trim().is_empty());
+    if team_rule && blocking_kind(f).is_none() {
+        return Class::Note(TEAM_RULE);
     }
     if f.severity.trim().eq_ignore_ascii_case("nit")
         || category_in(&f.category, PREFERENCE_CATEGORIES)
     {
         return Class::Note(PREFERENCE);
     }
-    // A category alone (hardening, maintainability, observability) never
-    // makes a finding optional: one that traces a concrete mechanism through
-    // the code, CI, data or documentation is a defect unless it says the
-    // current code is correct.
-    if f.optional == Some(true)
-        || says_optional(f)
-        || (f.optional != Some(false)
-            && !traces_mechanism(f)
-            && category_in(&f.category, SUGGESTION_CATEGORIES))
-    {
+    if f.optional == Some(true) || says_optional(f) {
         return Class::Note(OPTIONAL);
     }
-    if f.evidence() == Evidence::UnverifiedConcern {
-        if f.basis() != Some(Basis::External) && traces_mechanism(f) {
-            return Class::Blocks("a defect the finding traces through cited evidence");
+    let judged_blocking = f.severity_check.as_ref().is_some_and(|c| c.blocking);
+    let Some(kind) = blocking_kind(f) else {
+        if judged_blocking {
+            return located_and_shown(f, "the severity check found it a blocking problem");
         }
-        return if one_shot(f) {
-            Class::Blocks("an unchecked concern on a path that runs once in production")
+        return if category_in(&f.category, SUGGESTION_CATEGORIES) {
+            Class::Note(OPTIONAL)
         } else {
-            Class::Note("a concern resting on state the reviewer couldn't check")
+            Class::Note(NOT_BLOCKING_KIND)
         };
+    };
+    if judged_blocking {
+        return located_and_shown(f, "the severity check found it a blocking problem");
     }
-    Class::Blocks("a verified defect")
+    if f.evidence() == Evidence::UnverifiedConcern
+        && (f.basis() == Some(Basis::External) || !traces_mechanism(f))
+    {
+        return Class::Note(UNSHOWN);
+    }
+    if !traces_mechanism(f) && f.evidence() != Evidence::VerifiedDefect {
+        return Class::Note(UNSHOWN);
+    }
+    located_and_shown(
+        f,
+        match kind {
+            common::stop_judge::BlockCategory::Security => "a security problem shown by evidence",
+            common::stop_judge::BlockCategory::DataLoss => "a data-loss problem shown by evidence",
+            common::stop_judge::BlockCategory::Correctness => {
+                if f.defeats_goal == Some(true) {
+                    "the PR doesn't achieve its stated goal"
+                } else {
+                    "a correctness problem shown by evidence"
+                }
+            }
+        },
+    )
+}
+
+/// Blocks only with a location in the change.
+fn located_and_shown(f: &Finding, why: &'static str) -> Class {
+    if f.file.trim().is_empty() {
+        return Class::Note(NO_LOCATION);
+    }
+    Class::Blocks(why)
 }
 
 // ── Grounding: fields from what the finding shows ──
@@ -555,24 +678,19 @@ pub fn finalize(findings: &mut [Finding]) {
 
 // ── The second pass: an independent check of every note ──
 
-/// The rubric the judge applies; the same as [`classify`].
+/// The rubric the severity check applies; the same as [`classify`].
 pub const JUDGE_SYSTEM: &str = "You check the severity of code review findings that were posted \
      as non-blocking notes. You see each finding's text, the diff hunk it is on, the pull \
      request's stated goal and the team's written rules; you don't see the reviewer's reasoning. \
-     A finding BLOCKS the merge by default. It is non-blocking only when it is one of: (a) a \
-     style or naming preference the reviewer inferred itself, not a written team or repository \
-     rule; (b) an optional suggestion or improvement where the current code is correct; (c) a \
-     concern that truly depends on unknown external state nobody could check, on code that \
-     doesn't run once in production. Everything else blocks: a defect shown by the code, tests, \
-     CI, a data query or the documentation of the tool, API or platform involved (exit codes, \
-     status codes, vendor docs); a correctness or data issue (lost or stale writes, cursors or \
-     watermarks that skip rows, duplicates, ordering that flips between runs); a finding showing \
-     the PR doesn't achieve its stated goal; a broken written team rule; a security issue. \
-     Likelihood and estimated impact never make a verified defect non-blocking: \"usually it \
-     won't happen\", \"few records look affected\" and \"the impact is likely small\" are not \
-     reasons. Code that runs once in production with no automatic retry (startup and \
-     provisioning scripts, migrations, deploy and release steps, data writes) is judged \
-     strictly. Output ONLY a fenced ```json block: \
+     A finding BLOCKS the merge only when it is a correctness, security or data-loss problem \
+     that the finding shows with evidence (the code path, a test or CI result, a data query, or \
+     the documentation of the tool, API or platform involved: exit codes, status codes, vendor \
+     docs) at a location in the change. Correctness includes a PR that doesn't achieve its \
+     stated goal; data loss includes lost or stale writes, cursors or watermarks that skip \
+     rows, duplicates and ordering that flips between runs. Likelihood and estimated impact \
+     never make a shown defect non-blocking. Everything else is a note: style and naming, \
+     optional improvements, a written team rule not followed with no defect shown, questions, \
+     and concerns resting on state nobody could check. Output ONLY a fenced ```json block: \
      {\"checks\":[{\"index\":<int>,\"blocking\":<bool>,\"reason\":\"one short sentence\"}]} \
      with one entry per finding.";
 
@@ -772,7 +890,7 @@ pub async fn second_pass(
     let reply = provider::converse_simple(
         state,
         provider,
-        provider.primary_model_id(),
+        provider.judgment_model_id(),
         JUDGE_SYSTEM,
         &prompt,
         usage,
@@ -833,26 +951,53 @@ mod tests {
         let external =
             finding(json!({"severity": "high", "category": "correctness", "basis": "external"}));
         assert!(!external.holds_merge());
-        // The same external concern on a one-shot path blocks.
+        // The same external concern on a one-shot path is an FYI note too:
+        // nothing shows the problem (a documented code would, see
+        // `ground_reads_documented_codes_on_one_shot_paths`).
         let on_deploy = finding(
             json!({"file": "deploy/run.sh", "severity": "medium", "category": "correctness", "basis": "external"}),
         );
-        assert!(on_deploy.holds_merge());
+        assert!(!on_deploy.holds_merge());
+        assert_eq!(label(&on_deploy), Some(Label::Fyi));
+        assert_eq!(label(&pref), Some(Label::Nit));
+        assert_eq!(label(&hardening), Some(Label::Suggestion));
+        assert_eq!(label(&optional), Some(Label::Suggestion));
     }
 
     #[test]
-    fn rules_goals_and_security_block_whatever_the_category() {
+    fn goals_and_shown_security_block_a_team_rule_alone_is_a_suggestion() {
         let rule = finding(
             json!({"severity": "low", "category": "convention", "team_rule": "Log a WARNING with the record id"}),
         );
-        assert!(rule.holds_merge());
+        assert!(!rule.holds_merge());
+        assert_eq!(classify(&rule), Class::Note(TEAM_RULE));
+        assert_eq!(label(&rule), Some(Label::Suggestion));
+        // A team rule broken by a shown correctness defect blocks as that.
+        let rule_bug = finding(
+            json!({"severity": "low", "category": "correctness", "evidence": "verified-defect", "team_rule": "Never drop rows"}),
+        );
+        assert!(rule_bug.holds_merge());
         let goal =
             finding(json!({"severity": "medium", "category": "suggestion", "defeats_goal": true}));
         assert!(goal.holds_merge());
+        // Security blocks when the finding shows it; an unshown concern is FYI.
         let sec = finding(
             json!({"severity": "low", "category": "security", "evidence": "unverified-concern"}),
         );
-        assert!(sec.holds_merge());
+        assert!(!sec.holds_merge());
+        assert_eq!(label(&sec), Some(Label::Fyi));
+        let shown = finding(
+            json!({"severity": "low", "category": "security", "basis": "code",
+                   "body": "`src/a.rs:3` builds the SQL from `req.query`"}),
+        );
+        assert!(shown.holds_merge());
+        assert_eq!(
+            classify(&shown),
+            Class::Blocks("a security problem shown by evidence")
+        );
+        // No location: a note.
+        let nowhere = finding(json!({"file": "", "category": "correctness", "basis": "code"}));
+        assert_eq!(classify(&nowhere), Class::Note(NO_LOCATION));
         // A policy note stays a note.
         let mut tracked = finding(json!({"severity": "high", "category": "bug"}));
         super::super::review_policy::demote(&mut tracked, "tracked");
@@ -989,13 +1134,13 @@ mod tests {
     #[test]
     fn the_judge_is_told_the_rubric() {
         for part in [
-            "BLOCKS the merge by default",
-            "style or naming preference the reviewer inferred",
-            "optional suggestion",
-            "unknown external state",
-            "doesn't achieve its stated goal",
-            "written team rule",
-            "\"the impact is likely small\"",
+            "BLOCKS the merge only when it is a correctness, security or data-loss",
+            "at a location in the change",
+            "style and naming",
+            "optional improvements",
+            "doesn't achieve its",
+            "written team rule not followed",
+            "Likelihood and estimated impact",
         ] {
             assert!(JUDGE_SYSTEM.contains(part), "{part}");
         }
@@ -1018,10 +1163,13 @@ mod tests {
         )]);
         let posted = super::super::review_agent::to_postable(&fs, &changed, &HashMap::new());
         let blocker = &posted.inline[0].body;
-        assert!(blocker.starts_with("🔴 **Stale cursor**"), "{blocker}");
+        assert!(
+            blocker.starts_with("🔴 **Blocking (correctness): Stale cursor**"),
+            "{blocker}"
+        );
         assert!(!blocker.contains(super::super::review_agent::NON_BLOCKING_MARK));
         let note = &posted.inline[1].body;
-        assert!(note.starts_with("💬"), "{note}");
+        assert!(note.starts_with("💬 **Nit: Rename**"), "{note}");
         assert!(note.contains(super::super::review_agent::NON_BLOCKING_MARK));
     }
 

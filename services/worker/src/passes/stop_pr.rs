@@ -72,12 +72,25 @@ pub async fn open(
     branch: &str,
     reason: &str,
 ) -> Result<String, BoxError> {
-    open_with(state, msg, run_id, branch, reason, &[], true).await
+    // Handing the work to a person is the stop judge's call: it either
+    // names what blocks, or the draft carries its assumption as an open item.
+    let mut usage = crate::models::TokenUsage::default();
+    let judged = super::stop_judge::decide_for_team(
+        state,
+        &mut usage,
+        &msg.team_id,
+        &super::stop_judge::run_subject(run_id),
+        "",
+        super::stop_judge::handoff_picture(msg, "stopped_after_work", reason, &[]),
+    )
+    .await;
+    open_with(state, msg, run_id, branch, reason, &[], true, &judged).await
 }
 
 /// [`open`], with what the checks left open going under Open items (on the
 /// pull request that is already there too), and the notification only when
 /// `notify` says this stop hasn't sent one.
+#[allow(clippy::too_many_arguments)]
 pub async fn open_with(
     state: &WorkerState,
     msg: &TicketMessage,
@@ -86,7 +99,20 @@ pub async fn open_with(
     reason: &str,
     items: &[super::proof::Finding],
     notify: bool,
+    judged: &super::stop_judge::Judged,
 ) -> Result<String, BoxError> {
+    let mut with_assumption = items.to_vec();
+    if let Some(a) = judged.assumption() {
+        with_assumption.push(super::proof::Finding {
+            point: super::proof::JUDGE_ASSUMPTION.to_string(),
+            detail: format!("handoff: {}", a.trim()),
+            settle: "Correct it in a comment on this pull request if it's wrong; otherwise \
+                     delete this line."
+                .to_string(),
+            ..Default::default()
+        });
+    }
+    let items = &with_assumption[..];
     let github = GitHubClient::new(
         &state.secrets.github_app_id,
         &state.secrets.github_private_key,
@@ -157,7 +183,11 @@ pub async fn open_with(
     let now = chrono::Utc::now().to_rfc3339();
     // The work is done and on the pull request: the run waits for its
     // review, named, never for "more detail" nobody was asked for.
-    let wait = review_wait(number, &url, reason);
+    let detail = match judged.hold_words() {
+        Some(h) => format!("{reason} Blocked on: {h}"),
+        None => reason.to_string(),
+    };
+    let wait = review_wait(number, &url, &detail);
     let _ = state
         .dynamo
         .update_item()

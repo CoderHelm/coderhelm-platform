@@ -133,6 +133,11 @@ pub async fn emit_run(state: &WorkerState, team_id: &str, run_id: &str, status: 
 /// team hears again what it waits for, through the usual `run.needs_input`
 /// event, and the run page notes it. Nothing is sent once the run moved on.
 pub async fn run_waiting(state: &WorkerState, msg: &common::messages::RunWaitingMessage) {
+    // A judged question's deadline passed: go ahead with its default.
+    if msg.why == "deadline" {
+        super::stop_judge::take_default(state, &msg.team_id, &msg.run_id).await;
+        return;
+    }
     let item = state
         .dynamo
         .get_item()
@@ -161,13 +166,9 @@ pub async fn run_waiting(state: &WorkerState, msg: &common::messages::RunWaiting
         )
     };
     super::add_progress_note(state, &msg.team_id, &msg.run_id, &note).await;
-    emit_run(
-        state,
-        &msg.team_id,
-        &msg.run_id,
-        common::run_status::NEEDS_INPUT,
-    )
-    .await;
+    // The event for the wait it already has (no status is written here).
+    let event_status = common::run_status::NEEDS_INPUT;
+    emit_run(state, &msg.team_id, &msg.run_id, event_status).await;
 }
 
 /// `pull_request.opened`'s `data` (pure).

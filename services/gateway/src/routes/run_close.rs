@@ -556,6 +556,14 @@ impl Ctx<'_> {
 
     async fn after_close(&self, run_id: &str, steps: &CloseSteps) -> CloseResult {
         info!(run_id, from = %steps.from, close_pr = self.close_pr, "Run closed by a person");
+        common::decision_log::on_run_acted(
+            &self.state.dynamo,
+            &self.state.config.settings_table_name,
+            self.team_id,
+            run_id,
+            common::decision_log::Outcome::CancelledRun,
+        )
+        .await;
         let mut out = CloseResult::new(run_id, Outcome::Closed, "Closed.");
         if let Some(ticket) = &steps.ticket_lock {
             super::api::delete_ticket_lock(self.state, self.team_id, ticket).await;

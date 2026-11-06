@@ -1,0 +1,17 @@
+{
+  "name": "a feature phrased as a complaint, with the planner's decision block missing, goes to code",
+  "about": "A ticket filed as a bug complains that a page lacks a filter; the planner's answer lost its fix_location block. The run asked a person where the fix belongs after spending its budget. The plan's tasks name this repository's files, so the run codes them and asks nothing.",
+  "case": "ticket_route",
+  "input": {
+    "title": "The class schedule page has no way to filter by coach",
+    "body": "Members keep complaining that they can't find a coach's classes on the schedule page.\n\n## Acceptance criteria\n- A coach filter on the schedule page\n- The filter keeps the chosen coach when the week changes",
+    "ticket_type": "Bug",
+    "model_intent": "bug",
+    "planner_answer": "## Design\nAdd a coach filter to the schedule page and pass it to the classes query.\n\n## Tasks\n- [ ] apps/web/src/app/schedule/page.tsx: [modify] Add the coach filter\n- [ ] apps/web/src/lib/classes.ts: [modify] Filter the query by coach\n",
+    "tasks": "- [ ] apps/web/src/app/schedule/page.tsx: [modify] Add the coach filter\n- [ ] apps/web/src/lib/classes.ts: [modify] Filter the query by coach"
+  },
+  "expect": {
+    "route": "code",
+    "asked": false
+  }
+}

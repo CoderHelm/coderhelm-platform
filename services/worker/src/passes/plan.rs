@@ -736,7 +736,7 @@ Then the ```fix_location.json block described above."#,
         effort: None,
     };
 
-    let model_id = provider.primary_model_id();
+    let model_id = provider.judgment_model_id();
     let can_look_up = live.as_ref().is_some_and(|l| !l.tools().is_empty());
     let lookups = || live.as_ref().map_or(0, |l| l.lookups_made());
     let mut response = provider::converse(
@@ -1248,8 +1248,8 @@ Then the ```fix_location.json block described above."#,
                     "user".to_string(),
                     vec![serde_json::json!({"type": "text", "text": revision_prompt(&advice)})],
                 ));
-                // The revision answers the advice; it doesn't plan again
-                // from scratch, so it runs at the plan review's low effort.
+                // The revision answers the advice in one turn, at the
+                // review's effort (high: a judgment step).
                 let one_turn = llm::ConverseOptions {
                     max_turns: 1,
                     effort: Some(super::skills::review_effort("plan")),
@@ -1522,7 +1522,7 @@ async fn reask_decision(
         state,
         provider,
         common::agent_policy::Agent::Planner,
-        provider.primary_model_id(),
+        provider.judgment_model_id(),
         "You write one JSON block for a plan that already exists. Return only the block.",
         &mut messages,
         &[],
@@ -1530,9 +1530,9 @@ async fn reask_decision(
         usage,
         llm::ConverseOptions {
             max_turns: 1,
-            max_tokens: 4096,
+            max_tokens: 8192,
             deadline: None,
-            effort: Some("low"),
+            effort: Some(common::stop_judge::JUDGMENT_EFFORT),
         },
         None,
         None,

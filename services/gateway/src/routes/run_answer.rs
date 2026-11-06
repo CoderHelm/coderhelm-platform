@@ -258,6 +258,17 @@ pub async fn answer(
         ));
     }
 
+    // What the person answered lands on the stop judge's decisions for this
+    // run: the default taken, or another answer (the outcome log).
+    let given: Vec<String> = answers.iter().map(|a| a.answer.clone()).collect();
+    common::decision_log::on_answers(
+        &state.dynamo,
+        &state.config.settings_table_name,
+        &claims.team_id,
+        run_id,
+        &given,
+    )
+    .await;
     let asked_at = asked.and_then(|a| a.comment_url);
     let comment_url = post_reply(state, &item, &person.public, &answers, asked_at.as_deref()).await;
     let posted = comment_url.is_some();

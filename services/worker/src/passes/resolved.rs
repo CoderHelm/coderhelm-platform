@@ -199,7 +199,7 @@ pub fn by_words(questions: &[Question], settled: &[Answer]) -> Vec<Verdict> {
 
 /// One verdict per question. Nothing settled: every question is open.
 pub async fn judge(
-    state: &WorkerState,
+    _state: &WorkerState,
     provider: &ModelProvider,
     questions: &[Question],
     settled: &[Answer],
@@ -210,13 +210,13 @@ pub async fn judge(
     }
     match crate::agent::anthropic::converse_json(
         &provider.client(),
-        &state.config.light_model_id,
+        provider.judgment_model_id(),
         SYSTEM,
         &prompt(questions, settled),
         &schema(),
         true,
-        "low",
-        2048,
+        common::stop_judge::JUDGMENT_EFFORT,
+        8192,
         usage,
     )
     .await

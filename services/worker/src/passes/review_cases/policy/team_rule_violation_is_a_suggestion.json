@@ -1,0 +1,64 @@
+{
+  "description": "The code skips missing or invalid records, while the team's written rules require a WARNING with the record id and a count in the run summary. The reviewer filed it as a convention finding that quotes the rule. Under the owner's policy a written team rule not followed, with no correctness, security or data-loss defect shown, is a Suggestion on the approval; a rule the finding cites that the team never wrote is dropped, and the finding is then a preference note.",
+  "steps": [
+    {
+      "team_rules": "## Data jobs\n- When a record is skipped because it is missing or invalid, log a WARNING with the record id and report the count of skipped records in the run summary.\n- Use the shared HTTP client."
+    },
+    {
+      "push": {
+        "head": "d1d2d3d"
+      }
+    },
+    {
+      "review": {
+        "trigger": "synchronize",
+        "dedup_key": "head#d1d2d3d",
+        "model": {
+          "verdict": "APPROVE",
+          "summary": "x",
+          "findings": [
+            {
+              "file": "jobs/import.py",
+              "line": 30,
+              "severity": "medium",
+              "category": "convention",
+              "evidence": "verified-defect",
+              "team_rule": "log a WARNING with the record id and report the count of skipped records in the run summary",
+              "title": "Invalid records are skipped silently",
+              "body": "`continue` on a missing price drops the record with no log and no count."
+            },
+            {
+              "file": "jobs/import.py",
+              "line": 50,
+              "severity": "medium",
+              "category": "convention",
+              "evidence": "verified-defect",
+              "team_rule": "Name every helper with a verb first",
+              "title": "Rename parse to parse_rows",
+              "body": "Helper names should start with a verb."
+            }
+          ]
+        }
+      }
+    }
+  ],
+  "expect": {
+    "formal": [
+      [
+        "d1d2d3d",
+        "APPROVE"
+      ]
+    ],
+    "last_notes": 2,
+    "body_contains": [
+      [
+        0,
+        "Invalid records are skipped silently"
+      ],
+      [
+        0,
+        "Rename parse to parse_rows"
+      ]
+    ]
+  }
+}

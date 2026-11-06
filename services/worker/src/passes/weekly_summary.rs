@@ -243,6 +243,9 @@ pub struct Summary {
     pub agent_asks: u64,
     pub lookups: LookupStats,
     pub usage: Usage,
+    /// The stop judge's week: unnecessary stops and nuisance blocks
+    /// (`common::decision_log`).
+    pub decisions: common::decision_log::Summary,
 }
 
 /// What a recipient may see, from their role.
@@ -981,6 +984,17 @@ fn details(sm: &Summary, access: Access) -> Vec<Detail> {
             link_label: "View",
             link: format!("{app}/reviewer/"),
         });
+    }
+    if access >= Access::Member {
+        if let Some(line) = common::decision_log::weekly_line(&sm.decisions) {
+            out.push(Detail {
+                name: "Stops and blocks",
+                line,
+                extra: String::new(),
+                link_label: "View",
+                link: format!("{app}/analytics/"),
+            });
+        }
     }
     let r = &sm.runs;
     if r.ci_fix_pushes + r.ci_handed_off > 0 {
@@ -1840,7 +1854,7 @@ pub async fn load_from(
     let use_hi = format!("SKILLUSE#{}", ulid_at(last, true));
     let log_lo = format!("DSLOG#{}", iso(start));
     let log_hi = format!("DSLOG#{}", iso(end));
-    let (runs, reviews, alerts, access, lookups, usage) = tokio::join!(
+    let (runs, reviews, alerts, access, lookups, usage, decided) = tokio::join!(
         load_runs(src, team_id, end),
         settings_range(
             src,
@@ -1853,7 +1867,22 @@ pub async fn load_from(
         settings_range(src, team_id, &use_lo, &use_hi, "#a, outcome"),
         settings_range(src, team_id, &log_lo, &log_hi, "outcome"),
         load_usage(src, team_id, start, now),
+        settings_range(
+            src,
+            team_id,
+            common::decision_log::SK_PREFIX,
+            // `$` sorts right after `#`: every DECISION# key, none after.
+            "DECISION$",
+            "sk, kind, step, verdict, category, detail, outcome, created_at, run_id, repo, pr_number",
+        ),
     );
+    // The stop judge's decisions this week (keys are by subject, not time).
+    let decisions: Vec<common::decision_log::Record> = decided
+        .unwrap_or_default()
+        .iter()
+        .map(common::decision_log::Record::from_item)
+        .filter(|r| within(&r.created_at, start, end))
+        .collect();
     let mut reviews = reviews?;
     // `rstat_hi` is exclusive in effect: a key at exactly `end` sorts after it
     // only when it has more digits; drop anything at or after `end`.
@@ -1900,6 +1929,7 @@ pub async fn load_from(
         agent_asks: skills.asks.max(0) as u64,
         lookups: looked,
         usage: usage?,
+        decisions: common::decision_log::summarize(&decisions),
     })
 }
 
@@ -2469,6 +2499,7 @@ mod tests {
                 }),
                 limits: legacy_limit(200_000_000, true),
             },
+            decisions: Default::default(),
         }
     }
 
@@ -2502,10 +2533,34 @@ mod tests {
                 week_tokens: None,
                 limits: Default::default(),
             },
+            decisions: Default::default(),
         }
     }
 
     const LINK: &str = "https://api.coderhelm.com/email/unsubscribe?t=abc.def";
+
+    #[test]
+    fn the_week_names_unnecessary_stops_and_nuisance_blocks_for_members() {
+        let mut sm = sample();
+        sm.decisions.nuisance_blocks = common::decision_log::Rate {
+            total: 4,
+            with_outcome: 2,
+            wrong: 1,
+            rate: 0.5,
+            ..Default::default()
+        };
+        let member = render(&sm, Access::Member, LINK);
+        assert!(member.text.contains("Stops and blocks"), "{}", member.text);
+        assert!(member
+            .text
+            .contains("nuisance 50% (1 of 2 with an outcome)"));
+        let viewer = render(&sm, Access::Viewer, LINK);
+        assert!(!viewer.text.contains("Stops and blocks"));
+        // Nothing judged: no line.
+        assert!(!render(&sample(), Access::Admin, LINK)
+            .text
+            .contains("Stops and blocks"));
+    }
 
     #[test]
     fn the_week_is_the_seven_whole_days_before_the_send_and_labelled_so() {
@@ -3009,6 +3064,7 @@ mod tests {
             agent_asks: 0,
             lookups: LookupStats::default(),
             usage: Usage::default(),
+            decisions: Default::default(),
         };
         let e = render(&sm, Access::Admin, LINK);
         assert!(e.has_data);

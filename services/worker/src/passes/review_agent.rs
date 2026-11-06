@@ -210,7 +210,12 @@ pub fn thread_holds_merge(body: &str) -> bool {
         return false;
     }
     let first = body.lines().next().unwrap_or("");
-    !first.trim_end().ends_with("(question)")
+    if first.contains("**Nit: ") || first.contains("**FYI: ") || first.contains("**Suggestion: ") {
+        return false;
+    }
+    // Older comments: a question never holds the merge, blocking or not.
+    let first = first.trim_end();
+    !(first.ends_with("(question)") || first.ends_with("(question, blocks the merge)"))
 }
 
 /// The model's structured review output.
@@ -328,7 +333,7 @@ pub const REQUIRE_TESTS_SECTION: &str = "\n## Tests are required in this repo\n\
      code so they assert the new behavior (a bug fix needs a test that would have caught it). \
      Use your tools: find where this code is already tested (search for the changed symbols / \
      files in test directories) and check the diff touches those tests. If tests are missing or \
-     stale, add ONE finding with category \"tests\" and severity \"blocking\", anchored on the \
+     stale, add ONE finding with category \"tests\" and severity \"medium\", anchored on the \
      main changed line, saying exactly what behavior needs a test and which existing test file \
      to add it to or update (or where similar tests live). Ask for a test at the level the repo \
      already tests that behavior: when a function is covered through the flow, mapper or screen \
@@ -598,14 +603,20 @@ pub fn format_discussion(comments: &[(String, String)]) -> String {
     s
 }
 
-/// "Require tests": every `tests` finding is blocking, and holds the merge
-/// as a policy the repo set.
+/// "Require tests": a `tests` finding is always posted (the critic never
+/// drops it) as a Suggestion on the approval. A missing test is not a
+/// correctness, security or data-loss problem, so it never requests changes
+/// on its own; CoderHelm's own coding passes still write the tests.
+pub const REQUIRED_TESTS_NOTE: &str = "This repository asks for tests with behavior changes.";
+
 pub fn enforce_required_tests(findings: &mut [Finding]) {
     for f in findings.iter_mut() {
         if f.category.eq_ignore_ascii_case("tests") {
-            f.severity = "blocking".to_string();
-            f.optional = Some(false);
-            f.evidence = Some(Evidence::VerifiedDefect.as_str().to_string());
+            f.severity = "medium".to_string();
+            f.optional = Some(true);
+            if !f.body.contains(REQUIRED_TESTS_NOTE) {
+                f.body = format!("{}\n\n_{REQUIRED_TESTS_NOTE}_", f.body.trim_end());
+            }
         }
     }
 }
@@ -769,9 +780,9 @@ fn one_line(s: &str) -> String {
     s.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-/// The unconfirmed facts in a review body: those the change rests on, as the
-/// ask that clears them, and the rest under "Notes" (they don't hold the
-/// merge).
+/// The unconfirmed facts in a review body, as FYI notes: an unconfirmed
+/// fact names no problem the review showed, so it never holds the merge.
+/// Those the change rests on come first, with how to confirm them.
 pub fn unconfirmed_markdown(unconfirmed: &[UnconfirmedFact]) -> String {
     let line = |f: &UnconfirmedFact| {
         if f.why.trim().is_empty() {
@@ -781,24 +792,22 @@ pub fn unconfirmed_markdown(unconfirmed: &[UnconfirmedFact]) -> String {
         }
     };
     let mut s = String::new();
-    let blocking: Vec<&UnconfirmedFact> = unconfirmed.iter().filter(|f| f.blocks).collect();
-    if !blocking.is_empty() {
+    let rests: Vec<&UnconfirmedFact> = unconfirmed.iter().filter(|f| f.blocks).collect();
+    if !rests.is_empty() {
         s.push_str(
-            "\n\n#### Confirm before merge\nThe change relies on these facts about another \
-             system, and the PR's evidence says they weren't confirmed. Confirm each from the \
-             real system (a payload or a row) and add what came back to the description. \
-             Updating the description starts a re-review on its own, so there's no need to \
-             push a commit or ask for one:\n",
+            "\n\n#### FYI: facts worth confirming\nThe change relies on these facts about \
+             another system, and the PR's evidence doesn't confirm them. They don't hold the \
+             merge; confirming each from the real system (a payload or a row) in the \
+             description makes the change safer to ship:\n",
         );
-        for f in blocking {
+        for f in rests {
             s.push_str(&line(f));
         }
     }
     let notes: Vec<&UnconfirmedFact> = unconfirmed.iter().filter(|f| !f.blocks).collect();
     if !notes.is_empty() {
         s.push_str(
-            "\n\n#### Notes\nUnconfirmed in the PR's evidence, but the change doesn't rest on \
-             them, so they don't hold the merge:\n",
+            "\n\n#### FYI\nUnconfirmed in the PR's evidence; the change doesn't rest on them:\n",
         );
         for f in notes {
             s.push_str(&line(f));
@@ -812,23 +821,23 @@ pub fn unconfirmed_markdown(unconfirmed: &[UnconfirmedFact]) -> String {
 /// `APPROVE` or `REQUEST_CHANGES`: a formal review never leaves the author
 /// guessing with a bare comment.
 ///
-/// `REQUEST_CHANGES` for anything that holds the merge: a verified defect
-/// (or a policy like required tests), a question or an unconfirmed fact the
-/// change's correctness rests on, an earlier requested change still open, or
-/// a failed verification. Otherwise `APPROVE`: notes, suggestions, concerns
-/// the reviewer couldn't verify, questions the change doesn't rest on and
-/// environment notes are posted with the approval.
+/// `REQUEST_CHANGES` only for a named correctness, security or data-loss
+/// problem with its location and evidence (a finding that holds the merge,
+/// [`super::review_severity::classify`]), an earlier such request still
+/// open, or a failed verification run (the change's own tests failing).
+/// Otherwise `APPROVE`, with every other finding as a labeled note: Nit,
+/// Suggestion or FYI (questions, unconfirmed facts, concerns the reviewer
+/// couldn't show). The stop judge sees a request for changes before it is
+/// posted (`passes::stop_judge`).
 pub fn decide_verdict(
     findings: &[Finding],
     prior_open_holding: usize,
-    unconfirmed: &[UnconfirmedFact],
+    _unconfirmed: &[UnconfirmedFact],
     verify_failed: bool,
 ) -> &'static str {
-    if verify_failed
-        || prior_open_holding > 0
-        || findings.iter().any(Finding::holds_merge)
-        || unconfirmed.iter().any(|f| f.blocks)
-    {
+    // An unconfirmed fact is an FYI note: it names no problem the review
+    // showed, so it never requests changes on its own.
+    if verify_failed || prior_open_holding > 0 || findings.iter().any(Finding::holds_merge) {
         "REQUEST_CHANGES"
     } else {
         "APPROVE"
@@ -1992,6 +2001,15 @@ pub fn to_postable(
         } else {
             "💬"
         };
+        // Notes carry their label first (Nit, Suggestion, FYI); a blocker
+        // names its kind.
+        let label = match super::review_severity::label(f) {
+            Some(l) => format!("{}: ", l.as_str()),
+            None => match super::review_severity::blocking_kind(f) {
+                Some(k) => format!("Blocking ({}): ", k.as_str().replace('_', " ")),
+                None => "Blocking: ".to_string(),
+            },
+        };
         let kind = match f.evidence() {
             Evidence::VerifiedDefect if f.basis() == Some(Basis::Documented) => {
                 format!("{}, documented", f.category)
@@ -2003,7 +2021,7 @@ pub fn to_postable(
             Evidence::Question => "question".to_string(),
             Evidence::UnverifiedConcern => format!("{}, not verified", f.category),
         };
-        let mut body = format!("{emoji} **{}** ({kind})\n\n{}", f.title, f.body);
+        let mut body = format!("{emoji} **{label}{}** ({kind})\n\n{}", f.title, f.body);
         if let Some(src) = f.source.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
             if !f.body.contains(src) {
                 body.push_str(&format!("\n\nSource: {src}"));
@@ -2803,7 +2821,7 @@ mod required_tests_tests {
     }
 
     #[test]
-    fn tests_findings_become_blocking_others_untouched() {
+    fn tests_findings_become_suggestions_others_untouched() {
         let mut v = vec![
             f("tests", "medium"),
             f("Tests", "low"),
@@ -2811,7 +2829,8 @@ mod required_tests_tests {
             f("convention", "nit"),
         ];
         enforce_required_tests(&mut v);
-        assert!(v[0].is_blocking() && v[1].is_blocking());
+        assert!(v[0].optional == Some(true) && v[1].optional == Some(true));
+        assert!(!v[0].is_blocking() && !v[0].holds_merge() && !v[1].holds_merge());
         assert_eq!(v[2].severity, "medium");
         assert_eq!(v[3].severity, "nit");
     }
@@ -2947,10 +2966,15 @@ mod evidence_tests {
     }
 
     #[test]
-    fn required_tests_are_a_policy_that_holds_the_merge() {
-        let mut v = vec![f("tests", Some("question"))];
+    fn required_tests_are_a_suggestion_on_the_approval() {
+        let mut v = vec![f("tests", Some("verified-defect"))];
         enforce_required_tests(&mut v);
-        assert!(v[0].holds_merge());
+        assert!(!v[0].holds_merge());
+        assert_eq!(
+            crate::passes::review_severity::label(&v[0]),
+            Some(crate::passes::review_severity::Label::Suggestion)
+        );
+        assert!(v[0].body.contains(REQUIRED_TESTS_NOTE));
     }
 
     fn lookup(
@@ -3068,11 +3092,12 @@ mod evidence_tests {
             )],
         );
         assert_eq!(rests_on.len(), 1, "{rests_on:?}");
-        assert_eq!(decide_verdict(&[], 0, &rests_on, false), "REQUEST_CHANGES");
+        // An unconfirmed fact is an FYI note, even one the change rests on.
+        assert_eq!(decide_verdict(&[], 0, &rests_on, false), "APPROVE");
         let md = unconfirmed_markdown(&rests_on);
-        assert!(md.contains("#### Confirm before merge"), "{md}");
+        assert!(md.contains("#### FYI: facts worth confirming"), "{md}");
         assert!(md.contains("confirm `line_type` from a real refund payload"));
-        assert!(!md.contains("#### Notes"));
+        assert!(!md.contains("Confirm before merge"));
 
         let env_only = unconfirmed_external_facts(
             body,
@@ -3084,10 +3109,10 @@ mod evidence_tests {
         );
         assert_eq!(decide_verdict(&[], 0, &env_only, false), "APPROVE");
 
-        // A description line no triage covers holds the merge until one does.
+        // A description line no triage covers is listed first, as an FYI.
         let untriaged = unconfirmed_external_facts(body, &[]);
         assert!(untriaged[0].blocks);
-        assert_eq!(decide_verdict(&[], 0, &untriaged, false), "REQUEST_CHANGES");
+        assert_eq!(decide_verdict(&[], 0, &untriaged, false), "APPROVE");
 
         // A human PR that says so in words: the reviewer's triage counts.
         let read = unconfirmed_external_facts(
@@ -3098,7 +3123,8 @@ mod evidence_tests {
                 "the code branches on it",
             )],
         );
-        assert_eq!(decide_verdict(&[], 0, &read, false), "REQUEST_CHANGES");
+        assert_eq!(read.len(), 1);
+        assert_eq!(decide_verdict(&[], 0, &read, false), "APPROVE");
         assert_eq!(decide_verdict(&[], 0, &[], false), "APPROVE");
         assert_eq!(unconfirmed_markdown(&[]), "");
     }
@@ -3141,7 +3167,7 @@ mod evidence_tests {
         );
         assert!(!heading.contains("Questions"));
         let md = unconfirmed_markdown(&facts);
-        assert!(md.contains("#### Notes"), "{md}");
+        assert!(md.contains("#### FYI"), "{md}");
         assert!(md.contains("a vendor sandbox outage, not the change"));
         assert!(!md.contains("Confirm before merge"));
         assert!(!md.contains("isn't approved"));
@@ -3182,16 +3208,21 @@ mod evidence_tests {
             let p = to_postable(std::slice::from_ref(&note), &changed, &HashMap::new());
             assert!(!thread_holds_merge(&p.inline[0].body));
         }
+        // The owner's policy: a question is an FYI note even when the change
+        // rests on it; reviews never hold the merge on a question.
         let rests_on = q(Some(true));
-        assert!(rests_on.holds_merge());
+        assert!(!rests_on.holds_merge());
         assert_eq!(
             decide_verdict(std::slice::from_ref(&rests_on), 0, &[], false),
-            "REQUEST_CHANGES"
+            "APPROVE"
         );
         let p = to_postable(std::slice::from_ref(&rests_on), &changed, &HashMap::new());
-        assert!(p.inline[0].body.contains("(question, blocks the merge)"));
-        // A later review counts the open thread as a requested change.
-        assert!(thread_holds_merge(&p.inline[0].body));
+        assert!(p.inline[0].body.contains("**FYI: "), "{}", p.inline[0].body);
+        assert!(!thread_holds_merge(&p.inline[0].body));
+        // An older blocking question thread no longer holds either.
+        assert!(!thread_holds_merge(
+            "🔴 **Is it idempotent?** (question, blocks the merge)\n\nx"
+        ));
     }
 
     /// Whatever the inputs, a finished review's verdict is one of two.
@@ -3275,9 +3306,16 @@ mod evidence_tests {
         use crate::passes::review_verdict::{may_post, HoldKind as K, Holding, Verdict};
         let nothing = Verdict::from_holding(vec![]);
         assert_eq!(nothing.event(), "APPROVE");
-        assert!(!may_post("REQUEST_CHANGES", &nothing));
-        assert!(may_post("APPROVE", &nothing));
-        assert!(may_post("COMMENT", &nothing));
+        let hold = crate::passes::stop_judge::test_hold(crate::passes::stop_judge::Kind::Block);
+        assert!(!may_post("REQUEST_CHANGES", &nothing, Some(&hold)));
+        assert!(may_post("APPROVE", &nothing, None));
+        assert!(may_post("COMMENT", &nothing, None));
+        // Something named, but no judged hold: refused.
+        let named = Verdict::from_holding(vec![Holding::new(K::Defect, "`a.rs:1` crash")]);
+        assert!(!may_post("REQUEST_CHANGES", &named, None));
+        assert!(may_post("REQUEST_CHANGES", &named, Some(&hold)));
+        let other = crate::passes::stop_judge::test_hold(crate::passes::stop_judge::Kind::Stop);
+        assert!(!may_post("REQUEST_CHANGES", &named, Some(&other)));
         // A blank name names nothing.
         let blank = Verdict::from_holding(vec![Holding::new(K::Defect, "  ")]);
         assert_eq!(blank.event(), "APPROVE");

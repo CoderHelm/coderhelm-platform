@@ -857,6 +857,8 @@ pub mod release_notes;
 pub mod release_plan;
 pub mod release_run;
 pub mod remote_mcp;
+#[cfg(test)]
+mod replay;
 pub(crate) mod repo_pick;
 mod resolve;
 mod resolved;
@@ -899,6 +901,7 @@ pub mod skills;
 pub mod stack;
 pub(crate) mod steps;
 pub(crate) mod stop_gate;
+pub mod stop_judge;
 pub mod stop_pr;
 pub mod support_sync;
 pub mod syntax_check;
@@ -2535,21 +2538,42 @@ async fn run_passes(
                 ),
                 ..Default::default()
             };
-            finish_without_code(
+            let proposed = unknown_fix_questions(&decision, &msg.answers, &plan_result.tasks);
+            let mut picture =
+                stop_judge::ask_picture("plan_files", &decision.cause, msg, &proposed);
+            picture.plan = plan_result.tasks.clone();
+            let judged = stop_judge::decide(
                 state,
-                msg,
-                run_id,
-                &github,
-                &decision,
-                fix_location::Route::Ask,
-                &plan_result.tasks,
+                &provider,
                 usage,
-                start,
-                &used_mcp_ids,
+                &msg.team_id,
+                &stop_judge::run_subject(run_id),
+                "",
+                picture,
             )
             .await;
-            close_memory(state, agent_memory.take()).await;
-            return Ok(());
+            if !judged.proceeds() {
+                finish_without_code(
+                    state,
+                    msg,
+                    run_id,
+                    &github,
+                    &decision,
+                    fix_location::Route::Ask,
+                    &plan_result.tasks,
+                    usage,
+                    start,
+                    &used_mcp_ids,
+                    Some(&judged),
+                )
+                .await;
+                close_memory(state, agent_memory.take()).await;
+                return Ok(());
+            }
+            info!(
+                run_id,
+                "Stop judge: code the plan's files on an assumption instead of asking"
+            );
         }
         early_validation = Some(v);
     }
@@ -2614,6 +2638,54 @@ async fn run_passes(
         );
     }
 
+    // Not knowing where the fix belongs is a question only when a person
+    // alone can answer it: the stop judge decides first, on the whole
+    // picture. A proceed codes what the plan's tasks name, on a written
+    // assumption; with nothing to code it reports what was found.
+    let mut fix_judged: Option<stop_judge::Judged> = None;
+    if fix_route == fix_location::Route::Ask
+        && !plan_result.tasks.starts_with("NO_CHANGES_NEEDED:")
+        && !plan_result.tasks.starts_with("CLARIFICATION_NEEDED:")
+    {
+        if let Some(decision) = plan_result.fix.as_ref() {
+            let proposed = unknown_fix_questions(decision, &msg.answers, &plan_result.tasks);
+            let mut picture = stop_judge::ask_picture(
+                "fix_location",
+                &format!(
+                    "the plan doesn't settle where the fix belongs: {}",
+                    decision.cause.trim()
+                ),
+                msg,
+                &proposed,
+            );
+            picture.plan = plan_result.tasks.clone();
+            let judged = stop_judge::decide(
+                state,
+                &provider,
+                usage,
+                &msg.team_id,
+                &stop_judge::run_subject(run_id),
+                "",
+                picture,
+            )
+            .await;
+            if judged.proceeds() {
+                let codes = !plan_result.tasks.trim().is_empty()
+                    && !plan_result
+                        .tasks
+                        .trim_start()
+                        .starts_with(fix_location::NO_CODE_CHANGE);
+                fix_route = if codes {
+                    fix_location::Route::Code
+                } else {
+                    fix_location::Route::OutsideOnly
+                };
+                info!(run_id, route = ?fix_route, "Stop judge: proceed instead of asking where the fix belongs");
+            }
+            fix_judged = Some(judged);
+        }
+    }
+
     // --- Check: is the fix outside the code? ---
     // The code works as designed and the outcome comes from data or settings
     // in another system: report the change to make there, open no PR. Not
@@ -2662,6 +2734,7 @@ async fn run_passes(
             usage,
             start,
             &used_mcp_ids,
+            fix_judged.as_ref(),
         )
         .await;
         close_memory(state, agent_memory.take()).await;
@@ -2838,7 +2911,93 @@ async fn run_passes(
     }
 
     // --- Check: clarification needed? ---
+    // The planner's questions go to the stop judge first: it proceeds on a
+    // written assumption unless only a person has the answer. A proceed
+    // plans again once with the assumption as the answer; a plan that still
+    // asks after that is a planner failure, never a question.
     if plan_result.tasks.starts_with("CLARIFICATION_NEEDED:") {
+        let detail = plan_result
+            .tasks
+            .strip_prefix("CLARIFICATION_NEEDED:")
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        let proposed = clarification_questions(&detail, &msg.answers);
+        let mut picture = stop_judge::ask_picture(
+            "plan",
+            &format!("the planner asks before it can plan: {detail}"),
+            msg,
+            &proposed,
+        );
+        picture.plan = plan_result.design.clone();
+        let judged = stop_judge::decide(
+            state,
+            &provider,
+            usage,
+            &msg.team_id,
+            &stop_judge::run_subject(run_id),
+            "",
+            picture,
+        )
+        .await;
+        if judged.proceeds() {
+            let assumed = stop_judge::assumed_answers(&judged, &proposed);
+            info!(
+                run_id,
+                "Stop judge: plan on an assumption instead of asking"
+            );
+            add_progress_note(
+                state,
+                &msg.team_id,
+                run_id,
+                &format!(
+                    "Planning on an assumption instead of asking: {}",
+                    judged.assumption().unwrap_or("")
+                ),
+            )
+            .await;
+            common::run_questions::merge(&mut msg.answers, &assumed);
+            plan_result = plan::run(
+                state,
+                msg,
+                &github,
+                &triage_result,
+                &repo_instructions,
+                &provider,
+                usage,
+                run_id,
+                &history,
+                true,
+            )
+            .await?;
+            if plan_result.tasks.starts_with("CLARIFICATION_NEEDED:") {
+                close_memory(state, agent_memory.take()).await;
+                return Err(format!(
+                    "Planner failure: the plan asked again after planning on the assumption \"{}\". \
+                     Nothing was asked of a person; retry the run.",
+                    judged.assumption().unwrap_or("")
+                )
+                .into());
+            }
+        }
+    }
+    if plan_result.tasks.starts_with("CLARIFICATION_NEEDED:") {
+        let judged = stop_judge::decide(
+            state,
+            &provider,
+            usage,
+            &msg.team_id,
+            &stop_judge::run_subject(run_id),
+            "",
+            stop_judge::ask_picture(
+                "plan",
+                "the planner still asks after an assumption",
+                msg,
+                &[],
+            ),
+        )
+        .await;
+
         let detail = plan_result
             .tasks
             .strip_prefix("CLARIFICATION_NEEDED:")
@@ -2849,10 +3008,11 @@ async fn run_passes(
             detail, "Plan needs clarification from the ticket author"
         );
 
-        // The questions, one by one: on the ticket, and kept on the run so
-        // its page lists them and takes answers. Questions people answered
-        // already in CoderHelm are not asked again.
-        let questions = clarification_questions(detail, &msg.answers);
+        // The judge's question (options, a default and a deadline), else
+        // the planner's, one by one: on the ticket, and kept on the run so
+        // its page lists them and takes answers.
+        let questions =
+            stop_judge::questions_for(&judged, &clarification_questions(detail, &msg.answers));
         // Stop rule 1, at the point the questions would be asked: one that
         // quotes the run's own tooling failing is never a question.
         if let Some(f) = questions.iter().find_map(|q| {
@@ -2861,8 +3021,8 @@ async fn run_passes(
             close_memory(state, agent_memory.take()).await;
             return Err(f.reason().into());
         }
-        let list_md = common::run_questions::markdown(&questions);
-        let list_plain = common::run_questions::plain(&questions);
+        let list_md = stop_judge::stop_text(&judged, &common::run_questions::markdown(&questions));
+        let list_plain = stop_judge::stop_text(&judged, &common::run_questions::plain(&questions));
         let raw_github = format!(
             "❓ **Clarification needed**\n\n{list_md}\n\nReply here, or answer on the run page in \
              CoderHelm, and I'll continue."
@@ -2883,12 +3043,27 @@ async fn run_passes(
             &github_comment,
             &jira_comment,
             "Clarification needed",
+            &judged,
         )
         .await;
 
         // Mark the run as needs_input so a comment can re-trigger it
-        let wait = wait_on_ticket(msg, &questions, detail);
-        mark_run_needs_input(state, msg, run_id, usage, start, &used_mcp_ids, &wait).await;
+        let wait = if judged.hold().is_some() {
+            stop_judge::wait_for(&judged, &questions, None, &ticket_url(msg))
+        } else {
+            wait_on_ticket(msg, &questions, detail)
+        };
+        mark_run_needs_input(
+            state,
+            msg,
+            run_id,
+            usage,
+            start,
+            &used_mcp_ids,
+            &wait,
+            &judged,
+        )
+        .await;
 
         close_memory(state, agent_memory.take()).await;
         return Ok(());
@@ -3180,9 +3355,10 @@ async fn run_passes(
         // about it: don't open a second one; ask (once).
         if existing_pr.is_none() && !open_pr_settled {
             if let Some(other) = other_open_pr.as_ref() {
-                stop_for_open_pr(state, msg, &github, run_id, usage, start, other).await;
-                close_memory(state, agent_memory.take()).await;
-                return Ok(());
+                if stop_for_open_pr(state, msg, &github, run_id, usage, start, other).await {
+                    close_memory(state, agent_memory.take()).await;
+                    return Ok(());
+                }
             }
         }
 
@@ -3950,7 +4126,11 @@ async fn run_passes(
                         if choice == open_pr_choice::Choice::Own {
                             continue;
                         }
-                        stop_for_open_pr(state, msg, &github, run_id, usage, start, &other).await;
+                        if !stop_for_open_pr(state, msg, &github, run_id, usage, start, &other)
+                            .await
+                        {
+                            continue;
+                        }
                         close_memory(state, agent_memory.take()).await;
                         return Ok(());
                     }
@@ -4517,14 +4697,45 @@ async fn run_passes(
                     result.files_modified = files;
                 }
                 run_end::Empty::Ask(qs) => {
+                    let proposed = run_end::questions_from(&qs);
+                    let judged = stop_judge::decide(
+                        state,
+                        &provider,
+                        usage,
+                        &msg.team_id,
+                        &stop_judge::run_subject(run_id),
+                        "",
+                        stop_judge::ask_picture(
+                            "implement",
+                            "the coder built what it could and asks for a decision",
+                            msg,
+                            &proposed,
+                        ),
+                    )
+                    .await;
+                    if judged.proceeds() {
+                        // Nothing to commit and nothing to ask: a failure the
+                        // run page names (Retry carries the assumption on).
+                        close_memory(state, agent_memory.take()).await;
+                        return Err(format!(
+                            "The coder made no change and asked for a decision; the stop judge \
+                             found it isn't one only a person has. Assumed: {}. Retry to build \
+                             on that.",
+                            judged.assumption().unwrap_or("")
+                        )
+                        .into());
+                    }
+                    let asked = stop_judge::questions_for(&judged, &proposed);
                     let text = format!(
-                        "I built what I could and need a decision before I go on:\n{}",
-                        qs.iter()
-                            .map(|q| format!("- {q}"))
-                            .collect::<Vec<_>>()
-                            .join("\n")
+                        "I built what I could and need a decision before I go on:\n\n{}",
+                        stop_judge::stop_text(
+                            &judged,
+                            &qs.iter()
+                                .map(|q| format!("- {q}"))
+                                .collect::<Vec<_>>()
+                                .join("\n")
+                        )
                     );
-                    let asked = run_end::questions_from(&qs);
                     ask_on_ticket(
                         state,
                         msg,
@@ -4534,11 +4745,21 @@ async fn run_passes(
                         &text,
                         &text,
                         "A decision is needed",
+                        &judged,
                     )
                     .await;
-                    let wait = wait_on_ticket(msg, &asked, &text);
-                    mark_run_needs_input(state, msg, run_id, usage, start, &used_mcp_ids, &wait)
-                        .await;
+                    let wait = stop_judge::wait_for(&judged, &asked, None, &ticket_url(msg));
+                    mark_run_needs_input(
+                        state,
+                        msg,
+                        run_id,
+                        usage,
+                        start,
+                        &used_mcp_ids,
+                        &wait,
+                        &judged,
+                    )
+                    .await;
                     close_memory(state, agent_memory.take()).await;
                     return Ok(());
                 }
@@ -4584,6 +4805,49 @@ async fn run_passes(
             } else {
                 empty_change_questions()
             };
+            // A repository the team hasn't turned on is access only a person
+            // can give; anything else goes to the stop judge, and a proceed
+            // is a failure to retry, never generic questions.
+            let judged = match elsewhere_note.as_deref() {
+                Some(note) => {
+                    stop_judge::cannot_proceed(
+                        state,
+                        &msg.team_id,
+                        &stop_judge::run_subject(run_id),
+                        stop_judge::Kind::Ask,
+                        "implement",
+                        note,
+                    )
+                    .await
+                }
+                None => {
+                    stop_judge::decide(
+                        state,
+                        &provider,
+                        usage,
+                        &msg.team_id,
+                        &stop_judge::run_subject(run_id),
+                        "",
+                        stop_judge::ask_picture(
+                            "implement",
+                            "the coder produced no file changes",
+                            msg,
+                            &questions,
+                        ),
+                    )
+                    .await
+                }
+            };
+            if judged.proceeds() {
+                close_memory(state, agent_memory.take()).await;
+                return Err(format!(
+                    "The coder produced no file changes. Nothing was asked of a person: the stop \
+                     judge found the ticket answers it. Assumed: {}. Retry the run.",
+                    judged.assumption().unwrap_or("")
+                )
+                .into());
+            }
+            let questions = stop_judge::questions_for(&judged, &questions);
             ask_on_ticket(
                 state,
                 msg,
@@ -4593,38 +4857,26 @@ async fn run_passes(
                 &clarification,
                 &clarification,
                 "More detail needed",
+                &judged,
             )
             .await;
 
-            let duration = start.elapsed().as_secs();
-            let delta = usage.unrecorded();
-            let now = chrono::Utc::now().to_rfc3339();
-            let wait = wait_on_ticket(msg, &questions, raw_clarification);
-            let usage_res = state
-                .dynamo
-                .update_item()
-                .table_name(&state.config.runs_table_name)
-                .key("team_id", attr_s(&msg.team_id))
-                .key("run_id", attr_s(run_id))
-                .update_expression(
-                    "SET #status = :s, status_run_id = :sri, waiting_on = :wo, error_message = :em, \
-                     tokens_in = if_not_exists(tokens_in, :uzero) + :ti, tokens_out = if_not_exists(tokens_out, :uzero) + :to, \
-             cache_read_tokens = if_not_exists(cache_read_tokens, :uzero) + :crt, cache_write_tokens = if_not_exists(cache_write_tokens, :uzero) + :cwt, \
-             cost_usd = if_not_exists(cost_usd, :uzero) + :c, duration_s = :d, updated_at = :t, current_pass = :cp",
-                )
-                .expression_attribute_names("#status", "status")
-                .needs_input(run_id, &wait)
-                .expression_attribute_values(":em", attr_s(raw_clarification))
-                .usage_values(&delta)
-                .expression_attribute_values(":d", attr_n(duration))
-                .expression_attribute_values(":t", attr_s(&now))
-                .expression_attribute_values(":cp", attr_s("done"))
-                .send()
-                .await;
-            if usage_res.is_ok() {
-                usage.mark_recorded(&delta);
-            }
-            self::webhooks::emit_run(state, &msg.team_id, run_id, "needs_input").await;
+            let wait = if judged.hold().is_some() {
+                stop_judge::wait_for(&judged, &questions, None, &ticket_url(msg))
+            } else {
+                wait_on_ticket(msg, &questions, raw_clarification)
+            };
+            mark_unbuilt_needs_input(
+                state,
+                msg,
+                run_id,
+                usage,
+                start,
+                &wait,
+                raw_clarification,
+                &judged,
+            )
+            .await;
             close_memory(state, agent_memory.take()).await;
             return Ok(());
         }
@@ -5606,6 +5858,9 @@ async fn run_passes(
     if let Some(f) = &feature_pr {
         gaps.extend(feature::open_findings(f));
     }
+    // What the stop judge assumed instead of asking: an Open item a person
+    // corrects if it's wrong.
+    gaps.extend(stop_judge::assumptions(state, &msg.team_id, run_id).await);
     pr::apply_checks(
         state,
         msg,
@@ -6600,6 +6855,7 @@ async fn run_repo_pipeline(
             None
         }
     };
+    gaps.extend(stop_judge::assumptions(state, &msg.team_id, run_id).await);
     pr::apply_checks(
         state,
         msg,
@@ -7037,8 +7293,12 @@ async fn finish_without_code(
     usage: &TokenUsage,
     start: &std::time::Instant,
     mcp_ids: &[String],
+    judged: Option<&stop_judge::Judged>,
 ) {
-    let outside = route == fix_location::Route::OutsideOnly;
+    // Asking needs a judged ask or hold; without one the run reports what it
+    // found and asks nothing.
+    let judged = judged.filter(|j| !j.proceeds());
+    let outside = route == fix_location::Route::OutsideOnly || judged.is_none();
     let (report, jira_title, jira_type) = if outside {
         (
             fix_location::outside_report(decision, false),
@@ -7089,10 +7349,15 @@ async fn finish_without_code(
                 warn!(run_id, error = %e, "Could not post the outside-the-code report on the ticket");
             }
         }
-    } else {
-        // Not knowing where the fix belongs is a question for a person: the
-        // run page lists the decision's questions and takes the answers.
-        let questions = unknown_fix_questions(decision, &msg.answers, tasks);
+    } else if let Some(judged) = judged {
+        // The judge let it ask (a fact only a person has) or named what
+        // blocks: the run page lists the question and takes the answer.
+        let questions = stop_judge::questions_for(
+            judged,
+            &unknown_fix_questions(decision, &msg.answers, tasks),
+        );
+        let github_body = format!("{github_body}\n\n{}", stop_judge::stop_text(judged, ""));
+        let jira_body = format!("{jira_body}\n\n{}", stop_judge::stop_text(judged, ""));
         ask_on_ticket(
             state,
             msg,
@@ -7102,10 +7367,15 @@ async fn finish_without_code(
             &github_body,
             &jira_body,
             jira_title,
+            judged,
         )
         .await;
-        let wait = wait_on_ticket(msg, &questions, &report);
-        mark_run_needs_input(state, msg, run_id, usage, start, mcp_ids, &wait).await;
+        let wait = if judged.hold().is_some() {
+            stop_judge::wait_for(judged, &questions, None, &ticket_url(msg))
+        } else {
+            wait_on_ticket(msg, &questions, &report)
+        };
+        mark_run_needs_input(state, msg, run_id, usage, start, mcp_ids, &wait, judged).await;
     }
     let status = if outside {
         fix_location::STATUS_OUTSIDE
@@ -7556,19 +7826,67 @@ async fn report_questions(
 
 /// What a run that asked on its ticket waits for: the questions it asked,
 /// else the missing detail on the ticket (`what`: what it said there).
-fn wait_on_ticket(
+/// A run that built nothing waits on the judged question or blocker, with
+/// what it found as its error message.
+#[allow(clippy::too_many_arguments)]
+async fn mark_unbuilt_needs_input(
+    state: &WorkerState,
     msg: &TicketMessage,
-    questions: &[common::run_questions::Question],
-    what: &str,
-) -> WaitingOn {
-    let ticket = if matches!(msg.source, TicketSource::Github) && msg.issue_number > 0 {
+    run_id: &str,
+    usage: &TokenUsage,
+    start: &std::time::Instant,
+    wait: &WaitingOn,
+    error: &str,
+    _judged: &stop_judge::Judged,
+) {
+    let duration = start.elapsed().as_secs();
+    let delta = usage.unrecorded();
+    let now = chrono::Utc::now().to_rfc3339();
+    let usage_res = state
+        .dynamo
+        .update_item()
+        .table_name(&state.config.runs_table_name)
+        .key("team_id", attr_s(&msg.team_id))
+        .key("run_id", attr_s(run_id))
+        .update_expression(
+            "SET #status = :s, status_run_id = :sri, waiting_on = :wo, error_message = :em, \
+             tokens_in = if_not_exists(tokens_in, :uzero) + :ti, tokens_out = if_not_exists(tokens_out, :uzero) + :to, \
+             cache_read_tokens = if_not_exists(cache_read_tokens, :uzero) + :crt, cache_write_tokens = if_not_exists(cache_write_tokens, :uzero) + :cwt, \
+             cost_usd = if_not_exists(cost_usd, :uzero) + :c, duration_s = :d, updated_at = :t, current_pass = :cp",
+        )
+        .expression_attribute_names("#status", "status")
+        .needs_input(run_id, wait)
+        .expression_attribute_values(":em", attr_s(error))
+        .usage_values(&delta)
+        .expression_attribute_values(":d", attr_n(duration))
+        .expression_attribute_values(":t", attr_s(&now))
+        .expression_attribute_values(":cp", attr_s("done"))
+        .send()
+        .await;
+    if usage_res.is_ok() {
+        usage.mark_recorded(&delta);
+    }
+    self::webhooks::emit_run(state, &msg.team_id, run_id, "needs_input").await;
+}
+
+/// The ticket's address, when it is a GitHub issue (empty otherwise).
+fn ticket_url(msg: &TicketMessage) -> String {
+    if matches!(msg.source, TicketSource::Github) && msg.issue_number > 0 {
         format!(
             "https://github.com/{}/{}/issues/{}",
             msg.repo_owner, msg.repo_name, msg.issue_number
         )
     } else {
         String::new()
-    };
+    }
+}
+
+fn wait_on_ticket(
+    msg: &TicketMessage,
+    questions: &[common::run_questions::Question],
+    what: &str,
+) -> WaitingOn {
+    let ticket = ticket_url(msg);
     WaitingOn::answer_or(
         questions,
         None,
@@ -7582,6 +7900,7 @@ fn wait_on_ticket(
 
 /// Mark a run `needs_input` (a comment or re-run can pick it up again) and
 /// count it in the analytics, the way every needs_input stop is recorded.
+#[allow(clippy::too_many_arguments)]
 async fn mark_run_needs_input(
     state: &WorkerState,
     msg: &TicketMessage,
@@ -7590,6 +7909,7 @@ async fn mark_run_needs_input(
     start: &std::time::Instant,
     mcp_ids: &[String],
     wait: &WaitingOn,
+    _judged: &stop_judge::Judged,
 ) {
     let duration = start.elapsed().as_secs();
     let delta = usage.unrecorded();
@@ -7647,6 +7967,7 @@ pub(crate) async fn mark_run_stopped_by_guard(
     msg: &TicketMessage,
     run_id: &str,
     reason: &str,
+    _judged: &stop_judge::Judged,
 ) {
     if let Err(e) = state
         .dynamo
@@ -7715,7 +8036,18 @@ async fn stop_run_repo_not_enabled(
         message,
         "",
     );
-    mark_run_needs_input(state, msg, run_id, usage, start, &[], &wait).await;
+    // Access only a person can give: recorded as the judge's decision, no
+    // model call.
+    let judged = stop_judge::cannot_proceed(
+        state,
+        &msg.team_id,
+        &stop_judge::run_subject(run_id),
+        stop_judge::Kind::Stop,
+        "repo_access",
+        message,
+    )
+    .await;
+    mark_run_needs_input(state, msg, run_id, usage, start, &[], &wait, &judged).await;
 }
 
 /// Append a timestamped progress note to the run record for live activity display.
@@ -8529,10 +8861,10 @@ async fn stop_for_open_pr(
     msg: &TicketMessage,
     github: &GitHubClient,
     run_id: &str,
-    usage: &TokenUsage,
+    usage: &mut TokenUsage,
     start: &std::time::Instant,
     pr: &open_pr_choice::OtherPr,
-) {
+) -> bool {
     let note = open_pr_choice::notice_text(&msg.ticket_id, pr);
     info!(
         run_id,
@@ -8542,6 +8874,44 @@ async fn stop_for_open_pr(
     );
     add_progress_note(state, &msg.team_id, run_id, &note).await;
     let question = open_pr_choice::notice_question(pr);
+    // Opening CoderHelm's own draft beside it is reversible and leaves the
+    // other pull request as it is: the stop judge decides whether this is a
+    // question only a person can answer.
+    let mut picture =
+        stop_judge::ask_picture("open_pr", &note, msg, std::slice::from_ref(&question));
+    picture.related = vec![stop_judge::Related {
+        ticket: msg.ticket_id.clone(),
+        summary: pr.title.clone(),
+        pr: format!("{}#{}", pr.repo, pr.number),
+        pr_state: "open".into(),
+    }];
+    let judged = stop_judge::decide_for_team(
+        state,
+        usage,
+        &msg.team_id,
+        &stop_judge::run_subject(run_id),
+        "",
+        picture,
+    )
+    .await;
+    if judged.proceeds() {
+        add_progress_note(
+            state,
+            &msg.team_id,
+            run_id,
+            &format!(
+                "Opening my own pull request beside #{} instead of asking: {}",
+                pr.number,
+                judged.assumption().unwrap_or("")
+            ),
+        )
+        .await;
+        return false;
+    }
+    let question = stop_judge::questions_for(&judged, std::slice::from_ref(&question))
+        .into_iter()
+        .next()
+        .unwrap_or(question);
     ask_on_ticket_keyed(
         state,
         msg,
@@ -8552,10 +8922,12 @@ async fn stop_for_open_pr(
         &note,
         "A pull request is already open",
         &pr.key(),
+        &judged,
     )
     .await;
     let wait = wait_on_ticket(msg, std::slice::from_ref(&question), &note);
-    mark_run_needs_input(state, msg, run_id, usage, start, &[], &wait).await;
+    mark_run_needs_input(state, msg, run_id, usage, start, &[], &wait, &judged).await;
+    true
 }
 
 async fn post_jira_comment(
@@ -8666,6 +9038,7 @@ async fn ask_on_ticket(
     github_body: &str,
     jira_body: &str,
     jira_title: &str,
+    judged: &stop_judge::Judged,
 ) {
     ask_on_ticket_keyed(
         state,
@@ -8677,6 +9050,7 @@ async fn ask_on_ticket(
         jira_body,
         jira_title,
         "",
+        judged,
     )
     .await
 }
@@ -8695,7 +9069,9 @@ async fn ask_on_ticket_keyed(
     jira_body: &str,
     jira_title: &str,
     key: &str,
+    judged: &stop_judge::Judged,
 ) {
+    stop_judge::keep_ask_deadline(state, &msg.team_id, run_id, judged).await;
     let text_hash = common::sha256_hex(&[
         &questions
             .iter()
@@ -8728,7 +9104,7 @@ async fn ask_on_ticket_keyed(
         )
         .await;
         let url = (!earlier.url.is_empty()).then(|| earlier.url.clone());
-        record_questions(state, &msg.team_id, run_id, questions, url).await;
+        record_questions(state, &msg.team_id, run_id, questions, url, judged).await;
         return;
     }
     let mut comment_url = None;
@@ -8785,7 +9161,7 @@ async fn ask_on_ticket_keyed(
         )
         .await;
     }
-    record_questions(state, &msg.team_id, run_id, questions, comment_url).await;
+    record_questions(state, &msg.team_id, run_id, questions, comment_url, judged).await;
 }
 
 /// What a run asks when it wrote no change and the ticket names no other
@@ -8836,6 +9212,7 @@ async fn record_questions(
     run_id: &str,
     questions: &[common::run_questions::Question],
     comment_url: Option<String>,
+    _judged: &stop_judge::Judged,
 ) {
     if questions.is_empty() {
         return;
@@ -10231,7 +10608,7 @@ Respond with ONLY one line: either "CORRECT" or "SWITCH owner/name"."#,
             state,
             provider,
             common::agent_policy::Agent::Planner,
-            provider.primary_model_id(),
+            provider.judgment_model_id(),
             system,
             &mut messages,
             &[],
@@ -10239,9 +10616,9 @@ Respond with ONLY one line: either "CORRECT" or "SWITCH owner/name"."#,
             usage,
             llm::ConverseOptions {
                 max_turns: 1,
-                max_tokens: 128,
+                max_tokens: 4096,
                 deadline: None,
-                effort: Some("low"),
+                effort: Some(common::stop_judge::JUDGMENT_EFFORT),
             },
             None,
             None,

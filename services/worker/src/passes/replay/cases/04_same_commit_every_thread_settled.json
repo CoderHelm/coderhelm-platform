@@ -1,0 +1,26 @@
+{
+  "name": "the same commit with every thread settled is approved",
+  "about": "A request for changes stood on a commit whose every thread had since been resolved or answered; nothing named held the merge, yet it kept blocking. A verdict lives only while its named reasons do: the review approves, replacing the stale request.",
+  "case": "review_settled",
+  "input": {
+    "head": "c0ffee1d2e3f",
+    "standing": "REQUEST_CHANGES",
+    "threads": [
+      {
+        "path": "src/queue.rs",
+        "line": 40,
+        "body": "🔴 **Blocking (correctness): Retry loop never ends** (correctness)\n\nThe loop retries forever on an empty queue.",
+        "settled": true
+      },
+      {
+        "path": "src/api.rs",
+        "line": 12,
+        "body": "🔴 **Blocking (security): Token logged** (security)\n\nThe bearer token is written to the log.",
+        "settled": true
+      }
+    ]
+  },
+  "expect": {
+    "event": "APPROVE"
+  }
+}

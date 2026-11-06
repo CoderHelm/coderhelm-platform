@@ -201,13 +201,13 @@ pub async fn screen_questions(
     let env = environment_section(&msg.team_instructions);
     let reads = match crate::agent::anthropic::converse_json(
         &provider.client(),
-        &state.config.light_model_id,
+        provider.judgment_model_id(),
         screen::QUESTIONS_SYSTEM,
         &screen::questions_prompt(Some(&d), &env, &can_read.lines(), questions),
         &screen::questions_schema(),
         true,
-        "low",
-        2048,
+        common::stop_judge::JUDGMENT_EFFORT,
+        8192,
         usage,
     )
     .await
@@ -415,7 +415,7 @@ pub fn tooling_fields(reason: &str) -> Vec<(&'static str, AttributeValue)> {
 /// skips the check.
 #[allow(clippy::too_many_arguments)]
 pub async fn existing_work(
-    state: &WorkerState,
+    _state: &WorkerState,
     provider: &ModelProvider,
     usage: &mut TokenUsage,
     msg: &TicketMessage,
@@ -481,7 +481,7 @@ pub async fn existing_work(
     for (pr, signals) in found {
         let v = match crate::agent::anthropic::converse_json(
             &provider.client(),
-            &state.config.light_model_id,
+            provider.judgment_model_id(),
             existing_work::SYSTEM,
             &existing_work::prompt(
                 &msg.title,
@@ -493,7 +493,7 @@ pub async fn existing_work(
             ),
             &existing_work::schema(),
             true,
-            "low",
+            common::stop_judge::JUDGMENT_EFFORT,
             512,
             usage,
         )

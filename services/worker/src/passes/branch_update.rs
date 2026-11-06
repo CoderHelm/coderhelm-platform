@@ -123,13 +123,13 @@ pub(crate) async fn asked(
         super::load_team_instructions(state, &msg.team_id, &msg.repo_owner, &msg.repo_name).await;
     match crate::agent::anthropic::converse_json(
         &provider.client(),
-        &state.config.light_model_id,
+        provider.judgment_model_id(),
         SYSTEM,
         &prompt(&comments, &team),
         &schema(),
         true,
-        "low",
-        512,
+        common::stop_judge::JUDGMENT_EFFORT,
+        4096,
         usage,
     )
     .await

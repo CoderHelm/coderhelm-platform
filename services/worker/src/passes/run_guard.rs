@@ -610,17 +610,40 @@ pub async fn end_if_stopped(
     .await;
     let mut items = ledger.update(|l| l.open_findings());
     items.push(proof::blocked_item("CoderHelm stopped this run", &reason));
+    // The guard's limit is hard; what the end says is the stop judge's:
+    // a named blocker for a person, or the draft with its assumption.
+    let mut usage = crate::models::TokenUsage::default();
+    let mut picture = super::stop_judge::handoff_picture(msg, "run_guard", &reason, &items);
+    if let Some(l) = load(state, &msg.team_id, run_id).await {
+        picture.budget = super::stop_judge::Budget {
+            spend_usd: l.totals.spend_usd,
+            spend_cap_usd: super::run_ceiling::MAX_RUN_SPEND_USD,
+            continuations: l.totals.continuations,
+            continuation_cap: super::run_ceiling::MAX_RUN_CONTINUATIONS,
+            ..Default::default()
+        };
+    }
+    let judged = super::stop_judge::decide_for_team(
+        state,
+        &mut usage,
+        &msg.team_id,
+        &super::stop_judge::run_subject(run_id),
+        "",
+        picture,
+    )
+    .await;
     let notify = claim_notification(state, &msg.team_id, run_id).await;
     let opened = match branch.filter(|b| !b.is_empty()) {
         Some(branch) => {
-            super::stop_pr::open_with(state, msg, run_id, branch, &reason, &items, notify).await
+            super::stop_pr::open_with(state, msg, run_id, branch, &reason, &items, notify, &judged)
+                .await
         }
         None => Err("no branch to open a pull request from".into()),
     };
     if let Err(e) = opened {
         // Nothing to open (no work yet): still never silent.
         warn!(run_id, error = %e, "Run guard: no draft pull request for the stopped run");
-        super::mark_run_stopped_by_guard(state, msg, run_id, &reason).await;
+        super::mark_run_stopped_by_guard(state, msg, run_id, &reason, &judged).await;
     }
     true
 }
@@ -633,10 +656,42 @@ pub async fn settle_open_pr(state: &WorkerState, team_id: &str, run_id: &str) ->
     let Some(reason) = load(state, team_id, run_id).await.and_then(|l| l.stopped) else {
         return false;
     };
+    let mut usage = crate::models::TokenUsage::default();
+    let mut picture =
+        super::stop_judge::Picture::new(super::stop_judge::Kind::Handoff, "run_guard", &reason);
+    picture.ticket_title = format!("run {run_id}");
+    let judged = super::stop_judge::decide_for_team(
+        state,
+        &mut usage,
+        team_id,
+        &super::stop_judge::run_subject(run_id),
+        "",
+        picture,
+    )
+    .await;
+    wait_on_open_pr(state, team_id, run_id, &reason, &judged).await;
+    true
+}
+
+/// The run waits on its pull request's review, with the guard's reason and
+/// the judge's blocker or assumption.
+async fn wait_on_open_pr(
+    state: &WorkerState,
+    team_id: &str,
+    run_id: &str,
+    reason: &str,
+    judged: &super::stop_judge::Judged,
+) {
+    let reason = match (judged.hold_words(), judged.assumption()) {
+        (Some(h), _) => format!("{reason} Blocked on: {h}"),
+        (None, Some(a)) => format!("{reason} Assumed: {a}"),
+        _ => reason.to_string(),
+    };
+    let reason = &reason;
     let now = chrono::Utc::now().to_rfc3339();
     // It has its pull request: it waits for that pull request's review.
     let (number, url) = run_pr(state, team_id, run_id).await;
-    let wait = super::stop_pr::review_wait(number, &url, &reason);
+    let wait = super::stop_pr::review_wait(number, &url, reason);
     if let Err(e) = state
         .dynamo
         .update_item()
@@ -651,7 +706,7 @@ pub async fn settle_open_pr(state: &WorkerState, team_id: &str, run_id: &str) ->
         .ended_values()
         .expression_attribute_names("#s", "status")
         .needs_input(run_id, &wait)
-        .expression_attribute_values(":em", attr_s(&reason))
+        .expression_attribute_values(":em", attr_s(reason))
         .expression_attribute_values(":t", attr_s(&now))
         .expression_attribute_values(":cp", attr_s("done"))
         .send()
@@ -662,7 +717,6 @@ pub async fn settle_open_pr(state: &WorkerState, team_id: &str, run_id: &str) ->
     if claim_notification(state, team_id, run_id).await {
         super::webhooks::emit_run(state, team_id, run_id, run_status::NEEDS_INPUT).await;
     }
-    true
 }
 
 /// The run's pull request (number, address), from its record.
@@ -746,7 +800,9 @@ impl CheckRecord {
         !self.stopped && self.rounds < max_rounds
     }
 
-    pub fn start_fix(&mut self) {
+    /// A fix round starts. The first needs no judgment; any later one only
+    /// with the stop judge's licence (`passes::stop_judge::CycleLicence`).
+    pub fn start_fix(&mut self, _licence: super::stop_judge::CycleLicence) {
         self.rounds = self.rounds.saturating_add(1);
         self.open_at_fix = Some(self.open);
         self.fixing = true;
@@ -1148,25 +1204,25 @@ mod tests {
         let mut r = CheckRecord::default();
         r.checked("a", 2);
         assert!(r.may_fix(2));
-        r.start_fix();
+        r.start_fix(crate::passes::stop_judge::CycleLicence::for_test());
         r.end_fix();
         r.checked("b", 2);
         assert!(!r.may_fix(2), "same findings: no second round");
 
         let mut r = CheckRecord::default();
         r.checked("a", 2);
-        r.start_fix();
+        r.start_fix(crate::passes::stop_judge::CycleLicence::for_test());
         r.end_fix();
         r.checked("b", 4);
         assert!(!r.may_fix(2), "more findings: no second round");
 
         let mut r = CheckRecord::default();
         r.checked("a", 3);
-        r.start_fix();
+        r.start_fix(crate::passes::stop_judge::CycleLicence::for_test());
         r.end_fix();
         r.checked("b", 1);
         assert!(r.may_fix(2), "fewer findings: a second round");
-        r.start_fix();
+        r.start_fix(crate::passes::stop_judge::CycleLicence::for_test());
         r.end_fix();
         r.checked("c", 0);
         assert!(!r.may_fix(2), "two rounds is the limit");
@@ -1176,7 +1232,7 @@ mod tests {
     fn a_round_that_changed_nothing_ends_the_fixing() {
         let mut r = CheckRecord::default();
         r.checked("a", 2);
-        r.start_fix();
+        r.start_fix(crate::passes::stop_judge::CycleLicence::for_test());
         r.end_fix();
         assert!(r.unchanged("a"), "no commit: no re-check");
         r.reused();
@@ -1187,7 +1243,7 @@ mod tests {
     fn reusing_a_result_between_steps_is_not_a_failed_round() {
         let mut r = CheckRecord::default();
         r.checked("a", 3);
-        r.start_fix();
+        r.start_fix(crate::passes::stop_judge::CycleLicence::for_test());
         r.end_fix();
         r.checked("b", 1);
         assert!(r.unchanged("b"));
@@ -1206,7 +1262,8 @@ mod tests {
     fn time_running_out_in_a_round_ends_every_checks_fixing() {
         let mut l = Ledger::default();
         l.rules.checked("a", 1);
-        l.rules.start_fix();
+        l.rules
+            .start_fix(crate::passes::stop_judge::CycleLicence::for_test());
         // The step is cut off here; the next one picks the ledger up.
         let mut next: Ledger = serde_json::from_str(&l.to_json_bounded()).unwrap();
         next.on_step_start();

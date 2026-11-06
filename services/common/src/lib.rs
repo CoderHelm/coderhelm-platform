@@ -100,6 +100,7 @@ pub mod paged;
 pub mod pr_outcome;
 pub mod run_prs;
 // review_stats: time-ordered review records for analytics
+pub mod decision_log;
 pub mod deploy_stats;
 /// Work CoderHelm started on its own pull request and hasn't landed, and
 /// what a person's mention there does about it.
@@ -144,6 +145,7 @@ pub mod skill_compat;
 pub mod skills;
 /// Who may ask CoderHelm for work from a GitHub comment or review.
 pub mod standing;
+pub mod stop_judge;
 pub mod stop_rules;
 /// A team's run and PR-reviewed counts, each added exactly once.
 pub mod team_counts;

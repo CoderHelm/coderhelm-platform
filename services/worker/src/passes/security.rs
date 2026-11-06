@@ -217,7 +217,7 @@ Output format:
         vec![serde_json::json!({"type": "text", "text": prompt})],
     )];
 
-    let model_id = provider.primary_model_id();
+    let model_id = provider.judgment_model_id();
     let final_text = provider::converse(
         state,
         provider,
