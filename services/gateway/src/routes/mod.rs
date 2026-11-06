@@ -15,6 +15,7 @@ pub mod chat_eval;
 pub mod chat_policy;
 pub mod connectors;
 pub mod data_sources;
+pub mod decisions;
 pub mod deliveries;
 pub mod deliveries_analytics;
 pub mod description_review;

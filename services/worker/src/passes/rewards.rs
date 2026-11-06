@@ -726,6 +726,7 @@ mod tests {
         assert_eq!(f[2].severity, "medium");
         assert!(f[3].holds_merge());
         assert_eq!(f[3].severity, "blocking");
+        // A tests finding that shows a failing test is a correctness problem.
         assert!(f[4].holds_merge());
         // Nothing to apply: nothing changes.
         let mut g = vec![finding("naming", "verified-defect", "high")];

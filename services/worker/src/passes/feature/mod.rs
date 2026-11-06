@@ -1068,7 +1068,25 @@ async fn check_and_fix(
             + sandbox_failed.len();
         w.report_findings("rules", open).await;
         w.ledger.update(|l| l.rules.checked(&head, open));
-        if clean || !w.ledger.update(|l| l.rules.may_fix(MAX_FIX_ROUNDS)) || !has_time() {
+        let licence =
+            if !clean && w.ledger.update(|l| l.rules.may_fix(MAX_FIX_ROUNDS)) && has_time() {
+                super::stop_judge::cycle_licence(
+                    w.state,
+                    w.msg,
+                    w.run_id,
+                    "new_feature_rules",
+                    w.ledger.update(|l| l.rules.rounds),
+                    MAX_FIX_ROUNDS,
+                    &super::stop_judge::evidence_lines(
+                        "new-feature rules",
+                        &[format!("{open} open item(s) of the new-feature rules")],
+                    ),
+                )
+                .await
+            } else {
+                None
+            };
+        if clean || licence.is_none() {
             if !release_gaps.is_empty() {
                 return Err(format!(
                     "the migration can't be released safely yet: {}",
@@ -1141,7 +1159,10 @@ async fn check_and_fix(
             .await;
             return Ok((!facts.is_empty()).then_some(facts));
         }
-        w.ledger.update(|l| l.rules.start_fix());
+        let Some(licence) = licence else {
+            return Ok(None);
+        };
+        w.ledger.update(|l| l.rules.start_fix(licence));
         w.save_ledger().await;
         let mut feedback = String::new();
         if !release_gaps.is_empty() {

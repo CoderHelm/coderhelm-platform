@@ -154,20 +154,20 @@ pub fn prompt(msg: &JiraCommentMessage) -> String {
 
 /// The model's reading of the comment; `None` when it couldn't be read.
 async fn classify(
-    state: &WorkerState,
+    _state: &WorkerState,
     provider: &ModelProvider,
     msg: &JiraCommentMessage,
     usage: &mut TokenUsage,
 ) -> Option<Intent> {
     match crate::agent::anthropic::converse_json(
         &provider.client(),
-        &state.config.light_model_id,
+        provider.judgment_model_id(),
         SYSTEM,
         &prompt(msg),
         &schema(),
         true,
-        "low",
-        512,
+        common::stop_judge::JUDGMENT_EFFORT,
+        4096,
         usage,
     )
     .await

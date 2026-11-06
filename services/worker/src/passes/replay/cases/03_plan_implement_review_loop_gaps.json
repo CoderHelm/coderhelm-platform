@@ -1,0 +1,22 @@
+{
+  "name": "a finished run whose checks report 2, 4, 3, 1 gaps across 11 continuations ends with a draft pull request within budget",
+  "about": "A small ticket finished its tasks, then spent 2.5 hours and about $42 over 11 continuations with no pull request: every step re-ran the checks (2, 4, 3, 1 gaps) and started fresh fix rounds. The draft opens first, a round that doesn't shrink the gaps ends fixing, and the run stops after its continuations allowance.",
+  "case": "run_loop",
+  "input": {
+    "gaps": [
+      2,
+      4,
+      3,
+      1
+    ],
+    "continuations": 11,
+    "usd_per_step": 4.0
+  },
+  "expect": {
+    "draft_pr": true,
+    "stops": true,
+    "max_continuations": 4,
+    "max_spend_usd": 16.0,
+    "max_fix_rounds": 2
+  }
+}

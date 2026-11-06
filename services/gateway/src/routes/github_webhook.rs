@@ -1874,6 +1874,26 @@ async fn handle_pull_request(
             {
                 warn!(pr_number, error = %e, "Could not record a stopped auto-merge's PR as closed");
             }
+            // Merged with CoderHelm's request for changes on it: the flagged
+            // lines left as they were, or fixed first (the outcome log).
+            if merged {
+                common::decision_log::on_merged(
+                    &state.dynamo,
+                    &state.config.settings_table_name,
+                    team_id,
+                    &format!(
+                        "{}/{}",
+                        repo["owner"]["login"].as_str().unwrap_or(""),
+                        repo["name"].as_str().unwrap_or("")
+                    ),
+                    pr_number,
+                    payload["pull_request"]["head"]["sha"]
+                        .as_str()
+                        .unwrap_or(""),
+                    None,
+                )
+                .await;
+            }
         }
     }
 
@@ -2281,6 +2301,21 @@ async fn handle_pr_review(
     // key. Re-evaluate the gate at once, so it never merges on a withdrawn
     // key and its status comment says so (fail closed).
     if action == "dismissed" {
+        // A person dismissing CoderHelm's request for changes says the block
+        // wasn't needed (the outcome log).
+        let reviewer = &payload["review"]["user"];
+        if reviewer["type"].as_str() == Some("Bot")
+            && payload["sender"]["type"].as_str() != Some("Bot")
+        {
+            common::decision_log::on_review_dismissed(
+                &state.dynamo,
+                &state.config.settings_table_name,
+                team_id,
+                &format!("{owner}/{name}"),
+                pr_number,
+            )
+            .await;
+        }
         rearm_gate(
             state,
             team_id,

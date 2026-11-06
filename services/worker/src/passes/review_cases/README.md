@@ -176,9 +176,11 @@ completes while its PR reviewer's verdict blocks.
 `passes/review_policy_eval.rs` replays the review sequences behind the
 verdict rules in `passes/review_policy.rs` and the severity rubric in
 `passes/review_severity.rs` (one review per head commit, no flip on an
-unchanged commit without new information, blocking by default with notes
-only for inferred preferences, optional improvements and unchecked external
-state, blockers raised up front). Each case is a list of steps (`push`,
+unchanged commit without new information, changes requested only for a
+named correctness, security or data-loss problem with its location and
+evidence, every other finding a labeled note (Nit, Suggestion, FYI) on the
+approval, blockers raised up front). A request for changes is also put to the
+stop judge before it is posted (`passes/stop_judge.rs`). Each case is a list of steps (`push`,
 `comment`, `base_failing`, `team_rules`, `claims_expire`, `review`, and
 `together` for jobs that start before any of them finishes) with the model
 output each review got (and the severity second pass's answer, `judge`, when

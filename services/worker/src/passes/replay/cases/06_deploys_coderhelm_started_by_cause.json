@@ -1,0 +1,62 @@
+{
+  "name": "deploys CoderHelm started are counted by cause from the runs that really deployed",
+  "about": "Analytics showed 0 production deploys: it counted only CoderHelm's own deploy labels. Deploys are the completed deploy runs CoderHelm's app triggered (a merge it made, a push to its PR), never a person's run and never a test workflow.",
+  "case": "deploy_count",
+  "input": {
+    "bot_login": "helper-app[bot]",
+    "default_branch": "main",
+    "deploy_workflows": "",
+    "runs": [
+      {
+        "triggering_actor": {
+          "login": "helper-app[bot]",
+          "type": "Bot"
+        },
+        "event": "push",
+        "head_branch": "main",
+        "name": "Deploy production",
+        "path": ".github/workflows/deploy.yml",
+        "conclusion": "success"
+      },
+      {
+        "triggering_actor": {
+          "login": "helper-app[bot]",
+          "type": "Bot"
+        },
+        "event": "pull_request",
+        "head_branch": "helper/gh-7-filter",
+        "name": "Deploy preview",
+        "path": ".github/workflows/preview.yml",
+        "conclusion": "success"
+      },
+      {
+        "triggering_actor": {
+          "login": "helper-app[bot]",
+          "type": "Bot"
+        },
+        "event": "push",
+        "head_branch": "main",
+        "name": "Tests",
+        "path": ".github/workflows/test.yml",
+        "conclusion": "success"
+      },
+      {
+        "triggering_actor": {
+          "login": "pat",
+          "type": "User"
+        },
+        "event": "push",
+        "head_branch": "main",
+        "name": "Deploy production",
+        "path": ".github/workflows/deploy.yml",
+        "conclusion": "success"
+      }
+    ]
+  },
+  "expect": {
+    "by_cause": {
+      "merge": 1,
+      "pull_request": 1
+    }
+  }
+}

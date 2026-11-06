@@ -11,8 +11,9 @@
 //!   people's words (`review_fingerprint`). Otherwise the verdict stands and the
 //!   reply says so.
 //! - Changes are requested only with at least one named thing holding the
-//!   merge ([`Verdict`]): nothing holding means approve, whatever the earlier
-//!   verdict was, and [`post`] refuses anything else.
+//!   merge ([`Verdict`]) that the stop judge held on (`passes::stop_judge`):
+//!   nothing holding means approve, whatever the earlier verdict was, and
+//!   [`post`] refuses anything else.
 //! - A finished review's formal verdict is APPROVE or REQUEST_CHANGES, never
 //!   a bare COMMENT ([`binary`]). Only GitHub's rule against verdicts on the
 //!   bot's own PR makes it a COMMENT there; answers to a person's question
@@ -25,6 +26,7 @@
 use crate::clients::github::{GitHubClient, InlineComment};
 use crate::models::ReviewMessage;
 use crate::passes::review_agent::VerdictChange;
+use common::stop_judge::Judged;
 use tracing::{info, warn};
 
 /// CoderHelm's formal review standing on a PR (its newest review that set a
@@ -118,9 +120,13 @@ impl Verdict {
     }
 }
 
-/// The chokepoint's rule: request changes only with something named.
-pub fn may_post(event: &str, verdict: &Verdict) -> bool {
-    event != "REQUEST_CHANGES" || verdict.event() == "REQUEST_CHANGES"
+/// The chokepoint's rule: request changes only with something named, and
+/// only when the stop judge held on it (`passes::stop_judge`).
+pub fn may_post(event: &str, verdict: &Verdict, judged: Option<&Judged>) -> bool {
+    event != "REQUEST_CHANGES"
+        || (verdict.event() == "REQUEST_CHANGES"
+            && judged
+                .is_some_and(|j| j.kind() == common::stop_judge::Kind::Block && j.hold().is_some()))
 }
 
 /// What happened that may change the formal review.
@@ -282,9 +288,12 @@ pub async fn post(
     body: &str,
     inline: &[InlineComment],
     verdict: &Verdict,
+    judged: Option<&Judged>,
 ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
-    if !may_post(event, verdict) {
-        return Err("refused to request changes with nothing named holding the merge".into());
+    if !may_post(event, verdict, judged) {
+        return Err(
+            "refused to request changes without a named problem the stop judge held on".into(),
+        );
     }
     let posted = github
         .create_pr_review_inline(

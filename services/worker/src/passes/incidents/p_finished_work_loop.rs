@@ -157,7 +157,8 @@ fn a_continuation_does_not_reset_the_rounds_or_recheck_a_head() {
             l.proof.checked(&at, open);
         }
         if l.proof.may_fix(MAX_PROOF_FIX_ROUNDS) && l.proof.open > 0 {
-            l.proof.start_fix();
+            l.proof
+                .start_fix(crate::passes::stop_judge::CycleLicence::for_test());
             rounds_run += 1;
             head += 1;
             l.proof.end_fix();
@@ -176,7 +177,7 @@ fn no_progress_between_rounds_stops_the_fixing_at_once() {
     let mut r = CheckRecord::default();
     r.checked("a", 2);
     assert!(r.may_fix(MAX_PROOF_FIX_ROUNDS));
-    r.start_fix();
+    r.start_fix(crate::passes::stop_judge::CycleLicence::for_test());
     r.end_fix();
     r.checked("b", 4);
     assert!(!r.may_fix(MAX_PROOF_FIX_ROUNDS));
@@ -203,7 +204,8 @@ fn time_running_out_during_fixes_leaves_only_the_description_to_do() {
         ..Default::default()
     };
     l.rules.checked("a", 1);
-    l.rules.start_fix();
+    l.rules
+        .start_fix(crate::passes::stop_judge::CycleLicence::for_test());
     let mut next: Ledger = serde_json::from_str(&l.to_json_bounded()).unwrap();
     next.on_step_start();
     assert_eq!(next.opened.as_ref().unwrap().number, 7, "no second PR");
@@ -279,14 +281,17 @@ fn every_check_runs_once_on_a_head_and_stops_at_the_deadline() {
         let gate = fn_of(src, "\npub async fn gate(", "\nasync fn check_and_fix(");
         assert!(gate.contains(".unchanged(&head)"), "{name}");
         assert!(gate.contains("return standing;"), "{name}");
-        assert!(src.contains("start_fix()"), "{name}");
+        // A round beyond the first starts only with the stop judge's licence.
+        assert!(src.contains("start_fix(licence)"), "{name}");
+        assert!(src.contains("stop_judge::cycle_licence("), "{name}");
         assert!(src.contains("w.deadline,"), "{name}");
         assert!(src.contains("end_fix()"), "{name}");
     }
     let proof_src = include_str!("../proof.rs");
     let prove = fn_of(proof_src, "\npub async fn prove(", "\n#[cfg(test)]");
     assert!(prove.contains("l.proof.unchanged(&head)"));
-    assert!(prove.contains("start_fix()"));
+    assert!(prove.contains("start_fix(lic)"));
+    assert!(prove.contains("stop_judge::cycle_licence("));
     // Nothing counts rounds in a local any more.
     for (name, src) in [
         ("proof", proof_src),

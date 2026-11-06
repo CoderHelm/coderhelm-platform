@@ -688,6 +688,8 @@ pub struct RunWaitingMessage {
     pub run_id: String,
     /// `reminder`: still waiting after `run_wait::REMIND_AFTER_HOURS`.
     /// `named`: it waited for nothing, and the sweep just named what for.
+    /// `deadline`: a judged question went unanswered past its deadline; the
+    /// worker goes ahead with its recommended default.
     #[serde(default)]
     pub why: String,
 }

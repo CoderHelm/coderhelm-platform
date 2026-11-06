@@ -560,9 +560,8 @@ pub fn named_holding(
             super::own_review::thread_line(path, *line, body),
         ));
     }
-    for fact in unconfirmed.iter().filter(|f| f.blocks) {
-        out.push(Holding::new(HoldKind::Fact, fact.fact.clone()));
-    }
+    // Unconfirmed facts are FYI notes on the approval, never a hold.
+    let _ = unconfirmed;
     if verify_failed {
         out.push(Holding::new(
             HoldKind::Verification,
@@ -887,7 +886,7 @@ mod tests {
             },
             Finding {
                 title: "integration-tests job fails".into(),
-                ..defect("a.rs", 6, "high", "tests")
+                ..defect("a.rs", 6, "high", "bug")
             },
             defect("a.rs", 7, "high", "bug"),
         ];
@@ -1641,9 +1640,11 @@ mod tests {
                                         assert!(heading.contains(&h.name), "{heading}");
                                     }
                                 }
+                                // An unconfirmed fact never holds: it is an
+                                // FYI note on the approval.
+                                let _ = u;
                                 let empty = !f.is_empty()
                                     || !t.is_empty()
-                                    || u.iter().any(|x| x.blocks)
                                     || v
                                     || !o.is_empty()
                                     || !k.is_empty();

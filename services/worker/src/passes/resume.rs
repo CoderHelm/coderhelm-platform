@@ -2617,6 +2617,40 @@ pub async fn run(
                         mark_events_processed(state, &msg.run_id, &events).await;
                         return Ok(());
                     }
+                    super::own_review::Next::Fix { .. }
+                        if progress.rounds > 0
+                            && super::stop_judge::cycle_licence(
+                                state,
+                                &ticket_msg,
+                                &msg.run_id,
+                                "own_review",
+                                progress.rounds,
+                                super::own_review::MAX_FIX_ROUNDS,
+                                &super::stop_judge::evidence_lines(
+                                    "CoderHelm's own review",
+                                    &own_open,
+                                ),
+                            )
+                            .await
+                            .is_none() =>
+                    {
+                        // The stop judge found no named blocker worth another
+                        // round: the draft goes to a person with what is open.
+                        stop_on_own_findings(
+                            state,
+                            &ticket_msg,
+                            &msg.run_id,
+                            &super::own_review::cap_reason(&own_open),
+                            &pr_url,
+                            pr_number,
+                            &branch,
+                            &usage,
+                            wall_clock_secs(created_at, &start),
+                        )
+                        .await?;
+                        mark_events_processed(state, &msg.run_id, &events).await;
+                        return Ok(());
+                    }
                     super::own_review::Next::Fix { stalled } => {
                         record_own_review_progress(
                             state,
@@ -4904,7 +4938,45 @@ async fn wait_for_review(
     usage: &TokenUsage,
     duration: u64,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let wait = super::stop_pr::review_wait(pr_number, pr_url, reason);
+    // Handing the run to a person is the stop judge's call: a named blocker
+    // for the person, or the draft carries the assumption it went on.
+    let mut judge_usage = TokenUsage::default();
+    let judged = super::stop_judge::decide_for_team(
+        state,
+        &mut judge_usage,
+        &msg.team_id,
+        &super::stop_judge::run_subject(run_id),
+        "",
+        super::stop_judge::handoff_picture(msg, "fix_rounds", reason, &[]),
+    )
+    .await;
+    wait_on_person(
+        state, msg, run_id, reason, pr_url, pr_number, branch, usage, duration, &judged,
+    )
+    .await
+}
+
+/// The run waits on its pull request's review, with the judge's blocker or
+/// assumption beside what is open.
+#[allow(clippy::too_many_arguments)]
+async fn wait_on_person(
+    state: &WorkerState,
+    msg: &TicketMessage,
+    run_id: &str,
+    reason: &str,
+    pr_url: &str,
+    pr_number: u64,
+    branch: &str,
+    usage: &TokenUsage,
+    duration: u64,
+    judged: &super::stop_judge::Judged,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let detail = match (judged.hold_words(), judged.assumption()) {
+        (Some(h), _) => format!("{reason}\nBlocked on: {h}"),
+        (None, Some(a)) => format!("{reason}\nAssumed: {a}"),
+        _ => reason.to_string(),
+    };
+    let wait = super::stop_pr::review_wait(pr_number, pr_url, &detail);
     end_run(
         state,
         msg,
@@ -4914,6 +4986,7 @@ async fn wait_for_review(
         (pr_url, pr_number, branch),
         usage,
         duration,
+        Some(judged),
     )
     .await
 }
@@ -4932,11 +5005,7 @@ async fn complete_run_with_status(
     usage: &TokenUsage,
     duration: u64,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    debug_assert_ne!(
-        status,
-        common::run_status::NEEDS_INPUT,
-        "use wait_for_review"
-    );
+    debug_assert_ne!(status, "needs_input", "use wait_for_review");
     end_run(
         state,
         msg,
@@ -4946,6 +5015,7 @@ async fn complete_run_with_status(
         (pr_url, pr_number, branch),
         usage,
         duration,
+        None,
     )
     .await
 }
@@ -4960,11 +5030,13 @@ async fn end_run(
     (pr_url, pr_number, branch): (&str, u64, &str),
     usage: &TokenUsage,
     duration: u64,
+    judged: Option<&super::stop_judge::Judged>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let now = chrono::Utc::now().to_rfc3339();
     let delta = usage.unrecorded();
-    // Waiting on a person is always for something named.
-    let wait = (status == common::run_status::NEEDS_INPUT).then(|| {
+    // Waiting on a person is always for something named, and only after
+    // the stop judge decided it.
+    let wait = (status == common::run_status::NEEDS_INPUT && judged.is_some()).then(|| {
         wait.cloned()
             .unwrap_or_else(|| super::stop_pr::review_wait(pr_number, pr_url, ""))
     });

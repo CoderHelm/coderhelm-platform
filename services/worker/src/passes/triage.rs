@@ -180,7 +180,7 @@ Rules:
 
     let mut messages = vec![("user".to_string(), content_blocks)];
 
-    let model_id = provider.primary_model_id();
+    let model_id = provider.judgment_model_id();
     let response = provider::converse(
         state,
         provider,
@@ -816,7 +816,7 @@ Then on the LAST line, return ONLY the repository in `owner/name` format (or `NO
 
     let mut messages = vec![("user".to_string(), content_blocks)];
 
-    let model_id = provider.primary_model_id();
+    let model_id = provider.judgment_model_id();
     let response = provider::converse(
         state,
         provider,
@@ -833,9 +833,9 @@ Then on the LAST line, return ONLY the repository in `owner/name` format (or `NO
             // the last line — 512 tokens routinely cut the completion before
             // the answer line existed, and the mid-sentence fragment fell
             // through to the repos[0] fallback.
-            max_tokens: 2048,
+            max_tokens: 8192,
             deadline: None,
-            effort: Some("low"),
+            effort: Some(common::stop_judge::JUDGMENT_EFFORT),
         },
         None,
         None,

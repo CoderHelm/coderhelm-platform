@@ -461,6 +461,14 @@ async fn main() -> Result<(), Error> {
         .route("/stats", get(routes::api::get_stats))
         .route("/stats/history", get(routes::api::get_stats_history))
         .route("/analytics", get(routes::analytics::get_analytics))
+        .route(
+            "/analytics/decisions",
+            get(routes::decisions::get_decisions),
+        )
+        .route(
+            "/analytics/decisions/export",
+            get(routes::decisions::export_decisions),
+        )
         // Reviewer agent — per-repo config, reviews list/detail, ratings
         .route(
             "/reviewer/org-config",

@@ -631,11 +631,18 @@ mod misgraded_findings {
         Optional,
         /// Negative: depends on external state nobody can check here.
         ExternalUnknown,
+        /// Negative (the owner's policy): a written team rule not followed,
+        /// with no correctness, security or data-loss defect shown, is a
+        /// Suggestion on the approval.
+        TeamRuleOnly,
     }
 
     impl Rule {
         fn blocks(self) -> bool {
-            !matches!(self, Rule::Style | Rule::Optional | Rule::ExternalUnknown)
+            !matches!(
+                self,
+                Rule::Style | Rule::Optional | Rule::ExternalUnknown | Rule::TeamRuleOnly
+            )
         }
     }
 
@@ -893,18 +900,6 @@ mod misgraded_findings {
                 ),
             },
             Graded {
-                name: "a shipped agent instruction contradicts the repository's written test rule",
-                rule: Rule::BrokenTeamRules,
-                finding: finding(
-                    "e2e/agents/test-healer.md", 1, "low", "docs", "verified-defect",
-                    "Healer agent is told to fixme failing tests, which the repo's rules forbid for payment tests",
-                    "This agent file says that when an error persists it should mark the test \
-                     `test.fixme()` and do whatever passes the test. The repository's own rules \
-                     (e2e/RULES.md) say payment tests are never skipped, fixme'd or loosened. An \
-                     agent invoked directly just follows its own prompt.",
-                ),
-            },
-            Graded {
                 name: "a one-shot batch script marks every remaining batch terminal on one lasting rejection",
                 rule: Rule::OneShot,
                 finding: finding(
@@ -937,6 +932,18 @@ mod misgraded_findings {
 
     fn true_notes() -> Vec<Graded> {
         vec![
+            Graded {
+                name: "a shipped agent instruction contradicts the repository's written test rule",
+                rule: Rule::TeamRuleOnly,
+                finding: finding(
+                    "e2e/agents/test-healer.md", 1, "low", "docs", "verified-defect",
+                    "Healer agent is told to fixme failing tests, which the repo's rules forbid for payment tests",
+                    "This agent file says that when an error persists it should mark the test \
+                     `test.fixme()` and do whatever passes the test. The repository's own rules \
+                     (e2e/RULES.md) say payment tests are never skipped, fixme'd or loosened. An \
+                     agent invoked directly just follows its own prompt.",
+                ),
+            },
             Graded {
                 name: "a comment that went stale",
                 rule: Rule::Style,

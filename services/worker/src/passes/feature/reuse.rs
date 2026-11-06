@@ -368,7 +368,7 @@ pub async fn judge(
     match provider::converse_simple(
         state,
         provider,
-        provider.primary_model_id(),
+        provider.judgment_model_id(),
         SYSTEM,
         &prompt(pairs),
         usage,

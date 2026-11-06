@@ -431,6 +431,33 @@ pub fn claim_stop(run_id: &str) -> Option<Stop> {
 /// pause ends) or waiting for input (an approval nobody answered), with the
 /// note on the run. Never overwrites a run a person cancelled or closed.
 pub async fn end_run_for_stop(state: &WorkerState, team_id: &str, run_id: &str, stop: &Stop) {
+    // An approval the team's policy requires is not the run's to skip: the
+    // stop is recorded as the judge's decision, without a model call.
+    let judged = match stop {
+        Stop::TimedOut { .. } => Some(
+            crate::passes::stop_judge::cannot_proceed(
+                state,
+                team_id,
+                &crate::passes::stop_judge::run_subject(run_id),
+                crate::passes::stop_judge::Kind::Ask,
+                "agent_policy",
+                &stop.note(),
+            )
+            .await,
+        ),
+        Stop::Paused { .. } => None,
+    };
+    write_run_stop(state, team_id, run_id, stop, judged.as_ref()).await;
+}
+
+/// Writes the stop [`end_run_for_stop`] decided.
+async fn write_run_stop(
+    state: &WorkerState,
+    team_id: &str,
+    run_id: &str,
+    stop: &Stop,
+    _judged: Option<&crate::passes::stop_judge::Judged>,
+) {
     use aws_sdk_dynamodb::types::AttributeValue;
     use common::run_status::EndedValues;
     let status = match stop {
