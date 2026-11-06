@@ -246,6 +246,25 @@ pub fn plan_reopen(item: Option<&Item>) -> ReopenPlan {
     }
 }
 
+/// What a run reopened as `needs_input` waits for: what it waited for before
+/// it was closed, else a Retry.
+pub fn reopened_wait(item: Option<&Item>) -> common::run_wait::WaitingOn {
+    use common::run_wait::WaitingOn;
+    let asked = item
+        .and_then(|i| i.get(common::run_questions::FIELD_QUESTIONS))
+        .and_then(|v| v.as_s().ok())
+        .and_then(|j| serde_json::from_str::<common::run_questions::Asked>(j).ok());
+    item.and_then(WaitingOn::of_item)
+        .or_else(|| asked.and_then(|a| WaitingOn::answer(&a.questions, a.comment_url.as_deref())))
+        .unwrap_or_else(|| {
+            WaitingOn::fixed(
+                "Press Retry to run it again, or close it",
+                "It was reopened after being closed, and nothing is running on it.",
+                "",
+            )
+        })
+}
+
 /// The status-index sort key of a reopened run. A failed run keeps the
 /// reason and pass it failed with; its key is the one `run_fail` writes.
 fn reopened_status_run_id(to: &str, run_id: &str) -> String {
@@ -752,19 +771,34 @@ pub async fn reopen_run(
         ReopenPlan::Reopen { to } => to,
     };
     let now = chrono::Utc::now().to_rfc3339();
-    let res = state
+    let update = state
         .dynamo
         .update_item()
         .table_name(&state.config.runs_table_name)
         .set_key(Some(run_key(&claims.team_id, &run_id)))
-        .update_expression(
-            "SET #s = :to, status_run_id = :sri, updated_at = :t, reopened_at = :t, reopened_by = :by \
-             REMOVE closed_at, closed_by, closed_by_name, closed_from, close_reason",
-        )
         .condition_expression("#s = :closed")
-        .expression_attribute_names("#s", "status")
-        .expression_attribute_values(":to", attr_s(to))
-        .expression_attribute_values(":sri", attr_s(&reopened_status_run_id(to, &run_id)))
+        .expression_attribute_names("#s", "status");
+    // Reopened as waiting on a person: for what it waited on before, else
+    // for a Retry by name (a run closed while it worked asked nothing).
+    let update = if to == run_status::NEEDS_INPUT {
+        use common::run_wait::NeedsInput;
+        update
+            .update_expression(
+                "SET #s = :s, status_run_id = :sri, waiting_on = :wo, updated_at = :t, \
+                 reopened_at = :t, reopened_by = :by \
+                 REMOVE closed_at, closed_by, closed_by_name, closed_from, close_reason",
+            )
+            .needs_input(&run_id, &reopened_wait(item.as_ref()))
+    } else {
+        update
+            .update_expression(
+                "SET #s = :to, status_run_id = :sri, updated_at = :t, reopened_at = :t, reopened_by = :by \
+                 REMOVE closed_at, closed_by, closed_by_name, closed_from, close_reason",
+            )
+            .expression_attribute_values(":to", attr_s(to))
+            .expression_attribute_values(":sri", attr_s(&reopened_status_run_id(to, &run_id)))
+    };
+    let res = update
         .expression_attribute_values(":t", attr_s(&now))
         .expression_attribute_values(":by", attr_s(&claims.email))
         .expression_attribute_values(":closed", attr_s(run_status::CLOSED))

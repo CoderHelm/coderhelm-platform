@@ -441,19 +441,41 @@ pub async fn end_run_for_stop(state: &WorkerState, team_id: &str, run_id: &str, 
         Stop::TimedOut { approval } => approval.id.clone(),
         Stop::Paused { .. } => String::new(),
     };
-    let r = state
+    use common::run_wait::{NeedsInput, WaitingOn};
+    let update = state
         .dynamo
         .update_item()
         .table_name(&state.config.runs_table_name)
         .key("team_id", AttributeValue::S(team_id.to_string()))
         .key("run_id", AttributeValue::S(run_id.to_string()))
-        .update_expression(
-            "SET #s = :s, status_run_id = :sri, policy_note = :n, policy_approval = :a, updated_at = :t",
-        )
-        .condition_expression(format!("attribute_exists(run_id) AND {}", common::run_status::not_ended("#s")))
-        .expression_attribute_names("#s", "status")
-        .expression_attribute_values(":s", AttributeValue::S(status.to_string()))
-        .expression_attribute_values(":sri", AttributeValue::S(format!("{status}#{run_id}")))
+        .condition_expression(format!(
+            "attribute_exists(run_id) AND {}",
+            common::run_status::not_ended("#s")
+        ))
+        .expression_attribute_names("#s", "status");
+    let update = match stop {
+        // Waiting on a person: for the approval, by name.
+        Stop::TimedOut { .. } => update
+            .update_expression(
+                "SET #s = :s, status_run_id = :sri, waiting_on = :wo, policy_note = :n, \
+                 policy_approval = :a, updated_at = :t",
+            )
+            .needs_input(
+                run_id,
+                &WaitingOn::fixed(
+                    "Answer the approval request this run is waiting on, then press Retry",
+                    &stop.note(),
+                    "",
+                ),
+            ),
+        Stop::Paused { .. } => update
+            .update_expression(
+                "SET #s = :s, status_run_id = :sri, policy_note = :n, policy_approval = :a, updated_at = :t",
+            )
+            .expression_attribute_values(":s", AttributeValue::S(status.to_string()))
+            .expression_attribute_values(":sri", AttributeValue::S(format!("{status}#{run_id}"))),
+    };
+    let r = update
         .expression_attribute_values(":n", AttributeValue::S(stop.note()))
         .expression_attribute_values(":a", AttributeValue::S(approval_id))
         .expression_attribute_values(":t", AttributeValue::S(chrono::Utc::now().to_rfc3339()))

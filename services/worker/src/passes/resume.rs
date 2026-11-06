@@ -1,5 +1,6 @@
 use aws_sdk_dynamodb::types::AttributeValue;
 use common::run_status::EndedValues;
+use common::run_wait::{NeedsInput, WaitingOn};
 use serde_json::Value;
 use tracing::{error, info, warn};
 
@@ -3873,11 +3874,12 @@ async fn after_planned_round(
             super::add_progress_note(state, &msg.team_id, &msg.run_id, &reason).await;
             // Not completed: the run waits on a person, says which tasks and
             // why, and the pull request stays a draft.
-            complete_run_with_status(
+            debug_assert_eq!(status, common::run_status::NEEDS_INPUT);
+            wait_for_review(
                 state,
                 &ctx.ticket_msg,
                 &msg.run_id,
-                status,
+                &reason,
                 pr.url,
                 pr.number,
                 pr.branch,
@@ -4880,20 +4882,43 @@ async fn stop_on_own_findings(
         pr_number, "Own review findings still open — the PR stays a draft"
     );
     super::add_progress_note(state, &msg.team_id, run_id, reason).await;
-    complete_run_with_status(
+    wait_for_review(
+        state, msg, run_id, reason, pr_url, pr_number, branch, usage, duration,
+    )
+    .await
+}
+
+/// The run stops with its work on its pull request and something open on
+/// it: it waits on a person (`needs_input`), named as the pull request's
+/// review with `reason` as what is open (never a wait for nothing).
+#[allow(clippy::too_many_arguments)]
+async fn wait_for_review(
+    state: &WorkerState,
+    msg: &TicketMessage,
+    run_id: &str,
+    reason: &str,
+    pr_url: &str,
+    pr_number: u64,
+    branch: &str,
+    usage: &TokenUsage,
+    duration: u64,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let wait = super::stop_pr::review_wait(pr_number, pr_url, reason);
+    end_run(
         state,
         msg,
         run_id,
         common::run_status::NEEDS_INPUT,
-        pr_url,
-        pr_number,
-        branch,
+        Some(&wait),
+        (pr_url, pr_number, branch),
         usage,
         duration,
     )
     .await
 }
 
+/// Ends the run as `status`. A wait on a person goes through
+/// [`wait_for_review`], which names what it waits for.
 #[allow(clippy::too_many_arguments)]
 async fn complete_run_with_status(
     state: &WorkerState,
@@ -4906,26 +4931,69 @@ async fn complete_run_with_status(
     usage: &TokenUsage,
     duration: u64,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    debug_assert_ne!(
+        status,
+        common::run_status::NEEDS_INPUT,
+        "use wait_for_review"
+    );
+    end_run(
+        state,
+        msg,
+        run_id,
+        status,
+        None,
+        (pr_url, pr_number, branch),
+        usage,
+        duration,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn end_run(
+    state: &WorkerState,
+    msg: &TicketMessage,
+    run_id: &str,
+    status: &str,
+    wait: Option<&WaitingOn>,
+    (pr_url, pr_number, branch): (&str, u64, &str),
+    usage: &TokenUsage,
+    duration: u64,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let now = chrono::Utc::now().to_rfc3339();
     let delta = usage.unrecorded();
-
-    let res = state
+    // Waiting on a person is always for something named.
+    let wait = (status == common::run_status::NEEDS_INPUT).then(|| {
+        wait.cloned()
+            .unwrap_or_else(|| super::stop_pr::review_wait(pr_number, pr_url, ""))
+    });
+    let set_status = if wait.is_some() {
+        "#s = :s, status_run_id = :sri, waiting_on = :wo"
+    } else {
+        "#s = :s, status_run_id = :sri"
+    };
+    let update = state
         .dynamo
         .update_item()
         .table_name(&state.config.runs_table_name)
         .key("team_id", attr_s(&msg.team_id))
         .key("run_id", attr_s(run_id))
-        .update_expression(
-            "SET #s = :s, pr_url = :pr, pr_number = :pn, branch = :b, \
+        .update_expression(format!(
+            "SET {set_status}, pr_url = :pr, pr_number = :pn, branch = :b, \
              tokens_in = if_not_exists(tokens_in, :uzero) + :ti, tokens_out = if_not_exists(tokens_out, :uzero) + :to, \
              cache_read_tokens = if_not_exists(cache_read_tokens, :uzero) + :crt, cache_write_tokens = if_not_exists(cache_write_tokens, :uzero) + :cwt, \
-             cost_usd = if_not_exists(cost_usd, :uzero) + :c, duration_s = :d, updated_at = :t, current_pass = :cp, \
-             status_run_id = :sri \
+             cost_usd = if_not_exists(cost_usd, :uzero) + :c, duration_s = :d, updated_at = :t, current_pass = :cp \
              REMOVE error_message, #err",
-        )
+        ))
         .expression_attribute_names("#s", "status")
-        .expression_attribute_names("#err", "error")
-        .expression_attribute_values(":s", attr_s(status))
+        .expression_attribute_names("#err", "error");
+    let update = match &wait {
+        Some(w) => update.needs_input(run_id, w),
+        None => update
+            .expression_attribute_values(":s", attr_s(status))
+            .expression_attribute_values(":sri", attr_s(&format!("{status}#{run_id}"))),
+    };
+    let res = update
         .expression_attribute_values(":pr", attr_s(pr_url))
         .expression_attribute_values(":pn", attr_n(pr_number))
         .expression_attribute_values(":b", attr_s(branch))
@@ -4933,7 +5001,6 @@ async fn complete_run_with_status(
         .expression_attribute_values(":d", attr_n(duration))
         .expression_attribute_values(":t", attr_s(&now))
         .expression_attribute_values(":cp", attr_s("done"))
-        .expression_attribute_values(":sri", attr_s(&format!("{status}#{run_id}")))
         // Cancel is terminal: never overwrite a cancelled run with a completion.
         .condition_expression(common::run_status::not_ended("#s"))
         .ended_values()

@@ -19,13 +19,22 @@
 //! 3. a place is a registry when it names the siblings by path or as a
 //!    whole string (an import, an `exports` key, a list of ids); a code file
 //!    that only mentions them as words is a maybe;
-//! 4. an item that isn't of the siblings' kind (the siblings all import a
-//!    package the new file doesn't) has no places;
+//! 4. a new file is an item of the siblings' kind only when its structure
+//!    says so, never because of the folder it sits in ([`kind_of`]): it has
+//!    the export shape the siblings share (a default export, a call to the
+//!    same definer such as `defineType(...)`, the same base class or trait)
+//!    and the shape the registries import them by (a registry that imports
+//!    each sibling's default export needs one from the new file too). A
+//!    helper, validator, utility, types or generated file next to them is
+//!    another kind and has no places. When the structure can't tell (the
+//!    file or too few siblings couldn't be read, or the siblings share no
+//!    shape), its places are only noted, never a block;
 //! 5. every place must name the new item on the run's branch.
 //!
 //! What a registry is missing goes back to the coder once with the list, and
 //! blocks the pull request if still missing. A maybe never blocks: it is
-//! noted in the pull request for a person to check.
+//! noted in the pull request for a person to check. And a block never stops
+//! the run: it is an Open item on the pull request (see `feature::gate`).
 
 use std::collections::BTreeSet;
 
@@ -95,12 +104,23 @@ fn is_test(p: &str) -> bool {
         || l.contains(".stories.")
 }
 
+/// Type declarations and generated files: never items of their own (a
+/// generated file is regenerated, it is not registered).
+fn is_generated_or_types(p: &str) -> bool {
+    let l = p.to_lowercase();
+    l.ends_with(".d.ts")
+        || l.contains(".generated.")
+        || l.contains(".gen.")
+        || l.contains("/generated/")
+        || l.contains("/__generated__/")
+}
+
 /// The items the added files make. `added` are the paths the change adds;
 /// `tree` is the default branch's file list.
 pub fn new_items(added: &[String], tree: &[String]) -> Vec<NewItem> {
     let mut out: Vec<NewItem> = Vec::new();
     for p in added {
-        if skipped(p) || is_test(p) {
+        if skipped(p) || is_test(p) || is_generated_or_types(p) {
             continue;
         }
         let (dir, file) = split_path(p);
@@ -149,7 +169,7 @@ pub fn siblings(item: &NewItem, tree: &[String], recorded: Option<&str>) -> Vec<
         let Some(rest) = t.strip_prefix(&prefix) else {
             continue;
         };
-        if skipped(t) || is_test(t) {
+        if skipped(t) || is_test(t) || is_generated_or_types(t) {
             continue;
         }
         if item.folder {
@@ -421,6 +441,292 @@ pub fn other_kind(new_text: &str, sibling_texts: &[String]) -> bool {
     common.is_disjoint(&mine)
 }
 
+/// What a file exports, by structure: what makes two files the same kind of
+/// item, whatever the framework.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct Shape {
+    /// A default export (`export default ...`, `module.exports = ...`).
+    pub default_export: bool,
+    /// What its exports are built with: the function a top-level export
+    /// calls (`defineType` in `export default defineType({...})`), a base
+    /// class (`class:Model`), a trait it implements (`impl:Block`) or a
+    /// decorator (`@register`).
+    pub definers: BTreeSet<String>,
+}
+
+const NOT_DEFINERS: &[&str] = &[
+    "function", "class", "async", "new", "await", "typeof", "return", "if", "for", "while",
+];
+
+/// The dotted name at the start of `s` and what follows it.
+fn lead_name(s: &str) -> (&str, &str) {
+    let end = s
+        .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '$' || c == '.'))
+        .unwrap_or(s.len());
+    (&s[..end], &s[end..])
+}
+
+/// The definer a value expression is built with: `defineType({...})` gives
+/// `defineType`, `z.object<...>(...)` gives `z.object`; a literal gives none.
+fn called(expr: &str) -> Option<String> {
+    let (name, rest) = lead_name(expr.trim_start());
+    let rest = rest.trim_start();
+    (!name.is_empty()
+        && !name.starts_with(|c: char| c.is_ascii_digit())
+        && !NOT_DEFINERS.contains(&name)
+        && (rest.starts_with('(') || rest.starts_with('<')))
+    .then(|| name.to_string())
+}
+
+/// The base class after `extends`, if any.
+fn extends(rest: &str) -> Option<String> {
+    let at = rest.find(" extends ")?;
+    let (name, _) = lead_name(rest[at + 9..].trim_start());
+    (!name.is_empty()).then(|| format!("class:{name}"))
+}
+
+/// The file's [`Shape`], read from its top-level lines (comments left out).
+pub fn shape(path: &str, text: &str) -> Shape {
+    let text = without_comments(path, text);
+    let mut out = Shape::default();
+    // `const author = defineType(...)` then `export default author`.
+    let mut locals: Vec<(String, String)> = Vec::new();
+    let mut exported: Vec<String> = Vec::new();
+    for line in text.lines() {
+        if line.starts_with(char::is_whitespace) {
+            continue;
+        }
+        let l = line.trim_end();
+        if let Some(rest) = l
+            .strip_prefix("export default ")
+            .or_else(|| l.strip_prefix("module.exports ="))
+            .or_else(|| l.strip_prefix("export ="))
+        {
+            out.default_export = true;
+            let rest = rest.trim_start();
+            if let Some(d) = called(rest) {
+                out.definers.insert(d);
+            } else if let Some(b) = extends(rest) {
+                out.definers.insert(b);
+            } else {
+                let (name, _) = lead_name(rest);
+                if !name.is_empty() {
+                    exported.push(name.to_string());
+                }
+            }
+            continue;
+        }
+        if let Some(list) = l.strip_prefix("export {") {
+            for part in list.trim_end_matches(['}', ';', ' ']).split(',') {
+                let mut words = part.split_whitespace();
+                let name = words.next().unwrap_or("");
+                if words.next() == Some("as") && words.next() == Some("default") {
+                    out.default_export = true;
+                }
+                exported.push(name.to_string());
+            }
+            continue;
+        }
+        let (is_export, decl) = match l.strip_prefix("export ") {
+            Some(d) => (true, d.trim_start()),
+            None => (false, l),
+        };
+        let decl = decl.strip_prefix("declare ").unwrap_or(decl);
+        if let Some(rest) = ["const ", "let ", "var "]
+            .iter()
+            .find_map(|k| decl.strip_prefix(k))
+        {
+            let (name, after) = lead_name(rest);
+            if let Some((_, value)) = after.split_once('=') {
+                if let Some(d) = called(value) {
+                    if is_export {
+                        out.definers.insert(d.clone());
+                    }
+                    locals.push((name.to_string(), d));
+                }
+            }
+            continue;
+        }
+        if let Some(rest) = decl.strip_prefix("class ") {
+            if let Some(b) = extends(&format!(" {rest}")) {
+                if is_export {
+                    out.definers.insert(b);
+                }
+            } else if let Some((_, bases)) = rest.split_once('(') {
+                // Python: `class Article(Model):`.
+                let (base, _) = lead_name(bases.trim_start());
+                if !base.is_empty() && rest.trim_end().ends_with(':') {
+                    out.definers.insert(format!("class:{base}"));
+                }
+            }
+            continue;
+        }
+        if let Some(rest) = l.strip_prefix("impl") {
+            // Rust: `impl Block for Quote`, `impl<T> Block for Quote<T>`.
+            let rest = rest.trim_start();
+            let rest = if rest.starts_with('<') {
+                rest.split_once('>')
+                    .map(|(_, r)| r)
+                    .unwrap_or("")
+                    .trim_start()
+            } else {
+                rest
+            };
+            if let Some((tr, _)) = rest.split_once(" for ") {
+                let (name, _) = lead_name(tr.trim());
+                if !name.is_empty() {
+                    out.definers.insert(format!("impl:{name}"));
+                }
+            }
+            continue;
+        }
+        if let Some(rest) = l.strip_prefix('@') {
+            // A top-level decorator (`@register`, `@app.route(...)`).
+            let (name, _) = lead_name(rest);
+            if !name.is_empty() {
+                out.definers.insert(format!("@{name}"));
+            }
+        }
+    }
+    for name in exported {
+        if let Some((_, d)) = locals.iter().find(|(n, _)| *n == name) {
+            out.definers.insert(d.clone());
+        }
+    }
+    out
+}
+
+/// Whether `text` imports the sibling's default export: `import author from
+/// './author'` (a registry that does needs one from every item it lists).
+pub fn imports_default(text: &str, sib: &str) -> bool {
+    let forms = variants(sib);
+    let mut from = 0;
+    while let Some(i) = text[from..].find("import ") {
+        let at = from + i;
+        from = at + 7;
+        if at > 0 && !text[..at].ends_with(|c: char| c.is_whitespace() || c == ';') {
+            continue;
+        }
+        let rest = text[from..].trim_start();
+        let rest = rest.strip_prefix("type ").unwrap_or(rest).trim_start();
+        let (name, after) = lead_name(rest);
+        if name.is_empty() || name.contains('.') || name == "from" {
+            continue;
+        }
+        let Some(spec_at) = after.find(" from ") else {
+            continue;
+        };
+        // The import clause is the default binding, optionally `, { ... }`.
+        let clause = &after[..spec_at];
+        if !(clause.trim().is_empty() || clause.trim_start().starts_with(',')) {
+            continue;
+        }
+        let spec = after[spec_at + 6..].trim_start();
+        let Some(q) = spec.chars().next().filter(|c| *c == '"' || *c == '\'') else {
+            continue;
+        };
+        let Some(end) = spec[1..].find(q) else {
+            continue;
+        };
+        let last = spec[1..1 + end].rsplit('/').next().unwrap_or("");
+        let stem = last.split('.').next().unwrap_or(last);
+        if forms.iter().any(|f| f == stem) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Whether a new file is the same kind of item as its siblings.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Kind {
+    /// It has the shape the siblings share: its places must name it.
+    Same,
+    /// Another kind (a helper or validator beside them): it has no places.
+    Other(String),
+    /// Can't tell: its places are noted for a person, never a block.
+    Unknown(String),
+}
+
+/// Whether the new file (`new`: path and text, `None` when it couldn't be
+/// read) is the siblings' kind, judged by structure: the export shape the
+/// read siblings all share, and the shape the registries import them by
+/// (`registries`: their texts). Never by the folder.
+pub fn kind_of(
+    new: Option<(&str, &str)>,
+    sibling_files: &[(String, String)],
+    registries: &[&str],
+    sibs: &[String],
+) -> Kind {
+    let Some((new_path, new_text)) = new else {
+        return Kind::Unknown("its file couldn't be read to compare".to_string());
+    };
+    if sibling_files.len() < 2 {
+        return Kind::Unknown("too few of its siblings could be read to compare".to_string());
+    }
+    let texts: Vec<String> = sibling_files.iter().map(|(_, t)| t.clone()).collect();
+    if other_kind(new_text, &texts) {
+        return Kind::Other("it imports none of the packages its siblings all import".to_string());
+    }
+    let shapes: Vec<Shape> = sibling_files.iter().map(|(p, t)| shape(p, t)).collect();
+    let all_default = shapes.iter().all(|s| s.default_export);
+    let common: BTreeSet<String> = shapes
+        .iter()
+        .skip(1)
+        .fold(shapes[0].definers.clone(), |acc, s| {
+            acc.intersection(&s.definers).cloned().collect()
+        });
+    let imported_default = registries
+        .iter()
+        .any(|r| sibs.iter().any(|s| imports_default(r, s)));
+    if !all_default && !imported_default && common.is_empty() {
+        return Kind::Unknown("its siblings share no export shape to compare it with".to_string());
+    }
+    let mine = shape(new_path, new_text);
+    if (all_default || imported_default) && !mine.default_export {
+        return Kind::Other(if imported_default {
+            "it has no default export, and the registries import each sibling's default export"
+                .to_string()
+        } else {
+            "it has no default export, which every sibling has".to_string()
+        });
+    }
+    if !common.is_empty() && mine.definers.is_disjoint(&common) {
+        let names = common
+            .iter()
+            .map(|d| format!("`{d}`"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Kind::Other(format!(
+            "its exports aren't built with {names}, as every sibling's are"
+        ));
+    }
+    Kind::Same
+}
+
+/// What the new item is missing, once its kind is known: nothing for
+/// another kind, and only notes when the kind can't be told.
+pub fn judge(
+    item: &NewItem,
+    sibs: &[String],
+    kind: &Kind,
+    places: &[(String, String, bool)],
+    on_branch: &dyn Fn(&str) -> Option<String>,
+) -> Vec<Missing> {
+    match kind {
+        Kind::Other(_) => Vec::new(),
+        Kind::Same => missing(item, sibs, places, on_branch),
+        Kind::Unknown(why) => missing(item, sibs, places, on_branch)
+            .into_iter()
+            .map(|mut m| {
+                m.registry = false;
+                m.unsure = Some(why.clone());
+                m
+            })
+            .collect(),
+    }
+}
+
 /// A sibling's own file on the default branch: `parent/<sib>.<ext>`, or its
 /// folder's index-like file.
 fn sibling_file(item: &NewItem, sib: &str, tree: &[String]) -> Option<String> {
@@ -511,6 +817,9 @@ pub struct Missing {
     /// A registry (names the siblings as paths or whole strings): missing
     /// from it blocks. Else a maybe, only noted.
     pub registry: bool,
+    /// Set when the structure couldn't tell whether the new file is the
+    /// siblings' kind: why. Only noted.
+    pub unsure: Option<String>,
 }
 
 impl Missing {
@@ -522,6 +831,13 @@ impl Missing {
             .map(|s| format!("`{s}`"))
             .collect::<Vec<_>>()
             .join(", ");
+        if let Some(why) = &self.unsure {
+            return format!(
+                "`{}` may need registering in `{}` (it names {names}); couldn't tell whether it is \
+                 the same kind of item ({why}); check by hand",
+                self.item, self.path
+            );
+        }
         if self.registry {
             format!(
                 "`{}` isn't registered in `{}` (it names {names})",
@@ -561,6 +877,7 @@ pub fn missing(
                     .cloned()
                     .collect(),
                 registry: *registry,
+                unsure: None,
             });
         }
     }
@@ -621,19 +938,27 @@ pub async fn check(
         } else {
             Some(item.path.clone())
         };
-        if let Some(own) = own_path {
-            if let Ok(own_text) = github.read_file(owner, repo, &own, branch).await {
-                let mut sib_texts = Vec::new();
-                for s in sibs.iter().take(3) {
-                    if let Some(f) = sibling_file(&item, s, tree) {
-                        if let Ok(t) = github.read_file(owner, repo, &f, base).await {
-                            sib_texts.push(t);
-                        }
-                    }
+        let own = match own_path {
+            Some(p) => github
+                .read_file(owner, repo, &p, branch)
+                .await
+                .ok()
+                .map(|t| (p, t)),
+            None => None,
+        };
+        let mut sib_files: Vec<(String, String)> = Vec::new();
+        for s in sibs.iter().take(3) {
+            if let Some(f) = sibling_file(&item, s, tree) {
+                if let Ok(t) = github.read_file(owner, repo, &f, base).await {
+                    sib_files.push((f, t));
                 }
-                if other_kind(&own_text, &sib_texts) {
-                    continue;
-                }
+            }
+        }
+        // Another kind by its imports alone: no need to search for places.
+        if let Some((_, t)) = &own {
+            let texts: Vec<String> = sib_files.iter().map(|(_, t)| t.clone()).collect();
+            if other_kind(t, &texts) {
+                continue;
             }
         }
         let mut candidates: Vec<String> = Vec::new();
@@ -663,6 +988,21 @@ pub async fn check(
                     .map(|(_, registry)| (p, t, *registry))
             })
             .collect();
+        let registries: Vec<&str> = places
+            .iter()
+            .filter(|(_, _, registry)| *registry)
+            .map(|(_, t, _)| t.as_str())
+            .collect();
+        let kind = kind_of(
+            own.as_ref().map(|(p, t)| (p.as_str(), t.as_str())),
+            &sib_files,
+            &registries,
+            &sibs,
+        );
+        if let Kind::Other(why) = &kind {
+            tracing::info!(item = %item.path, why, "Not a new item of its siblings' kind");
+            continue;
+        }
         checked += places.len();
         let mut on_branch: Vec<(String, Option<String>)> = Vec::new();
         for (p, _, _) in &places {
@@ -677,7 +1017,7 @@ pub async fn check(
                 .find(|(q, _)| q == p)
                 .and_then(|(_, t)| t.clone())
         };
-        for m in missing(&item, &sibs, &places, &lookup) {
+        for m in judge(&item, &sibs, &kind, &places, &lookup) {
             if !out.iter().any(|x| x.item == m.item && x.path == m.path) {
                 out.push(m);
             }
@@ -921,6 +1261,257 @@ mod tests {
             imported_packages("import x from '@scope/pkg/sub'\nconst y = require(\"lodash/get\")\nimport z from './local'"),
             ["@scope/pkg", "lodash"].iter().map(|s| s.to_string()).collect()
         );
+    }
+
+    // A content studio's schema folder: three registered document schemas,
+    // a documents index that imports each one's default export, and a
+    // structure file that lists them by name.
+    fn studio_tree() -> Vec<String> {
+        [
+            "studio/schemaTypes/documents/author.ts",
+            "studio/schemaTypes/documents/blog.ts",
+            "studio/schemaTypes/documents/blog-index.ts",
+            "studio/schemaTypes/documents/index.ts",
+            "studio/structure.ts",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect()
+    }
+
+    fn studio_doc(name: &str) -> String {
+        format!(
+            "import {{defineField, defineType}} from 'cms-kit'\n\nexport default defineType({{\n  \
+             name: '{name}',\n  type: 'document',\n  fields: [defineField({{name: 'title', type: 'string'}})],\n}})\n"
+        )
+    }
+
+    fn studio_places() -> Vec<(String, String)> {
+        vec![
+            (
+                "studio/schemaTypes/documents/index.ts".to_string(),
+                "import author from './author'\nimport blog from './blog'\nimport blogIndex from './blog-index'\n\nexport const documents = [author, blog, blogIndex]\n".to_string(),
+            ),
+            (
+                "studio/structure.ts".to_string(),
+                "export const structure = (S) =>\n  S.list().items([\n    S.documentTypeListItem('author'),\n    S.documentTypeListItem('blog'),\n    S.documentTypeListItem('blog-index'),\n  ])\n".to_string(),
+            ),
+        ]
+    }
+
+    /// The whole check after its reads, as `check` runs it.
+    fn run_rule(new_path: &str, new_text: &str) -> Vec<Missing> {
+        let tree = studio_tree();
+        let item = &new_items(&[new_path.to_string()], &tree)[0];
+        let sibs = siblings(item, &tree, None);
+        assert_eq!(sibs, vec!["author", "blog", "blog-index"]);
+        let sib_files: Vec<(String, String)> = sibs
+            .iter()
+            .map(|s| (sibling_file(item, s, &tree).unwrap(), studio_doc(s)))
+            .collect();
+        let files = studio_places();
+        let keep = registration_places(item, &sibs, &files);
+        let places: Vec<(String, String, bool)> = files
+            .into_iter()
+            .filter_map(|(p, t)| keep.iter().find(|(k, _)| *k == p).map(|(_, r)| (p, t, *r)))
+            .collect();
+        assert_eq!(places.len(), 2, "both registries are places");
+        let registries: Vec<&str> = places
+            .iter()
+            .filter(|(_, _, r)| *r)
+            .map(|(_, t, _)| t.as_str())
+            .collect();
+        let kind = kind_of(Some((new_path, new_text)), &sib_files, &registries, &sibs);
+        // The branch registers nothing new.
+        let unchanged: Vec<(String, String)> = studio_places();
+        let lookup = |p: &str| {
+            unchanged
+                .iter()
+                .find(|(q, _)| q == p)
+                .map(|(_, t)| t.clone())
+        };
+        judge(item, &sibs, &kind, &places, &lookup)
+    }
+
+    #[test]
+    fn a_validation_helper_beside_schema_documents_is_not_a_new_item() {
+        // A standalone module of validation predicates next to the schema
+        // documents: it imports the same package (types only), but exports
+        // no schema. It was blocked as an unregistered document.
+        let helper = "import type {ValidationContext} from 'cms-kit'\n\n\
+                      export function endsAfterStart(value: unknown, context: ValidationContext) {\n  \
+                      return true\n}\n\n\
+                      export const requireCode = (rule: any) => rule.custom((v: string) => !!v)\n";
+        let m = run_rule(
+            "studio/schemaTypes/documents/promotion-validation.ts",
+            helper,
+        );
+        assert!(m.is_empty(), "{m:?}");
+        assert!(blocking(&m).is_empty());
+    }
+
+    #[test]
+    fn a_real_new_schema_document_not_registered_is_still_flagged() {
+        let m = run_rule(
+            "studio/schemaTypes/documents/promotion.ts",
+            &studio_doc("promotion"),
+        );
+        let b = blocking(&m);
+        assert_eq!(b.len(), 2, "{m:?}");
+        assert!(b
+            .iter()
+            .any(|x| x.path == "studio/schemaTypes/documents/index.ts"));
+        assert!(b.iter().any(|x| x.path == "studio/structure.ts"));
+        // Declared, then exported by name: the same kind.
+        let later = "import {defineType} from 'cms-kit'\n\nconst promotion = defineType({name: 'promotion'})\n\nexport default promotion\n";
+        assert_eq!(
+            blocking(&run_rule(
+                "studio/schemaTypes/documents/promotion.ts",
+                later
+            ))
+            .len(),
+            2
+        );
+    }
+
+    #[test]
+    fn when_the_structure_cant_tell_the_places_are_only_noted() {
+        let tree = studio_tree();
+        let item = &new_items(
+            &["studio/schemaTypes/documents/promotion.ts".to_string()],
+            &tree,
+        )[0];
+        let sibs = siblings(item, &tree, None);
+        // The new file couldn't be read.
+        let sib_files: Vec<(String, String)> = sibs
+            .iter()
+            .map(|s| (format!("{s}.ts"), studio_doc(s)))
+            .collect();
+        let kind = kind_of(None, &sib_files, &[], &sibs);
+        assert!(matches!(kind, Kind::Unknown(_)));
+        // Siblings with nothing in common to compare.
+        let loose = vec![
+            ("a.ts".to_string(), "export const a = 1\n".to_string()),
+            ("b.ts".to_string(), "export function b() {}\n".to_string()),
+        ];
+        assert!(matches!(
+            kind_of(Some(("n.ts", "export const n = 2\n")), &loose, &[], &sibs),
+            Kind::Unknown(_)
+        ));
+        let places: Vec<(String, String, bool)> = studio_places()
+            .into_iter()
+            .map(|(p, t)| (p, t, true))
+            .collect();
+        let m = judge(item, &sibs, &kind, &places, &|p: &str| {
+            studio_places()
+                .into_iter()
+                .find(|(q, _)| q == p)
+                .map(|(_, t)| t)
+        });
+        assert_eq!(m.len(), 2);
+        assert!(blocking(&m).is_empty());
+        assert!(m[0].line().contains("check by hand"));
+        assert!(m[0].line().contains("couldn't tell"));
+    }
+
+    #[test]
+    fn shapes_are_read_by_structure_in_any_language() {
+        let s = shape("x.ts", "export default defineType({name: 'a'})\n");
+        assert!(s.default_export);
+        assert!(s.definers.contains("defineType"));
+        let s = shape("x.tsx", "export default class Hero extends Block {}\n");
+        assert!(s.definers.contains("class:Block"));
+        let s = shape("x.js", "module.exports = createRoute('/a')\n");
+        assert!(s.default_export && s.definers.contains("createRoute"));
+        let s = shape(
+            "x.ts",
+            "// export default defineType()\nexport function helper() {}\n",
+        );
+        assert_eq!(s, Shape::default());
+        let s = shape("m.py", "@register\nclass Article(Model):\n    pass\n");
+        assert!(s.definers.contains("class:Model"));
+        assert!(s.definers.contains("@register"));
+        let s = shape("q.rs", "pub struct Quote;\nimpl Block for Quote {}\n");
+        assert!(s.definers.contains("impl:Block"));
+
+        // Python models beside a helper module: the helper is another kind.
+        let models = vec![
+            (
+                "app/models/user.py".to_string(),
+                "from django.db import models\n\nclass User(models.Model):\n    pass\n".to_string(),
+            ),
+            (
+                "app/models/order.py".to_string(),
+                "from django.db import models\n\nclass Order(models.Model):\n    pass\n"
+                    .to_string(),
+            ),
+        ];
+        let helper = "from django.db import models\n\ndef money(v):\n    return round(v, 2)\n";
+        assert!(matches!(
+            kind_of(Some(("app/models/money.py", helper)), &models, &[], &[]),
+            Kind::Other(_)
+        ));
+        let model = "from django.db import models\n\nclass Coupon(models.Model):\n    pass\n";
+        assert_eq!(
+            kind_of(Some(("app/models/coupon.py", model)), &models, &[], &[]),
+            Kind::Same
+        );
+    }
+
+    #[test]
+    fn a_registry_that_imports_defaults_needs_a_default_export() {
+        assert!(imports_default(
+            "import blogIndex from './blog-index'",
+            "blog-index"
+        ));
+        assert!(imports_default(
+            "import Hero, { heroQuery } from \"@/blocks/Hero\"",
+            "Hero"
+        ));
+        assert!(!imports_default("import { Hero } from './Hero'", "Hero"));
+        assert!(!imports_default("import * as Hero from './Hero'", "Hero"));
+        assert!(!imports_default("import x from './HeroBanner'", "Hero"));
+        // Siblings share nothing but the registry imports their defaults.
+        let sibs = vec!["a".to_string(), "b".to_string()];
+        let files = vec![
+            (
+                "a.ts".to_string(),
+                "const a = {}\nexport default a\n".to_string(),
+            ),
+            (
+                "b.ts".to_string(),
+                "export default function b() {}\n".to_string(),
+            ),
+        ];
+        let registry = "import a from './a'\nimport b from './b'\n";
+        assert!(matches!(
+            kind_of(
+                Some(("n.ts", "export const n = 1\n")),
+                &files,
+                &[registry],
+                &sibs
+            ),
+            Kind::Other(_)
+        ));
+        assert_eq!(
+            kind_of(
+                Some(("n.ts", "export default {}\n")),
+                &files,
+                &[registry],
+                &sibs
+            ),
+            Kind::Same
+        );
+    }
+
+    #[test]
+    fn types_and_generated_files_are_never_items() {
+        let added = vec![
+            "src/blocks/types.d.ts".to_string(),
+            "src/blocks/schema.generated.ts".to_string(),
+            "src/__generated__/blocks.ts".to_string(),
+        ];
+        assert!(new_items(&added, &tree()).is_empty());
     }
 
     #[test]
