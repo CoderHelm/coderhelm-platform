@@ -19,7 +19,10 @@ Actions (the `action` field of the event):
 - update_now  starts the update build for a version (default: the latest,
             read from GitHub at that moment).
             Only a version newer than the one running: going back is a
-            rollback.
+            rollback. Pressed while the release check runs, the press is
+            recorded and the update starts by itself once the check passes
+            (follow_request); pressed again for the update in progress, it
+            answers with that update.
 - rollback  starts the build for the version before the last update, or an
             admin's pick, which must be a version this install ran before.
 - apply_update  a native install: an admin applies the prepared update that
@@ -1587,6 +1590,8 @@ def confirm_check(store, env, now, probe=None, cb=None):
                                      "build": v["build"], "at": now.isoformat()})
     mc = model_check(store, env, now, version, env.get("RELEASE_REPO", RELEASE_REPO), probe or invoke_worker)
     notify_blocked(store, env, mc)
+    # An admin pressed Update while this ran: it carries on now.
+    follow_request(store, env, now, probe, record=mc)
     return "verified"
 
 
@@ -1789,6 +1794,112 @@ def blocked_message(record):
     first = failures(record, required=True) or failures(record)
     f = first[0] if first else {}
     return f"Update to {record['version']} needs your action: {f.get('detail', 'a model was refused.')} {f.get('fix', '')}".strip()
+
+
+# ── Update pressed while the release check runs ──────────────────────────
+#
+# Pressing Update while the release's signature and models are still being
+# checked is never a refusal: the press is recorded (UPDATE_REQUEST: who,
+# which version, when) and the updater carries on by itself once the check
+# ends, exactly as if the admin pressed again: it prepares the update (begin)
+# and the update then applies or waits for their OK as usual. A check that
+# fails ends the request with the check's own reason, which the card shows.
+# Another press, or a newer release, replaces the request. A request that
+# never sees its check end is dropped after REQUEST_LIMIT.
+#
+# status: waiting (the check runs, or the release is still publishing),
+# started (begin ran: `id` is the update), ended (`reason` says why), or done
+# (the install already runs that version).
+
+REQUEST_LIMIT = timedelta(hours=2)
+
+
+def record_request(store, now, version, actor, skip_check=False, waiting_for="the release check"):
+    """Records an admin's Update press that waits for the release check."""
+    old = store.get("UPDATE_REQUEST") or {}
+    req = {"version": version, "actor": actor, "requested_at": now.isoformat(), "status": "waiting", "waiting_for": waiting_for}
+    if skip_check:
+        req["skip_check"] = True
+    if old.get("status") == "waiting" and old.get("version") != version:
+        req["replaces"] = old.get("version")
+    store.put("UPDATE_REQUEST", req)
+    return req
+
+
+def settle_request(store, req, now, status, reason="", **extra):
+    req = dict(req, status=status, reason=reason, ended_at=now.isoformat(), **extra)
+    store.put("UPDATE_REQUEST", req)
+    return req
+
+
+def follow_request(store, env, now, probe=None, latest=None, record=None):
+    """Carries a waiting Update press on: once its release check passed, the
+    update starts as if the admin pressed again; a check that failed ends it
+    with the check's reason. `latest` (the newest release offered) replaces
+    the request's version when it is newer. `record` is the model check as
+    the version route sees it (a stalled view). Returns the request, or None."""
+    req = store.get("UPDATE_REQUEST")
+    if not req or req.get("status") != "waiting":
+        return req or None
+    version = req.get("version") or ""
+    current = env.get("CODERHELM_VERSION", "")
+    if not parse_version(version):
+        return settle_request(store, req, now, "ended", "the requested version isn't a release")
+    if parse_version(current) and compare(version, current) <= 0:
+        return settle_request(store, req, now, "done", f"this install already runs {current}")
+    if latest and parse_version(latest) and compare(latest, version) > 0:
+        # A newer release came out while this one was checked: Update means the newest.
+        req = record_request(store, now, latest, req.get("actor") or DIRECT_ACTOR, req.get("skip_check", False))
+        version = latest
+        record = model_check(store, env, now, version, env.get("RELEASE_REPO", RELEASE_REPO), probe or invoke_worker)
+    state = store.get("UPDATE_STATE", {}) or {}
+    if running(state, now):
+        live = (store.get(state["running_id"], {}) or {}) if state.get("running_id") else {}
+        if live.get("version") == version:
+            # The window (or another press) started this very update.
+            return settle_request(store, req, now, "started", id=state.get("running_id"))
+        if not (is_native(env) and unapplied(live)):
+            return req  # another update runs: this one waits for it
+    mc = record if record and record.get("version") == version else (store.get("MODEL_CHECK") or {})
+    if mc.get("version") != version or mc.get("pending"):
+        try:
+            old = now - datetime.fromisoformat(req.get("requested_at") or "") > REQUEST_LIMIT
+        except ValueError:
+            old = True
+        if old:
+            return settle_request(store, req, now, "ended", f"checking {version} didn't finish; press Update to start it over")
+        return req
+    if mc.get("stalled"):
+        return settle_request(store, req, now, "ended", mc.get("note") or f"checking {version} didn't finish")
+    if failures(mc, required=True):
+        return settle_request(store, req, now, "ended", blocked_message(mc))
+    note = None
+    if failures(mc):
+        if not req.get("skip_check"):
+            return settle_request(store, req, now, "ended", blocked_message(mc) + " This release doesn't call it, so you can skip this check.")
+        note = "model check skipped for " + ", ".join(f.get("model", "?") for f in failures(mc))
+    try:
+        started = begin(store, env, now, version, req.get("actor") or DIRECT_ACTOR, "update", note=note)
+    except ReleaseNotReady as e:
+        req = dict(req, waiting_for=str(e))
+        store.put("UPDATE_REQUEST", req)
+        return req
+    except ValueError as e:
+        return settle_request(store, req, now, "ended", str(e)[:500])
+    return settle_request(store, req, now, "started", id=started.get("id"))
+
+
+def request_view(req, now):
+    """The Update press for the version route: while it waits, and for a day after it ended."""
+    if not req or req.get("status") in ("done", None):
+        return None
+    if req.get("status") != "waiting":
+        try:
+            if now - datetime.fromisoformat(req.get("ended_at") or "") > timedelta(days=1):
+                return None
+        except ValueError:
+            return None
+    return {k: req.get(k) for k in ("version", "actor", "requested_at", "status", "waiting_for", "reason", "ended_at", "id", "replaces") if req.get(k) is not None}
 
 
 # ── The deploy window (hardened installs) ────────────────────────────────
@@ -2934,6 +3045,11 @@ def handle(event, env, store, now, fetch=fetch_releases, probe=None, hint=None):
         # Opening Settings, System reads the list again when it is a couple
         # of minutes old; Check for updates (refresh) reads it now.
         _, latest, behind = releases(0, refresh=True) if event.get("refresh") else releases(FRESH_SECONDS)
+        mc_view = model_check_view(store, env, now, latest["version"], probe) if latest else None
+        # An Update press that waited for the check carries on (or ends) here too.
+        follow_request(store, env, now, probe, latest=latest["version"] if latest else None, record=mc_view)
+        if (store.get("UPDATE_REQUEST") or {}).get("version") != (mc_view or {}).get("version") and latest:
+            mc_view = model_check_view(store, env, now, latest["version"], probe)
         if is_native(env):
             # The pending update as CloudFormation has it now, not as last stored.
             reconcile(store, env, now)
@@ -2955,7 +3071,9 @@ def handle(event, env, store, now, fetch=fetch_releases, probe=None, hint=None):
             "failed_versions": sorted(state.get("failed_versions") or []),
             "history": history_view(store.history(), state, now),
             # The model check for the latest release (Settings, System and Setup).
-            "model_check": model_check_view(store, env, now, latest["version"], probe) if latest else None,
+            "model_check": mc_view,
+            # An admin's Update press waiting for the release check (or how it ended).
+            "update_request": request_view(store.get("UPDATE_REQUEST"), now),
             # Which install this is, for Settings, System, Uninstall's link to the uninstall page.
             "install": install_identity(env),
             # A native install: the stack, and the change set an admin reviews.
@@ -2987,11 +3105,21 @@ def handle(event, env, store, now, fetch=fetch_releases, probe=None, hint=None):
         # Forward only: an older (or the same) release is a rollback.
         if parse_version(current) and compare(version, current) <= 0:
             raise ValueError(f"{version} is not newer than {current}; use Roll back to go to an earlier release")
+        actor = event.get("actor") or DIRECT_ACTOR
         if running(state, now):
-            raise ValueError("an update is already running")
+            live = (store.get(state["running_id"], {}) or {}) if state.get("running_id") else {}
+            if live.get("version") == version and live.get("status") in ("running", "preparing", "review"):
+                # Pressed again (a second click, or a waiting press already
+                # started it): the update in progress is the answer.
+                return dict(live, id=state["running_id"], state="started")
+            if not (is_native(env) and unapplied(live)):
+                raise ValueError(f"the update to {live.get('version') or 'another version'} is still running; this one can start once it finishes")
         mc = model_check(store, env, now, version, repo, probe)
         if mc.get("pending"):
-            raise ModelsBlocked(f"Checking {version}'s signature and the models it calls first; try Update now again in a few minutes.", mc)
+            # Not a refusal: the press is kept, and the update starts by
+            # itself once the check passes (follow_request).
+            req = record_request(store, now, version, actor, bool(event.get("skip_check")))
+            return {"state": "checking", "version": version, "request": request_view(req, now), "model_check": mc}
         if failures(mc, required=True):
             # No override: the release would call a model this install can't.
             raise ModelsBlocked(blocked_message(mc), mc)
@@ -3001,12 +3129,21 @@ def handle(event, env, store, now, fetch=fetch_releases, probe=None, hint=None):
                 raise ModelsBlocked(blocked_message(mc) + " This release doesn't call it, so you can skip this check.",
                                     dict(mc, skippable=True))
             note = "model check skipped for " + ", ".join(f.get("model", "?") for f in failures(mc))
-        started = begin(store, env, now, version, event.get("actor") or DIRECT_ACTOR, "update", note=note)
+        try:
+            started = begin(store, env, now, version, actor, "update", note=note)
+        except ReleaseNotReady as e:
+            # Still publishing, or its template not verified yet: a wait, kept like a check.
+            req = record_request(store, now, version, actor, bool(event.get("skip_check")), waiting_for=str(e))
+            return {"state": "checking", "version": version, "request": request_view(req, now), "model_check": mc}
+        req = store.get("UPDATE_REQUEST") or {}
+        if req.get("status") == "waiting":
+            # This press replaces the one that waited.
+            settle_request(store, req, now, "started", id=started.get("id"))
         stored = store.get("MODEL_CHECK") or {}
         if stored.get("version") == version and (stored.get("pending") or stored.get("stalled")):
             # Written meanwhile by an older check: the one that just passed stands.
             store.put("MODEL_CHECK", mc)
-        return started
+        return dict(started, state="started")
 
     if action == "models_verified":
         # From the release check build, after the signature check. Only a
@@ -3028,6 +3165,7 @@ def handle(event, env, store, now, fetch=fetch_releases, probe=None, hint=None):
                 mc.update(pending=False, stalled=True, ok=False, checked_at=now.isoformat(),
                           note=f"The release check couldn't verify {version}: {why}. Check again to start it over.")
                 store.put("MODEL_CHECK", mc)
+            follow_request(store, env, now, probe, record=mc)
             return {"verified": False}
         sha = event.get("template_sha256")
         if sha is not None and not (isinstance(sha, str) and re.fullmatch(r"[0-9a-f]{64}", sha)):
@@ -3057,7 +3195,9 @@ def handle(event, env, store, now, fetch=fetch_releases, probe=None, hint=None):
             if not latest:
                 return {"model_check": None}
             version = latest["version"]
-        return {"model_check": model_check(store, env, now, version, repo, probe)}
+        mc = model_check(store, env, now, version, repo, probe)
+        follow_request(store, env, now, probe, record=mc)
+        return {"model_check": mc, "request": request_view(store.get("UPDATE_REQUEST"), now)}
 
     if action == "rollback":
         target = event.get("version")
@@ -3155,6 +3295,11 @@ def handle(event, env, store, now, fetch=fetch_releases, probe=None, hint=None):
         if latest and not running(state, now) and needs_check(mc, latest["version"], now):
             mc = model_check(store, env, now, latest["version"], repo, probe)
             notify_blocked(store, env, mc)
+        if not behind:
+            # An Update press that waited for the check carries on.
+            follow_request(store, env, now, probe, latest=latest["version"] if latest else None)
+            state = store.get("UPDATE_STATE", {})
+            mc = store.get("MODEL_CHECK")
         if behind:
             # Never an older release while a newer one is out.
             d = {"action": "none", "version": behind["version"], "reason": behind["reason"]}

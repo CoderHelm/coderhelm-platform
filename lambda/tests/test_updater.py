@@ -406,8 +406,10 @@ class Handler(unittest.TestCase):
     def test_update_now_and_finished_failure_marks_the_version(self):
         e = u.handle({"action": "update_now", "actor": "owner@example.org"}, self.env, self.store, SUNDAY_3AM, self.fetch)
         self.assertEqual((e["version"], e["actor"], e["status"]), ("v2.0.0", "owner@example.org", "running"))
-        with self.assertRaises(ValueError):
-            u.handle({"action": "update_now"}, self.env, self.store, SUNDAY_3AM, self.fetch)
+        # Pressed again while it runs: the same update, never a second one or an error.
+        again = u.handle({"action": "update_now"}, self.env, self.store, SUNDAY_3AM, self.fetch)
+        self.assertEqual((again["id"], again["state"]), (e["id"], "started"))
+        self.assertEqual(len(self.builds), 1)
         r = u.handle({"action": "finished", "status": "rolled_back", "reason": "health check failed after deploy", "history_id": e["id"]},
                      self.env, self.store, SUNDAY_3AM, self.fetch)
         self.assertEqual(r["status"], "rolled_back")
@@ -845,9 +847,10 @@ class ModelCheck(unittest.TestCase):
         self.assertEqual(d["action"], "notify")
         self.assertEqual(self.worker.payloads, [])
         self.assertTrue(self.store.get("MODEL_CHECK")["pending"])
-        with self.assertRaises(u.ModelsBlocked) as e:
-            u.handle({"action": "update_now", "actor": "a"}, self.env, self.store, SUNDAY_3AM, self.releases, self.worker)
-        self.assertIn("signature", str(e.exception))
+        # Update pressed while it runs: recorded, not refused.
+        r = u.handle({"action": "update_now", "actor": "a"}, self.env, self.store, SUNDAY_3AM, self.releases, self.worker)
+        self.assertEqual((r["state"], r["version"]), ("checking", "v1.1.0"))
+        self.assertTrue(r["model_check"]["pending"])
         # Not started again within 30 minutes.
         self.assertEqual(self.builds, [("v1.1.0", "check", "release-check")])
         # A report that isn't from the build the updater started is refused.
@@ -944,6 +947,167 @@ class ModelCheck(unittest.TestCase):
         for h in range(6, 24 * 12, 6):
             self.tick(SUNDAY_3AM + timedelta(hours=h))
         self.assertEqual(self.notices, ["update to v1.1.0 needs your OK", "update to v1.1.0 still needs your OK"])
+
+
+class PressDuringCheck(unittest.TestCase):
+    """Update pressed while the release check runs: recorded, then carried on by itself."""
+
+    def setUp(self):
+        self.db = FakeDynamo()
+        self.store = u.Store(self.db, "t")
+        self.builds, self.notices = [], []
+        real_build, real_notify, real_check = u.start_build, u.notify, u.start_check
+        u.start_build = lambda env, version, actor, mode, hid, extra=None: self.builds.append((version, actor, mode)) or "b-1"
+        u.notify = lambda subject, text, env=None, **kw: self.notices.append(subject) or 1
+        u.start_check = lambda env, version: self.checks.append(version) or f"c-{version}"
+        self.addCleanup(setattr, u, "start_build", real_build)
+        self.addCleanup(setattr, u, "notify", real_notify)
+        self.addCleanup(setattr, u, "start_check", real_check)
+        self.checks = []
+        self.cb = FakeCodeBuild()
+        u._clients["codebuild"] = self.cb
+        self.addCleanup(u._clients.pop, "codebuild", None)
+        self.env = {"CODERHELM_VERSION": "v1.0.0", "APP_URL": "https://helm.example.org", "UPDATE_PROJECT_NAME": "p",
+                    "RELEASE_CHECK_PROJECT_NAME": "coderhelm-prod-release-check", "WORKER_FUNCTION_NAME": "w",
+                    "CONFIGURED_MODELS": "claude-opus-5-5,claude-sonnet-5-5"}
+        self.worker = FakeWorker(refuse=())
+        self.tags = ["v1.1.0"]
+
+    def releases(self, _repo):
+        return [rel(t) for t in self.tags]
+
+    def h(self, event, at=SUNDAY_3AM):
+        return u.handle(event, self.env, self.store, at, self.releases, self.worker)
+
+    def press(self, at=SUNDAY_3AM, **kw):
+        return self.h(dict({"action": "update_now", "actor": "admin@example.org"}, **kw), at)
+
+    def verify(self, version="v1.1.0", at=SUNDAY_3AM, manifest=MANIFEST):
+        """The release check build reports, then CodeBuild says it succeeded."""
+        text = json.dumps(dict(manifest, version=version))
+        self.h({"action": "models_verified", "version": version, "build": f"c-{version}", "status": "verified", "manifest_text": text}, at)
+        self.cb.finish(f"c-{version}", version=version, models=hashlib.sha256(text.encode()).hexdigest())
+
+    def updates(self):
+        return [b for b in self.builds if b[2] == "update"]
+
+    def test_a_press_while_checking_is_recorded_not_refused(self):
+        r = self.press()
+        self.assertEqual((r["state"], r["version"]), ("checking", "v1.1.0"))
+        self.assertTrue(r["model_check"]["pending"])
+        self.assertEqual(r["request"]["actor"], "admin@example.org")
+        self.assertEqual(r["request"]["status"], "waiting")
+        self.assertEqual(self.updates(), [])
+        req = self.store.get("UPDATE_REQUEST")
+        self.assertEqual((req["version"], req["actor"], req["requested_at"]), ("v1.1.0", "admin@example.org", SUNDAY_3AM.isoformat()))
+        s = self.h({"action": "status"})
+        self.assertEqual(s["update_request"]["status"], "waiting")
+        self.assertTrue(s["model_check"]["pending"])
+        # The handler answers ok: the gateway never turns it into an error.
+        self.assertNotIn("error", r)
+
+    def test_the_update_starts_by_itself_once_the_check_passes(self):
+        self.press()
+        self.verify()
+        self.assertEqual(self.updates(), [])  # CodeBuild hasn't said yet
+        d = self.h({"action": "tick"}, SUNDAY_3AM + timedelta(minutes=5))
+        self.assertEqual(self.updates(), [("v1.1.0", "admin@example.org", "update")])
+        req = self.store.get("UPDATE_REQUEST")
+        self.assertEqual(req["status"], "started")
+        self.assertEqual(req["id"], self.store.get("UPDATE_STATE")["running_id"])
+        self.assertEqual(d["reason"], "an update is running")
+        # Pressing again now is the same update, not a second one or an error.
+        again = self.press(SUNDAY_3AM + timedelta(minutes=6))
+        self.assertEqual((again["state"], again["id"]), ("started", req["id"]))
+        self.assertEqual(len(self.updates()), 1)
+
+    def test_status_carries_it_on_without_a_tick(self):
+        self.press()
+        self.verify()
+        s = self.h({"action": "status"}, SUNDAY_3AM + timedelta(minutes=3))
+        self.assertEqual(self.updates(), [("v1.1.0", "admin@example.org", "update")])
+        self.assertTrue(s["running"])
+        self.assertEqual(s["update_request"]["status"], "started")
+
+    def test_a_refused_model_ends_the_request_with_the_reason(self):
+        self.worker.refuse = {"claude-sonnet-5-5"}
+        self.press()
+        self.verify()
+        s = self.h({"action": "status"}, SUNDAY_3AM + timedelta(minutes=3))
+        self.assertEqual(self.updates(), [])
+        self.assertEqual(s["update_request"]["status"], "ended")
+        self.assertTrue(s["update_request"]["reason"].startswith("Update to v1.1.0 needs your action"))
+        self.assertFalse(s["running"])
+
+    def test_a_failed_signature_check_ends_the_request_with_its_reason(self):
+        self.press()
+        self.h({"action": "models_verified", "version": "v1.1.0", "build": "c-v1.1.0", "status": "failed", "reason": "bad signature"})
+        req = self.store.get("UPDATE_REQUEST")
+        self.assertEqual(req["status"], "ended")
+        self.assertIn("couldn't verify v1.1.0: bad signature", req["reason"])
+        self.assertEqual(self.updates(), [])
+
+    def test_a_check_that_never_ends_drops_the_request(self):
+        self.press()
+        later = SUNDAY_3AM + u.REQUEST_LIMIT + timedelta(minutes=1)
+        self.cb.builds["c-v1.1.0"] = {"buildStatus": "IN_PROGRESS"}
+        self.h({"action": "tick"}, later)
+        req = self.store.get("UPDATE_REQUEST")
+        self.assertEqual(req["status"], "ended")
+        self.assertIn("didn't finish", req["reason"])
+
+    def test_a_newer_press_replaces_the_waiting_one(self):
+        self.press()
+        self.tags = ["v1.1.0", "v1.2.0"]
+        r = self.press(SUNDAY_3AM + timedelta(minutes=1), version="v1.2.0")
+        self.assertEqual(r["state"], "checking")
+        req = self.store.get("UPDATE_REQUEST")
+        self.assertEqual((req["version"], req["replaces"]), ("v1.2.0", "v1.1.0"))
+        # The check now runs for v1.2.0, and that is what starts.
+        self.assertEqual(self.store.get("UPDATE_STATE")["verifying"]["version"], "v1.2.0")
+        self.verify("v1.2.0", SUNDAY_3AM + timedelta(minutes=2))
+        self.h({"action": "status"}, SUNDAY_3AM + timedelta(minutes=3))
+        self.assertEqual(self.updates(), [("v1.2.0", "admin@example.org", "update")])
+
+    def test_a_newer_release_replaces_the_waiting_request(self):
+        self.press()
+        self.tags = ["v1.1.0", "v1.2.0"]
+        s = self.h({"action": "status", "refresh": True}, SUNDAY_3AM + timedelta(minutes=1))
+        self.assertEqual(s["latest"]["version"], "v1.2.0")
+        self.assertEqual(s["update_request"]["version"], "v1.2.0")
+        self.assertEqual(s["update_request"]["replaces"], "v1.1.0")
+        self.assertEqual(s["model_check"]["version"], "v1.2.0")
+        self.assertTrue(s["model_check"]["pending"])
+        self.verify("v1.2.0", SUNDAY_3AM + timedelta(minutes=2))
+        self.h({"action": "status"}, SUNDAY_3AM + timedelta(minutes=3))
+        self.assertEqual(self.updates(), [("v1.2.0", "admin@example.org", "update")])
+
+    def test_a_press_after_the_check_passed_starts_at_once(self):
+        self.store.put("MANIFEST#v1.1.0", {"verified": True, "manifest": MANIFEST})
+        r = self.press()
+        self.assertEqual(r["state"], "started")
+        self.assertEqual(self.updates(), [("v1.1.0", "admin@example.org", "update")])
+
+    def test_the_scheduled_window_is_unchanged_and_starts_once(self):
+        self.h({"action": "settings", "settings": {"auto": True, "day": "daily"}})
+        # No press: the window waits for the check, then applies by itself.
+        d = self.h({"action": "tick"})
+        self.assertEqual(d["action"], "notify")
+        self.assertEqual(self.updates(), [])
+        self.verify()
+        d = self.h({"action": "tick"}, SUNDAY_3AM + timedelta(minutes=5))
+        self.assertEqual(d["action"], "update")
+        self.assertEqual(self.updates(), [("v1.1.0", "auto", "update")])
+        self.assertIsNone(self.store.get("UPDATE_REQUEST"))
+
+    def test_a_press_and_the_window_start_one_update(self):
+        self.h({"action": "settings", "settings": {"auto": True, "day": "daily"}})
+        self.press()
+        self.verify()
+        self.h({"action": "tick"}, SUNDAY_3AM + timedelta(minutes=5))
+        self.h({"action": "tick"}, SUNDAY_3AM + timedelta(minutes=6))
+        self.assertEqual(len(self.updates()), 1)
+        self.assertEqual(self.updates()[0][1], "admin@example.org")
 
 
 class NeverAcceptsTerms(unittest.TestCase):
