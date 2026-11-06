@@ -226,9 +226,13 @@ pub async fn update_now(
         .and_then(Value::as_str)
         .map(str::to_string);
     let skip = body.get("skip_check").and_then(Value::as_bool) == Some(true);
+    // The admin pressed Update next to "it may change what Coderhelm's own
+    // roles may do": their OK for permission changes inside the boundary,
+    // never for data (lambda/updater, consented).
+    let accept = body.get("accept_permissions").and_then(Value::as_bool) == Some(true);
     let body = call(
         &state,
-        json!({ "action": "update_now", "version": version, "actor": claims.email, "skip_check": skip }),
+        json!({ "action": "update_now", "version": version, "actor": claims.email, "skip_check": skip, "accept_permissions": accept }),
     )
     .await
     .map_err(status_only)?;

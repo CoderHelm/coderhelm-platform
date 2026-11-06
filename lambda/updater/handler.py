@@ -1814,12 +1814,14 @@ def blocked_message(record):
 REQUEST_LIMIT = timedelta(hours=2)
 
 
-def record_request(store, now, version, actor, skip_check=False, waiting_for="the release check"):
+def record_request(store, now, version, actor, skip_check=False, waiting_for="the release check", consent=False):
     """Records an admin's Update press that waits for the release check."""
     old = store.get("UPDATE_REQUEST") or {}
     req = {"version": version, "actor": actor, "requested_at": now.isoformat(), "status": "waiting", "waiting_for": waiting_for}
     if skip_check:
         req["skip_check"] = True
+    if consent:
+        req["accept_permissions"] = True
     if old.get("status") == "waiting" and old.get("version") != version:
         req["replaces"] = old.get("version")
     store.put("UPDATE_REQUEST", req)
@@ -1849,7 +1851,8 @@ def follow_request(store, env, now, probe=None, latest=None, record=None):
         return settle_request(store, req, now, "done", f"this install already runs {current}")
     if latest and parse_version(latest) and compare(latest, version) > 0:
         # A newer release came out while this one was checked: Update means the newest.
-        req = record_request(store, now, latest, req.get("actor") or DIRECT_ACTOR, req.get("skip_check", False))
+        req = record_request(store, now, latest, req.get("actor") or DIRECT_ACTOR, req.get("skip_check", False),
+                             consent=req.get("accept_permissions", False))
         version = latest
         record = model_check(store, env, now, version, env.get("RELEASE_REPO", RELEASE_REPO), probe or invoke_worker)
     state = store.get("UPDATE_STATE", {}) or {}
@@ -1879,7 +1882,8 @@ def follow_request(store, env, now, probe=None, latest=None, record=None):
             return settle_request(store, req, now, "ended", blocked_message(mc) + " This release doesn't call it, so you can skip this check.")
         note = "model check skipped for " + ", ".join(f.get("model", "?") for f in failures(mc))
     try:
-        started = begin(store, env, now, version, req.get("actor") or DIRECT_ACTOR, "update", note=note)
+        started = begin(store, env, now, version, req.get("actor") or DIRECT_ACTOR, "update", note=note,
+                        consent=req.get("accept_permissions", False))
     except ReleaseNotReady as e:
         req = dict(req, waiting_for=str(e))
         store.put("UPDATE_REQUEST", req)
@@ -2542,6 +2546,11 @@ def native_poll(store, env, now, cfn=None):
                 return {"native": "moved on"}
             cfn.execute_change_set(ChangeSetName=cs_id, StackName=env["NATIVE_STACK"])
             entry.update({"executed_at": now.isoformat(), "status": "running"})
+            if entry.get("permission_changes") and consented(entry):
+                # What the press agreed to, as it turned out: kept with the update.
+                c = entry["consent"]
+                entry["confirmed"] = {"by": c.get("by"), "at": c.get("at"), "data_changes": [],
+                                      "permission_changes": entry["permission_changes"], "on": "update"}
             store.put(hid, entry)
             return {"native": "executing"}
         if entry.get("status") != "review":
@@ -2622,12 +2631,20 @@ def native_hold(store, env, entry):
     if entry.get("data_changes"):
         # Never without a person: data would be replaced or removed.
         return f"{who}: it would replace or remove " + "; ".join(entry["data_changes"])[:400]
-    if entry.get("permission_changes"):
+    if entry.get("permission_changes") and not consented(entry):
         # Never without a person: it changes who may do what.
         return f"{who}: it changes permissions (" + "; ".join(entry["permission_changes"])[:400] + ")"
     if entry.get("scheduled") and not auto_on(store, env):
         return "auto-update was turned off before it ran: press Apply to apply it"
     return ""
+
+
+def consented(entry):
+    """An admin's Update press (never the window) agreed to permission changes
+    of CoderHelm's own roles. They stay inside the permissions boundary; the
+    deploy role and the boundary themselves are admin_changes, never applied here."""
+    c = entry.get("consent") or {}
+    return bool(c.get("permissions")) and not entry.get("scheduled")
 
 
 def prepared_role(entry):
@@ -2916,7 +2933,7 @@ def not_started_details(e, version, from_version):
     return {k: d[k][:1000] for k in ("summary", "fix", "technical")}
 
 
-def begin(store, env, now, version, actor, mode, extra=None, note=None, scheduled=False):
+def begin(store, env, now, version, actor, mode, extra=None, note=None, scheduled=False, consent=False):
     """Starts the update and records it in history.
 
     History holds updates that started: the row is written once the change
@@ -2942,6 +2959,11 @@ def begin(store, env, now, version, actor, mode, extra=None, note=None, schedule
     if scheduled:
         # The maintenance window started it: it applies only while auto-update is on.
         entry["scheduled"] = True
+    elif consent:
+        # The admin pressed Update next to "it may change what CoderHelm's own
+        # roles may do, inside the install's permissions boundary": that press
+        # is their OK for permission changes (see native_hold). Never for data.
+        entry["consent"] = {"permissions": True, "by": actor, "at": now.isoformat()}
 
     def refused(e):
         entry.update({"status": "not_started", "reason": not_started_reason(e), "finished_at": now.isoformat()})
@@ -3118,7 +3140,7 @@ def handle(event, env, store, now, fetch=fetch_releases, probe=None, hint=None):
         if mc.get("pending"):
             # Not a refusal: the press is kept, and the update starts by
             # itself once the check passes (follow_request).
-            req = record_request(store, now, version, actor, bool(event.get("skip_check")))
+            req = record_request(store, now, version, actor, bool(event.get("skip_check")), consent=bool(event.get("accept_permissions")))
             return {"state": "checking", "version": version, "request": request_view(req, now), "model_check": mc}
         if failures(mc, required=True):
             # No override: the release would call a model this install can't.
@@ -3130,10 +3152,11 @@ def handle(event, env, store, now, fetch=fetch_releases, probe=None, hint=None):
                                     dict(mc, skippable=True))
             note = "model check skipped for " + ", ".join(f.get("model", "?") for f in failures(mc))
         try:
-            started = begin(store, env, now, version, actor, "update", note=note)
+            started = begin(store, env, now, version, actor, "update", note=note, consent=bool(event.get("accept_permissions")))
         except ReleaseNotReady as e:
             # Still publishing, or its template not verified yet: a wait, kept like a check.
-            req = record_request(store, now, version, actor, bool(event.get("skip_check")), waiting_for=str(e))
+            req = record_request(store, now, version, actor, bool(event.get("skip_check")), waiting_for=str(e),
+                                 consent=bool(event.get("accept_permissions")))
             return {"state": "checking", "version": version, "request": request_view(req, now), "model_check": mc}
         req = store.get("UPDATE_REQUEST") or {}
         if req.get("status") == "waiting":
