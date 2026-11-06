@@ -88,6 +88,31 @@ const PLACEHOLDER_HTML = `<!doctype html><html><head><meta charset="utf-8"><titl
 (it downloads the dashboard for this release), or set <code>dashboard.assetDir</code>
 in your config to a dashboard build and deploy again.</p></body></html>`;
 
+/**
+ * The origin the dashboard build writes into its link preview tags (og:url,
+ * og:image, twitter:image; CoderHelm/coderhelm dashboard/src/lib/link-preview.ts).
+ * One build serves every install, so the pages upload swaps it for this
+ * install's own public URL: a link pasted into Teams or Slack previews with a
+ * picture from the install itself, never from CoderHelm's servers.
+ */
+export const DASHBOARD_URL_PLACEHOLDER = "https://coderhelm-install.invalid";
+
+/**
+ * `source`, with every occurrence of `placeholder` in its files replaced by
+ * `value` when the upload runs (the bucket deployment's marker substitution,
+ * the same one `Source.data` uses for deploy-time values). `value` may be a
+ * token: a native release's address is only known when the stack deploys, and
+ * a later domain change re-runs the upload with the new one.
+ */
+export function withDeployTimeValue(source: s3deploy.ISource, placeholder: string, value: string): s3deploy.ISource {
+  return {
+    bind(scope, context) {
+      const config = source.bind(scope, context);
+      return { ...config, markers: { ...(config.markers ?? {}), [placeholder]: value } };
+    },
+  };
+}
+
 /** What the dashboard reads at start (public/runtime-config.js in its build). */
 export function runtimeConfigScript(cfg: ResolvedConfig): string {
   const stamp = releaseStamp(cfg);
@@ -271,7 +296,15 @@ export class WebStack extends cdk.Stack {
         memoryLimit: 512,
       });
       const pages = new s3deploy.BucketDeployment(this, "DashboardPages", {
-        sources: [s3deploy.Source.asset(assetDir, { exclude: ["_next/**", "runtime-config.js"] }), runtimeConfig, notFound],
+        sources: [
+          withDeployTimeValue(
+            s3deploy.Source.asset(assetDir, { exclude: ["_next/**", "runtime-config.js"] }),
+            DASHBOARD_URL_PLACEHOLDER,
+            this.publicUrl,
+          ),
+          runtimeConfig,
+          notFound,
+        ],
         destinationBucket: bucket,
         exclude: ["_next/*"],
         prune: true,
