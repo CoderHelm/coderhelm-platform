@@ -849,6 +849,15 @@ pub async fn converse_tool_loop(
             .collect();
 
         if tool_uses.is_empty() || response.stop_reason.as_deref() == Some("end_turn") {
+            // An answer cut at the output limit loses whatever it was to
+            // end with (a planner's decision block comes last): say so.
+            if response.stop_reason.as_deref() == Some("max_tokens") {
+                warn!(
+                    max_tokens,
+                    output_tokens = response.usage.output_tokens,
+                    "Final answer stopped at the output limit; its end is missing"
+                );
+            }
             // Log the final assistant response
             if let Some(ref mut log) = conversation_log {
                 log.push(json!({

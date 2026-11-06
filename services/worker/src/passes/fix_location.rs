@@ -371,6 +371,12 @@ pub struct FixDecision {
     /// can't take: that one action and what each outcome would mean.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub next_step: Option<NextStep>,
+    /// Set when the planner's own answer carried no readable decision (a
+    /// format failure, never a question for a person): what was wrong with
+    /// it and how the run settled where the fix belongs instead (asked the
+    /// planner again for the block, or fell back from the plan itself).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub planner_failure: String,
 }
 
 /// One step of the whole job, and who does it.
@@ -669,27 +675,264 @@ pub fn parse_for(response: &str, intent: TicketIntent) -> Option<FixDecision> {
 
 /// The decision in the planner's reply, if it wrote one that reads.
 pub fn parse(response: &str) -> Option<FixDecision> {
+    match parse_detailed(response) {
+        Ok(d) => Some(d),
+        Err(BlockProblem::Missing) => None,
+        Err(p) => {
+            tracing::warn!(problem = %p.describe(), "Planner's fix_location block didn't read");
+            None
+        }
+    }
+}
+
+/// Why a planner's reply has no decision that reads.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BlockProblem {
+    /// No ```fix_location.json fence at all.
+    Missing,
+    /// The fence opens but never closes: the answer was cut off (usually
+    /// at the output limit, since the block comes last).
+    Unterminated,
+    /// The fence closes but its JSON doesn't read.
+    Invalid(String),
+}
+
+impl BlockProblem {
+    /// For the run's notes and record.
+    pub fn describe(&self) -> String {
+        match self {
+            BlockProblem::Missing => "the planner's answer had no fix_location block".to_string(),
+            BlockProblem::Unterminated => {
+                "the planner's fix_location block was cut off before it closed".to_string()
+            }
+            BlockProblem::Invalid(e) => format!(
+                "the planner's fix_location block didn't read as JSON ({})",
+                common::truncate_str(e, 160)
+            ),
+        }
+    }
+
+    /// A short kind for analytics.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            BlockProblem::Missing => "fix_location_missing",
+            BlockProblem::Unterminated => "fix_location_cut_off",
+            BlockProblem::Invalid(_) => "fix_location_malformed",
+        }
+    }
+}
+
+/// The decision in the planner's reply, or what is wrong with it.
+pub fn parse_detailed(response: &str) -> Result<FixDecision, BlockProblem> {
     let marker = format!("```{FENCE}");
-    let start = response.find(&marker)?;
-    let body_start = start + response[start..].find('\n')? + 1;
-    let end = response[body_start..]
-        .find("```")
-        .map(|i| body_start + i)
-        .unwrap_or(response.len());
-    let raw = response[body_start..end].trim();
+    let start = response.find(&marker).ok_or(BlockProblem::Missing)?;
+    let Some(nl) = response[start..].find('\n') else {
+        return Err(BlockProblem::Unterminated);
+    };
+    let body_start = start + nl + 1;
+    let closed = response[body_start..].find("```").map(|i| body_start + i);
+    let raw = response[body_start..closed.unwrap_or(response.len())].trim();
     match serde_json::from_str::<FixDecision>(raw) {
         Ok(mut d) => {
             // What the ticket asks for comes from triage, never the block.
             d.intent = TicketIntent::default();
             // What is still open is the plan check's to say.
             d.open_gaps.clear();
-            Some(d)
+            // How a missing block was settled is the run's to say.
+            d.planner_failure.clear();
+            Ok(d)
         }
-        Err(e) => {
-            tracing::warn!(error = %e, "Planner's fix_location block didn't read");
-            None
-        }
+        Err(_) if closed.is_none() => Err(BlockProblem::Unterminated),
+        Err(e) => Err(BlockProblem::Invalid(e.to_string())),
     }
+}
+
+/// The one cheap call that asks the planner again for only its decision,
+/// when its answer carried none that reads: the ticket, the plan it wrote
+/// and the block's shape. No tools, no research: the plan is already made.
+pub fn reask_prompt(
+    title: &str,
+    intent: TicketIntent,
+    problem: &BlockProblem,
+    proposal: &str,
+    design: &str,
+    tasks: &str,
+) -> String {
+    format!(
+        "You planned this ticket, but {problem}. Write that block now, from the plan below, and \
+         nothing else: no other text, no other files.\n\n\
+         ## Ticket\nTitle: {title}\nTriage read it as: {intent}\n\n\
+         ## Your plan\n### proposal.md\n{proposal}\n\n### design.md\n{design}\n\n### tasks.md\n{tasks}\n\n\
+         ## The block\n\
+         - `fix_location`: `code` when the tasks change files in the repository (new work always is, \
+         unless a person or vendor does part of it: then `both`), `outside_code` only when the plan \
+         itself says the fix is a change in another system, `unknown` only when tasks.md says \
+         `NO_CODE_CHANGE:`.\n\
+         - `cause`: one or two sentences, from the plan.\n\
+         - `evidence.basis`: `feature` for new work, `code` or `data` for a bug.\n\
+         - `questions`: only what the plan says a person must decide, each naming the options; [] \
+         when none.\n\
+         - `outside_change`: null unless `outside_code` or `both`, then `system` and `change`.\n\n\
+         ```{FENCE}\n{{\"fix_location\": \"code\", \"cause\": \"...\", \"evidence\": {{\"basis\": \"feature\"}}, \"outside_change\": null, \"questions\": []}}\n```",
+        problem = problem.describe(),
+        intent = intent.as_str(),
+        proposal = common::truncate_str(proposal.trim(), 6000),
+        design = common::truncate_str(design.trim(), 6000),
+        tasks = common::truncate_str(tasks.trim(), 6000),
+    )
+}
+
+/// Where the fix belongs when the planner gave no decision that reads,
+/// even after being asked once more: decided from the plan itself, never
+/// by asking a person. New work or upkeep, and a plan whose tasks name
+/// files in the repository, is `code`; a plan that says it changes no code
+/// is `unknown` with its own line as the cause. `None` when the plan has
+/// nothing to decide from (no tasks): that is a planner failure.
+pub fn fallback(intent: TicketIntent, tasks: &str, failure: &str) -> Option<FixDecision> {
+    let t = tasks.trim_start();
+    if t.is_empty() || t.starts_with("NO_CHANGES_NEEDED:") || t.starts_with("CLARIFICATION_NEEDED:")
+    {
+        return None;
+    }
+    let mut d = FixDecision {
+        intent,
+        planner_failure: failure.to_string(),
+        ..Default::default()
+    };
+    if let Some(line) = t.strip_prefix(NO_CODE_CHANGE) {
+        d.fix_location = FixLocation::Unknown;
+        d.cause = line.trim().to_string();
+        return Some(d);
+    }
+    let files = super::feature::plan_files::planned_files(tasks);
+    let new_work = matches!(intent, TicketIntent::Feature | TicketIntent::Chore);
+    if !new_work && files.is_empty() {
+        return None;
+    }
+    d.fix_location = FixLocation::Code;
+    d.evidence.basis = if new_work { "feature" } else { "code" }.to_string();
+    let names: Vec<&str> = files.iter().take(5).map(|f| f.path.as_str()).collect();
+    d.cause = if names.is_empty() {
+        "The plan's tasks change this repository's code.".to_string()
+    } else {
+        format!(
+            "The plan's tasks change {} in this repository.",
+            names.join(", ")
+        )
+    };
+    Some(d)
+}
+
+/// What a run asks a person when it stops without a fix: the plan's own
+/// questions not answered already and fit to ask (see
+/// `run_questions::too_open`), else one concrete question built from what
+/// the run found, with the options it considered. Never an open "where
+/// does the fix belong". Empty when there is nothing concrete to ask.
+pub fn person_questions(
+    d: &FixDecision,
+    answers: &[common::run_questions::Answer],
+    tasks: &str,
+) -> Vec<common::run_questions::Question> {
+    use common::run_questions::{too_open, unanswered, Question};
+    let renumber = |qs: Vec<Question>| -> Vec<Question> {
+        qs.into_iter()
+            .enumerate()
+            .map(|(i, q)| Question {
+                id: format!("q{}", i + 1),
+                ..q
+            })
+            .collect()
+    };
+    let own: Vec<Question> = unanswered(common::run_questions::from_lines(&d.questions), answers)
+        .into_iter()
+        .filter(|q| too_open(q).is_none())
+        .collect();
+    if !own.is_empty() {
+        return renumber(own);
+    }
+    let why = common::truncate_str(&one_line(&d.cause), 600).to_string();
+    let q = |question: String, suggestions: Vec<String>| Question {
+        id: "q1".to_string(),
+        question,
+        why: why.clone(),
+        suggestions,
+        ..Default::default()
+    };
+    let built = if let Some(n) = d.next_step.as_ref().filter(|n| n.is_usable()) {
+        q(
+            format!(
+                "Can you {} and tell me what you see?",
+                one_line(&n.action).trim_end_matches('.')
+            ),
+            n.outcomes
+                .iter()
+                .filter(|o| !o.if_.trim().is_empty())
+                .map(|o| one_line(&o.if_))
+                .collect(),
+        )
+    } else if let Some(c) = d
+        .outside_change
+        .as_ref()
+        .filter(|c| !c.change.trim().is_empty())
+    {
+        let system = if c.system.trim().is_empty() {
+            "another system".to_string()
+        } else {
+            one_line(&c.system)
+        };
+        q(
+            format!(
+                "I think the fix is this change in {system}: {}. Is that the fix, or should I change the code instead?",
+                one_line(&c.change).trim_end_matches('.')
+            ),
+            vec![
+                format!("Yes: make that change in {system}"),
+                "No: change the code in this repository".to_string(),
+            ],
+        )
+    } else {
+        let files: Vec<String> = super::feature::plan_files::planned_files(tasks)
+            .into_iter()
+            .take(5)
+            .map(|f| f.path)
+            .collect();
+        if !files.is_empty() {
+            q(
+                format!(
+                    "I plan to change {}. Go ahead, or does it need anything else?",
+                    files.join(", ")
+                ),
+                vec![
+                    "Go ahead with this plan".to_string(),
+                    "It also needs: (say what)".to_string(),
+                ],
+            )
+        } else if let Some(line) = tasks.trim_start().strip_prefix(NO_CODE_CHANGE) {
+            q(
+                format!(
+                    "I found no code change to make: {}. Is that right?",
+                    one_line(line).trim_end_matches('.')
+                ),
+                vec![
+                    "Yes: nothing to change in the code".to_string(),
+                    "No: the code should change (say where)".to_string(),
+                ],
+            )
+        } else if !why.is_empty() {
+            q(
+                "I stopped before changing code for the reason above. I recommend changing the \
+                 code in this repository; go ahead?"
+                    .to_string(),
+                vec![
+                    "Go ahead and change the code".to_string(),
+                    "No: the fix is somewhere else (say where)".to_string(),
+                ],
+            )
+        } else {
+            return Vec::new();
+        }
+    };
+    unanswered(vec![built], answers)
 }
 
 /// The planner's instructions for the decision, appended to its prompt, by
@@ -1112,17 +1355,6 @@ pub fn outside_report(d: &FixDecision, heading: bool) -> String {
          Once it is made, nothing else is needed here.",
     );
     out
-}
-
-/// The decision a run asks with when the plan carried none.
-pub fn undecided() -> FixDecision {
-    FixDecision {
-        fix_location: FixLocation::Unknown,
-        cause: "The plan didn't say where the fix belongs (in this code or in data or settings \
-                in another system), so I stopped before changing any code."
-            .to_string(),
-        ..Default::default()
-    }
 }
 
 /// The report when the run stops to ask: for a bug, where the fix belongs
@@ -1571,7 +1803,7 @@ mod tests {
     #[test]
     fn a_plan_without_a_decision_asks_and_never_codes() {
         assert_eq!(route(None), Route::Ask);
-        assert!(unknown_report(&undecided(), false).contains("stopped before changing any code"));
+
         assert_eq!(parse("```tasks.md\n- [ ] a.rs: x\n```"), None);
         let d = FixDecision::default();
         assert_eq!(route(Some(&d)), Route::Code);
@@ -2196,5 +2428,191 @@ mod intent_tests {
         assert!(ticket.contains("1. Deploy the studio to staging Done by CoderHelm: started `Deploy studio`: https://example.test/run/1."));
         assert!(ticket.contains("(owner: a content editor)"));
         assert!(!ticket.contains("Not checked"));
+    }
+}
+
+#[cfg(test)]
+mod missing_block_tests {
+    use super::*;
+
+    const FEATURE_TASKS: &str =
+        "- [ ] studio/schemas/blocks/hero.ts: [modify] Add a titleSize field (section | page)\n\
+- [ ] studio/schemas/blocks/cards.ts: [modify] Add a titleSize field\n\
+- [ ] web/components/blocks/Hero.tsx: [modify] Read titleSize for the heading level";
+
+    #[test]
+    fn a_missing_or_cut_off_or_malformed_block_says_which() {
+        assert_eq!(
+            parse_detailed("```tasks.md\n- [ ] a.rs: x\n```"),
+            Err(BlockProblem::Missing)
+        );
+        // The answer hit the output limit inside the block.
+        assert_eq!(
+            parse_detailed("```fix_location.json\n{\"fix_location\": \"co"),
+            Err(BlockProblem::Unterminated)
+        );
+        assert!(matches!(
+            parse_detailed("```fix_location.json\n{\"fix_location\": }\n```"),
+            Err(BlockProblem::Invalid(_))
+        ));
+        let d = parse_detailed(
+            "```fix_location.json\n{\"fix_location\": \"code\", \"planner_failure\": \"x\"}\n```",
+        )
+        .unwrap();
+        assert_eq!(d.fix_location, FixLocation::Code);
+        assert!(d.planner_failure.is_empty(), "the block never sets it");
+    }
+
+    #[test]
+    fn a_feature_phrased_as_a_complaint_with_no_block_proceeds_to_code() {
+        // The live case: new work, the planner left the block out (twice).
+        let d = fallback(
+            TicketIntent::Feature,
+            FEATURE_TASKS,
+            "fix_location_missing; asked again: still none",
+        )
+        .expect("a plan with tasks always decides");
+        assert_eq!(route_for_plan(Some(&d), FEATURE_TASKS), Route::Code);
+        assert_eq!(d.evidence.basis, "feature");
+        assert!(
+            d.cause.contains("studio/schemas/blocks/hero.ts"),
+            "{}",
+            d.cause
+        );
+        assert!(!d.planner_failure.is_empty());
+        // Even read as a bug, a plan whose tasks name this repo's files codes.
+        let d = fallback(TicketIntent::Bug, FEATURE_TASKS, "x").unwrap();
+        assert_eq!(route_for_plan(Some(&d), FEATURE_TASKS), Route::Code);
+        // New work codes even when the tasks name no files the parser knows.
+        let d = fallback(TicketIntent::Chore, "- [ ] bump the SDK", "x").unwrap();
+        assert_eq!(d.fix_location, FixLocation::Code);
+    }
+
+    #[test]
+    fn a_plan_with_nothing_to_decide_from_is_a_planner_failure_not_a_question() {
+        assert_eq!(fallback(TicketIntent::Bug, "  ", "x"), None);
+        assert_eq!(fallback(TicketIntent::Feature, "", "x"), None);
+        assert_eq!(fallback(TicketIntent::Bug, "- [ ] look into it", "x"), None);
+        // Directives are handled before any decision is needed.
+        assert_eq!(
+            fallback(TicketIntent::Bug, "NO_CHANGES_NEEDED: done", "x"),
+            None
+        );
+        assert_eq!(
+            fallback(
+                TicketIntent::Bug,
+                "CLARIFICATION_NEEDED:\n- question: x",
+                "x"
+            ),
+            None
+        );
+        // A plan that says it changes no code keeps its own line as the cause.
+        let d = fallback(
+            TicketIntent::Bug,
+            "NO_CODE_CHANGE: the venue's hours are unset in the CMS",
+            "x",
+        )
+        .unwrap();
+        assert_eq!(d.fix_location, FixLocation::Unknown);
+        assert_eq!(d.cause, "the venue's hours are unset in the CMS");
+        // A decision settled for new work never reads as a fault question.
+        let d = fallback(TicketIntent::Feature, FEATURE_TASKS, "x").unwrap();
+        assert_eq!(ask_title(&d), "Questions before I build this");
+    }
+
+    #[test]
+    fn the_reask_is_small_and_asks_only_for_the_block() {
+        let p = reask_prompt(
+            "Add a title size setting",
+            TicketIntent::Feature,
+            &BlockProblem::Unterminated,
+            "proposal",
+            "design",
+            FEATURE_TASKS,
+        );
+        assert!(p.contains("cut off before it closed"), "{p}");
+        assert!(p.contains("```fix_location.json"), "{p}");
+        assert!(p.contains("nothing else"), "{p}");
+        assert!(p.len() < 8000, "{}", p.len());
+        // What the model then writes reads as a decision.
+        let reply = "```fix_location.json\n{\"fix_location\": \"code\", \"cause\": \"Adds the setting.\", \"evidence\": {\"basis\": \"feature\"}, \"outside_change\": null, \"questions\": []}\n```";
+        let d = parse_for(reply, TicketIntent::Feature).unwrap();
+        assert_eq!(route(Some(&d)), Route::Code);
+    }
+
+    #[test]
+    fn a_question_to_a_person_is_never_an_open_where_does_it_belong() {
+        use common::run_questions::too_open;
+        // No decision questions, a plan with files: the question names them.
+        let d = FixDecision {
+            fix_location: FixLocation::Unknown,
+            intent: TicketIntent::Bug,
+            cause: "Not sure yet.".into(),
+            questions: vec!["Where does the fix belong: which system or part of it?".into()],
+            ..Default::default()
+        };
+        let qs = person_questions(&d, &[], FEATURE_TASKS);
+        assert_eq!(qs.len(), 1);
+        assert!(
+            qs[0]
+                .question
+                .starts_with("I plan to change studio/schemas/blocks/hero.ts"),
+            "{}",
+            qs[0].question
+        );
+        assert!(qs[0].suggestions.len() >= 2);
+        for q in &qs {
+            assert_eq!(too_open(q), None, "{}", q.question);
+        }
+        // Nothing concrete at all: nothing is asked.
+        assert!(person_questions(&FixDecision::default(), &[], "").is_empty());
+    }
+
+    #[test]
+    fn a_real_bug_outside_the_code_still_asks_with_a_concrete_next_step() {
+        let mut d = parse(fixture::PLANNER_REPLY).unwrap();
+        d.intent = TicketIntent::Bug;
+        d.questions.clear();
+        assert_eq!(route(Some(&d)), Route::OutsideOnly);
+        // Unsure, with the one step a person takes: the question is that step.
+        d.fix_location = FixLocation::Unknown;
+        d.next_step = Some(NextStep {
+            action: "run the full rebuild of the search index".into(),
+            why_person: "no access to the indexer".into(),
+            outcomes: vec![
+                Outcome {
+                    if_: "the item appears".into(),
+                    means: "the incremental sync skipped it".into(),
+                },
+                Outcome {
+                    if_: "it still doesn't".into(),
+                    means: "the inclusion rule drops it".into(),
+                },
+            ],
+        });
+        assert_eq!(route(Some(&d)), Route::Ask);
+        let qs = person_questions(&d, &[], "NO_CODE_CHANGE: unsure");
+        assert_eq!(
+            qs[0].question,
+            "Can you run the full rebuild of the search index and tell me what you see?"
+        );
+        assert_eq!(
+            qs[0].suggestions,
+            vec![
+                "the item appears".to_string(),
+                "it still doesn't".to_string()
+            ]
+        );
+        // Without a next step, the outside change it found is offered.
+        d.next_step = None;
+        let qs = person_questions(&d, &[], "NO_CODE_CHANGE: unsure");
+        assert!(
+            qs[0]
+                .question
+                .starts_with("I think the fix is this change in the booking system"),
+            "{}",
+            qs[0].question
+        );
+        assert_eq!(common::run_questions::too_open(&qs[0]), None);
     }
 }

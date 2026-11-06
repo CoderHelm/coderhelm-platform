@@ -2942,6 +2942,7 @@ async fn fix_context(
         resume_from: None,
         retry_of_run: false,
         model_retries: 0,
+        ticket_type: None,
         ticket_update_note: None,
         ticket_history_note: None,
         plan_cache_key: None,

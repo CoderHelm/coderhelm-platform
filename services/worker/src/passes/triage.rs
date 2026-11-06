@@ -43,7 +43,9 @@ impl TicketIntent {
     /// unreadable answer keeps the root-cause flow.
     pub fn parse(s: &str) -> TicketIntent {
         match s.trim().to_ascii_lowercase().as_str() {
-            "feature" => TicketIntent::Feature,
+            "feature" | "new_feature" | "new feature" | "enhancement" | "improvement" | "story" => {
+                TicketIntent::Feature
+            }
             "chore" => TicketIntent::Chore,
             "question" => TicketIntent::Question,
             _ => TicketIntent::Bug,
@@ -146,8 +148,8 @@ Return a JSON object with these fields:
 - "clarity": "clear" if you have enough info to implement, "needs_clarification" if not
 - "questions": list of specific questions if clarity is "needs_clarification" (empty list if clear)
 - "intent": what the ticket asks for, read from its meaning (not its wording or its labels):
-  - "bug": something that works, or should work, is wrong, missing or failing for its users
-  - "feature": something new to build, create or add (a new user, resource, endpoint, page, job, integration or setting), including setup work that never existed before
+  - "bug": something that already exists behaves wrongly or fails (an error, a crash, a wrong value, a regression, data that should show and doesn't)
+  - "feature": something new to build, create or add (a new user, resource, endpoint, page, field, option, setting, job, integration or capability), including setup work that never existed before. A ticket that asks to add a setting, option, field, page or capability is a feature even when it is phrased as a complaint ("editors can't choose X", "users have no way to Y")
   - "chore": upkeep with no new behaviour (a dependency bump, a config value, a cleanup, a rename)
   - "question": asks for information or an investigation, not a change
 
@@ -228,8 +230,248 @@ Rules:
             common::truncate_str(raw, 200)
         )
     })?;
+    let mut result = result;
+    let read = result.intent;
+    result.intent = settle_intent(read, &msg.title, &msg.body, msg.ticket_type.as_deref());
+    if result.intent != read {
+        info!(
+            model = read.as_str(),
+            settled = result.intent.as_str(),
+            ticket_type = msg.ticket_type.as_deref().unwrap_or(""),
+            "Triage intent settled from the ticket's type and wording"
+        );
+    }
     info!(complexity = %result.complexity, clarity = %result.clarity, intent = result.intent.as_str(), "Triage complete");
     Ok(result)
+}
+
+/// What the tracker's own type for a ticket says, when it says something.
+fn intent_of_type(ticket_type: &str) -> Option<TicketIntent> {
+    let t = ticket_type.trim().to_ascii_lowercase();
+    let t = t
+        .trim_start_matches("type:")
+        .trim_start_matches("kind/")
+        .trim();
+    match t {
+        "story" | "user story" | "feature" | "new feature" | "feature request" | "enhancement"
+        | "improvement" | "epic" => Some(TicketIntent::Feature),
+        "bug" | "defect" | "regression" | "incident" | "problem" => Some(TicketIntent::Bug),
+        "chore" | "maintenance" | "tech debt" | "technical debt" => Some(TicketIntent::Chore),
+        "question" | "spike" | "research" => Some(TicketIntent::Question),
+        _ => None,
+    }
+}
+
+/// Verbs that ask for something to be built.
+const NEW_WORK_VERBS: &[&str] = &[
+    "add",
+    "adds",
+    "adding",
+    "create",
+    "introduce",
+    "implement",
+    "build",
+    "support",
+    "enable",
+    "allow",
+    "let",
+    "expose",
+    "new",
+];
+
+/// Things a ticket asks to have built.
+const NEW_WORK_NOUNS: &[&str] = &[
+    "setting",
+    "settings",
+    "option",
+    "options",
+    "field",
+    "fields",
+    "page",
+    "pages",
+    "capability",
+    "ability",
+    "toggle",
+    "control",
+    "dropdown",
+    "selector",
+    "picker",
+    "filter",
+    "column",
+    "endpoint",
+    "button",
+    "tab",
+    "section",
+    "variant",
+    "mode",
+    "preference",
+    "config",
+    "configuration",
+    "integration",
+    "report",
+    "view",
+    "menu",
+    "screen",
+    "block",
+    "component",
+    "widget",
+    "flag",
+    "size",
+    "style",
+];
+
+/// Words that describe something broken rather than missing.
+const DEFECT_WORDS: &[&str] = &[
+    "crash",
+    "crashes",
+    "crashing",
+    "error",
+    "errors",
+    "broken",
+    "breaks",
+    "bug",
+    "regression",
+    "regressed",
+    "fails",
+    "failing",
+    "failed",
+    "failure",
+    "exception",
+    "incorrect",
+    "wrong",
+    "500",
+    "404",
+    "timeout",
+    "hangs",
+    "stopped",
+    "anymore",
+    "longer",
+    "duplicate",
+    "duplicated",
+];
+
+fn lower_words(text: &str) -> Vec<String> {
+    text.to_ascii_lowercase()
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .filter(|w| !w.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// Whether a line asks for something new: a new-work verb with a thing to
+/// build after it, and nothing that says an existing thing is broken.
+fn line_asks_for_new_work(line: &str) -> bool {
+    let words = lower_words(line);
+    if words.iter().any(|w| DEFECT_WORDS.contains(&w.as_str())) {
+        return false;
+    }
+    // "Allow admins to ...", "let editors ...", "enable users to ...": a
+    // request for a capability on its own.
+    if words
+        .first()
+        .is_some_and(|w| matches!(w.as_str(), "allow" | "let" | "enable"))
+        && words.len() >= 3
+    {
+        return true;
+    }
+    words.iter().enumerate().any(|(i, w)| {
+        NEW_WORK_VERBS.contains(&w.as_str())
+            && words
+                .iter()
+                .skip(i + 1)
+                .take(8)
+                .any(|n| NEW_WORK_NOUNS.contains(&n.as_str()))
+    })
+}
+
+/// The ticket's acceptance criteria lines, when it has a section for them.
+fn acceptance_lines(body: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let mut inside = false;
+    for line in body.lines() {
+        let low = line.trim().to_ascii_lowercase();
+        let heading = low.starts_with('#') || low.ends_with(':') || low.starts_with("**");
+        if low.contains("acceptance criteria") || low.contains("definition of done") {
+            inside = true;
+            continue;
+        }
+        if inside && heading && !low.starts_with("- ") && !low.starts_with("* ") {
+            if low
+                .trim_matches(|c: char| !c.is_ascii_alphanumeric())
+                .is_empty()
+            {
+                continue;
+            }
+            inside = false;
+        }
+        if inside && !low.is_empty() {
+            out.push(line.trim());
+        }
+    }
+    out
+}
+
+/// Whether the ticket's own words ask for new work: the title (the part a
+/// person reads first, often "<complaint>: <what to add>") or its acceptance
+/// criteria ("editors can choose ...", "a new X setting").
+pub fn asks_for_new_work(title: &str, body: &str) -> bool {
+    let title_defect = lower_words(title)
+        .iter()
+        .any(|w| DEFECT_WORDS.contains(&w.as_str()));
+    // A title that says something is broken is a bug, whatever it asks
+    // to add to fix it.
+    if title_defect {
+        return false;
+    }
+    if title
+        .split([':', '-', '\u{2013}', '\u{2014}', '(', ')', ';'])
+        .any(line_asks_for_new_work)
+    {
+        return true;
+    }
+    let criteria = acceptance_lines(body);
+    let new_work = criteria
+        .iter()
+        .filter(|l| {
+            line_asks_for_new_work(l) || {
+                let w = lower_words(l);
+                let can = w.windows(2).any(|p| {
+                    p[0] == "can"
+                        && matches!(
+                            p[1].as_str(),
+                            "choose" | "select" | "set" | "pick" | "configure" | "toggle"
+                        )
+                });
+                can && !w.iter().any(|x| DEFECT_WORDS.contains(&x.as_str()))
+            }
+        })
+        .count();
+    new_work > 0 && new_work * 2 >= criteria.len()
+}
+
+/// The ticket's intent, from the model's read and the structured inputs the
+/// ticket has: the tracker's own type, then the title's verbs and the
+/// acceptance criteria. A ticket that asks to add a setting, option, field,
+/// page or capability is new work even when it reads as a complaint; a
+/// question or a chore the model named stays what it is.
+pub fn settle_intent(
+    model: TicketIntent,
+    title: &str,
+    body: &str,
+    ticket_type: Option<&str>,
+) -> TicketIntent {
+    let typed = ticket_type.and_then(intent_of_type);
+    match (model, typed) {
+        // The model read new work but the tracker says bug: the person
+        // filing it called it broken, and the text has to show otherwise.
+        (TicketIntent::Feature, Some(TicketIntent::Bug)) if !asks_for_new_work(title, body) => {
+            TicketIntent::Bug
+        }
+        (TicketIntent::Bug, Some(TicketIntent::Feature)) => TicketIntent::Feature,
+        (TicketIntent::Bug, Some(TicketIntent::Bug)) => TicketIntent::Bug,
+        (TicketIntent::Bug, _) if asks_for_new_work(title, body) => TicketIntent::Feature,
+        (m, _) => m,
+    }
 }
 
 /// No-op tool executor for passes that don't need tools.
@@ -801,7 +1043,98 @@ mod tests {
 
 #[cfg(test)]
 mod intent_tests {
-    use super::{TicketIntent, TriageResult};
+    use super::{asks_for_new_work, settle_intent, TicketIntent, TriageResult};
+
+    #[test]
+    fn a_setting_asked_for_as_a_complaint_is_new_work() {
+        // The live case: a complaint, then what to add, with a Story type
+        // or with none at all.
+        let title = "Editors can't choose a block's title size: add a Title Size setting \
+                     (Section / Page) to the venue page blocks";
+        let body = "Part 4 of 4.\n\nAcceptance criteria:\n- Editors can choose Section or Page \
+                    for each block's title\n- The site renders the chosen size";
+        assert!(asks_for_new_work(title, body));
+        for t in [None, Some("Story"), Some("Task")] {
+            assert_eq!(
+                settle_intent(TicketIntent::Bug, title, body, t),
+                TicketIntent::Feature,
+                "{t:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn varied_new_work_phrasings_are_features() {
+        for (title, body) in [
+            ("Allow admins to set a default timezone", ""),
+            ("Support a dark mode option in settings", ""),
+            ("Create a new page for venue events", ""),
+            ("Add an export button to the reports view", ""),
+            ("Users have no way to filter orders by date: add a date filter", ""),
+            (
+                "Users can't export reports to CSV",
+                "## Acceptance criteria\n- Users can select CSV in the export menu\n- The file downloads",
+            ),
+        ] {
+            assert_eq!(
+                settle_intent(TicketIntent::Bug, title, body, None),
+                TicketIntent::Feature,
+                "{title}"
+            );
+        }
+    }
+
+    #[test]
+    fn real_bugs_stay_bugs() {
+        for (title, body, t) in [
+            ("Add a null check so checkout stops crashing", "", None),
+            ("Login button doesn't work on Safari", "", None),
+            ("Price field shows the wrong currency", "", None),
+            ("Venue hours are missing on the venue page", "", None),
+            (
+                "The new settings page throws an error on save",
+                "## Acceptance criteria\n- Saving works without an error",
+                None,
+            ),
+            ("Header overlaps the menu on mobile", "", Some("Bug")),
+            ("Search fails: add a missing index field", "", None),
+        ] {
+            assert_eq!(
+                settle_intent(TicketIntent::Bug, title, body, t),
+                TicketIntent::Bug,
+                "{title}"
+            );
+        }
+        // A tracker that calls it a bug wins over a model that read new
+        // work, unless the text plainly asks for something new.
+        assert_eq!(
+            settle_intent(
+                TicketIntent::Feature,
+                "Totals are off by one",
+                "",
+                Some("Bug")
+            ),
+            TicketIntent::Bug
+        );
+        assert_eq!(
+            settle_intent(
+                TicketIntent::Feature,
+                "Add a page size option to the table",
+                "",
+                Some("Bug")
+            ),
+            TicketIntent::Feature
+        );
+        // Chores and questions stay what the model read.
+        assert_eq!(
+            settle_intent(TicketIntent::Chore, "Bump the SDK", "", Some("Story")),
+            TicketIntent::Chore
+        );
+        assert_eq!(
+            settle_intent(TicketIntent::Bug, "Totals are off", "", Some("Story")),
+            TicketIntent::Feature
+        );
+    }
 
     #[test]
     fn the_models_intent_is_read_and_anything_else_is_a_bug() {
@@ -818,7 +1151,8 @@ mod intent_tests {
         assert_eq!(old.intent, TicketIntent::Bug);
         assert_eq!(TicketIntent::parse("chore"), TicketIntent::Chore);
         assert_eq!(TicketIntent::parse("question"), TicketIntent::Question);
-        assert_eq!(TicketIntent::parse("enhancement"), TicketIntent::Bug);
+        assert_eq!(TicketIntent::parse("enhancement"), TicketIntent::Feature);
+        assert_eq!(TicketIntent::parse("something else"), TicketIntent::Bug);
         assert!(!TicketIntent::Feature.is_bug());
         let json = serde_json::to_string(&r).unwrap();
         assert!(json.contains("\"intent\":\"feature\""), "{json}");

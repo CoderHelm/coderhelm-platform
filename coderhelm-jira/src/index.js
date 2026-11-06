@@ -93,7 +93,7 @@ exports.handler = async (event, context) => {
     let fields = {};
     if (issue.id) {
       try {
-        const res = await api.asApp().requestJira(route`/rest/api/3/issue/${issue.id}?fields=summary,description,labels,assignee,reporter,creator,project,attachment`);
+        const res = await api.asApp().requestJira(route`/rest/api/3/issue/${issue.id}?fields=summary,description,labels,assignee,reporter,creator,project,attachment,issuetype`);
         if (res.ok) {
           const full = await res.json();
           fields = full.fields || {};
@@ -128,6 +128,7 @@ exports.handler = async (event, context) => {
           reporter: fields.reporter,
           creator: fields.creator,
           project: fields.project,
+          issuetype: fields.issuetype ? { name: fields.issuetype.name } : undefined,
         },
       },
       comment: {
@@ -158,7 +159,7 @@ exports.handler = async (event, context) => {
   let fields = {};
   if (issue.id) {
     try {
-      const res = await api.asApp().requestJira(route`/rest/api/3/issue/${issue.id}?fields=summary,description,labels,assignee,reporter,creator,project,attachment`);
+      const res = await api.asApp().requestJira(route`/rest/api/3/issue/${issue.id}?fields=summary,description,labels,assignee,reporter,creator,project,attachment,issuetype`);
       if (res.ok) {
         const full = await res.json();
         fields = full.fields || {};
@@ -201,6 +202,7 @@ exports.handler = async (event, context) => {
         reporter: fields.reporter,
         creator: fields.creator,
         project: fields.project,
+        issuetype: fields.issuetype ? { name: fields.issuetype.name } : undefined,
       },
     },
     image_attachments: imageAttachments,
