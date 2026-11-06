@@ -849,6 +849,7 @@ async fn own_pr_failures(
             url = run.url,
         );
         let fb = FeedbackMessage {
+            github_wait: Default::default(),
             team_id: msg.team_id.clone(),
             installation_id: msg.installation_id,
             run_id,
@@ -1610,6 +1611,7 @@ async fn start_fix_ticket(
         runs = BURN_IN_RUNS,
     );
     let ticket = TicketMessage {
+        github_wait: Default::default(),
         team_id: msg.team_id.clone(),
         installation_id: msg.installation_id,
         source: TicketSource::Alert,
@@ -1862,6 +1864,7 @@ pub async fn act(state: &WorkerState, a: TestAction) -> Result<(), Err> {
                 base = if rec.evidence.iter().any(|e| e.kind == "bug_ticket") { " and fails on the code from before the bug fix" } else { "" },
             );
             let ticket = TicketMessage {
+                github_wait: Default::default(),
                 team_id: a.team_id.clone(),
                 installation_id,
                 source: TicketSource::Alert,

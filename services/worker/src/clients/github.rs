@@ -216,6 +216,168 @@ pub fn rate_limited(e: &(dyn std::error::Error + Send + Sync + 'static)) -> Opti
     .then_some(60)
 }
 
+/// GitHub can't be used for a while (`common::github_wait`): the pass stops
+/// here and the run waits until `until`, then goes on by itself. Never a
+/// failure of the work, and never the coder's.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GitHubPaused {
+    pub cause: common::github_wait::Cause,
+    /// When the run may go on (epoch seconds).
+    pub until: u64,
+}
+
+impl GitHubPaused {
+    /// A wait of `wait_secs` from now.
+    pub fn after(cause: common::github_wait::Cause, wait_secs: u64) -> Self {
+        Self {
+            cause,
+            until: common::github_wait::until(GitHubClient::now_epoch(), wait_secs),
+        }
+    }
+}
+
+impl std::fmt::Display for GitHubPaused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&common::github_wait::waiting_text(self.cause, self.until))
+    }
+}
+
+impl std::error::Error for GitHubPaused {}
+
+/// Seconds a moment of GitHub failing (a 5xx, no answer) waits before the
+/// run tries again.
+pub const OUTAGE_WAIT_SECS: u64 = 60;
+
+/// Whether a request to `url` went to GitHub's API.
+fn is_github_url(url: &str) -> bool {
+    url.starts_with(API_BASE) || url.contains("://api.github.com/")
+}
+
+/// Whether this error is GitHub refusing for a while, and how long to wait:
+/// its rate limit (primary or secondary), a 5xx from its API, or its API not
+/// answering (timeout, refused or reset connection). Anything else (a 404, a
+/// 422, a 403 for a permission) is a real answer and None. Walks the error's
+/// sources, and reads the status line of errors that lost their type.
+pub fn outside_wait(
+    e: &(dyn std::error::Error + 'static),
+) -> Option<(common::github_wait::Cause, u64)> {
+    use common::github_wait::Cause;
+    let mut cur: Option<&(dyn std::error::Error + 'static)> = Some(e);
+    while let Some(err) = cur {
+        if let Some(p) = err.downcast_ref::<GitHubPaused>() {
+            let left = p.until.saturating_sub(GitHubClient::now_epoch());
+            return Some((p.cause, left.max(1)));
+        }
+        if let Some(r) = err.downcast_ref::<RateLimited>() {
+            return Some((Cause::RateLimit, r.wait_secs));
+        }
+        if let Some(r) = err.downcast_ref::<reqwest::Error>() {
+            let github = r.url().is_some_and(|u| is_github_url(u.as_str()));
+            let transient = r.is_timeout() || r.is_connect() || r.is_request() || r.is_body();
+            if github && transient {
+                return Some((Cause::Outage, OUTAGE_WAIT_SECS));
+            }
+            if github && r.status().is_some_and(|s| s.is_server_error()) {
+                return Some((Cause::Outage, OUTAGE_WAIT_SECS));
+            }
+        }
+        cur = err.source();
+    }
+    let m = e.to_string();
+    if m.contains("(429 Too Many Requests)")
+        || (m.contains("(403 Forbidden)") && m.to_ascii_lowercase().contains("rate limit"))
+    {
+        return Some((Cause::RateLimit, 60));
+    }
+    outage_in_text(&m).then_some((Cause::Outage, OUTAGE_WAIT_SECS))
+}
+
+/// A 5xx from GitHub's API, as `status_error_message` writes it.
+fn outage_in_text(m: &str) -> bool {
+    m.contains("HTTP status server error (5") && m.contains("api.github.com")
+}
+
+/// Until when each installation's GitHub is known to refuse requests (epoch
+/// seconds), and why, in this process: its rate limit (every request made
+/// while it holds fails), or a 5xx or no answer a moment ago. A decision
+/// that reads GitHub's failures as answers ("no file on the branch") checks
+/// this first and waits instead.
+static LIMITED: std::sync::LazyLock<Mutex<HashMap<u64, (u64, common::github_wait::Cause)>>> =
+    std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Until when a response says the installation is limited: a 429, or a 403
+/// with no requests left (until the reset) or a `retry-after`.
+fn limited_until_from(
+    status: u16,
+    retry_after: Option<&str>,
+    remaining: Option<&str>,
+    reset: Option<&str>,
+    now: u64,
+) -> Option<u64> {
+    let spent = remaining.map(str::trim) == Some("0");
+    let after = retry_after.and_then(|s| s.trim().parse::<u64>().ok());
+    let limited = status == 429 || (status == 403 && (spent || after.is_some()));
+    if !limited {
+        return None;
+    }
+    let until_reset = reset
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .filter(|_| spent);
+    Some(after.map(|a| now + a).or(until_reset).unwrap_or(now + 60))
+}
+
+fn note_limited(installation_id: u64, headers: &reqwest::header::HeaderMap, status: u16) {
+    let h = |name: &str| headers.get(name).and_then(|v| v.to_str().ok());
+    let now = GitHubClient::now_epoch();
+    if let Some(until) = limited_until_from(
+        status,
+        h("retry-after"),
+        h("x-ratelimit-remaining"),
+        h("x-ratelimit-reset"),
+        now,
+    ) {
+        mark_limited(installation_id, until);
+    } else if (500..=599).contains(&status) {
+        mark_outside(
+            installation_id,
+            common::github_wait::Cause::Outage,
+            now + OUTAGE_WAIT_SECS,
+        );
+    }
+}
+
+/// Records that the installation is rate limited until `until` (epoch
+/// seconds).
+pub fn mark_limited(installation_id: u64, until: u64) {
+    mark_outside(
+        installation_id,
+        common::github_wait::Cause::RateLimit,
+        until,
+    );
+}
+
+/// Records that GitHub refuses the installation's requests until `until`.
+/// A rate limit is never shortened by a later, shorter outage.
+pub fn mark_outside(installation_id: u64, cause: common::github_wait::Cause, until: u64) {
+    if let Ok(mut m) = LIMITED.lock() {
+        let now = GitHubClient::now_epoch();
+        let e = m
+            .entry(installation_id)
+            .or_insert((0, common::github_wait::Cause::Outage));
+        if e.0 <= now || until > e.0 {
+            *e = (until, cause);
+        }
+    }
+}
+
+/// Why GitHub refuses the installation's requests right now and for how
+/// many more seconds, when it does.
+pub fn outside_for(installation_id: u64) -> Option<(common::github_wait::Cause, u64)> {
+    let (until, cause) = *LIMITED.lock().ok()?.get(&installation_id)?;
+    let now = GitHubClient::now_epoch();
+    (until > now).then(|| (cause, until - now))
+}
+
 fn status_error_message(status: reqwest::StatusCode, url: &str, body: &str) -> String {
     let kind = if status.is_client_error() {
         "client"
@@ -581,9 +743,29 @@ impl GitHubClient {
         &self,
         req: reqwest::RequestBuilder,
     ) -> Result<reqwest::Response, reqwest::Error> {
-        let resp = req.send().await?;
+        let resp = match req.send().await {
+            Ok(r) => r,
+            Err(e) => {
+                // GitHub not answering at all is a moment it can't be used.
+                if e.is_timeout() || e.is_connect() {
+                    mark_outside(
+                        self.installation_id,
+                        common::github_wait::Cause::Outage,
+                        Self::now_epoch() + OUTAGE_WAIT_SECS,
+                    );
+                }
+                return Err(e);
+            }
+        };
         observe_budget(self.installation_id, resp.headers());
+        note_limited(self.installation_id, resp.headers(), resp.status().as_u16());
         Ok(resp)
+    }
+
+    /// GitHub refusing this installation's requests right now: why, and until
+    /// when the run waits (see [`outside_for`]).
+    pub fn outside(&self) -> Option<GitHubPaused> {
+        outside_for(self.installation_id).map(|(cause, secs)| GitHubPaused::after(cause, secs))
     }
 
     /// How long background reads should wait for the installation's budget
@@ -4687,6 +4869,86 @@ mod status_error_tests {
         assert!(m.contains("422"));
         assert!(m.contains("client error"));
         assert!(m.contains("Line could not be resolved"));
+    }
+
+    /// The incident: every write came back "403 ... API rate limit
+    /// exceeded". That is GitHub's limit, a wait until its reset; a 5xx is a
+    /// short wait; a real refusal (permission, unprocessable) is not a wait.
+    #[test]
+    fn github_refusing_for_a_while_is_told_apart_from_a_real_answer() {
+        use common::github_wait::Cause;
+        let limited: Box<dyn std::error::Error + Send + Sync> = Box::new(RateLimited {
+            wait_secs: 1_700,
+            message: "HTTP status client error (403 Forbidden) for url \
+                      (https://api.github.com/repos/o/r/git/trees): API rate limit exceeded"
+                .into(),
+        });
+        assert_eq!(outside_wait(&*limited), Some((Cause::RateLimit, 1_700)));
+        // The same, after something turned it into text.
+        let text: Box<dyn std::error::Error + Send + Sync> = limited.to_string().into();
+        assert_eq!(outside_wait(&*text).map(|w| w.0), Some(Cause::RateLimit));
+        let bad_gateway: Box<dyn std::error::Error + Send + Sync> = status_error_message(
+            reqwest::StatusCode::BAD_GATEWAY,
+            "https://api.github.com/repos/o/r/compare/main...x",
+            "",
+        )
+        .into();
+        assert_eq!(
+            outside_wait(&*bad_gateway),
+            Some((Cause::Outage, OUTAGE_WAIT_SECS))
+        );
+        for real in [
+            status_error_message(
+                reqwest::StatusCode::FORBIDDEN,
+                "https://api.github.com/repos/o/r/contents/a",
+                "Resource not accessible by integration",
+            ),
+            status_error_message(
+                reqwest::StatusCode::UNPROCESSABLE_ENTITY,
+                "https://api.github.com/repos/o/r/git/refs",
+                "Reference update failed",
+            ),
+            "Missing path".to_string(),
+        ] {
+            let e: Box<dyn std::error::Error + Send + Sync> = real.clone().into();
+            assert_eq!(outside_wait(&*e), None, "{real}");
+        }
+        // A paused pass's error says when it goes on, plainly.
+        let paused: Box<dyn std::error::Error + Send + Sync> =
+            Box::new(GitHubPaused::after(Cause::RateLimit, 600));
+        let (cause, left) = outside_wait(&*paused).unwrap();
+        assert_eq!(cause, Cause::RateLimit);
+        assert!((600..=606).contains(&left), "{left}");
+        assert!(paused
+            .to_string()
+            .starts_with("Waiting for GitHub's hourly limit to reset at "));
+    }
+
+    #[test]
+    fn a_limited_installation_is_known_until_its_reset() {
+        let now = 10_000;
+        assert_eq!(
+            limited_until_from(403, None, Some("0"), Some("12000"), now),
+            Some(12_000)
+        );
+        assert_eq!(
+            limited_until_from(403, Some("90"), Some("40"), None, now),
+            Some(10_090),
+            "a secondary limit"
+        );
+        assert_eq!(limited_until_from(429, None, None, None, now), Some(10_060));
+        assert_eq!(limited_until_from(403, None, Some("12"), None, now), None);
+        assert_eq!(
+            limited_until_from(200, None, Some("0"), Some("12000"), now),
+            None
+        );
+        let inst = 555_000_111;
+        assert_eq!(outside_for(inst), None);
+        mark_limited(inst, GitHubClient::now_epoch() + 300);
+        assert!(outside_for(inst)
+            .is_some_and(|(c, s)| c == common::github_wait::Cause::RateLimit && s <= 300));
+        mark_limited(inst + 1, GitHubClient::now_epoch().saturating_sub(5));
+        assert_eq!(outside_for(inst + 1), None, "a reset in the past is over");
     }
 
     #[test]

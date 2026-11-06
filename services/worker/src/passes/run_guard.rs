@@ -485,6 +485,39 @@ pub async fn on_pass(state: &WorkerState, team_id: &str, run_id: &str) -> Result
     }
 }
 
+/// The pass each run goes on with after a wait for GitHub, in this process:
+/// entering it again is not a pass transition (`common::github_wait`).
+static REENTRY: std::sync::LazyLock<Mutex<std::collections::HashMap<String, String>>> =
+    std::sync::LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
+
+/// The run goes on with `pass` after a wait for GitHub: its next entry into
+/// that pass is not counted as a new pass.
+pub fn forgive_reentry(run_id: &str, pass: &str) {
+    if let Ok(mut m) = REENTRY.lock() {
+        m.insert(run_id.to_string(), pass.to_string());
+    }
+}
+
+/// Whether entering `pass` now is the run going on after a wait for GitHub
+/// (once: the entry after it counts as usual).
+pub fn take_reentry(run_id: &str, pass: &str) -> bool {
+    let Ok(mut m) = REENTRY.lock() else {
+        return false;
+    };
+    match m.get(run_id) {
+        Some(p) if p == pass => {
+            m.remove(run_id);
+            true
+        }
+        Some(_) => {
+            // The run went on elsewhere: whatever it enters counts.
+            m.remove(run_id);
+            false
+        }
+        None => false,
+    }
+}
+
 /// A step is about to hand off (from `try_auto_continue`, so every
 /// continuation). `Some(reason)` when the next step must not start.
 pub async fn on_continuation(state: &WorkerState, team_id: &str, run_id: &str) -> Option<String> {

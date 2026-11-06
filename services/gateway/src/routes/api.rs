@@ -1091,6 +1091,13 @@ pub struct Run {
     /// answered in time.
     #[schema(example = json!(null))]
     pub policy_note: Option<String>,
+    /// While the run waits for GitHub (its hourly limit, or a moment GitHub
+    /// failed to answer): when it goes on, in plain words. The run continues
+    /// by itself; nothing is needed from anyone.
+    #[schema(
+        example = "Waiting for GitHub's hourly limit to reset at 21:05 UTC; continues by itself"
+    )]
+    pub github_wait: Option<String>,
     /// The approval card that timed out, when one did.
     #[schema(example = json!(null))]
     pub policy_approval: Option<String>,
@@ -1638,6 +1645,7 @@ fn run_of(
         duration_s: num("duration_s"),
         error: st("error_message"),
         policy_note: st("policy_note"),
+        github_wait: st("github_wait"),
         policy_approval: st("policy_approval").filter(|s| !s.is_empty()),
         sign_in_prompts: item
             .get("sign_in_prompts")

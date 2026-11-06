@@ -130,6 +130,9 @@ pub struct ImplementResult {
     pub conversation_log: Vec<serde_json::Value>,
     /// What the pass could read, looked up, and wrote as its evidence.
     pub evidence: super::proof::RunEvidence,
+    /// The writes GitHub refused or rejected: a pass that wrote no file
+    /// because GitHub refused it did write (see `run_end`).
+    pub writes: super::run_end::Writes,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -699,6 +702,7 @@ pub async fn run(
             branch: branch.to_string(),
             base_branch: msg.base_branch.clone(),
             files_modified: std::sync::Mutex::new(HashSet::new()),
+            writes: Default::default(),
             task_tracker: &task_tracker,
             file_cache,
             state,
@@ -936,6 +940,10 @@ pub async fn run(
             )
             .await
             {
+                // GitHub refusing for a while ends the pass: the run waits.
+                if crate::clients::github::outside_wait(&*e).is_some() {
+                    return Err(e);
+                }
                 warn!(error = %e, "Test-remediation pass errored — proceeding with current state");
             }
             if let Some(s) = &skills {
@@ -1009,6 +1017,9 @@ pub async fn run(
         )
         .await
         {
+            if crate::clients::github::outside_wait(&*e).is_some() {
+                return Err(e);
+            }
             warn!(error = %e, "Migration-registration pass errored — proceeding with current state");
         }
         if let Some(s) = &skills {
@@ -1060,10 +1071,12 @@ pub async fn run(
         .unwrap()
         .clone();
     let ci_gates = super::checks::kinds_from(&ci);
+    let writes = std::mem::take(&mut *executor.write_executor.writes.lock().unwrap());
     Ok(ImplementResult {
         files_modified: files,
         timed_out,
         conversation_log: conv_log,
+        writes,
         evidence: super::proof::RunEvidence {
             sources,
             lookups,
@@ -1529,6 +1542,8 @@ struct WriteToolExecutor<'a> {
     branch: String,
     base_branch: String,
     files_modified: std::sync::Mutex<HashSet<String>>,
+    /// Write calls GitHub refused for a while or rejected (see `run_end`).
+    writes: std::sync::Mutex<super::run_end::Writes>,
     task_tracker: &'a TaskTracker,
     file_cache: &'a FileCache,
     /// Worker state + the code graph (shared with every agent that reads
@@ -1608,6 +1623,16 @@ impl<'a> ToolExecutor for WriteToolExecutor<'a> {
     ) -> Result<serde_json::Value, Box<dyn std::error::Error + Send + Sync>> {
         let out = self.execute_tool(name, input).await;
         if let Err(e) = &out {
+            if is_write_tool(name) {
+                let mut w = self.writes.lock().unwrap();
+                match crate::clients::github::outside_wait(&**e) {
+                    Some((cause, wait)) => {
+                        let p = crate::clients::github::GitHubPaused::after(cause, wait);
+                        w.refuse(p.cause, p.until);
+                    }
+                    None => w.reject(&tool_write_paths(input).join(", "), &e.to_string()),
+                }
+            }
             // A write refused as stale must leave NO stale copy behind: the
             // client already dropped its snapshot, and the pass cache goes too,
             // so the re-read the error asks for sees live content (it used to
@@ -1622,6 +1647,14 @@ impl<'a> ToolExecutor for WriteToolExecutor<'a> {
         }
         out
     }
+}
+
+/// The tools that write to the branch.
+fn is_write_tool(name: &str) -> bool {
+    matches!(
+        name,
+        "write_file" | "edit_file" | "batch_write" | "restore_file"
+    )
 }
 
 /// True for the write refusals that mean "your copy of the file is stale".

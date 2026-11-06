@@ -446,7 +446,7 @@ impl WorkerMessage {
             WorkerMessage::Ticket(t) => t
                 .continuation_run_id
                 .as_deref()
-                .filter(|r| !r.is_empty() && (t.continuation > 0 || t.model_retries > 0))
+                .filter(|r| !r.is_empty() && t.same_run())
                 .map(|r| (t.team_id.as_str(), r)),
             WorkerMessage::Feedback(m) => Some((m.team_id.as_str(), m.run_id.as_str())),
             WorkerMessage::Resume(m) => Some((m.team_id.as_str(), m.run_id.as_str())),
@@ -829,6 +829,11 @@ pub struct ReviewMessage {
     /// one SQS delay allows, so it is sent on in hops until this reaches 0.
     #[serde(default)]
     pub wait_secs: u64,
+    /// How many times this review waited for GitHub's rate limit to reset.
+    /// Those waits don't spend `attempt`: the limit is GitHub's, not a
+    /// failure of the review.
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub limit_waits: u32,
     /// Set when CoderHelm's own reply on the PR concluded something the
     /// standing formal verdict doesn't match; the review checks it.
     #[serde(default)]
@@ -906,6 +911,14 @@ pub struct ResumeMessage {
     /// Times this resume was sent again after a transient model error.
     #[serde(default)]
     pub model_retries: u32,
+    /// Set while this message waits for GitHub (its rate limit, or a moment
+    /// it failed to answer): sent on in hops until `until`, without spending
+    /// `model_retries` (see `github_wait`).
+    #[serde(
+        default,
+        skip_serializing_if = "crate::github_wait::GitHubWait::is_idle"
+    )]
+    pub github_wait: crate::github_wait::GitHubWait,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
@@ -960,6 +973,13 @@ pub struct TicketMessage {
     /// The run keeps its run_id across these, like a continuation.
     #[serde(default)]
     pub model_retries: u32,
+    /// Set while the run waits for GitHub (its rate limit, or a moment it
+    /// failed to answer): sent on in hops until `until`, then the run goes on
+    /// as itself (see `github_wait`). The run keeps its run_id, like a
+    /// continuation, and the wait adds no step. Boxed: most tickets never
+    /// wait, and every queued message carries the field.
+    #[serde(default, skip_serializing_if = "crate::github_wait::is_idle_boxed")]
+    pub github_wait: Box<crate::github_wait::GitHubWait>,
     /// What the tracker calls the ticket (a Jira issue type such as `Story`
     /// or `Bug`, a GitHub issue type or its `bug`/`enhancement` label), when
     /// it says. Triage weighs it with the ticket's text (see
@@ -1003,8 +1023,21 @@ pub struct TicketMessage {
     pub new_run_id: Option<String>,
 }
 
+fn is_zero_u32(n: &u32) -> bool {
+    *n == 0
+}
+
 fn default_branch() -> String {
     "main".to_string()
+}
+
+impl TicketMessage {
+    /// This message goes on with an existing run (`continuation_run_id`): a
+    /// continuation, a send after a transient model error, or after a wait
+    /// for GitHub.
+    pub fn same_run(&self) -> bool {
+        self.continuation > 0 || self.model_retries > 0 || self.github_wait.waits > 0
+    }
 }
 
 /// The issue type a Jira issue carries (`fields.issuetype.name`), when the
@@ -1080,6 +1113,7 @@ impl Default for TicketMessage {
             resume_from: None,
             retry_of_run: false,
             model_retries: 0,
+            github_wait: Default::default(),
             ticket_type: None,
             ticket_update_note: None,
             ticket_history_note: None,
@@ -1127,6 +1161,14 @@ pub struct FeedbackMessage {
     /// Times this feedback was sent again after a transient model error.
     #[serde(default)]
     pub model_retries: u32,
+    /// Set while this message waits for GitHub (its rate limit, or a moment
+    /// it failed to answer): sent on in hops until `until`, without spending
+    /// `model_retries` (see `github_wait`).
+    #[serde(
+        default,
+        skip_serializing_if = "crate::github_wait::GitHubWait::is_idle"
+    )]
+    pub github_wait: crate::github_wait::GitHubWait,
     /// Steps this feedback round already used: each step has its own time
     /// budget, and a round that runs out of it with work left continues in
     /// the next step (see `run_round`).

@@ -441,6 +441,7 @@ async fn start_fix(
     }
     let original = format!("{}/{}#{pr}", msg.repo_owner, msg.repo_name);
     let ticket = TicketMessage {
+        github_wait: Default::default(),
         team_id: msg.team_id.clone(),
         installation_id: msg.installation_id,
         source: TicketSource::Alert,

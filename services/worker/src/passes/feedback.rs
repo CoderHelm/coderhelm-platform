@@ -19,6 +19,14 @@ pub async fn run(
     let start = std::time::Instant::now();
     let mut usage = TokenUsage::default();
 
+    // Feedback waiting for GitHub is sent on in hops until its reset.
+    let now = chrono::Utc::now().timestamp().max(0) as u64;
+    if let Some(hop) = common::github_wait::hop(msg.github_wait.until, now) {
+        if send_feedback_message(state, &msg, hop).await {
+            return Ok(());
+        }
+    }
+
     // Load team's Anthropic API key (required), gated for this run.
     let provider = ModelProvider::load_for_team(
         &state.dynamo,
@@ -240,6 +248,7 @@ pub async fn run(
             if !branch.is_empty() && may_update {
                 // The run's ticket, so the merge commit carries its real key.
                 let ticket_msg = crate::models::TicketMessage {
+                    github_wait: Default::default(),
                     team_id: msg.team_id.clone(),
                     installation_id: msg.installation_id,
                     source: if ticket.2 > 0 {
@@ -1658,6 +1667,62 @@ Rules:
     Ok(())
 }
 
+/// Feedback GitHub refused for a while (its rate limit, a 5xx, no answer) is
+/// sent again once GitHub's reset passes, in hops, without spending a model
+/// retry (`common::github_wait`). False when the error isn't GitHub's or
+/// every wait is taken.
+pub(crate) async fn wait_for_github(
+    state: &WorkerState,
+    msg: &FeedbackMessage,
+    e: &(dyn std::error::Error + 'static),
+) -> bool {
+    let Some((cause, wait)) = crate::clients::github::outside_wait(e) else {
+        return false;
+    };
+    if msg.github_wait.waits >= common::github_wait::MAX_WAITS {
+        return false;
+    }
+    let now = chrono::Utc::now().timestamp().max(0) as u64;
+    let until = common::github_wait::until(now, wait);
+    let mut next = msg.clone();
+    next.github_wait = common::github_wait::GitHubWait {
+        until,
+        waits: msg.github_wait.waits + 1,
+        pass: String::new(),
+        cause,
+    };
+    let first =
+        common::github_wait::hop(until, now).unwrap_or(common::github_wait::RESET_SLACK_SECS + 1);
+    if !send_feedback_message(state, &next, first).await {
+        return false;
+    }
+    let text = common::github_wait::waiting_text(cause, until);
+    warn!(run_id = %msg.run_id, until, "github_wait: the feedback round waits for GitHub");
+    super::add_progress_note(state, &msg.team_id, &msg.run_id, &text).await;
+    true
+}
+
+/// Sends this feedback message, as it is, to the feedback queue after
+/// `delay` seconds (at most one SQS delay).
+async fn send_feedback_message(state: &WorkerState, msg: &FeedbackMessage, delay: u64) -> bool {
+    if state.config.feedback_queue_url.is_empty() {
+        return false;
+    }
+    let Ok(body) = serde_json::to_string(&WorkerMessage::Feedback(msg.clone())) else {
+        return false;
+    };
+    state
+        .sqs
+        .send_message()
+        .queue_url(&state.config.feedback_queue_url)
+        .message_body(body)
+        .delay_seconds(delay.min(common::github_wait::MAX_HOP_SECS) as i32)
+        .send()
+        .await
+        .map_err(|e| warn!(run_id = %msg.run_id, error = %e, "Could not send the feedback on"))
+        .is_ok()
+}
+
 /// Sends feedback again after a transient model error, per
 /// [`common::model_retry::requeue_delay`]. False once the policy is spent.
 pub(crate) async fn requeue_after_model_error(state: &WorkerState, msg: &FeedbackMessage) -> bool {
@@ -2890,6 +2955,7 @@ async fn handle_wrong_repo(
 
     // Send new ticket message to re-trigger in the correct repo
     let ticket_msg = WorkerMessage::Ticket(crate::models::TicketMessage {
+        github_wait: Default::default(),
         team_id: msg.team_id.clone(),
         installation_id: msg.installation_id,
         source,

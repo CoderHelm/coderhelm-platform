@@ -41,6 +41,7 @@ fn run_messages() -> Vec<(&'static str, WorkerMessage)> {
         ..Default::default()
     };
     let resume = ResumeMessage {
+        github_wait: Default::default(),
         team_id: TEAM.into(),
         run_id: RUN.into(),
         installation_id: 1,

@@ -360,6 +360,7 @@ impl Sim {
 
     fn job(&self, head: &str, dedup_key: &str) -> ReviewMessage {
         ReviewMessage {
+            limit_waits: 0,
             team_id: "T".into(),
             installation_id: 1,
             repo_owner: "acme".into(),
@@ -615,6 +616,9 @@ impl Sim {
                                     gave_up: false,
                                     updated_at: ts(sim.now),
                                 });
+                            }
+                            FailurePlan::WaitForLimit { .. } | FailurePlan::LimitOutlasted => {
+                                unreachable!("a service error never waits for GitHub's limit")
                             }
                             FailurePlan::GiveUp => {
                                 sim.failure = Some(FailureNote {

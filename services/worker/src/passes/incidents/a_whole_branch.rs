@@ -28,6 +28,8 @@ fn last_step_writes_nothing(gh: &FakeGitHub, coder_notes: &str, ticket: &str) ->
         &tasks,
         &run_end::coder_questions(coder_notes),
         run_end::ticket_names_files(ticket),
+        &run_end::Writes::default(),
+        None,
     ) {
         Empty::Carry(files) => {
             end.said(format!(
@@ -50,6 +52,7 @@ fn last_step_writes_nothing(gh: &FakeGitHub, coder_notes: &str, ticket: &str) ->
             end.said(format!("{OLD} for this issue."));
             end.status = common::run_status::NEEDS_INPUT.into();
         }
+        other => panic!("nothing was refused here: {other:?}"),
     }
     end
 }
