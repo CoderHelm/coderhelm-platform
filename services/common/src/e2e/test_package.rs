@@ -296,9 +296,33 @@ fn q(s: &str) -> Option<String> {
     ok.then(|| format!("'{s}'"))
 }
 
+/// Makes the package's manager available before anything calls it. npm
+/// comes with Node; pnpm and yarn come through corepack, which also uses
+/// the version a `packageManager` field pins in the nearest package.json
+/// (so a nested package gets its own); bun, or a Node without corepack
+/// (Node 25 dropped it), installs from the npm registry. Empty for npm.
+pub fn ensure_manager(m: Manager) -> &'static str {
+    match m {
+        Manager::Npm => "",
+        Manager::Pnpm => {
+            "(command -v pnpm >/dev/null 2>&1 || corepack enable pnpm >/dev/null 2>&1 || npm install -g pnpm >/dev/null 2>&1) && "
+        }
+        Manager::Yarn => {
+            "(command -v yarn >/dev/null 2>&1 || corepack enable yarn >/dev/null 2>&1 || npm install -g yarn >/dev/null 2>&1) && "
+        }
+        Manager::Bun => {
+            "(command -v bun >/dev/null 2>&1 || npm install -g bun >/dev/null 2>&1) && "
+        }
+    }
+}
+
 /// Installs the package's dependencies on their own, never the parent
-/// workspace's.
+/// workspace's, after making its manager available.
 pub fn install_cmd(p: &TestPackage) -> String {
+    format!("{}{}", ensure_manager(p.manager), install_only(p))
+}
+
+fn install_only(p: &TestPackage) -> String {
     let frozen = p.lockfile.is_some();
     match p.manager {
         Manager::Npm if frozen => "npm ci --no-audit --no-fund --workspaces=false".into(),
@@ -681,13 +705,18 @@ mod tests {
         };
         assert_eq!(
             install_cmd(&p),
-            "pnpm install --ignore-workspace --frozen-lockfile"
+            format!(
+                "{}pnpm install --ignore-workspace --frozen-lockfile",
+                ensure_manager(Manager::Pnpm)
+            )
         );
         p.manager = Manager::Yarn;
         assert!(install_cmd(&p).contains("--frozen-lockfile"));
         p.manager = Manager::Npm;
         p.lockfile = None;
         assert!(install_cmd(&p).contains("--workspaces=false"));
+        // npm ships with Node: nothing to set up first.
+        assert!(install_cmd(&p).starts_with("npm install"));
         assert_eq!(check_steps(&p).unwrap().len(), 1);
         p.dir = "bad dir; rm -rf /".into();
         assert!(check_steps(&p).is_none());

@@ -103,6 +103,26 @@ impl ToolingFailure {
     }
 }
 
+/// The tool a shell said it couldn't find (`bash: line 1: pnpm: command not
+/// found`, `sh: 1: yarn: not found`), so the failure names it.
+pub fn missing_command(line: &str) -> Option<String> {
+    let l = line.trim();
+    let lower = l.to_lowercase();
+    let head = if let Some(h) = lower.strip_suffix(": command not found") {
+        h
+    } else if lower.starts_with("sh:") || lower.starts_with("bash:") {
+        lower.strip_suffix(": not found")?
+    } else {
+        return None;
+    };
+    let tool = l.get(..head.len())?.rsplit(": ").next()?.trim();
+    let ok = !tool.is_empty()
+        && tool
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "-_./@".contains(c));
+    ok.then(|| tool.to_string())
+}
+
 fn one_line(s: &str) -> String {
     s.split_whitespace().collect::<Vec<_>>().join(" ")
 }
@@ -239,6 +259,15 @@ pub fn signature(output: &str) -> Option<String> {
             continue;
         }
         let lower = l.to_lowercase();
+        if let Some(tool) = missing_command(l) {
+            return Some(
+                crate::truncate_str(
+                    &format!("`{tool}` isn't installed in CoderHelm's sandbox ({l})"),
+                    MAX_ERROR_CHARS,
+                )
+                .to_string(),
+            );
+        }
         let hit = lower.contains("command not found")
             || (lower.starts_with("sh:") && lower.ends_with("not found"))
             || (lower.starts_with("sh:") && lower.contains("permission denied"))
@@ -473,14 +502,18 @@ pub fn repair_steps(p: &TestPackage, failed: &str) -> Vec<Step> {
         format!("cd {} && ", quote(&at))
     };
     let frozen = p.lockfile.is_some();
+    // The manager itself may be what's missing (`pnpm: command not found`):
+    // make it available first, in the package's folder so corepack uses the
+    // version that folder's package.json pins.
+    let ensure = test_package::ensure_manager(p.manager);
     let install = if frozen {
         format!(
-            "{cd}({} || {})",
+            "{cd}{ensure}({} || {})",
             install_line(p.manager, true, isolated),
             install_line(p.manager, false, isolated)
         )
     } else {
-        format!("{cd}{}", install_line(p.manager, false, isolated))
+        format!("{cd}{ensure}{}", install_line(p.manager, false, isolated))
     };
     let mut retry = with_manager(failed, p.manager);
     if command_dir(&retry).is_none() && p.dir != "." {
@@ -696,7 +729,7 @@ mod tests {
         assert_eq!(steps[0].kind, "install");
         assert_eq!(
             steps[0].cmd,
-            "cd 'e2e' && (pnpm install --ignore-workspace --frozen-lockfile || pnpm install --ignore-workspace)"
+            format!("cd 'e2e' && {}(pnpm install --ignore-workspace --frozen-lockfile || pnpm install --ignore-workspace)", test_package::ensure_manager(Manager::Pnpm))
         );
         assert_eq!(
             steps[1].cmd,
@@ -708,7 +741,7 @@ mod tests {
         let steps = repair_steps(&member, "npx --no-install eslint src/a.ts");
         assert_eq!(
             steps[0].cmd,
-            "(yarn install --ignore-engines --frozen-lockfile || yarn install --ignore-engines)"
+            format!("{}(yarn install --ignore-engines --frozen-lockfile || yarn install --ignore-engines)", test_package::ensure_manager(Manager::Yarn))
         );
         assert_eq!(steps[1].cmd, "cd 'apps/web' && yarn eslint src/a.ts");
 
@@ -736,7 +769,7 @@ mod tests {
         );
         assert_eq!(
             steps[0].cmd,
-            "cd 'e2e' && (pnpm install --ignore-workspace --frozen-lockfile || pnpm install --ignore-workspace)"
+            format!("cd 'e2e' && {}(pnpm install --ignore-workspace --frozen-lockfile || pnpm install --ignore-workspace)", test_package::ensure_manager(Manager::Pnpm))
         );
         assert_eq!(
             steps[1].cmd,
@@ -889,5 +922,50 @@ mod tests {
             "the check couldn't reach h1.example.com, h2.example.com, h3.example.com and 2 more"
         ));
         assert!(m.contains("To allow them"));
+    }
+
+    #[test]
+    fn a_missing_package_manager_is_named_and_installed_before_the_install() {
+        // The sandbox had no pnpm for a nested package with its own lockfile.
+        let line = "bash: line 1: pnpm: command not found";
+        assert_eq!(missing_command(line).as_deref(), Some("pnpm"));
+        assert_eq!(
+            missing_command("sh: 1: yarn: not found").as_deref(),
+            Some("yarn")
+        );
+        assert_eq!(missing_command("error TS2307: not found"), None);
+        let err = signature(&format!("installing\n{line}\n")).unwrap();
+        assert!(err.starts_with("`pnpm` isn't installed in CoderHelm's sandbox"));
+        assert!(err.contains(line));
+
+        // The repair makes pnpm available in the package's own folder (where
+        // corepack reads its pinned version), then installs, then retries.
+        let p = pkg("e2e", Manager::Pnpm, Some("e2e/pnpm-lock.yaml"));
+        let install = &repair_steps(&p, "cd 'e2e' && npx --no-install tsc")[0].cmd;
+        assert!(install.starts_with("cd 'e2e' && (command -v pnpm"));
+        assert!(install.contains("corepack enable pnpm"));
+        assert!(install.contains("npm install -g pnpm"));
+        let ensure_at = install.find("corepack").unwrap();
+        assert!(ensure_at < install.find("pnpm install --ignore-workspace").unwrap());
+
+        // The checks a package runs set it up the same way.
+        let steps = hardened(
+            &pkg("e2e", Manager::Pnpm, Some("pnpm-lock.yaml")),
+            test_package::check_steps(&TestPackage {
+                files: vec!["tests/a.spec.ts".into()],
+                ..pkg("e2e", Manager::Pnpm, Some("pnpm-lock.yaml"))
+            })
+            .unwrap(),
+        );
+        assert!(steps[0].cmd.contains("corepack enable pnpm"));
+
+        // npm comes with Node: nothing extra.
+        let npm = pkg("e2e", Manager::Npm, Some("e2e/package-lock.json"));
+        assert!(!repair_steps(&npm, "tsc")[0].cmd.contains("command -v"));
+        // bun has no corepack: it installs from the registry.
+        let bun = pkg("e2e", Manager::Bun, Some("e2e/bun.lockb"));
+        assert!(repair_steps(&bun, "tsc")[0]
+            .cmd
+            .contains("npm install -g bun"));
     }
 }
