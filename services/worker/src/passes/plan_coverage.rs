@@ -180,6 +180,10 @@ pub fn plan_tasks(tasks_md: &str) -> Vec<PlanTask> {
 pub struct Coverage {
     pub done: Vec<PlanTask>,
     pub missing: Vec<PlanTask>,
+    /// The done tasks whose file only the branch this one is stacked on
+    /// changes: the pull request ships on top of it, so they are done there,
+    /// not in this branch's own diff.
+    pub on_base: Vec<String>,
 }
 
 impl Coverage {
@@ -248,15 +252,74 @@ pub fn settle_generated(mut cov: Coverage, settled: &[String]) -> Coverage {
 /// the coder's account: a task whose file the diff doesn't touch is not done
 /// whatever the coder's summary says.
 pub fn coverage(tasks: &[PlanTask], changed: &[String]) -> Coverage {
+    stacked_coverage(tasks, changed, &[])
+}
+
+/// [`coverage`] for a branch stacked on another open pull request's branch:
+/// `on_base` is what that branch changes against the repository's default
+/// branch. A task whose file only it changes is done there: the pull request
+/// ships on top of it, and the coder, reading the branch, finds the file
+/// already in its planned form. Counting such a task as missing sent a run
+/// round after round with nothing to write until it was stopped.
+pub fn stacked_coverage(tasks: &[PlanTask], changed: &[String], on_base: &[String]) -> Coverage {
     let mut cov = Coverage::default();
     for t in tasks {
         if path_changed(&t.path, changed) {
+            cov.done.push(t.clone());
+        } else if path_changed(&t.path, on_base) {
+            cov.on_base.push(t.path.clone());
             cov.done.push(t.clone());
         } else {
             cov.missing.push(t.clone());
         }
     }
     cov
+}
+
+/// What the plan check reads: the branch's own diff against its base and,
+/// when that base is another open pull request's branch (not the
+/// repository's default), the files that branch changes.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PlanChanges {
+    pub own: Vec<String>,
+    pub on_base: Vec<String>,
+}
+
+impl PlanChanges {
+    pub fn coverage(&self, tasks: &[PlanTask]) -> Coverage {
+        stacked_coverage(tasks, &self.own, &self.on_base)
+    }
+}
+
+/// Whether `base` is another branch the run is stacked on, not the
+/// repository's default branch.
+pub fn stacked_base(base: &str, default: &str) -> bool {
+    !default.is_empty() && !base.is_empty() && base != default
+}
+
+/// [`changed_files`] plus, for a stacked base, what that base changes
+/// against the repository's default branch. `None` when the branch's own
+/// diff can't be read; a base whose diff can't be read adds nothing.
+pub async fn plan_changes(
+    github: &GitHubClient,
+    owner: &str,
+    repo: &str,
+    base: &str,
+    branch: &str,
+) -> Option<PlanChanges> {
+    let own = changed_files(github, owner, repo, base, branch).await?;
+    let default = github
+        .get_default_branch(owner, repo)
+        .await
+        .unwrap_or_default();
+    let on_base = if stacked_base(base, &default) {
+        changed_files(github, owner, repo, &default, base)
+            .await
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    Some(PlanChanges { own, on_base })
 }
 
 /// What follows a coverage check.
@@ -363,7 +426,12 @@ pub fn progress_note(cov: &Coverage) -> String {
         cov.total()
     )];
     for t in &cov.done {
-        lines.push(format!("- [x] {}", t.path));
+        let note = if cov.on_base.contains(&t.path) {
+            " (changed by the branch this one is stacked on)"
+        } else {
+            ""
+        };
+        lines.push(format!("- [x] {}{note}", t.path));
     }
     for t in &cov.missing {
         let note = if t.optional {
@@ -537,19 +605,20 @@ pub async fn close_gaps(
     }
     let mut rounds = 0;
     loop {
-        let changed = changed_files(
+        let cov = plan_changes(
             w.github,
             &w.msg.repo_owner,
             &w.msg.repo_name,
             &w.msg.base_branch,
             w.branch,
         )
-        .await?;
-        let cov = coverage(&tasks, &changed);
+        .await?
+        .coverage(&tasks);
         info!(
             run_id = w.run_id,
             done = cov.done.len(),
             missing = cov.missing.len(),
+            on_base = cov.on_base.len(),
             rounds,
             "Plan check"
         );

@@ -598,7 +598,7 @@ pub async fn unfinished_tasks(
     if tasks.is_empty() {
         return Vec::new();
     }
-    let Some(changed) = super::plan_coverage::changed_files(
+    let Some(changes) = super::plan_coverage::plan_changes(
         github,
         &msg.repo_owner,
         &msg.repo_name,
@@ -609,7 +609,8 @@ pub async fn unfinished_tasks(
     else {
         return Vec::new();
     };
-    super::plan_coverage::coverage(&tasks, &changed)
+    changes
+        .coverage(&tasks)
         .required_missing()
         .into_iter()
         .map(|t| t.task.clone())

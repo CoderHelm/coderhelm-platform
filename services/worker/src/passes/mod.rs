@@ -2009,7 +2009,18 @@ async fn run_passes(
             }
         }
     };
-    msg.base_branch = default_branch;
+    let incoming_base = std::mem::replace(&mut msg.base_branch, default_branch);
+    // A later step of the same run keeps the open pull request branch an
+    // earlier step stacked it on (`stack::kept`).
+    let kept_stack = if stack::keeps_base(msg.same_run(), &incoming_base, &msg.base_branch) {
+        stack::kept(&github, &msg.repo_owner, &msg.repo_name, &incoming_base).await
+    } else {
+        None
+    };
+    if let Some(d) = &kept_stack {
+        info!(run_id, base = %d.branch, pr = d.number, "Continuation: keeping the stacked base");
+        msg.base_branch = d.branch.clone();
+    }
 
     // create_run_record() ran BEFORE run_passes and persisted the UNRESOLVED
     // incoming base_branch, which defaults to `main`. Now that the repo's real
@@ -2448,6 +2459,9 @@ async fn run_passes(
             .collect();
         stack::for_ticket(&github, msg, &own).await
     };
+    if stacked_on.is_none() {
+        stacked_on = kept_stack.filter(|d| d.branch == msg.base_branch);
+    }
     // Building what CoderHelm's own covering pull request lacks: on its
     // branch, so the work goes onto it without copying anything.
     if let Some((_, dep)) = &continue_in {
@@ -5714,7 +5728,7 @@ async fn run_passes(
                         &plan_result.tasks,
                     )
                     .await;
-                    if let Some(changed) = plan_coverage::changed_files(
+                    if let Some(changes) = plan_coverage::plan_changes(
                         &github,
                         &msg.repo_owner,
                         &msg.repo_name,
@@ -5724,7 +5738,7 @@ async fn run_passes(
                     .await
                     {
                         let cov = plan_coverage::settle_generated(
-                            plan_coverage::coverage(&tasks, &changed),
+                            changes.coverage(&tasks),
                             &settled_generated,
                         );
                         save_checked_tasks(
@@ -6435,7 +6449,7 @@ async fn resumed_optional(
     let tasks =
         plan_coverage::tasks_for(github, &msg.repo_owner, &msg.repo_name, branch, &plan.tasks)
             .await;
-    let Some(changed) = plan_coverage::changed_files(
+    let Some(changes) = plan_coverage::plan_changes(
         github,
         &msg.repo_owner,
         &msg.repo_name,
@@ -6446,7 +6460,7 @@ async fn resumed_optional(
     else {
         return Vec::new();
     };
-    plan_coverage::optional_findings(&plan_coverage::coverage(&tasks, &changed))
+    plan_coverage::optional_findings(&changes.coverage(&tasks))
 }
 
 /// Keeps a branch's commits on `coderhelm-wip/<branch>` when a run stops before its
