@@ -124,10 +124,17 @@ pub fn closed_prs_of(runs: &[Item]) -> Vec<health::ClosedPr> {
                 m if !m.is_empty() => m,
                 _ => item_s(r, "pr_closed_at"),
             };
+            // The coder arm its run picked; a run from before the coder had
+            // variants has none, and its PR can't be credited to one.
+            let variant = match item_s(r, "prompt_variant") {
+                v if bandit::arm(common::rewards::event::AGENT_CODER, &v).is_some() => v,
+                _ => String::new(),
+            };
             (!closed_at.is_empty()).then(|| health::ClosedPr {
                 repo: format!("{owner}/{name}"),
                 pr,
                 closed_at,
+                variant,
             })
         })
         .collect()
@@ -144,7 +151,7 @@ async fn closed_runs(state: &AppState, team: &str, since: &str) -> Vec<Item> {
             .table_name(&state.config.runs_table_name)
             .key_condition_expression("team_id = :t")
             .filter_expression("merged_at >= :s OR pr_closed_at >= :s")
-            .projection_expression("pr_url, merged_at, pr_closed_at")
+            .projection_expression("pr_url, merged_at, pr_closed_at, prompt_variant")
             .expression_attribute_values(
                 ":t",
                 aws_sdk_dynamodb::types::AttributeValue::S(team.into()),
@@ -483,6 +490,22 @@ mod tests {
         assert_eq!(got.len(), 2);
         assert_eq!((got[0].repo.as_str(), got[0].pr), ("acme/web", 3));
         assert_eq!(got[1].closed_at, "2026-11-04T00:00:00Z");
+        assert_eq!(got[0].variant, "");
+
+        // The coder arm its run picked comes along; a reviewer arm or a
+        // made-up one does not.
+        let with = |arm: &str| {
+            let mut i = run(
+                "https://github.com/acme/web/pull/6",
+                "2026-11-05T00:00:00Z",
+                "",
+            );
+            i.insert("prompt_variant".into(), A::S(arm.into()));
+            i
+        };
+        let got = closed_prs_of(&[with("read_first"), with("focused"), with("nope")]);
+        let arms: Vec<&str> = got.iter().map(|p| p.variant.as_str()).collect();
+        assert_eq!(arms, vec!["read_first", "", ""]);
     }
 
     #[test]
