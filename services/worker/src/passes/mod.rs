@@ -1088,6 +1088,8 @@ pub mod pr_outcomes;
 mod pr_risk;
 mod proof;
 pub mod quarantine;
+/// Whether a finished run's pull request leaves draft, decided in one place.
+pub mod ready;
 pub mod relay_retry;
 pub mod release_notes;
 pub mod release_plan;

@@ -3091,6 +3091,7 @@ async fn handle_workflow_run(
                         repo_owner: repo_owner.to_string(),
                         repo_name: repo_name.to_string(),
                         pr_number,
+                        ..Default::default()
                     });
                     let _ = send_to_queue(state, &state.config.ticket_queue_url, &message).await;
                 }

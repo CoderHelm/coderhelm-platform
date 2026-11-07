@@ -864,6 +864,28 @@ pub struct MarkReadyMessage {
     pub repo_owner: String,
     pub repo_name: String,
     pub pr_number: u64,
+    /// The run whose pull request this is, when the sender knows it (else
+    /// the worker looks it up by the pull request).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub run_id: String,
+    /// Tries so far that GitHub refused for a while (its rate limit, a 5xx,
+    /// an unreadable timeline). A refused try is sent again after a delay,
+    /// up to `common::github_wait::MAX_WAITS`; the last refusal is recorded
+    /// on the run.
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub attempt: u32,
+    /// Not before this time (epoch seconds): a wait longer than one SQS
+    /// delay is sent on in hops until then.
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub not_before: u64,
+    /// Squash the branch before marking it ready, under the first commit's
+    /// message when true (the in-run path). Unset: no squash.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub squash_keep_first: Option<bool>,
+}
+
+fn is_zero_u64(n: &u64) -> bool {
+    *n == 0
 }
 
 /// A force push to `branch` (from `before` to `after`).

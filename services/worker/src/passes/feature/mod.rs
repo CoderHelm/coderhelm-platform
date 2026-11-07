@@ -861,9 +861,10 @@ pub(crate) async fn load_connection(
     }
 }
 
-/// What the rules left failing, as Open items. The checklist already keeps
-/// the pull request a draft until it passes (`ready_hold`), so these only say
-/// what is open.
+/// What the rules left failing, as Open items. They keep the pull request a
+/// draft only until the repository's CI is green and CoderHelm's review
+/// approved (`ready::decide`); then it is marked ready with them still
+/// listed, for a person to look at.
 pub fn open_findings(f: &PrFacts) -> Vec<super::proof::Finding> {
     checklist::failing(&f.checklist)
         .into_iter()
@@ -876,7 +877,8 @@ pub fn open_findings(f: &PrFacts) -> Vec<super::proof::Finding> {
         .map(|detail| super::proof::Finding {
             point: "rule_failing".to_string(),
             detail,
-            settle: "Fix it on this branch; the pull request stays a draft until the rules pass."
+            settle: "Fix it on this branch, or judge it fine: once CI is green and the review \
+                     approved, the pull request is marked ready with this still listed."
                 .to_string(),
             ..Default::default()
         })
@@ -1327,9 +1329,36 @@ pub async fn register_pr(
     }
 }
 
-/// Why a feature pull request stays a draft, read from its head now: the
-/// checklist's diff items fail, or the sandbox checks failed on this same
-/// head. `None` when it may leave draft (or isn't a feature pull request).
+/// What CoderHelm's own checks of a feature pull request still find on its
+/// head: sandbox checks that failed on this same head, and checklist items
+/// that fail. Every checklist item here is about tests (their count, specs,
+/// test maps, responsive checks), none a correctness, security or data-loss
+/// finding, so `ready::decide` weighs them against the repository's CI and
+/// the review instead of letting them hold the draft alone.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FeatureHold {
+    pub sandbox_failed: Vec<String>,
+    pub checklist_fails: Vec<String>,
+}
+
+impl FeatureHold {
+    /// Every item, one line each.
+    pub fn items(&self) -> Vec<String> {
+        self.sandbox_failed
+            .iter()
+            .map(|l| format!("CoderHelm's sandbox check failed: {l}"))
+            .chain(
+                self.checklist_fails
+                    .iter()
+                    .map(|l| format!("Verification checklist: {l}")),
+            )
+            .collect()
+    }
+}
+
+/// What CoderHelm's own checks still find on a feature pull request's head
+/// ([`FeatureHold`]). `None` when nothing (or it isn't a feature pull
+/// request, or what it needs can't be read: a read failure never holds).
 pub async fn ready_hold(
     state: &WorkerState,
     github: &GitHubClient,
@@ -1337,7 +1366,7 @@ pub async fn ready_hold(
     owner: &str,
     repo: &str,
     pr: u64,
-) -> Option<String> {
+) -> Option<FeatureHold> {
     let full = format!("{owner}/{repo}");
     let item = state
         .dynamo
@@ -1353,13 +1382,24 @@ pub async fn ready_hold(
     let p = github.get_pull_request(owner, repo, pr).await.ok()?;
     let sha = p["head"]["sha"].as_str().unwrap_or("").to_string();
     let base = p["base"]["ref"].as_str().unwrap_or("main").to_string();
-    if sha == r.sha && !r.sandbox_failed.is_empty() {
-        return Some(r.sandbox_failed.join("; "));
-    }
-    let files = github
+    let sandbox_failed = if sha == r.sha {
+        r.sandbox_failed.clone()
+    } else {
+        Vec::new()
+    };
+    let held = |checklist_fails: Vec<String>| {
+        let h = FeatureHold {
+            sandbox_failed: sandbox_failed.clone(),
+            checklist_fails,
+        };
+        (!h.items().is_empty()).then_some(h)
+    };
+    let Ok(files) = github
         .compare_files_with_patches(owner, repo, &base, &sha)
         .await
-        .ok()?;
+    else {
+        return held(Vec::new());
+    };
     let mut facts = r.facts.clone();
     facts.cases_added = checklist::unit_cases_added(&files);
     facts.responsive_specs.clear();
@@ -1386,12 +1426,11 @@ pub async fn ready_hold(
         .map(|(m, s)| format!("{m}: {s}"))
         .collect();
     let fails = checklist::failing(&checklist::static_items(&facts));
-    if fails.is_empty() {
-        None
-    } else {
-        info!(pr, fails = ?fails, "Feature checklist fails; the PR stays a draft");
-        Some(fails.join("; "))
+    let h = held(fails);
+    if let Some(h) = &h {
+        info!(pr, sandbox_failed = ?h.sandbox_failed, checklist_fails = ?h.checklist_fails, "CoderHelm's own feature checks still find items on the head");
     }
+    h
 }
 
 #[cfg(test)]

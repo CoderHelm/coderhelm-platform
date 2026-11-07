@@ -33,3 +33,4 @@ mod o_mention_resumes_held_work;
 mod p_finished_work_loop;
 mod q_run_ceiling;
 mod r_github_limit;
+mod s_silent_draft;

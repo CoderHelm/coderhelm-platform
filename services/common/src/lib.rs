@@ -52,6 +52,8 @@ pub mod alert_notify;
 /// channel, sealed webhook URLs.
 pub mod notify;
 
+/// Why a finished run's pull request is still a draft, on the run record.
+pub mod draft_hold;
 /// Read-only lookups against a team's own systems (their API today). Shared so
 /// the dashboard's test path and the reviewer's tool path enforce the same rules.
 pub mod e2e;

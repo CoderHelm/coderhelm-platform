@@ -4467,7 +4467,7 @@ async fn set_run_awaiting_ci(
              cache_read_tokens = if_not_exists(cache_read_tokens, :uzero) + :crt, cache_write_tokens = if_not_exists(cache_write_tokens, :uzero) + :cwt, \
              cost_usd = if_not_exists(cost_usd, :uzero) + :c, duration_s = :d, updated_at = :t, current_pass = :cp, \
              status_run_id = :sri \
-             REMOVE error_message, #err, #inc",
+             REMOVE error_message, #err, #inc, draft_hold",
         )
         .condition_expression(common::run_status::not_ended("#s"))
         .expression_attribute_names("#s", "status")
@@ -4507,6 +4507,10 @@ async fn set_run_awaiting_ci(
     }
 }
 
+/// Marks a finished run's pull request ready, or records why it stays a
+/// draft: one decision for every caller (`ready::settle`). The run's own
+/// completion squashes its history first; with a team commit template, the
+/// squash keeps the message the run's first commit was given from it.
 pub(crate) async fn mark_pr_ready(
     state: &WorkerState,
     team_id: &str,
@@ -4515,46 +4519,19 @@ pub(crate) async fn mark_pr_ready(
     repo_name: &str,
     pr_number: u64,
 ) {
-    // Asking people to merge: the PR's redirects and links are checked
-    // again and the description's table updated; one that fails now keeps
-    // the PR a draft, with the reason in that table.
-    if let Some(r) = super::link_checks::refresh_pr(
-        state, github, team_id, repo_owner, repo_name, pr_number, "", true,
-    )
-    .await
-    .filter(|r| !r.blocking.is_empty())
-    {
-        warn!(pr_number, blocking = ?r.blocking, "Link and redirect checks fail now; the PR stays a draft");
-        return;
-    }
-    // A failing-test fix stays a draft until the checks that test it are
-    // green on its head and a repeat run passed.
-    if let super::test_fix::Hold::Wait(_) =
-        super::test_fix::ready_gate(state, github, team_id, repo_owner, repo_name, pr_number).await
-    {
-        return;
-    }
-    // A new feature stays a draft until its verification checklist passes.
-    if super::feature::ready_hold(state, github, team_id, repo_owner, repo_name, pr_number)
-        .await
-        .is_some()
-    {
-        return;
-    }
-    // With a team commit template, the final squash keeps the message the
-    // run's first commit was given from it; otherwise the PR title, as always.
     let keep_first = super::load_git_conventions(state, team_id, "")
         .await
         .commit
         .is_some();
-    mark_ready(github, repo_owner, repo_name, pr_number, false, keep_first).await
+    let mut ctx = super::ready::Ctx::new(state, github, team_id, repo_owner, repo_name, pr_number);
+    ctx.squash_keep_first = Some(keep_first);
+    super::ready::settle(&ctx).await;
 }
 
-/// Marks an E2E fix or generated-test PR ready once its repeat runs proved it.
-/// Those PRs are skipped by [`mark_pr_ready`]: green CI alone isn't enough.
 /// Marks a finished run's PR ready for review. A flaky-test fix PR starts its
 /// proof first, and stays a draft while the proof runs or after the fix was
-/// refused; when no proof can run it is marked ready with a note saying so.
+/// refused (each recorded, never silent); when no proof can run it is marked
+/// ready with a note saying so.
 pub(crate) async fn ready_or_prove(
     state: &WorkerState,
     github: &GitHubClient,
@@ -4564,27 +4541,33 @@ pub(crate) async fn ready_or_prove(
     pr_number: u64,
 ) {
     use super::e2e::Proof;
+    let mut ctx = super::ready::Ctx::new(state, github, team_id, repo_owner, repo_name, pr_number);
     match super::e2e::start_fix_proof(state, github, team_id, repo_owner, repo_name, pr_number)
         .await
     {
-        Proof::Ready => mark_e2e_pr_ready(github, repo_owner, repo_name, pr_number).await,
-        Proof::Running | Proof::Refused => info!(
-            pr_number,
-            "Flaky-test fix PR stays a draft while its proof runs or after it was refused"
-        ),
+        Proof::Ready => ctx.proven = true,
+        Proof::Running => ctx.e2e = super::ready::E2e::Running,
+        Proof::Refused => ctx.e2e = super::ready::E2e::Refused,
         Proof::NotAFix => {
-            mark_pr_ready(state, team_id, github, repo_owner, repo_name, pr_number).await
+            return mark_pr_ready(state, team_id, github, repo_owner, repo_name, pr_number).await
         }
     }
+    super::ready::settle(&ctx).await;
 }
 
+/// Marks an E2E fix or generated-test PR ready once its repeat runs proved
+/// it, through the same decision as every other PR (`ready::settle`).
 pub(crate) async fn mark_e2e_pr_ready(
+    state: &WorkerState,
     github: &GitHubClient,
+    team_id: &str,
     repo_owner: &str,
     repo_name: &str,
     pr_number: u64,
 ) {
-    mark_ready(github, repo_owner, repo_name, pr_number, true, false).await
+    let mut ctx = super::ready::Ctx::new(state, github, team_id, repo_owner, repo_name, pr_number);
+    ctx.proven = true;
+    super::ready::settle(&ctx).await;
 }
 
 /// Whether a PR title belongs to an E2E fix or generated test, which waits for
@@ -4596,7 +4579,7 @@ pub(crate) fn is_e2e_proof_pr(title: &str) -> bool {
 
 /// The message of the PR's first commit CoderHelm made (the squash at PR
 /// open, written from the team's commit template).
-fn first_own_commit_message(commits: &[serde_json::Value]) -> Option<String> {
+pub(crate) fn first_own_commit_message(commits: &[serde_json::Value]) -> Option<String> {
     commits.iter().find_map(|c| {
         let own = [&c["committer"]["login"], &c["author"]["login"]]
             .iter()
@@ -4607,170 +4590,16 @@ fn first_own_commit_message(commits: &[serde_json::Value]) -> Option<String> {
 }
 
 /// Why an open pull request stays a draft, read from its description and
-/// title; `None` when nothing holds it. Security items still open, planned
-/// work not done ("Not finished"), and an end-to-end fix or generated test
-/// whose repeat runs haven't proved it (`proven`) each hold it.
-pub(crate) fn draft_hold(body: &str, title: &str, proven: bool) -> Option<&'static str> {
-    if super::proof::holds_security_items(body) {
-        return Some("security items are open in the description");
+/// title (the first of `ready::body_holds`); `None` when nothing there holds
+/// it. An end-to-end fix or generated test whose repeat runs haven't proved
+/// it (`proven`) waits too.
+#[cfg(test)]
+pub(crate) fn draft_hold(body: &str, title: &str, proven: bool) -> Option<String> {
+    if let Some(r) = super::ready::body_holds(body).into_iter().next() {
+        return Some(r.what);
     }
-    if super::proof::holds_unfinished(body) {
-        return Some("planned work not done is listed in the description");
-    }
-    if super::proof::holds_blocked(body) {
-        return Some("a check the change didn't pass is listed in the description");
-    }
-    if super::own_review::hold(body).is_some() {
-        return Some("CoderHelm's own review findings are open in the description");
-    }
-    if super::stack::hold(body).is_some() {
-        return Some("the stacked change asks for a look first");
-    }
-    if !proven && is_e2e_proof_pr(title) {
-        return Some("an end-to-end proof PR waits for its repeat runs");
-    }
-    None
-}
-
-async fn mark_ready(
-    github: &GitHubClient,
-    repo_owner: &str,
-    repo_name: &str,
-    pr_number: u64,
-    proven: bool,
-    // The team has a commit template: squash under the first commit's
-    // message (CoderHelm wrote it from the template) instead of the title.
-    keep_first_message: bool,
-) {
-    if pr_number == 0 {
-        return;
-    }
-    // Retry once on failure — transient GitHub API issues are common
-    for attempt in 1..=2 {
-        match github
-            .get_pull_request(repo_owner, repo_name, pr_number)
-            .await
-        {
-            Ok(pr) => {
-                // If the PR was closed (e.g. a human closed it), never
-                // reopen/mark it ready — respect the close.
-                if pr.get("state").and_then(|v| v.as_str()) == Some("closed") {
-                    info!(pr_number, "PR is closed — not marking ready");
-                    return;
-                }
-                if let Some(why) = draft_hold(
-                    pr.get("body").and_then(|v| v.as_str()).unwrap_or(""),
-                    pr.get("title").and_then(|v| v.as_str()).unwrap_or(""),
-                    proven,
-                ) {
-                    info!(pr_number, why, "The PR stays a draft");
-                    return;
-                }
-                // A person put this PR back into draft: that is their call, and
-                // a later CI pass or run completion must not undo it. Only a
-                // draft CoderHelm opened (or marked ready itself) is its to mark
-                // ready. When the timeline can't be read, the draft is left alone
-                // this time (fail closed: a draft stays a draft).
-                if pr.get("draft").and_then(|v| v.as_bool()).unwrap_or(false) {
-                    match github
-                        .list_issue_timeline(repo_owner, repo_name, pr_number)
-                        .await
-                    {
-                        Ok(timeline) => {
-                            if let Some(who) =
-                                crate::clients::github::human_converted_to_draft(&timeline)
-                            {
-                                info!(pr_number, converted_by = %who, "PR was put back into draft by a person — not marking ready");
-                                return;
-                            }
-                        }
-                        Err(e) => {
-                            warn!(pr_number, error = %e, "Could not read the PR timeline — leaving the draft as is");
-                            return;
-                        }
-                    }
-                }
-                // A PR reaching ready (CI + review passed) is no longer
-                // "partial" — drop the salvage marker from the title.
-                if let Some(title) = pr.get("title").and_then(|v| v.as_str()) {
-                    if let Some(clean) = title.strip_prefix("⚠️ Partial: ") {
-                        let _ = github
-                            .update_pr_title(repo_owner, repo_name, pr_number, clean)
-                            .await;
-                    }
-                }
-                let is_draft = pr.get("draft").and_then(|v| v.as_bool()).unwrap_or(false);
-                if !is_draft {
-                    info!(pr_number, "PR already not a draft — skipping mark_pr_ready");
-                    return;
-                }
-                // Final squash: collapse the run's whole history — the initial
-                // implementation AND every CI-fix cycle (including any
-                // restore/refix churn) — into ONE clean commit before the PR
-                // goes up for review. Runs once, here at completion: the loop is
-                // done (single writer), and only while still a draft, so a human
-                // who has taken the PR over isn't clobbered. Best-effort — a
-                // failure just leaves the noisier history.
-                if let (Some(head), Some(base)) = (
-                    pr.get("head")
-                        .and_then(|h| h.get("ref"))
-                        .and_then(|v| v.as_str()),
-                    pr.get("base")
-                        .and_then(|b| b.get("ref"))
-                        .and_then(|v| v.as_str()),
-                ) {
-                    let title = pr
-                        .get("title")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("Apply changes");
-                    let mut squash_msg = title
-                        .strip_prefix("⚠️ Partial: ")
-                        .unwrap_or(title)
-                        .to_string();
-                    if keep_first_message {
-                        if let Ok(commits) = github
-                            .list_pr_commits(repo_owner, repo_name, pr_number)
-                            .await
-                        {
-                            if let Some(m) = first_own_commit_message(&commits) {
-                                squash_msg = m;
-                            }
-                        }
-                    }
-                    // A commit message an agent wrote may carry a stand-in
-                    // key (`ABC-0`); the PR title carries the real one.
-                    let squash_msg = common::git_conventions::normalize_message(
-                        &squash_msg,
-                        common::git_conventions::subject_key(title).as_deref(),
-                    );
-                    if let Err(e) = github
-                        .squash_branch(repo_owner, repo_name, head, base, &squash_msg)
-                        .await
-                    {
-                        warn!(pr_number, error = %e, "Final squash before mark-ready failed — proceeding with full history");
-                    }
-                }
-                if let Some(node_id) = pr.get("node_id").and_then(|v| v.as_str()) {
-                    match github.mark_pr_ready(node_id).await {
-                        Ok(_) => {
-                            info!(pr_number, "PR marked ready for review");
-                            return;
-                        }
-                        Err(e) => {
-                            warn!(pr_number, attempt, error = %e, "Failed to mark PR ready");
-                        }
-                    }
-                } else {
-                    warn!(pr_number, attempt, "PR response missing node_id");
-                }
-            }
-            Err(e) => warn!(pr_number, attempt, error = %e, "Failed to fetch PR for marking ready"),
-        }
-        if attempt < 2 {
-            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-        }
-    }
-    error!(pr_number, "Failed to mark PR ready after 2 attempts");
+    (!proven && is_e2e_proof_pr(title))
+        .then(|| "an end-to-end proof PR waits for its repeat runs".to_string())
 }
 
 /// The own-review progress a run recorded.
@@ -5105,6 +4934,11 @@ async fn end_run(
     // The team's counters already have these tokens: each model call is
     // counted as it happens (common::usage).
     info!(run_id, status, "Run completed");
+    // The pull request's ready decision runs before this write: a hold it
+    // recorded makes the finished run `needs_input`, never plain completed.
+    if status == common::run_status::COMPLETED {
+        super::ready::after_completion(state, &msg.team_id, run_id).await;
+    }
     // CoderHelm's own pushes during the run weren't reviewed by the PR
     // reviewer (`review_scope::own_loop_holds_push`): a run that hands its
     // PR over asks for the review of its head now. A head the run's own ask

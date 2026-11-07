@@ -93,15 +93,15 @@ fn the_own_review_requests_changes_and_lists_every_non_optional_finding() {
         ),
         0,
     ));
-    // While they are listed the PR stays a draft: neither mark-ready path
-    // goes on.
+    // While they are listed the PR stays a draft: every mark-ready path
+    // goes through the one decision, which holds on them.
     assert!(draft_hold(&body, "Keep the text", true).is_some());
+    let ready = include_str!("../ready.rs");
+    let holds = fn_src(ready, "pub fn body_holds(");
+    assert!(holds.contains("own_review::hold(body)"));
+    assert!(fn_src(ready, "pub fn decide(").contains("body_holds(&f.body)"));
     let main = include_str!("../../main.rs");
-    let mark = fn_src(main, "\nasync fn mark_pr_ready(");
-    let gate = mark
-        .find("own_review::hold")
-        .expect("mark_pr_ready checks own_review::hold");
-    assert!(gate < mark.find("github.mark_pr_ready(").unwrap());
+    assert!(main.contains("passes::ready::on_message(&state, msg)"));
     // The run gets them as a fix round, not a completion.
     let rr = RunReview {
         verdict: "APPROVE",

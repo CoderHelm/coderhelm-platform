@@ -3511,6 +3511,17 @@
               "null"
             ]
           },
+          "draft_hold": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/RunDraftHold",
+                "description": "Set when the run finished and its pull request is still a draft: why,\nand what to do about each reason. A held run is also `needs_input`,\nwith `waiting_on` naming the pull request. Null once the pull request\nis ready or closed."
+              }
+            ]
+          },
           "duration_s": {
             "description": "How long the run took, in seconds.",
             "examples": [
@@ -4134,6 +4145,82 @@
         },
         "required": [
           "branch"
+        ],
+        "type": "object"
+      },
+      "RunDraftHold": {
+        "description": "Why a finished run's pull request is still a draft, with what to do\nabout each reason. A finished run never leaves its pull request a draft\nwithout one of these.",
+        "properties": {
+          "kind": {
+            "description": "`held` (a person must deal with a reason; the run is `needs_input`),\n`waiting` (CoderHelm waits for something that settles by itself and\nchecks again), or `failed` (CoderHelm decided it was ready but GitHub\nrefused every try to mark it).",
+            "examples": [
+              "held"
+            ],
+            "type": "string"
+          },
+          "pr_number": {
+            "description": "The pull request.",
+            "examples": [
+              318
+            ],
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "reasons": {
+            "description": "Each reason, with what to do about it.",
+            "items": {
+              "$ref": "#/components/schemas/RunDraftHoldReason"
+            },
+            "type": "array"
+          },
+          "since": {
+            "description": "When it was first held for these reasons (RFC 3339).",
+            "examples": [
+              "2026-11-06T22:17:25Z"
+            ],
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "summary": {
+            "description": "The run page's line, ready to show.",
+            "examples": [
+              "Finished, but pull request #318 stays a draft: Security items are open under Open items. Fix them on this branch (CoderHelm checks again on the next push), or delete each security line once a person has checked it."
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "kind",
+          "summary",
+          "reasons",
+          "pr_number"
+        ],
+        "type": "object"
+      },
+      "RunDraftHoldReason": {
+        "description": "One reason a pull request stays a draft.",
+        "properties": {
+          "todo": {
+            "description": "What to do about it.",
+            "examples": [
+              "Fix them on this branch (CoderHelm checks again on the next push), or delete each security line once a person has checked it."
+            ],
+            "type": "string"
+          },
+          "what": {
+            "description": "What holds it.",
+            "examples": [
+              "Security items are open under Open items"
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "what",
+          "todo"
         ],
         "type": "object"
       },

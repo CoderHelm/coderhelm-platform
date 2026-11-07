@@ -1494,7 +1494,15 @@ async fn follow_fix(
                     let _ = gh
                         .create_issue_comment(&msg.repo_owner, &msg.repo_name, pr, &format!("The fix held: `{}` passed {total} of {total} repeat runs. Ready for review.", r.title))
                         .await;
-                    super::resume::mark_e2e_pr_ready(gh, &msg.repo_owner, &msg.repo_name, pr).await;
+                    super::resume::mark_e2e_pr_ready(
+                        state,
+                        gh,
+                        &msg.team_id,
+                        &msg.repo_owner,
+                        &msg.repo_name,
+                        pr,
+                    )
+                    .await;
                 }
             } else {
                 r.fix_status = Some("failed".into());
@@ -2102,7 +2110,15 @@ async fn follow_generated(
                 rec.phase = Some("proven".into());
                 if let Some(pr) = pr {
                     let _ = gh.create_issue_comment(&msg.repo_owner, &msg.repo_name, pr, &format!("The new test passed {GENERATED_RUNS} of {GENERATED_RUNS} repeat runs. Ready for review.")).await;
-                    super::resume::mark_e2e_pr_ready(gh, &msg.repo_owner, &msg.repo_name, pr).await;
+                    super::resume::mark_e2e_pr_ready(
+                        state,
+                        gh,
+                        &msg.team_id,
+                        &msg.repo_owner,
+                        &msg.repo_name,
+                        pr,
+                    )
+                    .await;
                 }
             }
         }
@@ -2122,7 +2138,15 @@ async fn follow_generated(
                 rec.phase = Some("proven".into());
                 if let Some(pr) = pr {
                     let _ = gh.create_issue_comment(&msg.repo_owner, &msg.repo_name, pr, &format!("The new test passed {GENERATED_RUNS} of {GENERATED_RUNS} repeat runs, and it fails on the code from before the bug fix, so it would have caught the bug. Ready for review.")).await;
-                    super::resume::mark_e2e_pr_ready(gh, &msg.repo_owner, &msg.repo_name, pr).await;
+                    super::resume::mark_e2e_pr_ready(
+                        state,
+                        gh,
+                        &msg.team_id,
+                        &msg.repo_owner,
+                        &msg.repo_name,
+                        pr,
+                    )
+                    .await;
                 }
             } else {
                 rec.phase = Some("failed".into());

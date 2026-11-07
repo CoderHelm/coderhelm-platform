@@ -415,10 +415,10 @@ async fn handle_message(state: Arc<WorkerState>, message: models::WorkerMessage)
             }
         }
         models::WorkerMessage::MarkReady(msg) => {
-            info!(team_id = %msg.team_id, pr_number = msg.pr_number, "Marking PR ready");
-            if let Err(e) = mark_pr_ready(&state, msg).await {
-                error!("Mark PR ready failed: {e}");
-            }
+            info!(team_id = %msg.team_id, pr_number = msg.pr_number, attempt = msg.attempt, "Deciding whether the PR leaves draft");
+            // One decision for every mark-ready path; a refusal from GitHub
+            // is sent again, and every hold is recorded (`passes::ready`).
+            passes::ready::on_message(&state, msg).await;
         }
         models::WorkerMessage::PlanExecute(msg) => {
             info!(team_id = %msg.team_id, plan_id = %msg.plan_id, "Executing plan");
@@ -511,6 +511,15 @@ async fn handle_message(state: Arc<WorkerState>, message: models::WorkerMessage)
                 ),
                 Err(e) => error!("Stuck-review sweep failed: {e:?}"),
             }
+            // Finished runs whose pull request is still a draft with no
+            // recorded reason: decided again, so none stays silently held.
+            let drafts = passes::ready::sweep(&state).await;
+            info!(
+                looked_at = drafts.looked_at,
+                decided = drafts.decided,
+                prs = ?drafts.settled,
+                "Draft sweep done"
+            );
         }
         models::WorkerMessage::ReviewReminder => {
             info!("Running review-reminder sweep");
@@ -745,86 +754,4 @@ async fn handle_message(state: Arc<WorkerState>, message: models::WorkerMessage)
         // Handled in `handle_sqs`, where a failure fails the message.
         models::WorkerMessage::UsageRecord(_) => {}
     }
-}
-
-async fn mark_pr_ready(
-    state: &WorkerState,
-    msg: models::MarkReadyMessage,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let github = clients::github::GitHubClient::new(
-        &state.secrets.github_app_id,
-        &state.secrets.github_private_key,
-        msg.installation_id,
-        &state.http,
-    )?;
-    // Fetch the PR to get its GraphQL node_id (REST PATCH {"draft":false} doesn't work)
-    let pr = github
-        .get_pull_request(&msg.repo_owner, &msg.repo_name, msg.pr_number)
-        .await?;
-    if pr["state"].as_str() != Some("open") || pr["draft"].as_bool() != Some(true) {
-        info!(
-            pr_number = msg.pr_number,
-            "PR is closed or not a draft — nothing to mark ready"
-        );
-        return Ok(());
-    }
-    // CoderHelm's own review still lists findings it hasn't fixed: the PR
-    // stays a draft until its fix rounds clear them (`own_review`).
-    if let Some(why) = pr["body"].as_str().and_then(passes::stack::hold) {
-        info!(pr_number = msg.pr_number, why = %why, "PR stays a draft");
-        return Ok(());
-    }
-    if let Some(why) = pr["body"].as_str().and_then(passes::own_review::hold) {
-        info!(pr_number = msg.pr_number, why = %why, "PR stays a draft");
-        return Ok(());
-    }
-    // A person put this PR back into draft: a CI pass must not undo that. A
-    // timeline that can't be read leaves the draft alone (fail closed).
-    let timeline = github
-        .list_issue_timeline(&msg.repo_owner, &msg.repo_name, msg.pr_number)
-        .await?;
-    if let Some(who) = clients::github::human_converted_to_draft(&timeline) {
-        info!(pr_number = msg.pr_number, converted_by = %who, "PR was put back into draft by a person — not marking ready");
-        return Ok(());
-    }
-    // A failing-test fix stays a draft until the checks that test it are
-    // green on its head and a repeat run passed (this message also brings
-    // the check back while it waits).
-    if let passes::test_fix::Hold::Wait(_) = passes::test_fix::ready_gate(
-        state,
-        &github,
-        &msg.team_id,
-        &msg.repo_owner,
-        &msg.repo_name,
-        msg.pr_number,
-    )
-    .await
-    {
-        return Ok(());
-    }
-    // A new feature stays a draft until its verification checklist passes.
-    if passes::feature::ready_hold(
-        state,
-        &github,
-        &msg.team_id,
-        &msg.repo_owner,
-        &msg.repo_name,
-        msg.pr_number,
-    )
-    .await
-    .is_some()
-    {
-        return Ok(());
-    }
-    let node_id = pr
-        .get("node_id")
-        .and_then(|v| v.as_str())
-        .ok_or("PR missing node_id")?;
-    github.mark_pr_ready(node_id).await?;
-    info!(
-        pr_number = msg.pr_number,
-        repo = %format!("{}/{}", msg.repo_owner, msg.repo_name),
-        "PR marked ready for review"
-    );
-    Ok(())
 }
