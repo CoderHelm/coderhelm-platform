@@ -96,7 +96,7 @@ test("the deploy role may make every call CloudFormation makes for a self-host i
 // (infra/lib/access.ts, NoOtherRolesHere and the read-role exception), as
 // AWS's simulator saw it: an identity policy allowing every sts action and
 // role tag, so the boundary alone decides.
-test("own-account roles: the evaluator gives the simulator's verdict, and only the gateway and worker may assume only the two read roles", () => {
+test("own-account roles: the evaluator gives the simulator's verdict, and only the gateway, worker and log analyzer may assume only the two read roles", () => {
   const { identity, rows } = FIXTURE.runtime;
   const { boundary } = FIXTURE.policies;
   const wrong = rows.flatMap((r) => Object.entries(r.actions).filter(([action, v]) => decision([identity], boundary, { action, resource: r.resource, context: r.context }) !== v).map(([a]) => `${a} on ${r.resource} as ${r.caller}`));
@@ -117,6 +117,9 @@ test("own-account roles: the evaluator gives the simulator's verdict, and only t
     "deploy role: iam:UntagRole on 111122223333:role/coderhelm-prod-ServiceRole-ab12cd34 tags other",
     "gateway: sts:AssumeRole on 111122223333:role/CoderHelmLogReader",
     "gateway: sts:AssumeRole on 111122223333:role/CoderhelmReadOnly",
+    // The log analyzer reads logs here; its own role policy keeps it to the log reader.
+    "log-analyzer: sts:AssumeRole on 111122223333:role/CoderHelmLogReader",
+    "log-analyzer: sts:AssumeRole on 111122223333:role/CoderhelmReadOnly",
     "untagged: sts:AssumeRole on 999988887777:role/CoderHelmLogReader",
     "worker: sts:AssumeRole on 111122223333:role/CoderHelmLogReader",
     "worker: sts:AssumeRole on 111122223333:role/CoderhelmReadOnly",

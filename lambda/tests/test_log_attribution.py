@@ -182,7 +182,7 @@ def run_incident(guard_reply):
         logs_client_for=lambda _c: cw,
         list_recent_findings=lambda *_a: [],
         record_connection_success=lambda *_a: None,
-        resolve_stale_recommendations=lambda *_a: None,
+        resolve_stale_recommendations=lambda *_a, **_k: None,
         notify_new_recommendations=lambda *_a: None,
         ask_model=ask,
         aws_insights_table=table,

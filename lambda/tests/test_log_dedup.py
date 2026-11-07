@@ -14,6 +14,8 @@ from test_log_attribution import ACCOUNT, NOW, FakeInsights, Patch, Table
 
 import merge_duplicates as M
 
+QUIET_CASES = __import__("pathlib").Path(__file__).resolve().parents[2] / "services/common/tests/fixtures/quiet_days_cases.json"
+
 A, F, L = h.attribution, h.fingerprint, h.lifecycle
 
 WEB = "/ecs/prod-shop-web"
@@ -289,6 +291,58 @@ class Lifecycle(unittest.TestCase):
                 "reopened_at": iso_ago(days=3), "last_seen_at": iso_ago(days=3)}
         self.assertEqual(L.quiet_days_for(item), 6)
         self.assertEqual(L.stale([item], set()), [])
+
+    def test_the_quiet_period_matches_the_page_on_every_shared_case(self):
+        # services/common/src/log_findings.rs runs the same cases, so the date
+        # the page shows is the one this sweep uses.
+        cases = json.load(open(QUIET_CASES))["cases"]
+        self.assertGreater(len(cases), 5)
+        for c in cases:
+            item = {k: c[k] for k in ("daily_lines", "last_resolved_at", "reopened_at") if c[k]}
+            self.assertEqual(L.quiet_days_for(item), c["quiet_days"], c["name"])
+
+    def test_an_acknowledged_finding_that_came_back_resolves_after_twice_its_silence(self):
+        # Resolved after one burst, back 4 days later, acknowledged, then
+        # quiet: it resolves 8 days after its last line, not 3.
+        item = {"rec_id": "e1", "sk": "REC#e1", "status": "pending", "source_log_group": WEB,
+                "acknowledged_at": "2026-11-03T06:44:39.346874173+00:00",
+                "daily_lines": [{"day": "2026-10-31", "lines": 6296}],
+                "last_resolved_at": "2026-10-27T03:48:40.472966+00:00",
+                "reopened_at": "2026-10-31T03:48:51.255562+00:00",
+                "last_seen_at": "2026-10-31T03:38:10.248+00:00"}
+        self.assertEqual(L.quiet_days_for(item), 8)
+        at = lambda t: datetime.fromisoformat(t)
+        self.assertEqual(L.stale([item], set(), at("2026-11-08T03:00:00+00:00")), [])
+        self.assertEqual(L.stale([item], set(), at("2026-11-08T03:39:00+00:00")), [item])
+
+    def test_a_failed_query_holds_only_the_groups_it_covered(self):
+        old = iso_ago(days=20)
+        web = {"rec_id": "w", "sk": "REC#w", "status": "pending", "source_log_group": WEB, "last_seen_at": old}
+        api = {"rec_id": "a", "sk": "REC#a", "status": "pending", "source_log_group": API, "last_seen_at": old}
+        t = Table()
+        with Patch(aws_insights_table=t, emit_event=lambda *_a, **_k: None):
+            h.resolve_stale_recommendations("TEAM#t", [web, api], set(), skip_groups={API})
+        resolves = [u["Key"]["sk"] for u in t.updates if ":s" in u["ExpressionAttributeValues"]]
+        self.assertEqual(resolves, ["REC#w"])
+
+    def test_a_query_that_fails_every_run_no_longer_holds_every_finding_open(self):
+        # One group's query keeps failing; the other groups' quiet findings
+        # still resolve on a run that read them in full.
+        old = iso_ago(days=20)
+        web = {"rec_id": "w", "sk": "REC#w", "status": "pending", "source_log_group": WEB, "last_seen_at": old,
+               "source_account_id": ACCOUNT}
+        calls = []
+        def query(cw, groups, q, start=None, end=None):
+            calls.append(list(groups))
+            return None if API in groups else []
+        t = Table()
+        with Patch(aws_insights_table=t, emit_event=lambda *_a, **_k: None, get_team_api_key=lambda _t: "k",
+                   logs_client_for=lambda _c: object(), log_groups_for=lambda _c, _l: [WEB],
+                   run_insights_query=query, list_recent_findings=lambda *_a, **_k: [web],
+                   record_connection_success=lambda *_a: None):
+            h.analyze_connection({"team_id": "TEAM#t", "account_id": ACCOUNT})
+        self.assertTrue(calls)
+        self.assertEqual([u["Key"]["sk"] for u in t.updates if ":s" in u["ExpressionAttributeValues"]], ["REC#w"])
 
     def test_history_adds_new_lines_per_day(self):
         hist = L.add_history([], "2026-10-25", 5)

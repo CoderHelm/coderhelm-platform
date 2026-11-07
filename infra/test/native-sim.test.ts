@@ -115,11 +115,14 @@ test("the helper may do what it needs and nothing on another install's or anyone
   assert.notEqual(row("secretsmanager:DeleteSecret", ":secret:coderhelm/other/secrets-AbCdEf")?.simulator, "allowed");
 });
 
-test("runtime roles: only the gateway and worker may take on the two read roles in the install's own account", () => {
+test("runtime roles: only the gateway, worker and log analyzer may take on the two read roles in the install's own account", () => {
   const allowed = (F.runtime.rows as any[]).flatMap((r) => Object.entries(r.actions).filter(([a, v]) => v === "allowed" && a.startsWith("sts:")).map(([a]) => `${r.caller}: ${a} on ${r.resource.split(":").slice(4).join(":")}`)).sort();
   assert.deepEqual(allowed, [
     "gateway: sts:AssumeRole on 111122223333:role/CoderHelmLogReader",
     "gateway: sts:AssumeRole on 111122223333:role/CoderhelmReadOnly",
+    // The log analyzer reads logs here; its own role policy keeps it to the log reader.
+    "log-analyzer: sts:AssumeRole on 111122223333:role/CoderHelmLogReader",
+    "log-analyzer: sts:AssumeRole on 111122223333:role/CoderhelmReadOnly",
     "untagged: sts:AssumeRole on 999988887777:role/CoderHelmLogReader",
     "worker: sts:AssumeRole on 111122223333:role/CoderHelmLogReader",
     "worker: sts:AssumeRole on 111122223333:role/CoderhelmReadOnly",

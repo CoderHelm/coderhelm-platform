@@ -136,6 +136,13 @@ impl Severity {
 /// The analyzer's quiet period for a burst that stopped
 /// (lambda/log-analyzer/lifecycle.py DEFAULT_QUIET_DAYS).
 pub const DEFAULT_QUIET_DAYS: u64 = 3;
+/// The shortest and longest quiet period (lifecycle.py MIN_QUIET_DAYS,
+/// MAX_QUIET_DAYS).
+pub const MIN_QUIET_DAYS: u64 = 1;
+pub const MAX_QUIET_DAYS: u64 = 14;
+/// How often the analyzer runs (its EventBridge schedule), so a finding past
+/// its quiet period resolves within this long once analysis works.
+pub const ANALYSIS_EVERY_HOURS: u64 = 6;
 
 /// One finding as stored.
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -192,9 +199,15 @@ pub struct Finding {
     /// N days"); empty while open.
     pub resolved_at: String,
     pub resolved_reason: String,
-    /// Days without a matching line before the analyzer resolves it
-    /// (lifecycle.quiet_days_for); missing on older items.
+    /// Days without a matching line before the analyzer resolves it, as the
+    /// analyzer last wrote it; missing on older items and stale while the
+    /// analyzer can't run. [`Finding::quiet_days`] works it out from the same
+    /// inputs the analyzer uses instead.
     pub quiet_days: Option<u64>,
+    /// Matching lines per day (`[{day, lines}]`), oldest first.
+    pub daily_lines: Vec<Counted>,
+    /// When it was last resolved before its latest reopen (empty if never).
+    pub last_resolved_at: String,
 }
 
 impl Finding {
@@ -254,6 +267,8 @@ impl Finding {
             resolved_at: s(item, "resolved_at"),
             resolved_reason: s(item, "resolved_reason"),
             quiet_days: n(item, "quiet_days"),
+            daily_lines: counted(item, "daily_lines", "day"),
+            last_resolved_at: s(item, "last_resolved_at"),
         })
     }
 
@@ -273,12 +288,11 @@ impl Finding {
             .to_string()
     }
 
-    /// The quiet period this finding resolves after: its own, or the
-    /// analyzer's default for a burst that stopped.
+    /// The quiet period this finding resolves after, worked out exactly as
+    /// the analyzer's resolve sweep does (lifecycle.quiet_days_for), so the
+    /// date the page shows is the date the sweep uses.
     pub fn quiet_days(&self) -> u64 {
-        self.quiet_days
-            .filter(|d| *d > 0)
-            .unwrap_or(DEFAULT_QUIET_DAYS)
+        quiet_days_for(&self.daily_lines, &self.last_resolved_at, &self.reopened_at)
     }
 
     /// When an open finding resolves on its own if no new line comes
@@ -306,6 +320,159 @@ impl Finding {
         (self.count_basis == "events")
             .then_some(self.seen_count)
             .flatten()
+    }
+}
+
+/// When a time string parses (RFC 3339, or the analyzer's
+/// "YYYY-MM-DD HH:MM:SS[.f]" in UTC).
+fn parse_time(v: &str) -> Option<DateTime<Utc>> {
+    let v = v.trim();
+    if v.is_empty() {
+        return None;
+    }
+    if let Ok(t) = DateTime::parse_from_rfc3339(v) {
+        return Some(t.with_timezone(&Utc));
+    }
+    ["%Y-%m-%d %H:%M:%S%.f", "%Y-%m-%d %H:%M:%S"]
+        .iter()
+        .find_map(|f| chrono::NaiveDateTime::parse_from_str(v, f).ok())
+        .map(|t| t.and_utc())
+}
+
+/// Pure: how long a finding must go without a matching line before it is
+/// resolved. The same rule as lambda/log-analyzer/lifecycle.py
+/// `quiet_days_for` (both are checked against
+/// services/common/tests/fixtures/quiet_days_cases.json):
+/// - a burst that stopped (lines on one run of consecutive days, or no
+///   daily history): [`DEFAULT_QUIET_DAYS`];
+/// - an error that keeps coming back: twice the longest silence it came back
+///   from (gaps between days with lines, and the time from a resolve to the
+///   reopen);
+/// - never less than [`MIN_QUIET_DAYS`] nor more than [`MAX_QUIET_DAYS`].
+pub fn quiet_days_for(daily_lines: &[Counted], last_resolved_at: &str, reopened_at: &str) -> u64 {
+    let mut days: Vec<chrono::NaiveDate> = daily_lines
+        .iter()
+        .filter(|d| d.lines > 0)
+        .filter_map(|d| chrono::NaiveDate::parse_from_str(d.name.trim(), "%Y-%m-%d").ok())
+        .collect();
+    days.sort();
+    let mut gaps: Vec<u64> = days
+        .windows(2)
+        .map(|w| (w[1] - w[0]).num_days())
+        .filter(|g| *g > 1)
+        .map(|g| g as u64)
+        .collect();
+    if let (Some(resolved), Some(back)) = (parse_time(last_resolved_at), parse_time(reopened_at)) {
+        if back > resolved {
+            let d = ((back - resolved).num_milliseconds() as f64 / 86_400_000.0).round_ties_even();
+            gaps.push((d as u64).max(1));
+        }
+    }
+    let quiet = gaps
+        .iter()
+        .max()
+        .map(|g| g * 2)
+        .unwrap_or(DEFAULT_QUIET_DAYS);
+    quiet.clamp(MIN_QUIET_DAYS, MAX_QUIET_DAYS)
+}
+
+/// How the log analyzer is doing for one AWS account, from its connection
+/// item (`last_analyzed_at` on a complete run; `last_error`/`last_error_at`
+/// while runs fail, cleared by the next one that works).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Analysis {
+    pub last_ok_at: String,
+    pub error: String,
+    pub error_at: String,
+}
+
+impl Analysis {
+    pub fn from_item(item: &Item) -> Analysis {
+        Analysis {
+            last_ok_at: s(item, "last_analyzed_at"),
+            error: s(item, "last_error"),
+            error_at: s(item, "last_error_at"),
+        }
+    }
+
+    /// Whether its latest run failed (an error newer than the last run that
+    /// worked).
+    pub fn failing(&self) -> bool {
+        match (parse_time(&self.error_at), parse_time(&self.last_ok_at)) {
+            (Some(e), Some(ok)) => e > ok,
+            (Some(_), None) => true,
+            _ => false,
+        }
+    }
+
+    /// The failure in plain words, for the page.
+    pub fn reason(&self) -> String {
+        analysis_reason(&self.error)
+    }
+}
+
+/// Pure: an analyzer error as a person reads it.
+pub fn analysis_reason(error: &str) -> String {
+    let e = error.trim();
+    if e.contains("AssumeRole") && e.contains("permissions boundary") {
+        return "this install's permissions boundary stops CoderHelm from reading your AWS logs \
+                through the log reader role (fixed by updating CoderHelm)"
+            .into();
+    }
+    if e.contains("AssumeRole") && (e.contains("AccessDenied") || e.contains("not authorized")) {
+        return "CoderHelm can't use the log reader role to read your AWS logs (access denied); \
+                check the role's trust policy and external id"
+            .into();
+    }
+    if e.is_empty() {
+        return "the last check of your AWS logs failed".into();
+    }
+    let first = e.lines().next().unwrap_or(e);
+    let mut out: String = first.chars().take(160).collect();
+    if first.chars().count() > 160 {
+        out.push_str("...");
+    }
+    out
+}
+
+/// When an open finding resolves on its own, as the page can promise it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum ResolveState {
+    /// Quiet until `at`; resolves then unless seen again.
+    Scheduled { at: String },
+    /// Its quiet period has ended: the next analyzer run resolves it
+    /// (within [`ANALYSIS_EVERY_HOURS`]).
+    Due { at: String },
+    /// Its quiet period has ended, but the analyzer has failed since
+    /// `analysis_ok_at` (empty: never worked), so nothing can resolve it
+    /// until that is fixed.
+    Blocked {
+        at: String,
+        analysis_ok_at: String,
+        reason: String,
+    },
+}
+
+/// Pure: what the page says about an open finding's resolve date. A date
+/// that has passed is never shown as a promise.
+pub fn resolve_state(
+    f: &Finding,
+    analysis: Option<&Analysis>,
+    now: DateTime<Utc>,
+) -> Option<ResolveState> {
+    let at = f.resolves_at()?;
+    let when = parse_time(&at)?;
+    if when > now {
+        return Some(ResolveState::Scheduled { at });
+    }
+    match analysis.filter(|a| a.failing()) {
+        Some(a) => Some(ResolveState::Blocked {
+            at,
+            analysis_ok_at: a.last_ok_at.clone(),
+            reason: a.reason(),
+        }),
+        None => Some(ResolveState::Due { at }),
     }
 }
 
@@ -1689,10 +1856,12 @@ mod tests {
             last_seen_at: "2026-10-31T03:38:10Z".into(),
             ..Default::default()
         };
-        // An older item without a quiet period gets the analyzer's default.
+        // A burst that stopped (no history) gets the analyzer's default.
         assert_eq!(f.quiet_days(), DEFAULT_QUIET_DAYS);
         assert_eq!(f.resolves_at().as_deref(), Some("2026-11-03T03:38:10Z"));
-        f.quiet_days = Some(8);
+        // Back 4 days after it was resolved: twice that.
+        f.last_resolved_at = "2026-10-27T03:48:40.472966+00:00".into();
+        f.reopened_at = "2026-10-31T03:48:51.255562+00:00".into();
         assert_eq!(f.resolves_at().as_deref(), Some("2026-11-08T03:38:10Z"));
         f.status = "resolved".into();
         assert_eq!(f.resolves_at(), None);
@@ -1702,6 +1871,166 @@ mod tests {
 
     use super::*;
     use std::sync::Mutex;
+
+    /// The incident: resolved after its first burst, back 4 days later,
+    /// acknowledged, then quiet. The stored item has no `quiet_days` (the
+    /// analyzer couldn't run to write one), and the analyzer has failed every
+    /// run since.
+    fn came_back_and_acknowledged() -> Finding {
+        Finding {
+            status: "pending".into(),
+            acknowledged_at: "2026-11-03T06:44:39.346874173+00:00".into(),
+            last_seen_at: "2026-10-31T03:38:10.248+00:00".into(),
+            last_resolved_at: "2026-10-27T03:48:40.472966+00:00".into(),
+            reopened_at: "2026-10-31T03:48:51.255562+00:00".into(),
+            reopen_count: 1,
+            daily_lines: vec![Counted {
+                name: "2026-10-31".into(),
+                lines: 6296,
+            }],
+            ..Default::default()
+        }
+    }
+
+    fn at(t: &str) -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339(t).unwrap().with_timezone(&Utc)
+    }
+
+    #[test]
+    fn the_quiet_period_matches_the_analyzer_on_every_shared_case() {
+        // lambda/tests/test_log_dedup.py runs the same cases against the
+        // analyzer's quiet_days_for, so the page's date is the sweep's.
+        let raw = include_str!("../tests/fixtures/quiet_days_cases.json");
+        let doc: serde_json::Value = serde_json::from_str(raw).unwrap();
+        let cases = doc["cases"].as_array().unwrap();
+        assert!(cases.len() > 5);
+        for c in cases {
+            let daily: Vec<Counted> = c["daily_lines"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|d| Counted {
+                    name: d["day"].as_str().unwrap().into(),
+                    lines: d["lines"].as_u64().unwrap(),
+                })
+                .collect();
+            let got = quiet_days_for(
+                &daily,
+                c["last_resolved_at"].as_str().unwrap(),
+                c["reopened_at"].as_str().unwrap(),
+            );
+            assert_eq!(got, c["quiet_days"].as_u64().unwrap(), "{}", c["name"]);
+        }
+    }
+
+    #[test]
+    fn a_stale_stored_quiet_period_never_moves_the_date() {
+        // The page used the stored value (missing: 3 days, Nov 3) while the
+        // sweep used 8 (Nov 8). Now both work it out the same way.
+        let mut f = came_back_and_acknowledged();
+        assert_eq!(f.quiet_days(), 8);
+        f.quiet_days = Some(3);
+        assert_eq!(f.quiet_days(), 8);
+        assert_eq!(f.resolves_at().as_deref(), Some("2026-11-08T03:38:10Z"));
+    }
+
+    #[test]
+    fn a_resolve_date_still_ahead_is_a_plain_date() {
+        let f = came_back_and_acknowledged();
+        let ok = Analysis {
+            last_ok_at: "2026-11-07T15:26:49Z".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            resolve_state(&f, Some(&ok), at("2026-11-07T16:00:00Z")),
+            Some(ResolveState::Scheduled {
+                at: "2026-11-08T03:38:10Z".into()
+            })
+        );
+    }
+
+    #[test]
+    fn a_passed_date_with_analysis_failing_says_why_it_has_not_resolved() {
+        let f = came_back_and_acknowledged();
+        let failing = Analysis {
+            last_ok_at: "2026-11-02T21:48:40.182316+00:00".into(),
+            error: "An error occurred (AccessDenied) when calling the AssumeRole operation: User: \
+                    arn:aws:sts::111122223333:assumed-role/x/coderhelm-prod-log-analyzer is not \
+                    authorized to perform: sts:AssumeRole on resource: \
+                    arn:aws:iam::111122223333:role/CoderHelmLogReader with an explicit deny in a \
+                    permissions boundary: arn:aws:iam::111122223333:policy/coderhelm-prod-boundary-stack"
+                .into(),
+            error_at: "2026-11-09T09:26:49.056528+00:00".into(),
+        };
+        assert!(failing.failing());
+        match resolve_state(&f, Some(&failing), at("2026-11-09T10:00:00Z")) {
+            Some(ResolveState::Blocked {
+                at,
+                analysis_ok_at,
+                reason,
+            }) => {
+                assert_eq!(at, "2026-11-08T03:38:10Z");
+                assert_eq!(analysis_ok_at, "2026-11-02T21:48:40.182316+00:00");
+                assert!(reason.contains("permissions boundary"), "{reason}");
+                assert!(!reason.contains("arn:aws"), "{reason}");
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_passed_date_with_analysis_working_resolves_at_the_next_run() {
+        let f = came_back_and_acknowledged();
+        // An error from before the last run that worked is history, not a failure.
+        let recovered = Analysis {
+            last_ok_at: "2026-11-09T09:26:49Z".into(),
+            error: "AccessDenied".into(),
+            error_at: "2026-11-09T03:26:49Z".into(),
+        };
+        assert!(!recovered.failing());
+        assert_eq!(
+            resolve_state(&f, Some(&recovered), at("2026-11-09T10:00:00Z")),
+            Some(ResolveState::Due {
+                at: "2026-11-08T03:38:10Z".into()
+            })
+        );
+        // No connection item at all: the next run decides.
+        assert_eq!(
+            resolve_state(&f, None, at("2026-11-09T10:00:00Z")),
+            Some(ResolveState::Due {
+                at: "2026-11-08T03:38:10Z".into()
+            })
+        );
+    }
+
+    #[test]
+    fn a_finding_that_is_not_open_has_no_resolve_state() {
+        let mut f = came_back_and_acknowledged();
+        f.status = "resolved".into();
+        assert_eq!(resolve_state(&f, None, at("2026-11-09T10:00:00Z")), None);
+    }
+
+    #[test]
+    fn analysis_errors_read_in_plain_words() {
+        assert!(analysis_reason("An error occurred (AccessDenied) when calling the AssumeRole operation: not authorized")
+            .contains("can't use the log reader role"));
+        assert_eq!(
+            analysis_reason(""),
+            "the last check of your AWS logs failed"
+        );
+        let long = "x".repeat(400);
+        assert!(analysis_reason(&long).chars().count() <= 163);
+        assert_eq!(analysis_reason("Throttled\ntraceback..."), "Throttled");
+    }
+
+    #[test]
+    fn the_analyzer_and_gateway_time_formats_both_parse() {
+        assert!(parse_time("2026-10-25 14:03:11.123").is_some());
+        assert!(parse_time("2026-11-03T06:44:39.346874173+00:00").is_some());
+        assert!(parse_time("2026-10-31T03:38:10Z").is_some());
+        assert!(parse_time("").is_none());
+        assert!(parse_time("soon").is_none());
+    }
 
     const TEAM: &str = "TEAM#acme";
 

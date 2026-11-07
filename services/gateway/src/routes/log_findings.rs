@@ -62,8 +62,15 @@ fn role(claims: &Claims, level: u8) -> Result<(), Reply> {
         .map_err(|c| fail(c, "forbidden", "Your role can't do this."))
 }
 
-/// `account → region` of the team's AWS connections.
-async fn connections(state: &AppState, team_id: &str) -> Result<HashMap<String, String>, Reply> {
+/// One AWS connection as the findings page needs it: its region, and how the
+/// log analyzer is doing there.
+struct Conn {
+    region: String,
+    analysis: lf::Analysis,
+}
+
+/// `account → connection` of the team's AWS connections.
+async fn connections(state: &AppState, team_id: &str) -> Result<HashMap<String, Conn>, Reply> {
     let out = state
         .dynamo
         .query()
@@ -84,7 +91,13 @@ async fn connections(state: &AppState, team_id: &str) -> Result<HashMap<String, 
                 .and_then(|v| v.as_s().ok())
                 .cloned()
                 .unwrap_or_else(|| "us-east-1".into());
-            Some((account, region))
+            Some((
+                account,
+                Conn {
+                    region,
+                    analysis: lf::Analysis::from_item(i),
+                },
+            ))
         })
         .collect())
 }
@@ -235,13 +248,17 @@ pub async fn list_findings(
                 now,
             )
         };
-        let row = finding_json(
+        let conn = conns.get(&f.source_account_id);
+        let mut row = finding_json(
             f,
             state_,
             run.as_ref(),
             &cfg,
-            conns.get(&f.source_account_id).map(String::as_str),
+            conn.map(|c| c.region.as_str()),
         );
+        // When it resolves on its own, as the analyzer can deliver it: a date
+        // that has passed says why it hasn't happened yet.
+        row["resolve"] = json!(lf::resolve_state(f, conn.map(|c| &c.analysis), now));
         if let Some(c) = counts.get_mut(row["status"].as_str().unwrap_or("")) {
             *c += 1;
         }
@@ -257,6 +274,18 @@ pub async fn list_findings(
         "counts": counts,
         "log_groups": groups,
         "aws_connected": !conns.is_empty(),
+        // Each account whose log analysis is failing, so the page says so
+        // instead of findings that quietly never move.
+        "analysis_failing": conns
+            .iter()
+            .filter(|(_, c)| c.analysis.failing())
+            .map(|(account, c)| json!({
+                "account_id": account,
+                "last_ok_at": (!c.analysis.last_ok_at.is_empty()).then_some(&c.analysis.last_ok_at),
+                "failing_since_check": c.analysis.error_at,
+                "reason": c.analysis.reason(),
+            }))
+            .collect::<Vec<_>>(),
     })))
 }
 

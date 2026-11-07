@@ -210,7 +210,7 @@ export class WorkerStack extends cdk.Stack {
     );
     // On a hardened install the boundary lets only the gateway's and the
     // worker's roles take on these two roles in the install's own account
-    // (infra/lib/access.ts, ReadRolesHereOnlyGatewayAndWorker): this tag
+    // (infra/lib/access.ts, ReadRolesHereOnlyCoderHelmRuntime): this tag
     // says which they are.
     cdk.Tags.of(this.workerFunction.role!).add(RUNTIME_ROLE_TAG, "worker");
     // MCP servers: read their settings; write back a remote server's renewed
