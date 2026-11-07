@@ -1276,9 +1276,83 @@ pub fn blocked_item(check: &str, why: &str) -> Finding {
     }
 }
 
-/// Whether the description lists a check the change didn't pass.
+/// The Open item for a check whose gate returned `why` instead of a result.
+/// A check CoderHelm's own tools couldn't run (a command not installed in its
+/// sandbox, an install that failed) says nothing about the change: it is a
+/// check the repository's CI settles on the pull request, never a hold. Any
+/// other reason is a check the change didn't pass ([`blocked_item`]).
+pub fn check_item(check: &str, why: &str) -> Finding {
+    if !is_tooling(why) {
+        return blocked_item(check, why);
+    }
+    Finding {
+        point: "ci_pending".to_string(),
+        detail: format!(
+            "{check} couldn't run in CoderHelm's sandbox, because its own tools failed: {}",
+            why.trim()
+        ),
+        settle: "The repository's CI on this pull request settles it; it doesn't keep the draft."
+            .to_string(),
+        ..Default::default()
+    }
+}
+
+/// Whether a check's reason (or an Open items line) is CoderHelm's own
+/// tooling failing, not the change.
+fn is_tooling(text: &str) -> bool {
+    text.contains(common::stop_rules::tooling::PREFIX)
+}
+
+/// The description's lines for checks the change didn't pass.
+fn blocked_lines(body: &str) -> impl Iterator<Item = &str> {
+    body.lines().filter(|l| l.contains(BLOCKED_MARK))
+}
+
+/// Whether a blocked line is settled now: it was only CoderHelm's own tools
+/// failing to run the check (written before [`check_item`] existed), and the
+/// repository's CI is green on the head, so the check it couldn't run has
+/// run and passed. A hold needs a reason that is still true.
+fn blocked_line_settled(line: &str, ci_green: bool) -> bool {
+    ci_green && is_tooling(line)
+}
+
+/// Whether the description lists a check the change didn't pass, CI aside.
+#[cfg(test)]
 pub fn holds_blocked(body: &str) -> bool {
-    body.contains(BLOCKED_MARK)
+    holds_blocked_on(body, false)
+}
+
+/// Whether the description lists a check the change didn't pass that still
+/// holds with the repository's CI where it stands on the head.
+pub fn holds_blocked_on(body: &str, ci_green: bool) -> bool {
+    blocked_lines(body).any(|l| !blocked_line_settled(l, ci_green))
+}
+
+/// The description without the blocked lines CI settled (see
+/// [`blocked_line_settled`]), the Open items section dropped when nothing is
+/// left in it. `None` when there is nothing to remove.
+pub fn without_settled_blocked(body: &str, ci_green: bool) -> Option<String> {
+    if !blocked_lines(body).any(|l| blocked_line_settled(l, ci_green)) {
+        return None;
+    }
+    let (mut owned, rest) = super::completeness::take_owned(body);
+    let kept: Vec<&str> = owned
+        .open_items
+        .lines()
+        .filter(|l| !(l.contains(BLOCKED_MARK) && blocked_line_settled(l, ci_green)))
+        .collect();
+    let any_item = kept.iter().any(|l| {
+        let l = l.trim_start_matches('>').trim_start();
+        l.starts_with("- ") || l.starts_with("* ")
+    });
+    let section = if any_item {
+        kept.join("\n")
+    } else {
+        String::new()
+    };
+    owned.set(super::completeness::Section::OpenItems, section);
+    let out = super::completeness::assemble(&rest, &owned);
+    (out != body).then_some(out)
 }
 
 /// One Open items line, with the mark its settler needs.
