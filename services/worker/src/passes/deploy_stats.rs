@@ -62,8 +62,15 @@ const RETRY_DELAY_SECS: u64 = 120;
 const MAX_RUN_ATTEMPTS: u32 = 5;
 /// The most GitHub requests one backfill pass makes, whatever the budget.
 const MAX_PASS_REQUESTS: usize = 1000;
-/// The wait before the pass after one that used its requests.
-const CAP_DELAY_SECS: u64 = 300;
+/// The wait before the pass after one that used its requests. Short: the
+/// headroom check before every page already leaves half of GitHub's budget
+/// to live work, so the gap only spaces the passes out.
+const CAP_DELAY_SECS: u64 = 60;
+/// Passes in a row that end in an error (no installation, a marker that
+/// can't be written) before the sweep stops starting new ones.
+const MAX_FAILED_PASSES: i64 = 8;
+/// The most progress items one sweep reads.
+const SWEEP_MAX_PAGES: usize = 50;
 
 /// GitHub refused because the app has no access to Actions here.
 fn is_no_access(e: &(dyn std::error::Error + Send + Sync)) -> bool {
@@ -406,26 +413,41 @@ impl<S: Source> RepoReads<S> {
         if !maybe {
             return Ok(0);
         }
+        // When the workflow file alone says where the run deployed, the jobs
+        // that ran can't change it: no request for them, and a run that
+        // deployed nothing (cancelled, skipped) costs none at all.
+        let settled = ds::jobs_settle(run, jobs.as_deref(), &self.setting);
+        let known = settled.then(|| ds::run_targets(run, jobs.as_deref(), None, &self.setting));
+        if known.as_ref().is_some_and(|t| t.is_empty()) {
+            return Ok(0);
+        }
         if queue_push && !self.merged_by_us(run).await? {
             return Ok(0);
         }
-        let is_tag =
-            event == "push" && branch != self.default_branch && self.is_tag(&branch).await?;
+        let is_tag = event == "push"
+            && branch != self.default_branch
+            && !ds::pushed_a_branch(run)
+            && self.is_tag(&branch).await?;
         let cause = ds::cause_of(run, &self.default_branch, is_tag);
         let run_id = run["id"].as_u64().unwrap_or(0);
-        let ran: Option<Vec<Value>> = match self
-            .src
-            .get(&format!("actions/runs/{run_id}/jobs?per_page=100"))
-            .await
-        {
-            Ok(v) => v["jobs"].as_array().cloned(),
-            Err(e) => {
-                only_pause(e)?;
-                warn!(run_id, "Deploys: could not read a run's jobs");
-                None
+        let targets = match known {
+            Some(t) => t,
+            None => {
+                let ran: Option<Vec<Value>> = match self
+                    .src
+                    .get(&format!("actions/runs/{run_id}/jobs?per_page=100"))
+                    .await
+                {
+                    Ok(v) => v["jobs"].as_array().cloned(),
+                    Err(e) => {
+                        only_pause(e)?;
+                        warn!(run_id, "Deploys: could not read a run's jobs");
+                        None
+                    }
+                };
+                ds::run_targets(run, jobs.as_deref(), ran.as_deref(), &self.setting)
             }
         };
-        let targets = ds::run_targets(run, jobs.as_deref(), ran.as_deref(), &self.setting);
         let mut written = 0;
         for t in &targets {
             let item = ds::stat_item(&self.team_id, &self.repo, run, cause, t);
@@ -621,6 +643,11 @@ async fn workflow_jobs(
                 .and_then(|n| n.parse().ok())
                 .unwrap_or(0);
             if now - at < WORKFLOW_CACHE_SECS {
+                // A file that couldn't be read (deleted since) is asked again
+                // only once the hour is up, not on every run that names it.
+                if matches!(i.get("missing"), Some(AttributeValue::Bool(true))) {
+                    return Ok(None);
+                }
                 let jobs: Vec<Value> = i
                     .get("jobs")
                     .and_then(|v| v.as_s().ok())
@@ -646,6 +673,17 @@ async fn workflow_jobs(
                 return Err(e);
             }
             warn!(path, error = %e, "Deploys: could not read a workflow file");
+            let _ = state
+                .dynamo
+                .put_item()
+                .table_name(table)
+                .item("pk", av(team_id))
+                .item("sk", av(&sk))
+                .item("missing", AttributeValue::Bool(true))
+                .item("checked_at", num(now))
+                .item("ttl", num(now + 86_400))
+                .send()
+                .await;
             return Ok(None);
         }
     };
@@ -969,21 +1007,127 @@ pub async fn backfill(state: &WorkerState, msg: &DeployStatsBackfillMessage) -> 
                 state,
                 team_id,
                 ds::BACKFILL_PROGRESS_SK,
-                &[],
-                &["lease", "lease_until"],
+                &[("done", AttributeValue::Bool(true))],
+                &["lease", "lease_until", "failed_passes", "last_error"],
             )
             .await;
             Ok(())
         }
         Ok(PassEnd::Again(delay)) => {
+            update(
+                state,
+                team_id,
+                ds::BACKFILL_PROGRESS_SK,
+                &[],
+                &["failed_passes", "last_error"],
+            )
+            .await;
             queue_next_pass(state, team_id, &lease, delay).await;
             Ok(())
         }
         Err(e) => {
-            progress(state, team_id, &[("lease_until", num(0))]).await;
+            // The lease goes, and the sweep starts the next pass; after
+            // `MAX_FAILED_PASSES` such passes in a row it stops trying.
+            let _ = state
+                .dynamo
+                .update_item()
+                .table_name(&state.config.settings_table_name)
+                .key("pk", av(team_id))
+                .key("sk", av(ds::BACKFILL_PROGRESS_SK))
+                .update_expression("SET lease_until = :z, last_error = :e ADD failed_passes :one")
+                .expression_attribute_values(":z", num(0))
+                .expression_attribute_values(":e", av(&plain_reason(&e)))
+                .expression_attribute_values(":one", num(1))
+                .send()
+                .await;
             Err(e)
         }
     }
+}
+
+/// Whether the sweep starts a pass for a team from its progress item: the
+/// backfill isn't done, no pass holds the lease (one that ended without
+/// queuing the next, by an error, a timeout or a lost message, let it
+/// lapse), and passes haven't kept failing.
+pub fn should_resume(progress: &Item, now: i64) -> bool {
+    let n = |k: &str| {
+        progress
+            .get(k)
+            .and_then(|v| v.as_n().ok())
+            .and_then(|x| x.parse::<i64>().ok())
+    };
+    let done = matches!(progress.get("done"), Some(AttributeValue::Bool(true)));
+    !done
+        && n("lease_until").unwrap_or(0) < now
+        && n("failed_passes").unwrap_or(0) < MAX_FAILED_PASSES
+}
+
+/// Starts the next pass of every unfinished backfill that nothing is
+/// carrying on, so a backfill never waits for someone to open Analytics.
+/// Runs with the 15-minute sweep; the lease keeps it from doubling a pass.
+pub async fn sweep(state: &WorkerState) -> usize {
+    let now = Utc::now().timestamp();
+    let mut start: Option<Item> = None;
+    let mut teams = Vec::new();
+    for _ in 0..SWEEP_MAX_PAGES {
+        let res = state
+            .dynamo
+            .scan()
+            .table_name(&state.config.settings_table_name)
+            .filter_expression("sk = :sk AND attribute_not_exists(done)")
+            .expression_attribute_values(":sk", av(ds::BACKFILL_PROGRESS_SK))
+            .set_exclusive_start_key(start.take())
+            .send()
+            .await;
+        let page = match res {
+            Ok(p) => p,
+            Err(e) => {
+                warn!(error = %aws_sdk_dynamodb::error::DisplayErrorContext(&e), "Deploys backfill sweep: scan failed");
+                break;
+            }
+        };
+        for item in page.items() {
+            if should_resume(item, now) {
+                if let Some(pk) = item.get("pk").and_then(|v| v.as_s().ok()) {
+                    teams.push(pk.clone());
+                }
+            }
+        }
+        match page.last_evaluated_key {
+            Some(k) if !k.is_empty() => start = Some(k),
+            _ => break,
+        }
+    }
+    let mut started = 0;
+    for team_id in teams {
+        // Finished before `done` was written: mark it so the sweep skips it.
+        let finished = state
+            .dynamo
+            .get_item()
+            .table_name(&state.config.settings_table_name)
+            .key("pk", av(&team_id))
+            .key("sk", av(ds::BACKFILL_MARKER_SK))
+            .send()
+            .await
+            .ok()
+            .is_some_and(|r| r.item().is_some());
+        if finished {
+            progress(state, &team_id, &[("done", AttributeValue::Bool(true))]).await;
+            continue;
+        }
+        let body = serde_json::to_string(&crate::models::WorkerMessage::DeployStatsBackfill(
+            DeployStatsBackfillMessage {
+                team_id: team_id.clone(),
+                lease: None,
+            },
+        ))
+        .unwrap_or_default();
+        if send(state, body, 0).await {
+            info!(team_id, "Deploys backfill sweep: started the next pass");
+            started += 1;
+        }
+    }
+    started
 }
 
 async fn backfill_pass(state: &WorkerState, team_id: &str) -> Result<PassEnd, String> {
@@ -1493,8 +1637,118 @@ mod tests {
                 .count(),
             1
         );
-        assert_eq!(asked.iter().filter(|a| a.contains("/jobs")).count(), 3);
+        // "Deploy production" says where it goes and no job declares an
+        // environment: the jobs that ran can't change that, so none is read.
+        assert_eq!(asked.iter().filter(|a| a.contains("/jobs")).count(), 0);
         assert_eq!(f.deploys.load(Ordering::SeqCst), 3);
+    }
+
+    /// The count of earlier deploys took ~2,000 requests for 48 deploys in
+    /// one repository: every run of its deploy workflows read its jobs and,
+    /// per new branch, asked whether the branch was a tag, though the
+    /// workflow's name already settled where it went. Replayed on that shape
+    /// (preview deploys on every push to a PR branch, most of them cancelled
+    /// by the next push, staging and production on the default branch), a
+    /// run now costs no request of its own: only the listing pages remain.
+    #[tokio::test]
+    async fn deploys_named_by_their_workflow_cost_no_request_per_run() {
+        let mut f = Fake::default();
+        let three = |a: &str, b: &str, c: &str| {
+            [a, b, c]
+                .iter()
+                .map(|k| JobDef {
+                    key: k.to_string(),
+                    name: k.to_string(),
+                    environment: String::new(),
+                })
+                .collect::<Vec<_>>()
+        };
+        f.workflows.insert(
+            ".github/workflows/deploy-preview.yml".into(),
+            three("build", "deploy_preview_web", "comment"),
+        );
+        f.workflows.insert(
+            ".github/workflows/deploy-staging.yml".into(),
+            three("build", "deploy_staging_web", "e2e_playwright"),
+        );
+        let mut r = reads(&f);
+        let mut deploys = 0;
+        for id in 0..800u64 {
+            let (mut run, counts) = match id % 50 {
+                // A staging deploy from the default branch.
+                0 => (
+                    bot_run(
+                        id,
+                        "push",
+                        "main",
+                        "Deploy Staging",
+                        ".github/workflows/deploy-staging.yml",
+                    ),
+                    true,
+                ),
+                // A preview deploy that finished.
+                1..=3 => (
+                    bot_run(
+                        id,
+                        "push",
+                        &format!("coderhelm/fix-{}", id / 3),
+                        "Deploy Preview",
+                        ".github/workflows/deploy-preview.yml",
+                    ),
+                    true,
+                ),
+                // Most preview runs are cancelled by the next push.
+                _ => {
+                    let mut run = bot_run(
+                        id,
+                        "push",
+                        &format!("coderhelm/fix-{}", id / 3),
+                        "Deploy Preview",
+                        ".github/workflows/deploy-preview.yml",
+                    );
+                    run["conclusion"] = json!("cancelled");
+                    (run, false)
+                }
+            };
+            run["pull_requests"] = json!([{"number": id / 3}]);
+            if id % 50 == 0 {
+                run["pull_requests"] = json!([]);
+            }
+            let n = r.record(&run).await.unwrap();
+            assert_eq!(n, usize::from(counts), "run {id}");
+            deploys += n;
+        }
+        let asked = f.asked.lock().unwrap().clone();
+        assert_eq!(deploys, 64);
+        assert!(asked.is_empty(), "no request per run: {asked:?}");
+        // Each workflow file is read once.
+        assert_eq!(f.workflow_reads.load(Ordering::SeqCst), 2);
+    }
+
+    /// A workflow whose jobs declare where they deploy still reads which of
+    /// them ran: a skipped deploy job is no deploy.
+    #[tokio::test]
+    async fn jobs_that_declare_an_environment_are_still_read() {
+        let mut f = Fake::default();
+        f.workflows.insert(
+            ".github/workflows/release.yml".into(),
+            vec![JobDef {
+                key: "ship".into(),
+                name: "ship".into(),
+                environment: "production".into(),
+            }],
+        );
+        let mut r = reads(&f);
+        let run = bot_run(
+            1,
+            "push",
+            "main",
+            "Release",
+            ".github/workflows/release.yml",
+        );
+        r.record(&run).await.unwrap();
+        let asked = f.asked.lock().unwrap().clone();
+        assert_eq!(asked.iter().filter(|a| a.contains("/jobs")).count(), 1);
     }
 
     #[tokio::test]
@@ -1631,5 +1885,56 @@ mod tests {
             start.next(now).as_ref(),
             "the next week is where the next pass starts"
         );
+    }
+
+    fn progress_item(pairs: &[(&str, AttributeValue)]) -> Item {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.clone()))
+            .collect()
+    }
+
+    /// A pass that errored, timed out or lost its next message left the
+    /// count at "Counting earlier deploys" until someone opened Analytics
+    /// and an hour had passed. The sweep now starts the next pass as soon as
+    /// the lease lapses, and leaves alone a pass that holds it.
+    #[test]
+    fn the_sweep_resumes_a_backfill_nothing_is_carrying_on() {
+        let now = 1_800_000_000;
+        // A pass ended in an error: the lease was let go.
+        let dropped = progress_item(&[
+            ("lease_until", num(0)),
+            ("failed_passes", num(1)),
+            ("repos_read", num(9)),
+        ]);
+        assert!(should_resume(&dropped, now));
+        // The worker timed out mid-pass: its lease ran out on its own.
+        let lapsed = progress_item(&[("lease_until", num(now - 1))]);
+        assert!(should_resume(&lapsed, now));
+        // Never had a lease field written: resume.
+        assert!(should_resume(&progress_item(&[]), now));
+        // A pass is reading, or the next one is queued and holds the lease.
+        let held = progress_item(&[("lease_until", num(now + 1200))]);
+        assert!(!should_resume(&held, now));
+        // Finished: never again.
+        let done = progress_item(&[("done", AttributeValue::Bool(true))]);
+        assert!(!should_resume(&done, now));
+    }
+
+    /// A team whose passes keep failing (no installation any more) isn't
+    /// started every 15 minutes forever.
+    #[test]
+    fn the_sweep_stops_after_passes_keep_failing() {
+        let now = 1_800_000_000;
+        let failing = progress_item(&[
+            ("lease_until", num(0)),
+            ("failed_passes", num(MAX_FAILED_PASSES)),
+        ]);
+        assert!(!should_resume(&failing, now));
+        let one_short = progress_item(&[
+            ("lease_until", num(0)),
+            ("failed_passes", num(MAX_FAILED_PASSES - 1)),
+        ]);
+        assert!(should_resume(&one_short, now));
     }
 }

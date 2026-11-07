@@ -361,6 +361,38 @@ pub fn run_targets(
     out
 }
 
+/// Whether the workflow file alone settles a run's deploy targets, so
+/// [`run_targets`] gives the same answer whatever jobs ran and reading them
+/// would cost a request for nothing: the repository's setting names the
+/// environment, or no job declares an environment and the workflow is a
+/// named deploy whose name or file says where it goes.
+pub fn jobs_settle(
+    run: &Value,
+    jobs: Option<&[JobDef]>,
+    setting: &HashMap<String, String>,
+) -> bool {
+    let workflow = run["name"].as_str().unwrap_or("");
+    let path = run["path"].as_str().unwrap_or("");
+    let file = path.rsplit('/').next().unwrap_or("").to_ascii_lowercase();
+    let set = setting.get(&file);
+    if set.is_some_and(|e| !e.is_empty()) {
+        return true;
+    }
+    // No jobs read (the file is gone): no job declares an environment.
+    let named_deploy = set.is_some() || says_deploy(workflow) || says_deploy(&file);
+    named_deploy
+        && jobs.unwrap_or(&[]).iter().all(|j| j.environment.is_empty())
+        && (env_of(workflow).is_some() || env_of(&file).is_some())
+}
+
+/// Whether a pushed ref is certainly a branch, from the run alone: GitHub
+/// lists the pull requests of a branch push, and a tag has none.
+pub fn pushed_a_branch(run: &Value) -> bool {
+    run["pull_requests"]
+        .as_array()
+        .is_some_and(|a| !a.is_empty())
+}
+
 pub fn stat_sk(created_at: &str, repo: &str, run_id: u64, env_name: &str) -> String {
     format!(
         "{PREFIX}{created_at}#{}#{run_id}#{}",
@@ -651,5 +683,87 @@ jobs:
         assert_eq!(a["environment"].as_s().unwrap(), "production");
         assert_eq!(a["cause"].as_s().unwrap(), "merge");
         assert_eq!(a["outcome"].as_s().unwrap(), "succeeded");
+    }
+
+    /// Skipping the jobs read must never change what is counted: whenever
+    /// the file alone settles a run, every set of jobs that ran gives the
+    /// same targets as reading none.
+    #[test]
+    fn a_run_the_file_settles_counts_the_same_whatever_ran() {
+        let jobs = vec![
+            JobDef {
+                key: "build".into(),
+                name: "build".into(),
+                environment: String::new(),
+            },
+            JobDef {
+                key: "deploy_preview_web".into(),
+                name: "deploy_preview_web".into(),
+                environment: String::new(),
+            },
+        ];
+        let setting = HashMap::new();
+        let ran_sets = [
+            serde_json::json!([]),
+            serde_json::json!([{"name": "build", "conclusion": "success"}]),
+            serde_json::json!([{"name": "deploy_preview_web", "conclusion": "skipped"}]),
+            serde_json::json!([{"name": "deploy to production", "conclusion": "failure"}]),
+        ];
+        for (name, path, conclusion) in [
+            (
+                "Deploy Preview",
+                ".github/workflows/deploy-preview.yml",
+                "success",
+            ),
+            (
+                "Deploy Staging",
+                ".github/workflows/deploy-staging.yml",
+                "failure",
+            ),
+            (
+                "Deploy Production",
+                ".github/workflows/deploy-production.yml",
+                "cancelled",
+            ),
+            ("Ship", ".github/workflows/deploy-prod.yml", "success"),
+        ] {
+            let run = serde_json::json!({"name": name, "path": path, "conclusion": conclusion});
+            assert!(jobs_settle(&run, Some(&jobs), &setting), "{name}");
+            let none = run_targets(&run, Some(&jobs), None, &setting);
+            for ran in &ran_sets {
+                let r = ran.as_array().unwrap().clone();
+                assert_eq!(
+                    run_targets(&run, Some(&jobs), Some(&r), &setting),
+                    none,
+                    "{name} {ran}"
+                );
+            }
+        }
+        // Not settled: a job declares an environment, the name says nothing
+        // about where, or the workflow isn't a deploy.
+        let with_env = vec![JobDef {
+            key: "ship".into(),
+            name: "ship".into(),
+            environment: "prod".into(),
+        }];
+        let run =
+            serde_json::json!({"name": "Deploy Production", "path": ".github/workflows/x.yml"});
+        assert!(!jobs_settle(&run, Some(&with_env), &setting));
+        let run = serde_json::json!({"name": "Deploy", "path": ".github/workflows/deploy.yml"});
+        assert!(!jobs_settle(&run, Some(&jobs), &setting));
+        let run = serde_json::json!({"name": "CI", "path": ".github/workflows/ci.yml"});
+        assert!(!jobs_settle(&run, Some(&jobs), &setting));
+        // The repository's setting names the environment: settled.
+        let set = HashMap::from([("ci.yml".to_string(), "staging".to_string())]);
+        assert!(jobs_settle(&run, Some(&with_env), &set));
+    }
+
+    #[test]
+    fn a_push_with_pull_requests_is_a_branch() {
+        assert!(pushed_a_branch(
+            &serde_json::json!({"pull_requests": [{"number": 3}]})
+        ));
+        assert!(!pushed_a_branch(&serde_json::json!({"pull_requests": []})));
+        assert!(!pushed_a_branch(&serde_json::json!({})));
     }
 }
