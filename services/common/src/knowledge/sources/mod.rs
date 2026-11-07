@@ -45,6 +45,7 @@ pub mod notion;
 pub mod oauth;
 pub mod sanity;
 pub mod sanity_mcp;
+pub mod sanity_repos;
 pub mod store;
 pub mod sync;
 pub mod text;
