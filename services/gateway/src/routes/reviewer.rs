@@ -477,6 +477,18 @@ pub async fn update_config(
         error!("Failed to update reviewer config: {e}");
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
+    // The review sweeps find configs through this index; the daily rebuild
+    // adds the team if this write fails, so the save still succeeds.
+    if let Err(e) = common::settings_index::add(
+        &state.dynamo,
+        &state.config.settings_table_name,
+        common::review_config_index::NAME,
+        &claims.team_id,
+    )
+    .await
+    {
+        tracing::warn!(error = %e, "Could not add the team to the reviewer config index");
+    }
 
     // A repo the reviewer is set up for gets its code graph built (once),
     // unless the graph was turned off for it.
