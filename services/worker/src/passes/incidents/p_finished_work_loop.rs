@@ -251,17 +251,17 @@ fn the_pull_request_opens_before_every_check() {
         }
         assert!(!body.contains("blocked the pull request"), "{name}");
         assert!(
-            body.contains("proof::blocked_item(\"The link and redirect check\""),
+            body.contains("proof::check_item(\"The link and redirect check\""),
             "{name}"
         );
         assert!(
-            body.contains("proof::blocked_item(\"The failing-test rules\""),
+            body.contains("proof::check_item(\"The failing-test rules\""),
             "{name}"
         );
     }
     let rules = single.find("feature::gate(").unwrap();
     assert!(single.find("pr::run(\n").unwrap() < rules);
-    assert!(single.contains("proof::blocked_item(\"The new-feature rules\""));
+    assert!(single.contains("proof::check_item(\"The new-feature rules\""));
     // A resume after the pull request never opens or describes it again.
     assert!(single.contains("let pr_result = if let Some(o) = opened {"));
     assert!(multi.contains("let pr_result = if let Some(o) = already_open {"));

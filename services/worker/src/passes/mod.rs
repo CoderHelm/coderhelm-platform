@@ -6127,7 +6127,7 @@ async fn run_passes(
     let links = match link_checks::gate(&work, &mut evidence, usage, has_time).await {
         Ok(l) => l,
         Err(why) => {
-            gaps.push(proof::blocked_item("The link and redirect check", &why));
+            gaps.push(proof::check_item("The link and redirect check", &why));
             String::new()
         }
     };
@@ -6140,7 +6140,7 @@ async fn run_passes(
     let test_pr = match test_fix::gate(&work, &mut evidence, usage, has_time).await {
         Ok(t) => t,
         Err(why) => {
-            gaps.push(proof::blocked_item("The failing-test rules", &why));
+            gaps.push(proof::check_item("The failing-test rules", &why));
             None
         }
     };
@@ -6163,7 +6163,7 @@ async fn run_passes(
     {
         Ok(f) => f,
         Err(why) => {
-            gaps.push(proof::blocked_item("The new-feature rules", &why));
+            gaps.push(proof::check_item("The new-feature rules", &why));
             None
         }
     };
@@ -7164,7 +7164,7 @@ async fn run_repo_pipeline(
     {
         Ok(l) => l,
         Err(why) => {
-            gaps.push(proof::blocked_item("The link and redirect check", &why));
+            gaps.push(proof::check_item("The link and redirect check", &why));
             String::new()
         }
     };
@@ -7177,7 +7177,7 @@ async fn run_repo_pipeline(
     {
         Ok(t) => t,
         Err(why) => {
-            gaps.push(proof::blocked_item("The failing-test rules", &why));
+            gaps.push(proof::check_item("The failing-test rules", &why));
             None
         }
     };

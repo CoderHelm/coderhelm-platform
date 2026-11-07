@@ -97,9 +97,9 @@ fn the_own_review_requests_changes_and_lists_every_non_optional_finding() {
     // goes through the one decision, which holds on them.
     assert!(draft_hold(&body, "Keep the text", true).is_some());
     let ready = include_str!("../ready.rs");
-    let holds = fn_src(ready, "pub fn body_holds(");
+    let holds = fn_src(ready, "pub fn body_holds_on(");
     assert!(holds.contains("own_review::hold(body)"));
-    assert!(fn_src(ready, "pub fn decide(").contains("body_holds(&f.body)"));
+    assert!(fn_src(ready, "pub fn decide(").contains("body_holds_on(&f.body, f.ci.green)"));
     let main = include_str!("../../main.rs");
     assert!(main.contains("passes::ready::on_message(&state, msg)"));
     // The run gets them as a fix round, not a completion.

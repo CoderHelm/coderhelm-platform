@@ -933,17 +933,17 @@ impl Ledger {
             None => {}
         }
         match &self.links_outcome {
-            Some(Err(why)) => open.push(proof::blocked_item("The link and redirect check", why)),
+            Some(Err(why)) => open.push(proof::check_item("The link and redirect check", why)),
             Some(Ok(_)) => {}
             None => {}
         }
         match &self.test_outcome {
-            Some(Err(why)) => open.push(proof::blocked_item("The failing-test rules", why)),
+            Some(Err(why)) => open.push(proof::check_item("The failing-test rules", why)),
             Some(Ok(_)) => {}
             None => {}
         }
         match &self.rules_outcome {
-            Some(Err(why)) => open.push(proof::blocked_item("The new-feature rules", why)),
+            Some(Err(why)) => open.push(proof::check_item("The new-feature rules", why)),
             Some(Ok(Some(facts))) => open.extend(feature::open_findings(facts)),
             Some(Ok(None)) => {}
             None => open.push(proof::blocked_item(

@@ -136,7 +136,15 @@ pub enum Decision {
 /// The reasons the description itself holds the draft for, each with what a
 /// person can do. Every one of these is something a person must decide or
 /// fix, so each stays a hold (see the module's rules).
+#[cfg(test)]
 pub fn body_holds(body: &str) -> Vec<Reason> {
+    body_holds_on(body, false)
+}
+
+/// [`body_holds`] with the repository's CI where it stands on the head: a
+/// check CoderHelm's own tools couldn't run is settled once CI is green, so it
+/// no longer holds (`proof::holds_blocked_on`).
+pub fn body_holds_on(body: &str, ci_green: bool) -> Vec<Reason> {
     let mut out = Vec::new();
     // Security: never shipped over without a person.
     if super::proof::holds_security_items(body) {
@@ -157,7 +165,7 @@ pub fn body_holds(body: &str) -> Vec<Reason> {
     // A check that would once have stopped the pull request (carried-over
     // commits, missing registrations, a migration that can't be released
     // safely, redirects): a named, checked problem.
-    if super::proof::holds_blocked(body) {
+    if super::proof::holds_blocked_on(body, ci_green) {
         out.push(Reason::new(
             "A check the change didn't pass is listed under Open items",
             "Fix it on this branch, or delete that line once a person has dealt with it.",
@@ -204,7 +212,7 @@ pub fn decide(f: &Facts) -> Decision {
             )],
         };
     }
-    let mut reasons = body_holds(&f.body);
+    let mut reasons = body_holds_on(&f.body, f.ci.green);
     // Redirects and links the change adds that fail when checked now: a
     // named, checked correctness problem a reader would hit.
     if !f.links_blocking.is_empty() {
@@ -353,6 +361,12 @@ pub fn body_for(body: &str, d: &Decision) -> Option<String> {
         status_section(d),
     );
     if let Decision::Ready { open } = d {
+        // A check CoderHelm's own tools couldn't run no longer holds once CI
+        // is green (the only way a description with one reaches Ready): its
+        // line goes, so the description doesn't say it still holds.
+        if let Some(b) = super::proof::without_settled_blocked(&out, true) {
+            out = b;
+        }
         if let Some(b) = super::proof::with_marked_items(
             &out,
             super::proof::READY_OPEN_MARK,
