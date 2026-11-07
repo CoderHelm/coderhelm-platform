@@ -190,11 +190,13 @@ pub async fn get_health(
     };
     let events = st.events_since(team, &since).await.map_err(internal)?;
     let runs = closed_runs(&state, team, &since).await;
-    let reviews: Vec<String> = fields("REVIEW#", &["created_at"])
+    // Each review's pull request comes from its key (`REVIEW#{repo}#{pr}#{at}`),
+    // so the review loops count pull requests on both sides.
+    let reviews: Vec<health::Review> = fields("REVIEW#", &["sk"])
         .await
         .iter()
-        .map(|i| item_s(i, "created_at"))
-        .filter(|t| t.as_str() >= since.as_str())
+        .filter_map(|i| health::Review::of_sk(&item_s(i, "sk")))
+        .filter(|r| r.created_at.as_str() >= since.as_str())
         .collect();
     let exemplar_last_used: Vec<String> =
         fields(common::rewards::exemplars::PREFIX, &["last_used_at"])
