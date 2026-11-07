@@ -1875,24 +1875,10 @@ async fn handle_pull_request(
                 warn!(pr_number, error = %e, "Could not record a stopped auto-merge's PR as closed");
             }
             // Merged with CoderHelm's request for changes on it: the flagged
-            // lines left as they were, or fixed first (the outcome log).
+            // lines left as they were, or fixed first (the outcome log),
+            // read from what changed since each block's head.
             if merged {
-                common::decision_log::on_merged(
-                    &state.dynamo,
-                    &state.config.settings_table_name,
-                    team_id,
-                    &format!(
-                        "{}/{}",
-                        repo["owner"]["login"].as_str().unwrap_or(""),
-                        repo["name"].as_str().unwrap_or("")
-                    ),
-                    pr_number,
-                    payload["pull_request"]["head"]["sha"]
-                        .as_str()
-                        .unwrap_or(""),
-                    None,
-                )
-                .await;
+                record_blocks_at_merge(state, payload, installation_id, team_id, pr_number).await;
             }
         }
     }
@@ -1907,21 +1893,31 @@ async fn handle_pull_request(
     let pr_user = payload["pull_request"]["user"]["login"]
         .as_str()
         .unwrap_or("");
+    let pr_number = payload["pull_request"]["number"].as_u64().unwrap_or(0);
+    let repo = &payload["repository"];
+    let owner = repo["owner"]["login"].as_str().unwrap_or("");
+    let name = repo["name"].as_str().unwrap_or("");
     if !pr_user.contains("coderhelm") {
+        // A person's PR CoderHelm reviewed: what became of each review
+        // comment (a Nit or a Suggestion on an approval as much as a
+        // blocker) is the reviewer's outcome.
+        if pr_number != 0 {
+            queue_review_outcome(state, team_id, installation_id, owner, name, pr_number).await;
+        }
         return Ok(StatusCode::OK);
     }
 
-    let pr_number = payload["pull_request"]["number"].as_u64().unwrap_or(0);
     if pr_number == 0 {
         return Ok(StatusCode::OK);
     }
 
-    let repo = &payload["repository"];
-    let owner = repo["owner"]["login"].as_str().unwrap_or("");
-    let name = repo["name"].as_str().unwrap_or("");
-
     // The run that opened this PR: its own PR, or one of a multi-repo run's.
     let found = lookup_run_item_by_pr(state, team_id, owner, name, pr_number).await;
+    if found.is_none() {
+        // CoderHelm's PR with no run behind it (opened by hand from the
+        // app, or its record expired): its review comments still count.
+        queue_review_outcome(state, team_id, installation_id, owner, name, pr_number).await;
+    }
     // A multi-repo run's other PR: its own outcome goes on its entry in
     // `prs`; the run's status and outcome follow the PR its record names.
     let is_primary = found
@@ -2172,10 +2168,137 @@ async fn queue_reward_outcome(
         repo_owner: owner.to_string(),
         repo_name: name.to_string(),
         pr_number,
+        review_only: false,
     });
     if let Err(e) = send_to_queue(state, &state.config.ticket_queue_url, &msg).await {
         warn!(team_id, run_id, pr_number, status = ?e, "Could not queue the PR's reward outcome");
     }
+}
+
+/// Hands a closed PR CoderHelm reviewed (and didn't write, or has no run
+/// for) to the worker, to record what became of each review comment. Only
+/// PRs with a CoderHelm review record are queued.
+async fn queue_review_outcome(
+    state: &AppState,
+    team_id: &str,
+    installation_id: u64,
+    owner: &str,
+    name: &str,
+    pr_number: u64,
+) {
+    if !super::review_lessons::reviewed_by_coderhelm(state, team_id, owner, name, pr_number).await {
+        return;
+    }
+    let msg = WorkerMessage::RewardOutcome(common::rewards::RewardOutcomeMessage {
+        team_id: team_id.to_string(),
+        installation_id,
+        run_id: String::new(),
+        repo_owner: owner.to_string(),
+        repo_name: name.to_string(),
+        pr_number,
+        review_only: true,
+    });
+    match send_to_queue(state, &state.config.ticket_queue_url, &msg).await {
+        Ok(_) => info!(
+            team_id,
+            owner, name, pr_number, "Reviewed PR closed: review outcome queued"
+        ),
+        Err(e) => {
+            warn!(team_id, pr_number, status = ?e, "Could not queue the reviewed PR's outcome")
+        }
+    }
+}
+
+/// A merged PR's open blocks in the outcome log: for each block's head, the
+/// files changed between it and the merged head decide whether the flagged
+/// lines were fixed or merged as they were. Without the compare every block
+/// with a later commit read as fixed.
+async fn record_blocks_at_merge(
+    state: &AppState,
+    payload: &Value,
+    installation_id: u64,
+    team_id: &str,
+    pr_number: u64,
+) {
+    let repo = &payload["repository"];
+    let owner = repo["owner"]["login"].as_str().unwrap_or("");
+    let name = repo["name"].as_str().unwrap_or("");
+    let full = format!("{owner}/{name}");
+    let merge_head = payload["pull_request"]["head"]["sha"]
+        .as_str()
+        .unwrap_or("");
+    let table = &state.config.settings_table_name;
+    let heads =
+        common::decision_log::open_block_heads(&state.dynamo, table, team_id, &full, pr_number)
+            .await;
+    if heads.is_empty() {
+        return;
+    }
+    let mut changed: std::collections::HashMap<String, Vec<String>> = Default::default();
+    for h in heads.iter().filter(|h| h.as_str() != merge_head).take(3) {
+        if let Some(files) =
+            changed_files_between(state, installation_id, owner, name, h, merge_head).await
+        {
+            changed.insert(h.clone(), files);
+        }
+    }
+    let n = common::decision_log::on_merged_by_head(
+        &state.dynamo,
+        table,
+        team_id,
+        &full,
+        pr_number,
+        merge_head,
+        &changed,
+    )
+    .await;
+    info!(team_id, repo = %full, pr_number, blocks = n, "Merge outcome recorded on the PR's blocks");
+}
+
+/// The files changed between two commits, from GitHub's compare. `None`
+/// when GitHub couldn't be asked.
+async fn changed_files_between(
+    state: &AppState,
+    installation_id: u64,
+    owner: &str,
+    name: &str,
+    base: &str,
+    head: &str,
+) -> Option<Vec<String>> {
+    if base.is_empty() || head.is_empty() {
+        return None;
+    }
+    let token = crate::auth::github_app::get_installation_token(state, installation_id)
+        .await
+        .ok()?;
+    let url = format!("https://api.github.com/repos/{owner}/{name}/compare/{base}...{head}");
+    let v: Value = state
+        .http
+        .get(&url)
+        .header("Authorization", format!("Bearer {token}"))
+        .header("Accept", "application/vnd.github+json")
+        .header("User-Agent", "Coderhelm-bot")
+        .send()
+        .await
+        .ok()?
+        .error_for_status()
+        .ok()?
+        .json()
+        .await
+        .ok()?;
+    Some(compare_files(&v))
+}
+
+/// The file names of a GitHub compare.
+pub(crate) fn compare_files(v: &Value) -> Vec<String> {
+    v["files"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|f| f["filename"].as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 fn reward_store(state: &AppState) -> common::rewards::store::Store {
@@ -2222,10 +2345,18 @@ async fn record_revert(state: &AppState, payload: &Value, team_id: &str) {
     ) else {
         return;
     };
-    let run_id = lookup_run_by_pr(state, team_id, owner, name, target).await;
-    if run_id.is_empty() {
+    let Some(run) = lookup_run_item_by_pr(state, team_id, owner, name, target).await else {
         return; // not one of CoderHelm's
-    }
+    };
+    let Some(run_id) = common::paged::run_id_of(&run) else {
+        return;
+    };
+    let run_s = |k: &str| {
+        run.get(k)
+            .and_then(|v| v.as_s().ok())
+            .cloned()
+            .unwrap_or_default()
+    };
     let at = pr["merged_at"]
         .as_str()
         .map(str::to_string)
@@ -2244,11 +2375,27 @@ async fn record_revert(state: &AppState, payload: &Value, team_id: &str) {
     ))
     .with_source("webhook:pull_request");
     ev.run_id = run_id;
+    // The area and the coder arm the reverted run's own outcome was scored
+    // under: the revert counts for the area's lesson and against that arm.
+    ev.area = run_s("reward_area");
+    if bandit_arm_ok(&run_s("prompt_variant")) {
+        ev.variant = run_s("prompt_variant");
+    }
+    ev.prompt_version = common::rewards::bandit::CODER_PROMPT_VERSION.to_string();
+    let title = pr["title"].as_str().unwrap_or("").trim().to_string();
+    if !title.is_empty() {
+        ev.notes = vec![common::truncate_str(&title, 200).to_string()];
+    }
     if let Err(e) = reward_store(state).record(&ev).await {
         warn!(error = %e, "Could not record the revert");
     } else {
         info!(team_id, repo = %full, pr = target, "A CoderHelm change was reverted");
     }
+}
+
+/// One of the coder's prompt variants.
+fn bandit_arm_ok(arm: &str) -> bool {
+    common::rewards::bandit::arm(common::rewards::event::AGENT_CODER, arm).is_some()
 }
 
 /// Counts people's commits on a merged pull request. `None` when GitHub

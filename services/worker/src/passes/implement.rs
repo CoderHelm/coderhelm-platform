@@ -181,10 +181,13 @@ pub async fn run(
             ""
         };
     // The team's instructions are never trimmed: they are its working rules.
+    // What outcomes taught the coder here (lessons naming what people
+    // changed, and the prompt variant its bandit picked) sits with the
+    // repository's own instructions, capped by `rewards::implement_block`.
     let system = coder_system(
         &msg.repo_owner,
         &msg.repo_name,
-        &format!("{rules_block}{instructions_block}"),
+        &format!("{rules_block}{instructions_block}{}", msg.coder_learning),
         &msg.team_instructions,
         tests_block,
     );

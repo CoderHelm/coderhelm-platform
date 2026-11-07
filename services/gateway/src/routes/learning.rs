@@ -7,7 +7,7 @@
 
 use axum::extract::{Query, State};
 use axum::{http::StatusCode, Extension, Json};
-use common::rewards::{bandit, event::AGENTS, store::Store, summary};
+use common::rewards::{bandit, event::AGENTS, health, store::Store, summary};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::sync::Arc;
@@ -92,6 +92,194 @@ pub async fn get_learning(
         exemplars: &exemplars,
         arms: &arms,
     })))
+}
+
+/// Pages read per record kind for the health page (keys and a few fields
+/// only, never an example's embedding or a decision's picture).
+const HEALTH_PAGES: usize = 10;
+
+type Item = std::collections::HashMap<String, aws_sdk_dynamodb::types::AttributeValue>;
+
+fn item_s(i: &Item, k: &str) -> String {
+    i.get(k)
+        .and_then(|v| v.as_s().ok())
+        .cloned()
+        .unwrap_or_default()
+}
+
+fn item_n(i: &Item, k: &str) -> f64 {
+    i.get(k)
+        .and_then(|v| v.as_n().ok())
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0.0)
+}
+
+/// Pure: the CoderHelm pull requests that closed, from run items
+/// (`pr_url`, `merged_at` or `pr_closed_at`).
+pub fn closed_prs_of(runs: &[Item]) -> Vec<health::ClosedPr> {
+    runs.iter()
+        .filter_map(|r| {
+            let (owner, name, pr) = common::pr_outcome::parse_pr_url(&item_s(r, "pr_url"))?;
+            let closed_at = match item_s(r, "merged_at") {
+                m if !m.is_empty() => m,
+                _ => item_s(r, "pr_closed_at"),
+            };
+            (!closed_at.is_empty()).then(|| health::ClosedPr {
+                repo: format!("{owner}/{name}"),
+                pr,
+                closed_at,
+            })
+        })
+        .collect()
+}
+
+/// The team's runs whose PR merged or closed since `since`.
+async fn closed_runs(state: &AppState, team: &str, since: &str) -> Vec<Item> {
+    let mut out = Vec::new();
+    let mut start: Option<Item> = None;
+    for _ in 0..HEALTH_PAGES {
+        let page = state
+            .dynamo
+            .query()
+            .table_name(&state.config.runs_table_name)
+            .key_condition_expression("team_id = :t")
+            .filter_expression("merged_at >= :s OR pr_closed_at >= :s")
+            .projection_expression("pr_url, merged_at, pr_closed_at")
+            .expression_attribute_values(
+                ":t",
+                aws_sdk_dynamodb::types::AttributeValue::S(team.into()),
+            )
+            .expression_attribute_values(
+                ":s",
+                aws_sdk_dynamodb::types::AttributeValue::S(since.into()),
+            )
+            .set_exclusive_start_key(start.take())
+            .send()
+            .await;
+        let Ok(page) = page else {
+            break;
+        };
+        out.extend(page.items().iter().cloned());
+        match page.last_evaluated_key() {
+            Some(k) if !k.is_empty() => start = Some(k.clone()),
+            _ => break,
+        }
+    }
+    out
+}
+
+/// GET /api/learning/health — per learning loop: its last signal, its count
+/// over the last 7 days, what should have fed it, and `quiet` (the page red)
+/// when a loop that should have fired stayed silent.
+pub async fn get_health(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<Claims>,
+) -> Result<Json<Value>, StatusCode> {
+    let team = claims.team_id.as_str();
+    let st = store(&state);
+    let now = chrono::Utc::now();
+    let since = (now - chrono::Duration::days(health::WINDOW_DAYS)).to_rfc3339();
+    let fields = |prefix: &'static str, f: &'static [&'static str]| {
+        let st = st.clone();
+        let team = team.to_string();
+        async move {
+            st.query_projected(&team, prefix, f, HEALTH_PAGES)
+                .await
+                .unwrap_or_default()
+        }
+    };
+    let events = st.events_since(team, &since).await.map_err(internal)?;
+    let runs = closed_runs(&state, team, &since).await;
+    let reviews: Vec<String> = fields("REVIEW#", &["created_at"])
+        .await
+        .iter()
+        .map(|i| item_s(i, "created_at"))
+        .filter(|t| t.as_str() >= since.as_str())
+        .collect();
+    let exemplar_last_used: Vec<String> =
+        fields(common::rewards::exemplars::PREFIX, &["last_used_at"])
+            .await
+            .iter()
+            .map(|i| item_s(i, "last_used_at"))
+            .collect();
+    let arms: Vec<health::ArmPull> = fields(
+        common::rewards::store::ARM_PREFIX,
+        &["agent", "pulls", "last_pull_at"],
+    )
+    .await
+    .iter()
+    .map(|i| health::ArmPull {
+        agent: item_s(i, "agent"),
+        pulls: item_n(i, "pulls").max(0.0) as u64,
+        last_pull_at: item_s(i, "last_pull_at"),
+    })
+    .collect();
+    let categories_updated: Vec<String> =
+        fields(common::rewards::store::CAT_PREFIX, &["updated_at"])
+            .await
+            .iter()
+            .map(|i| item_s(i, "updated_at"))
+            .collect();
+    let calibration_changes: Vec<(String, String)> = st
+        .changes(team)
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|c| c.kind == common::rewards::changes::KIND_CALIBRATION)
+        .map(|c| (c.at, c.to))
+        .collect();
+    let coder_lessons_seen: Vec<String> = st
+        .lessons(team, None)
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|l| l.agent == common::rewards::event::AGENT_CODER)
+        .map(|l| l.last_seen_at)
+        .collect();
+    let pending: Vec<health::Pending> = fields(
+        common::review_lessons::PENDING_SK_PREFIX,
+        &["status", "last_event_at", "judged_at", "learned"],
+    )
+    .await
+    .iter()
+    .map(|i| health::Pending {
+        status: item_s(i, "status"),
+        last_event_at_ms: item_n(i, "last_event_at") as i64,
+        judged_at: item_s(i, "judged_at"),
+        learned: item_n(i, "learned").max(0.0) as u64,
+    })
+    .collect();
+    let review_lessons_seen: Vec<String> =
+        fields(common::review_lessons::LESSON_SK_PREFIX, &["last_seen_at"])
+            .await
+            .iter()
+            .map(|i| item_s(i, "last_seen_at"))
+            .collect();
+    let decisions = common::decision_log::since_light(
+        &state.dynamo,
+        &state.config.settings_table_name,
+        team,
+        &since,
+        HEALTH_PAGES,
+    )
+    .await;
+    let closed = closed_prs_of(&runs);
+    Ok(Json(health::build(
+        &health::Inputs {
+            events: &events,
+            closed_prs: &closed,
+            reviews: &reviews,
+            exemplar_last_used: &exemplar_last_used,
+            arms: &arms,
+            categories_updated: &categories_updated,
+            calibration_changes: &calibration_changes,
+            coder_lessons_seen: &coder_lessons_seen,
+            pending: &pending,
+            review_lessons_seen: &review_lessons_seen,
+            decisions: &decisions,
+        },
+        now,
+    )))
 }
 
 #[derive(Deserialize)]
@@ -255,8 +443,44 @@ mod tests {
             check_pin("reviewer", Some("bogus")),
             Err(StatusCode::BAD_REQUEST)
         );
-        assert_eq!(check_pin("coder", None), Err(StatusCode::BAD_REQUEST));
+        // The coder has variants now, so they can be pinned too.
+        assert_eq!(check_pin("coder", None), Ok(()));
+        assert_eq!(check_pin("coder", Some("read_first")), Ok(()));
+        assert_eq!(check_pin("planner", None), Err(StatusCode::BAD_REQUEST));
         assert_eq!(check_pin("nope", Some("x")), Err(StatusCode::BAD_REQUEST));
+    }
+
+    #[test]
+    fn closed_prs_are_read_from_runs() {
+        use aws_sdk_dynamodb::types::AttributeValue as A;
+        let run = |url: &str, merged: &str, closed: &str| {
+            let mut i = Item::new();
+            i.insert("pr_url".into(), A::S(url.into()));
+            if !merged.is_empty() {
+                i.insert("merged_at".into(), A::S(merged.into()));
+            }
+            if !closed.is_empty() {
+                i.insert("pr_closed_at".into(), A::S(closed.into()));
+            }
+            i
+        };
+        let got = closed_prs_of(&[
+            run(
+                "https://github.com/acme/web/pull/3",
+                "2026-11-05T00:00:00Z",
+                "",
+            ),
+            run(
+                "https://github.com/acme/web/pull/4",
+                "",
+                "2026-11-04T00:00:00Z",
+            ),
+            run("https://github.com/acme/web/pull/5", "", ""),
+            run("not a url", "2026-11-05T00:00:00Z", ""),
+        ]);
+        assert_eq!(got.len(), 2);
+        assert_eq!((got[0].repo.as_str(), got[0].pr), ("acme/web", 3));
+        assert_eq!(got[1].closed_at, "2026-11-04T00:00:00Z");
     }
 
     #[test]

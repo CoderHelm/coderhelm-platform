@@ -320,6 +320,7 @@ mod tests {
             ticket_history_note: None,
             plan_cache_key: None,
             team_instructions: String::new(),
+            coder_learning: String::new(),
             person_direction: None,
             answers: Vec::new(),
             new_run_id: None,

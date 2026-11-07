@@ -1,0 +1,23 @@
+{
+  "name": "The stop judge is shown the blocks people overrode, so the outcome log feeds the next decision",
+  "about": "What people did after an ask, stop or block was recorded only for analytics and the weekly email: nothing the judge saw changed. The merge also passed no compare, so every block with a later commit read as fixed. The judge's picture now carries the team's recent decisions of the same kind that people's acts showed wrong (same step first), and a merge compares each block's own head.",
+  "case": "decision_overturned",
+  "input": {
+    "kind": "block",
+    "step": "review",
+    "records": [
+      { "kind": "block", "step": "review", "verdict": "hold", "category": "other", "detail": "Log level should be warn", "outcome": "overrode", "created_at": "2026-11-01T00:00:00Z" },
+      { "kind": "block", "step": "review", "verdict": "hold", "category": "correctness", "detail": "Null cursor on the last page", "outcome": "fixed", "created_at": "2026-11-02T00:00:00Z" },
+      { "kind": "block", "step": "own_review", "verdict": "hold", "category": "other", "detail": "Rename the helper", "outcome": "merged_flagged_unchanged", "created_at": "2026-11-03T00:00:00Z" },
+      { "kind": "ask", "step": "plan", "verdict": "ask", "category": "business_rule", "detail": "Monthly or weekly totals?", "outcome": "answered_default", "created_at": "2026-11-03T00:00:00Z" }
+    ]
+  },
+  "expect": {
+    "lines": 2,
+    "prompt_contains": [
+      "## Earlier decisions like this one that people overturned",
+      "hold by the review step (other): \"Log level should be warn\"; people went ahead over it",
+      "people merged with the flagged lines unchanged"
+    ]
+  }
+}

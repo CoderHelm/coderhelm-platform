@@ -126,6 +126,45 @@ impl Store {
         Ok(out)
     }
 
+    /// Like [`Self::query_prefix`], reading only `projection` (comma-separated
+    /// attribute names, no reserved words), for counts that need no payload
+    /// (an example's embedding or a decision's picture stay unread).
+    pub async fn query_projected(
+        &self,
+        team_id: &str,
+        prefix: &str,
+        projection: &[&str],
+        max_pages: usize,
+    ) -> Result<Vec<Item>, String> {
+        let mut out = vec![];
+        let mut start: Option<Item> = None;
+        let names: Vec<String> = (0..projection.len()).map(|i| format!("#p{i}")).collect();
+        for _ in 0..max_pages.max(1) {
+            let mut q = self
+                .dynamo
+                .query()
+                .table_name(&self.table)
+                .key_condition_expression("pk = :pk AND begins_with(sk, :p)")
+                .expression_attribute_values(":pk", s(team_id))
+                .expression_attribute_values(":p", s(prefix))
+                .projection_expression(names.join(", "))
+                .set_exclusive_start_key(start.take());
+            for (alias, name) in names.iter().zip(projection) {
+                q = q.expression_attribute_names(alias, *name);
+            }
+            let page = q
+                .send()
+                .await
+                .map_err(|e| DisplayErrorContext(e).to_string())?;
+            out.extend(page.items.unwrap_or_default());
+            match page.last_evaluated_key {
+                Some(k) if !k.is_empty() => start = Some(k),
+                _ => break,
+            }
+        }
+        Ok(out)
+    }
+
     async fn get(&self, team_id: &str, sk: &str) -> Result<Option<Item>, String> {
         self.dynamo
             .get_item()
@@ -400,11 +439,13 @@ impl Store {
             .table_name(&self.table)
             .key("pk", s(team_id))
             .key("sk", s(&arm_sk(agent, arm)))
-            .update_expression("ADD #p :one SET #rt = :rt, #ag = :a, #arm = :k")
+            .update_expression("ADD #p :one SET #rt = :rt, #ag = :a, #arm = :k, #lp = :now")
             .expression_attribute_names("#p", "pulls")
             .expression_attribute_names("#rt", "record_type")
             .expression_attribute_names("#ag", "agent")
             .expression_attribute_names("#arm", "arm")
+            .expression_attribute_names("#lp", "last_pull_at")
+            .expression_attribute_values(":now", s(&chrono::Utc::now().to_rfc3339()))
             .expression_attribute_values(":one", n(1))
             .expression_attribute_values(":rt", s("reward_arm"))
             .expression_attribute_values(":a", s(agent))
@@ -863,6 +904,113 @@ impl Store {
         };
         let items = self.query_prefix(team_id, &prefix, None).await?;
         Ok(items.iter().map(lesson_of).collect())
+    }
+
+    /// The coder's one lesson for (`repo`, `area`), written or rewritten from
+    /// the area's recent setbacks when the evidence backs it (two independent
+    /// outcomes, one strong): the text follows what people did most
+    /// recently, `seen` counts the outcomes behind it, an admin's revert
+    /// stays, and the area's older generic lessons are removed. A new lesson
+    /// is logged as a change. Returns the lesson's id, or None when the
+    /// evidence does not back one.
+    pub async fn learn_area(
+        &self,
+        team_id: &str,
+        repo: &str,
+        area: &str,
+        text: &str,
+        evidence: &[RewardEvent],
+    ) -> Result<Option<String>, String> {
+        if text.trim().is_empty() || !super::lessons::backed(evidence) {
+            return Ok(None);
+        }
+        let id = super::lessons::area_lesson_id(area);
+        let sk = lesson_sk(repo, &id);
+        let kept = self.lessons(team_id, Some(repo)).await?;
+        let existing = kept.iter().find(|l| l.id == id);
+        let now = chrono::Utc::now().to_rfc3339();
+        let seen = evidence
+            .iter()
+            .map(|e| format!("{}#{}", e.repo, e.pr))
+            .collect::<std::collections::BTreeSet<_>>()
+            .len()
+            .max(1);
+        let lines: Vec<AttributeValue> = evidence
+            .iter()
+            .take(12)
+            .map(|e| {
+                s(&format!(
+                    "{} PR #{}: {}",
+                    e.kind.map(RewardKind::label).unwrap_or(""),
+                    e.pr,
+                    e.detail
+                ))
+            })
+            .collect();
+        self.dynamo
+            .put_item()
+            .table_name(&self.table)
+            .item("pk", s(team_id))
+            .item("sk", s(&sk))
+            .item("record_type", s("reward_lesson"))
+            .item("id", s(&id))
+            .item("repo", s(repo))
+            .item("agent", s(super::event::AGENT_CODER))
+            .item("area", s(area))
+            .item("text", s(text))
+            .item("seen", n(seen))
+            .item(
+                "created_at",
+                s(existing.map(|l| l.created_at.as_str()).unwrap_or(&now)),
+            )
+            .item("last_seen_at", s(&now))
+            .item("evidence", AttributeValue::L(lines))
+            .item(
+                "reverted",
+                AttributeValue::Bool(existing.is_some_and(|l| l.reverted)),
+            )
+            .send()
+            .await
+            .map_err(|e| DisplayErrorContext(e).to_string())?;
+        for old in kept
+            .iter()
+            .filter(|l| l.id != id && l.agent == super::event::AGENT_CODER)
+            .filter(|l| super::lessons::is_generic_area_lesson(&l.text, area))
+        {
+            let _ = self
+                .dynamo
+                .delete_item()
+                .table_name(&self.table)
+                .key("pk", s(team_id))
+                .key("sk", s(&lesson_sk(repo, &old.id)))
+                .send()
+                .await;
+        }
+        if existing.is_none() {
+            let change = Change {
+                id: ulid::Ulid::new().to_string(),
+                repo: repo.to_string(),
+                kind: changes::KIND_LESSON.into(),
+                key: id.clone(),
+                from: String::new(),
+                to: crate::truncate_str(text, 300).to_string(),
+                reason: format!("New coder lesson for `{area}` backed by {seen} outcomes"),
+                evidence: evidence
+                    .iter()
+                    .take(12)
+                    .map(|e| {
+                        serde_json::json!({
+                            "kind": e.kind.map(RewardKind::key).unwrap_or(""),
+                            "at": e.at, "pr": e.pr, "run_id": e.run_id, "detail": e.detail,
+                        })
+                    })
+                    .collect(),
+                at: now,
+                ..Default::default()
+            };
+            self.apply_change(team_id, &change).await?;
+        }
+        Ok(Some(id))
     }
 
     /// Writes a lesson the evidence backs, or reinforces the one it repeats,

@@ -522,6 +522,7 @@ async fn main() -> Result<(), Error> {
         )
         // What CoderHelm learned from outcomes, and the admin controls
         .route("/learning", get(routes::learning::get_learning))
+        .route("/learning/health", get(routes::learning::get_health))
         .route("/learning/pin", post(routes::learning::pin_variant))
         .route("/learning/revert", post(routes::learning::revert_change))
         .route("/learning/restore", post(routes::learning::restore_change))

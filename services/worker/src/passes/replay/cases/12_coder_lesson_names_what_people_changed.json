@@ -1,0 +1,22 @@
+{
+  "name": "A coder lesson names what people changed and said, not 'read the surrounding code'",
+  "about": "The two coder lessons in production said only that changes in an area 'were closed without merging, needed CI fix rounds, rewritten by people' and to 'read the surrounding code and keep the change small': nothing the coder could act on, and the second was a near copy of the first with more PR numbers. A lesson now names the files people changed with their commit subjects, why a PR was closed, and what to do next, one lesson per area.",
+  "case": "learning_coder_lesson",
+  "input": {
+    "area": "apps/site",
+    "events": [
+      { "kind": "pr_merged_edited", "pr": 21, "at": "2026-11-02T10:00:00Z", "value": 0.45, "files": ["apps/site/src/fetch.ts", "apps/site/src/hooks/useSlots.ts"], "notes": ["Use the shared fetch hook instead of a new client"] },
+      { "kind": "pr_closed_unmerged", "pr": 24, "at": "2026-11-04T10:00:00Z", "notes": ["The banner text lives in the CMS, not in code"] },
+      { "kind": "ci_fix_rounds", "pr": 24, "at": "2026-11-04T10:00:00Z", "value": 3 }
+    ]
+  },
+  "expect": {
+    "contains": [
+      "In `apps/site`",
+      "PR #24 was closed without merging (\"The banner text lives in the CMS, not in code\")",
+      "people changed `apps/site/src/fetch.ts`, `apps/site/src/hooks/useSlots.ts` before merging (\"Use the shared fetch hook instead of a new client\")",
+      "read `apps/site/src/fetch.ts`, `apps/site/src/hooks/useSlots.ts` first"
+    ],
+    "not_contains": ["Read the surrounding code", "100%"]
+  }
+}

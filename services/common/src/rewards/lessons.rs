@@ -49,9 +49,11 @@ fn words(s: &str) -> BTreeSet<String> {
         "the", "a", "an", "and", "or", "of", "to", "in", "on", "for", "is", "are", "be", "this",
         "that", "with", "it", "as", "at", "by", "here", "when", "only",
     ];
+    // Numbers (PR numbers, percentages) say which outcome, not what was
+    // learned: two lessons differing only in them are the same lesson.
     s.to_ascii_lowercase()
         .split(|c: char| !c.is_ascii_alphanumeric())
-        .filter(|w| w.len() > 1 && !STOP.contains(w))
+        .filter(|w| w.len() > 1 && !STOP.contains(w) && !w.chars().all(|c| c.is_ascii_digit()))
         .map(str::to_string)
         .collect()
 }
@@ -127,7 +129,13 @@ pub fn prompt_block(lessons: &[Lesson]) -> String {
     }
     let lines: Vec<String> = lessons
         .iter()
-        .map(|l| format!("- {} (seen {}×)", l.text.trim(), l.seen))
+        .map(|l| {
+            format!(
+                "- {} (seen {}×)",
+                crate::truncate_str(l.text.trim(), MAX_PROMPT_LESSON_CHARS),
+                l.seen
+            )
+        })
         .collect();
     format!(
         "\n\n## Lessons from what happened to earlier work in this repository\nEach is backed by at least two outcomes.\n{}",
@@ -156,41 +164,192 @@ pub fn plan(text: &str, evidence: &[RewardEvent], kept: &[Lesson]) -> Plan {
     }
 }
 
-/// The lesson an outcome pattern teaches, in plain words, or None.
-/// `negatives` are this repo area's recent bad outcomes for the coder.
-pub fn coder_lesson_text(area: &str, negatives: &[RewardEvent]) -> Option<String> {
-    if negatives.is_empty() {
-        return None;
+/// A coder outcome bad enough to look for a pattern behind it.
+pub fn is_coder_setback(e: &RewardEvent) -> bool {
+    match e.kind {
+        Some(RewardKind::PrClosedUnmerged)
+        | Some(RewardKind::PrReverted)
+        | Some(RewardKind::IncidentLinked) => true,
+        Some(RewardKind::CiFixRounds) => e.value >= 2.0,
+        // People changed a real part of it (measured from their own
+        // commits, so a merge of the base branch no longer counts).
+        Some(RewardKind::PrMergedEdited) => e.value >= SETBACK_EDIT_SHARE,
+        _ => false,
     }
-    let mut kinds: Vec<&str> = negatives
-        .iter()
-        .filter_map(|e| e.kind)
-        .map(|k| match k {
-            RewardKind::PrReverted => "reverted",
-            RewardKind::PrClosedUnmerged => "closed without merging",
-            RewardKind::IncidentLinked => "tied to an alert",
-            RewardKind::CiFixRounds => "needed CI fix rounds",
-            RewardKind::PrMergedEdited => "rewritten by people before merging",
-            _ => "rejected",
-        })
-        .collect();
-    kinds.sort();
-    kinds.dedup();
-    let prs: BTreeSet<String> = negatives
-        .iter()
-        .filter(|e| e.pr > 0)
-        .map(|e| format!("#{}", e.pr))
-        .collect();
+}
+
+/// The share of a PR's diff people changed that makes it a setback.
+pub const SETBACK_EDIT_SHARE: f64 = 0.3;
+
+/// Most pull requests one coder lesson names, newest first.
+pub const MAX_LESSON_PRS: usize = 4;
+/// Longest coder lesson.
+pub const MAX_LESSON_CHARS: usize = 900;
+/// Longest lesson text put into a prompt.
+pub const MAX_PROMPT_LESSON_CHARS: usize = 700;
+
+/// The id of the one coder lesson kept per (repository, area): later
+/// outcomes in the area rewrite it with what people did most recently,
+/// instead of piling up near-copies that differ only in PR numbers.
+pub fn area_lesson_id(area: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let d = Sha256::digest(area.as_bytes());
+    let h: String = d.iter().take(8).map(|b| format!("{b:02x}")).collect();
+    format!("AREA-{h}")
+}
+
+/// A coder lesson written before lessons named what people did (`Changes in
+/// `area` were ...`): replaced by the area's lesson when it is written.
+pub fn is_generic_area_lesson(text: &str, area: &str) -> bool {
     let place = if area.is_empty() {
         "this repository".to_string()
     } else {
         format!("`{area}`")
     };
-    Some(format!(
-        "Changes in {place} were {} ({}). Read the surrounding code and its tests before changing it, and keep the change small.",
-        kinds.join(", "),
-        prs.into_iter().collect::<Vec<_>>().join(", ")
-    ))
+    text.starts_with(&format!("Changes in {place} were "))
+}
+
+fn quote(s: &str) -> String {
+    format!(
+        "\"{}\"",
+        crate::truncate_str(s.trim().trim_matches('"'), 140)
+    )
+}
+
+/// What one bad outcome says, specifically: the files people changed and
+/// their own words, why a PR was closed, a revert, or CI rounds.
+fn outcome_line(e: &RewardEvent) -> Option<String> {
+    let pr = if e.pr > 0 {
+        format!("PR #{}", e.pr)
+    } else {
+        "a change".to_string()
+    };
+    let notes: Vec<String> = e
+        .notes
+        .iter()
+        .filter(|n| !n.trim().is_empty())
+        .take(2)
+        .map(|n| quote(n))
+        .collect();
+    let said = if notes.is_empty() {
+        String::new()
+    } else {
+        format!(" ({})", notes.join("; "))
+    };
+    match e.kind? {
+        RewardKind::PrMergedEdited => {
+            let files: Vec<String> = e.files.iter().take(3).map(|f| format!("`{f}`")).collect();
+            if files.is_empty() && notes.is_empty() {
+                return Some(format!(
+                    "{pr} was rewritten by people before merging ({}% of the diff)",
+                    (e.value * 100.0).round() as u64
+                ));
+            }
+            let what = if files.is_empty() {
+                "changed it".to_string()
+            } else {
+                format!("changed {}", files.join(", "))
+            };
+            Some(format!("on {pr} people {what} before merging{said}"))
+        }
+        RewardKind::PrClosedUnmerged => Some(format!("{pr} was closed without merging{said}")),
+        RewardKind::PrReverted => Some(format!("{pr} was reverted after merging{said}")),
+        RewardKind::IncidentLinked => Some(format!("{pr} was tied to an alert{said}")),
+        RewardKind::CiFixRounds => Some(format!(
+            "{pr} needed {} CI fix rounds",
+            e.value.round() as u64
+        )),
+        _ => None,
+    }
+}
+
+/// The lesson an outcome pattern teaches, in plain words, or None.
+/// `negatives` are this repo area's recent bad outcomes for the coder. The
+/// lesson names what people did (the files they changed and their commit
+/// subjects, why they closed a PR), newest first, and what to do about it,
+/// so it changes what the coder does rather than restating "be careful".
+pub fn coder_lesson_text(area: &str, negatives: &[RewardEvent]) -> Option<String> {
+    let mut newest: Vec<&RewardEvent> = negatives.iter().filter(|e| e.kind.is_some()).collect();
+    if newest.is_empty() {
+        return None;
+    }
+    newest.sort_by(|a, b| b.at.cmp(&a.at));
+    // One line per pull request: the most telling outcome of it.
+    let rank = |e: &RewardEvent| match e.kind {
+        Some(RewardKind::PrReverted) | Some(RewardKind::IncidentLinked) => 0,
+        Some(RewardKind::PrMergedEdited) if !e.files.is_empty() || !e.notes.is_empty() => 1,
+        Some(RewardKind::PrClosedUnmerged) if !e.notes.is_empty() => 1,
+        Some(RewardKind::PrClosedUnmerged) | Some(RewardKind::PrMergedEdited) => 2,
+        _ => 3,
+    };
+    let mut lines: Vec<String> = Vec::new();
+    let mut by_pr: Vec<(&RewardEvent, i32)> = Vec::new();
+    for e in &newest {
+        match by_pr
+            .iter_mut()
+            .find(|(x, _)| x.repo == e.repo && x.pr == e.pr)
+        {
+            Some(slot) if rank(e) < slot.1 => *slot = (e, rank(e)),
+            Some(_) => {}
+            None => by_pr.push((e, rank(e))),
+        }
+    }
+    for (e, _) in &by_pr {
+        if let Some(l) = outcome_line(e) {
+            lines.push(l);
+        }
+        if lines.len() >= MAX_LESSON_PRS {
+            break;
+        }
+    }
+    if lines.is_empty() {
+        return None;
+    }
+    let place = if area.is_empty() {
+        "this repository".to_string()
+    } else {
+        format!("`{area}`")
+    };
+    let edited_files: Vec<String> = {
+        let mut f: Vec<String> = Vec::new();
+        for e in &newest {
+            for p in &e.files {
+                if !f.contains(p) {
+                    f.push(p.clone());
+                }
+            }
+        }
+        f.into_iter().take(4).collect()
+    };
+    let has = |k: RewardKind| newest.iter().any(|e| e.kind == Some(k));
+    let mut todo: Vec<String> = Vec::new();
+    if !edited_files.is_empty() {
+        todo.push(format!(
+            "read {} first and follow what people changed there",
+            edited_files
+                .iter()
+                .map(|f| format!("`{f}`"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+    if has(RewardKind::PrClosedUnmerged) || has(RewardKind::PrReverted) {
+        todo.push("check the reasons above against the plan before writing code".into());
+    }
+    if has(RewardKind::CiFixRounds) {
+        todo.push(format!(
+            "run the repository's own checks for {place} before finishing"
+        ));
+    }
+    if todo.is_empty() {
+        todo.push("keep the change to what the ticket asks".into());
+    }
+    let text = format!(
+        "In {place}: {}. Next time, {}.",
+        lines.join("; "),
+        todo.join(", and ")
+    );
+    Some(crate::truncate_str(&text, MAX_LESSON_CHARS).to_string())
 }
 
 #[cfg(test)]
@@ -306,8 +465,49 @@ mod tests {
         )
         .unwrap();
         assert!(t.contains("`src/billing`"));
-        assert!(t.contains("#3, #9"));
-        assert!(t.contains("closed without merging, reverted"));
+        assert!(t.contains("PR #3 was reverted"), "{t}");
+        assert!(t.contains("PR #9 was closed without merging"), "{t}");
         assert!(coder_lesson_text("", &[]).is_none());
+    }
+
+    /// Production had two lessons for one area that said only "were closed
+    /// without merging, needed CI fix rounds, rewritten by people... Read
+    /// the surrounding code": nothing a coder could act on. A lesson names
+    /// what people changed and said, newest first, and what to do.
+    #[test]
+    fn coder_lessons_say_what_people_changed() {
+        let mut edited = ev(RewardKind::PrMergedEdited, 12).with_value(0.4);
+        edited.at = "2026-10-03T00:00:00Z".into();
+        edited.files = vec!["apps/web/src/api.ts".into(), "apps/web/src/hooks.ts".into()];
+        edited.notes = vec!["Use the shared fetch hook".into()];
+        let mut closed = ev(RewardKind::PrClosedUnmerged, 15);
+        closed.at = "2026-10-04T00:00:00Z".into();
+        closed.notes = vec!["The flag lives in the CMS, not in code".into()];
+        let mut ci = ev(RewardKind::CiFixRounds, 15).with_value(3.0);
+        ci.at = "2026-10-04T00:00:00Z".into();
+        let t = coder_lesson_text("apps/web", &[edited, closed, ci]).unwrap();
+        assert!(t.starts_with("In `apps/web`: PR #15 was closed without merging (\"The flag lives in the CMS, not in code\")"), "{t}");
+        assert!(t.contains("on PR #12 people changed `apps/web/src/api.ts`, `apps/web/src/hooks.ts` before merging (\"Use the shared fetch hook\")"), "{t}");
+        assert!(
+            t.contains("read `apps/web/src/api.ts`, `apps/web/src/hooks.ts` first"),
+            "{t}"
+        );
+        assert!(!t.contains("Read the surrounding code"));
+        assert!(t.len() <= MAX_LESSON_CHARS);
+        // One lesson per area, and the old generic ones are recognised.
+        assert_eq!(area_lesson_id("apps/web"), area_lesson_id("apps/web"));
+        assert_ne!(area_lesson_id("apps/web"), area_lesson_id("apps/api"));
+        assert!(is_generic_area_lesson(
+            "Changes in `apps/web` were closed without merging (#1). Read the surrounding code.",
+            "apps/web"
+        ));
+        assert!(!is_generic_area_lesson(&t, "apps/web"));
+        // PR numbers alone don't make a different lesson.
+        assert!(
+            similarity(
+                "closed without merging #12 #13",
+                "closed without merging #99"
+            ) > 0.99
+        );
     }
 }

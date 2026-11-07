@@ -283,11 +283,19 @@ pub struct Picture {
     /// The decision is still recorded here, without a model call.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub cannot_proceed: String,
+    /// Earlier decisions of this kind on this team that people's acts
+    /// showed wrong (a question answered with its default, a block dismissed
+    /// or merged over), one line each: what the judge learns from the outcome
+    /// log (`decision_log::overturned_lines`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub overturned: Vec<String>,
 }
 
 /// Longest text of one field in the prompt and the stored record.
 const MAX_FIELD: usize = 6_000;
 const MAX_ITEMS: usize = 40;
+/// Most overturned decisions shown to the judge.
+pub const MAX_OVERTURNED: usize = 5;
 
 impl Picture {
     pub fn new(kind: Kind, step: &str, reason: &str) -> Self {
@@ -307,6 +315,7 @@ impl Picture {
         self.threads.truncate(MAX_ITEMS);
         self.related.truncate(MAX_ITEMS);
         self.results.truncate(MAX_ITEMS);
+        self.overturned.truncate(MAX_OVERTURNED);
         for (i, e) in self.evidence.iter_mut().enumerate() {
             if e.id.trim().is_empty() {
                 e.id = format!("E{}", i + 1);
@@ -320,7 +329,8 @@ impl Picture {
         self
     }
 
-    fn kind(&self) -> Kind {
+    /// The decision proposed (a stop when unset).
+    pub fn kind(&self) -> Kind {
         self.kind.unwrap_or(Kind::Stop)
     }
 
@@ -700,6 +710,17 @@ pub fn prompt(p: &Picture) -> String {
         }
         s.push('\n');
     }
+    if !p.overturned.is_empty() {
+        s.push_str(
+            "## Earlier decisions like this one that people overturned\nWhat people did after \
+             them shows they weren't needed. Don't repeat one unless this case differs in a way \
+             you can name.\n",
+        );
+        for o in &p.overturned {
+            s.push_str(&format!("- {}\n", clip(o)));
+        }
+        s.push('\n');
+    }
     s.push_str(&format!("## Budget\n{}\n", p.budget.line()));
     s
 }
@@ -970,6 +991,24 @@ mod tests {
         json!({"verdict":"hold","assumption":"","question":"","person_only":"","tried":[],
                "options":[],"default":"","deadline_hours":0,"blocker":blocker,
                "evidence":evidence,"category":category,"location":location})
+    }
+
+    #[test]
+    fn overturned_decisions_reach_the_prompt_bounded() {
+        let mut p = picture(Kind::Block);
+        assert!(!prompt(&p).contains("people overturned"));
+        p.overturned = (0..9).map(|i| format!("hold number {i}")).collect();
+        let p = p.with_ids();
+        assert_eq!(p.overturned.len(), MAX_OVERTURNED);
+        let text = prompt(&p);
+        assert!(text.contains("## Earlier decisions like this one that people overturned"));
+        assert!(text.contains("- hold number 0"));
+        assert!(!text.contains("hold number 5"));
+        // Older stored pictures without the field still read.
+        let old: Picture = serde_json::from_value(json!({"kind":"block","step":"review",
+            "reason":"r","reversible":true,"ticket_title":"","ticket_body":""}))
+        .unwrap();
+        assert!(old.overturned.is_empty());
     }
 
     fn proceed(a: &str) -> Value {

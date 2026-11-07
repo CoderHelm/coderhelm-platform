@@ -2141,18 +2141,18 @@ async fn run_passes(
     };
     // What outcomes taught the coder in this repository: changes merged as
     // written and ones closed, rewritten or reverted, and evidence-backed
-    // lessons.
-    let memory_context = format!(
-        "{memory_context}{}",
-        rewards::coder_learning(
-            state,
-            &msg.team_id,
-            &format!("{}/{}", msg.repo_owner, msg.repo_name),
-            run_id,
-            &format!("{} {}", msg.title, common::truncate_str(&msg.body, 1500)),
-        )
-        .await
-    );
+    // lessons, for the planner; the lessons and the prompt variant the
+    // coder's bandit picked, for the coder itself.
+    let coder_learned = rewards::coder_learning(
+        state,
+        &msg.team_id,
+        &format!("{}/{}", msg.repo_owner, msg.repo_name),
+        run_id,
+        &format!("{} {}", msg.title, common::truncate_str(&msg.body, 1500)),
+    )
+    .await;
+    msg.coder_learning = coder_learned.implement.clone();
+    let memory_context = format!("{memory_context}{}", coder_learned.context);
 
     // --- A continuation of this same run (Lambda time limit, step budget,
     // a transient model error) picks up this run's own triage and plan: the
@@ -2661,6 +2661,15 @@ async fn run_passes(
                 // go into the plan made there.
                 repo_instructions =
                     load_repo_instructions(&github, &msg.repo_owner, &msg.repo_name).await;
+                msg.coder_learning = rewards::coder_learning(
+                    state,
+                    &msg.team_id,
+                    &format!("{}/{}", msg.repo_owner, msg.repo_name),
+                    run_id,
+                    &format!("{} {}", msg.title, common::truncate_str(&msg.body, 1500)),
+                )
+                .await
+                .implement;
                 msg.team_instructions =
                     load_team_instructions(state, &msg.team_id, &msg.repo_owner, &msg.repo_name)
                         .await;
