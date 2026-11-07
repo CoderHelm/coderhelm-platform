@@ -1004,6 +1004,9 @@ pub struct DeployBackfill {
     pub not_read: Vec<(String, String)>,
     /// While it runs: repositories read, of how many.
     pub progress: Option<(u64, u64)>,
+    /// While it waits out GitHub's rate limit: when reading resumes (epoch
+    /// seconds).
+    pub resume_at: Option<i64>,
 }
 
 impl DeployBackfill {
@@ -1034,6 +1037,10 @@ impl DeployBackfill {
                 .unwrap_or_default(),
             not_read,
             progress: progress.and_then(|p| Some((n(p, "repos_read")?, n(p, "repos_total")?))),
+            resume_at: progress
+                .and_then(|p| p.get("resume_at"))
+                .and_then(|v| v.as_n().ok())
+                .and_then(|x| x.parse::<i64>().ok()),
         }
     }
 }
@@ -1139,10 +1146,16 @@ pub fn add_deploys(
         .iter()
         .map(|(repo, reason)| json!({"repo": repo, "reason": reason}))
         .collect::<Vec<_>>());
-    // Real progress while earlier deploys are read: repositories read of all.
+    // Real progress while earlier deploys are read: repositories read of all,
+    // and when reading resumes while it waits out GitHub's rate limit.
     compared["deploys_backfill_progress"] = match backfill.progress {
         Some((read, total)) if backfill.since.is_none() && total > 0 => {
-            json!({"read": read.min(total), "total": total})
+            let resumes_at = backfill
+                .resume_at
+                .filter(|t| *t > Utc::now().timestamp())
+                .and_then(|t| DateTime::<Utc>::from_timestamp(t, 0))
+                .map(|t| t.to_rfc3339_opts(chrono::SecondsFormat::Secs, true));
+            json!({"read": read.min(total), "total": total, "resumes_at": resumes_at})
         }
         _ => Value::Null,
     };
@@ -2553,6 +2566,38 @@ mod tests {
         assert_eq!(c["deploys_comparable"], true);
     }
 
+    /// While the backfill waits out GitHub's rate limit the page can say
+    /// when it resumes instead of a bare "Counting"; a time already past
+    /// isn't shown.
+    #[test]
+    fn a_waiting_backfill_says_when_it_resumes() {
+        let (w, p) = windows();
+        let soon = Utc::now().timestamp() + 1800;
+        let waiting: Item = HashMap::from([
+            ("repos_read".to_string(), AttributeValue::N("9".into())),
+            ("repos_total".to_string(), AttributeValue::N("11".into())),
+            ("resume_at".to_string(), AttributeValue::N(soon.to_string())),
+        ]);
+        let b = DeployBackfill::from_items(None, Some(&waiting));
+        let mut c = comparison(w, p, None, &[], &[], &[]);
+        add_deploys(&mut c, w, p, None, &[], None, &b);
+        let expected = DateTime::<Utc>::from_timestamp(soon, 0)
+            .unwrap()
+            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        assert_eq!(
+            c["deploys_backfill_progress"]["resumes_at"],
+            json!(expected)
+        );
+        assert_eq!(c["deploys_backfill_progress"]["read"], 9);
+
+        let mut past = waiting.clone();
+        past.insert("resume_at".to_string(), AttributeValue::N("1000".into()));
+        let b = DeployBackfill::from_items(None, Some(&past));
+        let mut d = comparison(w, p, None, &[], &[], &[]);
+        add_deploys(&mut d, w, p, None, &[], None, &b);
+        assert_eq!(d["deploys_backfill_progress"]["resumes_at"], Value::Null);
+    }
+
     /// The page showed "Counting earlier deploys" for hours: while the
     /// backfill runs it says how far it got, and once done it names the
     /// repositories it gave up on instead of counting forever.
@@ -2572,7 +2617,7 @@ mod tests {
         assert_eq!(c["deploys_backfill"], "running");
         assert_eq!(
             c["deploys_backfill_progress"],
-            json!({"read": 12, "total": 40})
+            json!({"read": 12, "total": 40, "resumes_at": null})
         );
         // The current period counts whatever the backfill's state.
         assert_eq!(c["current"]["deploys"], 1);

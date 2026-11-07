@@ -520,6 +520,10 @@ async fn handle_message(state: Arc<WorkerState>, message: models::WorkerMessage)
                 prs = ?drafts.settled,
                 "Draft sweep done"
             );
+            // Deploy counts that stopped between passes carry on without
+            // waiting for someone to open Analytics.
+            let resumed = passes::deploy_stats::sweep(&state).await;
+            info!(resumed, "Deploys backfill sweep done");
         }
         models::WorkerMessage::ReviewReminder => {
             info!("Running review-reminder sweep");
