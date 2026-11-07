@@ -22,6 +22,10 @@
 
 use super::names::{self, NameRecord};
 
+/// The settings index naming every reserved name (`crate::settings_index`):
+/// the gateway adds a name when it is claimed, the name check reads it.
+pub const NAME_INDEX: &str = "HYBRIDNAME";
+
 /// Wrong answers in a row before a name is parked (15 minutes apart: about
 /// 45 minutes).
 pub const PARK_AFTER: u32 = 3;

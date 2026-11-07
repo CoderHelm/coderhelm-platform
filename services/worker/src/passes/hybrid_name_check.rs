@@ -84,27 +84,47 @@ fn claim_from(i: &std::collections::HashMap<String, AttributeValue>) -> Option<C
     })
 }
 
-/// Every name reservation (`HYBRIDNAME#<name>` / `NAME`).
+/// The reservation's name, for the index rebuild's full scan.
+fn reserved_name(i: &std::collections::HashMap<String, AttributeValue>) -> Option<String> {
+    let sk = i.get("sk").and_then(|v| v.as_s().ok())?;
+    let pk = i.get("pk").and_then(|v| v.as_s().ok())?;
+    (sk == "NAME").then(|| pk.strip_prefix("HYBRIDNAME#").map(String::from))?
+}
+
+fn name_index() -> common::settings_index::Spec<'static> {
+    common::settings_index::Spec {
+        name: name_check::NAME_INDEX,
+        filter: "begins_with(pk, :p) AND sk = :s",
+        values: vec![(":p", s("HYBRIDNAME#")), (":s", s("NAME"))],
+        member_of: reserved_name,
+    }
+}
+
+/// Every name reservation (`HYBRIDNAME#<name>` / `NAME`), read by key from
+/// the names index. This was a scan of the whole settings table every 15
+/// minutes before.
 async fn claims(state: &WorkerState) -> Result<Vec<Claim>, Error> {
+    let table = &state.config.settings_table_name;
+    let names = common::settings_index::members(&state.dynamo, table, &name_index()).await?;
     let mut out = vec![];
-    let mut start = None;
-    loop {
+    for name in names {
         let r = state
             .dynamo
-            .scan()
-            .table_name(&state.config.settings_table_name)
-            .filter_expression("begins_with(pk, :p) AND sk = :s")
-            .expression_attribute_values(":p", s("HYBRIDNAME#"))
-            .expression_attribute_values(":s", s("NAME"))
-            .set_exclusive_start_key(start)
+            .get_item()
+            .table_name(table)
+            .key("pk", s(&format!("HYBRIDNAME#{name}")))
+            .key("sk", s("NAME"))
             .send()
             .await?;
-        out.extend(r.items().iter().filter_map(claim_from));
-        start = r.last_evaluated_key().cloned();
-        if start.is_none() {
-            return Ok(out);
+        match r.item() {
+            None => {
+                common::settings_index::remove(&state.dynamo, table, name_check::NAME_INDEX, &name)
+                    .await
+            }
+            Some(i) => out.extend(claim_from(i)),
         }
     }
+    Ok(out)
 }
 
 /// The install's recorded CloudFront address, when it is active, verified,
@@ -561,5 +581,32 @@ mod tests {
         // A key that isn't a valid name is skipped, never acted on.
         i.insert("pk".into(), s("HYBRIDNAME#Not A Name"));
         assert!(claim_from(&i).is_none());
+    }
+}
+
+#[cfg(test)]
+mod name_index_tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    fn item(pk: &str, sk: &str) -> HashMap<String, AttributeValue> {
+        HashMap::from([("pk".to_string(), s(pk)), ("sk".to_string(), s(sk))])
+    }
+
+    #[test]
+    fn only_name_reservations_become_index_members() {
+        assert_eq!(
+            reserved_name(&item("HYBRIDNAME#acme", "NAME")),
+            Some("acme".into())
+        );
+        assert_eq!(reserved_name(&item("HYBRIDNAME#acme", "AUDIT#1")), None);
+        assert_eq!(reserved_name(&item("TEAM#x", "NAME")), None);
+    }
+
+    #[test]
+    fn the_rebuild_scan_matches_what_the_old_scan_matched() {
+        let spec = name_index();
+        assert_eq!(spec.name, name_check::NAME_INDEX);
+        assert_eq!(spec.filter, "begins_with(pk, :p) AND sk = :s");
     }
 }

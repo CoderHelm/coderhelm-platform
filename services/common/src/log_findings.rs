@@ -1244,33 +1244,52 @@ pub async fn load_ticket(
     })
 }
 
-/// Teams whose automatic fixes are on.
+/// The settings index naming every team with an automatic-fix setting
+/// ([`crate::settings_index`]); the gateway adds the team when it saves one.
+pub const AUTOFIX_INDEX: &str = "LOG_AUTOFIX";
+
+fn autofix_team(i: &Item) -> Option<String> {
+    let team = s(i, "pk");
+    (s(i, "sk") == AUTOFIX_SK && !team.is_empty()).then_some(team)
+}
+
+/// How a full scan finds the automatic-fix settings (the index's rebuild).
+pub fn autofix_index() -> crate::settings_index::Spec<'static> {
+    crate::settings_index::Spec {
+        name: AUTOFIX_INDEX,
+        filter: "sk = :sk",
+        values: vec![(":sk", attr(AUTOFIX_SK))],
+        member_of: autofix_team,
+    }
+}
+
+/// Teams whose automatic fixes are on: each indexed team's setting, read by
+/// key. This ran hourly as a scan of the whole settings table before.
 pub async fn teams_with_autofix(
     dynamo: &DynamoClient,
     settings_table: &str,
 ) -> Result<Vec<(String, AutoFix)>, String> {
+    let teams = crate::settings_index::members(dynamo, settings_table, &autofix_index()).await?;
     let mut out = Vec::new();
-    let mut start: Option<Item> = None;
-    loop {
-        let page = dynamo
-            .scan()
+    for team in teams {
+        let got = dynamo
+            .get_item()
             .table_name(settings_table)
-            .filter_expression("sk = :sk")
-            .expression_attribute_values(":sk", attr(AUTOFIX_SK))
-            .set_exclusive_start_key(start.take())
+            .key("pk", attr(&team))
+            .key("sk", attr(AUTOFIX_SK))
             .send()
             .await
             .map_err(|e| e.to_string())?;
-        for i in page.items() {
-            let cfg = AutoFix::from_item(Some(i));
-            let team = s(i, "pk");
-            if cfg.enabled && !team.is_empty() {
-                out.push((team, cfg));
+        match got.item() {
+            None => {
+                crate::settings_index::remove(dynamo, settings_table, AUTOFIX_INDEX, &team).await
             }
-        }
-        match page.last_evaluated_key() {
-            Some(k) if !k.is_empty() => start = Some(k.clone()),
-            _ => break,
+            Some(i) => {
+                let cfg = AutoFix::from_item(Some(i));
+                if cfg.enabled {
+                    out.push((team, cfg));
+                }
+            }
         }
     }
     Ok(out)
@@ -2503,5 +2522,32 @@ mod tests {
         assert_eq!(console_url("us-east-1", "bad group"), None);
         assert!(valid_repo("acme/shop.web") && !valid_repo("acme/..") && !valid_repo("/shop"));
         assert_eq!(daily_sk(t(NOW)), "LOG_AUTOFIX_RUNS#2026-10-21");
+    }
+}
+
+#[cfg(test)]
+mod autofix_index_tests {
+    use super::*;
+
+    fn item(pk: &str, sk: &str) -> Item {
+        HashMap::from([("pk".to_string(), attr(pk)), ("sk".to_string(), attr(sk))])
+    }
+
+    #[test]
+    fn only_automatic_fix_settings_become_index_members() {
+        assert_eq!(
+            autofix_team(&item("TEAM#a", AUTOFIX_SK)),
+            Some("TEAM#a".into())
+        );
+        assert_eq!(autofix_team(&item("TEAM#a", "ANALYTICS#x")), None);
+        assert_eq!(autofix_team(&item("", AUTOFIX_SK)), None);
+    }
+
+    #[test]
+    fn the_rebuild_scan_matches_the_setting_key() {
+        let spec = autofix_index();
+        assert_eq!(spec.name, AUTOFIX_INDEX);
+        assert_eq!(spec.filter, "sk = :sk");
+        assert_eq!(spec.values[0].1, attr(AUTOFIX_SK));
     }
 }

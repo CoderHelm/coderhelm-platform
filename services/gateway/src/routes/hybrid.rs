@@ -740,6 +740,18 @@ pub async fn claim_name(
             )
         });
     }
+    // The 15-minute name check reads reservations from this index, not a
+    // table scan. A failed add is found by the index's daily rebuild.
+    if let Err(e) = common::settings_index::add(
+        &state.dynamo,
+        &state.config.settings_table_name,
+        common::hybrid::name_check::NAME_INDEX,
+        &name,
+    )
+    .await
+    {
+        tracing::warn!(name = %name, error = %e, "Could not index the name reservation");
+    }
     // The setup page for the name. CREATE: a name with any record already
     // in the zone (made outside this API) is refused, never overwritten.
     if let Err(e) = apply_dns(&name, &names::plan_claim(&name)).await {
