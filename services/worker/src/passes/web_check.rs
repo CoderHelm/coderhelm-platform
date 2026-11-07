@@ -15,8 +15,10 @@
 //!   (never an IP literal);
 //! - the host must be one of the team's own: a domain an admin listed in the
 //!   team's review settings (that domain and its subdomains), a host named in
-//!   a URL in the work at hand (the PR's diff, the ticket), or a host that
-//!   appears in one of the team's connected repositories;
+//!   a URL in the work at hand (the PR's diff, the ticket), a host that
+//!   appears in one of the team's connected repositories, or a service's API
+//!   host built from an id in those repositories' config (a CMS project id:
+//!   see [`config_service`]);
 //! - every address the host resolves to must be public (private, loopback,
 //!   link-local, cloud metadata, carrier NAT, multicast and reserved ranges
 //!   are refused) and the request is pinned to the address that was checked,
@@ -79,7 +81,10 @@ pub fn tool() -> ToolDefinition {
              into it: use it to see the value a page actually shows (an id, an address, a price) \
              before explaining why it's wrong. Only the team's \
              hosts can be checked (listed in your instructions, named in a URL in the work at \
-             hand, or used in the team's repositories); others are refused. Use it before \
+             hand, used in the team's repositories, or a service API host built from an id in \
+             their config, such as a CMS project's API); others are refused. A JSON or text \
+             response is searched with `find` too, so a read-only API query (GET, no \
+             credentials) can show the value it returns. Use it before \
              asking anyone to confirm a link, redirect target or page works: check it and \
              report what came back. At most {MAX_CHECKS} URLs per run."
         ),
@@ -276,6 +281,57 @@ impl HostGate for HostPolicy {
     }
 }
 
+/// Services whose API host is built from an account id a repository keeps
+/// in its config (`projectId` in a CMS config, an env file), so the host
+/// itself never appears in the code: `(host suffixes, the service's name as
+/// it appears next to the id)`. The host counts as the team's only when a
+/// team repository holds that id next to the service's name.
+const CONFIG_SERVICES: &[(&[&str], &str)] = &[
+    (&[".api.sanity.io", ".apicdn.sanity.io"], "sanity"),
+    (&[".supabase.co"], "supabase"),
+];
+
+/// The config id and service name behind a service API host
+/// (`abc123de.api.sanity.io` gives `("abc123de", "sanity")`). `None` for
+/// any other host, and for one whose first label isn't a plain id.
+pub fn config_service(host: &str) -> Option<(String, &'static str)> {
+    for (suffixes, service) in CONFIG_SERVICES {
+        for suffix in *suffixes {
+            let Some(id) = host.strip_suffix(suffix) else {
+                continue;
+            };
+            let plain = (4..=40).contains(&id.len())
+                && !id.starts_with('-')
+                && !id.ends_with('-')
+                && id
+                    .chars()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+                && id.chars().any(|c| c.is_ascii_digit());
+            if plain {
+                return Some((id.to_string(), service));
+            }
+        }
+    }
+    None
+}
+
+/// The organization's code search: the repositories (`owner/name`) with a
+/// file matching `query`. Behind a trait so the tests can script it.
+#[async_trait::async_trait]
+pub trait OrgSearch: Send + Sync {
+    async fn repos_with(&self, org: &str, query: &str) -> Result<Vec<String>, String>;
+}
+
+#[async_trait::async_trait]
+impl OrgSearch for GitHubClient {
+    async fn repos_with(&self, org: &str, query: &str) -> Result<Vec<String>, String> {
+        self.search_org_code(org, query)
+            .await
+            .map(|hits| hits.into_iter().map(|(repo, _)| repo).collect())
+            .map_err(|e| e.to_string())
+    }
+}
+
 // ─── Requests ───────────────────────────────────────────────
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -353,7 +409,7 @@ impl Transport for Net {
         let content_type = header(reqwest::header::CONTENT_TYPE).unwrap_or_default();
         let status = resp.status().as_u16();
         let mut body = Vec::new();
-        if method == Method::Get && is_html(&content_type) {
+        if method == Method::Get && is_readable(&content_type) {
             while body.len() < PAGE_SCAN_BYTES {
                 match resp.chunk().await {
                     Ok(Some(c)) => body.extend_from_slice(&c),
@@ -374,6 +430,15 @@ impl Transport for Net {
 fn is_html(content_type: &str) -> bool {
     let c = content_type.to_ascii_lowercase();
     c.starts_with("text/html") || c.starts_with("application/xhtml")
+}
+
+/// A body `find` can search: a page, JSON (an API's answer) or plain text.
+fn is_readable(content_type: &str) -> bool {
+    let c = content_type.to_ascii_lowercase();
+    is_html(&c)
+        || c.starts_with("application/json")
+        || (c.starts_with("application/") && c.contains("+json"))
+        || c.starts_with("text/plain")
 }
 
 /// The page's `<title>`, plain text, at most 200 characters.
@@ -537,8 +602,9 @@ async fn vetted_addr(t: &dyn Transport, host: &str) -> Result<SocketAddr, CheckE
     Ok(SocketAddr::new(ips[0], 443))
 }
 
-/// Checks one URL: HEAD, then GET when HEAD fails, errs, or the page is
-/// HTML (for its title); redirects followed with every hop re-vetted.
+/// Checks one URL: HEAD, then GET when HEAD fails, errs, the page is HTML
+/// (for its title) or `find` has terms to look for in a JSON or text body;
+/// redirects followed with every hop re-vetted.
 #[cfg(test)]
 pub async fn check(
     raw: &str,
@@ -559,8 +625,11 @@ pub async fn check_and_find(
     if !gate.allowed(&host).await {
         return Err(refused(format!(
             "{host} isn't one of the team's sites. Only hosts listed in the team's review \
-             settings, named in a URL in this work, or used in the team's repositories can be \
-             checked."
+             settings, named in a URL in this work, used in the team's repositories, or a \
+             service API host built from an id in their config can be checked. A person can \
+             allow it by adding the domain in Settings, Integrations, Your websites (a domain \
+             covers its subdomains). Don't retry it in this run: record an open item that names \
+             {host} and what checking it would have confirmed, then go on without it."
         )));
     }
     let mut out = Checked::default();
@@ -576,8 +645,15 @@ pub async fn check_and_find(
         let head = t.send(Method::Head, &url, addr).await;
         let resp = match head {
             Ok(r) if (300..400).contains(&r.status) && r.location.is_some() => r,
-            Ok(r) if (200..300).contains(&r.status) && !is_html(&r.content_type) => r,
-            // HEAD refused or errored, or the page is HTML (title): GET.
+            Ok(r)
+                if (200..300).contains(&r.status)
+                    && !is_html(&r.content_type)
+                    && (find.is_empty() || !is_readable(&r.content_type)) =>
+            {
+                r
+            }
+            // HEAD refused or errored, the page is HTML (title), or the
+            // body holds what `find` asks for: GET.
             _ => match t.send(Method::Get, &url, addr).await {
                 Ok(r) => r,
                 Err(e) if hop == 0 => return Err(CheckError::Failed(format!("{url}: {e}"))),
@@ -662,6 +738,9 @@ pub struct WebCheck {
     limit: usize,
     /// One line per checked URL, for the critic.
     results: Mutex<Vec<String>>,
+    /// Checks that were refused or failed, as the run's lookups: what the
+    /// work could not confirm is evidence too, never dropped silently.
+    unconfirmed: Mutex<Vec<super::proof::Lookup>>,
 }
 
 /// The team's listed domains from its review settings.
@@ -736,6 +815,30 @@ impl WebCheck {
             used: AtomicUsize::new(0),
             limit: MAX_CHECKS,
             results: Mutex::new(Vec::new()),
+            unconfirmed: Mutex::new(Vec::new()),
+        }
+    }
+
+    /// The checks this run could not make (refused or failed), as lookups
+    /// for the run's evidence, so what wasn't confirmed reaches the check
+    /// before the pull request and its open items.
+    pub fn lookups(&self) -> Vec<super::proof::Lookup> {
+        self.unconfirmed
+            .lock()
+            .map(|l| l.clone())
+            .unwrap_or_default()
+    }
+
+    fn note_unconfirmed(&self, u: &str, why: &str) {
+        if let Ok(mut l) = self.unconfirmed.lock() {
+            let id = format!("W{}", l.len() + 1);
+            l.push(super::proof::Lookup::new(
+                id,
+                SOURCE_NAME,
+                super::proof::LookupOutcome::Failed,
+                &format!("check_url {u}"),
+                why,
+            ));
         }
     }
 
@@ -815,7 +918,10 @@ impl WebCheck {
         github: &GitHubClient,
         u: &str,
     ) -> Result<Checked, CheckError> {
-        let gate = RepoGate { web: self, github };
+        let gate = RepoGate {
+            web: self,
+            search: github,
+        };
         let (res, ms) = self.checked(&gate, &Net, u, &[]).await;
         let (outcome, detail) = outcome_of(&res);
         if !self.log(state, u, outcome, &detail, ms).await {
@@ -871,7 +977,10 @@ impl WebCheck {
         if name != TOOL {
             return None;
         }
-        let gate = RepoGate { web: self, github };
+        let gate = RepoGate {
+            web: self,
+            search: github,
+        };
         Some(self.run_urls(state, &gate, &Net, input).await)
     }
 
@@ -932,8 +1041,12 @@ impl WebCheck {
                     ms,
                 )
             }
-            Err(CheckError::Refused(m)) => ("refused", format!("{u}\n  refused: {m}\n"), m, ms),
+            Err(CheckError::Refused(m)) => {
+                self.note_unconfirmed(u, &format!("refused: {m}"));
+                ("refused", format!("{u}\n  refused: {m}\n"), m, ms)
+            }
             Err(CheckError::Failed(m)) => {
+                self.note_unconfirmed(u, &format!("could not check: {m}"));
                 if let Ok(mut r) = self.results.lock() {
                     r.push(format!("{u}: could not be checked ({m})"));
                 }
@@ -1022,10 +1135,29 @@ fn requested(input: &Value) -> Vec<String> {
     v
 }
 
-/// The policy, then a search of the team's repositories for the host.
+/// The policy, then a search of the team's repositories for the host, or
+/// for the config id a service API host is built from.
 struct RepoGate<'a> {
     web: &'a WebCheck,
-    github: &'a GitHubClient,
+    search: &'a dyn OrgSearch,
+}
+
+impl RepoGate<'_> {
+    /// Whether a file matching `query` is in one of the team's repositories.
+    async fn in_team_repos(&self, query: &str, host: &str) -> bool {
+        match self.search.repos_with(&self.web.org, query).await {
+            Ok(repos) => repos.iter().any(|repo| {
+                self.web
+                    .team_repos
+                    .iter()
+                    .any(|r| r.eq_ignore_ascii_case(repo))
+            }),
+            Err(e) => {
+                warn!(error = %e, host, "Could not search the team's repositories for a host");
+                false
+            }
+        }
+    }
 }
 
 #[async_trait::async_trait]
@@ -1045,19 +1177,15 @@ impl HostGate for RepoGate<'_> {
         }
         let found = if self.web.org.is_empty() {
             false
+        } else if self.in_team_repos(host, host).await {
+            true
+        } else if let Some((id, service)) = config_service(host) {
+            // The host is built from an id in the config: the id next to
+            // the service's name in a team repository makes it the team's.
+            self.in_team_repos(&format!("\"{id}\" {service}"), host)
+                .await
         } else {
-            match self.github.search_org_code(&self.web.org, host).await {
-                Ok(hits) => hits.iter().any(|(repo, _)| {
-                    self.web
-                        .team_repos
-                        .iter()
-                        .any(|r| r.eq_ignore_ascii_case(repo))
-                }),
-                Err(e) => {
-                    warn!(error = %e, host, "Could not search the team's repositories for a host");
-                    false
-                }
-            }
+            false
         };
         if let Ok(mut m) = self.web.searched.lock() {
             m.insert(host.to_string(), found);
@@ -1517,6 +1645,151 @@ mod tests {
         }
         assert_eq!((ok, limited), (MAX_CHECKS, 3));
         assert!(web.evidence().contains("200"));
+    }
+
+    /// The org's code search, scripted: `query -> repositories`.
+    #[derive(Default)]
+    struct FakeSearch {
+        hits: HashMap<String, Vec<String>>,
+        asked: Mutex<Vec<String>>,
+    }
+
+    impl FakeSearch {
+        fn hit(mut self, query: &str, repo: &str) -> Self {
+            self.hits.entry(query.into()).or_default().push(repo.into());
+            self
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl OrgSearch for FakeSearch {
+        async fn repos_with(&self, _org: &str, query: &str) -> Result<Vec<String>, String> {
+            self.asked.lock().unwrap().push(query.into());
+            Ok(self.hits.get(query).cloned().unwrap_or_default())
+        }
+    }
+
+    fn team_web() -> WebCheck {
+        WebCheck::new(
+            "TEAM#t",
+            "acme/site",
+            "coder",
+            0,
+            vec![],
+            "",
+            vec!["acme/site".into(), "acme/studio".into()],
+        )
+    }
+
+    #[test]
+    fn a_service_api_host_gives_its_config_id() {
+        assert_eq!(
+            config_service("ab12cd34.api.sanity.io"),
+            Some(("ab12cd34".into(), "sanity"))
+        );
+        assert_eq!(
+            config_service("ab12cd34.apicdn.sanity.io"),
+            Some(("ab12cd34".into(), "sanity"))
+        );
+        assert_eq!(
+            config_service("xyzref0123.supabase.co"),
+            Some(("xyzref0123".into(), "supabase"))
+        );
+        // Not a plain id, or not a service host: nothing derived.
+        assert_eq!(config_service("www.api.sanity.io"), None);
+        assert_eq!(config_service("a.b.api.sanity.io"), None);
+        assert_eq!(config_service("api.sanity.io"), None);
+        assert_eq!(config_service("ab12cd34.api.example.com"), None);
+    }
+
+    #[tokio::test]
+    async fn a_cms_api_host_built_from_the_repos_project_id_is_the_teams() {
+        // The repository's config holds the project id, never the host.
+        let web = team_web();
+        let search = FakeSearch::default().hit("\"ab12cd34\" sanity", "acme/studio");
+        let gate = RepoGate {
+            web: &web,
+            search: &search,
+        };
+        assert!(gate.allowed("ab12cd34.api.sanity.io").await);
+        assert_eq!(
+            *search.asked.lock().unwrap(),
+            vec!["ab12cd34.api.sanity.io", "\"ab12cd34\" sanity"]
+        );
+        // Decided once per run.
+        assert!(gate.allowed("ab12cd34.api.sanity.io").await);
+        assert_eq!(search.asked.lock().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_project_id_only_outside_the_teams_repositories_is_refused() {
+        let web = team_web();
+        let search = FakeSearch::default().hit("\"ab12cd34\" sanity", "acme/someone-elses");
+        let gate = RepoGate {
+            web: &web,
+            search: &search,
+        };
+        assert!(!gate.allowed("ab12cd34.api.sanity.io").await);
+        // Any other project's API stays refused.
+        assert!(!gate.allowed("zz99yy88.api.sanity.io").await);
+    }
+
+    #[tokio::test]
+    async fn an_ordinary_host_is_never_matched_by_an_id() {
+        let web = team_web();
+        let search = FakeSearch::default();
+        let gate = RepoGate {
+            web: &web,
+            search: &search,
+        };
+        assert!(!gate.allowed("ab12cd34.example.com").await);
+        assert_eq!(*search.asked.lock().unwrap(), vec!["ab12cd34.example.com"]);
+    }
+
+    #[tokio::test]
+    async fn a_json_answer_is_searched_with_find() {
+        let url = "https://ab12cd34.api.sanity.io/v2023-06-21/data/query/production?query=count(*)";
+        let t = Fake::default().host("ab12cd34.api.sanity.io", PUBLIC).page(
+            url,
+            200,
+            "application/json; charset=utf-8",
+            r#"{"result":{"total":12,"withField":3}}"#,
+        );
+        let find = vec!["total".to_string()];
+        let c = check_and_find(url, &find, &policy(&["ab12cd34.api.sanity.io"]), &t)
+            .await
+            .unwrap();
+        let text = c.render(url);
+        assert!(text.contains("\"total\":12"), "{text}");
+        // Read-only: HEAD, then one GET for the body; nothing else.
+        let sent = t.sent.lock().unwrap();
+        assert!(sent
+            .iter()
+            .all(|s| matches!(s.0, Method::Head | Method::Get)));
+    }
+
+    #[tokio::test]
+    async fn a_refusal_says_how_a_person_allows_the_host_and_is_recorded() {
+        let web = team_web();
+        let t = Fake::default();
+        let gate = policy(&[]);
+        let (outcome, text, _, _) = web
+            .one(&gate, &t, "https://ab12cd34.api.sanity.io/v1/data", &[])
+            .await;
+        assert_eq!(outcome, "refused");
+        assert!(
+            text.contains("Settings, Integrations, Your websites"),
+            "{text}"
+        );
+        assert!(text.contains("record an open item"), "{text}");
+        let l = web.lookups();
+        assert_eq!(l.len(), 1);
+        assert_eq!(l[0].outcome, super::super::proof::LookupOutcome::Failed);
+        assert!(
+            l[0].line.contains("ab12cd34.api.sanity.io"),
+            "{}",
+            l[0].line
+        );
     }
 
     #[test]
