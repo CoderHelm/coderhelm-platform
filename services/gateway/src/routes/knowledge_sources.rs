@@ -240,7 +240,10 @@ pub async fn connectors(
         let st = connect::status(
             &env,
             kind,
-            app(&state, kind).is_set() || super::hybrid_install::brokered(kind).is_some(),
+            app(&state, kind).is_set()
+                || super::hybrid_install::brokered(&state, kind)
+                    .await
+                    .is_some(),
             &claims.email,
         )
         .await;
@@ -301,7 +304,7 @@ pub async fn connect(
     let kind = kind_of(&kind)?;
     // A hybrid install that chose CoderHelm's app for this provider signs in
     // through CoderHelm's broker (its client id is the install id).
-    let brokered = super::hybrid_install::brokered(kind);
+    let brokered = super::hybrid_install::brokered(&state, kind).await;
     let own = app(&state, kind);
     let hosted = common::hybrid::hosted_url();
     let via = match &brokered {

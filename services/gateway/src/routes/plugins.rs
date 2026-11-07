@@ -444,8 +444,20 @@ pub async fn test_connection(
     claims.require_role(3)?; // admin+
     let plugin_def = CATALOG
         .iter()
-        .find(|p| p.id == plugin_id && !p.npx_package.is_empty())
+        .find(|p| p.id == plugin_id)
         .ok_or(StatusCode::NOT_FOUND)?;
+    if plugin_def.npx_package.is_empty() {
+        // Nothing here runs a package for it (a key kept for Knowledge, for
+        // one): say what the key is for instead of failing the test.
+        return Ok(Json(json!({
+            "status": "ok",
+            "tool_count": 0,
+            "message": format!(
+                "Saved. Agents reach {} through its sign-in, not this key.",
+                plugin_def.name
+            ),
+        })));
+    }
 
     // Open the saved values for this call only.
     let creds = load_credentials(&state, &claims.team_id, &plugin_id)

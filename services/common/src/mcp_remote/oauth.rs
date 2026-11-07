@@ -217,19 +217,48 @@ fn origin_of(u: &str) -> String {
     }
 }
 
+/// The first words of every refusal that means "only approved apps": the
+/// gateway adds where to create a key after it.
+pub const APPROVED_APPS_ONLY: &str = "This service only lets apps it has approved sign in";
+
+/// Why a registration was refused, in plain words with the next step.
+/// Providers that limit sign-in to apps they approved answer 401 or 403
+/// (often with no body), or 400 `invalid_redirect_uri` / "not approved":
+/// no retry helps, so the way in is a key.
+pub fn registration_refused(status: u16, doc: &serde_json::Value) -> String {
+    let code = doc["error"].as_str().unwrap_or("");
+    let why = doc["error_description"]
+        .as_str()
+        .or(doc["message"].as_str())
+        .unwrap_or("");
+    let approved_only = status == 401
+        || status == 403
+        || code == "invalid_redirect_uri"
+        || code == "unapproved_software_statement"
+        || why.to_ascii_lowercase().contains("not approved");
+    if approved_only {
+        return format!(
+            "{APPROVED_APPS_ONLY}, so Coderhelm can't sign in to it from this install. Use a key instead."
+        );
+    }
+    if why.is_empty() && code.is_empty() {
+        format!(
+            "The sign-in server turned Coderhelm away (HTTP {status}) without saying why. Try again in a minute, or use a key instead."
+        )
+    } else {
+        let said = if why.is_empty() { code } else { why };
+        format!(
+            "The sign-in server turned Coderhelm away (HTTP {status}): {}. Use a key instead.",
+            crate::truncate_str(said, 200).trim_end_matches('.')
+        )
+    }
+}
+
 /// Reads a registration reply.
 pub fn parse_registration(r: &HttpResponse) -> Result<Client, String> {
     let doc = r.json().unwrap_or_default();
     if !(200..300).contains(&r.status) {
-        let why = doc["error_description"]
-            .as_str()
-            .or(doc["error"].as_str())
-            .unwrap_or("no reason given");
-        return Err(format!(
-            "The sign-in server refused to register Coderhelm ({}: {}).",
-            r.status,
-            crate::truncate_str(why, 200)
-        ));
+        return Err(registration_refused(r.status, &doc));
     }
     let client_id = doc["client_id"].as_str().unwrap_or("").to_string();
     if client_id.is_empty() {
@@ -505,6 +534,47 @@ mod tests {
     use serde_json::json as j;
 
     #[test]
+    fn a_service_that_only_takes_approved_apps_says_so_and_points_to_a_key() {
+        // A 403 with no body (a design tool's server), and a 400 naming the
+        // redirect (a hosting platform's server): both mean "approved apps
+        // only", never "no reason given".
+        for (status, doc) in [
+            (403, j!({})),
+            (401, j!({})),
+            (
+                400,
+                j!({"error": "invalid_redirect_uri", "error_description": "The provided redirect URIs are not approved for use by this authorization server."}),
+            ),
+        ] {
+            let m = registration_refused(status, &doc);
+            assert!(m.starts_with(APPROVED_APPS_ONLY), "{status}: {m}");
+            assert!(m.ends_with("Use a key instead."), "{m}");
+            assert!(!m.contains("no reason"), "{m}");
+        }
+        let r = resp(403, &[], "");
+        let e = parse_registration(&r).unwrap_err();
+        assert!(e.starts_with(APPROVED_APPS_ONLY), "{e}");
+    }
+
+    #[test]
+    fn other_refusals_name_what_the_server_said_or_that_it_said_nothing() {
+        let m = registration_refused(500, &j!({}));
+        assert!(
+            m.contains("HTTP 500") && m.contains("without saying why"),
+            "{m}"
+        );
+        assert!(!m.contains("no reason"));
+        let m = registration_refused(
+            400,
+            &j!({"error": "invalid_client_metadata", "error_description": "scope is too long."}),
+        );
+        assert_eq!(
+            m,
+            "The sign-in server turned Coderhelm away (HTTP 400): scope is too long. Use a key instead."
+        );
+    }
+
+    #[test]
     fn provider_apis_without_a_resource_get_json_bodies_and_extra_params() {
         let c = Client {
             client_id: "cid".into(),
@@ -646,10 +716,11 @@ mod tests {
         let c =
             parse_registration(&json(201, j!({"client_id": "abc", "client_secret": "s"}))).unwrap();
         assert_eq!(c.auth, ClientAuth::ClientSecretBasic);
+        // A refused redirect means "approved apps only", said plainly.
         assert!(
             parse_registration(&json(400, j!({"error": "invalid_redirect_uri"})))
                 .unwrap_err()
-                .contains("invalid_redirect_uri")
+                .starts_with(APPROVED_APPS_ONLY)
         );
         assert!(parse_registration(&json(201, j!({}))).is_err());
     }

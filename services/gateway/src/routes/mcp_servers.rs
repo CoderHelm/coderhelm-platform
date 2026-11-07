@@ -29,7 +29,7 @@ use common::mcp_remote::runtime::{detect, Detected, Runtime};
 use common::mcp_remote::store::{AuthKind, OAuthSettings, Owner, ServerRecord, Sharing, Status};
 use common::mcp_remote::{oauth, tools};
 use serde_json::{json, Value};
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 use crate::models::Claims;
 use crate::AppState;
@@ -74,13 +74,59 @@ fn dashboard_origin(stage: &str) -> &'static str {
     common::public_urls::app_url(stage)
 }
 
-/// Coderhelm's Client ID Metadata Document (served by the dashboard). Only
-/// on the hosted dashboard: the document's static copy names the hosted
-/// callback, so other installs register dynamically instead.
+/// Where an install's own Client ID Metadata Document is served (the API's
+/// public `/integrations/` paths, which a self-hosted install's address
+/// routes to the API).
+pub const METADATA_DOCUMENT_PATH: &str = "/integrations/mcp-client.json";
+
+/// Coderhelm's Client ID Metadata Document: the `client_id` a sign-in
+/// server that supports them fetches to learn who is asking and where it
+/// may send people back.
+///
+/// The hosted dashboard serves a static copy naming the hosted callback.
+/// Every other install with an https address serves its own (see
+/// [`metadata_document`]), naming its own callback. Without one, an install
+/// falls back to dynamic registration, which some services (a hosting
+/// platform's MCP server among them) accept only from apps they approved,
+/// so the document is how a self-hosted install signs in to them.
 pub fn metadata_document_url(stage: &str) -> Option<String> {
     let origin = dashboard_origin(stage);
-    (origin == common::public_urls::stage_app_url("prod"))
-        .then(|| format!("{origin}/oauth/mcp-client.json"))
+    if origin == common::public_urls::stage_app_url("prod") {
+        return Some(format!("{origin}/oauth/mcp-client.json"));
+    }
+    let api = common::public_urls::api_url(stage);
+    api.starts_with("https://")
+        .then(|| format!("{api}{METADATA_DOCUMENT_PATH}"))
+}
+
+/// The metadata document this install serves at [`metadata_document_url`]:
+/// its `client_id` is its own address, and it names this install's callback.
+/// `None` where the install serves none (the hosted one's is static).
+pub fn metadata_document(stage: &str) -> Option<Value> {
+    let id = metadata_document_url(stage)?;
+    if !id.ends_with(METADATA_DOCUMENT_PATH) {
+        return None;
+    }
+    let app = dashboard_origin(stage);
+    Some(json!({
+        "client_id": id,
+        "client_name": "Coderhelm",
+        "client_uri": app,
+        "redirect_uris": [redirect_uri(stage)],
+        "grant_types": ["authorization_code", "refresh_token"],
+        "response_types": ["code"],
+        "token_endpoint_auth_method": "none",
+    }))
+}
+
+/// GET /integrations/mcp-client.json — this install's Client ID Metadata
+/// Document (public: sign-in servers fetch it with no sign-in).
+pub async fn client_metadata_document(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<Value>, StatusCode> {
+    metadata_document(&state.config.stage)
+        .map(Json)
+        .ok_or(StatusCode::NOT_FOUND)
 }
 
 pub(crate) fn runtime(state: &AppState, team: &str) -> Runtime {
@@ -236,6 +282,9 @@ pub async fn create(
         .await
         .map_err(|e| internal("list mcp servers", e))?;
     let catalog_id = body["catalog_id"].as_str().unwrap_or("").trim().to_string();
+    // A key for a catalog server whose vendor's remote server takes one
+    // (`Authorization: Bearer <key>`): connect with it instead of signing in.
+    let mut catalog_key: Option<String> = None;
     let (id, name, url) = if catalog_id.is_empty() {
         let url = body["url"].as_str().unwrap_or("").trim().to_string();
         let ep = check_url(&url).map_err(|e| fail(StatusCode::BAD_REQUEST, &e.to_string()))?;
@@ -259,6 +308,19 @@ pub async fn create(
                 "This server has no remote sign-in. Use a key instead.",
             ));
         }
+        if let Some(key) = body["key"]
+            .as_str()
+            .map(str::trim)
+            .filter(|k| !k.is_empty())
+        {
+            if entry["remote_key"].as_bool() != Some(true) {
+                return Err(fail(
+                    StatusCode::BAD_REQUEST,
+                    "This server doesn't take a key. Use its sign-in instead.",
+                ));
+            }
+            catalog_key = Some(bearer(key));
+        }
         (
             catalog_id.clone(),
             entry["name"].as_str().unwrap_or(&catalog_id).to_string(),
@@ -280,9 +342,14 @@ pub async fn create(
     s.added_by = claims.email.to_ascii_lowercase();
     s.added_at = chrono::Utc::now().to_rfc3339();
     s.changed_by = s.added_by.clone();
-    let detected = detect(rt.http.as_ref(), &url)
-        .await
-        .map_err(|e| fail(StatusCode::BAD_REQUEST, &e))?;
+    let detected = match &catalog_key {
+        // The vendor documents the key; no need to ask the server how it
+        // signs in (it would answer OAuth, which a key replaces).
+        Some(_) => Detected::Header,
+        None => detect(rt.http.as_ref(), &url)
+            .await
+            .map_err(|e| fail(StatusCode::BAD_REQUEST, &e))?,
+    };
     match &detected {
         Detected::Open { tools, era } => {
             s.auth = AuthKind::None;
@@ -298,11 +365,13 @@ pub async fn create(
                 .filter(|h| !h.is_empty())
                 .unwrap_or("Authorization")
                 .to_string();
-            let value = body["header_value"]
-                .as_str()
-                .unwrap_or("")
-                .trim()
-                .to_string();
+            let value = catalog_key.clone().unwrap_or_else(|| {
+                body["header_value"]
+                    .as_str()
+                    .unwrap_or("")
+                    .trim()
+                    .to_string()
+            });
             if value.is_empty() {
                 return Err(fail(
                     StatusCode::BAD_REQUEST,
@@ -362,6 +431,16 @@ pub async fn create(
         "server": reply_server(&rt, &s, &claims).await,
         "detected": detected_json(&detected),
     })))
+}
+
+/// A pasted key as an `Authorization` value: `Bearer <key>`, unless the
+/// person already pasted it that way.
+fn bearer(key: &str) -> String {
+    if key.len() > 7 && key[..7].eq_ignore_ascii_case("bearer ") {
+        format!("Bearer {}", key[7..].trim())
+    } else {
+        format!("Bearer {key}")
+    }
 }
 
 fn valid_header_name(h: &str) -> bool {
@@ -509,6 +588,15 @@ pub async fn set_key(
     ))
 }
 
+/// A sign-in error, plus where to create the key when the error sends the
+/// person to one and the server is in the catalog.
+fn with_key_help(e: &str, id: &str) -> String {
+    match common::mcp_catalog::key_help(id) {
+        Some(help) if e.ends_with("Use a key instead.") => format!("{e} {help}"),
+        _ => e.to_string(),
+    }
+}
+
 /// POST /api/mcp-servers/:id/connect — start an OAuth sign-in. Admins
 /// connect a shared server; anyone connects their own on a personal one.
 pub async fn connect(
@@ -542,7 +630,10 @@ pub async fn connect(
             metadata_document_url(&state.config.stage).as_deref(),
         )
         .await
-        .map_err(|e| fail(StatusCode::BAD_REQUEST, &e))?;
+        .map_err(|e| {
+            warn!(team = %rt.team, server = %s.id, error = %e, "MCP sign-in could not start");
+            fail(StatusCode::BAD_REQUEST, &with_key_help(&e, &s.id))
+        })?;
     info!(team = %rt.team, server = %s.id, owner = %owner.key(), "MCP sign-in started");
     Ok(Json(json!({ "authorize_url": url })))
 }
@@ -773,6 +864,40 @@ mod tests {
     }
 
     #[test]
+    fn a_self_hosted_install_serves_its_own_metadata_document() {
+        common::public_urls::override_for_this_thread(Some(common::public_urls::Override {
+            urls: common::public_urls::from_single("https://coderhelm.example.com"),
+            site: None,
+            self_hosted: true,
+        }));
+        let id = metadata_document_url("prod").unwrap();
+        assert_eq!(
+            id,
+            "https://coderhelm.example.com/integrations/mcp-client.json"
+        );
+        let doc = metadata_document("prod").unwrap();
+        assert_eq!(doc["client_id"], id.as_str());
+        assert_eq!(
+            doc["redirect_uris"],
+            json!(["https://coderhelm.example.com/settings/integrations/mcp-callback/"])
+        );
+        assert_eq!(doc["token_endpoint_auth_method"], "none");
+        common::public_urls::override_for_this_thread(None);
+        // The hosted dashboard keeps its static copy and serves none here.
+        assert!(metadata_document("prod").is_none());
+    }
+
+    #[test]
+    fn a_refused_sign_in_says_where_to_create_the_key() {
+        let e = common::mcp_remote::oauth::registration_refused(403, &json!({}));
+        let m = with_key_help(&e, "figma");
+        assert!(m.contains("Personal access tokens"), "{m}");
+        assert!(m.contains("https://help.figma.com/"), "{m}");
+        // Errors that don't send the person to a key are left alone.
+        assert_eq!(with_key_help("Try again.", "figma"), "Try again.");
+    }
+
+    #[test]
     fn ids_never_take_a_catalog_or_builtin_name() {
         let taken: BTreeSet<String> = ["docs".to_string()].into();
         assert_eq!(new_id("Docs", &taken), "docs-2");
@@ -783,6 +908,31 @@ mod tests {
             "Ünïcode!!",
             &BTreeSet::new()
         )));
+    }
+
+    #[test]
+    fn a_pasted_key_becomes_one_bearer_value() {
+        assert_eq!(bearer("lin_api_abc"), "Bearer lin_api_abc");
+        assert_eq!(bearer("Bearer lin_api_abc"), "Bearer lin_api_abc");
+        assert_eq!(bearer("bearer  lin_api_abc"), "Bearer lin_api_abc");
+    }
+
+    #[test]
+    fn catalog_keys_go_only_to_servers_that_take_them() {
+        // Every catalog entry that takes a key at its remote server has one,
+        // and the dashboard is told so in the catalog it reads.
+        let json = super::super::plugins::catalog_json();
+        for e in &json {
+            if e["remote_key"].as_bool() == Some(true) {
+                assert!(!e["remote_url"].as_str().unwrap_or("").is_empty(), "{e}");
+            }
+        }
+        assert!(json
+            .iter()
+            .any(|e| e["id"] == "linear" && e["remote_key"] == true));
+        assert!(json
+            .iter()
+            .any(|e| e["id"] == "vercel" && e["remote_key"] == false));
     }
 
     #[test]

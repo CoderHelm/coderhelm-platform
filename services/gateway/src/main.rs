@@ -1461,6 +1461,12 @@ async fn main() -> Result<(), Error> {
             "/integrations/jira/forge-register",
             post(routes::api::forge_register_urls),
         )
+        // This install's OAuth client metadata document, fetched by MCP
+        // sign-in servers (public, no sign-in).
+        .route(
+            routes::mcp_servers::METADATA_DOCUMENT_PATH,
+            get(routes::mcp_servers::client_metadata_document),
+        )
         // The sign-in methods that work here: the sign-in page reads it on
         // every load, so it stays out of the sign-in attempts' rate limit.
         .route("/auth/methods", get(routes::auth::methods))

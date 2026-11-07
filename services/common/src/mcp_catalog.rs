@@ -27,6 +27,14 @@ pub struct McpServerDef {
     /// The vendor's own remote MCP server, signed in to with OAuth (see the
     /// gateway's `mcp_servers`). Empty when the vendor runs none.
     pub remote_url: &'static str,
+    /// The vendor's remote server also takes a key as `Authorization:
+    /// Bearer <key>`: a key saved for it connects to the remote server
+    /// (the npm package path is for vendors without one).
+    pub remote_key: bool,
+    /// Why there is no key path, in plain words, when neither a package
+    /// the proxy can run nor a remote server that takes a key exists.
+    /// Empty when a key works.
+    pub key_unavailable: &'static str,
 }
 
 #[derive(serde::Serialize, Debug)]
@@ -57,7 +65,12 @@ pub const CATALOG: &[McpServerDef] = &[
         default_prompt: "Use the Figma MCP to extract design tokens, component details, and layout information from design files. Reference specific frames and layers by name. Do not modify or delete any Figma data.",
         recommended_permissions: "Read-only file access",
         npx_package: "figma-developer-mcp",
-        remote_url: "https://mcp.figma.com/mcp",
+        // No remote sign-in: Figma's MCP server registers only clients Figma
+        // approved (dynamic registration answers 403) and takes no client
+        // metadata documents, so a key is the way in.
+        remote_url: "",
+        remote_key: false,
+        key_unavailable: "",
         env_mapping: &[("api_token", "FIGMA_API_KEY")],
     },
     McpServerDef {
@@ -87,6 +100,8 @@ pub const CATALOG: &[McpServerDef] = &[
         recommended_permissions: "Read-only: event:read, issue:read, project:read",
         npx_package: "@sentry/mcp-server",
         remote_url: "https://mcp.sentry.dev/mcp",
+        remote_key: false,
+        key_unavailable: "",
         env_mapping: &[("auth_token", "SENTRY_ACCESS_TOKEN"), ("org_slug", "SENTRY_ORG")],
     },
     McpServerDef {
@@ -106,9 +121,11 @@ pub const CATALOG: &[McpServerDef] = &[
         repo_url: "https://linear.app/docs/mcp",
         default_prompt: "Use the Linear MCP to manage issues and projects. Create issues with proper labels and priorities, update status, and query project progress. Do not delete issues or modify team settings.",
         recommended_permissions: "Read + write issues only",
-        npx_package: "@linear/mcp-server",
+        npx_package: "",
         remote_url: "https://mcp.linear.app/mcp",
-        env_mapping: &[("api_key", "LINEAR_API_KEY")],
+        remote_key: true,
+        key_unavailable: "",
+        env_mapping: &[],
     },
     McpServerDef {
         id: "notion",
@@ -129,6 +146,8 @@ pub const CATALOG: &[McpServerDef] = &[
         recommended_permissions: "Read content only — no insert capabilities",
         npx_package: "@notionhq/notion-mcp-server",
         remote_url: "https://mcp.notion.com/mcp",
+        remote_key: false,
+        key_unavailable: "",
         env_mapping: &[("api_key", "OPENAPI_MCP_HEADERS")],
     },
 
@@ -151,9 +170,11 @@ pub const CATALOG: &[McpServerDef] = &[
         repo_url: "https://github.com/vercel/vercel-mcp",
         default_prompt: "Use the Vercel MCP to check deployment statuses, manage environment variables, and inspect build logs. Do not trigger deployments or modify production settings without confirmation.",
         recommended_permissions: "Read-only token — no deploy access",
-        npx_package: "@vercel/mcp",
+        npx_package: "",
         remote_url: "https://mcp.vercel.com",
-        env_mapping: &[("api_token", "VERCEL_API_TOKEN")],
+        remote_key: false,
+        key_unavailable: "Vercel's MCP server takes no key: use Sign in with Vercel.",
+        env_mapping: &[],
     },
     McpServerDef {
         id: "stripe",
@@ -164,17 +185,19 @@ pub const CATALOG: &[McpServerDef] = &[
         icon: "stripe",
         credential_fields: &[CredentialField {
             key: "api_key",
-            label: "Restricted API Key",
-            placeholder: "rk_live_...",
+            label: "Agent API key",
+            placeholder: "",
             secret: true,
         }],
-        docs_url: "https://docs.stripe.com/api",
+        docs_url: "https://docs.stripe.com/mcp",
         repo_url: "https://github.com/stripe/agent-toolkit",
         default_prompt: "Use the Stripe MCP to query customers, list recent charges, and inspect subscription statuses. Never create charges, refunds, or modify billing data.",
         recommended_permissions: "Restricted key: read-only charges, customers, subscriptions",
-        npx_package: "@stripe/mcp",
+        npx_package: "",
         remote_url: "https://mcp.stripe.com",
-        env_mapping: &[("api_key", "STRIPE_SECRET_KEY")],
+        remote_key: true,
+        key_unavailable: "",
+        env_mapping: &[],
     },
     // Cloudflare removed — their MCP server moved to remote OAuth-only (*.mcp.cloudflare.com)
     McpServerDef {
@@ -202,9 +225,11 @@ pub const CATALOG: &[McpServerDef] = &[
         repo_url: "https://github.com/posthog/mcp",
         default_prompt: "Use the PostHog MCP to query user analytics events, check feature flag statuses, and analyze user funnels. Do not modify feature flags or delete data.",
         recommended_permissions: "Read-only personal API key",
-        npx_package: "@nicholasoxford/posthog-mcp",
+        npx_package: "",
         remote_url: "https://mcp.posthog.com/mcp",
-        env_mapping: &[("api_key", "POSTHOG_API_KEY"), ("host", "POSTHOG_HOST")],
+        remote_key: false,
+        key_unavailable: "PostHog's MCP server signs in with PostHog: use Sign in with PostHog.",
+        env_mapping: &[],
     },
 
     McpServerDef {
@@ -232,9 +257,11 @@ pub const CATALOG: &[McpServerDef] = &[
         repo_url: "https://docs.gitlab.com/user/gitlab_duo/model_context_protocol/mcp_server/",
         default_prompt: "Use the GitLab MCP to list merge requests, check pipeline statuses, and query issues. Do not push code, merge MRs, or modify project settings.",
         recommended_permissions: "read_api scope only",
-        npx_package: "@anthropic-ai/gitlab-mcp-server",
+        npx_package: "",
         remote_url: "https://gitlab.com/api/v4/mcp",
-        env_mapping: &[("api_token", "GITLAB_TOKEN"), ("base_url", "GITLAB_URL")],
+        remote_key: false,
+        key_unavailable: "GitLab's MCP server takes no key: use Sign in with GitLab.",
+        env_mapping: &[],
     },
     McpServerDef {
         id: "neon",
@@ -253,9 +280,11 @@ pub const CATALOG: &[McpServerDef] = &[
         repo_url: "https://github.com/neondatabase/mcp-server-neon",
         default_prompt: "Use the Neon MCP to inspect Postgres schemas and run read-only queries. Do not run DDL statements, drop tables, or modify data without explicit approval.",
         recommended_permissions: "Read-only database role — no DDL, no deletes",
-        npx_package: "@neondatabase/mcp-server-neon",
+        npx_package: "",
         remote_url: "https://mcp.neon.tech/mcp",
-        env_mapping: &[("api_key", "NEON_API_KEY")],
+        remote_key: true,
+        key_unavailable: "",
+        env_mapping: &[],
     },
     McpServerDef {
         id: "turso",
@@ -282,9 +311,11 @@ pub const CATALOG: &[McpServerDef] = &[
         repo_url: "https://github.com/tursodatabase/turso-mcp",
         default_prompt: "Use the Turso MCP to inspect LibSQL schemas and run read-only queries. Do not execute DDL or destructive operations without explicit approval.",
         recommended_permissions: "Read-only API token",
-        npx_package: "@tursodatabase/turso-mcp",
+        npx_package: "",
         remote_url: "https://mcp.turso.ai/mcp",
-        env_mapping: &[("api_token", "TURSO_API_TOKEN"), ("org_name", "TURSO_ORG")],
+        remote_key: false,
+        key_unavailable: "Turso's MCP server takes no key: use Sign in with Turso.",
+        env_mapping: &[],
     },
     // Tier 3 — Nice to have
     McpServerDef {
@@ -304,9 +335,11 @@ pub const CATALOG: &[McpServerDef] = &[
         repo_url: "https://github.com/snyk/snyk-ls",
         default_prompt: "Use the Snyk MCP to scan for vulnerabilities, check dependency health, and list security issues. Do not modify project settings or ignore policies.",
         recommended_permissions: "Read-only: view org, view project",
-        npx_package: "snyk-mcp-server",
+        npx_package: "",
         remote_url: "",
-        env_mapping: &[("api_token", "SNYK_TOKEN")],
+        remote_key: false,
+        key_unavailable: "Snyk's MCP server runs through the Snyk command line, which Coderhelm can't run yet.",
+        env_mapping: &[],
     },
     McpServerDef {
         id: "launchdarkly",
@@ -325,9 +358,11 @@ pub const CATALOG: &[McpServerDef] = &[
         repo_url: "https://github.com/launchdarkly/mcp-server",
         default_prompt: "Use the LaunchDarkly MCP to check feature flag statuses across environments. Do not toggle flags or modify targeting rules without explicit confirmation.",
         recommended_permissions: "Reader role — no write access",
-        npx_package: "@launchdarkly/mcp-server",
+        npx_package: "",
         remote_url: "https://mcp.launchdarkly.com/mcp/launchdarkly",
-        env_mapping: &[("api_key", "LAUNCHDARKLY_ACCESS_TOKEN")],
+        remote_key: false,
+        key_unavailable: "LaunchDarkly's MCP server needs start options Coderhelm can't pass yet: use Sign in with LaunchDarkly.",
+        env_mapping: &[],
     },
     McpServerDef {
         id: "mongodb",
@@ -338,31 +373,27 @@ pub const CATALOG: &[McpServerDef] = &[
         icon: "mongodb",
         credential_fields: &[
             CredentialField {
-                key: "public_key",
-                label: "Public Key",
-                placeholder: "abc123",
+                key: "client_id",
+                label: "Service account client ID",
+                placeholder: "mdb_sa_id_...",
                 secret: false,
             },
             CredentialField {
-                key: "private_key",
-                label: "Private Key",
-                placeholder: "...",
+                key: "client_secret",
+                label: "Service account client secret",
+                placeholder: "mdb_sa_sk_...",
                 secret: true,
             },
-            CredentialField {
-                key: "group_id",
-                label: "Project ID",
-                placeholder: "64abc...",
-                secret: false,
-            },
         ],
-        docs_url: "https://www.mongodb.com/docs/atlas/api/",
+        docs_url: "https://www.mongodb.com/docs/atlas/configure-api-access/",
         repo_url: "https://github.com/mongodb-js/mongodb-mcp-server",
         default_prompt: "Use the MongoDB MCP to query collections and inspect document schemas. Do not drop collections, modify indexes, or delete data.",
         recommended_permissions: "Project Read Only role",
         npx_package: "mongodb-mcp-server",
         remote_url: "",
-        env_mapping: &[("public_key", "MDB_MCP_API_PUBLIC_KEY"), ("private_key", "MDB_MCP_API_PRIVATE_KEY"), ("group_id", "MDB_MCP_API_GROUP_ID")],
+        remote_key: false,
+        key_unavailable: "",
+        env_mapping: &[("client_id", "MDB_MCP_API_CLIENT_ID"), ("client_secret", "MDB_MCP_API_CLIENT_SECRET")],
     },
     McpServerDef {
         id: "grafana",
@@ -389,9 +420,11 @@ pub const CATALOG: &[McpServerDef] = &[
         repo_url: "https://github.com/grafana/mcp-grafana",
         default_prompt: "Use the Grafana MCP to query dashboards, check alert statuses, and explore data sources. Do not modify dashboards or silence alerts.",
         recommended_permissions: "Viewer role service account",
-        npx_package: "mcp-grafana",
+        npx_package: "",
         remote_url: "https://mcp.grafana.com/mcp",
-        env_mapping: &[("api_key", "GRAFANA_API_KEY"), ("base_url", "GRAFANA_URL")],
+        remote_key: false,
+        key_unavailable: "Grafana's MCP server runs as its own program, which Coderhelm can't run yet. Use Sign in with Grafana.",
+        env_mapping: &[],
     },
     McpServerDef {
         id: "redis",
@@ -410,9 +443,11 @@ pub const CATALOG: &[McpServerDef] = &[
         repo_url: "https://github.com/redis/mcp-redis",
         default_prompt: "Use the Redis MCP to inspect keys and run read-only commands. Do not run FLUSHDB, DEL, or any destructive commands.",
         recommended_permissions: "Read-only user — no write commands",
-        npx_package: "@redis/mcp-server",
+        npx_package: "",
         remote_url: "",
-        env_mapping: &[("connection_url", "REDIS_URL")],
+        remote_key: false,
+        key_unavailable: "Redis's MCP server runs with Python, which Coderhelm can't run yet.",
+        env_mapping: &[],
     },
     McpServerDef {
         id: "upstash",
@@ -439,8 +474,10 @@ pub const CATALOG: &[McpServerDef] = &[
         repo_url: "https://github.com/upstash/mcp-server",
         default_prompt: "Use the Upstash MCP to inspect Redis databases and read data. Do not delete databases, flush data, or modify configurations.",
         recommended_permissions: "Read-only API key",
-        npx_package: "@anthropic-ai/upstash-mcp-server",
+        npx_package: "@upstash/mcp-server",
         remote_url: "https://mcp.upstash.com/mcp",
+        remote_key: false,
+        key_unavailable: "",
         env_mapping: &[("email", "UPSTASH_EMAIL"), ("api_key", "UPSTASH_API_KEY")],
     },
 
@@ -469,8 +506,10 @@ pub const CATALOG: &[McpServerDef] = &[
         repo_url: "https://github.com/sanity-io/sanity-mcp-server",
         default_prompt: "Use the Sanity MCP to query documents and read content schemas. Do not create, publish, or delete documents without explicit approval.",
         recommended_permissions: "Viewer token — read-only access",
-        npx_package: "sanity-mcp-server",
+        npx_package: "",
         remote_url: "https://mcp.sanity.io",
+        remote_key: false,
+        key_unavailable: "",
         env_mapping: &[("api_token", "SANITY_API_TOKEN"), ("project_id", "SANITY_PROJECT_ID")],
     },
 
@@ -489,12 +528,38 @@ pub const CATALOG: &[McpServerDef] = &[
         npx_package: "",
         env_mapping: &[],
         remote_url: "https://mcp.atlassian.com/v1/mcp",
+        remote_key: false,
+        key_unavailable: "",
     },
 ];
 
 /// The catalog entry for a server id.
 pub fn find(id: &str) -> Option<&'static McpServerDef> {
     CATALOG.iter().find(|p| p.id == id)
+}
+
+/// Where a person creates the key for a catalog server, in plain words, for
+/// when its sign-in can't be used. Falls back to the server's API docs.
+pub fn key_help(id: &str) -> Option<String> {
+    let place = match id {
+        "figma" => "Figma, Settings, Security, Personal access tokens (https://help.figma.com/hc/en-us/articles/8085703771159)",
+        "vercel" => "Vercel, Account Settings, Tokens (https://vercel.com/account/settings/tokens)",
+        "stripe" => "the Stripe Dashboard as an agent API key (https://docs.stripe.com/keys#agent-keys)",
+        "sentry" => "Sentry, User Settings, Personal Tokens (https://sentry.io/settings/account/api/auth-tokens/)",
+        "linear" => "Linear, Settings, Security & access, Personal API keys (https://linear.app/settings/account/security)",
+        "notion" => "Notion, Settings, Connections, Develop or manage integrations (https://www.notion.so/profile/integrations)",
+        "gitlab" => "GitLab, Preferences, Access tokens (https://gitlab.com/-/user_settings/personal_access_tokens)",
+        "neon" => "the Neon Console, Account settings, API keys (https://console.neon.tech/app/settings/api-keys)",
+        _ => {
+            let p = find(id)?;
+            return (!p.docs_url.is_empty()).then(|| {
+                format!("Create one as {}'s API docs describe: {}", p.name, p.docs_url)
+            });
+        }
+    };
+    Some(format!(
+        "Create one in {place}, then paste it under Use a key instead."
+    ))
 }
 
 /// The catalog's server ids, in catalog order.
@@ -511,9 +576,32 @@ mod tests {
         let mut seen = std::collections::HashSet::new();
         for p in CATALOG {
             assert!(seen.insert(p.id), "{} listed twice", p.id);
-            // A server is run locally (npx) or reached remotely, or both.
+            // A server is run locally (npx) or reached remotely, or says
+            // plainly why it can't be used with a key.
             assert!(
-                !p.npx_package.is_empty() || !p.remote_url.is_empty(),
+                !p.npx_package.is_empty()
+                    || !p.remote_url.is_empty()
+                    || !p.key_unavailable.is_empty(),
+                "{}",
+                p.id
+            );
+            // A key goes to the remote server only when there is one.
+            assert!(!p.remote_key || !p.remote_url.is_empty(), "{}", p.id);
+            // Every entry has exactly one key story: a package, the remote
+            // server taking the key, a reason there is none, or (Sanity) a
+            // key kept for Knowledge.
+            let key_paths = [
+                !p.npx_package.is_empty(),
+                p.remote_key,
+                !p.key_unavailable.is_empty(),
+            ]
+            .iter()
+            .filter(|b| **b)
+            .count();
+            assert!(key_paths <= 1, "{}: more than one key path", p.id);
+            // A package's env mapping only exists with the package.
+            assert!(
+                !p.npx_package.is_empty() || p.env_mapping.is_empty() || p.id == "sanity",
                 "{}",
                 p.id
             );
@@ -527,6 +615,23 @@ mod tests {
         }
         assert!(find("sanity").is_some());
         assert_eq!(find("nope").map(|p| p.id), None);
+    }
+
+    #[test]
+    fn the_proxy_allowlist_is_exactly_the_catalogs_packages() {
+        // Every package the catalog runs is allowed, and nothing else is: a
+        // stale name there would be a package anyone could publish.
+        let proxy = include_str!("../../../lambda/mcp-proxy/handler.mjs");
+        let start = proxy.find("ALLOWED_PACKAGES = new Set([").unwrap();
+        let end = start + proxy[start..].find("]);").unwrap();
+        let allowed: std::collections::BTreeSet<&str> =
+            proxy[start..end].split('"').skip(1).step_by(2).collect();
+        let catalog: std::collections::BTreeSet<&str> = CATALOG
+            .iter()
+            .map(|p| p.npx_package)
+            .filter(|p| !p.is_empty())
+            .collect();
+        assert_eq!(allowed, catalog);
     }
 
     #[test]

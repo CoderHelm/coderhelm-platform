@@ -203,19 +203,22 @@ pub async fn sign_in_apps(
         ));
     }
     let redirect = super::mcp_servers::redirect_uri(&state.config.stage);
-    let apps: Vec<Value> = [Kind::Notion, Kind::Confluence, Kind::GoogleDrive]
-        .into_iter()
-        .map(|k| {
-            // A hybrid install may sign in through Coderhelm's own app instead.
-            let brokered = super::hybrid_install::brokered(k).is_some();
-            let source = if app(&state, k).is_set() || !brokered {
-                app_source(&state.secrets, k)
-            } else {
-                "Coderhelm's app (hybrid)"
-            };
-            app_row(k, app(&state, k).is_set() || brokered, source, &redirect)
-        })
-        .collect();
+    let mut apps: Vec<Value> = Vec::new();
+    for k in [Kind::Notion, Kind::Confluence, Kind::GoogleDrive] {
+        // A hybrid install may sign in through Coderhelm's own app instead.
+        let brokered = super::hybrid_install::brokered(&state, k).await.is_some();
+        let source = if app(&state, k).is_set() || !brokered {
+            app_source(&state.secrets, k)
+        } else {
+            "Coderhelm's app (hybrid)"
+        };
+        apps.push(app_row(
+            k,
+            app(&state, k).is_set() || brokered,
+            source,
+            &redirect,
+        ));
+    }
     let secret = std::env::var("SECRETS_NAME").unwrap_or_else(|_| "coderhelm/prod/secrets".into());
     Ok(Json(json!({ "apps": apps, "secret_name": secret })))
 }
