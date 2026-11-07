@@ -163,6 +163,74 @@ pub struct SanityMcp {
     pub tools: mcp::Tools,
     /// Unix seconds now.
     pub now: i64,
+    /// Projects the team's repositories name (id, repository), offered when
+    /// Sanity's own list leaves them out (see [`super::sanity_repos`]).
+    pub hints: Vec<(String, String)>,
+}
+
+/// What the picker says when the sign-in works but Sanity lists no project
+/// and none could be found another way.
+pub const EMPTY_LIST: &str = "Sanity listed no projects for this sign-in. Sanity's list shows only projects the signed-in account is a member of by name, so a project reached through an organization role or an API token doesn't show. Type the project id in the search box (it's on sanity.io/manage, or `projectId` in your Studio's sanity.config) and Coderhelm opens it if this sign-in can read it.";
+
+/// Most projects checked (by listing their datasets) for one picker view.
+const MAX_CHECKED: usize = 8;
+
+/// Keys a project's id is found under in Sanity's answers.
+const ID_KEYS: &[&str] = &["id", "projectId", "project_id"];
+const NAME_KEYS: &[&str] = &["displayName", "name", "title"];
+
+/// The projects in a `list_projects` answer: every object (at any depth,
+/// in the structured answer and in each text item) with a project id,
+/// named by its display name when it has one.
+pub fn projects_in(result: &Value) -> Result<Vec<(String, String)>, ConnectorError> {
+    let mut answers: Vec<Value> = vec![result_json(PROVIDER, result)?];
+    for t in result["content"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|c| c["type"] == "text")
+        .filter_map(|c| c["text"].as_str())
+    {
+        if let Some(v) = mcp::data_in(t) {
+            answers.push(v);
+        }
+    }
+    let id_of = |m: &serde_json::Map<String, Value>| {
+        ID_KEYS
+            .iter()
+            .find_map(|k| m.get(*k).and_then(Value::as_str))
+            .filter(|id| valid_project(id))
+            .map(str::to_string)
+    };
+    let mut out: Vec<(String, String)> = Vec::new();
+    for v in &answers {
+        for m in objects(v, &|m| id_of(m).is_some()) {
+            let id = id_of(m).unwrap_or_default();
+            let name = NAME_KEYS
+                .iter()
+                .find_map(|k| m.get(*k).and_then(Value::as_str))
+                .filter(|n| !n.trim().is_empty())
+                .unwrap_or(&id)
+                .to_string();
+            if !out.iter().any(|(i, _)| *i == id) {
+                out.push((id, name));
+            }
+        }
+    }
+    out.sort_by_key(|(_, name)| name.to_lowercase());
+    Ok(out)
+}
+
+fn project_node(id: &str, title: String, detail: String) -> Node {
+    Node {
+        id: format!("project:{id}"),
+        title,
+        kind: "project".into(),
+        has_children: true,
+        selectable: false,
+        detail,
+        ..Default::default()
+    }
 }
 
 impl SanityMcp {
@@ -221,26 +289,64 @@ impl SanityMcp {
     }
 
     pub async fn projects(&self) -> Result<Vec<(String, String)>, ConnectorError> {
-        let v = self.call("list_projects", json!({})).await?;
-        let mut out: Vec<(String, String)> = Vec::new();
-        for m in objects(&v, &|m| {
-            m.get("id")
-                .and_then(Value::as_str)
-                .is_some_and(valid_project)
-        }) {
-            let id = m["id"].as_str().unwrap_or("").to_string();
-            let name = m
-                .get("displayName")
-                .or(m.get("name"))
-                .and_then(Value::as_str)
-                .unwrap_or(&id)
-                .to_string();
-            if !out.iter().any(|(i, _)| *i == id) {
-                out.push((id, name));
+        let t = self.find_tool("list_projects").await?;
+        let r = self.tools.call(&t, &json!({})).await?;
+        let out = projects_in(&r)?;
+        if out.is_empty() {
+            // The answer's shape (never its text), so an empty picker can be
+            // told apart from an answer this code doesn't read.
+            tracing::warn!(
+                provider = PROVIDER,
+                shape = %mcp::answer_shape(&r),
+                "Sanity's project list named no project"
+            );
+        }
+        Ok(out)
+    }
+
+    /// The picker's top level: Sanity's project list, then projects the
+    /// team's repositories name and a project id typed in the search box,
+    /// each shown only when this sign-in can list its datasets.
+    async fn top_level(&self, query: &str) -> Result<Vec<Node>, ConnectorError> {
+        let listed = self.projects().await?;
+        let typed = query.trim();
+        let mut nodes: Vec<Node> = listed
+            .iter()
+            .filter(|(id, name)| matches(query, name) || matches(query, id))
+            .map(|(id, name)| project_node(id, name.clone(), format!("Project {id}")))
+            .collect();
+        let mut extra: Vec<(String, String)> = Vec::new();
+        for (id, repo) in &self.hints {
+            if !listed.iter().any(|(i, _)| i == id)
+                && !extra.iter().any(|(i, _)| i == id)
+                && (matches(query, id) || matches(query, repo))
+            {
+                extra.push((id.clone(), format!("Project {id}, named in {repo}")));
             }
         }
-        out.sort_by_key(|(_, name)| name.to_lowercase());
-        Ok(out)
+        // A search that matches nothing listed or named may be a project id.
+        if nodes.is_empty()
+            && extra.is_empty()
+            && valid_project(typed)
+            && !listed.iter().any(|(i, _)| i == typed)
+        {
+            extra.push((typed.to_string(), format!("Project {typed}")));
+        }
+        for (id, detail) in extra.into_iter().take(MAX_CHECKED) {
+            match self.datasets(&id).await {
+                Ok(ds) if !ds.is_empty() => nodes.push(project_node(&id, id.clone(), detail)),
+                Ok(_) => {}
+                Err(e) => tracing::info!(
+                    provider = PROVIDER,
+                    error = %e,
+                    "A Sanity project from the repositories or the search isn't readable with this sign-in"
+                ),
+            }
+        }
+        if nodes.is_empty() && typed.is_empty() {
+            return Err(ConnectorError::Config(EMPTY_LIST.into()));
+        }
+        Ok(nodes)
     }
 
     pub async fn datasets(&self, project: &str) -> Result<Vec<String>, ConnectorError> {
@@ -474,21 +580,7 @@ impl Connector for SanityMcp {
 
     async fn browse(&self, parent: Option<&str>, query: &str) -> Result<Vec<Node>, ConnectorError> {
         match parent.and_then(parse_ref) {
-            None => Ok(self
-                .projects()
-                .await?
-                .into_iter()
-                .filter(|(id, name)| matches(query, name) || matches(query, id))
-                .map(|(id, name)| Node {
-                    id: format!("project:{id}"),
-                    title: name,
-                    kind: "project".into(),
-                    has_children: true,
-                    selectable: false,
-                    detail: format!("Project {id}"),
-                    ..Default::default()
-                })
-                .collect()),
+            None => self.top_level(query).await,
             Some(Ref::Project(p)) => Ok(self
                 .datasets(p)
                 .await?
@@ -670,6 +762,7 @@ mod tests {
         let c = SanityMcp {
             tools: f.clone(),
             now: 0,
+            hints: Vec::new(),
         };
         let top = c.browse(None, "").await.unwrap();
         assert_eq!(
@@ -691,6 +784,90 @@ mod tests {
         );
     }
 
+    #[test]
+    fn project_ids_are_read_under_every_key_and_from_text_beside_structured_content() {
+        let r = json!({
+            "structuredContent": {"result": "ok"},
+            "content": [{"type": "text", "text": "Found 2 projects: {\"projects\": [{\"projectId\": \"9ab8cd7e\", \"displayName\": \"Site\"}, {\"project_id\": \"zz11\"}]}"}]
+        });
+        assert_eq!(
+            projects_in(&r).unwrap(),
+            [
+                ("9ab8cd7e".to_string(), "Site".to_string()),
+                ("zz11".to_string(), "zz11".to_string())
+            ]
+        );
+        let err =
+            json!({"isError": true, "content": [{"type": "text", "text": "No projects found"}]});
+        assert!(projects_in(&err).is_err(), "an error answer stays an error");
+    }
+
+    /// A sign-in whose project list is empty, but which reads `readable`.
+    fn member_of_nothing(readable: &'static str) -> Arc<FakeMcp> {
+        server(move |name, args| {
+            Ok(match name {
+                "list_projects" => text_result(&json!({"orgs": {}})),
+                "list_datasets" if args["projectId"] == readable => {
+                    text_result(&json!({"datasets": {"production": {"name": "production"}}}))
+                }
+                "list_datasets" => {
+                    json!({"isError": true, "content": [{"type": "text", "text": "Project not found"}]})
+                }
+                _ => unreachable!(),
+            })
+        })
+    }
+
+    #[tokio::test]
+    async fn projects_the_repositories_name_show_when_sanitys_list_leaves_them_out() {
+        let f = member_of_nothing("9ab8cd7e");
+        let c = SanityMcp {
+            tools: f.clone(),
+            now: 0,
+            hints: vec![
+                ("9ab8cd7e".into(), "acme/site".into()),
+                ("nope1234".into(), "acme/other".into()),
+            ],
+        };
+        let top = c.browse(None, "").await.unwrap();
+        assert_eq!(top.len(), 1, "only the project this sign-in can read");
+        assert_eq!(top[0].id, "project:9ab8cd7e");
+        assert_eq!(top[0].detail, "Project 9ab8cd7e, named in acme/site");
+        let ds = c.browse(Some(&top[0].id), "").await.unwrap();
+        assert_eq!(ds[0].id, "dataset:9ab8cd7e:production");
+    }
+
+    #[tokio::test]
+    async fn a_project_id_typed_in_the_search_opens_when_the_sign_in_reads_it() {
+        let c = SanityMcp {
+            tools: member_of_nothing("9ab8cd7e"),
+            now: 0,
+            hints: Vec::new(),
+        };
+        let found = c.browse(None, " 9ab8cd7e ").await.unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].id, "project:9ab8cd7e");
+        assert!(
+            c.browse(None, "nope1234").await.unwrap().is_empty(),
+            "an id the sign-in can't read is not offered"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_empty_list_says_why_and_what_to_do() {
+        let c = SanityMcp {
+            tools: member_of_nothing("9ab8cd7e"),
+            now: 0,
+            hints: Vec::new(),
+        };
+        let e = c.browse(None, "").await.unwrap_err();
+        assert_eq!(e.to_string(), EMPTY_LIST);
+        assert!(e
+            .to_string()
+            .contains("Type the project id in the search box"));
+        assert!(!e.to_string().contains("hasn't shared anything"));
+    }
+
     #[tokio::test]
     async fn the_picker_reads_sanitys_own_xml_answers() {
         use super::super::mcp::tests::{SANITY_DATASETS, SANITY_PROJECTS, SANITY_QUERY};
@@ -706,6 +883,7 @@ mod tests {
         let c = SanityMcp {
             tools: f.clone(),
             now: 0,
+            hints: Vec::new(),
         };
         let top = c.browse(None, "").await.unwrap();
         assert_eq!(
@@ -751,6 +929,7 @@ mod tests {
         let c = SanityMcp {
             tools: f.clone(),
             now: 1_000,
+            hints: Vec::new(),
         };
         let l = c
             .list(&source(&["type:abc123:production:post"]))
@@ -779,6 +958,7 @@ mod tests {
         let c = SanityMcp {
             tools: f.clone(),
             now: 2_000,
+            hints: Vec::new(),
         };
         let mut src = source(&["type:abc123:production:post"]);
         src.cursor = serde_json::to_string(&Cursor {
@@ -830,6 +1010,7 @@ mod tests {
         let l = SanityMcp {
             tools: f.clone(),
             now: FULL_EVERY_SECS + 1,
+            hints: Vec::new(),
         }
         .list(&src)
         .await
@@ -845,6 +1026,7 @@ mod tests {
         let l = SanityMcp {
             tools: f.clone(),
             now: FULL_EVERY_SECS + 2,
+            hints: Vec::new(),
         }
         .list(&changed)
         .await
@@ -873,6 +1055,7 @@ mod tests {
         let d = SanityMcp {
             tools: f.clone(),
             now: 0,
+            hints: Vec::new(),
         }
         .fetch(
             &src,
@@ -900,6 +1083,7 @@ mod tests {
         let e = SanityMcp {
             tools: f.clone(),
             now: 0,
+            hints: Vec::new(),
         }
         .fetch(&src, &item)
         .await
@@ -909,6 +1093,7 @@ mod tests {
         let e = SanityMcp {
             tools: expired.clone(),
             now: 0,
+            hints: Vec::new(),
         }
         .list(&src)
         .await
@@ -922,6 +1107,7 @@ mod tests {
         let c = SanityMcp {
             tools: f.clone(),
             now: 0,
+            hints: Vec::new(),
         };
         let e = c.call("create_documents", json!({})).await.unwrap_err();
         assert!(matches!(e, ConnectorError::Config(_)));
@@ -938,7 +1124,8 @@ mod tests {
         assert_eq!(
             SanityMcp {
                 tools: f.clone(),
-                now: 0
+                now: 0,
+                hints: Vec::new(),
             }
             .account()
             .await,

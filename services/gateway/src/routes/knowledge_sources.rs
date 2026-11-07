@@ -506,11 +506,14 @@ pub async fn browse(
         .filter(|p| !p.is_empty() && p.len() <= 2_000);
     if q.via == "sign_in" && kind == Kind::Sanity {
         let si = member_signin(&state, &claims, kind).await?;
-        let c = connect::sanity_signin(
+        let mut c = connect::sanity_signin(
             super::mcp_servers::runtime(&state, &claims.team_id),
             si.server,
             si.owner,
         );
+        if parent.is_none() {
+            c.hints = sanity_repo_projects(&state, &claims.team_id).await;
+        }
         let nodes = c
             .browse(parent, query)
             .await
@@ -533,6 +536,74 @@ pub async fn browse(
         "nodes": nodes.into_iter().take(500).collect::<Vec<_>>(),
         "options": public_options(&opened.options),
     })))
+}
+
+/// Where the team's scan for Sanity projects named in its repositories is
+/// kept, and for how long it is reused.
+const SANITY_REPO_PROJECTS_SK: &str = "KNOWLEDGE#SANITY_REPO_PROJECTS";
+const SANITY_REPO_PROJECTS_TTL_SECS: i64 = 24 * 60 * 60;
+
+/// The Sanity projects the team's repositories name (id, repository), from
+/// the cached scan when it is under a day old. Empty when the team has no
+/// GitHub App or the scan fails: the picker then shows Sanity's own list.
+async fn sanity_repo_projects(state: &AppState, team: &str) -> Vec<(String, String)> {
+    use aws_sdk_dynamodb::types::AttributeValue as Av;
+    let table = &state.config.settings_table_name;
+    let key = |k: &str, v: &str| (k.to_string(), Av::S(v.to_string()));
+    if let Ok(out) = state
+        .dynamo
+        .get_item()
+        .table_name(table)
+        .key("pk", Av::S(team.to_string()))
+        .key("sk", Av::S(SANITY_REPO_PROJECTS_SK.into()))
+        .send()
+        .await
+    {
+        if let Some(item) = out.item() {
+            let at = item
+                .get("at")
+                .and_then(|v| v.as_n().ok())
+                .and_then(|n| n.parse::<i64>().ok())
+                .unwrap_or(0);
+            if now_secs() - at < SANITY_REPO_PROJECTS_TTL_SECS {
+                let found = item
+                    .get("found")
+                    .and_then(|v| v.as_s().ok())
+                    .map(|s| ks::sanity_repos::from_json(s))
+                    .unwrap_or_default();
+                return found;
+            }
+        }
+    }
+    let Some(token) = github_token(state, team).await else {
+        return Vec::new();
+    };
+    let http = common::mcp_remote::http::GuardedHttps;
+    let found = match ks::sanity_repos::scan(&http, &format!("Bearer {token}")).await {
+        Ok(f) => f,
+        Err(e) => {
+            warn!(team, error = %e, "Couldn't read the repositories for Sanity projects");
+            return Vec::new();
+        }
+    };
+    let _ = state
+        .dynamo
+        .put_item()
+        .table_name(table)
+        .set_item(Some(
+            [
+                key("pk", team),
+                key("sk", SANITY_REPO_PROJECTS_SK),
+                key("found", &ks::sanity_repos::to_json(&found)),
+                ("at".to_string(), Av::N(now_secs().to_string())),
+            ]
+            .into_iter()
+            .collect(),
+        ))
+        .send()
+        .await
+        .map_err(|e| warn!(team, error = %e, "Couldn't keep the Sanity repository scan"));
+    found
 }
 
 fn connector_fail(kind: Kind, e: &ks::ConnectorError) -> (StatusCode, Json<Value>) {

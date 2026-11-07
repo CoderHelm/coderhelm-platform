@@ -495,6 +495,7 @@ pub fn sanity_signin(rt: Runtime, server: ServerRecord, owner: Owner) -> SanityM
     SanityMcp {
         tools: Arc::new(RuntimeTools::new(rt, server, owner, "Sanity")),
         now: chrono::Utc::now().timestamp(),
+        hints: Vec::new(),
     }
 }
 
