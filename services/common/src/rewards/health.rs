@@ -68,6 +68,9 @@ pub struct ClosedPr {
     pub repo: String,
     pub pr: u64,
     pub closed_at: String,
+    /// The coder variant its run used; empty for a run started before the
+    /// coder had variants (nothing can be credited to it).
+    pub variant: String,
 }
 
 /// One review CoderHelm posted, from its record's key
@@ -300,13 +303,25 @@ pub fn loops(i: &Inputs<'_>, now: DateTime<Utc>) -> Vec<Loop> {
     });
 
     // 4 and 5. Prompt variants, per agent.
-    // Unit: pull requests (reviewed, or CoderHelm's that closed), and those
-    // of them with an outcome credited to a variant.
-    let closed: BTreeSet<(String, u64)> = i
+    // Unit: pull requests (reviewed, or CoderHelm's that closed from a run
+    // that picked a variant), and those of them with an outcome credited to
+    // a variant. A coder PR whose run started before the coder had variants
+    // can't be credited to one, so it is named, not counted as a miss.
+    let closed_window: Vec<&ClosedPr> = i
         .closed_prs
         .iter()
         .filter(|p| within(&p.closed_at, since))
+        .collect();
+    let closed: BTreeSet<(String, u64)> = closed_window
+        .iter()
+        .filter(|p| !p.variant.is_empty())
         .map(|p| (p.repo.clone(), p.pr))
+        .collect();
+    let before_variants: BTreeSet<(String, u64)> = closed_window
+        .iter()
+        .filter(|p| p.variant.is_empty())
+        .map(|p| (p.repo.clone(), p.pr))
+        .filter(|k| !closed.contains(k))
         .collect();
     for (agent, key, label, prs) in [
         (
@@ -334,13 +349,27 @@ pub fn loops(i: &Inputs<'_>, now: DateTime<Utc>) -> Vec<Loop> {
         let credited_here = prs.intersection(&credited_prs).count();
         let pulls: u64 = arms.iter().map(|a| a.pulls).sum();
         let recent = within(&last, since);
-        // The coder's variants are new: PRs of runs started before them
-        // close with no pull, which is not a broken loop.
-        let not_started = agent == AGENT_CODER && arms.is_empty();
+        let mut detail = format!(
+            "{credited_here} of {expected} pull request(s) have an outcome credited to a variant; {} arm(s), {pulls} pull(s) in all",
+            arms.len()
+        );
+        if agent == AGENT_CODER {
+            if pulls == 0 {
+                detail.push_str("; no coder run has picked a variant yet, the next one will");
+            }
+            if !before_variants.is_empty() {
+                detail.push_str(&format!(
+                    "; {} closed pull request(s) ran before the coder had variants and are not counted",
+                    before_variants.len()
+                ));
+            }
+        }
         out.push(Loop {
             key,
             label,
-            state: if expected == 0 || not_started {
+            // Only PRs that could be credited are expected, so a coder PR
+            // from before the variants never turns the loop red.
+            state: if expected == 0 {
                 State::Idle
             } else if recent || (last.is_empty() && pulls > 0 && credited > 0) {
                 State::Ok
@@ -350,10 +379,7 @@ pub fn loops(i: &Inputs<'_>, now: DateTime<Utc>) -> Vec<Loop> {
             last_signal_at: last,
             count: credited_here as u64,
             expected: Some(expected as u64),
-            detail: format!(
-                "{credited_here} of {expected} pull request(s) have an outcome credited to a variant; {} arm(s), {pulls} pull(s) in all",
-                arms.len()
-            ),
+            detail,
         });
     }
 
@@ -536,17 +562,20 @@ mod tests {
                 repo: "acme/web".into(),
                 pr: 1,
                 closed_at: "2026-11-05T00:00:00Z".into(),
+                ..Default::default()
             },
             ClosedPr {
                 repo: "acme/web".into(),
                 pr: 2,
                 closed_at: "2026-11-05T00:00:00Z".into(),
+                ..Default::default()
             },
             // Closed minutes ago: still within the grace.
             ClosedPr {
                 repo: "acme/web".into(),
                 pr: 3,
                 closed_at: "2026-11-06T11:50:00Z".into(),
+                ..Default::default()
             },
         ];
         let events = vec![ev(
@@ -591,6 +620,7 @@ mod tests {
             repo: "acme/web".into(),
             pr: 9,
             closed_at: "2026-11-05T00:00:00Z".into(),
+            ..Default::default()
         }];
         let i2 = Inputs {
             closed_prs: &closed,
@@ -605,8 +635,14 @@ mod tests {
             pulls: 3,
             last_pull_at: "2026-10-01T00:00:00Z".into(),
         }];
+        // A PR whose run picked a variant, closed with nothing credited and
+        // no pull since: red.
+        let picked = vec![ClosedPr {
+            variant: "read_first".into(),
+            ..closed[0].clone()
+        }];
         let i2 = Inputs {
-            closed_prs: &closed,
+            closed_prs: &picked,
             arms: &stale,
             ..Default::default()
         };
@@ -724,6 +760,7 @@ mod tests {
                 repo: "acme/web".into(),
                 pr,
                 closed_at: "2026-11-04T00:00:00Z".into(),
+                variant: "read_first".into(),
             })
             .collect();
         let arms = vec![
@@ -758,6 +795,72 @@ mod tests {
         assert_eq!(by_key(&l, "pr_outcomes").count, 2);
         assert_eq!(by_key(&l, "coder_variants").count, 2);
         assert_eq!(by_key(&l, "coder_lessons").expected, None);
+    }
+
+    /// Production: 17 CoderHelm PRs closed the week the coder got variants,
+    /// all from runs started before, so none could be credited. The page read
+    /// "0 of 17" as if the loop were missing them. They are named, not
+    /// counted; the first PR of a run that picked a variant is expected, and
+    /// red if it closes with nothing credited once pulls stop.
+    #[test]
+    fn coder_prs_from_before_the_variants_are_not_expected() {
+        let mut closed: Vec<ClosedPr> = (1..=17)
+            .map(|pr| ClosedPr {
+                repo: "acme/web".into(),
+                pr,
+                closed_at: "2026-11-05T00:00:00Z".into(),
+                ..Default::default()
+            })
+            .collect();
+        let i = Inputs {
+            closed_prs: &closed,
+            ..Default::default()
+        };
+        let l = loops(&i, now());
+        let v = by_key(&l, "coder_variants");
+        assert_eq!(v.state, State::Idle);
+        assert_eq!(v.expected, Some(0));
+        assert!(
+            v.detail.contains("17 closed pull request(s) ran before"),
+            "{}",
+            v.detail
+        );
+        assert!(
+            v.detail.contains("no coder run has picked a variant yet"),
+            "{}",
+            v.detail
+        );
+
+        // One run picked a variant and its PR closed with the outcome credited.
+        closed.push(ClosedPr {
+            repo: "acme/web".into(),
+            pr: 18,
+            closed_at: "2026-11-06T00:00:00Z".into(),
+            variant: "read_first".into(),
+        });
+        let mut credited = ev(
+            RewardKind::PrMergedUnchanged,
+            AGENT_CODER,
+            18,
+            "2026-11-06T01:00:00Z",
+        );
+        credited.variant = "read_first".into();
+        let events = vec![credited];
+        let arms = vec![ArmPull {
+            agent: AGENT_CODER.into(),
+            pulls: 1,
+            last_pull_at: "2026-11-05T12:00:00Z".into(),
+        }];
+        let i = Inputs {
+            closed_prs: &closed,
+            events: &events,
+            arms: &arms,
+            ..Default::default()
+        };
+        let v = by_key(&loops(&i, now()), "coder_variants").clone();
+        assert_eq!(v.state, State::Ok);
+        assert_eq!((v.count, v.expected), (1, Some(1)));
+        assert!(!v.detail.contains("no coder run"), "{}", v.detail);
     }
 
     #[test]

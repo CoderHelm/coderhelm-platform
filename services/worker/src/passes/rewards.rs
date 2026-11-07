@@ -907,6 +907,82 @@ mod tests {
     use common::rewards::calibration::Counts;
     use serde_json::json;
 
+    /// A coder run from pick to the health page: the bandit's arm is noted on
+    /// the run, read back when its PR closes, carried by every outcome event,
+    /// and counted by the health page as one credited PR of one expected.
+    #[test]
+    fn a_coder_run_feeds_its_variant_from_pick_to_health() {
+        use aws_sdk_dynamodb::types::AttributeValue as A;
+        use common::rewards::health;
+
+        // 1. A fresh team: the bandit picks the default arm.
+        let choice = bandit::choose(
+            bandit::arms_for(rev::AGENT_CODER),
+            &[],
+            None,
+            bandit::MIN_PULLS,
+            bandit::EXPLORATION_CAP,
+        );
+        assert_eq!(choice.arm, "standard");
+
+        // 2. note_coder_arm writes it on the run as `prompt_variant`.
+        let mut run = Item::new();
+        run.insert("prompt_variant".into(), A::S(choice.arm.clone()));
+        run.insert(
+            "pr_url".into(),
+            A::S("https://github.com/acme/web/pull/7".into()),
+        );
+        run.insert("merged_at".into(), A::S("2026-11-05T10:00:00Z".into()));
+
+        // 3. score_outcome reads it back and builds the closed-PR events.
+        let arm = coder_arm_of(&run);
+        assert_eq!(arm, "standard");
+        let ctx = mapping::RunContext {
+            team_id: "TEAM#t".into(),
+            run_id: "r1".into(),
+            repo: "acme/web".into(),
+            pr: 7,
+            prompt_version: bandit::CODER_PROMPT_VERSION.into(),
+            variant: arm,
+            ..Default::default()
+        };
+        let pr = json!({
+            "number": 7, "merged_at": "2026-11-05T10:00:00Z",
+            "created_at": "2026-11-05T09:00:00Z", "additions": 10, "deletions": 2
+        });
+        let events = mapping::pr_closed_events(&ctx, &pr, Some(0), None, Default::default());
+        assert!(!events.is_empty());
+        assert!(events.iter().all(|e| e.variant == "standard"), "{events:?}");
+
+        // 4. The health page expects that PR and counts it credited.
+        let closed = vec![health::ClosedPr {
+            repo: "acme/web".into(),
+            pr: 7,
+            closed_at: "2026-11-05T10:00:00Z".into(),
+            variant: "standard".into(),
+        }];
+        let arms = vec![health::ArmPull {
+            agent: rev::AGENT_CODER.into(),
+            pulls: 1,
+            last_pull_at: "2026-11-05T09:00:00Z".into(),
+        }];
+        let now = chrono::DateTime::parse_from_rfc3339("2026-11-06T12:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let loops = health::loops(
+            &health::Inputs {
+                events: &events,
+                closed_prs: &closed,
+                arms: &arms,
+                ..Default::default()
+            },
+            now,
+        );
+        let v = loops.iter().find(|l| l.key == "coder_variants").unwrap();
+        assert_eq!((v.count, v.expected), (1, Some(1)));
+        assert_eq!(v.state, health::State::Ok);
+    }
+
     fn finding(category: &str, evidence: &str, severity: &str) -> Finding {
         serde_json::from_value(json!({
             "file": "src/a.rs", "line": 3, "severity": severity, "category": category,
