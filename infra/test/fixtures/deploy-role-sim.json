@@ -700,7 +700,7 @@
      ]
     },
     {
-     "Sid": "ReadRolesHereOnlyGatewayAndWorker",
+     "Sid": "ReadRolesHereOnlyCoderHelmRuntime",
      "Effect": "Deny",
      "Action": "sts:AssumeRole",
      "Resource": [
@@ -711,7 +711,8 @@
       "StringNotEquals": {
        "aws:PrincipalTag/coderhelm:role": [
         "gateway",
-        "worker"
+        "worker",
+        "log-analyzer"
        ]
       }
      }
@@ -1348,12 +1349,12 @@
   "rows": [
    {"actions": {"sts:AssumeRole": "allowed", "sts:AssumeRoleWithSAML": "explicitDeny", "sts:AssumeRoleWithWebIdentity": "explicitDeny", "sts:SetSourceIdentity": "explicitDeny", "sts:TagSession": "explicitDeny"}, "caller": "gateway", "context": {"aws:PrincipalTag/coderhelm:role": "gateway", "aws:ResourceAccount": "111122223333"}, "resource": "arn:aws:iam::111122223333:role/CoderHelmLogReader"},
    {"actions": {"sts:AssumeRole": "allowed", "sts:AssumeRoleWithSAML": "explicitDeny", "sts:AssumeRoleWithWebIdentity": "explicitDeny", "sts:SetSourceIdentity": "explicitDeny", "sts:TagSession": "explicitDeny"}, "caller": "worker", "context": {"aws:PrincipalTag/coderhelm:role": "worker", "aws:ResourceAccount": "111122223333"}, "resource": "arn:aws:iam::111122223333:role/CoderHelmLogReader"},
-   {"actions": {"sts:AssumeRole": "explicitDeny", "sts:AssumeRoleWithSAML": "explicitDeny", "sts:AssumeRoleWithWebIdentity": "explicitDeny", "sts:SetSourceIdentity": "explicitDeny", "sts:TagSession": "explicitDeny"}, "caller": "log-analyzer", "context": {"aws:PrincipalTag/coderhelm:role": "log-analyzer", "aws:ResourceAccount": "111122223333"}, "resource": "arn:aws:iam::111122223333:role/CoderHelmLogReader"},
+   {"actions": {"sts:AssumeRole": "allowed", "sts:AssumeRoleWithSAML": "explicitDeny", "sts:AssumeRoleWithWebIdentity": "explicitDeny", "sts:SetSourceIdentity": "explicitDeny", "sts:TagSession": "explicitDeny"}, "caller": "log-analyzer", "context": {"aws:PrincipalTag/coderhelm:role": "log-analyzer", "aws:ResourceAccount": "111122223333"}, "resource": "arn:aws:iam::111122223333:role/CoderHelmLogReader"},
    {"actions": {"sts:AssumeRole": "explicitDeny", "sts:AssumeRoleWithSAML": "explicitDeny", "sts:AssumeRoleWithWebIdentity": "explicitDeny", "sts:SetSourceIdentity": "explicitDeny", "sts:TagSession": "explicitDeny"}, "caller": "lookalike tag", "context": {"aws:PrincipalTag/coderhelm:role": "Gateway", "aws:ResourceAccount": "111122223333"}, "resource": "arn:aws:iam::111122223333:role/CoderHelmLogReader"},
    {"actions": {"sts:AssumeRole": "explicitDeny", "sts:AssumeRoleWithSAML": "explicitDeny", "sts:AssumeRoleWithWebIdentity": "explicitDeny", "sts:SetSourceIdentity": "explicitDeny", "sts:TagSession": "explicitDeny"}, "caller": "untagged", "context": {"aws:ResourceAccount": "111122223333"}, "resource": "arn:aws:iam::111122223333:role/CoderHelmLogReader"},
    {"actions": {"sts:AssumeRole": "allowed", "sts:AssumeRoleWithSAML": "explicitDeny", "sts:AssumeRoleWithWebIdentity": "explicitDeny", "sts:SetSourceIdentity": "explicitDeny", "sts:TagSession": "explicitDeny"}, "caller": "gateway", "context": {"aws:PrincipalTag/coderhelm:role": "gateway", "aws:ResourceAccount": "111122223333"}, "resource": "arn:aws:iam::111122223333:role/CoderhelmReadOnly"},
    {"actions": {"sts:AssumeRole": "allowed", "sts:AssumeRoleWithSAML": "explicitDeny", "sts:AssumeRoleWithWebIdentity": "explicitDeny", "sts:SetSourceIdentity": "explicitDeny", "sts:TagSession": "explicitDeny"}, "caller": "worker", "context": {"aws:PrincipalTag/coderhelm:role": "worker", "aws:ResourceAccount": "111122223333"}, "resource": "arn:aws:iam::111122223333:role/CoderhelmReadOnly"},
-   {"actions": {"sts:AssumeRole": "explicitDeny", "sts:AssumeRoleWithSAML": "explicitDeny", "sts:AssumeRoleWithWebIdentity": "explicitDeny", "sts:SetSourceIdentity": "explicitDeny", "sts:TagSession": "explicitDeny"}, "caller": "log-analyzer", "context": {"aws:PrincipalTag/coderhelm:role": "log-analyzer", "aws:ResourceAccount": "111122223333"}, "resource": "arn:aws:iam::111122223333:role/CoderhelmReadOnly"},
+   {"actions": {"sts:AssumeRole": "allowed", "sts:AssumeRoleWithSAML": "explicitDeny", "sts:AssumeRoleWithWebIdentity": "explicitDeny", "sts:SetSourceIdentity": "explicitDeny", "sts:TagSession": "explicitDeny"}, "caller": "log-analyzer", "context": {"aws:PrincipalTag/coderhelm:role": "log-analyzer", "aws:ResourceAccount": "111122223333"}, "resource": "arn:aws:iam::111122223333:role/CoderhelmReadOnly"},
    {"actions": {"sts:AssumeRole": "explicitDeny", "sts:AssumeRoleWithSAML": "explicitDeny", "sts:AssumeRoleWithWebIdentity": "explicitDeny", "sts:SetSourceIdentity": "explicitDeny", "sts:TagSession": "explicitDeny"}, "caller": "lookalike tag", "context": {"aws:PrincipalTag/coderhelm:role": "Gateway", "aws:ResourceAccount": "111122223333"}, "resource": "arn:aws:iam::111122223333:role/CoderhelmReadOnly"},
    {"actions": {"sts:AssumeRole": "explicitDeny", "sts:AssumeRoleWithSAML": "explicitDeny", "sts:AssumeRoleWithWebIdentity": "explicitDeny", "sts:SetSourceIdentity": "explicitDeny", "sts:TagSession": "explicitDeny"}, "caller": "untagged", "context": {"aws:ResourceAccount": "111122223333"}, "resource": "arn:aws:iam::111122223333:role/CoderhelmReadOnly"},
    {"actions": {"sts:AssumeRole": "explicitDeny", "sts:AssumeRoleWithSAML": "explicitDeny", "sts:AssumeRoleWithWebIdentity": "explicitDeny", "sts:SetSourceIdentity": "explicitDeny", "sts:TagSession": "explicitDeny"}, "caller": "gateway", "context": {"aws:PrincipalTag/coderhelm:role": "gateway", "aws:ResourceAccount": "111122223333"}, "resource": "arn:aws:iam::111122223333:role/CoderhelmReadOnly-2"},

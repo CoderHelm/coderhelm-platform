@@ -93,7 +93,8 @@ const noBoundary = [];
 const admin = [];
 const star = [];
 // The tag that lets a role take on CoderHelm's read roles in this account
-// (infra/lib/access.ts RUNTIME_ROLE_TAG): only the gateway's and worker's.
+// (infra/lib/access.ts RUNTIME_ROLE_TAG): only the gateway's, the worker's
+// and the log analyzer's (the log reader only).
 const RUNTIME_TAG = "coderhelm:role";
 const runtimeTagged = new Map();
 for (const r of roles) {
@@ -277,7 +278,8 @@ try {
     for (const r of others) for (const a of ["sts:AssumeRole", "sts:TagSession"]) if (decide(a, roleArn(r), tag) === "allowed") broader.push(`${tag}: ${a} on ${r}`);
     for (const r of READ_ROLES) for (const a of ["sts:TagSession", "sts:SetSourceIdentity", "sts:AssumeRoleWithWebIdentity"]) if (decide(a, roleArn(r), tag) === "allowed") broader.push(`${tag}: ${a} on ${r}`);
   }
-  for (const r of READ_ROLES) for (const tag of [null, "log-analyzer"]) if (decide("sts:AssumeRole", roleArn(r), tag) === "allowed") broader.push(`${tag ? `role tagged ${tag}` : "an untagged role"}: sts:AssumeRole on ${r}`);
+  for (const r of READ_ROLES) if (decide("sts:AssumeRole", roleArn(r), null) === "allowed") broader.push(`an untagged role: sts:AssumeRole on ${r}`);
+  for (const r of others) if (decide("sts:AssumeRole", roleArn(r), "log-analyzer") === "allowed") broader.push(`log-analyzer: sts:AssumeRole on ${r}`);
   const hasException = READ_ROLES.some((r) => ["gateway", "worker"].some((tag) => decide("sts:AssumeRole", roleArn(r), tag) === "allowed"));
   if (hasException) {
     for (const a of ["iam:TagRole", "iam:UntagRole", "iam:CreateRole"]) {
@@ -291,11 +293,12 @@ try {
   check("the boundary: no other role in this account can be assumed (only CoderHelm's two read roles, by the gateway and worker)", false, e.message);
 }
 
-// Only the gateway's and the worker's roles carry the tag, and they can
-// take on the read roles (the policy simulator, with the role's own tag).
-// The functions' roles, found in their stacks (GatewayServiceRole..., WorkerServiceRole...).
+// Only the gateway's, the worker's and the log analyzer's roles carry the
+// tag, and they can take on the read roles (the policy simulator, with the
+// role's own tag). The functions' roles, found in their stacks
+// (GatewayServiceRole..., WorkerServiceRole..., LogAnalyzerServiceRole...).
 const runtime = {};
-for (const [f, stack, id] of [["gateway", "api", "GatewayServiceRole"], ["worker", "worker", "WorkerServiceRole"]]) {
+for (const [f, stack, id] of [["gateway", "api", "GatewayServiceRole"], ["worker", "worker", "WorkerServiceRole"], ["log-analyzer", "log-analyzer", "LogAnalyzerServiceRole"]]) {
   try {
     const res = aws("cloudformation", "describe-stack-resources", "--stack-name", `${prefix}-${stack}`).StackResources ?? [];
     runtime[f] = res.find((r) => r.ResourceType === "AWS::IAM::Role" && r.LogicalResourceId.startsWith(id))?.PhysicalResourceId ?? null;
@@ -304,7 +307,7 @@ for (const [f, stack, id] of [["gateway", "api", "GatewayServiceRole"], ["worker
   }
 }
 const wrongTag = [...runtimeTagged].filter(([name, v]) => !(runtime[v] === name)).map(([name, v]) => `${name} (${RUNTIME_TAG}=${v})`);
-check(`only the gateway's and worker's roles carry ${RUNTIME_TAG}`, wrongTag.length === 0, wrongTag.join(", ") || [...runtimeTagged].map(([name, v]) => `${v}: ${name}`).join(", ") || "no role carries it yet (a release from before it)");
+check(`only the gateway's, worker's and log analyzer's roles carry ${RUNTIME_TAG}`, wrongTag.length === 0, wrongTag.join(", ") || [...runtimeTagged].map(([name, v]) => `${v}: ${name}`).join(", ") || "no role carries it yet (a release from before it)");
 try {
   const notes = [];
   const broader = [];
@@ -315,10 +318,13 @@ try {
       "--context-entries", ctxEntry("aws:ResourceAccount", account), ...(tag ? [ctxEntry(`aws:PrincipalTag/${RUNTIME_TAG}`, tag)] : [])).EvaluationResults?.[0]?.EvalDecision;
     notes.push(`${f}: ${READ_ROLES.map((r) => `${r} ${sim(r)}`).join(", ")}`);
     for (const r of [`cdk-hnb659fds-deploy-role-${account}-${region}`, deployRole, "CoderhelmReadOnly-2"]) if (sim(r) === "allowed") broader.push(`${f}: sts:AssumeRole on ${r}`);
+    // The log analyzer reads logs only: its own role policy keeps it to the
+    // log reader, never the data-source role.
+    if (f === "log-analyzer" && sim("CoderhelmReadOnly") === "allowed") broader.push("log-analyzer: sts:AssumeRole on CoderhelmReadOnly");
   }
-  check("the gateway and worker roles: only the read roles in this account (policy simulator)", broader.length === 0, broader.join(", ") || notes.join("; "));
+  check("the gateway, worker and log analyzer roles: only the read roles in this account (policy simulator)", broader.length === 0, broader.join(", ") || notes.join("; "));
 } catch (e) {
-  check("the gateway and worker roles: only the read roles in this account (policy simulator)", false, e.message);
+  check("the gateway, worker and log analyzer roles: only the read roles in this account (policy simulator)", false, e.message);
 }
 
 // CoderHelm's read roles in this account, when they exist: the boundary

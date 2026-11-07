@@ -137,6 +137,18 @@ export const OWN_READ_ROLES = ["CoderHelmLogReader", "CoderhelmReadOnly"];
  */
 export const RUNTIME_ROLE_TAG = "coderhelm:role";
 export const RUNTIME_ROLES = ["gateway", "worker"];
+/**
+ * The log analyzer's tag value (infra/lib/log-analyzer-stack.ts). It reads
+ * logs through the log reader here: without it a same-account install never
+ * analyzes its logs, and no finding ever resolves. The boundary lets it take
+ * on CoderHelm's read roles like the gateway and worker (one statement keeps
+ * the boundary under IAM's 6,144 characters); its own role policy allows
+ * sts:AssumeRole on CoderHelmLogReader only, so it never takes on the
+ * data-source role (selfhost/check-access.mjs checks both together).
+ */
+export const LOG_ANALYZER_ROLE = "log-analyzer";
+/** Every tag value the boundary lets take on the read roles in this account. */
+export const READ_ROLE_CALLERS = [...RUNTIME_ROLES, LOG_ANALYZER_ROLE];
 /** STS actions on a role in this account: all denied, except sts:AssumeRole on the read roles above. */
 const ROLE_SESSION_ACTIONS = ["sts:AssumeRole", "sts:AssumeRoleWithWebIdentity", "sts:AssumeRoleWithSAML", "sts:TagSession", "sts:SetSourceIdentity"];
 
@@ -331,14 +343,15 @@ export function guardrails(n: AccessNames, otherBoundaries: string[] = []): Stat
       Resource: a.ownReadRoles,
     },
     {
-      // And only by the gateway's and the worker's roles (their tag; a role
-      // without it is refused). Each read role's trust policy still requires
-      // the team's external id.
-      Sid: "ReadRolesHereOnlyGatewayAndWorker",
+      // And only by CoderHelm's own functions that read through them (their
+      // tag; a role without it is refused): the gateway, the worker and the
+      // log analyzer. Each read role's trust policy still requires the
+      // team's external id.
+      Sid: "ReadRolesHereOnlyCoderHelmRuntime",
       Effect: "Deny",
       Action: "sts:AssumeRole",
       Resource: a.ownReadRoles,
-      Condition: { StringNotEquals: { [`aws:PrincipalTag/${RUNTIME_ROLE_TAG}`]: RUNTIME_ROLES } },
+      Condition: { StringNotEquals: { [`aws:PrincipalTag/${RUNTIME_ROLE_TAG}`]: READ_ROLE_CALLERS } },
     },
     {
       // That tag is set and removed only by CloudFormation through the

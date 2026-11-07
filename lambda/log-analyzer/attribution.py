@@ -24,6 +24,7 @@ Pure helpers take plain data; the query helpers take a boto3 `logs` client.
 
 import json
 import logging
+import re
 import time
 from datetime import datetime, timezone
 
@@ -74,8 +75,11 @@ def parse_ts(value):
             return datetime.strptime(text, fmt).replace(tzinfo=timezone.utc)
         except ValueError:
             pass
+    # The gateway writes nanoseconds (9 digits); fromisoformat before 3.13
+    # takes at most 6, so the rest is dropped (sub-microsecond, never used).
+    text = re.sub(r"(\.\d{6})\d+", r"\1", text.replace("Z", "+00:00"))
     try:
-        t = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        t = datetime.fromisoformat(text)
     except ValueError:
         return None
     return t if t.tzinfo else t.replace(tzinfo=timezone.utc)

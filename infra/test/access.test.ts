@@ -14,7 +14,7 @@ import * as path from "node:path";
 import * as cdk from "aws-cdk-lib";
 import { buildApp } from "../lib/app";
 import { resolveConfig, ResolvedConfig, CoderhelmConfig } from "../lib/config";
-import { AccessNames, accessNames, boundaryPolicy, BOUNDARY_SERVICES, OWN_READ_ROLES, RUNTIME_ROLE_TAG, RUNTIME_ROLES, deployPolicy, INSTALL_TAG, PolicyDocument, Statement, WINDOW_EXPIRES, WINDOW_USER_ID, windowPolicy, windowPolicyParts } from "../lib/access";
+import { AccessNames, accessNames, boundaryPolicy, BOUNDARY_SERVICES, LOG_ANALYZER_ROLE, OWN_READ_ROLES, READ_ROLE_CALLERS, RUNTIME_ROLE_TAG, RUNTIME_ROLES, deployPolicy, INSTALL_TAG, PolicyDocument, Statement, WINDOW_EXPIRES, WINDOW_USER_ID, windowPolicy, windowPolicyParts } from "../lib/access";
 import { allowed, glob, list, Request } from "./iam-eval";
 import { installName } from "../lib/hardening";
 import { buildSpecSha256, canonicalJson, updateBuildSpecObject, UPDATE_BUILD_VARIABLES } from "../lib/updates-stack";
@@ -123,15 +123,20 @@ test("boundary: even a role whose own policy allows everything stays inside it",
 // An install in the same AWS account as the data it reads takes on
 // CoderHelm's own read roles there. The boundary allows exactly that: only
 // sts:AssumeRole, only on those two names, only by the gateway's and the
-// worker's roles (their coderhelm:role tag).
-test("boundary: in its own account, only the gateway and worker may assume only CoderHelm's two read roles", () => {
+// worker's roles, plus the log analyzer's on the log reader alone (their
+// coderhelm:role tag). Without the analyzer's exception a same-account
+// install never analyzes its logs, so no finding ever resolves.
+test("boundary: in its own account, only the gateway, worker and log analyzer may assume only CoderHelm's read roles", () => {
   const sts: PolicyDocument = { Version: "2012-10-17", Statement: [{ Sid: "AllSts", Effect: "Allow", Action: "sts:*", Resource: "*" }] };
   const can = (action: string, resource: string, tag?: string) =>
     allowed([sts], BOUNDARY, { action, resource, context: { "aws:ResourceAccount": resource.split(":")[4], ...(tag ? { [`aws:PrincipalTag/${RUNTIME_ROLE_TAG}`]: tag } : {}) } });
   for (const r of ["CoderHelmLogReader", "CoderhelmReadOnly"]) {
     for (const t of RUNTIME_ROLES) assert.ok(can("sts:AssumeRole", role(r), t), `${t} may assume ${r} here`);
+    // The log analyzer too (its own role policy keeps it to the log reader).
+    assert.ok(can("sts:AssumeRole", role(r), LOG_ANALYZER_ROLE), `log-analyzer may assume ${r} here`);
     // Any other caller: another function's role, a build, an untagged role, a lookalike tag value.
-    for (const t of ["log-analyzer", "update-build", "Gateway", "gateway-x", "", undefined]) assert.ok(!can("sts:AssumeRole", role(r), t), `${t ?? "no tag"} may not assume ${r}`);
+    for (const t of ["update-build", "Gateway", "gateway-x", "Log-Analyzer", "log-analyzer-x", "", undefined]) assert.ok(!can("sts:AssumeRole", role(r), t), `${t ?? "no tag"} may not assume ${r}`);
+    for (const a of ["sts:TagSession", "sts:SetSourceIdentity", "sts:AssumeRoleWithWebIdentity"]) assert.ok(!can(a, role(r), LOG_ANALYZER_ROLE), `log-analyzer: ${a} on ${r}`);
     // Only AssumeRole: no other STS action on them, even from the gateway.
     for (const a of ["sts:TagSession", "sts:SetSourceIdentity", "sts:AssumeRoleWithWebIdentity", "sts:AssumeRoleWithSAML"]) assert.ok(!can(a, role(r), "gateway"), `${a} on ${r}`);
   }
@@ -141,7 +146,7 @@ test("boundary: in its own account, only the gateway and worker may assume only 
     "CoderhelmReadOnly-2", "CoderhelmReadOnlyAdmin", "CoderHelmLogReaderAdmin", "team/CoderhelmReadOnly", "coderhelmreadonly", "CoderHelmReadOnly",
     "cdk-hnb659fds-cfn-exec-role-111122223333-us-west-2", n.deployRoleName, "coderhelm-prod-ServiceRole-ab12cd34", "coderhelm-prod-update-build", "OrganizationAccountAccessRole",
   ]) {
-    for (const t of RUNTIME_ROLES) {
+    for (const t of [...RUNTIME_ROLES, LOG_ANALYZER_ROLE]) {
       for (const a of ["sts:AssumeRole", "sts:TagSession", "sts:SetSourceIdentity", "sts:AssumeRoleWithWebIdentity"]) assert.ok(!can(a, role(r), t), `${t}: ${a} on ${r}`);
     }
   }
@@ -188,7 +193,9 @@ test("boundary: the read role names are the ones CoderHelm's own template and se
       tagged[tag.Value] = fn?.Properties.FunctionName;
     }
   }
-  assert.deepEqual(tagged, { gateway: "coderhelm-prod-gateway", worker: "coderhelm-prod-worker" });
+  assert.deepEqual(tagged, { gateway: "coderhelm-prod-gateway", worker: "coderhelm-prod-worker", "log-analyzer": "coderhelm-prod-log-analyzer" });
+  // Each tag the boundary lets in is one a CoderHelm function carries.
+  for (const c of READ_ROLE_CALLERS) assert.ok(c in tagged, c);
 });
 
 test("boundary: allows every action every synthesized CoderHelm role is given", () => {

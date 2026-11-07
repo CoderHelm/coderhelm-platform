@@ -1,0 +1,15 @@
+{
+  "about": "How long a log finding must be quiet before it resolves. lambda/log-analyzer/lifecycle.py quiet_days_for (the resolve sweep) and services/common/src/log_findings.rs quiet_days_for (the date the page shows) both run every case, so the page never promises a date the sweep won't use.",
+  "cases": [
+    { "name": "no history: a burst that stopped", "daily_lines": [], "last_resolved_at": "", "reopened_at": "", "quiet_days": 3 },
+    { "name": "one run of consecutive days", "daily_lines": [{ "day": "2026-10-01", "lines": 40 }, { "day": "2026-10-02", "lines": 9 }, { "day": "2026-10-03", "lines": 1 }], "last_resolved_at": "", "reopened_at": "", "quiet_days": 3 },
+    { "name": "back every 4 days", "daily_lines": [{ "day": "2026-10-01", "lines": 5 }, { "day": "2026-10-05", "lines": 5 }, { "day": "2026-10-09", "lines": 5 }], "last_resolved_at": "", "reopened_at": "", "quiet_days": 8 },
+    { "name": "days without lines are no sighting", "daily_lines": [{ "day": "2026-10-01", "lines": 5 }, { "day": "2026-10-03", "lines": 0 }, { "day": "2026-10-02", "lines": 2 }], "last_resolved_at": "", "reopened_at": "", "quiet_days": 3 },
+    { "name": "resolved, then back 4 days later (one day of history)", "daily_lines": [{ "day": "2026-10-31", "lines": 6296 }], "last_resolved_at": "2026-10-27T03:48:40.472966+00:00", "reopened_at": "2026-10-31T03:48:51.255562+00:00", "quiet_days": 8 },
+    { "name": "back the same day it resolved", "daily_lines": [], "last_resolved_at": "2026-10-27T03:00:00+00:00", "reopened_at": "2026-10-27T10:00:00+00:00", "quiet_days": 2 },
+    { "name": "a half day rounds to even", "daily_lines": [], "last_resolved_at": "2026-10-20T00:00:00+00:00", "reopened_at": "2026-10-22T12:00:00+00:00", "quiet_days": 4 },
+    { "name": "reopen time before the resolve is ignored", "daily_lines": [], "last_resolved_at": "2026-10-27T03:00:00+00:00", "reopened_at": "2026-10-20T03:00:00+00:00", "quiet_days": 3 },
+    { "name": "a rare error is capped", "daily_lines": [{ "day": "2026-09-01", "lines": 1 }, { "day": "2026-09-21", "lines": 1 }], "last_resolved_at": "", "reopened_at": "", "quiet_days": 14 },
+    { "name": "Z and nanosecond times", "daily_lines": [], "last_resolved_at": "2026-10-27T03:48:40Z", "reopened_at": "2026-11-02T03:48:40.123456789Z", "quiet_days": 12 }
+  ]
+}

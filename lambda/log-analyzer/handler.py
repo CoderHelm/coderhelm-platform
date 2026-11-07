@@ -308,9 +308,11 @@ def analyze_connection(conn):
     start, end = lookback_window()
 
     # Run queries and collect results. A query that fails is not "no errors":
-    # when any fails, nothing is auto-resolved this run.
+    # nothing in the log groups it covered is auto-resolved this run (the
+    # other groups were read in full, so their quiet findings still resolve).
     batches = []
     any_query_failed = False
+    failed_groups = set()
     for query_def in INSIGHTS_QUERIES:
         matching_groups = filter_log_groups(log_groups, query_def.get("log_group_pattern"))
         if not matching_groups:
@@ -321,6 +323,7 @@ def analyze_connection(conn):
             results = run_insights_query(cw_logs, batch, query_def["query"], start, end)
             if results is None:
                 any_query_failed = True
+                failed_groups.update(batch)
                 continue
             if results:
                 batches.append(
@@ -339,11 +342,12 @@ def analyze_connection(conn):
     if not batches:
         record_connection_success(team_id, account_id)
         if any_query_failed:
-            logger.warning(f"{team_id}/{account_id}: queries failed and none returned rows, skipping resolution")
-            return 0
-        logger.info(f"No errors found for {team_id}/{account_id}")
-        # Every query ran and found nothing: the findings are no longer erroring.
-        resolve_stale_recommendations(team_id, existing, set())
+            logger.warning(f"{team_id}/{account_id}: queries failed for {len(failed_groups)} log group(s); resolving only in the others")
+        else:
+            logger.info(f"No errors found for {team_id}/{account_id}")
+        # Every query that ran found nothing: those groups' findings are no
+        # longer erroring.
+        resolve_stale_recommendations(team_id, existing, set(), skip_groups=failed_groups)
         return 0
 
     # One entry per log group and message, each with its own counts and times.
@@ -374,8 +378,6 @@ def analyze_connection(conn):
     # Credit each finding to the log groups whose lines match it, checked one
     # group at a time; then make its words match that evidence.
     candidates, check_failed = attribute_recommendations(cw_logs, recommendations, evidence, start, end)
-    if check_failed:
-        any_query_failed = True
     attribution.guard_texts(
         candidates, log_groups, lambda prompt: ask_model(prompt, api_key, team_id)
     )
@@ -388,10 +390,13 @@ def analyze_connection(conn):
         if is_new or cand.get("seen_again"):
             new_recs.append(cand)
 
-    # Resolve findings that stopped appearing for the quiet period — only
-    # after a complete run.
-    if not any_query_failed:
-        resolve_stale_recommendations(team_id, existing, seen_ids)
+    # Resolve findings that stopped appearing for the quiet period, in every
+    # log group this run read in full. A failed attribution check can't tell
+    # which group a line was in, so then nothing is resolved.
+    if check_failed:
+        logger.warning(f"{team_id}/{account_id}: an attribution check failed, skipping resolution")
+    else:
+        resolve_stale_recommendations(team_id, existing, seen_ids, skip_groups=failed_groups)
 
     notify_new_recommendations(team_id, account_id, new_recs)
     logger.info(f"{team_id}/{account_id}: {len(new_recs)} new recommendations")
@@ -742,15 +747,18 @@ def list_recent_findings(team_id, account_id, now=None):
     return items
 
 
-def resolve_stale_recommendations(team_id, existing, seen_ids, now=None):
-    """Mark open findings resolved when this complete run didn't see them and
-    they have been quiet for their quiet period (lifecycle.quiet_days_for).
-    One missed run never resolves a finding. Open findings also carry their
-    quiet period (`quiet_days`) so the page can say when one resolves."""
+def resolve_stale_recommendations(team_id, existing, seen_ids, now=None, skip_groups=()):
+    """Mark open findings resolved when this run read their log group in full,
+    didn't see them, and they have been quiet for their quiet period
+    (lifecycle.quiet_days_for). One missed run never resolves a finding, and a
+    group whose query failed (`skip_groups`) resolves nothing. Open findings
+    also carry their quiet period (`quiet_days`) so the page can say when one
+    resolves."""
     now_dt = now or datetime.now(timezone.utc)
     now_iso = now_dt.isoformat()
     resolved_count = 0
-    stale = lifecycle.stale(existing, seen_ids, now_dt)
+    skip = set(skip_groups or ())
+    stale = [i for i in lifecycle.stale(existing, seen_ids, now_dt) if i.get("source_log_group") not in skip]
     stale_ids = {i.get("rec_id") for i in stale}
     for item in stale:
         days = lifecycle.quiet_days_for(item)

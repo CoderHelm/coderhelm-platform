@@ -10,6 +10,7 @@ import * as s3 from "aws-cdk-lib/aws-s3";
 import * as s3deploy from "aws-cdk-lib/aws-s3-deployment";
 import * as sqs from "aws-cdk-lib/aws-sqs";
 import { Construct } from "constructs";
+import { LOG_ANALYZER_ROLE, RUNTIME_ROLE_TAG } from "./access";
 import { ResolvedConfig } from "./config";
 import { repoPath } from "./paths";
 import { modelProviderEnvironment, modelPolicyStatements } from "./service-env";
@@ -119,6 +120,12 @@ export class LogAnalyzerStack extends cdk.Stack {
         },
       })
     );
+
+    // On a hardened install in the same account as the logs it reads, the
+    // boundary lets this tag take on the read roles there
+    // (infra/lib/access.ts READ_ROLE_CALLERS); the statement above keeps it
+    // to the log reader.
+    cdk.Tags.of(analyzerFunction.role!).add(RUNTIME_ROLE_TAG, LOG_ANALYZER_ROLE);
 
     // --- EventBridge Schedule: every 6 hours ---
     new events.Rule(this, "AnalyzerSchedule", {

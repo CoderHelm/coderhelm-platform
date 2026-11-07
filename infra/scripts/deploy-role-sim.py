@@ -15,7 +15,8 @@ with AWS's IAM policy simulator against the deploy role and its boundary.
 4. Simulates what the boundary leaves the install's functions in its own
    account (`runtime`): sts actions on CoderHelm's two read roles, on
    lookalike names, the CDK bootstrap, the deploy role and the install's own
-   roles, by the gateway's and worker's roles (their coderhelm:role tag), by
+   roles, by the gateway's, worker's and log analyzer's roles (their
+   coderhelm:role tag), by
    another role and by an untagged one; and who may set that tag. The
    identity policy allows all of it, so only the boundary decides.
 5. Writes infra/test/fixtures/deploy-role-sim.json, which
@@ -665,6 +666,13 @@ for (const [part, t] of Object.entries(rel.children)) {
   for (const [p, v] of Object.entries(rel.parent.Resources[part].Properties.Parameters)) {
     const g = v["Fn::GetAtt"];
     if (!g) continue;
+    if (!rel.children[g[0]]) {
+      // A parent resource, not a part: its role's ARN (the auto-update role).
+      const r = rel.parent.Resources[g[0]];
+      if (!r || r.Type !== "AWS::IAM::Role" || g[1] !== "Arn") throw new Error("unresolved GetAtt " + JSON.stringify(g));
+      imports[part + "/" + p] = "arn:aws:iam::" + ACCT + ":role/" + resolveValue(r.Properties.RoleName, { values });
+      continue;
+    }
     const exp = rel.children[g[0]].Outputs[g[1].replace("Outputs.", "")].Export.Name;
     imports[part + "/" + p] = resolveValue(exp, { values });
   }
