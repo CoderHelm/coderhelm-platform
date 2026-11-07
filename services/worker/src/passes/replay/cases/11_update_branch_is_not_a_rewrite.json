@@ -1,0 +1,15 @@
+{
+  "name": "Pressing Update branch is not people rewriting CoderHelm's change",
+  "about": "Coder lessons said changes in one area were 'rewritten by people before merging, 100% of the diff changed' on PR after PR. The share compared CoderHelm's last commit with the merged head, so the base branch a person merged in with Update branch counted as their edits, and that merge commit counted as a person's commit. Only people's own non-merge commits count now, each by its own size.",
+  "case": "learning_edits",
+  "input": {
+    "pr_lines": 200,
+    "commits": [
+      { "sha": "c1", "author": { "login": "coderhelm[bot]", "type": "Bot" }, "parents": [{ "sha": "p0" }] },
+      { "sha": "m1", "author": { "login": "a-person", "type": "User" }, "parents": [{ "sha": "c1" }, { "sha": "b9" }], "commit": { "message": "Merge branch 'main' into fix" } },
+      { "sha": "h1", "author": { "login": "a-person", "type": "User" }, "parents": [{ "sha": "m1" }], "commit": { "message": "Use the shared date helper" } }
+    ],
+    "lines": { "c1": 200, "m1": 4800, "h1": 12 }
+  },
+  "expect": { "human_commits": 1, "share_at_most": 0.1, "setback": false }
+}

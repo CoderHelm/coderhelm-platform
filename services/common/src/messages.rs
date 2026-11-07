@@ -17,6 +17,11 @@ pub struct WeeklySummaryTestMessage {
 /// Every message on the worker queues. The gateway, the schedules and the
 /// worker all read and write this one enum, so a tag one side sends is always
 /// one the other reads.
+///
+/// A message is built once and handed over by value (never kept in bulk),
+/// so the ticket variant's size costs nothing; boxing it would only change
+/// every match on it.
+#[allow(clippy::large_enum_variant)]
 #[derive(Serialize, Deserialize, Debug)]
 #[serde(tag = "type")]
 pub enum WorkerMessage {
@@ -1006,6 +1011,11 @@ pub struct TicketMessage {
     /// serialized.
     #[serde(skip)]
     pub team_instructions: String,
+    /// Set in-process, once per run: what outcomes taught the coder in this
+    /// repository (its lessons and the prompt variant the coder's bandit
+    /// picked), for the coder's system prompt. Capped; never serialized.
+    #[serde(skip)]
+    pub coder_learning: String,
     /// A person's direction that started this run (a reply on the ticket
     /// telling CoderHelm where the fix is and to go ahead), as
     /// "author: words". The planner's trace checks then inform, not block.
@@ -1119,6 +1129,7 @@ impl Default for TicketMessage {
             ticket_history_note: None,
             plan_cache_key: None,
             team_instructions: String::new(),
+            coder_learning: String::new(),
             person_direction: None,
             answers: Vec::new(),
             new_run_id: None,

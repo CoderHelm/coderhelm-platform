@@ -63,22 +63,6 @@ async fn embed(state: &WorkerState, team_id: &str, text: &str) -> Option<Vec<f32
     }
 }
 
-/// The SHA of CoderHelm's last commit on a pull request (commits oldest
-/// first, as GitHub lists them).
-pub fn last_coderhelm_sha(commits: &[serde_json::Value]) -> Option<String> {
-    commits
-        .iter()
-        .rev()
-        .find(|c| {
-            let login = c["author"]["login"]
-                .as_str()
-                .or(c["committer"]["login"].as_str())
-                .unwrap_or("");
-            login.contains("coderhelm")
-        })
-        .and_then(|c| c["sha"].as_str().map(str::to_string))
-}
-
 /// The area most of the changed paths are in.
 pub fn main_area(paths: &[String]) -> String {
     let mut counts: BTreeMap<String, usize> = BTreeMap::new();
@@ -105,15 +89,74 @@ pub fn ci_of(run: &Item) -> CiSummary {
     }
 }
 
-/// A coder outcome bad enough to look for a pattern behind it.
-pub fn is_coder_setback(e: &RewardEvent) -> bool {
-    match e.kind {
-        Some(RewardKind::PrClosedUnmerged)
-        | Some(RewardKind::PrReverted)
-        | Some(RewardKind::IncidentLinked) => true,
-        Some(RewardKind::CiFixRounds) => e.value >= 2.0,
-        Some(RewardKind::PrMergedEdited) => e.value >= 0.5,
-        _ => false,
+pub use common::rewards::lessons::is_coder_setback;
+
+/// Most of people's commits read for what they changed.
+const MAX_EDIT_COMMITS: usize = 20;
+
+/// What people changed on top of CoderHelm's work: their own non-merge
+/// commits, each measured by its own stats. `None` when GitHub couldn't say
+/// for any of them (then no merged-after-edits event is guessed).
+async fn people_edits(
+    github: &GitHubClient,
+    owner: &str,
+    name: &str,
+    commits: &[serde_json::Value],
+) -> Option<mapping::PeopleEdits> {
+    let mine = common::pr_outcome::human_edit_commits(commits);
+    if mine.is_empty() {
+        return Some(mapping::PeopleEdits::default());
+    }
+    let mut lines = 0u64;
+    let mut read = 0usize;
+    let mut touched: BTreeMap<String, usize> = BTreeMap::new();
+    let mut subjects = Vec::new();
+    for c in mine.iter().take(MAX_EDIT_COMMITS) {
+        let Some(sha) = c["sha"].as_str() else {
+            continue;
+        };
+        if let Ok((n, files)) = github.commit_stats(owner, name, sha).await {
+            read += 1;
+            lines += n;
+            for f in files {
+                *touched.entry(f).or_default() += 1;
+            }
+        }
+        let subject = common::pr_outcome::commit_subject(c);
+        if !subject.is_empty() {
+            subjects.push(subject);
+        }
+    }
+    if read == 0 {
+        return None;
+    }
+    let mut files: Vec<(String, usize)> = touched.into_iter().collect();
+    files.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+    Some(mapping::PeopleEdits {
+        commits: mine.len() as u64,
+        lines,
+        files: files.into_iter().map(|(f, _)| f).collect(),
+        subjects,
+    })
+}
+
+/// Why people closed a run's PR, when they said: the reason picked when the
+/// run was closed in CoderHelm, or their answer to CoderHelm's one question.
+pub fn close_reason_of(run: &Item) -> String {
+    let picked = gs(run, "close_reason");
+    if !picked.trim().is_empty() {
+        return picked;
+    }
+    gs(run, "close_reason_answer")
+}
+
+/// The coder arm a run used, when it is one of the coder's arms.
+pub fn coder_arm_of(run: &Item) -> String {
+    let a = gs(run, "prompt_variant");
+    if bandit::arm(rev::AGENT_CODER, &a).is_some() {
+        a
+    } else {
+        String::new()
     }
 }
 
@@ -187,9 +230,6 @@ async fn add_example(state: &WorkerState, team_id: &str, mut ex: Exemplar, score
 
 pub async fn score_outcome(state: &WorkerState, msg: RewardOutcomeMessage) -> Result<(), String> {
     let repo = format!("{}/{}", msg.repo_owner, msg.repo_name);
-    let run = load_run(state, &msg.team_id, &msg.run_id)
-        .await
-        .unwrap_or_default();
     let github = GitHubClient::new(
         &state.secrets.github_app_id,
         &state.secrets.github_private_key,
@@ -201,84 +241,104 @@ pub async fn score_outcome(state: &WorkerState, msg: RewardOutcomeMessage) -> Re
         .get_pull_request(&msg.repo_owner, &msg.repo_name, msg.pr_number)
         .await
         .map_err(|e| e.to_string())?;
-    let commits = github
-        .list_pr_commits(&msg.repo_owner, &msg.repo_name, msg.pr_number)
-        .await
-        .ok();
-    let human = commits
-        .as_deref()
-        .map(common::pr_outcome::human_commit_count);
-    let head = pr["head"]["sha"].as_str().unwrap_or("").to_string();
-    let base = pr["base"]["sha"].as_str().unwrap_or("").to_string();
-    // How much of the diff people changed after CoderHelm's last commit.
-    let mut edit_share = None;
-    if let (Some(n), Some(c)) = (human, commits.as_deref()) {
-        if n > 0 {
-            if let Some(last) = last_coderhelm_sha(c) {
-                if let Ok(changed) = github
-                    .compare_line_changes(&msg.repo_owner, &msg.repo_name, &last, &head)
-                    .await
-                {
-                    let total = pr["additions"].as_u64().unwrap_or(0)
-                        + pr["deletions"].as_u64().unwrap_or(0);
-                    edit_share = Some(mapping::edit_fraction(changed, total));
-                }
-            }
-        }
-    }
-    let paths = if !base.is_empty() && !head.is_empty() {
-        github
-            .compare_changed_files(&msg.repo_owner, &msg.repo_name, &base, &head)
-            .await
-            .unwrap_or_default()
-    } else {
-        vec![]
-    };
-    let ctx = RunContext {
-        team_id: msg.team_id.clone(),
-        run_id: msg.run_id.clone(),
-        repo: repo.clone(),
-        pr: msg.pr_number,
-        model: gs(&run, "model"),
-        prompt_version: bandit::CODER_PROMPT_VERSION.to_string(),
-        variant: String::new(),
-        skills: vec![],
-        plugin: gs(&run, "plugin"),
-        area: main_area(&paths),
-    };
-    let mut events = mapping::pr_closed_events(&ctx, &pr, human, edit_share, ci_of(&run));
-
-    // Review comments CoderHelm left that nobody acted on or answered.
     let closed_at = pr["closed_at"].as_str().unwrap_or("").to_string();
+    let merged = pr["merged_at"].as_str().is_some_and(|m| !m.is_empty());
+    let coder = !msg.review_only && !msg.run_id.is_empty();
+    let mut events = Vec::new();
+    let mut area = String::new();
+    if coder {
+        let run = load_run(state, &msg.team_id, &msg.run_id)
+            .await
+            .unwrap_or_default();
+        let commits = github
+            .list_pr_commits(&msg.repo_owner, &msg.repo_name, msg.pr_number)
+            .await
+            .ok();
+        let human = commits
+            .as_deref()
+            .map(common::pr_outcome::human_commit_count);
+        // What people changed after CoderHelm, from their own commits (a
+        // merge of the base branch brings other work and is not an edit).
+        let edits = match (human, commits.as_deref()) {
+            (Some(n), Some(c)) if n > 0 => {
+                people_edits(&github, &msg.repo_owner, &msg.repo_name, c).await
+            }
+            _ => None,
+        };
+        let head = pr["head"]["sha"].as_str().unwrap_or("").to_string();
+        let base = pr["base"]["sha"].as_str().unwrap_or("").to_string();
+        let paths = if !base.is_empty() && !head.is_empty() {
+            github
+                .compare_changed_files(&msg.repo_owner, &msg.repo_name, &base, &head)
+                .await
+                .unwrap_or_default()
+        } else {
+            vec![]
+        };
+        area = main_area(&paths);
+        let ctx = RunContext {
+            team_id: msg.team_id.clone(),
+            run_id: msg.run_id.clone(),
+            repo: repo.clone(),
+            pr: msg.pr_number,
+            model: gs(&run, "model"),
+            prompt_version: bandit::CODER_PROMPT_VERSION.to_string(),
+            // The arm the run used: its outcome is what the coder's bandit
+            // learns from.
+            variant: coder_arm_of(&run),
+            skills: vec![],
+            plugin: gs(&run, "plugin"),
+            area: area.clone(),
+            close_reason: close_reason_of(&run),
+        };
+        events.extend(mapping::pr_closed_events(
+            &ctx,
+            &pr,
+            human,
+            edits.as_ref(),
+            ci_of(&run),
+        ));
+    }
+
+    // What became of each of CoderHelm's review comments, notes (Nit,
+    // Suggestion) as much as blockers, on its own PRs and on people's.
     if !closed_at.is_empty() {
         if let Ok(threads) = github
             .list_bot_review_threads(&msg.repo_owner, &msg.repo_name, msg.pr_number)
             .await
         {
             let review = latest_review(state, &msg.team_id, &repo, msg.pr_number).await;
-            for t in threads.iter().filter(|t| ignored_at_close(t)) {
-                let mut e = mapping::finding_event(
-                    &msg.team_id,
-                    RewardKind::FindingIgnored,
-                    &repo,
-                    msg.pr_number,
-                    &t.id,
-                    &t.path,
-                    &t.body,
-                    &closed_at,
-                );
-                credit(&mut e, &review);
-                events.push(e);
-            }
+            events.extend(thread_events(
+                &msg.team_id,
+                &repo,
+                msg.pr_number,
+                &threads,
+                merged,
+                &closed_at,
+                &review,
+            ));
         }
     }
 
     let st = store(state);
     let fresh = st.record_all(&events).await;
-    info!(team_id = %msg.team_id, pr = msg.pr_number, events = events.len(), fresh, "Pull request outcome scored");
-    if fresh == 0 {
-        return Ok(()); // already scored (a redelivered webhook)
+    let findings = events
+        .iter()
+        .filter(|e| e.kind.is_some_and(RewardKind::is_finding))
+        .count();
+    info!(
+        team_id = %msg.team_id,
+        pr = msg.pr_number,
+        review_only = msg.review_only,
+        events = events.len(),
+        findings,
+        fresh,
+        "Pull request outcome scored"
+    );
+    if fresh == 0 || !coder {
+        return Ok(()); // already scored (a redelivered webhook), or no coder part
     }
+    note_reward_area(state, &msg.team_id, &msg.run_id, &area).await;
 
     // Keep the change as an example for the coder.
     let weights = st.weights(&msg.team_id).await;
@@ -305,7 +365,7 @@ pub async fn score_outcome(state: &WorkerState, msg: RewardOutcomeMessage) -> Re
             id: exemplars::id_for(&repo, msg.pr_number, "fix"),
             repo: repo.clone(),
             kind: exemplars::KIND_FIX.into(),
-            area: ctx.area.clone(),
+            area: area.clone(),
             pr: msg.pr_number,
             run_id: msg.run_id.clone(),
             reason: exemplars::fix_reason(&outcome),
@@ -320,20 +380,69 @@ pub async fn score_outcome(state: &WorkerState, msg: RewardOutcomeMessage) -> Re
 
     // A setback: look for a pattern in this area worth a lesson.
     if events.iter().any(is_coder_setback) {
-        learn_from_setbacks(state, &msg.team_id, &repo, &ctx.area).await;
+        learn_from_setbacks(state, &msg.team_id, &repo, &area).await;
     }
     Ok(())
 }
 
-/// A thread still open when the PR closed: not resolved, not answered by a
-/// person, and its code not replaced.
-pub fn ignored_at_close(t: &BotReviewThread) -> bool {
-    !t.resolved && !t.outdated && !t.replies.iter().any(|r| !r.by_bot)
+/// The calibration events of CoderHelm's review threads on a closed PR (see
+/// `mapping::thread_outcome`), each credited to the review that left it.
+pub fn thread_events(
+    team_id: &str,
+    repo: &str,
+    pr: u64,
+    threads: &[BotReviewThread],
+    merged: bool,
+    closed_at: &str,
+    review: &Option<(String, String, String, String)>,
+) -> Vec<RewardEvent> {
+    let mut out = Vec::new();
+    for t in threads {
+        let Some(kind) = mapping::thread_outcome(&thread_at_close(t), merged) else {
+            continue;
+        };
+        let mut e =
+            mapping::finding_event(team_id, kind, repo, pr, &t.id, &t.path, &t.body, closed_at)
+                .with_detail(&mapping::thread_outcome_detail(kind, &t.body, &t.path));
+        credit(&mut e, review);
+        out.push(e);
+    }
+    out
 }
 
-/// Writes (or reinforces) a coder lesson when this area's recent setbacks
-/// back one.
-async fn learn_from_setbacks(state: &WorkerState, team_id: &str, repo: &str, area: &str) {
+/// A thread as `mapping::thread_outcome` reads it.
+pub fn thread_at_close(t: &BotReviewThread) -> mapping::ThreadAtClose {
+    mapping::ThreadAtClose {
+        resolved: t.resolved,
+        resolved_by_person: t.resolved_by_person,
+        outdated: t.outdated,
+        person_replied: t.replies.iter().any(|r| !r.by_bot),
+        body: t.body.clone(),
+    }
+}
+
+/// Keeps the area a run's PR touched on the run (`reward_area`), so a later
+/// revert of it is credited to the same area and its lesson.
+async fn note_reward_area(state: &WorkerState, team_id: &str, run_id: &str, area: &str) {
+    if area.is_empty() {
+        return;
+    }
+    let _ = state
+        .dynamo
+        .update_item()
+        .table_name(&state.config.runs_table_name)
+        .key("team_id", crate::passes::attr_s(team_id))
+        .key("run_id", crate::passes::attr_s(run_id))
+        .condition_expression("attribute_exists(run_id)")
+        .update_expression("SET reward_area = :a")
+        .expression_attribute_values(":a", crate::passes::attr_s(area))
+        .send()
+        .await;
+}
+
+/// Writes (or rewrites) the coder's lesson for this area when its recent
+/// setbacks back one: what people changed, why they closed or reverted it.
+pub async fn learn_from_setbacks(state: &WorkerState, team_id: &str, repo: &str, area: &str) {
     let st = store(state);
     let since = (chrono::Utc::now() - chrono::Duration::days(90)).to_rfc3339();
     let Ok(events) = st.events_since(team_id, &since).await else {
@@ -347,16 +456,52 @@ async fn learn_from_setbacks(state: &WorkerState, team_id: &str, repo: &str, are
     let Some(text) = lessons::coder_lesson_text(area, &setbacks) else {
         return;
     };
-    match st
-        .learn(team_id, repo, rev::AGENT_CODER, &text, &setbacks)
-        .await
-    {
+    match st.learn_area(team_id, repo, area, &text, &setbacks).await {
         Ok(Some(id)) => {
             info!(team_id, repo, area, lesson = %id, "Coder lesson written or reinforced")
         }
         Ok(None) => {}
         Err(e) => warn!(error = %e, "Could not keep the coder lesson"),
     }
+}
+
+/// A person said why they closed CoderHelm's PR after it was scored (the
+/// answer to its one question): the reason joins the closed event's notes
+/// and the area's lesson is written again with it.
+pub async fn note_close_reason(
+    state: &WorkerState,
+    team_id: &str,
+    run: &Item,
+    repo: &str,
+    pr: u64,
+    reason: &str,
+) {
+    let closed_at = gs(run, "pr_closed_at");
+    if closed_at.is_empty() || reason.trim().is_empty() || pr == 0 {
+        return;
+    }
+    let sk = rev::event_sk(&closed_at, &format!("closed#{repo}#{pr}"));
+    let r = state
+        .dynamo
+        .update_item()
+        .table_name(&state.config.settings_table_name)
+        .key("pk", crate::passes::attr_s(team_id))
+        .key("sk", crate::passes::attr_s(&sk))
+        .condition_expression("attribute_exists(sk)")
+        .update_expression("SET notes = :n")
+        .expression_attribute_values(
+            ":n",
+            aws_sdk_dynamodb::types::AttributeValue::L(vec![crate::passes::attr_s(
+                common::truncate_str(reason.trim(), 240),
+            )]),
+        )
+        .send()
+        .await;
+    if r.is_err() {
+        return; // never scored, or scored under another time: nothing to add to
+    }
+    let area = gs(run, "reward_area");
+    learn_from_setbacks(state, team_id, repo, &area).await;
 }
 
 // ── Review comments acted on or dismissed ─────────────────────────────
@@ -574,16 +719,73 @@ pub async fn note_review_variant(
     }
 }
 
-/// The coder's learning for `repo`: examples of merged and rejected changes
-/// and evidence-backed lessons. Empty when there are none.
+/// What the coder is given for one run.
+#[derive(Debug, Default, Clone)]
+pub struct CoderLearning {
+    /// For the planner (through the triage summary): examples of merged and
+    /// rejected changes, and the lessons.
+    pub context: String,
+    /// For the coder's own system prompt: the lessons and the variant's
+    /// addendum, capped at [`MAX_CODER_PROMPT_CHARS`].
+    pub implement: String,
+}
+
+/// Longest learning block in the coder's system prompt.
+pub const MAX_CODER_PROMPT_CHARS: usize = 3_000;
+
+/// The coder's block: the variant's addendum, then the lessons, capped.
+pub fn implement_block(addendum: &str, lesson_block: &str) -> String {
+    let text = format!("{addendum}{lesson_block}");
+    common::truncate_str(&text, MAX_CODER_PROMPT_CHARS).to_string()
+}
+
+/// The coder's learning for `repo`: examples of merged and rejected changes,
+/// evidence-backed lessons, and the prompt variant the coder's bandit picks.
+/// A run keeps the arm it started with (continuations and retries read it
+/// back from the run) and its pull is counted once.
 pub async fn coder_learning(
     state: &WorkerState,
     team_id: &str,
     repo: &str,
     run_id: &str,
     query: &str,
-) -> String {
+) -> CoderLearning {
     let st = store(state);
+    let run = load_run(state, team_id, run_id).await.unwrap_or_default();
+    let arm = match coder_arm_of(&run) {
+        a if !a.is_empty() => a,
+        _ => {
+            let weights = st.weights(team_id).await;
+            let stats = st
+                .arm_stats(team_id, rev::AGENT_CODER, &weights)
+                .await
+                .unwrap_or_default();
+            let pinned = st.pin(team_id, rev::AGENT_CODER).await;
+            let choice = bandit::choose(
+                bandit::arms_for(rev::AGENT_CODER),
+                &stats,
+                pinned.as_deref(),
+                bandit::MIN_PULLS,
+                bandit::EXPLORATION_CAP,
+            );
+            // Only the first writer counts the pull: a continuation racing
+            // its own start doesn't count twice.
+            if note_coder_arm(state, team_id, run_id, &choice.arm).await {
+                st.count_pull(team_id, rev::AGENT_CODER, &choice.arm).await;
+                info!(team_id, repo, run_id, arm = %choice.arm, why = ?choice.why, "Coder variant chosen");
+                choice.arm
+            } else {
+                let again = load_run(state, team_id, run_id).await.unwrap_or_default();
+                match coder_arm_of(&again) {
+                    a if !a.is_empty() => a,
+                    _ => choice.arm,
+                }
+            }
+        }
+    };
+    let addendum = bandit::arm(rev::AGENT_CODER, &arm)
+        .map(|a| a.addendum)
+        .unwrap_or("");
     let by = exemplars::Use {
         at: chrono::Utc::now().to_rfc3339(),
         agent: rev::AGENT_CODER.into(),
@@ -592,12 +794,42 @@ pub async fn coder_learning(
     };
     let examples = examples_block(state, team_id, repo, exemplars::KIND_FIX, &[], query, &by).await;
     let kept = st.lessons(team_id, Some(repo)).await.unwrap_or_default();
-    let lesson_block = lessons::prompt_block(&lessons::recall(
-        &kept,
-        rev::AGENT_CODER,
-        chrono::Utc::now(),
-    ));
-    format!("{examples}{lesson_block}")
+    let recalled = lessons::recall(&kept, rev::AGENT_CODER, chrono::Utc::now());
+    let lesson_block = lessons::prompt_block(&recalled);
+    info!(
+        team_id,
+        repo,
+        run_id,
+        arm = %arm,
+        lessons = recalled.len(),
+        examples = !examples.is_empty(),
+        "Coder learning loaded"
+    );
+    CoderLearning {
+        implement: implement_block(addendum, &lesson_block),
+        context: format!("{examples}{lesson_block}"),
+    }
+}
+
+/// Notes the coder arm on the run, only when none is noted yet. True when
+/// this call wrote it.
+async fn note_coder_arm(state: &WorkerState, team_id: &str, run_id: &str, arm: &str) -> bool {
+    if run_id.is_empty() || arm.is_empty() {
+        return false;
+    }
+    state
+        .dynamo
+        .update_item()
+        .table_name(&state.config.runs_table_name)
+        .key("team_id", crate::passes::attr_s(team_id))
+        .key("run_id", crate::passes::attr_s(run_id))
+        .condition_expression("attribute_exists(run_id) AND attribute_not_exists(prompt_variant)")
+        .update_expression("SET prompt_variant = :v, prompt_version = :p")
+        .expression_attribute_values(":v", crate::passes::attr_s(arm))
+        .expression_attribute_values(":p", crate::passes::attr_s(bandit::CODER_PROMPT_VERSION))
+        .send()
+        .await
+        .is_ok()
 }
 
 async fn examples_block(
@@ -736,14 +968,7 @@ mod tests {
     }
 
     #[test]
-    fn last_coderhelm_commit_and_main_area() {
-        let commits = vec![
-            json!({"sha":"a1","author":{"login":"coderhelm[bot]"}}),
-            json!({"sha":"b2","author":{"login":"coderhelm[bot]"}}),
-            json!({"sha":"c3","author":{"login":"pat"}}),
-        ];
-        assert_eq!(last_coderhelm_sha(&commits).as_deref(), Some("b2"));
-        assert_eq!(last_coderhelm_sha(&[]), None);
+    fn main_area_is_where_most_paths_are() {
         let paths: Vec<String> = ["src/api/a.ts", "src/api/b.ts", "docs/x.md", "README.md"]
             .iter()
             .map(|s| s.to_string())
@@ -765,28 +990,131 @@ mod tests {
         assert!(!ci_of(&Item::new()).known);
     }
 
+    /// Since the reviewer approves with notes, a person merging over a Nit
+    /// is no pushback to judge; what became of each note is still a signal,
+    /// and it reaches calibration both ways, credited to the review's arm.
     #[test]
-    fn only_untouched_threads_count_as_ignored() {
-        let t = |resolved, outdated, replies: Vec<ThreadReply>| BotReviewThread {
-            root_id: 0,
-            id: "T".into(),
-            path: "a".into(),
-            line: 1,
-            outdated,
-            body: "x".into(),
-            replies,
-            resolved,
-            resolved_by_person: false,
+    fn notes_at_close_become_calibration_events() {
+        let t = |id: &str, resolved, by_person, outdated, replies: Vec<ThreadReply>, body: &str| {
+            BotReviewThread {
+                root_id: 0,
+                id: id.into(),
+                path: "src/a.rs".into(),
+                line: 1,
+                outdated,
+                body: body.into(),
+                replies,
+                resolved,
+                resolved_by_person: by_person,
+            }
         };
-        assert!(ignored_at_close(&t(false, false, vec![])));
-        assert!(!ignored_at_close(&t(true, false, vec![])));
-        assert!(!ignored_at_close(&t(false, true, vec![])));
         let person = ThreadReply {
             author: "pat".into(),
             by_bot: false,
             body: "no".into(),
         };
-        assert!(!ignored_at_close(&t(false, false, vec![person])));
+        let nit = "💬 **Nit: Rename** (style, not verified)";
+        let threads = vec![
+            t("T1", false, false, false, vec![], nit),
+            t("T2", false, false, true, vec![], nit),
+            t("T3", true, true, false, vec![], nit),
+            t("T4", false, false, false, vec![person], nit),
+            t(
+                "T5",
+                false,
+                false,
+                false,
+                vec![],
+                "💬 **FYI: Cache** (other)",
+            ),
+        ];
+        let review = Some((
+            "REVIEW#acme/web#000003#t".to_string(),
+            "focused".to_string(),
+            "m".to_string(),
+            "v".to_string(),
+        ));
+        let ev = thread_events(
+            "TEAM#a",
+            "acme/web",
+            3,
+            &threads,
+            true,
+            "2026-11-05T00:00:00Z",
+            &review,
+        );
+        let kinds: Vec<(String, RewardKind)> = ev
+            .iter()
+            .map(|e| (e.dedup.clone(), e.kind.unwrap()))
+            .collect();
+        assert_eq!(
+            kinds,
+            vec![
+                ("finding_ignored#T1".to_string(), RewardKind::FindingIgnored),
+                (
+                    "finding_accepted#T2".to_string(),
+                    RewardKind::FindingAccepted
+                ),
+                (
+                    "finding_dismissed#T3".to_string(),
+                    RewardKind::FindingDismissed
+                ),
+            ]
+        );
+        assert!(ev
+            .iter()
+            .all(|e| e.category == "style" && e.variant == "focused"));
+        assert!(ev[0]
+            .detail
+            .contains("still open and untouched when the PR merged"));
+        // Closed without merging: untouched notes say nothing.
+        let ev = thread_events(
+            "TEAM#a",
+            "acme/web",
+            3,
+            &threads,
+            false,
+            "2026-11-05T00:00:00Z",
+            &None,
+        );
+        assert_eq!(ev.len(), 2);
+    }
+
+    /// The coder's lessons and its arm's addendum reach its own system
+    /// prompt (not only the planner's triage summary), capped.
+    #[test]
+    fn the_coders_block_carries_the_arm_and_lessons_capped() {
+        let addendum = bandit::arm(rev::AGENT_CODER, "read_first")
+            .unwrap()
+            .addendum;
+        let lesson = lessons::prompt_block(&[lessons::Lesson {
+            text: "In `apps/site`: on PR #4 people changed `apps/site/a.ts` before merging.".into(),
+            seen: 2,
+            ..Default::default()
+        }]);
+        let b = implement_block(addendum, &lesson);
+        assert!(b.contains("## Before you write"));
+        assert!(b.contains("people changed `apps/site/a.ts`"));
+        let long = "x".repeat(10_000);
+        assert!(implement_block(addendum, &long).len() <= MAX_CODER_PROMPT_CHARS);
+        assert_eq!(implement_block("", ""), "");
+    }
+
+    #[test]
+    fn a_runs_arm_and_close_reason_are_read_back() {
+        use aws_sdk_dynamodb::types::AttributeValue as A;
+        let run = Item::from([
+            ("prompt_variant".to_string(), A::S("read_first".into())),
+            ("close_reason_answer".to_string(), A::S("Not needed".into())),
+        ]);
+        assert_eq!(coder_arm_of(&run), "read_first");
+        assert_eq!(close_reason_of(&run), "Not needed");
+        let other = Item::from([("prompt_variant".to_string(), A::S("focused".into()))]);
+        assert_eq!(
+            coder_arm_of(&other),
+            "",
+            "a reviewer arm is not the coder's"
+        );
     }
 
     #[test]

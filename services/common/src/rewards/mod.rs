@@ -23,6 +23,7 @@ pub mod changes;
 pub mod event;
 pub mod example_text;
 pub mod exemplars;
+pub mod health;
 pub mod lessons;
 pub mod mapping;
 pub mod score;
@@ -31,10 +32,13 @@ pub mod summary;
 
 pub use event::{RewardEvent, RewardKind};
 
-/// The outcome of a CoderHelm pull request to score (gateway → worker, on
-/// the `pull_request.closed` webhook). The worker reads the PR, its commits
-/// and CoderHelm's open review threads, and records the events.
-#[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
+/// The outcome of a closed pull request to score (gateway to worker, on the
+/// `pull_request.closed` webhook, and from the worker's reconcile sweep for a
+/// close the webhook missed). For CoderHelm's own PR the worker reads the PR,
+/// its commits and CoderHelm's review threads and records the coder's and
+/// the reviewer's events; for a person's PR CoderHelm reviewed
+/// (`review_only`) it records only what became of the review's comments.
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, Default)]
 pub struct RewardOutcomeMessage {
     pub team_id: String,
     pub installation_id: u64,
@@ -42,4 +46,7 @@ pub struct RewardOutcomeMessage {
     pub repo_owner: String,
     pub repo_name: String,
     pub pr_number: u64,
+    /// A PR CoderHelm reviewed but didn't write: no coder outcome.
+    #[serde(default)]
+    pub review_only: bool,
 }

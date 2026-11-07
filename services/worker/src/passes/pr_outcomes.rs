@@ -15,6 +15,7 @@ use crate::passes::{attr_n, attr_s};
 use crate::WorkerState;
 use aws_sdk_dynamodb::types::AttributeValue;
 use common::pr_outcome::{human_commit_count, outcome, parse_pr_url, Outcome};
+use common::rewards::RewardOutcomeMessage;
 use std::collections::HashMap;
 use tracing::{info, warn};
 
@@ -98,7 +99,10 @@ pub async fn backfill(state: &WorkerState) -> Result<(), Box<dyn std::error::Err
             req = req.expression_attribute_values(":hc", attr_n(n));
         }
         match req.update_expression(expr).send().await {
-            Ok(_) => filled += 1,
+            Ok(_) => {
+                filled += 1;
+                score_missed(state, &p, &owner, &repo, number).await;
+            }
             Err(e) => warn!(run_id = %p.run_id, error = %e, "Backfill: could not save the merge"),
         }
     }
@@ -222,7 +226,10 @@ async fn reconcile_finished(
             req = req.expression_attribute_values(*placeholder, attr_s(value));
         }
         match req.send().await {
-            Ok(_) => recorded += 1,
+            Ok(_) => {
+                recorded += 1;
+                score_missed(state, &p, &owner, &repo, number).await;
+            }
             Err(e) => {
                 warn!(run_id = %p.run_id, error = %e, "Reconcile: could not save the PR outcome")
             }
@@ -302,6 +309,33 @@ async fn find_runs(
     Ok(out)
 }
 
+/// The reward message for a run whose close the webhook never delivered.
+fn missed_outcome(p: &Pending, owner: &str, repo: &str, number: u64) -> RewardOutcomeMessage {
+    RewardOutcomeMessage {
+        team_id: p.team_id.clone(),
+        installation_id: p.installation_id,
+        run_id: p.run_id.clone(),
+        repo_owner: owner.to_string(),
+        repo_name: repo.to_string(),
+        pr_number: number,
+        review_only: false,
+    }
+}
+
+/// A close the webhook missed is learned from like any other: the run's
+/// outcome was only written on the run before, so the coder's and the
+/// reviewer's rewards never saw it. Scoring is idempotent per signal, so a
+/// webhook that arrives late counts nothing twice.
+async fn score_missed(state: &WorkerState, p: &Pending, owner: &str, repo: &str, number: u64) {
+    if let Err(e) =
+        super::rewards::score_outcome(state, missed_outcome(p, owner, repo, number)).await
+    {
+        warn!(run_id = %p.run_id, error = %e, "Reconcile: could not score the PR outcome");
+    } else {
+        info!(run_id = %p.run_id, pr = number, "Reconcile: scored a PR outcome the webhook missed");
+    }
+}
+
 /// Stops retrying a run GitHub can't answer for.
 async fn mark_unknown(state: &WorkerState, p: &Pending, why: &str) {
     let _ = state
@@ -365,6 +399,30 @@ mod tests {
             p.dedup();
             assert_eq!(p.len(), f.len());
         }
+    }
+
+    /// "Reconciled PR outcomes on finished runs" wrote the outcome on the
+    /// run and nothing else: a close the webhook missed never reached the
+    /// rewards. The message it now scores names the run and the PR.
+    #[test]
+    fn a_missed_close_is_scored_for_its_run() {
+        let p = Pending {
+            team_id: "TEAM#a".into(),
+            run_id: "R1".into(),
+            pr_url: "https://github.com/acme/web/pull/7".into(),
+            installation_id: 42,
+        };
+        let m = missed_outcome(&p, "acme", "web", 7);
+        assert_eq!(
+            (m.team_id.as_str(), m.run_id.as_str(), m.pr_number),
+            ("TEAM#a", "R1", 7)
+        );
+        assert_eq!(
+            (m.repo_owner.as_str(), m.repo_name.as_str()),
+            ("acme", "web")
+        );
+        assert_eq!(m.installation_id, 42);
+        assert!(!m.review_only);
     }
 
     #[test]

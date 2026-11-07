@@ -77,6 +77,10 @@ pub async fn decide(
         model: provider.judgment_model_id().to_string(),
         usage: Mutex::new(TokenUsage::default()),
     };
+    let mut picture = picture;
+    if picture.overturned.is_empty() {
+        picture.overturned = overturned(state, team_id, &picture).await;
+    }
     let picture = picture.with_ids();
     let judged = judge::judge(&model, picture.clone()).await;
     if let Ok(u) = model.usage.lock() {
@@ -84,6 +88,31 @@ pub async fn decide(
     }
     keep(state, team_id, subject, head_sha, &picture, &judged).await;
     judged
+}
+
+/// Days of the outcome log the judge remembers.
+const OVERTURNED_DAYS: i64 = 60;
+/// Pages of the light decision query read for it.
+const OVERTURNED_PAGES: usize = 3;
+
+/// The team's recent decisions of this kind that people's acts showed
+/// wrong, for the judge's picture: the outcome log closes the loop instead
+/// of only feeding analytics. Best effort: empty on any failure.
+async fn overturned(state: &WorkerState, team_id: &str, picture: &Picture) -> Vec<String> {
+    let since = (chrono::Utc::now() - chrono::Duration::days(OVERTURNED_DAYS)).to_rfc3339();
+    let records = decision_log::since_light(
+        &state.dynamo,
+        &state.config.settings_table_name,
+        team_id,
+        &since,
+        OVERTURNED_PAGES,
+    )
+    .await;
+    let lines = decision_log::overturned_lines(&records, picture.kind().as_str(), &picture.step);
+    if !lines.is_empty() {
+        info!(team_id, step = %picture.step, overturned = lines.len(), "Stop judge given the decisions people overturned");
+    }
+    lines
 }
 
 /// Records a judged decision (best effort).

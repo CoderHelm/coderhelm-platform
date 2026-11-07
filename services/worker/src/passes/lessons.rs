@@ -475,7 +475,19 @@ pub async fn run(
                 return Ok(());
             }
             if msg.trigger == TRIGGER_CLOSE_REASON {
-                record_answer(state, &msg, &ctx).await;
+                // The PR was scored when it closed; the reason joins that
+                // outcome and the coder's lesson for the area.
+                if let Some(answer) = record_answer(state, &msg, &ctx).await {
+                    super::rewards::note_close_reason(
+                        state,
+                        &msg.team_id,
+                        &item,
+                        &format!("{}/{}", msg.repo_owner, msg.repo_name),
+                        msg.pr_number,
+                        &answer,
+                    )
+                    .await;
+                }
             }
             let mut usage = TokenUsage::default();
             let judged = judge(state, &provider, &ctx, &mut usage).await;
@@ -581,15 +593,16 @@ async fn ask_close_reason(state: &WorkerState, github: &GitHubClient, msg: &Less
 
 /// The answer to the one question: kept on the run (the planner reads it
 /// with the ticket's history) and the signal moved to "closed with reason".
-async fn record_answer(state: &WorkerState, msg: &LessonMessage, ctx: &LessonContext) {
-    let Some((_, answer)) = ctx
+async fn record_answer(
+    state: &WorkerState,
+    msg: &LessonMessage,
+    ctx: &LessonContext,
+) -> Option<String> {
+    let (_, answer) = ctx
         .comments
         .iter()
         .rev()
-        .find(|(_, t)| !t.trim().is_empty())
-    else {
-        return;
-    };
+        .find(|(_, t)| !t.trim().is_empty())?;
     let _ = state
         .dynamo
         .update_item()
@@ -605,6 +618,7 @@ async fn record_answer(state: &WorkerState, msg: &LessonMessage, ctx: &LessonCon
         .expression_attribute_values(":t", attr_s(&chrono::Utc::now().to_rfc3339()))
         .send()
         .await;
+    Some(answer.clone())
 }
 
 async fn mark(state: &WorkerState, msg: &LessonMessage, field: &str, value: Option<&str>) {

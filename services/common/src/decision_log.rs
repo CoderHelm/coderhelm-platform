@@ -589,6 +589,188 @@ pub async fn on_merged(
     .await
 }
 
+/// A person approved the pull request while CoderHelm's block stood: each
+/// open block on it was overridden.
+pub async fn on_approved_over_block(
+    dynamo: &aws_sdk_dynamodb::Client,
+    table: &str,
+    team_id: &str,
+    repo: &str,
+    pr: u64,
+) -> usize {
+    let subject = Subject::Pr {
+        repo: repo.to_string(),
+        number: pr,
+    };
+    land(dynamo, table, team_id, &subject, Group::Block, |_| {
+        Some(Outcome::Overrode)
+    })
+    .await
+}
+
+/// The pull request heads the open blocks on it were decided on (so a merge
+/// can compare each head with the merged one).
+pub async fn open_block_heads(
+    dynamo: &aws_sdk_dynamodb::Client,
+    table: &str,
+    team_id: &str,
+    repo: &str,
+    pr: u64,
+) -> Vec<String> {
+    let subject = Subject::Pr {
+        repo: repo.to_string(),
+        number: pr,
+    };
+    let records = for_subject(dynamo, table, team_id, &subject).await;
+    let mut heads: Vec<String> = pending(&records, Group::Block)
+        .iter()
+        .map(|r| r.head_sha.clone())
+        .filter(|h| !h.is_empty())
+        .collect();
+    heads.sort();
+    heads.dedup();
+    heads
+}
+
+/// A merge's outcome for one block, given the files changed since each
+/// block's head (`changed_by_head`, from a compare of that head with the
+/// merged one). A block with no compare falls back to [`merge_outcome`]
+/// without one.
+pub fn merge_outcome_by_head(
+    rec: &Record,
+    merge_head: &str,
+    changed_by_head: &HashMap<String, Vec<String>>,
+) -> Outcome {
+    merge_outcome(
+        rec,
+        merge_head,
+        changed_by_head.get(&rec.head_sha).map(|v| v.as_slice()),
+    )
+}
+
+/// A pull request merged, with the files changed since each open block's
+/// head: a block whose flagged file was never touched merged unchanged
+/// (it wasn't needed), one whose file changed was fixed.
+pub async fn on_merged_by_head(
+    dynamo: &aws_sdk_dynamodb::Client,
+    table: &str,
+    team_id: &str,
+    repo: &str,
+    pr: u64,
+    merge_head: &str,
+    changed_by_head: &HashMap<String, Vec<String>>,
+) -> usize {
+    let subject = Subject::Pr {
+        repo: repo.to_string(),
+        number: pr,
+    };
+    land(dynamo, table, team_id, &subject, Group::Block, |r| {
+        Some(merge_outcome_by_head(r, merge_head, changed_by_head))
+    })
+    .await
+}
+
+/// The judge's memory of the outcome log: earlier stops or blocks of `kind`
+/// that people's acts showed wrong, newest first, the same step first, one
+/// line each (`category`: what it said, and what people did).
+pub fn overturned_lines(records: &[Record], kind: &str, step: &str) -> Vec<String> {
+    let mut wrong: Vec<&Record> = records
+        .iter()
+        .filter(|r| r.kind == kind && r.confirmed_wrong())
+        .collect();
+    wrong.sort_by(|a, b| {
+        (b.step == step)
+            .cmp(&(a.step == step))
+            .then(b.created_at.cmp(&a.created_at))
+    });
+    let mut out: Vec<String> = Vec::new();
+    for r in wrong {
+        let line = format!(
+            "{} by the {} step ({}): \"{}\"; people {}",
+            r.verdict,
+            r.step,
+            if r.category.is_empty() {
+                "no category"
+            } else {
+                r.category.as_str()
+            },
+            crate::truncate_str(r.detail.trim(), 200),
+            match r.outcome {
+                Some(Outcome::AnsweredDefault) => "answered with the default it offered",
+                Some(Outcome::Retried) => "retried the run as it was",
+                Some(Outcome::Overrode) => "went ahead over it",
+                Some(Outcome::DismissedReview) => "dismissed the review",
+                Some(Outcome::MergedFlaggedUnchanged) => "merged with the flagged lines unchanged",
+                _ => "overturned it",
+            }
+        );
+        if !out.contains(&line) {
+            out.push(line);
+        }
+        if out.len() >= crate::stop_judge::MAX_OVERTURNED {
+            break;
+        }
+    }
+    out
+}
+
+/// Decisions newer than `since`, without the stored picture and answers
+/// (for counts and the judge's memory: a few kilobytes, not megabytes).
+pub async fn since_light(
+    dynamo: &aws_sdk_dynamodb::Client,
+    table: &str,
+    team_id: &str,
+    since: &str,
+    max_pages: usize,
+) -> Vec<Record> {
+    let mut out = Vec::new();
+    if table.is_empty() {
+        return out;
+    }
+    let fields = [
+        "sk",
+        "kind",
+        "step",
+        "verdict",
+        "category",
+        "detail",
+        "outcome",
+        "outcome_at",
+        "created_at",
+        "head_sha",
+        "location",
+        "repo",
+        "pr_number",
+        "run_id",
+    ];
+    let names: Vec<String> = (0..fields.len()).map(|i| format!("#f{i}")).collect();
+    let mut start: Option<HashMap<String, AttributeValue>> = None;
+    for _ in 0..max_pages.max(1) {
+        let mut q = dynamo
+            .query()
+            .table_name(table)
+            .key_condition_expression("pk = :pk AND begins_with(sk, :p)")
+            .filter_expression("#f8 >= :since")
+            .expression_attribute_values(":pk", AttributeValue::S(team_id.into()))
+            .expression_attribute_values(":p", AttributeValue::S(SK_PREFIX.into()))
+            .expression_attribute_values(":since", AttributeValue::S(since.into()))
+            .projection_expression(names.join(", "))
+            .set_exclusive_start_key(start.take());
+        for (alias, name) in names.iter().zip(fields) {
+            q = q.expression_attribute_names(alias, name);
+        }
+        let Ok(page) = q.send().await else {
+            break;
+        };
+        out.extend(page.items().iter().map(Record::from_item));
+        match page.last_evaluated_key() {
+            Some(k) if !k.is_empty() => start = Some(k.clone()),
+            _ => break,
+        }
+    }
+    out
+}
+
 /// Decisions newer than `since` (RFC 3339), across the team.
 pub async fn since(
     dynamo: &aws_sdk_dynamodb::Client,
@@ -931,6 +1113,55 @@ mod tests {
         );
         let touched = vec!["src/a.rs".to_string()];
         assert_eq!(merge_outcome(&r, "h2", Some(&touched)), Outcome::Fixed);
+    }
+
+    /// The merge webhook used to pass no compare, so every block on a PR
+    /// with any later commit read as "fixed" and none as a nuisance.
+    #[test]
+    fn a_merge_compares_each_blocks_own_head() {
+        let (j, p) = judged(Kind::Block, hold());
+        let pr = Subject::Pr {
+            repo: "a/b".into(),
+            number: 1,
+        };
+        let r = Record::new(&pr, &j, &p, "h1");
+        let mut by_head = HashMap::new();
+        by_head.insert("h1".to_string(), vec!["README.md".to_string()]);
+        assert_eq!(
+            merge_outcome_by_head(&r, "h9", &by_head),
+            Outcome::MergedFlaggedUnchanged
+        );
+        by_head.insert("h1".to_string(), vec!["src/a.rs".to_string()]);
+        assert_eq!(merge_outcome_by_head(&r, "h9", &by_head), Outcome::Fixed);
+    }
+
+    #[test]
+    fn overturned_decisions_become_the_judges_memory() {
+        let (j, p) = judged(Kind::Block, hold());
+        let pr = Subject::Pr {
+            repo: "a/b".into(),
+            number: 1,
+        };
+        let mut wrong = Record::new(&pr, &j, &p, "h1");
+        wrong.outcome = Some(Outcome::Overrode);
+        wrong.created_at = "2026-11-02T00:00:00Z".into();
+        let mut right = Record::new(&pr, &j, &p, "h1");
+        right.outcome = Some(Outcome::Fixed);
+        let open = Record::new(&pr, &j, &p, "h1");
+        let mut other_step = wrong.clone();
+        other_step.step = "own_review".into();
+        other_step.created_at = "2026-11-05T00:00:00Z".into();
+        other_step.detail = "another".into();
+        let lines = overturned_lines(&[wrong.clone(), right, open, other_step], "block", "review");
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        // The same step first, even when older.
+        assert!(
+            lines[0].contains("by the review step (correctness)"),
+            "{lines:?}"
+        );
+        assert!(lines[0].contains("people went ahead over it"));
+        assert!(lines[1].contains("own_review"));
+        assert!(overturned_lines(&[wrong], "ask", "review").is_empty());
     }
 
     #[test]

@@ -23,8 +23,12 @@ only (no company, customer, repository, ticket or person names).
 
 - `case` picks the decision path (see `mod.rs`): `stop_judge`,
   `ticket_route`, `registration`, `run_loop`, `review_settled`,
-  `blocker_comment`, `deploy_count`. Each reads its own `input` and
-  `expect`; the existing cases show both.
+  `blocker_comment`, `deploy_count`, and the learning loops:
+  `learning_threads` (review threads at close, what calibration hears),
+  `learning_edits` (what counts as people rewriting a change),
+  `learning_coder_lesson` (what a coder lesson says) and
+  `decision_overturned` (the outcome log in the stop judge's prompt). Each
+  reads its own `input` and `expect`; the existing cases show both.
 - `replies`: where the stop judge is called, the model's recorded answers,
   one list per trial, in call order (a rule-breaking first answer followed by
   the re-asked one is two entries). Three trials (`k` = 3), and every trial

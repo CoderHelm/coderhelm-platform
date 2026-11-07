@@ -1,6 +1,7 @@
 //! Picking between prompt variants by their reward (UCB1, capped).
 //!
-//! An agent with variants (today the reviewer's prompt) has a default arm.
+//! An agent with variants (the reviewer's prompt and the coder's) has a
+//! default arm.
 //! The default is used until it and every other arm have enough samples;
 //! under-sampled arms are tried only while the share of reviews spent off
 //! the default stays under the exploration cap. Once arms have
@@ -52,6 +53,33 @@ pub const REVIEWER_ARMS: &[Arm] = &[
     },
 ];
 
+/// The coder's prompt variants (implement and plan). The first is the
+/// default. A run keeps the arm it started with across continuations (it is
+/// noted on the run), and its PR's outcome (merged as written, rewritten,
+/// closed, reverted, CI rounds) is credited to that arm.
+pub const CODER_ARMS: &[Arm] = &[
+    Arm {
+        key: "standard",
+        label: "Standard",
+        addendum: "",
+    },
+    Arm {
+        key: "read_first",
+        label: "Read first",
+        addendum: "\n\n## Before you write\nRead every file you will change and the tests that \
+                   cover it, and one neighbouring file that does the same kind of thing. Copy \
+                   the patterns you find there (helpers, naming, error handling) instead of \
+                   writing new ones.",
+    },
+    Arm {
+        key: "smallest_change",
+        label: "Smallest change",
+        addendum: "\n\n## Size of the change\nMake the smallest change that does what the ticket \
+                   asks. Touch no file the ticket doesn't need, add no new abstraction, and \
+                   leave unrelated code as it is.",
+    },
+];
+
 /// The prompt version of each agent's base prompt. Bump when the base prompt
 /// changes in a way that should start a fresh comparison.
 pub const REVIEWER_PROMPT_VERSION: &str = "review-2026-10";
@@ -61,6 +89,7 @@ pub const CODER_PROMPT_VERSION: &str = "implement-2026-10";
 pub fn arms_for(agent: &str) -> &'static [Arm] {
     match agent {
         super::event::AGENT_REVIEWER => REVIEWER_ARMS,
+        super::event::AGENT_CODER => CODER_ARMS,
         _ => &[],
     }
 }
@@ -308,7 +337,11 @@ mod tests {
 
     #[test]
     fn agents_without_variants_have_no_arms() {
-        assert!(arms_for("coder").is_empty());
+        assert!(arms_for("planner").is_empty());
+        // The coder has variants too: its outcomes pick between them.
+        assert_eq!(arms_for("coder").len(), 3);
+        assert_eq!(arms_for("coder")[0].key, "standard");
+        assert!(arm("coder", "read_first").is_some());
         let c = choose(&[], &[], Some("x"), MIN_PULLS, EXPLORATION_CAP);
         assert_eq!(c.arm, "");
         assert!(arm("reviewer", "focused").is_some());

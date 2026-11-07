@@ -16,6 +16,14 @@
 //! - `blocker_comment`: a person's comment naming a blocker on an unchanged
 //!   commit, through `review_policy` and `review_verdict::decide`.
 //! - `deploy_count`: workflow runs through `common::deploy_stats`.
+//! - `learning_threads`: review threads at a PR's close through
+//!   `rewards::thread_events` (what calibration hears).
+//! - `learning_edits`: a merged PR's commits through `common::pr_outcome`
+//!   (what counts as people rewriting CoderHelm's work).
+//! - `learning_coder_lesson`: an area's setbacks through
+//!   `lessons::coder_lesson_text` (what the coder is told).
+//! - `decision_overturned`: the outcome log through
+//!   `decision_log::overturned_lines` into the stop judge's prompt.
 //!
 //! Where the stop judge is involved the case carries the model's recorded
 //! answers for `k` trials (pass^k: every trial must pass, k = 3), so CI is
@@ -528,8 +536,209 @@ fn run_deploy_count(c: &Case, _: &Model) -> Result<(), String> {
     Ok(())
 }
 
+/// What became of CoderHelm's review threads when a PR closed, through
+/// `rewards::thread_events`: `expect.kinds` maps thread ids to the event
+/// kind each must record; `expect.none` lists threads that record nothing.
+fn run_learning_threads(c: &Case, _: &Model) -> Result<(), String> {
+    use crate::clients::github::{BotReviewThread, ThreadReply};
+    let i = &c.input;
+    let threads: Vec<BotReviewThread> = i["threads"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|t| BotReviewThread {
+            root_id: 0,
+            id: s(t, "id").to_string(),
+            path: s(t, "path").to_string(),
+            line: 1,
+            outdated: t["outdated"].as_bool().unwrap_or(false),
+            body: s(t, "body").to_string(),
+            replies: if t["person_replied"].as_bool().unwrap_or(false) {
+                vec![ThreadReply {
+                    author: "a-person".into(),
+                    by_bot: false,
+                    body: "a reply".into(),
+                }]
+            } else {
+                vec![]
+            },
+            resolved: t["resolved"].as_bool().unwrap_or(false),
+            resolved_by_person: t["resolved_by_person"].as_bool().unwrap_or(false),
+        })
+        .collect();
+    let events = crate::passes::rewards::thread_events(
+        "TEAM#replay",
+        "example/site",
+        1,
+        &threads,
+        i["merged"].as_bool().unwrap_or(false),
+        "2026-11-05T00:00:00Z",
+        &None,
+    );
+    let got: std::collections::BTreeMap<String, String> = events
+        .iter()
+        .map(|e| {
+            (
+                e.dedup.split('#').nth(1).unwrap_or("").to_string(),
+                e.kind.map(|k| k.key()).unwrap_or("").to_string(),
+            )
+        })
+        .collect();
+    for (id, want) in c.expect["kinds"].as_object().into_iter().flatten() {
+        let want = want.as_str().unwrap_or("");
+        match got.get(id) {
+            Some(k) if k == want => {}
+            other => return Err(format!("thread {id}: got {other:?}, want {want}")),
+        }
+    }
+    for id in strings(&c.expect["none"]) {
+        if let Some(k) = got.get(&id) {
+            return Err(format!("thread {id} recorded {k}, want nothing"));
+        }
+    }
+    Ok(())
+}
+
+/// What people changed on a merged PR, through `common::pr_outcome` and
+/// `PeopleEdits::share`: `input.commits` as GitHub lists them, `input.lines`
+/// each commit's own size by sha, `input.pr_lines` the PR's diff.
+fn run_learning_edits(c: &Case, _: &Model) -> Result<(), String> {
+    let i = &c.input;
+    let commits: Vec<Value> = i["commits"].as_array().cloned().unwrap_or_default();
+    let mine = common::pr_outcome::human_edit_commits(&commits);
+    let lines: u64 = mine
+        .iter()
+        .map(|c| {
+            i["lines"][c["sha"].as_str().unwrap_or("")]
+                .as_u64()
+                .unwrap_or(0)
+        })
+        .sum();
+    let ed = common::rewards::mapping::PeopleEdits {
+        commits: mine.len() as u64,
+        lines,
+        ..Default::default()
+    };
+    let share = ed.share(i["pr_lines"].as_u64().unwrap_or(0));
+    let e = &c.expect;
+    if let Some(n) = e["human_commits"].as_u64() {
+        if ed.commits != n {
+            return Err(format!("{} human commits, want {n}", ed.commits));
+        }
+    }
+    if let Some(max) = e["share_at_most"].as_f64() {
+        if share > max {
+            return Err(format!("edit share {share:.2}, want at most {max}"));
+        }
+    }
+    let setback = share >= common::rewards::lessons::SETBACK_EDIT_SHARE;
+    if let Some(want) = e["setback"].as_bool() {
+        if setback != want {
+            return Err(format!("setback {setback}, want {want}"));
+        }
+    }
+    Ok(())
+}
+
+/// The coder lesson an area's setbacks write, through
+/// `lessons::coder_lesson_text`: it must contain `expect.contains` and none
+/// of `expect.not_contains`.
+fn run_learning_coder_lesson(c: &Case, _: &Model) -> Result<(), String> {
+    use common::rewards::event::{RewardEvent, RewardKind, AGENT_CODER};
+    let i = &c.input;
+    let events: Vec<RewardEvent> = i["events"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|e| {
+            let kind = RewardKind::from_key(s(e, "kind"))?;
+            let pr = e["pr"].as_u64().unwrap_or(0);
+            let mut ev = RewardEvent::new("T", kind, AGENT_CODER, s(e, "at"), &format!("{pr}"))
+                .with_repo("example/site", pr)
+                .with_value(e["value"].as_f64().unwrap_or(0.0));
+            ev.area = s(i, "area").to_string();
+            ev.files = strings(&e["files"]);
+            ev.notes = strings(&e["notes"]);
+            Some(ev)
+        })
+        .collect();
+    let setbacks: Vec<RewardEvent> = events
+        .into_iter()
+        .filter(common::rewards::lessons::is_coder_setback)
+        .collect();
+    if !common::rewards::lessons::backed(&setbacks) {
+        return Err("the setbacks don't back a lesson".into());
+    }
+    let text =
+        common::rewards::lessons::coder_lesson_text(s(i, "area"), &setbacks).ok_or("no lesson")?;
+    for want in strings(&c.expect["contains"]) {
+        if !text.contains(&want) {
+            return Err(format!("the lesson misses `{want}`: {text}"));
+        }
+    }
+    for bad in strings(&c.expect["not_contains"]) {
+        if text.contains(&bad) {
+            return Err(format!("the lesson says `{bad}`: {text}"));
+        }
+    }
+    Ok(())
+}
+
+/// The stop judge's memory of the outcome log, through
+/// `decision_log::overturned_lines` and the judge's prompt.
+fn run_decision_overturned(c: &Case, _: &Model) -> Result<(), String> {
+    use common::decision_log::{Outcome, Record};
+    let i = &c.input;
+    let records: Vec<Record> = i["records"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|r| Record {
+            kind: s(r, "kind").into(),
+            step: s(r, "step").into(),
+            verdict: s(r, "verdict").into(),
+            category: s(r, "category").into(),
+            detail: s(r, "detail").into(),
+            created_at: s(r, "created_at").into(),
+            outcome: Outcome::parse(s(r, "outcome")),
+            ..Default::default()
+        })
+        .collect();
+    let lines = common::decision_log::overturned_lines(&records, s(i, "kind"), s(i, "step"));
+    let e = &c.expect;
+    if let Some(n) = e["lines"].as_u64() {
+        if lines.len() as u64 != n {
+            return Err(format!(
+                "{} overturned lines, want {n}: {lines:?}",
+                lines.len()
+            ));
+        }
+    }
+    let mut p = Picture::new(
+        if s(i, "kind") == "block" {
+            judge::Kind::Block
+        } else {
+            judge::Kind::Ask
+        },
+        s(i, "step"),
+        "replay",
+    );
+    p.overturned = lines;
+    let prompt = judge::prompt(&p.with_ids());
+    for want in strings(&e["prompt_contains"]) {
+        if !prompt.contains(&want) {
+            return Err(format!("the judge's prompt misses `{want}`"));
+        }
+    }
+    Ok(())
+}
+
 fn run_one(c: &Case, model: &Model) -> Result<(), String> {
     match c.case.as_str() {
+        "learning_threads" => run_learning_threads(c, model),
+        "learning_edits" => run_learning_edits(c, model),
+        "learning_coder_lesson" => run_learning_coder_lesson(c, model),
+        "decision_overturned" => run_decision_overturned(c, model),
         "stop_judge" => run_stop_judge(c, model),
         "ticket_route" => run_ticket_route(c, model),
         "registration" => run_registration(c, model),
@@ -627,6 +836,10 @@ fn the_seed_incidents_are_all_here() {
         "review_settled",
         "blocker_comment",
         "deploy_count",
+        "learning_threads",
+        "learning_edits",
+        "learning_coder_lesson",
+        "decision_overturned",
     ] {
         assert!(kinds.iter().any(|x| x == k), "no `{k}` case");
     }

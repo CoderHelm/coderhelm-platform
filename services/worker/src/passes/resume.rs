@@ -2996,6 +2996,7 @@ async fn fix_context(
         // message.
         team_instructions: super::load_team_instructions(state, &msg.team_id, t.owner, t.repo)
             .await,
+        coder_learning: String::new(),
         person_direction: None,
         answers: Vec::new(),
         new_run_id: None,

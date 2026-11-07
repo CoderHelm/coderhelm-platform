@@ -3952,26 +3952,30 @@ impl GitHubClient {
             .unwrap_or_default())
     }
 
-    /// Lines added plus removed between two commits (the compare's files).
-    pub async fn compare_line_changes(
+    /// One commit's own size and files: lines added plus removed (its
+    /// `stats`), and the paths it touched (first page, up to 300).
+    pub async fn commit_stats(
         &self,
         owner: &str,
         repo: &str,
-        base: &str,
-        head: &str,
-    ) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
-        let url = format!("{API_BASE}/repos/{owner}/{repo}/compare/{base}...{head}");
-        let data = self.get(&url).await?;
-        Ok(data["files"]
+        sha: &str,
+    ) -> Result<(u64, Vec<String>), Box<dyn std::error::Error + Send + Sync>> {
+        let v = self
+            .get(&format!("{API_BASE}/repos/{owner}/{repo}/commits/{sha}"))
+            .await?;
+        let total = v["stats"]["total"].as_u64().unwrap_or_else(|| {
+            v["stats"]["additions"].as_u64().unwrap_or(0)
+                + v["stats"]["deletions"].as_u64().unwrap_or(0)
+        });
+        let files = v["files"]
             .as_array()
-            .map(|arr| {
-                arr.iter()
-                    .map(|f| {
-                        f["additions"].as_u64().unwrap_or(0) + f["deletions"].as_u64().unwrap_or(0)
-                    })
-                    .sum()
+            .map(|a| {
+                a.iter()
+                    .filter_map(|f| f["filename"].as_str().map(String::from))
+                    .collect()
             })
-            .unwrap_or(0))
+            .unwrap_or_default();
+        Ok((total, files))
     }
 
     /// Find the most recent closed-but-unmerged PR for a head branch.

@@ -20,6 +20,35 @@ pub struct RunContext {
     pub plugin: String,
     /// The area most of the change touched.
     pub area: String,
+    /// Why people closed the PR, when they said (the run's close reason or
+    /// their answer to CoderHelm's one question).
+    pub close_reason: String,
+}
+
+/// What people changed on top of CoderHelm's work before merging: their own
+/// commits only (a merge of the base branch is not an edit), measured from
+/// each commit's own stats.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct PeopleEdits {
+    /// Their non-merge commits.
+    pub commits: u64,
+    /// Lines they added and removed, summed over those commits.
+    pub lines: u64,
+    /// The paths they touched, most touched first.
+    pub files: Vec<String>,
+    /// Their commit subjects, oldest first.
+    pub subjects: Vec<String>,
+}
+
+/// Most paths and commit subjects kept on one event.
+pub const MAX_EDIT_FILES: usize = 6;
+pub const MAX_EDIT_NOTES: usize = 4;
+
+impl PeopleEdits {
+    /// The share of the PR's diff they changed, 0..1.
+    pub fn share(&self, pr_lines: u64) -> f64 {
+        edit_fraction(self.lines, pr_lines)
+    }
 }
 
 impl RunContext {
@@ -78,9 +107,10 @@ pub fn pr_closed_events(
     ctx: &RunContext,
     pr: &Value,
     human_commits: Option<u64>,
-    edit_share: Option<f64>,
+    edits: Option<&PeopleEdits>,
     ci: CiSummary,
 ) -> Vec<RewardEvent> {
+    let pr_lines = pr["additions"].as_u64().unwrap_or(0) + pr["deletions"].as_u64().unwrap_or(0);
     let mut out = vec![];
     let key = format!("{}#{}", ctx.repo, ctx.pr);
     let opened = pr["created_at"].as_str().unwrap_or("");
@@ -101,9 +131,10 @@ pub fn pr_closed_events(
                     .with_detail(&format!("PR #{} merged as written by {merged_by}", ctx.pr)),
                 ),
                 Some(n) => {
-                    if let Some(share) = edit_share {
-                        out.push(
-                            ctx.event(
+                    if let Some(ed) = edits {
+                        let share = ed.share(pr_lines);
+                        let mut e = ctx
+                            .event(
                                 RewardKind::PrMergedEdited,
                                 AGENT_CODER,
                                 &merged_at,
@@ -114,8 +145,16 @@ pub fn pr_closed_events(
                                 "PR #{} merged after {n} commit(s) from people, {}% of the diff changed",
                                 ctx.pr,
                                 (share * 100.0).round() as u64
-                            )),
-                        );
+                            ));
+                        e.files = ed.files.iter().take(MAX_EDIT_FILES).cloned().collect();
+                        e.notes = ed
+                            .subjects
+                            .iter()
+                            .filter(|t| !t.trim().is_empty())
+                            .take(MAX_EDIT_NOTES)
+                            .map(|t| crate::truncate_str(t.trim(), 160).to_string())
+                            .collect();
+                        out.push(e);
                     }
                 }
                 None => {}
@@ -138,15 +177,18 @@ pub fn pr_closed_events(
             out.extend(ci_event(ctx, &merged_at, &key, ci));
         }
         crate::pr_outcome::Outcome::Closed { closed_at, .. } => {
-            out.push(
-                ctx.event(
+            let mut e = ctx
+                .event(
                     RewardKind::PrClosedUnmerged,
                     AGENT_CODER,
                     &closed_at,
                     &format!("closed#{key}"),
                 )
-                .with_detail(&format!("PR #{} closed without merging", ctx.pr)),
-            );
+                .with_detail(&format!("PR #{} closed without merging", ctx.pr));
+            if !ctx.close_reason.trim().is_empty() {
+                e.notes = vec![crate::truncate_str(ctx.close_reason.trim(), 240).to_string()];
+            }
+            out.push(e);
             out.extend(ci_event(ctx, &closed_at, &key, ci));
         }
         crate::pr_outcome::Outcome::Open => {}
@@ -226,6 +268,64 @@ pub fn thread_title(body: &str) -> String {
         (Some(a), Some(b)) if b > a + 2 => first[a + 2..b].trim().to_string(),
         _ => crate::truncate_str(first.trim(), 120).to_string(),
     }
+}
+
+/// What one of CoderHelm's review threads says about the comment once the
+/// PR closed, for the reviewer's calibration. Read from the thread itself, so
+/// a note on an approved review (a Nit or a Suggestion) counts the same as a
+/// blocker:
+///
+/// * a person replied: their words are the review-lesson judge's to read, so
+///   nothing here (the judge records a dismissal when the reviewer was wrong);
+/// * CoderHelm resolved it (a later review saw it fixed), or the lines it
+///   pointed at changed: acted on;
+/// * a person resolved it with the lines unchanged: dismissed;
+/// * merged with it still open and untouched: left open (an FYI asks for
+///   nothing, so it never counts as left open);
+/// * closed without merging and untouched: nothing (the PR was dropped, not
+///   the comment).
+pub fn thread_outcome(t: &ThreadAtClose, merged: bool) -> Option<RewardKind> {
+    if t.person_replied {
+        return None;
+    }
+    if (t.resolved && !t.resolved_by_person) || t.outdated {
+        return Some(RewardKind::FindingAccepted);
+    }
+    if t.resolved && t.resolved_by_person {
+        return Some(RewardKind::FindingDismissed);
+    }
+    if merged && !is_fyi(&t.body) {
+        return Some(RewardKind::FindingIgnored);
+    }
+    None
+}
+
+/// A review thread as it stood when the PR closed.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ThreadAtClose {
+    pub resolved: bool,
+    pub resolved_by_person: bool,
+    /// GitHub marks a thread outdated when the lines it is anchored on changed.
+    pub outdated: bool,
+    /// A person (not a bot) wrote under it.
+    pub person_replied: bool,
+    pub body: String,
+}
+
+/// An FYI note: information, nothing to act on.
+pub fn is_fyi(body: &str) -> bool {
+    body.lines().next().unwrap_or("").contains("**FYI: ")
+}
+
+/// The words people read for a thread outcome, as evidence.
+pub fn thread_outcome_detail(kind: RewardKind, body: &str, path: &str) -> String {
+    let why = match kind {
+        RewardKind::FindingAccepted => "acted on before the PR closed",
+        RewardKind::FindingDismissed => "resolved by a person with the lines unchanged",
+        RewardKind::FindingIgnored => "still open and untouched when the PR merged",
+        _ => "",
+    };
+    format!("{} ({path}): {why}", thread_title(body))
 }
 
 /// A finding event for one of CoderHelm's review threads.
@@ -386,7 +486,16 @@ mod tests {
             passed: true,
             known: true,
         };
-        let v = pr_closed_events(&ctx(), &merged(), Some(3), Some(0.4), ci);
+        let ed = PeopleEdits {
+            commits: 3,
+            lines: 40,
+            files: vec!["src/api/a.ts".into()],
+            subjects: vec!["Use the shared client".into(), " ".into()],
+        };
+        let mut pr = merged();
+        pr["additions"] = json!(80);
+        pr["deletions"] = json!(20);
+        let v = pr_closed_events(&ctx(), &pr, Some(3), Some(&ed), ci);
         assert_eq!(
             kinds(&v),
             vec![
@@ -397,6 +506,9 @@ mod tests {
         );
         assert_eq!(v[0].value, 0.4);
         assert!(v[0].detail.contains("40% of the diff"));
+        // What people changed and said travels on the event.
+        assert_eq!(v[0].files, vec!["src/api/a.ts".to_string()]);
+        assert_eq!(v[0].notes, vec!["Use the shared client".to_string()]);
         assert_eq!(v[2].value, 2.0);
         // Unmeasured edits are not guessed.
         let v = pr_closed_events(&ctx(), &merged(), Some(3), None, CiSummary::default());
@@ -412,6 +524,14 @@ mod tests {
         let v = pr_closed_events(&ctx(), &pr, Some(0), None, CiSummary::default());
         assert_eq!(kinds(&v), vec![RewardKind::PrClosedUnmerged]);
         assert_eq!(v[0].at, "2026-10-03T00:00:00Z");
+        assert!(v[0].notes.is_empty());
+        let mut c = ctx();
+        c.close_reason = "Wrong approach: the flag lives in the CMS".into();
+        let v = pr_closed_events(&c, &pr, Some(0), None, CiSummary::default());
+        assert_eq!(
+            v[0].notes,
+            vec!["Wrong approach: the flag lives in the CMS".to_string()]
+        );
         let open = json!({"state":"open"});
         assert!(pr_closed_events(&ctx(), &open, Some(0), None, CiSummary::default()).is_empty());
     }
@@ -446,6 +566,56 @@ mod tests {
         );
         assert_eq!(revert_target("Fix login", "Reverts #12", "acme/web"), None);
         assert_eq!(revert_target("Revert \"x\"", "no ref", "acme/web"), None);
+    }
+
+    #[test]
+    fn threads_at_close_feed_calibration_both_ways() {
+        let t = |resolved, by_person, outdated, replied, body: &str| ThreadAtClose {
+            resolved,
+            resolved_by_person: by_person,
+            outdated,
+            person_replied: replied,
+            body: body.into(),
+        };
+        let nit = "💬 **Nit: Rename the flag** (style, not verified)";
+        let fyi = "💬 **FYI: The cache is per region** (other, not verified)";
+        // Untouched at merge: left open, a Nit as much as a blocker.
+        assert_eq!(
+            thread_outcome(&t(false, false, false, false, nit), true),
+            Some(RewardKind::FindingIgnored)
+        );
+        // An FYI asks for nothing; a dropped PR says nothing about a note.
+        assert_eq!(
+            thread_outcome(&t(false, false, false, false, fyi), true),
+            None
+        );
+        assert_eq!(
+            thread_outcome(&t(false, false, false, false, nit), false),
+            None
+        );
+        // Lines changed under it, or CoderHelm saw it fixed: acted on.
+        assert_eq!(
+            thread_outcome(&t(false, false, true, false, nit), true),
+            Some(RewardKind::FindingAccepted)
+        );
+        assert_eq!(
+            thread_outcome(&t(true, false, false, false, nit), false),
+            Some(RewardKind::FindingAccepted)
+        );
+        // A person resolved it with the lines unchanged: dismissed.
+        assert_eq!(
+            thread_outcome(&t(true, true, false, false, nit), true),
+            Some(RewardKind::FindingDismissed)
+        );
+        // Words under it are the judge's to read.
+        assert_eq!(
+            thread_outcome(&t(false, false, false, true, nit), true),
+            None
+        );
+        assert!(
+            thread_outcome_detail(RewardKind::FindingIgnored, nit, "a.rs")
+                .starts_with("Nit: Rename the flag (a.rs)")
+        );
     }
 
     #[test]

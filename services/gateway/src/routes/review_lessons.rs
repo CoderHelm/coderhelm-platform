@@ -171,6 +171,19 @@ pub fn qualifies(verdicts_newest_first: &[String], needs_changes_requested: bool
             .is_some_and(|v| v == "REQUEST_CHANGES")
 }
 
+/// Pure: why a trigger is not judged, in the log's words. A person
+/// approving or merging over an approval with notes (a Nit, a Suggestion)
+/// pushes back on nothing; what became of each note is recorded when the PR
+/// closes (`rewards::score_outcome`, review only), so it still reaches
+/// calibration.
+pub fn not_judged_reason(verdicts_newest_first: &[String]) -> &'static str {
+    if verdicts_newest_first.is_empty() {
+        "CoderHelm hasn't reviewed this PR"
+    } else {
+        "CoderHelm's verdict doesn't request changes: its notes are scored when the PR closes"
+    }
+}
+
 /// CoderHelm reviewed this PR (it has a review record of it).
 pub async fn reviewed_by_coderhelm(
     state: &AppState,
@@ -258,11 +271,23 @@ pub async fn on_webhook(
             return;
         }
     }
-    if !qualifies(
-        &verdicts(state, team_id, &t).await,
-        t.needs_changes_requested,
-    ) {
-        info!(owner = %t.owner, name = %t.name, pr = t.pr_number, trigger = t.trigger, reason = "CoderHelm hasn't reviewed this PR, or its verdict doesn't request changes", "Pushback on a review not judged");
+    let verdicts = verdicts(state, team_id, &t).await;
+    // A person approving while CoderHelm's request for changes stands
+    // overrode it: the stop judge's outcome log hears it, whatever the
+    // judgment below decides. (A block already cleared by a later approval
+    // was not overridden; the merge records it as fixed.)
+    if t.trigger == rl::TRIGGER_APPROVED_OVER_BLOCK && qualifies(&verdicts, true) {
+        common::decision_log::on_approved_over_block(
+            &state.dynamo,
+            &state.config.settings_table_name,
+            team_id,
+            &format!("{}/{}", t.owner, t.name),
+            t.pr_number,
+        )
+        .await;
+    }
+    if !qualifies(&verdicts, t.needs_changes_requested) {
+        info!(owner = %t.owner, name = %t.name, pr = t.pr_number, trigger = t.trigger, reason = not_judged_reason(&verdicts), "Pushback on a review not judged");
         return;
     }
     let event_at = match rl::mark_event(
@@ -606,6 +631,16 @@ mod tests {
         p["pull_request"]["merged"] = json!(false);
         p["sender"] = bot("coderhelm[bot]");
         assert_eq!(detect("pull_request", &p), None);
+    }
+
+    /// Production logged 90 "not judged" in a week, mostly approvals over an
+    /// approval with notes: the log now says where those notes go.
+    #[test]
+    fn approvals_over_notes_say_the_notes_are_scored_at_close() {
+        let v = |xs: &[&str]| xs.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert!(!qualifies(&v(&["APPROVE"]), true));
+        assert!(not_judged_reason(&v(&["APPROVE"])).contains("scored when the PR closes"));
+        assert_eq!(not_judged_reason(&[]), "CoderHelm hasn't reviewed this PR");
     }
 
     #[test]

@@ -38,8 +38,16 @@ pub fn outcome(pr: &Value) -> Outcome {
     Outcome::Open
 }
 
-/// Commits on a pull request that a person pushed (not Coderhelm, not a bot).
+/// Commits on a pull request that a person pushed (not Coderhelm, not a bot)
+/// and that change the work itself. A merge commit (GitHub's "Update
+/// branch", or a person merging the base in) brings other people's merged
+/// work along; counting it made every updated PR look rewritten by people.
 pub fn human_commit_count(commits: &[Value]) -> u64 {
+    human_edit_commits(commits).len() as u64
+}
+
+/// The commits [`human_commit_count`] counts, oldest first.
+pub fn human_edit_commits(commits: &[Value]) -> Vec<&Value> {
     commits
         .iter()
         .filter(|c| {
@@ -48,9 +56,26 @@ pub fn human_commit_count(commits: &[Value]) -> u64 {
                 .or(c["committer"]["login"].as_str())
                 .unwrap_or("");
             let is_bot = c["author"]["type"].as_str() == Some("Bot") || login.ends_with("[bot]");
-            !login.contains("coderhelm") && !is_bot && !login.is_empty()
+            !login.contains("coderhelm") && !is_bot && !login.is_empty() && !is_merge_commit(c)
         })
-        .count() as u64
+        .collect()
+}
+
+/// A merge commit: more than one parent.
+pub fn is_merge_commit(c: &Value) -> bool {
+    c["parents"].as_array().is_some_and(|p| p.len() > 1)
+}
+
+/// The first line of a commit's message, as people wrote it.
+pub fn commit_subject(c: &Value) -> String {
+    c["commit"]["message"]
+        .as_str()
+        .unwrap_or("")
+        .lines()
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_string()
 }
 
 /// `(owner, repo, number)` from a PR's html URL.
@@ -106,6 +131,22 @@ mod tests {
         ];
         assert_eq!(human_commit_count(&commits), 2);
         assert_eq!(human_commit_count(&[]), 0);
+    }
+
+    #[test]
+    fn a_persons_update_branch_merge_is_not_an_edit() {
+        let commits = vec![
+            json!({"author":{"login":"coderhelm[bot]","type":"Bot"},"parents":[{"sha":"a"}]}),
+            // GitHub's "Update branch": authored by the person who pressed it.
+            json!({"author":{"login":"alice","type":"User"},"parents":[{"sha":"b"},{"sha":"c"}],
+                   "commit":{"message":"Merge branch 'main' into fix"}}),
+            json!({"author":{"login":"alice","type":"User"},"parents":[{"sha":"d"}],
+                   "commit":{"message":"Use the shared client\n\nThe new one leaked."}}),
+        ];
+        assert_eq!(human_commit_count(&commits), 1);
+        let edits = human_edit_commits(&commits);
+        assert_eq!(commit_subject(edits[0]), "Use the shared client");
+        assert!(is_merge_commit(&commits[1]));
     }
 
     #[test]

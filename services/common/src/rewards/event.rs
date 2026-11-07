@@ -182,6 +182,12 @@ pub struct RewardEvent {
     pub source: String,
     /// What makes two deliveries of the same signal one event.
     pub dedup: String,
+    /// The paths people changed on top of CoderHelm's work (a merge after
+    /// edits), so a lesson can name them.
+    pub files: Vec<String>,
+    /// People's own words about it: their commit subjects, the reason a PR
+    /// was closed.
+    pub notes: Vec<String>,
 }
 
 impl RewardEvent {
@@ -260,6 +266,13 @@ fn get_s(item: &Item, k: &str) -> String {
         .unwrap_or_default()
 }
 
+fn get_l(item: &Item, k: &str) -> Vec<String> {
+    item.get(k)
+        .and_then(|v| v.as_l().ok())
+        .map(|l| l.iter().filter_map(|x| x.as_s().ok().cloned()).collect())
+        .unwrap_or_default()
+}
+
 fn get_f(item: &Item, k: &str) -> f64 {
     item.get(k)
         .and_then(|v| v.as_n().ok())
@@ -318,6 +331,14 @@ impl RewardEvent {
                 AttributeValue::Ss(self.skills.clone()),
             );
         }
+        for (k, v) in [("files", &self.files), ("notes", &self.notes)] {
+            if !v.is_empty() {
+                i.insert(
+                    k.to_string(),
+                    AttributeValue::L(v.iter().map(|x| s(x)).collect()),
+                );
+            }
+        }
         i
     }
 
@@ -351,6 +372,8 @@ impl RewardEvent {
             detail: get_s(item, "detail"),
             source: get_s(item, "source"),
             dedup: get_s(item, "dedup"),
+            files: get_l(item, "files"),
+            notes: get_l(item, "notes"),
         })
     }
 }
@@ -402,6 +425,8 @@ mod tests {
         .with_detail("people changed a quarter");
         e.skills = vec!["tests@3".into()];
         e.variant = "standard".into();
+        e.files = vec!["src/a.ts".into()];
+        e.notes = vec!["Use the shared client".into()];
         let item = e.to_item();
         assert_eq!(item["pk"], AttributeValue::S("TEAM#a".into()));
         let back = RewardEvent::from_item(&item).unwrap();
