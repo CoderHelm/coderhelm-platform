@@ -67,11 +67,22 @@ pub fn provider(kind: Kind) -> Option<Provider> {
             authorize: "https://auth.atlassian.com/authorize",
             token: "https://auth.atlassian.com/oauth/token",
             revoke: None,
+            // Exactly what the sync calls, and nothing more. The Atlassian
+            // app (developer console, Permissions, Confluence API) must have
+            // every one of these added, or Atlassian's consent page shows
+            // "Something went wrong" to whoever signs in:
+            // - Granular scopes tab: read:page:confluence and
+            //   read:space:confluence (GET /wiki/api/v2/spaces, spaces/{id}/pages,
+            //   pages/{id}), read:hierarchical-content:confluence
+            //   (GET /wiki/api/v2/pages/{id}/children).
+            // - Classic scopes tab: search:confluence (GET
+            //   /wiki/rest/api/content/search, CQL, which has no v2 version).
+            // offline_access isn't a console scope: it asks for a refresh token.
+            // `confluence_scopes_match_what_the_sync_calls` pins this list.
             scopes: &[
                 "read:page:confluence",
                 "read:space:confluence",
                 "read:hierarchical-content:confluence",
-                "read:confluence-content.summary",
                 "search:confluence",
                 "offline_access",
             ],
@@ -542,5 +553,49 @@ mod tests {
         let p = provider(Kind::GoogleDrive).unwrap();
         assert!(p.extra.contains(&("access_type", "offline")));
         assert_eq!(p.scopes, ["https://www.googleapis.com/auth/drive.readonly"]);
+    }
+
+    #[test]
+    fn confluence_scopes_match_what_the_sync_calls() {
+        // The list the Atlassian app must have (see the comment on it). A
+        // change here is a change to the app's console settings too.
+        let p = provider(Kind::Confluence).unwrap();
+        assert_eq!(
+            p.scopes,
+            [
+                "read:page:confluence",
+                "read:space:confluence",
+                "read:hierarchical-content:confluence",
+                "search:confluence",
+                "offline_access",
+            ]
+        );
+        // Every Confluence call the sync makes is one these scopes cover: v2
+        // spaces and pages (granular), and v1 only for CQL search (classic).
+        // (Links people open in a browser, like /wiki/spaces/..., aren't API
+        // calls and need no scope.)
+        let src = include_str!("confluence.rs");
+        let src = src.split("#[cfg(test)]").next().unwrap();
+        let mut seen = 0;
+        for api in ["/wiki/api/", "/wiki/rest/"] {
+            let mut rest = src;
+            while let Some(i) = rest.find(api) {
+                let tail = &rest[i..];
+                let path: String = tail
+                    .chars()
+                    .take_while(|c| !matches!(c, '"' | '?' | '{' | ' ' | '`' | ')'))
+                    .collect();
+                assert!(
+                    path.starts_with("/wiki/api/v2/spaces")
+                        || path.starts_with("/wiki/api/v2/pages")
+                        || path == "/wiki/api/v2/..."
+                        || path == "/wiki/rest/api/content/search",
+                    "a Confluence call no requested scope covers: {path}"
+                );
+                seen += 1;
+                rest = &tail[api.len()..];
+            }
+        }
+        assert!(seen > 0, "the sync's Confluence calls were found");
     }
 }

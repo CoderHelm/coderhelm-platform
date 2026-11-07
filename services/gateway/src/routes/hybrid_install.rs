@@ -2218,13 +2218,25 @@ pub async fn linked_installations(state: &AppState) -> usize {
 
 /// The registration to sign in with when this install chose CoderHelm's app
 /// for a knowledge provider (Notion, Confluence, Google Drive).
-pub fn brokered(kind: common::knowledge::sources::Kind) -> Option<Credentials> {
-    let l = cached_local()?;
-    l.integrations
-        .iter()
-        .any(|i| i == kind.key())
-        .then(client::credentials)
-        .flatten()
+///
+/// Reads the hybrid settings and the registration (from this instance's
+/// memory, or from the store and the secret when a fresh instance hasn't
+/// loaded them yet). It used to read memory only, so on a fresh instance
+/// it said "no" and the add flow showed token steps instead of sign-in.
+pub async fn brokered(
+    state: &AppState,
+    kind: common::knowledge::sources::Kind,
+) -> Option<Credentials> {
+    let l = local(state).await;
+    if !brokers(&l, kind) {
+        return None;
+    }
+    creds_now().await
+}
+
+/// Whether the hybrid settings route `kind` through CoderHelm's app.
+fn brokers(l: &Local, kind: common::knowledge::sources::Kind) -> bool {
+    l.integrations.iter().any(|i| i == kind.key())
 }
 
 /// For the public GitHub checks: is GitHub going through CoderHelm's app?
@@ -2237,6 +2249,17 @@ mod tests {
 
     fn no_own_apps(_: &str) -> bool {
         false
+    }
+
+    #[test]
+    fn a_provider_is_brokered_only_when_the_settings_list_it() {
+        use common::knowledge::sources::Kind;
+        let mut l = Local::default();
+        assert!(!brokers(&l, Kind::Notion));
+        l.integrations = vec!["github".into(), "notion".into(), "confluence".into()];
+        assert!(brokers(&l, Kind::Notion));
+        assert!(brokers(&l, Kind::Confluence));
+        assert!(!brokers(&l, Kind::GoogleDrive));
     }
 
     #[test]

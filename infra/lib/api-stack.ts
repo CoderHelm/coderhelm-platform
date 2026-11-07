@@ -949,6 +949,14 @@ export class ApiStack extends cdk.Stack {
       integration: lambdaIntegration,
     });
 
+    // This install's OAuth client metadata document (public): MCP sign-in
+    // servers fetch it to learn which callback the install signs in with.
+    httpApi.addRoutes({
+      path: "/integrations/mcp-client.json",
+      methods: [apigatewayv2.HttpMethod.GET],
+      integration: lambdaIntegration,
+    });
+
     // Auth routes
     httpApi.addRoutes({
       path: "/auth/{proxy+}",

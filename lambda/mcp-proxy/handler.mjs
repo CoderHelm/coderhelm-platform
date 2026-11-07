@@ -30,21 +30,9 @@ const TOOL_CACHE_PREFIX = "config/mcp-tools";
 const ALLOWED_PACKAGES = new Set([
   "figma-developer-mcp",
   "@sentry/mcp-server",
-  "@linear/mcp-server",
   "@notionhq/notion-mcp-server",
-  "@vercel/mcp",
-  "@stripe/mcp",
-  "@nicholasoxford/posthog-mcp",
-  "@anthropic-ai/gitlab-mcp-server",
-  "@neondatabase/mcp-server-neon",
-  "@tursodatabase/turso-mcp",
-  "snyk-mcp-server",
-  "@launchdarkly/mcp-server",
   "mongodb-mcp-server",
-  "mcp-grafana",
-  "@redis/mcp-server",
-  "@anthropic-ai/upstash-mcp-server",
-  "sanity-mcp-server",
+  "@upstash/mcp-server",
 ]);
 
 export async function handler(event) {
