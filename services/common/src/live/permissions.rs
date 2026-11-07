@@ -17,7 +17,9 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
-use super::aws::{assume, AwsTarget, Session};
+use super::aws::{
+    assume_exact, install_read_role, install_target, own_session, AwsTarget, Session,
+};
 use crate::log_reader::{self, ABILITIES};
 
 /// What the simulator said about one action.
@@ -62,6 +64,14 @@ pub struct PermissionCheck {
     pub scp_blocks: Vec<String>,
     pub update_stack: UpdateStack,
     pub error: String,
+    /// The account is the self-hosted install's own: its read-only
+    /// permissions arrive with the install's version updates, never from a
+    /// stack a person launches.
+    #[serde(default)]
+    pub install_account: bool,
+    /// Checked on the install's own read role (its stack keeps it current).
+    #[serde(default)]
+    pub install_role: bool,
 }
 
 /// What the page shows for one account.
@@ -86,6 +96,8 @@ impl PermissionCheck {
             scp_blocks: Vec::new(),
             update_stack: UpdateStack::Unknown,
             error: String::new(),
+            install_account: false,
+            install_role: false,
         }
     }
 
@@ -131,6 +143,20 @@ impl PermissionCheck {
         }
         if self.missing.is_empty() {
             return None;
+        }
+        if self.install_account && self.scp_blocks.is_empty() {
+            // Nothing for a person to launch in AWS: the install's own stack
+            // grants these with its next version update.
+            return Some(Problem {
+                code: "install_update",
+                message: format!(
+                    "{} read-only permission{} of this release {} not on this install's read role yet.",
+                    self.missing.len(),
+                    if self.missing.len() == 1 { "" } else { "s" },
+                    if self.missing.len() == 1 { "is" } else { "are" },
+                ),
+                fix: "They arrive with this install's next version update (Settings, Version and updates). Nothing is needed in AWS.".into(),
+            });
         }
         if !self.scp_blocks.is_empty() {
             return Some(Problem {
@@ -225,7 +251,7 @@ impl PermissionCheck {
                 })
             })
             .collect();
-        let update = (self.status() == "update_needed")
+        let update = (self.status() == "update_needed" && !self.install_account)
             .then(|| log_reader::update_template_url(template_url))
             .flatten()
             .map(|t| {
@@ -250,6 +276,7 @@ impl PermissionCheck {
             "missing_abilities": self.missing_abilities(),
             "abilities": abilities,
             "update": update,
+            "install_account": self.install_account,
             "problem": self.problem(pressed),
         })
     }
@@ -484,14 +511,34 @@ pub async fn check(
     actor: &str,
     now: &str,
 ) -> PermissionCheck {
+    let own = install_read_role();
+    let install_account = super::aws::in_install_account(&target.role_arn, own.as_deref());
+    if let Some(t) = install_target(target, own.as_deref()) {
+        if let Some(session) = own_session(&t.region) {
+            // The install's own role, checked as the role it is.
+            let mut c = check_with(session, &t, now).await;
+            c.install_account = true;
+            c.install_role = true;
+            return c;
+        }
+    }
     let mut c = PermissionCheck::new(target, now);
-    let session = match assume(sts, target, actor).await {
+    let session = match assume_exact(sts, target, actor).await {
         Ok(s) => s,
         Err(e) => {
             c.error = e.message;
+            c.install_account = install_account;
             return c;
         }
     };
+    let mut c = check_with(session, target, now).await;
+    c.install_account = install_account;
+    c
+}
+
+/// [`check`] with a session on `target`'s role.
+async fn check_with(session: Session, target: &AwsTarget, now: &str) -> PermissionCheck {
+    let mut c = PermissionCheck::new(target, now);
     c.works = true;
     match simulate(&session, target).await {
         Ok(results) => apply_simulation(&mut c, &results),
@@ -545,6 +592,46 @@ mod tests {
         assert_eq!(c.status(), "up_to_date");
         assert!(c.problem(true).is_none());
         assert_eq!(c.method, "simulate");
+    }
+
+    #[test]
+    fn the_install_account_is_never_offered_an_update_stack() {
+        let mut c = checked();
+        c.install_account = true;
+        apply_simulation(&mut c, &[sim("ecs:DescribeTasks", false)]);
+        assert_eq!(c.status(), "update_needed");
+        let v = c.view(
+            true,
+            "https://example.com/launch/v1.2.3/coderhelm-log-reader.yaml",
+        );
+        assert!(v["update"].is_null(), "no stack to launch: {v}");
+        assert_eq!(v["install_account"], true);
+        let p = c.problem(true).expect("says what happens");
+        assert_eq!(p.code, "install_update");
+        assert!(p.fix.contains("next version update"));
+        assert!(!p.fix.contains("Update in AWS"));
+    }
+
+    #[test]
+    fn another_account_still_gets_the_update_stack() {
+        let mut c = checked();
+        apply_simulation(&mut c, &[sim("ecs:DescribeTasks", false)]);
+        let v = c.view(
+            false,
+            "https://example.com/launch/v1.2.3/coderhelm-log-reader.yaml",
+        );
+        assert_eq!(v["install_account"], false);
+        assert_eq!(v["status"], "update_needed");
+    }
+
+    #[test]
+    fn a_check_saved_before_the_install_fields_still_reads() {
+        let mut v = serde_json::to_value(checked()).unwrap();
+        let o = v.as_object_mut().unwrap();
+        o.remove("install_account");
+        o.remove("install_role");
+        let c: PermissionCheck = serde_json::from_value(v).unwrap();
+        assert!(!c.install_account && !c.install_role);
     }
 
     #[test]

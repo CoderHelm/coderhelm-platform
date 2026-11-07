@@ -849,7 +849,17 @@ pub async fn aws_check(
     Ok(Json(json!({
         "check": check,
         "missing": missing,
-        "update_url": if missing.is_empty() { None } else { update_stack_url(&t.region) },
+        // The install's own account gets these with its version updates.
+        "update_url": if missing.is_empty()
+            || common::live::aws::in_install_account(
+                &t.role_arn,
+                common::live::aws::install_read_role().as_deref(),
+            )
+        {
+            None
+        } else {
+            update_stack_url(&t.region)
+        },
         "stack_name": common::log_reader::update_stack_name(),
         "template_url": common::log_reader::update_template_url(&template),
     })))

@@ -176,6 +176,47 @@ test("fresh self-host config without a domain: nothing hosted-specific, one Clou
   assert.ok(json(t["coderhelm-prod-email"]).includes("Fn::ImportValue"), "email templates link to the web stack's URL");
 });
 
+test("self-host: the gateway and worker read the install's own account with this release's read-only permissions", () => {
+  const t = synth(selfHost());
+  // Every permission the services check a role against (services/common/src/log_reader.rs ABILITIES).
+  const rs = fs.readFileSync(path.join(INFRA, "..", "services", "common", "src", "log_reader.rs"), "utf8");
+  const abilities = rs.slice(rs.indexOf("pub const ABILITIES"), rs.indexOf("];", rs.indexOf("pub const ABILITIES")));
+  const needed = [...new Set([...abilities.matchAll(/"([a-z0-9-]+:[A-Za-z]+)"/g)].map((m) => m[1]))];
+  assert.ok(needed.length > 20, `${needed.length} actions`);
+  for (const [stack, fn] of [
+    ["coderhelm-prod-api", "coderhelm-prod-gateway"],
+    ["coderhelm-prod-worker", "coderhelm-prod-worker"],
+  ]) {
+    const policies = Object.values(t[stack].findResources("AWS::IAM::ManagedPolicy")).filter((p: any) =>
+      String(p.Properties.Description ?? "").includes("this install's own AWS account"),
+    ) as any[];
+    assert.equal(policies.length, 1, `${fn}: one read policy`);
+    const doc = JSON.stringify(policies[0].Properties.PolicyDocument);
+    for (const a of needed) assert.ok(doc.includes(`"${a}"`), `${fn} lacks ${a}`);
+    // Only reads: list, describe, get, query, never a write.
+    const actions: string[] = policies[0].Properties.PolicyDocument.Statement.flatMap((s: any) => ([] as string[]).concat(s.Action));
+    for (const a of actions) assert.match(a, /^[a-z0-9-]+:(List|Describe|Get|Filter|Start(Query)?$|Stop(Query)?$|BatchGet|Simulate|InvokeRestApi)/, a);
+    // It checks its own permissions on its own role only.
+    const sim = policies[0].Properties.PolicyDocument.Statement.find((s: any) => ([] as string[]).concat(s.Action).includes("iam:SimulatePrincipalPolicy"));
+    assert.ok(JSON.stringify(sim.Resource).includes("Fn::GetAtt"), "its own role's ARN");
+    // The function knows its role, so it reads its own account with it.
+    const env = envOf(t[stack], fn);
+    assert.ok(env.INSTALL_OWN_ROLE_ARN, `${fn} names its own role`);
+  }
+});
+
+test("hosted: no read policy for an own account and no own role", () => {
+  const cfg = loadConfigFile(path.join(INFRA, "config", "hosted.prod.json"), { CDK_DEFAULT_ACCOUNT: "654654210434" });
+  const t = synth(cfg, zoneContext("654654210434", "us-east-1", "coderhelm.com"));
+  for (const [stack, fn] of [
+    ["coderhelm-prod-api", "coderhelm-prod-gateway"],
+    ["coderhelm-prod-worker", "coderhelm-prod-worker"],
+  ]) {
+    assert.ok(!json(t[stack]).includes("this install's own AWS account"), stack);
+    assert.equal(envOf(t[stack], fn).INSTALL_OWN_ROLE_ARN, undefined, fn);
+  }
+});
+
 test("self-host with a domain in another region and Bedrock", () => {
   const cfg = selfHost({
     region: "eu-west-1",

@@ -150,7 +150,9 @@ export const LOG_ANALYZER_ROLE = "log-analyzer";
 /** Every tag value the boundary lets take on the read roles in this account. */
 export const READ_ROLE_CALLERS = [...RUNTIME_ROLES, LOG_ANALYZER_ROLE];
 /** STS actions on a role in this account: all denied, except sts:AssumeRole on the read roles above. */
-const ROLE_SESSION_ACTIONS = ["sts:AssumeRole", "sts:AssumeRoleWithWebIdentity", "sts:AssumeRoleWithSAML", "sts:TagSession", "sts:SetSourceIdentity"];
+const ROLE_SESSION_ACTIONS = ["sts:AssumeRole*", "sts:TagSession", "sts:SetSourceIdentity"];
+/** The same, without sts:AssumeRole itself (AssumeRoleWithWebIdentity and AssumeRoleWithSAML). */
+const OTHER_SESSION_ACTIONS = ["sts:AssumeRoleWith*", "sts:TagSession", "sts:SetSourceIdentity"];
 
 /** Role and policy writes: only with the boundary on the role. */
 export const ROLE_WRITES = [
@@ -196,6 +198,15 @@ const POLICY_MANAGE = [
  */
 export const BOUNDARY_SERVICES = [
   "acm:*",
+  // A self-hosted install reading its own account (own-account-read.ts):
+  // Airflow as a Viewer, ECS services and image manifests, read-only.
+  "airflow:Get*",
+  "airflow:List*",
+  "airflow:InvokeRestApi",
+  "ecs:Describe*",
+  "ecs:List*",
+  "ecr:BatchGetImage",
+  "ecr:List*",
   "apigateway:*",
   "bedrock:InvokeModel",
   "bedrock:InvokeModelWithResponseStream",
@@ -339,7 +350,7 @@ export function guardrails(n: AccessNames, otherBoundaries: string[] = []): Stat
       // On the read roles: sts:AssumeRole only, no other STS action.
       Sid: "ReadRolesHereAssumeOnly",
       Effect: "Deny",
-      Action: ROLE_SESSION_ACTIONS.filter((x) => x !== "sts:AssumeRole"),
+      Action: OTHER_SESSION_ACTIONS,
       Resource: a.ownReadRoles,
     },
     {
@@ -376,7 +387,7 @@ export function boundaryPolicy(n: AccessNames, otherBoundaries: string[] = []): 
     { Sid: "CoderHelmServices", Effect: "Allow", Action: BOUNDARY_SERVICES, Resource: "*" },
     { Sid: "InstallRoleWrites", Effect: "Allow", Action: ROLE_WRITES, Resource: a.role, Condition: { StringEquals: { "iam:PermissionsBoundary": n.boundaryArn } } },
     // The same calls as ROLE_MANAGE and POLICY_MANAGE, shorter (the boundary must fit IAM's 6,144 characters).
-    { Sid: "InstallRoles", Effect: "Allow", Action: ["iam:Get*", "iam:List*", "iam:DeleteRole", "iam:UpdateRole*", "iam:UpdateAssumeRolePolicy", "iam:TagRole", "iam:UntagRole", "iam:PassRole"], Resource: a.role },
+    { Sid: "InstallRoles", Effect: "Allow", Action: ["iam:Get*", "iam:List*", "iam:Simulate*", "iam:DeleteRole", "iam:UpdateRole*", "iam:UpdateAssumeRolePolicy", "iam:TagRole", "iam:UntagRole", "iam:PassRole"], Resource: a.role },
     { Sid: "InstallPolicies", Effect: "Allow", Action: ["iam:CreatePolicy*", "iam:DeletePolicy*", "iam:Get*", "iam:List*", "iam:TagPolicy", "iam:UntagPolicy"], Resource: a.policy },
     ...guardrails(n, otherBoundaries),
   ]);

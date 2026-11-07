@@ -249,6 +249,24 @@ pub fn aws_missing(a: &AwsAccount) -> Vec<&'static str> {
     out
 }
 
+/// The account is the self-hosted install's own. Its read-only permissions
+/// arrive with the install's version updates, so no update stack is offered.
+pub fn install_account(a: &AwsAccount) -> bool {
+    a.permissions.as_ref().is_some_and(|p| p.install_account)
+        || common::live::aws::in_install_account(
+            &a.role_arn,
+            common::live::aws::install_read_role().as_deref(),
+        )
+}
+
+/// The one-click update stack's link, when the role lacks something and a
+/// person can add it (never in the install's own account).
+fn update_stack_link(a: &AwsAccount) -> Option<String> {
+    (!install_account(a) && (!aws_missing(a).is_empty() || needs_update(a)))
+        .then(|| super::connectors::update_stack_url(&a.region))
+        .flatten()
+}
+
 /// The last live check found permissions of this release missing.
 pub fn needs_update(a: &AwsAccount) -> bool {
     a.permissions
@@ -511,11 +529,6 @@ pub async fn list(
     ));
 
     // AWS accounts: one card each (or one to connect the first).
-    let stack_url = |a: &AwsAccount| {
-        (!aws_missing(a).is_empty() || needs_update(a))
-            .then(|| super::connectors::update_stack_url(&a.region))
-            .flatten()
-    };
     if accounts.is_empty() {
         items.push(card(
             "aws",
@@ -530,7 +543,8 @@ pub async fn list(
         for a in &accounts {
             let mut detail = a.public_json();
             detail["missing"] = json!(aws_missing(a));
-            detail["update_url"] = json!(stack_url(a));
+            detail["update_url"] = json!(update_stack_link(a));
+            detail["install_account"] = json!(install_account(a));
             detail["stack_name"] = json!(common::log_reader::update_stack_name());
             items.push(card(
                 &format!("aws-{}", a.account),
@@ -731,9 +745,8 @@ async fn load_account(
 fn account_reply(a: &AwsAccount) -> Value {
     let mut detail = a.public_json();
     detail["missing"] = json!(aws_missing(a));
-    detail["update_url"] = json!((!aws_missing(a).is_empty() || needs_update(a))
-        .then(|| super::connectors::update_stack_url(&a.region))
-        .flatten());
+    detail["update_url"] = json!(update_stack_link(a));
+    detail["install_account"] = json!(install_account(a));
     detail["stack_name"] = json!(common::log_reader::update_stack_name());
     let st = aws_state(a);
     json!({ "account": detail, "status": st.status, "reason": st.reason, "last_check": a.abilities.checked_at })

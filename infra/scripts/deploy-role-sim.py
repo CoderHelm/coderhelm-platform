@@ -321,6 +321,10 @@ def targets(st, lid, r, action):
         if action in ("iam:AttachRolePolicy", "iam:DetachRolePolicy"):
             return [(f"arn:aws:iam::{ACCT}:role/{st.resolve(x)}", {}) for x in p.get("Roles", [])]
         return [(arn, {})]
+    # A bulk operation is its own resource (bulk-operation/<id>), described only
+    # while one runs; the install's tables never start one (no import source).
+    if action == "dynamodb:DescribeBulkOperation" and not p.get("ImportSourceSpecification"):
+        return [("UNUSED:no bulk operation", {})]
     if svc == "iam" and ty == "AWS::SNS::Topic":
         return [("UNUSED:no delivery status logging role", {})]
     if svc == "sns" and action in ("sns:Subscribe", "sns:Unsubscribe", "sns:ListSubscriptionsByTopic") and not p.get("Subscription"):

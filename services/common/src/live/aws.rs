@@ -557,14 +557,85 @@ fn session_name(actor: &str) -> String {
     crate::truncate_str(&name, 64).to_string()
 }
 
+/// On a self-hosted install, the gateway's and worker's own role
+/// (infra/lib/own-account-read.ts): its stack gives it this release's
+/// read-only permissions in the install's own account.
+pub const OWN_ROLE_ENV: &str = "INSTALL_OWN_ROLE_ARN";
+
+/// The function's own role, when its stack gave it the read-only
+/// permissions for the install's own account.
+pub fn install_read_role() -> Option<String> {
+    std::env::var(OWN_ROLE_ENV)
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+fn account_of(role_arn: &str) -> &str {
+    role_arn.split(':').nth(4).unwrap_or("")
+}
+
+/// `role_arn` is in the same account as the install's own role `own`.
+pub fn in_install_account(role_arn: &str, own: Option<&str>) -> bool {
+    own.is_some_and(|o| {
+        let a = account_of(o);
+        a.len() == 12 && a == account_of(role_arn)
+    })
+}
+
+/// What to read through instead of `target`, when `target` is the log
+/// reader a person created in the install's own account: the install's own
+/// role, whose permissions arrive with each version update. `None` for any
+/// other role or account (the data-source role, another account, the
+/// hosted deployment). Connecting still proves the person's role with the
+/// team's private ID; this only changes how a connected account is read.
+pub fn install_target(target: &AwsTarget, own: Option<&str>) -> Option<AwsTarget> {
+    let own = own?;
+    let name = target.role_arn.rsplit('/').next().unwrap_or("");
+    (name == LOG_READER_ROLE && in_install_account(&target.role_arn, Some(own))).then(|| {
+        AwsTarget {
+            role_arn: own.to_string(),
+            ..target.clone()
+        }
+    })
+}
+
+/// A session on the function's own role (its environment's credentials),
+/// in `region`. `None` outside Lambda.
+pub fn own_session(region: &str) -> Option<Session> {
+    let get = |k: &str| std::env::var(k).ok().filter(|v| !v.is_empty());
+    Some(Session {
+        access_key_id: get("AWS_ACCESS_KEY_ID")?,
+        secret_access_key: get("AWS_SECRET_ACCESS_KEY")?,
+        session_token: get("AWS_SESSION_TOKEN").unwrap_or_default(),
+        region: region.to_string(),
+    })
+}
+
 /// Takes on a team's role. `actor` names the session in the team's AWS
-/// records (`reviewer`, `planner`, a person's email).
+/// records (`reviewer`, `planner`, a person's email). In a self-hosted
+/// install's own account the log reader is read with the install's own role
+/// ([`install_target`]).
 pub async fn assume(
     sts: &aws_sdk_sts::Client,
     target: &AwsTarget,
     actor: &str,
 ) -> Result<Session, StepError> {
     check_target(target)?;
+    if install_target(target, install_read_role().as_deref()).is_some() {
+        if let Some(s) = own_session(&target.region) {
+            return Ok(s);
+        }
+    }
+    assume_exact(sts, target, actor).await
+}
+
+/// Takes on exactly `target`'s role (already checked by the caller).
+pub async fn assume_exact(
+    sts: &aws_sdk_sts::Client,
+    target: &AwsTarget,
+    actor: &str,
+) -> Result<Session, StepError> {
     let external_id = target.external_id.as_str();
     if external_id.is_empty() {
         return Err(StepError::new(
@@ -680,6 +751,48 @@ mod tests {
     use super::*;
 
     const ROLE: &str = "arn:aws:iam::123456789012:role/CoderhelmReadOnly";
+
+    const OWN: &str = "arn:aws:iam::111122223333:role/coderhelm-prod-gateway-1a2b3c4d";
+
+    fn reader(account: &str) -> AwsTarget {
+        AwsTarget {
+            role_arn: format!("arn:aws:iam::{account}:role/{LOG_READER_ROLE}"),
+            external_id: "team-id".into(),
+            region: "us-east-1".into(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn the_install_account_reads_with_the_install_role() {
+        let t = install_target(&reader("111122223333"), Some(OWN)).expect("swapped");
+        assert_eq!(t.role_arn, OWN);
+        // The team's private ID and region carry over.
+        assert_eq!(t.external_id, "team-id");
+        assert_eq!(t.region, "us-east-1");
+    }
+
+    #[test]
+    fn other_accounts_roles_and_installs_keep_their_role() {
+        // Another account keeps the person's log reader and its update flow.
+        assert!(install_target(&reader("444455556666"), Some(OWN)).is_none());
+        // The data-source role is never swapped.
+        let data = AwsTarget {
+            role_arn: "arn:aws:iam::111122223333:role/CoderhelmReadOnly".into(),
+            ..reader("111122223333")
+        };
+        assert!(install_target(&data, Some(OWN)).is_none());
+        // No install role (the hosted deployment, or an install not updated yet).
+        assert!(install_target(&reader("111122223333"), None).is_none());
+        assert!(!in_install_account(
+            "arn:aws:iam::111122223333:role/x",
+            None
+        ));
+        assert!(!in_install_account(
+            "arn:aws:iam::111122223333:role/x",
+            Some("not-an-arn")
+        ));
+    }
 
     #[test]
     fn log_groups_must_be_names_or_real_prefixes() {
