@@ -4,6 +4,9 @@
 //! calibration, the prompt variants, examples, coder lessons, pushback
 //! judgments, the stop judge's outcome log) is shown with the time of its
 //! last signal, its count over the window, and what should have fed it.
+//! A count and what should have fed it are always in the same unit (pull
+//! requests, for the PR and review loops), and the count is a part of it, so
+//! "3 of 5" never reads as "14 of 6".
 //! A loop that should have fired and stayed quiet (PRs merged but none
 //! scored, reviews posted but no comment outcome) is `quiet`: the page turns
 //! red, so a broken loop is seen in days, not found in an audit.
@@ -67,6 +70,31 @@ pub struct ClosedPr {
     pub closed_at: String,
 }
 
+/// One review CoderHelm posted, from its record's key
+/// (`REVIEW#{owner}/{repo}#{pr:06}#{created_at}`).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Review {
+    pub repo: String,
+    pub pr: u64,
+    pub created_at: String,
+}
+
+impl Review {
+    /// From a review record's sort key; None for any other key.
+    pub fn of_sk(sk: &str) -> Option<Self> {
+        let rest = sk.strip_prefix("REVIEW#")?;
+        let mut parts = rest.rsplitn(3, '#');
+        let created_at = parts.next()?.to_string();
+        let pr: u64 = parts.next()?.parse().ok()?;
+        let repo = parts.next()?.to_string();
+        (!repo.is_empty() && !created_at.is_empty()).then_some(Self {
+            repo,
+            pr,
+            created_at,
+        })
+    }
+}
+
 /// One prompt variant's pull counter.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct ArmPull {
@@ -90,8 +118,8 @@ pub struct Pending {
 pub struct Inputs<'a> {
     pub events: &'a [RewardEvent],
     pub closed_prs: &'a [ClosedPr],
-    /// When CoderHelm posted each review in the window.
-    pub reviews: &'a [String],
+    /// The reviews CoderHelm posted in the window.
+    pub reviews: &'a [Review],
     /// Each example's last use.
     pub exemplar_last_used: &'a [String],
     pub arms: &'a [ArmPull],
@@ -128,7 +156,14 @@ fn within(t: &str, since: DateTime<Utc>) -> bool {
 pub fn loops(i: &Inputs<'_>, now: DateTime<Utc>) -> Vec<Loop> {
     let since = now - chrono::Duration::days(WINDOW_DAYS);
     let events: Vec<&RewardEvent> = i.events.iter().filter(|e| within(&e.at, since)).collect();
-    let reviews: Vec<&String> = i.reviews.iter().filter(|t| within(t, since)).collect();
+    let reviews: Vec<&Review> = i
+        .reviews
+        .iter()
+        .filter(|r| within(&r.created_at, since))
+        .collect();
+    // The unit of the review loops: a pull request CoderHelm reviewed.
+    let reviewed: BTreeSet<(String, u64)> =
+        reviews.iter().map(|r| (r.repo.clone(), r.pr)).collect();
     let mut out = Vec::new();
 
     // 1. Outcomes of CoderHelm's own PRs.
@@ -173,12 +208,14 @@ pub fn loops(i: &Inputs<'_>, now: DateTime<Utc>) -> Vec<Loop> {
                 .filter(|e| e.agent == AGENT_CODER)
                 .map(|e| e.at.as_str()),
         ),
-        count: scored.len() as u64,
+        // Scored among the due ones: a PR scored inside the grace, or one
+        // that closed before the window, is not part of "of N".
+        count: due.intersection(&scored).count() as u64,
         expected: Some(due.len() as u64),
         detail: if missing.is_empty() {
             format!(
                 "{} of {} pull requests that closed were scored",
-                due.len().min(scored.len()),
+                due.intersection(&scored).count(),
                 due.len()
             )
         } else {
@@ -201,10 +238,15 @@ pub fn loops(i: &Inputs<'_>, now: DateTime<Utc>) -> Vec<Loop> {
         .filter(|e| e.kind.is_some_and(RewardKind::is_finding))
         .collect();
     let by_kind = |k: RewardKind| findings.iter().filter(|e| e.kind == Some(k)).count();
+    // Pull requests: reviewed ones, and those of them with a comment outcome.
+    let with_outcome = reviewed
+        .iter()
+        .filter(|(repo, pr)| findings.iter().any(|e| &e.repo == repo && e.pr == *pr))
+        .count();
     out.push(Loop {
         key: "review_outcomes",
         label: "Outcomes of review comments",
-        state: if reviews.is_empty() {
+        state: if reviewed.is_empty() {
             State::Idle
         } else if findings.is_empty() && reviews.len() >= MIN_REVIEWS_FOR_OUTCOMES {
             State::Quiet
@@ -212,14 +254,14 @@ pub fn loops(i: &Inputs<'_>, now: DateTime<Utc>) -> Vec<Loop> {
             State::Ok
         },
         last_signal_at: newest(findings.iter().map(|e| e.at.as_str())),
-        count: findings.len() as u64,
-        expected: Some(reviews.len() as u64),
+        count: with_outcome as u64,
+        expected: Some(reviewed.len() as u64),
         detail: format!(
-            "{} acted on, {} dismissed, {} left open, from {} review(s)",
+            "{with_outcome} of {} reviewed pull request(s) have a comment outcome; comments: {} acted on, {} dismissed, {} left open",
+            reviewed.len(),
             by_kind(RewardKind::FindingAccepted),
             by_kind(RewardKind::FindingDismissed),
             by_kind(RewardKind::FindingIgnored),
-            reviews.len()
         ),
     });
 
@@ -258,29 +300,38 @@ pub fn loops(i: &Inputs<'_>, now: DateTime<Utc>) -> Vec<Loop> {
     });
 
     // 4 and 5. Prompt variants, per agent.
-    for (agent, key, label, expected) in [
+    // Unit: pull requests (reviewed, or CoderHelm's that closed), and those
+    // of them with an outcome credited to a variant.
+    let closed: BTreeSet<(String, u64)> = i
+        .closed_prs
+        .iter()
+        .filter(|p| within(&p.closed_at, since))
+        .map(|p| (p.repo.clone(), p.pr))
+        .collect();
+    for (agent, key, label, prs) in [
         (
             AGENT_REVIEWER,
             "reviewer_variants",
             "Reviewer prompt variants",
-            reviews.len(),
+            &reviewed,
         ),
         (
             AGENT_CODER,
             "coder_variants",
             "Coder prompt variants",
-            i.closed_prs
-                .iter()
-                .filter(|p| within(&p.closed_at, since))
-                .count(),
+            &closed,
         ),
     ] {
+        let expected = prs.len();
         let arms: Vec<&ArmPull> = i.arms.iter().filter(|a| a.agent == agent).collect();
         let last = newest(arms.iter().map(|a| a.last_pull_at.as_str()));
-        let credited = events
+        let credited_prs: BTreeSet<(String, u64)> = events
             .iter()
             .filter(|e| e.agent == agent && !e.variant.is_empty())
-            .count();
+            .map(|e| (e.repo.clone(), e.pr))
+            .collect();
+        let credited = credited_prs.len();
+        let credited_here = prs.intersection(&credited_prs).count();
         let pulls: u64 = arms.iter().map(|a| a.pulls).sum();
         let recent = within(&last, since);
         // The coder's variants are new: PRs of runs started before them
@@ -297,10 +348,10 @@ pub fn loops(i: &Inputs<'_>, now: DateTime<Utc>) -> Vec<Loop> {
                 State::Quiet
             },
             last_signal_at: last,
-            count: credited as u64,
+            count: credited_here as u64,
             expected: Some(expected as u64),
             detail: format!(
-                "{} arm(s), {pulls} pull(s) in all; {credited} outcome(s) credited to a variant this window",
+                "{credited_here} of {expected} pull request(s) have an outcome credited to a variant; {} arm(s), {pulls} pull(s) in all",
                 arms.len()
             ),
         });
@@ -356,8 +407,10 @@ pub fn loops(i: &Inputs<'_>, now: DateTime<Utc>) -> Vec<Loop> {
             State::Ok
         },
         last_signal_at: newest(i.coder_lessons_seen.iter().map(String::as_str)),
+        // Lessons and areas are different units (one lesson can be
+        // reinforced many times), so there is no "of N" here.
         count: lessons_7d as u64,
-        expected: Some(backed_areas as u64),
+        expected: None,
         detail: format!(
             "{} setback(s) in {} area(s); {backed_areas} area(s) with enough evidence for a lesson; {lessons_7d} lesson(s) written or reinforced",
             by_area.values().map(Vec::len).sum::<usize>(),
@@ -523,7 +576,9 @@ mod tests {
 
     #[test]
     fn reviews_with_no_comment_outcome_are_quiet_and_outcomes_count() {
-        let reviews: Vec<String> = (0..6).map(|_| "2026-11-05T00:00:00Z".to_string()).collect();
+        let reviews: Vec<Review> = (1..=6)
+            .map(|pr| review(pr, "2026-11-05T00:00:00Z"))
+            .collect();
         let i = Inputs {
             reviews: &reviews,
             ..Default::default()
@@ -590,7 +645,15 @@ mod tests {
         let l = loops(&i, now());
         let r = by_key(&l, "review_outcomes");
         assert_eq!(r.state, State::Ok);
-        assert!(r.detail.starts_with("1 acted on, 0 dismissed, 1 left open"));
+        // Six reviewed pull requests, one with comment outcomes (two comments).
+        assert_eq!((r.count, r.expected), (1, Some(6)));
+        assert!(
+            r.detail.starts_with("1 of 6 reviewed pull request(s) have a comment outcome; comments: 1 acted on, 0 dismissed, 1 left open"),
+            "{}",
+            r.detail
+        );
+        let v = by_key(&l, "reviewer_variants");
+        assert_eq!((v.count, v.expected), (1, Some(6)));
         assert_eq!(r.last_signal_at, "2026-11-05T02:00:00Z");
         assert_eq!(by_key(&l, "reviewer_variants").state, State::Ok);
         assert_eq!(by_key(&l, "calibration").state, State::Ok);
@@ -598,6 +661,103 @@ mod tests {
         let l = loops(&Inputs::default(), now());
         assert!(l.iter().all(|x| x.state == State::Idle), "{l:?}");
         assert_eq!(build(&Inputs::default(), now())["state"], "ok");
+    }
+
+    fn review(pr: u64, at: &str) -> Review {
+        Review {
+            repo: "acme/web".into(),
+            pr,
+            created_at: at.into(),
+        }
+    }
+
+    #[test]
+    fn a_review_is_read_from_its_record_key() {
+        assert_eq!(
+            Review::of_sk("REVIEW#acme/web#000042#2026-11-05T00:00:00Z"),
+            Some(review(42, "2026-11-05T00:00:00Z"))
+        );
+        assert_eq!(Review::of_sk("REVIEW#acme/web#x#2026"), None);
+        assert_eq!(Review::of_sk("LESSON#acme/web#000042#2026"), None);
+    }
+
+    /// Production: the page read "14 of 6 this week": comment outcomes
+    /// against reviews. A count and what should have fed it share one unit,
+    /// so the count never passes it, however many comments, credits or
+    /// re-scores one pull request gets.
+    #[test]
+    fn a_count_never_exceeds_what_should_have_fed_it() {
+        let mut events = Vec::new();
+        for pr in 1..=3 {
+            for k in 0..5 {
+                let at = format!("2026-11-05T0{k}:00:00Z");
+                let mut f = ev(RewardKind::FindingAccepted, AGENT_REVIEWER, pr, &at);
+                f.variant = "focused".into();
+                events.push(f);
+                let mut c = ev(RewardKind::PrMergedUnchanged, AGENT_CODER, pr, &at);
+                c.variant = "read_first".into();
+                events.push(c);
+                events.push(ev(RewardKind::TimeToMerge, AGENT_CODER, pr, &at));
+            }
+        }
+        // Outcomes for PRs outside the reviewed and closed sets, too.
+        events.push(ev(
+            RewardKind::FindingDismissed,
+            AGENT_REVIEWER,
+            99,
+            "2026-11-05T00:00:00Z",
+        ));
+        events.push(ev(
+            RewardKind::PrMergedEdited,
+            AGENT_CODER,
+            98,
+            "2026-11-05T00:00:00Z",
+        ));
+        // Several reviews of the same two pull requests.
+        let reviews: Vec<Review> = [1, 1, 1, 2, 2, 2, 2]
+            .iter()
+            .map(|&pr| review(pr, "2026-11-04T00:00:00Z"))
+            .collect();
+        let closed: Vec<ClosedPr> = [1, 2]
+            .iter()
+            .map(|&pr| ClosedPr {
+                repo: "acme/web".into(),
+                pr,
+                closed_at: "2026-11-04T00:00:00Z".into(),
+            })
+            .collect();
+        let arms = vec![
+            ArmPull {
+                agent: AGENT_REVIEWER.into(),
+                pulls: 40,
+                last_pull_at: "2026-11-05T00:00:00Z".into(),
+            },
+            ArmPull {
+                agent: AGENT_CODER.into(),
+                pulls: 40,
+                last_pull_at: "2026-11-05T00:00:00Z".into(),
+            },
+        ];
+        let seen: Vec<String> = (0..9).map(|_| "2026-11-05T00:00:00Z".into()).collect();
+        let i = Inputs {
+            events: &events,
+            closed_prs: &closed,
+            reviews: &reviews,
+            arms: &arms,
+            coder_lessons_seen: &seen,
+            ..Default::default()
+        };
+        let l = loops(&i, now());
+        for x in &l {
+            if let Some(e) = x.expected {
+                assert!(x.count <= e, "{}: {} of {}", x.key, x.count, e);
+            }
+        }
+        assert_eq!(by_key(&l, "review_outcomes").expected, Some(2));
+        assert_eq!(by_key(&l, "review_outcomes").count, 2);
+        assert_eq!(by_key(&l, "pr_outcomes").count, 2);
+        assert_eq!(by_key(&l, "coder_variants").count, 2);
+        assert_eq!(by_key(&l, "coder_lessons").expected, None);
     }
 
     #[test]
