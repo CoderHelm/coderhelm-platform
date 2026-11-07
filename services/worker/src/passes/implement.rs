@@ -1058,6 +1058,8 @@ pub async fn run(
         sources.extend(o.connected());
         lookups.extend(o.lookups());
     }
+    // Page checks the coder couldn't make: what it could not confirm.
+    lookups.extend(web.lookups());
     // Which checks ran and what they came to, as recorded by run_checks, and
     // which ones the repo's CI runs on the PR: facts the proof check reads
     // instead of the coder's account.
