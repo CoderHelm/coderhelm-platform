@@ -123,7 +123,7 @@ fn planned_work_left_opens_a_draft_then_coderhelm_finishes_it() {
     assert!(gh.pr(21).draft);
     assert_eq!(
         draft_hold(&gh.pr(21).body, "Add the card block", false),
-        Some("planned work not done is listed in the description")
+        Some("Planned work is not done yet (listed under Not finished)".to_string())
     );
     assert!(gh
         .pr(21)

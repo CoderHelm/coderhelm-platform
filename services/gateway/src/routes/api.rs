@@ -929,6 +929,68 @@ pub struct RunWaitingOn {
     pub since: Option<String>,
 }
 
+/// Why a finished run's pull request is still a draft, with what to do
+/// about each reason. A finished run never leaves its pull request a draft
+/// without one of these.
+#[derive(serde::Serialize, utoipa::ToSchema)]
+pub struct RunDraftHold {
+    /// `held` (a person must deal with a reason; the run is `needs_input`),
+    /// `waiting` (CoderHelm waits for something that settles by itself and
+    /// checks again), or `failed` (CoderHelm decided it was ready but GitHub
+    /// refused every try to mark it).
+    #[schema(example = "held")]
+    pub kind: String,
+    /// The run page's line, ready to show.
+    #[schema(
+        example = "Finished, but pull request #318 stays a draft: Security items are open under Open items. Fix them on this branch (CoderHelm checks again on the next push), or delete each security line once a person has checked it."
+    )]
+    pub summary: String,
+    /// Each reason, with what to do about it.
+    pub reasons: Vec<RunDraftHoldReason>,
+    /// The pull request.
+    #[schema(example = 318)]
+    pub pr_number: u64,
+    /// When it was first held for these reasons (RFC 3339).
+    #[schema(example = "2026-11-06T22:17:25Z")]
+    pub since: Option<String>,
+}
+
+/// One reason a pull request stays a draft.
+#[derive(serde::Serialize, utoipa::ToSchema)]
+pub struct RunDraftHoldReason {
+    /// What holds it.
+    #[schema(example = "Security items are open under Open items")]
+    pub what: String,
+    /// What to do about it.
+    #[schema(
+        example = "Fix them on this branch (CoderHelm checks again on the next push), or delete each security line once a person has checked it."
+    )]
+    pub todo: String,
+}
+
+fn draft_hold_of(item: &run_search::Item) -> Option<RunDraftHold> {
+    let h = common::draft_hold::DraftHold::of_item(item)?;
+    Some(RunDraftHold {
+        kind: match h.kind {
+            common::draft_hold::Kind::Held => "held",
+            common::draft_hold::Kind::Waiting => "waiting",
+            common::draft_hold::Kind::Failed => "failed",
+        }
+        .to_string(),
+        summary: h.summary(),
+        reasons: h
+            .reasons
+            .iter()
+            .map(|r| RunDraftHoldReason {
+                what: r.what.clone(),
+                todo: r.todo.clone(),
+            })
+            .collect(),
+        pr_number: h.pr_number,
+        since: Some(h.since).filter(|s| !s.is_empty()),
+    })
+}
+
 fn waiting_on_of(item: &run_search::Item) -> Option<RunWaitingOn> {
     let w = common::run_wait::WaitingOn::of_item(item)?;
     Some(RunWaitingOn {
@@ -1181,6 +1243,12 @@ pub struct Run {
     /// request). A run never waits on a person for nothing.
     #[schema(example = json!(null))]
     pub waiting_on: Option<RunWaitingOn>,
+    /// Set when the run finished and its pull request is still a draft: why,
+    /// and what to do about each reason. A held run is also `needs_input`,
+    /// with `waiting_on` naming the pull request. Null once the pull request
+    /// is ready or closed.
+    #[schema(example = json!(null))]
+    pub draft_hold: Option<RunDraftHold>,
 }
 
 /// The public values a run's code generator was missing, as the API shows them.
@@ -1721,6 +1789,7 @@ fn run_of(
         } else {
             None
         },
+        draft_hold: draft_hold_of(item),
     }
 }
 

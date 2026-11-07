@@ -2384,8 +2384,17 @@ pub fn refusals(files: &[(String, String, String)], g: &GateRecord) -> Vec<Strin
 pub enum Hold {
     /// Not a test-fix pull request, or everything passed.
     Go,
-    /// Stays a draft, for this reason.
+    /// Stays a draft while this settles by itself (checks running, the
+    /// repeat run not passed yet): the check runs again in ten minutes.
     Wait(String),
+    /// Stays a draft: the diff adds what the failing-test rules refuse (a
+    /// loosened test, a wait with no timing failure behind it). A "fix" like
+    /// that can hide the bug, so a person decides; the check still runs
+    /// again, so a pushed fix clears it.
+    Refused(String),
+    /// Waited through every recheck (about twelve hours) and it still
+    /// holds, for this reason: nothing runs again by itself.
+    GaveUp(String),
 }
 
 /// Whether the repeat run on CI has passed on `sha`: `Some(true)` passed,
@@ -2409,7 +2418,7 @@ pub fn decide(
     repeat_ok: Option<bool>,
 ) -> Hold {
     if !refused.is_empty() {
-        return Hold::Wait(format!(
+        return Hold::Refused(format!(
             "it adds what the failing-test rules refuse: {}",
             refused.join("; ")
         ));
@@ -2570,8 +2579,8 @@ pub async fn ready_gate(
         }
     }
 
-    let hold = decide(&refused, &standing, repeat_ok);
-    if let Hold::Wait(why) = &hold {
+    let mut hold = decide(&refused, &standing, repeat_ok);
+    if let Hold::Wait(why) | Hold::Refused(why) = hold.clone() {
         let no_repeat = repeat_ok.is_none() && g.ci_workflow.is_empty();
         if g.noted != sha {
             g.noted = sha.clone();
@@ -2604,6 +2613,14 @@ pub async fn ready_gate(
                 pr_number,
             )
             .await;
+        } else {
+            // No recheck is left: the hold is final until a person acts,
+            // and `ready` records it on the run as one.
+            hold = Hold::GaveUp(format!(
+                "{why} (checked every {} minutes for about {} hours)",
+                RECHECK_SECS / 60,
+                MAX_POLLS * RECHECK_SECS as u32 / 3600
+            ));
         }
         info!(pr_number, reason = %why, polls = g.polls, "Test fix stays a draft");
     }
@@ -2626,6 +2643,7 @@ async fn recheck_later(
         repo_owner: owner.to_string(),
         repo_name: repo.to_string(),
         pr_number: pr,
+        ..Default::default()
     });
     let Ok(body) = serde_json::to_string(&msg) else {
         return;
@@ -3129,7 +3147,7 @@ mod tests {
             what: "waitForTimeout".into(),
         };
         assert!(
-            matches!(decide(&[finding.sentence()], &green, Some(true)), Hold::Wait(w) if w.contains("refuse"))
+            matches!(decide(&[finding.sentence()], &green, Some(true)), Hold::Refused(w) if w.contains("refuse"))
         );
     }
 

@@ -132,10 +132,14 @@ pub enum Section {
     /// everything: a reader never ships over an objection without seeing it
     /// (see [`objections_section`]).
     Objections,
+    /// Why the pull request is still a draft, and what to do about it, at
+    /// the very top (see `ready::status_section`): a finished run never
+    /// leaves its pull request a draft without saying why here.
+    DraftStatus,
 }
 
 impl Section {
-    const ALL: [Section; 9] = [
+    const ALL: [Section; 10] = [
         Section::Links,
         Section::Mirrors,
         Section::MergeOrder,
@@ -145,6 +149,7 @@ impl Section {
         Section::Unfinished,
         Section::OpenFindings,
         Section::Objections,
+        Section::DraftStatus,
     ];
 
     /// Its start and end markers.
@@ -168,6 +173,7 @@ impl Section {
             Section::Unfinished => (super::proof::UNFINISHED_START, super::proof::UNFINISHED_END),
             Section::OpenFindings => (super::own_review::START, super::own_review::END),
             Section::Objections => (OBJECTIONS_START, OBJECTIONS_END),
+            Section::DraftStatus => (super::ready::STATUS_START, super::ready::STATUS_END),
         }
     }
 }
@@ -204,6 +210,7 @@ pub struct Owned {
     pub unfinished: String,
     pub open_findings: String,
     pub objections: String,
+    pub draft_status: String,
 }
 
 impl Owned {
@@ -218,6 +225,7 @@ impl Owned {
             Section::Unfinished => &mut self.unfinished,
             Section::OpenFindings => &mut self.open_findings,
             Section::Objections => &mut self.objections,
+            Section::DraftStatus => &mut self.draft_status,
         }
     }
 
@@ -396,6 +404,16 @@ pub fn assemble(rest: &str, owned: &Owned) -> String {
             objections.to_string()
         } else {
             format!("{objections}\n\n{body}")
+        };
+    }
+    // Why it is still a draft goes first of all: the reader sees it before
+    // anything else.
+    let draft_status = owned.draft_status.trim();
+    if !draft_status.is_empty() {
+        body = if body.is_empty() {
+            draft_status.to_string()
+        } else {
+            format!("{draft_status}\n\n{body}")
         };
     }
     format!("{body}{footer}")
@@ -1182,6 +1200,7 @@ mod tests {
             unfinished: String::new(),
             open_findings: String::new(),
             objections: String::new(),
+            draft_status: String::new(),
             links: String::new(),
             mirrors: mirrors_section(&[Mirror {
                 path: "envs/prod/users.tf".into(),

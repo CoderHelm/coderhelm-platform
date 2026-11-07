@@ -1333,15 +1333,27 @@ pub fn holds_security_items(body: &str) -> bool {
 /// gone when `items` is empty), other Open items kept as they are. `None`
 /// when there is nothing to change.
 pub fn with_security_items(body: &str, items: &[Finding]) -> Option<String> {
+    with_marked_items(body, SECURITY_MARK, items.iter().map(item_line).collect())
+}
+
+/// On an Open item a check left open when CoderHelm marked the pull request
+/// ready anyway (`ready`): CoderHelm's own sandbox or checklist found it, CI
+/// is green and the review approved, so it is for a person to look at, not a
+/// reason to keep the draft.
+pub const READY_OPEN_MARK: &str = "<!-- coderhelm:open-when-ready -->";
+
+/// The description with the Open items that carry `mark` replaced by `new`
+/// (each line already carrying the mark; none when empty), other Open items
+/// kept as they are. `None` when there is nothing to change.
+pub fn with_marked_items(body: &str, mark: &str, new: Vec<String>) -> Option<String> {
     let (mut owned, rest) = super::completeness::take_owned(body);
-    let new: Vec<String> = items.iter().map(item_line).collect();
-    if new.is_empty() && !owned.open_items.contains(SECURITY_MARK) {
+    if new.is_empty() && !owned.open_items.contains(mark) {
         return None;
     }
     let kept: Vec<&str> = owned
         .open_items
         .lines()
-        .filter(|l| !l.contains(SECURITY_MARK))
+        .filter(|l| !l.contains(mark))
         .collect();
     let others: Vec<&str> = kept
         .iter()
