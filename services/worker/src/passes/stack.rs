@@ -580,6 +580,42 @@ pub async fn for_ticket(
     Some(d)
 }
 
+/// Whether a step of a run looks for the base an earlier step stacked it
+/// on: only a later step of the same run whose message still names a base
+/// other than the repository's default.
+pub fn keeps_base(same_run: bool, incoming: &str, default: &str) -> bool {
+    same_run && super::plan_coverage::stacked_base(incoming, default)
+}
+
+/// A later step of the same run keeps the base an earlier step stacked it
+/// on, while that base is still an open pull request's branch in this
+/// repository. Every step used to start again from the default branch: the
+/// branch, already built on the other pull request, then read as copying
+/// its commits, was rebuilt and force-pushed in every step, and the plan
+/// check measured against a base that flipped between steps.
+pub async fn kept(
+    github: &GitHubClient,
+    owner: &str,
+    repo: &str,
+    base: &str,
+) -> Option<Dependency> {
+    let open = github.list_open_pulls(owner, repo).await.ok()?;
+    let full = format!("{owner}/{repo}").to_ascii_lowercase();
+    let p = open.as_array()?.iter().find(|p| {
+        p["head"]["ref"].as_str() == Some(base)
+            && p["head"]["repo"]["full_name"]
+                .as_str()
+                .is_some_and(|f| f.eq_ignore_ascii_case(&full))
+    })?;
+    Some(Dependency {
+        number: p["number"].as_u64().unwrap_or(0),
+        branch: base.to_string(),
+        title: p["title"].as_str().unwrap_or("").to_string(),
+        why: "An earlier step of this run stacked it on this pull request's branch.".to_string(),
+        ..Default::default()
+    })
+}
+
 /// Right after the run's branch is ready, before any implementation: a
 /// branch kept from an earlier attempt (or retried) may carry copies of
 /// another open pull request's commits (that pull request's branch was

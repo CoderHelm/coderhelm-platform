@@ -76,6 +76,9 @@ pub const MAX_TRANSITIONS_WITHOUT_PROGRESS: u32 = 40;
 /// prompted this guard spent $41.96 in eleven), so this is five full steps with
 /// nothing to show, about half of that run.
 pub const MAX_SPEND_WITHOUT_PROGRESS_USD: f64 = 20.0;
+/// Times the plan check's count may fall and its recovery still count as
+/// progress; past that, only a new best does.
+pub const MAX_TASK_DROPS: u32 = 2;
 
 /// The most pass transitions a normal large ticket makes between two progress
 /// events, with every fix round every check is allowed. A pass count is bounded
@@ -191,8 +194,15 @@ pub struct GuardState {
     /// Spend since the last progress, from every model call of every step.
     #[serde(default)]
     pub spend_usd: f64,
+    /// The most tasks done so far.
     #[serde(default)]
     pub tasks_done: usize,
+    /// The last plan check's count (`None` before the first one).
+    #[serde(default)]
+    pub tasks_last: Option<usize>,
+    /// How many times the count fell below the one before it.
+    #[serde(default)]
+    pub task_drops: u32,
     #[serde(default)]
     pub work_done: bool,
     #[serde(default)]
@@ -225,9 +235,21 @@ impl GuardState {
     pub fn apply(&mut self, p: &Progress) -> bool {
         let real = match p {
             Progress::TasksDone(n) => {
-                let more = *n > self.tasks_done;
-                self.tasks_done = self.tasks_done.max(*n);
-                more
+                let n = *n;
+                let prev = self.tasks_last.unwrap_or(self.tasks_done);
+                if n < prev {
+                    self.task_drops = self.task_drops.saturating_add(1);
+                }
+                self.tasks_last = Some(n);
+                let more = n > self.tasks_done;
+                // Work the count lost (the base moved, a rebuild, a revert)
+                // being done again is progress, not a repeat of old news:
+                // measured from the last count, a bounded number of times so
+                // a count that keeps falling and rising still ends.
+                let recovered =
+                    !more && n > prev && self.task_drops > 0 && self.task_drops <= MAX_TASK_DROPS;
+                self.tasks_done = self.tasks_done.max(n);
+                more || recovered
             }
             Progress::WorkDone => !std::mem::replace(&mut self.work_done, true),
             Progress::PrOpen => !std::mem::replace(&mut self.pr_open, true),
@@ -551,8 +573,32 @@ pub async fn progress(state: &WorkerState, team_id: &str, run_id: &str, p: Progr
     // What was spent before this news counts against the time before it: real
     // progress clears the guard's count, never the run's lifetime one.
     l.guard.spend_usd += spent;
+    let drops = l.guard.task_drops;
+    let before = l.guard.tasks_last.unwrap_or(l.guard.tasks_done);
     if l.guard.apply(&p) {
         info!(run_id, progress = ?p, "Run guard: progress");
+    }
+    if l.guard.task_drops > drops {
+        // Never silent: a fall in finished tasks is work to find, not a run
+        // that merely stopped moving.
+        warn!(
+            run_id,
+            before,
+            now = l.guard.tasks_last.unwrap_or(0),
+            best = l.guard.tasks_done,
+            "Run guard: the plan check finds fewer tasks done than before"
+        );
+        super::add_progress_note(
+            state,
+            team_id,
+            run_id,
+            &format!(
+                "The plan check now finds {} planned task(s) done, down from {before}: the \
+                 branch or what it is measured against changed. The run goes on from here.",
+                l.guard.tasks_last.unwrap_or(0)
+            ),
+        )
+        .await;
     }
     save(state, team_id, run_id, &l.guard, 0, 0, spent).await;
 }
