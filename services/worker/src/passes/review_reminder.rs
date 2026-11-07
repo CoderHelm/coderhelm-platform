@@ -21,13 +21,11 @@
 use crate::clients::github::GitHubClient;
 use crate::passes::{attr_n, attr_s};
 use crate::WorkerState;
-use aws_sdk_dynamodb::types::AttributeValue;
 use common::mcp_credentials::Kms;
 use common::notify::{self, store, Channels};
 use std::collections::HashMap;
 use tracing::{info, warn};
 
-const CONFIG_PREFIX: &str = "REVIEW_CONFIG#REPO#";
 const DEFAULT_COOLDOWN_HOURS: i64 = 4;
 /// Minimum quiet time before a head change may re-nudge. Head churn on an
 /// active PR must not beat this; only the full cooldown re-nudges otherwise.
@@ -95,76 +93,41 @@ pub async fn run(state: &WorkerState) -> Result<(), Box<dyn std::error::Error + 
     Ok(())
 }
 
-/// Scan the settings table for reviewer configs with reminders enabled and a
-/// saved channel (Teams or Slack webhook). Paginated; bounded so a huge table can't run the
-/// Lambda forever (logs when truncated rather than silently capping).
+/// Reviewer configs with reminders on and a saved channel (Teams or Slack
+/// webhook), read by key for every team (see `review_configs`).
 async fn load_reminder_configs(state: &WorkerState) -> Vec<RepoReminder> {
     let mut out = vec![];
-    let mut last_key: Option<HashMap<String, AttributeValue>> = None;
-    for page in 0..50 {
-        let mut req = state
-            .dynamo
-            .scan()
-            .table_name(&state.config.settings_table_name)
-            .filter_expression("begins_with(sk, :pfx) AND reminders_enabled = :t")
-            .expression_attribute_values(":pfx", attr_s(CONFIG_PREFIX))
-            .expression_attribute_values(":t", AttributeValue::Bool(true));
-        if let Some(k) = last_key.take() {
-            req = req.set_exclusive_start_key(Some(k));
+    for cfg in super::review_configs::all(state, "review-reminder").await {
+        let item = &cfg.item;
+        let on = item
+            .get("reminders_enabled")
+            .and_then(|v| v.as_bool().ok())
+            .copied()
+            .unwrap_or(false);
+        if !on || !store::any_set(item) {
+            continue;
         }
-        let resp = match req.send().await {
-            Ok(r) => r,
-            Err(e) => {
-                warn!(error = %e, "Reminder config scan failed");
-                break;
-            }
+        let cooldown_hours = item
+            .get("reminder_cooldown_hours")
+            .and_then(|v| v.as_n().ok())
+            .and_then(|n| n.parse::<i64>().ok())
+            .filter(|h| *h > 0)
+            .unwrap_or(DEFAULT_COOLDOWN_HOURS);
+        let cipher = Kms {
+            client: &state.kms,
+            key_id: "",
         };
-        for item in resp.items() {
-            if !store::any_set(item) {
-                continue;
-            }
-            let team_id = item
-                .get("pk")
-                .and_then(|v| v.as_s().ok())
-                .cloned()
-                .unwrap_or_default();
-            let repo = item
-                .get("sk")
-                .and_then(|v| v.as_s().ok())
-                .and_then(|sk| sk.strip_prefix(CONFIG_PREFIX).map(|s| s.to_string()))
-                .unwrap_or_default();
-            if team_id.is_empty() || repo.is_empty() {
-                continue;
-            }
-            let cooldown_hours = item
-                .get("reminder_cooldown_hours")
-                .and_then(|v| v.as_n().ok())
-                .and_then(|n| n.parse::<i64>().ok())
-                .filter(|h| *h > 0)
-                .unwrap_or(DEFAULT_COOLDOWN_HOURS);
-            let cipher = Kms {
-                client: &state.kms,
-                key_id: "",
-            };
-            let channels = store::open_all(&cipher, &team_id, item).await;
-            if channels.is_empty() {
-                warn!(repo = %repo, "Reminder channels could not be opened — skipping");
-                continue;
-            }
-            out.push(RepoReminder {
-                team_id,
-                repo,
-                channels,
-                cooldown_secs: cooldown_hours * 3600,
-            });
+        let channels = store::open_all(&cipher, &cfg.team_id, item).await;
+        if channels.is_empty() {
+            warn!(repo = %cfg.repo, "Reminder channels could not be opened — skipping");
+            continue;
         }
-        match resp.last_evaluated_key() {
-            Some(k) => last_key = Some(k.clone()),
-            None => return out,
-        }
-        if page == 49 {
-            warn!("Reminder config scan hit page cap (50) — some repos may be skipped this tick");
-        }
+        out.push(RepoReminder {
+            team_id: cfg.team_id,
+            repo: cfg.repo,
+            channels,
+            cooldown_secs: cooldown_hours * 3600,
+        });
     }
     out
 }

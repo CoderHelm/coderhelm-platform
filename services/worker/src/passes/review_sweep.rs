@@ -28,8 +28,6 @@ pub const STUCK_AFTER_SECS: i64 = 30 * 60;
 /// How long the sweep won't re-run the same PR head again.
 const SWEEP_CLAIM_TTL_SECS: u64 = 24 * 3600;
 
-const CONFIG_PREFIX: &str = "REVIEW_CONFIG#REPO#";
-
 /// One stored CoderHelm review of a PR (a `REVIEW#` record).
 #[derive(Debug, Clone, Default)]
 pub struct ReviewRecord {
@@ -256,60 +254,39 @@ struct ReviewedRepo {
     label: String,
 }
 
-/// Every repo with the reviewer on (and not killed). Paginated and bounded.
+/// Every repo with the reviewer on (and not killed), read by key for every
+/// team (see `review_configs`).
 async fn reviewed_repos(state: &WorkerState) -> Vec<ReviewedRepo> {
-    let mut out = vec![];
-    let mut last_key: Option<HashMap<String, AttributeValue>> = None;
-    for page in 0..50 {
-        let mut req = state
-            .dynamo
-            .scan()
-            .table_name(&state.config.settings_table_name)
-            .filter_expression("begins_with(sk, :pfx) AND enabled = :t")
-            .expression_attribute_values(":pfx", attr_s(CONFIG_PREFIX))
-            .expression_attribute_values(":t", AttributeValue::Bool(true));
-        if let Some(k) = last_key.take() {
-            req = req.set_exclusive_start_key(Some(k));
-        }
-        let resp = match req.send().await {
-            Ok(r) => r,
-            Err(e) => {
-                warn!(error = %aws_sdk_dynamodb::error::DisplayErrorContext(&e), "Reviewer config scan failed");
-                break;
-            }
-        };
-        for item in resp.items() {
-            let killed = item
-                .get("killed")
-                .and_then(|v| v.as_bool().ok())
-                .copied()
-                .unwrap_or(false);
-            let team_id = s_of(item, "pk");
-            let repo = s_of(item, "sk")
-                .strip_prefix(CONFIG_PREFIX)
-                .unwrap_or("")
-                .to_string();
-            if killed || team_id.is_empty() || !repo.contains('/') {
-                continue;
-            }
-            let label = Some(s_of(item, "label"))
-                .filter(|l| !l.is_empty())
-                .unwrap_or_else(|| "ch-review".to_string());
-            out.push(ReviewedRepo {
-                team_id,
-                repo,
-                label,
-            });
-        }
-        match resp.last_evaluated_key() {
-            Some(k) => last_key = Some(k.clone()),
-            None => return out,
-        }
-        if page == 49 {
-            warn!("Reviewer config scan hit its page cap; some repos wait for the next sweep");
-        }
+    super::review_configs::all(state, "stuck-review")
+        .await
+        .into_iter()
+        .filter_map(|c| reviewed(c.team_id, c.repo, &c.item))
+        .collect()
+}
+
+/// A config the sweep covers: the reviewer on and not killed.
+fn reviewed(
+    team_id: String,
+    repo: String,
+    item: &HashMap<String, AttributeValue>,
+) -> Option<ReviewedRepo> {
+    let flag = |k: &str| {
+        item.get(k)
+            .and_then(|v| v.as_bool().ok())
+            .copied()
+            .unwrap_or(false)
+    };
+    if !flag("enabled") || flag("killed") || team_id.is_empty() {
+        return None;
     }
-    out
+    let label = Some(s_of(item, "label"))
+        .filter(|l| !l.is_empty())
+        .unwrap_or_else(|| "ch-review".to_string());
+    Some(ReviewedRepo {
+        team_id,
+        repo,
+        label,
+    })
 }
 
 /// Runs the sweep over every reviewed repo of every team.

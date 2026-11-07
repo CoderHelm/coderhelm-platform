@@ -81,6 +81,9 @@ pub mod merge_gate;
 pub mod messages;
 /// Retrying model API calls on transient failures, classified by status.
 pub mod model_retry;
+/// The index of teams that have per-repository reviewer configs.
+pub mod review_config_index;
+/// Index partitions in the settings table, so sweeps read records by key.
 /// A repository's staging-only CMS write connection (for content the
 /// end-to-end tests read).
 pub mod staging_cms;

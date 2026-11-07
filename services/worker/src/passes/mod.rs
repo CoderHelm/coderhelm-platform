@@ -1105,6 +1105,7 @@ pub mod resume;
 mod review;
 pub mod review_actions;
 pub mod review_agent;
+pub mod review_configs;
 #[cfg(test)]
 mod review_eval;
 pub(crate) mod review_fingerprint;
