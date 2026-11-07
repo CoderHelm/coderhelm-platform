@@ -21,6 +21,7 @@ import * as scheduler from "aws-cdk-lib/aws-scheduler";
 import { Construct } from "constructs";
 import { ResolvedConfig } from "./config";
 import { repoPath } from "./paths";
+import { grantOwnAccountRead } from "./own-account-read";
 import { Hybrid } from "./hybrid";
 import { serviceEnvironment, modelPolicyStatements, publicUrlReadStatement, recordNameIn, setupEnvironment, setupStatements, updaterInvokeStatement, weeklySummaryScheduled } from "./service-env";
 import { MailRelay, relaySendStatement } from "./mail-relay";
@@ -625,6 +626,9 @@ export class ApiStack extends cdk.Stack {
         ...serviceEnvironment(cfg, this.account),
       },
     });
+    // A self-hosted install reads its own AWS account with this role, whose
+    // read-only permissions arrive with each version update (own-account-read.ts).
+    if (cfg.layout === "single-origin") grantOwnAccountRead(this, "GatewayOwnAccountRead", this.gatewayFunction);
     for (const st of [...modelPolicyStatements(cfg, this), publicUrlReadStatement(cfg, this), updaterInvokeStatement(cfg, this), relaySendStatement(cfg, this.account)]) {
       if (st) this.gatewayFunction.addToRolePolicy(st);
     }

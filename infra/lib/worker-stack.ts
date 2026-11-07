@@ -16,6 +16,7 @@ import { Construct } from "constructs";
 import { ResolvedConfig } from "./config";
 import { HYBRID_SIGNER_TAG, grantHybridMaster, grantNameRecords, hybridSigningAlias } from "./hybrid";
 import { repoPath } from "./paths";
+import { grantOwnAccountRead } from "./own-account-read";
 import * as path from "path";
 import { relaySendStatement } from "./mail-relay";
 import { serviceEnvironment, modelPolicyStatements, publicUrlReadStatement, weeklySummaryScheduled } from "./service-env";
@@ -141,6 +142,9 @@ export class WorkerStack extends cdk.Stack {
         ...serviceEnvironment(cfg, this.account),
       },
     });
+    // A self-hosted install reads its own AWS account with this role, whose
+    // read-only permissions arrive with each version update (own-account-read.ts).
+    if (cfg.layout === "single-origin") grantOwnAccountRead(this, "WorkerOwnAccountRead", this.workerFunction);
     for (const st of [...modelPolicyStatements(cfg, this), publicUrlReadStatement(cfg, this), relaySendStatement(cfg, this.account)]) {
       if (st) this.workerFunction.addToRolePolicy(st);
     }
