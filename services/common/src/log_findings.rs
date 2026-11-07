@@ -1995,7 +1995,10 @@ mod tests {
     fn analysis_errors_read_in_plain_words() {
         assert!(analysis_reason("An error occurred (AccessDenied) when calling the AssumeRole operation: not authorized")
             .contains("can't use the log reader role"));
-        assert_eq!(analysis_reason(""), "the last check of your AWS logs failed");
+        assert_eq!(
+            analysis_reason(""),
+            "the last check of your AWS logs failed"
+        );
         let long = "x".repeat(400);
         assert!(analysis_reason(&long).chars().count() <= 163);
         assert_eq!(analysis_reason("Throttled\ntraceback..."), "Throttled");
