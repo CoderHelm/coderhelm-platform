@@ -1999,24 +1999,57 @@ fn intake_claim_message(code: &str) -> &'static str {
 }
 
 /// The install's team, when it has exactly one (the usual self-hosted case).
+///
+/// Every page is read: the teams table also holds each team's ticket locks,
+/// so one 50-item page could hold no team record at all, or only one of
+/// several teams (and that one was then taken as the only team).
 async fn only_team(state: &AppState) -> Option<String> {
-    let r = state
-        .dynamo
-        .scan()
-        .table_name(&state.config.teams_table_name)
-        .filter_expression("sk = :m")
-        .expression_attribute_values(":m", AttributeValue::S("META".into()))
-        .projection_expression("team_id")
-        .limit(50)
-        .send()
-        .await
-        .ok()?;
-    let ids: Vec<String> = r
-        .items()
-        .iter()
-        .filter_map(|i| i.get("team_id")?.as_s().ok().cloned())
-        .collect();
-    (ids.len() == 1).then(|| ids[0].clone())
+    let mut ids: Vec<String> = Vec::new();
+    let mut start = None;
+    loop {
+        let r = state
+            .dynamo
+            .scan()
+            .table_name(&state.config.teams_table_name)
+            .filter_expression("sk = :m")
+            .expression_attribute_values(":m", AttributeValue::S("META".into()))
+            .projection_expression("team_id")
+            .set_exclusive_start_key(start)
+            .send()
+            .await
+            .ok()?;
+        ids.extend(
+            r.items()
+                .iter()
+                .filter_map(|i| i.get("team_id")?.as_s().ok().cloned()),
+        );
+        if ids.len() > 1 {
+            return None;
+        }
+        start = r.last_evaluated_key().filter(|k| !k.is_empty()).cloned();
+        if start.is_none() {
+            break;
+        }
+    }
+    sole(ids)
+}
+
+/// Pure: the one team, when there is exactly one.
+fn sole(mut ids: Vec<String>) -> Option<String> {
+    ids.dedup();
+    (ids.len() == 1).then(|| ids.remove(0))
+}
+
+#[cfg(test)]
+mod only_team_tests {
+    use super::sole;
+
+    #[test]
+    fn exactly_one_team_is_the_install_team() {
+        assert_eq!(sole(vec!["TEAM#a".into()]), Some("TEAM#a".into()));
+        assert_eq!(sole(vec![]), None);
+        assert_eq!(sole(vec!["TEAM#a".into(), "TEAM#b".into()]), None);
+    }
 }
 
 #[derive(Deserialize, Default)]

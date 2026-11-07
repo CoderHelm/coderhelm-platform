@@ -749,6 +749,18 @@ async fn save_autofix(state: &AppState, team: &str, cfg: &AutoFix, by: &str) -> 
         .send()
         .await
         .map_err(|e| internal("Could not save the automatic-fix setting", e))?;
+    // The hourly sweep reads teams from this index, not a table scan. A
+    // failed add is found by the index's daily rebuild.
+    if let Err(e) = common::settings_index::add(
+        &state.dynamo,
+        &state.config.settings_table_name,
+        lf::AUTOFIX_INDEX,
+        team,
+    )
+    .await
+    {
+        tracing::warn!(team, error = %e, "Could not index the automatic-fix setting");
+    }
     Ok(())
 }
 

@@ -63,6 +63,7 @@ pub mod github_wait;
 pub mod live;
 /// Log findings and the fix runs started from them.
 pub mod log_findings;
+pub mod settings_index;
 // Which repo a log group's or alarm's code lives in, from evidence.
 pub mod log_reader;
 pub mod log_repo;
