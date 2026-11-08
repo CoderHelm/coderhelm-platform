@@ -12,6 +12,13 @@
  * Connecting the account still proves the team's own CoderHelmLogReader role
  * with its private ID (routes/log_analyzer.rs); only reading uses the
  * install's role (services/common/src/live/aws.rs, install_target).
+ *
+ * Bedrock knowledge bases connected in place (services/common/src/knowledge/remote.rs):
+ * the install is the customer's alone, so its role may search every knowledge
+ * base in its own account (the template's KnowledgeBases "all"), and list them
+ * for the picker. Admins still choose which ones a team connects. Retrieve also
+ * needs the permissions boundary to allow bedrock:Retrieve, which reaches an
+ * install only through the access stack an AWS admin applies (native/access-stack.ts).
  */
 import * as cdk from "aws-cdk-lib";
 import * as iam from "aws-cdk-lib/aws-iam";
@@ -24,15 +31,39 @@ export const OWN_ROLE_ENV = "INSTALL_OWN_ROLE_ARN";
 const UPDATE_TEMPLATE = "infra/cfn/coderhelm-log-reader-update.yaml";
 const UPDATE_POLICY_ID = "CoderHelmReadOnlyUpdate";
 const ROLE_NAME_MARK = "__CODERHELM_ROLE__";
+/** The install's own role searches every knowledge base in its own account. */
+const OWN_KNOWLEDGE_BASES = "all";
+/** The template's conditions for that value. A condition not listed here fails the build. */
+const OWN_CONDITIONS: Record<string, boolean> = { ReadsKnowledgeBases: true, ReadsEveryKnowledgeBase: true };
 
 type Statement = { Sid?: string; Effect: string; Action: string | string[]; Resource: unknown };
 
-/** The update template's statements, as the template has them. */
+/**
+ * `v` with every `Fn::If` decided by `conditions` and every `AWS::NoValue`
+ * dropped, as CloudFormation would for those values (CfnInclude keeps them,
+ * and the policy is written into another stack that has no such conditions).
+ */
+export function decideConditions(v: unknown, conditions: Record<string, boolean>): unknown {
+  const noValue = (x: unknown) => !!x && typeof x === "object" && (x as any).Ref === "AWS::NoValue";
+  if (Array.isArray(v)) return v.map((x) => decideConditions(x, conditions)).filter((x) => !noValue(x));
+  if (v && typeof v === "object") {
+    const o = v as Record<string, unknown>;
+    if (Object.keys(o).length === 1 && Array.isArray(o["Fn::If"])) {
+      const [name, yes, no] = o["Fn::If"] as [string, unknown, unknown];
+      if (!(name in conditions)) throw new Error(`${UPDATE_TEMPLATE}: condition ${name} isn't decided for the install's own role (own-account-read.ts)`);
+      return decideConditions(conditions[name] ? yes : no, conditions);
+    }
+    return Object.fromEntries(Object.entries(o).map(([k, x]) => [k, decideConditions(x, conditions)]).filter(([, x]) => !noValue(x)));
+  }
+  return v;
+}
+
+/** The update template's statements for the install's own role: its knowledge bases are every one in its account. */
 export function updateTemplateStatements(): Statement[] {
   const scratch = new cdk.Stack(new cdk.App(), "Scratch");
-  const inc = new CfnInclude(scratch, "T", { templateFile: repoPath(UPDATE_TEMPLATE), parameters: { RoleName: ROLE_NAME_MARK } });
+  const inc = new CfnInclude(scratch, "T", { templateFile: repoPath(UPDATE_TEMPLATE), parameters: { RoleName: ROLE_NAME_MARK, KnowledgeBases: OWN_KNOWLEDGE_BASES } });
   const p = inc.getResource(UPDATE_POLICY_ID) as iam.CfnPolicy;
-  return scratch.resolve(p.policyDocument).Statement as Statement[];
+  return decideConditions(scratch.resolve(p.policyDocument).Statement, OWN_CONDITIONS) as Statement[];
 }
 
 /**
@@ -49,7 +80,7 @@ export function ownAccountStatements(roleArn: string): Statement[] {
 export function grantOwnAccountRead(scope: Construct, id: string, fn: cdk.aws_lambda.Function): void {
   const role = fn.role!;
   new iam.CfnManagedPolicy(scope, id, {
-    description: "CoderHelm: reads this install's own AWS account (logs, metrics, Airflow, ECS), read-only; kept current by each version update",
+    description: "CoderHelm: reads this install's own AWS account (logs, metrics, Airflow, ECS, Bedrock knowledge bases), read-only; kept current by each version update",
     roles: [role.roleName],
     policyDocument: { Version: "2012-10-17", Statement: ownAccountStatements(role.roleArn) },
   });

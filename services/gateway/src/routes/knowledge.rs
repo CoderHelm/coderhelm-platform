@@ -48,6 +48,17 @@ fn forbidden(_: StatusCode) -> (StatusCode, Json<Value>) {
     fail(StatusCode::FORBIDDEN, "Only admins manage knowledge bases.")
 }
 
+/// Searches the team's connected Bedrock knowledge bases, as `actor` in the
+/// team's AWS records.
+pub(crate) fn retriever<'a>(state: &'a AppState, actor: &'a str) -> kb::remote::Bedrock<'a> {
+    kb::remote::Bedrock {
+        sts: &state.sts,
+        dynamo: &state.dynamo,
+        accounts_table: &state.config.aws_insights_table_name,
+        actor,
+    }
+}
+
 pub(crate) fn store(state: &AppState) -> kb::search::AwsStore {
     kb::search::AwsStore {
         dynamo: state.dynamo.clone(),
@@ -95,6 +106,21 @@ pub struct BaseInput {
     /// with what it holds in one step.
     #[serde(default)]
     pub source: Option<super::knowledge_sources::SourceInput>,
+    /// On create only: a knowledge base to connect in place instead (it is
+    /// searched live where it is and holds no files here).
+    #[serde(default)]
+    pub connect: Option<ConnectInput>,
+}
+
+/// A knowledge base to connect in place.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct ConnectInput {
+    /// `bedrock_kb`.
+    #[serde(default)]
+    pub provider: String,
+    /// The Bedrock knowledge base's ARN.
+    #[serde(default)]
+    pub target: String,
 }
 
 /// `input` applied to `base`, or why it can't be.
@@ -258,10 +284,180 @@ fn base_json(
         "authoritative": b.authoritative,
         "created_at": b.created_at,
         "updated_at": b.updated_at,
+        "backend": backend_json(b),
         "files": files.len(),
         "ready": count(FileStatus::Ready),
         "processing": count(FileStatus::Processing) + count(FileStatus::Uploading),
         "failed": count(FileStatus::Failed),
+    })
+}
+
+/// Where a base's passages are, for the page: `local`, or connected in
+/// place with where it lives and how it is reached (never a private ID).
+fn backend_json(b: &Base) -> Value {
+    match b.remote() {
+        None => json!({ "kind": "local" }),
+        Some(r) => json!({
+            "kind": "remote",
+            "provider": r.provider,
+            "label": r.provider.label(),
+            "target": r.target,
+            "region": r.region,
+            "account": r.target.split(':').nth(4).unwrap_or(""),
+            "access": match &r.access {
+                kb::Access::Install => "install",
+                kb::Access::Account { .. } => "account",
+            },
+            "hybrid": r.hybrid,
+        }),
+    }
+}
+
+/// Files and synced apps belong to bases kept here: a base connected in
+/// place has none.
+fn refuse_connected(base: &Base) -> Result<(), (StatusCode, Json<Value>)> {
+    match base.remote() {
+        Some(r) => Err(fail(
+            StatusCode::BAD_REQUEST,
+            &format!(
+                "This knowledge base is connected in place: it is searched live in your AWS account, so nothing can be added to it here. Add documents to the {} itself.",
+                r.provider.label()
+            ),
+        )),
+        None => Ok(()),
+    }
+}
+
+/// Refuses adding to `kb_id` when it is connected in place.
+pub(crate) async fn refuse_if_connected(
+    state: &AppState,
+    team_id: &str,
+    kb_id: &str,
+) -> Result<(), (StatusCode, Json<Value>)> {
+    match get_base_record(state, team_id, kb_id)
+        .await
+        .map_err(|e| internal("knowledge base", e))?
+    {
+        Some(b) => refuse_connected(&b),
+        None => Ok(()),
+    }
+}
+
+/// A connection failure as the page shows it: what happened, what to do,
+/// and (when the role only lacks the permission) the one-click update that
+/// grants it.
+fn connect_fail(r: &kb::remote::Refusal, grant: Option<Value>) -> (StatusCode, Json<Value>) {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(json!({
+            "error": r.message,
+            "fix": r.fix,
+            "code": r.code,
+            "grant": grant,
+        })),
+    )
+}
+
+/// The connected AWS accounts of the team (none when the install keeps no
+/// such table).
+async fn aws_accounts(
+    state: &AppState,
+    team_id: &str,
+) -> Vec<common::live::aws_account::AwsAccount> {
+    let table = &state.config.aws_insights_table_name;
+    if table.is_empty() {
+        return Vec::new();
+    }
+    common::live::aws_account::list(&state.dynamo, table, team_id)
+        .await
+        .unwrap_or_else(|e| {
+            warn!(error = %e, "Could not read AWS accounts");
+            Vec::new()
+        })
+}
+
+/// Checks a knowledge base to connect, with one test search, and returns
+/// how it is reached. Nothing is saved.
+async fn check_connect(
+    state: &AppState,
+    claims: &Claims,
+    existing: &[Base],
+    input: &ConnectInput,
+) -> Result<kb::Remote, (StatusCode, Json<Value>)> {
+    if !input.provider.is_empty() && input.provider != "bedrock_kb" {
+        return Err(fail(
+            StatusCode::BAD_REQUEST,
+            "Only a Bedrock knowledge base can be connected in place.",
+        ));
+    }
+    let arn =
+        kb::remote::parse_kb_arn(&input.target).map_err(|m| fail(StatusCode::BAD_REQUEST, &m))?;
+    if let Some(same) = existing
+        .iter()
+        .find(|b| b.remote().is_some_and(|r| r.target == arn.arn()))
+    {
+        return Err(fail(
+            StatusCode::BAD_REQUEST,
+            &format!("That knowledge base is already connected as {}.", same.name),
+        ));
+    }
+    let accounts = aws_accounts(state, &claims.team_id).await;
+    let own = common::live::aws::install_read_role();
+    let access = kb::remote::access_for(&arn, own.as_deref(), &accounts)
+        .map_err(|r| connect_fail(&r, None))?;
+    let mut remote = kb::remote::bedrock_remote(&arn, access, true);
+    remote.hybrid = test_remote(state, claims, existing, &accounts, &remote).await?;
+    Ok(remote)
+}
+
+/// One test search of `remote` as the team: `Ok(hybrid)`, or what went
+/// wrong in plain words (with the one-click grant when the team's role only
+/// lacks the permission).
+async fn test_remote(
+    state: &AppState,
+    claims: &Claims,
+    existing: &[Base],
+    accounts: &[common::live::aws_account::AwsAccount],
+    remote: &kb::Remote,
+) -> Result<bool, (StatusCode, Json<Value>)> {
+    let actor = format!("knowledge-{}", claims.email);
+    let session = kb::remote::session(
+        &state.sts,
+        &state.dynamo,
+        &state.config.aws_insights_table_name,
+        &claims.team_id,
+        remote,
+        &actor,
+    )
+    .await
+    .map_err(|r| connect_fail(&r, None))?;
+    kb::remote::test_retrieve(&session, remote).await.map_err(|r| {
+        // The team's role only lacks the permission: the update that lets
+        // it search this knowledge base (and the ones already connected in
+        // that account), in one click.
+        let grant = match (&remote.access, r.code) {
+            (kb::Access::Account { account }, "access") => {
+                let mut kbs = kb::remote::arns_in(existing, account);
+                kbs.push(remote.target.clone());
+                kbs.sort();
+                kbs.dedup();
+                let region = accounts
+                    .iter()
+                    .find(|a| &a.account == account)
+                    .map(|a| a.region.clone())
+                    .unwrap_or_else(|| remote.region.clone());
+                super::connectors::update_stack_url(&region, &kbs).map(|url| {
+                    json!({
+                        "url": url,
+                        "stack_name": common::log_reader::update_stack_name_for(&kbs),
+                        "account": account,
+                    })
+                })
+            }
+            _ => None,
+        };
+        info!(team_id = %claims.team_id, code = r.code, "A connected knowledge base's test search failed");
+        connect_fail(&r, grant)
     })
 }
 
@@ -330,6 +526,80 @@ pub async fn get_base(
 
 // ── Managing (admins) ───────────────────────────────────────────────────────
 
+/// GET /api/knowledge/bedrock — what connecting a Bedrock knowledge base
+/// starts from: on a self-hosted install, the knowledge bases in its own
+/// account (or why they can't be listed); everywhere, the team's connected
+/// AWS accounts, whose roles can search a pasted ARN.
+pub async fn bedrock_bases(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<Claims>,
+) -> Reply {
+    claims.require_role(3).map_err(forbidden)?;
+    let own = common::live::aws::install_read_role();
+    let region = std::env::var("AWS_REGION").unwrap_or_default();
+    let (bases, list_error) = if own.is_some() && !region.is_empty() {
+        match kb::remote::list_install_bases(&region).await {
+            Ok(b) => (Some(b), None),
+            Err(r) => (
+                None,
+                Some(json!({ "message": r.message, "fix": r.fix, "code": r.code })),
+            ),
+        }
+    } else {
+        (None, None)
+    };
+    let connected: Vec<String> = store(&state)
+        .bases(&claims.team_id)
+        .await
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|b| b.remote().map(|r| r.target.clone()))
+        .collect();
+    let accounts: Vec<Value> = aws_accounts(&state, &claims.team_id)
+        .await
+        .iter()
+        .map(|a| json!({ "account": a.account, "region": a.region }))
+        .collect();
+    Ok(Json(json!({
+        "install": own.is_some(),
+        "install_account": own.as_deref().and_then(|r| r.split(':').nth(4)).unwrap_or(""),
+        "region": region,
+        "bases": bases,
+        "list_error": list_error,
+        "accounts": accounts,
+        "connected": connected,
+    })))
+}
+
+/// POST /api/knowledge/:kb_id/check — one test search of a connected base,
+/// now: it works, or what is wrong and what to do.
+pub async fn check_connection(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<Claims>,
+    Path(kb_id): Path<String>,
+) -> Reply {
+    claims.require_role(3).map_err(forbidden)?;
+    let existing = store(&state)
+        .bases(&claims.team_id)
+        .await
+        .map_err(|e| internal("knowledge bases", e))?;
+    let base = existing
+        .iter()
+        .find(|b| b.id == kb_id)
+        .ok_or_else(|| fail(StatusCode::NOT_FOUND, "No such knowledge base."))?;
+    let remote = base.remote().ok_or_else(|| {
+        fail(
+            StatusCode::BAD_REQUEST,
+            "This knowledge base is kept here: there is no connection to check.",
+        )
+    })?;
+    let accounts = aws_accounts(&state, &claims.team_id).await;
+    let hybrid = test_remote(&state, &claims, &existing, &accounts, remote).await?;
+    Ok(Json(
+        json!({ "ok": true, "hybrid": hybrid, "checked_at": now() }),
+    ))
+}
+
 /// POST /api/knowledge — create a base.
 pub async fn create_base(
     State(state): State<Arc<AppState>>,
@@ -356,6 +626,20 @@ pub async fn create_base(
         ..Default::default()
     };
     apply_input(&mut base, &input).map_err(|m| fail(StatusCode::BAD_REQUEST, &m))?;
+    if let Some(c) = input
+        .connect
+        .as_ref()
+        .filter(|c| !c.target.trim().is_empty())
+    {
+        if input.source.as_ref().is_some_and(|s| !s.kind.is_empty()) {
+            return Err(fail(
+                StatusCode::BAD_REQUEST,
+                "A knowledge base connected in place can't also sync an app.",
+            ));
+        }
+        // One test search first: nothing is saved unless it works.
+        base.backend = kb::Backend::Remote(check_connect(&state, &claims, &existing, c).await?);
+    }
     state
         .dynamo
         .put_item()
@@ -364,7 +648,7 @@ pub async fn create_base(
         .send()
         .await
         .map_err(|e| internal("create knowledge base", e.to_string()))?;
-    info!(team_id = %claims.team_id, kb = %base.id, "Knowledge base created");
+    info!(team_id = %claims.team_id, kb = %base.id, connected = base.remote().is_some(), "Knowledge base created");
     let mut added = Value::Null;
     if let Some(src) = input.source.as_ref().filter(|s| !s.kind.is_empty()) {
         match super::knowledge_sources::add_source(&state, &claims, &base.id, src).await {
@@ -554,6 +838,7 @@ pub async fn start_upload(
         .await
         .map_err(|e| internal("knowledge base", e))?
         .ok_or_else(|| fail(StatusCode::NOT_FOUND, "No such knowledge base."))?;
+    refuse_connected(&base)?;
     let name = kb::clean_file_name(&body.name);
     let kind = check_upload(&name, body.size, MAX_FILE_BYTES)
         .map_err(|m| fail(StatusCode::BAD_REQUEST, &m))?;
@@ -849,5 +1134,66 @@ mod tests {
         assert!(check_upload("a.md", MAX_FILE_BYTES + 1, MAX_FILE_BYTES)
             .unwrap_err()
             .contains("25 MB"));
+    }
+
+    #[test]
+    fn a_connected_base_shows_where_it_lives_and_takes_no_files() {
+        let remote = kb::remote::bedrock_remote(
+            &kb::remote::parse_kb_arn(
+                "arn:aws:bedrock:eu-west-1:111122223333:knowledge-base/ABCDE12345",
+            )
+            .unwrap(),
+            kb::Access::Account {
+                account: "111122223333".into(),
+            },
+            false,
+        );
+        let b = Base {
+            id: "kb".into(),
+            name: "Runbooks".into(),
+            backend: kb::Backend::Remote(remote),
+            ..Default::default()
+        };
+        let v = base_json(&b, &[], &[]);
+        assert_eq!(v["backend"]["kind"], "remote");
+        assert_eq!(v["backend"]["label"], "Bedrock knowledge base");
+        assert_eq!(v["backend"]["region"], "eu-west-1");
+        assert_eq!(v["backend"]["account"], "111122223333");
+        assert_eq!(v["backend"]["access"], "account");
+        assert_eq!(v["backend"]["hybrid"], false);
+        assert_eq!(v["files"], 0);
+        let (code, body) = refuse_connected(&b).unwrap_err();
+        assert_eq!(code, StatusCode::BAD_REQUEST);
+        assert!(body["error"]
+            .as_str()
+            .unwrap()
+            .contains("connected in place"));
+        // A base kept here says so and takes files.
+        let local = Base::default();
+        assert_eq!(base_json(&local, &[], &[])["backend"]["kind"], "local");
+        assert!(refuse_connected(&local).is_ok());
+    }
+
+    #[test]
+    fn a_failed_connection_says_what_happened_what_to_do_and_offers_the_grant() {
+        let r = kb::remote::refusal("AccessDeniedException", "not authorized to perform: bedrock:Retrieve because no identity-based policy allows the bedrock:Retrieve action");
+        let (code, body) = connect_fail(
+            &r,
+            Some(json!({ "url": "https://console.aws.amazon.com/x", "stack_name": "s" })),
+        );
+        assert_eq!(code, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            body["error"],
+            "The role in your account does not allow Retrieve on this knowledge base."
+        );
+        assert_eq!(body["code"], "access");
+        assert!(body["fix"].as_str().unwrap().contains("bedrock:Retrieve"));
+        assert_eq!(body["grant"]["stack_name"], "s");
+        // The connect input reads as the dashboard sends it.
+        let input: BaseInput = serde_json::from_value(json!({
+            "name": "Runbooks", "connect": { "provider": "bedrock_kb", "target": "arn:aws:bedrock:us-east-1:111122223333:knowledge-base/ABCDE12345" }
+        }))
+        .unwrap();
+        assert_eq!(input.connect.unwrap().provider, "bedrock_kb");
     }
 }

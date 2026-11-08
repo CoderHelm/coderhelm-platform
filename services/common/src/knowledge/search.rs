@@ -184,6 +184,24 @@ pub trait Store: Send + Sync {
     async fn index(&self, team_id: &str, key: &str) -> Result<Arc<Index>, String>;
 }
 
+/// Searches a base connected in place ([`super::Backend::Remote`]) where it
+/// lives: the provider ranks, Coderhelm only merges. Takes the team, like
+/// every [`Store`] method, and reaches the base only with that team's own
+/// access (its role and private ID), so another team's id finds nothing.
+#[async_trait::async_trait]
+pub trait Retriever: Send + Sync {
+    /// Up to `k` passages of the team's remote `base` for `query`, best
+    /// first. `kb_id`, `kb_name` and `authoritative` of the hits are set by
+    /// [`search`] from the base, whatever this returns.
+    async fn retrieve(
+        &self,
+        team_id: &str,
+        base: &Base,
+        query: &str,
+        k: usize,
+    ) -> Result<Vec<Hit>, String>;
+}
+
 /// Turns text into a vector.
 #[async_trait::async_trait]
 pub trait Embedder: Send + Sync {
@@ -362,12 +380,27 @@ pub struct Stale {
     pub version: u32,
 }
 
+/// A connected base that couldn't be searched this time, and why in plain
+/// words.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Unreached {
+    pub kb_id: String,
+    pub kb_name: String,
+    pub reason: String,
+}
+
 /// What a search found.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Found {
     pub hits: Vec<Hit>,
     pub stale: Vec<Stale>,
+    /// Connected bases that didn't answer; the others' passages still count.
+    pub unreached: Vec<Unreached>,
 }
+
+/// How many passages a connected base is asked for: anything ranked lower
+/// is under [`MIN_FUSED`] anyway.
+pub const REMOTE_DEPTH: usize = 30;
 
 /// The vector list keeps passages at least this similar.
 pub const MIN_COSINE: f32 = 0.25;
@@ -533,16 +566,14 @@ pub fn keyword_list(query: &str, cands: &[Candidate]) -> Vec<(usize, f32)> {
     out
 }
 
-/// Reciprocal rank fusion of the two lists, nudged by recency and by a
-/// source of truth, cut at [`MIN_FUSED`]. Returns `(position, score)`, best
-/// first.
-pub fn fuse(
-    vector: &[(usize, f32)],
-    keyword: &[(usize, f32)],
-    cands: &[Candidate],
-) -> Vec<(usize, f32)> {
+/// Reciprocal rank fusion of ranked lists (the local vector and keyword
+/// lists, and one list per connected base, ranked where it lives), nudged
+/// by recency and by a source of truth, cut at [`MIN_FUSED`]. Only ranks
+/// count, so lists scored on different scales (a Titan cosine, a BM25 sum,
+/// a Bedrock score) merge fairly. Returns `(position, score)`, best first.
+pub fn fuse(lists: &[&[(usize, f32)]], cands: &[Candidate]) -> Vec<(usize, f32)> {
     let mut fused: HashMap<usize, f32> = HashMap::new();
-    for list in [vector, keyword] {
+    for list in lists {
         for (rank, (i, _)) in list.iter().enumerate() {
             *fused.entry(*i).or_default() += 1.0 / (RRF_K + rank as f32 + 1.0);
         }
@@ -568,12 +599,28 @@ fn age_days(as_of: &str, now: chrono::DateTime<chrono::Utc>) -> f32 {
         .unwrap_or(0.0)
 }
 
+/// One passage in the fused ranking: from a local index, or as a connected
+/// base returned it.
+enum Entry<'a> {
+    Local(&'a Base, &'a FileMeta, &'a IndexedChunk),
+    Remote(&'a Base, &'a Hit),
+}
+
 /// The best passages for `query` in the team's bases `kb_ids`, at most `k`.
 /// Each base is read by the team's key, so an id from another team (or a
 /// made-up one) finds nothing.
+///
+/// Local bases are ranked here (vector and keyword lists); each connected
+/// base is searched where it lives, all at once, and its answer joins the
+/// fusion as one more ranked list. The question is embedded only when a
+/// local file will be scored against it. A connected base that doesn't
+/// answer is reported in [`Found::unreached`]; the search fails only when
+/// nothing could be searched at all.
+#[allow(clippy::too_many_arguments)]
 pub async fn search(
     store: &dyn Store,
     embedder: &dyn Embedder,
+    retriever: &dyn Retriever,
     team_id: &str,
     kb_ids: &[String],
     query: &str,
@@ -586,10 +633,17 @@ pub async fn search(
         return Ok(found);
     }
     let mut files: Vec<(Base, FileMeta, String)> = Vec::new();
+    let mut remote: Vec<Base> = Vec::new();
     for id in kb_ids {
         let Some(base) = store.base(team_id, id).await? else {
             continue;
         };
+        if base.remote().is_some() {
+            if !remote.iter().any(|b| b.id == base.id) {
+                remote.push(base);
+            }
+            continue;
+        }
         for f in store.files(team_id, &base.id).await? {
             if f.kb_id != base.id {
                 continue;
@@ -602,34 +656,76 @@ pub async fn search(
             }
         }
     }
-    if files.is_empty() {
+    if files.is_empty() && remote.is_empty() {
         return Ok(found);
     }
-    let qv = embedder.embed(crate::truncate_str(query, 8_000)).await?;
-    let mut loaded: Vec<(Base, FileMeta, Arc<Index>)> = Vec::new();
-    for (base, file, key) in files {
-        match store.index(team_id, &key).await {
-            Ok(i) if i.model != embedder.model() || i.dims != qv.len() => {
-                tracing::warn!(kb = %base.id, file = %file.id, model = %i.model, dims = i.dims,
-                    "Knowledge index from another embedding model; needs re-embedding");
-                found.stale.push(Stale {
-                    kb_id: base.id.clone(),
-                    file_id: file.id.clone(),
-                    version: file.ready_version,
-                });
+
+    // Every connected base at once, while the local side embeds and loads.
+    let asked = futures::future::join_all(
+        remote
+            .iter()
+            .map(|b| retriever.retrieve(team_id, b, query, REMOTE_DEPTH)),
+    );
+    let local = async {
+        if files.is_empty() {
+            return Ok((Vec::new(), Vec::new(), Vec::new()));
+        }
+        let qv = embedder.embed(crate::truncate_str(query, 8_000)).await?;
+        let mut loaded: Vec<(Base, FileMeta, Arc<Index>)> = Vec::new();
+        let mut stale = Vec::new();
+        for (base, file, key) in &files {
+            match store.index(team_id, key).await {
+                Ok(i) if i.model != embedder.model() || i.dims != qv.len() => {
+                    tracing::warn!(kb = %base.id, file = %file.id, model = %i.model, dims = i.dims,
+                        "Knowledge index from another embedding model; needs re-embedding");
+                    stale.push(Stale {
+                        kb_id: base.id.clone(),
+                        file_id: file.id.clone(),
+                        version: file.ready_version,
+                    });
+                }
+                Ok(i) => loaded.push((base.clone(), file.clone(), i)),
+                Err(e) => {
+                    tracing::warn!(kb = %base.id, file = %file.id, error = %e, "Knowledge index unreadable; skipped");
+                }
             }
-            Ok(i) => loaded.push((base, file, i)),
-            Err(e) => {
-                tracing::warn!(kb = %base.id, file = %file.id, error = %e, "Knowledge index unreadable; skipped");
+        }
+        Ok::<_, String>((qv, loaded, stale))
+    };
+    let (answers, local) = futures::join!(asked, local);
+    let (qv, loaded, stale) = local?;
+    found.stale = stale;
+
+    let mut remote_hits: Vec<(&Base, Vec<Hit>)> = Vec::new();
+    for (base, answer) in remote.iter().zip(answers) {
+        match answer {
+            Ok(hits) => remote_hits.push((base, hits)),
+            Err(reason) => {
+                tracing::warn!(kb = %base.id, error = %reason, "Connected knowledge base didn't answer; skipped");
+                found.unreached.push(Unreached {
+                    kb_id: base.id.clone(),
+                    kb_name: base.name.clone(),
+                    reason,
+                });
             }
         }
     }
-    let mut owners: Vec<(&Base, &FileMeta, &IndexedChunk)> = Vec::new();
+    if files.is_empty() && remote_hits.is_empty() {
+        // Nothing could be searched: say why rather than "nothing matched".
+        let why: Vec<String> = found
+            .unreached
+            .iter()
+            .map(|u| format!("{}: {}", u.kb_name, u.reason))
+            .collect();
+        return Err(why.join(" "));
+    }
+
+    let mut entries: Vec<Entry> = Vec::new();
     let mut cands: Vec<Candidate> = Vec::new();
     for (base, file, index) in &loaded {
         let age = age_days(&file.as_of, now);
         for c in &index.chunks {
-            owners.push((base, file, c));
+            entries.push(Entry::Local(base, file, c));
             cands.push(Candidate {
                 text: &c.text,
                 loc: &c.loc,
@@ -639,39 +735,77 @@ pub async fn search(
             });
         }
     }
-    let ranked = fuse(
-        &vector_list(&qv, &cands),
-        &keyword_list(query, &cands),
-        &cands,
-    );
-    // No more than three passages from one file, so one long document
-    // doesn't crowd out the others.
-    let mut per_file: HashMap<&str, usize> = HashMap::new();
+    let n_local = cands.len();
+    // The local lists rank local passages only; each connected base's
+    // passages come ranked already, as their own list.
+    let mut lists: Vec<Vec<(usize, f32)>> = vec![
+        vector_list(&qv, &cands[..n_local]),
+        keyword_list(query, &cands[..n_local]),
+    ];
+    for (base, hits) in &remote_hits {
+        let mut list = Vec::new();
+        for h in hits.iter().take(REMOTE_DEPTH) {
+            if h.text.trim().is_empty() {
+                continue;
+            }
+            list.push((cands.len(), h.score));
+            entries.push(Entry::Remote(base, h));
+            cands.push(Candidate {
+                text: &h.text,
+                loc: &h.loc,
+                vector: &[],
+                age_days: age_days(&h.as_of, now),
+                authoritative: base.authoritative,
+            });
+        }
+        lists.push(list);
+    }
+    let refs: Vec<&[(usize, f32)]> = lists.iter().map(Vec::as_slice).collect();
+    let ranked = fuse(&refs, &cands);
+    // No more than three passages from one file (a connected base's
+    // document), so one long document doesn't crowd out the others.
+    let mut per_file: HashMap<(&str, &str), usize> = HashMap::new();
     for (i, score) in ranked {
-        let (base, file, c) = owners[i];
-        let n = per_file.entry(file.id.as_str()).or_default();
+        let hit = match entries[i] {
+            Entry::Local(base, file, c) => Hit {
+                kb_id: base.id.clone(),
+                kb_name: base.name.clone(),
+                file_id: file.id.clone(),
+                file_name: file.name.clone(),
+                loc: c.loc.clone(),
+                as_of: file.as_of.clone(),
+                text: c.text.clone(),
+                score,
+                authoritative: base.authoritative,
+                ord: c.ord,
+                url: file.url.clone(),
+                source_kind: if file.is_synced() {
+                    file.kind.clone()
+                } else {
+                    String::new()
+                },
+            },
+            // The base's own name, flag and kind, whatever the retriever said.
+            Entry::Remote(base, h) => Hit {
+                kb_id: base.id.clone(),
+                kb_name: base.name.clone(),
+                score,
+                authoritative: base.authoritative,
+                source_kind: super::SourceKind::BedrockKb.key().into(),
+                ..h.clone()
+            },
+        };
+        let n = per_file
+            .entry(match entries[i] {
+                Entry::Local(base, file, _) => (base.id.as_str(), file.id.as_str()),
+                Entry::Remote(base, h) => (base.id.as_str(), h.file_id.as_str()),
+            })
+            .or_default();
         *n += 1;
         if *n > 3 {
             continue;
         }
-        found.hits.push(Hit {
-            kb_id: base.id.clone(),
-            kb_name: base.name.clone(),
-            file_id: file.id.clone(),
-            file_name: file.name.clone(),
-            loc: c.loc.clone(),
-            as_of: file.as_of.clone(),
-            text: c.text.clone(),
-            score,
-            authoritative: base.authoritative,
-            ord: c.ord,
-            url: file.url.clone(),
-            source_kind: if file.is_synced() {
-                file.kind.clone()
-            } else {
-                String::new()
-            },
-        });
+        found.hits.push(hit);
         if found.hits.len() >= k {
             break;
         }
@@ -768,7 +902,112 @@ pub mod testing {
         }
     }
 
+    /// What a connected base answers, per `(team, base)`.
+    type Answers = HashMap<(String, String), Result<Vec<Hit>, String>>;
+
+    /// A connected base's answers, set per team and base: a team only ever
+    /// gets the answers set for it, like the real one (its own role).
+    #[derive(Default)]
+    pub struct FakeRetriever {
+        pub answers: Mutex<Answers>,
+        /// `(team, base)` of every call, in order.
+        pub calls: Mutex<Vec<(String, String)>>,
+    }
+
+    impl FakeRetriever {
+        /// What base `kb_id` of `team_id` answers.
+        pub fn answer(&self, team_id: &str, kb_id: &str, a: Result<Vec<Hit>, String>) {
+            self.answers
+                .lock()
+                .unwrap()
+                .insert((team_id.into(), kb_id.into()), a);
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Retriever for FakeRetriever {
+        async fn retrieve(
+            &self,
+            team_id: &str,
+            base: &Base,
+            _query: &str,
+            k: usize,
+        ) -> Result<Vec<Hit>, String> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push((team_id.into(), base.id.clone()));
+            match self
+                .answers
+                .lock()
+                .unwrap()
+                .get(&(team_id.to_string(), base.id.clone()))
+            {
+                Some(Ok(h)) => Ok(h.iter().take(k).cloned().collect()),
+                Some(Err(e)) => Err(e.clone()),
+                None => Ok(Vec::new()),
+            }
+        }
+    }
+
+    /// The word embedder, counting its calls.
+    #[derive(Default)]
+    pub struct CountingEmbedder {
+        pub calls: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl Embedder for CountingEmbedder {
+        fn model(&self) -> &str {
+            TEST_MODEL
+        }
+        async fn embed(&self, text: &str) -> Result<Vec<f32>, String> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(embed_words(text))
+        }
+    }
+
+    /// A base connected in place (a Bedrock knowledge base in `account`).
+    pub fn remote_base(id: &str, name: &str, account: &str) -> Base {
+        Base {
+            id: id.into(),
+            name: name.into(),
+            read_role: "member".into(),
+            backend: crate::knowledge::Backend::Remote(crate::knowledge::Remote {
+                provider: crate::knowledge::Provider::BedrockKb,
+                target: format!("arn:aws:bedrock:us-east-1:{account}:knowledge-base/ABCDE12345"),
+                region: "us-east-1".into(),
+                access: crate::knowledge::Access::Account {
+                    account: account.into(),
+                },
+                hybrid: true,
+            }),
+            ..Default::default()
+        }
+    }
+
+    /// A passage as a connected base returns it.
+    pub fn remote_hit(doc: &str, text: &str) -> Hit {
+        Hit {
+            file_id: doc.into(),
+            file_name: doc.rsplit('/').next().unwrap_or(doc).into(),
+            loc: doc.into(),
+            text: text.into(),
+            score: 0.5,
+            ..Default::default()
+        }
+    }
+
     impl MemoryStore {
+        /// Adds a base with no files (a connected one).
+        pub fn add_base(&self, team_id: &str, base: &Base) {
+            let mut b = self.bases.lock().unwrap();
+            let list = b.entry(team_id.to_string()).or_default();
+            if !list.iter().any(|x| x.id == base.id) {
+                list.push(base.clone());
+            }
+        }
+
         /// Adds a ready file whose passages are `texts`.
         pub fn add_file(
             &self,
@@ -943,6 +1182,7 @@ mod tests {
         let found = search(
             &store,
             &WordEmbedder,
+            &FakeRetriever::default(),
             "t",
             &["kb".into()],
             "parental leave weeks",
@@ -1014,9 +1254,18 @@ mod tests {
             .collect();
         assert!(vector_list(&qv, &cands).is_empty());
         // Hybrid search finds it through the keyword list.
-        let found = search(&store, &WordEmbedder, "t", &["kb_ops".into()], q, 5, now())
-            .await
-            .unwrap();
+        let found = search(
+            &store,
+            &WordEmbedder,
+            &FakeRetriever::default(),
+            "t",
+            &["kb_ops".into()],
+            q,
+            5,
+            now(),
+        )
+        .await
+        .unwrap();
         assert_eq!(found.hits.len(), 1, "{:?}", found.hits);
         assert!(found.hits[0].text.starts_with("ERR-4021"));
     }
@@ -1050,7 +1299,7 @@ mod tests {
         let v = vector_list(&qv, &cands);
         let k = keyword_list(q, &cands);
         assert!(v.iter().all(|(i, _)| *i == 0) && k.iter().all(|(i, _)| *i == 0));
-        let fused = fuse(&v, &k, &cands);
+        let fused = fuse(&[&v, &k], &cands);
         assert_eq!(fused.iter().map(|(i, _)| *i).collect::<Vec<_>>(), [0]);
         // One word in common out of many is not enough for the keyword list.
         let thin = [Candidate {
@@ -1072,7 +1321,7 @@ mod tests {
                 authoritative: false,
             })
             .collect();
-        let fused = fuse(&deep, &[], &many);
+        let fused = fuse(&[&deep, &[]], &many);
         assert_eq!(fused.len(), 30);
         assert!(fused.iter().all(|(i, _)| *i < 30));
     }
@@ -1094,13 +1343,13 @@ mod tests {
             mk(900.0, true),
         ];
         // 0 is first in both lists; 1 only in one.
-        let fused = fuse(&[(0, 0.9), (1, 0.8)], &[(0, 5.0)], &cands);
+        let fused = fuse(&[&[(0, 0.9), (1, 0.8)], &[(0, 5.0)]], &cands);
         assert_eq!(fused[0].0, 0);
         // Same ranks: the source of truth outranks the plain old one.
-        let fused = fuse(&[(2, 0.9)], &[(3, 5.0)], &cands);
+        let fused = fuse(&[&[(2, 0.9)], &[(3, 5.0)]], &cands);
         assert_eq!(fused[0].0, 3);
         // Same ranks: the newer one outranks the older one.
-        let fused = fuse(&[(2, 0.9)], &[(1, 5.0)], &cands);
+        let fused = fuse(&[&[(2, 0.9)], &[(1, 5.0)]], &cands);
         assert_eq!(fused[0].0, 1);
     }
 
@@ -1122,6 +1371,7 @@ mod tests {
         let found = search(
             &store,
             &WordEmbedder,
+            &FakeRetriever::default(),
             "team_a",
             &["kb_hr".into()],
             "How many weeks is parental leave?",
@@ -1155,6 +1405,7 @@ mod tests {
         let b = search(
             &store,
             &WordEmbedder,
+            &FakeRetriever::default(),
             "team_b",
             &["kb_b".into()],
             q,
@@ -1168,6 +1419,7 @@ mod tests {
         let a = search(
             &store,
             &WordEmbedder,
+            &FakeRetriever::default(),
             "team_a",
             &["kb_b".into()],
             q,
@@ -1190,6 +1442,7 @@ mod tests {
         let a = search(
             &store,
             &WordEmbedder,
+            &FakeRetriever::default(),
             "team_a",
             &["kb_b".into()],
             q,
@@ -1219,6 +1472,7 @@ mod tests {
         let found = search(
             &store,
             &WordEmbedder,
+            &FakeRetriever::default(),
             "t",
             &["kb_hr".into()],
             "Kubernetes ingress certificate rotation",
@@ -1228,13 +1482,20 @@ mod tests {
         .await
         .unwrap();
         assert!(found.hits.is_empty(), "{:?}", found.hits);
-        assert!(
-            search(&store, &WordEmbedder, "t", &[], "Parental leave", 5, now())
-                .await
-                .unwrap()
-                .hits
-                .is_empty()
-        );
+        assert!(search(
+            &store,
+            &WordEmbedder,
+            &FakeRetriever::default(),
+            "t",
+            &[],
+            "Parental leave",
+            5,
+            now()
+        )
+        .await
+        .unwrap()
+        .hits
+        .is_empty());
     }
 
     #[tokio::test]
@@ -1253,6 +1514,7 @@ mod tests {
         let found = search(
             &store,
             &WordEmbedder,
+            &FakeRetriever::default(),
             "t",
             &["kb".into()],
             "parental leave weeks",
@@ -1284,6 +1546,7 @@ mod tests {
         let found = search(
             &store,
             &WordEmbedder,
+            &FakeRetriever::default(),
             "t",
             &["kb".into()],
             "deploy freeze friday",
@@ -1294,5 +1557,335 @@ mod tests {
         .unwrap();
         assert!(found.hits.iter().filter(|h| h.file_id == "big").count() <= 3);
         assert!(found.hits.iter().any(|h| h.file_id == "small"));
+    }
+
+    // ── Connected bases ─────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn a_connected_base_joins_the_fusion_as_one_more_ranked_list() {
+        let store = MemoryStore::default();
+        let local = base("kb_local", "Handbook");
+        store.add_file(
+            "t",
+            &local,
+            "f1",
+            "Leave.md",
+            "2026-05-01",
+            &["Parental leave is sixteen weeks fully paid."],
+        );
+        let remote = remote_base("kb_aws", "Runbooks in AWS", "111122223333");
+        store.add_base("t", &remote);
+        let retriever = FakeRetriever::default();
+        retriever.answer(
+            "t",
+            "kb_aws",
+            Ok(vec![
+                // Bedrock's own ranking: best first, its own scale of score.
+                Hit {
+                    as_of: "2026-10-01".into(),
+                    url: "https://wiki.example.org/leave".into(),
+                    ..remote_hit(
+                        "s3://docs/hr/leave-policy.pdf",
+                        "Parental leave can be split into two blocks of eight weeks.",
+                    )
+                },
+                remote_hit(
+                    "s3://docs/hr/holidays.pdf",
+                    "Public holidays follow the office's country.",
+                ),
+            ]),
+        );
+        let found = search(
+            &store,
+            &WordEmbedder,
+            &retriever,
+            "t",
+            &["kb_local".into(), "kb_aws".into()],
+            "parental leave weeks",
+            10,
+            now(),
+        )
+        .await
+        .unwrap();
+        // Both sides are in one ranking; the remote hit carries the base's
+        // own name and the Bedrock kind, its document and its link.
+        let from_aws: Vec<&Hit> = found.hits.iter().filter(|h| h.kb_id == "kb_aws").collect();
+        assert!(
+            found.hits.iter().any(|h| h.kb_id == "kb_local"),
+            "{:?}",
+            found.hits
+        );
+        assert_eq!(from_aws.len(), 2, "{:?}", found.hits);
+        assert_eq!(from_aws[0].kb_name, "Runbooks in AWS");
+        assert_eq!(from_aws[0].source_kind, "bedrock_kb");
+        assert_eq!(from_aws[0].file_id, "s3://docs/hr/leave-policy.pdf");
+        assert_eq!(from_aws[0].url, "https://wiki.example.org/leave");
+        assert!(from_aws[0].text.contains("two blocks"));
+        // Its first passage outranks its second: Bedrock's order is kept.
+        let pos = |t: &str| found.hits.iter().position(|h| h.text.contains(t)).unwrap();
+        assert!(pos("two blocks") < pos("Public holidays"));
+        // The base was asked once, as this team.
+        assert_eq!(
+            *retriever.calls.lock().unwrap(),
+            [("t".to_string(), "kb_aws".to_string())]
+        );
+        // A list ranked elsewhere counts by rank only: the same rank in the
+        // remote list and in one local list scores the same.
+        let v = vec![0.0f32; 2];
+        let mk = || Candidate {
+            text: "",
+            loc: "",
+            vector: &v,
+            age_days: 0.0,
+            authoritative: false,
+        };
+        let cands = [mk(), mk()];
+        let fused = fuse(&[&[(0, 0.91)], &[], &[(1, 1234.0)]], &cands);
+        assert!((fused[0].1 - fused[1].1).abs() < 1e-9, "{fused:?}");
+    }
+
+    #[tokio::test]
+    async fn a_connected_document_gives_at_most_three_passages() {
+        let store = MemoryStore::default();
+        let remote = remote_base("kb_aws", "Docs in AWS", "111122223333");
+        store.add_base("t", &remote);
+        let retriever = FakeRetriever::default();
+        let mut hits: Vec<Hit> = (0..6)
+            .map(|i| {
+                remote_hit(
+                    "doc-big",
+                    &format!("Deploy freeze rules part {i}: no deploys on Fridays."),
+                )
+            })
+            .collect();
+        hits.push(remote_hit(
+            "doc-small",
+            "Deploy freeze starts Friday at noon.",
+        ));
+        retriever.answer("t", "kb_aws", Ok(hits));
+        let found = search(
+            &store,
+            &WordEmbedder,
+            &retriever,
+            "t",
+            &["kb_aws".into()],
+            "deploy freeze friday",
+            10,
+            now(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            found.hits.iter().filter(|h| h.file_id == "doc-big").count(),
+            3
+        );
+        assert!(found.hits.iter().any(|h| h.file_id == "doc-small"));
+        // The cap is per base and document: the same document id in another
+        // base is another document.
+        let other = remote_base("kb_aws2", "More docs", "111122223333");
+        store.add_base("t", &other);
+        retriever.answer(
+            "t",
+            "kb_aws2",
+            Ok((0..3)
+                .map(|i| remote_hit("doc-big", &format!("Freeze note {i}")))
+                .collect()),
+        );
+        let found = search(
+            &store,
+            &WordEmbedder,
+            &retriever,
+            "t",
+            &["kb_aws".into(), "kb_aws2".into()],
+            "deploy freeze friday",
+            20,
+            now(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            found.hits.iter().filter(|h| h.file_id == "doc-big").count(),
+            6
+        );
+    }
+
+    #[tokio::test]
+    async fn only_connected_bases_never_embed_the_question() {
+        let store = MemoryStore::default();
+        store.add_base("t", &remote_base("kb_aws", "Docs in AWS", "111122223333"));
+        let retriever = FakeRetriever::default();
+        retriever.answer(
+            "t",
+            "kb_aws",
+            Ok(vec![remote_hit(
+                "d",
+                "Rotate the signing keys every ninety days.",
+            )]),
+        );
+        let titan = CountingEmbedder::default();
+        let found = search(
+            &store,
+            &titan,
+            &retriever,
+            "t",
+            &["kb_aws".into()],
+            "signing keys",
+            5,
+            now(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(found.hits.len(), 1);
+        assert_eq!(titan.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+        // With a local file as well, the question is embedded once.
+        let local = base("kb_local", "Handbook");
+        store.add_file(
+            "t",
+            &local,
+            "f",
+            "Keys.md",
+            "2026-01-01",
+            &["Signing keys rotate quarterly."],
+        );
+        search(
+            &store,
+            &titan,
+            &retriever,
+            "t",
+            &["kb_aws".into(), "kb_local".into()],
+            "signing keys",
+            5,
+            now(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(titan.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn a_team_never_reaches_another_teams_connected_base() {
+        let store = MemoryStore::default();
+        let theirs = remote_base("kb_b", "Team B in AWS", "444455556666");
+        store.add_base("team_b", &theirs);
+        let retriever = FakeRetriever::default();
+        retriever.answer(
+            "team_b",
+            "kb_b",
+            Ok(vec![remote_hit(
+                "d",
+                "The enterprise discount floor is forty percent.",
+            )]),
+        );
+        let q = "enterprise discount floor";
+        let b = search(
+            &store,
+            &WordEmbedder,
+            &retriever,
+            "team_b",
+            &["kb_b".into()],
+            q,
+            5,
+            now(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(b.hits.len(), 1);
+        // Team A naming team B's base id: the base isn't team A's, so its
+        // retriever is never even asked.
+        retriever.calls.lock().unwrap().clear();
+        let a = search(
+            &store,
+            &WordEmbedder,
+            &retriever,
+            "team_a",
+            &["kb_b".into()],
+            q,
+            5,
+            now(),
+        )
+        .await
+        .unwrap();
+        assert!(a.hits.is_empty());
+        assert!(retriever.calls.lock().unwrap().is_empty());
+        // A base of team A's with the same id is asked as team A, and gets
+        // team A's answer only.
+        store.add_base(
+            "team_a",
+            &remote_base("kb_b", "Team A in AWS", "111122223333"),
+        );
+        let a = search(
+            &store,
+            &WordEmbedder,
+            &retriever,
+            "team_a",
+            &["kb_b".into()],
+            q,
+            5,
+            now(),
+        )
+        .await
+        .unwrap();
+        assert!(a.hits.is_empty(), "{:?}", a.hits);
+        assert_eq!(
+            *retriever.calls.lock().unwrap(),
+            [("team_a".to_string(), "kb_b".to_string())]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_connected_base_that_fails_is_named_and_the_rest_still_answer() {
+        let store = MemoryStore::default();
+        let local = base("kb_local", "Handbook");
+        store.add_file(
+            "t",
+            &local,
+            "f",
+            "Leave.md",
+            "2026-01-01",
+            &["Parental leave is sixteen weeks."],
+        );
+        store.add_base("t", &remote_base("kb_aws", "Docs in AWS", "111122223333"));
+        let retriever = FakeRetriever::default();
+        let why = crate::knowledge::remote::refusal("AccessDeniedException", "User: arn:aws:sts::111122223333:assumed-role/CoderHelmLogReader/x is not authorized to perform: bedrock:Retrieve on resource: arn:aws:bedrock:us-east-1:111122223333:knowledge-base/ABCDE12345 because no identity-based policy allows the bedrock:Retrieve action");
+        retriever.answer("t", "kb_aws", Err(why.message.clone()));
+        let found = search(
+            &store,
+            &WordEmbedder,
+            &retriever,
+            "t",
+            &["kb_local".into(), "kb_aws".into()],
+            "parental leave weeks",
+            5,
+            now(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(found.hits.len(), 1);
+        assert_eq!(found.unreached.len(), 1);
+        assert_eq!(found.unreached[0].kb_name, "Docs in AWS");
+        assert!(
+            found.unreached[0]
+                .reason
+                .contains("does not allow Retrieve on this knowledge base"),
+            "{}",
+            found.unreached[0].reason
+        );
+        // Only the failing connected base: the search fails, in plain words.
+        let err = search(
+            &store,
+            &WordEmbedder,
+            &retriever,
+            "t",
+            &["kb_aws".into()],
+            "parental leave",
+            5,
+            now(),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            err.starts_with("Docs in AWS: The role in your account does not allow Retrieve"),
+            "{err}"
+        );
     }
 }

@@ -713,6 +713,7 @@ pub(crate) async fn add_source(
     kb_id: &str,
     input: &SourceInput,
 ) -> Result<Value, (StatusCode, Json<Value>)> {
+    super::knowledge::refuse_if_connected(state, &claims.team_id, kb_id).await?;
     let kind = kind_of(&input.kind)?;
     let selection = clean_selection(input.selection.as_deref().unwrap_or_default())
         .map_err(|m| fail(StatusCode::BAD_REQUEST, &m))?;

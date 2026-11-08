@@ -67,6 +67,10 @@ pub struct AwsAccount {
     pub abilities: Abilities,
     /// The last live check of this release's permissions, if any.
     pub permissions: Option<super::permissions::PermissionCheck>,
+    /// The ARNs of the team's knowledge bases connected in this account
+    /// (filled by the caller, never stored here): an update keeps the role
+    /// able to search them.
+    pub knowledge_bases: Vec<String>,
 }
 
 fn s(item: &Item, k: &str) -> String {
@@ -115,6 +119,7 @@ impl AwsAccount {
                 region
             },
             status: s(item, "status"),
+            knowledge_bases: Vec::new(),
             permissions: item
                 .get("permissions_check")
                 .and_then(|v| v.as_s().ok())
@@ -303,7 +308,7 @@ impl AwsAccount {
                 "skipped": a.airflow_skip,
                 "environments": self.airflow_environments(),
             },
-            "permissions": self.permissions.as_ref().map(|p| p.view(false, &crate::public_urls::log_reader_template_url())),
+            "permissions": self.permissions.as_ref().map(|p| p.view_with(false, &crate::public_urls::log_reader_template_url(), &self.knowledge_bases)),
         })
     }
 

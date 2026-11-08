@@ -367,9 +367,16 @@ impl KnowledgeTools {
             client: &state.bedrock,
             meter: &meter,
         };
+        let retriever = common::knowledge::remote::Bedrock {
+            sts: &state.sts,
+            dynamo: &state.dynamo,
+            accounts_table: &state.config.aws_insights_table_name,
+            actor: "knowledge",
+        };
         let hits = search(
             &store(state),
             &titan,
+            &retriever,
             &self.team_id,
             &ids,
             query,
@@ -385,7 +392,14 @@ impl KnowledgeTools {
                         "Knowledge files embedded by another model are skipped until re-embedded"
                     );
                 }
-                render_hits(&found.hits)
+                let mut text = render_hits(&found.hits);
+                for u in &found.unreached {
+                    text.push_str(&format!(
+                        "\n(Couldn't search {} this time: {})",
+                        u.kb_name, u.reason
+                    ));
+                }
+                text
             }
             Err(e) => {
                 warn!(error = %e, "Knowledge search failed");

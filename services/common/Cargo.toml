@@ -28,6 +28,10 @@ aws-sdk-scheduler = "1"
 hex = "0.4"
 # embed: Titan embeddings on CoderHelm's own AWS account, metered
 aws-sdk-bedrockruntime = "1"
+# knowledge: a Bedrock knowledge base connected in place, searched live in
+# the team's own account (Retrieve), and listed on a self-hosted install
+aws-sdk-bedrockagentruntime = "1"
+aws-sdk-bedrockagent = "1"
 tokio = { version = "1", features = ["macros", "time", "net", "rt", "sync"] }
 # live: read-only lookups against a team's own systems
 graphql-parser = "0.4"

@@ -16,10 +16,17 @@
 //! the old one only once it is ready. Search loads the indexes of the bases
 //! asked for (cached per version) and ranks passages in memory, which is
 //! comfortably fast at the limits below.
+//!
+//! A base can instead be **connected in place** ([`Backend::Remote`]): an
+//! Amazon Bedrock knowledge base in the team's own AWS account, searched
+//! live where it is ([`remote`]). Nothing of it is copied: it has no files,
+//! no passages and no vectors here, and search merges the list Bedrock
+//! ranked with the local ones.
 
 pub mod answer;
 pub mod chunk;
 pub mod extract;
+pub mod remote;
 pub mod search;
 pub mod sources;
 
@@ -88,6 +95,117 @@ pub struct Base {
     pub created_by: String,
     #[serde(default)]
     pub updated_at: String,
+    /// Where its passages are: here ([`Backend::Local`], every base made
+    /// before connecting in place existed), or searched live elsewhere.
+    #[serde(default, skip_serializing_if = "Backend::is_local")]
+    pub backend: Backend,
+}
+
+/// Where a base's passages live and are ranked.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum Backend {
+    /// Uploaded and synced files, embedded and ranked by Coderhelm.
+    #[default]
+    Local,
+    /// Searched live where it lives; nothing is copied.
+    Remote(Remote),
+}
+
+impl Backend {
+    pub fn is_local(&self) -> bool {
+        matches!(self, Backend::Local)
+    }
+}
+
+/// A knowledge base connected in place.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Remote {
+    pub provider: Provider,
+    /// The provider's address for it (a Bedrock knowledge base's ARN).
+    pub target: String,
+    /// The region it lives in, read from the ARN (never the install's).
+    pub region: String,
+    /// How Coderhelm reaches it.
+    pub access: Access,
+    /// Bedrock's hybrid search (vectors and keywords) is used: true unless
+    /// the knowledge base's vector store refused it when it was connected.
+    #[serde(default = "yes")]
+    pub hybrid: bool,
+}
+
+fn yes() -> bool {
+    true
+}
+
+/// Who answers for a connected knowledge base.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Provider {
+    /// Amazon Bedrock Knowledge Bases (`bedrock-agent-runtime` Retrieve).
+    BedrockKb,
+}
+
+impl Provider {
+    pub fn label(self) -> &'static str {
+        match self {
+            Provider::BedrockKb => "Bedrock knowledge base",
+        }
+    }
+}
+
+/// The AWS identity a connected knowledge base is searched with.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum Access {
+    /// A self-hosted install's own role, in the install's own account
+    /// (`live::aws::install_read_role`): its permissions come with each
+    /// version update.
+    Install,
+    /// The team's connected `CoderHelmLogReader` role in `account`, taken
+    /// on with the team's private ID for a 15 minute session
+    /// (`live::aws::assume`). The private ID is read from Coderhelm's own
+    /// record of the account, never stored here.
+    Account { account: String },
+}
+
+/// Where a passage came from, as a [`search::Hit`] and a citation name it
+/// (`source_kind`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SourceKind {
+    /// A file someone uploaded.
+    Upload,
+    /// An item synced from a connected app.
+    Synced(sources::Kind),
+    /// A passage a connected Bedrock knowledge base returned, live.
+    BedrockKb,
+}
+
+impl SourceKind {
+    /// The key a hit and a citation carry (empty for an upload).
+    pub fn key(self) -> &'static str {
+        match self {
+            SourceKind::Upload => "",
+            SourceKind::Synced(k) => k.key(),
+            SourceKind::BedrockKb => "bedrock_kb",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            SourceKind::Upload => "Uploaded file",
+            SourceKind::Synced(k) => k.label(),
+            SourceKind::BedrockKb => Provider::BedrockKb.label(),
+        }
+    }
+
+    pub fn parse(key: &str) -> Option<SourceKind> {
+        match key {
+            "" => Some(SourceKind::Upload),
+            "bedrock_kb" => Some(SourceKind::BedrockKb),
+            k => sources::Kind::parse(k).map(SourceKind::Synced),
+        }
+    }
 }
 
 fn default_read_role() -> String {
@@ -95,6 +213,14 @@ fn default_read_role() -> String {
 }
 
 impl Base {
+    /// Connected in place: searched live where it lives, nothing copied.
+    pub fn remote(&self) -> Option<&Remote> {
+        match &self.backend {
+            Backend::Remote(r) => Some(r),
+            Backend::Local => None,
+        }
+    }
+
     /// May someone with `role` read this base?
     pub fn readable_by(&self, role: &str) -> bool {
         role_level(role) >= role_level(&self.read_role)
@@ -436,6 +562,53 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(read_data::<Base>(&base_record("t", &b)).unwrap(), b);
+    }
+
+    #[test]
+    fn every_existing_base_is_local_and_a_connected_one_round_trips() {
+        // A record saved before backends existed reads as local, and a local
+        // base is saved exactly as before (no new field).
+        let old: Base = serde_json::from_str(r#"{"id":"k","name":"n"}"#).unwrap();
+        assert_eq!(old.backend, Backend::Local);
+        assert!(old.remote().is_none());
+        let saved = serde_json::to_value(&old).unwrap();
+        assert!(saved.get("backend").is_none(), "{saved}");
+        let b = Base {
+            id: "kb".into(),
+            name: "Runbooks".into(),
+            backend: Backend::Remote(Remote {
+                provider: Provider::BedrockKb,
+                target: "arn:aws:bedrock:eu-west-1:111122223333:knowledge-base/ABCDE12345".into(),
+                region: "eu-west-1".into(),
+                access: Access::Account {
+                    account: "111122223333".into(),
+                },
+                hybrid: true,
+            }),
+            ..Default::default()
+        };
+        let v = serde_json::to_value(&b).unwrap();
+        assert_eq!(v["backend"]["kind"], "remote");
+        assert_eq!(v["backend"]["provider"], "bedrock_kb");
+        assert_eq!(v["backend"]["access"]["kind"], "account");
+        assert_eq!(read_data::<Base>(&base_record("t", &b)).unwrap(), b);
+        // No private ID is ever kept on the base.
+        assert!(!v.to_string().contains("external"));
+        let install: Access = serde_json::from_str(r#"{"kind":"install"}"#).unwrap();
+        assert_eq!(install, Access::Install);
+    }
+
+    #[test]
+    fn source_kinds_name_where_a_passage_came_from() {
+        assert_eq!(SourceKind::BedrockKb.key(), "bedrock_kb");
+        assert_eq!(SourceKind::BedrockKb.label(), "Bedrock knowledge base");
+        assert_eq!(SourceKind::parse("bedrock_kb"), Some(SourceKind::BedrockKb));
+        assert_eq!(
+            SourceKind::parse("notion"),
+            Some(SourceKind::Synced(sources::Kind::Notion))
+        );
+        assert_eq!(SourceKind::parse(""), Some(SourceKind::Upload));
+        assert_eq!(SourceKind::parse("nope"), None);
     }
 
     #[test]

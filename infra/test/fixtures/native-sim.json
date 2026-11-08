@@ -489,6 +489,7 @@
       "bedrock:InvokeModelWithResponseStream",
       "bedrock:Get*",
       "bedrock:List*",
+      "bedrock:Retrieve",
       "cloudformation:*",
       "cloudfront:*",
       "cloudwatch:*",

@@ -221,6 +221,17 @@ impl PermissionCheck {
     /// missing), the one-click update and any problem. `template_url` is
     /// the install's role template ([`crate::public_urls::log_reader_template_url`]).
     pub fn view(&self, pressed: bool, template_url: &str) -> Value {
+        self.view_with(pressed, template_url, &[])
+    }
+
+    /// [`Self::view`], with the ARNs of the team's knowledge bases connected
+    /// in this account: the update keeps the role able to search them.
+    pub fn view_with(
+        &self,
+        pressed: bool,
+        template_url: &str,
+        knowledge_bases: &[String],
+    ) -> Value {
         let missing: Vec<Value> = self
             .missing
             .iter()
@@ -256,8 +267,8 @@ impl PermissionCheck {
             .flatten()
             .map(|t| {
                 json!({
-                    "url": log_reader::update_url(&t, &self.region),
-                    "stack_name": log_reader::update_stack_name(),
+                    "url": log_reader::update_url(&t, &self.region, knowledge_bases),
+                    "stack_name": log_reader::update_stack_name_for(knowledge_bases),
                     "template_url": t,
                     "sign_in_account": self.account,
                     "stacks_url": log_reader::stack_list_url(&self.region),
@@ -388,7 +399,7 @@ async fn simulate(s: &Session, target: &AwsTarget) -> Result<Vec<Simulated>, boo
     let iam = client!(aws_sdk_iam, s, "us-east-1".to_string());
     let account = target.account();
     let mut groups: Vec<(String, Vec<String>)> = Vec::new();
-    for a in log_reader::all_actions() {
+    for a in log_reader::checked_actions() {
         let r = simulated_resource(a, &target.role_arn, &target.region, account);
         match groups.iter_mut().find(|(res, _)| *res == r) {
             Some((_, v)) => v.push(a.to_string()),

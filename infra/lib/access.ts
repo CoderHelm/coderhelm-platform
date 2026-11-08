@@ -212,6 +212,13 @@ export const BOUNDARY_SERVICES = [
   "bedrock:InvokeModelWithResponseStream",
   "bedrock:Get*",
   "bedrock:List*",
+  // Searching a Bedrock knowledge base connected in place, in the install's own
+  // account (own-account-read.ts; GetDocumentContent and ListKnowledgeBases are
+  // under Get* and List*). It reaches an install only through the access stack
+  // an AWS admin applies (native/access-stack.ts): the parent keeps its pinned
+  // boundary (access-pinned.json), and until the admin step the knowledge base
+  // page says so (services/common/src/knowledge/remote.rs, refusal).
+  "bedrock:Retrieve",
   "cloudformation:*",
   "cloudfront:*",
   "cloudwatch:*",

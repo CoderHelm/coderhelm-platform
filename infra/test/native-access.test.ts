@@ -52,14 +52,16 @@ const canon = (v: unknown) => JSON.stringify(v, (_k, x) => (x && typeof x === "o
 const sha = (v: unknown) => crypto.createHash("sha256").update(canon(v)).digest("hex");
 
 /**
- * Today's boundary and deploy role policy, as their sha256. A change here
+ * Today's boundary and deploy role policy, as their sha256. Last changed for
+ * bedrock:Retrieve (a Bedrock knowledge base connected in place, searched with
+ * the install's own role). A change here
  * reaches no install by itself: an AWS admin applies it through the access
  * stack (Settings, System, Permissions). Before changing these two values,
  * batch it with whatever else needs the same admin step, and say so in the
  * release notes; the dashboard then offers it as one optional item.
  */
 const ACCESS_DOCS = {
-  boundary: "e336aa5d3446090ae84ae7b36ab55953455d662b997ab0947aabb5a091ec555e",
+  boundary: "1dfff5e344b055bba2eb45e611d86466018eff191525cbbffab7fdf33b841141",
   deployRole: "d11f40637e639812ba5408d153351341bc593cb604726f6cb4193861c2dd7b1f",
 };
 
@@ -157,4 +159,20 @@ test("the access stack has no service role and changes nothing on delete", () =>
   assert.equal(ACCESS.RoleARN, undefined);
   for (const r of Object.values<any>(ACCESS.Resources)) assert.equal(r.DeletionPolicy, undefined);
   assert.match(fs.readFileSync(path.join(__dirname, "..", "..", "..", "lambda", "native-access", "handler.py"), "utf8"), /On Delete it changes nothing/);
+});
+
+test("searching a connected Bedrock knowledge base arrives with the access stack, never with an update", () => {
+  const values = prodValues("111122223333", "us-east-1");
+  const kb = { action: "bedrock:Retrieve", resource: "arn:aws:bedrock:us-east-1:111122223333:knowledge-base/ABCDE12345" };
+  const anything: PolicyDocument = { Version: "2012-10-17", Statement: [{ Sid: "All", Effect: "Allow", Action: "*", Resource: "*" }] };
+  // The parent's boundary is the pinned one: an update leaves an install without Retrieve.
+  const pinned = resolveValue((pinnedAccess().Boundary as any).Properties.PolicyDocument, { values, conditions: { HasEmailFrom: true } }) as PolicyDocument;
+  assert.notEqual(decision([anything], pinned, kb), "allowed", "the pinned boundary must not change");
+  // Today's boundary, which access.json writes when an AWS admin applies it, allows it.
+  const today = resolveValue(ACCESS.Resources.Access.Properties.Boundary.Document, { values: { ...values, EmailFrom: "owner@example.org" }, conditions: { HasEmailFrom: true } }) as PolicyDocument;
+  assert.equal(decision([anything], today, kb), "allowed");
+  // Listing and reading a cited document were already allowed (bedrock:List*, bedrock:Get*).
+  for (const action of ["bedrock:ListKnowledgeBases", "bedrock:GetDocumentContent"]) {
+    assert.equal(decision([anything], pinned, { ...kb, action }), "allowed", action);
+  }
 });

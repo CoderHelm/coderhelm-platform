@@ -294,7 +294,7 @@ pub fn install_account(a: &AwsAccount) -> bool {
 /// person can add it (never in the install's own account).
 fn update_stack_link(a: &AwsAccount) -> Option<String> {
     (!install_account(a) && (!aws_missing(a).is_empty() || needs_update(a)))
-        .then(|| super::connectors::update_stack_url(&a.region))
+        .then(|| super::connectors::update_stack_url(&a.region, &a.knowledge_bases))
         .flatten()
 }
 
@@ -445,6 +445,7 @@ pub async fn list(
         aws_account::list(&state.dynamo, &state.config.aws_insights_table_name, &team)
             .await
             .map_err(|e| internal("list aws accounts", e))?;
+    with_knowledge_bases(&state, &team, &mut accounts).await;
     // A support view only reads: no migration, no checks into the team's
     // AWS accounts (they would run as the support admin).
     let support_view = claims.support_view.is_some();
@@ -576,7 +577,9 @@ pub async fn list(
             detail["missing"] = json!(aws_missing(a));
             detail["update_url"] = json!(update_stack_link(a));
             detail["install_account"] = json!(install_account(a));
-            detail["stack_name"] = json!(common::log_reader::update_stack_name());
+            detail["stack_name"] = json!(common::log_reader::update_stack_name_for(
+                &a.knowledge_bases
+            ));
             items.push(card(
                 &format!("aws-{}", a.account),
                 &format!("AWS account {}", a.account),
@@ -787,6 +790,7 @@ async fn load_account(
     team_id: &str,
     account: &str,
 ) -> Result<AwsAccount, (StatusCode, Json<Value>)> {
+    let kbs = common::knowledge::remote::arns_in(&team_bases(state, team_id).await, account);
     aws_account::list(
         &state.dynamo,
         &state.config.aws_insights_table_name,
@@ -797,6 +801,27 @@ async fn load_account(
     .into_iter()
     .find(|a| a.account == account)
     .ok_or_else(|| fail(StatusCode::NOT_FOUND, "That AWS account isn't connected."))
+    .map(|mut a| {
+        a.knowledge_bases = kbs;
+        a
+    })
+}
+
+/// Each account's connected knowledge bases, so its update link keeps the
+/// role able to search them.
+async fn with_knowledge_bases(state: &AppState, team_id: &str, accounts: &mut [AwsAccount]) {
+    let bases = team_bases(state, team_id).await;
+    for a in accounts {
+        a.knowledge_bases = common::knowledge::remote::arns_in(&bases, &a.account);
+    }
+}
+
+async fn team_bases(state: &AppState, team_id: &str) -> Vec<common::knowledge::Base> {
+    use common::knowledge::search::Store;
+    super::knowledge::store(state)
+        .bases(team_id)
+        .await
+        .unwrap_or_default()
 }
 
 fn account_reply(a: &AwsAccount) -> Value {
@@ -804,7 +829,9 @@ fn account_reply(a: &AwsAccount) -> Value {
     detail["missing"] = json!(aws_missing(a));
     detail["update_url"] = json!(update_stack_link(a));
     detail["install_account"] = json!(install_account(a));
-    detail["stack_name"] = json!(common::log_reader::update_stack_name());
+    detail["stack_name"] = json!(common::log_reader::update_stack_name_for(
+        &a.knowledge_bases
+    ));
     let st = aws_state(a);
     json!({ "account": detail, "status": st.status, "reason": st.reason, "last_check": a.abilities.checked_at })
 }

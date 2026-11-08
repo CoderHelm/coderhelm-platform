@@ -135,6 +135,40 @@ CoderHelm asks for `https://www.googleapis.com/auth/drive.readonly`. A knowledge
 
 On a hybrid install that chose CoderHelm's Google app, Drive is offered only while the hosted service has its own Drive app; otherwise the choice is unavailable and the install falls back to its own keys.
 
+## Bedrock knowledge bases, connected in place
+
+A knowledge base in Amazon Bedrock can be connected in place instead of copied. CoderHelm searches it live in your AWS account each time an agent or the brain chat needs it, and nothing is copied out: no documents, no passages, no vectors. Bedrock turns the question into a search itself, so it doesn't matter which embedding model, chunking or vector store the knowledge base uses. Both kinds of Bedrock knowledge base work, the classic ones whose vector store you run and the managed ones.
+
+To connect one, open **Knowledge**, **New knowledge base**, **Bedrock knowledge base**. On a self-hosted install the dialog lists the knowledge bases in the install's own account and region; pick one, or paste the ARN of any knowledge base (`arn:aws:bedrock:<region>:<account>:knowledge-base/<id>`). Before anything is saved, CoderHelm runs one test search. When it fails, the dialog says why in one sentence and what to do. The base's page then shows **Connected in place: searched live in your AWS account, nothing copied** instead of a list of files, and it takes no uploads or synced apps.
+
+How it is searched:
+
+- **Hybrid search.** CoderHelm asks for Bedrock's hybrid search (vectors and keywords) where the vector store supports it, and plain vector search where it doesn't (the test search finds out). No reranking.
+- **Merged with your other bases.** Bedrock's ranked list joins the same rank fusion as CoderHelm's own lists, so answers can cite a connected base and an uploaded file side by side. At most three passages come from one document.
+- **Citations.** A citation names the document and links to it: the original page for a web, Confluence or SharePoint source, and the S3 console for an S3 object (which opens only for people who can sign in to that account).
+- **The region is the ARN's.** A knowledge base in another region than the install is searched in its own region.
+- **When it doesn't answer.** The other bases still answer, and the agent or chat is told that this one couldn't be searched, and why.
+
+### Who searches it
+
+A knowledge base in the install's own account is searched with the install's own gateway and worker roles. Their read-only policy comes from the same update template as the rest of the install's own-account reads, and for the install it names every knowledge base in its account (`bedrock:Retrieve` and `bedrock:GetDocumentContent` on `arn:aws:bedrock:*:<account>:knowledge-base/*`, and `bedrock:ListKnowledgeBases` for the list). Admins still choose which ones a team connects. Each version update brings this policy along.
+
+A knowledge base in another account is searched with that account's `CoderHelmLogReader` role, the one the account was connected with on **Settings**, **Integrations**, **AWS**. Connect that account first. The role may search only the knowledge bases named in its stack's `KnowledgeBases` parameter (their ARNs separated by commas, or `all` for every knowledge base in that account). When the test search finds the role can't, the dialog says "The role in your account does not allow Retrieve on this knowledge base" and offers a one-click update stack in that account with the parameter filled in. That stack carries everything the role's other update stacks do, so you can delete the older `CoderHelmLogReaderUpdate` stacks once it is in place. If AWS says the role's policies are too large, delete them first.
+
+### The permissions boundary: one admin step
+
+Searching needs `bedrock:Retrieve`, and the install's permissions boundary allows it only from this release on. Listing and reading a cited document were already allowed (`bedrock:List*`, `bedrock:Get*`). An update never changes the boundary: the parent stack keeps the boundary installs have, and the new one reaches an install only through the access stack an AWS admin applies (**Settings**, **System**, **Version**, **Permissions**, one link to the AWS console). See [Updates](./updates.md).
+
+Until an admin applies it, connecting a knowledge base in the install's own account says so plainly: "This install's permission limit doesn't allow searching Bedrock knowledge bases yet: the release that searches them needs a permission change an AWS admin hasn't applied." Nothing else waits on it, and knowledge bases in other accounts work without it.
+
+### Private networks
+
+An install whose functions have no internet route needs interface VPC endpoints for `bedrock-agent-runtime` (search) and `bedrock-agent` (the list), in each region a connected knowledge base lives in. Without them the dialog says CoderHelm couldn't reach Bedrock.
+
+### Who sees what
+
+Everyone who can read the CoderHelm knowledge base sees what the search returns, whatever their rights in the systems the Bedrock knowledge base was built from. Agents search the bases attached to them, so anyone who can start a run reaches everything the role can search in those bases. Connect only knowledge bases that everyone with that access may read.
+
 ## What runs
 
 - **Schedule.** An EventBridge rule (`<prefix>-knowledge-sync`) drops `knowledge_sync_sweep` on the ticket queue every 15 minutes. The worker queues a sync for each source that is due: every 15 minutes for a Sanity sign-in source, every hour for other sources, or every 6 hours as a backstop for sources that get instant updates.

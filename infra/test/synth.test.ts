@@ -195,7 +195,7 @@ test("self-host: the gateway and worker read the install's own account with this
     for (const a of needed) assert.ok(doc.includes(`"${a}"`), `${fn} lacks ${a}`);
     // Only reads: list, describe, get, query, never a write.
     const actions: string[] = policies[0].Properties.PolicyDocument.Statement.flatMap((s: any) => ([] as string[]).concat(s.Action));
-    for (const a of actions) assert.match(a, /^[a-z0-9-]+:(List|Describe|Get|Filter|Start(Query)?$|Stop(Query)?$|BatchGet|Simulate|InvokeRestApi)/, a);
+    for (const a of actions) assert.match(a, /^[a-z0-9-]+:(List|Describe|Get|Filter|Start(Query)?$|Stop(Query)?$|BatchGet|Simulate|InvokeRestApi|Retrieve$)/, a);
     // It checks its own permissions on its own role only.
     const sim = policies[0].Properties.PolicyDocument.Statement.find((s: any) => ([] as string[]).concat(s.Action).includes("iam:SimulatePrincipalPolicy"));
     assert.ok(JSON.stringify(sim.Resource).includes("Fn::GetAtt"), "its own role's ARN");
