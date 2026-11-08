@@ -1070,6 +1070,10 @@ async fn main() -> Result<(), Error> {
             put(routes::mcp_servers::save_own_app),
         )
         .route(
+            "/mcp-servers/apps/:catalog_id/coderhelm",
+            post(routes::mcp_servers::connect_coderhelm_app),
+        )
+        .route(
             "/mcp-servers/:id/client",
             put(routes::mcp_servers::set_client),
         )

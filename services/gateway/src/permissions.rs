@@ -555,6 +555,7 @@ pub const CAPABILITIES: &[Capability] = &[
             "mcp_servers::remove",
             "mcp_servers::set_client",
             "mcp_servers::save_own_app",
+            "mcp_servers::connect_coderhelm_app",
             "mcp_servers::set_key",
             "mcp_servers::set_tools",
             "mcp_servers::approve",

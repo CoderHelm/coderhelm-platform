@@ -2742,33 +2742,92 @@ pub async fn share(
     Ok(Json(json!({ "ok": true })))
 }
 
-// ── OAuth broker (Notion, Confluence, Google Drive) ──────────────────────
+// ── OAuth broker (Notion, Confluence, Google Drive, Figma) ───────────────
 
-fn kind_of(raw: &str) -> Option<common::knowledge::sources::Kind> {
+/// A provider the broker signs installs in to with CoderHelm's app: a
+/// knowledge source, or a catalog server whose package takes a token (Figma).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Brokered {
+    Source(common::knowledge::sources::Kind),
+    App(&'static str),
+}
+
+impl Brokered {
+    /// The id installs and the hybrid settings name it by.
+    pub fn key(self) -> &'static str {
+        match self {
+            Brokered::Source(k) => k.key(),
+            Brokered::App(id) => id,
+        }
+    }
+
+    /// The id of its sign-in record (the same on both sides).
+    pub fn connection_id(self) -> String {
+        match self {
+            Brokered::Source(k) => common::knowledge::sources::oauth::connection_id(k),
+            Brokered::App(id) => common::mcp_remote::own_app::connection_id(id),
+        }
+    }
+
+    /// The sign-in record with CoderHelm's app `client_id` (its secret
+    /// already sealed for the record).
+    pub fn record(
+        self,
+        client_id: &str,
+        sealed: &str,
+    ) -> Option<common::mcp_remote::store::ServerRecord> {
+        match self {
+            Brokered::Source(k) => {
+                let p = common::knowledge::sources::oauth::provider(k)?;
+                Some(common::knowledge::sources::oauth::connection_record(
+                    k, &p, client_id, sealed,
+                ))
+            }
+            Brokered::App(id) => {
+                let app = common::mcp_catalog::own_app(id)?;
+                let def = common::mcp_catalog::find(id)?;
+                Some(common::mcp_remote::own_app::record(
+                    id, def.name, &app, client_id, sealed,
+                ))
+            }
+        }
+    }
+}
+
+/// The provider an id names, when the broker serves it.
+pub fn brokered_of(raw: &str) -> Option<Brokered> {
     use common::knowledge::sources::Kind;
     match raw {
-        "notion" => Some(Kind::Notion),
-        "confluence" => Some(Kind::Confluence),
-        "google_drive" | "google-drive" => Some(Kind::GoogleDrive),
+        "notion" => Some(Brokered::Source(Kind::Notion)),
+        "confluence" => Some(Brokered::Source(Kind::Confluence)),
+        "google_drive" | "google-drive" => Some(Brokered::Source(Kind::GoogleDrive)),
+        "figma" => Some(Brokered::App("figma")),
         _ => None,
     }
 }
 
-/// The hosted integrations this side can actually serve: a knowledge
+/// CoderHelm's app for a brokered provider, from the hosted secret.
+fn broker_app(state: &AppState, b: Brokered) -> common::knowledge::sources::oauth::App {
+    match b {
+        Brokered::Source(k) => super::knowledge_sources::app(state, k),
+        Brokered::App(id) => super::mcp_servers::coderhelm_app(state, id),
+    }
+}
+
+/// The hosted integrations this side can actually serve: a brokered
 /// provider only when CoderHelm's own app for it is set up (Google Drive
 /// needs `google_drive_client_id` and `google_drive_client_secret`, never
-/// the Google sign-in client). Installs see this as `offered` and can't
-/// choose the rest.
+/// the Google sign-in client; Figma `figma_client_id` and
+/// `figma_client_secret`). Installs see this as `offered` and can't choose
+/// the rest.
 pub fn offered_ids(state: &AppState) -> Vec<&'static str> {
-    offered_from(|k| super::knowledge_sources::app(state, k).is_set())
+    offered_from(|b| broker_app(state, b).is_set())
 }
 
 /// [`offered_ids`] for a given "is this provider's app set up" (pure; tested).
-pub fn offered_from(
-    app_set: impl Fn(common::knowledge::sources::Kind) -> bool,
-) -> Vec<&'static str> {
+pub fn offered_from(app_set: impl Fn(Brokered) -> bool) -> Vec<&'static str> {
     common::hybrid::integrations::hosted_ids()
-        .filter(|id| kind_of(id).is_none_or(&app_set))
+        .filter(|id| brokered_of(id).is_none_or(&app_set))
         .collect()
 }
 
@@ -2825,7 +2884,7 @@ pub async fn oauth_authorize(
         )
             .into_response();
     }
-    let Some(k) = kind_of(&kind) else {
+    let Some(k) = brokered_of(&kind) else {
         return (StatusCode::NOT_FOUND, "Unknown provider.").into_response();
     };
     let install_id = q.client_id.unwrap_or_default();
@@ -2856,10 +2915,7 @@ pub async fn oauth_authorize(
     let flow = broker::new_handle("fl");
     let team = signin_team(&install.id, &flow);
     let rt = super::mcp_servers::runtime(&state, &team);
-    let a = super::knowledge_sources::app(&state, k);
-    let Some(p) = common::knowledge::sources::oauth::provider(k) else {
-        return StatusCode::NOT_FOUND.into_response();
-    };
+    let a = broker_app(&state, k);
     if !a.is_set() {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -2867,12 +2923,13 @@ pub async fn oauth_authorize(
         )
             .into_response();
     }
-    let id = common::knowledge::sources::oauth::connection_id(k);
+    let id = k.connection_id();
     let Ok(sealed) = rt.seal_client_secret(&id, a.client_secret.trim()).await else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
-    let mut rec =
-        common::knowledge::sources::oauth::connection_record(k, &p, a.client_id.trim(), &sealed);
+    let Some(mut rec) = k.record(a.client_id.trim(), &sealed) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
     rec.added_by = format!("hybrid:{}", install.id);
     rec.added_at = now();
     if rt.store.put_server(&team, &rec).await.is_err() {
@@ -3018,19 +3075,19 @@ async fn adopt_provider_sign_in(
     if !is_flow(flow) {
         return Err("no holding partition".into());
     }
-    let k = kind_of(kind).ok_or("unknown provider")?;
-    let p = common::knowledge::sources::oauth::provider(k).ok_or("unknown provider")?;
-    let a = super::knowledge_sources::app(state, k);
+    let k = brokered_of(kind).ok_or("unknown provider")?;
+    let a = broker_app(state, k);
     if !a.is_set() {
         return Err("CoderHelm's app for this provider isn't set up".into());
     }
     let team = hosted_team(install_id);
     let rt = super::mcp_servers::runtime(state, &team);
     let hold = super::mcp_servers::runtime(state, &signin_team(install_id, flow));
-    let id = common::knowledge::sources::oauth::connection_id(k);
+    let id = k.connection_id();
     let sealed = rt.seal_client_secret(&id, a.client_secret.trim()).await?;
-    let mut rec =
-        common::knowledge::sources::oauth::connection_record(k, &p, a.client_id.trim(), &sealed);
+    let mut rec = k
+        .record(a.client_id.trim(), &sealed)
+        .ok_or("unknown provider")?;
     rec.added_by = format!("hybrid:{install_id}");
     rec.added_at = now();
     rt.store.put_server(&team, &rec).await?;
@@ -3170,12 +3227,12 @@ pub async fn oauth_token(State(state): State<Arc<AppState>>, body: Bytes) -> Rep
             "CoderHelm's app for this provider was turned off for this install.",
         ));
     }
-    let k = kind_of(&kind).ok_or_else(|| token_error("invalid_grant", "Unknown provider."))?;
+    let k = brokered_of(&kind).ok_or_else(|| token_error("invalid_grant", "Unknown provider."))?;
     let team = hosted_team(&install.id);
     let rt = super::mcp_servers::runtime(&state, &team);
     let rec = rt
         .store
-        .get_server(&team, &common::knowledge::sources::oauth::connection_id(k))
+        .get_server(&team, &k.connection_id())
         .await
         .ok()
         .flatten()
@@ -3354,10 +3411,59 @@ mod tests {
         use common::knowledge::sources::Kind;
         let none = offered_from(|_| false);
         assert_eq!(none, vec!["github", "jira"]);
-        let no_drive = offered_from(|k| k != Kind::GoogleDrive);
+        let no_drive = offered_from(|k| k != Brokered::Source(Kind::GoogleDrive));
         assert!(!no_drive.contains(&"google_drive"));
         assert!(no_drive.contains(&"notion") && no_drive.contains(&"confluence"));
         assert!(offered_from(|_| true).contains(&"google_drive"));
+    }
+
+    /// Figma is offered only once CoderHelm's Figma app is in the hosted
+    /// secret, like every other brokered provider.
+    #[test]
+    fn figma_is_offered_only_with_coderhelms_figma_app() {
+        assert!(!offered_from(|b| b != Brokered::App("figma")).contains(&"figma"));
+        assert!(offered_from(|_| true).contains(&"figma"));
+    }
+
+    /// The broker serves Figma with the same record an install keeps (id
+    /// `app-figma`), signed in at Figma itself with CoderHelm's client.
+    #[test]
+    fn figma_is_brokered_with_its_own_app_record() {
+        let b = brokered_of("figma").unwrap();
+        assert_eq!(b.key(), "figma");
+        assert_eq!(b.connection_id(), "app-figma");
+        let r = b.record("ch-client", "sealed").unwrap();
+        assert_eq!(r.id, "app-figma");
+        assert_eq!(r.catalog_id, "app:figma");
+        let o = r.oauth.unwrap();
+        assert_eq!(o.authorization_endpoint, "https://www.figma.com/oauth");
+        assert_eq!(o.token_endpoint, "https://api.figma.com/v1/oauth/token");
+        assert_eq!(o.refresh_endpoint, "https://api.figma.com/v1/oauth/refresh");
+        assert_eq!(o.client_id, "ch-client");
+        assert_eq!(o.scopes, vec!["current_user:read", "file_content:read"]);
+        // Knowledge sources keep their ids; anything else isn't brokered.
+        assert_eq!(brokered_of("notion").unwrap().connection_id(), "ks-notion");
+        assert!(brokered_of("sentry").is_none() && brokered_of("github").is_none());
+    }
+
+    /// The broker hands a sign-in back only to the install's own callback
+    /// page (the one redirect Figma knows is the hosted page; the install's
+    /// is checked here, never sent to Figma).
+    #[test]
+    fn a_figma_sign_in_returns_only_to_the_installs_callback() {
+        let origins = vec!["https://acme.coderhelm.com".to_string()];
+        assert!(broker::redirect_allowed(
+            "https://acme.coderhelm.com/settings/integrations/mcp-callback/",
+            &origins
+        ));
+        for bad in [
+            "https://other.coderhelm.com/settings/integrations/mcp-callback/",
+            "https://acme.coderhelm.com/settings/integrations/mcp-callback/?next=https://evil.example",
+            "https://acme.coderhelm.com/settings/integrations/figma/",
+            "http://acme.coderhelm.com/settings/integrations/mcp-callback/",
+        ] {
+            assert!(!broker::redirect_allowed(bad, &origins), "{bad}");
+        }
     }
 
     use super::*;

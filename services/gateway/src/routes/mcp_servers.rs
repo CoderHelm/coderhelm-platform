@@ -566,16 +566,18 @@ pub async fn save_own_app(
             "This server can't use your own app. Use a key instead.",
         ),
         own_app::SaveError::Invalid(m) => fail(StatusCode::BAD_REQUEST, m),
+        own_app::SaveError::NotSetUp => fail(StatusCode::BAD_REQUEST, "Paste the app's client id."),
         own_app::SaveError::Internal(e) => internal("save own app", e),
     })?;
     info!(team = %rt.team, server = %s.id, by = %claims.email, "Own app saved");
     Ok(Json(
-        json!({ "own_app": own_app_json(&rt, &s, &state.config.stage).await }),
+        json!({ "own_app": own_app_json(&state, &rt, &s).await }),
     ))
 }
 
-/// A team's own app for a catalog server, for its card: never the secret.
-pub async fn own_app_json(rt: &Runtime, s: &ServerRecord, stage: &str) -> Value {
+/// A catalog server's sign-in, for its card: never the secret. `source` is
+/// whose app it uses (`coderhelm` or `own`).
+pub async fn own_app_json(state: &AppState, rt: &Runtime, s: &ServerRecord) -> Value {
     let token = rt
         .store
         .get_token(&rt.team, &s.id, &Owner::Team)
@@ -587,16 +589,134 @@ pub async fn own_app_json(rt: &Runtime, s: &ServerRecord, stage: &str) -> Value 
         None => (Status::NotConnected, String::new()),
     };
     let o = s.oauth.as_ref();
+    let coderhelm_id = own_app::catalog_of(&s.catalog_id)
+        .map(|c| coderhelm_app(state, c).client_id)
+        .unwrap_or_default();
+    let source = own_app::source(s, &coderhelm_id);
     json!({
         "id": s.id,
-        "client_id": o.map(|o| o.client_id.as_str()).unwrap_or(""),
-        "has_secret": o.is_some_and(|o| !o.client_secret_sealed.is_empty()),
+        "source": source.as_str(),
+        // CoderHelm's client id is no secret, but it is no business of the card's.
+        "client_id": match source {
+            own_app::Source::Own => o.map(|o| o.client_id.as_str()).unwrap_or(""),
+            own_app::Source::Coderhelm => "",
+        },
+        "has_secret": source == own_app::Source::Own && o.is_some_and(|o| !o.client_secret_sealed.is_empty()),
         "status": status.as_str(),
         "status_reason": reason,
         "connected_by": token.as_ref().map(|t| t.connected_by.as_str()).unwrap_or(""),
         "connected_at": token.as_ref().map(|t| t.connected_at.as_str()).unwrap_or(""),
-        "redirect_uri": redirect_uri(stage),
+        "redirect_uri": redirect_uri(&state.config.stage),
     })
+}
+
+/// CoderHelm's own public app with the vendor of `catalog_id`, from this
+/// deployment's secret (`mcp_catalog::OwnApp::coderhelm_keys`). Not set where
+/// the secret has no such keys.
+pub(crate) fn coderhelm_app(
+    state: &AppState,
+    catalog_id: &str,
+) -> common::knowledge::sources::oauth::App {
+    coderhelm_app_from(&state.secrets, catalog_id)
+}
+
+pub(crate) fn coderhelm_app_from(
+    secrets: &crate::models::Secrets,
+    catalog_id: &str,
+) -> common::knowledge::sources::oauth::App {
+    let Some(app) = common::mcp_catalog::own_app(catalog_id) else {
+        return Default::default();
+    };
+    let read = |k: &str| {
+        secrets
+            .oauth_key(k)
+            .map(|v| v.trim().to_string())
+            .unwrap_or_default()
+    };
+    common::knowledge::sources::oauth::App {
+        client_id: read(app.coderhelm_keys.0),
+        client_secret: read(app.coderhelm_keys.1),
+    }
+}
+
+/// Whether the one-click sign-in with CoderHelm's app works here for
+/// `catalog_id`: through the hosted broker on a hybrid install that chose
+/// it, or with the app in this deployment's secret.
+pub async fn coderhelm_app_ready(state: &AppState, catalog_id: &str) -> bool {
+    common::mcp_catalog::own_app(catalog_id).is_some()
+        && (coderhelm_app(state, catalog_id).is_set()
+            || super::hybrid_install::brokered_id(state, catalog_id)
+                .await
+                .is_some())
+}
+
+/// POST /api/mcp-servers/apps/:catalog_id/coderhelm — sign in with
+/// CoderHelm's app for a catalog server whose package takes a token (Figma).
+/// Makes it the team's sign-in (in place of the team's own app, if one was
+/// saved) and answers where to send the browser; the dashboard's callback
+/// page finishes it as for any other sign-in.
+pub async fn connect_coderhelm_app(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<Claims>,
+    Path(catalog_id): Path<String>,
+) -> Reply {
+    claims.require_role(3).map_err(forbidden)?;
+    if common::mcp_catalog::own_app(&catalog_id).is_none() {
+        return Err(fail(
+            StatusCode::NOT_FOUND,
+            "This server can't sign in with CoderHelm's app. Use a key instead.",
+        ));
+    }
+    // A hybrid install that chose CoderHelm's app signs in through the
+    // hosted broker; anywhere else, with the app in this deployment's secret.
+    let brokered = super::hybrid_install::brokered_id(&state, &catalog_id).await;
+    let app = coderhelm_app(&state, &catalog_id);
+    let hosted = common::hybrid::hosted_url();
+    let via = match &brokered {
+        Some(c) => common::knowledge::sources::oauth::Via::Broker {
+            hosted: &hosted,
+            install_id: &c.install_id,
+            secret: &c.secret,
+        },
+        None => common::knowledge::sources::oauth::Via::App(&app),
+    };
+    let rt = runtime(&state, &claims.team_id);
+    let mut s = own_app::use_coderhelm_app(
+        &rt,
+        &catalog_id,
+        via,
+        &claims.email,
+        &chrono::Utc::now().to_rfc3339(),
+    )
+    .await
+    .map_err(|e| match e {
+        own_app::SaveError::NotSetUp => fail(
+            StatusCode::BAD_REQUEST,
+            "CoderHelm's app isn't set up on this install. Use your own app or a key instead.",
+        ),
+        own_app::SaveError::NoOwnApp => fail(StatusCode::NOT_FOUND, "This server has no sign-in."),
+        own_app::SaveError::Invalid(m) => fail(StatusCode::BAD_REQUEST, m),
+        own_app::SaveError::Internal(e) => internal("use coderhelm app", e),
+    })?;
+    let url = rt
+        .start_sign_in(
+            &mut s,
+            &Owner::Team,
+            &claims.sub,
+            &claims.email,
+            &redirect_uri(&state.config.stage),
+            None,
+        )
+        .await
+        .map_err(|e| {
+            warn!(team = %rt.team, server = %s.id, error = %e, "CoderHelm app sign-in could not start");
+            fail(StatusCode::BAD_REQUEST, &e)
+        })?;
+    info!(team = %rt.team, server = %s.id, brokered = brokered.is_some(), "CoderHelm app sign-in started");
+    Ok(Json(json!({
+        "authorize_url": url,
+        "own_app": own_app_json(&state, &rt, &s).await,
+    })))
 }
 
 /// PUT /api/mcp-servers/:id/key { header_name?, header_value } — replace a

@@ -131,19 +131,24 @@ pub fn plugin_state(
 /// in yet) the key's state stands, saying a sign-in is waiting.
 pub fn own_app_state(own_app: &Value, key: &CardState) -> CardState {
     let reason = own_app["status_reason"].as_str().unwrap_or("").to_string();
+    let coderhelm = own_app["source"] == "coderhelm";
     match own_app["status"].as_str().unwrap_or("") {
+        "connected" if coderhelm => cs("connected", "Signed in with Coderhelm's app.", "manage"),
         "connected" => cs("connected", "Signed in with your own app.", "manage"),
         "needs_reconnect" => cs(
             "needs_reconnect",
-            if reason.is_empty() {
-                "Your own app's sign-in has to be renewed.".to_string()
-            } else {
+            if !reason.is_empty() {
                 reason
+            } else if coderhelm {
+                "The sign-in has to be renewed.".to_string()
+            } else {
+                "Your own app's sign-in has to be renewed.".to_string()
             },
             "reconnect",
         ),
         "failed" => cs("error", reason, "check_again"),
         _ if key.status == "connected" => key.clone(),
+        _ if coderhelm => cs("not_connected", "", "connect"),
         _ => cs(
             "not_connected",
             "Your own app is saved. Connect it to sign in.",
@@ -709,7 +714,7 @@ pub async fn list(
             }
         };
         let own_json = match &own {
-            Some(o) => Some(super::mcp_servers::own_app_json(&rt, o, &state.config.stage).await),
+            Some(o) => Some(super::mcp_servers::own_app_json(&state, &rt, o).await),
             None => None,
         };
         let st = match own_json.as_ref().map(|o| own_app_state(o, &st)) {
@@ -719,9 +724,13 @@ pub async fn list(
         // Where the team's own app sends people back, for its setup steps.
         let own_redirect = common::mcp_catalog::own_app(&id)
             .map(|_| super::mcp_servers::redirect_uri(&state.config.stage));
+        // The one-click sign-in with CoderHelm's app, where it works here.
+        let coderhelm_app =
+            own_redirect.is_some() && super::mcp_servers::coderhelm_app_ready(&state, &id).await;
         let detail = json!({
             "own_app": own_json,
             "own_app_redirect_uri": own_redirect,
+            "coderhelm_app": coderhelm_app,
             "remote": remote.map(|r| r.public_json(my_tokens.get(&r.id), can_edit)),
             "plugin": p,
             "enabled": enabled.unwrap_or(false),
@@ -966,6 +975,21 @@ mod tests {
         assert_eq!(own_app_state(&own("not_connected", ""), &key_on), key_on);
         let st = own_app_state(&own("not_connected", ""), &key_off);
         assert_eq!((st.status, st.action), ("not_connected", "connect"));
+    }
+
+    #[test]
+    fn a_sign_in_with_coderhelms_app_says_so() {
+        let key_off = plugin_state(None, false, None, "", false);
+        let ours =
+            |status: &str| json!({ "status": status, "status_reason": "", "source": "coderhelm" });
+        let st = own_app_state(&ours("connected"), &key_off);
+        assert_eq!(st.reason, "Signed in with Coderhelm's app.");
+        let st = own_app_state(&ours("needs_reconnect"), &key_off);
+        assert_eq!((st.status, st.action), ("needs_reconnect", "reconnect"));
+        assert!(!st.reason.contains("own app"));
+        // Started but not finished: nothing of "your own app" on the card.
+        let st = own_app_state(&ours("not_connected"), &key_off);
+        assert_eq!((st.status, st.reason.as_str()), ("not_connected", ""));
     }
     use common::live::identity::RoleCheck;
 
