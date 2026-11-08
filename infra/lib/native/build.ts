@@ -11,6 +11,8 @@
  * coderhelm-public/launch/<version>/):
  *
  *   coderhelm.json          the parent template (Launch Stack opens it)
+ *   access.json             the access stack's template (an AWS admin applies
+ *                           newer boundary and deploy role permissions with it)
  *   stacks/<Part>.json      one per part
  *   assets/<hash>.zip       the code, by CDK's content hash
  *   files.txt               every file, relative, for SHA256SUMS
@@ -24,7 +26,8 @@ import { buildApp } from "../app";
 import { repoPath } from "../paths";
 import { nativeConfig } from "./config";
 import { Json, checkLimits, readAssembly, sha256File } from "./package";
-import { buildParent, childKey } from "./parent";
+import { buildAccess } from "./access-stack";
+import { ACCESS_FILE, buildParent, childKey } from "./parent";
 
 export interface NativeRelease {
   parent: Json;
@@ -93,10 +96,14 @@ export function buildNative(version: string, outDir: string, opts: { dashboardDi
     problems.push(...checkLimits(c.name, c.template));
   }
   const helperCode = fs.readFileSync(repoPath("lambda/native-helper/handler.py"), "utf8");
-  const parent = buildParent({ version, children, assets, childSha, helperCode });
+  const access = buildAccess(version);
+  fs.writeFileSync(path.join(outDir, ACCESS_FILE), JSON.stringify(access, null, 1));
+  problems.push(...checkLimits(ACCESS_FILE, access));
+  const accessSha = sha256File(path.join(outDir, ACCESS_FILE));
+  const parent = buildParent({ version, children, assets, childSha, helperCode, accessSha });
   fs.writeFileSync(path.join(outDir, "coderhelm.json"), JSON.stringify(parent, null, 1));
   problems.push(...checkLimits("coderhelm.json", parent));
-  const files = ["coderhelm.json", ...children.map((c) => childKey(version, c.name).key), ...assets.map((a) => a.key)];
+  const files = ["coderhelm.json", ACCESS_FILE, ...children.map((c) => childKey(version, c.name).key), ...assets.map((a) => a.key)];
   fs.writeFileSync(path.join(outDir, "files.txt"), files.join("\n") + "\n");
   return { parent, children: out, files, problems };
 }

@@ -236,4 +236,4 @@ jobs:
           GATEWAY_ZIP="$S/gateway" WORKER_ZIP="$S/worker" MCP_PROXY_DIR="$S/mcp" CODERHELM_DASHBOARD_DIR="$S/dash" node dist/lib/native/build.js v0.0.0-ci "$RUNNER_TEMP/native"
           pip install --quiet cfn-lint==1.58.0
           cfn-lint ../infra/cfn/*.yaml
-          cfn-lint -i W3005 -i W2531 -- "$RUNNER_TEMP/native/coderhelm.json" "$RUNNER_TEMP/native"/stacks/*.json
+          cfn-lint -i W3005 -i W2531 -- "$RUNNER_TEMP/native/coderhelm.json" "$RUNNER_TEMP/native/access.json" "$RUNNER_TEMP/native"/stacks/*.json

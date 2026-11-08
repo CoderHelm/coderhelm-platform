@@ -1,0 +1,160 @@
+// The deploy role's own access on a native install (infra/lib/native/parent.ts
+// pinnedAccess, infra/lib/native/access-stack.ts, lambda/updater "held").
+//
+// Every update runs as the parent's deploy role, and the boundary forbids that
+// role to change itself or a boundary; an AWS admin's Execute in the console
+// runs as that role too (the stack's service role). So:
+//
+// - the parent carries Boundary, DeployBoundary and DeployRole exactly as
+//   installs have them (v0.8.36 to v0.8.53), and a change to them fails here;
+// - today's documents ship in access.json, which an AWS admin applies with
+//   their own permissions, and no CoderHelm role can reach its writer;
+// - every call CloudFormation makes for a release through the deploy role
+//   (the simulator's table) is allowed under the pinned boundary too, so an
+//   update that keeps an install's older boundary still installs;
+// - a change to today's boundary or deploy policy is flagged (ACCESS_DOCS):
+//   it reaches installs only through an admin, so it is a deliberate,
+//   batched decision.
+//
+//   npm test
+
+import { test } from "node:test";
+import * as assert from "node:assert/strict";
+import * as crypto from "node:crypto";
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
+import { accessNames, boundaryPolicy, PolicyDocument } from "../lib/access";
+import { ACCESS_PARAMETERS, ACCESS_WRITER_NAME, buildAccess, writerPolicy } from "../lib/native/access-stack";
+import { buildNative } from "../lib/native/build";
+import { ACCESS_FILE, deployRolePolicy, nativeNames, pinnedAccess, subInstall } from "../lib/native/parent";
+import { sha256File } from "../lib/native/package";
+import { prodValues, resolveValue } from "../lib/native/resolve";
+import { decision } from "./iam-eval";
+
+const STUBS = fs.mkdtempSync(path.join(os.tmpdir(), "chacc-"));
+for (const d of ["gateway", "worker", "mcp"]) {
+  fs.mkdirSync(path.join(STUBS, d), { recursive: true });
+  fs.writeFileSync(path.join(STUBS, d, d === "mcp" ? "handler.js" : "bootstrap"), "stub");
+}
+const DASH = path.join(STUBS, "dash");
+fs.mkdirSync(DASH, { recursive: true });
+fs.writeFileSync(path.join(DASH, "index.html"), "<html></html>");
+process.env.GATEWAY_ZIP = path.join(STUBS, "gateway");
+process.env.WORKER_ZIP = path.join(STUBS, "worker");
+process.env.MCP_PROXY_DIR = path.join(STUBS, "mcp");
+const OUT = fs.mkdtempSync(path.join(os.tmpdir(), "chaccrel-"));
+const rel = buildNative("v9.8.7", OUT, { dashboardDir: DASH, commit: "0".repeat(40), releasedAt: "2026-11-08T00:00:00Z" });
+const R = rel.parent.Resources;
+const ACCESS = JSON.parse(fs.readFileSync(path.join(OUT, ACCESS_FILE), "utf8"));
+
+const canon = (v: unknown) => JSON.stringify(v, (_k, x) => (x && typeof x === "object" && !Array.isArray(x) ? Object.fromEntries(Object.entries(x).sort(([a], [b]) => a.localeCompare(b))) : x));
+const sha = (v: unknown) => crypto.createHash("sha256").update(canon(v)).digest("hex");
+
+/**
+ * Today's boundary and deploy role policy, as their sha256. A change here
+ * reaches no install by itself: an AWS admin applies it through the access
+ * stack (Settings, System, Permissions). Before changing these two values,
+ * batch it with whatever else needs the same admin step, and say so in the
+ * release notes; the dashboard then offers it as one optional item.
+ */
+const ACCESS_DOCS = {
+  boundary: "e336aa5d3446090ae84ae7b36ab55953455d662b997ab0947aabb5a091ec555e",
+  deployRole: "d11f40637e639812ba5408d153351341bc593cb604726f6cb4193861c2dd7b1f",
+};
+
+test("the parent carries the deploy role and both boundaries exactly as installs have them, so no update ever changes them", () => {
+  const pinned = pinnedAccess();
+  for (const k of ["Boundary", "DeployBoundary", "DeployRole"] as const) assert.deepEqual(R[k], pinned[k], k);
+  // The pinned file is v0.8.36 to v0.8.53's: a change to it holds every install's next update.
+  const f = JSON.parse(fs.readFileSync(path.join(__dirname, "..", "..", "lib", "native", "access-pinned.json"), "utf8"));
+  assert.equal(sha(f.resources), "bf5ec8ae9432f9468256ff208b3b40e782742f25a36b57f935740d583ce32c78", "access-pinned.json changed: every install's next update would wait for an AWS admin");
+});
+
+test("access.json is built, pinned by sha256 in the parent and published with the release", () => {
+  const files = R.ReleaseAssets.Properties.Files as { Key: string; Dest: string; Sha256: string }[];
+  const f = files.find((x) => x.Key === ACCESS_FILE)!;
+  assert.ok(f, "access.json is in ReleaseAssets");
+  assert.equal(f.Sha256, sha256File(path.join(OUT, ACCESS_FILE)));
+  assert.equal(f.Dest, "releases/v9.8.7/access.json");
+  assert.ok(rel.files.includes(ACCESS_FILE));
+});
+
+test("access.json writes today's boundary to both boundaries and today's deploy policy to the deploy role", () => {
+  const p = ACCESS.Resources.Access.Properties;
+  const n = nativeNames();
+  const today = subInstall(boundaryPolicy(n, ["arn:${AWS::Partition}:iam::${AWS::AccountId}:policy/coderhelm-${Stage}-deploy-boundary-stack"]));
+  assert.deepEqual(p.Boundary.Document, today);
+  assert.deepEqual(p.DeployBoundary.Document, today);
+  assert.deepEqual(p.Boundary.Arn, { "Fn::Sub": "arn:${AWS::Partition}:iam::${AWS::AccountId}:policy/coderhelm-${Stage}-boundary-stack" });
+  assert.deepEqual(p.DeployBoundary.Arn, { "Fn::Sub": "arn:${AWS::Partition}:iam::${AWS::AccountId}:policy/coderhelm-${Stage}-deploy-boundary-stack" });
+  assert.deepEqual(p.DeployRole.Document, subInstall(deployRolePolicy(n)));
+  assert.deepEqual(p.DeployRole.RoleName, { "Fn::Sub": "coderhelm-${Stage}-deploy-stack" });
+  // Every ${Name} the template uses is a parameter it declares (the Launch link fills them) or a pseudo parameter.
+  const used = new Set([...JSON.stringify(ACCESS).matchAll(/\$\{([A-Za-z]+)\}/g)].map((m) => m[1]));
+  for (const u of used) assert.ok(ACCESS_PARAMETERS.includes(u) || u === "EmailIdentity", u);
+  assert.deepEqual(Object.keys(ACCESS.Parameters).sort(), [...ACCESS_PARAMETERS].sort());
+  // Its writer's code is in the signed template.
+  assert.match(ACCESS.Resources.Writer.Properties.Code.ZipFile, /def write_policy/);
+});
+
+test("today's boundary and deploy policy are the reviewed ones (a change is a deliberate, batched admin step)", () => {
+  const n = nativeNames();
+  const now = { boundary: sha(subInstall(boundaryPolicy(n, ["arn:${AWS::Partition}:iam::${AWS::AccountId}:policy/coderhelm-${Stage}-deploy-boundary-stack"]))), deployRole: sha(subInstall(deployRolePolicy(n))) };
+  assert.deepEqual(now, ACCESS_DOCS,
+    "This changes the permissions boundary or the deploy role's policy. No update can apply that: installs get it only when an AWS admin " +
+    "applies the access stack (Settings, System, Permissions). Batch it with other such changes, then set ACCESS_DOCS in this test to the new values.");
+});
+
+/** A policy document for stage prod in the simulator fixture's account. */
+const F = JSON.parse(fs.readFileSync(path.join(__dirname, "..", "..", "test", "fixtures", "native-sim.json"), "utf8"));
+function resolved(v: unknown): PolicyDocument {
+  const values: Record<string, string> = { ...prodValues(F.account, F.region), EmailFrom: "owner@example.org" };
+  return resolveValue(v as any, { values, conditions: { HasEmailFrom: true } }) as PolicyDocument;
+}
+
+test("a release installs through the deploy role under the pinned boundary too: every call it may make today, it may make with the boundary installs have", () => {
+  const pinned = pinnedAccess();
+  const boundary = resolved((pinned.Boundary as any).Properties.PolicyDocument);
+  const deploy = resolved((pinned.DeployRole as any).Properties.Policies[0].PolicyDocument);
+  assert.ok(!JSON.stringify([boundary, deploy]).includes("Fn::"), "fully resolved");
+  const pairs = (F.rows as any[]).flatMap((r) => Object.entries(r.actions as Record<string, string>).map(([action, verdict]) => ({ action, verdict, resource: r.resource, context: r.context })));
+  const lost = pairs.filter((p) => p.verdict === "allowed" && decision([deploy], boundary, p) !== "allowed").map((p) => `${p.action} on ${p.resource}`);
+  assert.deepEqual(lost, [], "the deploy needs more than the pinned boundary allows: such a release can't install until an admin applies the access stack");
+});
+
+test("no CoderHelm role can reach the access stack, its writer or the writer's role", () => {
+  const names = { ...accessNames({ account: "111122223333", region: "us-east-1", prefix: "coderhelm-prod", suffix: "-111122223333", secretName: "coderhelm/prod/secrets", id: "stack" }), emailIdentity: "owner@example.org" };
+  const boundary = boundaryPolicy(names, ["arn:aws:iam::111122223333:policy/coderhelm-prod-deploy-boundary-stack"]);
+  const anything: PolicyDocument = { Version: "2012-10-17", Statement: [{ Sid: "All", Effect: "Allow", Action: "*", Resource: "*" }] };
+  const writer = ACCESS_WRITER_NAME.replace("${Stage}", "prod");
+  const calls: [string, string][] = [
+    ["lambda:InvokeFunction", `arn:aws:lambda:us-east-1:111122223333:function:${writer}`],
+    ["lambda:UpdateFunctionCode", `arn:aws:lambda:us-east-1:111122223333:function:${writer}`],
+    ["iam:PassRole", `arn:aws:iam::111122223333:role/${writer}`],
+    ["iam:UpdateAssumeRolePolicy", `arn:aws:iam::111122223333:role/${writer}`],
+    ["iam:PutRolePolicy", `arn:aws:iam::111122223333:role/${writer}`],
+    ["cloudformation:CreateChangeSet", "arn:aws:cloudformation:us-east-1:111122223333:stack/coderhelm-prod-access/abc"],
+    ["cloudformation:ExecuteChangeSet", "arn:aws:cloudformation:us-east-1:111122223333:stack/coderhelm-prod-access/abc"],
+    ["cloudformation:UpdateStack", "arn:aws:cloudformation:us-east-1:111122223333:stack/coderhelm-prod-access/abc"],
+    ["cloudformation:DeleteStack", "arn:aws:cloudformation:us-east-1:111122223333:stack/coderhelm-prod-access/abc"],
+  ];
+  for (const [action, resource] of calls) {
+    assert.notEqual(decision([anything], boundary, { action, resource, context: { "iam:PermissionsBoundary": names.boundaryArn } }), "allowed", `${action} on ${resource}`);
+  }
+  // The writer may write exactly the two boundaries and the deploy role's policy, nothing else.
+  const w = resolveValue(writerPolicy(), { values: prodValues("111122223333", "us-east-1") }) as PolicyDocument;
+  const can = (action: string, resource: string) => decision([w], null, { action, resource }) === "allowed";
+  assert.ok(can("iam:CreatePolicyVersion", "arn:aws:iam::111122223333:policy/coderhelm-prod-boundary-stack"));
+  assert.ok(can("iam:CreatePolicyVersion", "arn:aws:iam::111122223333:policy/coderhelm-prod-deploy-boundary-stack"));
+  assert.ok(can("iam:PutRolePolicy", "arn:aws:iam::111122223333:role/coderhelm-prod-deploy-stack"));
+  assert.ok(!can("iam:CreatePolicyVersion", "arn:aws:iam::111122223333:policy/coderhelm-prod-other"));
+  assert.ok(!can("iam:PutRolePolicy", "arn:aws:iam::111122223333:role/coderhelm-prod-gateway"));
+  assert.ok(!can("iam:CreateRole", "arn:aws:iam::111122223333:role/anything"));
+});
+
+test("the access stack has no service role and changes nothing on delete", () => {
+  assert.equal(ACCESS.RoleARN, undefined);
+  for (const r of Object.values<any>(ACCESS.Resources)) assert.equal(r.DeletionPolicy, undefined);
+  assert.match(fs.readFileSync(path.join(__dirname, "..", "..", "..", "lambda", "native-access", "handler.py"), "utf8"), /On Delete it changes nothing/);
+});

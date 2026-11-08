@@ -578,7 +578,12 @@ function nativeUpdates(scope: Construct, cfg: ResolvedConfig, fn: lambda.Functio
     actions: ["cloudformation:CreateChangeSet"],
     resources: [root],
     conditions: {
-      StringLike: { "cloudformation:TemplateUrl": [`${NATIVE_TEMPLATE_BASE}/v*.*.*/${NATIVE_TEMPLATE_FILE}`] },
+      StringLike: { "cloudformation:TemplateUrl": [
+        `${NATIVE_TEMPLATE_BASE}/v*.*.*/${NATIVE_TEMPLATE_FILE}`,
+        // The same release with the install's own Boundary, DeployBoundary and DeployRole kept (the helper
+        // writes it, checked against the verified template; lambda/updater "held"): an update never changes those.
+        `https://${cfg.prefix}-release-${stack.account}.s3.${stack.region}.${stack.urlSuffix}/releases/v*.*.*/held/${NATIVE_TEMPLATE_FILE}`,
+      ] },
       // A role only the stack's own deploy role (none only on an older parent without it).
       StringEqualsIfExists: { "cloudformation:RoleArn": deployRole },
     },
@@ -616,6 +621,23 @@ function nativeUpdates(scope: Construct, cfg: ResolvedConfig, fn: lambda.Functio
     ],
     // The parts' nested change sets too (each data change is checked before auto-update applies it).
     resources: [root, parts],
+  }));
+  // A stack whose rollback failed (UPDATE_ROLLBACK_FAILED) can't be updated at
+  // all: the updater continues the rollback itself, skipping only resources
+  // it has checked are exactly as the rollback would leave them.
+  fn.addToRolePolicy(new iam.PolicyStatement({
+    sid: "RecoverFailedRollback",
+    actions: ["cloudformation:ContinueUpdateRollback"],
+    resources: [root],
+  }));
+  // Read-only: what the deploy role may do (its policy and its boundary, as IAM
+  // has them now), so a prepared update that it couldn't apply is refused
+  // before it starts; and whether the boundaries are already the release's.
+  const iamArn = `arn:${stack.partition}:iam::${stack.account}`;
+  fn.addToRolePolicy(new iam.PolicyStatement({
+    sid: "ReadDeployRoleAccess",
+    actions: ["iam:GetRole", "iam:GetRolePolicy", "iam:ListRolePolicies", "iam:ListAttachedRolePolicies", "iam:GetPolicy", "iam:GetPolicyVersion"],
+    resources: [deployRole, `${iamArn}:policy/${cfg.prefix}-boundary-stack`, `${iamArn}:policy/${cfg.prefix}-deploy-boundary-stack`],
   }));
   fn.addToRolePolicy(new iam.PolicyStatement({
     sid: "AutoUpdateThroughDeployRole",

@@ -1,0 +1,1416 @@
+{
+ "about": "The parent's Boundary, DeployBoundary and DeployRole exactly as every native release from v0.8.36 to v0.8.53 carried them. Updates never change these three (an update runs as the deploy role, which may not change itself or a boundary); newer permissions reach an install through its access stack (access.json). Changing this file makes every install's next update wait for an AWS admin.",
+ "since": "v0.8.36",
+ "resources": {
+  "Boundary": {
+   "Type": "AWS::IAM::ManagedPolicy",
+   "DeletionPolicy": "Delete",
+   "UpdateReplacePolicy": "Retain",
+   "Properties": {
+    "ManagedPolicyName": {
+     "Fn::Sub": "coderhelm-${Stage}-boundary-stack"
+    },
+    "Description": "CoderHelm: the most any CoderHelm role can do (docs/self-host/security.md)",
+    "PolicyDocument": {
+     "Version": "2012-10-17",
+     "Statement": [
+      {
+       "Sid": "CoderHelmServices",
+       "Effect": "Allow",
+       "Action": [
+        "acm:*",
+        "apigateway:*",
+        "bedrock:InvokeModel",
+        "bedrock:InvokeModelWithResponseStream",
+        "bedrock:Get*",
+        "bedrock:List*",
+        "cloudformation:*",
+        "cloudfront:*",
+        "cloudwatch:*",
+        "codebuild:*",
+        "cognito-idp:*",
+        "dynamodb:*",
+        "events:*",
+        "kms:*",
+        "lambda:*",
+        "logs:*",
+        "s3:*",
+        "scheduler:*",
+        "secretsmanager:*",
+        "ses:*",
+        "sns:*",
+        "sqs:*",
+        "ssm:*",
+        "sts:AssumeRole",
+        "sts:GetCallerIdentity"
+       ],
+       "Resource": "*"
+      },
+      {
+       "Sid": "InstallRoleWrites",
+       "Effect": "Allow",
+       "Action": [
+        "iam:CreateRole",
+        "iam:PutRolePolicy",
+        "iam:AttachRolePolicy",
+        "iam:DetachRolePolicy",
+        "iam:DeleteRolePolicy",
+        "iam:PutRolePermissionsBoundary"
+       ],
+       "Resource": {
+        "Fn::Sub": "arn:${AWS::Partition}:iam::${AWS::AccountId}:role/coderhelm-${Stage}-*"
+       },
+       "Condition": {
+        "StringEquals": {
+         "iam:PermissionsBoundary": {
+          "Fn::Sub": "arn:${AWS::Partition}:iam::${AWS::AccountId}:policy/coderhelm-${Stage}-boundary-stack"
+         }
+        }
+       }
+      },
+      {
+       "Sid": "InstallRoles",
+       "Effect": "Allow",
+       "Action": [
+        "iam:Get*",
+        "iam:List*",
+        "iam:DeleteRole",
+        "iam:UpdateRole*",
+        "iam:UpdateAssumeRolePolicy",
+        "iam:TagRole",
+        "iam:UntagRole",
+        "iam:PassRole"
+       ],
+       "Resource": {
+        "Fn::Sub": "arn:${AWS::Partition}:iam::${AWS::AccountId}:role/coderhelm-${Stage}-*"
+       }
+      },
+      {
+       "Sid": "InstallPolicies",
+       "Effect": "Allow",
+       "Action": [
+        "iam:CreatePolicy*",
+        "iam:DeletePolicy*",
+        "iam:Get*",
+        "iam:List*",
+        "iam:TagPolicy",
+        "iam:UntagPolicy"
+       ],
+       "Resource": {
+        "Fn::Sub": "arn:${AWS::Partition}:iam::${AWS::AccountId}:policy/coderhelm-${Stage}-*"
+       }
+      },
+      {
+       "Sid": "NoDnsChanges",
+       "Effect": "Deny",
+       "Action": [
+        "route53:ChangeResourceRecordSets",
+        "route53:CreateHostedZone",
+        "route53:DeleteHostedZone"
+       ],
+       "Resource": "*"
+      },
+      {
+       "Sid": "NoIamUsersOrKeys",
+       "Effect": "Deny",
+       "Action": [
+        "iam:*User*",
+        "iam:*AccessKey*",
+        "iam:*LoginProfile*",
+        "iam:*Group*",
+        "iam:*ServiceSpecificCredential*",
+        "iam:*SSHPublicKey*",
+        "iam:Create*Provider",
+        "iam:UpdateAccountPasswordPolicy",
+        "iam:CreateAccountAlias"
+       ],
+       "Resource": "*"
+      },
+      {
+       "Sid": "NoAccountGuardrailChanges",
+       "Effect": "Deny",
+       "Action": [
+        "organizations:*",
+        "account:*",
+        "cloudtrail:*",
+        "guardduty:*"
+       ],
+       "Resource": "*"
+      },
+      {
+       "Sid": "NoIamOutsideTheInstall",
+       "Effect": "Deny",
+       "Action": "iam:*",
+       "NotResource": [
+        {
+         "Fn::Sub": "arn:${AWS::Partition}:iam::${AWS::AccountId}:role/coderhelm-${Stage}-*"
+        },
+        {
+         "Fn::Sub": "arn:${AWS::Partition}:iam::${AWS::AccountId}:policy/coderhelm-${Stage}-*"
+        }
+       ]
+      },
+      {
+       "Sid": "RolesOnlyWithTheBoundary",
+       "Effect": "Deny",
+       "Action": [
+        "iam:CreateRole",
+        "iam:PutRolePolicy",
+        "iam:AttachRolePolicy",
+        "iam:DetachRolePolicy",
+        "iam:DeleteRolePolicy",
+        "iam:PutRolePermissionsBoundary"
+       ],
+       "Resource": "*",
+       "Condition": {
+        "StringNotEquals": {
+         "iam:PermissionsBoundary": {
+          "Fn::Sub": "arn:${AWS::Partition}:iam::${AWS::AccountId}:policy/coderhelm-${Stage}-boundary-stack"
+         }
+        }
+       }
+      },
+      {
+       "Sid": "TheBoundaryStays",
+       "Effect": "Deny",
+       "Action": [
+        "iam:DeleteRolePermissionsBoundary",
+        "iam:CreatePolicy*",
+        "iam:DeletePolicy*",
+        "iam:SetDefault*",
+        "iam:*agPolicy"
+       ],
+       "Resource": [
+        {
+         "Fn::Sub": "arn:${AWS::Partition}:iam::${AWS::AccountId}:policy/coderhelm-${Stage}-*boundary-stack"
+        },
+        {
+         "Fn::Sub": "arn:${AWS::Partition}:iam::${AWS::AccountId}:role/*"
+        }
+       ]
+      },
+      {
+       "Sid": "OnlyTheInstallsOwn",
+       "Effect": "Deny",
+       "Action": [
+        "lambda:CreateF*",
+        "lambda:CreateAlias",
+        "lambda:Delete*",
+        "lambda:Update*",
+        "lambda:Invoke*",
+        "lambda:Put*",
+        "lambda:*Permission",
+        "lambda:Publish*",
+        "cloudformation:Create*",
+        "cloudformation:Update*",
+        "cloudformation:Delete*",
+        "cloudformation:Execute*",
+        "cloudformation:Set*",
+        "cloudformation:Continue*",
+        "s3:Put*",
+        "s3:Delete*",
+        "secretsmanager:GetSecretValue",
+        "secretsmanager:Put*",
+        "secretsmanager:Update*",
+        "secretsmanager:Delete*",
+        "ssm:Put*",
+        "ssm:Delete*"
+       ],
+       "NotResource": [
+        {
+         "Fn::Sub": "arn:*:lambda:*:*:function:coderhelm-${Stage}-*"
+        },
+        {
+         "Fn::Sub": "arn:*:lambda:*:*:layer:coderhelm-${Stage}-*"
+        },
+        "arn:*:lambda:*:*:event-source-mapping:*",
+        {
+         "Fn::Sub": "arn:*:cloudformation:*:*:stack/coderhelm-${Stage}*"
+        },
+        "arn:*:cloudformation:*:aws:transform/*",
+        {
+         "Fn::Sub": "arn:*:s3:::coderhelm-${Stage}-*"
+        },
+        "arn:*:s3:::coderhelm-setup-*",
+        {
+         "Fn::Sub": "arn:*:secretsmanager:*:*:secret:coderhelm/${Stage}/*"
+        },
+        {
+         "Fn::Sub": "arn:*:ssm:*:*:parameter/coderhelm-${Stage}/*"
+        }
+       ]
+      },
+      {
+       "Sid": "NoCommandsOnInstances",
+       "Effect": "Deny",
+       "Action": [
+        "ssm:SendCommand",
+        "ssm:Start*",
+        "ssm:*Association*"
+       ],
+       "Resource": "*"
+      },
+      {
+       "Sid": "TheDeployRoleStays",
+       "Effect": "Deny",
+       "Action": [
+        "iam:CreateRole",
+        "iam:PutRolePolicy",
+        "iam:AttachRolePolicy",
+        "iam:DetachRolePolicy",
+        "iam:DeleteRolePolicy",
+        "iam:PutRolePermissionsBoundary",
+        "iam:DeleteRole",
+        "iam:UpdateRole",
+        "iam:UpdateAssumeRolePolicy",
+        "iam:TagRole",
+        "iam:UntagRole"
+       ],
+       "Resource": {
+        "Fn::Sub": "arn:${AWS::Partition}:iam::${AWS::AccountId}:role/coderhelm-${Stage}-deploy-stack"
+       }
+      },
+      {
+       "Sid": "TheAccessStackStays",
+       "Effect": "Deny",
+       "Action": [
+        "cloudformation:CreateChangeSet",
+        "cloudformation:ExecuteChangeSet",
+        "cloudformation:UpdateStack",
+        "cloudformation:DeleteStack",
+        "cloudformation:CreateStack",
+        "cloudformation:SetStackPolicy"
+       ],
+       "Resource": {
+        "Fn::Sub": "arn:${AWS::Partition}:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/coderhelm-${Stage}-access/*"
+       }
+      },
+      {
+       "Sid": "NoOtherRolesHere",
+       "Effect": "Deny",
+       "Action": [
+        "sts:AssumeRole",
+        "sts:AssumeRoleWithWebIdentity",
+        "sts:AssumeRoleWithSAML",
+        "sts:TagSession",
+        "sts:SetSourceIdentity"
+       ],
+       "NotResource": [
+        {
+         "Fn::Sub": "arn:${AWS::Partition}:iam::${AWS::AccountId}:role/CoderHelmLogReader"
+        },
+        {
+         "Fn::Sub": "arn:${AWS::Partition}:iam::${AWS::AccountId}:role/CoderhelmReadOnly"
+        }
+       ],
+       "Condition": {
+        "StringEquals": {
+         "aws:ResourceAccount": {
+          "Fn::Sub": "${AWS::AccountId}"
+         }
+        }
+       }
+      },
+      {
+       "Sid": "ReadRolesHereAssumeOnly",
+       "Effect": "Deny",
+       "Action": [
+        "sts:AssumeRoleWithWebIdentity",
+        "sts:AssumeRoleWithSAML",
+        "sts:TagSession",
+        "sts:SetSourceIdentity"
+       ],
+       "Resource": [
+        {
+         "Fn::Sub": "arn:${AWS::Partition}:iam::${AWS::AccountId}:role/CoderHelmLogReader"
+        },
+        {
+         "Fn::Sub": "arn:${AWS::Partition}:iam::${AWS::AccountId}:role/CoderhelmReadOnly"
+        }
+       ]
+      },
+      {
+       "Sid": "ReadRolesHereOnlyGatewayAndWorker",
+       "Effect": "Deny",
+       "Action": "sts:AssumeRole",
+       "Resource": [
+        {
+         "Fn::Sub": "arn:${AWS::Partition}:iam::${AWS::AccountId}:role/CoderHelmLogReader"
+        },
+        {
+         "Fn::Sub": "arn:${AWS::Partition}:iam::${AWS::AccountId}:role/CoderhelmReadOnly"
+        }
+       ],
+       "Condition": {
+        "StringNotEquals": {
+         "aws:PrincipalTag/coderhelm:role": [
+          "gateway",
+          "worker"
+         ]
+        }
+       }
+      },
+      {
+       "Sid": "RuntimeTagOnlyByDeploy",
+       "Effect": "Deny",
+       "Action": [
+        "iam:CreateRole",
+        "iam:TagRole",
+        "iam:UntagRole"
+       ],
+       "Resource": "*",
+       "Condition": {
+        "ForAnyValue:StringEqualsIgnoreCase": {
+         "aws:TagKeys": [
+          "coderhelm:role"
+         ]
+        },
+        "ArnNotEquals": {
+         "aws:PrincipalArn": {
+          "Fn::Sub": "arn:${AWS::Partition}:iam::${AWS::AccountId}:role/coderhelm-${Stage}-deploy-stack"
+         }
+        }
+       }
+      }
+     ]
+    }
+   }
+  },
+  "DeployBoundary": {
+   "Type": "AWS::IAM::ManagedPolicy",
+   "DeletionPolicy": "Retain",
+   "UpdateReplacePolicy": "Retain",
+   "Metadata": {
+    "cfn-lint": {
+     "config": {
+      "ignore_checks": [
+       "W3011"
+      ]
+     }
+    }
+   },
+   "Properties": {
+    "ManagedPolicyName": {
+     "Fn::Sub": "coderhelm-${Stage}-deploy-boundary-stack"
+    },
+    "Description": "CoderHelm: the auto-update role's boundary, the same as every CoderHelm role's (docs/self-host/security.md)",
+    "PolicyDocument": {
+     "Version": "2012-10-17",
+     "Statement": [
+      {
+       "Sid": "CoderHelmServices",
+       "Effect": "Allow",
+       "Action": [
+        "acm:*",
+        "apigateway:*",
+        "bedrock:InvokeModel",
+        "bedrock:InvokeModelWithResponseStream",
+        "bedrock:Get*",
+        "bedrock:List*",
+        "cloudformation:*",
+        "cloudfront:*",
+        "cloudwatch:*",
+        "codebuild:*",
+        "cognito-idp:*",
+        "dynamodb:*",
+        "events:*",
+        "kms:*",
+        "lambda:*",
+        "logs:*",
+        "s3:*",
+        "scheduler:*",
+        "secretsmanager:*",
+        "ses:*",
+        "sns:*",
+        "sqs:*",
+        "ssm:*",
+        "sts:AssumeRole",
+        "sts:GetCallerIdentity"
+       ],
+       "Resource": "*"
+      },
+      {
+       "Sid": "InstallRoleWrites",
+       "Effect": "Allow",
+       "Action": [
+        "iam:CreateRole",
+        "iam:PutRolePolicy",
+        "iam:AttachRolePolicy",
+        "iam:DetachRolePolicy",
+        "iam:DeleteRolePolicy",
+        "iam:PutRolePermissionsBoundary"
+       ],
+       "Resource": {
+        "Fn::Sub": "arn:${AWS::Partition}:iam::${AWS::AccountId}:role/coderhelm-${Stage}-*"
+       },
+       "Condition": {
+        "StringEquals": {
+         "iam:PermissionsBoundary": {
+          "Fn::Sub": "arn:${AWS::Partition}:iam::${AWS::AccountId}:policy/coderhelm-${Stage}-boundary-stack"
+         }
+        }
+       }
+      },
+      {
+       "Sid": "InstallRoles",
+       "Effect": "Allow",
+       "Action": [
+        "iam:Get*",
+        "iam:List*",
+        "iam:DeleteRole",
+        "iam:UpdateRole*",
+        "iam:UpdateAssumeRolePolicy",
+        "iam:TagRole",
+        "iam:UntagRole",
+        "iam:PassRole"
+       ],
+       "Resource": {
+        "Fn::Sub": "arn:${AWS::Partition}:iam::${AWS::AccountId}:role/coderhelm-${Stage}-*"
+       }
+      },
+      {
+       "Sid": "InstallPolicies",
+       "Effect": "Allow",
+       "Action": [
+        "iam:CreatePolicy*",
+        "iam:DeletePolicy*",
+        "iam:Get*",
+        "iam:List*",
+        "iam:TagPolicy",
+        "iam:UntagPolicy"
+       ],
+       "Resource": {
+        "Fn::Sub": "arn:${AWS::Partition}:iam::${AWS::AccountId}:policy/coderhelm-${Stage}-*"
+       }
+      },
+      {
+       "Sid": "NoDnsChanges",
+       "Effect": "Deny",
+       "Action": [
+        "route53:ChangeResourceRecordSets",
+        "route53:CreateHostedZone",
+        "route53:DeleteHostedZone"
+       ],
+       "Resource": "*"
+      },
+      {
+       "Sid": "NoIamUsersOrKeys",
+       "Effect": "Deny",
+       "Action": [
+        "iam:*User*",
+        "iam:*AccessKey*",
+        "iam:*LoginProfile*",
+        "iam:*Group*",
+        "iam:*ServiceSpecificCredential*",
+        "iam:*SSHPublicKey*",
+        "iam:Create*Provider",
+        "iam:UpdateAccountPasswordPolicy",
+        "iam:CreateAccountAlias"
+       ],
+       "Resource": "*"
+      },
+      {
+       "Sid": "NoAccountGuardrailChanges",
+       "Effect": "Deny",
+       "Action": [
+        "organizations:*",
+        "account:*",
+        "cloudtrail:*",
+        "guardduty:*"
+       ],
+       "Resource": "*"
+      },
+      {
+       "Sid": "NoIamOutsideTheInstall",
+       "Effect": "Deny",
+       "Action": "iam:*",
+       "NotResource": [
+        {
+         "Fn::Sub": "arn:${AWS::Partition}:iam::${AWS::AccountId}:role/coderhelm-${Stage}-*"
+        },
+        {
+         "Fn::Sub": "arn:${AWS::Partition}:iam::${AWS::AccountId}:policy/coderhelm-${Stage}-*"
+        }
+       ]
+      },
+      {
+       "Sid": "RolesOnlyWithTheBoundary",
+       "Effect": "Deny",
+       "Action": [
+        "iam:CreateRole",
+        "iam:PutRolePolicy",
+        "iam:AttachRolePolicy",
+        "iam:DetachRolePolicy",
+        "iam:DeleteRolePolicy",
+        "iam:PutRolePermissionsBoundary"
+       ],
+       "Resource": "*",
+       "Condition": {
+        "StringNotEquals": {
+         "iam:PermissionsBoundary": {
+          "Fn::Sub": "arn:${AWS::Partition}:iam::${AWS::AccountId}:policy/coderhelm-${Stage}-boundary-stack"
+         }
+        }
+       }
+      },
+      {
+       "Sid": "TheBoundaryStays",
+       "Effect": "Deny",
+       "Action": [
+        "iam:DeleteRolePermissionsBoundary",
+        "iam:CreatePolicy*",
+        "iam:DeletePolicy*",
+        "iam:SetDefault*",
+        "iam:*agPolicy"
+       ],
+       "Resource": [
+        {
+         "Fn::Sub": "arn:${AWS::Partition}:iam::${AWS::AccountId}:policy/coderhelm-${Stage}-*boundary-stack"
+        },
+        {
+         "Fn::Sub": "arn:${AWS::Partition}:iam::${AWS::AccountId}:role/*"
+        }
+       ]
+      },
+      {
+       "Sid": "OnlyTheInstallsOwn",
+       "Effect": "Deny",
+       "Action": [
+        "lambda:CreateF*",
+        "lambda:CreateAlias",
+        "lambda:Delete*",
+        "lambda:Update*",
+        "lambda:Invoke*",
+        "lambda:Put*",
+        "lambda:*Permission",
+        "lambda:Publish*",
+        "cloudformation:Create*",
+        "cloudformation:Update*",
+        "cloudformation:Delete*",
+        "cloudformation:Execute*",
+        "cloudformation:Set*",
+        "cloudformation:Continue*",
+        "s3:Put*",
+        "s3:Delete*",
+        "secretsmanager:GetSecretValue",
+        "secretsmanager:Put*",
+        "secretsmanager:Update*",
+        "secretsmanager:Delete*",
+        "ssm:Put*",
+        "ssm:Delete*"
+       ],
+       "NotResource": [
+        {
+         "Fn::Sub": "arn:*:lambda:*:*:function:coderhelm-${Stage}-*"
+        },
+        {
+         "Fn::Sub": "arn:*:lambda:*:*:layer:coderhelm-${Stage}-*"
+        },
+        "arn:*:lambda:*:*:event-source-mapping:*",
+        {
+         "Fn::Sub": "arn:*:cloudformation:*:*:stack/coderhelm-${Stage}*"
+        },
+        "arn:*:cloudformation:*:aws:transform/*",
+        {
+         "Fn::Sub": "arn:*:s3:::coderhelm-${Stage}-*"
+        },
+        "arn:*:s3:::coderhelm-setup-*",
+        {
+         "Fn::Sub": "arn:*:secretsmanager:*:*:secret:coderhelm/${Stage}/*"
+        },
+        {
+         "Fn::Sub": "arn:*:ssm:*:*:parameter/coderhelm-${Stage}/*"
+        }
+       ]
+      },
+      {
+       "Sid": "NoCommandsOnInstances",
+       "Effect": "Deny",
+       "Action": [
+        "ssm:SendCommand",
+        "ssm:Start*",
+        "ssm:*Association*"
+       ],
+       "Resource": "*"
+      },
+      {
+       "Sid": "TheDeployRoleStays",
+       "Effect": "Deny",
+       "Action": [
+        "iam:CreateRole",
+        "iam:PutRolePolicy",
+        "iam:AttachRolePolicy",
+        "iam:DetachRolePolicy",
+        "iam:DeleteRolePolicy",
+        "iam:PutRolePermissionsBoundary",
+        "iam:DeleteRole",
+        "iam:UpdateRole",
+        "iam:UpdateAssumeRolePolicy",
+        "iam:TagRole",
+        "iam:UntagRole"
+       ],
+       "Resource": {
+        "Fn::Sub": "arn:${AWS::Partition}:iam::${AWS::AccountId}:role/coderhelm-${Stage}-deploy-stack"
+       }
+      },
+      {
+       "Sid": "TheAccessStackStays",
+       "Effect": "Deny",
+       "Action": [
+        "cloudformation:CreateChangeSet",
+        "cloudformation:ExecuteChangeSet",
+        "cloudformation:UpdateStack",
+        "cloudformation:DeleteStack",
+        "cloudformation:CreateStack",
+        "cloudformation:SetStackPolicy"
+       ],
+       "Resource": {
+        "Fn::Sub": "arn:${AWS::Partition}:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/coderhelm-${Stage}-access/*"
+       }
+      },
+      {
+       "Sid": "NoOtherRolesHere",
+       "Effect": "Deny",
+       "Action": [
+        "sts:AssumeRole",
+        "sts:AssumeRoleWithWebIdentity",
+        "sts:AssumeRoleWithSAML",
+        "sts:TagSession",
+        "sts:SetSourceIdentity"
+       ],
+       "NotResource": [
+        {
+         "Fn::Sub": "arn:${AWS::Partition}:iam::${AWS::AccountId}:role/CoderHelmLogReader"
+        },
+        {
+         "Fn::Sub": "arn:${AWS::Partition}:iam::${AWS::AccountId}:role/CoderhelmReadOnly"
+        }
+       ],
+       "Condition": {
+        "StringEquals": {
+         "aws:ResourceAccount": {
+          "Fn::Sub": "${AWS::AccountId}"
+         }
+        }
+       }
+      },
+      {
+       "Sid": "ReadRolesHereAssumeOnly",
+       "Effect": "Deny",
+       "Action": [
+        "sts:AssumeRoleWithWebIdentity",
+        "sts:AssumeRoleWithSAML",
+        "sts:TagSession",
+        "sts:SetSourceIdentity"
+       ],
+       "Resource": [
+        {
+         "Fn::Sub": "arn:${AWS::Partition}:iam::${AWS::AccountId}:role/CoderHelmLogReader"
+        },
+        {
+         "Fn::Sub": "arn:${AWS::Partition}:iam::${AWS::AccountId}:role/CoderhelmReadOnly"
+        }
+       ]
+      },
+      {
+       "Sid": "ReadRolesHereOnlyGatewayAndWorker",
+       "Effect": "Deny",
+       "Action": "sts:AssumeRole",
+       "Resource": [
+        {
+         "Fn::Sub": "arn:${AWS::Partition}:iam::${AWS::AccountId}:role/CoderHelmLogReader"
+        },
+        {
+         "Fn::Sub": "arn:${AWS::Partition}:iam::${AWS::AccountId}:role/CoderhelmReadOnly"
+        }
+       ],
+       "Condition": {
+        "StringNotEquals": {
+         "aws:PrincipalTag/coderhelm:role": [
+          "gateway",
+          "worker"
+         ]
+        }
+       }
+      },
+      {
+       "Sid": "RuntimeTagOnlyByDeploy",
+       "Effect": "Deny",
+       "Action": [
+        "iam:CreateRole",
+        "iam:TagRole",
+        "iam:UntagRole"
+       ],
+       "Resource": "*",
+       "Condition": {
+        "ForAnyValue:StringEqualsIgnoreCase": {
+         "aws:TagKeys": [
+          "coderhelm:role"
+         ]
+        },
+        "ArnNotEquals": {
+         "aws:PrincipalArn": {
+          "Fn::Sub": "arn:${AWS::Partition}:iam::${AWS::AccountId}:role/coderhelm-${Stage}-deploy-stack"
+         }
+        }
+       }
+      }
+     ]
+    }
+   }
+  },
+  "DeployRole": {
+   "Type": "AWS::IAM::Role",
+   "DeletionPolicy": "Retain",
+   "UpdateReplacePolicy": "Retain",
+   "Metadata": {
+    "cfn-lint": {
+     "config": {
+      "ignore_checks": [
+       "W3037",
+       "W3011"
+      ]
+     }
+    }
+   },
+   "Properties": {
+    "RoleName": {
+     "Fn::Sub": "coderhelm-${Stage}-deploy-stack"
+    },
+    "Description": "CoderHelm: applies a reviewed release's stack update when auto-update is on (docs/self-host/security.md)",
+    "AssumeRolePolicyDocument": {
+     "Version": "2012-10-17",
+     "Statement": [
+      {
+       "Effect": "Allow",
+       "Principal": {
+        "Service": "cloudformation.amazonaws.com"
+       },
+       "Action": "sts:AssumeRole",
+       "Condition": {
+        "StringEquals": {
+         "aws:SourceAccount": {
+          "Ref": "AWS::AccountId"
+         }
+        },
+        "StringLike": {
+         "aws:SourceArn": [
+          {
+           "Fn::Sub": "arn:${AWS::Partition}:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/coderhelm-${Stage}/*"
+          },
+          {
+           "Fn::Sub": "arn:${AWS::Partition}:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/coderhelm-${Stage}-*/*"
+          }
+         ]
+        }
+       }
+      }
+     ]
+    },
+    "PermissionsBoundary": {
+     "Ref": "DeployBoundary"
+    },
+    "Policies": [
+     {
+      "PolicyName": "deploy",
+      "PolicyDocument": {
+       "Version": "2012-10-17",
+       "Statement": [
+        {
+         "Sid": "Roles",
+         "Effect": "Allow",
+         "Action": [
+          "iam:CreateRole",
+          "iam:PutRolePolicy",
+          "iam:AttachRolePolicy",
+          "iam:DetachRolePolicy",
+          "iam:DeleteRolePolicy",
+          "iam:PutRolePermissionsBoundary"
+         ],
+         "Resource": {
+          "Fn::Sub": "arn:${AWS::Partition}:iam::${AWS::AccountId}:role/coderhelm-${Stage}-*"
+         },
+         "Condition": {
+          "StringEquals": {
+           "iam:PermissionsBoundary": {
+            "Fn::Sub": "arn:${AWS::Partition}:iam::${AWS::AccountId}:policy/coderhelm-${Stage}-boundary-stack"
+           }
+          }
+         }
+        },
+        {
+         "Sid": "RolesManage",
+         "Effect": "Allow",
+         "Action": [
+          "iam:DeleteRole",
+          "iam:GetRole",
+          "iam:GetRolePolicy",
+          "iam:ListRolePolicies",
+          "iam:ListAttachedRolePolicies",
+          "iam:ListRoleTags",
+          "iam:UpdateRole",
+          "iam:UpdateRoleDescription",
+          "iam:UpdateAssumeRolePolicy",
+          "iam:TagRole",
+          "iam:UntagRole"
+         ],
+         "Resource": {
+          "Fn::Sub": "arn:${AWS::Partition}:iam::${AWS::AccountId}:role/coderhelm-${Stage}-*"
+         }
+        },
+        {
+         "Sid": "Policies",
+         "Effect": "Allow",
+         "Action": [
+          "iam:CreatePolicy",
+          "iam:DeletePolicy",
+          "iam:CreatePolicyVersion",
+          "iam:DeletePolicyVersion",
+          "iam:GetPolicy",
+          "iam:GetPolicyVersion",
+          "iam:ListPolicyVersions",
+          "iam:ListEntitiesForPolicy",
+          "iam:TagPolicy",
+          "iam:UntagPolicy"
+         ],
+         "Resource": {
+          "Fn::Sub": "arn:${AWS::Partition}:iam::${AWS::AccountId}:policy/coderhelm-${Stage}-*"
+         }
+        },
+        {
+         "Sid": "PassInstallRoles",
+         "Effect": "Allow",
+         "Action": "iam:PassRole",
+         "Resource": {
+          "Fn::Sub": "arn:${AWS::Partition}:iam::${AWS::AccountId}:role/coderhelm-${Stage}-*"
+         }
+        },
+        {
+         "Sid": "Functions",
+         "Effect": "Allow",
+         "Action": "lambda:*",
+         "Resource": [
+          {
+           "Fn::Sub": "arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:coderhelm-${Stage}-*"
+          },
+          {
+           "Fn::Sub": "arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:layer:coderhelm-${Stage}-*"
+          }
+         ]
+        },
+        {
+         "Sid": "FunctionEvents",
+         "Effect": "Allow",
+         "Action": [
+          "lambda:CreateEventSourceMapping",
+          "lambda:UpdateEventSourceMapping",
+          "lambda:DeleteEventSourceMapping"
+         ],
+         "Resource": "*",
+         "Condition": {
+          "ArnLike": {
+           "lambda:FunctionArn": {
+            "Fn::Sub": "arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:coderhelm-${Stage}-*"
+           }
+          }
+         }
+        },
+        {
+         "Sid": "FunctionEventTags",
+         "Effect": "Allow",
+         "Action": [
+          "lambda:TagResource",
+          "lambda:UntagResource",
+          "lambda:ListTags"
+         ],
+         "Resource": {
+          "Fn::Sub": "arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:event-source-mapping:*"
+         }
+        },
+        {
+         "Sid": "Tables",
+         "Effect": "Allow",
+         "Action": "dynamodb:*",
+         "Resource": [
+          {
+           "Fn::Sub": "arn:${AWS::Partition}:dynamodb:${AWS::Region}:${AWS::AccountId}:table/coderhelm-${Stage}"
+          },
+          {
+           "Fn::Sub": "arn:${AWS::Partition}:dynamodb:${AWS::Region}:${AWS::AccountId}:table/coderhelm-${Stage}/*"
+          },
+          {
+           "Fn::Sub": "arn:${AWS::Partition}:dynamodb:${AWS::Region}:${AWS::AccountId}:table/coderhelm-${Stage}-*"
+          }
+         ]
+        },
+        {
+         "Sid": "Buckets",
+         "Effect": "Allow",
+         "Action": "s3:*",
+         "Resource": [
+          {
+           "Fn::Sub": "arn:${AWS::Partition}:s3:::coderhelm-${Stage}-*"
+          }
+         ]
+        },
+        {
+         "Sid": "Queues",
+         "Effect": "Allow",
+         "Action": "sqs:*",
+         "Resource": {
+          "Fn::Sub": "arn:${AWS::Partition}:sqs:${AWS::Region}:${AWS::AccountId}:coderhelm-${Stage}-*"
+         }
+        },
+        {
+         "Sid": "Topics",
+         "Effect": "Allow",
+         "Action": "sns:*",
+         "Resource": {
+          "Fn::Sub": "arn:${AWS::Partition}:sns:${AWS::Region}:${AWS::AccountId}:coderhelm-${Stage}-*"
+         }
+        },
+        {
+         "Sid": "Logs",
+         "Effect": "Allow",
+         "Action": "logs:*",
+         "Resource": [
+          {
+           "Fn::Sub": "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/coderhelm-${Stage}-*"
+          },
+          {
+           "Fn::Sub": "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/codebuild/coderhelm-${Stage}-*"
+          }
+         ]
+        },
+        {
+         "Sid": "Schedules",
+         "Effect": "Allow",
+         "Action": [
+          "events:*",
+          "scheduler:*"
+         ],
+         "Resource": [
+          {
+           "Fn::Sub": "arn:${AWS::Partition}:events:${AWS::Region}:${AWS::AccountId}:rule/coderhelm-${Stage}-*"
+          },
+          {
+           "Fn::Sub": "arn:${AWS::Partition}:scheduler:${AWS::Region}:${AWS::AccountId}:schedule-group/coderhelm-${Stage}-*"
+          },
+          {
+           "Fn::Sub": "arn:${AWS::Partition}:scheduler:${AWS::Region}:${AWS::AccountId}:schedule/coderhelm-${Stage}-*/*"
+          }
+         ]
+        },
+        {
+         "Sid": "Alarms",
+         "Effect": "Allow",
+         "Action": "cloudwatch:*",
+         "Resource": [
+          {
+           "Fn::Sub": "arn:${AWS::Partition}:cloudwatch:${AWS::Region}:${AWS::AccountId}:alarm:coderhelm-${Stage}-*"
+          },
+          {
+           "Fn::Sub": "arn:${AWS::Partition}:cloudwatch::${AWS::AccountId}:dashboard/coderhelm-${Stage}"
+          },
+          {
+           "Fn::Sub": "arn:${AWS::Partition}:cloudwatch::${AWS::AccountId}:dashboard/coderhelm-${Stage}-*"
+          }
+         ]
+        },
+        {
+         "Sid": "Builds",
+         "Effect": "Allow",
+         "Action": "codebuild:*",
+         "Resource": [
+          {
+           "Fn::Sub": "arn:${AWS::Partition}:codebuild:${AWS::Region}:${AWS::AccountId}:project/coderhelm-${Stage}-*"
+          },
+          {
+           "Fn::Sub": "arn:${AWS::Partition}:codebuild:${AWS::Region}:${AWS::AccountId}:report-group/coderhelm-${Stage}-*"
+          }
+         ]
+        },
+        {
+         "Sid": "Parameters",
+         "Effect": "Allow",
+         "Action": "ssm:*",
+         "Resource": {
+          "Fn::Sub": "arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/coderhelm-${Stage}/*"
+         }
+        },
+        {
+         "Sid": "Email",
+         "Effect": "Allow",
+         "Action": "ses:*",
+         "Resource": [
+          {
+           "Fn::Sub": "arn:${AWS::Partition}:ses:${AWS::Region}:${AWS::AccountId}:configuration-set/coderhelm-${Stage}-*"
+          },
+          {
+           "Fn::Sub": "arn:${AWS::Partition}:ses:${AWS::Region}:${AWS::AccountId}:template/coderhelm-${Stage}-*"
+          },
+          {
+           "Fn::Sub": [
+            "arn:${AWS::Partition}:ses:${AWS::Region}:${AWS::AccountId}:identity/${EmailIdentity}",
+            {
+             "EmailIdentity": {
+              "Fn::If": [
+               "HasEmailFrom",
+               {
+                "Ref": "EmailFrom"
+               },
+               {
+                "Ref": "AdminEmail"
+               }
+              ]
+             }
+            }
+           ]
+          }
+         ]
+        },
+        {
+         "Sid": "EmailTemplatesV1",
+         "Effect": "Allow",
+         "Action": [
+          "ses:CreateTemplate",
+          "ses:UpdateTemplate",
+          "ses:DeleteTemplate"
+         ],
+         "Resource": "*"
+        },
+        {
+         "Sid": "KeysCreate",
+         "Effect": "Allow",
+         "Action": [
+          "kms:CreateKey",
+          "kms:TagResource"
+         ],
+         "Resource": "*",
+         "Condition": {
+          "StringEquals": {
+           "aws:RequestTag/coderhelm:install": {
+            "Fn::Sub": "coderhelm-${Stage}"
+           }
+          }
+         }
+        },
+        {
+         "Sid": "Keys",
+         "Effect": "Allow",
+         "Action": "kms:*",
+         "Resource": {
+          "Fn::Sub": "arn:${AWS::Partition}:kms:${AWS::Region}:${AWS::AccountId}:key/*"
+         },
+         "Condition": {
+          "StringEquals": {
+           "aws:ResourceTag/coderhelm:install": {
+            "Fn::Sub": "coderhelm-${Stage}"
+           }
+          }
+         }
+        },
+        {
+         "Sid": "KeyAliases",
+         "Effect": "Allow",
+         "Action": [
+          "kms:CreateAlias",
+          "kms:DeleteAlias",
+          "kms:UpdateAlias"
+         ],
+         "Resource": {
+          "Fn::Sub": "arn:${AWS::Partition}:kms:${AWS::Region}:${AWS::AccountId}:alias/coderhelm-${Stage}-*"
+         }
+        },
+        {
+         "Sid": "UserPoolsCreate",
+         "Effect": "Allow",
+         "Action": "cognito-idp:CreateUserPool",
+         "Resource": "*"
+        },
+        {
+         "Sid": "UserPoolsTag",
+         "Effect": "Allow",
+         "Action": "cognito-idp:TagResource",
+         "Resource": "*",
+         "Condition": {
+          "StringEquals": {
+           "aws:RequestTag/coderhelm:install": {
+            "Fn::Sub": "coderhelm-${Stage}"
+           }
+          }
+         }
+        },
+        {
+         "Sid": "UserPools",
+         "Effect": "Allow",
+         "Action": "cognito-idp:*",
+         "Resource": {
+          "Fn::Sub": "arn:${AWS::Partition}:cognito-idp:${AWS::Region}:${AWS::AccountId}:userpool/*"
+         },
+         "Condition": {
+          "StringEquals": {
+           "aws:ResourceTag/coderhelm:install": {
+            "Fn::Sub": "coderhelm-${Stage}"
+           }
+          }
+         }
+        },
+        {
+         "Sid": "DistributionsCreate",
+         "Effect": "Allow",
+         "Action": [
+          "cloudfront:CreateDistribution",
+          "cloudfront:CreateDistributionWithTags"
+         ],
+         "Resource": "*"
+        },
+        {
+         "Sid": "DistributionsTag",
+         "Effect": "Allow",
+         "Action": "cloudfront:TagResource",
+         "Resource": "*",
+         "Condition": {
+          "StringEquals": {
+           "aws:RequestTag/coderhelm:install": {
+            "Fn::Sub": "coderhelm-${Stage}"
+           }
+          }
+         }
+        },
+        {
+         "Sid": "Distributions",
+         "Effect": "Allow",
+         "Action": "cloudfront:*",
+         "Resource": {
+          "Fn::Sub": "arn:${AWS::Partition}:cloudfront::${AWS::AccountId}:distribution/*"
+         },
+         "Condition": {
+          "StringEquals": {
+           "aws:ResourceTag/coderhelm:install": {
+            "Fn::Sub": "coderhelm-${Stage}"
+           }
+          }
+         }
+        },
+        {
+         "Sid": "EdgeFunctionsCreate",
+         "Effect": "Allow",
+         "Action": "cloudfront:CreateFunction",
+         "Resource": "*"
+        },
+        {
+         "Sid": "EdgeFunctions",
+         "Effect": "Allow",
+         "Action": "cloudfront:*",
+         "Resource": {
+          "Fn::Sub": "arn:${AWS::Partition}:cloudfront::${AWS::AccountId}:function/coderhelm-${Stage}-*"
+         }
+        },
+        {
+         "Sid": "EdgeSettings",
+         "Effect": "Allow",
+         "Action": [
+          "cloudfront:CreateOriginAccessControl",
+          "cloudfront:UpdateOriginAccessControl",
+          "cloudfront:DeleteOriginAccessControl",
+          "cloudfront:GetOriginAccessControl",
+          "cloudfront:CreateResponseHeadersPolicy",
+          "cloudfront:UpdateResponseHeadersPolicy",
+          "cloudfront:DeleteResponseHeadersPolicy",
+          "cloudfront:GetResponseHeadersPolicy"
+         ],
+         "Resource": "*"
+        },
+        {
+         "Sid": "HttpApi",
+         "Effect": "Allow",
+         "Action": [
+          "apigateway:GET",
+          "apigateway:POST",
+          "apigateway:PUT",
+          "apigateway:PATCH",
+          "apigateway:DELETE",
+          "apigateway:TagResource",
+          "apigateway:UntagResource"
+         ],
+         "Resource": [
+          {
+           "Fn::Sub": "arn:${AWS::Partition}:apigateway:${AWS::Region}::/apis"
+          },
+          {
+           "Fn::Sub": "arn:${AWS::Partition}:apigateway:${AWS::Region}::/apis/*"
+          },
+          {
+           "Fn::Sub": "arn:${AWS::Partition}:apigateway:${AWS::Region}::/tags/*"
+          },
+          {
+           "Fn::Sub": "arn:${AWS::Partition}:apigateway:${AWS::Region}::/domainnames"
+          },
+          {
+           "Fn::Sub": "arn:${AWS::Partition}:apigateway:${AWS::Region}::/domainnames/*"
+          }
+         ]
+        },
+        {
+         "Sid": "CertificatesRequest",
+         "Effect": "Allow",
+         "Action": [
+          "acm:RequestCertificate",
+          "acm:AddTagsToCertificate"
+         ],
+         "Resource": "*",
+         "Condition": {
+          "StringEquals": {
+           "aws:RequestTag/coderhelm:install": {
+            "Fn::Sub": "coderhelm-${Stage}"
+           }
+          }
+         }
+        },
+        {
+         "Sid": "Certificates",
+         "Effect": "Allow",
+         "Action": "acm:*",
+         "Resource": {
+          "Fn::Sub": "arn:${AWS::Partition}:acm:*:${AWS::AccountId}:certificate/*"
+         },
+         "Condition": {
+          "StringEquals": {
+           "aws:ResourceTag/coderhelm:install": {
+            "Fn::Sub": "coderhelm-${Stage}"
+           }
+          }
+         }
+        },
+        {
+         "Sid": "NoIamUsersOrKeys",
+         "Effect": "Deny",
+         "Action": [
+          "iam:CreateUser",
+          "iam:CreateAccessKey",
+          "iam:CreateLoginProfile"
+         ],
+         "Resource": "*"
+        },
+        {
+         "Sid": "NoKeyDestruction",
+         "Effect": "Deny",
+         "Action": [
+          "kms:ScheduleKeyDeletion",
+          "kms:DisableKey",
+          "kms:DeleteImportedKeyMaterial"
+         ],
+         "Resource": "*"
+        },
+        {
+         "Sid": "Reads",
+         "Effect": "Allow",
+         "Action": [
+          "cloudformation:Describe*",
+          "cloudformation:Get*",
+          "cloudformation:List*",
+          "cloudfront:Get*",
+          "cloudfront:List*",
+          "cloudwatch:Describe*",
+          "cloudwatch:Get*",
+          "cloudwatch:List*",
+          "cognito-idp:Describe*",
+          "cognito-idp:List*",
+          "dynamodb:Describe*",
+          "dynamodb:List*",
+          "events:Describe*",
+          "events:List*",
+          "kms:List*",
+          "lambda:Get*",
+          "lambda:List*",
+          "logs:Describe*",
+          "logs:List*",
+          "ses:Get*",
+          "ses:List*",
+          "ses:DescribeConfigurationSet",
+          "sqs:List*",
+          "sns:List*",
+          "ssm:Describe*",
+          "acm:Describe*",
+          "acm:List*",
+          "codebuild:List*",
+          "scheduler:List*",
+          "sts:GetCallerIdentity"
+         ],
+         "Resource": "*"
+        },
+        {
+         "Sid": "ParentStack",
+         "Effect": "Allow",
+         "Action": [
+          "cloudformation:*"
+         ],
+         "Resource": [
+          {
+           "Fn::Sub": "arn:${AWS::Partition}:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/coderhelm-${Stage}/*"
+          },
+          {
+           "Fn::Sub": "arn:${AWS::Partition}:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/coderhelm-${Stage}-*/*"
+          }
+         ]
+        },
+        {
+         "Sid": "ReleaseFiles",
+         "Effect": "Allow",
+         "Action": [
+          "s3:GetObject"
+         ],
+         "Resource": {
+          "Fn::Sub": "arn:${AWS::Partition}:s3:::coderhelm-${Stage}-release-${AWS::AccountId}/*"
+         }
+        },
+        {
+         "Sid": "InstallSecret",
+         "Effect": "Allow",
+         "Action": [
+          "secretsmanager:DescribeSecret",
+          "secretsmanager:GetSecretValue",
+          "secretsmanager:UpdateSecret",
+          "secretsmanager:TagResource",
+          "secretsmanager:UntagResource"
+         ],
+         "Resource": {
+          "Fn::Sub": "arn:${AWS::Partition}:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:coderhelm/${Stage}/secrets-??????"
+         }
+        },
+        {
+         "Sid": "SecretPassword",
+         "Effect": "Allow",
+         "Action": "secretsmanager:GetRandomPassword",
+         "Resource": "*"
+        },
+        {
+         "Sid": "ProgressBucket",
+         "Effect": "Allow",
+         "Action": "s3:*",
+         "Resource": [
+          {
+           "Fn::Sub": "arn:${AWS::Partition}:s3:::coderhelm-setup-${StatusId}"
+          },
+          {
+           "Fn::Sub": "arn:${AWS::Partition}:s3:::coderhelm-setup-${StatusId}/*"
+          }
+         ]
+        }
+       ]
+      }
+     }
+    ],
+    "Tags": [
+     {
+      "Key": "coderhelm:install",
+      "Value": {
+       "Fn::Sub": "coderhelm-${Stage}"
+      }
+     }
+    ]
+   }
+  }
+ }
+}

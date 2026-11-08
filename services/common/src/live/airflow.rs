@@ -373,6 +373,13 @@ where
     use aws_sdk_mwaa::error::ProvideErrorMetadata as _;
     let code = e.code().unwrap_or("").to_string();
     let msg = e.message().unwrap_or("").to_string();
+    if code.contains("AccessDenied") && super::boundary_refusal(&msg) {
+        return StepError::new(
+            "sign_in",
+            "This install's permission limit doesn't allow reading Airflow yet: the release that reads it needs a permission change an AWS admin hasn't applied.",
+            super::PENDING_PERMISSION_FIX,
+        );
+    }
     if code.contains("AccessDenied") {
         return StepError::new(
             "sign_in",

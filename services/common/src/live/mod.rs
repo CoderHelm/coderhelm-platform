@@ -87,6 +87,20 @@ pub fn error_detail(code: &str, message: &str) -> String {
     crate::truncate_str(&text, 300).to_string()
 }
 
+/// AWS refused a call because of a permissions boundary (its message says
+/// so: "no permissions boundary allows" or "explicit deny in a permissions
+/// boundary"). On a self-hosted install reading its own account, that is the
+/// install's own boundary: a newer release needs read access the install
+/// doesn't have until an AWS admin applies the pending permission change.
+pub fn boundary_refusal(message: &str) -> bool {
+    message
+        .to_ascii_lowercase()
+        .contains("permissions boundary")
+}
+
+/// What to do when the install's own boundary refused a read.
+pub const PENDING_PERMISSION_FIX: &str = "An AWS admin applies the pending permission change: Settings, System, Version, Permissions (one link to the AWS console). Nothing else waits on it.";
+
 /// A failure a person can act on: which step failed, what happened, what to do.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct StepError {
@@ -120,6 +134,18 @@ impl std::fmt::Display for StepError {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    #[test]
+    fn a_boundary_refusal_is_told_apart_from_a_missing_role_permission() {
+        assert!(boundary_refusal("User: arn:aws:sts::1:assumed-role/coderhelm-prod-worker/x is not authorized to perform: airflow:InvokeRestApi on resource: y because no permissions boundary allows the airflow:InvokeRestApi action"));
+        assert!(boundary_refusal(
+            "... with an explicit deny in a permissions boundary"
+        ));
+        assert!(!boundary_refusal("User is not authorized to perform: airflow:InvokeRestApi because no identity-based policy allows it"));
+        assert!(PENDING_PERMISSION_FIX.contains("Settings, System"));
+    }
+
     #[test]
     fn counts_read_naturally() {
         assert_eq!(super::count(1, "row"), "1 row");
