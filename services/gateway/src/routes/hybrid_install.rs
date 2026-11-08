@@ -76,17 +76,21 @@ pub struct Local {
     pub github_mode: String,
     /// Integrations using CoderHelm's apps (common::hybrid::integrations), as
     /// CoderHelm last accepted them. Worked out from `github_mode` and
-    /// `apps` ([`wanted_integrations`]), never set by hand.
+    /// `apps_mode` ([`wanted_integrations`]), never set by hand.
     #[serde(default)]
     pub integrations: Vec<String>,
-    /// Other apps, per tool (`integrations::app_choice_ids`): `coderhelm` or
-    /// `own`, as someone chose it in Settings or the install guide. A tool
-    /// with no entry was never chosen and uses CoderHelm's app, unless this
-    /// install has its own app for it set up.
+    /// Other apps, for the whole install: `coderhelm` (CoderHelm's app for
+    /// every tool in `integrations::app_choice_ids`, including ones added in
+    /// later releases) or `private` (none). A tool with the install's own app
+    /// set up uses that app either way. Empty until [`migrate_apps`] runs.
+    #[serde(default)]
+    pub apps_mode: String,
+    /// The per-tool choices of earlier releases (`coderhelm` or `own`). Read
+    /// once by [`migrate_apps`]; kept so an older release still finds them.
     #[serde(default)]
     pub apps: BTreeMap<String, String>,
-    /// 1 once `apps` holds the choices. A record from before (0) kept them
-    /// only in `integrations`; [`migrate_apps`] reads them from there once.
+    /// 2 once `apps_mode` holds the choice. 1: the choices were per tool, in
+    /// `apps`. 0: they were only in `integrations`.
     #[serde(default)]
     pub apps_v: u8,
     /// The `integrations` last asked of CoderHelm (it may accept fewer:
@@ -378,7 +382,7 @@ pub(crate) async fn do_register(state: &AppState) -> Result<Local, (StatusCode, 
     save_local(state, &l).await?;
     info!(install = %c.install_id, "hybrid: registered with CoderHelm");
     let _ = do_verify(state, &mut l).await;
-    // The Other apps choices (CoderHelm's app for each tool nobody chose).
+    // The Other apps choice (CoderHelm's apps unless someone chose private).
     l.apps_sent.clear();
     sync_apps(state, &mut l, None).await;
     Ok(l)
@@ -598,8 +602,13 @@ pub struct SettingsBody {
     /// Settings, Integrations, Jira, "Link through CoderHelm" on or off.
     #[serde(default)]
     pub jira_link: Option<bool>,
-    /// Other apps, per tool: `{ "notion": "coderhelm" | "own", ... }`. Only
-    /// the tools named change.
+    /// Other apps, for the whole install: `coderhelm` or `private`.
+    #[serde(default)]
+    pub apps_mode: Option<String>,
+    /// Earlier releases' per-tool choices, `{ "notion": "coderhelm" | "own" }`,
+    /// still taken for one release (older dashboards and install guides):
+    /// any `coderhelm` means CoderHelm's apps, only `own` means private.
+    /// Ignored when `apps_mode` is sent.
     #[serde(default)]
     pub apps: Option<BTreeMap<String, String>>,
 }
@@ -621,20 +630,9 @@ pub fn apply_settings(l: &mut Local, b: &SettingsBody) -> Result<(), &'static st
         }
     }
     if let Some(list) = &b.integrations {
-        // The whole list (from a dashboard before `apps`): only the tools it
-        // switches on or off become a choice.
         let allowed: Vec<&str> = integrations::hosted_ids().collect();
         if list.iter().any(|i| !allowed.contains(&i.as_str())) {
             return Err("an integration that can't use CoderHelm's app");
-        }
-        for id in integrations::app_choice_ids() {
-            let listed = list.iter().any(|i| i == id);
-            let on = l.integrations.iter().any(|i| i == id);
-            if listed && !on {
-                l.apps.insert(id.into(), "coderhelm".into());
-            } else if !listed && on {
-                l.apps.insert(id.into(), "own".into());
-            }
         }
     }
     if let Some(apps) = &b.apps {
@@ -646,9 +644,14 @@ pub fn apply_settings(l: &mut Local, b: &SettingsBody) -> Result<(), &'static st
                 return Err("each app is coderhelm or own");
             }
         }
-        for (id, v) in apps {
-            l.apps.insert(id.clone(), v.clone());
+    }
+    if let Some(m) = &b.apps_mode {
+        match m.as_str() {
+            "coderhelm" | "private" => l.apps_mode = m.clone(),
+            _ => return Err("apps_mode is coderhelm or private"),
         }
+    } else if let Some(mode) = legacy_apps_mode(b) {
+        l.apps_mode = mode.into();
     }
     if let Some(s) = &b.sharing {
         l.sharing = s.enabled;
@@ -666,7 +669,7 @@ async fn do_settings(
 ) -> Result<Local, (StatusCode, Json<Value>)> {
     let mut l = local(state).await;
     let was_linking = l.jira_link;
-    migrate_apps(&mut l, None);
+    migrate_apps(&mut l);
     apply_settings(&mut l, b).map_err(|m| fail(StatusCode::BAD_REQUEST, "bad_settings", m))?;
     if l.jira_link && creds_now().await.is_none() {
         return Err(not_registered());
@@ -706,22 +709,42 @@ fn strings(v: &Value) -> Option<Vec<String>> {
 }
 
 /// Does this install have its own app set up for a tool (its own Notion,
-/// Atlassian or Google client in its secret)? Then a tool nobody chose for
-/// keeps using it.
+/// Atlassian, Google or Figma client in its secret)? Then the tool uses it,
+/// whichever Other apps choice the install made.
 fn own_app_set(state: &AppState, id: &str) -> bool {
     common::knowledge::sources::Kind::parse(id)
         .is_some_and(|k| super::knowledge_sources::app(state, k).is_set())
         || super::mcp_servers::coderhelm_app(state, id).is_set()
 }
 
-/// Does `id` use CoderHelm's app: as chosen, or by default (CoderHelm's,
-/// unless the install has its own app for it set up). Pure; tested.
-pub fn uses_coderhelm(l: &Local, id: &str, own_app_set: impl Fn(&str) -> bool) -> bool {
-    match l.apps.get(id).map(String::as_str) {
-        Some("own") => false,
-        Some(_) => true,
-        None => !own_app_set(id),
+/// The Other apps choice, `coderhelm` unless someone chose `private`.
+pub fn apps_mode(l: &Local) -> &'static str {
+    if l.apps_mode == "private" {
+        "private"
+    } else {
+        "coderhelm"
     }
+}
+
+/// Does `id` use CoderHelm's app: the install chose CoderHelm's apps and has
+/// no app of its own for `id`. Pure; tested.
+pub fn uses_coderhelm(l: &Local, id: &str, own_app_set: impl Fn(&str) -> bool) -> bool {
+    apps_mode(l) == "coderhelm" && !own_app_set(id)
+}
+
+/// The install-wide choice an earlier release's settings body means: the
+/// per-tool `apps`, or the whole `integrations` list from before them. Any
+/// tool on CoderHelm's app means CoderHelm's apps; only `own` (or a list
+/// with none of the tools) means private, so an older page never makes an
+/// install less private than it asked. `None` when neither is sent.
+pub fn legacy_apps_mode(b: &SettingsBody) -> Option<&'static str> {
+    let pick = |coderhelm: bool| if coderhelm { "coderhelm" } else { "private" };
+    if let Some(apps) = b.apps.as_ref().filter(|a| !a.is_empty()) {
+        return Some(pick(apps.values().any(|v| v == "coderhelm")));
+    }
+    b.integrations
+        .as_ref()
+        .map(|list| pick(integrations::app_choice_ids().any(|id| list.iter().any(|i| i == id))))
 }
 
 /// The integrations to ask CoderHelm for: GitHub when its mode is hosted,
@@ -739,31 +762,31 @@ pub fn wanted_integrations(l: &Local, own_app_set: impl Fn(&str) -> bool) -> Vec
     out
 }
 
-/// A record from before per-tool choices kept them only as the list. If that
-/// list names any Other apps tool, someone chose there: each tool on it is
-/// CoderHelm's app, and each one CoderHelm offered but isn't on it is their
-/// own. A list with none was never chosen, so every tool takes the default.
-/// True when the record changed. Pure; tested.
-pub fn migrate_apps(l: &mut Local, offered: Option<&[String]>) -> bool {
-    if l.apps_v >= 1 {
+/// Turns an earlier release's per-tool choices into the install-wide one,
+/// once. A tool was on CoderHelm's app when someone chose that for it, or
+/// when nobody chose and CoderHelm holds it (a record from before per-tool
+/// choices kept them only in that list). Any tool on CoderHelm's app means
+/// CoderHelm's apps; tools all chosen as their own means private; nothing
+/// chosen means the default, CoderHelm's apps. True when the record
+/// changed. Pure; tested.
+pub fn migrate_apps(l: &mut Local) -> bool {
+    if l.apps_v >= 2 {
         return false;
     }
-    l.apps_v = 1;
-    let on = |id: &str| l.integrations.iter().any(|i| i == id);
-    if integrations::app_choice_ids().any(on) {
-        let picks: Vec<(String, String)> = integrations::app_choice_ids()
-            .filter_map(|id| {
-                if on(id) {
-                    Some((id.into(), "coderhelm".into()))
-                } else if offered.is_none_or(|o| o.iter().any(|x| x == id)) {
-                    Some((id.into(), "own".into()))
-                } else {
-                    None
-                }
-            })
-            .collect();
-        l.apps.extend(picks);
+    l.apps_v = 2;
+    if !l.apps_mode.is_empty() {
+        return true;
     }
+    let on = |id: &str| match l.apps.get(id).map(String::as_str) {
+        Some(v) => v == "coderhelm",
+        None => l.integrations.iter().any(|i| i == id),
+    };
+    let any_own = l.apps.values().any(|v| v == "own");
+    l.apps_mode = if integrations::app_choice_ids().any(on) || !any_own {
+        "coderhelm".into()
+    } else {
+        "private".into()
+    };
     true
 }
 
@@ -787,7 +810,7 @@ pub fn apps_out_of_date(l: &Local, want: &[String], hosted_now: Option<&[String]
 /// through changes: nothing is connected or synced here.
 async fn sync_apps(state: &AppState, l: &mut Local, hosted: Option<&Value>) {
     let offered = offered_by(hosted);
-    let mut changed = migrate_apps(l, offered.as_deref());
+    let mut changed = migrate_apps(l);
     let mut want = wanted_integrations(l, |id| own_app_set(state, id));
     if let Some(o) = &offered {
         want.retain(|i| o.contains(i));
@@ -1012,6 +1035,8 @@ async fn status_value(state: &AppState, deep: bool) -> Value {
     let offered = offered_by(hosted.as_ref());
     if creds.is_some() {
         sync_apps(state, &mut l, hosted.as_ref()).await;
+    } else if migrate_apps(&mut l) {
+        let _ = save_local(state, &l).await;
     }
     let chosen: Vec<Value> = integrations::CATALOG
         .iter()
@@ -1026,6 +1051,11 @@ async fn status_value(state: &AppState, deep: bool) -> Value {
                     .any(|i| i == e.id)
             };
             v["uses_coderhelm"] = json!(uses);
+            // The install's own app for this tool, which it uses whichever
+            // Other apps choice was made.
+            if integrations::app_choice_ids().any(|id| id == e.id) {
+                v["own_app"] = json!(own_app_set(state, e.id));
+            }
             v["offered"] = json!(offered.as_ref().is_none_or(|o| o.iter().any(|i| i == e.id)));
             v
         })
@@ -1046,6 +1076,7 @@ async fn status_value(state: &AppState, deep: bool) -> Value {
             "links": hosted.as_ref().map(|h| h["github"]["links"].clone()).unwrap_or(json!([])),
             "app_slug": hosted.as_ref().map(|h| h["github"]["app_slug"].clone()).unwrap_or(Value::Null),
         },
+        "apps_mode": apps_mode(&l),
         "integrations": chosen,
         "sharing": { "enabled": l.sharing, "payloads": l.share_payloads },
         "jira": {
@@ -1527,7 +1558,7 @@ async fn ensure_jira_synced(state: &AppState) -> Result<(), (StatusCode, &'stati
         .map_err(|_| (StatusCode::SERVICE_UNAVAILABLE, "jira_link_unsynced"))
 }
 
-/// PUT /api/system/hybrid/settings `{github_mode?, integrations?, sharing?, jira_link?, apps?}`
+/// PUT /api/system/hybrid/settings `{github_mode?, sharing?, jira_link?, apps_mode?}` (and, for one release, the older `integrations?` and `apps?`)
 pub async fn put_settings(
     State(state): State<Arc<AppState>>,
     Extension(claims): Extension<Claims>,
@@ -1564,7 +1595,10 @@ pub struct GuideBody {
     /// install admin, after sign-up).
     #[serde(default)]
     jira_link: Option<bool>,
-    /// The guide's Other apps choices, per tool (`coderhelm` or `own`).
+    /// The guide's Other apps choice: `coderhelm` or `private`.
+    #[serde(default)]
+    apps_mode: Option<String>,
+    /// An earlier guide's per-tool choices (see [`SettingsBody::apps`]).
     #[serde(default)]
     apps: Option<BTreeMap<String, String>>,
 }
@@ -1649,7 +1683,7 @@ pub async fn setup_github_link(
     guide_reply(r)
 }
 
-/// POST /api/setup/hybrid/settings `{setup_token, github_mode?, integrations?, sharing?, jira_link?, apps?}`
+/// POST /api/setup/hybrid/settings `{setup_token, github_mode?, sharing?, jira_link?, apps_mode?}` (and, for one release, the older `integrations?` and `apps?`)
 pub async fn setup_settings(
     State(state): State<Arc<AppState>>,
     body: Bytes,
@@ -1662,6 +1696,7 @@ pub async fn setup_settings(
             integrations: b.integrations.clone(),
             sharing: b.sharing.clone(),
             jira_link: b.jira_link,
+            apps_mode: b.apps_mode.clone(),
             apps: b.apps.clone(),
         };
         do_settings(&state, &s).await?;
@@ -2278,77 +2313,134 @@ mod tests {
     }
 
     #[test]
-    fn every_other_app_uses_coderhelms_unless_someone_chose_their_own() {
-        // A new install: nobody chose, so every tool is CoderHelm's app.
+    fn every_hosted_app_is_on_with_coderhelms_apps_and_none_when_private() {
+        // A new install: nothing chosen, so CoderHelm's apps, for every tool.
         let mut l = Local::default();
-        assert!(migrate_apps(&mut l, None) && l.apps.is_empty());
+        assert!(migrate_apps(&mut l));
+        assert_eq!(apps_mode(&l), "coderhelm");
         assert_eq!(
             wanted_integrations(&l, no_own_apps),
-            vec!["jira", "notion", "confluence", "google_drive", "figma"]
+            integrations::app_choice_ids().collect::<Vec<_>>()
         );
-        // An explicit "my own app" is kept; the rest stay on the default.
-        l.apps.insert("notion".into(), "own".into());
-        assert!(!uses_coderhelm(&l, "notion", no_own_apps));
-        assert!(uses_coderhelm(&l, "confluence", no_own_apps));
-        // A tool nobody chose, with the install's own app set up, keeps it.
-        let own_drive = |id: &str| id == "google_drive" || id == "figma";
-        // An install with its own Figma app in its secret keeps it too.
-        assert!(!uses_coderhelm(&l, "figma", own_drive));
-        assert!(!uses_coderhelm(&l, "google_drive", own_drive));
-        // Chosen CoderHelm's app explicitly: wins over an own app set up.
-        l.apps.insert("google_drive".into(), "coderhelm".into());
-        assert!(uses_coderhelm(&l, "google_drive", own_drive));
+        // A tool with the install's own app set up uses it either way.
+        let own_figma = |id: &str| id == "figma";
+        assert!(!uses_coderhelm(&l, "figma", own_figma));
+        assert!(uses_coderhelm(&l, "notion", own_figma));
         l.github_mode = "hosted".into();
         assert_eq!(
-            wanted_integrations(&l, no_own_apps),
-            vec!["github", "jira", "confluence", "google_drive", "figma"]
+            wanted_integrations(&l, own_figma),
+            vec!["github", "jira", "notion", "confluence", "google_drive"]
         );
-        // Unrecorded: the serde default of a record from before is unset.
-        let old: Local = serde_json::from_str(r#"{"integrations":["github"]}"#).unwrap();
-        assert!(old.apps.is_empty() && old.apps_v == 0);
+        // Fully private: no app through CoderHelm; GitHub keeps its own choice.
+        l.apps_mode = "private".into();
+        assert_eq!(wanted_integrations(&l, no_own_apps), vec!["github"]);
+        l.github_mode = "own".into();
+        assert!(wanted_integrations(&l, no_own_apps).is_empty());
     }
 
     #[test]
-    fn a_record_from_before_keeps_its_explicit_own_choices() {
-        // Never chose anything in Other apps (only GitHub's app): defaults.
-        let mut l = Local {
-            github_mode: "hosted".into(),
-            integrations: vec!["github".into()],
+    fn a_new_hosted_entry_is_on_with_no_choice_to_make() {
+        // Whatever the catalog holds, every hosted entry but GitHub is wanted
+        // by an install on CoderHelm's apps: nothing names the tools one by one.
+        let l = Local {
+            apps_mode: "coderhelm".into(),
+            apps_v: 2,
             ..Default::default()
         };
-        assert!(migrate_apps(&mut l, None));
-        assert!(l.apps.is_empty());
-        assert_eq!(
-            wanted_integrations(&l, no_own_apps),
-            vec![
-                "github",
-                "jira",
-                "notion",
-                "confluence",
-                "google_drive",
-                "figma"
-            ]
-        );
-        assert!(!migrate_apps(&mut l, None), "only once");
-        // Chose Notion only, while Google Drive wasn't offered: Jira and
-        // Confluence were left on their own app on purpose, Drive wasn't.
+        let hosted: Vec<&str> = integrations::CATALOG
+            .iter()
+            .filter(|e| e.mode == integrations::Mode::Hosted && e.id != "github")
+            .map(|e| e.id)
+            .collect();
+        assert_eq!(wanted_integrations(&l, no_own_apps), hosted);
+        // A record migrated by an earlier release, before an entry was added
+        // (Figma here), gets the entry too: per-tool picks are no longer read.
         let mut l = Local {
+            apps: [("jira", "coderhelm"), ("notion", "own")]
+                .map(|(a, b)| (a.to_string(), b.to_string()))
+                .into(),
+            apps_v: 1,
+            ..Default::default()
+        };
+        assert!(migrate_apps(&mut l));
+        assert!(wanted_integrations(&l, no_own_apps).contains(&"figma".to_string()));
+        assert!(wanted_integrations(&l, no_own_apps).contains(&"notion".to_string()));
+    }
+
+    #[test]
+    fn earlier_per_tool_choices_migrate_once() {
+        let picks = |p: &[(&str, &str)]| -> BTreeMap<String, String> {
+            p.iter()
+                .map(|(a, b)| (a.to_string(), b.to_string()))
+                .collect()
+        };
+        // Any tool on CoderHelm's app: CoderHelm's apps.
+        let mut l = Local {
+            apps: picks(&[
+                ("jira", "own"),
+                ("notion", "coderhelm"),
+                ("confluence", "own"),
+            ]),
+            apps_v: 1,
+            ..Default::default()
+        };
+        assert!(migrate_apps(&mut l));
+        assert_eq!(l.apps_mode, "coderhelm");
+        assert!(!migrate_apps(&mut l), "only once");
+        // Every tool chosen as their own: private.
+        let mut l = Local {
+            apps: picks(&[
+                ("jira", "own"),
+                ("notion", "own"),
+                ("confluence", "own"),
+                ("google_drive", "own"),
+            ]),
+            apps_v: 1,
+            ..Default::default()
+        };
+        assert!(migrate_apps(&mut l));
+        assert_eq!(l.apps_mode, "private");
+        assert!(wanted_integrations(&l, no_own_apps).is_empty());
+        // Some own, the rest never chosen but held by CoderHelm (the old
+        // default): those were on CoderHelm's app, so CoderHelm's apps.
+        let mut l = Local {
+            apps: picks(&[("notion", "own")]),
+            integrations: vec!["jira".into(), "confluence".into()],
+            apps_v: 1,
+            ..Default::default()
+        };
+        migrate_apps(&mut l);
+        assert_eq!(l.apps_mode, "coderhelm");
+        // Some own and nothing else on CoderHelm's app: private.
+        let mut l = Local {
+            apps: picks(&[("notion", "own"), ("confluence", "own")]),
+            integrations: vec!["github".into()],
+            apps_v: 1,
+            ..Default::default()
+        };
+        migrate_apps(&mut l);
+        assert_eq!(l.apps_mode, "private");
+        // A record from before per-tool choices (only the list): any tool on
+        // it means CoderHelm's apps; none means never chosen, the default.
+        for list in [vec!["github", "notion"], vec!["github"], vec![]] {
+            let mut l = Local {
+                integrations: list.iter().map(|s| s.to_string()).collect(),
+                ..Default::default()
+            };
+            assert!(migrate_apps(&mut l));
+            assert_eq!(l.apps_mode, "coderhelm", "{list:?}");
+        }
+        // A record from before has none of the new fields.
+        let old: Local = serde_json::from_str(r#"{"integrations":["github"]}"#).unwrap();
+        assert!(old.apps.is_empty() && old.apps_v == 0 && old.apps_mode.is_empty());
+        // A choice made already is never overwritten.
+        let mut l = Local {
+            apps_mode: "private".into(),
             integrations: vec!["notion".into()],
             ..Default::default()
         };
-        let offered: Vec<String> = ["github", "jira", "notion", "confluence"]
-            .map(String::from)
-            .to_vec();
-        assert!(migrate_apps(&mut l, Some(&offered)));
-        assert_eq!(l.apps.get("notion").map(String::as_str), Some("coderhelm"));
-        assert_eq!(l.apps.get("jira").map(String::as_str), Some("own"));
-        assert_eq!(l.apps.get("confluence").map(String::as_str), Some("own"));
-        assert!(!l.apps.contains_key("google_drive"));
-        assert_eq!(
-            wanted_integrations(&l, no_own_apps),
-            vec!["notion", "google_drive", "figma"]
-        );
-        assert!(offered_by(Some(&serde_json::json!({}))).is_none());
+        assert!(migrate_apps(&mut l));
+        assert_eq!(l.apps_mode, "private");
     }
 
     #[test]
@@ -2362,36 +2454,51 @@ mod tests {
         assert!(!apps_out_of_date(&l, &want, Some(&l.integrations.clone())));
         // CoderHelm holds something else: send again.
         assert!(apps_out_of_date(&l, &want, Some(&["jira".to_string()])));
-        l.apps.insert("jira".into(), "own".into());
+        l.apps_mode = "private".into();
         let want = wanted_integrations(&l, no_own_apps);
         assert!(apps_out_of_date(&l, &want, None));
     }
 
     #[test]
-    fn the_guide_and_settings_record_each_tool_they_name() {
+    fn the_guide_and_settings_take_one_choice_and_older_bodies_for_now() {
         let mut l = Local::default();
-        let b = SettingsBody {
+        let mode = |m: &str| SettingsBody {
+            apps_mode: Some(m.into()),
+            ..Default::default()
+        };
+        apply_settings(&mut l, &mode("private")).unwrap();
+        assert_eq!(apps_mode(&l), "private");
+        apply_settings(&mut l, &mode("coderhelm")).unwrap();
+        assert_eq!(apps_mode(&l), "coderhelm");
+        assert!(apply_settings(&mut l, &mode("own")).is_err());
+        // An older dashboard's per-tool body: any CoderHelm's app means
+        // CoderHelm's apps, only "own" means private.
+        let apps = |p: &[(&str, &str)]| SettingsBody {
             apps: Some(
-                [("notion", "own"), ("jira", "coderhelm")]
+                p.iter()
                     .map(|(a, b)| (a.to_string(), b.to_string()))
-                    .into(),
+                    .collect(),
             ),
             ..Default::default()
         };
-        apply_settings(&mut l, &b).unwrap();
-        assert_eq!(
-            wanted_integrations(&l, no_own_apps),
-            vec!["jira", "confluence", "google_drive", "figma"]
-        );
-        let bad = |id: &str, v: &str| SettingsBody {
-            apps: Some([(id.to_string(), v.to_string())].into()),
-            ..Default::default()
+        apply_settings(&mut l, &apps(&[("notion", "own")])).unwrap();
+        assert_eq!(apps_mode(&l), "private");
+        apply_settings(&mut l, &apps(&[("notion", "own"), ("jira", "coderhelm")])).unwrap();
+        assert_eq!(apps_mode(&l), "coderhelm");
+        // Both sent (the guide, for older installs): the new field decides.
+        let both = SettingsBody {
+            apps_mode: Some("private".into()),
+            ..apps(&[("jira", "coderhelm")])
         };
-        assert!(apply_settings(&mut l, &bad("github", "own")).is_err());
-        assert!(apply_settings(&mut l, &bad("slack_commands", "coderhelm")).is_err());
-        assert!(apply_settings(&mut l, &bad("notion", "both")).is_err());
-        // The guide's body takes the same field.
-        let g = guide_body(br#"{"setup_token":"t","apps":{"confluence":"own"}}"#);
+        apply_settings(&mut l, &both).unwrap();
+        assert_eq!(apps_mode(&l), "private");
+        assert!(apply_settings(&mut l, &apps(&[("github", "own")])).is_err());
+        assert!(apply_settings(&mut l, &apps(&[("slack_commands", "coderhelm")])).is_err());
+        assert!(apply_settings(&mut l, &apps(&[("notion", "both")])).is_err());
+        // The guide's body takes the same fields.
+        let g =
+            guide_body(br#"{"setup_token":"t","apps_mode":"private","apps":{"confluence":"own"}}"#);
+        assert_eq!(g.apps_mode.as_deref(), Some("private"));
         assert_eq!(
             g.apps.unwrap().get("confluence").map(String::as_str),
             Some("own")
@@ -2678,23 +2785,23 @@ mod tests {
                 payloads: true,
             }),
             jira_link: None,
+            apps_mode: None,
             apps: None,
         };
         apply_settings(&mut l, &b).unwrap();
-        // The whole list from an older dashboard: Notion switched on.
-        assert_eq!(l.apps.get("notion").map(String::as_str), Some("coderhelm"));
+        // The whole list from an older dashboard: a tool on it, CoderHelm's apps.
+        assert_eq!(apps_mode(&l), "coderhelm");
         assert_eq!(wanted_integrations(&l, no_own_apps)[0], "github");
         assert!(!l.share_payloads, "payloads only with sharing on");
-        // Switched off in that list: an explicit own choice.
-        l.integrations = vec!["github".into(), "notion".into()];
+        // None of the tools on that list: private.
         let b = SettingsBody {
             github_mode: Some("own".into()),
             integrations: Some(vec![]),
             ..Default::default()
         };
         apply_settings(&mut l, &b).unwrap();
-        assert_eq!(l.apps.get("notion").map(String::as_str), Some("own"));
-        assert!(!wanted_integrations(&l, no_own_apps).contains(&"github".to_string()));
+        assert_eq!(apps_mode(&l), "private");
+        assert!(wanted_integrations(&l, no_own_apps).is_empty());
         let bad = SettingsBody {
             integrations: Some(vec!["slack_commands".into()]),
             ..Default::default()

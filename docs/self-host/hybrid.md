@@ -11,11 +11,11 @@ A **hybrid** install runs entirely in your AWS account, like any self-hosted Cod
 | **A CoderHelm address**, `yourname.coderhelm.com` | buying a domain and adding DNS records | a real address with HTTPS in a few minutes, set up end to end |
 | **CoderHelm's GitHub App**, through the event relay | creating and keeping your own GitHub App | install one app on your organization; events and tokens arrive at your install |
 | **CoderHelm's Jira app**, through the event relay | setting up your own Jira app | link your Jira site once; its events arrive at your install, without the app's secret |
-| **CoderHelm's integration apps** (Notion, Confluence, Google Drive) | registering an app with each provider | sign in with one click, as on coderhelm.com |
+| **CoderHelm's integration apps** (Notion, Confluence, Google Drive, Figma, and any CoderHelm adds later) | registering an app with each provider | sign in with one click, as on coderhelm.com |
 
 Each part is a separate choice, at install time (the [install guide](/self-host/install/)) or later in **Settings, System, Hybrid**. **Fully private** (your own domain or the AWS address, your own GitHub App and apps) sends nothing to CoderHelm and needs no registration.
 
-On a hybrid install, every tool under **Other apps** (Jira, Notion, Confluence, Google Drive) uses CoderHelm's app unless you choose **Use my own app (fully private)** for it ([Other apps](#other-apps)). That only decides which app a sign-in goes through: nothing reaches your install or CoderHelm until someone connects the tool.
+On a hybrid install, **Other apps** is one choice for the whole install: **Use Coderhelm's apps (easiest)**, the default, or **Fully private** ([Other apps](#other-apps)). That only decides which app a sign-in goes through: nothing reaches your install or CoderHelm until someone connects a tool.
 
 ## Trust model
 
@@ -148,12 +148,20 @@ The Setup checks show the link as `hybrid_jira` (in Settings, Setup and the inst
 
 ## Other apps
 
-**Settings, System, Hybrid, Other apps** lists each tool with **Use Coderhelm's app (easiest)** or **Use my own app (fully private)**, and one line on what passes through CoderHelm for it. The install guide offers the same choices under **What CoderHelm sets up for you**, all on, and applies them when the install registers.
+**Settings, System, Hybrid, Other apps** is one choice for the whole install. The install guide offers the same choice under **What CoderHelm sets up for you** and applies it when the install registers.
 
-- **CoderHelm's app is the default** for each tool nobody chose, on a new install and on an install that registered before these choices existed. A tool for which your install already has its own app set up (its own Notion, Atlassian or Google client in its secret) keeps using that until you pick CoderHelm's.
-- **A choice is kept.** Picking **Use my own app** for a tool, in Settings or the guide, stays until you change it. An install whose admin had already turned some tools on under Other apps keeps the others on its own app.
-- **Nothing starts by itself.** With CoderHelm's app chosen, **Connect** on that tool signs in through CoderHelm's app; until someone connects, no sign-in exists, no event is relayed and nothing is synced. Jira events come through only once CoderHelm's Jira app is installed on your site with your install id, or a site is linked.
-- **A tool CoderHelm can't offer yet** (its app for that provider isn't set up on the hosted side) shows **Coderhelm's app isn't set up yet** and uses your own app until it is.
+- **Use Coderhelm's apps (easiest)** is the default. Every tool CoderHelm has an app for uses it: today Jira, Notion, Confluence, Google Drive and Figma. A tool CoderHelm adds in a later release is on as soon as your install runs that release, with nothing more to choose.
+- **Fully private** means no tool signs in or sends events through CoderHelm. Each tool uses your team's own app, which you set up on that tool's card in **Settings, Integrations**.
+
+GitHub is not part of this choice: it keeps its own, under **GitHub** on the same page.
+
+A few things hold either way:
+
+- **Your own app wins.** A tool for which your install has its own app set up (its own Notion, Atlassian, Google or Figma client in its secret) always uses that app, whichever option you chose.
+- **Nothing starts by itself.** With CoderHelm's apps, **Connect** on a tool signs in through CoderHelm's app; until someone connects, no sign-in exists, no event is relayed and nothing is synced. Jira events come through only once CoderHelm's Jira app is installed on your site with your install id, or a site is linked.
+- **A tool CoderHelm can't offer yet** (its app for that provider isn't set up on the hosted side) is shown as not ready and uses your own app until it is.
+
+An install that chose per tool in an earlier release moves to this choice once, on its first start after the update: if any tool was on CoderHelm's app, it gets **Use Coderhelm's apps**; if every tool chosen was on its own app, it gets **Fully private**. For one release, the settings API still takes the older `apps` (per tool) and `integrations` fields: any tool on CoderHelm's app means CoderHelm's apps, and only own apps means fully private. New callers send `apps_mode`, `coderhelm` or `private`.
 
 ## Integrations
 

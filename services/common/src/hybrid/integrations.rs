@@ -135,9 +135,10 @@ pub fn hosted_ids() -> impl Iterator<Item = &'static str> {
         .map(|e| e.id)
 }
 
-/// The tools an install picks an app for, one by one (Settings, System,
-/// Hybrid, Other apps, and the install guide): every hosted one but GitHub,
-/// which has its own choice.
+/// The tools the install-wide Other apps choice covers (Settings, System,
+/// Hybrid, and the install guide): every hosted one but GitHub, which has its
+/// own choice. An entry added here is on for every install that chose
+/// CoderHelm's apps, with nothing more to choose.
 pub fn app_choice_ids() -> impl Iterator<Item = &'static str> {
     hosted_ids().filter(|id| *id != "github")
 }
