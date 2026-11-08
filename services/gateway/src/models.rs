@@ -156,6 +156,14 @@ pub struct Secrets {
     pub google_drive_client_id: Option<String>,
     #[serde(default)]
     pub google_drive_client_secret: Option<String>,
+    /// Figma: CoderHelm's public Figma OAuth app on the hosted side (or an
+    /// install's own app for every team on it). Its package then reads
+    /// Figma's API with a sign-in instead of a key; hybrid installs sign in
+    /// through the hosted broker with it.
+    #[serde(default)]
+    pub figma_client_id: Option<String>,
+    #[serde(default)]
+    pub figma_client_secret: Option<String>,
     /// Hosted side of hybrid only: the key every install's registration
     /// secret and relay key are derived from (common::hybrid::sign). Absent
     /// on self-hosted installs, which then never serve `/hybrid/*`.
@@ -172,8 +180,9 @@ pub struct Secrets {
 }
 
 impl Secrets {
-    /// A knowledge source sign-in key by its name in the secret
-    /// (`oauth::Provider::id_key` / `secret_key`). Only those keys answer.
+    /// An OAuth app key by its name in the secret: a knowledge source's
+    /// (`oauth::Provider::id_key` / `secret_key`) or a catalog server's
+    /// (`mcp_catalog::OwnApp::coderhelm_keys`). Only those keys answer.
     pub fn oauth_key(&self, key: &str) -> Option<String> {
         match key {
             "notion_client_id" => self.notion_client_id.clone(),
@@ -182,6 +191,8 @@ impl Secrets {
             "atlassian_client_secret" => self.atlassian_client_secret.clone(),
             "google_drive_client_id" => self.google_drive_client_id.clone(),
             "google_drive_client_secret" => self.google_drive_client_secret.clone(),
+            "figma_client_id" => self.figma_client_id.clone(),
+            "figma_client_secret" => self.figma_client_secret.clone(),
             _ => None,
         }
     }

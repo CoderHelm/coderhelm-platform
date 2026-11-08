@@ -13,6 +13,15 @@
 //! never listed or used as an MCP server ([`super::store::is_token_only`]).
 //! The token goes only to the vendor's API, through the vendor's package,
 //! exactly where a key for it would go.
+//!
+//! The same record also holds a sign-in with CoderHelm's own public app with
+//! the vendor ([`use_coderhelm_app`]): on the hosted service (and on an
+//! install with that app in its own secret) the app's client id and secret
+//! come from the deployment's secret ([`crate::mcp_catalog::OwnApp::coderhelm_keys`]);
+//! on a hybrid install that chose CoderHelm's app, the hosted broker is the
+//! authorization server ([`brokered_record`]), exactly as for Notion,
+//! Confluence and Google Drive. One record per server: the team uses
+//! CoderHelm's app or its own, never both.
 
 use super::http::HttpRequest;
 use super::oauth::ClientAuth;
@@ -74,6 +83,157 @@ pub fn record(
     s
 }
 
+/// The record for a sign-in through CoderHelm's broker (a hybrid install
+/// that chose CoderHelm's app): the hosted side is the authorization server,
+/// the install id the client id and its registration secret the client
+/// secret. The vendor's app, scopes and refresh token stay on the hosted
+/// side; the install gets short-lived access tokens and renews them with a
+/// grant handle at the hosted token endpoint.
+pub fn brokered_record(
+    catalog_id: &str,
+    name: &str,
+    hosted: &str,
+    install_id: &str,
+    sealed_secret: &str,
+) -> ServerRecord {
+    let hosted = hosted.trim_end_matches('/');
+    let mut s = ServerRecord::new(&connection_id(catalog_id), name, hosted);
+    s.catalog_id = tag(catalog_id);
+    s.auth = AuthKind::OAuth;
+    s.sharing = Sharing::Shared;
+    s.oauth = Some(OAuthSettings {
+        issuer: hosted.into(),
+        authorization_endpoint: format!("{hosted}/hybrid/oauth/{catalog_id}/authorize"),
+        token_endpoint: format!("{hosted}{BROKER_TOKEN_PATH}"),
+        revocation_endpoint: Some(format!("{hosted}/hybrid/oauth/revoke")),
+        token_auth_methods: vec![ClientAuth::ClientSecretPost.as_str().into()],
+        client_id: install_id.into(),
+        client_auth: ClientAuth::ClientSecretPost,
+        client_secret_sealed: sealed_secret.into(),
+        registration: super::oauth::Registration::Manual.as_str().into(),
+        ..Default::default()
+    });
+    s
+}
+
+/// The hosted broker's token endpoint path.
+const BROKER_TOKEN_PATH: &str = "/hybrid/oauth/token";
+
+/// Whose app a sign-in record uses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Source {
+    /// CoderHelm's public app (directly, or through the hosted broker).
+    Coderhelm,
+    /// The team's own app.
+    Own,
+}
+
+impl Source {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Source::Coderhelm => "coderhelm",
+            Source::Own => "own",
+        }
+    }
+}
+
+/// Whose app `s` signs in with: CoderHelm's when it goes through the broker,
+/// or when its client id is CoderHelm's (`coderhelm_client_id`, from the
+/// deployment's secret; empty where there is none).
+pub fn source(s: &ServerRecord, coderhelm_client_id: &str) -> Source {
+    let Some(o) = s.oauth.as_ref() else {
+        return Source::Own;
+    };
+    let id = coderhelm_client_id.trim();
+    if o.token_endpoint.ends_with(BROKER_TOKEN_PATH) || (!id.is_empty() && o.client_id == id) {
+        Source::Coderhelm
+    } else {
+        Source::Own
+    }
+}
+
+/// Puts `rec` in place of the team's sign-in record for its server: the same
+/// app (same client id at the same token endpoint) keeps its sign-in, any
+/// other app ends the old one first (its tokens belong to that app).
+async fn replace(
+    rt: &Runtime,
+    mut rec: ServerRecord,
+    by: &str,
+    at: &str,
+) -> Result<ServerRecord, SaveError> {
+    let old = rt
+        .store
+        .get_server(&rt.team, &rec.id)
+        .await
+        .map_err(SaveError::Internal)?;
+    rec.added_by = by.to_ascii_lowercase();
+    rec.added_at = at.to_string();
+    rec.status = Status::NotConnected;
+    if let Some(old) = &old {
+        let key = |s: &ServerRecord| {
+            s.oauth
+                .as_ref()
+                .map(|o| (o.client_id.clone(), o.token_endpoint.clone()))
+        };
+        if key(old).is_some() && key(old) == key(&rec) {
+            rec.status = old.status;
+            rec.status_reason = old.status_reason.clone();
+        } else if let Err(e) = rt.disconnect(old, &Owner::Team).await {
+            return Err(SaveError::Internal(e));
+        }
+        rec.added_by = old.added_by.clone();
+        rec.added_at = old.added_at.clone();
+        rec.custom_prompt = old.custom_prompt.clone();
+    }
+    rt.store
+        .put_server(&rt.team, &rec)
+        .await
+        .map_err(SaveError::Internal)?;
+    Ok(rec)
+}
+
+/// Makes CoderHelm's app the team's sign-in for `catalog_id`: directly with
+/// the app from the deployment's secret, or through the hosted broker on a
+/// hybrid install that chose it. Replaces the team's own app, if one was
+/// saved. The caller then starts the sign-in on the returned record.
+pub async fn use_coderhelm_app(
+    rt: &Runtime,
+    catalog_id: &str,
+    via: crate::knowledge::sources::oauth::Via<'_>,
+    by: &str,
+    at: &str,
+) -> Result<ServerRecord, SaveError> {
+    use crate::knowledge::sources::oauth::Via;
+    let app = crate::mcp_catalog::own_app(catalog_id).ok_or(SaveError::NoOwnApp)?;
+    let def = crate::mcp_catalog::find(catalog_id).ok_or(SaveError::NoOwnApp)?;
+    let id = connection_id(catalog_id);
+    let rec = match via {
+        Via::App(a) if a.is_set() => {
+            let sealed = rt
+                .seal_client_secret(&id, a.client_secret.trim())
+                .await
+                .map_err(SaveError::Internal)?;
+            record(catalog_id, def.name, &app, a.client_id.trim(), &sealed)
+        }
+        Via::Broker {
+            hosted,
+            install_id,
+            secret,
+        } if !hosted.trim().is_empty()
+            && !install_id.trim().is_empty()
+            && !secret.trim().is_empty() =>
+        {
+            let sealed = rt
+                .seal_client_secret(&id, secret.trim())
+                .await
+                .map_err(SaveError::Internal)?;
+            brokered_record(catalog_id, def.name, hosted, install_id.trim(), &sealed)
+        }
+        _ => return Err(SaveError::NotSetUp),
+    };
+    replace(rt, rec, by, at).await
+}
+
 fn origin(u: &str) -> String {
     url::Url::parse(u)
         .map(|p| p.origin().ascii_serialization())
@@ -87,6 +247,8 @@ pub enum SaveError {
     NoOwnApp,
     /// Something the person pasted isn't usable; the message says what.
     Invalid(&'static str),
+    /// CoderHelm's app for this server isn't set up on this deployment.
+    NotSetUp,
     Internal(String),
 }
 
@@ -128,27 +290,13 @@ pub async fn save(
             .await
             .map_err(SaveError::Internal)?,
     };
-    let mut rec = record(catalog_id, def.name, &app, client_id, &sealed);
-    rec.added_by = by.to_ascii_lowercase();
-    rec.added_at = at.to_string();
-    rec.status = Status::NotConnected;
-    if let Some(old) = &old {
-        let same_app = old_oauth.as_ref().is_some_and(|o| o.client_id == client_id);
-        if same_app {
-            rec.status = old.status;
-            rec.status_reason = old.status_reason.clone();
-        } else if let Err(e) = rt.disconnect(old, &Owner::Team).await {
-            return Err(SaveError::Internal(e));
-        }
-        rec.added_by = old.added_by.clone();
-        rec.added_at = old.added_at.clone();
-        rec.custom_prompt = old.custom_prompt.clone();
-    }
-    rt.store
-        .put_server(&rt.team, &rec)
-        .await
-        .map_err(SaveError::Internal)?;
-    Ok(rec)
+    replace(
+        rt,
+        record(catalog_id, def.name, &app, client_id, &sealed),
+        by,
+        at,
+    )
+    .await
 }
 
 /// The team's own-app record for `catalog_id`, when one is saved.
@@ -511,5 +659,273 @@ mod tests {
         let e = check(&rt, &s).await.unwrap_err();
         assert!(e.contains("published for your team"), "{e}");
         assert!(!connected(&rt, "figma").await);
+    }
+
+    fn coderhelm_app() -> crate::knowledge::sources::oauth::App {
+        crate::knowledge::sources::oauth::App {
+            client_id: "ch-client".into(),
+            client_secret: "ch-secret".into(),
+        }
+    }
+
+    /// The hosted service (or an install with CoderHelm's app in its secret)
+    /// signs in with CoderHelm's public Figma app at Figma itself, and the
+    /// package gets the token exactly as with the team's own app.
+    #[tokio::test]
+    async fn coderhelm_app_signs_in_at_figma_with_its_own_client() {
+        use crate::knowledge::sources::oauth::Via;
+        let http = Arc::new(Fake::default());
+        let rt = rt_with(http.clone(), 1_000_000);
+        let app = coderhelm_app();
+        let mut s = use_coderhelm_app(&rt, "figma", Via::App(&app), "Ada@Example.com", "t0")
+            .await
+            .unwrap();
+        assert_eq!(s.id, "app-figma");
+        assert_eq!(source(&s, "ch-client"), Source::Coderhelm);
+        assert_eq!(source(&s, ""), Source::Own);
+        let url = rt
+            .start_sign_in(
+                &mut s,
+                &Owner::Team,
+                "sub-1",
+                "ada@example.com",
+                REDIRECT,
+                None,
+            )
+            .await
+            .unwrap();
+        let q = query(&url);
+        assert!(url.starts_with("https://www.figma.com/oauth?"));
+        assert_eq!(q["client_id"], "ch-client");
+        assert_eq!(q["redirect_uri"], REDIRECT);
+        assert_eq!(q["scope"], "current_user:read file_content:read");
+        http.on(
+            Method::Post,
+            "https://api.figma.com/v1/oauth/token",
+            fjson(
+                200,
+                json!({"access_token": "at-1", "expires_in": 7_776_000, "refresh_token": "rt-1"}),
+            ),
+        );
+        rt.finish_sign_in(
+            &q["state"],
+            Some("code-1"),
+            None,
+            None,
+            "sub-1",
+            "ada@example.com",
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            token_env(&rt, "figma").await.unwrap(),
+            Some(("FIGMA_OAUTH_TOKEN", "at-1".to_string()))
+        );
+        // A state from another sign-in, or used twice, finishes nothing.
+        assert!(rt
+            .finish_sign_in(
+                &q["state"],
+                Some("code-1"),
+                None,
+                None,
+                "sub-1",
+                "ada@example.com"
+            )
+            .await
+            .is_err());
+        assert!(rt
+            .finish_sign_in(
+                "forged",
+                Some("code-2"),
+                None,
+                None,
+                "sub-1",
+                "ada@example.com"
+            )
+            .await
+            .is_err());
+    }
+
+    /// Without CoderHelm's app in the secret and without the broker, there
+    /// is nothing to sign in with: no authorize address is ever built.
+    #[tokio::test]
+    async fn coderhelm_app_needs_a_client_or_the_broker() {
+        use crate::knowledge::sources::oauth::{App, Via};
+        let rt = rt_with(Arc::new(Fake::default()), 1);
+        let none = App::default();
+        assert_eq!(
+            use_coderhelm_app(&rt, "figma", Via::App(&none), "a@example.com", "t0")
+                .await
+                .unwrap_err(),
+            SaveError::NotSetUp
+        );
+        let blank = Via::Broker {
+            hosted: "https://api.coderhelm.com",
+            install_id: "",
+            secret: "s",
+        };
+        assert_eq!(
+            use_coderhelm_app(&rt, "figma", blank, "a@example.com", "t0")
+                .await
+                .unwrap_err(),
+            SaveError::NotSetUp
+        );
+        assert_eq!(
+            use_coderhelm_app(
+                &rt,
+                "sentry",
+                Via::App(&coderhelm_app()),
+                "a@example.com",
+                "t0"
+            )
+            .await
+            .unwrap_err(),
+            SaveError::NoOwnApp
+        );
+        assert!(rt
+            .store
+            .get_server(&rt.team, "app-figma")
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    /// A hybrid install that chose CoderHelm's app signs in through the
+    /// hosted broker: the broker is the authorization server, the install
+    /// id and its registration secret are the client, the redirect is the
+    /// install's own callback page, and the token is renewed at the broker
+    /// with the grant handle (never at Figma: the install has no Figma
+    /// refresh token or secret).
+    #[tokio::test]
+    async fn a_hybrid_install_signs_in_through_the_broker_and_renews_there() {
+        use crate::knowledge::sources::oauth::Via;
+        let http = Arc::new(Fake::default());
+        let rt = rt_with(http.clone(), 3_000_000);
+        let via = Via::Broker {
+            hosted: "https://api.coderhelm.com/",
+            install_id: "in_abc",
+            secret: "reg-secret",
+        };
+        let mut s = use_coderhelm_app(&rt, "figma", via, "a@example.com", "t0")
+            .await
+            .unwrap();
+        assert_eq!(source(&s, ""), Source::Coderhelm);
+        let o = s.oauth.clone().unwrap();
+        assert_eq!(
+            o.authorization_endpoint,
+            "https://api.coderhelm.com/hybrid/oauth/figma/authorize"
+        );
+        assert_eq!(
+            o.token_endpoint,
+            "https://api.coderhelm.com/hybrid/oauth/token"
+        );
+        assert_eq!(o.refresh_endpoint, "");
+        assert!(o.scopes.is_empty());
+        let url = rt
+            .start_sign_in(
+                &mut s,
+                &Owner::Team,
+                "sub-1",
+                "a@example.com",
+                REDIRECT,
+                None,
+            )
+            .await
+            .unwrap();
+        let q = query(&url);
+        assert!(url.starts_with("https://api.coderhelm.com/hybrid/oauth/figma/authorize?"));
+        assert_eq!(q["client_id"], "in_abc");
+        assert_eq!(q["redirect_uri"], REDIRECT);
+        assert_eq!(q["code_challenge_method"], "S256");
+        assert!(!q.contains_key("client_secret"));
+        http.on(
+            Method::Post,
+            "https://api.coderhelm.com/hybrid/oauth/token",
+            fjson(200, json!({"access_token": "fig-at-1", "token_type": "Bearer", "expires_in": 600, "refresh_token": "hr_handle"})),
+        );
+        rt.finish_sign_in(
+            &q["state"],
+            Some("hc_code"),
+            None,
+            None,
+            "sub-1",
+            "a@example.com",
+        )
+        .await
+        .unwrap();
+        let sent = http.sent_to("https://api.coderhelm.com/hybrid/oauth/token");
+        let body = sent[0].body_text();
+        assert!(body.contains("client_id=in_abc") && body.contains("client_secret=reg-secret"));
+        assert!(body.contains("code_verifier=") && body.contains("code=hc_code"));
+        assert_eq!(
+            token_env(&rt, "figma").await.unwrap(),
+            Some(("FIGMA_OAUTH_TOKEN", "fig-at-1".to_string()))
+        );
+        // Renewed at the broker with the handle.
+        http.on(
+            Method::Post,
+            "https://api.coderhelm.com/hybrid/oauth/token",
+            fjson(200, json!({"access_token": "fig-at-2", "expires_in": 600, "refresh_token": "hr_handle"})),
+        );
+        let s = load(&rt, "figma").await.unwrap().unwrap();
+        rt.auth_header(&s, &Owner::Team, true).await.unwrap();
+        let sent = http.sent_to("https://api.coderhelm.com/hybrid/oauth/token");
+        assert!(sent[1].body_text().contains("grant_type=refresh_token"));
+        assert!(sent[1].body_text().contains("refresh_token=hr_handle"));
+        assert!(http
+            .sent_to("https://api.figma.com/v1/oauth/refresh")
+            .is_empty());
+    }
+
+    /// Switching between the team's own app and CoderHelm's ends the old
+    /// sign-in; signing in again with the same app keeps it.
+    #[tokio::test]
+    async fn switching_apps_ends_the_old_sign_in() {
+        use crate::knowledge::sources::oauth::Via;
+        let rt = rt_with(Arc::new(Fake::default()), 1);
+        save(&rt, "figma", "own-1", "own-secret", "a@example.com", "t0")
+            .await
+            .unwrap();
+        sign_in(
+            &rt,
+            "app-figma",
+            &Owner::Team,
+            "at",
+            Some("rt"),
+            None,
+            "a@example.com",
+        )
+        .await;
+        rt.store
+            .set_status(&rt.team, "app-figma", Status::Connected, "")
+            .await
+            .unwrap();
+        assert!(connected(&rt, "figma").await);
+        let app = coderhelm_app();
+        let s = use_coderhelm_app(&rt, "figma", Via::App(&app), "b@example.com", "t1")
+            .await
+            .unwrap();
+        assert!(!connected(&rt, "figma").await);
+        assert_eq!(s.added_by, "a@example.com");
+        sign_in(
+            &rt,
+            "app-figma",
+            &Owner::Team,
+            "at2",
+            Some("rt2"),
+            None,
+            "b@example.com",
+        )
+        .await;
+        rt.store
+            .set_status(&rt.team, "app-figma", Status::Connected, "")
+            .await
+            .unwrap();
+        // Same app again (a reconnect): the sign-in stays until the new one lands.
+        let s = use_coderhelm_app(&rt, "figma", Via::App(&app), "b@example.com", "t2")
+            .await
+            .unwrap();
+        assert_eq!(s.status, Status::Connected);
+        assert!(connected(&rt, "figma").await);
     }
 }

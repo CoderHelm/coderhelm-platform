@@ -81,6 +81,14 @@ pub const CATALOG: &[Entry] = &[
         reason: "",
     },
     Entry {
+        id: "figma",
+        name: "Figma",
+        mode: Mode::Hosted,
+        through_coderhelm: "You sign in through CoderHelm's Figma app (read-only: your profile and file contents). CoderHelm keeps the sign-in (encrypted) and hands your install access tokens that expire within ten minutes.",
+        stays_with_you: "The designs your install reads. Agents call Figma's API from your install with those tokens.",
+        reason: "",
+    },
+    Entry {
         id: "slack_notifications",
         name: "Slack and Teams notifications",
         mode: Mode::Direct,
@@ -90,9 +98,9 @@ pub const CATALOG: &[Entry] = &[
     },
     Entry {
         id: "mcp_apps",
-        name: "Figma, Linear, Sentry, Sanity and other sign-in apps",
+        name: "Linear, Sentry, Sanity and other sign-in apps",
         mode: Mode::Direct,
-        through_coderhelm: "Nothing: your install registers itself with each provider's sign-in server and keeps its own tokens. Figma signs in only apps it approved, so Figma uses your own Figma app or a key.",
+        through_coderhelm: "Nothing: your install registers itself with each provider's sign-in server and keeps its own tokens.",
         stays_with_you: "Everything.",
         reason: "",
     },
@@ -161,11 +169,18 @@ mod tests {
         let ids: Vec<_> = hosted_ids().collect();
         assert_eq!(
             ids,
-            vec!["github", "jira", "notion", "confluence", "google_drive"]
+            vec![
+                "github",
+                "jira",
+                "notion",
+                "confluence",
+                "google_drive",
+                "figma"
+            ]
         );
         assert_eq!(
             app_choice_ids().collect::<Vec<_>>(),
-            vec!["jira", "notion", "confluence", "google_drive"]
+            vec!["jira", "notion", "confluence", "google_drive", "figma"]
         );
         assert!(entry("github").is_some() && entry("nope").is_none());
         let j = serde_json::to_value(entry("slack_commands").unwrap()).unwrap();

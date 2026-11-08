@@ -711,6 +711,7 @@ fn strings(v: &Value) -> Option<Vec<String>> {
 fn own_app_set(state: &AppState, id: &str) -> bool {
     common::knowledge::sources::Kind::parse(id)
         .is_some_and(|k| super::knowledge_sources::app(state, k).is_set())
+        || super::mcp_servers::coderhelm_app(state, id).is_set()
 }
 
 /// Does `id` use CoderHelm's app: as chosen, or by default (CoderHelm's,
@@ -2234,9 +2235,23 @@ pub async fn brokered(
     creds_now().await
 }
 
+/// [`brokered`] for a catalog server signed in with an app (Figma), by its
+/// catalog id (the same id the hybrid settings list it under).
+pub async fn brokered_id(state: &AppState, id: &str) -> Option<Credentials> {
+    let l = local(state).await;
+    if !brokers_id(&l, id) {
+        return None;
+    }
+    creds_now().await
+}
+
 /// Whether the hybrid settings route `kind` through CoderHelm's app.
 fn brokers(l: &Local, kind: common::knowledge::sources::Kind) -> bool {
-    l.integrations.iter().any(|i| i == kind.key())
+    brokers_id(l, kind.key())
+}
+
+fn brokers_id(l: &Local, id: &str) -> bool {
+    l.integrations.iter().any(|i| i == id)
 }
 
 /// For the public GitHub checks: is GitHub going through CoderHelm's app?
@@ -2269,14 +2284,16 @@ mod tests {
         assert!(migrate_apps(&mut l, None) && l.apps.is_empty());
         assert_eq!(
             wanted_integrations(&l, no_own_apps),
-            vec!["jira", "notion", "confluence", "google_drive"]
+            vec!["jira", "notion", "confluence", "google_drive", "figma"]
         );
         // An explicit "my own app" is kept; the rest stay on the default.
         l.apps.insert("notion".into(), "own".into());
         assert!(!uses_coderhelm(&l, "notion", no_own_apps));
         assert!(uses_coderhelm(&l, "confluence", no_own_apps));
         // A tool nobody chose, with the install's own app set up, keeps it.
-        let own_drive = |id: &str| id == "google_drive";
+        let own_drive = |id: &str| id == "google_drive" || id == "figma";
+        // An install with its own Figma app in its secret keeps it too.
+        assert!(!uses_coderhelm(&l, "figma", own_drive));
         assert!(!uses_coderhelm(&l, "google_drive", own_drive));
         // Chosen CoderHelm's app explicitly: wins over an own app set up.
         l.apps.insert("google_drive".into(), "coderhelm".into());
@@ -2284,7 +2301,7 @@ mod tests {
         l.github_mode = "hosted".into();
         assert_eq!(
             wanted_integrations(&l, no_own_apps),
-            vec!["github", "jira", "confluence", "google_drive"]
+            vec!["github", "jira", "confluence", "google_drive", "figma"]
         );
         // Unrecorded: the serde default of a record from before is unset.
         let old: Local = serde_json::from_str(r#"{"integrations":["github"]}"#).unwrap();
@@ -2303,7 +2320,14 @@ mod tests {
         assert!(l.apps.is_empty());
         assert_eq!(
             wanted_integrations(&l, no_own_apps),
-            vec!["github", "jira", "notion", "confluence", "google_drive"]
+            vec![
+                "github",
+                "jira",
+                "notion",
+                "confluence",
+                "google_drive",
+                "figma"
+            ]
         );
         assert!(!migrate_apps(&mut l, None), "only once");
         // Chose Notion only, while Google Drive wasn't offered: Jira and
@@ -2322,7 +2346,7 @@ mod tests {
         assert!(!l.apps.contains_key("google_drive"));
         assert_eq!(
             wanted_integrations(&l, no_own_apps),
-            vec!["notion", "google_drive"]
+            vec!["notion", "google_drive", "figma"]
         );
         assert!(offered_by(Some(&serde_json::json!({}))).is_none());
     }
@@ -2357,7 +2381,7 @@ mod tests {
         apply_settings(&mut l, &b).unwrap();
         assert_eq!(
             wanted_integrations(&l, no_own_apps),
-            vec!["jira", "confluence", "google_drive"]
+            vec!["jira", "confluence", "google_drive", "figma"]
         );
         let bad = |id: &str, v: &str| SettingsBody {
             apps: Some([(id.to_string(), v.to_string())].into()),

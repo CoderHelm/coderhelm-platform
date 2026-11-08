@@ -589,15 +589,22 @@ pub struct OwnApp {
     pub console: &'static str,
     /// The vendor's guide to creating one.
     pub guide: &'static str,
+    /// The keys in the deployment's secret holding CoderHelm's own public
+    /// app with the vendor (client id, client secret): the one-click
+    /// sign-in every team gets, and what the hosted broker signs in a
+    /// self-hosted install with. Never in code.
+    #[serde(skip)]
+    pub coderhelm_keys: (&'static str, &'static str),
 }
 
 /// The own-app sign-in for a catalog server, when its package takes an
 /// OAuth token.
 pub fn own_app(id: &str) -> Option<OwnApp> {
     match id {
-        // Figma's REST API takes tokens from any OAuth app, and a private
-        // app needs no review from Figma for people on the team or
-        // organization that owns it. The token endpoint wants the client in
+        // Figma's REST API takes tokens from any OAuth app. A private app
+        // needs no review from Figma for people on the team or organization
+        // that owns it; CoderHelm's own public app (`coderhelm_keys`) was
+        // reviewed by Figma and signs in anyone. The token endpoint wants the client in
         // an HTTP Basic header; refreshing has its own address and never
         // rotates the refresh token. The package calls GET /v1/files,
         // /v1/files/:key/nodes, /v1/images and /v1/files/:key/images (all
@@ -612,6 +619,7 @@ pub fn own_app(id: &str) -> Option<OwnApp> {
             check: "https://api.figma.com/v1/me",
             console: "https://www.figma.com/developers/apps",
             guide: "https://developers.figma.com/docs/rest-api/oauth-apps/",
+            coderhelm_keys: ("figma_client_id", "figma_client_secret"),
         }),
         _ => None,
     }
@@ -687,6 +695,10 @@ mod tests {
                 assert!(u.starts_with("https://"), "{}: {u}", p.id);
             }
             assert!(app.refresh.is_empty() || app.refresh.starts_with("https://"));
+            // CoderHelm's app is read from two keys named after the vendor.
+            let (id, secret) = app.coderhelm_keys;
+            assert_eq!(id, format!("{}_client_id", p.id));
+            assert_eq!(secret, format!("{}_client_secret", p.id));
         }
         assert!(own_app("sentry").is_none());
     }
