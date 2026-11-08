@@ -395,6 +395,14 @@ class AccessItem(Base):
         self.assertEqual(st["native"]["access"]["state"], "pending")
         self.assertEqual(len(self.urls), 1)
 
+    def test_a_pending_change_is_read_again_within_a_minute(self):
+        from datetime import timedelta
+        u.handle({"action": "status"}, self.env, self.store, base.NOW, fetch=lambda repo: [])
+        u.handle({"action": "status"}, self.env, self.store, base.NOW + timedelta(seconds=20), fetch=lambda repo: [])
+        self.assertEqual(len(self.urls), 1)
+        u.handle({"action": "status"}, self.env, self.store, base.NOW + timedelta(seconds=40), fetch=lambda repo: [])
+        self.assertEqual(len(self.urls), 2, "an admin's finished access stack shows within a minute")
+
 
 class StuckBase(Base):
     def setUp(self):

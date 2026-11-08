@@ -2249,6 +2249,9 @@ HELD = ("Boundary", "DeployBoundary", "DeployRole")
 HELD_FILE = "held/coderhelm.json"
 ACCESS_FILE = "access.json"
 ACCESS_CACHE_SECONDS = 300
+# While a permission change waits for an AWS admin, it is read again this
+# often, so the card goes away within a minute of their access stack finishing.
+ACCESS_PENDING_SECONDS = 30
 
 
 def held_template(release, keep):
@@ -2816,10 +2819,11 @@ def access_compute(env, cfn=None, iam=None, opener=None):
 
 
 def access_view(store, env, now, force=False, **kw):
-    """access_compute, at most every ACCESS_CACHE_SECONDS (never fails the route)."""
+    """access_compute, at most every ACCESS_CACHE_SECONDS, or ACCESS_PENDING_SECONDS while a change waits (never fails the route)."""
     rec = store.get("ACCESS") or {}
+    ttl = ACCESS_PENDING_SECONDS if (rec.get("view") or {}).get("state") == "pending" else ACCESS_CACHE_SECONDS
     try:
-        fresh = rec.get("at") and (now - datetime.fromisoformat(rec["at"])).total_seconds() < ACCESS_CACHE_SECONDS
+        fresh = rec.get("at") and (now - datetime.fromisoformat(rec["at"])).total_seconds() < ttl
     except ValueError:
         fresh = False
     if fresh and not force:
