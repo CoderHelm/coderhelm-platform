@@ -102,18 +102,18 @@ New Relic, Confluence, OpenSearch, REST APIs, SQL databases, CloudWatch metrics 
   Nothing. Servers that support OAuth dynamic client registration register your install by themselves the first time someone signs in. The redirect URI is your install's `https://coderhelm.example.com/settings/integrations/mcp-callback/`, and the add flow shows it for servers that need an app registered by hand.
 - **Figma**\
   Figma's MCP server signs in only apps Figma approved, so CoderHelm runs Figma's tools against Figma's API with a sign-in (or a personal access token). Three ways, in Settings, Integrations, Figma:
-  - **Sign in with Figma** (CoderHelm's app): with hybrid, choose CoderHelm's app for Figma (Settings, Version and updates, Hybrid, or on the Figma card) and sign in. Nothing to create. CoderHelm keeps the sign-in (encrypted) and hands your install access tokens that expire within ten minutes; agents call Figma from your install.
+  - **Sign in with Figma** (CoderHelm's app): on a hybrid install that uses Coderhelm's apps (the default, in Settings, System, Hybrid, Other apps), sign in. Nothing to create. CoderHelm keeps the sign-in (encrypted) and hands your install access tokens that expire within ten minutes; agents call Figma from your install.
   - **Use my own Figma app**: create the app at https://www.figma.com/developers/apps under your Figma team or organization, add the redirect URI above, give it the `current_user:read` and `file_content:read` scopes, and publish it as a private app (no review from Figma; people in that team or organization can sign in). Paste its client id and secret there, then select Connect.
   - **For every team on the install**: put a Figma app's `figma_client_id` and `figma_client_secret` in the install's secret. The card's Sign in with Figma then uses it, with no hybrid.
 - **With hybrid**\
-  MCP sign-ins go to your install directly, except Figma when CoderHelm's app is chosen for it (above).
+  MCP sign-ins go to your install directly, except Figma when the install uses Coderhelm's apps and has no Figma app of its own (above).
 
 ## Knowledge sources
 
 - **What you need**\
   Sanity, GitHub and website sources work with nothing to set up. Notion and Confluence work with a token pasted in the add flow. One-click sign-in for Notion, Confluence and Google Drive, and instant updates from Notion, need OAuth apps of your own, registered with your install's redirect URI. See [Knowledge sources](./knowledge-sources.md).
 - **With hybrid**\
-  CoderHelm's Notion, Confluence and Google Drive apps can sign you in instead. This only works on your install's CloudFront address or its `<name>.coderhelm.com` address, not on a domain of your own yet. With CoderHelm's Notion app there are no instant updates: those sources sync every hour.
+  With Coderhelm's apps (the default under Settings, System, Hybrid, Other apps), CoderHelm's Notion, Confluence and Google Drive apps sign you in instead. This only works on your install's CloudFront address or its `<name>.coderhelm.com` address, not on a domain of your own yet. With CoderHelm's Notion app there are no instant updates: those sources sync every hour.
 
 ## Plugins
 
