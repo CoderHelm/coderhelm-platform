@@ -1066,6 +1066,10 @@ async fn main() -> Result<(), Error> {
             delete(routes::mcp_servers::disconnect),
         )
         .route(
+            "/mcp-servers/apps/:catalog_id",
+            put(routes::mcp_servers::save_own_app),
+        )
+        .route(
             "/mcp-servers/:id/client",
             put(routes::mcp_servers::set_client),
         )

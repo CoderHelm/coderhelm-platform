@@ -72,12 +72,47 @@ pub(crate) fn mcp_table(state: &AppState) -> &str {
     }
 }
 
-/// The catalog as the Integrations page shows it.
+/// The catalog as the Integrations page shows it. A server whose package
+/// also takes a token from the team's own OAuth app says where to create
+/// one and the scopes to give it (`own_app`).
 pub(crate) fn catalog_json() -> Vec<Value> {
     CATALOG
         .iter()
-        .filter_map(|p| serde_json::to_value(p).ok())
+        .filter_map(|p| {
+            let mut v = serde_json::to_value(p).ok()?;
+            if let Some(app) = common::mcp_catalog::own_app(p.id) {
+                v["own_app"] = serde_json::to_value(app).ok()?;
+            }
+            Some(v)
+        })
         .collect()
+}
+
+/// The environment a catalog package runs with for a team: the token from
+/// the team's own app when it signed in with one, else its saved key. Opened
+/// for this call only.
+pub(crate) async fn package_env(
+    state: &AppState,
+    team_id: &str,
+    def: &common::mcp_catalog::McpServerDef,
+) -> Result<serde_json::Map<String, Value>, String> {
+    let mut env = serde_json::Map::new();
+    let rt = super::mcp_servers::runtime(state, team_id);
+    match common::mcp_remote::own_app::token_env(&rt, def.id).await {
+        Ok(Some((var, token))) => {
+            env.insert(var.to_string(), json!(token));
+            return Ok(env);
+        }
+        Ok(None) => {}
+        Err(e) => return Err(format!("{}'s sign-in: {e}", def.name)),
+    }
+    let creds = load_credentials(state, team_id, def.id).await?;
+    for (cred_key, env_var) in def.env_mapping {
+        if let Some(val) = creds.get(*cred_key) {
+            env.insert(env_var.to_string(), json!(val));
+        }
+    }
+    Ok(env)
 }
 
 fn cipher(state: &AppState) -> Kms<'_> {

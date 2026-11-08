@@ -16,14 +16,18 @@
 //! - [`tools`]: the allow list and its second-admin approval.
 //! - [`store`]: the records, sealed where they hold secrets.
 //! - [`runtime`]: everything above put together for the gateway and worker.
+//! - [`own_app`]: a team's own OAuth app for a catalog package that reads
+//!   the vendor's API with a token (Figma), signed in to the same way.
 //!
 //! A token Coderhelm gets for a server is sent to that server only, and is
-//! never handed to a model or passed through to anything else.
+//! never handed to a model or passed through to anything else. An own-app
+//! token goes only to the vendor's API, through the vendor's package.
 
 pub mod client;
 pub mod discovery;
 pub mod http;
 pub mod oauth;
+pub mod own_app;
 pub mod runtime;
 pub mod store;
 pub mod tools;

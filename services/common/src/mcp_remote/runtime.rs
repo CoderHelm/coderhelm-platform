@@ -387,8 +387,12 @@ impl Runtime {
             .as_ref()
             .ok_or_else(|| ConnError::Failed("No sign-in settings.".into()))?;
         let client = self.client(s).await.map_err(ConnError::Failed)?;
-        let mut req =
-            oauth::refresh_request(&o.token_endpoint, &client, &refresh_token, &o.resource);
+        let endpoint = if o.refresh_endpoint.is_empty() {
+            &o.token_endpoint
+        } else {
+            &o.refresh_endpoint
+        };
+        let mut req = oauth::refresh_request(endpoint, &client, &refresh_token, &o.resource);
         if o.token_body_json {
             req = oauth::as_json_body(req);
         }

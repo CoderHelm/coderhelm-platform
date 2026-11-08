@@ -44,6 +44,20 @@ pub struct McpPlugin {
     /// Set for a remote server (Streamable HTTP, OAuth or a key): calls go
     /// to it directly instead of through the proxy Lambda.
     pub remote: Option<RemoteBinding>,
+    /// Set when the team signed in to this catalog server with its own
+    /// OAuth app: the package runs with that token (renewed when due)
+    /// instead of the saved key.
+    pub own_app: Option<OwnAppBinding>,
+}
+
+/// The team's runtime for its own-app sign-in to a catalog server.
+#[derive(Clone)]
+pub struct OwnAppBinding(pub Runtime);
+
+impl std::fmt::Debug for OwnAppBinding {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OwnAppBinding").finish_non_exhaustive()
+    }
 }
 
 /// A remote MCP server, bound to the connection this run uses.
@@ -108,6 +122,7 @@ pub async fn load_remote_plugins(
             stored: common::mcp_credentials::Stored::None,
             kms: kms.clone(),
             custom_prompt: Some(server.custom_prompt.clone()).filter(|p| !p.trim().is_empty()),
+            own_app: None,
             remote: Some(RemoteBinding {
                 rt: rt.clone(),
                 server,
@@ -346,6 +361,16 @@ pub async fn call_tool(
 async fn build_env_vars(
     plugin: &McpPlugin,
 ) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
+    if let Some(rt) = &plugin.own_app {
+        match common::mcp_remote::own_app::token_env(&rt.0, &plugin.server_id).await {
+            Ok(Some((var, token))) => {
+                return Ok(json!({ var: token }));
+            }
+            // Disconnected since the run started: the saved key, if any.
+            Ok(None) => {}
+            Err(e) => return Err(format!("{} sign-in: {e}", plugin.server_id).into()),
+        }
+    }
     let kms = common::mcp_credentials::Kms {
         client: &plugin.kms,
         key_id: "",
@@ -364,8 +389,61 @@ async fn build_env_vars(
 }
 
 /// Load enabled MCP plugins with credentials for a team from DynamoDB.
-/// Returns plugins that are enabled AND have credentials stored.
+/// Returns plugins that are enabled AND have credentials stored, and the
+/// catalog servers the team signed in to with its own OAuth app (whose
+/// token takes the place of a key; `key_id` seals a renewed token).
 pub async fn load_team_plugins(
+    dynamo: &aws_sdk_dynamodb::Client,
+    kms: &aws_sdk_kms::Client,
+    settings_table: &str,
+    key_id: &str,
+    team_id: &str,
+) -> Vec<McpPlugin> {
+    let mut plugins = load_keyed_plugins(dynamo, kms, settings_table, team_id).await;
+    let rt = Runtime::aws(dynamo.clone(), settings_table, kms.clone(), key_id, team_id);
+    for id in common::mcp_catalog::ids() {
+        if !common::mcp_remote::own_app::connected(&rt, id).await {
+            continue;
+        }
+        let Some(def) = common::mcp_catalog::find(id) else {
+            continue;
+        };
+        with_own_app(&mut plugins, def, &rt, kms, team_id);
+    }
+    plugins
+}
+
+/// Marks `def`'s plugin as run with the team's own app, adding it when no
+/// key switched it on.
+fn with_own_app(
+    plugins: &mut Vec<McpPlugin>,
+    def: &common::mcp_catalog::McpServerDef,
+    rt: &Runtime,
+    kms: &aws_sdk_kms::Client,
+    team_id: &str,
+) {
+    if let Some(p) = plugins.iter_mut().find(|p| p.server_id == def.id) {
+        p.own_app = Some(OwnAppBinding(rt.clone()));
+        return;
+    }
+    plugins.push(McpPlugin {
+        server_id: def.id.to_string(),
+        npx_package: def.npx_package.to_string(),
+        env_mapping: Vec::new(),
+        team_id: team_id.to_string(),
+        stored: common::mcp_credentials::Stored::None,
+        kms: kms.clone(),
+        custom_prompt: None,
+        remote: None,
+        own_app: Some(OwnAppBinding(rt.clone())),
+    });
+    info!(
+        server_id = def.id,
+        "Catalog server runs with the team's own app"
+    );
+}
+
+async fn load_keyed_plugins(
     dynamo: &aws_sdk_dynamodb::Client,
     kms: &aws_sdk_kms::Client,
     settings_table: &str,
@@ -456,6 +534,7 @@ pub async fn load_team_plugins(
             kms: kms.clone(),
             custom_prompt,
             remote: None,
+            own_app: None,
         });
     }
 
@@ -481,7 +560,42 @@ mod tests {
             kms: aws_sdk_kms::Client::from_conf(conf),
             custom_prompt: None,
             remote: None,
+            own_app: None,
         }
+    }
+
+    fn runtime() -> Runtime {
+        let conf = aws_sdk_dynamodb::Config::builder()
+            .behavior_version(aws_sdk_dynamodb::config::BehaviorVersion::latest())
+            .region(aws_sdk_dynamodb::config::Region::new("us-east-1"))
+            .build();
+        let kms = local("x").kms;
+        Runtime::aws(
+            aws_sdk_dynamodb::Client::from_conf(conf),
+            "t",
+            kms,
+            "k",
+            "TEAM#a",
+        )
+    }
+
+    #[test]
+    fn an_own_app_sign_in_runs_the_package_without_a_key() {
+        let rt = runtime();
+        let kms = local("x").kms;
+        let figma = common::mcp_catalog::find("figma").unwrap();
+        // Switched on with a key: the same plugin now uses the sign-in.
+        let mut plugins = vec![local("figma"), local("sentry")];
+        with_own_app(&mut plugins, figma, &rt, &kms, "TEAM#a");
+        assert_eq!(plugins.len(), 2);
+        assert!(plugins[0].own_app.is_some() && plugins[1].own_app.is_none());
+        // No key at all: the plugin is added, running the catalog package.
+        let mut plugins = vec![local("sentry")];
+        with_own_app(&mut plugins, figma, &rt, &kms, "TEAM#a");
+        let p = plugins.iter().find(|p| p.server_id == "figma").unwrap();
+        assert_eq!(p.npx_package, "figma-developer-mcp");
+        assert!(p.own_app.is_some() && p.remote.is_none());
+        assert!(matches!(p.stored, common::mcp_credentials::Stored::None));
     }
 
     #[test]

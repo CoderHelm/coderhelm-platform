@@ -3849,7 +3849,27 @@ fn mcp_table(state: &AppState) -> &str {
 }
 
 /// Load enabled plugins for the team, returning (server_id, has_credentials, custom_prompt).
+/// A catalog server the team signed in to with its own app counts as
+/// switched on with credentials.
 pub(crate) async fn load_enabled_plugins(
+    state: &AppState,
+    team_id: &str,
+) -> Vec<(String, bool, Option<String>)> {
+    let mut out = load_switched_on_plugins(state, team_id).await;
+    let rt = super::mcp_servers::runtime(state, team_id);
+    for id in common::mcp_catalog::ids() {
+        if !common::mcp_remote::own_app::connected(&rt, id).await {
+            continue;
+        }
+        match out.iter_mut().find(|(p, _, _)| p == id) {
+            Some(p) => p.1 = true,
+            None => out.push((id.to_string(), true, None)),
+        }
+    }
+    out
+}
+
+async fn load_switched_on_plugins(
     state: &AppState,
     team_id: &str,
 ) -> Vec<(String, bool, Option<String>)> {
@@ -3940,19 +3960,10 @@ pub(crate) async fn invoke_mcp_tool(
     // Find catalog entry for this server
     let entry = common::mcp_catalog::find(server_id)
         .ok_or_else(|| format!("Unknown MCP server: {server_id}"))?;
-    let (npx_package, env_mapping) = (entry.npx_package, entry.env_mapping);
+    let npx_package = entry.npx_package;
 
-    // Open the saved values for this call only.
-    let creds = super::plugins::load_credentials(state, team_id, server_id).await?;
-
-    // Map credential fields to env vars
-    let mut env_vars = serde_json::Map::new();
-    for (cred_key, env_var) in env_mapping {
-        if let Some(val) = creds.get(*cred_key) {
-            env_vars.insert(env_var.to_string(), json!(val));
-        }
-    }
-    drop(creds);
+    // The team's own-app token or its saved key, opened for this call only.
+    let env_vars = super::plugins::package_env(state, team_id, entry).await?;
 
     // Build proxy Lambda payload
     let payload = json!({
