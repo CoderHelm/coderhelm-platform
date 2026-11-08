@@ -52,6 +52,17 @@ stacks. The helper reads the release's coderhelm.json itself from the
 release location, checks it against the sha256 (from the signed
 SHA256SUMS), and copies only the files that template lists, each checked.
 
+{"action": "stage_held", "version", "template_sha256", "keep"} from the
+updater: the same release's coderhelm.json with the install's own Boundary,
+DeployBoundary and DeployRole definitions in place of the release's, written
+to releases/<version>/held/. The helper reads those definitions itself from
+the root stack's current template (cloudformation:GetTemplate): what the
+updater sends as "keep" must be exactly that, or nothing is written, so a
+caller can never put a role or a boundary of its own into the template.
+An update runs as the deploy role, which may never change those three, so
+the rest of the release installs while a newer boundary waits for an AWS
+admin (the access stack). Nothing else of the verified template changes.
+
 Delete-time work runs only when the ROOT stack is being deleted (or its first
 create is rolling back), never when an update removes or replaces one of
 these resources. Every step and every AWS error is printed (CloudWatch) and
@@ -335,6 +346,89 @@ def stage_release(event, bucket, s3=None, opener=None):
         raise ValueError(f"{version}'s template lists no child templates")
     data = copy_assets({"Bucket": bucket, "BaseUrl": base, "Files": files}, s3=s3, opener=opener)
     return {"ok": True, "version": version, "staged": int(data["Files"]), "copied": int(data["Copied"])}
+
+
+HELD_RESOURCES = ("Boundary", "DeployBoundary", "DeployRole")
+
+
+def canonical_sha(obj):
+    return hashlib.sha256(json.dumps(obj, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+
+
+def held_template(release, keep):
+    """`release` with each of HELD_RESOURCES replaced by the install's own
+    definition (lambda/updater/handler.py has the same function). Only those
+    three, only of the same type, never one with a condition."""
+    out = json.loads(json.dumps(release))
+    res = out.get("Resources") or {}
+    for k, v in (keep or {}).items():
+        if k not in HELD_RESOURCES:
+            raise ValueError(f"{k} is not a resource an update keeps")
+        if k not in res or not isinstance(v, dict) or v.get("Type") != res[k].get("Type") or "Condition" in v:
+            raise ValueError(f"the install's {k} can't be kept in this release")
+        res[k] = v
+    return out
+
+
+def keep_for(release, deployed):
+    """The root stack's own definitions of HELD_RESOURCES that differ from the
+    release's (lambda/updater/handler.py has the same function)."""
+    rr = (release or {}).get("Resources") or {}
+    dr = (deployed or {}).get("Resources") or {}
+    keep = {}
+    for k in HELD_RESOURCES:
+        mine, theirs = dr.get(k), rr.get(k)
+        if not isinstance(mine, dict) or not isinstance(theirs, dict) or mine == theirs:
+            continue
+        if mine.get("Type") != theirs.get("Type") or "Condition" in mine:
+            continue
+        keep[k] = mine
+    return keep
+
+
+def deployed_template(stack, cfn=None):
+    """The root stack's current template, as CloudFormation stored it."""
+    if not stack:
+        raise ValueError("the helper doesn't know its root stack")
+    body = (cfn or client("cloudformation")).get_template(StackName=stack, TemplateStage="Original").get("TemplateBody")
+    if isinstance(body, str):
+        body = json.loads(body)
+    if not isinstance(body, dict) or not body.get("Resources"):
+        raise ValueError("the root stack's template couldn't be read")
+    return body
+
+
+def stage_held(event, bucket, s3=None, opener=None, cfn=None, stack=None):
+    """The release's coderhelm.json, verified, with the root stack's own
+    access resources kept, written to releases/<version>/held/coderhelm.json.
+    The kept definitions come from the root stack itself, never the caller."""
+    version = str(event.get("version") or "")
+    want = str(event.get("template_sha256") or "").lower()
+    if not VERSION_RE.match(version):
+        raise ValueError(f"not a release version: {version!r}")
+    if not SHA_RE.match(want):
+        raise ValueError("the template's sha256 is missing")
+    if not bucket:
+        raise ValueError("no assets bucket")
+    path = download_verified(release_url(f"https://{RELEASE_HOST}/launch/{version}", RELEASE_FILE), want, opener)
+    try:
+        with open(path, "rb") as fh:
+            release = json.load(fh)
+    finally:
+        os.unlink(path)
+    keep = keep_for(release, deployed_template(stack if stack is not None else os.environ.get("ROOT_STACK", ""), cfn))
+    asked = event.get("keep")
+    if asked is not None and canonical_sha(asked) != canonical_sha(keep):
+        raise ValueError("the definitions to keep aren't the root stack's own: refused")
+    if not keep:
+        raise ValueError("this release doesn't change the install's deploy role or boundaries: nothing to keep")
+    held = held_template(release, keep)
+    body = json.dumps(held, sort_keys=True, separators=(",", ":")).encode()
+    sha = hashlib.sha256(body).hexdigest()
+    key = f"releases/{version}/held/{RELEASE_FILE}"
+    (s3 or client("s3")).put_object(Bucket=bucket, Key=key, Body=body, ChecksumSHA256=b64(sha), ContentType="application/json")
+    log("held template written:", key, sha)
+    return {"ok": True, "version": version, "key": key, "sha256": sha, "canonical": canonical_sha(held)}
 
 
 def delete_secret(secret_id, sm=None):
@@ -873,14 +967,15 @@ def handle(event, context=None):
 
 
 def handler(event, context):
-    if event.get("action") == "stage":
+    if event.get("action") in ("stage", "stage_held"):
         # The updater, directly (CloudFormation's events have no "action").
         try:
-            r = stage_release(event, os.environ.get("ASSETS_BUCKET", ""))
+            fn = stage_release if event["action"] == "stage" else stage_held
+            r = fn(event, os.environ.get("ASSETS_BUCKET", ""))
         except Exception as e:
             log("stage FAILED:", type(e).__name__, e)
             r = {"ok": False, "error": f"{type(e).__name__}: {e}"}
-        log("stage", json.dumps(r))
+        log(event["action"], json.dumps(r))
         return r
     if not RESPONSE_URL_RE.match(str(event.get("ResponseURL", ""))):
         # Only CloudFormation asks with its own presigned answer URL: anything else is not a stack, so nothing is done.

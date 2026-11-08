@@ -8,8 +8,37 @@
  * stack update to the next release's coderhelm.json updates it, Delete
  * stack removes it.
  */
+import * as fs from "fs";
 import { accessNames, AccessNames, boundaryPolicy, deployPolicy, INSTALL_TAG, PolicyDocument } from "../access";
+import { repoPath } from "../paths";
 import { Asset, Child, Json, KEEP_PARAM } from "./package";
+
+/** The access resources' logical ids in the parent: the deploy role and the two boundaries. */
+export const ACCESS_RESOURCES = ["Boundary", "DeployBoundary", "DeployRole"] as const;
+
+/**
+ * The parent's Boundary, DeployBoundary and DeployRole, exactly as every
+ * native release from v0.8.36 on carried them (infra/lib/native/access-pinned.json).
+ *
+ * An update runs as the deploy role, and the boundary forbids that role to
+ * change itself or a boundary (TheBoundaryStays, TheDeployRoleStays): a
+ * parent whose copy of these differed from an install's would be an update
+ * nothing can apply, not even an AWS admin in the console (the stack's
+ * service role is the deploy role, so CloudFormation runs it as that role).
+ * So the parent never changes them. Today's documents (access.ts) reach an
+ * install through its access stack instead (access.json, applied by an AWS
+ * admin with their own permissions), and the updater keeps each install's
+ * own copy of these three in every update it prepares (lambda/updater, "held").
+ */
+export function pinnedAccess(): Record<(typeof ACCESS_RESOURCES)[number], Json> {
+  const f = JSON.parse(fs.readFileSync(repoPath("infra/lib/native/access-pinned.json"), "utf8"));
+  return f.resources;
+}
+
+/** Today's boundary document, for the parent's names (the access stack applies it). */
+export function nativeBoundaryDoc(): Json {
+  return subInstall(boundaryPolicy(nativeNames(), [DEPLOY_BOUNDARY_ARN]));
+}
 
 /** A string with substitutions becomes Fn::Sub; objects and arrays recursively. */
 export function sub(v: unknown): any {
@@ -183,6 +212,9 @@ export function installValue(name: string): Json {
 /** The admin's "delete everything when uninstalled" switch: the updater writes it, the helper reads it on delete. */
 export const UNINSTALL_SWITCH = "/coderhelm-${Stage}/uninstall/delete-data";
 
+/** The helper's one read of the root stack's template (stage_held). */
+export const ROOT_TEMPLATE_SID = "RootStackTemplate";
+
 export function helperPolicy(): PolicyDocument {
   const p = "coderhelm-${Stage}";
   const at = (svc: string) => `arn:\${AWS::Partition}:${svc}:\${AWS::Region}:\${AWS::AccountId}`;
@@ -200,6 +232,8 @@ export function helperPolicy(): PolicyDocument {
       { Sid: "TableKey", Effect: "Allow", Action: ["kms:Encrypt", "kms:Decrypt", "kms:GenerateDataKey*", "kms:DescribeKey"], Resource: "*", Condition: { StringEquals: { [`aws:ResourceTag/${INSTALL_TAG}`]: p } } },
       { Sid: "Domain", Effect: "Allow", Action: "lambda:InvokeFunction", Resource: `${at("lambda")}:function:${p}-updater` },
       { Sid: "RootStack", Effect: "Allow", Action: ["cloudformation:DescribeStacks", "cloudformation:DescribeStackEvents"], Resource: "arn:${AWS::Partition}:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/${AWS::StackName}/*" },
+      // stage_held: the root stack's own deploy role and boundaries, read from its current template (read-only, that stack only).
+      { Sid: ROOT_TEMPLATE_SID, Effect: "Allow", Action: "cloudformation:GetTemplate", Resource: "arn:${AWS::Partition}:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/${AWS::StackName}/*" },
       { Sid: "LogGroupsOnDelete", Effect: "Allow", Action: ["logs:DescribeLogGroups"], Resource: "*" },
       // Only log groups tagged for this install (every one the stack declares is).
       { Sid: "InstallLogGroupsOnDelete", Effect: "Allow", Action: ["logs:DeleteLogGroup", "logs:ListTagsForResource"], Resource: [`${at("logs")}:log-group:/aws/lambda/${p}-*`, `${at("logs")}:log-group:/aws/codebuild/${p}-*`] },
@@ -253,7 +287,12 @@ export interface ParentInput {
   /** Child templates: name -> sha256 of the published file. */
   childSha: Record<string, string>;
   helperCode: string;
+  /** sha256 of the release's access.json (the access stack's template), when built. */
+  accessSha?: string;
 }
+
+/** The access stack's template in a release, next to coderhelm.json. */
+export const ACCESS_FILE = "access.json";
 
 export function childKey(version: string, name: string): { key: string; dest: string } {
   return { key: `stacks/${name}.json`, dest: `releases/${version}/stacks/${name}.json` };
@@ -266,6 +305,8 @@ export function buildParent(input: ParentInput): Json {
   const files = [
     ...children.map((c) => ({ Key: childKey(version, c.name).key, Dest: childKey(version, c.name).dest, Sha256: input.childSha[c.name] })),
     ...input.assets.map((a) => ({ Key: a.key, Dest: a.dest, Sha256: a.sha256 })),
+    // Published with the release and pinned here like every file (the updater checks it before it links to it).
+    ...(input.accessSha ? [{ Key: ACCESS_FILE, Dest: `releases/${version}/${ACCESS_FILE}`, Sha256: input.accessSha }] : []),
   ];
   const root = { RootStackId: { Ref: "AWS::StackId" } };
   const helper = { ServiceToken: { "Fn::GetAtt": ["Helper", "Arn"] }, ...root };
@@ -275,32 +316,11 @@ export function buildParent(input: ParentInput): Json {
   // that transform already resolved, so a later "use the current template"
   // update would silently keep every old parameter value (KeepDataOnDelete
   // included). Every policy in this template is a literal.
-  const boundaryDoc = subInstall(boundaryPolicy(n, [DEPLOY_BOUNDARY_ARN]));
-  R.Boundary = {
-    Type: "AWS::IAM::ManagedPolicy",
-    // Only roles the stack deletes carry it (the kept auto-update role has its own copy).
-    DeletionPolicy: "Delete",
-    UpdateReplacePolicy: "Retain",
-    Properties: {
-      ManagedPolicyName: sub(n.boundaryName),
-      Description: "CoderHelm: the most any CoderHelm role can do (docs/self-host/security.md)",
-      PolicyDocument: boundaryDoc,
-    },
-  };
-  // The same boundary for the auto-update role. That role is kept on delete,
-  // and IAM refuses to delete a policy a role still carries: kept with it,
-  // and both listed by the leftover check.
-  R.DeployBoundary = {
-    Type: "AWS::IAM::ManagedPolicy",
-    DeletionPolicy: "Retain",
-    UpdateReplacePolicy: "Retain",
-    Metadata: { "cfn-lint": { config: { ignore_checks: ["W3011"] } } },
-    Properties: {
-      ManagedPolicyName: sub(DEPLOY_BOUNDARY_NAME),
-      Description: "CoderHelm: the auto-update role's boundary, the same as every CoderHelm role's (docs/self-host/security.md)",
-      PolicyDocument: boundaryDoc,
-    },
-  };
+  // The boundary (Boundary), the auto-update role's own copy (DeployBoundary,
+  // kept with that role on delete): pinned, see pinnedAccess().
+  const pinned = pinnedAccess();
+  R.Boundary = pinned.Boundary;
+  R.DeployBoundary = pinned.DeployBoundary;
   R.AssetsBucket = {
     Type: "AWS::S3::Bucket",
     Properties: { BucketName: sub(ASSETS_BUCKET_NAME), ...s3Secure, Tags: [{ Key: INSTALL_TAG, Value: sub("coderhelm-${Stage}") }] },
@@ -370,8 +390,9 @@ export function buildParent(input: ParentInput): Json {
       Role: { "Fn::GetAtt": ["HelperRole", "Arn"] },
       LoggingConfig: { LogGroup: { Ref: "HelperLogs" } },
       Code: { ZipFile: input.helperCode },
-      // stage: the only bucket it copies a release's child templates to.
-      Environment: { Variables: { ASSETS_BUCKET: { Ref: "AssetsBucket" } } },
+      // stage: the only bucket it copies a release's child templates to. stage_held:
+      // the stack whose own deploy role and boundaries it keeps (read, never taken from the caller).
+      Environment: { Variables: { ASSETS_BUCKET: { Ref: "AssetsBucket" }, ROOT_STACK: { Ref: "AWS::StackName" } } },
       Tags: [{ Key: INSTALL_TAG, Value: sub("coderhelm-${Stage}") }],
     },
   };
@@ -405,33 +426,9 @@ export function buildParent(input: ParentInput): Json {
     },
   };
   // On every install, whatever AutoUpdate says: an admin's Update in Settings,
-  // System applies through it too (AutoUpdate only schedules). Its
-  // Description stays as it was so an install that had it sees no change.
-  R.DeployRole = {
-    Type: "AWS::IAM::Role",
-    // A role can't delete itself, and CloudFormation keeps using a stack's
-    // role for later operations: kept on delete (the leftover check lists it).
-    DeletionPolicy: "Retain",
-    UpdateReplacePolicy: "Retain",
-    Metadata: { "cfn-lint": { config: { ignore_checks: ["W3037", "W3011"] } } },
-    Properties: {
-      RoleName: sub(n.deployRoleName),
-      Description: "CoderHelm: applies a reviewed release's stack update when auto-update is on (docs/self-host/security.md)",
-      AssumeRolePolicyDocument: {
-        Version: "2012-10-17",
-        Statement: [{
-          Effect: "Allow", Principal: { Service: "cloudformation.amazonaws.com" }, Action: "sts:AssumeRole",
-          Condition: {
-            StringEquals: { "aws:SourceAccount": { Ref: "AWS::AccountId" } },
-            StringLike: { "aws:SourceArn": [{ "Fn::Sub": "arn:${AWS::Partition}:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/coderhelm-${Stage}/*" }, { "Fn::Sub": "arn:${AWS::Partition}:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/coderhelm-${Stage}-*/*" }] },
-          },
-        }],
-      },
-      PermissionsBoundary: { Ref: "DeployBoundary" },
-      Policies: [{ PolicyName: "deploy", PolicyDocument: subInstall(deployRolePolicy(n)) }],
-      Tags: [{ Key: INSTALL_TAG, Value: sub("coderhelm-${Stage}") }],
-    },
-  };
+  // System applies through it too (AutoUpdate only schedules). Kept on delete
+  // (a role can't delete itself). Pinned like the boundaries.
+  R.DeployRole = pinned.DeployRole;
 
   for (const c of children) {
     const params: Json = {};

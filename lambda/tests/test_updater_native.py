@@ -90,8 +90,12 @@ class FakeCfn:
             self.log.append("change set")
         return {"Id": "arn:cs/1"}
 
-    def get_template(self, StackName, ChangeSetName, TemplateStage):
-        return {"TemplateBody": self.fetched}
+    def get_template(self, StackName, ChangeSetName=None, TemplateStage="Original"):
+        # A change set's template (what CloudFormation fetched), or the stack's own.
+        return {"TemplateBody": self.fetched if ChangeSetName else getattr(self, "deployed", {})}
+
+    def continue_update_rollback(self, **kw):
+        self.continued = getattr(self, "continued", []) + [kw]
 
     def delete_change_set(self, ChangeSetName, StackName):
         self.deleted.append(ChangeSetName)
@@ -118,6 +122,45 @@ class FakeCfn:
 
     def describe_stack_events(self, StackName):
         return {"StackEvents": self.events}
+
+
+class FakeIam:
+    """The deploy role as IAM has it: its inline policies and its boundary."""
+
+    def __init__(self, deploy=None, boundary=None, policies=None):
+        self.deploy = deploy or {"Version": "2012-10-17", "Statement": [{"Effect": "Allow", "Action": "*", "Resource": "*"}]}
+        self.boundary = boundary
+        # Managed policies by ARN (the boundaries), as their default version.
+        self.policies = dict(policies or {})
+        self.role_policies = {}
+
+    def get_role(self, RoleName):
+        r = {"RoleName": RoleName}
+        if self.boundary is not None:
+            r["PermissionsBoundary"] = {"PermissionsBoundaryArn": "arn:aws:iam::1:policy/coderhelm-prod-deploy-boundary-stack"}
+            self.policies.setdefault("arn:aws:iam::1:policy/coderhelm-prod-deploy-boundary-stack", self.boundary)
+        return {"Role": r}
+
+    def list_role_policies(self, RoleName):
+        return {"PolicyNames": ["deploy"]}
+
+    def get_role_policy(self, RoleName, PolicyName):
+        return {"PolicyDocument": self.role_policies.get((RoleName, PolicyName), self.deploy)}
+
+    def list_attached_role_policies(self, RoleName):
+        return {"AttachedPolicies": []}
+
+    def get_policy(self, PolicyArn):
+        if PolicyArn not in self.policies:
+            raise Exception(f"NoSuchEntity: {PolicyArn}")
+        return {"Policy": {"DefaultVersionId": "v1"}}
+
+    def get_policy_version(self, PolicyArn, VersionId):
+        return {"PolicyVersion": {"Document": self.policies[PolicyArn]}}
+
+
+# Every test that doesn't set its own: a deploy role that may do anything.
+u._clients["iam"] = FakeIam()
 
 
 class FakeCodeBuild:
@@ -698,7 +741,9 @@ class AnthropicKeysInstall(unittest.TestCase):
 
 class AdminOnlyChanges(unittest.TestCase):
     """The auto-update role can't change itself or a boundary (the boundary
-    refuses it): such a change set waits for an admin instead of failing."""
+    refuses it), and a change set made with it runs as it whoever executes it
+    (the stack's service role): such a change set is never offered to anyone,
+    it ends before it starts."""
 
     def setUp(self):
         self.store = u.Store(FakeDynamo(), "t")
@@ -723,8 +768,12 @@ class AdminOnlyChanges(unittest.TestCase):
             {"ResourceChange": {"Action": "Add", "LogicalResourceId": "DeployBoundary", "ResourceType": "AWS::IAM::ManagedPolicy"}},
         ]}
         r = u.native_poll(self.store, env, NOW)
-        self.assertEqual(r["native"], "review")
+        self.assertEqual(r["status"], "failed")
         self.assertEqual(self.cfn.executed, [])
+        self.assertEqual(self.cfn.deleted, ["arn:cs/1"])
+        h = self.store.history()[0]
+        self.assertIn("update role doesn't have", h["summary"])
+        self.assertIn("DeployBoundary", h["technical"])
 
     def test_admin_changes_names_only_those(self):
         cs = {"Changes": [{"ResourceChange": {"Action": "Modify", "LogicalResourceId": "Boundary"}},
@@ -899,9 +948,9 @@ class AdminApplies(unittest.TestCase):
 
     def test_the_press_never_agrees_to_a_role_or_boundary_change(self):
         r = self.prepare(parent=[{"ResourceChange": {"Action": "Modify", "LogicalResourceId": "DeployBoundary", "ResourceType": "AWS::IAM::ManagedPolicy"}}], consent=True)
-        self.assertEqual(r["native"], "review")
+        self.assertEqual(r["status"], "failed")
         self.assertEqual(self.cfn.executed, [])
-        self.assertFalse(self.pending()["can_apply"])
+        self.assertIsNone(self.pending())
 
     def test_the_window_never_carries_a_press_consent(self):
         self.store.put("AUTO_UPDATE", {"auto": True})
@@ -936,15 +985,14 @@ class AdminApplies(unittest.TestCase):
             self.apply(confirm=other)
         self.assertEqual(self.cfn.executed, [])
 
-    def test_a_change_to_the_role_or_a_boundary_is_never_applied_here(self):
+    def test_a_change_to_the_role_or_a_boundary_is_never_applied_or_offered(self):
         r = self.prepare(parent=[{"ResourceChange": {"Action": "Modify", "LogicalResourceId": "DeployBoundary", "ResourceType": "AWS::IAM::ManagedPolicy"}}])
-        self.assertEqual(r["native"], "review")
-        p = self.pending()
-        self.assertFalse(p["can_apply"])
-        self.assertIn("DeployBoundary", p["admin_changes"][0])
-        self.assertIn("AWS console", self.sent[-1])
-        with self.assertRaisesRegex(ValueError, "can't apply for you"):
-            self.apply(confirm=p["confirm"])
+        self.assertEqual(r["status"], "failed")
+        self.assertIsNone(self.pending())
+        # Nobody is sent to the AWS console to execute it: it would run as the deploy role there too.
+        self.assertFalse(any("choose Execute" in m for m in self.sent))
+        with self.assertRaisesRegex(ValueError, "no prepared update"):
+            self.apply()
         self.assertEqual(self.cfn.executed, [])
 
     def test_a_change_set_prepared_with_the_role_applies(self):

@@ -341,9 +341,9 @@ jobs:
           export CODERHELM_COMMIT CODERHELM_RELEASED_AT
           CODERHELM_DASHBOARD_DIR="$RUNNER_TEMP/dash" node dist/lib/native/build.js "$TAG" "$RUNNER_TEMP/native"
           pip install --quiet cfn-lint==1.58.0
-          cfn-lint -i W3005 -i W2531 -- "$RUNNER_TEMP/native/coderhelm.json" "$RUNNER_TEMP/native"/stacks/*.json
+          cfn-lint -i W3005 -i W2531 -- "$RUNNER_TEMP/native/coderhelm.json" "$RUNNER_TEMP/native/access.json" "$RUNNER_TEMP/native"/stacks/*.json
           cp "$RUNNER_TEMP/native/coderhelm.json" ../dist/coderhelm.json
-          tar -czf ../dist/coderhelm-native.tar.gz -C "$RUNNER_TEMP/native" stacks assets
+          tar -czf ../dist/coderhelm-native.tar.gz -C "$RUNNER_TEMP/native" access.json stacks assets
       - name: Checksums
         run: |
           (cd dist && sha256sum gateway.zip worker.zip mcp-proxy.zip dashboard.tar.gz source.tar.gz coderhelm-selfhost.tgz install.sh coderhelm.json coderhelm-native.tar.gz models.json coderhelm-log-reader.yaml coderhelm-log-reader-update.yaml > SHA256SUMS)

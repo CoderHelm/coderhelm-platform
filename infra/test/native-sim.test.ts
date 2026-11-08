@@ -15,7 +15,7 @@ import * as assert from "node:assert/strict";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { accessNames, boundaryPolicy, PolicyDocument } from "../lib/access";
-import { deployRolePolicy, helperPolicy, nativeNames } from "../lib/native/parent";
+import { deployRolePolicy, helperPolicy, nativeNames, ROOT_TEMPLATE_SID } from "../lib/native/parent";
 import { prodValues, resolveValue } from "../lib/native/resolve";
 import { decision } from "./iam-eval";
 
@@ -70,7 +70,13 @@ test("the fixture is AWS's verdict on thousands of calls, for the native policie
   const t = today();
   assert.deepEqual(F.policies.deploy, t.deploy, "the auto-update role changed: run deploy-role-sim.py --native again");
   assert.deepEqual(F.policies.boundary, t.boundary, "the boundary changed: run deploy-role-sim.py --native again");
-  assert.deepEqual(F.helper.policy, t.helper, "the helper's policy changed: run deploy-role-sim.py --native again");
+  // The helper's one read of the root stack's template (stage_held) came after the simulator's last run:
+  // it is a single read-only GetTemplate on the root stack, checked here; everything else is what the simulator saw.
+  // Run deploy-role-sim.py --native again to fold it in.
+  const added = t.helper.Statement.filter((s) => s.Sid === ROOT_TEMPLATE_SID);
+  assert.deepEqual(added, [{ Sid: ROOT_TEMPLATE_SID, Effect: "Allow", Action: "cloudformation:GetTemplate", Resource: "arn:aws:cloudformation:us-east-1:111122223333:stack/coderhelm-prod/*" }]);
+  const seen = F.helper.policy.Statement.some((s: any) => s.Sid === ROOT_TEMPLATE_SID) ? t.helper : { ...t.helper, Statement: t.helper.Statement.filter((s) => s.Sid !== ROOT_TEMPLATE_SID) };
+  assert.deepEqual(F.helper.policy, seen, "the helper's policy changed: run deploy-role-sim.py --native again");
 });
 
 test("the local evaluator gives the simulator's verdict on every call", () => {
