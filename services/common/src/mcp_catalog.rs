@@ -66,8 +66,10 @@ pub const CATALOG: &[McpServerDef] = &[
         recommended_permissions: "Read-only file access",
         npx_package: "figma-developer-mcp",
         // No remote sign-in: Figma's MCP server registers only clients Figma
-        // approved (dynamic registration answers 403) and takes no client
-        // metadata documents, so a key is the way in.
+        // approved (dynamic registration answers 403, and its `mcp:connect`
+        // scope is refused to any other app) and takes no client metadata
+        // documents. The package reads Figma's REST API, which takes a key or
+        // a token from the team's own Figma OAuth app ([`own_app`]).
         remote_url: "",
         remote_key: false,
         key_unavailable: "",
@@ -562,6 +564,59 @@ pub fn key_help(id: &str) -> Option<String> {
     ))
 }
 
+/// A team's own OAuth app with a vendor whose package reads the vendor's
+/// API with an OAuth token as well as a key. The team registers the app with
+/// the vendor and pastes its client id and secret; a sign-in then gives the
+/// package a token in place of a key, renewed before it expires.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub struct OwnApp {
+    /// Where people approve the app.
+    pub authorize: &'static str,
+    /// Where a code is exchanged for tokens.
+    pub token: &'static str,
+    /// Where a refresh token is exchanged, when the vendor uses a separate
+    /// address for it. Empty means [`OwnApp::token`].
+    pub refresh: &'static str,
+    /// Exactly what the package (and the connection check) calls.
+    pub scopes: &'static [&'static str],
+    /// The environment variable the package reads the token from.
+    #[serde(skip)]
+    pub env_var: &'static str,
+    /// Asked with the token after a sign-in to confirm it works.
+    #[serde(skip)]
+    pub check: &'static str,
+    /// Where the team creates the app.
+    pub console: &'static str,
+    /// The vendor's guide to creating one.
+    pub guide: &'static str,
+}
+
+/// The own-app sign-in for a catalog server, when its package takes an
+/// OAuth token.
+pub fn own_app(id: &str) -> Option<OwnApp> {
+    match id {
+        // Figma's REST API takes tokens from any OAuth app, and a private
+        // app needs no review from Figma for people on the team or
+        // organization that owns it. The token endpoint wants the client in
+        // an HTTP Basic header; refreshing has its own address and never
+        // rotates the refresh token. The package calls GET /v1/files,
+        // /v1/files/:key/nodes, /v1/images and /v1/files/:key/images (all
+        // file_content:read); the check calls GET /v1/me (current_user:read).
+        // `figma_own_app_asks_for_what_the_package_calls` pins this list.
+        "figma" => Some(OwnApp {
+            authorize: "https://www.figma.com/oauth",
+            token: "https://api.figma.com/v1/oauth/token",
+            refresh: "https://api.figma.com/v1/oauth/refresh",
+            scopes: &["current_user:read", "file_content:read"],
+            env_var: "FIGMA_OAUTH_TOKEN",
+            check: "https://api.figma.com/v1/me",
+            console: "https://www.figma.com/developers/apps",
+            guide: "https://developers.figma.com/docs/rest-api/oauth-apps/",
+        }),
+        _ => None,
+    }
+}
+
 /// The catalog's server ids, in catalog order.
 pub fn ids() -> impl Iterator<Item = &'static str> {
     CATALOG.iter().map(|p| p.id)
@@ -615,6 +670,36 @@ mod tests {
         }
         assert!(find("sanity").is_some());
         assert_eq!(find("nope").map(|p| p.id), None);
+    }
+
+    #[test]
+    fn an_own_app_is_only_for_a_package_that_reads_its_token() {
+        for p in CATALOG {
+            let Some(app) = own_app(p.id) else { continue };
+            // The token goes to the package, so there must be one.
+            assert!(!p.npx_package.is_empty(), "{}", p.id);
+            assert!(
+                !app.env_var.is_empty() && !app.scopes.is_empty(),
+                "{}",
+                p.id
+            );
+            for u in [app.authorize, app.token, app.check, app.console] {
+                assert!(u.starts_with("https://"), "{}: {u}", p.id);
+            }
+            assert!(app.refresh.is_empty() || app.refresh.starts_with("https://"));
+        }
+        assert!(own_app("sentry").is_none());
+    }
+
+    #[test]
+    fn figma_own_app_asks_for_what_the_package_calls() {
+        let app = own_app("figma").unwrap();
+        assert_eq!(app.scopes, &["current_user:read", "file_content:read"]);
+        // figma-developer-mcp sends FIGMA_OAUTH_TOKEN as a bearer token
+        // (and FIGMA_API_KEY as X-Figma-Token).
+        assert_eq!(app.env_var, "FIGMA_OAUTH_TOKEN");
+        assert_eq!(find("figma").unwrap().npx_package, "figma-developer-mcp");
+        assert_eq!(app.refresh, "https://api.figma.com/v1/oauth/refresh");
     }
 
     #[test]

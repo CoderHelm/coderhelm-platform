@@ -303,6 +303,7 @@ pub fn connection_record(
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect(),
         token_body_json: p.json_body,
+        refresh_endpoint: String::new(),
     });
     s
 }
@@ -346,6 +347,7 @@ pub fn brokered_connection_record(
         legacy: false,
         extra_authorize: vec![],
         token_body_json: false,
+        refresh_endpoint: String::new(),
     });
     s
 }

@@ -162,6 +162,9 @@ pub struct OAuthSettings {
     pub extra_authorize: Vec<(String, String)>,
     /// The token endpoint takes JSON instead of a form (Notion, Atlassian).
     pub token_body_json: bool,
+    /// Where a refresh token is exchanged, when the provider uses its own
+    /// address for that (Figma). Empty means the token endpoint.
+    pub refresh_endpoint: String,
 }
 
 impl OAuthSettings {
@@ -216,6 +219,7 @@ impl OAuthSettings {
             "legacy": self.legacy,
             "extra_authorize": self.extra_authorize,
             "token_body_json": self.token_body_json,
+            "refresh_endpoint": self.refresh_endpoint,
         })
     }
 
@@ -250,6 +254,7 @@ impl OAuthSettings {
             extra_authorize: serde_json::from_value(v["extra_authorize"].clone())
                 .unwrap_or_default(),
             token_body_json: v["token_body_json"].as_bool().unwrap_or(false),
+            refresh_endpoint: st("refresh_endpoint"),
         }
     }
 }
@@ -319,6 +324,14 @@ fn av(v: impl Into<String>) -> AttributeValue {
 
 fn num(v: i64) -> AttributeValue {
     AttributeValue::N(v.to_string())
+}
+
+/// A record that only holds a sign-in for something else to use (a
+/// knowledge source's sync, a catalog package run with the team's own app),
+/// never an MCP server of its own.
+pub fn is_token_only(catalog_id: &str) -> bool {
+    crate::knowledge::sources::oauth::is_source_connection(catalog_id)
+        || super::own_app::is_app_connection(catalog_id)
 }
 
 fn set_json(v: &BTreeSet<String>) -> String {
@@ -860,9 +873,10 @@ impl Store for DynamoStore {
             .await?
             .iter()
             .filter_map(ServerRecord::from_item)
-            // A knowledge source's sign-in is kept here too, but it is never
-            // an MCP server (`knowledge::sources::oauth`).
-            .filter(|s| !crate::knowledge::sources::oauth::is_source_connection(&s.catalog_id))
+            // A knowledge source's sign-in and a catalog server's own-app
+            // sign-in are kept here too, but neither is an MCP server
+            // (`knowledge::sources::oauth`, `mcp_remote::own_app`).
+            .filter(|s| !is_token_only(&s.catalog_id))
             .collect())
     }
 
@@ -1152,7 +1166,7 @@ pub mod fake {
                 .prefix(team, SERVER_PREFIX)
                 .iter()
                 .filter_map(ServerRecord::from_item)
-                .filter(|s| !crate::knowledge::sources::oauth::is_source_connection(&s.catalog_id))
+                .filter(|s| !is_token_only(&s.catalog_id))
                 .collect())
         }
         async fn put_server(&self, team: &str, s: &ServerRecord) -> Result<(), String> {

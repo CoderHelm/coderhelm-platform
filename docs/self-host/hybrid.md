@@ -163,7 +163,7 @@ The Setup checks show the link as `hybrid_jira` (in Settings, Setup and the inst
 | Jira (Forge app) | yes | install CoderHelm's Jira app and enter your install id as the team id, or link a hosted team's site ([Jira through CoderHelm](#jira-through-coderhelm)) |
 | Notion, Confluence, Google Drive | yes | one-click sign-in through CoderHelm; tokens brokered |
 | Slack and Teams notifications | not needed | your install posts to the incoming webhook you paste |
-| Figma, Linear, Sentry, Sanity and other sign-in apps | not needed | your install registers itself with each provider |
+| Figma, Linear, Sentry, Sanity and other sign-in apps | not needed | your install registers itself with each provider; Figma signs in only apps it approved, so Figma uses your own Figma app or a key |
 | Slack and Teams commands | no | there is no shared Slack or Teams app: each team uses its own app's signing secret, as today |
 | Sign in with GitHub | yes | CoderHelm's app carries the trip to GitHub; your install checks the account with GitHub and applies its own rules ([Sign in with GitHub through CoderHelm](#sign-in-with-github-through-coderhelm)) |
 | Sign in with Google | no | a self-hosted install has no Google sign-in, through CoderHelm or its own ([Sign-in and people](./sign-in.md#no-google-sign-in)) |

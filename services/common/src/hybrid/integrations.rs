@@ -92,7 +92,7 @@ pub const CATALOG: &[Entry] = &[
         id: "mcp_apps",
         name: "Figma, Linear, Sentry, Sanity and other sign-in apps",
         mode: Mode::Direct,
-        through_coderhelm: "Nothing: your install registers itself with each provider's sign-in server and keeps its own tokens.",
+        through_coderhelm: "Nothing: your install registers itself with each provider's sign-in server and keeps its own tokens. Figma signs in only apps it approved, so Figma uses your own Figma app or a key.",
         stays_with_you: "Everything.",
         reason: "",
     },

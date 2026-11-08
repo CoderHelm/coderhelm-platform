@@ -27,7 +27,7 @@ use axum::{
 use common::mcp_remote::http::check_url;
 use common::mcp_remote::runtime::{detect, Detected, Runtime};
 use common::mcp_remote::store::{AuthKind, OAuthSettings, Owner, ServerRecord, Sharing, Status};
-use common::mcp_remote::{oauth, tools};
+use common::mcp_remote::{oauth, own_app, tools};
 use serde_json::{json, Value};
 use tracing::{error, info, warn};
 
@@ -537,6 +537,68 @@ pub async fn set_client(
     ))
 }
 
+/// PUT /api/mcp-servers/apps/:catalog_id { client_id, client_secret? } — the
+/// team's own OAuth app for a catalog server whose package takes a token
+/// (Figma). Connecting it is then `POST /api/mcp-servers/app-<id>/connect`,
+/// and removing it `DELETE /api/mcp-servers/app-<id>`. A blank secret keeps
+/// the saved one for the same client id; another client id ends the old
+/// sign-in.
+pub async fn save_own_app(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<Claims>,
+    Path(catalog_id): Path<String>,
+    Json(body): Json<Value>,
+) -> Reply {
+    claims.require_role(3).map_err(forbidden)?;
+    let rt = runtime(&state, &claims.team_id);
+    let s = own_app::save(
+        &rt,
+        &catalog_id,
+        body["client_id"].as_str().unwrap_or(""),
+        body["client_secret"].as_str().unwrap_or(""),
+        &claims.email,
+        &chrono::Utc::now().to_rfc3339(),
+    )
+    .await
+    .map_err(|e| match e {
+        own_app::SaveError::NoOwnApp => fail(
+            StatusCode::NOT_FOUND,
+            "This server can't use your own app. Use a key instead.",
+        ),
+        own_app::SaveError::Invalid(m) => fail(StatusCode::BAD_REQUEST, m),
+        own_app::SaveError::Internal(e) => internal("save own app", e),
+    })?;
+    info!(team = %rt.team, server = %s.id, by = %claims.email, "Own app saved");
+    Ok(Json(
+        json!({ "own_app": own_app_json(&rt, &s, &state.config.stage).await }),
+    ))
+}
+
+/// A team's own app for a catalog server, for its card: never the secret.
+pub async fn own_app_json(rt: &Runtime, s: &ServerRecord, stage: &str) -> Value {
+    let token = rt
+        .store
+        .get_token(&rt.team, &s.id, &Owner::Team)
+        .await
+        .ok()
+        .flatten();
+    let (status, reason) = match &token {
+        Some(t) => (t.status, t.status_reason.clone()),
+        None => (Status::NotConnected, String::new()),
+    };
+    let o = s.oauth.as_ref();
+    json!({
+        "id": s.id,
+        "client_id": o.map(|o| o.client_id.as_str()).unwrap_or(""),
+        "has_secret": o.is_some_and(|o| !o.client_secret_sealed.is_empty()),
+        "status": status.as_str(),
+        "status_reason": reason,
+        "connected_by": token.as_ref().map(|t| t.connected_by.as_str()).unwrap_or(""),
+        "connected_at": token.as_ref().map(|t| t.connected_at.as_str()).unwrap_or(""),
+        "redirect_uri": redirect_uri(stage),
+    })
+}
+
 /// PUT /api/mcp-servers/:id/key { header_name?, header_value } — replace a
 /// static key (checked against the server before it is saved).
 pub async fn set_key(
@@ -664,6 +726,18 @@ pub async fn oauth_callback(
         )
         .await
         .map_err(|e| fail(StatusCode::BAD_REQUEST, &e))?;
+    // A catalog server's own-app sign-in has no tools either: its package
+    // gets the token. Check the token with the vendor's API now, so a wrong
+    // scope or an unpublished app shows on the card instead of in a run.
+    if let Some(catalog) = own_app::catalog_of(&s.catalog_id) {
+        let checked = own_app::check(&rt, &s).await;
+        info!(team = %rt.team, server = %s.id, ok = checked.is_ok(), "Own app signed in");
+        return Ok(Json(json!({
+            "server": { "id": s.id, "name": s.name, "catalog_id": catalog },
+            "tools_error": checked.err(),
+            "own_app": true,
+        })));
+    }
     // List the tools now so the picker has them. A failure here leaves the
     // connection saved; the status says why.
     // A knowledge source's sign-in has no tools to list.

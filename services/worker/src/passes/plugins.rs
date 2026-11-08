@@ -393,11 +393,17 @@ impl CatalogConnections<'_> {
         } else {
             &self.state.config.mcp_configs_table_name
         };
-        crate::agent::mcp::load_team_plugins(&self.state.dynamo, &self.state.kms, table, team)
-            .await
-            .into_iter()
-            .find(|p| p.server_id == server)
-            .ok_or_else(|| format!("{server} isn't connected on the Connections page."))
+        crate::agent::mcp::load_team_plugins(
+            &self.state.dynamo,
+            &self.state.kms,
+            table,
+            &self.state.config.secrets_key_id,
+            team,
+        )
+        .await
+        .into_iter()
+        .find(|p| p.server_id == server)
+        .ok_or_else(|| format!("{server} isn't connected on the Connections page."))
     }
 }
 

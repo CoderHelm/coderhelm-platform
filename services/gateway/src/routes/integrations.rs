@@ -126,6 +126,32 @@ pub fn plugin_state(
     }
 }
 
+/// A catalog server with the team's own app saved (`own_app` is its card
+/// JSON): connected through it, it needs signing in again, or (not signed
+/// in yet) the key's state stands, saying a sign-in is waiting.
+pub fn own_app_state(own_app: &Value, key: &CardState) -> CardState {
+    let reason = own_app["status_reason"].as_str().unwrap_or("").to_string();
+    match own_app["status"].as_str().unwrap_or("") {
+        "connected" => cs("connected", "Signed in with your own app.", "manage"),
+        "needs_reconnect" => cs(
+            "needs_reconnect",
+            if reason.is_empty() {
+                "Your own app's sign-in has to be renewed.".to_string()
+            } else {
+                reason
+            },
+            "reconnect",
+        ),
+        "failed" => cs("error", reason, "check_again"),
+        _ if key.status == "connected" => key.clone(),
+        _ => cs(
+            "not_connected",
+            "Your own app is saved. Connect it to sign in.",
+            "connect",
+        ),
+    }
+}
+
 /// A remote MCP server, as seen by one person: their own connection on a
 /// personal server, the team's otherwise.
 pub fn remote_state(
@@ -673,7 +699,29 @@ pub async fn list(
             Some(r) => r.tools_listed_at.clone(),
             None => tested_at,
         };
+        // Signed in with the team's own app: that sign-in is what agents
+        // use (the key stays as a fallback), so its state is the card's.
+        let own = match common::mcp_remote::own_app::load(&rt, &id).await {
+            Ok(o) => o,
+            Err(e) => {
+                warn!(error = %e, plugin = %id, "Could not read own app");
+                None
+            }
+        };
+        let own_json = match &own {
+            Some(o) => Some(super::mcp_servers::own_app_json(&rt, o, &state.config.stage).await),
+            None => None,
+        };
+        let st = match own_json.as_ref().map(|o| own_app_state(o, &st)) {
+            Some(s) => s,
+            None => st,
+        };
+        // Where the team's own app sends people back, for its setup steps.
+        let own_redirect = common::mcp_catalog::own_app(&id)
+            .map(|_| super::mcp_servers::redirect_uri(&state.config.stage));
         let detail = json!({
+            "own_app": own_json,
+            "own_app_redirect_uri": own_redirect,
             "remote": remote.map(|r| r.public_json(my_tokens.get(&r.id), can_edit)),
             "plugin": p,
             "enabled": enabled.unwrap_or(false),
@@ -901,6 +949,24 @@ pub async fn set_aws_abilities(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_own_app_sign_in_is_the_cards_state() {
+        let key_off = plugin_state(None, false, None, "", false);
+        let key_on = plugin_state(Some(true), true, Some(true), "", true);
+        let own = |status: &str, reason: &str| json!({ "status": status, "status_reason": reason });
+        let st = own_app_state(&own("connected", ""), &key_off);
+        assert_eq!((st.status, st.action), ("connected", "manage"));
+        let st = own_app_state(&own("needs_reconnect", "Figma refused it."), &key_on);
+        assert_eq!(
+            (st.status, st.reason.as_str()),
+            ("needs_reconnect", "Figma refused it.")
+        );
+        // Saved but not signed in: a working key still stands.
+        assert_eq!(own_app_state(&own("not_connected", ""), &key_on), key_on);
+        let st = own_app_state(&own("not_connected", ""), &key_off);
+        assert_eq!((st.status, st.action), ("not_connected", "connect"));
+    }
     use common::live::identity::RoleCheck;
 
     fn account() -> AwsAccount {
