@@ -203,6 +203,27 @@ pub fn projects_in(result: &Value) -> Result<Vec<(String, String)>, ConnectorErr
             .map(str::to_string)
     };
     let mut out: Vec<(String, String)> = Vec::new();
+    // Sanity's hosted server answers in tags, one element per project named
+    // by its id: `<projects><abc123><name>Site</name>…</abc123></projects>`.
+    for t in result["content"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|c| c["type"] == "text")
+        .filter_map(|c| c["text"].as_str())
+    {
+        for (id, name) in tagged_projects(t) {
+            if !out.iter().any(|(i, _)| *i == id) {
+                out.push((id, name));
+            }
+        }
+    }
+    // A tagged answer names its projects by tag; its nested `<id>`s
+    // (an organization's, say) are never projects.
+    if !out.is_empty() {
+        out.sort_by_key(|(_, name)| name.to_lowercase());
+        return Ok(out);
+    }
     for v in &answers {
         for m in objects(v, &|m| id_of(m).is_some()) {
             let id = id_of(m).unwrap_or_default();
@@ -219,6 +240,51 @@ pub fn projects_in(result: &Value) -> Result<Vec<(String, String)>, ConnectorErr
     }
     out.sort_by_key(|(_, name)| name.to_lowercase());
     Ok(out)
+}
+
+/// Projects in a tagged answer: each element directly inside `<projects>`
+/// whose tag is a project id, named by its `<displayName>` or `<name>`
+/// child. Anything else in the text is ignored.
+fn tagged_projects(text: &str) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    let Some(start) = text.find("<projects>") else {
+        return out;
+    };
+    let body = &text[start + "<projects>".len()..];
+    let body = &body[..body.find("</projects>").unwrap_or(body.len())];
+    let mut rest = body;
+    while let Some(open) = rest.find('<') {
+        let after = &rest[open + 1..];
+        let Some(close) = after.find('>') else { break };
+        let tag = after[..close].trim();
+        let inner_start = &after[close + 1..];
+        let end_tag = format!("</{tag}>");
+        if tag.starts_with('/') || !valid_project(tag) {
+            rest = inner_start;
+            continue;
+        }
+        let Some(end) = inner_start.find(&end_tag) else {
+            rest = inner_start;
+            continue;
+        };
+        let inner = &inner_start[..end];
+        let child = |name: &str| {
+            let (o, c) = (format!("<{name}>"), format!("</{name}>"));
+            let i = inner.find(&o)? + o.len();
+            let j = inner[i..].find(&c)? + i;
+            Some(inner[i..j].trim().to_string()).filter(|v| !v.is_empty())
+        };
+        // A project element holds fields; a bare `<name>`-like word with no
+        // children is not a project.
+        if inner.contains('<') {
+            let name = child("displayName")
+                .or_else(|| child("name"))
+                .unwrap_or_else(|| tag.to_string());
+            out.push((tag.to_string(), name));
+        }
+        rest = &inner_start[end + end_tag.len()..];
+    }
+    out
 }
 
 fn project_node(id: &str, title: String, detail: String) -> Node {
@@ -800,6 +866,25 @@ mod tests {
         let err =
             json!({"isError": true, "content": [{"type": "text", "text": "No projects found"}]});
         assert!(projects_in(&err).is_err(), "an error answer stays an error");
+    }
+
+    #[test]
+    fn project_ids_are_read_from_a_tagged_answer() {
+        let text = "Found 2 projects in 1 organization: \n<projects>\n  <5tubhumo>\n    <name>Mobile app</name>\n    <organization>\n      <id>o1</id>\n    </organization>\n  </5tubhumo>\n  <9ab8cd7e>\n    <displayName>Site</displayName>\n    <name>site</name>\n  </9ab8cd7e>\n</projects>";
+        let r = json!({"content": [{"type": "text", "text": text}]});
+        assert_eq!(
+            projects_in(&r).unwrap(),
+            [
+                ("5tubhumo".to_string(), "Mobile app".to_string()),
+                ("9ab8cd7e".to_string(), "Site".to_string())
+            ]
+        );
+        assert!(tagged_projects("<projects></projects>").is_empty());
+        assert!(
+            tagged_projects("<projects><name>x</name></projects>").is_empty(),
+            "a field with no children is never a project"
+        );
+        assert!(tagged_projects("no tags here").is_empty());
     }
 
     /// A sign-in whose project list is empty, but which reads `readable`.
