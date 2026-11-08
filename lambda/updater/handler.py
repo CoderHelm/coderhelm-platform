@@ -2200,12 +2200,15 @@ def native_propose(store, env, version, mode, extra=None, cfn=None, opener=None)
     # nested change sets: the helper copies them into the install's bucket
     # first, each checked against this verified template.
     stage_release(env, version, want)
-    proposed, held = template, []
+    proposed, held, deployed_access = template, [], {}
     if role:
         # The update runs as the deploy role, which may never change itself or
         # a boundary: the install's own copies of those stay as they are, and
         # a newer one waits as a separate item for an AWS admin (access).
-        keep = keep_for(template, deployed_template(cfn, env["NATIVE_STACK"]))
+        deployed = deployed_template(cfn, env["NATIVE_STACK"])
+        # What a rollback of this update restores (recover_stuck compares with it).
+        deployed_access = {k: v for k, v in (deployed.get("Resources") or {}).items() if k in HELD}
+        keep = keep_for(template, deployed)
         if keep:
             proposed = held_template(template, keep)
             r = stage_held(env, version, want, keep)
@@ -2216,7 +2219,8 @@ def native_propose(store, env, version, mode, extra=None, cfn=None, opener=None)
     r = cfn.create_change_set(**kwargs)
     # DescribeChangeSet never returns the role a change set was made with, so
     # the entry records it: apply checks it against the deploy role.
-    return {"change_set_id": r["Id"], "apply": bool(role), "role_arn": role, "template_canonical": canonical_sha(proposed), "held": held}
+    return {"change_set_id": r["Id"], "apply": bool(role), "role_arn": role, "template_canonical": canonical_sha(proposed), "held": held,
+            "deployed_access": deployed_access}
 
 
 # ── The deploy role's own access ──────────────────────────────────────────
@@ -2360,10 +2364,14 @@ def canonical_policy(doc):
         return v
 
     out = walk(doc)
-    for st in out.get("Statement", []) if isinstance(out, dict) else []:
-        for op in (st.get("Condition") or {}).values():
-            for k, val in list(op.items()):
-                op[k] = sorted(val) if isinstance(val, list) else [val]
+    if isinstance(out, dict):
+        out["Statement"] = _as_list(out.get("Statement"))
+        for st in out["Statement"]:
+            for op in (st.get("Condition") or {}).values():
+                for k, val in list(op.items()):
+                    op[k] = sorted(val) if isinstance(val, list) else [val]
+        # The order of statements doesn't matter either.
+        out["Statement"] = sorted(out["Statement"], key=lambda x: json.dumps(x, sort_keys=True))
     return json.dumps(out, sort_keys=True, separators=(",", ":"))
 
 
@@ -2384,7 +2392,15 @@ def _as_list(v):
     return [] if v is None else (v if isinstance(v, list) else [v])
 
 
-def _condition_holds(cond, ctx):
+POSITIVE_OPS = ("StringEquals", "StringEqualsIgnoreCase", "StringLike", "ArnEquals", "ArnLike", "Bool",
+                "ForAnyValue:StringEquals", "ForAnyValue:StringEqualsIgnoreCase", "ForAnyValue:StringLike")
+
+
+def _condition_holds(cond, ctx, deny=False):
+    """Whether a statement's condition holds for the request. Fails closed:
+    an operator it doesn't know raises; a Deny whose positive operator names a
+    key the request doesn't carry counts as applying (it may well apply in
+    AWS), while an Allow with such a key doesn't."""
     for op, kv in (cond or {}).items():
         for key, want in kv.items():
             have = ctx.get(key)
@@ -2394,19 +2410,23 @@ def _condition_holds(cond, ctx):
 
             def any_(f):
                 return any(f(h, w) for h in haves for w in wants)
-            base = op.replace("IfExists", "")
+            base = op[:-len("IfExists")] if op.endswith("IfExists") else op
             if op.endswith("IfExists") and have is None:
                 continue
-            if base == "StringEquals" or base == "ArnEquals" or base == "ForAnyValue:StringEquals":
+            if have is None and base in POSITIVE_OPS:
+                if deny:
+                    continue  # unknown here: a deny counts as applying
+                return False
+            if base in ("StringEquals", "ArnEquals", "ForAnyValue:StringEquals"):
                 ok = any_(lambda h, w: h == w)
-            elif base == "StringNotEquals" or base == "ArnNotEquals":
+            elif base in ("StringEqualsIgnoreCase", "ForAnyValue:StringEqualsIgnoreCase"):
+                ok = any_(lambda h, w: h.lower() == w.lower())
+            elif base in ("StringNotEquals", "ArnNotEquals"):
                 ok = have is None or not any_(lambda h, w: h == w)
-            elif base in ("StringLike", "ArnLike"):
+            elif base in ("StringLike", "ArnLike", "ForAnyValue:StringLike"):
                 ok = any_(lambda h, w: _iam_glob(w, h))
             elif base in ("StringNotLike", "ArnNotLike"):
                 ok = have is None or not any_(lambda h, w: _iam_glob(w, h))
-            elif base == "ForAnyValue:StringEqualsIgnoreCase":
-                ok = any_(lambda h, w: h.lower() == w.lower())
             elif base == "ForAllValues:StringEquals":
                 ok = all(h in wants for h in haves)
             elif base == "ForAllValues:StringLike":
@@ -2416,7 +2436,7 @@ def _condition_holds(cond, ctx):
             elif base == "Bool":
                 ok = any_(lambda h, w: str(h).lower() == str(w).lower())
             else:
-                raise ValueError(f"the preflight can't evaluate the condition {op}")
+                raise ValueError(f"the preflight can't evaluate the condition operator {op}")
             if not ok:
                 return False
     return True
@@ -2433,7 +2453,7 @@ def _statement_matches(s, action, resource, ctx):
         hit = any(_iam_glob(r, resource) for r in _as_list(s["Resource"]))
     else:
         hit = not any(_iam_glob(r, resource) for r in _as_list(s.get("NotResource")))
-    return hit and _condition_holds(s.get("Condition"), ctx)
+    return hit and _condition_holds(s.get("Condition"), ctx, deny=s.get("Effect") == "Deny")
 
 
 def iam_decision(identity, boundary, action, resource, ctx=None):
@@ -2485,56 +2505,107 @@ ROLE_PROPERTY_CALLS = {
 }
 
 
-def iam_calls(rc, account, partition, install_boundary):
-    """[(action, resource ARN, context)] the IAM calls CloudFormation makes
-    for one resource change (IAM resources only: that is where an install's
-    denies are)."""
+def _role_names(v):
+    return [r for r in _as_list(v) if _known(r)]
+
+
+def _passed_roles(props, account):
+    """Role ARNs a resource hands to a service (its Role, RoleArn, ServiceRole, ExecutionRoleArn, ...): iam:PassRole."""
+    out = set()
+
+    def walk(v, key=""):
+        if isinstance(v, dict):
+            for k, x in v.items():
+                walk(x, k)
+        elif isinstance(v, list):
+            for x in v:
+                walk(x, key)
+        elif isinstance(v, str) and re.match(r"^arn:[\w-]+:iam::\d+:role/", v) and re.search(r"Role(Arn)?$", key or ""):
+            out.add(v)
+    walk(props)
+    return sorted(out)
+
+
+def iam_calls(rc, account, partition, install_boundary, prefix="coderhelm"):
+    """[(action, resource ARN, context)] the IAM calls CloudFormation makes for
+    one resource change: IAM resources (a replacement is a create and a
+    delete), managed policy attachments, inline policies, and iam:PassRole
+    for a role a resource hands to a service. A role or policy whose name
+    isn't known yet gets the name CloudFormation would make (the stack's
+    name, the logical id, a suffix), which is inside the install's names."""
     t, act = rc.get("ResourceType") or "", rc.get("Action") or ""
+    lid = rc.get("LogicalResourceId") or "x"
     phys = rc.get("PhysicalResourceId") or ""
     after = context(rc.get("AfterContext"))
     after = after.get("Properties", after) if isinstance(after, dict) else {}
     targets = {(d.get("Target") or {}).get("Name") for d in rc.get("Details") or []} - {None}
+    replaced = act == "Modify" and rc.get("Replacement") in ("True", "Conditional")
     iam_arn = f"arn:{partition}:iam::{account}"
+    generated = f"{prefix}-{lid}-GENERATED"
+    calls = []
+    if act in ("Add", "Modify"):
+        calls += [("iam:PassRole", r, {"iam:PassedToService": "cloudformation.amazonaws.com"}) for r in _passed_roles(after, account)]
     if t == "AWS::IAM::ManagedPolicy":
-        arn = phys if phys.startswith("arn:") else (f"{iam_arn}:policy/{after.get('ManagedPolicyName')}" if _known(after.get("ManagedPolicyName")) else "")
-        if not arn:
-            return []
-        acts = {"Add": ["iam:CreatePolicy"],
-                "Modify": ["iam:CreatePolicyVersion", "iam:DeletePolicyVersion", "iam:ListPolicyVersions"],
-                "Remove": ["iam:DeletePolicy", "iam:DeletePolicyVersion", "iam:ListPolicyVersions"]}.get(act, [])
-        return [(a, arn, {}) for a in acts]
+        name = after.get("ManagedPolicyName")
+        new = f"{iam_arn}:policy/{name if _known(name) else generated}"
+        old = phys if phys.startswith("arn:") else new
+        if act == "Add" or replaced:
+            calls.append(("iam:CreatePolicy", new, {}))
+        if replaced:
+            calls += [("iam:DeletePolicy", old, {}), ("iam:DeletePolicyVersion", old, {})]
+        elif act == "Modify":
+            calls += [(a, old, {}) for a in ("iam:CreatePolicyVersion", "iam:DeletePolicyVersion", "iam:ListPolicyVersions")]
+        elif act == "Remove":
+            calls += [(a, old, {}) for a in ("iam:DeletePolicy", "iam:DeletePolicyVersion", "iam:ListPolicyVersions")]
+        if act in ("Add", "Modify"):
+            ctx = {"iam:PolicyARN": new}
+            calls += [("iam:AttachRolePolicy", f"{iam_arn}:role/{r}", dict(ctx, **{"iam:PermissionsBoundary": install_boundary})) for r in _role_names(after.get("Roles"))]
+            calls += [("iam:DetachRolePolicy", f"{iam_arn}:role/{r}", dict(ctx, **{"iam:PermissionsBoundary": install_boundary})) for r in _role_names(after.get("Roles")) if act == "Modify"]
+            calls += [("iam:AttachUserPolicy", f"{iam_arn}:user/{u}", ctx) for u in _role_names(after.get("Users"))]
+            calls += [("iam:AttachGroupPolicy", f"{iam_arn}:group/{g}", ctx) for g in _role_names(after.get("Groups"))]
+        return calls
     if t == "AWS::IAM::Role":
-        name = phys if act != "Add" else after.get("RoleName")
-        if not _known(name):
-            return []
+        name = after.get("RoleName")
+        new_name = name if _known(name) else generated
+        old_name = phys or new_name
         pb = after.get("PermissionsBoundary")
         ctx = {"iam:PermissionsBoundary": pb if _known(pb) and pb.startswith("arn:") else install_boundary}
-        if act == "Add":
-            acts = ["iam:CreateRole"] + (["iam:PutRolePolicy"] if after.get("Policies") else [])
+        if act == "Add" or replaced:
+            acts = ["iam:CreateRole"] + (["iam:PutRolePolicy"] if after.get("Policies") else []) + (["iam:AttachRolePolicy"] if after.get("ManagedPolicyArns") else [])
+            calls += [(a, f"{iam_arn}:role/{new_name}", ctx) for a in acts]
+        if replaced or act == "Remove":
+            calls += [(a, f"{iam_arn}:role/{old_name}", ctx) for a in ("iam:DeleteRole", "iam:DeleteRolePolicy", "iam:DetachRolePolicy")]
         elif act == "Modify":
-            acts = sorted({a for k in targets for a in ROLE_PROPERTY_CALLS.get(k, [])})
+            acts = sorted({a for k in targets for a in ROLE_PROPERTY_CALLS.get(k, ["iam:UpdateRole"])})
+            calls += [(a, f"{iam_arn}:role/{old_name}", ctx) for a in acts]
+        return calls
+    if t in ("AWS::IAM::Policy", "AWS::IAM::RolePolicy"):
+        roles = _role_names(after.get("Roles")) + _role_names(after.get("RoleName"))
+        if act in ("Add", "Modify"):
+            calls += [("iam:PutRolePolicy", f"{iam_arn}:role/{r}", {"iam:PermissionsBoundary": install_boundary}) for r in roles]
+            if not roles:
+                calls.append(("iam:PutRolePolicy", f"{iam_arn}:role/{generated}", {"iam:PermissionsBoundary": install_boundary}))
         elif act == "Remove":
-            acts = ["iam:DeleteRole"]
-        else:
-            acts = []
-        return [(a, f"{iam_arn}:role/{name}", ctx) for a in acts]
-    if t == "AWS::IAM::Policy" and act in ("Add", "Modify"):
-        return [("iam:PutRolePolicy", f"{iam_arn}:role/{r}", {"iam:PermissionsBoundary": install_boundary})
-                for r in _as_list(after.get("Roles")) if _known(r)]
-    return []
+            calls += [("iam:DeleteRolePolicy", f"{iam_arn}:role/{r}", {"iam:PermissionsBoundary": install_boundary}) for r in roles]
+        return calls
+    return calls
+
+
+class Unchecked(Exception):
+    """The preflight couldn't check the change set: it holds the update."""
 
 
 def preflight(cfn, env, cs_id, stack, iam=None):
     """Each IAM call the change set (and its parts') needs that the deploy role
-    would be refused, in words; [] when it may make them all. None when the
-    role's policies couldn't be read (then nothing is held on it)."""
+    would be refused, in words; [] when it may make them all. When it can't
+    tell (the role's policies unreadable, a condition it can't evaluate), it
+    says so as a refused call: an update is never started unchecked."""
     if not env.get("DEPLOY_ROLE_ARN"):
         return []
     try:
         access = deploy_role_access(env, iam)
     except Exception as e:  # noqa: BLE001
-        logger.warning(f"preflight: the deploy role's policies couldn't be read: {e}")
-        return None
+        return [f"couldn't check: the deploy role's policies couldn't be read ({type(e).__name__}: {str(e)[:160]})"]
     account, partition = stack_account(stack), stack_partition(stack)
     prefix = env.get("RESOURCE_PREFIX") or env["NATIVE_STACK"]
     install_boundary = f"arn:{partition}:iam::{account}:policy/{prefix}-boundary-stack"
@@ -2543,9 +2614,13 @@ def preflight(cfn, env, cs_id, stack, iam=None):
     def walk(cid, part, stack_name):
         for ch in change_set_pages(cfn, cid, stack_name):
             rc = ch.get("ResourceChange") or {}
-            for action, arn, ctx in iam_calls(rc, account, partition, install_boundary):
-                verdict, sid = iam_decision(access["identity"], access["boundary"], action, arn,
-                                            dict(ctx, **{"aws:PrincipalArn": access["role_arn"]}))
+            for action, arn, ctx in iam_calls(rc, account, partition, install_boundary, prefix):
+                try:
+                    verdict, sid = iam_decision(access["identity"], access["boundary"], action, arn,
+                                                dict(ctx, **{"aws:PrincipalArn": access["role_arn"]}))
+                except ValueError as e:
+                    out.append(f"{part}.{rc.get('LogicalResourceId')}: {action} on {arn} (couldn't check: {e})")
+                    continue
                 if verdict != "allowed":
                     why = f"denied by {sid}" if verdict == "explicitDeny" else f"not allowed by {sid or 'its boundary'}"
                     out.append(f"{part}.{rc.get('LogicalResourceId')}: {action} on {arn} ({why})")
@@ -2555,9 +2630,8 @@ def preflight(cfn, env, cs_id, stack, iam=None):
                 walk(nested, rc.get("LogicalResourceId"), None)
     try:
         walk(cs_id, "parent", env["NATIVE_STACK"])
-    except ValueError as e:
-        logger.warning(f"preflight not evaluated: {e}")
-        return None
+    except Exception as e:  # noqa: BLE001
+        out.append(f"couldn't check: the change set couldn't be read in full ({type(e).__name__}: {str(e)[:160]})")
     return out
 
 
@@ -2766,39 +2840,78 @@ RECOVERY_TRIES = 3
 
 
 def rollback_failures(cfn, stack_name):
-    """The resources whose rollback failed in the stack's last rollback: [(id, type, reason)]."""
-    events = cfn.describe_stack_events(StackName=stack_name).get("StackEvents") or []
-    out, seen = [], set()
-    for e in events:  # newest first
-        if e.get("LogicalResourceId") == stack_name and e.get("ResourceStatus") == "UPDATE_ROLLBACK_IN_PROGRESS":
-            break
-        lid = e.get("LogicalResourceId")
-        if str(e.get("ResourceStatus", "")).endswith("_FAILED") and lid != stack_name and lid not in seen:
-            seen.add(lid)
-            out.append((lid, e.get("ResourceType") or "", e.get("ResourceStatusReason") or ""))
+    """The resources whose rollback failed in the stack's last rollback: [(id, type, reason)], every page read."""
+    out, seen, token = [], set(), None
+    while True:
+        kw = {"StackName": stack_name}
+        if token:
+            kw["NextToken"] = token
+        page = cfn.describe_stack_events(**kw)
+        for e in page.get("StackEvents") or []:  # newest first
+            if e.get("LogicalResourceId") == stack_name and e.get("ResourceStatus") == "UPDATE_ROLLBACK_IN_PROGRESS":
+                return out
+            lid = e.get("LogicalResourceId")
+            if str(e.get("ResourceStatus", "")).endswith("_FAILED") and lid != stack_name and lid not in seen:
+                seen.add(lid)
+                out.append((lid, e.get("ResourceType") or "", e.get("ResourceStatusReason") or ""))
+        token = page.get("NextToken")
+        if not token:
+            return out
+
+
+def _resource_values(old, values, conds):
+    """Ref to a managed policy of the template resolves to its ARN (by its name)."""
+    out = dict(values)
+    for lid, r in (old.get("Resources") or {}).items():
+        if r.get("Type") == "AWS::IAM::ManagedPolicy" and "ManagedPolicyName" in (r.get("Properties") or {}):
+            try:
+                out[lid] = f"arn:{values['AWS::Partition']}:iam::{values['AWS::AccountId']}:policy/{cfn_resolve(r['Properties']['ManagedPolicyName'], values, conds)}"
+            except ValueError:
+                pass
     return out
+
+
+def _tags(v):
+    return sorted((t.get("Key"), t.get("Value")) for t in v or [])
 
 
 def unchanged_by_rollback(lid, rtype, old, values, iam):
     """'' when the resource is exactly as the rollback would leave it (so it
-    may be skipped), else why not."""
+    may be skipped), else why not. A managed policy: its default document. A
+    role: its trust policy, boundary, tags, managed policies, and the names
+    and documents of its inline policies. Anything else is never skipped."""
     r = ((old.get("Resources") or {}).get(lid)) or {}
     if not r:
         return "the release it rolls back to doesn't have it"
     props = r.get("Properties") or {}
     conds = old.get("Conditions") or {}
+    vals = _resource_values(old, values, conds)
     try:
         if rtype == "AWS::IAM::ManagedPolicy":
-            arn = f"arn:{values['AWS::Partition']}:iam::{values['AWS::AccountId']}:policy/{cfn_resolve(props['ManagedPolicyName'], values, conds)}"
-            if same_policy(managed_policy_doc(iam, arn), cfn_resolve(props["PolicyDocument"], values, conds)):
+            arn = f"arn:{values['AWS::Partition']}:iam::{values['AWS::AccountId']}:policy/{cfn_resolve(props['ManagedPolicyName'], vals, conds)}"
+            if same_policy(managed_policy_doc(iam, arn), cfn_resolve(props["PolicyDocument"], vals, conds)):
                 return ""
             return "its policy differs from the release it rolls back to"
         if rtype == "AWS::IAM::Role":
-            name = cfn_resolve(props["RoleName"], values, conds)
-            for p in props.get("Policies") or []:
-                have = policy_doc(iam.get_role_policy(RoleName=name, PolicyName=cfn_resolve(p["PolicyName"], values, conds))["PolicyDocument"])
-                if not same_policy(have, cfn_resolve(p["PolicyDocument"], values, conds)):
-                    return f"its policy {p['PolicyName']} differs from the release it rolls back to"
+            p = cfn_resolve(props, vals, conds)
+            name = p["RoleName"]
+            role = iam.get_role(RoleName=name)["Role"]
+            if not same_policy(role.get("AssumeRolePolicyDocument"), p.get("AssumeRolePolicyDocument")):
+                return "its trust policy differs from the release it rolls back to"
+            if ((role.get("PermissionsBoundary") or {}).get("PermissionsBoundaryArn") or "") != (p.get("PermissionsBoundary") or ""):
+                return "its permissions boundary differs from the release it rolls back to"
+            if _tags(role.get("Tags")) != _tags(p.get("Tags")):
+                return "its tags differ from the release it rolls back to"
+            attached = sorted(a["PolicyArn"] for a in iam.list_attached_role_policies(RoleName=name).get("AttachedPolicies") or [])
+            if attached != sorted(p.get("ManagedPolicyArns") or []):
+                return "its managed policies differ from the release it rolls back to"
+            inline = sorted(iam.list_role_policies(RoleName=name).get("PolicyNames") or [])
+            if inline != sorted(x["PolicyName"] for x in p.get("Policies") or []):
+                return "its inline policies differ from the release it rolls back to"
+            for x in p.get("Policies") or []:
+                have = policy_doc(iam.get_role_policy(RoleName=name, PolicyName=x["PolicyName"])["PolicyDocument"])
+                if not same_policy(have, x["PolicyDocument"]):
+                    return f"its policy {x['PolicyName']} differs from the release it rolls back to"
             return ""
     except Exception as e:  # noqa: BLE001
         return f"it couldn't be checked ({type(e).__name__}: {str(e)[:120]})"
@@ -2806,11 +2919,22 @@ def unchanged_by_rollback(lid, rtype, old, values, iam):
 
 
 def rollback_target(store, env):
-    """The release a failed rollback goes back to: the last update's from_version, else the running one."""
+    """(release, the install's own access resources as that update found them) a
+    failed rollback goes back to: the last executed update's from_version, else
+    the running one. A held update kept the install's own deploy role and
+    boundaries, so those are what the rollback restores, not the release's."""
     for h in store.history(10):
         if h.get("executed_at") and parse_version(h.get("from_version") or ""):
-            return h["from_version"]
-    return env.get("CODERHELM_VERSION") or ""
+            return h["from_version"], h.get("deployed_access") or {}
+    return env.get("CODERHELM_VERSION") or "", {}
+
+
+def _stuck_notice(store, env, now, stack, rec):
+    notify_once(store, f"stuck:{stack.get('LastUpdatedTime') or now.date().isoformat()}", now,
+                "your CoderHelm install's last update couldn't be rolled back",
+                "AWS stopped while putting the previous release back, and CoderHelm couldn't safely finish it by itself: "
+                f"{rec['reason']}. CoderHelm keeps running. Settings, System says what stopped it:\n{app_url(env)}/settings/system/#version",
+                env, what="stuck", version=rec.get("target"), facts={"reason": rec["reason"], "action": rec.get("link")})
 
 
 def recover_stuck(store, env, now, cfn=None, iam=None, opener=None):
@@ -2823,27 +2947,32 @@ def recover_stuck(store, env, now, cfn=None, iam=None, opener=None):
     state = store.get("UPDATE_STATE", {})
     rec = state.get("recovery") or {}
     if st != STUCK:
-        if rec.get("status") == "continuing" and not st.endswith("_IN_PROGRESS"):
+        if rec.get("status") in ("continuing", "retrying") and not st.endswith("_IN_PROGRESS"):
             rec.update({"status": "recovered" if st == "UPDATE_ROLLBACK_COMPLETE" else "failed", "finished_at": now.isoformat(),
                         "stack_status": st})
             state["recovery"] = rec
             store.put("UPDATE_STATE", state)
         return None
-    tries = int(rec.get("tries") or 0) if rec.get("status") in ("continuing", "stuck") else 0
+    tries = int(rec.get("tries") or 0) if rec.get("status") in ("continuing", "retrying", "stuck") else 0
     failed = rollback_failures(cfn, root)
-    target = rollback_target(store, env)
+    target, kept = rollback_target(store, env)
     why = {}
     if tries >= RECOVERY_TRIES:
-        why = {"": f"continuing the rollback didn't finish after {tries} tries"}
+        why = {"": f"continuing the rollback didn't finish after {tries} tries" + (f" (last: {rec.get('error')})" if rec.get("error") else "")}
     elif not failed:
         why = {"": "AWS doesn't say which resource stopped the rollback"}
     else:
         try:
-            body = fetch_template(native_template_url(env, target), opener)
             want = (store.get(f"MANIFEST#{target}") or {}).get("template_sha256")
-            if want and hashlib.sha256(body).hexdigest() != want:
+            if not want:
+                raise ValueError(f"{target}'s template isn't verified on this install, so it can't be compared")
+            body = fetch_template(native_template_url(env, target), opener)
+            if hashlib.sha256(body).hexdigest() != want:
                 raise ValueError("it doesn't match its signed checksum")
             old = json.loads(body)
+            for k, v in kept.items():
+                if k in HELD and k in (old.get("Resources") or {}):
+                    old["Resources"][k] = v
             values = cfn_values(stack, env)
             iam = iam or client("iam")
             for lid, rtype, _ in failed:
@@ -2859,17 +2988,25 @@ def recover_stuck(store, env, now, cfn=None, iam=None, opener=None):
                "reason": "; ".join(f"{k}: {v}" if k else v for k, v in why.items())[:600], "link": link}
         state["recovery"] = rec
         store.put("UPDATE_STATE", state)
-        notify_once(store, f"stuck:{stack.get('LastUpdatedTime') or now.date().isoformat()}", now,
-                    "your CoderHelm install's last update couldn't be rolled back",
-                    "AWS stopped while putting the previous release back, and CoderHelm couldn't safely finish it by itself: "
-                    f"{rec['reason']}. CoderHelm keeps running. Settings, System says what stopped it:\n{app_url(env)}/settings/system/#version",
-                    env, what="stuck", version=target, facts={"reason": rec["reason"], "action": link})
+        _stuck_notice(store, env, now, stack, rec)
         return rec
     skip = [f[0] for f in failed]
     kw = {"StackName": root, "ResourcesToSkip": skip}
     if env.get("DEPLOY_ROLE_ARN"):
         kw["RoleARN"] = env["DEPLOY_ROLE_ARN"]
-    cfn.continue_update_rollback(**kw)
+    try:
+        cfn.continue_update_rollback(**kw)
+    except Exception as e:  # noqa: BLE001  recorded and counted, never swallowed
+        err = f"{type(e).__name__}: {str(e)[:200]}"
+        rec = {"status": "retrying", "at": now.isoformat(), "failed": skip, "target": target, "tries": tries + 1, "error": err, "link": link,
+               "reason": f"AWS refused to continue the rollback ({err}); CoderHelm tries again in 5 minutes"}
+        if tries + 1 >= RECOVERY_TRIES:
+            rec.update({"status": "stuck", "reason": f"AWS refused to continue the rollback {tries + 1} times ({err})"})
+            _stuck_notice(store, env, now, stack, rec)
+        state["recovery"] = rec
+        store.put("UPDATE_STATE", state)
+        logger.warning(f"continue rollback refused: {err}")
+        return rec
     rec = {"status": "continuing", "at": now.isoformat(), "skipped": skip, "target": target, "tries": tries + 1,
            "reason": f"AWS stopped while putting {target} back; CoderHelm continued the rollback, skipping "
                      f"{', '.join(skip)}, each checked to be exactly as {target} has it"}
@@ -3352,6 +3489,9 @@ def never_runs(entry):
     found it would be refused, fails, and then its rollback fails too."""
     if not (entry.get("role_arn") or (entry.get("role_arn") is None and entry.get("apply"))):
         return ""
+    if "preflight" in entry and entry["preflight"] is None:
+        # Never unchecked: an older entry that couldn't be checked is checked as refused.
+        return f"{PREFLIGHT_MARK}: couldn't check them"
     calls = list(entry.get("preflight") or [])
     if entry.get("admin_changes") and not calls:
         calls = [f"parent.{c}" for c in entry["admin_changes"]]

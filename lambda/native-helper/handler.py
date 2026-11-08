@@ -54,8 +54,11 @@ SHA256SUMS), and copies only the files that template lists, each checked.
 
 {"action": "stage_held", "version", "template_sha256", "keep"} from the
 updater: the same release's coderhelm.json with the install's own Boundary,
-DeployBoundary and DeployRole definitions ("keep", from the stack's current
-template) in place of the release's, written to releases/<version>/held/.
+DeployBoundary and DeployRole definitions in place of the release's, written
+to releases/<version>/held/. The helper reads those definitions itself from
+the root stack's current template (cloudformation:GetTemplate): what the
+updater sends as "keep" must be exactly that, or nothing is written, so a
+caller can never put a role or a boundary of its own into the template.
 An update runs as the deploy role, which may never change those three, so
 the rest of the release installs while a newer boundary waits for an AWS
 admin (the access stack). Nothing else of the verified template changes.
@@ -367,9 +370,38 @@ def held_template(release, keep):
     return out
 
 
-def stage_held(event, bucket, s3=None, opener=None):
-    """The release's coderhelm.json, verified, with the install's own access
-    resources kept, written to releases/<version>/held/coderhelm.json."""
+def keep_for(release, deployed):
+    """The root stack's own definitions of HELD_RESOURCES that differ from the
+    release's (lambda/updater/handler.py has the same function)."""
+    rr = (release or {}).get("Resources") or {}
+    dr = (deployed or {}).get("Resources") or {}
+    keep = {}
+    for k in HELD_RESOURCES:
+        mine, theirs = dr.get(k), rr.get(k)
+        if not isinstance(mine, dict) or not isinstance(theirs, dict) or mine == theirs:
+            continue
+        if mine.get("Type") != theirs.get("Type") or "Condition" in mine:
+            continue
+        keep[k] = mine
+    return keep
+
+
+def deployed_template(stack, cfn=None):
+    """The root stack's current template, as CloudFormation stored it."""
+    if not stack:
+        raise ValueError("the helper doesn't know its root stack")
+    body = (cfn or client("cloudformation")).get_template(StackName=stack, TemplateStage="Original").get("TemplateBody")
+    if isinstance(body, str):
+        body = json.loads(body)
+    if not isinstance(body, dict) or not body.get("Resources"):
+        raise ValueError("the root stack's template couldn't be read")
+    return body
+
+
+def stage_held(event, bucket, s3=None, opener=None, cfn=None, stack=None):
+    """The release's coderhelm.json, verified, with the root stack's own
+    access resources kept, written to releases/<version>/held/coderhelm.json.
+    The kept definitions come from the root stack itself, never the caller."""
     version = str(event.get("version") or "")
     want = str(event.get("template_sha256") or "").lower()
     if not VERSION_RE.match(version):
@@ -384,7 +416,13 @@ def stage_held(event, bucket, s3=None, opener=None):
             release = json.load(fh)
     finally:
         os.unlink(path)
-    held = held_template(release, event.get("keep") or {})
+    keep = keep_for(release, deployed_template(stack if stack is not None else os.environ.get("ROOT_STACK", ""), cfn))
+    asked = event.get("keep")
+    if asked is not None and canonical_sha(asked) != canonical_sha(keep):
+        raise ValueError("the definitions to keep aren't the root stack's own: refused")
+    if not keep:
+        raise ValueError("this release doesn't change the install's deploy role or boundaries: nothing to keep")
+    held = held_template(release, keep)
     body = json.dumps(held, sort_keys=True, separators=(",", ":")).encode()
     sha = hashlib.sha256(body).hexdigest()
     key = f"releases/{version}/held/{RELEASE_FILE}"

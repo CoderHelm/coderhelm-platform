@@ -212,6 +212,9 @@ export function installValue(name: string): Json {
 /** The admin's "delete everything when uninstalled" switch: the updater writes it, the helper reads it on delete. */
 export const UNINSTALL_SWITCH = "/coderhelm-${Stage}/uninstall/delete-data";
 
+/** The helper's one read of the root stack's template (stage_held). */
+export const ROOT_TEMPLATE_SID = "RootStackTemplate";
+
 export function helperPolicy(): PolicyDocument {
   const p = "coderhelm-${Stage}";
   const at = (svc: string) => `arn:\${AWS::Partition}:${svc}:\${AWS::Region}:\${AWS::AccountId}`;
@@ -229,6 +232,8 @@ export function helperPolicy(): PolicyDocument {
       { Sid: "TableKey", Effect: "Allow", Action: ["kms:Encrypt", "kms:Decrypt", "kms:GenerateDataKey*", "kms:DescribeKey"], Resource: "*", Condition: { StringEquals: { [`aws:ResourceTag/${INSTALL_TAG}`]: p } } },
       { Sid: "Domain", Effect: "Allow", Action: "lambda:InvokeFunction", Resource: `${at("lambda")}:function:${p}-updater` },
       { Sid: "RootStack", Effect: "Allow", Action: ["cloudformation:DescribeStacks", "cloudformation:DescribeStackEvents"], Resource: "arn:${AWS::Partition}:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/${AWS::StackName}/*" },
+      // stage_held: the root stack's own deploy role and boundaries, read from its current template (read-only, that stack only).
+      { Sid: ROOT_TEMPLATE_SID, Effect: "Allow", Action: "cloudformation:GetTemplate", Resource: "arn:${AWS::Partition}:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/${AWS::StackName}/*" },
       { Sid: "LogGroupsOnDelete", Effect: "Allow", Action: ["logs:DescribeLogGroups"], Resource: "*" },
       // Only log groups tagged for this install (every one the stack declares is).
       { Sid: "InstallLogGroupsOnDelete", Effect: "Allow", Action: ["logs:DeleteLogGroup", "logs:ListTagsForResource"], Resource: [`${at("logs")}:log-group:/aws/lambda/${p}-*`, `${at("logs")}:log-group:/aws/codebuild/${p}-*`] },
@@ -385,8 +390,9 @@ export function buildParent(input: ParentInput): Json {
       Role: { "Fn::GetAtt": ["HelperRole", "Arn"] },
       LoggingConfig: { LogGroup: { Ref: "HelperLogs" } },
       Code: { ZipFile: input.helperCode },
-      // stage: the only bucket it copies a release's child templates to.
-      Environment: { Variables: { ASSETS_BUCKET: { Ref: "AssetsBucket" } } },
+      // stage: the only bucket it copies a release's child templates to. stage_held:
+      // the stack whose own deploy role and boundaries it keeps (read, never taken from the caller).
+      Environment: { Variables: { ASSETS_BUCKET: { Ref: "AssetsBucket" }, ROOT_STACK: { Ref: "AWS::StackName" } } },
       Tags: [{ Key: INSTALL_TAG, Value: sub("coderhelm-${Stage}") }],
     },
   };

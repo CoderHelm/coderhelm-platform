@@ -110,9 +110,10 @@ class Stack(base.FakeCfn):
 class HeldLambda(base.FakeLambda):
     """The install helper: "stage" as before, "stage_held" through the helper's own code."""
 
-    def __init__(self, release_body):
+    def __init__(self, release_body, cfn):
         super().__init__()
         self.release_body = release_body
+        self.cfn = cfn
         self.put = []
 
     def invoke(self, FunctionName, InvocationType, Payload):
@@ -132,7 +133,10 @@ class HeldLambda(base.FakeLambda):
 
         def opener(req, timeout=0):
             return io.BytesIO(body)
-        r = helper.stage_held(ev, "coderhelm-prod-release-1", s3=S3(), opener=opener)
+        try:
+            r = helper.stage_held(ev, "coderhelm-prod-release-1", s3=S3(), opener=opener, cfn=self.cfn, stack="coderhelm-prod")
+        except ValueError as e:
+            r = {"ok": False, "error": str(e)}
         return {"Payload": io.BytesIO(json.dumps(r).encode())}
 
 
@@ -156,7 +160,7 @@ class Base(unittest.TestCase):
         body = json.dumps(t).encode()
         self.store.put("MANIFEST#v1.1.0", {"verified": True, "manifest": None, "template_sha256": hashlib.sha256(body).hexdigest()})
         u.fetch_template = lambda url, opener=None: body
-        self.lam = HeldLambda(body)
+        self.lam = HeldLambda(body, self.cfn)
         u._clients["lambda"] = self.lam
         return body
 
@@ -276,6 +280,30 @@ class HeldAccess(Base):
             u.begin(self.store, self.env, base.NOW, "v1.1.0", "owner@example.org", "update")
         self.assertEqual(self.cfn.created, [])
 
+    def test_the_helper_never_takes_what_to_keep_from_its_caller(self):
+        """A compromised updater role asks the helper to keep a deploy role of its own
+        (another name, trusted by anyone, Allow *): the helper reads the stack's own and refuses."""
+        new = release_template(newer(PINNED["Boundary"]["Properties"]["PolicyDocument"]))
+        body = self.release(new)
+        self.cfn.deployed = release_template(PINNED["Boundary"]["Properties"]["PolicyDocument"])
+        evil = copy.deepcopy(PINNED["DeployRole"])
+        evil["Properties"]["RoleName"] = "coderhelm-prod-mine"
+        evil["Properties"]["AssumeRolePolicyDocument"]["Statement"][0]["Principal"] = {"AWS": "*"}
+        evil["Properties"]["Policies"] = [{"PolicyName": "all", "PolicyDocument": {"Version": "2012-10-17", "Statement": [{"Effect": "Allow", "Action": "*", "Resource": "*"}]}}]
+        for keep in ({"DeployRole": evil}, dict(u.keep_for(new, self.cfn.deployed), DeployRole=evil), {}):
+            out = self.lam.invoke(FunctionName="h", InvocationType="RequestResponse", Payload=json.dumps(
+                {"action": "stage_held", "version": "v1.1.0", "template_sha256": hashlib.sha256(body).hexdigest(), "keep": keep}).encode())
+            r = json.loads(out["Payload"].read())
+            self.assertFalse(r["ok"])
+            self.assertIn("aren't the root stack's own", r["error"])
+        self.assertEqual(self.lam.put, [], "nothing written")
+        # Without a "keep" it uses the stack's own: never the caller's.
+        out = self.lam.invoke(FunctionName="h", InvocationType="RequestResponse", Payload=json.dumps(
+            {"action": "stage_held", "version": "v1.1.0", "template_sha256": hashlib.sha256(body).hexdigest()}).encode())
+        written = json.loads(self.lam.put[0]["Body"])
+        self.assertEqual(written["Resources"]["DeployRole"], PINNED["DeployRole"])
+        self.assertEqual(written["Resources"]["Boundary"], self.cfn.deployed["Resources"]["Boundary"])
+
     def test_the_helper_keeps_only_the_three_and_only_of_the_same_type(self):
         t = release_template(PINNED["Boundary"]["Properties"]["PolicyDocument"])
         with self.assertRaisesRegex(ValueError, "not a resource an update keeps"):
@@ -368,7 +396,7 @@ class AccessItem(Base):
         self.assertEqual(len(self.urls), 1)
 
 
-class StuckRollback(Base):
+class StuckBase(Base):
     def setUp(self):
         super().setUp()
         self.cfn.stack_status = "UPDATE_ROLLBACK_FAILED"
@@ -385,6 +413,9 @@ class StuckRollback(Base):
         self.store.put("MANIFEST#v1.0.0", {"template_sha256": hashlib.sha256(self.old_body).hexdigest()})
         u.fetch_template = lambda url, opener=None: self.old_body
 
+
+
+class StuckRollback(StuckBase):
     def test_it_continues_the_rollback_skipping_only_what_it_checked_unchanged(self):
         r = u.native_poll(self.store, self.env, base.NOW)
         self.assertEqual(r["native"], "recovering")
@@ -428,6 +459,135 @@ class StuckRollback(Base):
         self.assertEqual(r["status"], "rolled_back")
         h = [x for x in self.store.history() if x.get("version") == "v1.1.0"][0]
         self.assertIn("AWS put everything back", h["summary"])
+
+
+class FailsClosed(Base):
+    """The preflight never lets an update start unchecked."""
+
+    def prepare(self, changes):
+        self.release(json.loads(base.TEMPLATE))
+        u.begin(self.store, self.env, base.NOW, "v1.1.0", "owner@example.org", "update", consent=True)
+        self.cfn.cs = {"Status": "CREATE_COMPLETE", "ExecutionStatus": "AVAILABLE", "Changes": changes}
+        return u.native_poll(self.store, self.env, base.NOW)
+
+    def technical(self):
+        return self.store.history()[0]["technical"]
+
+    def test_unreadable_policies_hold_it(self):
+        class Broken(base.FakeIam):
+            def get_role(self, RoleName):
+                raise Exception("AccessDenied: iam:GetRole")
+        u._clients["iam"] = Broken()
+        r = self.prepare([{"ResourceChange": {"Action": "Add", "LogicalResourceId": "Q", "ResourceType": "AWS::SQS::Queue"}}])
+        self.assertEqual(r["status"], "failed")
+        self.assertIn("couldn't check: the deploy role's policies couldn't be read", self.technical())
+        self.assertEqual(self.cfn.executed, [])
+
+    def test_an_unknown_condition_operator_holds_it(self):
+        weird = copy.deepcopy(OLD_DEPLOY)
+        weird["Statement"].append({"Sid": "Odd", "Effect": "Deny", "Action": "iam:*", "Resource": "*", "Condition": {"NumericLessThan": {"aws:MultiFactorAuthAge": "1"}}})
+        self.iam.deploy = weird
+        r = self.prepare([{"ResourceChange": {"Action": "Modify", "LogicalResourceId": "GatewayRole", "ResourceType": "AWS::IAM::Role",
+                                              "PhysicalResourceId": "coderhelm-prod-gateway", "Details": [{"Target": {"Name": "Tags"}}]}}])
+        self.assertEqual(r["status"], "failed")
+        self.assertIn("couldn't check: the preflight can't evaluate the condition operator NumericLessThan", self.technical())
+
+    def test_a_deny_on_a_key_it_doesnt_supply_counts_as_applying(self):
+        d = copy.deepcopy(OLD_DEPLOY)
+        d["Statement"].append({"Sid": "NoTagsHere", "Effect": "Deny", "Action": "iam:TagRole", "Resource": "*", "Condition": {"StringEquals": {"aws:RequestTag/x": "y"}}})
+        self.iam.deploy = d
+        r = self.prepare([{"ResourceChange": {"Action": "Modify", "LogicalResourceId": "GatewayRole", "ResourceType": "AWS::IAM::Role",
+                                              "PhysicalResourceId": "coderhelm-prod-gateway", "Details": [{"Target": {"Name": "Tags"}}]}}])
+        self.assertEqual(r["status"], "failed")
+        self.assertIn("iam:TagRole on arn:aws:iam::1:role/coderhelm-prod-gateway (denied by NoTagsHere)", self.technical())
+
+    def test_an_older_entry_that_couldnt_be_checked_is_never_run(self):
+        self.assertIn("couldn't check", u.never_runs({"role_arn": ROLE, "preflight": None}))
+
+    def test_replacements_attachments_inline_policies_passrole_and_unnamed_adds_are_checked(self):
+        arn = "arn:aws:iam::1"
+        calls = lambda rc: [(a, r) for a, r, _ in u.iam_calls(rc, "1", "aws", f"{arn}:policy/coderhelm-prod-boundary-stack", "coderhelm-prod")]
+        self.assertEqual(calls({"Action": "Modify", "Replacement": "True", "LogicalResourceId": "R", "ResourceType": "AWS::IAM::Role", "PhysicalResourceId": "coderhelm-prod-old",
+                                "AfterContext": json.dumps({"Properties": {"RoleName": "coderhelm-prod-new"}})})[:2],
+                         [("iam:CreateRole", f"{arn}:role/coderhelm-prod-new"), ("iam:DeleteRole", f"{arn}:role/coderhelm-prod-old")])
+        self.assertIn(("iam:DeletePolicy", f"{arn}:policy/coderhelm-prod-old"), calls({"Action": "Modify", "Replacement": "True", "LogicalResourceId": "P", "ResourceType": "AWS::IAM::ManagedPolicy",
+                       "PhysicalResourceId": f"{arn}:policy/coderhelm-prod-old", "AfterContext": json.dumps({"Properties": {"ManagedPolicyName": "coderhelm-prod-new"}})}))
+        self.assertIn(("iam:AttachRolePolicy", f"{arn}:role/coderhelm-prod-gateway"), calls({"Action": "Add", "LogicalResourceId": "P", "ResourceType": "AWS::IAM::ManagedPolicy",
+                       "AfterContext": json.dumps({"Properties": {"Roles": ["coderhelm-prod-gateway"]}})}))
+        self.assertEqual(calls({"Action": "Add", "LogicalResourceId": "P", "ResourceType": "AWS::IAM::RolePolicy", "AfterContext": json.dumps({"Properties": {"RoleName": "coderhelm-prod-x"}})}),
+                         [("iam:PutRolePolicy", f"{arn}:role/coderhelm-prod-x")])
+        self.assertIn(("iam:PassRole", f"{arn}:role/coderhelm-prod-fn"), calls({"Action": "Add", "LogicalResourceId": "F", "ResourceType": "AWS::Lambda::Function",
+                       "AfterContext": json.dumps({"Properties": {"Role": f"{arn}:role/coderhelm-prod-fn"}})}))
+        self.assertEqual(calls({"Action": "Add", "LogicalResourceId": "Anon", "ResourceType": "AWS::IAM::Role", "AfterContext": "{}"}), [("iam:CreateRole", f"{arn}:role/coderhelm-prod-Anon-GENERATED")])
+
+    def test_statement_order_is_not_a_change(self):
+        a = {"Version": "2012-10-17", "Statement": [{"Sid": "A", "Effect": "Allow", "Action": "s3:Get*", "Resource": "*"}, {"Sid": "B", "Effect": "Deny", "Action": ["iam:*"], "Resource": "*"}]}
+        b = {"Version": "2012-10-17", "Statement": list(reversed(a["Statement"]))}
+        self.assertTrue(u.same_policy(a, b))
+        self.assertTrue(writer.same(a, b))
+
+
+class RecoveryChecks(StuckBase):
+    def test_a_role_is_compared_whole(self):
+        old = release_template(PINNED["Boundary"]["Properties"]["PolicyDocument"])
+        values = dict(VALUES)
+
+        class Iam(base.FakeIam):
+            def __init__(s, trust):
+                super().__init__(deploy=OLD_DEPLOY, boundary=OLD_BOUNDARY, policies={DEPLOY_BOUNDARY_ARN: OLD_BOUNDARY})
+                s.trust = trust
+
+            def get_role(s, RoleName):
+                return {"Role": {"RoleName": RoleName, "AssumeRolePolicyDocument": s.trust,
+                                 "PermissionsBoundary": {"PermissionsBoundaryArn": DEPLOY_BOUNDARY_ARN},
+                                 "Tags": [{"Key": "coderhelm:install", "Value": "coderhelm-prod"}]}}
+        trust = resolved(PINNED["DeployRole"]["Properties"]["AssumeRolePolicyDocument"])
+        self.assertEqual(u.unchanged_by_rollback("DeployRole", "AWS::IAM::Role", old, values, Iam(trust)), "")
+        anyone = copy.deepcopy(trust)
+        anyone["Statement"][0]["Principal"] = {"AWS": "*"}
+        self.assertEqual(u.unchanged_by_rollback("DeployRole", "AWS::IAM::Role", old, values, Iam(anyone)),
+                         "its trust policy differs from the release it rolls back to")
+        self.assertIn("isn't one CoderHelm checks", u.unchanged_by_rollback("Api", "AWS::CloudFormation::Stack", old, values, Iam(trust)))
+
+    def test_an_unverified_target_is_never_compared(self):
+        self.store.put("MANIFEST#v1.0.0", {})
+        r = u.recover_stuck(self.store, self.env, base.NOW)
+        self.assertEqual(r["status"], "stuck")
+        self.assertIn("isn't verified on this install", r["reason"])
+        self.assertFalse(hasattr(self.cfn, "continued"))
+
+    def test_a_refused_continue_is_recorded_counted_and_told_at_the_last_try(self):
+        def refuse(**kw):
+            raise Exception("ValidationError: throttled")
+        self.cfn.continue_update_rollback = refuse
+        for n in (1, 2):
+            r = u.recover_stuck(self.store, self.env, base.NOW)
+            self.assertEqual((r["status"], r["tries"]), ("retrying", n))
+            self.assertIn("throttled", r["error"])
+        self.assertEqual(self.sent, [])
+        r = u.recover_stuck(self.store, self.env, base.NOW)
+        self.assertEqual((r["status"], r["tries"]), ("stuck", 3))
+        self.assertEqual(len(self.sent), 1)
+
+    def test_every_page_of_events_is_read(self):
+        events = self.cfn.events
+        pages = [events[:1], events[1:]]
+
+        def page(StackName, NextToken=None):
+            i = int(NextToken or 0)
+            return dict({"StackEvents": pages[i]}, **({"NextToken": "1"} if i == 0 else {}))
+        self.cfn.describe_stack_events = page
+        self.assertEqual([f[0] for f in u.rollback_failures(self.cfn, "coderhelm-prod")], ["DeployBoundary", "Boundary"])
+
+    def test_a_held_update_rolls_back_to_the_installs_own_boundaries(self):
+        # The install ran v1.0.0 with the newer boundary kept (held): that is what the rollback restores.
+        mine = release_template(newer(PINNED["Boundary"]["Properties"]["PolicyDocument"]))["Resources"]
+        self.iam.policies[BOUNDARY_ARN] = newer(OLD_BOUNDARY)
+        self.iam.policies[DEPLOY_BOUNDARY_ARN] = newer(OLD_BOUNDARY)
+        self.store.put("UPDATE#2026-10-31T11:00:00Z#a", {"version": "v1.1.0", "from_version": "v1.0.0", "executed_at": "2026-10-31T11:00:00Z",
+                                                       "deployed_access": {k: mine[k] for k in u.HELD}})
+        r = u.recover_stuck(self.store, self.env, base.NOW)
+        self.assertEqual(r["status"], "continuing")
 
 
 if __name__ == "__main__":

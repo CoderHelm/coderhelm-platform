@@ -56,10 +56,15 @@ def canonical(doc):
         return v
 
     out = walk(doc)
-    for st in out.get("Statement", []) if isinstance(out, dict) else []:
-        for op in (st.get("Condition") or {}).values():
-            for k, val in list(op.items()):
-                op[k] = sorted(val) if isinstance(val, list) else [val]
+    if isinstance(out, dict):
+        sts = out.get("Statement")
+        out["Statement"] = sts if isinstance(sts, list) else ([sts] if sts else [])
+        for st in out["Statement"]:
+            for op in (st.get("Condition") or {}).values():
+                for k, val in list(op.items()):
+                    op[k] = sorted(val) if isinstance(val, list) else [val]
+        # The order of statements doesn't matter either.
+        out["Statement"] = sorted(out["Statement"], key=lambda x: json.dumps(x, sort_keys=True))
     return json.dumps(out, sort_keys=True, separators=(",", ":"))
 
 

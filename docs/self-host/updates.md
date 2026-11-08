@@ -136,6 +136,15 @@ Some releases can do more once your install's permission limit (its boundary) or
 
 Updates never wait for this item, and it never waits for an update.
 
+### An install launched from v0.8.54-beta.20261108
+
+v0.8.54-beta.20261108 was the one release whose template carried a newer boundary. An install launched from it (not updated to it) has that boundary, and its updater is the one from before held updates. So the next release, which carries the earlier boundary, shows **vX needs an AWS admin** there once. Don't execute that change set: it runs as the deploy role and can't change the boundary. If someone already did and the stack reads `UPDATE_ROLLBACK_FAILED`, recover it once in the CloudFormation console:
+
+1. Open the stack `coderhelm-<name>`, then **Stack actions**, then **Continue update rollback**.
+2. Under **Resources to skip**, select **Boundary** and **DeployBoundary**. Neither was changed: the update was refused before it changed them. Choose **Continue update rollback**.
+
+The install is then back on v0.8.54-beta.20261108, working as before, and it stays on it: its updater can't keep its own boundary in a newer release, and the deploy role can't change it. Moving such an install on takes one step by an AWS admin, which CoderHelm doesn't automate yet. No other install is affected: every install launched from any other release updates as usual.
+
 ## A rollback that stopped
 
 If AWS stops while it puts the previous release back (the stack reads `UPDATE_ROLLBACK_FAILED`), no update can run until the rollback finishes. CoderHelm finishes it by itself: for each resource AWS couldn't put back, it checks that the resource is already exactly as the previous release has it (a policy's document, as IAM has it now), and continues the rollback skipping only those. **Settings, then System** shows it, and the update's history entry ends as rolled back. If a resource isn't as the previous release has it, CoderHelm skips nothing, emails admins once and shows what differs.
