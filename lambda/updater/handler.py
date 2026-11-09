@@ -2759,6 +2759,22 @@ def access_link(region, stack_name, template_url, params):
             + urlencode(q, quote_via=quote, safe=""))
 
 
+def access_stack_origin(cfn, st):
+    """Who made the stack named <install>-access: a release's access.json (its
+    template says kind "access"; deleting it changes nothing, so it may be
+    deleted to make room for the newer one), or something else of that name,
+    like the boundary stack of an install hardened from the CLI, which must
+    never be deleted. Unreadable counts as something else."""
+    try:
+        meta = (deployed_template(cfn, st.get("StackId") or st.get("StackName")).get("Metadata") or {}).get("CoderHelm") or {}
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"access stack template not read: {e}")
+        meta = {}
+    if meta.get("kind") == "access":
+        return {"kind": "access", "version": meta.get("version") or None}
+    return {"kind": "other", "version": None}
+
+
 def access_compute(env, cfn=None, iam=None, opener=None):
     """The install's access against what its release's access.json gives: the
     pending permission change, if any, and the one link that applies it."""
@@ -2797,6 +2813,7 @@ def access_compute(env, cfn=None, iam=None, opener=None):
     try:
         st = cfn.describe_stacks(StackName=f"{root}-access")["Stacks"][0]
         existing = {"status": st.get("StackStatus"), "link": f"https://{env.get('AWS_REGION')}.console.aws.amazon.com/cloudformation/home?region={env.get('AWS_REGION')}#/stacks/stackinfo?stackId={st.get('StackId')}"}
+        existing.update(access_stack_origin(cfn, st))
     except Exception as e:  # noqa: BLE001
         if "does not exist" not in str(e):
             raise
