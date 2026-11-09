@@ -648,7 +648,10 @@ pub async fn sources(
     for b in bases
         .map_err(|e| internal("knowledge bases", e))?
         .into_iter()
-        .filter(|b| b.readable_by(super::knowledge::reader_role(&claims.holder())))
+        .filter(|b| {
+            b.readable_by(super::knowledge::reader_role(&claims.holder()))
+                && b.open_to(&super::knowledge::person(&claims))
+        })
     {
         let files = st.files(&claims.team_id, &b.id).await.unwrap_or_default();
         let ready = files.iter().filter(|f| f.ready_version > 0).count();
@@ -908,10 +911,11 @@ pub async fn starters(
         recent_runs(&state, &claims.team_id),
     );
     let role = super::knowledge::reader_role(&claims.holder());
+    let me = super::knowledge::person(&claims);
     let mut readable: Vec<_> = bases
         .map_err(|e| internal("knowledge bases", e))?
         .into_iter()
-        .filter(|b| b.readable_by(role))
+        .filter(|b| b.readable_by(role) && b.open_to(&me))
         .collect();
     readable.sort_by(|a, b| a.name.cmp(&b.name));
     // Bases with something to read come first; at most a few are checked.
@@ -1483,10 +1487,11 @@ async fn run_tool(
                 meter: &meter,
             };
             let st = super::knowledge::store(state);
+            let servers = super::knowledge::servers(state, &run.team_id);
             match search(
                 &st,
                 &titan,
-                &super::knowledge::retriever(state, "brain"),
+                &super::knowledge::retriever(state, "brain", &servers, Some(&run.user_email)),
                 &run.team_id,
                 &run.kb_ids,
                 q,
@@ -1940,6 +1945,7 @@ pub async fn brain_stream(
         ));
     }
     let reader = super::knowledge::reader_role(&holder);
+    let me = super::knowledge::person(&claims);
     claims.role = holder.floor().to_string();
     let question = body.question.trim().to_string();
     if question.is_empty() || question.chars().count() > MAX_QUESTION_CHARS {
@@ -1989,7 +1995,7 @@ pub async fn brain_stream(
         .await
         .unwrap_or_default()
         .into_iter()
-        .filter(|b| b.readable_by(reader))
+        .filter(|b| b.readable_by(reader) && b.open_to(&me))
         .map(|b| b.id)
         .collect();
     let all_repos = load_repos(&state, &claims.team_id).await;
@@ -2259,10 +2265,11 @@ async fn answer(
             meter: &meter,
         };
         let st = super::knowledge::store(state);
+        let servers = super::knowledge::servers(state, &run.team_id);
         match search(
             &st,
             &titan,
-            &super::knowledge::retriever(state, "brain"),
+            &super::knowledge::retriever(state, "brain", &servers, Some(&run.user_email)),
             &run.team_id,
             &run.kb_ids,
             &retrieval_query(question, history),

@@ -1,6 +1,6 @@
 ---
 title: Knowledge sources
-description: Sanity connects by signing in on every install with nothing to set up; the OAuth apps and webhook settings here give Notion, Confluence and Google Drive one-click sign-in and instant updates.
+description: Sanity connects by signing in on every install with nothing to set up; the OAuth apps and webhook settings here give Notion, Confluence and Google Drive one-click sign-in and instant updates. Bedrock knowledge bases and MCP search tools connect in place; S3 buckets, Bedrock knowledge bases and export archives import.
 order: 14
 ---
 
@@ -165,9 +165,40 @@ Until an admin applies it, connecting a knowledge base in the install's own acco
 
 An install whose functions have no internet route needs interface VPC endpoints for `bedrock-agent-runtime` (search) and `bedrock-agent` (the list), in each region a connected knowledge base lives in. Without them the dialog says CoderHelm couldn't reach Bedrock.
 
-### Who sees what
+## Connecting a search tool through MCP
 
-Everyone who can read the CoderHelm knowledge base sees what the search returns, whatever their rights in the systems the Bedrock knowledge base was built from. Agents search the bases attached to them, so anyone who can start a run reaches everything the role can search in those bases. Connect only knowledge bases that everyone with that access may read.
+Any search tool your team already runs behind an MCP server can be connected in place too: Azure AI Search or Foundry IQ, Pinecone Assistant, Glean, Atlassian Rovo, Dropbox Dash, a Bedrock knowledge base behind an AgentCore gateway, or your own retrieval server. Add the server on **Settings**, **Connected apps** first, then open **Knowledge**, **New knowledge base**, **Search tool (MCP)** and pick it.
+
+- **The tools.** CoderHelm calls the server's search tool (`search`, `knowledge_base_retrieve`, `retrieve`, `get_context` and similar names are found by themselves, or pick one) and, for results without text, its fetch tool (`fetch` or similar). Nothing else is called, and a tool the server marks as destructive is never picked.
+- **Check on save.** One test search runs before anything is saved. When it fails, the dialog says why in one sentence (not signed in, no search tool, an answer it couldn't read, the server's own error, unreachable) and what to do.
+- **Who it searches as.** A server the team shares is searched with the team's connection. A server that signs each person in is searched with the asking person's own sign-in, so they only get what the tool lets them see; agent runs search it as the person who started them, and runs nobody started skip it.
+- **Nothing new in AWS.** It uses the Connected apps sign-in and tokens (sealed with your KMS key) and needs no permission change. If you restrict outbound traffic, allow the server's address.
+
+## Importing an existing knowledge base
+
+### From Amazon S3
+
+A bucket of documents (or a folder in one) becomes a source of a knowledge base: **Add source**, **Amazon S3**, pick the AWS account, type the bucket name, and pick folders or files. CoderHelm reads supported files (PDF, Word, Markdown, text, CSV, Excel, HTML), embeds them with Titan and keeps them in sync like any other source: an object whose ETag didn't change isn't read again, a changed one re-embeds only its changed passages, and a deleted one is removed. A `<file>.metadata.json` sidecar next to a document (the Bedrock data source format) gives it its title, original link and date.
+
+The bucket is always read with that account's `CoderHelmLogReader` role (connect the account on **Settings**, **Integrations**, **AWS**, including the install's own account), never with the install's own role. The role may read only the buckets named in its stack's `ImportBuckets` parameter: `s3:ListBucket`, `s3:GetBucketLocation` and `s3:GetObject` on them, and `kms:Decrypt` only through S3 for a bucket with its own KMS key. When the role can't read a bucket, the dialog offers the one-click update stack with the bucket named. The install's permissions boundary already allows S3 and KMS, so there is no admin step on the install itself.
+
+### From a Bedrock knowledge base
+
+**Import from a Bedrock knowledge base** reads the knowledge base's settings (`bedrock:GetKnowledgeBase`, `bedrock:ListDataSources`, `bedrock:GetDataSource`) and turns each S3 data source into an S3 source on its bucket and prefixes. Bedrock can't export its passages, so CoderHelm reads the original documents and indexes them itself; nothing in Bedrock changes. A Confluence or web data source points you at CoderHelm's own connector instead; SharePoint and Salesforce data sources can't be imported, so connect the knowledge base in place to search them. On a self-hosted install, a knowledge base in its own account is read with the install's own role (the boundary's `bedrock:Get*` and `bedrock:List*`, which arrive with the version update); one in another account with that account's role, whose `ReadKnowledgeBases` statement now includes these three actions.
+
+### From an export archive
+
+**Upload an archive** takes a `.zip` (up to 200 MB) of a Notion export (Markdown and CSV), a Confluence HTML export or a zipped docs folder, and unpacks it on the server. Every supported entry becomes a page of the base, titled without the export's ids. Uploading a newer export to the same archive keeps unchanged pages, re-reads changed ones and removes pages it no longer has. The archive is kept in the team's folder of the data bucket and goes with its source. Before the upload the dialog warns that every page becomes readable by everyone who can read the base, and that a Confluence Full Export includes restricted pages.
+
+### Limits
+
+An import keeps up to 2,500 documents per source (other sources keep 1,000). CoderHelm ranks its own bases in memory, so a bigger corpus is better connected in place; the page says so when an import is cut short. Each search reads up to 16 indexes at once and keeps recently used indexes in memory (up to 160 MB per process).
+
+## Who sees what
+
+Every knowledge base has a lowest read role, and can also be limited to named people and roles (**Only these people or roles**). A person only gets passages from bases they may read, in the brain chat and on the Knowledge page.
+
+Agents search the bases attached to them. A base limited to named people is searched only in runs one of them started; a search tool that signs each person in is searched as the person who started the run. Every other attached base is searched by every run, whatever the starter's rights in the systems the content came from, and the page says so when a base is attached. Connect and attach only content that everyone with that access may read.
 
 ## What runs
 

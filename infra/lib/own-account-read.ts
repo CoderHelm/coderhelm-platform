@@ -19,6 +19,12 @@
  * for the picker. Admins still choose which ones a team connects. Retrieve also
  * needs the permissions boundary to allow bedrock:Retrieve, which reaches an
  * install only through the access stack an AWS admin applies (native/access-stack.ts).
+ *
+ * Knowledge imports from S3 (services/common/src/knowledge/sources/s3.rs) never
+ * use the install's own role: the template's ImportBuckets is empty here, so
+ * the role gains no read on the account's buckets. An import reads a bucket
+ * with the team's CoderHelmLogReader role in that account, whose stack names
+ * every bucket an admin chose.
  */
 import * as cdk from "aws-cdk-lib";
 import * as iam from "aws-cdk-lib/aws-iam";
@@ -34,7 +40,7 @@ const ROLE_NAME_MARK = "__CODERHELM_ROLE__";
 /** The install's own role searches every knowledge base in its own account. */
 const OWN_KNOWLEDGE_BASES = "all";
 /** The template's conditions for that value. A condition not listed here fails the build. */
-const OWN_CONDITIONS: Record<string, boolean> = { ReadsKnowledgeBases: true, ReadsEveryKnowledgeBase: true };
+const OWN_CONDITIONS: Record<string, boolean> = { ReadsKnowledgeBases: true, ReadsEveryKnowledgeBase: true, ReadsImportBuckets: false };
 
 type Statement = { Sid?: string; Effect: string; Action: string | string[]; Resource: unknown };
 
@@ -61,7 +67,7 @@ export function decideConditions(v: unknown, conditions: Record<string, boolean>
 /** The update template's statements for the install's own role: its knowledge bases are every one in its account. */
 export function updateTemplateStatements(): Statement[] {
   const scratch = new cdk.Stack(new cdk.App(), "Scratch");
-  const inc = new CfnInclude(scratch, "T", { templateFile: repoPath(UPDATE_TEMPLATE), parameters: { RoleName: ROLE_NAME_MARK, KnowledgeBases: OWN_KNOWLEDGE_BASES } });
+  const inc = new CfnInclude(scratch, "T", { templateFile: repoPath(UPDATE_TEMPLATE), parameters: { RoleName: ROLE_NAME_MARK, KnowledgeBases: OWN_KNOWLEDGE_BASES, ImportBuckets: "" } });
   const p = inc.getResource(UPDATE_POLICY_ID) as iam.CfnPolicy;
   return decideConditions(scratch.resolve(p.policyDocument).Statement, OWN_CONDITIONS) as Statement[];
 }

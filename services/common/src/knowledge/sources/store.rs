@@ -379,6 +379,39 @@ impl SyncStore for AwsSyncStore {
     }
 }
 
+/// Every source of a team, across its bases (for the log reader update that
+/// names the buckets the team imports from).
+pub async fn team_sources(
+    dynamo: &aws_sdk_dynamodb::Client,
+    table: &str,
+    team: &str,
+) -> Result<Vec<Source>, String> {
+    let mut out = Vec::new();
+    let mut start: Option<HashMap<String, AttributeValue>> = None;
+    loop {
+        let resp = dynamo
+            .query()
+            .table_name(table)
+            .key_condition_expression("pk = :pk AND begins_with(sk, :p)")
+            .expression_attribute_values(":pk", AttributeValue::S(team.to_string()))
+            .expression_attribute_values(":p", AttributeValue::S("KBSRC#".into()))
+            .set_exclusive_start_key(start.take())
+            .send()
+            .await
+            .map_err(|e| format!("query sources: {e}"))?;
+        out.extend(
+            resp.items()
+                .iter()
+                .filter_map(super::super::read_data::<Source>),
+        );
+        match resp.last_evaluated_key() {
+            Some(k) if !k.is_empty() => start = Some(k.clone()),
+            _ => break,
+        }
+    }
+    Ok(out)
+}
+
 /// An in-memory store for tests here and in the services.
 pub mod memory {
     use std::sync::Mutex;

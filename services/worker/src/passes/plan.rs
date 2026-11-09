@@ -684,7 +684,13 @@ Then the ```fix_location.json block described above."#,
     }
 
     // Knowledge bases the team attached to the planner.
-    let knowledge = super::knowledge::KnowledgeTools::load(state, &msg.team_id, "planner").await;
+    let knowledge = super::knowledge::KnowledgeTools::load(
+        state,
+        &msg.team_id,
+        "planner",
+        super::requester_email(msg),
+    )
+    .await;
     if let Some(k) = &knowledge {
         tools.extend(k.tools());
         full_system.push_str(&k.prompt_section());

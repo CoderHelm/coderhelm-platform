@@ -138,10 +138,47 @@ pub const ABILITIES: &[Ability] = &[
             "bedrock:Retrieve",
             "bedrock:GetDocumentContent",
             "bedrock:ListKnowledgeBases",
+            "bedrock:GetKnowledgeBase",
+            "bedrock:ListDataSources",
+            "bedrock:GetDataSource",
+        ],
+        chosen: true,
+    },
+    Ability {
+        key: "imports",
+        name: "Knowledge imports from S3",
+        why: "Reads the documents in the S3 buckets a team imports into a knowledge base (a docs folder, or the data source behind a Bedrock knowledge base), and decrypts them through S3 when a bucket uses its own KMS key. Only the buckets named in the stack's ImportBuckets parameter. Nothing is changed.",
+        actions: &[
+            "s3:ListBucket",
+            "s3:GetBucketLocation",
+            "s3:GetObject",
+            "kms:Decrypt",
         ],
         chosen: true,
     },
 ];
+
+/// What a team chose for the role in one account: the knowledge bases it
+/// connects and the buckets it imports. The update stack grants exactly
+/// these.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Chosen<'a> {
+    pub knowledge_bases: &'a [String],
+    pub buckets: &'a [String],
+}
+
+impl<'a> Chosen<'a> {
+    pub fn new(knowledge_bases: &'a [String], buckets: &'a [String]) -> Chosen<'a> {
+        Chosen {
+            knowledge_bases,
+            buckets,
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.knowledge_bases.is_empty() && self.buckets.is_empty()
+    }
+}
 
 /// Every action of [`ABILITIES`], once each, in order.
 pub fn all_actions() -> Vec<&'static str> {
@@ -307,39 +344,56 @@ pub fn quick_create_url(
 
 /// The one-click update: a Launch Stack link that adds this release's
 /// update stack to the role, in `region` (IAM is global; the region only
-/// decides where the stack is listed). `knowledge_bases` are the ARNs of
-/// the team's knowledge bases connected in this account: the stack lets the
-/// role search them, and its name says which (a new set is a new stack, so
-/// it never collides with the one before it).
-pub fn update_url(update_template_url: &str, region: &str, knowledge_bases: &[String]) -> String {
+/// decides where the stack is listed). `chosen` are the team's knowledge
+/// bases connected in this account and the buckets it imports from: the
+/// stack lets the role search and read exactly those, and its name says
+/// which (a new set is a new stack, so it never collides with the one
+/// before it).
+pub fn update_url(update_template_url: &str, region: &str, chosen: &Chosen) -> String {
     let mut u = format!(
         "https://console.aws.amazon.com/cloudformation/home?region={region}#/stacks/quickcreate?stackName={}&templateURL={}&param_RoleName={ROLE_NAME}",
-        update_stack_name_for(knowledge_bases),
+        update_stack_name_for(chosen),
         urlencoding::encode(update_template_url)
     );
-    if !knowledge_bases.is_empty() {
+    if !chosen.knowledge_bases.is_empty() {
         u.push_str(&format!(
             "&param_KnowledgeBases={}",
-            urlencoding::encode(&knowledge_bases.join(","))
+            urlencoding::encode(&chosen.knowledge_bases.join(","))
+        ));
+    }
+    if !chosen.buckets.is_empty() {
+        u.push_str(&format!(
+            "&param_ImportBuckets={}",
+            urlencoding::encode(&chosen.buckets.join(","))
         ));
     }
     u
 }
 
-/// This release's update stack name for a set of knowledge bases: the
-/// release's own name when there are none.
-pub fn update_stack_name_for(knowledge_bases: &[String]) -> String {
-    if knowledge_bases.is_empty() {
+fn sorted(v: &[String]) -> Vec<&str> {
+    let mut out: Vec<&str> = v.iter().map(String::as_str).collect();
+    out.sort_unstable();
+    out.dedup();
+    out
+}
+
+/// This release's update stack name for what a team chose: the release's
+/// own name when it chose nothing.
+pub fn update_stack_name_for(chosen: &Chosen) -> String {
+    if chosen.is_empty() {
         return update_stack_name();
     }
     use sha2::{Digest, Sha256};
-    let mut kbs: Vec<&str> = knowledge_bases.iter().map(String::as_str).collect();
-    kbs.sort_unstable();
-    kbs.dedup();
+    let mut seed = sorted(chosen.knowledge_bases).join(",");
+    // Knowledge bases alone keep the name they had before imports existed.
+    if !chosen.buckets.is_empty() {
+        seed.push('|');
+        seed.push_str(&sorted(chosen.buckets).join(","));
+    }
     format!(
         "{}-kb{}",
         update_stack_name(),
-        hex::encode(&Sha256::digest(kbs.join(",").as_bytes())[..3])
+        hex::encode(&Sha256::digest(seed.as_bytes())[..3])
     )
 }
 
@@ -410,6 +464,12 @@ mod tests {
                 !template_actions(t).iter().any(|x| x.starts_with("bedrock:")
                     && !ability("knowledge").unwrap().actions.contains(&x.as_str()))
             );
+            // Imports: read objects only in the buckets named, decrypt only
+            // through S3.
+            assert!(t.contains("- Sid: ReadImportBuckets"));
+            assert!(t.contains("!Split [\",\", !Ref ImportBuckets]"));
+            assert!(t.contains("kms:ViaService"));
+            assert!(!t.contains("\"s3:*\""));
         }
         // Airflow's REST API only as the Viewer role.
         assert!(UPDATE_TEMPLATE.contains("arn:aws:airflow:*:*:role/*/Viewer"));
@@ -427,7 +487,7 @@ mod tests {
         let u = update_url(
             "https://b.s3.amazonaws.com/launch/v1.2.3/coderhelm-log-reader-update.yaml",
             "eu-west-1",
-            &[],
+            &Chosen::default(),
         );
         assert!(u.starts_with("https://console.aws.amazon.com/cloudformation/home?region=eu-west-1#/stacks/quickcreate?"));
         assert!(u.contains(&format!("stackName=CoderHelmLogReaderUpdate-{id}")));
@@ -482,15 +542,26 @@ mod tests {
 
     /// The reviewer's bucket and key lookups use exactly the settings
     /// ability's actions, all reads of settings: no object reads, no
-    /// encrypt or decrypt.
+    /// encrypt or decrypt. Object reads and decrypts exist only in the
+    /// knowledge import statements, on the buckets a team names.
     #[test]
     fn the_settings_ability_is_what_the_lookups_use() {
         let a = ability("settings").unwrap();
         assert_eq!(a.actions, crate::live::aws_settings::ACTIONS);
+        for x in ["s3:GetObject", "s3:ListBucket", "kms:Decrypt"] {
+            assert!(!a.actions.contains(&x), "{x}");
+            assert!(ability("imports").unwrap().actions.contains(&x), "{x}");
+        }
         for t in [ROLE_TEMPLATE, UPDATE_TEMPLATE] {
-            let all = template_actions(t);
+            // Everything but the import statements.
+            let start = t
+                .find("Sid: ReadImportBuckets")
+                .expect("the import statements");
+            let end = t.find("kms:ViaService").expect("decrypt only through S3");
+            let rest = format!("{}{}", &t[..start], &t[end..]);
+            let all = template_actions(&rest);
             for x in a.actions {
-                assert!(all.iter().any(|y| y == x), "{x}");
+                assert!(template_actions(t).iter().any(|y| y == x), "{x}");
             }
             for no in [
                 "s3:GetObject",
@@ -506,13 +577,15 @@ mod tests {
     #[test]
     fn knowledge_bases_ride_on_the_update_and_are_never_counted_missing() {
         let kb = "arn:aws:bedrock:us-east-1:111122223333:knowledge-base/ABCDE12345".to_string();
+        let kbs = std::slice::from_ref(&kb);
         let u = update_url(
             "https://b/x/coderhelm-log-reader-update.yaml",
             "us-east-1",
-            std::slice::from_ref(&kb),
+            &Chosen::new(kbs, &[]),
         );
         assert!(u.contains("&param_KnowledgeBases=arn%3Aaws%3Abedrock%3Aus-east-1%3A111122223333%3Aknowledge-base%2FABCDE12345"), "{u}");
-        let name = update_stack_name_for(std::slice::from_ref(&kb));
+        assert!(!u.contains("ImportBuckets"));
+        let name = update_stack_name_for(&Chosen::new(kbs, &[]));
         assert!(
             name.starts_with(&format!("{}-kb", update_stack_name())),
             "{name}"
@@ -521,18 +594,37 @@ mod tests {
         assert!(u.contains(&format!("stackName={name}")));
         // The same set in another order is the same stack; another set is another.
         let other = "arn:aws:bedrock:us-east-1:111122223333:knowledge-base/ZZZZZ00000".to_string();
+        let both = [kb.clone(), other.clone()];
+        let reversed = [other.clone(), kb.clone()];
         assert_eq!(
-            update_stack_name_for(&[kb.clone(), other.clone()]),
-            update_stack_name_for(&[other.clone(), kb.clone()])
+            update_stack_name_for(&Chosen::new(&both, &[])),
+            update_stack_name_for(&Chosen::new(&reversed, &[]))
         );
-        assert_ne!(update_stack_name_for(&[kb.clone(), other]), name);
-        assert_eq!(update_stack_name_for(&[]), update_stack_name());
-        assert!(!update_url("https://b/x/y.yaml", "us-east-1", &[]).contains("KnowledgeBases"));
-        // The live check asks about everything but the chosen knowledge bases.
+        assert_ne!(update_stack_name_for(&Chosen::new(&both, &[])), name);
+        assert_eq!(
+            update_stack_name_for(&Chosen::default()),
+            update_stack_name()
+        );
+        assert!(
+            !update_url("https://b/x/y.yaml", "us-east-1", &Chosen::default())
+                .contains("KnowledgeBases")
+        );
+        // Buckets ride along too, and make it another stack.
+        let buckets = ["team-docs".to_string()];
+        let u = update_url(
+            "https://b/x/y.yaml",
+            "us-east-1",
+            &Chosen::new(kbs, &buckets),
+        );
+        assert!(u.contains("&param_ImportBuckets=team-docs"), "{u}");
+        assert_ne!(update_stack_name_for(&Chosen::new(kbs, &buckets)), name);
+        assert!(update_stack_name_for(&Chosen::new(&[], &buckets)).len() <= 128);
+        // The live check asks about everything but what a team chose.
         let checked = checked_actions();
         assert!(!checked.contains(&"bedrock:Retrieve"));
+        assert!(!checked.contains(&"s3:GetObject"));
         assert!(checked.contains(&"logs:StartQuery"));
-        assert_eq!(checked.len() + 3, all_actions().len());
+        assert_eq!(checked.len() + 10, all_actions().len());
     }
 
     #[test]

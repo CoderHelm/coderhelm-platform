@@ -710,6 +710,22 @@ async fn main() -> Result<(), Error> {
         )
         .route("/knowledge/bedrock", get(routes::knowledge::bedrock_bases))
         .route(
+            "/knowledge/bedrock/import",
+            get(routes::knowledge::bedrock_import),
+        )
+        .route(
+            "/knowledge/search-tools",
+            get(routes::knowledge::search_tools),
+        )
+        .route(
+            "/knowledge/:kb_id/archives",
+            post(routes::knowledge::start_archive),
+        )
+        .route(
+            "/knowledge/:kb_id/archives/:source_id/uploaded",
+            post(routes::knowledge::finish_archive),
+        )
+        .route(
             "/knowledge/:kb_id",
             get(routes::knowledge::get_base)
                 .put(routes::knowledge::update_base)

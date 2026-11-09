@@ -48,15 +48,40 @@ fn forbidden(_: StatusCode) -> (StatusCode, Json<Value>) {
     fail(StatusCode::FORBIDDEN, "Only admins manage knowledge bases.")
 }
 
-/// Searches the team's connected Bedrock knowledge bases, as `actor` in the
-/// team's AWS records.
-pub(crate) fn retriever<'a>(state: &'a AppState, actor: &'a str) -> kb::remote::Bedrock<'a> {
-    kb::remote::Bedrock {
-        sts: &state.sts,
-        dynamo: &state.dynamo,
-        accounts_table: &state.config.aws_insights_table_name,
-        actor,
+/// The team's Connected apps servers, which connected search tools are
+/// searched through.
+pub(crate) fn servers(state: &AppState, team: &str) -> kb::remote_mcp::RuntimeServers {
+    kb::remote_mcp::RuntimeServers {
+        rt: super::mcp_servers::runtime(state, team),
     }
+}
+
+/// Searches the team's connected bases: Bedrock knowledge bases as `actor`
+/// in the team's AWS records, search tools through `servers` as `person`
+/// (the asker's email) where each person signs in.
+pub(crate) fn retriever<'a>(
+    state: &'a AppState,
+    actor: &'a str,
+    servers: &'a kb::remote_mcp::RuntimeServers,
+    person: Option<&str>,
+) -> kb::remote::Connected<'a> {
+    kb::remote::Connected {
+        bedrock: kb::remote::Bedrock {
+            sts: &state.sts,
+            dynamo: &state.dynamo,
+            accounts_table: &state.config.aws_insights_table_name,
+            actor,
+        },
+        mcp: kb::remote_mcp::McpSearch {
+            servers,
+            person: person.map(str::to_string),
+        },
+    }
+}
+
+/// The person asking, for named readers ([`kb::Base::open_to`]).
+pub(crate) fn person(claims: &Claims) -> kb::Person {
+    kb::Person::new(&claims.email, claims.session_role())
 }
 
 pub(crate) fn store(state: &AppState) -> kb::search::AwsStore {
@@ -102,6 +127,10 @@ pub struct BaseInput {
     pub agents: Vec<String>,
     #[serde(default)]
     pub authoritative: bool,
+    /// Only these people and roles read it (`user:<email>`, `role:<key>`);
+    /// left out, the readers stay as they are.
+    #[serde(default)]
+    pub readers: Option<Vec<String>>,
     /// On create only: the base's first connected source, so a base is made
     /// with what it holds in one step.
     #[serde(default)]
@@ -115,12 +144,18 @@ pub struct BaseInput {
 /// A knowledge base to connect in place.
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct ConnectInput {
-    /// `bedrock_kb`.
+    /// `bedrock_kb` (the default) or `mcp`.
     #[serde(default)]
     pub provider: String,
-    /// The Bedrock knowledge base's ARN.
+    /// The Bedrock knowledge base's ARN, or the Connected apps server's id.
     #[serde(default)]
     pub target: String,
+    /// A search tool's tool that searches (picked when empty).
+    #[serde(default)]
+    pub search_tool: String,
+    /// Its tool that reads a result in full (picked when empty).
+    #[serde(default)]
+    pub fetch_tool: String,
 }
 
 /// `input` applied to `base`, or why it can't be.
@@ -161,6 +196,9 @@ pub fn apply_input(base: &mut Base, input: &BaseInput) -> Result<(), String> {
     base.name = name.to_string();
     base.description = input.description.trim().to_string();
     base.read_role = role;
+    if let Some(r) = &input.readers {
+        base.readers = kb::clean_readers(r)?;
+    }
     base.attach_team = input.attach_team;
     base.agents = agents;
     base.authoritative = input.authoritative;
@@ -285,6 +323,8 @@ fn base_json(
         "created_at": b.created_at,
         "updated_at": b.updated_at,
         "backend": backend_json(b),
+        "readers": b.readers,
+        "agent_access_note": b.agent_access_note(),
         "files": files.len(),
         "ready": count(FileStatus::Ready),
         "processing": count(FileStatus::Processing) + count(FileStatus::Uploading),
@@ -297,6 +337,17 @@ fn base_json(
 fn backend_json(b: &Base) -> Value {
     match b.remote() {
         None => json!({ "kind": "local" }),
+        Some(r) if r.provider == kb::Provider::Mcp => json!({
+            "kind": "remote",
+            "provider": r.provider,
+            "label": r.provider.label(),
+            "target": r.target,
+            "server_name": r.name,
+            "access": if r.per_person { "per_person" } else { "team" },
+            "per_person": r.per_person,
+            "search_tool": r.search_tool,
+            "fetch_tool": r.fetch_tool,
+        }),
         Some(r) => json!({
             "kind": "remote",
             "provider": r.provider,
@@ -307,6 +358,7 @@ fn backend_json(b: &Base) -> Value {
             "access": match &r.access {
                 kb::Access::Install => "install",
                 kb::Access::Account { .. } => "account",
+                kb::Access::Connection { .. } => "team",
             },
             "hybrid": r.hybrid,
         }),
@@ -317,6 +369,10 @@ fn backend_json(b: &Base) -> Value {
 /// place has none.
 fn refuse_connected(base: &Base) -> Result<(), (StatusCode, Json<Value>)> {
     match base.remote() {
+        Some(r) if r.provider == kb::Provider::Mcp => Err(fail(
+            StatusCode::BAD_REQUEST,
+            "This knowledge base is connected in place: it is searched live through its search tool, so nothing can be added to it here. Add documents to the search tool itself.",
+        )),
         Some(r) => Err(fail(
             StatusCode::BAD_REQUEST,
             &format!(
@@ -384,11 +440,15 @@ async fn check_connect(
     existing: &[Base],
     input: &ConnectInput,
 ) -> Result<kb::Remote, (StatusCode, Json<Value>)> {
-    if !input.provider.is_empty() && input.provider != "bedrock_kb" {
-        return Err(fail(
-            StatusCode::BAD_REQUEST,
-            "Only a Bedrock knowledge base can be connected in place.",
-        ));
+    match input.provider.as_str() {
+        "" | "bedrock_kb" => {}
+        "mcp" => return check_mcp(state, claims, existing, input).await,
+        _ => {
+            return Err(fail(
+                StatusCode::BAD_REQUEST,
+                "Connect a Bedrock knowledge base or a search tool (MCP) in place.",
+            ))
+        }
     }
     let arn =
         kb::remote::parse_kb_arn(&input.target).map_err(|m| fail(StatusCode::BAD_REQUEST, &m))?;
@@ -408,6 +468,48 @@ async fn check_connect(
     let mut remote = kb::remote::bedrock_remote(&arn, access, true);
     remote.hybrid = test_remote(state, claims, existing, &accounts, &remote).await?;
     Ok(remote)
+}
+
+/// Checks a search tool to connect: its server is on the team's Connected
+/// apps, a search tool is there, and one test search reads (as the admin
+/// connecting it, with their own sign-in where the server signs each person
+/// in). Nothing is saved.
+async fn check_mcp(
+    state: &AppState,
+    claims: &Claims,
+    existing: &[Base],
+    input: &ConnectInput,
+) -> Result<kb::Remote, (StatusCode, Json<Value>)> {
+    let id = input.target.trim();
+    if !kb::valid_id(id) {
+        return Err(fail(
+            StatusCode::BAD_REQUEST,
+            "Pick the search tool's server from Connected apps.",
+        ));
+    }
+    if let Some(same) = existing.iter().find(|b| {
+        b.remote()
+            .is_some_and(|r| r.provider == kb::Provider::Mcp && r.target == id)
+    }) {
+        return Err(fail(
+            StatusCode::BAD_REQUEST,
+            &format!("That search tool is already connected as {}.", same.name),
+        ));
+    }
+    let servers = servers(state, &claims.team_id);
+    let checked = kb::remote_mcp::check(
+        &servers,
+        id,
+        &claims.email,
+        &input.search_tool,
+        &input.fetch_tool,
+    )
+    .await
+    .map_err(|r| {
+        info!(team_id = %claims.team_id, code = r.code, "A search tool's test search failed");
+        connect_fail(&r, None)
+    })?;
+    Ok(kb::remote_mcp::mcp_remote(id, &checked))
 }
 
 /// One test search of `remote` as the team: `Ok(hybrid)`, or what went
@@ -431,33 +533,68 @@ async fn test_remote(
     )
     .await
     .map_err(|r| connect_fail(&r, None))?;
-    kb::remote::test_retrieve(&session, remote).await.map_err(|r| {
-        // The team's role only lacks the permission: the update that lets
-        // it search this knowledge base (and the ones already connected in
-        // that account), in one click.
-        let grant = match (&remote.access, r.code) {
-            (kb::Access::Account { account }, "access") => {
-                let mut kbs = kb::remote::arns_in(existing, account);
-                kbs.push(remote.target.clone());
-                kbs.sort();
-                kbs.dedup();
-                let region = accounts
-                    .iter()
-                    .find(|a| &a.account == account)
-                    .map(|a| a.region.clone())
-                    .unwrap_or_else(|| remote.region.clone());
-                super::connectors::update_stack_url(&region, &kbs).map(|url| {
-                    json!({
-                        "url": url,
-                        "stack_name": common::log_reader::update_stack_name_for(&kbs),
-                        "account": account,
-                    })
-                })
-            }
-            _ => None,
-        };
-        info!(team_id = %claims.team_id, code = r.code, "A connected knowledge base's test search failed");
-        connect_fail(&r, grant)
+    let r = match kb::remote::test_retrieve(&session, remote).await {
+        Ok(hybrid) => return Ok(hybrid),
+        Err(r) => r,
+    };
+    // The team's role only lacks the permission: the update that lets it
+    // search this knowledge base (and keeps what the team already chose in
+    // that account), in one click.
+    let grant = match (&remote.access, r.code) {
+        (kb::Access::Account { account }, "access") => {
+            let region = accounts
+                .iter()
+                .find(|a| &a.account == account)
+                .map(|a| a.region.clone())
+                .unwrap_or_else(|| remote.region.clone());
+            grant_for(
+                state,
+                &claims.team_id,
+                existing,
+                account,
+                &region,
+                Some(&remote.target),
+                None,
+            )
+            .await
+        }
+        _ => None,
+    };
+    info!(team_id = %claims.team_id, code = r.code, "A connected knowledge base's test search failed");
+    Err(connect_fail(&r, grant))
+}
+
+/// The one-click update that lets the team's role in `account` search the
+/// knowledge bases the team connected there and read the buckets it imports
+/// from, plus `add_kb` and `add_bucket` (what is being added now).
+pub(crate) async fn grant_for(
+    state: &AppState,
+    team: &str,
+    bases: &[Base],
+    account: &str,
+    region: &str,
+    add_kb: Option<&str>,
+    add_bucket: Option<&str>,
+) -> Option<Value> {
+    let mut kbs = kb::remote::arns_in(bases, account);
+    kbs.extend(add_kb.map(str::to_string));
+    kbs.sort();
+    kbs.dedup();
+    let sources =
+        kb::sources::store::team_sources(&state.dynamo, &state.config.settings_table_name, team)
+            .await
+            .unwrap_or_default();
+    let mut buckets = kb::sources::s3::buckets_in(&sources, account);
+    buckets.extend(add_bucket.map(str::to_string));
+    buckets.sort();
+    buckets.dedup();
+    let chosen = common::log_reader::Chosen::new(&kbs, &buckets);
+    super::connectors::update_stack_url(region, &chosen).map(|url| {
+        json!({
+            "url": url,
+            "stack_name": common::log_reader::update_stack_name_for(&chosen),
+            "account": account,
+        })
     })
 }
 
@@ -465,6 +602,10 @@ fn limits() -> Value {
     json!({
         "max_file_bytes": MAX_FILE_BYTES,
         "max_files": MAX_FILES_PER_BASE,
+        "max_items_per_import": kb::sources::MAX_ITEMS_PER_IMPORT,
+        "max_items_per_source": kb::sources::MAX_ITEMS_PER_SOURCE,
+        "max_archive_bytes": kb::sources::archive::MAX_ARCHIVE_BYTES,
+        "max_readers": kb::MAX_READERS,
         "extensions": EXTENSIONS,
         "agents": AGENTS.iter().map(|(k, l)| json!({"key": k, "label": l})).collect::<Vec<_>>(),
         "read_roles": READ_ROLES,
@@ -483,7 +624,12 @@ pub async fn list_bases(
         .map_err(|e| internal("knowledge bases", e))?;
     let mut out = Vec::new();
     let reader = reader_role(&claims.holder());
-    for b in bases.iter().filter(|b| b.readable_by(reader)) {
+    let manages = claims.holder().holds("knowledge_manage");
+    let me = person(&claims);
+    for b in bases
+        .iter()
+        .filter(|b| b.readable_by(reader) && (manages || b.open_to(&me)))
+    {
         let files = st.files(&claims.team_id, &b.id).await.unwrap_or_default();
         let sources = super::knowledge_sources::sources_of(&state, &claims.team_id, &b.id).await;
         out.push(base_json(b, &files, &sources));
@@ -505,7 +651,10 @@ pub async fn get_base(
     let base = get_base_record(&state, &claims.team_id, &kb_id)
         .await
         .map_err(|e| internal("knowledge base", e))?
-        .filter(|b| b.readable_by(reader_role(&claims.holder())))
+        .filter(|b| {
+            b.readable_by(reader_role(&claims.holder()))
+                && (claims.holder().holds("knowledge_manage") || b.open_to(&person(&claims)))
+        })
         .ok_or_else(|| fail(StatusCode::NOT_FOUND, "No such knowledge base."))?;
     let mut files = store(&state)
         .files(&claims.team_id, &base.id)
@@ -593,11 +742,315 @@ pub async fn check_connection(
             "This knowledge base is kept here: there is no connection to check.",
         )
     })?;
+    if remote.provider == kb::Provider::Mcp {
+        let servers = servers(&state, &claims.team_id);
+        kb::remote_mcp::check(
+            &servers,
+            &remote.target,
+            &claims.email,
+            &remote.search_tool,
+            &remote.fetch_tool,
+        )
+        .await
+        .map_err(|r| connect_fail(&r, None))?;
+        return Ok(Json(json!({ "ok": true, "checked_at": now() })));
+    }
     let accounts = aws_accounts(&state, &claims.team_id).await;
     let hybrid = test_remote(&state, &claims, &existing, &accounts, remote).await?;
     Ok(Json(
         json!({ "ok": true, "hybrid": hybrid, "checked_at": now() }),
     ))
+}
+
+/// GET /api/knowledge/search-tools — the servers on the team's Connected
+/// apps a knowledge base can be connected to, each with the tools that look
+/// like its search and fetch (from its last tool listing), and which are
+/// connected already.
+pub async fn search_tools(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<Claims>,
+) -> Reply {
+    claims.require_role(3).map_err(forbidden)?;
+    let rt = super::mcp_servers::runtime(&state, &claims.team_id);
+    let list = rt
+        .store
+        .list_servers(&claims.team_id)
+        .await
+        .map_err(|e| internal("mcp servers", e))?;
+    let mut servers = Vec::new();
+    for s in &list {
+        let owner = kb::remote_mcp::owner_for(
+            s.sharing == common::mcp_remote::store::Sharing::Personal
+                && s.auth == common::mcp_remote::store::AuthKind::OAuth,
+            Some(&claims.email),
+        );
+        let connected = match (s.auth, owner) {
+            (common::mcp_remote::store::AuthKind::OAuth, Some(o)) => matches!(
+                rt.store.get_token(&claims.team_id, &s.id, &o).await,
+                Ok(Some(t)) if t.status == common::mcp_remote::store::Status::Connected
+            ),
+            _ => s.status == common::mcp_remote::store::Status::Connected,
+        };
+        let mut v = serde_json::to_value(kb::remote_mcp::listed(s)).unwrap_or_default();
+        v["connected"] = json!(connected);
+        servers.push(v);
+    }
+    let connected: Vec<String> = store(&state)
+        .bases(&claims.team_id)
+        .await
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|b| b.remote())
+        .filter(|r| r.provider == kb::Provider::Mcp)
+        .map(|r| r.target.clone())
+        .collect();
+    Ok(Json(json!({ "servers": servers, "connected": connected })))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ImportQuery {
+    #[serde(default)]
+    pub arn: String,
+}
+
+/// GET /api/knowledge/bedrock/import?arn= — where a Bedrock knowledge
+/// base's documents are and how each of its data sources is imported (an
+/// S3 data source becomes an S3 source here). Read with the same role that
+/// would search it; nothing in Bedrock changes.
+pub async fn bedrock_import(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<Claims>,
+    axum::extract::Query(q): axum::extract::Query<ImportQuery>,
+) -> Reply {
+    claims.require_role(3).map_err(forbidden)?;
+    let arn = kb::remote::parse_kb_arn(&q.arn).map_err(|m| fail(StatusCode::BAD_REQUEST, &m))?;
+    let accounts = aws_accounts(&state, &claims.team_id).await;
+    let own = common::live::aws::install_read_role();
+    let access = kb::remote::access_for(&arn, own.as_deref(), &accounts)
+        .map_err(|r| connect_fail(&r, None))?;
+    let remote = kb::remote::bedrock_remote(&arn, access, true);
+    let actor = format!("knowledge-{}", claims.email);
+    let session = kb::remote::session(
+        &state.sts,
+        &state.dynamo,
+        &state.config.aws_insights_table_name,
+        &claims.team_id,
+        &remote,
+        &actor,
+    )
+    .await
+    .map_err(|r| connect_fail(&r, None))?;
+    let catalog = kb::sources::bedrock_import::Bedrock::new(&session, &arn.region);
+    match kb::sources::bedrock_import::plan(&catalog, &arn).await {
+        Ok(p) => Ok(Json(serde_json::to_value(p).unwrap_or_default())),
+        Err(r) => {
+            let grant = match (&remote.access, r.code) {
+                (kb::Access::Account { account }, "access") => {
+                    let bases = store(&state)
+                        .bases(&claims.team_id)
+                        .await
+                        .unwrap_or_default();
+                    let region = accounts
+                        .iter()
+                        .find(|a| &a.account == account)
+                        .map(|a| a.region.clone())
+                        .unwrap_or_else(|| arn.region.clone());
+                    grant_for(
+                        &state,
+                        &claims.team_id,
+                        &bases,
+                        account,
+                        &region,
+                        Some(&arn.arn()),
+                        None,
+                    )
+                    .await
+                }
+                _ => None,
+            };
+            Err(connect_fail(&r, grant))
+        }
+    }
+}
+
+/// What starting an archive upload takes.
+#[derive(Debug, Deserialize)]
+pub struct ArchiveBody {
+    pub name: String,
+    pub size: u64,
+    /// Upload a newer export to this archive source.
+    #[serde(default)]
+    pub replace: Option<String>,
+}
+
+/// POST /api/knowledge/:kb_id/archives — start uploading an export archive
+/// (a new archive source, or a newer export for one): the source and a
+/// signed upload URL. Nothing is read until the upload is in.
+pub async fn start_archive(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<Claims>,
+    Path(kb_id): Path<String>,
+    Json(body): Json<ArchiveBody>,
+) -> Reply {
+    use kb::sources::store::SyncStore;
+    claims.require_role(3).map_err(forbidden)?;
+    let base = get_base_record(&state, &claims.team_id, &kb_id)
+        .await
+        .map_err(|e| internal("knowledge base", e))?
+        .ok_or_else(|| fail(StatusCode::NOT_FOUND, "No such knowledge base."))?;
+    refuse_connected(&base)?;
+    let name = kb::sources::archive::check_archive(&body.name, body.size)
+        .map_err(|m| fail(StatusCode::BAD_REQUEST, &m))?;
+    let st = super::knowledge_sources::sync_store(&state);
+    let mut src = match body.replace.as_deref() {
+        Some(id) => {
+            let s = st
+                .source(&claims.team_id, &base.id, id)
+                .await
+                .map_err(|e| internal("knowledge source", e))?
+                .filter(|s| s.kind == Some(kb::sources::Kind::Archive))
+                .ok_or_else(|| fail(StatusCode::NOT_FOUND, "No such archive."))?;
+            s
+        }
+        None => {
+            let existing =
+                super::knowledge_sources::sources_of(&state, &claims.team_id, &base.id).await;
+            if existing.len() >= kb::sources::MAX_SOURCES_PER_BASE {
+                return Err(fail(
+                    StatusCode::BAD_REQUEST,
+                    &format!(
+                        "A knowledge base can have up to {} sources.",
+                        kb::sources::MAX_SOURCES_PER_BASE
+                    ),
+                ));
+            }
+            kb::sources::Source {
+                id: kb::new_id(),
+                kb_id: base.id.clone(),
+                kind: Some(kb::sources::Kind::Archive),
+                name: common::truncate_str(name.trim_end_matches(".zip"), 80).to_string(),
+                selection: vec![kb::sources::Selected {
+                    id: "archive".into(),
+                    title: name.clone(),
+                    kind: "file".into(),
+                    ..Default::default()
+                }],
+                options: json!({}),
+                created_at: now(),
+                created_by: claims.email.clone(),
+                // Paused until the upload is in: the sweep never reads a
+                // missing archive.
+                paused: true,
+                ..Default::default()
+            }
+        }
+    };
+    let version = src.options["version"].as_u64().unwrap_or(0) as u32 + 1;
+    src.options["pending"] = json!({ "version": version, "file_name": name, "size": body.size });
+    st.put_source(&claims.team_id, &src)
+        .await
+        .map_err(|e| internal("archive source", e))?;
+    let key = kb::sources::archive::archive_key(&claims.team_id, &base.id, &src.id, version);
+    let upload = presign_put(&state, &key, "application/zip", body.size)
+        .await
+        .map_err(|e| internal("archive upload url", e))?;
+    info!(team_id = %claims.team_id, kb = %base.id, source = %src.id, version, "Archive upload started");
+    Ok(Json(json!({
+        "source": super::knowledge_sources::source_json(&src, chrono::Utc::now().timestamp()),
+        "upload": upload,
+        "note": kb::sources::archive::NOTE,
+    })))
+}
+
+/// POST /api/knowledge/:kb_id/archives/:source_id/uploaded — the archive is
+/// in: point the source at it and import it (a newer export re-reads only
+/// what changed and removes what it no longer has).
+pub async fn finish_archive(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<Claims>,
+    Path((kb_id, source_id)): Path<(String, String)>,
+) -> Reply {
+    use kb::sources::store::SyncStore;
+    claims.require_role(3).map_err(forbidden)?;
+    let st = super::knowledge_sources::sync_store(&state);
+    let mut src = st
+        .source(&claims.team_id, &kb_id, &source_id)
+        .await
+        .map_err(|e| internal("knowledge source", e))?
+        .filter(|s| s.kind == Some(kb::sources::Kind::Archive))
+        .ok_or_else(|| fail(StatusCode::NOT_FOUND, "No such archive."))?;
+    let pending = src.options["pending"].clone();
+    let version = pending["version"].as_u64().unwrap_or(0) as u32;
+    if version == 0 {
+        return Err(fail(StatusCode::BAD_REQUEST, "Start the upload first."));
+    }
+    let key = kb::sources::archive::archive_key(&claims.team_id, &kb_id, &source_id, version);
+    let size = match state
+        .s3
+        .head_object()
+        .bucket(&state.config.bucket_name)
+        .key(&key)
+        .send()
+        .await
+    {
+        Ok(h) => h.content_length().unwrap_or(0).max(0) as u64,
+        Err(_) => {
+            return Err(fail(
+                StatusCode::BAD_REQUEST,
+                "The upload didn't arrive. Try uploading the archive again.",
+            ))
+        }
+    };
+    if size == 0 || size > kb::sources::archive::MAX_ARCHIVE_BYTES {
+        return Err(fail(
+            StatusCode::BAD_REQUEST,
+            "The uploaded archive is empty or too large.",
+        ));
+    }
+    let old = kb::sources::archive::current_key(&claims.team_id, &src);
+    let file_name = pending["file_name"]
+        .as_str()
+        .unwrap_or("archive.zip")
+        .to_string();
+    src.options = json!({
+        "version": version,
+        "key": key,
+        "file_name": file_name,
+        "size": size,
+        "uploaded_at": now(),
+        "uploaded_by": claims.email,
+    });
+    src.selection = vec![kb::sources::Selected {
+        id: "archive".into(),
+        title: file_name,
+        kind: "file".into(),
+        ..Default::default()
+    }];
+    src.paused = false;
+    src.next_sync_at = chrono::Utc::now().timestamp();
+    if src.status == kb::sources::Status::Error {
+        src.status = kb::sources::Status::Queued;
+        src.error = None;
+    }
+    st.put_source(&claims.team_id, &src)
+        .await
+        .map_err(|e| internal("archive source", e))?;
+    st.put_registry(&claims.team_id, &src)
+        .await
+        .map_err(|e| internal("register archive source", e))?;
+    // The export it replaces is no longer needed.
+    if let Some(old) = old.filter(|o| *o != key) {
+        st.delete_object(&claims.team_id, &old).await;
+    }
+    if let Err(e) =
+        super::knowledge_sources::start_sync(&state, &claims.team_id, &kb_id, &source_id).await
+    {
+        warn!(error = %e, "Archive import not started; the sweep starts it");
+    }
+    info!(team_id = %claims.team_id, kb = %kb_id, source = %source_id, version, "Archive uploaded");
+    Ok(Json(json!({
+        "source": super::knowledge_sources::source_json(&src, chrono::Utc::now().timestamp()),
+    })))
 }
 
 /// POST /api/knowledge — create a base.
@@ -1172,6 +1625,111 @@ mod tests {
         let local = Base::default();
         assert_eq!(base_json(&local, &[], &[])["backend"]["kind"], "local");
         assert!(refuse_connected(&local).is_ok());
+    }
+
+    #[test]
+    fn a_connected_search_tool_shows_its_server_and_who_it_searches_as() {
+        let remote = kb::remote_mcp::mcp_remote(
+            "search-1",
+            &kb::remote_mcp::Checked {
+                server_name: "Docs search".into(),
+                search_tool: "search".into(),
+                fetch_tool: "fetch".into(),
+                per_person: true,
+            },
+        );
+        let b = Base {
+            id: "kb".into(),
+            name: "Product docs".into(),
+            agents: vec!["coder".into()],
+            backend: kb::Backend::Remote(remote),
+            ..Default::default()
+        };
+        let v = base_json(&b, &[], &[]);
+        assert_eq!(v["backend"]["provider"], "mcp");
+        assert_eq!(v["backend"]["label"], "Search tool (MCP)");
+        assert_eq!(v["backend"]["server_name"], "Docs search");
+        assert_eq!(v["backend"]["access"], "per_person");
+        assert_eq!(v["backend"]["search_tool"], "search");
+        assert!(v["agent_access_note"]
+            .as_str()
+            .unwrap()
+            .contains("own sign-in"));
+        let (_, body) = refuse_connected(&b).unwrap_err();
+        assert!(body["error"].as_str().unwrap().contains("search tool"));
+        let input: BaseInput = serde_json::from_value(json!({
+            "name": "Docs", "connect": { "provider": "mcp", "target": "search-1", "search_tool": "search" }
+        }))
+        .unwrap();
+        let c = input.connect.unwrap();
+        assert_eq!(
+            (c.provider.as_str(), c.search_tool.as_str()),
+            ("mcp", "search")
+        );
+    }
+
+    #[test]
+    fn readers_are_checked_and_the_attach_note_says_who_sees_results() {
+        let mut b = Base {
+            read_role: "member".into(),
+            ..Default::default()
+        };
+        let input = BaseInput {
+            name: "HR".into(),
+            readers: Some(vec![
+                " Ada@Example.com ".into(),
+                "role:admin".into(),
+                "user:ada@example.com".into(),
+            ]),
+            attach_team: true,
+            ..Default::default()
+        };
+        apply_input(&mut b, &input).unwrap();
+        assert_eq!(b.readers, ["user:ada@example.com", "role:admin"]);
+        assert!(b.agent_access_note().contains("only in runs started by"));
+        let v = base_json(&b, &[], &[]);
+        assert_eq!(v["readers"][1], "role:admin");
+        // Left out: unchanged. Empty: everyone the role allows.
+        apply_input(
+            &mut b,
+            &BaseInput {
+                name: "HR".into(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(b.readers.len(), 2);
+        apply_input(
+            &mut b,
+            &BaseInput {
+                name: "HR".into(),
+                readers: Some(vec![]),
+                attach_team: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(b.readers.is_empty());
+        assert!(b
+            .agent_access_note()
+            .starts_with("Everyone who can start an agent run"));
+        let bad = BaseInput {
+            name: "HR".into(),
+            readers: Some(vec!["not a person".into()]),
+            ..Default::default()
+        };
+        assert!(apply_input(&mut b, &bad)
+            .unwrap_err()
+            .contains("isn't a person or a role"));
+        // Not attached: no note.
+        assert_eq!(Base::default().agent_access_note(), "");
+        // Limits say what imports take.
+        let l = limits();
+        assert_eq!(l["max_items_per_import"], kb::sources::MAX_ITEMS_PER_IMPORT);
+        assert_eq!(
+            l["max_archive_bytes"],
+            kb::sources::archive::MAX_ARCHIVE_BYTES
+        );
     }
 
     #[test]

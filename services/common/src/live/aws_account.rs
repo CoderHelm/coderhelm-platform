@@ -71,6 +71,17 @@ pub struct AwsAccount {
     /// (filled by the caller, never stored here): an update keeps the role
     /// able to search them.
     pub knowledge_bases: Vec<String>,
+    /// The buckets the team imports knowledge from in this account (filled
+    /// by the caller, never stored here): an update keeps the role able to
+    /// read them.
+    pub import_buckets: Vec<String>,
+}
+
+impl AwsAccount {
+    /// What the team chose for the role here.
+    pub fn chosen(&self) -> crate::log_reader::Chosen<'_> {
+        crate::log_reader::Chosen::new(&self.knowledge_bases, &self.import_buckets)
+    }
 }
 
 fn s(item: &Item, k: &str) -> String {
@@ -120,6 +131,7 @@ impl AwsAccount {
             },
             status: s(item, "status"),
             knowledge_bases: Vec::new(),
+            import_buckets: Vec::new(),
             permissions: item
                 .get("permissions_check")
                 .and_then(|v| v.as_s().ok())
@@ -308,7 +320,7 @@ impl AwsAccount {
                 "skipped": a.airflow_skip,
                 "environments": self.airflow_environments(),
             },
-            "permissions": self.permissions.as_ref().map(|p| p.view_with(false, &crate::public_urls::log_reader_template_url(), &self.knowledge_bases)),
+            "permissions": self.permissions.as_ref().map(|p| p.view_with(false, &crate::public_urls::log_reader_template_url(), &self.chosen())),
         })
     }
 

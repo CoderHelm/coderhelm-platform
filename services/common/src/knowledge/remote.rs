@@ -229,6 +229,10 @@ pub fn bedrock_remote(arn: &KbArn, access: Access, hybrid: bool) -> Remote {
         region: arn.region.clone(),
         access,
         hybrid,
+        per_person: false,
+        search_tool: String::new(),
+        fetch_tool: String::new(),
+        name: String::new(),
     }
 }
 
@@ -259,6 +263,11 @@ pub async fn session(
                 )
             })
         }
+        Access::Connection { .. } => Err(Refusal::new(
+            "invalid",
+            "This knowledge base is reached through a search tool, not AWS.",
+            "Check it from its own page.",
+        )),
         Access::Account { account } => {
             let accounts = if accounts_table.is_empty() {
                 Vec::new()
@@ -477,6 +486,11 @@ const DATE_KEYS: &[&str] = &[
     "date",
 ];
 
+/// A metadata date as `YYYY-MM-DD` ([`as_of`]), for the other retrievers.
+pub fn date_of(raw: &str) -> String {
+    as_of(raw)
+}
+
 /// A metadata date as `YYYY-MM-DD`: RFC 3339, a plain date, or epoch
 /// seconds or milliseconds. Empty when there is none (no recency nudge).
 fn as_of(raw: &str) -> String {
@@ -590,8 +604,8 @@ impl Retriever for Bedrock<'_> {
         let Backend::Remote(remote) = &base.backend else {
             return Ok(Vec::new());
         };
-        match remote.provider {
-            Provider::BedrockKb => {}
+        if remote.provider != Provider::BedrockKb {
+            return Err("This knowledge base isn't a Bedrock knowledge base.".into());
         }
         let s = session(
             self.sts,
@@ -607,6 +621,30 @@ impl Retriever for Bedrock<'_> {
             .await
             .map_err(|r| r.message)?;
         Ok(to_hits(base, remote, &passages))
+    }
+}
+
+/// Every kind of connected base, each answered by its own retriever: what
+/// [`super::search::search`] is given in production.
+pub struct Connected<'a> {
+    pub bedrock: Bedrock<'a>,
+    pub mcp: super::remote_mcp::McpSearch<'a>,
+}
+
+#[async_trait::async_trait]
+impl Retriever for Connected<'_> {
+    async fn retrieve(
+        &self,
+        team_id: &str,
+        base: &Base,
+        query: &str,
+        k: usize,
+    ) -> Result<Vec<Hit>, String> {
+        match base.remote().map(|r| r.provider) {
+            Some(Provider::BedrockKb) => self.bedrock.retrieve(team_id, base, query, k).await,
+            Some(Provider::Mcp) => self.mcp.retrieve(team_id, base, query, k).await,
+            None => Ok(Vec::new()),
+        }
     }
 }
 

@@ -119,6 +119,13 @@ pub(crate) async fn env(state: &AppState, team: &str, kind: Option<Kind>) -> con
         team: team.to_string(),
         http: Arc::new(common::mcp_remote::http::GuardedHttps),
         github_token: github,
+        aws: Some(connect::AwsEnv {
+            sts: state.sts.clone(),
+            accounts_table: state.config.aws_insights_table_name.clone(),
+            s3: state.s3.clone(),
+            bucket: state.config.bucket_name.clone(),
+            actor: "knowledge".into(),
+        }),
     }
 }
 
@@ -490,6 +497,13 @@ pub struct BrowseQuery {
     /// `sign_in`: browse with your own sign-in (Sanity), not the team's key.
     #[serde(default)]
     pub via: String,
+    /// Amazon S3: the account, bucket and region to browse.
+    #[serde(default)]
+    pub account: String,
+    #[serde(default)]
+    pub bucket: String,
+    #[serde(default)]
+    pub region: String,
 }
 
 /// GET /api/knowledge/connectors/:kind/browse?parent=&q= — one level of the
@@ -527,18 +541,71 @@ pub async fn browse(
         })));
     }
     let env = env(&state, &claims.team_id, Some(kind)).await;
-    let opened = connect::open(&env, kind, &json!({}))
-        .await
-        .map_err(|e| connector_fail(kind, &e))?;
-    let nodes = opened
-        .connector
-        .browse(parent, query)
-        .await
-        .map_err(|e| connector_fail(kind, &e))?;
+    let options = if kind == Kind::S3 {
+        json!({ "account": q.account.trim(), "bucket": q.bucket.trim(), "region": q.region.trim() })
+    } else {
+        json!({})
+    };
+    if kind == Kind::Archive {
+        return Err(fail(
+            StatusCode::BAD_REQUEST,
+            "An archive is uploaded, not browsed.",
+        ));
+    }
+    let opened = match connect::open(&env, kind, &options).await {
+        Ok(o) => o,
+        Err(e) if kind == Kind::S3 => return Err(s3_fail(&state, &claims, &options, &e).await),
+        Err(e) => return Err(connector_fail(kind, &e)),
+    };
+    let nodes = match opened.connector.browse(parent, query).await {
+        Ok(n) => n,
+        Err(e) if kind == Kind::S3 => return Err(s3_fail(&state, &claims, &options, &e).await),
+        Err(e) => return Err(connector_fail(kind, &e)),
+    };
     Ok(Json(json!({
         "nodes": nodes.into_iter().take(500).collect::<Vec<_>>(),
         "options": public_options(&opened.options),
     })))
+}
+
+/// An S3 bucket that couldn't be read, in plain words, with the one-click
+/// update that names the bucket for the team's role when that is all it
+/// lacks.
+async fn s3_fail(
+    state: &AppState,
+    claims: &Claims,
+    options: &Value,
+    e: &ks::ConnectorError,
+) -> (StatusCode, Json<Value>) {
+    let (status, Json(mut body)) = connector_fail(Kind::S3, e);
+    if let (ks::ConnectorError::Forbidden(_), Ok(w)) = (e, ks::s3::where_of(options)) {
+        use common::knowledge::search::Store;
+        let bases = super::knowledge::store(state)
+            .bases(&claims.team_id)
+            .await
+            .unwrap_or_default();
+        let env = env(state, &claims.team_id, Some(Kind::S3)).await;
+        let region = env
+            .aws_accounts()
+            .await
+            .into_iter()
+            .find(|a| a.account == w.account)
+            .map(|a| a.region)
+            .unwrap_or_else(|| w.region.clone());
+        body["fix"] = json!("Update the CoderHelmLogReader role in that account so it may read this bucket (the link below names it in the role's update stack), then try again.");
+        body["grant"] = super::knowledge::grant_for(
+            state,
+            &claims.team_id,
+            &bases,
+            &w.account,
+            &region,
+            None,
+            Some(&w.bucket),
+        )
+        .await
+        .unwrap_or(Value::Null);
+    }
+    (status, Json(body))
 }
 
 /// Where the team's scan for Sanity projects named in its repositories is
@@ -666,6 +733,7 @@ pub fn clean_options(kind: Kind, raw: &Value) -> Result<Value, String> {
     let allowed: &[&str] = match kind {
         Kind::Sanity => &["project_id", "studio_url", "types"],
         Kind::Confluence => &["cloud_id", "site"],
+        Kind::S3 => &["account", "bucket", "region"],
         _ => &[],
     };
     let mut out = serde_json::Map::new();
@@ -715,6 +783,12 @@ pub(crate) async fn add_source(
 ) -> Result<Value, (StatusCode, Json<Value>)> {
     super::knowledge::refuse_if_connected(state, &claims.team_id, kb_id).await?;
     let kind = kind_of(&input.kind)?;
+    if kind == Kind::Archive {
+        return Err(fail(
+            StatusCode::BAD_REQUEST,
+            "Upload an archive from the knowledge base's page instead.",
+        ));
+    }
     let selection = clean_selection(input.selection.as_deref().unwrap_or_default())
         .map_err(|m| fail(StatusCode::BAD_REQUEST, &m))?;
     let existing = sources_of(state, &claims.team_id, kb_id).await;
@@ -726,15 +800,29 @@ pub(crate) async fn add_source(
     }
     let mut options = clean_options(kind, input.options.as_ref().unwrap_or(&Value::Null))
         .map_err(|m| fail(StatusCode::BAD_REQUEST, &m))?;
+    if kind == Kind::S3 {
+        let w = ks::s3::where_of(&options).map_err(|m| fail(StatusCode::BAD_REQUEST, &m))?;
+        options["bucket"] = json!(w.bucket);
+    }
     if input.via.as_deref() == Some("sign_in") {
         return add_signin_source(state, claims, kb_id, kind, selection, options, input).await;
     }
     // Opening it checks the connection works before anything is saved, and
     // settles which site or project it reads.
     let env = env(state, &claims.team_id, Some(kind)).await;
-    let opened = connect::open(&env, kind, &options)
-        .await
-        .map_err(|e| connector_fail(kind, &e))?;
+    let opened = match connect::open(&env, kind, &options).await {
+        Ok(o) => o,
+        Err(e) if kind == Kind::S3 => return Err(s3_fail(state, claims, &options, &e).await),
+        Err(e) => return Err(connector_fail(kind, &e)),
+    };
+    // An import from S3 reads the bucket once first: nothing is saved
+    // unless the team's role can list what was picked.
+    if kind == Kind::S3 {
+        let first = selection.first().map(|s| s.id.as_str());
+        if let Err(e) = opened.connector.browse(first, "").await {
+            return Err(s3_fail(state, claims, &opened.options, &e).await);
+        }
+    }
     if let (Some(o), Some(resolved)) = (options.as_object_mut(), opened.options.as_object()) {
         for (k, v) in resolved {
             o.entry(k.clone()).or_insert(v.clone());
@@ -1137,6 +1225,20 @@ pub(crate) async fn remove_source(
     let items = st.items(team, &src.kb_id, &src.id).await?;
     for f in &items {
         st.delete_item(team, f).await?;
+    }
+    if src.kind == Some(Kind::Archive) {
+        // Every upload of the archive goes too.
+        let v = src.options["version"]
+            .as_u64()
+            .unwrap_or(0)
+            .max(src.options["pending"]["version"].as_u64().unwrap_or(0)) as u32;
+        for n in 1..=v {
+            st.delete_object(
+                team,
+                &ks::archive::archive_key(team, &src.kb_id, &src.id, n),
+            )
+            .await;
+        }
     }
     if !src.hook.is_empty() {
         let _ = state

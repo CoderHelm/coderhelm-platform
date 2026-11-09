@@ -18,15 +18,22 @@
 //! comfortably fast at the limits below.
 //!
 //! A base can instead be **connected in place** ([`Backend::Remote`]): an
-//! Amazon Bedrock knowledge base in the team's own AWS account, searched
-//! live where it is ([`remote`]). Nothing of it is copied: it has no files,
-//! no passages and no vectors here, and search merges the list Bedrock
-//! ranked with the local ones.
+//! Amazon Bedrock knowledge base in the team's own AWS account ([`remote`]),
+//! or a search tool the team already runs behind an MCP server
+//! ([`remote_mcp`]), searched live where it is. Nothing of it is copied: it
+//! has no files, no passages and no vectors here, and search merges the list
+//! the provider ranked with the local ones.
+//!
+//! Who reads a base: its lowest read role, and optionally only named people
+//! or roles ([`Base::readers`], checked with [`Base::open_to`]). A base read
+//! through each person's own sign-in ([`Remote::per_person`]) answers every
+//! search with that person's access in the tool itself.
 
 pub mod answer;
 pub mod chunk;
 pub mod extract;
 pub mod remote;
+pub mod remote_mcp;
 pub mod search;
 pub mod sources;
 
@@ -38,6 +45,8 @@ pub const MAX_FILE_BYTES: u64 = 25 * 1024 * 1024;
 pub const MAX_ATTACHMENT_BYTES: u64 = 10 * 1024 * 1024;
 /// Files per knowledge base.
 pub const MAX_FILES_PER_BASE: usize = 500;
+/// Named readers one base keeps ([`Base::readers`]).
+pub const MAX_READERS: usize = 50;
 /// Knowledge bases per team.
 pub const MAX_BASES: usize = 50;
 /// Passages kept from one file; the rest of a very long file is dropped
@@ -99,6 +108,74 @@ pub struct Base {
     /// before connecting in place existed), or searched live elsewhere.
     #[serde(default, skip_serializing_if = "Backend::is_local")]
     pub backend: Backend,
+    /// Only these people and roles read it (on top of [`Self::read_role`]):
+    /// `user:<email>` or `role:<role key>`. Empty: everyone the read role
+    /// allows.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub readers: Vec<String>,
+}
+
+/// A person asking: who they are and which role they hold on the team.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Person {
+    /// Lowercased email.
+    pub email: String,
+    /// Their role's key (`member`, `admin`, a custom role's id).
+    pub role: String,
+}
+
+impl Person {
+    pub fn new(email: &str, role: &str) -> Person {
+        Person {
+            email: email.trim().to_ascii_lowercase(),
+            role: role.trim().to_string(),
+        }
+    }
+}
+
+/// A reader entry as stored (`user:<email>`, `role:<key>`), or why it isn't
+/// one.
+pub fn clean_reader(raw: &str) -> Result<String, String> {
+    let raw = raw.trim();
+    let bad = || {
+        format!("\"{raw}\" isn't a person or a role. Use an email, or role: and the role's name.")
+    };
+    let (kind, value) = match raw.split_once(':') {
+        Some((k, v)) if k.eq_ignore_ascii_case("user") || k.eq_ignore_ascii_case("role") => {
+            (k.to_ascii_lowercase(), v.trim())
+        }
+        _ if raw.contains('@') => ("user".to_string(), raw),
+        _ => return Err(bad()),
+    };
+    if value.is_empty()
+        || value.len() > 200
+        || value.chars().any(|c| c.is_control() || c.is_whitespace())
+    {
+        return Err(bad());
+    }
+    if kind == "user" {
+        let (local, domain) = value.split_once('@').ok_or_else(bad)?;
+        if local.is_empty() || !domain.contains('.') {
+            return Err(bad());
+        }
+        return Ok(format!("user:{}", value.to_ascii_lowercase()));
+    }
+    Ok(format!("role:{value}"))
+}
+
+/// Reader entries checked, duplicates dropped, at most [`MAX_READERS`].
+pub fn clean_readers(raw: &[String]) -> Result<Vec<String>, String> {
+    let mut out: Vec<String> = Vec::new();
+    for r in raw.iter().filter(|r| !r.trim().is_empty()) {
+        let r = clean_reader(r)?;
+        if !out.contains(&r) {
+            out.push(r);
+        }
+    }
+    if out.len() > MAX_READERS {
+        return Err(format!("Name up to {MAX_READERS} people and roles."));
+    }
+    Ok(out)
 }
 
 /// Where a base's passages live and are ranked.
@@ -132,6 +209,22 @@ pub struct Remote {
     /// the knowledge base's vector store refused it when it was connected.
     #[serde(default = "yes")]
     pub hybrid: bool,
+    /// Searched with each person's own sign-in (a search tool whose MCP
+    /// server signs every person in): a person only gets what the tool lets
+    /// them see, and a search nobody asked for (an agent run without a
+    /// person) skips it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub per_person: bool,
+    /// The search tool's tool that searches (`search`), for an MCP base.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub search_tool: String,
+    /// Its tool that reads one result in full (`fetch`), when it has one.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub fetch_tool: String,
+    /// What the provider calls it, when connected (a search tool's server
+    /// name), for the page.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub name: String,
 }
 
 fn yes() -> bool {
@@ -144,12 +237,25 @@ fn yes() -> bool {
 pub enum Provider {
     /// Amazon Bedrock Knowledge Bases (`bedrock-agent-runtime` Retrieve).
     BedrockKb,
+    /// A search tool behind an MCP server on the team's Connected apps
+    /// (Azure AI Search, Pinecone Assistant, Glean, Rovo, Dropbox Dash, an
+    /// AgentCore gateway, the team's own): its `search` and `fetch` tools.
+    Mcp,
 }
 
 impl Provider {
     pub fn label(self) -> &'static str {
         match self {
             Provider::BedrockKb => "Bedrock knowledge base",
+            Provider::Mcp => "Search tool (MCP)",
+        }
+    }
+
+    /// What a passage from it is cited as.
+    pub fn source_kind(self) -> SourceKind {
+        match self {
+            Provider::BedrockKb => SourceKind::BedrockKb,
+            Provider::Mcp => SourceKind::McpSearch,
         }
     }
 }
@@ -167,6 +273,10 @@ pub enum Access {
     /// (`live::aws::assume`). The private ID is read from Coderhelm's own
     /// record of the account, never stored here.
     Account { account: String },
+    /// A server on the team's Connected apps (`mcp_remote`): its shared
+    /// connection, or each person's own sign-in ([`Remote::per_person`]).
+    /// Tokens stay sealed with the server's record, never here.
+    Connection { server_id: String },
 }
 
 /// Where a passage came from, as a [`search::Hit`] and a citation name it
@@ -179,6 +289,8 @@ pub enum SourceKind {
     Synced(sources::Kind),
     /// A passage a connected Bedrock knowledge base returned, live.
     BedrockKb,
+    /// A passage a connected search tool (MCP) returned, live.
+    McpSearch,
 }
 
 impl SourceKind {
@@ -188,6 +300,7 @@ impl SourceKind {
             SourceKind::Upload => "",
             SourceKind::Synced(k) => k.key(),
             SourceKind::BedrockKb => "bedrock_kb",
+            SourceKind::McpSearch => "mcp",
         }
     }
 
@@ -196,6 +309,7 @@ impl SourceKind {
             SourceKind::Upload => "Uploaded file",
             SourceKind::Synced(k) => k.label(),
             SourceKind::BedrockKb => Provider::BedrockKb.label(),
+            SourceKind::McpSearch => Provider::Mcp.label(),
         }
     }
 
@@ -203,6 +317,7 @@ impl SourceKind {
         match key {
             "" => Some(SourceKind::Upload),
             "bedrock_kb" => Some(SourceKind::BedrockKb),
+            "mcp" => Some(SourceKind::McpSearch),
             k => sources::Kind::parse(k).map(SourceKind::Synced),
         }
     }
@@ -224,6 +339,56 @@ impl Base {
     /// May someone with `role` read this base?
     pub fn readable_by(&self, role: &str) -> bool {
         role_level(role) >= role_level(&self.read_role)
+    }
+
+    /// Is the base open to `who` by name? Always, unless it names its
+    /// readers ([`Self::readers`]); then only a named person or someone
+    /// holding a named role. On top of [`Self::readable_by`], never instead.
+    pub fn open_to(&self, who: &Person) -> bool {
+        self.readers.is_empty()
+            || self.readers.iter().any(|r| match r.split_once(':') {
+                Some(("user", e)) => !who.email.is_empty() && e.eq_ignore_ascii_case(&who.email),
+                Some(("role", k)) => !who.role.is_empty() && k == who.role,
+                _ => false,
+            })
+    }
+
+    /// Read only by named people or roles.
+    pub fn named_readers(&self) -> bool {
+        !self.readers.is_empty()
+    }
+
+    /// Searched with each person's own sign-in.
+    pub fn per_person(&self) -> bool {
+        self.remote().is_some_and(|r| r.per_person)
+    }
+
+    /// May an agent run started by `who` (`None`: nobody, such as a
+    /// scheduled run) search this attached base? A base for named readers
+    /// only in runs one of them started; a base read with each person's own
+    /// sign-in only when a person started the run. Every other attached base
+    /// is searched by every run, which the page says when it is attached
+    /// ([`Self::agent_access_note`]).
+    pub fn searchable_in_run(&self, who: Option<&Person>) -> bool {
+        match who {
+            Some(p) => self.open_to(p),
+            None => !self.named_readers() && !self.per_person(),
+        }
+    }
+
+    /// What attaching it to agents means for who sees its results, for the
+    /// page (empty when it isn't attached to any agent).
+    pub fn agent_access_note(&self) -> &'static str {
+        if !self.attach_team && self.agents.is_empty() {
+            return "";
+        }
+        if self.per_person() {
+            "Agent runs search it as the person who started them, with their own sign-in. Runs nobody started skip it."
+        } else if self.named_readers() {
+            "Agents search it only in runs started by the people and roles named here. Runs anyone else started skip it."
+        } else {
+            "Everyone who can start an agent run gets results from this knowledge base when the agent searches it, whatever their own access in the app the content comes from."
+        }
     }
 
     /// Does `agent` (a key of [`AGENTS`]) search this base?
@@ -584,6 +749,10 @@ mod tests {
                     account: "111122223333".into(),
                 },
                 hybrid: true,
+                per_person: false,
+                search_tool: String::new(),
+                fetch_tool: String::new(),
+                name: String::new(),
             }),
             ..Default::default()
         };
@@ -609,6 +778,57 @@ mod tests {
         );
         assert_eq!(SourceKind::parse(""), Some(SourceKind::Upload));
         assert_eq!(SourceKind::parse("nope"), None);
+    }
+
+    #[test]
+    fn named_readers_open_a_base_to_those_people_and_roles_only() {
+        assert_eq!(
+            clean_reader("Ada@Example.com").unwrap(),
+            "user:ada@example.com"
+        );
+        assert_eq!(clean_reader("role:custom:r1").unwrap(), "role:custom:r1");
+        assert_eq!(clean_reader("USER:bo@x.io").unwrap(), "user:bo@x.io");
+        for bad in [
+            "ada",
+            "user:",
+            "user:no-at",
+            "role:",
+            "role:two words",
+            "x:y",
+        ] {
+            assert!(clean_reader(bad).is_err(), "{bad}");
+        }
+        let many: Vec<String> = (0..=MAX_READERS).map(|i| format!("u{i}@x.io")).collect();
+        assert!(clean_readers(&many).is_err());
+        assert_eq!(
+            clean_readers(&["a@x.io".into(), "A@x.io".into(), " ".into()]).unwrap(),
+            ["user:a@x.io"]
+        );
+
+        let open = Base::default();
+        let ada = Person::new("Ada@Example.com", "member");
+        let bo = Person::new("bo@example.com", "member");
+        let admin = Person::new("cy@example.com", "admin");
+        assert!(open.open_to(&ada) && open.open_to(&Person::default()));
+        let named = Base {
+            readers: vec!["user:ada@example.com".into(), "role:admin".into()],
+            ..Default::default()
+        };
+        assert!(named.open_to(&ada));
+        assert!(!named.open_to(&bo));
+        assert!(named.open_to(&admin));
+        assert!(!named.open_to(&Person::default()));
+        // Runs: a named base only for its readers, never for nobody.
+        assert!(named.searchable_in_run(Some(&ada)));
+        assert!(!named.searchable_in_run(Some(&bo)));
+        assert!(!named.searchable_in_run(None));
+        assert!(open.searchable_in_run(None));
+        // An old record has no readers and saves none.
+        let old: Base = serde_json::from_str(r#"{"id":"k","name":"n"}"#).unwrap();
+        assert!(old.readers.is_empty());
+        assert!(serde_json::to_value(&old).unwrap().get("readers").is_none());
+        assert_eq!(SourceKind::parse("mcp"), Some(SourceKind::McpSearch));
+        assert_eq!(Provider::Mcp.source_kind().label(), "Search tool (MCP)");
     }
 
     #[test]

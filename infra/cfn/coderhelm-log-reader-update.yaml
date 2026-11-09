@@ -1,8 +1,9 @@
 AWSTemplateFormatVersion: "2010-09-09"
 Description: >
   Brings the existing CoderHelmLogReader role up to date with the read-only
-  permissions the current CoderHelm release uses, and lets it search the
-  Bedrock knowledge bases named in KnowledgeBases. Every permission here is
+  permissions the current CoderHelm release uses, lets it search the
+  Bedrock knowledge bases named in KnowledgeBases, and lets it read the
+  documents in the S3 buckets named in ImportBuckets. Every permission here is
   read-only: CoderHelm can list, describe and query, never change anything.
   It only adds: to drop a permission an older release granted, update the
   CoderHelmLogReader stack itself with the current role template.
@@ -26,9 +27,20 @@ Parameters:
     AllowedPattern: "^(|all|arn:aws:bedrock:[a-z0-9-]+:[0-9]{12}:knowledge-base/[A-Z0-9]{10}(,arn:aws:bedrock:[a-z0-9-]+:[0-9]{12}:knowledge-base/[A-Z0-9]{10})*)$"
     ConstraintDescription: Knowledge base ARNs separated by commas, "all", or empty.
 
+  ImportBuckets:
+    Type: String
+    Default: ""
+    Description: >
+      S3 buckets CoderHelm may import knowledge base documents from,
+      read-only: their names separated by commas. Empty: none (the role reads
+      no object in any bucket).
+    AllowedPattern: "^(|[a-z0-9][a-z0-9.-]{1,61}[a-z0-9](,[a-z0-9][a-z0-9.-]{1,61}[a-z0-9])*)$"
+    ConstraintDescription: Bucket names separated by commas, or empty.
+
 Conditions:
   ReadsKnowledgeBases: !Not [!Equals [!Ref KnowledgeBases, ""]]
   ReadsEveryKnowledgeBase: !Equals [!Ref KnowledgeBases, "all"]
+  ReadsImportBuckets: !Not [!Equals [!Ref ImportBuckets, ""]]
 
 Resources:
   CoderHelmReadOnlyUpdate:
@@ -130,6 +142,9 @@ Resources:
               Action:
                 - "bedrock:Retrieve"
                 - "bedrock:GetDocumentContent"
+                - "bedrock:GetKnowledgeBase"
+                - "bedrock:ListDataSources"
+                - "bedrock:GetDataSource"
               Resource: !If
                 - ReadsEveryKnowledgeBase
                 - !Sub "arn:aws:bedrock:*:${AWS::AccountId}:knowledge-base/*"
@@ -142,4 +157,45 @@ Resources:
               Action:
                 - "bedrock:ListKnowledgeBases"
               Resource: "*"
+            - !Ref AWS::NoValue
+          # Imports: the documents in the buckets named in ImportBuckets,
+          # read so a knowledge base can index them; never a write, never
+          # another bucket.
+          - !If
+            - ReadsImportBuckets
+            - Sid: ReadImportBuckets
+              Effect: Allow
+              Action:
+                - "s3:ListBucket"
+                - "s3:GetBucketLocation"
+              Resource: !Split
+                - ","
+                - !Sub
+                  - "arn:aws:s3:::${Names}"
+                  - Names: !Join [",arn:aws:s3:::", !Split [",", !Ref ImportBuckets]]
+            - !Ref AWS::NoValue
+          - !If
+            - ReadsImportBuckets
+            - Sid: ReadImportObjects
+              Effect: Allow
+              Action:
+                - "s3:GetObject"
+              Resource: !Split
+                - ","
+                - !Sub
+                  - "arn:aws:s3:::${Names}/*"
+                  - Names: !Join ["/*,arn:aws:s3:::", !Split [",", !Ref ImportBuckets]]
+            - !Ref AWS::NoValue
+          # A bucket encrypted with its own KMS key: decrypt only through S3,
+          # so only objects the role may read anyway.
+          - !If
+            - ReadsImportBuckets
+            - Sid: DecryptImportsThroughS3
+              Effect: Allow
+              Action:
+                - "kms:Decrypt"
+              Resource: "*"
+              Condition:
+                StringLike:
+                  kms:ViaService: "s3.*.amazonaws.com"
             - !Ref AWS::NoValue
