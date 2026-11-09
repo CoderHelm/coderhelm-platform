@@ -377,6 +377,21 @@ class AccessItem(Base):
         self.cfn.get_template = denied
         self.assertEqual(u.access_compute(self.env)["existing"]["kind"], "other", "unreadable is never called deletable")
 
+    def test_mid_update_the_version_is_the_pins_not_the_older_output(self):
+        # The template already pins v1.1.0's access.json; the Version output still says v1.0.0.
+        self.cfn.deployed["Resources"]["ReleaseAssets"]["Properties"]["Files"][0]["Dest"] = "releases/v1.1.0/access.json"
+        v = u.access_compute(self.env)
+        self.assertEqual((v["state"], v["version"]), ("pending", "v1.1.0"))
+        self.assertEqual(self.urls, ["https://coderhelm-public.s3.amazonaws.com/launch/v1.1.0/access.json"])
+
+    def test_an_unsettled_read_is_read_again_within_a_minute(self):
+        from datetime import timedelta
+        self.body = self.body + b" "
+        u.handle({"action": "status"}, self.env, self.store, base.NOW, fetch=lambda repo: [])
+        self.body = self.body[:-1]
+        st = u.handle({"action": "status"}, self.env, self.store, base.NOW + timedelta(seconds=40), fetch=lambda repo: [])
+        self.assertEqual(st["native"]["access"]["state"], "pending")
+
     def test_a_changed_access_json_is_never_linked(self):
         self.body = self.body + b" "
         self.assertEqual(u.access_compute(self.env)["state"], "unknown")

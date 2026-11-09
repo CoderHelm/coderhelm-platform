@@ -2784,7 +2784,11 @@ def access_compute(env, cfn=None, iam=None, opener=None):
     deployed = deployed_template(cfn, root)
     files = ((((deployed.get("Resources") or {}).get("ReleaseAssets") or {}).get("Properties") or {}).get("Files")) or []
     pin = next((f for f in files if f.get("Key") == ACCESS_FILE), None)
-    version = stack_version(stack) or env.get("CODERHELM_VERSION") or ""
+    # The version comes from the pin itself (releases/<version>/access.json), the same
+    # template the sha256 comes from: mid-update the stack's Version output is still
+    # the older release while its template already pins the newer access.json.
+    m = re.match(r"releases/(v[^/]+)/" + re.escape(ACCESS_FILE) + "$", str((pin or {}).get("Dest") or ""))
+    version = (m.group(1) if m else "") or stack_version(stack) or env.get("CODERHELM_VERSION") or ""
     if not pin or not parse_version(version):
         return {"state": "none"}
     url = f"https://{NATIVE_HOST}/launch/{version}/{ACCESS_FILE}"
@@ -2838,7 +2842,8 @@ def access_compute(env, cfn=None, iam=None, opener=None):
 def access_view(store, env, now, force=False, **kw):
     """access_compute, at most every ACCESS_CACHE_SECONDS, or ACCESS_PENDING_SECONDS while a change waits (never fails the route)."""
     rec = store.get("ACCESS") or {}
-    ttl = ACCESS_PENDING_SECONDS if (rec.get("view") or {}).get("state") == "pending" else ACCESS_CACHE_SECONDS
+    # A change waiting, or a read that didn't settle (unknown), is read again soon.
+    ttl = ACCESS_PENDING_SECONDS if (rec.get("view") or {}).get("state") in ("pending", "unknown") else ACCESS_CACHE_SECONDS
     try:
         fresh = rec.get("at") and (now - datetime.fromisoformat(rec["at"])).total_seconds() < ttl
     except ValueError:
