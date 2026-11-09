@@ -114,6 +114,46 @@ fn a_check_the_change_really_failed_still_holds_with_ci_green() {
     assert_eq!(proof::without_settled_blocked(&body, true), None);
 }
 
+/// The same pull request, decided again by the sweep after the fix above
+/// shipped: still held, every 75 minutes, for a day. The decision only read
+/// the repository's CI when CoderHelm's own feature checks had findings;
+/// this pull request had none, so CI stayed "not green" without being asked
+/// and the tooling line kept holding although CI had passed on the head.
+#[test]
+fn the_decision_reads_ci_when_only_a_tooling_line_holds() {
+    let body = the_description_as_written();
+    let f = Facts {
+        draft: true,
+        body: body.clone(),
+        ..Default::default()
+    };
+    assert!(f.feature.is_none(), "no feature findings, as in the run");
+    assert!(ready::reads_ci(&f), "CI settles the line, so it is read");
+    // A description with no line CI settles, and no feature findings, needs
+    // no CI read.
+    let plain = Facts {
+        draft: true,
+        body: "## Summary\nx\n".into(),
+        ..Default::default()
+    };
+    assert!(!ready::reads_ci(&plain));
+    // A check the change really didn't pass is not settled by CI: no read
+    // needed for it, and it still holds whatever CI says.
+    let real = format!(
+        "## Summary\nx\n\n{}",
+        proof::gaps_section(&[proof::check_item(
+            "The new-feature rules",
+            "two new blocks aren't registered in the schema index",
+        )])
+    );
+    assert!(!proof::ci_settles_a_hold(&real));
+    // The gathering step asks the predicate, not the feature findings alone.
+    let ready_src = include_str!("../ready.rs");
+    let gather = super::fixture::fn_src(ready_src, "async fn gather(");
+    assert!(gather.contains("if reads_ci(&f) {"), "{gather}");
+    assert!(!gather.contains("if f.feature.is_some() {"), "{gather}");
+}
+
 #[test]
 fn the_pipeline_writes_gate_errors_through_check_item() {
     let src = include_str!("../mod.rs");

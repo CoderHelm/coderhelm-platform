@@ -1033,7 +1033,12 @@ Then the ```fix_location.json block described above."#,
             tokens_so_far = spent,
             "Planner gave no readable decision — asking again for the block only"
         );
-        let again = reask_decision(state, provider, usage, msg, intent, &problem, &files).await;
+        // The re-ask carries what the plan's checks still need in the block
+        // (a data migration's `release`), so asking for the block alone
+        // never drops it.
+        let also = super::release_plan::plan_gaps(&files, &abilities.release);
+        let again =
+            reask_decision(state, provider, usage, msg, intent, &problem, &files, &also).await;
         let outcome = if again.is_some() {
             "asked the planner again for the block: got it"
         } else {
@@ -1503,7 +1508,9 @@ fn needs_decision(tasks: &str) -> bool {
 
 /// Asks the planner once more for only its decision block: a fresh, small
 /// call with the plan it wrote, no tools, low effort. `None` when the reply
-/// still has no block that reads or the call fails.
+/// still has no block that reads or the call fails. `also`: what the plan's
+/// checks need in the block too (see `fix_location::reask_prompt`).
+#[allow(clippy::too_many_arguments)]
 async fn reask_decision(
     state: &WorkerState,
     provider: &ModelProvider,
@@ -1512,6 +1519,7 @@ async fn reask_decision(
     intent: super::triage::TicketIntent,
     problem: &super::fix_location::BlockProblem,
     files: &PlanResult,
+    also: &[String],
 ) -> Option<super::fix_location::FixDecision> {
     let prompt = super::fix_location::reask_prompt(
         &msg.title,
@@ -1520,6 +1528,7 @@ async fn reask_decision(
         &files.proposal,
         &files.design,
         &files.tasks,
+        also,
     );
     let mut messages = vec![(
         "user".to_string(),

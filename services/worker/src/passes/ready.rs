@@ -614,7 +614,7 @@ async fn gather(ctx: &Ctx<'_>) -> Result<Facts, Refused> {
     f.draft = pr["draft"].as_bool().unwrap_or(f.draft);
     f.body = pr["body"].as_str().unwrap_or("").to_string();
     f.title = pr["title"].as_str().unwrap_or("").to_string();
-    if f.feature.is_some() {
+    if reads_ci(&f) {
         let sha = pr["head"]["sha"].as_str().unwrap_or("");
         f.ci = ci_on(gh, ctx.owner, ctx.repo, sha).await.map_err(|e| {
             Refused::of(
@@ -638,6 +638,16 @@ async fn gather(ctx: &Ctx<'_>) -> Result<Facts, Refused> {
         );
     }
     Ok(f)
+}
+
+/// Whether the decision needs the repository's CI on the head: CoderHelm's
+/// own feature findings weigh against it, and so does a description line for
+/// a check CoderHelm's own tools couldn't run (CI green settles it, see
+/// `proof::holds_blocked_on`). CI was once read only for the first: a pull
+/// request whose one hold was such a line read CI as "not green" without
+/// asking, and stayed a draft on every sweep although its CI had passed.
+pub fn reads_ci(f: &Facts) -> bool {
+    f.feature.is_some() || super::proof::ci_settles_a_hold(&f.body)
 }
 
 /// Whether a check is CoderHelm's own (its review check, or any check its
