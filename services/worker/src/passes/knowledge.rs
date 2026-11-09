@@ -276,19 +276,64 @@ async fn remove_old_versions(state: &WorkerState, req: &IngestRequest, keep: u32
 
 // ── The agents' tool ────────────────────────────────────────────────────────
 
-/// The knowledge bases attached to one agent of a team.
+/// The knowledge bases attached to one agent of a team, for one run.
 pub struct KnowledgeTools {
     team_id: String,
     bases: Vec<kb::Base>,
+    /// The team member who started the run, when known: bases read with
+    /// each person's own sign-in search as them.
+    person: Option<kb::Person>,
+}
+
+/// The team member with `email`, with their role (an invited person who
+/// hasn't joined isn't one).
+async fn member(state: &WorkerState, team: &str, email: &str) -> Option<kb::Person> {
+    let mut start = None;
+    for _ in 0..20 {
+        let resp = state
+            .dynamo
+            .query()
+            .table_name(&state.config.users_table_name)
+            .key_condition_expression("pk = :pk AND begins_with(sk, :p)")
+            .expression_attribute_values(":pk", AttributeValue::S(team.to_string()))
+            .expression_attribute_values(":p", AttributeValue::S("USER#".into()))
+            .set_exclusive_start_key(start.take())
+            .send()
+            .await
+            .map_err(|e| warn!(error = %e, "Team members unreadable for knowledge access"))
+            .ok()?;
+        for i in resp.items() {
+            let s = |k: &str| {
+                i.get(k)
+                    .and_then(|v| v.as_s().ok())
+                    .map(String::as_str)
+                    .unwrap_or("")
+            };
+            if s("email").eq_ignore_ascii_case(email) && s("status") != "invited" {
+                return Some(kb::Person::new(email, s("role")));
+            }
+        }
+        match resp.last_evaluated_key() {
+            Some(k) => start = Some(k.clone()),
+            None => return None,
+        }
+    }
+    None
 }
 
 /// The tool's name.
 pub const TOOL: &str = "search_knowledge";
 
 impl KnowledgeTools {
-    /// The bases attached to `agent` (a key of `knowledge::AGENTS`), or None
-    /// when there are none.
-    pub async fn load(state: &WorkerState, team_id: &str, agent: &str) -> Option<Self> {
+    /// The bases attached to `agent` (a key of `knowledge::AGENTS`) that a
+    /// run started by `requester` (their email, when the run names one) may
+    /// search, or None when there are none.
+    pub async fn load(
+        state: &WorkerState,
+        team_id: &str,
+        agent: &str,
+        requester: Option<&str>,
+    ) -> Option<Self> {
         let bases = match common::knowledge::search::Store::bases(&store(state), team_id).await {
             Ok(b) => b,
             Err(e) => {
@@ -296,14 +341,32 @@ impl KnowledgeTools {
                 return None;
             }
         };
-        Self::from_bases(team_id, bases, agent)
+        let person = match requester.filter(|e| e.contains('@')) {
+            Some(e) if bases.iter().any(|b| b.attached_to(agent)) => {
+                member(state, team_id, e).await
+            }
+            _ => None,
+        };
+        Self::from_bases(team_id, bases, agent, person)
     }
 
-    pub fn from_bases(team_id: &str, bases: Vec<kb::Base>, agent: &str) -> Option<Self> {
-        let bases: Vec<kb::Base> = bases.into_iter().filter(|b| b.attached_to(agent)).collect();
+    /// The attached bases this run may search: a base for named readers only
+    /// in runs one of them started, a base read with each person's own
+    /// sign-in only when a person started the run (`kb::Base::searchable_in_run`).
+    pub fn from_bases(
+        team_id: &str,
+        bases: Vec<kb::Base>,
+        agent: &str,
+        person: Option<kb::Person>,
+    ) -> Option<Self> {
+        let bases: Vec<kb::Base> = bases
+            .into_iter()
+            .filter(|b| b.attached_to(agent) && b.searchable_in_run(person.as_ref()))
+            .collect();
         (!bases.is_empty()).then(|| Self {
             team_id: team_id.to_string(),
             bases,
+            person,
         })
     }
 
@@ -367,11 +430,30 @@ impl KnowledgeTools {
             client: &state.bedrock,
             meter: &meter,
         };
-        let retriever = common::knowledge::remote::Bedrock {
-            sts: &state.sts,
-            dynamo: &state.dynamo,
-            accounts_table: &state.config.aws_insights_table_name,
-            actor: "knowledge",
+        let servers = common::knowledge::remote_mcp::RuntimeServers {
+            rt: common::mcp_remote::runtime::Runtime::aws(
+                state.dynamo.clone(),
+                if state.config.mcp_configs_table_name.is_empty() {
+                    &state.config.settings_table_name
+                } else {
+                    &state.config.mcp_configs_table_name
+                },
+                state.kms.clone(),
+                &state.config.secrets_key_id,
+                &self.team_id,
+            ),
+        };
+        let retriever = common::knowledge::remote::Connected {
+            bedrock: common::knowledge::remote::Bedrock {
+                sts: &state.sts,
+                dynamo: &state.dynamo,
+                accounts_table: &state.config.aws_insights_table_name,
+                actor: "knowledge",
+            },
+            mcp: common::knowledge::remote_mcp::McpSearch {
+                servers: &servers,
+                person: self.person.as_ref().map(|p| p.email.clone()),
+            },
         };
         let hits = search(
             &store(state),
@@ -462,16 +544,67 @@ mod tests {
             base("b", &[], true),
             base("c", &["coder"], false),
         ];
-        let r = KnowledgeTools::from_bases("t", bases.clone(), "reviewer").unwrap();
+        let r = KnowledgeTools::from_bases("t", bases.clone(), "reviewer", None).unwrap();
         let ids: Vec<&str> = r.bases.iter().map(|b| b.id.as_str()).collect();
         assert_eq!(ids, ["a", "b"]);
-        assert!(
-            KnowledgeTools::from_bases("t", vec![base("c", &["coder"], false)], "planner")
-                .is_none()
-        );
+        assert!(KnowledgeTools::from_bases(
+            "t",
+            vec![base("c", &["coder"], false)],
+            "planner",
+            None
+        )
+        .is_none());
         let p = r.prompt_section();
         assert!(p.contains("Base a") && p.contains("search_knowledge"));
         assert_eq!(r.tools()[0].name, TOOL);
+    }
+
+    #[test]
+    fn a_run_only_searches_the_bases_its_person_may_read() {
+        let mut named = base("hr", &[], true);
+        named.readers = vec!["user:ada@example.com".into(), "role:admin".into()];
+        let mut per_person = base("glean", &[], true);
+        per_person.backend = kb::Backend::Remote(kb::remote_mcp::mcp_remote(
+            "search-1",
+            &kb::remote_mcp::Checked {
+                server_name: "Glean".into(),
+                search_tool: "search".into(),
+                fetch_tool: String::new(),
+                per_person: true,
+            },
+        ));
+        let open = base("docs", &[], true);
+        let all = vec![named, per_person, open];
+        let ids = |p: Option<kb::Person>| {
+            KnowledgeTools::from_bases("t", all.clone(), "coder", p)
+                .map(|k| k.bases.iter().map(|b| b.id.clone()).collect::<Vec<_>>())
+                .unwrap_or_default()
+        };
+        // Nobody started it (a scheduled run): only the base open to every run.
+        assert_eq!(ids(None), ["docs"]);
+        // A named reader gets all three; another member doesn't get the named base.
+        assert_eq!(
+            ids(Some(kb::Person::new("ada@example.com", "member"))),
+            ["hr", "glean", "docs"]
+        );
+        assert_eq!(
+            ids(Some(kb::Person::new("bo@example.com", "member"))),
+            ["glean", "docs"]
+        );
+        // A named role counts.
+        assert_eq!(
+            ids(Some(kb::Person::new("cy@example.com", "admin"))),
+            ["hr", "glean", "docs"]
+        );
+        // The person searches the per-person base as themselves.
+        let k = KnowledgeTools::from_bases(
+            "t",
+            all.clone(),
+            "coder",
+            Some(kb::Person::new("Bo@Example.com", "member")),
+        )
+        .unwrap();
+        assert_eq!(k.person.unwrap().email, "bo@example.com");
     }
 
     #[test]

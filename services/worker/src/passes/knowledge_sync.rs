@@ -74,6 +74,13 @@ pub async fn sync(state: &WorkerState, msg: &SyncMessage) -> Value {
         team: msg.team_id.clone(),
         http: Arc::new(common::mcp_remote::http::GuardedHttps),
         github_token,
+        aws: Some(connect::AwsEnv {
+            sts: state.sts.clone(),
+            accounts_table: state.config.aws_insights_table_name.clone(),
+            s3: state.s3.clone(),
+            bucket: state.config.bucket_name.clone(),
+            actor: "knowledge-sync".into(),
+        }),
     };
     let now = || chrono::Utc::now().timestamp();
     if let Some(si) = &src.signin {

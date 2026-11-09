@@ -221,16 +221,17 @@ impl PermissionCheck {
     /// missing), the one-click update and any problem. `template_url` is
     /// the install's role template ([`crate::public_urls::log_reader_template_url`]).
     pub fn view(&self, pressed: bool, template_url: &str) -> Value {
-        self.view_with(pressed, template_url, &[])
+        self.view_with(pressed, template_url, &log_reader::Chosen::default())
     }
 
-    /// [`Self::view`], with the ARNs of the team's knowledge bases connected
-    /// in this account: the update keeps the role able to search them.
+    /// [`Self::view`], with what the team chose in this account (its
+    /// connected knowledge bases and its import buckets): the update keeps
+    /// the role able to search and read them.
     pub fn view_with(
         &self,
         pressed: bool,
         template_url: &str,
-        knowledge_bases: &[String],
+        chosen: &log_reader::Chosen,
     ) -> Value {
         let missing: Vec<Value> = self
             .missing
@@ -267,8 +268,8 @@ impl PermissionCheck {
             .flatten()
             .map(|t| {
                 json!({
-                    "url": log_reader::update_url(&t, &self.region, knowledge_bases),
-                    "stack_name": log_reader::update_stack_name_for(knowledge_bases),
+                    "url": log_reader::update_url(&t, &self.region, chosen),
+                    "stack_name": log_reader::update_stack_name_for(chosen),
                     "template_url": t,
                     "sign_in_account": self.account,
                     "stacks_url": log_reader::stack_list_url(&self.region),

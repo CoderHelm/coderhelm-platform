@@ -699,7 +699,13 @@ pub async fn run(
         &plan.tasks,
     );
     // Knowledge bases the team attached to the coder.
-    let knowledge = super::knowledge::KnowledgeTools::load(state, &msg.team_id, "coder").await;
+    let knowledge = super::knowledge::KnowledgeTools::load(
+        state,
+        &msg.team_id,
+        "coder",
+        super::requester_email(msg),
+    )
+    .await;
     if let Some(k) = &knowledge {
         tools.extend(k.tools());
         full_system.push_str(&k.prompt_section());

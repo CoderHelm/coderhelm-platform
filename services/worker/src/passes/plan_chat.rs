@@ -108,7 +108,7 @@ async fn load(state: &WorkerState, req: &Request) -> Loaded {
     let knowledge = if req.feature == "brain" {
         None
     } else {
-        super::knowledge::KnowledgeTools::load(state, &req.team_id, "plan_chat").await
+        super::knowledge::KnowledgeTools::load(state, &req.team_id, "plan_chat", None).await
     };
     Loaded {
         skills,

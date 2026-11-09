@@ -180,7 +180,14 @@ test("self-host: the gateway and worker read the install's own account with this
   const t = synth(selfHost());
   // Every permission the services check a role against (services/common/src/log_reader.rs ABILITIES).
   const rs = fs.readFileSync(path.join(INFRA, "..", "services", "common", "src", "log_reader.rs"), "utf8");
-  const abilities = rs.slice(rs.indexOf("pub const ABILITIES"), rs.indexOf("];", rs.indexOf("pub const ABILITIES")));
+  const all = rs.slice(rs.indexOf("pub const ABILITIES"), rs.indexOf("];", rs.indexOf("pub const ABILITIES")));
+  // Knowledge imports from S3 read a bucket only with the team's CoderHelmLogReader role, whose stack
+  // names each bucket (services/common/src/knowledge/sources/s3.rs): the install's own role never gains
+  // read on the account's buckets.
+  const importsAt = all.indexOf('key: "imports"');
+  assert.ok(importsAt > 0, "the imports ability");
+  const nextAt = all.indexOf("Ability {", importsAt);
+  const abilities = all.slice(0, importsAt) + (nextAt > 0 ? all.slice(nextAt) : "");
   const needed = [...new Set([...abilities.matchAll(/"([a-z0-9-]+:[A-Za-z]+)"/g)].map((m) => m[1]))];
   assert.ok(needed.length > 20, `${needed.length} actions`);
   for (const [stack, fn] of [
@@ -193,6 +200,7 @@ test("self-host: the gateway and worker read the install's own account with this
     assert.equal(policies.length, 1, `${fn}: one read policy`);
     const doc = JSON.stringify(policies[0].Properties.PolicyDocument);
     for (const a of needed) assert.ok(doc.includes(`"${a}"`), `${fn} lacks ${a}`);
+    for (const a of ["s3:GetObject", "s3:ListBucket", "kms:Decrypt"]) assert.ok(!doc.includes(`"${a}"`), `${fn} must not read buckets with ${a}`);
     // Only reads: list, describe, get, query, never a write.
     const actions: string[] = policies[0].Properties.PolicyDocument.Statement.flatMap((s: any) => ([] as string[]).concat(s.Action));
     for (const a of actions) assert.match(a, /^[a-z0-9-]+:(List|Describe|Get|Filter|Start(Query)?$|Stop(Query)?$|BatchGet|Simulate|InvokeRestApi|Retrieve$)/, a);

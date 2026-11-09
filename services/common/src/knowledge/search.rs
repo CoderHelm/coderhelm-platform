@@ -269,12 +269,84 @@ async fn query_data<T: for<'de> Deserialize<'de>>(
 }
 
 /// Indexes kept in memory, by key (a key names one version, so a cached
-/// index is never stale).
-fn cache() -> &'static Mutex<HashMap<String, Arc<Index>>> {
-    static C: OnceLock<Mutex<HashMap<String, Arc<Index>>>> = OnceLock::new();
-    C.get_or_init(|| Mutex::new(HashMap::new()))
+/// index is never stale), least recently used first out once they pass
+/// [`CACHE_BYTES`] or [`CACHE_ENTRIES`].
+#[derive(Default)]
+pub struct IndexCache {
+    map: HashMap<String, (Arc<Index>, usize, u64)>,
+    bytes: usize,
+    tick: u64,
 }
-const CACHE_ENTRIES: usize = 64;
+
+/// Memory the cached indexes may take in one process.
+pub const CACHE_BYTES: usize = 160 * 1024 * 1024;
+/// Indexes one process keeps at most.
+pub const CACHE_ENTRIES: usize = 4_096;
+/// Indexes read at once for one search.
+pub const LOAD_CONCURRENCY: usize = 16;
+
+/// About how much memory an index takes.
+pub fn index_bytes(i: &Index) -> usize {
+    i.chunks
+        .iter()
+        .map(|c| c.vector.len() * 4 + c.text.len() + c.loc.len() + 64)
+        .sum::<usize>()
+        + 64
+}
+
+impl IndexCache {
+    pub fn get(&mut self, key: &str) -> Option<Arc<Index>> {
+        self.tick += 1;
+        let tick = self.tick;
+        self.map.get_mut(key).map(|e| {
+            e.2 = tick;
+            e.0.clone()
+        })
+    }
+
+    /// Keeps `index`, letting the least recently used go until it fits.
+    /// An index bigger than the whole budget isn't kept.
+    pub fn put(&mut self, key: &str, index: Arc<Index>, budget: usize, entries: usize) {
+        let size = index_bytes(&index);
+        if size > budget {
+            return;
+        }
+        if let Some((_, old, _)) = self.map.remove(key) {
+            self.bytes -= old;
+        }
+        while !self.map.is_empty() && (self.bytes + size > budget || self.map.len() >= entries) {
+            let oldest = self
+                .map
+                .iter()
+                .min_by_key(|(_, e)| e.2)
+                .map(|(k, _)| k.clone())
+                .unwrap_or_default();
+            if let Some((_, b, _)) = self.map.remove(&oldest) {
+                self.bytes -= b;
+            }
+        }
+        self.tick += 1;
+        self.bytes += size;
+        self.map.insert(key.to_string(), (index, size, self.tick));
+    }
+
+    pub fn len(&self) -> usize {
+        self.map.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.map.is_empty()
+    }
+
+    pub fn bytes(&self) -> usize {
+        self.bytes
+    }
+}
+
+fn cache() -> &'static Mutex<IndexCache> {
+    static C: OnceLock<Mutex<IndexCache>> = OnceLock::new();
+    C.get_or_init(|| Mutex::new(IndexCache::default()))
+}
 
 #[async_trait::async_trait]
 impl Store for AwsStore {
@@ -315,7 +387,7 @@ impl Store for AwsStore {
         if !super::owns_key(team_id, key) {
             return Err("that index isn't this team's".into());
         }
-        if let Some(hit) = cache().lock().ok().and_then(|c| c.get(key).cloned()) {
+        if let Some(hit) = cache().lock().ok().and_then(|mut c| c.get(key)) {
             return Ok(hit);
         }
         let obj = self
@@ -334,10 +406,7 @@ impl Store for AwsStore {
             .into_bytes();
         let index = Arc::new(decode_index(&bytes)?);
         if let Ok(mut c) = cache().lock() {
-            if c.len() >= CACHE_ENTRIES {
-                c.clear();
-            }
-            c.insert(key.to_string(), index.clone());
+            c.put(key, index.clone(), CACHE_BYTES, CACHE_ENTRIES);
         }
         Ok(index)
     }
@@ -673,8 +742,17 @@ pub async fn search(
         let qv = embedder.embed(crate::truncate_str(query, 8_000)).await?;
         let mut loaded: Vec<(Base, FileMeta, Arc<Index>)> = Vec::new();
         let mut stale = Vec::new();
-        for (base, file, key) in &files {
-            match store.index(team_id, key).await {
+        // Many files at once (an import holds thousands), in a steady order.
+        let mut read = Vec::with_capacity(files.len());
+        for group in files.chunks(LOAD_CONCURRENCY) {
+            let got =
+                futures::future::join_all(group.iter().map(|f| store.index(team_id, &f.2))).await;
+            for (f, index) in group.iter().zip(got) {
+                read.push((&f.0, &f.1, index));
+            }
+        }
+        for (base, file, index) in read {
+            match index {
                 Ok(i) if i.model != embedder.model() || i.dims != qv.len() => {
                     tracing::warn!(kb = %base.id, file = %file.id, model = %i.model, dims = i.dims,
                         "Knowledge index from another embedding model; needs re-embedding");
@@ -791,7 +869,12 @@ pub async fn search(
                 kb_name: base.name.clone(),
                 score,
                 authoritative: base.authoritative,
-                source_kind: super::SourceKind::BedrockKb.key().into(),
+                source_kind: base
+                    .remote()
+                    .map(|r| r.provider.source_kind())
+                    .unwrap_or(super::SourceKind::BedrockKb)
+                    .key()
+                    .into(),
                 ..h.clone()
             },
         };
@@ -981,6 +1064,10 @@ pub mod testing {
                     account: account.into(),
                 },
                 hybrid: true,
+                per_person: false,
+                search_tool: String::new(),
+                fetch_tool: String::new(),
+                name: String::new(),
             }),
             ..Default::default()
         }
@@ -1083,6 +1170,51 @@ pub mod testing {
 mod tests {
     use super::testing::*;
     use super::*;
+
+    #[test]
+    fn the_index_cache_keeps_the_most_recently_used_within_its_budget() {
+        let idx = |n: usize| {
+            Arc::new(Index {
+                model: "m".into(),
+                dims: 4,
+                chunks: (0..n)
+                    .map(|i| IndexedChunk {
+                        ord: i as u32,
+                        loc: String::new(),
+                        text: "x".repeat(36),
+                        vector: vec![0.0; 4],
+                    })
+                    .collect(),
+            })
+        };
+        let one = index_bytes(&idx(1));
+        let mut c = IndexCache::default();
+        let budget = one * 3;
+        c.put("a", idx(1), budget, 100);
+        c.put("b", idx(1), budget, 100);
+        c.put("c", idx(1), budget, 100);
+        assert_eq!(c.len(), 3);
+        // "a" is used, so "b" is the oldest when "d" needs room.
+        assert!(c.get("a").is_some());
+        c.put("d", idx(1), budget, 100);
+        assert!(c.get("b").is_none());
+        assert!(c.get("a").is_some() && c.get("c").is_some() && c.get("d").is_some());
+        assert!(c.bytes() <= budget);
+        // Too big for the whole budget: not kept, nothing else lost.
+        c.put("huge", idx(10), budget, 100);
+        assert!(c.get("huge").is_none());
+        assert_eq!(c.len(), 3);
+        // The entry cap holds too.
+        let mut small = IndexCache::default();
+        for k in ["p", "q", "r"] {
+            small.put(k, idx(1), usize::MAX, 2);
+        }
+        assert_eq!(small.len(), 2);
+        assert!(small.get("p").is_none());
+        // Putting the same key again replaces it without counting it twice.
+        small.put("r", idx(2), usize::MAX, 2);
+        assert_eq!(small.bytes(), index_bytes(&idx(1)) + index_bytes(&idx(2)));
+    }
 
     fn base(id: &str, name: &str) -> Base {
         Base {

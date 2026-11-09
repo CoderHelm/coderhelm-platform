@@ -1,6 +1,10 @@
 //! Connected sources: a knowledge base kept in sync with pages that live
 //! somewhere else (Notion, Confluence, Sanity, Google Drive, GitHub, public
-//! web pages), next to the files people upload.
+//! web pages), next to the files people upload; and imports of an existing
+//! knowledge base: an S3 bucket of documents (or the S3 data source behind
+//! a Bedrock knowledge base) and an uploaded export archive. An import is a
+//! source like the others, so re-syncing, removing what was deleted and
+//! re-embedding only what changed work the same way.
 //!
 //! A source is one connector plus a selection ("these Notion pages and
 //! everything under them"). Syncing it works the same for every connector
@@ -35,6 +39,8 @@
 //! the GitHub App) and the worker opens it for each sync.
 
 pub mod alert;
+pub mod archive;
+pub mod bedrock_import;
 pub mod confluence;
 pub mod connect;
 pub mod connector;
@@ -43,6 +49,7 @@ pub mod github;
 pub mod mcp;
 pub mod notion;
 pub mod oauth;
+pub mod s3;
 pub mod sanity;
 pub mod sanity_mcp;
 pub mod sanity_repos;
@@ -77,6 +84,10 @@ pub const MAX_SOURCES_PER_BASE: usize = 10;
 /// Items one source keeps; a bigger selection syncs its first ones and says
 /// so.
 pub const MAX_ITEMS_PER_SOURCE: usize = 1_000;
+/// Items one import keeps (an S3 bucket, an archive). Higher than a synced
+/// app's, still bounded: every local base is ranked in memory, so a bigger
+/// corpus is connected in place instead (the page says so).
+pub const MAX_ITEMS_PER_IMPORT: usize = 2_500;
 /// Entries one selection holds (each may cover a whole tree).
 pub const MAX_SELECTED: usize = 100;
 /// How often a source is synced on schedule without webhooks.
@@ -103,16 +114,22 @@ pub enum Kind {
     GoogleDrive,
     Github,
     Web,
+    /// Documents in an S3 bucket, read with the team's role in its account.
+    S3,
+    /// An uploaded export archive (`.zip`), unpacked on the server.
+    Archive,
 }
 
 impl Kind {
-    pub const ALL: [Kind; 6] = [
+    pub const ALL: [Kind; 8] = [
         Kind::Notion,
         Kind::Confluence,
         Kind::Sanity,
         Kind::GoogleDrive,
         Kind::Github,
         Kind::Web,
+        Kind::S3,
+        Kind::Archive,
     ];
 
     pub fn key(self) -> &'static str {
@@ -123,6 +140,8 @@ impl Kind {
             Kind::GoogleDrive => "google_drive",
             Kind::Github => "github",
             Kind::Web => "web",
+            Kind::S3 => "s3",
+            Kind::Archive => "archive",
         }
     }
 
@@ -138,6 +157,8 @@ impl Kind {
             Kind::GoogleDrive => "Google Drive",
             Kind::Github => "GitHub",
             Kind::Web => "Website",
+            Kind::S3 => "Amazon S3",
+            Kind::Archive => "Archive upload",
         }
     }
 
@@ -150,6 +171,22 @@ impl Kind {
             Kind::GoogleDrive => "Folders, Docs, Sheets, Slides and PDFs",
             Kind::Github => "Docs folders and Markdown in your repositories",
             Kind::Web => "Public pages or a whole sitemap",
+            Kind::S3 => "Documents in a bucket, or a Bedrock knowledge base's data source",
+            Kind::Archive => "A Notion or Confluence export, or a zipped docs folder",
+        }
+    }
+
+    /// An import of an existing knowledge base (higher limits).
+    pub fn is_import(self) -> bool {
+        matches!(self, Kind::S3 | Kind::Archive)
+    }
+
+    /// Items one source of this kind keeps.
+    pub fn max_items(self) -> usize {
+        if self.is_import() {
+            MAX_ITEMS_PER_IMPORT
+        } else {
+            MAX_ITEMS_PER_SOURCE
         }
     }
 
@@ -800,5 +837,10 @@ mod tests {
             assert_eq!(serde_json::to_value(k).unwrap(), serde_json::json!(k.key()));
         }
         assert_eq!(Kind::parse("dropbox"), None);
+        assert_eq!(Kind::parse("s3"), Some(Kind::S3));
+        assert_eq!(Kind::parse("archive"), Some(Kind::Archive));
+        assert!(!Kind::S3.has_webhooks() && !Kind::Archive.has_webhooks());
+        assert!(Kind::S3.max_items() > Kind::Notion.max_items());
+        assert_eq!(Kind::Archive.max_items(), MAX_ITEMS_PER_IMPORT);
     }
 }

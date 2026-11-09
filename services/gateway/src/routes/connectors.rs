@@ -172,12 +172,12 @@ async fn log_reader(
 /// role up to this release's permissions (metrics, Airflow, ECS and the
 /// rest), as a stack in its own account, from the install's own template
 /// copy. None when the install's template has no update template next to
-/// it (a template URL an operator chose). `knowledge_bases` are the ARNs
-/// of the team's knowledge bases connected in that account, which the
-/// update lets the role search.
-pub fn update_stack_url(region: &str, knowledge_bases: &[String]) -> Option<String> {
+/// it (a template URL an operator chose). `chosen` are the team's knowledge
+/// bases connected in that account and the buckets it imports from, which
+/// the update lets the role search and read.
+pub fn update_stack_url(region: &str, chosen: &common::log_reader::Chosen) -> Option<String> {
     common::log_reader::update_template_url(&common::public_urls::log_reader_template_url())
-        .map(|t| common::log_reader::update_url(&t, region, knowledge_bases))
+        .map(|t| common::log_reader::update_url(&t, region, chosen))
 }
 
 async fn record(
@@ -860,7 +860,7 @@ pub async fn aws_check(
         {
             None
         } else {
-            update_stack_url(&t.region, &[])
+            update_stack_url(&t.region, &common::log_reader::Chosen::default())
         },
         "stack_name": common::log_reader::update_stack_name(),
         "template_url": common::log_reader::update_template_url(&template),
@@ -911,7 +911,7 @@ mod tests {
 
     #[test]
     fn the_update_link_opens_the_update_stack_for_the_existing_role() {
-        let u = update_stack_url("us-west-2", &[]).unwrap();
+        let u = update_stack_url("us-west-2", &common::log_reader::Chosen::default()).unwrap();
         assert!(u.starts_with("https://console.aws.amazon.com/cloudformation/home?region=us-west-2#/stacks/quickcreate?"));
         assert!(u.contains("stackName=CoderHelmLogReaderUpdate-"));
         assert!(u.contains("coderhelm-log-reader-update.yaml"));

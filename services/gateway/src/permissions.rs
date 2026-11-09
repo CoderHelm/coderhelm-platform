@@ -354,6 +354,10 @@ pub const CAPABILITIES: &[Capability] = &[
         handlers: &[
             "knowledge::create_base",
             "knowledge::bedrock_bases",
+            "knowledge::bedrock_import",
+            "knowledge::search_tools",
+            "knowledge::start_archive",
+            "knowledge::finish_archive",
             "knowledge::check_connection",
             "knowledge::update_base",
             "knowledge::delete_base",

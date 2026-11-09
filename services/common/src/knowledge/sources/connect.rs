@@ -12,6 +12,8 @@
 //! | Google Drive | Google sign-in (OAuth) | |
 //! | GitHub | the Coderhelm GitHub App | |
 //! | Website | none needed | |
+//! | Amazon S3 | the team's `CoderHelmLogReader` role in the bucket's account | |
+//! | Archive upload | none needed (the upload is in the team's own folder) | |
 //!
 //! A token is opened for the one call that needs it and never leaves the
 //! server.
@@ -36,7 +38,7 @@ use super::connector::{Connector, ConnectorError};
 use super::mcp::RuntimeTools;
 use super::oauth::{catalog_id, connection_id};
 use super::sanity_mcp::{self, SanityMcp};
-use super::{confluence, gdrive, github, notion, sanity, web, Kind, SignIn, Source};
+use super::{archive, confluence, gdrive, github, notion, s3, sanity, web, Kind, SignIn, Source};
 use crate::live::connectors::{self as conns, ConnKind};
 use crate::mcp_remote::http::Http;
 use crate::mcp_remote::runtime::{ConnError, Detected, KmsCipher, Runtime};
@@ -54,6 +56,64 @@ pub struct Env {
     pub http: Arc<dyn Http>,
     /// An installation token of the team's GitHub App, when it has one.
     pub github_token: Option<String>,
+    /// AWS, for imports: the team's connected accounts and the data bucket.
+    pub aws: Option<AwsEnv>,
+}
+
+/// What an import from AWS (an S3 bucket) or an uploaded archive needs.
+#[derive(Clone)]
+pub struct AwsEnv {
+    pub sts: aws_sdk_sts::Client,
+    /// The table of connected AWS accounts (`AWS_CONN#`).
+    pub accounts_table: String,
+    /// The data bucket uploads are kept in, and its client.
+    pub s3: aws_sdk_s3::Client,
+    pub bucket: String,
+    /// Names the session in the team's AWS records.
+    pub actor: String,
+}
+
+impl Env {
+    /// The team's connected AWS accounts.
+    pub async fn aws_accounts(&self) -> Vec<crate::live::aws_account::AwsAccount> {
+        let Some(a) = self.aws.as_ref().filter(|a| !a.accounts_table.is_empty()) else {
+            return Vec::new();
+        };
+        crate::live::aws_account::list(&self.dynamo, &a.accounts_table, &self.team)
+            .await
+            .unwrap_or_default()
+    }
+
+    /// A session on the team's role in the account that holds bucket `w`.
+    pub async fn s3_session(
+        &self,
+        w: &s3::Where,
+    ) -> Result<crate::live::aws::Session, ConnectorError> {
+        let a = self
+            .aws
+            .as_ref()
+            .ok_or_else(|| ConnectorError::Config("This Coderhelm can't reach AWS here.".into()))?;
+        let accounts = self.aws_accounts().await;
+        let acct = accounts.iter().find(|x| x.account == w.account).ok_or_else(|| {
+            ConnectorError::Reconnect(format!(
+                "AWS account {} isn't connected to Coderhelm. Connect it on Settings, Integrations, AWS.",
+                w.account
+            ))
+        })?;
+        let target = crate::live::aws::AwsTarget {
+            region: if w.region.is_empty() {
+                acct.region.clone()
+            } else {
+                w.region.clone()
+            },
+            ..acct.target()
+        };
+        // Always the team's role, never the install's own: an admin names
+        // every bucket the role may read.
+        crate::live::aws::assume_exact(&a.sts, &target, &a.actor)
+            .await
+            .map_err(|e| ConnectorError::Reconnect(format!("{} {}", e.message, e.fix)))
+    }
 }
 
 /// How a connector reaches its provider.
@@ -66,6 +126,10 @@ pub enum Via {
     SavedKey,
     GithubApp,
     Public,
+    /// The team's role in its AWS account.
+    AwsRole,
+    /// An archive uploaded to the team's own folder.
+    Upload,
 }
 
 /// A connector ready to call, and the settings it worked out on the way
@@ -330,6 +394,56 @@ pub async fn open<'a>(
             )
         }
         Kind::Web => (Box::new(web::Web { http }), Via::Public),
+        Kind::S3 => {
+            let w = s3::where_of(&opts).map_err(ConnectorError::Config)?;
+            let session = env.s3_session(&w).await?;
+            let mut objects = s3::AwsObjects::new(&session, &w);
+            let region = if w.region.is_empty() {
+                let r = s3::bucket_region(&objects).await?;
+                opts["region"] = json!(r);
+                objects = s3::AwsObjects::new(
+                    &session,
+                    &s3::Where {
+                        region: r.clone(),
+                        ..w.clone()
+                    },
+                );
+                r
+            } else {
+                w.region.clone()
+            };
+            (
+                Box::new(s3::S3 {
+                    objects: Box::new(objects),
+                    bucket: w.bucket,
+                    region,
+                    max_items: Kind::S3.max_items(),
+                }),
+                Via::AwsRole,
+            )
+        }
+        Kind::Archive => {
+            let a = env.aws.as_ref().ok_or_else(|| {
+                ConnectorError::Config("This Coderhelm can't read uploads here.".into())
+            })?;
+            let key = opts["key"].as_str().unwrap_or("").to_string();
+            if key.is_empty() || !crate::knowledge::owns_key(&env.team, &key) {
+                return Err(ConnectorError::Config(
+                    "Upload the archive again: its upload wasn't found.".into(),
+                ));
+            }
+            (
+                Box::new(archive::Archive::new(
+                    Box::new(archive::StoredArchive {
+                        s3: a.s3.clone(),
+                        bucket: a.bucket.clone(),
+                        key,
+                    }),
+                    Kind::Archive.max_items(),
+                )),
+                Via::Upload,
+            )
+        }
     };
     Ok(Opened {
         connector,
@@ -581,6 +695,18 @@ pub async fn status(env: &Env, kind: Kind, app_configured: bool, member: &str) -
         Kind::Web => {
             st.connected = true;
             st.via = "public".into();
+        }
+        Kind::Archive => {
+            st.connected = true;
+            st.via = "upload".into();
+        }
+        Kind::S3 => {
+            st.connected = !env.aws_accounts().await.is_empty();
+            if st.connected {
+                st.via = "aws_role".into();
+            } else {
+                st.hint = "Connect the AWS account the bucket is in first (Settings, then Integrations, then AWS).".into();
+            }
         }
         Kind::Github => {
             st.connected = env.github_token.is_some();

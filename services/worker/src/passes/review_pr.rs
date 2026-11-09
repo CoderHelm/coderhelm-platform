@@ -1945,7 +1945,7 @@ async fn run_once(
             )
         };
         let knowledge =
-            super::knowledge::KnowledgeTools::load(state, &msg.team_id, "reviewer").await;
+            super::knowledge::KnowledgeTools::load(state, &msg.team_id, "reviewer", None).await;
         let system = match &knowledge {
             Some(k) => format!("{system}{}", k.prompt_section()),
             None => system,
@@ -2801,7 +2801,8 @@ async fn run_once(
     let extra_context = format!("{extra_context}{agent_notes}");
 
     // Knowledge bases the team attached to the reviewer.
-    let knowledge = super::knowledge::KnowledgeTools::load(state, &msg.team_id, "reviewer").await;
+    let knowledge =
+        super::knowledge::KnowledgeTools::load(state, &msg.team_id, "reviewer", None).await;
     // 1) High-recall generation with repo-walking tools.
     live_job
         .step(
