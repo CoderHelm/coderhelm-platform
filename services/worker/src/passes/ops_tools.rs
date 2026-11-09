@@ -648,7 +648,7 @@ impl OpsTools {
             ));
             out.push(tool(
                 "newrelic_nrql",
-                "Run ONE NRQL query (read-only), e.g. `SELECT average(duration), percentage(count(*), WHERE error IS true) FROM Transaction WHERE appName = 'api' SINCE 2 hours ago TIMESERIES`. Ask for few rows.",
+                "Run ONE NRQL query (read-only), e.g. `SELECT average(duration), percentage(count(*), WHERE error IS true) FROM Transaction WHERE appName = 'api' SINCE 2 hours ago TIMESERIES`. Ask for few rows. Rules New Relic enforces: uniques() and keyset() can't take FACET; strings use single quotes; to compare metrics per resource select them directly (`SELECT average(aws.rds.CPUUtilization) FROM Metric FACET aws.rds.DBClusterIdentifier SINCE 1 day ago`); unsure what exists? `SHOW EVENT TYPES`, then `SELECT keyset() FROM <EventType>`.",
                 json!({ "type": "object", "properties": { "account": account, "nrql": { "type": "string" } }, "required": ["nrql"] }),
             ));
             out.push(tool(

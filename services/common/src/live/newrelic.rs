@@ -36,6 +36,47 @@ fn refused(message: impl Into<String>, fix: &str) -> StepError {
 }
 
 /// Checks NRQL: one statement that starts with SELECT, FROM or SHOW.
+/// What to change when New Relic refuses an NRQL query: a concrete rewrite
+/// for the mistakes queries most often make, else the general rules. The
+/// agent reads it with the error and asks again.
+pub fn nrql_fix(refusal: &str) -> String {
+    let m = refusal.to_ascii_lowercase();
+    let has = |s: &str| m.contains(s);
+    let specific = if has("facet") && (has("uniques") || has("keyset")) {
+        "uniques() and keyset() can't be combined with FACET. To see which metrics exist, drop the FACET: `SELECT uniques(metricName) FROM Metric WHERE metricName LIKE 'aws.rds.%' SINCE 1 day ago`. To compare them per resource, select the metrics themselves: `SELECT average(aws.rds.CPUUtilization), max(aws.rds.DatabaseConnections) FROM Metric FACET aws.rds.DBClusterIdentifier SINCE 1 day ago`."
+    } else if has("timeseries") && has("facet") && has("limit") {
+        "With FACET and TIMESERIES together keep LIMIT at 10 or less, or drop TIMESERIES."
+    } else if has("unknown function")
+        || has("is not a valid function")
+        || has("function") && has("not found")
+    {
+        "Use NRQL's own functions: count(*), sum(), average(), max(), min(), latest(), percentile(x, 95), uniqueCount(), uniques(), rate(count(*), 1 minute), percentage(count(*), WHERE ...), filter(count(*), WHERE ...)."
+    } else if has("unknown event type")
+        || has("event type") && has("not found")
+        || has("no such event")
+    {
+        "That event type isn't in this account. Run `SHOW EVENT TYPES SINCE 1 week ago` first, then query one it lists."
+    } else if has("unknown attribute") || has("attribute") && has("not found") {
+        "That attribute isn't on this event type. Run `SELECT keyset() FROM <EventType> SINCE 1 day ago` (no FACET) to see the attributes it has."
+    } else if has("since") && (has("too far") || has("retention") || has("exceeds"))
+        || has("time range")
+    {
+        "Ask for a shorter window, like SINCE 1 day ago or SINCE 7 days ago; older data may be past the account's retention."
+    } else if has("timeout") || has("timed out") || has("too many") || has("limit exceeded") {
+        "Make the query smaller: a shorter SINCE, a WHERE on the app or host, and LIMIT 20."
+    } else if has("syntax") || has("parse") || has("unexpected") || has("mismatched") {
+        "The NRQL didn't parse. Strings take single quotes ('api'), an attribute name with spaces or dashes takes backticks (`my-attr`), clauses go SELECT, FROM, WHERE, FACET, SINCE, LIMIT, TIMESERIES, and it is one query (no semicolons)."
+    } else {
+        ""
+    };
+    let general = "Check the account id, the event type and attribute names, and the NRQL, then ask again with the corrected query.";
+    if specific.is_empty() {
+        general.to_string()
+    } else {
+        format!("{specific} Then ask again with the corrected query.")
+    }
+}
+
 pub fn check_nrql(nrql: &str) -> Result<String, StepError> {
     let q = nrql.trim().trim_end_matches(';').trim();
     let fix = "Send one NRQL query, like SELECT count(*) FROM Transaction SINCE 1 hour ago.";
@@ -207,7 +248,13 @@ impl NewRelic<'_> {
                 "query($id: Int!, $q: Nrql!) { actor { account(id: $id) { nrql(query: $q, timeout: 30) { results } } } }",
                 json!({ "id": id, "q": q }),
             )
-            .await?;
+            .await
+            .map_err(|mut e| {
+                if e.message.starts_with("New Relic refused the lookup") {
+                    e.fix = nrql_fix(&e.message);
+                }
+                e
+            })?;
         let results = data["actor"]["account"]["nrql"]["results"].clone();
         Ok(self.clean(format!("[{id}] {q}"), results))
     }
@@ -365,6 +412,24 @@ impl NewRelic<'_> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_refused_nrql_query_says_how_to_correct_it() {
+        let f = super::nrql_fix(
+            "New Relic refused the lookup: Invalid facet on uniques(metricName) query",
+        );
+        assert!(f.contains("can't be combined with FACET"), "{f}");
+        assert!(f.contains("FACET aws.rds.DBClusterIdentifier"), "{f}");
+        assert!(super::nrql_fix("New Relic refused the lookup: NRQL Syntax Error: Error at line 1 position 12, unexpected 'FORM'").contains("single quotes"));
+        assert!(
+            super::nrql_fix("New Relic refused the lookup: Unknown function avg()")
+                .contains("average()")
+        );
+        assert!(
+            super::nrql_fix("New Relic refused the lookup: something new")
+                .contains("ask again with the corrected query")
+        );
+    }
+
     use super::*;
     use crate::live::http::fake::Fake;
 
