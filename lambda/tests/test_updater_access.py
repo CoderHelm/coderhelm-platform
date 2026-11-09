@@ -95,6 +95,12 @@ class Stack(base.FakeCfn):
         super().__init__()
         self.deployed = {}
         self.access_stack = None
+        self.access_template = {}
+
+    def get_template(self, StackName, ChangeSetName=None, TemplateStage="Original"):
+        if "-access" in StackName:
+            return {"TemplateBody": json.dumps(self.access_template)}
+        return super().get_template(StackName, ChangeSetName, TemplateStage)
 
     def describe_stacks(self, StackName):
         if StackName.endswith("-access"):
@@ -349,6 +355,27 @@ class AccessItem(Base):
         self.assertIn("#/stacks/quickcreate?stackName=coderhelm-prod-access&templateURL=https%3A%2F%2Fcoderhelm-public.s3.amazonaws.com%2Flaunch%2Fv1.0.0%2Faccess.json", v["link"])
         self.assertIn("param_Stage=prod", v["link"])
         self.assertIsNone(v["existing"])
+
+    def test_an_access_stack_a_release_made_says_so_and_its_version(self):
+        self.cfn.access_stack = {"StackId": "arn:aws:cloudformation:us-east-1:1:stack/coderhelm-prod-access/x", "StackName": "coderhelm-prod-access", "StackStatus": "CREATE_COMPLETE"}
+        self.cfn.access_template = {"Metadata": {"CoderHelm": {"version": "v0.9.0", "kind": "access"}}, "Resources": {}}
+        e = u.access_compute(self.env)["existing"]
+        self.assertEqual((e["status"], e["kind"], e["version"]), ("CREATE_COMPLETE", "access", "v0.9.0"))
+        self.assertIn("#/stacks/stackinfo?stackId=arn:aws:cloudformation:us-east-1:1:stack/coderhelm-prod-access/x", e["link"])
+
+    def test_a_stack_of_that_name_a_release_didnt_make_is_never_called_deletable(self):
+        # Like the boundary stack of an install hardened from the CLI: deleting that one would matter.
+        self.cfn.access_stack = {"StackId": "arn:aws:cloudformation:us-east-1:1:stack/coderhelm-prod-access/y", "StackName": "coderhelm-prod-access", "StackStatus": "UPDATE_COMPLETE"}
+        self.cfn.access_template = {"Description": "CoderHelm prod: the permissions boundary, deploy role and assets bucket", "Resources": {}}
+        self.assertEqual(u.access_compute(self.env)["existing"]["kind"], "other")
+        root = self.cfn.get_template
+
+        def denied(StackName, **kw):
+            if "-access" in StackName:
+                raise Exception("AccessDenied")
+            return root(StackName, **kw)
+        self.cfn.get_template = denied
+        self.assertEqual(u.access_compute(self.env)["existing"]["kind"], "other", "unreadable is never called deletable")
 
     def test_a_changed_access_json_is_never_linked(self):
         self.body = self.body + b" "
