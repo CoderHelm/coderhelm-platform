@@ -780,7 +780,7 @@ pub async fn run(
         effort: None,
     };
 
-    let on_tool: Option<Box<llm::OnToolCall>> = if let Some(rid) = run_id {
+    let on_tool: Option<llm::ToolCallFn> = if let Some(rid) = run_id {
         let dynamo = state.dynamo.clone();
         let s3 = state.s3.clone();
         let bucket = state.config.bucket_name.clone();
@@ -788,7 +788,7 @@ pub async fn run(
         let events_table = state.config.events_table_name.clone();
         let team = msg.team_id.clone();
         let rid = rid.to_string();
-        Some(Box::new(
+        Some(llm::ToolCallFn(Box::new(
             move |tool_name: &str, duration_ms: u64, input_summary: &str, is_error: bool| {
                 let dynamo = dynamo.clone();
                 let s3 = s3.clone();
@@ -868,7 +868,7 @@ pub async fn run(
                     }
                 });
             },
-        ))
+        )))
     } else {
         None
     };
@@ -887,7 +887,7 @@ pub async fn run(
         &executor,
         usage,
         opts,
-        on_tool.as_ref().map(|b| b.as_ref()),
+        on_tool.as_ref().map(|o| o as &dyn llm::LoopObserver),
         Some(&mut conv_log),
     )
     .await?;
@@ -945,7 +945,7 @@ pub async fn run(
                 &executor,
                 usage,
                 remediation_opts,
-                on_tool.as_ref().map(|b| b.as_ref()),
+                on_tool.as_ref().map(|o| o as &dyn llm::LoopObserver),
                 Some(&mut conv_log),
             )
             .await
@@ -1022,7 +1022,7 @@ pub async fn run(
             &executor,
             usage,
             opts,
-            on_tool.as_ref().map(|b| b.as_ref()),
+            on_tool.as_ref().map(|o| o as &dyn llm::LoopObserver),
             Some(&mut conv_log),
         )
         .await

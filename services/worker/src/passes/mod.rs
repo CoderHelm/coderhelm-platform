@@ -1104,6 +1104,7 @@ pub mod restack;
 pub mod resume;
 mod review;
 pub mod review_actions;
+pub mod review_activity;
 pub mod review_agent;
 pub mod review_configs;
 #[cfg(test)]

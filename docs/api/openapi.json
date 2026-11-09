@@ -1,6 +1,102 @@
 {
   "components": {
     "schemas": {
+      "ActivityGroup": {
+        "description": "Consecutive steps of one kind while the reviewer read the pull request\n(\"Search 3 times\", \"View 4 files\"), or one note it wrote on what it was\nchecking. Only where it looked is kept, never what it read.",
+        "properties": {
+          "ended_at": {
+            "description": "When its last step happened (RFC 3339, milliseconds).",
+            "examples": [
+              "2026-10-22T14:18:12.020+00:00"
+            ],
+            "type": "string"
+          },
+          "items": {
+            "description": "Its steps, oldest first. Empty for a note.",
+            "items": {
+              "$ref": "#/components/schemas/ActivityItem"
+            },
+            "type": "array"
+          },
+          "kind": {
+            "description": "`search`, `view`, `find`, `lookup`, `note` or `comment`.",
+            "examples": [
+              "view"
+            ],
+            "type": "string"
+          },
+          "started_at": {
+            "description": "When its first step happened (RFC 3339, milliseconds).",
+            "examples": [
+              "2026-10-22T14:18:09.412+00:00"
+            ],
+            "type": "string"
+          },
+          "text": {
+            "description": "A note's sentences. Empty for other groups.",
+            "examples": [
+              ""
+            ],
+            "type": "string"
+          },
+          "title": {
+            "description": "The group in words, or a note's heading.",
+            "examples": [
+              "View 2 files"
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "kind",
+          "title",
+          "started_at",
+          "ended_at",
+          "text",
+          "items"
+        ],
+        "type": "object"
+      },
+      "ActivityItem": {
+        "description": "One entry of an activity group: a search query, a `path:lines` the\nreviewer read, a comment's place.",
+        "properties": {
+          "at": {
+            "description": "When (RFC 3339, milliseconds).",
+            "examples": [
+              "2026-10-22T14:18:09.412+00:00"
+            ],
+            "type": "string"
+          },
+          "detail": {
+            "description": "A comment's title, or the tool's name in words. Empty otherwise.",
+            "examples": [
+              ""
+            ],
+            "type": "string"
+          },
+          "failed": {
+            "description": "The call failed or was refused.",
+            "examples": [
+              false
+            ],
+            "type": "boolean"
+          },
+          "label": {
+            "description": "What it looked at: a query, `path:10-40`, a comment's `path:line`.\nEmpty for a tool shown by its name only.",
+            "examples": [
+              "src/orders/sort.ts:10-48"
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "at",
+          "label",
+          "detail",
+          "failed"
+        ],
+        "type": "object"
+      },
       "AnswerRun": {
         "description": "Answers to a run's questions.",
         "properties": {
@@ -1708,6 +1804,30 @@
         },
         "type": "object"
       },
+      "OverviewFile": {
+        "description": "One row of the overview's file table.",
+        "properties": {
+          "description": {
+            "description": "What the change does in that file, in one short line.",
+            "examples": [
+              "Sorts orders before the status filter"
+            ],
+            "type": "string"
+          },
+          "path": {
+            "description": "The file, as the diff names it.",
+            "examples": [
+              "src/orders/sort.ts"
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "path",
+          "description"
+        ],
+        "type": "object"
+      },
       "Plan": {
         "description": "A plan.",
         "properties": {
@@ -3014,9 +3134,72 @@
         ],
         "type": "object"
       },
+      "ReviewOverview": {
+        "description": "The \"PR Overview\" the review led with on GitHub.",
+        "properties": {
+          "changes": {
+            "description": "What it changes, a few short bullets.",
+            "examples": [
+              [
+                "Sort runs before the status filter"
+              ]
+            ],
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "files": {
+            "description": "One line per changed file, in the diff's order (at most 100).",
+            "items": {
+              "$ref": "#/components/schemas/OverviewFile"
+            },
+            "type": "array"
+          },
+          "files_total": {
+            "description": "How many files the pull request changed.",
+            "examples": [
+              3
+            ],
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "summary": {
+            "description": "What the pull request does, in one sentence.",
+            "examples": [
+              "Sorts the order list before filtering it by status."
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "summary",
+          "changes",
+          "files",
+          "files_total"
+        ],
+        "type": "object"
+      },
       "ReviewSession": {
         "description": "One review job, step by step: what CoderHelm's \"CoderHelm review\" check\nlinks to. Each job has its own session, so an older check keeps showing\nits own review.",
         "properties": {
+          "activity": {
+            "description": "What the reviewer did while it read the pull request, live while it\nruns: its searches, file views and lookups in groups, the notes it\nwrote, and the comments it kept. Oldest first.",
+            "items": {
+              "$ref": "#/components/schemas/ActivityGroup"
+            },
+            "type": "array"
+          },
+          "activity_dropped": {
+            "description": "Steps left out of `activity` because the review passed its cap.",
+            "examples": [
+              0
+            ],
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
           "attempt": {
             "description": "Which try this job is, from 0.",
             "examples": [
@@ -3084,6 +3267,17 @@
               "review"
             ],
             "type": "string"
+          },
+          "overview": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ReviewOverview",
+                "description": "The \"PR Overview\" the review posted, once there is one."
+              }
+            ]
           },
           "pr_number": {
             "description": "The pull request number.",
@@ -3174,7 +3368,9 @@
           "reason",
           "verdict",
           "review_url",
-          "steps"
+          "steps",
+          "activity",
+          "activity_dropped"
         ],
         "type": "object"
       },

@@ -1263,6 +1263,123 @@ pub struct SessionStep {
     pub detail: String,
 }
 
+/// One entry of an activity group: a search query, a `path:lines` the
+/// reviewer read, a comment's place.
+#[derive(serde::Serialize, utoipa::ToSchema)]
+pub struct ActivityItem {
+    /// When (RFC 3339, milliseconds).
+    #[schema(example = "2026-10-22T14:18:09.412+00:00")]
+    pub at: String,
+    /// What it looked at: a query, `path:10-40`, a comment's `path:line`.
+    /// Empty for a tool shown by its name only.
+    #[schema(example = "src/orders/sort.ts:10-48")]
+    pub label: String,
+    /// A comment's title, or the tool's name in words. Empty otherwise.
+    #[schema(example = "")]
+    pub detail: String,
+    /// The call failed or was refused.
+    #[schema(example = false)]
+    pub failed: bool,
+}
+
+/// Consecutive steps of one kind while the reviewer read the pull request
+/// ("Search 3 times", "View 4 files"), or one note it wrote on what it was
+/// checking. Only where it looked is kept, never what it read.
+#[derive(serde::Serialize, utoipa::ToSchema)]
+pub struct ActivityGroup {
+    /// `search`, `view`, `find`, `lookup`, `note` or `comment`.
+    #[schema(example = "view")]
+    pub kind: String,
+    /// The group in words, or a note's heading.
+    #[schema(example = "View 2 files")]
+    pub title: String,
+    /// When its first step happened (RFC 3339, milliseconds).
+    #[schema(example = "2026-10-22T14:18:09.412+00:00")]
+    pub started_at: String,
+    /// When its last step happened (RFC 3339, milliseconds).
+    #[schema(example = "2026-10-22T14:18:12.020+00:00")]
+    pub ended_at: String,
+    /// A note's sentences. Empty for other groups.
+    #[schema(example = "")]
+    pub text: String,
+    /// Its steps, oldest first. Empty for a note.
+    pub items: Vec<ActivityItem>,
+}
+
+/// One row of the overview's file table.
+#[derive(serde::Serialize, utoipa::ToSchema)]
+pub struct OverviewFile {
+    /// The file, as the diff names it.
+    #[schema(example = "src/orders/sort.ts")]
+    pub path: String,
+    /// What the change does in that file, in one short line.
+    #[schema(example = "Sorts orders before the status filter")]
+    pub description: String,
+}
+
+/// The "PR Overview" the review led with on GitHub.
+#[derive(serde::Serialize, utoipa::ToSchema)]
+pub struct ReviewOverview {
+    /// What the pull request does, in one sentence.
+    #[schema(example = "Sorts the order list before filtering it by status.")]
+    pub summary: String,
+    /// What it changes, a few short bullets.
+    #[schema(example = json!(["Sort runs before the status filter"]))]
+    pub changes: Vec<String>,
+    /// One line per changed file, in the diff's order (at most 100).
+    pub files: Vec<OverviewFile>,
+    /// How many files the pull request changed.
+    #[schema(example = 3)]
+    pub files_total: u64,
+}
+
+fn rfc3339_ms(ms: i64) -> String {
+    chrono::DateTime::from_timestamp_millis(ms)
+        .map(|d| d.to_rfc3339_opts(chrono::SecondsFormat::Millis, false))
+        .unwrap_or_default()
+}
+
+/// Pure: the session's activity in groups, as the API returns it.
+fn activity_groups(item: &HashMap<String, AttributeValue>) -> Vec<ActivityGroup> {
+    common::review_activity::group(&common::review_session::activity_of(item))
+        .into_iter()
+        .map(|g| ActivityGroup {
+            kind: g.kind,
+            title: g.title,
+            started_at: rfc3339_ms(g.started_ms),
+            ended_at: rfc3339_ms(g.ended_ms),
+            text: g.text,
+            items: g
+                .items
+                .into_iter()
+                .map(|i| ActivityItem {
+                    at: rfc3339_ms(i.at_ms),
+                    label: i.label,
+                    detail: i.detail,
+                    failed: i.failed,
+                })
+                .collect(),
+        })
+        .collect()
+}
+
+/// Pure: the overview a session holds, as the API returns it.
+fn overview_of(item: &HashMap<String, AttributeValue>) -> Option<ReviewOverview> {
+    common::review_overview::of_item(item).map(|o| ReviewOverview {
+        summary: o.summary,
+        changes: o.changes,
+        files: o
+            .files
+            .into_iter()
+            .map(|f| OverviewFile {
+                path: f.path,
+                description: f.description,
+            })
+            .collect(),
+        files_total: o.files_total as u64,
+    })
+}
+
 /// One review job, step by step: what CoderHelm's "CoderHelm review" check
 /// links to. Each job has its own session, so an older check keeps showing
 /// its own review.
@@ -1323,6 +1440,15 @@ pub struct ReviewSession {
     pub check_run_id: Option<u64>,
     /// The steps so far, oldest first.
     pub steps: Vec<SessionStep>,
+    /// What the reviewer did while it read the pull request, live while it
+    /// runs: its searches, file views and lookups in groups, the notes it
+    /// wrote, and the comments it kept. Oldest first.
+    pub activity: Vec<ActivityGroup>,
+    /// Steps left out of `activity` because the review passed its cap.
+    #[schema(example = 0)]
+    pub activity_dropped: u64,
+    /// The "PR Overview" the review posted, once there is one.
+    pub overview: Option<ReviewOverview>,
 }
 
 /// Pure: the session in `item` as `team_id` sees it. `None` for a record
@@ -1373,6 +1499,9 @@ fn session_of(
                 detail: s.detail,
             })
             .collect(),
+        activity: activity_groups(item),
+        activity_dropped: common::review_session::activity_dropped(item),
+        overview: overview_of(item),
     })
 }
 
@@ -1779,6 +1908,71 @@ mod tests {
         let done = session_of(&done, "t", 9_999).unwrap();
         assert_eq!((done.status.as_str(), done.findings), ("done", Some(0)));
         assert_eq!(done.check_run_id, Some(77));
+    }
+
+    #[test]
+    fn a_session_returns_its_activity_in_groups_and_its_overview() {
+        use common::review_activity::Event;
+        use common::review_session as rs;
+        let mut it = session_item("t", "reviewing", 2_000);
+        let events = [
+            Event::note(1_000_500, "**Checking callers**\nThree places call it.").unwrap(),
+            Event::tool(
+                1_001_000,
+                "search_code",
+                &serde_json::json!({"query": "settle("}),
+                false,
+            ),
+            Event::tool(
+                1_002_000,
+                "search_code",
+                &serde_json::json!({"query": "Settle"}),
+                false,
+            ),
+            Event::tool(
+                1_003_250,
+                "read_file_lines",
+                &serde_json::json!({"path": "a.rs", "start_line": 3, "end_line": 9}),
+                false,
+            ),
+        ];
+        it.insert(
+            "activity".into(),
+            AttributeValue::L(events.iter().map(rs::activity_value).collect()),
+        );
+        it.insert("activity_dropped".into(), attr_n(2));
+        let s = session_of(&it, "t", 1_500).unwrap();
+        let titles: Vec<&str> = s.activity.iter().map(|g| g.title.as_str()).collect();
+        assert_eq!(
+            titles,
+            vec!["Checking callers", "Search 2 times", "View 1 file"]
+        );
+        assert_eq!(s.activity[0].text, "Three places call it.");
+        assert_eq!(s.activity[1].items[0].label, "settle(");
+        assert_eq!(s.activity[1].started_at, "1970-01-01T00:16:41.000+00:00");
+        assert_eq!(s.activity[2].items[0].label, "a.rs:3-9");
+        assert_eq!(s.activity_dropped, 2);
+        assert!(s.overview.is_none());
+
+        let o = common::review_overview::build(
+            &common::review_overview::ModelOverview {
+                summary: "Sorts orders first.".into(),
+                changes: vec!["Sort first".into()],
+                files: vec![],
+            },
+            &[common::review_overview::ChangedFile {
+                path: "a.rs".into(),
+                status: "modified".into(),
+                additions: 1,
+                deletions: 0,
+            }],
+        );
+        it.insert("overview".into(), common::review_overview::to_attr(&o));
+        let s = session_of(&it, "t", 1_500).unwrap();
+        let ov = s.overview.unwrap();
+        assert_eq!(ov.summary, "Sorts orders first.");
+        assert_eq!(ov.files[0].description, "Changed (+1/-0)");
+        assert_eq!(ov.files_total, 1);
     }
 
     #[test]

@@ -2811,6 +2811,15 @@ async fn run_once(
             "Against the repository's rules, the team's standards and what earlier reviews taught.",
         )
         .await;
+    // What the reviewer does from here, live on the session page.
+    let activity =
+        super::review_activity::ActivityFeed::start(super::review_activity::SessionTarget {
+            dynamo: state.dynamo.clone(),
+            table: state.config.settings_table_name.clone(),
+            team_id: msg.team_id.clone(),
+            job: live_job.id.clone(),
+        });
+    let observer = super::review_activity::ActivityObserver(activity.recorder().clone());
     let output = review_agent::generate_review(
         state,
         &provider,
@@ -2832,6 +2841,7 @@ async fn run_once(
         Some(&web),
         mcp.as_ref(),
         knowledge.as_ref(),
+        Some(&observer),
         &mut usage,
     )
     .await;
@@ -3329,6 +3339,11 @@ async fn run_once(
     // demoted finding is posted as a note.
     let hunks = review_agent::right_line_hunks(&compare);
     let postable = review_agent::to_postable(&findings, &changed, &hunks);
+    // The comments the review keeps close its activity.
+    for f in &findings {
+        activity.recorder().comment(&f.file, f.line, &f.title);
+    }
+    activity.close().await;
     let blocking_facts = unconfirmed.iter().filter(|f| f.blocks).count();
     if !unconfirmed.is_empty() {
         info!(
@@ -3371,6 +3386,17 @@ async fn run_once(
         )
     } else {
         verdict_line
+    };
+    // The review leads with what the PR does, file by file.
+    let overview = common::review_overview::build(
+        &output.overview,
+        &common::review_overview::changed_files(&compare),
+    );
+    let overview_md = common::review_overview::markdown(&overview);
+    let verdict_line = if overview_md.is_empty() {
+        verdict_line
+    } else {
+        format!("{overview_md}\n{verdict_line}")
     };
     let mut full_body = match &stable.note {
         Some(n) => format!(
@@ -3664,6 +3690,14 @@ async fn run_once(
     live_job
         .verdict(state, &msg, verdict, findings.len(), &review_url)
         .await;
+    common::review_session::set_overview(
+        &state.dynamo,
+        &state.config.settings_table_name,
+        &msg.team_id,
+        &live_job.id,
+        &overview,
+    )
+    .await;
     let posted_step = if should_comment {
         "Posted the review on GitHub"
     } else if already_answered {

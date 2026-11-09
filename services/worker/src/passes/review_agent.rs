@@ -247,6 +247,11 @@ pub struct ReviewOutput {
     /// same commit: what new information changed it, in one sentence.
     #[serde(default)]
     pub change_of_mind: String,
+    /// What the PR does, in one sentence, a few bullets and a line per
+    /// changed file: the "PR Overview" the posted review leads with
+    /// ([`common::review_overview`]).
+    #[serde(default)]
+    pub overview: common::review_overview::ModelOverview,
 }
 
 /// A fact the PR's own evidence says is unconfirmed, and whether the change
@@ -519,6 +524,14 @@ pub const TONE_RULE: &str = "TONE: write like a helpful colleague: calm, plain a
      changes until\"), and never argue with a decision a person has made. ";
 
 /// Most replies shown per thread, and most conversation comments shown.
+/// The notes the session page shows while the review runs
+/// ([`common::review_activity`]).
+pub const PROGRESS_NOTES_RULE: &str = "PROGRESS NOTES: the team watches your work live. \
+     Before each batch of tool calls, write one short note: a bold heading of two to five \
+     words (**Checking the callers**), then one or two plain sentences on what you are \
+     about to check and why. Never put code, file contents, secrets or credentials in a \
+     note. ";
+
 const MAX_THREAD_REPLIES: usize = 10;
 pub const MAX_DISCUSSION_COMMENTS: usize = 12;
 
@@ -1498,13 +1511,15 @@ pub fn review_system_prompt(
          {PROOF_RULE}\
          {COPY_RULE}\
          {TONE_RULE}\
+         {PROGRESS_NOTES_RULE}\
          CI EVIDENCE: this PR's current CI results are provided below. Never claim an install, \
          build, or typecheck \"will fail\" when a GREEN check on this same head already ran it — \
          cite the check instead. A RED check is evidence for a finding; name it.\
          {instructions_block}\n\n\
          When done exploring, output ONLY a fenced ```json block, no prose after it, matching:\n\
          {{\n  \"verdict\": \"APPROVE\" | \"REQUEST_CHANGES\",\n  \"risk\": \"LOW\" | \"MEDIUM\" | \"HIGH\",\n  \
-         \"summary\": \"2-4 sentence overview\",\n  \"findings\": [{{\n    \"file\": \"path\", \"line\": <int, a line present on the RIGHT side of the diff>,\n    \
+         \"overview\": {{\"summary\": \"one sentence: what the PR does\", \"changes\": [\"3-6 short bullets: what it changes\"], \"files\": [{{\"path\": \"a changed file, as in the diff\", \"description\": \"what the change does in it, one short line\"}}]  (every changed file)}},\n  \
+         \"summary\": \"2-4 sentences: what you checked and what you found (what the PR does goes in overview)\",\n  \"findings\": [{{\n    \"file\": \"path\", \"line\": <int, a line present on the RIGHT side of the diff>,\n    \
          \"end_line\": <optional int for a range>, \"severity\": \"blocking|high|medium|low|nit\",\n    \
          \"category\": \"bug|security|correctness|perf|convention|style|logging|hardening|follow-up|scope|tests|source-data-override|manual-check|question\", \"title\": \"short\",\n    \
          \"evidence\": \"verified-defect|unverified-concern|question\",\n    \
@@ -1584,6 +1599,7 @@ pub async fn generate_review(
     web: Option<&super::web_check::WebCheck>,
     mcp: Option<&super::remote_mcp::RemoteMcp>,
     knowledge: Option<&super::knowledge::KnowledgeTools>,
+    observer: Option<&dyn llm::LoopObserver>,
     usage: &mut TokenUsage,
 ) -> Result<ReviewOutput, String> {
     let graph_tools = graph.map(|g| g.tools()).unwrap_or_default();
@@ -1664,7 +1680,7 @@ pub async fn generate_review(
             deadline: None,
             effort: None,
         },
-        None,
+        observer,
         None,
     )
     .await;
@@ -2500,6 +2516,25 @@ mod tests {
             AskKind::ContinueWork
         );
         assert!(ask_schema().to_string().contains("continue_work"));
+    }
+
+    #[test]
+    fn a_review_carries_its_overview_and_the_prompt_asks_for_notes() {
+        let reply = r#"Done.
+```json
+{"verdict": "APPROVE", "summary": "Checked the callers.", "findings": [],
+ "overview": {"summary": "Sorts orders first.", "changes": ["Sort first"],
+   "files": [{"path": "src/a.rs", "description": "Sorts before the filter"}]}}
+```"#;
+        let out = parse_review(reply).unwrap();
+        assert_eq!(out.overview.summary, "Sorts orders first.");
+        assert_eq!(out.overview.files[0].path, "src/a.rs");
+        // An older answer without an overview still reads.
+        let old = parse_review(r#"{"verdict": "APPROVE", "summary": "ok"}"#).unwrap();
+        assert!(old.overview.files.is_empty());
+        let prompt = review_system_prompt("acme", "web", "", false);
+        assert!(prompt.contains("\"overview\": {"), "{prompt}");
+        assert!(prompt.contains(PROGRESS_NOTES_RULE));
     }
 
     #[test]
