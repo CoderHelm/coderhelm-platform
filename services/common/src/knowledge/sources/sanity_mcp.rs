@@ -424,25 +424,34 @@ impl SanityMcp {
         let t = self.find_tool("list_datasets").await?;
         let args = scoped_args(&t, project, None, json!({}));
         let r = self.tools.call(&t, &args).await?;
-        let v = result_json(PROVIDER, &r)?;
-        let mut out: Vec<String> = Vec::new();
-        let mut push = |n: &str| {
-            if valid_name(n) && !out.iter().any(|x| x == n) {
-                out.push(n.to_string());
+        let mut out = dataset_names(&result_json(PROVIDER, &r)?);
+        if out.is_empty() {
+            // Every Sanity project has a dataset, so an empty list is an answer
+            // this code doesn't read. Say what it looked like (no content), and
+            // ask once more with only the project id, the shape the hosted
+            // server takes today, when the first ask used another.
+            tracing::warn!(
+                provider = PROVIDER,
+                shape = %super::mcp::answer_shape(&r),
+                args = ?args.as_object().map(|m| m.keys().cloned().collect::<Vec<_>>()),
+                takes = ?t.input_schema["properties"].as_object().map(|m| m.keys().cloned().collect::<Vec<_>>()),
+                "Sanity listed no datasets for a project"
+            );
+            if args.get("projectId").is_none() {
+                let r = self
+                    .tools
+                    .call(&t, &json!({ "projectId": project }))
+                    .await?;
+                if let Ok(v) = result_json(PROVIDER, &r) {
+                    out = dataset_names(&v);
+                }
             }
-        };
-        for m in objects(&v, &|m| {
-            m.get("name").and_then(Value::as_str).is_some()
-                && m.get("datasetProfile").and_then(Value::as_str) != Some("comments")
-        }) {
-            push(m["name"].as_str().unwrap_or(""));
         }
-        if let Some(a) = find_key(&v, "datasets").and_then(Value::as_array) {
-            for n in a.iter().filter_map(Value::as_str) {
-                push(n);
-            }
+        if out.is_empty() {
+            return Err(ConnectorError::Temporary(format!(
+                "Sanity didn't list any datasets for project {project}. Check that your Sanity sign-in can open it in Sanity, then try again."
+            )));
         }
-        out.sort();
         Ok(out)
     }
 
@@ -638,6 +647,29 @@ fn newest(items: &[Listed], or: &str) -> String {
         .to_string()
 }
 
+/// The dataset names in a `list_datasets` answer (not the comments dataset).
+fn dataset_names(v: &Value) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut push = |n: &str| {
+        if valid_name(n) && !out.iter().any(|x| x == n) {
+            out.push(n.to_string());
+        }
+    };
+    for m in objects(v, &|m| {
+        m.get("name").and_then(Value::as_str).is_some()
+            && m.get("datasetProfile").and_then(Value::as_str) != Some("comments")
+    }) {
+        push(m["name"].as_str().unwrap_or(""));
+    }
+    if let Some(a) = find_key(v, "datasets").and_then(Value::as_array) {
+        for n in a.iter().filter_map(Value::as_str) {
+            push(n);
+        }
+    }
+    out.sort();
+    out
+}
+
 #[async_trait::async_trait]
 impl Connector for SanityMcp {
     fn kind(&self) -> Kind {
@@ -799,6 +831,51 @@ mod tests {
 
     fn doc(id: &str, rev: &str, at: &str) -> Value {
         json!({"_id": id, "_type": "post", "_rev": rev, "_updatedAt": at, "title": format!("Post {id}")})
+    }
+
+    #[tokio::test]
+    async fn a_project_with_no_readable_datasets_is_an_error_never_an_empty_list() {
+        // The tool says it takes `resource` (the first ask); only a plain `projectId` answers.
+        let f = Arc::new(FakeMcp::new(
+            vec![
+                tool_with("list_projects", &[]),
+                tool_with("list_datasets", &["resource"]),
+            ],
+            |name, args| {
+                Ok(match name {
+                    "list_datasets"
+                        if args.get("projectId").is_some() && args.get("resource").is_none() =>
+                    {
+                        text_result(&json!({"datasets": {"production": {"name": "production"}}}))
+                    }
+                    "list_datasets" => text_result(&json!({"datasets": {}})),
+                    _ => unreachable!(),
+                })
+            },
+        ));
+        let c = SanityMcp {
+            tools: f.clone(),
+            now: 0,
+            hints: Vec::new(),
+        };
+        let kids = c.browse(Some("project:abc123"), "").await.unwrap();
+        assert_eq!(
+            kids.iter().map(|n| n.title.as_str()).collect::<Vec<_>>(),
+            ["production"]
+        );
+
+        let empty = server(|_, _| Ok(text_result(&json!({"datasets": {}}))));
+        let c = SanityMcp {
+            tools: empty,
+            now: 0,
+            hints: Vec::new(),
+        };
+        let e = c.browse(Some("project:abc123"), "").await.unwrap_err();
+        assert!(
+            e.to_string()
+                .contains("didn't list any datasets for project abc123"),
+            "{e}"
+        );
     }
 
     #[tokio::test]
