@@ -1,7 +1,8 @@
 AWSTemplateFormatVersion: "2010-09-09"
 Description: >
   Brings the existing CoderHelmLogReader role up to date with the read-only
-  permissions the current CoderHelm release uses. Every permission here is
+  permissions the current CoderHelm release uses, and lets it search the
+  Bedrock knowledge bases named in KnowledgeBases. Every permission here is
   read-only: CoderHelm can list, describe and query, never change anything.
   It only adds: to drop a permission an older release granted, update the
   CoderHelmLogReader stack itself with the current role template.
@@ -14,6 +15,20 @@ Parameters:
     Default: CoderHelmLogReader
     Description: The CoderHelm role to update (do not change this value).
     AllowedPattern: "^CoderHelmLogReader$"
+
+  KnowledgeBases:
+    Type: String
+    Default: ""
+    Description: >
+      Bedrock knowledge bases CoderHelm may search, read-only: their ARNs
+      separated by commas, or "all" for every knowledge base in this account.
+      Empty: none (the role reads no knowledge base).
+    AllowedPattern: "^(|all|arn:aws:bedrock:[a-z0-9-]+:[0-9]{12}:knowledge-base/[A-Z0-9]{10}(,arn:aws:bedrock:[a-z0-9-]+:[0-9]{12}:knowledge-base/[A-Z0-9]{10})*)$"
+    ConstraintDescription: Knowledge base ARNs separated by commas, "all", or empty.
+
+Conditions:
+  ReadsKnowledgeBases: !Not [!Equals [!Ref KnowledgeBases, ""]]
+  ReadsEveryKnowledgeBase: !Equals [!Ref KnowledgeBases, "all"]
 
 Resources:
   CoderHelmReadOnlyUpdate:
@@ -104,3 +119,27 @@ Resources:
               - "kms:DescribeKey"
               - "kms:GetKeyPolicy"
             Resource: "*"
+          # Bedrock knowledge bases connected in place: searched live in
+          # this account, nothing copied. Only the knowledge bases named in
+          # KnowledgeBases (or every one in this account with "all"):
+          # search and read a cited document, never change one.
+          - !If
+            - ReadsKnowledgeBases
+            - Sid: ReadKnowledgeBases
+              Effect: Allow
+              Action:
+                - "bedrock:Retrieve"
+                - "bedrock:GetDocumentContent"
+              Resource: !If
+                - ReadsEveryKnowledgeBase
+                - !Sub "arn:aws:bedrock:*:${AWS::AccountId}:knowledge-base/*"
+                - !Split [",", !Ref KnowledgeBases]
+            - !Ref AWS::NoValue
+          - !If
+            - ReadsEveryKnowledgeBase
+            - Sid: ListKnowledgeBases
+              Effect: Allow
+              Action:
+                - "bedrock:ListKnowledgeBases"
+              Resource: "*"
+            - !Ref AWS::NoValue

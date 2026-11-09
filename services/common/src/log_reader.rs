@@ -40,6 +40,10 @@ pub struct Ability {
     pub name: &'static str,
     pub why: &'static str,
     pub actions: &'static [&'static str],
+    /// Granted only on what a team names (the knowledge bases it connects),
+    /// so the role's live check never counts it missing: connecting runs
+    /// its own test instead (`knowledge::remote::test_retrieve`).
+    pub chosen: bool,
 }
 
 /// Everything the current release's role allows, by ability. Tests keep
@@ -59,18 +63,21 @@ pub const ABILITIES: &[Ability] = &[
             "cloudwatch:DescribeAlarms",
             "sts:GetCallerIdentity",
         ],
+        chosen: false,
     },
     Ability {
         key: "check",
         name: "Checking its own permissions",
         why: "Asks IAM which of these permissions the role has, and whether CoderHelm's own update stack finished, so this page can say when an update is needed. It only looks at this one role and CoderHelm's update stacks.",
         actions: &["iam:SimulatePrincipalPolicy", "cloudformation:DescribeStacks"],
+        chosen: false,
     },
     Ability {
         key: "metrics",
         name: "CloudWatch metrics",
         why: "Reads error rate, latency and other metrics before and after a deploy.",
         actions: &["cloudwatch:GetMetricData", "cloudwatch:ListMetrics"],
+        chosen: false,
     },
     Ability {
         key: "airflow",
@@ -81,6 +88,7 @@ pub const ABILITIES: &[Ability] = &[
             "airflow:GetEnvironment",
             "airflow:InvokeRestApi",
         ],
+        chosen: false,
     },
     Ability {
         key: "ecs",
@@ -94,6 +102,7 @@ pub const ABILITIES: &[Ability] = &[
             "ecs:ListTasks",
             "ecs:DescribeTasks",
         ],
+        chosen: false,
     },
     Ability {
         key: "code",
@@ -106,6 +115,7 @@ pub const ABILITIES: &[Ability] = &[
             "ecr:BatchGetImage",
             "ecr:ListTagsForResource",
         ],
+        chosen: false,
     },
     Ability {
         key: "settings",
@@ -118,6 +128,18 @@ pub const ABILITIES: &[Ability] = &[
             "kms:DescribeKey",
             "kms:GetKeyPolicy",
         ],
+        chosen: false,
+    },
+    Ability {
+        key: "knowledge",
+        name: "Bedrock knowledge bases",
+        why: "Searches the Bedrock knowledge bases a team connects, live and read-only, so answers can cite them; reads a cited document. Only the knowledge bases named in the stack's KnowledgeBases parameter (or every one in the account, when it says all). Nothing is copied out of the account and nothing is changed.",
+        actions: &[
+            "bedrock:Retrieve",
+            "bedrock:GetDocumentContent",
+            "bedrock:ListKnowledgeBases",
+        ],
+        chosen: true,
     },
 ];
 
@@ -125,6 +147,20 @@ pub const ABILITIES: &[Ability] = &[
 pub fn all_actions() -> Vec<&'static str> {
     let mut out: Vec<&'static str> = Vec::new();
     for a in ABILITIES {
+        for x in a.actions {
+            if !out.contains(x) {
+                out.push(x);
+            }
+        }
+    }
+    out
+}
+
+/// The actions the role's live check asks about: every ability's except
+/// the [`Ability::chosen`] ones, which only exist for what a team named.
+pub fn checked_actions() -> Vec<&'static str> {
+    let mut out: Vec<&'static str> = Vec::new();
+    for a in ABILITIES.iter().filter(|a| !a.chosen) {
         for x in a.actions {
             if !out.contains(x) {
                 out.push(x);
@@ -271,12 +307,39 @@ pub fn quick_create_url(
 
 /// The one-click update: a Launch Stack link that adds this release's
 /// update stack to the role, in `region` (IAM is global; the region only
-/// decides where the stack is listed).
-pub fn update_url(update_template_url: &str, region: &str) -> String {
-    format!(
+/// decides where the stack is listed). `knowledge_bases` are the ARNs of
+/// the team's knowledge bases connected in this account: the stack lets the
+/// role search them, and its name says which (a new set is a new stack, so
+/// it never collides with the one before it).
+pub fn update_url(update_template_url: &str, region: &str, knowledge_bases: &[String]) -> String {
+    let mut u = format!(
         "https://console.aws.amazon.com/cloudformation/home?region={region}#/stacks/quickcreate?stackName={}&templateURL={}&param_RoleName={ROLE_NAME}",
-        update_stack_name(),
+        update_stack_name_for(knowledge_bases),
         urlencoding::encode(update_template_url)
+    );
+    if !knowledge_bases.is_empty() {
+        u.push_str(&format!(
+            "&param_KnowledgeBases={}",
+            urlencoding::encode(&knowledge_bases.join(","))
+        ));
+    }
+    u
+}
+
+/// This release's update stack name for a set of knowledge bases: the
+/// release's own name when there are none.
+pub fn update_stack_name_for(knowledge_bases: &[String]) -> String {
+    if knowledge_bases.is_empty() {
+        return update_stack_name();
+    }
+    use sha2::{Digest, Sha256};
+    let mut kbs: Vec<&str> = knowledge_bases.iter().map(String::as_str).collect();
+    kbs.sort_unstable();
+    kbs.dedup();
+    format!(
+        "{}-kb{}",
+        update_stack_name(),
+        hex::encode(&Sha256::digest(kbs.join(",").as_bytes())[..3])
     )
 }
 
@@ -337,6 +400,17 @@ mod tests {
                 "{a} is not read-only"
             );
         }
+        // Knowledge bases: search and read a cited document, only those named.
+        for t in [ROLE_TEMPLATE, UPDATE_TEMPLATE] {
+            assert!(t.contains("- Sid: ReadKnowledgeBases"));
+            assert!(t.contains("!Split [\",\", !Ref KnowledgeBases]"));
+            assert!(t.contains("knowledge-base/*"));
+            assert!(!t.contains("bedrock:Retrieve\"\n                - \"bedrock:Rerank"));
+            assert!(
+                !template_actions(t).iter().any(|x| x.starts_with("bedrock:")
+                    && !ability("knowledge").unwrap().actions.contains(&x.as_str()))
+            );
+        }
         // Airflow's REST API only as the Viewer role.
         assert!(UPDATE_TEMPLATE.contains("arn:aws:airflow:*:*:role/*/Viewer"));
         assert!(ROLE_TEMPLATE.contains("arn:aws:airflow:*:*:role/*/Viewer"));
@@ -353,6 +427,7 @@ mod tests {
         let u = update_url(
             "https://b.s3.amazonaws.com/launch/v1.2.3/coderhelm-log-reader-update.yaml",
             "eu-west-1",
+            &[],
         );
         assert!(u.starts_with("https://console.aws.amazon.com/cloudformation/home?region=eu-west-1#/stacks/quickcreate?"));
         assert!(u.contains(&format!("stackName=CoderHelmLogReaderUpdate-{id}")));
@@ -426,6 +501,38 @@ mod tests {
                 assert!(!all.iter().any(|y| y == no), "{no}");
             }
         }
+    }
+
+    #[test]
+    fn knowledge_bases_ride_on_the_update_and_are_never_counted_missing() {
+        let kb = "arn:aws:bedrock:us-east-1:111122223333:knowledge-base/ABCDE12345".to_string();
+        let u = update_url(
+            "https://b/x/coderhelm-log-reader-update.yaml",
+            "us-east-1",
+            std::slice::from_ref(&kb),
+        );
+        assert!(u.contains("&param_KnowledgeBases=arn%3Aaws%3Abedrock%3Aus-east-1%3A111122223333%3Aknowledge-base%2FABCDE12345"), "{u}");
+        let name = update_stack_name_for(std::slice::from_ref(&kb));
+        assert!(
+            name.starts_with(&format!("{}-kb", update_stack_name())),
+            "{name}"
+        );
+        assert!(name.len() <= 128);
+        assert!(u.contains(&format!("stackName={name}")));
+        // The same set in another order is the same stack; another set is another.
+        let other = "arn:aws:bedrock:us-east-1:111122223333:knowledge-base/ZZZZZ00000".to_string();
+        assert_eq!(
+            update_stack_name_for(&[kb.clone(), other.clone()]),
+            update_stack_name_for(&[other.clone(), kb.clone()])
+        );
+        assert_ne!(update_stack_name_for(&[kb.clone(), other]), name);
+        assert_eq!(update_stack_name_for(&[]), update_stack_name());
+        assert!(!update_url("https://b/x/y.yaml", "us-east-1", &[]).contains("KnowledgeBases"));
+        // The live check asks about everything but the chosen knowledge bases.
+        let checked = checked_actions();
+        assert!(!checked.contains(&"bedrock:Retrieve"));
+        assert!(checked.contains(&"logs:StartQuery"));
+        assert_eq!(checked.len() + 3, all_actions().len());
     }
 
     #[test]

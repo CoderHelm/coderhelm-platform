@@ -1447,6 +1447,15 @@ fn graph_sources(
 }
 
 /// Runs one tool other than the code tools and registers what it read.
+/// The connected knowledge bases that didn't answer, for the model to say
+/// so instead of claiming they hold nothing.
+fn unreached_note(unreached: &[common::knowledge::search::Unreached]) -> String {
+    unreached
+        .iter()
+        .map(|u| format!("\n(Couldn't search {} this time: {})", u.kb_name, u.reason))
+        .collect()
+}
+
 /// Returns the text the model reads, a short summary for the dashboard, and
 /// whether it failed.
 async fn run_tool(
@@ -1477,6 +1486,7 @@ async fn run_tool(
             match search(
                 &st,
                 &titan,
+                &super::knowledge::retriever(state, "brain"),
                 &run.team_id,
                 &run.kb_ids,
                 q,
@@ -1488,12 +1498,16 @@ async fn run_tool(
                 Ok(found) if !found.hits.is_empty() => {
                     super::knowledge::reembed(state, &run.team_id, &found.stale).await;
                     let ids = reg.add_hits(&found.hits);
-                    (reg.render(&ids), format!("{} passages", ids.len()), false)
+                    (
+                        format!("{}{}", reg.render(&ids), unreached_note(&found.unreached)),
+                        format!("{} passages", ids.len()),
+                        false,
+                    )
                 }
                 Ok(found) => {
                     super::knowledge::reembed(state, &run.team_id, &found.stale).await;
                     (
-                        "No passages matched.".into(),
+                        format!("No passages matched.{}", unreached_note(&found.unreached)),
                         "No passages matched".into(),
                         false,
                     )
@@ -2248,6 +2262,7 @@ async fn answer(
         match search(
             &st,
             &titan,
+            &super::knowledge::retriever(state, "brain"),
             &run.team_id,
             &run.kb_ids,
             &retrieval_query(question, history),

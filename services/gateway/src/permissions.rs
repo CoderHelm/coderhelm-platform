@@ -352,6 +352,8 @@ pub const CAPABILITIES: &[Capability] = &[
         min_role: "admin",
         handlers: &[
             "knowledge::create_base",
+            "knowledge::bedrock_bases",
+            "knowledge::check_connection",
             "knowledge::update_base",
             "knowledge::delete_base",
             "knowledge::start_upload",

@@ -240,6 +240,55 @@ dependencies = [
 ]
 
 [[package]]
+name = "aws-sdk-bedrockagent"
+version = "1.129.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c012c3bcf5d19e7591b881bd7996aa5ff0163b07aeefca49b1b4ebabcadfc12e"
+dependencies = [
+ "aws-credential-types",
+ "aws-runtime",
+ "aws-smithy-async",
+ "aws-smithy-http",
+ "aws-smithy-json",
+ "aws-smithy-observability",
+ "aws-smithy-runtime",
+ "aws-smithy-runtime-api",
+ "aws-smithy-types",
+ "aws-types",
+ "bytes",
+ "fastrand",
+ "http 0.2.12",
+ "http 1.4.0",
+ "regex-lite",
+ "tracing",
+]
+
+[[package]]
+name = "aws-sdk-bedrockagentruntime"
+version = "1.125.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9c2c4a870cd06e0daa3eab787a0da73ffa505861a688db665b589da55cfce2a9"
+dependencies = [
+ "aws-credential-types",
+ "aws-runtime",
+ "aws-smithy-async",
+ "aws-smithy-eventstream",
+ "aws-smithy-http",
+ "aws-smithy-json",
+ "aws-smithy-observability",
+ "aws-smithy-runtime",
+ "aws-smithy-runtime-api",
+ "aws-smithy-types",
+ "aws-types",
+ "bytes",
+ "fastrand",
+ "http 0.2.12",
+ "http 1.4.0",
+ "regex-lite",
+ "tracing",
+]
+
+[[package]]
 name = "aws-sdk-bedrockruntime"
 version = "1.129.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1440,6 +1489,8 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "aws-config",
+ "aws-sdk-bedrockagent",
+ "aws-sdk-bedrockagentruntime",
  "aws-sdk-bedrockruntime",
  "aws-sdk-cloudformation",
  "aws-sdk-cloudwatch",

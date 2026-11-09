@@ -691,11 +691,16 @@ async fn main() -> Result<(), Error> {
             "/knowledge",
             get(routes::knowledge::list_bases).post(routes::knowledge::create_base),
         )
+        .route("/knowledge/bedrock", get(routes::knowledge::bedrock_bases))
         .route(
             "/knowledge/:kb_id",
             get(routes::knowledge::get_base)
                 .put(routes::knowledge::update_base)
                 .delete(routes::knowledge::delete_base),
+        )
+        .route(
+            "/knowledge/:kb_id/check",
+            post(routes::knowledge::check_connection),
         )
         .route(
             "/knowledge/:kb_id/files",
