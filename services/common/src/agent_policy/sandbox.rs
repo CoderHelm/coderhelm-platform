@@ -229,6 +229,30 @@ pub fn new_suggestions(
 
 /// Keeps commands a run met that aren't on the repository's allowlist as
 /// suggestions for an admin to accept (never allowed on their own).
+/// The allowlist entry to suggest for a command a run met: the command
+/// itself, or, when it ends in file names (the test files one change
+/// touched), everything before them followed by `*`, so one entry covers
+/// every change instead of one per change.
+pub fn suggestion_for(cmd: &str) -> String {
+    let words: Vec<&str> = cmd.split_whitespace().collect();
+    let is_file = |w: &str| {
+        !w.starts_with('-')
+            && (w.contains('/')
+                || [
+                    ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".py", ".rb", ".go", ".rs",
+                    ".java", ".kt", ".php",
+                ]
+                .iter()
+                .any(|e| w.ends_with(e)))
+    };
+    match words.iter().position(|w| is_file(w)) {
+        Some(i) if i >= 2 && words[i..].iter().all(|w| is_file(w)) => {
+            format!("{}*", words[..i].join(" "))
+        }
+        _ => words.join(" "),
+    }
+}
+
 pub async fn remember(
     store: &dyn super::store::PolicyStore,
     team: &str,
@@ -243,10 +267,25 @@ pub async fn remember(
         let Ok(mut p) = store.load(team).await else {
             return;
         };
-        let mut fresh = new_suggestions(&p.sandbox, &repo, found.clone());
+        let general: Vec<CommandSuggestion> = found
+            .iter()
+            .map(|f| CommandSuggestion {
+                command: suggestion_for(&f.command),
+                origin: f.origin.clone(),
+            })
+            .collect();
+        let mut fresh = new_suggestions(&p.sandbox, &repo, general.clone());
         let existing = p.sandbox.suggestions.entry(repo.clone()).or_default();
+        // Earlier one-change suggestions a general entry now covers go.
+        let before = existing.len();
+        existing.retain(|e| {
+            !general
+                .iter()
+                .any(|g| g.command != e.command && command_matches(&g.command, &e.command))
+        });
+        let cleaned = existing.len() != before;
         fresh.retain(|f| !existing.iter().any(|e| e.command == f.command));
-        if fresh.is_empty() {
+        if fresh.is_empty() && !cleaned {
             return;
         }
         existing.extend(fresh);
@@ -345,6 +384,28 @@ mod tests {
             super::super::engine::decide(&bare, &call, None, "2026-10-24T00:00:00Z").decision,
             Decision::Ask
         );
+    }
+
+    #[test]
+    fn a_command_ending_in_test_files_is_suggested_once_for_every_change() {
+        assert_eq!(
+            suggestion_for("npm test -- --passWithNoTests block-headings.spec.ts heading.test.tsx"),
+            "npm test -- --passWithNoTests*"
+        );
+        assert_eq!(
+            suggestion_for("npm test -- --passWithNoTests src/a/b.test.ts"),
+            "npm test -- --passWithNoTests*"
+        );
+        assert_eq!(suggestion_for("npm run lint"), "npm run lint");
+        assert_eq!(
+            suggestion_for("pytest tests/test_a.py"),
+            "pytest tests/test_a.py",
+            "too short to generalize"
+        );
+        assert!(command_matches(
+            &suggestion_for("npm test -- --passWithNoTests a.test.ts"),
+            "npm test -- --passWithNoTests x.spec.ts y.test.tsx"
+        ));
     }
 
     #[test]
