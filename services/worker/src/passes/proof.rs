@@ -1328,6 +1328,12 @@ pub fn holds_blocked_on(body: &str, ci_green: bool) -> bool {
     blocked_lines(body).any(|l| !blocked_line_settled(l, ci_green))
 }
 
+/// Whether the description has a blocked line CI green on the head would
+/// settle: the decision has to read CI for it.
+pub fn ci_settles_a_hold(body: &str) -> bool {
+    blocked_lines(body).any(|l| blocked_line_settled(l, true))
+}
+
 /// The description without the blocked lines CI settled (see
 /// [`blocked_line_settled`]), the Open items section dropped when nothing is
 /// left in it. `None` when there is nothing to remove.

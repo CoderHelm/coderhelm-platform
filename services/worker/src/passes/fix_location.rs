@@ -757,7 +757,24 @@ pub fn reask_prompt(
     proposal: &str,
     design: &str,
     tasks: &str,
+    also: &[String],
 ) -> String {
+    // What the plan's checks asked the block to carry (a data migration's
+    // `release`): a re-ask that left it out lost it, and the check then
+    // found it missing with no turn left to write it.
+    let also = if also.is_empty() {
+        String::new()
+    } else {
+        let lines: Vec<String> = also
+            .iter()
+            .map(|g| format!("- {}", common::truncate_str(g.trim(), 1500)))
+            .collect();
+        format!(
+            "\n\n## The plan's checks also need in the block\nWrite these fields in the same block, \
+             from the plan:\n{}",
+            lines.join("\n")
+        )
+    };
     format!(
         "You planned this ticket, but {problem}. Write that block now, from the plan below, and \
          nothing else: no other text, no other files.\n\n\
@@ -772,7 +789,7 @@ pub fn reask_prompt(
          - `evidence.basis`: `feature` for new work, `code` or `data` for a bug.\n\
          - `questions`: only what the plan says a person must decide, each naming the options; [] \
          when none.\n\
-         - `outside_change`: null unless `outside_code` or `both`, then `system` and `change`.\n\n\
+         - `outside_change`: null unless `outside_code` or `both`, then `system` and `change`.{also}\n\n\
          ```{FENCE}\n{{\"fix_location\": \"code\", \"cause\": \"...\", \"evidence\": {{\"basis\": \"feature\"}}, \"outside_change\": null, \"questions\": []}}\n```",
         problem = problem.describe(),
         intent = intent.as_str(),
@@ -2529,6 +2546,7 @@ mod missing_block_tests {
             "proposal",
             "design",
             FEATURE_TASKS,
+            &[],
         );
         assert!(p.contains("cut off before it closed"), "{p}");
         assert!(p.contains("```fix_location.json"), "{p}");
@@ -2538,6 +2556,49 @@ mod missing_block_tests {
         let reply = "```fix_location.json\n{\"fix_location\": \"code\", \"cause\": \"Adds the setting.\", \"evidence\": {\"basis\": \"feature\"}, \"outside_change\": null, \"questions\": []}\n```";
         let d = parse_for(reply, TicketIntent::Feature).unwrap();
         assert_eq!(route(Some(&d)), Route::Code);
+    }
+
+    /// A run's planner was sent back for a data migration's `release`, and
+    /// its revised block was cut off. The re-ask asked for the core fields
+    /// only, so the block came back without `release` and the plan went on
+    /// with that gap open. The re-ask now names what the checks need.
+    #[test]
+    fn the_reask_carries_what_the_checks_need_in_the_block() {
+        let gap = "The plan migrates data (`apps/cms/migrations/add-level/index.ts`). Write \
+                   `release` in the fix_location.json block: the fields it changes, an expand and \
+                   a separate contract migration, the fallback and its test, and the affected \
+                   counts per environment.";
+        let p = reask_prompt(
+            "Add a title size setting",
+            TicketIntent::Feature,
+            &BlockProblem::Unterminated,
+            "proposal",
+            "design",
+            FEATURE_TASKS,
+            &[gap.to_string()],
+        );
+        assert!(p.contains("also need in the block"), "{p}");
+        assert!(
+            p.contains("Write `release` in the fix_location.json block"),
+            "{p}"
+        );
+        // Still one block and nothing else, and still small.
+        assert!(p.contains("nothing else"), "{p}");
+        assert!(p.len() < 10_000, "{}", p.len());
+        // Nothing asked: the prompt is as before.
+        let plain = reask_prompt(
+            "t",
+            TicketIntent::Feature,
+            &BlockProblem::Unterminated,
+            "p",
+            "d",
+            FEATURE_TASKS,
+            &[],
+        );
+        assert!(!plain.contains("also need in the block"), "{plain}");
+        // The planning step passes the release check's gaps to the re-ask.
+        let plan_src = include_str!("plan.rs");
+        assert!(plan_src.contains("release_plan::plan_gaps(&files, &abilities.release);\n        let again =\n            reask_decision("));
     }
 
     #[test]
