@@ -13,6 +13,8 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilte
 mod api_keys;
 mod auth;
 mod clients;
+mod mcp_oauth;
+mod mcp_server;
 mod middleware;
 mod model_call;
 mod models;
@@ -395,6 +397,9 @@ async fn main() -> Result<(), Error> {
         )
         .route("/search", get(routes::search::search))
         .route("/runs", get(routes::api::list_runs))
+        // A person starts a run on a ticket from outside its tracker (a
+        // connected app's start_run).
+        .route("/runs/start", post(routes::run_start::start_run))
         .route("/runs/:run_id", get(routes::api::get_run))
         .route("/runs/:run_id/traces", get(routes::api::get_run_traces))
         .route("/runs/:run_id/agent-log", get(routes::api::get_agent_log))
@@ -637,6 +642,18 @@ async fn main() -> Result<(), Error> {
             get(routes::api_keys::list).post(routes::api_keys::create),
         )
         .route("/api-keys/:key_id", delete(routes::api_keys::revoke))
+        // Connecting apps to CoderHelm's MCP server: the consent page, and
+        // the apps people connected (routes::mcp_oauth).
+        .route(
+            "/mcp/authorize/describe",
+            post(routes::mcp_oauth::describe_request),
+        )
+        .route("/mcp/authorize", post(routes::mcp_oauth::decide_request))
+        .route("/mcp/connections", get(routes::mcp_oauth::list_connections))
+        .route(
+            "/mcp/connections/:grant_id",
+            delete(routes::mcp_oauth::revoke_connection),
+        )
         .route(
             "/roles/:role_id",
             put(routes::roles::update_role).delete(routes::roles::delete_role),
@@ -1396,6 +1413,21 @@ async fn main() -> Result<(), Error> {
             middleware::rate_limit::rate_limit_email,
         ));
 
+    // Signing in to CoderHelm's MCP server (public; routes::mcp_oauth).
+    let oauth_routes = Router::new()
+        .route("/register", post(routes::mcp_oauth::register))
+        .route("/authorize", get(routes::mcp_oauth::authorize))
+        .route("/token", post(routes::mcp_oauth::token))
+        .route("/revoke", post(routes::mcp_oauth::revoke));
+
+    // The tools of the MCP server call the API router as the person who
+    // connected the app, through its auth middleware (mcp_server::call).
+    let mcp_api = mcp_server::McpApi(
+        Router::new()
+            .nest("/api", api_routes.clone())
+            .with_state(state.clone()),
+    );
+
     let app = Router::new()
         // Root health/info
         .route(
@@ -1475,6 +1507,28 @@ async fn main() -> Result<(), Error> {
             routes::mcp_servers::METADATA_DOCUMENT_PATH,
             get(routes::mcp_servers::client_metadata_document),
         )
+        // CoderHelm's MCP server, for Claude, Cursor, VS Code and other MCP
+        // clients (mcp_server), and where its clients learn how to sign in.
+        .route(
+            "/mcp",
+            post(mcp_server::post)
+                .get(mcp_server::not_allowed)
+                .delete(mcp_server::not_allowed)
+                .layer(axum::Extension(mcp_api)),
+        )
+        .route(
+            "/.well-known/oauth-protected-resource",
+            get(routes::mcp_oauth::protected_resource),
+        )
+        .route(
+            "/.well-known/oauth-protected-resource/mcp",
+            get(routes::mcp_oauth::protected_resource),
+        )
+        .route(
+            "/.well-known/oauth-authorization-server",
+            get(routes::mcp_oauth::authorization_server),
+        )
+        .nest("/oauth", oauth_routes)
         // The sign-in methods that work here: the sign-in page reads it on
         // every load, so it stays out of the sign-in attempts' rate limit.
         .route("/auth/methods", get(routes::auth::methods))

@@ -46,6 +46,17 @@ pub fn public_methods(path: &str) -> Option<&'static str> {
     if path == "/openapi.json" || path == "/api/setup/status" {
         return Some("GET");
     }
+    // The MCP server and how its clients sign in: a browser-based MCP
+    // client calls them with a bearer token, never with cookies.
+    if path == "/mcp" {
+        return Some("GET, POST, DELETE");
+    }
+    if path.starts_with("/.well-known/oauth-") {
+        return Some("GET");
+    }
+    if crate::routes::mcp_oauth::is_public_oauth_path(path) {
+        return Some("POST");
+    }
     if let Some(name) = path.strip_prefix("/hybrid/names/") {
         // GET /hybrid/names/:name only; /hybrid/names/records is for installs.
         if !name.is_empty() && !name.contains('/') && name != "records" {
@@ -67,6 +78,19 @@ pub fn public_methods(path: &str) -> Option<&'static str> {
     }
     None
 }
+
+/// The request headers any origin may send on a public path.
+fn public_headers(path: &str) -> &'static str {
+    if path == "/mcp" {
+        "Content-Type, Authorization, Mcp-Session-Id, MCP-Protocol-Version, Last-Event-ID"
+    } else {
+        "Content-Type"
+    }
+}
+
+/// The MCP server's answers a browser-based client must read: where to sign
+/// in, on a refusal.
+const MCP_EXPOSED: &str = "WWW-Authenticate, Mcp-Session-Id";
 
 /// The middleware, with the origins from `CORS_ORIGINS`.
 pub async fn cors(req: Request, next: Next) -> Response {
@@ -116,7 +140,7 @@ pub async fn apply(credentialed: &[String], req: Request, next: Next) -> Respons
             );
             h.insert(
                 header::ACCESS_CONTROL_ALLOW_HEADERS,
-                HeaderValue::from_static("Content-Type"),
+                HeaderValue::from_static(public_headers(&path)),
             );
         }
         if trusted.is_some() || public.is_some() {
@@ -151,6 +175,12 @@ pub async fn apply(credentialed: &[String], req: Request, next: Next) -> Respons
                 header::ACCESS_CONTROL_ALLOW_ORIGIN,
                 HeaderValue::from_static("*"),
             );
+            if path == "/mcp" || path.starts_with("/.well-known/") {
+                h.insert(
+                    header::ACCESS_CONTROL_EXPOSE_HEADERS,
+                    HeaderValue::from_static(MCP_EXPOSED),
+                );
+            }
         }
     }
     res
@@ -353,6 +383,48 @@ mod tests {
                 "{path}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn a_browser_based_mcp_client_may_call_the_mcp_server_and_sign_in() {
+        let app = Router::new()
+            .route("/mcp", post(|| async { "{}" }))
+            .route("/oauth/token", post(|| async { "{}" }))
+            .route("/oauth/authorize", get(|| async { "" }))
+            .layer(axum::middleware::from_fn(|req, next| async move {
+                apply(&[], req, next).await
+            }));
+        let pre = Request::builder()
+            .method("OPTIONS")
+            .uri("/mcp")
+            .header(header::ORIGIN, "http://localhost:6274")
+            .header(header::ACCESS_CONTROL_REQUEST_METHOD, "POST")
+            .body(Body::empty())
+            .unwrap();
+        let r = app.clone().oneshot(pre).await.unwrap();
+        assert_eq!(get_h(&r, header::ACCESS_CONTROL_ALLOW_ORIGIN), Some("*"));
+        assert!(get_h(&r, header::ACCESS_CONTROL_ALLOW_HEADERS)
+            .unwrap()
+            .contains("Authorization"));
+        assert_eq!(get_h(&r, header::ACCESS_CONTROL_ALLOW_CREDENTIALS), None);
+        let call = Request::builder()
+            .method("POST")
+            .uri("/mcp")
+            .header(header::ORIGIN, "http://localhost:6274")
+            .body(Body::empty())
+            .unwrap();
+        let r = app.clone().oneshot(call).await.unwrap();
+        assert_eq!(
+            get_h(&r, header::ACCESS_CONTROL_EXPOSE_HEADERS),
+            Some(MCP_EXPOSED)
+        );
+        assert_eq!(public_methods("/oauth/token"), Some("POST"));
+        assert_eq!(
+            public_methods("/.well-known/oauth-authorization-server"),
+            Some("GET")
+        );
+        // The consent step is a page in the browser, not a cross-origin call.
+        assert_eq!(public_methods("/oauth/authorize"), None);
     }
 
     async fn post_with(origin: Option<&str>, fetch_site: Option<&str>, cookie: bool) -> StatusCode {

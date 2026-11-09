@@ -471,6 +471,34 @@ test("single origin: every public route the gateway serves outside /api reaches 
   assert.ok(covered("/agent-approvals/link"));
 });
 
+test("the MCP server and its sign-in reach the gateway, hosted and self-hosted", () => {
+  const cfg = loadConfigFile(path.join(INFRA, "config", "hosted.prod.json"), { CDK_DEFAULT_ACCOUNT: "654654210434" });
+  const api = synth(cfg, zoneContext("654654210434", "us-east-1", "coderhelm.com"))["coderhelm-prod-api"];
+  const keys = Object.values(api.findResources("AWS::ApiGatewayV2::Route")).map((r: any) => String(r.Properties.RouteKey));
+  for (const [m, p] of [
+    ["POST", "/mcp"],
+    ["GET", "/mcp"],
+    ["OPTIONS", "/mcp"],
+    ["GET", "/.well-known/oauth-protected-resource/mcp"],
+    ["GET", "/.well-known/oauth-authorization-server"],
+    ["POST", "/oauth/register"],
+    ["GET", "/oauth/authorize"],
+    ["POST", "/oauth/token"],
+    ["POST", "/oauth/revoke"],
+  ]) {
+    assert.ok(keys.some((k) => routeTakes(k, m, p)), `no HTTP API route for ${m} ${p}`);
+  }
+  // Single origin: CloudFront sends them to the API, and the dashboard's
+  // consent page (/authorize) to the dashboard.
+  const covered = (p: string) =>
+    API_PATHS.some((a) => (a.endsWith("*") ? p.startsWith(a.slice(0, -1)) : p === a));
+  for (const p of ["/mcp", "/.well-known/oauth-protected-resource", "/.well-known/oauth-protected-resource/mcp", "/.well-known/oauth-authorization-server", "/oauth/token"]) {
+    assert.ok(covered(p), `${p} isn't in API_PATHS`);
+  }
+  assert.ok(!covered("/authorize"));
+  assert.ok(!covered("/settings/connected-apps"));
+});
+
 test("self-host serves the OpenAPI document through CloudFront", () => {
   assert.ok(API_PATHS.includes("/openapi.json"));
 });

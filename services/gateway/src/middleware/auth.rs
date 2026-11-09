@@ -10,6 +10,7 @@ use std::time::{Duration, Instant};
 
 use crate::api_keys::{self, Outcome, RateWindow};
 use crate::auth::jwt;
+use crate::mcp_server::{self, McpCaller};
 use crate::models::{ApiKeyRef, Claims};
 use crate::openapi;
 use crate::permissions::{self, Access, Capability};
@@ -32,6 +33,12 @@ pub async fn require_auth(
     mut req: Request,
     next: Next,
 ) -> Result<Response, StatusCode> {
+    // A tool call of a connected app (mcp_server::call): set only by the
+    // gateway on the requests it makes itself, never from outside.
+    if let Some(caller) = req.extensions().get::<McpCaller>().cloned() {
+        return Ok(app_request(&state, req, next, caller).await);
+    }
+
     // A team API key: its own path, and never a session's (no cookies, no
     // support view, no sliding refresh).
     if let Some(token) = api_keys::bearer_key(req.headers()).map(str::to_string) {
@@ -177,6 +184,51 @@ pub async fn require_auth(
     }
 
     Ok(response)
+}
+
+/// A connected app's request, as the person who connected it: the same
+/// checks a session of theirs gets on every request (still on the team, no
+/// session ended since they connected the app, the team's two-factor rule,
+/// their role's capabilities, custom roles included), plus the connection's
+/// scopes and the routes the tools may call (`mcp_server::decide`). No
+/// support view, no cookies, no sliding refresh.
+async fn app_request(
+    state: &Arc<AppState>,
+    mut req: Request,
+    next: Next,
+    caller: McpCaller,
+) -> Response {
+    let handler = req
+        .extensions()
+        .get::<MatchedPath>()
+        .and_then(|m| permissions::routed_handler(req.method().as_str(), m.as_str()));
+    let mut claims = caller.claims.clone();
+    claims.support_view = None;
+    claims.api_key = None;
+    if let Err(ended) = sign_in::check_member_session(state, &claims).await {
+        return ended;
+    }
+    let proof = jwt::SignInProof {
+        mfa: caller.grant.mfa,
+        via: caller.grant.via.clone(),
+    };
+    if let Err(held) = sign_in::check_session(state, &claims.team_id, &proof, handler).await {
+        return held;
+    }
+    let holder = roles::holder_for(state, &claims).await;
+    match mcp_server::decide(&caller.scopes, caller.tool_handlers, &holder, handler) {
+        Err(refusal) => return refusal.response(),
+        Ok(effective_role) => {
+            if holder.custom.is_some() {
+                claims.role = effective_role.to_string();
+                claims.custom = Some(holder);
+            }
+        }
+    }
+    note_activity(state, &claims.team_id, &claims.sub).await;
+    req.extensions_mut().insert(claims);
+    req.extensions_mut().insert(proof);
+    next.run(req).await
 }
 
 /// A request made with a team API key. The key is checked and counted
