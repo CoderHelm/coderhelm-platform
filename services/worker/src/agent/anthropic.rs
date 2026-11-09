@@ -707,7 +707,7 @@ pub async fn converse_tool_loop(
     max_tokens: i32,
     deadline: Option<std::time::Instant>,
     effort: Option<&str>,
-    on_tool_call: Option<&super::llm::OnToolCall>,
+    observer: Option<&dyn super::llm::LoopObserver>,
     mut conversation_log: Option<&mut Vec<Value>>,
 ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
     let family = ModelFamily::of(model_id);
@@ -885,6 +885,19 @@ pub async fn converse_tool_loop(
             })
             .collect::<Vec<_>>()
             .join(" ");
+        if let Some(o) = observer {
+            // The blocks joined by line, so a heading stays on its own line.
+            let written: Vec<&str> = blocks
+                .iter()
+                .filter_map(|b| match b {
+                    ContentBlock::Text { text } if !text.trim().is_empty() => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect();
+            if !written.is_empty() {
+                o.on_text(&written.join("\n"));
+            }
+        }
 
         // Execute tools, each only after the policy gate allows it.
         let mut tool_results: Vec<Value> = Vec::new();
@@ -916,8 +929,8 @@ pub async fn converse_tool_loop(
             {
                 super::policy::Gated::Ran(r) => r,
                 super::policy::Gated::Refused(message) => {
-                    if let Some(cb) = on_tool_call {
-                        cb(tool_name, 0, &truncate_input_summary(tool_input), true);
+                    if let Some(o) = observer {
+                        o.on_tool_call(tool_name, tool_input, 0, true);
                     }
                     info!(tool = %tool_name, "Tool not run: the policy gate said no");
                     tool_results.push(json!({
@@ -937,9 +950,8 @@ pub async fn converse_tool_loop(
                 Ok(result) => {
                     let duration_ms = tool_start.elapsed().as_millis() as u64;
                     usage.record_tool_call(tool_name, duration_ms);
-                    if let Some(cb) = on_tool_call {
-                        let input_summary = truncate_input_summary(tool_input);
-                        cb(tool_name, duration_ms, &input_summary, false);
+                    if let Some(o) = observer {
+                        o.on_tool_call(tool_name, tool_input, duration_ms, false);
                     }
                     info!(tool = %tool_name, duration_ms, "Tool completed");
                     tool_results.push(json!({
@@ -951,9 +963,8 @@ pub async fn converse_tool_loop(
                 Err(e) => {
                     let duration_ms = tool_start.elapsed().as_millis() as u64;
                     usage.record_tool_call(tool_name, duration_ms);
-                    if let Some(cb) = on_tool_call {
-                        let input_summary = truncate_input_summary(tool_input);
-                        cb(tool_name, duration_ms, &input_summary, true);
+                    if let Some(o) = observer {
+                        o.on_tool_call(tool_name, tool_input, duration_ms, true);
                     }
                     warn!(tool = %tool_name, error = %e, duration_ms, "Tool execution failed");
                     // GitHub refusing for a while is not an answer to retry:
@@ -1108,26 +1119,6 @@ pub(crate) fn shared_prefix_bytes(
 }
 
 // --- Internal helpers ---
-
-/// Produce a short summary of tool input for live event display.
-fn truncate_input_summary(input: &Value) -> String {
-    // For common tools, extract the most relevant field
-    let summary = if let Some(path) = input.get("path").and_then(|v| v.as_str()) {
-        path.to_string()
-    } else if let Some(pattern) = input.get("pattern").and_then(|v| v.as_str()) {
-        format!("pattern: {pattern}")
-    } else if let Some(command) = input.get("command").and_then(|v| v.as_str()) {
-        command.chars().take(200).collect()
-    } else {
-        let s = input.to_string();
-        if s.len() > 200 {
-            format!("{}…", common::truncate_str(&s, 200))
-        } else {
-            s
-        }
-    };
-    summary
-}
 
 /// Sends one Messages request, streamed, and counts it: every attempt into
 /// the team's counters as it happens (`common::model_stream`, a reply that

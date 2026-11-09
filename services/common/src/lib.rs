@@ -121,6 +121,8 @@ pub mod plugins;
 pub mod public_urls;
 /// Who asked for a run: one identity per person, for per-person analytics.
 pub mod requester;
+/// What the reviewer did while it read a pull request, for the session page.
+pub mod review_activity;
 /// The PR's "CoderHelm review" check run, from scheduled to finished.
 pub mod review_check;
 /// Lessons the reviewer learns from people's pushback on its findings.
@@ -128,6 +130,8 @@ pub mod review_lessons;
 /// Where the reviewer is with each PR right now (queued, reviewing, retrying,
 /// done), and the one status a PR shows on the dashboard.
 pub mod review_live;
+/// The "PR Overview" a review leads with: what the PR does, file by file.
+pub mod review_overview;
 pub mod review_session;
 pub mod review_stats;
 /// Learning from outcomes: reward events, scores, calibration, variants,

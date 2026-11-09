@@ -312,6 +312,134 @@ pub async fn close(
     log_unless_missing(named(req, &update).send().await.err(), job, "close");
 }
 
+/// Pure: one entry of `activity` ([`crate::review_activity::Event`]).
+pub fn activity_value(e: &crate::review_activity::Event) -> AttributeValue {
+    let mut m = HashMap::from([
+        ("at".to_string(), n(e.at_ms)),
+        ("kind".to_string(), s(&e.kind)),
+    ]);
+    for (k, v) in [
+        ("label", &e.label),
+        ("heading", &e.heading),
+        ("text", &e.text),
+    ] {
+        if !v.is_empty() {
+            m.insert(k.to_string(), s(v));
+        }
+    }
+    if e.failed {
+        m.insert("failed".to_string(), AttributeValue::Bool(true));
+    }
+    AttributeValue::M(m)
+}
+
+/// Pure: the update that appends a batch of activity (`:ev`, a list) and
+/// counts the events the review's caps dropped (`:d`).
+pub fn activity_update() -> String {
+    "SET #activity = list_append(if_not_exists(#activity, :none), :ev), #updated_at = :at \
+     ADD #activity_dropped :d"
+        .to_string()
+}
+
+/// Append a batch of what the reviewer did to `job`'s session. The events
+/// are already capped and scrubbed ([`crate::review_activity::Recorder`]).
+pub async fn append_activity(
+    dynamo: &DynamoClient,
+    table: &str,
+    team_id: &str,
+    job: &str,
+    events: &[crate::review_activity::Event],
+    dropped: u64,
+) {
+    if events.is_empty() && dropped == 0 {
+        return;
+    }
+    let update = activity_update();
+    let req = dynamo
+        .update_item()
+        .table_name(table)
+        .key("pk", s(team_id))
+        .key("sk", s(&record_sk(job)))
+        .update_expression(&update)
+        .condition_expression(EXISTS)
+        .expression_attribute_values(":none", AttributeValue::L(vec![]))
+        .expression_attribute_values(
+            ":ev",
+            AttributeValue::L(events.iter().map(activity_value).collect()),
+        )
+        .expression_attribute_values(":d", n(dropped as i64))
+        .expression_attribute_values(":at", s(&chrono::Utc::now().to_rfc3339()));
+    log_unless_missing(named(req, &update).send().await.err(), job, "activity");
+}
+
+/// Pure: the activity of a record, in the order it was appended, at most
+/// [`crate::review_activity::MAX_EVENTS`].
+pub fn activity_of(item: &HashMap<String, AttributeValue>) -> Vec<crate::review_activity::Event> {
+    let Some(list) = item.get("activity").and_then(|v| v.as_l().ok()) else {
+        return Vec::new();
+    };
+    list.iter()
+        .filter_map(|v| v.as_m().ok())
+        .map(|m| {
+            let get = |k: &str| {
+                m.get(k)
+                    .and_then(|v| v.as_s().ok())
+                    .cloned()
+                    .unwrap_or_default()
+            };
+            crate::review_activity::Event {
+                at_ms: m
+                    .get("at")
+                    .and_then(|v| v.as_n().ok())
+                    .and_then(|n| n.parse().ok())
+                    .unwrap_or(0),
+                kind: get("kind"),
+                label: get("label"),
+                heading: get("heading"),
+                text: get("text"),
+                failed: m
+                    .get("failed")
+                    .and_then(|v| v.as_bool().ok())
+                    .copied()
+                    .unwrap_or(false),
+            }
+        })
+        .take(crate::review_activity::MAX_EVENTS)
+        .collect()
+}
+
+/// Pure: how many events the review's caps left out.
+pub fn activity_dropped(item: &HashMap<String, AttributeValue>) -> u64 {
+    item.get("activity_dropped")
+        .and_then(|v| v.as_n().ok())
+        .and_then(|n| n.parse().ok())
+        .unwrap_or(0)
+}
+
+/// Record the review's "PR Overview" on `job`'s session.
+pub async fn set_overview(
+    dynamo: &DynamoClient,
+    table: &str,
+    team_id: &str,
+    job: &str,
+    overview: &crate::review_overview::Overview,
+) {
+    if overview.is_empty() {
+        return;
+    }
+    let update = "SET #overview = :o, #updated_at = :at";
+    let req = dynamo
+        .update_item()
+        .table_name(table)
+        .key("pk", s(team_id))
+        .key("sk", s(&record_sk(job)))
+        .update_expression(update)
+        .condition_expression(EXISTS)
+        .expression_attribute_values(":o", crate::review_overview::to_attr(overview))
+        .expression_attribute_values(":at", s(&chrono::Utc::now().to_rfc3339()));
+    log_unless_missing(named(req, update).send().await.err(), job, "overview");
+}
+
 /// A condition miss is a job that never opened a session (it stopped before
 /// real work); anything else is logged and dropped.
 fn log_unless_missing<E, R>(
@@ -462,6 +590,45 @@ mod tests {
         );
         let with = close_update(true);
         assert!(with.contains("#reason = :why") && with.ends_with("REMOVE #expires_at"));
+    }
+
+    #[test]
+    fn activity_appends_and_reads_back_in_order() {
+        use crate::review_activity::{Event, MAX_EVENTS};
+        let update = activity_update();
+        assert!(update.contains("list_append(if_not_exists(#activity, :none), :ev)"));
+        assert!(update.contains("ADD #activity_dropped :d"));
+        assert_eq!(
+            placeholders(&update),
+            vec!["activity", "updated_at", "activity_dropped"]
+        );
+        let events = vec![
+            Event::note(1, "**Checking callers**\nTwo places.").unwrap(),
+            Event::tool(2, "read_file", &serde_json::json!({"path": "a.rs"}), true),
+            Event::comment(3, "a.rs", 9, "Off by one"),
+        ];
+        let item = HashMap::from([
+            (
+                "activity".to_string(),
+                AttributeValue::L(events.iter().map(activity_value).collect()),
+            ),
+            ("activity_dropped".to_string(), n(4)),
+        ]);
+        assert_eq!(activity_of(&item), events);
+        assert_eq!(activity_dropped(&item), 4);
+        // Empty fields aren't written.
+        let AttributeValue::M(m) = activity_value(&events[1]) else {
+            panic!()
+        };
+        assert!(!m.contains_key("text") && m.contains_key("failed"));
+        // A record past the cap is read back capped.
+        let many = HashMap::from([(
+            "activity".to_string(),
+            AttributeValue::L(vec![activity_value(&events[1]); MAX_EVENTS + 10]),
+        )]);
+        assert_eq!(activity_of(&many).len(), MAX_EVENTS);
+        assert!(activity_of(&HashMap::new()).is_empty());
+        assert_eq!(activity_dropped(&HashMap::new()), 0);
     }
 
     #[test]

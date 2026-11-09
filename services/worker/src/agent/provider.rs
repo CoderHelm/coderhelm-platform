@@ -245,7 +245,7 @@ pub async fn converse(
     tool_executor: &dyn ToolExecutor,
     usage: &mut TokenUsage,
     opts: ConverseOptions,
-    on_tool_call: Option<&super::llm::OnToolCall>,
+    observer: Option<&dyn super::llm::LoopObserver>,
     conversation_log: Option<&mut Vec<serde_json::Value>>,
 ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
     // A switch in Settings, System, Models reaches the next loop.
@@ -268,7 +268,7 @@ pub async fn converse(
         opts.max_tokens,
         opts.deadline,
         opts.effort,
-        on_tool_call,
+        observer,
         conversation_log,
     )
     .await
