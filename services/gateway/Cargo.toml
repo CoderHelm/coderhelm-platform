@@ -75,6 +75,8 @@ uuid = { version = "1", features = ["v4"] }
 regex = "1"
 md5 = "0.7"
 futures = "0.3"
+# mcp_server: a tool call runs through the API router (ServiceExt::oneshot)
+tower = { version = "0.5", features = ["util"] }
 tokio-stream = "0.1"
 
 # MenteDB (agent memory browsing)
@@ -86,7 +88,5 @@ tar = "0.4"
 [dev-dependencies]
 # rsa 0.9 key generation needs the rand 0.8 RNG traits (tests only)
 rand08 = { package = "rand", version = "0.8" }
-# middleware tests drive a small router
-tower = { version = "0.5", features = ["util"] }
 # signs test messages the way CoderHelm's KMS key does (hosted_sig)
 ed25519-dalek = { version = "2", default-features = false, features = ["std"] }

@@ -5,7 +5,7 @@
  * service paths to their backends, all on one hostname:
  *
  *   /api/plans/chat/stream /api/brain/stream   → the streaming function URL (SSE)
- *   /api/* /auth/* /webhooks/* /email/* /integrations/*   → the HTTP API
+ *   /api/* /auth/* /webhooks/* /email/* /integrations/* /mcp /oauth/*   → the HTTP API
  *   everything else          → the dashboard (static export in S3)
  *
  * One hostname means the session cookie (`__Host-`, SameSite=Strict) is
@@ -45,6 +45,11 @@ export const API_PATHS = [
   "/agent-approvals/*",
   "/plugins/approve*",
   "/openapi.json",
+  // The MCP server and how its clients sign in (the dashboard's consent
+  // page is /authorize, outside these).
+  "/mcp",
+  "/.well-known/oauth-*",
+  "/oauth/*",
 ];
 /** The chat stream (SSE, served by the streaming function). */
 export const STREAM_PATH = "/api/plans/chat/stream";

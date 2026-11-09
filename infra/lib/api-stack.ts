@@ -961,6 +961,35 @@ export class ApiStack extends cdk.Stack {
       integration: lambdaIntegration,
     });
 
+    // CoderHelm's MCP server (Streamable HTTP, POST; GET and DELETE answer
+    // 405) and how MCP clients sign in to it: the metadata documents and the
+    // OAuth endpoints (gateway mcp_server.rs, routes/mcp_oauth.rs). OPTIONS
+    // too, for browser-based MCP clients: the gateway answers preflights.
+    httpApi.addRoutes({
+      path: "/mcp",
+      methods: [
+        apigatewayv2.HttpMethod.GET,
+        apigatewayv2.HttpMethod.POST,
+        apigatewayv2.HttpMethod.DELETE,
+        apigatewayv2.HttpMethod.OPTIONS,
+      ],
+      integration: lambdaIntegration,
+    });
+    httpApi.addRoutes({
+      path: "/.well-known/{proxy+}",
+      methods: [apigatewayv2.HttpMethod.GET, apigatewayv2.HttpMethod.OPTIONS],
+      integration: lambdaIntegration,
+    });
+    httpApi.addRoutes({
+      path: "/oauth/{proxy+}",
+      methods: [
+        apigatewayv2.HttpMethod.GET,
+        apigatewayv2.HttpMethod.POST,
+        apigatewayv2.HttpMethod.OPTIONS,
+      ],
+      integration: lambdaIntegration,
+    });
+
     // Auth routes
     httpApi.addRoutes({
       path: "/auth/{proxy+}",
