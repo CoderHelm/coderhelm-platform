@@ -1,0 +1,66 @@
+{
+  "coderhelm.json/Boundary": {
+    "Description": "CoderHelm: the most any CoderHelm role can do (docs/self-host/security.md)",
+    "ManagedPolicyName": {
+      "Fn::Sub": "coderhelm-${Stage}-boundary-stack"
+    },
+    "Path": null
+  },
+  "coderhelm.json/DeployBoundary": {
+    "Description": "CoderHelm: the auto-update role's boundary, the same as every CoderHelm role's (docs/self-host/security.md)",
+    "ManagedPolicyName": {
+      "Fn::Sub": "coderhelm-${Stage}-deploy-boundary-stack"
+    },
+    "Path": null
+  },
+  "Api/GatewayServiceRoleOverflowPolicy11BB532A1": {
+    "Description": {
+      "Fn::Sub": "Part of the policies for coderhelm-${Stage}-api/Gateway/ServiceRole"
+    },
+    "ManagedPolicyName": {
+      "Fn::Sub": "coderhelm-${Stage}-OverflowPolicy1-81668949"
+    },
+    "Path": "/"
+  },
+  "Api/GatewayServiceRoleOverflowPolicy23FA68F4F": {
+    "Description": {
+      "Fn::Sub": "Part of the policies for coderhelm-${Stage}-api/Gateway/ServiceRole"
+    },
+    "ManagedPolicyName": {
+      "Fn::Sub": "coderhelm-${Stage}-OverflowPolicy2-e68ee111"
+    },
+    "Path": "/"
+  },
+  "Api/GatewayOwnAccountRead": {
+    "Description": "CoderHelm: reads this install's own AWS account (logs, metrics, Airflow, ECS), read-only; kept current by each version update",
+    "ManagedPolicyName": {
+      "Fn::Sub": "coderhelm-${Stage}-GatewayOwnAccountRead-aa934871"
+    },
+    "Path": null
+  },
+  "Worker/WorkerServiceRoleOverflowPolicy15A2EF9BB": {
+    "Description": {
+      "Fn::Sub": "Part of the policies for coderhelm-${Stage}-worker/Worker/ServiceRole"
+    },
+    "ManagedPolicyName": {
+      "Fn::Sub": "coderhelm-${Stage}-OverflowPolicy1-2ccac3d5"
+    },
+    "Path": "/"
+  },
+  "Worker/WorkerServiceRoleOverflowPolicy29FC0A908": {
+    "Description": {
+      "Fn::Sub": "Part of the policies for coderhelm-${Stage}-worker/Worker/ServiceRole"
+    },
+    "ManagedPolicyName": {
+      "Fn::Sub": "coderhelm-${Stage}-OverflowPolicy2-b95bf6c8"
+    },
+    "Path": "/"
+  },
+  "Worker/WorkerOwnAccountRead": {
+    "Description": "CoderHelm: reads this install's own AWS account (logs, metrics, Airflow, ECS), read-only; kept current by each version update",
+    "ManagedPolicyName": {
+      "Fn::Sub": "coderhelm-${Stage}-WorkerOwnAccountRead-e10f242c"
+    },
+    "Path": null
+  }
+}

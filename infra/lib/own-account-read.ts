@@ -85,8 +85,12 @@ export function ownAccountStatements(roleArn: string): Statement[] {
 /** Gives `fn`'s role this release's read-only permissions in its own account, and tells it so. */
 export function grantOwnAccountRead(scope: Construct, id: string, fn: cdk.aws_lambda.Function): void {
   const role = fn.role!;
+  // The description is frozen as released (test/fixtures/released-managed-policies.json).
+  // Changing it replaces the policy, the replacement keeps the generated name,
+  // and every install's update fails with "already exists". What the policy
+  // covers now (Bedrock knowledge bases too) is in the statements, not here.
   new iam.CfnManagedPolicy(scope, id, {
-    description: "CoderHelm: reads this install's own AWS account (logs, metrics, Airflow, ECS, Bedrock knowledge bases), read-only; kept current by each version update",
+    description: "CoderHelm: reads this install's own AWS account (logs, metrics, Airflow, ECS), read-only; kept current by each version update",
     roles: [role.roleName],
     policyDocument: { Version: "2012-10-17", Statement: ownAccountStatements(role.roleArn) },
   });

@@ -21,6 +21,7 @@ import * as path from "node:path";
 import { buildApp } from "../lib/app";
 import { resolveConfig } from "../lib/config";
 import { buildNative, nativeStamp } from "../lib/native/build";
+import { repoPath } from "../lib/paths";
 import { ASSETS_BUCKET_SENTINEL, REGION_SENTINEL, STAGE_SENTINEL, nativeConfig } from "../lib/native/config";
 import { emailEnvironment } from "../lib/service-env";
 import { decision } from "./iam-eval";
@@ -626,4 +627,48 @@ test("every resource type in the release is one the simulator checked the auto-u
     for (const r of Object.values<any>(t.Resources)) if (r.Type.startsWith("AWS::") && !checked.has(r.Type)) missing.add(`${name}: ${r.Type}`);
   }
   assert.deepEqual([...missing], []);
+});
+
+// A released managed policy's Description, ManagedPolicyName and Path can't
+// change. Each forces CloudFormation to replace the policy, the replacement
+// keeps the name CloudFormation generated for it, the create comes before the
+// delete, and IAM refuses it: "A policy called ... already exists", so the
+// update rolls back on every install (v0.8.57, GatewayOwnAccountRead).
+// test/fixtures/released-managed-policies.json holds those properties as
+// released. A new policy is added there; an entry already there never changes.
+test("no released managed policy is replaced on update: Description, ManagedPolicyName and Path stay as released (test/fixtures/released-managed-policies.json)", () => {
+  const FROZEN = ["Description", "ManagedPolicyName", "Path"] as const;
+  const fixture = repoPath("infra", "test", "fixtures", "released-managed-policies.json");
+  const released: Record<string, Record<string, unknown>> = JSON.parse(fs.readFileSync(fixture, "utf8"));
+  const changed: string[] = [];
+  const unpinned: string[] = [];
+  for (const [name, t] of all()) {
+    for (const [id, r] of Object.entries<any>(t.Resources)) {
+      if (r.Type !== "AWS::IAM::ManagedPolicy") continue;
+      const key = `${name}/${id}`;
+      const now = Object.fromEntries(FROZEN.map((k) => [k, r.Properties?.[k] ?? null]));
+      const was = released[key];
+      if (!was) {
+        unpinned.push(`${key}: ${JSON.stringify(now)}`);
+        continue;
+      }
+      for (const k of FROZEN) {
+        if (JSON.stringify(now[k]) !== JSON.stringify(was[k] ?? null)) {
+          changed.push(`${key} ${k}: released ${JSON.stringify(was[k] ?? null)}, now ${JSON.stringify(now[k])}`);
+        }
+      }
+    }
+  }
+  assert.deepEqual(
+    changed,
+    [],
+    "Changing a released managed policy's Description, ManagedPolicyName or Path replaces the policy, and every install's update " +
+      "fails with \"A policy called ... already exists\" and rolls back. Restore the released value; put new wording in a code " +
+      "comment or in the policy statements' Sid, never in the description.",
+  );
+  assert.deepEqual(
+    unpinned,
+    [],
+    `A new managed policy: add it to ${fixture} as shown, so its Description, ManagedPolicyName and Path are pinned from its first release.`,
+  );
 });
