@@ -440,6 +440,69 @@ pub async fn set_overview(
     log_unless_missing(named(req, update).send().await.err(), job, "overview");
 }
 
+/// Attribute on a session naming the review record (`REVIEW#…` sort key)
+/// the job wrote.
+pub const REVIEW_SK: &str = "review_sk";
+
+/// Attribute on a review record naming the job (its session id) that wrote
+/// it.
+pub const REVIEW_SESSION_ID: &str = "session_id";
+
+/// Pure: the update that links a session to the review record it wrote. A
+/// verdict always takes the link; an answer to a question takes it only
+/// when the job wrote no review (a job that reviews and then answers links
+/// its review).
+pub fn review_link_update(is_verdict: bool) -> String {
+    if is_verdict {
+        "SET #review_sk = :r, #updated_at = :at".to_string()
+    } else {
+        "SET #review_sk = if_not_exists(#review_sk, :r), #updated_at = :at".to_string()
+    }
+}
+
+/// Link `job`'s session to the review record `review_sk` it wrote. Nothing
+/// happens for a job that never opened a session.
+pub async fn link_review(
+    dynamo: &DynamoClient,
+    table: &str,
+    team_id: &str,
+    job: &str,
+    review_sk: &str,
+    is_verdict: bool,
+) {
+    if review_sk.is_empty() {
+        return;
+    }
+    let update = review_link_update(is_verdict);
+    let req = dynamo
+        .update_item()
+        .table_name(table)
+        .key("pk", s(team_id))
+        .key("sk", s(&record_sk(job)))
+        .update_expression(&update)
+        .condition_expression(EXISTS)
+        .expression_attribute_values(":r", s(review_sk))
+        .expression_attribute_values(":at", s(&chrono::Utc::now().to_rfc3339()));
+    log_unless_missing(named(req, &update).send().await.err(), job, "review link");
+}
+
+/// Pure: the review record a session wrote, when it is linked to one.
+pub fn review_sk_of(item: &HashMap<String, AttributeValue>) -> Option<String> {
+    item.get(REVIEW_SK)
+        .and_then(|v| v.as_s().ok())
+        .filter(|s| s.starts_with("REVIEW#"))
+        .cloned()
+}
+
+/// Pure: the session that wrote a review record, when the record names one
+/// (older records don't).
+pub fn session_id_of(item: &HashMap<String, AttributeValue>) -> Option<String> {
+    item.get(REVIEW_SESSION_ID)
+        .and_then(|v| v.as_s().ok())
+        .filter(|s| valid_id(s))
+        .cloned()
+}
+
 /// A condition miss is a job that never opened a session (it stopped before
 /// real work); anything else is logged and dropped.
 fn log_unless_missing<E, R>(
@@ -640,5 +703,39 @@ mod tests {
             assert!(p.iter().any(|n| n == name), "{name}");
         }
         assert_eq!(placeholders(&step_update()), vec!["steps", "updated_at"]);
+    }
+
+    #[test]
+    fn a_verdict_links_its_session_and_an_answer_never_replaces_it() {
+        assert_eq!(
+            review_link_update(true),
+            "SET #review_sk = :r, #updated_at = :at"
+        );
+        let answer = review_link_update(false);
+        assert!(answer.contains("if_not_exists(#review_sk, :r)"), "{answer}");
+        for expr in [review_link_update(true), review_link_update(false)] {
+            assert_eq!(placeholders(&expr), vec!["review_sk", "updated_at"]);
+            assert!(!expr.contains("#steps"));
+        }
+    }
+
+    #[test]
+    fn the_links_read_back_and_old_records_have_none() {
+        let job = "3f2c9a1e-5b7d-4c8e-9a0b-1c2d3e4f5a6b";
+        let review = "REVIEW#acme/web#000318#2026-10-22T14:20:05+00:00";
+        let session = HashMap::from([(REVIEW_SK.to_string(), s(review))]);
+        assert_eq!(review_sk_of(&session).as_deref(), Some(review));
+        let record = HashMap::from([(REVIEW_SESSION_ID.to_string(), s(job))]);
+        assert_eq!(session_id_of(&record).as_deref(), Some(job));
+        // Older records: nothing.
+        assert_eq!(review_sk_of(&HashMap::new()), None);
+        assert_eq!(session_id_of(&HashMap::new()), None);
+        // Anything that isn't a key or a job id is not a link.
+        let bad = HashMap::from([
+            (REVIEW_SK.to_string(), s("REVIEWSESSION#x")),
+            (REVIEW_SESSION_ID.to_string(), s("not-a-job")),
+        ]);
+        assert_eq!(review_sk_of(&bad), None);
+        assert_eq!(session_id_of(&bad), None);
     }
 }

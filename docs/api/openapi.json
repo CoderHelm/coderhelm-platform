@@ -2963,6 +2963,16 @@
             ],
             "type": "string"
           },
+          "session_id": {
+            "description": "The review job that wrote this review: its session\n(`/api/reviewer/session?id=`). Null on older reviews.",
+            "examples": [
+              "3f2c9a1e-5b7d-4c8e-9a0b-1c2d3e4f5a6b"
+            ],
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "sk": {
             "description": "The review's key: pass it as `sk` to get the review.",
             "examples": [
@@ -3309,6 +3319,16 @@
             ],
             "type": "string"
           },
+          "review_sk": {
+            "description": "The review this session wrote (its `sk`, for `/api/reviewer/review`).\nNull while it runs, when it ended without one, and on older sessions.",
+            "examples": [
+              "REVIEW#acme/web#000318#2026-10-22T14:20:05+00:00"
+            ],
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "review_url": {
             "description": "The review posted on GitHub; empty when nothing new was posted.",
             "examples": [
@@ -3607,6 +3627,17 @@
             "minimum": 0,
             "type": "integer"
           },
+          "checks": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/RunChecks",
+                "description": "The CI checks on the head of the run's open pull request, read from\nGitHub (reused for up to a minute). Null when the run has no open\npull request or GitHub can't be read."
+              }
+            ]
+          },
           "close_reason": {
             "description": "Why it was closed.",
             "examples": [
@@ -3882,6 +3913,17 @@
             "type": [
               "array",
               "null"
+            ]
+          },
+          "pr_review": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/RunPrReview",
+                "description": "CoderHelm's latest review verdict on the run's pull request. Null\nbefore any."
+              }
             ]
           },
           "pr_url": {
@@ -4184,6 +4226,165 @@
         ],
         "type": "object"
       },
+      "RunCheck": {
+        "description": "One check on the pull request's head.",
+        "properties": {
+          "completed_at": {
+            "description": "When it ended (RFC 3339). Null while it runs.",
+            "examples": [
+              "2026-10-22T14:21:40Z"
+            ],
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "conclusion": {
+            "description": "GitHub's word for how it ended (`success`, `failure`, `neutral`,\n`cancelled`, `timed_out`, `skipped`, `error`, ...). Null until it ends.",
+            "examples": [
+              "success"
+            ],
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "name": {
+            "description": "The check's name (a check run's name or a commit status's context).",
+            "examples": [
+              "build"
+            ],
+            "type": "string"
+          },
+          "required": {
+            "description": "The branch's rules require it before merging. False when they can't\nbe read.",
+            "examples": [
+              true
+            ],
+            "type": "boolean"
+          },
+          "started_at": {
+            "description": "When it started (RFC 3339), when known.",
+            "examples": [
+              "2026-10-22T14:18:00Z"
+            ],
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "state": {
+            "description": "`passed`, `failed`, `running`, `queued` or `skipped`. A required check\nthat hasn't reported yet is `queued`.",
+            "examples": [
+              "passed"
+            ],
+            "type": "string"
+          },
+          "url": {
+            "description": "Its page on GitHub or in the CI system.",
+            "examples": [
+              "https://github.com/acme/web/actions/runs/1/job/2"
+            ],
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "name",
+          "state",
+          "required"
+        ],
+        "type": "object"
+      },
+      "RunCheckCounts": {
+        "description": "How many checks are in each state.",
+        "properties": {
+          "failed": {
+            "description": "Failed, timed out or cancelled.",
+            "examples": [
+              0
+            ],
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "passed": {
+            "description": "Passed.",
+            "examples": [
+              5
+            ],
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "queued": {
+            "description": "Waiting to start, or required and not reported yet.",
+            "examples": [
+              0
+            ],
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "running": {
+            "description": "Running now.",
+            "examples": [
+              1
+            ],
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "skipped": {
+            "description": "Skipped or neutral.",
+            "examples": [
+              1
+            ],
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "passed",
+          "failed",
+          "running",
+          "queued",
+          "skipped"
+        ],
+        "type": "object"
+      },
+      "RunChecks": {
+        "description": "The CI checks on the run's open pull request's head.",
+        "properties": {
+          "counts": {
+            "$ref": "#/components/schemas/RunCheckCounts",
+            "description": "How many checks are in each state."
+          },
+          "items": {
+            "description": "Failed first, then running, queued, passed and skipped; by name\nwithin each.",
+            "items": {
+              "$ref": "#/components/schemas/RunCheck"
+            },
+            "type": "array"
+          },
+          "sha": {
+            "description": "The commit they ran on: the pull request's head.",
+            "examples": [
+              "9fceb02d0ae598e95dc970b74767f19372d61af8"
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "sha",
+          "items",
+          "counts"
+        ],
+        "type": "object"
+      },
       "RunCoveredBy": {
         "description": "The open pull request that already does a run's work.",
         "properties": {
@@ -4470,6 +4671,56 @@
             ]
           }
         },
+        "type": "object"
+      },
+      "RunPrReview": {
+        "description": "CoderHelm's latest review verdict on the run's pull request.",
+        "properties": {
+          "at": {
+            "description": "When it was written (RFC 3339).",
+            "examples": [
+              "2026-10-22T14:20:05+00:00"
+            ],
+            "type": "string"
+          },
+          "review_sk": {
+            "description": "The review's key, for `/api/reviewer/review?sk=`.",
+            "examples": [
+              "REVIEW#acme/web#000318#2026-10-22T14:20:05+00:00"
+            ],
+            "type": "string"
+          },
+          "reviewed_sha": {
+            "description": "The commit it reviewed.",
+            "examples": [
+              "9fceb02d0ae598e95dc970b74767f19372d61af8"
+            ],
+            "type": "string"
+          },
+          "session_id": {
+            "description": "The review job that wrote it (`/api/reviewer/session?id=`). Null on\nolder reviews.",
+            "examples": [
+              "3f2c9a1e-5b7d-4c8e-9a0b-1c2d3e4f5a6b"
+            ],
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "verdict": {
+            "description": "`APPROVE` or `REQUEST_CHANGES`.",
+            "examples": [
+              "APPROVE"
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "verdict",
+          "review_sk",
+          "reviewed_sha",
+          "at"
+        ],
         "type": "object"
       },
       "RunQuestion": {

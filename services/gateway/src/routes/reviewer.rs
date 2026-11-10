@@ -638,6 +638,10 @@ pub struct Review {
     /// The team standards the review was given in full ("always apply").
     #[schema(example = json!(["api-error-format"]))]
     pub applied_standards: Vec<String>,
+    /// The review job that wrote this review: its session
+    /// (`/api/reviewer/session?id=`). Null on older reviews.
+    #[schema(example = "3f2c9a1e-5b7d-4c8e-9a0b-1c2d3e4f5a6b")]
+    pub session_id: Option<String>,
 }
 
 /// A page of reviews.
@@ -727,6 +731,7 @@ fn review_of(item: &HashMap<String, AttributeValue>, truncate_body: bool) -> Rev
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default(),
+        session_id: common::review_session::session_id_of(item),
     }
 }
 
@@ -1449,6 +1454,10 @@ pub struct ReviewSession {
     pub activity_dropped: u64,
     /// The "PR Overview" the review posted, once there is one.
     pub overview: Option<ReviewOverview>,
+    /// The review this session wrote (its `sk`, for `/api/reviewer/review`).
+    /// Null while it runs, when it ended without one, and on older sessions.
+    #[schema(example = "REVIEW#acme/web#000318#2026-10-22T14:20:05+00:00")]
+    pub review_sk: Option<String>,
 }
 
 /// Pure: the session in `item` as `team_id` sees it. `None` for a record
@@ -1502,6 +1511,7 @@ fn session_of(
         activity: activity_groups(item),
         activity_dropped: common::review_session::activity_dropped(item),
         overview: overview_of(item),
+        review_sk: common::review_session::review_sk_of(item),
     })
 }
 
@@ -1908,6 +1918,38 @@ mod tests {
         let done = session_of(&done, "t", 9_999).unwrap();
         assert_eq!((done.status.as_str(), done.findings), ("done", Some(0)));
         assert_eq!(done.check_run_id, Some(77));
+    }
+
+    #[test]
+    fn a_review_and_its_session_link_both_ways_and_old_records_show_null() {
+        use common::review_session as rs;
+        let job = "3f2c9a1e-5b7d-4c8e-9a0b-1c2d3e4f5a6b";
+        let review_sk = "REVIEW#acme/web#000318#2026-10-22T14:20:05+00:00";
+        let mut review = item(&[
+            ("sk", attr_s(review_sk)),
+            ("verdict", attr_s("APPROVE")),
+            (rs::REVIEW_SESSION_ID, attr_s(job)),
+        ]);
+        let j = review_item_to_json(&review, false);
+        assert_eq!(j["session_id"], job);
+        // The list carries it too.
+        assert_eq!(review_item_to_json(&review, true)["session_id"], job);
+        review.remove(rs::REVIEW_SESSION_ID);
+        let j = review_item_to_json(&review, false);
+        assert!(j.as_object().unwrap().contains_key("session_id"));
+        assert!(j["session_id"].is_null());
+
+        let mut session = session_item("t", "done", 2_000);
+        session.insert(rs::REVIEW_SK.into(), attr_s(review_sk));
+        let s = serde_json::to_value(session_of(&session, "t", 9_999).unwrap()).unwrap();
+        assert_eq!(s["review_sk"], review_sk);
+        assert_eq!(s["id"], job);
+        let s = serde_json::to_value(
+            session_of(&session_item("t", "done", 2_000), "t", 9_999).unwrap(),
+        )
+        .unwrap();
+        assert!(s.as_object().unwrap().contains_key("review_sk"));
+        assert!(s["review_sk"].is_null());
     }
 
     #[test]
