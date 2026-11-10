@@ -467,6 +467,9 @@ export class DatabaseStack extends cdk.Stack {
       encryption: dynamodb.TableEncryptionV2.customerManagedKey(
         this.encryptionKey
       ),
+      pointInTimeRecoverySpecification: {
+        pointInTimeRecoveryEnabled: true,
+      },
       deletionProtection: isProd,
       removalPolicy: isProd
         ? cdk.RemovalPolicy.RETAIN
@@ -529,7 +532,15 @@ export class DatabaseStack extends cdk.Stack {
       encryption: dynamodb.TableEncryptionV2.customerManagedKey(
         this.encryptionKey
       ),
-      removalPolicy: cdk.RemovalPolicy.DESTROY,
+      pointInTimeRecoverySpecification: {
+        pointInTimeRecoveryEnabled: true,
+      },
+      // Run history: deleting it is a person's choice (KeepDataOnDelete
+      // on a native install, retainData otherwise), like every other table.
+      deletionProtection: isProd,
+      removalPolicy: isProd
+        ? cdk.RemovalPolicy.RETAIN
+        : cdk.RemovalPolicy.DESTROY,
       timeToLiveAttribute: "ttl",
     });
 
@@ -546,7 +557,15 @@ export class DatabaseStack extends cdk.Stack {
       encryption: dynamodb.TableEncryptionV2.customerManagedKey(
         this.encryptionKey
       ),
-      removalPolicy: cdk.RemovalPolicy.DESTROY,
+      pointInTimeRecoverySpecification: {
+        pointInTimeRecoveryEnabled: true,
+      },
+      // Run history: deleting it is a person's choice (KeepDataOnDelete
+      // on a native install, retainData otherwise), like every other table.
+      deletionProtection: isProd,
+      removalPolicy: isProd
+        ? cdk.RemovalPolicy.RETAIN
+        : cdk.RemovalPolicy.DESTROY,
       timeToLiveAttribute: "ttl",
     });
 
@@ -596,6 +615,10 @@ export class DatabaseStack extends cdk.Stack {
       partitionKey: { name: "pk", type: dynamodb.AttributeType.STRING },
       sortKey: { name: "sk", type: dynamodb.AttributeType.STRING },
       billing: dynamodb.Billing.onDemand(),
+      pointInTimeRecoverySpecification: {
+        pointInTimeRecoveryEnabled: true,
+      },
+      deletionProtection: isProd,
       removalPolicy: cdk.RemovalPolicy.RETAIN,
     });
     new cdk.CfnOutput(this, "BillingTableName", {

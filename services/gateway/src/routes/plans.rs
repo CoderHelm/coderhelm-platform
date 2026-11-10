@@ -3555,15 +3555,11 @@ pub async fn plan_chat_stream(
     >,
     StatusCode,
 > {
-    // Validate Bearer token (issued by /api/plans/chat/token)
-    let token = headers
-        .get("authorization")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.strip_prefix("Bearer "))
-        .ok_or_else(|| {
-            warn!("plan_chat_stream: missing or invalid Authorization header");
-            StatusCode::UNAUTHORIZED
-        })?;
+    // The token issued by /api/plans/chat/token (auth::jwt::stream_token).
+    let token = crate::auth::jwt::stream_token(&headers).ok_or_else(|| {
+        warn!("plan_chat_stream: no stream token");
+        StatusCode::UNAUTHORIZED
+    })?;
 
     let claims =
         crate::auth::jwt::validate_token(token, &state.secrets.jwt_secret).map_err(|e| {

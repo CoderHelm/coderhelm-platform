@@ -339,6 +339,8 @@ export interface ResolvedConfig {
   /** Data bucket name. */
   dataBucketName: string;
   sandboxBucketName: string;
+  /** The access log bucket: S3 server access logs and CloudFront's logs (storage-stack.ts). */
+  logBucketName: string;
   cognitoDomainPrefix: string;
   /**
    * A native release (infra/lib/native): one set of templates for every
@@ -742,6 +744,7 @@ export function resolveConfig(cfg: CoderhelmConfig, opts: { skipValidation?: boo
       : null,
     dataBucketName: `${prefix}-data${suffix}`,
     sandboxBucketName: `${prefix}-sandbox${suffix}`,
+    logBucketName: `${prefix}-logs${suffix}`,
     cognitoDomainPrefix: `${prefix}${suffix}`,
   };
 }

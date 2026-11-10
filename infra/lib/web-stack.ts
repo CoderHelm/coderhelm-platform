@@ -4,7 +4,8 @@
  * One CloudFront distribution serves the dashboard from S3 and forwards the
  * service paths to their backends, all on one hostname:
  *
- *   /api/plans/chat/stream /api/brain/stream   → the streaming function URL (SSE)
+ *   /api/plans/chat/stream /api/brain/stream   → the streaming function URL (SSE),
+ *       signed by CloudFront (origin access control; the URL takes only signed calls)
  *   /api/* /auth/* /webhooks/* /email/* /integrations/* /mcp /oauth/*   → the HTTP API
  *   everything else          → the dashboard (static export in S3)
  *
@@ -29,6 +30,7 @@ import * as ssm from "aws-cdk-lib/aws-ssm";
 import { Construct } from "constructs";
 import { ResolvedConfig } from "./config";
 import { releaseStamp } from "./release";
+import { logAccessTo, logBucketOf } from "./storage-stack";
 
 /**
  * Paths the HTTP API serves (each also matches its sub-paths). Includes the
@@ -55,6 +57,23 @@ export const API_PATHS = [
 export const STREAM_PATH = "/api/plans/chat/stream";
 /** Chat's answer stream: answers that read code run past the HTTP API's 30-second limit. */
 export const BRAIN_STREAM_PATH = "/api/brain/stream";
+
+/**
+ * The lowest TLS version and ciphers viewers may use: CloudFront's newest
+ * TLS 1.2 policy (TLS 1.2 with AES-GCM and ChaCha20 only, and TLS 1.3).
+ */
+export const VIEWER_TLS_POLICY = cloudfront.SecurityPolicyProtocol.TLS_V1_2_2025;
+
+/**
+ * The regions CloudFront's standard logs (legacy, to S3) can be delivered to:
+ * every region enabled by default. It delivers none to a bucket in an opt-in
+ * region, so an install there has no CloudFront logs (S3 access logs still).
+ */
+export const CLOUDFRONT_LOG_REGIONS = [
+  "us-east-1", "us-east-2", "us-west-1", "us-west-2", "ca-central-1", "sa-east-1",
+  "eu-west-1", "eu-west-2", "eu-west-3", "eu-central-1", "eu-north-1",
+  "ap-northeast-1", "ap-northeast-2", "ap-northeast-3", "ap-southeast-1", "ap-southeast-2", "ap-south-1",
+];
 
 /** Hashed build files: cached for a year. */
 const ASSET_CACHE_CONTROL = "public, max-age=31536000, immutable";
@@ -162,7 +181,10 @@ export class WebStack extends cdk.Stack {
       // The build is re-uploaded on every deploy, so it never needs keeping.
       removalPolicy: cdk.RemovalPolicy.DESTROY,
       autoDeleteObjects: true,
+      lifecycleRules: [{ id: "abort-uploads", abortIncompleteMultipartUploadAfter: cdk.Duration.days(1) }],
     });
+    // Into the storage stack's log bucket (this stack depends on it: app.ts).
+    logAccessTo(bucket, cfg, "dashboard");
 
     // --- Certificate and DNS (custom domain only) ---
     let certificate: acm.ICertificate | undefined;
@@ -178,10 +200,13 @@ export class WebStack extends cdk.Stack {
       protocolPolicy: cloudfront.OriginProtocolPolicy.HTTPS_ONLY,
       originSslProtocols: [cloudfront.OriginSslPolicy.TLS_V1_2],
     });
-    const streamDomain = cdk.Fn.select(2, cdk.Fn.split("/", props.streamingFunctionUrl.url));
-    const streamOrigin = new origins.HttpOrigin(streamDomain, {
-      protocolPolicy: cloudfront.OriginProtocolPolicy.HTTPS_ONLY,
-      originSslProtocols: [cloudfront.OriginSslPolicy.TLS_V1_2],
+    // The chat streams: the function URL takes only calls signed with AWS
+    // credentials (AWS_IAM, streaming-stack.ts), and CloudFront signs each one
+    // through origin access control. The dashboard sends the stream token in
+    // its own header (CloudFront's signature is the Authorization header) and
+    // the body's SHA-256 in x-amz-content-sha256, which Lambda requires of a
+    // signed POST. Response streaming passes through as before.
+    const streamOrigin = origins.FunctionUrlOrigin.withOriginAccessControl(props.streamingFunctionUrl, {
       readTimeout: cdk.Duration.seconds(60),
     });
     const passThrough: Omit<cloudfront.BehaviorOptions, "origin"> = {
@@ -231,7 +256,7 @@ export class WebStack extends cdk.Stack {
       ...(domain && certificate ? { domainNames: [domain.hostname], certificate } : {}),
       defaultRootObject: "index.html",
       httpVersion: cloudfront.HttpVersion.HTTP2_AND_3,
-      minimumProtocolVersion: cloudfront.SecurityPolicyProtocol.TLS_V1_2_2021,
+      minimumProtocolVersion: VIEWER_TLS_POLICY,
       defaultBehavior: {
         // List too, so a file that isn't there is a 404 (not S3's 403),
         // which the error response below turns into the install's own page.
@@ -255,6 +280,18 @@ export class WebStack extends cdk.Stack {
       errorResponses: [
         { httpStatus: 404, responseHttpStatus: 404, responsePagePath: "/_errors/404.html", ttl: cdk.Duration.seconds(60) },
       ],
+    });
+
+    this.standardLogs(cfg);
+
+    // Origin access control signs the stream's calls as CloudFront; Lambda
+    // needs both of these for a function URL (FunctionUrlOrigin adds the first).
+    new lambda.CfnPermission(this, "StreamInvokeFromDistribution", {
+      action: "lambda:InvokeFunction",
+      functionName: props.streamingFunctionUrl.functionArn,
+      principal: "cloudfront.amazonaws.com",
+      sourceArn: `arn:${this.partition}:cloudfront::${this.account}:distribution/${this.distribution.distributionId}`,
+      invokedViaFunctionUrl: true,
     });
 
     let hostname = domain ? domain.hostname : this.distribution.distributionDomainName;
@@ -343,6 +380,34 @@ export class WebStack extends cdk.Stack {
   }
 
   /**
+   * Standard logs into the storage stack's log bucket (`cloudfront/`, kept
+   * 90 days), where CloudFront can deliver them: a native release's one
+   * template decides by its region (a condition), any other install at synth.
+   */
+  private standardLogs(cfg: ResolvedConfig): void {
+    const logging = {
+      Bucket: logBucketOf(this, cfg).bucketRegionalDomainName,
+      IncludeCookies: false,
+      Prefix: "cloudfront/",
+    };
+    const cfn = this.distribution.node.defaultChild as cloudfront.CfnDistribution;
+    if (cfg.native) {
+      const eq = (r: string) => cdk.Fn.conditionEquals(cdk.Aws.REGION, r);
+      const half = Math.ceil(CLOUDFRONT_LOG_REGIONS.length / 2);
+      const supported = new cdk.CfnCondition(this, "CloudFrontLogsRegion", {
+        // Fn::Or takes at most 10.
+        expression: cdk.Fn.conditionOr(
+          cdk.Fn.conditionOr(...CLOUDFRONT_LOG_REGIONS.slice(0, half).map(eq)),
+          cdk.Fn.conditionOr(...CLOUDFRONT_LOG_REGIONS.slice(half).map(eq)),
+        ),
+      });
+      cfn.addPropertyOverride("DistributionConfig.Logging", cdk.Fn.conditionIf(supported.logicalId, logging, cdk.Aws.NO_VALUE));
+    } else if (CLOUDFRONT_LOG_REGIONS.includes(cfg.region)) {
+      cfn.addPropertyOverride("DistributionConfig.Logging", logging);
+    }
+  }
+
+  /**
    * A native release's own domain: stack parameters, not a redeploy. The
    * updater requests the certificate (Settings, System, or the Hostname
    * launch parameter through the parent's Domain custom resource), then
@@ -369,7 +434,7 @@ export class WebStack extends cdk.Stack {
       "DistributionConfig.ViewerCertificate",
       cdk.Fn.conditionIf(
         has.logicalId,
-        { AcmCertificateArn: cert.valueAsString, SslSupportMethod: "sni-only", MinimumProtocolVersion: "TLSv1.2_2021" },
+        { AcmCertificateArn: cert.valueAsString, SslSupportMethod: "sni-only", MinimumProtocolVersion: VIEWER_TLS_POLICY },
         cdk.Aws.NO_VALUE,
       ),
     );

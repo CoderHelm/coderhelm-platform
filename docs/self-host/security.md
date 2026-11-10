@@ -15,8 +15,8 @@ order: 11
 
 | From | To | How |
 |---|---|---|
-| People | CloudFront (your hostname) | HTTPS only, TLS 1.2+, HSTS |
-| CloudFront | HTTP API, streaming function URL, dashboard bucket | HTTPS; the bucket is private and only CloudFront can read it |
+| People | CloudFront (your hostname) | HTTPS only, TLS 1.2+ (CloudFront's `TLSv1.2_2025` policy on your own domain), HSTS |
+| CloudFront | HTTP API, streaming function URL, dashboard bucket | HTTPS; the bucket is private and only CloudFront can read it; the streaming function URL takes only calls CloudFront signs (origin access control) |
 | GitHub, Jira | `/webhooks/*` | Signed payloads, checked before use |
 | Functions | GitHub, Anthropic, Bedrock, the services teams connect | HTTPS from Lambda (no VPC) |
 
@@ -275,6 +275,51 @@ CoderHelm **cannot** see: your code at rest, your runs, plans, reviews, memory, 
 - Someone who controls CoderHelm's hosted side could mint tokens for linked installations, read relayed events and act as the relay. Choose your own GitHub App and apps (fully private) if that is outside what you accept.
 - Messages from CoderHelm carry CoderHelm's own signature (Ed25519, key in AWS KMS), checked with public keys pinned in your signed release once a release pins them: a leaked relay key alone can't make an install accept a message. See hybrid.md, "How an install knows a message is from CoderHelm". The answers of the OAuth sign-in broker (Notion and the other OAuth integrations) are not signed yet; HTTPS and the install's client secret protect them.
 - Install requests carry no one-time number, so someone who could break HTTPS could repeat one within its 5 minutes. They would already see the same traffic, tokens included.
+
+## Security Hub
+
+AWS Security Hub checks an install against AWS's best practices. This is what each check finds on an install, and why.
+
+### What an install sets
+
+| Control | What the stacks set |
+|---|---|
+| Lambda.1, CloudFront.16 | The chat stream's function URL takes only calls signed with AWS credentials (`AWS_IAM`), and only the install's CloudFront may call it: origin access control signs every request, and the function's policy allows `cloudfront.amazonaws.com` for that one distribution. The function still checks the person's short-lived stream token on every request. Because CloudFront's signature is the `Authorization` header, the dashboard sends the token in `x-coderhelm-stream-token`, and sends the body's SHA-256 in `x-amz-content-sha256`, which Lambda requires of a signed POST. Responses still stream. |
+| S3.5 | Every bucket refuses requests without TLS, the release bucket included. |
+| S3.9 | The data, dashboard and sandbox buckets write server access logs to the install's log bucket, `coderhelm-<name>-logs-<account>`, under `s3/<bucket>/`. |
+| S3.13 | Every bucket has a lifecycle: access logs expire after 90 days, sandbox tarballs after a day, old versions of data after 30 days, and unfinished uploads after a day. |
+| CloudFront.5 | The distribution writes standard logs to the log bucket, under `cloudfront/`, in every region AWS enables by default. CloudFront delivers no standard logs to a bucket in an opt-in region (Cape Town, Hong Kong, Milan, Spain, Zurich, Tel Aviv, the UAE, Bahrain, Hyderabad, Jakarta, Melbourne, Calgary, Mexico and newer), so an install there has the S3 access logs only. |
+| CloudFront.15 | On your own domain, viewers need TLS 1.2 with modern ciphers, or TLS 1.3 (`TLSv1.2_2025`). |
+| DynamoDB.2, DynamoDB.6 | Every table has point-in-time recovery and deletion protection. On a Launch Stack install, deletion protection follows **KeepDataOnDelete**, so an uninstall that deletes the data can delete the tables. |
+| Cognito.3, Cognito.6 | Passwords need 8 characters with an upper-case and a lower-case letter, a digit and a symbol. Temporary passwords last 7 days. The user pool has deletion protection, which follows **KeepDataOnDelete** like the tables. |
+| Lambda.2 | Every function runs on a supported runtime (the MCP proxy on Node.js 22). |
+| SES.3 | The install's SES configuration set sends only over TLS: a receiving server that can't do TLS gets no mail. |
+
+The log bucket uses SSE-S3 and has ACLs enabled with the bucket owner preferred: S3 log delivery can't write to an SSE-KMS bucket, and CloudFront's standard logging writes with an ACL. The install still owns every object, and the bucket blocks all public access. It is deleted with the stack: writes are refused first, then it is emptied.
+
+### Accepted, and why
+
+Mark these as accepted in Security Hub (workflow status **Suppressed**, with the reason below).
+
+| Control | Resource | Why it stays |
+|---|---|---|
+| APIGateway.9 | The HTTP API's `$default` stage | Every request to the API comes through the install's CloudFront, whose standard logs record each one (CloudFront.5). Access logs on the stage itself need `logs:CreateLogDelivery` and `logs:PutResourcePolicy` on all resources, which the install's deploy role deliberately doesn't have, so an update could never turn them on. |
+| CloudFront.4 | The distribution | Origin failover needs a second copy of each origin in another region. The API and the functions run in one region, and failover covers only GET, HEAD and OPTIONS. |
+| CloudFront.6 | The distribution | AWS WAF is billed per web ACL, per rule and per request, and the boundary doesn't let an install create one. Every API route checks a session, a signed webhook or a stream token, and the HTTP API throttles each stage. Attach your own web ACL to the distribution if your account requires one. |
+| CloudFront.17 | The distribution | Trusted key groups are for signed URLs and cookies. CoderHelm serves nothing private through CloudFront that way: the dashboard is public static files, and everything else checks its own session or signature. |
+| CloudFront.15 | A distribution without your own domain | CloudFront's default certificate (`*.cloudfront.net`) allows only its own TLS policy. Add your own domain to get `TLSv1.2_2025`. |
+| S3.15 | Every bucket | Object Lock would stop CoderHelm deleting what it must: data a team removes, a release's old files, the sandbox's tarballs, the dashboard's old build, and everything on uninstall with **KeepDataOnDelete** `false`. |
+| S3.17 | The dashboard, release, sandbox and log buckets | They use SSE-S3 on purpose. The dashboard is public static files that CloudFront reads; the release bucket holds the signed release's public files, each checked against its sha256; the sandbox holds tarballs that live for a day; S3 log delivery can't write to an SSE-KMS bucket. The data bucket uses the install's KMS key. |
+| S3.20 | Every bucket | Only the account's root user can turn on MFA delete, from the CLI with the root user's MFA device. A template can't. |
+| S3.9 | The release bucket and the log bucket | The release bucket is made before every other part (it holds their templates), so before the log bucket exists. Only the install helper may write to it (its bucket policy), and CloudTrail records each write. A log bucket that logged to itself would log forever. |
+| Cognito.1, Cognito.4 | The user pool | Threat protection needs Cognito's Plus tier, billed for every monthly active user. The gateway rate-limits sign-in attempts itself. Turn it on in the console if your account requires it. |
+| Cognito.5 | The user pool | Two-factor is optional, with an authenticator app. An admin can require it for everyone (the **RequireTwoFactor** launch parameter, or **Settings, Sign-in**), and CoderHelm enforces that at sign-in. Requiring it in Cognito would force it on every install, including those that chose not to. |
+| KMS.2 | The roles `coderhelm-<name>-deploy-stack` and `coderhelm-<name>-install-helper` | Both allow `kms:Decrypt` only on keys tagged `coderhelm:install = coderhelm-<name>` (the install's own keys), but Security Hub reads only the resource, not the condition. The deploy role creates those keys, so their ids can't be known when its policy is written, and no update can change that role (see [Updates and the deploy role](#updates-and-the-deploy-role)). The helper is made before the part that makes the keys, for the same reason. |
+| SecretsManager.1 | `coderhelm/<name>/secrets` | It holds the GitHub App's keys, which only GitHub can issue, and the session signing key: rotating that key signs everyone out. |
+| SecretsManager.1 | `coderhelm-readonly-*` | You create these for a data source: a read-only database user of yours. Rotate them with your database's own rotation. |
+| CloudFormation.3 | `coderhelm-<name>`, `coderhelm-<name>-access`, `CoderHelmLogReader*` | Uninstalling is deleting the stack. To protect it, turn termination protection on: `aws cloudformation update-termination-protection --enable-termination-protection --stack-name coderhelm-<name>`. Updates still apply. Turn it off with `--no-enable-termination-protection` before you uninstall. |
+| CloudFormation.4 | `coderhelm-<name>-access`, `CoderHelmLogReader*` | An AWS admin creates these with their own permissions, because they write IAM roles and policies. A service role would need the same IAM permissions. The main stack `coderhelm-<name>` has its service role, the deploy role. |
+| KMS.3 | Keys of an install already uninstalled | An uninstall with **KeepDataOnDelete** `false` schedules the install's keys for deletion after 7 days, on purpose. The finding goes away when they are deleted. |
 
 ## Reporting a problem
 

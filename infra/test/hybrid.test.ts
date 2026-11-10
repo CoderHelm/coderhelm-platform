@@ -163,7 +163,8 @@ test("hosted CORS trusts exact origins only, never a coderhelm.com wildcard", ()
 
 test("relay bodies held for retries are gone after two days", () => {
   const storage = hosted()["coderhelm-prod-storage"];
-  const bucket = Object.values(storage.findResources("AWS::S3::Bucket"))[0] as any;
+  // The data bucket (the storage stack also has the access log bucket).
+  const bucket = Object.values(storage.findResources("AWS::S3::Bucket")).find((b: any) => JSON.stringify(b.Properties.BucketName).includes("-data")) as any;
   const rule = bucket.Properties.LifecycleConfiguration.Rules.find((r: any) => r.Prefix === "relay/");
   assert.equal(rule.ExpirationInDays, 2);
 });

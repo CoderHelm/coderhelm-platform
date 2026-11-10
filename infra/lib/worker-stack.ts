@@ -19,6 +19,7 @@ import { repoPath } from "./paths";
 import { grantOwnAccountRead } from "./own-account-read";
 import * as path from "path";
 import { relaySendStatement } from "./mail-relay";
+import { logAccessTo } from "./storage-stack";
 import { serviceEnvironment, modelPolicyStatements, publicUrlReadStatement, weeklySummaryScheduled } from "./service-env";
 
 interface WorkerStackProps extends cdk.StackProps {
@@ -372,8 +373,10 @@ export class WorkerStack extends cdk.Stack {
         // Source tarballs are transient: the worker uploads one per commit per
         // run and reuses it for every check of that commit; this expiry is
         // what removes them.
-        lifecycleRules: [{ expiration: cdk.Duration.days(1) }],
+        lifecycleRules: [{ expiration: cdk.Duration.days(1), abortIncompleteMultipartUploadAfter: cdk.Duration.days(1) }],
       });
+      // Into the storage stack's log bucket (this stack depends on it: app.ts).
+      logAccessTo(sandboxBucket, cfg, "sandbox");
 
       const sandboxProject = new codebuild.Project(this, "SandboxProject", {
         projectName: `${prefix}-sandbox`,

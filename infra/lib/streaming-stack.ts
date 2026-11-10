@@ -185,8 +185,14 @@ export class StreamingStack extends cdk.Stack {
 
     // --- Function URL with Response Streaming ---
 
+    // Single-origin: the install's CloudFront is the only way in. The URL
+    // takes only calls signed with AWS credentials, and CloudFront signs each
+    // one (origin access control, web-stack.ts); the function still checks the
+    // member's stream token on every request. The split layout (CoderHelm's
+    // own deployment) answers browsers on the URL itself, so its URL stays
+    // open and the token is the only check.
     const functionUrl = this.streamingFunction.addFunctionUrl({
-      authType: lambda.FunctionUrlAuthType.NONE,
+      authType: cfg.layout === "single-origin" ? lambda.FunctionUrlAuthType.AWS_IAM : lambda.FunctionUrlAuthType.NONE,
       invokeMode: lambda.InvokeMode.RESPONSE_STREAM,
       // Cross-origin only in the split layout (single-origin forwards the
       // stream from the dashboard's own hostname).
