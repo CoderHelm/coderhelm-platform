@@ -52,13 +52,13 @@ fn the_own_review_requests_changes_and_lists_every_non_optional_finding() {
     review_severity::ground(&mut findings, "");
     review_severity::finalize(&mut findings);
     // The two correctness and data-loss problems block; the skipped-records
-    // finding (a written team rule, category convention, no defect class) is
-    // a Suggestion. The verdict still can't be APPROVE.
+    // finding (a written team rule not marked required, category convention,
+    // no defect class) is a Should fix note. The verdict still can't be APPROVE.
     assert!(findings[0].holds_merge() && findings[1].holds_merge());
     assert!(!findings[2].holds_merge());
     assert_eq!(
         review_severity::label(&findings[2]),
-        Some(review_severity::Label::Suggestion)
+        Some(review_severity::Label::ShouldFix)
     );
     let verdict = review_agent::decide_verdict(&findings, 0, &[], false);
     assert_eq!(verdict, "REQUEST_CHANGES");

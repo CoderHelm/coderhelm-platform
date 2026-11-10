@@ -1,0 +1,110 @@
+{
+  "description": "A change to the hash that signs uploads (a header the CDN validates). The reviewer traced it but nothing proves the encoding matches what the CDN computes, and it called the point optional. A critical path with no test or proof blocks; the same finding with a test as proof is a note.",
+  "steps": [
+    {
+      "push": {
+        "head": "b1b2b3b",
+        "changed": {
+          "apps/cms/plugins/uploads/upload-handler.ts": [
+            1,
+            2,
+            3,
+            4,
+            5
+          ]
+        }
+      }
+    },
+    {
+      "review": {
+        "trigger": "synchronize",
+        "dedup_key": "head#b1b2b3b",
+        "model": {
+          "verdict": "APPROVE",
+          "summary": "x",
+          "findings": [
+            {
+              "file": "apps/cms/plugins/uploads/upload-handler.ts",
+              "line": 2,
+              "severity": "low",
+              "category": "correctness",
+              "evidence": "unverified-concern",
+              "optional": true,
+              "critical_path": "the x-amz-content-sha256 header the CDN validates",
+              "proof": "",
+              "title": "Nothing shows the hash matches the bytes fetch sends",
+              "body": "sha256Hex hashes the JSON string with TextEncoder; fetch sends the same string as UTF-8. Nothing in the PR checks a non-ASCII body. Just a heads-up."
+            }
+          ]
+        }
+      }
+    },
+    {
+      "push": {
+        "head": "b4b5b6b",
+        "changed": {
+          "apps/cms/plugins/uploads/upload-handler.test.ts": [
+            1,
+            2,
+            3
+          ]
+        }
+      }
+    },
+    {
+      "review": {
+        "trigger": "synchronize",
+        "dedup_key": "head#b4b5b6b",
+        "model": {
+          "verdict": "APPROVE",
+          "summary": "x",
+          "prior": [
+            {
+              "index": 0,
+              "status": "fixed"
+            }
+          ],
+          "findings": [
+            {
+              "file": "apps/cms/plugins/uploads/upload-handler.test.ts",
+              "line": 2,
+              "severity": "low",
+              "category": "correctness",
+              "evidence": "verified-defect",
+              "optional": true,
+              "critical_path": "the x-amz-content-sha256 header the CDN validates",
+              "proof": "apps/cms/plugins/uploads/upload-handler.test.ts compares it with createHash on a non-ASCII body",
+              "title": "Consider one more empty-body case",
+              "body": "The test covers ASCII and non-ASCII bodies; an empty body would complete it."
+            }
+          ]
+        }
+      }
+    }
+  ],
+  "expect": {
+    "formal": [
+      [
+        "b1b2b3b",
+        "REQUEST_CHANGES"
+      ],
+      [
+        "b4b5b6b",
+        "APPROVE"
+      ]
+    ],
+    "body_contains": [
+      [
+        0,
+        "(Blocking (critical path, no proof))"
+      ]
+    ],
+    "body_lacks": [
+      [
+        0,
+        "Just a heads-up"
+      ]
+    ],
+    "last_notes": 1
+  }
+}

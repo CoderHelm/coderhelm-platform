@@ -284,6 +284,11 @@ pub fn apply_blocking_policy(findings: &mut [Finding], base_failing: &[String]) 
             continue;
         }
         if let Some(why) = note_reason(f, base_failing) {
+            // A check the base branch fails too isn't the PR's: it no longer
+            // blocks as a failing check either.
+            if f.tracked != Some(true) && f.required.is_none() {
+                f.caused_by_diff = Some(false);
+            }
             demote(f, why);
             n += 1;
         }
@@ -428,6 +433,9 @@ pub fn hold_late_blockers(findings: &mut Vec<Finding>, ctx: &UpFront<'_>) -> Lat
     let (mut held, keep): (Vec<Finding>, Vec<Finding>) =
         std::mem::take(findings).into_iter().partition(|f| {
             f.holds_merge()
+                // A required rule, a failing check and an unproven critical
+                // path hold until the change meets them, raised late or not.
+                && super::review_rules::mandatory(f).is_none()
                 && !on_changed_lines(f, changed)
                 && !earlier(f)
                 && !(ctx.person_spoke && f.prompted_by_reply == Some(true))
@@ -486,6 +494,11 @@ pub fn prompt_section(same_head_before: Option<&ReviewRecord>, round: &Round) ->
 
 // ── Rule 2: verdict stability ──
 
+/// Why an approval of the same commit gives way: something now blocks by
+/// rule (`review_rules::mandatory`), which no earlier verdict outweighs.
+pub const BY_RULE_FLIP: &str =
+    "What changed: this review holds the change to a rule that blocks whatever an earlier review said";
+
 /// A person's comment that only asks for another look carries no new facts.
 pub fn is_bare_command(text: &str) -> bool {
     const FILLER: &[&str] = &[
@@ -540,7 +553,10 @@ pub fn named_holding(
 ) -> Vec<Holding> {
     let mut out: Vec<Holding> = Vec::new();
     for f in findings.iter().filter(|f| f.holds_merge()) {
-        let kind = if f.evidence() == Evidence::Question {
+        let by_rule = super::review_rules::mandatory(f);
+        let kind = if by_rule.is_some() {
+            HoldKind::Required
+        } else if f.evidence() == Evidence::Question {
             HoldKind::Question
         } else {
             HoldKind::Defect
@@ -552,11 +568,22 @@ pub fn named_holding(
         } else {
             format!("`{}` {}", f.file, f.title)
         };
+        let name = match (by_rule, f.required.as_deref()) {
+            (Some(_), Some(rule)) => format!("{name} (required: {rule})"),
+            (Some(why), None) => format!("{name} ({why})"),
+            _ => name,
+        };
         out.push(Holding::new(kind, name));
     }
     for (path, line, body) in open_threads {
+        // A thread for a required rule holds by rule until a fix settles it.
+        let kind = if body.contains(super::review_rules::REQUIRED_MARK) {
+            HoldKind::Required
+        } else {
+            HoldKind::EarlierThread
+        };
         out.push(Holding::new(
-            HoldKind::EarlierThread,
+            kind,
             super::own_review::thread_line(path, *line, body),
         ));
     }
@@ -668,6 +695,20 @@ pub fn stabilize(
     };
     if !changed.is_empty() {
         return flip(format!("What changed: {}.", in_words(changed)));
+    }
+    // A rule the repository requires can't stand approved: the verdict
+    // follows it even on the same commit, and says so.
+    if before == "APPROVE" {
+        if let Some(f) = findings
+            .iter()
+            .find(|f| f.holds_merge() && super::review_rules::mandatory(f).is_some())
+        {
+            return flip(format!(
+                "{BY_RULE_FLIP} ({}: {}).",
+                super::review_rules::mandatory(f).unwrap_or_default(),
+                f.title.trim()
+            ));
+        }
     }
     if before == "APPROVE" {
         for f in findings.iter_mut().filter(|f| f.holds_merge()) {

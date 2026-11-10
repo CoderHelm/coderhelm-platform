@@ -3011,6 +3011,13 @@
               "REQUEST_CHANGES"
             ],
             "type": "string"
+          },
+          "verdict_reason": {
+            "description": "One line on why the review approved or requested changes, naming the\nfindings that decided it. Empty on older reviews.",
+            "examples": [
+              "Why changes requested: `src/auth/login.ts:42` The attempt counter is never reset (required: tests with behavior changes)."
+            ],
+            "type": "string"
           }
         },
         "required": [
@@ -3029,7 +3036,8 @@
           "rating_comments",
           "created_at",
           "pr_title",
-          "applied_standards"
+          "applied_standards",
+          "verdict_reason"
         ],
         "type": "object"
       },

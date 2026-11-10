@@ -1,0 +1,153 @@
+{
+  "description": "A repository with Require tests on. The PR adds sha256Hex, which builds the x-amz-content-sha256 header CloudFront validates on signed uploads, in a package with no test runner. The reviewer checked it by hand and posted the missing test as 'a suggestion only', and the review approved. A required rule broken blocks whatever the model called it; no runner is not an exemption, so the finding asks for the runner and the test. A re-review of the same commit keeps the block, an answer explaining the missing runner doesn't settle it, and only the push that adds the runner and the test approves.",
+  "steps": [
+    {
+      "require_tests": true
+    },
+    {
+      "push": {
+        "head": "c1a2b3c",
+        "changed": {
+          "apps/cms/plugins/uploads/upload-handler.ts": [
+            1,
+            2,
+            3,
+            4,
+            5,
+            6,
+            7,
+            8,
+            9,
+            10
+          ]
+        }
+      }
+    },
+    {
+      "review": {
+        "trigger": "labeled",
+        "dedup_key": "head#c1a2b3c",
+        "model": {
+          "verdict": "APPROVE",
+          "summary": "Adds the content hash header.",
+          "findings": [
+            {
+              "file": "apps/cms/plugins/uploads/upload-handler.ts",
+              "line": 2,
+              "severity": "medium",
+              "category": "tests",
+              "evidence": "verified-defect",
+              "optional": true,
+              "title": "sha256Hex check isn't kept as a test",
+              "body": "Verification step 2 compared sha256Hex with Node's createHash by hand. apps/cms has no test runner (no vitest in its package.json), so nothing keeps that check. When the package gets tests, a small case hashing a sample body that includes non-ASCII characters, compared with createHash('sha256').update(body, 'utf8').digest('hex'), would lock in the exact header CloudFront needs. This is a suggestion only."
+            }
+          ]
+        }
+      }
+    },
+    {
+      "claims_expire": {}
+    },
+    {
+      "comment": {
+        "by": "dev-a",
+        "text": "@coderhelm this package has no test runner, so I checked the hash by hand. Please re-review."
+      }
+    },
+    {
+      "review": {
+        "trigger": "reply",
+        "dedup_key": "reply#701",
+        "model": {
+          "verdict": "APPROVE",
+          "summary": "x",
+          "prior": [
+            {
+              "index": 0,
+              "status": "answered"
+            }
+          ],
+          "findings": []
+        }
+      }
+    },
+    {
+      "push": {
+        "head": "d4e5f6a",
+        "changed": {
+          "apps/cms/package.json": [
+            12,
+            20
+          ],
+          "apps/cms/vitest.config.ts": [
+            1,
+            2,
+            3
+          ],
+          "apps/cms/plugins/uploads/upload-handler.test.ts": [
+            1,
+            2,
+            3,
+            4,
+            5,
+            6
+          ]
+        }
+      }
+    },
+    {
+      "review": {
+        "trigger": "synchronize",
+        "dedup_key": "head#d4e5f6a",
+        "model": {
+          "verdict": "APPROVE",
+          "summary": "Adds vitest and the hash test.",
+          "prior": [
+            {
+              "index": 0,
+              "status": "fixed"
+            }
+          ],
+          "findings": []
+        }
+      }
+    }
+  ],
+  "expect": {
+    "formal": [
+      [
+        "c1a2b3c",
+        "REQUEST_CHANGES"
+      ],
+      [
+        "c1a2b3c",
+        "REQUEST_CHANGES"
+      ],
+      [
+        "d4e5f6a",
+        "APPROVE"
+      ]
+    ],
+    "body_contains": [
+      [
+        0,
+        "sha256Hex check isn't kept as a test (Blocking (required: tests))"
+      ],
+      [
+        0,
+        "No test runner in this package is not a reason to skip the test"
+      ],
+      [
+        0,
+        "This repository requires tests with behavior changes"
+      ]
+    ],
+    "body_lacks": [
+      [
+        0,
+        "suggestion only"
+      ]
+    ],
+    "last_notes": 0
+  }
+}

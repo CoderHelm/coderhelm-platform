@@ -1151,6 +1151,7 @@ mod review_policy_eval;
 pub mod review_pr;
 pub mod review_reminder;
 pub mod review_risk;
+pub mod review_rules;
 pub mod review_scope;
 pub(crate) mod review_session;
 pub mod review_severity;

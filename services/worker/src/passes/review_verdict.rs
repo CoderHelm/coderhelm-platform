@@ -11,9 +11,13 @@
 //!   people's words (`review_fingerprint`). Otherwise the verdict stands and the
 //!   reply says so.
 //! - Changes are requested only with at least one named thing holding the
-//!   merge ([`Verdict`]) that the stop judge held on (`passes::stop_judge`):
-//!   nothing holding means approve, whatever the earlier verdict was, and
-//!   [`post`] refuses anything else.
+//!   merge ([`Verdict`]) that the stop judge held on (`passes::stop_judge`),
+//!   or that blocks by rule (a rule the repository requires, a failing
+//!   check, a critical path with no proof: `passes::review_rules`), which no
+//!   judge can lift: nothing holding means approve, whatever the earlier
+//!   verdict was, and [`post`] refuses anything else.
+//! - Every verdict says why in one line ([`Verdict::why`]), naming what
+//!   decided it; the line is kept on the review record.
 //! - A finished review's formal verdict is APPROVE or REQUEST_CHANGES, never
 //!   a bare COMMENT ([`binary`]). Only GitHub's rule against verdicts on the
 //!   bot's own PR makes it a COMMENT there; answers to a person's question
@@ -51,6 +55,9 @@ impl StandingReview {
 /// What kind of thing holds the merge.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HoldKind {
+    /// Blocks by rule (`review_rules::mandatory`): a required rule broken, a
+    /// failing check, a critical path with no proof. No judge lifts it.
+    Required,
     Defect,
     /// On CoderHelm's own PR: a finding it fixes itself before ready.
     OwnFinding,
@@ -118,6 +125,59 @@ impl Verdict {
     pub fn names(&self) -> Vec<String> {
         self.holding.iter().map(|h| h.name.clone()).collect()
     }
+
+    /// Something holds the merge by rule, which no judge can lift.
+    pub fn holds_by_rule(&self) -> bool {
+        self.holding
+            .iter()
+            .any(|h| matches!(h.kind, HoldKind::Required | HoldKind::Verification))
+    }
+
+    /// One line saying why: the deciding items when changes are requested
+    /// (by rule first), or what was left as notes when approved.
+    /// `should_fix` and `suggestions` count the notes by tier.
+    pub fn why(&self, should_fix: usize, suggestions: usize) -> String {
+        let n = |k: usize, one: &str, many: &str| {
+            if k == 1 {
+                format!("1 {one}")
+            } else {
+                format!("{k} {many}")
+            }
+        };
+        if self.holding.is_empty() {
+            let notes = match (should_fix, suggestions) {
+                (0, 0) => "no findings".to_string(),
+                (0, s) => n(s, "suggestion", "suggestions"),
+                (f, 0) => n(f, "should-fix note", "should-fix notes"),
+                (f, s) => format!(
+                    "{} and {}",
+                    n(f, "should-fix note", "should-fix notes"),
+                    n(s, "suggestion", "suggestions")
+                ),
+            };
+            return format!(
+                "Why approved: nothing blocks (no required rule broken, no failing check, no \
+                 shown defect, no unproven critical path); {notes}."
+            );
+        }
+        let mut deciding: Vec<&Holding> = self.holding.iter().collect();
+        deciding.sort_by_key(|h| !matches!(h.kind, HoldKind::Required | HoldKind::Verification));
+        let names: Vec<String> = deciding
+            .iter()
+            .take(3)
+            .map(|h| h.name.replace('\n', " "))
+            .collect();
+        let more = self.holding.len().saturating_sub(3);
+        format!(
+            "Why changes requested: {}{}.",
+            names.join("; "),
+            if more > 0 {
+                format!("; and {more} more")
+            } else {
+                String::new()
+            }
+        )
+    }
 }
 
 /// The chokepoint's rule: request changes only with something named, and
@@ -125,8 +185,10 @@ impl Verdict {
 pub fn may_post(event: &str, verdict: &Verdict, judged: Option<&Judged>) -> bool {
     event != "REQUEST_CHANGES"
         || (verdict.event() == "REQUEST_CHANGES"
-            && judged
-                .is_some_and(|j| j.kind() == common::stop_judge::Kind::Block && j.hold().is_some()))
+            && (verdict.holds_by_rule()
+                || judged.is_some_and(|j| {
+                    j.kind() == common::stop_judge::Kind::Block && j.hold().is_some()
+                })))
 }
 
 /// What happened that may change the formal review.
@@ -684,6 +746,40 @@ mod tests {
         }
         assert_eq!(binary("COMMENT"), "REQUEST_CHANGES");
         assert_eq!(binary("APPROVE"), "APPROVE");
+    }
+
+    /// A hold by rule may be posted without the stop judge; a judgment hold
+    /// may not.
+    #[test]
+    fn a_hold_by_rule_needs_no_judge_and_every_verdict_says_why() {
+        let by_rule = Verdict::from_holding(vec![Holding::new(
+            HoldKind::Required,
+            "`a.ts:2` sha256Hex has no test (required: tests with behavior changes)",
+        )]);
+        assert!(may_post("REQUEST_CHANGES", &by_rule, None));
+        let judged = Verdict::from_holding(vec![Holding::new(HoldKind::Defect, "`a.ts:2` bug")]);
+        assert!(!may_post("REQUEST_CHANGES", &judged, None));
+        assert!(may_post("APPROVE", &Verdict::approve(), None));
+        assert_eq!(
+            by_rule.why(0, 0),
+            "Why changes requested: `a.ts:2` sha256Hex has no test (required: tests with behavior changes)."
+        );
+        let mixed = Verdict::from_holding(vec![
+            Holding::new(HoldKind::Defect, "d1"),
+            Holding::new(HoldKind::Defect, "d2"),
+            Holding::new(HoldKind::Defect, "d3"),
+            Holding::new(HoldKind::Required, "r1"),
+        ]);
+        assert_eq!(
+            mixed.why(0, 0),
+            "Why changes requested: r1; d1; d2; and 1 more."
+        );
+        assert!(Verdict::approve()
+            .why(1, 2)
+            .starts_with("Why approved: nothing blocks"));
+        assert!(Verdict::approve()
+            .why(1, 2)
+            .ends_with("1 should-fix note and 2 suggestions."));
     }
 
     #[test]

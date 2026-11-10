@@ -1,0 +1,58 @@
+{
+  "description": "Require tests on, and the PR only edits documentation. The reviewer files a tests finding with the docs exemption; the changed files bear it out, so the finding is a note and the review approves.",
+  "steps": [
+    {
+      "require_tests": true
+    },
+    {
+      "push": {
+        "head": "e1e2e3e",
+        "changed": {
+          "docs/uploads.md": [
+            3,
+            4
+          ],
+          "README.md": [
+            10
+          ]
+        }
+      }
+    },
+    {
+      "review": {
+        "trigger": "synchronize",
+        "dedup_key": "head#e1e2e3e",
+        "model": {
+          "verdict": "APPROVE",
+          "summary": "x",
+          "findings": [
+            {
+              "file": "docs/uploads.md",
+              "line": 3,
+              "severity": "low",
+              "category": "tests",
+              "exemption": "docs",
+              "title": "No test for the new upload steps",
+              "body": "The doc change describes the steps; there is no code to test."
+            }
+          ]
+        }
+      }
+    }
+  ],
+  "expect": {
+    "formal": [
+      [
+        "e1e2e3e",
+        "APPROVE"
+      ]
+    ],
+    "body_contains": [
+      [
+        0,
+        "Not required here: only documentation changed"
+      ]
+    ],
+    "last_notes": 1
+  }
+}

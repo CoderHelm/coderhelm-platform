@@ -174,17 +174,29 @@ completes while its PR reviewer's verdict blocks.
 ## Verdict policy cases (`policy/`)
 
 `passes/review_policy_eval.rs` replays the review sequences behind the
-verdict rules in `passes/review_policy.rs` and the severity rubric in
+verdict rules in `passes/review_policy.rs`, the required rules in
+`passes/review_rules.rs` and the severity rubric in
 `passes/review_severity.rs` (one review per head commit, no flip on an
-unchanged commit without new information, changes requested only for a
-named correctness, security or data-loss problem with its location and
-evidence, every other finding a labeled note (Nit, Suggestion, FYI) on the
-approval, blockers raised up front). A request for changes is also put to the
-stop judge before it is posted (`passes/stop_judge.rs`). Each case is a list of steps (`push`,
-`comment`, `base_failing`, `team_rules`, `claims_expire`, `review`, and
-`together` for jobs that start before any of them finishes) with the model
-output each review got (and the severity second pass's answer, `judge`, when
-it should answer), and `expect` lists the formal reviews posted. Graded
+unchanged commit without new information, changes requested for a named
+correctness, security or data-loss problem with its location and evidence
+and for what blocks by rule: a rule the repository requires broken, such as
+a missing test with "Require tests" on (a missing test runner is not an
+exemption), a check failing on the commit, a critical path with no test or
+proof; every other finding a labeled note (Should fix, Suggestion, Nit, FYI)
+on the approval, blockers raised up front). A request for changes on a
+judgment is also put to the stop judge before it is posted
+(`passes/stop_judge.rs`); what blocks by rule is not. Each case is a list of
+steps (`push`, `comment`, `base_failing`, `team_rules`, `require_tests`,
+`claims_expire`, `review`, and `together` for jobs that start before any of
+them finishes) with the model output each review got (and the severity
+second pass's answer, `judge`, when it should answer), and `expect` lists the
+formal reviews posted and what their bodies say (`body_contains`) and don't
+(`body_lacks`).
+
+`replay_audit_sample` (ignored) replays recorded reviews through the same
+rules offline for an audit: `REVIEW_AUDIT_SAMPLE` names a JSON list of
+`{"id", "require_tests", "team_rules", "changed_files", "findings"}` and
+`REVIEW_AUDIT_OUT` where the verdicts go. Graded
 findings from the production audit live in the file's `misgraded_findings`
 module.
 Every case also checks that jobs running together post one verdict per head,

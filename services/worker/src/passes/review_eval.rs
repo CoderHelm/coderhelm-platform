@@ -400,9 +400,17 @@ impl Sim {
         let out: ReviewOutput =
             serde_json::from_value(step.model_output.clone()).expect("model_output is a review");
         let mut findings: Vec<Finding> = out.findings.clone();
-        if self.require_tests {
-            review_agent::enforce_required_tests(&mut findings);
-        }
+        let changed_files: Vec<String> = {
+            let mut v: Vec<String> = findings.iter().map(|f| f.file.clone()).collect();
+            v.sort();
+            v.dedup();
+            v
+        };
+        super::review_rules::apply(
+            &mut findings,
+            &super::review_rules::Policy::new(self.require_tests, ""),
+            &changed_files,
+        );
         super::review_severity::ground(&mut findings, "");
         review_agent::enforce_source_data_override(&mut findings);
         review_agent::enforce_manual_checks_are_notes(&mut findings);
