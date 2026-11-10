@@ -396,6 +396,8 @@ pub enum Settler {
 /// settle it, in characters.
 const MAX_WHAT: usize = 220;
 const MAX_SETTLE: usize = 160;
+/// A check that holds the draft: all of what failed, up to this.
+const MAX_BLOCKED: usize = 1500;
 
 impl Finding {
     /// What settles this finding, by its point.
@@ -445,7 +447,15 @@ impl Finding {
     /// One bullet: what's unverified, then how to settle it, each cut to one
     /// sentence and a length cap at a word boundary.
     fn line(&self) -> String {
-        let what = sentence(&self.detail, MAX_WHAT);
+        // A check that holds the draft says all of what failed: its first
+        // sentence alone ("the change makes the staging content ... out of
+        // date.") leaves a person nothing to fix and the hold nothing to be
+        // settled by.
+        let what = if self.point.trim() == "check_blocked" {
+            capped(&self.detail, MAX_BLOCKED)
+        } else {
+            sentence(&self.detail, MAX_WHAT)
+        };
         let settle = match (self.settler(), sentence(&self.settle, MAX_SETTLE)) {
             (Settler::Ci, _) if !self.ci_cmd.is_empty() => {
                 format!(
@@ -459,6 +469,21 @@ impl Finding {
         };
         format!("- **{}:** {what}{settle}", self.label())
     }
+}
+
+/// `text` with whitespace collapsed, cut to `max` characters at a word
+/// boundary (with an ellipsis) when longer: every sentence kept.
+fn capped(text: &str, max: usize) -> String {
+    let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if flat.chars().count() <= max {
+        return flat;
+    }
+    let cut: String = flat.chars().take(max).collect();
+    let at_word = match cut.rfind(' ') {
+        Some(i) if i > 0 => &cut[..i],
+        _ => cut.as_str(),
+    };
+    format!("{}…", at_word.trim_end_matches([',', ';', ':']))
 }
 
 /// The first sentence of `text`, whitespace collapsed, cut to `max`
@@ -1312,8 +1337,11 @@ fn blocked_lines(body: &str) -> impl Iterator<Item = &str> {
 /// failing to run the check (written before [`check_item`] existed), and the
 /// repository's CI is green on the head, so the check it couldn't run has
 /// run and passed. A hold needs a reason that is still true.
+/// A staging content line that lists only fields the schema dropped is
+/// settled whatever CI says: a leftover field is inert (see
+/// `feature::content::still_needed`).
 fn blocked_line_settled(line: &str, ci_green: bool) -> bool {
-    ci_green && is_tooling(line)
+    (ci_green && is_tooling(line)) || super::feature::content::only_dropped_fields(line)
 }
 
 /// Whether the description lists a check the change didn't pass, CI aside.

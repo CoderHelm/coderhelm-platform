@@ -285,6 +285,32 @@ pub fn needs(changes: &[SchemaChange], specs: &[(String, String)]) -> Vec<Need> 
     out
 }
 
+/// The needs that are really staging work, given what the change's own
+/// migrations do (`removes`, `sets`: the fields they remove and set) and
+/// whether CoderHelm has a staging connection.
+///
+/// - A field a migration in the change removes or sets is that migration's
+///   job when the change is released: never a person's edit on staging.
+/// - A field the schema drops but documents still hold is inert: the CMS
+///   ignores it and nothing reads it (the code stopped). With a connection
+///   CoderHelm still removes it; without one it is never a reason to hold
+///   the pull request.
+pub fn still_needed(
+    needs: Vec<Need>,
+    removes: &std::collections::BTreeSet<String>,
+    sets: &std::collections::BTreeSet<String>,
+    connected: bool,
+) -> Vec<Need> {
+    needs
+        .into_iter()
+        .filter(|n| match n {
+            Need::Unset { field, .. } => connected && !removes.contains(field),
+            Need::Require { field, .. } => !sets.contains(field),
+            Need::BlockOnPage { .. } => true,
+        })
+        .collect()
+}
+
 /// What a new block's schema declares: its fields, the required ones, and
 /// where documents hold it (`(document type, array field)`).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -586,6 +612,19 @@ impl Blocked {
             self.what, self.why_person, self.grant
         )
     }
+}
+
+/// Whether an Open items line written by the staging content check lists only
+/// fields the schema dropped ("remove `f` from every `T` document that still
+/// has it"). Those are inert ([`still_needed`]), so such a line, written
+/// before that rule, never holds a pull request.
+pub fn only_dropped_fields(line: &str) -> bool {
+    const ITEM: &str = " (why CoderHelm didn't: ";
+    const DROPPED: &str = "document that still has it (why CoderHelm didn't: ";
+    let items = line.matches(ITEM).count();
+    line.contains("staging content its end-to-end tests read out of date")
+        && items > 0
+        && line.matches(DROPPED).count() == items
 }
 
 /// Why CoderHelm can't change staging content without a connection, and

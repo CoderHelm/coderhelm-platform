@@ -629,9 +629,23 @@ pub async fn at_start(
     branch: &str,
     provider: &crate::agent::provider::ModelProvider,
     usage: &mut crate::models::TokenUsage,
+    stacked: bool,
 ) -> Option<Dependency> {
     let (owner, repo) = (msg.repo_owner.clone(), msg.repo_name.clone());
+    // A branch an earlier step already stacked on the pull request's branch,
+    // which holds that branch's head as it is now, has nothing to rebuild:
+    // a rebuild would make the same tree again under new commits, force
+    // push it, and make every later check measure a branch that only moved.
+    if stacked && already_on(github, &owner, &repo, &msg.base_branch, branch).await {
+        return None;
+    }
     let c = copied(github, &owner, &repo, &msg.base_branch, branch).await?;
+    tracing::info!(
+        branch,
+        dep = c.dep.number,
+        copies = ?c.commits,
+        "Copies of an open pull request's commits found on the branch"
+    );
     let mut merger = restack::ModelMerger {
         state,
         provider,
@@ -667,6 +681,25 @@ pub async fn at_start(
             None
         }
     }
+}
+
+/// Whether `branch` already holds `base`'s head (it is not behind it).
+async fn already_on(
+    github: &GitHubClient,
+    owner: &str,
+    repo: &str,
+    base: &str,
+    branch: &str,
+) -> bool {
+    match github.get_diff(owner, repo, base, branch).await {
+        Ok(c) => holds_head(&c),
+        Err(_) => false,
+    }
+}
+
+/// A compare of `<base>...<branch>` says the branch holds the base's head.
+pub fn holds_head(compare: &serde_json::Value) -> bool {
+    compare["behind_by"].as_u64() == Some(0)
 }
 
 /// Right before the pull request opens: a branch that copied another open
