@@ -64,6 +64,17 @@ fn hosted_refusal(e: &client::CallError) -> Reason {
     }
 }
 
+/// Why the code exchange at CoderHelm failed: GitHub's own refusal (a
+/// wrong or used code, a verifier GitHub doesn't accept) is the provider's;
+/// anything else (CoderHelm unreachable, storage, another install's flow) is
+/// a problem on CoderHelm's side or with setup, never "GitHub didn't confirm".
+fn exchange_refusal(e: &client::CallError) -> Reason {
+    match e.code.as_str() {
+        "github_refused" | "invalid_grant" | "bad_verification_code" => Reason::Provider,
+        _ => hosted_refusal(e),
+    }
+}
+
 /// GET /auth/github on a hybrid install: a new state and PKCE pair, a signed
 /// start at CoderHelm, a check of the GitHub address it answers, then GitHub.
 pub async fn start(state: &AppState) -> Response {
@@ -231,7 +242,7 @@ async fn callback_inner(
     });
     let v = client::call(&state.http, &creds, "POST", gs::EXCHANGE_PATH, Some(&body))
         .await
-        .map_err(|e| SignInFailure::new(P, Reason::Provider, "exchange", e))?;
+        .map_err(|e| SignInFailure::new(P, exchange_refusal(&e), "exchange", e))?;
     let token = token_from(&v).ok_or_else(|| {
         SignInFailure::new(
             P,
@@ -391,5 +402,19 @@ mod tests {
         assert_eq!(hosted_refusal(&e("sign_in_unavailable")), Reason::NotSetUp);
         assert_eq!(hosted_refusal(&e("redirect_not_allowed")), Reason::NotSetUp);
         assert_eq!(hosted_refusal(&e("broker_unreachable")), Reason::Server);
+    }
+
+    #[test]
+    fn only_githubs_own_refusal_reads_as_github_at_the_exchange() {
+        let e = |c: &str| client::CallError {
+            status: Some(400),
+            code: c.into(),
+            message: String::new(),
+        };
+        assert_eq!(exchange_refusal(&e("github_refused")), Reason::Provider);
+        assert_eq!(exchange_refusal(&e("invalid_grant")), Reason::Provider);
+        assert_eq!(exchange_refusal(&e("store_unavailable")), Reason::Server);
+        assert_eq!(exchange_refusal(&e("wrong_install")), Reason::Server);
+        assert_eq!(exchange_refusal(&e("not_verified")), Reason::NotSetUp);
     }
 }

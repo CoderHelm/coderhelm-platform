@@ -59,6 +59,76 @@ pub fn new_state() -> String {
     random_token()
 }
 
+/// Which sign-in a `state` belongs to, so the one callback page sends each
+/// answer back to the page that started it.
+///
+/// Every flow shares the dashboard's callback address (one registered
+/// redirect per provider app), so the kind travels in the `state` itself:
+/// `<tag>.<random>`. The tag is only a hint for the words the page shows
+/// when the answer can't be matched; what the answer may do comes from the
+/// stored sign-in, found by the hash of the whole `state` (see
+/// [`state_key`]), which records the same kind, the team, the person, the
+/// return path and the expiry. Changing the tag changes the hash, so a
+/// tampered `state` matches nothing. A `state` from before tags (no dot)
+/// still finishes: its record has no kind and the kind is worked out from
+/// the server it signs in to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Flow {
+    /// An MCP server on Settings, Integrations (or a sign-in card in a chat or a run).
+    Mcp,
+    /// A catalog server signed in with an OAuth app (the team's own or CoderHelm's).
+    App,
+    /// A knowledge source (Notion, Confluence, Google Drive, Sanity).
+    Knowledge,
+    /// The hosted side signing a hybrid install in with CoderHelm's app.
+    Broker,
+}
+
+impl Flow {
+    pub const ALL: [Flow; 4] = [Flow::Mcp, Flow::App, Flow::Knowledge, Flow::Broker];
+
+    pub fn tag(self) -> &'static str {
+        match self {
+            Flow::Mcp => "mcp",
+            Flow::App => "app",
+            Flow::Knowledge => "ks",
+            Flow::Broker => "hyb",
+        }
+    }
+
+    pub fn parse(tag: &str) -> Option<Flow> {
+        Flow::ALL.into_iter().find(|f| f.tag() == tag)
+    }
+
+    /// The kind a `state` says it is, when it says one.
+    pub fn of_state(state: &str) -> Option<Flow> {
+        state.split_once('.').and_then(|(t, _)| Flow::parse(t))
+    }
+}
+
+/// A fresh, unguessable `state` for one kind of sign-in: `<tag>.<random>`.
+pub fn new_state_for(flow: Flow) -> String {
+    format!("{}.{}", flow.tag(), random_token())
+}
+
+/// A page inside the dashboard a sign-in may return to: a path on this
+/// origin (never `//host` or a scheme), at most 300 characters, no control
+/// characters. Anything else is dropped, so the callback page can't be made
+/// to send anyone off the dashboard.
+pub fn clean_return_path(raw: &str) -> String {
+    let p = raw.trim();
+    let ok = p.starts_with('/')
+        && !p.starts_with("//")
+        && !p.starts_with("/\\")
+        && p.len() <= 300
+        && !p.chars().any(|c| c.is_control() || c == '\\');
+    if ok {
+        p.to_string()
+    } else {
+        String::new()
+    }
+}
+
 /// What a `state` is stored under: its hash, so the stored record alone
 /// can't be replayed as a valid `state`.
 pub fn state_key(state: &str) -> String {
@@ -833,5 +903,44 @@ mod tests {
         // No normalization: a trailing slash is a different issuer.
         assert!(check_iss(false, rec, Some("https://auth.example.com/")).is_err());
         assert!(check_iss(false, rec, None).is_ok());
+    }
+
+    #[test]
+    fn flows_round_trip_through_their_tags() {
+        for f in Flow::ALL {
+            let st = new_state_for(f);
+            assert_eq!(Flow::of_state(&st), Some(f));
+            assert!(st.len() > 40, "still unguessable");
+        }
+        assert_eq!(
+            Flow::of_state(&new_state()),
+            None,
+            "a bare state has no kind"
+        );
+        assert_eq!(Flow::of_state("zz.abc"), None);
+        assert!(
+            state_key("ks.a") != state_key("mcp.a"),
+            "the tag is part of the key"
+        );
+    }
+
+    #[test]
+    fn return_paths_stay_on_the_dashboard() {
+        assert_eq!(
+            clean_return_path("/knowledge/base/?id=kb1"),
+            "/knowledge/base/?id=kb1"
+        );
+        for bad in [
+            "//evil.example",
+            "/\\evil.example",
+            "https://evil.example",
+            "javascript:alert(1)",
+            "",
+            "/a\nb",
+            "knowledge",
+        ] {
+            assert_eq!(clean_return_path(bad), "", "{bad:?}");
+        }
+        assert_eq!(clean_return_path(&format!("/{}", "a".repeat(400))), "");
     }
 }

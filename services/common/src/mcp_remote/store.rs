@@ -618,6 +618,12 @@ pub struct PendingAuth {
     pub issuer: String,
     pub redirect_uri: String,
     pub expires_at: i64,
+    /// Which kind of sign-in this is ([`super::oauth::Flow::tag`]); empty
+    /// for one started before kinds were recorded.
+    pub flow: String,
+    /// The dashboard page to go back to once it finishes (a path on the
+    /// dashboard, already checked); empty for the flow's usual page.
+    pub return_to: String,
 }
 
 impl std::fmt::Debug for PendingAuth {
@@ -642,6 +648,12 @@ impl PendingAuth {
         i.insert("issuer".into(), av(&self.issuer));
         i.insert("redirect_uri".into(), av(&self.redirect_uri));
         i.insert("expires_at".into(), num(self.expires_at));
+        if !self.flow.is_empty() {
+            i.insert("flow".into(), av(&self.flow));
+        }
+        if !self.return_to.is_empty() {
+            i.insert("return_to".into(), av(&self.return_to));
+        }
         // DynamoDB removes it on its own once expired (when TTL is on).
         i.insert("ttl".into(), num(self.expires_at));
         i
@@ -658,6 +670,8 @@ impl PendingAuth {
             issuer: s(item, "issuer"),
             redirect_uri: s(item, "redirect_uri"),
             expires_at: n(item, "expires_at").unwrap_or(0),
+            flow: s(item, "flow"),
+            return_to: s(item, "return_to"),
         })
     }
 
@@ -1427,6 +1441,8 @@ mod tests {
             issuer: "https://auth.example.com".into(),
             redirect_uri: "https://app.example.com/cb/".into(),
             expires_at: 1000,
+            flow: "ks".into(),
+            return_to: "/knowledge/".into(),
         };
         assert!(p.check("USER#1", "A@x.com", 999).is_ok());
         assert!(p.check("USER#2", "a@x.com", 999).is_err());
