@@ -40,6 +40,8 @@ pub async fn run(
         "",
         &format!("Feedback on pull request #{}", msg.pr_number),
     );
+    // The agent log keeps this round's model calls as feedback.
+    crate::agent::run_log::set_pass(&msg.run_id, "feedback");
 
     let github = GitHubClient::new(
         &state.secrets.github_app_id,
@@ -2506,11 +2508,21 @@ impl<'a> ToolExecutor for FeedbackToolExecutor<'a> {
                     .and_then(|v| v.as_str())
                     .ok_or("Missing path")?;
                 if super::implement::is_protected_path(path) {
+                    crate::agent::tool_outcome::note(
+                        crate::agent::tool_outcome::ToolOutcome::soft_fail(
+                            "not changed: a protected CI/CD file",
+                        ),
+                    );
                     return Ok(json!(format!(
                         "Cannot modify {path}: CI/CD workflow files are protected."
                     )));
                 }
                 if self.scope_guard.should_block(path) {
+                    crate::agent::tool_outcome::note(
+                        crate::agent::tool_outcome::ToolOutcome::soft_fail(
+                            "rejected: outside the ticket's files",
+                        ),
+                    );
                     return Ok(json!(super::write_guard::ScopeGuard::reject_msg(path)));
                 }
                 let edits = input
@@ -2529,6 +2541,13 @@ impl<'a> ToolExecutor for FeedbackToolExecutor<'a> {
                 let content = match super::implement::apply_text_edits(&original, edits) {
                     Ok(c) => c,
                     Err(errors) => {
+                        crate::agent::tool_outcome::note(
+                            crate::agent::tool_outcome::ToolOutcome::soft_fail(format!(
+                                "no edits applied: {} of {} did not match",
+                                errors.len(),
+                                edits.len()
+                            )),
+                        );
                         return Ok(json!(format!(
                             "NO edits applied to {path} — all edits in one call must succeed \
                              atomically, and {} failed: {}. Re-read the file (read_file_lines) \
@@ -2543,6 +2562,11 @@ impl<'a> ToolExecutor for FeedbackToolExecutor<'a> {
                 if let Err(problem) =
                     super::syntax_check::validate_change(path, Some(&original), &content)
                 {
+                    crate::agent::tool_outcome::note(
+                        crate::agent::tool_outcome::ToolOutcome::soft_fail(
+                            "rejected: it would break the syntax",
+                        ),
+                    );
                     return Ok(json!(format!(
                         "Edit REJECTED for {path} — it would break the file's syntax: {problem}. \
                          Read the file again and retry with a corrected edit."
@@ -2551,6 +2575,11 @@ impl<'a> ToolExecutor for FeedbackToolExecutor<'a> {
                 if let Some(problem) =
                     super::implement::validate_edit_safety(&original, &content, path)
                 {
+                    crate::agent::tool_outcome::note(
+                        crate::agent::tool_outcome::ToolOutcome::soft_fail(
+                            "rejected: it would gut the file",
+                        ),
+                    );
                     return Ok(json!(format!(
                         "Edit REJECTED for {path}: {problem}. Retry with a smaller, more precise edit."
                     )));
@@ -2572,6 +2601,10 @@ impl<'a> ToolExecutor for FeedbackToolExecutor<'a> {
                     )
                     .await?;
                 *self.files_modified.lock().unwrap() = true;
+                let (add, del) = common::agent_log::line_delta(&original, &content);
+                crate::agent::tool_outcome::note(crate::agent::tool_outcome::ToolOutcome::ok(
+                    format!("{} edit(s), +{add}/-{del} lines", edits.len()),
+                ));
                 Ok(json!(format!("Applied {} edit(s) to {path}", edits.len())))
             }
             "write_file" => {
@@ -2582,11 +2615,21 @@ impl<'a> ToolExecutor for FeedbackToolExecutor<'a> {
                 // Guard parity with the implement executor — this path had NONE
                 // of the write protections, which is where post-PR churn ran.
                 if super::implement::is_protected_path(path) {
+                    crate::agent::tool_outcome::note(
+                        crate::agent::tool_outcome::ToolOutcome::soft_fail(
+                            "not changed: a protected CI/CD file",
+                        ),
+                    );
                     return Ok(json!(format!(
                         "Cannot modify {path}: CI/CD workflow files are protected."
                     )));
                 }
                 if self.scope_guard.should_block(path) {
+                    crate::agent::tool_outcome::note(
+                        crate::agent::tool_outcome::ToolOutcome::soft_fail(
+                            "rejected: outside the ticket's files",
+                        ),
+                    );
                     return Ok(json!(super::write_guard::ScopeGuard::reject_msg(path)));
                 }
                 let content = input
@@ -2599,6 +2642,11 @@ impl<'a> ToolExecutor for FeedbackToolExecutor<'a> {
                     .ok_or("Missing message")?;
                 let message: &str = &self.commit_message(message);
                 if let Err(problem) = super::syntax_check::validate_change(path, None, content) {
+                    crate::agent::tool_outcome::note(
+                        crate::agent::tool_outcome::ToolOutcome::soft_fail(
+                            "rejected: syntax problems",
+                        ),
+                    );
                     return Ok(json!(format!(
                         "Write REJECTED for {path} — content has syntax problems: {problem}. \
                          Fix the content and retry."
@@ -2614,6 +2662,11 @@ impl<'a> ToolExecutor for FeedbackToolExecutor<'a> {
                     if let Some(problem) =
                         super::implement::validate_edit_safety(&old, content, path)
                     {
+                        crate::agent::tool_outcome::note(
+                            crate::agent::tool_outcome::ToolOutcome::soft_fail(
+                                "rejected: it would gut the file",
+                            ),
+                        );
                         return Ok(json!(format!(
                             "Write REJECTED for {path}: {problem}. Write the COMPLETE file — \
                              never a stub or placeholder."
@@ -2639,6 +2692,9 @@ impl<'a> ToolExecutor for FeedbackToolExecutor<'a> {
                     )
                     .await?;
                 *self.files_modified.lock().unwrap() = true;
+                crate::agent::tool_outcome::note(crate::agent::tool_outcome::ToolOutcome::ok(
+                    format!("written, {} lines", content.lines().count()),
+                ));
                 Ok(json!(format!("Wrote {path}")))
             }
             "batch_write" => {
@@ -2660,12 +2716,22 @@ impl<'a> ToolExecutor for FeedbackToolExecutor<'a> {
                     // Guard parity with the implement executor (atomic: one bad
                     // file rejects the whole batch; nothing committed).
                     if super::implement::is_protected_path(path) {
+                        crate::agent::tool_outcome::note(
+                            crate::agent::tool_outcome::ToolOutcome::soft_fail(
+                                "nothing committed: a file was rejected",
+                            ),
+                        );
                         return Ok(json!(format!(
                             "Batch write REJECTED — {path} is a protected CI/CD workflow file. \
                              Nothing was committed."
                         )));
                     }
                     if self.scope_guard.should_block(path) {
+                        crate::agent::tool_outcome::note(
+                            crate::agent::tool_outcome::ToolOutcome::soft_fail(
+                                "nothing committed: a file was rejected",
+                            ),
+                        );
                         return Ok(json!(format!(
                             "Batch write REJECTED — {}. Nothing was committed.",
                             super::write_guard::ScopeGuard::reject_msg(path)
@@ -2681,6 +2747,11 @@ impl<'a> ToolExecutor for FeedbackToolExecutor<'a> {
                         if let Err(problem) =
                             super::syntax_check::validate_change(path, None, content)
                         {
+                            crate::agent::tool_outcome::note(
+                                crate::agent::tool_outcome::ToolOutcome::soft_fail(
+                                    "nothing committed: a file was rejected",
+                                ),
+                            );
                             return Ok(json!(format!(
                                 "Batch write REJECTED — {path} has syntax problems: {problem}. \
                                  Nothing was committed."
@@ -2694,6 +2765,11 @@ impl<'a> ToolExecutor for FeedbackToolExecutor<'a> {
                             if let Some(problem) =
                                 super::implement::validate_edit_safety(&old, content, path)
                             {
+                                crate::agent::tool_outcome::note(
+                                    crate::agent::tool_outcome::ToolOutcome::soft_fail(
+                                        "nothing committed: a file was rejected",
+                                    ),
+                                );
                                 return Ok(json!(format!(
                                     "Batch write REJECTED — {path}: {problem}. Never replace a \
                                      real file with a stub; write the COMPLETE file. Nothing was \
@@ -2712,6 +2788,9 @@ impl<'a> ToolExecutor for FeedbackToolExecutor<'a> {
                     .batch_write(self.owner, self.repo, self.branch, message, &ops)
                     .await?;
                 *self.files_modified.lock().unwrap() = true;
+                crate::agent::tool_outcome::note(crate::agent::tool_outcome::ToolOutcome::ok(
+                    format!("{} files committed", ops.len()),
+                ));
                 Ok(json!(format!(
                     "Batch commit {} — {} files",
                     &sha[..8.min(sha.len())],

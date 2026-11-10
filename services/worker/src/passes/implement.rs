@@ -6,6 +6,7 @@ use crate::agent::llm::{self, ToolDefinition, ToolExecutor};
 use crate::agent::mcp;
 use crate::agent::provider;
 use crate::agent::provider::ModelProvider;
+use crate::agent::tool_outcome::{note, ToolOutcome as LogOutcome};
 use crate::clients::github::{FileOp, GitHubClient};
 use crate::models::{TicketMessage, TokenUsage};
 use crate::passes::checks::CheckKind;
@@ -794,87 +795,99 @@ pub async fn run(
         let events_table = state.config.events_table_name.clone();
         let team = msg.team_id.clone();
         let rid = rid.to_string();
-        Some(llm::ToolCallFn(Box::new(
-            move |tool_name: &str, duration_ms: u64, input_summary: &str, is_error: bool| {
-                let dynamo = dynamo.clone();
-                let s3 = s3.clone();
-                let bucket = bucket.clone();
-                let table = table.clone();
-                let events_table = events_table.clone();
-                let team = team.clone();
-                let rid = rid.clone();
-                let tool_name = tool_name.to_string();
-                let input_summary = input_summary.to_string();
-                tokio::spawn(async move {
-                    let now = chrono::Utc::now().to_rfc3339();
+        Some(llm::ToolCallFn(Box::new(move |ev: &llm::ToolEvent<'_>| {
+            let duration_ms = ev.duration_ms;
+            let is_error = ev.is_error;
+            // Which pass the call is in, its id and its start: the run
+            // page joins it to the agent log by `tool_use_id`.
+            let pass = crate::agent::run_log::current_pass(&rid)
+                .unwrap_or_else(|| "implement".to_string());
+            let tool_use_id = ev.tool_use_id.to_string();
+            let started_at = ev.started_at.to_string();
+            let outcome = ev.outcome.to_value();
+            let tool_name = ev.tool;
+            // The same redaction as the agent log.
+            let input_summary = common::agent_log::redact_text(ev.input_summary);
+            let dynamo = dynamo.clone();
+            let s3 = s3.clone();
+            let bucket = bucket.clone();
+            let table = table.clone();
+            let events_table = events_table.clone();
+            let team = team.clone();
+            let rid = rid.clone();
+            let tool_name = tool_name.to_string();
+            tokio::spawn(async move {
+                let now = chrono::Utc::now().to_rfc3339();
 
-                    // Write progress note (existing behavior for timeline)
-                    let msg = if input_summary.is_empty() {
-                        format!("Tool: {tool_name}")
-                    } else {
-                        format!(
-                            "Tool: {tool_name} — {}",
-                            common::truncate_str(&input_summary, 100)
-                        )
-                    };
-                    super::run_lists::append_note(
-                        &super::run_lists::Target {
-                            dynamo: &dynamo,
-                            table: &table,
-                            team_id: &team,
-                            run_id: &rid,
-                            archive: Some((&s3, &bucket)),
-                        },
-                        &msg,
+                // Write progress note (existing behavior for timeline)
+                let msg = if input_summary.is_empty() {
+                    format!("Tool: {tool_name}")
+                } else {
+                    format!(
+                        "Tool: {tool_name} — {}",
+                        common::truncate_str(&input_summary, 100)
                     )
-                    .await;
+                };
+                super::run_lists::append_note(
+                    &super::run_lists::Target {
+                        dynamo: &dynamo,
+                        table: &table,
+                        team_id: &team,
+                        run_id: &rid,
+                        archive: Some((&s3, &bucket)),
+                    },
+                    &msg,
+                )
+                .await;
 
-                    // Write detailed tool event to events table for agent log live view
-                    if !events_table.is_empty() {
-                        let ts = chrono::Utc::now().timestamp_millis();
-                        let sk = format!("TOOL#{ts:013}#{tool_name}");
-                        let payload = serde_json::json!({
-                            "tool": tool_name,
-                            "input_summary": input_summary,
-                            "duration_ms": duration_ms,
-                            "is_error": is_error,
-                        });
-                        let _ = dynamo
-                            .put_item()
-                            .table_name(&events_table)
-                            .item(
-                                "pk",
-                                aws_sdk_dynamodb::types::AttributeValue::S(format!("RUN#{rid}")),
-                            )
-                            .item("sk", aws_sdk_dynamodb::types::AttributeValue::S(sk))
-                            .item(
-                                "event_type",
-                                aws_sdk_dynamodb::types::AttributeValue::S("tool_call".to_string()),
-                            )
-                            .item(
-                                "payload",
-                                aws_sdk_dynamodb::types::AttributeValue::S(payload.to_string()),
-                            )
-                            .item(
-                                "processed",
-                                aws_sdk_dynamodb::types::AttributeValue::Bool(true),
-                            )
-                            .item("timestamp", aws_sdk_dynamodb::types::AttributeValue::S(now))
-                            // The events table's TTL attribute is `expires_at`
-                            // (infra database-stack); `ttl` never expired.
-                            .item(
-                                "expires_at",
-                                aws_sdk_dynamodb::types::AttributeValue::N(
-                                    (chrono::Utc::now().timestamp() as u64 + 30 * 86400)
-                                        .to_string(),
-                                ),
-                            )
-                            .send()
-                            .await;
-                    }
-                });
-            },
-        )))
+                // Write detailed tool event to events table for agent log live view
+                if !events_table.is_empty() {
+                    let ts = chrono::Utc::now().timestamp_millis();
+                    let sk = format!("TOOL#{ts:013}#{tool_name}");
+                    let payload = serde_json::json!({
+                        "tool": tool_name,
+                        "input_summary": input_summary,
+                        "duration_ms": duration_ms,
+                        "is_error": is_error,
+                        "pass": pass,
+                        "tool_use_id": tool_use_id,
+                        "started_at": started_at,
+                        "outcome": outcome,
+                    });
+                    let _ = dynamo
+                        .put_item()
+                        .table_name(&events_table)
+                        .item(
+                            "pk",
+                            aws_sdk_dynamodb::types::AttributeValue::S(format!("RUN#{rid}")),
+                        )
+                        .item("sk", aws_sdk_dynamodb::types::AttributeValue::S(sk))
+                        .item(
+                            "event_type",
+                            aws_sdk_dynamodb::types::AttributeValue::S("tool_call".to_string()),
+                        )
+                        .item(
+                            "payload",
+                            aws_sdk_dynamodb::types::AttributeValue::S(payload.to_string()),
+                        )
+                        .item(
+                            "processed",
+                            aws_sdk_dynamodb::types::AttributeValue::Bool(true),
+                        )
+                        .item("timestamp", aws_sdk_dynamodb::types::AttributeValue::S(now))
+                        // The events table's TTL attribute is `expires_at`
+                        // (infra database-stack); `ttl` never expired.
+                        .item(
+                            "expires_at",
+                            aws_sdk_dynamodb::types::AttributeValue::N(
+                                (chrono::Utc::now().timestamp() as u64 + 30 * 86400).to_string(),
+                            ),
+                        )
+                        .send()
+                        .await;
+                }
+            });
+        })))
     } else {
         None
     };
@@ -1672,6 +1685,52 @@ impl<'a> ToolExecutor for WriteToolExecutor<'a> {
     }
 }
 
+/// A code search's outcome for the agent log: how many matches in how many
+/// files.
+fn search_outcome(files: usize, matches: usize) -> LogOutcome {
+    if files == 0 {
+        LogOutcome::ok("no matches")
+    } else {
+        LogOutcome::ok(format!("{matches} matches in {files} files"))
+    }
+}
+
+/// A whole-file write's outcome for the agent log: created, or rewritten
+/// with how many lines it added and removed.
+fn write_outcome(existing: Option<&str>, content: &str) -> LogOutcome {
+    match existing {
+        None => LogOutcome::ok(format!("created, +{} lines", content.lines().count())),
+        Some(old) => {
+            let (add, del) = common::agent_log::line_delta(old, content);
+            LogOutcome::ok(format!("rewritten, +{add}/-{del} lines"))
+        }
+    }
+}
+
+/// A sandbox checks run's outcome for the agent log, from each step's exit
+/// code: `ok` when the checks passed, `soft_fail` when they did not.
+fn checks_outcome(passed: bool, codes: &[Option<i32>]) -> LogOutcome {
+    let total = codes.len();
+    let ok = codes.iter().filter(|c| **c == Some(0)).count();
+    let failed = codes
+        .iter()
+        .filter(|c| matches!(c, Some(n) if *n != 0))
+        .count();
+    let none = total - ok - failed;
+    let mut summary = format!("{ok} of {total} checks passed");
+    if failed > 0 {
+        summary.push_str(&format!(", {failed} failed"));
+    }
+    if none > 0 {
+        summary.push_str(&format!(", {none} gave no result"));
+    }
+    if passed {
+        LogOutcome::ok(summary)
+    } else {
+        LogOutcome::soft_fail(summary)
+    }
+}
+
 /// The tools that write to the branch.
 fn is_write_tool(name: &str) -> bool {
     matches!(
@@ -1729,6 +1788,7 @@ impl<'a> WriteToolExecutor<'a> {
                     .filter(|e| e.entry_type == "blob")
                     .map(|e| e.path.as_str())
                     .collect();
+                note(LogOutcome::ok(format!("{} files", paths.len())));
                 Ok(json!(super::truncate_tree(&paths)))
             }
             "read_file" => {
@@ -1747,6 +1807,7 @@ impl<'a> WriteToolExecutor<'a> {
                     self.file_cache.insert(cache_key, fetched.clone()).await;
                     fetched
                 };
+                note(LogOutcome::ok(format!("{} lines", content.lines().count())));
                 Ok(json!(super::truncate_content(&content, path)))
             }
             "read_file_lines" => {
@@ -1766,6 +1827,7 @@ impl<'a> WriteToolExecutor<'a> {
                     .github
                     .read_file_lines(&self.owner, &self.repo, path, &self.branch, start, end)
                     .await?;
+                note(LogOutcome::ok(format!("lines {start}-{end}")));
                 Ok(json!(content))
             }
             "search_code" => {
@@ -1777,6 +1839,10 @@ impl<'a> WriteToolExecutor<'a> {
                     .github
                     .search_code(&self.owner, &self.repo, &self.branch, query)
                     .await?;
+                note(search_outcome(
+                    results.len(),
+                    results.iter().map(|r| r.matches.len().max(1)).sum(),
+                ));
                 let lines: Vec<String> = results
                     .iter()
                     .map(|r| {
@@ -1802,6 +1868,7 @@ impl<'a> WriteToolExecutor<'a> {
                     .iter()
                     .map(|e| format!("{}: {}", e.entry_type, e.name))
                     .collect();
+                note(LogOutcome::ok(format!("{} entries", lines.len())));
                 Ok(json!(lines.join("\n")))
             }
             "write_file" => {
@@ -1810,6 +1877,7 @@ impl<'a> WriteToolExecutor<'a> {
                     .and_then(|v| v.as_str())
                     .ok_or("Missing path")?;
                 if is_protected_path(path) {
+                    note(LogOutcome::soft_fail("not written: a protected CI/CD file"));
                     return Ok(json!(format!(
                         "Cannot modify {path}: CI/CD workflow files are protected. \
                          Skip this file and continue with other changes."
@@ -1828,6 +1896,7 @@ impl<'a> WriteToolExecutor<'a> {
                 // no prior brokenness to inherit for a rewrite the agent
                 // authored end-to-end.
                 if let Err(problem) = syntax_check::validate_change(path, None, content) {
+                    note(LogOutcome::soft_fail("rejected: syntax problems"));
                     return Ok(json!(format!(
                         "Write REJECTED for {path} — content has syntax problems: {problem}. \
                          Fix the content and retry."
@@ -1853,14 +1922,19 @@ impl<'a> WriteToolExecutor<'a> {
                     // run_codegen. Bounded (see should_block_generated) so it can
                     // never deadlock on a file codegen can't regenerate.
                     if self.should_block_generated(path, old) {
+                        note(LogOutcome::soft_fail("rejected: a generated file"));
                         return Ok(json!(generated_file_reject(path)));
                     }
                     // Ticket-scope guard: EDITS of existing out-of-PR files only —
                     // creating a genuinely-needed new file is never blocked.
                     if self.scope_guard.should_block(path) {
+                        note(LogOutcome::soft_fail(
+                            "rejected: outside the ticket's files",
+                        ));
                         return Ok(json!(super::write_guard::ScopeGuard::reject_msg(path)));
                     }
                     if let Some(problem) = validate_edit_safety(old, content, path) {
+                        note(LogOutcome::soft_fail("rejected: it would gut the file"));
                         return Ok(json!(format!(
                             "Write REJECTED for {path}: {problem}. If you are rewriting the whole \
                              file, write the COMPLETE implementation — never a stub or placeholder. \
@@ -1893,6 +1967,7 @@ impl<'a> WriteToolExecutor<'a> {
                     .remove(&format!("{}:{}", self.branch, path))
                     .await;
                 self.task_tracker.mark_files_done(&[path]).await;
+                note(write_outcome(existing.as_deref(), content));
                 Ok(json!(format!("Wrote {path}")))
             }
             "edit_file" => {
@@ -1901,11 +1976,15 @@ impl<'a> WriteToolExecutor<'a> {
                     .and_then(|v| v.as_str())
                     .ok_or("Missing path")?;
                 if is_protected_path(path) {
+                    note(LogOutcome::soft_fail("not edited: a protected CI/CD file"));
                     return Ok(json!(format!(
                         "Cannot modify {path}: CI/CD workflow files are protected."
                     )));
                 }
                 if self.scope_guard.should_block(path) {
+                    note(LogOutcome::soft_fail(
+                        "rejected: outside the ticket's files",
+                    ));
                     return Ok(json!(super::write_guard::ScopeGuard::reject_msg(path)));
                 }
                 let edits = input
@@ -1934,6 +2013,11 @@ impl<'a> WriteToolExecutor<'a> {
                 let content = match apply_text_edits(&original_content, edits) {
                     Ok(c) => c,
                     Err(errors) => {
+                        note(LogOutcome::soft_fail(format!(
+                            "no edits applied: {} of {} did not match",
+                            errors.len(),
+                            edits.len()
+                        )));
                         return Ok(json!(format!(
                             "NO edits applied to {path} — all edits in one call must succeed \
                              atomically, and {} failed: {}. Re-read the current file content \
@@ -1952,6 +2036,7 @@ impl<'a> WriteToolExecutor<'a> {
                 // Generated files must be regenerated, not hand-edited — steer
                 // to run_codegen. Bounded escape hatch prevents any deadlock.
                 if self.should_block_generated(path, &original_content) {
+                    note(LogOutcome::soft_fail("rejected: a generated file"));
                     return Ok(json!(generated_file_reject(path)));
                 }
                 // Syntax gate: the edited file must parse-scan clean (or be no
@@ -1960,6 +2045,7 @@ impl<'a> WriteToolExecutor<'a> {
                 if let Err(problem) =
                     syntax_check::validate_change(path, Some(&original_content), &content)
                 {
+                    note(LogOutcome::soft_fail("rejected: it would break the syntax"));
                     return Ok(json!(format!(
                         "Edit REJECTED for {path} — it would break the file's syntax: {problem}. \
                          Read the file again and retry with a corrected edit."
@@ -1967,6 +2053,7 @@ impl<'a> WriteToolExecutor<'a> {
                 }
                 // Deletion guardrail: reject edits that gut the file
                 if let Some(problem) = validate_edit_safety(&original_content, &content, path) {
+                    note(LogOutcome::soft_fail("rejected: it would gut the file"));
                     return Ok(json!(format!(
                         "Edit REJECTED for {path}: {problem}. \
                          Read the file again and retry with a smaller, more precise edit."
@@ -1992,8 +2079,13 @@ impl<'a> WriteToolExecutor<'a> {
                     )
                     .await?;
                 self.files_modified.lock().unwrap().insert(path.to_string());
+                let (add, del) = common::agent_log::line_delta(&original_content, &content);
                 self.file_cache.insert(cache_key, content).await;
                 self.task_tracker.mark_files_done(&[path]).await;
+                note(LogOutcome::ok(format!(
+                    "{} edit(s), +{add}/-{del} lines",
+                    edits.len()
+                )));
 
                 Ok(json!(format!("Applied {} edit(s) to {path}", edits.len())))
             }
@@ -2028,6 +2120,7 @@ impl<'a> WriteToolExecutor<'a> {
                         // Atomic batch: one syntactically broken file rejects
                         // the whole commit — same contract as edit_file.
                         if let Err(problem) = syntax_check::validate_change(path, None, content) {
+                            note(LogOutcome::soft_fail("nothing committed: syntax problems"));
                             return Ok(json!(format!(
                                 "Batch write REJECTED — {path} has syntax problems: {problem}. \
                                  Nothing was committed; fix the content and retry."
@@ -2048,6 +2141,7 @@ impl<'a> WriteToolExecutor<'a> {
                         };
                         if let Some(old) = &bw_existing {
                             if self.should_block_generated(path, old) {
+                                note(LogOutcome::soft_fail("nothing committed: a generated file"));
                                 return Ok(json!(format!(
                                     "Batch write REJECTED — {path} is a GENERATED file (do-not-edit \
                                      banner). Change the source and call `run_codegen` to regenerate \
@@ -2057,12 +2151,18 @@ impl<'a> WriteToolExecutor<'a> {
                             // Ticket-scope guard: EDITS of existing out-of-PR files
                             // only — new-file creation is never blocked.
                             if self.scope_guard.should_block(path) {
+                                note(LogOutcome::soft_fail(
+                                    "nothing committed: outside the ticket's files",
+                                ));
                                 return Ok(json!(format!(
                                     "Batch write REJECTED — {}. Nothing was committed.",
                                     super::write_guard::ScopeGuard::reject_msg(path)
                                 )));
                             }
                             if let Some(problem) = validate_edit_safety(old, content, path) {
+                                note(LogOutcome::soft_fail(
+                                    "nothing committed: it would gut a file",
+                                ));
                                 return Ok(json!(format!(
                                     "Batch write REJECTED — {path}: {problem}. Never replace a \
                                      real file with a stub or placeholder; write the COMPLETE \
@@ -2077,6 +2177,9 @@ impl<'a> WriteToolExecutor<'a> {
                     }
                 }
                 if ops.is_empty() {
+                    note(LogOutcome::soft_fail(
+                        "nothing committed: protected CI/CD files",
+                    ));
                     return Ok(json!(format!(
                         "All files skipped (protected CI/CD paths): {}",
                         skipped.join(", ")
@@ -2107,6 +2210,15 @@ impl<'a> WriteToolExecutor<'a> {
                     .collect();
                 self.task_tracker.mark_files_done(&written_paths).await;
                 let short_sha = &sha[..8.min(sha.len())];
+                note(LogOutcome::ok(if skipped.is_empty() {
+                    format!("{} files committed", ops.len())
+                } else {
+                    format!(
+                        "{} files committed, {} protected skipped",
+                        ops.len(),
+                        skipped.len()
+                    )
+                }));
                 let mut result = format!("Batch commit {short_sha} — {} files", ops.len());
                 if !skipped.is_empty() {
                     result.push_str(&format!(
@@ -2123,6 +2235,18 @@ impl<'a> WriteToolExecutor<'a> {
                     .await?;
                 let files = diff.get("files").and_then(|v| v.as_array());
                 if let Some(files) = files {
+                    let sum = |k: &str| -> u64 {
+                        files
+                            .iter()
+                            .filter_map(|f| f.get(k).and_then(|v| v.as_u64()))
+                            .sum()
+                    };
+                    note(LogOutcome::ok(format!(
+                        "{} files changed, +{}/-{}",
+                        files.len(),
+                        sum("additions"),
+                        sum("deletions")
+                    )));
                     let mut lines = Vec::new();
                     for f in files {
                         let filename = f.get("filename").and_then(|v| v.as_str()).unwrap_or("");
@@ -2141,6 +2265,7 @@ impl<'a> WriteToolExecutor<'a> {
                     }
                     Ok(json!(lines.join("\n")))
                 } else {
+                    note(LogOutcome::ok("no changes"));
                     Ok(json!("No changes compared to the PR's base branch."))
                 }
             }
@@ -2150,6 +2275,9 @@ impl<'a> WriteToolExecutor<'a> {
                     .and_then(|v| v.as_str())
                     .ok_or("Missing path")?;
                 if is_protected_path(path) {
+                    note(LogOutcome::soft_fail(
+                        "not restored: a protected CI/CD file",
+                    ));
                     return Ok(json!(format!(
                         "Cannot modify {path}: CI/CD workflow files are protected."
                     )));
@@ -2157,6 +2285,9 @@ impl<'a> WriteToolExecutor<'a> {
                 // An out-of-scope file is identical to base in this PR — a
                 // "restore" of it is either a no-op commit or out-of-scope churn.
                 if self.scope_guard.should_block(path) {
+                    note(LogOutcome::soft_fail(
+                        "rejected: outside the ticket's files",
+                    ));
                     return Ok(json!(super::write_guard::ScopeGuard::reject_msg(path)));
                 }
                 // Default to the PR's base branch — restoring an out-of-scope file
@@ -2169,6 +2300,9 @@ impl<'a> WriteToolExecutor<'a> {
                     .filter(|s| !s.trim().is_empty())
                     .unwrap_or(&self.base_branch);
                 if let Some(no) = super::stack::restore_refusal(from_ref, &self.base_branch) {
+                    note(LogOutcome::soft_fail(format!(
+                        "not restored from {from_ref}"
+                    )));
                     return Ok(json!(no));
                 }
                 let message = input
@@ -2187,6 +2321,9 @@ impl<'a> WriteToolExecutor<'a> {
                 {
                     Ok(c) => c,
                     Err(e) => {
+                        note(LogOutcome::soft_fail(format!(
+                            "not restored: could not read it at {from_ref}"
+                        )));
                         let hint = format!(
                             "Could not read {path} at ref '{from_ref}': {e}. Check the path and ref."
                         );
@@ -2214,6 +2351,7 @@ impl<'a> WriteToolExecutor<'a> {
                     .insert(format!("{}:{}", self.branch, path), content.clone())
                     .await;
                 self.task_tracker.mark_files_done(&[path]).await;
+                note(LogOutcome::ok(format!("restored from {from_ref}")));
                 Ok(json!(format!(
                     "Restored {path} from '{from_ref}' ({} bytes) — exact copy, content not loaded into context",
                     content.len()
@@ -2323,6 +2461,7 @@ impl<'a> WriteToolExecutor<'a> {
         let (Some(sandbox), Some(cmd), Some(run_id)) =
             (&self.sandbox, &self.checks_cmd, &self.run_id)
         else {
+            note(LogOutcome::soft_fail("not run: no sandbox for this run"));
             return Ok(json!(
                 "Sandbox verification isn't available for this run; rely on careful reasoning \
                  and the existing tests."
@@ -2332,6 +2471,9 @@ impl<'a> WriteToolExecutor<'a> {
         // Budget doubles as the per-attempt S3 key nonce (unique, deterministic).
         let attempt = self.check_budget.fetch_add(1, Ordering::SeqCst);
         if attempt >= MAX_CHECKS_PER_RUN {
+            note(LogOutcome::soft_fail(
+                "not run: the run's check budget is used",
+            ));
             return Ok(json!(format!(
                 "run_checks budget ({MAX_CHECKS_PER_RUN}) reached for this run. Finalize using \
                  the output you already have."
@@ -2341,12 +2483,16 @@ impl<'a> WriteToolExecutor<'a> {
         // say why and stop spending the pass on it.
         if let Some((n, reason)) = crate::clients::sandbox::NoResults::given_up(run_id) {
             self.record_no_result(&reason, n, &[]);
+            note(LogOutcome::soft_fail(format!(
+                "not run: the sandbox gave no result {n} times"
+            )));
             return Ok(json!(format!(
                 "The sandbox gave no result {n} times in this run ({reason}), so no more builds \
                  are started. Finalize your changes without it; CI still runs on the PR."
             )));
         }
         if !sandbox.has_time(self.deadline) {
+            note(LogOutcome::soft_fail("not run: not enough time left"));
             return Ok(json!(
                 "Not enough time remains to run a sandbox build safely; finalize your changes now."
             ));
@@ -2365,6 +2511,9 @@ impl<'a> WriteToolExecutor<'a> {
             Err(stop) => return Err(stop),
         };
         if steps.is_empty() {
+            note(LogOutcome::refused(
+                "not run: the agent permissions allow no check command",
+            ));
             return Ok(json!(format!(
                 "No sandbox command may run under the team's agent permissions: {}. \
                  Finalize your changes without the sandbox; CI still runs on the PR.",
@@ -2376,9 +2525,12 @@ impl<'a> WriteToolExecutor<'a> {
         let source = match self.sandbox_source(sandbox, run_id).await {
             Ok(k) => k,
             Err(e) => {
+                note(LogOutcome::soft_fail(
+                    "not run: could not snapshot the branch",
+                ));
                 return Ok(json!(format!(
                 "Could not snapshot the branch for checks: {e}. Proceed carefully; CI still runs."
-            )))
+            )));
             }
         };
 
@@ -2417,9 +2569,10 @@ impl<'a> WriteToolExecutor<'a> {
                     !steps.iter().any(|s| s.kinds.contains(&CheckKind::Tests)),
                     &o.output,
                 );
-                if let Some(note) = blocked_check_note(o.passed, &o.output) {
-                    report = format!("{note}\n\n{report}");
+                if let Some(blocked) = blocked_check_note(o.passed, &o.output) {
+                    report = format!("{blocked}\n\n{report}");
                 }
+                note(checks_outcome(o.passed, &codes));
                 Ok(json!(report))
             }
             Ok(o) => {
@@ -2429,6 +2582,7 @@ impl<'a> WriteToolExecutor<'a> {
                     0
                 };
                 self.record_no_result(&o.reason, n, &steps);
+                note(LogOutcome::soft_fail("the sandbox gave no result"));
                 let stop = if n >= crate::clients::sandbox::MAX_NO_RESULT {
                     format!(
                         " That is {n} builds without a result in this run, so no more are \
@@ -2446,6 +2600,7 @@ impl<'a> WriteToolExecutor<'a> {
             Err(e) => {
                 let reason = format!("the sandbox could not be driven ({e})");
                 self.record_no_result(&reason, 0, &steps);
+                note(LogOutcome::soft_fail("sandbox error"));
                 Ok(json!(format!(
                     "Sandbox error: {e}. Proceed carefully; CI still runs."
                 )))
@@ -2485,6 +2640,9 @@ impl<'a> WriteToolExecutor<'a> {
         let (Some(sandbox), Some(cmd), Some(run_id)) =
             (&self.sandbox, &self.codegen_cmd, &self.run_id)
         else {
+            note(LogOutcome::soft_fail(
+                "not run: no codegen for this repository",
+            ));
             return Ok(json!("Codegen isn't available for this repo."));
         };
         if let Some(gate) = &self.policy {
@@ -2496,17 +2654,24 @@ impl<'a> WriteToolExecutor<'a> {
                 }
                 common::agent_policy::Outcome::Refused { message, .. }
                 | common::agent_policy::Outcome::Pending { message, .. } => {
+                    note(LogOutcome::refused(
+                        "not run: the agent policy did not allow it",
+                    ));
                     return Ok(json!(format!("Codegen didn't run: {message}")));
                 }
             }
         }
         let attempt = self.check_budget.fetch_add(1, Ordering::SeqCst);
         if attempt >= MAX_CHECKS_PER_RUN {
+            note(LogOutcome::soft_fail(
+                "not run: the run's sandbox budget is used",
+            ));
             return Ok(json!(format!(
                 "Sandbox budget ({MAX_CHECKS_PER_RUN}) reached for this run."
             )));
         }
         if !sandbox.has_time(self.deadline) {
+            note(LogOutcome::soft_fail("not run: not enough time left"));
             return Ok(json!(
                 "Not enough time remains to run codegen; finalize your changes now."
             ));
@@ -2514,9 +2679,12 @@ impl<'a> WriteToolExecutor<'a> {
         let source = match self.sandbox_source(sandbox, run_id).await {
             Ok(k) => k,
             Err(e) => {
+                note(LogOutcome::soft_fail(
+                    "not run: could not snapshot the branch",
+                ));
                 return Ok(json!(format!(
                     "Could not snapshot the branch for codegen: {e}."
-                )))
+                )));
             }
         };
         match sandbox
@@ -2534,6 +2702,9 @@ impl<'a> WriteToolExecutor<'a> {
             Ok(o) if !o.passed && blocked_codegen(cmd, &o.output).is_some() => {
                 let f = blocked_codegen(cmd, &o.output).unwrap_or_default();
                 crate::clients::sandbox::EgressBlocks::record(run_id, &f);
+                note(LogOutcome::soft_fail(
+                    "failed: the sandbox network blocked it",
+                ));
                 Ok(json!(format!(
                     "Codegen FAILED because {} This is the sandbox's network, not your change: \
                      don't edit code to work around it and don't hand-write the generated \
@@ -2556,9 +2727,14 @@ impl<'a> WriteToolExecutor<'a> {
                     )
                 };
                 if o.changed.is_empty() && !dropped.is_empty() {
+                    note(LogOutcome::soft_fail(format!(
+                        "{} file(s) not committed",
+                        o.dropped.len()
+                    )));
                     return Ok(json!(format!("Codegen ran.{dropped}")));
                 }
                 if o.changed.is_empty() {
+                    note(LogOutcome::ok("no files changed"));
                     return Ok(json!(format!(
                         "Codegen ran cleanly but changed no files (nothing to regenerate). \
                          Commands: {cmd}"
@@ -2597,6 +2773,15 @@ impl<'a> WriteToolExecutor<'a> {
                             // agent touch them without scope rejections.
                             self.scope_guard.allow(p);
                         }
+                        note(if o.dropped.is_empty() {
+                            LogOutcome::ok(format!("{} file(s) regenerated", paths.len()))
+                        } else {
+                            LogOutcome::soft_fail(format!(
+                                "{} file(s) regenerated, {} not committed",
+                                paths.len(),
+                                o.dropped.len()
+                            ))
+                        });
                         Ok(json!(format!(
                             "Regenerated and committed {} file(s): {}.{dropped} Now call \
                              run_checks to confirm the type errors are resolved.",
@@ -2604,21 +2789,33 @@ impl<'a> WriteToolExecutor<'a> {
                             paths.join(", ")
                         )))
                     }
-                    Err(e) => Ok(json!(format!(
-                        "Codegen produced {} file(s) but committing them failed: {e}",
-                        paths.len()
-                    ))),
+                    Err(e) => {
+                        note(LogOutcome::soft_fail("regenerated, but the commit failed"));
+                        Ok(json!(format!(
+                            "Codegen produced {} file(s) but committing them failed: {e}",
+                            paths.len()
+                        )))
+                    }
                 }
             }
-            Ok(o) if o.ran => Ok(json!(format!(
-                "Codegen FAILED (non-zero exit). Commands: {cmd}\n\n--- output (tail) ---\n{}",
-                o.output
-            ))),
-            Ok(o) => Ok(json!(format!(
-                "Codegen couldn't run ({}). Proceed carefully.",
-                o.output
-            ))),
-            Err(e) => Ok(json!(format!("Codegen error: {e}."))),
+            Ok(o) if o.ran => {
+                note(LogOutcome::soft_fail("codegen failed"));
+                Ok(json!(format!(
+                    "Codegen FAILED (non-zero exit). Commands: {cmd}\n\n--- output (tail) ---\n{}",
+                    o.output
+                )))
+            }
+            Ok(o) => {
+                note(LogOutcome::soft_fail("codegen could not run"));
+                Ok(json!(format!(
+                    "Codegen couldn't run ({}). Proceed carefully.",
+                    o.output
+                )))
+            }
+            Err(e) => {
+                note(LogOutcome::soft_fail("codegen error"));
+                Ok(json!(format!("Codegen error: {e}.")))
+            }
         }
     }
 }
@@ -3415,5 +3612,49 @@ mod graph_tests {
             assert!(tools.iter().any(|t| t.name == name), "{name}");
         }
         assert!(system.contains("not your edits"));
+    }
+}
+
+#[cfg(test)]
+mod log_outcome_tests {
+    use super::*;
+    use common::agent_log::OutcomeStatus;
+
+    #[test]
+    fn searches_count_matches_and_files() {
+        assert_eq!(search_outcome(0, 0), LogOutcome::ok("no matches"));
+        assert_eq!(
+            search_outcome(3, 12),
+            LogOutcome::ok("12 matches in 3 files")
+        );
+    }
+
+    #[test]
+    fn writes_say_created_or_rewritten_with_line_counts() {
+        assert_eq!(
+            write_outcome(None, "a\nb\nc"),
+            LogOutcome::ok("created, +3 lines")
+        );
+        assert_eq!(
+            write_outcome(Some("a\nb\nc"), "a\nB\nc\nd"),
+            LogOutcome::ok("rewritten, +2/-1 lines")
+        );
+    }
+
+    #[test]
+    fn checks_are_ok_only_when_they_passed() {
+        let passed = checks_outcome(true, &[Some(0), Some(0)]);
+        assert_eq!(passed, LogOutcome::ok("2 of 2 checks passed"));
+        let failed = checks_outcome(false, &[Some(0), Some(2), None]);
+        assert_eq!(failed.status, OutcomeStatus::SoftFail);
+        assert_eq!(
+            failed.summary.as_deref(),
+            Some("1 of 3 checks passed, 1 failed, 1 gave no result")
+        );
+        // A lint failure the gate does not count still reads as passed.
+        assert_eq!(
+            checks_outcome(true, &[Some(0), Some(1)]).status,
+            OutcomeStatus::Ok
+        );
     }
 }
