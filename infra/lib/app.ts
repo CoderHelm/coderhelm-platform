@@ -79,6 +79,9 @@ export function buildApp(app: cdk.App, cfg: ResolvedConfig, opts: { accessStack?
       : undefined,
   });
 
+  // The sandbox bucket logs into the storage stack's log bucket (by name).
+  worker.addDependency(storage);
+
   // --- Streaming (SSE via Lambda Function URL + Web Adapter) ---
   // Created before email and log analyzer so a single-origin web stack can
   // sit between them (those two link to the dashboard URL it creates).
@@ -110,6 +113,8 @@ export function buildApp(app: cdk.App, cfg: ResolvedConfig, opts: { accessStack?
       streamingFunctionUrl: streaming.functionUrl,
       crossRegionReferences: false,
     });
+    // Its dashboard bucket and distribution log into the storage stack's log bucket (by name).
+    web.addDependency(storage);
   }
 
   /** The dashboard's URL: static when known, else the web stack's CloudFront URL. */

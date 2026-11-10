@@ -35,6 +35,7 @@ The stack parameter **KeepDataOnDelete** does the same from AWS. It is `true` un
 | CoderHelm's functions, roles, queues, API, CloudFront, dashboard, schedules, alarms, the permissions boundary, the install helper | deleted | deleted |
 | The release bucket (`coderhelm-<name>-release-<account>`) and the install guide's progress bucket | emptied and deleted | emptied and deleted |
 | Log groups the stack declares (every function's) | deleted | deleted |
+| The access log bucket (`coderhelm-<name>-logs-<account>`: S3 and CloudFront access logs, 90 days) | writes stopped, emptied and deleted | writes stopped, emptied and deleted |
 | Certificates the updater requested for your own domain | deleted | deleted |
 | DNS records you added for the domain (the certificate's validation CNAME and the address CNAME) | kept: CoderHelm never changes your DNS. The uninstall's log names them so you can remove them | kept, the same |
 | DynamoDB tables | kept | deleted |

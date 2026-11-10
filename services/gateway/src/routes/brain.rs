@@ -1924,10 +1924,7 @@ pub async fn brain_stream(
     >,
     (StatusCode, Json<Value>),
 > {
-    let token = headers
-        .get("authorization")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.strip_prefix("Bearer "))
+    let token = crate::auth::jwt::stream_token(&headers)
         .ok_or_else(|| fail(StatusCode::UNAUTHORIZED, "Sign in again."))?;
     let mut claims = crate::auth::jwt::validate_scoped_token(
         token,

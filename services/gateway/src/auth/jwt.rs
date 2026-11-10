@@ -224,9 +224,64 @@ pub fn validate_token(token: &str, secret: &str) -> Result<Claims, jsonwebtoken:
     Ok(token_data.claims)
 }
 
+/// Where the dashboard puts a stream token when the stream goes through the
+/// install's own CloudFront. CloudFront signs every request to the streaming
+/// function's URL (origin access control, the URL takes only signed calls),
+/// and that signature is the request's `Authorization` header, so a token
+/// can't travel there.
+pub const STREAM_TOKEN_HEADER: &str = "x-coderhelm-stream-token";
+
+/// The short-lived token of a stream request (`/api/plans/chat/stream`,
+/// `/api/brain/stream`): [`STREAM_TOKEN_HEADER`], else `Authorization: Bearer`
+/// (a stream answered straight from the function URL, as CoderHelm's own
+/// deployment does). The token itself is checked by the route.
+pub fn stream_token(headers: &axum::http::HeaderMap) -> Option<&str> {
+    if let Some(t) = headers
+        .get(STREAM_TOKEN_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+    {
+        return Some(t);
+    }
+    headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_stream_token_comes_from_its_header_or_a_bearer_authorization() {
+        use axum::http::{HeaderMap, HeaderValue};
+        let mut h = HeaderMap::new();
+        assert_eq!(stream_token(&h), None);
+        h.insert("authorization", HeaderValue::from_static("Bearer abc"));
+        assert_eq!(stream_token(&h), Some("abc"));
+        // Through CloudFront the Authorization header is CloudFront's own
+        // signature: the token is in its header, which wins.
+        h.insert(
+            "authorization",
+            HeaderValue::from_static(
+                "AWS4-HMAC-SHA256 Credential=AKIA/20261110/us-east-1/lambda/aws4_request",
+            ),
+        );
+        assert_eq!(stream_token(&h), None);
+        h.insert(STREAM_TOKEN_HEADER, HeaderValue::from_static("xyz"));
+        assert_eq!(stream_token(&h), Some("xyz"));
+        // An empty header doesn't hide a bearer token.
+        let mut e = HeaderMap::new();
+        e.insert(STREAM_TOKEN_HEADER, HeaderValue::from_static(""));
+        e.insert("authorization", HeaderValue::from_static("Bearer abc"));
+        assert_eq!(stream_token(&e), Some("abc"));
+        e.insert("authorization", HeaderValue::from_static("Bearer "));
+        assert_eq!(stream_token(&e), None);
+    }
 
     #[test]
     fn test_roundtrip_jwt() {

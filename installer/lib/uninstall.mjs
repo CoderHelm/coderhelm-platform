@@ -185,7 +185,7 @@ export async function discover(ctx, base, { mode = "keep", installStatus = "", o
   const bucketNames = new Set(buckets.map((b) => b.Name));
   // S3 names carry no region: the stacks' own buckets only when they are in this region.
   const want = [...inv.ids.map((id) => [`${P}-assets-${id}-${A}`, "bucket"])];
-  for (const [name, kind] of [[`${P}-dashboard-${A}`, "bucket"], [`${P}-sandbox-${A}`, "bucket"], [`${P}-data-${A}`, "data bucket"]]) {
+  for (const [name, kind] of [[`${P}-dashboard-${A}`, "bucket"], [`${P}-sandbox-${A}`, "bucket"], [`${P}-logs-${A}`, "bucket"], [`${P}-data-${A}`, "data bucket"]]) {
     if (!bucketNames.has(name)) continue;
     const loc = await aws.read("s3api", "get-bucket-location", ["--bucket", name]);
     if ((loc?.LocationConstraint || "us-east-1") === region) want.push([name, kind]);

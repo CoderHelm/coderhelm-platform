@@ -265,13 +265,19 @@ pub async fn signup(
 
 const WEAK_PASSWORD: &str = "Password must contain at least 8 characters, including uppercase, lowercase, a number, and a special character";
 
-/// The user pool's password rules (infra: at least 8 characters, an upper-case and a
-/// lower-case letter, and a digit).
+/// The characters Cognito counts as special in a password (its password policy).
+const PASSWORD_SYMBOLS: &str = "^$*.[]{}()?\"!@#%&/\\,><':;|_~`=+-";
+
+/// The user pool's password rules (infra/lib/api-stack.ts: at least 8 characters, an
+/// upper-case and a lower-case letter, a digit and a symbol).
 pub fn password_fits(p: &str) -> bool {
+    let inner = p.trim();
     p.chars().count() >= 8
         && p.chars().any(|c| c.is_uppercase())
         && p.chars().any(|c| c.is_lowercase())
         && p.chars().any(|c| c.is_ascii_digit())
+        // A space counts too, but not a leading or trailing one (Cognito's rule).
+        && (p.chars().any(|c| PASSWORD_SYMBOLS.contains(c)) || inner.contains(' '))
 }
 
 /// A self-hosted install's sign-up answer, the same for every email: invited or allowed (a
@@ -3536,8 +3542,16 @@ mod forgot_tests {
 
     #[test]
     fn passwords_are_checked_before_anyone_is_looked_up() {
-        assert!(password_fits("Acme2026x"));
-        for p in ["acme2026x", "ACME2026X", "AcmeAcmeX", "Ac2"] {
+        assert!(password_fits("Acme2026x!"));
+        assert!(password_fits("Acme 2026x"));
+        for p in [
+            "acme2026x!",
+            "ACME2026X!",
+            "AcmeAcmeX!",
+            "Ac2!",
+            "Acme2026x",
+            " Acme2026x ",
+        ] {
             assert!(!password_fits(p), "{p}");
         }
     }

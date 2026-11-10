@@ -40,6 +40,8 @@ export class EmailStack extends cdk.Stack {
       configurationSetName: `${prefix}-emails`,
       reputationMetrics: true,
       sendingEnabled: true,
+      // Never in the clear: a receiving server without TLS gets no mail.
+      tlsPolicy: ses.ConfigurationSetTlsPolicy.REQUIRE,
     });
     // A self-hosted install counts its own email by kind (Deliveries): every
     // send, delivery, bounce, complaint and rejection goes to its worker

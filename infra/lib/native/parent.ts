@@ -323,9 +323,16 @@ export function buildParent(input: ParentInput): Json {
   R.DeployBoundary = pinned.DeployBoundary;
   R.AssetsBucket = {
     Type: "AWS::S3::Bucket",
-    Properties: { BucketName: sub(ASSETS_BUCKET_NAME), ...s3Secure, Tags: [{ Key: INSTALL_TAG, Value: sub("coderhelm-${Stage}") }] },
+    Properties: {
+      BucketName: sub(ASSETS_BUCKET_NAME),
+      ...s3Secure,
+      // The helper copies each file whole; nothing should keep half an upload.
+      LifecycleConfiguration: { Rules: [{ Id: "abort-uploads", Status: "Enabled", AbortIncompleteMultipartUpload: { DaysAfterInitiation: 1 } }] },
+      Tags: [{ Key: INSTALL_TAG, Value: sub("coderhelm-${Stage}") }],
+    },
   };
-  // Only the helper may write or delete the release files (it checks each one).
+  // Only the helper may write or delete the release files (it checks each one),
+  // and only over TLS.
   R.AssetsBucketPolicy = {
     Type: "AWS::S3::BucketPolicy",
     Properties: {
@@ -337,6 +344,10 @@ export function buildParent(input: ParentInput): Json {
           Action: ["s3:PutObject", "s3:DeleteObject", "s3:DeleteObjectVersion", "s3:PutObjectAcl"],
           Resource: { "Fn::Sub": "${AssetsBucket.Arn}/*" },
           Condition: { ArnNotEquals: { "aws:PrincipalArn": { "Fn::GetAtt": ["HelperRole", "Arn"] } } },
+        }, {
+          Sid: "TlsOnly", Effect: "Deny", Principal: "*", Action: "s3:*",
+          Resource: [{ "Fn::GetAtt": ["AssetsBucket", "Arn"] }, { "Fn::Sub": "${AssetsBucket.Arn}/*" }],
+          Condition: { Bool: { "aws:SecureTransport": "false" } },
         }],
       },
     },

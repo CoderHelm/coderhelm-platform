@@ -88,7 +88,9 @@ export class ApiStack extends cdk.Stack {
         requireUppercase: true,
         requireLowercase: true,
         requireDigits: true,
-        requireSymbols: false,
+        // The gateway checks the same before it calls Cognito (routes/auth.rs password_fits).
+        requireSymbols: true,
+        tempPasswordValidity: cdk.Duration.days(7),
       },
       mfa: cognito.Mfa.OPTIONAL,
       mfaSecondFactor: { sms: false, otp: true },
@@ -105,6 +107,10 @@ export class ApiStack extends cdk.Stack {
               : {}),
           })
         : cognito.UserPoolEmail.withCognito(),
+      // Deleting the pool takes turning this off first: the uninstaller and a
+      // native install's helper do (KeepDataOnDelete=false); a native install
+      // follows KeepDataOnDelete (native/package.ts).
+      deletionProtection: cfg.retainData,
       removalPolicy: cfg.retainData
         ? cdk.RemovalPolicy.RETAIN
         : cdk.RemovalPolicy.DESTROY,
@@ -802,7 +808,7 @@ export class ApiStack extends cdk.Stack {
 
     this.mcpProxyFunction = new lambda.Function(this, "McpProxy", {
       functionName: `${prefix}-mcp-proxy`,
-      runtime: lambda.Runtime.NODEJS_20_X,
+      runtime: lambda.Runtime.NODEJS_22_X,
       architecture: lambda.Architecture.ARM_64,
       handler: "handler.handler",
       // MCP_PROXY_DIR: a prebuilt proxy (release artifact) instead of a local build.

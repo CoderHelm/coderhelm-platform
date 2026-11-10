@@ -4,7 +4,8 @@
  * One CloudFront distribution serves the dashboard from S3 and forwards the
  * service paths to their backends, all on one hostname:
  *
- *   /api/plans/chat/stream /api/brain/stream   → the streaming function URL (SSE)
+ *   /api/plans/chat/stream /api/brain/stream   → the streaming function URL (SSE),
+ *       signed by CloudFront (origin access control; the URL takes only signed calls)
  *   /api/* /auth/* /webhooks/* /email/* /integrations/* /mcp /oauth/*   → the HTTP API
  *   everything else          → the dashboard (static export in S3)
  *
@@ -29,6 +30,7 @@ import * as ssm from "aws-cdk-lib/aws-ssm";
 import { Construct } from "constructs";
 import { ResolvedConfig } from "./config";
 import { releaseStamp } from "./release";
+import { logAccessTo, logBucketOf } from "./storage-stack";
 
 /**
  * Paths the HTTP API serves (each also matches its sub-paths). Includes the
@@ -55,6 +57,12 @@ export const API_PATHS = [
 export const STREAM_PATH = "/api/plans/chat/stream";
 /** Chat's answer stream: answers that read code run past the HTTP API's 30-second limit. */
 export const BRAIN_STREAM_PATH = "/api/brain/stream";
+
+/**
+ * The lowest TLS version and ciphers viewers may use: CloudFront's newest
+ * TLS 1.2 policy (TLS 1.2 with AES-GCM and ChaCha20 only, and TLS 1.3).
+ */
+export const VIEWER_TLS_POLICY = cloudfront.SecurityPolicyProtocol.TLS_V1_2_2025;
 
 /** Hashed build files: cached for a year. */
 const ASSET_CACHE_CONTROL = "public, max-age=31536000, immutable";
@@ -162,7 +170,10 @@ export class WebStack extends cdk.Stack {
       // The build is re-uploaded on every deploy, so it never needs keeping.
       removalPolicy: cdk.RemovalPolicy.DESTROY,
       autoDeleteObjects: true,
+      lifecycleRules: [{ id: "abort-uploads", abortIncompleteMultipartUploadAfter: cdk.Duration.days(1) }],
     });
+    // Into the storage stack's log bucket (this stack depends on it: app.ts).
+    logAccessTo(bucket, cfg, "dashboard");
 
     // --- Certificate and DNS (custom domain only) ---
     let certificate: acm.ICertificate | undefined;
@@ -178,10 +189,13 @@ export class WebStack extends cdk.Stack {
       protocolPolicy: cloudfront.OriginProtocolPolicy.HTTPS_ONLY,
       originSslProtocols: [cloudfront.OriginSslPolicy.TLS_V1_2],
     });
-    const streamDomain = cdk.Fn.select(2, cdk.Fn.split("/", props.streamingFunctionUrl.url));
-    const streamOrigin = new origins.HttpOrigin(streamDomain, {
-      protocolPolicy: cloudfront.OriginProtocolPolicy.HTTPS_ONLY,
-      originSslProtocols: [cloudfront.OriginSslPolicy.TLS_V1_2],
+    // The chat streams: the function URL takes only calls signed with AWS
+    // credentials (AWS_IAM, streaming-stack.ts), and CloudFront signs each one
+    // through origin access control. The dashboard sends the stream token in
+    // its own header (CloudFront's signature is the Authorization header) and
+    // the body's SHA-256 in x-amz-content-sha256, which Lambda requires of a
+    // signed POST. Response streaming passes through as before.
+    const streamOrigin = origins.FunctionUrlOrigin.withOriginAccessControl(props.streamingFunctionUrl, {
       readTimeout: cdk.Duration.seconds(60),
     });
     const passThrough: Omit<cloudfront.BehaviorOptions, "origin"> = {
@@ -231,7 +245,11 @@ export class WebStack extends cdk.Stack {
       ...(domain && certificate ? { domainNames: [domain.hostname], certificate } : {}),
       defaultRootObject: "index.html",
       httpVersion: cloudfront.HttpVersion.HTTP2_AND_3,
-      minimumProtocolVersion: cloudfront.SecurityPolicyProtocol.TLS_V1_2_2021,
+      minimumProtocolVersion: VIEWER_TLS_POLICY,
+      // Standard logs, kept 90 days in the storage stack's log bucket.
+      enableLogging: true,
+      logBucket: logBucketOf(this, cfg),
+      logFilePrefix: "cloudfront/",
       defaultBehavior: {
         // List too, so a file that isn't there is a 404 (not S3's 403),
         // which the error response below turns into the install's own page.
@@ -255,6 +273,16 @@ export class WebStack extends cdk.Stack {
       errorResponses: [
         { httpStatus: 404, responseHttpStatus: 404, responsePagePath: "/_errors/404.html", ttl: cdk.Duration.seconds(60) },
       ],
+    });
+
+    // Origin access control signs the stream's calls as CloudFront; Lambda
+    // needs both of these for a function URL (FunctionUrlOrigin adds the first).
+    new lambda.CfnPermission(this, "StreamInvokeFromDistribution", {
+      action: "lambda:InvokeFunction",
+      functionName: props.streamingFunctionUrl.functionArn,
+      principal: "cloudfront.amazonaws.com",
+      sourceArn: `arn:${this.partition}:cloudfront::${this.account}:distribution/${this.distribution.distributionId}`,
+      invokedViaFunctionUrl: true,
     });
 
     let hostname = domain ? domain.hostname : this.distribution.distributionDomainName;
@@ -369,7 +397,7 @@ export class WebStack extends cdk.Stack {
       "DistributionConfig.ViewerCertificate",
       cdk.Fn.conditionIf(
         has.logicalId,
-        { AcmCertificateArn: cert.valueAsString, SslSupportMethod: "sni-only", MinimumProtocolVersion: "TLSv1.2_2021" },
+        { AcmCertificateArn: cert.valueAsString, SslSupportMethod: "sni-only", MinimumProtocolVersion: VIEWER_TLS_POLICY },
         cdk.Aws.NO_VALUE,
       ),
     );

@@ -88,6 +88,8 @@ export class MailRelay extends Construct {
       reputationMetrics: true,
       sendingEnabled: true,
       suppressionReasons: ses.SuppressionReasons.BOUNCES_AND_COMPLAINTS,
+      // Never in the clear: a receiving server without TLS gets no mail.
+      tlsPolicy: ses.ConfigurationSetTlsPolicy.REQUIRE,
     });
     configSet.addEventDestination("BouncesAndComplaints", {
       destination: ses.EventDestination.snsTopic(this.topic),
