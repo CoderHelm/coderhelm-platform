@@ -1,0 +1,95 @@
+{
+  "description": "The commit was approved by a review that raised no test finding. A re-review asked on the same commit finds the required test missing. A rule the repository requires can't stand approved: the verdict changes on the same commit, and the review says it changed by rule.",
+  "steps": [
+    {
+      "require_tests": true
+    },
+    {
+      "push": {
+        "head": "c1a2b3c",
+        "changed": {
+          "apps/cms/plugins/uploads/upload-handler.ts": [
+            1,
+            2,
+            3,
+            4,
+            5,
+            6,
+            7,
+            8,
+            9,
+            10
+          ]
+        }
+      }
+    },
+    {
+      "review": {
+        "trigger": "labeled",
+        "dedup_key": "head#c1a2b3c",
+        "model": {
+          "verdict": "APPROVE",
+          "summary": "x",
+          "findings": []
+        }
+      }
+    },
+    {
+      "claims_expire": {}
+    },
+    {
+      "comment": {
+        "by": "dev-a",
+        "text": "@coderhelm re-review"
+      }
+    },
+    {
+      "review": {
+        "trigger": "rerequest",
+        "dedup_key": "rerequest#1",
+        "model": {
+          "verdict": "APPROVE",
+          "summary": "x",
+          "findings": [
+            {
+              "file": "apps/cms/plugins/uploads/upload-handler.ts",
+              "line": 2,
+              "severity": "medium",
+              "category": "tests",
+              "evidence": "verified-defect",
+              "optional": true,
+              "title": "sha256Hex check isn't kept as a test",
+              "body": "Verification step 2 compared sha256Hex with Node's createHash by hand. apps/cms has no test runner (no vitest in its package.json), so nothing keeps that check. When the package gets tests, a small case hashing a sample body that includes non-ASCII characters, compared with createHash('sha256').update(body, 'utf8').digest('hex'), would lock in the exact header CloudFront needs. This is a suggestion only."
+            }
+          ]
+        }
+      }
+    }
+  ],
+  "expect": {
+    "formal": [
+      [
+        "c1a2b3c",
+        "APPROVE"
+      ],
+      [
+        "c1a2b3c",
+        "REQUEST_CHANGES"
+      ]
+    ],
+    "body_contains": [
+      [
+        1,
+        "Changed my verdict"
+      ],
+      [
+        1,
+        "blocks whatever an earlier review said"
+      ],
+      [
+        1,
+        "(Blocking (required: tests))"
+      ]
+    ]
+  }
+}

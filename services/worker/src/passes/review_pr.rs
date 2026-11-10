@@ -3149,12 +3149,26 @@ async fn run_once(
         );
     }
 
-    // 3) Map to inline comments (only diff-anchored lines) + summary bullets.
-    // With "Require tests" on, a missing/stale-tests finding blocks the merge
-    // whatever severity the model gave it (it sometimes rated them medium/low
-    // and the PR was approved without the tests).
-    if cfg.require_tests {
-        review_agent::enforce_required_tests(&mut findings);
+    // 3) What the repository requires: with "Require tests" on, a missing or
+    // stale test blocks unless a checked exemption applies (a package without
+    // a test runner is not one), and a finding that breaks a rule the team
+    // wrote as required (MUST, NEVER, ...) blocks. Nothing after this makes
+    // such a finding a note (`review_rules::mandatory`).
+    let rules_policy = super::review_rules::Policy::new(cfg.require_tests, &team_instructions);
+    let changed_list: Vec<String> = {
+        let mut v: Vec<String> = changed_files(&compare).into_iter().collect();
+        v.sort();
+        v
+    };
+    let ruled = super::review_rules::apply(&mut findings, &rules_policy, &changed_list);
+    if ruled != Default::default() {
+        info!(
+            pr = msg.pr_number,
+            required = ruled.required,
+            exempt = ruled.exempt,
+            refused_exemptions = ruled.refused,
+            "Findings held to the repository's required rules"
+        );
     }
     review_agent::enforce_source_data_override(&mut findings);
     // A request to test something by hand is a note, never a block.
@@ -3369,7 +3383,17 @@ async fn run_once(
     // holdings as notes and its assumption written down.
     let mut review_judged: Option<super::stop_judge::Judged> = None;
     let mut judge_note = String::new();
-    if !self_authored && final_verdict.event() == "REQUEST_CHANGES" {
+    // What blocks by rule (a required rule, a failing check, a critical path
+    // with no proof) isn't a judgment: no judge lifts it, so a verdict held
+    // only by rule isn't put to one.
+    let only_by_rule = final_verdict.holding().iter().all(|h| {
+        matches!(
+            h.kind,
+            super::review_verdict::HoldKind::Required
+                | super::review_verdict::HoldKind::Verification
+        )
+    });
+    if !self_authored && final_verdict.event() == "REQUEST_CHANGES" && !only_by_rule {
         let picture = block_picture(
             title,
             pr_body,
@@ -3393,18 +3417,42 @@ async fn run_once(
         .await;
         if let Some(a) = judged.assumption() {
             info!(pr = msg.pr_number, head = %head_sha, "Stop judge: approve with notes instead of requesting changes");
-            for f in findings.iter_mut().filter(|f| f.holds_merge()) {
+            for f in findings
+                .iter_mut()
+                .filter(|f| f.holds_merge() && super::review_rules::mandatory(f).is_none())
+            {
                 super::review_policy::demote(
                     f,
                     "FYI, not a block: on the whole picture this is not a named correctness, \
                      security or data-loss problem to hold the merge on.",
                 );
             }
-            judge_note = format!(
-                "\n\n**FYI:** on the whole picture nothing here holds the merge. Assumed: {}",
-                a.trim()
-            );
-            final_verdict = super::review_verdict::Verdict::approve();
+            // What blocks by rule still holds; the rest is the judge's call.
+            let by_rule: Vec<super::review_verdict::Holding> = final_verdict
+                .holding()
+                .iter()
+                .filter(|h| {
+                    matches!(
+                        h.kind,
+                        super::review_verdict::HoldKind::Required
+                            | super::review_verdict::HoldKind::Verification
+                    )
+                })
+                .cloned()
+                .collect();
+            judge_note = if by_rule.is_empty() {
+                format!(
+                    "\n\n**FYI:** on the whole picture nothing here holds the merge. Assumed: {}",
+                    a.trim()
+                )
+            } else {
+                format!(
+                    "\n\n**FYI:** apart from what blocks by rule, nothing here holds the merge. \
+                     Assumed: {}",
+                    a.trim()
+                )
+            };
+            final_verdict = super::review_verdict::Verdict::from_holding(by_rule);
         }
         review_judged = Some(judged);
     }
@@ -3474,6 +3522,8 @@ async fn run_once(
     // Inline comments from the findings as they stand after every rule, so a
     // demoted finding is posted as a note.
     let hunks = review_agent::right_line_hunks(&compare);
+    // Blockers first, everywhere the findings are listed.
+    findings.sort_by_key(|f| super::review_severity::tier(f) as u8);
     let postable = review_agent::to_postable(&findings, &changed, &hunks);
     // The comments the review keeps close its activity.
     for f in &findings {
@@ -3509,6 +3559,22 @@ async fn run_once(
             + (unconfirmed.len() - blocking_facts)
             + held_late.len(),
     );
+    // One line naming what decided the verdict, on the review and its record.
+    let verdict_why = {
+        use super::review_severity::{tier, Tier};
+        let should_fix = findings
+            .iter()
+            .filter(|f| tier(f) == Tier::ShouldFix)
+            .count();
+        let suggestions = findings
+            .iter()
+            .filter(|f| tier(f) == Tier::Suggestion)
+            .count()
+            + (unconfirmed.len() - blocking_facts)
+            + held_late.len();
+        final_verdict.why(should_fix, suggestions)
+    };
+    let verdict_line = format!("{verdict_line}\n\n_{verdict_why}_");
     let summary = if output.summary.trim().is_empty() {
         "Automated review complete.".to_string()
     } else {
@@ -3822,6 +3888,7 @@ async fn run_once(
         &record_sk,
         &rests_on,
         &final_verdict.names(),
+        &verdict_why,
     )
     .await;
     live_job
@@ -5052,6 +5119,10 @@ fn findings_record(findings: &[review_agent::Finding]) -> String {
                 "model_severity": f.model_severity.as_deref().unwrap_or(&f.severity).trim().to_ascii_lowercase(),
                 "kind": kind,
                 "blocks": f.holds_merge(),
+                "tier": super::review_severity::tier(f).as_str(),
+                "category": f.category,
+                "required": f.required.as_deref().unwrap_or(""),
+                "critical_path": f.critical_path.as_deref().unwrap_or(""),
                 "class_reason": super::review_severity::classify(f).reason(),
                 "severity_checked": check.is_some(),
                 "severity_check_reason": check.map(|c| c.reason.as_str()).unwrap_or(""),
@@ -5075,6 +5146,7 @@ async fn note_review_state(
     record_sk: &str,
     rests_on: &super::review_fingerprint::Fingerprint,
     holding: &[String],
+    verdict_reason: &str,
 ) {
     let as_json = |r: serde_json::Result<String>| r.unwrap_or_default();
     let upd = state
@@ -5083,9 +5155,10 @@ async fn note_review_state(
         .table_name(&state.config.settings_table_name)
         .key("pk", attr_s(team_id))
         .key("sk", attr_s(record_sk))
-        .update_expression("SET fingerprint = :f, holding = :h")
+        .update_expression("SET fingerprint = :f, holding = :h, verdict_reason = :w")
         .expression_attribute_values(":f", attr_s(&as_json(serde_json::to_string(rests_on))))
         .expression_attribute_values(":h", attr_s(&as_json(serde_json::to_string(holding))))
+        .expression_attribute_values(":w", attr_s(verdict_reason))
         .send()
         .await;
     if let Err(e) = upd {
@@ -5395,7 +5468,12 @@ fn settled_prior_threads<'a>(
     let mut seen = std::collections::HashSet::new();
     statuses
         .iter()
-        .filter(|s| s.is_settled() && s.index < prior.len() && seen.insert(s.index))
+        .filter(|s| {
+            s.is_settled()
+                && s.index < prior.len()
+                && super::review_rules::settles(&prior[s.index].body, &s.status)
+                && seen.insert(s.index)
+        })
         .map(|s| prior[s.index])
         .collect()
 }
@@ -5982,14 +6060,23 @@ mod verdict_tests {
             decide_verdict(std::slice::from_ref(&nit), 0, &[], false),
             "APPROVE"
         );
-        // A required test is a Suggestion on the approval; a failed
-        // verification run (the change's own tests failing) still blocks.
+        // A required test missing blocks, a nit alongside it doesn't; a
+        // failed verification run (the change's own tests failing) blocks.
         let mut tests = Finding {
+            file: "src/a.ts".into(),
             category: "tests".into(),
             ..Default::default()
         };
-        super::review_agent::enforce_required_tests(std::slice::from_mut(&mut tests));
-        assert_eq!(decide_verdict(&[nit, tests], 0, &[], false), "APPROVE");
+        crate::passes::review_rules::apply(
+            std::slice::from_mut(&mut tests),
+            &crate::passes::review_rules::Policy::new(true, ""),
+            &["src/a.ts".to_string()],
+        );
+        assert_eq!(
+            decide_verdict(&[nit.clone(), tests], 0, &[], false),
+            "REQUEST_CHANGES"
+        );
+        assert_eq!(decide_verdict(&[nit], 0, &[], false), "APPROVE");
         assert_eq!(decide_verdict(&[], 0, &[], true), "REQUEST_CHANGES");
     }
 

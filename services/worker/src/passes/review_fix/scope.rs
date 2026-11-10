@@ -13,8 +13,9 @@ pub const SYSTEM: &str = "You check that a fix for pull request review comments 
 what the comments ask for. You get the review comments (each thread's request, with the file \
 and line it is on) and the fix as numbered hunks. For every hunk, say whether a comment asked \
 for it. \"requested\": the hunk does what a comment asks, or is needed for it to work (an \
-import, a test for the requested change, a call site the requested change forces to change, a \
-fix for a CI failure listed with the comments). \"out_of_scope\": nothing in the comments asks \
+import, a test for the requested change, the test runner, its config, its dev dependency and \
+`test` script when a comment asks for a test in a package without one, a call site the \
+requested change forces to change, a fix for a CI failure listed with the comments). \"out_of_scope\": nothing in the comments asks \
 for it: a similar line elsewhere the comment did not name, the same change applied to \
 neighbouring code, a refactor, a rename, reformatting, or a cleanup. When a comment names one \
 place, changes to other places that look the same are out of scope unless the comment says to \

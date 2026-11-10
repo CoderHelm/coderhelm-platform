@@ -1,0 +1,82 @@
+{
+  "description": "Require tests on and a team rule written as required, but the review found only a naming nit, a stale comment and a should-fix description mismatch. Nits never block: the review approves with three notes.",
+  "steps": [
+    {
+      "require_tests": true
+    },
+    {
+      "team_rules": "- Any dependency change MUST include a matching lockfile update.\n- Keep the PR description in step with the diff."
+    },
+    {
+      "push": {
+        "head": "a9a8a7a",
+        "changed": {
+          "src/cards.tsx": [
+            10,
+            11,
+            12
+          ]
+        }
+      }
+    },
+    {
+      "review": {
+        "trigger": "synchronize",
+        "dedup_key": "head#a9a8a7a",
+        "model": {
+          "verdict": "APPROVE",
+          "summary": "x",
+          "findings": [
+            {
+              "file": "src/cards.tsx",
+              "line": 10,
+              "severity": "nit",
+              "category": "naming",
+              "evidence": "verified-defect",
+              "title": "Rename c to card",
+              "body": "A one-letter name."
+            },
+            {
+              "file": "src/cards.tsx",
+              "line": 11,
+              "severity": "low",
+              "category": "docs",
+              "evidence": "verified-defect",
+              "title": "Comment tells the bug's history",
+              "body": "State the invariant instead."
+            },
+            {
+              "file": "src/cards.tsx",
+              "line": 12,
+              "severity": "medium",
+              "category": "convention",
+              "evidence": "verified-defect",
+              "team_rule": "Keep the PR description in step with the diff.",
+              "title": "Description still lists the old prop",
+              "body": "The Changes section names `compact`, which this push removed."
+            }
+          ]
+        }
+      }
+    }
+  ],
+  "expect": {
+    "formal": [
+      [
+        "a9a8a7a",
+        "APPROVE"
+      ]
+    ],
+    "body_contains": [
+      [
+        0,
+        "Rename c to card (Nit)"
+      ],
+      [
+        0,
+        "Description still lists the old prop (Should fix)"
+      ]
+    ],
+    "last_notes": 3
+  }
+}

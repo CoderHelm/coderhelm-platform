@@ -60,6 +60,8 @@ enum Step {
     BaseFailing(Vec<String>),
     /// The team's written rules (repository and team instructions).
     TeamRules(String),
+    /// The repository's "Require tests" setting from now on.
+    RequireTests(bool),
     /// A person writes on the PR.
     Comment { by: String, text: String },
     /// Claims older than their window are gone.
@@ -97,6 +99,9 @@ struct Expect {
     /// (index of a formal review, text its body must contain).
     #[serde(default)]
     body_contains: Vec<(usize, String)>,
+    /// (index of a formal review, text its body must not contain).
+    #[serde(default)]
+    body_lacks: Vec<(usize, String)>,
     /// Notes (findings that don't hold the merge) in the last formal review.
     #[serde(default)]
     last_notes: Option<usize>,
@@ -115,6 +120,8 @@ struct Thread {
     file: String,
     line: u64,
     holds: bool,
+    /// Posted for a required rule: only a fix settles it.
+    required: bool,
     open: bool,
 }
 
@@ -134,6 +141,7 @@ struct Sim {
     pushes: Vec<(String, HashMap<String, HashSet<u64>>)>,
     base_failing: Vec<String>,
     team_rules: String,
+    require_tests: bool,
     comments: Vec<Value>,
     /// Conditional-write claims held.
     claims: HashSet<String>,
@@ -221,6 +229,21 @@ impl Sim {
         let out: ReviewOutput = serde_json::from_value(model).expect("model is a ReviewOutput");
         let mut findings: Vec<Finding> = out.findings.clone();
         super::review_severity::ground(&mut findings, &self.team_rules);
+        // The PR's files: every file a push changed.
+        let mut files: Vec<String> = self
+            .pushes
+            .iter()
+            .flat_map(|(_, c)| c.keys().cloned())
+            .chain(findings.iter().map(|f| f.file.clone()))
+            .filter(|f| !f.is_empty())
+            .collect();
+        files.sort();
+        files.dedup();
+        super::review_rules::apply(
+            &mut findings,
+            &super::review_rules::Policy::new(self.require_tests, &self.team_rules),
+            &files,
+        );
         review_agent::enforce_source_data_override(&mut findings);
         review_agent::enforce_manual_checks_are_notes(&mut findings);
         policy::apply_blocking_policy(&mut findings, &self.base_failing);
@@ -229,9 +252,16 @@ impl Sim {
         let mut open: Vec<usize> = (0..self.threads.len())
             .filter(|&i| self.threads[i].open)
             .collect();
-        for p in out.prior.iter().filter(|p| p.is_settled()) {
+        for p in &out.prior {
             if let Some(&i) = open.get(p.index) {
-                self.threads[i].open = false;
+                let body = if self.threads[i].required {
+                    super::review_rules::REQUIRED_MARK
+                } else {
+                    ""
+                };
+                if super::review_rules::settles(body, &p.status) {
+                    self.threads[i].open = false;
+                }
             }
         }
         open.retain(|&i| self.threads[i].open);
@@ -299,7 +329,11 @@ impl Sim {
         // Invariant (b).
         if let Some(prev) = &same_head {
             let before = super::review_verdict::binary(&prev.verdict);
-            if before != stable.verdict && changed.is_empty() {
+            let by_rule = stable
+                .note
+                .as_deref()
+                .is_some_and(|n| n.contains(policy::BY_RULE_FLIP));
+            if before != stable.verdict && changed.is_empty() && !by_rule {
                 self.violations.push(format!(
                     "the verdict on {} flipped from {before} to {} with nothing new",
                     job.head, stable.verdict
@@ -375,7 +409,14 @@ impl Sim {
                 body.push('\n');
             }
             for f in findings.iter().chain(late.held.iter()) {
-                body.push_str(&format!("- [{}] {} {}\n", f.severity, f.title, f.body));
+                let label = super::review_severity::label(f)
+                    .map(|l| l.as_str().to_string())
+                    .or_else(|| super::review_rules::mandatory_label(f))
+                    .unwrap_or_else(|| "Blocking".to_string());
+                body.push_str(&format!(
+                    "- [{}] {} ({label}) {}\n",
+                    f.severity, f.title, f.body
+                ));
             }
             // Invariant (a): jobs that ran together post one verdict per
             // head, and an automatic trigger never reviews a reviewed head.
@@ -407,6 +448,7 @@ impl Sim {
                     file: f.file.clone(),
                     line: f.line,
                     holds: f.holds_merge(),
+                    required: f.holds_merge() && f.required.is_some(),
                     open: true,
                 });
             }
@@ -444,6 +486,7 @@ impl Sim {
                 }
                 Step::BaseFailing(names) => sim.base_failing = names.clone(),
                 Step::TeamRules(text) => sim.team_rules = text.clone(),
+                Step::RequireTests(on) => sim.require_tests = *on,
                 Step::Comment { by, text } => {
                     let at = sim.tick();
                     sim.comments.push(serde_json::json!({
@@ -536,6 +579,15 @@ fn review_policy_eval_replays_every_case() {
             match sim.formal.get(*i) {
                 Some(f) if f.body.contains(text.as_str()) => {}
                 Some(f) => fail(format!("formal #{i} lacks {text:?}: {}", f.body)),
+                None => fail(format!("no formal review #{i}")),
+            }
+        }
+        for (i, text) in &case.expect.body_lacks {
+            match sim.formal.get(*i) {
+                Some(f) if f.body.contains(text.as_str()) => {
+                    fail(format!("formal #{i} still says {text:?}: {}", f.body))
+                }
+                Some(_) => {}
                 None => fail(format!("no formal review #{i}")),
             }
         }
@@ -1073,4 +1125,74 @@ mod misgraded_findings {
         let failures = replay(cases);
         assert!(failures.is_empty(), "{}", failures.join("\n"));
     }
+}
+
+/// Replays recorded reviews through the verdict rules offline, for an audit:
+/// `REVIEW_AUDIT_SAMPLE` names a JSON list of reviews, each
+/// `{"id", "require_tests", "team_rules", "changed_files", "findings": [<Finding>]}`
+/// (the model's findings as recorded), and `REVIEW_AUDIT_OUT` the file the
+/// verdicts are written to (`[{"id", "verdict", "why", "tiers": [...]}]`).
+/// No model, no network: the same rules `review_pr::run_once` applies after
+/// the model answers. Run with
+/// `REVIEW_AUDIT_SAMPLE=... REVIEW_AUDIT_OUT=... cargo test -p worker replay_audit_sample -- --ignored`.
+#[test]
+#[ignore]
+fn replay_audit_sample() {
+    #[derive(Deserialize)]
+    struct Recorded {
+        id: String,
+        #[serde(default)]
+        require_tests: bool,
+        #[serde(default)]
+        team_rules: String,
+        #[serde(default)]
+        changed_files: Vec<String>,
+        findings: Vec<Finding>,
+    }
+    let (Ok(sample), Ok(out)) = (
+        std::env::var("REVIEW_AUDIT_SAMPLE"),
+        std::env::var("REVIEW_AUDIT_OUT"),
+    ) else {
+        eprintln!("set REVIEW_AUDIT_SAMPLE and REVIEW_AUDIT_OUT");
+        return;
+    };
+    let reviews: Vec<Recorded> =
+        serde_json::from_str(&std::fs::read_to_string(&sample).expect("sample")).expect("json");
+    let mut results = Vec::new();
+    for r in reviews {
+        let mut findings = r.findings;
+        super::review_severity::ground(&mut findings, &r.team_rules);
+        super::review_rules::apply(
+            &mut findings,
+            &super::review_rules::Policy::new(r.require_tests, &r.team_rules),
+            &r.changed_files,
+        );
+        review_agent::enforce_source_data_override(&mut findings);
+        review_agent::enforce_manual_checks_are_notes(&mut findings);
+        policy::apply_blocking_policy(&mut findings, &[]);
+        super::review_severity::finalize(&mut findings);
+        let verdict = super::review_verdict::Verdict::from_holding(policy::named_holding(
+            &findings,
+            &[],
+            &[],
+            false,
+            &[],
+            &[],
+        ));
+        use super::review_severity::{tier, Tier};
+        let count = |t: Tier| findings.iter().filter(|f| tier(f) == t).count();
+        results.push(serde_json::json!({
+            "id": r.id,
+            "verdict": verdict.event(),
+            "why": verdict.why(count(Tier::ShouldFix), count(Tier::Suggestion)),
+            "tiers": findings.iter().map(|f| serde_json::json!({
+                "title": f.title,
+                "tier": tier(f).as_str(),
+                "label": super::review_severity::label(f).map(|l| l.as_str().to_string())
+                    .or_else(|| super::review_rules::mandatory_label(f)),
+                "reason": super::review_severity::classify(f).reason(),
+            })).collect::<Vec<_>>(),
+        }));
+    }
+    std::fs::write(&out, serde_json::to_string_pretty(&results).unwrap()).expect("write");
 }

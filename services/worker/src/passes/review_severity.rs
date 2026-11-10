@@ -1,14 +1,19 @@
 //! Whether a review finding holds the merge, and how a note is labeled.
 //!
-//! The owner's policy: changes are requested only for a named correctness,
-//! security or data-loss problem, with its location and evidence. Every
-//! other finding is posted on an approval as a labeled note ([`Label`]):
+//! Changes are requested for a named correctness, security or data-loss
+//! problem with its location and evidence, and for what blocks by rule
+//! whatever the model called it ([`super::review_rules::mandatory`]: a rule
+//! the repository requires, broken; a check failing on this commit; a
+//! critical path with no test or proof). Every other finding is posted on an
+//! approval as a labeled note ([`Label`]), in three tiers:
 //!
-//! - **Nit**: a style, naming or layout preference;
-//! - **Suggestion**: an optional improvement, hardening, a refactor, or a
-//!   written team rule the change doesn't follow (no defect shown);
-//! - **FYI**: a question, a concern resting on state nobody could check, an
-//!   unconfirmed fact, or a problem without a location or evidence.
+//! - **Should fix**: a written team rule not marked required, or a problem
+//!   outside the three blocking kinds (a missing test where tests aren't
+//!   required);
+//! - **Suggestion**: an optional improvement, hardening or a refactor;
+//! - **Nit** and **FYI** (suggestion tier): a style, naming or layout
+//!   preference; a question, a concern resting on state nobody could check,
+//!   an unconfirmed fact, or a problem without a location or evidence.
 //!
 //! [`classify`] decides from the finding's structured fields (basis,
 //! category, location, stated-goal miss); the model's own severity is only
@@ -175,6 +180,7 @@ pub const UNSHOWN: &str = "a concern the review couldn't show with evidence";
 /// How a note is labeled on the approval.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Label {
+    ShouldFix,
     Nit,
     Suggestion,
     Fyi,
@@ -183,10 +189,38 @@ pub enum Label {
 impl Label {
     pub fn as_str(self) -> &'static str {
         match self {
+            Label::ShouldFix => "Should fix",
             Label::Nit => "Nit",
             Label::Suggestion => "Suggestion",
             Label::Fyi => "FYI",
         }
+    }
+}
+
+/// The three tiers a finding falls in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Tier {
+    Blocking,
+    ShouldFix,
+    Suggestion,
+}
+
+impl Tier {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Tier::Blocking => "blocking",
+            Tier::ShouldFix => "should-fix",
+            Tier::Suggestion => "suggestion",
+        }
+    }
+}
+
+/// The tier of a finding, from its class.
+pub fn tier(f: &Finding) -> Tier {
+    match label(f) {
+        None => Tier::Blocking,
+        Some(Label::ShouldFix) => Tier::ShouldFix,
+        Some(_) => Tier::Suggestion,
     }
 }
 
@@ -195,9 +229,8 @@ pub fn label(f: &Finding) -> Option<Label> {
     match classify(f) {
         Class::Blocks(_) => None,
         Class::Note(r) if r == PREFERENCE => Some(Label::Nit),
-        Class::Note(r) if r == OPTIONAL || r == TEAM_RULE || r == NOT_BLOCKING_KIND => {
-            Some(Label::Suggestion)
-        }
+        Class::Note(r) if r == TEAM_RULE || r == NOT_BLOCKING_KIND => Some(Label::ShouldFix),
+        Class::Note(r) if r == OPTIONAL => Some(Label::Suggestion),
         Class::Note(_) => Some(Label::Fyi),
     }
 }
@@ -285,8 +318,26 @@ pub fn blocking_kind(f: &Finding) -> Option<common::stop_judge::BlockCategory> {
     Some(K::Correctness)
 }
 
+/// Whether the finding shows a security or data-loss defect: the model's
+/// `optional` can't make one of those a suggestion.
+fn shown_harm(f: &Finding) -> bool {
+    matches!(
+        blocking_kind(f),
+        Some(
+            common::stop_judge::BlockCategory::Security
+                | common::stop_judge::BlockCategory::DataLoss
+        )
+    ) && f.evidence() == Evidence::VerifiedDefect
+        && traces_mechanism(f)
+}
+
 /// The rubric. Pure over the finding's fields.
 pub fn classify(f: &Finding) -> Class {
+    // What blocks by rule is decided first: no policy note, question form or
+    // `optional` flag lifts it.
+    if let Some(why) = super::review_rules::mandatory(f) {
+        return Class::Blocks(why);
+    }
     if f.note_only.is_some() {
         return Class::Note("a policy made it a note");
     }
@@ -302,7 +353,7 @@ pub fn classify(f: &Finding) -> Class {
     {
         return Class::Note(PREFERENCE);
     }
-    if f.optional == Some(true) || says_optional(f) {
+    if (f.optional == Some(true) || says_optional(f)) && !shown_harm(f) {
         return Class::Note(OPTIONAL);
     }
     let judged_blocking = f.severity_check.as_ref().is_some_and(|c| c.blocking);
@@ -658,8 +709,17 @@ pub fn ground(findings: &mut [Finding], team_rules: &str) -> Grounded {
 /// Sets each finding's severity to match its class: a finding that holds the
 /// merge reads as blocking ("high" at least), a note is "medium" at most.
 /// The model's severity is kept in `model_severity` when it changes.
+///
+/// A finding that holds the merge loses the sentences that call it optional
+/// ("a suggestion only", "just a heads-up"), so its words match the verdict.
 pub fn finalize(findings: &mut [Finding]) {
     for f in findings.iter_mut() {
+        if f.holds_merge() {
+            let stripped = super::review_rules::strip_hedges(&f.body);
+            if !stripped.is_empty() {
+                f.body = stripped;
+            }
+        }
         let high = matches!(
             f.severity.trim().to_ascii_lowercase().as_str(),
             "blocking" | "high" | "critical"
@@ -685,7 +745,11 @@ pub const JUDGE_SYSTEM: &str = "You check the severity of code review findings t
      A finding BLOCKS the merge only when it is a correctness, security or data-loss problem \
      that the finding shows with evidence (the code path, a test or CI result, a data query, or \
      the documentation of the tool, API or platform involved: exit codes, status codes, vendor \
-     docs) at a location in the change. Correctness includes a PR that doesn't achieve its \
+     docs) at a location in the change. A finding also BLOCKS when it breaks a rule the team's \
+     written rules mark required (MUST, MUST NOT, NEVER, REQUIRED or ALWAYS in capitals), or \
+     when it is on a critical path (a header, hash or signature another system validates, \
+     auth, payments, data writes, a public contract, a deploy step) and nothing in the PR \
+     proves the change holds there (no test, no check). Correctness includes a PR that doesn't achieve its \
      stated goal; data loss includes lost or stale writes, cursors or watermarks that skip \
      rows, duplicates and ordering that flips between runs. Likelihood and estimated impact \
      never make a shown defect non-blocking. Everything else is a note: style and naming, \
@@ -965,13 +1029,20 @@ mod tests {
     }
 
     #[test]
-    fn goals_and_shown_security_block_a_team_rule_alone_is_a_suggestion() {
+    fn goals_and_shown_security_block_a_team_rule_alone_is_should_fix() {
         let rule = finding(
             json!({"severity": "low", "category": "convention", "team_rule": "Log a WARNING with the record id"}),
         );
         assert!(!rule.holds_merge());
         assert_eq!(classify(&rule), Class::Note(TEAM_RULE));
-        assert_eq!(label(&rule), Some(Label::Suggestion));
+        assert_eq!(label(&rule), Some(Label::ShouldFix));
+        assert_eq!(tier(&rule), Tier::ShouldFix);
+        // A shown security defect the model called optional still blocks.
+        let leak = finding(
+            json!({"severity": "low", "category": "security", "basis": "code", "optional": true,
+                   "body": "`src/a.rs:3` inlines the secret into the public bundle"}),
+        );
+        assert!(leak.holds_merge());
         // A team rule broken by a shown correctness defect blocks as that.
         let rule_bug = finding(
             json!({"severity": "low", "category": "correctness", "evidence": "verified-defect", "team_rule": "Never drop rows"}),

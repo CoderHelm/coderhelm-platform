@@ -91,6 +91,27 @@ pub struct Finding {
     /// improvement; false when the code as written is wrong.
     #[serde(default)]
     pub optional: Option<bool>,
+    /// What depends on the changed code when it is a critical path: a
+    /// header, hash or signature another system validates, auth, payments,
+    /// data writes, a public contract, a deploy step. With no `proof`, the
+    /// finding blocks ([`super::review_rules::mandatory`]).
+    #[serde(default)]
+    pub critical_path: Option<String>,
+    /// The test, check or lookup that proves the critical path holds.
+    #[serde(default)]
+    pub proof: Option<String>,
+    /// For a tests finding in a repository that requires tests: the
+    /// exemption the reviewer claims (docs, config, generated, tests only, or
+    /// a covered refactor), checked against the changed files.
+    #[serde(default)]
+    pub exemption: Option<String>,
+    /// The required rule this finding breaks, set by
+    /// [`super::review_rules::apply`], never by the model.
+    #[serde(skip)]
+    pub required: Option<String>,
+    /// The checked exemption that lifted a required rule.
+    #[serde(skip)]
+    pub exempt: Option<String>,
     /// Why a policy made this a note whatever it says (the PR tracks it,
     /// didn't cause it, a late blocker, a lookup that returned nothing). Set
     /// by [`super::review_policy::demote`].
@@ -210,7 +231,11 @@ pub fn thread_holds_merge(body: &str) -> bool {
         return false;
     }
     let first = body.lines().next().unwrap_or("");
-    if first.contains("**Nit: ") || first.contains("**FYI: ") || first.contains("**Suggestion: ") {
+    if first.contains("**Nit: ")
+        || first.contains("**FYI: ")
+        || first.contains("**Suggestion: ")
+        || first.contains("**Should fix: ")
+    {
         return false;
     }
     // Older comments: a question never holds the merge, blocking or not.
@@ -333,25 +358,38 @@ impl PriorStatus {
 
 /// Prompt section for repos that require tests with behavior changes.
 pub const REQUIRE_TESTS_SECTION: &str = "\n## Tests are required in this repo\n\
-     A PR that ADDS behavior (a feature, endpoint, UI flow, option, job) must add tests that \
-     exercise it. A PR that CHANGES or FIXES behavior must add or UPDATE the tests covering that \
-     code so they assert the new behavior (a bug fix needs a test that would have caught it). \
-     Use your tools: find where this code is already tested (search for the changed symbols / \
-     files in test directories) and check the diff touches those tests. If tests are missing or \
-     stale, add ONE finding with category \"tests\" and severity \"medium\", anchored on the \
-     main changed line, saying exactly what behavior needs a test and which existing test file \
-     to add it to or update (or where similar tests live). Ask for a test at the level the repo \
-     already tests that behavior: when a function is covered through the flow, mapper or screen \
-     test that uses it, ask for a case there, not a new test per function. Not required for: pure refactors with \
-     no behavior change, docs, comments, formatting, config/infra values, dependency bumps, and \
-     generated files.\n";
+     This repository REQUIRES tests with behavior changes: a missing or stale test BLOCKS the \
+     merge. A PR that ADDS behavior (a feature, endpoint, UI flow, option, job, helper) must add \
+     tests that exercise it. A PR that CHANGES or FIXES behavior must add or UPDATE the tests \
+     covering that code so they assert the new behavior (a bug fix needs a test that would have \
+     caught it). A check done by hand in the description is not a test: nothing keeps it. Use \
+     your tools: find where this code is already tested (search for the changed symbols / files \
+     in test directories) and check the diff touches those tests. If tests are missing or stale, \
+     add ONE finding with category \"tests\" and severity \"blocking\", anchored on the main \
+     changed line, saying exactly what behavior needs a test, the test file to add it to (or \
+     where similar tests live) and the case: its input and the result it must assert (for a \
+     hash, encoding or signature, include a non-ASCII input). Ask for a test at the level the \
+     repo already tests that behavior: when a function is covered through the flow, mapper or \
+     screen test that uses it, ask for a case there, not a new test per function. Never call it \
+     a suggestion, optional or a follow-up. NO TEST RUNNER IS NOT AN EXEMPTION: when the package \
+     has no test runner, read how the rest of the repository tests (another package's \
+     package.json `test` script, its runner and config, or the root's) and say exactly what to \
+     add to this package: the dev dependency, the `test` script, the smallest config file, the \
+     test file path and the case. EXEMPTIONS: only these lift the rule, set in `exemption` and \
+     checked against the changed files: \"docs\" (only documentation files changed; a change to \
+     code comments alone needs no tests finding at all), \
+     \"config\" (only configuration values or dependency versions), \"generated\" (only \
+     generated files), \"tests\" (only tests changed), \"refactor\" (no behavior change, with \
+     `proof` naming the existing test file that covers the code). Nothing else is one: not a \
+     missing runner, not test infrastructure to come, not a test planned for later.\n";
 
 /// The critic's note for a repo that requires tests — so a correct
 /// "tests missing" finding isn't dropped as a style nit.
 pub const REQUIRE_TESTS_CRITIC_NOTE: &str = " This repo REQUIRES tests with behavior changes: a \
      `tests` finding is REAL (keep it) when the diff adds or changes behavior and no added or \
      updated test in the diff exercises it; drop it only if the diff does include such a test or \
-     the change has no behavior effect.";
+     the change has no behavior effect. A package without a test runner is not a reason to drop \
+     it: the finding asks for the runner and the test.";
 
 /// The finding category for code that works around a source system's data.
 pub const SOURCE_DATA_OVERRIDE: &str = "source-data-override";
@@ -483,6 +521,23 @@ pub const UNCONFIRMED_RULE: &str = "UNCONFIRMED FACTS: for each fact the PR's ow
 
 /// How the reviewer checks tests of UI state (and Coderhelm's own test
 /// fixes in self-review).
+/// How the reviewer judges code on a critical path.
+pub const CRITICAL_PATH_RULE: &str = "CRITICAL PATHS: analyse critically and never hedge. When \
+     the change sits on a critical path (something another system validates or depends on: a \
+     signature, hash or header a CDN, gateway or vendor checks; auth and sessions; payments and \
+     idempotency; data writes, migrations and deletes; a public API, schema or event other code \
+     consumes; a deploy or release step), trace it: read every caller, the encoding (UTF-8 bytes \
+     vs string code units, hex vs base64, line endings), the edge cases (empty, non-ASCII, large, \
+     concurrent and retried input) and the order things deploy in (which side ships first and \
+     what breaks in between). Set `critical_path` on a finding about such code to what depends on \
+     it, in a few words (\"the x-amz-content-sha256 header CloudFront validates\"), and `proof` \
+     to the test, check or lookup that proves the change holds there (a test in the diff or the \
+     repository, a CI check, a documented contract you read). Leave `proof` empty when nothing \
+     does: a critical path with no proof blocks the merge. Never set `critical_path` on style, \
+     naming or wording. Write what you found as a fact with its consequence (\"every upload fails \
+     once signing is enforced\"); never \"a suggestion only\", \"just a heads-up\" or \
+     \"optional\" about something that can break production. ";
+
 pub const TEST_STATE_RULE: &str = "TESTS OF UI STATE: when the diff writes or changes a test \
      or page object that checks a page offers something (a way to register, buy or book), \
      check that it accepts every valid state the UI can be in for its data (open, full with a \
@@ -614,24 +669,6 @@ pub fn format_discussion(comments: &[(String, String)]) -> String {
         ));
     }
     s
-}
-
-/// "Require tests": a `tests` finding is always posted (the critic never
-/// drops it) as a Suggestion on the approval. A missing test is not a
-/// correctness, security or data-loss problem, so it never requests changes
-/// on its own; CoderHelm's own coding passes still write the tests.
-pub const REQUIRED_TESTS_NOTE: &str = "This repository asks for tests with behavior changes.";
-
-pub fn enforce_required_tests(findings: &mut [Finding]) {
-    for f in findings.iter_mut() {
-        if f.category.eq_ignore_ascii_case("tests") {
-            f.severity = "medium".to_string();
-            f.optional = Some(true);
-            if !f.body.contains(REQUIRED_TESTS_NOTE) {
-                f.body = format!("{}\n\n_{REQUIRED_TESTS_NOTE}_", f.body.trim_end());
-            }
-        }
-    }
 }
 
 impl Finding {
@@ -882,6 +919,11 @@ pub fn verdict_heading(verdict: &super::review_verdict::Verdict, notes: usize) -
     let count = |k: K| verdict.holding().iter().filter(|h| h.kind == k).count();
     let mut why: Vec<String> = Vec::new();
     for (kind, one, many) in [
+        (
+            K::Required,
+            "required item (a required rule, a failing check or an unproven critical path)",
+            "required items (required rules, failing checks or unproven critical paths)",
+        ),
         (K::Defect, "defect to fix", "defects to fix"),
         (
             K::OwnFinding,
@@ -1509,6 +1551,7 @@ pub fn review_system_prompt(
          {SOURCE_DATA_RULE}\
 {EXISTING_PATTERN_RULE}\
          {PROOF_RULE}\
+         {CRITICAL_PATH_RULE}\
          {COPY_RULE}\
          {TONE_RULE}\
          {PROGRESS_NOTES_RULE}\
@@ -1527,6 +1570,8 @@ pub fn review_system_prompt(
          \"one_shot\": <bool, true when the code runs once in production with no automatic retry or rollback>,\n    \
          \"defeats_goal\": <bool, true when the change doesn't achieve what its title or description says it does>, \"team_rule\": \"the written team or repository rule it breaks, quoted exactly\",\n    \
          \"optional\": <bool, true when the current code is correct and this is an optional improvement, false when the code as written is wrong>,\n    \
+         \"critical_path\": \"per CRITICAL PATHS: what depends on this code, in a few words; omit when it isn't on one\", \"proof\": \"the test, check or lookup that proves it holds there; empty when nothing does\",\n    \
+         \"exemption\": \"tests findings in a repo that requires tests only: docs | config | generated | tests | refactor, when one applies\",\n    \
          \"lookups\": [\"L1\"]  (ids of the live lookups the finding rests on, if any),\n    \
          \"blocks\": <bool, questions only: true when the change's correctness rests on the answer>,\n    \
          \"caused_by_diff\": <bool, false when the PR's change didn't cause it>, \"tracked\": <bool, true for a follow-up the PR tracks or work outside the repo>, \"prompted_by_reply\": <bool, true when a person's reply since your previous review made it relevant>,\n    \
@@ -1542,7 +1587,9 @@ pub fn review_system_prompt(
          moves code, or changes more than one place, gets NO suggestion; describe it in the body instead.\n\
          The verdict is always APPROVE or REQUEST_CHANGES, never a bare comment: the PR is \
          approved unless a finding that blocks under WHAT BLOCKS, a required test, a failed \
-         check, or a question or unconfirmed fact the change rests on is left; preferences, \
+         check, a critical path with no proof, or a question or unconfirmed fact the change \
+         rests on is left; the verdict is computed from your findings, so give each one its true \
+         severity and fields; preferences, \
          optional suggestions, external concerns and questions it doesn't rest on are posted \
          with the approval. So every reason to hold the merge MUST be a finding: a concern \
          written only in the summary holds nothing. Give every remaining item now, in this review: do not hold back non-blocking \
@@ -2021,9 +2068,13 @@ pub fn to_postable(
         // names its kind.
         let label = match super::review_severity::label(f) {
             Some(l) => format!("{}: ", l.as_str()),
-            None => match super::review_severity::blocking_kind(f) {
-                Some(k) => format!("Blocking ({}): ", k.as_str().replace('_', " ")),
-                None => "Blocking: ".to_string(),
+            None => match (
+                super::review_rules::mandatory_label(f),
+                super::review_severity::blocking_kind(f),
+            ) {
+                (Some(m), _) => format!("{m}: "),
+                (None, Some(k)) => format!("Blocking ({}): ", k.as_str().replace('_', " ")),
+                (None, None) => "Blocking: ".to_string(),
             },
         };
         let kind = match f.evidence() {
@@ -2045,6 +2096,8 @@ pub fn to_postable(
         }
         if !holds {
             body.push_str(&format!("\n\n{NON_BLOCKING_MARK}"));
+        } else if f.required.is_some() {
+            body.push_str(&format!("\n\n{}", super::review_rules::REQUIRED_MARK));
         }
         if let Some(sugg) = &f.suggestion {
             if collapsed {
@@ -2856,18 +2909,20 @@ mod required_tests_tests {
     }
 
     #[test]
-    fn tests_findings_become_suggestions_others_untouched() {
+    fn required_tests_findings_block_others_untouched() {
         let mut v = vec![
             f("tests", "medium"),
             f("Tests", "low"),
             f("bug", "medium"),
             f("convention", "nit"),
         ];
-        enforce_required_tests(&mut v);
-        assert!(v[0].optional == Some(true) && v[1].optional == Some(true));
-        assert!(!v[0].is_blocking() && !v[0].holds_merge() && !v[1].holds_merge());
+        let policy = super::super::review_rules::Policy::new(true, "");
+        let a = super::super::review_rules::apply(&mut v, &policy, &["src/a.rs".to_string()]);
+        assert_eq!(a.required, 2);
+        assert!(v[0].holds_merge() && v[1].holds_merge());
         assert_eq!(v[2].severity, "medium");
         assert_eq!(v[3].severity, "nit");
+        assert!(!v[3].holds_merge());
     }
 
     fn sugg(line: u64, end_line: Option<u64>, s: &str) -> Finding {
@@ -3001,15 +3056,30 @@ mod evidence_tests {
     }
 
     #[test]
-    fn required_tests_are_a_suggestion_on_the_approval() {
+    fn required_tests_block_and_say_so_on_the_comment() {
         let mut v = vec![f("tests", Some("verified-defect"))];
-        enforce_required_tests(&mut v);
-        assert!(!v[0].holds_merge());
-        assert_eq!(
-            crate::passes::review_severity::label(&v[0]),
-            Some(crate::passes::review_severity::Label::Suggestion)
+        let policy = super::super::review_rules::Policy::new(true, "");
+        let files = [v[0].file.clone()];
+        super::super::review_rules::apply(&mut v, &policy, &files);
+        assert!(v[0].holds_merge());
+        assert_eq!(crate::passes::review_severity::label(&v[0]), None);
+        assert!(v[0]
+            .body
+            .contains(super::super::review_rules::REQUIRED_TESTS_LINE));
+        let changed: HashMap<String, HashSet<u64>> =
+            [(v[0].file.clone(), [v[0].line].into_iter().collect())]
+                .into_iter()
+                .collect();
+        let p = to_postable(&v, &changed, &HashMap::new());
+        assert!(
+            p.inline[0].body.contains("**Blocking (required: tests): "),
+            "{}",
+            p.inline[0].body
         );
-        assert!(v[0].body.contains(REQUIRED_TESTS_NOTE));
+        assert!(p.inline[0]
+            .body
+            .contains(super::super::review_rules::REQUIRED_MARK));
+        assert!(thread_holds_merge(&p.inline[0].body));
     }
 
     fn lookup(

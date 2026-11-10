@@ -638,6 +638,12 @@ pub struct Review {
     /// The team standards the review was given in full ("always apply").
     #[schema(example = json!(["api-error-format"]))]
     pub applied_standards: Vec<String>,
+    /// One line on why the review approved or requested changes, naming the
+    /// findings that decided it. Empty on older reviews.
+    #[schema(
+        example = "Why changes requested: `src/auth/login.ts:42` The attempt counter is never reset (required: tests with behavior changes)."
+    )]
+    pub verdict_reason: String,
     /// The review job that wrote this review: its session
     /// (`/api/reviewer/session?id=`). Null on older reviews.
     #[schema(example = "3f2c9a1e-5b7d-4c8e-9a0b-1c2d3e4f5a6b")]
@@ -731,6 +737,7 @@ fn review_of(item: &HashMap<String, AttributeValue>, truncate_body: bool) -> Rev
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default(),
+        verdict_reason: item_str(item, "verdict_reason", ""),
         session_id: common::review_session::session_id_of(item),
     }
 }
@@ -1793,6 +1800,10 @@ mod tests {
             ("repo".into(), attr_s("example-org/web")),
             ("pr_title".into(), attr_s("Add login page")),
             (
+                "verdict_reason".into(),
+                attr_s("Why changes requested: `a.ts:3` T (a check fails on this commit)."),
+            ),
+            (
                 "findings".into(),
                 attr_s(
                     r#"[{"severity":"high","kind":"defect","blocks":true,"file":"a.ts","line":3,"title":"T","body":"B"}]"#,
@@ -1803,6 +1814,10 @@ mod tests {
         assert_eq!(full["pr_title"], "Add login page");
         assert_eq!(full["findings"][0]["file"], "a.ts");
         assert_eq!(full["findings"][0]["blocks"], true);
+        assert_eq!(
+            full["verdict_reason"],
+            "Why changes requested: `a.ts:3` T (a check fails on this commit)."
+        );
         // The list page leaves them out.
         assert!(review_item_to_json(&item, true)["findings"].is_null());
         // Older records, and unreadable ones, have none.
@@ -1810,8 +1825,10 @@ mod tests {
         assert!(review_item_to_json(&item, false)["findings"].is_null());
         item.remove("findings");
         item.remove("pr_title");
+        item.remove("verdict_reason");
         let old = review_item_to_json(&item, false);
         assert!(old["findings"].is_null());
+        assert_eq!(old["verdict_reason"], "");
         assert_eq!(old["pr_title"], "");
     }
 
