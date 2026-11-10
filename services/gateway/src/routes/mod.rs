@@ -59,6 +59,7 @@ pub mod review_lessons;
 pub mod reviewer;
 pub mod roles;
 pub mod run_answer;
+pub mod run_checks;
 pub mod run_close;
 pub mod run_search;
 pub mod run_start;

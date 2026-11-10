@@ -1249,6 +1249,15 @@ pub struct Run {
     /// is ready or closed.
     #[schema(example = json!(null))]
     pub draft_hold: Option<RunDraftHold>,
+    /// The CI checks on the head of the run's open pull request, read from
+    /// GitHub (reused for up to a minute). Null when the run has no open
+    /// pull request or GitHub can't be read.
+    #[schema(example = json!(null))]
+    pub checks: Option<super::run_checks::RunChecks>,
+    /// CoderHelm's latest review verdict on the run's pull request. Null
+    /// before any.
+    #[schema(example = json!(null))]
+    pub pr_review: Option<super::run_checks::RunPrReview>,
 }
 
 /// The public values a run's code generator was missing, as the API shows them.
@@ -1602,7 +1611,7 @@ pub async fn get_run(
     };
 
     let lookups = run_trigger::load_lookups(&state, &claims.team_id, [item]).await;
-    Ok(Json(run_of(
+    let mut run = run_of(
         item,
         &run_id,
         RunUsage {
@@ -1613,7 +1622,34 @@ pub async fn get_run(
             cost_usd,
         },
         &lookups,
-    )))
+    );
+    // The open pull request's CI checks and review verdict: never fail the
+    // run for them.
+    let primary = common::run_prs::primary(&run.prs, run.repo.as_deref().unwrap_or(""))
+        .map(|p| (p.repo.clone(), p.pr_number))
+        .filter(|(_, n)| *n > 0);
+    if let Some((repo, pr)) = primary {
+        let open = super::run_checks::open_pr(&run.prs, run.repo.as_deref().unwrap_or(""));
+        let installation_id = item
+            .get("installation_id")
+            .and_then(|v| v.as_n().ok())
+            .and_then(|n| n.parse::<u64>().ok())
+            .unwrap_or(0);
+        let checks = async {
+            match &open {
+                Some((repo, pr)) => {
+                    super::run_checks::for_run(&state, &claims.team_id, installation_id, repo, *pr)
+                        .await
+                }
+                None => None,
+            }
+        };
+        let review = super::run_checks::pr_review(&state, &claims.team_id, &repo, pr);
+        let (checks, review) = tokio::join!(checks, review);
+        run.checks = checks;
+        run.pr_review = review;
+    }
+    Ok(Json(run))
 }
 
 /// A run's token use and cost: the run's own, or summed from its traces.
@@ -1790,6 +1826,8 @@ fn run_of(
             None
         },
         draft_hold: draft_hold_of(item),
+        checks: None,
+        pr_review: None,
     }
 }
 

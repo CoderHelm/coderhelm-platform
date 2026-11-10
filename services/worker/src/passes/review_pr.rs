@@ -515,6 +515,11 @@ impl LiveJob {
         }
     }
 
+    /// The job's session id, once its session page exists.
+    fn session_id(&self) -> Option<String> {
+        self.session().opened.then(|| self.id.clone())
+    }
+
     fn session(&self) -> std::sync::MutexGuard<'_, Session> {
         self.session.lock().unwrap_or_else(|p| p.into_inner())
     }
@@ -1048,7 +1053,7 @@ pub async fn run(
                     FormalResult::Failed
                 }
             };
-            let out = post_reply(state, &msg, *reply, formal).await;
+            let out = post_reply(state, &msg, &job, *reply, formal).await;
             // A failed formal review already shows its retry.
             if formal != FormalResult::Failed {
                 job.finished(state, &msg, common::review_live::Finished::Done)
@@ -1126,6 +1131,7 @@ pub(crate) fn reply_after_formal(answer: &str, head: &str, formal: FormalResult)
 async fn post_reply(
     state: &WorkerState,
     msg: &ReviewMessage,
+    job: &LiveJob,
     reply: PendingReply,
     formal: FormalResult,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -1140,6 +1146,7 @@ async fn post_reply(
         state,
         &github,
         msg,
+        job,
         &reply.head_sha,
         &answer,
         &reply.consulted,
@@ -1156,6 +1163,7 @@ async fn send_reply(
     state: &WorkerState,
     github: &GitHubClient,
     msg: &ReviewMessage,
+    job: &LiveJob,
     head_sha: &str,
     answer: &str,
     consulted: &str,
@@ -1184,6 +1192,7 @@ async fn send_reply(
     let record_sk = store_review_record(
         state,
         msg,
+        job,
         head_sha,
         "QUESTION",
         "N/A",
@@ -2138,7 +2147,7 @@ async fn run_once(
             }
         }
         send_reply(
-            state, &github, &msg, &head_sha, &answer, &consulted, &applied, &usage,
+            state, &github, &msg, live_job, &head_sha, &answer, &consulted, &applied, &usage,
         )
         .await?;
         live_job
@@ -2175,7 +2184,18 @@ async fn run_once(
                 super::review_policy::standing_answer(&head_sha, &prev.verdict, &prev.holding);
             let mut asked = msg.clone();
             asked.reply_to_comment_id = asked_in;
-            send_reply(state, &github, &asked, &head_sha, &answer, "", &[], &usage).await?;
+            send_reply(
+                state,
+                &github,
+                &asked,
+                live_job,
+                &head_sha,
+                &answer,
+                "",
+                &[],
+                &usage,
+            )
+            .await?;
             live_job
                 .step(
                     state,
@@ -2315,6 +2335,7 @@ async fn run_once(
                         state,
                         &github,
                         &msg,
+                        live_job,
                         &head_sha,
                         &approved,
                         own_change_unchanged,
@@ -3644,6 +3665,7 @@ async fn run_once(
     let record_sk = store_review_record(
         state,
         &msg,
+        live_job,
         &head_sha,
         verdict,
         &risk,
@@ -3907,6 +3929,7 @@ async fn carry_approval(
     state: &WorkerState,
     github: &GitHubClient,
     msg: &ReviewMessage,
+    job: &LiveJob,
     head: &str,
     approved: &str,
     only_base_merged: bool,
@@ -3955,6 +3978,7 @@ async fn carry_approval(
     store_review_record(
         state,
         msg,
+        job,
         head,
         "APPROVE",
         "N/A",
@@ -4590,6 +4614,66 @@ fn head_commit_by_bot(compare: &serde_json::Value, head_sha: &str) -> bool {
         .is_some_and(|login| login.contains("coderhelm"))
 }
 
+/// What one review record holds besides the PR it is on.
+struct ReviewRecord<'a> {
+    head_sha: &'a str,
+    verdict: &'a str,
+    risk: &'a str,
+    body: &'a str,
+    posted_as: &'a str,
+    action_summary: &'a str,
+    /// RFC 3339; also the end of the sort key.
+    created_at: &'a str,
+    /// The job (session) that wrote it, when its session page exists.
+    session_id: Option<&'a str>,
+}
+
+/// Pure: a review record's sort key and item.
+fn review_record_item(
+    msg: &ReviewMessage,
+    r: &ReviewRecord<'_>,
+) -> (
+    String,
+    std::collections::HashMap<String, aws_sdk_dynamodb::types::AttributeValue>,
+) {
+    let repo = format!("{}/{}", msg.repo_owner, msg.repo_name);
+    let sk = format!("REVIEW#{repo}#{:0>6}#{}", msg.pr_number, r.created_at);
+    // Truncate the stored body so a huge review can't blow the 400KB item limit.
+    let body = common::head_tail_str(r.body, 30_000);
+    let mut item: std::collections::HashMap<String, aws_sdk_dynamodb::types::AttributeValue> = [
+        ("pk", attr_s(&msg.team_id)),
+        ("sk", attr_s(&sk)),
+        ("record_type", attr_s("review")),
+        ("repo", attr_s(&repo)),
+        ("pr_number", attr_n(msg.pr_number)),
+        ("head_sha", attr_s(r.head_sha)),
+        ("verdict", attr_s(r.verdict)),
+        ("risk", attr_s(r.risk)),
+        ("body", attr_s(&body)),
+        ("posted_as", attr_s(r.posted_as)),
+        ("trigger", attr_s(&msg.trigger)),
+        ("thumbs_up", attr_n(0)),
+        ("thumbs_down", attr_n(0)),
+        ("created_at", attr_s(r.created_at)),
+    ]
+    .into_iter()
+    .map(|(k, v)| (k.to_string(), v))
+    .collect();
+    if !r.action_summary.is_empty() {
+        item.insert(
+            "action_summary".to_string(),
+            attr_s(&common::head_tail_str(r.action_summary, 8_000)),
+        );
+    }
+    if let Some(id) = r.session_id.filter(|id| !id.is_empty()) {
+        item.insert(
+            common::review_session::REVIEW_SESSION_ID.to_string(),
+            attr_s(id),
+        );
+    }
+    (sk, item)
+}
+
 /// Persist a review record to the settings table so the dashboard can list it and
 /// ratings/actions can attach. Keyed pk=team_id, sk=REVIEW#{repo}#{pr:06}#{ts}.
 /// Best-effort: a storage failure must never break the actual GitHub review.
@@ -4600,6 +4684,7 @@ fn head_commit_by_bot(compare: &serde_json::Value, head_sha: &str) -> bool {
 async fn store_review_record(
     state: &WorkerState,
     msg: &ReviewMessage,
+    job: &LiveJob,
     head_sha: &str,
     verdict: &str,
     risk: &str,
@@ -4610,36 +4695,41 @@ async fn store_review_record(
 ) -> String {
     let created_at = chrono::Utc::now().to_rfc3339();
     let repo = format!("{}/{}", msg.repo_owner, msg.repo_name);
-    let sk = format!("REVIEW#{repo}#{:0>6}#{created_at}", msg.pr_number);
-    // Truncate the stored body so a huge review can't blow the 400KB item limit.
-    let body = common::head_tail_str(body, 30_000);
-
-    let mut put = state
+    let session_id = job.session_id();
+    let (sk, item) = review_record_item(
+        msg,
+        &ReviewRecord {
+            head_sha,
+            verdict,
+            risk,
+            body,
+            posted_as,
+            action_summary,
+            created_at: &created_at,
+            session_id: session_id.as_deref(),
+        },
+    );
+    if let Err(e) = state
         .dynamo
         .put_item()
         .table_name(&state.config.settings_table_name)
-        .item("pk", attr_s(&msg.team_id))
-        .item("sk", attr_s(&sk))
-        .item("record_type", attr_s("review"))
-        .item("repo", attr_s(&repo))
-        .item("pr_number", attr_n(msg.pr_number))
-        .item("head_sha", attr_s(head_sha))
-        .item("verdict", attr_s(verdict))
-        .item("risk", attr_s(risk))
-        .item("body", attr_s(&body))
-        .item("posted_as", attr_s(posted_as))
-        .item("trigger", attr_s(&msg.trigger))
-        .item("thumbs_up", attr_n(0))
-        .item("thumbs_down", attr_n(0))
-        .item("created_at", attr_s(&created_at));
-    if !action_summary.is_empty() {
-        put = put.item(
-            "action_summary",
-            attr_s(&common::head_tail_str(action_summary, 8_000)),
-        );
-    }
-    if let Err(e) = put.send().await {
+        .set_item(Some(item))
+        .send()
+        .await
+    {
         warn!(pr = msg.pr_number, error = %e, "Failed to persist review record (non-fatal)");
+    }
+    // The session that wrote it points back at it, for its page.
+    if let Some(id) = &session_id {
+        common::review_session::link_review(
+            &state.dynamo,
+            &state.config.settings_table_name,
+            &msg.team_id,
+            id,
+            &sk,
+            verdict != "QUESTION",
+        )
+        .await;
     }
     // A posted review is an event for the team's webhooks (an answer to a
     // question isn't a review).
@@ -5810,6 +5900,45 @@ mod failure_tests {
             description_hash: None,
             full_review: false,
         }
+    }
+
+    #[test]
+    fn a_review_record_names_the_session_that_wrote_it() {
+        let job = LiveJob::start();
+        // No session page yet: no link.
+        assert_eq!(job.session_id(), None);
+        job.session().opened = true;
+        let id = job.session_id().unwrap();
+        assert_eq!(id, job.id);
+        let record = |session_id: Option<&str>| {
+            review_record_item(
+                &msg(),
+                &ReviewRecord {
+                    head_sha: "a1b2c3d4",
+                    verdict: "APPROVE",
+                    risk: "LOW",
+                    body: "Looks right.",
+                    posted_as: "APPROVE",
+                    action_summary: "",
+                    created_at: "2026-11-10T12:00:00+00:00",
+                    session_id,
+                },
+            )
+        };
+        let (sk, item) = record(Some(&id));
+        assert_eq!(sk, "REVIEW#o/r#000042#2026-11-10T12:00:00+00:00");
+        assert_eq!(item["sk"].as_s().unwrap(), &sk);
+        assert_eq!(item["verdict"].as_s().unwrap(), "APPROVE");
+        assert!(!item.contains_key("action_summary"));
+        // What the review page reads back is the job's id.
+        assert_eq!(
+            common::review_session::session_id_of(&item).as_deref(),
+            Some(id.as_str())
+        );
+        // A job without a session page writes no link.
+        let (_, item) = record(None);
+        assert!(!item.contains_key(common::review_session::REVIEW_SESSION_ID));
+        assert_eq!(common::review_session::session_id_of(&item), None);
     }
 
     /// A review that fails (a 520 that outlasted the client's retries, an
