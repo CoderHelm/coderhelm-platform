@@ -78,7 +78,8 @@ impl Dependency {
                 "## Builds on #{n}\n\nThis pull request is stacked on #{n} (`{b}`, \"{t}\"): its \
                  base is that branch, so its diff shows only this ticket's change. {why}\n\n\
                  Merge order: #{n} first, then this one. When #{n} merges, GitHub moves this pull \
-                 request's base to #{n}'s base; CoderHelm rebases it if needed."
+                 request's base to #{n}'s base; if it then needs a rebase, comment \"rebase\" on \
+                 it and CoderHelm brings it up to date."
             )
         };
         if !self.unresolved.is_empty() {

@@ -16,6 +16,7 @@
 mod fixture;
 
 mod a_whole_branch;
+mod aa_promised_round;
 mod b_open_pr_retry;
 mod c_codegen_egress;
 mod d_echoed_markers;

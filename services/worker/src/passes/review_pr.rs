@@ -3920,7 +3920,36 @@ async fn run_once(
         //       findings stay visible for a human to judge.
         //   (2) Convergence cap — bound the self-review→fix rounds per PR. Past the
         //       cap, stop auto-fixing and hand off to a human (announced once).
-        if prev_verdict.as_deref() == Some("APPROVE") {
+        //   (3) A finished run's findings are the ready decision's: it queues one
+        //       review-fix round per head under the run's own round budget, or
+        //       names them for a person. Feeding them back here too would fix
+        //       them twice, outside that budget.
+        let finished_run = if own_open.is_empty() {
+            false
+        } else {
+            match lookup_run_by_pr(
+                state,
+                &msg.team_id,
+                &msg.repo_owner,
+                &msg.repo_name,
+                msg.pr_number,
+            )
+            .await
+            {
+                Some(run_id) => super::resume::run_finished(state, &msg.team_id, &run_id).await,
+                None => false,
+            }
+        };
+        if finished_run {
+            info!(
+                pr = msg.pr_number,
+                open = own_open.len(),
+                "Own PR of a finished run has open findings — the ready decision queues their round"
+            );
+            if msg.trigger != super::review_scope::HANDOFF_TRIGGER {
+                super::ready::request(state, &msg).await;
+            }
+        } else if prev_verdict.as_deref() == Some("APPROVE") {
             info!(
                 pr = msg.pr_number,
                 "Self-review flipped APPROVE→REQUEST_CHANGES — holding for a human, not re-fixing (hysteresis)"
