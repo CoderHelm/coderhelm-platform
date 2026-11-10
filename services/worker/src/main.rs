@@ -542,6 +542,19 @@ async fn handle_message(state: Arc<WorkerState>, message: models::WorkerMessage)
             if let Err(e) = passes::skills::sweep(&state).await {
                 error!("Skill repository sweep failed: {e:?}");
             }
+            // Stale pull requests: each repository at most once an hour.
+            let stale = passes::stale_prs::sweep(&state).await;
+            info!(
+                repos = stale.repos,
+                marked = stale.marked,
+                closed = stale.closed,
+                unstaled = stale.unstaled,
+                "Stale PR sweep done"
+            );
+        }
+        models::WorkerMessage::StalePrsPreview(msg) => {
+            info!(team_id = %msg.team_id, repo = %msg.repo, "Stale PR preview");
+            passes::stale_prs::preview(&state, &msg).await;
         }
         models::WorkerMessage::PluginRun(msg) => {
             info!(team_id = %msg.team_id, plugin = %msg.plugin_id, run_id = %msg.run_id, trigger = %msg.trigger, "Plugin run");

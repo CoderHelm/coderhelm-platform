@@ -1173,6 +1173,7 @@ pub mod skill_suggest;
 pub mod skills;
 pub mod skipped_checks;
 pub mod stack;
+pub mod stale_prs;
 pub(crate) mod steps;
 pub(crate) mod stop_gate;
 pub mod stop_judge;

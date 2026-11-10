@@ -485,6 +485,17 @@ async fn main() -> Result<(), Error> {
             "/reviewer/config/:owner/:name",
             get(routes::reviewer::get_config).put(routes::reviewer::update_config),
         )
+        // Stale pull request cleanup: settings, the plan and the log
+        .route(
+            "/reviewer/stale/config",
+            get(routes::stale_prs::get_config).put(routes::stale_prs::put_config),
+        )
+        .route("/reviewer/stale", get(routes::stale_prs::get_activity))
+        .route("/reviewer/stale/preview", post(routes::stale_prs::preview))
+        .route(
+            "/reviewer/stale/keep-open",
+            put(routes::stale_prs::put_keep_open),
+        )
         .route(
             "/alert-routes",
             get(routes::alerts::list_routes)

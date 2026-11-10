@@ -55,6 +55,11 @@ pub enum WorkerMessage {
     /// review that didn't finish (a service error) for the PR's current head.
     #[serde(rename = "review_sweep")]
     ReviewSweep,
+    /// Work out one repository's stale pull request plan now, without
+    /// changing anything (the dashboard's "Preview"). The scheduled cleanup
+    /// rides on the review-reminder tick.
+    #[serde(rename = "stale_prs_preview")]
+    StalePrsPreview(StalePrsPreviewMessage),
     /// Async post-merge health check (self-scheduled with SQS delay). Waits for
     /// the base-branch deploy checks to complete, then alerts only on failures
     /// that are NEW vs. the pre-merge baseline.
@@ -405,7 +410,8 @@ impl WorkerMessage {
             WorkerMessage::Review(_)
             | WorkerMessage::ReviewLesson(_)
             | WorkerMessage::ReviewReminder
-            | WorkerMessage::ReviewSweep => f::REVIEW,
+            | WorkerMessage::ReviewSweep
+            | WorkerMessage::StalePrsPreview(_) => f::REVIEW,
             WorkerMessage::SkillSync(_) => f::SKILL_SYNC,
             WorkerMessage::SkillAsk(_) => f::AGENT_ASK,
             WorkerMessage::ReleaseNotes(_) | WorkerMessage::TagSweep(_) => f::RELEASE_NOTES,
@@ -471,6 +477,7 @@ impl WorkerMessage {
             | WorkerMessage::Review(_)
             | WorkerMessage::ReviewReminder
             | WorkerMessage::ReviewSweep
+            | WorkerMessage::StalePrsPreview(_)
             | WorkerMessage::HealthCheck(_)
             | WorkerMessage::AwaitMerge(_)
             | WorkerMessage::ReleaseSteps(_)
@@ -563,6 +570,14 @@ impl WorkerMessage {
             _ => None,
         }
     }
+}
+
+/// One repository's stale pull request preview (`common::stale_prs`).
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+pub struct StalePrsPreviewMessage {
+    pub team_id: String,
+    /// `owner/name`.
+    pub repo: String,
 }
 
 /// A code-graph index job. `changed_files: None` ⇒ full index of the branch

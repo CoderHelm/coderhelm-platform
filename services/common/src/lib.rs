@@ -158,6 +158,8 @@ mod selfhost_links;
 pub mod skill_apply;
 pub mod skill_compat;
 pub mod skills;
+/// Stale pull request cleanup: settings, activity and the decision.
+pub mod stale_prs;
 /// Who may ask CoderHelm for work from a GitHub comment or review.
 pub mod standing;
 pub mod stop_judge;

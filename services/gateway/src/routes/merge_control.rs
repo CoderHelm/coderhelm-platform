@@ -74,7 +74,7 @@ pub(crate) async fn gh_get(
     Ok((status, body))
 }
 
-async fn gh_post(state: &AppState, token: &str, url: &str, body: &Value) {
+pub(crate) async fn gh_post(state: &AppState, token: &str, url: &str, body: &Value) {
     let res = state
         .http
         .post(url)

@@ -487,6 +487,8 @@ pub const CAPABILITIES: &[Capability] = &[
             "api::update_git_conventions",
             "reviewer::update_org_config",
             "reviewer::update_config",
+            "stale_prs::put_config",
+            "stale_prs::put_keep_open",
             "review_lessons::delete_lesson",
         ],
     },
