@@ -15,6 +15,11 @@ const MIN_TIME_FOR_REMEDIATION_SECS: u64 = 240; // 4 minutes
 /// left (conflict resolution and the description are model calls); with
 /// less, the run continues in a fresh step at the pull request.
 const MIN_TIME_FOR_PR_SECS: u64 = 150;
+/// Least time left in a step for the coder to start in it (it stops 150s
+/// before the end): less, and it starts in a fresh step instead.
+const MIN_TIME_FOR_IMPLEMENT_SECS: u64 = 480;
+// Past the PR buffer and the coder's wrap-up window, with minutes to build.
+const _: () = assert!(MIN_TIME_FOR_IMPLEMENT_SECS >= 150 + 120 + 180);
 
 /// The pass the checks on the open pull request run under.
 pub(crate) const PASS_CHECKS: &str = "review";
@@ -678,6 +683,29 @@ mod continuation_tests {
         assert!(h.contains("steps::save_gate("));
         assert!(h.contains("try_auto_continue("));
         assert!(h.contains("couldn't continue in a"));
+    }
+
+    /// A run whose planning used 11 of its 15 minutes started the coder with
+    /// 80 seconds; it wrote nothing and the run ended as "made no write".
+    /// The coder starts in a fresh step when the step's time is short, and
+    /// a coder that ran out of time before writing continues, never stops.
+    #[test]
+    fn the_coder_never_starts_or_ends_on_a_spent_step() {
+        let rp = run_passes_src();
+        let check = rp
+            .find("if remaining_secs(start) < MIN_TIME_FOR_IMPLEMENT_SECS {")
+            .expect("a time check before the coder starts");
+        let first_run = rp.find("let mut result = implement::run(").unwrap();
+        assert!(check < first_run);
+        assert!(rp[check..first_run].contains("try_auto_continue("));
+        let judged = rp.find("let mut verdict = run_end::judge(").unwrap();
+        let timed = rp[judged..]
+            .find("if result.timed_out")
+            .expect("a timed-out coder continues")
+            + judged;
+        let again = rp.find("let again = implement::run(").unwrap();
+        assert!(timed < again);
+        assert!(rp[timed..again].contains("try_auto_continue("));
     }
 
     /// A continuation resumes at the gate the last step handed off at: the
@@ -4710,6 +4738,26 @@ async fn run_passes(
             usage,
         )
         .await;
+        // Planning (and a re-plan) can use most of a step: the coder never
+        // starts with a few seconds left, writes nothing and ends the run as
+        // "made no write". It starts in a fresh step with its full time.
+        if remaining_secs(start) < MIN_TIME_FOR_IMPLEMENT_SECS {
+            let resume_from = Some(("implement_started".to_string(), branch_name.clone(), 0u8));
+            let handoff = try_auto_continue(
+                state,
+                msg,
+                run_id,
+                &resume_from,
+                &["implement_started"],
+                false,
+                "Planning used most of this step; the coder starts in a fresh one",
+            )
+            .await;
+            if handoff.continued() {
+                close_memory(state, agent_memory.take()).await;
+                return Ok(());
+            }
+        }
         // A continuation picks up the planned tasks the branch doesn't do yet.
         let still_to_do = if msg.continuation > 0 {
             continuation_feedback(state, run_id, &github, msg, &plan_result, &branch_name).await
@@ -4958,6 +5006,30 @@ async fn run_passes(
                 &result.writes,
                 outside,
             );
+            // The coder ran out of this step's time before writing: that is
+            // never "made no write" or a question. It builds in a fresh step.
+            if result.timed_out
+                && matches!(
+                    verdict,
+                    run_end::Empty::Unbuilt(_) | run_end::Empty::Ask(_) | run_end::Empty::Generic
+                )
+            {
+                let resume_from = Some(("implement_started".to_string(), branch_name.clone(), 0u8));
+                let handoff = try_auto_continue(
+                    state,
+                    msg,
+                    run_id,
+                    &resume_from,
+                    &["implement_started"],
+                    false,
+                    "The coder ran out of this step's time before writing a file",
+                )
+                .await;
+                if handoff.continued() {
+                    close_memory(state, agent_memory.take()).await;
+                    return Ok(());
+                }
+            }
             // Nothing on the branch, and the plan says what to build: one
             // more build, told every task, before anything is asked.
             if matches!(verdict, run_end::Empty::Unbuilt(_))

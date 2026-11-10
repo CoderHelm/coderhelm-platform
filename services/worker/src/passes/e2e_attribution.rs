@@ -306,6 +306,8 @@ pub async fn attribute(
             .cloned();
         let mut texts: Vec<String> =
             vec![f.failed_step.clone(), f.snippet.clone(), f.error.clone()];
+        // The test's own files: its spec and the page objects it imports.
+        let mut test_files = vec![spec.clone().unwrap_or_else(|| f.file.clone())];
         if let Some(spec) = &spec {
             if let Ok(src) = gh.read_file(owner, repo, spec, &msg.head_sha).await {
                 for import in common::e2e::test_package::relative_imports(spec, &src, &tree)
@@ -315,15 +317,17 @@ pub async fn attribute(
                     if let Ok(po) = gh.read_file(owner, repo, &import, &msg.head_sha).await {
                         texts.push(po);
                     }
+                    test_files.push(import);
                 }
             }
         }
+        let test_changed = attribution::test_changed(&diff, &test_files);
         let refs: Vec<&str> = texts.iter().map(String::as_str).collect();
         let mut hooks = attribution::hooks(&refs);
         hooks.extend(requests.into_iter().map(Hook::Request));
         let found = find_hooks(gh, owner, repo, &msg.head_sha, &hooks).await;
         let (path, path_evidence) = attribution::failing_path(&found);
-        let touched = attribution::touched(&diff, &path);
+        let mut touched = attribution::touched(&diff, &path);
         let page = read_page(
             state,
             &provider,
@@ -336,7 +340,19 @@ pub async fn attribute(
         )
         .await
         .unwrap_or_default();
-        let verdict = attribution::decide(&touched, page.valid_for_data);
+        let mut verdict = attribution::decide(&touched, page.valid_for_data);
+        let mut reason = page.reason;
+        // The change wrote or edited this test: its fix is the change's,
+        // on its own pull request (the test may not exist anywhere else).
+        if !test_changed.is_empty() {
+            verdict = Verdict::Related;
+            reason = attribution::test_changed_reason(&test_changed);
+            for t in test_changed {
+                if !touched.contains(&t) {
+                    touched.push(t);
+                }
+            }
+        }
         out.push(Attribution {
             test: title,
             file: spec.unwrap_or_else(|| f.file.clone()),
@@ -351,7 +367,7 @@ pub async fn attribute(
             touched,
             diff: diff.clone(),
             valid_for_data: page.valid_for_data,
-            reason: page.reason,
+            reason,
             verdict,
             fix_pr: None,
             source: f.source.clone(),
