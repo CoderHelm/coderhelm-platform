@@ -912,6 +912,25 @@ impl LiveJob {
                 CheckEnd::Failed { reason },
             ),
         };
+        // Every job ends here, and says how in one line: a verdict, a skip
+        // with its reason, a retry or a failure. A job once ended between
+        // "Reviewing PR from label" and its first step with no line at all.
+        let (repo_slug, head) = (
+            format!("{}/{}", msg.repo_owner, msg.repo_name),
+            check_head(msg).to_string(),
+        );
+        match &how {
+            Finished::Failed { .. } | Finished::Retrying { .. } => warn!(
+                team_id = %msg.team_id, repo = %repo_slug, pr = msg.pr_number, head = %head,
+                trigger = %msg.trigger, dedup_key = %msg.dedup_key, job = %self.id,
+                outcome = status, ending = %last, "review_job_ended"
+            ),
+            _ => info!(
+                team_id = %msg.team_id, repo = %repo_slug, pr = msg.pr_number, head = %head,
+                trigger = %msg.trigger, dedup_key = %msg.dedup_key, job = %self.id,
+                outcome = status, ending = %last, "review_job_ended"
+            ),
+        }
         // An ending without a new review that the job named itself (a
         // standing verdict carried, a newer commit's review).
         if let (CheckEnd::Skipped { reason }, Some((conclusion, title))) = (end, &settled) {
@@ -1018,14 +1037,21 @@ pub async fn run(
         if !enqueue_review(state, &next, hop).await {
             return Err("could not send a waiting review retry on".into());
         }
+        info!(pr = msg.pr_number, trigger = %msg.trigger, wait_secs = next.wait_secs, hop, "Review job waits on: sent on for its next hop");
         return Ok(());
     }
     let job = LiveJob::start();
     let mut reviewed_head = msg.head_sha.clone();
     match run_budgeted(state, msg.clone(), &mut reviewed_head, &job).await {
-        Ok(Outcome::Done { .. }) => {
+        Ok(Outcome::Done { posted, .. }) => {
             job.finished(state, &msg, common::review_live::Finished::Done)
                 .await;
+            // A run's hand-off (or the ready gate's ask) gave the verdict
+            // the draft decision waits for: decide it now, not at the next
+            // sweep.
+            if posted.is_some() && msg.trigger == super::review_scope::HANDOFF_TRIGGER {
+                super::ready::request(state, &msg).await;
+            }
             Ok(())
         }
         Ok(Outcome::Skipped { reason }) => {
@@ -1424,6 +1450,7 @@ async fn run_once(
             )
             .await;
         }
+        live_job.not_posted("the reviewer is off for this repository");
         return Ok(DONE);
     }
 
@@ -1459,6 +1486,9 @@ async fn run_once(
                     reason = "it doesn't answer CoderHelm's review and doesn't address CoderHelm",
                     "Reviewer: reply not handled"
                 );
+                live_job.not_posted(
+                    "the reply doesn't answer CoderHelm's review and doesn't address CoderHelm",
+                );
                 return Ok(DONE);
             }
         }
@@ -1489,6 +1519,7 @@ async fn run_once(
                 "A repeat delivery of something CoderHelm already handled.",
             )
             .await;
+            live_job.not_posted("a repeat delivery of a job CoderHelm already handled");
             return Ok(DONE);
         }
     }
@@ -1547,6 +1578,22 @@ async fn run_once(
     if msg.trigger == super::review_scope::TRIGGER_PUSH && super::is_own_login(pr_author) {
         if let Some(reason) = own_loop_hold(state, &github, &msg, &head_sha).await {
             info!(pr = msg.pr_number, head = %head_sha, "CoderHelm's own push during its run's fix loop — not reviewed now");
+            // The gateway took this head's review claim when it queued the
+            // push. Nothing reviews the head now, so the claim goes: a run's
+            // hand-off of this same head must not read it as "already being
+            // reviewed".
+            common::claim::release(
+                &state.dynamo,
+                &state.config.settings_table_name,
+                &msg.team_id,
+                &super::review_policy::head_claim_sk(
+                    &msg.repo_owner,
+                    &msg.repo_name,
+                    msg.pr_number,
+                    &head_sha,
+                ),
+            )
+            .await;
             live_job.settle(NotReviewed::OwnPushDuringRun);
             return Ok(Outcome::Skipped { reason });
         }
@@ -1620,17 +1667,19 @@ async fn run_once(
         }
     }
 
-    // A run's handoff and the PR's ready-for-review event can ask for the
-    // same commit together: the handoff takes the per-commit claim the
-    // gateway's push and ready reviews take, so only one of them runs.
-    if msg.trigger == super::review_scope::HANDOFF_TRIGGER && pr["draft"].as_bool() == Some(true) {
-        // Still a draft (a proof running, a check holding it): the review
-        // runs when it is marked ready, as every PR's does.
-        live_job.settle(NotReviewed::Draft);
-        return Ok(Outcome::Skipped {
-            reason: "Still a draft: reviewed when it is marked ready.".into(),
-        });
-    }
+    // A run's hand-off reviews its pull request, draft or not. It once
+    // skipped a draft until it left draft, while the ready gate kept the
+    // draft until CoderHelm's review approved the head: each waited on the
+    // other and the pull request was held for good. A person's draft still
+    // waits for its ready-for-review event (the gateway's rule); this is
+    // CoderHelm's own finished work.
+    //
+    // A run's hand-off and the PR's ready-for-review event can ask for the
+    // same commit together: the hand-off takes the per-commit claim the
+    // gateway's push and ready reviews take. When another review holds it,
+    // the hand-off waits for that review and looks again (its verdict then
+    // stands, `review_policy::start`); after the last wait it reviews, so a
+    // claim whose review never came can't stop it.
     if msg.trigger == super::review_scope::HANDOFF_TRIGGER && !head_sha.is_empty() {
         let sk = super::review_policy::head_claim_sk(
             &msg.repo_owner,
@@ -1648,10 +1697,19 @@ async fn run_once(
         .await
             == common::claim::Claim::Held
         {
-            live_job.settle(NotReviewed::HeldByAnotherReview { head: &head_sha });
-            return Ok(Outcome::Skipped {
-                reason: "This commit is already being reviewed.".into(),
-            });
+            if let Some(later) = super::review_policy::deferred_ask(&msg) {
+                if enqueue_review(state, &later, super::review_policy::ASK_WAIT_SECS).await {
+                    note_queued(state, &later, super::review_policy::ASK_WAIT_SECS).await;
+                    info!(pr = msg.pr_number, head = %head_sha, dedup_key = %later.dedup_key, "Hand-off review waits for the running review of this commit, then looks again");
+                    live_job.settle(NotReviewed::HeldByAnotherReview { head: &head_sha });
+                    return Ok(Outcome::Skipped {
+                        reason: "This commit is already being reviewed; the hand-off looks again \
+                                 after that review."
+                            .into(),
+                    });
+                }
+            }
+            info!(pr = msg.pr_number, head = %head_sha, "Hand-off review runs now (waited enough, or couldn't wait)");
         }
     }
 
@@ -1799,6 +1857,9 @@ async fn run_once(
                 // the person on the PR. With no run to hand it to, the reviewer
                 // answers instead, so the person is never left unanswered.
                 if forward_ask_to_fix_loop(state, &msg, &comment).await {
+                    live_job.not_posted(
+                        "the ask went to the run's fix loop, which answers on the pull request",
+                    );
                     return Ok(DONE);
                 }
             }
@@ -4085,7 +4146,7 @@ pub async fn review_for_run(
             None
         }
         Ok(Ok(Outcome::Skipped { reason })) => {
-            settle_job_claim(state, &msg, true).await;
+            settle_job_claim(state, &msg, false).await;
             job.finished(state, &msg, Finished::Skipped { reason: &reason })
                 .await;
             None
@@ -4224,8 +4285,22 @@ async fn run_budgeted(
         Ok(r) => r,
         Err(_) => Err(format!("the review ran past its {REVIEW_BUDGET_SECS}s budget").into()),
     };
-    settle_job_claim(state, &job, out.is_ok()).await;
+    settle_job_claim(state, &job, keeps_job_claim(&out)).await;
     out
+}
+
+/// Whether a job keeps its dedup claim for the dedup window. A job that
+/// reviewed (or answered) keeps it, so a redelivered copy is dropped. A job
+/// that failed gives it up for its retry, and so does one that ended without
+/// reviewing: the same key used by a later job (a run's own review takes the
+/// key of a push review of the same head) must run. A push review CoderHelm
+/// skipped as its own push during the run once kept `head#<sha>` for six
+/// hours, and the run's own review of that head was dropped as a repeat.
+pub(crate) fn keeps_job_claim<E>(out: &Result<Outcome, E>) -> bool {
+    matches!(
+        out,
+        Ok(Outcome::Done { .. } | Outcome::ReviewThenReply { .. })
+    )
 }
 
 /// Hand a person's fix request on CoderHelm's own PR to the run's fix loop,
@@ -4542,11 +4617,77 @@ pub(crate) async fn review_on_handoff(
         ..Default::default()
     };
     if enqueue_review(state, &msg, 0).await {
+        // The dashboard shows it queued, like a review the gateway sends.
+        note_queued(state, &msg, 0).await;
         info!(
             pr = pr_number,
             run_id, "Run handed its PR over — review queued"
         );
+    } else {
+        warn!(pr = pr_number, run_id, "Run handed its PR over, but its review couldn't be queued; the ready gate asks for it again");
     }
+}
+
+/// What asking for a review of a held draft's head did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ReadyReviewAsk {
+    /// A review of the head is queued now.
+    Queued,
+    /// One was queued for this head before (it runs, or ran).
+    AlreadyQueued,
+    /// The reviewer is off for the repository: no review comes.
+    ReviewerOff,
+    /// The queue refused; the next decision asks again.
+    Failed,
+}
+
+/// How long one ask for a head's review counts: a review that never came
+/// (it failed every retry) is asked for again after this.
+const READY_REVIEW_ASK_SECS: u64 = 2 * 3600;
+
+/// The ready gate holds a draft for CoderHelm's approval on `head` and no
+/// review of that head exists: one review is queued, once per head. It runs
+/// as a run's hand-off does (drafts reviewed, the head claim respected), and
+/// its verdict asks for the ready decision again.
+pub(crate) async fn review_for_ready(
+    state: &WorkerState,
+    team_id: &str,
+    installation_id: u64,
+    (owner, repo, pr_number): (&str, &str, u64),
+    head: &str,
+) -> ReadyReviewAsk {
+    let Some(label) = enabled_trigger_label(state, team_id, owner, repo).await else {
+        return ReadyReviewAsk::ReviewerOff;
+    };
+    let sk = format!("READYREVIEW#{owner}/{repo}#{pr_number:06}#{head}");
+    let table = &state.config.settings_table_name;
+    if common::claim::claim(&state.dynamo, table, team_id, &sk, READY_REVIEW_ASK_SECS).await
+        == common::claim::Claim::Held
+    {
+        return ReadyReviewAsk::AlreadyQueued;
+    }
+    let msg = ReviewMessage {
+        team_id: team_id.to_string(),
+        installation_id,
+        repo_owner: owner.to_string(),
+        repo_name: repo.to_string(),
+        pr_number,
+        head_sha: head.to_string(),
+        label,
+        trigger: super::review_scope::HANDOFF_TRIGGER.to_string(),
+        dedup_key: format!("ready#{head}"),
+        ..Default::default()
+    };
+    if !enqueue_review(state, &msg, 0).await {
+        common::claim::release(&state.dynamo, table, team_id, &sk).await;
+        return ReadyReviewAsk::Failed;
+    }
+    note_queued(state, &msg, 0).await;
+    info!(
+        pr = pr_number,
+        head, "The ready gate waits for CoderHelm's review of this head — review queued"
+    );
+    ReadyReviewAsk::Queued
 }
 
 /// CoderHelm's most recent review of a PR.

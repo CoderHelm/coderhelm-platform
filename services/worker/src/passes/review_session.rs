@@ -75,8 +75,6 @@ pub(crate) enum NotReviewed<'a> {
     DescriptionSeen { head: &'a str },
     /// The commit already has CoderHelm's verdict.
     AlreadyReviewed { head: &'a str, verdict: &'a str },
-    /// The PR is still a draft.
-    Draft,
     /// Another review of the same commit holds it.
     HeldByAnotherReview { head: &'a str },
     /// The team has no model provider set up.
@@ -121,10 +119,6 @@ pub(crate) fn not_reviewed(why: NotReviewed<'_>) -> (&'static str, String) {
                 rc::short(head),
                 verdict_words(verdict)
             ),
-        ),
-        NotReviewed::Draft => (
-            "neutral",
-            "Still a draft: reviewed when it is marked ready".into(),
         ),
         NotReviewed::HeldByAnotherReview { head } => (
             "neutral",
@@ -466,11 +460,6 @@ mod tests {
                 },
                 "neutral",
                 "Already reviewed 9fceb02: changes requested stands",
-            ),
-            (
-                Draft,
-                "neutral",
-                "Still a draft: reviewed when it is marked ready",
             ),
             (
                 HeldByAnotherReview { head: HEAD },
