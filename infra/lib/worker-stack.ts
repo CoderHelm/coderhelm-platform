@@ -223,10 +223,13 @@ export class WorkerStack extends cdk.Stack {
     props.mcpConfigsTable.grantReadWriteData(this.workerFunction);
     // A renewed remote MCP sign-in is sealed before it is saved. The worker
     // may seal only that kind of value: nothing else it could encrypt would
-    // carry this purpose in its encryption context.
+    // carry this purpose in its encryption context. Tokens over KMS's direct
+    // 4 KB (an Atlassian sign-in) are sealed in an envelope, with a data key
+    // from GenerateDataKey under the same context
+    // (services/common/src/envelope.rs); opening one needs only Decrypt.
     this.workerFunction.addToRolePolicy(
       new iam.PolicyStatement({
-        actions: ["kms:Encrypt"],
+        actions: ["kms:Encrypt", "kms:GenerateDataKey"],
         resources: [props.secretsKey.keyArn],
         conditions: {
           StringEquals: { "kms:EncryptionContext:purpose": "mcp-oauth-token" },

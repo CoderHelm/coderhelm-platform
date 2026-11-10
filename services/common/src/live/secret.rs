@@ -6,8 +6,9 @@
 
 use std::collections::HashMap;
 
-use aws_sdk_kms::primitives::Blob;
 use base64::{engine::general_purpose::STANDARD, Engine};
+
+use crate::mcp_credentials::{Cipher, Kms};
 
 const PURPOSE: &str = "data-source-key";
 
@@ -18,29 +19,29 @@ fn context(team_id: &str) -> HashMap<String, String> {
     ])
 }
 
-/// Encrypts `plaintext` for `team_id`. Returns text safe to store.
+/// Encrypts `plaintext` for `team_id`. Returns text safe to store. A key
+/// larger than KMS encrypts directly is sealed in an envelope
+/// ([`crate::envelope`]).
 pub async fn seal(
     kms: &aws_sdk_kms::Client,
     key_id: &str,
     team_id: &str,
     plaintext: &str,
 ) -> Result<String, String> {
-    if key_id.is_empty() {
-        return Err("no secrets key configured".to_string());
+    if let Some(e) = crate::envelope::too_large("The key", plaintext.len()) {
+        return Err(e);
     }
-    let out = kms
-        .encrypt()
-        .key_id(key_id)
-        .set_encryption_context(Some(context(team_id)))
-        .plaintext(Blob::new(plaintext.as_bytes()))
-        .send()
-        .await
-        .map_err(|e| format!("kms encrypt: {e}"))?;
-    let blob = out.ciphertext_blob().ok_or("kms returned no ciphertext")?;
-    Ok(STANDARD.encode(blob.as_ref()))
+    let cipher = Kms {
+        client: kms,
+        key_id,
+    };
+    let blob = cipher
+        .encrypt(context(team_id), plaintext.as_bytes())
+        .await?;
+    Ok(STANDARD.encode(blob))
 }
 
-/// Opens a value sealed for `team_id`.
+/// Opens a value sealed for `team_id` (directly or in an envelope).
 pub async fn open(
     kms: &aws_sdk_kms::Client,
     team_id: &str,
@@ -49,15 +50,12 @@ pub async fn open(
     let bytes = STANDARD
         .decode(sealed)
         .map_err(|_| "stored key is not valid".to_string())?;
-    let out = kms
-        .decrypt()
-        .set_encryption_context(Some(context(team_id)))
-        .ciphertext_blob(Blob::new(bytes))
-        .send()
-        .await
-        .map_err(|e| format!("kms decrypt: {e}"))?;
-    let plain = out.plaintext().ok_or("kms returned no plaintext")?;
-    String::from_utf8(plain.as_ref().to_vec()).map_err(|_| "stored key is not text".to_string())
+    let cipher = Kms {
+        client: kms,
+        key_id: "",
+    };
+    let plain = cipher.decrypt(context(team_id), &bytes).await?;
+    String::from_utf8(plain).map_err(|_| "stored key is not text".to_string())
 }
 
 /// The last four characters, for telling keys apart without revealing one.

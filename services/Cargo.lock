@@ -1523,6 +1523,7 @@ dependencies = [
  "rand 0.9.4",
  "regex",
  "reqwest",
+ "ring",
  "serde",
  "serde_json",
  "serde_yaml",
@@ -1534,6 +1535,7 @@ dependencies = [
  "url",
  "urlencoding",
  "yaml-rust2",
+ "zeroize",
  "zip",
 ]
 

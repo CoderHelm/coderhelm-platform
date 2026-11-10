@@ -37,6 +37,9 @@ tokio = { version = "1", features = ["macros", "time", "net", "rt", "sync"] }
 graphql-parser = "0.4"
 url = "2"
 aws-sdk-kms = "1"
+# envelope: AES-256-GCM for sealed values larger than KMS encrypts directly
+ring = "0.17"
+zeroize = "1"
 base64 = "0.22"
 ed25519-dalek = { version = "2", default-features = false, features = ["std", "zeroize"] }
 # mcp_remote: PKCE verifiers and OAuth state values
