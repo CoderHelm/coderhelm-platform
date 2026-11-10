@@ -226,6 +226,8 @@ class Stack:
                 if attr == "ApiId": return self.ident(lid)[0]
                 if attr == "UserPoolId": return self.ident(lid)[0]
                 if attr == "Id" and ty == "AWS::CloudFront::Distribution": return self.ident(lid)[0]
+                # A function URL's function (the web part's OAC permissions name the streaming function).
+                if attr == "FunctionArn" and ty == "AWS::Lambda::Url": return self.resolve(self.res[lid]["Properties"]["TargetFunctionArn"])
                 return f"<{lid}.{attr}>"
             if "Fn::Join" in v:
                 sep, parts = v["Fn::Join"]
@@ -310,6 +312,9 @@ def targets(st, lid, r, action):
                "AWS::Cognito::UserPool": "email.cognito-idp.amazonaws.com/AWSServiceRoleForAmazonCognitoIdpEmailService",
                "AWS::Cognito::UserPoolClient": "email.cognito-idp.amazonaws.com/AWSServiceRoleForAmazonCognitoIdpEmailService"}[ty]
         return [(f"arn:aws:iam::{ACCT}:role/aws-service-role/{slr}", {"iam:AWSServiceName": slr.split("/")[0]})]
+    # One inline policy on one role (the native helper's table-key policy).
+    if svc == "iam" and ty == "AWS::IAM::RolePolicy":
+        return [(f"arn:aws:iam::{ACCT}:role/{st.resolve(p['RoleName'])}", {})]
     if svc == "iam" and ty in ("AWS::IAM::Policy",):
         roles = [st.resolve(x) for x in p.get("Roles", [])]
         if action.startswith("iam:") and ("User" in action or "Group" in action):
@@ -738,6 +743,8 @@ def helper_rows():
         ("ssm:PutParameter", f"{at('ssm')}:parameter/{P}/uninstall/delete-data"), ("ssm:DeleteParameter", f"{at('ssm')}:parameter/{P}/public-url"),
         ("s3:DeleteBucket", f"{s3}someone-else"), ("s3:DeleteBucket", f"{s3}{P}-dashboard-{ACCT}"), ("kms:DeleteAlias", f"{at('kms')}:alias/my-app"),
         ("kms:ScheduleKeyDeletion", f"{at('kms')}:key/0f0f0f0f-1111-2222-3333-444455556666"),
+        # No key use in its own policy: the table key, by ARN, is its table-key policy (Security Hub KMS.2).
+        ("kms:Decrypt", f"{at('kms')}:key/0f0f0f0f-1111-2222-3333-444455556666"), ("kms:Decrypt", "*"),
         ("cognito-idp:DeleteUserPool", f"{at('cognito-idp')}:userpool/us-east-1_someones"),
         # Nothing public: progress goes to CoderHelm with the guide's key.
         ("s3:PutObject", f"{s3}coderhelm-setup-0123456789abcdef/status.json"), ("s3:PutBucketPolicy", f"{s3}coderhelm-setup-0123456789abcdef"),
