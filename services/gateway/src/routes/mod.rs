@@ -66,6 +66,7 @@ pub mod run_search;
 pub mod run_start;
 pub mod run_trigger;
 pub mod search;
+pub mod security;
 pub mod setup;
 pub mod setup_checks;
 pub mod sign_in;

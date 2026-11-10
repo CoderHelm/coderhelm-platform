@@ -41,6 +41,8 @@ pub mod feature {
     pub const SKILL_SYNC: &str = "skill_sync";
     /// Alert triage and alert runs.
     pub const ALERT: &str = "alert";
+    /// Security fixes: reachability triage of advisories.
+    pub const SECURITY: &str = "security";
     /// Repository onboarding.
     pub const ONBOARD: &str = "onboard";
     /// Infrastructure analysis.

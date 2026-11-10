@@ -32,6 +32,10 @@ export const PERMISSIONS = {
   metadata: "read",
   // The email of the person who connects their GitHub account.
   email_addresses: "read",
+  // Security fixes read Dependabot's alerts (and the dependabot_alert event).
+  // Optional (REQUIRED_PERMISSIONS leaves it out): without it they use OSV
+  // and GitHub's advisories only.
+  vulnerability_alerts: "read",
 };
 
 /**
@@ -39,7 +43,7 @@ export const PERMISSIONS = {
  * permission was added to PERMISSIONS is warned about that one, not failed
  * (services/gateway/src/routes/setup_checks.rs REQUIRED_PERMISSIONS).
  */
-export const REQUIRED_PERMISSIONS = { ...PERMISSIONS, checks: "read" };
+export const REQUIRED_PERMISSIONS = (({ vulnerability_alerts: _optional, ...rest }) => ({ ...rest, checks: "read" }))(PERMISSIONS);
 
 /** The webhook events the gateway handles (services/gateway/src/routes/github_webhook.rs). */
 export const EVENTS = [
@@ -54,7 +58,15 @@ export const EVENTS = [
   "check_suite",
   "workflow_run",
   "repository",
+  "dependabot_alert",
+  "security_advisory",
 ];
+
+/**
+ * Events a new app subscribes to that CoderHelm works without (security
+ * fixes): an app created before them is warned, not failed.
+ */
+export const OPTIONAL_EVENTS = ["dependabot_alert", "security_advisory"];
 
 /** The manifest GitHub registers the app from. */
 export function buildManifest({ publicUrl, name, redirectUrl }) {

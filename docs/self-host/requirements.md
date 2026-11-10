@@ -33,6 +33,18 @@ You do not need Rust, Docker or the CDK CLI: the release ships built code, and t
 - An account or organization where you can create GitHub Apps (organization owners, or members with the GitHub App manager role).
 - github.com. GitHub Enterprise Server can't create apps from a manifest; create the app by hand and pass its values to `github-app` (see [The GitHub App](./github-app.md#github-enterprise-server)). CoderHelm itself calls `api.github.com`, so Enterprise Server is not supported yet.
 
+## Outbound calls
+
+Besides GitHub and your model provider, the worker calls these hosts over HTTPS, and only for teams that turn on security fixes. If you restrict outbound traffic, allow them:
+
+| Host | What it reads | Sent |
+|---|---|---|
+| `api.osv.dev` | Advisories for each dependency (`/v1/querybatch`, then `/v1/vulns/<id>`) | Package names and versions from the repository's dependency list. No code |
+| `www.cisa.gov` | CISA's list of exploited vulnerabilities, once a day | Nothing about your install |
+| `api.first.org` | EPSS scores for the CVEs your findings name, once a day | CVE ids |
+
+OSV is read through its API ("api" mode on the Security page). A local copy of OSV's data, so that no dependency names leave your account, is not built yet.
+
 ## Optional
 
 - **A domain** at any DNS provider (Route 53 included): you add two records. CoderHelm never changes your DNS. See [Domains](./domains.md).

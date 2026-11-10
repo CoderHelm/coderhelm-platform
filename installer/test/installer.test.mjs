@@ -211,6 +211,10 @@ test("manifest: URLs, permissions and events", () => {
   assert.deepEqual(m.default_permissions, PERMISSIONS);
   assert.ok(m.default_events.includes("pull_request_review_thread"));
   assert.deepEqual(m.default_events, EVENTS);
+  // Security fixes: Dependabot alerts and the advisory events are asked for.
+  assert.equal(m.default_permissions.vulnerability_alerts, "read");
+  assert.ok(m.default_events.includes("dependabot_alert"));
+  assert.ok(m.default_events.includes("security_advisory"));
   assert.equal(newAppUrl(null, "s1"), "https://github.com/settings/apps/new?state=s1");
   assert.equal(newAppUrl("acme", "s1"), "https://github.com/organizations/acme/settings/apps/new?state=s1");
   const page = formPage({ name: '"><script>' }, newAppUrl("acme", "s"));

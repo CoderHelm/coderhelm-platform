@@ -60,6 +60,12 @@ pub enum WorkerMessage {
     /// rides on the review-reminder tick.
     #[serde(rename = "stale_prs_preview")]
     StalePrsPreview(StalePrsPreviewMessage),
+    /// Security fixes (`common::security_fixes`): a Dependabot alert or a
+    /// GitHub advisory arrived, a default branch's dependencies changed, or
+    /// a person asked for a check now. The scheduled work rides on the
+    /// review-reminder tick.
+    #[serde(rename = "security_event")]
+    SecurityEvent(SecurityEventMessage),
     /// Async post-merge health check (self-scheduled with SQS delay). Waits for
     /// the base-branch deploy checks to complete, then alerts only on failures
     /// that are NEW vs. the pre-merge baseline.
@@ -412,6 +418,7 @@ impl WorkerMessage {
             | WorkerMessage::ReviewReminder
             | WorkerMessage::ReviewSweep
             | WorkerMessage::StalePrsPreview(_) => f::REVIEW,
+            WorkerMessage::SecurityEvent(_) => f::SECURITY,
             WorkerMessage::SkillSync(_) => f::SKILL_SYNC,
             WorkerMessage::SkillAsk(_) => f::AGENT_ASK,
             WorkerMessage::ReleaseNotes(_) | WorkerMessage::TagSweep(_) => f::RELEASE_NOTES,
@@ -478,6 +485,7 @@ impl WorkerMessage {
             | WorkerMessage::ReviewReminder
             | WorkerMessage::ReviewSweep
             | WorkerMessage::StalePrsPreview(_)
+            | WorkerMessage::SecurityEvent(_)
             | WorkerMessage::HealthCheck(_)
             | WorkerMessage::AwaitMerge(_)
             | WorkerMessage::ReleaseSteps(_)
@@ -570,6 +578,29 @@ impl WorkerMessage {
             _ => None,
         }
     }
+}
+
+/// One security event (`common::security_fixes`). Small on purpose: the
+/// worker reads the alert or advisory itself.
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+pub struct SecurityEventMessage {
+    /// Empty for a global advisory delivered without an installation: every
+    /// team with security fixes on.
+    pub team_id: String,
+    #[serde(default)]
+    pub installation_id: u64,
+    /// `dependabot_alert`, `security_advisory`, `push` or `scan`.
+    pub kind: String,
+    /// `owner/name`; empty for a scan of every repository.
+    #[serde(default)]
+    pub repo: String,
+    /// The webhook's action (`created`, `fixed`, `withdrawn`, ...).
+    #[serde(default)]
+    pub action: String,
+    #[serde(default)]
+    pub alert_number: u64,
+    #[serde(default)]
+    pub ghsa_id: String,
 }
 
 /// One repository's stale pull request preview (`common::stale_prs`).

@@ -66,6 +66,8 @@ pub mod github_wait;
 pub mod live;
 /// Log findings and the fix runs started from them.
 pub mod log_findings;
+/// Security fixes: advisories, triage, fix runs and cards (gateway and worker).
+pub mod security_fixes;
 pub mod settings_index;
 // Which repo a log group's or alarm's code lives in, from evidence.
 /// Sealed credentials for a team's MCP servers (KMS, bound to team and server).

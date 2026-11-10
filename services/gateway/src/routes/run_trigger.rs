@@ -3,7 +3,7 @@
 //! Runs don't record "how they started" as one field: a run carries
 //! `ticket_source` (`github`, `jira`, `alert` or `plugin`), a ticket id whose
 //! prefix says which part of CoderHelm made it (`E2E-FIX-`, `LOG-`,
-//! `ALERT-`), who asked (`requester_*`, or the free-text `sender` on older
+//! `ALERT-`, `SEC-`), who asked (`requester_*`, or the free-text `sender` on older
 //! runs) and, for runs of a plan's task, `plan_id`. [`kind`] reads those
 //! fields alone, so the runs list can filter on it while it scans; [`trigger`]
 //! adds the words and the link, using a few records looked up once per page
@@ -25,6 +25,8 @@ const E2E_FIX: &str = "E2E-FIX-";
 const E2E_GEN: &str = "E2E-GEN-";
 /// Ticket id of an alert (`ALERT-<hash>`).
 const ALERT: &str = "ALERT-";
+/// Ticket id of a security fix (`SEC-<hash>`, `common::security_fixes`).
+const SEC: &str = common::security_fixes::TICKET_PREFIX;
 
 /// The group a run's start belongs to, which the runs list filters on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, utoipa::ToSchema)]
@@ -154,6 +156,9 @@ pub fn kind(item: &Item) -> TriggerKind {
     if ticket.starts_with(E2E_FIX) || ticket.starts_with(E2E_GEN) {
         return TriggerKind::Coderhelm;
     }
+    if ticket.starts_with(SEC) {
+        return TriggerKind::Coderhelm;
+    }
     if common::log_findings::is_log_ticket(ticket) {
         return if log_fix_is_automatic(item) {
             TriggerKind::Coderhelm
@@ -184,7 +189,7 @@ pub struct Lookups {
     /// The team's Jira site, `https://<site>.atlassian.net`.
     pub jira_site: Option<String>,
     /// Settings-table items by sort key: `LOG_TICKET#`, `ALERT_TICKET#`,
-    /// `JIRAUSER#`.
+    /// `SEC_TICKET#`, `JIRAUSER#`.
     pub records: HashMap<String, Item>,
 }
 
@@ -222,6 +227,8 @@ pub fn lookup_keys<'a>(items: impl IntoIterator<Item = &'a Item>) -> Vec<String>
             keys.push(log_ticket_sk(ticket));
         } else if ticket.starts_with(ALERT) {
             keys.push(alert_ticket_sk(ticket));
+        } else if ticket.starts_with(SEC) {
+            keys.push(common::security_fixes::ticket_sk(ticket));
         }
         if let Some(id) = jira_account(item) {
             keys.push(requester::jira_user_sk(&id));
@@ -401,6 +408,18 @@ pub fn trigger(item: &Item, lookups: &Lookups) -> RunTrigger {
             Some("/tests".to_string()),
             None,
         ),
+        _ if ticket.starts_with(SEC) => {
+            let rec = lookups.record(&common::security_fixes::ticket_sk(ticket));
+            let url = rec
+                .map(|r| s(r, "lead_finding"))
+                .filter(|id| !id.is_empty())
+                .map(|id| format!("/security/detail?id={}", q(id)))
+                .unwrap_or_else(|| "/security".to_string());
+            let name = rec
+                .and_then(|r| some(s(r, "title")))
+                .or_else(|| some(s(item, "title")));
+            t("Started by Coderhelm · security fix", name, Some(url), None)
+        }
         _ if common::log_findings::is_log_ticket(ticket) => {
             let rec = lookups.record(&log_ticket_sk(ticket));
             let url = rec
@@ -652,6 +671,39 @@ mod tests {
         assert_eq!(tr.r#ref.as_deref(), Some("api-5xx"));
         assert_eq!(tr.ref_url.as_deref(), Some("/alerts/detail?id=ev%201"));
         assert_eq!(tr.by, None);
+    }
+
+    #[test]
+    fn a_security_fix_is_coderhelms_and_links_its_finding() {
+        let item = run(&[
+            ("ticket_source", "alert"),
+            ("ticket_id", "SEC-1A2B3C4D5E6F"),
+            ("sender", "security"),
+            ("requester_key", "coderhelm:security"),
+            (
+                "title",
+                "fix(deps): bump undici 6.19.2 to 6.21.1 [SECURITY] (CVE-2026-31337)",
+            ),
+        ]);
+        assert_eq!(kind(&item), TriggerKind::Coderhelm);
+        assert_eq!(lookup_keys([&item]), vec!["SEC_TICKET#SEC-1A2B3C4D5E6F"]);
+        let mut l = Lookups::default();
+        assert_eq!(trigger(&item, &l).ref_url.as_deref(), Some("/security"));
+        l.records.insert(
+            "SEC_TICKET#SEC-1A2B3C4D5E6F".into(),
+            rec(&[
+                ("lead_finding", "abc123"),
+                ("title", "fix(deps): bump undici"),
+            ]),
+        );
+        let tr = trigger(&item, &l);
+        assert_eq!(tr.label, "Started by Coderhelm · security fix");
+        assert_eq!(tr.ref_url.as_deref(), Some("/security/detail?id=abc123"));
+        assert_eq!(tr.by, None);
+        assert_eq!(
+            Requester::coderhelm(requester::SECURITY).key,
+            "coderhelm:security"
+        );
     }
 
     #[test]
