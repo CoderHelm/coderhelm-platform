@@ -1904,108 +1904,168 @@ pub async fn get_run_traces(
     Ok(Json(json!({ "traces": traces })))
 }
 
-/// GET /api/runs/:run_id/agent-log — fetch conversation logs from S3.
+/// GET /api/runs/:run_id/agent-log: the run's agent logs and live tool
+/// events.
+///
+/// `passes` holds one item per stored log (`common::agent_log` has the
+/// format), in the order they ran, each with `{id, pass, round, step,
+/// started_at, ended_at, format, conversation}`. `live_events` holds every
+/// tool event of the run (read across every page of the query), oldest
+/// first; `live_events_truncated` is true when more were left unread.
 pub async fn get_agent_log(
     State(state): State<Arc<AppState>>,
     Extension(claims): Extension<Claims>,
     axum::extract::Path(run_id): axum::extract::Path<String>,
 ) -> Result<Json<Value>, StatusCode> {
-    // Verify the run belongs to this team
-    let _ = state
+    // Verify the run belongs to this team (and read when each pass began).
+    let run = state
         .dynamo
         .get_item()
         .table_name(&state.config.runs_table_name)
         .key("team_id", attr_s(&claims.team_id))
         .key("run_id", attr_s(&run_id))
-        .projection_expression("run_id")
+        .projection_expression("run_id, pass_history")
         .send()
         .await
         .map_err(|e| {
             error!("Failed to verify run ownership for agent-log: {e}");
             StatusCode::INTERNAL_SERVER_ERROR
-        })?
-        .item()
-        .ok_or(StatusCode::NOT_FOUND)?;
-
-    // List all conversation log files under runs/{team_id}/{run_id}/conversation/
-    let prefix = format!("runs/{}/{}/conversation/", claims.team_id, run_id);
-    let list_result = state
-        .s3
-        .list_objects_v2()
-        .bucket(&state.config.bucket_name)
-        .prefix(&prefix)
-        .send()
-        .await
-        .map_err(|e| {
-            error!("Failed to list agent-log objects: {e}");
-            StatusCode::INTERNAL_SERVER_ERROR
         })?;
+    let run = run.item().ok_or(StatusCode::NOT_FOUND)?;
+    let history = agent_log_pass_history(run);
 
-    let mut passes: Vec<Value> = Vec::new();
-    for obj in list_result.contents() {
-        let key = obj.key().unwrap_or_default();
-        let pass_name = key
-            .strip_prefix(&prefix)
-            .unwrap_or(key)
-            .trim_end_matches(".json");
-        if let Ok(output) = state
+    // Every log file under runs/{team_id}/{run_id}/conversation/, every page.
+    let prefix = common::agent_log::log_prefix(&claims.team_id, &run_id);
+    let mut objects: Vec<(String, Option<String>)> = Vec::new();
+    let mut token: Option<String> = None;
+    loop {
+        let page = state
             .s3
-            .get_object()
+            .list_objects_v2()
             .bucket(&state.config.bucket_name)
-            .key(key)
+            .prefix(&prefix)
+            .set_continuation_token(token.take())
             .send()
             .await
-        {
-            if let Ok(bytes) = output.body.collect().await {
-                if let Ok(log) = serde_json::from_slice::<Value>(&bytes.into_bytes()) {
-                    passes.push(json!({
-                        "pass": pass_name,
-                        "conversation": log
-                    }));
-                }
-            }
+            .map_err(|e| {
+                error!("Failed to list agent-log objects: {e}");
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
+        for obj in page.contents() {
+            let key = obj.key().unwrap_or_default().to_string();
+            let stored_at = obj.last_modified().and_then(|t| {
+                chrono::DateTime::<chrono::Utc>::from_timestamp(t.secs(), t.subsec_nanos())
+                    .map(common::agent_log::rfc3339)
+            });
+            objects.push((key, stored_at));
+        }
+        match page.next_continuation_token() {
+            Some(t) if page.is_truncated() == Some(true) => token = Some(t.to_string()),
+            _ => break,
         }
     }
 
-    // Also fetch live tool_call events from events table
+    let fetches = objects.into_iter().map(|(key, stored_at)| {
+        let state = state.clone();
+        let prefix = prefix.clone();
+        async move {
+            let output = state
+                .s3
+                .get_object()
+                .bucket(&state.config.bucket_name)
+                .key(&key)
+                .send()
+                .await
+                .ok()?;
+            let bytes = output.body.collect().await.ok()?.into_bytes();
+            let body = serde_json::from_slice::<Value>(&bytes).ok()?;
+            let name = key.strip_prefix(&prefix).unwrap_or(&key);
+            common::agent_log::parse_file(name, body, stored_at)
+        }
+    });
+    let logs: Vec<common::agent_log::PassLog> = futures::future::join_all(fetches)
+        .await
+        .into_iter()
+        .flatten()
+        .collect();
+    let passes: Vec<Value> = common::agent_log::order_logs(logs, &history)
+        .iter()
+        .map(|l| l.to_value())
+        .collect();
+
+    // Live tool events from the events table, across every page.
     let mut live_events: Vec<Value> = Vec::new();
+    let mut live_events_truncated = false;
     if !state.config.events_table_name.is_empty() {
-        if let Ok(result) = state
+        let query = state
             .dynamo
             .query()
             .table_name(&state.config.events_table_name)
             .key_condition_expression("pk = :pk AND begins_with(sk, :prefix)")
             .expression_attribute_values(":pk", attr_s(&format!("RUN#{run_id}")))
-            .expression_attribute_values(":prefix", attr_s("TOOL#"))
-            .send()
-            .await
+            .expression_attribute_values(":prefix", attr_s("TOOL#"));
+        match common::paged::all_pages(
+            |start| {
+                let q = query.clone().set_exclusive_start_key(start);
+                async move {
+                    let out = q
+                        .send()
+                        .await
+                        .map_err(|e| aws_sdk_dynamodb::error::DisplayErrorContext(e).to_string())?;
+                    Ok::<_, String>((out.items.unwrap_or_default(), out.last_evaluated_key))
+                }
+            },
+            AGENT_LOG_EVENT_PAGES,
+        )
+        .await
         {
-            for item in result.items() {
-                let payload_str = item
-                    .get("payload")
-                    .and_then(|v| v.as_s().ok())
-                    .cloned()
-                    .unwrap_or_default();
-                let payload: Value = serde_json::from_str(&payload_str).unwrap_or_default();
-                let timestamp = item
-                    .get("timestamp")
-                    .and_then(|v| v.as_s().ok())
-                    .cloned()
-                    .unwrap_or_default();
-                live_events.push(json!({
-                    "tool": payload.get("tool").and_then(|v| v.as_str()).unwrap_or(""),
-                    "input_summary": payload.get("input_summary").and_then(|v| v.as_str()).unwrap_or(""),
-                    "duration_ms": payload.get("duration_ms").and_then(|v| v.as_u64()).unwrap_or(0),
-                    "is_error": payload.get("is_error").and_then(|v| v.as_bool()).unwrap_or(false),
-                    "timestamp": timestamp,
-                }));
+            Ok((items, more)) => {
+                live_events_truncated = more;
+                for item in &items {
+                    let payload: Value = item
+                        .get("payload")
+                        .and_then(|v| v.as_s().ok())
+                        .and_then(|p| serde_json::from_str(p).ok())
+                        .unwrap_or_default();
+                    let timestamp = item
+                        .get("timestamp")
+                        .and_then(|v| v.as_s().ok())
+                        .map(String::as_str)
+                        .unwrap_or_default();
+                    live_events.push(common::agent_log::live_event(&payload, timestamp));
+                }
             }
+            Err(e) => warn!(run_id, error = %e, "Failed to read live tool events"),
         }
     }
 
-    Ok(Json(
-        json!({ "passes": passes, "live_events": live_events }),
-    ))
+    Ok(Json(json!({
+        "passes": passes,
+        "live_events": live_events,
+        "live_events_truncated": live_events_truncated,
+    })))
+}
+
+/// The most pages of live tool events one agent-log read takes (1 MB each).
+const AGENT_LOG_EVENT_PAGES: usize = 20;
+
+/// A run's `pass_history` as `(pass, started_at)` in run order.
+fn agent_log_pass_history(
+    run: &std::collections::HashMap<String, AttributeValue>,
+) -> Vec<(String, String)> {
+    run.get("pass_history")
+        .and_then(|v| v.as_l().ok())
+        .map(|list| {
+            list.iter()
+                .filter_map(|e| {
+                    let m = e.as_m().ok()?;
+                    let pass = m.get("pass")?.as_s().ok()?.clone();
+                    let at = m.get("started_at")?.as_s().ok()?.clone();
+                    Some((pass, at))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// GET /api/runs/:run_id/openspec — fetch the four openspec files from S3.
@@ -6757,5 +6817,39 @@ mod trace_detail_tests {
         assert_eq!(d["reviews"][0]["gaps"], "No rollback task");
         assert_eq!(trace_detail(Some(&"cut {".to_string())), json!("cut {"));
         assert_eq!(trace_detail(None), Value::Null);
+    }
+}
+
+#[cfg(test)]
+mod agent_log_tests {
+    use super::*;
+
+    #[test]
+    fn pass_history_reads_in_run_order_and_skips_bad_entries() {
+        let entry = |p: &str, t: &str| {
+            AttributeValue::M(std::collections::HashMap::from([
+                ("pass".to_string(), AttributeValue::S(p.into())),
+                ("started_at".to_string(), AttributeValue::S(t.into())),
+            ]))
+        };
+        let run = std::collections::HashMap::from([(
+            "pass_history".to_string(),
+            AttributeValue::L(vec![
+                entry("plan", "2026-11-10T10:00:00+00:00"),
+                AttributeValue::S("junk".into()),
+                entry("implement", "2026-11-10T10:05:00+00:00"),
+            ]),
+        )]);
+        assert_eq!(
+            agent_log_pass_history(&run),
+            vec![
+                ("plan".to_string(), "2026-11-10T10:00:00+00:00".to_string()),
+                (
+                    "implement".to_string(),
+                    "2026-11-10T10:05:00+00:00".to_string()
+                ),
+            ]
+        );
+        assert!(agent_log_pass_history(&Default::default()).is_empty());
     }
 }

@@ -7628,6 +7628,8 @@ pub(crate) async fn update_pass(
     run_id: &str,
     pass: &str,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    // The agent log files this pass's model calls under its name.
+    crate::agent::run_log::set_pass(run_id, pass);
     let now = chrono::Utc::now().to_rfc3339();
     let entry = aws_sdk_dynamodb::types::AttributeValue::M(std::collections::HashMap::from([
         ("pass".to_string(), attr_s(pass)),
@@ -8592,7 +8594,8 @@ pub(crate) async fn add_progress_note(
     .await;
 }
 
-/// Write a conversation log to S3 for the agent log viewer.
+/// Write a conversation log to S3 for the agent log viewer: a new file per
+/// call, so a later round of the same pass never replaces this one.
 async fn write_conversation_log(
     state: &WorkerState,
     team_id: &str,
@@ -8600,36 +8603,7 @@ async fn write_conversation_log(
     pass_name: &str,
     log: &[serde_json::Value],
 ) {
-    if log.is_empty() {
-        return;
-    }
-    let key = format!("runs/{team_id}/{run_id}/conversation/{pass_name}.json");
-    match serde_json::to_vec(log) {
-        Ok(body) => {
-            if let Err(e) = state
-                .s3
-                .put_object()
-                .bucket(&state.config.bucket_name)
-                .key(&key)
-                .body(body.into())
-                .content_type("application/json")
-                .send()
-                .await
-            {
-                warn!(run_id, pass_name, error = %e, "Failed to write conversation log to S3");
-            } else {
-                info!(
-                    run_id,
-                    pass_name,
-                    entries = log.len(),
-                    "Conversation log saved to S3"
-                );
-            }
-        }
-        Err(e) => {
-            warn!(run_id, pass_name, error = %e, "Failed to serialize conversation log");
-        }
-    }
+    crate::agent::run_log::write(state, team_id, run_id, pass_name, None, log).await;
 }
 
 /// Check if a person ended the run from the dashboard (cancelled or closed

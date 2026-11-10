@@ -255,7 +255,17 @@ pub async fn converse(
     // tool the policy would refuse whatever the call is never offered.
     let mut gate = super::policy::gate(state, provider.scope.ctx(agent), opts.deadline);
     let tools = super::policy::offerable(&mut gate, tools).await;
-    anthropic::converse_tool_loop(
+    // A loop on a run whose caller keeps no log of its own is logged here,
+    // under the pass the run is in, one file per call (`run_log`).
+    let scope = &provider.scope;
+    let mut own: Vec<serde_json::Value> = Vec::new();
+    let own_log = conversation_log.is_none() && !scope.run_id.is_empty() && !scope.team.is_empty();
+    let log = match conversation_log {
+        Some(l) => Some(l),
+        None if own_log => Some(&mut own),
+        None => None,
+    };
+    let out = anthropic::converse_tool_loop(
         &client,
         model_id,
         system_prompt,
@@ -269,9 +279,15 @@ pub async fn converse(
         opts.deadline,
         opts.effort,
         observer,
-        conversation_log,
+        log,
     )
-    .await
+    .await;
+    if own_log {
+        let step = scope.agent(agent).key();
+        let pass = super::run_log::current_pass(&scope.run_id).unwrap_or_else(|| step.to_string());
+        super::run_log::write(state, &scope.team, &scope.run_id, &pass, Some(step), &own).await;
+    }
+    out
 }
 
 /// Simple one-shot converse (no tools) via Anthropic Messages API.

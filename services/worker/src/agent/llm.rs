@@ -27,8 +27,34 @@ impl Default for ConverseOptions {
     }
 }
 
-/// Observer invoked after each tool call: (tool_name, duration_ms, input_summary, is_error).
-pub type OnToolCall = dyn Fn(&str, u64, &str, bool) + Send + Sync;
+/// One tool call that ended (or was refused), as a loop observer sees it.
+pub struct ToolEnded<'a> {
+    pub name: &'a str,
+    pub input: &'a Value,
+    /// The model's id for the call (`toolu_…`), the same as in the log.
+    pub tool_use_id: &'a str,
+    /// When the call started (RFC 3339, UTC, milliseconds).
+    pub started_at: &'a str,
+    pub duration_ms: u64,
+    /// It failed or was refused.
+    pub is_error: bool,
+    pub outcome: &'a common::agent_log::ToolOutcome,
+}
+
+/// A tool call as a [`ToolCallFn`] gets it: the input as a short summary
+/// ([`input_summary`]), never the whole input.
+pub struct ToolEvent<'a> {
+    pub tool: &'a str,
+    pub input_summary: &'a str,
+    pub tool_use_id: &'a str,
+    pub started_at: &'a str,
+    pub duration_ms: u64,
+    pub is_error: bool,
+    pub outcome: &'a common::agent_log::ToolOutcome,
+}
+
+/// Observer invoked after each tool call.
+pub type OnToolCall = dyn Fn(&ToolEvent<'_>) + Send + Sync;
 
 /// Watches a tool loop as it runs: what the agent wrote before each batch
 /// of tool calls, and each call once it ended (or was refused). Called
@@ -39,6 +65,11 @@ pub trait LoopObserver: Send + Sync {
     /// One tool call ended: its name, its input, how long it took, and
     /// whether it failed or was refused.
     fn on_tool_call(&self, name: &str, input: &Value, duration_ms: u64, is_error: bool);
+    /// One tool call ended, with its id, start and outcome. The loop calls
+    /// this; by default it is [`LoopObserver::on_tool_call`].
+    fn on_tool_ended(&self, call: &ToolEnded<'_>) {
+        self.on_tool_call(call.name, call.input, call.duration_ms, call.is_error);
+    }
 }
 
 /// A plain [`OnToolCall`] closure as a loop observer: it sees each call with
@@ -47,7 +78,28 @@ pub struct ToolCallFn(pub Box<OnToolCall>);
 
 impl LoopObserver for ToolCallFn {
     fn on_tool_call(&self, name: &str, input: &Value, duration_ms: u64, is_error: bool) {
-        (self.0)(name, duration_ms, &input_summary(input), is_error);
+        let outcome = common::agent_log::ToolOutcome::default_for(is_error);
+        self.on_tool_ended(&ToolEnded {
+            name,
+            input,
+            tool_use_id: "",
+            started_at: "",
+            duration_ms,
+            is_error,
+            outcome: &outcome,
+        });
+    }
+    fn on_tool_ended(&self, call: &ToolEnded<'_>) {
+        let summary = input_summary(call.input);
+        (self.0)(&ToolEvent {
+            tool: call.name,
+            input_summary: &summary,
+            tool_use_id: call.tool_use_id,
+            started_at: call.started_at,
+            duration_ms: call.duration_ms,
+            is_error: call.is_error,
+            outcome: call.outcome,
+        });
     }
 }
 

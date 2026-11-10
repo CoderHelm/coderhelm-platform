@@ -717,6 +717,18 @@ pub async fn converse_tool_loop(
 
     let mut turns: usize = 0;
     let mut deadline_warned = false;
+    // Which model call of the log this is: turns start again at 1 in each.
+    let call = conversation_log.as_deref().map_or(1, |l| call_index(l));
+    if let Some(log) = conversation_log.as_deref_mut() {
+        log.push(json!({
+            "role": "call_started",
+            "call": call,
+            "turn": 0,
+            "started_at": common::agent_log::now(),
+            "model": model_id,
+            "max_turns": max_turns,
+        }));
+    }
     // Set once the step budget is used: one more turn, with tools off, in
     // which the agent must answer from what it already learned. Without it,
     // everything a planner read was thrown away the moment it ran out.
@@ -735,14 +747,16 @@ pub async fn converse_tool_loop(
             }
             answer_now = true;
             warn!("Hit max turn limit ({max_turns}), asking for the final answer with tools off");
+            log_note(
+                conversation_log.as_deref_mut(),
+                call,
+                turns,
+                common::agent_log::NoteKind::ToolsOff,
+                TOOLS_OFF_NOTE,
+            );
             messages.push((
                 "user".to_string(),
-                vec![json!({"type": "text", "text":
-                    "[SYSTEM NOTE] You have used every tool step. Tools are now off. Write your \
-                     final answer NOW, in exactly the format you were asked for, using what you \
-                     have already learned. Where something is still unknown, say so in the \
-                     answer instead of guessing."
-                })],
+                vec![json!({"type": "text", "text": TOOLS_OFF_NOTE})],
             ));
         }
 
@@ -760,6 +774,13 @@ pub async fn converse_tool_loop(
                     remaining,
                     "Approaching deadline — injecting wrap-up message"
                 );
+                log_note(
+                    conversation_log.as_deref_mut(),
+                    call,
+                    turns,
+                    common::agent_log::NoteKind::WrapUp,
+                    WRAP_UP_NOTE,
+                );
                 messages.push((
                     "user".to_string(),
                     vec![json!({"type": "text", "text":
@@ -770,12 +791,19 @@ pub async fn converse_tool_loop(
         }
 
         // Progress note every 10 turns
-        if turns > 1 && (turns.is_multiple_of(5) || turns == max_turns - 2) {
+        if turns > 1 && (turns.is_multiple_of(5) || turns == max_turns.saturating_sub(2)) {
             info!(turns, "Injecting progress note at turn {turns}");
-            let remaining = max_turns - turns;
+            let remaining = max_turns.saturating_sub(turns);
             let note = format!(
                 "[SYSTEM NOTE] You have used {turns} of {max_turns} tool-use turns. \
                  {remaining} turns remaining. Focus on completing the task efficiently."
+            );
+            log_note(
+                conversation_log.as_deref_mut(),
+                call,
+                turns,
+                common::agent_log::NoteKind::TurnBudget,
+                &note,
             );
             messages.push((
                 "user".to_string(),
@@ -793,7 +821,9 @@ pub async fn converse_tool_loop(
             effort,
         );
 
+        let asked_at = common::agent_log::now();
         let response = send_request(client, &request, usage).await?;
+        let answered_at = common::agent_log::now();
 
         if let Some(refusal) = response.refusal() {
             return Err(refusal.into());
@@ -862,7 +892,10 @@ pub async fn converse_tool_loop(
             if let Some(ref mut log) = conversation_log {
                 log.push(json!({
                     "turn": turns,
+                    "call": call,
                     "role": "assistant",
+                    "started_at": asked_at,
+                    "ended_at": answered_at,
                     "content": response.content,
                     "usage": {
                         "input_tokens": response.usage.input_tokens,
@@ -901,16 +934,33 @@ pub async fn converse_tool_loop(
 
         // Execute tools, each only after the policy gate allows it.
         let mut tool_results: Vec<Value> = Vec::new();
+        // The same results as the log keeps them: with when each call
+        // started, how long it took and how it ended. Never sent to the
+        // model (the API takes only its own fields).
+        let mut logged: Vec<Value> = Vec::new();
+        let results_started_at = common::agent_log::now();
         // Set once GitHub refused a call for a while (its rate limit, a
         // 5xx): the calls after it in this turn aren't run, and the loop
         // ends after this turn so the run can wait (`common::github_wait`).
         let mut paused: Option<crate::clients::github::GitHubPaused> = None;
         for (tool_id, tool_name, tool_input) in &tool_uses {
+            let started_at = common::agent_log::now();
             if let Some(p) = &paused {
+                let content = common::github_wait::not_run(p.cause, p.until);
+                let outcome = common::agent_log::ToolOutcome::refused("not run: GitHub is paused");
+                logged.push(logged_result(
+                    tool_id,
+                    tool_name,
+                    &content,
+                    true,
+                    &started_at,
+                    0,
+                    &outcome,
+                ));
                 tool_results.push(json!({
                     "type": "tool_result",
                     "tool_use_id": tool_id,
-                    "content": common::github_wait::not_run(p.cause, p.until),
+                    "content": content,
                     "is_error": true
                 }));
                 continue;
@@ -918,21 +968,41 @@ pub async fn converse_tool_loop(
             let tool_start = std::time::Instant::now();
             info!(tool = %tool_name, "Executing tool");
 
-            let ran = match super::policy::gated_execute(
+            let (gated, noted) = super::tool_outcome::capture(super::policy::gated_execute(
                 gate,
                 tool_executor,
                 tool_name,
                 tool_input,
                 common::truncate_str(why.trim(), 500),
-            )
-            .await
-            {
+            ))
+            .await;
+            let ran = match gated {
                 super::policy::Gated::Ran(r) => r,
                 super::policy::Gated::Refused(message) => {
+                    let outcome = common::agent_log::ToolOutcome::refused(
+                        "the agent policy did not allow it",
+                    );
                     if let Some(o) = observer {
-                        o.on_tool_call(tool_name, tool_input, 0, true);
+                        o.on_tool_ended(&super::llm::ToolEnded {
+                            name: tool_name,
+                            input: tool_input,
+                            tool_use_id: tool_id,
+                            started_at: &started_at,
+                            duration_ms: 0,
+                            is_error: true,
+                            outcome: &outcome,
+                        });
                     }
                     info!(tool = %tool_name, "Tool not run: the policy gate said no");
+                    logged.push(logged_result(
+                        tool_id,
+                        tool_name,
+                        &message,
+                        true,
+                        &started_at,
+                        0,
+                        &outcome,
+                    ));
                     tool_results.push(json!({
                         "type": "tool_result",
                         "tool_use_id": tool_id,
@@ -946,26 +1016,14 @@ pub async fn converse_tool_loop(
                     return Err(Box::new(common::agent_policy::AgentStopped(stop)));
                 }
             };
-            match ran {
+            let duration_ms = tool_start.elapsed().as_millis() as u64;
+            usage.record_tool_call(tool_name, duration_ms);
+            let (content, is_error) = match ran {
                 Ok(result) => {
-                    let duration_ms = tool_start.elapsed().as_millis() as u64;
-                    usage.record_tool_call(tool_name, duration_ms);
-                    if let Some(o) = observer {
-                        o.on_tool_call(tool_name, tool_input, duration_ms, false);
-                    }
                     info!(tool = %tool_name, duration_ms, "Tool completed");
-                    tool_results.push(json!({
-                        "type": "tool_result",
-                        "tool_use_id": tool_id,
-                        "content": serde_json::to_string(&result)?
-                    }));
+                    (serde_json::to_string(&result)?, false)
                 }
                 Err(e) => {
-                    let duration_ms = tool_start.elapsed().as_millis() as u64;
-                    usage.record_tool_call(tool_name, duration_ms);
-                    if let Some(o) = observer {
-                        o.on_tool_call(tool_name, tool_input, duration_ms, true);
-                    }
                     warn!(tool = %tool_name, error = %e, duration_ms, "Tool execution failed");
                     // GitHub refusing for a while is not an answer to retry:
                     // the model is told the run pauses, and the loop ends.
@@ -984,14 +1042,49 @@ pub async fn converse_tool_loop(
                         }
                         None => format!("Error: {e}"),
                     };
-                    tool_results.push(json!({
-                        "type": "tool_result",
-                        "tool_use_id": tool_id,
-                        "content": content,
-                        "is_error": true
-                    }));
+                    (content, true)
                 }
+            };
+            // The tool's own word on how it went, else how it returned.
+            let outcome = match noted {
+                Some(o) if !is_error => o,
+                Some(o) if o.status == common::agent_log::OutcomeStatus::Error => o,
+                _ => common::agent_log::ToolOutcome::default_for(is_error),
+            };
+            if let Some(o) = observer {
+                o.on_tool_ended(&super::llm::ToolEnded {
+                    name: tool_name,
+                    input: tool_input,
+                    tool_use_id: tool_id,
+                    started_at: &started_at,
+                    duration_ms,
+                    is_error,
+                    outcome: &outcome,
+                });
             }
+            logged.push(logged_result(
+                tool_id,
+                tool_name,
+                &content,
+                is_error,
+                &started_at,
+                duration_ms,
+                &outcome,
+            ));
+            tool_results.push(if is_error {
+                json!({
+                    "type": "tool_result",
+                    "tool_use_id": tool_id,
+                    "content": content,
+                    "is_error": true
+                })
+            } else {
+                json!({
+                    "type": "tool_result",
+                    "tool_use_id": tool_id,
+                    "content": content
+                })
+            });
         }
 
         // Log this turn to the conversation log (before compaction loses it)
@@ -999,7 +1092,10 @@ pub async fn converse_tool_loop(
             // Log assistant response with tool calls
             log.push(json!({
                 "turn": turns,
+                "call": call,
                 "role": "assistant",
+                "started_at": asked_at,
+                "ended_at": answered_at,
                 "content": response.content,
                 "usage": {
                     "input_tokens": response.usage.input_tokens,
@@ -1008,27 +1104,13 @@ pub async fn converse_tool_loop(
                     "cache_write": response.usage.cache_creation_input_tokens
                 }
             }));
-            // Log tool results (truncate large outputs to 100KB)
-            let truncated_results: Vec<Value> = tool_results
-                .iter()
-                .map(|r| {
-                    let mut entry = r.clone();
-                    if let Some(content) = entry.get("content").and_then(|c| c.as_str()) {
-                        if content.len() > 102_400 {
-                            entry["content"] = Value::String(format!(
-                                "{}... [truncated, {} bytes total]",
-                                common::truncate_str(content, 102_400),
-                                content.len()
-                            ));
-                        }
-                    }
-                    entry
-                })
-                .collect();
             log.push(json!({
                 "turn": turns,
+                "call": call,
                 "role": "tool_results",
-                "content": truncated_results
+                "started_at": results_started_at,
+                "ended_at": common::agent_log::now(),
+                "content": logged
             }));
         }
 
@@ -1037,6 +1119,69 @@ pub async fn converse_tool_loop(
             return Err(Box::new(p));
         }
     }
+}
+
+/// The note the loop sends when every tool step is used.
+const TOOLS_OFF_NOTE: &str = "[SYSTEM NOTE] You have used every tool step. Tools are now off. \
+     Write your final answer NOW, in exactly the format you were asked for, using what you have \
+     already learned. Where something is still unknown, say so in the answer instead of guessing.";
+
+/// The 1-based index of the model call about to start in `log`: one more
+/// than the calls already in it.
+fn call_index(log: &[Value]) -> usize {
+    log.iter()
+        .filter(|e| e.get("role").and_then(|r| r.as_str()) == Some("call_started"))
+        .count()
+        + 1
+}
+
+/// Logs a message the loop put into the conversation itself.
+fn log_note(
+    log: Option<&mut Vec<Value>>,
+    call: usize,
+    turn: usize,
+    kind: common::agent_log::NoteKind,
+    text: &str,
+) {
+    if let Some(log) = log {
+        log.push(json!({
+            "role": "system_note",
+            "call": call,
+            "turn": turn,
+            "kind": kind.as_str(),
+            "text": text,
+            "started_at": common::agent_log::now(),
+        }));
+    }
+}
+
+/// One tool result as the log keeps it: the content the model saw (cut to
+/// the log's cap), how it is encoded, the tool, when it started, how long
+/// it took and how it ended.
+#[allow(clippy::too_many_arguments)]
+fn logged_result(
+    tool_use_id: &str,
+    tool: &str,
+    content: &str,
+    is_error: bool,
+    started_at: &str,
+    duration_ms: u64,
+    outcome: &common::agent_log::ToolOutcome,
+) -> Value {
+    let mut r = json!({
+        "type": "tool_result",
+        "tool_use_id": tool_use_id,
+        "tool": tool,
+        "content": common::agent_log::cap_result(content),
+        "content_encoding": common::agent_log::content_encoding(content),
+        "started_at": started_at,
+        "duration_ms": duration_ms,
+        "outcome": outcome.to_value(),
+    });
+    if is_error {
+        r["is_error"] = json!(true);
+    }
+    r
 }
 
 /// One turn's request of the tool loop. Rendered in the order tools,
@@ -1708,6 +1853,246 @@ mod accounting_tests {
                  installation ID 1."
                 .into())
         }
+    }
+
+    /// Says how its call went, the way the build tools do.
+    struct NotingFiles;
+
+    #[async_trait::async_trait]
+    impl super::super::llm::ToolExecutor for NotingFiles {
+        async fn execute(
+            &self,
+            _name: &str,
+            _input: &Value,
+        ) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
+            crate::agent::tool_outcome::note(common::agent_log::ToolOutcome::soft_fail(
+                "no edits applied: 1 of 1 did not match",
+            ));
+            Ok(json!("NO edits applied to a.rs"))
+        }
+    }
+
+    /// Records what the loop tells an observer about each call.
+    #[derive(Default)]
+    struct Ended(Mutex<Vec<(String, String, String)>>);
+
+    impl super::super::llm::LoopObserver for Ended {
+        fn on_tool_call(&self, _: &str, _: &Value, _: u64, _: bool) {}
+        fn on_tool_ended(&self, call: &super::super::llm::ToolEnded<'_>) {
+            self.0.lock().unwrap().push((
+                call.tool_use_id.to_string(),
+                call.started_at.to_string(),
+                serde_json::to_string(call.outcome).unwrap(),
+            ));
+        }
+    }
+
+    async fn logged_loop(
+        replies: Vec<String>,
+        max_turns: usize,
+        executor: &dyn super::super::llm::ToolExecutor,
+        log: &mut Vec<Value>,
+        observer: Option<&dyn super::super::llm::LoopObserver>,
+    ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+        let (url, _) = server(replies).await;
+        let (meter, _) = UsageMeter::memory("team-1");
+        let client = AnthropicClient::new("k".into(), meter).at(&url);
+        let tools = crate::passes::review_agent::review_tools();
+        let gate = common::agent_policy::Gate::new(
+            Arc::new(common::agent_policy::store::MemStore::new()),
+            common::agent_policy::GateCtx::new("t", common::agent_policy::Agent::Reviewer),
+        )
+        .offering(tools.iter().map(|t| t.name.clone()));
+        let mut messages = vec![(
+            "user".to_string(),
+            vec![json!({"type":"text","text":"review"})],
+        )];
+        let mut usage = TokenUsage::default();
+        converse_tool_loop(
+            &client,
+            "claude-opus-5-5",
+            "You review code.",
+            &mut messages,
+            &tools,
+            executor,
+            &gate,
+            &mut usage,
+            max_turns,
+            1024,
+            None,
+            None,
+            observer,
+            Some(log),
+        )
+        .await
+    }
+
+    fn roles(log: &[Value]) -> Vec<String> {
+        log.iter()
+            .map(|e| e["role"].as_str().unwrap_or("").to_string())
+            .collect()
+    }
+
+    /// Every entry is timed and belongs to a call; each tool result has its
+    /// id, start, duration, encoding and the outcome its tool noted; the
+    /// observer gets the same id, start and outcome.
+    #[tokio::test]
+    async fn the_log_times_every_entry_and_keeps_tool_outcomes() {
+        let mut log = Vec::new();
+        let seen = Ended::default();
+        let out = logged_loop(
+            vec![tool_turn(0, 0), answer_turn(0, 0)],
+            10,
+            &NotingFiles,
+            &mut log,
+            Some(&seen),
+        )
+        .await
+        .unwrap();
+        assert_eq!(out, "done");
+        assert_eq!(
+            roles(&log),
+            vec!["call_started", "assistant", "tool_results", "assistant"]
+        );
+        assert_eq!(log[0]["call"], 1);
+        assert_eq!(log[0]["model"], "claude-opus-5-5");
+        assert_eq!(log[0]["max_turns"], 10);
+        for e in &log[1..] {
+            assert_eq!(e["call"], 1, "{e}");
+            assert!(e["started_at"].as_str().is_some(), "{e}");
+        }
+        for a in [&log[1], &log[3]] {
+            let (start, end) = (
+                a["started_at"].as_str().unwrap(),
+                a["ended_at"].as_str().unwrap(),
+            );
+            assert!(start <= end);
+        }
+        assert_eq!(log[3]["stop_reason"], "end_turn");
+        let r = &log[2]["content"][0];
+        assert_eq!(r["tool_use_id"], "tu0");
+        assert_eq!(r["tool"], "read_file");
+        assert_eq!(r["content_encoding"], "json");
+        assert!(r["duration_ms"].as_u64().is_some());
+        assert!(r["started_at"].as_str().is_some());
+        assert_eq!(r["outcome"]["status"], "soft_fail");
+        assert_eq!(
+            r["outcome"]["summary"],
+            "no edits applied: 1 of 1 did not match"
+        );
+        assert!(r.get("is_error").is_none());
+        let seen = seen.0.lock().unwrap();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].0, "tu0");
+        assert_eq!(seen[0].1, r["started_at"].as_str().unwrap());
+        assert!(seen[0].2.contains("soft_fail"));
+    }
+
+    /// A tool that says nothing is `ok`; a failed call is `error` with plain
+    /// text content.
+    #[tokio::test]
+    async fn outcomes_default_from_how_the_call_returned() {
+        let mut log = Vec::new();
+        logged_loop(
+            vec![tool_turn(0, 0), answer_turn(0, 0)],
+            10,
+            &Files,
+            &mut log,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(log[2]["content"][0]["outcome"], json!({"status": "ok"}));
+
+        struct Failing;
+        #[async_trait::async_trait]
+        impl super::super::llm::ToolExecutor for Failing {
+            async fn execute(
+                &self,
+                _: &str,
+                _: &Value,
+            ) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
+                Err("Missing path".into())
+            }
+        }
+        let mut log = Vec::new();
+        logged_loop(
+            vec![tool_turn(0, 0), answer_turn(0, 0)],
+            10,
+            &Failing,
+            &mut log,
+            None,
+        )
+        .await
+        .unwrap();
+        let r = &log[2]["content"][0];
+        assert_eq!(r["outcome"]["status"], "error");
+        assert_eq!(r["is_error"], true);
+        assert_eq!(r["content"], "Error: Missing path");
+        assert_eq!(r["content_encoding"], "text");
+    }
+
+    /// A second call into the same log is call 2, with its own marker, so
+    /// turns starting again at 1 are told apart.
+    #[tokio::test]
+    async fn a_second_call_is_marked_and_numbered() {
+        let mut log = Vec::new();
+        logged_loop(vec![answer_turn(0, 0)], 10, &Files, &mut log, None)
+            .await
+            .unwrap();
+        logged_loop(vec![answer_turn(0, 0)], 10, &Files, &mut log, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            roles(&log),
+            vec!["call_started", "assistant", "call_started", "assistant"]
+        );
+        assert_eq!(log[2]["call"], 2);
+        assert_eq!(log[3]["call"], 2);
+        assert_eq!(log[3]["turn"], 1);
+    }
+
+    /// The notes the loop puts in the conversation are logged as
+    /// `system_note` entries, in order, with their kind and text.
+    #[tokio::test]
+    async fn injected_notes_are_logged() {
+        // The turn budget note: at turn max_turns - 2.
+        let mut log = Vec::new();
+        logged_loop(
+            vec![tool_turn(0, 0), tool_turn(1, 0), answer_turn(0, 0)],
+            4,
+            &Files,
+            &mut log,
+            None,
+        )
+        .await
+        .unwrap();
+        let notes: Vec<&Value> = log.iter().filter(|e| e["role"] == "system_note").collect();
+        assert_eq!(notes.len(), 1, "{log:?}");
+        assert_eq!(notes[0]["kind"], "turn_budget");
+        assert_eq!(notes[0]["turn"], 2);
+        assert!(notes[0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("You have used 2 of 4 tool-use turns"));
+        let at = log.iter().position(|e| e["role"] == "system_note").unwrap();
+        assert_eq!(log[at + 1]["role"], "assistant");
+        assert_eq!(log[at + 1]["turn"], 2);
+
+        // Every step used: tools are off, answer now.
+        let mut log = Vec::new();
+        logged_loop(
+            vec![tool_turn(0, 0), answer_turn(0, 0)],
+            1,
+            &Files,
+            &mut log,
+            None,
+        )
+        .await
+        .unwrap();
+        let note = log.iter().find(|e| e["role"] == "system_note").unwrap();
+        assert_eq!(note["kind"], "tools_off");
+        assert_eq!(note["text"], TOOLS_OFF_NOTE);
     }
 
     /// A tool call GitHub refused for its limit ends the loop with a pause

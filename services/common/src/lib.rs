@@ -1,5 +1,8 @@
 //! Logic shared between the gateway and worker services.
 
+/// The agent log of a run: its file format, outcomes, order and redaction
+/// (worker writes it, gateway serves it).
+pub mod agent_log;
 /// Distributed fencing lock for a team+repo memory snapshot. Lives in common
 /// because BOTH writers must honor it: the worker's run-scoped memory open and
 /// the gateway's dashboard memory-delete (an unlocked delete raced a concurrent

@@ -34,6 +34,28 @@ where
     }
 }
 
+/// Every item from pages of `fetch` (given the previous page's
+/// LastEvaluatedKey, None for the first page), following LastEvaluatedKey
+/// until a page has none or `max_pages` pages were read. Returns the items
+/// and whether more pages were left unread.
+pub async fn all_pages<E, F, Fut>(mut fetch: F, max_pages: usize) -> Result<(Vec<Item>, bool), E>
+where
+    F: FnMut(Option<Item>) -> Fut,
+    Fut: Future<Output = Result<(Vec<Item>, Option<Item>), E>>,
+{
+    let mut out = Vec::new();
+    let mut start: Option<Item> = None;
+    for _ in 0..max_pages.max(1) {
+        let (items, next) = fetch(start.take()).await?;
+        out.extend(items);
+        match next {
+            Some(key) if !key.is_empty() => start = Some(key),
+            _ => return Ok((out, false)),
+        }
+    }
+    Ok((out, true))
+}
+
 /// Run `query` across every page and return the first item `pick` accepts.
 pub async fn query_first_match<T, P>(
     query: QueryFluentBuilder,
@@ -105,6 +127,51 @@ mod tests {
         .await;
         assert_eq!(found.unwrap().as_deref(), Some("run-3"));
         assert_eq!(calls, vec![0, 1, 2]);
+    }
+
+    /// Pages: [a], [b, c], [d]: every item, in order, across three pages.
+    #[tokio::test]
+    async fn all_pages_reads_every_page_in_order() {
+        let pages = [
+            (vec![item("a")], key(1)),
+            (vec![item("b"), item("c")], key(2)),
+            (vec![item("d")], None),
+        ];
+        let (items, more): (Vec<Item>, bool) = all_pages(
+            |start| {
+                let i = start
+                    .as_ref()
+                    .and_then(|k| k.get("k"))
+                    .and_then(|v| v.as_n().ok())
+                    .map(|n| n.parse::<usize>().unwrap())
+                    .unwrap_or(0);
+                let page = pages[i].clone();
+                async move { Ok::<_, String>(page) }
+            },
+            10,
+        )
+        .await
+        .unwrap();
+        let ids: Vec<String> = items.iter().filter_map(run_id_of).collect();
+        assert_eq!(ids, vec!["a", "b", "c", "d"]);
+        assert!(!more);
+    }
+
+    #[tokio::test]
+    async fn all_pages_stops_at_its_page_cap() {
+        let mut calls = 0;
+        let (items, more) = all_pages(
+            |_| {
+                calls += 1;
+                async { Ok::<_, String>((vec![item("x")], key(1))) }
+            },
+            3,
+        )
+        .await
+        .unwrap();
+        assert_eq!(calls, 3);
+        assert_eq!(items.len(), 3);
+        assert!(more, "pages were left");
     }
 
     #[tokio::test]
