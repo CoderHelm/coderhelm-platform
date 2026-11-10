@@ -1267,6 +1267,28 @@ async fn handle_issue_comment(
         parse_reviewer_ask(body)
     };
 
+    // `@coderhelm keep open` on any PR: never closed as stale, from its
+    // author or someone with write access.
+    if payload["issue"]["pull_request"].is_object()
+        && ask
+            .as_ref()
+            .and_then(|a| a.question.as_deref())
+            .is_some_and(common::stale_prs::is_keep_open)
+    {
+        let repo = &payload["repository"];
+        return super::stale_prs::on_keep_open_comment(
+            state,
+            team_id,
+            installation_id,
+            repo["owner"]["login"].as_str().unwrap_or(""),
+            repo["name"].as_str().unwrap_or(""),
+            &payload["issue"],
+            commenter,
+            payload["comment"]["id"].as_u64().unwrap_or(0),
+        )
+        .await;
+    }
+
     // `@coderhelm stop auto-merge` / `@coderhelm resume auto-merge` on any PR
     // (people's and CoderHelm's own): only from someone with write access.
     if payload["issue"]["pull_request"].is_object() {

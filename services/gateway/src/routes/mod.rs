@@ -72,6 +72,7 @@ pub mod sign_in;
 pub mod skills;
 pub mod sns;
 pub mod staging_cms;
+pub mod stale_prs;
 pub mod support;
 pub mod support_access;
 pub mod system;

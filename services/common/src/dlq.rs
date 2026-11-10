@@ -40,6 +40,7 @@ pub const WORKER_MESSAGE_TYPES: &[&str] = &[
     "review",
     "review_reminder",
     "review_sweep",
+    "stale_prs_preview",
     "health_check",
     "await_merge",
     "release_steps",

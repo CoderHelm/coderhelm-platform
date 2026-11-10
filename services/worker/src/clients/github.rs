@@ -105,6 +105,16 @@ impl std::fmt::Display for RateLimited {
 
 impl std::error::Error for RateLimited {}
 
+#[cfg(test)]
+impl RateLimited {
+    pub fn for_test(wait_secs: u64) -> Self {
+        RateLimited {
+            wait_secs,
+            message: "GitHub API error 429: rate limit".to_string(),
+        }
+    }
+}
+
 /// When a response is a rate limit, how long to wait before asking again:
 /// a 429, or a 403 with no requests left or a body that says rate limit.
 /// `retry-after` wins, then the primary limit's reset time, else a minute.
@@ -3234,6 +3244,32 @@ impl GitHubClient {
             "{API_BASE}/repos/{owner}/{repo}/pulls?state=open&sort=created&direction=desc&per_page=100"
         );
         self.get(&url).await
+    }
+
+    /// Every open PR of a repo, oldest first, up to `max_pages` pages of 100
+    /// (the stale PR cleanup reads them all, a page at a time).
+    pub async fn list_open_pulls_all(
+        &self,
+        owner: &str,
+        repo: &str,
+        max_pages: u32,
+    ) -> Result<Vec<serde_json::Value>, Box<dyn std::error::Error + Send + Sync>> {
+        let mut out = Vec::new();
+        for page in 1..=max_pages {
+            let url = format!(
+                "{API_BASE}/repos/{owner}/{repo}/pulls?state=open&sort=created&direction=asc&per_page=100&page={page}"
+            );
+            let batch = match self.get(&url).await? {
+                serde_json::Value::Array(b) => b,
+                other => return Err(format!("expected a JSON array, got {other}").into()),
+            };
+            let done = batch.len() < 100;
+            out.extend(batch);
+            if done {
+                break;
+            }
+        }
+        Ok(out)
     }
 
     /// The files an open PR changes, as (path, patch), first 100.
