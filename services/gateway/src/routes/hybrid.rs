@@ -3952,6 +3952,20 @@ mod tests {
         );
         assert!(!q.contains("access_denied"));
         assert!(q.contains("invalid_grant"));
+        // Tokens too large to store: the reason, naming the provider and the
+        // sizes, reaches the install whole.
+        let why = common::envelope::too_large(
+            "The sign-in tokens Confluence sent (access and refresh token)",
+            70 * 1024,
+        )
+        .unwrap();
+        let q = super::broker_failure_query(None, None, &why);
+        let desc: String = url::form_urlencoded::parse(q.as_bytes())
+            .find(|(k, _)| k == "error_description")
+            .map(|(_, v)| v.into_owned())
+            .unwrap();
+        assert_eq!(desc, why);
+        assert!(desc.contains("Confluence") && desc.contains("70 KB") && desc.contains("64 KB"));
     }
 
     #[test]

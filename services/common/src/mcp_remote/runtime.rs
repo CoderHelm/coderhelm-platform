@@ -39,7 +39,9 @@ const CLIENT_PURPOSE: &str = "mcp-oauth-client";
 const HEADER_PURPOSE: &str = "mcp-header";
 
 /// KMS with the secrets key, owned (the worker and gateway keep one per
-/// request). `key_id` is needed only to seal.
+/// request). `key_id` is needed only to seal. Values larger than KMS
+/// encrypts directly (a large sign-in's tokens) are sealed in an envelope
+/// ([`crate::envelope`]).
 pub struct KmsCipher {
     pub client: aws_sdk_kms::Client,
     pub key_id: String,
@@ -267,10 +269,17 @@ impl Runtime {
         (self.clock)()
     }
 
-    async fn seal(&self, c: HashMap<String, String>, text: &[u8]) -> Result<String, String> {
+    /// Seals `text`; `what` names it for the error when it is over the
+    /// most one sealed value may hold ("Confluence's sign-in tokens").
+    async fn seal(
+        &self,
+        c: HashMap<String, String>,
+        text: &[u8],
+        what: &str,
+    ) -> Result<String, String> {
         use base64::{engine::general_purpose::STANDARD, Engine};
-        if text.len() > crate::mcp_credentials::MAX_PLAINTEXT_BYTES {
-            return Err("That value is too long to store.".into());
+        if let Some(e) = crate::envelope::too_large(what, text.len()) {
+            return Err(e);
         }
         Ok(STANDARD.encode(self.cipher.encrypt(c, text).await?))
     }
@@ -288,6 +297,7 @@ impl Runtime {
         self.seal(
             ctx(&self.team, server_id, HEADER_PURPOSE, None),
             value.as_bytes(),
+            "The key header's value",
         )
         .await
     }
@@ -301,20 +311,30 @@ impl Runtime {
         self.seal(
             ctx(&self.team, server_id, CLIENT_PURPOSE, None),
             secret.as_bytes(),
+            "The client secret",
         )
         .await
     }
 
+    /// Seals a sign-in's tokens. `provider` names who sent them, for the
+    /// error when they are too large to store.
     async fn seal_tokens(
         &self,
         server_id: &str,
         owner: &Owner,
         t: &TokenSet,
+        provider: &str,
     ) -> Result<String, String> {
         let json = serde_json::to_vec(t).map_err(|_| "tokens are not valid".to_string())?;
+        let who = if provider.trim().is_empty() {
+            server_id
+        } else {
+            provider.trim()
+        };
         self.seal(
             ctx(&self.team, server_id, TOKEN_PURPOSE, Some(owner)),
             &json,
+            &format!("The sign-in tokens {who} sent (access and refresh token)"),
         )
         .await
     }
@@ -483,7 +503,7 @@ impl Runtime {
         match oauth::parse_token_response(&resp, now, Some(&set)) {
             Ok(new) => {
                 let sealed = self
-                    .seal_tokens(&s.id, owner, &new)
+                    .seal_tokens(&s.id, owner, &new, &display_name(s))
                     .await
                     .map_err(ConnError::Temporary)?;
                 let next = TokenRecord {
@@ -1013,7 +1033,7 @@ impl Runtime {
         let set =
             oauth::parse_token_response(&resp, now, None).map_err(|e| fail(e.message, &e.code))?;
         let sealed = self
-            .seal_tokens(&s.id, &p.owner, &set)
+            .seal_tokens(&s.id, &p.owner, &set, &display_name(&s))
             .await
             .map_err(|e| fail(e, ""))?;
         let version = self
@@ -1152,7 +1172,15 @@ impl Runtime {
             .await?
             .ok_or("There is no finished sign-in to take.")?;
         let set = from.open_tokens(server_id, owner, &t.sealed).await?;
-        let sealed = self.seal_tokens(server_id, owner, &set).await?;
+        let name = from
+            .store
+            .get_server(&from.team, server_id)
+            .await
+            .ok()
+            .flatten()
+            .map(|s| display_name(&s))
+            .unwrap_or_default();
+        let sealed = self.seal_tokens(server_id, owner, &set, &name).await?;
         let version = self
             .store
             .get_token(&self.team, server_id, owner)
@@ -1240,7 +1268,7 @@ pub(crate) mod testing {
             expires_at,
             scope: String::new(),
         };
-        let sealed = rt.seal_tokens(server_id, owner, &set).await.unwrap();
+        let sealed = rt.seal_tokens(server_id, owner, &set, "").await.unwrap();
         rt.store
             .put_token(
                 &rt.team,
@@ -1410,7 +1438,7 @@ mod tests {
     }
 
     async fn connect(r: &Rig, s: &ServerRecord, owner: &Owner, tokens: TokenSet) {
-        let sealed = r.rt.seal_tokens(&s.id, owner, &tokens).await.unwrap();
+        let sealed = r.rt.seal_tokens(&s.id, owner, &tokens, "").await.unwrap();
         r.store
             .put_token(
                 &r.rt.team,
@@ -1591,6 +1619,7 @@ mod tests {
                 "docs",
                 &Owner::Team,
                 &tokens("at-winner", Some(1_000_000 + 3600)),
+                "",
             )
             .await
             .unwrap();
@@ -2414,5 +2443,208 @@ mod tests {
             )),
             "Confluence"
         );
+    }
+
+    /// An Atlassian-sized access token: a JWT of about 5 KB.
+    fn big_jwt() -> String {
+        format!(
+            "eyJraWQiOiJhdXRoLmF0bGFzc2lhbi5jb20iLCJhbGciOiJSUzI1NiJ9.{}.{}",
+            "eyJodHRwczovL2F0bGFzc2lhbi5jb20vc3lzdGVtQWNjb3VudElkIjoi".repeat(90),
+            "c2lnbmF0dXJl".repeat(30)
+        )
+    }
+
+    fn enveloped_rt(store: &Arc<MemStore>, http: &Arc<Fake>, team: &str) -> Runtime {
+        Runtime {
+            store: store.clone(),
+            cipher: Arc::new(crate::envelope::Enveloped(
+                crate::envelope::testing::FakeKeys::default(),
+            )),
+            http: http.clone(),
+            team: team.into(),
+            clock: Arc::new(|| 1_000_000),
+        }
+    }
+
+    async fn start(rt: &Runtime, s: &mut ServerRecord, who: &str) -> String {
+        let url = rt
+            .start_sign_in(
+                s,
+                &Owner::Team,
+                who,
+                who,
+                "https://app.example.com/cb/",
+                None,
+            )
+            .await
+            .unwrap();
+        state_of(&url)
+    }
+
+    /// The hybrid broker with a large sign-in, end to end: the provider's
+    /// tokens (over KMS's direct 4 KB) are sealed in the holding partition,
+    /// adopted into the install's hosted partition, handed out as the access
+    /// token, and sealed again on the install, which signs in with the
+    /// broker's token and a grant handle.
+    #[tokio::test]
+    async fn the_broker_carries_an_atlassian_sized_sign_in_end_to_end() {
+        let jwt = big_jwt();
+        let refresh = format!("eyJraWQiOiJyZWZyZXNoIn0.{}", "cmVmcmVzaA".repeat(120));
+        assert!(jwt.len() + refresh.len() > 5000, "{}", jwt.len());
+        let store = Arc::new(MemStore::default());
+        let http = Arc::new(Fake::default());
+        http.on(
+            Method::Post,
+            TOKEN,
+            fjson(
+                200,
+                json!({"access_token": jwt, "token_type": "Bearer", "expires_in": 3600, "refresh_token": refresh}),
+            ),
+        );
+        let hosted = enveloped_rt(&store, &http, "HYBRID#ins_a");
+        let hold = enveloped_rt(&store, &http, "HYBRID#ins_a#SIGNIN#fl_1");
+        let mut s = server();
+        store.put_server(&hosted.team, &s).await.unwrap();
+        store.put_server(&hold.team, &s).await.unwrap();
+
+        // The provider's answer is finished in the holding partition.
+        let sub = "hybrid:ins_a";
+        let state = start(&hold, &mut s, sub).await;
+        let done = hold
+            .finish(
+                &Answer {
+                    state: &state,
+                    code: Some("code-1"),
+                    iss: ISS,
+                    ..Default::default()
+                },
+                sub,
+                sub,
+            )
+            .await;
+        assert!(done.is_ok(), "{:?}", done.err());
+        let held = store
+            .get_token(&hold.team, &s.id, &Owner::Team)
+            .await
+            .unwrap()
+            .unwrap();
+        let blob = {
+            use base64::{engine::general_purpose::STANDARD, Engine};
+            STANDARD.decode(&held.sealed).unwrap()
+        };
+        assert!(blob.starts_with(crate::envelope::MAGIC), "enveloped");
+
+        // The install redeems the code: the sign-in moves to its partition.
+        hosted
+            .adopt_sign_in(&hold, &s.id, &Owner::Team)
+            .await
+            .unwrap();
+        let t = store
+            .get_token(&hosted.team, &s.id, &Owner::Team)
+            .await
+            .unwrap()
+            .unwrap();
+        let set = hosted
+            .open_tokens(&s.id, &Owner::Team, &t.sealed)
+            .await
+            .unwrap();
+        assert_eq!(set.access_token, jwt);
+        assert_eq!(set.refresh_token.as_deref(), Some(refresh.as_str()));
+        // Another team can't open the adopted tokens.
+        let other = enveloped_rt(&store, &http, "HYBRID#ins_b");
+        assert!(other
+            .open_tokens(&s.id, &Owner::Team, &t.sealed)
+            .await
+            .is_err());
+
+        // What the broker's token endpoint hands out: the big access token.
+        let header = hosted
+            .auth_header(&s, &Owner::Team, false)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(header.1, format!("Bearer {jwt}"));
+
+        // The install signs in at the broker and stores what it got.
+        let install_http = Arc::new(Fake::default());
+        install_http.on(
+            Method::Post,
+            TOKEN,
+            fjson(
+                200,
+                json!({"access_token": jwt, "token_type": "Bearer", "expires_in": 600, "refresh_token": "hr_handle"}),
+            ),
+        );
+        let install = enveloped_rt(
+            &Arc::new(MemStore::default()),
+            &install_http,
+            "TEAM#install",
+        );
+        let mut si = server();
+        install.store.put_server(&install.team, &si).await.unwrap();
+        let state = start(&install, &mut si, "USER#1").await;
+        install
+            .finish(
+                &Answer {
+                    state: &state,
+                    code: Some("hc_1"),
+                    iss: ISS,
+                    ..Default::default()
+                },
+                "USER#1",
+                "USER#1",
+            )
+            .await
+            .unwrap();
+        let header = install
+            .auth_header(&si, &Owner::Team, false)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(header.1, format!("Bearer {jwt}"));
+    }
+
+    /// Tokens over the bound: the sign-in fails with words that name the
+    /// provider and what was too large, and nothing is saved.
+    #[tokio::test]
+    async fn tokens_over_the_bound_fail_naming_the_provider() {
+        let store = Arc::new(MemStore::default());
+        let http = Arc::new(Fake::default());
+        http.on(
+            Method::Post,
+            TOKEN,
+            fjson(
+                200,
+                json!({"access_token": "x".repeat(crate::envelope::MAX_SEALED_BYTES), "token_type": "Bearer", "refresh_token": "r"}),
+            ),
+        );
+        let rt = enveloped_rt(&store, &http, "TEAM#a");
+        let mut s = server();
+        s.name = "Confluence (knowledge)".into();
+        store.put_server(&rt.team, &s).await.unwrap();
+        let state = start(&rt, &mut s, "USER#1").await;
+        let f = rt
+            .finish(
+                &Answer {
+                    state: &state,
+                    code: Some("c"),
+                    iss: ISS,
+                    ..Default::default()
+                },
+                "USER#1",
+                "USER#1",
+            )
+            .await
+            .unwrap_err();
+        assert!(f.message.contains("Confluence sent"), "{}", f.message);
+        assert!(f.message.contains("sign-in tokens"), "{}", f.message);
+        assert!(f.message.contains("64 KB"), "{}", f.message);
+        assert!(!f.message.contains("xxxx"), "no token value");
+        assert_eq!(f.server_name, "Confluence");
+        assert!(store
+            .get_token(&rt.team, &s.id, &Owner::Team)
+            .await
+            .unwrap()
+            .is_none());
     }
 }

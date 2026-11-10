@@ -68,11 +68,12 @@ pub mod live;
 pub mod log_findings;
 pub mod settings_index;
 // Which repo a log group's or alarm's code lives in, from evidence.
+/// Sealed credentials for a team's MCP servers (KMS, bound to team and server).
+pub mod envelope;
 pub mod log_reader;
 pub mod log_repo;
 /// The MCP servers a team can switch on: one catalog for gateway and worker.
 pub mod mcp_catalog;
-/// Sealed credentials for a team's MCP servers (KMS, bound to team and server).
 pub mod mcp_credentials;
 /// Remote MCP servers over HTTP: OAuth sign-in, tokens, allowed tools.
 pub mod mcp_remote;
