@@ -7,7 +7,9 @@
  *   pinned here (not only the checksums file published next to it).
  * - $VERSION must be a release tag (vX.Y.Z), so it can't reach a path or a
  *   command as anything else.
- * - Downloads are HTTPS only, redirects included (curl --proto =https).
+ * - Downloads are HTTPS only, redirects included (curl --proto =https), and
+ *   ride out a brief GitHub error: curl tries each one again (CURL), and the
+ *   git fetch of the tag is tried again too (FETCH_TRIES), both bounded.
  * - The tag $VERSION, fetched from this repository with git, must be an
  *   annotated tag named exactly $VERSION, on a commit that is on main (that
  *   commit is $COMMIT), and vouched for in one of two ways:
@@ -52,8 +54,19 @@ export const AUTO_RELEASE_STATEMENT = `'coderhelm-release-tag v1\\nrepository %s
 export const COSIGN_VERSION = "v2.4.1";
 export const COSIGN_LINUX_AMD64_SHA256 = "8b24b946dd5809c6bd93de08033bcf6bc0ed7d336b7785787c080f574b89249b";
 
-/** curl that only speaks HTTPS, also after a redirect. */
-export const CURL = "curl --proto =https --proto-redir =https --tlsv1.2 -fsSL";
+/**
+ * curl that only speaks HTTPS, also after a redirect, and tries a download
+ * again when GitHub answers with an error (a 5xx, a 429, a reset
+ * connection): 5 more tries, 2 seconds apart, never past 2 minutes in all.
+ * --retry-all-errors needs curl 7.71 or newer; the builds run CodeBuild's
+ * standard:7.0 image (Ubuntu 22.04, curl 7.81). Each file is still checked
+ * against the signed SHA256SUMS, so a retried download is trusted no more
+ * than the first.
+ */
+export const CURL = "curl --proto =https --proto-redir =https --tlsv1.2 -fsSL --retry 5 --retry-all-errors --retry-delay 2 --retry-max-time 120";
+
+/** How many times the build fetches the release tag from GitHub before it gives up. */
+export const FETCH_TRIES = 4;
 
 /** Installs the pinned cosign. */
 export function installCosignCommands(): string[] {
@@ -102,7 +115,28 @@ const G = `env GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 GIT_TERMINAL_PR
  * build with the reason when its check fails.
  */
 export function verifyTagCommands(keys: MaintainerKey[] = maintainerKeys()): string[] {
+  return [...fetchTagCommands(keys), ...checkTagCommands()];
+}
+
+/**
+ * The download half of verifyTagCommands: the pinned keys written out, and
+ * the tag and main fetched from GitHub (tried again, FETCH_TRIES in all,
+ * when GitHub doesn't answer). Nothing is checked yet. The release check
+ * runs these before its verification (its pre_build), so a download that
+ * fails there is told apart from a release that doesn't verify.
+ */
+export function fetchTagCommands(keys: MaintainerKey[] = maintainerKeys()): string[] {
   const lines = keys.map((k) => `'${k.login} namespaces="git" ${k.key}'`).join(" ");
+  const fetch = `${G} fetch -q --no-tags --filter=tree:0 https://github.com/${RELEASE_REPO}.git "+refs/tags/$VERSION:refs/tags/$VERSION" "+refs/heads/main:refs/heads/main"`;
+  return [
+    `rm -rf ${TAG_DIR} && mkdir -p ${TAG_DIR} && printf '%s\\n' ${lines} > ${TAG_DIR}.signers`,
+    `${G} init -q --bare`,
+    `for i in $(seq 1 ${FETCH_TRIES}); do ${fetch} && break; [ "$i" = ${FETCH_TRIES} ] && { echo "could not fetch the tag $VERSION from GitHub (${FETCH_TRIES} tries)"; exit 1; }; sleep $((i * 2)); done`,
+  ];
+}
+
+/** The check half of verifyTagCommands: everything after the fetch. */
+export function checkTagCommands(): string[] {
   const T = `${TAG_DIR}.tag`;
   const SSH = "-----BEGIN SSH SIGNATURE-----";
   const maintainer =
@@ -122,9 +156,6 @@ export function verifyTagCommands(keys: MaintainerKey[] = maintainerKeys()): str
     ` ${TAG_DIR}.statement || { echo "$VERSION's release attestation is not from auto-release.yml on main for this tag and commit"; exit 1; }; ` +
     `echo "$VERSION was released by auto-release.yml on main"`;
   return [
-    `rm -rf ${TAG_DIR} && mkdir -p ${TAG_DIR} && printf '%s\\n' ${lines} > ${TAG_DIR}.signers`,
-    `${G} init -q --bare`,
-    `${G} fetch -q --no-tags --filter=tree:0 https://github.com/${RELEASE_REPO}.git "+refs/tags/$VERSION:refs/tags/$VERSION" "+refs/heads/main:refs/heads/main"`,
     `[ "$(${G} cat-file -t "refs/tags/$VERSION")" = tag ] || { echo "$VERSION is not an annotated tag"; exit 1; }`,
     `${G} cat-file tag "refs/tags/$VERSION" > ${T}`,
     `[ "$(sed -n '/^$/q;s/^tag //p' ${T})" = "$VERSION" ] || { echo "the tag object under $VERSION is named for another version"; exit 1; }`,

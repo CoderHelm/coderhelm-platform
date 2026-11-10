@@ -1110,6 +1110,179 @@ class PressDuringCheck(unittest.TestCase):
         self.assertEqual(self.updates()[0][1], "admin@example.org")
 
 
+class CheckRetries(unittest.TestCase):
+    """A release check that failed before it verified anything (GitHub didn't
+    answer a download) is started again by the updater itself, a bounded
+    number of times; a release that didn't verify is never started again."""
+
+    def setUp(self):
+        self.db = FakeDynamo()
+        self.store = u.Store(self.db, "t")
+        self.builds, self.checks = [], []
+        real_build, real_notify, real_check = u.start_build, u.notify, u.start_check
+        u.start_build = lambda env, version, actor, mode, hid, extra=None: self.builds.append((version, actor, mode)) or "b-1"
+        u.notify = lambda subject, text, env=None, **kw: 1
+        u.start_check = lambda env, version: self.checks.append(version) or f"c-{len(self.checks)}"
+        self.addCleanup(setattr, u, "start_build", real_build)
+        self.addCleanup(setattr, u, "notify", real_notify)
+        self.addCleanup(setattr, u, "start_check", real_check)
+        self.cb = FakeCodeBuild()
+        u._clients["codebuild"] = self.cb
+        self.addCleanup(u._clients.pop, "codebuild", None)
+        self.env = {"CODERHELM_VERSION": "v1.0.0", "APP_URL": "https://helm.example.org", "UPDATE_PROJECT_NAME": "p",
+                    "RELEASE_CHECK_PROJECT_NAME": "coderhelm-prod-release-check", "WORKER_FUNCTION_NAME": "w",
+                    "CONFIGURED_MODELS": "claude-opus-5-5,claude-sonnet-5-5"}
+        self.worker = FakeWorker(refuse=())
+
+    def releases(self, _repo):
+        return [rel("v1.1.0")]
+
+    def h(self, event, at=SUNDAY_3AM):
+        return u.handle(event, self.env, self.store, at, self.releases, self.worker)
+
+    def status(self, at):
+        return self.h({"action": "status"}, at)
+
+    def press(self, at=SUNDAY_3AM):
+        return self.h({"action": "update_now", "actor": "admin@example.org"}, at)
+
+    def failed(self, build, phase, at, status="FAILED", phase_status="FAILED"):
+        """CodeBuild's record of a build that ended in `phase`, as boto3 returns it."""
+        phases = []
+        for p in ("SUBMITTED", "QUEUED", "PROVISIONING", "DOWNLOAD_SOURCE", "INSTALL", "PRE_BUILD", "BUILD", "POST_BUILD"):
+            if p == phase:
+                phases.append({"phaseType": p, "phaseStatus": phase_status,
+                               "contexts": [{"statusCode": "COMMAND_EXECUTION_ERROR", "message": "Reason: exit status 22"}]})
+                break
+            phases.append({"phaseType": p, "phaseStatus": "SUCCEEDED"})
+        phases.append({"phaseType": "FINALIZING", "phaseStatus": "SUCCEEDED"})
+        self.cb.builds[build] = {"id": build, "buildStatus": status, "phases": phases, "endTime": at}
+
+    def verify(self, build, at):
+        text = json.dumps(dict(MANIFEST, version="v1.1.0"))
+        self.h({"action": "models_verified", "version": "v1.1.0", "build": build, "status": "verified", "manifest_text": text}, at)
+        self.cb.finish(build, version="v1.1.0", models=hashlib.sha256(text.encode()).hexdigest())
+
+    def updates(self):
+        return [b for b in self.builds if b[2] == "update"]
+
+    def test_a_download_github_didnt_answer_is_checked_again_and_the_update_goes_on(self):
+        self.press()
+        self.assertEqual(self.checks, ["v1.1.0"])
+        # The install phase's cosign download got an HTTP error from GitHub.
+        self.failed("c-1", "INSTALL", SUNDAY_3AM + timedelta(minutes=1))
+        s = self.status(SUNDAY_3AM + timedelta(minutes=1, seconds=10))
+        mc = s["model_check"]
+        self.assertTrue(mc["pending"])
+        self.assertFalse(mc.get("stalled"))
+        self.assertEqual(mc["note"], "GitHub didn't answer a download; checking again (2 of 3)")
+        self.assertTrue(mc["progress"]["retry"]["waiting"])
+        self.assertEqual(self.checks, ["v1.1.0"])  # a short wait first
+        self.assertEqual(s["update_request"]["status"], "waiting")
+        # After the wait it starts again by itself; the request keeps waiting.
+        s = self.status(SUNDAY_3AM + timedelta(minutes=2))
+        self.assertEqual(self.checks, ["v1.1.0", "v1.1.0"])
+        self.assertEqual(s["model_check"]["note"], "GitHub didn't answer a download; checking again (2 of 3)")
+        self.assertEqual(s["model_check"]["progress"]["build"], "IN_PROGRESS")
+        self.assertEqual(s["update_request"]["status"], "waiting")
+        v = self.store.get("UPDATE_STATE")["verifying"]
+        self.assertEqual((v["build"], v["attempt"], v["retried"]), ("c-2", 2, "INSTALL"))
+        # Read again while it runs: not started a third time.
+        self.cb.builds["c-2"] = {"id": "c-2", "buildStatus": "IN_PROGRESS"}
+        s = self.status(SUNDAY_3AM + timedelta(minutes=3))
+        self.assertEqual(len(self.checks), 2)
+        self.assertEqual(s["model_check"]["progress"]["attempt"], {"attempt": 2, "of": 3})
+        # The second fails in pre_build (the release's files): a longer wait, then the last try.
+        self.failed("c-2", "PRE_BUILD", SUNDAY_3AM + timedelta(minutes=4))
+        self.status(SUNDAY_3AM + timedelta(minutes=5))
+        self.assertEqual(len(self.checks), 2)
+        s = self.status(SUNDAY_3AM + timedelta(minutes=6, seconds=1))
+        self.assertEqual(len(self.checks), 3)
+        self.assertEqual(s["model_check"]["note"], "GitHub didn't answer a download; checking again (3 of 3)")
+        # The third verifies: the update the admin asked for starts by itself.
+        self.verify("c-3", SUNDAY_3AM + timedelta(minutes=8))
+        s = self.status(SUNDAY_3AM + timedelta(minutes=9))
+        self.assertEqual(self.updates(), [("v1.1.0", "admin@example.org", "update")])
+        self.assertEqual(s["update_request"]["status"], "started")
+
+    def test_automatic_retries_are_bounded(self):
+        self.press()
+        at = SUNDAY_3AM
+        for n in range(1, u.CHECK_ATTEMPTS + 1):
+            self.failed(f"c-{n}", "INSTALL", at)
+            at += timedelta(minutes=5)
+            s = self.status(at)
+        self.assertEqual(len(self.checks), u.CHECK_ATTEMPTS)
+        mc = s["model_check"]
+        self.assertTrue(mc["stalled"])
+        self.assertIn("GitHub didn't answer a download in 3 tries", mc["note"])
+        req = self.store.get("UPDATE_REQUEST")
+        self.assertEqual(req["status"], "ended")
+        self.assertIn("GitHub didn't answer a download in 3 tries. Check again to start it over.", req["reason"])
+        # And nothing more by itself.
+        self.status(at + timedelta(hours=1))
+        self.assertEqual(len(self.checks), u.CHECK_ATTEMPTS)
+        self.assertEqual(self.updates(), [])
+
+    def test_a_release_that_didnt_verify_is_never_checked_again_by_itself(self):
+        cases = [
+            # The build phase verifies: a bad signature reports back, and ends the request at once.
+            ("reported", None),
+            # The build phase failed and nothing reported back (its report didn't arrive).
+            ("build failed", ("BUILD", "FAILED", "FAILED")),
+            ("build timed out", ("BUILD", "TIMED_OUT", "TIMED_OUT")),
+            ("post_build failed", ("POST_BUILD", "FAILED", "FAILED")),
+            # A person stopped it: that is theirs to start again.
+            ("stopped", ("INSTALL", "STOPPED", "STOPPED")),
+        ]
+        for why, failure in cases:
+            with self.subTest(why):
+                self.db.items.clear()
+                self.checks.clear()
+                self.cb.builds.clear()
+                self.press()
+                if failure is None:
+                    self.h({"action": "models_verified", "version": "v1.1.0", "build": "c-1", "status": "failed",
+                            "reason": "SHA256SUMS's signature isn't release.yml's"}, SUNDAY_3AM + timedelta(minutes=1))
+                    self.failed("c-1", "BUILD", SUNDAY_3AM + timedelta(minutes=1))
+                else:
+                    phase, status, phase_status = failure
+                    self.failed("c-1", phase, SUNDAY_3AM + timedelta(minutes=1), status=status, phase_status=phase_status)
+                for minutes in (2, 5, 10, 30):
+                    self.status(SUNDAY_3AM + timedelta(minutes=minutes))
+                self.assertEqual(self.checks, ["v1.1.0"], "never started again by itself")
+                req = self.store.get("UPDATE_REQUEST")
+                self.assertEqual(req["status"], "ended")
+                self.assertNotIn("checking again", req["reason"])
+                self.assertEqual(self.updates(), [])
+
+    def test_a_models_json_download_that_failed_is_checked_again(self):
+        self.press()
+        # The build phase's one download: reported as unavailable, not as a failed check.
+        r = self.h({"action": "models_verified", "version": "v1.1.0", "build": "c-1", "status": "unavailable",
+                    "reason": "a release file could not be downloaded from GitHub"}, SUNDAY_3AM + timedelta(minutes=1))
+        self.assertEqual(r, {"verified": False, "retrying": True})
+        self.assertEqual(self.store.get("UPDATE_REQUEST")["status"], "waiting")
+        self.assertIsNone(self.store.get("MANIFEST#v1.1.0"))
+        self.failed("c-1", "BUILD", SUNDAY_3AM + timedelta(minutes=1))
+        s = self.status(SUNDAY_3AM + timedelta(minutes=2))
+        self.assertEqual(self.checks, ["v1.1.0", "v1.1.0"])
+        self.assertTrue(s["model_check"]["pending"])
+        self.assertEqual(s["update_request"]["status"], "waiting")
+        # The new build starts clean: its own failure in build is a real one.
+        self.assertNotIn("unavailable", self.store.get("UPDATE_STATE")["verifying"])
+        self.failed("c-2", "BUILD", SUNDAY_3AM + timedelta(minutes=4))
+        self.status(SUNDAY_3AM + timedelta(minutes=10))
+        self.assertEqual(len(self.checks), 2)
+        self.assertEqual(self.store.get("UPDATE_REQUEST")["status"], "ended")
+
+    def test_an_unavailable_report_from_another_build_is_refused(self):
+        self.press()
+        with self.assertRaisesRegex(ValueError, "doesn't come from the release check build"):
+            self.h({"action": "models_verified", "version": "v1.1.0", "build": "other", "status": "unavailable"})
+        self.assertNotIn("unavailable", self.store.get("UPDATE_STATE")["verifying"])
+
+
 class NeverAcceptsTerms(unittest.TestCase):
     """The updater only checks: no subscription, agreement or form is ever sent."""
 

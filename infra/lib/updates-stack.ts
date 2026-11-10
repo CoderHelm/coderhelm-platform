@@ -36,7 +36,7 @@ import { repoPath } from "./paths";
 import { hybridUrlEnvironment } from "./service-env";
 import { releaseStamp, stampEnvironment } from "./release";
 import { WINDOW_MINUTES, WINDOW_POLICY_NAME, windowPolicyParts } from "./access";
-import { CHECK_VERSION, CURL, installCosignCommands, RELEASE_BASE, RELEASE_REPO, VERIFY_SUMS, verifyTagCommands } from "./release-verify";
+import { CHECK_VERSION, checkTagCommands, CURL, fetchTagCommands, installCosignCommands, RELEASE_BASE, RELEASE_REPO, VERIFY_SUMS, verifyTagCommands } from "./release-verify";
 
 /** The functions that read the install's secret once, at start. */
 export function secretReaders(prefix: string): string[] {
@@ -62,6 +62,16 @@ export interface UpdatesStackProps extends cdk.StackProps {
  * CodeBuild shows this build succeeded with the same checksums exported
  * (TEMPLATE_SHA256, MODELS_SHA256): the function can be invoked by more than
  * this build, a build's exported variables can't be faked.
+ *
+ * The downloads run before anything is verified: cosign in install, the
+ * release's SHA256SUMS, its signature and the tag in pre_build. A failure
+ * there is GitHub or CodeBuild, never the release: CodeBuild skips
+ * post_build, nothing reports back, and the updater reads the failed phase
+ * from CodeBuild and starts the check again by itself (lambda/updater,
+ * retry_check). build verifies; its one download (models.json, read only
+ * after the signature check) reports "unavailable" when it fails, so it is
+ * retried the same way. Anything else that fails in build is a release
+ * that didn't verify, and the check ends at once.
  */
 export function releaseCheckBuildSpec(cfg: ResolvedConfig): codebuild.BuildSpec {
   return codebuild.BuildSpec.fromObject({
@@ -69,16 +79,26 @@ export function releaseCheckBuildSpec(cfg: ResolvedConfig): codebuild.BuildSpec 
     env: { shell: "bash", "exported-variables": ["TEMPLATE_SHA256", "MODELS_SHA256"] },
     phases: {
       install: { "runtime-versions": { nodejs: 20 }, commands: ["set -euo pipefail", ...installCosignCommands()] },
-      build: {
+      pre_build: {
         commands: [
           "set -euo pipefail",
+          // The updater only starts the check for a release tag; checked again before $VERSION reaches a URL.
           CHECK_VERSION,
           "mkdir -p /tmp/ch && cd /tmp/ch",
           RELEASE_BASE,
           `${CURL} -o SHA256SUMS "$B/SHA256SUMS"`,
           `${CURL} -o SHA256SUMS.sigstore.json "$B/SHA256SUMS.sigstore.json"`,
+          // The tag and main, fetched only: checked in build.
+          ...fetchTagCommands(),
+        ],
+      },
+      build: {
+        commands: [
+          "set -euo pipefail",
+          "cd /tmp/ch",
+          RELEASE_BASE,
           // The tag: on main ($COMMIT), signed by a pinned maintainer key or attested by auto-release.yml on main.
-          ...verifyTagCommands(),
+          ...checkTagCommands(),
           VERIFY_SUMS,
           // A native release's parent template: its sha256 as the signed
           // SHA256SUMS lists it (the updater checks the downloaded template
@@ -88,7 +108,7 @@ export function releaseCheckBuildSpec(cfg: ResolvedConfig): codebuild.BuildSpec 
           "MODELS_SHA256=$(awk '$2==\"models.json\"{print $1}' SHA256SUMS); MODELS_SHA256=${MODELS_SHA256:-none}; export MODELS_SHA256",
           // A signed release from before model manifests lists none.
           "if grep -q ' models.json$' SHA256SUMS; then " +
-            `${CURL} -o models.json "$B/models.json"; ` +
+            `${CURL} -o models.json "$B/models.json" || { touch /tmp/download-failed; exit 1; }; ` +
             "grep ' models.json$' SHA256SUMS | sha256sum -c -; " +
             'node -e \'process.stdout.write(JSON.stringify({status:"verified",manifest_text:require("fs").readFileSync("models.json","utf8")}))\' > /tmp/result.json; ' +
             'else echo \'{"status":"verified","manifest_text":null}\' > /tmp/result.json; fi',
@@ -96,8 +116,10 @@ export function releaseCheckBuildSpec(cfg: ResolvedConfig): codebuild.BuildSpec 
       },
       post_build: {
         commands: [
-          // Anything short of a verified result reports a failure (nothing is trusted).
-          'if [ "${CODEBUILD_BUILD_SUCCEEDING:-0}" != "1" ] || [ ! -s /tmp/result.json ]; then echo \'{"status":"failed","reason":"the release check failed: see its log"}\' > /tmp/result.json; fi',
+          // A download that failed is "unavailable" (checked again); anything
+          // else short of a verified result reports a failure (nothing is trusted).
+          'if [ -f /tmp/download-failed ]; then echo \'{"status":"unavailable","reason":"a release file could not be downloaded from GitHub"}\' > /tmp/result.json; ' +
+            'elif [ "${CODEBUILD_BUILD_SUCCEEDING:-0}" != "1" ] || [ ! -s /tmp/result.json ]; then echo \'{"status":"failed","reason":"the release check failed: see its log"}\' > /tmp/result.json; fi',
           'node -e \'const r=require("/tmp/result.json");process.stdout.write(JSON.stringify({action:"models_verified",version:process.env.VERSION,build:process.env.CODEBUILD_BUILD_ID,status:r.status,reason:r.reason,manifest_text:r.manifest_text??null,template_sha256:r.status==="verified"&&/^[0-9a-f]{64}$/.test(process.env.TEMPLATE_SHA256||"")?process.env.TEMPLATE_SHA256:null}))\' > /tmp/payload.json',
           `aws lambda invoke --function-name ${cfg.prefix}-updater --cli-binary-format raw-in-base64-out --payload file:///tmp/payload.json /tmp/out.json`,
         ],

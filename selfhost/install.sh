@@ -38,7 +38,13 @@ need ssh-keygen "OpenSSH (ssh-keygen)" "your package manager"
 major=$(node -p 'process.versions.node.split(".")[0]')
 [ "$major" -ge 20 ] || { echo "Node.js 20 or newer is needed (found $(node --version))." >&2; exit 1; }
 
-get() { curl --proto =https --proto-redir =https --tlsv1.2 -fsSL "$@"; }
+# HTTPS only, redirects included. A brief GitHub error (a 5xx, a reset
+# connection) is tried again, 5 more times over at most 2 minutes; curl 7.71
+# or newer also tries again on any other error.
+retry="--retry 5 --retry-delay 2 --retry-max-time 120"
+if curl --help all 2>/dev/null | grep -q -- --retry-all-errors; then retry="$retry --retry-all-errors"; fi
+# shellcheck disable=SC2086
+get() { curl --proto =https --proto-redir =https --tlsv1.2 -fsSL $retry "$@"; }
 
 # The signature names one tag, so "latest" is turned into it first.
 if [ "$VERSION" = "latest" ]; then
@@ -62,8 +68,11 @@ src="$dir/src"
 g() { GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 GIT_TERMINAL_PROMPT=0 git -C "$src" "$@"; }
 mkdir -p "$src" && g init -q --bare
 printf '%s\n' "$SIGNERS" > "$dir/allowed_signers"
-g fetch -q --no-tags --filter=tree:0 "https://github.com/$REPO.git" "+refs/tags/$VERSION:refs/tags/$VERSION" "+refs/heads/main:refs/heads/main" \
-  || refuse "Could not fetch the tag $VERSION from GitHub"
+i=1
+until g fetch -q --no-tags --filter=tree:0 "https://github.com/$REPO.git" "+refs/tags/$VERSION:refs/tags/$VERSION" "+refs/heads/main:refs/heads/main"; do
+  [ "$i" -ge 4 ] && refuse "Could not fetch the tag $VERSION from GitHub (4 tries)"
+  sleep $((i * 2)); i=$((i + 1))
+done
 [ "$(g cat-file -t "refs/tags/$VERSION")" = tag ] || refuse "$VERSION is not an annotated tag"
 g cat-file tag "refs/tags/$VERSION" > "$dir/tag"
 [ "$(sed -n '/^$/q;s/^tag //p' "$dir/tag")" = "$VERSION" ] || refuse "The tag object under $VERSION is named for another version"

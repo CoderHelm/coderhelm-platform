@@ -1535,11 +1535,17 @@ pub fn preflight(checks: &[Check], status: Option<&Value>) -> Vec<Blocker> {
     // blocker per model, each with its own fix.
     if let Some(mc) = v.get("model_check").filter(|m| m["pending"] == true) {
         let ver = mc["version"].as_str().unwrap_or("the next release");
+        // The updater starts a check again by itself when GitHub didn't
+        // answer a download (lambda/updater, retry_check): say so.
+        let retry = mc["progress"]["retry"]["note"].as_str();
         out.push(Blocker {
             technical: None,
             key: "model_check_pending".into(),
             severity: "block",
-            detail: format!("Checking {ver}'s signature before reading the models it calls."),
+            detail: match retry {
+                Some(note) => format!("Checking {ver}'s signature: {note}."),
+                None => format!("Checking {ver}'s signature before reading the models it calls."),
+            },
             fix: Fix::text("Wait a few minutes, then check again.")
                 .href("/settings/system#readiness"),
         });
@@ -3034,6 +3040,19 @@ mod tests {
             ("model_check_pending", "block")
         );
         assert!(preflight(&[], Some(&ok)).is_empty());
+        // Started again by the updater after GitHub didn't answer a download: it says so.
+        let retrying = json!({"model_check": {"version": "v1.3.0", "ok": false, "pending": true, "results": [],
+            "note": "GitHub didn't answer a download; checking again (2 of 3)",
+            "progress": {"step": "signature", "build": "IN_PROGRESS",
+                "retry": {"attempt": 2, "of": 3, "note": "GitHub didn't answer a download; checking again (2 of 3)"}}}});
+        let b = preflight(&[], Some(&retrying));
+        assert_eq!(
+            (b[0].key.as_str(), b[0].detail.as_str()),
+            (
+                "model_check_pending",
+                "Checking v1.3.0's signature: GitHub didn't answer a download; checking again (2 of 3)."
+            )
+        );
         // A release check that stopped reporting: held, with its reason, never "Checking".
         let stalled = json!({"model_check": {"version": "v1.3.0", "ok": false, "pending": false, "stalled": true, "results": [],
             "note": "Checking v1.3.0 didn't finish: the release check build ended FAILED without reporting back. Check again to start it over."}});
