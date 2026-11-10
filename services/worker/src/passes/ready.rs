@@ -45,6 +45,20 @@
 //!   step (`recheck`), once per code version, and the pull request waits for
 //!   that instead of staying held on the old line. What the checks find then
 //!   decides, here, as always.
+//! - A draft never waits on checks that skip drafts. A failing-test fix once
+//!   stayed a draft for twelve hours waiting for its staging deploy and
+//!   end-to-end checks, which in that repository run only on a pull request
+//!   that isn't a draft: draft, so skipped, so still a draft. When the proof
+//!   a decision waits on (the failing-test fix's checks, an end-to-end fix's
+//!   repeat runs) is skipped on the draft because its workflow skips drafts
+//!   (`skipped_checks`), the pull request is marked ready so they run
+//!   ([`Decision::Proving`]); the description says it is still being proven
+//!   until they pass, and if they fail it is held with the reason. Checks
+//!   skipped for a label CoderHelm can't add are a hold with that one
+//!   action, never a wait.
+//! - Every wait is bounded: one whose reason hasn't changed on the same head
+//!   for `common::draft_hold::WAIT_LIMIT_SECS` becomes a hold that names what
+//!   didn't happen.
 
 use std::collections::HashMap;
 
@@ -129,8 +143,25 @@ pub struct Facts {
     /// The reviewer is off for the repository: no review, so no approval,
     /// ever comes.
     pub reviewer_off: bool,
-    /// The head the CI and the verdict were read on; empty when not read.
+    /// The pull request's head commit; empty when not read.
     pub head: String,
+    /// Checks the proof waits on that were skipped on this draft and run
+    /// once it is marked ready (an end-to-end fix's; the failing-test fix
+    /// reports its own in [`TestHold::RunsWhenReady`]).
+    pub runs_when_ready: Vec<String>,
+    /// The run's last recorded hold, to bound a wait that doesn't change.
+    pub prior: Option<DraftHold>,
+    /// When it is decided; a wait is bounded against it.
+    pub now: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+/// Marks a ready pull request's description as still being proven.
+pub const PROVING_MARK: &str = "<!-- coderhelm:proving -->";
+
+/// Whether CoderHelm marked the pull request ready while it is still being
+/// proven (its description says so).
+pub fn is_proving(body: &str) -> bool {
+    body.contains(PROVING_MARK)
 }
 
 /// What the description and the run say while CoderHelm's review of the
@@ -165,6 +196,37 @@ pub enum Decision {
     Wait { why: String, until: Option<u64> },
     /// A person closed it: nothing to mark, and it is never reopened.
     Closed,
+    /// Marked ready (or kept ready) while it is still being proven: the
+    /// checks that test it skip drafts, so they run only once it is ready.
+    /// With no `reasons` it waits for them (`why`); with reasons they
+    /// failed or can't run, and a person deals with each.
+    Proving { why: String, reasons: Vec<Reason> },
+}
+
+fn check_names(v: &[String]) -> String {
+    v.iter()
+        .map(|n| format!("`{n}`"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// The hold a wait becomes once it stalled on this head
+/// (`DraftHold::stalled`), or `None` while it may still settle.
+fn stalled(f: &Facts, why: &str) -> Option<Reason> {
+    let (prior, now) = (f.prior.as_ref()?, f.now?);
+    if !prior.stalled(why, &f.head, now) {
+        return None;
+    }
+    Some(Reason::new(
+        format!(
+            "{}, and that hasn't changed in {} hours on this head",
+            why.trim().trim_end_matches('.'),
+            common::draft_hold::WAIT_LIMIT_SECS / 3600
+        ),
+        "Look at why it didn't happen (the checks on the pull request say), then push a fix, \
+         start what didn't run, or mark it ready yourself; CoderHelm decides again on the next \
+         push.",
+    ))
 }
 
 /// The reasons the description itself holds the draft for, each with what a
@@ -233,12 +295,13 @@ pub fn decide(f: &Facts) -> Decision {
         (Some(h), true) => h.items(),
         _ => Vec::new(),
     };
-    if !f.draft {
+    let proving = !f.draft && is_proving(&f.body);
+    if !f.draft && !proving {
         return Decision::Ready { open };
     }
     // A person put it back to draft: their call, and nothing CoderHelm
     // decides undoes it.
-    if let Some(who) = &f.put_back_by {
+    if let Some(who) = f.put_back_by.as_ref().filter(|_| f.draft) {
         return Decision::Held {
             reasons: vec![Reason::new(
                 format!("`{who}` put it back to draft"),
@@ -260,6 +323,10 @@ pub fn decide(f: &Facts) -> Decision {
         ));
     }
     let mut wait: Option<String> = None;
+    // A wait on CI proof (the failing-test fix's checks, an end-to-end
+    // fix's repeat runs), and the checks of it that skip drafts.
+    let mut proof_wait: Option<String> = None;
+    let mut runs_when_ready = f.runs_when_ready.clone();
     match &f.test_fix {
         // A "fix" that loosens the test can hide the bug: a person decides.
         Some(TestHold::Refused(why)) => reasons.push(Reason::new(
@@ -271,7 +338,19 @@ pub fn decide(f: &Facts) -> Decision {
             format!("This failing-test fix never cleared its ready check: {why}"),
             "Run the affected test on the branch and mark it ready yourself, or push a fix.",
         )),
-        Some(TestHold::Wait(why)) => wait = Some(format!("this failing-test fix waits: {why}")),
+        Some(TestHold::Untriggered { what, todo }) => reasons.push(Reason::new(
+            format!("This failing-test fix can't be proven yet: {what}"),
+            todo,
+        )),
+        Some(TestHold::Failed(why)) => reasons.push(Reason::new(
+            format!("This failing-test fix isn't proven: {why}"),
+            "Push a fix to the branch (CoderHelm decides again on the push), or close the pull \
+             request if the fix is wrong.",
+        )),
+        Some(TestHold::RunsWhenReady(checks)) => runs_when_ready.extend(checks.iter().cloned()),
+        Some(TestHold::Wait(why)) => {
+            proof_wait = Some(format!("this failing-test fix waits: {why}"))
+        }
         Some(TestHold::Go) | None => {}
     }
     match f.e2e {
@@ -281,11 +360,11 @@ pub fn decide(f: &Facts) -> Decision {
             "Push a fix that makes the test pass without loosening it, or close the pull request.",
         )),
         E2e::Running => {
-            wait.get_or_insert_with(|| "its repeat runs are going".to_string());
+            proof_wait.get_or_insert_with(|| "its repeat runs are going".to_string());
         }
         E2e::None => {
             if !f.proven && super::resume::is_e2e_proof_pr(&f.title) {
-                wait.get_or_insert_with(|| {
+                proof_wait.get_or_insert_with(|| {
                     "it is an end-to-end fix or new test, which leaves draft once its repeat \
                      runs prove it"
                         .to_string()
@@ -335,9 +414,47 @@ pub fn decide(f: &Facts) -> Decision {
         }
     }
     if !reasons.is_empty() {
+        if proving {
+            return Decision::Proving {
+                why: String::new(),
+                reasons,
+            };
+        }
         return Decision::Held { reasons };
     }
-    if let Some(why) = wait {
+    runs_when_ready.dedup();
+    // The proof it waits on skips drafts: waiting on the draft is waiting
+    // forever, so it is marked ready for them (CoderHelm's own review, when
+    // that is what the draft waits for, comes first).
+    if f.draft && !runs_when_ready.is_empty() && wait.is_none() {
+        return Decision::Proving {
+            why: format!(
+                "{} run only on a pull request that isn't a draft, so it was marked ready for \
+                 them",
+                check_names(&runs_when_ready)
+            ),
+            reasons: Vec::new(),
+        };
+    }
+    if proving {
+        return match proof_wait.or(wait) {
+            Some(why) => match stalled(f, &why) {
+                Some(r) => Decision::Proving {
+                    why: String::new(),
+                    reasons: vec![r],
+                },
+                None => Decision::Proving {
+                    why,
+                    reasons: Vec::new(),
+                },
+            },
+            None => Decision::Ready { open },
+        };
+    }
+    if let Some(why) = wait.or(proof_wait) {
+        if let Some(r) = stalled(f, &why) {
+            return Decision::Held { reasons: vec![r] };
+        }
         return Decision::Wait { why, until: None };
     }
     Decision::Ready { open }
@@ -374,6 +491,20 @@ pub fn status_section(d: &Decision) -> String {
              again by itself and marks it ready when that is done.\n{STATUS_END}",
             why.trim().trim_end_matches('.')
         ),
+        Decision::Proving { why, reasons } if reasons.is_empty() => format!(
+            "{STATUS_START}\n{PROVING_MARK}\n**Marked ready so its checks run; it is still being \
+             proven:** {}. Don't merge it yet: CoderHelm checks again by itself and removes this \
+             note once they pass.\n{STATUS_END}",
+            why.trim().trim_end_matches('.')
+        ),
+        Decision::Proving { reasons, .. } => {
+            let items: Vec<String> = reasons.iter().map(|r| format!("- {}", r.line())).collect();
+            format!(
+                "{STATUS_START}\n{PROVING_MARK}\n**Marked ready so its checks run, and it isn't \
+                 proven.** Don't merge it yet; a person needs to deal with:\n{}\n{STATUS_END}",
+                items.join("\n")
+            )
+        }
         Decision::Ready { .. } | Decision::Closed => String::new(),
     }
 }
@@ -530,6 +661,8 @@ pub enum Outcome {
     Waiting,
     /// Held on a check older code wrote: the run checks it again.
     Rechecking,
+    /// Marked ready so its checks run; still being proven.
+    Proving,
     Closed,
     /// Sent again for later (GitHub refused for a while).
     Retrying,
@@ -560,7 +693,17 @@ pub async fn settle(ctx: &Ctx<'_>) -> Outcome {
         Err(r) => return retry_or_give_up(ctx, &run_id, &pr_url, r).await,
     };
     ask_for_review(ctx, &mut facts).await;
+    if !run_id.is_empty() && !facts.closed {
+        facts.prior = run_hold(ctx.state, ctx.team_id, &run_id)
+            .await
+            .and_then(|(_, h)| h);
+    }
+    facts.now = Some(chrono::Utc::now());
     let decision = decide(&facts);
+    let on_head = |mut h: DraftHold| {
+        h.head = facts.head.clone();
+        h
+    };
     match &decision {
         Decision::Closed => {
             info!(pr = ctx.pr, "PR is closed — not marking ready");
@@ -611,10 +754,20 @@ pub async fn settle(ctx: &Ctx<'_>) -> Outcome {
         }
         Decision::Held { reasons } => {
             let lines: Vec<String> = reasons.iter().map(Reason::line).collect();
-            warn!(pr = ctx.pr, run_id = %run_id, reasons = ?lines, "The PR stays a draft");
+            // The sweep decides a held pull request again every hour: the
+            // same hold is said at warn once, then at info.
+            let again = facts
+                .prior
+                .as_ref()
+                .is_some_and(|p| p.kind == Kind::Held && &p.reasons == reasons);
+            if again {
+                info!(pr = ctx.pr, run_id = %run_id, reasons = ?lines, "The PR stays a draft (unchanged)");
+            } else {
+                warn!(pr = ctx.pr, run_id = %run_id, reasons = ?lines, "The PR stays a draft");
+            }
             write_body(ctx, &facts.body, &decision).await;
             if let Some(h) = DraftHold::new(Kind::Held, reasons.clone(), ctx.pr, &pr_url) {
-                record_hold(ctx.state, ctx.team_id, &run_id, h).await;
+                record_hold(ctx.state, ctx.team_id, &run_id, on_head(h)).await;
             }
             Outcome::Held
         }
@@ -624,9 +777,35 @@ pub async fn settle(ctx: &Ctx<'_>) -> Outcome {
             if let Some(h) =
                 DraftHold::new(Kind::Waiting, vec![Reason::new(why, "")], ctx.pr, &pr_url)
             {
-                record_hold(ctx.state, ctx.team_id, &run_id, h).await;
+                record_hold(ctx.state, ctx.team_id, &run_id, on_head(h)).await;
             }
             Outcome::Waiting
+        }
+        Decision::Proving { why, reasons } => {
+            if facts.draft {
+                info!(pr = ctx.pr, why = %why, "Marking PR ready so the checks that skip drafts run");
+                if let Err(r) = make_ready(ctx, &facts).await {
+                    return retry_or_give_up(ctx, &run_id, &pr_url, r).await;
+                }
+            }
+            write_body(ctx, &facts.body, &decision).await;
+            let (kind, reasons) = if reasons.is_empty() {
+                info!(pr = ctx.pr, run_id = %run_id, why = %why, "The PR is ready and still being proven");
+                (Kind::Waiting, vec![Reason::new(why, "")])
+            } else {
+                let lines: Vec<String> = reasons.iter().map(Reason::line).collect();
+                warn!(pr = ctx.pr, run_id = %run_id, reasons = ?lines, "The PR was marked ready to be proven and isn't");
+                (Kind::Held, reasons.clone())
+            };
+            if let Some(mut h) = DraftHold::new(kind, reasons, ctx.pr, &pr_url) {
+                h.ready = true;
+                record_hold(ctx.state, ctx.team_id, &run_id, on_head(h)).await;
+            }
+            if kind == Kind::Waiting {
+                Outcome::Proving
+            } else {
+                Outcome::Held
+            }
         }
     }
 }
@@ -650,24 +829,30 @@ async fn gather(ctx: &Ctx<'_>) -> Result<Facts, Refused> {
         e2e: ctx.e2e,
         ..Default::default()
     };
-    if f.closed || !f.draft {
+    f.head = pr["head"]["sha"].as_str().unwrap_or("").to_string();
+    // A ready pull request is decided from the pull request alone, unless
+    // CoderHelm marked it ready while it is still being proven.
+    let proving = !f.draft && is_proving(pr["body"].as_str().unwrap_or(""));
+    if f.closed || (!f.draft && !proving) {
         f.body = pr["body"].as_str().unwrap_or("").to_string();
         f.title = pr["title"].as_str().unwrap_or("").to_string();
         return Ok(f);
     }
     // A person putting it back to draft is their call. A timeline that
     // can't be read is tried again, never taken as "leave it".
-    let timeline = gh
-        .list_issue_timeline(ctx.owner, ctx.repo, ctx.pr)
-        .await
-        .map_err(|e| {
-            Refused::of(
-                "the pull request's timeline couldn't be read",
-                &*e,
-                ctx.attempt,
-            )
-        })?;
-    f.put_back_by = crate::clients::github::human_converted_to_draft(&timeline);
+    if f.draft {
+        let timeline = gh
+            .list_issue_timeline(ctx.owner, ctx.repo, ctx.pr)
+            .await
+            .map_err(|e| {
+                Refused::of(
+                    "the pull request's timeline couldn't be read",
+                    &*e,
+                    ctx.attempt,
+                )
+            })?;
+        f.put_back_by = crate::clients::github::human_converted_to_draft(&timeline);
+    }
     if f.put_back_by.is_none() {
         // Asking people to merge: the redirects and links are checked again
         // and the description's table updated.
@@ -703,6 +888,21 @@ async fn gather(ctx: &Ctx<'_>) -> Result<Facts, Refused> {
     }
     // The description as it is now (the link check may have rewritten it).
     let pr = read_pr().await?;
+    // An end-to-end fix's proof that waits on checks skipping this draft.
+    let e2e_waits = f.e2e == E2e::Running
+        || (f.e2e == E2e::None
+            && !f.proven
+            && super::resume::is_e2e_proof_pr(pr["title"].as_str().unwrap_or("")));
+    if f.draft && f.put_back_by.is_none() && f.test_fix.is_none() && e2e_waits {
+        f.runs_when_ready = super::skipped_checks::draft_gated_on_head(
+            ctx.state,
+            gh,
+            ctx.team_id,
+            (ctx.owner, ctx.repo),
+            &pr,
+        )
+        .await;
+    }
     f.closed = pr["state"].as_str() == Some("closed");
     f.draft = pr["draft"].as_bool().unwrap_or(f.draft);
     f.body = pr["body"].as_str().unwrap_or("").to_string();
@@ -729,8 +929,8 @@ async fn gather(ctx: &Ctx<'_>) -> Result<Facts, Refused> {
         f.approved = matches!(&verdict, Ok(Some(v)) if v == "APPROVE");
         // Only a read that found no review: a failed read never queues one.
         f.review_missing = matches!(verdict, Ok(None)) && !sha.is_empty();
-        f.head = sha.to_string();
     }
+    f.head = pr["head"]["sha"].as_str().unwrap_or("").to_string();
     Ok(f)
 }
 

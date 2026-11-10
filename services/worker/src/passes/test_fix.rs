@@ -45,6 +45,7 @@ use common::e2e::parse::Links;
 use common::e2e::report_source::{Location, ReportSource};
 use common::e2e::store::Store;
 use common::e2e::test_package::{self, Repeat, TestPackage};
+use common::e2e::workflow_gate;
 use common::stop_rules::environment::{self, TestEnvironment};
 use common::stop_rules::tooling::{self, Repair, ToolingFailure};
 use serde::{Deserialize, Serialize};
@@ -2266,6 +2267,9 @@ pub struct GateRecord {
     /// Workflow runs started again, as `{sha}:{run}`.
     #[serde(default)]
     pub reruns: Vec<String>,
+    /// Labels CoderHelm added to run skipped checks, as `{sha}:{label}`.
+    #[serde(default)]
+    pub labeled: Vec<String>,
     /// The commit the last hold was explained on.
     #[serde(default)]
     pub noted: String,
@@ -2298,24 +2302,82 @@ async fn load_gate(state: &WorkerState, team_id: &str, repo: &str, pr: u64) -> O
 
 async fn save_gate(state: &WorkerState, team_id: &str, repo: &str, pr: u64, g: &GateRecord) {
     let ttl = (chrono::Utc::now() + chrono::Duration::days(60)).timestamp();
+    // An update, not a put: the pending recheck's claim (`recheck_at`) on
+    // the same item survives every save.
     if let Err(e) = state
         .dynamo
-        .put_item()
+        .update_item()
         .table_name(&state.config.settings_table_name)
-        .item("pk", super::attr_s(team_id))
-        .item("sk", super::attr_s(&gate_sk(repo, pr)))
-        .item(
-            "data",
+        .key("pk", super::attr_s(team_id))
+        .key("sk", super::attr_s(&gate_sk(repo, pr)))
+        .update_expression("SET #d = :d, #t = :t")
+        .expression_attribute_names("#d", "data")
+        .expression_attribute_names("#t", "ttl")
+        .expression_attribute_values(
+            ":d",
             super::attr_s(&serde_json::to_string(g).unwrap_or_default()),
         )
-        .item(
-            "ttl",
+        .expression_attribute_values(
+            ":t",
             aws_sdk_dynamodb::types::AttributeValue::N(ttl.to_string()),
         )
         .send()
         .await
     {
         warn!(error = %e, "Could not save the test fix's ready check");
+    }
+}
+
+/// How early a recheck may arrive and still count as the pending one (SQS
+/// delays are not exact).
+const RECHECK_SLACK_SECS: i64 = 60;
+
+/// Whether this decision may schedule the next recheck: only when none is
+/// pending. Every decision used to schedule its own, so a decision from the
+/// run's completion and one from the review's verdict became two chains
+/// that each decided every ten minutes, forever twice (and spent the poll
+/// budget twice as fast). The claim is one conditional write on the gate's
+/// item, so two decisions at once can't both win
+/// (`recheck_at <= late_bound(now)`).
+#[cfg(test)]
+pub fn may_schedule(pending_at: Option<i64>, now: i64) -> bool {
+    pending_at.is_none_or(|at| at <= late_bound(now))
+}
+
+/// The latest pending recheck that counts as due at `now`.
+fn late_bound(now: i64) -> i64 {
+    now + RECHECK_SLACK_SECS
+}
+
+async fn claim_recheck(state: &WorkerState, team_id: &str, repo: &str, pr: u64) -> bool {
+    let now = chrono::Utc::now().timestamp();
+    let due = now + i64::from(RECHECK_SECS);
+    let res = state
+        .dynamo
+        .update_item()
+        .table_name(&state.config.settings_table_name)
+        .key("pk", super::attr_s(team_id))
+        .key("sk", super::attr_s(&gate_sk(repo, pr)))
+        .update_expression("SET recheck_at = :due")
+        .condition_expression("attribute_not_exists(recheck_at) OR recheck_at <= :late")
+        .expression_attribute_values(
+            ":due",
+            aws_sdk_dynamodb::types::AttributeValue::N(due.to_string()),
+        )
+        .expression_attribute_values(
+            ":late",
+            aws_sdk_dynamodb::types::AttributeValue::N(late_bound(now).to_string()),
+        )
+        .send()
+        .await;
+    match res {
+        Ok(_) => true,
+        Err(e) if format!("{e:?}").contains("ConditionalCheckFailed") => false,
+        // A failed claim must not stop the chain: schedule.
+        Err(e) => {
+            warn!(error = %e, "Could not claim the test fix's next ready check; scheduling it");
+            true
+        }
     }
 }
 
@@ -2395,6 +2457,18 @@ pub enum Hold {
     /// Waited through every recheck (about twelve hours) and it still
     /// holds, for this reason: nothing runs again by itself.
     GaveUp(String),
+    /// The checks that test it were skipped on the draft because they run
+    /// only on a pull request that isn't a draft (named here). Waiting for
+    /// them on the draft is waiting forever, so the ready decision marks it
+    /// ready, says it is still being proven, and keeps checking.
+    RunsWhenReady(Vec<String>),
+    /// The checks that test it were skipped and CoderHelm can't start them
+    /// (a label it may not add, a reason the workflow doesn't show): a
+    /// person does `todo`, never an endless wait.
+    Untriggered { what: String, todo: String },
+    /// Marked ready to be proven, and the checks that test it fail on its
+    /// head (named here): a person (or a pushed fix) deals with it.
+    Failed(String),
 }
 
 /// Whether the repeat run on CI has passed on `sha`: `Some(true)` passed,
@@ -2411,10 +2485,21 @@ fn ci_repeat_result(runs: &[Value], sha: &str, since: &str) -> Option<bool> {
     Some(run["conclusion"].as_str() == Some("success"))
 }
 
+fn names(v: &[String]) -> String {
+    v.iter()
+        .map(|n| format!("`{n}`"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 /// The decision, from what was found. Pure, so every case is tested.
+/// `skipped` says why each skipped check was skipped; `draft` is whether
+/// the pull request is a draft now.
 pub fn decide(
     refused: &[String],
     standing: &check_gate::Standing,
+    skipped: &workflow_gate::Skipped,
+    draft: bool,
     repeat_ok: Option<bool>,
 ) -> Hold {
     if !refused.is_empty() {
@@ -2423,10 +2508,54 @@ pub fn decide(
             refused.join("; ")
         ));
     }
-    if !standing.ready() {
+    // Marked ready so they run, and they failed: that is the proof's
+    // result, never something to wait out.
+    if !draft && !standing.failed.is_empty() {
+        return Hold::Failed(format!(
+            "the checks that test it fail on its head commit: {}",
+            names(&standing.failed)
+        ));
+    }
+    let settling =
+        !standing.failed.is_empty() || !standing.waiting.is_empty() || !standing.missing.is_empty();
+    if settling {
         return Hold::Wait(format!(
             "the checks that test it aren't green on its head commit ({})",
             standing.why_not()
+        ));
+    }
+    if !standing.skipped.is_empty() {
+        // A skipped check nothing explained is one CoderHelm can't start.
+        let mut skipped = skipped.clone();
+        for n in &standing.skipped {
+            let known = skipped.draft_gated.contains(n)
+                || skipped.draft_no_start.contains(n)
+                || skipped.unknown.contains(n)
+                || skipped.label_gated.iter().any(|(c, _)| c == n);
+            if !known {
+                skipped.unknown.push(n.clone());
+            }
+        }
+        // Some run once it is marked ready: that comes first. Any skipped
+        // for a missing label are named once it is ready and still skipped.
+        if draft && !skipped.draft_gated.is_empty() {
+            return Hold::RunsWhenReady(skipped.draft_gated.clone());
+        }
+        // Skipped for a reason CoderHelm can't act on: one plain action.
+        if let Some(todo) = skipped.action() {
+            return Hold::Untriggered {
+                what: format!(
+                    "the checks that test it were skipped on its head commit: {}",
+                    names(&standing.skipped)
+                ),
+                todo,
+            };
+        }
+        // Draft-gated on a pull request just marked ready: they start now
+        // (a wait the ready decision bounds).
+        return Hold::Wait(format!(
+            "{} start now that it is marked ready",
+            names(&standing.skipped)
         ));
     }
     match repeat_ok {
@@ -2480,6 +2609,8 @@ pub async fn ready_gate(
     let sha = pr["head"]["sha"].as_str().unwrap_or("").to_string();
     let head_ref = pr["head"]["ref"].as_str().unwrap_or("").to_string();
     let base = pr["base"]["ref"].as_str().unwrap_or("main").to_string();
+    let draft = pr["draft"].as_bool().unwrap_or(false);
+    let labels = super::skipped_checks::labels_of(&pr);
 
     // The diff as it is now (feedback rounds change it too).
     let refused = match github
@@ -2512,10 +2643,58 @@ pub async fn ready_gate(
             .as_ref(),
     );
     let standing = check_gate::standing(&checks, &required);
+    // Why each skipped check was skipped, from its workflow: on a draft, a
+    // check that runs only once the pull request is ready is never waited
+    // on (it would be skipped on every push: draft, so skipped, so draft).
+    let mut skipped = super::skipped_checks::sort(
+        state,
+        github,
+        team_id,
+        (owner, repo),
+        &head_ref,
+        &labels,
+        &checks,
+        &standing.skipped,
+    )
+    .await;
+    // A label that runs them, which the team's settings let CoderHelm add:
+    // added once per commit, and the checks are waited for.
+    let wanted = skipped.labels();
+    if !wanted.is_empty() {
+        let mut add = Vec::new();
+        for l in &wanted {
+            let key = format!("{sha}:{l}");
+            if !g.labeled.contains(&key)
+                && super::review_pr::may_add_label(state, team_id, owner, repo, l).await
+            {
+                g.labeled.push(key);
+                add.push(l.clone());
+            }
+        }
+        if !add.is_empty() {
+            match github.add_labels(owner, repo, pr_number, &add).await {
+                Ok(_) => {
+                    info!(pr_number, labels = ?add, "Added the labels that run the skipped test checks");
+                    skipped
+                        .label_gated
+                        .retain(|(_, ls)| !ls.iter().any(|l| add.contains(l)));
+                }
+                Err(e) => {
+                    warn!(pr_number, error = %e, "Could not add the labels that run the skipped test checks")
+                }
+            }
+        }
+    }
 
-    // A skipped or neutral test check ran nothing: start it again, once
-    // per commit.
-    for run in &standing.rerun {
+    // A skipped or neutral test check whose workflow shows no draft or
+    // label condition: start it again, once per commit. (One skipped by a
+    // condition would be skipped again: a rerun replays the same event.)
+    let unknown_runs: Vec<u64> = checks
+        .iter()
+        .filter(|c| skipped.unknown.contains(&c.name))
+        .filter_map(|c| c.run_id)
+        .collect();
+    for run in standing.rerun.iter().filter(|r| unknown_runs.contains(r)) {
         let key = format!("{sha}:{run}");
         if g.reruns.contains(&key) {
             continue;
@@ -2579,7 +2758,19 @@ pub async fn ready_gate(
         }
     }
 
-    let mut hold = decide(&refused, &standing, repeat_ok);
+    let mut hold = decide(&refused, &standing, &skipped, draft, repeat_ok);
+    if let Hold::RunsWhenReady(gated) = &hold {
+        info!(pr_number, checks = ?gated, "The checks that test this fix run only once it is marked ready");
+        schedule_recheck(
+            state,
+            github.installation_id(),
+            team_id,
+            owner,
+            repo,
+            pr_number,
+        )
+        .await;
+    }
     if let Hold::Wait(why) | Hold::Refused(why) = hold.clone() {
         let no_repeat = repeat_ok.is_none() && g.ci_workflow.is_empty();
         if g.noted != sha {
@@ -2598,13 +2789,17 @@ pub async fn ready_gate(
                     owner,
                     repo,
                     pr_number,
-                    &format!("This test fix stays a draft: {why}.{how}"),
+                    &if draft {
+                        format!("This test fix stays a draft: {why}.{how}")
+                    } else {
+                        format!("This test fix is still being proven: {why}.{how}")
+                    },
                 )
                 .await;
         }
         g.polls += 1;
         if g.polls <= MAX_POLLS {
-            recheck_later(
+            schedule_recheck(
                 state,
                 github.installation_id(),
                 team_id,
@@ -2626,6 +2821,26 @@ pub async fn ready_gate(
     }
     save_gate(state, team_id, &full, pr_number, &g).await;
     hold
+}
+
+/// Asks for the ready check again in ten minutes, unless a recheck is
+/// already pending ([`may_schedule`]).
+async fn schedule_recheck(
+    state: &WorkerState,
+    installation_id: u64,
+    team_id: &str,
+    owner: &str,
+    repo: &str,
+    pr: u64,
+) {
+    if claim_recheck(state, team_id, &format!("{owner}/{repo}"), pr).await {
+        recheck_later(state, installation_id, team_id, owner, repo, pr).await;
+    } else {
+        info!(
+            pr,
+            "A ready check is already pending for this pull request; not adding another"
+        );
+    }
 }
 
 /// Asks for the ready check again in ten minutes.
@@ -3129,6 +3344,8 @@ mod tests {
             green: vec!["e2e".into()],
             ..Default::default()
         };
+        let none = workflow_gate::Skipped::default();
+        let decide = |r: &[String], s: &Standing, ok| decide(r, s, &none, true, ok);
         assert_eq!(decide(&[], &green, Some(true)), Hold::Go);
         assert!(matches!(decide(&[], &green, None), Hold::Wait(w) if w.contains("hasn't passed")));
         assert!(matches!(decide(&[], &green, Some(false)), Hold::Wait(w) if w.contains("failed")));
@@ -3138,7 +3355,7 @@ mod tests {
             ..Default::default()
         };
         assert!(
-            matches!(decide(&[], &skipped, Some(true)), Hold::Wait(w) if w.contains("skipped on this commit"))
+            matches!(decide(&[], &skipped, Some(true)), Hold::Untriggered { what, todo } if what.contains("skipped on its head commit") && todo.contains("Start `deploy-preview`"))
         );
         let finding = fix_guard::Finding {
             path: "e2e/a.spec.ts".into(),

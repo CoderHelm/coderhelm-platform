@@ -19,6 +19,8 @@
 //!   affected spec.
 //! - [`check_gate`] keeps the pull request a draft until the checks that
 //!   test it are green on its head.
+//! - [`workflow_gate`] tells why a check was skipped on the head: a draft,
+//!   a missing label, or a reason the workflow doesn't show.
 //! - [`fix_ticket`] reads the ticket and shapes the description.
 //! - [`integrity`] refuses fixes that ask less of a test.
 //! - [`attribution`] decides whether a failure on Coderhelm's own pull
@@ -47,3 +49,4 @@ pub mod stats;
 pub mod store;
 pub mod test_package;
 pub mod triage;
+pub mod workflow_gate;

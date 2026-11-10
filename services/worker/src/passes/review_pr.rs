@@ -117,6 +117,32 @@ async fn load_config(
     })
 }
 
+/// Whether CoderHelm may add `label` to a pull request in this repo by
+/// itself: the reviewer is on with label picking, and the team's settings
+/// allow the label by name or family (`review_labels::LabelRules`). Labels
+/// the repo's docs merely mention are never added this way, and neither are
+/// deploy, staging or production labels: a person adds those.
+pub(crate) async fn may_add_label(
+    state: &WorkerState,
+    team_id: &str,
+    owner: &str,
+    name: &str,
+    label: &str,
+) -> bool {
+    // Deploy labels cost a shared environment, and the team's label rules
+    // decide when one is worth it (the reviewer weighs them per change):
+    // never added just because a workflow asks for one.
+    let l = label.to_ascii_lowercase();
+    if label.ends_with('*') || ["prod", "deploy", "staging"].iter().any(|w| l.contains(w)) {
+        return false;
+    }
+    load_config(state, team_id, owner, name)
+        .await
+        .is_ok_and(|cfg| {
+            cfg.enabled && !cfg.killed && cfg.auto_labels && cfg.label_rules.allowed(label)
+        })
+}
+
 /// True when the repo turned on "Require tests" (and review isn't off/killed).
 /// The same switch makes the reviewer block untested behavior changes and makes
 /// CoderHelm's own coding passes write those tests.
