@@ -681,3 +681,52 @@ process.exit(ok ? 0 : 1);
     process.env.PATH = oldPath;
   }
 });
+
+// ── a brief GitHub error is asked again; a wrong release never is ────────
+
+import { download, DOWNLOAD_TRIES } from "../lib/release.mjs";
+import { FETCH_TRIES } from "../lib/source-tag.mjs";
+
+/** A fetch that answers `statuses` in turn (a thrown Error for "throw"), then the file. */
+function flakyFetch(statuses) {
+  const seen = [];
+  const fetchImpl = async (url) => {
+    seen.push(url);
+    const s = statuses.shift() ?? 200;
+    if (s === "throw") throw new Error("socket hang up");
+    return { ok: s === 200, status: s, url, arrayBuffer: async () => Buffer.from("SUMS") };
+  };
+  return { fetchImpl, seen };
+}
+
+test("a release download that GitHub briefly fails is asked again, bounded", async () => {
+  const waits = [];
+  const wait = async (ms) => waits.push(ms);
+  const ok = flakyFetch([502, "throw", 503]);
+  assert.equal((await download(ok.fetchImpl, TAG, "SHA256SUMS", { wait })).toString(), "SUMS");
+  assert.equal(ok.seen.length, 4);
+  assert.deepEqual(waits, [2000, 4000, 6000]);
+  // Never past DOWNLOAD_TRIES.
+  const down = flakyFetch(Array(10).fill(500));
+  await assert.rejects(() => download(down.fetchImpl, TAG, "SHA256SUMS", { wait }), /Could not download SHA256SUMS for v1\.2\.3 \(500\)/);
+  assert.equal(down.seen.length, DOWNLOAD_TRIES);
+  // A 404 is GitHub's answer, not an outage: asked once.
+  const missing = flakyFetch([404]);
+  await assert.rejects(() => download(missing.fetchImpl, TAG, "SHA256SUMS", { wait }), /\(404\)\. Is v1\.2\.3 a CoderHelm release\?/);
+  assert.equal(missing.seen.length, 1);
+});
+
+test("the tag fetch is asked again after a brief error, never for a tag GitHub doesn't have", async () => {
+  let fails = 2;
+  const flaky = cosignOk({ "fetch -q --no-tags": () => (fails-- > 0 ? { code: 128, stderr: "fatal: unable to access: The requested URL returned error: 502" } : "") });
+  const waits = [];
+  assert.equal(await verifySourceTag(TAG, { runner: flaky, wait: async (ms) => waits.push(ms) }), COMMIT);
+  assert.equal(flaky.lines().filter((l) => l.includes("fetch -q --no-tags")).length, 3);
+  assert.deepEqual(waits, [2000, 4000]);
+  const down = cosignOk({ "fetch -q --no-tags": { code: 128, stderr: "fatal: unable to access: 503" } });
+  await assert.rejects(() => verifySourceTag(TAG, { runner: down, wait: async () => {} }), /could not fetch the tag v1\.2\.3/);
+  assert.equal(down.lines().filter((l) => l.includes("fetch -q --no-tags")).length, FETCH_TRIES);
+  const missing = cosignOk({ "fetch -q --no-tags": { code: 128, stderr: "fatal: couldn't find remote ref refs/tags/v1.2.3" } });
+  await assert.rejects(() => verifySourceTag(TAG, { runner: missing, wait: async () => assert.fail("never waits") }), /could not fetch the tag/);
+  assert.equal(missing.lines().filter((l) => l.includes("fetch -q --no-tags")).length, 1);
+});

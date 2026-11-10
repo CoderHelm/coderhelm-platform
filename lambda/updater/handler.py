@@ -1521,9 +1521,8 @@ def start_verify(store, env, now, version):
     return True
 
 
-def build_state(build_id, cb=None):
-    """CodeBuild's status for a release check build (IN_PROGRESS, SUCCEEDED,
-    FAILED, ...), or None when it can't be read."""
+def read_build(build_id, cb=None):
+    """CodeBuild's record of a release check build, or None when it can't be read."""
     if not build_id:
         return None
     try:
@@ -1531,7 +1530,97 @@ def build_state(build_id, cb=None):
     except Exception as e:  # noqa: BLE001  unknown is not a result
         logger.warning(f"Release check build not read: {e}")
         return None
-    return (builds[0].get("buildStatus") if builds else None) or None
+    return builds[0] if builds else None
+
+
+def build_state(build_id, cb=None):
+    """CodeBuild's status for a release check build (IN_PROGRESS, SUCCEEDED,
+    FAILED, ...), or None when it can't be read."""
+    return ((read_build(build_id, cb) or {}).get("buildStatus")) or None
+
+
+# ── A release check that failed before it verified anything ──────────────
+#
+# The release check build downloads before it verifies: cosign in its
+# install phase, the release's SHA256SUMS, signature and tag in pre_build
+# (infra/lib/updates-stack.ts, releaseCheckBuildSpec). A failure there is
+# GitHub not answering, or CodeBuild not starting the build, never the
+# release: nothing reports back, and CodeBuild's record names the phase.
+# The one download in its build phase (models.json) reports "unavailable".
+# Either way the updater starts the check again by itself, CHECK_ATTEMPTS
+# builds in all, each after its CHECK_BACKOFF. A failure while verifying
+# (the build or post_build phase: a bad signature, a wrong tag) is never
+# started again by itself: the check ends at once with its reason.
+
+CHECK_ATTEMPTS = 3
+CHECK_BACKOFF = (timedelta(seconds=30), timedelta(minutes=2))
+# The phases before the release check verifies anything.
+SETUP_PHASES = ("SUBMITTED", "QUEUED", "PROVISIONING", "DOWNLOAD_SOURCE", "INSTALL", "PRE_BUILD")
+PHASE_FAILED = ("FAILED", "FAULT", "TIMED_OUT", "CLIENT_ERROR")
+DOWNLOAD_PHASES = ("INSTALL", "PRE_BUILD", "DOWNLOAD")
+
+
+def setup_failure(build, verifying=None):
+    """The phase a release check build failed in before it verified anything
+    (INSTALL, PRE_BUILD, PROVISIONING, ...; DOWNLOAD when its build phase
+    reported a download that failed), or "" when it failed while verifying,
+    was stopped, or CodeBuild doesn't say where."""
+    build = build or {}
+    if build.get("buildStatus") not in ("FAILED", "FAULT", "TIMED_OUT"):
+        return ""
+    if (verifying or {}).get("unavailable"):
+        return "DOWNLOAD"
+    failed = [p.get("phaseType") for p in build.get("phases") or [] if p.get("phaseStatus") in PHASE_FAILED]
+    if not failed or any(p not in SETUP_PHASES for p in failed):
+        return ""
+    return failed[0]
+
+
+def setup_reason(phase):
+    if phase in DOWNLOAD_PHASES:
+        return "GitHub didn't answer a download"
+    return f"CodeBuild couldn't run the release check ({phase.lower().replace('_', ' ')} failed)"
+
+
+def when(value):
+    """A CodeBuild time (a datetime from boto3, or ISO text) as an aware datetime, or None."""
+    if isinstance(value, datetime):
+        return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+    try:
+        return datetime.fromisoformat(str(value))
+    except (TypeError, ValueError):
+        return None
+
+
+def retry_check(store, env, now, version, v, build):
+    """Starts the release check of `version` again by itself when its build
+    failed before verifying anything, at most CHECK_ATTEMPTS builds in all.
+    Returns the retry ({attempt, of, reason, note, waiting}) while the check
+    carries on, or None when it doesn't: the build failed while verifying,
+    was stopped, or every attempt was used."""
+    phase = setup_failure(build, v)
+    attempt = int(v.get("attempt") or 1)
+    if not phase or attempt >= CHECK_ATTEMPTS:
+        return None
+    nxt = attempt + 1
+    reason = setup_reason(phase)
+    out = {"attempt": nxt, "of": CHECK_ATTEMPTS, "reason": reason, "phase": phase,
+           "note": f"{reason}; checking again ({nxt} of {CHECK_ATTEMPTS})"}
+    ended = when((build or {}).get("endTime")) or when(v.get("at")) or now
+    if now - ended < CHECK_BACKOFF[attempt - 1]:
+        return dict(out, waiting=True)
+    state = store.get("UPDATE_STATE", {}) or {}
+    if (state.get("verifying") or {}).get("build") != v.get("build"):
+        return dict(out, waiting=False)  # started again meanwhile (another read of the page)
+    try:
+        new = start_check(env, version)
+    except Exception as e:  # noqa: BLE001  the next read tries again
+        logger.warning(f"Release check of {version} not started again: {e}")
+        return dict(out, waiting=True)
+    logger.warning(f"Release check of {version} failed in {phase} before verifying; started again ({nxt} of {CHECK_ATTEMPTS})")
+    state["verifying"] = {"version": version, "at": now.isoformat(), "build": new, "attempt": nxt, "retried": phase}
+    store.put("UPDATE_STATE", state)
+    return dict(out, waiting=False)
 
 
 def claim_problem(event, state, version):
@@ -1708,11 +1797,26 @@ def model_check_view(store, env, now, version, probe=None, cb=None):
     v = (store.get("UPDATE_STATE", {}) or {}).get("verifying") or {}
     mine = v.get("version") == version
     started = (v.get("at") if mine else None) or mc.get("started_at") or mc.get("checked_at")
-    build = build_state(v.get("build"), cb) if mine else None
+    record = read_build(v.get("build"), cb) if mine else None
+    build = (record or {}).get("buildStatus") or None
     view = dict(mc, progress={"step": "signature", "started_at": started, "build": build})
+    if mine and int(v.get("attempt") or 1) > 1:
+        view["progress"]["attempt"] = {"attempt": int(v["attempt"]), "of": CHECK_ATTEMPTS}
     reason = ""
     if build and build != "IN_PROGRESS" and not v.get("claim"):
-        reason = f"the release check build ended {build} without reporting back"
+        # Failed before verifying anything (GitHub didn't answer a
+        # download): started again by itself, the request keeps waiting.
+        retry = retry_check(store, env, now, version, v, record)
+        if retry:
+            progress = dict(view["progress"], retry=retry)
+            if not retry.get("waiting"):
+                progress.update(build="IN_PROGRESS", started_at=now.isoformat())
+            return dict(view, note=retry["note"], progress=progress)
+        phase = setup_failure(record, v)
+        if phase:
+            reason = f"{setup_reason(phase)} in {CHECK_ATTEMPTS} tries"
+        else:
+            reason = f"the release check build ended {build} without reporting back"
     else:
         try:
             if now - datetime.fromisoformat(started) > CHECK_LIMIT:
@@ -4098,6 +4202,14 @@ def handle(event, env, store, now, fetch=fetch_releases, probe=None, hint=None):
         problem = claim_problem(event, state, version)
         if problem:
             raise ValueError(problem)
+        if event.get("status") == "unavailable":
+            # A release file didn't download (GitHub didn't answer): nothing
+            # was verified or refused. The version route starts the check
+            # again once CodeBuild shows the build ended (retry_check).
+            logger.warning(f"Release check for {version} couldn't download: {event.get('reason')}")
+            state["verifying"]["unavailable"] = True
+            store.put("UPDATE_STATE", state)
+            return {"verified": False, "retrying": True}
         if event.get("status") != "verified":
             logger.warning(f"Release check for {version} failed: {event.get('reason')}")
             state.pop("verifying", None)

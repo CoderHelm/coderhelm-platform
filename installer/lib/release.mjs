@@ -82,12 +82,41 @@ export function checkDownloadUrl(url) {
   return u.href;
 }
 
-export async function download(fetchImpl, tag, name) {
+/** How many times a release file is asked for before a brief GitHub error is an error. */
+export const DOWNLOAD_TRIES = 4;
+
+const pause = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+/** GitHub answers a download with these when it is briefly unwell: ask again. */
+export function transientStatus(status) {
+  return status === 408 || status === 429 || status >= 500;
+}
+
+/**
+ * One release file. A brief GitHub error (no answer, a 408, 429 or 5xx) is
+ * asked again, DOWNLOAD_TRIES in all, 2, 4 then 6 seconds apart; a 404 or
+ * any other answer is final. The file is checked against the signed
+ * SHA256SUMS by the caller either way.
+ */
+export async function download(fetchImpl, tag, name, { tries = DOWNLOAD_TRIES, wait = pause } = {}) {
   const url = releaseUrl(tag, name);
-  const r = await fetchImpl(url, { redirect: "follow" });
-  if (!r.ok) throw new Error(`Could not download ${name} for ${tag} (${r.status}). Is ${tag} a CoderHelm release?`);
-  checkDownloadUrl(r.url || url);
-  return Buffer.from(await r.arrayBuffer());
+  for (let i = 1; ; i++) {
+    let r;
+    try {
+      r = await fetchImpl(url, { redirect: "follow" });
+    } catch (e) {
+      if (i >= tries) throw new Error(`Could not download ${name} for ${tag}: ${e.message} (${tries} tries).`);
+      await wait(2000 * i);
+      continue;
+    }
+    if (!r.ok && transientStatus(r.status) && i < tries) {
+      await wait(2000 * i);
+      continue;
+    }
+    if (!r.ok) throw new Error(`Could not download ${name} for ${tag} (${r.status}). Is ${tag} a CoderHelm release?`);
+    checkDownloadUrl(r.url || url);
+    return Buffer.from(await r.arrayBuffer());
+  }
 }
 
 /** Parses SHA256SUMS ("<hex>  <file>" per line). */

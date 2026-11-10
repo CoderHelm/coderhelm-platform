@@ -17,7 +17,7 @@ import { buildApp } from "../lib/app";
 import { CoderhelmConfig, loadConfigFile, resolveConfig, ResolvedConfig } from "../lib/config";
 import { API_PATHS, BRAIN_STREAM_PATH, DASHBOARD_URL_PLACEHOLDER, STREAM_PATH, runtimeConfigScript } from "../lib/web-stack";
 import { releaseCheckBuildSpec, updateBuildSpec } from "../lib/updates-stack";
-import { CHECK_VERSION, COSIGN_LINUX_AMD64_SHA256, VERIFY_SUMS, verifyTagCommands } from "../lib/release-verify";
+import { CHECK_VERSION, checkTagCommands, COSIGN_LINUX_AMD64_SHA256, CURL, FETCH_TRIES, fetchTagCommands, VERIFY_SUMS, verifyTagCommands } from "../lib/release-verify";
 import { accessNames, deployPolicy } from "../lib/access";
 
 const INFRA = path.join(__dirname, "..", "..");
@@ -812,6 +812,47 @@ test("the release check reads models.json only after the signature check, and ca
   assert.ok(actions.every((a) => a === "lambda:InvokeFunction" || a.startsWith("logs:") || /^codebuild:(Create|Update|BatchPut)/.test(a)), JSON.stringify(actions));
   assert.ok(!actions.some((a) => /sts:|secretsmanager:|ssm:|cloudformation:|bedrock:/.test(a)));
   assert.equal(envOf(u, "coderhelm-prod-updater").RELEASE_CHECK_PROJECT_NAME, "coderhelm-prod-release-check");
+});
+
+test("every release download rides out a brief GitHub error, HTTPS only", () => {
+  // curl tries again (bounded) and never leaves HTTPS, redirects included.
+  assert.match(CURL, /--proto =https --proto-redir =https --tlsv1\.2 -fsSL/);
+  assert.match(CURL, /--retry 5 --retry-all-errors --retry-delay 2 --retry-max-time 120/);
+  const cfg = selfHost();
+  for (const spec of [updateBuildSpec(cfg), releaseCheckBuildSpec(cfg)]) {
+    const commands: string[] = [...Object.values((spec as any).spec.phases)].flatMap((p: any) => p.commands);
+    const curls = commands.filter((c) => /\bcurl /.test(c));
+    assert.ok(curls.length >= 3);
+    for (const c of curls) assert.ok(c.includes(CURL), c);
+    // The git fetch of the tag is tried again too, a bounded number of times.
+    const fetch = commands.find((c) => c.includes(" fetch -q --no-tags"));
+    assert.ok(fetch?.startsWith(`for i in $(seq 1 ${FETCH_TRIES}); do `), fetch);
+    assert.match(fetch!, /&& break; .* exit 1; \}; sleep \$\(\(i \* 2\)\); done$/);
+  }
+});
+
+test("the release check downloads before it verifies, so the updater can tell a GitHub error from a bad release", () => {
+  const phases = (releaseCheckBuildSpec(selfHost()) as any).spec.phases;
+  assert.deepEqual(Object.keys(phases), ["install", "pre_build", "build", "post_build"]);
+  // install and pre_build only download: nothing there checks the release.
+  for (const p of ["install", "pre_build"]) {
+    assert.ok(!phases[p].commands.some((c: string) => /verify-blob|verify-tag|sha256sum -c -.*SHA256SUMS|merge-base/.test(c) && !c.includes("/tmp/cosign")), p);
+  }
+  for (const line of fetchTagCommands()) assert.ok(phases.pre_build.commands.includes(line), line);
+  assert.ok(phases.pre_build.commands.some((c: string) => c.includes('-o SHA256SUMS "$B/SHA256SUMS"')));
+  assert.ok(phases.pre_build.commands.some((c: string) => c.includes('-o SHA256SUMS.sigstore.json')));
+  assert.ok(phases.pre_build.commands.indexOf(CHECK_VERSION) < phases.pre_build.commands.findIndex((c: string) => c.includes("curl")));
+  // build does every check, in the update build's order.
+  for (const line of checkTagCommands()) assert.ok(phases.build.commands.includes(line), line);
+  assert.ok(phases.build.commands.includes(VERIFY_SUMS));
+  assert.deepEqual([...fetchTagCommands(), ...checkTagCommands()], verifyTagCommands());
+  // Its one download (models.json, after the signature check) says so when it fails, and post_build reports
+  // it as "unavailable" (checked again), never as a release that didn't verify.
+  const models = phases.build.commands.find((c: string) => c.includes("-o models.json"));
+  assert.ok(models.includes('"$B/models.json" || { touch /tmp/download-failed; exit 1; }'));
+  const report = phases.post_build.commands[0];
+  assert.ok(report.startsWith('if [ -f /tmp/download-failed ]; then echo \'{"status":"unavailable"'), report);
+  assert.ok(report.includes('elif [ "${CODEBUILD_BUILD_SUCCEEDING:-0}" != "1" ]'), "any other failure still reports failed");
 });
 
 test("sign-in: self-host checks every new account in Cognito (pre-sign-up trigger); MFA stays optional with authenticator apps", () => {

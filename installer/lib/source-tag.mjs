@@ -153,13 +153,19 @@ export function tagHeader(text) {
   return fields;
 }
 
+/** How many times the tag is fetched from GitHub before a brief error is an error. */
+export const FETCH_TRIES = 4;
+/** git's answer when GitHub has no such tag: asking again won't change it. */
+const NO_SUCH_REF = /couldn't find remote ref|not our ref/i;
+const pause = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
 /**
  * Checks `tag` in `remote` (this repository on GitHub) and returns the
  * commit it points to: annotated, named `tag`, on main, and either signed
  * by a maintainer key or attested by auto-release.yml on main for exactly
  * this tag and commit. Throws, naming the check, on anything else.
  */
-export async function verifySourceTag(tag, { runner, remote = SOURCE_REMOTE, keysFile = maintainersFile(), log = () => {} }) {
+export async function verifySourceTag(tag, { runner, remote = SOURCE_REMOTE, keysFile = maintainersFile(), log = () => {}, fetchTries = FETCH_TRIES, wait = pause }) {
   checkTag(tag);
   const keys = parseMaintainers(fs.readFileSync(keysFile, "utf8"));
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "ch-tag-"));
@@ -168,7 +174,13 @@ export async function verifySourceTag(tag, { runner, remote = SOURCE_REMOTE, key
     const r0 = await runner.run("git", ["init", "-q", "--bare", dir], { capture: true, allowFail: true, env: GIT_ENV }).catch((e) => ({ code: 127, stderr: e.message }));
     if (r0.code !== 0) throw new Error(`git is needed to check the release's tag (${(r0.stderr || "").trim() || "git init failed"})`);
     // The tag and main's commits (no trees or files: small and quick).
-    const f = await git(["fetch", "-q", "--no-tags", "--filter=tree:0", remote, `+refs/tags/${tag}:refs/tags/${tag}`, "+refs/heads/main:refs/heads/main"]);
+    // A brief GitHub error is asked again; a tag GitHub says it doesn't have is final.
+    let f;
+    for (let i = 1; ; i++) {
+      f = await git(["fetch", "-q", "--no-tags", "--filter=tree:0", remote, `+refs/tags/${tag}:refs/tags/${tag}`, "+refs/heads/main:refs/heads/main"]);
+      if (f.code === 0 || i >= fetchTries || NO_SUCH_REF.test(f.stderr || "")) break;
+      await wait(2000 * i);
+    }
     if (f.code !== 0) throw new Error(`could not fetch the tag ${tag} and main from ${remote}${f.stderr ? `: ${f.stderr.trim()}` : ""}`);
     const type = (await git(["cat-file", "-t", `refs/tags/${tag}`])).stdout.trim();
     if (type !== "tag") throw new Error(`${tag} is a lightweight tag, not an annotated, signed one`);
