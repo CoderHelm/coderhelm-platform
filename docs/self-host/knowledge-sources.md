@@ -56,7 +56,7 @@ Every provider sends people back to the dashboard's sign-in page, the same one r
 https://<your dashboard URL>/settings/integrations/mcp-callback/
 ```
 
-Register exactly this address (with the trailing slash) as the redirect URI in each app below. On the hosted service it is `https://app.coderhelm.com/settings/integrations/mcp-callback/`, and the secret is `coderhelm/prod/secrets` in Secrets Manager (the gateway reads `SECRETS_NAME`, which the deploy sets to `coderhelm/<stage>/secrets`, or `<prefix>/secrets` for a custom prefix).
+Register exactly this address (with the trailing slash) as the redirect URI in each app below. [OAuth sign-ins](../oauth.md) lists every flow that returns there, and what each error on that page means. On the hosted service it is `https://app.coderhelm.com/settings/integrations/mcp-callback/`, and the secret is `coderhelm/prod/secrets` in Secrets Manager (the gateway reads `SECRETS_NAME`, which the deploy sets to `coderhelm/<stage>/secrets`, or `<prefix>/secrets` for a custom prefix).
 
 ## Notion
 
@@ -87,9 +87,11 @@ Events are checked with `X-Notion-Signature` (HMAC-SHA256 with that token). An e
 ## Confluence (Atlassian)
 
 1. Open <https://developer.atlassian.com/console/myapps/> and create an **OAuth 2.0 integration**.
-2. Under **Permissions**, add the Confluence API with these scopes: `read:page:confluence`, `read:space:confluence`, `read:hierarchical-content:confluence`, `read:confluence-content.summary`, `search:confluence`.
-3. Under **Authorization**, set the callback URL to the sign-in address above.
-4. Under **Distribution**, make it sharable if teams outside your Atlassian organization will connect.
+2. Under **Permissions**, add the Confluence API, then add exactly the scopes CoderHelm asks for. A scope the sign-in asks for but the app doesn't have makes Atlassian's consent page fail.
+   - **Granular scopes** tab: `read:page:confluence`, `read:space:confluence`, `read:hierarchical-content:confluence`.
+   - **Classic scopes** tab: `search:confluence` (CQL search has no granular version CoderHelm uses).
+3. Under **Authorization**, set the callback URL to the sign-in address above. Atlassian keeps one callback URL per app, so an app shared by two installs can't serve both: give each install its own app, or use [hybrid](./hybrid.md) with CoderHelm's.
+4. Under **Distribution**, make it sharable if anyone outside the app owner's Atlassian account will connect. An app that isn't shared answers other people with `access_denied`, the same answer as choosing Cancel; CoderHelm now shows Atlassian's own description with it.
 5. Add to the secret:
 
 ```json

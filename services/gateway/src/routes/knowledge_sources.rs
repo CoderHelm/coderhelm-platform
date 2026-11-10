@@ -291,6 +291,18 @@ pub async fn connectors(
     ))
 }
 
+/// The `return_to` a sign-in start may send (`{"return_to": "/knowledge/..."}`):
+/// a Knowledge page only, else nothing (the callback goes to Knowledge).
+pub fn return_to_of(body: &[u8]) -> String {
+    let v: Value = serde_json::from_slice(body).unwrap_or_default();
+    let p = common::mcp_remote::oauth::clean_return_path(v["return_to"].as_str().unwrap_or(""));
+    if p == "/knowledge" || p.starts_with("/knowledge/") || p.starts_with("/knowledge?") {
+        p
+    } else {
+        String::new()
+    }
+}
+
 /// What a sign-in that isn't set up says: one sentence, then who can fix it.
 fn not_set_up(kind: Kind) -> String {
     format!(
@@ -306,7 +318,9 @@ pub async fn connect(
     State(state): State<Arc<AppState>>,
     Extension(claims): Extension<Claims>,
     Path(kind): Path<String>,
+    body: Bytes,
 ) -> Reply {
+    let return_to = return_to_of(&body);
     claims.require_role(3).map_err(forbidden)?;
     let kind = kind_of(&kind)?;
     // A hybrid install that chose CoderHelm's app for this provider signs in
@@ -330,6 +344,7 @@ pub async fn connect(
         user_email: &claims.email,
         added_at: &added_at,
         redirect_uri: &redirect,
+        return_to: &return_to,
     };
     let url = oauth::start_sign_in(&rt, kind, via, &who)
         .await
@@ -354,19 +369,22 @@ async fn start_member_signin(
     state: &AppState,
     claims: &Claims,
     kind: Kind,
+    return_to: &str,
 ) -> Result<String, (StatusCode, Json<Value>)> {
     let rt = super::mcp_servers::runtime(state, &claims.team_id);
     let mut rec = connect::signin_target(&rt, kind)
         .await
         .map_err(|e| fail(StatusCode::BAD_GATEWAY, &e))?;
     let url = rt
-        .start_sign_in(
+        .start_sign_in_for(
             &mut rec,
             &Owner::user(&claims.email),
             &claims.sub,
             &claims.email,
             &super::mcp_servers::redirect_uri(&state.config.stage),
             super::mcp_servers::metadata_document_url(&state.config.stage).as_deref(),
+            Some(common::mcp_remote::oauth::Flow::Knowledge),
+            return_to,
         )
         .await
         .map_err(|e| fail(StatusCode::BAD_REQUEST, &e))?;
@@ -381,6 +399,7 @@ pub async fn signin(
     State(state): State<Arc<AppState>>,
     Extension(claims): Extension<Claims>,
     Path(kind): Path<String>,
+    body: Bytes,
 ) -> Reply {
     claims.require_role(3).map_err(forbidden)?;
     let kind = kind_of(&kind)?;
@@ -398,7 +417,7 @@ pub async fn signin(
     {
         return Ok(Json(json!({ "signed_in": true })));
     }
-    let url = start_member_signin(&state, &claims, kind).await?;
+    let url = start_member_signin(&state, &claims, kind, &return_to_of(&body)).await?;
     Ok(Json(json!({ "signed_in": false, "authorize_url": url })))
 }
 
@@ -1208,7 +1227,8 @@ pub async fn source_signin(
         .await
         .map_err(|e| connector_fail(kind, &e))?
     else {
-        let url = start_member_signin(&state, &claims, kind).await?;
+        let back = format!("/knowledge/base/?id={}", urlencoding::encode(&kb_id));
+        let url = start_member_signin(&state, &claims, kind, &back).await?;
         return Ok(Json(json!({ "authorize_url": url })));
     };
     src.signin = Some(signin_for_source(&state, &claims, &si).await);
@@ -1719,5 +1739,19 @@ mod tests {
             ["notion", "upload"]
         );
         assert_eq!(kinds(&[synced], &[notion]), ["notion"]);
+    }
+
+    #[test]
+    fn a_sign_in_returns_only_to_a_knowledge_page() {
+        let r = |b: &str| super::return_to_of(b.as_bytes());
+        assert_eq!(
+            r(r#"{"return_to":"/knowledge/base/?id=kb1"}"#),
+            "/knowledge/base/?id=kb1"
+        );
+        assert_eq!(r(r#"{"return_to":"/knowledge/"}"#), "/knowledge/");
+        assert_eq!(r(r#"{"return_to":"/settings/"}"#), "");
+        assert_eq!(r(r#"{"return_to":"//evil.example/knowledge/"}"#), "");
+        assert_eq!(r(r#"{"return_to":"/knowledgeX"}"#), "");
+        assert_eq!(r(""), "", "an older dashboard sends no body");
     }
 }

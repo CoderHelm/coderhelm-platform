@@ -3724,12 +3724,21 @@ pub async fn forge_register_urls(
         .and_then(|v| v.as_str())
         .unwrap_or("");
     let site_url = body.get("site_url").and_then(|v| v.as_str()).unwrap_or("");
+    // Every trigger is called with this side's HTTP client and its answer
+    // read back, so each must be a Forge web trigger (https on
+    // *.atlassian-dev.net, no port or credentials), the same check the
+    // hybrid relay makes. Anything else would let whoever holds the Forge
+    // secret point Coderhelm at an internal address.
+    if let Err(field) = forge_triggers_ok(&body) {
+        warn!(team_id = %raw_team_id, field, "Forge registration refused: a trigger isn't a Forge web trigger");
+        return Err(StatusCode::BAD_REQUEST);
+    }
     // Newer app versions also register the release-notes triggers (Confluence
-    // publish + Jira issue lookup). Older installs omit them → stored empty.
+    // publish + Jira issue lookup). Older installs omit them: stored empty.
     let https_or_empty = |k: &str| -> &str {
         body.get(k)
             .and_then(|v| v.as_str())
-            .filter(|u| u.starts_with("https://"))
+            .filter(|u| super::hybrid_jira::callable(u))
             .unwrap_or("")
     };
     let publish_release_url = https_or_empty("publish_release_url");
@@ -4046,7 +4055,7 @@ pub async fn fetch_jira_projects(
     let url = config_item
         .get("list_projects_url")
         .and_then(|v| v.as_s().ok())
-        .filter(|s| !s.is_empty())
+        .filter(|s| super::hybrid_jira::callable(s))
         .ok_or_else(|| {
             warn!(team_id = %claims.team_id, "No list_projects_url configured");
             StatusCode::NOT_FOUND
@@ -5403,6 +5412,32 @@ pub async fn get_usage(
 /// `max_tokens` / `counted_tokens` / `limit_counts_cache` describe the old
 /// single limit for older clients (0 / new input + output once the new limits
 /// are saved).
+/// The Forge trigger fields a registration may carry: the required ones
+/// must be Forge web triggers; the optional ones empty or Forge web
+/// triggers. Answers the first field that isn't (pure; tested).
+pub fn forge_triggers_ok(body: &Value) -> Result<(), &'static str> {
+    const REQUIRED: [&str; 2] = ["list_projects_url", "create_ticket_url"];
+    const OPTIONAL: [&str; 4] = [
+        "add_comment_url",
+        "publish_release_url",
+        "get_issues_url",
+        common::live::jira_app::CONFLUENCE_TRIGGER_FIELD,
+    ];
+    let get = |k: &str| body.get(k).and_then(|v| v.as_str()).unwrap_or("").trim();
+    for k in REQUIRED {
+        if !super::hybrid_jira::callable(get(k)) {
+            return Err(k);
+        }
+    }
+    for k in OPTIONAL {
+        let v = get(k);
+        if !v.is_empty() && !super::hybrid_jira::callable(v) {
+            return Err(k);
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 pub fn usage_json(
     month: &str,
@@ -6874,5 +6909,53 @@ mod agent_log_tests {
             ]
         );
         assert!(agent_log_pass_history(&Default::default()).is_empty());
+    }
+
+    #[test]
+    fn forge_triggers_must_be_forge_web_triggers() {
+        let ok = "https://abc.hello.atlassian-dev.net/x1/trigger";
+        let body = |extra: Value| {
+            let mut v = json!({ "list_projects_url": ok, "create_ticket_url": ok });
+            v.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            v
+        };
+        assert_eq!(super::forge_triggers_ok(&body(json!({}))), Ok(()));
+        assert_eq!(
+            super::forge_triggers_ok(&body(
+                json!({ "add_comment_url": ok, "publish_release_url": "" })
+            )),
+            Ok(())
+        );
+        for bad in [
+            "http://169.254.169.254/latest/meta-data",
+            "https://internal.example.com/x",
+            "https://abc.hello.atlassian-dev.net:8443/x",
+            "https://u:p@abc.hello.atlassian-dev.net/x",
+            "https://atlassian-dev.net.evil.example/x",
+        ] {
+            assert_eq!(
+                super::forge_triggers_ok(
+                    &json!({ "list_projects_url": bad, "create_ticket_url": ok })
+                ),
+                Err("list_projects_url"),
+                "{bad}"
+            );
+            assert_eq!(
+                super::forge_triggers_ok(&body(json!({ "add_comment_url": bad }))),
+                Err("add_comment_url"),
+                "{bad}"
+            );
+            assert_eq!(
+                super::forge_triggers_ok(&body(json!({ "get_issues_url": bad }))),
+                Err("get_issues_url"),
+                "{bad}"
+            );
+        }
+        assert_eq!(
+            super::forge_triggers_ok(&json!({})),
+            Err("list_projects_url")
+        );
     }
 }

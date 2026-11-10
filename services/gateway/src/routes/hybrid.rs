@@ -1500,13 +1500,34 @@ pub async fn github_setup(
     if master(&state).is_none() {
         return StatusCode::NOT_FOUND.into_response();
     }
+    // Asked an organization owner to approve the app: GitHub sends no
+    // installation yet. Nothing is linked; the person goes back to their
+    // install's page, which says the request was sent.
+    if q.setup_action.as_deref() == Some("request") && q.installation_id.is_none() {
+        let st = q.state.clone().unwrap_or_default();
+        if !st.starts_with("hyb_") || st.len() > 60 {
+            return (StatusCode::BAD_REQUEST, "Unknown state.").into_response();
+        }
+        let Some(pending) = take_state(&state, &format!("HYBRIDSTATE#{st}")).await else {
+            return (
+                StatusCode::BAD_REQUEST,
+                "That link expired or was already used. Start it again from your install.",
+            )
+                .into_response();
+        };
+        let ret = pending
+            .get("return_url")
+            .and_then(|v| v.as_s().ok())
+            .cloned()
+            .unwrap_or_default();
+        return page_redirect(&ret, "requested");
+    }
     let (Some(iid), Some(st)) = (q.installation_id, q.state.clone()) else {
         return (StatusCode::BAD_REQUEST, "Missing installation_id or state.").into_response();
     };
     if !st.starts_with("hyb_") || st.len() > 60 {
         return (StatusCode::BAD_REQUEST, "Unknown state.").into_response();
     }
-    let _ = q.setup_action;
     let Some(code) = q.code.clone().filter(|c| !c.is_empty()) else {
         // Sign in with GitHub first; GitHub comes back to the callback below.
         let pending = format!("{st}.{iid}");
@@ -1546,16 +1567,70 @@ pub async fn github_signin_return(
     if let Some(flow) = q.state.as_deref().filter(|s| s.starts_with("hsi_")) {
         return sign_in_return(&state, flow, q.code.as_deref(), q.error.as_deref()).await;
     }
-    let (Some(code), Some(pending)) = (q.code, q.state) else {
-        return (StatusCode::BAD_REQUEST, "Missing code or state.").into_response();
-    };
-    let Some((st, iid)) = pending
-        .split_once('.')
+    match link_return(q.code.as_deref(), q.state.as_deref(), q.error.as_deref()) {
+        LinkReturn::Link { st, iid, code } => link_with_code(&state, &st, iid, &code).await,
+        // Cancel (or any refusal) at GitHub: the link is used up and the
+        // person goes back to their install's page, which says so, instead
+        // of a bare error page on this side.
+        LinkReturn::Refused { st, error } => {
+            let Some(pending) = take_state(&state, &format!("HYBRIDSTATE#{st}")).await else {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    "That link expired or was already used. Start it again from your install.",
+                )
+                    .into_response();
+            };
+            let ret = pending
+                .get("return_url")
+                .and_then(|v| v.as_s().ok())
+                .cloned()
+                .unwrap_or_default();
+            let outcome = if error == "access_denied" {
+                "declined"
+            } else {
+                "signin_failed"
+            };
+            page_redirect(&ret, outcome)
+        }
+        LinkReturn::Bad => (
+            StatusCode::BAD_REQUEST,
+            "This GitHub sign-in link is incomplete. Start it again from your install.",
+        )
+            .into_response(),
+    }
+}
+
+/// What came back to the linking sign-in.
+#[derive(Debug, PartialEq, Eq)]
+pub enum LinkReturn {
+    Link { st: String, iid: u64, code: String },
+    Refused { st: String, error: String },
+    Bad,
+}
+
+/// Reads GitHub's return for an installation link: `state=<state>.<installation>`
+/// with a `code`, or with an `error` when the person cancelled.
+pub fn link_return(code: Option<&str>, state: Option<&str>, error: Option<&str>) -> LinkReturn {
+    let Some((st, iid)) = state
+        .and_then(|p| p.split_once('.'))
         .and_then(|(s, i)| Some((s.to_string(), i.parse::<u64>().ok()?)))
     else {
-        return (StatusCode::BAD_REQUEST, "Unknown state.").into_response();
+        return LinkReturn::Bad;
     };
-    link_with_code(&state, &st, iid, &code).await
+    if let Some(e) = error.filter(|e| !e.is_empty()) {
+        return LinkReturn::Refused {
+            st,
+            error: e.to_string(),
+        };
+    }
+    match code.filter(|c| !c.is_empty()) {
+        Some(c) => LinkReturn::Link {
+            st,
+            iid,
+            code: c.to_string(),
+        },
+        None => LinkReturn::Bad,
+    }
 }
 
 // ── GitHub sign-in on an install (common::hybrid::github_sign_in) ───────
@@ -1829,6 +1904,25 @@ pub async fn sign_in_exchange(
     ))
 }
 
+/// Revokes a GitHub user token issued to CoderHelm's app (only its client
+/// may). True when GitHub took it back.
+async fn revoke_user_token(state: &AppState, token: &str) -> bool {
+    if !github_client_set(state) {
+        return false;
+    }
+    let id = state.secrets.github_client_id.trim();
+    state
+        .http
+        .delete(format!("https://api.github.com/applications/{id}/token"))
+        .basic_auth(id, Some(state.secrets.github_client_secret.trim()))
+        .header("Accept", "application/vnd.github+json")
+        .header("User-Agent", "Coderhelm")
+        .json(&json!({ "access_token": token }))
+        .send()
+        .await
+        .is_ok_and(|r| r.status() == StatusCode::NO_CONTENT)
+}
+
 /// POST /hybrid/github/sign-in/revoke (signed) `{access_token}`: the install
 /// is done with a sign-in token; revoke it at GitHub (only CoderHelm's
 /// client may). Answers whether GitHub took it back.
@@ -1845,20 +1939,7 @@ pub async fn sign_in_revoke(
         .as_str()
         .filter(|t| !t.is_empty() && t.len() <= 512)
         .ok_or_else(|| fail(StatusCode::BAD_REQUEST, "bad_request", "Send the token."))?;
-    if !github_client_set(&state) {
-        return Ok(Json(json!({ "revoked": false })));
-    }
-    let id = state.secrets.github_client_id.trim();
-    let revoked = state
-        .http
-        .delete(format!("https://api.github.com/applications/{id}/token"))
-        .basic_auth(id, Some(state.secrets.github_client_secret.trim()))
-        .header("Accept", "application/vnd.github+json")
-        .header("User-Agent", "Coderhelm")
-        .json(&json!({ "access_token": token }))
-        .send()
-        .await
-        .is_ok_and(|r| r.status() == StatusCode::NO_CONTENT);
+    let revoked = revoke_user_token(&state, token).await;
     if !revoked {
         warn!(install = %install.id, "hybrid: GitHub sign-in token not revoked");
     }
@@ -1999,6 +2080,23 @@ async fn link_with_code(state: &AppState, st: &str, iid: u64, code: &str) -> Res
     let Some(user_token) = tok["access_token"].as_str() else {
         return page_redirect(&ret, "signin_failed");
     };
+    // The token proves the installation is the person's and caps the link;
+    // it is never needed again, so it is revoked however the link ends.
+    let out = link_with_user_token(state, &install_id, &ret, iid, user_token).await;
+    if !revoke_user_token(state, user_token).await {
+        warn!(install = %install_id, "hybrid: GitHub linking token not revoked");
+    }
+    out
+}
+
+async fn link_with_user_token(
+    state: &AppState,
+    install_id: &str,
+    ret: &str,
+    iid: u64,
+    user_token: &str,
+) -> Response {
+    let (install_id, ret) = (install_id.to_string(), ret.to_string());
     let installs: Value = match state
         .http
         .get("https://api.github.com/user/installations?per_page=100")
@@ -3022,27 +3120,30 @@ pub async fn oauth_callback(State(state): State<Arc<AppState>>, body: Bytes) -> 
             urlencoding::encode(&install_state)
         )
     };
-    if let Some(err) = b["error"].as_str().filter(|e| !e.is_empty()) {
-        return Ok(Json(
-            json!({ "redirect": back(&format!("error={}", urlencoding::encode(err))) }),
-        ));
-    }
     let team = signin_team(&install_id, &flow);
     let rt = super::mcp_servers::runtime(&state, &team);
     let sub = format!("hybrid:{install_id}");
-    if let Err(e) = rt
-        .finish_sign_in(
-            provider_state,
-            b["code"].as_str(),
-            None,
-            b["iss"].as_str(),
-            &sub,
-            &sub,
-        )
-        .await
-    {
-        warn!(install = %install_id, error = %e, "hybrid: provider sign-in failed");
-        return Ok(Json(json!({ "redirect": back("error=access_denied") })));
+    let text = |k: &str| b[k].as_str().filter(|e| !e.trim().is_empty());
+    // The provider's answer is finished here either way (a refusal too, so
+    // its pending sign-in is used up), and whatever went wrong goes back to
+    // the install as it is: the provider's own error code and words, or
+    // `server_error` with the reason when the code exchange failed. Never a
+    // made-up `access_denied`: that told people they had refused access
+    // when it was this side that couldn't finish.
+    let answer = common::mcp_remote::runtime::Answer {
+        state: provider_state,
+        code: text("code"),
+        error: text("error"),
+        error_description: text("error_description"),
+        iss: text("iss"),
+    };
+    if let Err(f) = rt.finish(&answer, &sub, &sub).await {
+        warn!(install = %install_id, kind = %kind, code = %f.code, error = %f.message, "hybrid: provider sign-in failed");
+        return Ok(Json(json!({ "redirect": back(&broker_failure_query(
+            text("error"),
+            text("error_description"),
+            &f.message,
+        )) })));
     }
     let code = broker::new_handle("hc");
     put_state(
@@ -3062,6 +3163,27 @@ pub async fn oauth_callback(State(state): State<Arc<AppState>>, body: Bytes) -> 
     Ok(Json(
         json!({ "redirect": back(&format!("code={}", urlencoding::encode(&code))) }),
     ))
+}
+
+/// The query a failed provider sign-in goes back to the install with
+/// (RFC 6749 4.1.2.1): the provider's own `error` and `error_description`
+/// when it refused, else `server_error` with why this side couldn't finish.
+pub fn broker_failure_query(
+    provider_error: Option<&str>,
+    provider_description: Option<&str>,
+    why: &str,
+) -> String {
+    let (code, desc) = match provider_error {
+        Some(e) => (e, provider_description.unwrap_or("")),
+        None => ("server_error", why),
+    };
+    let code = common::truncate_str(code.trim(), 80);
+    let desc = common::truncate_str(desc.trim(), 300);
+    let mut q = format!("error={}", urlencoding::encode(code));
+    if !desc.is_empty() {
+        q.push_str(&format!("&error_description={}", urlencoding::encode(desc)));
+    }
+    q
 }
 
 /// Moves a finished provider sign-in from its holding partition into the
@@ -3807,5 +3929,63 @@ mod tests {
         let f = form(b"grant_type=refresh_token&refresh_token=hr_abc&client_id=ins_x");
         assert_eq!(f["grant_type"], "refresh_token");
         assert_eq!(f["refresh_token"], "hr_abc");
+    }
+
+    #[test]
+    fn a_failed_broker_sign_in_goes_back_with_its_real_reason() {
+        // The provider refused: its own code and words, as it sent them.
+        assert_eq!(
+            super::broker_failure_query(Some("access_denied"), Some("User declined"), "ignored"),
+            "error=access_denied&error_description=User%20declined"
+        );
+        assert_eq!(
+            super::broker_failure_query(Some("invalid_scope"), None, "ignored"),
+            "error=invalid_scope"
+        );
+        // This side couldn't finish (the code exchange failed): never a
+        // made-up access_denied, but server_error with why.
+        let q =
+            super::broker_failure_query(None, None, "The sign-in server refused (invalid_grant).");
+        assert!(
+            q.starts_with("error=server_error&error_description="),
+            "{q}"
+        );
+        assert!(!q.contains("access_denied"));
+        assert!(q.contains("invalid_grant"));
+    }
+
+    #[test]
+    fn a_cancelled_github_link_goes_back_to_the_install() {
+        use super::{link_return, LinkReturn};
+        assert_eq!(
+            link_return(Some("c0de"), Some("abc.42"), None),
+            LinkReturn::Link {
+                st: "abc".into(),
+                iid: 42,
+                code: "c0de".into()
+            }
+        );
+        assert_eq!(
+            link_return(None, Some("abc.42"), Some("access_denied")),
+            LinkReturn::Refused {
+                st: "abc".into(),
+                error: "access_denied".into()
+            }
+        );
+        assert_eq!(link_return(None, Some("abc.42"), None), LinkReturn::Bad);
+        assert_eq!(link_return(Some("c"), Some("nodot"), None), LinkReturn::Bad);
+        assert_eq!(link_return(Some("c"), None, None), LinkReturn::Bad);
+    }
+
+    #[test]
+    fn the_linking_token_is_revoked_however_the_link_ends() {
+        let src = include_str!("hybrid.rs");
+        let start = src.find("async fn link_with_code(").unwrap();
+        let end = src[start..].find("async fn link_with_user_token(").unwrap() + start;
+        let f = &src[start..end];
+        // Every outcome after the token exists goes through one call, then the revoke.
+        assert!(f.contains("link_with_user_token(state"), "{f}");
+        assert!(f.contains("revoke_user_token(state, user_token)"), "{f}");
+        assert!(!f.contains("return page_redirect(&ret, \"not_yours\")"));
     }
 }

@@ -1214,6 +1214,22 @@ pub(crate) fn cookie_header(headers: &HeaderMap) -> &str {
         .unwrap_or("")
 }
 
+/// The Cognito hosted UI's address: a custom domain as it is, a prefix
+/// domain in the region the user pool lives in (the Lambda's own region,
+/// `AWS_REGION`; us-east-1 when unset).
+pub(crate) fn cognito_base(domain: &str, region: &str) -> String {
+    if domain.contains('.') {
+        format!("https://{domain}")
+    } else {
+        let region = if region.trim().is_empty() {
+            "us-east-1"
+        } else {
+            region.trim()
+        };
+        format!("https://{domain}.auth.{region}.amazoncognito.com")
+    }
+}
+
 /// The end of every successful sign-in: the session cookie, the state cookie
 /// cleared, and the dashboard.
 fn session_redirect(provider: Provider, token: &str, dashboard_url: &str) -> Response {
@@ -1275,11 +1291,7 @@ pub async fn google_login(State(state): State<Arc<AppState>>, headers: HeaderMap
 
     // Custom domains (contain '.') use https://{domain}/oauth2/...
     // Cognito prefix domains use https://{domain}.auth.{region}.amazoncognito.com/oauth2/...
-    let base = if domain.contains('.') {
-        format!("https://{domain}")
-    } else {
-        format!("https://{domain}.auth.us-east-1.amazoncognito.com")
-    };
+    let base = cognito_base(domain, &std::env::var("AWS_REGION").unwrap_or_default());
 
     let csrf = ulid::Ulid::new().to_string();
     let url = format!(
@@ -1336,11 +1348,7 @@ async fn google_callback_inner(
     let client_id = &state.config.cognito_client_id;
 
     // Exchange code for tokens with Cognito token endpoint
-    let base = if domain.contains('.') {
-        format!("https://{domain}")
-    } else {
-        format!("https://{domain}.auth.us-east-1.amazoncognito.com")
-    };
+    let base = cognito_base(domain, &std::env::var("AWS_REGION").unwrap_or_default());
     let token_url = format!("{base}/oauth2/token");
 
     let client_secret = &state.cognito_client_secret;
@@ -1907,6 +1915,7 @@ pub(crate) async fn github_sign_in_with_token(
         } else {
             &[]
         };
+        let mut linked = 0usize;
         for (inst_id, org) in linkable {
             let owner = super::github_webhook::resolve_team_by_installation(state, *inst_id).await;
             if !may_link_installation(owner.as_deref(), &claims.team_id) {
@@ -1957,6 +1966,7 @@ pub(crate) async fn github_sign_in_with_token(
                 .send()
                 .await;
 
+            linked += 1;
             info!(
                 installation_id = inst_id,
                 org,
@@ -2009,13 +2019,40 @@ pub(crate) async fn github_sign_in_with_token(
 
         info!(github_login, "GitHub connected to existing account");
 
-        let dashboard_url = common::public_urls::app_url(&state.config.stage);
-        return Ok(session_redirect(P, &token, dashboard_url));
+        // Say what happened to the installation the person meant to link,
+        // on the GitHub page, instead of landing on the dashboard as if it
+        // had worked whatever happened.
+        let outcome = link_outcome(may_link_for_team, all_installations.len(), linked);
+        let back = format!(
+            "{}/settings/integrations/github/?github_link={outcome}",
+            common::public_urls::app_url(&state.config.stage)
+        );
+        return Ok(session_redirect(P, &token, &back));
     }
 
     // No existing session — GitHub-only login flow
     let github_user_id = format!("USER#{github_id}");
-    let email = user["email"].as_str().unwrap_or("");
+    // The profile email is empty when the person keeps it private; their
+    // primary verified address comes from `GET /user/emails` (the app's
+    // "Email addresses: read" account permission). Without either, the
+    // invite can't be matched by email.
+    let emails: serde_json::Value = if user["email"].as_str().is_some_and(|e| !e.is_empty()) {
+        serde_json::Value::Null
+    } else {
+        match client
+            .get("https://api.github.com/user/emails")
+            .header("Authorization", format!("Bearer {access_token}"))
+            .header("User-Agent", "Coderhelm")
+            .header("Accept", "application/vnd.github+json")
+            .send()
+            .await
+        {
+            Ok(r) if r.status().is_success() => r.json().await.unwrap_or_default(),
+            _ => serde_json::Value::Null,
+        }
+    };
+    let email = pick_github_email(&user, &emails);
+    let email = email.as_str();
     let normalized_email = normalize_email(email);
 
     // 1. Try to find an existing user by GitHub ID (GSI1 across all teams)
@@ -2465,18 +2502,64 @@ pub(crate) async fn user_app_installations(
     state: &AppState,
     access_token: &str,
 ) -> Result<Vec<(u64, String)>, reqwest::Error> {
-    let installs: serde_json::Value = state
-        .http
-        .get("https://api.github.com/user/installations")
-        .header("Authorization", format!("Bearer {access_token}"))
-        .header("User-Agent", "Coderhelm")
-        .send()
-        .await?
-        .json()
-        .await?;
-
     let our_app_id: u64 = state.secrets.github_app_id.parse().unwrap_or(0);
-    Ok(our_installations(&installs, our_app_id))
+    // GitHub pages this list (30 by default): ask for 100 at a time, and
+    // read every page, so a person in many organizations still finds ours.
+    let mut out = Vec::new();
+    for page in 1..=10 {
+        let installs: serde_json::Value = state
+            .http
+            .get(format!(
+                "https://api.github.com/user/installations?per_page=100&page={page}"
+            ))
+            .header("Authorization", format!("Bearer {access_token}"))
+            .header("User-Agent", "Coderhelm")
+            .send()
+            .await?
+            .json()
+            .await?;
+        let n = installs["installations"].as_array().map_or(0, |a| a.len());
+        out.extend(our_installations(&installs, our_app_id));
+        if n < 100 {
+            break;
+        }
+    }
+    Ok(out)
+}
+
+/// What linking did when someone connected GitHub while signed in, for the
+/// GitHub page to say: `linked`, `not_admin` (only owners and admins link),
+/// `owned_elsewhere` (another team has every installation they can see), or
+/// `none_visible` (GitHub shows them no installation of the app).
+pub(crate) fn link_outcome(may_link: bool, visible: usize, linked: usize) -> &'static str {
+    if visible == 0 {
+        "none_visible"
+    } else if !may_link {
+        "not_admin"
+    } else if linked == 0 {
+        "owned_elsewhere"
+    } else {
+        "linked"
+    }
+}
+
+/// The email a GitHub sign-in is matched by: the profile's public email,
+/// else the primary verified address from `GET /user/emails`, else any
+/// verified one. Unverified addresses never count.
+pub(crate) fn pick_github_email(profile: &serde_json::Value, emails: &serde_json::Value) -> String {
+    if let Some(e) = profile["email"].as_str().filter(|e| !e.trim().is_empty()) {
+        return e.trim().to_string();
+    }
+    let list = emails.as_array().map(|a| a.as_slice()).unwrap_or_default();
+    let verified = |e: &&serde_json::Value| e["verified"].as_bool() == Some(true);
+    list.iter()
+        .filter(verified)
+        .find(|e| e["primary"].as_bool() == Some(true))
+        .or_else(|| list.iter().find(verified))
+        .and_then(|e| e["email"].as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string()
 }
 
 /// Our app's installations in a `GET /user/installations` response, as
@@ -3615,5 +3698,56 @@ mod forgot_tests {
         );
         assert_eq!(address_of("acme.dev"), None);
         assert_eq!(address_of(""), None);
+    }
+}
+
+#[cfg(test)]
+mod github_link_tests {
+    use super::{cognito_base, link_outcome, pick_github_email};
+
+    #[test]
+    fn cognito_prefix_domains_use_the_pools_region() {
+        assert_eq!(
+            cognito_base("auth.acme.dev", "eu-west-1"),
+            "https://auth.acme.dev"
+        );
+        assert_eq!(
+            cognito_base("coderhelm", "eu-west-1"),
+            "https://coderhelm.auth.eu-west-1.amazoncognito.com"
+        );
+        assert_eq!(
+            cognito_base("coderhelm", ""),
+            "https://coderhelm.auth.us-east-1.amazoncognito.com"
+        );
+    }
+    use serde_json::json;
+
+    #[test]
+    fn a_private_github_email_is_read_from_the_verified_list() {
+        let public = json!({"email": "ada@acme.com"});
+        assert_eq!(
+            pick_github_email(&public, &serde_json::Value::Null),
+            "ada@acme.com"
+        );
+        let private = json!({"email": null});
+        let emails = json!([
+            {"email": "old@acme.com", "verified": false, "primary": false},
+            {"email": "ada@users.noreply.github.com", "verified": true, "primary": false},
+            {"email": "ada@acme.com", "verified": true, "primary": true},
+        ]);
+        assert_eq!(pick_github_email(&private, &emails), "ada@acme.com");
+        let no_primary = json!([{"email": "x@acme.com", "verified": true, "primary": false}]);
+        assert_eq!(pick_github_email(&private, &no_primary), "x@acme.com");
+        let unverified = json!([{"email": "x@acme.com", "verified": false, "primary": true}]);
+        assert_eq!(pick_github_email(&private, &unverified), "");
+        assert_eq!(pick_github_email(&private, &serde_json::Value::Null), "");
+    }
+
+    #[test]
+    fn connecting_github_says_what_linking_did() {
+        assert_eq!(link_outcome(true, 0, 0), "none_visible");
+        assert_eq!(link_outcome(false, 2, 0), "not_admin");
+        assert_eq!(link_outcome(true, 2, 0), "owned_elsewhere");
+        assert_eq!(link_outcome(true, 2, 1), "linked");
     }
 }
