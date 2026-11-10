@@ -1258,6 +1258,12 @@ pub struct Run {
     /// before any.
     #[schema(example = json!(null))]
     pub pr_review: Option<super::run_checks::RunPrReview>,
+    /// Open review comments and requested changes from people on the run's
+    /// open pull request (read from GitHub, reused for up to a minute): above
+    /// zero, people asked for changes. Null when the run has no open pull
+    /// request or GitHub can't be read.
+    #[schema(example = 2)]
+    pub pr_review_comments: Option<u32>,
 }
 
 /// The public values a run's code generator was missing, as the API shows them.
@@ -1644,10 +1650,26 @@ pub async fn get_run(
                 None => None,
             }
         };
+        let asks = async {
+            match &open {
+                Some((repo, pr)) => {
+                    super::run_checks::review_asks_for_run(
+                        &state,
+                        &claims.team_id,
+                        installation_id,
+                        repo,
+                        *pr,
+                    )
+                    .await
+                }
+                None => None,
+            }
+        };
         let review = super::run_checks::pr_review(&state, &claims.team_id, &repo, pr);
-        let (checks, review) = tokio::join!(checks, review);
+        let (checks, review, asks) = tokio::join!(checks, review, asks);
         run.checks = checks;
         run.pr_review = review;
+        run.pr_review_comments = asks;
     }
     Ok(Json(run))
 }
@@ -1828,6 +1850,7 @@ fn run_of(
         draft_hold: draft_hold_of(item),
         checks: None,
         pr_review: None,
+        pr_review_comments: None,
     }
 }
 

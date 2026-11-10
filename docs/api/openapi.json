@@ -3926,6 +3926,18 @@
               }
             ]
           },
+          "pr_review_comments": {
+            "description": "Open review comments and requested changes from people on the run's\nopen pull request (read from GitHub, reused for up to a minute): above\nzero, people asked for changes. Null when the run has no open pull\nrequest or GitHub can't be read.",
+            "examples": [
+              2
+            ],
+            "format": "int32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
           "pr_url": {
             "description": "The pull request the run opened.",
             "examples": [

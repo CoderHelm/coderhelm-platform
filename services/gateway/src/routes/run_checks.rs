@@ -1,7 +1,8 @@
 //! What a run's page shows about its open pull request: the CI checks on
 //! the pull request's head (GitHub check runs and commit statuses, required
-//! ones marked from the branch's rules), and CoderHelm's latest review
-//! verdict on it.
+//! ones marked from the branch's rules), CoderHelm's latest review verdict
+//! on it, and how many things people asked to change on it
+//! ([`review_asks`]).
 //!
 //! The checks are read from GitHub when the page asks, never stored. Pages
 //! poll, and an installation has hit GitHub's hourly limit before, so every
@@ -27,6 +28,8 @@ use crate::AppState;
 pub const PR_TTL: Duration = Duration::from_secs(30);
 /// How long the checks on one commit are reused.
 pub const CHECKS_TTL: Duration = Duration::from_secs(45);
+/// How long a pull request's open review asks are reused.
+pub const ASKS_TTL: Duration = Duration::from_secs(60);
 /// How long a branch's required checks are reused.
 pub const REQUIRED_TTL: Duration = Duration::from_secs(600);
 /// How long an installation token is reused (GitHub's last an hour).
@@ -307,6 +310,37 @@ pub fn latest_verdict(items: &[HashMap<String, AttributeValue>]) -> Option<RunPr
     })
 }
 
+/// Pure: what people asked to change on a pull request, from a GraphQL
+/// read of its `latestOpinionatedReviews` and `reviewThreads`: each person
+/// whose latest review requests changes, plus each unresolved, current
+/// review thread a person started. Bots (CoderHelm among them) don't count.
+pub fn review_asks(pr: &Value) -> u32 {
+    let human = |author: &Value| author["__typename"].as_str() == Some("User");
+    let changes = pr["latestOpinionatedReviews"]["nodes"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter(|r| r["state"].as_str() == Some("CHANGES_REQUESTED") && human(&r["author"]))
+                .count()
+        })
+        .unwrap_or(0);
+    let threads = pr["reviewThreads"]["nodes"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter(|t| {
+                    t["isResolved"].as_bool() == Some(false)
+                        && t["isOutdated"].as_bool() != Some(true)
+                        && human(&t["comments"]["nodes"][0]["author"])
+                })
+                .count()
+        })
+        .unwrap_or(0);
+    u32::try_from(changes + threads).unwrap_or(u32::MAX)
+}
+
+const ASKS_QUERY: &str = "query($owner:String!,$name:String!,$number:Int!){repository(owner:$owner,name:$name){pullRequest(number:$number){latestOpinionatedReviews(first:50){nodes{state author{__typename}}} reviewThreads(first:100){nodes{isResolved isOutdated comments(first:1){nodes{author{__typename}}}}}}}}";
+
 // ─── Caches ─────────────────────────────────────────────────────────
 
 /// A small map whose entries expire.
@@ -360,6 +394,7 @@ static TOKENS: LazyLock<TtlCache<String>> = LazyLock::new(TtlCache::new);
 static PR_HEADS: LazyLock<TtlCache<Option<PrHead>>> = LazyLock::new(TtlCache::new);
 static CHECKS: LazyLock<TtlCache<Option<Vec<RunCheck>>>> = LazyLock::new(TtlCache::new);
 static REQUIRED: LazyLock<TtlCache<Vec<String>>> = LazyLock::new(TtlCache::new);
+static ASKS: LazyLock<TtlCache<Option<u32>>> = LazyLock::new(TtlCache::new);
 
 // ─── GitHub reads ───────────────────────────────────────────────────
 
@@ -515,6 +550,72 @@ pub async fn for_run(
         })
 }
 
+async fn read_asks(state: &AppState, installation_id: u64, repo: &str, pr: u64) -> Option<u32> {
+    let key = format!("{}#{pr}", repo.to_ascii_lowercase());
+    if let Some(n) = ASKS.get(&key, Instant::now()) {
+        return n;
+    }
+    let token = token(state, installation_id).await?;
+    let (owner, name) = repo.split_once('/')?;
+    let body = serde_json::json!({
+        "query": ASKS_QUERY,
+        "variables": {"owner": owner, "name": name, "number": pr},
+    });
+    let res = state
+        .http
+        .post(format!("{API}/graphql"))
+        .header("Authorization", format!("Bearer {token}"))
+        .header("User-Agent", "Coderhelm-bot")
+        .json(&body)
+        .send()
+        .await;
+    let asks = match res {
+        Ok(r) if r.status().is_success() => r.json::<Value>().await.ok().and_then(|v| {
+            let pr = &v["data"]["repository"]["pullRequest"];
+            pr.is_object().then(|| review_asks(pr))
+        }),
+        Ok(r) => {
+            warn!(
+                repo,
+                pr,
+                code = r.status().as_u16(),
+                "Run review asks: GitHub refused"
+            );
+            None
+        }
+        Err(e) => {
+            warn!(repo, pr, error = %e, "Run review asks: GitHub read failed");
+            None
+        }
+    };
+    ASKS.put(key, asks, ASKS_TTL, Instant::now());
+    asks
+}
+
+/// Open review comments and requested changes from people on the run's open
+/// pull request. `None` when GitHub can't be read in time.
+pub async fn review_asks_for_run(
+    state: &AppState,
+    team_id: &str,
+    run_installation_id: u64,
+    repo: &str,
+    pr: u64,
+) -> Option<u32> {
+    let installation_id = if run_installation_id > 0 {
+        run_installation_id
+    } else {
+        super::api::get_team_installation_id(state, team_id)
+            .await
+            .ok()?
+    };
+    tokio::time::timeout(READ_BUDGET, read_asks(state, installation_id, repo, pr))
+        .await
+        .unwrap_or_else(|_| {
+            warn!(repo, pr, "Run review asks: GitHub took too long");
+            None
+        })
+}
+
 /// CoderHelm's latest verdict on `repo`#`pr`, from the team's review records
 /// (newest first, as the reviewer pages list them).
 pub async fn pr_review(
@@ -557,6 +658,31 @@ pub async fn pr_review(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn review_asks_count_people_not_bots_and_only_open_threads() {
+        let user = json!({"__typename": "User"});
+        let bot = json!({"__typename": "Bot"});
+        let thread = |resolved: bool, outdated: bool, author: &Value| {
+            json!({"isResolved": resolved, "isOutdated": outdated,
+                   "comments": {"nodes": [{"author": author}]}})
+        };
+        let pr = json!({
+            "latestOpinionatedReviews": {"nodes": [
+                {"state": "CHANGES_REQUESTED", "author": user},
+                {"state": "APPROVED", "author": user},
+                {"state": "CHANGES_REQUESTED", "author": bot},
+            ]},
+            "reviewThreads": {"nodes": [
+                thread(false, false, &user),
+                thread(true, false, &user),
+                thread(false, true, &user),
+                thread(false, false, &bot),
+            ]},
+        });
+        assert_eq!(review_asks(&pr), 2);
+        assert_eq!(review_asks(&json!({})), 0);
+    }
 
     fn run(name: &str, status: &str, conclusion: Option<&str>, started: &str, id: u64) -> Value {
         json!({

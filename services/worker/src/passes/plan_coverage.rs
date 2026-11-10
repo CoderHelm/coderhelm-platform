@@ -564,13 +564,18 @@ pub fn checked_tasks_md(tasks_md: &str, cov: &Coverage) -> String {
     tasks_md
         .lines()
         .map(|line| {
-            let done = plan_tasks(line)
-                .first()
-                .is_some_and(|t| cov.done.iter().any(|d| d.path == t.path));
+            // A line that isn't a task with a file stays as written.
+            let Some(task) = plan_tasks(line).into_iter().next() else {
+                return line.to_string();
+            };
+            let done = cov.done.iter().any(|d| d.path == task.path);
             if done {
                 line.replacen("- [ ]", "- [x]", 1)
             } else {
-                line.to_string()
+                // The plan check is the one place a task is unchecked: its
+                // file was reverted, or the branch never changed it.
+                line.replacen("- [x]", "- [ ]", 1)
+                    .replacen("- [X]", "- [ ]", 1)
             }
         })
         .collect::<Vec<_>>()
