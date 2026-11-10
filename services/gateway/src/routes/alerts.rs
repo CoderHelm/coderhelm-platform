@@ -774,6 +774,16 @@ async fn handle_notification(
     let tid = ticket_id(&alert.fingerprint);
     let rule = pick_rule(&route.rules, &alert);
     let id = event_id(&msg.timestamp, &msg.message_id);
+    if is_redelivery(
+        recorded_outcome(state, &route.team_id, &id)
+            .await
+            .as_deref(),
+    ) {
+        // SNS delivered this message before and it was handled: its record,
+        // run and card stand. Only a delivery that failed is tried again.
+        info!(topic = %msg.topic_arn, ticket = %tid, "Alert redelivered — already handled, nothing done");
+        return Ok(StatusCode::OK);
+    }
     let mode = episodes::effective(route.repeat, &route.alarm_repeat, alert.kind, &alert.title);
     let tracked = if route.enabled && mode != Repeat::EveryTime {
         track_episode(state, msg, route, &alert, &id, mode).await
@@ -823,22 +833,16 @@ async fn handle_notification(
             }
             let opens_episode = matches!(decision, Some(Decision::Opened | Decision::Reopened(_)));
             let decided = decide(state, msg, route, rule, &alert, &tid).await;
-            match &decided {
-                Err(_) if opens_episode => {
-                    // SNS retries this delivery: let it open the episode again.
-                    forget_episode(
-                        state,
-                        &route.team_id,
-                        &msg.topic_arn,
-                        &alert.fingerprint,
-                        Some(&id),
-                    )
-                    .await;
-                }
-                Ok(Outcome::Duplicate) if opens_episode => {
-                    line_override = Some(episodes::reopened_without_run_line().to_string());
-                }
-                _ => {}
+            if decided.is_err() && opens_episode {
+                // SNS retries this delivery: let it open the episode again.
+                forget_episode(
+                    state,
+                    &route.team_id,
+                    &msg.topic_arn,
+                    &alert.fingerprint,
+                    Some(&id),
+                )
+                .await;
             }
             decided
         }
@@ -1126,12 +1130,33 @@ async fn link_incident(state: &AppState, team_id: &str, repo: &str, alert: &Aler
     }
 }
 
-/// Pure: the card's line on what CoderHelm did. None = don't notify (a repeat
-/// of an alert already posted, a paused route, a failure SNS will retry, a
-/// recovery whose alert has no open card, or a recovery or other state change
-/// on a route that doesn't post them). A route that posts recoveries posts one
-/// per open alert card, not one per OK.
-pub fn notify_line(outcome: Outcome, repo: &str, post_recoveries: bool) -> Option<String> {
+/// Pure: is this an outcome for an alert CoderHelm already handled (a run
+/// started for it recently, or one is open or finished)? Such a repeat posts
+/// only when its earlier card is closed, so it fired anew after a recovery.
+pub fn is_repeat(outcome: Outcome) -> bool {
+    matches!(outcome, Outcome::Duplicate | Outcome::InFlight)
+}
+
+/// Pure: the line on a repeat's card when its earlier card was closed, so it
+/// fired anew, and a run for it is open or finished.
+pub fn fired_again_handled_line() -> &'static str {
+    "Fired again after it cleared. A CoderHelm run for this alert is open or already finished, so no new run."
+}
+
+/// Pure: the one decision on whether a delivery posts to chat, and the card's
+/// line on what CoderHelm did. Every channel (Teams, Slack) gets its card from
+/// this step only. None = don't notify: a repeat of an alert already handled
+/// while its card is open (it is recorded on the alerts page instead), a
+/// paused route, a failure SNS will retry, a recovery whose alert has no open
+/// card, or a recovery or other state change on a route that doesn't post
+/// them. A route that posts recoveries posts one per open alert card, not one
+/// per OK. `card_open` matters only for repeats (see [`is_repeat`]).
+pub fn notify_line(
+    outcome: Outcome,
+    repo: &str,
+    post_recoveries: bool,
+    card_open: bool,
+) -> Option<String> {
     Some(match outcome {
         Outcome::RunStarted => {
             format!("CoderHelm is working on a fix in {repo}. A follow-up card will link the pull request.")
@@ -1143,7 +1168,9 @@ pub fn notify_line(outcome: Outcome, repo: &str, post_recoveries: bool) -> Optio
         Outcome::Recovered if post_recoveries => String::new(),
         Outcome::Recovered => return None,
         Outcome::NoOpenAlert => return None,
-        Outcome::InFlight => "A CoderHelm run for this alert is already open.".to_string(),
+        Outcome::Duplicate | Outcome::InFlight if card_open => return None,
+        Outcome::Duplicate => episodes::reopened_without_run_line().to_string(),
+        Outcome::InFlight => fired_again_handled_line().to_string(),
         Outcome::Budget => "No fix started: the team's token limit was reached.".to_string(),
         Outcome::AlertBudget => {
             "No fix started: today's alert token budget was reached.".to_string()
@@ -1152,11 +1179,9 @@ pub fn notify_line(outcome: Outcome, repo: &str, post_recoveries: bool) -> Optio
         Outcome::Misconfigured => "No fix started: the rule's repo is invalid.".to_string(),
         // The reminder's line is built from its episode.
         Outcome::Reminded => String::new(),
-        Outcome::Duplicate
-        | Outcome::RoutePaused
-        | Outcome::Error
-        | Outcome::Suppressed
-        | Outcome::Clearing => return None,
+        Outcome::RoutePaused | Outcome::Error | Outcome::Suppressed | Outcome::Clearing => {
+            return None
+        }
     })
 }
 
@@ -1200,20 +1225,42 @@ async fn notify_channels(
     outcome: Outcome,
     line_override: Option<String>,
 ) {
-    let new_episode = outcome == Outcome::Duplicate && line_override.is_some();
-    let Some(line) = notify_line(outcome, repo, route.post_recoveries)
-        .or_else(|| new_episode.then(String::new))
+    let table = &state.config.settings_table_name;
+    let id = event_id(&msg.timestamp, &msg.message_id);
+    // A repeat is checked against the alert's card: still open = the same
+    // alert, so no new card.
+    let card_open = is_repeat(outcome)
+        && alert_notify::alert_card_open(&state.dynamo, table, &route.team_id, &alert.fingerprint)
+            .await;
+    if outcome == Outcome::RunStarted && alert.actionable {
+        // A run in progress handles the alert even if no card lands, so its
+        // repeats stay quiet too.
+        open_alert(state, &route.team_id, alert, &id, &msg.timestamp, false).await;
+    }
+    let Some(line) = notify_line(outcome, repo, route.post_recoveries, card_open)
         .map(|l| line_override.unwrap_or(l))
     else {
+        if card_open {
+            info!(topic = %msg.topic_arn, outcome = outcome.as_str(), "Alert repeat — its card is still open, nothing posted");
+            // Each repeat keeps the open card from expiring.
+            open_alert(state, &route.team_id, alert, &id, &msg.timestamp, true).await;
+        }
         return;
     };
     let channels = route_channels(state, route).await;
     if channels.is_empty() {
         return;
     }
+    // One card per SNS message, even when two deliveries of it race.
+    let post_sk = post_claim_sk(&id);
+    let claimed =
+        common::claim::claim(&state.dynamo, table, &route.team_id, &post_sk, DAY_SECS).await;
+    if !claimed.won_or_failed_open() {
+        info!(topic = %msg.topic_arn, alert = %id, "Alert card already posted for this message — not posting again");
+        return;
+    }
     let region = msg.topic_arn.split(':').nth(3).unwrap_or("");
     let context = alert_notify::card_context(&msg.topic_arn, &msg.timestamp);
-    let id = event_id(&msg.timestamp, &msg.message_id);
     let alert_url = format!("{}/alerts/detail?id={id}", dashboard_base(state));
     let console = episodes::alarm_name(alert.kind, &alert.title)
         .and_then(|name| alert_notify::cloudwatch_console_url(region, name));
@@ -1238,8 +1285,49 @@ async fn notify_channels(
     )
     .await;
     let posted = sent.any_ok();
+    if !posted {
+        // Nothing landed: a later delivery of this message may try again.
+        common::claim::release(&state.dynamo, table, &route.team_id, &post_sk).await;
+    }
     if posted && alert.actionable {
-        open_alert(state, &route.team_id, alert, &id, &msg.timestamp).await;
+        open_alert(state, &route.team_id, alert, &id, &msg.timestamp, false).await;
+    }
+}
+
+/// Settings-table key of the claim that one SNS message posts one card.
+fn post_claim_sk(alert_id: &str) -> String {
+    format!("ALERT_POSTED#{alert_id}")
+}
+
+/// Pure: was this message delivered before and handled? A recorded outcome
+/// other than an error (which SNS retries on purpose) means it was.
+pub fn is_redelivery(recorded_outcome: Option<&str>) -> bool {
+    recorded_outcome.is_some_and(|o| o != Outcome::Error.as_str())
+}
+
+/// The outcome already recorded for alert `id`, if any. Unreadable = none, so
+/// the delivery goes ahead (its run and card claims still hold duplicates).
+async fn recorded_outcome(state: &AppState, team_id: &str, id: &str) -> Option<String> {
+    let out = state
+        .dynamo
+        .get_item()
+        .table_name(&state.config.settings_table_name)
+        .key("pk", attr_s(team_id))
+        .key("sk", attr_s(&event_sk(id)))
+        .projection_expression("outcome")
+        .consistent_read(true)
+        .send()
+        .await;
+    match out {
+        Ok(o) => o
+            .item()
+            .and_then(|i| i.get("outcome"))
+            .and_then(|v| v.as_s().ok())
+            .cloned(),
+        Err(e) => {
+            warn!(team_id, error = %e, "Could not read the alert's record; handling the delivery");
+            None
+        }
     }
 }
 
@@ -1252,12 +1340,24 @@ async fn notify_channels(
 const OPEN_ALERT_SECS: u64 = 30 * DAY_SECS;
 
 /// Mark an alert's card open. A repeat keeps the first card's link and renews
-/// how long it stays open. Best effort.
-async fn open_alert(state: &AppState, team_id: &str, alert: &Alert, id: &str, posted_at: &str) {
+/// how long it stays open; `renew_only` never opens a card that isn't (a
+/// recovery may have just closed it). Best effort.
+async fn open_alert(
+    state: &AppState,
+    team_id: &str,
+    alert: &Alert,
+    id: &str,
+    posted_at: &str,
+    renew_only: bool,
+) {
     let ttl = chrono::Utc::now().timestamp().max(0) as u64 + OPEN_ALERT_SECS;
-    let written = state
-        .dynamo
-        .update_item()
+    let update = state.dynamo.update_item();
+    let update = if renew_only {
+        update.condition_expression("attribute_exists(pk)")
+    } else {
+        update
+    };
+    let written = update
         .table_name(&state.config.settings_table_name)
         .key("pk", attr_s(team_id))
         .key("sk", attr_s(&alert_notify::open_alert_sk(&alert.fingerprint)))
@@ -1273,7 +1373,12 @@ async fn open_alert(state: &AppState, team_id: &str, alert: &Alert, id: &str, po
         .send()
         .await;
     if let Err(e) = written {
-        warn!(team_id, error = %e, "Could not mark the alert open; its recovery won't post");
+        let closed = renew_only
+            && e.as_service_error()
+                .is_some_and(|se| se.is_conditional_check_failed_exception());
+        if !closed {
+            warn!(team_id, error = %e, "Could not mark the alert open; its recovery won't post");
+        }
     }
 }
 
@@ -3086,30 +3191,174 @@ mod tests {
 
     #[test]
     fn notifications_skip_repeats_and_retries() {
-        assert!(notify_line(Outcome::RunStarted, "o/r", false)
+        assert!(notify_line(Outcome::RunStarted, "o/r", false, false)
             .unwrap()
             .contains("o/r"));
         assert_eq!(
-            notify_line(Outcome::NotAlarm, "o/r", true).as_deref(),
+            notify_line(Outcome::NotAlarm, "o/r", true, false).as_deref(),
             Some("")
         );
-        assert!(notify_line(Outcome::NotAlarm, "o/r", false).is_none());
-        assert!(notify_line(Outcome::NoMatch, "o/r", false).is_some());
+        assert!(notify_line(Outcome::NotAlarm, "o/r", false, false).is_none());
+        assert!(notify_line(Outcome::NoMatch, "o/r", false, false).is_some());
         assert_eq!(
-            notify_line(Outcome::Notified, "", false).as_deref(),
+            notify_line(Outcome::Notified, "", false, false).as_deref(),
             Some("")
         );
-        assert!(notify_line(Outcome::Duplicate, "o/r", false).is_none());
-        assert!(notify_line(Outcome::RoutePaused, "o/r", false).is_none());
-        assert!(notify_line(Outcome::Error, "o/r", false).is_none());
+        assert!(notify_line(Outcome::Duplicate, "o/r", false, true).is_none());
+        assert!(notify_line(Outcome::RoutePaused, "o/r", false, false).is_none());
+        assert!(notify_line(Outcome::Error, "o/r", false, false).is_none());
         // A recovery posts only when it closed an open card, on a route that
         // posts recoveries.
         assert_eq!(
-            notify_line(Outcome::Recovered, "", true).as_deref(),
+            notify_line(Outcome::Recovered, "", true, false).as_deref(),
             Some("")
         );
-        assert!(notify_line(Outcome::Recovered, "", false).is_none());
-        assert!(notify_line(Outcome::NoOpenAlert, "", true).is_none());
+        assert!(notify_line(Outcome::Recovered, "", false, false).is_none());
+        assert!(notify_line(Outcome::NoOpenAlert, "", true, false).is_none());
+    }
+
+    #[test]
+    fn a_repeat_while_its_run_is_in_progress_posts_nothing() {
+        // The same alert again inside the repeat window, its run still open
+        // and its card still up: recorded on the alerts page, no card.
+        assert!(is_repeat(Outcome::Duplicate));
+        assert!(notify_line(Outcome::Duplicate, "o/r", false, true).is_none());
+        assert!(notify_line(Outcome::Duplicate, "o/r", true, true).is_none());
+        // The run gate saw the run open: the same.
+        assert!(notify_line(Outcome::InFlight, "o/r", false, true).is_none());
+        assert!(notify_line(Outcome::InFlight, "o/r", true, true).is_none());
+    }
+
+    #[test]
+    fn a_repeat_after_its_run_finished_posts_nothing() {
+        // The run's PR merged days ago and the alert came back with its card
+        // never recovered: the gate says in flight or done, and no card.
+        assert!(is_repeat(Outcome::InFlight));
+        assert!(notify_line(Outcome::InFlight, "o/r", false, true).is_none());
+        // Outcomes that aren't repeats never read the card.
+        for o in [
+            Outcome::RunStarted,
+            Outcome::Notified,
+            Outcome::NoMatch,
+            Outcome::Recovered,
+            Outcome::Reminded,
+            Outcome::Suppressed,
+        ] {
+            assert!(!is_repeat(o), "{o:?}");
+        }
+    }
+
+    #[test]
+    fn a_redelivered_message_is_handled_once() {
+        // SNS sends the same message again: same id, so the same record and
+        // the same post claim.
+        let a = event_id("2026-11-10T15:10:04.664Z", "m-1");
+        assert_eq!(a, event_id("2026-11-10T15:10:04.664Z", "m-1"));
+        assert_eq!(post_claim_sk(&a), post_claim_sk(&a));
+        assert_ne!(
+            post_claim_sk(&a),
+            post_claim_sk(&event_id("2026-11-10T15:10:04.664Z", "m-2"))
+        );
+        // Recorded already: nothing is done again. Not recorded, or recorded
+        // as an error SNS retries on purpose: handled.
+        for o in [
+            "run_started",
+            "in_flight",
+            "duplicate",
+            "notified",
+            "recovered",
+        ] {
+            assert!(is_redelivery(Some(o)), "{o}");
+        }
+        assert!(!is_redelivery(None));
+        assert!(!is_redelivery(Some(Outcome::Error.as_str())));
+    }
+
+    #[test]
+    fn a_new_alert_after_a_recovery_posts() {
+        // A recovery closed the card, so the next fire is a new alert: it
+        // posts once even though a run for it already started or finished.
+        assert_eq!(
+            notify_line(Outcome::Duplicate, "o/r", false, false).as_deref(),
+            Some(episodes::reopened_without_run_line())
+        );
+        assert_eq!(
+            notify_line(Outcome::InFlight, "o/r", false, false).as_deref(),
+            Some(fired_again_handled_line())
+        );
+        // A fresh run, or a route that only notifies, posts as before.
+        assert!(notify_line(Outcome::RunStarted, "o/r", false, false).is_some());
+        assert!(notify_line(Outcome::RunStarted, "o/r", false, true).is_some());
+        assert!(notify_line(Outcome::Notified, "", false, false).is_some());
+    }
+
+    #[test]
+    fn recoveries_post_only_on_routes_that_post_them() {
+        // Off: the recovery closes the card silently.
+        assert!(notify_line(Outcome::Recovered, "", false, false).is_none());
+        assert!(notify_line(Outcome::Recovered, "", false, true).is_none());
+        // On: one green card for the open alert; nothing open, nothing posted.
+        assert_eq!(
+            notify_line(Outcome::Recovered, "", true, false).as_deref(),
+            Some("")
+        );
+        assert!(notify_line(Outcome::NoOpenAlert, "", true, false).is_none());
+        assert!(notify_line(Outcome::NoOpenAlert, "", false, false).is_none());
+        // A CloudWatch OK is a recovery, not a repeat.
+        let ok = normalize(
+            None,
+            &json!({"AlarmName": "example-vendor-slow", "NewStateValue": "OK"}).to_string(),
+        );
+        assert!(ok.recovers.is_some());
+        assert_eq!(plan(None, ok.recovers.is_some(), true), Plan::Recover);
+    }
+
+    #[test]
+    fn a_custom_notification_on_a_fix_route_posts_once() {
+        // A Chatbot custom notification routed to a repo by a match term.
+        let msg = json!({
+            "version": "1.0",
+            "source": "custom",
+            "content": {
+                "title": "New crawler TLS fingerprint on example-web-acl",
+                "description": "t13d1516h2_x passed the threshold"
+            },
+            "metadata": {"threadId": "fp-t13d1516h2_x"}
+        })
+        .to_string();
+        let alert = normalize(None, &msg);
+        assert_eq!(alert.kind, "chatbot_custom");
+        assert!(alert.actionable && alert.recovers.is_none());
+        let rules = vec![Rule {
+            id: "r1".into(),
+            alarms: vec![],
+            terms: vec!["crawler TLS fingerprint".into()],
+            repo: "o/infra".into(),
+            instructions: String::new(),
+        }];
+        let rule = pick_rule(&rules, &alert).expect("the match term takes it");
+        assert_eq!(rule.repo, "o/infra");
+        // Custom notifications have no recovery, so they post every time
+        // and their repeats meet the run gates.
+        assert_eq!(
+            episodes::effective(
+                Repeat::EveryTime,
+                &Default::default(),
+                alert.kind,
+                &alert.title
+            ),
+            Repeat::EveryTime
+        );
+        assert_eq!(plan(None, false, true), Plan::Decide);
+        // The first one starts a run and posts.
+        assert!(notify_line(Outcome::RunStarted, &rule.repo, false, false)
+            .unwrap()
+            .contains("o/infra"));
+        // Its repeat days later, after the run's PR merged: the run gate says
+        // done, the card is still open, nothing posts.
+        assert!(notify_line(Outcome::InFlight, &rule.repo, false, true).is_none());
+        // Inside the repeat window: the same.
+        assert!(notify_line(Outcome::Duplicate, &rule.repo, false, true).is_none());
     }
 
     #[test]
@@ -3304,10 +3553,10 @@ mod tests {
 
     #[test]
     fn held_and_waiting_alerts_post_nothing_and_reminders_post() {
-        assert!(notify_line(Outcome::Suppressed, "o/r", true).is_none());
-        assert!(notify_line(Outcome::Clearing, "", true).is_none());
+        assert!(notify_line(Outcome::Suppressed, "o/r", true, false).is_none());
+        assert!(notify_line(Outcome::Clearing, "", true, false).is_none());
         assert_eq!(
-            notify_line(Outcome::Reminded, "", false).as_deref(),
+            notify_line(Outcome::Reminded, "", false, false).as_deref(),
             Some("")
         );
         assert_eq!(Outcome::Suppressed.as_str(), "suppressed");

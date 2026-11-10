@@ -474,6 +474,33 @@ pub async fn close_open_alert(
     })
 }
 
+/// Is the alert's card still open (posted, or its run started, and no recovery
+/// since)? While it is, a repeat of the alert is the same alert and posts
+/// nothing. An error reads as open: a quiet repeat beats a duplicate card.
+pub async fn alert_card_open(
+    dynamo: &DynamoClient,
+    table: &str,
+    team_id: &str,
+    fingerprint: &str,
+) -> bool {
+    let out = dynamo
+        .get_item()
+        .table_name(table)
+        .key("pk", AttributeValue::S(team_id.to_string()))
+        .key("sk", AttributeValue::S(open_alert_sk(fingerprint)))
+        .projection_expression("pk")
+        .consistent_read(true)
+        .send()
+        .await;
+    match out {
+        Ok(o) => o.item().is_some(),
+        Err(e) => {
+            tracing::warn!(team_id, error = %e, "Could not read the open alert; treating the repeat as open");
+            true
+        }
+    }
+}
+
 /// Pure: the alarm's page in the CloudWatch console.
 pub fn cloudwatch_console_url(region: &str, alarm_name: &str) -> Option<String> {
     let ok_region = !region.is_empty()
