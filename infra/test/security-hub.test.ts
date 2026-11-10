@@ -17,6 +17,7 @@ import { buildApp } from "../lib/app";
 import { loadConfigFile, resolveConfig, ResolvedConfig } from "../lib/config";
 import { buildNative } from "../lib/native/build";
 import { ACCESS_LOG_DAYS } from "../lib/storage-stack";
+import { CLOUDFRONT_LOG_REGIONS } from "../lib/web-stack";
 
 const INFRA = path.join(__dirname, "..", "..");
 const STUBS = fs.mkdtempSync(path.join(os.tmpdir(), "chsec-"));
@@ -157,12 +158,22 @@ test("the release bucket (native parent): TLS-only, a lifecycle, only the helper
 });
 
 test("CloudFront.5, CloudFront.15: standard logs to the log bucket; the newest TLS policy on a domain", () => {
-  for (const [name, t] of INSTALLS) {
-    const d = one(resources(t, "AWS::CloudFront::Distribution"), name).r.Properties.DistributionConfig;
-    assert.equal(d.Logging.Prefix, "cloudfront/", name);
-    assert.match(JSON.stringify(d.Logging.Bucket), /-logs-.*\.s3\./, name);
-    assert.match(JSON.stringify(d.ViewerCertificate ?? {}), /TLSv1\.2_2025|^\{\}$/, name);
-  }
+  const self = one(resources(selfHost, "AWS::CloudFront::Distribution"), "self-host").r.Properties.DistributionConfig;
+  assert.deepEqual(self.Logging.Prefix, "cloudfront/");
+  assert.equal(self.Logging.IncludeCookies, false);
+  assert.match(JSON.stringify(self.Logging.Bucket), /coderhelm-prod-logs-111122223333\.s3\./);
+  // Native: one template for every region, and CloudFront delivers no standard
+  // logs to a bucket in an opt-in region, so the region decides.
+  const nd = native.Web.Resources.Distribution830FAC52.Properties.DistributionConfig;
+  assert.equal(nd.Logging["Fn::If"][0], "CloudFrontLogsRegion");
+  assert.equal(nd.Logging["Fn::If"][1].Prefix, "cloudfront/");
+  assert.deepEqual(nd.Logging["Fn::If"][2], { Ref: "AWS::NoValue" });
+  const regions = JSON.stringify(native.Web.Conditions.CloudFrontLogsRegion).match(/"(?:[a-z]+-)+\d"/g)!.map((r) => JSON.parse(r)).sort();
+  assert.deepEqual(regions, [...CLOUDFRONT_LOG_REGIONS].sort());
+  for (const r of ["af-south-1", "il-central-1", "eu-south-2", "me-central-1", "ap-east-1", "mx-central-1"]) assert.ok(!regions.includes(r), r);
+  // A self-host install in an opt-in region: no standard logs (the update would fail).
+  const optIn = synth(resolveConfig({ account: "111122223333", region: "eu-south-2", stage: "prod", email: { from: "coderhelm@example.org" }, admins: ["owner@example.org"] }));
+  assert.equal(one(resources(optIn, "AWS::CloudFront::Distribution"), "opt-in").r.Properties.DistributionConfig.Logging, undefined);
   // Native: the domain's certificate, when there is one.
   assert.match(JSON.stringify(native.Web.Resources.Distribution830FAC52.Properties.DistributionConfig.ViewerCertificate), /"MinimumProtocolVersion":"TLSv1.2_2025"/);
   const withDomain = synth(resolveConfig({

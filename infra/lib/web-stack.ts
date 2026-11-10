@@ -64,6 +64,17 @@ export const BRAIN_STREAM_PATH = "/api/brain/stream";
  */
 export const VIEWER_TLS_POLICY = cloudfront.SecurityPolicyProtocol.TLS_V1_2_2025;
 
+/**
+ * The regions CloudFront's standard logs (legacy, to S3) can be delivered to:
+ * every region enabled by default. It delivers none to a bucket in an opt-in
+ * region, so an install there has no CloudFront logs (S3 access logs still).
+ */
+export const CLOUDFRONT_LOG_REGIONS = [
+  "us-east-1", "us-east-2", "us-west-1", "us-west-2", "ca-central-1", "sa-east-1",
+  "eu-west-1", "eu-west-2", "eu-west-3", "eu-central-1", "eu-north-1",
+  "ap-northeast-1", "ap-northeast-2", "ap-northeast-3", "ap-southeast-1", "ap-southeast-2", "ap-south-1",
+];
+
 /** Hashed build files: cached for a year. */
 const ASSET_CACHE_CONTROL = "public, max-age=31536000, immutable";
 /** Pages and the runtime config: revalidated on every visit. */
@@ -246,10 +257,6 @@ export class WebStack extends cdk.Stack {
       defaultRootObject: "index.html",
       httpVersion: cloudfront.HttpVersion.HTTP2_AND_3,
       minimumProtocolVersion: VIEWER_TLS_POLICY,
-      // Standard logs, kept 90 days in the storage stack's log bucket.
-      enableLogging: true,
-      logBucket: logBucketOf(this, cfg),
-      logFilePrefix: "cloudfront/",
       defaultBehavior: {
         // List too, so a file that isn't there is a 404 (not S3's 403),
         // which the error response below turns into the install's own page.
@@ -274,6 +281,8 @@ export class WebStack extends cdk.Stack {
         { httpStatus: 404, responseHttpStatus: 404, responsePagePath: "/_errors/404.html", ttl: cdk.Duration.seconds(60) },
       ],
     });
+
+    this.standardLogs(cfg);
 
     // Origin access control signs the stream's calls as CloudFront; Lambda
     // needs both of these for a function URL (FunctionUrlOrigin adds the first).
@@ -367,6 +376,34 @@ export class WebStack extends cdk.Stack {
         value: `${domain.hostname} CNAME ${this.distribution.distributionDomainName}`,
         description: "Create this DNS record at your DNS provider",
       });
+    }
+  }
+
+  /**
+   * Standard logs into the storage stack's log bucket (`cloudfront/`, kept
+   * 90 days), where CloudFront can deliver them: a native release's one
+   * template decides by its region (a condition), any other install at synth.
+   */
+  private standardLogs(cfg: ResolvedConfig): void {
+    const logging = {
+      Bucket: logBucketOf(this, cfg).bucketRegionalDomainName,
+      IncludeCookies: false,
+      Prefix: "cloudfront/",
+    };
+    const cfn = this.distribution.node.defaultChild as cloudfront.CfnDistribution;
+    if (cfg.native) {
+      const eq = (r: string) => cdk.Fn.conditionEquals(cdk.Aws.REGION, r);
+      const half = Math.ceil(CLOUDFRONT_LOG_REGIONS.length / 2);
+      const supported = new cdk.CfnCondition(this, "CloudFrontLogsRegion", {
+        // Fn::Or takes at most 10.
+        expression: cdk.Fn.conditionOr(
+          cdk.Fn.conditionOr(...CLOUDFRONT_LOG_REGIONS.slice(0, half).map(eq)),
+          cdk.Fn.conditionOr(...CLOUDFRONT_LOG_REGIONS.slice(half).map(eq)),
+        ),
+      });
+      cfn.addPropertyOverride("DistributionConfig.Logging", cdk.Fn.conditionIf(supported.logicalId, logging, cdk.Aws.NO_VALUE));
+    } else if (CLOUDFRONT_LOG_REGIONS.includes(cfg.region)) {
+      cfn.addPropertyOverride("DistributionConfig.Logging", logging);
     }
   }
 

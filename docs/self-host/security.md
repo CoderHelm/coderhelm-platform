@@ -288,7 +288,7 @@ AWS Security Hub checks an install against AWS's best practices. This is what ea
 | S3.5 | Every bucket refuses requests without TLS, the release bucket included. |
 | S3.9 | The data, dashboard and sandbox buckets write server access logs to the install's log bucket, `coderhelm-<name>-logs-<account>`, under `s3/<bucket>/`. |
 | S3.13 | Every bucket has a lifecycle: access logs expire after 90 days, sandbox tarballs after a day, old versions of data after 30 days, and unfinished uploads after a day. |
-| CloudFront.5 | The distribution writes standard logs to the log bucket, under `cloudfront/`. |
+| CloudFront.5 | The distribution writes standard logs to the log bucket, under `cloudfront/`, in every region AWS enables by default. CloudFront delivers no standard logs to a bucket in an opt-in region (Cape Town, Hong Kong, Milan, Spain, Zurich, Tel Aviv, the UAE, Bahrain, Hyderabad, Jakarta, Melbourne, Calgary, Mexico and newer), so an install there has the S3 access logs only. |
 | CloudFront.15 | On your own domain, viewers need TLS 1.2 with modern ciphers, or TLS 1.3 (`TLSv1.2_2025`). |
 | DynamoDB.2, DynamoDB.6 | Every table has point-in-time recovery and deletion protection. On a Launch Stack install, deletion protection follows **KeepDataOnDelete**, so an uninstall that deletes the data can delete the tables. |
 | Cognito.3, Cognito.6 | Passwords need 8 characters with an upper-case and a lower-case letter, a digit and a symbol. Temporary passwords last 7 days. The user pool has deletion protection, which follows **KeepDataOnDelete** like the tables. |
