@@ -285,7 +285,10 @@ pub fn settle_generated(mut cov: Coverage, settled: &[String]) -> Coverage {
 
 /// Each planned task, done when the branch changes its file. Structural, not
 /// the coder's account: a task whose file the diff doesn't touch is not done
-/// whatever the coder's summary says.
+/// whatever the coder's summary says. Every plan check in the run measures
+/// with [`plan_changes`] (a stacked base adds its changes); this is that
+/// measure with no stacked base, kept for the tests.
+#[cfg(test)]
 pub fn coverage(tasks: &[PlanTask], changed: &[String]) -> Coverage {
     stacked_coverage(tasks, changed, &[])
 }

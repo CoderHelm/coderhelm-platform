@@ -1043,7 +1043,7 @@ pub async fn run(
         }
     }
 
-    let files = executor
+    let files: Vec<String> = executor
         .write_executor
         .files_modified
         .lock()
@@ -1051,6 +1051,11 @@ pub async fn run(
         .iter()
         .cloned()
         .collect();
+    // The run's own code moved: what the run guard weighs a recovered plan
+    // check count against.
+    if let (Some(run_id), false) = (run_id, files.is_empty()) {
+        super::run_guard::wrote_code(state, &msg.team_id, run_id).await;
+    }
 
     // Cut short by the deadline: the loop's own marker, or the pass ended
     // inside the wrap-up window (the agent summarized what was left).

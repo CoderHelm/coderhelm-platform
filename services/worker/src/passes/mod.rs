@@ -1118,6 +1118,7 @@ mod proof;
 pub mod quarantine;
 /// Whether a finished run's pull request leaves draft, decided in one place.
 pub mod ready;
+pub mod recheck;
 pub mod relay_retry;
 pub mod release_notes;
 pub mod release_plan;
@@ -3530,6 +3531,13 @@ async fn run_passes(
         run_guard::LedgerCell::new(&checks_scope, Default::default())
     };
     ledger.update(|l| l.on_step_start());
+    // Results another version of the checks wrote run again on this head.
+    if ledger.update(|l| l.for_checks_version(proof::checks_version())) {
+        info!(
+            run_id,
+            "The checks' code changed since their last results: they run again"
+        );
+    }
     if let Some((remembered, _)) = &continue_in {
         ledger.update(|l| l.covering = Some(remembered.clone()));
     }
@@ -6527,6 +6535,70 @@ async fn hand_off_at(
     }
 }
 
+/// A finished run's checks, again, in a fresh step of the run that resumes
+/// at [`steps::Gate::Checks`] on its open pull request (see `recheck`):
+/// the checks run on the head and the Open items are written from what they
+/// find now. `msg` is the run's last step's message. It is not a
+/// continuation of work that stalled, so the step guard starts fresh and
+/// the run guard doesn't count it; the team's usage limit and the runaway
+/// ceiling still stop it.
+pub(crate) async fn recheck_at_checks(
+    state: &WorkerState,
+    msg: &TicketMessage,
+    run_id: &str,
+    branch: &str,
+    carry: Option<&steps::Carry>,
+    why: &str,
+) -> Handoff {
+    if branch.is_empty() {
+        return Handoff::Stopped("the run has no branch".into());
+    }
+    if state.config.ticket_queue_url.is_empty() {
+        return Handoff::Stopped("no queue to continue on".into());
+    }
+    if let Some(reason) = check_budget_exceeded(state, &msg.team_id).await {
+        return Handoff::Stopped(reason);
+    }
+    if !steps::under_ceiling(msg.continuation) {
+        return Handoff::Stopped(format!(
+            "the run reached the safety ceiling of {} steps",
+            steps::MAX_RUN_STEPS
+        ));
+    }
+    save_checkpoint(
+        state,
+        &msg.team_id,
+        run_id,
+        "implement",
+        branch,
+        0,
+        &TokenUsage::default(),
+    )
+    .await;
+    steps::save_gate(state, &msg.team_id, run_id, steps::Gate::Checks, carry).await;
+    // New code checking the same head is not a step that made no progress.
+    steps::save_mark(state, &msg.team_id, run_id, "", 0, 0).await;
+    let now_ms = chrono::Utc::now().timestamp_millis().max(0) as u64;
+    let next = steps::next_message(msg, run_id, now_ms);
+    let step = steps::step_number(next.continuation);
+    if !send_ticket_after(state, &next, steps::STEP_DELAY_SECS as u64).await {
+        return Handoff::Stopped("the step couldn't be queued".into());
+    }
+    info!(
+        run_id,
+        step, "Checking the pull request again in a fresh step"
+    );
+    add_progress_note(
+        state,
+        &msg.team_id,
+        run_id,
+        &format!("{why}: checking it again in step {step}"),
+    )
+    .await;
+    steps::mark_queued(state, &msg.team_id, run_id, step).await;
+    Handoff::Continued
+}
+
 /// For a step resuming at a gate: the optional tasks the plan check left
 /// out, read again from the branch (they go in the PR's Open items).
 async fn resumed_optional(
@@ -6630,7 +6702,12 @@ async fn continuation_feedback(
     if tasks.is_empty() {
         return None;
     }
-    let changed = plan_coverage::changed_files(
+    // The same measure as every other plan check (`close_gaps`): a branch
+    // stacked on another pull request's branch has the files that branch
+    // changes done there. Measured on the branch's own diff alone, a stacked
+    // run read 23 of 38 tasks at the start of every step and 37 of 38 after
+    // it, and told its coder 14 tasks were missing that weren't.
+    let changes = plan_coverage::plan_changes(
         github,
         &msg.repo_owner,
         &msg.repo_name,
@@ -6638,7 +6715,7 @@ async fn continuation_feedback(
         branch,
     )
     .await?;
-    let cov = plan_coverage::coverage(&tasks, &changed);
+    let cov = changes.coverage(&tasks);
     run_guard::progress(
         state,
         &msg.team_id,
@@ -7122,6 +7199,13 @@ async fn run_repo_pipeline(
     )
     .await;
     ledger.update(|l| l.on_step_start());
+    // Results another version of the checks wrote run again on this head.
+    if ledger.update(|l| l.for_checks_version(proof::checks_version())) {
+        info!(
+            run_id,
+            "The checks' code changed since their last results: they run again"
+        );
+    }
     let already_open = ledger.update(|l| l.opened.clone());
 
     // --- The draft pull request, before the checks (see the single-repository

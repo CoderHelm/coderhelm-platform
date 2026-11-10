@@ -39,6 +39,12 @@
 //!   no recorded reason, and decides again: it marks the pull request ready
 //!   or records why not. A person's draft and a closed pull request are
 //!   respected.
+//! - A hold is only as current as the code that wrote it. When the pull
+//!   request is held on a check line other code than the code running now
+//!   wrote ([`recheck_due`]), the run checks it again on the head in a fresh
+//!   step (`recheck`), once per code version, and the pull request waits for
+//!   that instead of staying held on the old line. What the checks find then
+//!   decides, here, as always.
 
 use std::collections::HashMap;
 
@@ -296,6 +302,21 @@ pub fn decide(f: &Facts) -> Decision {
     Decision::Ready { open }
 }
 
+/// Whether a held pull request is checked again before its hold is
+/// recorded: a check line written by code other than `version` holds it
+/// (see `recheck`). Never for a pull request a person put back to draft, or
+/// one that isn't held.
+pub fn recheck_due(f: &Facts, d: &Decision, version: &str) -> bool {
+    matches!(d, Decision::Held { .. })
+        && f.draft
+        && !f.closed
+        && f.put_back_by.is_none()
+        && super::proof::holds_on_other_version(&f.body, f.ci.green, version)
+}
+
+/// What the description says while the checks run again.
+pub const RECHECK_WHY: &str = "CoderHelm's checks run again on this head: the check listed under                                Open items was written by an earlier version of them";
+
 /// The description's draft status for a decision; empty when it is ready.
 pub fn status_section(d: &Decision) -> String {
     match d {
@@ -466,6 +487,8 @@ pub enum Outcome {
     Ready,
     Held,
     Waiting,
+    /// Held on a check older code wrote: the run checks it again.
+    Rechecking,
     Closed,
     /// Sent again for later (GitHub refused for a while).
     Retrying,
@@ -515,6 +538,34 @@ pub async fn settle(ctx: &Ctx<'_>) -> Outcome {
             write_body(ctx, &facts.body, &decision).await;
             record_settled(ctx.state, ctx.team_id, &run_id, "ready").await;
             Outcome::Ready
+        }
+        Decision::Held { .. }
+            if recheck_due(&facts, &decision, super::proof::checks_version())
+                && super::recheck::start(
+                    ctx.state,
+                    ctx.team_id,
+                    &run_id,
+                    ctx.pr,
+                    &facts.body,
+                    super::proof::checks_version(),
+                )
+                .await =>
+        {
+            info!(pr = ctx.pr, run_id = %run_id, "The PR's hold was written by older checks: checking it again");
+            let wait = Decision::Wait {
+                why: RECHECK_WHY.to_string(),
+                until: None,
+            };
+            write_body(ctx, &facts.body, &wait).await;
+            if let Some(h) = DraftHold::new(
+                Kind::Waiting,
+                vec![Reason::new(RECHECK_WHY, "")],
+                ctx.pr,
+                &pr_url,
+            ) {
+                record_hold(ctx.state, ctx.team_id, &run_id, h).await;
+            }
+            Outcome::Rechecking
         }
         Decision::Held { reasons } => {
             let lines: Vec<String> = reasons.iter().map(Reason::line).collect();

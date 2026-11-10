@@ -125,6 +125,8 @@ fn a_fall_in_the_count_is_news_and_its_recovery_is_progress() {
     assert!(!g.apply(&Progress::TasksDone(17)));
     assert_eq!(g.task_drops, 2);
     g.on_continuation(1.0);
+    // The run's coder writes the lost work again.
+    g.on_own_code();
     assert!(
         g.apply(&Progress::TasksDone(23)),
         "lost work done again is progress"
@@ -138,6 +140,7 @@ fn a_fall_in_the_count_is_news_and_its_recovery_is_progress() {
         g.on_continuation(1.0);
         g.apply(&Progress::TasksDone(17));
         g.on_continuation(1.0);
+        g.on_own_code();
         g.apply(&Progress::TasksDone(23));
     }
     assert!(g.task_drops > MAX_TASK_DROPS);
