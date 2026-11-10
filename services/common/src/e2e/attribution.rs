@@ -356,11 +356,43 @@ pub struct Attribution {
     /// The separate pull request that fixes the test.
     #[serde(default)]
     pub fix_pr: Option<u64>,
+    /// The separate fix run ended without a pull request: nothing will fix
+    /// the test there, so it never blocks the original pull request.
+    #[serde(default)]
+    pub fix_failed: bool,
     #[serde(default)]
     pub source: String,
 }
 
 impl Attribution {
+    /// The rules as they stand, applied to a verdict saved under older
+    /// ones: an "unrelated" failure in a test the change itself adds or
+    /// edits is the change's (see [`test_changed`]). Returns whether it
+    /// changed.
+    pub fn settle(&mut self) -> bool {
+        if self.verdict != Verdict::Unrelated {
+            return false;
+        }
+        let own = test_changed(&self.diff, std::slice::from_ref(&self.file));
+        if own.is_empty() {
+            return false;
+        }
+        self.verdict = Verdict::Related;
+        self.reason = test_changed_reason(&own);
+        for f in own {
+            if !self.touched.contains(&f) {
+                self.touched.push(f);
+            }
+        }
+        true
+    }
+
+    /// Whether this failure holds the original pull request's CI as blocked
+    /// on a separate fix: unrelated, and that fix hasn't ended without one.
+    pub fn blocks(&self) -> bool {
+        self.verdict == Verdict::Unrelated && !self.fix_failed
+    }
+
     /// "Diff touches failing path: yes/no", with the evidence.
     pub fn causality_line(&self) -> String {
         let path = if self.path_evidence.is_empty() {
@@ -427,6 +459,9 @@ impl Attribution {
 
     /// The status line of the original pull request while the fix waits.
     pub fn blocked_line(&self) -> Option<String> {
+        if !self.blocks() {
+            return None;
+        }
         match (self.verdict, self.fix_pr) {
             (Verdict::Unrelated, Some(n)) => Some(format!(
                 "Blocked on #{n}: `{}` fails for a reason outside this change; re-run E2E after #{n} merges.",
@@ -495,6 +530,37 @@ mod tests {
         assert_eq!(changed.len(), 2);
         assert!(test_changed_reason(&changed).contains("`e2e/pages/venue-subnav.ts`"));
         assert!(test_changed(&diff, &["e2e/tests/site/home.spec.ts".to_string()]).is_empty());
+    }
+
+    /// A verdict saved before that rule (the spec in the diff, called
+    /// unrelated) settles to related when read; a failed fix never blocks.
+    #[test]
+    fn a_saved_unrelated_verdict_settles_under_the_current_rules() {
+        let mut a = Attribution {
+            test: "More menu on a phone".into(),
+            file: "e2e/tests/site/venue-subnav-more-menu.spec.ts".into(),
+            diff: vec![
+                "e2e/pages/venue-subnav.ts".into(),
+                "e2e/tests/site/venue-subnav-more-menu.spec.ts".into(),
+            ],
+            verdict: Verdict::Unrelated,
+            ..Default::default()
+        };
+        assert!(a.settle());
+        assert_eq!(a.verdict, Verdict::Related);
+        assert!(!a.blocks());
+        assert!(!a.settle());
+
+        let mut other = Attribution {
+            file: "e2e/tests/site/home.spec.ts".into(),
+            diff: vec!["web/src/app.tsx".into()],
+            verdict: Verdict::Unrelated,
+            ..Default::default()
+        };
+        assert!(!other.settle());
+        assert!(other.blocks());
+        other.fix_failed = true;
+        assert!(!other.blocks());
     }
 
     #[test]

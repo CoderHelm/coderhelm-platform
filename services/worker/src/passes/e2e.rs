@@ -784,11 +784,7 @@ async fn own_pr_failures(
             .filter(|t| caused.iter().any(|l| l.title == t.full_title()))
             .collect();
         let found = super::e2e_attribution::handle_own_pr(state, gh, msg, pr, &failing).await;
-        caused.retain(|l| {
-            !found.iter().any(|a| {
-                a.test == l.title && a.verdict == common::e2e::attribution::Verdict::Unrelated
-            })
-        });
+        caused.retain(|l| !found.iter().any(|a| a.test == l.title && a.blocks()));
         for a in found {
             causality.insert(a.test.clone(), a.causality_line());
         }
