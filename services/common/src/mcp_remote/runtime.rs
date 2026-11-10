@@ -138,6 +138,85 @@ pub fn system_clock() -> Clock {
     Arc::new(|| chrono::Utc::now().timestamp())
 }
 
+/// What a provider sent back to the dashboard's callback page.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Answer<'a> {
+    pub state: &'a str,
+    pub code: Option<&'a str>,
+    pub error: Option<&'a str>,
+    /// The provider's own words for `error` (RFC 6749 4.1.2.1).
+    pub error_description: Option<&'a str>,
+    pub iss: Option<&'a str>,
+}
+
+/// A sign-in that finished.
+#[derive(Debug, Clone)]
+pub struct Finished {
+    pub server: ServerRecord,
+    pub owner: Owner,
+    pub flow: oauth::Flow,
+    /// Where the dashboard goes back to (empty: the flow's usual page).
+    pub return_to: String,
+}
+
+/// A sign-in that didn't finish: why, in words a person can act on, and
+/// what the callback page needs to send them back to where they started.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Failed {
+    pub message: String,
+    /// The provider's or token endpoint's error code, when there was one.
+    pub code: String,
+    /// The kind of sign-in, when known (from its record, else its `state`).
+    pub flow: Option<oauth::Flow>,
+    pub return_to: String,
+    /// The server or source it was for, when the sign-in was matched.
+    pub server_name: String,
+    pub catalog_id: String,
+}
+
+/// A record's name as people know it ("Confluence", not "Confluence (knowledge)").
+pub fn display_name(s: &ServerRecord) -> String {
+    s.name.trim_end_matches(" (knowledge)").to_string()
+}
+
+/// The words for a provider's `error` answer, with its own description when
+/// it sent one. Only `access_denied` with no other words reads as "not
+/// granted", and even then it says the other reason providers use it for
+/// (the account may not use the app), because Atlassian, Microsoft and
+/// others answer `access_denied` for both.
+pub fn provider_error(provider: &str, code: &str, description: &str) -> String {
+    let who = if provider.trim().is_empty() {
+        "The sign-in page"
+    } else {
+        provider.trim()
+    };
+    let desc: String = crate::truncate_str(description.trim(), 300)
+        .chars()
+        .filter(|c| !c.is_control())
+        .collect::<String>();
+    let said = if desc.is_empty() {
+        String::new()
+    } else {
+        format!(" {who} said: \"{desc}\".")
+    };
+    match code {
+        "access_denied" if desc.is_empty() => format!(
+            "{who} answered access_denied: access wasn't granted. Either Cancel was chosen on its sign-in page, or {who} doesn't let this account use Coderhelm's app (for example, the app isn't shared with your organization, or your account can't reach the site). Start again, and ask an admin of {who} if it keeps happening."
+        ),
+        "access_denied" => format!("{who} didn't grant access (access_denied).{said}"),
+        "invalid_scope" => format!(
+            "{who} refused the permissions Coderhelm asked for (invalid_scope).{said} Whoever set up the app must add every scope listed in the sign-in setup to it."
+        ),
+        "unauthorized_client" | "invalid_client" | "invalid_request" => format!(
+            "{who} refused the sign-in request ({code}).{said} The app's settings (client id, redirect address) don't match what {who} has registered."
+        ),
+        "temporarily_unavailable" | "server_error" => {
+            format!("{who} had a problem finishing the sign-in ({code}).{said} Start it again.")
+        }
+        other => format!("{who} returned an error ({other}).{said}"),
+    }
+}
+
 /// One team's remote servers.
 #[derive(Clone)]
 pub struct Runtime {
@@ -697,6 +776,49 @@ impl Runtime {
         redirect_uri: &str,
         metadata_document_url: Option<&str>,
     ) -> Result<String, String> {
+        self.start_sign_in_for(
+            s,
+            owner,
+            user_sub,
+            user_email,
+            redirect_uri,
+            metadata_document_url,
+            None,
+            "",
+        )
+        .await
+    }
+
+    /// The kind of sign-in a record's flow is when the caller doesn't say.
+    pub fn flow_of(&self, s: &ServerRecord) -> oauth::Flow {
+        if super::store::holding_expiry(&self.team, 0).is_some() {
+            oauth::Flow::Broker
+        } else if s.catalog_id.starts_with("source:") {
+            oauth::Flow::Knowledge
+        } else if super::own_app::catalog_of(&s.catalog_id).is_some() {
+            oauth::Flow::App
+        } else {
+            oauth::Flow::Mcp
+        }
+    }
+
+    /// [`Self::start_sign_in`] for a given kind of sign-in (`None`: worked
+    /// out from the record) and a dashboard page to return to (checked with
+    /// [`oauth::clean_return_path`]; empty for the flow's usual page). Both
+    /// are kept with the pending sign-in, and the kind goes in the `state`.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn start_sign_in_for(
+        &self,
+        s: &mut ServerRecord,
+        owner: &Owner,
+        user_sub: &str,
+        user_email: &str,
+        redirect_uri: &str,
+        metadata_document_url: Option<&str>,
+        flow: Option<oauth::Flow>,
+        return_to: &str,
+    ) -> Result<String, String> {
+        let flow = flow.unwrap_or_else(|| self.flow_of(s));
         let mut o = s
             .oauth
             .clone()
@@ -740,7 +862,7 @@ impl Runtime {
             }
         }
         let pkce = oauth::Pkce::new();
-        let state = oauth::new_state();
+        let state = oauth::new_state_for(flow);
         self.store
             .put_pending(
                 &self.team,
@@ -754,6 +876,8 @@ impl Runtime {
                     issuer: o.issuer.clone(),
                     redirect_uri: redirect_uri.to_string(),
                     expires_at: self.now() + PENDING_TTL_SECS,
+                    flow: flow.tag().to_string(),
+                    return_to: oauth::clean_return_path(return_to),
                 },
             )
             .await?;
@@ -782,41 +906,92 @@ impl Runtime {
         user_sub: &str,
         user_email: &str,
     ) -> Result<(ServerRecord, Owner), String> {
+        let a = Answer {
+            state,
+            code,
+            error,
+            error_description: None,
+            iss,
+        };
+        self.finish(&a, user_sub, user_email)
+            .await
+            .map(|f| (f.server, f.owner))
+            .map_err(|f| f.message)
+    }
+
+    /// [`Self::finish_sign_in`] with the whole answer (the provider's
+    /// `error_description` too), saying which kind of sign-in it was and
+    /// where it goes back to, whether it finished or not, so the callback
+    /// page can send the person back to the page that started it and show
+    /// the provider's own reason.
+    pub async fn finish(
+        &self,
+        a: &Answer<'_>,
+        user_sub: &str,
+        user_email: &str,
+    ) -> Result<Finished, Failed> {
+        let unmatched = |message: &str| Failed {
+            message: message.to_string(),
+            code: String::new(),
+            flow: oauth::Flow::of_state(a.state),
+            return_to: String::new(),
+            server_name: String::new(),
+            catalog_id: String::new(),
+        };
         let p = self
             .store
-            .take_pending(&self.team, &oauth::state_key(state))
-            .await?
-            .ok_or("That sign-in was already used or has expired. Start it again.")?;
-        p.check(user_sub, user_email, self.now())?;
-        let s = self
-            .store
-            .get_server(&self.team, &p.server_id)
-            .await?
-            .ok_or("That server was removed while you were signing in.")?;
+            .take_pending(&self.team, &oauth::state_key(a.state))
+            .await
+            .map_err(|e| unmatched(&e))?
+            .ok_or_else(|| {
+                unmatched("That sign-in was already used or has expired. Start it again.")
+            })?;
+        let s = self.store.get_server(&self.team, &p.server_id).await;
+        let s = match s {
+            Ok(Some(s)) => s,
+            Ok(None) => {
+                let mut f = unmatched("That server was removed while you were signing in.");
+                f.flow = oauth::Flow::parse(&p.flow).or(f.flow);
+                f.return_to = p.return_to.clone();
+                return Err(f);
+            }
+            Err(e) => return Err(unmatched(&e)),
+        };
+        let flow = oauth::Flow::parse(&p.flow).unwrap_or_else(|| self.flow_of(&s));
+        let fail = |message: String, code: &str| Failed {
+            message,
+            code: code.to_string(),
+            flow: Some(flow),
+            return_to: p.return_to.clone(),
+            server_name: display_name(&s),
+            catalog_id: s.catalog_id.clone(),
+        };
+        p.check(user_sub, user_email, self.now())
+            .map_err(|e| fail(e, ""))?;
         let o = s
             .oauth
             .clone()
-            .ok_or("This server doesn't sign in with OAuth.")?;
+            .ok_or_else(|| fail("This server doesn't sign in with OAuth.".into(), ""))?;
         if o.issuer != p.issuer {
-            return Err(
+            return Err(fail(
                 "The server's sign-in settings changed while you were signing in. Start again."
                     .into(),
-            );
+                "",
+            ));
         }
-        oauth::check_iss(o.iss_supported, &p.issuer, iss)?;
-        if let Some(err) = error {
-            return Err(match err {
-                "access_denied" => "Access was not granted on the sign-in page.".to_string(),
-                other => format!(
-                    "The sign-in page returned an error ({}).",
-                    crate::truncate_str(other, 80)
-                ),
-            });
+        oauth::check_iss(o.iss_supported, &p.issuer, a.iss).map_err(|e| fail(e, ""))?;
+        if let Some(err) = a.error.filter(|e| !e.is_empty()) {
+            let code = crate::truncate_str(err.trim(), 80).to_string();
+            return Err(fail(
+                provider_error(&display_name(&s), &code, a.error_description.unwrap_or("")),
+                &code,
+            ));
         }
-        let code = code
+        let code = a
+            .code
             .filter(|c| !c.is_empty())
-            .ok_or("The sign-in page sent no code.")?;
-        let client = self.client(&s).await?;
+            .ok_or_else(|| fail("The sign-in page sent no code. Start it again.".into(), ""))?;
+        let client = self.client(&s).await.map_err(|e| fail(e, ""))?;
         let mut req = oauth::token_request(
             &o.auth_server(),
             &client,
@@ -828,14 +1003,24 @@ impl Runtime {
         if o.token_body_json {
             req = oauth::as_json_body(req);
         }
-        let resp = self.http.send(req).await.map_err(|e| e.to_string())?;
+        let resp = self.http.send(req).await.map_err(|e| {
+            fail(
+                format!("Coderhelm couldn't reach the sign-in server: {e}"),
+                "",
+            )
+        })?;
         let now = self.now();
-        let set = oauth::parse_token_response(&resp, now, None).map_err(|e| e.message)?;
-        let sealed = self.seal_tokens(&s.id, &p.owner, &set).await?;
+        let set =
+            oauth::parse_token_response(&resp, now, None).map_err(|e| fail(e.message, &e.code))?;
+        let sealed = self
+            .seal_tokens(&s.id, &p.owner, &set)
+            .await
+            .map_err(|e| fail(e, ""))?;
         let version = self
             .store
             .get_token(&self.team, &s.id, &p.owner)
-            .await?
+            .await
+            .map_err(|e| fail(e, ""))?
             .map(|t| t.version + 1)
             .unwrap_or(1);
         self.store
@@ -856,13 +1041,20 @@ impl Runtime {
                 },
                 None,
             )
-            .await?;
+            .await
+            .map_err(|e| fail(e, ""))?;
         if p.owner == Owner::Team {
             self.store
                 .set_status(&self.team, &s.id, Status::Connected, "")
-                .await?;
+                .await
+                .map_err(|e| fail(e, ""))?;
         }
-        Ok((s, p.owner))
+        Ok(Finished {
+            return_to: p.return_to.clone(),
+            server: s,
+            owner: p.owner,
+            flow,
+        })
     }
 
     /// Disconnects one owner: revokes the tokens at the authorization server
@@ -1985,5 +2177,242 @@ mod tests {
             .unwrap();
         assert_eq!(rec.status, Status::NeedsReconnect);
         let _ = &r.now;
+    }
+
+    fn state_of(url: &str) -> String {
+        reqwest::Url::parse(url)
+            .unwrap()
+            .query_pairs()
+            .find(|(k, _)| k == "state")
+            .map(|(_, v)| v.to_string())
+            .unwrap()
+    }
+
+    const ISS: Option<&str> = Some("https://auth.example.com");
+
+    #[tokio::test]
+    async fn a_state_carries_its_flow_and_its_record_the_return_path() {
+        let r = rig("TEAM#a");
+        let mut s = server();
+        r.store.put_server("TEAM#a", &s).await.unwrap();
+        let url =
+            r.rt.start_sign_in_for(
+                &mut s,
+                &Owner::Team,
+                "USER#1",
+                "a@x.com",
+                "https://app.example.com/cb/",
+                None,
+                Some(oauth::Flow::Knowledge),
+                "/knowledge/base/?id=kb1",
+            )
+            .await
+            .unwrap();
+        let state = state_of(&url);
+        assert!(state.starts_with("ks."), "{state}");
+        assert_eq!(oauth::Flow::of_state(&state), Some(oauth::Flow::Knowledge));
+        // A provider refusal with its own words: the flow, the page to go
+        // back to and the provider's description all come back.
+        let f =
+            r.rt.finish(
+                &Answer {
+                    state: &state,
+                    code: None,
+                    error: Some("access_denied"),
+                    error_description: Some("The app is not installed on this site"),
+                    iss: ISS,
+                },
+                "USER#1",
+                "a@x.com",
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(f.flow, Some(oauth::Flow::Knowledge));
+        assert_eq!(f.return_to, "/knowledge/base/?id=kb1");
+        assert_eq!(f.code, "access_denied");
+        assert_eq!(f.server_name, "Docs");
+        assert!(
+            f.message.contains("The app is not installed on this site"),
+            "{}",
+            f.message
+        );
+        // The state was used up by the refusal.
+        let again =
+            r.rt.finish(
+                &Answer {
+                    state: &state,
+                    code: Some("c"),
+                    iss: ISS,
+                    ..Default::default()
+                },
+                "USER#1",
+                "a@x.com",
+            )
+            .await
+            .unwrap_err();
+        assert!(again.message.contains("already used"));
+        assert_eq!(again.flow, Some(oauth::Flow::Knowledge), "from the tag");
+    }
+
+    #[tokio::test]
+    async fn a_return_path_off_the_dashboard_is_dropped() {
+        let r = rig("TEAM#a");
+        let mut s = server();
+        r.store.put_server("TEAM#a", &s).await.unwrap();
+        let url =
+            r.rt.start_sign_in_for(
+                &mut s,
+                &Owner::Team,
+                "USER#1",
+                "a@x.com",
+                "https://app.example.com/cb/",
+                None,
+                None,
+                "https://evil.example.net/",
+            )
+            .await
+            .unwrap();
+        let state = state_of(&url);
+        assert!(state.starts_with("mcp."), "worked out from the record");
+        r.http.on(
+            Method::Post,
+            TOKEN,
+            fjson(
+                200,
+                json!({"access_token": "at-1", "token_type": "Bearer", "expires_in": 3600}),
+            ),
+        );
+        let done =
+            r.rt.finish(
+                &Answer {
+                    state: &state,
+                    code: Some("c"),
+                    iss: ISS,
+                    ..Default::default()
+                },
+                "USER#1",
+                "a@x.com",
+            )
+            .await
+            .unwrap();
+        assert_eq!(done.flow, oauth::Flow::Mcp);
+        assert_eq!(done.return_to, "");
+    }
+
+    #[tokio::test]
+    async fn a_state_from_before_flows_still_finishes() {
+        let r = rig("TEAM#a");
+        let mut s = server();
+        s.catalog_id = "source:notion".into();
+        r.store.put_server("TEAM#a", &s).await.unwrap();
+        // A pending sign-in as an older gateway wrote it: a bare random
+        // state, no flow, no return path.
+        let state = oauth::new_state();
+        let pkce = oauth::Pkce::new();
+        r.store
+            .put_pending(
+                "TEAM#a",
+                &PendingAuth {
+                    key: oauth::state_key(&state),
+                    server_id: "docs".into(),
+                    owner: Owner::Team,
+                    user_sub: "USER#1".into(),
+                    user_email: "a@x.com".into(),
+                    verifier: pkce.verifier,
+                    issuer: "https://auth.example.com".into(),
+                    redirect_uri: "https://app.example.com/cb/".into(),
+                    expires_at: 2_000_000_000,
+                    flow: String::new(),
+                    return_to: String::new(),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(oauth::Flow::of_state(&state), None);
+        r.http.on(
+            Method::Post,
+            TOKEN,
+            fjson(200, json!({"access_token": "at-1", "token_type": "Bearer"})),
+        );
+        let done =
+            r.rt.finish(
+                &Answer {
+                    state: &state,
+                    code: Some("c"),
+                    iss: ISS,
+                    ..Default::default()
+                },
+                "USER#1",
+                "a@x.com",
+            )
+            .await
+            .unwrap();
+        assert_eq!(done.flow, oauth::Flow::Knowledge, "from the record");
+    }
+
+    #[tokio::test]
+    async fn a_failed_code_exchange_says_the_token_endpoints_reason() {
+        let r = rig("TEAM#a");
+        let mut s = server();
+        r.store.put_server("TEAM#a", &s).await.unwrap();
+        let url =
+            r.rt.start_sign_in(
+                &mut s,
+                &Owner::Team,
+                "USER#1",
+                "a@x.com",
+                "https://app.example.com/cb/",
+                None,
+            )
+            .await
+            .unwrap();
+        r.http.on(
+            Method::Post,
+            TOKEN,
+            fjson(400, json!({"error": "invalid_grant", "error_description": "authorization code expired"})),
+        );
+        let f =
+            r.rt.finish(
+                &Answer {
+                    state: &state_of(&url),
+                    code: Some("c"),
+                    iss: ISS,
+                    ..Default::default()
+                },
+                "USER#1",
+                "a@x.com",
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(f.code, "invalid_grant");
+        assert!(f.message.contains("authorization code expired"));
+        assert!(!f.message.contains("not granted"));
+    }
+
+    #[test]
+    fn provider_errors_are_told_as_the_provider_told_them() {
+        let bare = provider_error("Confluence", "access_denied", "");
+        assert!(
+            bare.contains("access_denied")
+                && bare.contains("Cancel")
+                && bare.contains("doesn't let this account")
+        );
+        let said = provider_error("Confluence", "access_denied", "User is not authorized");
+        assert!(said.contains("User is not authorized") && !said.contains("Cancel"));
+        assert!(provider_error("Notion", "invalid_scope", "").contains("scope"));
+        assert!(provider_error("", "server_error", "token exchange failed")
+            .starts_with("The sign-in page"));
+        assert!(
+            provider_error("X", "weird", "a\u{7}b").contains("ab"),
+            "control characters dropped"
+        );
+        assert_eq!(
+            display_name(&ServerRecord::new(
+                "ks-confluence",
+                "Confluence (knowledge)",
+                MCP
+            )),
+            "Confluence"
+        );
     }
 }

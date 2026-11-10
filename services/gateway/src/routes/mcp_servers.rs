@@ -820,7 +820,14 @@ pub async fn connect(
     Ok(Json(json!({ "authorize_url": url })))
 }
 
-/// POST /api/mcp-servers/oauth/callback { state, code?, error?, iss? }
+/// POST /api/mcp-servers/oauth/callback { state, code?, error?, error_description?, iss? }
+///
+/// The one place every OAuth sign-in that returns to the dashboard's
+/// callback page finishes (MCP servers, catalog apps, knowledge sources, and
+/// a hybrid install's sign-ins through CoderHelm's app). Whether it finishes
+/// or not, the answer says which kind of sign-in it was (`flow`) and where
+/// the page goes back to (`return_to`), so the page never guesses; a failure
+/// carries the provider's own error code and words.
 pub async fn oauth_callback(
     State(state): State<Arc<AppState>>,
     Extension(claims): Extension<Claims>,
@@ -831,21 +838,36 @@ pub async fn oauth_callback(
     if st.is_empty() || st.len() > 200 {
         return Err(fail(
             StatusCode::BAD_REQUEST,
-            "That sign-in link is missing its state.",
+            "That sign-in link is missing its state. Start the sign-in again.",
         ));
     }
     let rt = runtime(&state, &claims.team_id);
-    let (mut s, owner) = rt
-        .finish_sign_in(
-            st,
-            body["code"].as_str(),
-            body["error"].as_str().filter(|e| !e.is_empty()),
-            body["iss"].as_str().filter(|e| !e.is_empty()),
-            &claims.sub,
-            &claims.email,
-        )
-        .await
-        .map_err(|e| fail(StatusCode::BAD_REQUEST, &e))?;
+    let text = |k: &str| body[k].as_str().filter(|e| !e.trim().is_empty());
+    let answer = common::mcp_remote::runtime::Answer {
+        state: st,
+        code: text("code"),
+        error: text("error"),
+        error_description: text("error_description"),
+        iss: text("iss"),
+    };
+    let done = match rt.finish(&answer, &claims.sub, &claims.email).await {
+        Ok(d) => d,
+        Err(f) => {
+            warn!(
+                team = %rt.team,
+                flow = f.flow.map(|x| x.tag()).unwrap_or(""),
+                catalog = %f.catalog_id,
+                code = %f.code,
+                error = %f.message,
+                "OAuth sign-in didn't finish"
+            );
+            return Err(callback_failed(&f));
+        }
+    };
+    let flow = done.flow.tag();
+    let return_to = done.return_to.clone();
+    let owner = done.owner;
+    let mut s = done.server;
     // A catalog server's own-app sign-in has no tools either: its package
     // gets the token. Check the token with the vendor's API now, so a wrong
     // scope or an unpublished app shows on the card instead of in a run.
@@ -856,18 +878,22 @@ pub async fn oauth_callback(
             "server": { "id": s.id, "name": s.name, "catalog_id": catalog },
             "tools_error": checked.err(),
             "own_app": true,
+            "flow": flow,
+            "return_to": return_to,
         })));
     }
-    // List the tools now so the picker has them. A failure here leaves the
-    // connection saved; the status says why.
     // A knowledge source's sign-in has no tools to list.
     if common::knowledge::sources::oauth::is_source_connection(&s.catalog_id) {
         info!(team = %rt.team, server = %s.id, "Knowledge source connected");
         return Ok(Json(json!({
             "server": { "id": s.id, "name": s.name, "catalog_id": s.catalog_id },
             "tools_error": Value::Null,
+            "flow": flow,
+            "return_to": return_to,
         })));
     }
+    // List the tools now so the picker has them. A failure here leaves the
+    // connection saved; the status says why.
     let listed = rt.refresh_tool_list(&mut s, &owner).await;
     if let Err(e) = &listed {
         info!(team = %rt.team, server = %s.id, error = %e, "Tools not listed after sign-in");
@@ -877,7 +903,26 @@ pub async fn oauth_callback(
     Ok(Json(json!({
         "server": reply_server(&rt, &s, &claims).await,
         "tools_error": listed.err().map(|e| e.to_string()),
+        "flow": flow,
+        "return_to": return_to,
     })))
+}
+
+/// The callback's answer for a sign-in that didn't finish: the words, the
+/// provider's code, and where it came from, so the page shows the right
+/// title and sends the person back to the page that started it.
+pub fn callback_failed(f: &common::mcp_remote::runtime::Failed) -> (StatusCode, Json<Value>) {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(json!({
+            "error": f.message,
+            "code": f.code,
+            "flow": f.flow.map(|x| x.tag()),
+            "return_to": f.return_to,
+            "server_name": f.server_name,
+            "catalog_id": f.catalog_id,
+        })),
+    )
 }
 
 /// DELETE /api/mcp-servers/:id/connection — disconnect (and revoke) the
@@ -1142,5 +1187,32 @@ mod tests {
     fn detection_replies_carry_nothing_secret() {
         let d = Detected::Header;
         assert_eq!(detected_json(&d)["auth"], "header");
+    }
+
+    #[test]
+    fn a_failed_callback_says_where_it_came_from() {
+        let f = common::mcp_remote::runtime::Failed {
+            message: "Confluence didn't grant access (access_denied).".into(),
+            code: "access_denied".into(),
+            flow: Some(oauth::Flow::Knowledge),
+            return_to: "/knowledge/".into(),
+            server_name: "Confluence".into(),
+            catalog_id: "source:confluence".into(),
+        };
+        let (status, Json(v)) = callback_failed(&f);
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            v,
+            json!({
+                "error": "Confluence didn't grant access (access_denied).",
+                "code": "access_denied",
+                "flow": "ks",
+                "return_to": "/knowledge/",
+                "server_name": "Confluence",
+                "catalog_id": "source:confluence",
+            })
+        );
+        let unmatched = common::mcp_remote::runtime::Failed { flow: None, ..f };
+        assert_eq!(callback_failed(&unmatched).1 .0["flow"], Value::Null);
     }
 }

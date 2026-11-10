@@ -179,6 +179,8 @@ pub struct Starter<'a> {
     pub added_at: &'a str,
     /// The callback page, exactly as registered with the provider's app.
     pub redirect_uri: &'a str,
+    /// The dashboard page the sign-in goes back to (empty: Knowledge).
+    pub return_to: &'a str,
 }
 
 /// Why a sign-in didn't start.
@@ -236,13 +238,15 @@ pub async fn start_sign_in(
         .put_server(&rt.team, &rec)
         .await
         .map_err(StartError::Internal)?;
-    rt.start_sign_in(
+    rt.start_sign_in_for(
         &mut rec,
         &Owner::Team,
         who.user_sub,
         who.user_email,
         who.redirect_uri,
         None,
+        Some(crate::mcp_remote::oauth::Flow::Knowledge),
+        who.return_to,
     )
     .await
     .map_err(StartError::Refused)
@@ -379,6 +383,7 @@ mod tests {
             user_email: "ada@example.com",
             added_at: "2026-10-26T00:00:00Z",
             redirect_uri: REDIRECT,
+            return_to: "/knowledge/base/?id=kb1",
         }
     }
 
