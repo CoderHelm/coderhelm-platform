@@ -8293,6 +8293,7 @@ async fn mark_unbuilt_needs_input(
         usage.mark_recorded(&delta);
     }
     self::webhooks::emit_run(state, &msg.team_id, run_id, "needs_input").await;
+    release_blocked_pr(state, msg).await;
 }
 
 /// The ticket's address, when it is a GitHub issue (empty otherwise).
@@ -8369,6 +8370,7 @@ async fn mark_run_needs_input(
         usage.mark_recorded(&delta);
     }
     self::webhooks::emit_run(state, &msg.team_id, run_id, "needs_input").await;
+    release_blocked_pr(state, msg).await;
 
     // Update analytics counters
     let analytics_month = chrono::Utc::now().format("%Y-%m").to_string();
@@ -8425,6 +8427,7 @@ pub(crate) async fn mark_run_stopped_by_guard(
         warn!(run_id, error = %e, "Could not hand the stopped run to a person");
     }
     self::webhooks::emit_run(state, &msg.team_id, run_id, "needs_input").await;
+    release_blocked_pr(state, msg).await;
 }
 
 /// Stop a Jira run whose ticket belongs in a repo that isn't connected or
@@ -8710,6 +8713,14 @@ fn budget_reason(hit: &common::token_limits::LimitUse) -> String {
     }
 }
 
+/// A separate test fix that ended without a pull request releases the pull
+/// request it was blocking (see `e2e_attribution::fix_ended_without_pr`).
+async fn release_blocked_pr(state: &WorkerState, msg: &TicketMessage) {
+    if msg.ticket_id.starts_with(e2e_attribution::FIX_PREFIX) {
+        e2e_attribution::fix_ended_without_pr(state, &msg.team_id, &msg.ticket_id).await;
+    }
+}
+
 async fn fail_run(
     state: &WorkerState,
     msg: &TicketMessage,
@@ -8749,7 +8760,8 @@ async fn fail_run(
     {
         Ok(true) => {
             usage.mark_recorded(&delta);
-            self::webhooks::emit_run(state, &msg.team_id, run_id, "failed").await
+            self::webhooks::emit_run(state, &msg.team_id, run_id, "failed").await;
+            release_blocked_pr(state, msg).await
         }
         // Cancelled or merged meanwhile: nothing failed, so nothing to tell.
         Ok(false) => return,

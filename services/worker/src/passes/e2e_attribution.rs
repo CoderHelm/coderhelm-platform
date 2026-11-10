@@ -52,7 +52,15 @@ impl Record {
         !runs.is_empty()
             && runs.iter().all(|r| self.runs.contains(r))
             && !self.tests.is_empty()
-            && self.tests.iter().all(|t| t.verdict == Verdict::Unrelated)
+            && self.tests.iter().all(Attribution::blocks)
+    }
+
+    /// Every saved verdict under the rules as they stand now.
+    pub fn settled(mut self) -> Self {
+        for t in &mut self.tests {
+            t.settle();
+        }
+        self
     }
 
     pub fn blocked_lines(&self) -> Vec<String> {
@@ -79,7 +87,9 @@ pub async fn load(state: &WorkerState, team_id: &str, repo: &str, sha: &str) -> 
         .ok()?
         .item
         .clone()?;
-    serde_json::from_str(item.get("data")?.as_s().ok()?).ok()
+    serde_json::from_str::<Record>(item.get("data")?.as_s().ok()?)
+        .ok()
+        .map(Record::settled)
 }
 
 async fn save(state: &WorkerState, team_id: &str, repo: &str, sha: &str, r: &Record) {
@@ -370,6 +380,7 @@ pub async fn attribute(
             reason,
             verdict,
             fix_pr: None,
+            fix_failed: false,
             source: f.source.clone(),
         });
     }
@@ -537,9 +548,17 @@ pub async fn handle_own_pr(
     failing: &[&ParsedTest],
 ) -> Vec<Attribution> {
     let full = format!("{}/{}", msg.repo_owner, msg.repo_name);
-    let found = attribute(state, gh, msg, failing).await;
+    let mut found = attribute(state, gh, msg, failing).await;
     if found.is_empty() {
         return found;
+    }
+    // An unrelated test whose separate fix already ended without a pull
+    // request is never waited on again (that fix is not started twice):
+    // the fix loop takes it.
+    for t in found.iter_mut().filter(|t| t.verdict == Verdict::Unrelated) {
+        if let Some(seed) = load_seed(state, &msg.team_id, &fix_ticket_id(pr, &t.test)).await {
+            t.fix_failed |= seed.attribution.fix_failed;
+        }
     }
     let mut rec = load(state, &msg.team_id, &full, &msg.head_sha)
         .await
@@ -573,7 +592,7 @@ pub async fn handle_own_pr(
         .await
         .map(|(id, _)| id)
         .unwrap_or_default();
-    for a in found.iter().filter(|a| a.verdict == Verdict::Unrelated) {
+    for a in found.iter().filter(|a| a.blocks()) {
         if start_fix(state, msg, pr, &run_id, a).await {
             let _ = gh
                 .create_issue_comment(&msg.repo_owner, &msg.repo_name, pr, &a.reply())
@@ -584,6 +603,57 @@ pub async fn handle_own_pr(
         }
     }
     found
+}
+
+/// Called when a test-fix run ends without a pull request (failed, or
+/// stopped with questions): nothing will fix the test there, so the
+/// original pull request is no longer blocked on it and its own fix rounds
+/// take the failure, and its run page stops saying it is blocked.
+pub async fn fix_ended_without_pr(state: &WorkerState, team_id: &str, ticket_id: &str) {
+    let Some(seed) = load_seed(state, team_id, ticket_id).await else {
+        return;
+    };
+    let full = format!("{}/{}", seed.owner, seed.repo);
+    if let Some(mut rec) = load(state, team_id, &full, &seed.sha).await {
+        if let Some(t) = rec
+            .tests
+            .iter_mut()
+            .find(|t| t.test == seed.attribution.test && t.fix_pr.is_none())
+        {
+            t.fix_failed = true;
+            save(state, team_id, &full, &seed.sha, &rec).await;
+            info!(repo = %full, pr = seed.pr, test = %seed.attribution.test, "Test fix ended without a pull request; the original is no longer blocked on it");
+        }
+    }
+    // Later commits of the pull request read it from the seed: one fix per
+    // test per pull request, so they never wait on that fix again.
+    let mut ended = seed.clone();
+    ended.attribution.fix_failed = true;
+    let _ = state
+        .dynamo
+        .update_item()
+        .table_name(&state.config.settings_table_name)
+        .key("pk", super::attr_s(team_id))
+        .key("sk", super::attr_s(&seed_sk(ticket_id)))
+        .update_expression("SET #d = :d")
+        .expression_attribute_names("#d", "data")
+        .expression_attribute_values(
+            ":d",
+            super::attr_s(&serde_json::to_string(&ended).unwrap_or_default()),
+        )
+        .send()
+        .await;
+    if !seed.run_id.is_empty() {
+        let _ = state
+            .dynamo
+            .update_item()
+            .table_name(&state.config.runs_table_name)
+            .key("team_id", super::attr_s(team_id))
+            .key("run_id", super::attr_s(&seed.run_id))
+            .update_expression("REMOVE ci_blocked_on")
+            .send()
+            .await;
+    }
 }
 
 /// Called when a test-fix run opened its pull request: links it from the
@@ -655,6 +725,41 @@ mod tests {
             ..rec
         };
         assert!(!related.blocks(&[100]));
+    }
+
+    /// The observed pull request: its own new spec failed, the old rule
+    /// called it unrelated and its separate fix ended without a pull
+    /// request, so it stayed blocked. Read under the current rules it is
+    /// not blocked; and a failed fix never blocks.
+    #[test]
+    fn a_stale_or_dead_unrelated_verdict_never_blocks_the_pull_request() {
+        let spec = "e2e/tests/site/venue-subnav-more-menu.spec.ts";
+        let saved = Record {
+            pr: 1501,
+            runs: vec![100],
+            tests: vec![Attribution {
+                test: "More menu on a phone".into(),
+                file: spec.into(),
+                diff: vec![spec.into()],
+                verdict: Verdict::Unrelated,
+                ..Default::default()
+            }],
+        };
+        assert!(saved.blocks(&[100]), "as saved under the old rule");
+        let now = saved.settled();
+        assert!(!now.blocks(&[100]));
+        assert_eq!(now.tests[0].verdict, Verdict::Related);
+        assert!(now.blocked_lines().is_empty());
+
+        let mut dead = Record {
+            pr: 7,
+            runs: vec![100],
+            tests: vec![att(Verdict::Unrelated)],
+        };
+        assert!(dead.blocks(&[100]));
+        dead.tests[0].fix_failed = true;
+        assert!(!dead.blocks(&[100]));
+        assert!(dead.blocked_lines().is_empty());
     }
 
     #[test]
