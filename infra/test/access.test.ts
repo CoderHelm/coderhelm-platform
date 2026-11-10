@@ -533,3 +533,21 @@ test("no install role and no boundary may change DNS: no Route 53 write anywhere
     }
   }
 });
+
+// Envelope sealing (services/common/src/envelope.rs): the worker makes data
+// keys for renewed sign-ins over KMS's direct 4 KB, inside the boundary.
+test("boundary: a hardened install's worker may make a data key for a sign-in's tokens", () => {
+  const everything: PolicyDocument = { Version: "2012-10-17", Statement: [{ Sid: "All", Effect: "Allow", Action: "*", Resource: "*" }] };
+  const key = `arn:aws:kms:us-west-2:${ACCOUNT}:key/00000000-0000-0000-0000-000000000000`;
+  for (const action of ["kms:GenerateDataKey", "kms:Encrypt", "kms:Decrypt"]) {
+    assert.ok(allowed([everything], BOUNDARY, { action, resource: key, context: { "kms:EncryptionContext:purpose": "mcp-oauth-token" } }), action);
+  }
+  const t = hardened();
+  const statements = Object.values<any>(t["coderhelm-prod-worker"].Resources)
+    .filter((r) => r.Type === "AWS::IAM::Policy" || r.Type === "AWS::IAM::ManagedPolicy")
+    .flatMap((p) => p.Properties.PolicyDocument.Statement as any[]);
+  const seal = statements.find((s) => JSON.stringify(s.Condition ?? {}).includes("mcp-oauth-token"));
+  assert.ok(seal, "the worker seals sign-in tokens");
+  assert.deepEqual([...list(seal.Action)].sort(), ["kms:Encrypt", "kms:GenerateDataKey"]);
+  assert.deepEqual(seal.Condition, { StringEquals: { "kms:EncryptionContext:purpose": "mcp-oauth-token" } });
+});

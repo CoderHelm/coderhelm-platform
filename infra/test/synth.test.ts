@@ -1122,3 +1122,25 @@ test("hosted SES templates escape every value (double braces, never triple)", ()
   assert.equal(src.includes("{{{"), false);
   assert.equal(src.includes("{{&"), false);
 });
+
+// Sealed values over KMS's direct 4 KB (an Atlassian sign-in's tokens) are
+// sealed in an envelope: a data key from GenerateDataKey under the same
+// encryption context (services/common/src/envelope.rs). Whoever seals needs
+// it; opening one needs only Decrypt.
+test("sealing: the gateway and the worker may make data keys for envelopes, hosted and self-hosted", () => {
+  const kmsStatements = (t: Template) =>
+    ([...Object.values(t.findResources("AWS::IAM::Policy")), ...Object.values(t.findResources("AWS::IAM::ManagedPolicy"))] as any[]).flatMap((p) => p.Properties.PolicyDocument.Statement as any[]).filter((s) => ([] as string[]).concat(s.Action).some((a) => a.startsWith("kms:")));
+  for (const t of [synth(loadConfigFile(path.join(INFRA, "config", "hosted.prod.json"), { CDK_DEFAULT_ACCOUNT: "654654210434" }), zoneContext("654654210434", "us-east-1", "coderhelm.com")), synth(selfHost())]) {
+    const worker = kmsStatements(t["coderhelm-prod-worker"]);
+    const seal = worker.find((s) => JSON.stringify(s.Condition ?? {}).includes("mcp-oauth-token"));
+    assert.ok(seal, "the worker seals renewed sign-ins");
+    assert.deepEqual([...seal.Action].sort(), ["kms:Encrypt", "kms:GenerateDataKey"]);
+    // Still only for sign-in tokens.
+    assert.deepEqual(seal.Condition, { StringEquals: { "kms:EncryptionContext:purpose": "mcp-oauth-token" } });
+    assert.ok(worker.some((s) => ([] as string[]).concat(s.Action).includes("kms:Decrypt")), "the worker opens data keys");
+    const gateway = kmsStatements(t["coderhelm-prod-api"]);
+    const both = gateway.find((s) => ([] as string[]).concat(s.Action).includes("kms:Encrypt"));
+    assert.ok(both, "the gateway seals");
+    for (const a of ["kms:Decrypt", "kms:GenerateDataKey*"]) assert.ok(([] as string[]).concat(both.Action).includes(a), `gateway lacks ${a}`);
+  }
+});

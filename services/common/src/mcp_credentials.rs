@@ -1,7 +1,8 @@
 //! Sealed credentials for a team's MCP servers (Figma, Sentry, Sanity, ...).
 //!
 //! The values a team saves for an MCP server are encrypted by KMS before they
-//! are stored, with the team and the server bound into the encryption
+//! are stored (directly, or in an envelope when larger than KMS takes:
+//! [`crate::envelope`]), with the team and the server bound into the encryption
 //! context: the stored value opens only for that team and that server, so an
 //! item copied under another team or another server will not decrypt. Values
 //! are opened at the moment a call needs them and are never returned by an API
@@ -23,8 +24,8 @@ pub const SEALED_ATTR: &str = "credentials_sealed";
 pub const PLAIN_ATTR: &str = "credentials";
 const PREFIX: &str = "PLUGIN#";
 const PURPOSE: &str = "mcp-credentials";
-/// KMS encrypts at most 4 KiB directly.
-pub const MAX_PLAINTEXT_BYTES: usize = 4096;
+/// The most one sealed value may hold ([`crate::envelope::MAX_SEALED_BYTES`]).
+pub const MAX_PLAINTEXT_BYTES: usize = crate::envelope::MAX_SEALED_BYTES;
 
 type Item = HashMap<String, AttributeValue>;
 pub type Credentials = HashMap<String, String>;
@@ -54,15 +55,18 @@ pub trait Cipher: Send + Sync {
     ) -> Result<Vec<u8>, String>;
 }
 
-/// KMS with the secrets key. `key_id` is needed only to encrypt.
+/// KMS with the secrets key. `key_id` is needed only to encrypt. As a
+/// [`Cipher`] it seals a value directly when KMS takes it whole, and in an
+/// envelope (`GenerateDataKey`, AES-256-GCM) when it is larger
+/// ([`crate::envelope`]); it opens both.
 pub struct Kms<'a> {
     pub client: &'a aws_sdk_kms::Client,
     pub key_id: &'a str,
 }
 
 #[async_trait::async_trait]
-impl Cipher for Kms<'_> {
-    async fn encrypt(
+impl crate::envelope::Keys for Kms<'_> {
+    async fn encrypt_direct(
         &self,
         context: HashMap<String, String>,
         plaintext: &[u8],
@@ -83,7 +87,32 @@ impl Cipher for Kms<'_> {
         Ok(blob.as_ref().to_vec())
     }
 
-    async fn decrypt(
+    async fn generate_data_key(
+        &self,
+        context: HashMap<String, String>,
+    ) -> Result<crate::envelope::DataKey, String> {
+        if self.key_id.is_empty() {
+            return Err("no secrets key configured".to_string());
+        }
+        let out = self
+            .client
+            .generate_data_key()
+            .key_id(self.key_id)
+            .key_spec(aws_sdk_kms::types::DataKeySpec::Aes256)
+            .set_encryption_context(Some(context))
+            .send()
+            .await
+            .map_err(|e| format!("kms generate data key: {e}"))?;
+        let (Some(plain), Some(encrypted)) = (out.plaintext(), out.ciphertext_blob()) else {
+            return Err("kms returned no data key".to_string());
+        };
+        Ok(crate::envelope::DataKey {
+            plaintext: plain.as_ref().to_vec(),
+            encrypted: encrypted.as_ref().to_vec(),
+        })
+    }
+
+    async fn decrypt_direct(
         &self,
         context: HashMap<String, String>,
         blob: &[u8],
@@ -101,6 +130,25 @@ impl Cipher for Kms<'_> {
     }
 }
 
+#[async_trait::async_trait]
+impl Cipher for Kms<'_> {
+    async fn encrypt(
+        &self,
+        context: HashMap<String, String>,
+        plaintext: &[u8],
+    ) -> Result<Vec<u8>, String> {
+        crate::envelope::seal(self, context, plaintext).await
+    }
+
+    async fn decrypt(
+        &self,
+        context: HashMap<String, String>,
+        blob: &[u8],
+    ) -> Result<Vec<u8>, String> {
+        crate::envelope::open(self, context, blob).await
+    }
+}
+
 /// Encrypts `creds` for one team's server. Returns text safe to store.
 pub async fn seal(
     cipher: &dyn Cipher,
@@ -109,8 +157,10 @@ pub async fn seal(
     creds: &Credentials,
 ) -> Result<String, String> {
     let json = serde_json::to_vec(creds).map_err(|_| "credentials are not valid".to_string())?;
-    if json.len() > MAX_PLAINTEXT_BYTES {
-        return Err("credentials are too long".to_string());
+    if let Some(e) =
+        crate::envelope::too_large(&format!("The values saved for {plugin_id}"), json.len())
+    {
+        return Err(e);
     }
     let blob = cipher.encrypt(context(team_id, plugin_id), &json).await?;
     Ok(STANDARD.encode(blob))
@@ -365,7 +415,27 @@ mod tests {
     #[tokio::test]
     async fn too_long_is_refused() {
         let big = HashMap::from([("k".to_string(), "x".repeat(MAX_PLAINTEXT_BYTES))]);
-        assert!(seal(&Fake, "TEAM#a", "figma", &big).await.is_err());
+        let e = seal(&Fake, "TEAM#a", "figma", &big).await.unwrap_err();
+        assert!(e.contains("figma") && e.contains("64 KB"), "{e}");
+    }
+
+    /// Values over KMS's direct 4 KB seal in an envelope and open again,
+    /// still bound to the team and server; values sealed directly before
+    /// envelopes still open.
+    #[tokio::test]
+    async fn large_values_seal_in_an_envelope() {
+        use crate::envelope::{testing::FakeKeys, Enveloped, MAGIC};
+        let c = Enveloped(FakeKeys::default());
+        let big = HashMap::from([("service_account".to_string(), "k".repeat(9000))]);
+        let sealed = seal(&c, "TEAM#a", "gdrive", &big).await.unwrap();
+        assert!(STANDARD.decode(&sealed).unwrap().starts_with(MAGIC));
+        assert_eq!(open(&c, "TEAM#a", "gdrive", &sealed).await.unwrap(), big);
+        assert!(open(&c, "TEAM#b", "gdrive", &sealed).await.is_err());
+        let old = STANDARD.encode(FakeKeys::wrap(
+            &context("TEAM#a", "figma"),
+            &serde_json::to_vec(&creds()).unwrap(),
+        ));
+        assert_eq!(open(&c, "TEAM#a", "figma", &old).await.unwrap(), creds());
     }
 
     #[tokio::test]

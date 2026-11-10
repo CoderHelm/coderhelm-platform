@@ -171,7 +171,14 @@ pub fn view(item: &Item) -> Value {
 }
 
 /// Encrypts a webhook URL for `team_id`. Returns text safe to store.
+///
+/// Always KMS directly, never an envelope: the log analyzer opens these with
+/// KMS `Decrypt` itself (lambda/log-analyzer/handler.py, `open_webhook`), and
+/// a webhook URL is far under KMS's 4 KB (the checks allow 1,000 characters).
 pub async fn seal(cipher: &dyn Cipher, team_id: &str, url: &str) -> Result<String, String> {
+    if url.len() > crate::envelope::KMS_DIRECT_MAX {
+        return Err("That webhook URL is too long to store.".to_string());
+    }
     let blob = cipher.encrypt(context(team_id), url.as_bytes()).await?;
     Ok(STANDARD.encode(blob))
 }
