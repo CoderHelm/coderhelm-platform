@@ -20,6 +20,13 @@
  * needs the permissions boundary to allow bedrock:Retrieve, which reaches an
  * install only through the access stack an AWS admin applies (native/access-stack.ts).
  *
+ * Copying a team's chosen knowledge bases into Bedrock (services/common/src/knowledge/bedrock_sync.rs)
+ * never uses the install's own role to write a knowledge base: the template's
+ * SyncKnowledgeBases is empty here, so this policy and the permissions boundary stay as
+ * they were. A self-hosted install copies into an S3 folder its own stack lets it write
+ * (infra/cfn/coderhelm-bedrock-export.yaml, a bucket named with the install's prefix),
+ * and that stack's own schedule starts the data source's syncs.
+ *
  * Knowledge imports from S3 (services/common/src/knowledge/sources/s3.rs) never
  * use the install's own role: the template's ImportBuckets is empty here, so
  * the role gains no read on the account's buckets. An import reads a bucket
@@ -40,7 +47,13 @@ const ROLE_NAME_MARK = "__CODERHELM_ROLE__";
 /** The install's own role searches every knowledge base in its own account. */
 const OWN_KNOWLEDGE_BASES = "all";
 /** The template's conditions for that value. A condition not listed here fails the build. */
-const OWN_CONDITIONS: Record<string, boolean> = { ReadsKnowledgeBases: true, ReadsEveryKnowledgeBase: true, ReadsImportBuckets: false };
+const OWN_CONDITIONS: Record<string, boolean> = {
+  ReadsKnowledgeBases: true,
+  ReadsEveryKnowledgeBase: true,
+  ReadsImportBuckets: false,
+  SyncsKnowledgeBases: false,
+  SyncsEveryKnowledgeBase: false,
+};
 
 type Statement = { Sid?: string; Effect: string; Action: string | string[]; Resource: unknown };
 
@@ -67,7 +80,7 @@ export function decideConditions(v: unknown, conditions: Record<string, boolean>
 /** The update template's statements for the install's own role: its knowledge bases are every one in its account. */
 export function updateTemplateStatements(): Statement[] {
   const scratch = new cdk.Stack(new cdk.App(), "Scratch");
-  const inc = new CfnInclude(scratch, "T", { templateFile: repoPath(UPDATE_TEMPLATE), parameters: { RoleName: ROLE_NAME_MARK, KnowledgeBases: OWN_KNOWLEDGE_BASES, ImportBuckets: "" } });
+  const inc = new CfnInclude(scratch, "T", { templateFile: repoPath(UPDATE_TEMPLATE), parameters: { RoleName: ROLE_NAME_MARK, KnowledgeBases: OWN_KNOWLEDGE_BASES, ImportBuckets: "", SyncKnowledgeBases: "" } });
   const p = inc.getResource(UPDATE_POLICY_ID) as iam.CfnPolicy;
   return decideConditions(scratch.resolve(p.policyDocument).Statement, OWN_CONDITIONS) as Statement[];
 }

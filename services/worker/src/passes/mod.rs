@@ -1056,6 +1056,7 @@ pub mod agent_tools;
 pub mod alert_episodes;
 pub mod await_merge;
 pub mod aws_permissions;
+pub mod bedrock_sync;
 mod branch_update;
 mod checks;
 pub mod code_graph;

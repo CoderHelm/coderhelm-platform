@@ -184,10 +184,17 @@ test("self-host: the gateway and worker read the install's own account with this
   // Knowledge imports from S3 read a bucket only with the team's CoderHelmLogReader role, whose stack
   // names each bucket (services/common/src/knowledge/sources/s3.rs): the install's own role never gains
   // read on the account's buckets.
-  const importsAt = all.indexOf('key: "imports"');
-  assert.ok(importsAt > 0, "the imports ability");
-  const nextAt = all.indexOf("Ability {", importsAt);
-  const abilities = all.slice(0, importsAt) + (nextAt > 0 ? all.slice(nextAt) : "");
+  // Copying into Bedrock likewise writes a knowledge base only with that role (hosted, or another
+  // account); a self-hosted install copies into an S3 folder its own export stack opens to it
+  // (services/common/src/knowledge/bedrock_sync.rs), so its own role gains no knowledge base writes.
+  const without = (src: string, key: string) => {
+    const at = src.indexOf(`key: "${key}"`);
+    assert.ok(at > 0, `the ${key} ability`);
+    const start = src.lastIndexOf("Ability {", at);
+    const next = src.indexOf("Ability {", at);
+    return src.slice(0, start) + (next > 0 ? src.slice(next) : "");
+  };
+  const abilities = without(without(all, "imports"), "sync");
   const needed = [...new Set([...abilities.matchAll(/"([a-z0-9-]+:[A-Za-z]+)"/g)].map((m) => m[1]))];
   assert.ok(needed.length > 20, `${needed.length} actions`);
   for (const [stack, fn] of [

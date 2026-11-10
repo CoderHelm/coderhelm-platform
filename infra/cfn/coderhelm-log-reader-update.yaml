@@ -3,8 +3,10 @@ Description: >
   Brings the existing CoderHelmLogReader role up to date with the read-only
   permissions the current CoderHelm release uses, lets it search the
   Bedrock knowledge bases named in KnowledgeBases, and lets it read the
-  documents in the S3 buckets named in ImportBuckets. Every permission here is
-  read-only: CoderHelm can list, describe and query, never change anything.
+  documents in the S3 buckets named in ImportBuckets. Every permission is
+  read-only (list, describe and query), except one you opt into: copying
+  your chosen CoderHelm knowledge bases into the Bedrock knowledge bases
+  named in SyncKnowledgeBases.
   It only adds: to drop a permission an older release granted, update the
   CoderHelmLogReader stack itself with the current role template.
   Created from the dashboard's Update link; you can delete older
@@ -37,10 +39,24 @@ Parameters:
     AllowedPattern: "^(|[a-z0-9][a-z0-9.-]{1,61}[a-z0-9](,[a-z0-9][a-z0-9.-]{1,61}[a-z0-9])*)$"
     ConstraintDescription: Bucket names separated by commas, or empty.
 
+  SyncKnowledgeBases:
+    Type: String
+    Default: ""
+    Description: >
+      Bedrock knowledge bases CoderHelm may copy your chosen CoderHelm
+      knowledge bases into: their ARNs separated by commas, or "all" for every
+      knowledge base in this account. CoderHelm adds, updates and removes only
+      the documents it copied there, and starts syncs of their data sources.
+      Empty: none (the role writes to no knowledge base).
+    AllowedPattern: "^(|all|arn:aws:bedrock:[a-z0-9-]+:[0-9]{12}:knowledge-base/[A-Z0-9]{10}(,arn:aws:bedrock:[a-z0-9-]+:[0-9]{12}:knowledge-base/[A-Z0-9]{10})*)$"
+    ConstraintDescription: Knowledge base ARNs separated by commas, "all", or empty.
+
 Conditions:
   ReadsKnowledgeBases: !Not [!Equals [!Ref KnowledgeBases, ""]]
   ReadsEveryKnowledgeBase: !Equals [!Ref KnowledgeBases, "all"]
   ReadsImportBuckets: !Not [!Equals [!Ref ImportBuckets, ""]]
+  SyncsKnowledgeBases: !Not [!Equals [!Ref SyncKnowledgeBases, ""]]
+  SyncsEveryKnowledgeBase: !Equals [!Ref SyncKnowledgeBases, "all"]
 
 Resources:
   CoderHelmReadOnlyUpdate:
@@ -198,4 +214,26 @@ Resources:
               Condition:
                 StringLike:
                   kms:ViaService: "s3.*.amazonaws.com"
+            - !Ref AWS::NoValue
+          # Copying knowledge into Bedrock: only into the knowledge bases named in
+          # SyncKnowledgeBases (or every one in this account with "all"). Adds,
+          # updates and removes documents of a custom data source, and starts a
+          # sync of an S3 data source; nothing else in a knowledge base changes.
+          - !If
+            - SyncsKnowledgeBases
+            - Sid: SyncKnowledgeBases
+              Effect: Allow
+              Action:
+                - "bedrock:IngestKnowledgeBaseDocuments"
+                - "bedrock:DeleteKnowledgeBaseDocuments"
+                - "bedrock:GetKnowledgeBaseDocuments"
+                - "bedrock:ListKnowledgeBaseDocuments"
+                - "bedrock:StartIngestionJob"
+                - "bedrock:GetIngestionJob"
+                - "bedrock:GetKnowledgeBase"
+                - "bedrock:GetDataSource"
+              Resource: !If
+                - SyncsEveryKnowledgeBase
+                - !Sub "arn:aws:bedrock:*:${AWS::AccountId}:knowledge-base/*"
+                - !Split [",", !Ref SyncKnowledgeBases]
             - !Ref AWS::NoValue

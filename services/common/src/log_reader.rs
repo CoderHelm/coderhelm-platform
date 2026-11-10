@@ -156,6 +156,30 @@ pub const ABILITIES: &[Ability] = &[
         ],
         chosen: true,
     },
+    Ability {
+        key: "sync",
+        name: "Copying knowledge into Bedrock",
+        why: "Adds, updates and removes the documents Coderhelm copies into the Bedrock knowledge bases a team names for it (a custom data source), and starts a sync of the S3 data source it writes to. Only the knowledge bases named in the stack's SyncKnowledgeBases parameter, and only when a team turns it on; nothing else in them is read or changed.",
+        actions: &[
+            "bedrock:IngestKnowledgeBaseDocuments",
+            "bedrock:DeleteKnowledgeBaseDocuments",
+            "bedrock:GetKnowledgeBaseDocuments",
+            "bedrock:ListKnowledgeBaseDocuments",
+            "bedrock:StartIngestionJob",
+            "bedrock:GetIngestionJob",
+            "bedrock:GetKnowledgeBase",
+            "bedrock:GetDataSource",
+        ],
+        chosen: true,
+    },
+];
+
+/// The only actions that change anything, all in [`ability`] `sync` and
+/// granted only on the knowledge bases a team names in SyncKnowledgeBases.
+pub const SYNC_WRITES: &[&str] = &[
+    "bedrock:IngestKnowledgeBaseDocuments",
+    "bedrock:DeleteKnowledgeBaseDocuments",
+    "bedrock:StartIngestionJob",
 ];
 
 /// What a team chose for the role in one account: the knowledge bases it
@@ -165,6 +189,8 @@ pub const ABILITIES: &[Ability] = &[
 pub struct Chosen<'a> {
     pub knowledge_bases: &'a [String],
     pub buckets: &'a [String],
+    /// Knowledge bases Coderhelm copies a team's knowledge into.
+    pub sync_knowledge_bases: &'a [String],
 }
 
 impl<'a> Chosen<'a> {
@@ -172,11 +198,22 @@ impl<'a> Chosen<'a> {
         Chosen {
             knowledge_bases,
             buckets,
+            sync_knowledge_bases: &[],
+        }
+    }
+
+    /// The same, also writing into `sync` (bedrock_sync).
+    pub fn with_sync(self, sync: &'a [String]) -> Chosen<'a> {
+        Chosen {
+            sync_knowledge_bases: sync,
+            ..self
         }
     }
 
     pub fn is_empty(&self) -> bool {
-        self.knowledge_bases.is_empty() && self.buckets.is_empty()
+        self.knowledge_bases.is_empty()
+            && self.buckets.is_empty()
+            && self.sync_knowledge_bases.is_empty()
     }
 }
 
@@ -367,6 +404,12 @@ pub fn update_url(update_template_url: &str, region: &str, chosen: &Chosen) -> S
             urlencoding::encode(&chosen.buckets.join(","))
         ));
     }
+    if !chosen.sync_knowledge_bases.is_empty() {
+        u.push_str(&format!(
+            "&param_SyncKnowledgeBases={}",
+            urlencoding::encode(&chosen.sync_knowledge_bases.join(","))
+        ));
+    }
     u
 }
 
@@ -389,6 +432,11 @@ pub fn update_stack_name_for(chosen: &Chosen) -> String {
     if !chosen.buckets.is_empty() {
         seed.push('|');
         seed.push_str(&sorted(chosen.buckets).join(","));
+    }
+    // Copying into Bedrock is its own part, so the names before it stay.
+    if !chosen.sync_knowledge_bases.is_empty() {
+        seed.push_str("|sync:");
+        seed.push_str(&sorted(chosen.sync_knowledge_bases).join(","));
     }
     format!(
         "{}-kb{}",
@@ -446,7 +494,7 @@ mod tests {
         let ok_reads = ["logs:StartQuery", "logs:StopQuery", "airflow:InvokeRestApi"];
         for a in all_actions() {
             let verb = a.split(':').nth(1).unwrap();
-            if ok_reads.contains(&a) {
+            if ok_reads.contains(&a) || SYNC_WRITES.contains(&a) {
                 continue;
             }
             assert!(
@@ -462,8 +510,25 @@ mod tests {
             assert!(!t.contains("bedrock:Retrieve\"\n                - \"bedrock:Rerank"));
             assert!(
                 !template_actions(t).iter().any(|x| x.starts_with("bedrock:")
-                    && !ability("knowledge").unwrap().actions.contains(&x.as_str()))
+                    && !ability("knowledge").unwrap().actions.contains(&x.as_str())
+                    && !ability("sync").unwrap().actions.contains(&x.as_str()))
             );
+            // The writes: only into the knowledge bases named for copying.
+            assert!(t.contains("- Sid: SyncKnowledgeBases"));
+            assert!(t.contains("!Split [\",\", !Ref SyncKnowledgeBases]"));
+            assert!(
+                t.contains("SyncsKnowledgeBases: !Not [!Equals [!Ref SyncKnowledgeBases, \"\"]]")
+            );
+            let sync_block = t.split("- Sid: SyncKnowledgeBases").nth(1).unwrap();
+            let sync_block = sync_block.split("- !Ref AWS::NoValue").next().unwrap();
+            for w in SYNC_WRITES {
+                assert!(sync_block.contains(&format!("\"{w}\"")), "{w}");
+                assert_eq!(
+                    t.matches(&format!("\"{w}\"")).count(),
+                    1,
+                    "{w} only in the sync statement"
+                );
+            }
             // Imports: read objects only in the buckets named, decrypt only
             // through S3.
             assert!(t.contains("- Sid: ReadImportBuckets"));
@@ -624,7 +689,20 @@ mod tests {
         assert!(!checked.contains(&"bedrock:Retrieve"));
         assert!(!checked.contains(&"s3:GetObject"));
         assert!(checked.contains(&"logs:StartQuery"));
-        assert_eq!(checked.len() + 10, all_actions().len());
+        // Knowledge bases (6), imports (4) and copying into Bedrock (6 more:
+        // its Get calls are the knowledge bases' too).
+        assert_eq!(checked.len() + 16, all_actions().len());
+        assert!(!checked.contains(&"bedrock:IngestKnowledgeBaseDocuments"));
+        // Copying into Bedrock rides along as its own parameter and stack.
+        let sync = ["arn:aws:bedrock:us-east-1:111122223333:knowledge-base/SYNC123456".to_string()];
+        let c = Chosen::new(kbs, &buckets).with_sync(&sync);
+        let u = update_url("https://b/x/y.yaml", "us-east-1", &c);
+        assert!(u.contains("&param_SyncKnowledgeBases=arn%3Aaws%3Abedrock%3Aus-east-1%3A111122223333%3Aknowledge-base%2FSYNC123456"), "{u}");
+        assert_ne!(
+            update_stack_name_for(&c),
+            update_stack_name_for(&Chosen::new(kbs, &buckets))
+        );
+        assert!(!Chosen::new(&[], &[]).with_sync(&sync).is_empty());
     }
 
     #[test]

@@ -39,6 +39,7 @@ pub mod installation_owner;
 pub mod integrations;
 pub mod jira_webhook;
 pub mod knowledge;
+pub mod knowledge_bedrock;
 pub mod knowledge_sources;
 pub mod knowledge_tokens;
 pub mod learning;

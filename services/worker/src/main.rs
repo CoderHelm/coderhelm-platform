@@ -151,6 +151,12 @@ async fn handle_event(
         let req: common::knowledge::sources::SyncMessage = serde_json::from_value(req.clone())?;
         let call = passes::knowledge_sync::sync(&state, &req);
         Ok(common::usage::with_feature(common::usage::feature::EMBEDDING, call).await)
+    } else if let Some(req) = payload.get("bedrock_sync") {
+        // Copy a team's chosen knowledge bases into Bedrock now (saving the
+        // settings, "Sync now"; called asynchronously by the gateway).
+        let req: common::knowledge::bedrock_sync::SyncMessage =
+            serde_json::from_value(req.clone())?;
+        Ok(passes::bedrock_sync::sync(&state, &req.team_id).await)
     } else {
         let sqs: SqsEvent = serde_json::from_value(payload)?;
         handle_sqs(state, LambdaEvent::new(sqs, context))
@@ -708,7 +714,12 @@ async fn handle_message(state: Arc<WorkerState>, message: models::WorkerMessage)
         }
         models::WorkerMessage::KnowledgeSyncSweep => {
             let queued = passes::knowledge_sync::sweep(&state).await;
-            info!(queued, "Knowledge sync sweep");
+            let bedrock = passes::bedrock_sync::sweep(&state).await;
+            info!(queued, bedrock, "Knowledge sync sweep");
+        }
+        models::WorkerMessage::BedrockSync(msg) => {
+            let out = passes::bedrock_sync::sync(&state, &msg.team_id).await;
+            info!(team_id = %msg.team_id, result = %out, "Bedrock sync");
         }
         models::WorkerMessage::KnowledgeSync(msg) => {
             let out = passes::knowledge_sync::sync(&state, &msg).await;

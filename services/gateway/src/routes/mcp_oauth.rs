@@ -97,9 +97,11 @@ pub fn server_metadata(issuer: &str) -> Value {
         "revocation_endpoint": format!("{issuer}/oauth/revoke"),
         "response_types_supported": ["code"],
         "response_modes_supported": ["query"],
-        "grant_types_supported": ["authorization_code", "refresh_token"],
+        // client_credentials: knowledge keys only (crate::knowledge_keys),
+        // for programs such as AgentCore Gateway; people sign in with a code.
+        "grant_types_supported": ["authorization_code", "refresh_token", "client_credentials"],
         "code_challenge_methods_supported": ["S256"],
-        "token_endpoint_auth_methods_supported": ["none"],
+        "token_endpoint_auth_methods_supported": ["none", "client_secret_basic", "client_secret_post"],
         "revocation_endpoint_auth_methods_supported": ["none"],
         "scopes_supported": SCOPES,
         "authorization_response_iss_parameter_supported": true,
@@ -231,6 +233,7 @@ pub async fn authorize(
 pub async fn token(
     State(state): State<Arc<AppState>>,
     ip: ClientIp,
+    headers: axum::http::HeaderMap,
     Form(form): Form<oauth::TokenForm>,
 ) -> Response {
     if rate_limit::allow_shared(&state, "mcp_token", &ip.0, 120, 300)
@@ -238,6 +241,9 @@ pub async fn token(
         .is_err()
     {
         return too_many();
+    }
+    if form.grant_type.as_deref() == Some("client_credentials") {
+        return knowledge_key_token(&state, &headers, &form).await;
     }
     let store = oauth::store(&state);
     match oauth::token(
@@ -258,6 +264,52 @@ pub async fn token(
         Ok(Err(e)) => oauth_error(StatusCode::BAD_REQUEST, e.error, &e.description),
         Err(e) => {
             error!(error = %e, "MCP token request failed");
+            unavailable()
+        }
+    }
+}
+
+/// `grant_type=client_credentials` for a knowledge key (`crate::knowledge_keys`).
+async fn knowledge_key_token(
+    state: &AppState,
+    headers: &axum::http::HeaderMap,
+    form: &oauth::TokenForm,
+) -> Response {
+    use crate::knowledge_keys as keys;
+    let basic = keys::basic_credentials(headers);
+    let (id, secret) = match &basic {
+        Some((i, s)) => (Some(i.as_str()), Some(s.as_str())),
+        None => (form.client_id.as_deref(), form.client_secret.as_deref()),
+    };
+    match keys::client_credentials(
+        &keys::store(state),
+        id,
+        secret,
+        form.scope.as_deref(),
+        &oauth::issuer(),
+        &state.secrets.jwt_secret,
+        chrono::Utc::now(),
+    )
+    .await
+    {
+        Ok(Ok(t)) => {
+            let mut r = Json(t).into_response();
+            r.headers_mut()
+                .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+            r.headers_mut()
+                .insert(header::PRAGMA, HeaderValue::from_static("no-cache"));
+            r
+        }
+        Ok(Err((code, msg))) => {
+            let status = if code == "invalid_client" {
+                StatusCode::UNAUTHORIZED
+            } else {
+                StatusCode::BAD_REQUEST
+            };
+            oauth_error(status, code, msg)
+        }
+        Err(e) => {
+            error!(error = %e, "Knowledge key token request failed");
             unavailable()
         }
     }
@@ -383,6 +435,9 @@ pub struct DecisionBody {
     approve: bool,
     #[serde(default)]
     allow_write: bool,
+    /// Searching the knowledge bases the person can read (`knowledge:read`).
+    #[serde(default)]
+    allow_knowledge: bool,
 }
 
 /// POST /api/mcp/authorize — the person's answer. Gives back where to send
@@ -412,6 +467,7 @@ pub async fn decide_request(
             mfa: proof.mfa,
             via: proof.via.clone(),
             allow_write: body.allow_write,
+            allow_knowledge: body.allow_knowledge,
         };
         let (code, stored) = oauth::approve(&req, &client, &who, chrono::Utc::now());
         // Written before the code goes out: no connection without a record.
@@ -571,7 +627,10 @@ mod tests {
         let r = resource_metadata("https://ch.example.org");
         assert_eq!(r["resource"], "https://ch.example.org/mcp");
         assert_eq!(r["authorization_servers"][0], "https://ch.example.org");
-        assert_eq!(r["scopes_supported"], json!(["runs:read", "runs:write"]));
+        assert_eq!(
+            r["scopes_supported"],
+            json!(["runs:read", "runs:write", "knowledge:read"])
+        );
         let s = server_metadata("https://ch.example.org");
         assert_eq!(s["issuer"], "https://ch.example.org");
         assert_eq!(
@@ -579,7 +638,14 @@ mod tests {
             "https://ch.example.org/oauth/register"
         );
         assert_eq!(s["code_challenge_methods_supported"], json!(["S256"]));
-        assert_eq!(s["token_endpoint_auth_methods_supported"], json!(["none"]));
+        assert_eq!(
+            s["token_endpoint_auth_methods_supported"],
+            json!(["none", "client_secret_basic", "client_secret_post"])
+        );
+        assert_eq!(
+            s["grant_types_supported"],
+            json!(["authorization_code", "refresh_token", "client_credentials"])
+        );
     }
 
     #[tokio::test]

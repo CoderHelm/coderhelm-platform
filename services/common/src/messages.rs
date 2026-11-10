@@ -128,6 +128,11 @@ pub enum WorkerMessage {
     /// Sync one knowledge source (queued by the sweep).
     #[serde(rename = "knowledge_sync")]
     KnowledgeSync(crate::knowledge::sources::SyncMessage),
+    /// Copy a team's chosen knowledge bases into its Bedrock knowledge base
+    /// (`crate::knowledge::bedrock_sync`): queued by "Sync now", by saving
+    /// the settings and by the knowledge sweep.
+    #[serde(rename = "bedrock_sync")]
+    BedrockSync(crate::knowledge::bedrock_sync::SyncMessage),
     /// The Monday weekly summary emails (EventBridge → SQS). Sends nothing
     /// unless WEEKLY_SUMMARY_ENABLED is true.
     #[serde(rename = "weekly_summary")]
@@ -407,6 +412,7 @@ impl WorkerMessage {
             WorkerMessage::TestIngest(_) | WorkerMessage::TestAction(_) => f::TESTS,
             WorkerMessage::ToolProposals(_) => f::LIVE_SOURCES,
             WorkerMessage::KnowledgeSync(_) => f::EMBEDDING,
+            WorkerMessage::BedrockSync(_) => f::OTHER,
             WorkerMessage::HiddenSuggest(_) => f::DATA_SOURCE,
             WorkerMessage::HealthCheck(_)
             | WorkerMessage::AwaitMerge(_)
@@ -482,6 +488,7 @@ impl WorkerMessage {
             | WorkerMessage::DlqCleanup
             | WorkerMessage::KnowledgeSyncSweep
             | WorkerMessage::KnowledgeSync(_)
+            | WorkerMessage::BedrockSync(_)
             | WorkerMessage::WeeklySummary
             | WorkerMessage::DeployStatsBackfill(_)
             | WorkerMessage::DeployRun(_)

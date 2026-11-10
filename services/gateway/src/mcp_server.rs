@@ -30,7 +30,9 @@ use std::time::{Duration, Instant};
 use tower::ServiceExt;
 use tracing::{error, warn};
 
-use crate::mcp_oauth::{self, AccessRefusal, StoredGrant, READ_SCOPE, WRITE_SCOPE};
+use crate::mcp_oauth::{
+    self, AccessRefusal, StoredGrant, KNOWLEDGE_SCOPE, READ_SCOPE, WRITE_SCOPE,
+};
 use crate::models::Claims;
 use crate::permissions::{self, Access, Capability, Holder};
 use crate::routes::roles::{self, AuditEntry};
@@ -967,7 +969,12 @@ pub fn negotiate(asked: Option<&str>) -> &'static str {
         .unwrap_or(PROTOCOL_VERSIONS[0])
 }
 
-pub fn initialize_result(asked: Option<&str>) -> Value {
+pub fn initialize_result(asked: Option<&str>, key: bool) -> Value {
+    let instructions = if key {
+        "Coderhelm's team knowledge: knowledge_list shows the knowledge bases this key reads, and knowledge_search finds passages in them, each with its source's title, link and last updated time. Cite the link."
+    } else {
+        "CoderHelm turns tickets into pull requests and reviews pull requests. Use list_runs and get_run to see work and why a run is waiting; start_run to start work from a GitHub issue, a Jira key or a task in words; retry_run to start a stopped run again; list_reviews, get_review and request_review for pull request reviews; knowledge_list and knowledge_search for the team's knowledge bases you can read. Everything happens as the person who connected this app, with their role in their CoderHelm team."
+    };
     json!({
         "protocolVersion": negotiate(asked),
         "capabilities": { "tools": { "listChanged": false } },
@@ -976,24 +983,32 @@ pub fn initialize_result(asked: Option<&str>) -> Value {
             "title": "CoderHelm",
             "version": env!("CARGO_PKG_VERSION"),
         },
-        "instructions": "CoderHelm turns tickets into pull requests and reviews pull requests. Use list_runs and get_run to see work and why a run is waiting; start_run to start work from a GitHub issue, a Jira key or a task in words; retry_run to start a stopped run again; list_reviews, get_review and request_review for pull request reviews. Everything happens as the person who connected this app, with their role in their CoderHelm team.",
+        "instructions": instructions,
     })
 }
 
+#[cfg(test)]
 pub fn tools_list() -> Value {
-    json!({ "tools": TOOLS.iter().map(Tool::listing).collect::<Vec<_>>() })
+    tools_for(false)
 }
 
-/// The person behind a connection, from their member record now. `None`
-/// when they are no longer an active member of its team.
-async fn member_claims(state: &AppState, g: &StoredGrant) -> Result<Option<Claims>, String> {
+/// The person behind a connection (or a knowledge key's maker), from their
+/// member record now. `None` when they are no longer an active member of
+/// its team.
+async fn member_claims(
+    state: &AppState,
+    team_id: &str,
+    user_id: &str,
+    email: &str,
+    iat: u64,
+) -> Result<Option<Claims>, String> {
     use aws_sdk_dynamodb::types::AttributeValue;
     let r = state
         .dynamo
         .get_item()
         .table_name(&state.config.users_table_name)
-        .key("pk", AttributeValue::S(g.team_id.clone()))
-        .key("sk", AttributeValue::S(g.user_id.clone()))
+        .key("pk", AttributeValue::S(team_id.to_string()))
+        .key("sk", AttributeValue::S(user_id.to_string()))
         .send()
         .await
         .map_err(|e| format!("{}", aws_sdk_dynamodb::error::DisplayErrorContext(&e)))?;
@@ -1005,14 +1020,14 @@ async fn member_claims(state: &AppState, g: &StoredGrant) -> Result<Option<Claim
         return Ok(None);
     }
     Ok(Some(Claims {
-        sub: g.user_id.clone(),
-        team_id: g.team_id.clone(),
-        email: get("email").unwrap_or_else(|| g.email.clone()),
+        sub: user_id.to_string(),
+        team_id: team_id.to_string(),
+        email: get("email").unwrap_or_else(|| email.to_string()),
         role: get("role").unwrap_or_else(|| "member".into()),
         github_login: get("github_login"),
         aud: mcp_oauth::ACCESS_AUDIENCE.into(),
         exp: 0,
-        iat: g.created_at_secs,
+        iat,
         support_view: None,
         custom: None,
         api_key: None,
@@ -1039,6 +1054,165 @@ fn due_to_note(id: &str) -> bool {
     }
 }
 
+/// Who is calling `/mcp`: a person through an app they connected, or a
+/// knowledge key (`knowledge_keys`).
+enum Caller {
+    Person(mcp_oauth::Authorized),
+    Key(crate::knowledge_keys::StoredKey),
+}
+
+/// The credential of a request: `Authorization: Bearer ...`, or an
+/// `X-Api-Key` header (a knowledge key, as AgentCore Gateway can send it).
+fn credential(headers: &HeaderMap) -> Option<&str> {
+    bearer(headers).or_else(|| {
+        headers
+            .get("x-api-key")
+            .and_then(|v| v.to_str().ok())
+            .map(str::trim)
+            .filter(|t| t.starts_with(crate::knowledge_keys::TOKEN_PREFIX))
+    })
+}
+
+/// A refused knowledge key or key token (`401`).
+fn key_refused(r: crate::knowledge_keys::Refusal) -> Response {
+    let mut res = (
+        StatusCode::UNAUTHORIZED,
+        Json(json!({ "error": "invalid_token", "error_description": r.description() })),
+    )
+        .into_response();
+    let challenge = format!(
+        "Bearer error=\"invalid_token\", error_description=\"{}\"",
+        quoted(r.description())
+    );
+    if let Ok(v) = HeaderValue::from_str(&challenge) {
+        res.headers_mut().insert(header::WWW_AUTHENTICATE, v);
+    }
+    res
+}
+
+/// Checks the request's credential: a knowledge key, a key's access token,
+/// or a person's access token, in that order.
+async fn authenticate(state: &AppState, token: &str) -> Result<Caller, Response> {
+    use crate::knowledge_keys as keys;
+    let now = chrono::Utc::now();
+    let now_secs = now.timestamp().max(0) as u64;
+    if token.starts_with(keys::TOKEN_PREFIX) {
+        return match keys::authenticate_secret(&keys::store(state), token, now).await {
+            Ok(Ok(k)) => Ok(Caller::Key(k)),
+            Ok(Err(r)) => Err(key_refused(r)),
+            Err(e) => {
+                error!(error = %e, "Knowledge key not read");
+                Err(StatusCode::SERVICE_UNAVAILABLE.into_response())
+            }
+        };
+    }
+    if let Some(claims) = keys::read_access(token, &state.secrets.jwt_secret, now_secs) {
+        let claims = claims.map_err(key_refused)?;
+        return match keys::authenticate_access(&keys::store(state), &claims, now).await {
+            Ok(Ok(k)) => Ok(Caller::Key(k)),
+            Ok(Err(r)) => Err(key_refused(r)),
+            Err(e) => {
+                error!(error = %e, "Knowledge key not read");
+                Err(StatusCode::SERVICE_UNAVAILABLE.into_response())
+            }
+        };
+    }
+    let store = mcp_oauth::store(state);
+    match mcp_oauth::authenticate(&store, token, &state.secrets.jwt_secret, now_secs).await {
+        Ok(Ok(a)) => Ok(Caller::Person(a)),
+        Ok(Err(refusal)) => Err(unauthorized(Some(refusal))),
+        Err(e) => {
+            error!(error = %e, "MCP connection not read");
+            Err(StatusCode::SERVICE_UNAVAILABLE.into_response())
+        }
+    }
+}
+
+/// The tools a caller sees: a knowledge key only the knowledge tools.
+pub fn tools_for(key: bool) -> Value {
+    let k = crate::mcp_knowledge::listing();
+    if key {
+        return json!({ "tools": k });
+    }
+    let mut all: Vec<Value> = TOOLS.iter().map(Tool::listing).collect();
+    all.extend(k);
+    json!({ "tools": all })
+}
+
+/// Runs a knowledge tool for `reader`, after its call is in the team's log.
+async fn knowledge_call(
+    state: &AppState,
+    id: &Value,
+    claims: &Claims,
+    entry: AuditEntry<'_>,
+    reader: crate::mcp_knowledge::Reader,
+    name: &str,
+    args: &Value,
+) -> Response {
+    use crate::mcp_knowledge as mk;
+    use common::knowledge::search::Store;
+    // Written before the call runs: nothing is read without a record.
+    if roles::record(state, claims, entry).await.is_err() {
+        return rpc_result(
+            id,
+            json!({
+                "content": [{ "type": "text", "text": "Coderhelm couldn't record this call in the team's log, so it didn't run it. Try again." }],
+                "isError": true,
+            }),
+        );
+    }
+    let st = crate::routes::knowledge::store(state);
+    let out: Result<Value, String> = if name == mk::LIST {
+        match st.bases(&reader.team_id).await {
+            Ok(b) => mk::readable(b, &reader).map(|b| mk::list(&b)),
+            Err(e) => {
+                error!(error = %e, "Knowledge bases not read for an MCP call");
+                Err("The knowledge bases couldn't be read. Try again.".into())
+            }
+        }
+    } else {
+        let meter = crate::model_call::chat_meter(state, &reader.team_id);
+        let titan = common::knowledge::search::Titan {
+            client: &state.bedrock,
+            meter: &meter,
+        };
+        let servers = crate::routes::knowledge::servers(state, &reader.team_id);
+        let retriever =
+            crate::routes::knowledge::retriever(state, "mcp", &servers, reader.signed_in_as());
+        match mk::run_search(
+            &st,
+            &titan,
+            &retriever,
+            &reader,
+            args,
+            common::public_urls::app_url_from_env(),
+            chrono::Utc::now(),
+        )
+        .await
+        {
+            Ok((v, stale)) => {
+                crate::routes::knowledge::reembed(state, &reader.team_id, &stale).await;
+                Ok(v)
+            }
+            Err(e) => Err(e),
+        }
+    };
+    match out {
+        Ok(v) => rpc_result(
+            id,
+            json!({
+                "content": [{ "type": "text", "text": serde_json::to_string_pretty(&v).unwrap_or_default() }],
+                "structuredContent": v,
+                "isError": false,
+            }),
+        ),
+        Err(message) => rpc_result(
+            id,
+            json!({ "content": [{ "type": "text", "text": message }], "isError": true }),
+        ),
+    }
+}
+
 /// `POST /mcp`: one JSON-RPC message from an MCP client.
 pub async fn post(
     State(state): State<Arc<AppState>>,
@@ -1046,29 +1220,19 @@ pub async fn post(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    let Some(token) = bearer(&headers) else {
+    let Some(token) = credential(&headers) else {
         return unauthorized(None);
     };
-    let store = mcp_oauth::store(&state);
-    let now = chrono::Utc::now();
-    let authorized = match mcp_oauth::authenticate(
-        &store,
-        token,
-        &state.secrets.jwt_secret,
-        now.timestamp().max(0) as u64,
-    )
-    .await
-    {
-        Ok(Ok(a)) => a,
-        Ok(Err(refusal)) => return unauthorized(Some(refusal)),
-        Err(e) => {
-            error!(error = %e, "MCP connection not read");
-            return StatusCode::SERVICE_UNAVAILABLE.into_response();
-        }
+    let caller = match authenticate(&state, token).await {
+        Ok(c) => c,
+        Err(r) => return r,
     };
-    let grant = authorized.grant;
+    let (limit_id, is_key) = match &caller {
+        Caller::Person(a) => (a.grant.id.clone(), false),
+        Caller::Key(k) => (format!("key:{}", k.id), true),
+    };
     if crate::middleware::rate_limit::allow(
-        &crate::middleware::rate_limit::ClientIp(grant.id.clone()),
+        &crate::middleware::rate_limit::ClientIp(limit_id.clone()),
         "mcp",
         300,
         60,
@@ -1093,9 +1257,19 @@ pub async fn post(
                 .into_response();
         }
     }
-    if due_to_note(&grant.id) {
+    let now = chrono::Utc::now();
+    if due_to_note(&limit_id) {
         let at = now.to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
-        if let Err(e) = mcp_oauth::OAuthStore::note_use(&store, &grant, &at).await {
+        let noted = match &caller {
+            Caller::Person(a) => {
+                mcp_oauth::OAuthStore::note_use(&mcp_oauth::store(&state), &a.grant, &at).await
+            }
+            Caller::Key(k) => {
+                use crate::knowledge_keys::KeyStore;
+                crate::knowledge_keys::store(&state).note_use(k, &at).await
+            }
+        };
+        if let Err(e) = noted {
             warn!(error = %e, "MCP connection use not noted");
         }
     }
@@ -1129,11 +1303,113 @@ pub async fn post(
     }
     let params = msg.get("params").cloned().unwrap_or(Value::Null);
     match method {
-        "initialize" => rpc_result(&id, initialize_result(params["protocolVersion"].as_str())),
+        "initialize" => rpc_result(
+            &id,
+            initialize_result(params["protocolVersion"].as_str(), is_key),
+        ),
         "ping" => rpc_result(&id, json!({})),
-        "tools/list" => rpc_result(&id, tools_list()),
+        "tools/list" => rpc_result(&id, tools_for(is_key)),
         "tools/call" => {
             let name = params["name"].as_str().unwrap_or("");
+            let args = match &params["arguments"] {
+                Value::Null => json!({}),
+                Value::Object(_) => params["arguments"].clone(),
+                _ => return rpc_error(StatusCode::OK, &id, -32602, "arguments must be an object."),
+            };
+            if crate::mcp_knowledge::is_tool(name) {
+                return match caller {
+                    Caller::Person(a) => {
+                        if !a.scopes.contains(KNOWLEDGE_SCOPE) {
+                            return insufficient_scope(KNOWLEDGE_SCOPE);
+                        }
+                        let claims = match member_claims(
+                            &state,
+                            &a.grant.team_id,
+                            &a.grant.user_id,
+                            &a.grant.email,
+                            a.grant.created_at_secs,
+                        )
+                        .await
+                        {
+                            Ok(Some(c)) => c,
+                            Ok(None) => return unauthorized(Some(AccessRefusal::Revoked)),
+                            Err(e) => {
+                                error!(error = %e, "Member record not read for an MCP call");
+                                return StatusCode::SERVICE_UNAVAILABLE.into_response();
+                            }
+                        };
+                        // The same checks a session of theirs gets: no session
+                        // ended since they connected, the team's two-factor rule.
+                        if let Err(r) =
+                            crate::routes::sign_in::check_member_session(&state, &claims).await
+                        {
+                            return r;
+                        }
+                        let proof = crate::auth::jwt::SignInProof {
+                            mfa: a.grant.mfa,
+                            via: a.grant.via.clone(),
+                        };
+                        if let Err(r) = crate::routes::sign_in::check_session(
+                            &state,
+                            &claims.team_id,
+                            &proof,
+                            None,
+                        )
+                        .await
+                        {
+                            return r;
+                        }
+                        let holder = roles::holder_for(&state, &claims).await;
+                        let reader = crate::mcp_knowledge::Reader {
+                            team_id: claims.team_id.clone(),
+                            person: crate::routes::knowledge::person(&claims),
+                            holder,
+                            key_bases: None,
+                        };
+                        let entry = AuditEntry {
+                            action: "mcp_call",
+                            role_id: &a.grant.id,
+                            role_name: &a.grant.client_name,
+                            detail: crate::mcp_knowledge::audit_detail(name, &args),
+                        };
+                        knowledge_call(&state, &id, &claims, entry, reader, name, &args).await
+                    }
+                    Caller::Key(k) => {
+                        let claims = match member_claims(
+                            &state,
+                            &k.team_id,
+                            &k.created_by,
+                            &k.created_by_email,
+                            0,
+                        )
+                        .await
+                        {
+                            Ok(Some(c)) => c,
+                            Ok(None) => {
+                                return key_refused(crate::knowledge_keys::Refusal::Revoked)
+                            }
+                            Err(e) => {
+                                error!(error = %e, "Member record not read for a knowledge key");
+                                return StatusCode::SERVICE_UNAVAILABLE.into_response();
+                            }
+                        };
+                        let holder = roles::holder_for(&state, &claims).await;
+                        let reader = crate::mcp_knowledge::Reader {
+                            team_id: claims.team_id.clone(),
+                            person: crate::routes::knowledge::person(&claims),
+                            holder,
+                            key_bases: Some(k.bases.clone()),
+                        };
+                        let entry = AuditEntry {
+                            action: "knowledge_key_call",
+                            role_id: &k.id,
+                            role_name: &k.name,
+                            detail: crate::mcp_knowledge::audit_detail(name, &args),
+                        };
+                        knowledge_call(&state, &id, &claims, entry, reader, name, &args).await
+                    }
+                };
+            }
             let Some(t) = find_tool(name) else {
                 return rpc_error(
                     StatusCode::OK,
@@ -1142,15 +1418,28 @@ pub async fn post(
                     &format!("There is no tool called {name}."),
                 );
             };
+            let authorized = match caller {
+                Caller::Person(a) => a,
+                Caller::Key(_) => return rpc_error(
+                    StatusCode::OK,
+                    &id,
+                    -32602,
+                    "A knowledge key reads knowledge only: knowledge_search and knowledge_list.",
+                ),
+            };
             if !authorized.scopes.contains(t.scope()) {
                 return insufficient_scope(t.scope());
             }
-            let args = match &params["arguments"] {
-                Value::Null => json!({}),
-                Value::Object(_) => params["arguments"].clone(),
-                _ => return rpc_error(StatusCode::OK, &id, -32602, "arguments must be an object."),
-            };
-            let claims = match member_claims(&state, &grant).await {
+            let grant = authorized.grant;
+            let claims = match member_claims(
+                &state,
+                &grant.team_id,
+                &grant.user_id,
+                &grant.email,
+                grant.created_at_secs,
+            )
+            .await
+            {
                 Ok(Some(c)) => c,
                 Ok(None) => return unauthorized(Some(AccessRefusal::Revoked)),
                 Err(e) => {
@@ -1273,13 +1562,27 @@ mod tests {
     fn annotations_say_which_tools_only_read() {
         let list = tools_list();
         let tools = list["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 7);
+        assert_eq!(tools.len(), 9);
+        // A knowledge key sees the knowledge tools only.
+        let keys = tools_for(true);
+        let names: Vec<&str> = keys["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, vec!["knowledge_search", "knowledge_list"]);
         for t in tools {
             let name = t["name"].as_str().unwrap();
             let read_only = t["annotations"]["readOnlyHint"].as_bool().unwrap();
             let want = matches!(
                 name,
-                "list_runs" | "get_run" | "list_reviews" | "get_review"
+                "list_runs"
+                    | "get_run"
+                    | "list_reviews"
+                    | "get_review"
+                    | "knowledge_search"
+                    | "knowledge_list"
             );
             assert_eq!(read_only, want, "{name}");
             assert_eq!(t["annotations"]["destructiveHint"], false, "{name}");
@@ -1604,7 +1907,11 @@ mod tests {
         assert_eq!(negotiate(Some("2025-06-18")), "2025-06-18");
         assert_eq!(negotiate(Some("1999-01-01")), PROTOCOL_VERSIONS[0]);
         assert_eq!(negotiate(None), PROTOCOL_VERSIONS[0]);
-        let r = initialize_result(Some("2025-03-26"));
+        let r = initialize_result(Some("2025-03-26"), false);
+        assert!(initialize_result(None, true)["instructions"]
+            .as_str()
+            .unwrap()
+            .contains("knowledge_search"));
         assert_eq!(r["capabilities"]["tools"]["listChanged"], false);
         assert_eq!(r["serverInfo"]["name"], "coderhelm");
     }

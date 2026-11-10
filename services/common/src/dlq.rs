@@ -73,6 +73,8 @@ pub const WORKER_MESSAGE_TYPES: &[&str] = &[
     // Knowledge sources: the scheduled sweep, and one source's sync.
     "knowledge_sync_sweep",
     "knowledge_sync",
+    // Copying a team's chosen knowledge bases into Bedrock.
+    "bedrock_sync",
     // Plugins: runs, publishing, source sync and its 15 minute poll,
     // recurring triggers and reading results back.
     "plugin_run",

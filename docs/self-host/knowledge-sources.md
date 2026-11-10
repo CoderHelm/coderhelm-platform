@@ -135,6 +135,10 @@ CoderHelm asks for `https://www.googleapis.com/auth/drive.readonly`. A knowledge
 
 On a hybrid install that chose CoderHelm's Google app, Drive is offered only while the hosted service has its own Drive app; otherwise the choice is unavailable and the install falls back to its own keys.
 
+## Using this knowledge from Bedrock
+
+The other way round: Bedrock agents can search your knowledge bases live through CoderHelm's MCP server with a knowledge key, and chosen knowledge bases can be kept copied into a Bedrock knowledge base through an S3 folder. See [Bedrock knowledge bases](./bedrock.md).
+
 ## Bedrock knowledge bases, connected in place
 
 A knowledge base in Amazon Bedrock can be connected in place instead of copied. CoderHelm searches it live in your AWS account each time an agent or the brain chat needs it, and nothing is copied out: no documents, no passages, no vectors. Bedrock turns the question into a search itself, so it doesn't matter which embedding model, chunking or vector store the knowledge base uses. Both kinds of Bedrock knowledge base work, the classic ones whose vector store you run and the managed ones.
