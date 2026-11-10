@@ -354,6 +354,13 @@ pub const CAPABILITIES: &[Capability] = &[
         handlers: &[
             "knowledge::create_base",
             "knowledge::bedrock_bases",
+            "knowledge_bedrock::list_keys",
+            "knowledge_bedrock::create_key",
+            "knowledge_bedrock::revoke_key",
+            "knowledge_bedrock::get_sync",
+            "knowledge_bedrock::save_sync",
+            "knowledge_bedrock::run_sync",
+            "knowledge_bedrock::export_template",
             "knowledge::bedrock_import",
             "knowledge::search_tools",
             "knowledge::start_archive",

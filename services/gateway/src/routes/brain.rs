@@ -910,13 +910,12 @@ pub async fn starters(
         load_repos(&state, &claims.team_id),
         recent_runs(&state, &claims.team_id),
     );
-    let role = super::knowledge::reader_role(&claims.holder());
     let me = super::knowledge::person(&claims);
-    let mut readable: Vec<_> = bases
-        .map_err(|e| internal("knowledge bases", e))?
-        .into_iter()
-        .filter(|b| b.readable_by(role) && b.open_to(&me))
-        .collect();
+    let mut readable: Vec<_> = super::knowledge::chat_readable(
+        bases.map_err(|e| internal("knowledge bases", e))?,
+        &claims.holder(),
+        &me,
+    );
     readable.sort_by(|a, b| a.name.cmp(&b.name));
     // Bases with something to read come first; at most a few are checked.
     let mut ready = Vec::new();
@@ -1941,7 +1940,6 @@ pub async fn brain_stream(
             "Your role can read shared chats but can't ask questions.",
         ));
     }
-    let reader = super::knowledge::reader_role(&holder);
     let me = super::knowledge::person(&claims);
     claims.role = holder.floor().to_string();
     let question = body.question.trim().to_string();
@@ -1987,14 +1985,14 @@ pub async fn brain_stream(
 
     let (api_key, model_id, check_model_id) = load_provider(&state, &claims.team_id).await;
     let st = super::knowledge::store(&state);
-    let readable: Vec<String> = st
-        .bases(&claims.team_id)
-        .await
-        .unwrap_or_default()
-        .into_iter()
-        .filter(|b| b.readable_by(reader) && b.open_to(&me))
-        .map(|b| b.id)
-        .collect();
+    let readable: Vec<String> = super::knowledge::chat_readable(
+        st.bases(&claims.team_id).await.unwrap_or_default(),
+        &holder,
+        &me,
+    )
+    .into_iter()
+    .map(|b| b.id)
+    .collect();
     let all_repos = load_repos(&state, &claims.team_id).await;
     let repo_names: Vec<String> = all_repos.iter().map(|r| r.name.clone()).collect();
     let picks = resolve_picks(

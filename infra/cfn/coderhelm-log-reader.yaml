@@ -2,6 +2,8 @@ AWSTemplateFormatVersion: "2010-09-09"
 Description: >
   Creates a read-only IAM role that allows Coderhelm to query your CloudWatch Logs and metrics,
   read Airflow (MWAA) as a Viewer, and search the Bedrock knowledge bases you name.
+  Only when you name them in SyncKnowledgeBases, it may also copy your chosen Coderhelm
+  knowledge bases into those Bedrock knowledge bases.
   This role uses an External ID to prevent confused deputy attacks.
 
 Parameters:
@@ -47,10 +49,24 @@ Parameters:
     AllowedPattern: "^(|[a-z0-9][a-z0-9.-]{1,61}[a-z0-9](,[a-z0-9][a-z0-9.-]{1,61}[a-z0-9])*)$"
     ConstraintDescription: Bucket names separated by commas, or empty.
 
+  SyncKnowledgeBases:
+    Type: String
+    Default: ""
+    Description: >
+      Bedrock knowledge bases CoderHelm may copy your chosen CoderHelm
+      knowledge bases into: their ARNs separated by commas, or "all" for every
+      knowledge base in this account. CoderHelm adds, updates and removes only
+      the documents it copied there, and starts syncs of their data sources.
+      Empty: none (the role writes to no knowledge base).
+    AllowedPattern: "^(|all|arn:aws:bedrock:[a-z0-9-]+:[0-9]{12}:knowledge-base/[A-Z0-9]{10}(,arn:aws:bedrock:[a-z0-9-]+:[0-9]{12}:knowledge-base/[A-Z0-9]{10})*)$"
+    ConstraintDescription: Knowledge base ARNs separated by commas, "all", or empty.
+
 Conditions:
   ReadsKnowledgeBases: !Not [!Equals [!Ref KnowledgeBases, ""]]
   ReadsEveryKnowledgeBase: !Equals [!Ref KnowledgeBases, "all"]
   ReadsImportBuckets: !Not [!Equals [!Ref ImportBuckets, ""]]
+  SyncsKnowledgeBases: !Not [!Equals [!Ref SyncKnowledgeBases, ""]]
+  SyncsEveryKnowledgeBase: !Equals [!Ref SyncKnowledgeBases, "all"]
 
 Resources:
   CoderHelmLogReaderRole:
@@ -266,6 +282,32 @@ Resources:
                   Condition:
                     StringLike:
                       kms:ViaService: "s3.*.amazonaws.com"
+          - !Ref AWS::NoValue
+        # Copying knowledge into Bedrock: only into the knowledge bases named
+        # in SyncKnowledgeBases (or every one in this account with "all").
+        # Adds, updates and removes documents of a custom data source, and
+        # starts a sync of an S3 data source; nothing else changes.
+        - !If
+          - SyncsKnowledgeBases
+          - PolicyName: KnowledgeBaseSync
+            PolicyDocument:
+              Version: "2012-10-17"
+              Statement:
+                - Sid: SyncKnowledgeBases
+                  Effect: Allow
+                  Action:
+                    - "bedrock:IngestKnowledgeBaseDocuments"
+                    - "bedrock:DeleteKnowledgeBaseDocuments"
+                    - "bedrock:GetKnowledgeBaseDocuments"
+                    - "bedrock:ListKnowledgeBaseDocuments"
+                    - "bedrock:StartIngestionJob"
+                    - "bedrock:GetIngestionJob"
+                    - "bedrock:GetKnowledgeBase"
+                    - "bedrock:GetDataSource"
+                  Resource: !If
+                    - SyncsEveryKnowledgeBase
+                    - !Sub "arn:aws:bedrock:*:${AWS::AccountId}:knowledge-base/*"
+                    - !Split [",", !Ref SyncKnowledgeBases]
           - !Ref AWS::NoValue
 
 Outputs:

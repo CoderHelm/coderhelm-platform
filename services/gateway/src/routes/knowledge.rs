@@ -110,6 +110,22 @@ pub(crate) fn reader_role(holder: &crate::permissions::Holder) -> &'static str {
     }
 }
 
+/// The bases a person reads in Chat: those their reading role reaches
+/// ([`reader_role`]) and that are open to them by name. The one rule Chat
+/// (`routes::brain`) and the MCP knowledge tools (`mcp_knowledge`) share, so
+/// an app never reads a base its person couldn't read in Chat.
+pub(crate) fn chat_readable(
+    bases: Vec<Base>,
+    holder: &crate::permissions::Holder,
+    me: &kb::Person,
+) -> Vec<Base> {
+    let reader = reader_role(holder);
+    bases
+        .into_iter()
+        .filter(|b| b.readable_by(reader) && b.open_to(me))
+        .collect()
+}
+
 // ── Input checks ────────────────────────────────────────────────────────────
 
 /// What a person may set on a base.
@@ -565,8 +581,9 @@ async fn test_remote(
 }
 
 /// The one-click update that lets the team's role in `account` search the
-/// knowledge bases the team connected there and read the buckets it imports
-/// from, plus `add_kb` and `add_bucket` (what is being added now).
+/// knowledge bases the team connected there, read the buckets it imports
+/// from and write the knowledge base it copies its knowledge into, plus
+/// `add_kb` and `add_bucket` (what is being added now).
 pub(crate) async fn grant_for(
     state: &AppState,
     team: &str,
@@ -588,7 +605,14 @@ pub(crate) async fn grant_for(
     buckets.extend(add_bucket.map(str::to_string));
     buckets.sort();
     buckets.dedup();
-    let chosen = common::log_reader::Chosen::new(&kbs, &buckets);
+    // The knowledge base the team copies its knowledge into, when it is in
+    // this account (kb::bedrock_sync): the same stack lets the role write it.
+    let sync_cfg = kb::bedrock_sync::load(&state.dynamo, &state.config.settings_table_name, team)
+        .await
+        .ok()
+        .flatten();
+    let sync = kb::bedrock_sync::sync_arns_in(sync_cfg.as_ref(), account);
+    let chosen = common::log_reader::Chosen::new(&kbs, &buckets).with_sync(&sync);
     super::connectors::update_stack_url(region, &chosen).map(|url| {
         json!({
             "url": url,

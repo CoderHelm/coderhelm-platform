@@ -44,14 +44,18 @@ use subtle::ConstantTimeEq;
 pub const READ_SCOPE: &str = "runs:read";
 /// Starting and retrying runs, and asking for reviews.
 pub const WRITE_SCOPE: &str = "runs:write";
+/// Searching the team's knowledge bases the person (or a knowledge key)
+/// can read, exactly as Chat does (`knowledge_search`, `knowledge_list`).
+pub const KNOWLEDGE_SCOPE: &str = "knowledge:read";
 /// Every scope, in the order they are shown.
-pub const SCOPES: &[&str] = &[READ_SCOPE, WRITE_SCOPE];
+pub const SCOPES: &[&str] = &[READ_SCOPE, WRITE_SCOPE, KNOWLEDGE_SCOPE];
 
 /// What a scope lets an app do, as the consent page says it.
 pub fn scope_label(scope: &str) -> &'static str {
     match scope {
         READ_SCOPE => "See your team's runs and reviews",
         WRITE_SCOPE => "Start and retry runs, and ask for reviews",
+        KNOWLEDGE_SCOPE => "Search the knowledge bases you can read in Chat",
         _ => "",
     }
 }
@@ -611,6 +615,8 @@ pub struct Consent {
     pub via: Option<String>,
     /// The person let the app start runs and ask for reviews.
     pub allow_write: bool,
+    /// The person let the app search the knowledge bases they can read.
+    pub allow_knowledge: bool,
 }
 
 /// A code waiting to be swapped, with everything the swap checks.
@@ -654,11 +660,15 @@ fn hash_matches(token: &str, stored: &str) -> bool {
         && bool::from(got.as_bytes().ct_eq(stored.as_bytes()))
 }
 
-/// The scopes a person granted: reading always, writing when they allowed it.
-pub fn granted_scopes(allow_write: bool) -> Vec<String> {
+/// The scopes a person granted: reading always, writing and searching
+/// knowledge when they allowed each.
+pub fn granted_scopes(allow_write: bool, allow_knowledge: bool) -> Vec<String> {
     let mut s = vec![READ_SCOPE.to_string()];
     if allow_write {
         s.push(WRITE_SCOPE.to_string());
+    }
+    if allow_knowledge {
+        s.push(KNOWLEDGE_SCOPE.to_string());
     }
     s
 }
@@ -678,7 +688,7 @@ pub fn approve(
         client_name: client.client_name.clone(),
         redirect_uri: req.redirect_uri.clone(),
         code_challenge: req.code_challenge.clone(),
-        scopes: granted_scopes(who.allow_write),
+        scopes: granted_scopes(who.allow_write, who.allow_knowledge),
         resource: req.resource.clone(),
         team_id: who.team_id.clone(),
         user_id: who.user_id.clone(),
@@ -859,6 +869,9 @@ pub struct TokenForm {
     pub code: Option<String>,
     pub redirect_uri: Option<String>,
     pub client_id: Option<String>,
+    /// A knowledge key's secret (`grant_type=client_credentials`).
+    #[serde(default)]
+    pub client_secret: Option<String>,
     pub code_verifier: Option<String>,
     pub refresh_token: Option<String>,
     pub resource: Option<String>,
@@ -1647,6 +1660,7 @@ pub(crate) mod tests {
             mfa: false,
             via: Some("password".into()),
             allow_write: write,
+            allow_knowledge: false,
         }
     }
 
@@ -1878,7 +1892,11 @@ pub(crate) mod tests {
             scope_string([WRITE_SCOPE, READ_SCOPE]),
             "runs:read runs:write"
         );
-        assert_eq!(granted_scopes(false), vec!["runs:read"]);
+        assert_eq!(granted_scopes(false, false), vec!["runs:read"]);
+        assert_eq!(
+            granted_scopes(false, true),
+            vec!["runs:read", "knowledge:read"]
+        );
     }
 
     #[test]

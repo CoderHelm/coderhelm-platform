@@ -1,0 +1,248 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Lets a self-hosted Coderhelm install copy the knowledge bases you choose into
+  an S3 folder in this account, for an Amazon Bedrock knowledge base to read.
+  Creates the bucket (encrypted, private, TLS only) and lets only the install's
+  own worker and gateway write to it. Optionally adds an S3 data source to an
+  existing Bedrock knowledge base (or names one it already has), lets that
+  knowledge base's service role read the folder, and syncs the data source
+  every 15 minutes so added, changed and deleted documents reach Bedrock.
+  Deploy it in the install's account and region.
+
+Parameters:
+  InstallPrefix:
+    Type: String
+    Description: >
+      The install's resource prefix (Settings, System shows it), such as
+      coderhelm-prod. The bucket is named after it, and only the install's
+      roles, whose names start with it, may write to the bucket.
+    AllowedPattern: "^[a-z0-9][a-z0-9-]{1,30}[a-z0-9]$"
+
+  Prefix:
+    Type: String
+    Default: "coderhelm/"
+    Description: The folder Coderhelm writes to inside the bucket. Ends with a slash.
+    AllowedPattern: "^([A-Za-z0-9._-]+/)+$"
+
+  KnowledgeBaseId:
+    Type: String
+    Default: ""
+    Description: >
+      Optional: an existing Bedrock knowledge base (its 10 character ID) to add
+      an S3 data source to, reading the folder. Empty: no data source is made.
+    AllowedPattern: "^(|[A-Z0-9]{10})$"
+
+  ExistingDataSourceId:
+    Type: String
+    Default: ""
+    Description: >
+      With KnowledgeBaseId: an S3 data source that knowledge base already has,
+      reading this bucket's folder (its 10 character ID). Empty: a new one is made.
+    AllowedPattern: "^(|[A-Z0-9]{10})$"
+
+  KnowledgeBaseRoleName:
+    Type: String
+    Default: ""
+    Description: >
+      With KnowledgeBaseId: the name of that knowledge base's service role
+      (on its page in the Bedrock console). It is given read access to the folder.
+    AllowedPattern: "^(|[\\w+=,.@-]{1,64})$"
+
+Conditions:
+  SyncsDataSource: !Not [!Equals [!Ref KnowledgeBaseId, ""]]
+  CreatesDataSource: !And
+    - !Condition SyncsDataSource
+    - !Equals [!Ref ExistingDataSourceId, ""]
+  GrantsKnowledgeBaseRole: !And
+    - !Condition SyncsDataSource
+    - !Not [!Equals [!Ref KnowledgeBaseRoleName, ""]]
+
+Resources:
+  ExportBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketName: !Sub "${InstallPrefix}-kb-export-${AWS::AccountId}"
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+            BucketKeyEnabled: true
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          # A removed or replaced document's old copy goes after a week, so a
+          # delete in Coderhelm is gone from the bucket too.
+          - Id: ExpireOldCopies
+            Status: Enabled
+            NoncurrentVersionExpiration:
+              NoncurrentDays: 7
+            ExpiredObjectDeleteMarker: true
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 1
+      Tags:
+        - Key: coderhelm:install
+          Value: !Ref InstallPrefix
+
+  ExportBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref ExportBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: TlsOnly
+            Effect: Deny
+            Principal: "*"
+            Action: "s3:*"
+            Resource:
+              - !GetAtt ExportBucket.Arn
+              - !Sub "${ExportBucket.Arn}/*"
+            Condition:
+              Bool:
+                aws:SecureTransport: "false"
+          # Only the install's own worker and gateway (their names start with
+          # the install's prefix, and they carry the coderhelm:role tag only
+          # the install's deploy role can set) write the folder.
+          - Sid: InstallWritesTheFolder
+            Effect: Allow
+            Principal: "*"
+            Action:
+              - "s3:PutObject"
+              - "s3:DeleteObject"
+              - "s3:GetObject"
+            Resource: !Sub "${ExportBucket.Arn}/${Prefix}*"
+            Condition:
+              StringEquals:
+                aws:PrincipalAccount: !Ref AWS::AccountId
+                aws:PrincipalTag/coderhelm:role: ["worker", "gateway"]
+              ArnLike:
+                aws:PrincipalArn: !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${InstallPrefix}-*"
+          - Sid: InstallListsTheFolder
+            Effect: Allow
+            Principal: "*"
+            Action:
+              - "s3:ListBucket"
+            Resource: !GetAtt ExportBucket.Arn
+            Condition:
+              StringEquals:
+                aws:PrincipalAccount: !Ref AWS::AccountId
+                aws:PrincipalTag/coderhelm:role: ["worker", "gateway"]
+              ArnLike:
+                aws:PrincipalArn: !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${InstallPrefix}-*"
+              StringLike:
+                s3:prefix: !Sub "${Prefix}*"
+
+  # The knowledge base's service role reads the folder (Bedrock's S3 data
+  # source needs ListBucket on the bucket and GetObject on its objects).
+  KnowledgeBaseReadsTheFolder:
+    Type: AWS::IAM::RolePolicy
+    Condition: GrantsKnowledgeBaseRole
+    Properties:
+      RoleName: !Ref KnowledgeBaseRoleName
+      PolicyName: !Sub "${InstallPrefix}-coderhelm-kb-export-read"
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: ListTheFolder
+            Effect: Allow
+            Action: "s3:ListBucket"
+            Resource: !GetAtt ExportBucket.Arn
+            Condition:
+              StringEquals:
+                aws:ResourceAccount: !Ref AWS::AccountId
+          - Sid: ReadTheFolder
+            Effect: Allow
+            Action: "s3:GetObject"
+            Resource: !Sub "${ExportBucket.Arn}/${Prefix}*"
+            Condition:
+              StringEquals:
+                aws:ResourceAccount: !Ref AWS::AccountId
+
+  ExportDataSource:
+    Type: AWS::Bedrock::DataSource
+    Condition: CreatesDataSource
+    DependsOn: ExportBucketPolicy
+    Properties:
+      KnowledgeBaseId: !Ref KnowledgeBaseId
+      Name: !Sub "${InstallPrefix}-coderhelm"
+      Description: Coderhelm knowledge bases, copied by the install. Synced by Coderhelm after each change.
+      # A document removed from the folder is removed from the vector store.
+      DataDeletionPolicy: DELETE
+      DataSourceConfiguration:
+        Type: S3
+        S3Configuration:
+          BucketArn: !GetAtt ExportBucket.Arn
+          InclusionPrefixes:
+            - !Ref Prefix
+
+  # Bedrock reads an S3 folder only when its data source syncs: every 15
+  # minutes this starts one (a sync with nothing new is quick; one already
+  # running makes this one wait for the next). The install never needs the
+  # permission itself.
+  SyncRole:
+    Type: AWS::IAM::Role
+    Condition: SyncsDataSource
+    Properties:
+      Description: Starts syncs of the Coderhelm data source, on a schedule.
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: scheduler.amazonaws.com
+            Action: "sts:AssumeRole"
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+      Policies:
+        - PolicyName: StartTheDataSourcesSync
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: "bedrock:StartIngestionJob"
+                Resource: !Sub "arn:${AWS::Partition}:bedrock:${AWS::Region}:${AWS::AccountId}:knowledge-base/${KnowledgeBaseId}"
+
+  SyncSchedule:
+    Type: AWS::Scheduler::Schedule
+    Condition: SyncsDataSource
+    Properties:
+      Description: Syncs the Coderhelm data source so changes in the folder reach Bedrock.
+      ScheduleExpression: rate(15 minutes)
+      FlexibleTimeWindow:
+        Mode: "OFF"
+      Target:
+        Arn: "arn:aws:scheduler:::aws-sdk:bedrockagent:startIngestionJob"
+        RoleArn: !GetAtt SyncRole.Arn
+        Input: !Sub
+          - '{"KnowledgeBaseId":"${KnowledgeBaseId}","DataSourceId":"${DataSourceId}","Description":"Coderhelm: scheduled sync"}'
+          - DataSourceId: !If [CreatesDataSource, !GetAtt ExportDataSource.DataSourceId, !Ref ExistingDataSourceId]
+        RetryPolicy:
+          MaximumRetryAttempts: 0
+
+Outputs:
+  BucketName:
+    Description: Paste into Coderhelm, Knowledge, Use in Bedrock, S3 folder.
+    Value: !Ref ExportBucket
+  Prefix:
+    Description: The folder inside the bucket.
+    Value: !Ref Prefix
+  DataSourceId:
+    Condition: SyncsDataSource
+    Description: The data source reading the folder, synced every 15 minutes.
+    Value: !If [CreatesDataSource, !GetAtt ExportDataSource.DataSourceId, !Ref ExistingDataSourceId]
+  KnowledgeBaseArn:
+    Condition: SyncsDataSource
+    Description: Paste into Coderhelm with the data source ID.
+    Value: !Sub "arn:${AWS::Partition}:bedrock:${AWS::Region}:${AWS::AccountId}:knowledge-base/${KnowledgeBaseId}"

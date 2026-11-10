@@ -13,6 +13,8 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilte
 mod api_keys;
 mod auth;
 mod clients;
+mod knowledge_keys;
+mod mcp_knowledge;
 mod mcp_oauth;
 mod mcp_server;
 mod middleware;
@@ -709,6 +711,27 @@ async fn main() -> Result<(), Error> {
             get(routes::knowledge::list_bases).post(routes::knowledge::create_base),
         )
         .route("/knowledge/bedrock", get(routes::knowledge::bedrock_bases))
+        // Using the team's knowledge from Amazon Bedrock (routes::knowledge_bedrock).
+        .route(
+            "/knowledge/keys",
+            get(routes::knowledge_bedrock::list_keys).post(routes::knowledge_bedrock::create_key),
+        )
+        .route(
+            "/knowledge/keys/:key_id",
+            delete(routes::knowledge_bedrock::revoke_key),
+        )
+        .route(
+            "/knowledge/bedrock-sync",
+            get(routes::knowledge_bedrock::get_sync).put(routes::knowledge_bedrock::save_sync),
+        )
+        .route(
+            "/knowledge/bedrock-sync/run",
+            post(routes::knowledge_bedrock::run_sync),
+        )
+        .route(
+            "/knowledge/bedrock-sync/template",
+            get(routes::knowledge_bedrock::export_template),
+        )
         .route(
             "/knowledge/bedrock/import",
             get(routes::knowledge::bedrock_import),
