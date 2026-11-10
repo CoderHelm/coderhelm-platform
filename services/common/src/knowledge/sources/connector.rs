@@ -114,6 +114,15 @@ pub struct Listing {
     /// More items exist than a source keeps.
     #[serde(default)]
     pub truncated: bool,
+    /// With `complete`: external id prefixes this listing didn't cover in
+    /// full (listed only from a cursor, or not read this time). Stored items
+    /// under them stay unless named in `deleted`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub partial: Vec<String>,
+    /// Part of the selection couldn't be read while the rest was: the sync
+    /// keeps what it read and shows this on the source.
+    #[serde(skip)]
+    pub problem: Option<ConnectorError>,
 }
 
 /// One item's content.
@@ -215,6 +224,13 @@ pub trait Connector: Send + Sync {
 
     /// One item's content.
     async fn fetch(&self, source: &Source, item: &Listed) -> Result<Document, ConnectorError>;
+
+    /// A stored item's id as this connector names it now, when it was saved
+    /// under an older form (`None`: unchanged). The sync renames the stored
+    /// item before comparing, so it is neither fetched as new nor removed.
+    fn current_id(&self, _source: &Source, _external_id: &str) -> Option<String> {
+        None
+    }
 }
 
 // ── HTTP shared by the connectors ───────────────────────────────────────────

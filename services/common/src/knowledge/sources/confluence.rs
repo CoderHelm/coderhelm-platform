@@ -453,6 +453,7 @@ impl Connector for Confluence<'_> {
             complete: complete && !truncated,
             cursor: String::new(),
             truncated,
+            ..Default::default()
         })
     }
 

@@ -302,6 +302,7 @@ impl Connector for Drive<'_> {
             complete: complete && !truncated,
             cursor: String::new(),
             truncated: truncated || !complete,
+            ..Default::default()
         })
     }
 

@@ -16,13 +16,21 @@
 //!
 //! The picker is project, then dataset, then document type. Ids carry the
 //! project (`dataset:<project>:<dataset>`, `type:<project>:<dataset>:<type>`)
-//! so a source knows which project it reads without a separate setting.
+//! so a source knows which projects it reads without a separate setting.
+//! One source can read datasets and types from several projects: each
+//! project and dataset is listed, synced and queried on its own, and a
+//! document's id is `<project>:<dataset>:<_id>` so ids never collide across
+//! projects (ids saved as `<dataset>:<_id>`, before a source could read
+//! several projects, are renamed to the source's first project on the next
+//! sync).
 //!
 //! Changes: a document's `_rev` is its marker, as with the token. There is
 //! no webhook through a sign-in, so syncs run on a schedule and each one
 //! asks only for documents whose `_updatedAt` is after the newest one seen
-//! (an incremental listing). Every [`FULL_EVERY_SECS`], and whenever the
-//! selection changes, a complete listing finds deleted documents too.
+//! (an incremental listing). Each project's dataset keeps its own cursor:
+//! every [`FULL_EVERY_SECS`], and whenever what is picked in it changes, a
+//! complete listing of it finds deleted documents too. A project the
+//! sign-in can't read is named on the source while the others sync.
 //! Drafts and release versions are never synced.
 
 use serde::{Deserialize, Serialize};
@@ -114,29 +122,111 @@ impl<'a> Ref<'a> {
     }
 }
 
-/// The one project a selection reads (every entry must name the same one).
-pub fn selection_project(source: &Source) -> Result<String, String> {
-    let mut project: Option<&str> = None;
+/// A dataset and the types picked in it (`None`: every content type).
+pub type DatasetScope = (String, Option<Vec<String>>);
+
+/// One project of a selection and what is picked in it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ProjectScope {
+    pub project: String,
+    pub sets: Vec<DatasetScope>,
+}
+
+/// What a selection reads, grouped by project (in the order first picked).
+/// A whole project can't be picked, and an empty selection reads nothing.
+pub fn selection_scope(source: &Source) -> Result<Vec<ProjectScope>, String> {
+    let mut out: Vec<ProjectScope> = Vec::new();
     for s in &source.selection {
         let r = parse_ref(&s.id)
             .ok_or_else(|| format!("\"{}\" isn't a Sanity dataset or type.", s.title))?;
-        if matches!(r, Ref::Project(_)) {
-            return Err("Pick a dataset or document types, not a whole project.".into());
-        }
-        match project {
-            None => project = Some(r.project()),
-            Some(p) if p != r.project() => {
-                return Err("Pick from one Sanity project per source.".into())
+        let (project, ds, ty) = match r {
+            Ref::Project(_) => {
+                return Err("Pick a dataset or document types, not a whole project.".into())
             }
-            _ => {}
+            Ref::Dataset { project, dataset } => (project, dataset, None),
+            Ref::Type {
+                project,
+                dataset,
+                ty,
+            } => (project, dataset, Some(ty)),
+        };
+        let p = match out.iter().position(|p| p.project == project) {
+            Some(i) => i,
+            None => {
+                out.push(ProjectScope {
+                    project: project.to_string(),
+                    sets: Vec::new(),
+                });
+                out.len() - 1
+            }
+        };
+        let sets = &mut out[p].sets;
+        let at = match sets.iter().position(|(d, _)| d == ds) {
+            Some(i) => i,
+            None => {
+                sets.push((ds.to_string(), Some(Vec::new())));
+                sets.len() - 1
+            }
+        };
+        match (ty, &mut sets[at].1) {
+            (None, slot) => *slot = None,
+            (Some(t), Some(list)) => {
+                if !list.iter().any(|x| x == t) {
+                    list.push(t.to_string())
+                }
+            }
+            (Some(_), None) => {}
         }
     }
-    project
-        .map(str::to_string)
-        .ok_or_else(|| "Pick at least one thing to sync.".into())
+    if out.is_empty() {
+        return Err("Pick at least one thing to sync.".into());
+    }
+    Ok(out)
 }
 
-/// Where the next listing starts.
+/// Every project a selection reads, in the order first picked.
+pub fn selection_projects(source: &Source) -> Result<Vec<String>, String> {
+    Ok(selection_scope(source)?
+        .into_iter()
+        .map(|p| p.project)
+        .collect())
+}
+
+/// The project a source read before a selection could span several: the
+/// `project_id` saved on it, else the selection's only project. Items and
+/// cursors saved then carry no project and belong to this one.
+pub fn legacy_project(source: &Source) -> Option<String> {
+    if let Some(p) = source.options["project_id"]
+        .as_str()
+        .filter(|p| valid_project(p))
+    {
+        return Some(p.to_string());
+    }
+    match selection_projects(source).ok()?.as_slice() {
+        [one] => Some(one.clone()),
+        _ => None,
+    }
+}
+
+/// A document's stable id: `<project>:<dataset>:<_id>`, unique across the
+/// projects of a source.
+pub fn stable_id(project: &str, dataset: &str, id: &str) -> String {
+    format!("{project}:{dataset}:{id}")
+}
+
+/// The project, dataset and `_id` in a stable id, or in an id saved before
+/// ids carried the project (`<dataset>:<_id>`, read as `legacy`'s).
+fn split_stable<'a>(ext: &'a str, legacy: Option<&'a str>) -> Option<(&'a str, &'a str, &'a str)> {
+    let mut parts = ext.splitn(3, ':');
+    let (a, b, c) = (parts.next()?, parts.next()?, parts.next());
+    match c {
+        Some(id) if valid_project(a) && valid_name(b) && !id.is_empty() => Some((a, b, id)),
+        None if valid_name(a) && !b.is_empty() => Some((legacy?, a, b)),
+        _ => None,
+    }
+}
+
+/// Where the next listing of one project's dataset starts.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Cursor {
     /// The newest `_updatedAt` seen.
@@ -150,14 +240,135 @@ pub struct Cursor {
     pub sel: String,
 }
 
-fn selection_hash(source: &Source) -> String {
-    let mut ids: Vec<&str> = source.selection.iter().map(|s| s.id.as_str()).collect();
+/// A source's cursor: one [`Cursor`] per `<project>:<dataset>`, so one
+/// project's changes or failure never reset another's.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct Cursors {
+    #[serde(default)]
+    pub sets: std::collections::BTreeMap<String, Cursor>,
+}
+
+fn set_key(project: &str, dataset: &str) -> String {
+    format!("{project}:{dataset}")
+}
+
+fn hash_ids(mut ids: Vec<&str>) -> String {
     ids.sort();
     super::hex(&Sha256::digest(ids.join("\n").as_bytes()))[..16].to_string()
 }
 
-/// A dataset and the types picked in it (`None`: every content type).
-type DatasetScope = (String, Option<Vec<String>>);
+/// The hash of the whole selection (what a cursor saved before cursors were
+/// per dataset covered).
+fn selection_hash(source: &Source) -> String {
+    hash_ids(source.selection.iter().map(|s| s.id.as_str()).collect())
+}
+
+/// The hash of what is picked in one project's dataset.
+fn set_hash(source: &Source, project: &str, dataset: &str) -> String {
+    hash_ids(
+        source
+            .selection
+            .iter()
+            .filter(|s| match parse_ref(&s.id) {
+                Some(Ref::Dataset {
+                    project: p,
+                    dataset: d,
+                })
+                | Some(Ref::Type {
+                    project: p,
+                    dataset: d,
+                    ..
+                }) => p == project && d == dataset,
+                _ => false,
+            })
+            .map(|s| s.id.as_str())
+            .collect(),
+    )
+}
+
+/// The source's cursors. One saved before cursors were per dataset (a
+/// single `{since, full_at, sel}`) is read as that cursor for each dataset
+/// of the [`legacy_project`]; it stays incremental only while the
+/// selection is the one it covered.
+pub fn read_cursors(source: &Source) -> Cursors {
+    let Ok(v) = serde_json::from_str::<Value>(&source.cursor) else {
+        return Cursors::default();
+    };
+    if v.get("sets").is_some() {
+        return serde_json::from_value(v).unwrap_or_default();
+    }
+    let old: Cursor = serde_json::from_value(v).unwrap_or_default();
+    let mut out = Cursors::default();
+    let (Some(legacy), Ok(scope)) = (legacy_project(source), selection_scope(source)) else {
+        return out;
+    };
+    if old.since.is_empty() {
+        return out;
+    }
+    let same = old.sel == selection_hash(source);
+    for p in scope.iter().filter(|p| p.project == legacy) {
+        for (ds, _) in &p.sets {
+            out.sets.insert(
+                set_key(&p.project, ds),
+                Cursor {
+                    since: old.since.clone(),
+                    full_at: old.full_at,
+                    sel: if same {
+                        set_hash(source, &p.project, ds)
+                    } else {
+                        String::new()
+                    },
+                },
+            );
+        }
+    }
+    out
+}
+
+/// `e`, saying which project it came from.
+fn in_project(project: &str, e: ConnectorError) -> ConnectorError {
+    let m = |s: String| format!("Sanity project {project}: {s}");
+    match e {
+        ConnectorError::Reconnect(s) => ConnectorError::Reconnect(m(s)),
+        ConnectorError::Forbidden(s) => ConnectorError::Forbidden(m(s)),
+        ConnectorError::NotFound(s) => ConnectorError::NotFound(m(s)),
+        ConnectorError::RateLimited(s) => ConnectorError::RateLimited(m(s)),
+        ConnectorError::Config(s) => ConnectorError::Config(m(s)),
+        ConnectorError::Temporary(s) => ConnectorError::Temporary(m(s)),
+    }
+}
+
+/// What a source shows when some of its projects couldn't be read and the
+/// others synced.
+fn projects_failed(failed: &[(String, ConnectorError)]) -> ConnectorError {
+    let mut names: Vec<&str> = failed.iter().map(|(p, _)| p.as_str()).collect();
+    names.dedup();
+    let why = failed
+        .first()
+        .map(|(_, e)| e.to_string())
+        .unwrap_or_default();
+    let what = match names.as_slice() {
+        [one] => format!("Sanity project {one} couldn't be read with this sign-in"),
+        many => format!(
+            "Sanity projects {} couldn't be read with this sign-in",
+            many.join(", ")
+        ),
+    };
+    let msg = format!("{what} ({why}). The other projects synced.");
+    match failed.first().map(|(_, e)| e) {
+        Some(ConnectorError::RateLimited(_)) => ConnectorError::RateLimited(msg),
+        Some(ConnectorError::Temporary(_)) => ConnectorError::Temporary(msg),
+        _ => ConnectorError::Forbidden(msg),
+    }
+}
+
+/// How one dataset's listing went.
+enum SetListing {
+    /// Only what changed since its cursor.
+    Changed(Vec<Listed>),
+    /// Everything in it (`true`: more than a source keeps).
+    All(Vec<Listed>, bool),
+}
 
 pub struct SanityMcp {
     pub tools: mcp::Tools,
@@ -492,30 +703,19 @@ impl SanityMcp {
             .unwrap_or_default()
     }
 
-    /// Per dataset: the picked types, or `None` for every content type.
-    fn scope(source: &Source) -> Result<(String, Vec<DatasetScope>), ConnectorError> {
-        let project = selection_project(source).map_err(ConnectorError::Config)?;
-        let mut sets: Vec<DatasetScope> = Vec::new();
-        for s in &source.selection {
-            let (ds, ty) = match parse_ref(&s.id) {
-                Some(Ref::Dataset { dataset, .. }) => (dataset, None),
-                Some(Ref::Type { dataset, ty, .. }) => (dataset, Some(ty)),
-                _ => continue,
-            };
-            let at = match sets.iter().position(|(d, _)| d == ds) {
-                Some(i) => i,
-                None => {
-                    sets.push((ds.to_string(), Some(Vec::new())));
-                    sets.len() - 1
-                }
-            };
-            match (ty, &mut sets[at].1) {
-                (None, slot) => *slot = None,
-                (Some(t), Some(list)) => list.push(t.to_string()),
-                (Some(_), None) => {}
-            }
+    /// Per project, per dataset: the picked types, or `None` for every
+    /// content type.
+    fn scope(source: &Source) -> Result<Vec<ProjectScope>, ConnectorError> {
+        selection_scope(source).map_err(ConnectorError::Config)
+    }
+
+    /// Can this sign-in read every one of `projects`? The first one it
+    /// can't is named in the error.
+    pub async fn check_projects(&self, projects: &[String]) -> Result<(), ConnectorError> {
+        for p in projects {
+            self.datasets(p).await.map_err(|e| in_project(p, e))?;
         }
-        Ok((project, sets))
+        Ok(())
     }
 
     fn filter(types: &Option<Vec<String>>) -> (String, Value) {
@@ -528,112 +728,170 @@ impl SanityMcp {
         }
     }
 
-    fn listed(ds: &str, d: &Value) -> Option<Listed> {
+    /// `many`: the source reads several projects, so the place shown names
+    /// the project too.
+    fn listed(project: &str, ds: &str, many: bool, d: &Value) -> Option<Listed> {
         let (id, ty) = (d["_id"].as_str()?, d["_type"].as_str()?);
         Some(Listed {
-            external_id: format!("{ds}:{id}"),
+            external_id: stable_id(project, ds, id),
             title: d["title"].as_str().unwrap_or(id).to_string(),
             url: String::new(),
             updated_at: d["_updatedAt"].as_str().unwrap_or("").to_string(),
             version: d["_rev"].as_str().unwrap_or("").to_string(),
-            path: format!("{ds} / {ty}"),
-            hint: json!({ "dataset": ds, "id": id, "type": ty }),
+            path: if many {
+                format!("{project} / {ds} / {ty}")
+            } else {
+                format!("{ds} / {ty}")
+            },
+            hint: json!({ "project": project, "dataset": ds, "id": id, "type": ty }),
         })
     }
 
-    /// Every document the selection covers, a page at a time by `_id`.
+    /// Every document one dataset's pick covers, a page at a time by `_id`,
+    /// at most `room` of them (`true`: there were more).
     async fn list_all(
         &self,
         project: &str,
-        sets: &[DatasetScope],
+        (ds, types): &DatasetScope,
+        many: bool,
+        room: usize,
     ) -> Result<(Vec<Listed>, bool), ConnectorError> {
         let projection = format!("{{_id, _type, _rev, _updatedAt, \"title\": {TITLE_FIELDS}}}");
         let mut items = Vec::new();
-        for (ds, types) in sets {
-            let (filter, base) = Self::filter(types);
-            let mut after = String::new();
-            loop {
-                let mut params = base.clone();
-                params["after"] = json!(after);
-                let v = self
-                    .query(
-                        project,
-                        ds,
-                        "chPage",
-                        &format!("*[{filter} && _id > $after] | order(_id asc) [0...{PAGE}] {projection}"),
-                        params,
-                    )
-                    .await?;
-                let page = v.as_array().cloned().unwrap_or_default();
-                for d in &page {
-                    if let Some(l) = Self::listed(ds, d) {
-                        items.push(l);
-                    }
+        let (filter, base) = Self::filter(types);
+        let mut after = String::new();
+        loop {
+            let mut params = base.clone();
+            params["after"] = json!(after);
+            let v = self
+                .query(
+                    project,
+                    ds,
+                    "chPage",
+                    &format!(
+                        "*[{filter} && _id > $after] | order(_id asc) [0...{PAGE}] {projection}"
+                    ),
+                    params,
+                )
+                .await?;
+            let page = v.as_array().cloned().unwrap_or_default();
+            for d in &page {
+                if let Some(l) = Self::listed(project, ds, many, d) {
+                    items.push(l);
                 }
-                if items.len() > MAX_ITEMS_PER_SOURCE {
-                    items.truncate(MAX_ITEMS_PER_SOURCE);
-                    return Ok((items, true));
+            }
+            if items.len() > room {
+                items.truncate(room);
+                return Ok((items, true));
+            }
+            match page.last().and_then(|d| d["_id"].as_str()) {
+                Some(last) if page.len() >= PAGE && last > after.as_str() => {
+                    after = last.to_string()
                 }
-                match page.last().and_then(|d| d["_id"].as_str()) {
-                    Some(last) if page.len() >= PAGE && last > after.as_str() => {
-                        after = last.to_string()
-                    }
-                    _ => break,
-                }
+                _ => break,
             }
         }
         Ok((items, false))
     }
 
-    /// Documents changed after `since`, oldest first. `None` when more
-    /// changed than a source keeps (a complete listing is due then).
+    /// One dataset's documents changed after `since`, oldest first. `None`
+    /// when more than `room` changed (a complete listing is due then).
     async fn list_changed(
         &self,
         project: &str,
-        sets: &[DatasetScope],
+        (ds, types): &DatasetScope,
+        many: bool,
         since: &str,
+        room: usize,
     ) -> Result<Option<Vec<Listed>>, ConnectorError> {
         let projection = format!("{{_id, _type, _rev, _updatedAt, \"title\": {TITLE_FIELDS}}}");
         let mut items = Vec::new();
-        for (ds, types) in sets {
-            let (filter, base) = Self::filter(types);
-            let (mut at, mut after) = (since.to_string(), String::new());
-            loop {
-                let mut params = base.clone();
-                params["since"] = json!(at);
-                params["after"] = json!(after);
-                let v = self
-                    .query(
-                        project,
-                        ds,
-                        "chPage",
-                        &format!("*[{filter} && (_updatedAt > $since || (_updatedAt == $since && _id > $after))] | order(_updatedAt asc, _id asc) [0...{PAGE}] {projection}"),
-                        params,
-                    )
-                    .await?;
-                let page = v.as_array().cloned().unwrap_or_default();
-                for d in &page {
-                    if let Some(l) = Self::listed(ds, d) {
-                        items.push(l);
-                    }
+        let (filter, base) = Self::filter(types);
+        let (mut at, mut after) = (since.to_string(), String::new());
+        loop {
+            let mut params = base.clone();
+            params["since"] = json!(at);
+            params["after"] = json!(after);
+            let v = self
+                .query(
+                    project,
+                    ds,
+                    "chPage",
+                    &format!("*[{filter} && (_updatedAt > $since || (_updatedAt == $since && _id > $after))] | order(_updatedAt asc, _id asc) [0...{PAGE}] {projection}"),
+                    params,
+                )
+                .await?;
+            let page = v.as_array().cloned().unwrap_or_default();
+            for d in &page {
+                if let Some(l) = Self::listed(project, ds, many, d) {
+                    items.push(l);
                 }
-                if items.len() > MAX_ITEMS_PER_SOURCE {
-                    return Ok(None);
+            }
+            if items.len() > room {
+                return Ok(None);
+            }
+            let last = page.last();
+            match (
+                last.and_then(|d| d["_updatedAt"].as_str()),
+                last.and_then(|d| d["_id"].as_str()),
+            ) {
+                (Some(u), Some(i)) if page.len() >= PAGE => {
+                    at = u.to_string();
+                    after = i.to_string();
                 }
-                let last = page.last();
-                match (
-                    last.and_then(|d| d["_updatedAt"].as_str()),
-                    last.and_then(|d| d["_id"].as_str()),
-                ) {
-                    (Some(u), Some(i)) if page.len() >= PAGE => {
-                        at = u.to_string();
-                        after = i.to_string();
-                    }
-                    _ => break,
-                }
+                _ => break,
             }
         }
         Ok(Some(items))
+    }
+
+    /// One dataset: only what changed when its cursor allows, else
+    /// everything.
+    async fn list_set(
+        &self,
+        project: &str,
+        set: &DatasetScope,
+        many: bool,
+        prev: Option<&Cursor>,
+        sel: &str,
+        room: usize,
+    ) -> Result<SetListing, ConnectorError> {
+        if let Some(p) = prev.filter(|p| {
+            !p.since.is_empty() && p.sel == sel && self.now - p.full_at < FULL_EVERY_SECS
+        }) {
+            if let Some(items) = self
+                .list_changed(project, set, many, &p.since, room)
+                .await?
+            {
+                return Ok(SetListing::Changed(items));
+            }
+        }
+        let (items, more) = self.list_all(project, set, many, room).await?;
+        Ok(SetListing::All(items, more))
+    }
+
+    /// The source's options as one project's documents read them: the
+    /// Studio address is that project's (`studio_urls`), or the source's
+    /// one Studio address when it reads one project or this is the project
+    /// it was set for.
+    fn options_for(source: &Source, project: &str, many: bool) -> Value {
+        let mut o = source.options.clone();
+        let own = source.options["studio_urls"][project]
+            .as_str()
+            .filter(|u| u.starts_with("https://"))
+            .map(str::to_string);
+        let shared = source.options["studio_url"].as_str().unwrap_or("");
+        let studio = match own {
+            Some(u) => u,
+            None if !many || legacy_project(source).as_deref() == Some(project) => {
+                shared.to_string()
+            }
+            None => String::new(),
+        };
+        if o.is_object() {
+            o["studio_url"] = json!(studio);
+        }
+        o
     }
 }
 
@@ -728,49 +986,131 @@ impl Connector for SanityMcp {
         }
     }
 
+    /// Every project and dataset of the selection is listed on its own
+    /// cursor. A dataset listed in full makes the listing complete for its
+    /// documents only; one listed from its cursor, or whose project couldn't
+    /// be read, keeps what is stored for it (`partial`). A project that
+    /// can't be read is named in the source's status while the others sync.
     async fn list(&self, source: &Source) -> Result<Listing, ConnectorError> {
-        let (project, sets) = Self::scope(source)?;
-        let sel = selection_hash(source);
-        let prev: Cursor = serde_json::from_str(&source.cursor).unwrap_or_default();
-        let incremental =
-            !prev.since.is_empty() && prev.sel == sel && self.now - prev.full_at < FULL_EVERY_SECS;
-        if incremental {
-            if let Some(items) = self.list_changed(&project, &sets, &prev.since).await? {
-                let cursor = Cursor {
-                    since: newest(&items, &prev.since),
-                    ..prev.clone()
+        let scope = Self::scope(source)?;
+        let many = scope.len() > 1;
+        let prev = read_cursors(source);
+        let mut next = Cursors::default();
+        let mut items: Vec<Listed> = Vec::new();
+        let mut partial: Vec<String> = Vec::new();
+        let mut failed: Vec<(String, ConnectorError)> = Vec::new();
+        let (mut any_full, mut truncated, mut sets) = (false, false, 0usize);
+        for p in &scope {
+            for set in &p.sets {
+                sets += 1;
+                let key = set_key(&p.project, &set.0);
+                let prefix = format!("{key}:");
+                let old = prev.sets.get(&key);
+                let keep_old = |next: &mut Cursors| {
+                    if let Some(c) = old {
+                        next.sets.insert(key.clone(), c.clone());
+                    }
                 };
-                return Ok(Listing {
-                    items,
-                    deleted: Vec::new(),
-                    complete: false,
-                    cursor: serde_json::to_string(&cursor).unwrap_or_default(),
-                    truncated: source.truncated,
-                });
+                let room = MAX_ITEMS_PER_SOURCE.saturating_sub(items.len());
+                if room == 0 {
+                    // The source is full: what is stored here stays.
+                    truncated = true;
+                    partial.push(prefix);
+                    keep_old(&mut next);
+                    continue;
+                }
+                let sel = set_hash(source, &p.project, &set.0);
+                match self.list_set(&p.project, set, many, old, &sel, room).await {
+                    Ok(SetListing::Changed(changed)) => {
+                        let c = old.cloned().unwrap_or_default();
+                        next.sets.insert(
+                            key,
+                            Cursor {
+                                since: newest(&changed, &c.since),
+                                ..c
+                            },
+                        );
+                        partial.push(prefix);
+                        items.extend(changed);
+                    }
+                    Ok(SetListing::All(all, more)) => {
+                        next.sets.insert(
+                            key,
+                            Cursor {
+                                since: newest(&all, ""),
+                                full_at: self.now,
+                                sel,
+                            },
+                        );
+                        any_full = true;
+                        if more {
+                            // Beyond what a source keeps: nothing stored here
+                            // is removed by this listing.
+                            truncated = true;
+                            partial.push(prefix);
+                        }
+                        items.extend(all);
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            provider = PROVIDER,
+                            project = %p.project,
+                            dataset = %set.0,
+                            error = %e,
+                            "A Sanity project's dataset wasn't listed; the others sync"
+                        );
+                        keep_old(&mut next);
+                        partial.push(prefix);
+                        failed.push((p.project.clone(), e));
+                    }
+                }
             }
         }
-        let (items, truncated) = self.list_all(&project, &sets).await?;
-        let cursor = Cursor {
-            since: newest(&items, ""),
-            full_at: self.now,
-            sel,
-        };
+        // Nothing could be read: the source stops with the reason (an
+        // expired sign-in asks to sign in again, as before).
+        if !failed.is_empty() && failed.len() == sets {
+            let (project, e) = failed.swap_remove(0);
+            return Err(if many { in_project(&project, e) } else { e });
+        }
+        if !any_full {
+            truncated = truncated || source.truncated;
+        }
         Ok(Listing {
             items,
             deleted: Vec::new(),
-            complete: !truncated,
-            cursor: serde_json::to_string(&cursor).unwrap_or_default(),
+            complete: any_full,
+            partial,
+            cursor: serde_json::to_string(&next).unwrap_or_default(),
             truncated,
+            problem: (!failed.is_empty()).then(|| projects_failed(&failed)),
         })
     }
 
     async fn fetch(&self, source: &Source, item: &Listed) -> Result<Document, ConnectorError> {
-        let project = selection_project(source).map_err(ConnectorError::Config)?;
-        let ds = item.hint["dataset"].as_str().unwrap_or("");
-        let id = item.hint["id"].as_str().unwrap_or("");
+        let projects = selection_projects(source).map_err(ConnectorError::Config)?;
+        let legacy = legacy_project(source);
+        let from_id = split_stable(&item.external_id, legacy.as_deref());
+        let project = item.hint["project"]
+            .as_str()
+            .or(from_id.map(|(p, _, _)| p))
+            .or(legacy.as_deref())
+            .unwrap_or("");
+        if !projects.iter().any(|p| p == project) {
+            return Err(ConnectorError::NotFound(
+                "The document's Sanity project isn't picked any more.".into(),
+            ));
+        }
+        let ds = item.hint["dataset"]
+            .as_str()
+            .or(from_id.map(|(_, d, _)| d))
+            .unwrap_or("");
+        let id = item.hint["id"]
+            .as_str()
+            .or(from_id.map(|(_, _, i)| i))
+            .unwrap_or("");
         let v = self
             .query(
-                &project,
+                project,
                 ds,
                 "chDoc",
                 "*[_id == $id][0]",
@@ -780,8 +1120,9 @@ impl Connector for SanityMcp {
         if v.is_null() {
             return Err(ConnectorError::NotFound("The document was deleted.".into()));
         }
+        let options = Self::options_for(source, project, projects.len() > 1);
         let ty = v["_type"].as_str().unwrap_or("");
-        let map = type_map(&source.options, ty);
+        let map = type_map(&options, ty);
         let title = if map.title.is_empty() {
             item.title.clone()
         } else {
@@ -791,7 +1132,7 @@ impl Connector for SanityMcp {
                 .unwrap_or_else(|| item.title.clone())
         };
         Ok(Document {
-            url: doc_url(&v, &map, &source.options),
+            url: doc_url(&v, &map, &options),
             updated_at: v["_updatedAt"]
                 .as_str()
                 .unwrap_or(&item.updated_at)
@@ -799,6 +1140,15 @@ impl Connector for SanityMcp {
             sections: doc_sections(&v, &title, &map),
             title,
         })
+    }
+
+    /// Ids saved before they carried the project (`<dataset>:<_id>`) are the
+    /// [`legacy_project`]'s.
+    fn current_id(&self, source: &Source, external_id: &str) -> Option<String> {
+        let legacy = legacy_project(source)?;
+        let (p, d, i) = split_stable(external_id, Some(&legacy))?;
+        let now = stable_id(p, d, i);
+        (now != external_id).then_some(now)
     }
 }
 
@@ -1164,9 +1514,11 @@ mod tests {
             .unwrap();
         assert!(l.complete);
         assert_eq!(l.items.len(), PAGE + 1);
-        assert_eq!(l.items[0].external_id, "production:d000");
+        assert_eq!(l.items[0].external_id, "abc123:production:d000");
         assert_eq!(l.items[0].version, "r1");
-        let cur: Cursor = serde_json::from_str(&l.cursor).unwrap();
+        assert_eq!(l.items[0].path, "production / post");
+        let cur: Cursors = serde_json::from_str(&l.cursor).unwrap();
+        let cur = &cur.sets["abc123:production"];
         assert_eq!(cur.since, "2026-10-03T00:00:00Z");
         assert_eq!(cur.full_at, 1_000);
         assert_eq!(f.calls().len(), 2);
@@ -1187,6 +1539,8 @@ mod tests {
             now: 2_000,
             hints: Vec::new(),
         };
+        // A cursor saved before cursors were per dataset: read as this
+        // project's, and still incremental (the selection is the same).
         let mut src = source(&["type:abc123:production:post"]);
         src.cursor = serde_json::to_string(&Cursor {
             since: "2026-10-03T00:00:00Z".into(),
@@ -1200,9 +1554,12 @@ mod tests {
             "an incremental listing removes nothing by itself"
         );
         assert_eq!(l.items.len(), 1);
-        let cur: Cursor = serde_json::from_str(&l.cursor).unwrap();
+        let cur: Cursors = serde_json::from_str(&l.cursor).unwrap();
+        assert_eq!(cur.sets.len(), 1, "saved again in the new form");
+        let cur = &cur.sets["abc123:production"];
         assert_eq!(cur.since, "2026-10-04T00:00:00Z");
         assert_eq!(cur.full_at, 1_000);
+        assert_eq!(cur.sel, set_hash(&src, "abc123", "production"));
         // The engine fetches only the changed document and removes nothing.
         let stored = |ext: &str, v: &str| FileMeta {
             external_id: ext.into(),
@@ -1212,7 +1569,10 @@ mod tests {
             ..Default::default()
         };
         let plan = plan_sync(
-            &[stored("production:p1", "r1"), stored("production:p2", "r1")],
+            &[
+                stored("abc123:production:p1", "r1"),
+                stored("abc123:production:p2", "r1"),
+            ],
             &l,
         );
         assert_eq!(plan.fetch.len(), 1);
@@ -1378,20 +1738,373 @@ mod tests {
         );
         assert_eq!(parse_ref("dataset:ABC:production"), None);
         assert_eq!(parse_ref("type:abc123:prod/../x:post"), None);
-        assert!(selection_project(&source(&[
-            "dataset:abc123:production",
-            "type:abc123:staging:post"
-        ]))
-        .is_ok());
-        assert!(selection_project(&source(&[
-            "dataset:abc123:production",
-            "dataset:other1:production"
-        ]))
-        .is_err());
-        assert!(selection_project(&source(&["project:abc123"])).is_err());
+        assert_eq!(
+            selection_projects(&source(&[
+                "dataset:abc123:production",
+                "type:abc123:staging:post"
+            ]))
+            .unwrap(),
+            ["abc123"]
+        );
+        assert_eq!(
+            selection_projects(&source(&[
+                "dataset:abc123:production",
+                "dataset:other1:production"
+            ]))
+            .unwrap(),
+            ["abc123", "other1"],
+            "one source reads several projects"
+        );
+        assert_eq!(
+            selection_projects(&source(&["project:abc123"])).unwrap_err(),
+            "Pick a dataset or document types, not a whole project."
+        );
+        assert_eq!(
+            selection_projects(&source(&[])).unwrap_err(),
+            "Pick at least one thing to sync."
+        );
         assert!(is_sanity_mcp("https://mcp.sanity.io"));
         assert!(is_sanity_mcp("https://mcp.sanity.io/mcp"));
         assert!(!is_sanity_mcp("https://api.sanity.io"));
         assert!(!is_sanity_mcp("https://mcp.sanity.io.evil.example"));
+    }
+
+    /// Two projects, each answering for its own datasets. `fail` names a
+    /// project the sign-in can't read.
+    fn two_projects(fail: Option<&'static str>) -> Arc<FakeMcp> {
+        server(move |_, args| {
+            let (project, ds) = (
+                args["projectId"].as_str().unwrap_or(""),
+                args["dataset"].as_str().unwrap_or(""),
+            );
+            if Some(project) == fail {
+                return Err(ConnectorError::Forbidden("Project not found".into()));
+            }
+            let q = args["query"].as_str().unwrap();
+            if q.starts_with("{\"chDoc\"") {
+                let id = args["params"]["id"].as_str().unwrap();
+                return Ok(text_result(&json!({"chDoc": {
+                    "_id": id, "_type": "post", "_updatedAt": "2026-10-02T00:00:00Z",
+                    "title": format!("{project} {ds} {id}"),
+                    "body": [{"_type": "block", "style": "normal", "children": [{"text": format!("Text of {id} in {project}.")}]}]
+                }})));
+            }
+            let at = if project == "abc123" {
+                "2026-10-02T00:00:00Z"
+            } else {
+                "2026-10-05T00:00:00Z"
+            };
+            let page = if q.contains("$since") {
+                vec![doc("p2", "r2", "2026-10-06T00:00:00Z")]
+            } else {
+                vec![doc("p1", "r1", at)]
+            };
+            Ok(text_result(&json!({"chPage": page})))
+        })
+    }
+
+    fn queried(f: &FakeMcp) -> Vec<(String, String, bool)> {
+        f.calls()
+            .iter()
+            .map(|(_, a)| {
+                (
+                    a["projectId"].as_str().unwrap_or("").to_string(),
+                    a["dataset"].as_str().unwrap_or("").to_string(),
+                    a["query"].as_str().unwrap_or("").contains("$since"),
+                )
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn one_source_lists_every_project_in_its_selection() {
+        let f = two_projects(None);
+        let c = SanityMcp {
+            tools: f.clone(),
+            now: 1_000,
+            hints: Vec::new(),
+        };
+        let src = source(&["type:abc123:production:post", "dataset:other1:staging"]);
+        let l = c.list(&src).await.unwrap();
+        assert!(l.complete && l.partial.is_empty() && l.problem.is_none());
+        let ids: Vec<&str> = l.items.iter().map(|i| i.external_id.as_str()).collect();
+        assert_eq!(
+            ids,
+            ["abc123:production:p1", "other1:staging:p1"],
+            "the same _id in two projects is two documents"
+        );
+        assert_eq!(l.items[1].path, "other1 / staging / post");
+        assert_eq!(l.items[1].hint["project"], "other1");
+        assert_eq!(
+            queried(&f),
+            [
+                ("abc123".into(), "production".into(), false),
+                ("other1".into(), "staging".into(), false)
+            ]
+        );
+        let cur: Cursors = serde_json::from_str(&l.cursor).unwrap();
+        assert_eq!(cur.sets["abc123:production"].since, "2026-10-02T00:00:00Z");
+        assert_eq!(cur.sets["other1:staging"].since, "2026-10-05T00:00:00Z");
+        // A document is read from its own project.
+        c.fetch(&src, &l.items[1]).await.unwrap();
+        let last = f.calls().last().unwrap().1.clone();
+        assert_eq!(
+            (last["projectId"].as_str(), last["dataset"].as_str()),
+            (Some("other1"), Some("staging"))
+        );
+        // One outside the selection's projects is never read.
+        let mut stray = l.items[1].clone();
+        stray.hint["project"] = json!("zzz999");
+        assert!(c.fetch(&src, &stray).await.unwrap_err().item_gone());
+    }
+
+    #[tokio::test]
+    async fn each_project_keeps_its_own_cursor() {
+        let f = two_projects(None);
+        let src0 = source(&["type:abc123:production:post", "dataset:other1:staging"]);
+        let mut src = src0.clone();
+        let mut sets = std::collections::BTreeMap::new();
+        sets.insert(
+            "abc123:production".to_string(),
+            Cursor {
+                since: "2026-10-02T00:00:00Z".into(),
+                full_at: 900,
+                sel: set_hash(&src0, "abc123", "production"),
+            },
+        );
+        // other1's complete listing is due (six hours old).
+        sets.insert(
+            "other1:staging".to_string(),
+            Cursor {
+                since: "2026-10-05T00:00:00Z".into(),
+                full_at: 0,
+                sel: set_hash(&src0, "other1", "staging"),
+            },
+        );
+        src.cursor = serde_json::to_string(&Cursors { sets }).unwrap();
+        let l = SanityMcp {
+            tools: f.clone(),
+            now: FULL_EVERY_SECS + 10,
+            hints: Vec::new(),
+        }
+        .list(&src)
+        .await
+        .unwrap();
+        assert_eq!(
+            queried(&f),
+            [
+                ("abc123".into(), "production".into(), true),
+                ("other1".into(), "staging".into(), false)
+            ],
+            "one project incremental, the other complete"
+        );
+        assert!(l.complete);
+        assert_eq!(
+            l.partial,
+            ["abc123:production:"],
+            "only the complete listing removes"
+        );
+        let cur: Cursors = serde_json::from_str(&l.cursor).unwrap();
+        assert_eq!(cur.sets["abc123:production"].full_at, 900);
+        assert_eq!(cur.sets["abc123:production"].since, "2026-10-06T00:00:00Z");
+        assert_eq!(cur.sets["other1:staging"].full_at, FULL_EVERY_SECS + 10);
+        // Picking more in one project resets only that project's cursor.
+        let mut more = src.clone();
+        more.selection.push(Selected {
+            id: "type:abc123:production:author".into(),
+            title: "author".into(),
+            ..Default::default()
+        });
+        let f2 = two_projects(None);
+        SanityMcp {
+            tools: f2.clone(),
+            now: 1_000,
+            hints: Vec::new(),
+        }
+        .list(&more)
+        .await
+        .unwrap();
+        assert_eq!(
+            queried(&f2),
+            [
+                ("abc123".into(), "production".into(), false),
+                ("other1".into(), "staging".into(), true)
+            ]
+        );
+    }
+
+    #[test]
+    fn stable_ids_carry_the_project_and_old_ids_move_to_it() {
+        let c = SanityMcp {
+            tools: two_projects(None),
+            now: 0,
+            hints: Vec::new(),
+        };
+        let mut src = source(&["dataset:abc123:production"]);
+        assert_eq!(
+            stable_id("abc123", "production", "p1"),
+            "abc123:production:p1"
+        );
+        assert_eq!(
+            c.current_id(&src, "production:p1").as_deref(),
+            Some("abc123:production:p1")
+        );
+        assert_eq!(c.current_id(&src, "abc123:production:p1"), None);
+        // Several projects: the saved project_id says whose old ids are.
+        src.selection.push(Selected {
+            id: "dataset:other1:production".into(),
+            ..Default::default()
+        });
+        assert_eq!(c.current_id(&src, "production:p1"), None, "no owner known");
+        src.options = json!({"project_id": "other1"});
+        assert_eq!(
+            c.current_id(&src, "production:p1").as_deref(),
+            Some("other1:production:p1")
+        );
+        assert_eq!(
+            split_stable("other1:production:a.b-c", None),
+            Some(("other1", "production", "a.b-c"))
+        );
+    }
+
+    async fn run_sync(
+        store: &crate::knowledge::sources::store::memory::MemSyncStore,
+        c: &SanityMcp,
+    ) -> crate::knowledge::sources::sync::Outcome {
+        use crate::knowledge::search::testing::WordEmbedder;
+        use crate::knowledge::sources::sync::{run, Ctx};
+        let now = || 1_800_000_000;
+        let ctx = Ctx {
+            store,
+            connector: c,
+            embedder: &WordEmbedder,
+            team: "TEAM#t",
+            now: &now,
+        };
+        run(&ctx, "kb1", "s1").await
+    }
+
+    fn stored_item(src: &Source, ext: &str, v: &str) -> FileMeta {
+        FileMeta {
+            id: super::super::item_id(&src.id, ext),
+            kb_id: src.kb_id.clone(),
+            source_id: src.id.clone(),
+            external_id: ext.into(),
+            remote_version: v.into(),
+            status: FileStatus::Ready,
+            ready_version: 1,
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn a_re_sync_moves_old_ids_without_fetching_or_dropping_them() {
+        use crate::knowledge::sources::store::memory::MemSyncStore;
+        let store = MemSyncStore::default();
+        let mut src = source(&["dataset:abc123:production", "dataset:other1:staging"]);
+        src.id = "s1".into();
+        src.kb_id = "kb1".into();
+        src.kind = Some(Kind::Sanity);
+        src.options = json!({"project_id": "abc123"});
+        // Saved before ids carried the project.
+        let old = stored_item(&src, "production:p1", "r1");
+        store
+            .items
+            .lock()
+            .unwrap()
+            .insert(old.id.clone(), old.clone());
+        store
+            .sources
+            .lock()
+            .unwrap()
+            .insert("s1".into(), src.clone());
+        let f = two_projects(None);
+        let c = SanityMcp {
+            tools: f.clone(),
+            now: 1_000,
+            hints: Vec::new(),
+        };
+        let o = run_sync(&store, &c).await;
+        assert!(o.error.is_none(), "{:?}", o.error);
+        assert_eq!(o.removed, 0, "the old document isn't dropped");
+        assert_eq!(o.fetched, 1, "only the other project's new document");
+        let items = store.items.lock().unwrap();
+        let moved = &items[&old.id];
+        assert_eq!(moved.external_id, "abc123:production:p1");
+        assert_eq!(moved.ready_version, 1, "its index stays");
+        let mut ids: Vec<&str> = items.values().map(|f| f.external_id.as_str()).collect();
+        ids.sort();
+        assert_eq!(ids, ["abc123:production:p1", "other1:staging:p1"]);
+    }
+
+    #[tokio::test]
+    async fn a_project_that_cant_be_read_is_named_and_the_others_sync() {
+        use crate::knowledge::sources::store::memory::MemSyncStore;
+        let store = MemSyncStore::default();
+        let mut src = source(&["dataset:abc123:production", "dataset:other1:staging"]);
+        src.id = "s1".into();
+        src.kb_id = "kb1".into();
+        src.kind = Some(Kind::Sanity);
+        // other1 was synced before; its cursor and documents must survive.
+        let kept = stored_item(&src, "other1:staging:p9", "r1");
+        store
+            .items
+            .lock()
+            .unwrap()
+            .insert(kept.id.clone(), kept.clone());
+        let mut sets = std::collections::BTreeMap::new();
+        let other = Cursor {
+            since: "2026-10-05T00:00:00Z".into(),
+            full_at: 900,
+            sel: set_hash(&src, "other1", "staging"),
+        };
+        sets.insert("other1:staging".to_string(), other.clone());
+        src.cursor = serde_json::to_string(&Cursors { sets }).unwrap();
+        store
+            .sources
+            .lock()
+            .unwrap()
+            .insert("s1".into(), src.clone());
+
+        let c = SanityMcp {
+            tools: two_projects(Some("other1")),
+            now: 1_000,
+            hints: Vec::new(),
+        };
+        let l = c.list(&src).await.unwrap();
+        assert!(l.complete);
+        assert_eq!(l.partial, ["other1:staging:"]);
+        let p = l.problem.clone().expect("the failing project is reported");
+        assert!(p.to_string().contains("Sanity project other1"), "{p}");
+        assert!(p.to_string().contains("The other projects synced."));
+        let cur: Cursors = serde_json::from_str(&l.cursor).unwrap();
+        assert_eq!(cur.sets["other1:staging"], other, "its cursor is kept");
+        assert_eq!(cur.sets["abc123:production"].full_at, 1_000);
+
+        let o = run_sync(&store, &c).await;
+        assert_eq!(o.indexed, 1, "abc123 synced");
+        assert_eq!(o.removed, 0, "other1's documents stay");
+        let items = store.items.lock().unwrap().clone();
+        assert!(items.contains_key(&kept.id));
+        assert!(items
+            .values()
+            .any(|f| f.external_id == "abc123:production:p1" && f.ready_version > 0));
+        let s = store.sources.lock().unwrap()["s1"].clone();
+        assert_eq!(s.status, super::super::Status::Error);
+        let e = s.error.unwrap();
+        assert!(e.message.contains("other1"), "{}", e.message);
+        assert_ne!(e.action, "sign_in", "the sign-in itself still works");
+
+        // When no project can be read, the reason stops the source as before.
+        let expired = server(|_, _| Err(ConnectorError::Reconnect("The sign-in expired.".into())));
+        let e = SanityMcp {
+            tools: expired,
+            now: 0,
+            hints: Vec::new(),
+        }
+        .list(&src)
+        .await
+        .unwrap_err();
+        assert!(matches!(e, ConnectorError::Reconnect(_)));
     }
 }

@@ -250,7 +250,7 @@ async fn one_round(ctx: &Ctx<'_>, src: &mut Source) -> Outcome {
     };
     out.listed = listing.items.len();
     src.truncated = listing.truncated;
-    let stored = match ctx.store.items(ctx.team, &src.kb_id, &src.id).await {
+    let mut stored = match ctx.store.items(ctx.team, &src.kb_id, &src.id).await {
         Ok(s) => s,
         Err(e) => {
             out.error = Some(ConnectorError::Temporary(format!(
@@ -259,6 +259,7 @@ async fn one_round(ctx: &Ctx<'_>, src: &mut Source) -> Outcome {
             return out;
         }
     };
+    rename_stored(ctx, src, &mut stored).await;
     let by_ext: HashMap<String, FileMeta> = stored
         .iter()
         .map(|f| (f.external_id.clone(), f.clone()))
@@ -317,7 +318,42 @@ async fn one_round(ctx: &Ctx<'_>, src: &mut Source) -> Outcome {
         }
     }
     src.cursor = listing.cursor;
+    if out.error.is_none() {
+        out.error = listing.problem;
+    }
     out
+}
+
+/// Stored items saved under an id the connector names differently now are
+/// renamed in place (an id that is already stored under its new name is
+/// a duplicate, and goes).
+async fn rename_stored(ctx: &Ctx<'_>, src: &Source, stored: &mut Vec<FileMeta>) {
+    let mut taken: std::collections::HashSet<String> =
+        stored.iter().map(|f| f.external_id.clone()).collect();
+    let mut keep = Vec::with_capacity(stored.len());
+    for mut f in std::mem::take(stored) {
+        let Some(now) = ctx
+            .connector
+            .current_id(src, &f.external_id)
+            .filter(|n| *n != f.external_id)
+        else {
+            keep.push(f);
+            continue;
+        };
+        if taken.contains(&now) {
+            if ctx.store.delete_item(ctx.team, &f).await.is_err() {
+                keep.push(f);
+            }
+            continue;
+        }
+        taken.insert(now.clone());
+        f.external_id = now;
+        if let Err(e) = ctx.store.put_item(ctx.team, &f).await {
+            tracing::warn!(error = %e, "A stored knowledge item wasn't renamed; the next sync tries again");
+        }
+        keep.push(f);
+    }
+    *stored = keep;
 }
 
 enum Indexed {
