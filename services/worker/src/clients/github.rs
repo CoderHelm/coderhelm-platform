@@ -2839,6 +2839,83 @@ impl GitHubClient {
             .await
     }
 
+    /// Takes one label off an issue/PR (the label stays in the repo).
+    pub async fn remove_label(
+        &self,
+        owner: &str,
+        repo: &str,
+        issue_number: u64,
+        label: &str,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let url = format!(
+            "{API_BASE}/repos/{owner}/{repo}/issues/{issue_number}/labels/{}",
+            urlencoding::encode(label)
+        );
+        self.delete_url(&url).await
+    }
+
+    /// One repo label (`name`, `color`, `description`), None when the repo
+    /// has no label of that name.
+    pub async fn get_label(
+        &self,
+        owner: &str,
+        repo: &str,
+        label: &str,
+    ) -> Result<Option<serde_json::Value>, Box<dyn std::error::Error + Send + Sync>> {
+        let url = format!(
+            "{API_BASE}/repos/{owner}/{repo}/labels/{}",
+            urlencoding::encode(label)
+        );
+        match self.get(&url).await {
+            Ok(v) => Ok(Some(v)),
+            Err(e) if e.to_string().contains("404") => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Whether any issue or pull request (open or closed) carries `label`.
+    pub async fn label_in_use(
+        &self,
+        owner: &str,
+        repo: &str,
+        label: &str,
+    ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+        let url = format!(
+            "{API_BASE}/repos/{owner}/{repo}/issues?state=all&per_page=1&labels={}",
+            urlencoding::encode(label)
+        );
+        Ok(self
+            .get(&url)
+            .await?
+            .as_array()
+            .is_some_and(|a| !a.is_empty()))
+    }
+
+    /// Deletes a repo label. Used only for a label CoderHelm itself created
+    /// by mistake that nothing else uses.
+    pub async fn delete_label(
+        &self,
+        owner: &str,
+        repo: &str,
+        label: &str,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let url = format!(
+            "{API_BASE}/repos/{owner}/{repo}/labels/{}",
+            urlencoding::encode(label)
+        );
+        self.delete_url(&url).await
+    }
+
+    async fn delete_url(&self, url: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let headers = self.auth_headers().await?;
+        let mut req = self.http.delete(url);
+        for (k, v) in headers {
+            req = req.header(k, v);
+        }
+        ok_or_body(self.send_tracked(req).await?).await?;
+        Ok(())
+    }
+
     /// Every label defined in the repo (name + description), all pages.
     pub async fn list_repo_labels(
         &self,

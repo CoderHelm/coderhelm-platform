@@ -222,7 +222,10 @@ fn a_check_skipped_for_a_label_coderhelm_may_not_add_is_one_action_never_a_wait(
     // CoderHelm never adds a deploy label just because a workflow asks.
     let src = include_str!("../review_pr.rs");
     let may = fn_src(src, "pub(crate) async fn may_add_label(");
-    assert!(may.contains("\"deploy\", \"staging\""));
+    assert!(may.contains("is_deploy_label(label)"));
+    assert!(common::e2e::workflow_gate::is_deploy_label(
+        "CI:DEPLOY_STAGING"
+    ));
 }
 
 #[test]
