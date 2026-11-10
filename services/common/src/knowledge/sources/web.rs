@@ -195,6 +195,7 @@ impl Connector for Web<'_> {
             complete: complete && !truncated,
             cursor: String::new(),
             truncated,
+            ..Default::default()
         })
     }
 

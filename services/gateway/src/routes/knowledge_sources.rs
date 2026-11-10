@@ -731,7 +731,7 @@ pub fn clean_options(kind: Kind, raw: &Value) -> Result<Value, String> {
         return Ok(json!({}));
     };
     let allowed: &[&str] = match kind {
-        Kind::Sanity => &["project_id", "studio_url", "types"],
+        Kind::Sanity => &["project_id", "studio_url", "studio_urls", "types"],
         Kind::Confluence => &["cloud_id", "site"],
         Kind::S3 => &["account", "bucket", "region"],
         _ => &[],
@@ -741,7 +741,24 @@ pub fn clean_options(kind: Kind, raw: &Value) -> Result<Value, String> {
         if !allowed.contains(&k.as_str()) {
             continue;
         }
-        if k == "types" {
+        if k == "studio_urls" {
+            // One Studio address per project, for a source reading several.
+            let Some(urls) = v.as_object() else {
+                return Err("Studio addresses must be an object.".into());
+            };
+            if urls.len() > 50 {
+                return Err("Give up to 50 Studio addresses.".into());
+            }
+            for (p, u) in urls {
+                let u = u.as_str().unwrap_or("");
+                if !sanity::valid_project(p) {
+                    return Err(format!("\"{p}\" isn't a Sanity project id."));
+                }
+                if u.len() > 300 || (!u.is_empty() && !u.starts_with("https://")) {
+                    return Err("The Studio address must start with https://".into());
+                }
+            }
+        } else if k == "types" {
             let Some(types) = v.as_object() else {
                 return Err("Type mappings must be an object.".into());
             };
@@ -956,19 +973,19 @@ async fn add_signin_source(
         selection: selection.clone(),
         ..Default::default()
     };
-    let project =
-        sanity_mcp::selection_project(&probe).map_err(|m| fail(StatusCode::BAD_REQUEST, &m))?;
+    let projects =
+        sanity_mcp::selection_projects(&probe).map_err(|m| fail(StatusCode::BAD_REQUEST, &m))?;
     let si = member_signin(state, claims, kind).await?;
-    // Checks the sign-in can read the project before anything is saved.
+    // Checks the sign-in can read every project before anything is saved.
     connect::sanity_signin(
         super::mcp_servers::runtime(state, &claims.team_id),
         si.server.clone(),
         si.owner.clone(),
     )
-    .datasets(&project)
+    .check_projects(&projects)
     .await
     .map_err(|e| connector_fail(kind, &e))?;
-    options["project_id"] = json!(project);
+    set_sanity_projects(&mut options, &projects);
     let name = input
         .name
         .as_deref()
@@ -1006,6 +1023,25 @@ async fn add_signin_source(
         "setup": Value::Null,
         "visibility_note": VISIBILITY_NOTE,
     }))
+}
+
+/// Records the projects a sign-in source reads. `project_id` keeps the
+/// project it was first saved with (documents and cursors saved before a
+/// source could read several projects are that project's), so it is set
+/// only when missing.
+fn set_sanity_projects(options: &mut Value, projects: &[String]) {
+    if !options.is_object() {
+        *options = json!({});
+    }
+    let has = options["project_id"]
+        .as_str()
+        .is_some_and(|p| !p.is_empty());
+    if !has {
+        if let Some(first) = projects.first() {
+            options["project_id"] = json!(first);
+        }
+    }
+    options["project_ids"] = json!(projects);
 }
 
 /// The dataset and picked types of a Sanity selection.
@@ -1081,16 +1117,22 @@ pub async fn update_source(
     if let Some(sel) = &input.selection {
         src.selection = clean_selection(sel).map_err(|m| fail(StatusCode::BAD_REQUEST, &m))?;
         if src.signin.is_some() {
-            let project = sanity_mcp::selection_project(&src)
+            let projects = sanity_mcp::selection_projects(&src)
                 .map_err(|m| fail(StatusCode::BAD_REQUEST, &m))?;
-            src.options["project_id"] = json!(project);
+            set_sanity_projects(&mut src.options, &projects);
         }
         resync = true;
     }
     if let Some(o) = &input.options {
         let mut cleaned = clean_options(kind, o).map_err(|m| fail(StatusCode::BAD_REQUEST, &m))?;
         // Keep what was worked out before (the site, the registered hook).
-        for keep in ["cloud_id", "site", "sanity_hook_id", "project_id"] {
+        for keep in [
+            "cloud_id",
+            "site",
+            "sanity_hook_id",
+            "project_id",
+            "project_ids",
+        ] {
             if cleaned.get(keep).is_none() {
                 if let Some(v) = src.options.get(keep) {
                     cleaned[keep] = v.clone();
@@ -1545,6 +1587,53 @@ mod tests {
         assert_eq!(
             clean_options(Kind::Notion, &json!({"project_id": "x"})).unwrap(),
             json!({})
+        );
+        let per_project =
+            json!({"studio_urls": {"abc123": "https://a.sanity.studio", "other1": ""}});
+        assert_eq!(
+            clean_options(Kind::Sanity, &per_project).unwrap(),
+            per_project
+        );
+        assert!(clean_options(
+            Kind::Sanity,
+            &json!({"studio_urls": {"abc123": "http://a.example"}})
+        )
+        .is_err());
+        assert!(clean_options(
+            Kind::Sanity,
+            &json!({"studio_urls": {"NOT A PROJECT": "https://a.example"}})
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn a_sign_in_source_records_every_project_and_keeps_its_first() {
+        let mut o = json!({});
+        set_sanity_projects(&mut o, &["abc123".into(), "other1".into()]);
+        assert_eq!(
+            o,
+            json!({"project_id": "abc123", "project_ids": ["abc123", "other1"]})
+        );
+        // Documents saved before belong to the first project: it stays.
+        set_sanity_projects(&mut o, &["other1".into()]);
+        assert_eq!(
+            o,
+            json!({"project_id": "abc123", "project_ids": ["other1"]})
+        );
+        let two = Source {
+            selection: ["dataset:abc123:production", "type:other1:staging:post"]
+                .iter()
+                .map(|i| Selected {
+                    id: i.to_string(),
+                    title: i.to_string(),
+                    ..Default::default()
+                })
+                .collect(),
+            ..Default::default()
+        };
+        assert_eq!(
+            sanity_mcp::selection_projects(&two).unwrap(),
+            ["abc123", "other1"]
         );
     }
 

@@ -550,7 +550,11 @@ pub fn plan_sync(stored: &[FileMeta], listing: &Listing) -> Plan {
     }
     let deleted: HashSet<&str> = listing.deleted.iter().map(String::as_str).collect();
     for f in stored {
-        let gone = if listing.complete {
+        let covered = !listing
+            .partial
+            .iter()
+            .any(|p| f.external_id.starts_with(p.as_str()));
+        let gone = if listing.complete && covered {
             !seen.contains(f.external_id.as_str())
         } else {
             deleted.contains(f.external_id.as_str())

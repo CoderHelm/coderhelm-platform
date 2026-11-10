@@ -304,6 +304,7 @@ impl Connector for GitHub<'_> {
             complete: complete && !truncated,
             cursor: String::new(),
             truncated,
+            ..Default::default()
         })
     }
 

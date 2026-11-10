@@ -677,6 +677,7 @@ impl Connector for Notion<'_> {
             complete: complete && !truncated,
             cursor: String::new(),
             truncated,
+            ..Default::default()
         })
     }
 

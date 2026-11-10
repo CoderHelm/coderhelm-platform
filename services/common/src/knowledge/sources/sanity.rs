@@ -318,6 +318,7 @@ impl Connector for Sanity<'_> {
             complete: !truncated,
             cursor: String::new(),
             truncated,
+            ..Default::default()
         })
     }
 
