@@ -22,6 +22,14 @@
 //!   findings stay listed, the PR stays a draft, and the run waits on a
 //!   person (`needs_input`). Uncapped, two runs spent $29 in 17 rounds
 //!   where the count of open findings went down by one and back up.
+//! - A finished run's PR held on its findings never waits on a round
+//!   nothing queued. The ready decision queues one review-fix round for
+//!   them, once per head, while the run has rounds left ([`round_left`]),
+//!   and waits for it; with none left, or once a round ran on the head and
+//!   the findings are still there, the hold names what a person does
+//!   ([`person_todo`]) and promises no CoderHelm work. A PR once stayed a
+//!   draft for days on "CoderHelm fixes them in its review rounds" after its
+//!   run had spent its fix budget.
 //! - Each round is told what the rounds before it found and looked up
 //!   ([`round_note`], [`fix_feedback`]), so it doesn't repeat the same
 //!   database and live-data lookups from scratch.
@@ -93,7 +101,7 @@ pub fn section(items: &[String]) -> String {
     let list: Vec<String> = items.iter().map(|i| format!("- {i}")).collect();
     format!(
         "{START}\n## Open review findings\nCoderHelm's own review of this pull request found \
-         these. It fixes them before the pull request is marked ready:\n{}\n{END}",
+         these. The pull request stays a draft while any of them is listed here:\n{}\n{END}",
         list.join("\n")
     )
 }
@@ -114,15 +122,92 @@ pub fn listed(body: &str) -> Vec<String> {
 }
 
 /// Why the PR may not be marked ready or merged yet, if it may not: its own
-/// review still lists open findings.
+/// review still lists open findings. Says only what is open, never who
+/// fixes it: that depends on whether a round is queued ([`fixing_why`],
+/// [`person_todo`]).
 pub fn hold(body: &str) -> Option<String> {
     let open = listed(body);
-    (!open.is_empty()).then(|| {
-        format!(
-            "CoderHelm's own review has {} open finding(s) not fixed yet",
-            open.len()
-        )
-    })
+    (!open.is_empty()).then(|| format!("{} still open", count(open.len())))
+}
+
+/// "1 finding from CoderHelm's review is" / "N findings ... are".
+fn count(n: usize) -> String {
+    if n == 1 {
+        "1 finding from CoderHelm's review is".to_string()
+    } else {
+        format!("{n} findings from CoderHelm's review are")
+    }
+}
+
+/// What a person does about findings no queued round will fix.
+pub fn person_todo() -> &'static str {
+    "Fix them on the branch, or remove a finding from the \"Open review findings\" list once \
+     you've judged it."
+}
+
+/// The wait while a queued round fixes the `n` findings listed.
+pub fn fixing_why(n: usize) -> String {
+    if n == 1 {
+        "CoderHelm is fixing 1 finding from its review".to_string()
+    } else {
+        format!("CoderHelm is fixing {n} findings from its review")
+    }
+}
+
+/// What a finished run has left for a fix round on its own review's
+/// findings, read from its record.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RoundBudget {
+    pub status: String,
+    /// The run guard stopped the run: a person has it.
+    pub guard_open: bool,
+    /// The run itself stopped its rounds and handed the findings to a
+    /// person (`own_review_handed`).
+    pub handed: bool,
+    /// Fix rounds taken on the own review's findings.
+    pub rounds: u32,
+    /// Automatic fix pushes taken (`MAX_AUTO_FIX_PUSHES`).
+    pub pushes: u32,
+    /// Review and CI fix cycles taken (`MAX_CI_FIX_CYCLES`).
+    pub cycles: usize,
+    /// The head a round was last queued for (`own_fix_head`).
+    pub queued_head: String,
+}
+
+/// Whether a fix round may be queued now for the findings on `head`:
+/// `Err` names why not, for the log. The round counts against the same
+/// budgets the run's own rounds draw on.
+pub fn round_left(
+    b: &RoundBudget,
+    head: &str,
+    max_pushes: u32,
+    max_cycles: usize,
+) -> Result<(), String> {
+    use common::run_status::{COMPLETED, NEEDS_INPUT, SUCCESS};
+    if head.is_empty() {
+        return Err("the pull request's head wasn't read".into());
+    }
+    if ![COMPLETED, SUCCESS, NEEDS_INPUT].contains(&b.status.as_str()) {
+        return Err(format!("the run is {}, not finished", b.status));
+    }
+    if b.guard_open {
+        return Err("the run guard stopped the run".into());
+    }
+    if b.handed {
+        return Err("the run stopped its rounds and handed the findings to a person".into());
+    }
+    if b.rounds >= MAX_FIX_ROUNDS {
+        return Err(format!(
+            "the run took its {MAX_FIX_ROUNDS} fix rounds on its own review's findings"
+        ));
+    }
+    if b.pushes >= max_pushes || b.cycles >= max_cycles {
+        return Err("the run's automatic fix budget is spent".into());
+    }
+    if b.queued_head == head {
+        return Err("a fix round already ran on this head".into());
+    }
+    Ok(())
 }
 
 /// Fix rounds a run takes on its own review's findings before it hands the
@@ -316,7 +401,11 @@ mod tests {
         let s = section(&items);
         let body = format!("{s}\n\n## Summary\nx");
         assert_eq!(listed(&body), items);
-        assert!(hold(&body).unwrap().contains("2 open finding(s)"));
+        assert_eq!(
+            hold(&body).unwrap(),
+            "2 findings from CoderHelm's review are still open"
+        );
+        assert!(!s.contains("It fixes them"));
         assert!(section(&[]).is_empty());
         assert!(hold("## Summary\nx").is_none());
     }

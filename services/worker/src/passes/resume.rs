@@ -4741,6 +4741,254 @@ async fn record_own_round_note(
     }
 }
 
+/// What becomes of a finished run's PR held on its own review's findings
+/// (`ready::settle`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum OwnRound {
+    /// A review-fix round for them is queued or running on this head.
+    Fixing,
+    /// No round will run: a person deals with them. Why, for the log.
+    Person(String),
+}
+
+/// The record fields that say what a finished run has left for a round on
+/// its own review's findings.
+pub(crate) fn own_round_budget(
+    item: &std::collections::HashMap<String, AttributeValue>,
+    cycles: usize,
+) -> super::own_review::RoundBudget {
+    let s = |k: &str| {
+        item.get(k)
+            .and_then(|v| v.as_s().ok())
+            .cloned()
+            .unwrap_or_default()
+    };
+    let n = |k: &str| {
+        item.get(k)
+            .and_then(|v| v.as_n().ok())
+            .and_then(|v| v.parse::<u32>().ok())
+            .unwrap_or(0)
+    };
+    super::own_review::RoundBudget {
+        status: s("status"),
+        guard_open: item.contains_key("guard_open"),
+        handed: item.contains_key(OWN_REVIEW_HANDED),
+        rounds: n("own_review_rounds"),
+        pushes: n("auto_fix_pushes"),
+        cycles,
+        queued_head: s(OWN_FIX_HEAD),
+    }
+}
+
+/// Whether the run is finished (completed, or waiting on a person): no
+/// loop of its own takes its review's findings any more.
+pub(crate) async fn run_finished(state: &WorkerState, team_id: &str, run_id: &str) -> bool {
+    use common::run_status::{COMPLETED, NEEDS_INPUT, SUCCESS};
+    let status = state
+        .dynamo
+        .get_item()
+        .table_name(&state.config.runs_table_name)
+        .key("team_id", attr_s(team_id))
+        .key("run_id", attr_s(run_id))
+        .projection_expression("#s")
+        .expression_attribute_names("#s", "status")
+        .consistent_read(true)
+        .send()
+        .await
+        .ok()
+        .and_then(|o| o.item)
+        .and_then(|i| i.get("status").and_then(|v| v.as_s().ok()).cloned())
+        .unwrap_or_default();
+    [COMPLETED, SUCCESS, NEEDS_INPUT].contains(&status.as_str())
+}
+
+/// On the run: the head a review-fix round was queued for after the run
+/// finished, so one is queued once per head.
+pub(crate) const OWN_FIX_HEAD: &str = "own_fix_head";
+/// On the run: its rounds on its own review's findings stopped and a
+/// person has them; nothing queues another.
+pub(crate) const OWN_REVIEW_HANDED: &str = "own_review_handed";
+
+/// A finished run's PR is held on its own review's findings (`items`, on
+/// `head`): queues one review-fix round for them while the run has rounds
+/// left, once per head, under the same budgets as the run's own rounds, and
+/// says whether one is on its way. Never promises a round nothing queued.
+pub(crate) async fn queue_own_review_round(
+    state: &WorkerState,
+    github: &GitHubClient,
+    team_id: &str,
+    run_id: &str,
+    head: &str,
+    items: &[String],
+) -> OwnRound {
+    if run_id.is_empty() || items.is_empty() {
+        return OwnRound::Person("no run or nothing listed".into());
+    }
+    let item = match state
+        .dynamo
+        .get_item()
+        .table_name(&state.config.runs_table_name)
+        .key("team_id", attr_s(team_id))
+        .key("run_id", attr_s(run_id))
+        .consistent_read(true)
+        .send()
+        .await
+    {
+        Ok(o) => o.item.unwrap_or_default(),
+        Err(e) => {
+            warn!(run_id, error = %e, "Could not read the run to fix its own review's findings");
+            return OwnRound::Person("the run couldn't be read".into());
+        }
+    };
+    let status = item
+        .get("status")
+        .and_then(|v| v.as_s().ok())
+        .cloned()
+        .unwrap_or_default();
+    let queued_here = item.get(OWN_FIX_HEAD).and_then(|v| v.as_s().ok()) == Some(&head.to_string());
+    // The round queued for this head hasn't finished: the run is working it.
+    if queued_here && common::run_status::IN_FLIGHT.contains(&status.as_str()) {
+        return OwnRound::Fixing;
+    }
+    let cycles = load_cycle_from_checkpoint(state, team_id, run_id).await;
+    let budget = own_round_budget(&item, cycles);
+    if let Err(why) =
+        super::own_review::round_left(&budget, head, super::MAX_AUTO_FIX_PUSHES, MAX_CI_FIX_CYCLES)
+    {
+        return OwnRound::Person(why);
+    }
+    let Some((ticket, branch)) = super::recheck::message_of(&item) else {
+        return OwnRound::Person("the run's record lacks what a round needs".into());
+    };
+    if state.config.ci_fix_queue_url.is_empty() {
+        return OwnRound::Person("no queue to run the round on".into());
+    }
+    // Claim it: the run is working again, on this head, with one more round
+    // taken. The same conditions as `round_left`, so two deciders can't both
+    // queue it.
+    let now = chrono::Utc::now().to_rfc3339();
+    let claim = state
+        .dynamo
+        .update_item()
+        .table_name(&state.config.runs_table_name)
+        .key("team_id", attr_s(team_id))
+        .key("run_id", attr_s(run_id))
+        .update_expression(
+            "SET #s = :aw, status_run_id = :sri, current_pass = :aw, #fh = :h, \
+             own_review_rounds = if_not_exists(own_review_rounds, :zero) + :one, updated_at = :t \
+             REMOVE waiting_on, wait_reminded_at",
+        )
+        .condition_expression(
+            "#s = :was AND attribute_not_exists(guard_open) AND attribute_not_exists(#hd) \
+             AND (attribute_not_exists(#fh) OR #fh <> :h) \
+             AND (attribute_not_exists(own_review_rounds) OR own_review_rounds < :maxr) \
+             AND (attribute_not_exists(auto_fix_pushes) OR auto_fix_pushes < :maxp)",
+        )
+        .expression_attribute_names("#s", "status")
+        .expression_attribute_names("#fh", OWN_FIX_HEAD)
+        .expression_attribute_names("#hd", OWN_REVIEW_HANDED)
+        .expression_attribute_values(":aw", attr_s(common::run_status::AWAITING_CI))
+        .expression_attribute_values(":sri", attr_s(&format!("awaiting_ci#{run_id}")))
+        .expression_attribute_values(":was", attr_s(&status))
+        .expression_attribute_values(":h", attr_s(head))
+        .expression_attribute_values(":zero", attr_n(0))
+        .expression_attribute_values(":one", attr_n(1))
+        .expression_attribute_values(":maxr", attr_n(super::own_review::MAX_FIX_ROUNDS))
+        .expression_attribute_values(":maxp", attr_n(super::MAX_AUTO_FIX_PUSHES))
+        .expression_attribute_values(":t", attr_s(&now))
+        .send()
+        .await;
+    if let Err(e) = claim {
+        if !format!("{e:?}").contains("ConditionalCheckFailed") {
+            warn!(run_id, error = %e, "Could not claim a fix round for the own review's findings");
+        }
+        return OwnRound::Person("another decision changed the run first".into());
+    }
+    let give_back = |why: String| async move {
+        let _ = state
+            .dynamo
+            .update_item()
+            .table_name(&state.config.runs_table_name)
+            .key("team_id", attr_s(team_id))
+            .key("run_id", attr_s(run_id))
+            .update_expression(
+                "SET #s = :was, status_run_id = :sri, own_review_rounds = own_review_rounds - :one \
+                 REMOVE #fh",
+            )
+            .condition_expression("#s = :aw AND #fh = :h")
+            .expression_attribute_names("#s", "status")
+            .expression_attribute_names("#fh", OWN_FIX_HEAD)
+            .expression_attribute_values(":was", attr_s(&status))
+            .expression_attribute_values(":sri", attr_s(&format!("{status}#{run_id}")))
+            .expression_attribute_values(":aw", attr_s(common::run_status::AWAITING_CI))
+            .expression_attribute_values(":h", attr_s(head))
+            .expression_attribute_values(":one", attr_n(1))
+            .send()
+            .await;
+        warn!(run_id, why = %why, "The fix round for the own review's findings couldn't be queued");
+        OwnRound::Person(why)
+    };
+    if !super::claim_auto_fix_slot(state, team_id, run_id).await {
+        return give_back("the run's automatic fix budget is spent".into()).await;
+    }
+    let base_sha =
+        super::round::branch_head(github, &ticket.repo_owner, &ticket.repo_name, &branch).await;
+    let progress = own_review_progress(&item);
+    let feedback = super::own_review::fix_feedback(
+        items,
+        "The findings are listed under \"Open review findings\" at the top of the pull \
+         request's description; CoderHelm's review comments on the pull request say more.",
+        &progress.notes,
+    );
+    let round = run_round::Round::start(
+        run_round::Kind::ReviewFix,
+        (cycles + 1).min(u32::MAX as usize) as u32,
+        &base_sha,
+        &feedback,
+        true,
+        chrono::Utc::now(),
+    )
+    .parked(false);
+    super::round::record(state, team_id, run_id, &round).await;
+    let body = serde_json::json!({
+        "type": "resume",
+        "team_id": team_id,
+        "run_id": run_id,
+        "installation_id": ticket.installation_id,
+    });
+    let sent = state
+        .sqs
+        .send_message()
+        .queue_url(&state.config.ci_fix_queue_url)
+        .message_body(body.to_string())
+        .delay_seconds(5)
+        .send()
+        .await;
+    if let Err(e) = sent {
+        super::round::clear(state, team_id, run_id).await;
+        return give_back(format!("the round couldn't be queued ({e})")).await;
+    }
+    super::add_progress_note(
+        state,
+        team_id,
+        run_id,
+        &format!(
+            "{}: a review fix round takes them (round {} of {}).",
+            super::own_review::fixing_why(items.len()),
+            budget.rounds + 1,
+            super::own_review::MAX_FIX_ROUNDS
+        ),
+    )
+    .await;
+    info!(
+        run_id,
+        head,
+        open = items.len(),
+        "Queued a fix round for the own review's findings on a finished run"
+    );
+    OwnRound::Fixing
+}
+
 /// The run stops with its own review's findings still open: it says which
 /// and why, waits on a person (`needs_input`, never `completed`), and the PR
 /// stays a draft with them listed at its top.
@@ -4760,6 +5008,22 @@ async fn stop_on_own_findings(
         run_id,
         pr_number, "Own review findings still open — the PR stays a draft"
     );
+    // The run's rounds on them are over: the ready decision never queues
+    // another one, and its hold names what a person does.
+    if let Err(e) = state
+        .dynamo
+        .update_item()
+        .table_name(&state.config.runs_table_name)
+        .key("team_id", attr_s(&msg.team_id))
+        .key("run_id", attr_s(run_id))
+        .update_expression("SET #hd = :t")
+        .expression_attribute_names("#hd", OWN_REVIEW_HANDED)
+        .expression_attribute_values(":t", attr_s(&chrono::Utc::now().to_rfc3339()))
+        .send()
+        .await
+    {
+        warn!(run_id, error = %e, "Could not record that the own review's rounds stopped");
+    }
     super::add_progress_note(state, &msg.team_id, run_id, reason).await;
     wait_for_review(
         state, msg, run_id, reason, pr_url, pr_number, branch, usage, duration,

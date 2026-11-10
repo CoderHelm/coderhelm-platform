@@ -125,7 +125,13 @@ fn planned_work_left_opens_a_draft_then_coderhelm_finishes_it() {
         draft_hold(&gh.pr(21).body, "Add the card block", false),
         Some("Planned work is not done yet (listed under Not finished)".to_string())
     );
+    // The section says what holds the draft and promises no work: whether
+    // CoderHelm works it is the run's status, not the description's.
     assert!(gh
+        .pr(21)
+        .body
+        .contains("stays a draft while this list is here"));
+    assert!(!gh
         .pr(21)
         .body
         .contains("CoderHelm keeps working on it here"));

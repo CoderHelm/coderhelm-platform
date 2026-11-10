@@ -59,6 +59,16 @@
 //! - Every wait is bounded: one whose reason hasn't changed on the same head
 //!   for `common::draft_hold::WAIT_LIMIT_SECS` becomes a hold that names what
 //!   didn't happen.
+//! - A hold never promises work nothing queued. A finished run's pull
+//!   request once stayed a draft for days on "CoderHelm fixes them in its
+//!   review rounds" after its run had spent its fix budget: no round ever
+//!   ran. CoderHelm's own open review findings on a finished run's draft
+//!   queue one review-fix round, once per head, while the run has rounds
+//!   left (`resume::queue_own_review_round`), and the pull request waits for
+//!   it ("CoderHelm is fixing N findings from its review"); with no round
+//!   left, or once one ran on the head and the findings are still there, the
+//!   hold names what a person does. Every other hold says only what CoderHelm
+//!   does when something is queued to do it.
 
 use std::collections::HashMap;
 
@@ -151,6 +161,10 @@ pub struct Facts {
     pub runs_when_ready: Vec<String>,
     /// The run's last recorded hold, to bound a wait that doesn't change.
     pub prior: Option<DraftHold>,
+    /// A review-fix round for CoderHelm's own open review findings is
+    /// queued or running on this head (`resume::queue_own_review_round`):
+    /// the findings are a wait, not a hold.
+    pub own_fixing: bool,
     /// When it is decided; a wait is bounded against it.
     pub now: Option<chrono::DateTime<chrono::Utc>>,
 }
@@ -242,20 +256,22 @@ pub fn body_holds(body: &str) -> Vec<Reason> {
 /// no longer holds (`proof::holds_blocked_on`).
 pub fn body_holds_on(body: &str, ci_green: bool) -> Vec<Reason> {
     let mut out = Vec::new();
-    // Security: never shipped over without a person.
+    // Security: never shipped over without a person. Nothing runs the
+    // security audit again once the run is over, so a person settles each.
     if super::proof::holds_security_items(body) {
         out.push(Reason::new(
             "Security items are open under Open items",
-            "Fix them on this branch (CoderHelm checks again on the next push), or delete each \
-             security line once a person has checked it.",
+            "Fix them on this branch, then delete each security line once a person has checked \
+             it.",
         ));
     }
-    // The change doesn't yet do what the ticket asked: correctness.
+    // The change doesn't yet do what the ticket asked: correctness. The
+    // run's planned-work rounds are over by the time this is decided for a
+    // finished run, and nothing queues another.
     if super::proof::holds_unfinished(body) {
         out.push(Reason::new(
             "Planned work is not done yet (listed under Not finished)",
-            "CoderHelm keeps working it on this pull request; finish it on the branch, or remove \
-             the section if the work isn't needed.",
+            "Finish it on the branch, or remove the section if the work isn't needed.",
         ));
     }
     // A check that would once have stopped the pull request (carried-over
@@ -267,13 +283,10 @@ pub fn body_holds_on(body: &str, ci_green: bool) -> Vec<Reason> {
             "Fix it on this branch, or delete that line once a person has dealt with it.",
         ));
     }
-    // Correctness findings of CoderHelm's own review, not yet fixed.
-    if let Some(why) = super::own_review::hold(body) {
-        out.push(Reason::new(
-            why,
-            "CoderHelm fixes them in its review rounds; fix them on the branch, or remove a \
-             finding from the list once a person has judged it.",
-        ));
+    // Correctness findings of CoderHelm's own review, not yet fixed: a
+    // person's, unless a round is queued for them ([`decide`]).
+    if let Some(r) = own_review_reason(body) {
+        out.push(r);
     }
     // A stacked change asks a person to look first.
     if let Some(why) = super::stack::hold(body) {
@@ -284,6 +297,12 @@ pub fn body_holds_on(body: &str, ci_green: bool) -> Vec<Reason> {
         ));
     }
     out
+}
+
+/// The hold for CoderHelm's own open review findings no queued round will
+/// fix: what is open and what a person does, no CoderHelm work promised.
+fn own_review_reason(body: &str) -> Option<Reason> {
+    super::own_review::hold(body).map(|why| Reason::new(why, super::own_review::person_todo()))
 }
 
 /// The one decision. Pure, so every case is tested.
@@ -310,6 +329,17 @@ pub fn decide(f: &Facts) -> Decision {
         };
     }
     let mut reasons = body_holds_on(&f.body, f.ci.green);
+    // A round queued for CoderHelm's own findings settles them by itself:
+    // a wait (bounded like every wait), not a person's hold.
+    let mut wait: Option<String> = None;
+    if f.own_fixing {
+        if let Some(own) = own_review_reason(&f.body) {
+            reasons.retain(|r| r != &own);
+            wait = Some(super::own_review::fixing_why(
+                super::own_review::listed(&f.body).len(),
+            ));
+        }
+    }
     // Redirects and links the change adds that fail when checked now: a
     // named, checked correctness problem a reader would hit.
     if !f.links_blocking.is_empty() {
@@ -322,7 +352,6 @@ pub fn decide(f: &Facts) -> Decision {
              request is marked ready.",
         ));
     }
-    let mut wait: Option<String> = None;
     // A wait on CI proof (the failing-test fix's checks, an end-to-end
     // fix's repeat runs), and the checks of it that skip drafts.
     let mut proof_wait: Option<String> = None;
@@ -693,6 +722,7 @@ pub async fn settle(ctx: &Ctx<'_>) -> Outcome {
         Err(r) => return retry_or_give_up(ctx, &run_id, &pr_url, r).await,
     };
     ask_for_review(ctx, &mut facts).await;
+    fix_own_findings(ctx, &run_id, &mut facts).await;
     if !run_id.is_empty() && !facts.closed {
         facts.prior = run_hold(ctx.state, ctx.team_id, &run_id)
             .await
@@ -971,6 +1001,42 @@ async fn ask_for_review(ctx: &Ctx<'_>, f: &mut Facts) {
     info!(pr = ctx.pr, head = %f.head, ?ask, "The draft needs CoderHelm's review of its head");
     if ask == super::review_pr::ReadyReviewAsk::ReviewerOff {
         f.reviewer_off = true;
+    }
+}
+
+/// Whether the draft is held on CoderHelm's own open review findings that a
+/// round could take: a draft nobody put back, with findings listed and a
+/// head read.
+pub fn wants_own_round(f: &Facts) -> bool {
+    !f.closed
+        && f.draft
+        && f.put_back_by.is_none()
+        && !f.head.is_empty()
+        && !super::own_review::listed(&f.body).is_empty()
+}
+
+/// CoderHelm's own open review findings hold the draft: a review-fix round
+/// is queued for them while the run has rounds left (once per head), and
+/// the decision waits for it. Otherwise they are a person's to deal with.
+async fn fix_own_findings(ctx: &Ctx<'_>, run_id: &str, f: &mut Facts) {
+    if !wants_own_round(f) {
+        return;
+    }
+    let items = super::own_review::listed(&f.body);
+    match super::resume::queue_own_review_round(
+        ctx.state,
+        ctx.github,
+        ctx.team_id,
+        run_id,
+        &f.head,
+        &items,
+    )
+    .await
+    {
+        super::resume::OwnRound::Fixing => f.own_fixing = true,
+        super::resume::OwnRound::Person(why) => {
+            info!(pr = ctx.pr, run_id, why = %why, "No fix round for the own review's findings: a person has them");
+        }
     }
 }
 

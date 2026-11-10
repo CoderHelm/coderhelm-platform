@@ -942,7 +942,7 @@ pub struct RunDraftHold {
     pub kind: String,
     /// The run page's line, ready to show.
     #[schema(
-        example = "Finished, but pull request #318 stays a draft: Security items are open under Open items. Fix them on this branch (CoderHelm checks again on the next push), or delete each security line once a person has checked it."
+        example = "Finished, but pull request #318 stays a draft: Security items are open under Open items. Fix them on this branch, then delete each security line once a person has checked it."
     )]
     pub summary: String,
     /// Each reason, with what to do about it.
@@ -963,7 +963,7 @@ pub struct RunDraftHoldReason {
     pub what: String,
     /// What to do about it.
     #[schema(
-        example = "Fix them on this branch (CoderHelm checks again on the next push), or delete each security line once a person has checked it."
+        example = "Fix them on this branch, then delete each security line once a person has checked it."
     )]
     pub todo: String,
 }

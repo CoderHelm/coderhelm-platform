@@ -4596,7 +4596,7 @@
           "summary": {
             "description": "The run page's line, ready to show.",
             "examples": [
-              "Finished, but pull request #318 stays a draft: Security items are open under Open items. Fix them on this branch (CoderHelm checks again on the next push), or delete each security line once a person has checked it."
+              "Finished, but pull request #318 stays a draft: Security items are open under Open items. Fix them on this branch, then delete each security line once a person has checked it."
             ],
             "type": "string"
           }
@@ -4615,7 +4615,7 @@
           "todo": {
             "description": "What to do about it.",
             "examples": [
-              "Fix them on this branch (CoderHelm checks again on the next push), or delete each security line once a person has checked it."
+              "Fix them on this branch, then delete each security line once a person has checked it."
             ],
             "type": "string"
           },
