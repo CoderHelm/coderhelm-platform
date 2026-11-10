@@ -1167,6 +1167,7 @@ mod series;
 pub mod skill_compat;
 pub mod skill_suggest;
 pub mod skills;
+pub mod skipped_checks;
 pub mod stack;
 pub(crate) mod steps;
 pub(crate) mod stop_gate;

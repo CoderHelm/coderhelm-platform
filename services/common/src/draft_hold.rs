@@ -102,7 +102,19 @@ pub struct DraftHold {
     /// this is old.
     #[serde(default)]
     pub checked_at: String,
+    /// The head commit it was decided on: a wait is bounded per head
+    /// ([`DraftHold::stalled`]).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub head: String,
+    /// CoderHelm marked the pull request ready so the checks that skip
+    /// drafts run, and it is still being proven (or failed its proof).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub ready: bool,
 }
+
+/// A wait whose reason hasn't changed on the same head for this long is a
+/// hold that names what didn't happen.
+pub const WAIT_LIMIT_SECS: i64 = 2 * 3600;
 
 impl DraftHold {
     /// A hold, or `None` when there is no reason: a hold is never for
@@ -125,7 +137,36 @@ impl DraftHold {
             pr_url: pr_url.trim().to_string(),
             since: now.clone(),
             checked_at: now,
+            head: String::new(),
+            ready: false,
         })
+    }
+
+    /// Whether the wait `why` on `head` has stalled at `now`: this record
+    /// waited on the same reason on the same head for [`WAIT_LIMIT_SECS`]
+    /// or more, or is already the hold that said so (its reason starts
+    /// with the wait's). A different head or reason starts over.
+    pub fn stalled(&self, why: &str, head: &str, now: chrono::DateTime<chrono::Utc>) -> bool {
+        if head.is_empty() || self.head != head {
+            return false;
+        }
+        let why = Reason::new(why, "").what;
+        let why = why.trim_end_matches('.');
+        if why.is_empty() {
+            return false;
+        }
+        match self.kind {
+            Kind::Waiting => {
+                self.reasons
+                    .first()
+                    .is_some_and(|r| r.what.trim_end_matches('.') == why)
+                    && chrono::DateTime::parse_from_rfc3339(&self.since).is_ok_and(|t| {
+                        (now - t.with_timezone(&chrono::Utc)).num_seconds() >= WAIT_LIMIT_SECS
+                    })
+            }
+            Kind::Held => self.reasons.iter().any(|r| r.what.starts_with(why)),
+            Kind::Failed => false,
+        }
     }
 
     /// Keeps the earlier `since` when the reasons are the same ones.
@@ -161,6 +202,16 @@ impl DraftHold {
             .collect::<Vec<_>>()
             .join(" ");
         match self.kind {
+            Kind::Held if self.ready => format!(
+                "Finished; {} was marked ready so its checks run, and a person needs to deal \
+                 with: {reasons}",
+                self.pr_words()
+            ),
+            Kind::Waiting if self.ready => format!(
+                "Finished; {} was marked ready so its checks run, and is still being proven: \
+                 {reasons} CoderHelm checks again by itself.",
+                self.pr_words()
+            ),
             Kind::Held => format!("Finished, but {} stays a draft: {reasons}", self.pr_words()),
             Kind::Waiting => format!(
                 "Finished; {} stays a draft for now: {reasons} CoderHelm checks again by itself \
@@ -286,6 +337,39 @@ mod tests {
             .unwrap()
             .continuing(Some(&first));
         assert_ne!(other.since, "2026-11-06T22:17:00Z");
+    }
+
+    #[test]
+    fn a_wait_stalls_after_two_hours_on_the_same_head() {
+        let t = |s: &str| {
+            chrono::DateTime::parse_from_rfc3339(s)
+                .unwrap()
+                .with_timezone(&chrono::Utc)
+        };
+        let why = "this failing-test fix waits: checks are skipped";
+        let mut w = DraftHold::new(Kind::Waiting, vec![Reason::new(why, "")], 1, "").unwrap();
+        w.since = "2026-11-10T06:35:00Z".into();
+        w.head = "abc".into();
+        assert!(!w.stalled(why, "abc", t("2026-11-10T08:34:00Z")));
+        assert!(w.stalled(why, "abc", t("2026-11-10T08:35:00Z")));
+        assert!(!w.stalled(why, "def", t("2026-11-10T12:00:00Z")));
+        assert!(!w.stalled("another reason", "abc", t("2026-11-10T12:00:00Z")));
+        // Already the hold that said so: it stays one on that head.
+        let mut h = DraftHold::new(
+            Kind::Held,
+            vec![Reason::new(
+                format!("{why}, and that hasn't changed in 2 hours"),
+                "x",
+            )],
+            1,
+            "",
+        )
+        .unwrap();
+        h.head = "abc".into();
+        assert!(h.stalled(why, "abc", t("2026-11-10T08:36:00Z")));
+        assert!(!h.stalled(why, "def", t("2026-11-10T08:36:00Z")));
+        h.ready = true;
+        assert!(h.summary().contains("was marked ready so its checks run"));
     }
 
     #[test]

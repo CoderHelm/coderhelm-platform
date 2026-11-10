@@ -80,7 +80,7 @@ fn held_facts() -> Facts {
 
 fn says(d: &Decision) -> String {
     match d {
-        Decision::Held { reasons } => reasons
+        Decision::Held { reasons } | Decision::Proving { reasons, .. } => reasons
             .iter()
             .map(|r| r.line())
             .collect::<Vec<_>>()
