@@ -661,10 +661,23 @@ fn dataset_names(v: &Value) -> Vec<String> {
     }) {
         push(m["name"].as_str().unwrap_or(""));
     }
-    if let Some(a) = find_key(v, "datasets").and_then(Value::as_array) {
-        for n in a.iter().filter_map(Value::as_str) {
-            push(n);
+    match find_key(v, "datasets") {
+        Some(Value::Array(a)) => {
+            for n in a.iter().filter_map(Value::as_str) {
+                push(n);
+            }
         }
+        // Sanity's server answers in XML with each dataset as an element
+        // named after it (`<datasets><production><aclMode>public</aclMode>
+        // ...</production></datasets>`): the names are the keys.
+        Some(Value::Object(m)) => {
+            for (name, d) in m {
+                if d.get("datasetProfile").and_then(Value::as_str) != Some("comments") {
+                    push(name);
+                }
+            }
+        }
+        _ => {}
     }
     out.sort();
     out
@@ -827,6 +840,58 @@ mod tests {
                 .collect(),
             ..Default::default()
         }
+    }
+
+    /// Sanity's server, as it answered a real project: a sentence, then XML
+    /// with each dataset as an element named after it.
+    #[tokio::test]
+    async fn datasets_named_by_their_elements_are_listed() {
+        let reply = "Here are the datasets: \n<datasets>\n  <production>\n    <aclMode>public</aclMode>\n    <createdAt>2024-01-08T21:23:57.066Z</createdAt>\n  </production>\n  <staging>\n    <aclMode>private</aclMode>\n    <createdAt>2024-02-01T10:00:00.000Z</createdAt>\n  </staging>\n  <comments>\n    <aclMode>private</aclMode>\n    <datasetProfile>comments</datasetProfile>\n  </comments>\n</datasets>";
+        let v = super::super::mcp::data_in(reply).expect("the XML is read");
+        assert_eq!(dataset_names(&v), vec!["production", "staging"]);
+
+        let mcp = server(move |tool, _| match tool {
+            "list_datasets" => Ok(json!({"content": [{"type": "text", "text": reply}]})),
+            _ => Ok(text_result(&json!([]))),
+        });
+        let c = SanityMcp {
+            tools: mcp,
+            now: 0,
+            hints: Vec::new(),
+        };
+        let nodes = c
+            .browse(Some("project:abc123"), "")
+            .await
+            .expect("the datasets are listed");
+        let titles: Vec<&str> = nodes.iter().map(|n| n.title.as_str()).collect();
+        assert_eq!(titles, vec!["production", "staging"]);
+    }
+
+    /// A query answered the way Sanity's server formats it: a sentence, then
+    /// `<documents><document>` holding the JSON of the one result.
+    #[tokio::test]
+    async fn a_query_answered_in_sanitys_xml_is_read() {
+        let mcp = server(|tool, _| match tool {
+            "query_documents" => Ok(json!({"content": [{"type": "text", "text":
+                "Query executed successfully. Found 1 total document, returning 1 (40 tokens): \n<documents>\n  <document>{\n  \"chTypes\": [\n    \"post\",\n    \"venue\"\n  ]\n}</document>\n</documents>\n<count>1</count>\n<totalAvailable>1</totalAvailable>\n"}]})),
+            _ => Ok(text_result(&json!([]))),
+        });
+        let c = SanityMcp {
+            tools: mcp,
+            now: 0,
+            hints: Vec::new(),
+        };
+        let v = c
+            .query(
+                "abc123",
+                "production",
+                "chTypes",
+                "array::unique(*[]._type)",
+                json!({}),
+            )
+            .await
+            .expect("the answer is read");
+        assert_eq!(v, json!(["post", "venue"]));
     }
 
     fn doc(id: &str, rev: &str, at: &str) -> Value {
