@@ -9,7 +9,10 @@
 //!    page objects it imports), found in app code, and the requests the
 //!    trace recorded, found where the app builds or serves them. The diff
 //!    touches the failing path only when it changes one of those app files;
-//!    a spec or helper the change shares with the test is not evidence.
+//!    a helper the change shares with other tests is not evidence. But a
+//!    change that adds or edits the failing test itself (its spec or a page
+//!    object it imports) owns the failure ([`test_changed`]): the fix goes
+//!    on that pull request, never a separate one from the default branch.
 //! 3. **Data dependence**: when the page behaved correctly for its data (a
 //!    registration window not open yet, a full class, content moved on
 //!    staging), the test is wrong, not the app.
@@ -238,6 +241,32 @@ pub fn touched(diff: &[String], path: &[String]) -> Vec<String> {
         .collect()
 }
 
+/// The failing test's own files (its spec and the page objects it imports)
+/// the change adds or edits. The test then runs this change's expectation:
+/// a separate pull request from the default branch can't fix it (the spec
+/// may not even be there), so the failure is the change's to fix.
+pub fn test_changed(diff: &[String], test_files: &[String]) -> Vec<String> {
+    let norm = |p: &str| p.trim_start_matches("./").to_string();
+    let files: Vec<String> = test_files.iter().map(|p| norm(p)).collect();
+    diff.iter()
+        .filter(|f| files.contains(&norm(f)))
+        .cloned()
+        .collect()
+}
+
+/// Why a failure in a test the change wrote or edited is the change's.
+pub fn test_changed_reason(files: &[String]) -> String {
+    format!(
+        "This pull request adds or edits the failing test itself ({}), so the fix belongs on \
+         this pull request, not in a separate one from the default branch.",
+        files
+            .iter()
+            .map(|f| format!("`{f}`"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    )
+}
+
 /// The verdict, from what the diff touches and whether the page was right
 /// for its data.
 pub fn decide(touched: &[String], page_valid_for_data: bool) -> Verdict {
@@ -447,6 +476,26 @@ mod tests {
     /// A page snapshot of a valid state the test didn't expect: the class's
     /// registration isn't open yet.
     pub const NOT_OPEN_YET: &str = "- main:\n  - heading \"Beginner swim, Tuesdays\" [level=1]\n  - paragraph: Registration opens on March 3.\n  - button \"Register\" [disabled]\n";
+
+    /// A test the pull request adds (its spec and page object are only on
+    /// its branch) is the pull request's to fix; a spec it doesn't touch
+    /// is not.
+    #[test]
+    fn a_test_the_change_adds_or_edits_is_the_changes_failure() {
+        let diff = vec![
+            "e2e/pages/venue-subnav.ts".to_string(),
+            "e2e/tests/site/venue-subnav-more-menu.spec.ts".to_string(),
+            "web/src/components/subnav.tsx".to_string(),
+        ];
+        let test_files = vec![
+            "./e2e/tests/site/venue-subnav-more-menu.spec.ts".to_string(),
+            "e2e/pages/venue-subnav.ts".to_string(),
+        ];
+        let changed = test_changed(&diff, &test_files);
+        assert_eq!(changed.len(), 2);
+        assert!(test_changed_reason(&changed).contains("`e2e/pages/venue-subnav.ts`"));
+        assert!(test_changed(&diff, &["e2e/tests/site/home.spec.ts".to_string()]).is_empty());
+    }
 
     #[test]
     fn hooks_come_from_locators_in_steps_and_page_objects() {
