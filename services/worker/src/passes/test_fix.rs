@@ -2267,7 +2267,8 @@ pub struct GateRecord {
     /// Workflow runs started again, as `{sha}:{run}`.
     #[serde(default)]
     pub reruns: Vec<String>,
-    /// Labels CoderHelm added to run skipped checks, as `{sha}:{label}`.
+    /// Labels CoderHelm added to run skipped checks, as `v2:{sha}:{label}`
+    /// (`{sha}:{label}` from before labels were read as patterns).
     #[serde(default)]
     pub labeled: Vec<String>,
     /// The commit the last hold was explained on.
@@ -2531,7 +2532,7 @@ pub fn decide(
             let known = skipped.draft_gated.contains(n)
                 || skipped.draft_no_start.contains(n)
                 || skipped.unknown.contains(n)
-                || skipped.label_gated.iter().any(|(c, _)| c == n);
+                || skipped.label_gated.iter().any(|g| &g.check == n);
             if !known {
                 skipped.unknown.push(n.clone());
             }
@@ -2646,44 +2647,72 @@ pub async fn ready_gate(
     // Why each skipped check was skipped, from its workflow: on a draft, a
     // check that runs only once the pull request is ready is never waited
     // on (it would be skipped on every push: draft, so skipped, so draft).
-    let mut skipped = super::skipped_checks::sort(
+    let rows = super::skipped_checks::gates(
         state,
         github,
         team_id,
         (owner, repo),
         &head_ref,
-        &labels,
         &checks,
         &standing.skipped,
     )
     .await;
-    // A label that runs them, which the team's settings let CoderHelm add:
-    // added once per commit, and the checks are waited for.
-    let wanted = skipped.labels();
-    if !wanted.is_empty() {
+    let mut labels = labels;
+    let mut skipped = super::skipped_checks::sorted(&rows, (owner, repo), &labels);
+    // Labels: only existing repo labels, only what the team's settings let
+    // CoderHelm add, and only one certain label per check (a prefix is
+    // never a label). Anything else is named for a person to add.
+    if !skipped.label_gated.is_empty()
+        || !super::skipped_checks::added_before(&g.labeled).is_empty()
+    {
+        let repo_labels: Vec<String> = github
+            .list_repo_labels(owner, repo)
+            .await
+            .map(|v| v.into_iter().map(|(n, _)| n).collect())
+            .unwrap_or_default();
+        let named = super::review_pr::named_labels(state, team_id, owner, repo).await;
+        // Labels added before labels were read as patterns, that were a
+        // prefix taken for a name or couldn't run the check alone, come off.
+        if !repo_labels.is_empty() {
+            let off = super::skipped_checks::take_off_mistakes(
+                github,
+                (owner, repo),
+                pr_number,
+                &rows,
+                &labels,
+                &g.labeled,
+                &repo_labels,
+                &named,
+            )
+            .await;
+            if !off.is_empty() {
+                labels.retain(|l| !off.iter().any(|o| o.eq_ignore_ascii_case(l)));
+                skipped = super::skipped_checks::sorted(&rows, (owner, repo), &labels);
+            }
+        }
         let mut add = Vec::new();
-        for l in &wanted {
-            let key = format!("{sha}:{l}");
+        for l in workflow_gate::choose(&skipped, &repo_labels, &named, &labels) {
+            let key = super::skipped_checks::added_key(&sha, &l);
             if !g.labeled.contains(&key)
-                && super::review_pr::may_add_label(state, team_id, owner, repo, l).await
+                && super::review_pr::may_add_label(state, team_id, owner, repo, &l).await
             {
                 g.labeled.push(key);
-                add.push(l.clone());
+                add.push(l);
             }
         }
         if !add.is_empty() {
             match github.add_labels(owner, repo, pr_number, &add).await {
                 Ok(_) => {
                     info!(pr_number, labels = ?add, "Added the labels that run the skipped test checks");
-                    skipped
-                        .label_gated
-                        .retain(|(_, ls)| !ls.iter().any(|l| add.contains(l)));
+                    skipped.labels_added(&add);
                 }
                 Err(e) => {
                     warn!(pr_number, error = %e, "Could not add the labels that run the skipped test checks")
                 }
             }
         }
+        // The hold names real labels, not patterns.
+        skipped.resolve_labels(&repo_labels, &named);
     }
 
     // A skipped or neutral test check whose workflow shows no draft or

@@ -132,8 +132,12 @@ pub(crate) async fn may_add_label(
     // Deploy labels cost a shared environment, and the team's label rules
     // decide when one is worth it (the reviewer weighs them per change):
     // never added just because a workflow asks for one.
-    let l = label.to_ascii_lowercase();
-    if label.ends_with('*') || ["prod", "deploy", "staging"].iter().any(|w| l.contains(w)) {
+    // A pattern or a bare prefix (`E2E:`) is never a label: an `E2E:*`
+    // family allows `E2E:nav`, not `E2E:` itself.
+    if label.contains('*')
+        || common::e2e::workflow_gate::is_bare_prefix(label)
+        || common::e2e::workflow_gate::is_deploy_label(label)
+    {
         return false;
     }
     load_config(state, team_id, owner, name)
@@ -141,6 +145,29 @@ pub(crate) async fn may_add_label(
         .is_ok_and(|cfg| {
             cfg.enabled && !cfg.killed && cfg.auto_labels && cfg.label_rules.allowed(label)
         })
+}
+
+/// The labels the team's settings name exactly (not as a family), for
+/// choosing one label among several a workflow condition matches. Empty
+/// when CoderHelm may not add labels in this repo.
+pub(crate) async fn named_labels(
+    state: &WorkerState,
+    team_id: &str,
+    owner: &str,
+    name: &str,
+) -> Vec<String> {
+    load_config(state, team_id, owner, name)
+        .await
+        .ok()
+        .filter(|cfg| cfg.enabled && !cfg.killed && cfg.auto_labels)
+        .map(|cfg| {
+            cfg.label_rules
+                .allow
+                .into_iter()
+                .filter(|l| !l.contains('*'))
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// True when the repo turned on "Require tests" (and review isn't off/killed).

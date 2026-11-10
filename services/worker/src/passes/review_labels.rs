@@ -118,7 +118,8 @@ fn valid_new_label(name: &str, rules: &LabelRules) -> bool {
 fn pattern_matches(pattern: &str, label: &str) -> bool {
     let (p, l) = (pattern.to_ascii_lowercase(), label.to_ascii_lowercase());
     match p.strip_suffix('*') {
-        Some(prefix) => l.starts_with(prefix),
+        // A family needs more than its prefix: `E2E:*` is not `E2E:`.
+        Some(prefix) => l.len() > prefix.len() && l.starts_with(prefix),
         None => p == l,
     }
 }
