@@ -629,7 +629,15 @@ async fn sandbox_items(
             return (items, failed);
         }
     };
-    let script = test_package::sandbox_script(&kept, repeat.as_deref());
+    // The root's package manager first: the sandbox switches Node to the
+    // repository's version, and that Node has no pnpm or yarn until corepack
+    // (or npm) provides it. Without it every step exited 127 with
+    // `pnpm: command not found`, and each was counted against the change.
+    let script = format!(
+        "{}true\n{}",
+        test_package::ensure_manager(checklist::manager(tree)),
+        test_package::sandbox_script(&kept, repeat.as_deref())
+    );
     let node = super::detect_node_version(w.github, owner, repo, branch).await;
     match sandbox
         .run_checks(&source, &script, node.as_deref(), None, None)
@@ -638,11 +646,20 @@ async fn sandbox_items(
         Ok(o) if o.ran => {
             let n = kept.len() + usize::from(repeat.is_some());
             let codes = test_package::step_codes(&o.output, n);
-            for (s, c) in kept.iter().zip(&codes) {
-                let (status, verdict) = match c {
-                    Some(0) => (Status::Pass, "passed".to_string()),
-                    Some(c) => (Status::Fail, format!("failed (exit {c})")),
-                    None => (Status::NotRun, "no result".to_string()),
+            for (s, r) in kept.iter().zip(step_results(&kept, &codes, &o.output)) {
+                let (status, verdict) = match r {
+                    StepResult::Pass => (Status::Pass, "passed".to_string()),
+                    StepResult::Fail(c) => (Status::Fail, format!("failed (exit {c})")),
+                    StepResult::NoResult => (Status::NotRun, "no result".to_string()),
+                    // CoderHelm's own environment failed, not the change:
+                    // the repository's CI runs it on the pull request.
+                    StepResult::Tooling(why) => {
+                        warn!(run_id = w.run_id, step = s.kind, reason = %why, "Sandbox check couldn't run: CoderHelm's own tooling failed");
+                        (
+                            Status::NotRun,
+                            format!("couldn't run in CoderHelm's sandbox ({why}); CI runs it on the pull request"),
+                        )
+                    }
                 };
                 if status == Status::Fail {
                     failed.push(format!("{} failed: `{}`", s.kind, s.cmd));
@@ -693,6 +710,56 @@ async fn sandbox_items(
         )),
     }
     (items, failed)
+}
+
+/// What one sandbox checklist step's result says about the change.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum StepResult {
+    Pass,
+    /// It ran and failed: the change's failure (its exit code).
+    Fail(i32),
+    /// It didn't report.
+    NoResult,
+    /// CoderHelm's own tools failed (a command not installed, an install
+    /// that couldn't run): says nothing about the change, never a hold.
+    Tooling(String),
+}
+
+/// Each step's [`StepResult`], from the exit codes and the output of a
+/// `test_package::sandbox_script` run. A step that exited 127 or printed a
+/// tooling error is tooling (`common::stop_rules::tooling`); so is every
+/// step after an install that failed that way, since nothing it needs was
+/// installed.
+pub(crate) fn step_results(steps: &[Step], codes: &[Option<i32>], output: &str) -> Vec<StepResult> {
+    use common::stop_rules::tooling;
+    let mut install_broke: Option<String> = None;
+    let mut out = Vec::new();
+    for (s, c) in steps.iter().zip(codes) {
+        let r = match c {
+            Some(0) => StepResult::Pass,
+            None => StepResult::NoResult,
+            Some(code) => {
+                let section = tooling::failed_section(output, s.kind);
+                match (
+                    tooling::from_output(&s.cmd, section, Some(*code)),
+                    &install_broke,
+                ) {
+                    (Some(f), _) => StepResult::Tooling(f.reason()),
+                    (None, Some(why)) => StepResult::Tooling(format!(
+                        "the install before it couldn't run in CoderHelm's sandbox: {why}"
+                    )),
+                    (None, None) => StepResult::Fail(*code),
+                }
+            }
+        };
+        if s.kind == "install" {
+            if let StepResult::Tooling(why) = &r {
+                install_broke.get_or_insert_with(|| why.clone());
+            }
+        }
+        out.push(r);
+    }
+    out
 }
 
 /// Rule 6: settles the staging content a schema change needs. `None` when

@@ -122,6 +122,34 @@ pub struct Facts {
     pub ci: Ci,
     /// CoderHelm's review verdict on the head is APPROVE.
     pub approved: bool,
+    /// CoderHelm has no finished review of the head (read, not a failed
+    /// read): an approval the decision needs can only come from a review
+    /// that is queued now ([`wants_review`]).
+    pub review_missing: bool,
+    /// The reviewer is off for the repository: no review, so no approval,
+    /// ever comes.
+    pub reviewer_off: bool,
+    /// The head the CI and the verdict were read on; empty when not read.
+    pub head: String,
+}
+
+/// What the description and the run say while CoderHelm's review of the
+/// head, which the decision waits for, runs.
+pub const REVIEWING_WHY: &str = "CoderHelm is reviewing this head; once the review approves and \
+                                 the repository's CI is green, it is marked ready";
+
+/// Whether the decision needs CoderHelm's approval on the head and no review
+/// of it exists, so one is queued (once per head). Without it, a draft whose
+/// hand-off review never ran waited on an approval nobody would give, at
+/// every sweep.
+pub fn wants_review(f: &Facts) -> bool {
+    !f.closed
+        && f.draft
+        && f.put_back_by.is_none()
+        && f.feature.is_some()
+        && !f.approved
+        && f.review_missing
+        && !f.reviewer_off
 }
 
 /// What happens to the pull request.
@@ -269,7 +297,13 @@ pub fn decide(f: &Facts) -> Decision {
     // repository's CI and the review: with both green they are open items
     // on a ready pull request, never a hold by themselves.
     if let Some(h) = &f.feature {
-        if !(f.ci.green && f.approved) {
+        // CI is green and the one thing missing is CoderHelm's own review,
+        // which is queued now: that settles by itself, so it is a wait,
+        // never a hold that names nothing a person can do.
+        let reviewing = f.review_missing && !f.reviewer_off && !f.approved;
+        if f.ci.green && reviewing {
+            wait.get_or_insert_with(|| REVIEWING_WHY.to_string());
+        } else if !(f.ci.green && f.approved) {
             let mut not_yet = Vec::new();
             if !f.ci.green {
                 not_yet.push(if f.ci.why.is_empty() {
@@ -279,7 +313,14 @@ pub fn decide(f: &Facts) -> Decision {
                 });
             }
             if !f.approved {
-                not_yet.push("CoderHelm's review hasn't approved this head".to_string());
+                not_yet.push(if reviewing {
+                    "CoderHelm is reviewing this head".to_string()
+                } else if f.reviewer_off && f.review_missing {
+                    "CoderHelm's reviewer is off for this repository, so no approval comes"
+                        .to_string()
+                } else {
+                    "CoderHelm's review hasn't approved this head".to_string()
+                });
             }
             reasons.push(Reason::new(
                 format!(
@@ -514,10 +555,11 @@ pub async fn settle(ctx: &Ctx<'_>) -> Outcome {
         "https://github.com/{}/{}/pull/{}",
         ctx.owner, ctx.repo, ctx.pr
     );
-    let facts = match gather(ctx).await {
+    let mut facts = match gather(ctx).await {
         Ok(f) => f,
         Err(r) => return retry_or_give_up(ctx, &run_id, &pr_url, r).await,
     };
+    ask_for_review(ctx, &mut facts).await;
     let decision = decide(&facts);
     match &decision {
         Decision::Closed => {
@@ -674,21 +716,62 @@ async fn gather(ctx: &Ctx<'_>) -> Result<Facts, Refused> {
                 ctx.attempt,
             )
         })?;
-        f.approved = matches!(
-            common::merge_gate::bot_verdict_at_head(
-                &ctx.state.dynamo,
-                &ctx.state.config.settings_table_name,
-                ctx.team_id,
-                ctx.owner,
-                ctx.repo,
-                ctx.pr,
-                sha,
-            )
-            .await,
-            Ok(Some(v)) if v == "APPROVE"
-        );
+        let verdict = common::merge_gate::bot_verdict_at_head(
+            &ctx.state.dynamo,
+            &ctx.state.config.settings_table_name,
+            ctx.team_id,
+            ctx.owner,
+            ctx.repo,
+            ctx.pr,
+            sha,
+        )
+        .await;
+        f.approved = matches!(&verdict, Ok(Some(v)) if v == "APPROVE");
+        // Only a read that found no review: a failed read never queues one.
+        f.review_missing = matches!(verdict, Ok(None)) && !sha.is_empty();
+        f.head = sha.to_string();
     }
     Ok(f)
+}
+
+/// Asks for the ready decision of a PR again, now: CoderHelm's review of its
+/// head just gave the verdict the decision waited for.
+pub async fn request(state: &WorkerState, msg: &crate::models::ReviewMessage) {
+    let m = MarkReadyMessage {
+        team_id: msg.team_id.clone(),
+        installation_id: msg.installation_id,
+        repo_owner: msg.repo_owner.clone(),
+        repo_name: msg.repo_name.clone(),
+        pr_number: msg.pr_number,
+        ..Default::default()
+    };
+    if send(state, &m, 0).await {
+        info!(
+            pr = msg.pr_number,
+            "CoderHelm's review gave its verdict: the draft is decided again"
+        );
+    }
+}
+
+/// The decision waits for CoderHelm's approval on the head and no review of
+/// it exists: one is queued (once per head). A reviewer that is off means
+/// no approval comes, and the hold says so.
+async fn ask_for_review(ctx: &Ctx<'_>, f: &mut Facts) {
+    if !wants_review(f) {
+        return;
+    }
+    let ask = super::review_pr::review_for_ready(
+        ctx.state,
+        ctx.team_id,
+        ctx.github.installation_id(),
+        (ctx.owner, ctx.repo, ctx.pr),
+        &f.head,
+    )
+    .await;
+    info!(pr = ctx.pr, head = %f.head, ?ask, "The draft needs CoderHelm's review of its head");
+    if ask == super::review_pr::ReadyReviewAsk::ReviewerOff {
+        f.reviewer_off = true;
+    }
 }
 
 /// Whether the decision needs the repository's CI on the head: CoderHelm's

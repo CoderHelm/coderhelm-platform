@@ -513,6 +513,18 @@ fn runner(tree: &[String]) -> &'static str {
     }
 }
 
+/// The root's package manager, for making it available in CoderHelm's
+/// sandbox before its steps run (`test_package::ensure_manager`).
+pub fn manager(tree: &[String]) -> common::e2e::test_package::Manager {
+    use common::e2e::test_package::Manager;
+    match runner(tree) {
+        "pnpm" => Manager::Pnpm,
+        "yarn" => Manager::Yarn,
+        "bun" => Manager::Bun,
+        _ => Manager::Npm,
+    }
+}
+
 fn install(tree: &[String]) -> String {
     match runner(tree) {
         "pnpm" => "pnpm install --frozen-lockfile".into(),
@@ -910,6 +922,15 @@ mod tests {
         // `test` that runs the browser suite isn't the unit tests.
         let pj = r#"{"scripts":{"test":"playwright test"}}"#;
         assert!(root_steps(pj, &tree).is_empty());
+    }
+
+    #[test]
+    fn the_manager_is_read_from_the_lockfile() {
+        use common::e2e::test_package::Manager;
+        assert_eq!(manager(&["pnpm-lock.yaml".to_string()]), Manager::Pnpm);
+        assert_eq!(manager(&["yarn.lock".to_string()]), Manager::Yarn);
+        assert_eq!(manager(&["bun.lock".to_string()]), Manager::Bun);
+        assert_eq!(manager(&["package-lock.json".to_string()]), Manager::Npm);
     }
 
     #[test]

@@ -299,17 +299,23 @@ pub enum Finished<'a> {
 
 /// Only the job that owns the record may end it. Not ended by this job: a
 /// review another job is running now, or a job queued after this one
-/// started.
-pub const FINISH_CONDITION: &str = "attribute_exists(sk) AND NOT ((#phase = :r AND #job <> :j \
-     AND #expires_at > :now) OR (#phase = :q AND #queued_at > :started))";
+/// started. A PR with no record yet gets one: a job the worker sent itself
+/// (a run's hand-off) was never marked queued, and a job that ends before
+/// it starts real work was never marked reviewing. Its ending was once
+/// dropped on this condition, so the job left no trace at all.
+pub const FINISH_CONDITION: &str = "attribute_not_exists(sk) OR NOT ((#phase = :r AND \
+     #job <> :j AND #expires_at > :now) OR (#phase = :q AND #queued_at > :started))";
 
-/// Pure: the update that records how a job ended.
+/// Pure: the update that records how a job ended. It names the PR too, so
+/// a record this write creates reads like any other.
 pub fn finish_update(has_reason: bool, has_expiry: bool) -> String {
     let mut sets = vec![
         "#phase = :p",
         "#finished_at = :now",
         "#updated_at = :at",
         "#ttl = :ttl",
+        "#repo = :repo",
+        "#pr_number = :pr",
     ];
     let mut removes = vec![];
     if has_reason {
@@ -372,7 +378,9 @@ pub async fn mark_finished(
         .expression_attribute_values(":now", n(now))
         .expression_attribute_values(":started", n(started_at))
         .expression_attribute_values(":at", s(&chrono::Utc::now().to_rfc3339()))
-        .expression_attribute_values(":ttl", n(now + RECORD_TTL_SECS));
+        .expression_attribute_values(":ttl", n(now + RECORD_TTL_SECS))
+        .expression_attribute_values(":repo", s(&format!("{owner}/{repo}")))
+        .expression_attribute_values(":pr", n(pr as i64));
     if let Some(why) = reason {
         req = req.expression_attribute_values(":why", s(crate::truncate_str(why, 500)));
     }
@@ -507,14 +515,25 @@ mod tests {
         );
     }
 
+    /// A job nobody marked queued or reviewing (a run's hand-off that ended
+    /// before real work) once had its ending dropped: the condition required
+    /// a record. Its ending now creates the record.
+    #[test]
+    fn a_job_with_no_record_yet_still_records_how_it_ended() {
+        assert!(FINISH_CONDITION.starts_with("attribute_not_exists(sk) OR "));
+        assert!(!FINISH_CONDITION.contains("attribute_exists(sk) AND"));
+        let u = finish_update(true, false);
+        assert!(u.contains("#repo = :repo") && u.contains("#pr_number = :pr"));
+    }
+
     #[test]
     fn updates_only_name_what_they_use() {
         assert!(reviewing_update(true).contains("#pr_title = :title"));
         assert!(!reviewing_update(false).contains("pr_title"));
         assert_eq!(
             finish_update(false, false),
-            "SET #phase = :p, #finished_at = :now, #updated_at = :at, #ttl = :ttl \
-             REMOVE #reason, #expires_at"
+            "SET #phase = :p, #finished_at = :now, #updated_at = :at, #ttl = :ttl, \
+             #repo = :repo, #pr_number = :pr REMOVE #reason, #expires_at"
         );
         let retry = finish_update(true, true);
         assert!(retry.contains("#reason = :why") && retry.contains("#expires_at = :exp"));
