@@ -826,6 +826,8 @@ struct RepoPrResult {
     /// The repository's owner and name.
     repo: (String, String),
     branch: String,
+    /// The branch its pull request merges into.
+    base: String,
     pr_number: u64,
     pr_url: String,
 }
@@ -1158,6 +1160,7 @@ pub mod rewards;
 pub(crate) mod round;
 pub mod run_ceiling;
 mod run_end;
+pub(crate) mod run_files;
 pub mod run_guard;
 pub(crate) mod run_lists;
 mod security;
@@ -4040,6 +4043,7 @@ async fn run_passes(
                         if usage_res.is_ok() {
                             usage.mark_recorded(&delta);
                         }
+                        run_files::record_for(state, &github, msg, run_id, &branch_name).await;
 
                         save_checkpoint(state, &msg.team_id, run_id, "pr", &branch_name, 1, usage)
                             .await;
@@ -4688,6 +4692,24 @@ async fn run_passes(
                 return Err(e.into());
             }
             usage.mark_recorded(&delta);
+            let branches: Vec<run_files::Branch> = pr_results
+                .iter()
+                .map(|p| run_files::Branch {
+                    owner: &p.repo.0,
+                    repo: &p.repo.1,
+                    base: &p.base,
+                    branch: &p.branch,
+                })
+                .collect();
+            run_files::record(
+                state,
+                &github,
+                &msg.team_id,
+                run_id,
+                &msg.ticket_id,
+                &branches,
+            )
+            .await;
 
             info!(
                 run_id,
@@ -6418,6 +6440,7 @@ async fn run_passes(
         return Err(e.into());
     }
     usage.mark_recorded(&delta);
+    run_files::record_for(state, &github, msg, run_id, &branch_name).await;
 
     info!(
         run_id,
@@ -7418,6 +7441,7 @@ async fn run_repo_pipeline(
     Ok(RepoPrResult {
         repo: (repo_owner.to_string(), repo_name.to_string()),
         branch: branch_name.to_string(),
+        base: base_branch.to_string(),
         pr_number: pr_result.pr_number,
         pr_url: pr_result.pr_url,
     })
@@ -8657,110 +8681,6 @@ async fn check_cancelled(
             }
         }
     }
-    Ok(())
-}
-
-#[allow(clippy::too_many_arguments, dead_code)]
-async fn complete_run(
-    state: &WorkerState,
-    msg: &TicketMessage,
-    run_id: &str,
-    pr: &pr::PrResult,
-    impl_result: &implement::ImplementResult,
-    mcp_server_ids: &[String],
-    usage: &TokenUsage,
-    duration: u64,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let now = chrono::Utc::now().to_rfc3339();
-    let delta = usage.unrecorded();
-
-    // Update run record in runs table
-    state
-        .dynamo
-        .update_item()
-        .table_name(&state.config.runs_table_name)
-        .key("team_id", attr_s(&msg.team_id))
-        .key("run_id", attr_s(run_id))
-        .update_expression(
-            "SET #status = :s, pr_url = :pr, pr_number = :pn, branch = :b, \
-             tokens_in = if_not_exists(tokens_in, :uzero) + :ti, tokens_out = if_not_exists(tokens_out, :uzero) + :to, \
-             cache_read_tokens = if_not_exists(cache_read_tokens, :uzero) + :crt, cache_write_tokens = if_not_exists(cache_write_tokens, :uzero) + :cwt, \
-             cost_usd = if_not_exists(cost_usd, :uzero) + :c, \
-             duration_s = :d, updated_at = :t, current_pass = :cp, \
-             status_run_id = :sri, files_modified = :fm, \
-             repo = :repo, team_repo = :tr, mcp_servers = :mcp \
-             REMOVE error_message, #err",
-        )
-        .expression_attribute_names("#status", "status")
-        .expression_attribute_names("#err", "error")
-        .expression_attribute_values(":s", attr_s("completed"))
-        .expression_attribute_values(":pr", attr_s(&pr.pr_url))
-        .expression_attribute_values(":pn", attr_n(pr.pr_number))
-        .expression_attribute_values(
-            ":repo",
-            attr_s(&format!("{}/{}", msg.repo_owner, msg.repo_name)),
-        )
-        .expression_attribute_values(
-            ":tr",
-            attr_s(&format!(
-                "{}#{}/{}",
-                msg.team_id, msg.repo_owner, msg.repo_name
-            )),
-        )
-        .expression_attribute_values(":b", attr_s(&pr.branch))
-        .usage_values(&delta)
-        .expression_attribute_values(":d", attr_n(duration))
-        .expression_attribute_values(":t", attr_s(&now))
-        .expression_attribute_values(":cp", attr_s("done"))
-        .expression_attribute_values(":sri", attr_s(&format!("completed#{run_id}")))
-        .expression_attribute_values(
-            ":fm",
-            AttributeValue::L(
-                impl_result
-                    .files_modified
-                    .iter()
-                    .map(|f| attr_s(f))
-                    .collect(),
-            ),
-        )
-        .expression_attribute_values(
-            ":mcp",
-            AttributeValue::L(mcp_server_ids.iter().map(|s| attr_s(s)).collect()),
-        )
-        .send()
-        .await?;
-    usage.mark_recorded(&delta);
-
-    // Update analytics counters (current month + all-time)
-    let month = chrono::Utc::now().format("%Y-%m").to_string();
-    for period in &[month.as_str(), "ALL_TIME"] {
-        state
-            .dynamo
-            .update_item()
-            .table_name(&state.config.analytics_table_name)
-            .key("team_id", attr_s(&msg.team_id))
-            .key("period", attr_s(period))
-            .update_expression("ADD completed :one")
-            .expression_attribute_values(":one", attr_n(1))
-            .send()
-            .await?;
-    }
-
-    // Increment team's monthly run count in main table
-    state
-        .dynamo
-        .update_item()
-        .table_name(&state.config.table_name)
-        .key("pk", attr_s(&msg.team_id))
-        .key("sk", attr_s("META"))
-        .update_expression("ADD run_count_mtd :one")
-        .expression_attribute_values(":one", attr_n(1))
-        .send()
-        .await?;
-
-    // Check token usage against limit and send warning if needed
-    check_token_usage_warning(state, &msg.team_id, usage).await;
-
     Ok(())
 }
 

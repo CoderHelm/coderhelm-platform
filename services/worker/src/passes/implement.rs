@@ -692,11 +692,14 @@ pub async fn run(
             &msg.repo_name
         )
     );
+    // Seeded from the checklist as saved: a plan check's result (or an
+    // earlier round's ticks) stays, and this round only adds its own.
+    let saved_tasks = super::read_s3_text(state, &tasks_key).await;
     let task_tracker = TaskTracker::new(
         &state.s3,
         &state.config.bucket_name,
         &tasks_key,
-        &plan.tasks,
+        &carry_ticks(&plan.tasks, saved_tasks.as_deref()),
     );
     // Knowledge bases the team attached to the coder.
     let knowledge = super::knowledge::KnowledgeTools::load(
@@ -1493,6 +1496,65 @@ fn all_tools() -> Vec<ToolDefinition> {
     ]
 }
 
+/// The plan's checklist with the ticks the saved one already has. A task
+/// line whose text (after its box) matches a checked line of the saved
+/// checklist is checked; nothing is unchecked. A saved checklist from
+/// another plan shares no lines and changes nothing.
+pub(crate) fn carry_ticks(plan_tasks: &str, saved: Option<&str>) -> String {
+    let Some(saved) = saved.filter(|s| !s.trim().is_empty()) else {
+        return plan_tasks.to_string();
+    };
+    let checked: HashSet<&str> = saved.lines().filter_map(checked_text).collect();
+    if checked.is_empty() {
+        return plan_tasks.to_string();
+    }
+    plan_tasks
+        .lines()
+        .map(|line| match unchecked_text(line) {
+            Some(text) if checked.contains(text) => line.replacen("- [ ]", "- [x]", 1),
+            _ => line.to_string(),
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn checked_text(line: &str) -> Option<&str> {
+    let l = line.trim_start();
+    l.strip_prefix("- [x]")
+        .or_else(|| l.strip_prefix("- [X]"))
+        .map(str::trim)
+}
+
+fn unchecked_text(line: &str) -> Option<&str> {
+    line.trim_start().strip_prefix("- [ ]").map(str::trim)
+}
+
+/// The checklist with every unchecked task that names one of `paths`
+/// checked, or `None` when nothing changes. Add only: a checked task is
+/// never unchecked here (only the plan check, `save_checked_tasks`, may).
+pub(crate) fn tick_files(tasks_md: &str, paths: &[&str]) -> Option<String> {
+    let mut changed = false;
+    let lines: Vec<String> = tasks_md
+        .lines()
+        .map(|line| {
+            if !line.contains("- [ ]") {
+                return line.to_string();
+            }
+            let matches = paths.iter().any(|p| {
+                let filename = p.rsplit('/').next().unwrap_or(p);
+                line.contains(p) || line.contains(filename)
+            });
+            if matches {
+                changed = true;
+                line.replacen("- [ ]", "- [x]", 1)
+            } else {
+                line.to_string()
+            }
+        })
+        .collect();
+    changed.then(|| lines.join("\n"))
+}
+
 /// Tracks task completion in S3 by matching written file paths against checklist items.
 struct TaskTracker {
     s3: aws_sdk_s3::Client,
@@ -1515,25 +1577,9 @@ impl TaskTracker {
     async fn mark_files_done(&self, paths: &[&str]) {
         let updated = {
             let mut md = self.tasks_md.lock().unwrap();
-            let mut changed = false;
-            let mut lines: Vec<String> = md.lines().map(|l| l.to_string()).collect();
-            for line in &mut lines {
-                if !line.contains("- [ ]") {
-                    continue;
-                }
-                let matches = paths.iter().any(|p| {
-                    let filename = p.rsplit('/').next().unwrap_or(p);
-                    line.contains(p) || line.contains(filename)
-                });
-                if matches {
-                    *line = line.replacen("- [ ]", "- [x]", 1);
-                    changed = true;
-                }
-            }
-            if !changed {
+            let Some(new_md) = tick_files(&md, paths) else {
                 return;
-            }
-            let new_md = lines.join("\n");
+            };
             *md = new_md.clone();
             new_md
         };

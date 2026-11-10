@@ -4490,6 +4490,9 @@ async fn set_run_awaiting_ci(
     match res {
         Ok(_) => {
             usage.mark_recorded(&delta);
+            // A round that pushed more commits changes what the pull
+            // request holds.
+            super::run_files::record_with_app(state, msg, run_id, branch).await;
             Ok(true)
         }
         // Display for a service error is only "service error" — classify on
@@ -4923,6 +4926,8 @@ async fn end_run(
     match res {
         Ok(_) => {
             usage.mark_recorded(&delta);
+            // The pull request as the run leaves it, its last round included.
+            super::run_files::record_with_app(state, msg, run_id, branch).await;
             super::webhooks::emit_run(state, &msg.team_id, run_id, status).await
         }
         Err(e) if format!("{e:?}").contains("ConditionalCheckFailed") => {
