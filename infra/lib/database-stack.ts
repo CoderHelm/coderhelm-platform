@@ -572,6 +572,8 @@ export class DatabaseStack extends cdk.Stack {
     // Outputs
     new cdk.CfnOutput(this, "TableName", { value: this.table.tableName });
     new cdk.CfnOutput(this, "TableArn", { value: this.table.tableArn });
+    // The table key, by ARN: a native install's helper may use only this key (native/parent.ts).
+    new cdk.CfnOutput(this, "TableKeyArn", { value: this.encryptionKey.keyArn });
     new cdk.CfnOutput(this, "TeamsTableName", {
       value: this.teamsTable.tableName,
     });

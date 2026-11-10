@@ -16,6 +16,7 @@ import { Template } from "aws-cdk-lib/assertions";
 import { buildApp } from "../lib/app";
 import { loadConfigFile, resolveConfig, ResolvedConfig } from "../lib/config";
 import { buildNative } from "../lib/native/build";
+import { HELPER_TABLE_KEY_ACTIONS, helperPolicy } from "../lib/native/parent";
 import { ACCESS_LOG_DAYS } from "../lib/storage-stack";
 import { CLOUDFRONT_LOG_REGIONS } from "../lib/web-stack";
 
@@ -235,5 +236,43 @@ test("SES.3: email is only sent over TLS", () => {
     assert.ok(sets.length >= 1, name);
     // The install's own set; on hosted, the mail relay's too.
     for (const c of sets) assert.equal(c.r.Properties.DeliveryOptions?.TlsPolicy, "REQUIRE", `${name} ${c.where}.${c.id}`);
+  }
+});
+
+test("KMS.2: the install helper decrypts with the table key by its ARN, never with every key", () => {
+  const R = rel.parent.Resources;
+  const decrypts = (st: any) => ([] as string[]).concat(st.Action ?? []).some((a) => /^kms:(\*|Decrypt|ReEncrypt\*|ReEncryptFrom)$/.test(a));
+  // Its own inline policy uses no key at all.
+  for (const s of helperPolicy().Statement) assert.ok(!decrypts(s), `helper ${s.Sid}`);
+  const p = R.HelperTableKey;
+  assert.equal(p.Type, "AWS::IAM::RolePolicy");
+  assert.deepEqual(p.Properties.RoleName, { Ref: "HelperRole" });
+  assert.deepEqual(p.Properties.PolicyDocument.Statement, [
+    { Sid: "TableKey", Effect: "Allow", Action: HELPER_TABLE_KEY_ACTIONS, Resource: { "Fn::GetAtt": ["Database", "Outputs.TableKeyArn"] } },
+  ]);
+  // That output is the table key itself, and the allowlist is written only once the policy is there.
+  const out = rel.children.Database.Outputs.TableKeyArn.Value["Fn::GetAtt"];
+  assert.equal(out[1], "Arn");
+  const key = rel.children.Database.Resources[out[0]];
+  assert.equal(key.Type, "AWS::KMS::Key");
+  assert.equal(key.Properties.Description, "Coderhelm DynamoDB encryption key");
+  assert.deepEqual(R.Allowlist.DependsOn, ["HelperTableKey"]);
+  // No role the release makes (its parts included) decrypts with every key; the
+  // pinned deploy role, which creates the keys, is the one exception (security.md).
+  for (const [name, t] of Object.entries<any>(native)) {
+    for (const [id, r] of Object.entries<any>(t.Resources ?? {})) {
+      if (id === "DeployRole") continue;
+      const docs = r.Type === "AWS::IAM::Role" ? (r.Properties.Policies ?? []).map((x: any) => x.PolicyDocument)
+        : r.Type === "AWS::IAM::Policy" || r.Type === "AWS::IAM::RolePolicy" ? [r.Properties.PolicyDocument] : [];
+      for (const d of docs) {
+        for (const s of ([] as any[]).concat(d.Statement)) {
+          if (s.Effect !== "Allow" || !decrypts(s)) continue;
+          for (const res of ([] as any[]).concat(s.Resource)) {
+            const txt = JSON.stringify(res);
+            assert.ok(res !== "*" && !/:key\/\*"?$/.test(txt.replace(/"\]+\}*$/, '"')), `${name}.${id}: ${txt}`);
+          }
+        }
+      }
+    }
   }
 });

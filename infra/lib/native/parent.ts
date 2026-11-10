@@ -229,7 +229,6 @@ export function helperPolicy(): PolicyDocument {
       // DeleteSecret: only on a stack delete with KeepDataOnDelete=false (Final).
       { Sid: "Secret", Effect: "Allow", Action: ["secretsmanager:GetSecretValue", "secretsmanager:PutSecretValue", "secretsmanager:DeleteSecret"], Resource: `${at("secretsmanager")}:secret:coderhelm/\${Stage}/secrets-??????` },
       { Sid: "AllowlistAndTablesOnDelete", Effect: "Allow", Action: ["dynamodb:BatchWriteItem", "dynamodb:DescribeTable", "dynamodb:DeleteTable", "dynamodb:UpdateTable"], Resource: [`${at("dynamodb")}:table/${p}`, `${at("dynamodb")}:table/${p}-*`] },
-      { Sid: "TableKey", Effect: "Allow", Action: ["kms:Encrypt", "kms:Decrypt", "kms:GenerateDataKey*", "kms:DescribeKey"], Resource: "*", Condition: { StringEquals: { [`aws:ResourceTag/${INSTALL_TAG}`]: p } } },
       { Sid: "Domain", Effect: "Allow", Action: "lambda:InvokeFunction", Resource: `${at("lambda")}:function:${p}-updater` },
       { Sid: "RootStack", Effect: "Allow", Action: ["cloudformation:DescribeStacks", "cloudformation:DescribeStackEvents"], Resource: "arn:${AWS::Partition}:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/${AWS::StackName}/*" },
       // stage_held: the root stack's own deploy role and boundaries, read from its current template (read-only, that stack only).
@@ -253,6 +252,10 @@ export function helperPolicy(): PolicyDocument {
     ],
   };
 }
+
+/** The helper's own policy on the install's table key, by its ARN (the Database part's output). */
+export const HELPER_TABLE_KEY_POLICY = "table-key";
+export const HELPER_TABLE_KEY_ACTIONS = ["kms:Encrypt", "kms:Decrypt", "kms:GenerateDataKey*", "kms:DescribeKey"];
 
 /** The auto-update role's policy: the deploy policy, the parent stack, the release files. */
 export function deployRolePolicy(n: AccessNames): PolicyDocument {
@@ -487,8 +490,24 @@ export function buildParent(input: ParentInput): Json {
     },
   };
   if (names.has("Database")) {
+    // The allowlist goes into a table encrypted with the install's table key.
+    // The helper is made before the parts, so it can't name the key in its
+    // own policy: this one, made once the Database part is, names that one
+    // key (never every key: Security Hub KMS.2).
+    R.HelperTableKey = {
+      Type: "AWS::IAM::RolePolicy",
+      Properties: {
+        RoleName: { Ref: "HelperRole" },
+        PolicyName: HELPER_TABLE_KEY_POLICY,
+        PolicyDocument: {
+          Version: "2012-10-17",
+          Statement: [{ Sid: "TableKey", Effect: "Allow", Action: HELPER_TABLE_KEY_ACTIONS, Resource: { "Fn::GetAtt": ["Database", "Outputs.TableKeyArn"] } }],
+        },
+      },
+    };
     R.Allowlist = {
       Type: "Custom::Allowlist",
+      DependsOn: ["HelperTableKey"],
       Properties: { ...helper, Table: { "Fn::GetAtt": ["Database", "Outputs.SettingsTableName"] }, Admin: { Ref: "AdminEmail" }, Domain: { Ref: "SignupDomain" }, TwoFactor: { Ref: "RequireTwoFactor" } },
     };
   }
