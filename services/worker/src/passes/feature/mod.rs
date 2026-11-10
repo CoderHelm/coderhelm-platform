@@ -751,12 +751,20 @@ async fn content_outcome(
     if !cms {
         return None;
     }
-    let needs = content::needs(&changes, &specs);
+    let full = format!("{owner}/{repo}");
+    let conn = load_connection(w.state, &w.msg.team_id, &full).await;
+    // What the change's own migrations already do to the content is never
+    // staging work for a person, and a field the schema drops is inert.
+    let migrated = crate::passes::release_plan::migrated(files);
+    let needs = content::still_needed(
+        content::needs(&changes, &specs),
+        &migrated.removes(),
+        &migrated.sets(),
+        conn.is_some(),
+    );
     if needs.is_empty() {
         return Some(content::Outcome::default());
     }
-    let full = format!("{owner}/{repo}");
-    let conn = load_connection(w.state, &w.msg.team_id, &full).await;
     let mut prod_files = Vec::new();
     for p in tree.iter().filter(|p| {
         let n = p.rsplit('/').next().unwrap_or(p);

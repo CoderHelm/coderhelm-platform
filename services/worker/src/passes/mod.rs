@@ -4212,8 +4212,16 @@ async fn run_passes(
         // rebased since): its own change is rebuilt on that branch now,
         // file by file, before any implementation, and the run stacks on it.
         if !pr_lookup_failed && !is_internal_ticket(&msg.ticket_id) {
-            if let Some(d) =
-                stack::at_start(state, &github, msg, &branch_name, &provider, usage).await
+            if let Some(d) = stack::at_start(
+                state,
+                &github,
+                msg,
+                &branch_name,
+                &provider,
+                usage,
+                stacked_on.is_some(),
+            )
+            .await
             {
                 add_progress_note(
                     state,

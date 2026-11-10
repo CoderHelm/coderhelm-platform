@@ -71,6 +71,41 @@ const OPTIONAL_MARKS: &[&str] = &[
     "read-only",
 ];
 
+/// What the coder says when it judged a planned file needs no change.
+const NO_CHANGE_MARKS: &[&str] = &[
+    "needs no change",
+    "need no change",
+    "no change needed",
+    "no changes needed",
+    "needs no edit",
+    "doesn't need a change",
+    "doesn't need any change",
+    "does not need a change",
+    "does not need any change",
+    "doesn't need changing",
+    "nothing to change",
+];
+
+/// The coder's own line saying `path` needs no change, when it wrote one: the
+/// line names the file (its path or, when that is how the coder wrote it,
+/// its file name) and says no change is needed.
+pub fn declined_by_coder(notes: &str, path: &str) -> Option<String> {
+    let name = path.rsplit('/').next().unwrap_or(path).to_lowercase();
+    if name.is_empty() {
+        return None;
+    }
+    notes.lines().find_map(|l| {
+        let low = l.to_lowercase();
+        (low.contains(&name) && NO_CHANGE_MARKS.iter().any(|m| low.contains(m))).then(|| {
+            let t = l
+                .trim()
+                .trim_start_matches(['-', '*', ' '])
+                .replace("**", "");
+            common::truncate_str(t.trim(), 300).to_string()
+        })
+    })
+}
+
 fn is_optional(desc: &str) -> bool {
     let d = desc.trim().to_lowercase();
     d.starts_with("optional")
@@ -592,7 +627,7 @@ pub async fn close_gaps(
     usage: &mut TokenUsage,
     has_time: impl Fn() -> bool,
 ) -> Option<Coverage> {
-    let tasks = tasks_for(
+    let mut tasks = tasks_for(
         w.github,
         &w.msg.repo_owner,
         &w.msg.repo_name,
@@ -680,6 +715,25 @@ pub async fn close_gaps(
         match result {
             Ok(r) => {
                 let timed_out = r.timed_out;
+                // Told to do a task, the coder wrote nothing for it and said
+                // why its file needs no change: that is its judgment, listed
+                // on the pull request for a person, never another round or
+                // step asking the same thing.
+                if r.files_modified.is_empty() {
+                    let missing: Vec<String> = cov
+                        .required_missing()
+                        .iter()
+                        .map(|t| t.path.clone())
+                        .collect();
+                    for t in tasks.iter_mut().filter(|t| missing.contains(&t.path)) {
+                        if let Some(why) = declined_by_coder(&r.evidence.notes, &t.path) {
+                            info!(run_id = w.run_id, path = %t.path, "The coder found a planned file needs no change");
+                            t.optional = true;
+                            t.task =
+                                format!("{} (the coder found it needs no change: {why})", t.task);
+                        }
+                    }
+                }
                 evidence.merge(r.evidence);
                 if timed_out {
                     // No time for another round here; what it wrote counts.
