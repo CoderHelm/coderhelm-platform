@@ -1356,6 +1356,42 @@ pub fn holds_blocked_on(body: &str, ci_green: bool) -> bool {
     blocked_lines(body).any(|l| !blocked_line_settled(l, ci_green))
 }
 
+/// Around the version of the code that wrote a blocked line, on the line
+/// itself: `<!-- coderhelm:checked-by <version> -->`.
+const CHECKED_BY_START: &str = "<!-- coderhelm:checked-by ";
+const CHECKED_BY_END: &str = " -->";
+
+/// The version of the code that runs CoderHelm's checks now: a hash of the
+/// worker's and the common crate's sources (see `build.rs`), the same on
+/// every install that runs the same code.
+pub fn checks_version() -> &'static str {
+    env!("CODERHELM_CHECKS_VERSION")
+}
+
+/// The mark naming the code version that wrote a blocked line.
+pub fn checked_by(version: &str) -> String {
+    format!("{CHECKED_BY_START}{version}{CHECKED_BY_END}")
+}
+
+/// The code version a blocked line names; `None` for a line written before
+/// lines carried one.
+pub fn checked_by_of(line: &str) -> Option<&str> {
+    let at = line.find(CHECKED_BY_START)? + CHECKED_BY_START.len();
+    let rest = &line[at..];
+    let end = rest.find(CHECKED_BY_END)?;
+    Some(rest[..end].trim()).filter(|v| !v.is_empty())
+}
+
+/// Whether a check the change didn't pass still holds the pull request on a
+/// line that code other than `version` wrote: the rule that wrote it may
+/// have been fixed since, so the hold is checked again on the head (see
+/// `ready::settle`). A line with no version was written before lines
+/// carried one.
+pub fn holds_on_other_version(body: &str, ci_green: bool, version: &str) -> bool {
+    blocked_lines(body)
+        .any(|l| !blocked_line_settled(l, ci_green) && checked_by_of(l) != Some(version))
+}
+
 /// Whether the description has a blocked line CI green on the head would
 /// settle: the decision has to read CI for it.
 pub fn ci_settles_a_hold(body: &str) -> bool {
@@ -1394,7 +1430,11 @@ fn item_line(f: &Finding) -> String {
     if is_security(f) {
         format!("{} {SECURITY_MARK}", f.line())
     } else if f.point.trim() == "check_blocked" {
-        format!("{} {BLOCKED_MARK}", f.line())
+        format!(
+            "{} {BLOCKED_MARK} {}",
+            f.line(),
+            checked_by(checks_version())
+        )
     } else {
         f.line()
     }

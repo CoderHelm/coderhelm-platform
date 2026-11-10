@@ -203,6 +203,13 @@ pub struct GuardState {
     /// How many times the count fell below the one before it.
     #[serde(default)]
     pub task_drops: u32,
+    /// The run's coder wrote code since the count last fell. Only then is a
+    /// recovery the run's own work done again: a count that falls and comes
+    /// back with nothing written moved because of what CoderHelm did to the
+    /// branch or measured it against (a rebuild, a rebase, another base), not
+    /// because the run did anything.
+    #[serde(default)]
+    pub wrote_since_fall: bool,
     #[serde(default)]
     pub work_done: bool,
     #[serde(default)]
@@ -239,15 +246,22 @@ impl GuardState {
                 let prev = self.tasks_last.unwrap_or(self.tasks_done);
                 if n < prev {
                     self.task_drops = self.task_drops.saturating_add(1);
+                    self.wrote_since_fall = false;
                 }
                 self.tasks_last = Some(n);
                 let more = n > self.tasks_done;
-                // Work the count lost (the base moved, a rebuild, a revert)
-                // being done again is progress, not a repeat of old news:
-                // measured from the last count, a bounded number of times so
-                // a count that keeps falling and rising still ends.
-                let recovered =
-                    !more && n > prev && self.task_drops > 0 && self.task_drops <= MAX_TASK_DROPS;
+                // Work the count lost (someone else moved the base, a revert)
+                // done again by the run is progress, not a repeat of old
+                // news: measured from the last count, only when the run wrote
+                // code since the fall (CoderHelm's own rebuild or rebase of
+                // the branch, undone by measuring again, is nothing the run
+                // did), and a bounded number of times so a count that keeps
+                // falling and rising still ends.
+                let recovered = !more
+                    && n > prev
+                    && self.wrote_since_fall
+                    && self.task_drops > 0
+                    && self.task_drops <= MAX_TASK_DROPS;
                 self.tasks_done = self.tasks_done.max(n);
                 more || recovered
             }
@@ -271,6 +285,12 @@ impl GuardState {
             self.reset();
         }
         real
+    }
+
+    /// The run's coder wrote code (`implement::run` changed files). Not
+    /// progress by itself: a commit never is.
+    pub fn on_own_code(&mut self) {
+        self.wrote_since_fall = true;
     }
 
     fn reset(&mut self) {
@@ -601,6 +621,19 @@ pub async fn progress(state: &WorkerState, team_id: &str, run_id: &str, p: Progr
         .await;
     }
     save(state, team_id, run_id, &l.guard, 0, 0, spent).await;
+}
+
+/// The run's coder wrote code: a fall in the plan check's count after this
+/// and its recovery can be the run's own work (see [`GuardState::apply`]).
+pub async fn wrote_code(state: &WorkerState, team_id: &str, run_id: &str) {
+    let Some(mut l) = load(state, team_id, run_id).await else {
+        return;
+    };
+    if l.guard.wrote_since_fall {
+        return;
+    }
+    l.guard.on_own_code();
+    save(state, team_id, run_id, &l.guard, 0, 0, 0.0).await;
 }
 
 /// A person acted on the run (a comment, a review): the counts start over and
@@ -939,6 +972,11 @@ pub struct Ledger {
     /// (`covering`).
     #[serde(default)]
     pub covering: Option<super::covering::Remembered>,
+    /// The version of the code whose checks wrote the results above
+    /// (`proof::checks_version`); empty for a ledger written before it was
+    /// kept.
+    #[serde(default)]
+    pub checks_version: String,
 }
 
 /// A record larger than this drops its longest text: DynamoDB's item limit is
@@ -962,6 +1000,26 @@ impl Ledger {
                 r.stopped = true;
             }
         }
+    }
+
+    /// The checks run by code at `version`. A result another version wrote
+    /// doesn't stand on an unchanged head for the checks whose failure is a
+    /// hold (the link and redirect check, the failing-test rules, the
+    /// new-feature rules): the rule that failed may be fixed now, so they run
+    /// again. Their fix rounds still count. The proof check's result stands:
+    /// what it leaves is never a check the change didn't pass. True when the
+    /// results were set aside.
+    pub fn for_checks_version(&mut self, version: &str) -> bool {
+        if self.checks_version == version {
+            return false;
+        }
+        self.checks_version = version.to_string();
+        let mut set_aside = false;
+        for r in [&mut self.rules, &mut self.links, &mut self.test_fix] {
+            set_aside |= !r.head.is_empty();
+            r.head.clear();
+        }
+        set_aside
     }
 
     /// What is still open, for a run the guard stopped. Honest about both:
