@@ -687,7 +687,7 @@ fn runbook(
         .to_string(),
         location: None,
         from: r.versions.engine_version.clone(),
-        to: pending.name.clone(),
+        to: String::new(),
         cli: vec![cli],
         console,
         apply_by: pending.apply_by.clone(),
