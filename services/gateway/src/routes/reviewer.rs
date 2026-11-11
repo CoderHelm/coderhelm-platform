@@ -21,9 +21,6 @@ fn attr_s(val: &str) -> AttributeValue {
 fn attr_n(val: impl std::fmt::Display) -> AttributeValue {
     AttributeValue::N(val.to_string())
 }
-fn attr_bool(val: bool) -> AttributeValue {
-    AttributeValue::Bool(val)
-}
 
 /// Reject repo path params that could inject into a DynamoDB key.
 pub(crate) fn validate_repo(repo: &str) -> Result<(), StatusCode> {
@@ -172,70 +169,25 @@ pub async fn get_config(
 ) -> Result<Json<Value>, StatusCode> {
     let repo = format!("{owner}/{name}");
     validate_repo(&repo)?;
-    let sk = format!("REVIEW_CONFIG#REPO#{repo}");
     let result = state
         .dynamo
         .get_item()
         .table_name(&state.config.settings_table_name)
         .key("pk", attr_s(&claims.team_id))
-        .key("sk", attr_s(&sk))
+        .key("sk", attr_s(&common::review_config::sk(&repo)))
         .send()
         .await
         .map_err(|e| {
             error!("Failed to fetch reviewer config: {e}");
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
-
-    let empty = HashMap::new();
-    let item = result.item().cloned().unwrap_or(empty);
-    let log_groups: Vec<String> = item
-        .get("health_log_groups")
-        .and_then(|v| v.as_l().ok())
-        .map(|l| l.iter().filter_map(|v| v.as_s().ok().cloned()).collect())
-        .unwrap_or_default();
-
-    Ok(Json(json!({
-        "enabled": item_bool(&item, "enabled", false),
-        "label": item_str(&item, "label", "ch-review"),
-        "killed": item_bool(&item, "killed", false),
-        "instructions": item_str(&item, "instructions", ""),
-        "auto_merge": item_bool(&item, "auto_merge", false),
-        "merge_method": item_str(&item, "merge_method", "squash"),
-        "require_human_approval": item_bool(&item, "require_human_approval", true),
-        "auto_tag": item_bool(&item, "auto_tag", false),
-        "tag_mode": item_str(&item, "tag_mode", "semver"),
-        "tag_prefix": item_str(&item, "tag_prefix", "v"),
-        "tag_batch_minutes": item_num(&item, "tag_batch_minutes", 15),
-        "health_check": item_bool(&item, "health_check", false),
-        "verify_tests": item_bool(&item, "verify_tests", false),
-        "require_tests": item_bool(&item, "require_tests", false),
-        "auto_labels": item_bool(&item, "auto_labels", false),
-        "auto_label_allow": item_str(&item, "auto_label_allow", ""),
-        "auto_label_requires": item_str(&item, "auto_label_requires", ""),
-        "auto_label_guide": item_str(&item, "auto_label_guide", ""),
-        "release_notes": item_bool(&item, "release_notes", false),
-        "release_notes_branch": item_str(&item, "release_notes_branch", ""),
-        "release_notes_confluence_space": item_str(&item, "release_notes_confluence_space", ""),
-        "release_notes_confluence_parent_id": item_str(&item, "release_notes_confluence_parent_id", ""),
-        "release_notes_confluence_container": item_str(&item, "release_notes_confluence_container", "Changelog"),
-        "release_notes_email_webhook_url": item_str(&item, "release_notes_email_webhook_url", ""),
-        // Never returned; the dashboard only learns whether one is set.
-        "release_notes_email_webhook_secret_set": !item_str(&item, "release_notes_email_webhook_secret", "").is_empty(),
-        "release_notes_guide": item_str(&item, "release_notes_guide", ""),
-        "release_notes_instructions": item_str(&item, "release_notes_instructions", ""),
-        "deploy_label": item_str(&item, "deploy_label", ""),
-        "deploy_workflows": item_str(&item, "deploy_workflows", ""),
-        "health_log_groups": log_groups,
-        "reminders_enabled": item_bool(&item, "reminders_enabled", false),
-        // Where reminders and release notes failures post. Shown only as a
-        // hint: a webhook posts as the team.
-        "webhooks": common::notify::store::view(&item),
-        "reminder_cooldown_hours": item_num(&item, "reminder_cooldown_hours", 4),
-    })))
+    let item = result.item().cloned().unwrap_or_default();
+    Ok(Json(common::review_config::view(&item)))
 }
 
 /// PUT /api/reviewer/config/:owner/:name — write the canonical config item.
-/// Admin only. Values are sanitized to the safe enum/range on the way in.
+/// Admin only. Values are sanitized to the safe enum/range on the way in
+/// (`common::review_config::build`, the same checks Setup's writes pass).
 pub async fn update_config(
     State(state): State<Arc<AppState>>,
     Extension(claims): Extension<Claims>,
@@ -245,188 +197,15 @@ pub async fn update_config(
     claims.require_role(3)?; // admin+
     let repo = format!("{owner}/{name}");
     validate_repo(&repo)?;
-    let sk = format!("REVIEW_CONFIG#REPO#{repo}");
-
-    let instructions = body["instructions"].as_str().unwrap_or("");
-    if instructions.len() > 20_000 {
-        return Err(StatusCode::PAYLOAD_TOO_LARGE);
-    }
-    let label = {
-        let l = body["label"].as_str().unwrap_or("ch-review").trim();
-        if l.is_empty() || l.len() > 100 {
-            "ch-review".to_string()
-        } else {
-            l.to_string()
-        }
-    };
-    let merge_method = match body["merge_method"].as_str().unwrap_or("squash") {
-        m @ ("squash" | "merge" | "rebase") => m,
-        _ => "squash",
-    };
-    let tag_mode = match body["tag_mode"].as_str().unwrap_or("semver") {
-        m @ ("semver" | "date") => m,
-        _ => "semver",
-    };
-    let tag_prefix = {
-        let t = body["tag_prefix"].as_str().unwrap_or("v");
-        if t.len() > 50 {
-            "v"
-        } else {
-            t
-        }
-    };
-    // Optional deploy label the reviewer adds once a PR is cleared to merge (to
-    // trigger the repo's own deploy CI). Operator-set free text; trimmed and
-    // capped to GitHub's 50-char label limit. Empty = no label step.
-    // Comma-separated list of labels to add once a PR is cleared to merge (each
-    // triggers the repo's own CI — deploy/staging/preview/E2E). Capped generously
-    // to fit several labels; trimming of individual entries happens worker-side.
-    let deploy_label: String = body["deploy_label"]
-        .as_str()
-        .unwrap_or("")
-        .trim()
-        .chars()
-        .take(200)
-        .collect();
-    // Workflows that deploy though their names and jobs don't say where
-    // (`file.yml=production`, comma separated): read by deploy stats.
-    let deploy_workflows: String = body["deploy_workflows"]
-        .as_str()
-        .unwrap_or("")
-        .trim()
-        .chars()
-        .filter(|c| !c.is_control())
-        .take(500)
-        .collect();
+    let sk = common::review_config::sk(&repo);
     // Reminder channels (Teams, Slack): each kept unless the body sets or
     // clears it, and only on its channel's webhook hosts, so the worker never
     // posts to an arbitrary or internal endpoint.
     let channels: common::notify::store::ChannelsInput =
         serde_json::from_value(body.clone()).map_err(|_| StatusCode::BAD_REQUEST)?;
     channels.check().map_err(super::alerts::save_error)?;
-    // Reviewer-picked CI labels: free text, bounded. The worker parses + enforces
-    // (allow-list and companion rules) — nothing outside `auto_label_allow` is
-    // ever added.
-    let bounded = |k: &str, max: usize| -> String {
-        body[k]
-            .as_str()
-            .unwrap_or("")
-            .trim()
-            .chars()
-            .take(max)
-            .collect()
-    };
-    let auto_label_allow = bounded("auto_label_allow", 1_000);
-    let auto_label_requires = bounded("auto_label_requires", 2_000);
-    let auto_label_guide = bounded("auto_label_guide", 5_000);
-    // Release notes. The email webhook must be https (it's POSTed to by the
-    // worker); the Confluence parent is a numeric page id.
-    let rn_email = bounded("release_notes_email_webhook_url", 1_000);
-    if !rn_email.is_empty() && !rn_email.starts_with("https://") {
-        return Err(StatusCode::BAD_REQUEST);
-    }
-    let rn_parent = bounded("release_notes_confluence_parent_id", 30);
-    if !rn_parent.chars().all(|c| c.is_ascii_digit()) {
-        return Err(StatusCode::BAD_REQUEST);
-    }
-    let rn_branch = bounded("release_notes_branch", 200);
-    let rn_space = bounded("release_notes_confluence_space", 100);
-    let rn_container = bounded("release_notes_confluence_container", 200);
-    let rn_guide = bounded("release_notes_guide", 300);
-    let rn_instructions = bounded("release_notes_instructions", 5_000);
-    let reminder_cooldown_hours = body["reminder_cooldown_hours"]
-        .as_u64()
-        .unwrap_or(4)
-        .clamp(1, 168);
-    // Release-tag batch window in minutes: 0 = tag every merge immediately,
-    // otherwise merges within the window share one release tag. Capped at 6h so
-    // a bad value can't strand a merge undeployed for days.
-    let tag_batch_minutes = body["tag_batch_minutes"].as_u64().unwrap_or(15).min(360);
-    let log_groups: Vec<AttributeValue> = body["health_log_groups"]
-        .as_array()
-        .map(|a| {
-            a.iter()
-                .filter_map(|v| v.as_str())
-                .take(20)
-                .map(attr_s)
-                .collect()
-        })
-        .unwrap_or_default();
-
-    let mut put = state
-        .dynamo
-        .put_item()
-        .table_name(&state.config.settings_table_name)
-        .item("pk", attr_s(&claims.team_id))
-        .item("sk", attr_s(&sk))
-        .item(
-            "enabled",
-            attr_bool(body["enabled"].as_bool().unwrap_or(false)),
-        )
-        .item("label", attr_s(&label))
-        .item(
-            "killed",
-            attr_bool(body["killed"].as_bool().unwrap_or(false)),
-        )
-        .item("instructions", attr_s(instructions))
-        .item(
-            "auto_merge",
-            attr_bool(body["auto_merge"].as_bool().unwrap_or(false)),
-        )
-        .item("merge_method", attr_s(merge_method))
-        .item(
-            "require_human_approval",
-            attr_bool(body["require_human_approval"].as_bool().unwrap_or(true)),
-        )
-        .item(
-            "auto_tag",
-            attr_bool(body["auto_tag"].as_bool().unwrap_or(false)),
-        )
-        .item("tag_mode", attr_s(tag_mode))
-        .item("tag_prefix", attr_s(tag_prefix))
-        .item("tag_batch_minutes", attr_n(tag_batch_minutes))
-        .item(
-            "health_check",
-            attr_bool(body["health_check"].as_bool().unwrap_or(false)),
-        )
-        .item(
-            "verify_tests",
-            attr_bool(body["verify_tests"].as_bool().unwrap_or(false)),
-        )
-        .item("deploy_label", attr_s(&deploy_label))
-        .item("deploy_workflows", attr_s(&deploy_workflows))
-        .item(
-            "require_tests",
-            attr_bool(body["require_tests"].as_bool().unwrap_or(false)),
-        )
-        .item(
-            "auto_labels",
-            attr_bool(body["auto_labels"].as_bool().unwrap_or(false)),
-        )
-        .item("auto_label_allow", attr_s(&auto_label_allow))
-        .item("auto_label_requires", attr_s(&auto_label_requires))
-        .item("auto_label_guide", attr_s(&auto_label_guide))
-        .item(
-            "release_notes",
-            attr_bool(body["release_notes"].as_bool().unwrap_or(false)),
-        )
-        .item("release_notes_branch", attr_s(&rn_branch))
-        .item("release_notes_confluence_space", attr_s(&rn_space))
-        .item("release_notes_confluence_parent_id", attr_s(&rn_parent))
-        .item("release_notes_confluence_container", attr_s(&rn_container))
-        .item("release_notes_email_webhook_url", attr_s(&rn_email))
-        .item("release_notes_guide", attr_s(&rn_guide))
-        .item("release_notes_instructions", attr_s(&rn_instructions))
-        .item(
-            "reminders_enabled",
-            attr_bool(body["reminders_enabled"].as_bool().unwrap_or(false)),
-        )
-        .item("reminder_cooldown_hours", attr_n(reminder_cooldown_hours))
-        .item("updated_at", attr_s(&chrono::Utc::now().to_rfc3339()));
     // Read the prior item BEFORE the overwrite: its write-only secret and its
-    // legacy `graph_enabled` are carried over. The code graph is its OWN
-    // feature with its own switch (`common::code_graph`); this page never
-    // turns it on or off.
+    // legacy `graph_enabled` are carried over by `build`.
     let prior = state
         .dynamo
         .get_item()
@@ -437,26 +216,17 @@ pub async fn update_config(
         .await
         .ok()
         .and_then(|o| o.item().cloned());
-    let legacy_graph = prior
-        .as_ref()
-        .and_then(|it| it.get("graph_enabled").cloned());
-    // The email-webhook secret is write-only: a PUT sets it only when the body
-    // carries a new value, clears it on `release_notes_email_webhook_secret_clear`,
-    // and otherwise keeps the stored one (GET never returns it, so the page
-    // can't send it back).
-    let prior_secret = prior
-        .as_ref()
-        .map(|it| item_str(it, "release_notes_email_webhook_secret", ""))
-        .unwrap_or_default();
-    let new_secret = bounded("release_notes_email_webhook_secret", 500);
-    let rn_secret = if body["release_notes_email_webhook_secret_clear"].as_bool() == Some(true) {
-        String::new()
-    } else if !new_secret.is_empty() {
-        new_secret
-    } else {
-        prior_secret
-    };
-    put = put.item("release_notes_email_webhook_secret", attr_s(&rn_secret));
+    let mut item = common::review_config::build(
+        &claims.team_id,
+        &repo,
+        &body,
+        prior.as_ref(),
+        &chrono::Utc::now().to_rfc3339(),
+    )
+    .map_err(|e| match e {
+        common::review_config::Reject::TooLarge => StatusCode::PAYLOAD_TOO_LARGE,
+        common::review_config::Reject::Bad(_) => StatusCode::BAD_REQUEST,
+    })?;
     for (k, v) in common::notify::store::save_attrs(
         &super::alerts::cipher(&state),
         &claims.team_id,
@@ -466,44 +236,49 @@ pub async fn update_config(
     .await
     .map_err(super::alerts::save_error)?
     {
-        put = put.item(k, v);
+        item.insert(k, v);
     }
-    if let Some(v) = legacy_graph {
-        put = put.item("graph_enabled", v);
-    }
-    put = put.item("health_log_groups", AttributeValue::L(log_groups));
+    state
+        .dynamo
+        .put_item()
+        .table_name(&state.config.settings_table_name)
+        .set_item(Some(item))
+        .send()
+        .await
+        .map_err(|e| {
+            error!("Failed to update reviewer config: {e}");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+    after_config_saved(&state, &claims.team_id, &owner, &name).await;
+    Ok(StatusCode::OK)
+}
 
-    put.send().await.map_err(|e| {
-        error!("Failed to update reviewer config: {e}");
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?;
+/// What follows a saved reviewer config, from the page or from Setup: the
+/// team joins the reviewer config index, and the repo gets its code graph
+/// built (once) unless the graph was turned off for it.
+pub(crate) async fn after_config_saved(state: &AppState, team_id: &str, owner: &str, name: &str) {
     // The review sweeps find configs through this index; the daily rebuild
     // adds the team if this write fails, so the save still succeeds.
     if let Err(e) = common::settings_index::add(
         &state.dynamo,
         &state.config.settings_table_name,
         common::review_config_index::NAME,
-        &claims.team_id,
+        team_id,
     )
     .await
     {
         tracing::warn!(error = %e, "Could not add the team to the reviewer config index");
     }
-
-    // A repo the reviewer is set up for gets its code graph built (once),
-    // unless the graph was turned off for it.
     if common::code_graph::is_enabled(
         &state.dynamo,
         &state.config.settings_table_name,
-        &claims.team_id,
+        team_id,
         &format!("{owner}/{name}"),
     )
     .await
     {
-        crate::routes::graph::enqueue_full_index(&state, &claims.team_id, &owner, &name, false)
-            .await;
+        crate::routes::graph::enqueue_full_index(state, team_id, owner, name, false).await;
     }
-    Ok(StatusCode::OK)
 }
 
 #[derive(serde::Deserialize, utoipa::IntoParams)]

@@ -67,6 +67,27 @@ impl GitConventions {
         }
     }
 
+    /// The settings item a save writes: a template left empty is left out,
+    /// so it keeps the default (the settings route and Setup).
+    pub fn to_item(&self, team_id: &str, now: &str) -> HashMap<String, AttributeValue> {
+        let s = |v: &str| AttributeValue::S(v.to_string());
+        let mut item = HashMap::from([
+            ("pk".to_string(), s(team_id)),
+            ("sk".to_string(), s(SETTINGS_SK)),
+            ("updated_at".to_string(), s(now)),
+        ]);
+        for (k, v) in [
+            ("branch", &self.branch),
+            ("commit", &self.commit),
+            ("pr_title", &self.pr_title),
+        ] {
+            if let Some(v) = v.as_deref().map(str::trim).filter(|v| !v.is_empty()) {
+                item.insert(k.to_string(), s(v));
+            }
+        }
+        item
+    }
+
     pub fn branch_template(&self) -> &str {
         self.branch.as_deref().unwrap_or(DEFAULT_BRANCH)
     }

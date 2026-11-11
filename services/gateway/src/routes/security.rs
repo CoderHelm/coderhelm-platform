@@ -1184,15 +1184,18 @@ pub async fn put_config(
     cfg.validate().map_err(|e| bad(&e))?;
     let cfg = cfg.cleaned();
     let text = serde_json::to_string(&cfg).map_err(|_| code(StatusCode::INTERNAL_SERVER_ERROR))?;
+    // The same item Setup writes (`common::setup::store::config_item`).
     state
         .dynamo
         .put_item()
         .table_name(&state.config.settings_table_name)
-        .item("pk", attr_s(&claims.team_id))
-        .item("sk", attr_s(sec::CONFIG_SK))
-        .item("config", attr_s(&text))
-        .item("updated_at", attr_s(&chrono::Utc::now().to_rfc3339()))
-        .item("updated_by", attr_s(&claims.email))
+        .set_item(Some(common::setup::store::config_item(
+            &claims.team_id,
+            sec::CONFIG_SK,
+            &text,
+            &claims.email,
+            &chrono::Utc::now().to_rfc3339(),
+        )))
         .send()
         .await
         .map_err(|e| {

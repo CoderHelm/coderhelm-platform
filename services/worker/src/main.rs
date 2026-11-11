@@ -415,10 +415,23 @@ async fn handle_message(state: Arc<WorkerState>, message: models::WorkerMessage)
         }
         models::WorkerMessage::Onboard(msg) => {
             info!(team_id = %msg.team_id, repos = msg.repos.len(), "Processing onboard");
+            let team_id = msg.team_id.clone();
+            let repos: Vec<String> = msg
+                .repos
+                .iter()
+                .map(|r| format!("{}/{}", r.owner, r.name))
+                .collect();
             let mut usage = models::TokenUsage::default();
             if let Err(e) = passes::onboard::run(&state, msg, &mut usage).await {
                 error!("Onboard failed: {e}");
             }
+            // Newly connected repos get the team's reviewed Setup choices
+            // when it asked for that (`auto_setup_new_repos`).
+            passes::setup::after_onboard(&state, &team_id, &repos).await;
+        }
+        models::WorkerMessage::SetupAnalyze(msg) => {
+            info!(team_id = %msg.team_id, run = %msg.run_id, repo = %msg.repo, "Setup: analyzing a repo");
+            passes::setup::analyze(&state, &msg).await;
         }
         models::WorkerMessage::MarkReady(msg) => {
             info!(team_id = %msg.team_id, pr_number = msg.pr_number, attempt = msg.attempt, "Deciding whether the PR leaves draft");
