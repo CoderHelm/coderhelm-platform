@@ -2735,10 +2735,20 @@ pub fn without(
 
 /// What a follow-up run on the open bundle is asked to add.
 pub fn join_note(add: &FixUnit, members: &[&Finding], cfg: &SecurityConfig) -> String {
+    join_note_with(add, members, cfg, &[])
+}
+
+/// [`join_note`] with the added bumps' upgrade notes.
+pub fn join_note_with(
+    add: &FixUnit,
+    members: &[&Finding],
+    cfg: &SecurityConfig,
+    notes: &[crate::upgrade_notes::PackageNotes],
+) -> String {
     let mut s = String::from(
         "Add these security fixes to this pull request, on its branch. Keep every bump already in it.\n\n",
     );
-    let plan = ticket_body(add, members, cfg);
+    let plan = ticket_body_with(add, members, cfg, notes);
     // The plan without its marker lines: they belong to the first ticket.
     s.push_str(
         plan.split("\n\n")
@@ -2784,6 +2794,18 @@ pub fn unit_due(unit: &FixUnit, cfg: &SecurityConfig) -> bool {
 /// The plan a fix run follows, given to the agent as the ticket's body. The
 /// marker line carries the branch.
 pub fn ticket_body(unit: &FixUnit, members: &[&Finding], cfg: &SecurityConfig) -> String {
+    ticket_body_with(unit, members, cfg, &[])
+}
+
+/// [`ticket_body`] with the upgrade notes the worker read before the run
+/// (`upgrade_notes`): the breaking changes, where the code uses them, and
+/// the lockfile's own command.
+pub fn ticket_body_with(
+    unit: &FixUnit,
+    members: &[&Finding],
+    cfg: &SecurityConfig,
+    notes: &[crate::upgrade_notes::PackageNotes],
+) -> String {
     if unit.ecosystem == crate::base_images::ECOSYSTEM {
         return crate::base_images::ticket_body(unit, members);
     }
@@ -2817,14 +2839,17 @@ pub fn ticket_body(unit: &FixUnit, members: &[&Finding], cfg: &SecurityConfig) -
             }
         ));
     }
+    s.push_str(&crate::upgrade_notes::ticket_section(notes));
+    let major_in_pr = cfg.major_bumps == MajorBumps::FixInPr && unit.bumps.iter().any(|b| b.major);
     s.push_str("\n## How\n");
-    s.push_str("1. Prefer a lockfile-only update within the allowed range (for example `npm update <pkg>`, `pnpm update <pkg>`, `cargo update -p <pkg> --precise <version>`, `bundle update --conservative <pkg>`).\n");
-    s.push_str("2. If the package is transitive and the lockfile alone can't reach the version, add the ecosystem's override (npm `overrides`, pnpm `pnpm.overrides`, Yarn `resolutions`, Poetry or uv constraints, Maven `dependencyManagement`, Gradle `constraints`) with a comment saying it can be removed once the parent ships the fixed version.\n");
-    s.push_str("3. Otherwise bump the version in the manifest.\n");
-    s.push_str("Regenerate lockfiles with the repository's own package manager and its pinned version; never edit a lockfile by hand.\n");
-    if cfg.major_bumps == MajorBumps::FixInPr && unit.bumps.iter().any(|b| b.major) {
-        s.push_str("A major version is needed: follow the upgrade guide and fix the code it breaks so the tests pass.\n");
+    s.push_str("1. Change the manifest only. A direct dependency: raise its version range to the fixed version. A transitive one: add the ecosystem's override (npm `overrides`, pnpm `pnpm.overrides`, Yarn `resolutions`, Poetry or uv constraints, Maven `dependencyManagement`, Gradle `constraints`) with a comment saying it can be removed once the parent ships the fixed version.\n");
+    s.push_str("2. Never write or edit a lockfile yourself. CoderHelm runs the repository's own package manager in its sandbox right after your change (the command is named under Upgrade notes) and commits the lockfile it writes; a lockfile you edited is replaced by that output.\n");
+    s.push_str("3. Read the upgrade notes above. For every breaking change they name, find each use in this repository with search_code (the listed places are where a search found them before the run, not necessarily all of them) and update every call site in this same change. Keep the behaviour the same.\n");
+    if major_in_pr {
+        s.push_str("   A major version is needed: follow its upgrade guide, change every call site of the APIs it changed, and fix the code it breaks so the build, type check and tests pass.\n");
     }
+    s.push_str("4. Before you finish, call run_checks (build, type check, tests). Fix what the upgrade breaks. If a check still fails, never say it passes: write which check fails and why under `### Not fixed` in your description; the pull request then stays a draft.\n");
+    s.push_str("5. In your description, for each package write `### <package> <from> to <to>` with the breaking changes you found and how each was handled (file and line), the files you changed for it, and anything a person should look at (behaviour at runtime, configuration, environment).\n");
     s.push_str("\n## Advisories\n");
     for f in members {
         s.push_str(&format!(
@@ -2920,6 +2945,24 @@ pub fn bump_table(unit: &FixUnit, members: &[(&Finding, &FindingState)]) -> Stri
 }
 
 pub fn pr_body(unit: &FixUnit, members: &[(&Finding, &FindingState)], change: &str) -> String {
+    pr_body_with(
+        unit,
+        members,
+        change,
+        &crate::upgrade_notes::WhatToCheck::default(),
+    )
+}
+
+/// [`pr_body`] with its "What to check" section written from the upgrade
+/// notes, the files the pull request touches and its CI
+/// ([`crate::upgrade_notes::what_to_check`]); the Proof says where CI
+/// stands, never a pass it didn't have.
+pub fn pr_body_with(
+    unit: &FixUnit,
+    members: &[(&Finding, &FindingState)],
+    change: &str,
+    check: &crate::upgrade_notes::WhatToCheck,
+) -> String {
     let mut s = String::new();
     let top = members
         .iter()
@@ -3073,7 +3116,27 @@ pub fn pr_body(unit: &FixUnit, members: &[(&Finding, &FindingState)], change: &s
         s.push_str(change);
         s.push('\n');
     }
-    s.push_str("\n## Proof\n\nCI runs on this pull request. After it merges, the dependency list is read again and the advisory clears from Security.\n");
+    s.push('\n');
+    s.push_str(&crate::upgrade_notes::what_to_check(&unit.bumps, check));
+    let ci = match check.ci.state.as_str() {
+        "passing" => "CI passes on this pull request.".to_string(),
+        "failing" => format!(
+            "CI fails on this pull request ({}), so it stays a draft until that is fixed.",
+            if check.ci.failing.is_empty() {
+                "see its checks".to_string()
+            } else {
+                check
+                    .ci
+                    .failing
+                    .iter()
+                    .map(|c| format!("`{c}`"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            }
+        ),
+        _ => "CI runs on this pull request; it stays a draft until CI passes.".to_string(),
+    };
+    s.push_str(&format!("\n## Proof\n\n{ci} After it merges, the dependency list is read again and the advisory clears from Security.\n"));
     s.push_str("\n## Closes\n\n");
     let mut closes = 0;
     for (f, _) in members {
@@ -5636,6 +5699,135 @@ mod tests {
         assert!(body.contains("Dependabot alert [#88]"));
         assert!(body.contains("P0, due Nov 12"));
         assert!(!body.contains('→') && !body.to_lowercase().contains("phase"));
+    }
+
+    /// A major bump with a breaking API change: the ticket hands the coder
+    /// the changelog's breaking change, the call site to update, the
+    /// lockfile's own command and the checks to run; the pull request's
+    /// "What to check" says, per package, what changed and that CI fails.
+    #[test]
+    fn a_major_bump_carries_its_breaking_changes_to_the_coder_and_the_reviewer() {
+        use crate::upgrade_notes::{self as un, CallSite, CiState, PackageNotes, WhatToCheck};
+        let changelog = "# Changelog\n\n## 3.0.0\n### Breaking Changes\n- `parse()` is removed: use `parseAsync()`.\n- The `strict` option now defaults to true.\n\n## 2.5.0\n- Added things\n";
+        let mut n = PackageNotes {
+            package: "parser".into(),
+            ecosystem: "npm".into(),
+            from: "2.4.1".into(),
+            to: "3.0.0".into(),
+            major: true,
+            manifest: "package.json".into(),
+            lockfile: "pnpm-lock.yaml".into(),
+            lock_command: "pnpm install --lockfile-only --ignore-scripts".into(),
+            ..Default::default()
+        };
+        un::fill(
+            &mut n,
+            "`CHANGELOG.md` of acme/parser",
+            "",
+            &un::changelog_between(changelog, "2.4.1", "3.0.0"),
+        );
+        n.call_sites = vec![CallSite {
+            api: "parse".into(),
+            file: "src/load.ts".into(),
+            line: 12,
+            text: "const doc = parse(text);".into(),
+        }];
+        let unit = FixUnit {
+            repo: "acme/web".into(),
+            ecosystem: "npm".into(),
+            bundle: true,
+            branch: "coderhelm/security-acme-web".into(),
+            bumps: vec![
+                Bump {
+                    package: "parser".into(),
+                    from: "2.4.1".into(),
+                    to: "3.0.0".into(),
+                    major: true,
+                    manifest: "package.json".into(),
+                },
+                Bump {
+                    package: "undici".into(),
+                    from: "6.19.2".into(),
+                    to: "6.21.1".into(),
+                    major: false,
+                    manifest: "package.json".into(),
+                },
+            ],
+            ..Default::default()
+        };
+        let cfg = SecurityConfig::default();
+        assert_eq!(cfg.major_bumps, MajorBumps::FixInPr);
+        let body = ticket_body_with(&unit, &[], &cfg, &[n.clone()]);
+        for want in [
+            "## Upgrade notes",
+            "### `parser` 2.4.1 to 3.0.0 (major version)",
+            "`parse()` is removed: use `parseAsync()`",
+            "`src/load.ts:12` uses `parse`",
+            "`pnpm-lock.yaml` is written by `pnpm install --lockfile-only",
+            "Never write or edit a lockfile yourself",
+            "update every call site in this same change",
+            "change every call site of the APIs it changed",
+            "call run_checks (build, type check, tests)",
+            "`### Not fixed`",
+        ] {
+            assert!(body.contains(want), "missing {want:?} in:\n{body}");
+        }
+        assert!(!body.contains("lockfile-only update within the allowed range"));
+        assert!(!body.contains('→') && !body.to_lowercase().contains("phase"));
+
+        let f1 = Finding {
+            package: "parser".into(),
+            version: "2.4.1".into(),
+            ..finding("a")
+        };
+        let f2 = Finding {
+            package: "undici".into(),
+            version: "6.19.2".into(),
+            ..finding("b")
+        };
+        let st = FindingState::default();
+        let check = WhatToCheck {
+            notes: vec![n],
+            files: vec![
+                "package.json".into(),
+                "pnpm-lock.yaml".into(),
+                "src/load.ts".into(),
+            ],
+            ci: CiState {
+                state: "failing".into(),
+                failing: vec!["test".into()],
+                checks: vec!["build".into(), "test".into()],
+            },
+        };
+        let pr = pr_body_with(
+            &unit,
+            &[(&f1, &st), (&f2, &st)],
+            "Moved to parseAsync.",
+            &check,
+        );
+        for want in [
+            "## What to check",
+            "### `parser` 2.4.1 to 3.0.0 (major version)",
+            "### `undici` 6.19.2 to 6.21.1",
+            "Breaking changes found: 2",
+            "`src/load.ts:12` (`parse`): changed in this pull request",
+            "Look at (runtime or configuration): The `strict` option now defaults to true.",
+            "**Files touched** (3)",
+            "CI fails on this pull request: `test`",
+            "## Proof\n\nCI fails on this pull request (`test`), so it stays a draft",
+        ] {
+            assert!(pr.contains(want), "missing {want:?} in:\n{pr}");
+        }
+        assert!(!pr.contains("CI passes"));
+        let order = [
+            "## Summary",
+            "## Change",
+            "## What to check",
+            "## Proof",
+            "## Closes",
+        ];
+        let at: Vec<usize> = order.iter().map(|h| pr.find(h).unwrap()).collect();
+        assert!(at.windows(2).all(|w| w[0] < w[1]), "{at:?}");
     }
 
     #[test]

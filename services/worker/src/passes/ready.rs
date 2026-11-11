@@ -167,6 +167,23 @@ pub struct Facts {
     pub own_fixing: bool,
     /// When it is decided; a wait is bounded against it.
     pub now: Option<chrono::DateTime<chrono::Utc>>,
+    /// A security fix's pull request (its description carries the security
+    /// marker): it leaves draft only once the repository's CI passes.
+    pub security: bool,
+    /// Its CI fix loop found every failing check failing on the base branch
+    /// too (`ci_end` = `red_on_base`): not this change's failure.
+    pub red_on_base: bool,
+}
+
+impl Ci {
+    /// A check failed on the head (not merely running or missing).
+    pub fn failing(&self) -> bool {
+        !self.green && self.why.starts_with("CI fails")
+    }
+    /// Checks are still running on the head.
+    pub fn running(&self) -> bool {
+        !self.green && self.why.starts_with("CI is still running")
+    }
 }
 
 /// Marks a ready pull request's description as still being proven.
@@ -400,6 +417,14 @@ pub fn decide(f: &Facts) -> Decision {
                 });
             }
         }
+    }
+    // A security fix leaves draft on green CI only.
+    let (sec_hold, sec_wait) = security_ci(f);
+    if let Some(r) = sec_hold {
+        reasons.push(r);
+    }
+    if let Some(w) = sec_wait {
+        proof_wait.get_or_insert(w);
     }
     // CoderHelm's own sandbox and checklist findings weigh against the
     // repository's CI and the review: with both green they are open items
@@ -937,6 +962,7 @@ async fn gather(ctx: &Ctx<'_>) -> Result<Facts, Refused> {
     f.draft = pr["draft"].as_bool().unwrap_or(f.draft);
     f.body = pr["body"].as_str().unwrap_or("").to_string();
     f.title = pr["title"].as_str().unwrap_or("").to_string();
+    f.security = f.body.contains(common::security_fixes::MARKER);
     if reads_ci(&f) {
         let sha = pr["head"]["sha"].as_str().unwrap_or("");
         f.ci = ci_on(gh, ctx.owner, ctx.repo, sha).await.map_err(|e| {
@@ -957,11 +983,42 @@ async fn gather(ctx: &Ctx<'_>) -> Result<Facts, Refused> {
         )
         .await;
         f.approved = matches!(&verdict, Ok(Some(v)) if v == "APPROVE");
+        if f.security && f.ci.failing() {
+            f.red_on_base = red_on_base(ctx).await;
+        }
         // Only a read that found no review: a failed read never queues one.
         f.review_missing = matches!(verdict, Ok(None)) && !sha.is_empty();
     }
     f.head = pr["head"]["sha"].as_str().unwrap_or("").to_string();
     Ok(f)
+}
+
+/// Whether the run's CI fix loop ended because every failing check fails on
+/// the base branch too.
+async fn red_on_base(ctx: &Ctx<'_>) -> bool {
+    let run_id = if ctx.run_id.is_empty() {
+        super::review_pr::lookup_run_by_pr(ctx.state, ctx.team_id, ctx.owner, ctx.repo, ctx.pr)
+            .await
+            .unwrap_or_default()
+    } else {
+        ctx.run_id.clone()
+    };
+    if run_id.is_empty() {
+        return false;
+    }
+    ctx.state
+        .dynamo
+        .get_item()
+        .table_name(&ctx.state.config.runs_table_name)
+        .key("team_id", attr_s(ctx.team_id))
+        .key("run_id", attr_s(&run_id))
+        .projection_expression("ci_end")
+        .send()
+        .await
+        .ok()
+        .and_then(|o| o.item)
+        .and_then(|i| i.get("ci_end").and_then(|v| v.as_s().ok()).cloned())
+        .is_some_and(|e| e == "red_on_base")
 }
 
 /// Asks for the ready decision of a PR again, now: CoderHelm's review of its
@@ -1047,7 +1104,45 @@ async fn fix_own_findings(ctx: &Ctx<'_>, run_id: &str, f: &mut Facts) {
 /// request whose one hold was such a line read CI as "not green" without
 /// asking, and stayed a draft on every sweep although its CI had passed.
 pub fn reads_ci(f: &Facts) -> bool {
-    f.feature.is_some() || super::proof::ci_settles_a_hold(&f.body)
+    f.feature.is_some() || f.security || super::proof::ci_settles_a_hold(&f.body)
+}
+
+/// A security fix's hold or wait on its CI: failing CI keeps the draft with
+/// the failing checks named (a version bump that breaks the build is never
+/// shipped as a fix), running CI is waited for. No CI at all, or a failure
+/// the base branch has too, holds nothing.
+pub fn security_ci(f: &Facts) -> (Option<Reason>, Option<String>) {
+    if !f.security || f.ci.green || f.red_on_base {
+        return (None, None);
+    }
+    if f.ci.failing() {
+        return (
+            Some(Reason::new(
+                format!(
+                    "This security fix doesn't pass CI: {}. The version bump broke something \
+                     CoderHelm's fixes couldn't repair (\"What to check\" lists the breaking \
+                     changes and call sites)",
+                    f.ci.why
+                        .trim_start_matches("CI fails on this head: ")
+                        .trim_end_matches('.')
+                ),
+                "Fix the failing checks on this branch (CoderHelm decides again on the push), or \
+                 close the pull request if the upgrade needs more work than a fix.",
+            )),
+            None,
+        );
+    }
+    if f.ci.running() {
+        return (
+            None,
+            Some(format!(
+                "this security fix waits for its CI: {}",
+                f.ci.why
+                    .trim_start_matches("CI is still running on this head: ")
+            )),
+        );
+    }
+    (None, None)
 }
 
 /// Whether a check is CoderHelm's own (its review check, or any check its
@@ -1845,6 +1940,78 @@ mod tests {
             approved: true,
             ..Default::default()
         }
+    }
+
+    /// A security fix whose CI the fix loop couldn't get green (it handed
+    /// the pull request off): it stays a draft, and the hold names the
+    /// failing checks at the top of the description.
+    #[test]
+    fn a_security_fix_with_failing_ci_stays_a_draft_and_says_what_broke() {
+        let runs = vec![
+            json!({"name": "build", "status": "completed", "conclusion": "success"}),
+            json!({"name": "test", "status": "completed", "conclusion": "failure"}),
+        ];
+        let f = Facts {
+            draft: true,
+            security: true,
+            body: format!("{}\n## Summary\nFixes it.", common::security_fixes::MARKER),
+            ci: ci_standing(&runs, &[]),
+            ..Default::default()
+        };
+        assert!(reads_ci(&f));
+        // The description's own marker is not an open security item.
+        assert!(!super::super::proof::holds_security_items(&f.body));
+        assert!(super::super::proof::holds_security_items(
+            "- Token logged in plain text <!-- coderhelm:security -->"
+        ));
+        let d = decide(&f);
+        let Decision::Held { reasons } = &d else {
+            panic!("held expected, got {d:?}");
+        };
+        assert_eq!(reasons.len(), 1);
+        assert!(reasons[0]
+            .line()
+            .contains("This security fix doesn't pass CI: `test`"));
+        let section = status_section(&d);
+        assert!(section.contains("**This pull request stays a draft.**"));
+        assert!(section.contains("`test`"));
+        // The same pull request without the marker is any other run's, and
+        // that run's hand-off still marks it ready for a person.
+        let plain = Facts {
+            security: false,
+            ..f.clone()
+        };
+        assert!(matches!(decide(&plain), Decision::Ready { .. }));
+        // Green CI: ready.
+        let green = Facts {
+            ci: Ci {
+                green: true,
+                why: String::new(),
+            },
+            ..f.clone()
+        };
+        assert!(matches!(decide(&green), Decision::Ready { .. }));
+        // Running CI: a wait, never a ready.
+        let running = Facts {
+            ci: ci_standing(
+                &[json!({"name": "test", "status": "in_progress", "conclusion": null})],
+                &[],
+            ),
+            ..f.clone()
+        };
+        assert!(matches!(decide(&running), Decision::Wait { .. }));
+        // Failing only on what the base branch fails too: not this change's.
+        let base = Facts {
+            red_on_base: true,
+            ..f.clone()
+        };
+        assert!(matches!(decide(&base), Decision::Ready { .. }));
+        // A repository without CI isn't held for it.
+        let none = Facts {
+            ci: ci_standing(&[], &[]),
+            ..f
+        };
+        assert!(matches!(decide(&none), Decision::Ready { .. }));
     }
 
     fn sandbox_fails() -> FeatureHold {

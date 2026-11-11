@@ -1197,6 +1197,7 @@ pub mod ticket_base;
 pub mod ticket_history;
 pub mod tool_proposals;
 mod triage;
+pub mod upgrade_notes;
 pub mod usage_reconcile;
 pub mod web_check;
 pub mod webhooks;

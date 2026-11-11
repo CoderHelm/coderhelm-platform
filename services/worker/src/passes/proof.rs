@@ -1474,7 +1474,13 @@ pub fn holds_unfinished(body: &str) -> bool {
 /// Whether the description still holds a security item: the pull request
 /// stays a draft until none is left.
 pub fn holds_security_items(body: &str) -> bool {
-    body.contains(SECURITY_MARK)
+    // An item carries the mark after its text. The same comment alone on a
+    // line is a security fix's own description marker
+    // (`common::security_fixes::MARKER`), not an open item: it once held
+    // every security fix pull request as a draft on "Security items are
+    // open".
+    body.lines()
+        .any(|l| l.contains(SECURITY_MARK) && l.trim() != SECURITY_MARK)
 }
 
 /// The description with its security items replaced by `items` (all of them
