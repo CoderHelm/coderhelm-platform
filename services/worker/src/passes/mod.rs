@@ -1166,6 +1166,7 @@ pub(crate) mod run_files;
 pub mod run_guard;
 pub(crate) mod run_lists;
 mod security;
+pub mod security_fixes;
 #[cfg(test)]
 mod selfhost_links;
 mod series;
@@ -3457,18 +3458,23 @@ async fn run_passes(
                 }
                 branch.clone()
             }
-            None => {
-                resolve_run_branch(
-                    &github,
-                    &msg.repo_owner,
-                    &msg.repo_name,
-                    &msg.ticket_id,
-                    &conventions,
-                    &tokens,
-                    "",
-                )
-                .await
-            }
+            // A security fix's branch is named by its plan
+            // (`coderhelm/security-<pkg>-<version>`).
+            None => match common::security_fixes::branch_in_body(&msg.ticket_id, &msg.body) {
+                Some(b) => b,
+                None => {
+                    resolve_run_branch(
+                        &github,
+                        &msg.repo_owner,
+                        &msg.repo_name,
+                        &msg.ticket_id,
+                        &conventions,
+                        &tokens,
+                        "",
+                    )
+                    .await
+                }
+            },
         };
         match open_pr_for_ticket(
             &github,

@@ -825,6 +825,32 @@ impl GitHubClient {
         Ok(resp.json().await?)
     }
 
+    /// GET an API path (`/repos/...`) with the installation's token, with the
+    /// status whatever it is: a caller that tells "no permission" from "turned
+    /// off" from "missing" reads the code and body itself.
+    pub async fn get_status(
+        &self,
+        path: &str,
+    ) -> Result<(u16, serde_json::Value), Box<dyn std::error::Error + Send + Sync>> {
+        let headers = self.auth_headers().await?;
+        let mut req = self.http.get(format!("{API_BASE}{path}"));
+        for (k, v) in headers {
+            req = req.header(k, v);
+        }
+        let resp = self.send_tracked(req).await?;
+        let status = resp.status().as_u16();
+        let body = resp.json().await.unwrap_or(serde_json::Value::Null);
+        Ok((status, body))
+    }
+
+    /// GET an API path; an error unless GitHub answers 2xx.
+    pub async fn get_api(
+        &self,
+        path: &str,
+    ) -> Result<serde_json::Value, Box<dyn std::error::Error + Send + Sync>> {
+        self.get(&format!("{API_BASE}{path}")).await
+    }
+
     // ─── Repo snapshot (tarball-backed local search + reads) ────
 
     /// Download the repo tarball for a ref. One core-API request; the 302

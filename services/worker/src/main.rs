@@ -551,6 +551,22 @@ async fn handle_message(state: Arc<WorkerState>, message: models::WorkerMessage)
                 unstaled = stale.unstaled,
                 "Stale PR sweep done"
             );
+            // Security fixes: daily sources per repository, triage, fix
+            // runs and cards (off unless a team turned them on).
+            let sec = passes::security_fixes::sweep(&state).await;
+            info!(
+                teams = sec.teams,
+                repos = sec.repos_synced,
+                new_findings = sec.new_findings,
+                triaged = sec.triaged,
+                runs = sec.runs,
+                cards = sec.cards,
+                "Security sweep done"
+            );
+        }
+        models::WorkerMessage::SecurityEvent(msg) => {
+            info!(team_id = %msg.team_id, kind = %msg.kind, repo = %msg.repo, "Security event");
+            passes::security_fixes::on_event(&state, &msg).await;
         }
         models::WorkerMessage::StalePrsPreview(msg) => {
             info!(team_id = %msg.team_id, repo = %msg.repo, "Stale PR preview");

@@ -242,6 +242,16 @@ test("GitHub: no app, refused keys, missing permissions, wrong webhook, bad secr
   assertExplained(warned, C.WARN);
   assert.match(warned.what, /Checks: write/);
 
+  // An app created before security fixes asked for Dependabot alerts is
+  // warned, never failed: security fixes use OSV and GitHub's advisories.
+  const { vulnerability_alerts: _gone, ...noAlerts } = PERMISSIONS;
+  const beforeSecurity = { ...APP, permissions: noAlerts, events: EVENTS.filter((e) => e !== "dependabot_alert" && e !== "security_advisory") };
+  const securityWarn = (await C.checkGithubApp({ fetchImpl: github({ "/app": json(200, beforeSecurity) }).fetchImpl }, SECRET, "https://helm.example.org")).find((r) => r.id === "github_permissions");
+  assertExplained(securityWarn, C.WARN);
+  assert.match(securityWarn.what, /Dependabot alerts: read/);
+  assert.match(securityWarn.what, /dependabot_alert event/);
+  assert.match(securityWarn.why, /Security fixes/);
+
   const hook = (await C.checkGithubApp({ fetchImpl: github({ "/app/hook/config": json(200, { url: "https://old.example.org/webhooks/github" }) }).fetchImpl }, SECRET, "https://helm.example.org")).find((r) => r.id === "github_webhook");
   assertExplained(hook);
   assert.match(hook.fix.text, /https:\/\/helm\.example\.org\/webhooks\/github/);

@@ -27,6 +27,7 @@
     "lesson": {"type":"lesson","team_id":"TEAM#team-a","installation_id":1,"run_id":"r1","repo_owner":"acme","repo_name":"widgets","pr_number":2,"trigger":"pr_closed"},
     "reward_outcome": {"type":"reward_outcome","team_id":"TEAM#team-a","installation_id":1,"run_id":"r1","repo_owner":"acme","repo_name":"widgets","pr_number":2},
     "stale_prs_preview": {"type":"stale_prs_preview","team_id":"TEAM#team-a","repo":"acme/widgets"},
+    "security_event": {"type":"security_event","team_id":"TEAM#team-a","installation_id":1,"kind":"dependabot_alert","repo":"acme/widgets","action":"created","alert_number":88,"ghsa_id":"GHSA-q9fx-2w5c-8m4r"},
     "review_lesson": {"type":"review_lesson","team_id":"TEAM#team-a","installation_id":1,"repo_owner":"acme","repo_name":"widgets","pr_number":2,"trigger":"reply","event_at":1},
     "jira_comment": {"type":"jira_comment","team_id":"TEAM#team-a","installation_id":1,"ticket_id":"T-1","title":"t","run_id":"r1","run_status":"completed","pr_number":2,"repo_owner":"acme","repo_name":"widgets","author":"someone","comment":"c","context_hash":"h","action":{"type":"resume","team_id":"TEAM#team-a","run_id":"r1","installation_id":1}},
     "usage_record": {"type":"usage_record","call_id":"req_011","team_id":"TEAM#team-a","at_ms":1792416387000,"feature":"run","model":"claude-opus-5-5","billed_to":"team","estimated":true,"usage":{"uncached_input":10,"cache_read":2000,"cache_write_5m":300,"cache_write_1h":0,"output":42}},

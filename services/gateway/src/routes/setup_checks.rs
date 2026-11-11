@@ -167,8 +167,16 @@ pub const REQUIRED_PERMISSIONS: &[(&str, &str, &str)] = &[
 /// What a new app asks for beyond [`REQUIRED_PERMISSIONS`]
 /// (installer/lib/github-app.mjs PERMISSIONS): CoderHelm works without it,
 /// so an app created before it was asked for is warned, never failed.
-/// Checks: write lets a review show its "CoderHelm review" check run.
-pub const OPTIONAL_PERMISSIONS: &[(&str, &str, &str)] = &[("checks", "write", "Checks")];
+/// Checks: write lets a review show its "CoderHelm review" check run;
+/// Dependabot alerts: read lets security fixes read Dependabot's alerts.
+pub const OPTIONAL_PERMISSIONS: &[(&str, &str, &str)] = &[
+    ("checks", "write", "Checks"),
+    ("vulnerability_alerts", "read", "Dependabot alerts"),
+];
+
+/// Events a new app subscribes to that CoderHelm works without (security
+/// fixes; installer/lib/github-app.mjs OPTIONAL_EVENTS): warned, never failed.
+pub const OPTIONAL_EVENTS: &[&str] = &["dependabot_alert", "security_advisory"];
 
 /// The webhook events the gateway handles.
 pub const REQUIRED_EVENTS: &[&str] = &[
@@ -355,20 +363,42 @@ pub fn github_permissions(app: &Value) -> Check {
         .filter(|e| !events.contains(e))
         .collect();
     if problems.is_empty() && missing_events.is_empty() {
-        let optional: Vec<String> = OPTIONAL_PERMISSIONS
+        let mut optional: Vec<String> = OPTIONAL_PERMISSIONS
             .iter()
             .filter(|(key, need, _)| level(have[*key].as_str().unwrap_or("none")) < level(need))
             .map(|(_, need, name)| format!("{name}: {need}"))
             .collect();
+        optional.extend(
+            OPTIONAL_EVENTS
+                .iter()
+                .filter(|e| !events.contains(e))
+                .map(|e| format!("the {e} event")),
+        );
         if !optional.is_empty() {
+            let mut why: Vec<&str> = vec![];
+            if optional.iter().any(|o| o.starts_with("Checks")) {
+                why.push(
+                    "Reviews work without Checks: write, but pull requests don't show the \
+                     \"CoderHelm review\" check that links to each review's session.",
+                );
+            }
+            if optional.iter().any(|o| {
+                o.starts_with("Dependabot")
+                    || o.contains("dependabot_alert")
+                    || o.contains("security_advisory")
+            }) {
+                why.push(
+                    "Security fixes work without Dependabot alerts and their events, using \
+                     OSV and GitHub's advisories only.",
+                );
+            }
             return Check::not_ok(
                 Status::Warn,
                 "github_permissions",
                 G,
                 "GitHub App permissions and events",
                 format!("Not granted yet: {}.", optional.join(", ")),
-                "Reviews work without it, but pull requests don't show the \"CoderHelm review\" \
-                 check that links to each review's session.",
+                why.join(" "),
                 Fix::text("Open the app's Permissions and events page, set the values listed, save, then accept the new permissions on each installation.")
                     .url(format!("{}/permissions", app_settings_url(app))),
             );
@@ -2768,7 +2798,32 @@ mod tests {
         for (k, v, _) in REQUIRED_PERMISSIONS.iter().chain(OPTIONAL_PERMISSIONS) {
             p.insert((*k).into(), json!(v));
         }
-        app(Value::Object(p), json!(REQUIRED_EVENTS))
+        let events: Vec<&str> = REQUIRED_EVENTS
+            .iter()
+            .chain(OPTIONAL_EVENTS)
+            .copied()
+            .collect();
+        app(Value::Object(p), json!(events))
+    }
+
+    #[test]
+    fn an_app_without_dependabot_alerts_is_warned_never_failed() {
+        let mut a = full();
+        a["permissions"]
+            .as_object_mut()
+            .unwrap()
+            .remove("vulnerability_alerts");
+        a["events"] = json!(REQUIRED_EVENTS);
+        let c = github_permissions(&a);
+        assert_eq!(c.status, Status::Warn);
+        assert!(c.detail.contains("Dependabot alerts: read"), "{}", c.detail);
+        assert!(
+            c.detail.contains("the dependabot_alert event"),
+            "{}",
+            c.detail
+        );
+        assert!(c.why.contains("Security fixes"), "{}", c.why);
+        assert_eq!(github_permissions(&full()).status, Status::Pass);
     }
 
     #[test]

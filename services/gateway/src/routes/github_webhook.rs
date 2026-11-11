@@ -272,6 +272,16 @@ pub async fn handle(
         StatusCode::BAD_REQUEST
     })?;
 
+    // A GitHub advisory is global: GitHub may send it without an
+    // installation, and then it goes to every team with security fixes on.
+    if event_type == "security_advisory" && payload["installation"]["id"].as_u64().is_none() {
+        info!(
+            event_type,
+            "GitHub advisory received without an installation"
+        );
+        return super::security::on_security_advisory(&state, &payload, 0, "").await;
+    }
+
     let installation_id = payload["installation"]["id"]
         .as_u64()
         .ok_or(StatusCode::BAD_REQUEST)?;
@@ -349,6 +359,8 @@ pub const HANDLED_EVENTS: &[&str] = &[
     "check_suite",
     "repository",
     "workflow_run",
+    "dependabot_alert",
+    "security_advisory",
 ];
 
 /// Handles one verified GitHub event (from GitHub, or from CoderHelm's relay
@@ -483,8 +495,10 @@ async fn dispatch(
             Ok(StatusCode::OK)
         }
         "security_advisory" => {
-            info!("Security advisory event received — logged");
-            Ok(StatusCode::OK)
+            super::security::on_security_advisory(state, payload, installation_id, team_id).await
+        }
+        "dependabot_alert" => {
+            super::security::on_dependabot_alert(state, payload, installation_id, team_id).await
         }
         _ => {
             info!(event_type, "Ignoring unhandled event type");
@@ -3907,6 +3921,15 @@ async fn handle_push(
     }
     // Knowledge sources reading this repository's docs sync now.
     super::knowledge_sources::on_push(state, team_id, &format!("{owner}/{name}")).await;
+    // Security fixes: a changed dependency file re-reads the dependencies.
+    super::security::on_default_branch_push(
+        state,
+        payload,
+        installation_id,
+        team_id,
+        &format!("{owner}/{name}"),
+    )
+    .await;
     // Team tool definitions in `.coderhelm/tools/` become proposals waiting
     // for an admin's approval. A merge never turns a tool on by itself.
     let tool_paths = tool_definition_paths(payload);

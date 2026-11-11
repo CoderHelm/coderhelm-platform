@@ -606,6 +606,16 @@ Return ONLY the markdown body text."#,
         None => full_body,
     };
 
+    // A security fix's description is its own: the advisory facts, with
+    // the run's words under Change.
+    let full_body = if common::security_fixes::is_ticket(&msg.ticket_id) {
+        super::security_fixes::pr_body(state, msg, clean_body)
+            .await
+            .unwrap_or(full_body)
+    } else {
+        full_body
+    };
+
     // The PR title and squash commit follow the team's templates.
     let conventions = super::load_git_conventions(state, &msg.team_id, &msg.ticket_id).await;
     let tokens = super::ticket_tokens(msg);
@@ -723,6 +733,8 @@ Return ONLY the markdown body text."#,
                 &url,
             )
             .await;
+        } else if common::security_fixes::is_ticket(&msg.ticket_id) {
+            super::security_fixes::on_pr_opened(state, github, msg, number, &url).await;
         } else if matches!(msg.source, TicketSource::Alert) {
             notify_alert_pr(state, msg, number, &title, &url).await;
         }
@@ -1307,6 +1319,11 @@ pub(crate) fn pr_title(
     tokens: &common::git_conventions::Tokens,
     msg: &TicketMessage,
 ) -> String {
+    // A security fix's title is already in its conventional form
+    // (`fix(deps): bump <pkg> <a> to <b> [SECURITY] (<id>)`).
+    if common::security_fixes::is_ticket(&msg.ticket_id) && !msg.title.is_empty() {
+        return msg.title.clone();
+    }
     if let Some(t) = &conventions.pr_title {
         return common::git_conventions::pr_title(t, tokens);
     }
@@ -1331,6 +1348,9 @@ fn squash_message(
     tokens: &common::git_conventions::Tokens,
     msg: &TicketMessage,
 ) -> String {
+    if common::security_fixes::is_ticket(&msg.ticket_id) && !msg.title.is_empty() {
+        return msg.title.clone();
+    }
     if let Some(t) = &conventions.commit {
         return common::git_conventions::commit(t, tokens);
     }

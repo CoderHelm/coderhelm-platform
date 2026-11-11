@@ -25,6 +25,8 @@ pub const ALERT: &str = "alert";
 pub const SCHEDULED: &str = "scheduled";
 /// A fix started automatically from a log finding.
 pub const LOG_FINDING: &str = "log_finding";
+/// A security fix started from an advisory (`common::security_fixes`).
+pub const SECURITY: &str = "security";
 
 /// Settings-table sort key prefix of a Jira user CoderHelm has seen.
 pub const JIRA_USER_PREFIX: &str = "JIRAUSER#";
@@ -147,7 +149,7 @@ impl Requester {
         if s.is_empty() || is_placeholder(s) {
             return None;
         }
-        if [E2E, ALERT, SCHEDULED]
+        if [E2E, ALERT, SCHEDULED, SECURITY]
             .iter()
             .any(|w| s.eq_ignore_ascii_case(w))
         {
@@ -205,6 +207,7 @@ fn coderhelm_label(what: &str) -> String {
         ALERT => "CoderHelm (alerts)".to_string(),
         SCHEDULED => "CoderHelm (scheduled)".to_string(),
         LOG_FINDING => "CoderHelm (log findings)".to_string(),
+        SECURITY => "CoderHelm (security fixes)".to_string(),
         other => format!("CoderHelm ({other})"),
     }
 }

@@ -11,7 +11,7 @@
 // anything; a few offer an action (such as running `cdk bootstrap`) that the
 // guided install asks about first.
 import crypto from "node:crypto";
-import { PERMISSIONS, REQUIRED_PERMISSIONS, EVENTS } from "./github-app.mjs";
+import { PERMISSIONS, REQUIRED_PERMISSIONS, EVENTS, OPTIONAL_EVENTS } from "./github-app.mjs";
 import { readSecret } from "./secrets.mjs";
 import { derived } from "./util.mjs";
 
@@ -459,6 +459,7 @@ const LEVEL = { none: 0, read: 1, write: 2, admin: 3 };
 const PERMISSION_NAMES = {
   contents: "Contents", pull_requests: "Pull requests", issues: "Issues", checks: "Checks", actions: "Actions",
   statuses: "Commit statuses", workflows: "Workflows", metadata: "Metadata", email_addresses: "Email addresses",
+  vulnerability_alerts: "Dependabot alerts",
 };
 
 export function appSettingsUrl(app) {
@@ -479,8 +480,22 @@ export function permissionGaps(app) {
   const optional = Object.entries(PERMISSIONS)
     .filter((p) => weak(p) && !weak([p[0], REQUIRED_PERMISSIONS[p[0]]]))
     .map(([k, need]) => `${PERMISSION_NAMES[k] ?? k}: ${need}`);
-  const events = EVENTS.filter((e) => !(app?.events ?? []).includes(e));
+  const missing = EVENTS.filter((e) => !(app?.events ?? []).includes(e));
+  const events = missing.filter((e) => !OPTIONAL_EVENTS.includes(e));
+  optional.push(...missing.filter((e) => OPTIONAL_EVENTS.includes(e)).map((e) => `the ${e} event`));
   return { perms, events, optional };
+}
+
+/** Why an optional permission or event matters, for the warning. */
+export function optionalWhy(optional) {
+  const why = [];
+  if (optional.some((o) => o.startsWith("Checks"))) {
+    why.push("Reviews work without Checks: write, but pull requests don't show the \"CoderHelm review\" check that links to each review's session.");
+  }
+  if (optional.some((o) => o.startsWith("Dependabot alerts") || o.includes("dependabot_alert") || o.includes("security_advisory"))) {
+    why.push("Security fixes work without Dependabot alerts and their events, using OSV and GitHub's advisories only.");
+  }
+  return why.join(" ");
 }
 
 async function gh(ctx, jwt, p) {
@@ -557,8 +572,8 @@ export async function checkGithubApp(ctx, secret, publicUrl, hybrid = null) {
   } else if (optional.length) {
     out.push(problem(WARN, "github_permissions", "GitHub App permissions and events", {
       what: `Not granted yet: ${optional.join(", ")}.`,
-      why: "Reviews work without it, but pull requests don't show the \"CoderHelm review\" check that links to each review's session.",
-      fix: { text: "Set it on the app's Permissions and events page, save, then accept the new permissions on each installation.", url: `${settings}/permissions` },
+      why: optionalWhy(optional),
+      fix: { text: "Set them on the app's Permissions and events page, save, then accept the new permissions on each installation.", url: `${settings}/permissions` },
     }));
   } else out.push(pass("github_permissions", "GitHub App permissions and events", "all granted"));
 

@@ -671,6 +671,20 @@ pub const CAPABILITIES: &[Capability] = &[
         ],
     },
     Capability {
+        key: "security",
+        label: "Change security fix settings, dismiss or reopen findings, check repositories now and preview what would open",
+
+        short_label: "Manage security fixes",
+        min_role: "admin",
+        handlers: &[
+            "security::put_config",
+            "security::dismiss",
+            "security::reopen",
+            "security::scan",
+            "security::preview",
+        ],
+    },
+    Capability {
         key: "model_provider",
         label: "See and change the model provider key",
 

@@ -496,6 +496,24 @@ async fn main() -> Result<(), Error> {
             "/reviewer/stale/keep-open",
             put(routes::stale_prs::put_keep_open),
         )
+        // Security fixes: findings, the settings, a check now, the preview
+        .route("/security/overview", get(routes::security::overview))
+        .route("/security/findings", get(routes::security::list_findings))
+        .route("/security/findings/:id", get(routes::security::get_finding))
+        .route(
+            "/security/findings/:id/dismiss",
+            post(routes::security::dismiss),
+        )
+        .route(
+            "/security/findings/:id/reopen",
+            post(routes::security::reopen),
+        )
+        .route("/security/scan", post(routes::security::scan))
+        .route(
+            "/security/config",
+            get(routes::security::get_config).put(routes::security::put_config),
+        )
+        .route("/security/preview", get(routes::security::preview))
         .route(
             "/alert-routes",
             get(routes::alerts::list_routes)
