@@ -27,10 +27,12 @@
  * (infra/cfn/coderhelm-bedrock-export.yaml, a bucket named with the install's prefix),
  * and that stack's own schedule starts the data source's syncs.
  *
- * Infrastructure vulnerabilities (services/worker/src/passes/infra_inventory.rs)
- * never use the install's own role yet: the template's
- * InfrastructureVulnerabilities is "off" here. A team reads another account
- * through its CoderHelmLogReader role there, whose stack has the switch.
+ * Infrastructure vulnerabilities (services/worker/src/passes/infra_inventory.rs):
+ * the template's InfrastructureVulnerabilities is "on" here, so the role may
+ * describe the account's EC2, Auto Scaling, load balancers, EKS, RDS,
+ * ElastiCache and OpenSearch versions, ECR scan results, SSM inventory and
+ * AWS's public AMI parameters, read-only. Like bedrock:Retrieve, the
+ * boundary allows them only through the access stack an AWS admin applies.
  *
  * Knowledge imports from S3 (services/common/src/knowledge/sources/s3.rs) never
  * use the install's own role: the template's ImportBuckets is empty here, so
@@ -58,12 +60,11 @@ const OWN_CONDITIONS: Record<string, boolean> = {
   ReadsImportBuckets: false,
   SyncsKnowledgeBases: false,
   SyncsEveryKnowledgeBase: false,
-  // Infrastructure vulnerabilities: not on the install's own role yet. Its
-  // reads need the permissions boundary to allow them, which reaches an
-  // install only through the access stack an AWS admin applies, batched
-  // with other boundary changes. Accounts a team connects with their own
-  // CoderHelmLogReader role aren't limited by this install's boundary.
-  ReadsInfrastructure: false,
+  // Infrastructure vulnerabilities: the install's own account is read like
+  // any account a team switches it on for (describe and list calls only).
+  // The permissions boundary allows these reads in today's boundary; they
+  // reach an install through the access stack an AWS admin applies.
+  ReadsInfrastructure: true,
   // Inspector and Health are team choices, read through a team's own role.
   ReadsInspector: false,
   ReadsHealth: false,
@@ -94,7 +95,7 @@ export function decideConditions(v: unknown, conditions: Record<string, boolean>
 /** The update template's statements for the install's own role: its knowledge bases are every one in its account. */
 export function updateTemplateStatements(): Statement[] {
   const scratch = new cdk.Stack(new cdk.App(), "Scratch");
-  const inc = new CfnInclude(scratch, "T", { templateFile: repoPath(UPDATE_TEMPLATE), parameters: { RoleName: ROLE_NAME_MARK, KnowledgeBases: OWN_KNOWLEDGE_BASES, ImportBuckets: "", SyncKnowledgeBases: "", InfrastructureVulnerabilities: "off", InspectorFindings: "off", HealthEvents: "off" } });
+  const inc = new CfnInclude(scratch, "T", { templateFile: repoPath(UPDATE_TEMPLATE), parameters: { RoleName: ROLE_NAME_MARK, KnowledgeBases: OWN_KNOWLEDGE_BASES, ImportBuckets: "", SyncKnowledgeBases: "", InfrastructureVulnerabilities: "on", InspectorFindings: "off", HealthEvents: "off" } });
   const p = inc.getResource(UPDATE_POLICY_ID) as iam.CfnPolicy;
   return decideConditions(scratch.resolve(p.policyDocument).Statement, OWN_CONDITIONS) as Statement[];
 }
