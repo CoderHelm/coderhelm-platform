@@ -311,6 +311,10 @@ pub struct Finding {
     pub dismissed: Option<Dismissed>,
     pub first_seen_at: String,
     pub updated_at: String,
+    /// A private report against the repository's own code (a repository
+    /// advisory still in triage or draft): never posted to a channel, and
+    /// never fixed in a public pull request or issue.
+    pub private_report: bool,
 }
 
 /// What CoderHelm keeps about a finding beyond what the API shows.
@@ -984,6 +988,8 @@ pub struct Observation {
     /// The Dependabot alert's own state (`open`, `fixed`, `dismissed`, ...).
     pub alert_state: Option<String>,
     pub alert_dismissed: Option<Dismissed>,
+    /// A repository advisory not yet published (see `Finding::private_report`).
+    pub private_report: bool,
 }
 
 /// Applies an observation: a new finding, or the existing one updated with
@@ -1082,6 +1088,9 @@ pub fn apply(
     }
     if o.alert.is_some() {
         f.dependabot_alert = o.alert.clone();
+    }
+    if a.source == REPOSITORY_ADVISORY {
+        f.private_report = o.private_report;
     }
     f.fixed_version = pick_fixed(&f.version, &[st.fixed.clone()]).or(f.fixed_version.take());
     match o.alert_state.as_deref() {
@@ -1281,7 +1290,7 @@ impl Stage {
 
 /// Whether a finding's tier posts cards at all.
 pub fn posts(f: &Finding, cfg: &SecurityConfig) -> bool {
-    f.tier.is_some_and(|t| cfg.post_alerts.get(t))
+    !f.private_report && f.tier.is_some_and(|t| cfg.post_alerts.get(t))
 }
 
 /// The escalation a finding is due now, if any: at the deadline, or at half
@@ -2148,6 +2157,8 @@ pub fn fixable(f: &Finding, st: &FindingState, cfg: &SecurityConfig, now: DateTi
         .and_then(parse_time)
         .is_some_and(|t| t > now);
     f.status == Status::Open
+        && !f.private_report
+        && f.ecosystem != OWN_CODE
         && !held
         && f.verdict != Verdict::Pending
         && !f.version.is_empty()
@@ -2925,6 +2936,67 @@ pub fn advisory_from_github(adv: &Value, package: Option<&str>, source: &str) ->
 }
 
 /// A Dependabot alert (webhook `alert` or the alerts API) as an observation.
+/// `Advisory::source` of a repository's own security advisory.
+pub const REPOSITORY_ADVISORY: &str = "repository_advisory";
+/// The ecosystem of a finding in the repository's own code (no dependency
+/// list names it, so the inventory never calls it fixed).
+pub const OWN_CODE: &str = "repository";
+/// The manifest of a finding in the repository's own code.
+pub const OWN_CODE_MANIFEST: &str = "(this repository's code)";
+
+/// How the repositories' own advisories were last read (the team state's
+/// `repository_advisories`), for the Security page: `ok`, `no_permission`,
+/// `error` or `unread`, and when CoderHelm can't read them, a sentence saying
+/// so and how to add the permission.
+pub fn repo_advisories_source(state: &str) -> Value {
+    let state = match state {
+        "ok" | "no_permission" | "error" => state,
+        _ => "unread",
+    };
+    json!({
+        "state": state,
+        "note": (state == "no_permission").then(|| crate::github_grants::limit_note(
+            "repository_advisories",
+            "Your repositories' own advisories and private vulnerability reports aren't read",
+        )),
+    })
+}
+
+/// The repository's own advisories (`GET /repos/{o}/{r}/security-advisories`,
+/// the `repository_advisories` permission).
+pub fn repo_advisories_path(repo: &str) -> String {
+    format!("/repos/{repo}/security-advisories?per_page=100&sort=updated")
+}
+
+/// A repository's own security advisory as an observation: a flaw in its
+/// own code, not a dependency. One still in `triage` (a private
+/// vulnerability report) or `draft` is a private report; `closed` or
+/// withdrawn is withdrawn. Its vulnerable functions are what triage looks
+/// for in the code.
+pub fn observation_from_repo_advisory(repo: &str, adv: &Value) -> Option<Observation> {
+    let state = adv["state"].as_str().unwrap_or("");
+    let mut a = advisory_from_github(adv, None, REPOSITORY_ADVISORY);
+    if a.ids.is_empty() {
+        return None;
+    }
+    a.withdrawn |= state == "closed" || adv["withdrawn_at"].is_string();
+    if a.severity.is_none() {
+        a.severity = adv["severity"].as_str().map(String::from);
+    }
+    let name = repo.rsplit('/').next().unwrap_or(repo);
+    let private = matches!(state, "triage" | "draft");
+    Some(Observation {
+        repo: repo.to_string(),
+        manifest: OWN_CODE_MANIFEST.to_string(),
+        ecosystem: OWN_CODE.to_string(),
+        package: name.to_string(),
+        version: String::new(),
+        advisory: a,
+        private_report: private,
+        ..Default::default()
+    })
+}
+
 pub fn observation_from_alert(repo: &str, alert: &Value) -> Option<Observation> {
     let dep = &alert["dependency"];
     let pkg = dep["package"]["name"]
@@ -2999,6 +3071,7 @@ pub fn observation_from_alert(repo: &str, alert: &Value) -> Option<Observation> 
         }),
         alert_state: state,
         alert_dismissed: dismissed,
+        private_report: false,
     })
 }
 
@@ -4087,6 +4160,84 @@ pub fn prs_to_close_on_withdraw(findings: &[(Finding, FindingState)]) -> Vec<(St
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_private_report_is_a_finding_that_never_goes_public() {
+        let adv = serde_json::json!({
+            "ghsa_id": "GHSA-aaaa-bbbb-cccc", "cve_id": null, "state": "triage",
+            "summary": "Path traversal in the upload handler", "severity": "high",
+            "vulnerabilities": [{"package": {"ecosystem": "npm", "name": "web"},
+                                 "vulnerable_version_range": "< 2.0.0",
+                                 "patched_versions": null,
+                                 "vulnerable_functions": ["saveUpload"]}],
+            "html_url": "https://github.com/acme/web/security/advisories/GHSA-aaaa-bbbb-cccc"
+        });
+        let o = observation_from_repo_advisory("acme/web", &adv).unwrap();
+        assert!(o.private_report);
+        assert_eq!(o.ecosystem, OWN_CODE);
+        assert_eq!(o.manifest, OWN_CODE_MANIFEST);
+        assert_eq!(o.advisory.symbols, ["saveUpload"]);
+        let (mut f, st, created) = apply(None, &o, Utc::now());
+        assert!(created && f.private_report);
+        f.tier = Some(Tier::P0);
+        f.verdict = Verdict::Reachable;
+        let cfg = SecurityConfig::default();
+        assert!(
+            !posts(&f, &cfg),
+            "a private report is never posted to a channel"
+        );
+        f.version = "1.0.0".into();
+        f.fixed_version = Some("2.0.0".into());
+        assert!(
+            !fixable(&f, &st, &cfg, Utc::now()),
+            "never fixed in a public pull request"
+        );
+        // Inventory never calls own code fixed.
+        assert!(!fixed_by_inventory(&f, &[]));
+    }
+
+    #[test]
+    fn the_page_says_when_own_advisories_cant_be_read() {
+        let v = repo_advisories_source("no_permission");
+        assert_eq!(v["state"], "no_permission");
+        assert!(v["note"]
+            .as_str()
+            .unwrap()
+            .contains("add Repository security advisories: read"));
+        assert!(repo_advisories_source("ok")["note"].is_null());
+        assert_eq!(repo_advisories_source("")["state"], "unread");
+    }
+
+    #[test]
+    fn a_published_or_closed_advisory_is_not_private() {
+        let published = serde_json::json!({"ghsa_id": "GHSA-1111-2222-3333", "state": "published"});
+        assert!(
+            !observation_from_repo_advisory("acme/web", &published)
+                .unwrap()
+                .private_report
+        );
+        let closed = serde_json::json!({"ghsa_id": "GHSA-1111-2222-3333", "state": "closed"});
+        let o = observation_from_repo_advisory("acme/web", &closed).unwrap();
+        assert!(o.advisory.withdrawn);
+        assert!(
+            observation_from_repo_advisory("acme/web", &serde_json::json!({"state": "draft"}))
+                .is_none()
+        );
+        // Publishing a report makes the finding public.
+        let draft = serde_json::json!({"ghsa_id": "GHSA-1111-2222-3333", "state": "draft"});
+        let (f, st, _) = apply(
+            None,
+            &observation_from_repo_advisory("acme/web", &draft).unwrap(),
+            Utc::now(),
+        );
+        assert!(f.private_report);
+        let (f, _, _) = apply(
+            Some((f, st)),
+            &observation_from_repo_advisory("acme/web", &published).unwrap(),
+            Utc::now(),
+        );
+        assert!(!f.private_report);
+    }
 
     fn t(s: &str) -> DateTime<Utc> {
         parse_time(s).unwrap()

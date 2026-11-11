@@ -478,6 +478,7 @@ pub async fn overview(
         "osv": { "synced_at": opt(&team_state, "osv_synced_at"), "mode": "api" },
         "kev_synced_at": opt(&kev, "synced_at"),
         "epss_synced_at": opt(&team_state, "epss_synced_at"),
+        "repository_advisories": sec::repo_advisories_source(&s(&team_state, "repository_advisories")),
     });
     out["source_rows"] = source_rows(&team_state, &kev, &findings);
     let deps = query_prefix(
